@@ -46,18 +46,25 @@ export function readPath(): PathView {
 		.split("/")
 		.filter((s) => s !== "")
 		.map(dec);
-	if (segs[0] === "projects") {
-		if (segs.length === 2) return { view: segs[1]!, task: null };
-		if (segs.length === 4 && segs[2] === "tasks")
-			return { view: segs[1]!, task: segs[3]! };
+	const [head, project, kind, task] = segs;
+	if (head === "projects") {
+		if (segs.length === 2 && project !== undefined)
+			return { view: project, task: null };
+		if (
+			segs.length === 4 &&
+			kind === "tasks" &&
+			project !== undefined &&
+			task !== undefined
+		)
+			return { view: project, task };
 		return { view: "", task: null };
 	}
-	if (segs[0] === SETTINGS_HASH) {
+	if (head === SETTINGS_HASH) {
 		if (segs.length === 1) return { view: SETTINGS_HASH, task: null };
 		if (segs.length === 2)
-			return { view: `${SETTINGS_HASH}/${segs[1]}`, task: null };
+			return { view: `${SETTINGS_HASH}/${project}`, task: null };
 	}
-	if (segs[0] === SYSTEM_VIEW && segs.length === 1)
+	if (head === SYSTEM_VIEW && segs.length === 1)
 		return { view: SYSTEM_VIEW, task: null };
 	return { view: "", task: null };
 }

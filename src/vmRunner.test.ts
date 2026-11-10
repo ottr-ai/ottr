@@ -188,6 +188,54 @@ function heldGuest(): {
 	};
 }
 
+/** One /run of the fake guest agent: records the body, answers the scripted stream. */
+async function fakeGuestRun(
+	script: GuestScript,
+	rec: GuestRec,
+	req: Request,
+): Promise<Response> {
+	rec.runBody = await req.json();
+	return (
+		script.run?.(rec) ??
+		ndjson('{"type":"tick"}', JSON.stringify({ [WORKER_DONE]: DONE_OK }))
+	);
+}
+
+/** One GET /files of the fake guest agent: records the query, answers the scripted tar. */
+function fakeGuestFiles(script: GuestScript, rec: GuestRec, u: URL): Response {
+	rec.fileQueries.push(u.searchParams);
+	return new Response(
+		(script.files?.(u.searchParams) ?? rawTar([])) as Uint8Array<ArrayBuffer>,
+	);
+}
+
+/** The fake guest agent's HTTP routes, shared by every VM a launcher run boots. */
+async function guestRoute(
+	script: GuestScript,
+	rec: GuestRec,
+	token: string,
+	req: Request,
+): Promise<Response> {
+	const u = new URL(req.url);
+	if (u.pathname === "/healthz") return new Response("ok");
+	if (req.headers.get("x-ottr-guest-token") !== token)
+		return new Response("unauthorized", { status: 401 });
+	if (req.method === "PUT" && u.pathname === "/files") {
+		rec.puts.push(new Uint8Array(await req.arrayBuffer()));
+		return new Response("ok");
+	}
+	if (req.method === "GET" && u.pathname === "/files")
+		return fakeGuestFiles(script, rec, u);
+	if (req.method === "POST" && u.pathname === "/run")
+		return fakeGuestRun(script, rec, req);
+	if (req.method === "POST" && u.pathname === "/bake")
+		return (
+			script.bake?.(rec) ??
+			ndjson(JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }))
+		);
+	return new Response("not found", { status: 404 });
+}
+
 function fakeLauncher(script: GuestScript): {
 	launcher: VmLauncher;
 	recs: GuestRec[];
@@ -209,43 +257,7 @@ function fakeLauncher(script: GuestScript): {
 			port: 0,
 			hostname: "127.0.0.1",
 			idleTimeout: 0,
-			fetch: async (req) => {
-				const u = new URL(req.url);
-				if (u.pathname === "/healthz") return new Response("ok");
-				if (req.headers.get("x-ottr-guest-token") !== token)
-					return new Response("unauthorized", { status: 401 });
-				if (req.method === "PUT" && u.pathname === "/files") {
-					rec.puts.push(new Uint8Array(await req.arrayBuffer()));
-					return new Response("ok");
-				}
-				if (req.method === "GET" && u.pathname === "/files") {
-					rec.fileQueries.push(u.searchParams);
-					return new Response(
-						(script.files?.(u.searchParams) ??
-							rawTar([])) as Uint8Array<ArrayBuffer>,
-					);
-				}
-				if (req.method === "POST" && u.pathname === "/run") {
-					rec.runBody = await req.json();
-					return (
-						script.run?.(rec) ??
-						ndjson(
-							'{"type":"tick"}',
-							JSON.stringify({ [WORKER_DONE]: DONE_OK }),
-						)
-					);
-				}
-				if (req.method === "POST" && u.pathname === "/bake")
-					return (
-						script.bake?.(rec) ??
-						ndjson(
-							JSON.stringify({
-								[WORKER_DONE]: { exitCode: 0, stderrTail: "" },
-							}),
-						)
-					);
-				return new Response("not found", { status: 404 });
-			},
+			fetch: (req) => guestRoute(script, rec, token, req),
 		});
 		stoppers.push(() => server.stop(true));
 		const die = (): void => {

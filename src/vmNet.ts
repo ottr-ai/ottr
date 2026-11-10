@@ -209,8 +209,8 @@ export function slotDownCommands(slot: Slot, board: BoardAddr): string[][] {
 export function parseTaps(ipLinkOutput: string): string[] {
 	const out: string[] = [];
 	for (const line of ipLinkOutput.split("\n")) {
-		const m = /^\d+:\s+(ovm\d+)[:@]/.exec(line);
-		if (m) out.push(m[1]!);
+		const tap = /^\d+:\s+(ovm\d+)[:@]/.exec(line)?.[1];
+		if (tap) out.push(tap);
 	}
 	return out;
 }

@@ -76,10 +76,27 @@ function fakeGh() {
 	const failList = new Set<string>();
 	let labelExists = true;
 	let labelPostFail = false;
-	const gh: GhFn = async (args) => {
-		calls.push(args);
-		const path = args.find((a) => a.startsWith("repos/")) ?? "";
-		const repo = path.split("/").slice(1, 3).join("/");
+	const labelEndpoint = (
+		args: string[],
+		path: string,
+		repo: string,
+	): { code: number; stdout: string; stderr: string } | null => {
+		if (path === `repos/${repo}/labels`) {
+			created.push(args);
+			labelExists = true;
+			return ok();
+		}
+		const m = path.match(/\/issues\/(\d+)\/labels$/);
+		if (m === null) return null;
+		if (labelPostFail) return { code: 1, stdout: "", stderr: "HTTP 403" };
+		labelled.push(Number(m[1]));
+		return ok("[]");
+	};
+	const respond = (
+		args: string[],
+		path: string,
+		repo: string,
+	): { code: number; stdout: string; stderr: string } => {
 		if (path.includes("/issues?")) {
 			if (failList.has(repo))
 				return { code: 1, stdout: "", stderr: "HTTP 500" };
@@ -93,18 +110,15 @@ function fakeGh() {
 						stdout: '{"message":"Not Found"}',
 						stderr: "gh: Not Found (HTTP 404)",
 					};
-		if (path === `repos/${repo}/labels`) {
-			created.push(args);
-			labelExists = true;
-			return ok();
-		}
-		const m = path.match(/\/issues\/(\d+)\/labels$/);
-		if (m) {
-			if (labelPostFail) return { code: 1, stdout: "", stderr: "HTTP 403" };
-			labelled.push(Number(m[1]));
-			return ok("[]");
-		}
+		const fromLabels = labelEndpoint(args, path, repo);
+		if (fromLabels !== null) return fromLabels;
 		return { code: 1, stdout: "", stderr: `unexpected call ${args.join(" ")}` };
+	};
+	const gh: GhFn = async (args) => {
+		calls.push(args);
+		const path = args.find((a) => a.startsWith("repos/")) ?? "";
+		const repo = path.split("/").slice(1, 3).join("/");
+		return respond(args, path, repo);
 	};
 	return {
 		gh,

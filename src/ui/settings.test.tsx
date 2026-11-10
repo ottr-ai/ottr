@@ -3320,7 +3320,8 @@ async function mountAlate(fetchMock: typeof fetch): Promise<{
 	};
 }
 
-function alateFetchMock(handlers: {
+/** The fetch behavior an Alate section test configures. */
+type AlateMockHandlers = {
 	config?: {
 		url: string | null;
 		keySet: boolean;
@@ -3338,38 +3339,58 @@ function alateFetchMock(handlers: {
 				results?: ProvisionResult[];
 		  }
 		| (() => Response);
-}): typeof fetch {
-	const ok = (body: unknown): Response =>
-		new Response(JSON.stringify(body), {
-			status: 200,
-			headers: { "Content-Type": "application/json" },
-		});
+};
+
+/** Every JSON body the Alate tests' fetch mock answers with: a 200 application/json Response. */
+const okJson = (body: unknown): Response =>
+	new Response(JSON.stringify(body), {
+		status: 200,
+		headers: { "Content-Type": "application/json" },
+	});
+
+/** The POST /api/settings/alate-key answer: the key handler's Response (a factory builds
+    a fresh one per call), or the default 200 when the test configures none. */
+function alateKeyResponse(
+	handlers: AlateMockHandlers,
+	init?: RequestInit,
+): Response {
+	if (init?.method === "POST") {
+		const h = handlers.keyPost;
+		return typeof h === "function" ? h() : (h ?? okJson({}));
+	}
+	const h = handlers.keyGet;
+	return typeof h === "function" ? h() : (h ?? okJson({ apiKey: null }));
+}
+
+/** The POST /api/alate/provision answer: the configured body as a Response, a factory's
+    fresh Response, or the thrown unexpected-fetch error when the test configures none. */
+function alateProvisionResponse(
+	handlers: AlateMockHandlers,
+	url: string,
+): Response {
+	const h = handlers.provisionPost;
+	if (h === undefined) throw new Error(`unexpected fetch POST ${url}`);
+	return typeof h === "function" ? h() : okJson(h);
+}
+
+function alateFetchMock(handlers: AlateMockHandlers): typeof fetch {
 	return (async (
 		input: RequestInfo | URL,
 		init?: RequestInit,
 	): Promise<Response> => {
 		const url = String(input);
 		if (url.endsWith("/api/alate") && init?.method === undefined)
-			return ok({
+			return okJson({
 				url: null,
 				keySet: false,
 				lastProvisionError: null,
 				...handlers.config,
 			});
 		if (url.endsWith("/api/alate/health")) throw new Error("no server");
-		if (url.endsWith("/api/alate/provision") && init?.method === "POST") {
-			const h = handlers.provisionPost;
-			if (h === undefined) throw new Error(`unexpected fetch POST ${url}`);
-			return typeof h === "function" ? h() : ok(h);
-		}
-		if (url.endsWith("/api/settings/alate-key")) {
-			if (init?.method === "POST") {
-				const h = handlers.keyPost;
-				return typeof h === "function" ? h() : (h ?? ok({}));
-			}
-			const h = handlers.keyGet;
-			return typeof h === "function" ? h() : (h ?? ok({ apiKey: null }));
-		}
+		if (url.endsWith("/api/alate/provision") && init?.method === "POST")
+			return alateProvisionResponse(handlers, url);
+		if (url.endsWith("/api/settings/alate-key"))
+			return alateKeyResponse(handlers, init);
 		throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 	}) as typeof fetch;
 }

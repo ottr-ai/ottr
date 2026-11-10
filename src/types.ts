@@ -73,43 +73,53 @@ export function askQuestions(args: unknown): AskQuestion[] | null {
 	if (!Array.isArray(raw)) return null;
 	const out: AskQuestion[] = [];
 	for (const item of raw) {
-		if (
-			typeof item !== "object" ||
-			item === null ||
-			!("question" in item) ||
-			!("options" in item)
-		)
-			continue;
-		const { question, options: rawOptions } = item;
-		const multi = "multi" in item ? item.multi : undefined;
-		const recommended = "recommended" in item ? item.recommended : undefined;
-		if (typeof question !== "string" || !Array.isArray(rawOptions)) continue;
-		const options: AskOption[] = [];
-		const keptRaw: number[] = [];
-		for (const [rawIdx, entry] of rawOptions.entries()) {
-			if (typeof entry !== "object" || entry === null || !("label" in entry))
-				continue;
-			const { label } = entry;
-			const description =
-				"description" in entry ? entry.description : undefined;
-			if (typeof label !== "string") continue;
-			options.push(
-				typeof description === "string" ? { label, description } : { label },
-			);
-			keptRaw.push(rawIdx);
-		}
-		// recommended is a raw index; map it onto the kept options or null when that
-		// option was dropped. indexOf rejects non-integers/out-of-range for free.
-		const at =
-			typeof recommended === "number" ? keptRaw.indexOf(recommended) : -1;
-		out.push({
-			question,
-			options,
-			multi: multi === true,
-			recommended: at === -1 ? null : at,
-		});
+		const q = askQuestionOf(item);
+		if (q !== null) out.push(q);
 	}
 	return out.length > 0 ? out : null;
+}
+
+/** One normalized ask question, or null when its question/options are unusable. */
+function askQuestionOf(item: unknown): AskQuestion | null {
+	if (
+		typeof item !== "object" ||
+		item === null ||
+		!("question" in item) ||
+		!("options" in item)
+	)
+		return null;
+	const { question, options: rawOptions } = item;
+	const multi = "multi" in item ? item.multi : undefined;
+	const recommended = "recommended" in item ? item.recommended : undefined;
+	if (typeof question !== "string" || !Array.isArray(rawOptions)) return null;
+	const options: AskOption[] = [];
+	const keptRaw: number[] = [];
+	for (const [rawIdx, entry] of rawOptions.entries()) {
+		const option = askOptionOf(entry);
+		if (option === null) continue;
+		options.push(option);
+		keptRaw.push(rawIdx);
+	}
+	// recommended is a raw index; map it onto the kept options or null when that
+	// option was dropped. indexOf rejects non-integers/out-of-range for free.
+	const at =
+		typeof recommended === "number" ? keptRaw.indexOf(recommended) : -1;
+	return {
+		question,
+		options,
+		multi: multi === true,
+		recommended: at === -1 ? null : at,
+	};
+}
+
+/** One normalized ask option, or null when the entry has no usable label. */
+function askOptionOf(entry: unknown): AskOption | null {
+	if (typeof entry !== "object" || entry === null || !("label" in entry))
+		return null;
+	const { label } = entry;
+	const description = "description" in entry ? entry.description : undefined;
+	if (typeof label !== "string") return null;
+	return typeof description === "string" ? { label, description } : { label };
 }
 
 /** Arguments of the agent's successful `report_outcome` tool call. */
@@ -969,7 +979,8 @@ export function answeredCard(
 	turns: Array<Pick<Turn, "kind" | "outcome">>,
 ): boolean {
 	for (let i = turns.length - 1; i >= 0; i--) {
-		const t = turns[i]!;
+		const t = turns[i];
+		if (t === undefined) continue;
 		if (t.kind === "work") return t.outcome === "answered";
 	}
 	return false;

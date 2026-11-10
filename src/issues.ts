@@ -37,47 +37,58 @@ export function issueUrl(repo: string, n: number): string {
 	return `${githubHost().webBase}/${repo}/issues/${n}`;
 }
 
+/** One label entry: a plain name or `{ name }`; anything else is skipped. */
+function parseLabel(l: unknown): string | null {
+	if (typeof l === "string") return l;
+	if (typeof l === "object" && l !== null) {
+		const name = (l as Record<string, unknown>).name;
+		if (typeof name === "string") return name;
+	}
+	return null;
+}
+
+/** One issue entry; null when it is not a usable open issue. */
+function parseIssueEntry(e: unknown): IssueInfo | null {
+	if (typeof e !== "object" || e === null) return null;
+	const x = e as Record<string, unknown>;
+	const createdAt =
+		typeof x.created_at === "string" ? Date.parse(x.created_at) : Number.NaN;
+	if (
+		typeof x.number !== "number" ||
+		!Number.isInteger(x.number) ||
+		x.number <= 0 ||
+		!Number.isFinite(createdAt) ||
+		x.state !== "open"
+	)
+		return null;
+	// No length cut here: a cut can split a secret so redaction no longer sees it. The
+	// card title is redacted first and cut after (cardTitle).
+	const title =
+		typeof x.title === "string" ? stripInvisible(x.title).text.trim() : "";
+	const labels: string[] = [];
+	if (Array.isArray(x.labels)) {
+		for (const l of x.labels) {
+			const name = parseLabel(l);
+			if (name !== null) labels.push(name);
+		}
+	}
+	return {
+		number: x.number,
+		title,
+		body: typeof x.body === "string" ? x.body : "",
+		createdAt,
+		labels,
+		isPull: x.pull_request !== undefined && x.pull_request !== null,
+	};
+}
+
 /** GitHub data is untrusted: malformed entries are skipped, never thrown on. */
 export function parseIssuePage(body: unknown): IssueInfo[] {
 	if (!Array.isArray(body)) return [];
 	const out: IssueInfo[] = [];
 	for (const e of body) {
-		if (typeof e !== "object" || e === null) continue;
-		const x = e as Record<string, unknown>;
-		const createdAt =
-			typeof x.created_at === "string" ? Date.parse(x.created_at) : Number.NaN;
-		if (
-			typeof x.number !== "number" ||
-			!Number.isInteger(x.number) ||
-			x.number <= 0 ||
-			!Number.isFinite(createdAt) ||
-			x.state !== "open"
-		)
-			continue;
-		// No length cut here: a cut can split a secret so redaction no longer sees it. The
-		// card title is redacted first and cut after (cardTitle).
-		const title =
-			typeof x.title === "string" ? stripInvisible(x.title).text.trim() : "";
-		const labels: string[] = [];
-		if (Array.isArray(x.labels)) {
-			for (const l of x.labels) {
-				if (typeof l === "string") labels.push(l);
-				else if (
-					typeof l === "object" &&
-					l !== null &&
-					typeof (l as Record<string, unknown>).name === "string"
-				)
-					labels.push((l as Record<string, unknown>).name as string);
-			}
-		}
-		out.push({
-			number: x.number,
-			title,
-			body: typeof x.body === "string" ? x.body : "",
-			createdAt,
-			labels,
-			isPull: x.pull_request !== undefined && x.pull_request !== null,
-		});
+		const info = parseIssueEntry(e);
+		if (info !== null) out.push(info);
 	}
 	return out;
 }
@@ -223,9 +234,10 @@ export function createIssueWatcher(deps: {
 
 	async function scanProject(project: ForkProject): Promise<void> {
 		const store = project.store;
+		if (project.github === null) return;
 		const repo =
 			ownerRepo(`${githubHost().webBase}/${project.github}.git`) ??
-			project.github!;
+			project.github;
 		if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
 		const since = store.getSettings().issueWatchSince;
 		if (since === null) {
@@ -270,9 +282,20 @@ export function createIssueWatcher(deps: {
 			deps.log(
 				`issues: ${project.name}: daily cap of ${ISSUE_GATES.DAILY_CARDS} cards reached; ${candidates.length - slots} issue(s) wait`,
 			);
-		for (const i of candidates.slice(0, slots)) {
+		fileCandidateCards(project, repo, candidates.slice(0, slots), t);
+		await labelWatchedIssues(project, repo, watching);
+	}
+
+	/** Files the chosen candidates as cards; a failure is logged, never thrown. */
+	function fileCandidateCards(
+		project: ForkProject,
+		repo: string,
+		chosen: IssueInfo[],
+		t: number,
+	): void {
+		for (const i of chosen) {
 			try {
-				store.fileIssueCard({
+				project.store.fileIssueCard({
 					number: i.number,
 					title: cardTitle(i.number, i.title),
 					prompt: issueCardPrompt({
@@ -289,14 +312,19 @@ export function createIssueWatcher(deps: {
 				);
 			}
 		}
-		// Labels go on after filing, from the table: a failed label call retries next tick
-		// without filing the issue again.
+	}
+
+	// Labels go on after filing, from the table: a failed label call retries next tick
+	// without filing the issue again.
+	async function labelWatchedIssues(
+		project: ForkProject,
+		repo: string,
+		watching: () => boolean,
+	): Promise<void> {
+		const store = project.store;
 		const unlabelled = store.unlabelledIssues();
-		if (
-			unlabelled.length === 0 ||
-			!(await ensureLabel(project, repo, watching))
-		)
-			return;
+		if (unlabelled.length === 0) return;
+		if (!(await ensureLabel(project, repo, watching))) return;
 		for (const n of unlabelled) {
 			if (!watching()) return;
 			const r = await gh([

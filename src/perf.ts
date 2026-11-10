@@ -78,14 +78,21 @@ export function median(xs: number[]): number | null {
 	if (xs.length === 0) return null;
 	const s = [...xs].sort((a, b) => a - b);
 	const mid = s.length >> 1;
-	return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+	// mid sits inside the list; the even case also has a left neighbor (mid >= 1).
+	const upper = s[mid];
+	if (upper === undefined) return null;
+	if (s.length % 2 === 1) return upper;
+	const lower = s[mid - 1];
+	if (lower === undefined) return upper;
+	return (lower + upper) / 2;
 }
 
 /** Nearest-rank percentile: ceil(p·n)-th smallest, 1-indexed. */
 function nearestRank(xs: number[], p: number): number | null {
 	if (xs.length === 0) return null;
 	const s = [...xs].sort((a, b) => a - b);
-	return s[Math.ceil(p * s.length) - 1]!;
+	const rank = s[Math.ceil(p * s.length) - 1];
+	return rank === undefined ? null : rank;
 }
 
 /** Minimum completed turns backing one ETA estimate; thinner history ships elapsed only. */
@@ -110,7 +117,9 @@ export function turnMedians(
 	const medians = new Map<string, number>();
 	for (const [key, list] of groups) {
 		if (list.length < ETA_MIN_HISTORY) continue;
-		medians.set(key, median(list)!);
+		const m = median(list);
+		if (m === null) continue;
+		medians.set(key, m);
 	}
 	return medians;
 }

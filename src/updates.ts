@@ -53,9 +53,64 @@ function iso(v: unknown): string | null {
 	return v;
 }
 
-function record(raw: unknown): UpdateRecord | null {
+/** The required `{ file, key }` pin; null unless both fields are text. */
+function parsePin(raw: unknown): { file: string; key: string } | null {
 	if (typeof raw !== "object" || raw === null) return null;
-	const r = raw as Record<string, unknown>;
+	const p = raw as Record<string, unknown>;
+	const file = text(p.file);
+	const key = text(p.key);
+	if (file === null || key === null) return null;
+	return { file, key };
+}
+
+/** The diffs list; [] when absent, null when one entry is malformed or the list is too long. */
+function parseDiffs(raw: unknown): { file: string; url: string }[] | null {
+	if (raw === undefined) return [];
+	if (!Array.isArray(raw) || raw.length > DIFFS_MAX) return null;
+	const diffs: { file: string; url: string }[] = [];
+	for (const d of raw) {
+		if (typeof d !== "object" || d === null) return null;
+		const o = d as Record<string, unknown>;
+		const file = text(o.file);
+		const url = httpUrl(o.url);
+		if (file === null || url === null) return null;
+		diffs.push({ file, url });
+	}
+	return diffs;
+}
+
+/** Sets managedBy/removed from the raw record; false when one is malformed. */
+function optionalFields(
+	rec: UpdateRecord,
+	r: Record<string, unknown>,
+	target: string | null,
+): boolean {
+	if (r.managedBy !== undefined) {
+		const managedBy = text(r.managedBy);
+		if (managedBy === null) return false;
+		rec.managedBy = managedBy;
+	}
+	if (r.removed !== undefined) {
+		if (r.removed !== true || target !== null) return false;
+		rec.removed = true;
+	}
+	return true;
+}
+
+/** The record's required fields, validated; null when one is missing or malformed. */
+function requiredFields(r: Record<string, unknown>): {
+	id: string;
+	name: string;
+	kind: string;
+	origin: string;
+	repo: string;
+	current: string;
+	latest: string;
+	target: string | null;
+	publishedAt: string;
+	qualifiesAt: string;
+	notesUrl: string;
+} | null {
 	const id = text(r.id);
 	const name = text(r.name);
 	const kind = text(r.kind);
@@ -78,23 +133,15 @@ function record(raw: unknown): UpdateRecord | null {
 		publishedAt === null ||
 		qualifiesAt === null ||
 		notesUrl === null ||
-		(r.target !== null && target === null) ||
-		!(kind in KIND_OK) ||
-		!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo)
+		(r.target !== null && target === null)
 	)
 		return null;
-	if (typeof r.pin !== "object" || r.pin === null) return null;
-	const p = r.pin as Record<string, unknown>;
-	const file = text(p.file);
-	const key = text(p.key);
-	if (file === null || key === null) return null;
-	const rec: UpdateRecord = {
+	return {
 		id,
 		name,
-		kind: kind as UpdateKind,
+		kind,
 		origin,
 		repo,
-		pin: { file, key },
 		current,
 		latest,
 		target,
@@ -102,28 +149,38 @@ function record(raw: unknown): UpdateRecord | null {
 		qualifiesAt,
 		notesUrl,
 	};
-	if (r.managedBy !== undefined) {
-		const managedBy = text(r.managedBy);
-		if (managedBy === null) return null;
-		rec.managedBy = managedBy;
-	}
-	if (r.removed !== undefined) {
-		if (r.removed !== true || target !== null) return null;
-		rec.removed = true;
-	}
-	if (r.diffs !== undefined) {
-		if (!Array.isArray(r.diffs) || r.diffs.length > DIFFS_MAX) return null;
-		const diffs: { file: string; url: string }[] = [];
-		for (const d of r.diffs as unknown[]) {
-			if (typeof d !== "object" || d === null) return null;
-			const o = d as Record<string, unknown>;
-			const file = text(o.file);
-			const url = httpUrl(o.url);
-			if (file === null || url === null) return null;
-			diffs.push({ file, url });
-		}
-		rec.diffs = diffs;
-	}
+}
+
+function record(raw: unknown): UpdateRecord | null {
+	if (typeof raw !== "object" || raw === null) return null;
+	const r = raw as Record<string, unknown>;
+	const f = requiredFields(r);
+	if (
+		f === null ||
+		!(f.kind in KIND_OK) ||
+		!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(f.repo)
+	)
+		return null;
+	const pin = parsePin(r.pin);
+	if (pin === null) return null;
+	const rec: UpdateRecord = {
+		id: f.id,
+		name: f.name,
+		kind: f.kind as UpdateKind,
+		origin: f.origin,
+		repo: f.repo,
+		pin,
+		current: f.current,
+		latest: f.latest,
+		target: f.target,
+		publishedAt: f.publishedAt,
+		qualifiesAt: f.qualifiesAt,
+		notesUrl: f.notesUrl,
+	};
+	if (!optionalFields(rec, r, f.target)) return null;
+	const diffs = parseDiffs(r.diffs);
+	if (diffs === null) return null;
+	if (r.diffs !== undefined) rec.diffs = diffs;
 	return rec;
 }
 

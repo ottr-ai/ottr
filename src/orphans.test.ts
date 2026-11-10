@@ -228,7 +228,7 @@ test("summarizeCmd drops leading env tokens and caps long commands", () => {
 	expect(summarizeCmd("A=1 B=2  omp   -p --mode json")).toBe(
 		"omp -p --mode json",
 	);
-	const long = "omp -p --mode json " + "x".repeat(200);
+	const long = `omp -p --mode json ${"x".repeat(200)}`;
 	const out = summarizeCmd(long);
 	expect(out.length).toBe(161);
 	expect(out.endsWith("…")).toBe(true);

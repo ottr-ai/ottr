@@ -278,12 +278,64 @@ export function createTrendingScanner(deps: {
 		}
 	}
 
+	/** The README text, cut to the cap; null on 404, throws on other failures. */
+	async function fetchReadme(
+		base: string,
+	): Promise<{ readme: string | null; truncated: boolean }> {
+		const readmePath = `${base}/readme`;
+		const rd = await api(readmePath, "application/vnd.github.raw");
+		if (rd.ok) {
+			const text = (await readBody(readmePath, rd, "text")) as string;
+			return {
+				readme: text.slice(0, README_MAX),
+				truncated: text.length > README_MAX,
+			};
+		}
+		if (rd.status !== 404) throw apiFailure(readmePath, rd);
+		return { readme: null, truncated: false };
+	}
+
+	/** The default branch's blob paths, cut to the cap; empty on 404/409. */
+	async function fetchTree(
+		base: string,
+		branch: string,
+	): Promise<{ tree: string[]; truncated: boolean }> {
+		const treePath = `${base}/git/trees/${branch}?recursive=1`;
+		const tr = await api(treePath, "application/vnd.github+json");
+		if (!tr.ok) {
+			// 404 = branch gone, 409 = empty repository: no tree, not a scan failure.
+			if (tr.status !== 404 && tr.status !== 409)
+				throw apiFailure(treePath, tr);
+			return { tree: [], truncated: false };
+		}
+		const t = (await readBody(treePath, tr, "json")) as {
+			tree?: unknown;
+			truncated?: unknown;
+		} | null;
+		const entries = t?.tree;
+		const blobs = Array.isArray(entries)
+			? (entries as { path?: unknown; type?: unknown }[])
+					.filter((e) => e?.type === "blob" && typeof e.path === "string")
+					.map((e) => e.path as string)
+			: [];
+		return {
+			tree: blobs.slice(0, TREE_MAX),
+			truncated: blobs.length > TREE_MAX || t?.truncated === true,
+		};
+	}
+
+	/** A redirect/404 answer means the repo is skipped, not failed. */
+	function metaSkipReason(status: number): string | null {
+		if (status === 404) return "not found (deleted or private)";
+		if (status >= 300 && status < 400) return `moved (HTTP ${status})`;
+		return null;
+	}
+
 	async function lookup(repo: string): Promise<RepoLookup> {
 		const base = `/repos/${repo}`;
 		const meta = await api(base, "application/vnd.github+json");
-		if (meta.status === 404) return { skip: "not found (deleted or private)" };
-		if (meta.status >= 300 && meta.status < 400)
-			return { skip: `moved (HTTP ${meta.status})` };
+		const skip = metaSkipReason(meta.status);
+		if (skip !== null) return { skip };
 		if (!meta.ok) throw apiFailure(base, meta);
 		const body = (await readBody(base, meta, "json")) as Record<
 			string,
@@ -293,39 +345,11 @@ export function createTrendingScanner(deps: {
 			throw new Error(`GitHub API ${base} returned a non-JSON body`);
 		if (body.archived === true) return { skip: "archived" };
 		const defaultBranch = str(body.default_branch) ?? "main";
-
-		const readmePath = `${base}/readme`;
-		const rd = await api(readmePath, "application/vnd.github.raw");
-		let readme: string | null = null;
-		let readmeTruncated = false;
-		if (rd.ok) {
-			const text = (await readBody(readmePath, rd, "text")) as string;
-			readmeTruncated = text.length > README_MAX;
-			readme = text.slice(0, README_MAX);
-		} else if (rd.status !== 404) throw apiFailure(readmePath, rd);
-
-		const branch = defaultBranch.split("/").map(encodeURIComponent).join("/");
-		const treePath = `${base}/git/trees/${branch}?recursive=1`;
-		const tr = await api(treePath, "application/vnd.github+json");
-		let tree: string[] = [];
-		let treeTruncated = false;
-		if (tr.ok) {
-			const t = (await readBody(treePath, tr, "json")) as {
-				tree?: unknown;
-				truncated?: unknown;
-			} | null;
-			const entries = t?.tree;
-			const blobs = Array.isArray(entries)
-				? (entries as { path?: unknown; type?: unknown }[])
-						.filter((e) => e?.type === "blob" && typeof e.path === "string")
-						.map((e) => e.path as string)
-				: [];
-			treeTruncated = blobs.length > TREE_MAX || t?.truncated === true;
-			tree = blobs.slice(0, TREE_MAX);
-			// 404 = branch gone, 409 = empty repository: no tree, not a scan failure.
-		} else if (tr.status !== 404 && tr.status !== 409)
-			throw apiFailure(treePath, tr);
-
+		const readme = await fetchReadme(base);
+		const tree = await fetchTree(
+			base,
+			defaultBranch.split("/").map(encodeURIComponent).join("/"),
+		);
 		const license = body.license as { spdx_id?: unknown } | null | undefined;
 		return {
 			repo,
@@ -339,11 +363,176 @@ export function createTrendingScanner(deps: {
 			license: str(license?.spdx_id),
 			pushedAt: str(body.pushed_at),
 			defaultBranch,
-			readme,
-			readmeTruncated,
-			tree,
-			treeTruncated,
+			readme: readme.readme,
+			readmeTruncated: readme.truncated,
+			tree: tree.tree,
+			treeTruncated: tree.truncated,
 		};
+	}
+
+	/** One project's picks and hints from the trending repos and its past verdicts. */
+	function planFor(
+		p: TrendingProject,
+		trending: string[],
+		seen: Set<string>,
+	): {
+		project: TrendingProject;
+		picks: {
+			repo: string;
+			trendingNow: boolean;
+			earlierReason: string | null;
+		}[];
+		hints: { repo: string; reason: string }[];
+	} {
+		const verdicts = p.store.listTrendingVerdicts();
+		const byRepo = new Map(verdicts.map((v) => [v.repo.toLowerCase(), v]));
+		const picks: {
+			repo: string;
+			trendingNow: boolean;
+			earlierReason: string | null;
+		}[] = [];
+		for (const repo of trending) {
+			const v = byRepo.get(repo);
+			if (v && v.verdict !== "deferred") continue;
+			picks.push({
+				repo,
+				trendingNow: true,
+				earlierReason: v ? v.reason : null,
+			});
+		}
+		for (const v of verdicts) {
+			const repo = v.repo.toLowerCase();
+			if (v.verdict !== "deferred" || seen.has(repo) || !validRepo(repo))
+				continue;
+			picks.push({ repo, trendingNow: false, earlierReason: v.reason });
+		}
+		const hints = verdicts
+			.filter((v) => v.verdict === "no_fit" && v.rejectedByUser)
+			.map((v) => ({ repo: v.repo, reason: v.reason }));
+		return { project: p, picks, hints };
+	}
+
+	/** Writes the bundle and files the scout card; null when the project has no candidates. */
+	function fileScoutCard(
+		project: TrendingProject,
+		candidates: (RepoLookup & {
+			trendingNow: boolean;
+			earlierReason: string | null;
+		})[],
+		hints: { repo: string; reason: string }[],
+		startedAt: number,
+	): string | null {
+		if (candidates.length === 0) {
+			deps.log(`trending: ${project.name}: no new candidates, no card`);
+			return null;
+		}
+		// The task data dir, not serverDir: a worker runs the scout (D6), and only the data dir
+		// is mounted there. writeBelow follows no symlink a worker planted under the data root.
+		const bundlePath = join(
+			project.store.tasksDir,
+			"trending",
+			`${startedAt}.json`,
+		);
+		writeBelow(
+			project.store.dataRoot,
+			bundlePath,
+			JSON.stringify(
+				{
+					project: project.name,
+					github: project.github,
+					scannedAt: startedAt,
+					pages: TRENDING_PAGES,
+					candidates,
+					hints,
+				},
+				null,
+				2,
+			),
+		);
+		const task = project.store.createTask(
+			trendingScoutPrompt({
+				project: project.name,
+				repo: project.github,
+				bundlePath,
+				candidates: candidates.length,
+				cap: TRENDING_CAP,
+				maxDeep: DEEP_REPOS,
+				maxFiles: DEEP_FILES,
+			}),
+			null,
+			"trending",
+		);
+		project.store.updateTask(task.id, {
+			title: `Trending scout: ${localDate(startedAt)}`,
+			topic: "trending scout",
+		});
+		deps.log(
+			`trending: ${project.name}: filed scout card ${task.id} with ${candidates.length} candidate(s)`,
+		);
+		return task.id;
+	}
+
+	/** Looks every wanted repo up in a bounded pool; skipped repos are logged, not dropped. */
+	async function lookupFacts(
+		wanted: string[],
+	): Promise<Map<string, RepoLookup>> {
+		const facts = new Map<string, RepoLookup>();
+		const looked = await pool(wanted, CONCURRENCY, lookup);
+		wanted.forEach((repo, i) => {
+			const f = looked[i] as RepoLookup;
+			if ("skip" in f) deps.log(`trending: ${repo}: skipped, ${f.skip}`);
+			facts.set(repo, f);
+		});
+		return facts;
+	}
+
+	/** Projects with no open scout card; open ones are logged. */
+	function eligibleProjects(projects: TrendingProject[]): TrendingProject[] {
+		return projects.filter((p) => {
+			const live = liveScout(p.store);
+			if (live)
+				deps.log(
+					`trending: ${p.name}: skipped, scout card ${live.id} is still open`,
+				);
+			return live === null;
+		});
+	}
+
+	/** A pick's lookup, with its trending flags; skipped or failed lookups drop out. */
+	function candidatesFor(
+		picks: {
+			repo: string;
+			trendingNow: boolean;
+			earlierReason: string | null;
+		}[],
+		facts: Map<string, RepoLookup>,
+	): (RepoLookup & {
+		trendingNow: boolean;
+		earlierReason: string | null;
+	})[] {
+		return picks.flatMap((x) => {
+			const f = facts.get(x.repo);
+			if (!f || "skip" in f) return [];
+			return [
+				{ ...f, trendingNow: x.trendingNow, earlierReason: x.earlierReason },
+			];
+		});
+	}
+
+	/** New trending repos, deduped across pages in page order. */
+	function mergeTrending(pages: string[][]): {
+		trending: string[];
+		seen: Set<string>;
+	} {
+		const trending: string[] = [];
+		const seen = new Set<string>();
+		for (const repos of pages)
+			for (const r of repos)
+				if (!seen.has(r)) {
+					seen.add(r);
+					trending.push(r);
+				}
+		return { trending, seen };
 	}
 
 	/**
@@ -353,124 +542,28 @@ export function createTrendingScanner(deps: {
 	 */
 	async function scan(projects: TrendingProject[]): Promise<string[]> {
 		const startedAt = now();
-		const eligible = projects.filter((p) => {
-			const live = liveScout(p.store);
-			if (live)
-				deps.log(
-					`trending: ${p.name}: skipped, scout card ${live.id} is still open`,
-				);
-			return live === null;
-		});
+		const eligible = eligibleProjects(projects);
 		if (eligible.length === 0) return [];
 
-		const trending: string[] = [];
-		const seen = new Set<string>();
 		const pages = await Promise.all(TRENDING_PAGES.map(fetchPage));
-		for (const repos of pages)
-			for (const r of repos)
-				if (!seen.has(r)) {
-					seen.add(r);
-					trending.push(r);
-				}
+		const { trending, seen } = mergeTrending(pages);
 
 		// Per project: trending repos without a final verdict, then every deferred repo.
-		const plans = eligible.map((p) => {
-			const verdicts = p.store.listTrendingVerdicts();
-			const byRepo = new Map(verdicts.map((v) => [v.repo.toLowerCase(), v]));
-			const picks: {
-				repo: string;
-				trendingNow: boolean;
-				earlierReason: string | null;
-			}[] = [];
-			for (const repo of trending) {
-				const v = byRepo.get(repo);
-				if (v && v.verdict !== "deferred") continue;
-				picks.push({
-					repo,
-					trendingNow: true,
-					earlierReason: v ? v.reason : null,
-				});
-			}
-			for (const v of verdicts) {
-				const repo = v.repo.toLowerCase();
-				if (v.verdict !== "deferred" || seen.has(repo) || !validRepo(repo))
-					continue;
-				picks.push({ repo, trendingNow: false, earlierReason: v.reason });
-			}
-			const hints = verdicts
-				.filter((v) => v.verdict === "no_fit" && v.rejectedByUser)
-				.map((v) => ({ repo: v.repo, reason: v.reason }));
-			return { project: p, picks, hints };
-		});
+		const plans = eligible.map((p) => planFor(p, trending, seen));
 
-		const wanted = [
+		const facts = await lookupFacts([
 			...new Set(plans.flatMap((pl) => pl.picks.map((x) => x.repo))),
-		];
-		const facts = new Map<string, RepoLookup>();
-		const looked = await pool(wanted, CONCURRENCY, lookup);
-		wanted.forEach((repo, i) => {
-			const f = looked[i] as RepoLookup;
-			if ("skip" in f) deps.log(`trending: ${repo}: skipped, ${f.skip}`);
-			facts.set(repo, f);
-		});
+		]);
 
 		const filed: string[] = [];
 		for (const { project, picks, hints } of plans) {
-			const candidates = picks.flatMap((x) => {
-				const f = facts.get(x.repo);
-				if (!f || "skip" in f) return [];
-				return [
-					{ ...f, trendingNow: x.trendingNow, earlierReason: x.earlierReason },
-				];
-			});
-			if (candidates.length === 0) {
-				deps.log(`trending: ${project.name}: no new candidates, no card`);
-				continue;
-			}
-			// The task data dir, not serverDir: a worker runs the scout (D6), and only the data dir
-			// is mounted there. writeBelow follows no symlink a worker planted under the data root.
-			const bundlePath = join(
-				project.store.tasksDir,
-				"trending",
-				`${startedAt}.json`,
+			const id = fileScoutCard(
+				project,
+				candidatesFor(picks, facts),
+				hints,
+				startedAt,
 			);
-			writeBelow(
-				project.store.dataRoot,
-				bundlePath,
-				JSON.stringify(
-					{
-						project: project.name,
-						github: project.github,
-						scannedAt: startedAt,
-						pages: TRENDING_PAGES,
-						candidates,
-						hints,
-					},
-					null,
-					2,
-				),
-			);
-			const task = project.store.createTask(
-				trendingScoutPrompt({
-					project: project.name,
-					repo: project.github,
-					bundlePath,
-					candidates: candidates.length,
-					cap: TRENDING_CAP,
-					maxDeep: DEEP_REPOS,
-					maxFiles: DEEP_FILES,
-				}),
-				null,
-				"trending",
-			);
-			project.store.updateTask(task.id, {
-				title: `Trending scout: ${localDate(startedAt)}`,
-				topic: "trending scout",
-			});
-			deps.log(
-				`trending: ${project.name}: filed scout card ${task.id} with ${candidates.length} candidate(s)`,
-			);
-			filed.push(task.id);
+			if (id !== null) filed.push(id);
 		}
 		if (filed.length > 0) deps.schedule();
 		return filed;

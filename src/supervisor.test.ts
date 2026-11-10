@@ -74,6 +74,38 @@ interface FakeOps extends SupervisorOps {
 	sweepUrls: string[];
 }
 
+/** The `gh pr ...` stub answer for one ops snapshot. */
+function ghPr(ops: FakeOps) {
+	ops.prCalls += 1;
+	if (ops.prResult instanceof Error) throw ops.prResult;
+	return ops.prResult ?? { code: 0, stdout: "[]", stderr: "" };
+}
+
+/** The `gh run view ...` stub answer for one ops snapshot. */
+function ghRunView(ops: FakeOps) {
+	ops.runViewCalls += 1;
+	if (ops.runViewResult instanceof Error) throw ops.runViewResult;
+	return (
+		ops.runViewResult ?? {
+			code: 1,
+			stdout: "",
+			stderr: "run view not stubbed",
+		}
+	);
+}
+
+/** The `gh api ...` stub answer for one ops snapshot; null falls through to ghResult. */
+function ghApi(
+	ops: FakeOps,
+	args: string[],
+): { code: number; stdout: string; stderr: string } | undefined {
+	ops.apiCalls.push(args);
+	const r = ops.apiResult?.(args[1] ?? "");
+	if (r === undefined || r === null) return undefined;
+	if (r instanceof Error) throw r;
+	return r;
+}
+
 function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 	const ops: FakeOps = {
 		calls: { remove: [], quarantine: [], fetches: [], scheduled: 0 },
@@ -123,30 +155,12 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		gh: async (args) => {
 			// Dependabot polls use `gh pr ...`; the CI watch uses `gh api ...` and one
 			// `gh run view ...` per failed run when it files a follow-up.
-			if (args[0] === "pr") {
-				ops.prCalls += 1;
-				if (ops.prResult instanceof Error) throw ops.prResult;
-				return ops.prResult ?? { code: 0, stdout: "[]", stderr: "" };
-			}
-			if (args[0] === "run") {
-				ops.runViewCalls += 1;
-				if (ops.runViewResult instanceof Error) throw ops.runViewResult;
-				return (
-					ops.runViewResult ?? {
-						code: 1,
-						stdout: "",
-						stderr: "run view not stubbed",
-					}
-				);
-			}
+			if (args[0] === "pr") return ghPr(ops);
+			if (args[0] === "run") return ghRunView(ops);
 			ops.ghCalls += 1;
 			if (args[0] === "api") {
-				ops.apiCalls.push(args);
-				const r = ops.apiResult?.(args[1] ?? "");
-				if (r !== undefined && r !== null) {
-					if (r instanceof Error) throw r;
-					return r;
-				}
+				const r = ghApi(ops, args);
+				if (r !== undefined) return r;
 			}
 			if (ops.ghResult instanceof Error) throw ops.ghResult;
 			return ops.ghResult ?? { code: 0, stdout: "", stderr: "" };

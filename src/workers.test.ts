@@ -1066,7 +1066,7 @@ describe("runWorker", () => {
 		});
 		const redir = Bun.serve({
 			port: 0,
-			fetch: () => Response.redirect(bounce.url.origin + "/run", 302),
+			fetch: () => Response.redirect(`${bounce.url.origin}/run`, 302),
 		});
 		servers.push(bounce, redir as Bun.Server<never>);
 		const sink = fakeSink();
@@ -1753,7 +1753,7 @@ describe("detach protocol", () => {
 			port: 0,
 			// Same-host bounce: the message names the redirect but must not blame
 			// a proxy.
-			fetch: (req) => Response.redirect(new URL(req.url).origin + "/run", 302),
+			fetch: (req) => Response.redirect(`${new URL(req.url).origin}/run`, 302),
 		});
 		servers.push(redir as Bun.Server<never>);
 		const err = await detachedRuns(`http://127.0.0.1:${redir.port}`).catch(

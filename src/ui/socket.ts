@@ -28,51 +28,68 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
 	const m = data as Record<string, unknown>; // shape checked field by field below
 	if (typeof m.type !== "string") return null;
 	switch (m.type) {
-		case "state": {
-			const s = m.state;
-			if (typeof s !== "object" || s === null) return null;
-			const st = s as Record<string, unknown>;
-			if (
-				!Array.isArray(st.tasks) ||
-				!Array.isArray(st.projects) ||
-				typeof st.serverVersion !== "string"
-			)
-				return null;
-			return { type: "state", state: st as unknown as StateResponse }; // server-produced frame; the fields the UI dereferences first are checked above
-		}
-		case "system": {
-			const s = m.system;
-			if (typeof s !== "object" || s === null) return null;
-			const sy = s as Record<string, unknown>;
-			if (
-				typeof sy.at !== "number" ||
-				!Array.isArray(sy.containers) ||
-				typeof sy.vm !== "object" ||
-				sy.vm === null ||
-				typeof sy.holds !== "object" ||
-				sy.holds === null
-			)
-				return null;
-			return { type: "system", system: sy as unknown as SystemSnapshot }; // server-produced frame; the fields the UI dereferences first are checked above
-		}
+		case "state":
+			return stateMessage(m);
+		case "system":
+			return systemMessage(m);
 		case "update":
-			if (
-				typeof m.behind !== "number" ||
-				!Number.isFinite(m.behind) ||
-				!Array.isArray(m.commits) ||
-				!m.commits.every((c) => typeof c === "string")
-			)
-				return null;
-			return { type: "update", behind: m.behind, commits: m.commits };
+			return updateMessage(m);
 		case "log":
-			if (typeof m.project !== "string" || typeof m.id !== "string")
-				return null;
-			return { type: "log", project: m.project, id: m.id };
+			return logMessage(m);
 		case "ping":
 			return { type: "ping" };
 		default:
 			return null;
 	}
+}
+
+/** The "state" frame, when its state field carries tasks, projects and a server version. */
+function stateMessage(m: Record<string, unknown>): ServerMessage | null {
+	const s = m.state;
+	if (typeof s !== "object" || s === null) return null;
+	const st = s as Record<string, unknown>;
+	if (
+		!Array.isArray(st.tasks) ||
+		!Array.isArray(st.projects) ||
+		typeof st.serverVersion !== "string"
+	)
+		return null;
+	return { type: "state", state: st as unknown as StateResponse }; // server-produced frame; the fields the UI dereferences first are checked above
+}
+
+/** The "system" frame, when its system field carries at, containers, vm and holds. */
+function systemMessage(m: Record<string, unknown>): ServerMessage | null {
+	const s = m.system;
+	if (typeof s !== "object" || s === null) return null;
+	const sy = s as Record<string, unknown>;
+	if (
+		typeof sy.at !== "number" ||
+		!Array.isArray(sy.containers) ||
+		typeof sy.vm !== "object" ||
+		sy.vm === null ||
+		typeof sy.holds !== "object" ||
+		sy.holds === null
+	)
+		return null;
+	return { type: "system", system: sy as unknown as SystemSnapshot }; // server-produced frame; the fields the UI dereferences first are checked above
+}
+
+/** The "update" frame, when behind is a finite number and commits is a string list. */
+function updateMessage(m: Record<string, unknown>): ServerMessage | null {
+	if (
+		typeof m.behind !== "number" ||
+		!Number.isFinite(m.behind) ||
+		!Array.isArray(m.commits) ||
+		!m.commits.every((c) => typeof c === "string")
+	)
+		return null;
+	return { type: "update", behind: m.behind, commits: m.commits };
+}
+
+/** The "log" frame, when project and id are strings. */
+function logMessage(m: Record<string, unknown>): ServerMessage | null {
+	if (typeof m.project !== "string" || typeof m.id !== "string") return null;
+	return { type: "log", project: m.project, id: m.id };
 }
 
 /** Exponential backoff with a 5 s ceiling: 500, 1000, 2000, 4000, then 5000 forever. */

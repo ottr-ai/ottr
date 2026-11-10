@@ -720,6 +720,22 @@ function isBusy(err: unknown): boolean {
 	return err instanceof SQLiteError && (err.errno & 0xff) === 5;
 }
 
+/** Can this process take a write lock on the db? false when another process holds it. */
+function probeWriteLock(dbPath: string): boolean {
+	const db = new Database(dbPath);
+	try {
+		db.exec("PRAGMA busy_timeout = 0");
+		db.exec("BEGIN IMMEDIATE");
+		db.exec("ROLLBACK");
+	} catch (err) {
+		if (isBusy(err)) return false;
+		throw err;
+	} finally {
+		db.close();
+	}
+	return true;
+}
+
 /** First db under `root` (a project's tasks.db, the state's tracker.db) that another
  * process holds, or null. A live board keeps every db it opened under an EXCLUSIVE
  * lock (src/dblock.ts), so one held file means a board already runs on this root. */
@@ -730,20 +746,29 @@ export function heldDb(root: string): string | null {
 		for (const file of ["tasks.db", "tracker.db"]) {
 			const dbPath = join(root, entry.name, ".tasks", file);
 			if (!existsSync(dbPath)) continue;
-			const db = new Database(dbPath);
-			try {
-				db.exec("PRAGMA busy_timeout = 0");
-				db.exec("BEGIN IMMEDIATE");
-				db.exec("ROLLBACK");
-			} catch (err) {
-				if (isBusy(err)) return dbPath;
-				throw err;
-			} finally {
-				db.close();
-			}
+			if (!probeWriteLock(dbPath)) return dbPath;
 		}
 	}
 	return null;
+}
+
+/** One db's refresh with busy retries: a held db is skipped with a warning after a few tries. */
+function refreshWithRetry(dbPath: string, now: number): void {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			refreshProject(dbPath, now);
+			return;
+		} catch (err) {
+			if (!isBusy(err)) throw err;
+			if (attempt >= BUSY_TRIES) {
+				console.warn(
+					`demo seed: ${dbPath} is locked by another process, live clocks not refreshed`,
+				);
+				return;
+			}
+			Bun.sleepSync(BUSY_SLEEP_MS);
+		}
+	}
 }
 
 /** Keep live clocks plausible on an existing board: running/preparing cards restarted a
@@ -755,21 +780,7 @@ function refreshLive(root: string, names: string[]): void {
 	for (const name of names) {
 		const dbPath = join(root, name, ".tasks", "tasks.db");
 		if (!existsSync(dbPath)) continue;
-		for (let attempt = 1; ; attempt++) {
-			try {
-				refreshProject(dbPath, now);
-				break;
-			} catch (err) {
-				if (!isBusy(err)) throw err;
-				if (attempt >= BUSY_TRIES) {
-					console.warn(
-						`demo seed: ${dbPath} is locked by another process, live clocks not refreshed`,
-					);
-					break;
-				}
-				Bun.sleepSync(BUSY_SLEEP_MS);
-			}
-		}
+		refreshWithRetry(dbPath, now);
 	}
 }
 

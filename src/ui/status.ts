@@ -36,9 +36,9 @@ export function strykerProgress(text: string | null | undefined): {
 	const m = /^(\S+) (\d+)% · (\d+)\/(\d+)(?: · (.+))?$/.exec(
 		(text ?? "").trim(),
 	);
-	if (m === null) return null;
+	if (m === null || m[1] === undefined) return null;
 	return {
-		tool: m[1]!,
+		tool: m[1],
 		pct: Number(m[2]),
 		tested: Number(m[3]),
 		total: Number(m[4]),
@@ -63,7 +63,8 @@ export function strykerStats(rest: string): Array<{
 		if (survived !== null)
 			return { label: "Survived", value: `${survived[1]} (${survived[2]})` };
 		const timedOut = /^(\d+) timed out$/.exec(part);
-		if (timedOut !== null) return { label: "Timed out", value: timedOut[1]! };
+		if (timedOut !== null && timedOut[1] !== undefined)
+			return { label: "Timed out", value: timedOut[1] };
 		return { label: "", value: part };
 	});
 }
@@ -112,7 +113,76 @@ export function holdLeft(
 	const time = left < 60_000 ? "<1m" : until(holdUntil, now);
 	const named =
 		reason === null ? null : /^The (\S+) usage limit is reached/.exec(reason);
-	return `held · ${named === null ? "" : `${named[1]!} limit · `}${time} left`;
+	const holder = named?.[1];
+	return `held · ${holder === undefined ? "" : `${holder} limit · `}${time} left`;
+}
+
+/** The statusLine words for a queued card that keeps a reason: a future holdUntil counts
+ *  down (a usage limit), the rest shows the card as resuming with the reason on record. */
+function queuedHoldLine(holdUntil: number | null, reason: string): string {
+	// A future holdUntil holds the card (a usage limit): count down instead of
+	// the raw reset stamp the reason carries.
+	if (holdUntil !== null && holdUntil > Date.now())
+		return holdLeft(holdUntil, Date.now(), reason) ?? reason;
+	return "resuming";
+}
+
+/** The statusLine words for a queued card: a re-queued card counts its hold down or names
+ *  the tracker's reason, a pending reply waits for a slot (for the restart while draining),
+ *  and the rest wait for rules, their merge hold, or a free slot. */
+function queuedLine(
+	t: Pick<
+		TaskCard,
+		| "cancelledAt"
+		| "state"
+		| "stage"
+		| "needsReason"
+		| "pendingPrompt"
+		| "holdUntil"
+		| "id"
+	>,
+	hasRules: boolean,
+	hold: string | null | undefined,
+	drain: boolean,
+	tasks:
+		| readonly (ReviewTask & Pick<Task, "title" | "state" | "queuedAt">)[]
+		| undefined,
+): string {
+	if (t.stage === "backlog") return "grill queued";
+	if (t.needsReason !== null) return queuedHoldLine(t.holdUntil, t.needsReason);
+	if (t.pendingPrompt !== null)
+		return drain
+			? "reply queued · waits for the update restart"
+			: "reply queued · waits for a free slot";
+	if (t.stage === "todo" && !hasRules) return "waiting for rules";
+	if (
+		(t.stage === "merging" ||
+			t.stage === "todo" ||
+			t.stage === "in_progress") &&
+		hold
+	)
+		return hold;
+	return drain
+		? "waiting for the update restart"
+		: (queuePosition(tasks ?? [], t) ?? "queued");
+}
+
+/** The statusLine words for an idle card: the backlog, the merge wait (never "done" —
+ *  fix list #35), or the tracker's reason. */
+function idleLine(
+	t: Pick<TaskCard, "stage" | "needsReason" | "prNumber" | "pushSha">,
+): string {
+	if (t.stage === "backlog") return "in backlog";
+	// PR mode parks the card here while its pull request waits for review and merge
+	// (fix list #35): never "done". pushSha is the CI watch's pin on the PR head, so a
+	// set sha names the pending CI verdict; a cleared one leaves the plain merge wait.
+	if (t.stage === "merging" && t.prNumber !== null) {
+		if (t.needsReason !== null) return t.needsReason;
+		return t.pushSha !== null
+			? `PR #${t.prNumber} open · waiting for CI`
+			: `PR #${t.prNumber} open · waiting for merge`;
+	}
+	return t.needsReason ?? "done";
 }
 
 export function statusLine(
@@ -144,48 +214,14 @@ export function statusLine(
 	// A cancelled card is final; the card's "Cancelled" chip carries the time.
 	if (t.cancelledAt !== null) return "cancelled";
 	// A queued card that keeps a reason was queued again by the tracker (restart, background-job exit).
-	if (t.state === "queued")
-		return t.stage === "backlog"
-			? "grill queued"
-			: t.needsReason !== null
-				? // A future holdUntil holds the card (a usage limit): count down instead of
-					// the raw reset stamp the reason carries.
-					t.holdUntil !== null && t.holdUntil > Date.now()
-					? (holdLeft(t.holdUntil, Date.now(), t.needsReason) ?? t.needsReason)
-					: "resuming"
-				: t.pendingPrompt !== null
-					? drain
-						? "reply queued · waits for the update restart"
-						: "reply queued · waits for a free slot"
-					: t.stage === "todo" && !hasRules
-						? "waiting for rules"
-						: (t.stage === "merging" ||
-									t.stage === "todo" ||
-									t.stage === "in_progress") &&
-								hold
-							? hold
-							: drain
-								? "waiting for the update restart"
-								: (queuePosition(tasks ?? [], t) ?? "queued");
+	if (t.state === "queued") return queuedLine(t, hasRules, hold, drain, tasks);
 	if (t.state === "preparing") return "preparing";
 	if (t.state === "running")
 		return t.progress ?? reviewProgress(tasks ?? [], t) ?? "running";
 	if (t.state === "needs_you")
 		return t.asked !== null ? "question asked" : "action required";
 	// A review card parked while its findings land: the reason is the status.
-	if (t.state === "idle") {
-		if (t.stage === "backlog") return "in backlog";
-		// PR mode parks the card here while its pull request waits for review and merge
-		// (fix list #35): never "done". pushSha is the CI watch's pin on the PR head, so a
-		// set sha names the pending CI verdict; a cleared one leaves the plain merge wait.
-		if (t.stage === "merging" && t.prNumber !== null) {
-			if (t.needsReason !== null) return t.needsReason;
-			return t.pushSha !== null
-				? `PR #${t.prNumber} open · waiting for CI`
-				: `PR #${t.prNumber} open · waiting for merge`;
-		}
-		return t.needsReason ?? "done";
-	}
+	if (t.state === "idle") return idleLine(t);
 	return "done";
 }
 

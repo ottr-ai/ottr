@@ -864,27 +864,34 @@ function monthBefore(at: number): number {
 	);
 }
 
+/** Length of l's quota window in ms: the numeric window id ("5h", "7d") first, then the
+ *  limit label's named unit ("5 Hours"), then the calendar window ("monthly" spans from
+ *  one month before resetsAt in UTC). null when none names a length. */
+function windowLengthMs(l: QuotaLimit): number | null {
+	if (l.resetsAt === null) return null;
+	const id = /^(\d+)([mhdw])$/.exec(l.window ?? "");
+	if (id !== null)
+		return Number(id[1]) * WINDOW_UNIT_MS[id[2] as keyof typeof WINDOW_UNIT_MS];
+	const named = /(\d+)\s*(hour|day|week)/i.exec(l.label);
+	const unit = named?.[2]?.[0]?.toLowerCase();
+	if (named !== null && (unit === "h" || unit === "d" || unit === "w"))
+		return Number(named[1]) * WINDOW_UNIT_MS[unit];
+	const calendar = /(daily|weekly|monthly)/i
+		.exec(`${l.window ?? ""} ${l.windowLabel ?? ""} ${l.label}`)?.[1]
+		?.toLowerCase();
+	if (calendar === "monthly") return l.resetsAt - monthBefore(l.resetsAt);
+	if (calendar !== undefined)
+		return WINDOW_UNIT_MS[calendar === "daily" ? "d" : "w"];
+	return null;
+}
+
 /** Share of a quota window that has passed, 0-100: from omp's window id ("5h", "7d", or the
  *  named "daily", "weekly", "monthly" ids), or, when omp names no id, the window label and the
  *  limit label ("5 Hours", "7 Day", "Weekly", "Monthly"). A named monthly window is one calendar
  *  month: it starts one month before resetsAt in UTC. Null when the length or the reset is unknown. */
 export function windowGone(l: QuotaLimit, now: number): number | null {
 	if (l.resetsAt === null) return null;
-	const id = /^(\d+)([mhdw])$/.exec(l.window ?? "");
-	const named = /(\d+)\s*(hour|day|week)/i.exec(l.label);
-	const calendar = /(daily|weekly|monthly)/i
-		.exec(`${l.window ?? ""} ${l.windowLabel ?? ""} ${l.label}`)?.[1]
-		?.toLowerCase();
-	const ms = id
-		? Number(id[1]) * WINDOW_UNIT_MS[id[2] as keyof typeof WINDOW_UNIT_MS]
-		: named
-			? Number(named[1]) *
-				WINDOW_UNIT_MS[named[2]![0]!.toLowerCase() as "h" | "d" | "w"]
-			: calendar === "monthly"
-				? l.resetsAt - monthBefore(l.resetsAt)
-				: calendar !== undefined
-					? WINDOW_UNIT_MS[calendar === "daily" ? "d" : "w"]
-					: null;
+	const ms = windowLengthMs(l);
 	if (ms === null || ms <= 0) return null;
 	return clamp(100 - ((l.resetsAt - now) / ms) * 100, 0, 100);
 }
@@ -1331,29 +1338,47 @@ export function ZoomableImage({ src, alt }: { src: string; alt: string }) {
 		return () => wrap.removeEventListener("wheel", onWheel);
 	}, [applyZoom, zoom]);
 
+	/** The zoom reset or tap-zoom a second tap within ZOOM_TAP_MS applies; false when e
+	 *  is not that second tap, so the caller records it as a first tap instead. */
+	const zoomDoubleTap = (e: React.PointerEvent<HTMLDivElement>): boolean => {
+		const prev = lastTap.current;
+		if (
+			prev === null ||
+			prev.type !== e.pointerType ||
+			e.timeStamp - prev.t >= ZOOM_TAP_MS ||
+			Math.hypot(e.clientX - prev.x, e.clientY - prev.y) >= ZOOM_TAP_PX
+		)
+			return false;
+		lastTap.current = null;
+		if (zoom.scale > 1) {
+			setZoom({ scale: 1, x: 0, y: 0 });
+			return true;
+		}
+		const img = imgRef.current;
+		if (img !== null) {
+			const rect = img.getBoundingClientRect();
+			applyZoom(zoomAt(zoom, rect, e.clientX, e.clientY, ZOOM_TAP_TARGET));
+		}
+		return true;
+	};
+
+	/** Pinch bookkeeping for the tracked pointers: the span's distance and midpoint. */
+	const startPinch = (base: ZoomState) => {
+		const [a, b] = [...pointers.current.values()];
+		if (a === undefined || b === undefined) return;
+		pinch.current = {
+			dist: Math.hypot(a.x - b.x, a.y - b.y),
+			mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+			zoom: base,
+		};
+		pan.current = null;
+	};
+
 	const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
 		if (e.target !== imgRef.current) return;
 		pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 		wrapRef.current?.setPointerCapture(e.pointerId);
-		const prev = lastTap.current;
-		if (
-			prev !== null &&
-			prev.type === e.pointerType &&
-			e.timeStamp - prev.t < ZOOM_TAP_MS &&
-			Math.hypot(e.clientX - prev.x, e.clientY - prev.y) < ZOOM_TAP_PX
-		) {
-			lastTap.current = null;
-			if (zoom.scale > 1) {
-				setZoom({ scale: 1, x: 0, y: 0 });
-			} else {
-				const img = imgRef.current;
-				if (img !== null) {
-					const rect = img.getBoundingClientRect();
-					applyZoom(zoomAt(zoom, rect, e.clientX, e.clientY, ZOOM_TAP_TARGET));
-				}
-			}
-			return;
-		}
+		if (zoomDoubleTap(e)) return;
 		lastTap.current = {
 			t: e.timeStamp,
 			x: e.clientX,
@@ -1364,15 +1389,48 @@ export function ZoomableImage({ src, alt }: { src: string; alt: string }) {
 			pan.current = { px: e.clientX, py: e.clientY, zoom };
 			setPanning(true);
 		} else if (pointers.current.size === 2) {
-			const [a, b] = [...pointers.current.values()];
-			if (a === undefined || b === undefined) return;
-			pinch.current = {
-				dist: Math.hypot(a.x - b.x, a.y - b.y),
-				mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
-				zoom,
-			};
-			pan.current = null;
+			startPinch(zoom);
 		}
+	};
+
+	/** The pinch step: zoom around the new midpoint by the distance ratio. */
+	const movePinch = (pts: { x: number; y: number }[]) => {
+		const [a, b] = pts;
+		if (a === undefined || b === undefined) return;
+		const dist = Math.hypot(a.x - b.x, a.y - b.y);
+		const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+		const img = imgRef.current;
+		if (img === null || pinch.current === null || pinch.current.dist === 0)
+			return;
+		const rect = img.getBoundingClientRect();
+		const next = zoomAt(
+			pinch.current.zoom,
+			rect,
+			mid.x,
+			mid.y,
+			pinch.current.zoom.scale * (dist / pinch.current.dist),
+		);
+		applyZoom({
+			...next,
+			x: next.x + mid.x - pinch.current.mid.x,
+			y: next.y + mid.y - pinch.current.mid.y,
+		});
+		pinch.current = { dist, mid, zoom: pinch.current.zoom };
+	};
+
+	/** The pan step: translate the image by the one tracked pointer's move. */
+	const movePan = (e: React.PointerEvent<HTMLDivElement>) => {
+		if (pan.current === null) return;
+		applyZoom({
+			...pan.current.zoom,
+			x: pan.current.zoom.x + e.clientX - pan.current.px,
+			y: pan.current.zoom.y + e.clientY - pan.current.py,
+		});
+		pan.current = {
+			px: e.clientX,
+			py: e.clientY,
+			zoom: pan.current.zoom,
+		};
 	};
 
 	const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -1380,37 +1438,9 @@ export function ZoomableImage({ src, alt }: { src: string; alt: string }) {
 		pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 		const pts = [...pointers.current.values()];
 		if (pinch.current !== null && pts.length >= 2) {
-			const [a, b] = pts;
-			if (a === undefined || b === undefined) return;
-			const dist = Math.hypot(a.x - b.x, a.y - b.y);
-			const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-			const img = imgRef.current;
-			if (img === null || pinch.current.dist === 0) return;
-			const rect = img.getBoundingClientRect();
-			const next = zoomAt(
-				pinch.current.zoom,
-				rect,
-				mid.x,
-				mid.y,
-				pinch.current.zoom.scale * (dist / pinch.current.dist),
-			);
-			applyZoom({
-				...next,
-				x: next.x + mid.x - pinch.current.mid.x,
-				y: next.y + mid.y - pinch.current.mid.y,
-			});
-			pinch.current = { dist, mid, zoom: pinch.current.zoom };
+			movePinch(pts);
 		} else if (pan.current !== null && pts.length === 1) {
-			applyZoom({
-				...pan.current.zoom,
-				x: pan.current.zoom.x + e.clientX - pan.current.px,
-				y: pan.current.zoom.y + e.clientY - pan.current.py,
-			});
-			pan.current = {
-				px: e.clientX,
-				py: e.clientY,
-				zoom: pan.current.zoom,
-			};
+			movePan(e);
 		}
 	};
 

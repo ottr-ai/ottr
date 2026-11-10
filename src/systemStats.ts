@@ -161,6 +161,53 @@ function readPss(path: string): number {
 	return kb === undefined ? 0 : (parseCount(kb) ?? 0) * 1024;
 }
 
+/** Map of pid → stat ticks and pid → child pids, from one read of every /proc/<pid>/stat
+ *  under procRoot. A pid whose stat or smaps_rollup is unreadable (it exited, or permission)
+ *  adds nothing. */
+function procTrees(
+	names: string[],
+	procRoot: string,
+): { ticks: Map<number, number>; children: Map<number, number[]> } {
+	const ticks = new Map<number, number>();
+	const children = new Map<number, number[]>();
+	for (const name of names) {
+		const pid = parseCount(name);
+		if (pid === null) continue;
+		const text = readText(join(procRoot, name, "stat"));
+		const stat = text === null ? null : parsePidStat(text);
+		if (stat === null) continue;
+		ticks.set(pid, stat.ticks);
+		const siblings = children.get(stat.ppid);
+		if (siblings) siblings.push(pid);
+		else children.set(stat.ppid, [pid]);
+	}
+	return { ticks, children };
+}
+
+/** Total smaps Pss and CPU ticks of one process tree (the root pid plus every descendant,
+ *  a walk over ppid). A tree member that exited between the readdir and its reads adds nothing. */
+function treeUsage(
+	rootPid: number,
+	procRoot: string,
+	ticks: Map<number, number>,
+	children: Map<number, number[]>,
+): { memBytes: number; treeTicks: number } {
+	let memBytes = 0;
+	let treeTicks = 0;
+	const seen = new Set<number>();
+	const queue = [rootPid];
+	while (queue.length > 0) {
+		const pid = queue.pop();
+		if (pid === undefined) break;
+		if (seen.has(pid)) continue;
+		seen.add(pid);
+		treeTicks += ticks.get(pid) ?? 0;
+		memBytes += readPss(join(procRoot, String(pid), "smaps_rollup"));
+		queue.push(...(children.get(pid) ?? []));
+	}
+	return { memBytes, treeTicks };
+}
+
 /** Each run's process tree (its root pid plus every descendant, a walk over ppid) from one read
  *  of every /proc/<pid>/stat under procRoot. A tree member whose stat or smaps_rollup is
  *  unreadable (it exited, or permission) adds nothing; a run whose root has no readable stat
@@ -176,34 +223,16 @@ export function readRunUsage(
 	} catch {
 		return [];
 	}
-	const ticks = new Map<number, number>();
-	const children = new Map<number, number[]>();
-	for (const name of names) {
-		const pid = parseCount(name);
-		if (pid === null) continue;
-		const text = readText(join(procRoot, name, "stat"));
-		const stat = text === null ? null : parsePidStat(text);
-		if (stat === null) continue;
-		ticks.set(pid, stat.ticks);
-		const siblings = children.get(stat.ppid);
-		if (siblings) siblings.push(pid);
-		else children.set(stat.ppid, [pid]);
-	}
+	const { ticks, children } = procTrees(names, procRoot);
 	const out: RunUsage[] = [];
 	for (const run of runs) {
 		if (!ticks.has(run.pid)) continue;
-		let memBytes = 0;
-		let treeTicks = 0;
-		const seen = new Set<number>();
-		const queue = [run.pid];
-		while (queue.length > 0) {
-			const pid = queue.pop()!;
-			if (seen.has(pid)) continue;
-			seen.add(pid);
-			treeTicks += ticks.get(pid) ?? 0;
-			memBytes += readPss(join(procRoot, String(pid), "smaps_rollup"));
-			queue.push(...(children.get(pid) ?? []));
-		}
+		const { memBytes, treeTicks } = treeUsage(
+			run.pid,
+			procRoot,
+			ticks,
+			children,
+		);
 		out.push({ id: run.id, memBytes, cpuUsec: treeTicks * USEC_PER_TICK });
 	}
 	return out;
@@ -253,8 +282,11 @@ export function parseProcStat(text: string | null): VmReading["cpuTicks"] {
 	const fields = line.trim().split(/\s+/).slice(1, 9).map(parseCount);
 	if (fields.length < 5 || fields.some((f) => f === null)) return null;
 	const ticks = fields as number[];
+	const idle = ticks[3];
+	const iowait = ticks[4];
+	if (idle === undefined || iowait === undefined) return null;
 	return {
-		idle: ticks[3]! + ticks[4]!,
+		idle: idle + iowait,
 		total: ticks.reduce((s, t) => s + t, 0),
 	};
 }
@@ -300,6 +332,60 @@ const isCountOrNull = (v: unknown): v is number | null =>
 /** A JSON object whose fields are not checked yet. */
 type Unchecked<T> = { [K in keyof T]?: unknown };
 
+/** cpuMax of a /stats body: "max", a {quotaUsec, periodUsec} object, or null. undefined when
+ *  the field has a wrong shape. */
+function parseCpuMaxField(v: unknown): CgroupReading["cpuMax"] | undefined {
+	if (v === "max") return "max";
+	if (v === null) return null;
+	if (typeof v !== "object") return undefined;
+	const m = v as Unchecked<Exclude<CgroupReading["cpuMax"], "max" | null>>;
+	if (!isCount(m.quotaUsec) || !isCount(m.periodUsec) || m.periodUsec === 0)
+		return undefined;
+	return { quotaUsec: m.quotaUsec, periodUsec: m.periodUsec };
+}
+
+/** memoryEvents of a /stats body: null, or {max, oom, oomKill} counts. undefined when the
+ *  field has a wrong shape. */
+function parseMemoryEventsField(
+	v: unknown,
+): CgroupReading["memoryEvents"] | undefined {
+	if (v === null) return null;
+	if (typeof v !== "object") return undefined;
+	const e = v as Unchecked<NonNullable<CgroupReading["memoryEvents"]>>;
+	if (!isCount(e.max) || !isCount(e.oom) || !isCount(e.oomKill))
+		return undefined;
+	return { max: e.max, oom: e.oom, oomKill: e.oomKill };
+}
+
+/** The runs array of a /stats body; [] when the field is absent (a worker image older than
+ *  the runs field omits it during a rolling update: no turns then), null when wrong. */
+function parseRunsField(v: unknown): RunUsage[] | null {
+	if (v === undefined) return [];
+	if (!Array.isArray(v)) return null;
+	const runs: RunUsage[] = [];
+	for (const entry of v) {
+		if (typeof entry !== "object" || entry === null) return null;
+		const u = entry as Unchecked<RunUsage>;
+		if (typeof u.id !== "string" || !isCount(u.memBytes) || !isCount(u.cpuUsec))
+			return null;
+		runs.push({ id: u.id, memBytes: u.memBytes, cpuUsec: u.cpuUsec });
+	}
+	return runs;
+}
+
+/** The lock part of a /stats body; null when the shape is wrong. */
+function parseLockField(v: unknown): CgroupReading["lock"] | null {
+	if (typeof v !== "object" || v === null) return null;
+	const l = v as Unchecked<CgroupReading["lock"]>;
+	if (
+		typeof l.exists !== "boolean" ||
+		typeof l.alive !== "boolean" ||
+		!isCountOrNull(l.pid)
+	)
+		return null;
+	return { exists: l.exists, pid: l.pid, alive: l.alive };
+}
+
 /** Validates a worker's GET /stats JSON body; null when the shape is wrong. */
 export function parseCgroupReading(body: unknown): CgroupReading | null {
 	if (typeof body !== "object" || body === null) return null;
@@ -311,50 +397,14 @@ export function parseCgroupReading(body: unknown): CgroupReading | null {
 		!(b.memoryMax === "max" || isCountOrNull(b.memoryMax))
 	)
 		return null;
-	let cpuMax: CgroupReading["cpuMax"] = null;
-	if (b.cpuMax === "max") cpuMax = "max";
-	else if (b.cpuMax !== null) {
-		if (typeof b.cpuMax !== "object") return null;
-		const m = b.cpuMax as Unchecked<
-			Exclude<CgroupReading["cpuMax"], "max" | null>
-		>;
-		if (!isCount(m.quotaUsec) || !isCount(m.periodUsec) || m.periodUsec === 0)
-			return null;
-		cpuMax = { quotaUsec: m.quotaUsec, periodUsec: m.periodUsec };
-	}
-	let memoryEvents: CgroupReading["memoryEvents"] = null;
-	if (b.memoryEvents !== null) {
-		if (typeof b.memoryEvents !== "object") return null;
-		const e = b.memoryEvents as Unchecked<
-			NonNullable<CgroupReading["memoryEvents"]>
-		>;
-		if (!isCount(e.max) || !isCount(e.oom) || !isCount(e.oomKill)) return null;
-		memoryEvents = { max: e.max, oom: e.oom, oomKill: e.oomKill };
-	}
-	const runs: RunUsage[] = [];
-	// A worker image older than the runs field omits it during a rolling update: no turns then.
-	if (b.runs !== undefined) {
-		if (!Array.isArray(b.runs)) return null;
-		for (const entry of b.runs as unknown[]) {
-			if (typeof entry !== "object" || entry === null) return null;
-			const u = entry as Unchecked<RunUsage>;
-			if (
-				typeof u.id !== "string" ||
-				!isCount(u.memBytes) ||
-				!isCount(u.cpuUsec)
-			)
-				return null;
-			runs.push({ id: u.id, memBytes: u.memBytes, cpuUsec: u.cpuUsec });
-		}
-	}
-	if (typeof b.lock !== "object" || b.lock === null) return null;
-	const l = b.lock as Unchecked<CgroupReading["lock"]>;
-	if (
-		typeof l.exists !== "boolean" ||
-		typeof l.alive !== "boolean" ||
-		!isCountOrNull(l.pid)
-	)
-		return null;
+	const cpuMax = parseCpuMaxField(b.cpuMax);
+	if (cpuMax === undefined) return null;
+	const memoryEvents = parseMemoryEventsField(b.memoryEvents);
+	if (memoryEvents === undefined) return null;
+	const runs = parseRunsField(b.runs);
+	if (runs === null) return null;
+	const lock = parseLockField(b.lock);
+	if (lock === null) return null;
 	return {
 		at: b.at,
 		cpuUsageUsec: b.cpuUsageUsec,
@@ -362,7 +412,7 @@ export function parseCgroupReading(body: unknown): CgroupReading | null {
 		memoryCurrent: b.memoryCurrent,
 		memoryMax: b.memoryMax,
 		memoryEvents,
-		lock: { exists: l.exists, pid: l.pid, alive: l.alive },
+		lock,
 		runs,
 	};
 }
@@ -457,10 +507,10 @@ export function counterGrowth(
 ): number {
 	let growth = 0;
 	for (let i = 1; i < readings.length; i++) {
-		const cur = readings[i]!;
-		if (cur.at < since) continue;
-		const prev = readings[i - 1]!.value;
-		growth += cur.value >= prev ? cur.value - prev : cur.value;
+		const cur = readings[i];
+		const prev = readings[i - 1];
+		if (cur === undefined || cur.at < since || prev === undefined) continue;
+		growth += cur.value >= prev.value ? cur.value - prev.value : cur.value;
 	}
 	return growth;
 }
@@ -513,15 +563,22 @@ export function rowLock(
 	// Only a Stryker status can hold the Stryker lock: runProgress also reports mutate.py runs.
 	const running = runs.filter(
 		(r) =>
-			r.progress !== null &&
-			r.progress.startsWith(STRYKER_PREFIX) &&
+			r.progress?.startsWith(STRYKER_PREFIX) === true &&
 			!r.progress.startsWith(LOCK_WAIT_PREFIX),
 	);
+	const holder = running.length === 1 ? running[0] : undefined;
 	return {
 		holderPid: lock?.exists && lock.alive ? lock.pid : null,
-		holderCard: running.length === 1 ? card(running[0]!) : null,
+		holderCard: holder !== undefined ? card(holder) : null,
 		waiters: waiters.map(card),
 	};
+}
+
+/** CPU share of one reading: the quota/period ratio, the whole VM's CPU count for "max",
+ *  null when the reading carries no cpu.max limit. */
+function cpuShareOf(r: CgroupReading, vmCpus: number): number | null {
+	if (r.cpuMax === null) return null;
+	return r.cpuMax === "max" ? vmCpus : r.cpuMax.quotaUsec / r.cpuMax.periodUsec;
 }
 
 /** One container's state between ticks. */
@@ -571,6 +628,26 @@ function sampleRuns(
 		});
 	}
 	return out;
+}
+
+/** Board turns of one runner, largest memory first. Usage comes only from a reachable row's
+ *  own samples; a server run has no runId, so its usage stays null, and since mem is never
+ *  negative the -1 sort key puts those turns last, the stable sort keeping board order. */
+function turnCards(
+	r: CgroupReading | null,
+	live: readonly LiveRun[],
+	runUsages: Map<string, RunSample>,
+): SystemTurn[] {
+	return live
+		.map((c) => ({
+			project: c.project,
+			id: c.id,
+			usage:
+				r !== null && c.runId !== null
+					? (runUsages.get(c.runId)?.usage ?? null)
+					: null,
+		}))
+		.sort((a, b) => (b.usage?.mem ?? -1) - (a.usage?.mem ?? -1));
 }
 
 export function createSystemSampler(): SystemSampler {
@@ -636,19 +713,7 @@ export function createSystemSampler(): SystemSampler {
 		const history = s.history.filter((p) => p.at >= now - HOUR_MS);
 		const live = runs.filter((run) => run.runner === name);
 		const lock = rowLock(r?.lock ?? null, live);
-		const cards: SystemTurn[] = live
-			.map((c) => ({
-				project: c.project,
-				id: c.id,
-				// Usage only from a reachable row's own samples: a server run has no runId.
-				usage:
-					r !== null && c.runId !== null
-						? (s.runs.get(c.runId)?.usage ?? null)
-						: null,
-			}))
-			// Largest memory first; mem is never negative, so -1 sorts the turns without usage
-			// last, and the stable sort keeps them in board order.
-			.sort((a, b) => (b.usage?.mem ?? -1) - (a.usage?.mem ?? -1));
+		const cards = turnCards(r, live, s.runs);
 		const base = {
 			name,
 			history,
@@ -670,12 +735,7 @@ export function createSystemSampler(): SystemSampler {
 				oomKillsHour: null,
 				warnings: [],
 			};
-		const cpuShare =
-			r.cpuMax === null
-				? null
-				: r.cpuMax === "max"
-					? s.vmCpus
-					: r.cpuMax.quotaUsec / r.cpuMax.periodUsec;
+		const cpuShare = cpuShareOf(r, s.vmCpus);
 		const memLimit = typeof r.memoryMax === "number" ? r.memoryMax : null;
 		const since = now - HOUR_MS;
 		const memMaxHitsHour = r.memoryEvents

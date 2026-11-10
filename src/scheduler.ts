@@ -108,6 +108,32 @@ export function isReview(t: Pick<Task, "kind" | "releaseVersion">): boolean {
 	return t.releaseVersion !== null || t.kind === "review";
 }
 
+/** The follow-up children created before `end`, by the parent they link to. */
+function followUpsByParent<T extends ReviewTask>(
+	tasks: readonly T[],
+	end: number,
+): Map<string, T[]> {
+	const kids = new Map<string, T[]>();
+	for (const t of tasks) {
+		if (t.followUpOf === null || t.createdAt > end) continue;
+		const list = kids.get(t.followUpOf);
+		if (list === undefined) kids.set(t.followUpOf, [t]);
+		else list.push(t);
+	}
+	return kids;
+}
+
+/** Adds `t` when it is new and not terminal: a retro card (R7) and its follow-ups never join. */
+function addIfNew<T extends ReviewTask>(
+	t: T | undefined,
+	seen: Set<string>,
+	found: T[],
+): void {
+	if (t === undefined || seen.has(t.id) || isRetro(t)) return;
+	seen.add(t.id);
+	found.push(t);
+}
+
 /** The review's findings: the cards it filed (create_task links each one to the review as
  * followUpOf), the cards those filed in turn, and every card a finding depends on, so a finding's
  * prerequisite is never held behind the review. Only cards created before the review was done
@@ -118,25 +144,15 @@ export function reviewFindings<T extends ReviewTask>(
 ): T[] {
 	const end = review.doneAt ?? Number.POSITIVE_INFINITY;
 	const byId = new Map(tasks.map((t) => [t.id, t]));
-	const kids = new Map<string, T[]>();
-	for (const t of tasks) {
-		if (t.followUpOf === null || t.createdAt > end) continue;
-		const list = kids.get(t.followUpOf);
-		if (list === undefined) kids.set(t.followUpOf, [t]);
-		else list.push(t);
-	}
+	const kids = followUpsByParent(tasks, end);
 	const seen = new Set([review.id]);
 	const found: T[] = [];
-	const add = (t: T | undefined): void => {
-		// A retro card is terminal (R7): it and its follow-ups never become review findings.
-		if (t === undefined || seen.has(t.id) || isRetro(t)) return;
-		seen.add(t.id);
-		found.push(t);
-	};
-	for (const k of kids.get(review.id) ?? []) add(k);
+	for (const k of kids.get(review.id) ?? []) addIfNew(k, seen, found);
 	// Both loops visit the cards they append: the follow-up chain first, then the dependency closure.
-	for (const f of found) for (const k of kids.get(f.id) ?? []) add(k);
-	for (const f of found) for (const d of f.dependsOn) add(byId.get(d));
+	for (const f of found)
+		for (const k of kids.get(f.id) ?? []) addIfNew(k, seen, found);
+	for (const f of found)
+		for (const d of f.dependsOn) addIfNew(byId.get(d), seen, found);
 	return found;
 }
 
@@ -172,6 +188,29 @@ export function pushHold(
 	return t.pushRetries > 0 || t.pendingBy === "user" ? null : PUSH_HOLD;
 }
 
+/** The hold `merge` waits under while the open review `r` gates the target, else null when
+ * `merge` is exempt (it is `r` itself, or one of `r`'s findings — those never wait). */
+function reviewHoldFor(
+	tasks: readonly ReviewTask[],
+	r: ReviewTask,
+	mergeId: string,
+): string | null {
+	const findings = reviewFindings(tasks, r);
+	if (findings.some((f) => f.id === mergeId)) return null;
+	if (r.releaseVersion !== null && r.stage !== "done")
+		return `waiting for release ${r.releaseVersion}`;
+	if (r.stage === "todo" || r.stage === "in_progress")
+		return "waiting for the review to finish";
+	// Parked at merging until its findings are done (findingsHold); a done review only reaches
+	// this with open findings when it finished before reviews parked.
+	if (
+		r.stage === "merging" ||
+		findings.some((f) => f.cancelledAt === null && f.stage !== "done")
+	)
+		return "waiting for the review's findings to be implemented";
+	return null;
+}
+
 /** Why the tracker holds a queued merge, else null. While a review runs, and until its findings are
  * done, only its findings merge; every other card waits in merging. So the next review counts from
  * exactly the commit this one saw, and a release ships only reviewed work plus the fixes it asked
@@ -186,19 +225,8 @@ export function mergeHold(
 ): string | null {
 	for (const r of tasks) {
 		if (r.id === merge.id || r.cancelledAt !== null || !isReview(r)) continue;
-		const findings = reviewFindings(tasks, r);
-		if (findings.some((f) => f.id === merge.id)) continue;
-		if (r.releaseVersion !== null && r.stage !== "done")
-			return `waiting for release ${r.releaseVersion}`;
-		if (r.stage === "todo" || r.stage === "in_progress")
-			return "waiting for the review to finish";
-		// Parked at merging until its findings are done (findingsHold); a done review only reaches
-		// this with open findings when it finished before reviews parked.
-		if (
-			r.stage === "merging" ||
-			findings.some((f) => f.cancelledAt === null && f.stage !== "done")
-		)
-			return "waiting for the review's findings to be implemented";
+		const held = reviewHoldFor(tasks, r, merge.id);
+		if (held !== null) return held;
 	}
 	if (o.mainUnpushed === true && o.prMode !== true) {
 		const held = pushHold(true, merge);
@@ -562,6 +590,85 @@ export interface PickOptions {
 	crossDeps?: DepIndex;
 }
 
+/** The oldest queued merge that no open review holds and whose dependencies are done; null
+ * when a merge turn already runs or nothing qualifies. */
+function mergeSlot(
+	live: ListedTask[],
+	running: ListedTask[],
+	queued: ListedTask[],
+	o: PickOptions,
+): ListedTask | null {
+	if (running.some((t) => t.stage === "merging")) return null;
+	return (
+		queued.find(
+			(t) =>
+				t.stage === "merging" &&
+				t.prNumber === null &&
+				mergeHold(live, t, {
+					mainUnpushed: o.mainUnpushed === true,
+					prMode: o.prMode === true,
+				}) === null &&
+				depHold(live, t, o.crossDeps) === null,
+		) ?? null
+	);
+}
+
+/** The queued grill card when no grill runs and a slot is free; null otherwise. A drain
+ * (`only` set) has already narrowed `queued` to that one card. */
+function grillSlot(
+	live: ListedTask[],
+	queued: ListedTask[],
+	free: number,
+): ListedTask | null {
+	const grilling = live.some(
+		(t) =>
+			t.stage === "backlog" &&
+			(t.state === "running" || t.state === "preparing"),
+	);
+	if (grilling || free <= 0) return null;
+	return queued.find((t) => t.stage === "backlog") ?? null;
+}
+
+/** A queued card fills a work slot when it is not a trending scout, its stage needs no rules
+ * file it lacks, and its dependencies are done. */
+function workSlotReady(
+	live: ListedTask[],
+	t: ListedTask,
+	o: PickOptions,
+): boolean {
+	// A trending scout only fills a slot nothing else wanted: pickLowPriority, after every project.
+	if (t.kind === "trending") return false;
+	// Work slots only: todo and in_progress (replies). Needs a rules file before a fresh todo starts.
+	if (t.stage === "todo" && !o.hasRules && t.kind !== "interview") return false;
+	// A queued card waits until every dependency is done (a cancelled dependency counts as
+	// done, waitingOn); merging cards wait in the merge slot above.
+	if (
+		(t.stage === "todo" || t.stage === "in_progress") &&
+		depHold(live, t, o.crossDeps) !== null
+	)
+		return false;
+	return t.stage === "todo" || t.stage === "in_progress";
+}
+
+/** Fills the work slots (todo, and in_progress replies) with the queued cards that pass the
+ * holds, up to `free` slots; appends to `picked`. */
+function pickWorkSlots(
+	live: ListedTask[],
+	queued: ListedTask[],
+	picked: ListedTask[],
+	o: PickOptions,
+	free: number,
+): void {
+	let slots = free;
+	for (const t of queued) {
+		if (picked.includes(t)) continue;
+		if (slots <= 0) break;
+		if (!workSlotReady(live, t, o)) continue;
+		picked.push(t);
+		slots -= 1;
+	}
+}
+
 /** Pick the tasks that may start an omp run right now. Pure; `tasks` is one project's tasks.
  * A trending scout card never takes a normal slot: pickLowPriority offers it afterwards. */
 export function pickRunnable(
@@ -590,57 +697,22 @@ export function pickRunnable(
 	// While local main has commits origin lacks, only the rejected card's rebase retry may
 	// start (pushHold), so the retry repairs main before anything merges — except in PR mode,
 	// where main is never written locally.
-	if (!running.some((t) => t.stage === "merging")) {
-		const merge = queued.find(
-			(t) =>
-				t.stage === "merging" &&
-				t.prNumber === null &&
-				mergeHold(live, t, {
-					mainUnpushed: o.mainUnpushed === true,
-					prMode: o.prMode === true,
-				}) === null &&
-				depHold(live, t, o.crossDeps) === null,
-		);
-		if (merge) {
-			picked.push(merge);
-			free -= 1;
-		}
+	const merge = mergeSlot(live, running, queued, o);
+	if (merge !== null) {
+		picked.push(merge);
+		free -= 1;
 	}
 
 	// The grill slot: a backlog card runs only when the user kicks it (state queued), and at
 	// most one grill runs at a time — every grill asks questions, so two at once just double
 	// the bells. A drain (`only` set) has already narrowed `queued` to that one card.
-	const grilling = live.some(
-		(t) =>
-			t.stage === "backlog" &&
-			(t.state === "running" || t.state === "preparing"),
-	);
-	if (!grilling && free > 0) {
-		const grill = queued.find((t) => t.stage === "backlog");
-		if (grill) {
-			picked.push(grill);
-			free -= 1;
-		}
-	}
-
-	for (const t of queued) {
-		if (picked.includes(t)) continue;
-		if (free <= 0) break;
-		// A trending scout only fills a slot nothing else wanted: pickLowPriority, after every project.
-		if (t.kind === "trending") continue;
-		// Work slots only: todo and in_progress (replies). Needs a rules file before a fresh todo starts.
-		if (t.stage === "todo" && !o.hasRules && t.kind !== "interview") continue;
-		// A queued card waits until every dependency is done (a cancelled dependency counts as
-		// done, waitingOn); merging cards wait in the merge slot above.
-		if (
-			(t.stage === "todo" || t.stage === "in_progress") &&
-			depHold(live, t, o.crossDeps) !== null
-		)
-			continue;
-		if (t.stage !== "todo" && t.stage !== "in_progress") continue;
-		picked.push(t);
+	const grill = grillSlot(live, queued, free);
+	if (grill !== null) {
+		picked.push(grill);
 		free -= 1;
 	}
+
+	pickWorkSlots(live, queued, picked, o, free);
 	return picked;
 }
 
@@ -835,7 +907,7 @@ export function applyCheckVerdicts(
 	selected.forEach((finding, i) => {
 		const id = i + 1;
 		const v = byId.get(id);
-		if (v !== undefined && v.keep) kept.push({ id, finding });
+		if (v?.keep === true) kept.push({ id, finding });
 		else
 			dropped.push({
 				id,
@@ -864,6 +936,67 @@ export interface WorkCheckVerdict {
 	fixed: { id: number; reason: string }[];
 }
 
+/** The verdict's blockers; null when `r.blockers` exists but is malformed (the run retries). */
+function parseWorkBlockers(
+	r: Record<string, unknown>,
+): WorkCheckVerdict["blockers"] | null {
+	if (r.blockers === undefined) return [];
+	if (!Array.isArray(r.blockers)) return null;
+	const blockers: WorkCheckVerdict["blockers"] = [];
+	for (const b of r.blockers) {
+		if (typeof b !== "object" || b === null) continue;
+		const e = b as Record<string, unknown>;
+		if (typeof e.finding !== "string" || typeof e.quote !== "string") continue;
+		const severity =
+			e.severity === "important" ||
+			e.severity === "nit" ||
+			e.severity === "pre-existing"
+				? e.severity
+				: undefined;
+		blockers.push({
+			finding: e.finding,
+			quote: e.quote,
+			severity,
+			bugClass:
+				typeof e.bugClass === "string" && e.bugClass.trim() !== ""
+					? e.bugClass.trim()
+					: undefined,
+		});
+	}
+	return blockers;
+}
+
+/** The verdict's notes; null when `r.notes` exists but is malformed (the run retries). */
+function parseWorkNotes(r: Record<string, unknown>): string[] | null {
+	if (r.notes === undefined) return [];
+	if (!Array.isArray(r.notes)) return null;
+	const notes: string[] = [];
+	for (const n of r.notes)
+		if (typeof n === "string" && n.trim() !== "") notes.push(n);
+	return notes;
+}
+
+/** The verdict's confirmed fixes; null when `r.fixed` exists but is malformed (the run retries). */
+function parseWorkFixed(
+	r: Record<string, unknown>,
+): { id: number; reason: string }[] | null {
+	if (r.fixed === undefined) return [];
+	if (!Array.isArray(r.fixed)) return null;
+	const fixed: { id: number; reason: string }[] = [];
+	for (const f of r.fixed) {
+		if (typeof f !== "object" || f === null) continue;
+		const e = f as Record<string, unknown>;
+		if (
+			typeof e.id !== "number" ||
+			!Number.isInteger(e.id) ||
+			typeof e.reason !== "string"
+		)
+			continue;
+		fixed.push({ id: e.id, reason: e.reason.trim() });
+	}
+	return fixed;
+}
+
 /** Parses the work check's final message; null when the text holds no JSON object at all (the
  * run failed and retries). Malformed entries are skipped, never fatal. Pure. */
 export function parseWorkCheck(text: string): WorkCheckVerdict | null {
@@ -878,52 +1011,12 @@ export function parseWorkCheck(text: string): WorkCheckVerdict | null {
 	}
 	if (typeof parsed !== "object" || parsed === null) return null;
 	const r = parsed as Record<string, unknown>;
-	const blockers: WorkCheckVerdict["blockers"] = [];
-	if (r.blockers !== undefined) {
-		if (!Array.isArray(r.blockers)) return null;
-		for (const b of r.blockers) {
-			if (typeof b !== "object" || b === null) continue;
-			const e = b as Record<string, unknown>;
-			if (typeof e.finding !== "string" || typeof e.quote !== "string")
-				continue;
-			const severity =
-				e.severity === "important" ||
-				e.severity === "nit" ||
-				e.severity === "pre-existing"
-					? e.severity
-					: undefined;
-			blockers.push({
-				finding: e.finding,
-				quote: e.quote,
-				severity,
-				bugClass:
-					typeof e.bugClass === "string" && e.bugClass.trim() !== ""
-						? e.bugClass.trim()
-						: undefined,
-			});
-		}
-	}
-	const notes: string[] = [];
-	if (r.notes !== undefined) {
-		if (!Array.isArray(r.notes)) return null;
-		for (const n of r.notes)
-			if (typeof n === "string" && n.trim() !== "") notes.push(n);
-	}
-	const fixed: { id: number; reason: string }[] = [];
-	if (r.fixed !== undefined) {
-		if (!Array.isArray(r.fixed)) return null;
-		for (const f of r.fixed) {
-			if (typeof f !== "object" || f === null) continue;
-			const e = f as Record<string, unknown>;
-			if (
-				typeof e.id !== "number" ||
-				!Number.isInteger(e.id) ||
-				typeof e.reason !== "string"
-			)
-				continue;
-			fixed.push({ id: e.id, reason: e.reason.trim() });
-		}
-	}
+	const blockers = parseWorkBlockers(r);
+	if (blockers === null) return null;
+	const notes = parseWorkNotes(r);
+	if (notes === null) return null;
+	const fixed = parseWorkFixed(r);
+	if (fixed === null) return null;
 	return { blockers, notes, fixed };
 }
 
@@ -934,8 +1027,8 @@ export function openWorkBlockers(
 	log: readonly WorkCheckRun[],
 ): WorkCheckBlocker[] {
 	for (let i = log.length - 1; i >= 0; i--) {
-		const run = log[i]!;
-		if (run.outcome !== "blockers") continue;
+		const run = log[i];
+		if (run === undefined || run.outcome !== "blockers") continue;
 		return run.blockers.filter((b) => b.status === undefined);
 	}
 	return [];

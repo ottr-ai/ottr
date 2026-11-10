@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 import {
 	createContext,
 	Fragment,
@@ -25,12 +25,14 @@ import type {
 	GithubFacts,
 	ProjectView,
 	ProvisioningResponse,
+	QuotaState,
 	TaskCard,
 	TrendingStatus,
 } from "../types.ts";
 import {
 	type Act,
 	BusyButton,
+	type BusyState,
 	CloseButton,
 	clamp,
 	confirmDialog,
@@ -69,6 +71,7 @@ import {
 	addRoleError,
 	classifyRolesSave,
 	fallbacksDirty,
+	type ModelCatalog,
 	type ModelRow,
 	missingCheckRoles,
 	modelMatches,
@@ -141,6 +144,166 @@ function pushedAge(pushedAt: number, now: number): string {
 	return `${Math.trunc(hours / 24)}d`;
 }
 
+/** Step 2's rules block: git init for a bare folder, align or interview, or open the queued card. */
+function SetupRulesSection({
+	gitless,
+	hasRules,
+	rulesTask,
+	rulesQueued,
+	openTask,
+	onClose,
+	initRepo,
+	alignRules,
+	discussRules,
+}: {
+	gitless: boolean;
+	hasRules: boolean;
+	rulesTask: string | null;
+	rulesQueued: boolean;
+	openTask?: (id: string) => void;
+	onClose: () => void;
+	initRepo: () => Promise<boolean>;
+	alignRules: () => Promise<boolean>;
+	discussRules: () => Promise<boolean>;
+}) {
+	return (
+		<section className="setup-sec">
+			<h3>Rules</h3>
+			{gitless ? (
+				<>
+					<p className="hint">
+						This folder is not a git repository yet, so every action waits until
+						it is one.
+					</p>
+					<div>
+						<BusyButton run={initRepo}>Create git repo</BusyButton>
+					</div>
+				</>
+			) : hasRules ? (
+				<>
+					<p className="hint">
+						AGENTS.md exists. Aligning re-reads it and files fixes where it
+						contradicts the tracker's pipeline.
+					</p>
+					<div>
+						<BusyButton run={alignRules}>Align rules</BusyButton>
+					</div>
+				</>
+			) : rulesTask !== null && openTask !== undefined ? (
+				<>
+					<p className="hint">
+						The rules task is live — it asks its questions on the card.
+					</p>
+					<div>
+						<BusyButton
+							run={async () => {
+								onClose();
+								openTask(rulesTask);
+								return true;
+							}}
+						>
+							Open rules task
+						</BusyButton>
+					</div>
+				</>
+			) : rulesQueued ? (
+				<p className="hint">
+					The rules interview is filed as a card — it starts shortly and asks
+					its questions on the card.
+				</p>
+			) : (
+				<>
+					<p className="hint">
+						No AGENTS.md yet, so tasks wait in Todo. The interview asks a few
+						questions and writes the rules.
+					</p>
+					<div>
+						<BusyButton run={discussRules}>Discuss rules</BusyButton>
+					</div>
+				</>
+			)}
+		</section>
+	);
+}
+
+/** One GitHub facts fetch, as the fork panel shows it: null while loading. */
+type GithubFactsState =
+	| { kind: "error"; message: string }
+	| { kind: "ok"; facts: GithubFacts }
+	| null;
+
+/** Step 3's fork-research panel: the checkbox, the GitHub facts, and the recent-forks table. */
+function SetupForkSection({
+	view,
+	facts,
+	forkEffective,
+	forkTouched,
+	onForkDraft,
+}: {
+	view: ProjectView;
+	facts: GithubFactsState;
+	forkEffective: boolean;
+	forkTouched: boolean;
+	onForkDraft: (checked: boolean) => void;
+}) {
+	return (
+		<section className="setup-sec">
+			<label className="add-check">
+				<input
+					type="checkbox"
+					checked={forkEffective}
+					onChange={(e) => {
+						onForkDraft(e.target.checked);
+					}}
+				/>
+				Fork research
+				<span className="hint">
+					{!forkTouched &&
+					facts?.kind === "ok" &&
+					facts.facts.active > 0 &&
+					!view.settings.forkResearch
+						? `${facts.facts.active} of ${facts.facts.forks} forks pushed in the last 90 days, so this starts checked.`
+						: "Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval."}
+				</span>
+			</label>
+			{facts === null ? (
+				<Skeleton shape="stats" rows={2} label="Loading GitHub facts" />
+			) : facts.kind === "error" ? (
+				<p className="hint" role="alert">
+					GitHub facts unavailable: {facts.message}
+				</p>
+			) : (
+				<>
+					<div className="setup-facts">
+						<div>
+							<b>{facts.facts.forks}</b>
+							<span>forks</span>
+						</div>
+						<div>
+							<b>{facts.facts.active}</b>
+							<span>pushed in the last 90 days</span>
+						</div>
+					</div>
+					{facts.facts.recent.length > 0 && (
+						<table className="setup-forks">
+							<tbody>
+								{facts.facts.recent.map((f) => (
+									<tr key={`${f.owner}/${f.name}`}>
+										<td>
+											{f.owner}/{f.name}
+										</td>
+										<td>{pushedAge(f.pushedAt, Date.now())} since last push</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+					)}
+				</>
+			)}
+		</section>
+	);
+}
+
 /** The wizard body after the project exists: Rules, Automation, Runners. Saves land at once,
  *  so a closed dialog never loses a choice. Opens at step 2 both after Add and standalone. */
 export function ProjectSetupSteps({
@@ -177,11 +340,7 @@ export function ProjectSetupSteps({
 	const [forkDraft, setForkDraft] = useState(false);
 	const forkTouched = useRef(false);
 	// GitHub facts for the fork panel, fetched once on entering step 3; null while loading.
-	const [facts, setFacts] = useState<
-		| { kind: "error"; message: string }
-		| { kind: "ok"; facts: GithubFacts }
-		| null
-	>(null);
+	const [facts, setFacts] = useState<GithubFactsState>(null);
 	// Step 4 drafts.
 	const [mp, setMp] = useState(
 		project.settings.maxParallel === null
@@ -214,6 +373,13 @@ export function ProjectSetupSteps({
 			onNotice?.(interviewMsg(r.interview));
 			if (r.id !== null) setRulesTask(r.id);
 			after?.();
+		}, setErr);
+
+	/** Step 2: create the missing git repository, then drop the gitless panel. */
+	const initRepo = (): Promise<boolean> =>
+		act(async () => {
+			await post(`/api/projects/${encodeURIComponent(view.name)}/init`, {});
+			setGitless(false);
 		}, setErr);
 
 	useEffect(() => {
@@ -266,80 +432,17 @@ export function ProjectSetupSteps({
 				</p>
 			)}
 			{step === 2 && (
-				<section className="setup-sec">
-					<h3>Rules</h3>
-					{gitless ? (
-						<>
-							<p className="hint">
-								This folder is not a git repository yet, so every action waits
-								until it is one.
-							</p>
-							<div>
-								<BusyButton
-									run={() =>
-										act(async () => {
-											await post(
-												`/api/projects/${encodeURIComponent(view.name)}/init`,
-												{},
-											);
-											setGitless(false);
-										}, setErr)
-									}
-								>
-									Create git repo
-								</BusyButton>
-							</div>
-						</>
-					) : view.hasRules ? (
-						<>
-							<p className="hint">
-								AGENTS.md exists. Aligning re-reads it and files fixes where it
-								contradicts the tracker's pipeline.
-							</p>
-							<div>
-								<BusyButton run={() => runInterview({ fix: true })}>
-									Align rules
-								</BusyButton>
-							</div>
-						</>
-					) : rulesTask !== null && openTask !== undefined ? (
-						<>
-							<p className="hint">
-								The rules task is live — it asks its questions on the card.
-							</p>
-							<div>
-								<BusyButton
-									run={async () => {
-										onClose();
-										openTask(rulesTask);
-										return true;
-									}}
-								>
-									Open rules task
-								</BusyButton>
-							</div>
-						</>
-					) : rulesQueued ? (
-						<p className="hint">
-							The rules interview is filed as a card — it starts shortly and
-							asks its questions on the card.
-						</p>
-					) : (
-						<>
-							<p className="hint">
-								No AGENTS.md yet, so tasks wait in Todo. The interview asks a
-								few questions and writes the rules.
-							</p>
-							<div>
-								<BusyButton
-									run={() => runInterview({}, () => setRulesQueued(true))}
-								>
-									Discuss rules
-								</BusyButton>
-							</div>
-						</>
-					)}
-				</section>
+				<SetupRulesSection
+					gitless={gitless}
+					hasRules={view.hasRules}
+					rulesTask={rulesTask}
+					rulesQueued={rulesQueued}
+					openTask={openTask}
+					onClose={onClose}
+					initRepo={initRepo}
+					alignRules={() => runInterview({ fix: true })}
+					discussRules={() => runInterview({}, () => setRulesQueued(true))}
+				/>
 			)}
 			{step === 3 && (
 				<>
@@ -374,64 +477,16 @@ export function ProjectSetupSteps({
 						</label>
 					</section>
 					{view.github !== null && (
-						<section className="setup-sec">
-							<label className="add-check">
-								<input
-									type="checkbox"
-									checked={forkEffective}
-									onChange={(e) => {
-										forkTouched.current = true;
-										setForkDraft(e.target.checked);
-									}}
-								/>
-								Fork research
-								<span className="hint">
-									{!forkTouched.current &&
-									facts?.kind === "ok" &&
-									facts.facts.active > 0 &&
-									!view.settings.forkResearch
-										? `${facts.facts.active} of ${facts.facts.forks} forks pushed in the last 90 days, so this starts checked.`
-										: "Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval."}
-								</span>
-							</label>
-							{facts === null ? (
-								<Skeleton shape="stats" rows={2} label="Loading GitHub facts" />
-							) : facts.kind === "error" ? (
-								<p className="hint" role="alert">
-									GitHub facts unavailable: {facts.message}
-								</p>
-							) : (
-								<>
-									<div className="setup-facts">
-										<div>
-											<b>{facts.facts.forks}</b>
-											<span>forks</span>
-										</div>
-										<div>
-											<b>{facts.facts.active}</b>
-											<span>pushed in the last 90 days</span>
-										</div>
-									</div>
-									{facts.facts.recent.length > 0 && (
-										<table className="setup-forks">
-											<tbody>
-												{facts.facts.recent.map((f) => (
-													<tr key={`${f.owner}/${f.name}`}>
-														<td>
-															{f.owner}/{f.name}
-														</td>
-														<td>
-															{pushedAge(f.pushedAt, Date.now())} since last
-															push
-														</td>
-													</tr>
-												))}
-											</tbody>
-										</table>
-									)}
-								</>
-							)}
-						</section>
+						<SetupForkSection
+							view={view}
+							facts={facts}
+							forkEffective={forkEffective}
+							forkTouched={forkTouched.current}
+							onForkDraft={(checked) => {
+								forkTouched.current = true;
+								setForkDraft(checked);
+							}}
+						/>
 					)}
 					<section className="setup-sec">
 						<label className="add-check">
@@ -1466,6 +1521,18 @@ function ApiKeySection() {
 	);
 }
 
+/** The reorder slot an Alt+Arrow requests on the row at index `i`: the name to land
+ *  before, null for the end, or undefined when the key does not reorder the row. */
+const arrowSlot = (
+	key: string,
+	view: readonly string[],
+	i: number,
+): string | null | undefined => {
+	if (key === "ArrowUp" && i > 0) return view[i - 1];
+	if (key === "ArrowDown" && i < view.length - 1) return view[i + 2] ?? null;
+	return undefined;
+};
+
 /** Board group, "Projects" card: drag a row (or press Alt+Arrow on it) to reorder the
  *  projects on the board and in this page. The full order saves to /api/projects/order at
  *  once; a failed save rolls the optimistic order back. Drag state follows the board's
@@ -1536,6 +1603,19 @@ export function ProjectsOrderSection({
 			() => setLocalOrder(null),
 		);
 	};
+	// Keyboard reorder: Alt+Arrow moves the focused row; blocked while a save runs.
+	const onReorderKeyDown = (e: KeyboardEvent<HTMLUListElement>): void => {
+		if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+		const id = (e.target as HTMLElement).closest<HTMLElement>("[data-name]")
+			?.dataset.name;
+		if (id === undefined) return;
+		const i = view.indexOf(id);
+		if (i < 0) return;
+		const slot = arrowSlot(e.key, view, i);
+		if (slot === undefined) return;
+		e.preventDefault();
+		save(moved(id, slot));
+	};
 	return (
 		<SettingsCard
 			id="projects-section"
@@ -1593,28 +1673,7 @@ export function ProjectsOrderSection({
 							}
 						: undefined
 				}
-				// Keyboard reorder: Alt+Arrow moves the focused row; blocked while a save runs.
-				onKeyDown={
-					busy
-						? undefined
-						: (e) => {
-								if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown"))
-									return;
-								const id = (e.target as HTMLElement).closest<HTMLElement>(
-									"[data-name]",
-								)?.dataset.name;
-								if (id === undefined) return;
-								const i = view.indexOf(id);
-								if (i < 0) return;
-								if (e.key === "ArrowUp" && i > 0) {
-									e.preventDefault();
-									save(moved(id, view[i - 1]!));
-								} else if (e.key === "ArrowDown" && i < view.length - 1) {
-									e.preventDefault();
-									save(moved(id, i + 2 < view.length ? view[i + 2]! : null));
-								}
-							}
-				}
+				onKeyDown={busy ? undefined : onReorderKeyDown}
 			>
 				{view.map((name, i) => {
 					const p = byName.get(name);
@@ -2013,6 +2072,14 @@ const toTestAnswer = ({
 		? { ok: true }
 		: (asTrust(data) ?? { error: asError(data, status, "the SSH key test") });
 
+/** The summary line for a clean install check: what the app covers. */
+const installSummary = (check: AppCheck): string =>
+	check.repos.length === 0
+		? "No board project has a GitHub repo."
+		: check.private.length === 0
+			? `Installed on all ${check.repos.length} board repos.`
+			: `Installed on all public board repos; ${check.private.length} private repo${check.private.length === 1 ? "" : "s"} skipped.`;
+
 /** The app's GitHub name and its installs on the board repos, from the server's last check. */
 export function AppCheckLines({ check }: { check: AppCheck | null }) {
 	if (check === null)
@@ -2039,13 +2106,7 @@ export function AppCheckLines({ check }: { check: AppCheck | null }) {
 			{check.missing.length === 0 && check.failed.length === 0 ? (
 				<p className="hint notif-line">
 					<Mark kind="done" />
-					<span>
-						{check.repos.length === 0
-							? "No board project has a GitHub repo."
-							: check.private.length === 0
-								? `Installed on all ${check.repos.length} board repos.`
-								: `Installed on all public board repos; ${check.private.length} private repo${check.private.length === 1 ? "" : "s"} skipped.`}
-					</span>
+					<span>{installSummary(check)}</span>
 				</p>
 			) : null}
 			{check.missing.length > 0 && (
@@ -2308,6 +2369,280 @@ function gitHostsChip(
 		: { label: parts.join(" · "), tone: "ok" };
 }
 
+/** The "GitHub App" block: the saved app's card, or the id and key form while it is open. */
+function GitHubAppBlock({
+	state,
+	formOpen,
+	setFormOpen,
+	appId,
+	setAppId,
+	appKey,
+	setAppKey,
+	busy,
+	onSave,
+	onRemove,
+}: {
+	state: GitHostsView | null;
+	formOpen: boolean;
+	setFormOpen: (open: boolean) => void;
+	appId: string;
+	setAppId: (v: string) => void;
+	appKey: string;
+	setAppKey: (v: string) => void;
+	busy: BusyState;
+	onSave: () => void;
+	onRemove: () => Promise<boolean>;
+}) {
+	return (
+		<div className="sec-block" id="github-app-block" tabIndex={-1}>
+			<h4>GitHub App</h4>
+			<p className="hint">
+				Optional. When it is set, posted PR reviews show as the app (a bot
+				account) instead of your own GitHub account.
+			</p>
+			{state !== null && state.githubApp !== null && !formOpen ? (
+				<div>
+					<div className="settings-field">
+						App ID <code>{state.githubApp.id}</code>
+					</div>
+					<AppCheckLines check={state.githubApp.check} />
+					<p className="hint">
+						Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
+					</p>
+					<button type="button" onClick={() => setFormOpen(true)}>
+						Replace key
+					</button>{" "}
+					<BusyButton className="danger" run={onRemove}>
+						Remove
+					</BusyButton>
+				</div>
+			) : (
+				<form
+					className="settings-form"
+					onSubmit={(e) => {
+						e.preventDefault();
+						onSave();
+					}}
+				>
+					<div className="alate-def-rows">
+						<DefRow
+							name="App ID"
+							help="The numeric ID on the GitHub App's settings page."
+							shape="digits"
+						>
+							<label>
+								<input
+									value={appId}
+									onChange={(e) => setAppId(e.target.value)}
+									placeholder="123456"
+									required
+									pattern="\d+"
+									inputMode="numeric"
+									aria-label="App ID"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Private key"
+							help="The app's private key, in PEM form, from the app's settings page. Ottr stores it and never shows it again."
+							shape="PEM · stored, never shown"
+						>
+							<label>
+								<textarea
+									rows={8}
+									value={appKey}
+									onChange={(e) => setAppKey(e.target.value)}
+									spellCheck={false}
+									autoComplete="off"
+									placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
+									required
+									aria-label="GitHub App private key"
+								/>
+							</label>
+						</DefRow>
+					</div>
+					<div className="alate-def-actions">
+						{state !== null && state.githubApp !== null && (
+							<button type="button" onClick={() => setFormOpen(false)}>
+								Cancel
+							</button>
+						)}
+						<button
+							type="submit"
+							disabled={busy.busy}
+							aria-busy={busy.busy || undefined}
+							className={busy.failed ? "failed" : ""}
+						>
+							{busy.busy && <span className="spinner" aria-hidden="true" />}
+							Save
+						</button>
+					</div>
+				</form>
+			)}
+		</div>
+	);
+}
+
+/** The "GitHub host" block: the field that saves the hostname, plus the invalid-env hint. */
+function GitHubHostBlock({
+	state,
+	draft,
+	setDraft,
+	busy,
+	onSave,
+}: {
+	state: GitHostsView | null;
+	draft: string | null;
+	setDraft: (v: string) => void;
+	busy: BusyState;
+	onSave: () => void;
+}) {
+	return (
+		<div className="sec-block" id="github-host-block" tabIndex={-1}>
+			<h4>GitHub host</h4>
+			<form
+				className="settings-form"
+				onSubmit={(e) => {
+					e.preventDefault();
+					onSave();
+				}}
+			>
+				<div className="alate-def-rows">
+					<DefRow
+						name="GitHub host"
+						help="Where GitHub lives for this board: github.com, a *.ghe.com Enterprise Cloud host, or an Enterprise Server host. It steers the API calls, gh, PR links, releases and fork research. A saved value wins over the OTTR_GITHUB_HOST env. Empty resets to the env value or github.com."
+						shape="bare hostname"
+						action={
+							<button
+								type="submit"
+								disabled={busy.busy}
+								className={`primary${busy.failed ? " failed" : ""}`}
+							>
+								{busy.busy && <span className="spinner" aria-hidden="true" />}
+								Save
+							</button>
+						}
+					>
+						<label>
+							<input
+								value={draft ?? state?.githubHost ?? ""}
+								onChange={(e) => setDraft(e.target.value)}
+								placeholder="github.com"
+								spellCheck={false}
+								aria-label="GitHub host"
+							/>
+						</label>
+					</DefRow>
+				</div>
+			</form>
+			{state !== null && state.githubHost === null && (
+				<p className="hint">
+					OTTR_GITHUB_HOST is invalid — use a bare hostname, for example
+					acme.ghe.com
+				</p>
+			)}
+		</div>
+	);
+}
+
+/** The "Global SSH key" block: the saved key's card or the empty hint, the pending key
+ *  row, and the test and save prompts. */
+function GlobalKeyBlock({
+	state,
+	pending,
+	setPending,
+	gUrl,
+	setGUrl,
+	gTest,
+	gSave,
+	onRemove,
+}: {
+	state: GitHostsView | null;
+	pending: PendingKeyInfo | null;
+	setPending: (p: PendingKeyInfo | null) => void;
+	gUrl: string;
+	setGUrl: (v: string) => void;
+	gTest: { button: ReactNode; result: ReactNode };
+	gSave: { button: ReactNode; result: ReactNode };
+	onRemove: () => Promise<boolean>;
+}) {
+	return (
+		<div className="sec-block" id="ssh-key-block" tabIndex={-1}>
+			<h4>Global SSH key</h4>
+			<p className="hint">
+				The server-side SSH key for clones, fetches and pushes over SSH. Each
+				project without its own key uses this key.
+			</p>
+			{state !== null &&
+				(state.globalKey === null ? (
+					<p className="hint">No global key.</p>
+				) : (
+					<div>
+						<p className="hint">
+							Fingerprint <code>{state.globalKey.fingerprint}</code>
+						</p>
+						<DefRow
+							name="Public key"
+							help="The public half of the global key. Add it as a deploy key with write access on each git host that the projects use."
+						>
+							<label>
+								<textarea
+									readOnly
+									rows={3}
+									value={state.globalKey.publicKey}
+									spellCheck={false}
+									onFocus={(e) => e.currentTarget.select()}
+									aria-label="Global public key"
+								/>
+							</label>
+						</DefRow>
+						<div className="key-actions">
+							<button
+								type="button"
+								onClick={() => void copyText(state.globalKey?.publicKey ?? "")}
+							>
+								Copy key
+							</button>
+							<BusyButton className="danger" run={onRemove}>
+								Remove
+							</BusyButton>
+						</div>
+					</div>
+				))}
+			<p className="hint">
+				Save replaces the global key: every project without its own key uses the
+				new one.
+			</p>
+			<PendingKeyRow pending={pending} onPending={setPending} />
+			<div className="alate-def-rows">
+				<DefRow
+					name="Test URL"
+					help="A repository that this key can read over SSH. Test checks access with the new key, or with the key in use, and saves nothing. Save key runs the same test and stores the new key only when it passes."
+					shape="SSH git URL"
+					action={gTest.button}
+				>
+					<label>
+						<input
+							value={gUrl}
+							onChange={(e) => setGUrl(e.target.value)}
+							placeholder="git@gitlab.com:group/repo.git"
+							inputMode="url"
+							spellCheck={false}
+							autoComplete="off"
+							aria-label="Test URL (a repository the key can read)"
+						/>
+					</label>
+				</DefRow>
+			</div>
+			{gTest.result}
+			<div className="ssh-test">
+				{gSave.button}
+				{gSave.result}
+			</div>
+		</div>
+	);
+}
+
 /** Settings "Git hosts" section: per-host HTTPS tokens and the server-side global SSH key.
  *  Token values are write-only: the server never returns them and the UI never shows one. */
 export function GitHostsSection() {
@@ -2540,52 +2875,13 @@ export function GitHostsSection() {
 			status={gitHostsChip(state)}
 			hint="The GitHub token serves the board's own git and releases. Other HTTPS tokens and the server-side SSH key serve clones, fetches and pushes on any git host. Agents on workers never receive them."
 		>
-			<div className="sec-block" id="github-host-block" tabIndex={-1}>
-				<h4>GitHub host</h4>
-				<form
-					className="settings-form"
-					onSubmit={(e) => {
-						e.preventDefault();
-						saveHost();
-					}}
-				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="GitHub host"
-							help="Where GitHub lives for this board: github.com, a *.ghe.com Enterprise Cloud host, or an Enterprise Server host. It steers the API calls, gh, PR links, releases and fork research. A saved value wins over the OTTR_GITHUB_HOST env. Empty resets to the env value or github.com."
-							shape="bare hostname"
-							action={
-								<button
-									type="submit"
-									disabled={ghBusy.busy}
-									className={`primary${ghBusy.failed ? " failed" : ""}`}
-								>
-									{ghBusy.busy && (
-										<span className="spinner" aria-hidden="true" />
-									)}
-									Save
-								</button>
-							}
-						>
-							<label>
-								<input
-									value={ghHostDraft ?? state?.githubHost ?? ""}
-									onChange={(e) => setGhHostDraft(e.target.value)}
-									placeholder="github.com"
-									spellCheck={false}
-									aria-label="GitHub host"
-								/>
-							</label>
-						</DefRow>
-					</div>
-				</form>
-				{state !== null && state.githubHost === null && (
-					<p className="hint">
-						OTTR_GITHUB_HOST is invalid — use a bare hostname, for example
-						acme.ghe.com
-					</p>
-				)}
-			</div>
+			<GitHubHostBlock
+				state={state}
+				draft={ghHostDraft}
+				setDraft={setGhHostDraft}
+				busy={ghBusy}
+				onSave={saveHost}
+			/>
 			<div className="sec-block" id="github-token-block" tabIndex={-1}>
 				<h4>GitHub token</h4>
 				<SecretTokenForm<{ tokenSet: boolean; expiresAt: string | null }>
@@ -2599,94 +2895,18 @@ export function GitHostsSection() {
 					expiry={(cfg) => expiryLine(cfg.expiresAt)}
 				/>
 			</div>
-			<div className="sec-block" id="github-app-block" tabIndex={-1}>
-				<h4>GitHub App</h4>
-				<p className="hint">
-					Optional. When it is set, posted PR reviews show as the app (a bot
-					account) instead of your own GitHub account.
-				</p>
-				{state !== null && state.githubApp !== null && !appFormOpen ? (
-					<div>
-						<div className="settings-field">
-							App ID <code>{state.githubApp.id}</code>
-						</div>
-						<AppCheckLines check={state.githubApp.check} />
-						<p className="hint">
-							Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
-						</p>
-						<button type="button" onClick={() => setAppFormOpen(true)}>
-							Replace key
-						</button>{" "}
-						<BusyButton className="danger" run={removeApp}>
-							Remove
-						</BusyButton>
-					</div>
-				) : (
-					<form
-						className="settings-form"
-						onSubmit={(e) => {
-							e.preventDefault();
-							saveApp();
-						}}
-					>
-						<div className="alate-def-rows">
-							<DefRow
-								name="App ID"
-								help="The numeric ID on the GitHub App's settings page."
-								shape="digits"
-							>
-								<label>
-									<input
-										value={appId}
-										onChange={(e) => setAppId(e.target.value)}
-										placeholder="123456"
-										required
-										pattern="\d+"
-										inputMode="numeric"
-										aria-label="App ID"
-									/>
-								</label>
-							</DefRow>
-							<DefRow
-								name="Private key"
-								help="The app's private key, in PEM form, from the app's settings page. Ottr stores it and never shows it again."
-								shape="PEM · stored, never shown"
-							>
-								<label>
-									<textarea
-										rows={8}
-										value={appKey}
-										onChange={(e) => setAppKey(e.target.value)}
-										spellCheck={false}
-										autoComplete="off"
-										placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…"}
-										required
-										aria-label="GitHub App private key"
-									/>
-								</label>
-							</DefRow>
-						</div>
-						<div className="alate-def-actions">
-							{state !== null && state.githubApp !== null && (
-								<button type="button" onClick={() => setAppFormOpen(false)}>
-									Cancel
-								</button>
-							)}
-							<button
-								type="submit"
-								disabled={appBusy.busy}
-								aria-busy={appBusy.busy || undefined}
-								className={appBusy.failed ? "failed" : ""}
-							>
-								{appBusy.busy && (
-									<span className="spinner" aria-hidden="true" />
-								)}
-								Save
-							</button>
-						</div>
-					</form>
-				)}
-			</div>
+			<GitHubAppBlock
+				state={state}
+				formOpen={appFormOpen}
+				setFormOpen={setAppFormOpen}
+				appId={appId}
+				setAppId={setAppId}
+				appKey={appKey}
+				setAppKey={setAppKey}
+				busy={appBusy}
+				onSave={saveApp}
+				onRemove={removeApp}
+			/>
 			<div className="sec-block" id="host-tokens-block" tabIndex={-1}>
 				<h4>Other host tokens</h4>
 				<p className="hint">
@@ -2828,81 +3048,16 @@ export function GitHostsSection() {
 					</div>
 				</form>
 			</div>
-			<div className="sec-block" id="ssh-key-block" tabIndex={-1}>
-				<h4>Global SSH key</h4>
-				<p className="hint">
-					The server-side SSH key for clones, fetches and pushes over SSH. Each
-					project without its own key uses this key.
-				</p>
-				{state !== null &&
-					(state.globalKey === null ? (
-						<p className="hint">No global key.</p>
-					) : (
-						<div>
-							<p className="hint">
-								Fingerprint <code>{state.globalKey.fingerprint}</code>
-							</p>
-							<DefRow
-								name="Public key"
-								help="The public half of the global key. Add it as a deploy key with write access on each git host that the projects use."
-							>
-								<label>
-									<textarea
-										readOnly
-										rows={3}
-										value={state.globalKey.publicKey}
-										spellCheck={false}
-										onFocus={(e) => e.currentTarget.select()}
-										aria-label="Global public key"
-									/>
-								</label>
-							</DefRow>
-							<div className="key-actions">
-								<button
-									type="button"
-									onClick={() =>
-										void copyText(state.globalKey?.publicKey ?? "")
-									}
-								>
-									Copy key
-								</button>
-								<BusyButton className="danger" run={removeGlobal}>
-									Remove
-								</BusyButton>
-							</div>
-						</div>
-					))}
-				<p className="hint">
-					Save replaces the global key: every project without its own key uses
-					the new one.
-				</p>
-				<PendingKeyRow pending={pending} onPending={setPending} />
-				<div className="alate-def-rows">
-					<DefRow
-						name="Test URL"
-						help="A repository that this key can read over SSH. Test checks access with the new key, or with the key in use, and saves nothing. Save key runs the same test and stores the new key only when it passes."
-						shape="SSH git URL"
-						action={gTest.button}
-					>
-						<label>
-							<input
-								value={gUrl}
-								onChange={(e) => setGUrl(e.target.value)}
-								placeholder="git@gitlab.com:group/repo.git"
-								inputMode="url"
-								spellCheck={false}
-								autoComplete="off"
-								aria-label="Test URL (a repository the key can read)"
-							/>
-						</label>
-					</DefRow>
-				</div>
-				{gTest.result}
-				<div className="ssh-test">
-					{gSave.button}
-					{gSave.result}
-				</div>
-			</div>
+			<GlobalKeyBlock
+				state={state}
+				pending={pending}
+				setPending={setPending}
+				gUrl={gUrl}
+				setGUrl={setGUrl}
+				gTest={gTest}
+				gSave={gSave}
+				onRemove={removeGlobal}
+			/>
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
@@ -3212,6 +3367,254 @@ type SignInState = {
 const signInPage = (output: string): string | null =>
 	output.match(/https:\/\/\S+/)?.[0] ?? null;
 
+/** The section's status chip: who is signed in, or undefined while the state loads. */
+const signinStatus = (
+	state: SignInState | null,
+	signedIn: number,
+): { label: string; tone: ChipTone } | undefined =>
+	state === null
+		? undefined
+		: signedIn > 0
+			? { label: `${signedIn} signed in`, tone: "ok" }
+			: { label: "None signed in", tone: "warn" };
+
+/** The status-dot class and the state words for one stored sign-in: expired ones lead,
+ *  OAuth sign-ins read as signed in, anything else holds an API key. */
+const signinState = (signIn: SignIn): { led: string; words: string } =>
+	signIn.active
+		? signIn.kind === "oauth"
+			? { led: "ok", words: "Signed in" }
+			: { led: "", words: "API key stored" }
+		: { led: "crit", words: "Sign-in expired: sign in again" };
+
+/** The stored sign-ins, one row per provider: status words, quota meters, and the
+ *  sign-in-again and sign-out actions. */
+function SignInRows({
+	signIns,
+	quota,
+	providerName,
+	busy,
+	waiting,
+	onStart,
+	onSignOut,
+}: {
+	signIns: SignIn[];
+	quota: QuotaState | null;
+	providerName: (id: string) => string;
+	busy: boolean;
+	waiting: boolean;
+	onStart: (id: string) => void;
+	onSignOut: (id: string) => void;
+}) {
+	return (
+		<div className="alate-def-rows">
+			{signIns.map((signIn) => {
+				const id = signIn.provider;
+				const limits = forProvider(quota?.limits ?? [], id);
+				const plan = limits.find((l) => l.plan !== null)?.plan ?? null;
+				const needs = !signIn.active;
+				const state = signinState(signIn);
+				return (
+					<div className="alate-def-row providers-row" key={id}>
+						<div className="alate-def-name">
+							<b className="provider-name">
+								<i className={`status-dot ${state.led}`} aria-hidden="true" />
+								{providerName(id)}
+							</b>
+							<span>
+								{state.words}
+								{signIn.active &&
+									(signIn.lent
+										? " · Lent to workers"
+										: " · Not lent to workers")}
+								{plan !== null &&
+									` · ${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan`}
+							</span>
+							<code>{id}</code>
+						</div>
+						<div className="providers-meters">
+							{limits.map((l) => (
+								<QuotaRow key={l.label} limit={l} />
+							))}
+						</div>
+						<div className="alate-def-actions">
+							{needs && (
+								<button
+									type="button"
+									onClick={() => onStart(id)}
+									disabled={busy || waiting}
+									aria-label={`Sign in again to ${providerName(id)}`}
+								>
+									Sign in again
+								</button>
+							)}
+							<button
+								type="button"
+								className="danger"
+								onClick={() => onSignOut(id)}
+								disabled={busy}
+								aria-label={`Sign out of ${providerName(id)}`}
+							>
+								Sign out
+							</button>
+						</div>
+					</div>
+				);
+			})}
+		</div>
+	);
+}
+
+/** The form shown while an omp sign-in waits for the provider's verdict: the open page
+ *  link, the code-or-address field, and the cancel and send actions. */
+function SignInFinishForm({
+	pending,
+	providerName,
+	page,
+	answer,
+	setAnswer,
+	busy,
+	failed,
+	onCancel,
+	onFinish,
+}: {
+	pending: LoginView;
+	providerName: (id: string) => string;
+	page: string | null;
+	answer: string;
+	setAnswer: (v: string) => void;
+	busy: boolean;
+	failed: boolean;
+	onCancel: () => void;
+	onFinish: () => void;
+}) {
+	return (
+		<form
+			className="settings-form"
+			onSubmit={(e) => {
+				e.preventDefault();
+				onFinish();
+			}}
+		>
+			<p className="hint">
+				<b>Finish signing in to {providerName(pending.provider)}</b>
+			</p>
+			<p className="hint">
+				{page !== null && (
+					<a href={page} target="_blank" rel="noreferrer">
+						Open the sign-in page
+					</a>
+				)}
+			</p>
+			<div className="providers-finish">
+				<div className="alate-def-row">
+					<div className="alate-def-name">
+						<b>
+							Code or address
+							<Help
+								label="Code or address"
+								text="After you finish the provider's sign-in page, paste the address that the page ends on (it starts with http://localhost) or the code that it shows. This works the same from another machine or a phone."
+							/>
+						</b>
+						<code>sent to omp once, never stored</code>
+					</div>
+					<label>
+						<input
+							type="text"
+							value={answer}
+							onChange={(e) => setAnswer(e.target.value)}
+							autoComplete="off"
+							spellCheck={false}
+							aria-label="Code or address"
+						/>
+					</label>
+				</div>
+				<div className="alate-def-actions">
+					<button type="button" onClick={onCancel} disabled={busy}>
+						Cancel
+					</button>
+					<button
+						type="submit"
+						disabled={busy}
+						className={failed ? "failed" : undefined}
+					>
+						{busy && <span className="spinner" aria-hidden="true" />}
+						Send code
+					</button>
+				</div>
+			</div>
+			<pre className="log">{pending.output}</pre>
+		</form>
+	);
+}
+
+/** The start form: pick or type an omp provider id and sign in. */
+function SignInStartForm({
+	provider,
+	setProvider,
+	providers,
+	busy,
+	failed,
+	onStart,
+}: {
+	provider: string;
+	setProvider: (v: string) => void;
+	providers: LoginProvider[];
+	busy: boolean;
+	failed: boolean;
+	onStart: (id: string) => void;
+}) {
+	return (
+		<form
+			className="settings-form providers-form"
+			onSubmit={(e) => {
+				e.preventDefault();
+				onStart(provider.trim());
+			}}
+		>
+			<div className="alate-def-row">
+				<div className="alate-def-name">
+					<b>
+						Provider
+						<Help
+							label="Provider"
+							text="The omp provider to sign in to. Pick one from the list, or type any id that omp login shows."
+						/>
+					</b>
+					<code>omp provider id</code>
+				</div>
+				<label>
+					<input
+						type="text"
+						list="login-providers"
+						value={provider}
+						onChange={(e) => setProvider(e.target.value)}
+						autoComplete="off"
+						spellCheck={false}
+						aria-label="Provider"
+						required
+					/>
+					<datalist id="login-providers">
+						{providers.map((p) => (
+							<option key={p.id} value={p.id}>
+								{p.name}
+							</option>
+						))}
+					</datalist>
+				</label>
+				<button
+					type="submit"
+					disabled={busy}
+					className={failed ? "failed" : "primary"}
+				>
+					{busy && <span className="spinner" aria-hidden="true" />}
+					Sign in
+				</button>
+			</div>
+		</form>
+	);
+}
+
 /** Settings "Provider sign-in" section: omp's sign-ins on the machine that runs the board. */
 function ProviderLoginSection() {
 	const [state, setState] = useState<SignInState | null>(null);
@@ -3309,76 +3712,19 @@ function ProviderLoginSection() {
 			id="signin-section"
 			className="providers"
 			title="Provider sign-in"
-			status={
-				state === null
-					? undefined
-					: signedIn > 0
-						? { label: `${signedIn} signed in`, tone: "ok" }
-						: { label: "None signed in", tone: "warn" }
-			}
+			status={signinStatus(state, signedIn)}
 			hint="One sign-in per provider, stored on the board's machine. For OAuth sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get a short-lived token in their env. Other providers are not lent: workers use their own sign-in, or the provider's key under Settings, Env. A sign-in works the same from a phone or another machine: finish the provider's page there, copy the address it ends on, or the code it shows, and paste it below."
 		>
 			{signIns.length > 0 && (
-				<div className="alate-def-rows">
-					{signIns.map((signIn) => {
-						const id = signIn.provider;
-						const limits = forProvider(quota?.limits ?? [], id);
-						const plan = limits.find((l) => l.plan !== null)?.plan ?? null;
-						const needs = !signIn.active;
-						const led = needs ? "crit" : signIn.kind === "oauth" ? "ok" : "";
-						const words = needs
-							? "Sign-in expired: sign in again"
-							: signIn.kind === "oauth"
-								? "Signed in"
-								: "API key stored";
-						return (
-							<div className="alate-def-row providers-row" key={id}>
-								<div className="alate-def-name">
-									<b className="provider-name">
-										<i className={`status-dot ${led}`} aria-hidden="true" />
-										{providerName(id)}
-									</b>
-									<span>
-										{words}
-										{signIn.active &&
-											(signIn.lent
-												? " · Lent to workers"
-												: " · Not lent to workers")}
-										{plan !== null &&
-											` · ${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan`}
-									</span>
-									<code>{id}</code>
-								</div>
-								<div className="providers-meters">
-									{limits.map((l) => (
-										<QuotaRow key={l.label} limit={l} />
-									))}
-								</div>
-								<div className="alate-def-actions">
-									{needs && (
-										<button
-											type="button"
-											onClick={() => start(id)}
-											disabled={act.busy || waiting}
-											aria-label={`Sign in again to ${providerName(id)}`}
-										>
-											Sign in again
-										</button>
-									)}
-									<button
-										type="button"
-										className="danger"
-										onClick={() => signOutOf(id)}
-										disabled={act.busy}
-										aria-label={`Sign out of ${providerName(id)}`}
-									>
-										Sign out
-									</button>
-								</div>
-							</div>
-						);
-					})}
-				</div>
+				<SignInRows
+					signIns={signIns}
+					quota={quota}
+					providerName={providerName}
+					busy={act.busy}
+					waiting={waiting}
+					onStart={start}
+					onSignOut={signOutOf}
+				/>
 			)}
 			{state?.signIns?.length === 0 && (
 				<p className="hint">omp has no sign-ins on this machine yet.</p>
@@ -3389,110 +3735,26 @@ function ProviderLoginSection() {
 				</p>
 			)}
 			{waiting ? (
-				<form
-					className="settings-form"
-					onSubmit={(e) => {
-						e.preventDefault();
-						finish();
-					}}
-				>
-					<p className="hint">
-						<b>Finish signing in to {providerName(pending.provider)}</b>
-					</p>
-					<p className="hint">
-						{page !== null && (
-							<a href={page} target="_blank" rel="noreferrer">
-								Open the sign-in page
-							</a>
-						)}
-					</p>
-					<div className="providers-finish">
-						<div className="alate-def-row">
-							<div className="alate-def-name">
-								<b>
-									Code or address
-									<Help
-										label="Code or address"
-										text="After you finish the provider's sign-in page, paste the address that the page ends on (it starts with http://localhost) or the code that it shows. This works the same from another machine or a phone."
-									/>
-								</b>
-								<code>sent to omp once, never stored</code>
-							</div>
-							<label>
-								<input
-									type="text"
-									value={answer}
-									onChange={(e) => setAnswer(e.target.value)}
-									autoComplete="off"
-									spellCheck={false}
-									aria-label="Code or address"
-								/>
-							</label>
-						</div>
-						<div className="alate-def-actions">
-							<button type="button" onClick={cancel} disabled={act.busy}>
-								Cancel
-							</button>
-							<button
-								type="submit"
-								disabled={act.busy}
-								className={act.failed ? "failed" : undefined}
-							>
-								{act.busy && <span className="spinner" aria-hidden="true" />}
-								Send code
-							</button>
-						</div>
-					</div>
-					<pre className="log">{pending.output}</pre>
-				</form>
+				<SignInFinishForm
+					pending={pending}
+					providerName={providerName}
+					page={page}
+					answer={answer}
+					setAnswer={setAnswer}
+					busy={act.busy}
+					failed={act.failed}
+					onCancel={cancel}
+					onFinish={finish}
+				/>
 			) : (
-				<form
-					className="settings-form providers-form"
-					onSubmit={(e) => {
-						e.preventDefault();
-						start(provider.trim());
-					}}
-				>
-					<div className="alate-def-row">
-						<div className="alate-def-name">
-							<b>
-								Provider
-								<Help
-									label="Provider"
-									text="The omp provider to sign in to. Pick one from the list, or type any id that omp login shows."
-								/>
-							</b>
-							<code>omp provider id</code>
-						</div>
-						<label>
-							<input
-								type="text"
-								list="login-providers"
-								value={provider}
-								onChange={(e) => setProvider(e.target.value)}
-								autoComplete="off"
-								spellCheck={false}
-								aria-label="Provider"
-								required
-							/>
-							<datalist id="login-providers">
-								{providers.map((p) => (
-									<option key={p.id} value={p.id}>
-										{p.name}
-									</option>
-								))}
-							</datalist>
-						</label>
-						<button
-							type="submit"
-							disabled={act.busy}
-							className={act.failed ? "failed" : "primary"}
-						>
-							{act.busy && <span className="spinner" aria-hidden="true" />}
-							Sign in
-						</button>
-					</div>
-				</form>
+				<SignInStartForm
+					provider={provider}
+					setProvider={setProvider}
+					providers={providers}
+					busy={act.busy}
+					failed={act.failed}
+					onStart={start}
+				/>
 			)}
 			<p className="hint" role="status">
 				{pending?.ok === true
@@ -3564,6 +3826,31 @@ const PROVISION_CHANGE_LINE = /^(added|updated|deleted|installed)\s+\S/;
 /** bun's own added-package marker: "+ typescript@5.6.3". */
 const PROVISION_BUN_ADD = /^\+ \S/;
 
+/** One short line's totals contribution: count tokens, per-file change lines, and
+ *  bun's added-package lines. */
+const countProvisionLine = (
+	line: string,
+	bunCounted: boolean,
+	bump: (verb: string, n: number) => void,
+): void => {
+	for (const [, n, verb] of line.matchAll(PROVISION_COUNT_TOKEN))
+		if (verb !== undefined) bump(verb, Number(n));
+	const change = PROVISION_CHANGE_LINE.exec(line);
+	if (change !== null) bump(change[1] ?? "", 1);
+	else if (PROVISION_BUN_ADD.test(line) && !bunCounted) bump("installed", 1);
+	else countBunSummary(line, bump);
+};
+
+/** bun's own summary line: "2 packages installed [104.00ms]" — the verb sits behind
+ *  "packages", so the count token above cannot see it; the count lands on "installed". */
+const countBunSummary = (
+	line: string,
+	bump: (verb: string, n: number) => void,
+): void => {
+	const bunSummary = /^(\d+) packages? installed\b/.exec(line);
+	if (bunSummary !== null) bump("installed", Number(bunSummary[1]));
+};
+
 /** A short total of what a provision changed, for example "1 updated, 2 installed";
  *  null when nothing changed. Counts the successful scripts' change lines and the
  *  non-quiet count lines, so it matches what the short view shows. */
@@ -3585,18 +3872,7 @@ export function provisionChangeSummary(
 			/^\d+ packages? installed\b/.test(line),
 		);
 		for (const line of short) {
-			for (const [, n, verb] of line.matchAll(PROVISION_COUNT_TOKEN))
-				if (verb !== undefined) bump(verb, Number(n));
-			const change = PROVISION_CHANGE_LINE.exec(line);
-			if (change !== null) bump(change[1] ?? "", 1);
-			else if (PROVISION_BUN_ADD.test(line) && !bunCounted)
-				bump("installed", 1);
-			else {
-				// bun's own summary: "2 packages installed [104.00ms]" — the verb sits
-				// behind "packages", so the count token above cannot see it.
-				const bunSummary = /^(\d+) packages? installed\b/.exec(line);
-				if (bunSummary !== null) bump("installed", Number(bunSummary[1]));
-			}
+			countProvisionLine(line, bunCounted, bump);
 		}
 	}
 	const parts = ["added", "updated", "installed", "deleted", "removed"]
@@ -3831,7 +4107,6 @@ function RoleFallbacks({
 						const setEntry = (next: string): void =>
 							edit((c) => c.map((v, j) => (j === i ? next : v)));
 						return (
-							// biome-ignore lint/suspicious/noArrayIndexKey: a chain can hold one selector twice; entries are positions
 							<li className="fallback-row" key={i}>
 								<span className="fallback-num" aria-hidden="true">
 									{n}
@@ -3917,6 +4192,567 @@ function RoleFallbacks({
 	);
 }
 
+/** The section's status chip: unavailable, the role count, or undefined while loading. */
+const rolesStatus = (
+	loadErr: string | null,
+	state: RolesState | null,
+): { label: string; tone: ChipTone } | undefined =>
+	loadErr !== null
+		? { label: "Unavailable", tone: "warn" }
+		: state === null
+			? undefined
+			: {
+					label: `${Object.keys(state.roles).length} roles`,
+					tone: "ok",
+				};
+
+/** The card hint: where a save lands, with or without a GitHub remote for the data repo. */
+function ModelRolesHint({ state }: { state: RolesState | null }) {
+	return (
+		<>
+			omp runs each role with its model, then with its fallbacks in order.{" "}
+			{state?.base === null ? (
+				<>
+					Save writes <code>user/omp/agent/config.yml</code> through Alate's
+					file editor: Alate commits the folder itself when it is a git repo (no
+					GitHub token), then Alate provisions the workers.
+				</>
+			) : (
+				<>
+					Save commits <code>user/omp/agent/config.yml</code> to Alate's data
+					repo with the board's GitHub token, then Alate provisions the workers.
+				</>
+			)}
+		</>
+	);
+}
+
+/** One model-role row: the model and thinking pickers, the remove button, the notes,
+ *  and the fallback chain editor. */
+function RoleRow({
+	name,
+	value,
+	index,
+	uid,
+	field,
+	warnings,
+	models,
+	first,
+	chain,
+	fallbackError,
+	locked,
+	onSetValue,
+	onRemove,
+	onEditChain,
+}: {
+	name: string;
+	value: string;
+	index: number;
+	uid: string;
+	field: string | undefined;
+	warnings: string[];
+	models: ModelOption[];
+	first: string | undefined;
+	chain: string[] | undefined;
+	fallbackError: string | undefined;
+	locked: boolean;
+	onSetValue: (name: string, value: string) => void;
+	onRemove: (name: string) => void;
+	onEditChain: (name: string, fn: (chain: string[]) => string[]) => void;
+}) {
+	const [base, level] = splitLevel(value);
+	const notesId =
+		field !== undefined || warnings.length > 0 ? `${uid}-${index}` : undefined;
+	return (
+		<div className="alate-def-row role-row">
+			<b className="role-name">{name}</b>
+			<RoleModelPicker
+				label={`Model for ${name}`}
+				base={base}
+				level={level}
+				models={models}
+				setValue={(v) => onSetValue(name, v)}
+				disabled={locked}
+				invalid={field !== undefined}
+				describedBy={notesId}
+			/>
+			<ThinkingSelect
+				label={`Thinking for ${name}`}
+				base={base}
+				level={level}
+				setValue={(v) => onSetValue(name, v)}
+				disabled={locked}
+				invalid={field !== undefined}
+				describedBy={notesId}
+			/>
+			<button
+				type="button"
+				className="icon role-remove"
+				aria-label={`Remove role ${name}`}
+				title="Remove role"
+				onClick={() => onRemove(name)}
+				disabled={locked}
+			>
+				<Icon name="x" />
+			</button>
+			{notesId !== undefined && (
+				<div className="role-notes" id={notesId}>
+					{field !== undefined && <p className="auth-error">{field}</p>}
+					{warnings.map((w) => (
+						<p className="hint" key={w}>
+							<Mark kind="warn" />
+							{w}
+						</p>
+					))}
+				</div>
+			)}
+			<RoleFallbacks
+				role={name}
+				chain={chain}
+				models={models}
+				first={first}
+				edit={(fn) => onEditChain(name, fn)}
+				disabled={locked}
+				error={fallbackError}
+				errorId={`${uid}-${index}-fallbacks`}
+			/>
+		</div>
+	);
+}
+
+/** The role rows: one RoleRow per entry, keyed by role name. */
+function RoleRows({
+	rows,
+	uid,
+	models,
+	first,
+	chains,
+	fields,
+	fallbackFields,
+	locked,
+	signIns,
+	onSetValue,
+	onRemove,
+	onEditChain,
+}: {
+	rows: Array<[string, string]>;
+	uid: string;
+	models: ModelOption[];
+	first: string | undefined;
+	chains: Record<string, string[]>;
+	fields: Record<string, string>;
+	fallbackFields: Record<string, string>;
+	locked: boolean;
+	signIns: string[] | null;
+	onSetValue: (name: string, value: string) => void;
+	onRemove: (name: string) => void;
+	onEditChain: (name: string, fn: (chain: string[]) => string[]) => void;
+}) {
+	return (
+		<div className="alate-def-rows">
+			{rows.map(([name, value], i) => (
+				<RoleRow
+					key={name}
+					name={name}
+					value={value}
+					index={i}
+					uid={uid}
+					field={ownField(fields, name)}
+					warnings={roleWarnings(value, signIns)}
+					models={models}
+					first={first}
+					chain={ownField(chains, name)}
+					fallbackError={ownField(fallbackFields, name)}
+					locked={locked}
+					onSetValue={onSetValue}
+					onRemove={onRemove}
+					onEditChain={onEditChain}
+				/>
+			))}
+		</div>
+	);
+}
+
+/** The read-only note: why a save cannot commit, with the fix for each cause. */
+function RoleReadonlyNote({
+	ro,
+}: {
+	ro: { path: string; cause: "plain" | "mount" };
+}) {
+	return (
+		<>
+			<p className="auth-error" role="alert">
+				read-only: folder source {ro.path}
+			</p>
+			<p className="hint">
+				{ro.cause === "mount" ? (
+					<>
+						The data folder is mounted read-only into Alate. Make the mount
+						writable, or edit <code>user/omp/agent/config.yml</code> in the
+						folder, then run Import and Provision in Alate, and reload the
+						settings.
+					</>
+				) : (
+					"Alate's data folder is not a git repo, so a save cannot commit. Make the folder a git repo or point Alate at a GitHub repo, then reload the settings."
+				)}
+			</p>
+		</>
+	);
+}
+
+/** The add-role form: the name field with its inline error line. */
+function RoleAddForm({
+	newName,
+	setNewName,
+	setAddErr,
+	addErr,
+	uid,
+	locked,
+	onAdd,
+}: {
+	newName: string;
+	setNewName: (v: string) => void;
+	setAddErr: (v: string | null) => void;
+	addErr: string | null;
+	uid: string;
+	locked: boolean;
+	onAdd: () => void;
+}) {
+	return (
+		<>
+			<form
+				className="role-add"
+				onSubmit={(e) => {
+					e.preventDefault();
+					onAdd();
+				}}
+			>
+				<label className="field">
+					New role name
+					<input
+						type="text"
+						value={newName}
+						onChange={(e) => {
+							setNewName(e.target.value);
+							setAddErr(null);
+						}}
+						spellCheck={false}
+						autoComplete="off"
+						aria-invalid={addErr !== null}
+						aria-describedby={addErr !== null ? `${uid}-add` : undefined}
+						disabled={locked}
+					/>
+				</label>
+				<button type="submit" disabled={locked}>
+					Add role
+				</button>
+			</form>
+			{addErr !== null && (
+				<p className="auth-error" id={`${uid}-add`} role="alert">
+					{addErr}
+				</p>
+			)}
+		</>
+	);
+}
+
+/** The provision line of the save steps: running with its elapsed timer, the handed-off
+ *  "still" note, the success note, or the failure with its error or failed-script count. */
+function ProvisionLine({
+	prov,
+	provSince,
+	failed,
+}: {
+	prov: ProvisionStep | null;
+	provSince: number | null;
+	failed: ProvisionResult[];
+}) {
+	if (prov === null || prov.state === "running")
+		return (
+			<>
+				<span className="spinner" aria-hidden="true" />
+				Provisioning the workers…
+				{provSince !== null && (
+					<>
+						{" · "}
+						<LiveElapsed since={provSince} />
+					</>
+				)}
+			</>
+		);
+	if (prov.state === "still")
+		return (
+			<>
+				<Mark kind="queued" />
+				The provision still runs on the Alate server. The Alate dashboard shows
+				its result.
+			</>
+		);
+	if (prov.ok && failed.length === 0)
+		return (
+			<>
+				<Mark kind="done" />
+				Provisioned the workers.
+			</>
+		);
+	return (
+		<>
+			<Mark kind="crit" />
+			The provision failed
+			{prov.error !== null
+				? `: ${prov.error}`
+				: failed.length > 0
+					? `: ${failed.length} of ${prov.results.length} scripts failed`
+					: ""}
+			. The commit stays in the data repo. Use Provision in the Alate section to
+			try again.
+		</>
+	);
+}
+
+/** The seed line of the save steps: what the board copy holds after the hourly deploy. */
+function SeedStepLine({
+	step,
+	commit,
+	seed,
+}: {
+	step: "copy" | "done" | "wait" | "replaced" | null;
+	commit: string;
+	seed: RolesState["seed"] | null;
+}) {
+	if (step === null || step === "copy")
+		return (
+			<>
+				<Mark kind="done" />
+				The board reads the provisioned copy.
+			</>
+		);
+	if (step === "done")
+		return (
+			<>
+				<Mark kind="done" />
+				The board copy has the saved roles
+				{seed?.commit ? (
+					<>
+						{" "}
+						(seed <code>{shortSha(seed.commit)}</code>)
+					</>
+				) : null}
+				{seed?.expiresAt !== undefined ? (
+					<> · {expiryLine(seed.expiresAt)}</>
+				) : null}
+				.
+			</>
+		);
+	if (step === "replaced")
+		return (
+			<>
+				<Mark kind="done" />
+				The board copy has other roles: a later change replaced this save.
+			</>
+		);
+	return (
+		<>
+			<Mark kind="queued" />
+			Waiting for the hourly deploy to seed <code>{shortSha(commit)}</code>.
+		</>
+	);
+}
+
+/** The section's Save button: accent fill unless read-only, disabled while clean or busy. */
+function ModelRolesSaveButton({
+	ro,
+	save,
+	dirty,
+	locked,
+	onClick,
+}: {
+	ro: { path: string; cause: "plain" | "mount" } | null;
+	save: BusyState;
+	dirty: boolean;
+	locked: boolean;
+	onClick: () => void;
+}) {
+	return (
+		<div className="alate-def-actions">
+			<button
+				type="button"
+				// Plain button while read-only: the accent fill reads clickable even at
+				// the disabled opacity, and the editor must read locked.
+				className={
+					ro !== null ? undefined : `primary${save.failed ? " failed" : ""}`
+				}
+				onClick={onClick}
+				disabled={!dirty || locked}
+			>
+				{save.busy && <span className="spinner" aria-hidden="true" />}
+				Save
+			</button>
+		</div>
+	);
+}
+
+/** The model roles body while its data is available: the rows, the missing-role note,
+ *  the read-only note, the add form, and the save button. */
+function ModelRolesContent({
+	loadErr,
+	state,
+	catalog,
+	uid,
+	rows,
+	chains,
+	models,
+	first,
+	missing,
+	ro,
+	fields,
+	fallbackFields,
+	addErr,
+	newName,
+	setNewName,
+	setAddErr,
+	locked,
+	dirty,
+	save,
+	onSetValue,
+	onRemoveRole,
+	onEditChain,
+	onAdd,
+	onSubmit,
+}: {
+	loadErr: string | null;
+	state: RolesState | null;
+	catalog: ModelCatalog | null;
+	uid: string;
+	rows: Array<[string, string]>;
+	chains: Record<string, string[]>;
+	models: ModelOption[];
+	first: string | undefined;
+	missing: string[];
+	ro: { path: string; cause: "plain" | "mount" } | null;
+	fields: Record<string, string>;
+	fallbackFields: Record<string, string>;
+	addErr: string | null;
+	newName: string;
+	setNewName: (v: string) => void;
+	setAddErr: (v: string | null) => void;
+	locked: boolean;
+	dirty: boolean;
+	save: BusyState;
+	onSetValue: (name: string, value: string) => void;
+	onRemoveRole: (name: string) => void;
+	onEditChain: (name: string, fn: (chain: string[]) => string[]) => void;
+	onAdd: () => void;
+	onSubmit: () => void;
+}) {
+	return (
+		<>
+			{loadErr !== null ? (
+				<p className="hint" role="status">
+					Cannot load the model roles: {loadErr}.{" "}
+					<button
+						type="button"
+						className="notif-link"
+						onClick={() => openSettingsSection("alate-section")}
+					>
+						Open the Alate settings
+					</button>
+				</p>
+			) : state === null || catalog === null ? (
+				<Skeleton shape="rows" rows={4} label="Loading the model roles" />
+			) : (
+				<>
+					<RoleRows
+						rows={rows}
+						uid={uid}
+						models={models}
+						first={first}
+						chains={chains}
+						fields={fields}
+						fallbackFields={fallbackFields}
+						locked={locked}
+						signIns={state.signIns}
+						onSetValue={onSetValue}
+						onRemove={onRemoveRole}
+						onEditChain={onEditChain}
+					/>
+					{missing.length > 0 && (
+						<p className="hint">
+							<Mark kind="warn" /> No {missing.join(" or ")} role
+							{missing.length > 1 ? "s" : ""}: second-model checks fall back to
+							the default model, which is often the model they check. critic
+							checks Anthropic models, adversary the rest.
+						</p>
+					)}
+					{ro !== null && <RoleReadonlyNote ro={ro} />}
+					<RoleAddForm
+						newName={newName}
+						setNewName={setNewName}
+						setAddErr={setAddErr}
+						addErr={addErr}
+						uid={uid}
+						locked={locked}
+						onAdd={onAdd}
+					/>
+					<ModelRolesSaveButton
+						ro={ro}
+						save={save}
+						dirty={dirty}
+						locked={locked}
+						onClick={onSubmit}
+					/>
+				</>
+			)}
+		</>
+	);
+}
+
+/** The save steps once a save committed: the commit line, the provision line, and the
+ *  seed line; then the failed scripts' logs. */
+function ModelRolesTail({
+	commit,
+	prov,
+	provSince,
+	failed,
+	step,
+	seed,
+}: {
+	commit: string | null;
+	prov: ProvisionStep | null;
+	provSince: number | null;
+	failed: ProvisionResult[];
+	step: "copy" | "done" | "wait" | "replaced" | null;
+	seed: RolesState["seed"] | null;
+}) {
+	return (
+		<>
+			<div aria-live="polite">
+				{commit !== null && (
+					<ol className="hint role-steps">
+						<li>
+							<Mark kind="done" />
+							Committed <code>{shortSha(commit)}</code> to the data repo.
+						</li>
+						<li>
+							<ProvisionLine
+								prov={prov}
+								provSince={provSince}
+								failed={failed}
+							/>
+						</li>
+						<li>
+							<SeedStepLine step={step} commit={commit} seed={seed} />
+						</li>
+					</ol>
+				)}
+			</div>
+			{prov?.state === "done" && prov.results.length > 0 && (
+				<ProvisionResults results={prov.results} />
+			)}
+		</>
+	);
+}
+
 /** Settings "Model roles" section: edits omp's modelRoles and each role's fallback chain in the
     data repo through Alate, then provisions. */
 export function ModelRolesSection() {
@@ -3996,6 +4832,8 @@ export function ModelRolesSection() {
 		a.name.localeCompare(b.name),
 	);
 	const first = models[0]?.selector;
+	// Every editor disables while a save runs or the source is read-only.
+	const locked = save.busy || ro !== null;
 	const dirty =
 		state !== null &&
 		(rolesDirty(rows, state.roles) ||
@@ -4071,79 +4909,79 @@ export function ModelRolesSection() {
 			setProvSince(null);
 		}
 	};
-	const submit = (): void =>
-		save.start(async () => {
-			if (state === null) return false;
-			setError(null);
-			setFields({});
-			setFallbackFields({});
-			setCommit(null);
-			setSaved(null);
-			setProv(null);
-			setProvSince(null);
-			try {
-				const res = await fetch("/api/model-roles", {
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify({
-						base: state.base,
-						hash: state.hash,
-						roles: Object.fromEntries(rows),
-						fallbacks: rowChains(
-							rows.map(([name]) => name),
-							chains,
-						),
-					}),
-				});
-				const r = classifyRolesSave(
-					res.ok,
-					res.status,
-					await res.json().catch(() => ({})),
-				);
-				if (r.kind === "readonly") {
-					setRo({ path: r.path, cause: r.cause });
-					setRows(Object.entries(state.roles));
-					setChains(rowChains(Object.keys(state.roles), state.fallbacks));
-					setError(null);
-					setFields({});
-					setFallbackFields({});
-					return false;
-				}
-				if (r.kind === "saved") {
-					const { commit: sha, base, hash, roles, fallbacks, seed } = r;
-					setState(
-						(old) => old && { ...old, base, hash, roles, fallbacks, seed },
-					);
-					setRows(Object.entries(roles));
-					setChains(rowChains(Object.keys(roles), fallbacks));
-					setSaved({
-						seedAtSave: seed.commit,
-						after: roles,
-						afterFallbacks: fallbacks,
-					});
-					setCommit(sha);
-					// The commit stands even when the provision fails; the steps list says so.
-					await provision();
-					return true;
-				}
-				if (r.kind === "conflict") {
-					// The data repo moved: load its current values, so the next save starts from them.
-					const { base, hash, roles, fallbacks } = r;
-					setState((old) => old && { ...old, base, hash, roles, fallbacks });
-					setRows(Object.entries(roles));
-					setChains(rowChains(Object.keys(roles), fallbacks));
-					setError(r.error);
-					return false;
-				}
-				setFields(r.fields);
-				setFallbackFields(r.fallbackFields);
-				setError(r.error);
-				return false;
-			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err));
+	const runSave = async (): Promise<boolean> => {
+		if (state === null) return false;
+		setError(null);
+		setFields({});
+		setFallbackFields({});
+		setCommit(null);
+		setSaved(null);
+		setProv(null);
+		setProvSince(null);
+		try {
+			const res = await fetch("/api/model-roles", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					base: state.base,
+					hash: state.hash,
+					roles: Object.fromEntries(rows),
+					fallbacks: rowChains(
+						rows.map(([name]) => name),
+						chains,
+					),
+				}),
+			});
+			const r = classifyRolesSave(
+				res.ok,
+				res.status,
+				await res.json().catch(() => ({})),
+			);
+			if (r.kind === "readonly") {
+				setRo({ path: r.path, cause: r.cause });
+				setRows(Object.entries(state.roles));
+				setChains(rowChains(Object.keys(state.roles), state.fallbacks));
+				setError(null);
+				setFields({});
+				setFallbackFields({});
 				return false;
 			}
-		});
+			if (r.kind === "saved") {
+				const { commit: sha, base, hash, roles, fallbacks, seed } = r;
+				setState(
+					(old) => old && { ...old, base, hash, roles, fallbacks, seed },
+				);
+				setRows(Object.entries(roles));
+				setChains(rowChains(Object.keys(roles), fallbacks));
+				setSaved({
+					seedAtSave: seed.commit,
+					after: roles,
+					afterFallbacks: fallbacks,
+				});
+				setCommit(sha);
+				// The commit stands even when the provision fails; the steps list says so.
+				await provision();
+				return true;
+			}
+			if (r.kind === "conflict") {
+				// The data repo moved: load its current values, so the next save starts from them.
+				const { base, hash, roles, fallbacks } = r;
+				setState((old) => old && { ...old, base, hash, roles, fallbacks });
+				setRows(Object.entries(roles));
+				setChains(rowChains(Object.keys(roles), fallbacks));
+				setError(r.error);
+				return false;
+			}
+			setFields(r.fields);
+			setFallbackFields(r.fallbackFields);
+			setError(r.error);
+			return false;
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	const submit = (): void => save.start(runSave);
 	const failed =
 		prov?.state === "done" ? prov.results.filter((r) => r.code !== 0) : [];
 	return (
@@ -4151,286 +4989,48 @@ export function ModelRolesSection() {
 			id="model-roles-section"
 			className="model-roles"
 			title="Model roles"
-			status={
-				loadErr !== null
-					? { label: "Unavailable", tone: "warn" }
-					: state === null
-						? undefined
-						: {
-								label: `${Object.keys(state.roles).length} roles`,
-								tone: "ok",
-							}
-			}
-			hint={
-				<>
-					omp runs each role with its model, then with its fallbacks in order.{" "}
-					{state?.base === null ? (
-						<>
-							Save writes <code>user/omp/agent/config.yml</code> through Alate's
-							file editor: Alate commits the folder itself when it is a git repo
-							(no GitHub token), then Alate provisions the workers.
-						</>
-					) : (
-						<>
-							Save commits <code>user/omp/agent/config.yml</code> to Alate's
-							data repo with the board's GitHub token, then Alate provisions the
-							workers.
-						</>
-					)}
-				</>
-			}
+			status={rolesStatus(loadErr, state)}
+			hint={<ModelRolesHint state={state} />}
 		>
-			{loadErr !== null ? (
-				<p className="hint" role="status">
-					Cannot load the model roles: {loadErr}.{" "}
-					<button
-						type="button"
-						className="notif-link"
-						onClick={() => openSettingsSection("alate-section")}
-					>
-						Open the Alate settings
-					</button>
-				</p>
-			) : state === null || catalog === null ? (
-				<Skeleton shape="rows" rows={4} label="Loading the model roles" />
-			) : (
-				<>
-					<div className="alate-def-rows">
-						{rows.map(([name, value], i) => {
-							const [base, level] = splitLevel(value);
-							const field = ownField(fields, name);
-							const warnings = roleWarnings(value, state.signIns);
-							const notesId =
-								field !== undefined || warnings.length > 0
-									? `${uid}-${i}`
-									: undefined;
-							return (
-								<div className="alate-def-row role-row" key={name}>
-									<b className="role-name">{name}</b>
-									<RoleModelPicker
-										label={`Model for ${name}`}
-										base={base}
-										level={level}
-										models={models}
-										setValue={(v) => setValue(name, v)}
-										disabled={save.busy || ro !== null}
-										invalid={field !== undefined}
-										describedBy={notesId}
-									/>
-									<ThinkingSelect
-										label={`Thinking for ${name}`}
-										base={base}
-										level={level}
-										setValue={(v) => setValue(name, v)}
-										disabled={save.busy || ro !== null}
-										invalid={field !== undefined}
-										describedBy={notesId}
-									/>
-									<button
-										type="button"
-										className="icon role-remove"
-										aria-label={`Remove role ${name}`}
-										title="Remove role"
-										onClick={() => removeRole(name)}
-										disabled={save.busy || ro !== null}
-									>
-										<Icon name="x" />
-									</button>
-									{notesId !== undefined && (
-										<div className="role-notes" id={notesId}>
-											{field !== undefined && (
-												<p className="auth-error">{field}</p>
-											)}
-											{warnings.map((w) => (
-												<p className="hint" key={w}>
-													<Mark kind="warn" />
-													{w}
-												</p>
-											))}
-										</div>
-									)}
-									<RoleFallbacks
-										role={name}
-										chain={ownField(chains, name)}
-										models={models}
-										first={first}
-										edit={(fn) => editChain(name, fn)}
-										disabled={save.busy || ro !== null}
-										error={ownField(fallbackFields, name)}
-										errorId={`${uid}-${i}-fallbacks`}
-									/>
-								</div>
-							);
-						})}
-					</div>
-					{missing.length > 0 && (
-						<p className="hint">
-							<Mark kind="warn" /> No {missing.join(" or ")} role
-							{missing.length > 1 ? "s" : ""}: second-model checks fall back to
-							the default model, which is often the model they check. critic
-							checks Anthropic models, adversary the rest.
-						</p>
-					)}
-					{ro !== null && (
-						<>
-							<p className="auth-error" role="alert">
-								read-only: folder source {ro.path}
-							</p>
-							<p className="hint">
-								{ro.cause === "mount" ? (
-									<>
-										The data folder is mounted read-only into Alate. Make the
-										mount writable, or edit{" "}
-										<code>user/omp/agent/config.yml</code> in the folder, then
-										run Import and Provision in Alate, and reload the settings.
-									</>
-								) : (
-									"Alate's data folder is not a git repo, so a save cannot commit. Make the folder a git repo or point Alate at a GitHub repo, then reload the settings."
-								)}
-							</p>
-						</>
-					)}
-					<form
-						className="role-add"
-						onSubmit={(e) => {
-							e.preventDefault();
-							add();
-						}}
-					>
-						<label className="field">
-							New role name
-							<input
-								type="text"
-								value={newName}
-								onChange={(e) => {
-									setNewName(e.target.value);
-									setAddErr(null);
-								}}
-								spellCheck={false}
-								autoComplete="off"
-								aria-invalid={addErr !== null}
-								aria-describedby={addErr !== null ? `${uid}-add` : undefined}
-								disabled={save.busy || ro !== null}
-							/>
-						</label>
-						<button type="submit" disabled={save.busy || ro !== null}>
-							Add role
-						</button>
-					</form>
-					{addErr !== null && (
-						<p className="auth-error" id={`${uid}-add`} role="alert">
-							{addErr}
-						</p>
-					)}
-					<div className="alate-def-actions">
-						<button
-							type="button"
-							// Plain button while read-only: the accent fill reads clickable even at
-							// the disabled opacity, and the editor must read locked.
-							className={
-								ro !== null
-									? undefined
-									: `primary${save.failed ? " failed" : ""}`
-							}
-							onClick={submit}
-							disabled={!dirty || save.busy || ro !== null}
-						>
-							{save.busy && <span className="spinner" aria-hidden="true" />}
-							Save
-						</button>
-					</div>
-				</>
-			)}
+			<ModelRolesContent
+				loadErr={loadErr}
+				state={state}
+				catalog={catalog}
+				uid={uid}
+				rows={rows}
+				chains={chains}
+				models={models}
+				first={first}
+				missing={missing}
+				ro={ro}
+				fields={fields}
+				fallbackFields={fallbackFields}
+				addErr={addErr}
+				newName={newName}
+				setNewName={setNewName}
+				setAddErr={setAddErr}
+				locked={locked}
+				dirty={dirty}
+				save={save}
+				onSetValue={setValue}
+				onRemoveRole={removeRole}
+				onEditChain={editChain}
+				onAdd={add}
+				onSubmit={submit}
+			/>
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
 				</p>
 			)}
-			<div aria-live="polite">
-				{commit !== null && (
-					<ol className="hint role-steps">
-						<li>
-							<Mark kind="done" />
-							Committed <code>{shortSha(commit)}</code> to the data repo.
-						</li>
-						<li>
-							{prov === null || prov.state === "running" ? (
-								<>
-									<span className="spinner" aria-hidden="true" />
-									Provisioning the workers…
-									{provSince !== null && (
-										<>
-											{" · "}
-											<LiveElapsed since={provSince} />
-										</>
-									)}
-								</>
-							) : prov.state === "still" ? (
-								<>
-									<Mark kind="queued" />
-									The provision still runs on the Alate server. The Alate
-									dashboard shows its result.
-								</>
-							) : prov.ok && failed.length === 0 ? (
-								<>
-									<Mark kind="done" />
-									Provisioned the workers.
-								</>
-							) : (
-								<>
-									<Mark kind="crit" />
-									The provision failed
-									{prov.error !== null
-										? `: ${prov.error}`
-										: failed.length > 0
-											? `: ${failed.length} of ${prov.results.length} scripts failed`
-											: ""}
-									. The commit stays in the data repo. Use Provision in the
-									Alate section to try again.
-								</>
-							)}
-						</li>
-						<li>
-							{step === null || step === "copy" ? (
-								<>
-									<Mark kind="done" />
-									The board reads the provisioned copy.
-								</>
-							) : step === "done" ? (
-								<>
-									<Mark kind="done" />
-									The board copy has the saved roles
-									{seed?.commit ? (
-										<>
-											{" "}
-											(seed <code>{shortSha(seed.commit)}</code>)
-										</>
-									) : null}
-									{seed?.expiresAt !== undefined ? (
-										<> · {expiryLine(seed.expiresAt)}</>
-									) : null}
-									.
-								</>
-							) : step === "replaced" ? (
-								<>
-									<Mark kind="done" />
-									The board copy has other roles: a later change replaced this
-									save.
-								</>
-							) : (
-								<>
-									<Mark kind="queued" />
-									Waiting for the hourly deploy to seed{" "}
-									<code>{shortSha(commit)}</code>.
-								</>
-							)}
-						</li>
-					</ol>
-				)}
-			</div>
-			{prov?.state === "done" && prov.results.length > 0 && (
-				<ProvisionResults results={prov.results} />
-			)}
+			<ModelRolesTail
+				commit={commit}
+				prov={prov}
+				provSince={provSince}
+				failed={failed}
+				step={step}
+				seed={seed}
+			/>
 		</SettingsCard>
 	);
 }
@@ -4695,6 +5295,172 @@ export function openSettingsSection(
 	return scrollToSectionWhenPresent(sectionId);
 }
 
+/** The status line a finished provision reports: the script count and the change totals. */
+const provisionStatus = (
+	rows: ProvisionResult[],
+	changed: string | null,
+): string => {
+	const failed = rows.filter((r) => r.code !== 0);
+	return failed.length === 0
+		? `Provisioned ${rows.length} script${rows.length === 1 ? "" : "s"} successfully.${changed === null ? "" : ` ${changed}.`}`
+		: `Provisioning failed: ${failed.length} of ${rows.length} script${rows.length === 1 ? "" : "s"} exited non-zero.`;
+};
+
+/** The stored-key row: reveal or copy the board's alate API key, or rotate it on the server. */
+function StoredKeyRow({
+	storedKey,
+	reveal,
+	copied,
+	keyError,
+	keyBusy,
+	onReveal,
+	onCopy,
+	onRegenerate,
+}: {
+	storedKey: string | null;
+	reveal: boolean;
+	copied: boolean;
+	keyError: string | null;
+	keyBusy: BusyState;
+	onReveal: () => void;
+	onCopy: () => void;
+	onRegenerate: () => void;
+}) {
+	return (
+		<div className="alate-def-row">
+			<div className="alate-def-name">
+				<b>
+					Stored API key
+					<Help
+						label="Stored API key"
+						text="This is the key the board stores for alate. Reveal or copy it to sign in to the alate dashboard. Regenerate rotates it on the alate server, and dashboard sessions end."
+					/>
+				</b>
+				<code>secret · hidden until revealed</code>
+			</div>
+			<div className="access-row">
+				<div className="access-key">
+					<code>
+						{reveal && storedKey !== null ? storedKey : "••••••••••••"}
+					</code>
+					<button
+						type="button"
+						className="icon"
+						aria-pressed={reveal}
+						aria-label={reveal ? "Hide Alate API key" : "Reveal Alate API key"}
+						title={reveal ? "Hide Alate API key" : "Reveal Alate API key"}
+						onClick={onReveal}
+						disabled={keyBusy.busy}
+					>
+						{keyBusy.busy && storedKey === null ? (
+							<span className="spinner" aria-hidden="true" />
+						) : (
+							<Icon name={reveal ? "eye-off" : "eye"} />
+						)}
+					</button>
+				</div>
+				<button
+					type="button"
+					className="icon"
+					aria-label={copied ? "Copied" : "Copy Alate API key"}
+					title={copied ? "Copied" : "Copy Alate API key"}
+					onClick={onCopy}
+				>
+					<Icon name={copied ? "check" : "copy"} />
+				</button>
+				<button
+					type="button"
+					className="icon danger"
+					aria-label="Regenerate Alate API key"
+					title="Regenerate Alate API key"
+					onClick={onRegenerate}
+					disabled={keyBusy.busy}
+				>
+					{keyBusy.busy ? (
+						<span className="spinner" aria-hidden="true" />
+					) : (
+						<Icon name="refresh-cw" />
+					)}
+				</button>
+			</div>
+			{keyError !== null && (
+				<p className="auth-error" role="alert">
+					{keyError}
+				</p>
+			)}
+		</div>
+	);
+}
+
+/** The form's action row: the connection Save and the Provision trigger. */
+function AlateActions({
+	saved,
+	save,
+	prov,
+	awaiting,
+	health,
+	onProvision,
+}: {
+	saved: boolean;
+	save: BusyState;
+	prov: BusyState;
+	awaiting: boolean;
+	health: AlateHealthState | null;
+	onProvision: () => void;
+}) {
+	return (
+		<div className="alate-def-actions">
+			<button
+				type="submit"
+				disabled={save.busy}
+				className={save.failed ? "failed" : undefined}
+			>
+				{save.busy && <span className="spinner" aria-hidden="true" />}
+				<SaveLabel saved={saved} />
+			</button>
+			<button
+				type="button"
+				onClick={onProvision}
+				disabled={prov.busy || awaiting}
+				className={`primary${health?.state === "ok" && health.pending ? " attention" : ""}`}
+			>
+				{(prov.busy || awaiting) && (
+					<span className="spinner" aria-hidden="true" />
+				)}
+				{awaiting ? "Provisioning…" : "Provision"}
+			</button>
+		</div>
+	);
+}
+
+/** The user-layer note after a provision: why it is empty and the sync command that fills it. */
+function UserLayerNote({
+	layer,
+}: {
+	layer: ProvisioningResponse["userLayer"] | null;
+}) {
+	if (layer === null) return null;
+	if (userLayerEmpty(layer))
+		return (
+			<>
+				{layer.mcp.length > 0 && <p className="hint">{userLayerLine(layer)}</p>}
+				<div className="prov-callout" role="status">
+					<Mark kind="needs" />
+					<span className="prov-callout-text">
+						<b>User layer is empty</b>
+						<small>
+							Workers get none of your skills or plugins. In a checkout of the
+							alate repo run{" "}
+							<code>node sync-user.mjs --data &lt;data-repo&gt;</code>, then
+							provision again.
+						</small>
+					</span>
+				</div>
+			</>
+		);
+	return <p className="hint">{userLayerLine(layer)}</p>;
+}
+
 /** Settings "Alate" section: provisioning config + one-shot provision trigger. */
 export function AlateSection() {
 	const [url, setUrl] = useState("");
@@ -4765,6 +5531,30 @@ export function AlateSection() {
 			}
 		});
 	};
+	const rotateKeyRun = async (): Promise<boolean> => {
+		// Raw read: a failed rotate may still carry the new key in the body.
+		try {
+			const res = await fetch("/api/settings/alate-key", { method: "POST" });
+			const body = await res.json().catch(() => ({}));
+			if (typeof body.apiKey === "string" && body.apiKey !== "") {
+				setStoredKey(body.apiKey);
+				setReveal(true);
+			}
+			if (!res.ok) {
+				setKeyError(
+					typeof body.error === "string"
+						? body.error
+						: `Regenerate failed (HTTP ${res.status}).`,
+				);
+				return false;
+			}
+			return true;
+		} catch (err) {
+			setKeyError(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+
 	const regenerateKey = async (): Promise<void> => {
 		if (
 			!(await confirmDialog(
@@ -4774,29 +5564,7 @@ export function AlateSection() {
 		)
 			return;
 		setKeyError(null);
-		keyBusy.start(async () => {
-			// Raw read: a failed rotate may still carry the new key in the body.
-			try {
-				const res = await fetch("/api/settings/alate-key", { method: "POST" });
-				const body = await res.json().catch(() => ({}));
-				if (typeof body.apiKey === "string" && body.apiKey !== "") {
-					setStoredKey(body.apiKey);
-					setReveal(true);
-				}
-				if (!res.ok) {
-					setKeyError(
-						typeof body.error === "string"
-							? body.error
-							: `Regenerate failed (HTTP ${res.status}).`,
-					);
-					return false;
-				}
-				return true;
-			} catch (err) {
-				setKeyError(err instanceof Error ? err.message : String(err));
-				return false;
-			}
-		});
+		keyBusy.start(rotateKeyRun);
 	};
 	const save = useBusy();
 	const prov = useBusy();
@@ -4902,79 +5670,73 @@ export function AlateSection() {
 			live = false;
 		};
 	}, [loadHealth, loadLayer]);
-	const submit = (): void =>
-		save.start(async () => {
-			setError(null);
-			try {
-				const body: Record<string, string> = {};
-				if (url.trim() !== "") body.url = url.trim();
-				const k = key.trim();
-				if (k !== "") body.key = k;
-				const cfg = await post<{
-					url: string | null;
-					keySet: boolean;
-					lastProvisionError: string | null;
-				}>("/api/alate", body);
-				setUrl(cfg.url ?? "");
-				setConn(cfg.url ?? "");
-				setKeySet(cfg.keySet);
-				setLastErr(cfg.lastProvisionError);
-				loadHealth(cfg.url ?? "");
-				setKey("");
-				flashSaved();
-				return true;
-			} catch (err) {
-				setError(err instanceof Error ? err.message : String(err));
-				return false;
-			}
-		});
-	const provision = (): void =>
-		prov.start(async () => {
-			setError(null);
-			setStatus(null);
-			setResults([]);
-			try {
-				const res = await post<{
-					ok: boolean;
-					running?: boolean;
-					results?: ProvisionResult[];
-				}>("/api/alate/provision", {});
-				if (res.running === true) {
-					// 202 from the board: its wait hit the transport bound, and alate's
-					// health reported the run as still running. Not a failure — the
-					// health probe follows the run until it converges, alate stops
-					// answering, or the deadline passes. Drop the probe snapshot taken
-					// before the click: it predates the run, so the convergence effect
-					// must wait for the fresh read below.
-					setHealth(null);
-					setStatus(
-						"Provisioning is still running on the alate server; the hint above follows it.",
-					);
-					watchDowns.current = 0;
-					setWatchSince(Date.now());
-					loadHealth(conn);
-					loadLayer();
-					return true;
-				}
-				const rows = res.results ?? [];
-				setResults(rows);
+	const runSave = async (): Promise<boolean> => {
+		setError(null);
+		try {
+			const body: Record<string, string> = {};
+			if (url.trim() !== "") body.url = url.trim();
+			const k = key.trim();
+			if (k !== "") body.key = k;
+			const cfg = await post<{
+				url: string | null;
+				keySet: boolean;
+				lastProvisionError: string | null;
+			}>("/api/alate", body);
+			setUrl(cfg.url ?? "");
+			setConn(cfg.url ?? "");
+			setKeySet(cfg.keySet);
+			setLastErr(cfg.lastProvisionError);
+			loadHealth(cfg.url ?? "");
+			setKey("");
+			flashSaved();
+			return true;
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	const submit = (): void => save.start(runSave);
+	const runProvision = async (): Promise<boolean> => {
+		setError(null);
+		setStatus(null);
+		setResults([]);
+		try {
+			const res = await post<{
+				ok: boolean;
+				running?: boolean;
+				results?: ProvisionResult[];
+			}>("/api/alate/provision", {});
+			if (res.running === true) {
+				// 202 from the board: its wait hit the transport bound, and alate's
+				// health reported the run as still running. Not a failure — the
+				// health probe follows the run until it converges, alate stops
+				// answering, or the deadline passes. Drop the probe snapshot taken
+				// before the click: it predates the run, so the convergence effect
+				// must wait for the fresh read below.
+				setHealth(null);
+				setStatus(
+					"Provisioning is still running on the alate server; the hint above follows it.",
+				);
+				watchDowns.current = 0;
+				setWatchSince(Date.now());
 				loadHealth(conn);
 				loadLayer();
-				if (res.ok) setLastErr(null);
-				const failed = rows.filter((r) => r.code !== 0);
-				const changed = provisionChangeSummary(rows);
-				setStatus(
-					failed.length === 0
-						? `Provisioned ${rows.length} script${rows.length === 1 ? "" : "s"} successfully.${changed === null ? "" : ` ${changed}.`}`
-						: `Provisioning failed: ${failed.length} of ${rows.length} script${rows.length === 1 ? "" : "s"} exited non-zero.`,
-				);
-				return res.ok;
-			} catch (err) {
-				setStatus("Provisioning failed.");
-				setError(err instanceof Error ? err.message : String(err));
-				return false;
+				return true;
 			}
-		});
+			const rows = res.results ?? [];
+			setResults(rows);
+			loadHealth(conn);
+			loadLayer();
+			if (res.ok) setLastErr(null);
+			setStatus(provisionStatus(rows, provisionChangeSummary(rows)));
+			return res.ok;
+		} catch (err) {
+			setStatus("Provisioning failed.");
+			setError(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	const provision = (): void => prov.start(runProvision);
 	return (
 		<SettingsCard
 			id="alate-section"
@@ -5050,95 +5812,26 @@ export function AlateSection() {
 						</label>
 					</div>
 					{conn !== "" && keySet && (
-						<div className="alate-def-row">
-							<div className="alate-def-name">
-								<b>
-									Stored API key
-									<Help
-										label="Stored API key"
-										text="This is the key the board stores for alate. Reveal or copy it to sign in to the alate dashboard. Regenerate rotates it on the alate server, and dashboard sessions end."
-									/>
-								</b>
-								<code>secret · hidden until revealed</code>
-							</div>
-							<div className="access-row">
-								<div className="access-key">
-									<code>
-										{reveal && storedKey !== null ? storedKey : "••••••••••••"}
-									</code>
-									<button
-										type="button"
-										className="icon"
-										aria-pressed={reveal}
-										aria-label={
-											reveal ? "Hide Alate API key" : "Reveal Alate API key"
-										}
-										title={
-											reveal ? "Hide Alate API key" : "Reveal Alate API key"
-										}
-										onClick={revealKey}
-										disabled={keyBusy.busy}
-									>
-										{keyBusy.busy && storedKey === null ? (
-											<span className="spinner" aria-hidden="true" />
-										) : (
-											<Icon name={reveal ? "eye-off" : "eye"} />
-										)}
-									</button>
-								</div>
-								<button
-									type="button"
-									className="icon"
-									aria-label={copied ? "Copied" : "Copy Alate API key"}
-									title={copied ? "Copied" : "Copy Alate API key"}
-									onClick={copyKey}
-								>
-									<Icon name={copied ? "check" : "copy"} />
-								</button>
-								<button
-									type="button"
-									className="icon danger"
-									aria-label="Regenerate Alate API key"
-									title="Regenerate Alate API key"
-									onClick={regenerateKey}
-									disabled={keyBusy.busy}
-								>
-									{keyBusy.busy ? (
-										<span className="spinner" aria-hidden="true" />
-									) : (
-										<Icon name="refresh-cw" />
-									)}
-								</button>
-							</div>
-							{keyError !== null && (
-								<p className="auth-error" role="alert">
-									{keyError}
-								</p>
-							)}
-						</div>
+						<StoredKeyRow
+							storedKey={storedKey}
+							reveal={reveal}
+							copied={copied}
+							keyError={keyError}
+							keyBusy={keyBusy}
+							onReveal={revealKey}
+							onCopy={copyKey}
+							onRegenerate={regenerateKey}
+						/>
 					)}
 				</div>
-				<div className="alate-def-actions">
-					<button
-						type="submit"
-						disabled={save.busy}
-						className={save.failed ? "failed" : undefined}
-					>
-						{save.busy && <span className="spinner" aria-hidden="true" />}
-						<SaveLabel saved={saved} />
-					</button>
-					<button
-						type="button"
-						onClick={provision}
-						disabled={prov.busy || awaiting}
-						className={`primary${health?.state === "ok" && health.pending ? " attention" : ""}`}
-					>
-						{(prov.busy || awaiting) && (
-							<span className="spinner" aria-hidden="true" />
-						)}
-						{awaiting ? "Provisioning…" : "Provision"}
-					</button>
-				</div>
+				<AlateActions
+					saved={saved}
+					save={save}
+					prov={prov}
+					awaiting={awaiting}
+					health={health}
+					onProvision={provision}
+				/>
 			</form>
 			{error !== null && (
 				<p className="auth-error" role="alert">
@@ -5148,28 +5841,7 @@ export function AlateSection() {
 			<p className="hint" aria-live="polite">
 				{status}
 			</p>
-			{layer !== null &&
-				(userLayerEmpty(layer) ? (
-					<>
-						{layer.mcp.length > 0 && (
-							<p className="hint">{userLayerLine(layer)}</p>
-						)}
-						<div className="prov-callout" role="status">
-							<Mark kind="needs" />
-							<span className="prov-callout-text">
-								<b>User layer is empty</b>
-								<small>
-									Workers get none of your skills or plugins. In a checkout of
-									the alate repo run{" "}
-									<code>node sync-user.mjs --data &lt;data-repo&gt;</code>, then
-									provision again.
-								</small>
-							</span>
-						</div>
-					</>
-				) : (
-					<p className="hint">{userLayerLine(layer)}</p>
-				))}
+			<UserLayerNote layer={layer} />
 			<ProvisionResults results={results} />
 		</SettingsCard>
 	);
@@ -5710,6 +6382,164 @@ function SettingsMap({
 	);
 }
 
+/** The nearest ancestor whose overflowY scrolls: the scroller that hosts the TOC. */
+const scrollerOf = (
+	first: HTMLElement | null | undefined,
+): HTMLElement | null => {
+	let root = first ?? null;
+	while (root !== null && !/auto|scroll/.test(getComputedStyle(root).overflowY))
+		root = root.parentElement;
+	return root;
+};
+
+/** The scroll position's active TOC id: the last section whose top crosses the watch
+ *  line; the last id wins at the bottom of the scroller. */
+const pickActiveToc = (
+	ids: readonly string[],
+	setActive: (id: string | null) => void,
+): void => {
+	const root = scrollerOf(document.getElementById(ids[0] ?? "")?.parentElement);
+	const r = root ?? document.documentElement;
+	const box = root?.getBoundingClientRect() ?? {
+		top: 0,
+		height: window.innerHeight,
+	};
+	if (r.scrollTop > 0 && r.scrollTop + r.clientHeight >= r.scrollHeight - 2) {
+		setActive(ids[ids.length - 1] ?? null);
+		return;
+	}
+	const line = box.top + Math.min(120, box.height * 0.3);
+	let cur = ids[0] ?? null;
+	for (const id of ids) {
+		const top = document.getElementById(id)?.getBoundingClientRect().top;
+		if (top !== undefined && top <= line) cur = id;
+	}
+	setActive(cur);
+};
+
+/** The machine-wide settings groups: Board, Access, Git and secrets, Agents. A group
+ *  renders only while the TOC keeps it; hosted mode drops a group with no card left. */
+function GeneralSettingsContent({
+	map,
+	general,
+	host,
+	projects,
+	maxTotal,
+	reviewCheck,
+	workCheck,
+	idleReviews,
+	trendingScan,
+	trendingStatus,
+	allocated,
+	commitIdentity,
+	act,
+}: {
+	map: ReactNode;
+	general: boolean;
+	host: boolean;
+	projects: ProjectView[];
+	maxTotal: number | null;
+	reviewCheck: boolean;
+	workCheck: boolean;
+	idleReviews: boolean;
+	trendingScan: boolean;
+	trendingStatus: TrendingStatus;
+	allocated: number;
+	commitIdentity: CommitIdentity | null;
+	act: Act;
+}) {
+	const shown = (id: string): boolean => !hostedHidden(host, id);
+	const groupShown = (id: string): boolean =>
+		pageToc(general, host).some((g) => g.id === id);
+	return (
+		<>
+			<details className="settings-toc-mobile">
+				<summary>
+					On this page
+					<Icon name="chevron-right" size={16} />
+				</summary>
+				{map}
+			</details>
+			{groupShown("board-group") && (
+				<section
+					className="settings-group"
+					id="board-group"
+					aria-labelledby="board-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="board-group-title">
+						Board
+					</h2>
+					{shown("runners-section") && (
+						<TotalRunnersForm
+							maxTotal={maxTotal}
+							reviewCheck={reviewCheck}
+							workCheck={workCheck}
+							idleReviews={idleReviews}
+							trendingScan={trendingScan}
+							trendingStatus={trendingStatus}
+							allocated={allocated}
+							act={act}
+						/>
+					)}
+					{shown("projects-section") && (
+						<ProjectsOrderSection projects={projects} act={act} />
+					)}
+					<NotificationsSection projects={projects} act={act} />
+				</section>
+			)}
+			{groupShown("access-group") && (
+				<section
+					className="settings-group"
+					id="access-group"
+					aria-labelledby="access-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="access-group-title">
+						Access
+					</h2>
+					{shown("api-key-section") && <ApiKeySection />}
+					{shown("session-section") && <SessionSection />}
+					{shown("omp-stats-section") && <OmpStatsSection />}
+				</section>
+			)}
+			{groupShown("git-group") && (
+				<section
+					className="settings-group"
+					id="git-group"
+					aria-labelledby="git-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="git-group-title">
+						Git and secrets
+					</h2>
+					{shown("git-hosts-section") && <GitHostsSection />}
+					{shown("commit-identity-section") && (
+						<CommitIdentitySection commitIdentity={commitIdentity} act={act} />
+					)}
+					<EnvSection />
+				</section>
+			)}
+			{groupShown("agents-group") && (
+				<section
+					className="settings-group"
+					id="agents-group"
+					aria-labelledby="agents-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="agents-group-title">
+						Agents
+					</h2>
+					{shown("signin-section") && <ProviderLoginSection />}
+					{shown("model-roles-section") && <ModelRolesSection />}
+					{shown("alate-section") && <AlateSection />}
+					{shown("hindsight-section") && <HindsightSection />}
+				</section>
+			)}
+		</>
+	);
+}
+
 export function SettingsPage({
 	projects,
 	tasks,
@@ -5752,10 +6582,6 @@ export function SettingsPage({
 	);
 	const general = project === null;
 	const host = hosted === true;
-	const shown = (id: string): boolean => !hostedHidden(host, id);
-	// A group renders only while the TOC keeps it: hosted mode drops a group with no card left.
-	const groupShown = (id: string): boolean =>
-		pageToc(general, host).some((g) => g.id === id);
 	const [active, setActive] = useState<string | null>(null);
 	// The clicked entry stays current until the user scrolls, because the end of the page can show several cards.
 	const pinned = useRef<string | null>(null);
@@ -5772,31 +6598,7 @@ export function SettingsPage({
 		);
 		const pick = () => {
 			if (pinned.current !== null) return;
-			let root = document.getElementById(ids[0] ?? "")?.parentElement ?? null;
-			while (
-				root !== null &&
-				!/auto|scroll/.test(getComputedStyle(root).overflowY)
-			)
-				root = root.parentElement;
-			const r = root ?? document.documentElement;
-			const box = root?.getBoundingClientRect() ?? {
-				top: 0,
-				height: window.innerHeight,
-			};
-			if (
-				r.scrollTop > 0 &&
-				r.scrollTop + r.clientHeight >= r.scrollHeight - 2
-			) {
-				setActive(ids[ids.length - 1] ?? null);
-				return;
-			}
-			const line = box.top + Math.min(120, box.height * 0.3);
-			let cur = ids[0] ?? null;
-			for (const id of ids) {
-				const top = document.getElementById(id)?.getBoundingClientRect().top;
-				if (top !== undefined && top <= line) cur = id;
-			}
-			setActive(cur);
+			pickActiveToc(ids, setActive);
 		};
 		// ponytail: capture-phase scroll listener instead of an observer; it sees scrolls of any container and fires for tall cards crossing the line.
 		const unpin = () => {
@@ -5891,94 +6693,21 @@ export function SettingsPage({
 			<div className="settings-content" key={view}>
 				<h1>Settings</h1>
 				{project === null ? (
-					<>
-						<details className="settings-toc-mobile">
-							<summary>
-								On this page
-								<Icon name="chevron-right" size={16} />
-							</summary>
-							{map}
-						</details>
-						{groupShown("board-group") && (
-							<section
-								className="settings-group"
-								id="board-group"
-								aria-labelledby="board-group-title"
-								tabIndex={-1}
-							>
-								<h2 className="settings-group-title" id="board-group-title">
-									Board
-								</h2>
-								{shown("runners-section") && (
-									<TotalRunnersForm
-										maxTotal={maxTotal}
-										reviewCheck={reviewCheck}
-										workCheck={workCheck}
-										idleReviews={idleReviews}
-										trendingScan={trendingScan}
-										trendingStatus={trendingStatus}
-										allocated={allocated}
-										act={act}
-									/>
-								)}
-								{shown("projects-section") && (
-									<ProjectsOrderSection projects={projects} act={act} />
-								)}
-								<NotificationsSection projects={projects} act={act} />
-							</section>
-						)}
-						{groupShown("access-group") && (
-							<section
-								className="settings-group"
-								id="access-group"
-								aria-labelledby="access-group-title"
-								tabIndex={-1}
-							>
-								<h2 className="settings-group-title" id="access-group-title">
-									Access
-								</h2>
-								{shown("api-key-section") && <ApiKeySection />}
-								{shown("session-section") && <SessionSection />}
-								{shown("omp-stats-section") && <OmpStatsSection />}
-							</section>
-						)}
-						{groupShown("git-group") && (
-							<section
-								className="settings-group"
-								id="git-group"
-								aria-labelledby="git-group-title"
-								tabIndex={-1}
-							>
-								<h2 className="settings-group-title" id="git-group-title">
-									Git and secrets
-								</h2>
-								{shown("git-hosts-section") && <GitHostsSection />}
-								{shown("commit-identity-section") && (
-									<CommitIdentitySection
-										commitIdentity={commitIdentity}
-										act={act}
-									/>
-								)}
-								<EnvSection />
-							</section>
-						)}
-						{groupShown("agents-group") && (
-							<section
-								className="settings-group"
-								id="agents-group"
-								aria-labelledby="agents-group-title"
-								tabIndex={-1}
-							>
-								<h2 className="settings-group-title" id="agents-group-title">
-									Agents
-								</h2>
-								{shown("signin-section") && <ProviderLoginSection />}
-								{shown("model-roles-section") && <ModelRolesSection />}
-								{shown("alate-section") && <AlateSection />}
-								{shown("hindsight-section") && <HindsightSection />}
-							</section>
-						)}
-					</>
+					<GeneralSettingsContent
+						map={map}
+						general={general}
+						host={host}
+						projects={projects}
+						maxTotal={maxTotal}
+						reviewCheck={reviewCheck}
+						workCheck={workCheck}
+						idleReviews={idleReviews}
+						trendingScan={trendingScan}
+						trendingStatus={trendingStatus}
+						allocated={allocated}
+						commitIdentity={commitIdentity}
+						act={act}
+					/>
 				) : (
 					<>
 						<details className="settings-toc-mobile">
@@ -6061,6 +6790,805 @@ function ReviewCounter({
 	);
 }
 
+/** The microVM switch's desc: why the switch may be off, then the Firecracker explainer. */
+const microVmDesc = (project: ProjectView, on: boolean): string =>
+	`${project.vmRunner.ok ? "" : project.vmRunner.configured ? `vm-runner is not ready (${project.vmRunner.reason ?? "no answer"})${on ? "; work turns wait until it is" : ""}. ` : "Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). "}Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.`;
+
+/** The switch tag when the repo is known-private: the outside watch is not needed. */
+const privateTagFor = (privateRepo: boolean | null): string | undefined =>
+	privateRepo === true ? "Not needed: private repo" : undefined;
+
+/** The desc prefix when the repo is known-private: nothing outside to watch. */
+const privateNoteFor = (privateRepo: boolean | null, what: string): string =>
+	privateRepo === true ? `Private repo: no outside ${what}. ` : "";
+
+/** The Updates card: the per-project watch and merge-hold switches. Hosted mode drops it. */
+function ProjectUpdatesCard({
+	project,
+	st,
+	send,
+	privateTag,
+	privateNote,
+	trendingScan,
+	act,
+}: {
+	project: ProjectView;
+	st: ProjectView["settings"];
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+	privateTag: string | undefined;
+	privateNote: (what: string) => string;
+	trendingScan: boolean;
+	act: Act;
+}) {
+	return (
+		<SettingsCard
+			id="project-updates-section"
+			title="Updates"
+			status={updatesChip(project.settings)}
+		>
+			<div className="alate-def-rows">
+				{/* U7: hold update-card merges at needs_you until a reply approves them. */}
+				<CheckRow
+					name="Hold update merges"
+					desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
+					checked={st.holdUpdateMerges}
+					save={(v) => send({ holdUpdateMerges: v })}
+					act={act}
+				/>
+				{/* OTTR-689: hold fork-born card merges at needs_you until a reply approves them. */}
+				<CheckRow
+					name="Hold fork-born merges"
+					desc="Fork-born cards wait at needs_you; your reply approves the merge of the card's work before it reaches the target branch. Turning this off does not release parked cards"
+					checked={st.forkMergeHold}
+					save={(v) => send({ forkMergeHold: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Retro"
+					desc="After each done task the supervisor proposes follow-up cards from its retro"
+					checked={st.retroSince !== null}
+					save={(v) => send({ retro: v })}
+					act={act}
+				/>
+				<CheckRow
+					sub
+					name="Friction filter"
+					desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
+					checked={st.retroFilter}
+					disabled={st.retroSince === null}
+					save={(v) => send({ retroFilter: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Fork research"
+					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
+					tag={privateTag}
+					checked={st.forkResearch}
+					save={(v) => send({ forkResearch: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Trending scout"
+					desc={
+						!trendingScan ? (
+							<>
+								The general 'Weekly trending scan' switch is off, so the scout
+								never runs — turn it on in{" "}
+								<a
+									href={`${settingsPath(null)}#runners-section`}
+									onClick={(e) =>
+										navClick(e, () => openSettingsSection("runners-section"))
+									}
+								>
+									General settings
+								</a>
+								. Weekly: an agent judges GitHub trending repos for this project
+								and files up to 3 backlog proposals
+							</>
+						) : (
+							"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+						)
+					}
+					checked={st.trendingScout}
+					disabled={!trendingScan && !st.trendingScout}
+					save={(v) => send({ trendingScout: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="PR reviews"
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("pull requests to review")}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
+					tag={privateTag}
+					checked={st.prReviews}
+					disabled={project.github === null && !st.prReviews}
+					save={(v) => send({ prReviews: v })}
+					act={act}
+				/>
+				<CheckRow
+					sub
+					name="PR review notifications"
+					desc="Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews"
+					checked={st.prReviewNotify}
+					disabled={!st.prReviews}
+					save={(v) => send({ prReviewNotify: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="PR mode"
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
+					checked={st.prMode}
+					disabled={project.github === null && !st.prMode}
+					save={(v) => send({ prMode: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Issue watch"
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+					tag={privateTag}
+					checked={st.issueWatch}
+					disabled={project.github === null && !st.issueWatch}
+					save={(v) => send({ issueWatch: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="omp watch"
+					desc="Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker."
+					checked={st.ompWatch}
+					save={(v) => send({ ompWatch: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Run work turns in microVMs"
+					desc={microVmDesc(project, st.microVm)}
+					checked={st.microVm}
+					disabled={!project.vmRunner.ok && !st.microVm}
+					save={(v) => send({ microVm: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Push sync commits"
+					desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
+					checked={st.pushSyncCommits}
+					save={(v) => send({ pushSyncCommits: v })}
+					act={act}
+				/>
+			</div>
+		</SettingsCard>
+	);
+}
+
+/** The project group: the icon card and the identity card (display name and task-id prefix). */
+function ProjectIdentitySection({
+	project,
+	st,
+	act,
+	icon,
+	markerSave,
+	marker,
+	setMarker,
+	markerDirty,
+	markerFormId,
+	markerFieldId,
+	label,
+	setLabel,
+	prefix,
+	setPrefix,
+	labelFieldId,
+	prefixFieldId,
+	send,
+}: {
+	project: ProjectView;
+	st: ProjectView["settings"];
+	act: Act;
+	icon: InstantSave;
+	markerSave: InstantSave;
+	marker: string;
+	setMarker: (v: string) => void;
+	markerDirty: boolean;
+	markerFormId: string;
+	markerFieldId: string;
+	label: string;
+	setLabel: (v: string) => void;
+	prefix: string;
+	setPrefix: (v: string) => void;
+	labelFieldId: string;
+	prefixFieldId: string;
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+}) {
+	return (
+		<section
+			className="settings-group"
+			id="project-group"
+			aria-labelledby="project-group-title"
+			tabIndex={-1}
+		>
+			<h2 className="settings-group-title" id="project-group-title">
+				Project
+			</h2>
+			<SettingsCard
+				id="project-icon-section"
+				title="Icon"
+				status={
+					st.iconText
+						? { label: "Text", tone: "ok" }
+						: project.icon !== null
+							? { label: "Uploaded", tone: "ok" }
+							: { label: "Default", tone: "off" }
+				}
+			>
+				<div className="alate-def-rows">
+					<DefRow
+						name="Project icon"
+						help="An image that replaces the project's letters on the board. Without one, Ottr uses the repo owner's avatar or the host's favicon, and then the letters."
+						shape="PNG, JPEG, WebP or GIF"
+					>
+						<div className="icon-row">
+							<span className="icon-preview">
+								<ProjectTag project={project} />
+							</span>
+							{/* The label keeps the hidden input keyboard-operable: tab to it, Enter opens the picker. */}
+							<label className="icon-upload ghost">
+								Upload
+								<input
+									type="file"
+									accept="image/png,image/jpeg,image/webp,image/gif"
+									onChange={(e) => {
+										const file = e.target.files?.[0];
+										e.target.value = "";
+										if (!file) return;
+										icon.run(async () => {
+											const res = await fetch(
+												`/api/projects/${encodeURIComponent(project.name)}/icon`,
+												{ method: "POST", body: file },
+											);
+											if (!res.ok)
+												throw new Error(
+													await httpProblem(res, "the icon upload"),
+												);
+										});
+									}}
+								/>
+							</label>
+							{project.icon !== null && (
+								<button
+									type="button"
+									className="danger"
+									disabled={icon.busy}
+									onClick={async () => {
+										if (
+											!(await confirmDialog(
+												"Delete the uploaded icon? The project falls back to its source icon or letters.",
+												{ ok: "Delete icon", danger: true },
+											))
+										)
+											return;
+										icon.run(async () => {
+											const res = await fetch(
+												`/api/projects/${encodeURIComponent(project.name)}/icon`,
+												{ method: "DELETE" },
+											);
+											if (!res.ok)
+												throw new Error(
+													await httpProblem(res, "the icon removal"),
+												);
+										});
+									}}
+								>
+									Delete icon
+								</button>
+							)}
+							<SaveTick
+								busy={icon.busy}
+								saved={icon.saved}
+								failed={icon.failed}
+								reason={icon.reason}
+							/>
+						</div>
+					</DefRow>
+					<DefRow
+						name="Text marker"
+						action={
+							<SaveButton
+								form={markerFormId}
+								s={markerSave}
+								dirty={markerDirty}
+							/>
+						}
+						help="Up to 4 characters shown on the plate instead of any icon: this upload, the owner's avatar or the host's favicon. Empty shows the images again."
+						shape="Up to 4 characters"
+						optional
+					>
+						<form
+							id={markerFormId}
+							onSubmit={(e) => {
+								e.preventDefault();
+								if (markerDirty)
+									markerSave.run(() =>
+										send({ iconText: marker.trim() || null }),
+									);
+							}}
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										id={markerFieldId}
+										type="text"
+										maxLength={4}
+										value={marker}
+										onChange={(e) => setMarker(e.target.value)}
+										placeholder="e.g. OT"
+										aria-label="Text marker"
+										aria-invalid={markerSave.failed || undefined}
+										aria-describedby={
+											markerSave.failed ? `${markerFieldId}-err` : undefined
+										}
+									/>
+								</label>
+								{markerSave.failed && (
+									<p
+										className="auth-error"
+										id={`${markerFieldId}-err`}
+										role="alert"
+									>
+										{markerSave.reason ?? "Not saved"}
+									</p>
+								)}
+							</div>
+						</form>
+					</DefRow>
+				</div>
+			</SettingsCard>
+			{/* Both typed fields save through one footer Save: a prefix change renames the
+				project route, so one deliberate save for the card fits. */}
+			<SaveCard
+				id="project-identity-section"
+				act={act}
+				dirty={
+					label.trim() !== (st.displayName ?? "") ||
+					prefix.trim().toUpperCase() !== (st.taskIdPrefix ?? "")
+				}
+				save={async () => {
+					const r = await send({
+						displayName: label.trim() || null,
+						taskIdPrefix: prefix.trim() || null,
+					});
+					if (r.name !== project.name)
+						settingsNavigate(`${SETTINGS_HASH}/${r.name}`);
+				}}
+				title="Identity"
+				status={
+					project.github !== null
+						? { label: "GitHub", tone: "ok" }
+						: project.gitless
+							? { label: "No git", tone: "off" }
+							: { label: "Local git", tone: "off" }
+				}
+			>
+				{(save, ident) => (
+					<>
+						<DefRow
+							name="Display name"
+							optional
+							help="A friendly name for the board. The folder and the repo keep their real names."
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										id={labelFieldId}
+										type="text"
+										maxLength={60}
+										value={label}
+										onChange={(e) => setLabel(e.target.value)}
+										placeholder={project.name}
+										aria-label="Display name"
+										aria-invalid={ident.failed || undefined}
+										aria-describedby={
+											ident.failed ? `${labelFieldId}-err` : undefined
+										}
+									/>
+								</label>
+								{ident.failed && (
+									<p
+										className="auth-error"
+										id={`${labelFieldId}-err`}
+										role="alert"
+									>
+										{ident.reason ?? "Not saved"}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						<DefRow
+							name="Task ID prefix"
+							help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
+							shape="empty = from folder name"
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										id={prefixFieldId}
+										type="text"
+										maxLength={8}
+										value={prefix}
+										onChange={(e) => setPrefix(e.target.value)}
+										placeholder={project.taskPrefix}
+										aria-label="Task ID prefix"
+										aria-invalid={ident.failed || undefined}
+										aria-describedby={
+											ident.failed ? `${prefixFieldId}-err` : undefined
+										}
+									/>
+								</label>
+								{ident.failed && (
+									<p
+										className="auth-error"
+										id={`${prefixFieldId}-err`}
+										role="alert"
+									>
+										{ident.reason ?? "Not saved"}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
+						<DefRow
+							name="Folder path"
+							desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
+						>
+							<code>{project.path}</code>
+						</DefRow>
+						{project.github !== null && (
+							<DefRow
+								name="GitHub"
+								desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
+							>
+								<a
+									href={project.github}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									{project.github}
+								</a>
+							</DefRow>
+						)}
+						{/* One save for the card (OTTR-679): the action row closes the form. */}
+						<div className="alate-def-actions">{save}</div>
+					</>
+				)}
+			</SaveCard>
+		</section>
+	);
+}
+
+/** The slots group: runner slots, worktrees, and the images cap. */
+function ProjectSlotsSection({
+	project,
+	st,
+	act,
+	send,
+	mp,
+	setMp,
+	mi,
+	setMi,
+	kwd,
+	setKwd,
+	extra,
+	setExtra,
+	tb,
+	setTb,
+	paths,
+	parallel,
+	imagesMax,
+	keepDays,
+	branchFieldId,
+}: {
+	project: ProjectView;
+	st: ProjectView["settings"];
+	act: Act;
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+	mp: string;
+	setMp: (v: string) => void;
+	mi: string;
+	setMi: (v: string) => void;
+	kwd: string;
+	setKwd: (v: string) => void;
+	extra: string;
+	setExtra: (v: string) => void;
+	tb: string;
+	setTb: (v: string) => void;
+	paths: string[];
+	parallel: number | null;
+	imagesMax: number;
+	keepDays: number;
+	branchFieldId: string;
+}) {
+	return (
+		<section
+			className="settings-group"
+			id="project-work-group"
+			aria-labelledby="project-work-group-title"
+			tabIndex={-1}
+		>
+			<h2 className="settings-group-title" id="project-work-group-title">
+				Work
+			</h2>
+			<SaveCard
+				id="project-runners-section"
+				act={act}
+				dirty={parallel !== st.maxParallel}
+				save={() => send({ maxParallel: parallel })}
+				title="Runners"
+				status={
+					project.settings.maxParallel === null
+						? { label: "No cap", tone: "off" }
+						: { label: `Cap ${project.settings.maxParallel}`, tone: "ok" }
+				}
+			>
+				{(save) => (
+					<>
+						<DefRow
+							name="Runner cap"
+							action={save}
+							help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
+							shape="empty = no cap"
+						>
+							<label>
+								<input
+									type="number"
+									min={1}
+									value={mp}
+									onChange={(e) => setMp(e.target.value)}
+									aria-label="Runner cap"
+								/>
+							</label>
+						</DefRow>
+					</>
+				)}
+			</SaveCard>
+			<SaveCard
+				id="project-worktrees-section"
+				act={act}
+				dirty={
+					tb.trim() !== (st.targetBranch ?? "") ||
+					paths.join("\n") !== st.copyExtra.join("\n") ||
+					keepDays !== st.keptWorktreeDays
+				}
+				save={() =>
+					send({
+						targetBranch: tb.trim() || null,
+						copyExtra: paths,
+						keptWorktreeDays: keepDays,
+					})
+				}
+				title="Worktrees"
+				status={
+					project.settings.copyExtra.length > 0
+						? {
+								label: `${project.settings.copyExtra.length} extra path${project.settings.copyExtra.length === 1 ? "" : "s"}`,
+								tone: "ok",
+							}
+						: { label: "No extra paths", tone: "off" }
+				}
+				hint={
+					'A card that kept its worktree ("Kept the worktree: …" after a turn, "Cancel kept the worktree: …" after a cancel) sits until you answer it. After the idle days below (0 = immediately) the supervisor quarantines its untracked files into .tasks/quarantine and removes the worktree — but only when no tracked change or unpushed commit would be lost.'
+				}
+			>
+				{(_save, wtS) => (
+					<>
+						<DefRow
+							name="Target branch"
+							help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
+							shape="branch name · empty = default"
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										id={branchFieldId}
+										type="text"
+										maxLength={200}
+										placeholder="main"
+										aria-label="Target branch for merges"
+										value={tb}
+										onChange={(e) => setTb(e.target.value)}
+										aria-invalid={wtS.failed || undefined}
+										aria-describedby={
+											wtS.failed ? `${branchFieldId}-err` : undefined
+										}
+									/>
+								</label>
+								{wtS.failed && (
+									<p
+										className="auth-error"
+										id={`${branchFieldId}-err`}
+										role="alert"
+									>
+										{wtS.reason ?? "Not saved"}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						<DefRow
+							name="Extra paths"
+							help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
+							shape="one path per line"
+						>
+							<label>
+								<textarea
+									rows={3}
+									value={extra}
+									onChange={(e) => setExtra(e.target.value)}
+									placeholder="scripts/release.mjs"
+									aria-label="Extra paths"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							name="Quarantine after"
+							help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
+							shape="days · 0 = immediately"
+						>
+							<label>
+								<input
+									type="number"
+									min={0}
+									max={365}
+									required
+									value={kwd}
+									onChange={(e) => setKwd(e.target.value)}
+									aria-label="Quarantine kept worktrees after this many idle days"
+								/>
+							</label>
+						</DefRow>
+					</>
+				)}
+			</SaveCard>
+			<SaveCard
+				id="project-messages-section"
+				act={act}
+				dirty={imagesMax !== st.maxImages}
+				save={() => send({ maxImages: imagesMax })}
+				title="Messages"
+				status={{
+					label: `${project.settings.maxImages} image${project.settings.maxImages === 1 ? "" : "s"}`,
+					tone: "off",
+				}}
+			>
+				{(save) => (
+					<>
+						<DefRow
+							name="Max images"
+							action={save}
+							help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
+							shape="1 or more"
+						>
+							<label>
+								<input
+									type="number"
+									min={1}
+									required
+									value={mi}
+									onChange={(e) => setMi(e.target.value)}
+									aria-label="Max images per message"
+								/>
+							</label>
+						</DefRow>
+					</>
+				)}
+			</SaveCard>
+		</section>
+	);
+}
+
+/** The releases and reviews cards: the release command and the review interval. */
+function ProjectReviewsCards({
+	project,
+	st,
+	act,
+	send,
+	relcmd,
+	setRelcmd,
+	cap,
+	setCap,
+	reviewCap,
+	tasks,
+	openTask,
+}: {
+	project: ProjectView;
+	st: ProjectView["settings"];
+	act: Act;
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+	relcmd: string;
+	setRelcmd: (v: string) => void;
+	cap: string;
+	setCap: (v: string) => void;
+	reviewCap: number;
+	tasks: TaskCard[];
+	openTask: (id: string) => void;
+}) {
+	return (
+		<>
+			<SaveCard
+				id="project-releases-section"
+				act={act}
+				dirty={relcmd.trim() !== (st.releaseCommand ?? "")}
+				save={() => send({ releaseCommand: relcmd.trim() || null })}
+				title="Releases"
+				status={
+					project.settings.releaseCommand !== null
+						? { label: "Own command", tone: "ok" }
+						: { label: "Ottr publishes", tone: "off" }
+				}
+				hint="Runs in the release worktree after the review approves, instead of Ottr's tag and GitHub release. It gets OTTR_RELEASE_VERSION, OTTR_RELEASE_COMMIT, OTTR_RELEASE_NOTES_FILE and OTTR_ARCH_REVIEW (commits since the last review). Must push the tag. Empty: Ottr tags and publishes itself."
+			>
+				{(save) => (
+					<>
+						<DefRow
+							name="Release command"
+							action={save}
+							help="A script that publishes the release after the review approves it. Empty: Ottr makes the git tag and the GitHub release itself."
+							shape="empty = Ottr tags and publishes"
+						>
+							<label>
+								<input
+									type="text"
+									maxLength={300}
+									value={relcmd}
+									onChange={(e) => setRelcmd(e.target.value)}
+									placeholder="node scripts/release.mjs --ottr"
+									aria-label="Release command"
+								/>
+							</label>
+						</DefRow>
+					</>
+				)}
+			</SaveCard>
+			<SaveCard
+				id="project-reviews-section"
+				act={act}
+				dirty={reviewCap !== st.archReviewCap}
+				save={() => send({ archReviewCap: reviewCap })}
+				title="Reviews"
+				status={{
+					label: `Every ${project.settings.archReviewCap} commits`,
+					tone: "off",
+				}}
+			>
+				{(save) => (
+					<>
+						<DefRow
+							name="Review interval"
+							action={save}
+							help="Ottr marks a review as due after this many new commits on the target branch."
+							shape="1 to 10000"
+						>
+							<label>
+								<input
+									type="number"
+									min={1}
+									max={10000}
+									required
+									value={cap}
+									onChange={(e) => setCap(e.target.value)}
+									aria-label="Review due after this many commits on the target"
+								/>
+							</label>
+						</DefRow>
+						{project.archReview != null && (
+							<p className="hint">
+								<ReviewCounter
+									review={project.archReview}
+									github={project.github}
+									tasks={tasks}
+									openTask={openTask}
+								/>
+							</p>
+						)}
+					</>
+				)}
+			</SaveCard>
+		</>
+	);
+}
+
 /** One project's settings page: identity, slots, worktrees, releases, reviews, messages, removal. */
 export function ProjectSettingsForm({
 	project,
@@ -6119,10 +7647,9 @@ export function ProjectSettingsForm({
 			live = false;
 		};
 	}, [project.name, project.github]);
-	const privateTag =
-		privateRepo === true ? "Not needed: private repo" : undefined;
+	const privateTag = privateTagFor(privateRepo);
 	const privateNote = (what: string): string =>
-		privateRepo === true ? `Private repo: no outside ${what}. ` : "";
+		privateNoteFor(privateRepo, what);
 	const [prefix, setPrefix] = useState(st.taskIdPrefix ?? "");
 	const icon = useInstantSave(act);
 	const markerSave = useInstantSave(act);
@@ -6171,440 +7698,46 @@ export function ProjectSettingsForm({
 					Open setup
 				</button>
 			</div>
-			<section
-				className="settings-group"
-				id="project-group"
-				aria-labelledby="project-group-title"
-				tabIndex={-1}
-			>
-				<h2 className="settings-group-title" id="project-group-title">
-					Project
-				</h2>
-				<SettingsCard
-					id="project-icon-section"
-					title="Icon"
-					status={
-						st.iconText
-							? { label: "Text", tone: "ok" }
-							: project.icon !== null
-								? { label: "Uploaded", tone: "ok" }
-								: { label: "Default", tone: "off" }
-					}
-				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Project icon"
-							help="An image that replaces the project's letters on the board. Without one, Ottr uses the repo owner's avatar or the host's favicon, and then the letters."
-							shape="PNG, JPEG, WebP or GIF"
-						>
-							<div className="icon-row">
-								<span className="icon-preview">
-									<ProjectTag project={project} />
-								</span>
-								{/* The label keeps the hidden input keyboard-operable: tab to it, Enter opens the picker. */}
-								<label className="icon-upload ghost">
-									Upload
-									<input
-										type="file"
-										accept="image/png,image/jpeg,image/webp,image/gif"
-										onChange={(e) => {
-											const file = e.target.files?.[0];
-											e.target.value = "";
-											if (!file) return;
-											icon.run(async () => {
-												const res = await fetch(
-													`/api/projects/${encodeURIComponent(project.name)}/icon`,
-													{ method: "POST", body: file },
-												);
-												if (!res.ok)
-													throw new Error(
-														await httpProblem(res, "the icon upload"),
-													);
-											});
-										}}
-									/>
-								</label>
-								{project.icon !== null && (
-									<button
-										type="button"
-										className="danger"
-										disabled={icon.busy}
-										onClick={async () => {
-											if (
-												!(await confirmDialog(
-													"Delete the uploaded icon? The project falls back to its source icon or letters.",
-													{ ok: "Delete icon", danger: true },
-												))
-											)
-												return;
-											icon.run(async () => {
-												const res = await fetch(
-													`/api/projects/${encodeURIComponent(project.name)}/icon`,
-													{ method: "DELETE" },
-												);
-												if (!res.ok)
-													throw new Error(
-														await httpProblem(res, "the icon removal"),
-													);
-											});
-										}}
-									>
-										Delete icon
-									</button>
-								)}
-								<SaveTick
-									busy={icon.busy}
-									saved={icon.saved}
-									failed={icon.failed}
-									reason={icon.reason}
-								/>
-							</div>
-						</DefRow>
-						<DefRow
-							name="Text marker"
-							action={
-								<SaveButton
-									form={markerFormId}
-									s={markerSave}
-									dirty={markerDirty}
-								/>
-							}
-							help="Up to 4 characters shown on the plate instead of any icon: this upload, the owner's avatar or the host's favicon. Empty shows the images again."
-							shape="Up to 4 characters"
-							optional
-						>
-							<form
-								id={markerFormId}
-								onSubmit={(e) => {
-									e.preventDefault();
-									if (markerDirty)
-										markerSave.run(() =>
-											send({ iconText: marker.trim() || null }),
-										);
-								}}
-							>
-								<div className="alate-field-stack">
-									<label>
-										<input
-											id={markerFieldId}
-											type="text"
-											maxLength={4}
-											value={marker}
-											onChange={(e) => setMarker(e.target.value)}
-											placeholder="e.g. OT"
-											aria-label="Text marker"
-											aria-invalid={markerSave.failed || undefined}
-											aria-describedby={
-												markerSave.failed ? `${markerFieldId}-err` : undefined
-											}
-										/>
-									</label>
-									{markerSave.failed && (
-										<p
-											className="auth-error"
-											id={`${markerFieldId}-err`}
-											role="alert"
-										>
-											{markerSave.reason ?? "Not saved"}
-										</p>
-									)}
-								</div>
-							</form>
-						</DefRow>
-					</div>
-				</SettingsCard>
-				{/* Both typed fields save through one footer Save: a prefix change renames the
-					project route, so one deliberate save for the card fits. */}
-				<SaveCard
-					id="project-identity-section"
-					act={act}
-					dirty={
-						label.trim() !== (st.displayName ?? "") ||
-						prefix.trim().toUpperCase() !== (st.taskIdPrefix ?? "")
-					}
-					save={async () => {
-						const r = await send({
-							displayName: label.trim() || null,
-							taskIdPrefix: prefix.trim() || null,
-						});
-						if (r.name !== project.name)
-							settingsNavigate(`${SETTINGS_HASH}/${r.name}`);
-					}}
-					title="Identity"
-					status={
-						project.github !== null
-							? { label: "GitHub", tone: "ok" }
-							: project.gitless
-								? { label: "No git", tone: "off" }
-								: { label: "Local git", tone: "off" }
-					}
-				>
-					{(save, ident) => (
-						<>
-							<DefRow
-								name="Display name"
-								optional
-								help="A friendly name for the board. The folder and the repo keep their real names."
-							>
-								<div className="alate-field-stack">
-									<label>
-										<input
-											id={labelFieldId}
-											type="text"
-											maxLength={60}
-											value={label}
-											onChange={(e) => setLabel(e.target.value)}
-											placeholder={project.name}
-											aria-label="Display name"
-											aria-invalid={ident.failed || undefined}
-											aria-describedby={
-												ident.failed ? `${labelFieldId}-err` : undefined
-											}
-										/>
-									</label>
-									{ident.failed && (
-										<p
-											className="auth-error"
-											id={`${labelFieldId}-err`}
-											role="alert"
-										>
-											{ident.reason ?? "Not saved"}
-										</p>
-									)}
-								</div>
-							</DefRow>
-							<DefRow
-								name="Task ID prefix"
-								help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle."
-								shape="empty = from folder name"
-							>
-								<div className="alate-field-stack">
-									<label>
-										<input
-											id={prefixFieldId}
-											type="text"
-											maxLength={8}
-											value={prefix}
-											onChange={(e) => setPrefix(e.target.value)}
-											placeholder={project.taskPrefix}
-											aria-label="Task ID prefix"
-											aria-invalid={ident.failed || undefined}
-											aria-describedby={
-												ident.failed ? `${prefixFieldId}-err` : undefined
-											}
-										/>
-									</label>
-									{ident.failed && (
-										<p
-											className="auth-error"
-											id={`${prefixFieldId}-err`}
-											role="alert"
-										>
-											{ident.reason ?? "Not saved"}
-										</p>
-									)}
-								</div>
-							</DefRow>
-							{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
-							<DefRow
-								name="Folder path"
-								desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
-							>
-								<code>{project.path}</code>
-							</DefRow>
-							{project.github !== null && (
-								<DefRow
-									name="GitHub"
-									desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
-								>
-									<a
-										href={project.github}
-										target="_blank"
-										rel="noopener noreferrer"
-									>
-										{project.github}
-									</a>
-								</DefRow>
-							)}
-							{/* One save for the card (OTTR-679): the action row closes the form. */}
-							<div className="alate-def-actions">{save}</div>
-						</>
-					)}
-				</SaveCard>
-			</section>
-			<section
-				className="settings-group"
-				id="project-work-group"
-				aria-labelledby="project-work-group-title"
-				tabIndex={-1}
-			>
-				<h2 className="settings-group-title" id="project-work-group-title">
-					Work
-				</h2>
-				<SaveCard
-					id="project-runners-section"
-					act={act}
-					dirty={parallel !== st.maxParallel}
-					save={() => send({ maxParallel: parallel })}
-					title="Runners"
-					status={
-						project.settings.maxParallel === null
-							? { label: "No cap", tone: "off" }
-							: { label: `Cap ${project.settings.maxParallel}`, tone: "ok" }
-					}
-				>
-					{(save) => (
-						<>
-							<DefRow
-								name="Runner cap"
-								action={save}
-								help="The most tasks of this project that run at the same time. The board-wide runner cap still applies."
-								shape="empty = no cap"
-							>
-								<label>
-									<input
-										type="number"
-										min={1}
-										value={mp}
-										onChange={(e) => setMp(e.target.value)}
-										aria-label="Runner cap"
-									/>
-								</label>
-							</DefRow>
-						</>
-					)}
-				</SaveCard>
-				<SaveCard
-					id="project-worktrees-section"
-					act={act}
-					dirty={
-						tb.trim() !== (st.targetBranch ?? "") ||
-						paths.join("\n") !== st.copyExtra.join("\n") ||
-						keepDays !== st.keptWorktreeDays
-					}
-					save={() =>
-						send({
-							targetBranch: tb.trim() || null,
-							copyExtra: paths,
-							keptWorktreeDays: keepDays,
-						})
-					}
-					title="Worktrees"
-					status={
-						project.settings.copyExtra.length > 0
-							? {
-									label: `${project.settings.copyExtra.length} extra path${project.settings.copyExtra.length === 1 ? "" : "s"}`,
-									tone: "ok",
-								}
-							: { label: "No extra paths", tone: "off" }
-					}
-					hint={
-						'A card that kept its worktree ("Kept the worktree: …" after a turn, "Cancel kept the worktree: …" after a cancel) sits until you answer it. After the idle days below (0 = immediately) the supervisor quarantines its untracked files into .tasks/quarantine and removes the worktree — but only when no tracked change or unpushed commit would be lost.'
-					}
-				>
-					{(_save, wtS) => (
-						<>
-							<DefRow
-								name="Target branch"
-								help="The branch on origin that finished cards merge into. Leave empty to use the repo's default branch (origin/HEAD), or the main checkout's upstream when origin/HEAD is missing."
-								shape="branch name · empty = default"
-							>
-								<div className="alate-field-stack">
-									<label>
-										<input
-											id={branchFieldId}
-											type="text"
-											maxLength={200}
-											placeholder="main"
-											aria-label="Target branch for merges"
-											value={tb}
-											onChange={(e) => setTb(e.target.value)}
-											aria-invalid={wtS.failed || undefined}
-											aria-describedby={
-												wtS.failed ? `${branchFieldId}-err` : undefined
-											}
-										/>
-									</label>
-									{wtS.failed && (
-										<p
-											className="auth-error"
-											id={`${branchFieldId}-err`}
-											role="alert"
-										>
-											{wtS.reason ?? "Not saved"}
-										</p>
-									)}
-								</div>
-							</DefRow>
-							<DefRow
-								name="Extra paths"
-								help="Files that git ignores but agents need, for example local config. Ottr copies them into each new worktree."
-								shape="one path per line"
-							>
-								<label>
-									<textarea
-										rows={3}
-										value={extra}
-										onChange={(e) => setExtra(e.target.value)}
-										placeholder="scripts/release.mjs"
-										aria-label="Extra paths"
-									/>
-								</label>
-							</DefRow>
-							<DefRow
-								name="Quarantine after"
-								help="How long a kept worktree can stay idle. Then Ottr moves its untracked files to .tasks/quarantine and removes the worktree, but only when no work would be lost."
-								shape="days · 0 = immediately"
-							>
-								<label>
-									<input
-										type="number"
-										min={0}
-										max={365}
-										required
-										value={kwd}
-										onChange={(e) => setKwd(e.target.value)}
-										aria-label="Quarantine kept worktrees after this many idle days"
-									/>
-								</label>
-							</DefRow>
-						</>
-					)}
-				</SaveCard>
-				<SaveCard
-					id="project-messages-section"
-					act={act}
-					dirty={imagesMax !== st.maxImages}
-					save={() => send({ maxImages: imagesMax })}
-					title="Messages"
-					status={{
-						label: `${project.settings.maxImages} image${project.settings.maxImages === 1 ? "" : "s"}`,
-						tone: "off",
-					}}
-				>
-					{(save) => (
-						<>
-							<DefRow
-								name="Max images"
-								action={save}
-								help="The most images you can attach to one message: a new task, a reply, a follow-up or a steer."
-								shape="1 or more"
-							>
-								<label>
-									<input
-										type="number"
-										min={1}
-										required
-										value={mi}
-										onChange={(e) => setMi(e.target.value)}
-										aria-label="Max images per message"
-									/>
-								</label>
-							</DefRow>
-						</>
-					)}
-				</SaveCard>
-			</section>
+			<ProjectIdentitySection
+				project={project}
+				st={st}
+				act={act}
+				icon={icon}
+				markerSave={markerSave}
+				marker={marker}
+				setMarker={setMarker}
+				markerDirty={markerDirty}
+				markerFormId={markerFormId}
+				markerFieldId={markerFieldId}
+				label={label}
+				setLabel={setLabel}
+				prefix={prefix}
+				setPrefix={setPrefix}
+				labelFieldId={labelFieldId}
+				prefixFieldId={prefixFieldId}
+				send={send}
+			/>
+			<ProjectSlotsSection
+				project={project}
+				st={st}
+				act={act}
+				send={send}
+				mp={mp}
+				setMp={setMp}
+				mi={mi}
+				setMi={setMi}
+				kwd={kwd}
+				setKwd={setKwd}
+				extra={extra}
+				setExtra={setExtra}
+				tb={tb}
+				setTb={setTb}
+				paths={paths}
+				parallel={parallel}
+				imagesMax={imagesMax}
+				keepDays={keepDays}
+				branchFieldId={branchFieldId}
+			/>
 			<section
 				className="settings-group"
 				id="project-reviews-group"
@@ -6614,220 +7747,29 @@ export function ProjectSettingsForm({
 				<h2 className="settings-group-title" id="project-reviews-group-title">
 					Releases and reviews
 				</h2>
-				<SaveCard
-					id="project-releases-section"
+				<ProjectReviewsCards
+					project={project}
+					st={st}
 					act={act}
-					dirty={relcmd.trim() !== (st.releaseCommand ?? "")}
-					save={() => send({ releaseCommand: relcmd.trim() || null })}
-					title="Releases"
-					status={
-						project.settings.releaseCommand !== null
-							? { label: "Own command", tone: "ok" }
-							: { label: "Ottr publishes", tone: "off" }
-					}
-					hint="Runs in the release worktree after the review approves, instead of Ottr's tag and GitHub release. It gets OTTR_RELEASE_VERSION, OTTR_RELEASE_COMMIT, OTTR_RELEASE_NOTES_FILE and OTTR_ARCH_REVIEW (commits since the last review). Must push the tag. Empty: Ottr tags and publishes itself."
-				>
-					{(save) => (
-						<>
-							<DefRow
-								name="Release command"
-								action={save}
-								help="A script that publishes the release after the review approves it. Empty: Ottr makes the git tag and the GitHub release itself."
-								shape="empty = Ottr tags and publishes"
-							>
-								<label>
-									<input
-										type="text"
-										maxLength={300}
-										value={relcmd}
-										onChange={(e) => setRelcmd(e.target.value)}
-										placeholder="node scripts/release.mjs --ottr"
-										aria-label="Release command"
-									/>
-								</label>
-							</DefRow>
-						</>
-					)}
-				</SaveCard>
-				<SaveCard
-					id="project-reviews-section"
-					act={act}
-					dirty={reviewCap !== st.archReviewCap}
-					save={() => send({ archReviewCap: reviewCap })}
-					title="Reviews"
-					status={{
-						label: `Every ${project.settings.archReviewCap} commits`,
-						tone: "off",
-					}}
-				>
-					{(save) => (
-						<>
-							<DefRow
-								name="Review interval"
-								action={save}
-								help="Ottr marks a review as due after this many new commits on the target branch."
-								shape="1 to 10000"
-							>
-								<label>
-									<input
-										type="number"
-										min={1}
-										max={10000}
-										required
-										value={cap}
-										onChange={(e) => setCap(e.target.value)}
-										aria-label="Review due after this many commits on the target"
-									/>
-								</label>
-							</DefRow>
-							{project.archReview != null && (
-								<p className="hint">
-									<ReviewCounter
-										review={project.archReview}
-										github={project.github}
-										tasks={tasks}
-										openTask={openTask}
-									/>
-								</p>
-							)}
-						</>
-					)}
-				</SaveCard>
+					send={send}
+					relcmd={relcmd}
+					setRelcmd={setRelcmd}
+					cap={cap}
+					setCap={setCap}
+					reviewCap={reviewCap}
+					tasks={tasks}
+					openTask={openTask}
+				/>
 				{!hostedHidden(hosted === true, "project-updates-section") && (
-					<SettingsCard
-						id="project-updates-section"
-						title="Updates"
-						status={updatesChip(project.settings)}
-					>
-						<div className="alate-def-rows">
-							{/* U7: hold update-card merges at needs_you until a reply approves them. */}
-							<CheckRow
-								name="Hold update merges"
-								desc="Update cards wait at needs_you after a ready turn; your reply approves the merge"
-								checked={st.holdUpdateMerges}
-								save={(v) => send({ holdUpdateMerges: v })}
-								act={act}
-							/>
-							{/* OTTR-689: hold fork-born card merges at needs_you until a reply approves them. */}
-							<CheckRow
-								name="Hold fork-born merges"
-								desc="Fork-born cards wait at needs_you; your reply approves the merge of the card's work before it reaches the target branch. Turning this off does not release parked cards"
-								checked={st.forkMergeHold}
-								save={(v) => send({ forkMergeHold: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="Retro"
-								desc="After each done task the supervisor proposes follow-up cards from its retro"
-								checked={st.retroSince !== null}
-								save={(v) => send({ retro: v })}
-								act={act}
-							/>
-							<CheckRow
-								sub
-								name="Friction filter"
-								desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
-								checked={st.retroFilter}
-								disabled={st.retroSince === null}
-								save={(v) => send({ retroFilter: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="Fork research"
-								desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
-								tag={privateTag}
-								checked={st.forkResearch}
-								save={(v) => send({ forkResearch: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="Trending scout"
-								desc={
-									!trendingScan ? (
-										<>
-											The general 'Weekly trending scan' switch is off, so the
-											scout never runs — turn it on in{" "}
-											<a
-												href={`${settingsPath(null)}#runners-section`}
-												onClick={(e) =>
-													navClick(e, () =>
-														openSettingsSection("runners-section"),
-													)
-												}
-											>
-												General settings
-											</a>
-											. Weekly: an agent judges GitHub trending repos for this
-											project and files up to 3 backlog proposals
-										</>
-									) : (
-										"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
-									)
-								}
-								checked={st.trendingScout}
-								disabled={!trendingScan && !st.trendingScout}
-								save={(v) => send({ trendingScout: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="PR reviews"
-								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("pull requests to review")}Hourly watch of open pull requests on GitHub; each new head gets a read-only review draft you can post as a comment`}
-								tag={privateTag}
-								checked={st.prReviews}
-								disabled={project.github === null && !st.prReviews}
-								save={(v) => send({ prReviews: v })}
-								act={act}
-							/>
-							<CheckRow
-								sub
-								name="PR review notifications"
-								desc="Bell and push when a review draft arrives or is rewritten, and when new comments land after a posted review; needs PR reviews"
-								checked={st.prReviewNotify}
-								disabled={!st.prReviews}
-								save={(v) => send({ prReviewNotify: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="PR mode"
-								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
-								checked={st.prMode}
-								disabled={project.github === null && !st.prMode}
-								save={(v) => send({ prMode: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="Issue watch"
-								desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
-								tag={privateTag}
-								checked={st.issueWatch}
-								disabled={project.github === null && !st.issueWatch}
-								save={(v) => send({ issueWatch: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="omp watch"
-								desc="Hourly, a model reads each new omp release's notes. A fail files a card and holds the pin. A pass files a card that bumps Dockerfile.worker."
-								checked={st.ompWatch}
-								save={(v) => send({ ompWatch: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="Run work turns in microVMs"
-								desc={`${project.vmRunner.ok ? "" : project.vmRunner.configured ? `vm-runner is not ready (${project.vmRunner.reason ?? "no answer"})${st.microVm ? "; work turns wait until it is" : ""}. ` : "Needs OTTR_VM_RUNNER_URL (docker compose --profile vm). "}Each work turn runs in its own Firecracker microVM with a fresh clone; merge turns stay on the board.`}
-								checked={st.microVm}
-								disabled={!project.vmRunner.ok && !st.microVm}
-								save={(v) => send({ microVm: v })}
-								act={act}
-							/>
-							<CheckRow
-								name="Push sync commits"
-								desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
-								checked={st.pushSyncCommits}
-								save={(v) => send({ pushSyncCommits: v })}
-								act={act}
-							/>
-						</div>
-					</SettingsCard>
+					<ProjectUpdatesCard
+						project={project}
+						st={st}
+						send={send}
+						privateTag={privateTag}
+						privateNote={privateNote}
+						trendingScan={trendingScan}
+						act={act}
+					/>
 				)}
 			</section>
 			{setupOpen && (

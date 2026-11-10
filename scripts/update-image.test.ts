@@ -70,81 +70,475 @@ function bump(ci: string, omp: string): void {
 	must(ci, "push", "-q", "origin", "HEAD:main");
 }
 
-/** Fake docker; `calls` records each call with the exec'd script shortened to <count>, <hold> or <free>. */
-function fakes(
-	o: {
-		build?: number;
-		/** Turn counts the board answers, in order; the last one repeats. */
-		turns?: string | string[];
-		/** Services `ps --services --status running` lists, "\n"-separated. */
-		running?: string;
-		/** Exit code of the ps (an error like a dead daemon). */
-		psCode?: number;
-		/** The build gave the server a new image. */
-		newImage?: boolean;
-		/** A host-only override service built from another local git checkout. */
-		sidecar?: { name: string; dir: string };
-		/** The sidecar's build gives it a new image. */
-		sidecarNewImage?: boolean;
-		/** Exit code of the sidecar's build. */
-		sidecarBuild?: number;
-		/** Exit code of the sidecar's own restart (`up --no-deps`). */
-		sidecarUp?: number;
-		/** Exit code of the vm-runner's own build (`build vm-runner`). */
-		vmBuild?: number;
-		/** Exit code of `compose images` (the image comparison's first step). */
-		imagesCode?: number;
-		/** The seed commit the server volume records (the `cat` exec's output). */
-		seedRecord?: string;
-		/** Exit code of the board-seed run. */
-		seedCode?: number;
-		/** Output of `compose ps -q alate` (a container id when the project's alate runs). */
-		alatePs?: string;
-		/** The image the project's alate container runs (`inspect .Config.Image`). */
-		alateInspect?: string;
-		/** Running containers that `docker ps --filter name=<regex>` filters like docker does. */
-		containers?: { name: string; image: string }[];
-		/** The containerd store's platform manifests: the one the server runs, the build's. */
-		manifest?: {
-			runs: string;
-			built: string;
-			platform?: { os: string; architecture: string; variant?: string };
+/** The scriptable answers `fakes` offers (the fake harness's knobs). */
+interface FakeOptions {
+	build?: number;
+	/** Turn counts the board answers, in order; the last one repeats. */
+	turns?: string | string[];
+	/** Services `ps --services --status running` lists, "\n"-separated. */
+	running?: string;
+	/** Exit code of the ps (an error like a dead daemon). */
+	psCode?: number;
+	/** The build gave the server a new image. */
+	newImage?: boolean;
+	/** A host-only override service built from another local git checkout. */
+	sidecar?: { name: string; dir: string };
+	/** The sidecar's build gives it a new image. */
+	sidecarNewImage?: boolean;
+	/** Exit code of the sidecar's build. */
+	sidecarBuild?: number;
+	/** Exit code of the sidecar's own restart (`up --no-deps`). */
+	sidecarUp?: number;
+	/** Exit code of the vm-runner's own build (`build vm-runner`). */
+	vmBuild?: number;
+	/** Exit code of `compose images` (the image comparison's first step). */
+	imagesCode?: number;
+	/** The seed commit the server volume records (the `cat` exec's output). */
+	seedRecord?: string;
+	/** Exit code of the board-seed run. */
+	seedCode?: number;
+	/** Output of `compose ps -q alate` (a container id when the project's alate runs). */
+	alatePs?: string;
+	/** The image the project's alate container runs (`inspect .Config.Image`). */
+	alateInspect?: string;
+	/** Running containers that `docker ps --filter name=<regex>` filters like docker does. */
+	containers?: { name: string; image: string }[];
+	/** The containerd store's platform manifests: the one the server runs, the build's. */
+	manifest?: {
+		runs: string;
+		built: string;
+		platform?: { os: string; architecture: string; variant?: string };
+	};
+	/** Exit codes of the holds in call order, the last one repeating (an older board lacks
+	 *  POST /api/drain). */
+	hold?: number | number[];
+	/** Exit code of the hold's early end (a board older than DELETE /api/drain). */
+	free?: number | number[];
+	up?: number;
+	/** Output of a failing `up` (its error text). */
+	upOut?: string;
+	/** Exit code and output of `up -d --no-deps --wait <service>`, per service. */
+	upBy?: Record<string, { code?: number; out?: string }>;
+	/** Exit code and output of `compose restart server` (a failed seed-only restart). */
+	restart?: number;
+	restartOut?: string;
+	/** The deployed commit the server volume records (the `cat` exec's output). */
+	deployedRecord?: string;
+	/** The restart-wait start the server volume records (the `cat` exec's output; "" = none). */
+	waitSince?: string;
+	/** The card ids the board answers for the running turns ("!fail" makes the exec exit 1). */
+	waitTurns?: string;
+	/** The board's answers to GET /api/drain, in order; the last one repeats. Without
+	 *  them the board answers 404 (one version older) and the run keeps the legacy
+	 *  whole-board flow. */
+	gets?: string[];
+	/** Exit codes of the healthz probes in call order, the last one repeating. */
+	health?: number | number[];
+	/** Exit codes of the worker /detach execs in call order, the last one repeating. */
+	detach?: number | number[];
+	/** The worker's GET /detached answers, in order; the last one repeats. Without
+	 *  them the worker answers [] (an old worker without the route). A body of
+	 *  "!fail" makes the exec exit 1; "!bad" prints a body that is no JSON. */
+	detachedList?: string[];
+	/** Runs after each poll wait: work that lands in the checkout mid-hold. */
+	onWait?: () => void;
+}
+
+/** One fake exec answer. */
+interface ExecResult {
+	code: number;
+	out: string;
+}
+
+/** Which exec script one composed docker line runs; several stay false together. */
+interface DockerFlags {
+	drain: boolean;
+	free: boolean;
+	get: boolean;
+	health: boolean;
+	detach: boolean;
+	dlist: boolean;
+	wt: boolean;
+}
+
+function dockerFlags(line: string): DockerFlags {
+	const drain = line.includes("/api/drain");
+	const free = drain && line.includes("'DELETE'");
+	const get = drain && !free && !line.includes("'POST'");
+	const health = line.includes("/healthz");
+	const detach = !drain && !health && line.includes("'/detach'");
+	const dlist = !drain && !health && !detach && line.includes('"/detached"');
+	// The wait-turns read fetches /api/state like the count, but maps the
+	// card ids out instead of counting.
+	const wt =
+		!drain &&
+		!health &&
+		!detach &&
+		!dlist &&
+		line.includes("/api/state") &&
+		line.includes(".map((t) => t.id)");
+	return { drain, free, get, health, detach, dlist, wt };
+}
+
+/** The redacted exec tag a logged line's script shortens to. */
+function execTag(f: DockerFlags): string {
+	if (f.free) return " -e <free>";
+	if (f.get) return " -e <get>";
+	if (f.drain) return " -e <hold>";
+	if (f.health) return " -e <health>";
+	if (f.detach) return " -e <detach>";
+	if (f.dlist) return " -e <detached>";
+	if (f.wt) return " -e <wait>";
+	return " -e <count>";
+}
+
+/** Per-run call counters for the repeating answer lists (the last entry repeats). */
+interface PollCounters {
+	counted: number;
+	hold: number;
+	get: number;
+	health: number;
+	free: number;
+	detach: number;
+	dlist: number;
+}
+
+/** The scripted answer lists (the last entry repeats; an absent list answers its fallback). */
+interface PollAnswers {
+	turns: string[];
+	holds: number[];
+	healths: number[];
+	frees: number[];
+	detaches: number[];
+	dlists: string[] | undefined;
+	gets: string[] | undefined;
+}
+
+/** The fake run's recorded calls (the arrays the tests assert on). */
+interface FakeRecord {
+	calls: string[];
+	seedRuns: string[];
+	seedImages: (string | undefined)[];
+	seedWrites: string[];
+	restartWaits: string[];
+	built: FakeRun["built"];
+}
+
+/** The board-seed run: recorded, answered with the scripted exit. */
+function boardSeedExec(
+	line: string,
+	o: FakeOptions,
+	rec: FakeRecord,
+): ExecResult {
+	rec.seedRuns.push(line);
+	rec.seedImages.push(process.env.ALATE_IMAGE);
+	rec.calls.push(line);
+	return {
+		code: o.seedCode ?? 0,
+		out: o.seedCode ? "the seed step failed\n" : "",
+	};
+}
+
+/** The record `cat` execs: the wait start, the deployed commit, or the seed commit. */
+function recordCat(line: string, o: FakeOptions): ExecResult {
+	if (line.includes("restart-waiting-since"))
+		return { code: 0, out: `${o.waitSince ?? ""}\n` };
+	if (line.includes("build-commit"))
+		return { code: 0, out: `${o.deployedRecord ?? ""}\n` };
+	return { code: 0, out: `${o.seedRecord ?? ""}\n` };
+}
+
+/** The seed/record `cat` read and `printf` write execs; null for any other line. */
+function recordExec(
+	line: string,
+	o: FakeOptions,
+	rec: FakeRecord,
+): ExecResult | null {
+	if (
+		line.includes("seed-commit") ||
+		line.includes("seed-token-expires") ||
+		line.includes("build-commit") ||
+		line.includes("restart-waiting-since") ||
+		line.includes("restart-wait")
+	) {
+		// The read is the `cat` exec, the write is the `printf` exec.
+		rec.calls.push(line);
+		if (line.includes("cat ")) return recordCat(line, o);
+		const waitRecord = line.endsWith("> /etc/ottr/restart-wait");
+		if (!waitRecord) rec.seedWrites.push(line);
+		// The restart-wait record write ends at `> /etc/ottr/restart-wait`; the
+		// wait clock's own write ends at `restart-waiting-since`, so the longer
+		// path keeps it out of this capture.
+		if (waitRecord) rec.restartWaits.push(line);
+		return { code: 0, out: "" };
+	}
+	return null;
+}
+
+/** `ps --filter name=<regex>`: Docker's name filter, an unanchored regex against the name, with or without "/". */
+function psFilterExec(
+	line: string,
+	o: FakeOptions,
+	rec: FakeRecord,
+): ExecResult {
+	rec.calls.push(line);
+	const re = new RegExp(line.split(" ")[2]?.slice(5) ?? "");
+	const out = (o.containers ?? [])
+		.filter((c) => re.test(c.name) || re.test(`/${c.name}`))
+		.map((c) => `${c.image}\n`)
+		.join("");
+	return { code: 0, out };
+}
+
+/** `build <service>`: the scripted build exit; a sidecar build records its context tree. */
+function buildExec(
+	args: string[],
+	extra: string | undefined,
+	o: FakeOptions,
+	rec: FakeRecord,
+): ExecResult | null {
+	if (!args.includes("build")) return null;
+	// What the sidecar's build context holds while the build runs.
+	if (extra !== undefined) {
+		const m = /context: (".*")/.exec(readFileSync(extra, "utf8"));
+		const tree = JSON.parse(m?.[1] ?? '""') as string;
+		rec.built.push({
+			tree,
+			files: readdirSync(tree)
+				.filter((n) => n !== ".git")
+				.sort(),
+			dockerfile: readFileSync(join(tree, "Dockerfile.worker"), "utf8"),
+		});
+	}
+	return {
+		code:
+			args.at(-1) === o.sidecar?.name
+				? (o.sidecarBuild ?? 0)
+				: args.at(-1) === "vm-runner"
+					? (o.vmBuild ?? 0)
+					: (o.build ?? 0),
+		out: args.at(-1) === "vm-runner" && o.vmBuild ? "kvm build failed\n" : "",
+	};
+}
+
+/** The dispatch of the comparison/descriptor queries; null when the line is none of them. */
+function queryExec(
+	args: string[],
+	line: string,
+	o: FakeOptions,
+): ExecResult | null {
+	if (args.includes("ps")) return psExec(args, o);
+	if (args.includes("images")) return imagesExec(o);
+	if (args.includes("--format")) return formatExec(o);
+	if (args.includes("config")) return configExec(args, o);
+	if (line.includes("ImageManifestDescriptor")) return manifestExec(o);
+	if (args.includes("--platform"))
+		return { code: 0, out: `${o.manifest?.built ?? ""}\n` };
+	if (line.includes("Config.Image"))
+		return { code: 0, out: `${o.alateInspect ?? ""}\n` };
+	if (args.includes("inspect")) return inspectExec(args, o);
+	return null;
+}
+
+/** `compose ps`: the scripted daemon error, or the running services / a container id. */
+function psExec(args: string[], o: FakeOptions): ExecResult {
+	return o.psCode
+		? { code: o.psCode, out: "Cannot connect to the Docker daemon" }
+		: {
+				code: 0,
+				out: args.includes("--services")
+					? `${o.running ?? "server"}\n`
+					: args.at(-1) === "alate"
+						? `${o.alatePs ?? ""}\n`
+						: `${args.at(-1)}\n`,
+			};
+}
+
+/** `compose images -q`: the comparison step's old image, or the scripted error. */
+function imagesExec(o: FakeOptions): ExecResult {
+	return o.imagesCode
+		? { code: o.imagesCode, out: "no such service" }
+		: { code: 0, out: "0ld\n" };
+}
+
+/** `config --format json`: the compose descriptor, with the sidecar service when scripted. */
+function formatExec(o: FakeOptions): ExecResult {
+	return {
+		code: 0,
+		out: JSON.stringify({
+			services: {
+				server: { build: { context: "." } },
+				...(o.sidecar
+					? {
+							[o.sidecar.name]: {
+								build: { context: o.sidecar.dir },
+							},
+						}
+					: {}),
+			},
+		}),
+	};
+}
+
+/** `config --images`: the local tag the compose file resolves the service to. */
+function configExec(args: string[], o: FakeOptions): ExecResult {
+	return {
+		code: 0,
+		out: `${args.at(-1) === o.sidecar?.name ? `${o.sidecar?.name}:local` : "ottr-worker:local"}\n`,
+	};
+}
+
+/** The manifest descriptor of the running server image: the scripted one, or the classic store's null. */
+function manifestExec(o: FakeOptions): ExecResult {
+	return {
+		code: 0,
+		out: o.manifest
+			? `${JSON.stringify({
+					mediaType: "application/vnd.oci.image.manifest.v1+json",
+					digest: o.manifest.runs,
+					platform: o.manifest.platform ?? {
+						architecture: "amd64",
+						os: "linux",
+					},
+				})}\n`
+			: "null\n",
+	};
+}
+
+/** `image inspect`: the id differs from the running one only when a build produced a new image. */
+function inspectExec(args: string[], o: FakeOptions): ExecResult {
+	const fresh = o.newImage ? "sha256:new\n" : "sha256:0ld\n";
+	return {
+		code: 0,
+		out:
+			args.at(-1) === `${o.sidecar?.name}:local` && o.sidecarNewImage
+				? "sha256:new\n"
+				: fresh,
+	};
+}
+
+/** The healthz probe: the scripted exit codes in call order, or the board's ok. */
+function healthExec(a: PollAnswers, n: PollCounters): ExecResult {
+	const code = a.healths[Math.min(n.health++, a.healths.length - 1)] ?? 0;
+	return code ? { code, out: "HTTP 500\n" } : { code: 0, out: '{"ok":true}\n' };
+}
+
+/** The wait-turns read: the card ids, or the board's HTTP status on a scripted failure. */
+function waitTurnsExec(o: FakeOptions): ExecResult {
+	// A failed read prints the board's HTTP status and exits 1, like the other scripts.
+	if (o.waitTurns === "!fail") return { code: 1, out: "HTTP 500\n" };
+	return { code: 0, out: `${o.waitTurns ?? ""}\n` };
+}
+
+/** GET /api/drain: the scripted answers in call order; no script at all is the 404 fallback. */
+function getsExec(a: PollAnswers, n: PollCounters): ExecResult {
+	// No answer at all is the mixed-version fallback: a board one version
+	// older has no GET /api/drain, and the run keeps the whole-board flow.
+	if (a.gets === undefined) return { code: 1, out: "HTTP 404\n" };
+	const g = a.gets[Math.min(n.get++, a.gets.length - 1)] ?? "{}";
+	// A deliberate failed read: the exec exits non-zero with HTTP text,
+	// like a board whose GET /api/drain answered 500.
+	if (g === "!fail") return { code: 1, out: "HTTP 500\n" };
+	return { code: 0, out: `${g}\n` };
+}
+
+/** The hold's early end (DELETE /api/drain): the scripted exit codes in call order. */
+function freesExec(a: PollAnswers, n: PollCounters): ExecResult {
+	const code = a.frees[Math.min(n.free++, a.frees.length - 1)] ?? 0;
+	return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
+}
+
+/** The hold itself (POST /api/drain): the scripted exit codes in call order. */
+function holdsExec(a: PollAnswers, n: PollCounters): ExecResult {
+	const code = a.holds[Math.min(n.hold++, a.holds.length - 1)] ?? 0;
+	return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
+}
+
+/** The worker /detach exec: the scripted exit codes in call order. */
+function detachExec(a: PollAnswers, n: PollCounters): ExecResult {
+	const code = a.detaches[Math.min(n.detach++, a.detaches.length - 1)] ?? 0;
+	// A failed detach prints the worker's HTTP status, like the other scripts.
+	return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
+}
+
+/** The worker GET /detached answers in call order; "!fail" is a scripted failure. */
+function dlistExec(a: PollAnswers, n: PollCounters): ExecResult {
+	const b = a.dlists?.[Math.min(n.dlist++, a.dlists.length - 1)] ?? "[]";
+	// A failed read prints the worker's HTTP status and exits 1, like
+	// the other scripts; "!bad" is an answer no JSON parser takes.
+	if (b === "!fail") return { code: 1, out: "HTTP 500\n" };
+	return { code: 0, out: `${b}\n` };
+}
+
+/** The poll-style exec answers, in the drain flow's order; null when the line is none of them. */
+function pollExec(
+	f: DockerFlags,
+	a: PollAnswers,
+	o: FakeOptions,
+	n: PollCounters,
+): ExecResult | null {
+	if (f.health) return healthExec(a, n);
+	if (f.wt) return waitTurnsExec(o);
+	if (f.get) return getsExec(a, n);
+	if (f.free) return freesExec(a, n);
+	if (f.drain) return holdsExec(a, n);
+	if (f.detach) return detachExec(a, n);
+	if (f.dlist) return dlistExec(a, n);
+	return null;
+}
+
+/** `compose restart server`: the scripted seed-only restart failure. */
+function restartExec(o: FakeOptions): ExecResult {
+	return o.restart
+		? { code: o.restart, out: o.restartOut ?? "" }
+		: { code: 0, out: "" };
+}
+
+/** `up -d --no-deps --wait <service>`: the per-service script, or the generic/sidecar exit. */
+function upExec(args: string[], o: FakeOptions): ExecResult {
+	const svc = args.at(-1)!;
+	const by = o.upBy?.[svc];
+	if (by)
+		return {
+			code: by.code ?? 0,
+			out: by.out ?? (by.code ? `container ${svc} is unhealthy` : ""),
 		};
-		/** Exit codes of the holds in call order, the last one repeating (an older board lacks
-		 *  POST /api/drain). */
-		hold?: number | number[];
-		/** Exit code of the hold's early end (a board older than DELETE /api/drain). */
-		free?: number | number[];
-		up?: number;
-		/** Output of a failing `up` (its error text). */
-		upOut?: string;
-		/** Exit code and output of `up -d --no-deps --wait <service>`, per service. */
-		upBy?: Record<string, { code?: number; out?: string }>;
-		/** Exit code and output of `compose restart server` (a failed seed-only restart). */
-		restart?: number;
-		restartOut?: string;
-		/** The deployed commit the server volume records (the `cat` exec's output). */
-		deployedRecord?: string;
-		/** The restart-wait start the server volume records (the `cat` exec's output; "" = none). */
-		waitSince?: string;
-		/** The card ids the board answers for the running turns ("!fail" makes the exec exit 1). */
-		waitTurns?: string;
-		/** The board's answers to GET /api/drain, in order; the last one repeats. Without
-		 *  them the board answers 404 (one version older) and the run keeps the legacy
-		 *  whole-board flow. */
-		gets?: string[];
-		/** Exit codes of the healthz probes in call order, the last one repeating. */
-		health?: number | number[];
-		/** Exit codes of the worker /detach execs in call order, the last one repeating. */
-		detach?: number | number[];
-		/** The worker's GET /detached answers, in order; the last one repeats. Without
-		 *  them the worker answers [] (an old worker without the route). A body of
-		 *  "!fail" makes the exec exit 1; "!bad" prints a body that is no JSON. */
-		detachedList?: string[];
-		/** Runs after each poll wait: work that lands in the checkout mid-hold. */
-		onWait?: () => void;
-	} = {},
-): FakeRun {
+	return args.at(-1) === o.sidecar?.name
+		? {
+				code: o.sidecarUp ?? 0,
+				out: o.sidecarUp ? "container sidecar exited (1)" : "",
+			}
+		: { code: o.up ?? 0, out: o.upOut ?? "" };
+}
+
+/** The answers after the line is recorded: build, queries, polls, restart, exec, up. */
+function postExec(
+	args: string[],
+	line: string,
+	extra: string | undefined,
+	o: FakeOptions,
+	a: PollAnswers,
+	n: PollCounters,
+	rec: FakeRecord,
+): ExecResult {
+	const built = buildExec(args, extra, o, rec);
+	if (built !== null) return built;
+	const query = queryExec(args, line, o);
+	if (query !== null) return query;
+	const poll = pollExec(dockerFlags(line), a, o, n);
+	if (poll !== null) return poll;
+	if (args.includes("restart")) return restartExec(o);
+	if (args.includes("exec"))
+		return {
+			code: 0,
+			out: a.turns[Math.min(n.counted++, a.turns.length - 1)] ?? "0",
+		};
+	if (args.includes("up")) return upExec(args, o);
+	return { code: 0, out: "" };
+}
+
+/** Fake docker; `calls` records each call with the exec'd script shortened to <count>, <hold> or <free>. */
+function fakes(o: FakeOptions = {}): FakeRun {
 	const calls: string[] = [];
 	const drains: string[] = [];
 	const seedRuns: string[] = [];
@@ -161,15 +555,32 @@ function fakes(
 	const frees = typeof o.free === "number" ? [o.free] : (o.free ?? [0]);
 	const detaches =
 		typeof o.detach === "number" ? [o.detach] : (o.detach ?? [0]);
-	const dlists = o.detachedList;
-	const gets = o.gets;
-	let counted = 0;
-	let holdCalls = 0;
-	let getCalls = 0;
-	let healthCalls = 0;
-	let freeCalls = 0;
-	let detachCalls = 0;
-	let dlistCalls = 0;
+	const answers: PollAnswers = {
+		turns,
+		holds,
+		healths,
+		frees,
+		detaches,
+		dlists: o.detachedList,
+		gets: o.gets,
+	};
+	const rec: FakeRecord = {
+		calls,
+		seedRuns,
+		seedImages,
+		seedWrites,
+		restartWaits,
+		built,
+	};
+	const n: PollCounters = {
+		counted: 0,
+		hold: 0,
+		get: 0,
+		health: 0,
+		free: 0,
+		detach: 0,
+		dlist: 0,
+	};
 	// A real epoch, not 0: the hold limit must measure the time since the hold, not the clock.
 	let clock = Date.UTC(2026, 9, 16);
 	const deps: Deps = {
@@ -178,244 +589,15 @@ function fakes(
 			const extra = raw.find((a) => /ottr-deploy-.*\.yml$/.test(a));
 			const args = raw.map((a) => (a === extra ? "<tree>.yml" : a));
 			const line = args.join(" ");
-			const drain = line.includes("/api/drain");
-			const free = drain && line.includes("'DELETE'");
-			const get = drain && !free && !line.includes("'POST'");
-			const health = line.includes("/healthz");
-			const detach = !drain && !health && line.includes("'/detach'");
-			const dlist =
-				!drain && !health && !detach && line.includes('"/detached"');
-			// The wait-turns read fetches /api/state like the count, but maps the
-			// card ids out instead of counting.
-			const wt =
-				!drain &&
-				!health &&
-				!detach &&
-				!dlist &&
-				line.includes("/api/state") &&
-				line.includes(".map((t) => t.id)");
-			if (drain) drains.push(line);
-			if (args.includes("board-seed")) {
-				seedRuns.push(line);
-				seedImages.push(process.env.ALATE_IMAGE);
-				calls.push(line);
-				return {
-					code: o.seedCode ?? 0,
-					out: o.seedCode ? "the seed step failed\n" : "",
-				};
-			}
-			if (
-				line.includes("seed-commit") ||
-				line.includes("seed-token-expires") ||
-				line.includes("build-commit") ||
-				line.includes("restart-waiting-since") ||
-				line.includes("restart-wait")
-			) {
-				// The read is the `cat` exec, the write is the `printf` exec.
-				calls.push(line);
-				if (line.includes("cat ")) {
-					if (line.includes("restart-waiting-since"))
-						return { code: 0, out: `${o.waitSince ?? ""}\n` };
-					if (line.includes("build-commit"))
-						return { code: 0, out: `${o.deployedRecord ?? ""}\n` };
-					return { code: 0, out: `${o.seedRecord ?? ""}\n` };
-				}
-				const waitRecord = line.endsWith("> /etc/ottr/restart-wait");
-				if (!waitRecord) seedWrites.push(line);
-				// The restart-wait record write ends at `> /etc/ottr/restart-wait`; the
-				// wait clock's own write ends at `restart-waiting-since`, so the longer
-				// path keeps it out of this capture.
-				if (waitRecord) restartWaits.push(line);
-				return { code: 0, out: "" };
-			}
-			if (line.startsWith("ps --filter name=")) {
-				// Docker's name filter: an unanchored regex against the name, with or without "/".
-				calls.push(line);
-				const re = new RegExp(line.split(" ")[2]?.slice(5) ?? "");
-				const out = (o.containers ?? [])
-					.filter((c) => re.test(c.name) || re.test(`/${c.name}`))
-					.map((c) => `${c.image}\n`)
-					.join("");
-				return { code: 0, out };
-			}
-			calls.push(
-				line.replace(
-					/ -e .*/s,
-					free
-						? " -e <free>"
-						: get
-							? " -e <get>"
-							: drain
-								? " -e <hold>"
-								: health
-									? " -e <health>"
-									: detach
-										? " -e <detach>"
-										: dlist
-											? " -e <detached>"
-											: wt
-												? " -e <wait>"
-												: " -e <count>",
-				),
-			);
-			if (args.includes("build")) {
-				// What the sidecar's build context holds while the build runs.
-				if (extra !== undefined) {
-					const m = /context: (".*")/.exec(readFileSync(extra, "utf8"));
-					const tree = JSON.parse(m?.[1] ?? '""') as string;
-					built.push({
-						tree,
-						files: readdirSync(tree)
-							.filter((n) => n !== ".git")
-							.sort(),
-						dockerfile: readFileSync(join(tree, "Dockerfile.worker"), "utf8"),
-					});
-				}
-				return {
-					code:
-						args.at(-1) === o.sidecar?.name
-							? (o.sidecarBuild ?? 0)
-							: args.at(-1) === "vm-runner"
-								? (o.vmBuild ?? 0)
-								: (o.build ?? 0),
-					out:
-						args.at(-1) === "vm-runner" && o.vmBuild
-							? "kvm build failed\n"
-							: "",
-				};
-			}
-			if (args.includes("ps"))
-				return o.psCode
-					? { code: o.psCode, out: "Cannot connect to the Docker daemon" }
-					: {
-							code: 0,
-							out: args.includes("--services")
-								? `${o.running ?? "server"}\n`
-								: args.at(-1) === "alate"
-									? `${o.alatePs ?? ""}\n`
-									: `${args.at(-1)}\n`,
-						};
-			if (args.includes("images"))
-				return o.imagesCode
-					? { code: o.imagesCode, out: "no such service" }
-					: { code: 0, out: "0ld\n" };
-			if (args.includes("--format"))
-				return {
-					code: 0,
-					out: JSON.stringify({
-						services: {
-							server: { build: { context: "." } },
-							...(o.sidecar
-								? {
-										[o.sidecar.name]: {
-											build: { context: o.sidecar.dir },
-										},
-									}
-								: {}),
-						},
-					}),
-				};
-			if (args.includes("config"))
-				return {
-					code: 0,
-					out: `${args.at(-1) === o.sidecar?.name ? `${o.sidecar?.name}:local` : "ottr-worker:local"}\n`,
-				};
-			// The classic store reports no descriptor: docker prints null.
-			if (line.includes("ImageManifestDescriptor"))
-				return {
-					code: 0,
-					out: o.manifest
-						? `${JSON.stringify({
-								mediaType: "application/vnd.oci.image.manifest.v1+json",
-								digest: o.manifest.runs,
-								platform: o.manifest.platform ?? {
-									architecture: "amd64",
-									os: "linux",
-								},
-							})}\n`
-						: "null\n",
-				};
-			if (args.includes("--platform"))
-				return { code: 0, out: `${o.manifest?.built ?? ""}\n` };
-			if (line.includes("Config.Image"))
-				return { code: 0, out: `${o.alateInspect ?? ""}\n` };
-			if (args.includes("inspect")) {
-				const fresh = o.newImage ? "sha256:new\n" : "sha256:0ld\n";
-				return {
-					code: 0,
-					out:
-						args.at(-1) === `${o.sidecar?.name}:local` && o.sidecarNewImage
-							? "sha256:new\n"
-							: fresh,
-				};
-			}
-			if (health) {
-				const code = healths[Math.min(healthCalls++, healths.length - 1)] ?? 0;
-				return code
-					? { code, out: "HTTP 500\n" }
-					: { code: 0, out: '{"ok":true}\n' };
-			}
-			if (wt) {
-				// A failed read prints the board's HTTP status and exits 1, like the other scripts.
-				if (o.waitTurns === "!fail") return { code: 1, out: "HTTP 500\n" };
-				return { code: 0, out: `${o.waitTurns ?? ""}\n` };
-			}
-			if (get) {
-				// No answer at all is the mixed-version fallback: a board one version
-				// older has no GET /api/drain, and the run keeps the whole-board flow.
-				if (gets === undefined) return { code: 1, out: "HTTP 404\n" };
-				const g = gets[Math.min(getCalls++, gets.length - 1)] ?? "{}";
-				// A deliberate failed read: the exec exits non-zero with HTTP text,
-				// like a board whose GET /api/drain answered 500.
-				if (g === "!fail") return { code: 1, out: "HTTP 500\n" };
-				return { code: 0, out: `${g}\n` };
-			}
-			if (free) {
-				const code = frees[Math.min(freeCalls++, frees.length - 1)] ?? 0;
-				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
-			}
-			if (drain) {
-				const code = holds[Math.min(holdCalls++, holds.length - 1)] ?? 0;
-				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
-			}
-			if (detach) {
-				const code =
-					detaches[Math.min(detachCalls++, detaches.length - 1)] ?? 0;
-				// A failed detach prints the worker's HTTP status, like the other scripts.
-				return code ? { code, out: "HTTP 404\n" } : { code: 0, out: "" };
-			}
-			if (dlist) {
-				const b = dlists?.[Math.min(dlistCalls++, dlists.length - 1)] ?? "[]";
-				// A failed read prints the worker's HTTP status and exits 1, like
-				// the other scripts; "!bad" is an answer no JSON parser takes.
-				if (b === "!fail") return { code: 1, out: "HTTP 500\n" };
-				return { code: 0, out: `${b}\n` };
-			}
-			if (args.includes("restart"))
-				return o.restart
-					? { code: o.restart, out: o.restartOut ?? "" }
-					: { code: 0, out: "" };
-			if (args.includes("exec"))
-				return {
-					code: 0,
-					out: turns[Math.min(counted++, turns.length - 1)] ?? "0",
-				};
-			if (args.includes("up")) {
-				const svc = args.at(-1)!;
-				const by = o.upBy?.[svc];
-				if (by)
-					return {
-						code: by.code ?? 0,
-						out: by.out ?? (by.code ? `container ${svc} is unhealthy` : ""),
-					};
-				return args.at(-1) === o.sidecar?.name
-					? {
-							code: o.sidecarUp ?? 0,
-							out: o.sidecarUp ? "container sidecar exited (1)" : "",
-						}
-					: { code: o.up ?? 0, out: o.upOut ?? "" };
-			}
-			return { code: 0, out: "" };
+			const flags = dockerFlags(line);
+			if (flags.drain) drains.push(line);
+			if (args.includes("board-seed")) return boardSeedExec(line, o, rec);
+			const record = recordExec(line, o, rec);
+			if (record !== null) return record;
+			if (line.startsWith("ps --filter name="))
+				return psFilterExec(line, o, rec);
+			calls.push(line.replace(/ -e .*/s, execTag(flags)));
+			return postExec(args, line, extra, o, answers, n, rec);
 		},
 		log: (line) => logs.push(line),
 		// The harness default never reaches the network: an injected githubApi replaces it.

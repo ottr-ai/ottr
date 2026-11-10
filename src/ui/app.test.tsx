@@ -6393,6 +6393,57 @@ describe("AddProjectModal board GitHub token reuse", () => {
 		githubTokenSet,
 	});
 
+	// The fetch mountAdd serves: gh-status 404, the git-hosts view for the token state,
+	// a first project POST that fails for the missing token, then success; every POST
+	// body lands in `posts`, and the github-token POST answers with the token set.
+	async function addProjectFetch(
+		hostsView: (githubTokenSet: boolean) => Record<string, unknown>,
+		posts: { url: string; body: Record<string, unknown> }[],
+		calls: { project: number },
+		project: ProjectView,
+		githubTokenSet: boolean,
+		input: RequestInfo | URL,
+		init?: RequestInit,
+	): Promise<Response> {
+		const url = String(input);
+		const method = init?.method ?? "GET";
+		if (url.endsWith("/api/gh-status")) {
+			return new Response("{}", { status: 404 });
+		}
+		if (url.endsWith("/api/git-hosts")) {
+			return new Response(JSON.stringify(hostsView(githubTokenSet)), {
+				status: 200,
+			});
+		}
+		if (url.endsWith("/api/projects") && method === "POST") {
+			calls.project += 1;
+			posts.push({
+				url,
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			});
+			if (calls.project === 1) {
+				return new Response(
+					JSON.stringify({
+						error: "Authentication failed",
+						needsToken: "github.com",
+					}),
+					{ status: 400 },
+				);
+			}
+			return new Response(JSON.stringify({ project, interview: "i1" }), {
+				status: 200,
+			});
+		}
+		if (url.endsWith("/api/git-hosts/github-token")) {
+			posts.push({
+				url,
+				body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+			});
+			return new Response(JSON.stringify(hostsView(true)), { status: 200 });
+		}
+		return new Response("{}", { status: 404 });
+	}
+
 	async function mountAdd(githubTokenSet: boolean): Promise<{
 		container: HTMLDivElement;
 		root: ReturnType<typeof createRoot>;
@@ -6402,50 +6453,18 @@ describe("AddProjectModal board GitHub token reuse", () => {
 	}> {
 		const posts: { url: string; body: Record<string, unknown> }[] = [];
 		const added: string[] = [];
-		let projectCalls = 0;
+		const calls = { project: 0 };
 		const realFetch = globalThis.fetch;
-		globalThis.fetch = (async (
-			input: RequestInfo | URL,
-			init?: RequestInit,
-		) => {
-			const url = String(input);
-			const method = init?.method ?? "GET";
-			if (url.endsWith("/api/gh-status")) {
-				return new Response("{}", { status: 404 });
-			}
-			if (url.endsWith("/api/git-hosts")) {
-				return new Response(JSON.stringify(hostsView(githubTokenSet)), {
-					status: 200,
-				});
-			}
-			if (url.endsWith("/api/projects") && method === "POST") {
-				projectCalls += 1;
-				posts.push({
-					url,
-					body: JSON.parse(String(init?.body)) as Record<string, unknown>,
-				});
-				if (projectCalls === 1) {
-					return new Response(
-						JSON.stringify({
-							error: "Authentication failed",
-							needsToken: "github.com",
-						}),
-						{ status: 400 },
-					);
-				}
-				return new Response(JSON.stringify({ project, interview: "i1" }), {
-					status: 200,
-				});
-			}
-			if (url.endsWith("/api/git-hosts/github-token")) {
-				posts.push({
-					url,
-					body: JSON.parse(String(init?.body)) as Record<string, unknown>,
-				});
-				return new Response(JSON.stringify(hostsView(true)), { status: 200 });
-			}
-			return new Response("{}", { status: 404 });
-		}) as unknown as typeof fetch;
+		globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+			addProjectFetch(
+				hostsView,
+				posts,
+				calls,
+				project,
+				githubTokenSet,
+				input,
+				init,
+			)) as unknown as typeof fetch;
 
 		const container = window.document.createElement(
 			"div",

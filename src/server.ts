@@ -502,7 +502,11 @@ async function probeVmRunner(): Promise<void> {
 		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
 		return;
 	}
-	const url = vmTarget.urls[0]!;
+	const url = vmTarget.urls[0];
+	if (url === undefined) {
+		vmState.health = { configured: false, ok: false, reason: VM_UNCONFIGURED };
+		return;
+	}
 	try {
 		const res = await fetch(`${url}/healthz`, {
 			headers: vmTarget.token ? { "x-otwr-token": vmTarget.token } : {},

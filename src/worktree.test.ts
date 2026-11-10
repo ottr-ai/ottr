@@ -4319,7 +4319,7 @@ describe("worktree helper matrices", () => {
 		);
 		expect(slugify("  MixED-Case_Name.go  ")).toBe("mixed-case-name-go");
 		expect(slugify("a".repeat(40))).toBe("a".repeat(32));
-		expect(slugify("ab".repeat(20) + "-tail")).toBe("ab".repeat(16));
+		expect(slugify(`${"ab".repeat(20)}-tail`)).toBe("ab".repeat(16));
 		expect(slugify("????")).toBe("task");
 		expect(slugify("")).toBe("task");
 		expect(slugify("- already-dashed -")).toBe("already-dashed");

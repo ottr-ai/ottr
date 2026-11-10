@@ -550,6 +550,31 @@ export function redact(text: string, list: readonly string[]): string {
  * cut through a match), so a token split across two writes is one match. The joined output
  * always equals redact() of the joined input. flush() releases the held tail.
  */
+/** The cut release emits up to: all of `held`, or the longest-secret holdback, moved back so it never cuts inside a match. */
+function releaseCut(
+	held: string,
+	live: readonly string[],
+	all: boolean,
+): number {
+	const longest = live.reduce((n, s) => Math.max(n, s.length), 0);
+	let cut = all || longest === 0 ? held.length : held.length - (longest - 1);
+	// Never cut inside a match: move the cut to the start of any match that crosses it.
+	for (let moved = true; moved; ) {
+		moved = false;
+		for (const s of live)
+			for (
+				let i = held.indexOf(s);
+				i !== -1 && i < cut;
+				i = held.indexOf(s, i + 1)
+			)
+				if (i + s.length > cut) {
+					cut = i;
+					moved = true;
+				}
+	}
+	return cut;
+}
+
 export function redactingWriter(
 	emit: (s: string) => void,
 	list: () => readonly string[],
@@ -557,22 +582,7 @@ export function redactingWriter(
 	let held = "";
 	const release = (all: boolean): void => {
 		const live = list().filter((s) => s !== "");
-		const longest = live.reduce((n, s) => Math.max(n, s.length), 0);
-		let cut = all || longest === 0 ? held.length : held.length - (longest - 1);
-		// Never cut inside a match: move the cut to the start of any match that crosses it.
-		for (let moved = true; moved; ) {
-			moved = false;
-			for (const s of live)
-				for (
-					let i = held.indexOf(s);
-					i !== -1 && i < cut;
-					i = held.indexOf(s, i + 1)
-				)
-					if (i + s.length > cut) {
-						cut = i;
-						moved = true;
-					}
-		}
+		const cut = releaseCut(held, live, all);
 		if (cut <= 0) return;
 		const out = redact(held.slice(0, cut), live);
 		held = held.slice(cut);
@@ -636,7 +646,7 @@ export async function githubUrl(
 	const r = await git(["remote", "-v"], mainPath);
 	if (r.code !== 0) return null;
 	const hostRe = new RegExp(
-		hostMatcher(host).source + "(.+?)(?:\\.git)?$",
+		`${hostMatcher(host).source}(.+?)(?:\\.git)?$`,
 		"i",
 	);
 	const byName = new Map<string, string>();
@@ -903,6 +913,162 @@ export async function resolveTarget(
 	});
 }
 
+/** The pinned-URL fetch for an origin target; its warning, or null when nothing fetched or the fetch succeeded. */
+async function pinnedFetch(
+	mainPath: string,
+	fetch: boolean,
+	originUrl: string | null,
+	o: {
+		target: string;
+		remote: string;
+		remoteRef: string;
+		short: string | null;
+		upstream: string;
+	},
+): Promise<string | null> {
+	if (!fetch || o.remote === "") return null;
+	// ponytail: a remote branch deleted since the last fetch only warns (its stale ref still resolves); add `git ls-remote --exit-code` if that bites
+	if (o.remote === "origin" && o.short !== null) {
+		// R5-1: fetch the pinned origin URL with an explicit refspec into the canonical
+		// tracking ref — a planted remote.origin.url and the configured refspecs stay
+		// irrelevant. No pin yet: skip (same degraded state as a failed fetch), never a
+		// fetch by the worker-writable name.
+		if (originUrl === null)
+			return `the origin URL is not pinned yet; using the last fetched ${o.target}`;
+		const guard = await checkPinnedRemote(mainPath, originUrl);
+		if (guard !== null) return `not fetching ${o.target}: ${guard}`;
+		const f = await git(
+			[
+				"fetch",
+				"--quiet",
+				originUrl,
+				`+${o.remoteRef}:refs/remotes/origin/${o.short}`,
+			],
+			mainPath,
+		);
+		if (f.code !== 0)
+			return `git fetch ${originUrl} ${o.remoteRef} failed: ${f.stderr.trim()}`;
+		return null;
+	}
+	// R5-1: a fetch by remote name runs the named repo's upload-pack in the server's
+	// git next to the tokens (a plantable uploadpack.packObjectsHook executes there).
+	// The board targets origin/<branch> only; any other upstream (a fork remote, a
+	// merge ref outside refs/heads) skips the refresh with the same warning a failed
+	// fetch gets, instead of trusting a plantable name.
+	return `not fetching ${o.upstream || o.remote}: the board fetches only the pinned origin`;
+}
+
+/** OTTR-605, derivation half: with no upstream and no origin/HEAD the ladder falls back
+ * to the bare local branch — a target the board never pushes. When origin exists but
+ * has no branch for the local branch yet (the new-project wizard pointed at an empty
+ * repo), aim the target at origin/<branch> instead, so the empty-origin resolution in
+ * the failure half below applies. Probed only on this rare fallback shape: a healthy
+ * clone has origin/HEAD or an upstream and never pays for the three local git reads. */
+async function deriveTarget(
+	mainPath: string,
+	o: {
+		remote: string;
+		branch: string;
+		upstream: string;
+		/** Loud error when the target does not resolve and no upstream message applies. */
+		fetchErrorNote: string | null;
+	},
+	target: string,
+): Promise<{ target: string; emptyOriginAim: boolean }> {
+	if (
+		o.fetchErrorNote !== null ||
+		o.remote !== "" ||
+		o.upstream !== "" ||
+		target !== o.branch
+	)
+		return { target, emptyOriginAim: false };
+	const [local, tracking, originGet] = await Promise.all([
+		git(
+			["rev-parse", "--verify", "--quiet", `refs/heads/${o.branch}`],
+			mainPath,
+		),
+		git(
+			["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${o.branch}`],
+			mainPath,
+		),
+		git(["remote", "get-url", "origin"], mainPath),
+	]);
+	if (local.code === 0 && tracking.code !== 0 && originGet.code === 0)
+		return { target: `origin/${o.branch}`, emptyOriginAim: true };
+	return { target, emptyOriginAim: false };
+}
+
+/** OTTR-605, failure half: the aspirational resolution of an origin that exists but has
+ * no branch for the local branch yet, or null when it does not apply and the standard
+ * throws must run. When the derivation names the checked-out branch and the local
+ * branch holds a commit, resolve origin/<branch> aspirationally: fetch=false
+ * callers (refreshRemote, boot) get the target plus the unpushed flag, so the
+ * project view shows the target and the "Push to origin" advisory at once, and the
+ * tick's branchUnpushed keeps the flag true. A fetch=true caller (merge turn,
+ * release, review) must not base work on a commit origin does not have, so it
+ * still fails — but with a reason that names the button instead of a manual git
+ * command, and only when the missing branch is proven (a fetch that failed naming
+ * the remote ref, or no fetch being possible at all), so a network outage or auth
+ * failure never poses as an empty origin. */
+async function unpushedOutcome(
+	mainPath: string,
+	fetch: boolean,
+	fetchError: string | null,
+	o: {
+		remote: string;
+		short: string | null;
+		branch: string;
+		/** Loud error when the target does not resolve and no upstream message applies. */
+		fetchErrorNote: string | null;
+	},
+	emptyOriginAim: boolean,
+	target: string,
+): Promise<{
+	target: string;
+	sha: string;
+	warning: string;
+	unpushed: true;
+} | null> {
+	const aimsAtLocalBranch =
+		emptyOriginAim || (o.remote === "origin" && o.short === o.branch);
+	if (o.fetchErrorNote !== null || !aimsAtLocalBranch) return null;
+	const [local, tracking, originGet] = await Promise.all([
+		git(
+			["rev-parse", "--verify", "--quiet", `refs/heads/${o.branch}`],
+			mainPath,
+		),
+		git(
+			["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${o.branch}`],
+			mainPath,
+		),
+		o.remote === "origin"
+			? Promise.resolve({ code: 0, stdout: "", stderr: "" })
+			: git(["remote", "get-url", "origin"], mainPath),
+	]);
+	const emptyOrigin =
+		local.code === 0 && tracking.code !== 0 && originGet.code === 0;
+	// fetch=true with an origin upstream runs the pinned fetch above, so a null
+	// fetchError cannot coexist with an unresolvable ref there; the no-fetch forms
+	// (fetch=false, or the derivation never names a fetchable remote) rest on the
+	// same local knowledge the board's fetch=false paths use.
+	const proven =
+		!fetch ||
+		o.remote === "" ||
+		(fetchError !== null && REMOTE_REF_MISSING.test(fetchError));
+	if (!emptyOrigin || !proven) return null;
+	if (fetch) {
+		throw new Error(
+			`origin has no ${o.branch} branch yet, so ${target} cannot resolve. Push the local ${o.branch} with the board's "Push to origin" button, then reply to this card.`,
+		);
+	}
+	return {
+		target,
+		sha: local.stdout.trim(),
+		warning: `origin has no ${o.branch} branch yet; the board targets origin/${o.branch} and treats the local ${o.branch} as unpushed until it is pushed`,
+		unpushed: true,
+	};
+}
+
 /** Shared tail of the ladder: the pinned-URL fetch for an origin target, then resolve the target's sha. */
 async function resolveLadderTarget(
 	mainPath: string,
@@ -927,144 +1093,171 @@ async function resolveLadderTarget(
 	unpushed?: true;
 }> {
 	// OTTR-605 may re-aim this at origin/<branch> before the rev-parse (see below).
-	let target = o.target;
-	let fetchError: string | null = null;
-	if (fetch && o.remote !== "") {
-		// ponytail: a remote branch deleted since the last fetch only warns (its stale ref still resolves); add `git ls-remote --exit-code` if that bites
-		if (o.remote === "origin" && o.short !== null) {
-			// R5-1: fetch the pinned origin URL with an explicit refspec into the canonical
-			// tracking ref — a planted remote.origin.url and the configured refspecs stay
-			// irrelevant. No pin yet: skip (same degraded state as a failed fetch), never a
-			// fetch by the worker-writable name.
-			if (originUrl === null) {
-				fetchError = `the origin URL is not pinned yet; using the last fetched ${target}`;
-			} else {
-				const guard = await checkPinnedRemote(mainPath, originUrl);
-				if (guard !== null) fetchError = `not fetching ${target}: ${guard}`;
-				else {
-					const f = await git(
-						[
-							"fetch",
-							"--quiet",
-							originUrl,
-							`+${o.remoteRef}:refs/remotes/origin/${o.short}`,
-						],
-						mainPath,
-					);
-					if (f.code !== 0)
-						fetchError = `git fetch ${originUrl} ${o.remoteRef} failed: ${f.stderr.trim()}`;
-				}
-			}
-		} else {
-			// R5-1: a fetch by remote name runs the named repo's upload-pack in the server's
-			// git next to the tokens (a plantable uploadpack.packObjectsHook executes there).
-			// The board targets origin/<branch> only; any other upstream (a fork remote, a
-			// merge ref outside refs/heads) skips the refresh with the same warning a failed
-			// fetch gets, instead of trusting a plantable name.
-			fetchError = `not fetching ${o.upstream || o.remote}: the board fetches only the pinned origin`;
-		}
-	}
-	// OTTR-605, derivation half: with no upstream and no origin/HEAD the ladder falls back
-	// to the bare local branch — a target the board never pushes. When origin exists but
-	// has no branch for the local branch yet (the new-project wizard pointed at an empty
-	// repo), aim the target at origin/<branch> instead, so the empty-origin resolution in
-	// the failure half below applies. Probed only on this rare fallback shape: a healthy
-	// clone has origin/HEAD or an upstream and never pays for the three local git reads.
-	let emptyOriginAim = false;
-	if (
-		o.fetchErrorNote === null &&
-		o.remote === "" &&
-		o.upstream === "" &&
-		target === o.branch
-	) {
-		const [local, tracking, originGet] = await Promise.all([
-			git(
-				["rev-parse", "--verify", "--quiet", `refs/heads/${o.branch}`],
-				mainPath,
-			),
-			git(
-				["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${o.branch}`],
-				mainPath,
-			),
-			git(["remote", "get-url", "origin"], mainPath),
-		]);
-		if (local.code === 0 && tracking.code !== 0 && originGet.code === 0) {
-			target = `origin/${o.branch}`;
-			emptyOriginAim = true;
-		}
-	}
+	const fetched = await pinnedFetch(mainPath, fetch, originUrl, o);
+	const derived = await deriveTarget(mainPath, o, o.target);
+	const target = derived.target;
 	const sha = await git(
 		["rev-parse", "--verify", "--quiet", `${target}^{commit}`],
 		mainPath,
 	);
 	if (sha.code !== 0) {
-		// OTTR-605, failure half: an origin that exists but has no branch for the local
-		// branch yet. When the derivation names the checked-out branch and the local
-		// branch holds a commit, resolve origin/<branch> aspirationally: fetch=false
-		// callers (refreshRemote, boot) get the target plus the unpushed flag, so the
-		// project view shows the target and the "Push to origin" advisory at once, and the
-		// tick's branchUnpushed keeps the flag true. A fetch=true caller (merge turn,
-		// release, review) must not base work on a commit origin does not have, so it
-		// still fails — but with a reason that names the button instead of a manual git
-		// command, and only when the missing branch is proven (a fetch that failed naming
-		// the remote ref, or no fetch being possible at all), so a network outage or auth
-		// failure never poses as an empty origin.
-		const aimsAtLocalBranch =
-			emptyOriginAim || (o.remote === "origin" && o.short === o.branch);
-		if (o.fetchErrorNote === null && aimsAtLocalBranch) {
-			const [local, tracking, originGet] = await Promise.all([
-				git(
-					["rev-parse", "--verify", "--quiet", `refs/heads/${o.branch}`],
-					mainPath,
-				),
-				git(
-					[
-						"rev-parse",
-						"--verify",
-						"--quiet",
-						`refs/remotes/origin/${o.branch}`,
-					],
-					mainPath,
-				),
-				o.remote === "origin"
-					? Promise.resolve({ code: 0, stdout: "", stderr: "" })
-					: git(["remote", "get-url", "origin"], mainPath),
-			]);
-			const emptyOrigin =
-				local.code === 0 && tracking.code !== 0 && originGet.code === 0;
-			// fetch=true with an origin upstream runs the pinned fetch above, so a null
-			// fetchError cannot coexist with an unresolvable ref there; the no-fetch forms
-			// (fetch=false, or the derivation never names a fetchable remote) rest on the
-			// same local knowledge the board's fetch=false paths use.
-			const proven =
-				!fetch ||
-				o.remote === "" ||
-				(fetchError !== null && REMOTE_REF_MISSING.test(fetchError));
-			if (emptyOrigin && proven) {
-				if (fetch) {
-					throw new Error(
-						`origin has no ${o.branch} branch yet, so ${target} cannot resolve. Push the local ${o.branch} with the board's "Push to origin" button, then reply to this card.`,
-					);
-				}
-				return {
-					target,
-					sha: local.stdout.trim(),
-					warning: `origin has no ${o.branch} branch yet; the board targets origin/${o.branch} and treats the local ${o.branch} as unpushed until it is pushed`,
-					unpushed: true,
-				};
-			}
-		}
+		const unpushed = await unpushedOutcome(
+			mainPath,
+			fetch,
+			fetched,
+			o,
+			derived.emptyOriginAim,
+			target,
+		);
+		if (unpushed !== null) return unpushed;
 		if (o.fetchErrorNote !== null) throw new Error(o.fetchErrorNote);
 		if (!o.upstream) throw new Error(`cannot resolve ${target}`);
 		throw new Error(
-			`upstream ${target} of ${o.branch} not found${fetchError ? ` (${fetchError})` : ""}; push ${o.branch} or set its upstream with git branch -u`,
+			`upstream ${target} of ${o.branch} not found${fetched ? ` (${fetched})` : ""}; push ${o.branch} or set its upstream with git branch -u`,
 		);
 	}
 	return {
 		target,
 		sha: sha.stdout.trim(),
-		warning: fetchError && `${fetchError}; using ${target} as last fetched`,
+		warning: fetched && `${fetched}; using ${target} as last fetched`,
 	};
+}
+
+/** Adds the worktree, reusing one a crashed attempt left behind when it is still linked.
+ * Reuse is decided by behavior, not by comparing registered path strings: on Windows git prints
+ * long paths while Node may hold 8.3 short forms (RUNNER~1), so a textual set lookup misreads a
+ * registered worktree as a scratch dir and deletes it behind git's back, and the next add dies
+ * with "already registered". Returns true when a fresh add ran. */
+async function addWorktree(o: {
+	mainPath: string;
+	worktreePath: string;
+	branch: string;
+	base: string;
+	log: (line: string) => void;
+}): Promise<boolean> {
+	const onDisk = existsSync(o.worktreePath);
+	if (onDisk && (await worktreeLinked(o.worktreePath))) {
+		o.log(`reusing worktree ${o.worktreePath} on ${o.branch}`);
+		return false;
+	}
+	if (onDisk)
+		// scratch dir from an interrupted add; the tracker owns .worktrees/<id>
+		removeBelow(worktreeAnchor(o.mainPath, o.worktreePath), o.worktreePath);
+	// a stale admin entry would fail the add with "missing but already registered"
+	await guardAdminEntries(o.mainPath, o.worktreePath);
+	const branchExists =
+		(await git(["rev-parse", "--quiet", "--verify", o.branch], o.mainPath))
+			.code === 0;
+	const add = await git(
+		branchExists
+			? ["worktree", "add", "--no-checkout", o.worktreePath, o.branch]
+			: [
+					"worktree",
+					"add",
+					"--no-checkout",
+					"-b",
+					o.branch,
+					o.worktreePath,
+					o.base,
+				],
+		o.mainPath,
+	);
+	if (add.code !== 0)
+		throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
+	return true;
+}
+
+/** The checkout `worktree add` would run, minus planted smudge drivers (sealedGit). */
+async function checkoutFresh(worktreePath: string): Promise<void> {
+	// ponytail: a crash between add and this checkout leaves an empty worktree that a retry
+	// reuses as is; check for the missing index on reuse if that ever bites.
+	const co = await sealedGit(
+		["reset", "--hard", "--no-recurse-submodules", "-q"],
+		worktreePath,
+	);
+	if (co.code !== 0)
+		throw new Error(`git checkout of the worktree failed: ${co.stderr.trim()}`);
+}
+
+/** Copies the untracked candidate files (rules, .omp, copy extras) into the worktree; returns the copied paths. */
+async function copyUntracked(o: {
+	mainPath: string;
+	worktreePath: string;
+	copyExtra: string[];
+	log: (line: string) => void;
+}): Promise<string[]> {
+	const candidates = ["AGENTS.md", ".omp", ...o.copyExtra].filter((p) =>
+		existsSync(path.join(o.mainPath, p)),
+	);
+	const copied: string[] = [];
+	if (candidates.length === 0) return copied;
+	// No ignore filter: local-only rules are ignored files by design (.git/info/exclude
+	// or a .gitignore), and the exclude entries that this copy adds would hide them from
+	// the next worktree. validateCopyPath rejects "." and the loop skips env files.
+	// ponytail: ls-files --others copies whole dirs (e.g. .omp) wholesale, ignored caches too; fine for rules-scale files
+	const ls = await git(
+		["ls-files", "-z", "--others", "--", ...candidates],
+		o.mainPath,
+	);
+	if (ls.code !== 0)
+		throw new Error(`git ls-files failed: ${ls.stderr.trim()}`);
+	for (const rel of ls.stdout.split("\0")) {
+		if (rel === "") continue;
+		if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
+			continue;
+		copyBelow(
+			{
+				anchor: trustedAnchor(o.mainPath),
+				file: path.join(o.mainPath, rel),
+			},
+			{
+				anchor: worktreeAnchor(o.mainPath, o.worktreePath),
+				file: path.join(o.worktreePath, rel),
+			},
+			o.mainPath,
+		);
+		copied.push(rel);
+		o.log(`copied ${rel}`);
+	}
+	return copied;
+}
+
+/** Adds the copied untracked files to .git/info/exclude, then proves the worktree clean. */
+async function excludeAndVerify(
+	o: {
+		mainPath: string;
+		worktreePath: string;
+		log: (line: string) => void;
+	},
+	copied: string[],
+): Promise<void> {
+	if (copied.length === 0) return;
+	const exclude = await excludeFile(o.mainPath);
+	for (const rel of copied) {
+		const relFwd = rel.replaceAll("\\", "/");
+		const ci = await git(["check-ignore", "-q", "--", rel], o.worktreePath);
+		if (ci.code === 1) {
+			appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
+			o.log(`added /${relFwd} to .git/info/exclude`);
+		} else if (ci.code > 1) {
+			throw new Error(
+				`git check-ignore failed for ${rel}: ${ci.stderr.trim()}`,
+			);
+		}
+	}
+	const st = await sealedGit(
+		[
+			"status",
+			"--porcelain",
+			"--untracked-files=all",
+			"--ignore-submodules=dirty",
+		],
+		o.worktreePath,
+	);
+	if (st.code !== 0)
+		throw new Error(`git status failed in worktree: ${st.stderr.trim()}`);
+	if (st.stdout !== "")
+		throw new Error(`worktree not clean after copying rules:\n${st.stdout}`);
 }
 
 export async function createWorktree(o: {
@@ -1084,122 +1277,14 @@ export async function createWorktree(o: {
 
 	// A crashed attempt (omp dying before its turn was recorded) can leave the branch and/or
 	// worktree behind; both names derive from the task id, so a retry reuses them instead of
-	// failing with "branch already exists". Reuse is decided by behavior, not by comparing
-	// registered path strings: on Windows git prints long paths while Node may hold 8.3 short
-	// forms (RUNNER~1), so a textual set lookup misreads a registered worktree as a scratch dir
-	// and deletes it behind git's back, and the next add dies with "already registered".
-	const onDisk = existsSync(o.worktreePath);
-	let fresh = false;
-	if (onDisk && (await worktreeLinked(o.worktreePath))) {
-		o.log(`reusing worktree ${o.worktreePath} on ${o.branch}`);
-	} else {
-		if (onDisk)
-			// scratch dir from an interrupted add; the tracker owns .worktrees/<id>
-			removeBelow(worktreeAnchor(o.mainPath, o.worktreePath), o.worktreePath);
-		// a stale admin entry would fail the add with "missing but already registered"
-		await guardAdminEntries(o.mainPath, o.worktreePath);
-		const branchExists =
-			(await git(["rev-parse", "--quiet", "--verify", o.branch], o.mainPath))
-				.code === 0;
-		const add = await git(
-			branchExists
-				? ["worktree", "add", "--no-checkout", o.worktreePath, o.branch]
-				: [
-						"worktree",
-						"add",
-						"--no-checkout",
-						"-b",
-						o.branch,
-						o.worktreePath,
-						o.base,
-					],
-			o.mainPath,
-		);
-		if (add.code !== 0)
-			throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
-		fresh = true;
-	}
+	// failing with "branch already exists".
+	const fresh = await addWorktree(o);
 	o.log(`worktree ${o.worktreePath} on ${o.branch}`);
 
 	try {
-		// The checkout `worktree add` would run, minus planted smudge drivers (sealedGit).
-		// ponytail: a crash between add and this checkout leaves an empty worktree that a retry
-		// reuses as is; check for the missing index on reuse if that ever bites.
-		if (fresh) {
-			const co = await sealedGit(
-				["reset", "--hard", "--no-recurse-submodules", "-q"],
-				o.worktreePath,
-			);
-			if (co.code !== 0)
-				throw new Error(
-					`git checkout of the worktree failed: ${co.stderr.trim()}`,
-				);
-		}
-		const candidates = ["AGENTS.md", ".omp", ...o.copyExtra].filter((p) =>
-			existsSync(path.join(o.mainPath, p)),
-		);
-		const copied: string[] = [];
-		if (candidates.length > 0) {
-			// No ignore filter: local-only rules are ignored files by design (.git/info/exclude
-			// or a .gitignore), and the exclude entries that this copy adds would hide them from
-			// the next worktree. validateCopyPath rejects "." and the loop skips env files.
-			// ponytail: ls-files --others copies whole dirs (e.g. .omp) wholesale, ignored caches too; fine for rules-scale files
-			const ls = await git(
-				["ls-files", "-z", "--others", "--", ...candidates],
-				o.mainPath,
-			);
-			if (ls.code !== 0)
-				throw new Error(`git ls-files failed: ${ls.stderr.trim()}`);
-			for (const rel of ls.stdout.split("\0")) {
-				if (rel === "") continue;
-				if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
-					continue;
-				copyBelow(
-					{
-						anchor: trustedAnchor(o.mainPath),
-						file: path.join(o.mainPath, rel),
-					},
-					{
-						anchor: worktreeAnchor(o.mainPath, o.worktreePath),
-						file: path.join(o.worktreePath, rel),
-					},
-					o.mainPath,
-				);
-				copied.push(rel);
-				o.log(`copied ${rel}`);
-			}
-		}
-
-		if (copied.length > 0) {
-			const exclude = await excludeFile(o.mainPath);
-			for (const rel of copied) {
-				const relFwd = rel.replaceAll("\\", "/");
-				const ci = await git(["check-ignore", "-q", "--", rel], o.worktreePath);
-				if (ci.code === 1) {
-					appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
-					o.log(`added /${relFwd} to .git/info/exclude`);
-				} else if (ci.code > 1) {
-					throw new Error(
-						`git check-ignore failed for ${rel}: ${ci.stderr.trim()}`,
-					);
-				}
-			}
-			const st = await sealedGit(
-				[
-					"status",
-					"--porcelain",
-					"--untracked-files=all",
-					"--ignore-submodules=dirty",
-				],
-				o.worktreePath,
-			);
-			if (st.code !== 0)
-				throw new Error(`git status failed in worktree: ${st.stderr.trim()}`);
-			if (st.stdout !== "")
-				throw new Error(
-					`worktree not clean after copying rules:\n${st.stdout}`,
-				);
-		}
+		if (fresh) await checkoutFresh(o.worktreePath);
+		const copied = await copyUntracked(o);
+		await excludeAndVerify(o, copied);
 	} catch (e) {
 		// worktree add succeeded; roll it back so a retry doesn't hit "already exists"
 		try {
@@ -1423,6 +1508,33 @@ function cappedPushOutput(text: string): string | undefined {
  * "error:") and `output` with git's complete output (OTTR-465), so the card log shows the
  * cause a permission failure points at.
  */
+/** The merge-hold gate: the audited origin tip must be contained in the local branch. Null when it holds. */
+async function holdGate(
+	mainPath: string,
+	leaseTip: string,
+	branch: string,
+): Promise<{ status: "failed"; error: string } | null> {
+	const pinned = await git(
+		["merge-base", "--is-ancestor", leaseTip, `refs/heads/${branch}`],
+		mainPath,
+	);
+	if (pinned.code === 0) return null;
+	return {
+		status: "failed",
+		error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in refs/heads/${branch}`,
+	};
+}
+
+/** The commit this merge would integrate: the worktree HEAD when linked, else the task branch's tip; null when neither applies. */
+async function integrationHead(
+	worktreePath: string,
+	taskBranch: string,
+	sha: (ref: string, cwd?: string) => Promise<string | null>,
+): Promise<string | null> {
+	if (await worktreeLinked(worktreePath)) return sha("HEAD", worktreePath);
+	return taskBranch === "" ? null : sha(`refs/heads/${taskBranch}`);
+}
+
 export async function serverMergePush(
 	mainPath: string,
 	worktreePath: string,
@@ -1449,21 +1561,10 @@ export async function serverMergePush(
 	if (local === null || local === (await sha(`refs/remotes/origin/${branch}`)))
 		return { status: "skipped" };
 	if (leaseTip !== null) {
-		const pinned = await git(
-			["merge-base", "--is-ancestor", leaseTip, `refs/heads/${branch}`],
-			mainPath,
-		);
-		if (pinned.code !== 0)
-			return {
-				status: "failed",
-				error: `merge-hold gate: the audited origin tip ${leaseTip} is not contained in refs/heads/${branch}`,
-			};
+		const gate = await holdGate(mainPath, leaseTip, branch);
+		if (gate !== null) return gate;
 	}
-	const head = (await worktreeLinked(worktreePath))
-		? await sha("HEAD", worktreePath)
-		: taskBranch === ""
-			? null
-			: await sha(`refs/heads/${taskBranch}`);
+	const head = await integrationHead(worktreePath, taskBranch, sha);
 	if (head !== null) {
 		const merged = await git(
 			["merge-base", "--is-ancestor", head, local],
@@ -1511,20 +1612,7 @@ export async function serverMergePush(
 	// needsReason keeps every reason line — "! [rejected]", "remote:", "fatal:" and the
 	// "error:" line — not only one line, so a push the server could not write shows its
 	// cause (a missing App installation, a token scope) instead of a bare summary.
-	const output = cappedPushOutput(
-		redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
-	);
-	const reasons = r.stderr
-		.split("\n")
-		.filter((line) => PUSH_REASON_LINE.test(line))
-		.join("\n")
-		.trim();
-	const error = redactUrlCredentials(
-		reasons !== ""
-			? reasons
-			: (r.stderr.trim().split("\n").filter(Boolean).pop() ??
-					`git push exited ${r.code}`),
-	);
+	const { error, output } = pushFailure(r);
 	// OTTR-394: git's rejection of a remote that moved while the merge ran ("fetch first" is
 	// the same rejection worded for a still-fast-forwardable local side); "(stale info)" is a
 	// --force-with-lease rejection, which the caller refuses to retry on a held push. Any
@@ -1566,6 +1654,28 @@ export async function serverMergePush(
 		}
 	}
 	return { status: "failed", error, output };
+}
+
+/** The redacted error and capped output of a failed git push (OTTR-465). */
+function pushFailure(r: GitResult): {
+	error: string;
+	output: string | undefined;
+} {
+	const output = cappedPushOutput(
+		redactUrlCredentials(`${r.stdout}${r.stderr}`).trim(),
+	);
+	const reasons = r.stderr
+		.split("\n")
+		.filter((line) => PUSH_REASON_LINE.test(line))
+		.join("\n")
+		.trim();
+	const error = redactUrlCredentials(
+		reasons !== ""
+			? reasons
+			: (r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git push exited ${r.code}`),
+	);
+	return { error, output };
 }
 
 /**
@@ -1997,25 +2107,28 @@ export async function worktreeLinked(path: string): Promise<boolean> {
  * A `.git` file whose gitdir still lives is NOT a husk (OTTR-349): git failed above for another reason (an index
  * lock, dubious ownership) and the worktree may be healthy — a husk verdict there would let the pre-dispatch guard
  * settle a zero-commit card done on a vacuous proof or rebuild a live checkout. */
+/** The gitdir a `.git` link file in `dir` names, resolved; null when the link is missing, unreadable, or names nothing. */
+function readGitdir(dir: string): string | null {
+	try {
+		if (!statSync(path.join(dir, ".git")).isFile()) return null;
+		const m = readFileSync(path.join(dir, ".git"), "utf8").match(
+			/^gitdir:\s*(.+)$/m,
+		);
+		const named = m === null ? "" : (m[1] ?? "").trim();
+		if (named === "") return null;
+		return path.isAbsolute(named) ? named : path.resolve(dir, named);
+	} catch {
+		// no readable .git link here: a climbing-git dir or only an empty dir is a husk
+		return null;
+	}
+}
+
 export async function worktreeHusk(dir: string): Promise<boolean> {
 	if (await worktreeLinked(dir)) return false;
 	// worktreeLinked's git read already failed, so the `.git` file alone proves nothing: read
 	// the gitdir it names and let that decide. An unreadable or malformed `.git` file leaves
 	// gitdir null and the climbing-git and empty-dir checks below decide instead.
-	let gitdir: string | null = null;
-	try {
-		if (statSync(path.join(dir, ".git")).isFile()) {
-			const m = readFileSync(path.join(dir, ".git"), "utf8").match(
-				/^gitdir:\s*(.+)$/m,
-			);
-			const named = m === null ? "" : (m[1] ?? "").trim();
-			if (named !== "") {
-				gitdir = path.isAbsolute(named) ? named : path.resolve(dir, named);
-			}
-		}
-	} catch {
-		// no readable .git link here: a climbing-git dir or only an empty dir is a husk
-	}
+	const gitdir = readGitdir(dir);
 	if (gitdir !== null) {
 		let alive = false;
 		try {
@@ -2187,8 +2300,8 @@ export async function statusRows(worktreePath: string): Promise<string[]> {
 	const recs = r.stdout.split("\0");
 	const out: string[] = [];
 	for (let i = 0; i < recs.length; i++) {
-		const rec = recs[i]!;
-		if (rec === "") continue; // trailing NUL
+		const rec = recs[i];
+		if (rec === undefined || rec === "") continue; // trailing NUL
 		out.push(rec);
 		// Skip the original-path record of a rename/copy (X or Y is R/C).
 		if (rec[0] === "R" || rec[0] === "C" || rec[1] === "R" || rec[1] === "C")

@@ -83,14 +83,200 @@ const INFLATE_PIXEL_CAP = 64_000_000;
 
 export type Rgba = { w: number; h: number; rgba: Uint8Array };
 
+/** Reads one byte with an explicit presence check: TS cannot relate the index to the length. */
+function byteAt(b: Uint8Array, i: number): number {
+	const v = b[i];
+	return v ?? 0;
+}
+
 function u32be(b: Uint8Array, off: number): number {
 	return (
-		((b[off]! << 24) |
-			(b[off + 1]! << 16) |
-			(b[off + 2]! << 8) |
-			b[off + 3]!) >>>
+		((byteAt(b, off) << 24) |
+			(byteAt(b, off + 1) << 16) |
+			(byteAt(b, off + 2) << 8) |
+			byteAt(b, off + 3)) >>>
 		0
 	);
+}
+
+/**
+ * Decodes the PNG subset that screenshot tools write: 8-bit gray, gray+alpha,
+ * RGB or RGBA, non-interlaced. Anything else (palette, 16-bit, interlaced,
+ * truncated, or not a PNG at all) returns null; the caller falls back to
+ * byte-level equality. Alpha composites over black.
+ */
+type PngHeader = { w: number; h: number; channels: number };
+type PngBody = PngHeader & { raw: Buffer };
+
+/** Channels for the supported 8-bit color types; 0 for the unsupported ones. */
+function colorChannels(colorType: number): number {
+	switch (colorType) {
+		case 0:
+			return 1;
+		case 2:
+			return 3;
+		case 4:
+			return 2;
+		case 6:
+			return 4;
+		default:
+			return 0;
+	}
+}
+
+/** Parses the IHDR payload; null when unsupported or the pixel count exceeds the inflate cap. */
+function parseIhdr(bytes: Uint8Array, dataStart: number): PngHeader | null {
+	const w = u32be(bytes, dataStart);
+	const h = u32be(bytes, dataStart + 4);
+	const colorType = byteAt(bytes, dataStart + 9);
+	const ok =
+		byteAt(bytes, dataStart + 8) === 8 && // bit depth
+		byteAt(bytes, dataStart + 10) === 0 && // compression
+		byteAt(bytes, dataStart + 11) === 0 && // filter method
+		byteAt(bytes, dataStart + 12) === 0; // interlace
+	const channels = colorChannels(colorType);
+	if (!ok || channels === 0) return null;
+	if (w === 0 || h === 0 || w * h > INFLATE_PIXEL_CAP) return null;
+	return { w, h, channels };
+}
+
+/** Consumes one IHDR or IDAT chunk and returns the running header, or null when the chunk is invalid in sequence. */
+function readDataChunk(
+	type: string,
+	len: number,
+	bytes: Uint8Array,
+	dataStart: number,
+	header: PngHeader | null,
+	idat: Buffer[],
+): PngHeader | null {
+	if (type === "IHDR") {
+		if (len !== 13 || header !== null) return null;
+		return parseIhdr(bytes, dataStart);
+	}
+	if (type === "IDAT") {
+		if (header === null) return null;
+		idat.push(Buffer.from(bytes.subarray(dataStart, dataStart + len)));
+	}
+	return header;
+}
+
+/** Walks the chunk stream and inflates the concatenated IDAT payload; null on structural problems. */
+function parsePngChunks(bytes: Uint8Array): PngBody | null {
+	const idat: Buffer[] = [];
+	let header: PngHeader | null = null;
+	let sawEnd = false;
+	let off = 8;
+	while (off + 12 <= bytes.length) {
+		const len = u32be(bytes, off);
+		const dataStart = off + 8;
+		const dataEnd = dataStart + len;
+		if (dataEnd + 4 > bytes.length) return null; // truncated chunk
+		const type = String.fromCharCode(
+			byteAt(bytes, off + 4),
+			byteAt(bytes, off + 5),
+			byteAt(bytes, off + 6),
+			byteAt(bytes, off + 7),
+		);
+		if (type === "IEND") {
+			sawEnd = true;
+			break;
+		}
+		if (type === "IHDR" || type === "IDAT") {
+			const next = readDataChunk(type, len, bytes, dataStart, header, idat);
+			if (next === null) return null;
+			header = next;
+		}
+		off = dataEnd + 4; // CRC
+	}
+	if (header === null || !sawEnd || idat.length === 0) return null;
+	const raw = inflateSync(Buffer.concat(idat));
+	const stride = header.w * header.channels;
+	if (raw.length < header.h * (stride + 1)) return null;
+	return { w: header.w, h: header.h, channels: header.channels, raw };
+}
+
+/** Paeth predictor for filter type 4. */
+function paeth(a: number, b: number, c: number): number {
+	const p = a + b - c;
+	const pa = Math.abs(p - a);
+	const pb = Math.abs(p - b);
+	const pc = Math.abs(p - c);
+	return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+}
+
+/** Reverses one row's filter into cur; a, b and c are the Paeth neighbors. */
+function unfilterRow(
+	raw: Buffer,
+	row: number,
+	cur: Uint8Array,
+	prev: Uint8Array,
+	stride: number,
+	channels: number,
+	filter: number,
+): void {
+	for (let x = 0; x < stride; x++) {
+		const a = x >= channels ? byteAt(cur, x - channels) : 0;
+		const b = byteAt(prev, x);
+		const c = x >= channels ? byteAt(prev, x - channels) : 0;
+		let v = byteAt(raw, row + 1 + x);
+		if (filter === 1) v = (v + a) & 0xff;
+		else if (filter === 2) v = (v + b) & 0xff;
+		else if (filter === 3) v = (v + ((a + b) >> 1)) & 0xff;
+		else if (filter === 4) v = (v + paeth(a, b, c)) & 0xff;
+		cur[x] = v;
+	}
+}
+
+/** Writes one unfiltered row into rgba as 8-bit RGBA; alpha composites over black. */
+function writeRow(
+	rgba: Uint8Array,
+	cur: Uint8Array,
+	y: number,
+	w: number,
+	channels: number,
+): void {
+	for (let x = 0; x < w; x++) {
+		const o = (y * w + x) * 4;
+		if (channels === 1) {
+			rgba[o] = rgba[o + 1] = rgba[o + 2] = byteAt(cur, x);
+			rgba[o + 3] = 255;
+		} else if (channels === 2) {
+			rgba[o] = rgba[o + 1] = rgba[o + 2] = byteAt(cur, x * 2);
+			rgba[o + 3] = byteAt(cur, x * 2 + 1);
+		} else if (channels === 3) {
+			rgba[o] = byteAt(cur, x * 3);
+			rgba[o + 1] = byteAt(cur, x * 3 + 1);
+			rgba[o + 2] = byteAt(cur, x * 3 + 2);
+			rgba[o + 3] = 255;
+		} else {
+			rgba[o] = byteAt(cur, x * 4);
+			rgba[o + 1] = byteAt(cur, x * 4 + 1);
+			rgba[o + 2] = byteAt(cur, x * 4 + 2);
+			rgba[o + 3] = byteAt(cur, x * 4 + 3);
+		}
+	}
+}
+
+/** Unfilters all rows into an RGBA buffer; null when a row uses an unsupported filter byte. */
+function unfilterRgba(
+	raw: Buffer,
+	w: number,
+	h: number,
+	channels: number,
+): Uint8Array | null {
+	const stride = w * channels;
+	const rgba = new Uint8Array(w * h * 4);
+	let prev = new Uint8Array(stride);
+	let cur = new Uint8Array(stride);
+	for (let y = 0; y < h; y++) {
+		const row = y * (stride + 1);
+		const filter = byteAt(raw, row);
+		if (filter > 4) return null;
+		unfilterRow(raw, row, cur, prev, stride, channels, filter);
+		writeRow(rgba, cur, y, w, channels);
+		[prev, cur] = [cur, prev]; // cur is fully rewritten each row
+	}
+	return rgba;
 }
 
 /**
@@ -103,107 +289,11 @@ export function decodePng(bytes: Uint8Array): Rgba | null {
 	try {
 		const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 		if (bytes.length < 8 || sig.some((c, i) => bytes[i] !== c)) return null;
-		let w = 0;
-		let h = 0;
-		let channels = 0;
-		const idat: Buffer[] = [];
-		let sawHeader = false;
-		let sawEnd = false;
-		let off = 8;
-		while (off + 12 <= bytes.length) {
-			const len = u32be(bytes, off);
-			const dataStart = off + 8;
-			const dataEnd = dataStart + len;
-			if (dataEnd + 4 > bytes.length) return null; // truncated chunk
-			const type = String.fromCharCode(
-				bytes[off + 4]!,
-				bytes[off + 5]!,
-				bytes[off + 6]!,
-				bytes[off + 7]!,
-			);
-			if (type === "IHDR") {
-				if (len !== 13 || sawHeader) return null;
-				w = u32be(bytes, dataStart);
-				h = u32be(bytes, dataStart + 4);
-				const colorType = bytes[dataStart + 9];
-				const ok =
-					bytes[dataStart + 8] === 8 && // bit depth
-					bytes[dataStart + 10] === 0 && // compression
-					bytes[dataStart + 11] === 0 && // filter method
-					bytes[dataStart + 12] === 0; // interlace
-				channels =
-					colorType === 0
-						? 1
-						: colorType === 2
-							? 3
-							: colorType === 4
-								? 2
-								: colorType === 6
-									? 4
-									: 0;
-				if (!ok || channels === 0) return null;
-				if (w === 0 || h === 0 || w * h > INFLATE_PIXEL_CAP) return null;
-				sawHeader = true;
-			} else if (type === "IDAT") {
-				if (!sawHeader) return null;
-				idat.push(Buffer.from(bytes.subarray(dataStart, dataEnd)));
-			} else if (type === "IEND") {
-				sawEnd = true;
-				break;
-			}
-			off = dataEnd + 4; // CRC
-		}
-		if (!sawHeader || !sawEnd || idat.length === 0) return null;
-		const raw = inflateSync(Buffer.concat(idat));
-		const stride = w * channels;
-		if (raw.length < h * (stride + 1)) return null;
-		const rgba = new Uint8Array(w * h * 4);
-		let prev = new Uint8Array(stride);
-		let cur = new Uint8Array(stride);
-		for (let y = 0; y < h; y++) {
-			const row = y * (stride + 1);
-			const filter = raw[row]!;
-			if (filter > 4) return null;
-			for (let x = 0; x < stride; x++) {
-				const a = x >= channels ? cur[x - channels]! : 0;
-				const b = prev[x]!;
-				const c = x >= channels ? prev[x - channels]! : 0;
-				let v = raw[row + 1 + x]!;
-				if (filter === 1) v = (v + a) & 0xff;
-				else if (filter === 2) v = (v + b) & 0xff;
-				else if (filter === 3) v = (v + ((a + b) >> 1)) & 0xff;
-				else if (filter === 4) {
-					const p = a + b - c;
-					const pa = Math.abs(p - a);
-					const pb = Math.abs(p - b);
-					const pc = Math.abs(p - c);
-					v = (v + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c)) & 0xff;
-				}
-				cur[x] = v;
-			}
-			for (let x = 0; x < w; x++) {
-				const o = (y * w + x) * 4;
-				if (channels === 1) {
-					rgba[o] = rgba[o + 1] = rgba[o + 2] = cur[x]!;
-					rgba[o + 3] = 255;
-				} else if (channels === 2) {
-					rgba[o] = rgba[o + 1] = rgba[o + 2] = cur[x * 2]!;
-					rgba[o + 3] = cur[x * 2 + 1]!;
-				} else if (channels === 3) {
-					rgba[o] = cur[x * 3]!;
-					rgba[o + 1] = cur[x * 3 + 1]!;
-					rgba[o + 2] = cur[x * 3 + 2]!;
-					rgba[o + 3] = 255;
-				} else {
-					rgba[o] = cur[x * 4]!;
-					rgba[o + 1] = cur[x * 4 + 1]!;
-					rgba[o + 2] = cur[x * 4 + 2]!;
-					rgba[o + 3] = cur[x * 4 + 3]!;
-				}
-			}
-			[prev, cur] = [cur, prev]; // cur is fully rewritten each row
-		}
-		return { w, h, rgba };
+		const body = parsePngChunks(bytes);
+		if (body === null) return null;
+		const rgba = unfilterRgba(body.raw, body.w, body.h, body.channels);
+		if (rgba === null) return null;
+		return { w: body.w, h: body.h, rgba };
 	} catch {
 		return null; // bad zlib stream or any structural surprise
 	}
@@ -223,11 +313,11 @@ export function gray16(pixels: Rgba): Uint8Array {
 			for (let y = y0; y < y1; y++) {
 				for (let x = x0; x < x1; x++) {
 					const o = (y * pixels.w + x) * 4;
-					const alpha = pixels.rgba[o + 3]! / 255;
+					const alpha = byteAt(pixels.rgba, o + 3) / 255;
 					sum +=
-						(0.299 * pixels.rgba[o]! +
-							0.587 * pixels.rgba[o + 1]! +
-							0.114 * pixels.rgba[o + 2]!) *
+						(0.299 * byteAt(pixels.rgba, o) +
+							0.587 * byteAt(pixels.rgba, o + 1) +
+							0.114 * byteAt(pixels.rgba, o + 2)) *
 						alpha;
 					n++;
 				}
@@ -256,7 +346,10 @@ const CELL_NOISE_MAX = 8; // cells that may exceed the noise band (of 256)
 export function visuallyIdentical(a: Uint8Array, b: Uint8Array): boolean {
 	let differing = 0;
 	for (let i = 0; i < 256; i++) {
-		if (Math.abs(a[i]! - b[i]!) > CELL_NOISE && ++differing > CELL_NOISE_MAX)
+		if (
+			Math.abs(byteAt(a, i) - byteAt(b, i)) > CELL_NOISE &&
+			++differing > CELL_NOISE_MAX
+		)
 			return false;
 	}
 	return true;

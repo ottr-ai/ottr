@@ -134,6 +134,56 @@ function parsePath(p: string): string | null {
 	return name === "" ? null : name;
 }
 
+/** One parsed remote: hostKey carries the port when one is named. */
+function remote(
+	scheme: "https" | "ssh",
+	host: { host: string; port: number | null },
+	name: string,
+): GitRemote {
+	return {
+		scheme,
+		host: host.host,
+		port: host.port,
+		hostKey: host.port === null ? host.host : `${host.host}:${host.port}`,
+		name,
+	};
+}
+
+/** The remote for a https:// or ssh:// URL; null on any rejection. */
+function parseUrlScheme(url: string, lower: string): GitRemote | null {
+	const scheme = lower.startsWith("https://") ? "https" : "ssh";
+	const rest = url.slice(scheme.length + 3);
+	const slash = rest.indexOf("/");
+	const authority = slash === -1 ? rest : rest.slice(0, slash);
+	const pathPart = slash === -1 ? "" : rest.slice(slash + 1);
+	let user = "";
+	let hostPort = authority;
+	const at = hostPort.lastIndexOf("@");
+	if (at !== -1) {
+		user = hostPort.slice(0, at);
+		hostPort = hostPort.slice(at + 1);
+	}
+	// https carries no credentials in the URL, ever; ssh may name a user.
+	if (user !== "" && (scheme === "https" || !/^[A-Za-z0-9_.-]+$/.test(user)))
+		return null;
+	const host = parseHostPort(hostPort);
+	if (host === null) return null;
+	const name = parsePath(pathPart);
+	if (name === null) return null;
+	return remote(scheme, host, name);
+}
+
+/** The remote for scp form: user@host:path (no port; the first colon starts the path, which may not be absolute). */
+function parseScp(url: string): GitRemote | null {
+	const scp = /^([A-Za-z0-9_.-]+)@([A-Za-z0-9.-]+):(\S.*)$/.exec(url);
+	if (scp === null || (scp[3]?.startsWith("/") ?? true)) return null;
+	const host = parseHostPort(scp[2] ?? "");
+	if (host === null) return null;
+	const name = parsePath(scp[3] ?? "");
+	if (name === null) return null;
+	return remote("ssh", host, name);
+}
+
 /**
  * The trust boundary for every clone URL. Returns the shared GIT_URL_ERROR for every rejection;
  * never throws, on any input. Outer whitespace is trimmed; anything else is total.
@@ -145,49 +195,9 @@ export function parseGitUrl(raw: unknown): GitRemote | { error: string } {
 	// Outer whitespace was trimmed above; any whitespace or control char left is inside the value.
 	if (/[\s\p{Cc}]/u.test(url)) return { error: GIT_URL_ERROR };
 	const lower = url.toLowerCase();
-	if (lower.startsWith("https://") || lower.startsWith("ssh://")) {
-		const scheme = lower.startsWith("https://") ? "https" : "ssh";
-		const rest = url.slice(scheme.length + 3);
-		const slash = rest.indexOf("/");
-		const authority = slash === -1 ? rest : rest.slice(0, slash);
-		const pathPart = slash === -1 ? "" : rest.slice(slash + 1);
-		let user = "";
-		let hostPort = authority;
-		const at = hostPort.lastIndexOf("@");
-		if (at !== -1) {
-			user = hostPort.slice(0, at);
-			hostPort = hostPort.slice(at + 1);
-		}
-		// https carries no credentials in the URL, ever; ssh may name a user.
-		if (user !== "" && (scheme === "https" || !/^[A-Za-z0-9_.-]+$/.test(user)))
-			return { error: GIT_URL_ERROR };
-		const host = parseHostPort(hostPort);
-		if (host === null) return { error: GIT_URL_ERROR };
-		const name = parsePath(pathPart);
-		if (name === null) return { error: GIT_URL_ERROR };
-		return {
-			scheme,
-			host: host.host,
-			port: host.port,
-			hostKey: host.port === null ? host.host : `${host.host}:${host.port}`,
-			name,
-		};
-	}
-	// scp form: user@host:path (no port; the first colon starts the path, which may not be absolute).
-	const scp = /^([A-Za-z0-9_.-]+)@([A-Za-z0-9.-]+):(\S.*)$/.exec(url);
-	if (scp === null || (scp[3]?.startsWith("/") ?? true))
-		return { error: GIT_URL_ERROR };
-	const host = parseHostPort(scp[2] ?? "");
-	if (host === null) return { error: GIT_URL_ERROR };
-	const name = parsePath(scp[3] ?? "");
-	if (name === null) return { error: GIT_URL_ERROR };
-	return {
-		scheme: "ssh",
-		host: host.host,
-		port: host.port,
-		hostKey: host.port === null ? host.host : `${host.host}:${host.port}`,
-		name,
-	};
+	if (lower.startsWith("https://") || lower.startsWith("ssh://"))
+		return parseUrlScheme(url, lower) ?? { error: GIT_URL_ERROR };
+	return parseScp(url) ?? { error: GIT_URL_ERROR };
 }
 
 export function parseGitToken(

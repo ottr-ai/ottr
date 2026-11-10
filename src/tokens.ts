@@ -87,6 +87,11 @@ function readToken(
 			cause: `cannot read the board store ${dbPath}: ${errmsg(err)}`,
 		};
 	}
+	return parseCredential(data, provider);
+}
+
+/** Parses the OAuth row's JSON payload into a lendable token, or why the row is damaged. */
+function parseCredential(data: string, provider: string): Read {
 	const damaged = (what: string): Read => ({
 		kind: "error",
 		cause: `the board's ${provider} sign-in ${what}`,
@@ -215,7 +220,17 @@ export async function lentProviderEnv(
 		return { env: {}, error: before.cause, busy: before.busy };
 	if (before.expires - now > TOKEN_REFRESH_MARGIN_MS)
 		return { env: { [name]: before.access }, error: null };
+	return refreshedLent(name, provider, dbPath, now, opts);
+}
 
+/** Re-reads the store after omp re-minted the token; fails closed with the refresh's cause. */
+async function refreshedLent(
+	name: string,
+	provider: string,
+	dbPath: string,
+	now: number,
+	opts: { busyTimeoutMs?: number; command?: string[] },
+): Promise<Lent> {
 	const cause = await sharedRefresh(
 		provider,
 		dirname(dbPath),

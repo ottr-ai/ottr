@@ -97,6 +97,108 @@ function errorBody(text: string | null): string {
 	return first === "" ? "A turn failed" : first.slice(0, ERROR_BODY_MAX);
 }
 
+/** One alert event for a card state. */
+function alertEvent(
+	t: AlertCardInput,
+	cls: AlertClass,
+	key: string,
+	body: string,
+): AlertEvent {
+	return {
+		key,
+		class: cls,
+		project: t.project,
+		taskId: t.id,
+		title: `${t.project}: ${t.sessionTitle ?? t.title}`,
+		body,
+		url: `/projects/${encodeURIComponent(t.project)}/tasks/${encodeURIComponent(t.id)}`,
+		tag: cls,
+	};
+}
+
+/** The error event for a card whose failed turn changed; null when there is none. */
+function errorEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
+	if (t.errorTurn === null || t.errorTurn === (old?.errorTurn ?? null))
+		return null;
+	// An error that leaves the card in needs_you takes the needs_you entry key, so the
+	// inbox entry and the push are one occurrence instead of two.
+	const key =
+		t.state === "needs_you" ? taskEntryKey(t) : `error:${t.id}:${t.errorTurn}`;
+	return alertEvent(t, "error", key, errorBody(t.errorText));
+}
+
+/** The needs_you state is a follow-up of an error already alerted on that same turn. */
+function isErrorFollowUp(
+	old: AlertCardInput | undefined,
+	t: AlertCardInput,
+): boolean {
+	return (
+		old !== undefined &&
+		old.state !== "needs_you" &&
+		t.errorTurn !== null &&
+		old.errorTurn === t.errorTurn
+	);
+}
+
+/** The needs_you body of a PR review card: which draft state the user walks into. */
+function prDraftBody(old: AlertCardInput | undefined): string {
+	if (old === undefined || (old.prDraft ?? null) === null)
+		return "Review draft ready to post";
+	return old.state !== "needs_you"
+		? "Review draft ready for the new head"
+		: "Review draft updated — re-read it before posting";
+}
+
+/** The request event when the card newly waits on the user; null when there is none. */
+function requestEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
+	if (t.state !== "needs_you" || isErrorFollowUp(old, t)) return null;
+	// The failed turn already alerted as an Error in an earlier frame: the needs_you it
+	// leads to is part of that alert, not a second Request.
+	if (
+		old !== undefined &&
+		old.state === "needs_you" &&
+		taskEntryKey(old) === taskEntryKey(t)
+	)
+		return null;
+	const body =
+		t.asked !== null && t.asked.length > 0
+			? t.asked.map((q) => q.question).join(" · ")
+			: t.kind === "pr_review"
+				? prDraftBody(old)
+				: (t.needsReason ?? "Action required");
+	return alertEvent(t, "request", taskEntryKey(t), body);
+}
+
+/** The event for a new comment wave on a posted review; null when there is none. A wave
+ * clears when the user reads it (the stamp nulls) or a newer wave replaces it, so one live
+ * `pr:` alert per card is enough. */
+function prCommentsEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
+	if (t.prComments === null || t.prComments === (old?.prComments ?? null))
+		return null;
+	return alertEvent(
+		t,
+		"request",
+		`pr:${t.id}:${t.prComments}`,
+		"New comments after your posted review",
+	);
+}
+
+/** The complete event when the card newly finished or was answered; null when there is none. */
+function completeEvent(t: AlertCardInput, old: AlertCardInput | undefined) {
+	if (
+		old === undefined ||
+		!(
+			(t.stage === "done" && old.stage !== "done") ||
+			(t.answered && !old.answered)
+		)
+	)
+		return null;
+	const body = t.answered
+		? (t.summary ?? "Answered; open the card to read it")
+		: `${t.title} was done`;
+	return alertEvent(t, "complete", `done:${t.id}`, body);
+}
+
 /**
  * Events for cards that changed between two frames: at most one per card, precedence
  * error > request > complete. An error that leaves the card in needs_you takes the needs_you
@@ -113,74 +215,12 @@ export function diffEvents(
 	for (const t of next) {
 		if (t.kind === "retro" || t.cancelled) continue;
 		const old = before.get(t.id);
-		const ev = (cls: AlertClass, key: string, body: string): AlertEvent => ({
-			key,
-			class: cls,
-			project: t.project,
-			taskId: t.id,
-			title: `${t.project}: ${t.sessionTitle ?? t.title}`,
-			body,
-			url: `/projects/${encodeURIComponent(t.project)}/tasks/${encodeURIComponent(t.id)}`,
-			tag: cls,
-		});
-		if (t.errorTurn !== null && t.errorTurn !== (old?.errorTurn ?? null)) {
-			const key =
-				t.state === "needs_you"
-					? taskEntryKey(t)
-					: `error:${t.id}:${t.errorTurn}`;
-			out.push(ev("error", key, errorBody(t.errorText)));
-			continue;
-		}
-		// The failed turn already alerted as an Error in an earlier frame: the needs_you it
-		// leads to is part of that alert, not a second Request.
-		const errorFollowUp =
-			old !== undefined &&
-			old.state !== "needs_you" &&
-			t.errorTurn !== null &&
-			old.errorTurn === t.errorTurn;
-		if (
-			t.state === "needs_you" &&
-			!errorFollowUp &&
-			(old === undefined ||
-				old.state !== "needs_you" ||
-				taskEntryKey(old) !== taskEntryKey(t))
-		) {
-			const body =
-				t.asked !== null && t.asked.length > 0
-					? t.asked.map((q) => q.question).join(" · ")
-					: t.kind === "pr_review"
-						? old === undefined || (old.prDraft ?? null) === null
-							? "Review draft ready to post"
-							: old.state !== "needs_you"
-								? "Review draft ready for the new head"
-								: "Review draft updated — re-read it before posting"
-						: (t.needsReason ?? "Action required");
-			out.push(ev("request", taskEntryKey(t), body));
-			continue;
-		}
-		// A new comment wave on a posted review is its own occurrence, whatever place the
-		// card sits at. It clears when the user reads it (the stamp nulls) or a newer wave
-		// replaces it, so one live `pr:` alert per card is enough.
-		if (t.prComments !== null && t.prComments !== (old?.prComments ?? null)) {
-			out.push(
-				ev(
-					"request",
-					`pr:${t.id}:${t.prComments}`,
-					"New comments after your posted review",
-				),
-			);
-			continue;
-		}
-		if (
-			old !== undefined &&
-			((t.stage === "done" && old.stage !== "done") ||
-				(t.answered && !old.answered))
-		) {
-			const body = t.answered
-				? (t.summary ?? "Answered; open the card to read it")
-				: `${t.title} was done`;
-			out.push(ev("complete", `done:${t.id}`, body));
-		}
+		const ev =
+			errorEvent(t, old) ??
+			requestEvent(t, old) ??
+			prCommentsEvent(t, old) ??
+			completeEvent(t, old);
+		if (ev !== null) out.push(ev);
 	}
 	return out;
 }

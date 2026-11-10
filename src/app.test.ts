@@ -4472,6 +4472,44 @@ extensions:
 					ref: "main",
 					importedSha: snapSha,
 				};
+	const alatePut = async (req: Request): Promise<Response> => {
+		const body = (await req.json()) as {
+			path: string;
+			base: string;
+			content: string;
+			message: string;
+		};
+		if (putFail)
+			return Response.json(
+				{ error: putFail.error },
+				{ status: putFail.status },
+			);
+		if (putConflict || body.base !== sha(snapshot))
+			return Response.json(
+				{
+					error:
+						"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
+				},
+				{ status: 409 },
+			);
+		puts.push(body);
+		snapshot = body.content;
+		return Response.json({
+			ok: true,
+			commit: folderGit ? NEW : "",
+			pushed: false,
+		});
+	};
+	const alateImport = (): Response => {
+		// A path source reports importedSha "" forever: the import refreshes the
+		// snapshot but never a commit.
+		snapshot = head;
+		if (!pathMode) snapSha = headSha;
+		const moved = afterImport;
+		afterImport = null;
+		moved?.();
+		return Response.json({ ok: true, state: { source: source() } });
+	};
 	const fake = Bun.serve({
 		port: 0,
 		fetch: async (req) => {
@@ -4487,46 +4525,11 @@ extensions:
 						? { ok: true, running: false, path: "/data" }
 						: { ok: true, running: false, repo: "o/data" },
 				);
-			if (u.pathname === "/api/file" && req.method === "PUT") {
-				const body = (await req.json()) as {
-					path: string;
-					base: string;
-					content: string;
-					message: string;
-				};
-				if (putFail)
-					return Response.json(
-						{ error: putFail.error },
-						{ status: putFail.status },
-					);
-				if (putConflict || body.base !== sha(snapshot))
-					return Response.json(
-						{
-							error:
-								"user/omp/agent/config.yml changed since it was loaded; reload it and retry",
-						},
-						{ status: 409 },
-					);
-				puts.push(body);
-				snapshot = body.content;
-				return Response.json({
-					ok: true,
-					commit: folderGit ? NEW : "",
-					pushed: false,
-				});
-			}
+			if (u.pathname === "/api/file" && req.method === "PUT")
+				return alatePut(req);
 			if (u.pathname === "/api/state")
 				return Response.json({ source: source() });
-			if (u.pathname === "/api/import") {
-				// A path source reports importedSha "" forever: the import refreshes the
-				// snapshot but never a commit.
-				snapshot = head;
-				if (!pathMode) snapSha = headSha;
-				const moved = afterImport;
-				afterImport = null;
-				moved?.();
-				return Response.json({ ok: true, state: { source: source() } });
-			}
+			if (u.pathname === "/api/import") return alateImport();
 			return Response.json({
 				path: u.searchParams.get("path"),
 				content: snapshot,
@@ -4540,14 +4543,12 @@ extensions:
 	const field = (args: string[], key: string) =>
 		args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1) as string;
 	// Fake GitHub: the ref moves only as a fast-forward, like `force: false` on GitHub.
-	const gh = async (args: string[]) => {
-		ghCalls.push(args);
+	const ghRoute = async (args: string[], path: string) => {
 		const ok = (body: unknown) => ({
 			code: 0,
 			stdout: JSON.stringify(body),
 			stderr: "",
 		});
-		const path = args.find((a) => a.startsWith("repos/")) ?? "";
 		if (path.startsWith("repos/o/data/git/commits/"))
 			return ok({ sha: path.split("/").at(-1), tree: { sha: "t0" } });
 		if (path === "repos/o/data/git/trees") {
@@ -4573,6 +4574,11 @@ extensions:
 			return ok({ object: { sha: NEW } });
 		}
 		return { code: 1, stdout: "", stderr: `unexpected gh call: ${path}` };
+	};
+	const gh = async (args: string[]) => {
+		ghCalls.push(args);
+		const path = args.find((a) => a.startsWith("repos/")) ?? "";
+		return ghRoute(args, path);
 	};
 	const model = (selector: string) => ({
 		id: selector,
@@ -6167,7 +6173,7 @@ describe("settings env", () => {
 		expect(await saved.json()).toEqual({ ok: true });
 		// The stored value reaches redaction and the turn loop, never an answer.
 		expect(gitSecrets()).toContain(value);
-		expect(shared.envValues["API_KEY"]).toBe(value);
+		expect(shared.envValues.API_KEY).toBe(value);
 		const after = await get("/api/settings/env");
 		const text = await after.text();
 		// The parsed answer and its raw body never hold the value.
@@ -9766,8 +9772,7 @@ describe("orphan facts and stop (OTTR-463)", () => {
 	});
 	// ps reports the full argv; the state carries summarizeCmd of it. The stop route
 	// compares shapes, so these tests post the summarized form, like the UI does.
-	const psCmd =
-		"OMP_PID=9 bun omp -p --mode json --session-dir " + ostore.sessionsDir;
+	const psCmd = `OMP_PID=9 bun omp -p --mode json --session-dir ${ostore.sessionsDir}`;
 	const cmd = summarizeCmd(psCmd);
 	const pid = 4321;
 	let listed: { pid: number; cmd: string; started: number }[] = [];
@@ -9810,7 +9815,7 @@ describe("orphan facts and stop (OTTR-463)", () => {
 			{
 				pid,
 				started: expect.any(Number),
-				cmd: "bun omp -p --mode json --session-dir " + ostore.sessionsDir,
+				cmd: `bun omp -p --mode json --session-dir ${ostore.sessionsDir}`,
 				project: "orph",
 				card: null,
 				kind: null,

@@ -91,7 +91,7 @@ export function summarizeCmd(cmd: string): string {
 	while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
 		t = t.split(/\s+/).slice(1).join(" ");
 	t = t.replace(/\s+/g, " ");
-	return t.length > 160 ? t.slice(0, 160) + "…" : t;
+	return t.length > 160 ? `${t.slice(0, 160)}…` : t;
 }
 
 const DELETED_SUFFIX = " (deleted)";
@@ -102,44 +102,55 @@ const DELETED_SUFFIX = " (deleted)";
  * store. Otherwise the --session-dir names the project through `samePath`. All facts are null
  * when nothing matches. Pure: no store or platform access.
  */
+/** The project whose `.worktrees` dir holds `cwd`, plus the raw card id; null when no match. */
+function cwdProject(
+	cwd: string,
+	projects: readonly OrphanProject[],
+): { project: OrphanProject; card: string } | null {
+	if (cwd === "") return null;
+	for (const pr of projects) {
+		const marker = `${join(pr.path, ".worktrees")}${sep}`;
+		if (!cwd.startsWith(marker)) continue;
+		const seg = cwd.slice(marker.length).split(sep)[0] ?? "";
+		if (seg === "") continue;
+		return {
+			project: pr,
+			card: seg.endsWith(DELETED_SUFFIX)
+				? seg.slice(0, -DELETED_SUFFIX.length)
+				: seg,
+		};
+	}
+	return null;
+}
+
+/** The project whose sessions dir is the process's --session-dir; null when none matches. */
+function sessionProject(
+	p: ProcessInfo,
+	projects: readonly OrphanProject[],
+	samePath: (a: string, b: string) => boolean,
+): OrphanProject | null {
+	const sdir = sessionDirOf(p.cmd);
+	if (sdir === null) return null;
+	for (const pr of projects) {
+		if (samePath(sdir, pr.sessionsDir)) return pr;
+	}
+	return null;
+}
+
 export function resolveOrphan(
 	p: ProcessInfo,
 	cwd: string,
 	projects: readonly OrphanProject[],
 	samePath: (a: string, b: string) => boolean,
 ): OrphanProcess {
-	let project: OrphanProject | null = null;
-	let card: string | null = null;
-	if (cwd !== "") {
-		for (const pr of projects) {
-			const marker = join(pr.path, ".worktrees") + sep;
-			if (!cwd.startsWith(marker)) continue;
-			const seg = cwd.slice(marker.length).split(sep)[0] ?? "";
-			if (seg === "") continue;
-			project = pr;
-			card = seg.endsWith(DELETED_SUFFIX)
-				? seg.slice(0, -DELETED_SUFFIX.length)
-				: seg;
-			break;
-		}
-	}
-	if (project === null) {
-		const sdir = sessionDirOf(p.cmd);
-		if (sdir !== null) {
-			for (const pr of projects) {
-				if (samePath(sdir, pr.sessionsDir)) {
-					project = pr;
-					break;
-				}
-			}
-		}
-	}
+	const fromCwd = cwdProject(cwd, projects);
+	const project = fromCwd?.project ?? sessionProject(p, projects, samePath);
 	return {
 		pid: p.pid,
 		started: p.started,
 		cmd: summarizeCmd(p.cmd),
 		project: project === null ? null : project.name,
-		card,
+		card: fromCwd?.card ?? null,
 		kind: runKind(p.cmd),
 	};
 }

@@ -113,7 +113,7 @@ function provision(
 	if (tools !== null)
 		writeFileSync(join(dir, "tools.json"), JSON.stringify(tools));
 	if (env.length > 0)
-		writeFileSync(join(dir, "env.txt"), env.join("\n") + "\n");
+		writeFileSync(join(dir, "env.txt"), `${env.join("\n")}\n`);
 }
 
 const entry = (over: Record<string, unknown>): ToolEntry => ({

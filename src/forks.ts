@@ -57,40 +57,46 @@ export function forkUrl(f: ForkInfo): string {
 	return `${githubHost().webBase}/${f.owner}/${f.name}.git`;
 }
 
+/** One /forks page entry as ForkInfo, or null when any required field is missing or invalid. */
+function parseForkEntry(e: unknown): ForkInfo | null {
+	if (typeof e !== "object" || e === null) return null;
+	const r = e as Record<string, unknown>;
+	if (typeof r.id !== "number" || !Number.isInteger(r.id) || r.id <= 0)
+		return null;
+	const owner = r.owner;
+	if (typeof owner !== "object" || owner === null) return null;
+	const login = (owner as Record<string, unknown>).login;
+	if (
+		typeof login !== "string" ||
+		!NAME_RE.test(login) ||
+		login.startsWith(".")
+	)
+		return null;
+	const name = r.name;
+	if (typeof name !== "string" || !NAME_RE.test(name) || name.startsWith("."))
+		return null;
+	const defaultBranch =
+		typeof r.default_branch === "string" ? r.default_branch : null;
+	const pushedAt =
+		typeof r.pushed_at === "string" ? Date.parse(r.pushed_at) || null : null;
+	const sizeKb = typeof r.size === "number" ? r.size : null;
+	return {
+		id: r.id,
+		owner: login,
+		name,
+		defaultBranch,
+		pushedAt,
+		sizeKb,
+	};
+}
+
 /** Validates one GitHub /forks page; invalid entries are skipped, never thrown. */
 export function parseForkPage(body: unknown): ForkInfo[] {
 	if (!Array.isArray(body)) return [];
 	const out: ForkInfo[] = [];
 	for (const e of body) {
-		if (typeof e !== "object" || e === null) continue;
-		const r = e as Record<string, unknown>;
-		if (typeof r.id !== "number" || !Number.isInteger(r.id) || r.id <= 0)
-			continue;
-		const owner = r.owner;
-		if (typeof owner !== "object" || owner === null) continue;
-		const login = (owner as Record<string, unknown>).login;
-		if (
-			typeof login !== "string" ||
-			!NAME_RE.test(login) ||
-			login.startsWith(".")
-		)
-			continue;
-		const name = r.name;
-		if (typeof name !== "string" || !NAME_RE.test(name) || name.startsWith("."))
-			continue;
-		const defaultBranch =
-			typeof r.default_branch === "string" ? r.default_branch : null;
-		const pushedAt =
-			typeof r.pushed_at === "string" ? Date.parse(r.pushed_at) || null : null;
-		const sizeKb = typeof r.size === "number" ? r.size : null;
-		out.push({
-			id: r.id,
-			owner: login,
-			name,
-			defaultBranch,
-			pushedAt,
-			sizeKb,
-		});
+		const fork = parseForkEntry(e);
+		if (fork) out.push(fork);
 	}
 	return out;
 }
@@ -100,15 +106,17 @@ export function forkSummary(
 	forks: ForkInfo[],
 	now: number,
 ): Omit<GithubFacts, "repo"> {
-	const dated = forks.filter((f) => f.pushedAt !== null);
+	const dated = forks.filter(
+		(f): f is ForkInfo & { pushedAt: number } => f.pushedAt !== null,
+	);
 	const cutoff = now - 90 * 24 * 60 * 60 * 1000;
 	const recent = dated
-		.sort((a, b) => b.pushedAt! - a.pushedAt!)
+		.sort((a, b) => b.pushedAt - a.pushedAt)
 		.slice(0, 5)
-		.map((f) => ({ owner: f.owner, name: f.name, pushedAt: f.pushedAt! }));
+		.map((f) => ({ owner: f.owner, name: f.name, pushedAt: f.pushedAt }));
 	return {
 		forks: forks.length,
-		active: dated.filter((f) => f.pushedAt! >= cutoff).length,
+		active: dated.filter((f) => f.pushedAt >= cutoff).length,
 		recent,
 	};
 }
@@ -311,25 +319,12 @@ function parseShow(out: string): {
 	return { sha, subject, patch };
 }
 
-/**
- * One upstream fetch into the cache plus the full ForkRange for the pending branches.
- * `held` maps a branch hash to the exclude refs that removed work from that branch.
- */
-export async function collectRange(o: {
-	cachePath: string;
-	mainPath: string;
-	fork: ForkInfo;
-	branches: Array<{
-		branchHash: string;
-		branch: string;
-		head: string;
-		analyzedHead: string | null;
-	}>;
-	/** Refs whose commits stay out of the range (fork branches with an open PR upstream). */
-	exclude?: string[];
-	git: GitFn;
-}): Promise<{ range: ForkRange; held: Map<string, string[]> }> {
-	const { cachePath, mainPath, fork, branches, git } = o;
+/** Fetches the operator's project into the fork cache as refs/heads/upstream; returns its head sha. */
+async function fetchUpstreamHead(
+	cachePath: string,
+	mainPath: string,
+	git: GitFn,
+): Promise<string> {
 	const fetchUp = await git(
 		[
 			"-c",
@@ -358,8 +353,128 @@ export async function collectRange(o: {
 		throw errSnippet("upstream fetch", fetchUp.code, fetchUp.stderr);
 	const up = await git(["rev-parse", "refs/heads/upstream"], cachePath, 10_000);
 	if (up.code !== 0) throw errSnippet("rev-parse upstream", up.code, up.stderr);
-	const upstreamHead = up.stdout.trim();
+	return up.stdout.trim();
+}
 
+/** ForkCommit for one parsed `git show --numstat`; the per-file counters come from numstat. */
+function commitFromShow(
+	sha: string,
+	p: { subject: string; patch: string },
+	numstat: string[],
+): ForkCommit {
+	const n = (i: number) =>
+		numstat.reduce(
+			(a, l) => a + (l.split("\t")[i] === "-" ? 0 : Number(l.split("\t")[i])),
+			0,
+		);
+	return {
+		sha,
+		subject: p.subject,
+		files: numstat.length,
+		plus: n(0),
+		minus: n(1),
+		patch: p.patch,
+		branches: [],
+	};
+}
+
+/** Adds one regular commit of one branch to the rollup; the same sha on another branch only joins it. */
+async function collectCommit(
+	sha: string,
+	branch: string,
+	cachePath: string,
+	git: GitFn,
+	bySha: Map<string, ForkCommit>,
+	commits: ForkCommit[],
+): Promise<void> {
+	const r = await git(
+		[
+			"show",
+			"--format=%H%x00%s",
+			"--numstat",
+			"--patch",
+			"--no-textconv",
+			"--no-ext-diff",
+			sha,
+		],
+		cachePath,
+		60_000,
+	);
+	if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
+	const p = parseShow(r.stdout);
+	if (!p) return;
+	const numstat = r.stdout
+		.split("\n")
+		.filter((l) => /^(\d+|-)\t(\d+|-)\t/.test(l));
+	let existing = bySha.get(sha);
+	if (existing === undefined) {
+		existing = commitFromShow(sha, p, numstat);
+		bySha.set(sha, existing);
+		commits.push(existing);
+	}
+	if (!existing.branches.includes(branch)) existing.branches.push(branch);
+}
+
+/** Adds one merge commit: a known sha only joins the branch, a new one comes from a
+ *  remerge-diff, or --cc when the remerge diff fails. */
+async function collectMerge(
+	sha: string,
+	branch: string,
+	cachePath: string,
+	git: GitFn,
+	bySha: Map<string, ForkCommit>,
+	merges: ForkCommit[],
+): Promise<void> {
+	const known = bySha.get(sha);
+	if (known !== undefined) {
+		if (!known.branches.includes(branch)) known.branches.push(branch);
+		return;
+	}
+	let r = await git(
+		["show", "--remerge-diff", "--format=%H%x00%s", sha],
+		cachePath,
+		60_000,
+	);
+	if (r.code !== 0)
+		r = await git(
+			["show", "--format=%H%x00%s", "--cc", sha],
+			cachePath,
+			60_000,
+		);
+	if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
+	const p = parseShow(r.stdout);
+	if (!p) return;
+	const m: ForkCommit = {
+		sha,
+		subject: p.subject,
+		files: 0,
+		plus: 0,
+		minus: 0,
+		patch: p.patch,
+		branches: [branch],
+	};
+	bySha.set(sha, m);
+	merges.push(m);
+}
+
+/** The commits and merges of all pending branches of one fork, deduplicated by sha;
+ *  `held` maps a branch hash to the exclude refs that removed its work. */
+async function collectBranchCommits(
+	branches: Array<{
+		branchHash: string;
+		branch: string;
+		head: string;
+		analyzedHead: string | null;
+	}>,
+	cachePath: string,
+	upstreamHead: string,
+	git: GitFn,
+	exclude: string[] = [],
+): Promise<{
+	commits: ForkCommit[];
+	merges: ForkCommit[];
+	held: Map<string, string[]>;
+}> {
 	const bySha = new Map<string, ForkCommit>();
 	const commits: ForkCommit[] = [];
 	const merges: ForkCommit[] = [];
@@ -371,93 +486,33 @@ export async function collectRange(o: {
 			b.head,
 			upstreamHead,
 			git,
-			o.exclude,
+			exclude,
 		);
 		const { shas, merges: mergeShas } = r0;
 		if (r0.held.length > 0) held.set(b.branchHash, r0.held);
-		for (const sha of shas) {
-			const r = await git(
-				[
-					"show",
-					"--format=%H%x00%s",
-					"--numstat",
-					"--patch",
-					"--no-textconv",
-					"--no-ext-diff",
-					sha,
-				],
-				cachePath,
-				60_000,
-			);
-			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
-			const p = parseShow(r.stdout);
-			if (!p) continue;
-			const numstat = r.stdout
-				.split("\n")
-				.filter((l) => /^(\d+|-)\t(\d+|-)\t/.test(l));
-			let existing = bySha.get(sha);
-			if (!existing) {
-				const n = (i: number) =>
-					numstat.reduce(
-						(a, l) =>
-							a + (l.split("\t")[i] === "-" ? 0 : Number(l.split("\t")[i])),
-						0,
-					);
-				existing = {
-					sha,
-					subject: p.subject,
-					files: numstat.length,
-					plus: n(0),
-					minus: n(1),
-					patch: p.patch,
-					branches: [],
-				};
-				bySha.set(sha, existing);
-				commits.push(existing);
-			}
-			if (!existing.branches.includes(b.branch))
-				existing.branches.push(b.branch);
-		}
-		for (const sha of mergeShas) {
-			if (bySha.has(sha)) {
-				const m = bySha.get(sha)!;
-				if (!m.branches.includes(b.branch)) m.branches.push(b.branch);
-				continue;
-			}
-			let r = await git(
-				["show", "--remerge-diff", "--format=%H%x00%s", sha],
-				cachePath,
-				60_000,
-			);
-			if (r.code !== 0)
-				r = await git(
-					["show", "--format=%H%x00%s", "--cc", sha],
-					cachePath,
-					60_000,
-				);
-			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
-			const p = parseShow(r.stdout);
-			if (!p) continue;
-			const m: ForkCommit = {
-				sha,
-				subject: p.subject,
-				files: 0,
-				plus: 0,
-				minus: 0,
-				patch: p.patch,
-				branches: [b.branch],
-			};
-			bySha.set(sha, m);
-			merges.push(m);
-		}
+		for (const sha of shas)
+			await collectCommit(sha, b.branch, cachePath, git, bySha, commits);
+		for (const sha of mergeShas)
+			await collectMerge(sha, b.branch, cachePath, git, bySha, merges);
 	}
+	return { commits, merges, held };
+}
 
+/** Upstream-side comparison evidence: the commits the fork lacks, the file list, the docs. */
+async function collectUpstreamContext(
+	cachePath: string,
+	firstBranch: { branchHash: string } | undefined,
+	git: GitFn,
+): Promise<{
+	upstreamCommits: string[];
+	upstreamFiles: string[];
+	upstreamDocs: string;
+}> {
 	const list = async (args: string[], cap: number) => {
 		const r = await git(args, cachePath, 60_000);
 		if (r.code !== 0) throw errSnippet(args[0] ?? "git", r.code, r.stderr);
 		return r.stdout.split("\n").filter(Boolean).slice(0, cap);
 	};
-	const firstBranch = branches[0];
 	// Commits UPSTREAM has that the fork's first branch lacks: what the fork is behind on
 	// (the comparison evidence), not the fork-side list the range already carries.
 	const upstreamCommits =
@@ -490,6 +545,38 @@ export async function collectRange(o: {
 		if (r.code !== 0) continue;
 		upstreamDocs += `${r.stdout.slice(0, 8000 - upstreamDocs.length)}\n`;
 	}
+	return { upstreamCommits, upstreamFiles, upstreamDocs };
+}
+
+/**
+ * One upstream fetch into the cache plus the full ForkRange for the pending branches.
+ * `held` maps a branch hash to the exclude refs that removed work from that branch.
+ */
+export async function collectRange(o: {
+	cachePath: string;
+	mainPath: string;
+	fork: ForkInfo;
+	branches: Array<{
+		branchHash: string;
+		branch: string;
+		head: string;
+		analyzedHead: string | null;
+	}>;
+	/** Refs whose commits stay out of the range (fork branches with an open PR upstream). */
+	exclude?: string[];
+	git: GitFn;
+}): Promise<{ range: ForkRange; held: Map<string, string[]> }> {
+	const { cachePath, mainPath, fork, branches, git } = o;
+	const upstreamHead = await fetchUpstreamHead(cachePath, mainPath, git);
+	const { commits, merges, held } = await collectBranchCommits(
+		branches,
+		cachePath,
+		upstreamHead,
+		git,
+		o.exclude,
+	);
+	const { upstreamCommits, upstreamFiles, upstreamDocs } =
+		await collectUpstreamContext(cachePath, branches[0], git);
 	const range: ForkRange = {
 		fork,
 		commits,
@@ -527,7 +614,7 @@ function buildPrior(store: ProjectStore): {
 	for (const t of tasks) {
 		if (!t.followUpOf) continue;
 		const parent = byId.get(t.followUpOf);
-		if (!parent || parent.topic !== "fork research") continue;
+		if (parent?.topic !== "fork research") continue;
 		if (t.cancelledAt !== null) {
 			if (t.needsReason) declines.push(t.needsReason);
 		} else if (t.title) titles.push(t.title);
@@ -572,6 +659,12 @@ export function holdAfter(
 		holdPrs: [...prs.values()],
 		holdBase: row.holdPrs !== null ? row.holdBase : row.analyzedHead,
 	};
+}
+
+/** The PR hold a finished run records per analyzed row (see ForkBranchState.holdPrs). */
+interface RowHold {
+	prs: NonNullable<ForkBranchState["holdPrs"]>;
+	base: string | null;
 }
 
 export function createForkWatcher(deps: {
@@ -668,306 +761,413 @@ export function createForkWatcher(deps: {
 		}
 	}
 
+	/** One head of one fork: insert its row when new, refresh a changed head, clear the
+	 *  pending cursor of an analyzed head. */
+	function syncBranchRow(
+		store: ProjectStore,
+		fork: ForkInfo,
+		byHash: Map<string, ForkBranchState>,
+		branch: string,
+		sha: string,
+	): void {
+		const bh = branchHash(branch);
+		const row = byHash.get(bh);
+		if (!row) {
+			store.saveForkBranch({
+				forkId: fork.id,
+				branchHash: bh,
+				branch,
+				head: sha,
+				analyzedHead: null,
+				firstPendingAt: null,
+				lastRunAt: null,
+				lastError: null,
+				retries: 0,
+				holdPrs: null,
+				holdBase: null,
+			});
+			return;
+		}
+		if (row.head === sha) return;
+		const firstPendingAt =
+			sha !== row.analyzedHead && row.firstPendingAt === null
+				? now()
+				: row.firstPendingAt;
+		if (sha === row.analyzedHead) {
+			store.saveForkBranch({ ...row, head: sha, firstPendingAt: null });
+		} else {
+			store.saveForkBranch({ ...row, head: sha, firstPendingAt });
+		}
+	}
+
+	/** Branch rows of one fork: insert unknown branches, refresh changed heads, clear the
+	 *  pending cursor of an analyzed head. */
+	async function syncForkBranches(
+		store: ProjectStore,
+		fork: ForkInfo,
+	): Promise<void> {
+		// Neutral cwd (server-only state dir, OTTR_SERVER_DATA_DIR): ls-remote carries GH_TOKEN
+		// via gitEnv, so it must not read a worker-writable repo config (planted credential.helper).
+		const { heads, skipped } = await listBranchHeads(
+			forkUrl(fork),
+			store.serverDir,
+			runGit,
+		);
+		if (skipped > 0)
+			deps.log(
+				`forks: ${fork.owner}/${fork.name}: skipped ${skipped} branch name(s) git rejects`,
+			);
+		const rows = store
+			.listAllForkBranches()
+			.filter((r) => r.forkId === fork.id);
+		const byHash = new Map(rows.map((r) => [r.branchHash, r]));
+		for (const [branch, sha] of heads)
+			syncBranchRow(store, fork, byHash, branch, sha);
+	}
+
+	/** The still-unanalyzed heads of one fork that carry no open PR, or null when the fork
+	 *  is not due for a run under the run spacing, retry, and quiet-period gates. */
+	function duePending(
+		rows: ForkBranchState[],
+		isManual: boolean,
+		prHeads: ReadonlySet<string>,
+		forkId: number,
+	): Array<ForkBranchState & { head: string }> | null {
+		const pending = rows.filter(
+			(r): r is ForkBranchState & { head: string } =>
+				r.head !== null &&
+				r.head !== r.analyzedHead &&
+				!prHeads.has(`${forkId}:${r.branch}`),
+		);
+		if (pending.length === 0) return null;
+		const lastRun = Math.max(0, ...rows.map((r) => r.lastRunAt ?? 0));
+		if (lastRun + FORK_GATES.FORK_RUN_SPACING_MS > now()) return null;
+		if (!isManual && pending.every((r) => r.retries >= 3)) return null;
+		if (
+			!isManual &&
+			!pending.some(
+				(r) =>
+					// A brand-new branch (firstPendingAt null) has waited its whole life.
+					r.firstPendingAt === null ||
+					r.firstPendingAt <= now() - FORK_GATES.QUIET_MS ||
+					r.firstPendingAt <= now() - FORK_GATES.MAX_WAIT_MS,
+			)
+		)
+			return null;
+		return pending;
+	}
+
+	/** The last covered sha per branch when the run deferred commits: the cursor stays there. */
+	function coveredHeadRows(
+		fork: ForkInfo,
+		range: ForkRange,
+		covered: Set<string>,
+		holdOf: (branchHash: string) => RowHold | null,
+	): Array<{
+		forkId: number;
+		branchHash: string;
+		head: string;
+		at: number;
+		hold: RowHold | null;
+	}> {
+		const analyzed: Array<{
+			forkId: number;
+			branchHash: string;
+			head: string;
+			at: number;
+			hold: RowHold | null;
+		}> = [];
+		for (const h of range.heads) {
+			let last: string | null = null;
+			for (const c of range.commits) {
+				if (covered.has(c.sha) && c.branches.includes(h.branch)) last = c.sha;
+			}
+			if (last)
+				analyzed.push({
+					forkId: fork.id,
+					branchHash: h.branchHash,
+					head: last,
+					at: now(),
+					hold: holdOf(h.branchHash),
+				});
+		}
+		return analyzed;
+	}
+
+	/** The analyzed-cursor rows of one finished run: the last covered sha per branch when
+	 *  commits were deferred, else every head as-is. */
+	function analyzedHeads(
+		fork: ForkInfo,
+		range: ForkRange,
+		covered: Set<string>,
+		deferredCount: number,
+		holdOf: (branchHash: string) => RowHold | null,
+	): Array<{
+		forkId: number;
+		branchHash: string;
+		head: string;
+		at: number;
+		hold: RowHold | null;
+	}> {
+		if (deferredCount > 0) {
+			deps.log(
+				`forks: ${fork.owner}/${fork.name}: deferred ${deferredCount} commit(s), cursor stays on the last covered sha`,
+			);
+			return coveredHeadRows(fork, range, covered, holdOf);
+		}
+		const analyzed: Array<{
+			forkId: number;
+			branchHash: string;
+			head: string;
+			at: number;
+			hold: RowHold | null;
+		}> = [];
+		for (const h of range.heads)
+			analyzed.push({
+				forkId: fork.id,
+				branchHash: h.branchHash,
+				head: h.head,
+				at: now(),
+				hold: holdOf(h.branchHash),
+			});
+		return analyzed;
+	}
+
+	/** Persists one finished fork analysis as a fork-research result with up to five proposals. */
+	function recordForkResult(
+		store: ProjectStore,
+		fork: ForkInfo,
+		range: ForkRange,
+		result: ForkAnalysisResult,
+		holdOf: (branchHash: string) => RowHold | null,
+	): void {
+		const covered = new Set(result.commits);
+		const analyzed = analyzedHeads(
+			fork,
+			range,
+			covered,
+			result.deferred.length,
+			holdOf,
+		);
+		const rangeLabel = range.heads
+			.map((h) => `${h.branch}:${h.head.slice(0, 7)}`)
+			.join(", ");
+		let prompt = `Server-generated fork research result for ${fork.owner}/${fork.name}. The report holds the commit, feature, and verdict tables. Range: ${rangeLabel}.`;
+		if (prompt.length > 500) prompt = prompt.slice(0, 500);
+		const title = `Fork research: ${fork.owner}/${fork.name} (${range.commits.length} new commits)`;
+		const proposals = result.proposals.slice(0, 5).map((p) => ({
+			prompt: proposalPrompt(fork.owner, fork.name, p),
+
+			model: null,
+		}));
+		let kept = proposals;
+		if (openProposals(store) >= 3) {
+			deps.log(
+				`forks: ${fork.owner}/${fork.name}: proposal(s) dropped: cap of 3 open proposals reached`,
+			);
+			kept = [];
+		}
+		store.createForkResult({
+			prompt,
+			title,
+			report: renderReport(range, result),
+			topic: "fork research",
+			proposals: kept,
+			analyzed,
+		});
+	}
+
+	/** Records a failed fork run on the attempted still-pending branch rows of the fork. */
+	function recordForkFailure(
+		store: ProjectStore,
+		fork: ForkInfo,
+		msg: string,
+		attempted: ReadonlySet<string>,
+	): void {
+		for (const r of store
+			.listAllForkBranches()
+			.filter(
+				(x) =>
+					x.forkId === fork.id &&
+					attempted.has(x.branchHash) &&
+					x.head !== null &&
+					x.head !== x.analyzedHead,
+			)) {
+			store.saveForkBranch({
+				...r,
+				retries: r.retries + 1,
+				lastError: msg,
+				lastRunAt: now(),
+			});
+		}
+	}
+
+	/** Fetch, analyze, and record one fork; PR-held work stays out of the range, and a
+	 *  failure bumps retries on the attempted still-pending rows. */
+	async function analyzeFork(
+		project: ForkProject,
+		store: ProjectStore,
+		fork: ForkInfo,
+		pending: Array<ForkBranchState & { head: string }>,
+		pulls: PullInfo[],
+		repo: string,
+	): Promise<void> {
+		try {
+			// Server-only state dir (OTTR_SERVER_DATA_DIR, docker: ottr-state volume), never the
+			// worker-shared OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay
+			// out of workers' reach.
+			const cachePath = await ensureCache(store.serverDir, fork, runGit);
+			const refspecs = pending.map(
+				(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
+			);
+			await fetchFork(cachePath, forkUrl(fork), refspecs, runGit);
+			// PR heads come from the upstream repo's pull refs, so a PR from any fork (or a
+			// branch of the repo itself) is covered. Ref names use only the validated number.
+			// Merged PRs still in a hold keep their final head out of a rerun.
+			const prHeadOf = new Map(pulls.map((p) => [p.number, p.head]));
+			for (const r of pending)
+				for (const e of r.holdPrs ?? [])
+					if (!prHeadOf.has(e.n)) prHeadOf.set(e.n, e.head);
+			if (prHeadOf.size > 0) {
+				if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
+				await fetchFork(
+					cachePath,
+					`${githubHost().webBase}/${repo}.git`,
+					[...prHeadOf.keys()].map((n) => `+refs/pull/${n}/head:${PR_REF}${n}`),
+					runGit,
+				);
+			}
+			const { range, held } = await collectRange({
+				cachePath,
+				mainPath: project.path,
+				fork,
+				branches: pending.map((r) => ({
+					branchHash: r.branchHash,
+					branch: r.branch,
+					head: r.head,
+					analyzedHead: r.analyzedHead,
+				})),
+				exclude: [...prHeadOf.keys()].map((n) => `${PR_REF}${n}`),
+				git: runGit,
+			});
+			const byHash = new Map(pending.map((r) => [r.branchHash, r]));
+			if (range.commits.length === 0 && range.merges.length === 0) {
+				// Nothing new to analyze: move the cursors without a model call, a run
+				// record, or a fork pause, so later work is not held back.
+				for (const r of pending)
+					store.saveForkBranch({
+						...r,
+						...holdAfter(r, held.get(r.branchHash) ?? [], prHeadOf),
+						analyzedHead: r.head,
+						firstPendingAt: null,
+						lastError: null,
+						retries: 0,
+					});
+				return;
+			}
+			store.recordForkRun(fork.id, now());
+			const result = await analyze(range, buildPrior(store));
+			const holdOf = (branchHash: string): RowHold | null => {
+				const row = byHash.get(branchHash);
+				if (row === undefined) return null;
+				const h = holdAfter(row, held.get(branchHash) ?? [], prHeadOf);
+				return h.holdPrs === null ? null : { prs: h.holdPrs, base: h.holdBase };
+			};
+			recordForkResult(store, fork, range, result, holdOf);
+		} catch (e) {
+			const msg = ((e as Error).message ?? String(e)).slice(0, 300);
+			recordForkFailure(
+				store,
+				fork,
+				msg,
+				new Set(pending.map((r) => r.branchHash)),
+			);
+			deps.log(`forks: ${fork.owner}/${fork.name}: ${msg}`);
+		}
+	}
+
+	/** One project per tick: sync the branch rows, check the PR holds, then run the forks due
+	 *  under the gates. */
+	async function scanProject(
+		project: ForkProject,
+		manual: string | undefined,
+	): Promise<void> {
+		const store = project.store;
+		if (store.getSettings().forkResearch !== true || project.github === null)
+			return;
+		const repo =
+			ownerRepo(`https://github.com/${project.github}.git`) ?? project.github;
+		let forks: ForkInfo[];
+		try {
+			forks = await listForks(repo, gh);
+		} catch (e) {
+			deps.log(`forks: ${project.name}: ${(e as Error).message}`);
+			return;
+		}
+		const forkIds = forks.map((f) => f.id);
+		for (const fork of forks) await syncForkBranches(store, fork);
+		// Prune only after the project's whole scan succeeded; the fork_branch rows live in
+		// this project's own store, so absent ids are this project's vanished forks.
+		store.deleteForkBranchesNotIn(forkIds);
+
+		const fresh = store.listAllForkBranches();
+		const isManual = manual !== undefined;
+		// The commits of every open PR into this repo arrive through that PR; porting them
+		// would duplicate it, in any fork. Listed once per project, only when a fork has
+		// pending work or a hold to check. A cursor that moves past such commits keeps a
+		// hold (ForkBranchState.holdPrs), so a PR that changes its head or closes without its
+		// work brings that work back for a new check.
+		let pulls: PullInfo[] | null = null;
+		const closed = new Map<number, { merged: boolean; head: string } | null>();
+		for (const fork of forks) {
+			if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
+				deps.log(
+					`forks: ${fork.owner}/${fork.name}: skipped, ${fork.sizeKb} KB over the size gate`,
+				);
+				continue;
+			}
+			let rows = fresh.filter((r) => r.forkId === fork.id);
+			const holding = rows.filter((r) => r.holdPrs !== null);
+			if (
+				holding.length === 0 &&
+				!rows.some((r) => r.head !== null && r.head !== r.analyzedHead)
+			)
+				continue;
+			if (pulls === null) {
+				try {
+					pulls = await listPulls(repo, gh);
+				} catch (e) {
+					deps.log(`forks: ${project.name}: ${(e as Error).message}`);
+					break;
+				}
+			}
+			if (holding.length > 0) {
+				await releaseHolds(store, holding, pulls, closed, repo, fork);
+				rows = store.listAllForkBranches().filter((r) => r.forkId === fork.id);
+			}
+			const prHeads = new Set(pulls.map((p) => `${p.headRepoId}:${p.headRef}`));
+			const pending = duePending(rows, isManual, prHeads, fork.id);
+			if (pending === null) continue;
+			if (
+				store.forkRunsSince(now() - FORK_GATES.FORK_RUN_SPACING_MS) >=
+				FORK_GATES.PROJECT_DAILY_RUNS
+			) {
+				deps.log(
+					`forks: ${project.name}: daily cap of ${FORK_GATES.PROJECT_DAILY_RUNS} runs reached, stopping analysis`,
+				);
+				break;
+			}
+			await analyzeFork(project, store, fork, pending, pulls, repo);
+		}
+	}
+
 	async function scan(opts?: { manual?: string }): Promise<void> {
 		const manual = opts?.manual;
 		// Fresh iteration per tick: a one-shot iterator (Map#values) would be exhausted after
 		// the boot tick and every later tick would silently see zero projects.
 		for (const project of deps.projects()) {
 			if (manual !== undefined && project.name !== manual) continue;
-			const store = project.store;
-			if (store.getSettings().forkResearch !== true || project.github === null)
-				continue;
-			const repo =
-				ownerRepo(`https://github.com/${project.github}.git`) ?? project.github;
-			let forks: ForkInfo[];
-			try {
-				forks = await listForks(repo, gh);
-			} catch (e) {
-				deps.log(`forks: ${project.name}: ${(e as Error).message}`);
-				continue;
-			}
-			const forkIds = forks.map((f) => f.id);
-			for (const fork of forks) {
-				// Neutral cwd (server-only state dir, OTTR_SERVER_DATA_DIR): ls-remote carries GH_TOKEN
-				// via gitEnv, so it must not read a worker-writable repo config (planted credential.helper).
-				const { heads, skipped } = await listBranchHeads(
-					forkUrl(fork),
-					store.serverDir,
-					runGit,
-				);
-				if (skipped > 0)
-					deps.log(
-						`forks: ${fork.owner}/${fork.name}: skipped ${skipped} branch name(s) git rejects`,
-					);
-				const rows = store
-					.listAllForkBranches()
-					.filter((r) => r.forkId === fork.id);
-				const byHash = new Map(rows.map((r) => [r.branchHash, r]));
-				for (const [branch, sha] of heads) {
-					const bh = branchHash(branch);
-					const row = byHash.get(bh);
-					if (!row) {
-						store.saveForkBranch({
-							forkId: fork.id,
-							branchHash: bh,
-							branch,
-							head: sha,
-							analyzedHead: null,
-							firstPendingAt: null,
-							lastRunAt: null,
-							lastError: null,
-							retries: 0,
-							holdPrs: null,
-							holdBase: null,
-						});
-						continue;
-					}
-					if (row.head === sha) continue;
-					const firstPendingAt =
-						sha !== row.analyzedHead && row.firstPendingAt === null
-							? now()
-							: row.firstPendingAt;
-					if (sha === row.analyzedHead) {
-						store.saveForkBranch({ ...row, head: sha, firstPendingAt: null });
-					} else {
-						store.saveForkBranch({ ...row, head: sha, firstPendingAt });
-					}
-				}
-			}
-			// Prune only after the project's whole scan succeeded; the fork_branch rows live in
-			// this project's own store, so absent ids are this project's vanished forks.
-			store.deleteForkBranchesNotIn(forkIds);
-
-			const fresh = store.listAllForkBranches();
-			const isManual = manual !== undefined;
-			// The commits of every open PR into this repo arrive through that PR; porting them
-			// would duplicate it, in any fork. Listed once per project, only when a fork has
-			// pending work or a hold to check. A cursor that moves past such commits keeps a
-			// hold (ForkBranchState.holdPrs), so a PR that changes its head or closes without its
-			// work brings that work back for a new check.
-			let pulls: PullInfo[] | null = null;
-			const closed = new Map<
-				number,
-				{ merged: boolean; head: string } | null
-			>();
-			for (const fork of forks) {
-				if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
-					deps.log(
-						`forks: ${fork.owner}/${fork.name}: skipped, ${fork.sizeKb} KB over the size gate`,
-					);
-					continue;
-				}
-				let rows = fresh.filter((r) => r.forkId === fork.id);
-				const holding = rows.filter((r) => r.holdPrs !== null);
-				if (
-					holding.length === 0 &&
-					!rows.some((r) => r.head !== null && r.head !== r.analyzedHead)
-				)
-					continue;
-				if (pulls === null) {
-					try {
-						pulls = await listPulls(repo, gh);
-					} catch (e) {
-						deps.log(`forks: ${project.name}: ${(e as Error).message}`);
-						break;
-					}
-				}
-				if (holding.length > 0) {
-					await releaseHolds(store, holding, pulls, closed, repo, fork);
-					rows = store
-						.listAllForkBranches()
-						.filter((r) => r.forkId === fork.id);
-				}
-				const prHeads = new Set(
-					pulls.map((p) => `${p.headRepoId}:${p.headRef}`),
-				);
-				const pending = rows.filter(
-					(r) =>
-						r.head !== null &&
-						r.head !== r.analyzedHead &&
-						!prHeads.has(`${fork.id}:${r.branch}`),
-				);
-				if (pending.length === 0) continue;
-				const lastRun = Math.max(0, ...rows.map((r) => r.lastRunAt ?? 0));
-				if (lastRun + FORK_GATES.FORK_RUN_SPACING_MS > now()) continue;
-				if (!isManual && pending.every((r) => r.retries >= 3)) continue;
-				if (
-					!isManual &&
-					!pending.some(
-						(r) =>
-							// A brand-new branch (firstPendingAt null) has waited its whole life.
-							r.firstPendingAt === null ||
-							r.firstPendingAt <= now() - FORK_GATES.QUIET_MS ||
-							r.firstPendingAt <= now() - FORK_GATES.MAX_WAIT_MS,
-					)
-				)
-					continue;
-				if (
-					store.forkRunsSince(now() - FORK_GATES.FORK_RUN_SPACING_MS) >=
-					FORK_GATES.PROJECT_DAILY_RUNS
-				) {
-					deps.log(
-						`forks: ${project.name}: daily cap of ${FORK_GATES.PROJECT_DAILY_RUNS} runs reached, stopping analysis`,
-					);
-					break;
-				}
-				try {
-					// Server-only state dir (OTTR_SERVER_DATA_DIR, docker: ottr-state volume), never the
-					// worker-shared OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay
-					// out of workers' reach.
-					const cachePath = await ensureCache(store.serverDir, fork, runGit);
-					const refspecs = pending.map(
-						(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
-					);
-					await fetchFork(cachePath, forkUrl(fork), refspecs, runGit);
-					// PR heads come from the upstream repo's pull refs, so a PR from any fork (or a
-					// branch of the repo itself) is covered. Ref names use only the validated number.
-					// Merged PRs still in a hold keep their final head out of a rerun.
-					const prHeadOf = new Map(pulls.map((p) => [p.number, p.head]));
-					for (const r of pending)
-						for (const e of r.holdPrs ?? [])
-							if (!prHeadOf.has(e.n)) prHeadOf.set(e.n, e.head);
-					if (prHeadOf.size > 0) {
-						if (!REPO_RE.test(repo))
-							throw new Error(`invalid repo id: ${repo}`);
-						await fetchFork(
-							cachePath,
-							`${githubHost().webBase}/${repo}.git`,
-							[...prHeadOf.keys()].map(
-								(n) => `+refs/pull/${n}/head:${PR_REF}${n}`,
-							),
-							runGit,
-						);
-					}
-					const { range, held } = await collectRange({
-						cachePath,
-						mainPath: project.path,
-						fork,
-						branches: pending.map((r) => ({
-							branchHash: r.branchHash,
-							branch: r.branch,
-							head: r.head!,
-							analyzedHead: r.analyzedHead,
-						})),
-						exclude: [...prHeadOf.keys()].map((n) => `${PR_REF}${n}`),
-						git: runGit,
-					});
-					const byHash = new Map(pending.map((r) => [r.branchHash, r]));
-					if (range.commits.length === 0 && range.merges.length === 0) {
-						// Nothing new to analyze: move the cursors without a model call, a run
-						// record, or a fork pause, so later work is not held back.
-						for (const r of pending)
-							store.saveForkBranch({
-								...r,
-								...holdAfter(r, held.get(r.branchHash) ?? [], prHeadOf),
-								analyzedHead: r.head,
-								firstPendingAt: null,
-								lastError: null,
-								retries: 0,
-							});
-						continue;
-					}
-					store.recordForkRun(fork.id, now());
-					const result = await analyze(range, buildPrior(store));
-					const covered = new Set(result.commits);
-					const analyzed: Array<{
-						forkId: number;
-						branchHash: string;
-						head: string;
-						at: number;
-						hold: {
-							prs: NonNullable<ForkBranchState["holdPrs"]>;
-							base: string | null;
-						} | null;
-					}> = [];
-					const holdOf = (branchHash: string) => {
-						const h = holdAfter(
-							byHash.get(branchHash)!,
-							held.get(branchHash) ?? [],
-							prHeadOf,
-						);
-						return h.holdPrs === null
-							? null
-							: { prs: h.holdPrs, base: h.holdBase };
-					};
-					if (result.deferred.length > 0) {
-						deps.log(
-							`forks: ${fork.owner}/${fork.name}: deferred ${result.deferred.length} commit(s), cursor stays on the last covered sha`,
-						);
-						for (const h of range.heads) {
-							let last: string | null = null;
-							for (const c of range.commits) {
-								if (covered.has(c.sha) && c.branches.includes(h.branch))
-									last = c.sha;
-							}
-							if (last)
-								analyzed.push({
-									forkId: fork.id,
-									branchHash: h.branchHash,
-									head: last,
-									at: now(),
-									hold: holdOf(h.branchHash),
-								});
-						}
-					} else {
-						for (const h of range.heads)
-							analyzed.push({
-								forkId: fork.id,
-								branchHash: h.branchHash,
-								head: h.head,
-								at: now(),
-								hold: holdOf(h.branchHash),
-							});
-					}
-					const rangeLabel = range.heads
-						.map((h) => `${h.branch}:${h.head.slice(0, 7)}`)
-						.join(", ");
-					let prompt = `Server-generated fork research result for ${fork.owner}/${fork.name}. The report holds the commit, feature, and verdict tables. Range: ${rangeLabel}.`;
-					if (prompt.length > 500) prompt = prompt.slice(0, 500);
-					const title = `Fork research: ${fork.owner}/${fork.name} (${range.commits.length} new commits)`;
-					const proposals = result.proposals.slice(0, 5).map((p) => ({
-						prompt: proposalPrompt(fork.owner, fork.name, p),
-
-						model: null,
-					}));
-					const open = openProposals(store);
-					const kept =
-						open >= 3
-							? (deps.log(
-									`forks: ${fork.owner}/${fork.name}: proposal(s) dropped: cap of 3 open proposals reached`,
-								),
-								[])
-							: proposals;
-					store.createForkResult({
-						prompt,
-						title,
-						report: renderReport(range, result),
-						topic: "fork research",
-						proposals: kept,
-						analyzed,
-					});
-				} catch (e) {
-					const msg = ((e as Error).message ?? String(e)).slice(0, 300);
-					const attempted = new Set(pending.map((r) => r.branchHash));
-					for (const r of store
-						.listAllForkBranches()
-						.filter(
-							(x) =>
-								x.forkId === fork.id &&
-								attempted.has(x.branchHash) &&
-								x.head !== null &&
-								x.head !== x.analyzedHead,
-						)) {
-						store.saveForkBranch({
-							...r,
-							retries: r.retries + 1,
-							lastError: msg,
-							lastRunAt: now(),
-						});
-					}
-					deps.log(`forks: ${fork.owner}/${fork.name}: ${msg}`);
-				}
-			}
+			await scanProject(project, manual);
 		}
 	}
 

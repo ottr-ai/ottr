@@ -78,6 +78,48 @@ export interface PushCommand {
 	ref: string;
 }
 
+/** One read of a receive-pack pkt-line. */
+type PktLine =
+	| { kind: "command"; line: string; at: number }
+	| { kind: "flush" }
+	| { kind: "error"; error: string };
+
+/** Reads one pkt-line from the body: a flush (0000), a payload line, or an error. */
+function readPktLine(body: Uint8Array, at: number, text: TextDecoder): PktLine {
+	if (at + 4 > body.length)
+		return { kind: "error", error: "truncated command list" };
+	const lenHex = text.decode(body.subarray(at, at + 4));
+	if (!/^[0-9a-f]{4}$/.test(lenHex))
+		return { kind: "error", error: "malformed pkt-line" };
+	const len = Number.parseInt(lenHex, 16);
+	if (len === 0) return { kind: "flush" };
+	if (len < 4 || at + len > body.length)
+		return { kind: "error", error: "malformed pkt-line" };
+	return {
+		kind: "command",
+		line: text.decode(body.subarray(at + 4, at + len)),
+		at: at + len,
+	};
+}
+
+/** One receive-pack command line: a command, null for a skipped shallow line, or an error. */
+type ParsedCommand = { command: PushCommand | null } | { error: string };
+
+/** Cleans and validates one command payload line. */
+function parseCommandLine(raw: string, isFirst: boolean): ParsedCommand {
+	let line = raw;
+	if (isFirst) {
+		const nul = line.indexOf("\0");
+		if (nul >= 0) line = line.slice(0, nul); // capabilities ride on the first command
+	}
+	line = line.replace(/\n$/, "");
+	if (/^shallow [0-9a-f]+$/.test(line)) return { command: null };
+	const [old = "", neu = "", ref = "", ...extra] = line.split(" ");
+	if (!SHA.test(old) || !SHA.test(neu) || ref === "" || extra.length > 0)
+		return { error: `unsupported push request line: ${line.slice(0, 80)}` };
+	return { command: { old, new: neu, ref } };
+}
+
 /**
  * The command section of a receive-pack request body: pkt-lines up to the first flush. Shallow
  * lines (a shallow VM clone) are skipped; anything else that is not `<old> <new> <ref>` (a
@@ -91,25 +133,13 @@ export function parseReceiveCommands(
 	const commands: PushCommand[] = [];
 	let at = 0;
 	for (;;) {
-		if (at + 4 > body.length) return { error: "truncated command list" };
-		const lenHex = text.decode(body.subarray(at, at + 4));
-		if (!/^[0-9a-f]{4}$/.test(lenHex)) return { error: "malformed pkt-line" };
-		const len = Number.parseInt(lenHex, 16);
-		if (len === 0) return { commands };
-		if (len < 4 || at + len > body.length)
-			return { error: "malformed pkt-line" };
-		let line = text.decode(body.subarray(at + 4, at + len));
-		at += len;
-		if (commands.length === 0) {
-			const nul = line.indexOf("\0");
-			if (nul >= 0) line = line.slice(0, nul); // capabilities ride on the first command
-		}
-		line = line.replace(/\n$/, "");
-		if (/^shallow [0-9a-f]+$/.test(line)) continue;
-		const [old = "", neu = "", ref = "", ...extra] = line.split(" ");
-		if (!SHA.test(old) || !SHA.test(neu) || ref === "" || extra.length > 0)
-			return { error: `unsupported push request line: ${line.slice(0, 80)}` };
-		commands.push({ old, new: neu, ref });
+		const pkt = readPktLine(body, at, text);
+		if (pkt.kind === "error") return { error: pkt.error };
+		if (pkt.kind === "flush") return { commands };
+		at = pkt.at;
+		const parsed = parseCommandLine(pkt.line, commands.length === 0);
+		if ("error" in parsed) return { error: parsed.error };
+		if (parsed.command !== null) commands.push(parsed.command);
 	}
 }
 
@@ -243,42 +273,70 @@ async function cgiResponse(
 	return new Response(body, { status, headers });
 }
 
-/** Serves one smart-HTTP request for a VM token's own project and branch. */
-export async function handleGit(
-	req: Request,
-	o: GitHttpOptions,
-): Promise<Response> {
-	const url = new URL(req.url);
+/** The grant for a routed request, or the error Response to return. */
+type GitAccess = { grant: VmGrant; rest: string } | { response: Response };
+
+/** Route match, token check, and project ownership; also picks the request kind. */
+function checkAccess(req: Request, url: URL, o: GitHttpOptions): GitAccess {
 	const m = ROUTE.exec(url.pathname);
-	if (!m) return plain("not found", 404);
+	if (!m) return { response: plain("not found", 404) };
 	const grant = o.tokens.check(vmTokenOf(req));
 	if (grant === null)
-		return plain("unauthorized", 401, {
-			"WWW-Authenticate": 'Basic realm="ottr"',
-		});
+		return {
+			response: plain("unauthorized", 401, {
+				"WWW-Authenticate": 'Basic realm="ottr"',
+			}),
+		};
 	let project: string;
 	try {
 		project = decodeURIComponent(m[1] ?? "");
 	} catch {
-		return plain("not found", 404);
+		return { response: plain("not found", 404) };
 	}
 	if (project !== grant.project)
-		return plain(`this token opens only ${grant.project}.git`, 403);
-	const rest = m[2] ?? "";
+		return {
+			response: plain(`this token opens only ${grant.project}.git`, 403),
+		};
+	return { grant, rest: m[2] ?? "" };
+}
+
+/** The method/service guard; null when the request may continue. */
+function methodGuard(req: Request, rest: string, url: URL): Response | null {
 	if (rest === "info/refs") {
 		if (req.method !== "GET") return plain("method not allowed", 405);
 		if (SERVICES[url.searchParams.get("service") ?? ""] !== true)
 			return plain("dumb HTTP is not served", 403);
 	} else if (req.method !== "POST") return plain("method not allowed", 405);
+	return null;
+}
 
+/** The Content-Encoding guard; also hands the parsed encoding to the backend. */
+function encodingGuard(
+	req: Request,
+	rest: string,
+): { encoding: string } | { response: Response } {
 	const encoding = (req.headers.get("content-encoding") ?? "").toLowerCase();
 	if (encoding !== "" && encoding !== "gzip" && encoding !== "x-gzip")
-		return plain(`unsupported content encoding ${encoding}`, 415);
+		return { response: plain(`unsupported content encoding ${encoding}`, 415) };
 	// git never gzips a push; refusing it keeps a gzip bomb out of the buffered body check.
 	if (rest === "git-receive-pack" && encoding !== "")
-		return plain(`unsupported content encoding ${encoding} on a push`, 415);
-	const config = [...PINNED_CONFIG, ...refVisibility(grant)];
+		return {
+			response: plain(
+				`unsupported content encoding ${encoding} on a push`,
+				415,
+			),
+		};
+	return { encoding };
+}
 
+/** The CGI environment for http-backend: board secrets out, pinned and per-grant config in. */
+function cgiEnv(
+	grant: VmGrant,
+	rest: string,
+	req: Request,
+	url: URL,
+): Record<string, string> {
+	const config = [...PINNED_CONFIG, ...refVisibility(grant)];
 	const env: Record<string, string> = {
 		// Built from scratch: http-backend and the git it starts see no board secret.
 		PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
@@ -305,9 +363,26 @@ export async function handleGit(
 	// Protocol v2 for fetches; the value lands in git's env, so only its own grammar passes.
 	if (proto !== null && /^[A-Za-z0-9=:._-]{1,64}$/.test(proto))
 		env.HTTP_GIT_PROTOCOL = proto;
+	return env;
+}
 
-	let stdin: Uint8Array | ReadableStream<Uint8Array> | "ignore" = "ignore";
-	let pushed: PushCommand[] = [];
+/** http-backend's stdin plus the parsed push commands; or the refusal Response. */
+type GitInput =
+	| {
+			stdin: Uint8Array | ReadableStream<Uint8Array> | "ignore";
+			pushed: PushCommand[];
+	  }
+	| { response: Response };
+
+/** Prepares the request body for the request kind: buffered (and checked) for a push. */
+async function gitInput(
+	req: Request,
+	grant: VmGrant,
+	rest: string,
+	env: Record<string, string>,
+	encoding: string,
+	o: GitHttpOptions,
+): Promise<GitInput> {
 	if (rest === "git-receive-pack") {
 		// Buffered: the ref check reads the command section before git sees a byte.
 		const body: Uint8Array<ArrayBuffer> = new Uint8Array(
@@ -316,22 +391,39 @@ export async function handleGit(
 		const parsed = parseReceiveCommands(body);
 		if ("error" in parsed) {
 			o.log(`${grant.project}/${grant.taskId}: push refused: ${parsed.error}`);
-			return plain(parsed.error, 403);
+			return { response: plain(parsed.error, 403) };
 		}
 		const refusal = pushRefusal(parsed.commands, grant.branch);
 		if (refusal !== null) {
 			o.log(`${grant.project}/${grant.taskId}: push refused: ${refusal}`);
-			return plain(refusal, 403);
+			return { response: plain(refusal, 403) };
 		}
-		pushed = parsed.commands;
 		env.CONTENT_LENGTH = String(body.length);
-		stdin = body;
-	} else if (rest === "git-upload-pack") {
+		return { stdin: body, pushed: parsed.commands };
+	}
+	if (rest === "git-upload-pack") {
 		// Streamed; http-backend inflates a gzip body itself (git gzips large fetch requests).
 		if (encoding !== "") env.HTTP_CONTENT_ENCODING = "gzip";
-		stdin = req.body ?? new Uint8Array(0);
+		return { stdin: req.body ?? new Uint8Array(0), pushed: [] };
 	}
+	return { stdin: "ignore", pushed: [] };
+}
 
+/** One running http-backend: the CGI answer and the process's exit code. */
+interface Backend {
+	res: Response;
+	exited: Promise<number>;
+}
+
+/** Spawns http-backend, wires abort killing and the stderr log, and answers as CGI. */
+async function runBackend(
+	grant: VmGrant,
+	rest: string,
+	env: Record<string, string>,
+	stdin: Uint8Array | ReadableStream<Uint8Array> | "ignore",
+	req: Request,
+	o: GitHttpOptions,
+): Promise<Backend> {
 	const proc = Bun.spawn([gitExe(), "http-backend"], {
 		cwd: grant.repoPath,
 		env,
@@ -351,14 +443,35 @@ export async function handleGit(
 				`${grant.project}/${grant.taskId}: git http-backend ${rest} exited ${code}: ${err.trim().slice(-500)}`,
 			);
 	});
+	return { res: await cgiResponse(proc.stdout, kill), exited: proc.exited };
+}
 
-	const res = await cgiResponse(proc.stdout, kill);
-	if (rest !== "git-receive-pack") return res;
+/** Serves one smart-HTTP request for a VM token's own project and branch. */
+export async function handleGit(
+	req: Request,
+	o: GitHttpOptions,
+): Promise<Response> {
+	const url = new URL(req.url);
+	const access = checkAccess(req, url, o);
+	if ("response" in access) return access.response;
+	const { grant, rest } = access;
+	const badMethod = methodGuard(req, rest, url);
+	if (badMethod !== null) return badMethod;
+	const badEncoding = encodingGuard(req, rest);
+	if ("response" in badEncoding) return badEncoding.response;
+	const env = cgiEnv(grant, rest, req, url);
+	const input = await gitInput(req, grant, rest, env, badEncoding.encoding, o);
+	if ("response" in input) return input.response;
+	const backend = await runBackend(grant, rest, env, input.stdin, req, o);
+	if (rest !== "git-receive-pack") return backend.res;
 	// The push answer is a short report-status: buffer it, so the VM's push returns only once
 	// the server worktree shows the pushed head.
-	const bytes = new Uint8Array(await res.arrayBuffer());
-	const code = await proc.exited;
-	if (res.status === 200 && code === 0 && pushed.length > 0)
+	const bytes = new Uint8Array(await backend.res.arrayBuffer());
+	const code = await backend.exited;
+	if (backend.res.status === 200 && code === 0 && input.pushed.length > 0)
 		await syncAfterPush(grant, o.log);
-	return new Response(bytes, { status: res.status, headers: res.headers });
+	return new Response(bytes, {
+		status: backend.res.status,
+		headers: backend.res.headers,
+	});
 }

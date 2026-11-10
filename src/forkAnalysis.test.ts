@@ -103,29 +103,29 @@ describe("redactSecrets", () => {
 		expect(r.text).toBe("[REDACTED]");
 	});
 	test("GitHub token", () => {
-		const r = redactSecrets("ghp_" + "x".repeat(36));
+		const r = redactSecrets(`ghp_${"x".repeat(36)}`);
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]");
 	});
 	test("GitHub fine-grained PAT", () => {
-		const r = redactSecrets("github_pat_" + "A".repeat(30));
+		const r = redactSecrets(`github_pat_${"A".repeat(30)}`);
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]");
 	});
 	test("Stripe live key", () => {
-		const r = redactSecrets("sk_live_" + "y".repeat(20));
+		const r = redactSecrets(`sk_live_${"y".repeat(20)}`);
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]");
 	});
 	test("Google API key", () => {
-		const r = redactSecrets("AIza" + "z".repeat(35));
+		const r = redactSecrets(`AIza${"z".repeat(35)}`);
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]");
 	});
 	test("a registered git-host token is redacted", () => {
-		setGitSecrets(["glpat-" + "q".repeat(20)]);
+		setGitSecrets([`glpat-${"q".repeat(20)}`]);
 		try {
-			const token = "glpat-" + "q".repeat(20);
+			const token = `glpat-${"q".repeat(20)}`;
 			const r = redactSecrets(`token ${token} in a log`);
 			expect(r.hits).toBe(1);
 			expect(r.text).toBe("token [REDACTED] in a log");
@@ -187,7 +187,7 @@ describe("redactSecrets", () => {
 		).toBeNull();
 	});
 	test("known tokens do not trigger pause", () => {
-		expect(redactSecrets("ghp_" + "x".repeat(36)).paused).toBeNull();
+		expect(redactSecrets(`ghp_${"x".repeat(36)}`).paused).toBeNull();
 	});
 });
 
@@ -331,7 +331,7 @@ describe("runGateway", () => {
 
 describe("parseAnalysis", () => {
 	test("accepts a valid sample and strips a json fence", () => {
-		const fenced = "```json\n" + JSON.stringify(VALID_RESULT) + "\n```";
+		const fenced = `\`\`\`json\n${JSON.stringify(VALID_RESULT)}\n\`\`\``;
 		const r = parseAnalysis(fenced, range());
 		expect(r.commits).toEqual([SHA1]);
 		expect(r.features[0]?.name).toBe("Dark mode");

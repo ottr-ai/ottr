@@ -41,6 +41,49 @@ export function boardBundle(): Promise<BoardBundle> {
 	return building;
 }
 
+/** One Bun.build output artifact. */
+type BuildOutput = Awaited<ReturnType<typeof Bun.build>>["outputs"][number];
+
+/** One servable output plus its URL-keyed name; throws on a nested path. */
+interface BuiltAsset {
+	name: string;
+	asset: BundleAsset;
+}
+
+/** Convert one built output into a servable asset. */
+async function builtAsset(out: BuildOutput): Promise<BuiltAsset> {
+	// Bun.build emits relative names ("./chunk-x.js"); serve at the root so the
+	// nested client routes resolve them (rewriteBundleHtml does the HTML side).
+	const name = out.path.replace(/^\.\//, "");
+	if (name.includes("/") || name.includes("\\"))
+		throw new Error(`ui bundle emitted a nested path: ${out.path}`);
+	const bytes = new Uint8Array(await out.arrayBuffer());
+	// The board serves the HTML at /projects/p/tasks/i and friends, so the built
+	// refs must be absolute before any variant of it is compressed.
+	const identity =
+		name === "index.html"
+			? textEncoder.encode(rewriteBundleHtml(textDecoder.decode(bytes)))
+			: bytes;
+	const compressible = /\.(html|js|css)$/.test(name);
+	// Variant suffixes stay inside the quotes: an ETag must be one opaque tag.
+	const hex = Bun.hash(identity).toString(16).padStart(16, "0");
+	const asset: BundleAsset = {
+		contentType: out.type ?? "application/octet-stream",
+		cacheControl: name === "index.html" ? NO_CACHE : IMMUTABLE_CACHE,
+		identity,
+		gzip: compressible ? (gzipSync(identity) as Uint8Array<ArrayBuffer>) : null,
+		br: compressible
+			? (brotliCompressSync(identity) as Uint8Array<ArrayBuffer>)
+			: null,
+		etags: {
+			identity: `"${hex}"`,
+			gzip: compressible ? `"${hex}-gzip"` : null,
+			br: compressible ? `"${hex}-br"` : null,
+		},
+	};
+	return { name, asset };
+}
+
 async function buildBoard(): Promise<BoardBundle> {
 	const built = await Bun.build({
 		entrypoints: [join(import.meta.dir, "ui", "index.html")],
@@ -51,37 +94,7 @@ async function buildBoard(): Promise<BoardBundle> {
 	const assets = new Map<string, BundleAsset>();
 	let html: BundleAsset | null = null;
 	for (const out of built.outputs) {
-		// Bun.build emits relative names ("./chunk-x.js"); serve at the root so the
-		// nested client routes resolve them (rewriteBundleHtml does the HTML side).
-		const name = out.path.replace(/^\.\//, "");
-		if (name.includes("/") || name.includes("\\"))
-			throw new Error(`ui bundle emitted a nested path: ${out.path}`);
-		const bytes = new Uint8Array(await out.arrayBuffer());
-		// The board serves the HTML at /projects/p/tasks/i and friends, so the built
-		// refs must be absolute before any variant of it is compressed.
-		const identity =
-			name === "index.html"
-				? textEncoder.encode(rewriteBundleHtml(textDecoder.decode(bytes)))
-				: bytes;
-		const compressible = /\.(html|js|css)$/.test(name);
-		// Variant suffixes stay inside the quotes: an ETag must be one opaque tag.
-		const hex = Bun.hash(identity).toString(16).padStart(16, "0");
-		const asset: BundleAsset = {
-			contentType: out.type ?? "application/octet-stream",
-			cacheControl: name === "index.html" ? NO_CACHE : IMMUTABLE_CACHE,
-			identity,
-			gzip: compressible
-				? (gzipSync(identity) as Uint8Array<ArrayBuffer>)
-				: null,
-			br: compressible
-				? (brotliCompressSync(identity) as Uint8Array<ArrayBuffer>)
-				: null,
-			etags: {
-				identity: `"${hex}"`,
-				gzip: compressible ? `"${hex}-gzip"` : null,
-				br: compressible ? `"${hex}-br"` : null,
-			},
-		};
+		const { name, asset } = await builtAsset(out);
 		if (name === "index.html") {
 			html = asset;
 			continue; // The html serves by route; the fallback map holds hashed outputs only.
@@ -104,6 +117,18 @@ interface AcceptedEncoding {
 	q: number;
 }
 
+/** The q from one member's `;` params: a missing q means 1, an unparsable or negative one means 0. */
+function qValue(params: string[]): number {
+	let q = 1;
+	for (const param of params) {
+		const m = /^\s*q=\s*(\S+)\s*$/i.exec(param);
+		if (m === null) continue;
+		const v = Number.parseFloat(m[1] ?? "");
+		q = Number.isFinite(v) && v >= 0 ? Math.min(v, 1) : 0;
+	}
+	return q;
+}
+
 /** Parse an Accept-Encoding header into members; a missing q means 1, an unparsable or negative one excludes. */
 export function parseAcceptEncoding(
 	header: string | null | undefined,
@@ -114,14 +139,7 @@ export function parseAcceptEncoding(
 		const [rawName, ...params] = part.trim().split(";");
 		const name = (rawName ?? "").trim().toLowerCase();
 		if (name === "") continue;
-		let q = 1;
-		for (const param of params) {
-			const m = /^\s*q=\s*(\S+)\s*$/i.exec(param);
-			if (m === null) continue;
-			const v = Number.parseFloat(m[1] ?? "");
-			q = Number.isFinite(v) && v >= 0 ? Math.min(v, 1) : 0;
-		}
-		out.push({ name, q });
+		out.push({ name, q: qValue(params) });
 	}
 	return out;
 }

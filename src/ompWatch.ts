@@ -84,6 +84,56 @@ export function compareVersions(a: string, b: string): number {
 	return 0;
 }
 
+/** One verdict entry; null when it fails the shape checks. */
+function parseVerdictEntry(v: unknown): OmpVerdict | null {
+	if (!isObj(v)) return null;
+	const { verdict, reasons, cardId, at } = v;
+	if (verdict !== "pass" && verdict !== "fail") return null;
+	if (!Array.isArray(reasons) || !reasons.every((r) => typeof r === "string"))
+		return null;
+	if (cardId !== null && typeof cardId !== "string") return null;
+	if (verdict === "fail" && cardId === null) return null;
+	if (typeof at !== "number" || !Number.isFinite(at)) return null;
+	return { verdict, reasons, cardId, at };
+}
+
+/** The verdict map; entries that fail the shape checks are dropped. */
+function parseVerdicts(raw: unknown): Record<string, OmpVerdict> {
+	const out: Record<string, OmpVerdict> = {};
+	if (!isObj(raw)) return out;
+	for (const [version, v] of Object.entries(raw)) {
+		if (!VERSION_RE.test(version)) continue;
+		const parsed = parseVerdictEntry(v);
+		if (parsed !== null) out[version] = parsed;
+	}
+	return out;
+}
+
+/** The bump-card pointer; null unless id and version both parse. */
+function parseBumpCard(raw: unknown): { id: string; version: string } | null {
+	if (
+		isObj(raw) &&
+		typeof raw.id === "string" &&
+		typeof raw.version === "string" &&
+		VERSION_RE.test(raw.version)
+	)
+		return { id: raw.id, version: raw.version };
+	return null;
+}
+
+/** The last tick's failure record; null unless the shape parses. */
+function parseLastError(raw: unknown): { reason: string; at: number } | null {
+	const e = raw;
+	if (
+		isObj(e) &&
+		typeof e.reason === "string" &&
+		typeof e.at === "number" &&
+		Number.isFinite(e.at)
+	)
+		return { reason: e.reason, at: e.at };
+	return null;
+}
+
 /**
  * Stored state from the global store. npm and model data passed through it once, so every
  * field is checked: a malformed value loads as the empty state and a malformed verdict entry
@@ -93,38 +143,9 @@ export function compareVersions(a: string, b: string): number {
 export function parseOmpWatchState(raw: unknown): OmpWatchState {
 	const out = emptyState();
 	if (!isObj(raw)) return out;
-	if (isObj(raw.verdicts)) {
-		for (const [version, v] of Object.entries(raw.verdicts)) {
-			if (!VERSION_RE.test(version) || !isObj(v)) continue;
-			const { verdict, reasons, cardId, at } = v;
-			if (verdict !== "pass" && verdict !== "fail") continue;
-			if (
-				!Array.isArray(reasons) ||
-				!reasons.every((r) => typeof r === "string")
-			)
-				continue;
-			if (cardId !== null && typeof cardId !== "string") continue;
-			if (verdict === "fail" && cardId === null) continue;
-			if (typeof at !== "number" || !Number.isFinite(at)) continue;
-			out.verdicts[version] = { verdict, reasons, cardId, at };
-		}
-	}
-	const b = raw.bumpCard;
-	if (
-		isObj(b) &&
-		typeof b.id === "string" &&
-		typeof b.version === "string" &&
-		VERSION_RE.test(b.version)
-	)
-		out.bumpCard = { id: b.id, version: b.version };
-	const e = raw.lastError;
-	if (
-		isObj(e) &&
-		typeof e.reason === "string" &&
-		typeof e.at === "number" &&
-		Number.isFinite(e.at)
-	)
-		out.lastError = { reason: e.reason, at: e.at };
+	out.verdicts = parseVerdicts(raw.verdicts);
+	out.bumpCard = parseBumpCard(raw.bumpCard);
+	out.lastError = parseLastError(raw.lastError);
 	return out;
 }
 
@@ -347,7 +368,6 @@ export function createOmpWatcher(deps: {
 			failures.push(reason);
 			deps.log(`${tag}: ${reason}`);
 		};
-		let filed = 0;
 		const cleared = (id: string): boolean => {
 			const t = store.getTask(id);
 			return t === null || t.stage === "done";
@@ -370,6 +390,45 @@ export function createOmpWatcher(deps: {
 		);
 		if (unreviewed.length > 0 && repo === null)
 			fail("npm: the packument names no GitHub repository");
+		let filed = 0;
+		filed += await reviewReleases(
+			project,
+			state,
+			unreviewed,
+			repo,
+			pin,
+			fail,
+			watching,
+		);
+		filed += await fileBumpCard(
+			project,
+			state,
+			releases,
+			pin,
+			fail,
+			watching,
+			cleared,
+		);
+
+		const reason = failures.at(-1);
+		state.lastError = reason === undefined ? null : { reason, at: now() };
+		deps.save(project.name, state);
+		if (filed > 0) deps.schedule();
+	}
+
+	/** Reviews the unreviewed releases; returns how many fail cards it filed. */
+	async function reviewReleases(
+		project: ForkProject,
+		state: OmpWatchState,
+		unreviewed: OmpRelease[],
+		repo: string | null,
+		pin: string,
+		fail: (reason: string) => void,
+		watching: () => boolean,
+	): Promise<number> {
+		const store = project.store;
+		const tag = project.name;
+		let filed = 0;
 		for (const r of unreviewed.slice(0, OMP_WATCH_GATES.reviewsPerTick)) {
 			if (repo === null || !watching()) break;
 			const v = await review(r, repo, pin, fail);
@@ -389,71 +448,97 @@ export function createOmpWatcher(deps: {
 				deps.log(`${tag}: omp ${r.version} passed the review`);
 				continue;
 			}
-			try {
-				const card = store.createTask(
-					failCardPrompt({
-						version: r.version,
-						pin,
-						reasons: v.reasons,
-						notes: v.notes,
-					}),
-					null,
-					"work",
-				);
-				store.updateTask(card.id, {
-					title: `omp ${r.version}: compatibility review failed`,
-					topic: "omp",
-				});
-				state.verdicts[r.version] = {
-					verdict: "fail",
-					reasons: v.reasons,
-					cardId: card.id,
-					at: t,
-				};
-				filed++;
-				deps.log(`${tag}: omp ${r.version} failed the review; card ${card.id}`);
-			} catch (e) {
-				fail(`omp ${r.version}: fail card not filed: ${errText(e)}`);
-			}
+			filed += await fileFailCard(store, state, r, pin, v, t, tag, fail);
 		}
+		return filed;
+	}
 
+	/** Files one review-fail card, records the verdict, and returns 1 on success. */
+	async function fileFailCard(
+		store: ForkProject["store"],
+		state: OmpWatchState,
+		r: OmpRelease,
+		pin: string,
+		v: { verdict: "pass" | "fail"; reasons: string[]; notes: string },
+		t: number,
+		tag: string,
+		fail: (reason: string) => void,
+	): Promise<number> {
+		try {
+			const card = store.createTask(
+				failCardPrompt({
+					version: r.version,
+					pin,
+					reasons: v.reasons,
+					notes: v.notes,
+				}),
+				null,
+				"work",
+			);
+			store.updateTask(card.id, {
+				title: `omp ${r.version}: compatibility review failed`,
+				topic: "omp",
+			});
+			state.verdicts[r.version] = {
+				verdict: "fail",
+				reasons: v.reasons,
+				cardId: card.id,
+				at: t,
+			};
+			deps.log(`${tag}: omp ${r.version} failed the review; card ${card.id}`);
+			return 1;
+		} catch (e) {
+			fail(`omp ${r.version}: fail card not filed: ${errText(e)}`);
+			return 0;
+		}
+	}
+
+	/** Files the bump card for a newer cleared target; returns 1 when it filed one. */
+	async function fileBumpCard(
+		project: ForkProject,
+		state: OmpWatchState,
+		releases: OmpRelease[],
+		pin: string,
+		fail: (reason: string) => void,
+		watching: () => boolean,
+		cleared: (cardId: string) => boolean,
+	): Promise<number> {
+		const store = project.store;
 		const target = bumpTarget(releases, state.verdicts, cleared, now());
 		const open = state.bumpCard !== null && !cleared(state.bumpCard.id);
 		if (
-			target !== null &&
-			!open &&
-			(state.bumpCard === null ||
-				compareVersions(target, state.bumpCard.version) > 0) &&
-			watching()
-		) {
-			const covers = releases
-				.filter((r) => compareVersions(r.version, target) <= 0)
-				.map((r) => {
-					const v = state.verdicts[r.version]!;
-					return { version: r.version, verdict: v.verdict, cardId: v.cardId };
-				});
-			try {
-				const card = store.createTask(
-					ompBumpCardPrompt({ version: target, pin, covers }),
-					null,
-					"work",
-				);
-				store.updateTask(card.id, {
-					title: `Bump omp to ${target}`,
-					topic: "omp",
-				});
-				state.bumpCard = { id: card.id, version: target };
-				filed++;
-				deps.log(`${tag}: filed bump card ${card.id} for omp ${target}`);
-			} catch (e) {
-				fail(`bump card for ${target} not filed: ${errText(e)}`);
-			}
+			target === null ||
+			open ||
+			(state.bumpCard !== null &&
+				compareVersions(target, state.bumpCard.version) <= 0) ||
+			!watching()
+		)
+			return 0;
+		// bumpTarget stops at the first release without a verdict, so every covered
+		// release has one here.
+		const covers = releases.flatMap((r) => {
+			if (compareVersions(r.version, target) > 0) return [];
+			const v = state.verdicts[r.version];
+			if (v === undefined) return [];
+			return [{ version: r.version, verdict: v.verdict, cardId: v.cardId }];
+		});
+		try {
+			const card = store.createTask(
+				ompBumpCardPrompt({ version: target, pin, covers }),
+				null,
+				"work",
+			);
+			store.updateTask(card.id, {
+				title: `Bump omp to ${target}`,
+				topic: "omp",
+			});
+			state.bumpCard = { id: card.id, version: target };
+			deps.log(`${project.name}: filed bump card ${card.id} for omp ${target}`);
+			return 1;
+		} catch (e) {
+			fail(`bump card for ${target} not filed: ${errText(e)}`);
+			return 0;
 		}
-
-		const reason = failures.at(-1);
-		state.lastError = reason === undefined ? null : { reason, at: now() };
-		deps.save(project.name, state);
-		if (filed > 0) deps.schedule();
 	}
 
 	/**

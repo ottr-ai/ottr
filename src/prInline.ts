@@ -50,27 +50,46 @@ function normalizeBody(lines: readonly string[]): string {
 		.trim();
 }
 
+/** The open block: its marker and its raw lines (marker included). */
+interface OpenBlock {
+	marker: Omit<InlineComment, "body">;
+	raw: string[];
+}
+
+/** Classifies one draft line: opens, closes, extends the open block, or stays plain body text. */
+function scanDraftLine(
+	body: string[],
+	comments: InlineComment[],
+	open: OpenBlock | null,
+	line: string,
+): OpenBlock | null {
+	const marker = openMarker(line);
+	if (marker) {
+		if (open) body.push(...open.raw);
+		return { marker, raw: [line] };
+	}
+	if (open === null) {
+		body.push(line);
+		return null;
+	}
+	if (line.trim() === CLOSE) {
+		const content = open.raw.slice(1).join("\n").trim();
+		if (content !== "") comments.push({ ...open.marker, body: content });
+		return null;
+	}
+	open.raw.push(line);
+	return open;
+}
+
 /** Splits a draft into the review body and the inline comments. A block with a bad
  *  marker or no close marker stays in the body as plain text; a block with an empty
  *  body is dropped. Total: never throws. */
 export function parseReviewDraft(text: string): ParsedReview {
 	const body: string[] = [];
 	const comments: InlineComment[] = [];
-	// The open block: its marker and its raw lines (marker included).
-	let open: { marker: Omit<InlineComment, "body">; raw: string[] } | null =
-		null;
-	for (const line of text.split(/\r\n|\r|\n/)) {
-		const marker = openMarker(line);
-		if (marker) {
-			if (open) body.push(...open.raw);
-			open = { marker, raw: [line] };
-		} else if (open && line.trim() === CLOSE) {
-			const content = open.raw.slice(1).join("\n").trim();
-			if (content !== "") comments.push({ ...open.marker, body: content });
-			open = null;
-		} else if (open) open.raw.push(line);
-		else body.push(line);
-	}
+	let open: OpenBlock | null = null;
+	for (const line of text.split(/\r\n|\r|\n/))
+		open = scanDraftLine(body, comments, open, line);
 	if (open) body.push(...open.raw);
 	return { body: normalizeBody(body), comments };
 }
@@ -86,57 +105,82 @@ export function formatInlineComment(c: InlineComment): string {
 	return `<!-- inline ${location(c)} -->\n${c.body}\n${CLOSE}`;
 }
 
-/** Commentable RIGHT-side lines per path: line → hunk index (unique across the diff). */
-function commentableLines(diff: string): Map<string, Map<number, number>> {
-	const files = new Map<string, Map<number, number>>();
-	let lines: Map<number, number> | null = null;
-	let hunk = -1;
-	let right = 0;
-	let oldLeft = 0;
-	let newLeft = 0;
-	for (const line of diff.split(/\r?\n/)) {
-		if (oldLeft > 0 || newLeft > 0) {
-			const kind = line[0];
-			if (kind === "\\") continue;
-			if (kind === " " || kind === undefined) {
-				lines?.set(right, hunk);
-				right++;
-				oldLeft--;
-				newLeft--;
-				continue;
-			}
-			if (kind === "+") {
-				lines?.set(right, hunk);
-				right++;
-				newLeft--;
-				continue;
-			}
-			if (kind === "-") {
-				oldLeft--;
-				continue;
-			}
-			oldLeft = 0;
-			newLeft = 0;
+/** Mutable cursor over one parsed diff walk. */
+interface DiffState {
+	files: Map<string, Map<number, number>>;
+	/** The current file's commentable lines, null outside a `b/` file. */
+	lines: Map<number, number> | null;
+	hunk: number;
+	/** The next RIGHT-side line number the diff prints. */
+	right: number;
+	/** Lines left in the hunk on the old and the new side. */
+	oldLeft: number;
+	newLeft: number;
+}
+
+/** One hunk-body line: counts it down and maps commentable RIGHT lines. True when consumed. */
+function hunkLine(state: DiffState, line: string): boolean {
+	if (state.oldLeft > 0 || state.newLeft > 0) {
+		const kind = line[0];
+		if (kind === "\\") return true;
+		if (kind === " " || kind === undefined) {
+			state.lines?.set(state.right, state.hunk);
+			state.right++;
+			state.oldLeft--;
+			state.newLeft--;
+			return true;
 		}
-		if (line.startsWith("diff --git ")) lines = null;
-		else if (line.startsWith("+++ ")) {
-			const target = line.slice(4);
-			if (target.startsWith("b/")) {
-				const path = target.slice(2);
-				lines = files.get(path) ?? new Map();
-				files.set(path, lines);
-			} else lines = null;
-		} else {
-			const m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
-			if (m) {
-				hunk++;
-				oldLeft = m[1] === undefined ? 1 : Number(m[1]);
-				right = Number(m[2]);
-				newLeft = m[3] === undefined ? 1 : Number(m[3]);
-			}
+		if (kind === "+") {
+			state.lines?.set(state.right, state.hunk);
+			state.right++;
+			state.newLeft--;
+			return true;
+		}
+		if (kind === "-") {
+			state.oldLeft--;
+			return true;
+		}
+		state.oldLeft = 0;
+		state.newLeft = 0;
+	}
+	return false;
+}
+
+/** One file or hunk header line: switches the current file or starts the next hunk. */
+function headerLine(state: DiffState, line: string): void {
+	if (line.startsWith("diff --git ")) state.lines = null;
+	else if (line.startsWith("+++ ")) {
+		const target = line.slice(4);
+		if (target.startsWith("b/")) {
+			const path = target.slice(2);
+			state.lines = state.files.get(path) ?? new Map();
+			state.files.set(path, state.lines);
+		} else state.lines = null;
+	} else {
+		const m = /^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+		if (m) {
+			state.hunk++;
+			state.oldLeft = m[1] === undefined ? 1 : Number(m[1]);
+			state.right = Number(m[2]);
+			state.newLeft = m[3] === undefined ? 1 : Number(m[3]);
 		}
 	}
-	return files;
+}
+
+/** Commentable RIGHT-side lines per path: line → hunk index (unique across the diff). */
+function commentableLines(diff: string): Map<string, Map<number, number>> {
+	const state: DiffState = {
+		files: new Map(),
+		lines: null,
+		hunk: -1,
+		right: 0,
+		oldLeft: 0,
+		newLeft: 0,
+	};
+	for (const line of diff.split(/\r?\n/)) {
+		if (!hunkLine(state, line)) headerLine(state, line);
+	}
+	return state.files;
 }
 
 /** Wraps a line in backticks when it would read as a marker, so stray marker lines in

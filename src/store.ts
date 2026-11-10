@@ -508,6 +508,20 @@ function toTask(project: string, r: TaskRow): Task {
 	return { ...toListedTask(project, r), diffText: r.diff_text };
 }
 
+/** One parsed diffstat entry, or null when the entry is wrong-shaped. */
+function diffFileStat(entry: unknown): DiffFileStat | null {
+	if (typeof entry !== "object" || entry === null) return null;
+	const { file, plus, minus } = entry as Record<string, unknown>;
+	if (typeof file !== "string") return null;
+	if (plus !== null && typeof plus !== "number") return null;
+	if (minus !== null && typeof minus !== "number") return null;
+	return {
+		file,
+		plus: typeof plus === "number" ? plus : null,
+		minus: typeof minus === "number" ? minus : null,
+	};
+}
+
 /** Parses the stored diffstat JSON; null when absent. A wrong-shaped entry drops the whole list:
  * a half-valid stat list would understate the card's diff. */
 function parseDiffFiles(raw: string | null): DiffFileStat[] | null {
@@ -517,16 +531,9 @@ function parseDiffFiles(raw: string | null): DiffFileStat[] | null {
 		if (!Array.isArray(value)) return null;
 		const files: DiffFileStat[] = [];
 		for (const entry of value) {
-			if (typeof entry !== "object" || entry === null) return null;
-			const { file, plus, minus } = entry as Record<string, unknown>;
-			if (typeof file !== "string") return null;
-			if (plus !== null && typeof plus !== "number") return null;
-			if (minus !== null && typeof minus !== "number") return null;
-			files.push({
-				file,
-				plus: typeof plus === "number" ? plus : null,
-				minus: typeof minus === "number" ? minus : null,
-			});
+			const stat = diffFileStat(entry);
+			if (stat === null) return null;
+			files.push(stat);
 		}
 		return files;
 	} catch {
@@ -584,6 +591,63 @@ function parseStringList(raw: string): string[] {
 	}
 }
 
+/** One parsed blocker, or null when the entry is wrong-shaped (it drops alone). */
+function parseWorkCheckBlocker(b: unknown): WorkCheckBlocker | null {
+	if (typeof b !== "object" || b === null) return null;
+	const blocker = b as Record<string, unknown>;
+	if (typeof blocker.finding !== "string") return null;
+	return {
+		finding: blocker.finding,
+		quote: typeof blocker.quote === "string" ? blocker.quote : "",
+		severity:
+			blocker.severity === "important" ||
+			blocker.severity === "nit" ||
+			blocker.severity === "pre-existing"
+				? blocker.severity
+				: undefined,
+		bugClass:
+			typeof blocker.bugClass === "string" ? blocker.bugClass : undefined,
+		status:
+			blocker.status === "fixed" || blocker.status === "overridden"
+				? blocker.status
+				: undefined,
+		statusReason:
+			typeof blocker.statusReason === "string"
+				? blocker.statusReason
+				: undefined,
+	};
+}
+
+/** One parsed work-check run, or null when the entry is wrong-shaped (it drops alone). */
+function parseWorkCheckRun(r: unknown): WorkCheckRun | null {
+	if (typeof r !== "object" || r === null) return null;
+	const e = r as Record<string, unknown>;
+	if (
+		typeof e.at !== "number" ||
+		(e.outcome !== "pass" &&
+			e.outcome !== "blockers" &&
+			e.outcome !== "error") ||
+		!Array.isArray(e.blockers) ||
+		!Array.isArray(e.notes)
+	)
+		return null;
+	const blockers: WorkCheckBlocker[] = [];
+	for (const b of e.blockers) {
+		const blocker = parseWorkCheckBlocker(b);
+		if (blocker !== null) blockers.push(blocker);
+	}
+	return {
+		at: e.at,
+		model: typeof e.model === "string" ? e.model : null,
+		outcome: e.outcome,
+		blockers,
+		notes: e.notes.filter((n): n is string => typeof n === "string"),
+		durationMs: typeof e.durationMs === "number" ? e.durationMs : 0,
+		error: typeof e.error === "string" ? e.error : undefined,
+		warn: typeof e.warn === "string" ? e.warn : undefined,
+	};
+}
+
 /** Parses the stored work-check log; a wrong-shaped run or blocker drops that entry only, so
  * one corrupt run never erases the history the card shows. */
 function parseWorkCheckLog(raw: string): WorkCheckRun[] {
@@ -596,53 +660,8 @@ function parseWorkCheckLog(raw: string): WorkCheckRun[] {
 	if (!Array.isArray(value)) return [];
 	const runs: WorkCheckRun[] = [];
 	for (const entry of value) {
-		if (typeof entry !== "object" || entry === null) continue;
-		const r = entry as Record<string, unknown>;
-		if (
-			typeof r.at !== "number" ||
-			(r.outcome !== "pass" &&
-				r.outcome !== "blockers" &&
-				r.outcome !== "error") ||
-			!Array.isArray(r.blockers) ||
-			!Array.isArray(r.notes)
-		)
-			continue;
-		const blockers: WorkCheckBlocker[] = [];
-		for (const b of r.blockers) {
-			if (typeof b !== "object" || b === null) continue;
-			const blocker = b as Record<string, unknown>;
-			if (typeof blocker.finding !== "string") continue;
-			blockers.push({
-				finding: blocker.finding,
-				quote: typeof blocker.quote === "string" ? blocker.quote : "",
-				severity:
-					blocker.severity === "important" ||
-					blocker.severity === "nit" ||
-					blocker.severity === "pre-existing"
-						? blocker.severity
-						: undefined,
-				bugClass:
-					typeof blocker.bugClass === "string" ? blocker.bugClass : undefined,
-				status:
-					blocker.status === "fixed" || blocker.status === "overridden"
-						? blocker.status
-						: undefined,
-				statusReason:
-					typeof blocker.statusReason === "string"
-						? blocker.statusReason
-						: undefined,
-			});
-		}
-		runs.push({
-			at: r.at,
-			model: typeof r.model === "string" ? r.model : null,
-			outcome: r.outcome,
-			blockers,
-			notes: r.notes.filter((n): n is string => typeof n === "string"),
-			durationMs: typeof r.durationMs === "number" ? r.durationMs : 0,
-			error: typeof r.error === "string" ? r.error : undefined,
-			warn: typeof r.warn === "string" ? r.warn : undefined,
-		});
+		const run = parseWorkCheckRun(entry);
+		if (run !== null) runs.push(run);
 	}
 	return runs.slice(-20);
 }
@@ -804,6 +823,72 @@ export type AdoptResult = {
 	error?: string;
 };
 
+/** Copies the open db into `tmp` via VACUUM and verifies the tasks/turns row counts match; throws on a mismatch. */
+function vacuumCopyAndVerify(db: Database, tmp: string): void {
+	db.query("VACUUM INTO ?").run(tmp);
+	const copy = new Database(tmp);
+	try {
+		for (const table of ["tasks", "turns"]) {
+			const sql = `SELECT COUNT(*) AS n FROM ${table}`;
+			const a = db.query<{ n: number }, []>(sql).get()?.n;
+			const b = copy.query<{ n: number }, []>(sql).get()?.n;
+			if (a !== b)
+				throw new Error(`${table} count mismatch: ${a} vs ${b} in copy`);
+		}
+	} finally {
+		copy.close();
+	}
+}
+
+/** Adopts one old per-task DB into the server dir; null when the dir holds no adoptable
+ * tasks.db or the server already has one. A StoreLockedError (a live board holds the DB)
+ * propagates; any other failure comes back as a failed AdoptResult. */
+function adoptOne(
+	oldDir: string,
+	name: string,
+	newDir: string,
+): AdoptResult | null {
+	const oldDb = join(oldDir, "tasks.db");
+	try {
+		if (!lstatSync(oldDir).isDirectory()) return null;
+		if (!lstatSync(oldDb).isFile()) return null;
+	} catch {
+		return null; // no tasks.db in this dir
+	}
+	const newDb = join(newDir, "tasks.db");
+	if (existsSync(newDb)) return null;
+	let db: Database;
+	try {
+		db = openLocked(oldDb);
+	} catch (err) {
+		if (err instanceof StoreLockedError) throw err;
+		return {
+			name,
+			status: "failed",
+			error: err instanceof Error ? err.message : String(err),
+		};
+	}
+	let open = true;
+	try {
+		mkdirSync(newDir, { recursive: true });
+		const tmp = join(newDir, "tasks.db.adopting");
+		rmSync(tmp, { force: true });
+		vacuumCopyAndVerify(db, tmp);
+		renameSync(tmp, newDb);
+		open = false;
+		closeLocked(db);
+		renameSync(oldDb, join(oldDir, "tasks.db.moved-to-server"));
+		return { name, status: "adopted" };
+	} catch (err) {
+		if (open) closeLocked(db);
+		return {
+			name,
+			status: "failed",
+			error: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
 /**
  * One-time move of the task DBs that older boards kept on the worker-shared data dir into
  * the server-only dir. The marker makes it one-time: a tasks.db a worker plants later is
@@ -818,60 +903,12 @@ export function adoptSharedProjectData(
 	const results: AdoptResult[] = [];
 	const names = existsSync(dataDir) ? readdirSync(dataDir) : [];
 	for (const name of names) {
-		const oldDir = join(dataDir, name);
-		const oldDb = join(oldDir, "tasks.db");
-		try {
-			if (!lstatSync(oldDir).isDirectory()) continue;
-			if (!lstatSync(oldDb).isFile()) continue;
-		} catch {
-			continue; // no tasks.db in this dir
-		}
-		const newDir = join(serverDataDir, name);
-		const newDb = join(newDir, "tasks.db");
-		if (existsSync(newDb)) continue;
-		let db: Database;
-		try {
-			db = openLocked(oldDb);
-		} catch (err) {
-			if (err instanceof StoreLockedError) throw err;
-			results.push({
-				name,
-				status: "failed",
-				error: err instanceof Error ? err.message : String(err),
-			});
-			continue;
-		}
-		let open = true;
-		try {
-			mkdirSync(newDir, { recursive: true });
-			const tmp = join(newDir, "tasks.db.adopting");
-			rmSync(tmp, { force: true });
-			db.query("VACUUM INTO ?").run(tmp);
-			const copy = new Database(tmp);
-			try {
-				for (const table of ["tasks", "turns"]) {
-					const sql = `SELECT COUNT(*) AS n FROM ${table}`;
-					const a = db.query<{ n: number }, []>(sql).get()?.n;
-					const b = copy.query<{ n: number }, []>(sql).get()?.n;
-					if (a !== b)
-						throw new Error(`${table} count mismatch: ${a} vs ${b} in copy`);
-				}
-			} finally {
-				copy.close();
-			}
-			renameSync(tmp, newDb);
-			open = false;
-			closeLocked(db);
-			renameSync(oldDb, join(oldDir, "tasks.db.moved-to-server"));
-			results.push({ name, status: "adopted" });
-		} catch (err) {
-			if (open) closeLocked(db);
-			results.push({
-				name,
-				status: "failed",
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
+		const result = adoptOne(
+			join(dataDir, name),
+			name,
+			join(serverDataDir, name),
+		);
+		if (result !== null) results.push(result);
 	}
 	mkdirSync(serverDataDir, { recursive: true });
 	writeFileSync(marker, `${new Date().toISOString()}\n`);
@@ -1134,6 +1171,24 @@ function rowToTrendingVerdict(r: TrendingVerdictRow): TrendingVerdict {
 	};
 }
 
+/** Serializes one task patch value for binding: JSON arrays and objects, booleans as
+ * 0/1, scalars pass through. */
+function bindTaskValue(
+	value: string | number | boolean | object | null,
+): string | number | null {
+	// ponytail: Array.isArray covers exactly the JSON array columns (images, pendingImages, shots, asked, keptFiles); more need a column->serializer map
+	// A plain object (proposalSummary) serializes too; null and the scalars pass through.
+	return Array.isArray(value)
+		? JSON.stringify(value)
+		: typeof value === "boolean"
+			? value
+				? 1
+				: 0
+			: value !== null && typeof value === "object"
+				? JSON.stringify(value)
+				: (value as string | number | null);
+}
+
 export class ProjectStore {
 	readonly path: string;
 	readonly name: string;
@@ -1170,124 +1225,62 @@ export class ProjectStore {
 		return ProjectStore.open(root);
 	}
 
-	static open(projectPath: string): ProjectStore {
-		const root = resolve(projectPath);
-		const tasksDir = tasksDirFor(root);
-		mkdirBelow(dataRootFor(root), tasksDir);
-		const serverDir = serverDirFor(root);
-		mkdirSync(serverDir, { recursive: true });
-		const dbPath = join(serverDir, "tasks.db");
-		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
-		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
-		const db = openLocked(dbPath);
-		db.exec(SCHEMA);
-		const cols = db
-			.query<{ name: string }, []>("PRAGMA table_info(tasks)")
-			.all()
-			.map((c) => c.name);
-		if (!cols.includes("images"))
-			db.exec("ALTER TABLE tasks ADD COLUMN images TEXT NOT NULL DEFAULT '[]'");
-		if (!cols.includes("pending_images"))
+	/** Additive column convergence: adds one column when the (possibly stale) column list lacks it. */
+	private static addColumn(
+		db: Database,
+		cols: readonly string[],
+		col: string,
+		ddl: string,
+	): void {
+		if (cols.includes(col)) return;
+		db.exec(ddl);
+	}
+
+	/** Rebuilds the tasks table in one transaction when its stored DDL still carries the
+	 * `detect` CHECK list: recreates from TASKS_DDL, adds `addCols`, copies the named
+	 * columns explicitly, verifies the count, then swaps — a failure leaves the old
+	 * table untouched. */
+	private static rebuildTasksOnCheck(
+		db: Database,
+		tasksSql: string,
+		detect: string,
+		addCols: readonly string[],
+		names: string,
+		label: string,
+	): void {
+		if (!tasksSql.includes(detect)) return;
+		const count = (table: string): number =>
+			db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
+				?.n ?? 0;
+		const before = count("tasks");
+		db.exec("BEGIN");
+		try {
 			db.exec(
-				"ALTER TABLE tasks ADD COLUMN pending_images TEXT NOT NULL DEFAULT '[]'",
+				TASKS_DDL.replace(
+					"CREATE TABLE IF NOT EXISTS tasks",
+					"CREATE TABLE tasks_migrating",
+				),
 			);
-		if (!cols.includes("shots"))
-			db.exec("ALTER TABLE tasks ADD COLUMN shots TEXT NOT NULL DEFAULT '[]'");
-		if (!cols.includes("session_title"))
-			db.exec("ALTER TABLE tasks ADD COLUMN session_title TEXT");
-		if (!cols.includes("commits"))
-			db.exec("ALTER TABLE tasks ADD COLUMN commits INTEGER");
-		if (!cols.includes("release_version"))
-			db.exec("ALTER TABLE tasks ADD COLUMN release_version TEXT");
-		if (!cols.includes("release_notes"))
-			db.exec("ALTER TABLE tasks ADD COLUMN release_notes TEXT");
-		if (!cols.includes("asked"))
-			db.exec("ALTER TABLE tasks ADD COLUMN asked TEXT");
-		if (!cols.includes("model"))
-			db.exec("ALTER TABLE tasks ADD COLUMN model TEXT");
-		if (!cols.includes("kept_files"))
+			for (const ddl of addCols) db.exec(ddl);
 			db.exec(
-				"ALTER TABLE tasks ADD COLUMN kept_files TEXT NOT NULL DEFAULT '[]'",
+				`INSERT INTO tasks_migrating (${names}) SELECT ${names} FROM tasks`,
 			);
-		if (!cols.includes("follow_up_of"))
-			db.exec("ALTER TABLE tasks ADD COLUMN follow_up_of TEXT");
-		if (!cols.includes("done_at"))
-			db.exec("ALTER TABLE tasks ADD COLUMN done_at INTEGER");
-		if (!cols.includes("push_sha"))
-			db.exec("ALTER TABLE tasks ADD COLUMN push_sha TEXT");
-		if (!cols.includes("report"))
-			db.exec("ALTER TABLE tasks ADD COLUMN report TEXT");
-		if (!cols.includes("research"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN research INTEGER NOT NULL DEFAULT 0",
-			);
-		if (!cols.includes("research_steps"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN research_steps TEXT NOT NULL DEFAULT 'unknown'",
-			);
-		if (!cols.includes("update_ids"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN update_ids TEXT NOT NULL DEFAULT '[]'",
-			);
-		if (!cols.includes("update_merge_approved"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN update_merge_approved INTEGER NOT NULL DEFAULT 0",
-			);
-		// Backfill runs on every open and is idempotent (only null rows): a process stop
-		// between the ALTER above and the UPDATE converges here on the next open instead
-		// of leaving done cards unstamped forever (includedTasks drops them from releases).
-		db.exec(
-			"UPDATE tasks SET done_at = (SELECT ended_at FROM turns WHERE turns.task_id = tasks.id ORDER BY turns.id DESC LIMIT 1) WHERE stage = 'done' AND done_at IS NULL",
-		);
-		// A CHECK constraint can only change by rebuilding the table: databases created before
-		// `preparing` carry the old state list, and the scheduler writes 'preparing' on every
-		// claim. Runs after the column backfills so old and new shapes have the same named
-		// columns; copies rows explicitly (legacy column ORDER can differ), verifies the count,
-		// then swaps — all in one transaction, so a failure leaves the old table untouched.
-		const tasksSql =
-			db
-				.query<{ sql: string }, []>(
-					"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
-				)
-				.get()?.sql ?? "";
-		if (tasksSql.includes("state IN ('queued','running','needs_you','idle')")) {
-			const count = (table: string): number =>
-				db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
-					?.n ?? 0;
-			const before = count("tasks");
-			db.exec("BEGIN");
-			try {
-				db.exec(
-					TASKS_DDL.replace(
-						"CREATE TABLE IF NOT EXISTS tasks",
-						"CREATE TABLE tasks_migrating",
-					),
+			const after = count("tasks_migrating");
+			if (after !== before)
+				throw Error(
+					`${label} migration would lose rows: ${before} -> ${after}`,
 				);
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER");
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER");
-				const names = `id, title, prompt, stage, state, needs_reason, pending_prompt,
-					branch, base, worktree, session_id, summary, details, created_at, updated_at,
-					queued_at, cancelled_at, images, pending_images, release_version, release_notes,
-					session_title, asked, model, kept_files, follow_up_of, commits, done_at`;
-				db.exec(
-					`INSERT INTO tasks_migrating (${names}) SELECT ${names} FROM tasks`,
-				);
-				const after = count("tasks_migrating");
-				if (after !== before)
-					throw Error(`state migration would lose rows: ${before} -> ${after}`);
-				db.exec("DROP TABLE tasks");
-				db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
-				db.exec("COMMIT");
-			} catch (err) {
-				db.exec("ROLLBACK");
-				throw err;
-			}
+			db.exec("DROP TABLE tasks");
+			db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
+			db.exec("COMMIT");
+		} catch (err) {
+			db.exec("ROLLBACK");
+			throw err;
 		}
-		// topic lands after the state-CHECK rebuild above on purpose: that migration copies
-		// named columns only, so a column added before it would be dropped together with the
-		// freshly backfilled labels. Same idempotent pattern as done_at: only null rows.
-		if (!cols.includes("topic"))
-			db.exec("ALTER TABLE tasks ADD COLUMN topic TEXT");
+	}
+
+	/** Backfills topics for done cards missing one; idempotent (only null rows). */
+	private static backfillTopics(db: Database): void {
 		const untopic = db
 			.query<
 				{ id: string; title: string | null; session_title: string | null },
@@ -1296,247 +1289,54 @@ export class ProjectStore {
 				"SELECT id, title, session_title FROM tasks WHERE stage = 'done' AND topic IS NULL",
 			)
 			.all();
-		if (untopic.length > 0) {
-			const topics = assignTopics(
-				untopic.map((r) => ({
-					id: r.id,
-					title: r.title ?? "",
-					sessionTitle: r.session_title,
-				})),
-			);
-			for (const [id, topic] of topics)
-				db.run("UPDATE tasks SET topic = ? WHERE id = ?", [topic, id]);
+		if (untopic.length === 0) return;
+		const topics = assignTopics(
+			untopic.map((r) => ({
+				id: r.id,
+				title: r.title ?? "",
+				sessionTitle: r.session_title,
+			})),
+		);
+		for (const [id, topic] of topics)
+			db.run("UPDATE tasks SET topic = ? WHERE id = ?", [topic, id]);
+	}
+
+	/** The converged needs_reason for one legacy proposal row, or null when nothing rewrites it. */
+	private static convergedReason(
+		db: Database,
+		row: { needs_reason: string; follow_up_of: string | null },
+	): string | null {
+		const reason = row.needs_reason;
+		if (reason.startsWith(LEGACY_PROPOSED_REASON_PREFIX)) {
+			const parent = row.follow_up_of
+				? db
+						.query<{ follow_up_of: string | null }, [string]>(
+							"SELECT follow_up_of FROM tasks WHERE id = ?",
+						)
+						.get(row.follow_up_of)
+				: null;
+			const sourceId =
+				parent === null ? null : (parent.follow_up_of ?? row.follow_up_of);
+			return sourceId !== null ? proposedReason({ id: sourceId }) : null;
 		}
-		if (!cols.includes("depends_on"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
-			);
-		// Diff capture columns: null on every pre-existing row (never captured), so plain ADD COLUMN
-		// converges; placed after the state-CHECK rebuild like topic, whose named-column copy would
-		// drop them otherwise.
-		if (!cols.includes("diff_files"))
-			db.exec("ALTER TABLE tasks ADD COLUMN diff_files TEXT");
-		if (!cols.includes("diff_text"))
-			db.exec("ALTER TABLE tasks ADD COLUMN diff_text TEXT");
-		// Work-check columns: absent from TASKS_DDL on purpose — the state-CHECK
-		// rebuild recreates the table from that DDL, so a column living in both would dupe
-		// here on the stale column list (same reason topic and the diff columns live here).
-		if (!cols.includes("work_check_log"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
-			);
-		if (!cols.includes("work_check_sendbacks"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
-			);
-		if (!cols.includes("work_check_head"))
-			db.exec("ALTER TABLE tasks ADD COLUMN work_check_head TEXT");
-		if (!cols.includes("work_check_report"))
-			db.exec("ALTER TABLE tasks ADD COLUMN work_check_report TEXT");
-		// fork_merge_approved lives after the state-CHECK rebuild on purpose (like topic and the
-		// diff columns): it is ALTER-only, so a rebuild before its backfill would drop the
-		// column and the stale `cols` list would never re-add it.
-		if (!cols.includes("fork_merge_approved"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
-			);
-		// A CHECK constraint can only change by rebuilding the table: databases created before
-		// `backlog` carry the old stage list, and a parked card writes 'backlog'. Same pattern as
-		// the state-CHECK rebuild above: runs after every column backfill (named-column copy),
-		// copies rows explicitly, verifies the count, swaps in one transaction.
-		if (tasksSql.includes("stage IN ('todo','in_progress','merging','done')")) {
-			const count = (table: string): number =>
-				db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
-					?.n ?? 0;
-			const before = count("tasks");
-			db.exec("BEGIN");
-			try {
-				db.exec(
-					TASKS_DDL.replace(
-						"CREATE TABLE IF NOT EXISTS tasks",
-						"CREATE TABLE tasks_migrating",
-					),
-				);
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER");
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER");
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN topic TEXT");
-				db.exec(
-					"ALTER TABLE tasks_migrating ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
-				);
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN diff_files TEXT");
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN diff_text TEXT");
-				db.exec(
-					"ALTER TABLE tasks_migrating ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
-				);
-				db.exec(
-					"ALTER TABLE tasks_migrating ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
-				);
-				db.exec("ALTER TABLE tasks_migrating ADD COLUMN work_check_head TEXT");
-				db.exec(
-					"ALTER TABLE tasks_migrating ADD COLUMN work_check_report TEXT",
-				);
-				db.exec(
-					"ALTER TABLE tasks_migrating ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
-				);
-				const names = `id, title, prompt, stage, state, needs_reason, pending_prompt,
-					branch, base, worktree, session_id, summary, details, report, research, research_steps,
-					created_at, updated_at, queued_at, cancelled_at, images, pending_images,
-					release_version, release_notes, session_title, asked, model, kept_files,
-					follow_up_of, push_sha, update_ids, update_merge_approved, fork_merge_approved,
-					commits, done_at, topic, depends_on, diff_files, diff_text, work_check_log,
-					work_check_sendbacks, work_check_head, work_check_report`;
-				db.exec(
-					`INSERT INTO tasks_migrating (${names}) SELECT ${names} FROM tasks`,
-				);
-				const after = count("tasks_migrating");
-				if (after !== before)
-					throw Error(`stage migration would lose rows: ${before} -> ${after}`);
-				db.exec("DROP TABLE tasks");
-				db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
-				db.exec("COMMIT");
-			} catch (err) {
-				db.exec("ROLLBACK");
-				throw err;
-			}
+		if (reason.startsWith(LEGACY_FORK_PROPOSED_REASON_PREFIX)) {
+			return row.follow_up_of !== null
+				? forkProposedReason({ id: row.follow_up_of })
+				: null;
 		}
-		// Triage columns: ALTER-only and placed after both CHECK rebuilds on
-		// purpose — the rebuilds copy named columns, so a column living in TASKS_DDL too
-		// would dupe here on the stale column list (same reason topic and the diff columns).
-		if (!cols.includes("priority"))
-			db.exec("ALTER TABLE tasks ADD COLUMN priority TEXT");
-		if (!cols.includes("close_candidate"))
-			db.exec("ALTER TABLE tasks ADD COLUMN close_candidate TEXT");
-		// Merge-hold heads (replace the retired update/fork_merge_approved flags, which stay
-		// unused in old rows): ALTER-only after the rebuilds, same reason as priority above.
-		for (const col of ["update_merge_head", "fork_merge_head", "hold_head"])
-			if (!cols.includes(col))
-				db.exec(`ALTER TABLE tasks ADD COLUMN ${col} TEXT`);
-		// Who authored pending_prompt ("user" | "supervisor"): ALTER-only after the
-		// rebuilds, same reason as priority above; null behaves as "user" on old rows.
-		if (!cols.includes("pending_by"))
-			db.exec("ALTER TABLE tasks ADD COLUMN pending_by TEXT");
-		// OTTR-394: how many automatic rebase retries a rejected server push has spent
-		// (budget 2 per card). ALTER-only after the rebuilds, like pending_by above.
-		if (!cols.includes("push_retries"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN push_retries INTEGER NOT NULL DEFAULT 0",
-			);
-		// OTTR-552 PR-mode PR fields: ALTER-only after both CHECK rebuilds, same reason as
-		// push_retries above — a rebuild's explicit column list would drop them.
-		if (!cols.includes("pr_number"))
-			db.exec("ALTER TABLE tasks ADD COLUMN pr_number INTEGER");
-		if (!cols.includes("pr_url"))
-			db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
-		if (!cols.includes("pr_head_sha"))
-			db.exec("ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT");
-		const turnCols = db
-			.query<{ name: string }, []>("PRAGMA table_info(turns)")
-			.all()
-			.map((c) => c.name);
-		if (!turnCols.includes("model"))
-			db.exec("ALTER TABLE turns ADD COLUMN model TEXT");
-		// The --model selector a swapped run was dispatched with; null when none served a
-		// different model than dispatched. Nullable, so plain ADD COLUMN converges.
-		if (!turnCols.includes("dispatched_model"))
-			db.exec("ALTER TABLE turns ADD COLUMN dispatched_model TEXT");
-		// Where the turn's run executed; null for turns recorded before OTTR-503.
-		if (!turnCols.includes("ran_on"))
-			db.exec("ALTER TABLE turns ADD COLUMN ran_on TEXT");
-		if (!turnCols.includes("input"))
-			db.exec("ALTER TABLE turns ADD COLUMN input TEXT");
-		// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".
-		if (!turnCols.includes("input_by"))
-			db.exec("ALTER TABLE turns ADD COLUMN input_by TEXT");
-		// Byte offset in the card log where the turn's own section starts; null for pre-field rows.
-		if (!turnCols.includes("log_offset"))
-			db.exec("ALTER TABLE turns ADD COLUMN log_offset INTEGER");
-		// Cost capture columns: nullable, so plain ADD COLUMN converges like the
-		// tasks columns above; the backfill below fills what the transcripts still allow.
-		for (const col of [
-			"tokens_in",
-			"tokens_out",
-			"cache_read",
-			"cache_write",
-		]) {
-			if (!turnCols.includes(col))
-				db.exec(`ALTER TABLE turns ADD COLUMN ${col} INTEGER`);
-		}
-		if (!turnCols.includes("cost"))
-			db.exec("ALTER TABLE turns ADD COLUMN cost REAL");
-		if (!turnCols.includes("layer"))
-			db.exec("ALTER TABLE turns ADD COLUMN layer TEXT");
-		// One-time-per-open cost backfill: finished turns without captured cost read their
-		// task's transcript once per task and fill each turn by its timestamp window. Never
-		// throws (spec): a failure or a missing transcript leaves the columns NULL and the
-		// next open tries again.
-		try {
-			backfillTurnCosts(db, join(tasksDir, "sessions"));
-		} catch {
-			/* backfill is best-effort; the next open retries */
-		}
-		// kind: trusted, server-set card kind. ALTER-only and placed after both
-		// table-rebuild blocks on purpose (like topic/fork_merge_approved): those copy rows by
-		// an explicit name list and would reset kind to 'work'. The one-time backfill maps
-		// pre-existing privileged cards to their kind: they were all created by the trusted
-		// routes whose prompt builders emit these prefixes, so a LIKE on the marker constants
-		// is exact here. After this backfill no code derives kind from prompt text again.
-		if (!cols.includes("kind")) {
-			db.exec("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'");
-			db.run("UPDATE tasks SET kind = 'retro' WHERE prompt LIKE ? || '%'", [
-				RETRO_MARKER,
-			]);
-			db.run("UPDATE tasks SET kind = 'interview' WHERE prompt LIKE ? || '%'", [
-				RULES_INTERVIEW_MARKER,
-			]);
-			db.run(
-				"UPDATE tasks SET kind = 'review' WHERE release_version IS NULL AND prompt LIKE ? || '%'",
-				[ARCH_REVIEW_MARKER],
-			);
-		}
-		// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
-		if (!cols.includes("hold_until"))
-			db.exec("ALTER TABLE tasks ADD COLUMN hold_until INTEGER");
-		// OTTR-688: which provider (and window) a usage-limit hold waits for; null on non-usage
-		// holds. Nullable TEXT, so plain ADD COLUMN converges; ALTER-only after every rebuild
-		// like hold_until above.
-		if (!cols.includes("hold_provider"))
-			db.exec("ALTER TABLE tasks ADD COLUMN hold_provider TEXT");
-		if (!cols.includes("hold_window"))
-			db.exec("ALTER TABLE tasks ADD COLUMN hold_window TEXT");
-		if (!cols.includes("starred"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
-			);
-		if (!cols.includes("merge_head"))
-			db.exec("ALTER TABLE tasks ADD COLUMN merge_head TEXT");
-		// The parent's project when follow_up_of names a card on another project's board
-		// (create_task's project parameter); null keeps the link on this board. ALTER-only
-		// after every rebuild, like the columns above: a rebuild's explicit column list
-		// would drop it, and a column living in TASKS_DDL too would dupe here on the
-		// stale cols list.
-		if (!cols.includes("follow_up_of_project"))
-			db.exec("ALTER TABLE tasks ADD COLUMN follow_up_of_project TEXT");
-		// context_tokens: the task's final context-window size in prompt tokens, captured
-		// at turn finish and backfilled for done tasks from their transcripts. ALTER-only
-		// after every rebuild, like the columns above.
-		if (!cols.includes("context_tokens"))
-			db.exec("ALTER TABLE tasks ADD COLUMN context_tokens INTEGER");
-		try {
-			backfillDoneContext(db, join(tasksDir, "sessions"));
-		} catch {
-			/* backfill is best-effort; the next open retries */
-		}
-		// uncommitted_files: the worktree's uncommitted files captured when a card settles
-		// done, so the done drawer still names them after removeWorktree deletes the tree.
-		// ALTER-only after every rebuild, like the columns above.
-		if (!cols.includes("uncommitted_files"))
-			db.exec(
-				"ALTER TABLE tasks ADD COLUMN uncommitted_files TEXT NOT NULL DEFAULT '[]'",
-			);
-		// OTTR-528: the decision panel's five fields, nullable JSON, ALTER-only after the
-		// rebuilds like the columns above.
-		if (!cols.includes("proposal_summary"))
-			db.exec("ALTER TABLE tasks ADD COLUMN proposal_summary TEXT");
+		const id = /^(?:Retro proposal from |Fork proposal from )(\S+) \("/.exec(
+			reason,
+		)?.[1];
+		if (id === undefined) return null;
+		return reason.startsWith(PROPOSED_REASON_PREFIX)
+			? proposedReason({ id })
+			: forkProposedReason({ id });
+	}
+
+	/** Rewrites legacy proposal needs_reason text to the current wording. Display text
+	 * only: it never touches titles, prompts or turn rows. A converged row no longer
+	 * matches, so the pass stays idempotent on every open. */
+	private static convergeProposalReasons(db: Database): void {
 		// Proposal reasons written before the 2026-11 wording fix double the kind label
 		// ("the retro of Retro of …", "the fork research Fork research: …") and describe
 		// the actions without naming the drawer buttons. replace() with the exact
@@ -1571,9 +1371,7 @@ export class ProjectStore {
 		// chain (a retro proposal names the parent retro's own follow-up, else that retro
 		// itself; a fork proposal names the result card); a row whose chain is gone keeps
 		// its legacy text — no id, no rewrite. Rows of the 2026-11 wording already carry
-		// the id and only drop the quoted title. Display text only: it never touches
-		// titles, prompts or turn rows. A converged row no longer matches, so the pass
-		// stays idempotent on every open.
+		// the id and only drop the quoted title.
 		for (const row of db
 			.query<
 				{ id: string; needs_reason: string; follow_up_of: string | null },
@@ -1591,46 +1389,569 @@ export class ProjectStore {
 				PROPOSED_REASON_PREFIX,
 				FORK_PROPOSED_REASON_PREFIX,
 			)) {
-			const reason = row.needs_reason;
-			let next: string | null = null;
-			if (reason.startsWith(LEGACY_PROPOSED_REASON_PREFIX)) {
-				const parent = row.follow_up_of
-					? db
-							.query<{ follow_up_of: string | null }, [string]>(
-								"SELECT follow_up_of FROM tasks WHERE id = ?",
-							)
-							.get(row.follow_up_of)
-					: null;
-				const sourceId =
-					parent === null ? null : (parent.follow_up_of ?? row.follow_up_of);
-				if (sourceId !== null) next = proposedReason({ id: sourceId });
-			} else if (reason.startsWith(LEGACY_FORK_PROPOSED_REASON_PREFIX)) {
-				if (row.follow_up_of !== null)
-					next = forkProposedReason({ id: row.follow_up_of });
-			} else {
-				const id =
-					/^(?:Retro proposal from |Fork proposal from )(\S+) \("/.exec(
-						reason,
-					)?.[1];
-				if (id !== undefined)
-					next = reason.startsWith(PROPOSED_REASON_PREFIX)
-						? proposedReason({ id })
-						: forkProposedReason({ id });
-			}
+			const next = ProjectStore.convergedReason(db, row);
 			if (next !== null)
 				db.run("UPDATE tasks SET needs_reason = ? WHERE id = ?", [
 					next,
 					row.id,
 				]);
 		}
+	}
+
+	/** Rebuilds pr_review_runs when its stored shape predates the current columns: copies
+	 * rows explicitly, verifies the count, swaps — one transaction, so a failure leaves
+	 * the old table untouched. */
+	private static rebuildPrReviewRuns(db: Database, runCols: string[]): void {
+		if (
+			runCols.length === 0 ||
+			["id", "number", "started_at", "head", "done"].every((c) =>
+				runCols.includes(c),
+			)
+		)
+			return;
+		const count = (table: string): number =>
+			db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
+				?.n ?? 0;
+		const before = count("pr_review_runs");
+		db.exec("BEGIN");
+		try {
+			db.exec(
+				PR_REVIEW_RUNS_DDL.replace(
+					"CREATE TABLE IF NOT EXISTS pr_review_runs",
+					"CREATE TABLE pr_review_runs_migrating",
+				),
+			);
+			if (runCols.includes("head")) {
+				// The head-era build wrote each row after its review finished, so done = 1
+				// keeps the one-review-per-head gate for heads already reviewed there.
+				db.exec(
+					"INSERT INTO pr_review_runs_migrating (number, started_at, head, done) SELECT number, started_at, head, 1 FROM pr_review_runs",
+				);
+				const after = count("pr_review_runs_migrating");
+				if (after !== before)
+					throw Error(
+						`pr_review_runs migration would lose rows: ${before} -> ${after}`,
+					);
+				// The first shape holds no head, so its rows cannot satisfy head NOT NULL
+				// and drop: they only carry the daily rate-limit window, never review content.
+			}
+			db.exec("DROP TABLE pr_review_runs");
+			db.exec("ALTER TABLE pr_review_runs_migrating RENAME TO pr_review_runs");
+			db.exec(
+				"CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at)",
+			);
+			db.exec("COMMIT");
+		} catch (err) {
+			db.exec("ROLLBACK");
+			throw err;
+		}
+	}
+
+	static open(projectPath: string): ProjectStore {
+		const root = resolve(projectPath);
+		const tasksDir = tasksDirFor(root);
+		mkdirBelow(dataRootFor(root), tasksDir);
+		const serverDir = serverDirFor(root);
+		mkdirSync(serverDir, { recursive: true });
+		const dbPath = join(serverDir, "tasks.db");
+		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
+		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
+		const db = openLocked(dbPath);
+		db.exec(SCHEMA);
+		const cols = db
+			.query<{ name: string }, []>("PRAGMA table_info(tasks)")
+			.all()
+			.map((c) => c.name);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"images",
+			"ALTER TABLE tasks ADD COLUMN images TEXT NOT NULL DEFAULT '[]'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"pending_images",
+			"ALTER TABLE tasks ADD COLUMN pending_images TEXT NOT NULL DEFAULT '[]'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"shots",
+			"ALTER TABLE tasks ADD COLUMN shots TEXT NOT NULL DEFAULT '[]'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"session_title",
+			"ALTER TABLE tasks ADD COLUMN session_title TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"commits",
+			"ALTER TABLE tasks ADD COLUMN commits INTEGER",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"release_version",
+			"ALTER TABLE tasks ADD COLUMN release_version TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"release_notes",
+			"ALTER TABLE tasks ADD COLUMN release_notes TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"asked",
+			"ALTER TABLE tasks ADD COLUMN asked TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"model",
+			"ALTER TABLE tasks ADD COLUMN model TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"kept_files",
+			"ALTER TABLE tasks ADD COLUMN kept_files TEXT NOT NULL DEFAULT '[]'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"follow_up_of",
+			"ALTER TABLE tasks ADD COLUMN follow_up_of TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"done_at",
+			"ALTER TABLE tasks ADD COLUMN done_at INTEGER",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"push_sha",
+			"ALTER TABLE tasks ADD COLUMN push_sha TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"report",
+			"ALTER TABLE tasks ADD COLUMN report TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"research",
+			"ALTER TABLE tasks ADD COLUMN research INTEGER NOT NULL DEFAULT 0",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"research_steps",
+			"ALTER TABLE tasks ADD COLUMN research_steps TEXT NOT NULL DEFAULT 'unknown'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"update_ids",
+			"ALTER TABLE tasks ADD COLUMN update_ids TEXT NOT NULL DEFAULT '[]'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"update_merge_approved",
+			"ALTER TABLE tasks ADD COLUMN update_merge_approved INTEGER NOT NULL DEFAULT 0",
+		);
+		// Backfill runs on every open and is idempotent (only null rows): a process stop
+		// between the ALTER above and the UPDATE converges here on the next open instead
+		// of leaving done cards unstamped forever (includedTasks drops them from releases).
+		db.exec(
+			"UPDATE tasks SET done_at = (SELECT ended_at FROM turns WHERE turns.task_id = tasks.id ORDER BY turns.id DESC LIMIT 1) WHERE stage = 'done' AND done_at IS NULL",
+		);
+		// A CHECK constraint can only change by rebuilding the table: databases created before
+		// `preparing` carry the old state list, and the scheduler writes 'preparing' on every
+		// claim. Runs after the column backfills so old and new shapes have the same named
+		// columns; copies rows explicitly (legacy column ORDER can differ), verifies the count,
+		// then swaps — all in one transaction, so a failure leaves the old table untouched.
+		const tasksSql =
+			db
+				.query<{ sql: string }, []>(
+					"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+				)
+				.get()?.sql ?? "";
+		ProjectStore.rebuildTasksOnCheck(
+			db,
+			tasksSql,
+			"state IN ('queued','running','needs_you','idle')",
+			[
+				"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
+				"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
+			],
+			`id, title, prompt, stage, state, needs_reason, pending_prompt,
+					branch, base, worktree, session_id, summary, details, created_at, updated_at,
+					queued_at, cancelled_at, images, pending_images, release_version, release_notes,
+					session_title, asked, model, kept_files, follow_up_of, commits, done_at`,
+			"state",
+		);
+		// topic lands after the state-CHECK rebuild above on purpose: that migration copies
+		// named columns only, so a column added before it would be dropped together with the
+		// freshly backfilled labels. Same idempotent pattern as done_at: only null rows.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"topic",
+			"ALTER TABLE tasks ADD COLUMN topic TEXT",
+		);
+		ProjectStore.backfillTopics(db);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"depends_on",
+			"ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
+		);
+		// Diff capture columns: null on every pre-existing row (never captured), so plain ADD COLUMN
+		// converges; placed after the state-CHECK rebuild like topic, whose named-column copy would
+		// drop them otherwise.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"diff_files",
+			"ALTER TABLE tasks ADD COLUMN diff_files TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"diff_text",
+			"ALTER TABLE tasks ADD COLUMN diff_text TEXT",
+		);
+		// Work-check columns: absent from TASKS_DDL on purpose — the state-CHECK
+		// rebuild recreates the table from that DDL, so a column living in both would dupe
+		// here on the stale column list (same reason topic and the diff columns live here).
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"work_check_log",
+			"ALTER TABLE tasks ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"work_check_sendbacks",
+			"ALTER TABLE tasks ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"work_check_head",
+			"ALTER TABLE tasks ADD COLUMN work_check_head TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"work_check_report",
+			"ALTER TABLE tasks ADD COLUMN work_check_report TEXT",
+		);
+		// fork_merge_approved lives after the state-CHECK rebuild on purpose (like topic and the
+		// diff columns): it is ALTER-only, so a rebuild before its backfill would drop the
+		// column and the stale `cols` list would never re-add it.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"fork_merge_approved",
+			"ALTER TABLE tasks ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
+		);
+		// A CHECK constraint can only change by rebuilding the table: databases created before
+		// `backlog` carry the old stage list, and a parked card writes 'backlog'. Same pattern as
+		// the state-CHECK rebuild above: runs after every column backfill (named-column copy),
+		// copies rows explicitly, verifies the count, swaps in one transaction.
+		ProjectStore.rebuildTasksOnCheck(
+			db,
+			tasksSql,
+			"stage IN ('todo','in_progress','merging','done')",
+			[
+				"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
+				"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
+				"ALTER TABLE tasks_migrating ADD COLUMN topic TEXT",
+				"ALTER TABLE tasks_migrating ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
+				"ALTER TABLE tasks_migrating ADD COLUMN diff_files TEXT",
+				"ALTER TABLE tasks_migrating ADD COLUMN diff_text TEXT",
+				"ALTER TABLE tasks_migrating ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
+				"ALTER TABLE tasks_migrating ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
+				"ALTER TABLE tasks_migrating ADD COLUMN work_check_head TEXT",
+				"ALTER TABLE tasks_migrating ADD COLUMN work_check_report TEXT",
+				"ALTER TABLE tasks_migrating ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
+			],
+			`id, title, prompt, stage, state, needs_reason, pending_prompt,
+					branch, base, worktree, session_id, summary, details, report, research, research_steps,
+					created_at, updated_at, queued_at, cancelled_at, images, pending_images,
+					release_version, release_notes, session_title, asked, model, kept_files,
+					follow_up_of, push_sha, update_ids, update_merge_approved, fork_merge_approved,
+					commits, done_at, topic, depends_on, diff_files, diff_text, work_check_log,
+					work_check_sendbacks, work_check_head, work_check_report`,
+			"stage",
+		);
+		// Triage columns: ALTER-only and placed after both CHECK rebuilds on
+		// purpose — the rebuilds copy named columns, so a column living in TASKS_DDL too
+		// would dupe here on the stale column list (same reason topic and the diff columns).
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"priority",
+			"ALTER TABLE tasks ADD COLUMN priority TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"close_candidate",
+			"ALTER TABLE tasks ADD COLUMN close_candidate TEXT",
+		);
+		// Merge-hold heads (replace the retired update/fork_merge_approved flags, which stay
+		// unused in old rows): ALTER-only after the rebuilds, same reason as priority above.
+		for (const col of ["update_merge_head", "fork_merge_head", "hold_head"])
+			ProjectStore.addColumn(
+				db,
+				cols,
+				col,
+				`ALTER TABLE tasks ADD COLUMN ${col} TEXT`,
+			);
+		// Who authored pending_prompt ("user" | "supervisor"): ALTER-only after the
+		// rebuilds, same reason as priority above; null behaves as "user" on old rows.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"pending_by",
+			"ALTER TABLE tasks ADD COLUMN pending_by TEXT",
+		);
+		// OTTR-394: how many automatic rebase retries a rejected server push has spent
+		// (budget 2 per card). ALTER-only after the rebuilds, like pending_by above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"push_retries",
+			"ALTER TABLE tasks ADD COLUMN push_retries INTEGER NOT NULL DEFAULT 0",
+		);
+		// OTTR-552 PR-mode PR fields: ALTER-only after both CHECK rebuilds, same reason as
+		// push_retries above — a rebuild's explicit column list would drop them.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"pr_number",
+			"ALTER TABLE tasks ADD COLUMN pr_number INTEGER",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"pr_url",
+			"ALTER TABLE tasks ADD COLUMN pr_url TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"pr_head_sha",
+			"ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT",
+		);
+		const turnCols = db
+			.query<{ name: string }, []>("PRAGMA table_info(turns)")
+			.all()
+			.map((c) => c.name);
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"model",
+			"ALTER TABLE turns ADD COLUMN model TEXT",
+		);
+		// The --model selector a swapped run was dispatched with; null when none served a
+		// different model than dispatched. Nullable, so plain ADD COLUMN converges.
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"dispatched_model",
+			"ALTER TABLE turns ADD COLUMN dispatched_model TEXT",
+		);
+		// Where the turn's run executed; null for turns recorded before OTTR-503.
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"ran_on",
+			"ALTER TABLE turns ADD COLUMN ran_on TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"input",
+			"ALTER TABLE turns ADD COLUMN input TEXT",
+		);
+		// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"input_by",
+			"ALTER TABLE turns ADD COLUMN input_by TEXT",
+		);
+		// Byte offset in the card log where the turn's own section starts; null for pre-field rows.
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"log_offset",
+			"ALTER TABLE turns ADD COLUMN log_offset INTEGER",
+		);
+		// Cost capture columns: nullable, so plain ADD COLUMN converges like the
+		// tasks columns above; the backfill below fills what the transcripts still allow.
+		for (const col of [
+			"tokens_in",
+			"tokens_out",
+			"cache_read",
+			"cache_write",
+		]) {
+			ProjectStore.addColumn(
+				db,
+				turnCols,
+				col,
+				`ALTER TABLE turns ADD COLUMN ${col} INTEGER`,
+			);
+		}
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"cost",
+			"ALTER TABLE turns ADD COLUMN cost REAL",
+		);
+		ProjectStore.addColumn(
+			db,
+			turnCols,
+			"layer",
+			"ALTER TABLE turns ADD COLUMN layer TEXT",
+		);
+		// One-time-per-open cost backfill: finished turns without captured cost read their
+		// task's transcript once per task and fill each turn by its timestamp window. Never
+		// throws (spec): a failure or a missing transcript leaves the columns NULL and the
+		// next open tries again.
+		try {
+			backfillTurnCosts(db, join(tasksDir, "sessions"));
+		} catch {
+			/* backfill is best-effort; the next open retries */
+		}
+		// kind: trusted, server-set card kind. ALTER-only and placed after both
+		// table-rebuild blocks on purpose (like topic/fork_merge_approved): those copy rows by
+		// an explicit name list and would reset kind to 'work'. The one-time backfill maps
+		// pre-existing privileged cards to their kind: they were all created by the trusted
+		// routes whose prompt builders emit these prefixes, so a LIKE on the marker constants
+		// is exact here. After this backfill no code derives kind from prompt text again.
+		if (!cols.includes("kind")) {
+			ProjectStore.addColumn(
+				db,
+				cols,
+				"kind",
+				"ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'",
+			);
+			db.run("UPDATE tasks SET kind = 'retro' WHERE prompt LIKE ? || '%'", [
+				RETRO_MARKER,
+			]);
+			db.run("UPDATE tasks SET kind = 'interview' WHERE prompt LIKE ? || '%'", [
+				RULES_INTERVIEW_MARKER,
+			]);
+			db.run(
+				"UPDATE tasks SET kind = 'review' WHERE release_version IS NULL AND prompt LIKE ? || '%'",
+				[ARCH_REVIEW_MARKER],
+			);
+		}
+		// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"hold_until",
+			"ALTER TABLE tasks ADD COLUMN hold_until INTEGER",
+		);
+		// OTTR-688: which provider (and window) a usage-limit hold waits for; null on non-usage
+		// holds. Nullable TEXT, so plain ADD COLUMN converges; ALTER-only after every rebuild
+		// like hold_until above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"hold_provider",
+			"ALTER TABLE tasks ADD COLUMN hold_provider TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"hold_window",
+			"ALTER TABLE tasks ADD COLUMN hold_window TEXT",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"starred",
+			"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"merge_head",
+			"ALTER TABLE tasks ADD COLUMN merge_head TEXT",
+		);
+		// The parent's project when follow_up_of names a card on another project's board
+		// (create_task's project parameter); null keeps the link on this board. ALTER-only
+		// after every rebuild, like the columns above: a rebuild's explicit column list
+		// would drop it, and a column living in TASKS_DDL too would dupe here on the
+		// stale cols list.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"follow_up_of_project",
+			"ALTER TABLE tasks ADD COLUMN follow_up_of_project TEXT",
+		);
+		// context_tokens: the task's final context-window size in prompt tokens, captured
+		// at turn finish and backfilled for done tasks from their transcripts. ALTER-only
+		// after every rebuild, like the columns above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"context_tokens",
+			"ALTER TABLE tasks ADD COLUMN context_tokens INTEGER",
+		);
+		try {
+			backfillDoneContext(db, join(tasksDir, "sessions"));
+		} catch {
+			/* backfill is best-effort; the next open retries */
+		}
+		// uncommitted_files: the worktree's uncommitted files captured when a card settles
+		// done, so the done drawer still names them after removeWorktree deletes the tree.
+		// ALTER-only after every rebuild, like the columns above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"uncommitted_files",
+			"ALTER TABLE tasks ADD COLUMN uncommitted_files TEXT NOT NULL DEFAULT '[]'",
+		);
+		// OTTR-528: the decision panel's five fields, nullable JSON, ALTER-only after the
+		// rebuilds like the columns above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"proposal_summary",
+			"ALTER TABLE tasks ADD COLUMN proposal_summary TEXT",
+		);
+		ProjectStore.convergeProposalReasons(db);
 		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
 		// updates a live table, so converge additively like the tasks columns above.
 		const prCols = db
 			.query<{ name: string }, []>("PRAGMA table_info(pr_review)")
 			.all()
 			.map((c) => c.name);
-		if (!prCols.includes("posted_url"))
-			db.exec("ALTER TABLE pr_review ADD COLUMN posted_url TEXT");
+		ProjectStore.addColumn(
+			db,
+			prCols,
+			"posted_url",
+			"ALTER TABLE pr_review ADD COLUMN posted_url TEXT",
+		);
 		// The open-PR hold columns landed after the first fork_branch release: same additive
 		// convergence; null reads as "no hold", the state of every older row.
 		const forkCols = db
@@ -1638,20 +1959,34 @@ export class ProjectStore {
 			.all()
 			.map((c) => c.name);
 		for (const col of ["hold_prs", "hold_base"])
-			if (!forkCols.includes(col))
-				db.exec(`ALTER TABLE fork_branch ADD COLUMN ${col} TEXT`);
+			ProjectStore.addColumn(
+				db,
+				forkCols,
+				col,
+				`ALTER TABLE fork_branch ADD COLUMN ${col} TEXT`,
+			);
 		// posted_login landed with the GitHub App posts: same additive convergence, so an
 		// older database still reads and posts without a rebuild.
-		if (!prCols.includes("posted_login"))
-			db.exec("ALTER TABLE pr_review ADD COLUMN posted_login TEXT");
+		ProjectStore.addColumn(
+			db,
+			prCols,
+			"posted_login",
+			"ALTER TABLE pr_review ADD COLUMN posted_login TEXT",
+		);
 		// The comment watch landed with the PR review notifications: same additive
 		// convergence, so an older database still sweeps and alerts without a rebuild.
-		if (!prCols.includes("comments_at"))
-			db.exec("ALTER TABLE pr_review ADD COLUMN comments_at INTEGER");
-		if (!prCols.includes("comments_unseen"))
-			db.exec(
-				"ALTER TABLE pr_review ADD COLUMN comments_unseen INTEGER NOT NULL DEFAULT 0",
-			);
+		ProjectStore.addColumn(
+			db,
+			prCols,
+			"comments_at",
+			"ALTER TABLE pr_review ADD COLUMN comments_at INTEGER",
+		);
+		ProjectStore.addColumn(
+			db,
+			prCols,
+			"comments_unseen",
+			"ALTER TABLE pr_review ADD COLUMN comments_unseen INTEGER NOT NULL DEFAULT 0",
+		);
 		// pr_review_runs changed shape twice inside the first pr_review releases (head, then
 		// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
 		// prHeadReviewed and the done update then throw "no such column" and the watcher
@@ -1662,51 +1997,7 @@ export class ProjectStore {
 			.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
 			.all()
 			.map((c) => c.name);
-		if (
-			runCols.length > 0 &&
-			!["id", "number", "started_at", "head", "done"].every((c) =>
-				runCols.includes(c),
-			)
-		) {
-			const count = (table: string): number =>
-				db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
-					?.n ?? 0;
-			const before = count("pr_review_runs");
-			db.exec("BEGIN");
-			try {
-				db.exec(
-					PR_REVIEW_RUNS_DDL.replace(
-						"CREATE TABLE IF NOT EXISTS pr_review_runs",
-						"CREATE TABLE pr_review_runs_migrating",
-					),
-				);
-				if (runCols.includes("head")) {
-					// The head-era build wrote each row after its review finished, so done = 1
-					// keeps the one-review-per-head gate for heads already reviewed there.
-					db.exec(
-						"INSERT INTO pr_review_runs_migrating (number, started_at, head, done) SELECT number, started_at, head, 1 FROM pr_review_runs",
-					);
-					const after = count("pr_review_runs_migrating");
-					if (after !== before)
-						throw Error(
-							`pr_review_runs migration would lose rows: ${before} -> ${after}`,
-						);
-					// The first shape holds no head, so its rows cannot satisfy head NOT NULL
-					// and drop: they only carry the daily rate-limit window, never review content.
-				}
-				db.exec("DROP TABLE pr_review_runs");
-				db.exec(
-					"ALTER TABLE pr_review_runs_migrating RENAME TO pr_review_runs",
-				);
-				db.exec(
-					"CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at)",
-				);
-				db.exec("COMMIT");
-			} catch (err) {
-				db.exec("ROLLBACK");
-				throw err;
-			}
-		}
+		ProjectStore.rebuildPrReviewRuns(db, runCols);
 		return new ProjectStore(root, db);
 	}
 
@@ -2072,8 +2363,7 @@ export class ProjectStore {
 	): { ok: true; repo: string } | { ok: false; error: string } {
 		const scout = this.getTask(scoutId);
 		if (
-			!scout ||
-			scout.kind !== "trending" ||
+			scout?.kind !== "trending" ||
 			scout.cancelledAt !== null ||
 			scout.stage === "done"
 		)
@@ -2636,19 +2926,7 @@ export class ProjectStore {
 			const value = patch[key];
 			if (value !== undefined) {
 				sets.push(`${TASK_COLUMNS[key]} = ?`);
-				// ponytail: Array.isArray covers exactly the JSON array columns (images, pendingImages, shots, asked, keptFiles); more need a column->serializer map
-				// A plain object (proposalSummary) serializes too; null and the scalars pass through.
-				values.push(
-					Array.isArray(value)
-						? JSON.stringify(value)
-						: typeof value === "boolean"
-							? value
-								? 1
-								: 0
-							: value !== null && typeof value === "object"
-								? JSON.stringify(value)
-								: (value as string | number | null),
-				);
+				values.push(bindTaskValue(value));
 			}
 		}
 		values.push(id);

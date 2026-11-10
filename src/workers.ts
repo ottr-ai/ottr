@@ -180,347 +180,479 @@ export function serveWorker(opts: {
 		for (const [id, e] of detached)
 			if (now - e.startedAt > ttl) detached.delete(id);
 	};
+	const tokenOk = (request: Request): boolean =>
+		!opts.token || request.headers.get("x-otwr-token") === opts.token;
+	// OTTR-548: the worker self-reports its own store's sign-ins; the board never reads
+	// the worker store (R5-1). Always HTTP 200: the board's tick decides what a null
+	// signIns list means, and a warning must never start with a failed request.
+	const handleSignIns = async (request: Request): Promise<Response> => {
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		const dbPath = workerAgentDb();
+		try {
+			// The injected reader answers without touching the worker's own store.
+			// The default guards first: a readonly open of a missing path fails
+			// with a message that names no file.
+			const read =
+				opts.readSignIns ??
+				(() => {
+					if (!existsSync(dbPath)) throw new Error(`${dbPath} does not exist`);
+					return signIns(dbPath);
+				});
+			return Response.json({ signIns: read() });
+		} catch (err) {
+			return Response.json({
+				signIns: null,
+				error: `${dbPath}: ${err instanceof Error ? err.message : String(err)}`,
+			});
+		}
+	};
+	// The System view's per-container numbers: the worker reads its own cgroup, since
+	// the server's /proc sees only the whole Docker VM. Each live run's process tree
+	// (attached or detached) adds the turn's own share, keyed by the server's run id.
+	const handleStats = (request: Request): Response => {
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		const runs = [...active.values(), ...detached.values()].flatMap((e) =>
+			e.running && e.pid !== null ? [{ id: e.id, pid: e.pid }] : [],
+		);
+		return Response.json(
+			readCgroup({
+				root: opts.cgroupRoot,
+				lockPath: opts.lockPath,
+				runs,
+				procRoot: opts.statsProcRoot,
+			}),
+		);
+	};
+	const handleSweep = async (request: Request): Promise<Response> => {
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		try {
+			const stopped = await sweepLeftovers({
+				roots: opts.sweepRoots,
+				graceMs: opts.sweepGraceMs,
+				keepPids: runChildren,
+				procRoot: opts.sweepProcRoot,
+				kill: opts.sweepKill,
+			});
+			return Response.json(stopped);
+		} catch (err) {
+			return new Response(err instanceof Error ? err.message : String(err), {
+				status: 500,
+			});
+		}
+	};
+	const handleDetachKill = async (request: Request): Promise<Response> => {
+		pruneDetached();
+		let body: { id?: string };
+		try {
+			body = (await request.json()) as { id?: string };
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		const e = typeof body.id === "string" ? detached.get(body.id) : undefined;
+		if (e === undefined) return new Response("not found", { status: 404 });
+		if (e.pid !== null && e.running) platform.killTree(e.pid);
+		e.killed = true;
+		e.running = false;
+		return Response.json({ killed: true });
+	};
+	const handleDetach = async (request: Request): Promise<Response> => {
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		const url = new URL(request.url);
+		if (request.method === "POST" && url.pathname === "/detach") {
+			// The restart drops every /run stream: release them all, keep the children.
+			// The abort and cancel handlers no longer kill; the close handler records
+			// the result into the detached entry instead of a gone stream.
+			let n = 0;
+			for (const [id, e] of active) {
+				e.detached = true;
+				e.closeStream();
+				detached.set(id, e);
+				active.delete(id);
+				n++;
+			}
+			return Response.json({ detached: n });
+		}
+		if (request.method === "GET" && url.pathname === "/detached") {
+			pruneDetached();
+			return Response.json(
+				[...detached.values()].map(
+					// The internal detach flag and the stream closure stay off the wire.
+					({ closeStream: _c, detached: _d, ...entry }) => entry,
+				),
+			);
+		}
+		if (request.method === "POST" && url.pathname === "/detach/kill")
+			return handleDetachKill(request);
+		return new Response("not found", { status: 404 });
+	};
+	// A failed install ends the run with the error as its stderr tail (the sentinel), so
+	// the client sees the provisioner's failure and no run spawns.
+	const provisionResponse = async (
+		project: string,
+	): Promise<{ notes: string; pathDir: string } | Response> => {
+		try {
+			return await provisionRun(
+				opts.ensurePackages ?? ensureProjectPackages,
+				opts.ensureTools ?? ensureProjectTools,
+				opts.ensurePython ?? ensureProjectPython,
+				opts.buildPath ?? buildToolsPath,
+				project,
+			);
+		} catch (err) {
+			const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
+			return new Response(
+				`${JSON.stringify({ [WORKER_DONE]: { exitCode: 1, stderrTail } })}\n`,
+				{ headers: { "content-type": "text/plain; charset=utf-8" } },
+			);
+		}
+	};
+	const parseRunBody = async (
+		request: Request,
+	): Promise<WorkerRequest | Response> => {
+		let body: WorkerRequest;
+		try {
+			body = (await request.json()) as WorkerRequest;
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		if (!validRunBody(body))
+			return new Response("bad request", { status: 400 });
+		return body;
+	};
+	// The project's package list (alate provisions it into the shared home) is installed
+	// in this container before omp starts; a failed install ends the run with apt's error,
+	// and the client giving up mid-install must not orphan the run.
+	const prepared = async (
+		request: Request,
+		body: WorkerRequest,
+	): Promise<{ notes: string; pathDir: string } | Response> => {
+		const project = body.env?.OTTR_PROJECT;
+		if (typeof project !== "string" || project === "")
+			return { notes: "", pathDir: "" };
+		const provided = await provisionResponse(project);
+		if (provided instanceof Response) return provided;
+		// The client gave up during the install: spawning now would orphan the run.
+		if (request.signal.aborted) return new Response("aborted", { status: 499 });
+		return provided;
+	};
+	const handleRun = async (request: Request): Promise<Response> => {
+		const url = new URL(request.url);
+		if (request.method !== "POST" || url.pathname !== "/run")
+			return new Response("not found", { status: 404 });
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		const parsed = await parseRunBody(request);
+		if (parsed instanceof Response) return parsed;
+		const run = await prepared(request, parsed);
+		if (run instanceof Response) return run;
+		return startRun(request, parsed, run.notes, run.pathDir);
+	};
+	const startRun = async (
+		request: Request,
+		body: WorkerRequest,
+		notes: string,
+		pathDir: string,
+	): Promise<Response> => {
+		const env = runChildEnv(body.env, pathDir);
+		// The provision guard's untracked scan compares against the rules dir as it
+		// stood before omp started (docs/specs/turn-provision-guard.md).
+		const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
+		let child: ChildProcess;
+		try {
+			child = spawn(opts.ompPath ?? "omp", body.argv, {
+				cwd: body.cwd,
+				env,
+				stdio: ["pipe", "pipe", "pipe"],
+				windowsHide: true,
+			});
+		} catch (err) {
+			return new Response(`spawn failed: ${String(err)}`, { status: 500 });
+		}
+		const forgetChild = (): void => {
+			if (child.pid !== undefined) runChildren.delete(child.pid);
+		};
+		// A spawn error never fires "close", so forget here too.
+		child.on("error", forgetChild);
+		if (child.pid !== undefined) runChildren.add(child.pid);
+		const entry: ActiveRun = {
+			id: body.id,
+			cwd: body.cwd,
+			pid: child.pid ?? null,
+			running: true,
+			startedAt: Date.now(),
+			detached: false,
+			closeStream: (): void => {},
+		};
+		active.set(entry.id, entry);
+		const forgetEntry = (): void => {
+			if (active.get(entry.id) === entry) active.delete(entry.id);
+		};
+		const killTree = (): void => {
+			// Detach releases the client on purpose: nothing on the dead request may kill
+			// the child afterwards, and the push helper's closed path lands here too.
+			if (entry.detached) return;
+			if (child.pid !== undefined) platform.killTree(child.pid);
+		};
+		// stderrTail stays reserved for omp's stderr: classify's no-stderr death rules
+		// (provider rejection, dispatch context) need an empty tail to fire. The apt
+		// install notes ride the stream as plain stdout lines instead.
+		const state: RunStreamState = {
+			closed: false,
+			stopWatch: (): void => {},
+			partial: "",
+			stderrTail: "",
+		};
+		child.stderr?.on("data", (chunk: Buffer) => {
+			state.stderrTail = `${state.stderrTail}${chunk.toString("utf8")}`
+				.replace(/\r\n/g, "\n")
+				.slice(-4000);
+		});
+		child.on("error", (err: Error) => {
+			forgetEntry();
+			state.stderrTail = `${state.stderrTail}${err.message}\n`
+				.replace(/\r\n/g, "\n")
+				.slice(-4000);
+		});
+		const stream = openRunStream({
+			child,
+			entry,
+			notes,
+			stdin: body.stdin,
+			state,
+			killTree,
+			forgetChild,
+			forgetEntry,
+			auditProvisioned: opts.auditProvisioned,
+			rulesAtStart,
+		});
+		request.signal.addEventListener("abort", killTree);
+		return new Response(stream, {
+			headers: { "content-type": "text/plain; charset=utf-8" },
+		});
+	};
+	const route = async (request: Request): Promise<Response> => {
+		const url = new URL(request.url);
+		if (request.method === "GET" && url.pathname === "/healthz")
+			return new Response("ok");
+		if (request.method === "GET" && url.pathname === "/signins")
+			return handleSignIns(request);
+		if (request.method === "GET" && url.pathname === "/stats")
+			return handleStats(request);
+		if (request.method === "POST" && url.pathname === "/sweep")
+			return handleSweep(request);
+		if (
+			url.pathname === "/detach" ||
+			url.pathname === "/detached" ||
+			url.pathname === "/detach/kill"
+		)
+			return handleDetach(request);
+		return handleRun(request);
+	};
 	return Bun.serve({
 		port: opts.port ?? 8787,
 		hostname: "0.0.0.0",
 		// Long silent turns must not be cut by an idle timeout.
 		idleTimeout: 0,
-		fetch: async (request) => {
-			const url = new URL(request.url);
-			if (request.method === "GET" && url.pathname === "/healthz")
-				return new Response("ok");
-			// OTTR-548: the worker self-reports its own store's sign-ins; the board never reads
-			// the worker store (R5-1). Always HTTP 200: the board's tick decides what a null
-			// signIns list means, and a warning must never start with a failed request.
-			if (request.method === "GET" && url.pathname === "/signins") {
-				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
-					return new Response("unauthorized", { status: 401 });
-				const dbPath = workerAgentDb();
-				try {
-					// The injected reader answers without touching the worker's own store.
-					// The default guards first: a readonly open of a missing path fails
-					// with a message that names no file.
-					const read =
-						opts.readSignIns ??
-						(() => {
-							if (!existsSync(dbPath))
-								throw new Error(`${dbPath} does not exist`);
-							return signIns(dbPath);
-						});
-					return Response.json({ signIns: read() });
-				} catch (err) {
-					return Response.json({
-						signIns: null,
-						error: `${dbPath}: ${err instanceof Error ? err.message : String(err)}`,
-					});
-				}
-			}
-			// The System view's per-container numbers: the worker reads its own cgroup, since
-			// the server's /proc sees only the whole Docker VM. Each live run's process tree
-			// (attached or detached) adds the turn's own share, keyed by the server's run id.
-			if (request.method === "GET" && url.pathname === "/stats") {
-				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
-					return new Response("unauthorized", { status: 401 });
-				const runs = [...active.values(), ...detached.values()].flatMap((e) =>
-					e.running && e.pid !== null ? [{ id: e.id, pid: e.pid }] : [],
-				);
-				return Response.json(
-					readCgroup({
-						root: opts.cgroupRoot,
-						lockPath: opts.lockPath,
-						runs,
-						procRoot: opts.statsProcRoot,
-					}),
-				);
-			}
-			if (request.method === "POST" && url.pathname === "/sweep") {
-				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
-					return new Response("unauthorized", { status: 401 });
-				try {
-					const stopped = await sweepLeftovers({
-						roots: opts.sweepRoots,
-						graceMs: opts.sweepGraceMs,
-						keepPids: runChildren,
-						procRoot: opts.sweepProcRoot,
-						kill: opts.sweepKill,
-					});
-					return Response.json(stopped);
-				} catch (err) {
-					return new Response(
-						err instanceof Error ? err.message : String(err),
-						{
-							status: 500,
-						},
-					);
-				}
-			}
-			if (
-				url.pathname === "/detach" ||
-				url.pathname === "/detached" ||
-				url.pathname === "/detach/kill"
-			) {
-				if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
-					return new Response("unauthorized", { status: 401 });
-				if (request.method === "POST" && url.pathname === "/detach") {
-					// The restart drops every /run stream: release them all, keep the children.
-					// The abort and cancel handlers no longer kill; the close handler records
-					// the result into the detached entry instead of a gone stream.
-					let n = 0;
-					for (const [id, e] of active) {
-						e.detached = true;
-						e.closeStream();
-						detached.set(id, e);
-						active.delete(id);
-						n++;
-					}
-					return Response.json({ detached: n });
-				}
-				if (request.method === "GET" && url.pathname === "/detached") {
-					pruneDetached();
-					return Response.json(
-						[...detached.values()].map(
-							// The internal detach flag and the stream closure stay off the wire.
-							({ closeStream: _c, detached: _d, ...entry }) => entry,
-						),
-					);
-				}
-				if (request.method === "POST" && url.pathname === "/detach/kill") {
-					pruneDetached();
-					let body: { id?: string };
-					try {
-						body = (await request.json()) as { id?: string };
-					} catch {
-						return new Response("bad json", { status: 400 });
-					}
-					const e =
-						typeof body.id === "string" ? detached.get(body.id) : undefined;
-					if (!e) return new Response("not found", { status: 404 });
-					if (e.pid !== null && e.running) platform.killTree(e.pid);
-					e.killed = true;
-					e.running = false;
-					return Response.json({ killed: true });
-				}
-			}
-			if (request.method !== "POST" || url.pathname !== "/run")
-				return new Response("not found", { status: 404 });
-			if (opts.token && request.headers.get("x-otwr-token") !== opts.token)
-				return new Response("unauthorized", { status: 401 });
-			let body: WorkerRequest;
-			try {
-				body = (await request.json()) as WorkerRequest;
-			} catch {
-				return new Response("bad json", { status: 400 });
-			}
-			if (
-				!Array.isArray(body.argv) ||
-				!body.argv.every((a) => typeof a === "string") ||
-				typeof body.cwd !== "string" ||
-				body.cwd === "" ||
-				!isAbsolute(body.cwd) ||
-				!existsSync(body.cwd) ||
-				!statSync(body.cwd).isDirectory()
-			)
-				return new Response("bad request", { status: 400 });
+		fetch: (request) => route(request),
+	});
+}
 
-			// The project's package list (alate provisions it into the shared home) is installed
-			// in this container before omp starts; a failed install ends the run with apt's error.
-			let notes = "";
-			let pathDir = "";
-			const project = body.env?.OTTR_PROJECT;
-			if (typeof project === "string" && project !== "") {
+/** A /run request is well-formed when argv is all strings and cwd is an existing absolute directory. */
+function validRunBody(body: WorkerRequest): boolean {
+	return (
+		Array.isArray(body.argv) &&
+		body.argv.every((a) => typeof a === "string") &&
+		typeof body.cwd === "string" &&
+		body.cwd !== "" &&
+		isAbsolute(body.cwd) &&
+		existsSync(body.cwd) &&
+		statSync(body.cwd).isDirectory()
+	);
+}
+
+/** Installs the project's packages, tools and python venv, and resolves the tools PATH dir.
+ * Throws when an install fails: the caller answers with the error as the run's stderr tail. */
+async function provisionRun(
+	ensurePackages: typeof ensureProjectPackages,
+	ensureTools: typeof ensureProjectTools,
+	ensurePython: typeof ensureProjectPython,
+	buildPath: typeof buildToolsPath,
+	project: string,
+): Promise<{ notes: string; pathDir: string }> {
+	const aptLines = await ensurePackages(project);
+	const toolLines = await ensureTools(project);
+	// The venv builds into the shared home, but stays off the PATH: a worker work
+	// turn keeps its ad-hoc pip --user flow, and a venv bin dir first on PATH would
+	// shadow the user site it installs into (docs/specs/merge-turn-packages.md).
+	const pipLines = await ensurePython(project);
+	const pathDir = buildPath(project);
+	const notes = [...aptLines, ...toolLines, ...pipLines]
+		.map((l) => `${l}\n`)
+		.join("");
+	return { notes, pathDir };
+}
+
+/** The child's env: request env over the container env, minus every push credential and the
+ * alate key; the tools link dir prepended to PATH. */
+function runChildEnv(
+	requestEnv: Record<string, string>,
+	pathDir: string,
+): Record<string, string | undefined> {
+	// The worker's own token drives every worker, and the container env can hold a git
+	// host token (an operator's GH_TOKEN): a turn inherits neither, from the container
+	// or the request. Push credentials stay on the server (D6).
+	const env: Record<string, string | undefined> = {
+		...process.env,
+		...requestEnv,
+	};
+	stripGitAuthEnv(env);
+	// OTTR-693: the board strips GIT_CONFIG_GLOBAL from the dispatched env (the
+	// pointer names a file only the server mounts); this side deletes whatever the
+	// worker container itself carries, so the turn's git never swaps the shared
+	// home's ~/.gitconfig for a file that does not exist here.
+	delete env.GIT_CONFIG_GLOBAL;
+	delete env.OTTR_WORKER_TOKEN;
+	// Same strip as childEnv on the server: no turn ever needs the alate key.
+	delete env.ALATE_API_KEY;
+	// Same strip as childEnv on the server: the container env can carry a
+	// corporate proxy URL with credentials; a turn keeps host and port only.
+	stripProxyCredentials(env);
+	// The tools link dir is per tool set: project pins, then _all pins, then the container
+	// PATH. The daemon's own PATH never changes, and two projects never see each
+	// other's pins because the dir is keyed by the project's own tool set.
+	if (pathDir) env.PATH = `${pathDir}:${String(env.PATH ?? "")}`;
+	return env;
+}
+
+/** Mutable state of one /run: the stream's closed flag, the stryker watch stopper, omp's
+ * unterminated stdout tail, and the reserved stderr tail. */
+interface RunStreamState {
+	closed: boolean;
+	stopWatch(): void;
+	partial: string;
+	stderrTail: string;
+}
+
+/** What openRunStream needs to wire one run's stream to its child and lifecycle helpers. */
+interface RunStreamArgs {
+	child: ChildProcess;
+	entry: ActiveRun;
+	notes: string;
+	stdin: string;
+	state: RunStreamState;
+	killTree(): void;
+	forgetChild(): void;
+	forgetEntry(): void;
+	auditProvisioned?: (
+		sinceMs: number,
+		rulesAtStart?: readonly string[],
+	) => readonly string[];
+	rulesAtStart: readonly string[] | undefined;
+}
+
+/** Feeds one omp stdout chunk through push a full line at a time; the tail stays in `state`. */
+function pushLines(
+	state: RunStreamState,
+	chunk: Buffer,
+	push: (text: string) => void,
+): void {
+	state.partial += chunk.toString("utf8");
+	let idx = state.partial.indexOf("\n");
+	while (idx >= 0) {
+		push(state.partial.slice(0, idx + 1));
+		state.partial = state.partial.slice(idx + 1);
+		idx = state.partial.indexOf("\n");
+	}
+}
+
+/** The run's end: forget the child, audit the shared home's drift, then either park the
+ * result on the detached entry or flush the stdout tail and the done sentinel. */
+function finishRun(
+	args: RunStreamArgs,
+	code: number | null,
+	push: (text: string) => void,
+	closeController: () => void,
+): void {
+	const { entry, state } = args;
+	state.stopWatch();
+	args.forgetChild();
+	args.forgetEntry();
+	// The provision guard audits this container's shared home once the run's
+	// writes are final (docs/specs/turn-provision-guard.md); drift rides the
+	// result, and classify parks the turn.
+	const provisionDrift =
+		args.auditProvisioned?.(entry.startedAt, args.rulesAtStart) ?? [];
+	const driftField = provisionDrift.length
+		? { provisionDrift: [...provisionDrift] }
+		: {};
+	if (entry.detached) {
+		// No client listens any more: the result waits in /detached for boot
+		// recovery instead of a sentinel on a gone stream.
+		entry.running = false;
+		entry.result = {
+			exitCode: code ?? null,
+			stderrTail: state.stderrTail,
+			...driftField,
+		};
+		return;
+	}
+	if (state.partial.length > 0) push(`${state.partial}\n`);
+	push(
+		`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail: state.stderrTail, host: hostname(), ...driftField } })}\n`,
+	);
+	closeController();
+}
+
+/** The run's response stream: install notes, omp stdout lines, the stryker progress watch,
+ * and the done sentinel — while the entry stays attached to a client. */
+function openRunStream(args: RunStreamArgs): ReadableStream<Uint8Array> {
+	const { entry, state } = args;
+	const enc = new TextEncoder();
+	return new ReadableStream({
+		start(controller) {
+			entry.closeStream = (): void => {
+				if (state.closed) return;
+				state.closed = true;
+				state.stopWatch();
 				try {
-					const aptLines = await (opts.ensurePackages ?? ensureProjectPackages)(
-						project,
-					);
-					const toolLines = await (opts.ensureTools ?? ensureProjectTools)(
-						project,
-					);
-					// The venv builds into the shared home, but stays off the PATH: a worker work
-					// turn keeps its ad-hoc pip --user flow, and a venv bin dir first on PATH would
-					// shadow the user site it installs into (docs/specs/merge-turn-packages.md).
-					const pipLines = await (opts.ensurePython ?? ensureProjectPython)(
-						project,
-					);
-					pathDir = (opts.buildPath ?? buildToolsPath)(project);
-					notes = [...aptLines, ...toolLines, ...pipLines]
-						.map((l) => `${l}\n`)
-						.join("");
-				} catch (err) {
-					const stderrTail = `${err instanceof Error ? err.message : String(err)}\n`;
-					return new Response(
-						`${JSON.stringify({ [WORKER_DONE]: { exitCode: 1, stderrTail } })}\n`,
-						{ headers: { "content-type": "text/plain; charset=utf-8" } },
-					);
+					controller.close();
+				} catch {
+					// already gone
 				}
-				// The client gave up during the install: spawning now would orphan the run.
-				if (request.signal.aborted)
-					return new Response("aborted", { status: 499 });
-			}
-
-			// The worker's own token drives every worker, and the container env can hold a git
-			// host token (an operator's GH_TOKEN): a turn inherits neither, from the container
-			// or the request. Push credentials stay on the server (D6).
-			const env: Record<string, string | undefined> = {
-				...process.env,
-				...body.env,
 			};
-			stripGitAuthEnv(env);
-			// OTTR-693: the board strips GIT_CONFIG_GLOBAL from the dispatched env (the
-			// pointer names a file only the server mounts); this side deletes whatever the
-			// worker container itself carries, so the turn's git never swaps the shared
-			// home's ~/.gitconfig for a file that does not exist here.
-			delete env.GIT_CONFIG_GLOBAL;
-			delete env.OTTR_WORKER_TOKEN;
-			// Same strip as childEnv on the server: no turn ever needs the alate key.
-			delete env.ALATE_API_KEY;
-			// Same strip as childEnv on the server: the container env can carry a
-			// corporate proxy URL with credentials; a turn keeps host and port only.
-			stripProxyCredentials(env);
-			// The provision guard's untracked scan compares against the rules dir as it
-			// stood before omp started (docs/specs/turn-provision-guard.md).
-			const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
-			let child: ChildProcess;
-			// The tools link dir is per tool set: project pins, then _all pins, then the container
-			// PATH. The daemon's own PATH never changes, and two projects never see each
-			// other's pins because the dir is keyed by the project's own tool set.
-			if (pathDir) env.PATH = `${pathDir}:${String(env.PATH ?? "")}`;
-			try {
-				child = spawn(opts.ompPath ?? "omp", body.argv, {
-					cwd: body.cwd,
-					env,
-					stdio: ["pipe", "pipe", "pipe"],
-					windowsHide: true,
-				});
-			} catch (err) {
-				return new Response(`spawn failed: ${String(err)}`, { status: 500 });
-			}
-			const forgetChild = (): void => {
-				if (child.pid !== undefined) runChildren.delete(child.pid);
+			// Lines omp wrote before the kill still drain from the pipe after the client
+			// left; a push into the gone stream throws from an event handler, which crashes
+			// this daemon (no crash trap) and every turn it runs.
+			const push = (text: string): void => {
+				if (state.closed) return;
+				try {
+					controller.enqueue(enc.encode(text));
+				} catch {
+					state.closed = true; // the stream ended without cancel(): nobody reads omp now
+					args.killTree();
+				}
 			};
-			// A spawn error never fires "close", so forget here too.
-			child.on("error", forgetChild);
-			if (child.pid !== undefined) runChildren.add(child.pid);
-			const entry: ActiveRun = {
-				id: body.id,
-				cwd: body.cwd,
-				pid: child.pid ?? null,
-				running: true,
-				startedAt: Date.now(),
-				detached: false,
-				closeStream: (): void => {},
-			};
-			active.set(entry.id, entry);
-			const forgetEntry = (): void => {
-				if (active.get(entry.id) === entry) active.delete(entry.id);
-			};
-			const killTree = (): void => {
-				// Detach releases the client on purpose: nothing on the dead request may kill
-				// the child afterwards, and the push helper's closed path lands here too.
-				if (entry.detached) return;
-				if (child.pid !== undefined) platform.killTree(child.pid);
-			};
-			// stderrTail stays reserved for omp's stderr: classify's no-stderr death rules
-			// (provider rejection, dispatch context) need an empty tail to fire. The apt
-			// install notes ride the stream as plain stdout lines instead.
-			let stderrTail = "";
-			child.stderr?.on("data", (chunk: Buffer) => {
-				stderrTail = `${stderrTail}${chunk.toString("utf8")}`
-					.replace(/\r\n/g, "\n")
-					.slice(-4000);
-			});
-			child.on("error", (err: Error) => {
-				forgetEntry();
-				stderrTail = `${stderrTail}${err.message}\n`
-					.replace(/\r\n/g, "\n")
-					.slice(-4000);
-			});
-
-			const enc = new TextEncoder();
-			let closed = false;
-			let stopWatch = (): void => {};
-			const stream = new ReadableStream({
-				start(controller) {
-					entry.closeStream = (): void => {
-						if (closed) return;
-						closed = true;
-						stopWatch();
-						try {
-							controller.close();
-						} catch {
-							// already gone
-						}
-					};
-					// Lines omp wrote before the kill still drain from the pipe after the client
-					// left; a push into the gone stream throws from an event handler, which crashes
-					// this daemon (no crash trap) and every turn it runs.
-					const push = (text: string): void => {
-						if (closed) return;
-						try {
-							controller.enqueue(enc.encode(text));
-						} catch {
-							closed = true; // the stream ended without cancel(): nobody reads omp now
-							killTree();
-						}
-					};
-					// The install notes lead the stream as plain lines: the client logs non-JSON
-					// lines verbatim, and omp's stderr tail stays clean for classify's rules.
-					if (notes) push(notes);
-					// Stryker progress rides the stream as one more event line (stryker.ts).
-					stopWatch = watchProgress(child.pid, push);
-					let partial = "";
-					child.stdout?.on("data", (chunk: Buffer) => {
-						partial += chunk.toString("utf8");
-						let idx = partial.indexOf("\n");
-						while (idx >= 0) {
-							push(partial.slice(0, idx + 1));
-							partial = partial.slice(idx + 1);
-							idx = partial.indexOf("\n");
-						}
-					});
-					// omp may die before reading stdin; a bare write would then crash us.
-					child.stdin?.on("error", () => {});
-					child.stdin?.write(body.stdin, "utf8");
-					child.stdin?.end();
-					child.on("close", (code) => {
-						stopWatch();
-						forgetChild();
-						forgetEntry();
-						// The provision guard audits this container's shared home once the run's
-						// writes are final (docs/specs/turn-provision-guard.md); drift rides the
-						// result, and classify parks the turn.
-						const provisionDrift =
-							opts.auditProvisioned?.(entry.startedAt, rulesAtStart) ?? [];
-						const driftField = provisionDrift.length
-							? { provisionDrift: [...provisionDrift] }
-							: {};
-						if (entry.detached) {
-							// No client listens any more: the result waits in /detached for boot
-							// recovery instead of a sentinel on a gone stream.
-							entry.running = false;
-							entry.result = {
-								exitCode: code ?? null,
-								stderrTail,
-								...driftField,
-							};
-							return;
-						}
-						if (partial.length > 0) push(`${partial}\n`);
-						push(
-							`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail, host: hostname(), ...driftField } })}\n`,
-						);
-						if (!closed) controller.close(); // else the client aborted; the stream is gone
-					});
-				},
-				cancel() {
-					closed = true;
-					stopWatch();
-					killTree();
-				},
-			});
-			request.signal.addEventListener("abort", killTree);
-			return new Response(stream, {
-				headers: { "content-type": "text/plain; charset=utf-8" },
-			});
+			// The install notes lead the stream as plain lines: the client logs non-JSON
+			// lines verbatim, and omp's stderr tail stays clean for classify's rules.
+			if (args.notes) push(args.notes);
+			// Stryker progress rides the stream as one more event line (stryker.ts).
+			state.stopWatch = watchProgress(args.child.pid, push);
+			args.child.stdout?.on("data", (chunk: Buffer) =>
+				pushLines(state, chunk, push),
+			);
+			// omp may die before reading stdin; a bare write would then crash us.
+			args.child.stdin?.on("error", () => {});
+			args.child.stdin?.write(args.stdin, "utf8");
+			args.child.stdin?.end();
+			args.child.on("close", (code) =>
+				finishRun(args, code, push, () => {
+					if (!state.closed) controller.close(); // else the client aborted; the stream is gone
+				}),
+			);
+		},
+		cancel() {
+			state.closed = true;
+			state.stopWatch();
+			args.killTree();
 		},
 	});
 }
@@ -598,7 +730,128 @@ function vmOutcome(v: VmOutcome): VmOutcome {
 /** Round-robin over the target's urls; shared by runWorker and the dispatch log line. */
 let rr = 0;
 function nextUrl(target: WorkerTarget): string {
-	return target.urls[rr++ % target.urls.length]!;
+	const url = target.urls[rr % target.urls.length];
+	rr += 1;
+	if (url !== undefined) return url;
+	return "";
+}
+
+/** POSTs the run request; maps the busy and non-200 answers to the worker errors. */
+async function dispatchRun(
+	url: string,
+	req: WorkerRequest,
+	target: WorkerTarget,
+	controller: AbortController,
+): Promise<Response> {
+	const res = await fetch(`${url}/run`, {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			...(target.token ? { "x-otwr-token": target.token } : {}),
+		},
+		body: JSON.stringify(req),
+		signal: controller.signal,
+		// redirect: "manual": the worker token must never follow a redirect
+		// off-host; a 3xx answer fails the dispatch like any non-200.
+		redirect: "manual",
+		// The daemon never idles out (idleTimeout 0); a silent turn (a quiet build,
+		// hidden reasoning) must not trip Bun's default 5-minute client idle timer.
+		timeout: false,
+	});
+	if (res.status === 503 && res.headers.get("x-ottr-busy") === "1") {
+		await res.body?.cancel();
+		throw new WorkerBusyError(`worker ${url} is busy`);
+	}
+	if (res.status !== 200) {
+		// The daemon's 500 body ("spawn failed: ...") is the real cause; surface it
+		// instead of only the status. ponytail: capped, the body is one error line.
+		const redirected = res.status >= 300 && res.status < 400;
+		const body = (await res.text()).trim().slice(0, 300);
+		throw new WorkerConnectError(
+			`worker ${url} responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
+		);
+	}
+	return res;
+}
+
+/** Settles the run from the done sentinel: the stderr lines, then the sink's result. */
+function settleSentinel(
+	sentinel: NonNullable<ReturnType<typeof parseSentinel>>,
+	sink: RunSink,
+	url: string,
+	finish: (r: RunResult) => void,
+): void {
+	for (const l of sentinel.stderrTail.split("\n"))
+		if (l.trim()) sink.stderrLine(l);
+	finish(
+		sink.result({
+			exitCode: sentinel.exitCode,
+			killed: false,
+			stderrTail: sentinel.stderrTail,
+			...(typeof sentinel.host === "string" && sentinel.host !== ""
+				? {
+						ranOn: `worker ${new URL(url).hostname} (${sentinel.host})`,
+					}
+				: {}),
+			...(sentinel.vm ? { vm: sentinel.vm } : {}),
+			...(sentinel.provisionDrift
+				? { provisionDrift: sentinel.provisionDrift }
+				: {}),
+		}),
+	);
+}
+
+/** Reads the worker's stream to its done sentinel and settles the run; a stream that dies
+ * first aborts the request (so the daemon kills omp) and settles as a lost connection. */
+async function consumeRun(
+	url: string,
+	res: Response,
+	controller: AbortController,
+	sink: RunSink,
+	finish: (r: RunResult) => void,
+	settled: () => boolean,
+): Promise<void> {
+	const body = res.body;
+	if (body === null) throw new Error(`worker ${url} answered 200 with no body`);
+	const reader = body.getReader();
+	const dec = new TextDecoder();
+	let partial = "";
+	let lost: string | undefined;
+	try {
+		for (;;) {
+			const { done: ended, value } = await reader.read();
+			if (ended) break;
+			partial += dec.decode(value, { stream: true });
+			let idx = partial.indexOf("\n");
+			while (idx >= 0) {
+				const line = partial.slice(0, idx);
+				partial = partial.slice(idx + 1);
+				const sentinel = parseSentinel(line);
+				if (sentinel) {
+					settleSentinel(sentinel, sink, url, finish);
+					return;
+				}
+				sink.line(line);
+				idx = partial.indexOf("\n");
+			}
+		}
+	} catch (err) {
+		// Keep the cause: the tail names why the stream died (idle timer, reset, ...).
+		lost = err instanceof Error ? err.message : String(err);
+	}
+	if (partial.trim()) sink.line(partial);
+	if (settled()) return;
+	// Gone without a sentinel: cancel the request so the daemon kills omp instead of
+	// running a turn whose client left (also covers a throw inside the read loop).
+	controller.abort();
+	finish(
+		sink.result({
+			exitCode: null,
+			killed: false,
+			stderrTail: `${sink.tail()}\nworker connection lost${lost ? `: ${lost}` : ""}`,
+			workerLost: true,
+		}),
+	);
 }
 
 export function runWorker(
@@ -641,34 +894,7 @@ export function runWorker(
 	(async () => {
 		let res: Response;
 		try {
-			res = await fetch(url + "/run", {
-				method: "POST",
-				headers: {
-					"content-type": "application/json",
-					...(target.token ? { "x-otwr-token": target.token } : {}),
-				},
-				body: JSON.stringify(req),
-				signal: controller.signal,
-				// redirect: "manual": the worker token must never follow a redirect
-				// off-host; a 3xx answer fails the dispatch like any non-200.
-				redirect: "manual",
-				// The daemon never idles out (idleTimeout 0); a silent turn (a quiet build,
-				// hidden reasoning) must not trip Bun's default 5-minute client idle timer.
-				timeout: false,
-			});
-			if (res.status === 503 && res.headers.get("x-ottr-busy") === "1") {
-				await res.body?.cancel();
-				throw new WorkerBusyError(`worker ${url} is busy`);
-			}
-			if (res.status !== 200) {
-				// The daemon's 500 body ("spawn failed: ...") is the real cause; surface it
-				// instead of only the status. ponytail: capped, the body is one error line.
-				const redirected = res.status >= 300 && res.status < 400;
-				const body = (await res.text()).trim().slice(0, 300);
-				throw new WorkerConnectError(
-					`worker ${url} responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
-				);
-			}
+			res = await dispatchRun(url, req, target, controller);
 		} catch (err) {
 			if (controller.signal.aborted) return; // kill() already settled
 			fail(
@@ -680,62 +906,7 @@ export function runWorker(
 		}
 		resolveAccepted(true);
 
-		const reader = res.body!.getReader();
-		const dec = new TextDecoder();
-		let partial = "";
-		let lost: string | undefined;
-		try {
-			for (;;) {
-				const { done: ended, value } = await reader.read();
-				if (ended) break;
-				partial += dec.decode(value, { stream: true });
-				let idx = partial.indexOf("\n");
-				while (idx >= 0) {
-					const line = partial.slice(0, idx);
-					partial = partial.slice(idx + 1);
-					const sentinel = parseSentinel(line);
-					if (sentinel) {
-						for (const l of sentinel.stderrTail.split("\n"))
-							if (l.trim()) sink.stderrLine(l);
-						finish(
-							sink.result({
-								exitCode: sentinel.exitCode,
-								killed: false,
-								stderrTail: sentinel.stderrTail,
-								...(typeof sentinel.host === "string" && sentinel.host !== ""
-									? {
-											ranOn: `worker ${new URL(url).hostname} (${sentinel.host})`,
-										}
-									: {}),
-								...(sentinel.vm ? { vm: sentinel.vm } : {}),
-								...(sentinel.provisionDrift
-									? { provisionDrift: sentinel.provisionDrift }
-									: {}),
-							}),
-						);
-						return;
-					}
-					sink.line(line);
-					idx = partial.indexOf("\n");
-				}
-			}
-		} catch (err) {
-			// Keep the cause: the tail names why the stream died (idle timer, reset, ...).
-			lost = err instanceof Error ? err.message : String(err);
-		}
-		if (partial.trim()) sink.line(partial);
-		if (settled) return;
-		// Gone without a sentinel: cancel the request so the daemon kills omp instead of
-		// running a turn whose client left (also covers a throw inside the read loop).
-		controller.abort();
-		finish(
-			sink.result({
-				exitCode: null,
-				killed: false,
-				stderrTail: `${sink.tail()}\nworker connection lost${lost ? `: ${lost}` : ""}`,
-				workerLost: true,
-			}),
-		);
+		await consumeRun(url, res, controller, sink, finish, () => settled);
 	})().catch(fail);
 
 	return {
@@ -783,11 +954,112 @@ export function matchSweepTarget(
 		const wt = segments.indexOf(".worktrees");
 		if (wt <= 0 || wt + 1 >= segments.length) continue;
 		const project = segments.slice(0, wt).join("/");
-		const cardId = segments[wt + 1]!;
-		if (project === "" || cardId === "") continue;
+		const cardId = segments[wt + 1];
+		if (project === "" || cardId === undefined || cardId === "") continue;
 		return { project, cardId };
 	}
 	return null;
+}
+
+/** One /proc snapshot of pid → parent: unreadable stat or an exited pid is skipped. */
+function procParents(procRoot: string): Map<number, number> {
+	const ppid = new Map<number, number>();
+	for (const name of readdirSync(procRoot)) {
+		const pid = Number(name);
+		if (!Number.isInteger(pid) || pid <= 0) continue;
+		try {
+			const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
+			// comm can hold spaces and parens: fields start after the last ")".
+			const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+			const parent = Number(after[1]);
+			if (Number.isInteger(parent)) ppid.set(pid, parent);
+		} catch {
+			// exited between readdir and stat
+		}
+	}
+	return ppid;
+}
+
+/** The keep roots plus every descendant, via BFS over the ppid snapshot. */
+function keepTrees(
+	ppid: Map<number, number>,
+	keepPids: Iterable<number>,
+): Set<number> {
+	const keep = new Set<number>();
+	const queue = [...keepPids];
+	while (queue.length > 0) {
+		const pid = queue.pop();
+		if (pid === undefined) break;
+		if (keep.has(pid)) continue;
+		keep.add(pid);
+		for (const [child, parent] of ppid)
+			if (parent === pid && !keep.has(child)) queue.push(child);
+	}
+	return keep;
+}
+
+/** Full argv joined with single spaces, "" when unreadable. */
+function pidCommand(procRoot: string, pid: number): string {
+	try {
+		return readFileSync(`${procRoot}/${pid}/cmdline`, "utf8")
+			.split("\0")
+			.filter((seg) => seg !== "")
+			.join(" ");
+	} catch {
+		return "";
+	}
+}
+
+/** The processes whose cwd is a deleted worktree under the roots; kept pids are never targets. */
+function sweepTargets(
+	roots: readonly string[],
+	procRoot: string,
+	keep: Set<number>,
+): SweptProcess[] {
+	const targets: SweptProcess[] = [];
+	for (const name of readdirSync(procRoot)) {
+		const pid = Number(name);
+		if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+		if (keep.has(pid)) continue; // a live /run child (or its tree) is not a leftover
+		let cwdLink: string;
+		try {
+			cwdLink = readlinkSync(`${procRoot}/${pid}/cwd`);
+		} catch {
+			continue; // exited, zombie, or permission denied
+		}
+		const match = matchSweepTarget(cwdLink, roots);
+		if (match === null) continue;
+		targets.push({ pid, command: pidCommand(procRoot, pid), ...match });
+	}
+	return targets;
+}
+
+/** SIGTERM first, then SIGKILL after the grace period for anything still alive. */
+async function stopTargets(
+	targets: SweptProcess[],
+	kill: typeof process.kill,
+	graceMs: number,
+): Promise<SweptProcess[]> {
+	const stopped: SweptProcess[] = [];
+	for (const target of targets) {
+		try {
+			kill(target.pid, "SIGTERM");
+		} catch {
+			continue; // ESRCH: already gone
+		}
+		stopped.push(target);
+	}
+	if (stopped.length > 0) await Bun.sleep(graceMs);
+	for (const target of stopped) {
+		try {
+			// Signal 0: existence probe. ESRCH here means the process took the TERM.
+			kill(target.pid, 0);
+			kill(target.pid, "SIGKILL");
+		} catch {
+			// already exited between the check and the kill
+		}
+	}
+	return stopped;
 }
 
 /**
@@ -819,71 +1091,9 @@ async function sweepLeftovers(opts?: {
 	// One /proc snapshot of the parent links; the kept set is the keep roots plus
 	// every descendant (BFS over ppid). A process that forks after the snapshot is
 	// swept at the next tick, same known gap killTree has.
-	const ppid = new Map<number, number>();
-	for (const name of readdirSync(procRoot)) {
-		const pid = Number(name);
-		if (!Number.isInteger(pid) || pid <= 0) continue;
-		try {
-			const stat = readFileSync(`${procRoot}/${pid}/stat`, "utf8");
-			// comm can hold spaces and parens: fields start after the last ")".
-			const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-			const parent = Number(after[1]);
-			if (Number.isInteger(parent)) ppid.set(pid, parent);
-		} catch {
-			// exited between readdir and stat
-		}
-	}
-	const keep = new Set<number>();
-	const queue = [...(opts?.keepPids ?? [])];
-	while (queue.length > 0) {
-		const pid = queue.pop()!;
-		if (keep.has(pid)) continue;
-		keep.add(pid);
-		for (const [child, parent] of ppid)
-			if (parent === pid && !keep.has(child)) queue.push(child);
-	}
-	const targets: SweptProcess[] = [];
-	for (const name of readdirSync(procRoot)) {
-		const pid = Number(name);
-		if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-		if (keep.has(pid)) continue; // a live /run child (or its tree) is not a leftover
-		let cwdLink: string;
-		try {
-			cwdLink = readlinkSync(`${procRoot}/${pid}/cwd`);
-		} catch {
-			continue; // exited, zombie, or permission denied
-		}
-		const match = matchSweepTarget(cwdLink, roots);
-		if (!match) continue;
-		let command = "";
-		try {
-			command = readFileSync(`${procRoot}/${pid}/cmdline`, "utf8")
-				.split("\0")
-				.filter((seg) => seg !== "")
-				.join(" ");
-		} catch {}
-		targets.push({ pid, command, ...match });
-	}
-	const stopped: SweptProcess[] = [];
-	for (const target of targets) {
-		try {
-			kill(target.pid, "SIGTERM");
-		} catch {
-			continue; // ESRCH: already gone
-		}
-		stopped.push(target);
-	}
-	if (stopped.length > 0) await Bun.sleep(graceMs);
-	for (const target of stopped) {
-		try {
-			// Signal 0: existence probe. ESRCH here means the process took the TERM.
-			kill(target.pid, 0);
-			kill(target.pid, "SIGKILL");
-		} catch {
-			// already exited between the check and the kill
-		}
-	}
-	return stopped;
+	const keep = keepTrees(procParents(procRoot), opts?.keepPids ?? []);
+	const targets = sweepTargets(roots, procRoot, keep);
+	return stopTargets(targets, kill, graceMs);
 }
 
 /** POST /sweep to a worker: kills the processes whose worktree is gone on that host. */

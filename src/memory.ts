@@ -68,45 +68,52 @@ export type MemoryHealth = {
 	checkedAt: string;
 };
 
+type MemoryHealthOpts = {
+	home?: string;
+	boardHome?: string | null;
+	fetchImpl?: typeof fetch;
+	now?: () => number;
+};
+
 /** Probe file for the mnemopi store; deleted right after a successful write. */
 const MNEMOPI_PROBE = "ottr-memory-health-probe";
 
-export async function checkMemoryHealth(
-	choice: MemoryChoice,
-	opts?: {
-		home?: string;
-		boardHome?: string | null;
-		fetchImpl?: typeof fetch;
-		now?: () => number;
-	},
+async function hindsightHealth(
+	choice: Extract<MemoryChoice, { backend: "hindsight" }>,
+	opts: MemoryHealthOpts | undefined,
+	checkedAt: string,
 ): Promise<MemoryHealth> {
-	const checkedAt = new Date((opts?.now ?? Date.now)()).toISOString();
-	if (choice.backend === "hindsight") {
-		const doFetch = opts?.fetchImpl ?? fetch;
-		try {
-			const res = await doFetch(`${choice.url}/v1/default/banks`, {
-				headers: { authorization: `Bearer ${choice.token}` },
-				// A hung Hindsight must not hold the health tick forever.
-				signal: AbortSignal.timeout(5000),
-			});
-			if (res.ok)
-				return { backend: choice.backend, ok: true, reason: null, checkedAt };
-			// Never name the token in a reason: the reason lands in the state frame's warnings.
-			const reason =
-				res.status === 401 || res.status === 403
-					? `Hindsight at ${choice.url} rejected the key (HTTP ${res.status})`
-					: `Hindsight at ${choice.url} answered HTTP ${res.status}`;
-			return { backend: choice.backend, ok: false, reason, checkedAt };
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return {
-				backend: choice.backend,
-				ok: false,
-				reason: `Hindsight at ${choice.url} did not answer: ${message}`,
-				checkedAt,
-			};
-		}
+	const doFetch = opts?.fetchImpl ?? fetch;
+	try {
+		const res = await doFetch(`${choice.url}/v1/default/banks`, {
+			headers: { authorization: `Bearer ${choice.token}` },
+			// A hung Hindsight must not hold the health tick forever.
+			signal: AbortSignal.timeout(5000),
+		});
+		if (res.ok)
+			return { backend: choice.backend, ok: true, reason: null, checkedAt };
+		// Never name the token in a reason: the reason lands in the state frame's warnings.
+		const reason =
+			res.status === 401 || res.status === 403
+				? `Hindsight at ${choice.url} rejected the key (HTTP ${res.status})`
+				: `Hindsight at ${choice.url} answered HTTP ${res.status}`;
+		return { backend: choice.backend, ok: false, reason, checkedAt };
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return {
+			backend: choice.backend,
+			ok: false,
+			reason: `Hindsight at ${choice.url} did not answer: ${message}`,
+			checkedAt,
+		};
 	}
+}
+
+async function mnemopiHealth(
+	choice: Extract<MemoryChoice, { backend: "mnemopi" }>,
+	opts: MemoryHealthOpts | undefined,
+	checkedAt: string,
+): Promise<MemoryHealth> {
 	const homes = [opts?.home ?? process.env.HOME ?? homedir()];
 	// The production tick passes no opts: the board home comes from the env then
 	// (docs/specs/memory-backend.md). null opts out explicitly.
@@ -134,4 +141,14 @@ export async function checkMemoryHealth(
 		}
 	}
 	return { backend: choice.backend, ok: true, reason: null, checkedAt };
+}
+
+export async function checkMemoryHealth(
+	choice: MemoryChoice,
+	opts?: MemoryHealthOpts,
+): Promise<MemoryHealth> {
+	const checkedAt = new Date((opts?.now ?? Date.now)()).toISOString();
+	if (choice.backend === "hindsight")
+		return hindsightHealth(choice, opts, checkedAt);
+	return mnemopiHealth(choice, opts, checkedAt);
 }

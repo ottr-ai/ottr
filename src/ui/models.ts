@@ -323,35 +323,42 @@ export type ModelRow = {
 	heading?: string;
 };
 
-/** Picker list data: the models omp roles use first, model first with its roles in braces
-    (e.g. "zai/glm-5.3-flash (plan, smol)"), one row per model even when several roles share it;
-    a divider; then the catalog grouped under provider headings — groups alphabetical, models
-    alphabetical inside each group, filtered by `query` with modelMatches. The first row runs
-    on omp's default model (empty selector, so the task follows a later default change); roles
-    that share the default model join that row. Role labels always resolve against the full
-    `models` catalog, so a role row keeps its display name while the search hides its model. */
-export function modelRows(
-	models: readonly ModelOption[],
+/** Role names sorted, grouped by the selector each role pins. */
+function selectorRoles(
 	roles: Record<string, string> | null,
-	selected: string,
-	query: string,
-): ModelRow[] {
-	const q = query.trim().toLowerCase();
-	const [selBase] = splitLevel(selected);
+): Map<string, string[]> {
 	const bySelector = new Map<string, string[]>();
 	for (const [r, s] of Object.entries(roles ?? {}).sort(([a], [b]) =>
 		a.localeCompare(b),
 	))
 		bySelector.set(s, [...(bySelector.get(s) ?? []), r]);
-	const def = roles?.default;
-	const defRoles =
-		def === undefined
-			? []
-			: [
-					"default",
-					...(bySelector.get(def) ?? []).filter((r) => r !== "default"),
-				];
-	const roleRows = [...bySelector]
+	return bySelector;
+}
+
+/** The role names that share the default model: the literal "default" first, then the
+    others, in bySelector's order. */
+function defaultRoles(
+	bySelector: Map<string, string[]>,
+	def: string | undefined,
+): string[] {
+	return def === undefined
+		? []
+		: [
+				"default",
+				...(bySelector.get(def) ?? []).filter((r) => r !== "default"),
+			];
+}
+
+/** One row per role selector that is not the default model and matches `q`: the display
+    name plus the roles in braces, sorted by selector. */
+function roleRows(
+	models: readonly ModelOption[],
+	bySelector: Map<string, string[]>,
+	def: string | undefined,
+	selBase: string,
+	q: string,
+): ModelRow[] {
+	return [...bySelector]
 		.filter(
 			([s, rs]) =>
 				s !== def &&
@@ -368,10 +375,18 @@ export function modelRows(
 				pressed: splitLevel(s)[0] === selBase,
 			}),
 		);
-	// Catalog grouped by provider (the selector part before "/", the whole selector as
-	// the fallback for a selector without a slash): groups alphabetical, models
-	// alphabetical inside each group, the first row of each group carries the provider
-	// heading, and the section's first row keeps the roles divider.
+}
+
+/** Catalog rows: `models` matching `query`, grouped by provider (the selector part
+    before "/", the whole selector as the fallback for a selector without a slash):
+    groups alphabetical, models alphabetical inside each group, the first row of each
+    group carries the provider heading, and the section's first row keeps the roles
+    divider. */
+function catalogRows(
+	models: readonly ModelOption[],
+	query: string,
+	selBase: string,
+): ModelRow[] {
 	const grouped = new Map<string, ModelRow[]>();
 	for (const m of [...models]
 		.filter((m) => modelMatches(m, query))
@@ -403,18 +418,38 @@ export function modelRows(
 		}
 		first = false;
 	}
+	return catalog;
+}
+
+/** Picker list data: the models omp roles use first, model first with its roles in braces
+    (e.g. "zai/glm-5.3-flash (plan, smol)"), one row per model even when several roles share it;
+    a divider; then the catalog grouped under provider headings — groups alphabetical, models
+    alphabetical inside each group, filtered by `query` with modelMatches. The first row runs
+    on omp's default model (empty selector, so the task follows a later default change); roles
+    that share the default model join that row. Role labels always resolve against the full
+    `models` catalog, so a role row keeps its display name while the search hides its model. */
+export function modelRows(
+	models: readonly ModelOption[],
+	roles: Record<string, string> | null,
+	selected: string,
+	query: string,
+): ModelRow[] {
+	const q = query.trim().toLowerCase();
+	const [selBase] = splitLevel(selected);
+	const bySelector = selectorRoles(roles);
+	const def = roles?.default;
 	return [
 		{
 			key: "role-default",
 			label:
 				def === undefined
 					? "Default"
-					: `${roleModelLabel(models, def)} (${defRoles.join(", ")})`,
+					: `${roleModelLabel(models, def)} (${defaultRoles(bySelector, def).join(", ")})`,
 			selector: "",
 			pressed: selected === "",
 		},
-		...roleRows,
-		...catalog,
+		...roleRows(models, bySelector, def, selBase, q),
+		...catalogRows(models, query, selBase),
 	];
 }
 

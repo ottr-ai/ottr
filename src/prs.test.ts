@@ -79,6 +79,74 @@ const ghComment = (author: string, date: string, body: string) => ({
 	body,
 });
 
+/** One GitHub API response, as GhFn resolves it. */
+interface FakeGhOut {
+	code: number;
+	stdout: string;
+	stderr: string;
+}
+
+/** The fake GitHub's mutable data; tests rewrite it through setup's setters. */
+interface FakeGhState {
+	open: { number: number; head: { sha: string } }[];
+	closed: Map<number, unknown>;
+	/** Diff overrides by PR number; others get a small default diff. */
+	diffs: Map<number, string>;
+	/** A PR whose head moves between the list call and the review's read. */
+	movedTo: string | null;
+	/** Re-review opt-ins: the posted reviews, the two comment sources, and the compare diff. */
+	reviews: unknown[];
+	reviewComments: unknown[];
+	issueComments: unknown[];
+	/** When set, the issues-comments branch serves one list per page (oldest first), like GitHub. */
+	issueCommentPages: unknown[][];
+	pullComments: unknown[];
+	/** null makes the compare GET fail, like a force-pushed branch on GitHub. */
+	compare: string | null;
+}
+
+const ghJson = (body: unknown): FakeGhOut => ({
+	code: 0,
+	stdout: JSON.stringify(body),
+	stderr: "",
+});
+
+/** One pull's GET body: a live PR's movable head, else the closed map's entry, else {}. */
+function pullRoute(state: FakeGhState, n: number): FakeGhOut {
+	const live = state.open.find((p) => p.number === n);
+	const body = live
+		? {
+				...live,
+				head: { sha: state.movedTo ?? live.head.sha },
+				body: "Please merge.",
+			}
+		: (state.closed.get(n) ?? {});
+	return ghJson(body);
+}
+
+/** The re-review reads: the posted reviews, the review's comments, both comment sources, and
+ * the compare diff. null falls through to the open-pull list. */
+function reviewRoute(state: FakeGhState, path: string): FakeGhOut | null {
+	if (/\/reviews\/\d+\/comments/.test(path))
+		return ghJson(state.reviewComments);
+	if (path.includes("/reviews")) return ghJson(state.reviews);
+	if (path.includes("/issues/") && path.includes("/comments")) {
+		const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+		const list =
+			state.issueCommentPages.length > 0
+				? (state.issueCommentPages[page - 1] ?? [])
+				: state.issueComments;
+		return ghJson(list);
+	}
+	if (path.includes("/comments")) return ghJson(state.pullComments);
+	if (path.includes("/compare/")) {
+		if (state.compare === null)
+			return { code: 1, stdout: "", stderr: "HTTP 404" };
+		return ghJson(state.compare);
+	}
+	return null;
+}
+
 function setup(
 	opts: { on?: boolean; github?: string | null; spawn?: SpawnFn } = {},
 ) {
@@ -86,27 +154,24 @@ function setup(
 	mkdirSync(dir, { recursive: true });
 	const store = ProjectStore.init(dir);
 	store.setSettings({ prReviews: opts.on ?? true });
-	let open: { number: number; head: { sha: string } }[] = [];
-	const closed = new Map<number, unknown>();
+	const state: FakeGhState = {
+		open: [],
+		closed: new Map(),
+		diffs: new Map(),
+		movedTo: null,
+		reviews: [],
+		reviewComments: [],
+		issueComments: [],
+		issueCommentPages: [],
+		pullComments: [],
+		compare: null,
+	};
 	const calls: string[] = [];
 	let fail = false;
 	let reviewFail = false;
-	/** A PR whose head moves between the list call and the review's read. */
-	let movedTo: string | null = null;
-	/** Diff overrides by PR number; others get a small default diff. */
-	const diffs = new Map<number, string>();
-	/** Re-review opt-ins: the posted reviews, the two comment sources, and the compare diff. */
-	let reviews: unknown[] = [];
-	let issueComments: unknown[] = [];
-	/** When set, the issues-comments branch serves one list per page (oldest first), like GitHub. */
-	let issueCommentPages: unknown[][] = [];
-	let pullComments: unknown[] = [];
-	/** The inline comments of a posted review (`reviews/<id>/comments`). */
-	let reviewComments: unknown[] = [];
+
 	/** The model's answer; null gives the numbered default. */
 	let answer: string | null = null;
-	/** null makes the compare GET fail, like a force-pushed branch on GitHub. */
-	let compare: string | null = null;
 	const logs: string[] = [];
 	const prompts: string[] = [];
 	/** Card ids the watcher un-read on a re-review (the board's seen-set drop). */
@@ -120,40 +185,13 @@ function setup(
 		if (m && args.includes("-H"))
 			return {
 				code: 0,
-				stdout: diffs.get(Number(m[1])) ?? `diff --git a/x b/x\n+pr ${m[1]}\n`,
+				stdout:
+					state.diffs.get(Number(m[1])) ?? `diff --git a/x b/x\n+pr ${m[1]}\n`,
 				stderr: "",
 			};
-		if (m) {
-			const n = Number(m[1]);
-			const live = open.find((p) => p.number === n);
-			const body = live
-				? {
-						...live,
-						head: { sha: movedTo ?? live.head.sha },
-						body: "Please merge.",
-					}
-				: (closed.get(n) ?? {});
-			return { code: 0, stdout: JSON.stringify(body), stderr: "" };
-		}
-		if (/\/reviews\/\d+\/comments/.test(path))
-			return { code: 0, stdout: JSON.stringify(reviewComments), stderr: "" };
-		if (path.includes("/reviews"))
-			return { code: 0, stdout: JSON.stringify(reviews), stderr: "" };
-		if (path.includes("/issues/") && path.includes("/comments")) {
-			const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
-			const list =
-				issueCommentPages.length > 0
-					? (issueCommentPages[page - 1] ?? [])
-					: issueComments;
-			return { code: 0, stdout: JSON.stringify(list), stderr: "" };
-		}
-		if (path.includes("/comments"))
-			return { code: 0, stdout: JSON.stringify(pullComments), stderr: "" };
-		if (path.includes("/compare/")) {
-			if (compare === null) return { code: 1, stdout: "", stderr: "HTTP 404" };
-			return { code: 0, stdout: compare, stderr: "" };
-		}
-		return { code: 0, stdout: JSON.stringify(open), stderr: "" };
+		if (m) return pullRoute(state, Number(m[1]));
+		const routed = reviewRoute(state, path);
+		return routed ?? ghJson(state.open);
 	};
 	const watcher = createPrWatcher({
 		projects: () => [
@@ -184,10 +222,10 @@ function setup(
 		logs,
 		prompts,
 		forgotten,
-		closed,
-		diffs,
+		closed: state.closed,
+		diffs: state.diffs,
 		setOpen: (v: { number: number; head: { sha: string } }[]) => {
-			open = v;
+			state.open = v;
 		},
 		setFail: (v: boolean) => {
 			fail = v;
@@ -196,28 +234,28 @@ function setup(
 			reviewFail = v;
 		},
 		setMovedTo: (v: string | null) => {
-			movedTo = v;
+			state.movedTo = v;
 		},
 		setReviews: (v: unknown[]) => {
-			reviews = v;
+			state.reviews = v;
 		},
 		setIssueComments: (v: unknown[]) => {
-			issueComments = v;
+			state.issueComments = v;
 		},
 		setIssueCommentPages: (v: unknown[][]) => {
-			issueCommentPages = v;
+			state.issueCommentPages = v;
 		},
 		setPullComments: (v: unknown[]) => {
-			pullComments = v;
+			state.pullComments = v;
 		},
 		setReviewComments: (v: unknown[]) => {
-			reviewComments = v;
+			state.reviewComments = v;
 		},
 		setAnswer: (v: string | null) => {
 			answer = v;
 		},
 		setCompare: (v: string | null) => {
-			compare = v;
+			state.compare = v;
 		},
 		advance: (ms: number) => {
 			t += ms;

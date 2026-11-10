@@ -19,23 +19,29 @@ export interface PushSub {
 	classes: ClassPrefs;
 }
 
+/** One stored sub entry; null when the shape is unusable. */
+function parseSub(s: unknown): PushSub | null {
+	if (typeof s !== "object" || s === null) return null;
+	if (!("endpoint" in s) || typeof s.endpoint !== "string") return null;
+	if (!("keys" in s) || typeof s.keys !== "object" || s.keys === null)
+		return null;
+	if (!("p256dh" in s.keys) || typeof s.keys.p256dh !== "string") return null;
+	if (!("auth" in s.keys) || typeof s.keys.auth !== "string") return null;
+	return {
+		endpoint: s.endpoint,
+		keys: { p256dh: s.keys.p256dh, auth: s.keys.auth },
+		addedAt: "addedAt" in s && typeof s.addedAt === "number" ? s.addedAt : 0,
+		classes: parseClasses("classes" in s ? s.classes : undefined),
+	};
+}
+
 export function loadSubs(store: GlobalStore): PushSub[] {
 	const parsed: unknown = store.get<unknown[]>("push_subs");
 	if (!Array.isArray(parsed)) return [];
 	const subs: PushSub[] = [];
 	for (const s of parsed) {
-		if (typeof s !== "object" || s === null) continue;
-		if (!("endpoint" in s) || typeof s.endpoint !== "string") continue;
-		if (!("keys" in s) || typeof s.keys !== "object" || s.keys === null)
-			continue;
-		if (!("p256dh" in s.keys) || typeof s.keys.p256dh !== "string") continue;
-		if (!("auth" in s.keys) || typeof s.keys.auth !== "string") continue;
-		subs.push({
-			endpoint: s.endpoint,
-			keys: { p256dh: s.keys.p256dh, auth: s.keys.auth },
-			addedAt: "addedAt" in s && typeof s.addedAt === "number" ? s.addedAt : 0,
-			classes: parseClasses("classes" in s ? s.classes : undefined),
-		});
+		const sub = parseSub(s);
+		if (sub !== null) subs.push(sub);
 	}
 	return subs;
 }
@@ -104,6 +110,40 @@ function boundedSend(
  * subject) is not a successful send. Each send is bounded by `SEND_TIMEOUT_MS`: a hung push
  * endpoint counts as failed (no status) instead of stalling the loop.
  */
+/** The push service's HTTP status on an error response; undefined on a network error. */
+function statusOf(err: unknown): number | undefined {
+	if (typeof err === "object" && err !== null && "statusCode" in err) {
+		const raw: unknown = err.statusCode;
+		if (typeof raw === "number") return raw;
+	}
+	return undefined;
+}
+
+/** Records one failed send: 404/410 expires the subscription, anything else keeps it. */
+function reportFailure(
+	report: SendReport,
+	endpoint: string,
+	err: unknown,
+): void {
+	const status = statusOf(err);
+	if (status === 404 || status === 410)
+		report.gone.add(endpoint); // subscription expired
+	else {
+		report.failed++;
+		report.status ??= status;
+		console.error(
+			`push send failed${status === undefined ? "" : ` (${status})`}:`,
+			err,
+		);
+	}
+}
+
+/**
+ * Sends to every sub; never throws. 404/410 endpoints are gone (unsubscribed device) and land in
+ * `gone`. Every other error counts in `failed` and keeps the sub — a 403 (e.g. a rejected VAPID
+ * subject) is not a successful send. Each send is bounded by `SEND_TIMEOUT_MS`: a hung push
+ * endpoint counts as failed (no status) instead of stalling the loop.
+ */
 export async function sendAll(
 	subs: PushSub[],
 	payload: string,
@@ -122,21 +162,7 @@ export async function sendAll(
 			await boundedSend(send(sub, payload), timeoutMs);
 			report.sent++;
 		} catch (err) {
-			let status: number | undefined;
-			if (typeof err === "object" && err !== null && "statusCode" in err) {
-				const raw: unknown = err.statusCode;
-				if (typeof raw === "number") status = raw;
-			}
-			if (status === 404 || status === 410)
-				report.gone.add(sub.endpoint); // subscription expired
-			else {
-				report.failed++;
-				report.status ??= status;
-				console.error(
-					`push send failed${status === undefined ? "" : ` (${status})`}:`,
-					err,
-				);
-			}
+			reportFailure(report, sub.endpoint, err);
 		}
 	}
 	return report;

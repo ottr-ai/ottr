@@ -73,6 +73,130 @@ export function rulesDirEntries(home: string): string[] {
  * next provision refuse; pre-existing unrecorded rules are deployment state that sync
  * keeps by design. Rules audit through their own record, the rules dir's
  * `.alate-installed.json` (sync.mjs rewrites it from the snapshot every provision). */
+/** A record name that stays inside its root: not absolute, no empty/`..` segment, no backslash. */
+function isSafeName(name: string): boolean {
+	return (
+		!name.startsWith("/") &&
+		!name.split("/").some((s) => s === "" || s === ".." || s.includes("\\"))
+	);
+}
+
+/** The install-user manifest, or null when absent, unreadable, or not a plain object. */
+function readManifest(path: string): Record<string, string> | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed))
+			return parsed as Record<string, string>;
+	} catch {
+		// No manifest or an unreadable one: no install-user baseline for those
+		// files; the rules record below still audits on its own.
+	}
+	return null;
+}
+
+/** The rules record: every own entry whose value is a string, from any JSON object. */
+function readRulesRecord(path: string): Record<string, string> | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof parsed === "object" && parsed !== null) {
+			const out: Record<string, string> = {};
+			for (const [k, v] of Object.entries(parsed))
+				if (typeof v === "string") out[k] = v;
+			return out;
+		}
+	} catch {
+		// No record or an unreadable one: no rules baseline, no rules findings.
+	}
+	return null;
+}
+
+/** One recorded file's drift line, or null when its fingerprint matches `sha`. */
+function recordedDrift(
+	path: string,
+	name: string,
+	sha: string,
+	prefix: string,
+	stripConfigBlocks: boolean,
+): string | null {
+	try {
+		lstatSync(path);
+	} catch {
+		return `${prefix} missing`;
+	}
+	let bytes: Buffer;
+	try {
+		bytes = readFileSync(path);
+	} catch {
+		return `${prefix} unreadable`;
+	}
+	// config.yml's deployment blocks are target-local; alate records and compares
+	// the config without them, so the audit must strip the same blocks.
+	if (stripConfigBlocks && name === "omp/agent/config.yml")
+		bytes = Buffer.from(
+			withoutDeploymentBlocks(bytes.toString("utf8")),
+			"utf8",
+		);
+	return provisionFingerprint(name, bytes) !== sha ? `${prefix} changed` : null;
+}
+
+/** Drift lines for the manifest's safe entries, in manifest key order. */
+function auditManifestFiles(
+	home: string,
+	manifest: Record<string, string>,
+): string[] {
+	const findings: string[] = [];
+	for (const rel of Object.keys(manifest)) {
+		// A hostile manifest must never send the walk outside home.
+		if (!isSafeName(rel)) continue;
+		const line = recordedDrift(
+			join(home, `.${rel}`),
+			rel,
+			manifest[rel] ?? "",
+			`.${rel}`,
+			true,
+		);
+		if (line !== null) findings.push(line);
+	}
+	return findings;
+}
+
+/** Drift lines for the rules record's safe entries, in record key order. */
+function auditRulesRecord(
+	rulesDir: string,
+	recorded: Record<string, string>,
+): string[] {
+	const findings: string[] = [];
+	for (const [name, sha] of Object.entries(recorded)) {
+		if (!isSafeName(name)) continue;
+		const line = recordedDrift(
+			join(rulesDir, name),
+			name,
+			sha,
+			`.omp/agent/rules/${name}`,
+			false,
+		);
+		if (line !== null) findings.push(line);
+	}
+	return findings;
+}
+
+/** Untracked-rule lines: entries the run itself added (the planted-rule class). */
+function untrackedRuleLines(
+	home: string,
+	recorded: Record<string, string>,
+	rulesAtStart: readonly string[],
+): string[] {
+	const atStart = new Set(rulesAtStart);
+	const added = rulesDirEntries(home).filter((name) => !atStart.has(name));
+	const lines: string[] = [];
+	for (const name of added) {
+		if (name === ".alate-installed.json" || recorded[name] !== undefined)
+			continue;
+		lines.push(`.omp/agent/rules/${name} untracked`);
+	}
+	return lines;
+}
+
 export function auditProvisioned(
 	home: string,
 	sinceMs?: number,
@@ -85,66 +209,18 @@ export function auditProvisioned(
 			return [];
 
 		const manifestPath = join(home, ".alate", "installed.json");
-		let manifest: Record<string, string> | null = null;
-		try {
-			const parsed: unknown = JSON.parse(readFileSync(manifestPath, "utf8"));
-			if (
-				typeof parsed === "object" &&
-				parsed !== null &&
-				!Array.isArray(parsed)
-			)
-				manifest = parsed as Record<string, string>;
-		} catch {
-			// No manifest or an unreadable one: no install-user baseline for those
-			// files; the rules record below still audits on its own.
-		}
-		if (
+		const manifest = readManifest(manifestPath);
+		// A manual provision rewrote the home inside the run's window; its writes
+		// are not this run's drift.
+		const staleManifest =
 			manifest !== null &&
 			sinceMs !== undefined &&
-			statSync(manifestPath).mtimeMs > sinceMs
-		) {
-			// A manual provision rewrote the home inside the run's window; its writes
-			// are not this run's drift.
-			manifest = null;
-		}
+			statSync(manifestPath).mtimeMs > sinceMs;
 
-		const tracked: string[] = [];
-		if (manifest !== null) {
-			// A hostile manifest must never send the walk outside home.
-			const valid: string[] = [];
-			for (const rel of Object.keys(manifest)) {
-				if (rel.startsWith("/")) continue;
-				const segs = rel.split("/");
-				if (segs.some((s) => s === "" || s === ".." || s.includes("\\")))
-					continue;
-				valid.push(rel);
-			}
-			for (const rel of valid) {
-				const p = join(home, `.${rel}`);
-				try {
-					lstatSync(p);
-				} catch {
-					tracked.push(`.${rel} missing`);
-					continue;
-				}
-				let bytes: Buffer;
-				try {
-					bytes = readFileSync(p);
-				} catch {
-					tracked.push(`.${rel} unreadable`);
-					continue;
-				}
-				// config.yml's deployment blocks are target-local; alate records and compares
-				// the config without them, so the audit must strip the same blocks.
-				if (rel === "omp/agent/config.yml")
-					bytes = Buffer.from(
-						withoutDeploymentBlocks(bytes.toString("utf8")),
-						"utf8",
-					);
-				if (provisionFingerprint(rel, bytes) !== manifest[rel])
-					tracked.push(`.${rel} changed`);
-			}
-		}
+		const tracked: string[] =
+			manifest === null || staleManifest
+				? []
+				: auditManifestFiles(home, manifest);
 
 		// Everything the manifest never recorded is machine state (agent.db, sessions,
 		// caches) that alate itself creates, or an unrecorded extra: neither changes what
@@ -162,17 +238,7 @@ export function auditProvisioned(
 			"rules",
 			".alate-installed.json",
 		);
-		let recorded: Record<string, string> | null = null;
-		try {
-			const parsed: unknown = JSON.parse(readFileSync(rulesRecordPath, "utf8"));
-			if (typeof parsed === "object" && parsed !== null) {
-				recorded = {};
-				for (const [k, v] of Object.entries(parsed))
-					if (typeof v === "string") recorded[k] = v;
-			}
-		} catch {
-			// No record or an unreadable one: no rules baseline, no rules findings.
-		}
+		const recorded = readRulesRecord(rulesRecordPath);
 		// The same run-window rule as the manifest: a mid-run sync rewrote the record,
 		// and its writes are not this run's drift.
 		let fresh = true;
@@ -182,48 +248,16 @@ export function auditProvisioned(
 			fresh = false; // the record vanished between the read and the stat
 		}
 		if (recorded !== null && fresh) {
-			const rulesDir = join(home, ".omp", "agent", "rules");
-			for (const [name, sha] of Object.entries(recorded)) {
-				if (
-					name.startsWith("/") ||
-					name
-						.split("/")
-						.some((s) => s === "" || s === ".." || s.includes("\\"))
-				)
-					continue;
-				const p = join(rulesDir, name);
-				try {
-					lstatSync(p);
-				} catch {
-					tracked.push(`.omp/agent/rules/${name} missing`);
-					continue;
-				}
-				let bytes: Buffer;
-				try {
-					bytes = readFileSync(p);
-				} catch {
-					tracked.push(`.omp/agent/rules/${name} unreadable`);
-					continue;
-				}
-				if (provisionFingerprint(name, bytes) !== sha)
-					tracked.push(`.omp/agent/rules/${name} changed`);
-			}
+			tracked.push(
+				...auditRulesRecord(join(home, ".omp", "agent", "rules"), recorded),
+			);
 			// The rules dir holds exactly the record and the snapshot's rules, but it can
 			// also hold unrecorded rules an older alate installed: sync keeps those by
 			// design ("Not from the data repo, left in place"). Only an entry the run
 			// itself added is a finding — the planted-rule class — so the scan compares
 			// against the spawn-time capture and stays off without one.
-			if (rulesAtStart !== undefined) {
-				const atStart = new Set(rulesAtStart);
-				const added = rulesDirEntries(home).filter(
-					(name) => !atStart.has(name),
-				);
-				for (const name of added) {
-					if (name === ".alate-installed.json" || recorded[name] !== undefined)
-						continue;
-					tracked.push(`.omp/agent/rules/${name} untracked`);
-				}
-			}
+			if (rulesAtStart !== undefined)
+				tracked.push(...untrackedRuleLines(home, recorded, rulesAtStart));
 		}
 
 		if (tracked.length > 40)

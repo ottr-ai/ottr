@@ -391,6 +391,50 @@ const boardState = (
 /** Every URL the board fetched, in order; a test clears it before it mounts. */
 const requested: string[] = [];
 
+/** The body serverFor answers `url` with; undefined serves the 503 failure line. */
+function hostedBody(
+	hosted: boolean,
+	extra: {
+		state?: Record<string, unknown>;
+		update?: { behind: number; commits: string[] };
+		ghStatus?: Record<string, unknown>;
+	},
+	url: string,
+): unknown {
+	if (url === "/api/boot")
+		return {
+			onboarding: false,
+			version: "vtest",
+			live: false,
+			...(hosted ? { hosted: true } : {}),
+		};
+	if (url === "/api/state") return boardState(hosted, extra.state);
+	if (url === "/api/update") return extra.update ?? { behind: 0, commits: [] };
+	if (url === "/api/gh-status") return extra.ghStatus;
+	if (url === "/api/system")
+		return {
+			at: 1,
+			containers: [],
+			vm: {
+				cpuPct: null,
+				cpus: 4,
+				load1: null,
+				memAvailable: null,
+				memTotal: null,
+				history: [],
+			},
+			holds: {
+				drainUntil: null,
+				drainCommits: null,
+				maxTotal: null,
+				running: 0,
+				queued: 0,
+				oldestQueuedAt: null,
+			},
+		};
+	return undefined;
+}
+
 /** The server as the board sees it: /api/boot and /api/state carry `hosted` only when on. */
 const serverFor = (
 	hosted: boolean,
@@ -403,39 +447,7 @@ const serverFor = (
 	(async (input: RequestInfo | URL) => {
 		const url = String(input);
 		requested.push(url);
-		let body: unknown;
-		if (url === "/api/boot")
-			body = {
-				onboarding: false,
-				version: "vtest",
-				live: false,
-				...(hosted ? { hosted: true } : {}),
-			};
-		else if (url === "/api/state") body = boardState(hosted, extra.state);
-		else if (url === "/api/update")
-			body = extra.update ?? { behind: 0, commits: [] };
-		else if (url === "/api/gh-status") body = extra.ghStatus;
-		else if (url === "/api/system")
-			body = {
-				at: 1,
-				containers: [],
-				vm: {
-					cpuPct: null,
-					cpus: 4,
-					load1: null,
-					memAvailable: null,
-					memTotal: null,
-					history: [],
-				},
-				holds: {
-					drainUntil: null,
-					drainCommits: null,
-					maxTotal: null,
-					running: 0,
-					queued: 0,
-					oldestQueuedAt: null,
-				},
-			};
+		const body = hostedBody(hosted, extra, url);
 		// Other loads (Overview figures, provisioning) fail; their panels show the failure line.
 		return new Response(JSON.stringify(body ?? { error: "not in this test" }), {
 			status: body === undefined ? 503 : 200,

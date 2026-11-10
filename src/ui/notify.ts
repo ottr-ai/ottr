@@ -49,10 +49,12 @@ export function pruneAskDrafts(alive: ReadonlySet<string>): void {
 	const drafts = loadAskDrafts();
 	const kept = Object.keys(drafts).filter((id) => alive.has(id));
 	if (kept.length === Object.keys(drafts).length) return;
-	localStorage.setItem(
-		ASK_DRAFTS_KEY,
-		JSON.stringify(Object.fromEntries(kept.map((id) => [id, drafts[id]!]))),
-	);
+	const keptDrafts: Record<string, AskDraft> = {};
+	for (const id of kept) {
+		const draft = drafts[id];
+		if (draft !== undefined) keptDrafts[id] = draft;
+	}
+	localStorage.setItem(ASK_DRAFTS_KEY, JSON.stringify(keptDrafts));
 }
 
 /** localStorage map of unsent compose drafts per dialog key (new task, backlog draft, follow-up);

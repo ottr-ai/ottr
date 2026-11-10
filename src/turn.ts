@@ -75,6 +75,7 @@ import {
 	resumePlan,
 	WORKER_BUSY,
 } from "./runner.ts";
+import type { DepProject, WorkCheckVerdict } from "./scheduler.ts";
 import {
 	applyCheckVerdicts,
 	badDep,
@@ -140,7 +141,7 @@ import {
 } from "./types.ts";
 import { vmState } from "./vmState.ts";
 import type { VmTokens } from "./vmTokens.ts";
-import type { DetachedRun } from "./workers.ts";
+import type { DetachedRun, VmOutcome } from "./workers.ts";
 
 import type {
 	ArchReviewDelta,
@@ -1191,6 +1192,177 @@ export interface TurnLoop {
 	recoverRestarted(): Promise<void>;
 }
 
+/** Values prepareTurnHeader fixes for the rest of the turn: the settings snapshot, the
+ * fetch target with its head, the turn's base, and the card-log byte offset of the
+ * turn's own section. */
+type TurnHeader = {
+	settings: ProjectSettings;
+	target: string;
+	sha: string;
+	base: string;
+	turnLogOffset: number;
+};
+
+/** The per-card kind flags turnIdentityFlags reads off the task row once. */
+type TurnIdentityFlags = {
+	releaseCard: boolean;
+	reviewCard: boolean;
+	retroCard: boolean;
+	boardCheck: boolean;
+	interview: boolean;
+	grill: boolean;
+	scout: boolean;
+};
+
+/** The flags plus the session name resolveTurnIdentity fixed before the run. */
+type TurnIdentity = TurnIdentityFlags & { sessionName: string | null };
+
+/** Where the turn runs, with `branch` proven only for worktree cards: interview, grill
+ * and trending-scout cards run in the main checkout and never read a branch name. */
+type RunLocation =
+	| { special: true; wt: string }
+	| { special: false; wt: string; branch: string };
+
+/** Mutable run state a phase helper writes and runTurn's catch and finally read. */
+type TurnRunShared = {
+	/** This run's slot in `running`; null until startRun returns (the catch/finally may run early). */
+	entry: RunEntry | null;
+	turn: Turn | null;
+	/** Set when sweepLostTurns took over a hung check of this run: the finally must then
+	 * leave the preparing claim alone (it may belong to a replacement run already). */
+	checkTakenOver: boolean;
+	/** OTTR-708: the other projects' main-checkout snapshots taken just before the run
+	 * started; null when this turn kind is not guarded. The settle re-checks them. */
+	guardBefore: Map<string, { head: string | null; status: string }> | null;
+};
+
+/** The agent run one turn dispatches (ops.startRun's handle). */
+type TurnRunHandle = ReturnType<TurnOps["startRun"]>;
+
+/** The metering handle openMeter returns for one agent run (null on a self-hosted board). */
+type OpenRunMeter = (
+	role: string,
+	main?: boolean,
+) => {
+	onUsage: InterimMeter["onUsage"];
+	settle(result: RunResult): void;
+} | null;
+
+/** What a turn resumes (resumePlan): the session id to --resume, and the note folded into
+ * the prompt when the saved session is lost (or the pending reply when none exists). */
+type TurnPlan = { resumeId: string | null; note: string | null };
+
+/** The pending reply state and the prompt the run carries, read as late as startRun. */
+type TurnInput = {
+	live: Task;
+	raw: string | null;
+	pending: string | null;
+	plan: TurnPlan;
+	prompt: string;
+	turnImages: string[];
+	imagePaths: string[];
+};
+
+/** The worker target the run dispatches to, with drained runners dropped. */
+type TurnLiveWorker = Pick<WorkerTarget, "urls" | "token">;
+
+/** The env values the board lends the run (ops.turnEnv; a fixed empty shape in tests). */
+type TurnEnvValues = Awaited<ReturnType<NonNullable<TurnOps["turnEnv"]>>>;
+
+/** The tools/PATH prep a local run gets (ops.prepareTurn; null for a worker run). */
+type TurnPrep = Awaited<ReturnType<NonNullable<TurnOps["prepareTurn"]>>> | null;
+
+/** Where and how the run executes, fixed by routeTurnRun. */
+type TurnRoute = {
+	vmTurn: boolean;
+	worker: WorkerTarget | null;
+	liveWorker: TurnLiveWorker | null;
+	local: boolean;
+	prep: TurnPrep;
+	execModel: string | null;
+	runModel: string | null;
+	restoreFailed: boolean;
+	turnEnv: TurnEnvValues;
+};
+
+/** The started run plus its metering handle, the HTTP-400 correlation window start, and the
+ * recorded turn row (also on mx.turn for runTurn's catch and finally). */
+type TurnDispatch = {
+	handle: TurnRunHandle;
+	runMeter: ReturnType<OpenRunMeter>;
+	runStartedAt: number;
+	turn: Turn;
+};
+
+/** One turn's settle pass: the context the prepare and dispatch phases fixed, plus the
+ * mutable state each settle helper reads and writes. Fields follow runTurn's original
+ * locals; every helper keeps the statement order of its original block. */
+type TurnSettle = {
+	name: string;
+	id: string;
+	key: string;
+	kind: TurnKind;
+	e: TurnProject;
+	store: ProjectStore;
+	task: Task;
+	header: TurnHeader;
+	idn: TurnIdentity;
+	loc: RunLocation;
+	input: TurnInput;
+	route: TurnRoute;
+	dispatch: TurnDispatch;
+	mx: TurnRunShared;
+	openMeter: OpenRunMeter;
+	creditBlocked: () => boolean;
+	log: (line: string) => void;
+	// run facts
+	result: RunResult;
+	vmOut: VmOutcome | null;
+	runEndedAt: number;
+	reportText: string | null;
+	reportError: string | null;
+	wasResearch: boolean;
+	demoteCandidate: boolean;
+	fromMain: boolean;
+	finishedCleanly: boolean;
+	shots: string[] | undefined;
+	// merge ship state
+	pushError: string | null;
+	pushRejected: boolean;
+	pushOutput: string | null;
+	recheckError: string | null;
+	holdHead: string | null;
+	holdMismatch: string | null;
+	holdDiff: string | null;
+	holdFiles: DiffFileStat[] | null;
+	holdTip: string | null;
+	remoteLanded: boolean;
+	refused: string | null;
+	prNext: Next | null;
+	// classify and post-classify state
+	research: boolean;
+	steered: boolean;
+	/** Settle timestamp: the row's endedAt and the queued write's queuedAt share it. */
+	now: number;
+	// settle writes
+	unsaved: string | null;
+	report: string | null | undefined;
+	steps: "yes" | "no" | undefined;
+	commits: number | null | undefined;
+	mergeHead: string | null | undefined;
+	keptFiles: string[] | undefined;
+	holdReason: string | null;
+	// checks
+	workCard: boolean;
+	reviewFindings: RecordedFinding[];
+	checkWillRun: boolean;
+};
+
+/** First line of a finding, for logs and the card report (the body can be long). */
+function findingHead(f: RecordedFinding): string {
+	return f.prompt.split("\n")[0]?.slice(0, 120) ?? "";
+}
+
 export function createTurnLoop(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -1413,6 +1585,37 @@ export function createTurnLoop(
 		);
 	}
 
+	/** The resume reply for a requeued lost turn: the omp session and worktree survive, so queue
+	 * a continue reply; a never-saved session starts fresh via resumePlan on the next start.
+	 * restartResumePrompt itself collapses dirty and unknown trees back to ".". */
+	async function lostResumeReply(cur: ListedTask): Promise<string> {
+		if (cur.worktree === null) return ".";
+		const sha = await ops.targetSha(cur.worktree, "HEAD").catch(() => null);
+		if (sha === null) return ".";
+		return restartResumePrompt({
+			sha,
+			clean: await ops.isClean(cur.worktree).catch(() => false),
+		});
+	}
+
+	/** The interrupted turn's prompt rides again when its omp session never saved it: a restart
+	 * seconds into a turn otherwise resumes the saved session with only the note, and the agent
+	 * never sees what the turn was asked to do. A missing session file needs no resend — that
+	 * turn starts a fresh session, whose start re-sends the card's instructions. */
+	function lostResumePrompt(
+		store: ProjectStore,
+		cur: ListedTask,
+		lost: Turn | null,
+		base: string,
+	): string {
+		return lost !== null &&
+			cur.sessionId !== null &&
+			sessionFile(store.sessionsDir, cur.sessionId) !== null &&
+			!sessionHoldsPrompt(store.sessionsDir, cur.sessionId, lost.prompt)
+			? `${lost.prompt}\n\n${base}`
+			: base;
+	}
+
 	/** Shared settle-and-requeue for the lost-run sweep and the boot restart sweep: end the open
 	 * row (null turnId: the crash landed before the row existed, or the last row is already
 	 * settled — nothing to finish), then queue the continue reply through restartResumePrompt
@@ -1445,22 +1648,7 @@ export function createTurnLoop(
 		// A cancel that landed while the run hung already owns the card's state.
 		const cur = store.getTask(t.id);
 		if (!cur || cur.cancelledAt !== null) return;
-		// Same resume route as a tracker restart: the omp session and worktree survive, so queue a
-		// continue reply; a never-saved session starts fresh via resumePlan on the next start.
-		// restartResumePrompt itself collapses dirty and unknown trees back to ".".
-		let resume = ".";
-		if (cur.worktree !== null) {
-			const sha = await ops.targetSha(cur.worktree, "HEAD").catch(() => null);
-			if (sha !== null)
-				resume = restartResumePrompt({
-					sha,
-					clean: await ops.isClean(cur.worktree).catch(() => false),
-				});
-		}
-		// The interrupted turn's prompt rides again when its omp session never saved it: a restart
-		// seconds into a turn otherwise resumes the saved session with only the note, and the agent
-		// never sees what the turn was asked to do. A missing session file needs no resend — that
-		// turn starts a fresh session, whose start re-sends the card's instructions.
+		const resume = await lostResumeReply(cur);
 		const lost =
 			turnId === null
 				? null
@@ -1469,13 +1657,7 @@ export function createTurnLoop(
 		store.updateTask(t.id, {
 			state: "queued",
 			needsReason,
-			pendingPrompt:
-				lost !== null &&
-				cur.sessionId !== null &&
-				sessionFile(store.sessionsDir, cur.sessionId) !== null &&
-				!sessionHoldsPrompt(store.sessionsDir, cur.sessionId, lost.prompt)
-					? `${lost.prompt}\n\n${base}`
-					: base,
+			pendingPrompt: lostResumePrompt(store, cur, lost, base),
 			// Queued user text keeps its authorship; the board's own resume text is supervisor.
 			pendingBy: cur.pendingPrompt !== null ? cur.pendingBy : "supervisor",
 		});
@@ -1521,6 +1703,94 @@ export function createTurnLoop(
 			});
 	}
 
+	/** OTTR-454, boot side: a pid-null row is a worker run the update detached instead of losing.
+	 * Ask the workers before settling it lost: a still-running match keeps the row open and
+	 * registers a watcher the sweep polls; a finished one settles through the resume route with
+	 * the restart reason. No match (or an unreachable worker) keeps the lost settle to the caller.
+	 * ponytail: matchDetached re-guards ops.detachedRuns, so this first conjunct is redundant;
+	 * the remaining conjuncts are pinned by the re-bind tests. */
+	async function rebindDetachedRestart(
+		e: TurnProject,
+		t: ListedTask,
+		turn: Turn | undefined,
+	): Promise<boolean> {
+		if (
+			ops.detachedRuns &&
+			t.cancelledAt === null &&
+			turn &&
+			turn.endedAt === null &&
+			turn.pid === null
+		) {
+			const match = await matchDetached(t.worktree);
+			if (match) {
+				if (match.run.running) {
+					detached.set(`${e.name}/${t.id}`, {
+						url: match.url,
+						runId: match.run.id,
+					});
+					appendLog(
+						e.store,
+						t.id,
+						`- re-bound detached run ${match.run.id} on ${new URL(match.url).host}; the card stays running`,
+					);
+					return true;
+				}
+				await settleDetached(e, t, turn.id);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** One card of the boot restart sweep: settle the open row of a card whose run died with
+	 * the tracker and requeue it through the resume route. */
+	async function restartSweepTask(
+		e: TurnProject,
+		t: ListedTask,
+	): Promise<void> {
+		if (t.state !== "running" && t.state !== "preparing") return;
+		const turn = e.store.listTurns(t.id).at(-1);
+		// An agent process is a child and can outlive the tracker restart: a still-alive
+		// recorded pid owns the worktree, so requeueing here would start a second agent
+		// on it. Leave the card to sweepLostTurns, which settles and requeues through
+		// this same route once the pid dies. A worker row (pid null) has no pid to
+		// prove liveness with and keeps the old behavior; a cancelled card falls
+		// through to finish its interrupted cancel below.
+		if (
+			turn &&
+			turn.endedAt === null &&
+			turn.pid !== null &&
+			ops.pidAlive(turn.pid) &&
+			t.cancelledAt === null
+		) {
+			appendLog(
+				e.store,
+				t.id,
+				`agent pid ${turn.pid} survived the tracker restart; leaving the card running`,
+			);
+			return;
+		}
+		if (await rebindDetachedRestart(e, t, turn)) return;
+		// null turnId: the crash landed before store.startTurn created the row (git/apt
+		// preparation), or the last row is already settled — requeue without finishing a row.
+		try {
+			await settleLostTurn(
+				e,
+				t,
+				turn && turn.endedAt === null ? turn.id : null,
+				"tracker restarted",
+				"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
+			);
+			// The cancel that owned this card died with the tracker: redo the decision it
+			// was interrupted in — a dirty worktree becomes a kept-worktree needs_you card,
+			// a clean one is removed and the card ends idle. No api() wrapper exists at
+			// boot, so a failure logs here and the next boot retries.
+			if (t.cancelledAt !== null) await cancel(e, t.id, false);
+		} catch (err) {
+			logStoreError(e.store.name, err);
+		}
+	}
+
 	/** Boot restart sweep: the tracker process died mid-run. Settle each open row whose run is
 	 * gone (a still-alive recorded agent pid keeps its card; sweepLostTurns takes it once the
 	 * pid dies) as "tracker restarted" and requeue through the same resume route as
@@ -1537,141 +1807,181 @@ export function createTurnLoop(
 				logStoreError(e.store.name, err);
 				continue;
 			}
-			for (const t of tasks) {
-				if (t.state !== "running" && t.state !== "preparing") continue;
-				const turn = e.store.listTurns(t.id).at(-1);
-				// An agent process is a child and can outlive the tracker restart: a still-alive
-				// recorded pid owns the worktree, so requeueing here would start a second agent
-				// on it. Leave the card to sweepLostTurns, which settles and requeues through
-				// this same route once the pid dies. A worker row (pid null) has no pid to
-				// prove liveness with and keeps the old behavior; a cancelled card falls
-				// through to finish its interrupted cancel below.
-				if (
-					turn &&
-					turn.endedAt === null &&
-					turn.pid !== null &&
-					ops.pidAlive(turn.pid) &&
-					t.cancelledAt === null
-				) {
-					appendLog(
-						e.store,
-						t.id,
-						`agent pid ${turn.pid} survived the tracker restart; leaving the card running`,
-					);
-					continue;
-				}
-				// OTTR-454: a pid-null row is a worker run the update detached instead of losing.
-				// Ask the workers before settling it lost: a still-running match keeps the row
-				// open and registers a watcher the sweep polls; a finished one settles through
-				// the resume route with the restart reason. No match (or an unreachable worker)
-				// keeps the lost settle below.
-				// ponytail: matchDetached re-guards ops.detachedRuns, so this first conjunct
-				// is redundant; the remaining conjuncts are pinned by the re-bind tests.
-				if (
-					ops.detachedRuns &&
-					t.cancelledAt === null &&
-					turn &&
-					turn.endedAt === null &&
-					turn.pid === null
-				) {
-					const match = await matchDetached(t.worktree);
-					if (match) {
-						if (match.run.running) {
-							detached.set(`${e.name}/${t.id}`, {
-								url: match.url,
-								runId: match.run.id,
-							});
-							appendLog(
-								e.store,
-								t.id,
-								`- re-bound detached run ${match.run.id} on ${new URL(match.url).host}; the card stays running`,
-							);
-							continue;
-						}
-						await settleDetached(e, t, turn.id);
-						continue;
-					}
-				}
-				// null turnId: the crash landed before store.startTurn created the row (git/apt
-				// preparation), or the last row is already settled — requeue without finishing a row.
-				try {
-					await settleLostTurn(
-						e,
-						t,
-						turn && turn.endedAt === null ? turn.id : null,
-						"tracker restarted",
-						"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
-					);
-					// The cancel that owned this card died with the tracker: redo the decision it
-					// was interrupted in — a dirty worktree becomes a kept-worktree needs_you card,
-					// a clean one is removed and the card ends idle. No api() wrapper exists at
-					// boot, so a failure logs here and the next boot retries.
-					if (t.cancelledAt !== null) await cancel(e, t.id, false);
-				} catch (err) {
-					logStoreError(e.store.name, err);
-				}
-			}
+			for (const t of tasks) await restartSweepTask(e, t);
 		}
 	}
 
-	/** Settles open turns whose agent process vanished while the tracker stayed up (killed agent,
-	 * emulator hang, machine sleep): a spawned grandchild can hold the run's stdio pipes open, the
-	 * child's `close` never fires, and without this the turn row stays open forever while the
-	 * scheduler's arch-review hold blocks the project's merge queue. Mirrors the boot restart sweep:
-	 * settle the row, then requeue through the same resume route. Detection only — nothing is killed
-	 * here. Runs from every schedule() tick, so board start (server.ts calls schedule() once at
-	 * boot) sweeps stale rows too. */
-	async function sweepLostTurns(): Promise<void> {
-		// Same fabricated data: the lost-turn sweep runs on every schedule tick.
-		if (demoBoard()) return;
-		// OTTR-454: poll every re-bound detached run first. Still running: leave its row to the
-		// scan below untouched this tick. Finished or gone: settle through the restart-resume
-		// route and drop the watcher (only after the settle write, so a concurrent tick's scan
-		// cannot double-settle the row). An unreachable worker keeps the watcher and the row.
-		for (const [key, watch] of [...detached]) {
-			if (!ops.detachedRuns) break;
-			// ponytail: a watcher exists only because workerTarget answered at recovery, so
-			// the optional chain cannot see null, and ?? equals || for string|undefined.
-			const runs = await ops
-				.detachedRuns(watch.url, runnerToken(watch.url) ?? "")
-				.catch(() => null);
-			// Probe failure is not proof of a loss: leave the row open and retry next tick.
-			if (runs === null) continue;
-			if (runs.find((r) => r.id === watch.runId)?.running) continue;
-			const sep = key.indexOf("/");
-			const e = projects.get(key.slice(0, sep));
-			const t = e?.store.getTask(key.slice(sep + 1));
-			const turn = t && e ? e.store.listTurns(t.id).at(-1) : null;
-			// ponytail: the t && e lookup above turns a missing project or task into a null
-			// turn, so !e and !t are backstopped by !turn.
-			if (!e || !t || !turn || turn.endedAt !== null) {
-				detached.delete(key);
-				continue;
-			}
-			try {
-				await settleDetached(e, t, turn.id);
-				detached.delete(key);
-			} catch (err) {
-				// Keep the watcher: the next tick retries the settle through the same route.
-				// ponytail: log-only — the watcher's fate (kept) is decided by the delete
-				// that never ran.
-				logStoreError(e.store.name, err);
-			}
+	/** One lost open row found by the sweep, with its settle arguments. */
+	interface LostRun {
+		e: TurnProject;
+		id: string;
+		turnId: number;
+		pid: number | null;
+	}
+
+	/** One lost second-model check found by the sweep, with its settle arguments. */
+	interface LostCheckRun {
+		e: TurnProject;
+		id: string;
+		checkKey: string;
+		pid: number | null;
+	}
+
+	/** One watcher of the poll: settle-and-drop a finished detached run, keep the watcher for
+	 * an unreachable worker (the next tick retries the settle through the same route). */
+	async function settleDetachedWatcher(
+		key: string,
+		watch: { url: string; runId: string },
+		probe: NonNullable<TurnOps["detachedRuns"]>,
+	): Promise<void> {
+		// ponytail: a watcher exists only because workerTarget answered at recovery, so
+		// the optional chain cannot see null, and ?? equals || for string|undefined.
+		const runs = await probe(watch.url, runnerToken(watch.url) ?? "").catch(
+			() => null,
+		);
+		// Probe failure is not proof of a loss: leave the row open and retry next tick.
+		if (runs === null) return;
+		if (runs.find((r) => r.id === watch.runId)?.running) return;
+		const sep = key.indexOf("/");
+		const e = projects.get(key.slice(0, sep));
+		const t = e?.store.getTask(key.slice(sep + 1));
+		const turn = t && e ? e.store.listTurns(t.id).at(-1) : null;
+		// ponytail: the t && e lookup above turns a missing project or task into a null
+		// turn, so !e and !t are backstopped by !turn.
+		if (!e || !t || !turn || turn.endedAt !== null) {
+			detached.delete(key);
+			return;
 		}
-		// Synchronous scan: claimed entries leave `running` before the first await, so a re-entrant
-		// schedule() cannot double-settle a row.
-		const lost: {
-			e: TurnProject;
-			id: string;
-			turnId: number;
-			pid: number | null;
-		}[] = [];
-		const lostChecks: {
-			e: TurnProject;
-			id: string;
-			checkKey: string;
-			pid: number | null;
-		}[] = [];
+		try {
+			await settleDetached(e, t, turn.id);
+			detached.delete(key);
+		} catch (err) {
+			// Keep the watcher: the next tick retries the settle through the same route.
+			// ponytail: log-only — the watcher's fate (kept) is decided by the delete
+			// that never ran.
+			logStoreError(e.store.name, err);
+		}
+	}
+
+	/** OTTR-454: poll every re-bound detached run first. Still running: leave its row to the
+	 * scan below untouched this tick. Finished or gone: settle through the restart-resume
+	 * route and drop the watcher (only after the settle write, so a concurrent tick's scan
+	 * cannot double-settle the row). An unreachable worker keeps the watcher and the row. */
+	async function pollDetachedWatchers(): Promise<void> {
+		for (const [key, watch] of [...detached]) {
+			const probe = ops.detachedRuns;
+			if (probe === undefined) break;
+			await settleDetachedWatcher(key, watch, probe);
+		}
+	}
+
+	/** d774111 keeps the card running while a second-model check runs, with the run's own row
+	 * already closed: the row path below never sees that phase. A check entry whose pid is dead
+	 * or absent hangs the card in running forever — a grandchild can hold the check's stdio
+	 * pipes past maxTime — and holds two cap units (its entry plus the run's preparing claim).
+	 * Sweep it like any lost run; a live check (own pid alive) is never swept. True when the
+	 * card holds a check entry, dead or alive. */
+	function collectLostCheck(
+		e: TurnProject,
+		t: ListedTask,
+		key: string,
+		lostChecks: LostCheckRun[],
+	): boolean {
+		const check = running.get(`${key}:check`);
+		if (check !== undefined) {
+			pushLostCheck(e, t, `${key}:check`, check, lostChecks);
+			return true;
+		}
+		const workCheck = running.get(`${key}:workcheck`);
+		if (workCheck === undefined) return false;
+		pushLostCheck(e, t, `${key}:workcheck`, workCheck, lostChecks);
+		return true;
+	}
+
+	function pushLostCheck(
+		e: TurnProject,
+		t: ListedTask,
+		checkKey: string,
+		entry: RunEntry,
+		lostChecks: LostCheckRun[],
+	): void {
+		const pid = entry.pid;
+		if (pid === null || !ops.pidAlive(pid))
+			lostChecks.push({ e, id: t.id, checkKey, pid });
+	}
+
+	/** Worker-run liveness for an open pid-null row: a re-bound detached run is its own proof
+	 * (the watcher poll settles it when it ends) and so is a live stream in `running`. */
+	function lostWorkerRow(key: string): boolean {
+		if (detached.has(key)) return false;
+		if (running.get(key)?.pid === null) return false;
+		return true;
+	}
+
+	/** Frees the cap slot of a run whose pid died with the row still open: a late `done` finds
+	 * the entry abandoned. The abandoned run's finally never runs while `done` hangs, so its
+	 * preparing claim would hold a cap slot forever; the resumed turn re-adds its own. */
+	function abandonDeadEntry(key: string, turn: Turn): void {
+		const entry = running.get(key);
+		if (entry === undefined || entry.pid !== turn.pid) return;
+		running.delete(key);
+		entry.abandoned = true;
+		preparing.delete(key);
+	}
+
+	/** One card's open turn row: classify it lost (worker run with no live proof, or a dead
+	 * pid) and record the settle arguments. */
+	function collectLostRow(
+		e: TurnProject,
+		t: ListedTask,
+		key: string,
+		lost: LostRun[],
+	): void {
+		const turn = e.store.listTurns(t.id).at(-1);
+		if (!turn || turn.endedAt !== null) return;
+		// A live runTurn owns its row from the claim until its settle writes: the omp pid can
+		// be dead while slow post-run git work is still in flight (running.delete happened,
+		// the preparing claim has not), and settling under it would make runTurn settle the
+		// row twice and requeue a finished card. A worker run whose fallback filled the pid
+		// after startTurn is owned the same way (its row pid is still null). Only the
+		// hung-pipe case still settles here: an entry holding the row's own pid whose `done`
+		// will never resolve.
+		if (
+			preparing.has(key) &&
+			!(turn.pid !== null && running.get(key)?.pid === turn.pid)
+		)
+			return;
+		if (turn.pid === null) {
+			// Worker run: the live stream in `running` is the liveness proof. A local spawn failure
+			// stores pid null too but settles its row in runTurn's catch; and running.set precedes
+			// store.startTurn synchronously, so a sweep can never see an open pid-null row for a
+			// live local run. A pid-null lost row therefore has no live entry to abandon by
+			// construction — the abandonment block below is pid-path only.
+			if (lostWorkerRow(key))
+				lost.push({ e, id: t.id, turnId: turn.id, pid: null });
+			return;
+		}
+		if (ops.pidAlive(turn.pid)) return;
+		abandonDeadEntry(key, turn);
+		lost.push({ e, id: t.id, turnId: turn.id, pid: turn.pid });
+	}
+
+	/** One card of the lost-run scan. */
+	function collectLostRun(
+		e: TurnProject,
+		t: ListedTask,
+		lost: LostRun[],
+		lostChecks: LostCheckRun[],
+	): void {
+		// Only in-flight cards can hold an open turn row (same filter as the boot restart sweep).
+		if (t.state !== "running" && t.state !== "preparing") return;
+		const key = `${e.name}/${t.id}`;
+		if (collectLostCheck(e, t, key, lostChecks)) return;
+		collectLostRow(e, t, key, lost);
+	}
+
+	/** The scan half of the sweep: every project's in-flight cards, one sick store isolated. */
+	function collectLostRuns(lost: LostRun[], lostChecks: LostCheckRun[]): void {
 		for (const e of projects.values()) {
 			let tasks: ListedTask[];
 			try {
@@ -1682,65 +1992,11 @@ export function createTurnLoop(
 				logStoreError(e.store.name, err);
 				continue;
 			}
-			for (const t of tasks) {
-				// Only in-flight cards can hold an open turn row (same filter as the boot restart sweep).
-				if (t.state !== "running" && t.state !== "preparing") continue;
-				const key = `${e.name}/${t.id}`;
-				// d774111 keeps the card running while a second-model check runs, with the run's
-				// own row already closed: the row path below never sees that phase. A check
-				// entry whose pid is dead or absent hangs the card in running forever — a
-				// grandchild can hold the check's stdio pipes past maxTime — and holds two cap
-				// units (its entry plus the run's preparing claim). Sweep it like any lost run;
-				// a live check (own pid alive) is never swept.
-				const checkKey = running.has(`${key}:check`)
-					? `${key}:check`
-					: running.has(`${key}:workcheck`)
-						? `${key}:workcheck`
-						: null;
-				if (checkKey !== null) {
-					const pid = running.get(checkKey)!.pid;
-					if (pid === null || !ops.pidAlive(pid))
-						lostChecks.push({ e, id: t.id, checkKey, pid });
-					continue;
-				}
-				const turn = e.store.listTurns(t.id).at(-1);
-				if (!turn || turn.endedAt !== null) continue;
-				// A live runTurn owns its row from the claim until its settle writes: the omp pid can
-				// be dead while slow post-run git work is still in flight (running.delete happened,
-				// the preparing claim has not), and settling under it would make runTurn settle the
-				// row twice and requeue a finished card. A worker run whose fallback filled the pid
-				// after startTurn is owned the same way (its row pid is still null). Only the
-				// hung-pipe case still settles here: an entry holding the row's own pid whose `done`
-				// will never resolve.
-				if (
-					preparing.has(key) &&
-					!(turn.pid !== null && running.get(key)?.pid === turn.pid)
-				)
-					continue;
-				if (turn.pid === null) {
-					// Worker run: the live stream in `running` is the liveness proof. A local spawn failure
-					// stores pid null too but settles its row in runTurn's catch; and running.set precedes
-					// store.startTurn synchronously, so a sweep can never see an open pid-null row for a
-					// live local run. A pid-null lost row therefore has no live entry to abandon by
-					// construction — the abandonment block below is pid-path only. A re-bound detached
-					// run is its own liveness proof: the watcher poll above settles it when it ends.
-					if (detached.has(key)) continue;
-					if (running.get(key)?.pid === null) continue;
-					lost.push({ e, id: t.id, turnId: turn.id, pid: null });
-					continue;
-				}
-				if (ops.pidAlive(turn.pid)) continue;
-				const entry = running.get(key);
-				if (entry && entry.pid === turn.pid) {
-					running.delete(key); // free the slot now; a late `done` finds the entry abandoned
-					entry.abandoned = true;
-					// The abandoned run's finally never runs while `done` hangs, so its preparing claim
-					// would hold a cap slot forever; the resumed turn re-adds its own.
-					preparing.delete(key);
-				}
-				lost.push({ e, id: t.id, turnId: turn.id, pid: turn.pid });
-			}
+			for (const t of tasks) collectLostRun(e, t, lost, lostChecks);
 		}
+	}
+
+	async function settleLostRows(lost: LostRun[]): Promise<void> {
 		for (const { e, id, turnId, pid } of lost) {
 			const error =
 				pid === null
@@ -1758,6 +2014,9 @@ export function createTurnLoop(
 				logStoreError(e.store.name, err);
 			}
 		}
+	}
+
+	async function settleLostChecks(lostChecks: LostCheckRun[]): Promise<void> {
 		for (const { e, id, checkKey, pid } of lostChecks) {
 			const error =
 				pid === null
@@ -1778,26 +2037,243 @@ export function createTurnLoop(
 		}
 	}
 
+	/** Settles open turns whose agent process vanished while the tracker stayed up (killed agent,
+	 * emulator hang, machine sleep): a spawned grandchild can hold the run's stdio pipes open, the
+	 * child's `close` never fires, and without this the turn row stays open forever while the
+	 * scheduler's arch-review hold blocks the project's merge queue. Mirrors the boot restart sweep:
+	 * settle the row, then requeue through the same resume route. Detection only — nothing is killed
+	 * here. Runs from every schedule() tick, so board start (server.ts calls schedule() once at
+	 * boot) sweeps stale rows too. */
+	async function sweepLostTurns(): Promise<void> {
+		// Same fabricated data: the lost-turn sweep runs on every schedule tick.
+		if (demoBoard()) return;
+		await pollDetachedWatchers();
+		// Synchronous scan: claimed entries leave `running` before the first await, so a re-entrant
+		// schedule() cannot double-settle a row.
+		const lost: LostRun[] = [];
+		const lostChecks: LostCheckRun[] = [];
+		collectLostRuns(lost, lostChecks);
+		await settleLostRows(lost);
+		await settleLostChecks(lostChecks);
+	}
+
+	/** One project's sync-commit hygiene findings; empty when none apply. */
+	async function syncCommitFinding(e: TurnProject): Promise<string[]> {
+		const lines: string[] = [];
+		if (e.gitless) return lines;
+		const target = e.target;
+		if (target === null || !target.startsWith("origin/")) return lines;
+		const short = target.slice("origin/".length);
+		const branch = await ops.checkedOutBranch(e.path).catch(() => null);
+		if (branch !== null && branch !== short)
+			lines.push(
+				`Board: ${e.name}'s main checkout is on branch ${branch}, not ${short}.`,
+			);
+		if (await ops.branchUnpushed(e.path, short))
+			lines.push(`Board: ${e.name}'s local ${short} has commits origin lacks.`);
+		return lines;
+	}
+
 	/** OTTR-531: one line per sync-commit hygiene finding, appended to a settled turn's
 	 * outcome details. Git failures add no line (the tick refreshes the flags instead). */
 	async function syncCommitFindings(): Promise<string[]> {
 		const lines: string[] = [];
-		for (const e of projects.values()) {
-			if (e.gitless) continue;
-			const target = e.target;
-			if (target === null || !target.startsWith("origin/")) continue;
-			const short = target.slice("origin/".length);
-			const branch = await ops.checkedOutBranch(e.path).catch(() => null);
-			if (branch !== null && branch !== short)
-				lines.push(
-					`Board: ${e.name}'s main checkout is on branch ${branch}, not ${short}.`,
-				);
-			if (await ops.branchUnpushed(e.path, short))
-				lines.push(
-					`Board: ${e.name}'s local ${short} has commits origin lacks.`,
-				);
-		}
+		for (const e of projects.values())
+			lines.push(...(await syncCommitFinding(e)));
 		return lines;
+	}
+
+	/** OTTR-531: on the false→true edge of an unpushed main, a standing pushSyncCommits
+	 * approval pushes the local target ref once — no edge (a failed push leaves the flag true)
+	 * means no retry storm. */
+	function syncUnpushedMain(
+		e: TurnProject,
+		branch: string,
+		unpushed: boolean,
+	): void {
+		const edge = !e.mainUnpushed && unpushed;
+		e.mainUnpushed = unpushed;
+		if (!edge || !e.store.getSettings().pushSyncCommits) return;
+		const settings = e.store.getSettings();
+		void ops
+			.serverMergePush(
+				e.path,
+				e.path,
+				`origin/${branch}`,
+				"",
+				null,
+				settings.originUrl,
+			)
+			.then((p) => {
+				if (p.status === "pushed") {
+					// The hold lifts at once instead of waiting for the next tick.
+					e.mainUnpushed = false;
+					// OTTR-708: record the head this board-made push moved the
+					// main checkout to, so the checkout guard discounts it.
+					void ops
+						.checkoutState(e.path)
+						.then((s) => {
+							if (s.head !== null) boardPushedHeads.set(e.name, s.head);
+						})
+						.catch(() => {});
+					console.log(
+						`${e.store.name}: - pushed ${branch} from the server (push sync commits)`,
+					);
+				} else if (p.status === "skipped") {
+					console.log(
+						`${e.store.name}: ! sync-commit push of ${branch} skipped`,
+					);
+				} else {
+					console.log(
+						`${e.store.name}: ! sync-commit push of ${branch} failed: ${p.error}`,
+					);
+				}
+			})
+			.catch((err: unknown) => {
+				console.log(
+					`${e.store.name}: ! sync-commit push of ${branch} failed: ${errmsg(err)}`,
+				);
+			});
+	}
+
+	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (with the standing
+	 * pushSyncCommits approval above), mainBranch, release/arch-review/PR flags. */
+	function refreshProjectFlags(e: TurnProject): void {
+		void ops
+			.isClean(e.path)
+			.then((clean) => {
+				e.dirty = !clean;
+			})
+			.catch(() => {
+				// git failed (e.g. the folder vanished): keep the last dirty flag; the next tick retries.
+			});
+		// OTTR-506: the merge hold's git fact, refreshed like the dirty flag — a failed
+		// check keeps the last value and the next tick retries.
+		const branch =
+			e.target?.startsWith("origin/") === true
+				? (e.target?.slice("origin/".length) ?? null)
+				: null;
+		if (branch !== null)
+			void ops
+				.branchUnpushed(e.path, branch)
+				.then((unpushed) => syncUnpushedMain(e, branch, unpushed))
+				.catch(() => {
+					// git failed: keep the last mainUnpushed flag; the next tick retries.
+				});
+		// OTTR-531: the off-default finding's git fact, refreshed like the dirty flag —
+		// a failed check keeps the last mainBranch; the next tick retries.
+		void ops
+			.checkedOutBranch(e.path)
+			.then((b) => {
+				e.mainBranch = b;
+			})
+			.catch(() => {
+				// git failed: keep the last mainBranch; the next tick retries.
+			});
+		void ops.refreshRelease(e);
+		void ops.refreshArchReview(e);
+		void ops.refreshOpenPrs?.(e);
+	}
+
+	/** One project's dispatch: pick runnable cards and start a turn for each. True when the
+	 * tick must stop (the global cap bit). */
+	function dispatchRunnable(
+		e: TurnProject,
+		drained: boolean,
+		cap: number | null,
+		active: () => number,
+		depProjects: DepProject[],
+	): boolean {
+		const settings = getSettingsLogged(e);
+		const runnable = pickRunnable(e.store.listTasks(), {
+			maxParallel: settings.maxParallel,
+			hasRules: ops.hasRules(e.path),
+			only: drained ? e.store.boardCheckId() : undefined,
+			mainUnpushed: e.mainUnpushed === true,
+			prMode: settings.prMode === true,
+			crossDeps: (did) => findDep(did, depProjects, depProjectOf(e.store)),
+		});
+		for (const t of runnable) {
+			if (cap !== null && active() >= cap) return true;
+			void runTurn(e.store.name, t.id);
+		}
+		// The release command's process takes a cap slot too: do not overbook the tick.
+		return cap !== null && active() >= cap;
+	}
+
+	/** One project of the dispatch loop: start its runnable turns, then settle review cards
+	 * unless an update drain holds the board. True when the tick must stop (the cap bit). */
+	function dispatchProject(
+		e: TurnProject,
+		drained: boolean,
+		cap: number | null,
+		active: () => number,
+		depProjects: DepProject[],
+	): boolean {
+		try {
+			if (dispatchRunnable(e, drained, cap, active, depProjects)) return true;
+			if (!drained) void settleReviews(e.store.name);
+			return false;
+		} catch (err) {
+			// One sick store (locked file, missing table) must not stop the other projects'
+			// schedule or turn the write that triggered this tick into a 500.
+			logStoreError(e.store.name, err);
+			return false;
+		}
+	}
+
+	/** One project's low-priority pick. A trending scout already running stops the whole tick. */
+	function pickProjectScout(
+		e: TurnProject,
+		drained: boolean,
+		scout: { name: string; id: string } | null,
+		depProjects: DepProject[],
+	): { name: string; id: string } | { stop: true } | null {
+		try {
+			const tasks = e.store.listTasks();
+			if (
+				tasks.some(
+					(t) =>
+						t.kind === "trending" &&
+						t.cancelledAt === null &&
+						(t.state === "running" || t.state === "preparing"),
+				)
+			)
+				return { stop: true };
+			if (scout !== null) return null;
+			const t = pickLowPriority(tasks, {
+				maxParallel: getSettingsLogged(e).maxParallel,
+				hasRules: ops.hasRules(e.path),
+				only: drained ? e.store.boardCheckId() : undefined,
+				mainUnpushed: e.mainUnpushed === true,
+				crossDeps: (did) => findDep(did, depProjects, depProjectOf(e.store)),
+			});
+			return t === null ? null : { name: e.store.name, id: t.id };
+		} catch (err) {
+			logStoreError(e.store.name, err);
+			return null;
+		}
+	}
+
+	/** The low-priority slot: a trending scout starts only after every project's picks above
+	 * left a free slot, in project order, at most one per call and one running board-wide.
+	 * Returns the scout to start, or a stop mark when one already runs (the tick ends). */
+	function pickScout(
+		drained: boolean,
+		cap: number | null,
+		active: () => number,
+		depProjects: DepProject[],
+	): { name: string; id: string } | { stop: true } | null {
+		if (cap !== null && active() >= cap) return { stop: true };
+		let scout: { name: string; id: string } | null = null;
+		for (const e of projects.values()) {
+			const found = pickProjectScout(e, drained, scout, depProjects);
+			if (found !== null) {
+				if ("stop" in found) return found;
+				scout = found;
+			}
+		}
+		return scout;
 	}
 
 	function schedule(): void {
@@ -1805,89 +2281,7 @@ export function createTurnLoop(
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
 		// Refresh every project first: a full cap must not skip the later projects' dirty and
 		// release flags (they gate the board and the merge queue).
-		for (const e of projects.values()) {
-			void ops
-				.isClean(e.path)
-				.then((clean) => {
-					e.dirty = !clean;
-				})
-				.catch(() => {
-					// git failed (e.g. the folder vanished): keep the last dirty flag; the next tick retries.
-				});
-			// OTTR-506: the merge hold's git fact, refreshed like the dirty flag — a failed
-			// check keeps the last value and the next tick retries.
-			const branch =
-				e.target !== null && e.target.startsWith("origin/")
-					? e.target.slice("origin/".length)
-					: null;
-			if (branch !== null)
-				void ops
-					.branchUnpushed(e.path, branch)
-					.then((unpushed) => {
-						// OTTR-531: on the false→true edge of an unpushed main, a standing
-						// pushSyncCommits approval pushes the local target ref once — no edge
-						// (a failed push leaves the flag true) means no retry storm.
-						const edge = !e.mainUnpushed && unpushed;
-						e.mainUnpushed = unpushed;
-						if (!edge || !e.store.getSettings().pushSyncCommits) return;
-						const settings = e.store.getSettings();
-						void ops
-							.serverMergePush(
-								e.path,
-								e.path,
-								`origin/${branch}`,
-								"",
-								null,
-								settings.originUrl,
-							)
-							.then((p) => {
-								if (p.status === "pushed") {
-									// The hold lifts at once instead of waiting for the next tick.
-									e.mainUnpushed = false;
-									// OTTR-708: record the head this board-made push moved the
-									// main checkout to, so the checkout guard discounts it.
-									void ops
-										.checkoutState(e.path)
-										.then((s) => {
-											if (s.head !== null) boardPushedHeads.set(e.name, s.head);
-										})
-										.catch(() => {});
-									console.log(
-										`${e.store.name}: - pushed ${branch} from the server (push sync commits)`,
-									);
-								} else if (p.status === "skipped") {
-									console.log(
-										`${e.store.name}: ! sync-commit push of ${branch} skipped`,
-									);
-								} else {
-									console.log(
-										`${e.store.name}: ! sync-commit push of ${branch} failed: ${p.error}`,
-									);
-								}
-							})
-							.catch((err: unknown) => {
-								console.log(
-									`${e.store.name}: ! sync-commit push of ${branch} failed: ${errmsg(err)}`,
-								);
-							});
-					})
-					.catch(() => {
-						// git failed: keep the last mainUnpushed flag; the next tick retries.
-					});
-			// OTTR-531: the off-default finding's git fact, refreshed like the dirty flag —
-			// a failed check keeps the last value and the next tick retries.
-			void ops
-				.checkedOutBranch(e.path)
-				.then((b) => {
-					e.mainBranch = b;
-				})
-				.catch(() => {
-					// git failed: keep the last mainBranch; the next tick retries.
-				});
-			void ops.refreshRelease(e);
-			void ops.refreshArchReview(e);
-			void ops.refreshOpenPrs?.(e);
-		}
+		for (const e of projects.values()) refreshProjectFlags(e);
 		// An update waits for an idle board: the running turns finish, and no new turn, merge or
 		// release publish starts until the restart (scripts/update-image.ts). The board check is
 		// the one exception: it only reads the board, so it never waits for the update, and the
@@ -1903,61 +2297,114 @@ export function createTurnLoop(
 		// OTTR-708: the pickers resolve foreign dependsOn ids across the board's projects.
 		const depProjects = depProjectsOf(projects.values());
 		for (const e of projects.values()) {
-			try {
-				const settings = getSettingsLogged(e);
-				const ownDep = depProjectOf(e.store);
-				const runnable = pickRunnable(e.store.listTasks(), {
-					maxParallel: settings.maxParallel,
-					hasRules: ops.hasRules(e.path),
-					only: drained ? e.store.boardCheckId() : undefined,
-					mainUnpushed: e.mainUnpushed === true,
-					prMode: settings.prMode === true,
-					crossDeps: (did) => findDep(did, depProjects, ownDep),
-				});
-				for (const t of runnable) {
-					if (cap !== null && active() >= cap) return;
-					void runTurn(e.store.name, t.id);
-				}
-				// The release command's process takes a cap slot too: do not overbook the tick.
-				if (cap !== null && active() >= cap) return;
-				if (!drained) void settleReviews(e.store.name);
-			} catch (err) {
-				// One sick store (locked file, missing table) must not stop the other projects'
-				// schedule or turn the write that triggered this tick into a 500.
-				logStoreError(e.store.name, err);
-			}
+			if (dispatchProject(e, drained, cap, active, depProjects)) return;
 		}
-		// The low-priority slot: a trending scout starts only after every project's picks above
-		// left a free slot, in project order, at most one per call and one running board-wide.
-		if (cap !== null && active() >= cap) return;
-		let scout: { name: string; id: string } | null = null;
-		for (const e of projects.values()) {
-			try {
-				const tasks = e.store.listTasks();
-				if (
-					tasks.some(
-						(t) =>
-							t.kind === "trending" &&
-							t.cancelledAt === null &&
-							(t.state === "running" || t.state === "preparing"),
-					)
-				)
-					return;
-				if (scout !== null) continue;
-				const ownDep = depProjectOf(e.store);
-				const t = pickLowPriority(tasks, {
-					maxParallel: getSettingsLogged(e).maxParallel,
-					hasRules: ops.hasRules(e.path),
-					only: drained ? e.store.boardCheckId() : undefined,
-					mainUnpushed: e.mainUnpushed === true,
-					crossDeps: (did) => findDep(did, depProjects, ownDep),
-				});
-				if (t !== null) scout = { name: e.store.name, id: t.id };
-			} catch (err) {
-				logStoreError(e.store.name, err);
-			}
+		const scouted = pickScout(drained, cap, active, depProjects);
+		if (scouted !== null && !("stop" in scouted))
+			void runTurn(scouted.name, scouted.id);
+	}
+
+	/** The finding cards' mergeHeads, in done order: the anchors that mark which late
+	 * commits are review fixes in the published notes. */
+	function releaseFindingHeads(
+		store: ProjectStore,
+		task: ListedTask,
+	): string[] {
+		return reviewFindings(store.listTasks(), task)
+			.filter(
+				(f): f is ListedTask & { mergeHead: string } =>
+					f.cancelledAt === null && f.mergeHead !== null,
+			)
+			.sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
+			.map((f) => f.mergeHead);
+	}
+
+	/** The default publish: tag the target's head — the review's fixes landed there after the
+	 * reviewed commit, and settleReviews waited for them (publishRelease refuses a head
+	 * without that commit). Returns the release line, or null when a cancel won the claim. */
+	async function publishTaggedRelease(
+		e: TurnProject,
+		task: ListedTask,
+		releaseVersion: string,
+		base: string,
+		settings: ProjectSettings,
+		archReview: { delta: number } | null,
+		findings: string[],
+		claimPublish: () => boolean,
+		log: (line: string) => void,
+	): Promise<string | null> {
+		const head = await ops.resolveTarget(
+			e.path,
+			true,
+			settings.originUrl,
+			settings.targetBranch,
+		);
+		if (head.warning !== null) log(head.warning);
+		if (!claimPublish()) return null;
+		return ops.publishRelease({
+			mainPath: e.path,
+			reviewed: base,
+			sha: head.sha,
+			version: releaseVersion,
+			notes: task.releaseNotes ?? "",
+			findings,
+			github: e.github,
+			archReview,
+			originUrl: settings.originUrl,
+			// Hosted: gh takes the project's minted token, never GH_TOKEN.
+			...(ops.hosted !== undefined && {
+				gh: await hostedGh(e.path, settings.originUrl),
+			}),
+		});
+	}
+
+	/** The project's own release command; the command may refuse a dirty tree. Returns the
+	 * release line, or null when a cancel won the claim. */
+	async function runReleaseCommandPublish(
+		e: TurnProject,
+		task: ListedTask,
+		releaseVersion: string,
+		wt: string,
+		target: string,
+		base: string,
+		releaseCommand: string,
+		originUrl: string | null,
+		archReview: { delta: number } | null,
+		claimPublish: () => boolean,
+		log: (line: string) => void,
+	): Promise<string | null> {
+		const store = e.store;
+		// Outside the worktree: the command may refuse a dirty tree.
+		const notesFile = join(store.tasksDir, `release-${task.id}.md`);
+		writeBelow(store.dataRoot, notesFile, task.releaseNotes ?? "");
+		log(`$ ${releaseCommand}`);
+		if (!claimPublish()) return null;
+		const key = `${store.name}/${task.id}`;
+		let releaseEntry: RunEntry | null = null;
+		try {
+			return await ops.runReleaseCommand({
+				command: releaseCommand,
+				cwd: wt,
+				mainPath: e.path,
+				originUrl,
+				target,
+				sha: base,
+				version: releaseVersion,
+				notesFile,
+				archReview,
+				log: (l) => log(`| ${l}`),
+				onSpawn: (h) => {
+					releaseEntry = h;
+					running.set(key, h);
+				},
+			});
+		} finally {
+			// The command's process is over: free its cap slot. runTurn's finally misses
+			// this entry (it compares against the omp handle), so without this every
+			// release-command publish burns one global-cap slot until a restart.
+			if (releaseEntry !== null && running.get(key) === releaseEntry)
+				running.delete(key);
 		}
-		if (scout !== null) void runTurn(scout.name, scout.id);
 	}
 
 	/** Publish one approved release card: Ottr's tag/push/GitHub release, or the project's release
@@ -1969,6 +2416,7 @@ export function createTurnLoop(
 	async function publishReleaseCard(
 		e: TurnProject,
 		task: ListedTask,
+		releaseVersion: string,
 		base: string,
 		wt: string,
 		target: string,
@@ -1993,76 +2441,167 @@ export function createTurnLoop(
 				.archReviewDelta(e.path, target, lastReviewBase(store.listTasks()))
 				.catch(() => null);
 			const archReview = archDelta !== null ? { delta: archDelta.delta } : null;
-			// The finding cards' mergeHeads, in done order: the anchors that mark which late
-			// commits are review fixes in the published notes.
-			const findings = reviewFindings(store.listTasks(), task)
-				.filter((f) => f.cancelledAt === null && f.mergeHead !== null)
-				.sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
-				.map((f) => f.mergeHead!);
-			let line: string;
-			if (settings.releaseCommand === null) {
-				// Tag the target's head: the review's fixes landed there after the reviewed commit, and
-				// settleReviews waited for them. publishRelease refuses a head without that commit.
-				const head = await ops.resolveTarget(
-					e.path,
-					true,
-					settings.originUrl,
-					settings.targetBranch,
-				);
-				if (head.warning !== null) log(head.warning);
-				if (!claimPublish()) return null;
-				line = await ops.publishRelease({
-					mainPath: e.path,
-					reviewed: base,
-					sha: head.sha,
-					version: task.releaseVersion!,
-					notes: task.releaseNotes ?? "",
-					findings,
-					github: e.github,
-					archReview,
-					originUrl: settings.originUrl,
-					// Hosted: gh takes the project's minted token, never GH_TOKEN.
-					...(ops.hosted !== undefined && {
-						gh: await hostedGh(e.path, settings.originUrl),
-					}),
-				});
-			} else {
-				// Outside the worktree: the command may refuse a dirty tree.
-				const notesFile = join(store.tasksDir, `release-${task.id}.md`);
-				writeBelow(store.dataRoot, notesFile, task.releaseNotes ?? "");
-				log(`$ ${settings.releaseCommand}`);
-				if (!claimPublish()) return null;
-				const key = `${store.name}/${task.id}`;
-				let releaseEntry: RunEntry | null = null;
-				try {
-					line = await ops.runReleaseCommand({
-						command: settings.releaseCommand,
-						cwd: wt,
-						mainPath: e.path,
-						originUrl: settings.originUrl,
-						target,
-						sha: base,
-						version: task.releaseVersion!,
-						notesFile,
-						archReview,
-						log: (l) => log(`| ${l}`),
-						onSpawn: (h) => {
-							releaseEntry = h;
-							running.set(key, h);
-						},
-					});
-				} finally {
-					// The command's process is over: free its cap slot. runTurn's finally misses
-					// this entry (it compares against the omp handle), so without this every
-					// release-command publish burns one global-cap slot until a restart.
-					if (releaseEntry !== null && running.get(key) === releaseEntry)
-						running.delete(key);
-				}
-			}
+			const findings = releaseFindingHeads(store, task);
+			const line =
+				settings.releaseCommand === null
+					? await publishTaggedRelease(
+							e,
+							task,
+							releaseVersion,
+							base,
+							settings,
+							archReview,
+							findings,
+							claimPublish,
+							log,
+						)
+					: await runReleaseCommandPublish(
+							e,
+							task,
+							releaseVersion,
+							wt,
+							target,
+							base,
+							settings.releaseCommand,
+							settings.originUrl,
+							archReview,
+							claimPublish,
+							log,
+						);
+			if (line === null) return null;
 			log(line);
 			return null;
 		} catch (err) {
 			return `Release failed: ${errmsg(err)}. Fix it, then reply to retry.`;
+		}
+	}
+
+	/** The exact state runTurn parks a held review card in; needsReason doubles as the held marker. */
+	function heldReviewCard(t: ListedTask): t is ListedTask & { base: string } {
+		return (
+			t.stage === "merging" &&
+			t.state === "idle" &&
+			t.needsReason !== null &&
+			isReview(t) &&
+			t.base !== null &&
+			t.cancelledAt === null
+		);
+	}
+
+	/** True while a merge that may push runs: one active, or a queued one no review holds. */
+	function mergePushInFlight(live: ListedTask[]): boolean {
+		return live.some(
+			(t) =>
+				t.stage === "merging" &&
+				(t.state === "running" ||
+					t.state === "preparing" ||
+					(t.state === "queued" && mergeHold(live, t) === null)),
+		);
+	}
+
+	/** A release card whose findings are done: publish, park on a failure, or land done with
+	 * the release summary. */
+	async function settleReleaseCard(
+		e: TurnProject,
+		t: ListedTask,
+		releaseVersion: string,
+		base: string,
+		target: string,
+		cancelled: () => boolean,
+	): Promise<void> {
+		// A release publishes from its worktree.
+		if (t.worktree === null) return;
+		const err = await publishReleaseCard(
+			e,
+			t,
+			releaseVersion,
+			base,
+			t.worktree,
+			target,
+		);
+		if (cancelled()) return;
+		if (err !== null) {
+			e.store.updateTask(t.id, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: err,
+			});
+			return;
+		}
+		const commits = await ops.targetCommits(e.path, target);
+		const mergeHead = await ops.targetSha(e.path, target).catch(() => null);
+		// Same capture rule as the plain review done above.
+		const uncommitted =
+			t.worktree !== null && existsSync(t.worktree)
+				? await ops.statusFiles(t.worktree)
+				: [];
+		if (cancelled()) return;
+		e.store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+			summary: `Released ${releaseVersion}`,
+			uncommittedFiles: uncommitted,
+			commits,
+			mergeHead,
+		});
+	}
+
+	/** One review card whose findings are done: the Review button's card lands done, a release
+	 * publishes. A cancel that lands in the awaits leaves the card alone. */
+	async function settleReviewCard(
+		e: TurnProject,
+		t: ListedTask,
+		base: string,
+		target: string,
+		cancelled: () => boolean,
+	): Promise<void> {
+		if (findingsHold(e.store.listTasks(), t) !== null) return;
+		if (t.releaseVersion === null) {
+			// The Review button's card has nothing to publish.
+			const commits = await ops.targetCommits(e.path, target);
+			const mergeHead = await ops.targetSha(e.path, target).catch(() => null);
+			// The review's worktree holds its generated report files; capture them
+			// before cleanupPass removes the tree, like the turn settle does.
+			const uncommitted =
+				t.worktree !== null && existsSync(t.worktree)
+					? await ops.statusFiles(t.worktree)
+					: [];
+			if (cancelled()) return;
+			e.store.updateTask(t.id, {
+				stage: "done",
+				state: "idle",
+				needsReason: null,
+				uncommittedFiles: uncommitted,
+				commits,
+				mergeHead,
+			});
+			return;
+		}
+		await settleReleaseCard(e, t, t.releaseVersion, base, target, cancelled);
+	}
+
+	/** One held review card of the tick: claim the settle, run it, release the claims. */
+	async function settleHeldReview(
+		e: TurnProject,
+		t: ListedTask & { base: string },
+		target: string,
+	): Promise<void> {
+		const key = `${e.store.name}/${t.id}`;
+		if (settling.has(key)) return;
+		settling.add(key);
+		// A release command's process takes a global cap slot: claim it before the first
+		// await, or every project in the same schedule() tick sees the slot free (R3-5).
+		preparing.add(key);
+		// `tasks` is this tick's snapshot and every await below may let a cancel in: re-read
+		// before each write, and leave a cancelled card to cancel.
+		const cancelled = () => e.store.getTask(t.id)?.cancelledAt !== null;
+		try {
+			await settleReviewCard(e, t, t.base, target, cancelled);
+		} finally {
+			settling.delete(key);
+			preparing.delete(key);
+			publishing.delete(key);
 		}
 	}
 
@@ -2081,103 +2620,10 @@ export function createTurnLoop(
 			const live = tasks.filter((t) => t.cancelledAt === null);
 			// Wait out a merge that may push: one that runs, or a queued one no review holds. A merge
 			// this release holds waits for the publish itself, so waiting for it would deadlock.
-			if (
-				live.some(
-					(t) =>
-						t.stage === "merging" &&
-						(t.state === "running" ||
-							t.state === "preparing" ||
-							(t.state === "queued" && mergeHold(live, t) === null)),
-				)
-			)
-				return;
+			if (mergePushInFlight(live)) return;
 			for (const t of tasks) {
-				// The exact state runTurn parks a held review card in; needsReason doubles as the held marker.
-				if (
-					t.stage !== "merging" ||
-					t.state !== "idle" ||
-					t.needsReason === null ||
-					!isReview(t) ||
-					t.base === null ||
-					t.cancelledAt !== null
-				)
-					continue;
-				const key = `${name}/${t.id}`;
-				if (settling.has(key)) continue;
-				settling.add(key);
-				// A release command's process takes a global cap slot: claim it before the first
-				// await, or every project in the same schedule() tick sees the slot free (R3-5).
-				preparing.add(key);
-				// `tasks` is this tick's snapshot and every await below may let a cancel in: re-read
-				// before each write, and leave a cancelled card to cancel.
-				const cancelled = () => e.store.getTask(t.id)?.cancelledAt !== null;
-				try {
-					if (findingsHold(e.store.listTasks(), t) !== null) continue;
-					if (t.releaseVersion === null) {
-						// The Review button's card has nothing to publish.
-						const commits = await ops.targetCommits(e.path, target);
-						const mergeHead = await ops
-							.targetSha(e.path, target)
-							.catch(() => null);
-						// The review's worktree holds its generated report files; capture them
-						// before cleanupPass removes the tree, like the turn settle does.
-						const uncommitted =
-							t.worktree !== null && existsSync(t.worktree)
-								? await ops.statusFiles(t.worktree)
-								: [];
-						if (cancelled()) continue;
-						e.store.updateTask(t.id, {
-							stage: "done",
-							state: "idle",
-							needsReason: null,
-							uncommittedFiles: uncommitted,
-							commits,
-							mergeHead,
-						});
-						continue;
-					}
-					// A release publishes from its worktree.
-					if (t.worktree === null) continue;
-					const err = await publishReleaseCard(
-						e,
-						t,
-						t.base,
-						t.worktree,
-						target,
-					);
-					if (cancelled()) continue;
-					if (err !== null) {
-						e.store.updateTask(t.id, {
-							stage: "in_progress",
-							state: "needs_you",
-							needsReason: err,
-						});
-						continue;
-					}
-					const commits = await ops.targetCommits(e.path, target);
-					const mergeHead = await ops
-						.targetSha(e.path, target)
-						.catch(() => null);
-					// Same capture rule as the plain review done above.
-					const uncommitted =
-						t.worktree !== null && existsSync(t.worktree)
-							? await ops.statusFiles(t.worktree)
-							: [];
-					if (cancelled()) continue;
-					e.store.updateTask(t.id, {
-						stage: "done",
-						state: "idle",
-						needsReason: null,
-						summary: `Released ${t.releaseVersion}`,
-						uncommittedFiles: uncommitted,
-						commits,
-						mergeHead,
-					});
-				} finally {
-					settling.delete(key);
-					preparing.delete(key);
-					publishing.delete(key);
-				}
+				if (!heldReviewCard(t)) continue;
+				await settleHeldReview(e, t, target);
 			}
 		} catch (err) {
 			// Voided by schedule(): a locked store must reject into the log, not unhandled.
@@ -2186,82 +2632,18 @@ export function createTurnLoop(
 	}
 
 	async function runTurn(name: string, id: string): Promise<void> {
-		const e = projects.get(name);
-		if (!e) return;
-		const store = e.store;
-		const task = store.getTask(id);
-		const key = `${name}/${id}`;
-		if (
-			!task ||
-			task.state !== "queued" ||
-			task.cancelledAt !== null ||
-			running.has(key)
-		)
-			return;
-		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
-		// Byte offset of this turn's own log section: captured just before the header write
-		// and stored on the turn row so the board can fetch only the turn's part of the log.
-		let turnLogOffset = 0;
-		// OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
-		// the card stays queued, and the next schedule tick retries. The board-wide gate
-		// (ops.drained() in schedule()) is unchanged; its board-check exception does not apply
-		// here — a "local" hold stops board checks too. Flags read before the claim: they are
-		// the same ones the worker decision below makes.
-		const preRetro = isRetro(task);
-		const preBoardCheck = store.boardCheckId() === id;
-		const target = ops.workerTarget ?? null;
-		// ponytail: `target !== null` appears here and in the ternary below; either
-		// `true`-replacement alone cannot change the branch (the other check re-derives
-		// it), so Stryker's two equivalent mutants of the pair stay without a killer test.
-		// OTTR-532: an eligible turn of a microVM project goes to vm-runner only. A runner
-		// that is down, unconfigured or drained, or a card whose last dispatch it refused as
-		// busy moments ago, leaves the card queued and unclaimed (the board shows vmHoldFor);
-		// it never falls back to the classic pool or the server.
-		const preVm = microVmTurn({
-			microVm: getSettingsLogged(e).microVm === true,
-			kind,
-			retro: preRetro,
-			boardCheck: preBoardCheck,
-			task,
-		});
-		if (preVm) {
-			const vmTarget = ops.vmTarget ?? null;
-			if (vmTarget === null || !vmState.health.ok) return;
-			if (vmTarget.urls.every((u) => ops.drainedRunner(new URL(u).hostname)))
-				return;
-			const busyAt = vmBusyAt.get(key);
-			if (busyAt !== undefined && Date.now() - busyAt < VM_BUSY_RETRY_MS)
-				return;
-		} else {
-			const toWorker =
-				kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
-			const runnerDrained =
-				toWorker && target !== null
-					? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
-					: ops.drainedRunner("local");
-			if (runnerDrained) return;
-		}
-		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
-		store.updateTask(id, {
-			state: "preparing",
-			needsReason: null,
-			asked: null,
-		});
-		preparing.add(key);
-		// A credit-stop mark belongs to a run claimed before the stop; this claim starts clean
-		// (a stop from now on marks it again, and the hold covers the gap until the gate).
-		creditStopped.delete(key);
+		const claim = claimTurn(name, id);
+		if (claim === null) return;
+		const { e, store, task, key, kind } = claim;
 		const log = (line: string) => appendLog(store, id, line);
-		let turn: Turn | null = null;
-		/** This run's slot in `running`; null until startRun returns (the catch/finally may run early). */
-		let entry: RunEntry | null = null;
-		/** Set when sweepLostTurns took over a hung check of this run: the finally must then
-		 * leave the preparing claim alone (it may belong to a replacement run already). */
-		let checkTakenOver = false;
-		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally.
-		 * `main` marks the turn's own work/merge run — the default-role run that carries the
-		 * card outcome and title at the settle (check runs, also one that meters as `default`
-		 * when no check role is set, never carry them). */
+		/** Mutable run state the catch and finally read after a phase helper wrote it. */
+		const mx: TurnRunShared = {
+			entry: null,
+			turn: null,
+			checkTakenOver: false,
+			guardBefore: null,
+		};
+		/** Hosted metering: one entry for each settled agent run of this turn, reported in the finally. */
 		const metered: MeteredRun[] = [];
 		/** Interim metering of this turn's runs that have not settled; the finally closes them. */
 		const interims = new Set<InterimMeter>();
@@ -2277,9 +2659,16 @@ export function createTurnLoop(
 			const interim = interimMeter(
 				ops.hosted,
 				() =>
-					turn === null
+					mx.turn === null
 						? null
-						: { project: name, taskId: id, turnId: turn.id, kind, role, run },
+						: {
+								project: name,
+								taskId: id,
+								turnId: mx.turn.id,
+								kind,
+								role,
+								run,
+							},
 				ops.meteringIntervalMs ?? METERING_INTERVAL_MS,
 			);
 			interims.add(interim);
@@ -2301,3056 +2690,4884 @@ export function createTurnLoop(
 		/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
 		 * hold or this turn's creditStop mark forbids the next model run. The card then parks
 		 * needs_you with the credit reason, unless a cancel or another park already owns it. */
-		const creditBlocked = (): boolean => {
-			if (ops.hosted === undefined) return false;
-			if (!creditHold && !creditStopped.has(key)) return false;
-			log("- model run not started: the board is out of credit");
-			const cur = store.getTask(id);
-			if (
-				cur !== null &&
-				cur.cancelledAt === null &&
-				(cur.state === "preparing" || cur.state === "running")
-			)
-				store.updateTask(id, {
-					state: "needs_you",
-					needsReason: ops.hosted.config.wording.creditReason,
-				});
-			return true;
-		};
+		const creditBlocked = () => creditBlockedRun(store, id, key, log);
 		try {
-			if (
-				ops.hosted !== undefined &&
-				!(await creditGate(ops.hosted, store, task, log))
-			)
-				return;
-			const settings = store.getSettings();
-			// Capture must stay adjacent to the header write: the offset is the header's byte
-			// position in the card log. A missing file is a fresh card, so the header starts at 0.
-			turnLogOffset =
-				statSync(store.logPath(id), { throwIfNoEntry: false })?.size ?? 0;
-			log(`== ${kind} turn ${new Date().toISOString()}`);
-			// A new worktree starts from a freshly fetched target; an existing one keeps its base.
-			const { target, sha, warning } = await ops.resolveTarget(
-				e.path,
-				!task.worktree || !task.branch,
-				settings.originUrl,
-				settings.targetBranch,
+			const header = await prepareTurnHeader(e, store, id, task, kind, log);
+			if (header === null) return;
+			const flags = turnIdentityFlags(store, id, task);
+			const idn = await resolveTurnIdentity(store, id, task, key, flags, log);
+			if (idn === null) return;
+			const loc = await prepareTurnWorktree(
+				e,
+				store,
+				id,
+				task,
+				header,
+				idn,
+				log,
 			);
-			if (warning) log(`! ${warning}`);
-			e.target = target;
+			if (loc === null) return;
+			const wt = loc.wt;
 
-			let wt = task.worktree;
-			let branch = task.branch;
-			const releaseCard = task.releaseVersion !== null && task.base !== null;
+			await captureMergeDiff(store, id, kind, wt, header, idn.interview, log);
+			const input = buildTurnInput(
+				store,
+				id,
+				task,
+				kind,
+				header,
+				idn,
+				loc,
+				log,
+			);
+
+			const route = await routeTurnRun(
+				name,
+				e,
+				store,
+				id,
+				task,
+				kind,
+				header,
+				idn,
+				loc,
+				input,
+				creditBlocked,
+				log,
+			);
+			if (route === null) return;
+
+			const dispatch = await dispatchTurnRun(
+				name,
+				e,
+				store,
+				id,
+				task,
+				key,
+				kind,
+				header,
+				idn,
+				loc,
+				input,
+				route,
+				mx,
+				openMeter,
+				log,
+			);
+			if (dispatch === null) return;
+
+			// True stops (a cancel, a taken-over check, a credit stop) have written their
+			// parks; nothing follows the settle in this try, so only the finally remains.
+			await settleTurnRun(
+				name,
+				e,
+				id,
+				task,
+				key,
+				kind,
+				header,
+				idn,
+				loc,
+				input,
+				route,
+				dispatch,
+				mx,
+				openMeter,
+				creditBlocked,
+			);
+		} catch (err) {
+			settleTurnError(name, store, id, mx, log, err);
+		} finally {
+			releaseRunClaim(name, e, id, task, key, kind, mx, interims, metered);
+		}
+	}
+
+	/** The turn died in the tracker: log the error, close the row when it exists, park the
+	 * card, and revoke any VM token of this card (startRun revokes its own token when its run
+	 * settles; this covers a throw in between). */
+	function settleTurnError(
+		name: string,
+		store: ProjectStore,
+		id: string,
+		mx: TurnRunShared,
+		log: (line: string) => void,
+		err: unknown,
+	): void {
+		const msg = errmsg(err);
+		try {
+			log(`! ${msg}`);
+		} catch {
+			// logging must not mask the error path
+		}
+		if (mx.turn)
+			store.finishTurn(mx.turn.id, { endedAt: Date.now(), error: msg });
+		store.updateTask(id, {
+			state: "needs_you",
+			needsReason: `Tracker error: ${msg}`,
+		});
+		ops.vmTokens?.revokeTask(name, id);
+	}
+
+	/** Releases one finished run's claims and reports its metering: the running slot (only
+	 * when the sweep has not replaced it), the stop mark, the preparing claim and credit-stop
+	 * mark (an abandoned run's claim was already deleted by the sweep and may belong to the
+	 * resumed replacement now — deleting it here would free the replacement's cap slot; a
+	 * taken-over check is the same case), the publishing claim, and each run's usage report
+	 * (also of a stopped or failed run; no interim record goes out after this point, also for
+	 * a run whose result never came). */
+	function releaseRunClaim(
+		name: string,
+		e: TurnProject,
+		id: string,
+		task: Task,
+		key: string,
+		kind: TurnKind,
+		mx: TurnRunShared,
+		interims: Set<InterimMeter>,
+		metered: MeteredRun[],
+	): void {
+		// The sweep may have replaced this entry: only drop the map slot this run still owns.
+		if (mx.entry && running.get(key) === mx.entry) running.delete(key);
+		// A stop that raced a natural finish leaves no mark behind.
+		stopping.delete(key);
+		if (!mx.entry?.abandoned && !mx.checkTakenOver) {
+			preparing.delete(key);
+			creditStopped.delete(key);
+		}
+		publishing.delete(key);
+		for (const interim of interims) interim.close();
+		if (ops.hosted !== undefined && mx.turn !== null) {
+			// M10: the outcome is the state the board shows after this settle. A parked card
+			// (credit stop, Esc stop, tracker error, check blockers) reads needs_you even when
+			// the run reported none, and the reverse holds: a card the settle requeues (a
+			// dependency hold, steering, a queued rebase retry) waits on the board's queue, so
+			// its needs_you row outcome ships as "queued" — the control plane would otherwise
+			// email the owner about a card nobody must act on. Every other settle keeps the
+			// settled turn row's outcome (ready, answered, integrated). A value outside
+			// /^[a-z_]{1,40}$/ (null included) sends nothing. The title is the card prompt's
+			// first line, trimmed and cut to 200 characters; an empty line sends nothing.
+			const settledTask = e.store.getTask(id);
+			const row = e.store.listTurns(id).at(-1)?.outcome ?? null;
+			const rowOutcome =
+				row !== null && /^[a-z_]{1,40}$/.test(row) ? row : null;
+			let outcome: string | null = rowOutcome;
+			if (settledTask?.state === "needs_you") outcome = "needs_you";
+			else if (settledTask?.state === "queued" && rowOutcome === "needs_you")
+				outcome = "queued";
+			const firstLine = task.prompt.split("\n")[0]?.trim() ?? "";
+			const title = firstLine === "" ? null : firstLine.slice(0, 200);
+			for (const entry of metered) {
+				const { main, ...r } = entry;
+				sendMetering(ops.hosted, {
+					project: name,
+					taskId: id,
+					turnId: mx.turn.id,
+					kind,
+					...r,
+					final: true,
+					...(main === true && outcome !== null ? { outcome } : {}),
+					...(main === true && title !== null ? { title } : {}),
+				});
+			}
+		}
+		schedule();
+	}
+
+	/** The synchronous claim of one queued turn: re-entrancy and drain gates, the preparing
+	 * write, and the run identity. Null: the card is not startable this tick. Runs before the
+	 * first await so a re-entrant schedule() cannot double-start. */
+	function claimTurn(
+		name: string,
+		id: string,
+	): {
+		e: TurnProject;
+		store: ProjectStore;
+		task: Task;
+		key: string;
+		kind: TurnKind;
+	} | null {
+		const e = projects.get(name);
+		if (!e) return null;
+		const store = e.store;
+		const task = store.getTask(id);
+		const key = `${name}/${id}`;
+		if (
+			task?.state !== "queued" ||
+			task.cancelledAt !== null ||
+			running.has(key)
+		)
+			return null;
+		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
+		const preRetro = isRetro(task);
+		const preBoardCheck = store.boardCheckId() === id;
+		if (startGatesHold(e, task, key, kind, preRetro, preBoardCheck))
+			return null;
+		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
+		store.updateTask(id, {
+			state: "preparing",
+			needsReason: null,
+			asked: null,
+		});
+		preparing.add(key);
+		// A credit-stop mark belongs to a run claimed before the stop; this claim starts clean
+		// (a stop from now on marks it again, and the hold covers the gap until the gate).
+		creditStopped.delete(key);
+		return { e, store, task, key, kind };
+	}
+
+	/** OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
+	 * the card stays queued, and the next schedule tick retries. The board-wide gate
+	 * (ops.drained() in schedule()) is unchanged; its board-check exception does not apply
+	 * here — a "local" hold stops board checks too. Flags read before the claim: they are
+	 * the same ones the worker decision in routeTurnRun makes.
+	 * OTTR-532: an eligible turn of a microVM project goes to vm-runner only. A runner
+	 * that is down, unconfigured or drained, or a card whose last dispatch it refused as
+	 * busy moments ago, leaves the card queued and unclaimed (the board shows vmHoldFor);
+	 * it never falls back to the classic pool or the server. */
+	function startGatesHold(
+		e: TurnProject,
+		task: Task,
+		key: string,
+		kind: TurnKind,
+		preRetro: boolean,
+		preBoardCheck: boolean,
+	): boolean {
+		if (
+			microVmTurn({
+				microVm: getSettingsLogged(e).microVm === true,
+				kind,
+				retro: preRetro,
+				boardCheck: preBoardCheck,
+				task,
+			})
+		)
+			return vmStartGateHolds(key);
+		return poolStartGateHolds(kind, preRetro, preBoardCheck);
+	}
+
+	/** The microVM start gate: a down or unconfigured runner, a drain, or a recent busy
+	 * refusal leaves the card queued and unclaimed. */
+	function vmStartGateHolds(key: string): boolean {
+		const vmTarget = ops.vmTarget ?? null;
+		if (vmTarget === null || !vmState.health.ok) return true;
+		if (vmTarget.urls.every((u) => ops.drainedRunner(new URL(u).hostname)))
+			return true;
+		const busyAt = vmBusyAt.get(key);
+		if (busyAt !== undefined && Date.now() - busyAt < VM_BUSY_RETRY_MS)
+			return true;
+		return false;
+	}
+
+	/** The classic-pool start gate: the runner the card would go to is drained. */
+	function poolStartGateHolds(
+		kind: TurnKind,
+		preRetro: boolean,
+		preBoardCheck: boolean,
+	): boolean {
+		// ponytail: `target !== null` appears here and in the ternary below; either
+		// `true`-replacement alone cannot change the branch (the other check re-derives
+		// it), so Stryker's two equivalent mutants of the pair stay without a killer test.
+		const target = ops.workerTarget ?? null;
+		const toWorker =
+			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
+		const runnerDrained =
+			toWorker && target !== null
+				? target.urls.every((u) => ops.drainedRunner(new URL(u).hostname))
+				: ops.drainedRunner("local");
+		return runnerDrained;
+	}
+
+	/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
+	 * hold or this turn's creditStop mark forbids the next model run. The card then parks
+	 * needs_you with the credit reason, unless a cancel or another park already owns it. */
+	function creditBlockedRun(
+		store: ProjectStore,
+		id: string,
+		key: string,
+		log: (line: string) => void,
+	): boolean {
+		if (ops.hosted === undefined) return false;
+		if (!creditHold && !creditStopped.has(key)) return false;
+		log("- model run not started: the board is out of credit");
+		const cur = store.getTask(id);
+		if (
+			cur !== null &&
+			cur.cancelledAt === null &&
+			(cur.state === "preparing" || cur.state === "running")
+		)
+			store.updateTask(id, {
+				state: "needs_you",
+				needsReason: ops.hosted.config.wording.creditReason,
+			});
+		return true;
+	}
+
+	/** Writes the card-log section header and resolves the fetch target the turn runs against
+	 * (a new worktree starts from a freshly fetched target; an existing one keeps its base).
+	 * Hosted: the credit gate runs first, before anything spends a model token. */
+	async function prepareTurnHeader(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		kind: TurnKind,
+		log: (line: string) => void,
+	): Promise<TurnHeader | null> {
+		if (
+			ops.hosted !== undefined &&
+			!(await creditGate(ops.hosted, store, task, log))
+		)
+			return null;
+		const settings = store.getSettings();
+		// Capture must stay adjacent to the header write: the offset is the header's byte
+		// position in the card log. A missing file is a fresh card, so the header starts at 0.
+		const turnLogOffset =
+			statSync(store.logPath(id), { throwIfNoEntry: false })?.size ?? 0;
+		log(`== ${kind} turn ${new Date().toISOString()}`);
+		// A new worktree starts from a freshly fetched target; an existing one keeps its base.
+		const { target, sha, warning } = await ops.resolveTarget(
+			e.path,
+			!task.worktree || !task.branch,
+			settings.originUrl,
+			settings.targetBranch,
+		);
+		if (warning) log(`! ${warning}`);
+		e.target = target;
+		// A review card reviews the frozen sha it was created with, not the current target head.
+		// A review card's base is always its frozen sha, so `?? sha` only fires for normal tasks.
+		return { settings, target, sha, base: task.base ?? sha, turnLogOffset };
+	}
+
+	/** The per-card kind flags: read once from the task row and reused by every phase. */
+	function turnIdentityFlags(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+	): TurnIdentityFlags {
+		return {
+			releaseCard: task.releaseVersion !== null && task.base !== null,
 			// The Review button's card runs the same read-only review at its frozen base, minus the publish.
-			const reviewCard = isReview(task) && task.base !== null;
-			const retroCard = isRetro(task);
+			reviewCard: isReview(task) && task.base !== null,
+			retroCard: isRetro(task),
 			// The Check the board button's card: only its route sets the mark, never the prompt text.
-			const boardCheck = store.boardCheckId() === id;
-			const interview = task.kind === "interview";
+			boardCheck: store.boardCheckId() === id,
+			interview: task.kind === "interview",
 			// A backlog card only ever runs grill turns: worktree-less, in the main checkout.
-			const grill = task.stage === "backlog";
+			grill: task.stage === "backlog",
 			// The weekly trending scout: read-only in the main checkout, with only the read tools
 			// and its two verdict tools (propose_repo, judge_repo) on the board env. It reads
 			// third-party text, so it runs on a worker when one exists (D6) and never holds the
 			// board's GitHub token, also on a local run.
-			const scout = task.kind === "trending";
-			// Review sessions get one fixed name, applied by the extension before the agent runs,
-			// so the board never depends on the agent inventing a title.
-			let sessionName = releaseCard
-				? "Release review"
-				: reviewCard
-					? "Review"
-					: boardCheck
-						? "Board check"
-						: null;
-			// Every other card gets its title here, in prepare: a tracker-generated name,
-			// persisted before the run and pinned on the session, so the board never waits
-			// for the run's rename (omp's auto titler can take ~30 minutes or never fire).
-			if (sessionName === null) {
-				const named = store.sessionTitle(task);
-				if (named !== null) sessionName = named;
-				else {
-					// The title is a model call: a credit stop in the prepare above ends here.
-					if (creditBlocked()) return;
-					let cause = "unknown failure";
-					const gen = await (ops.genTitle ?? generateTitle)(
-						task.prompt,
-						undefined,
-						(c) => {
-							cause = c;
-						},
-					);
-					if (gen !== null) {
-						store.nameTask(id, gen);
-						// Any pending retry is spent either way; clear it before the transcript
-						// title can win the race the hold was holding back.
-						store.releaseTitleHold(id);
-						sessionName = gen;
-						log(`+ title: ${gen}`);
-					} else {
-						log(
-							`! title generation failed (${cause}); the card shows the prompt cut until the run names itself`,
-						);
-						if (store.titleHold(id)) {
-							// This failed attempt was the one retry an earlier turn scheduled:
-							// give up, so the run's own transcript title can name the card.
-							store.releaseTitleHold(id);
-						} else {
-							// Hosted: the retry is a model call, so a credit stop that lands
-							// before it fires skips it (docs/specs/hosted-mode.md section 5).
-							scheduleTitleRetry(
-								store,
-								id,
-								task.prompt,
-								log,
-								ops,
-								() =>
-									ops.hosted !== undefined &&
-									(creditHold || creditStopped.has(key)),
-							);
-						}
-					}
-				}
-			}
-			// A review card reviews the frozen sha it was created with, not the current target head.
-			// A review card's base is always its frozen sha, so `?? sha` only fires for normal tasks.
-			const base = task.base ?? sha;
-			if (interview || grill || scout) {
-				wt = e.path;
-			} else if (!wt || !branch) {
-				branch = `ott/${id.toLowerCase()}-${slugify(task.title)}`;
-				wt = join(store.worktreesDir, id);
-				log(
-					`+ worktree ${branch} from ${target} at ${base}${releaseCard ? " (frozen release base)" : ""}`,
-				);
-				await ops.createWorktree({
+			scout: task.kind === "trending",
+		};
+	}
+
+	/** Fixes the session name before the run: the fixed name of a release-review, review or
+	 * board-check card, else a tracker-generated title (persisted before the run and pinned on
+	 * the session, so the board never waits for the run's rename — omp's auto titler can take
+	 * ~30 minutes or never fire). Null: a credit stop owns the card, the turn stops. */
+	async function resolveTurnIdentity(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		key: string,
+		flags: TurnIdentityFlags,
+		log: (line: string) => void,
+	): Promise<TurnIdentity | null> {
+		// Review sessions get one fixed name, applied by the extension before the agent runs,
+		// so the board never depends on the agent inventing a title.
+		const sessionName = fixedSessionName(flags);
+		if (sessionName !== null) return { ...flags, sessionName };
+		const named = await resolveSessionTitle(store, id, task, key, log);
+		if (named.stopped) return null;
+		return { ...flags, sessionName: named.name };
+	}
+
+	/** The fixed session name of the board-driven cards; every other card gets its title
+	 * from the stored or generated session title below. */
+	function fixedSessionName(flags: TurnIdentityFlags): string | null {
+		return flags.releaseCard
+			? "Release review"
+			: flags.reviewCard
+				? "Review"
+				: flags.boardCheck
+					? "Board check"
+					: null;
+	}
+
+	/** The stored session title, else one generated title attempt. A stored title wins so a
+	 * rename the user edited stays; a generated one is a model call a credit stop can veto. */
+	async function resolveSessionTitle(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		key: string,
+		log: (line: string) => void,
+	): Promise<{ name: string | null; stopped: boolean }> {
+		const named = store.sessionTitle(task);
+		if (named !== null) return { name: named, stopped: false };
+		// The title is a model call: a credit stop in the prepare above ends the turn.
+		if (creditBlockedRun(store, id, key, log))
+			return { name: null, stopped: true };
+		return {
+			name: await generateSessionTitle(store, id, task, key, log),
+			stopped: false,
+		};
+	}
+
+	/** One title attempt: names the card and clears any pending retry, or logs the failure and
+	 * schedules the one retry an earlier turn may have promised (hosted: skipped under a
+	 * credit stop, docs/specs/hosted-mode.md section 5). */
+	async function generateSessionTitle(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		key: string,
+		log: (line: string) => void,
+	): Promise<string | null> {
+		let cause = "unknown failure";
+		const gen = await (ops.genTitle ?? generateTitle)(
+			task.prompt,
+			undefined,
+			(c) => {
+				cause = c;
+			},
+		);
+		if (gen !== null) {
+			store.nameTask(id, gen);
+			// Any pending retry is spent either way; clear it before the transcript
+			// title can win the race the hold was holding back.
+			store.releaseTitleHold(id);
+			log(`+ title: ${gen}`);
+			return gen;
+		}
+		log(
+			`! title generation failed (${cause}); the card shows the prompt cut until the run names itself`,
+		);
+		if (store.titleHold(id)) {
+			// This failed attempt was the one retry an earlier turn scheduled:
+			// give up, so the run's own transcript title can name the card.
+			store.releaseTitleHold(id);
+		} else {
+			scheduleTitleRetry(
+				store,
+				id,
+				task.prompt,
+				log,
+				ops,
+				() =>
+					ops.hosted !== undefined && (creditHold || creditStopped.has(key)),
+			);
+		}
+		return null;
+	}
+
+	/** Fixes where the turn runs: the main checkout for a worktree-less card, the card's
+	 * worktree otherwise — created fresh when missing, rebuilt when a husk holds a branch
+	 * whose work never landed (OTTR-341/347). Null: a cancel or a husk park owns the card,
+	 * the turn stops. */
+	async function prepareTurnWorktree(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		header: TurnHeader,
+		flags: TurnIdentity,
+		log: (line: string) => void,
+	): Promise<RunLocation | null> {
+		const special = flags.interview || flags.grill || flags.scout;
+		// A card run always holds a branch name here: task.branch, or the one the
+		// worktree step below creates. Worktree-less cards (interview, grill, scout)
+		// never read it — every branch read below sits behind a !special or
+		// wt !== e.path guard — so "" is an unobserved placeholder for them.
+		let branch: string = task.branch ?? "";
+		let wt = task.worktree;
+		if (special) {
+			wt = e.path;
+		} else if (!wt || !branch) {
+			const fresh = await createTurnWorktree(
+				e,
+				store,
+				id,
+				task,
+				header,
+				flags.releaseCard,
+				log,
+			);
+			if (fresh === null) return null;
+			wt = fresh.wt;
+			branch = fresh.branch;
+		}
+		if (
+			await settleHuskWorktree(
+				e,
+				store,
+				id,
+				task,
+				wt,
+				branch,
+				header,
+				special,
+				log,
+			)
+		)
+			return null;
+		return special ? { special: true, wt } : { special: false, wt, branch };
+	}
+
+	/** Creates the card worktree and stamps the card row with it. Null: a cancel landed
+	 * during the create; the fresh worktree is removed again (the agent never ran, so there
+	 * is nothing to lose) and the turn stops. */
+	async function createTurnWorktree(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		header: TurnHeader,
+		releaseCard: boolean,
+		log: (line: string) => void,
+	): Promise<{ wt: string; branch: string } | null> {
+		const branch = `ott/${id.toLowerCase()}-${slugify(task.title)}`;
+		const wt = join(store.worktreesDir, id);
+		log(
+			`+ worktree ${branch} from ${header.target} at ${header.base}${releaseCard ? " (frozen release base)" : ""}`,
+		);
+		await ops.createWorktree({
+			mainPath: e.path,
+			worktreePath: wt,
+			branch,
+			base: header.base,
+			copyExtra: header.settings.copyExtra,
+			log,
+		});
+		store.updateTask(id, { branch, base: header.base, worktree: wt });
+		if (store.getTask(id)?.cancelledAt) {
+			// fresh worktree: the agent never ran, so there is nothing to lose
+			await ops
+				.removeWorktree({
 					mainPath: e.path,
 					worktreePath: wt,
 					branch,
-					base,
-					copyExtra: settings.copyExtra,
-					log,
-				});
-				store.updateTask(id, { branch, base, worktree: wt });
-				if (store.getTask(id)?.cancelledAt) {
-					// fresh worktree: the agent never ran, so there is nothing to lose
-					await ops
-						.removeWorktree({
-							mainPath: e.path,
-							worktreePath: wt,
-							branch,
-						})
-						.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
-					return;
-				}
-			}
+				})
+				.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+			return null;
+		}
+		return { wt, branch };
+	}
 
-			// OTTR-341: never dispatch a turn into a missing worktree. A card whose agent merged
-			// and removed the worktree (AGEN-24) stays queued at a dead cwd: every worker refuses
-			// the turn with a 400 and the card parks on a lost-worker reason forever. When the
-			// approved hold head (U7) or the branch head is already an ancestor of the target,
-			// the work landed: settle done here, the same containment proof the hold settle
-			// accepts for a turn that removed its own worktree. A branch-head proof only counts
-			// when the branch has commits past base (OTTR-349): review, release-review and retro
-			// cards never commit, and base is always an ancestor of the target, so a tip at base
-			// would settle every unrun card done on a vacuous proof. Nothing on the branch is
-			// thrown away (OTTR-347): a tip past base rebuilds the worktree from the branch and
-			// dispatches, a tip at base rebuilds from base (the husk holds no checkout); only a
-			// card whose approved head is not on the target and whose branch cannot speak for
-			// the work parks for the user.
-			if (
-				!interview &&
-				!grill &&
-				!scout &&
-				wt !== null &&
-				branch !== null &&
-				wt === task.worktree &&
-				(await ops.worktreeHusk(wt).catch(() => false))
-			) {
-				const approvedHead = task.updateMergeHead ?? task.forkMergeHead;
-				const branchHead = await ops
-					.targetSha(e.path, `refs/heads/${branch}`)
-					.catch(() => null);
-				const head = approvedHead ?? branchHead;
-				const landed =
-					head !== null &&
-					head !== base &&
-					(await ops.targetContains(e.path, head, target).catch(() => false));
-				// A cancel that landed while the git reads ran owns the card; never write over it.
-				const cur = store.getTask(id);
-				if (cur === null || cur.cancelledAt !== null) return;
-				if (landed) {
-					log(
-						`- worktree is gone; head ${head} is already on ${target}: the card settles done`,
-					);
-					// Same end state as the hold settle for a landed approval; the turn never ran,
-					// so there is no row to finish and its queued reply is consumed unread.
-					store.updateTask(id, {
-						stage: "done",
-						state: "idle",
-						needsReason: null,
-						asked: null,
-						pendingPrompt: null,
-						pendingImages: [],
-						holdHead: null,
-						commits: await ops.targetCommits(e.path, target).catch(() => 0),
-						mergeHead: await ops.targetSha(e.path, target).catch(() => null),
-					});
-					return;
-				}
-				if (branchHead !== null && branchHead !== base) {
-					// OTTR-347: the branch holds commits the target never got; rebuild the
-					// worktree from its tip so the turn resumes the branch's work.
-					log(
-						`+ worktree is gone; recreating ${branch} at its head ${branchHead}`,
-					);
-					await ops.createWorktree({
-						mainPath: e.path,
-						worktreePath: wt,
-						branch,
-						base: branchHead,
-						copyExtra: settings.copyExtra,
-						log,
-					});
-					// A cancel that landed while the worktree was rebuilt owns the card; the
-					// branch holds the work, so nothing is deleted here.
-					if (store.getTask(id)?.cancelledAt) return;
-				} else if (head === null || head === base) {
-					// Nothing approved and nothing committed past base: a husk holds no checkout,
-					// so rebuild the worktree on the same branch (createWorktree reuses the branch
-					// at its tip) and let the turn run from base.
-					log(
-						`- worktree is gone; ${branch} has no commits past ${base}: recreating the worktree`,
-					);
-					await ops.createWorktree({
-						mainPath: e.path,
-						worktreePath: wt,
-						branch,
-						base,
-						copyExtra: settings.copyExtra,
-						log,
-					});
-					store.updateTask(id, { branch, base, worktree: wt });
-					if (store.getTask(id)?.cancelledAt) {
-						// fresh worktree: the agent never ran, so there is nothing to lose
-						await ops
-							.removeWorktree({
-								mainPath: e.path,
-								worktreePath: wt,
-								branch,
-							})
-							.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
-						return;
-					}
-				} else {
-					log(`! worktree is gone; its work is not on ${target}`);
-					store.updateTask(id, {
-						state: "needs_you",
-						needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
-					});
-					return;
-				}
-			}
-
-			// Capture the card's diff now: once the ff-merge lands, the branch tip sits on the target
-			// and no later git view can separate this branch's files from its siblings'. Skipped when
-			// the branch is already integrated (a retried merge turn): the first capture stands.
-			if (
-				kind === "merge" &&
-				!interview &&
-				(await ops.commitsAhead(wt, target).catch(() => 0)) > 0
-			) {
-				const files = await ops.diffStat(wt, base, target).catch(() => null);
-				const text = await ops.diffText(wt, base, target).catch(() => null);
-				if (files !== null) {
-					store.updateTask(id, {
-						diffFiles: files,
-						// ponytail: 200 KB cap — bigger diffs keep their numstat, the raw view truncates; raise the cap when a card needs more.
-						diffText:
-							text === null
-								? null
-								: text.length > 200_000
-									? `${text.slice(0, 200_000)}\n… diff truncated at 200 KB`
-									: text,
-					});
-					log(`- captured diff: ${files.length} file(s)`);
-				}
-			}
-
-			const siblings = store
-				.listTasks()
-				.filter(
-					(t) => t.id !== id && t.cancelledAt === null && t.stage !== "done",
-				)
-				.map((t) => ({ title: t.title, stage: t.stage, branch: t.branch }));
-
-			// Fresh read: steering can land between the pick and the omp spawn, so pendingPrompt is read as
-			// late as possible and only the consumed prefix is cleared after startRun.
-			const live = store.getTask(id) ?? task;
-			const raw = live.pendingPrompt;
-			// A dep-held card parks the marker; the real reply names each dependency and its end
-			// state, known only at restart (the scheduler starts the card only once they are done
-			// or cancelled — a dependency missing from the project counts as done).
-			const all = store.listTasks();
-			const pending =
-				raw === DEP_HELD_PROMPT
-					? depResumePrompt({
-							deps: live.dependsOn.map((did) => {
-								// OTTR-708: a foreign dependency's title comes from its project's
-								// store; this runs once, on the dep-held restart only.
-								const d =
-									all.find((t) => t.id === did) ??
-									findDep(
-										did,
-										depProjectsOf(projects.values()),
-										depProjectOf(store),
-									);
-								return {
-									id: did,
-									title: d?.title ?? did,
-									done: d === undefined || d === null || d.stage === "done",
-								};
-							}),
-						})
-					: raw;
-			const plan = resumePlan(
-				live.sessionId,
-				sessionFile(store.sessionsDir, live.sessionId) !== null,
-				pending,
+	// OTTR-341: never dispatch a turn into a missing worktree. A card whose agent merged
+	// and removed the worktree (AGEN-24) stays queued at a dead cwd: every worker refuses
+	// the turn with a 400 and the card parks on a lost-worker reason forever. When the
+	// approved hold head (U7) or the branch head is already an ancestor of the target,
+	// the work landed: settle done here, the same containment proof the hold settle
+	// accepts for a turn that removed its own worktree. A branch-head proof only counts
+	// when the branch has commits past base (OTTR-349): review, release-review and retro
+	// cards never commit, and base is always an ancestor of the target, so a tip at base
+	// would settle every unrun card done on a vacuous proof. Nothing on the branch is
+	// thrown away (OTTR-347): a tip past base rebuilds the worktree from the branch and
+	// dispatches, a tip at base rebuilds from base (the husk holds no checkout); only a
+	// card whose approved head is not on the target and whose branch cannot speak for
+	// the work parks for the user.
+	async function settleHuskWorktree(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		wt: string,
+		branch: string,
+		header: TurnHeader,
+		special: boolean,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		if (
+			special ||
+			wt !== task.worktree ||
+			!(await ops.worktreeHusk(wt).catch(() => false))
+		)
+			return false;
+		const facts = await huskLandedFacts(
+			e,
+			store,
+			id,
+			task,
+			branch,
+			header.base,
+			header.target,
+		);
+		// A cancel that landed while the git reads ran owns the card; never write over it.
+		if (facts === null) return true;
+		if (facts.landed)
+			return settleLandedHusk(e, store, id, header.target, facts.head, log);
+		if (facts.branchHead !== null && facts.branchHead !== header.base)
+			return rebuildHuskAtBranch(
+				e,
+				store,
+				id,
+				wt,
+				branch,
+				facts.branchHead,
+				header,
+				log,
 			);
-			if (plan.resumeId !== live.sessionId)
-				log(
-					`! omp never saved session ${live.sessionId}; starting a fresh session`,
-				);
-			// A fresh session (resumePlan folds the reply into its note) must not swallow a pending
-			// reply: workPrompt carries the note inside its text; the raw release/interview prompt
-			// and mergePrompt get it appended. prompts.ts wording is untouched.
-			const withNote = (base: string) =>
-				plan.note === null ? base : `${base}\n\n${plan.note}`;
-			// startTurn runs after startRun, so the last turn here is the one this reply answers.
-			// A parked merge hold names its hold text as the turn error, so rejectedReport reads it
-			// as a rejected report (AGEN-24): agents read "reply to approve the merge" as an order
-			// and merged by themselves. A hold reason is never a rejection; the reply rides alone.
-			const rejected = rejectedReport(store.listTurns(id).at(-1));
-			const holdRejected =
-				rejected === UPDATE_HOLD_REASON ||
-				rejected === FORK_HOLD_REASON ||
-				rejected === MERGE_HOLD_MISMATCH_REASON;
-			const replyRejected = holdRejected ? null : rejected;
-			const ownPrompt =
-				pending && plan.resumeId
-					? retroCard
-						? retroReplyPrompt({
-								text: pending,
-								rejected: replyRejected,
-							})
-						: replyPrompt({
-								text: pending,
-								kind,
-								release: releaseCard,
-								rejected: replyRejected,
-							})
-					: releaseCard ||
-							interview ||
-							retroCard ||
-							boardCheck ||
-							grill ||
-							scout
-						? withNote(grill ? grillPrompt(task.prompt) : task.prompt)
-						: kind === "work"
-							? workPrompt({
-									text: task.prompt,
-									branch: branch!, // interview and retro cards take the raw-prompt branch above, so branch is a string here
-									siblings,
-									note: plan.note,
-								})
-							: withNote(
-									mergePrompt({
-										branch: branch!,
-										target,
-										pr: settings.prMode === true,
-									}),
-								);
-			// Hosted wording (docs/specs/hosted-mode.md section 1) rides after the prompt, so
-			// prompts.ts stays untouched: the resume text on a reply into a session, else by kind.
-			const wording = ops.hosted?.config.wording;
-			const hostedSuffix =
-				wording === undefined
-					? ""
-					: pending && plan.resumeId
-						? wording.resumeSuffix
-						: kind === "work"
-							? wording.workSuffix
-							: wording.mergeSuffix;
-			const prompt =
-				hostedSuffix === "" ? ownPrompt : `${ownPrompt}\n\n${hostedSuffix}`;
-			// Reply turn: only the reply's images. Work turn: original prompt is re-sent, so its images plus any
-			// not-yet-sent reply images (a reply note before the first omp session). Merge turns get none.
-			const turnImages =
-				pending && plan.resumeId
-					? live.pendingImages
-					: kind === "work"
-						? [...live.images, ...live.pendingImages]
-						: [];
-			const imagePaths = turnImages.map((n) => join(store.imagesDir(id), n));
-			for (const p of imagePaths) {
-				const st = statSync(p, { throwIfNoEntry: false });
-				log(
-					st
-						? `attached image ${p} (${st.size} bytes)`
-						: `attached image ${p} (missing)`,
-				);
-			}
+		if (facts.head !== null && facts.head !== header.base) {
+			parkHuskWorktree(store, id, header.target, log);
+			return true;
+		}
+		return rebuildHuskAtBase(e, store, id, wt, branch, header, log);
+	}
 
-			// D6: merge turns mutate shared state (main checkout, push) and stay server-side;
-			// work turns go to the worker pool when one is configured.
-			// ponytail: the worker path cannot strip the board env, and a retro is a small
-			// read-only run — a per-run env channel for workers is the upgrade path.
-			// A board check stays here as well: only loopback in the server's own container reaches
-			// the whole board API, and the turns' host on a worker only files cards.
-			// OTTR-454: drop workers under a per-runner drain so the round-robin only
-			// sees live workers; the empty-list guard sits after stopBeforeRun below.
-			// OTTR-532: a microVM project's eligible turn (its cwd is the card worktree) goes to
-			// vm-runner and nowhere else; everything else keeps today's routing.
-			const vmTurn =
-				wt !== e.path &&
-				branch !== null &&
-				microVmTurn({
-					microVm: settings.microVm === true,
-					kind,
-					retro: retroCard,
-					boardCheck,
-					task,
+	/** The husk's git facts: the head the approved hold or the branch names and whether the
+	 * target already contains it. Null: a cancel landed while the git reads ran and owns
+	 * the card. */
+	async function huskLandedFacts(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		branch: string,
+		base: string,
+		target: string,
+	): Promise<{
+		head: string | null;
+		landed: boolean;
+		branchHead: string | null;
+	} | null> {
+		const approvedHead = task.updateMergeHead ?? task.forkMergeHead;
+		const branchHead = await ops
+			.targetSha(e.path, `refs/heads/${branch}`)
+			.catch(() => null);
+		const head = approvedHead ?? branchHead;
+		const landed =
+			head !== null &&
+			head !== base &&
+			(await ops.targetContains(e.path, head, target).catch(() => false));
+		const cur = store.getTask(id);
+		if (cur === null || cur.cancelledAt !== null) return null;
+		return { head, landed, branchHead };
+	}
+
+	/** The husk's branch already landed on the target: settle the card done. The turn never
+	 * ran, so there is no row to finish and its queued reply is consumed unread. */
+	async function settleLandedHusk(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		target: string,
+		head: string | null,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		log(
+			`- worktree is gone; head ${head} is already on ${target}: the card settles done`,
+		);
+		// Same end state as the hold settle for a landed approval.
+		store.updateTask(id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+			asked: null,
+			pendingPrompt: null,
+			pendingImages: [],
+			holdHead: null,
+			commits: await ops.targetCommits(e.path, target).catch(() => 0),
+			mergeHead: await ops.targetSha(e.path, target).catch(() => null),
+		});
+		return true;
+	}
+
+	// OTTR-347: the branch holds commits the target never got; rebuild the
+	// worktree from its tip so the turn resumes the branch's work.
+	async function rebuildHuskAtBranch(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		wt: string,
+		branch: string,
+		branchHead: string,
+		header: TurnHeader,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		log(`+ worktree is gone; recreating ${branch} at its head ${branchHead}`);
+		await ops.createWorktree({
+			mainPath: e.path,
+			worktreePath: wt,
+			branch,
+			base: branchHead,
+			copyExtra: header.settings.copyExtra,
+			log,
+		});
+		// A cancel that landed while the worktree was rebuilt owns the card; the
+		// branch holds the work, so nothing is deleted here.
+		if (store.getTask(id)?.cancelledAt) return true;
+		return false;
+	}
+
+	/** Nothing approved and nothing committed past base: a husk holds no checkout, so rebuild
+	 * the worktree on the same branch (createWorktree reuses the branch at its tip) and let
+	 * the turn run from base. */
+	async function rebuildHuskAtBase(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		wt: string,
+		branch: string,
+		header: TurnHeader,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		log(
+			`- worktree is gone; ${branch} has no commits past ${header.base}: recreating the worktree`,
+		);
+		await ops.createWorktree({
+			mainPath: e.path,
+			worktreePath: wt,
+			branch,
+			base: header.base,
+			copyExtra: header.settings.copyExtra,
+			log,
+		});
+		store.updateTask(id, { branch, base: header.base, worktree: wt });
+		if (store.getTask(id)?.cancelledAt) {
+			// fresh worktree: the agent never ran, so there is nothing to lose
+			await ops
+				.removeWorktree({
+					mainPath: e.path,
+					worktreePath: wt,
+					branch,
+				})
+				.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+			return true;
+		}
+		return false;
+	}
+
+	/** The husk's work is not on the target: park the card for the user. */
+	function parkHuskWorktree(
+		store: ProjectStore,
+		id: string,
+		target: string,
+		log: (line: string) => void,
+	): void {
+		log(`! worktree is gone; its work is not on ${target}`);
+		store.updateTask(id, {
+			state: "needs_you",
+			needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
+		});
+	}
+
+	/** Capture the card's diff now: once the ff-merge lands, the branch tip sits on the target
+	 * and no later git view can separate this branch's files from its siblings'. Skipped when
+	 * the branch is already integrated (a retried merge turn): the first capture stands. */
+	async function captureMergeDiff(
+		store: ProjectStore,
+		id: string,
+		kind: TurnKind,
+		wt: string,
+		header: TurnHeader,
+		interview: boolean,
+		log: (line: string) => void,
+	): Promise<void> {
+		if (
+			kind === "merge" &&
+			!interview &&
+			(await ops.commitsAhead(wt, header.target).catch(() => 0)) > 0
+		) {
+			const files = await ops
+				.diffStat(wt, header.base, header.target)
+				.catch(() => null);
+			const text = await ops
+				.diffText(wt, header.base, header.target)
+				.catch(() => null);
+			if (files !== null) {
+				store.updateTask(id, {
+					diffFiles: files,
+					// ponytail: 200 KB cap — bigger diffs keep their numstat, the raw view truncates; raise the cap when a card needs more.
+					diffText:
+						text === null
+							? null
+							: text.length > 200_000
+								? `${text.slice(0, 200_000)}\n… diff truncated at 200 KB`
+								: text,
 				});
-			const worker = vmTurn
-				? (ops.vmTarget ?? null)
-				: retroCard || boardCheck || kind === "merge"
-					? null
-					: (ops.workerTarget ?? null);
-			// A worker installs the project's packages into its own container (vm-runner bakes them
-			// into the project layer); a local run does it here.
-			const local = !worker && !vmTurn;
-			if (local) for (const line of await ops.ensurePackages(name)) log(line);
-			const prep =
-				local && ops.prepareTurn ? await ops.prepareTurn(name) : null;
-			for (const l of prep?.lines ?? []) log(l);
-			// One rule for worker turns: the board lends a token for the model omp runs, and omp runs
-			// that model through an explicit --model, also on a resume. The execution model is the
-			// card's model; else, on a resume, the saved session's model; else the board's default
-			// role. A local run (merge, retro, board check) uses the board store itself: no lending,
-			// and the card's model as before.
-			const execModel =
-				worker === null
-					? null
-					: live.model?.trim() ||
-						(plan.resumeId !== null
-							? sessionModel(store.sessionsDir, plan.resumeId)
-							: null) ||
-						(ops.modelRoles ?? modelRoles)().default?.trim() ||
-						null;
-			// Parks the card with the cause instead of starting omp; a cancel that landed in the
-			// prepare awaits already owns the card (same rule as the preRun check below).
-			const stopBeforeRun = (reason: string): void => {
-				log(`! ${reason}`);
-				const cur = store.getTask(id);
-				if (!cur || cur.cancelledAt !== null || cur.state !== "preparing")
-					return;
-				store.updateTask(id, { state: "needs_you", needsReason: reason });
-			};
-			// The worker target with drained runners dropped; fail closed on an empty list
-			// (a drain landed while the turn prepared): park instead of dispatching to a
-			// drained worker or falling back to the server. A drain that lands after this
-			// point cannot strand the turn: the update script counts every live run on the
-			// runner (the entry's url) before it recreates.
-			const liveWorker =
-				worker === null
-					? null
-					: {
-							urls: worker.urls.filter(
-								(u) => !ops.drainedRunner(new URL(u).hostname),
-							),
-							token: worker.token,
-						};
-			if (vmTurn && (worker === null || ops.vmTokens === undefined)) {
-				// Fail closed: never the classic pool or the server for a microVM turn.
-				stopBeforeRun(
-					"MicroVM mode is on for this project, but the board has no microVM runner (OTTR_VM_RUNNER_URL). Set it, or turn microVM mode off, then reply to retry.",
-				);
-				return;
+				log(`- captured diff: ${files.length} file(s)`);
 			}
-			if (liveWorker !== null && liveWorker.urls.length === 0) {
-				stopBeforeRun(
-					vmTurn
-						? "The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry."
-						: "Every worker is drained for an image update, so the turn did not start. The update undrains the worker when its roll ends; reply to retry.",
-				);
-				return;
-			}
-			if (worker !== null && execModel === null) {
-				stopBeforeRun(
-					"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
-				);
-				return;
-			}
-			// The env values ride the run env into a worker too (the runner forwards them with
-			// the rest of the child env), so every turn gets them and every card log names a
-			// listed name that has no value.
-			// A microVM turn is lent nothing: its providers go through the board's /llm proxy,
-			// so no provider token may ride its env (a null model lends none).
-			const turnEnv = (await ops.turnEnv?.(
-				name,
-				vmTurn ? null : execModel,
-			)) ?? {
-				env: {},
-				missing: [],
-			};
-			if (turnEnv.missing.length > 0)
-				log(
-					`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
-				);
-			// Fail closed: any error value stops the turn, an empty message included.
-			if (
-				turnEnv.credentialError !== undefined &&
-				turnEnv.credentialError !== null
-			) {
-				stopBeforeRun(
-					signInNeedsReason(turnEnv.credentialError, turnEnv.busy === true),
-				);
-				return;
-			}
+		}
+	}
 
-			// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
-			// a merge turn) already owns the card: its kept path wrote the final state. Starting the
-			// run now would drive omp behind a "kept the worktree" card.
-			const preRun = store.getTask(id);
-			if (
-				!preRun ||
-				preRun.cancelledAt !== null ||
-				preRun.state !== "preparing"
+	/** Builds the run's prompt, reply state, and image list: the fresh pending read (steering
+	 * can land between the pick and the omp spawn), the resume plan, the reply/raw prompt with
+	 * hosted wording appended, and the images the run carries. */
+	function buildTurnInput(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		log: (line: string) => void,
+	): TurnInput {
+		const siblings = store
+			.listTasks()
+			.filter(
+				(t) => t.id !== id && t.cancelledAt === null && t.stage !== "done",
 			)
-				return;
+			.map((t) => ({ title: t.title, stage: t.stage, branch: t.branch }));
+		// Fresh read: steering can land between the pick and the omp spawn, so pendingPrompt is read as
+		// late as possible and only the consumed prefix is cleared after startRun.
+		const live = store.getTask(id) ?? task;
+		const raw = live.pendingPrompt;
+		const pending = resumePendingPrompt(store, live, raw);
+		const plan = resumePlan(
+			live.sessionId,
+			sessionFile(store.sessionsDir, live.sessionId) !== null,
+			pending,
+		);
+		if (plan.resumeId !== live.sessionId)
+			log(
+				`! omp never saved session ${live.sessionId}; starting a fresh session`,
+			);
+		// startTurn runs after startRun, so the last turn here is the one this reply answers.
+		// A parked merge hold names its hold text as the turn error, so rejectedReport reads it
+		// as a rejected report (AGEN-24): agents read "reply to approve the merge" as an order
+		// and merged by themselves. A hold reason is never a rejection; the reply rides alone.
+		const rejected = rejectedReport(store.listTurns(id).at(-1));
+		const holdRejected =
+			rejected === UPDATE_HOLD_REASON ||
+			rejected === FORK_HOLD_REASON ||
+			rejected === MERGE_HOLD_MISMATCH_REASON;
+		const replyRejected = holdRejected ? null : rejected;
+		const ownPrompt = turnPrompt(
+			task,
+			kind,
+			header,
+			idn,
+			loc,
+			pending,
+			plan,
+			siblings,
+			replyRejected,
+		);
+		// Hosted wording (docs/specs/hosted-mode.md section 1) rides after the prompt, so
+		// prompts.ts stays untouched: the resume text on a reply into a session, else by kind.
+		const suffix = hostedWordingSuffix(pending, plan, kind);
+		const prompt = suffix === "" ? ownPrompt : `${ownPrompt}\n\n${suffix}`;
+		const turnImages = turnRunImages(kind, live, pending, plan);
+		const imagePaths = turnImages.map((n) => join(store.imagesDir(id), n));
+		logTurnImages(imagePaths, log);
+		return { live, raw, pending, plan, prompt, turnImages, imagePaths };
+	}
 
-			// The previous turn died because omp could not restore the session's saved model (its
-			// provider has no sign-in on the board): an explicit --model skips that restore, so a
-			// board turn on the default role reruns with the board's default role. The card's model stays.
-			const restoreFailed =
-				live.model === null &&
-				worker === null &&
-				plan.resumeId !== null &&
-				store.listTurns(id).at(-1)?.error?.startsWith(MODEL_RESTORE) === true;
-			// The model that runs (and that the turn row records): a worker turn's execution model,
-			// else the restore fallback or the card's model of a local run.
-			const runModel =
-				worker !== null
-					? execModel
-					: restoreFailed
-						? ((ops.modelRoles ?? modelRoles)().default ?? null)
-						: live.model;
-			if (restoreFailed)
-				log(
-					runModel === null
-						? "! the board has no default model role to replace the session's model"
-						: `- model ${runModel}: the board's default role replaces the session's model`,
-				);
+	/** A dep-held card parks the marker; the real reply names each dependency and its end
+	 * state, known only at restart (the scheduler starts the card only once they are done
+	 * or cancelled — a dependency missing from the project counts as done). */
+	function resumePendingPrompt(
+		store: ProjectStore,
+		live: Task,
+		raw: string | null,
+	): string | null {
+		if (raw !== DEP_HELD_PROMPT) return raw;
+		const all = store.listTasks();
+		// OTTR-708: a foreign dependency's title comes from its project's
+		// store; this runs once, on the dep-held restart only.
+		const depProjects = depProjectsOf(projects.values());
+		const ownDep = depProjectOf(store);
+		return depResumePrompt({
+			deps: live.dependsOn.map((did) => {
+				const d =
+					all.find((t) => t.id === did) ?? findDep(did, depProjects, ownDep);
+				return {
+					id: did,
+					title: d?.title ?? did,
+					done: d === undefined || d === null || d.stage === "done",
+				};
+			}),
+		});
+	}
 
-			// Start gate: the dispatched model's provider is out of quota with a known reset.
-			// Starting now would die at the provider's first answer, so requeue with the reset
-			// as holdUntil — the scheduler starts the card when the limit resets. A reply or
-			// steer queued meanwhile stays pending: this start consumed nothing. A cancel
-			// landing during the quota await owns the card; only a still-claimed card requeues.
-			// A queued user message is the override the hold's text promises ("Send a message
-			// to run it now"): the steer and reply routes cleared holdUntil, so only this gate
-			// would re-hold — stale quota data must not trap the user's message until the
-			// reset. Supervisor-authored pending text (a park's own instruction) waits.
-			const userOverride =
-				live.pendingPrompt !== null && live.pendingBy !== "supervisor";
-			const startHold = userOverride
-				? null
-				: await usageResetFor(
-						runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
+	/** The run's own prompt: a reply into the session, the raw release/interview/retro/check
+	 * prompt with the resume note appended, or the work/merge prompt. A fresh session
+	 * (resumePlan folds the reply into its note) must not swallow a pending reply: workPrompt
+	 * carries the note inside its text; the raw prompts and mergePrompt get it appended.
+	 * prompts.ts wording is untouched. */
+	function turnPrompt(
+		task: Task,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		pending: string | null,
+		plan: TurnPlan,
+		siblings: { title: string; stage: Task["stage"]; branch: string | null }[],
+		replyRejected: string | null,
+	): string {
+		return pending && plan.resumeId
+			? replyTurnPrompt(kind, idn, pending, replyRejected)
+			: rawTurnPrompt(task, kind, header, idn, loc, plan, siblings);
+	}
+
+	/** The reply into a resumed session: a retro's verdict-aware reply, else the plain reply. */
+	function replyTurnPrompt(
+		kind: TurnKind,
+		idn: TurnIdentity,
+		pending: string,
+		replyRejected: string | null,
+	): string {
+		return idn.retroCard
+			? retroReplyPrompt({
+					text: pending,
+					rejected: replyRejected,
+				})
+			: replyPrompt({
+					text: pending,
+					kind,
+					release: idn.releaseCard,
+					rejected: replyRejected,
+				});
+	}
+
+	/** The no-reply prompt: a fresh session (resumePlan folds the reply into its note) must
+	 * not swallow a pending reply — workPrompt carries the note inside its text; the raw
+	 * release/interview prompt and mergePrompt get it appended. prompts.ts wording is
+	 * untouched. */
+	function rawTurnPrompt(
+		task: Task,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		plan: TurnPlan,
+		siblings: { title: string; stage: Task["stage"]; branch: string | null }[],
+	): string {
+		// A fresh session (resumePlan folds the reply into its note) must not swallow a pending
+		// reply: workPrompt carries the note inside its text; the raw release/interview prompt
+		// and mergePrompt get it appended. prompts.ts wording is untouched.
+		const withNote = (base: string) =>
+			plan.note === null ? base : `${base}\n\n${plan.note}`;
+		return idn.releaseCard || loc.special || idn.retroCard || idn.boardCheck
+			? withNote(idn.grill ? grillPrompt(task.prompt) : task.prompt)
+			: kind === "work"
+				? workPrompt({
+						text: task.prompt,
+						branch: loc.branch, // loc.special is false here, so branch holds the card's branch
+						siblings,
+						note: plan.note,
+					})
+				: withNote(
+						mergePrompt({
+							branch: loc.branch,
+							target: header.target,
+							pr: header.settings.prMode === true,
+						}),
 					);
-			// The last await before the spawn: a credit stop that landed in any prepare await parks
-			// the card here, before the usage-limit hold could requeue it or omp could start.
-			if (creditBlocked()) return;
-			if (userOverride)
-				log("- user message queued: the usage-limit start gate does not hold");
-			if (startHold !== null) {
-				const at = new Date(startHold.resetsAt)
-					.toISOString()
-					.slice(0, 16)
-					.replace("T", " ");
-				log(
-					`- ${kind} turn held until ${at} UTC: ${startHold.provider} usage limit`,
-				);
-				const cur = store.getTask(id);
-				if (cur && cur.cancelledAt === null && cur.state === "preparing")
-					store.updateTask(id, {
-						state: "queued",
-						queuedAt: Date.now(),
-						holdUntil: startHold.resetsAt,
-						holdProvider: startHold.provider,
-						holdWindow: startHold.window,
-						needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
-					});
-				ops.publishSoon();
-				return;
-			}
+	}
 
-			// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
-			// OTTR-708: work turns that receive workPrompt (work and research cards; the
-			// interview, grill, scout, board-check, release, and retro variants take other
-			// prompts) snapshot every other project's main checkout and re-check it at settle:
-			// the agent must not touch another project's checkout.
-			const checkoutGuard =
-				kind === "work" &&
-				!releaseCard &&
-				!interview &&
-				!retroCard &&
-				!boardCheck &&
-				!grill &&
-				!scout;
-			const guardBefore = checkoutGuard
-				? await snapshotOtherCheckouts(projects, ops, name)
-				: null;
-			const runStartedAt = Date.now();
-			// The work or merge run resolves its model from the default role, also when the card
-			// or session names its own model (docs/specs/hosted-mode.md section 4). It is the
-			// turn's main run: its final record carries the card outcome and title (M10).
-			const runMeter = openMeter("default", true);
-			const handle = ops.startRun({
-				meter: ops.hosted !== undefined,
-				auditProvisioned: (sinceMs, rulesAtStart) =>
-					auditProvisioned(homedir(), sinceMs, rulesAtStart),
-				rulesAtStart: () => rulesDirEntries(homedir()),
-				...(runMeter !== null && { onUsage: runMeter.onUsage }),
-				cwd: wt,
-				prompt,
-				images: imagePaths,
-				// OTTR-693: the identity this turn's git commits with when its home config names none.
-				commitIdentity: ops.commitIdentity?.() ?? null,
-				sessionDir: store.sessionsDir,
-				extensionPath: ops.extensionPath,
-				board: retroCard ? null : { ...ops.board, project: name, taskId: id },
-				resumeId: plan.resumeId,
-				model: runModel,
-				sessionName,
-				worker: vmTurn ? null : liveWorker,
-				vm:
-					vmTurn && liveWorker !== null && ops.vmTokens !== undefined
-						? {
-								target: liveWorker,
-								tokens: ops.vmTokens,
-								grant: {
-									project: name,
-									taskId: id,
-									branch: branch!, // vmTurn requires a branch
-									repoPath: e.path,
-									worktree: wt,
-								},
-								base,
-								boardUrl: ops.board.url,
-							}
-						: null,
-				secrets: turnEnv.secrets,
-				// Retro flags: the retro.yml config sits next to the tracker extension, the
-				// skill is pinned, and the board env is stripped (the proposal files here).
-				// A review run gets OTTR_REVIEW=1: the extension then registers propose_task,
-				// and the findings are recorded, not filed — Ottr files them after the run.
-				env: {
-					...turnEnv.env,
-					...(retroCard
-						? { OTTR_RETRO: "1" }
-						: reviewCard
-							? { OTTR_REVIEW: "1" }
-							: scout
-								? { OTTR_TRENDING: "1" }
-								: {}),
-					// PATH last, so an env.txt value can never shadow the tools link dir.
-					...(prep?.pathDir
-						? { PATH: `${prep.pathDir}:${process.env.PATH ?? ""}` }
-						: {}),
-					// No git host auth for any agent, merge turns included (D6): the server
-					// pushes non-GitHub merges itself after the turn.
-				},
-				stripBoard: retroCard,
-				stripGithubToken: scout,
-				tools: retroCard
-					? "read,grep,glob,report_outcome,propose_task"
-					: scout
-						? "read,grep,glob,report_outcome,propose_repo,judge_repo"
-						: undefined,
-				config: retroCard
-					? join(dirname(ops.extensionPath), "retro.yml")
-					: scout
-						? join(dirname(ops.extensionPath), "trending.yml")
-						: undefined,
-				skills: retroCard ? "retro" : undefined,
-				dataRoot: store.dataRoot,
-				logPath: store.logPath(id),
-				onLog: () => ops.notifyLog(name, id),
-				onProgress: (text) => {
-					if (entry === null) return;
-					// Only a movement of the numbers is live activity: a repeated line (elapsed
-					// ticks of a frozen run, a lock wait) proves nothing and must not reset the
-					// silent-log clock (ALAT-23).
-					const key = text === null ? null : progressKey(text);
-					if (key !== null && key !== entry.progressKey)
-						entry.progressAt = Date.now();
-					entry.progressKey = key ?? undefined;
-					entry.progress = text ?? undefined;
-					ops.publishSoon();
-				},
-				onSession: (sid) => {
-					const cur = store.getTask(id);
-					if (!cur || cur.state !== "preparing" || cur.cancelledAt !== null)
-						return;
-					store.updateTask(id, {
-						sessionId: sid,
-						state: "running",
-						...(kind === "work" && cur.stage === "todo"
-							? { stage: "in_progress" }
-							: {}),
-					});
-				},
-			});
-			entry = handle;
-			running.set(key, entry);
-			if (vmTurn && handle.accepted !== undefined) {
-				// Wait for vm-runner to take the turn before anything records it: a busy answer
-				// must leave the card exactly as it was before the claim (no turn row, the reply
-				// still pending, no lost-worker count). Any other non-start (refused, unreachable,
-				// killed) falls through and settles like today's worker dispatch.
-				const started = await handle.accepted;
-				const early = started ? null : ((await handle.done) as RunResult);
-				if (early?.workerBusy === true) {
-					running.delete(key);
-					vmState.busy.add(key);
-					vmBusyAt.set(key, Date.now());
-					log(
-						`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`,
-					);
-					const cur = store.getTask(id);
-					// A cancel or stop that landed meanwhile owns the card.
-					if (cur && cur.cancelledAt === null && cur.state === "preparing")
-						store.updateTask(id, {
-							state: "queued",
-							needsReason: task.needsReason,
-							asked: task.asked,
-						});
-					ops.publishSoon();
-					return;
-				}
-				vmState.busy.delete(key);
-				vmBusyAt.delete(key);
-			}
-			// Consume only what this turn sends; steering that landed since the build stays queued for the next one.
-			// The column holds the raw parked text (raw, e.g. the dep-hold marker); pending may be the
-			// dispatcher's swap of it, so strip by raw — a mismatched strip would re-steer forever.
-			// The steer route appends with "\n\n", so only raw itself or raw plus that separator is
-			// this turn's text: a cancelled steer replaced by one that merely starts with raw stays whole.
-			const fresh = store.getTask(id);
-			let rest = fresh?.pendingPrompt ?? null;
-			if (raw !== null && pending !== null && rest !== null) {
-				if (rest === raw) rest = null;
-				else if (rest.startsWith(`${raw}\n\n`))
-					rest = rest.slice(raw.length + 2) || null;
-			}
-			// Same prefix rule for images: a steer landing since the build appends, so drop only what this turn sends.
-			let restImages = fresh?.pendingImages ?? [];
-			if (
-				restImages.length >= live.pendingImages.length &&
-				live.pendingImages.every((n, i) => restImages[i] === n)
-			)
-				restImages = restImages.slice(live.pendingImages.length);
-			store.updateTask(id, {
-				pendingPrompt: rest,
-				pendingImages: restImages,
-				// rest holds only steering that landed mid-run (user); a full consume clears.
-				pendingBy: rest === null ? null : "user",
-			});
-			const turnInput =
-				pending &&
-				(plan.resumeId !== null || (plan.note !== null && pending !== "."))
-					? pending
-					: null;
-			turn = store.startTurn(
+	/** Hosted wording (docs/specs/hosted-mode.md section 1) rides after the prompt, so
+	 * prompts.ts stays untouched: the resume text on a reply into a session, else by kind. */
+	function hostedWordingSuffix(
+		pending: string | null,
+		plan: TurnPlan,
+		kind: TurnKind,
+	): string {
+		const wording = ops.hosted?.config.wording;
+		if (wording === undefined) return "";
+		return pending && plan.resumeId
+			? wording.resumeSuffix
+			: kind === "work"
+				? wording.workSuffix
+				: wording.mergeSuffix;
+	}
+
+	/** Reply turn: only the reply's images. Work turn: original prompt is re-sent, so its images
+	 * plus any not-yet-sent reply images (a reply note before the first omp session). Merge turns
+	 * get none. */
+	function turnRunImages(
+		kind: TurnKind,
+		live: Task,
+		pending: string | null,
+		plan: TurnPlan,
+	): string[] {
+		return pending && plan.resumeId
+			? live.pendingImages
+			: kind === "work"
+				? [...live.images, ...live.pendingImages]
+				: [];
+	}
+
+	/** Logs every image the run carries, with its size; a missing file says so. */
+	function logTurnImages(
+		imagePaths: string[],
+		log: (line: string) => void,
+	): void {
+		for (const p of imagePaths) {
+			const st = statSync(p, { throwIfNoEntry: false });
+			log(
+				st
+					? `attached image ${p} (${st.size} bytes)`
+					: `attached image ${p} (missing)`,
+			);
+		}
+	}
+
+	/** Routes and gates the run: where it executes (vm-runner, worker pool, server), the
+	 * execution model, the env, and every start park (drained runners, no model, credential
+	 * fault, a cancel that landed in the prepare awaits, a usage-limit hold). Null: the turn
+	 * stopped before its run. */
+	async function routeTurnRun(
+		name: string,
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		input: TurnInput,
+		creditBlocked: () => boolean,
+		log: (line: string) => void,
+	): Promise<TurnRoute | null> {
+		// D6: merge turns mutate shared state (main checkout, push) and stay server-side;
+		// work turns go to the worker pool when one is configured.
+		// ponytail: the worker path cannot strip the board env, and a retro is a small
+		// read-only run — a per-run env channel for workers is the upgrade path.
+		// A board check stays here as well: only loopback in the server's own container reaches
+		// the whole board API, and the turns' host on a worker only files cards.
+		// OTTR-454: drop workers under a per-runner drain so the round-robin only
+		// sees live workers; the empty-list guard sits after stopBeforeRun below.
+		// OTTR-532: a microVM project's eligible turn (its cwd is the card worktree) goes to
+		// vm-runner and nowhere else; everything else keeps today's routing.
+		const picked = pickTurnWorker(e, kind, header, idn, loc, task);
+		const prep = await prepareTurnPackages(name, picked.local, log);
+		const execModel = resolveExecModel(
+			store,
+			input.live,
+			input.plan,
+			picked.worker,
+		);
+		const start = await gateTurnStart(
+			store,
+			id,
+			picked.vmTurn,
+			picked.worker,
+			execModel,
+			log,
+		);
+		if (start === null) return null;
+		const liveWorker = start.liveWorker;
+		const turnEnv = await gateTurnEnv(
+			name,
+			store,
+			id,
+			picked.vmTurn,
+			execModel,
+			log,
+		);
+		if (turnEnv === null) return null;
+		// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
+		// a merge turn) already owns the card: its kept path wrote the final state. Starting the
+		// run now would drive omp behind a "kept the worktree" card.
+		const preRun = store.getTask(id);
+		if (!preRun || preRun.cancelledAt !== null || preRun.state !== "preparing")
+			return null;
+		const { restoreFailed, runModel } = resolveRunModel(
+			store,
+			id,
+			input.live,
+			input.plan,
+			picked.worker,
+			execModel,
+			log,
+		);
+		if (
+			await gateUsageStart(
+				store,
 				id,
 				kind,
-				prompt,
-				handle.pid,
-				// The user text this turn delivered (steer or reply) — the timeline shows it on the turn.
-				// A fresh session that folded the reply into its prompt records it here too; the "."
-				// continue marker is not user text.
-				turnInput,
-				// The dispatch snapshot: the --model this turn starts with, so the card states the
-				// selected model while it runs; the settled row keeps what the stream served.
+				input.live,
 				runModel,
-				// live was read with raw, so its pendingBy is raw's authorship (a mid-run steer
-				// lands after this read and rides the next turn).
-				turnInput !== null ? live.pendingBy : null,
-				// The layer this run pinned at start (null = flat home); a record only, clean-up reads in-use.json.
-				handle.layerId ?? null,
-				// The card-log byte offset captured with the header write; the drawer fetches the turn's section from it.
-				turnLogOffset,
-			);
+				creditBlocked,
+				log,
+			)
+		)
+			return null;
+		return {
+			vmTurn: picked.vmTurn,
+			worker: picked.worker,
+			liveWorker,
+			local: picked.local,
+			prep,
+			execModel,
+			runModel,
+			restoreFailed,
+			turnEnv,
+		};
+	}
 
-			// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
-			const result0 = (await handle.done) as RunResult;
-			runMeter?.settle(result0);
-			const runEndedAt = Date.now();
-			// sweepLostTurns proved the pid dead and settled this turn's row; a late resolution must
-			// not settle again or clobber the card the sweep requeued.
-			if (entry?.abandoned) return;
-			// OTTR-532: a microVM turn's tree lives in the VM. The server worktree follows the
-			// branch tip in the main checkout (the git endpoint already syncs every push; this
-			// covers a push whose sync failed), and the tree state comes from the VM's own report
-			// below. The head the VM reports is a claim, never a reset target: the worktree only
-			// ever moves to the real tip of the card's branch.
-			const vmOut = vmTurn ? (result0.vm ?? null) : null;
-			if (vmOut !== null) {
-				if (vmOut.pushError !== null)
-					log(`! microVM push failed: ${vmOut.pushError}`);
-				const tip =
-					branch === null
-						? null
-						: await ops
-								.targetSha(e.path, `refs/heads/${branch}`)
-								.catch(() => null);
-				if (vmOut.head !== null && tip !== null && vmOut.head !== tip)
-					log(
-						`! microVM: reported head ${vmOut.head} is not the branch tip ${tip}`,
-					);
-				if (tip === null)
-					log(
-						`! microVM: branch ${branch ?? "(none)"} does not resolve; the worktree is not synced`,
-					);
-				else if (ops.syncWorktreeTo) {
-					const syncTo = ops.syncWorktreeTo;
-					const current = await ops.targetSha(wt, "HEAD").catch(() => null);
-					if (current !== tip)
-						await syncTo(wt, tip).catch((err: unknown) =>
-							log(
-								`! microVM: syncing the worktree to ${tip} failed: ${errmsg(err)}`,
-							),
-						);
-				}
-				// Uncommitted files the turn leaves for the board (the research report, shots)
-				// never ride a push: the sentinel carries them, before the report read below.
-				if (vmOut.files) writeVmFiles(wt, vmOut.files, log);
-			}
-			// The agent self-declares research by writing the report file; its presence at settle flips the card.
-			// Sync read: settle must stay within one microtask flush (tests await runTurn or flush microtasks only).
-			// No symlink is followed: a worker could point the file at a server-only secret (OTTR-233).
-			let reportText: string | null = null;
-			// A refused report (symlink, not a file, too big) holds the card: no quarantine, no removal.
-			let reportError: string | null = null;
-			if (kind === "work" && !interview && !grill && !scout) {
-				try {
-					reportText =
-						readBelow(
-							worktreeAnchor(e.path, wt),
-							join(wt, RESEARCH_REPORT),
-							REPORT_MAX_BYTES,
-						)?.toString("utf8") ?? null;
-				} catch (err) {
-					reportError = errmsg(err);
-					log(`! ${RESEARCH_REPORT}: ${reportError}`);
-				}
-			}
-			const autoResearch =
-				!releaseCard && !task.research && reportText !== null;
-			if (autoResearch) store.updateTask(id, { research: true });
-			const wasResearch = task.research || autoResearch;
-			// A research card's later turn can do real work: a ready outcome, landable clean
-			// commits, and no report file (it cleared the file it once self-declared with). The
-			// demotion needs the git facts below, so the rewrite waits for that case.
-			const demoteCandidate =
-				wasResearch &&
-				!interview &&
-				!grill &&
-				!releaseCard &&
-				reportText === null &&
-				reportError === null &&
-				result0.outcome?.status === "ready";
-			// An interview or trending scout card has nothing to integrate, and agents mix up
-			// statuses: a ready outcome settles done.
-			// A research card has nothing to integrate either: its deliverable is the report file.
-			let result =
-				(interview || scout || wasResearch) &&
-				!demoteCandidate &&
-				result0.outcome?.status === "ready"
-					? {
-							...result0,
-							outcome: { ...result0.outcome, status: "answered" as const },
-						}
-					: result0;
-			running.delete(key);
-
-			if (result.killed || store.getTask(id)?.cancelledAt) {
-				// A stop-turn request owns this kill: end the row as stopped and park the
-				// card like Esc — worktree, branch and session stay, the user replies.
-				const stopReason = stopping.get(key);
-				stopping.delete(key);
-				store.finishTurn(turn.id, {
-					endedAt: Date.now(),
-					exitCode: result.exitCode,
-					error: stopReason !== undefined ? "stopped" : "cancelled",
-				});
-				// A cancel that landed meanwhile owns the card: cancelTask writes its kept
-				// or idle state after the kill, so only mark the card when no cancel ran.
-				const cur = store.getTask(id);
-				if (stopReason !== undefined && cur && cur.cancelledAt === null)
-					store.updateTask(id, {
-						state: "needs_you",
-						needsReason: stopReason,
-					});
-				return;
-			}
-
-			// ponytail: after an agent removes its worktree, an empty folder can stay (omp's cwd holds it on Windows),
-			// and git there reads the main checkout: another card's unpushed merge fails `integrated`, and base..HEAD
-			// counts main's commits. Upgrade: read the task branch from the main repo when `<worktree>/.git` is gone.
-			// A husk (unlinked, no checkout) cannot speak for HEAD at all: when the branch is also gone or
-			// already contained in the target, "integrated" is provable from the main repo alone.
-			const husk =
-				interview || grill || scout
-					? false
-					: await ops.worktreeHusk(wt).catch(() => false);
-			// A deregistered worktree can lose its `.git` file while keeping the checkout: then neither
-			// worktreeLinked (git climbs out) nor worktreeHusk's `.git`-file test fires. isIntegrated
-			// returns false unconditionally there, so a merged card would bounce forever; the branch
-			// inside the main repo is the proof (branchMergedOrGone).
-			const unlinked =
-				!interview &&
-				!grill &&
-				!scout &&
-				!husk &&
-				!(await ops.worktreeLinked(wt).catch(() => false));
-			const fromMain = husk || unlinked;
-			const finishedCleanly =
-				result.exitCode === 0 &&
-				result.sawTerminalEnd &&
-				!result.killed &&
-				!result.approvalRefused &&
-				result.asked === null &&
-				result.outcome?.status !== "needs_you";
-			// Copy agent-reported UI screenshots into the task's images dir, before the
-			// untracked-file quarantine and unsavedWork touch the worktree. Until 2026-10-09 the
-			// tracker extension's report_outcome schema had no shots field, so the harness
-			// dropped every reported shot; a plain work turn whose outcome carries no shots
-			// still adopts the conventional shots/ directory. Never fails the turn. The copy
-			// only reads the worktree: sources stay put, so committed shots keep the tree clean
-			// for the ready gate's isClean read below (deleting them turned tracked files into
-			// ` D` rows and bounced the turn). Adoption skips git-tracked shots: a committed
-			// shot rides every fresh worktree, so adopting it pinned a leftover image on cards
-			// whose agents never captured anything (the 2026-10-14 incident). Scratch shots
-			// under the gitignored /shots/ and root /*.png paths stay on disk unseen (worktree
-			// removal GCs them); other untracked scratch shots are swept afterwards by the
-			// quarantine.
-			let shots: string[] | undefined;
-			if (result.outcome) {
-				// Dedup by content: agents re-report the same screenshots (the same path
-				// twice in one outcome, or again on a later turn of the same card), and each
-				// copy used to land as a fresh numbered file. Seed with what the card has.
-				// Byte-exact copies dedup on the sha256; a re-capture of an unchanged screen
-				// (new bytes, same pixels) matches an existing shot visually and replaces it,
-				// so a check send-back round does not double every screenshot on the card.
-				const seen = new Set<string>();
-				const stored: { name: string; gray: Uint8Array }[] = [];
-				for (const name of task.shots) {
-					try {
-						const bytes = readRegular(join(store.imagesDir(id), name));
-						seen.add(createHash("sha256").update(bytes).digest("hex"));
-						const gray = pngGray16(bytes);
-						if (gray !== null) stored.push({ name, gray });
-					} catch {
-						// pruned or absent: nothing to dedup against
-					}
-				}
-				const reported = result.outcome.shots ?? [];
-				let candidates: [string, string][] = [];
-				if (reported.length > 0) {
-					candidates = reported.map((shot) => [shot, resolve(wt, shot)]);
-				} else if (
-					kind === "work" &&
-					!interview &&
-					!grill &&
-					!scout &&
-					!wasResearch &&
-					!releaseCard &&
-					existsSync(join(wt, "shots"))
-				) {
-					const tracked = new Set(await ops.trackedFiles(wt, "shots"));
-					candidates = readdirSync(join(wt, "shots"), { withFileTypes: true })
-						.filter((d) => d.isFile() && !tracked.has(`shots/${d.name}`))
-						.map((d) => [`shots/${d.name}`, join(wt, "shots", d.name)]);
-				}
-				const copied: DecodedImage[] = [];
-				// Grays of this run's new copies: a second capture of the same new screen
-				// in one outcome skips too, instead of landing as a fresh numbered file.
-				const batch: Uint8Array[] = [];
-				for (const [shot, p] of candidates) {
-					try {
-						if (!p.startsWith(resolve(wt) + sep))
-							log(
-								`! shot ${shot}: path escapes the worktree — keep the path inside the worktree, for example shots/<name>.png (shots/ is gitignored)`,
-							);
-						else {
-							const bytes = readBelow(
-								worktreeAnchor(e.path, wt),
-								p,
-								MAX_IMAGE_BYTES,
-							);
-							if (bytes === null) throw new Error("no such file");
-							const ext = sniffImage(bytes);
-							if (ext === null) log(`! shot ${shot}: not a recognized image`);
-							else {
-								const hash = createHash("sha256").update(bytes).digest("hex");
-								if (seen.has(hash))
-									log(`! shot ${shot}: duplicate of an existing screenshot`);
-								else {
-									const gray = pngGray16(bytes);
-									if (gray === null) {
-										// Undecodable (jpg, webp, exotic png): byte-exact dedup only.
-										seen.add(hash);
-										copied.push({ bytes, ext });
-									} else {
-										const twin = stored.findIndex((s) =>
-											visuallyIdentical(s.gray, gray),
-										);
-										const batchTwin =
-											twin === -1
-												? batch.findIndex((g) => visuallyIdentical(g, gray))
-												: -1;
-										if (twin !== -1) {
-											// Same screen, new bytes: refresh the stored shot in place
-											// instead of appending a second copy of it.
-											const name = stored[twin]!.name;
-											writeBelow(
-												store.dataRoot,
-												join(store.imagesDir(id), name),
-												bytes,
-												"truncate",
-											);
-											stored[twin] = { name, gray };
-											seen.add(hash);
-											log(
-												`! shot ${shot}: visually identical to ${name} — replaced it`,
-											);
-										} else if (batchTwin !== -1) {
-											seen.add(hash);
-											log(
-												`! shot ${shot}: visually identical to a shot saved this turn`,
-											);
-										} else {
-											seen.add(hash);
-											copied.push({ bytes, ext });
-											batch.push(gray);
-										}
-									}
-								}
-							}
-						}
-					} catch (err) {
-						log(`! shot ${shot}: ${err instanceof Error ? err.message : err}`);
-					}
-				}
-				if (copied.length > 0) {
-					const names = saveImages(store.dataRoot, store.imagesDir(id), copied);
-					shots = [...task.shots, ...names].slice(-8); // cap 8, keep newest
-				}
-			}
-			if (
-				kind === "work" &&
-				!interview &&
-				!grill &&
-				!scout &&
-				!wasResearch &&
-				!releaseCard &&
-				finishedCleanly &&
-				reportError === null
-			) {
-				try {
-					const moved = await ops.quarantineUntracked(
-						wt,
-						join(store.tasksDir, "quarantine", id),
-						store.dataRoot,
-					);
-					if (moved.length > 0)
-						appendLog(
-							store,
-							id,
-							`quarantined ${moved.length} untracked file(s) to .tasks/quarantine/${id}: ${moved.slice(0, 20).join(", ")}${moved.length > 20 ? " …" : ""}`,
-						);
-				} catch (err) {
-					appendLog(store, id, `quarantine failed: ${errmsg(err)}`);
-				}
-			}
-			// Per-host git credentials never enter an agent, so the server pushes a merge itself.
-			// It runs before the integration facts: the check reads origin's tip, which only this
-			// push moves. It is gated on proof of the local merge in the main repo, never on what
-			// the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
-			// local branch, and only this push moves it to origin.
-			let pushError: string | null = null;
-			// OTTR-394: the push failed as a rejected non-fast-forward (origin moved).
-			let pushRejected = false;
-			// OTTR-465: git's complete push output for the card log, and a failed origin
-			// re-check ahead of the retry — both reach the card log and the park reason.
-			let pushOutput: string | null = null;
-			let recheckError: string | null = null;
-			// The head a settle parks for a hold: a work-settle hold parks the worktree HEAD, a
-			// merge-hold mismatch park the local target head. A reply approves exactly this head.
-			let holdHead: string | null = null;
-			// OTTR-274: set when a held merge carries patches beyond the approval; parks the card
-			// after classify instead of landing it. holdDiff/holdFiles carry the exact push-side
-			// delta for the reviewer: the parked card's drawer serves them instead of the live
-			// worktree diff, which no longer speaks for the push set.
-			let holdMismatch: string | null = null;
-			let holdDiff: string | null = null;
-			let holdFiles: DiffFileStat[] | null = null;
-			// The origin tip the gate fetched and audited; the push leases against it so a
-			// merge agent cannot aim the fetch and the push at different remotes.
-			let holdTip: string | null = null;
-			// VELV-89: the probe proved the merge already landed on the fetched remote target
-			// with no patches beyond the approval. No park, no push: the settle reads it as the
-			// integration proof (the worktree and the local branch can both still sit behind
-			// origin, so the ordinary git facts cannot prove it).
-			let remoteLanded = false;
-			// The merge push and the OTTR-510 automatic rebase retry in the pushError handling
-			// below push through the same closure. `refused` stays null for every non-merge
-			// turn: only a merge settle pays for the hold-tip read.
-			let refused: string | null = null;
-			// Appends the GitHub-API hint under a bare 401/403; the git error stands alone
-			// when the probe cannot say more. Never throws.
-			const withAuthHint = async (
-				url: string,
-				error: string,
-			): Promise<string> => {
-				if (!GIT_HTTP_AUTH_STATUS.test(error)) return error;
-				try {
-					return error + ((await ops.githubAuthHint(url)) ?? "");
-				} catch {
-					return error;
-				}
-			};
-			// PR mode: the settle's ship step decides the card's next state itself (merging/idle
-			// with the PR stored, or a needs_you park); it overrides classify's done.
-			let prNext: Next | null = null;
-			const runPush = (): Promise<
-				| { status: "skipped" }
-				| { status: "pushed"; output: string }
-				| { status: "failed" | "rejected"; error: string; output?: string }
-			> =>
-				refused !== null
-					? Promise.resolve({
-							status: "failed" as const,
-							error: refused,
-						})
-					: ops
-							.serverMergePush(
-								e.path,
-								wt,
-								target,
-								task.branch ?? "",
-								holdTip,
-								settings.originUrl,
-							)
-							.then(async (p) =>
-								(p.status === "failed" || p.status === "rejected") &&
-								typeof settings.originUrl === "string" &&
-								settings.originUrl !== ""
-									? {
-											...p,
-											error: await withAuthHint(settings.originUrl, p.error),
-										}
-									: p,
-							)
-							.catch((err: unknown) => ({
-								status: "failed" as const,
-								error: errmsg(err),
-							}));
-			const mergeMachinery =
-				kind === "merge" && !interview && !grill && !releaseCard;
-			if (mergeMachinery) {
-				// PR mode ships the card branch itself: the server pushes the branch and opens the
-				// pull request, so nothing local is ever pushed to the target — the merge-hold
-				// machinery and serverMergePush of the target must not run for these cards.
-				if (settings.prMode === true) {
-					// The ship step settles an integrated report and nothing else: the PR prompt
-					// rebases before the gates and the security review, so a clean rebased tree
-					// alone proves nothing about their verdict. A needs_you report (a blocking
-					// finding, a failed gate) must reach classify and park with the agent's
-					// question — prNext stays null so classify decides.
-					if (result.outcome?.status !== "integrated") {
-						if (result.outcome === null)
-							// A lost receipt must not land via classify's git-integrated done
-							// path: nothing was merged, so ask for a human instead.
-							prNext = {
-								stage: "merging",
-								state: "needs_you",
-								needsReason:
-									"The agent finished without calling report_outcome.",
-							};
-					} else if (task.prNumber !== null) {
-						// A card already carrying a PR never re-ships: its PR is open and the
-						// tracker waits on GitHub; the card just stays merging/idle.
-						prNext = { stage: "merging", state: "idle", needsReason: null };
-					} else if (ops.pushBranch === undefined || ops.openPr === undefined) {
-						prNext = {
-							stage: "merging",
-							state: "needs_you",
-							needsReason:
-								"PR mode is on but the server's ship step is not wired; restart the board",
-						};
-					} else {
-						// Ship a proven integration: the same proof classify reads (clean tree,
-						// origin/<target> an ancestor of HEAD). An unproven integrated report
-						// ships nothing — classify takes the not-on-target park.
-						const proof = await ops
-							.prIntegrated?.(e.path, wt, target)
-							.catch(() => false);
-						const prBranch = task.branch ?? "";
-						const tip =
-							proof === true
-								? await ops
-										.targetSha(e.path, `refs/heads/${prBranch}`)
-										.catch(() => null)
-								: null;
-						if (proof !== true) {
-							// No ship: classify parks the integrated report as not-on-target.
-						} else if (tip === null || prBranch === "") {
-							prNext = {
-								stage: "merging",
-								state: "needs_you",
-								needsReason: `PR mode could not read the branch tip for ${prBranch || "(no branch)"}`,
-							};
-						} else if (settings.originUrl === null) {
-							prNext = {
-								stage: "merging",
-								state: "needs_you",
-								needsReason:
-									"no pinned origin URL; restart the board (or set it in project settings) so the server pins the origin remote before pushing the branch",
-							};
-						} else {
-							const pr = await ops
-								.pushBranch(e.path, prBranch, settings.originUrl)
-								.catch((err: unknown) => ({
-									status: "failed" as const,
-									error: errmsg(err),
-								}));
-							if (pr.status === "pushed") {
-								log(`- pushed ${prBranch} from the server`);
-							} else {
-								log(
-									`! server push of ${prBranch} ${pr.status === "rejected" ? "rejected" : "failed"}: ${pr.error}`,
-								);
-								const pushOut = "output" in pr ? (pr.output ?? null) : null;
-								if (pushOut !== null)
-									log(`git's full push output:\n${pushOut}`);
-								const kindAuth =
-									settings.originUrl === null
-										? null
-										: (ops.pushAuthKind?.(settings.originUrl) ?? null);
-								if (kindAuth !== null) log(`- push auth: ${kindAuth}`);
-								prNext = {
-									stage: "merging",
-									state: "needs_you",
-									needsReason: `Server push to origin failed: ${pr.error}`,
-								};
-							}
-							if (pr.status === "pushed") {
-								// The PR needs a GitHub remote: PR mode without one is not a state
-								// the board holds, but the setting can drift — fail closed here.
-								const repo = e.github === null ? null : ownerRepo(e.github);
-								if (repo === null) {
-									prNext = {
-										stage: "merging",
-										state: "needs_you",
-										needsReason:
-											"PR mode requires a GitHub remote on the project; disable PR mode or add the remote",
-									};
-								} else {
-									const slash = repo.indexOf("/");
-									const opened = await ops
-										.openPr({
-											repo,
-											owner: repo.slice(0, slash),
-											branch: prBranch,
-											base: target.replace(/^origin\//, ""),
-											title: task.title,
-											body: prBody(task, result.outcome),
-											// Hosted: gh takes the project's minted token, never GH_TOKEN.
-											...(ops.hosted !== undefined && {
-												gh: await hostedGh(e.path, settings.originUrl),
-											}),
-										})
-										.catch((err: unknown) => ({
-											ok: false as const,
-											error: errmsg(err),
-										}));
-									if (!opened.ok) {
-										log(`! opening the pull request failed: ${opened.error}`);
-										prNext = {
-											stage: "merging",
-											state: "needs_you",
-											needsReason: `Opening the pull request failed: ${opened.error}`,
-										};
-									} else {
-										store.updateTask(id, {
-											stage: "merging",
-											state: "idle",
-											needsReason: null,
-											prNumber: opened.pr.number,
-											prUrl: opened.pr.url,
-											prHeadSha: tip,
-											pushSha: tip,
-										});
-										appendLog(
-											store,
-											id,
-											`- PR #${opened.pr.number} opened (base ${target.replace(/^origin\//, "")})`,
-										);
-										prNext = {
-											stage: "merging",
-											state: "idle",
-											needsReason: null,
-										};
-									}
-								}
-							}
-						}
-					}
-				} else {
-					// An approved merge hold fixes what may ship. The merge turn resumes the same agent
-					// session and could commit beyond the approved head, so the push set
-					// (target..refs/heads/<branch>) must carry exactly the approved patches
-					// (base..approvedHead). Fails closed: git trouble parks the card. A reply to the
-					// mismatch park approves the exact parked head, so a sha-equal re-merge pushes.
-					const approvedHeads = [
-						task.updateMergeHead,
-						task.forkMergeHead,
-					].filter((h) => h !== null);
-					const branch = target.startsWith("origin/")
-						? target.slice("origin/".length)
-						: null;
-					const localHead =
-						branch === null || approvedHeads.length === 0
-							? null
-							: await ops
-									.targetSha(e.path, `refs/heads/${branch}`)
-									.catch(() => null);
-					if (branch !== null && approvedHeads.length > 0) {
-						if (localHead !== null && approvedHeads.includes(localHead)) {
-							// the exact head a reply approved: nothing new to judge
-						} else {
-							// VELV-89: the merge can land through a project rule that pushes the target
-							// from the worktree and never moves the main checkout's local branch, so
-							// the gate below would judge a stale push set and park a landed card. Ask
-							// the fetched remote target first: every approved head already contained
-							// in it and no patches beyond the approval means the merge landed — settle
-							// it. False on git trouble or extra patches: the gate below judges the
-							// push set, and it still fails closed into the park.
-							const landed = await ops
-								.mergeHoldLanded(
-									e.path,
-									target,
-									base,
-									approvedHeads,
-									settings.originUrl,
-								)
-								.catch(() => false);
-							if (landed) {
-								remoteLanded = true;
-								log(
-									`- approved head already on ${target}: the merge landed without the local branch moving`,
-								);
-							} else {
-								for (const ah of approvedHeads) {
-									const { mismatch, pushDiff, auditedTip } = await ops
-										.mergeHoldMismatch(
-											e.path,
-											target,
-											base,
-											ah,
-											settings.originUrl,
-										)
-										.catch(() => ({
-											mismatch: true,
-											pushDiff: null,
-											auditedTip: null,
-										}));
-									if (mismatch) {
-										holdMismatch = MERGE_HOLD_MISMATCH_REASON;
-										holdHead = localHead;
-										// Same cap as the merge-start capture: bigger diffs keep their numstat.
-										holdDiff =
-											pushDiff === null
-												? null
-												: pushDiff.length > 200_000
-													? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
-													: pushDiff;
-										holdFiles =
-											holdDiff === null
-												? null
-												: await ops
-														.diffStat(e.path, target, `refs/heads/${branch}`)
-														.catch(() => null);
-										log(
-											"! held merge carries patches beyond the approved head",
-										);
-										// OTTR-326: the park resets the branch to the gate's audited tip so the
-										// held patches cannot ship with a later card's un-gated push; the
-										// reviewer still reads them from holdDiff/holdFiles. Without an audited
-										// tip (gate fetch failed) there is no trusted tip to reset to, and the
-										// push refusal below keeps the branch pinned instead.
-										const reset =
-											auditedTip !== null &&
-											(await ops
-												.resetBranchTo(e.path, branch, auditedTip)
-												.catch(() => false));
-										if (!reset)
-											log(
-												"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
-											);
-										break;
-									}
-									holdTip = auditedTip;
-								}
-							}
-						}
-					}
-					// OTTR-326: a park whose branch reset could not run leaves the held patches as the
-					// local tip; no other card may push the branch while that head sits there.
-					refused = await heldMergeOnBranchTip(store, id, e.path, branch, ops);
-					// A landed merge has nothing to push: the remote target already holds every
-					// approved patch, and pushing the stale local branch would only fight it.
-					if (holdMismatch === null && !remoteLanded) {
-						let p = await runPush();
-						let authLogged = false;
-						for (let attempt = 1; ; attempt++) {
-							if (p.status === "skipped") break;
-							if (p.status === "pushed") {
-								// A retry that landed erases the earlier failure: the card lands instead
-								// of parking on an error the second push already resolved.
-								pushError = null;
-								pushOutput = null;
-								pushRejected = false;
-								// OTTR-506: the push put the target on origin, so the merge hold lifts
-								// at once instead of waiting for the tick's branchUnpushed refresh.
-								e.mainUnpushed = false;
-								log(`- pushed ${target} from the server`);
-								// OTTR-743: a "cannot lock ref" failure whose head the remote already
-								// holds lands as pushed; name the recovery in the card log.
-								if (p.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
-									log(`- ${p.output}`);
-								// The agent's own push has no credentials (D6). A merge agent that stopped at
-								// needs_you on that authentication failure did integrate: the server push landed
-								// it, so the report becomes integrated with the push output in details.
-								const o = result.outcome;
-								const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
-								if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
-									result = {
-										...result,
-										asked: null,
-										outcome: {
-											...o,
-											status: "integrated",
-											question: undefined,
-											details: `${o.details ?? o.summary}\n\nServer push of ${target}:\n${p.output || "(no output)"}`,
-										},
-									};
-									log(
-										"- needs_you on a push authentication failure resolved: the server pushed",
-									);
-								}
-								break;
-							}
-							pushRejected = p.status === "rejected";
-							pushError = p.error;
-							pushOutput = p.output ?? null;
-							log(
-								`! server push of ${target} ${pushRejected ? "rejected" : "failed"}: ${p.error}`,
-							);
-							// OTTR-465: the card log keeps git's complete output, so the cause a
-							// permission failure points at (a missing App installation, a token scope)
-							// stays visible, and one line names the credential kinds the push could use.
-							if (pushOutput !== null)
-								log(`git's full push output:\n${pushOutput}`);
-							if (!authLogged) {
-								authLogged = true;
-								const kind =
-									settings.originUrl === null
-										? null
-										: (ops.pushAuthKind?.(settings.originUrl) ?? null);
-								if (kind !== null) log(`- push auth: ${kind}`);
-							}
-							// OTTR-465: a push can fail while origin never moved (a dropped connection,
-							// a token-refresh hiccup): ALAT-60 landed unchanged on a later merge turn.
-							// One retry, when a fetch proves the push should still be a fast-forward —
-							// origin's tip still sits at the base the merge started from, or the local
-							// head is a fast-forward of it. A rejected push (origin moved) takes the
-							// OTTR-394 rebase path below instead.
-							if (
-								pushRejected ||
-								refused !== null ||
-								branch === null ||
-								attempt > 1
-							)
-								break;
-							if (settings.originUrl === null) {
-								log(
-									"! no pinned origin URL; cannot re-check origin's tip before a push retry",
-								);
-								break;
-							}
-							const fetchError = await ops
-								.fetchOriginBranch(e.path, branch, settings.originUrl)
-								.then(() => null)
-								.catch((err: unknown) =>
-									withAuthHint(settings.originUrl ?? "", errmsg(err)),
-								);
-							if (fetchError !== null) {
-								// The re-check's own reason (a network error, a token-refresh failure)
-								// rides the park reason; the retry stays off without a proven origin tip.
-								recheckError = fetchError;
-								log(
-									`! origin re-check before a push retry failed: ${fetchError}`,
-								);
-								break;
-							}
-							const originTip = await ops
-								.targetSha(e.path, `refs/remotes/origin/${branch}`)
-								.catch(() => null);
-							const localTip = await ops
-								.targetSha(e.path, `refs/heads/${branch}`)
-								.catch(() => null);
-							const fastForward =
-								originTip !== null &&
-								localTip !== null &&
-								(await ops
-									.targetContains(e.path, originTip, localTip)
-									.catch(() => false));
-							if (!fastForward) {
-								log(
-									"! origin moved or its tip is unreadable; not retrying the push",
-								);
-								break;
-							}
-							const waitMs = ops.pushRetryDelayMs ?? MERGE_PUSH_RETRY_WAIT_MS;
-							log(
-								`- origin did not move; retrying the server push once in ${Math.round(waitMs / 1000)} s`,
-							);
-							await new Promise<void>((r) => setTimeout(r, waitMs));
-							p = await runPush();
-						}
-					}
-				}
-			}
-			// PR mode proves the rebase instead of the merge: origin/<target> an ancestor of the
-			// worktree HEAD on a clean tree — the branch is rebased and ready for the server's
-			// mechanical steps. Every other project keeps today's targetContains proof.
-			const prModeFacts =
-				kind === "merge" &&
-				!interview &&
-				!grill &&
-				!fromMain &&
-				!releaseCard &&
-				settings.prMode === true;
-			const facts: GitFacts = {
-				// An interview card runs in the main checkout with no base branch: the commits-ahead
-				// gate would count its own AGENTS.md commit and trap the card, so it stays exempt.
-				// A trending scout runs there too: the checkout's own commits are never its work.
-				// A husk or unlinked dir would make git speak for the enclosing checkout instead,
-				// so the main-repo proof stands in for all three facts there.
-				commitsAhead:
-					interview || grill || scout || fromMain
-						? 0
-						: await ops.commitsAhead(wt, base).catch(() => 0),
-				// A microVM's tree is gone with the VM: its end-of-run status report decides,
-				// and a VM that could not report (null) is never clean.
-				clean: fromMain
-					? true
-					: vmOut !== null
-						? vmOut.dirty !== null && vmOut.dirty.length === 0
-						: await ops.isClean(wt).catch(() => false),
-				integrated:
-					// VELV-89: the hold probe proved the fetched remote target holds the approved
-					// merge; the stale worktree proof cannot see it.
-					remoteLanded ||
-					(fromMain
-						? await ops
-								.branchMergedOrGone(e.path, task.branch ?? "", target)
-								.catch(() => false)
-						: prModeFacts
-							? ((await ops
-									.prIntegrated?.(e.path, wt, target)
-									.catch(() => false)) ?? false)
-							: await ops.isIntegrated(wt, target).catch(() => false)),
-			};
-			// Landable clean commits with the report file gone: the card did real work after its
-			// research mark. Clear the flag and classify like any other work turn — the ready
-			// outcome was held unrewritten, so classify's ready branch sends it to merging.
-			const demoted = demoteCandidate && facts.commitsAhead > 0 && facts.clean;
-			if (demoted) store.updateTask(id, { research: false });
-			const research = wasResearch && !demoted;
-			// listTurns ends with this turn; the one before it tells classify whether this exit repeats.
-			let next = classify({
+	/** Decides where the run executes: vm-runner for a microVM project's eligible turn, the
+	 * classic worker pool for a plain work turn, the server itself for merges, retros, board
+	 * checks and read-only scouts (D6, OTTR-454, OTTR-532). */
+	function pickTurnWorker(
+		e: TurnProject,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		task: Task,
+	): { vmTurn: boolean; worker: WorkerTarget | null; local: boolean } {
+		const vmTurn =
+			loc.wt !== e.path &&
+			!loc.special &&
+			microVmTurn({
+				microVm: header.settings.microVm === true,
 				kind,
-				result,
-				git: facts,
-				research,
-				hasReport: reportText !== null,
-				grill,
-				target,
-				previousError: store.listTurns(id).at(-2)?.error ?? null,
-				...(vmOut !== null ? { vmDirty: vmOut.dirty } : {}),
-				images: imagePaths.length,
-				http400: () =>
-					findHttp400Rejection({
-						from: runStartedAt,
-						to: runEndedAt,
-						dir: ops.http400Dir,
-					}),
+				retro: idn.retroCard,
+				boardCheck: idn.boardCheck,
+				task,
 			});
-			// The PR-mode ship step owns the card's next state: it never lands, so the done
-			// write below (pushSha pinning, worktree removal, release stamping) is skipped.
-			if (prNext !== null) next = prNext;
-			// A run the provider stopped at its usage limit continues automatically (classify's
-			// queued continue): stamp the provider's reset as the hold, so the continue fires
-			// after the reset instead of against the still-exhausted window. Without a known
-			// reset the retry starts at once; classify's streak rule parks the next identical
-			// death for a human.
-			if (
+		const worker = vmTurn
+			? (ops.vmTarget ?? null)
+			: idn.retroCard || idn.boardCheck || kind === "merge"
+				? null
+				: (ops.workerTarget ?? null);
+		// A worker installs the project's packages into its own container (vm-runner bakes them
+		// into the project layer); a local run does it here.
+		return { vmTurn, worker, local: !worker && !vmTurn };
+	}
+
+	/** A worker installs the project's packages into its own container (vm-runner bakes them
+	 * into the project layer); a local run does it here. */
+	async function prepareTurnPackages(
+		name: string,
+		local: boolean,
+		log: (line: string) => void,
+	): Promise<TurnPrep | null> {
+		if (local) for (const line of await ops.ensurePackages(name)) log(line);
+		const prep = local && ops.prepareTurn ? await ops.prepareTurn(name) : null;
+		for (const l of prep?.lines ?? []) log(l);
+		return prep;
+	}
+
+	/** One rule for worker turns: the board lends a token for the model omp runs, and omp runs
+	 * that model through an explicit --model, also on a resume. The execution model is the
+	 * card's model; else, on a resume, the saved session's model; else the board's default
+	 * role. A local run (merge, retro, board check) uses the board store itself: no lending,
+	 * and the card's model as before. */
+	function resolveExecModel(
+		store: ProjectStore,
+		live: Task,
+		plan: TurnPlan,
+		worker: WorkerTarget | null,
+	): string | null {
+		return worker === null
+			? null
+			: live.model?.trim() ||
+					(plan.resumeId !== null
+						? sessionModel(store.sessionsDir, plan.resumeId)
+						: null) ||
+					(ops.modelRoles ?? modelRoles)().default?.trim() ||
+					null;
+	}
+
+	/** Parks the card with the cause instead of starting omp; a cancel that landed in the
+	 * prepare awaits already owns the card (same rule as the preRun check below). */
+	function parkBeforeRun(
+		store: ProjectStore,
+		id: string,
+		reason: string,
+		log: (line: string) => void,
+	): void {
+		log(`! ${reason}`);
+		const cur = store.getTask(id);
+		if (!cur || cur.cancelledAt !== null || cur.state !== "preparing") return;
+		store.updateTask(id, { state: "needs_you", needsReason: reason });
+	}
+
+	/** The worker target with drained runners dropped; fail closed on an empty list
+	 * (a drain landed while the turn prepared): park instead of dispatching to a drained
+	 * worker or falling back to the server. A drain that lands after this point cannot strand
+	 * the turn: the update script counts every live run on the runner (the entry's url) before
+	 * it recreates. Null: the turn stopped. Null `liveWorker`: a local run, the turn goes on. */
+	async function gateTurnStart(
+		store: ProjectStore,
+		id: string,
+		vmTurn: boolean,
+		worker: WorkerTarget | null,
+		execModel: string | null,
+		log: (line: string) => void,
+	): Promise<{ liveWorker: TurnLiveWorker | null } | null> {
+		const liveWorker =
+			worker === null
+				? null
+				: {
+						urls: worker.urls.filter(
+							(u) => !ops.drainedRunner(new URL(u).hostname),
+						),
+						token: worker.token,
+					};
+		if (vmTurn && (worker === null || ops.vmTokens === undefined)) {
+			// Fail closed: never the classic pool or the server for a microVM turn.
+			parkBeforeRun(
+				store,
+				id,
+				"MicroVM mode is on for this project, but the board has no microVM runner (OTTR_VM_RUNNER_URL). Set it, or turn microVM mode off, then reply to retry.",
+				log,
+			);
+			return null;
+		}
+		if (liveWorker !== null && liveWorker.urls.length === 0) {
+			parkBeforeRun(
+				store,
+				id,
+				vmTurn
+					? "The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry."
+					: "Every worker is drained for an image update, so the turn did not start. The update undrains the worker when its roll ends; reply to retry.",
+				log,
+			);
+			return null;
+		}
+		if (worker !== null && execModel === null) {
+			parkBeforeRun(
+				store,
+				id,
+				"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
+				log,
+			);
+			return null;
+		}
+		return { liveWorker };
+	}
+
+	/** The env values ride the run env into a worker too (the runner forwards them with the
+	 * rest of the child env), so every turn gets them and every card log names a listed name
+	 * that has no value. A microVM turn is lent nothing: its providers go through the board's
+	 * /llm proxy, so no provider token may ride its env (a null model lends none). Null: a
+	 * credential fault parked the card — fail closed, an empty error message included. */
+	async function gateTurnEnv(
+		name: string,
+		store: ProjectStore,
+		id: string,
+		vmTurn: boolean,
+		execModel: string | null,
+		log: (line: string) => void,
+	): Promise<TurnEnvValues | null> {
+		const turnEnv = (await ops.turnEnv?.(name, vmTurn ? null : execModel)) ?? {
+			env: {},
+			missing: [],
+		};
+		if (turnEnv.missing.length > 0)
+			log(
+				`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
+			);
+		if (
+			turnEnv.credentialError !== undefined &&
+			turnEnv.credentialError !== null
+		) {
+			parkBeforeRun(
+				store,
+				id,
+				signInNeedsReason(turnEnv.credentialError, turnEnv.busy === true),
+				log,
+			);
+			return null;
+		}
+		return turnEnv;
+	}
+
+	/** The previous turn died because omp could not restore the session's saved model (its
+	 * provider has no sign-in on the board): an explicit --model skips that restore, so a
+	 * board turn on the default role reruns with the board's default role. The card's model
+	 * stays. The model that runs (and that the turn row records): a worker turn's execution
+	 * model, else the restore fallback or the card's model of a local run. */
+	function resolveRunModel(
+		store: ProjectStore,
+		id: string,
+		live: Task,
+		plan: TurnPlan,
+		worker: WorkerTarget | null,
+		execModel: string | null,
+		log: (line: string) => void,
+	): { restoreFailed: boolean; runModel: string | null } {
+		const restoreFailed =
+			live.model === null &&
+			worker === null &&
+			plan.resumeId !== null &&
+			store.listTurns(id).at(-1)?.error?.startsWith(MODEL_RESTORE) === true;
+		const runModel =
+			worker !== null
+				? execModel
+				: restoreFailed
+					? ((ops.modelRoles ?? modelRoles)().default ?? null)
+					: live.model;
+		if (restoreFailed)
+			log(
+				runModel === null
+					? "! the board has no default model role to replace the session's model"
+					: `- model ${runModel}: the board's default role replaces the session's model`,
+			);
+		return { restoreFailed, runModel };
+	}
+
+	/** Start gate: the dispatched model's provider is out of quota with a known reset.
+	 * Starting now would die at the provider's first answer, so requeue with the reset
+	 * as holdUntil — the scheduler starts the card when the limit resets. A reply or
+	 * steer queued meanwhile stays pending: this start consumed nothing. A cancel
+	 * landing during the quota await owns the card; only a still-claimed card requeues.
+	 * A queued user message is the override the hold's text promises ("Send a message
+	 * to run it now"): the steer and reply routes cleared holdUntil, so only this gate
+	 * would re-hold — stale quota data must not trap the user's message until the
+	 * reset. Supervisor-authored pending text (a park's own instruction) waits.
+	 * The last await before the spawn: a credit stop that landed in any prepare await parks
+	 * the card here, before the usage-limit hold could requeue it or omp could start.
+	 * True: the turn stopped. */
+	async function gateUsageStart(
+		store: ProjectStore,
+		id: string,
+		kind: TurnKind,
+		live: Task,
+		runModel: string | null,
+		creditBlocked: () => boolean,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		const userOverride =
+			live.pendingPrompt !== null && live.pendingBy !== "supervisor";
+		const startHold = userOverride
+			? null
+			: await usageResetFor(
+					runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
+				);
+		if (creditBlocked()) return true;
+		if (userOverride)
+			log("- user message queued: the usage-limit start gate does not hold");
+		if (startHold !== null) {
+			const at = new Date(startHold.resetsAt)
+				.toISOString()
+				.slice(0, 16)
+				.replace("T", " ");
+			log(
+				`- ${kind} turn held until ${at} UTC: ${startHold.provider} usage limit`,
+			);
+			const cur = store.getTask(id);
+			if (cur && cur.cancelledAt === null && cur.state === "preparing")
+				store.updateTask(id, {
+					state: "queued",
+					queuedAt: Date.now(),
+					holdUntil: startHold.resetsAt,
+					holdProvider: startHold.provider,
+					holdWindow: startHold.window,
+					needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
+				});
+			ops.publishSoon();
+			return true;
+		}
+		return false;
+	}
+
+	/** The microVM grant a vm-runner dispatch carries (null for every other run): the lent
+	 * worker target and tokens, the card branch (vmTurn requires a branch), the repo and
+	 * worktree paths, the base, and the board URL. */
+	function vmGrantFor(
+		name: string,
+		e: TurnProject,
+		id: string,
+		header: TurnHeader,
+		loc: RunLocation,
+		route: TurnRoute,
+	): {
+		target: TurnLiveWorker;
+		tokens: VmTokens;
+		grant: {
+			project: string;
+			taskId: string;
+			branch: string;
+			repoPath: string;
+			worktree: string;
+		};
+		base: string;
+		boardUrl: string;
+	} | null {
+		return route.vmTurn &&
+			route.liveWorker !== null &&
+			ops.vmTokens !== undefined
+			? {
+					target: route.liveWorker,
+					tokens: ops.vmTokens,
+					grant: {
+						project: name,
+						taskId: id,
+						branch: loc.special ? "" : loc.branch, // vmTurn requires a branch
+						repoPath: e.path,
+						worktree: loc.wt,
+					},
+					base: header.base,
+					boardUrl: ops.board.url,
+				}
+			: null;
+	}
+
+	/** Starts the agent run (startRun), claims its slot in `running`, waits out a microVM
+	 * busy answer, consumes this turn's pending text and images, and records the turn row.
+	 * Null: vm-runner answered busy — the card went back to the queue untouched. */
+	async function dispatchTurnRun(
+		name: string,
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		key: string,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		input: TurnInput,
+		route: TurnRoute,
+		mx: TurnRunShared,
+		openMeter: OpenRunMeter,
+		log: (line: string) => void,
+	): Promise<TurnDispatch | null> {
+		// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
+		const runStartedAt = Date.now();
+		// OTTR-708: work turns that receive workPrompt (work and research cards; the
+		// interview, grill, scout, board-check, release, and retro variants take other
+		// prompts) snapshot every other project's main checkout and re-check it at settle:
+		// the agent must not touch another project's checkout.
+		const checkoutGuard =
+			kind === "work" &&
+			!idn.releaseCard &&
+			!idn.interview &&
+			!idn.retroCard &&
+			!idn.boardCheck &&
+			!idn.grill &&
+			!idn.scout;
+		if (checkoutGuard)
+			mx.guardBefore = await snapshotOtherCheckouts(projects, ops, name);
+		// The work or merge run resolves its model from the default role, also when the card
+		// or session names its own model (docs/specs/hosted-mode.md section 4). It is the
+		// turn's main run: its final record carries the card outcome and title (M10).
+		const runMeter = openMeter("default", true);
+		const handle = ops.startRun({
+			meter: ops.hosted !== undefined,
+			auditProvisioned: (sinceMs, rulesAtStart) =>
+				auditProvisioned(homedir(), sinceMs, rulesAtStart),
+			rulesAtStart: () => rulesDirEntries(homedir()),
+			...(runMeter !== null && { onUsage: runMeter.onUsage }),
+			cwd: loc.wt,
+			prompt: input.prompt,
+			images: input.imagePaths,
+			// OTTR-693: the identity this turn's git commits with when its home config names none.
+			commitIdentity: ops.commitIdentity?.() ?? null,
+			sessionDir: store.sessionsDir,
+			extensionPath: ops.extensionPath,
+			board: idn.retroCard ? null : { ...ops.board, project: name, taskId: id },
+			resumeId: input.plan.resumeId,
+			model: route.runModel,
+			sessionName: idn.sessionName,
+			worker: route.vmTurn ? null : route.liveWorker,
+			vm: vmGrantFor(name, e, id, header, loc, route),
+			secrets: route.turnEnv.secrets,
+			// Retro flags: the retro.yml config sits next to the tracker extension, the
+			// skill is pinned, and the board env is stripped (the proposal files here).
+			// A review run gets OTTR_REVIEW=1: the extension then registers propose_task,
+			// and the findings are recorded, not filed — Ottr files them after the run.
+			env: {
+				...route.turnEnv.env,
+				...retroEnvMarks(idn),
+				// PATH last, so an env.txt value can never shadow the tools link dir.
+				...(route.prep?.pathDir
+					? { PATH: `${route.prep.pathDir}:${process.env.PATH ?? ""}` }
+					: {}),
+				// No git host auth for any agent, merge turns included (D6): the server
+				// pushes non-GitHub merges itself after the turn.
+			},
+			stripBoard: idn.retroCard,
+			stripGithubToken: idn.scout,
+			...turnRunTools(idn),
+			dataRoot: store.dataRoot,
+			logPath: store.logPath(id),
+			onLog: () => ops.notifyLog(name, id),
+			onProgress: (text) => {
+				if (mx.entry === null) return;
+				// Only a movement of the numbers is live activity: a repeated line (elapsed
+				// ticks of a frozen run, a lock wait) proves nothing and must not reset the
+				// silent-log clock (ALAT-23).
+				const key = text === null ? null : progressKey(text);
+				if (key !== null && key !== mx.entry.progressKey)
+					mx.entry.progressAt = Date.now();
+				mx.entry.progressKey = key ?? undefined;
+				mx.entry.progress = text ?? undefined;
+				ops.publishSoon();
+			},
+			onSession: (sid) => {
+				const cur = store.getTask(id);
+				if (cur?.state !== "preparing" || cur.cancelledAt !== null) return;
+				store.updateTask(id, {
+					sessionId: sid,
+					state: "running",
+					...(kind === "work" && cur.stage === "todo"
+						? { stage: "in_progress" }
+						: {}),
+				});
+			},
+		});
+		mx.entry = handle;
+		running.set(key, mx.entry);
+		// Awaited only where the original awaited (a microVM dispatch): the sync path must
+		// not yield, so a pid that fills in a later microtask is still null at startTurn.
+		if (route.vmTurn && handle.accepted !== undefined) {
+			const ok = await vmAcceptance(store, id, task, key, handle, log);
+			if (!ok) return null;
+		}
+		consumeTurnPending(store, id, input);
+		const turn = recordTurnRow(
+			store,
+			id,
+			kind,
+			input,
+			route,
+			mx,
+			handle,
+			header,
+		);
+		return { handle, runMeter, runStartedAt, turn };
+	}
+
+	/** Waits for vm-runner to take a microVM turn before anything records it: a busy answer
+	 * must leave the card exactly as it was before the claim (no turn row, the reply still
+	 * pending, no lost-worker count). Any other non-start (refused, unreachable, killed) falls
+	 * through and settles like today's worker dispatch. False: busy — the caller stops. */
+	async function vmAcceptance(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		key: string,
+		handle: TurnRunHandle,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		if (handle.accepted === undefined) return true;
+		const started = await handle.accepted;
+		const early = started ? null : ((await handle.done) as RunResult);
+		if (early?.workerBusy !== true) {
+			vmState.busy.delete(key);
+			vmBusyAt.delete(key);
+			return true;
+		}
+		running.delete(key);
+		vmState.busy.add(key);
+		vmBusyAt.set(key, Date.now());
+		log(`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`);
+		const cur = store.getTask(id);
+		// A cancel or stop that landed meanwhile owns the card.
+		if (cur && cur.cancelledAt === null && cur.state === "preparing")
+			store.updateTask(id, {
+				state: "queued",
+				needsReason: task.needsReason,
+				asked: task.asked,
+			});
+		ops.publishSoon();
+		return false;
+	}
+
+	/** Consumes only what this turn sends; steering that landed since the build stays queued
+	 * for the next one. The column holds the raw parked text (raw, e.g. the dep-hold marker);
+	 * pending may be the dispatcher's swap of it, so strip by raw — a mismatched strip would
+	 * re-steer forever. The steer route appends with "\n\n", so only raw itself or raw plus
+	 * that separator is this turn's text: a cancelled steer replaced by one that merely starts
+	 * with raw stays whole. Same prefix rule for images: a steer landing since the build
+	 * appends, so drop only what this turn sends. */
+	function consumeTurnPending(
+		store: ProjectStore,
+		id: string,
+		input: TurnInput,
+	): void {
+		const fresh = store.getTask(id);
+		let rest = fresh?.pendingPrompt ?? null;
+		if (input.raw !== null && input.pending !== null && rest !== null) {
+			if (rest === input.raw) rest = null;
+			else if (rest.startsWith(`${input.raw}\n\n`))
+				rest = rest.slice(input.raw.length + 2) || null;
+		}
+		const restImages = stripConsumedImages(fresh, input);
+		store.updateTask(id, {
+			pendingPrompt: rest,
+			pendingImages: restImages,
+			// rest holds only steering that landed mid-run (user); a full consume clears.
+			pendingBy: rest === null ? null : "user",
+		});
+	}
+
+	/** Same prefix rule for images as for the prompt text: a steer landing since the build
+	 * appends, so drop only what this turn sends. */
+	function stripConsumedImages(fresh: Task | null, input: TurnInput): string[] {
+		let restImages = fresh?.pendingImages ?? [];
+		if (
+			restImages.length >= input.live.pendingImages.length &&
+			input.live.pendingImages.every((n, i) => restImages[i] === n)
+		)
+			restImages = restImages.slice(input.live.pendingImages.length);
+		return restImages;
+	}
+
+	/** Records the turn row: the user text this turn delivered (steer or reply — the timeline
+	 * shows it on the turn; a fresh session that folded the reply into its prompt records it
+	 * here too; the "." continue marker is not user text), the dispatch snapshot of the
+	 * --model, the pending text's authorship, the layer this run pinned at start, and the
+	 * card-log byte offset captured with the header write. */
+	function recordTurnRow(
+		store: ProjectStore,
+		id: string,
+		kind: TurnKind,
+		input: TurnInput,
+		route: TurnRoute,
+		mx: TurnRunShared,
+		handle: TurnRunHandle,
+		header: TurnHeader,
+	): Turn {
+		const turnInput =
+			input.pending &&
+			(input.plan.resumeId !== null ||
+				(input.plan.note !== null && input.pending !== "."))
+				? input.pending
+				: null;
+		const turn = store.startTurn(
+			id,
+			kind,
+			input.prompt,
+			handle.pid,
+			// The user text this turn delivered (steer or reply) — the timeline shows it on the turn.
+			// A fresh session that folded the reply into its prompt records it here too; the "."
+			// continue marker is not user text.
+			turnInput,
+			// The dispatch snapshot: the --model this turn starts with, so the card states the
+			// selected model while it runs; the settled row keeps what the stream served.
+			route.runModel,
+			// live was read with raw, so its pendingBy is raw's authorship (a mid-run steer
+			// lands after this read and rides the next turn).
+			turnInput !== null ? input.live.pendingBy : null,
+			// The layer this run pinned at start (null = flat home); a record only, clean-up reads in-use.json.
+			handle.layerId ?? null,
+			// The card-log byte offset captured with the header write; the drawer fetches the turn's section from it.
+			header.turnLogOffset,
+		);
+		mx.turn = turn;
+		return turn;
+	}
+
+	/** The env marks a retro, review or scout run carries (the extension registers its
+	 * per-kind tools from them; the board env is stripped for a retro, whose proposal
+	 * files here). */
+	function retroEnvMarks(idn: TurnIdentity): Record<string, string> {
+		if (idn.retroCard) return { OTTR_RETRO: "1" };
+		if (idn.reviewCard) return { OTTR_REVIEW: "1" };
+		if (idn.scout) return { OTTR_TRENDING: "1" };
+		return {};
+	}
+
+	/** The pinned per-kind run config: the retro skill and yml, the scout's two verdict
+	 * tools and yml, else the run keeps the default tools and no config. */
+	function turnRunTools(idn: TurnIdentity): {
+		tools?: string;
+		config?: string;
+		skills?: string;
+	} {
+		if (idn.retroCard)
+			return {
+				tools: "read,grep,glob,report_outcome,propose_task",
+				config: join(dirname(ops.extensionPath), "retro.yml"),
+				skills: "retro",
+			};
+		if (idn.scout)
+			return {
+				tools: "read,grep,glob,report_outcome,propose_repo,judge_repo",
+				config: join(dirname(ops.extensionPath), "trending.yml"),
+			};
+		return {};
+	}
+
+	/** Settles the finished run: outcome sync, report read, tree analysis, shot adoption,
+	 * merge ship, classify, hold parks, card writes, and the two second-model checks. True:
+	 * the turn stopped early (a cancel, a taken-over check, a credit stop) — runTurn returns. */
+	async function settleTurnRun(
+		name: string,
+		e: TurnProject,
+		id: string,
+		task: Task,
+		key: string,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		input: TurnInput,
+		route: TurnRoute,
+		dispatch: TurnDispatch,
+		mx: TurnRunShared,
+		openMeter: OpenRunMeter,
+		creditBlocked: () => boolean,
+	): Promise<boolean> {
+		// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
+		const result0 = (await dispatch.handle.done) as RunResult;
+		const st: TurnSettle = {
+			name,
+			id,
+			key,
+			kind,
+			e,
+			store: e.store,
+			task,
+			header,
+			idn,
+			loc,
+			input,
+			route,
+			dispatch,
+			mx,
+			openMeter,
+			creditBlocked,
+			log: (line) => appendLog(e.store, id, line),
+			result: result0,
+			vmOut: null,
+			runEndedAt: 0,
+			reportText: null,
+			reportError: null,
+			wasResearch: false,
+			demoteCandidate: false,
+			fromMain: false,
+			finishedCleanly: false,
+			shots: undefined,
+			pushError: null,
+			pushRejected: false,
+			pushOutput: null,
+			recheckError: null,
+			holdHead: null,
+			holdMismatch: null,
+			holdDiff: null,
+			holdFiles: null,
+			holdTip: null,
+			remoteLanded: false,
+			refused: null,
+			prNext: null,
+			research: false,
+			steered: false,
+			now: 0,
+			unsaved: null,
+			report: undefined,
+			steps: undefined,
+			commits: undefined,
+			mergeHead: undefined,
+			keptFiles: undefined,
+			holdReason: null,
+			workCard: false,
+			reviewFindings: [],
+			checkWillRun: false,
+		};
+		if (await readTurnOutcome(st, result0)) return true;
+		readRunReport(st, result0);
+		running.delete(key);
+		if (await settleKilledRun(st)) return true;
+		await analyzeTurnTree(st);
+		await adoptTurnShots(st);
+		await quarantineUntrackedFiles(st);
+		await shipMergeTurn(st);
+		const { facts, next } = await classifyTurnEnd(st);
+		const recovered = await recoverMergePush(st, next);
+		const stabilized = await stabilizeNext(st, facts, recovered);
+		const guarded = await guardUiShot(st, stabilized);
+		const planned = await planSettleWrite(st, guarded);
+		await recordSyncFindings(st);
+		if (await finishTurnRow(st, planned)) return true;
+		planTurnChecks(st, planned);
+		writeSettledCard(st, planned);
+		await fileRetroProposal(st, planned);
+		if (await runReviewCheck(st)) return true;
+		if (await runWorkCheck(st, planned)) return true;
+		writePostCheckState(st, planned);
+		await stampDoneCard(st, planned);
+		return false;
+	}
+
+	/** Awaits the run's result, settles its metering, and syncs a microVM's tree state into
+	 * the server worktree. True: a late resolution after sweepLostTurns took over — the sweep
+	 * owns the card, the turn stops. */
+	async function readTurnOutcome(
+		st: TurnSettle,
+		result0: RunResult,
+	): Promise<boolean> {
+		st.dispatch.runMeter?.settle(result0);
+		st.runEndedAt = Date.now();
+		// sweepLostTurns proved the pid dead and settled this turn's row; a late resolution must
+		// not settle again or clobber the card the sweep requeued.
+		if (st.mx.entry?.abandoned) return true;
+		await syncVmWorktree(st, result0);
+		return false;
+	}
+
+	/** OTTR-532: a microVM turn's tree lives in the VM. The server worktree follows the branch
+	 * tip in the main checkout (the git endpoint already syncs every push; this covers a push
+	 * whose sync failed), and the tree state comes from the VM's own report. The head the VM
+	 * reports is a claim, never a reset target: the worktree only ever moves to the real tip
+	 * of the card's branch. Uncommitted files the turn leaves for the board (the research
+	 * report, shots) never ride a push: the sentinel carries them, before the report read. */
+	async function syncVmWorktree(
+		st: TurnSettle,
+		result0: RunResult,
+	): Promise<void> {
+		const vmOut = st.route.vmTurn ? (result0.vm ?? null) : null;
+		st.vmOut = vmOut;
+		if (vmOut === null) return;
+		if (vmOut.pushError !== null)
+			st.log(`! microVM push failed: ${vmOut.pushError}`);
+		// The card run always holds a branch name here: vmTurn requires a non-special card.
+		const branch = st.loc.special ? (st.task.branch ?? "") : st.loc.branch;
+		await syncVmTip(st, branch, vmOut);
+		// Uncommitted files the turn leaves for the board (the research report, shots)
+		// never ride a push: the sentinel carries them, before the report read below.
+		if (vmOut.files) writeVmFiles(st.loc.wt, vmOut.files, st.log);
+	}
+
+	/** The branch-tip read a microVM settle syncs against: log a reported head that is not the
+	 * tip, and move the server worktree to the real tip when it lags. */
+	async function syncVmTip(
+		st: TurnSettle,
+		branch: string,
+		vmOut: VmOutcome,
+	): Promise<void> {
+		const tip =
+			branch === null
+				? null
+				: await ops
+						.targetSha(st.e.path, `refs/heads/${branch}`)
+						.catch(() => null);
+		if (vmOut.head !== null && tip !== null && vmOut.head !== tip)
+			st.log(
+				`! microVM: reported head ${vmOut.head} is not the branch tip ${tip}`,
+			);
+		if (tip === null)
+			st.log(
+				`! microVM: branch ${branch ?? "(none)"} does not resolve; the worktree is not synced`,
+			);
+		else if (ops.syncWorktreeTo) {
+			const syncTo = ops.syncWorktreeTo;
+			const current = await ops.targetSha(st.loc.wt, "HEAD").catch(() => null);
+			if (current !== tip)
+				await syncTo(st.loc.wt, tip).catch((err: unknown) =>
+					st.log(
+						`! microVM: syncing the worktree to ${tip} failed: ${errmsg(err)}`,
+					),
+				);
+		}
+	}
+
+	/** The agent self-declares research by writing the report file; its presence at settle flips
+	 * the card. Sync read: settle must stay within one microtask flush (tests await runTurn or
+	 * flush microtasks only). No symlink is followed: a worker could point the file at a
+	 * server-only secret (OTTR-233). */
+	function readRunReport(st: TurnSettle, result0: RunResult): void {
+		const report = readReportFile(st);
+		const autoResearch =
+			!st.idn.releaseCard && !st.task.research && report.text !== null;
+		if (autoResearch) st.store.updateTask(st.id, { research: true });
+		const wasResearch = st.task.research || autoResearch;
+		// A research card's later turn can do real work: a ready outcome, landable clean
+		// commits, and no report file (it cleared the file it once self-declared with). The
+		// demotion needs the git facts below, so the rewrite waits for that case.
+		st.demoteCandidate =
+			wasResearch &&
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.idn.releaseCard &&
+			report.text === null &&
+			report.error === null &&
+			result0.outcome?.status === "ready";
+		// An interview or trending scout card has nothing to integrate, and agents mix up
+		// statuses: a ready outcome settles done.
+		// A research card has nothing to integrate either: its deliverable is the report file.
+		st.result =
+			(st.idn.interview || st.idn.scout || wasResearch) &&
+			!st.demoteCandidate &&
+			result0.outcome?.status === "ready"
+				? {
+						...result0,
+						outcome: { ...result0.outcome, status: "answered" as const },
+					}
+				: result0;
+		st.reportText = report.text;
+		st.reportError = report.error;
+		st.wasResearch = wasResearch;
+	}
+
+	/** Reads the research report file out of the worktree (work cards only). A refused report
+	 * (symlink, not a file, too big) holds the card: no quarantine, no removal. */
+	function readReportFile(st: TurnSettle): {
+		text: string | null;
+		error: string | null;
+	} {
+		if (
+			!(
+				st.kind === "work" &&
+				!st.idn.interview &&
+				!st.idn.grill &&
+				!st.idn.scout
+			)
+		)
+			return { text: null, error: null };
+		try {
+			return {
+				text:
+					readBelow(
+						worktreeAnchor(st.e.path, st.loc.wt),
+						join(st.loc.wt, RESEARCH_REPORT),
+						REPORT_MAX_BYTES,
+					)?.toString("utf8") ?? null,
+				error: null,
+			};
+		} catch (err) {
+			const error = errmsg(err);
+			st.log(`! ${RESEARCH_REPORT}: ${error}`);
+			return { text: null, error };
+		}
+	}
+
+	/** A stop-turn request owns this kill: end the row as stopped and park the card like Esc —
+	 * worktree, branch and session stay, the user replies. True: the turn stops. */
+	async function settleKilledRun(st: TurnSettle): Promise<boolean> {
+		if (!st.result.killed && !st.store.getTask(st.id)?.cancelledAt)
+			return false;
+		const stopReason = stopping.get(st.key);
+		stopping.delete(st.key);
+		st.store.finishTurn(st.dispatch.turn.id, {
+			endedAt: Date.now(),
+			exitCode: st.result.exitCode,
+			error: stopReason !== undefined ? "stopped" : "cancelled",
+		});
+		// A cancel that landed meanwhile owns the card: cancelTask writes its kept
+		// or idle state after the kill, so only mark the card when no cancel ran.
+		const cur = st.store.getTask(st.id);
+		if (stopReason !== undefined && cur && cur.cancelledAt === null)
+			st.store.updateTask(st.id, {
+				state: "needs_you",
+				needsReason: stopReason,
+			});
+		return true;
+	}
+
+	/** ponytail: after an agent removes its worktree, an empty folder can stay (omp's cwd holds
+	 * it on Windows), and git there reads the main checkout: another card's unpushed merge
+	 * fails `integrated`, and base..HEAD counts main's commits. Upgrade: read the task branch
+	 * from the main repo when `<worktree>/.git` is gone. A husk (unlinked, no checkout) cannot
+	 * speak for HEAD at all: when the branch is also gone or already contained in the target,
+	 * "integrated" is provable from the main repo alone. */
+	async function analyzeTurnTree(st: TurnSettle): Promise<void> {
+		const husk =
+			st.idn.interview || st.idn.grill || st.idn.scout
+				? false
+				: await ops.worktreeHusk(st.loc.wt).catch(() => false);
+		// A deregistered worktree can lose its `.git` file while keeping the checkout: then neither
+		// worktreeLinked (git climbs out) nor worktreeHusk's `.git`-file test fires. isIntegrated
+		// returns false unconditionally there, so a merged card would bounce forever; the branch
+		// inside the main repo is the proof (branchMergedOrGone).
+		const unlinked =
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.idn.scout &&
+			!husk &&
+			!(await ops.worktreeLinked(st.loc.wt).catch(() => false));
+		st.fromMain = husk || unlinked;
+		st.finishedCleanly =
+			st.result.exitCode === 0 &&
+			st.result.sawTerminalEnd &&
+			!st.result.killed &&
+			!st.result.approvalRefused &&
+			st.result.asked === null &&
+			st.result.outcome?.status !== "needs_you";
+	}
+
+	/** Copy agent-reported UI screenshots into the task's images dir, before the
+	 * untracked-file quarantine and unsavedWork touch the worktree. Until 2026-10-09 the
+	 * tracker extension's report_outcome schema had no shots field, so the harness
+	 * dropped every reported shot; a plain work turn whose outcome carries no shots
+	 * still adopts the conventional shots/ directory. Never fails the turn. The copy
+	 * only reads the worktree: sources stay put, so committed shots keep the tree clean
+	 * for the ready gate's isClean read below (deleting them turned tracked files into
+	 * ` D` rows and bounced the turn). Adoption skips git-tracked shots: a committed
+	 * shot rides every fresh worktree, so adopting it pinned a leftover image on cards
+	 * whose agents never captured anything (the 2026-10-14 incident). Scratch shots
+	 * under the gitignored /shots/ and root /*.png paths stay on disk unseen (worktree
+	 * removal GCs them); other untracked scratch shots are swept afterwards by the
+	 * quarantine.
+	 * Dedup by content: agents re-report the same screenshots (the same path twice in one
+	 * outcome, or again on a later turn of the same card), and each copy used to land as a
+	 * fresh numbered file. Seed with what the card has. */
+	async function adoptTurnShots(st: TurnSettle): Promise<void> {
+		if (!st.result.outcome) return;
+		const seen = new Set<string>();
+		const stored: { name: string; gray: Uint8Array }[] = [];
+		seedStoredShots(st, seen, stored);
+		const reported = st.result.outcome.shots ?? [];
+		const copied: DecodedImage[] = [];
+		// Grays of this run's new copies: a second capture of the same new screen
+		// in one outcome skips too, instead of landing as a fresh numbered file.
+		const batch: Uint8Array[] = [];
+		for (const [shot, p] of await shotCandidates(st, reported)) {
+			try {
+				await adoptShot(st, seen, stored, batch, copied, shot, p);
+			} catch (err) {
+				st.log(`! shot ${shot}: ${err instanceof Error ? err.message : err}`);
+			}
+		}
+		if (copied.length > 0) {
+			const names = saveImages(
+				st.store.dataRoot,
+				st.store.imagesDir(st.id),
+				copied,
+			);
+			st.shots = [...st.task.shots, ...names].slice(-8); // cap 8, keep newest
+		}
+	}
+
+	/** Seeds the dedup state with what the card already stores; pruned or absent shots
+	 * contribute nothing. */
+	function seedStoredShots(
+		st: TurnSettle,
+		seen: Set<string>,
+		stored: { name: string; gray: Uint8Array }[],
+	): void {
+		for (const name of st.task.shots) {
+			try {
+				const bytes = readRegular(join(st.store.imagesDir(st.id), name));
+				seen.add(createHash("sha256").update(bytes).digest("hex"));
+				const gray = pngGray16(bytes);
+				if (gray !== null) stored.push({ name, gray });
+			} catch {
+				// pruned or absent: nothing to dedup against
+			}
+		}
+	}
+
+	/** The shot paths to adopt: the outcome's reported shots, else (a plain work turn) the
+	 * untracked files under the gitignored shots/ directory. */
+	async function shotCandidates(
+		st: TurnSettle,
+		reported: string[],
+	): Promise<[string, string][]> {
+		if (reported.length > 0)
+			return reported.map((shot) => [shot, resolve(st.loc.wt, shot)]);
+		if (
+			st.kind === "work" &&
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.idn.scout &&
+			!st.wasResearch &&
+			!st.idn.releaseCard &&
+			existsSync(join(st.loc.wt, "shots"))
+		) {
+			const tracked = new Set(await ops.trackedFiles(st.loc.wt, "shots"));
+			return readdirSync(join(st.loc.wt, "shots"), { withFileTypes: true })
+				.filter((d) => d.isFile() && !tracked.has(`shots/${d.name}`))
+				.map((d) => [`shots/${d.name}`, join(st.loc.wt, "shots", d.name)]);
+		}
+		return [];
+	}
+
+	/** Adopts one candidate shot: path-escape and sniff checks, byte-exact dedup against the
+	 * card's stored shots, and the visual-twin check below. Throws on an unreadable file —
+	 * the caller's catch logs it and keeps the turn green. */
+	async function adoptShot(
+		st: TurnSettle,
+		seen: Set<string>,
+		stored: { name: string; gray: Uint8Array }[],
+		batch: Uint8Array[],
+		copied: DecodedImage[],
+		shot: string,
+		p: string,
+	): Promise<void> {
+		if (!p.startsWith(resolve(st.loc.wt) + sep)) {
+			st.log(
+				`! shot ${shot}: path escapes the worktree — keep the path inside the worktree, for example shots/<name>.png (shots/ is gitignored)`,
+			);
+			return;
+		}
+		const bytes = readBelow(
+			worktreeAnchor(st.e.path, st.loc.wt),
+			p,
+			MAX_IMAGE_BYTES,
+		);
+		if (bytes === null) throw new Error("no such file");
+		const ext = sniffImage(bytes);
+		if (ext === null) {
+			st.log(`! shot ${shot}: not a recognized image`);
+			return;
+		}
+		const hash = createHash("sha256").update(bytes).digest("hex");
+		if (seen.has(hash)) {
+			st.log(`! shot ${shot}: duplicate of an existing screenshot`);
+			return;
+		}
+		const gray = pngGray16(bytes);
+		if (gray === null) {
+			// Undecodable (jpg, webp, exotic png): byte-exact dedup only.
+			seen.add(hash);
+			copied.push({ bytes, ext });
+			return;
+		}
+		if (adoptVisualTwin(st, stored, batch, gray, bytes, shot)) return;
+		seen.add(hash);
+		copied.push({ bytes, ext });
+		batch.push(gray);
+	}
+
+	/** A re-capture of an unchanged screen (new bytes, same pixels) matches an existing shot
+	 * visually and replaces it, so a check send-back round does not double every screenshot on
+	 * the card. True: the shot was a twin (stored, or saved this turn) — nothing to copy. */
+	function adoptVisualTwin(
+		st: TurnSettle,
+		stored: { name: string; gray: Uint8Array }[],
+		batch: Uint8Array[],
+		gray: Uint8Array,
+		bytes: Uint8Array,
+		shot: string,
+	): boolean {
+		const twin = stored.findIndex((s) => visuallyIdentical(s.gray, gray));
+		const twinShot = stored[twin];
+		const batchTwin =
+			twinShot === undefined
+				? batch.findIndex((g) => visuallyIdentical(g, gray))
+				: -1;
+		if (twinShot !== undefined) {
+			// Same screen, new bytes: refresh the stored shot in place
+			// instead of appending a second copy of it.
+			writeBelow(
+				st.store.dataRoot,
+				join(st.store.imagesDir(st.id), twinShot.name),
+				bytes,
+				"truncate",
+			);
+			stored[twin] = { name: twinShot.name, gray };
+			st.log(
+				`! shot ${shot}: visually identical to ${twinShot.name} — replaced it`,
+			);
+			return true;
+		}
+		if (batchTwin !== -1) {
+			st.log(`! shot ${shot}: visually identical to a shot saved this turn`);
+			return true;
+		}
+		return false;
+	}
+
+	/** Sweeps untracked scratch files a clean work turn leaves behind (never for a research,
+	 * release or special card, and only after a clean finish with a readable report). */
+	async function quarantineUntrackedFiles(st: TurnSettle): Promise<void> {
+		if (
+			!(
+				st.kind === "work" &&
+				!st.idn.interview &&
+				!st.idn.grill &&
+				!st.idn.scout &&
+				!st.wasResearch &&
+				!st.idn.releaseCard &&
+				st.finishedCleanly &&
+				st.reportError === null
+			)
+		)
+			return;
+		try {
+			const moved = await ops.quarantineUntracked(
+				st.loc.wt,
+				join(st.store.tasksDir, "quarantine", st.id),
+				st.store.dataRoot,
+			);
+			if (moved.length > 0)
+				appendLog(
+					st.store,
+					st.id,
+					`quarantined ${moved.length} untracked file(s) to .tasks/quarantine/${st.id}: ${moved.slice(0, 20).join(", ")}${moved.length > 20 ? " …" : ""}`,
+				);
+		} catch (err) {
+			appendLog(st.store, st.id, `quarantine failed: ${errmsg(err)}`);
+		}
+	}
+
+	/** Per-host git credentials never enter an agent, so the server pushes a merge itself.
+	 * It runs before the integration facts: the check reads origin's tip, which only this
+	 * push moves. It is gated on proof of the local merge in the main repo, never on what
+	 * the agent reported. A removed worktree (fromMain) still pushes: its merge is on the
+	 * local branch, and only this push moves it to origin. */
+	async function shipMergeTurn(st: TurnSettle): Promise<void> {
+		if (
+			st.kind !== "merge" ||
+			st.idn.interview ||
+			st.idn.grill ||
+			st.idn.releaseCard
+		)
+			return;
+		if (st.header.settings.prMode === true) await shipPrCard(st);
+		else await auditMergeHold(st);
+	}
+
+	/** Appends the GitHub-API hint under a bare 401/403; the git error stands alone
+	 * when the probe cannot say more. Never throws. */
+	async function withAuthHint(url: string, error: string): Promise<string> {
+		if (!GIT_HTTP_AUTH_STATUS.test(error)) return error;
+		try {
+			return error + ((await ops.githubAuthHint(url)) ?? "");
+		} catch {
+			return error;
+		}
+	}
+
+	/** The merge push and the OTTR-510 automatic rebase retry push through the same helper.
+	 * `refused` stays null for every non-merge turn: only a merge settle pays for the hold-tip
+	 * read. */
+	async function serverPush(
+		st: TurnSettle,
+	): Promise<
+		| { status: "skipped" }
+		| { status: "pushed"; output: string }
+		| { status: "failed" | "rejected"; error: string; output?: string }
+	> {
+		return st.refused !== null
+			? Promise.resolve({
+					status: "failed" as const,
+					error: st.refused,
+				})
+			: ops
+					.serverMergePush(
+						st.e.path,
+						st.loc.wt,
+						st.header.target,
+						st.task.branch ?? "",
+						st.holdTip,
+						st.header.settings.originUrl,
+					)
+					.then(async (p) =>
+						(p.status === "failed" || p.status === "rejected") &&
+						typeof st.header.settings.originUrl === "string" &&
+						st.header.settings.originUrl !== ""
+							? {
+									...p,
+									error: await withAuthHint(
+										st.header.settings.originUrl,
+										p.error,
+									),
+								}
+							: p,
+					)
+					.catch((err: unknown) => ({
+						status: "failed" as const,
+						error: errmsg(err),
+					}));
+	}
+
+	/** PR mode ships the card branch itself: the server pushes the branch and opens the
+	 * pull request, so nothing local is ever pushed to the target — the merge-hold
+	 * machinery and serverMergePush of the target must not run for these cards.
+	 * The ship step settles an integrated report and nothing else: the PR prompt
+	 * rebases before the gates and the security review, so a clean rebased tree
+	 * alone proves nothing about their verdict. A needs_you report (a blocking
+	 * finding, a failed gate) must reach classify and park with the agent's
+	 * question — prNext stays null so classify decides. */
+	async function shipPrCard(st: TurnSettle): Promise<void> {
+		const outcome = st.result.outcome;
+		if (outcome?.status !== "integrated") {
+			if (outcome === null)
+				// A lost receipt must not land via classify's git-integrated done
+				// path: nothing was merged, so ask for a human instead.
+				st.prNext = {
+					stage: "merging",
+					state: "needs_you",
+					needsReason: "The agent finished without calling report_outcome.",
+				};
+			return;
+		}
+		if (st.task.prNumber !== null) {
+			// A card already carrying a PR never re-ships: its PR is open and the
+			// tracker waits on GitHub; the card just stays merging/idle.
+			st.prNext = { stage: "merging", state: "idle", needsReason: null };
+			return;
+		}
+		const pushBranch = ops.pushBranch;
+		const openPr = ops.openPr;
+		if (pushBranch === undefined || openPr === undefined) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"PR mode is on but the server's ship step is not wired; restart the board",
+			};
+			return;
+		}
+		await openPullRequest(st, pushBranch, openPr);
+	}
+
+	/** Ships a proven integration: the same proof classify reads (clean tree, origin/<target>
+	 * an ancestor of HEAD). An unproven integrated report ships nothing — classify takes the
+	 * not-on-target park. */
+	async function openPullRequest(
+		st: TurnSettle,
+		pushBranch: NonNullable<TurnOps["pushBranch"]>,
+		openPr: NonNullable<TurnOps["openPr"]>,
+	): Promise<void> {
+		const proof = await ops
+			.prIntegrated?.(st.e.path, st.loc.wt, st.header.target)
+			.catch(() => false);
+		const prBranch = st.task.branch ?? "";
+		const tip =
+			proof === true
+				? await ops
+						.targetSha(st.e.path, `refs/heads/${prBranch}`)
+						.catch(() => null)
+				: null;
+		if (proof !== true) {
+			// No ship: classify parks the integrated report as not-on-target.
+			return;
+		}
+		if (tip === null || prBranch === "") {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `PR mode could not read the branch tip for ${prBranch || "(no branch)"}`,
+			};
+			return;
+		}
+		if (st.header.settings.originUrl === null) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"no pinned origin URL; restart the board (or set it in project settings) so the server pins the origin remote before pushing the branch",
+			};
+			return;
+		}
+		await pushPrBranch(st, prBranch, tip, pushBranch, openPr);
+	}
+
+	/** Pushes the card branch from the server and opens the pull request when it lands. */
+	async function pushPrBranch(
+		st: TurnSettle,
+		prBranch: string,
+		tip: string,
+		pushBranch: NonNullable<TurnOps["pushBranch"]>,
+		openPr: NonNullable<TurnOps["openPr"]>,
+	): Promise<void> {
+		// openPullRequest parked on a null origin before this call, so the pinned URL is set.
+		const originUrl = st.header.settings.originUrl;
+		if (originUrl === null) return;
+		const pr = await pushBranch(st.e.path, prBranch, originUrl).catch(
+			(err: unknown) => ({
+				status: "failed" as const,
+				error: errmsg(err),
+			}),
+		);
+		if (pr.status === "pushed") {
+			st.log(`- pushed ${prBranch} from the server`);
+		} else {
+			logPrPushFailure(st, prBranch, pr);
+		}
+		if (pr.status === "pushed") {
+			// The PR needs a GitHub remote: PR mode without one is not a state
+			// the board holds, but the setting can drift — fail closed here.
+			await openPrCard(st, prBranch, tip, openPr);
+		}
+	}
+
+	/** Logs a failed server branch push with git's full output and the credential kinds the
+	 * push could use, and parks the card with the reason. */
+	function logPrPushFailure(
+		st: TurnSettle,
+		prBranch: string,
+		pr: { status: "failed" | "rejected"; error: string; output?: string },
+	): void {
+		st.log(
+			`! server push of ${prBranch} ${pr.status === "rejected" ? "rejected" : "failed"}: ${pr.error}`,
+		);
+		const pushOut = "output" in pr ? (pr.output ?? null) : null;
+		if (pushOut !== null) st.log(`git's full push output:\n${pushOut}`);
+		const kindAuth =
+			st.header.settings.originUrl === null
+				? null
+				: (ops.pushAuthKind?.(st.header.settings.originUrl) ?? null);
+		if (kindAuth !== null) st.log(`- push auth: ${kindAuth}`);
+		st.prNext = {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: `Server push to origin failed: ${pr.error}`,
+		};
+	}
+
+	/** Opens the pull request for a pushed branch and stores it on the card (merging/idle). */
+	async function openPrCard(
+		st: TurnSettle,
+		prBranch: string,
+		tip: string,
+		openPr: NonNullable<TurnOps["openPr"]>,
+	): Promise<void> {
+		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
+		if (repo === null) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"PR mode requires a GitHub remote on the project; disable PR mode or add the remote",
+			};
+			return;
+		}
+		const slash = repo.indexOf("/");
+		const opened = await openPr({
+			repo,
+			owner: repo.slice(0, slash),
+			branch: prBranch,
+			base: st.header.target.replace(/^origin\//, ""),
+			title: st.task.title,
+			body: prBody(st.task, st.result.outcome),
+			// Hosted: gh takes the project's minted token, never GH_TOKEN.
+			...(ops.hosted !== undefined && {
+				gh: await hostedGh(st.e.path, st.header.settings.originUrl),
+			}),
+		}).catch((err: unknown) => ({
+			ok: false as const,
+			error: errmsg(err),
+		}));
+		if (!opened.ok) {
+			st.log(`! opening the pull request failed: ${opened.error}`);
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Opening the pull request failed: ${opened.error}`,
+			};
+			return;
+		}
+		st.store.updateTask(st.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: null,
+			prNumber: opened.pr.number,
+			prUrl: opened.pr.url,
+			prHeadSha: tip,
+			pushSha: tip,
+		});
+		appendLog(
+			st.store,
+			st.id,
+			`- PR #${opened.pr.number} opened (base ${st.header.target.replace(/^origin\//, "")})`,
+		);
+		st.prNext = {
+			stage: "merging",
+			state: "idle",
+			needsReason: null,
+		};
+	}
+
+	/** An approved merge hold fixes what may ship. The merge turn resumes the same agent
+	 * session and could commit beyond the approved head, so the push set
+	 * (target..refs/heads/<branch>) must carry exactly the approved patches
+	 * (base..approvedHead). Fails closed: git trouble parks the card. A reply to the
+	 * mismatch park approves the exact parked head, so a sha-equal re-merge pushes. */
+	async function auditMergeHold(st: TurnSettle): Promise<void> {
+		const approvedHeads = [
+			st.task.updateMergeHead,
+			st.task.forkMergeHead,
+		].filter((h) => h !== null);
+		const branch = st.header.target.startsWith("origin/")
+			? st.header.target.slice("origin/".length)
+			: null;
+		const localHead =
+			branch === null || approvedHeads.length === 0
+				? null
+				: await ops
+						.targetSha(st.e.path, `refs/heads/${branch}`)
+						.catch(() => null);
+		if (branch !== null && approvedHeads.length > 0)
+			await holdApprovedHead(st, approvedHeads, branch, localHead);
+		// OTTR-326: a park whose branch reset could not run leaves the held patches as the
+		// local tip; no other card may push the branch while that head sits there.
+		st.refused = await heldMergeOnBranchTip(
+			st.store,
+			st.id,
+			st.e.path,
+			branch,
+			ops,
+		);
+		// A landed merge has nothing to push: the remote target already holds every
+		// approved patch, and pushing the stale local branch would only fight it.
+		if (st.holdMismatch === null && !st.remoteLanded)
+			await pushMergeTarget(st, branch);
+	}
+
+	/** The approved hold heads vs the push set: exact head match judges nothing new; VELV-89
+	 * probes the fetched remote target first — the merge can land through a project rule that
+	 * pushes the target from the worktree and never moves the main checkout's local branch, so
+	 * the gate below would judge a stale push set and park a landed card. Every approved head
+	 * already contained in it and no patches beyond the approval means the merge landed —
+	 * settle it. False on git trouble or extra patches: the gate below judges the push set,
+	 * and it still fails closed into the park. */
+	async function holdApprovedHead(
+		st: TurnSettle,
+		approvedHeads: string[],
+		branch: string,
+		localHead: string | null,
+	): Promise<void> {
+		if (localHead !== null && approvedHeads.includes(localHead)) {
+			// the exact head a reply approved: nothing new to judge
+			return;
+		}
+		const landed = await ops
+			.mergeHoldLanded(
+				st.e.path,
+				st.header.target,
+				st.header.base,
+				approvedHeads,
+				st.header.settings.originUrl,
+			)
+			.catch(() => false);
+		if (landed) {
+			st.remoteLanded = true;
+			st.log(
+				`- approved head already on ${st.header.target}: the merge landed without the local branch moving`,
+			);
+			return;
+		}
+		for (const ah of approvedHeads) {
+			const { mismatch, pushDiff, auditedTip } = await ops
+				.mergeHoldMismatch(
+					st.e.path,
+					st.header.target,
+					st.header.base,
+					ah,
+					st.header.settings.originUrl,
+				)
+				.catch(() => ({
+					mismatch: true,
+					pushDiff: null,
+					auditedTip: null,
+				}));
+			if (mismatch) {
+				await parkHeldMismatch(st, branch, localHead, pushDiff, auditedTip);
+				break;
+			}
+			st.holdTip = auditedTip;
+		}
+	}
+
+	/** The audited push set carries patches beyond the approved head: park the card for the
+	 * reviewer with the exact push-side delta, and reset the branch to the gate's audited tip
+	 * so the held patches cannot ship with a later card's un-gated push (OTTR-326). Without an
+	 * audited tip (gate fetch failed) there is no trusted tip to reset to, and the push refusal
+	 * below keeps the branch pinned instead. */
+	async function parkHeldMismatch(
+		st: TurnSettle,
+		branch: string,
+		localHead: string | null,
+		pushDiff: string | null,
+		auditedTip: string | null,
+	): Promise<void> {
+		st.holdMismatch = MERGE_HOLD_MISMATCH_REASON;
+		st.holdHead = localHead;
+		// Same cap as the merge-start capture: bigger diffs keep their numstat.
+		st.holdDiff =
+			pushDiff === null
+				? null
+				: pushDiff.length > 200_000
+					? `${pushDiff.slice(0, 200_000)}\n… diff truncated at 200 KB`
+					: pushDiff;
+		st.holdFiles =
+			st.holdDiff === null
+				? null
+				: await ops
+						.diffStat(st.e.path, st.header.target, `refs/heads/${branch}`)
+						.catch(() => null);
+		st.log("! held merge carries patches beyond the approved head");
+		const reset =
+			auditedTip !== null &&
+			(await ops
+				.resetBranchTo(st.e.path, branch, auditedTip)
+				.catch(() => false));
+		if (!reset)
+			st.log(
+				"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
+			);
+	}
+
+	/** The server push of the target with the OTTR-465 origin re-check and the one retry.
+	 * A push can fail while origin never moved (a dropped connection, a token-refresh
+	 * hiccup): ALAT-60 landed unchanged on a later merge turn. One retry, when a fetch
+	 * proves the push should still be a fast-forward — origin's tip still sits at the base
+	 * the merge started from, or the local head is a fast-forward of it. A rejected push
+	 * (origin moved) takes the OTTR-394 rebase path below instead. */
+	async function pushMergeTarget(
+		st: TurnSettle,
+		branch: string | null,
+	): Promise<void> {
+		let p = await serverPush(st);
+		let authLogged = false;
+		for (let attempt = 1; ; attempt++) {
+			if (p.status === "skipped") break;
+			if (p.status === "pushed") {
+				markPushedRun(st, p);
+				break;
+			}
+			await logPushFailure(st, p);
+			if (!authLogged) {
+				authLogged = true;
+				logPushAuthKind(st);
+			}
+			if (!(await retryFailedPush(st, branch, attempt))) break;
+			p = await serverPush(st);
+		}
+	}
+
+	/** A retry that landed erases the earlier failure: the card lands instead of parking on an
+	 * error the second push already resolved. OTTR-506: the push put the target on origin, so
+	 * the merge hold lifts at once instead of waiting for the tick's branchUnpushed refresh.
+	 * The agent's own push has no credentials (D6). A merge agent that stopped at needs_you on
+	 * that authentication failure did integrate: the server push landed it, so the report
+	 * becomes integrated with the push output in details. */
+	function markPushedRun(
+		st: TurnSettle,
+		p: { status: "pushed"; output: string },
+	): void {
+		st.pushError = null;
+		st.pushOutput = null;
+		st.pushRejected = false;
+		st.e.mainUnpushed = false;
+		st.log(`- pushed ${st.header.target} from the server`);
+		// OTTR-743: a "cannot lock ref" failure whose head the remote already
+		// holds lands as pushed; name the recovery in the card log.
+		if (p.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
+			st.log(`- ${p.output}`);
+		const o = st.result.outcome;
+		const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
+		if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
+			st.result = {
+				...st.result,
+				asked: null,
+				outcome: {
+					...o,
+					status: "integrated",
+					question: undefined,
+					details: `${o.details ?? o.summary}\n\nServer push of ${st.header.target}:\n${p.output || "(no output)"}`,
+				},
+			};
+			st.log(
+				"- needs_you on a push authentication failure resolved: the server pushed",
+			);
+		}
+	}
+
+	/** Logs a failed server push with git's complete output, so the cause a permission
+	 * failure points at (a missing App installation, a token scope) stays visible (OTTR-465). */
+	async function logPushFailure(
+		st: TurnSettle,
+		p: { status: "failed" | "rejected"; error: string; output?: string },
+	): Promise<void> {
+		st.pushRejected = p.status === "rejected";
+		st.pushError = p.error;
+		st.pushOutput = p.output ?? null;
+		st.log(
+			`! server push of ${st.header.target} ${st.pushRejected ? "rejected" : "failed"}: ${p.error}`,
+		);
+		if (st.pushOutput !== null)
+			st.log(`git's full push output:\n${st.pushOutput}`);
+	}
+
+	/** One line naming the credential kinds the push could use (OTTR-465). */
+	function logPushAuthKind(st: TurnSettle): void {
+		const kind =
+			st.header.settings.originUrl === null
+				? null
+				: (ops.pushAuthKind?.(st.header.settings.originUrl) ?? null);
+		if (kind !== null) st.log(`- push auth: ${kind}`);
+	}
+
+	/** The OTTR-465 retry decision after a failed server push. True: the fetch proved the
+	 * push should still be a fast-forward and the caller retries once. */
+	async function retryFailedPush(
+		st: TurnSettle,
+		branch: string | null,
+		attempt: number,
+	): Promise<boolean> {
+		if (
+			st.pushRejected ||
+			st.refused !== null ||
+			branch === null ||
+			attempt > 1
+		)
+			return false;
+		if (st.header.settings.originUrl === null) {
+			st.log(
+				"! no pinned origin URL; cannot re-check origin's tip before a push retry",
+			);
+			return false;
+		}
+		const originUrl = st.header.settings.originUrl;
+		const fetchError = await ops
+			.fetchOriginBranch(st.e.path, branch, originUrl)
+			.then(() => null)
+			.catch((err: unknown) => withAuthHint(originUrl, errmsg(err)));
+		if (fetchError !== null) {
+			// The re-check's own reason (a network error, a token-refresh failure)
+			// rides the park reason; the retry stays off without a proven origin tip.
+			st.recheckError = fetchError;
+			st.log(`! origin re-check before a push retry failed: ${fetchError}`);
+			return false;
+		}
+		if (!(await originStillFastForward(st, branch))) {
+			st.log("! origin moved or its tip is unreadable; not retrying the push");
+			return false;
+		}
+		const waitMs = ops.pushRetryDelayMs ?? MERGE_PUSH_RETRY_WAIT_MS;
+		st.log(
+			`- origin did not move; retrying the server push once in ${Math.round(waitMs / 1000)} s`,
+		);
+		await new Promise<void>((r) => setTimeout(r, waitMs));
+		return true;
+	}
+
+	/** True when a fetch proves the failed push should still be a fast-forward: origin's
+	 * tip still sits at the base the merge started from, or the local head is a
+	 * fast-forward of it. */
+	async function originStillFastForward(
+		st: TurnSettle,
+		branch: string,
+	): Promise<boolean> {
+		const originTip = await ops
+			.targetSha(st.e.path, `refs/remotes/origin/${branch}`)
+			.catch(() => null);
+		const localTip = await ops
+			.targetSha(st.e.path, `refs/heads/${branch}`)
+			.catch(() => null);
+		return (
+			originTip !== null &&
+			localTip !== null &&
+			(await ops
+				.targetContains(st.e.path, originTip, localTip)
+				.catch(() => false))
+		);
+	}
+
+	/** The settle git facts, the research demotion, and classify's verdict. The PR-mode ship
+	 * step owns the card's next state: it never lands, so the done write below (pushSha
+	 * pinning, worktree removal, release stamping) is skipped. A run the provider stopped at
+	 * its usage limit continues automatically (classify's queued continue): stamp the
+	 * provider's reset as the hold, so the continue fires after the reset instead of against
+	 * the still-exhausted window. Without a known reset the retry starts at once; classify's
+	 * streak rule parks the next identical death for a human. */
+	async function classifyTurnEnd(
+		st: TurnSettle,
+	): Promise<{ facts: GitFacts; next: Next }> {
+		// PR mode proves the rebase instead of the merge: origin/<target> an ancestor of the
+		// worktree HEAD on a clean tree — the branch is rebased and ready for the server's
+		// mechanical steps. Every other project keeps today's targetContains proof.
+		const prModeFacts =
+			st.kind === "merge" &&
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.fromMain &&
+			!st.idn.releaseCard &&
+			st.header.settings.prMode === true;
+		const facts: GitFacts = await settleGitFacts(st, prModeFacts);
+		// Landable clean commits with the report file gone: the card did real work after its
+		// research mark. Clear the flag and classify like any other work turn — the ready
+		// outcome was held unrewritten, so classify's ready branch sends it to merging.
+		const demoted = st.demoteCandidate && facts.commitsAhead > 0 && facts.clean;
+		if (demoted) st.store.updateTask(st.id, { research: false });
+		st.research = st.wasResearch && !demoted;
+		// listTurns ends with this turn; the one before it tells classify whether this exit repeats.
+		let next = classify({
+			kind: st.kind,
+			result: st.result,
+			git: facts,
+			research: st.research,
+			hasReport: st.reportText !== null,
+			grill: st.idn.grill,
+			target: st.header.target,
+			previousError: st.store.listTurns(st.id).at(-2)?.error ?? null,
+			...(st.vmOut !== null ? { vmDirty: st.vmOut.dirty } : {}),
+			images: st.input.imagePaths.length,
+			http400: () =>
+				findHttp400Rejection({
+					from: st.dispatch.runStartedAt,
+					to: st.runEndedAt,
+					dir: ops.http400Dir,
+				}),
+		});
+		// The PR-mode ship step owns the card's next state: it never lands, so the done
+		// write below (pushSha pinning, worktree removal, release stamping) is skipped.
+		if (st.prNext !== null) next = st.prNext;
+		return { facts, next: await stampUsageHold(st, next) };
+	}
+
+	/** A run the provider stopped at its usage limit continues automatically (classify's
+	 * queued continue): stamp the provider's reset as the hold, so the continue fires
+	 * after the reset instead of against the still-exhausted window. Without a known
+	 * reset the retry starts at once; classify's streak rule parks the next identical
+	 * death for a human. */
+	async function stampUsageHold(st: TurnSettle, next: Next): Promise<Next> {
+		if (
+			!(
 				next.state === "queued" &&
 				next.pendingPrompt !== undefined &&
-				hitUsageLimit(result)
-			) {
-				const hit = await usageResetFor(result.model ?? runModel ?? null);
-				if (hit !== null) {
-					const at = new Date(hit.resetsAt)
-						.toISOString()
-						.slice(0, 16)
-						.replace("T", " ");
-					next = {
-						...next,
-						holdUntil: hit.resetsAt,
-						holdProvider: hit.provider,
-						holdWindow: hit.window,
-						needsReason: `${QUOTA_LIMIT} - the board continues the task after the ${hit.provider} limit resets at ${at} UTC. Cancel to stop it instead.`,
-					};
-				}
-			}
-			// A failed server push keeps the card at merging with git's reason: the worktree stays.
-			// OTTR-394: a rejected non-fast-forward means origin moved while the merge ran. The
-			// server fetches origin with its own credentials, then — OTTR-510 — rebases the
-			// target branch onto the fetched tip, runs the merge gates, and pushes again. The
-			// recovery merge turn goes out only when the automatic retry cannot converge: a
-			// rebase conflict, failed gates, or a still-rejected retry push. The guards are
-			// unchanged: the retry budget (2 automatic retries per card), a hold-approved push
-			// whose lease pins one exact head (OTTR-274), and the pinned origin URL all still
-			// take today's needs_you with git's reason.
-			if (pushError !== null) {
-				// OTTR-506: the rejection left local main with commits origin lacks, so the
-				// merge hold must gate the very next tick, not wait for the refresh.
-				if (pushRejected) e.mainUnpushed = true;
-				const branch = target.startsWith("origin/")
-					? target.slice("origin/".length)
-					: null;
-				const retries = store.getTask(id)?.pushRetries ?? 0;
-				const ruleHint = BRANCH_RULE_REJECTION.test(pushError)
-					? "\nThis push was refused by a GitHub branch rule: the target branch requires pull requests. Project PR mode ships cards as pull requests instead; turn it on under the project's settings."
-					: "";
-				if (
-					pushRejected &&
-					holdTip === null &&
-					branch !== null &&
-					retries < MERGE_PUSH_RETRIES
-				) {
-					const fetchError =
-						settings.originUrl === null
-							? "no pinned origin URL to fetch the moved tip from"
-							: await ops
-									.fetchOriginBranch(e.path, branch, settings.originUrl)
-									.then(() => null)
-									.catch((err: unknown) =>
-										withAuthHint(settings.originUrl ?? "", errmsg(err)),
-									);
-					if (fetchError !== null) {
-						next = {
-							stage: "merging",
-							state: "needs_you",
-							needsReason: `Server push to origin failed: ${pushError}${ruleHint}`,
-						};
-					} else {
-						log(
-							`- push rejected and origin moved: trying the automatic rebase of ${branch} onto the fetched tip first`,
+				hitUsageLimit(st.result)
+			)
+		)
+			return next;
+		const hit = await usageResetFor(
+			st.result.model ?? st.route.runModel ?? null,
+		);
+		if (hit === null) return next;
+		const at = new Date(hit.resetsAt)
+			.toISOString()
+			.slice(0, 16)
+			.replace("T", " ");
+		return {
+			...next,
+			holdUntil: hit.resetsAt,
+			holdProvider: hit.provider,
+			holdWindow: hit.window,
+			needsReason: `${QUOTA_LIMIT} - the board continues the task after the ${hit.provider} limit resets at ${at} UTC. Cancel to stop it instead.`,
+		};
+	}
+
+	/** The settle git facts: the commits-ahead gate (interview, scout and main-checkout
+	 * cards exempt), the cleanliness read, and the integration proof. */
+	async function settleGitFacts(
+		st: TurnSettle,
+		prModeFacts: boolean,
+	): Promise<GitFacts> {
+		return {
+			// An interview card runs in the main checkout with no base branch: the commits-ahead
+			// gate would count its own AGENTS.md commit and trap the card, so it stays exempt.
+			// A trending scout runs there too: the checkout's own commits are never its work.
+			// A husk or unlinked dir would make git speak for the enclosing checkout instead,
+			// so the main-repo proof stands in for all three facts there.
+			commitsAhead:
+				st.idn.interview || st.idn.grill || st.idn.scout || st.fromMain
+					? 0
+					: await ops.commitsAhead(st.loc.wt, st.header.base).catch(() => 0),
+			// A microVM's tree is gone with the VM: its end-of-run status report decides,
+			// and a VM that could not report (null) is never clean.
+			clean: st.fromMain
+				? true
+				: st.vmOut !== null
+					? st.vmOut.dirty !== null && st.vmOut.dirty.length === 0
+					: await ops.isClean(st.loc.wt).catch(() => false),
+			integrated: await integrationProof(st, prModeFacts),
+		};
+	}
+
+	/** The integration proof: VELV-89's hold probe (the fetched remote target holds the
+	 * approved merge; the stale worktree proof cannot see it), else the main-repo proof for
+	 * a lost worktree link, the PR-mode rebase proof, or the worktree's isIntegrated. */
+	async function integrationProof(
+		st: TurnSettle,
+		prModeFacts: boolean,
+	): Promise<boolean> {
+		return (
+			st.remoteLanded ||
+			(st.fromMain
+				? await ops
+						.branchMergedOrGone(
+							st.e.path,
+							st.task.branch ?? "",
+							st.header.target,
+						)
+						.catch(() => false)
+				: prModeFacts
+					? ((await ops
+							.prIntegrated?.(st.e.path, st.loc.wt, st.header.target)
+							.catch(() => false)) ?? false)
+					: await ops
+							.isIntegrated(st.loc.wt, st.header.target)
+							.catch(() => false))
+		);
+	}
+
+	/** A failed server push keeps the card at merging with git's reason: the worktree stays.
+	 * OTTR-394: a rejected non-fast-forward means origin moved while the merge ran. The
+	 * server fetches origin with its own credentials, then — OTTR-510 — rebases the
+	 * target branch onto the fetched tip, runs the merge gates, and pushes again. The
+	 * recovery merge turn goes out only when the automatic retry cannot converge: a
+	 * rebase conflict, failed gates, or a still-rejected retry push. The guards are
+	 * unchanged: the retry budget (2 automatic retries per card), a hold-approved push
+	 * whose lease pins one exact head (OTTR-274), and the pinned origin URL all still
+	 * take today's needs_you with git's reason. */
+	async function recoverMergePush(st: TurnSettle, next: Next): Promise<Next> {
+		if (st.pushError === null) return next;
+		// OTTR-506: the rejection left local main with commits origin lacks, so the
+		// merge hold must gate the very next tick, not wait for the refresh.
+		if (st.pushRejected) st.e.mainUnpushed = true;
+		const branch = st.header.target.startsWith("origin/")
+			? st.header.target.slice("origin/".length)
+			: null;
+		const retries = st.store.getTask(st.id)?.pushRetries ?? 0;
+		const ruleHint = BRANCH_RULE_REJECTION.test(st.pushError)
+			? "\nThis push was refused by a GitHub branch rule: the target branch requires pull requests. Project PR mode ships cards as pull requests instead; turn it on under the project's settings."
+			: "";
+		if (
+			st.pushRejected &&
+			st.holdTip === null &&
+			branch !== null &&
+			retries < MERGE_PUSH_RETRIES
+		)
+			return rebaseRecoveredPush(st, branch, retries, ruleHint, next);
+		return parkFailedPush(st, ruleHint);
+	}
+
+	/** The card keeps git's push failure: merging with the reason (the re-check failure's own
+	 * reason rides along when the OTTR-465 re-check failed). */
+	function parkFailedPush(st: TurnSettle, ruleHint: string): Next {
+		return {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: `Server push to origin failed: ${st.pushError}${st.recheckError === null ? "" : `\norigin re-check failed: ${st.recheckError}`}${ruleHint}`,
+		};
+	}
+
+	/** The OTTR-394/510 automatic recovery: fetch the moved tip, rebase the target branch
+	 * onto it, run the merge gates, and push again. */
+	async function rebaseRecoveredPush(
+		st: TurnSettle,
+		branch: string,
+		retries: number,
+		ruleHint: string,
+		next: Next,
+	): Promise<Next> {
+		const fetchError =
+			st.header.settings.originUrl === null
+				? "no pinned origin URL to fetch the moved tip from"
+				: await ops
+						.fetchOriginBranch(st.e.path, branch, st.header.settings.originUrl)
+						.then(() => null)
+						.catch((err: unknown) =>
+							withAuthHint(st.header.settings.originUrl ?? "", errmsg(err)),
 						);
-						// OTTR-510: the recovery steer is built here but sent only from the paths
-						// where the automatic retry cannot converge.
-						const queueRebaseTurn = async (): Promise<void> => {
-							// The gates can run minutes: re-fetch so the prompt's "the server has
-							// fetched origin" stays true when the recovery turn starts.
-							const refetchError =
-								settings.originUrl === null
-									? "no pinned origin URL to fetch the moved tip from"
-									: await ops
-											.fetchOriginBranch(e.path, branch, settings.originUrl)
-											.then(() => null)
-											.catch((err: unknown) =>
-												withAuthHint(settings.originUrl ?? "", errmsg(err)),
-											);
-							if (refetchError !== null) {
-								log(
-									`! origin re-fetch before the recovery turn failed: ${refetchError}`,
-								);
-								// Fail closed: no turn queued, no retry budget spent.
-								next = {
-									stage: "merging",
-									state: "needs_you",
-									needsReason: `Server push to origin failed: ${pushError}\norigin re-fetch before the recovery turn failed: ${refetchError}${ruleHint}`,
-								};
-								return;
-							}
-							const prompt = rebaseRetryPrompt({
-								branch,
-								attempt: retries + 1,
-								max: MERGE_PUSH_RETRIES,
-							});
-							// Steering that landed mid-run rides the rebase turn, its authorship
-							// leading — the same rule a hold park follows under queued user text.
-							const steer = store.getTask(id)?.pendingPrompt ?? null;
-							store.updateTask(id, { pushRetries: retries + 1 });
-							appendLog(
-								store,
-								id,
-								`server push rejected: origin moved, merge turn queued to rebase (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
-							);
-							next = {
-								stage: "merging",
-								state: "queued",
-								needsReason: null,
-								pendingPrompt:
-									steer === null ? prompt : `${prompt}\n\n${steer}`,
-								pendingBy:
-									steer === null ? "supervisor" : (live.pendingBy ?? "user"),
-							};
-						};
-						const rb = await ops
-							.rebaseTargetBranch(e.path, branch)
-							.catch((err: unknown) => ({
-								ok: false as const,
-								conflict: false,
-								error: errmsg(err),
-							}));
-						if (!rb.ok && rb.conflict) {
-							log(
-								`! the automatic rebase of ${branch} hit a conflict (the branch stays on its rejected head); queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
-							);
-							await queueRebaseTurn();
-						} else if (!rb.ok) {
-							// Fail closed: no turn queued, no retry budget spent.
-							log(`! the automatic rebase of ${branch} failed: ${rb.error}`);
-							next = {
-								stage: "merging",
-								state: "needs_you",
-								needsReason: `Server push to origin failed: ${pushError}\nthe automatic rebase failed: ${rb.error}${ruleHint}`,
-							};
-						} else {
-							log(
-								`- automatic rebase of ${branch} onto the fetched origin tip converged; running the merge gates (bun run check, bun test)`,
-							);
-							const gates = await ops
-								.runMergeGates(e.path)
-								.catch((err: unknown) => ({ ok: false, output: errmsg(err) }));
-							if (!gates.ok) {
-								log(
-									`! merge gates failed on the rebased ${branch}; queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
-								);
-								if (gates.output !== "")
-									log(`! merge gates output:\n${gates.output}`);
-								await queueRebaseTurn();
-							} else {
-								log(
-									`- merge gates passed on the rebased ${branch}; retrying the server push`,
-								);
-								const p2 = await runPush();
-								if (p2.status === "pushed") {
-									pushError = null;
-									pushOutput = null;
-									pushRejected = false;
-									log(
-										`- pushed ${target} from the server after the automatic rebase`,
-									);
-									// OTTR-743: the same recovery reason line rides a retry push.
-									if (p2.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
-										log(`- ${p2.output}`);
-								} else if (p2.status === "skipped") {
-									pushError = null;
-									pushOutput = null;
-									pushRejected = false;
-									log(
-										"- server push skipped after the automatic rebase (nothing to push)",
-									);
-								} else {
-									log(
-										`! the retry push of ${target} ${p2.status} after the automatic rebase: ${p2.error}`,
-									);
-									await queueRebaseTurn();
-								}
-							}
-						}
-					}
-				} else {
-					next = {
-						stage: "merging",
-						state: "needs_you",
-						needsReason: `Server push to origin failed: ${pushError}${recheckError === null ? "" : `\norigin re-check failed: ${recheckError}`}${ruleHint}`,
-					};
-				}
-			}
-			// OTTR-274: a held merge carries patches beyond the approval: park instead of landing
-			// it. holdHead holds the exact local target head the reply can approve.
-			if (holdMismatch !== null)
-				next = {
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: holdMismatch,
-				};
-			if (mergeMachinery) {
-				// OTTR-708: the merge machinery has done all it will do to the main checkout —
-				// the merge agent fast-forwarded it before the push, the settle may have reset
-				// the branch (resetBranchTo on a hold park), and the push attempt ended pushed,
-				// failed, rejected, or skipped, or was refused outright, or never ran. Record
-				// the head it left behind, whatever the path took, so the checkout guard of a
-				// concurrent work turn in another project discounts the board's own advance.
-				const s = await ops.checkoutState(e.path).catch(() => null);
-				if (s !== null && s.head !== null) boardPushedHeads.set(name, s.head);
-			}
-			if (
-				fromMain &&
-				!facts.integrated &&
-				next.needsReason?.startsWith("Reported integrated, but HEAD is not on")
-			)
-				next = {
-					...next,
-					needsReason: "worktree link lost and branch has unreached commits",
-				};
-			// A no-stderr death carries its dispatch context in the reason; the run log gets the
-			// same line so an operator tailing the log sees the answer without opening the board.
-			if (
-				next.needsReason?.startsWith("omp exited with code ") &&
-				next.needsReason.includes(" (dispatch ")
-			)
-				appendLog(store, id, next.needsReason);
-			if (next.quarantineImages) {
-				try {
-					const moved = quarantineImageFiles(
-						store.dataRoot,
-						store.imagesDir(id),
-						join(store.tasksDir, "quarantine", id),
-						turnImages,
-					);
-					store.updateTask(id, {
-						images: live.images.filter((n) => !moved.includes(n)),
-					});
-					appendLog(
-						store,
-						id,
-						`provider rejected the attached images (died before any output); quarantined ${moved.length} image(s) to .tasks/quarantine/${id}: ${moved.slice(0, 20).join(", ")} — retrying text-only`,
-					);
-				} catch (err) {
-					// Never requeue with the images still attached: that is the loop this handles.
-					next = {
-						stage: kind === "work" ? "in_progress" : "merging",
-						state: "needs_you",
-						needsReason: `Image quarantine failed: ${errmsg(err)}.`,
-					};
-				}
-			}
-			// A run that could not restore its model never delivered this turn's reply: the retry
-			// sends it again, with any steering that landed meanwhile.
-			const restoreRetry =
+		if (fetchError !== null)
+			return {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Server push to origin failed: ${st.pushError}${ruleHint}`,
+			};
+		st.log(
+			`- push rejected and origin moved: trying the automatic rebase of ${branch} onto the fetched tip first`,
+		);
+		const rb = await ops
+			.rebaseTargetBranch(st.e.path, branch)
+			.catch((err: unknown) => ({
+				ok: false as const,
+				conflict: false,
+				error: errmsg(err),
+			}));
+		if (!rb.ok && rb.conflict) {
+			st.log(
+				`! the automatic rebase of ${branch} hit a conflict (the branch stays on its rejected head); queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+			);
+			return queueRebaseTurn(st, branch, retries, ruleHint);
+		}
+		if (!rb.ok) {
+			// Fail closed: no turn queued, no retry budget spent.
+			st.log(`! the automatic rebase of ${branch} failed: ${rb.error}`);
+			return {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Server push to origin failed: ${st.pushError}\nthe automatic rebase failed: ${rb.error}${ruleHint}`,
+			};
+		}
+		st.log(
+			`- automatic rebase of ${branch} onto the fetched origin tip converged; running the merge gates (bun run check, bun test)`,
+		);
+		return runRebaseGates(st, branch, retries, ruleHint, next);
+	}
+
+	/** Queues the rebase recovery merge turn (OTTR-510). The gates can run minutes: re-fetch
+	 * so the prompt's "the server has fetched origin" stays true when the recovery turn
+	 * starts. Steering that landed mid-run rides the rebase turn, its authorship leading —
+	 * the same rule a hold park follows under queued user text. */
+	async function queueRebaseTurn(
+		st: TurnSettle,
+		branch: string,
+		retries: number,
+		ruleHint: string,
+	): Promise<Next> {
+		const refetchError =
+			st.header.settings.originUrl === null
+				? "no pinned origin URL to fetch the moved tip from"
+				: await ops
+						.fetchOriginBranch(st.e.path, branch, st.header.settings.originUrl)
+						.then(() => null)
+						.catch((err: unknown) =>
+							withAuthHint(st.header.settings.originUrl ?? "", errmsg(err)),
+						);
+		if (refetchError !== null) {
+			st.log(
+				`! origin re-fetch before the recovery turn failed: ${refetchError}`,
+			);
+			// Fail closed: no turn queued, no retry budget spent.
+			return {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Server push to origin failed: ${st.pushError}\norigin re-fetch before the recovery turn failed: ${refetchError}${ruleHint}`,
+			};
+		}
+		const prompt = rebaseRetryPrompt({
+			branch,
+			attempt: retries + 1,
+			max: MERGE_PUSH_RETRIES,
+		});
+		// Steering that landed mid-run rides the rebase turn, its authorship
+		// leading — the same rule a hold park follows under queued user text.
+		const steer = st.store.getTask(st.id)?.pendingPrompt ?? null;
+		st.store.updateTask(st.id, { pushRetries: retries + 1 });
+		appendLog(
+			st.store,
+			st.id,
+			`server push rejected: origin moved, merge turn queued to rebase (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+		);
+		return {
+			stage: "merging",
+			state: "queued",
+			needsReason: null,
+			pendingPrompt: steer === null ? prompt : `${prompt}\n\n${steer}`,
+			pendingBy:
+				steer === null ? "supervisor" : (st.input.live.pendingBy ?? "user"),
+		};
+	}
+
+	/** The merge gates on the rebased branch: pass pushes the target again, fail queues the
+	 * recovery turn. */
+	async function runRebaseGates(
+		st: TurnSettle,
+		branch: string,
+		retries: number,
+		ruleHint: string,
+		next: Next,
+	): Promise<Next> {
+		const gates = await ops
+			.runMergeGates(st.e.path)
+			.catch((err: unknown) => ({ ok: false, output: errmsg(err) }));
+		if (!gates.ok) {
+			st.log(
+				`! merge gates failed on the rebased ${branch}; queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
+			);
+			if (gates.output !== "") st.log(`! merge gates output:\n${gates.output}`);
+			return queueRebaseTurn(st, branch, retries, ruleHint);
+		}
+		st.log(
+			`- merge gates passed on the rebased ${branch}; retrying the server push`,
+		);
+		const p2 = await serverPush(st);
+		if (p2.status === "pushed") {
+			st.pushError = null;
+			st.pushOutput = null;
+			st.pushRejected = false;
+			st.log(
+				`- pushed ${st.header.target} from the server after the automatic rebase`,
+			);
+			// OTTR-743: the same recovery reason line rides a retry push.
+			if (p2.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
+				st.log(`- ${p2.output}`);
+		} else if (p2.status === "skipped") {
+			st.pushError = null;
+			st.pushOutput = null;
+			st.pushRejected = false;
+			st.log(
+				"- server push skipped after the automatic rebase (nothing to push)",
+			);
+		} else {
+			st.log(
+				`! the retry push of ${st.header.target} ${p2.status} after the automatic rebase: ${p2.error}`,
+			);
+			return queueRebaseTurn(st, branch, retries, ruleHint);
+		}
+		return next;
+	}
+
+	/** The verdict fixes after classify and recovery: hold parks, the lost-worktree rewrite,
+	 * the dispatch-context log, image quarantine, the model-restore requeue, mid-run steering,
+	 * reported dependencies, and the review/scout card parks. */
+	async function stabilizeNext(
+		st: TurnSettle,
+		facts: GitFacts,
+		next: Next,
+	): Promise<Next> {
+		let settled = next;
+		// OTTR-274: a held merge carries patches beyond the approval: park instead of landing
+		// it. holdHead holds the exact local target head the reply can approve.
+		if (st.holdMismatch !== null)
+			settled = {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: st.holdMismatch,
+			};
+		// OTTR-708: the merge machinery has done all it will do to the main checkout —
+		// the merge agent fast-forwarded it before the push, the settle may have reset
+		// the branch (resetBranchTo on a hold park), and the push attempt ended pushed,
+		// failed, rejected, or skipped, or was refused outright, or never ran. Record
+		// the head it left behind, whatever the path took, so the checkout guard of a
+		// concurrent work turn in another project discounts the board's own advance.
+		if (
+			st.kind === "merge" &&
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.idn.releaseCard
+		) {
+			const s = await ops.checkoutState(st.e.path).catch(() => null);
+			if (s !== null && s.head !== null) boardPushedHeads.set(st.name, s.head);
+		}
+		if (
+			st.fromMain &&
+			!facts.integrated &&
+			settled.needsReason?.startsWith("Reported integrated, but HEAD is not on")
+		)
+			settled = {
+				...settled,
+				needsReason: "worktree link lost and branch has unreached commits",
+			};
+		// A no-stderr death carries its dispatch context in the reason; the run log gets the
+		// same line so an operator tailing the log sees the answer without opening the board.
+		if (
+			settled.needsReason?.startsWith("omp exited with code ") &&
+			settled.needsReason.includes(" (dispatch ")
+		)
+			appendLog(st.store, st.id, settled.needsReason);
+		settled = await quarantineTurnImages(st, settled);
+		settled = await requeueModelRestore(st, settled);
+		// A run that could not restore its model never delivered this turn's reply: the retry
+		// sends it again, with any steering that landed meanwhile.
+		const restoreRetry =
+			settled.state === "queued" &&
+			settled.needsReason?.startsWith(MODEL_RESTORE) === true;
+		settled = await settleSteered(st, settled, restoreRetry);
+		settled = await settleReportedDeps(st, settled);
+		settled = await parkCardKind(st, settled);
+		return settled;
+	}
+
+	/** A provider that died before any output with the images attached: quarantine the images
+	 * and requeue text-only. */
+	async function quarantineTurnImages(
+		st: TurnSettle,
+		next: Next,
+	): Promise<Next> {
+		if (!next.quarantineImages) return next;
+		try {
+			const moved = quarantineImageFiles(
+				st.store.dataRoot,
+				st.store.imagesDir(st.id),
+				join(st.store.tasksDir, "quarantine", st.id),
+				st.input.turnImages,
+			);
+			st.store.updateTask(st.id, {
+				images: st.input.live.images.filter((n) => !moved.includes(n)),
+			});
+			appendLog(
+				st.store,
+				st.id,
+				`provider rejected the attached images (died before any output); quarantined ${moved.length} image(s) to .tasks/quarantine/${st.id}: ${moved.slice(0, 20).join(", ")} — retrying text-only`,
+			);
+		} catch (err) {
+			// Never requeue with the images still attached: that is the loop this handles.
+			return {
+				stage: st.kind === "work" ? "in_progress" : "merging",
+				state: "needs_you",
+				needsReason: `Image quarantine failed: ${errmsg(err)}.`,
+			};
+		}
+		return next;
+	}
+
+	/** A run that could not restore its model never delivered this turn's reply: the retry
+	 * sends it again, with any steering that landed meanwhile (raw's authorship leads the
+	 * re-park; a null behaves as user). */
+	async function requeueModelRestore(
+		st: TurnSettle,
+		next: Next,
+	): Promise<Next> {
+		if (
+			!(
 				next.state === "queued" &&
-				next.needsReason?.startsWith(MODEL_RESTORE) === true;
-			if (restoreRetry) {
-				const sent = [raw, store.getTask(id)?.pendingPrompt ?? null].filter(
-					(p): p is string => p !== null && p !== ".",
-				);
-				next = {
-					...next,
-					pendingPrompt: sent.join("\n\n") || (raw ?? undefined),
-					// raw's authorship leads the re-park; a null behaves as user.
-					pendingBy: live.pendingBy ?? "user",
-				};
-			}
-			// Steering queued while the turn ran: deliver it as the next turn instead of settling
-			// (a pendingPrompt at turn end can only have arrived via /steer mid-run).
-			const steered = (store.getTask(id)?.pendingPrompt ?? null) !== null;
-			if (steered && !restoreRetry)
-				next = {
-					stage: kind === "work" ? "in_progress" : "merging",
-					state: "queued",
-					needsReason: null,
-				};
-			// The agent holds this turn on other cards (report_outcome dependsOn): valid ids are
-			// recorded on the card, and a needs_you outcome requeues it in the current stage instead
-			// of parking at needs_you — the scheduler restarts the turn when every id is done or
-			// cancelled (waitingOn). A bad id — this card itself, an unknown project's handle, a
-			// missing card here or abroad — parks needs_you naming it; the ids are not recorded.
-			const outcome = result.outcome;
-			const reportedDeps = outcome !== null ? outcome.dependsOn : undefined;
-			if (reportedDeps !== undefined && reportedDeps.length > 0) {
-				// OTTR-708: ids resolve across the board's projects, this store's own cards first.
-				const depProjects = depProjectsOf(projects.values());
-				const ownDep = depProjectOf(store);
-				const bad = badDep(reportedDeps, depProjects, ownDep, id);
-				if (bad !== null)
-					next = {
-						stage: next.stage,
-						state: "needs_you",
-						needsReason: bad.reason,
-						asked: next.asked,
-					};
-				else {
-					const merged = [...new Set([...task.dependsOn, ...reportedDeps])];
-					if (
-						merged.length !== task.dependsOn.length ||
-						reportedDeps.some((d, i) => task.dependsOn[i] !== d)
-					)
-						store.updateTask(id, { dependsOn: merged });
-					if (
-						outcome?.status === "needs_you" &&
-						next.state === "needs_you" &&
-						next.asked === undefined
-					)
-						next = {
-							stage: next.stage,
-							state: "queued",
-							needsReason: depHold(
-								store.listTasks(),
-								{ ...task, dependsOn: merged },
-								(did) => findDep(did, depProjects, ownDep),
-							),
-							pendingPrompt: DEP_HELD_PROMPT,
-							pendingBy: "supervisor",
-						};
-				}
-			}
-			// Review cards never integrate: committing fails the review, and a release publishes via the tracker.
-			if (reviewCard && next.stage === "merging")
-				next = {
+				next.needsReason?.startsWith(MODEL_RESTORE) === true
+			)
+		)
+			return next;
+		const sent = [
+			st.input.raw,
+			st.store.getTask(st.id)?.pendingPrompt ?? null,
+		].filter((p): p is string => p !== null && p !== ".");
+		return {
+			...next,
+			pendingPrompt: sent.join("\n\n") || (st.input.raw ?? undefined),
+			// raw's authorship leads the re-park; a null behaves as user.
+			pendingBy: st.input.live.pendingBy ?? "user",
+		};
+	}
+
+	/** Steering queued while the turn ran: deliver it as the next turn instead of settling
+	 * (a pendingPrompt at turn end can only have arrived via /steer mid-run). */
+	async function settleSteered(
+		st: TurnSettle,
+		next: Next,
+		restoreRetry: boolean,
+	): Promise<Next> {
+		const steered = (st.store.getTask(st.id)?.pendingPrompt ?? null) !== null;
+		st.steered = steered;
+		if (!steered || restoreRetry) return next;
+		return {
+			stage: st.kind === "work" ? "in_progress" : "merging",
+			state: "queued",
+			needsReason: null,
+		};
+	}
+
+	/** The agent holds this turn on other cards (report_outcome dependsOn): valid ids are
+	 * recorded on the card, and a needs_you outcome requeues it in the current stage instead
+	 * of parking at needs_you — the scheduler restarts the turn when every id is done or
+	 * cancelled (waitingOn). A bad id — this card itself, an unknown project's handle, a
+	 * missing card here or abroad — parks needs_you naming it; the ids are not recorded. */
+	async function settleReportedDeps(st: TurnSettle, next: Next): Promise<Next> {
+		const outcome = st.result.outcome;
+		const reportedDeps = outcome !== null ? outcome.dependsOn : undefined;
+		if (reportedDeps === undefined || reportedDeps.length === 0) return next;
+		// OTTR-708: ids resolve across the board's projects, this store's own cards first.
+		const depProjects = depProjectsOf(projects.values());
+		const ownDep = depProjectOf(st.store);
+		const bad = badDep(reportedDeps, depProjects, ownDep, st.id);
+		if (bad !== null) return parkBadDep(next, bad.reason);
+		const merged = [...new Set([...st.task.dependsOn, ...reportedDeps])];
+		if (
+			merged.length !== st.task.dependsOn.length ||
+			reportedDeps.some((d, i) => st.task.dependsOn[i] !== d)
+		)
+			st.store.updateTask(st.id, { dependsOn: merged });
+		return queueDepHold(st, next, outcome, merged, depProjects, ownDep);
+	}
+
+	/** A bad id parks needs_you naming it; the ids are not recorded. */
+	function parkBadDep(next: Next, reason: string): Next {
+		return {
+			stage: next.stage,
+			state: "needs_you",
+			needsReason: reason,
+			asked: next.asked,
+		};
+	}
+
+	/** A needs_you outcome holding on valid ids: requeue in the current stage until every id
+	 * is done or cancelled (the scheduler restarts the turn then). */
+	function queueDepHold(
+		st: TurnSettle,
+		next: Next,
+		outcome: Outcome | null,
+		merged: string[],
+		depProjects: DepProject[],
+		ownDep: DepProject,
+	): Next {
+		if (
+			!(
+				outcome?.status === "needs_you" &&
+				next.state === "needs_you" &&
+				next.asked === undefined
+			)
+		)
+			return next;
+		return {
+			stage: next.stage,
+			state: "queued",
+			needsReason: depHold(
+				st.store.listTasks(),
+				{
+					...st.task,
+					dependsOn: merged,
+				},
+				(did) => findDep(did, depProjects, ownDep),
+			),
+			pendingPrompt: DEP_HELD_PROMPT,
+			pendingBy: "supervisor",
+		};
+	}
+
+	/** Review cards never integrate: committing fails the review, and a release publishes via
+	 * the tracker. A trending scout is read-only: it reads the main checkout and files cards
+	 * through the board, so nothing of it may ever reach a merge turn. A review card
+	 * classified done parks at merging on its findings (see parkReviewDone). */
+	async function parkCardKind(st: TurnSettle, next: Next): Promise<Next> {
+		if (st.idn.reviewCard && next.stage === "merging")
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: st.idn.releaseCard
+					? "A release review must not commit. Cancel this release, or reply to continue."
+					: "A review must not commit. Cancel this review, or reply to continue.",
+			};
+		if (st.idn.scout && next.stage === "merging")
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: "A trending scout must not commit.",
+			};
+		if (st.idn.reviewCard && next.stage === "done")
+			return parkReviewDone(st, next);
+		return next;
+	}
+
+	/** A review card classified done: findings recorded this run hold the card at merging/idle
+	 * with FINDINGS_HOLD; the check below files the kept ones while the card is still
+	 * in_progress/running, and only then is the parked state stored: settleReviews never sees
+	 * a parked card whose findings are missing. */
+	async function parkReviewDone(st: TurnSettle, next: Next): Promise<Next> {
+		const hold =
+			st.result.recorded.length > 0
+				? FINDINGS_HOLD
+				: findingsHold(st.store.listTasks(), st.task);
+		if (hold !== null)
+			return { stage: "merging", state: "idle", needsReason: hold };
+		if (st.idn.releaseCard && st.task.releaseVersion !== null) {
+			const err = await publishReleaseCard(
+				st.e,
+				st.task,
+				st.task.releaseVersion,
+				st.header.base,
+				st.loc.wt,
+				st.header.target,
+			);
+			if (err !== null)
+				return {
 					stage: "in_progress",
 					state: "needs_you",
-					needsReason: releaseCard
-						? "A release review must not commit. Cancel this release, or reply to continue."
-						: "A review must not commit. Cancel this review, or reply to continue.",
+					needsReason: err,
 				};
-			// A trending scout is read-only: it reads the main checkout and files cards through
-			// the board, so nothing of it may ever reach a merge turn.
-			if (scout && next.stage === "merging")
-				next = {
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: "A trending scout must not commit.",
-				};
-			if (reviewCard && next.stage === "done") {
-				// Findings recorded this run hold the card at merging/idle with FINDINGS_HOLD;
-				// the check below files the kept ones while the card is still in_progress/running,
-				// and only then is the parked state stored: settleReviews never sees a parked
-				// card whose findings are missing.
-				const hold =
-					result.recorded.length > 0
-						? FINDINGS_HOLD
-						: findingsHold(store.listTasks(), task);
-				if (hold !== null)
-					next = { stage: "merging", state: "idle", needsReason: hold };
-				else if (releaseCard) {
-					const err = await publishReleaseCard(e, task, base, wt, target);
-					if (err !== null)
-						next = {
-							stage: "in_progress",
-							state: "needs_you",
-							needsReason: err,
-						};
-				}
-				// A cancel before the publish step skips it and is caught by the settle recheck below;
-				// from the publish step to the final write, the `publishing` claim refuses a cancel.
-			}
-			// UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
-			// screenshot warns — the board would otherwise show UI work without visual proof. On a
-			// clean settle it re-prompts: the session resumes with a request to capture the shot.
-			// A second miss parks the card at needs_you instead of letting it settle toward
-			// done: a UI change must not reach done without its screenshot, and only a human
-			// (one more capture attempt, or an explicit cancel) can end the ping-pong.
-			if (
-				kind === "work" &&
-				!interview &&
-				!grill &&
-				!scout &&
-				!research &&
-				!releaseCard &&
+		}
+		// A cancel before the publish step skips it and is caught by the settle recheck below;
+		// from the publish step to the final write, the `publishing` claim refuses a cancel.
+		return next;
+	}
+
+	/** UI-shot guard: a work turn whose diff touches UI files (uiFiles) but attached no
+	 * screenshot warns — the board would otherwise show UI work without visual proof. On a
+	 * clean settle it re-prompts: the session resumes with a request to capture the shot.
+	 * A second miss parks the card at needs_you instead of letting it settle toward
+	 * done: a UI change must not reach done without its screenshot, and only a human
+	 * (one more capture attempt, or an explicit cancel) can end the ping-pong. */
+	async function guardUiShot(st: TurnSettle, next: Next): Promise<Next> {
+		if (
+			!(
+				st.kind === "work" &&
+				!st.idn.interview &&
+				!st.idn.grill &&
+				!st.idn.scout &&
+				!st.research &&
+				!st.idn.releaseCard &&
 				// This turn's copies count, and so do shots an earlier turn on this card attached:
 				// changedFiles is the card's cumulative diff, so without the card's history
 				// every later clean turn would re-prompt for a screenshot that already exists.
-				!(shots ?? task.shots).length
-			) {
-				const changed = await ops
-					.changedFiles(wt, base, target)
-					.catch(() => [] as string[]);
-				const ui = uiFiles(changed);
-				if (ui.length > 0) {
-					const priorLog = existsSync(store.logPath(id))
-						? readRegular(store.logPath(id)).toString("utf8")
-						: "";
-					appendLog(store, id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
-					if (next.needsReason === null && !steered) {
-						if (!priorLog.includes(UI_SHOT_WARNING))
-							next = {
-								stage: "in_progress",
-								state: "queued",
-								needsReason:
-									"no screenshot attached - resuming automatically to capture one. Cancel to stop it instead.",
-								pendingPrompt: uiShotReprompt(ui),
-								pendingBy: "supervisor",
-							};
-						else
-							next = {
-								stage: "in_progress",
-								state: "needs_you",
-								needsReason: `UI files changed (${listed(ui)}) but still no screenshot was attached. The card cannot finish without one: reply to resume the session and have it capture the shot (report_outcome's shots field), or cancel the card.`,
-							};
-					}
-				}
-			}
-			if (reportError !== null && !releaseCard && next.state !== "queued")
-				next = {
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: `The research report file ${RESEARCH_REPORT} cannot be read: ${reportError}. Reply to have the agent write it as a regular file, or cancel the card.`,
-				};
-			// Delete check: a worktree that still holds changes or unmerged commits is kept, and the card asks you.
-			// A review card's worktree is disposable (mutation runs leave report files, and a review
-			// must not commit), so it skips the check.
-			// A research card's worktree is disposable like a review card's: the report is already harvested.
-			// A trending scout's cwd is the main checkout: what it holds is the user's, never the card's.
-			const unsaved =
-				next.stage === "done" &&
-				!reviewCard &&
-				!interview &&
-				!scout &&
-				!research
-					? await ops.unsavedWork(wt, target)
-					: null;
-			// A research card's deliverable is the report file: archive it before the worktree goes.
-			let report: string | null | undefined;
-			if (research && !interview && next.state !== "queued") {
-				report = reportText;
-				if (next.stage === "done" && report === null)
-					next = {
-						stage: "in_progress",
-						state: "needs_you",
-						needsReason: `The research report file ${RESEARCH_REPORT} is missing from the worktree. Reply to have the agent write it, or cancel the card.`,
-					};
-			}
-			// OTTR-488: harvest the steps recommendation with the report — 'yes' when the report
-			// recommends steps by the same detection the drawer button uses (the exact heading
-			// the prompt asks for, or the older shapes OTTR-468 upgraded the regex to catch, so
-			// a stored row can never lose the button a legacy row keeps), 'no' when a harvested
-			// report carries none; no report (or none harvested this settle) writes nothing.
-			const steps =
-				report === null || report === undefined
-					? undefined
-					: recommendsSteps(report)
-						? ("yes" as const)
-						: ("no" as const);
-			const now = Date.now();
-			if (unsaved)
-				next = {
-					stage: kind === "work" ? "in_progress" : "merging",
-					state: "needs_you",
-					needsReason: keptReason(unsaved),
-				};
-			// OTTR-708: the cross-project checkout guard. Only a settle that would otherwise
-			// complete asks the question: a card already parked or auto-resumed keeps its own
-			// reason. A merging-bound settle (ready with commits) with a violation must park
-			// before the merge; a steered requeue (state queued, needsReason null) with a
-			// violation also parks, and the pending steering text survives the park.
-			// Note: when both a dep hold and a violation apply, the violation reason wins
-			// the park — that ordering is acceptable.
-			if (checkoutGuard && guardBefore !== null && next.needsReason === null) {
-				const violation = await checkoutGuardReason(
-					projects,
-					ops,
-					boardPushedHeads,
-					name,
-					guardBefore,
-				);
-				if (violation !== null)
-					next = {
-						stage: "in_progress",
-						state: "needs_you",
-						needsReason: violation,
-					};
-			}
-			// The settle git reads are slow; a cancel landing inside them owns the card (its kept
-			// path already wrote the final state). Finish only the turn row and leave the card
-			// alone in that case.
-			let commits =
-				next.stage === "done"
-					? await ops.targetCommits(e.path, target)
-					: undefined;
-			// Stamped with `commits`: the target head at Done anchors the release's late-commit
-			// attribution to this card's merge.
-			const mergeHead =
-				next.stage === "done"
-					? await ops.targetSha(e.path, target).catch(() => null)
-					: undefined;
-			const keptFiles =
-				!releaseCard && next.stage === "done"
-					? []
-					: unsaved
-						? await ops.statusFiles(wt)
-						: undefined;
-			// U7: an update card on a hold-update-merges project parks for a human approval; the reply
-			// approves the parked head (holdHead), and the next ready work turn integrates only while
-			// HEAD still equals it: a commit after the approval parks the card again. A ready work
-			// settle lands at merging (commits to integrate) or straight done (already integrated).
-			// fork-born tasks (analysis proposals AND manual follow-ups of a fork research card) always
-			// hold their merge for approval; the parent existing implies the feature ran, so this is
-			// independent of the forkResearch toggle. The hold covers every descendant: a card an agent
-			// files from a fork-born card (create_task) must not merge without approval either.
-			const readyWork =
-				kind === "work" && (next.stage === "done" || next.stage === "merging");
-			const updateHold =
-				readyWork &&
-				task.updateIds.length > 0 &&
-				store.getSettings().holdUpdateMerges;
-			let forkBorn = false;
-			const seen = new Set<string>([task.id]);
-			let up = task.followUpOf;
-			while (up !== null && !seen.has(up) && !forkBorn) {
-				seen.add(up);
-				const anc = store.getTask(up);
-				forkBorn = anc?.topic === "fork research";
-				up = anc?.followUpOf ?? null;
-			}
-			// A read-only retro has nothing to merge; holding it blocks later retros. The
-			// forkMergeHold switch gates new holds (OTTR-689): with it off a fork-born card merges
-			// like any work card. A card already parked on a fork hold (a parked head, its fork
-			// approval not spent) stays held with the switch off, so it still needs an approval
-			// at its parked head; only the approving settle lifts that one.
-			const forkHold =
-				readyWork &&
-				forkBorn &&
-				!retroCard &&
-				(store.getSettings().forkMergeHold ||
-					(task.holdHead !== null && task.forkMergeHead === null));
-			const head =
-				updateHold || forkHold
-					? await ops.targetSha(wt, "HEAD").catch(() => null)
-					: null;
-			// AGEN-24: the approving turn may integrate by itself (a project's AGENTS.md can tell it
-			// to merge) and remove the worktree before it reports; the HEAD read then returns null
-			// and the hold below parked the approved card again while the work already sat on the
-			// target. When the target already contains the head the reply approved, the merge
-			// landed: let the settle finish instead of parking again.
-			const approvedHead = updateHold
-				? task.updateMergeHead
-				: forkHold
-					? task.forkMergeHead
-					: null;
-			const holdLanded =
-				head === null &&
-				approvedHead !== null &&
-				(await ops
-					.targetContains(e.path, approvedHead, target)
-					.catch(() => false));
-			// A null head (git failed) never matches: the hold fails closed.
-			const holdReason = holdLanded
-				? null
-				: updateHold && (head === null || task.updateMergeHead !== head)
-					? UPDATE_HOLD_REASON
-					: forkHold && (head === null || task.forkMergeHead !== head)
-						? FORK_HOLD_REASON
-						: null;
-			if (holdReason !== null) {
-				next = {
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: holdReason,
-				};
-				holdHead = head;
-				commits = undefined; // not done: the approving settle re-measures
-			}
-			// OTTR-531: sync-commit hygiene findings land on the card before any settle write.
-			if (result.outcome) {
-				const lines = await syncCommitFindings();
-				if (lines.length > 0) {
-					const o = result.outcome;
-					result = {
-						...result,
-						outcome: {
-							...o,
-							details: `${o.details ?? ""}${o.details ? "\n\n" : ""}${lines.join("\n")}`,
-						},
-					};
-				}
-			}
-			const settled = store.getTask(id);
-			if (
-				!settled ||
-				settled.cancelledAt !== null ||
-				(settled.state !== "running" && settled.state !== "preparing")
-			) {
-				store.finishTurn(turn.id, {
-					endedAt: now,
-					exitCode: result.exitCode,
-					error: "cancelled",
-				});
-				return;
-			}
-			// The model the stream served, with the dispatch's thinking level re-attached when the
-			// bases match; and the dispatched selector when the run fell back to another model.
-			const served = turnModel(result.model, runModel);
-			const swap = modelSwap(result.model, runModel);
-			if (swap !== null)
-				log(
-					`! model swap: dispatched ${swap} but the run served ${served}${result.providerError ? ` (${result.providerError})` : ""} — the card keeps ${swap} for its next turn`,
-				);
-			store.finishTurn(turn.id, {
-				endedAt: now,
-				exitCode: result.exitCode,
-				// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
-				// Without a served model (a crash before message_start) the dispatch snapshot stands.
-				model: served ?? turn.model,
-				// The fallback proof: the selector the run was dispatched with, kept only when the
-				// run served another model's base, so the timeline can name the swap.
-				dispatchedModel: swap,
-				ranOn: result.ranOn ?? null,
-				outcome: result.outcome?.status ?? null,
-				summary: result.outcome?.summary ?? null,
-				details: result.outcome?.details ?? (result.finalText || null),
-				// Only a tool ask marks the turn as a question: a needs_you report's free-text
-				// question field is often a hold instruction ("re-run after X"), not a question,
-				// so the timeline keeps its alert styling unless the ask tool actually ran.
-				question: result.asked?.[0]?.question ?? null,
-				error: next.needsReason, // null on success; an automatic continue keeps its reason for the next classify
-			});
-			// A finished work card gets one second-model check before the merge queue takes it:
-			// a fresh, memory-less session with read/grep/glob verifies the ready
-			// report against the branch diff and the work transcript, and every blocker must
-			// quote one of them. Only a plain work card that classify classified as merging gets
-			// here; the check's verdict (or a skipped check) decides the final stored state.
-			const workCard =
-				kind === "work" &&
-				!research &&
-				!reviewCard &&
-				!releaseCard &&
-				!interview &&
-				!grill &&
-				!scout &&
-				!retroCard;
-			// A review that parked needs_you still files its findings (OTTR-322): a failed
-			// gate must not hide them. A later turn of the same review re-records its
-			// findings: skip by prompt text the ones that already have a card linked to it.
-			const reviewFindings =
-				reviewCard &&
-				result.recorded.length > 0 &&
-				(next.stage === "merging" || next.state === "needs_you")
-					? result.recorded.filter((f) => {
-							const linked = store
-								.listTasks()
-								.some((x) => x.followUpOf === id && x.prompt === f.prompt);
-							return !linked;
-						})
-					: [];
-			// A second-model check (review findings, work check) runs below while the card is still
-			// in_progress/running: the final stage/state only lands once the check's verdict — or a
-			// skipped check — is in, so the schedule tick can neither pick the card for a merge turn
-			// nor settle a parked review early.
-			const checkWillRun =
-				reviewFindings.length > 0 || (workCard && next.stage === "merging");
-			store.updateTask(id, {
-				...(checkWillRun
-					? {}
-					: {
-							stage: next.stage,
-							state: next.state,
-							needsReason: next.needsReason,
-							queuedAt: next.state === "queued" ? now : task.queuedAt,
-							// A usage-limit continue's reset hold; undefined keeps the column.
-							// The owner rides with it so the quota refresh can release early.
-							...(next.holdUntil !== undefined
-								? {
-										holdUntil: next.holdUntil,
-										holdProvider: next.holdProvider ?? null,
-										holdWindow: next.holdWindow ?? null,
-									}
-								: {}),
-						}),
-				shots,
-				pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it
-				// Authorship rides only when the prompt is actually written; classify's
-				// automatic continue is the board's own voice.
-				...(next.pendingPrompt !== undefined
-					? { pendingBy: next.pendingBy ?? "supervisor" }
-					: {}),
-				asked: next.asked ?? null, // updateTask stringifies arrays; null clears — cleared whenever the turn did not end on a fresh ask
-				summary:
-					releaseCard && next.stage === "done"
-						? `Released ${task.releaseVersion}`
-						: (result.outcome?.summary ?? task.summary),
-				details: result.outcome?.details ?? (result.finalText || task.details),
-				// The report's own `topic:` line groups the card on the board; null -> undefined keeps the column.
-				topic:
-					parseTopicReport(
-						result.outcome?.details ?? (result.finalText || task.details),
-					) ?? undefined,
-				commits,
-				mergeHead,
-				report,
-				steps,
-				keptFiles,
-				holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
-				// A merge-hold mismatch park serves the reviewer the exact push-side delta it
-				// flagged (undefined keeps the column): the live worktree diff no longer speaks
-				// for the push set once the branch is integrated.
-				diffFiles: holdFiles ?? undefined,
-				diffText: holdDiff ?? undefined,
-				// A park spends that hold's approval (undefined keeps the column): a stale approval never
-				// carries into a later settle. Only the parked hold's column clears, so an approved
-				// update hold survives a fork-hold park of the same card.
-				updateMergeHead: holdReason === UPDATE_HOLD_REASON ? null : undefined,
-				forkMergeHead: holdReason === FORK_HOLD_REASON ? null : undefined,
-			});
+				!(st.shots ?? st.task.shots).length
+			)
+		)
+			return next;
+		const changed = await ops
+			.changedFiles(st.loc.wt, st.header.base, st.header.target)
+			.catch(() => [] as string[]);
+		const ui = uiFiles(changed);
+		if (ui.length === 0) return next;
+		const priorLog = existsSync(st.store.logPath(st.id))
+			? readRegular(st.store.logPath(st.id)).toString("utf8")
+			: "";
+		appendLog(st.store, st.id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
+		if (next.needsReason !== null || st.steered) return next;
+		if (!priorLog.includes(UI_SHOT_WARNING))
+			return {
+				stage: "in_progress",
+				state: "queued",
+				needsReason:
+					"no screenshot attached - resuming automatically to capture one. Cancel to stop it instead.",
+				pendingPrompt: uiShotReprompt(ui),
+				pendingBy: "supervisor",
+			};
+		return {
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: `UI files changed (${listed(ui)}) but still no screenshot was attached. The card cannot finish without one: reply to resume the session and have it capture the shot (report_outcome's shots field), or cancel the card.`,
+		};
+	}
 
-			// A retro's proposal is filed as a held card (needs_you, followUpOf this retro):
-			// the settle recheck above confirmed the card is still ours, so this write is safe.
-			if (retroCard && next.stage === "done" && result.proposed !== null) {
-				const openProposals = store
+	/** The unreadable research report holds the card (a release card ships without one, and
+	 * a queued continue has not consumed this settle yet). */
+	function parkUnreadableReport(st: TurnSettle): Next {
+		return {
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: `The research report file ${RESEARCH_REPORT} cannot be read: ${st.reportError}. Reply to have the agent write it as a regular file, or cancel the card.`,
+		};
+	}
+
+	/** The delete check: a worktree that still holds changes or unmerged commits is kept, and
+	 * the card asks you. A review card's worktree is disposable (mutation runs leave report
+	 * files, and a review must not commit), so it skips the check. A research card's worktree
+	 * is disposable like a review card's: the report is already harvested. A trending scout's
+	 * cwd is the main checkout: what it holds is the user's, never the card's. */
+	async function measureUnsavedTree(st: TurnSettle, next: Next): Promise<void> {
+		st.unsaved =
+			next.stage === "done" &&
+			!st.idn.reviewCard &&
+			!st.idn.interview &&
+			!st.idn.scout &&
+			!st.research
+				? await ops.unsavedWork(st.loc.wt, st.header.target)
+				: null;
+	}
+
+	/** The settle writes planned before the row and card land: the unreadable-report park, the
+	 * report archive, the delete check, the kept-tree park, and the U7/fork merge holds. */
+	async function planSettleWrite(st: TurnSettle, next: Next): Promise<Next> {
+		let planned = next;
+		if (
+			st.reportError !== null &&
+			!st.idn.releaseCard &&
+			planned.state !== "queued"
+		)
+			planned = parkUnreadableReport(st);
+		await measureUnsavedTree(st, planned);
+		planned = await archiveReport(st, planned);
+		st.now = Date.now();
+		if (st.unsaved)
+			planned = {
+				stage: st.kind === "work" ? "in_progress" : "merging",
+				state: "needs_you",
+				needsReason: keptReason(st.unsaved),
+			};
+		// OTTR-708: the cross-project checkout guard. Only a settle that would otherwise
+		// complete asks the question: a card already parked or auto-resumed keeps its own
+		// reason. A merging-bound settle (ready with commits) with a violation must park
+		// before the merge; a steered requeue (state queued, needsReason null) with a
+		// violation also parks, and the pending steering text survives the park.
+		// Note: when both a dep hold and a violation apply, the violation reason wins
+		// the park — that ordering is acceptable.
+		if (
+			st.kind === "work" &&
+			st.mx.guardBefore !== null &&
+			planned.needsReason === null
+		) {
+			const violation = await checkoutGuardReason(
+				projects,
+				ops,
+				boardPushedHeads,
+				st.name,
+				st.mx.guardBefore,
+			);
+			if (violation !== null)
+				planned = {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: violation,
+				};
+		}
+		await measureSettleGit(st, planned);
+		return planMergeHolds(st, planned);
+	}
+
+	/** A research card's deliverable is the report file: archive it before the worktree goes,
+	 * and park a done card whose file never landed. OTTR-488: harvest the steps recommendation
+	 * with the report — 'yes' when the report recommends steps by the same detection the drawer
+	 * button uses (the exact heading the prompt asks for, or the older shapes OTTR-468 upgraded
+	 * the regex to catch, so a stored row can never lose the button a legacy row keeps), 'no'
+	 * when a harvested report carries none; no report (or none harvested this settle) writes
+	 * nothing. */
+	async function archiveReport(st: TurnSettle, next: Next): Promise<Next> {
+		if (!(st.research && !st.idn.interview && next.state !== "queued"))
+			return next;
+		st.report = st.reportText;
+		if (next.stage === "done" && st.report === null)
+			return {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: `The research report file ${RESEARCH_REPORT} is missing from the worktree. Reply to have the agent write it, or cancel the card.`,
+			};
+		st.steps =
+			st.report === null || st.report === undefined
+				? undefined
+				: recommendsSteps(st.report)
+					? ("yes" as const)
+					: ("no" as const);
+		return next;
+	}
+
+	/** The done settle's git reads (the settle reads are slow; a cancel landing inside them
+	 * owns the card — its kept path already wrote the final state, and the checks below only
+	 * finish the turn row). Kept files ride a kept or release card; a plain done card keeps
+	 * none (its worktree goes away). */
+	async function measureSettleGit(st: TurnSettle, next: Next): Promise<void> {
+		// Stamped with `commits`: the target head at Done anchors the release's late-commit
+		// attribution to this card's merge.
+		st.commits =
+			next.stage === "done"
+				? await ops.targetCommits(st.e.path, st.header.target)
+				: undefined;
+		st.mergeHead =
+			next.stage === "done"
+				? await ops.targetSha(st.e.path, st.header.target).catch(() => null)
+				: undefined;
+		st.keptFiles =
+			!st.idn.releaseCard && next.stage === "done"
+				? []
+				: st.unsaved
+					? await ops.statusFiles(st.loc.wt)
+					: undefined;
+	}
+
+	/** True when a card descends from a fork-research card: the parent existing implies the
+	 * feature ran, so this is independent of the forkResearch toggle. The hold covers every
+	 * descendant: a card an agent files from a fork-born card (create_task) must not merge
+	 * without approval either. */
+	function isForkBorn(st: TurnSettle): boolean {
+		const seen = new Set<string>([st.task.id]);
+		let up = st.task.followUpOf;
+		let forkBorn = false;
+		while (up !== null && !seen.has(up) && !forkBorn) {
+			seen.add(up);
+			const anc = st.store.getTask(up);
+			forkBorn = anc?.topic === "fork research";
+			up = anc?.followUpOf ?? null;
+		}
+		return forkBorn;
+	}
+
+	/** U7: an update card on a hold-update-merges project parks for a human approval; the reply
+	 * approves the parked head (holdHead), and the next ready work turn integrates only while
+	 * HEAD still equals it: a commit after the approval parks the card again. A ready work
+	 * settle lands at merging (commits to integrate) or straight done (already integrated).
+	 * fork-born tasks (analysis proposals AND manual follow-ups of a fork research card) always
+	 * hold their merge for approval. A read-only retro has nothing to merge; holding it blocks
+	 * later retros. The forkMergeHold switch gates new holds (OTTR-689): with it off a fork-born
+	 * card merges like any work card. A card already parked on a fork hold (a parked head, its
+	 * fork approval not spent) stays held with the switch off, so it still needs an approval
+	 * at its parked head; only the approving settle lifts that one. */
+	async function planMergeHolds(st: TurnSettle, next: Next): Promise<Next> {
+		const readyWork =
+			st.kind === "work" && (next.stage === "done" || next.stage === "merging");
+		const updateHold =
+			readyWork &&
+			st.task.updateIds.length > 0 &&
+			st.store.getSettings().holdUpdateMerges;
+		const forkHold =
+			readyWork &&
+			isForkBorn(st) &&
+			!st.idn.retroCard &&
+			(st.store.getSettings().forkMergeHold ||
+				(st.task.holdHead !== null && st.task.forkMergeHead === null));
+		const { head, holdLanded } = await resolveHoldHead(
+			st,
+			updateHold,
+			forkHold,
+		);
+		// A null head (git failed) never matches: the hold fails closed.
+		const holdReason = holdReasonFor(
+			st,
+			updateHold,
+			forkHold,
+			head,
+			holdLanded,
+		);
+		if (holdReason === null) return next;
+		st.holdHead = head;
+		st.holdReason = holdReason;
+		st.commits = undefined; // not done: the approving settle re-measures
+		return {
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: holdReason,
+		};
+	}
+
+	/** The HEAD the hold pins and whether the approved merge already landed: AGEN-24 — the
+	 * approving turn may integrate by itself (a project's AGENTS.md can tell it to merge) and
+	 * remove the worktree before it reports; the HEAD read then returns null and the hold
+	 * below parked the approved card again while the work already sat on the target. When the
+	 * target already contains the head the reply approved, the merge landed: let the settle
+	 * finish instead of parking again. */
+	async function resolveHoldHead(
+		st: TurnSettle,
+		updateHold: boolean,
+		forkHold: boolean,
+	): Promise<{ head: string | null; holdLanded: boolean }> {
+		const head =
+			updateHold || forkHold
+				? await ops.targetSha(st.loc.wt, "HEAD").catch(() => null)
+				: null;
+		const approvedHead = updateHold
+			? st.task.updateMergeHead
+			: forkHold
+				? st.task.forkMergeHead
+				: null;
+		const holdLanded =
+			head === null &&
+			approvedHead !== null &&
+			(await ops
+				.targetContains(st.e.path, approvedHead, st.header.target)
+				.catch(() => false));
+		return { head, holdLanded };
+	}
+
+	/** Which hold reason parks the settle, if any: the hold fails closed — a null head (git
+	 * failed) never matches, and a head that is not exactly the approved one parks. */
+	function holdReasonFor(
+		st: TurnSettle,
+		updateHold: boolean,
+		forkHold: boolean,
+		head: string | null,
+		holdLanded: boolean,
+	): string | null {
+		if (holdLanded) return null;
+		if (updateHold && (head === null || st.task.updateMergeHead !== head))
+			return UPDATE_HOLD_REASON;
+		if (forkHold && (head === null || st.task.forkMergeHead !== head))
+			return FORK_HOLD_REASON;
+		return null;
+	}
+
+	/** OTTR-531: sync-commit hygiene findings land on the card before any settle write. */
+	async function recordSyncFindings(st: TurnSettle): Promise<void> {
+		const outcome = st.result.outcome;
+		if (outcome === null) return;
+		const lines = await syncCommitFindings();
+		if (lines.length === 0) return;
+		st.result = {
+			...st.result,
+			outcome: {
+				...outcome,
+				details: `${outcome.details ?? ""}${outcome.details ? "\n\n" : ""}${lines.join("\n")}`,
+			},
+		};
+	}
+
+	/** A cancel that landed inside the slow settle git reads owns the card (its kept path
+	 * already wrote the final state): finish only the turn row and leave the card alone.
+	 * True: the turn stops. */
+	function settleCancelled(st: TurnSettle, now: number): boolean {
+		const settled = st.store.getTask(st.id);
+		if (
+			!settled ||
+			settled.cancelledAt !== null ||
+			(settled.state !== "running" && settled.state !== "preparing")
+		) {
+			st.store.finishTurn(st.dispatch.turn.id, {
+				endedAt: now,
+				exitCode: st.result.exitCode,
+				error: "cancelled",
+			});
+			return true;
+		}
+		return false;
+	}
+
+	/** Finishes the turn row: the served model (with the dispatch's thinking level re-attached
+	 * when the bases match; and the dispatched selector when the run fell back to another
+	 * model), the outcome, and the question (only a tool ask marks the turn as a question: a
+	 * needs_you report's free-text question field is often a hold instruction ("re-run after
+	 * X"), not a question, so the timeline keeps its alert styling unless the ask tool actually
+	 * ran). True: the turn stopped (a cancel owned the card). */
+	function finishTurnRow(st: TurnSettle, next: Next): boolean {
+		if (settleCancelled(st, st.now)) return true;
+		// The model the stream served, with the dispatch's thinking level re-attached when the
+		// bases match; and the dispatched selector when the run fell back to another model.
+		const served = turnModel(st.result.model, st.route.runModel);
+		const swap = modelSwap(st.result.model, st.route.runModel);
+		if (swap !== null)
+			st.log(
+				`! model swap: dispatched ${swap} but the run served ${served}${st.result.providerError ? ` (${st.result.providerError})` : ""} — the card keeps ${swap} for its next turn`,
+			);
+		st.store.finishTurn(st.dispatch.turn.id, {
+			endedAt: st.now,
+			exitCode: st.result.exitCode,
+			// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
+			// Without a served model (a crash before message_start) the dispatch snapshot stands.
+			model: served ?? st.dispatch.turn.model,
+			// The fallback proof: the selector the run was dispatched with, kept only when the
+			// run served another model's base, so the timeline can name the swap.
+			dispatchedModel: swap,
+			ranOn: st.result.ranOn ?? null,
+			outcome: st.result.outcome?.status ?? null,
+			summary: st.result.outcome?.summary ?? null,
+			details: st.result.outcome?.details ?? (st.result.finalText || null),
+			// Only a tool ask marks the turn as a question: a needs_you report's free-text
+			// question field is often a hold instruction ("re-run after X"), not a question,
+			// so the timeline keeps its alert styling unless the ask tool actually ran.
+			question: st.result.asked?.[0]?.question ?? null,
+			error: next.needsReason, // null on success; an automatic continue keeps its reason for the next classify
+		});
+		return false;
+	}
+
+	/** A finished work card gets one second-model check before the merge queue takes it:
+	 * a fresh, memory-less session with read/grep/glob verifies the ready report against the
+	 * branch diff and the work transcript, and every blocker must quote one of them. Only a
+	 * plain work card that classify classified as merging gets here; the check's verdict (or
+	 * a skipped check) decides the final stored state. A review that parked needs_you still
+	 * files its findings (OTTR-322): a failed gate must not hide them. A later turn of the
+	 * same review re-records its findings: skip by prompt text the ones that already have a
+	 * card linked to it. A second-model check (review findings, work check) runs below while
+	 * the card is still in_progress/running: the final stage/state only lands once the check's
+	 * verdict — or a skipped check — is in, so the schedule tick can neither pick the card for
+	 * a merge turn nor settle a parked review early. */
+	function planTurnChecks(st: TurnSettle, next: Next): void {
+		st.workCard =
+			st.kind === "work" &&
+			!st.research &&
+			!st.idn.reviewCard &&
+			!st.idn.releaseCard &&
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.idn.scout &&
+			!st.idn.retroCard;
+		st.reviewFindings =
+			st.idn.reviewCard &&
+			st.result.recorded.length > 0 &&
+			(next.stage === "merging" || next.state === "needs_you")
+				? st.result.recorded.filter((f) => {
+						const linked = st.store
+							.listTasks()
+							.some((x) => x.followUpOf === st.id && x.prompt === f.prompt);
+						return !linked;
+					})
+				: [];
+		st.checkWillRun =
+			st.reviewFindings.length > 0 || (st.workCard && next.stage === "merging");
+	}
+
+	/** The stage/state columns ride the card write only when no second-model check runs: the
+	 * check's verdict (or a skipped check) decides the final stored state below. */
+	function settledCardState(
+		st: TurnSettle,
+		next: Next,
+	):
+		| {
+				stage: Next["stage"];
+				state: Next["state"];
+				needsReason: string | null;
+				queuedAt: number | null | undefined;
+				holdUntil?: number;
+				holdProvider?: string | null;
+				holdWindow?: string | null;
+		  }
+		| Record<string, never> {
+		if (st.checkWillRun) return {};
+		return {
+			stage: next.stage,
+			state: next.state,
+			needsReason: next.needsReason,
+			queuedAt: next.state === "queued" ? st.now : st.task.queuedAt,
+			// A usage-limit continue's reset hold; undefined keeps the column.
+			// The owner rides with it so the quota refresh can release early.
+			...(next.holdUntil !== undefined
+				? {
+						holdUntil: next.holdUntil,
+						holdProvider: next.holdProvider ?? null,
+						holdWindow: next.holdWindow ?? null,
+					}
+				: {}),
+		};
+	}
+
+	/** The card's summary, details, and the report's own `topic:` line that groups the card on
+	 * the board (null -> undefined keeps the column). */
+	function settledCardText(
+		st: TurnSettle,
+		next: Next,
+	): {
+		summary: string | null;
+		details: string | null;
+		topic: string | undefined;
+	} {
+		const body =
+			st.result.outcome?.details ?? (st.result.finalText || st.task.details);
+		return {
+			summary:
+				st.idn.releaseCard && next.stage === "done"
+					? `Released ${st.task.releaseVersion}`
+					: (st.result.outcome?.summary ?? st.task.summary),
+			details:
+				st.result.outcome?.details ?? (st.result.finalText || st.task.details),
+			topic: parseTopicReport(body) ?? undefined,
+		};
+	}
+
+	/** Stores the settle on the card row: the (deferred) stage/state, shots, the pending
+	 * prompt, the ask, text, the git facts, the report, and the hold columns. */
+	function writeSettledCard(st: TurnSettle, next: Next): void {
+		st.store.updateTask(st.id, {
+			...settledCardState(st, next),
+			shots: st.shots,
+			pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it
+			// Authorship rides only when the prompt is actually written; classify's
+			// automatic continue is the board's own voice.
+			...(next.pendingPrompt !== undefined
+				? { pendingBy: next.pendingBy ?? "supervisor" }
+				: {}),
+			asked: next.asked ?? null, // updateTask stringifies arrays; null clears — cleared whenever the turn did not end on a fresh ask
+			...settledCardText(st, next),
+			commits: st.commits,
+			mergeHead: st.mergeHead,
+			report: st.report,
+			steps: st.steps,
+			keptFiles: st.keptFiles,
+			holdHead: st.holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
+			// A merge-hold mismatch park serves the reviewer the exact push-side delta it
+			// flagged (undefined keeps the column): the live worktree diff no longer speaks
+			// for the push set once the branch is integrated.
+			diffFiles: st.holdFiles ?? undefined,
+			diffText: st.holdDiff ?? undefined,
+			// A park spends that hold's approval (undefined keeps the column): a stale approval never
+			// carries into a later settle. Only the parked hold's column clears, so an approved
+			// update hold survives a fork-hold park of the same card.
+			updateMergeHead: st.holdReason === UPDATE_HOLD_REASON ? null : undefined,
+			forkMergeHead: st.holdReason === FORK_HOLD_REASON ? null : undefined,
+		});
+	}
+
+	/** A retro's proposal is filed as a held card (needs_you, followUpOf this retro): the
+	 * settle recheck above confirmed the card is still ours, so this write is safe. */
+	async function fileRetroProposal(st: TurnSettle, next: Next): Promise<void> {
+		if (
+			!(
+				st.idn.retroCard &&
+				next.stage === "done" &&
+				st.result.proposed !== null
+			)
+		)
+			return;
+		const openProposals = st.store
+			.listTasks()
+			.filter(
+				(x) =>
+					!x.cancelledAt &&
+					x.state === "needs_you" &&
+					isRetroProposalReason(x.needsReason) &&
+					st.store.listTurns(x.id).length === 0,
+			).length;
+		if (openProposals >= 3) {
+			st.log("retro: proposal dropped: cap of 3 open proposals reached");
+			return;
+		}
+		const child = st.store.createTask(st.result.proposed.prompt);
+		const handoffPath = join(st.store.tasksDir, "handoffs", `${child.id}.md`);
+		let prompt = followUpPrompt({
+			text: st.result.proposed.prompt,
+			title: st.task.title,
+			handoffPath,
+		});
+		try {
+			writeBelow(
+				st.store.dataRoot,
+				handoffPath,
+				handoffMarkdown({
+					task: st.store.getTask(st.id) ?? st.task,
+					turns: st.store.listTurns(st.id),
+					sessionsDir: st.store.sessionsDir,
+				}),
+			);
+		} catch (err) {
+			// The card is still held; it just starts without the handoff pointer.
+			prompt = st.result.proposed.prompt;
+			st.log(`! handoff write failed: ${errmsg(err)}`);
+		}
+		st.store.updateTask(child.id, {
+			prompt,
+			followUpOf: st.id,
+			// A null model means the proposal card runs on the default role.
+			model: st.result.proposed.model,
+			state: "needs_you",
+			// The reason names the retro's source card once; a missing link falls
+			// back to naming the retro itself.
+			needsReason: proposedReason(
+				(st.task.followUpOf !== null
+					? st.store.getTask(st.task.followUpOf)
+					: null) ?? { id: st.task.id },
+			),
+			// The drawer's decision panel reads it; older proposals keep null.
+			proposalSummary: st.result.proposed.summary,
+		});
+		st.log(`- filed proposal ${child.id} (held for approval)`);
+	}
+
+	/** A review's recorded findings: Ottr caps them, checks the selection with a second model
+	 * (a fresh session — never --resume, never the review's own — memory off, read/grep/glob
+	 * only), and files the kept ones as queued cards linked to the review, the flow
+	 * create_task's per-finding calls did inline before. An approved review holds at merging
+	 * (FINDINGS_HOLD) and a needs_you review keeps its park: either way the card stays
+	 * in_progress/running until the deferred write below stores the final state.
+	 * True: the turn stopped (a credit stop or a taken-over check). */
+	async function runReviewCheck(st: TurnSettle): Promise<boolean> {
+		if (st.reviewFindings.length === 0) return false;
+		const checkOn = ops.reviewCheck?.() ?? true;
+		const selected = selectFindings(st.reviewFindings);
+		const selectedSet = new Set(selected);
+		const belowCap = st.reviewFindings.filter((f) => !selectedSet.has(f));
+		let kept: { id: number; finding: RecordedFinding }[] = selected.map(
+			(finding, i) => ({ id: i + 1, finding }),
+		);
+		let dropped: {
+			id: number;
+			finding: RecordedFinding;
+			reason: string;
+		}[] = [];
+		let checkMs = 0;
+		let checkFailed: string | null = null;
+		// The model the check resolves to (the role's selector, else the board's default
+		// role — omp's fallback) and why it gives no second-model opinion, for the card.
+		let checkModel: string | null = null;
+		let checkWarn: "same model" | "same vendor" | null = null;
+		if (checkOn) {
+			const attempt = await reviewCheckAttempts(st, selected);
+			if (attempt === null) return true;
+			kept = attempt.kept;
+			dropped = attempt.dropped;
+			checkMs = attempt.checkMs;
+			checkFailed = attempt.checkFailed;
+			checkModel = attempt.checkModel;
+			checkWarn = attempt.checkWarn;
+			await settleReviewCheckFailure(st, attempt);
+		} else {
+			for (const f of belowCap)
+				st.log(`- finding below the cap of 10, not filed: ${findingHead(f)}`);
+		}
+		fileKeptFindings(st, {
+			kept,
+			dropped,
+			belowCap,
+			checkOn,
+			checkMs,
+			checkFailed,
+			checkModel,
+			checkWarn,
+		});
+		return false;
+	}
+
+	/** Runs the review-check attempts (two, then the user decides: a half-checked review files
+	 * no cards). A usage limit skips the retry: it fails the same way until the reset.
+	 * Null: a credit stop or a taken-over check stopped the turn. */
+	async function reviewCheckAttempts(
+		st: TurnSettle,
+		selected: RecordedFinding[],
+	): Promise<{
+		kept: { id: number; finding: RecordedFinding }[];
+		dropped: { id: number; finding: RecordedFinding; reason: string }[];
+		checkMs: number;
+		checkFailed: string | null;
+		checkModel: string | null;
+		checkWarn: "same model" | "same vendor" | null;
+		hold: UsageHold | null;
+		limitHit: boolean;
+	} | null> {
+		const built = await reviewCheckInput(st, selected);
+		const loop = await reviewCheckLoop(st, selected, built);
+		if (loop === null) return null;
+		return {
+			kept: loop.kept,
+			dropped: loop.dropped,
+			checkMs: loop.checkMs,
+			checkFailed: loop.checkFailed,
+			checkModel: built.checkModel,
+			checkWarn: built.checkWarn,
+			hold: loop.hold,
+			limitHit: loop.limitHit,
+		};
+	}
+
+	/** The review check's input as data: the findings (numbered from 1), the frozen sha, the
+	 * open cards, and the commits main gained since the review — the one git fact a run
+	 * without a shell cannot see for itself. Also the model the check resolves to (the role's
+	 * selector, else the board's default role — omp's fallback) and why it gives no
+	 * second-model opinion, for the card. */
+	async function reviewCheckInput(
+		st: TurnSettle,
+		selected: RecordedFinding[],
+	): Promise<{
+		input: string;
+		checkRole: string;
+		selector: string | undefined;
+		checkModel: string | null;
+		checkWarn: "same model" | "same vendor" | null;
+	}> {
+		const [openCards, commitsSince] = await Promise.all([
+			Promise.resolve(
+				st.store
 					.listTasks()
 					.filter(
 						(x) =>
-							!x.cancelledAt &&
-							x.state === "needs_you" &&
-							isRetroProposalReason(x.needsReason) &&
-							store.listTurns(x.id).length === 0,
-					).length;
-				if (openProposals >= 3) {
-					log("retro: proposal dropped: cap of 3 open proposals reached");
-				} else {
-					const child = store.createTask(result.proposed.prompt);
-					const handoffPath = join(
-						store.tasksDir,
-						"handoffs",
-						`${child.id}.md`,
-					);
-					let prompt = followUpPrompt({
-						text: result.proposed.prompt,
-						title: task.title,
-						handoffPath,
-					});
-					try {
-						writeBelow(
-							store.dataRoot,
-							handoffPath,
-							handoffMarkdown({
-								task: store.getTask(id) ?? task,
-								turns: store.listTurns(id),
-								sessionsDir: store.sessionsDir,
-							}),
-						);
-					} catch (err) {
-						// The card is still held; it just starts without the handoff pointer.
-						prompt = result.proposed.prompt;
-						log(`! handoff write failed: ${errmsg(err)}`);
-					}
-					store.updateTask(child.id, {
-						prompt,
-						followUpOf: id,
-						// A null model means the proposal card runs on the default role.
-						model: result.proposed.model,
-						state: "needs_you",
-						// The reason names the retro's source card once; a missing link falls
-						// back to naming the retro itself.
-						needsReason: proposedReason(
-							(task.followUpOf !== null
-								? store.getTask(task.followUpOf)
-								: null) ?? { id: task.id },
-						),
-						// The drawer's decision panel reads it; older proposals keep null.
-						proposalSummary: result.proposed.summary,
-					});
-					log(`- filed proposal ${child.id} (held for approval)`);
-				}
-			}
+							x.id !== st.id && x.cancelledAt === null && x.stage !== "done",
+					)
+					.map((x) => ({ id: x.id, title: x.title })),
+			),
+			st.task.base !== null && st.header.target !== null
+				? (ops.commitSubjects ?? commitSubjects)(
+						st.e.path,
+						st.task.base,
+						st.header.target,
+					)
+				: Promise.resolve([] as string[]),
+		]);
+		const roles = (ops.modelRoles ?? modelRoles)();
+		const checkRole = checkRoleFor(st.result.model);
+		const selector = roles[checkRole];
+		// A missing role falls back to the board's default role (omp's default
+		// model), which is often the reviewed model itself — shown on the card.
+		const checkModel = selector ?? roles.default ?? null;
+		const checkWarn = checkModelWarning(st.result.model, checkModel);
+		const input = reviewCheckPrompt({
+			sha: st.task.base ?? "",
+			findings: selected.map((f, i) => ({
+				id: i + 1,
+				rank: f.rank,
+				security: f.security ?? "",
+				prompt: f.prompt,
+			})),
+			openCards,
+			commitsSince,
+		});
+		return { input, checkRole, selector, checkModel, checkWarn };
+	}
 
-			// A review's recorded findings: Ottr caps them, checks the selection with a second model
-			// (a fresh session — never --resume, never the review's own — memory off, read/grep/glob
-			// only), and files the kept ones as queued cards linked to the review, the flow
-			// create_task's per-finding calls did inline before. An approved review holds at merging
-			// (FINDINGS_HOLD) and a needs_you review keeps its park: either way the card stays
-			// in_progress/running until the deferred write below stores the final state.
-			if (reviewFindings.length > 0) {
-				const checkOn = ops.reviewCheck?.() ?? true;
-				const selected = selectFindings(reviewFindings);
-				const selectedSet = new Set(selected);
-				const belowCap = reviewFindings.filter((f) => !selectedSet.has(f));
-				// First line of a finding, for logs and the card report (the body can be long).
-				const head = (f: RecordedFinding): string =>
-					f.prompt.split("\n")[0]?.slice(0, 120) ?? "";
-				let kept: { id: number; finding: RecordedFinding }[] = selected.map(
-					(finding, i) => ({ id: i + 1, finding }),
-				);
-				let dropped: {
-					id: number;
-					finding: RecordedFinding;
-					reason: string;
-				}[] = [];
-				let checkMs = 0;
-				let checkFailed: string | null = null;
-				// The model the check resolves to (the role's selector, else the board's default
-				// role — omp's fallback) and why it gives no second-model opinion, for the card.
-				let checkModel: string | null = null;
-				let checkWarn: "same model" | "same vendor" | null = null;
-				if (checkOn) {
-					// Input as data: the findings (numbered from 1), the frozen sha, the open cards,
-					// and the commits main gained since the review — the one git fact a run without
-					// a shell cannot see for itself.
-					const [openCards, commitsSince] = await Promise.all([
-						Promise.resolve(
-							store
-								.listTasks()
-								.filter(
-									(x) =>
-										x.id !== id && x.cancelledAt === null && x.stage !== "done",
-								)
-								.map((x) => ({ id: x.id, title: x.title })),
-						),
-						task.base !== null && target !== null
-							? (ops.commitSubjects ?? commitSubjects)(
-									e.path,
-									task.base,
-									target,
-								)
-							: Promise.resolve([] as string[]),
-					]);
-					const roles = (ops.modelRoles ?? modelRoles)();
-					const checkRole = checkRoleFor(result.model);
-					const selector = roles[checkRole];
-					// A missing role falls back to the board's default role (omp's default
-					// model), which is often the reviewed model itself — shown on the card.
-					checkModel = selector ?? roles.default ?? null;
-					checkWarn = checkModelWarning(result.model, checkModel);
-					const input = reviewCheckPrompt({
-						sha: task.base ?? "",
-						findings: selected.map((f, i) => ({
-							id: i + 1,
-							rank: f.rank,
-							security: f.security ?? "",
-							prompt: f.prompt,
-						})),
-						openCards,
-						commitsSince,
-					});
-					// Two attempts, then the user decides: a half-checked review files no cards.
-					// A usage limit skips the retry: it fails the same way until the reset.
-					let hold: UsageHold | null = null;
-					let limitHit = false;
-					for (let attempt = 1; attempt <= 2; attempt++) {
-						// Hosted: no check attempt starts under a credit stop, the retry included.
-						if (creditBlocked()) return;
-						const startedAt = Date.now();
-						const checkMeter = openMeter(
-							selector === undefined ? "default" : checkRole,
-						);
-						const handle = ops.startRun({
-							meter: ops.hosted !== undefined,
-							auditProvisioned: (sinceMs, rulesAtStart) =>
-								auditProvisioned(homedir(), sinceMs, rulesAtStart),
-							rulesAtStart: () => rulesDirEntries(homedir()),
-							...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
-							cwd: wt,
-							prompt: input,
-							sessionDir: store.sessionsDir,
-							extensionPath: null,
-							resumeId: null,
-							model: selector,
-							tools: "read,grep,glob",
-							config: join(dirname(ops.extensionPath), "check.yml"),
-							maxTime: "1800",
-							dataRoot: store.dataRoot,
-							// The check's transcript lands in the review card's log, next to the run it checks.
-							logPath: store.logPath(id),
-							onLog: () => ops.notifyLog(name, id),
-						});
-						// The check holds a board slot like any run: it sits in the loop's live map,
-						// so the global cap sees it until it ends.
-						const checkKey = `${key}:check`;
-						running.set(checkKey, handle);
-						const checkResult = (await handle.done) as RunResult;
-						checkMeter?.settle(checkResult);
-						// sweepLostTurns settled a lost check: its outcome owns the card now.
-						if (running.get(checkKey) !== handle) {
-							checkTakenOver = true;
-							return;
-						}
-						running.delete(checkKey);
-						// A creditStop killed this check: park with the credit reason, no retry.
-						if (creditBlocked()) return;
-						checkMs += Date.now() - startedAt;
-						const err = checkRunError(checkResult);
-						if (err === null) {
-							const verdicts = parseCheckVerdicts(checkResult.finalText);
-							if (verdicts !== null) {
-								const split = applyCheckVerdicts(selected, verdicts);
-								kept = split.kept;
-								dropped = split.dropped;
-								checkFailed = null; // the retry succeeded
-								break;
-							}
-							checkFailed = "the check verdict was not valid JSON";
-						} else {
-							checkFailed = err;
-							limitHit = hitUsageLimit(checkResult);
-						}
-						log(`! review check attempt ${attempt} failed: ${checkFailed}`);
-						if (limitHit) {
-							hold = await usageHold(checkResult.model ?? selector ?? null);
-							break;
-						}
-					}
-					if (checkFailed !== null) {
-						const cur = store.getTask(id);
-						if (hold !== null) {
-							log(
-								`- review check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`,
-							);
-							const patch = holdPatch(store, id, hold);
-							if (patch !== null) store.updateTask(id, patch);
-						} else {
-							log(`- review check gave up after a retry: ${checkFailed}`);
-							if (cur !== null && cur.cancelledAt === null)
-								store.updateTask(id, {
-									stage: "in_progress",
-									state: "needs_you",
-									needsReason: `The review check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run the review, or cancel the card.`,
-								});
-						}
-					} else
-						for (const d of dropped)
-							log(`- dropped finding ${d.id}: ${d.reason}`);
-				} else {
-					for (const f of belowCap)
-						log(`- finding below the cap of 10, not filed: ${head(f)}`);
-				}
-				// File the kept findings as queued cards linked to the review, like create_task did.
-				const filed: string[] = [];
-				const live = store.getTask(id);
-				if (checkFailed === null && live !== null && live.cancelledAt === null)
-					for (const k of kept) {
-						const child = store.createTask(k.finding.prompt);
-						store.updateTask(child.id, {
-							followUpOf: id,
-							// A null model means the finding card runs on the default role.
-							model: k.finding.model,
-						});
-						filed.push(child.id);
-					}
-				log(
-					`- review findings: ${reviewFindings.length} recorded, ${filed.length} filed, ${
-						belowCap.length + dropped.length
-					} not filed${checkOn ? `, check ${(checkMs / 1000).toFixed(0)}s` : ", check off"}`,
-				);
-				// The counts and every unfiled finding with its reason live on the review card: the
-				// user can file any of them by hand.
-				const cur = store.getTask(id);
-				if (checkFailed === null && cur !== null && cur.cancelledAt === null) {
-					const notFiled = [
-						...belowCap.map((f) => `- below the cap of 10: ${head(f)}`),
-						...dropped.map(
-							(d) => `- dropped: ${head(d.finding)} — ${d.reason}`,
-						),
-					];
-					store.updateTask(id, {
-						summary: `${cur.summary ?? "Review finished"}\nFindings: ${reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${checkOn ? ` (check ${(checkMs / 1000).toFixed(0)}s on ${checkModel ?? "default model"}${checkWarn === null ? "" : ` — ${checkWarn} as the review`})` : ""}.`,
-						details: `${cur.details ?? ""}\n\n## Findings\n${
-							filed.length > 0
-								? filed.map((cid) => `- filed as card #${cid}`).join("\n")
-								: "- none filed"
-						}\n${notFiled.join("\n")}`,
-					});
-				}
+	/** The review check attempts (two, then the user decides: a half-checked review files no
+	 * cards). A usage limit skips the retry: it fails the same way until the reset.
+	 * Null: a credit stop or a taken-over check stopped the turn. */
+	async function reviewCheckLoop(
+		st: TurnSettle,
+		selected: RecordedFinding[],
+		built: {
+			input: string;
+			checkRole: string;
+			selector: string | undefined;
+		},
+	): Promise<{
+		kept: { id: number; finding: RecordedFinding }[];
+		dropped: { id: number; finding: RecordedFinding; reason: string }[];
+		checkMs: number;
+		checkFailed: string | null;
+		hold: UsageHold | null;
+		limitHit: boolean;
+	} | null> {
+		let kept: { id: number; finding: RecordedFinding }[] = selected.map(
+			(finding, i) => ({ id: i + 1, finding }),
+		);
+		let dropped: {
+			id: number;
+			finding: RecordedFinding;
+			reason: string;
+		}[] = [];
+		let checkMs = 0;
+		let checkFailed: string | null = null;
+		let hold: UsageHold | null = null;
+		let limitHit = false;
+		for (let attempt = 1; attempt <= 2; attempt++) {
+			const ran = await awaitCheckAttempt(
+				st,
+				built.input,
+				built.selector,
+				built.checkRole,
+				`${st.key}:check`,
+			);
+			if (ran === null) return null;
+			checkMs += ran.checkMs;
+			const out = reviewAttemptOutcome(selected, ran.result);
+			if (out.split !== null) {
+				kept = out.split.kept;
+				dropped = out.split.dropped;
+				checkFailed = null; // the retry succeeded
+				break;
 			}
-
-			if (workCard && next.stage === "merging") {
-				const checkOn = ops.workCheck?.() ?? true;
-				const head = await ops.targetSha(wt, "HEAD").catch(() => null);
-				const cur = store.getTask(id);
-				if (checkOn && cur !== null && cur.cancelledAt === null) {
-					const priorLog = cur.workCheckLog;
-					const open = openWorkBlockers(priorLog);
-					const seen = head !== null && cur.workCheckHead === head;
-					// Human messages since the last check started (a reply approving a hard stop,
-					// or steering): they re-open the check at an unchanged head. The tracker's own
-					// send-back texts are not human input. ponytail: only the send-back prefix is
-					// filtered; a tracker prompt from another flow (rare here) would cost one
-					// extra check run, not a wrong verdict.
-					const lastCheckAt =
-						priorLog.length > 0 ? priorLog[priorLog.length - 1]!.at : 0;
-					const replies = store
-						.listTurns(id)
-						.filter(
-							(t) =>
-								t.input !== null &&
-								t.startedAt > lastCheckAt &&
-								!t.input.startsWith(WORK_CHECK_SENDBACK_OPENING),
-						)
-						.map((t) => t.input as string);
-					// The ready report of the run being checked: the outcome's summary and
-					// details, else the run's final message. The first completed check stamps
-					// it on the card as the original result every later re-check gets.
-					const readyReport = readyReportText(result.outcome, result.finalText);
-					// Send the blockers back to the work agent, or ask the user once the cap is
-					// spent: only a fresh verdict reaches this, and a send-back counts as an
-					// attempt against the same WORK_CHECK_MAX_SENDBACKS cap.
-					const sendBack = (
-						blockers: WorkCheckBlocker[],
-						runs: WorkCheckRun[],
-					) => {
-						const sendbacks = cur.workCheckSendbacks;
-						const reportStamp =
-							cur.workCheckReport === null
-								? { workCheckReport: readyReport }
-								: {};
-						// A block after the cap asks the user: the reply route turns a click into the
-						// send-back or the merge (no board check skill needed to unstick it).
-						if (sendbacks >= WORK_CHECK_MAX_SENDBACKS)
-							store.updateTask(id, {
-								stage: "in_progress",
-								state: "needs_you",
-								needsReason: `${WORK_CHECK_ASK_BLOCK}: ${blockers
-									.map((b, i) => `${i + 1}. ${b.finding}`)
-									.join(
-										" ",
-									)}. Reply to send it back anyway, run Merge anyway, or cancel the card.`,
-								asked: workCheckAsk(blockers),
-								workCheckLog: runs,
-								workCheckHead: head,
-								...reportStamp,
-							});
-						else {
-							store.updateTask(id, {
-								stage: "in_progress",
-								state: "queued",
-								queuedAt: Date.now(),
-								pendingPrompt: workCheckSendBack({
-									blockers,
-									attempt: sendbacks + 1,
-									max: WORK_CHECK_MAX_SENDBACKS,
-								}),
-								pendingBy: "supervisor",
-								needsReason: null,
-								workCheckLog: runs,
-								workCheckHead: head,
-								workCheckSendbacks: sendbacks + 1,
-								...reportStamp,
-							});
-							log(
-								`- work check: sent back to the work agent (${sendbacks + 1} of ${WORK_CHECK_MAX_SENDBACKS})`,
-							);
-						}
-					};
-					// Every ready report after a send-back gets a fresh check, even at an
-					// unchanged head with no new report text: the update may be new evidence
-					// (a run the transcript now shows) or a corrected claim, and only a fresh
-					// session judges it. A re-ready after a passing check at an unchanged head
-					// starts nothing: the last check passed and nothing changed.
-					if (!seen || open.length > 0) {
-						const checkBase = task.base ?? target ?? "HEAD";
-						// A re-check sees only the commits since the head the last completed
-						// check stamped — empty at an unchanged head, where only the report
-						// moved. The checked code was already reviewed once, and repeat checks
-						// mostly re-flag old code; the full branch diff is still read below for
-						// quote grounding, so a re-cited blocker's quote stays verbatim there.
-						const checkFrom =
-							head !== null && cur.workCheckHead !== null
-								? cur.workCheckHead
-								: checkBase;
-						const sincePreviousCheck = checkFrom !== checkBase;
-						const diff =
-							(await ops.diffText(wt, checkBase, "HEAD").catch(() => null)) ??
-							"";
-						const checkDiff = sincePreviousCheck
-							? ((await ops
-									.diffText(wt, checkFrom, "HEAD")
-									.catch(() => null)) ?? diff)
-							: diff;
-						const transcriptPath =
-							sessionFile(store.sessionsDir, result.sessionId) ?? "";
-						let transcriptText = "";
-						try {
-							transcriptText = readRegular(transcriptPath).toString("utf8");
-						} catch {
-							// No transcript file on disk: the check works from the diff alone.
-						}
-						const roles = (ops.modelRoles ?? modelRoles)();
-						const checkRole = checkRoleFor(result.model);
-						const selector = roles[checkRole];
-						// The check must not be the model it checks: a missing role falls back
-						// to the board's default role (omp's default model), often the work
-						// model itself. Same model or vendor goes on the card as a warning.
-						const checkModel = selector ?? roles.default ?? null;
-						const checkWarn = checkModelWarning(result.model, checkModel);
-						const warn =
-							checkWarn === null
-								? {}
-								: {
-										warn:
-											checkWarn === "same model"
-												? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
-												: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
-									};
-						const input = workCheckPrompt({
-							title: task.title,
-							prompt: task.prompt,
-							base: checkBase,
-							head: head ?? "HEAD",
-							diff: checkDiff,
-							sincePreviousCheck,
-							report: readyReport,
-							originalReport: cur.workCheckReport ?? undefined,
-							transcriptPath,
-							earlier: open.map((b, i) => ({
-								id: i + 1,
-								finding: b.finding,
-								quote: b.quote,
-							})),
-							replies,
-						});
-						const checkStart = Date.now();
-						let checkMs = 0;
-						let checkFailed: string | null = null;
-						let split: {
-							blockers: WorkCheckBlocker[];
-							notes: string[];
-						} | null = null;
-						// Two attempts, then the user decides: an unchecked card never merges.
-						// A usage limit skips the retry: it fails the same way until the reset.
-						let hold: UsageHold | null = null;
-						let limitHit = false;
-						for (let attempt = 1; attempt <= 2; attempt++) {
-							// Hosted: no check attempt starts under a credit stop, the retry included.
-							if (creditBlocked()) return;
-							const startedAt = Date.now();
-							const checkMeter = openMeter(
-								selector === undefined ? "default" : checkRole,
-							);
-							const handle = ops.startRun({
-								meter: ops.hosted !== undefined,
-								auditProvisioned: (sinceMs, rulesAtStart) =>
-									auditProvisioned(homedir(), sinceMs, rulesAtStart),
-								rulesAtStart: () => rulesDirEntries(homedir()),
-								...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
-								cwd: wt,
-								prompt: input,
-								sessionDir: store.sessionsDir,
-								extensionPath: null,
-								resumeId: null,
-								model: selector,
-								tools: "read,grep,glob",
-								config: join(dirname(ops.extensionPath), "check.yml"),
-								maxTime: "1800",
-								dataRoot: store.dataRoot,
-								// The check's transcript lands in the card's log, next to the run it checks.
-								logPath: store.logPath(id),
-								onLog: () => ops.notifyLog(name, id),
-							});
-							// The check holds a board slot like any run: it sits in the loop's live map,
-							// so the global cap sees it until it ends.
-							const checkKey = `${key}:workcheck`;
-							running.set(checkKey, handle);
-							const checkResult = (await handle.done) as RunResult;
-							checkMeter?.settle(checkResult);
-							// sweepLostTurns settled a lost check: its outcome owns the card now.
-							if (running.get(checkKey) !== handle) {
-								checkTakenOver = true;
-								return;
-							}
-							running.delete(checkKey);
-							// A creditStop killed this check: park with the credit reason, no retry.
-							if (creditBlocked()) return;
-							checkMs += Date.now() - startedAt;
-							const err = checkRunError(checkResult);
-							if (err === null) {
-								const verdict = parseWorkCheck(checkResult.finalText);
-								if (verdict !== null) {
-									split = demoteUnquoted(
-										verdict,
-										diff,
-										readyReport,
-										transcriptText,
-									);
-									checkFailed = null; // the retry succeeded
-									// Earlier blockers resolve three ways: the verdict's fixed list
-									// (by the prompt's 1-based id) wins; a blocker whose exact quote
-									// the new blockers re-cite stays open; anything else counts as
-									// fixed because the re-check dropped it. Copies, never in place.
-									const fixedById = new Map(
-										verdict.fixed.map((f) => [f.id, f.reason]),
-									);
-									const requoted = new Set(split.blockers.map((b) => b.quote));
-									const runs = [...priorLog];
-									const lastIdx = runs.findLastIndex(
-										(r) => r.outcome === "blockers",
-									);
-									if (lastIdx >= 0) {
-										const prev = runs[lastIdx]!;
-										runs[lastIdx] = {
-											...prev,
-											blockers: prev.blockers.map((b) => {
-												const oi = open.indexOf(b);
-												if (oi === -1) return b;
-												const reason = fixedById.get(oi + 1);
-												if (reason !== undefined)
-													return {
-														...b,
-														status: "fixed" as const,
-														statusReason: reason,
-													};
-												if (requoted.has(b.quote)) return b;
-												return {
-													...b,
-													status: "fixed" as const,
-													statusReason: "not re-cited by the re-check",
-												};
-											}),
-										};
-									}
-									const run: WorkCheckRun = {
-										at: checkStart,
-										// The resolved model, not just the role selector: with the role
-										// missing, the card must name the default role it fell back to.
-										model: checkModel,
-										outcome: split.blockers.length === 0 ? "pass" : "blockers",
-										blockers: split.blockers,
-										notes: split.notes,
-										durationMs: checkMs,
-										...warn,
-									};
-									const allRuns = [...runs, run].slice(-20);
-									log(
-										`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
-									);
-									if (split.blockers.length === 0)
-										// Pass: the card stays in its current state; the deferred write
-										// below stores merging/queued with the check record stamped.
-										store.updateTask(id, {
-											workCheckLog: allRuns,
-											workCheckHead: head,
-											workCheckSendbacks: cur.workCheckSendbacks,
-											...(cur.workCheckReport === null
-												? { workCheckReport: readyReport }
-												: {}),
-										});
-									else sendBack(split.blockers, allRuns);
-									break;
-								}
-								checkFailed = "the work check verdict was not valid JSON";
-							} else {
-								checkFailed = err;
-								limitHit = hitUsageLimit(checkResult);
-							}
-							log(`! work check attempt ${attempt} failed: ${checkFailed}`);
-							if (limitHit) {
-								hold = await usageHold(checkResult.model ?? selector ?? null);
-								break;
-							}
-						}
-						if (checkFailed !== null) {
-							// No head stamp: the next ready at this head must run the check again.
-							log(
-								hold !== null
-									? `- work check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`
-									: `- work check failed: ${checkFailed}`,
-							);
-							const patch = hold === null ? null : holdPatch(store, id, hold);
-							store.updateTask(id, {
-								...(hold === null
-									? {
-											stage: "in_progress" as const,
-											state: "needs_you" as const,
-											needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
-										}
-									: patch),
-								workCheckLog: [
-									...priorLog,
-									{
-										at: checkStart,
-										model: checkModel,
-										outcome: "error",
-										blockers: [],
-										notes: [],
-										durationMs: checkMs,
-										...warn,
-										error: checkFailed,
-									},
-								],
-							});
-						}
-					}
-					// seen with no open blockers: this head already passed a check; the deferred
-					// write below stores merging/queued.
-				}
+			checkFailed = out.failed;
+			limitHit = out.limitHit;
+			st.log(`! review check attempt ${attempt} failed: ${checkFailed}`);
+			if (limitHit) {
+				hold = await usageHold(ran.result.model ?? built.selector ?? null);
+				break;
 			}
-
-			// A check block above ran while the card was still in_progress/running: store the final
-			// state now, if the card is still ours. The overrides the checks wrote (send-back,
-			// needs_you, a failed check) moved the state away from running; this write must not
-			// clobber them, so it fires only on the still-running card.
-			if (checkWillRun) {
-				const afterCheck = store.getTask(id);
-				if (
-					afterCheck &&
-					afterCheck.cancelledAt === null &&
-					(afterCheck.state === "running" || afterCheck.state === "preparing")
-				)
-					store.updateTask(id, {
-						stage: next.stage,
-						state: next.state,
-						needsReason: next.needsReason,
-						queuedAt: next.state === "queued" ? Date.now() : undefined,
-					});
-			}
-
-			if (next.stage === "done") {
-				// Stamp the version the merge released so state rows can show it without their turns —
-				// but only when a real tag of that name points at the pushed head: a version string in
-				// report prose (a quoted commit message, release notes) must not mint a release pill.
-				if (!releaseCard && kind === "merge") {
-					const last = store.listTurns(id).at(-1);
-					const version =
-						last?.outcome === "integrated"
-							? parseReleaseVersion(
-									`${last.summary ?? ""}\n${last.details ?? ""}`,
-								)
-							: null;
-					// CI watch: pin the pushed sha only when origin's remote-tracking tip equals the local target
-					// tip — a merge turn that skipped its push would otherwise pin an older run to this card.
-					// ponytail: two merges landing between push and capture pin the newer run to both cards.
-					const short = target.replace(/^origin\//, "");
-					const [local, pushed] = await Promise.all([
-						ops.targetSha(e.path, target).catch(() => null),
-						ops
-							.targetSha(e.path, `refs/remotes/origin/${short}`)
-							.catch(() => null),
-					]);
-					const onOrigin = local !== null && local === pushed;
-					const tagged =
-						version !== null && onOrigin
-							? await ops
-									.targetSha(e.path, `refs/tags/${version}`)
-									.catch(() => null)
-							: null;
-					if (version !== null) {
-						if (onOrigin && tagged === pushed)
-							store.updateTask(id, { releaseVersion: version });
-						else
-							log(
-								`- no release stamp for ${version}: no tag on the pushed head`,
-							);
-					}
-					if (onOrigin) store.updateTask(id, { pushSha: pushed });
-					else log("- CI watch skipped: merge push not on origin");
-				}
-				// An interview, grill or trending scout card runs in the main checkout: its wt must
-				// never be removed.
-				if (!interview && !grill && !scout) {
-					// The done drawer keeps naming what the run left uncommitted after the
-					// worktree is gone: capture the list before removeWorktree deletes it.
-					// statusFiles never rejects (an unreadable tree reads as []).
-					store.updateTask(id, { uncommittedFiles: await ops.statusFiles(wt) });
-					try {
-						await ops.removeWorktree({
-							mainPath: e.path,
-							worktreePath: wt,
-							branch,
-						});
-						log("- worktree removed");
-					} catch (err) {
-						log(`! removeWorktree: ${errmsg(err)}`);
-					}
-				}
-			}
-		} catch (err) {
-			const msg = errmsg(err);
-			try {
-				log(`! ${msg}`);
-			} catch {
-				// logging must not mask the error path
-			}
-			if (turn) store.finishTurn(turn.id, { endedAt: Date.now(), error: msg });
-			store.updateTask(id, {
-				state: "needs_you",
-				needsReason: `Tracker error: ${msg}`,
-			});
-			// The turn died in the tracker: no VM of this card may keep pushing on its token
-			// (startRun revokes its own token when its run settles; this covers a throw in
-			// between).
-			ops.vmTokens?.revokeTask(name, id);
-		} finally {
-			// The sweep may have replaced this entry: only drop the map slot this run still owns.
-			if (entry && running.get(key) === entry) running.delete(key);
-			// A stop that raced a natural finish leaves no mark behind.
-			stopping.delete(key);
-			// An abandoned run's claim was already deleted by the sweep and may belong to the
-			// resumed replacement now; deleting it here would free the replacement's cap slot.
-			// A taken-over check is the same case: the sweep deleted this run's claim.
-			if (!entry?.abandoned && !checkTakenOver) {
-				preparing.delete(key);
-				creditStopped.delete(key);
-			}
-			publishing.delete(key);
-			// Settle is done: report each run's usage, also of a stopped or failed run. No interim
-			// record goes out after this point, also for a run whose result never came.
-			for (const interim of interims) interim.close();
-			if (ops.hosted !== undefined && turn !== null) {
-				// M10: the outcome is the state the board shows after this settle. A parked card
-				// (credit stop, Esc stop, tracker error, check blockers) reads needs_you even when
-				// the run reported none, and the reverse holds: a card the settle requeues (a
-				// dependency hold, steering, a queued rebase retry) waits on the board's queue, so
-				// its needs_you row outcome ships as "queued" — the control plane would otherwise
-				// email the owner about a card nobody must act on. Every other settle keeps the
-				// settled turn row's outcome (ready, answered, integrated). A value outside
-				// /^[a-z_]{1,40}$/ (null included) sends nothing. The title is the card prompt's
-				// first line, trimmed and cut to 200 characters; an empty line sends nothing.
-				const settledTask = store.getTask(id);
-				const row = store.listTurns(id).at(-1)?.outcome ?? null;
-				const rowOutcome =
-					row !== null && /^[a-z_]{1,40}$/.test(row) ? row : null;
-				let outcome: string | null = rowOutcome;
-				if (settledTask?.state === "needs_you") outcome = "needs_you";
-				else if (settledTask?.state === "queued" && rowOutcome === "needs_you")
-					outcome = "queued";
-				const firstLine = task.prompt.split("\n")[0]?.trim() ?? "";
-				const title = firstLine === "" ? null : firstLine.slice(0, 200);
-				for (const entry of metered) {
-					const { main, ...r } = entry;
-					sendMetering(ops.hosted, {
-						project: name,
-						taskId: id,
-						turnId: turn.id,
-						kind,
-						...r,
-						final: true,
-						...(main === true && outcome !== null ? { outcome } : {}),
-						...(main === true && title !== null ? { title } : {}),
-					});
-				}
-			}
-			schedule();
 		}
+		return { kept, dropped, checkMs, checkFailed, hold, limitHit };
+	}
+
+	/** One review-check attempt's outcome: the kept/dropped split on a valid JSON verdict
+	 * (split null on an invalid one), else the failure reason and whether a usage limit
+	 * caused it. */
+	function reviewAttemptOutcome(
+		selected: RecordedFinding[],
+		result: RunResult,
+	): {
+		split: {
+			kept: { id: number; finding: RecordedFinding }[];
+			dropped: { id: number; finding: RecordedFinding; reason: string }[];
+		} | null;
+		failed: string;
+		limitHit: boolean;
+	} {
+		const err = checkRunError(result);
+		if (err === null) {
+			const verdicts = parseCheckVerdicts(result.finalText);
+			if (verdicts === null)
+				return {
+					split: null,
+					failed: "the check verdict was not valid JSON",
+					limitHit: false,
+				};
+			return {
+				split: applyCheckVerdicts(selected, verdicts),
+				failed: "",
+				limitHit: false,
+			};
+		}
+		return { split: null, failed: err, limitHit: hitUsageLimit(result) };
+	}
+
+	/** One check attempt (shared by the review and work checks): a credit stop before and
+	 * after, the meter, the run, and the takeover check. Null: the turn stopped. */
+	async function awaitCheckAttempt(
+		st: TurnSettle,
+		input: string,
+		selector: string | undefined,
+		checkRole: string,
+		checkKey: string,
+	): Promise<{ result: RunResult; checkMs: number } | null> {
+		// Hosted: no check attempt starts under a credit stop, the retry included.
+		if (st.creditBlocked()) return null;
+		const startedAt = Date.now();
+		const checkMeter = st.openMeter(
+			selector === undefined ? "default" : checkRole,
+		);
+		const handle = startCheckRun(st, input, selector, checkMeter);
+		const result = await awaitCheckRun(st, checkKey, handle, checkMeter);
+		if (result === null) return null;
+		// A creditStop killed this check: park with the credit reason, no retry.
+		if (st.creditBlocked()) return null;
+		return { result, checkMs: Date.now() - startedAt };
+	}
+
+	/** Starts one second-model check run in the card's worktree: a fresh session (never
+	 * --resume, never the checked run's own — memory off), read/grep/glob only, the
+	 * check.yml config, capped at 30 minutes. The check's transcript lands in the card's
+	 * log, next to the run it checks. */
+	function startCheckRun(
+		st: TurnSettle,
+		input: string,
+		selector: string | undefined,
+		checkMeter: ReturnType<OpenRunMeter>,
+	): TurnRunHandle {
+		return ops.startRun({
+			meter: ops.hosted !== undefined,
+			auditProvisioned: (sinceMs, rulesAtStart) =>
+				auditProvisioned(homedir(), sinceMs, rulesAtStart),
+			rulesAtStart: () => rulesDirEntries(homedir()),
+			...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
+			cwd: st.loc.wt,
+			prompt: input,
+			sessionDir: st.store.sessionsDir,
+			extensionPath: null,
+			resumeId: null,
+			model: selector,
+			tools: "read,grep,glob",
+			config: join(dirname(ops.extensionPath), "check.yml"),
+			maxTime: "1800",
+			dataRoot: st.store.dataRoot,
+			// The check's transcript lands in the card's log, next to the run it checks.
+			logPath: st.store.logPath(st.id),
+			onLog: () => ops.notifyLog(st.name, st.id),
+		});
+	}
+
+	/** Awaits one check run. The check holds a board slot like any run: it sits in the loop's
+	 * live map, so the global cap sees it until it ends. sweepLostTurns settling a lost check
+	 * owns the card: null and checkTakenOver tell the caller to stop. */
+	async function awaitCheckRun(
+		st: TurnSettle,
+		checkKey: string,
+		handle: TurnRunHandle,
+		checkMeter: ReturnType<OpenRunMeter>,
+	): Promise<RunResult | null> {
+		running.set(checkKey, handle);
+		const checkResult = (await handle.done) as RunResult;
+		checkMeter?.settle(checkResult);
+		// sweepLostTurns settled a lost check: its outcome owns the card now.
+		if (running.get(checkKey) !== handle) {
+			st.mx.checkTakenOver = true;
+			return null;
+		}
+		running.delete(checkKey);
+		return checkResult;
+	}
+
+	/** A failed check: hold the card on the usage reset when one is known, else park needs_you
+	 * for a re-run. A passing check logs the dropped findings instead. */
+	async function settleReviewCheckFailure(
+		st: TurnSettle,
+		attempt: NonNullable<Awaited<ReturnType<typeof reviewCheckAttempts>>>,
+	): Promise<void> {
+		if (attempt.checkFailed === null) {
+			for (const d of attempt.dropped)
+				st.log(`- dropped finding ${d.id}: ${d.reason}`);
+			return;
+		}
+		if (attempt.hold !== null) {
+			parkReviewCheckHold(st, attempt.hold);
+			return;
+		}
+		st.log(`- review check gave up after a retry: ${attempt.checkFailed}`);
+		const cur = st.store.getTask(st.id);
+		if (cur !== null && cur.cancelledAt === null)
+			st.store.updateTask(st.id, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: `The review check failed${attempt.limitHit ? "" : " twice"}: ${attempt.checkFailed}. Reply to re-run the review, or cancel the card.`,
+			});
+	}
+
+	/** Holds the review card on the provider's usage reset (the write only lands when the card
+	 * is still this run's). */
+	function parkReviewCheckHold(st: TurnSettle, hold: UsageHold): void {
+		st.log(
+			`- review check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`,
+		);
+		const patch = holdPatch(st.store, st.id, hold);
+		if (patch !== null) st.store.updateTask(st.id, patch);
+	}
+
+	/** Files the kept findings as queued cards linked to the review (the flow create_task's
+	 * per-finding calls did inline before), logs the counts, and writes every unfiled finding
+	 * with its reason onto the review card so the user can file any of them by hand. */
+	function fileKeptFindings(
+		st: TurnSettle,
+		args: {
+			kept: { id: number; finding: RecordedFinding }[];
+			dropped: { id: number; finding: RecordedFinding; reason: string }[];
+			belowCap: RecordedFinding[];
+			checkOn: boolean;
+			checkMs: number;
+			checkFailed: string | null;
+			checkModel: string | null;
+			checkWarn: "same model" | "same vendor" | null;
+		},
+	): void {
+		const filed: string[] = [];
+		const live = st.store.getTask(st.id);
+		if (args.checkFailed === null && live !== null && live.cancelledAt === null)
+			for (const k of args.kept) {
+				const child = st.store.createTask(k.finding.prompt);
+				st.store.updateTask(child.id, {
+					followUpOf: st.id,
+					// A null model means the finding card runs on the default role.
+					model: k.finding.model,
+				});
+				filed.push(child.id);
+			}
+		st.log(
+			`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${
+				args.belowCap.length + args.dropped.length
+			} not filed${args.checkOn ? `, check ${(args.checkMs / 1000).toFixed(0)}s` : ", check off"}`,
+		);
+		// The counts and every unfiled finding with its reason live on the review card: the
+		// user can file any of them by hand.
+		const cur = st.store.getTask(st.id);
+		if (args.checkFailed !== null || cur === null || cur.cancelledAt !== null)
+			return;
+		const notFiled = [
+			...args.belowCap.map((f) => `- below the cap of 10: ${findingHead(f)}`),
+			...args.dropped.map(
+				(d) => `- dropped: ${findingHead(d.finding)} — ${d.reason}`,
+			),
+		];
+		writeReviewFindingsCard(st, cur, filed, notFiled, args);
+	}
+
+	/** Writes the finding counts and every unfiled finding with its reason onto the review
+	 * card, so the user can file any of them by hand. */
+	function writeReviewFindingsCard(
+		st: TurnSettle,
+		cur: Task,
+		filed: string[],
+		notFiled: string[],
+		args: {
+			checkOn: boolean;
+			checkMs: number;
+			checkModel: string | null;
+			checkWarn: "same model" | "same vendor" | null;
+		},
+	): void {
+		st.store.updateTask(st.id, {
+			summary: `${cur.summary ?? "Review finished"}\nFindings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${args.checkOn ? ` (check ${(args.checkMs / 1000).toFixed(0)}s on ${args.checkModel ?? "default model"}${args.checkWarn === null ? "" : ` — ${args.checkWarn} as the review`})` : ""}.`,
+			details: `${cur.details ?? ""}\n\n## Findings\n${
+				filed.length > 0
+					? filed.map((cid) => `- filed as card #${cid}`).join("\n")
+					: "- none filed"
+			}\n${notFiled.join("\n")}`,
+		});
+	}
+
+	/** Runs the second-model check on a work card that classify sent to merging. True: the
+	 * turn stopped. */
+	async function runWorkCheck(st: TurnSettle, next: Next): Promise<boolean> {
+		if (!(st.workCard && next.stage === "merging")) return false;
+		return prepareWorkCheck(st);
+	}
+
+	/** The work-check gate: off by switch, on a cancelled card, or on a card that stopped
+	 * running skips the check entirely (the deferred write below stores the classify state). */
+	async function prepareWorkCheck(st: TurnSettle): Promise<boolean> {
+		const checkOn = ops.workCheck?.() ?? true;
+		const head = await ops.targetSha(st.loc.wt, "HEAD").catch(() => null);
+		const cur = st.store.getTask(st.id);
+		if (!(checkOn && cur !== null && cur.cancelledAt === null)) return false;
+		return routeWorkCheck(st, cur, head);
+	}
+
+	/** Routes a work card due for its check: every ready report after a send-back gets a
+	 * fresh check (new commits, a human word, or just a re-reported ready — the update may
+	 * be new evidence or a corrected claim, and only a fresh session judges it); a head
+	 * that already passed skips it. */
+	async function routeWorkCheck(
+		st: TurnSettle,
+		cur: Task,
+		head: string | null,
+	): Promise<boolean> {
+		const priorLog = cur.workCheckLog;
+		const open = openWorkBlockers(priorLog);
+		const seen = head !== null && cur.workCheckHead === head;
+		// Human messages since the last check started (a reply approving a hard stop,
+		// or steering): they re-open the check at an unchanged head. The tracker's own
+		// send-back texts are not human input. ponytail: only the send-back prefix is
+		// filtered; a tracker prompt from another flow (rare here) would cost one
+		// extra check run, not a wrong verdict.
+		const lastRun = priorLog[priorLog.length - 1];
+		const lastCheckAt = lastRun === undefined ? 0 : lastRun.at;
+		const replies = st.store
+			.listTurns(st.id)
+			.filter(
+				(t) =>
+					t.input !== null &&
+					t.startedAt > lastCheckAt &&
+					!t.input.startsWith(WORK_CHECK_SENDBACK_OPENING),
+			)
+			.map((t) => t.input as string);
+		// Every ready report after a send-back gets a fresh check, even at an
+		// unchanged head with no new report text: the update may be new evidence
+		// (a run the transcript now shows) or a corrected claim, and only a fresh
+		// session judges it. A re-ready after a passing check at an unchanged head
+		// starts nothing: the last check passed and nothing changed.
+		if (!seen || open.length > 0)
+			return attemptWorkCheck(st, cur, head, priorLog, open, replies);
+		// seen with no open blockers: this head already passed a check; the deferred
+		// write below stores merging/queued.
+		return false;
+	}
+
+	/** Send the blockers back to the work agent, or ask the user once the cap is spent: only
+	 * a fresh verdict reaches this, and a send-back counts as an attempt against the same
+	 * WORK_CHECK_MAX_SENDBACKS cap. A block after the cap asks the user: the reply
+	 * route turns a click into the send-back or the merge (no board check skill needed to
+	 * unstick it). */
+	function sendWorkCheckBack(
+		st: TurnSettle,
+		cur: Task,
+		head: string | null,
+		blockers: WorkCheckBlocker[],
+		runs: WorkCheckRun[],
+	): void {
+		const sendbacks = cur.workCheckSendbacks;
+		// The ready report of the run being checked: the outcome's summary and
+		// details, else the run's final message. The first completed check stamps
+		// it on the card as the original result every later re-check gets.
+		const readyReport = readyReportText(st.result.outcome, st.result.finalText);
+		const reportStamp =
+			cur.workCheckReport === null ? { workCheckReport: readyReport } : {};
+		if (sendbacks >= WORK_CHECK_MAX_SENDBACKS) {
+			st.store.updateTask(st.id, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: `${WORK_CHECK_ASK_BLOCK}: ${blockers
+					.map((b, i) => `${i + 1}. ${b.finding}`)
+					.join(
+						" ",
+					)}. Reply to send it back anyway, run Merge anyway, or cancel the card.`,
+				asked: workCheckAsk(blockers),
+				workCheckLog: runs,
+				workCheckHead: head,
+				...reportStamp,
+			});
+			return;
+		}
+		st.store.updateTask(st.id, {
+			stage: "in_progress",
+			state: "queued",
+			queuedAt: Date.now(),
+			pendingPrompt: workCheckSendBack({
+				blockers,
+				attempt: sendbacks + 1,
+				max: WORK_CHECK_MAX_SENDBACKS,
+			}),
+			pendingBy: "supervisor",
+			needsReason: null,
+			workCheckLog: runs,
+			workCheckHead: head,
+			workCheckSendbacks: sendbacks + 1,
+			...reportStamp,
+		});
+		st.log(
+			`- work check: sent back to the work agent (${sendbacks + 1} of ${WORK_CHECK_MAX_SENDBACKS})`,
+		);
+	}
+
+	/** Runs the second-model check on a work card that classify sent to merging (two attempts,
+	 * then the user decides: an unchecked card never merges; a usage limit skips the retry: it
+	 * fails the same way until the reset). At an unchanged head (a reply- or evidence-driven
+	 * re-check) the full diff stays, so the check can re-cite an earlier blocker's quote
+	 * verbatim; a re-check after new commits sees only those commits: the checked code was
+	 * already reviewed once, and repeat checks mostly re-flag old code. True: the turn stopped. */
+	async function attemptWorkCheck(
+		st: TurnSettle,
+		cur: Task,
+		head: string | null,
+		priorLog: WorkCheckRun[],
+		open: WorkCheckBlocker[],
+		replies: string[],
+	): Promise<boolean> {
+		const built = await workCheckInput(st, cur, head, open, replies);
+		const roles = workCheckRoles(st);
+		return workCheckAttempts(st, cur, head, open, priorLog, roles, built);
+	}
+
+	/** The work check attempts (two, then the user decides: an unchecked card never merges;
+	 * a usage limit skips the retry: it fails the same way until the reset).
+	 * True: the turn stopped. */
+	async function workCheckAttempts(
+		st: TurnSettle,
+		cur: Task,
+		head: string | null,
+		open: WorkCheckBlocker[],
+		priorLog: WorkCheckRun[],
+		roles: Awaited<ReturnType<typeof workCheckRoles>>,
+		built: { input: string; diff: string; transcriptText: string },
+	): Promise<boolean> {
+		const checkStart = Date.now();
+		let checkMs = 0;
+		let checkFailed: string | null = null;
+		let limitHit = false;
+		let hold: UsageHold | null = null;
+		for (let attempt = 1; attempt <= 2; attempt++) {
+			const ran = await awaitWorkCheckAttempt(
+				st,
+				built.input,
+				roles.selector,
+				roles.checkRole,
+			);
+			if (ran === null) return true;
+			checkMs += ran.checkMs;
+			const out = workAttemptOutcome(ran.result);
+			if (out.verdict !== null) {
+				applyWorkCheckVerdict(
+					st,
+					cur,
+					head,
+					roles.checkModel,
+					open,
+					priorLog,
+					roles.warn,
+					checkStart,
+					checkMs,
+					out.verdict,
+					built.diff,
+					built.transcriptText,
+				);
+				return false;
+			}
+			checkFailed = out.failed;
+			limitHit = out.limitHit;
+			st.log(`! work check attempt ${attempt} failed: ${checkFailed}`);
+			if (limitHit) {
+				hold = await usageHold(ran.result.model ?? roles.selector ?? null);
+				break;
+			}
+		}
+		if (checkFailed !== null)
+			parkFailedWorkCheck(
+				st,
+				priorLog,
+				roles.warn,
+				roles.checkModel,
+				checkStart,
+				checkMs,
+				checkFailed,
+				limitHit,
+				hold,
+			);
+		return false;
+	}
+
+	/** The check's input: at an unchanged head (a reply- or evidence-driven re-check) the full
+	 * diff stays, so the check can re-cite an earlier blocker's quote verbatim; a re-check
+	 * after new commits sees only those commits: the checked code was already reviewed once,
+	 * and repeat checks mostly re-flag old code. The run transcript rides when it is on disk;
+	 * without it the check works from the diff alone. */
+	async function workCheckInput(
+		st: TurnSettle,
+		cur: Task,
+		head: string | null,
+		open: WorkCheckBlocker[],
+		replies: string[],
+	): Promise<{ input: string; diff: string; transcriptText: string }> {
+		const checkBase = st.task.base ?? st.header.target ?? "HEAD";
+		// A re-check sees only the commits since the head the last completed
+		// check stamped — empty at an unchanged head, where only the report
+		// moved. The checked code was already reviewed once, and repeat checks
+		// mostly re-flag old code; the full branch diff is still read below for
+		// quote grounding, so a re-cited blocker's quote stays verbatim there.
+		const checkFrom =
+			head !== null && cur.workCheckHead !== null
+				? cur.workCheckHead
+				: checkBase;
+		const sincePreviousCheck = checkFrom !== checkBase;
+		const diff =
+			(await ops.diffText(st.loc.wt, checkBase, "HEAD").catch(() => null)) ??
+			"";
+		const checkDiff = sincePreviousCheck
+			? ((await ops.diffText(st.loc.wt, checkFrom, "HEAD").catch(() => null)) ??
+				diff)
+			: diff;
+		const transcriptPath =
+			sessionFile(st.store.sessionsDir, st.result.sessionId) ?? "";
+		let transcriptText = "";
+		try {
+			transcriptText = readRegular(transcriptPath).toString("utf8");
+		} catch {
+			// No transcript file on disk: the check works from the diff alone.
+		}
+		// The ready report of the run being checked; on a re-check the report the
+		// first completed check judged rides along as the original result.
+		const readyReport = readyReportText(st.result.outcome, st.result.finalText);
+		const input = workCheckPrompt({
+			title: st.task.title,
+			prompt: st.task.prompt,
+			base: checkBase,
+			head: head ?? "HEAD",
+			diff: checkDiff,
+			sincePreviousCheck,
+			report: readyReport,
+			originalReport: cur.workCheckReport ?? undefined,
+			transcriptPath,
+			earlier: open.map((b, i) => ({
+				id: i + 1,
+				finding: b.finding,
+				quote: b.quote,
+			})),
+			replies,
+		});
+		return { input, diff, transcriptText };
+	}
+
+	/** The check's model: the role's selector, else the board's default role (omp's fallback).
+	 * The check must not be the model it checks — same model or vendor goes on the card as a
+	 * warning. */
+	function workCheckRoles(st: TurnSettle): {
+		selector: string | undefined;
+		checkRole: string;
+		checkModel: string | null;
+		warn: { warn?: string };
+	} {
+		const roles = (ops.modelRoles ?? modelRoles)();
+		const checkRole = checkRoleFor(st.result.model);
+		const selector = roles[checkRole];
+		const checkModel = selector ?? roles.default ?? null;
+		const checkWarn = checkModelWarning(st.result.model, checkModel);
+		const warn =
+			checkWarn === null
+				? {}
+				: {
+						warn:
+							checkWarn === "same model"
+								? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
+								: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
+					};
+		return { selector, checkRole, checkModel, warn };
+	}
+
+	/** One work-check attempt (the review check shares awaitCheckAttempt): a credit stop
+	 * before and after, the meter, the run, and the takeover check. Null: the turn stopped. */
+	async function awaitWorkCheckAttempt(
+		st: TurnSettle,
+		input: string,
+		selector: string | undefined,
+		checkRole: string,
+	): Promise<{ result: RunResult; checkMs: number } | null> {
+		return awaitCheckAttempt(
+			st,
+			input,
+			selector,
+			checkRole,
+			`${st.key}:workcheck`,
+		);
+	}
+
+	/** Applies a valid work-check verdict: earlier blockers resolve three ways — the verdict's
+	 * fixed list (by the prompt's 1-based id) wins; a blocker whose exact quote the new
+	 * blockers re-cite stays open; anything else counts as fixed because the re-check dropped
+	 * it. Copies, never in place. A pass stamps the card (the deferred write below stores
+	 * merging/queued with the check record); blockers go back to the work agent. */
+	function applyWorkCheckVerdict(
+		st: TurnSettle,
+		cur: Task,
+		head: string | null,
+		checkModel: string | null,
+		open: WorkCheckBlocker[],
+		priorLog: WorkCheckRun[],
+		warn: { warn?: string },
+		checkStart: number,
+		checkMs: number,
+		verdict: WorkCheckVerdict,
+		diff: string,
+		transcriptText: string,
+	): void {
+		const readyReport = readyReportText(st.result.outcome, st.result.finalText);
+		const split = demoteUnquoted(verdict, diff, readyReport, transcriptText);
+		// Earlier blockers resolve three ways: the verdict's fixed list
+		// (by the prompt's 1-based id) wins; a blocker whose exact quote
+		// the new blockers re-cite stays open; anything else counts as
+		// fixed because the re-check dropped it. Copies, never in place.
+		const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
+		const requoted = new Set(split.blockers.map((b) => b.quote));
+		const runs = [...priorLog];
+		const lastIdx = runs.findLastIndex((r) => r.outcome === "blockers");
+		const prev = lastIdx === -1 ? undefined : runs[lastIdx];
+		if (prev !== undefined)
+			runs[lastIdx] = {
+				...prev,
+				blockers: prev.blockers.map((b) => {
+					const oi = open.indexOf(b);
+					if (oi === -1) return b;
+					const reason = fixedById.get(oi + 1);
+					if (reason !== undefined)
+						return {
+							...b,
+							status: "fixed" as const,
+							statusReason: reason,
+						};
+					if (requoted.has(b.quote)) return b;
+					return {
+						...b,
+						status: "fixed" as const,
+						statusReason: "not re-cited by the re-check",
+					};
+				}),
+			};
+		const run: WorkCheckRun = {
+			at: checkStart,
+			// The resolved model, not just the role selector: with the role
+			// missing, the card must name the default role it fell back to.
+			model: checkModel,
+			outcome: split.blockers.length === 0 ? "pass" : "blockers",
+			blockers: split.blockers,
+			notes: split.notes,
+			durationMs: checkMs,
+			...warn,
+		};
+		const allRuns = [...runs, run].slice(-20);
+		st.log(
+			`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
+		);
+		if (split.blockers.length === 0)
+			// Pass: the card stays in its current state; the deferred write
+			// below stores merging/queued with the check record stamped.
+			st.store.updateTask(st.id, {
+				workCheckLog: allRuns,
+				workCheckHead: head,
+				workCheckSendbacks: cur.workCheckSendbacks,
+				...(cur.workCheckReport === null
+					? { workCheckReport: readyReport }
+					: {}),
+			});
+		else sendWorkCheckBack(st, cur, head, split.blockers, allRuns);
+	}
+
+	/** A work check that failed twice (or hit a usage limit): park needs_you for a re-run, or
+	 * hold the card until the provider's reset. No head stamp: the next ready at this head
+	 * must run the check again. */
+	function parkFailedWorkCheck(
+		st: TurnSettle,
+		priorLog: WorkCheckRun[],
+		warn: { warn?: string },
+		checkModel: string | null,
+		checkStart: number,
+		checkMs: number,
+		checkFailed: string,
+		limitHit: boolean,
+		hold: UsageHold | null,
+	): void {
+		st.log(
+			hold !== null
+				? `- work check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`
+				: `- work check failed: ${checkFailed}`,
+		);
+		const patch = hold === null ? null : holdPatch(st.store, st.id, hold);
+		st.store.updateTask(st.id, {
+			...(hold === null
+				? {
+						stage: "in_progress" as const,
+						state: "needs_you" as const,
+						needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
+					}
+				: patch),
+			workCheckLog: [
+				...priorLog,
+				{
+					at: checkStart,
+					model: checkModel,
+					outcome: "error",
+					blockers: [],
+					notes: [],
+					durationMs: checkMs,
+					...warn,
+					error: checkFailed,
+				},
+			],
+		});
+	}
+
+	/** A check block above ran while the card was still in_progress/running: store the final
+	 * state now, if the card is still ours. The overrides the checks wrote (send-back,
+	 * needs_you, a failed check) moved the state away from running; this write must not
+	 * clobber them, so it fires only on the still-running card. */
+	function writePostCheckState(st: TurnSettle, next: Next): void {
+		if (!st.checkWillRun) return;
+		const afterCheck = st.store.getTask(st.id);
+		if (
+			afterCheck &&
+			afterCheck.cancelledAt === null &&
+			(afterCheck.state === "running" || afterCheck.state === "preparing")
+		)
+			st.store.updateTask(st.id, {
+				stage: next.stage,
+				state: next.state,
+				needsReason: next.needsReason,
+				queuedAt: next.state === "queued" ? Date.now() : undefined,
+			});
+	}
+
+	/** One work-check attempt's outcome: the parsed verdict on a valid one (null on an
+	 * invalid JSON verdict), else the failure reason and whether a usage limit caused it. */
+	function workAttemptOutcome(result: RunResult): {
+		verdict: WorkCheckVerdict | null;
+		failed: string;
+		limitHit: boolean;
+	} {
+		const err = checkRunError(result);
+		if (err === null) {
+			const verdict = parseWorkCheck(result.finalText);
+			return {
+				verdict,
+				failed:
+					verdict === null ? "the work check verdict was not valid JSON" : "",
+				limitHit: false,
+			};
+		}
+		return { verdict: null, failed: err, limitHit: hitUsageLimit(result) };
+	}
+
+	/** The done card: stamp the released version and remove the worktree. */
+	async function stampDoneCard(st: TurnSettle, next: Next): Promise<void> {
+		if (next.stage !== "done") return;
+		if (!st.idn.releaseCard && st.kind === "merge")
+			await stampReleaseVersion(st);
+		await removeDoneWorktree(
+			st,
+			st.loc.special ? (st.task.branch ?? "") : st.loc.branch,
+		);
+	}
+
+	/** Stamp the version the merge released so state rows can show it without their turns —
+	 * but only when a real tag of that name points at the pushed head: a version string in
+	 * report prose (a quoted commit message, release notes) must not mint a release pill.
+	 * CI watch: pin the pushed sha only when origin's remote-tracking tip equals the local
+	 * target tip — a merge turn that skipped its push would otherwise pin an older run to
+	 * this card. ponytail: two merges landing between push and capture pin the newer run to
+	 * both cards. */
+	async function stampReleaseVersion(st: TurnSettle): Promise<void> {
+		const version = readReleasedVersion(st);
+		const short = st.header.target.replace(/^origin\//, "");
+		const [local, pushed] = await Promise.all([
+			ops.targetSha(st.e.path, st.header.target).catch(() => null),
+			ops
+				.targetSha(st.e.path, `refs/remotes/origin/${short}`)
+				.catch(() => null),
+		]);
+		const onOrigin = local !== null && local === pushed;
+		const tagged =
+			version !== null && onOrigin
+				? await ops
+						.targetSha(st.e.path, `refs/tags/${version}`)
+						.catch(() => null)
+				: null;
+		if (version !== null) {
+			if (onOrigin && tagged === pushed)
+				st.store.updateTask(st.id, { releaseVersion: version });
+			else
+				st.log(`- no release stamp for ${version}: no tag on the pushed head`);
+		}
+		if (onOrigin) st.store.updateTask(st.id, { pushSha: pushed });
+		else st.log("- CI watch skipped: merge push not on origin");
+	}
+
+	/** The version this merge turn released, parsed from the settled row's report prose
+	 * (null unless the run reported an integrated outcome). */
+	function readReleasedVersion(st: TurnSettle): string | null {
+		const last = st.store.listTurns(st.id).at(-1);
+		return last?.outcome === "integrated"
+			? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
+			: null;
+	}
+
+	/** An interview, grill or trending scout card runs in the main checkout: its worktree must
+	 * never be removed. A done work card's worktree goes away. */
+	async function removeDoneWorktree(
+		st: TurnSettle,
+		branch: string,
+	): Promise<void> {
+		if (st.idn.interview || st.idn.grill || st.idn.scout) return;
+		// The done drawer keeps naming what the run left uncommitted after the
+		// worktree is gone: capture the list before removeWorktree deletes it.
+		// statusFiles never rejects (an unreadable tree reads as []).
+		st.store.updateTask(st.id, {
+			uncommittedFiles: await ops.statusFiles(st.loc.wt),
+		});
+		try {
+			await ops.removeWorktree({
+				mainPath: st.e.path,
+				worktreePath: st.loc.wt,
+				branch,
+			});
+			st.log("- worktree removed");
+		} catch (err) {
+			st.log(`! removeWorktree: ${errmsg(err)}`);
+		}
+	}
+
+	/** OTTR-454: a re-bound detached run has no local handle, so Esc kills it on its worker
+	 * and settles the row here — the same stopped park a live kill gets from runTurn. */
+	async function stopDetachedRun(
+		store: ProjectStore,
+		id: string,
+		reason: string,
+		watch: { url: string; runId: string },
+	): Promise<StopOutcome> {
+		detached.delete(`${store.name}/${id}`);
+		try {
+			// ponytail: a watcher exists only because workerTarget answered at recovery,
+			// so the optional chain on the token cannot see null here.
+			await ops.killDetached?.(watch.url, runnerToken(watch.url), watch.runId);
+		} catch (err) {
+			appendLog(store, id, `! stop killDetached: ${errmsg(err)}`);
+		}
+		const turn = store.listTurns(id).at(-1);
+		if (turn && turn.endedAt === null)
+			store.finishTurn(turn.id, {
+				endedAt: Date.now(),
+				exitCode: null,
+				error: "stopped",
+			});
+		store.updateTask(id, {
+			state: "needs_you",
+			needsReason: reason,
+		});
+		return { ok: true };
 	}
 
 	/** Stops the running turn without cancelling the task (the board's Esc): kills the agent
@@ -5371,32 +7588,7 @@ export function createTurnLoop(
 		// and settles the row here — the same stopped park a live kill gets from runTurn.
 		const watch = detached.get(`${store.name}/${id}`);
 		if (!handle && !watch) return { error: "no turn is running", status: 409 };
-		if (watch) {
-			detached.delete(`${store.name}/${id}`);
-			try {
-				// ponytail: a watcher exists only because workerTarget answered at recovery,
-				// so the optional chain on the token cannot see null here.
-				await ops.killDetached?.(
-					watch.url,
-					runnerToken(watch.url),
-					watch.runId,
-				);
-			} catch (err) {
-				appendLog(store, id, `! stop killDetached: ${errmsg(err)}`);
-			}
-			const turn = store.listTurns(id).at(-1);
-			if (turn && turn.endedAt === null)
-				store.finishTurn(turn.id, {
-					endedAt: Date.now(),
-					exitCode: null,
-					error: "stopped",
-				});
-			store.updateTask(id, {
-				state: "needs_you",
-				needsReason: reason,
-			});
-			return { ok: true };
-		}
+		if (watch !== undefined) return stopDetachedRun(store, id, reason, watch);
 		// A watcher row returned above, so handle is set here; the guard keeps TS exact.
 		if (!handle) return { error: "no turn is running", status: 409 };
 		stopping.set(`${store.name}/${id}`, reason);
@@ -5469,17 +7661,12 @@ export function createTurnLoop(
 		return Promise.resolve(true);
 	}
 
-	/** Hosted mode (docs/specs/hosted-mode.md section 5): the control plane's release after a
-	 * top-up. It clears the credit hold, as a fresh true gate answer does, and changes no other
-	 * stop state. Then it queues every needs_you card that the credit stop or the credit gate
-	 * parked (its reason is the credit reason) like an owner Resume ("."): a stopped card resumes
-	 * its session on the kept worktree. Each queued turn still passes the credit gate. Resolves
-	 * to the number queued; a second call finds no parked card. */
-	async function creditRelease(): Promise<number> {
-		if (ops.hosted === undefined) return 0;
-		const reason = ops.hosted.config.wording.creditReason;
-		creditHold = false;
-		creditReleases += 1;
+	/** Queues every needs_you card the credit stop or the credit gate parked (its reason is the
+	 * credit reason) like an owner Resume ("."): a stopped card resumes its session on the kept
+	 * worktree. Each queued turn still passes the credit gate. Resolves to the number queued; a
+	 * second call finds no parked card. One sick store must not keep the other projects' cards
+	 * parked. */
+	function releaseParkedCards(reason: string): number {
 		let released = 0;
 		for (const e of projects.values()) {
 			try {
@@ -5495,13 +7682,118 @@ export function createTurnLoop(
 					released += 1;
 				}
 			} catch (err) {
-				// One sick store must not keep the other projects' cards parked.
 				logStoreError(e.store.name, err);
 			}
 		}
+		return released;
+	}
+
+	/** Hosted mode (docs/specs/hosted-mode.md section 5): the control plane's release after a
+	 * top-up. It clears the credit hold, as a fresh true gate answer does, and changes no other
+	 * stop state. Then it queues every needs_you card that the credit stop or the credit gate
+	 * parked (its reason is the credit reason) like an owner Resume ("."): a stopped card resumes
+	 * its session on the kept worktree. Each queued turn still passes the credit gate. Resolves
+	 * to the number queued; a second call finds no parked card. */
+	async function creditRelease(): Promise<number> {
+		if (ops.hosted === undefined) return 0;
+		const reason = ops.hosted.config.wording.creditReason;
+		creditHold = false;
+		creditReleases += 1;
+		const released = releaseParkedCards(reason);
 		if (released > 0) ops.publishSoon();
 		schedule();
 		return released;
+	}
+
+	/** OTTR-454: a re-bound detached run has no local handle; the worker kills it, and the
+	 * cancel flow below settles the card like any cancel without a live run. */
+	async function killDetachedWatch(e: TurnProject, id: string): Promise<void> {
+		const watch = detached.get(`${e.store.name}/${id}`);
+		if (watch === undefined) return;
+		detached.delete(`${e.store.name}/${id}`);
+		try {
+			// ponytail: a watcher exists only because workerTarget answered at recovery,
+			// so the optional chain on the token cannot see null here.
+			await ops.killDetached?.(watch.url, runnerToken(watch.url), watch.runId);
+		} catch (err) {
+			appendLog(e.store, id, `! cancel killDetached: ${errmsg(err)}`);
+		}
+	}
+
+	/** The cancel's worktree verdict: what the tree holds against the target (null = nothing
+	 * unsaved) and whether the branch must stay. OTTR-347: a husk holds no checkout, but its
+	 * branch can still hold commits the target never got — such a cancel keeps the branch. */
+	async function keptWorktreeVerdict(
+		e: TurnProject,
+		task: ListedTask,
+		wt: string,
+		force: boolean,
+	): Promise<{ unsaved: string | null; keepBranch: boolean }> {
+		let unsaved: string | null = null;
+		let keepBranch = false;
+		// A Done task passed the delete check when its worktree was removed; only its record is left.
+		// A release card's worktree is disposable: cancel it like a forced cancel.
+		if (!force && task.stage !== "done" && task.releaseVersion === null) {
+			const into = e.target ?? task.base;
+			if (await ops.worktreeHusk(wt)) {
+				// Fail closed: with no target to prove against, the branch stays.
+				keepBranch =
+					task.branch !== null &&
+					!(into && (await ops.branchMergedOrGone(e.path, task.branch, into)));
+			} else {
+				unsaved = into
+					? await ops.unsavedWork(wt, into)
+					: "its base commit is unknown";
+			}
+		}
+		return { unsaved, keepBranch };
+	}
+
+	/** The worktree a cancelled card holds: kept (a needs_you park with the kept files) when
+	 * it holds work the target lacks, else removed. Null when nothing was kept. */
+	async function disposeCancelledWorktree(
+		e: TurnProject,
+		id: string,
+		task: ListedTask,
+		wt: string,
+		force: boolean,
+	): Promise<{ kept: string } | null> {
+		const store = e.store;
+		const { unsaved, keepBranch } = await keptWorktreeVerdict(
+			e,
+			task,
+			wt,
+			force,
+		);
+		if (unsaved !== null) {
+			appendLog(store, id, `! cancel kept the worktree: ${unsaved}`);
+			store.updateTask(id, {
+				cancelledAt: null,
+				state: "needs_you",
+				// Its own prefix (R5-2): the supervisor's auto-tend matches "Kept the
+				// worktree: " and must not answer a card the user just cancelled; the
+				// kept counts and finish-kept still cover it via isKeptReason.
+				needsReason: cancelKeptReason(unsaved),
+				keptFiles: await ops.statusFiles(wt),
+			});
+			return { kept: unsaved };
+		}
+		try {
+			await ops.removeWorktree({
+				mainPath: e.path,
+				worktreePath: wt,
+				branch: keepBranch ? null : task.branch,
+			});
+		} catch (err) {
+			appendLog(store, id, `! cancel removeWorktree: ${errmsg(err)}`);
+		}
+		if (keepBranch && task.branch)
+			appendLog(
+				store,
+				id,
+				`! cancel kept the branch ${task.branch}: it holds commits that never reached ${e.target ?? task.base}`,
+			);
+		return null;
 	}
 
 	/**
@@ -5518,23 +7810,7 @@ export function createTurnLoop(
 		if (publishing.has(`${store.name}/${id}`))
 			return { error: "release already publishing", status: 409 };
 		store.updateTask(id, { cancelledAt: Date.now() });
-		// OTTR-454: a re-bound detached run has no local handle; the worker kills it, and the
-		// flow below settles the card like any cancel without a live run.
-		const watch = detached.get(`${store.name}/${id}`);
-		if (watch) {
-			detached.delete(`${store.name}/${id}`);
-			try {
-				// ponytail: a watcher exists only because workerTarget answered at recovery,
-				// so the optional chain on the token cannot see null here.
-				await ops.killDetached?.(
-					watch.url,
-					runnerToken(watch.url),
-					watch.runId,
-				);
-			} catch (err) {
-				appendLog(store, id, `! cancel killDetached: ${errmsg(err)}`);
-			}
-		}
+		await killDetachedWatch(e, id);
 		const handle = running.get(`${store.name}/${id}`);
 		if (handle) {
 			await handle.kill();
@@ -5545,108 +7821,26 @@ export function createTurnLoop(
 		}
 		const task = store.getTask(id);
 		if (task?.worktree) {
-			let unsaved: string | null = null;
-			// OTTR-347: a husk holds no checkout, but its branch can still hold commits the
-			// target never got. Such a cancel keeps the branch instead of deleting it.
-			let keepBranch = false;
-			// A Done task passed the delete check when its worktree was removed; only its record is left.
-			// A release card's worktree is disposable: cancel it like a forced cancel.
-			if (!force && task.stage !== "done" && task.releaseVersion === null) {
-				const into = e.target ?? task.base;
-				if (await ops.worktreeHusk(task.worktree)) {
-					// Fail closed: with no target to prove against, the branch stays.
-					keepBranch =
-						task.branch !== null &&
-						!(
-							into && (await ops.branchMergedOrGone(e.path, task.branch, into))
-						);
-				} else {
-					unsaved = into
-						? await ops.unsavedWork(task.worktree, into)
-						: "its base commit is unknown";
-				}
-			}
-			if (unsaved) {
-				appendLog(store, id, `! cancel kept the worktree: ${unsaved}`);
-				store.updateTask(id, {
-					cancelledAt: null,
-					state: "needs_you",
-					// Its own prefix (R5-2): the supervisor's auto-tend matches "Kept the
-					// worktree: " and must not answer a card the user just cancelled; the
-					// kept counts and finish-kept still cover it via isKeptReason.
-					needsReason: cancelKeptReason(unsaved),
-					keptFiles: await ops.statusFiles(task.worktree),
-				});
-				return { kept: unsaved };
-			}
-			try {
-				await ops.removeWorktree({
-					mainPath: e.path,
-					worktreePath: task.worktree,
-					branch: keepBranch ? null : task.branch,
-				});
-			} catch (err) {
-				appendLog(store, id, `! cancel removeWorktree: ${errmsg(err)}`);
-			}
-			if (keepBranch && task.branch)
-				appendLog(
-					store,
-					id,
-					`! cancel kept the branch ${task.branch}: it holds commits that never reached ${e.target ?? task.base}`,
-				);
+			const kept = await disposeCancelledWorktree(
+				e,
+				id,
+				task,
+				task.worktree,
+				force,
+			);
+			if (kept !== null) return kept;
 		}
 		store.updateTask(id, { state: "idle" });
 		return { removed: true };
 	}
 
-	/** Resolves a kept-worktree card: applies move/ignore/delete choices, then removes the worktree. */
-	async function finishKept(
+	/** One planned kept-file move onto the main checkout. Returns the 409 outcome on the first
+	 * missing or uncopyable file. */
+	function moveKeptFiles(
 		e: TurnProject,
-		id: string,
-		choices: unknown,
-	): Promise<FinishKeptOutcome> {
-		const store = e.store;
-		const task = store.getTask(id);
-		if (task === null) return { error: "unknown task", status: 404 };
-		if (
-			task.state !== "needs_you" ||
-			(task.stage !== "merging" && task.stage !== "in_progress") ||
-			!isKeptReason(task.needsReason)
-		) {
-			return { error: "task is not kept on a worktree", status: 409 };
-		}
-		if (running.has(`${store.name}/${id}`))
-			return { error: "a turn is running", status: 409 };
-		const target = e.target ?? task.base;
-		if (target === null) return { error: "no integration target", status: 409 };
-		// A husk (unlinked, holds no checkout) cannot speak for HEAD: dispose it when nothing
-		// recoverable is left (branch gone or merged); otherwise the branch names the blocker.
-		const wt = task.worktree;
-		const husk = wt === null || (await ops.worktreeHusk(wt));
-		if (husk) {
-			if (task.branch === null)
-				return {
-					error: "worktree is missing and no branch to check",
-					status: 409,
-				};
-			if (!(await ops.branchMergedOrGone(e.path, task.branch, target)))
-				return {
-					error: `branch ${task.branch} has commits that never reached ${target}`,
-					status: 409,
-				};
-		} else if (!(await ops.isIntegrated(wt, target).catch(() => false))) {
-			return { error: `HEAD is not integrated into ${target}`, status: 409 };
-		}
-		const parsed = parseKeptChoices(choices, task.keptFiles);
-		if ("error" in parsed) return { error: parsed.error, status: 400 };
-		const planned = planKeptFinish(task.keptFiles, parsed.choices, (rel) =>
-			existsSync(join(e.path, rel)),
-		);
-		if ("conflict" in planned)
-			return {
-				error: `file already exists in the main checkout: ${planned.conflict}`,
-				status: 409,
-			};
+		wt: string | null,
+		planned: { moves: string[]; ignores: string[]; deletes: string[] },
+	): { error: string; status: 409 } | null {
 		for (const rel of planned.moves) {
 			if (wt === null || !existsSync(join(wt, rel)))
 				return { error: `file missing in the worktree: ${rel}`, status: 409 };
@@ -5660,17 +7854,102 @@ export function createTurnLoop(
 				return { error: `cannot move ${rel}: ${errmsg(err)}`, status: 409 };
 			}
 		}
-		for (const rel of planned.ignores) await ops.ignoreInMain(e.path, rel);
+		return null;
+	}
+
+	/** The pre-delete proof for a kept-worktree card: a husk (unlinked, holds no checkout)
+	 * disposes when its branch is gone or merged, else the branch names the blocker; a live
+	 * worktree must already be integrated. Returns the 409 outcome, or null. */
+	async function checkKeptWorktree(
+		e: TurnProject,
+		task: ListedTask,
+		target: string,
+	): Promise<{ error: string; status: 409 } | null> {
+		const wt = task.worktree;
+		const husk = wt === null || (await ops.worktreeHusk(wt));
+		if (husk) {
+			if (task.branch === null)
+				return {
+					error: "worktree is missing and no branch to check",
+					status: 409,
+				};
+			if (!(await ops.branchMergedOrGone(e.path, task.branch, target)))
+				return {
+					error: `branch ${task.branch} has commits that never reached ${target}`,
+					status: 409,
+				};
+			return null;
+		}
+		if (!(await ops.isIntegrated(wt, target).catch(() => false)))
+			return { error: `HEAD is not integrated into ${target}`, status: 409 };
+		return null;
+	}
+
+	/** Validates a finish-kept request and plans the file moves: the card's guards, the husk
+	 * or integration proof, and the move/ignore/delete plan. Returns the outcome to return,
+	 * or the plan with the integration target. */
+	async function planKeptFinishRun(
+		e: TurnProject,
+		id: string,
+		task: ListedTask,
+		choices: unknown,
+	): Promise<
+		| Exclude<FinishKeptOutcome, { ok: true }>
+		| {
+				planned: { moves: string[]; ignores: string[]; deletes: string[] };
+				target: string;
+		  }
+	> {
+		if (
+			task.state !== "needs_you" ||
+			(task.stage !== "merging" && task.stage !== "in_progress") ||
+			!isKeptReason(task.needsReason)
+		) {
+			return { error: "task is not kept on a worktree", status: 409 };
+		}
+		if (running.has(`${e.store.name}/${id}`))
+			return { error: "a turn is running", status: 409 };
+		const target = e.target ?? task.base;
+		if (target === null) return { error: "no integration target", status: 409 };
+		const conflict = await checkKeptWorktree(e, task, target);
+		if (conflict !== null) return conflict;
+		const parsed = parseKeptChoices(choices, task.keptFiles);
+		if ("error" in parsed) return { error: parsed.error, status: 400 };
+		const planned = planKeptFinish(task.keptFiles, parsed.choices, (rel) =>
+			existsSync(join(e.path, rel)),
+		);
+		if ("conflict" in planned)
+			return {
+				error: `file already exists in the main checkout: ${planned.conflict}`,
+				status: 409,
+			};
+		return { planned, target };
+	}
+
+	/** Resolves a kept-worktree card: applies move/ignore/delete choices, then removes the worktree. */
+	async function finishKept(
+		e: TurnProject,
+		id: string,
+		choices: unknown,
+	): Promise<FinishKeptOutcome> {
+		const store = e.store;
+		const task = store.getTask(id);
+		if (task === null) return { error: "unknown task", status: 404 };
+		const plan = await planKeptFinishRun(e, id, task, choices);
+		if ("error" in plan) return plan;
+		const failed = moveKeptFiles(e, task.worktree, plan.planned);
+		if (failed !== null) return failed;
+		for (const rel of plan.planned.ignores) await ops.ignoreInMain(e.path, rel);
 		appendLog(
 			store,
 			id,
-			`- finished kept worktree: ${planned.moves.length} moved, ${planned.ignores.length} ignored, ${planned.deletes.length} deleted`,
+			`- finished kept worktree: ${plan.planned.moves.length} moved, ${plan.planned.ignores.length} ignored, ${plan.planned.deletes.length} deleted`,
 		);
 		try {
-			if (wt !== null)
+			if (task.worktree !== null)
 				await ops.removeWorktree({
 					mainPath: e.path,
-					worktreePath: wt,
+					worktreePath: task.worktree,
 					branch: task.branch,
 				});
 		} catch (err) {
@@ -5684,8 +7963,8 @@ export function createTurnLoop(
 			// naming them now that the worktree they lived in is gone.
 			uncommittedFiles: task.keptFiles,
 			keptFiles: [],
-			commits: await ops.targetCommits(e.path, target),
-			mergeHead: await ops.targetSha(e.path, target).catch(() => null),
+			commits: await ops.targetCommits(e.path, plan.target),
+			mergeHead: await ops.targetSha(e.path, plan.target).catch(() => null),
 		});
 		return { ok: true };
 	}

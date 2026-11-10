@@ -100,23 +100,193 @@ function ts(v: unknown): number {
 			: NaN;
 }
 
+type SessionRecord = {
+	type?: string;
+	customType?: string;
+	timestamp?: string;
+	message?: unknown;
+	data?: unknown;
+};
+
+type StartEntry = { tool: string; intent: string; startedAt: number };
+type StartMap = Map<string, StartEntry>;
+
+type SessionMessage = {
+	role?: string;
+	model?: unknown;
+	usage?: unknown;
+	content?: unknown;
+	toolCallId?: unknown;
+	toolName?: unknown;
+	isError?: unknown;
+	details?: unknown;
+};
+
+/** Adds one tool call to the session's per-tool stats. */
+function bumpTool(
+	s: ParsedSession,
+	tool: string,
+	patch?: { error?: boolean; seconds?: number },
+): void {
+	const t = s.tools[tool] ?? { calls: 0, errors: 0, seconds: 0 };
+	t.calls += 1;
+	if (patch?.error) t.errors += 1;
+	if (patch?.seconds !== undefined) t.seconds += patch.seconds;
+	s.tools[tool] = t;
+}
+
+/** A `session-stop-continuation` marker; true when the record was one. */
+function isContinuation(rec: SessionRecord, s: ParsedSession): boolean {
+	if (
+		rec.type === "custom_message" &&
+		rec.customType === "session-stop-continuation"
+	) {
+		s.continuations += 1;
+		return true;
+	}
+	return false;
+}
+
+/** A `tool_execution_start` record; true when the record was one (consumed either way). */
+function recordToolStart(rec: SessionRecord, starts: StartMap): boolean {
+	if (!(rec.type === "custom" && rec.customType === "tool_execution_start"))
+		return false;
+	if (typeof rec.data !== "object" || rec.data === null) return true;
+	const data = rec.data as {
+		toolCallId?: unknown;
+		toolName?: unknown;
+		intent?: unknown;
+		startedAt?: unknown;
+	};
+	if (typeof data.toolCallId === "string") {
+		starts.set(data.toolCallId, {
+			tool: typeof data.toolName === "string" ? data.toolName : "unknown",
+			intent: typeof data.intent === "string" ? data.intent : "",
+			startedAt: ts(data.startedAt ?? rec.timestamp),
+		});
+	}
+	return true;
+}
+
+/** The message record's message object; null when the record is not one. */
+function messageOf(rec: SessionRecord): SessionMessage | null {
+	if (
+		rec.type !== "message" ||
+		typeof rec.message !== "object" ||
+		rec.message === null
+	)
+		return null;
+	return rec.message as SessionMessage;
+}
+
+/** Usage of one assistant message into the session's usage list. */
+function pushUsage(
+	m: SessionMessage,
+	rec: SessionRecord,
+	s: ParsedSession,
+): void {
+	const u = m.usage as {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		cost?: { total?: number };
+	};
+	s.usage.push({
+		model: typeof m.model === "string" ? m.model : "unknown",
+		timestamp: ts(rec.timestamp),
+		input: u.input ?? 0,
+		output: u.output ?? 0,
+		cacheRead: u.cacheRead ?? 0,
+		cacheWrite: u.cacheWrite ?? 0,
+		cost: u.cost?.total ?? 0,
+	});
+}
+
+/** Tool calls announced only by their assistant content; the fallback start time is the
+ * message timestamp when no tool_execution_start custom event precedes the result. */
+function recordPendingCalls(
+	m: SessionMessage,
+	rec: SessionRecord,
+	starts: StartMap,
+): void {
+	for (const c of m.content as unknown[]) {
+		if (typeof c !== "object" || c === null) continue;
+		const call = c as {
+			type?: string;
+			id?: unknown;
+			name?: unknown;
+			intent?: unknown;
+		};
+		if (
+			call.type !== "toolCall" ||
+			typeof call.id !== "string" ||
+			starts.has(call.id)
+		)
+			continue;
+		starts.set(call.id, {
+			tool: typeof call.name === "string" ? call.name : "unknown",
+			intent: typeof call.intent === "string" ? call.intent : "",
+			startedAt: ts(rec.timestamp),
+		});
+	}
+}
+
+/** One tool result: closes its call's timing and adds the tool stat (and a slow entry). */
+function recordToolResult(
+	m: SessionMessage,
+	rec: SessionRecord,
+	s: ParsedSession,
+	starts: StartMap,
+): void {
+	const toolCallId = typeof m.toolCallId === "string" ? m.toolCallId : null;
+	const start = toolCallId ? starts.get(toolCallId) : undefined;
+	let seconds: number | undefined;
+	if (start) {
+		const details = m.details as { wallTimeMs?: unknown } | null;
+		if (
+			typeof details?.wallTimeMs === "number" &&
+			Number.isFinite(details.wallTimeMs) &&
+			details.wallTimeMs >= 0
+		) {
+			seconds = details.wallTimeMs / 1000;
+		} else {
+			const elapsed = (ts(rec.timestamp) - start.startedAt) / 1000;
+			if (Number.isFinite(elapsed) && elapsed >= 0) seconds = elapsed;
+		}
+	}
+	bumpTool(s, m.toolName as string, { error: m.isError === true, seconds });
+	if (start && seconds !== undefined)
+		s.slow.push({ tool: start.tool, intent: start.intent, seconds });
+}
+
+/** Routes one parsed message record to its handler. */
+function handleMessage(
+	m: SessionMessage,
+	rec: SessionRecord,
+	s: ParsedSession,
+	starts: StartMap,
+): void {
+	if (
+		m.role === "assistant" &&
+		typeof m.usage === "object" &&
+		m.usage !== null
+	) {
+		pushUsage(m, rec, s);
+		return;
+	}
+	if (m.role === "assistant" && Array.isArray(m.content)) {
+		recordPendingCalls(m, rec, starts);
+		return;
+	}
+	if (m.role === "toolResult" && typeof m.toolName === "string")
+		recordToolResult(m, rec, s, starts);
+}
+
 function parseSession(text: string): ParsedSession {
 	const s: ParsedSession = { usage: [], tools: {}, slow: [], continuations: 0 };
 	/** toolCallId → start data; a `tool_execution_start` overwrites startedAt (it is the precise one). */
-	const starts = new Map<
-		string,
-		{ tool: string; intent: string; startedAt: number }
-	>();
-	const bump = (
-		tool: string,
-		patch?: { error?: boolean; seconds?: number },
-	) => {
-		const t = s.tools[tool] ?? { calls: 0, errors: 0, seconds: 0 };
-		t.calls += 1;
-		if (patch?.error) t.errors += 1;
-		if (patch?.seconds !== undefined) t.seconds += patch.seconds;
-		s.tools[tool] = t;
-	};
+	const starts: StartMap = new Map();
 	for (const line of text.split("\n")) {
 		if (!line) continue;
 		let d: unknown;
@@ -126,122 +296,11 @@ function parseSession(text: string): ParsedSession {
 			continue;
 		}
 		if (typeof d !== "object" || d === null) continue;
-		const rec = d as {
-			type?: string;
-			customType?: string;
-			timestamp?: string;
-			message?: unknown;
-			data?: unknown;
-		};
-		if (
-			rec.type === "custom_message" &&
-			rec.customType === "session-stop-continuation"
-		) {
-			s.continuations += 1;
-			continue;
-		}
-		if (
-			rec.type === "custom" &&
-			rec.customType === "tool_execution_start" &&
-			typeof rec.data === "object" &&
-			rec.data !== null
-		) {
-			const data = rec.data as {
-				toolCallId?: unknown;
-				toolName?: unknown;
-				intent?: unknown;
-				startedAt?: unknown;
-			};
-			if (typeof data.toolCallId === "string") {
-				starts.set(data.toolCallId, {
-					tool: typeof data.toolName === "string" ? data.toolName : "unknown",
-					intent: typeof data.intent === "string" ? data.intent : "",
-					startedAt: ts(data.startedAt ?? rec.timestamp),
-				});
-			}
-			continue;
-		}
-		if (
-			rec.type !== "message" ||
-			typeof rec.message !== "object" ||
-			rec.message === null
-		)
-			continue;
-		const m = rec.message as {
-			role?: string;
-			model?: unknown;
-			usage?: unknown;
-			content?: unknown;
-			toolCallId?: unknown;
-			toolName?: unknown;
-			isError?: unknown;
-			details?: unknown;
-		};
-		if (
-			m.role === "assistant" &&
-			typeof m.usage === "object" &&
-			m.usage !== null
-		) {
-			const u = m.usage as {
-				input?: number;
-				output?: number;
-				cacheRead?: number;
-				cacheWrite?: number;
-				cost?: { total?: number };
-			};
-			s.usage.push({
-				model: typeof m.model === "string" ? m.model : "unknown",
-				timestamp: ts(rec.timestamp),
-				input: u.input ?? 0,
-				output: u.output ?? 0,
-				cacheRead: u.cacheRead ?? 0,
-				cacheWrite: u.cacheWrite ?? 0,
-				cost: u.cost?.total ?? 0,
-			});
-		} else if (m.role === "assistant" && Array.isArray(m.content)) {
-			// Fallback start time when no tool_execution_start custom event precedes the result.
-			for (const c of m.content) {
-				if (typeof c !== "object" || c === null) continue;
-				const call = c as {
-					type?: string;
-					id?: unknown;
-					name?: unknown;
-					intent?: unknown;
-					arguments?: { i?: unknown };
-				};
-				if (
-					call.type !== "toolCall" ||
-					typeof call.id !== "string" ||
-					starts.has(call.id)
-				)
-					continue;
-				starts.set(call.id, {
-					tool: typeof call.name === "string" ? call.name : "unknown",
-					intent: typeof call.intent === "string" ? call.intent : "",
-					startedAt: ts(rec.timestamp),
-				});
-			}
-		} else if (m.role === "toolResult" && typeof m.toolName === "string") {
-			const toolCallId = typeof m.toolCallId === "string" ? m.toolCallId : null;
-			const start = toolCallId ? starts.get(toolCallId) : undefined;
-			let seconds: number | undefined;
-			if (start) {
-				const details = m.details as { wallTimeMs?: unknown } | null;
-				if (
-					typeof details?.wallTimeMs === "number" &&
-					Number.isFinite(details.wallTimeMs) &&
-					details.wallTimeMs >= 0
-				) {
-					seconds = details.wallTimeMs / 1000;
-				} else {
-					const elapsed = (ts(rec.timestamp) - start.startedAt) / 1000;
-					if (Number.isFinite(elapsed) && elapsed >= 0) seconds = elapsed;
-				}
-			}
-			bump(m.toolName, { error: m.isError === true, seconds });
-			if (start && seconds !== undefined)
-				s.slow.push({ tool: start.tool, intent: start.intent, seconds });
-		}
+		const rec = d as SessionRecord;
+		if (isContinuation(rec, s)) continue;
+		if (recordToolStart(rec, starts)) continue;
+		const m = messageOf(rec);
+		if (m !== null) handleMessage(m, rec, s, starts);
 	}
 	return s;
 }
@@ -439,7 +498,7 @@ export function collectRetroFacts(o: {
 		})),
 		needsYouEpisodes: o.turns.filter((t) => t.outcome === "needs_you").length,
 		ciVerdict,
-		ciFailed: ciVerdict !== null && ciVerdict.includes("CI failed"),
+		ciFailed: ciVerdict?.includes("CI failed") === true,
 		tools: Object.entries(all.tools)
 			.map(([name, t]) => ({ name, ...t }))
 			.sort((a, b) => b.calls - a.calls),

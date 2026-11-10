@@ -285,24 +285,39 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		current = self;
 		request.signal.addEventListener("abort", kill);
 
-		const pump = async (push: (text: string) => void): Promise<void> => {
-			const outcome: VmOutcome = { head: null, pushError: null, dirty: null };
-			const finish = (exitCode: number | null, stderrTail: string): void => {
-				push(
-					`${JSON.stringify({ [WORKER_DONE]: { exitCode, stderrTail: tail(stderrTail), vm: outcome } })}\n`,
-				);
-			};
-			const status = async (): Promise<string[] | null> => {
-				const st = await git(cwd, [
-					"status",
-					"--porcelain",
-					"--untracked-files=all",
-				]);
-				return st.ok ? st.out.split("\n").filter((l) => l !== "") : null;
-			};
-
-			// The clone authenticates with the turn token; the header persists in the clone's
-			// own config, scoped to the board's URL, so every later push and fetch carries it.
+		const outcome: VmOutcome = { head: null, pushError: null, dirty: null };
+		const status = async (): Promise<string[] | null> => {
+			const st = await git(cwd, [
+				"status",
+				"--porcelain",
+				"--untracked-files=all",
+			]);
+			return st.ok ? st.out.split("\n").filter((l) => l !== "") : null;
+		};
+		const finish = (
+			push: (text: string) => void,
+			exitCode: number | null,
+			stderrTail: string,
+		): void => {
+			push(
+				`${JSON.stringify({ [WORKER_DONE]: { exitCode, stderrTail: tail(stderrTail), vm: outcome } })}\n`,
+			);
+		};
+		// The VM has no shared home with an identity; commits must still work. A global
+		// identity the image ships wins.
+		const setIdentity = async (): Promise<void> => {
+			for (const [key, value] of [
+				["user.name", "Ottr agent"],
+				["user.email", "ottr-agent@localhost"],
+			] as const)
+				if (!(await git(cwd, ["config", "--get", key])).ok)
+					await git(cwd, ["config", key, value]);
+		};
+		// The clone authenticates with the turn token; the header persists in the clone's
+		// own config, scoped to the board's URL, so every later push and fetch carries it.
+		const cloneTurn = async (
+			push: (text: string) => void,
+		): Promise<string | null> => {
 			const header = `Authorization: Bearer ${vm.token}`;
 			const clone = await git(undefined, [
 				"-c",
@@ -317,8 +332,8 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 			]);
 			if (!clone.ok) {
 				outcome.pushError = clone.err;
-				finish(1, `${clone.err}\n`);
-				return;
+				finish(push, 1, `${clone.err}\n`);
+				return null;
 			}
 			const scoped = await git(cwd, [
 				"config",
@@ -327,80 +342,89 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 			]);
 			if (!scoped.ok) {
 				outcome.pushError = scoped.err;
-				finish(1, `${scoped.err}\n`);
-				return;
+				finish(push, 1, `${scoped.err}\n`);
+				return null;
 			}
-			// The VM has no shared home with an identity; commits must still work. A global
-			// identity the image ships wins.
-			for (const [key, value] of [
-				["user.name", "Ottr agent"],
-				["user.email", "ottr-agent@localhost"],
-			] as const)
-				if (!(await git(cwd, ["config", "--get", key])).ok)
-					await git(cwd, ["config", key, value]);
+			await setIdentity();
 			const cloned = await git(cwd, ["rev-parse", "HEAD"]);
 			if (!cloned.ok) {
 				outcome.pushError = cloned.err;
-				finish(1, `${cloned.err}\n`);
-				return;
+				finish(push, 1, `${cloned.err}\n`);
+				return null;
 			}
-			const cloneHead = cloned.out.trim();
-
+			return cloned.out.trim();
+		};
+		// The guest's own env stays out of the turn (its token above all); omp gets a
+		// working PATH, locale and home, then exactly what the board sent.
+		const turnEnv = (): Record<string, string> => {
 			const env: Record<string, string> = {};
-			// The guest's own env stays out of the turn (its token above all); omp gets a
-			// working PATH, locale and home, then exactly what the board sent.
 			for (const k of ["PATH", "LANG", "HOME"]) {
 				const v = process.env[k];
 				if (v !== undefined) env[k] = v;
 			}
 			Object.assign(env, body.env);
+			return env;
+		};
+		// Routes the turn's providers through the board's /llm proxy; false ends the turn.
+		const addProviders = async (
+			push: (text: string) => void,
+			env: Record<string, string>,
+		): Promise<boolean> => {
 			const agentDir = body.env.PI_CODING_AGENT_DIR;
-			if (vm.providers.length > 0 && agentDir) {
-				try {
-					writeProviderOverrides(agentDir, vm.providers, `${boardUrl}/llm`);
-				} catch (err) {
-					outcome.dirty = await status();
-					finish(1, `${err instanceof Error ? err.message : String(err)}\n`);
+			if (vm.providers.length === 0 || !agentDir) return true;
+			try {
+				writeProviderOverrides(agentDir, vm.providers, `${boardUrl}/llm`);
+			} catch (err) {
+				outcome.dirty = await status();
+				finish(
+					push,
+					1,
+					`${err instanceof Error ? err.message : String(err)}\n`,
+				);
+				return false;
+			}
+			env.OTTR_VM_TOKEN = vm.token;
+			return true;
+		};
+		// --no-verify: this push only syncs the board's copy of the branch; the
+		// project's own pre-push checks belong to the real push to origin.
+		const pushSha = async (sha: string): Promise<void> => {
+			const r = await git(cwd, [
+				"push",
+				"--no-verify",
+				"origin",
+				`+${sha}:refs/heads/${vm.branch}`,
+			]);
+			if (r.ok) {
+				outcome.head = sha;
+				outcome.pushError = null;
+			} else outcome.pushError = r.err;
+		};
+		// Pushes run one at a time, and each pushes the exact sha it read: HEAD can move
+		// between the read and the push, and head must name what the board received.
+		let chain: Promise<void> = Promise.resolve();
+		const pushIfMoved = (cloneHead: string): Promise<void> => {
+			chain = chain.then(async () => {
+				const rev = await git(cwd, ["rev-parse", "HEAD"]);
+				if (!rev.ok) {
+					outcome.pushError = rev.err;
 					return;
 				}
-				env.OTTR_VM_TOKEN = vm.token;
-			}
-			if (vm.hindsight) {
-				env.HINDSIGHT_API_URL = `${boardUrl}/hindsight`;
-				env.HINDSIGHT_API_TOKEN = vm.token;
-			}
-
-			// Pushes run one at a time, and each pushes the exact sha it read: HEAD can move
-			// between the read and the push, and head must name what the board received.
-			let chain: Promise<void> = Promise.resolve();
-			const pushIfMoved = (): Promise<void> => {
-				chain = chain.then(async () => {
-					const rev = await git(cwd, ["rev-parse", "HEAD"]);
-					if (!rev.ok) {
-						outcome.pushError = rev.err;
-						return;
-					}
-					const sha = rev.out.trim();
-					if (sha === (outcome.head ?? cloneHead)) return;
-					// --no-verify: this push only syncs the board's copy of the branch; the
-					// project's own pre-push checks belong to the real push to origin.
-					const r = await git(cwd, [
-						"push",
-						"--no-verify",
-						"origin",
-						`+${sha}:refs/heads/${vm.branch}`,
-					]);
-					if (r.ok) {
-						outcome.head = sha;
-						outcome.pushError = null;
-					} else outcome.pushError = r.err;
-				});
-				return chain;
-			};
-
-			// A /kill or a client abort during the clone means no turn at all.
+				const sha = rev.out.trim();
+				if (sha === (outcome.head ?? cloneHead)) return;
+				await pushSha(sha);
+			});
+			return chain;
+		};
+		// Runs omp to its end, streaming its stdout; returns the turn's exit and stderr.
+		const runOmp = async (
+			push: (text: string) => void,
+			env: Record<string, string>,
+			cloneHead: string,
+		): Promise<{ exitCode: number | null; stderrTail: string }> => {
 			let exitCode: number | null = null;
 			let stderrTail = "";
+			// A /kill or a client abort during the clone means no turn at all.
 			if (!killed) {
 				try {
 					child = spawn(opts.ompPath ?? "omp", body.argv, {
@@ -416,7 +440,10 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 			}
 			const spawned = child;
 			if (spawned !== null) {
-				const timer = setInterval(() => void pushIfMoved(), pushIntervalMs);
+				const timer = setInterval(
+					() => void pushIfMoved(cloneHead),
+					pushIntervalMs,
+				);
 				const ended = Promise.withResolvers<number | null>();
 				spawned.stderr?.on("data", (chunk: Buffer) => {
 					stderrTail = tail(`${stderrTail}${chunk.toString("utf8")}`);
@@ -449,15 +476,37 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				// The pid is free for reuse now: a late abort or /kill must not signal it.
 				child = null;
 			}
-			await pushIfMoved();
+			return { exitCode, stderrTail };
+		};
+		// The board reads the turn's uncommitted files with the sentinel; a file over the
+		// cap is named, not sent.
+		const settle = async (
+			push: (text: string) => void,
+			exitCode: number | null,
+			stderrTail: string,
+		): Promise<void> => {
 			outcome.dirty = await status();
 			const left = collectBoardFiles(cwd);
 			if (left.files.length > 0) outcome.files = left.files;
+			let sent = stderrTail;
 			if (left.skipped.length > 0)
-				stderrTail = tail(
+				sent = tail(
 					`${stderrTail}board files over ${BOARD_FILES_MAX_BYTES} bytes, not sent: ${left.skipped.join(", ")}\n`,
 				);
-			finish(exitCode, stderrTail);
+			finish(push, exitCode, sent);
+		};
+		const pump = async (push: (text: string) => void): Promise<void> => {
+			const cloneHead = await cloneTurn(push);
+			if (cloneHead === null) return;
+			const env = turnEnv();
+			if (!(await addProviders(push, env))) return;
+			if (vm.hindsight) {
+				env.HINDSIGHT_API_URL = `${boardUrl}/hindsight`;
+				env.HINDSIGHT_API_TOKEN = vm.token;
+			}
+			const { exitCode, stderrTail } = await runOmp(push, env, cloneHead);
+			await pushIfMoved(cloneHead);
+			await settle(push, exitCode, stderrTail);
 		};
 
 		return ndjson(
@@ -469,25 +518,34 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		);
 	};
 
+	/** Runs the bake installs, pushing each note line; the turn's exit code and stderr. */
+	const runBake = async (
+		project: string,
+		push: (text: string) => void,
+	): Promise<{ exitCode: number; stderrTail: string }> => {
+		const steps: Ensure[] = [
+			opts.ensure?.packages ?? ensureProjectPackages,
+			opts.ensure?.tools ?? ensureProjectTools,
+			opts.ensure?.python ?? ensureProjectPython,
+		];
+		let exitCode = 0;
+		let stderrTail = "";
+		try {
+			for (const step of steps)
+				for (const line of await step(project, "/root")) push(`${line}\n`);
+		} catch (err) {
+			exitCode = 1;
+			stderrTail = tail(
+				`${err instanceof Error ? err.message : String(err)}\n`,
+			);
+		}
+		return { exitCode, stderrTail };
+	};
+
 	const handleBake = (project: string): Response =>
 		ndjson(
 			async (push) => {
-				const steps: Ensure[] = [
-					opts.ensure?.packages ?? ensureProjectPackages,
-					opts.ensure?.tools ?? ensureProjectTools,
-					opts.ensure?.python ?? ensureProjectPython,
-				];
-				let exitCode = 0;
-				let stderrTail = "";
-				try {
-					for (const step of steps)
-						for (const line of await step(project, "/root")) push(`${line}\n`);
-				} catch (err) {
-					exitCode = 1;
-					stderrTail = tail(
-						`${err instanceof Error ? err.message : String(err)}\n`,
-					);
-				}
+				const { exitCode, stderrTail } = await runBake(project, push);
 				// vm-runner stops the VM right after the sentinel, with no clean shutdown: the
 				// installs must be on the layer disk before it can read the line.
 				await exec(["sync"]);
@@ -498,6 +556,7 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 			() => {},
 		);
 
+	/** PUT /files: unpacks the copy-in tar at /, after refusing unsafe member names. */
 	const putFiles = async (request: Request): Promise<Response> => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-guest-in-"));
 		try {
@@ -562,6 +621,77 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		});
 	};
 
+	/** The /files routes; null falls through when the method does not match. */
+	const handleFiles = async (
+		request: Request,
+		url: URL,
+	): Promise<Response | null> => {
+		if (url.pathname !== "/files") return null;
+		if (request.method === "PUT") return putFiles(request);
+		if (request.method === "GET") return getFiles(url);
+		return null;
+	};
+
+	const handleKill = (): Response => {
+		const running = current;
+		running?.kill();
+		return Response.json({ killed: running !== null });
+	};
+
+	/** A project name the bake may act on, or null. */
+	const bakeProject = (body: unknown): string | null => {
+		const project =
+			typeof body === "object" && body !== null && "project" in body
+				? body.project
+				: undefined;
+		// The name becomes a path under /root/.ottr/workers.
+		if (
+			typeof project !== "string" ||
+			project === "" ||
+			project.includes("/") ||
+			project === ".."
+		)
+			return null;
+		return project;
+	};
+
+	const handleBakeRequest = async (request: Request): Promise<Response> => {
+		let body: unknown;
+		try {
+			body = await request.json();
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		const project = bakeProject(body);
+		if (project === null) return new Response("bad request", { status: 400 });
+		return handleBake(project);
+	};
+
+	const handleRunRequest = async (request: Request): Promise<Response> => {
+		let raw: unknown;
+		try {
+			raw = await request.json();
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		const body = parseRun(raw);
+		if (body === null) return new Response("bad request", { status: 400 });
+		if (current !== null)
+			return new Response("a run is active", { status: 409 });
+		return handleRun(request, body);
+	};
+
+	/** The POST routes; null falls through to the not-found answer. */
+	const handlePost = async (
+		request: Request,
+		url: URL,
+	): Promise<Response | null> => {
+		if (url.pathname === "/kill") return handleKill();
+		if (url.pathname === "/bake") return handleBakeRequest(request);
+		if (url.pathname === "/run") return handleRunRequest(request);
+		return null;
+	};
+
 	return Bun.serve({
 		port: opts.port ?? GUEST_PORT,
 		hostname: "0.0.0.0",
@@ -575,48 +705,11 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				return new Response("ok");
 			if (request.headers.get("x-ottr-guest-token") !== opts.token)
 				return new Response("unauthorized", { status: 401 });
-			if (url.pathname === "/files") {
-				if (request.method === "PUT") return putFiles(request);
-				if (request.method === "GET") return getFiles(url);
-			}
-			if (request.method === "POST" && url.pathname === "/kill") {
-				const running = current;
-				running?.kill();
-				return Response.json({ killed: running !== null });
-			}
-			if (request.method === "POST" && url.pathname === "/bake") {
-				let body: unknown;
-				try {
-					body = await request.json();
-				} catch {
-					return new Response("bad json", { status: 400 });
-				}
-				const project =
-					typeof body === "object" && body !== null && "project" in body
-						? body.project
-						: undefined;
-				// The name becomes a path under /root/.ottr/workers.
-				if (
-					typeof project !== "string" ||
-					project === "" ||
-					project.includes("/") ||
-					project === ".."
-				)
-					return new Response("bad request", { status: 400 });
-				return handleBake(project);
-			}
-			if (request.method === "POST" && url.pathname === "/run") {
-				let raw: unknown;
-				try {
-					raw = await request.json();
-				} catch {
-					return new Response("bad json", { status: 400 });
-				}
-				const body = parseRun(raw);
-				if (body === null) return new Response("bad request", { status: 400 });
-				if (current !== null)
-					return new Response("a run is active", { status: 409 });
-				return handleRun(request, body);
+			const files = await handleFiles(request, url);
+			if (files !== null) return files;
+			if (request.method === "POST") {
+				const posted = await handlePost(request, url);
+				if (posted !== null) return posted;
 			}
 			return new Response("not found", { status: 404 });
 		},

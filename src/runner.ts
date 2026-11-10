@@ -274,6 +274,72 @@ function providerError(message: AnyRec): string | null {
 /** The ask tool by itself or with a mount prefix; `task` and other names merely ending in "ask" do not match. */
 const ASK_TOOL = /(?:^|[./:_-])ask$/;
 
+/** The message_update variants the log renders; everything else is noise. */
+function renderMessageUpdate(e: AnyRec): string {
+	const a = e.assistantMessageEvent;
+	if (typeof a !== "object" || a === null) return "";
+	const ame = a as AnyRec;
+	// Thinking arrives as thinking_start -> thinking_delta* -> thinking_end, right before text_start.
+	if (ame.type === "thinking_start") return "\n⟦thinking⟧ ";
+	if (ame.type === "thinking_end") return "\n";
+	if (ame.type === "thinking_delta")
+		return typeof ame.delta === "string" ? ame.delta : "";
+	return ame.type === "text_delta" && typeof ame.delta === "string"
+		? ame.delta
+		: "";
+}
+
+function renderMessageEnd(e: AnyRec): string {
+	const m = e.message;
+	if (typeof m !== "object" || m === null || (m as AnyRec).role !== "assistant")
+		return "";
+	const error = providerError(m as AnyRec);
+	return error ? `\n! provider: ${error}\n` : "\n";
+}
+
+/** The ask tool's questions, or null when the args carry no usable questions. */
+function renderAsk(args: unknown): string | null {
+	const qs = askQuestions(args);
+	if (qs === null) return null;
+	return `\n▸ ask\n${qs
+		.map(
+			(q) =>
+				`  ? ${q.question}\n${q.options.map((o) => `    • ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n")}`,
+		)
+		.join("\n")}\n`;
+}
+
+function renderToolStart(e: AnyRec): string {
+	const name = e.toolName;
+	if (typeof name !== "string") return "";
+	const args =
+		typeof e.args === "object" && e.args !== null ? (e.args as AnyRec) : {};
+	if (name.endsWith("report_outcome"))
+		return `\n▸ report_outcome: ${String(args.status ?? "?")} — ${String(args.summary ?? "")}\n`;
+	if (ASK_TOOL.test(name)) {
+		const ask = renderAsk(e.args);
+		if (ask !== null) return ask;
+	}
+	const s =
+		typeof args.command === "string"
+			? args.command
+			: typeof e.intent === "string" && e.intent !== ""
+				? e.intent
+				: JSON.stringify(args);
+	const flat = s.replace(/\r?\n/g, " ⏎ ");
+	return `\n▸ ${name}: ${flat.length > 300 ? `${flat.slice(0, 300)}…` : flat}\n`;
+}
+
+function renderToolEnd(e: AnyRec): string {
+	if (e.isError !== true) return "";
+	const result =
+		typeof e.result === "object" && e.result !== null
+			? (e.result as AnyRec)
+			: {};
+	const flat = textParts(result.content).replace(/\r?\n/g, " ⏎ ");
+	return `  ✗ ${flat.length > 500 ? `${flat.slice(0, 500)}…` : flat}\n`;
+}
+
 /** Pure: one omp JSON event -> text appended to the task log. Malformed/unknown -> "". */
 export function renderEvent(ev: unknown): string {
 	if (typeof ev !== "object" || ev === null) return "";
@@ -281,65 +347,14 @@ export function renderEvent(ev: unknown): string {
 	switch (e.type) {
 		case "session":
 			return typeof e.id === "string" ? `[omp session ${e.id}]\n` : "";
-		case "message_update": {
-			const a = e.assistantMessageEvent;
-			if (typeof a !== "object" || a === null) return "";
-			const ame = a as AnyRec;
-			// Thinking arrives as thinking_start -> thinking_delta* -> thinking_end, right before text_start.
-			if (ame.type === "thinking_start") return "\n⟦thinking⟧ ";
-			if (ame.type === "thinking_end") return "\n";
-			if (ame.type === "thinking_delta")
-				return typeof ame.delta === "string" ? ame.delta : "";
-			return ame.type === "text_delta" && typeof ame.delta === "string"
-				? ame.delta
-				: "";
-		}
-		case "message_end": {
-			const m = e.message;
-			if (
-				typeof m !== "object" ||
-				m === null ||
-				(m as AnyRec).role !== "assistant"
-			)
-				return "";
-			const error = providerError(m as AnyRec);
-			return error ? `\n! provider: ${error}\n` : "\n";
-		}
-		case "tool_execution_start": {
-			const name = e.toolName;
-			if (typeof name !== "string") return "";
-			const args =
-				typeof e.args === "object" && e.args !== null ? (e.args as AnyRec) : {};
-			if (name.endsWith("report_outcome"))
-				return `\n▸ report_outcome: ${String(args.status ?? "?")} — ${String(args.summary ?? "")}\n`;
-			if (ASK_TOOL.test(name)) {
-				const qs = askQuestions(e.args);
-				if (qs !== null)
-					return `\n▸ ask\n${qs
-						.map(
-							(q) =>
-								`  ? ${q.question}\n${q.options.map((o) => `    • ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n")}`,
-						)
-						.join("\n")}\n`;
-			}
-			const s =
-				typeof args.command === "string"
-					? args.command
-					: typeof e.intent === "string" && e.intent !== ""
-						? e.intent
-						: JSON.stringify(args);
-			const flat = s.replace(/\r?\n/g, " ⏎ ");
-			return `\n▸ ${name}: ${flat.length > 300 ? `${flat.slice(0, 300)}…` : flat}\n`;
-		}
-		case "tool_execution_end": {
-			if (e.isError !== true) return "";
-			const result =
-				typeof e.result === "object" && e.result !== null
-					? (e.result as AnyRec)
-					: {};
-			const flat = textParts(result.content).replace(/\r?\n/g, " ⏎ ");
-			return `  ✗ ${flat.length > 500 ? `${flat.slice(0, 500)}…` : flat}\n`;
-		}
+		case "message_update":
+			return renderMessageUpdate(e);
+		case "message_end":
+			return renderMessageEnd(e);
+		case "tool_execution_start":
+			return renderToolStart(e);
+		case "tool_execution_end":
+			return renderToolEnd(e);
 		case "agent_end":
 			return "\n";
 		default:
@@ -448,10 +463,8 @@ export function hitUsageLimit(r: RunResult): boolean {
 	);
 }
 
-/** Pure: decide where a task goes after a turn. First matching rule wins.
- * `research` marks a research card: research must not merge, so only the answered-with-commits
- * mapping checks it. */
-export function classify(o: {
+/** The inputs classify reads. */
+interface ClassifyInput {
 	kind: TurnKind;
 	result: RunResult;
 	git: GitFacts;
@@ -473,228 +486,342 @@ export function classify(o: {
 	/** A microVM turn's end-of-run `git status --porcelain` lines (VmOutcome.dirty); null when
 	 * the VM could not report. Undefined for every other run. Only the ready refusal reads it. */
 	vmDirty?: string[] | null;
-}): Next {
-	const { kind, result, git, target } = o;
-	const stage: Next["stage"] =
-		o.grill === true ? "backlog" : kind === "work" ? "in_progress" : "merging";
-	const needs = (reason: string): Next => ({
+}
+
+/** One classify rule: the first non-null result wins. */
+type ClassifyRule = (o: ClassifyInput, stage: Next["stage"]) => Next | null;
+
+const needsAt = (stage: Next["stage"], reason: string): Next => ({
+	stage,
+	state: "needs_you",
+	needsReason: reason,
+});
+
+/** The provision guard outweighs every other rule: a run that left the alate-provisioned
+ * agent layer drifts parks even on a received receipt — the next provision refuses or
+ * overwrites the changed files, and the only fix is a data-repo commit
+ * (docs/specs/turn-provision-guard.md). */
+const provisionRule: ClassifyRule = (o, stage) => {
+	const { result } = o;
+	if (!result.provisionDrift?.length) return null;
+	const shown = result.provisionDrift.slice(0, 4);
+	const more = result.provisionDrift.length - shown.length;
+	return needsAt(
 		stage,
-		state: "needs_you",
-		needsReason: reason,
-	});
+		`A turn changed the alate-provisioned agent layer: ${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}. The next provision refuses or overwrites these files — do not edit the installed copies; change it in agent-data, then reply.`,
+	);
+};
 
-	// The provision guard outweighs every other rule: a run that left the alate-provisioned
-	// agent layer drifted parks even on a received receipt — the next provision refuses or
-	// overwrites the changed files, and the only fix is a data-repo commit
-	// (docs/specs/turn-provision-guard.md).
-	if (result.provisionDrift?.length) {
-		const shown = result.provisionDrift.slice(0, 4);
-		const more = result.provisionDrift.length - shown.length;
-		return needs(
-			`A turn changed the alate-provisioned agent layer: ${shown.join(", ")}${more > 0 ? ` (+${more} more)` : ""}. The next provision refuses or overwrites these files — do not edit the installed copies; change it in agent-data, then reply.`,
-		);
-	}
+const killedRule: ClassifyRule = (o, stage) =>
+	o.result.killed ? needsAt(stage, "Stopped by the tracker.") : null;
 
-	if (result.killed) return needs("Stopped by the tracker.");
+/** One-shot omp runs exit 0 when the agent ends its reply on a pending wait/background call
+ * (nothing is alive to deliver the result and wake it). The session survives, so the corrective
+ * continue re-checks. ponytail: one automatic continue per streak; if the previous turn already ended this
+ * way, a human decides. Count streaks if agents often need a second one. */
+const backgroundWaitRule: ClassifyRule = (o, stage) => {
+	const { result, previousError } = o;
+	if (!(result.exitCode === 0 && !result.sawTerminalEnd)) return null;
+	return previousError?.startsWith(BACKGROUND_WAIT)
+		? needsAt(
+				stage,
+				`${BACKGROUND_WAIT} again; a one-shot omp run exits instead of being woken. Reply "." to let it re-check, or use New session.`,
+			)
+		: {
+				stage,
+				state: "queued",
+				needsReason: `${BACKGROUND_WAIT} - the run exited and the background job died with it; resuming automatically. Cancel to stop it instead.`,
+				pendingPrompt:
+					"Your previous turn ended while a background job ran; the run exits and kills the job. Continue the task and run slow gates in the foreground.",
+			};
+};
 
-	// One-shot omp runs exit 0 when the agent ends its reply on a pending wait/background call
-	// (nothing is alive to deliver the result and wake it). The session survives, so the corrective
-	// continue re-checks. ponytail: one automatic continue per streak; if the previous turn already ended this
-	// way, a human decides. Count streaks if agents often need a second one.
-	if (result.exitCode === 0 && !result.sawTerminalEnd)
-		return o.previousError?.startsWith(BACKGROUND_WAIT)
-			? needs(
-					`${BACKGROUND_WAIT} again; a one-shot omp run exits instead of being woken. Reply "." to let it re-check, or use New session.`,
-				)
-			: {
-					stage,
-					state: "queued",
-					needsReason: `${BACKGROUND_WAIT} - the run exited and the background job died with it; resuming automatically. Cancel to stop it instead.`,
-					pendingPrompt:
-						"Your previous turn ended while a background job ran; the run exits and kills the job. Continue the task and run slow gates in the foreground.",
-				};
+/** A lost worker is not the turn's fault: a fresh worker runs the same reply. Same
+ * one-auto-resume-per-streak pattern as the background-wait rule above. */
+const workerLostRule: ClassifyRule = (o, stage) => {
+	if (o.result.workerLost !== true) return null;
+	return o.previousError?.startsWith(WORKER_LOST)
+		? needsAt(
+				stage,
+				`${WORKER_LOST} again; a fresh worker runs the reply. Cancel to stop it instead.`,
+			)
+		: {
+				stage,
+				state: "queued",
+				needsReason: `${WORKER_LOST} - resuming automatically. Cancel to stop it instead.`,
+				pendingPrompt: ".",
+			};
+};
 
-	// A lost worker is not the turn's fault: a fresh worker runs the same reply. Same
-	// one-auto-resume-per-streak pattern as the background-wait rule above.
-	if (result.workerLost === true)
-		return o.previousError?.startsWith(WORKER_LOST)
-			? needs(
-					`${WORKER_LOST} again; a fresh worker runs the reply. Cancel to stop it instead.`,
-				)
-			: {
-					stage,
-					state: "queued",
-					needsReason: `${WORKER_LOST} - resuming automatically. Cancel to stop it instead.`,
-					pendingPrompt: ".",
-				};
+/** The turn's death context: stderr, then the provider's structured error. */
+function deathContext(o: ClassifyInput): string | null | undefined {
+	return deathLine(o.result.stderrTail) ?? o.result.providerError;
+}
 
-	// omp can crash after report_outcome (e.g. session persistence failing at shutdown):
-	// a received ready/answered/integrated is terminal and decides below; the exit code
-	// must not override finished work. No report, or an ask, and a bad exit stays a failure.
+/** A turn that died before its first event with empty stderr is the provider answering
+ * with an HTTP 400 (e.g. a content filter). With attached images it rejected the
+ * image input: re-attaching the same images would loop forever, so the caller
+ * quarantines the files and this requeues text-only. The text-only retry carries
+ * images 0, so a second failure takes one of the rules below. */
+const providerRejectionRule: ClassifyRule = (o, stage) => {
+	const { result } = o;
 	if (
-		(result.exitCode !== 0 || !result.sawTerminalEnd) &&
-		!(result.outcome !== null && result.outcome.status !== "needs_you")
-	) {
-		// A turn that died before its first event with empty stderr is the provider answering
-		// with an HTTP 400 (e.g. a content filter). With attached images it rejected the
-		// image input: re-attaching the same images would loop forever, so the caller
-		// quarantines the files and this requeues text-only. The text-only retry carries
-		// images 0, so a second failure takes one of the rules below.
-		if (
+		!(
 			result.sessionId === null &&
 			result.outcome === null &&
 			result.stderrTail.trim() === "" &&
 			!result.providerError
-		) {
-			if ((o.images ?? 0) > 0)
-				return {
-					stage,
-					state: "queued",
-					needsReason:
-						"The provider rejected the attached images (the run died before any output). Quarantining them and retrying text-only.",
-					quarantineImages: true,
-				};
-			// Plain text: an HTTP-400 log entry inside this turn's window is the provider
-			// rejecting the prompt's content. No retry can fix the wording; a human rewords.
-			const evidence = o.http400?.();
-			if (evidence)
-				return needs(
-					`The provider rejects this prompt's content - reword the task (evidence: ~/.omp/logs/http-400-requests/${evidence}).`,
-				);
-		}
-		// Prefer stderr, then the provider's structured error, then dispatch context.
-		const last = deathLine(result.stderrTail) ?? result.providerError;
-		// omp restores a resumed session's saved model unless --model is given; a model whose
-		// provider has no sign-in here kills the run. runTurn retries once with the board's
-		// default role. A failure after that retry needs a human.
-		if (o.previousError?.startsWith(MODEL_RESTORE))
-			return needs(
-				`${MODEL_RESTORE}, and the retry with the board's default model role failed too${last ? `: ${last}` : ""}. Sign in to a provider under Settings, set a default model role, or switch the card's model, then reply.`,
-			);
-		const lost = last && /Could not restore model (\S+)/.exec(last)?.[1];
-		if (lost)
-			return {
-				stage,
-				state: "queued",
-				needsReason: `${MODEL_RESTORE} ${lost} (no sign-in for its provider here) - retrying with the board's default model role. Cancel to stop it instead.`,
-			};
-		// The run died at the provider's usage or quota limit: a retry before the reset fails
-		// the same way. One automatic continue per streak (worker-lost's rule): the settle in
-		// turn.ts stamps the provider's reset as holdUntil on the queued card when the provider
-		// reports one, so the continue fires after the reset; without a known reset the retry
-		// starts at once, and this same rule's second death parks for a human.
-		if (hitUsageLimit(result))
-			return o.previousError?.startsWith(QUOTA_LIMIT)
-				? needs(
-						`${QUOTA_LIMIT} again after the automatic continue${last ? `: ${last}` : ""}. Reply after the limit resets, or switch the card's model, then reply.`,
-					)
-				: {
-						stage,
-						state: "queued",
-						needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
-						pendingPrompt: ".",
-					};
-		const ctx = last
-			? `: ${last}`
-			: result.dispatch
-				? ` (dispatch ${result.dispatch}, no stderr)`
-				: "";
-		return needs(
-			`omp exited with code ${result.exitCode ?? "unknown"} before finishing${ctx}.`,
-		);
-	}
-
-	if (result.approvalRefused)
-		return needs(
-			"A tool call needed approval, which tracker runs can't answer. Allow the tool in omp's config or continue in a terminal (see the card).",
-		);
-
-	// The agent asked the user a question via the ask tool and paused: surface it as the "?" state.
-	// If it went on to finish the turn on its own (ready/answered/integrated), the ask is moot.
-	if (
-		result.asked !== null &&
-		(result.outcome === null || result.outcome.status === "needs_you")
-	) {
-		const q = result.asked[0]!.question;
+		)
+	)
+		return null;
+	if ((o.images ?? 0) > 0)
 		return {
 			stage,
-			state: "needs_you",
-			needsReason: `Wants your answer: ${q.length > 160 ? `${q.slice(0, 160)}…` : q}${result.asked.length > 1 ? ` (+${result.asked.length - 1} more)` : ""}`,
-			asked: result.asked,
+			state: "queued",
+			needsReason:
+				"The provider rejected the attached images (the run died before any output). Quarantining them and retrying text-only.",
+			quarantineImages: true,
 		};
-	}
-
-	const oc = result.outcome;
-	// A grill turn never leaves the backlog column: a received ready or answered report marks
-	// the item grilled — parked at idle until the user promotes it. Everything upstream (deaths,
-	// background waits, open asks) keeps the generic flows, now with stage=backlog.
-	if (
-		o.grill === true &&
-		oc !== null &&
-		oc.status !== "needs_you" &&
-		oc.status !== "integrated"
-	)
-		return { stage, state: "idle", needsReason: null };
-	if (oc === null) {
-		// The receipt path can be down (e.g. the tracker extension failed to load) while the turn
-		// itself finished fine. Prove what it completed from git, by the same predicates a receipt
-		// is validated against below; anything unprovable still asks for a human. Turns that
-		// aborted (crash, refusal, pending background job) never reach this branch.
-		// A research card's deliverable is the report file, not a receipt: exit 0 with the report
-		// present settles done. Before the commits rule: research never merges.
-		if (kind === "work" && o.research === true && o.hasReport === true)
-			return { stage: "done", state: "idle", needsReason: null };
-		if (
-			kind === "work" &&
-			o.grill !== true &&
-			git.commitsAhead > 0 &&
-			git.clean
-		)
-			return { stage: "merging", state: "queued", needsReason: null };
-		if (kind === "merge" && git.integrated)
-			return { stage: "done", state: "idle", needsReason: null };
-		return needs("The agent finished without calling report_outcome.");
-	}
-
-	// Only a merge turn may report integrated: merging is the merge turn's job (rebase, gates,
-	// server push). A work turn that integrated by hand is rejected once with the reason; the
-	// reply that resumes the card carries it (rejectedReport), so the agent re-reports ready
-	// and the normal merge turn pushes (AGEN-33 landed without a server push this way).
-	if (oc.status === "integrated") {
-		if (kind === "work") return needs("Work turns do not merge; report ready.");
-		if (git.integrated)
-			return { stage: "done", state: "idle", needsReason: null };
-		return needs(
-			`Reported integrated, but HEAD is not on ${target ?? "the integration target"}.`,
+	// Plain text: an HTTP-400 log entry inside this turn's window is the provider
+	// rejecting the prompt's content. No retry can fix the wording; a human rewords.
+	const evidence = o.http400?.();
+	if (evidence)
+		return needsAt(
+			stage,
+			`The provider rejects this prompt's content - reword the task (evidence: ~/.omp/logs/http-400-requests/${evidence}).`,
 		);
+	return null;
+};
+
+/** omp restores a resumed session's saved model unless --model is given; a model whose
+ * provider has no sign-in here kills the run. runTurn retries once with the board's
+ * default role. A failure after that retry needs a human. */
+const modelRestoreRule: ClassifyRule = (o, stage) => {
+	const last = deathContext(o);
+	if (o.previousError?.startsWith(MODEL_RESTORE))
+		return needsAt(
+			stage,
+			`${MODEL_RESTORE}, and the retry with the board's default model role failed too${last ? `: ${last}` : ""}. Sign in to a provider under Settings, set a default model role, or switch the card's model, then reply.`,
+		);
+	const lost = last && /Could not restore model (\S+)/.exec(last)?.[1];
+	if (lost)
+		return {
+			stage,
+			state: "queued",
+			needsReason: `${MODEL_RESTORE} ${lost} (no sign-in for its provider here) - retrying with the board's default model role. Cancel to stop it instead.`,
+		};
+	return null;
+};
+
+/** The run died at the provider's usage or quota limit: a retry before the reset fails
+ * the same way. One automatic continue per streak (worker-lost's rule): the settle in
+ * turn.ts stamps the provider's reset as holdUntil on the queued card when the provider
+ * reports one, so the continue fires after the reset; without a known reset the retry
+ * starts at once, and this same rule's second death parks for a human. */
+const usageLimitRule: ClassifyRule = (o, stage) => {
+	if (!hitUsageLimit(o.result)) return null;
+	const last = deathContext(o);
+	return o.previousError?.startsWith(QUOTA_LIMIT)
+		? needsAt(
+				stage,
+				`${QUOTA_LIMIT} again after the automatic continue${last ? `: ${last}` : ""}. Reply after the limit resets, or switch the card's model, then reply.`,
+			)
+		: {
+				stage,
+				state: "queued",
+				needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
+				pendingPrompt: ".",
+			};
+};
+
+/** The death block: omp exited without a terminal report; every sub-rule shares the
+ * `last` context for the final generic failure. */
+function deathRule(o: ClassifyInput, stage: Next["stage"]): Next | null {
+	const { result } = o;
+	if (
+		!(
+			(result.exitCode !== 0 || !result.sawTerminalEnd) &&
+			(result.outcome === null || result.outcome.status === "needs_you")
+		)
+	)
+		return null;
+	const reject = providerRejectionRule(o, stage);
+	if (reject !== null) return reject;
+	const restore = modelRestoreRule(o, stage);
+	if (restore !== null) return restore;
+	const usage = usageLimitRule(o, stage);
+	if (usage !== null) return usage;
+	// Prefer stderr, then the provider's structured error, then dispatch context.
+	const last = deathContext(o);
+	const ctx = last
+		? `: ${last}`
+		: result.dispatch
+			? ` (dispatch ${result.dispatch}, no stderr)`
+			: "";
+	return needsAt(
+		stage,
+		`omp exited with code ${result.exitCode ?? "unknown"} before finishing${ctx}.`,
+	);
+}
+
+const approvalRefusedRule: ClassifyRule = (o, stage) =>
+	o.result.approvalRefused
+		? needsAt(
+				stage,
+				"A tool call needed approval, which tracker runs can't answer. Allow the tool in omp's config or continue in a terminal (see the card).",
+			)
+		: null;
+
+/** The agent asked the user a question via the ask tool and paused: surface it as the "?" state.
+ * If it went on to finish the turn on its own (ready/answered/integrated), the ask is moot. */
+const askedRule: ClassifyRule = (o, stage) => {
+	const { result } = o;
+	if (result.asked === null) return null;
+	if (result.outcome !== null && result.outcome.status !== "needs_you")
+		return null;
+	const asked = result.asked;
+	const first = asked[0];
+	if (first === undefined) return null;
+	const q = first.question;
+	return {
+		stage,
+		state: "needs_you",
+		needsReason: `Wants your answer: ${q.length > 160 ? `${q.slice(0, 160)}…` : q}${asked.length > 1 ? ` (+${asked.length - 1} more)` : ""}`,
+		asked,
+	};
+};
+
+/** A grill turn never leaves the backlog column: a received ready or answered report marks
+ * the item grilled — parked at idle until the user promotes it. Everything upstream (deaths,
+ * background waits, open asks) keeps the generic flows, now with stage=backlog. */
+const grillIdleRule: ClassifyRule = (o, stage) => {
+	if (o.grill !== true) return null;
+	const oc = o.result.outcome;
+	if (oc === null) return null;
+	if (oc.status === "needs_you" || oc.status === "integrated") return null;
+	return { stage, state: "idle", needsReason: null };
+};
+
+/** The receipt path can be down (e.g. the tracker extension failed to load) while the turn
+ * itself finished fine. Prove what it completed from git, by the same predicates a receipt
+ * is validated against below; anything unprovable still asks for a human. Turns that
+ * aborted (crash, refusal, pending background job) never reach this branch.
+ * A research card's deliverable is the report file, not a receipt: exit 0 with the report
+ * present settles done. Before the commits rule: research never merges. */
+function receiptFallback(o: ClassifyInput, stage: Next["stage"]): Next {
+	const { kind, git } = o;
+	if (kind === "work" && o.research === true && o.hasReport === true)
+		return { stage: "done", state: "idle", needsReason: null };
+	if (kind === "work" && o.grill !== true && git.commitsAhead > 0 && git.clean)
+		return { stage: "merging", state: "queued", needsReason: null };
+	if (kind === "merge" && git.integrated)
+		return { stage: "done", state: "idle", needsReason: null };
+	return needsAt(stage, "The agent finished without calling report_outcome.");
+}
+
+/** Only a merge turn may report integrated: merging is the merge turn's job (rebase, gates,
+ * server push). A work turn that integrated by hand is rejected once with the reason; the
+ * reply that resumes the card carries it (rejectedReport), so the agent re-reports ready
+ * and the normal merge turn pushes (AGEN-33 landed without a server push this way). */
+const integratedRule: ClassifyRule = (o, stage) => {
+	const { kind, git, target } = o;
+	const oc = o.result.outcome;
+	if (oc === null || oc.status !== "integrated") return null;
+	if (kind === "work")
+		return needsAt(stage, "Work turns do not merge; report ready.");
+	if (git.integrated)
+		return { stage: "done", state: "idle", needsReason: null };
+	return needsAt(
+		stage,
+		`Reported integrated, but HEAD is not on ${target ?? "the integration target"}.`,
+	);
+};
+
+/** A work turn's ready report: mergeable trees queue for merging, a sibling's already-integrated fix settles done, the rest is a ready refusal. */
+function workReadyNext(
+	o: ClassifyInput,
+	stage: Next["stage"],
+	git: GitFacts,
+): Next {
+	if (o.grill !== true && git.commitsAhead > 0 && git.clean)
+		return { stage: "merging", state: "queued", needsReason: null };
+	// A sibling card already merged the same fix: nothing left to merge, the ready report is complete.
+	if (git.commitsAhead === 0 && git.integrated)
+		return { stage: "done", state: "idle", needsReason: null };
+	return needsAt(
+		stage,
+		`Reported ready, but git shows ${git.commitsAhead} commit(s) ahead of the base${git.clean ? "" : vmDirtyText(o.vmDirty)}.`,
+	);
+}
+
+/** A work turn's answered report: no commits settle done, an integrable branch still merges (never research), the rest is a refusal. */
+function workAnsweredNext(
+	o: ClassifyInput,
+	stage: Next["stage"],
+	git: GitFacts,
+): Next {
+	if (git.commitsAhead === 0)
+		return { stage: "done", state: "idle", needsReason: null };
+	// The agent misfiled answered while landable commits sit on the branch; git proves work to
+	// integrate. Research cards must not merge, so only non-research turns take this path.
+	if (git.clean && o.research !== true)
+		return { stage: "merging", state: "queued", needsReason: null };
+	return needsAt(
+		stage,
+		`Reported answered, but the branch has ${git.commitsAhead} commit(s) that were never integrated.`,
+	);
+}
+
+const workOutcomeRule: ClassifyRule = (o, stage) => {
+	if (o.kind !== "work") return null;
+	const oc = o.result.outcome;
+	if (oc === null) return null;
+	if (oc.status === "ready") return workReadyNext(o, stage, o.git);
+	if (oc.status === "answered") return workAnsweredNext(o, stage, o.git);
+	return null;
+};
+
+const mergeOutcomeRule: ClassifyRule = (o, stage) => {
+	if (o.kind === "work") return null;
+	const oc = o.result.outcome;
+	if (oc === null) return null;
+	if (oc.status === "ready" || oc.status === "answered")
+		return needsAt(stage, `Unexpected outcome "${oc.status}" in a merge turn.`);
+	return null;
+};
+
+/** First matching rule wins. */
+const CLASSIFY_RULES: ClassifyRule[] = [
+	provisionRule,
+	killedRule,
+	backgroundWaitRule,
+	workerLostRule,
+	deathRule,
+	approvalRefusedRule,
+	askedRule,
+	grillIdleRule,
+	integratedRule,
+	workOutcomeRule,
+	mergeOutcomeRule,
+];
+
+/** Pure: decide where a task goes after a turn. First matching rule wins.
+ * `research` marks a research card: research must not merge, so only the answered-with-commits
+ * mapping checks it. */
+export function classify(o: ClassifyInput): Next {
+	const stage: Next["stage"] =
+		o.grill === true
+			? "backlog"
+			: o.kind === "work"
+				? "in_progress"
+				: "merging";
+	for (const rule of CLASSIFY_RULES) {
+		const next = rule(o, stage);
+		if (next !== null) return next;
 	}
-
-	if (kind === "work") {
-		if (oc.status === "ready") {
-			if (o.grill !== true && git.commitsAhead > 0 && git.clean)
-				return { stage: "merging", state: "queued", needsReason: null };
-			// A sibling card already merged the same fix: nothing left to merge, the ready report is complete.
-			if (git.commitsAhead === 0 && git.integrated)
-				return { stage: "done", state: "idle", needsReason: null };
-			return needs(
-				`Reported ready, but git shows ${git.commitsAhead} commit(s) ahead of the base${git.clean ? "" : vmDirtyText(o.vmDirty)}.`,
-			);
-		}
-		if (oc.status === "answered") {
-			if (git.commitsAhead === 0)
-				return { stage: "done", state: "idle", needsReason: null };
-			// The agent misfiled answered while landable commits sit on the branch; git proves work to
-			// integrate. Research cards must not merge, so only non-research turns take this path.
-			if (git.clean && o.research !== true)
-				return { stage: "merging", state: "queued", needsReason: null };
-			return needs(
-				`Reported answered, but the branch has ${git.commitsAhead} commit(s) that were never integrated.`,
-			);
-		}
-	} else if (oc.status === "ready" || oc.status === "answered")
-		return needs(`Unexpected outcome "${oc.status}" in a merge turn.`);
-
-	return needs(oc.question?.trim() ? oc.question.trim() : oc.summary);
+	const oc = o.result.outcome;
+	if (oc === null) return receiptFallback(o, stage);
+	return needsAt(stage, oc.question?.trim() ? oc.question.trim() : oc.summary);
 }
 
 /** The ready refusal's tail for an unclean tree: a microVM's tree is gone after the run, so
@@ -774,6 +901,165 @@ export function newEventState(): EventState {
 	};
 }
 
+function applyMessageStart(state: EventState, e: AnyRec): void {
+	const m = e.message;
+	if (
+		typeof m === "object" &&
+		m !== null &&
+		(m as AnyRec).role === "assistant"
+	) {
+		const rec = m as AnyRec;
+		if (typeof rec.model === "string" && rec.model !== "") {
+			state.model =
+				typeof rec.provider === "string" && rec.provider !== ""
+					? `${rec.provider}/${rec.model}`
+					: rec.model;
+		}
+	}
+}
+
+function applyMessageEnd(state: EventState, e: AnyRec, meter: boolean): void {
+	const m = e.message;
+	if (
+		typeof m === "object" &&
+		m !== null &&
+		(m as AnyRec).role === "assistant"
+	) {
+		state.providerError = providerError(m as AnyRec);
+		if (meter) addUsage(state, (m as AnyRec).usage);
+	}
+}
+
+function applyAsk(state: EventState, e: AnyRec): void {
+	const qs = askQuestions(e.args);
+	// The extension allows one ask per turn and refuses later ones: the first usable ask
+	// is the durable state, a refused second ask must not replace it on the card.
+	if (qs !== null && state.asked === null) state.asked = qs;
+}
+
+/** The proposal's summary fields; null when a required field is missing or empty. */
+function proposedSummary(
+	args: AnyRec,
+): NonNullable<EventState["proposed"]>["summary"] {
+	const part = (key: string): string | null => {
+		if (typeof args[key] !== "string") return null;
+		const value = (args[key] as string).trim();
+		if (value === "") return null;
+		return value.length > 400 ? `${value.slice(0, 399)}…` : value;
+	};
+	const whatChanges = part("whatChanges");
+	const why = part("why");
+	const gain = part("gain");
+	const check = part("check");
+	if (whatChanges === null || why === null || gain === null || check === null)
+		return null;
+	// Summary policy: whatChanges/why/gain/check are required, risk optional and defaults
+	// to "none found"; each field is capped at 400 characters (slice to 399 + "…").
+	return { whatChanges, why, gain, risk: part("risk") ?? "none found", check };
+}
+
+function applyProposeTask(state: EventState, e: AnyRec): void {
+	const args =
+		typeof e.args === "object" && e.args !== null ? (e.args as AnyRec) : {};
+	if (typeof args.prompt !== "string" || args.prompt === "") return;
+	const call: RecordedFinding = {
+		prompt: args.prompt,
+		model: typeof args.model === "string" && args.model ? args.model : null,
+		rank:
+			typeof args.rank === "number" &&
+			Number.isInteger(args.rank) &&
+			args.rank >= 1
+				? args.rank
+				: null,
+		security:
+			args.security === "critical" || args.security === "high"
+				? args.security
+				: null,
+	};
+	state.recorded.push(call);
+	// Retro semantics: the first valid call is the proposal (the extension refuses a second).
+	if (state.proposed === null)
+		state.proposed = {
+			prompt: call.prompt,
+			model: call.model,
+			summary: proposedSummary(args),
+		};
+}
+
+function applyReportStart(state: EventState, e: AnyRec): void {
+	const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
+	if (id !== null)
+		state.remembered.set(
+			id,
+			typeof e.args === "object" && e.args !== null ? e.args : {},
+		);
+}
+
+/** The report_outcome outcome an xd:// device's end event carried, or null. omp can mount
+ * report_outcome as an xd:// device: the agent then calls `write xd://report_outcome`,
+ * and only the end event's details name the tool and carry its parsed args. */
+function xdevOutcome(result: AnyRec): Outcome | null {
+	const details =
+		typeof result.details === "object" && result.details !== null
+			? (result.details as AnyRec)
+			: {};
+	const xdev =
+		typeof details.xdev === "object" && details.xdev !== null
+			? (details.xdev as AnyRec)
+			: {};
+	if (
+		typeof xdev.tool === "string" &&
+		xdev.tool.endsWith("report_outcome") &&
+		isOutcome(xdev.args)
+	)
+		return xdev.args;
+	return null;
+}
+
+function applyToolEnd(state: EventState, e: AnyRec): void {
+	const result =
+		typeof e.result === "object" && e.result !== null
+			? (e.result as AnyRec)
+			: {};
+	// Refusal can hit any tool, not just report_outcome: flag whenever an errored
+	// end carries the approval text.
+	if (
+		e.isError === true &&
+		textParts(result.content).includes(APPROVAL_REFUSAL)
+	)
+		state.approvalRefused = true;
+	const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
+	if (id !== null && state.remembered.has(id)) {
+		const args = state.remembered.get(id);
+		state.remembered.delete(id);
+		if (e.isError === false && isOutcome(args)) state.outcome = args; // latest valid wins
+	}
+	if (e.isError === false) {
+		const xd = xdevOutcome(result);
+		if (xd !== null) state.outcome = xd;
+	}
+}
+
+function applyAgentEnd(state: EventState, e: AnyRec): void {
+	state.sawTerminalEnd = true;
+	const messages = Array.isArray(e.messages) ? e.messages : [];
+	let lastAssistant: AnyRec | undefined;
+	for (const m of messages) {
+		const rec = m as AnyRec;
+		if (typeof rec === "object" && rec !== null && rec.role === "assistant")
+			lastAssistant = rec;
+	}
+	state.finalText = lastAssistant ? textParts(lastAssistant.content) : "";
+}
+
+/** tool_execution_start: the ask, propose_task and report_outcome bookkeeping. */
+function applyToolStart(state: EventState, e: AnyRec): void {
+	if (typeof e.toolName !== "string") return;
+	if (ASK_TOOL.test(e.toolName)) applyAsk(state, e);
+	else if (e.toolName === "propose_task") applyProposeTask(state, e);
+	else if (e.toolName.endsWith("report_outcome")) applyReportStart(state, e);
+}
+
 /** Pure: apply one omp JSON event to state. Returns the session id when it is first seen. */
 export function applyEvent(
 	state: EventState,
@@ -783,167 +1069,30 @@ export function applyEvent(
 ): { sessionStarted?: string } {
 	if (typeof ev !== "object" || ev === null) return {};
 	const e = ev as AnyRec;
-	if (
-		e.type === "session" &&
-		typeof e.id === "string" &&
-		state.sessionId === null
-	) {
-		state.sessionId = e.id;
-		return { sessionStarted: e.id };
-	}
-	if (e.type === "message_start") {
-		const m = e.message;
-		if (
-			typeof m === "object" &&
-			m !== null &&
-			(m as AnyRec).role === "assistant"
-		) {
-			const rec = m as AnyRec;
-			if (typeof rec.model === "string" && rec.model !== "") {
-				state.model =
-					typeof rec.provider === "string" && rec.provider !== ""
-						? `${rec.provider}/${rec.model}`
-						: rec.model;
-			}
+	switch (e.type) {
+		case "session": {
+			if (typeof e.id !== "string" || state.sessionId !== null) return {};
+			state.sessionId = e.id;
+			return { sessionStarted: e.id };
 		}
-		return {};
+		case "message_start":
+			applyMessageStart(state, e);
+			return {};
+		case "message_end":
+			applyMessageEnd(state, e, meter);
+			return {};
+		case "tool_execution_start":
+			applyToolStart(state, e);
+			return {};
+		case "tool_execution_end":
+			applyToolEnd(state, e);
+			return {};
+		case "agent_end":
+			if (e.isTerminal !== false) applyAgentEnd(state, e);
+			return {};
+		default:
+			return {};
 	}
-	if (e.type === "message_end") {
-		const m = e.message;
-		if (
-			typeof m === "object" &&
-			m !== null &&
-			(m as AnyRec).role === "assistant"
-		) {
-			state.providerError = providerError(m as AnyRec);
-			if (meter) addUsage(state, (m as AnyRec).usage);
-		}
-		return {};
-	}
-	if (
-		e.type === "tool_execution_start" &&
-		typeof e.toolName === "string" &&
-		ASK_TOOL.test(e.toolName)
-	) {
-		const qs = askQuestions(e.args);
-		// The extension allows one ask per turn and refuses later ones: the first usable ask
-		// is the durable state, a refused second ask must not replace it on the card.
-		if (qs !== null && state.asked === null) state.asked = qs;
-		return {};
-	}
-	if (
-		e.type === "tool_execution_start" &&
-		typeof e.toolName === "string" &&
-		e.toolName === "propose_task"
-	) {
-		const args =
-			typeof e.args === "object" && e.args !== null ? (e.args as AnyRec) : {};
-		if (typeof args.prompt === "string" && args.prompt !== "") {
-			const call: RecordedFinding = {
-				prompt: args.prompt,
-				model: typeof args.model === "string" && args.model ? args.model : null,
-				rank:
-					typeof args.rank === "number" &&
-					Number.isInteger(args.rank) &&
-					args.rank >= 1
-						? args.rank
-						: null,
-				security:
-					args.security === "critical" || args.security === "high"
-						? args.security
-						: null,
-			};
-			state.recorded.push(call);
-			// Retro semantics: the first valid call is the proposal (the extension refuses a second).
-			// Summary policy: whatChanges/why/gain/check are required, risk optional and defaults
-			// to "none found"; each field is capped at 400 characters (slice to 399 + "…").
-			if (state.proposed === null) {
-				const part = (key: string): string | null => {
-					if (typeof args[key] !== "string") return null;
-					const value = (args[key] as string).trim();
-					if (value === "") return null;
-					return value.length > 400 ? value.slice(0, 399) + "…" : value;
-				};
-				const whatChanges = part("whatChanges");
-				const why = part("why");
-				const gain = part("gain");
-				const check = part("check");
-				const risk = part("risk") ?? "none found";
-				const summary =
-					whatChanges !== null &&
-					why !== null &&
-					gain !== null &&
-					check !== null
-						? { whatChanges, why, gain, risk, check }
-						: null;
-				state.proposed = { prompt: call.prompt, model: call.model, summary };
-			}
-		}
-		return {};
-	}
-	if (
-		e.type === "tool_execution_start" &&
-		typeof e.toolName === "string" &&
-		e.toolName.endsWith("report_outcome")
-	) {
-		const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
-		if (id !== null)
-			state.remembered.set(
-				id,
-				typeof e.args === "object" && e.args !== null ? e.args : {},
-			);
-		return {};
-	}
-	if (e.type === "tool_execution_end") {
-		const result =
-			typeof e.result === "object" && e.result !== null
-				? (e.result as AnyRec)
-				: {};
-		// Refusal can hit any tool, not just report_outcome: flag whenever an errored
-		// end carries the approval text.
-		if (
-			e.isError === true &&
-			textParts(result.content).includes(APPROVAL_REFUSAL)
-		)
-			state.approvalRefused = true;
-		const id = typeof e.toolCallId === "string" ? e.toolCallId : null;
-		if (id !== null && state.remembered.has(id)) {
-			const args = state.remembered.get(id);
-			state.remembered.delete(id);
-			if (e.isError === false && isOutcome(args)) state.outcome = args; // latest valid wins
-		}
-		// omp can mount report_outcome as an xd:// device: the agent then calls `write xd://report_outcome`,
-		// and only the end event's details name the tool and carry its parsed args.
-		const details =
-			typeof result.details === "object" && result.details !== null
-				? (result.details as AnyRec)
-				: {};
-		const xdev =
-			typeof details.xdev === "object" && details.xdev !== null
-				? (details.xdev as AnyRec)
-				: {};
-		if (
-			e.isError === false &&
-			typeof xdev.tool === "string" &&
-			xdev.tool.endsWith("report_outcome") &&
-			isOutcome(xdev.args)
-		) {
-			state.outcome = xdev.args;
-		}
-		return {};
-	}
-	if (e.type === "agent_end" && e.isTerminal !== false) {
-		state.sawTerminalEnd = true;
-		const messages = Array.isArray(e.messages) ? e.messages : [];
-		let lastAssistant: AnyRec | undefined;
-		for (const m of messages) {
-			const rec = m as AnyRec;
-			if (typeof rec === "object" && rec !== null && rec.role === "assistant")
-				lastAssistant = rec;
-		}
-		state.finalText = lastAssistant ? textParts(lastAssistant.content) : "";
-	}
-	return {};
 }
 
 /** A token count or cost omp reported; anything missing, negative or not finite counts 0. */
@@ -1038,6 +1187,44 @@ export interface RunSink {
 	): RunResult;
 }
 
+/** One complete stdout line: a progress event updates the card, anything else renders into
+ * the log and advances the event state (session, interim usage). */
+function handleEventLine(
+	raw: string,
+	o: {
+		onSession?: (sessionId: string) => void;
+		/** A progress event (stryker.ts): never logged; null text clears the card's progress. */
+		onProgress?: (text: string | null) => void;
+		/** Hosted metering on: sum assistant usage into state.usage; off leaves it null. */
+		meter?: boolean;
+		/** Hosted mode only (needs `meter`): interim usage of the active run. */
+		onUsage?: (usage: TokenUsage, model: string | null) => void;
+	},
+	es: EventState,
+	log: { write(text: string): void },
+): void {
+	const line = raw.replace(/\r$/, "");
+	if (!line.trim()) return;
+	let ev: unknown;
+	try {
+		ev = JSON.parse(line);
+	} catch {
+		log.write(`${line}\n`);
+		return;
+	}
+	const e = typeof ev === "object" && ev !== null ? (ev as AnyRec) : null;
+	if (e?.type === PROGRESS_EVENT) {
+		o.onProgress?.(typeof e.text === "string" ? e.text : null);
+		return;
+	}
+	log.write(renderEvent(ev));
+	const before = es.usage;
+	const { sessionStarted } = applyEvent(es, ev, o.meter === true);
+	if (sessionStarted !== undefined) o.onSession?.(sessionStarted);
+	if (es.usage !== null && !sameUsage(before, es.usage))
+		o.onUsage?.({ ...es.usage }, es.model);
+}
+
 export function createRunSink(o: {
 	logPath: string;
 	/** Anchor for the log write (src/confine.ts). */
@@ -1099,28 +1286,7 @@ export function createRunSink(o: {
 	const liveSecrets = () => [...runSecrets, ...gitSecrets()];
 	const log = redactingWriter(appendLog, liveSecrets);
 
-	const handleLine = (raw: string): void => {
-		const line = raw.replace(/\r$/, "");
-		if (!line.trim()) return;
-		let ev: unknown;
-		try {
-			ev = JSON.parse(line);
-		} catch {
-			log.write(`${line}\n`);
-			return;
-		}
-		const e = typeof ev === "object" && ev !== null ? (ev as AnyRec) : null;
-		if (e?.type === PROGRESS_EVENT) {
-			o.onProgress?.(typeof e.text === "string" ? e.text : null);
-			return;
-		}
-		log.write(renderEvent(ev));
-		const before = es.usage;
-		const { sessionStarted } = applyEvent(es, ev, o.meter === true);
-		if (sessionStarted !== undefined) o.onSession?.(sessionStarted);
-		if (es.usage !== null && !sameUsage(before, es.usage))
-			o.onUsage?.({ ...es.usage }, es.model);
-	};
+	const handleLine = (raw: string): void => handleEventLine(raw, o, es, log);
 
 	let partial = "";
 	let stderrPartial = "";
@@ -1215,6 +1381,30 @@ export const WORKER_BUSY = "every microVM was busy";
  */
 const VM_DENIED_ENV = /^(ANTHROPIC_|OPENAI_|GH_|GITHUB_|HINDSIGHT_)/;
 
+/** True when the env entry must not reach a microVM guest: denied names, lent names, git
+ * auth names, secret values, the guest's own PATH/home/agent dir, the board-config pointer
+ * the guest mounts no file for (OTTR-693), and OTTR_ names outside the turn flags. */
+function vmEnvDenied(
+	k: string,
+	v: string | undefined,
+	secrets: Set<string>,
+	lent: Set<string>,
+): boolean {
+	if (typeof v !== "string") return true;
+	if (VM_DENIED_ENV.test(k) || lent.has(k) || GIT_AUTH_ENV_NAME.test(k))
+		return true;
+	if (secrets.has(v)) return true;
+	// The guest owns its PATH, home and agent dir; the board's are meaningless inside.
+	if (k === "PATH" || k === "HOME" || k === "PI_CODING_AGENT_DIR") return true;
+	// OTTR-693: the guest mounts no board-config, so the board's GIT_CONFIG_GLOBAL
+	// pointer would name a missing file there; git would then skip the global scope
+	// entirely and never see an identity the VM image ships in its own home.
+	if (k === "GIT_CONFIG_GLOBAL") return true;
+	if (k.startsWith("OTTR_") && !/^OTTR_(RETRO|REVIEW|TRENDING)$/.test(k))
+		return true;
+	return false;
+}
+
 /**
  * The microVM turn's env, built as an allowlist instead of from process.env: the run's own
  * values (env.txt values, the retro/review/trending flags) minus every denied name and every
@@ -1234,21 +1424,8 @@ export function vmEnv(o: {
 	const secrets = new Set(o.secrets ?? []);
 	const lent = new Set(Object.values(LENT_ENV));
 	const env: Record<string, string> = {};
-	for (const [k, v] of Object.entries(o.env ?? {})) {
-		if (typeof v !== "string") continue;
-		if (VM_DENIED_ENV.test(k) || lent.has(k) || GIT_AUTH_ENV_NAME.test(k))
-			continue;
-		if (secrets.has(v)) continue;
-		// The guest owns its PATH, home and agent dir; the board's are meaningless inside.
-		if (k === "PATH" || k === "HOME" || k === "PI_CODING_AGENT_DIR") continue;
-		// OTTR-693: the guest mounts no board-config, so the board's GIT_CONFIG_GLOBAL
-		// pointer would name a missing file there; git would then skip the global scope
-		// entirely and never see an identity the VM image ships in its own home.
-		if (k === "GIT_CONFIG_GLOBAL") continue;
-		if (k.startsWith("OTTR_") && !/^OTTR_(RETRO|REVIEW|TRENDING)$/.test(k))
-			continue;
-		env[k] = v;
-	}
+	for (const [k, v] of Object.entries(o.env ?? {}))
+		if (!vmEnvDenied(k, v, secrets, lent)) env[k] = v;
 	if (o.sessionName) env.OTTR_SESSION_NAME = o.sessionName;
 	if (o.board && !o.stripBoard) {
 		env.OTTR_BOARD_URL = o.boardUrl;
@@ -1293,7 +1470,8 @@ function sessionPaths(sessionDir: string, resumeId: string | null): string[] {
 	}
 }
 
-export function startRun(o: {
+/** The inputs startRun reads. */
+interface StartOptions {
 	cwd: string;
 	prompt: string;
 	sessionDir: string;
@@ -1371,43 +1549,50 @@ export function startRun(o: {
 	rulesAtStart?: () => readonly string[];
 	/** Hosted mode only: interim usage of the active run (createRunSink). */
 	onUsage?: (usage: TokenUsage, model: string | null) => void;
-}): RunHandle {
-	// Issued before the sink exists so the log redacts the raw token like any other secret.
-	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
-	const vmToken = o.vm
-		? o.vm.tokens.issue({ ...o.vm.grant, base: o.vm.base })
-		: null;
-	const sink = createRunSink({
-		logPath: o.logPath,
-		dataRoot: o.dataRoot,
-		onLog: o.onLog,
-		onSession: o.onSession,
-		onProgress: o.onProgress,
-		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
-		meter: o.meter,
-		onUsage: o.onUsage,
-	});
+}
 
-	// Context a no-stderr death reports (classify folds it into the failure reason): how the
-	// run was dispatched, how much it was asked to do, where, under which pid, for how long.
-	const memoryConfig =
-		o.memoryConfigPath !== undefined
-			? o.memoryConfigPath
-			: o.vm
-				? // vm-runner copies in only paths under /data/<project>/ (the dir holding the
-					// sessions dir), so a VM turn's overlay lives there, not at the shared root.
-					ensureMemoryOverlay({
-						...process.env,
-						OTTR_DATA_DIR: dirname(o.sessionDir),
-					})
-				: ensureMemoryOverlay();
-	const args = buildOmpArgs({ ...o, memoryConfig });
-	const startedAt = Date.now();
+/** Shared state the local, worker and microVM dispatch paths read. */
+interface RunStart {
+	o: StartOptions;
+	sink: RunSink;
+	args: string[];
+	memoryConfig: string | null;
+	startedAt: number;
+	/** Shared-state overrides a pinned run carries on top of its dispatch's base env. */
+	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null;
+	/** The layer dir the VM gets as layerDir (null when the run is unpinned). */
+	layerDir: string | null;
+	layerId: string | null;
+	unregisterLayer: () => void;
+	identityEnv: Record<string, string>;
+}
 
-	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
-	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
-	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
-	const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
+/** Context a no-stderr death reports (classify folds it into the failure reason): how the
+ * run was dispatched, how much it was asked to do, where, under which pid, for how long. */
+function resolveMemoryConfig(o: StartOptions): string | null {
+	if (o.memoryConfigPath !== undefined) return o.memoryConfigPath;
+	if (o.vm)
+		// vm-runner copies in only paths under /data/<project>/ (the dir holding the
+		// sessions dir), so a VM turn's overlay lives there, not at the shared root.
+		return ensureMemoryOverlay({
+			...process.env,
+			OTTR_DATA_DIR: dirname(o.sessionDir),
+		});
+	return ensureMemoryOverlay();
+}
+
+/** Pin the agent layer once per call, before any spawn: the env carries the resolved layer
+ * directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
+ * runs resolve the shared home (alate provisions it), the board's own runs the board home. */
+function resolveLayerPin(
+	layerHome: string,
+	sink: RunSink,
+): {
+	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null;
+	layerDir: string | null;
+	layerId: string | null;
+	unregisterLayer: () => void;
+} {
 	const pin = pinnedAgentLayer(layerHome);
 	if (!pin.ok && pin.reason !== "none")
 		sink.logMark(
@@ -1420,235 +1605,280 @@ export function startRun(o: {
 		removeLayerUse(layerHome, pin.layer.id);
 	};
 	if (pin.ok) addLayerUse(layerHome, pin.layer.id);
-	/** Shared-state overrides a pinned run carries on top of its dispatch's base env. */
-	const layerEnv = pin.ok
-		? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
-		: null;
+	return {
+		layerEnv: pin.ok
+			? { HOME: pin.layer.dir, PI_CODING_AGENT_DIR: pin.agentDir }
+			: null,
+		layerDir: pin.ok ? pin.layer.dir : null,
+		layerId: pin.ok ? pin.layer.id : null,
+		unregisterLayer,
+	};
+}
 
-	// OTTR-693: the ident env beats every git config scope, so the probe must mirror the
-	// turn's git exactly: same worktree (repo-local config and includeIf rules count), same
-	// HOME (the layer pin moves it), same GIT_CONFIG_GLOBAL. Worker dispatch strips the
-	// pointer below: the worker mounts no board-config, so a pinned path would name a
-	// missing file there and hide the shared home's ~/.gitconfig — the exact "no author
-	// identity" failure this fixes. A VM guest owns its home and seeds the clone's own
-	// config (src/vmGuest.ts; vmEnv drops the pointer too), so only an explicit Settings
-	// identity rides the VM env, never the automatic default.
+/** OTTR-693: the ident env beats every git config scope, so the probe must mirror the
+ * turn's git exactly: same worktree (repo-local config and includeIf rules count), same
+ * HOME (the layer pin moves it), same GIT_CONFIG_GLOBAL. Worker dispatch strips the
+ * pointer below: the worker mounts no board-config, so a pinned path would name a
+ * missing file there and hide the shared home's ~/.gitconfig — the exact "no author
+ * identity" failure this fixes. A VM guest owns its home and seeds the clone's own
+ * config (src/vmGuest.ts; vmEnv drops the pointer too), so only an explicit Settings
+ * identity rides the VM env, never the automatic default. */
+function resolveIdentityEnv(
+	o: StartOptions,
+	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
+): Record<string, string> {
 	const identBaseEnv = withoutGitAuth({ ...process.env, ...o.env });
-	let identityEnv: Record<string, string>;
 	if (o.vm) {
-		identityEnv =
-			o.commitIdentity != null
-				? commitIdentityEnv(o.commitIdentity, { name: false, email: false })
-				: {};
-	} else {
-		const identity = o.commitIdentity ?? {
-			name: DEFAULT_COMMIT_NAME,
-			email: DEFAULT_COMMIT_EMAIL,
-		};
-		const probe = (o.gitProbe ?? probeGitIdent)({
-			cwd: o.cwd,
-			home: layerEnv?.HOME ?? process.env.HOME ?? null,
-			gitConfigGlobal:
-				o.worker != null ? null : (identBaseEnv.GIT_CONFIG_GLOBAL ?? null),
-			baseEnv: identBaseEnv,
-		});
-		identityEnv = commitIdentityEnv(identity, probe);
+		return o.commitIdentity != null
+			? commitIdentityEnv(o.commitIdentity, { name: false, email: false })
+			: {};
 	}
+	const identity = o.commitIdentity ?? {
+		name: DEFAULT_COMMIT_NAME,
+		email: DEFAULT_COMMIT_EMAIL,
+	};
+	const probe = (o.gitProbe ?? probeGitIdent)({
+		cwd: o.cwd,
+		home: layerEnv?.HOME ?? process.env.HOME ?? null,
+		gitConfigGlobal:
+			o.worker != null ? null : (identBaseEnv.GIT_CONFIG_GLOBAL ?? null),
+		baseEnv: identBaseEnv,
+	});
+	return commitIdentityEnv(identity, probe);
+}
 
+/** The local dispatch: omp spawns on this host and streams its events into the sink. */
+function startLocalRun(s: RunStart): RunHandle {
+	const {
+		o,
+		sink,
+		args,
+		startedAt,
+		layerEnv,
+		identityEnv,
+		layerId,
+		unregisterLayer,
+	} = s;
 	// Every local child gets an explicit env so worker credentials never reach a turn (R3-6/D6).
-	const startLocal = (): RunHandle => {
-		const launch: RunLauncher = o.launcher ?? spawn;
-		// The provision guard's untracked scan compares against the rules dir as it
-		// stood before omp started (docs/specs/turn-provision-guard.md).
-		const rulesAtStart = o.rulesAtStart ? o.rulesAtStart() : undefined;
-		const base = boardOmpEnv(
-			withoutGitAuth({
-				...process.env,
-				...o.env,
-				...(o.stripGithubToken
-					? { GH_TOKEN: undefined, GITHUB_TOKEN: undefined }
-					: {}),
+	const launch: RunLauncher = o.launcher ?? spawn;
+	// The provision guard's untracked scan compares against the rules dir as it
+	// stood before omp started (docs/specs/turn-provision-guard.md).
+	const rulesAtStart = o.rulesAtStart ? o.rulesAtStart() : undefined;
+	const base = boardOmpEnv(
+		withoutGitAuth({
+			...process.env,
+			...o.env,
+			...(o.stripGithubToken
+				? { GH_TOKEN: undefined, GITHUB_TOKEN: undefined }
+				: {}),
+		}),
+	);
+	if (layerEnv !== null) Object.assign(base, layerEnv);
+	Object.assign(base, identityEnv);
+	const child = launch("omp", args, {
+		cwd: o.cwd,
+		stdio: ["pipe", "pipe", "pipe"],
+		windowsHide: true,
+		env: childEnv({
+			sessionName: o.sessionName,
+			board: o.board ?? null,
+			// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
+			// replacing it would strip PATH and the provider auth the child needs. HOME moves
+			// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
+			base,
+			stripBoard: o.stripBoard,
+		}),
+	});
+
+	let killed = false;
+	const stopWatch = watchProgress(child.pid, sink.line);
+	child.stdout?.on("data", (chunk: Buffer) =>
+		sink.stdout(chunk.toString("utf8")),
+	);
+	child.stderr?.on("data", (chunk: Buffer) =>
+		sink.stderr(chunk.toString("utf8")),
+	);
+
+	// omp may die before reading stdin; a bare write would then emit an
+	// unhandled EPIPE 'error' and crash the tracker.
+	child.stdin?.on("error", () => {});
+	child.stdin?.write(o.prompt, "utf8");
+	child.stdin?.end();
+
+	let settled = false;
+	const { promise: done, resolve: resolveDone } =
+		Promise.withResolvers<RunResult>();
+	const settle = (code: number | null): void => {
+		if (settled) return;
+		settled = true;
+		unregisterLayer();
+		// The provision guard fires after the run's writes are final; drift fails the
+		// run through classify (docs/specs/turn-provision-guard.md).
+		const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
+		resolveDone(
+			sink.result({
+				exitCode: code,
+				killed,
+				stderrTail: sink.tail(),
+				ranOn: `board (${hostname()})`,
+				dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
+				...(drift.length ? { provisionDrift: [...drift] } : {}),
 			}),
 		);
-		if (layerEnv !== null) Object.assign(base, layerEnv);
-		Object.assign(base, identityEnv);
-		const child = launch("omp", args, {
-			cwd: o.cwd,
-			stdio: ["pipe", "pipe", "pipe"],
-			windowsHide: true,
-			env: childEnv({
-				sessionName: o.sessionName,
-				board: o.board ?? null,
-				// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
-				// replacing it would strip PATH and the provider auth the child needs. HOME moves
-				// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
-				base,
-				stripBoard: o.stripBoard,
-			}),
-		});
-
-		let killed = false;
-		const stopWatch = watchProgress(child.pid, sink.line);
-		child.stdout?.on("data", (chunk: Buffer) =>
-			sink.stdout(chunk.toString("utf8")),
-		);
-		child.stderr?.on("data", (chunk: Buffer) =>
-			sink.stderr(chunk.toString("utf8")),
-		);
-
-		// omp may die before reading stdin; a bare write would then emit an
-		// unhandled EPIPE 'error' and crash the tracker.
-		child.stdin?.on("error", () => {});
-		child.stdin?.write(o.prompt, "utf8");
-		child.stdin?.end();
-
-		let settled = false;
-		const { promise: done, resolve: resolveDone } =
-			Promise.withResolvers<RunResult>();
-		const settle = (code: number | null): void => {
-			if (settled) return;
-			settled = true;
-			unregisterLayer();
-			// The provision guard fires after the run's writes are final; drift fails the
-			// run through classify (docs/specs/turn-provision-guard.md).
-			const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
-			resolveDone(
-				sink.result({
-					exitCode: code,
-					killed,
-					stderrTail: sink.tail(),
-					ranOn: `board (${hostname()})`,
-					dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
-					...(drift.length ? { provisionDrift: [...drift] } : {}),
-				}),
-			);
-		};
-
-		child.on("error", (err: Error) => {
-			sink.childError(err.message);
-			if (child.pid === undefined) settle(null); // failed to spawn (e.g. ENOENT)
-		});
-
-		child.on("close", (code) => {
-			stopWatch();
-			sink.flush();
-			settle(code ?? null);
-		});
-
-		return {
-			pid: child.pid ?? null,
-			done,
-			kill: () => {
-				killed = true;
-				if (child.pid !== undefined) platform.killTree(child.pid);
-				return Promise.resolve();
-			},
-			layerId: pin.ok ? pin.layer.id : null,
-		};
 	};
 
-	if (o.vm && vmToken !== null) {
-		const vm = o.vm;
-		const token = vmToken;
-		let stored: { provider: string; active: boolean }[] | null = null;
-		if (vm.providers === undefined)
-			try {
-				stored = signIns(join(agentDir(), "agent.db"));
-			} catch (err) {
-				// An unreadable store still routes the turn model's provider and the env keys.
-				sink.logMark(
-					`! microVM: cannot read the board's sign-ins (${err instanceof Error ? err.message : err})\n`,
-				);
-			}
-		const spec: VmSpec = {
-			project: vm.grant.project,
-			taskId: vm.grant.taskId,
-			branch: vm.grant.branch,
-			base: vm.base,
-			boardUrl: vm.boardUrl,
-			token,
-			providers: vm.providers ?? vmProviders(o.model, stored),
-			hindsight:
-				vm.hindsight ??
-				memoryBackendFromEnv(process.env).backend === "hindsight",
-			layerDir: pin.ok ? pin.layer.dir : null,
-			copyIn: [
-				...sessionPaths(o.sessionDir, o.resumeId),
-				...(o.images ?? []),
-				...(memoryConfig ? [memoryConfig] : []),
-			],
-			copyOut: [o.sessionDir],
-		};
-		const vmHandle = runWorker(
-			{
-				id: crypto.randomUUID(),
-				argv: args,
-				cwd: o.cwd,
-				stdin: o.prompt,
-				env: vmEnv({
-					env: { ...o.env, ...identityEnv },
-					secrets: o.secrets,
-					sessionName: o.sessionName,
-					board: o.board ?? null,
-					stripBoard: o.stripBoard,
-					boardUrl: vm.boardUrl,
-					token,
-					layerEnv,
-				}),
-				vm: spec,
-			},
-			vm.target,
-			sink,
-		);
-		const vmDispatch = (): string =>
-			`vm ${vmHandle.url}, argv ${args.length}, cwd ${basename(o.cwd)}, ${Math.round((Date.now() - startedAt) / 1000)}s`;
-		const settle = (): void => {
-			unregisterLayer();
-			// The run is over (any outcome): the VM must not push or reach /llm any more. A
-			// board restart never gets here, so a detached run keeps its token for the re-bind.
-			vm.tokens.revoke(token);
-		};
-		return {
-			pid: null,
-			url: vmHandle.url,
-			done: vmHandle.done
-				.then((r) => {
-					settle();
-					return { ...r, dispatch: vmDispatch() };
-				})
-				.catch((err) => {
-					settle();
-					if (err instanceof WorkerBusyError) {
-						// Nothing ran: runTurn puts the card back to queued as it was.
-						sink.logMark(`- ${WORKER_BUSY}: ${err.message}\n`);
-						return sink.result({
-							exitCode: null,
-							killed: false,
-							stderrTail: sink.tail(),
-							workerBusy: true,
-							dispatch: vmDispatch(),
-						});
-					}
-					if (!(err instanceof WorkerConnectError)) throw err;
-					// Same fail-closed rule as a classic worker: never the classic pool, never
-					// the server. Classify requeues a lost VM once, then parks it.
-					sink.logMark(`! microVM dispatch failed: ${err.message}\n`);
+	child.on("error", (err: Error) => {
+		sink.childError(err.message);
+		if (child.pid === undefined) settle(null); // failed to spawn (e.g. ENOENT)
+	});
+
+	child.on("close", (code) => {
+		stopWatch();
+		sink.flush();
+		settle(code ?? null);
+	});
+
+	return {
+		pid: child.pid ?? null,
+		done,
+		kill: () => {
+			killed = true;
+			if (child.pid !== undefined) platform.killTree(child.pid);
+			return Promise.resolve();
+		},
+		layerId,
+	};
+}
+
+/** The microVM dispatch: vm-runner runs the turn in a fresh VM; busy and connect failures
+ * settle as workerBusy / workerLost results instead of throwing. */
+function startVmRun(
+	s: RunStart,
+	vm: NonNullable<StartOptions["vm"]>,
+	token: string,
+): RunHandle {
+	const {
+		o,
+		sink,
+		args,
+		memoryConfig,
+		startedAt,
+		layerEnv,
+		identityEnv,
+		layerDir,
+		layerId,
+		unregisterLayer,
+	} = s;
+	let stored: { provider: string; active: boolean }[] | null = null;
+	if (vm.providers === undefined)
+		try {
+			stored = signIns(join(agentDir(), "agent.db"));
+		} catch (err) {
+			// An unreadable store still routes the turn model's provider and the env keys.
+			sink.logMark(
+				`! microVM: cannot read the board's sign-ins (${err instanceof Error ? err.message : err})\n`,
+			);
+		}
+	const spec: VmSpec = {
+		project: vm.grant.project,
+		taskId: vm.grant.taskId,
+		branch: vm.grant.branch,
+		base: vm.base,
+		boardUrl: vm.boardUrl,
+		token,
+		providers: vm.providers ?? vmProviders(o.model, stored),
+		hindsight:
+			vm.hindsight ?? memoryBackendFromEnv(process.env).backend === "hindsight",
+		layerDir,
+		copyIn: [
+			...sessionPaths(o.sessionDir, o.resumeId),
+			...(o.images ?? []),
+			...(memoryConfig ? [memoryConfig] : []),
+		],
+		copyOut: [o.sessionDir],
+	};
+	const vmHandle = runWorker(
+		{
+			id: crypto.randomUUID(),
+			argv: args,
+			cwd: o.cwd,
+			stdin: o.prompt,
+			env: vmEnv({
+				env: { ...o.env, ...identityEnv },
+				secrets: o.secrets,
+				sessionName: o.sessionName,
+				board: o.board ?? null,
+				stripBoard: o.stripBoard,
+				boardUrl: vm.boardUrl,
+				token,
+				layerEnv,
+			}),
+			vm: spec,
+		},
+		vm.target,
+		sink,
+	);
+	const vmDispatch = (): string =>
+		`vm ${vmHandle.url}, argv ${args.length}, cwd ${basename(o.cwd)}, ${Math.round((Date.now() - startedAt) / 1000)}s`;
+	const settle = (): void => {
+		unregisterLayer();
+		// The run is over (any outcome): the VM must not push or reach /llm any more. A
+		// board restart never gets here, so a detached run keeps its token for the re-bind.
+		vm.tokens.revoke(token);
+	};
+	return {
+		pid: null,
+		url: vmHandle.url,
+		done: vmHandle.done
+			.then((r) => {
+				settle();
+				return { ...r, dispatch: vmDispatch() };
+			})
+			.catch((err) => {
+				settle();
+				if (err instanceof WorkerBusyError) {
+					// Nothing ran: runTurn puts the card back to queued as it was.
+					sink.logMark(`- ${WORKER_BUSY}: ${err.message}\n`);
 					return sink.result({
 						exitCode: null,
 						killed: false,
-						stderrTail: `${sink.tail()}\nworker dispatch failed: ${err.message}`,
-						workerLost: true,
+						stderrTail: sink.tail(),
+						workerBusy: true,
 						dispatch: vmDispatch(),
 					});
-				}),
-			kill: async () => vmHandle.kill(),
-			accepted: vmHandle.accepted,
-			layerId: pin.ok ? pin.layer.id : null,
-		};
-	}
+				}
+				if (!(err instanceof WorkerConnectError)) throw err;
+				// Same fail-closed rule as a classic worker: never the classic pool, never
+				// the server. Classify requeues a lost VM once, then parks it.
+				sink.logMark(`! microVM dispatch failed: ${err.message}\n`);
+				return sink.result({
+					exitCode: null,
+					killed: false,
+					stderrTail: `${sink.tail()}\nworker dispatch failed: ${err.message}`,
+					workerLost: true,
+					dispatch: vmDispatch(),
+				});
+			}),
+		kill: async () => vmHandle.kill(),
+		accepted: vmHandle.accepted,
+		layerId,
+	};
+}
 
-	if (!o.worker) return startLocal();
-
+/** The classic worker dispatch: the worker container runs omp; a connect failure settles as
+ * a lost worker, never a local fallback. */
+function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
+	const {
+		o,
+		sink,
+		args,
+		memoryConfig,
+		startedAt,
+		layerEnv,
+		identityEnv,
+		layerId,
+		unregisterLayer,
+	} = s;
 	// The worker runs omp itself; the tracker env is forwarded so a pinned session
 	// name and the board coordinates still reach the extension, but the worker's own
 	// credentials do not (childEnv strips them), and neither does the board's GitHub
@@ -1690,7 +1920,7 @@ export function startRun(o: {
 			stdin: o.prompt,
 			env,
 		},
-		o.worker,
+		worker,
 		sink,
 	);
 	const dispatch = (): string =>
@@ -1724,8 +1954,47 @@ export function startRun(o: {
 				});
 			}),
 		kill: async () => workerHandle.kill(),
-		layerId: pin.ok ? pin.layer.id : null,
+		layerId,
 	};
+}
+
+export function startRun(o: StartOptions): RunHandle {
+	// Issued before the sink exists so the log redacts the raw token like any other secret.
+	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
+	const vmToken = o.vm
+		? o.vm.tokens.issue({ ...o.vm.grant, base: o.vm.base })
+		: null;
+	const sink = createRunSink({
+		logPath: o.logPath,
+		dataRoot: o.dataRoot,
+		onLog: o.onLog,
+		onSession: o.onSession,
+		onProgress: o.onProgress,
+		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
+		meter: o.meter,
+		onUsage: o.onUsage,
+	});
+	const memoryConfig = resolveMemoryConfig(o);
+	const args = buildOmpArgs({ ...o, memoryConfig });
+	const startedAt = Date.now();
+	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
+	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
+	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
+	const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
+	const layerPin = resolveLayerPin(layerHome, sink);
+	const identityEnv = resolveIdentityEnv(o, layerPin.layerEnv);
+	const s: RunStart = {
+		o,
+		sink,
+		args,
+		memoryConfig,
+		startedAt,
+		...layerPin,
+		identityEnv,
+	};
+	if (o.vm && vmToken !== null) return startVmRun(s, o.vm, vmToken);
+	if (!o.worker) return startLocalRun(s);
+	return startWorkerRun(s, o.worker);
 }
 
 /** Worker pool from the tracker env; null when no worker is configured. */

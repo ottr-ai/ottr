@@ -357,6 +357,22 @@ describe("decodePng, gray16 and visuallyIdentical", () => {
 		return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
 	};
 
+	/** The filtered byte for one pixel under the PNG filter `filter`. */
+	const filteredByte = (
+		cur: number,
+		left: number,
+		above: number,
+		aboveLeft: number,
+		filter: number,
+	): number => {
+		let v = cur;
+		if (filter === 1) v = cur - left;
+		else if (filter === 2) v = cur - above;
+		else if (filter === 3) v = cur - ((left + above) >> 1);
+		else if (filter === 4) v = cur - paeth(left, above, aboveLeft);
+		return v & 0xff;
+	};
+
 	/** Encodes `pixels` (w*h*channels bytes, row-major) as a PNG with the given per-row filter type. */
 	const buildPngPixels = (
 		w: number,
@@ -377,12 +393,13 @@ describe("decodePng, gray16 and visuallyIdentical", () => {
 				const left = x >= channels ? at(y, x - channels) : 0;
 				const above = at(y - 1, x);
 				const aboveLeft = x >= channels ? at(y - 1, x - channels) : 0;
-				let v = cur;
-				if (filter === 1) v = cur - left;
-				else if (filter === 2) v = cur - above;
-				else if (filter === 3) v = cur - ((left + above) >> 1);
-				else if (filter === 4) v = cur - paeth(left, above, aboveLeft);
-				raw[y * (stride + 1) + 1 + x] = v & 0xff;
+				raw[y * (stride + 1) + 1 + x] = filteredByte(
+					cur,
+					left,
+					above,
+					aboveLeft,
+					filter,
+				);
 			}
 		}
 		return Buffer.concat([

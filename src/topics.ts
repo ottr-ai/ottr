@@ -38,10 +38,10 @@ export function assignTopics(
 			for (const term of new Set(tokens(text)))
 				weights.set(term, (weights.get(term) ?? 0) + weight);
 		}
-		return weights;
+		return { row, weights };
 	});
 	const df = new Map<string, number>();
-	for (const weights of rowTerms)
+	for (const { weights } of rowTerms)
 		for (const [term, weight] of weights)
 			df.set(term, (df.get(term) ?? 0) + weight);
 	const rank = new Map(
@@ -51,10 +51,10 @@ export function assignTopics(
 			.map(([term], i) => [term, i] as const),
 	);
 	const out = new Map<string, string | null>();
-	for (const [i, row] of rows.entries()) {
+	for (const { row, weights } of rowTerms) {
 		let best: string | null = null;
 		let bestRank = Infinity;
-		for (const term of rowTerms[i]!.keys()) {
+		for (const term of weights.keys()) {
 			const r = rank.get(term);
 			if (r !== undefined && r < bestRank) {
 				best = term;
@@ -72,11 +72,12 @@ export function groupTopics<T extends { topic: string | null }>(
 ): { key: string; label: string; tasks: T[] }[] {
 	const byKey = new Map<string, { key: string; label: string; tasks: T[] }>();
 	for (const t of tasks) {
-		const key = t.topic?.trim().toLowerCase() ?? "";
+		const label = t.topic?.trim() ?? "";
+		const key = label.toLowerCase();
 		if (key === "") continue;
 		let section = byKey.get(key);
 		if (section === undefined) {
-			section = { key, label: t.topic!.trim(), tasks: [] };
+			section = { key, label, tasks: [] };
 			byKey.set(key, section);
 		}
 		section.tasks.push(t);

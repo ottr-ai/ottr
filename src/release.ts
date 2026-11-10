@@ -98,6 +98,75 @@ function droppedCommits(
 	return dropped;
 }
 
+/** The semver bump the parsed commits ask for: breaking lifts the major (or the minor before
+ * 1.0), a feat lifts the minor, everything else the patch. */
+function bumpVersion(
+	m: RegExpMatchArray,
+	parsed: (ConventionalCommit | null)[],
+): string {
+	let [x = 0, y = 0, z = 0] = m.slice(1).map(Number);
+	if (parsed.some((c) => c?.breaking)) {
+		if (x >= 1) {
+			x++;
+			y = 0;
+			z = 0;
+		} else {
+			y++;
+			z = 0;
+		}
+	} else if (parsed.some((c) => c?.type === "feat")) {
+		y++;
+		z = 0;
+	} else z++;
+	return `v${x}.${y}.${z}`;
+}
+
+/** The notes heading a commit's bullet lands under: parsed types get their own, the rest Changes. */
+function noteSection(c: ConventionalCommit | null): string {
+	return c === null
+		? "## Changes"
+		: c.type === "feat"
+			? "## New features"
+			: c.type === "fix"
+				? "## Bug fixes"
+				: "## Changes";
+}
+
+/** One bullet per listed commit, in commit order; unlisted types only when breaking; dedupe. */
+function buildNotes(
+	commits: { subject: string; body: string }[],
+	parsed: (ConventionalCommit | null)[],
+): { notes: string; releasable: boolean } {
+	const sections: Record<string, string[]> = {
+		"## New features": [],
+		"## Bug fixes": [],
+		"## Changes": [],
+	};
+	const seen = new Set<string>();
+	for (const [i, commit] of commits.entries()) {
+		const c = parsed[i] ?? null;
+		let text: string;
+		if (c === null) text = upperFirst(commit.subject.trim());
+		else if (!LISTED[c.type] && !c.breaking) continue;
+		else text = (c.scope ? `${c.scope}: ` : "") + upperFirst(c.description);
+		if (c?.breaking) text = `**Breaking:** ${text}`;
+		if (seen.has(text)) continue;
+		seen.add(text);
+		const section = noteSection(c);
+		const list = sections[section] ?? [];
+		list.push(text);
+		sections[section] = list;
+	}
+	const notes = Object.entries(sections)
+		.filter(([, bullets]) => bullets.length > 0)
+		.map(
+			([title, bullets]) =>
+				`${title}\n\n${bullets.map((b) => `- ${b}`).join("\n")}`,
+		)
+		.join("\n\n");
+	return { notes, releasable: seen.size > 0 };
+}
+
 export function computeRelease(
 	from: string | null,
 	all: { sha?: string; subject: string; body: string }[],
@@ -114,57 +183,9 @@ export function computeRelease(
 	const dropped = droppedCommits(all);
 	const commits = all.filter((_, i) => !dropped.has(i));
 	const parsed = commits.map((c) => parseCommit(c.subject, c.body));
-	let [x = 0, y = 0, z = 0] = m.slice(1).map(Number);
-	if (parsed.some((c) => c?.breaking)) {
-		if (x >= 1) {
-			x++;
-			y = 0;
-			z = 0;
-		} else {
-			y++;
-			z = 0;
-		}
-	} else if (parsed.some((c) => c?.type === "feat")) {
-		y++;
-		z = 0;
-	} else z++;
-
-	// One bullet per listed commit, in commit order; unlisted types only when breaking; dedupe.
-	const sections: Record<string, string[]> = {
-		"## New features": [],
-		"## Bug fixes": [],
-		"## Changes": [],
-	};
-	const seen = new Set<string>();
-	for (const [i, commit] of commits.entries()) {
-		const c = parsed[i] ?? null;
-		let text: string;
-		if (c === null) text = upperFirst(commit.subject.trim());
-		else if (!LISTED[c.type] && !c.breaking) continue;
-		else text = (c.scope ? `${c.scope}: ` : "") + upperFirst(c.description);
-		if (c?.breaking) text = `**Breaking:** ${text}`;
-		if (seen.has(text)) continue;
-		seen.add(text);
-		const section =
-			c === null
-				? "## Changes"
-				: c.type === "feat"
-					? "## New features"
-					: c.type === "fix"
-						? "## Bug fixes"
-						: "## Changes";
-		const list = sections[section] ?? [];
-		list.push(text);
-		sections[section] = list;
-	}
-	const notes = Object.entries(sections)
-		.filter(([, bullets]) => bullets.length > 0)
-		.map(
-			([title, bullets]) =>
-				`${title}\n\n${bullets.map((b) => `- ${b}`).join("\n")}`,
-		)
-		.join("\n\n");
-	return { version: `v${x}.${y}.${z}`, notes, releasable: seen.size > 0 };
+	const version = bumpVersion(m, parsed);
+	const { notes, releasable } = buildNotes(commits, parsed);
+	return { version, notes, releasable };
 }
 
 /** Highest strictly-semantic `vX.Y.Z` tag among lines. */
@@ -207,18 +228,11 @@ function timeoutText(ms: number): string {
 	return `timed out after ${ms / 1000}s`;
 }
 
-/**
- * Latest `vX.Y.Z` tag of the repo's public ghcr.io image (the "owner/name" image, lowercased),
- * with its package page. Anonymous registry pull (the v2 API), so private or absent images
- * come back null. timeoutMs: per-fetch probe ceiling; tests inject a short one.
- */
-export async function latestImage(
-	repo: string,
-	timeoutMs: number = GHCR_FETCH_TIMEOUT_MS,
-): Promise<LatestImage | null> {
-	const [owner, name] = repo.split("/");
-	if (owner === undefined || name === undefined) return null;
-	const image = `${owner}/${name}`.toLowerCase();
+/** The anonymous pull token of the image; undefined when ghcr answers without one. */
+async function ghcrToken(
+	image: string,
+	timeoutMs: number,
+): Promise<string | undefined> {
 	const tokenRes = await fetch(
 		`https://ghcr.io/token?scope=repository:${image}:pull&service=ghcr.io`,
 		{ signal: AbortSignal.timeout(timeoutMs) },
@@ -228,22 +242,30 @@ export async function latestImage(
 		return null;
 	});
 	// ghcr's token endpoint: { "token": "..." }; anything else means no public pull.
-	let tokenBody: unknown;
 	try {
-		tokenBody = tokenRes?.ok ? await tokenRes.json() : undefined;
+		const tokenBody = tokenRes?.ok ? await tokenRes.json() : undefined;
+		return typeof tokenBody === "object" &&
+			tokenBody !== null &&
+			"token" in tokenBody &&
+			typeof tokenBody.token === "string"
+			? tokenBody.token
+			: undefined;
 	} catch (e: unknown) {
 		if (isTimeout(e))
 			throw new Error(`ghcr token request ${timeoutText(timeoutMs)}`);
 		throw e;
 	}
-	const token =
-		typeof tokenBody === "object" &&
-		tokenBody !== null &&
-		"token" in tokenBody &&
-		typeof tokenBody.token === "string"
-			? tokenBody.token
-			: undefined;
-	if (token === undefined) return null;
+}
+
+/**
+ * The image's tag list; an empty list on every "no chip" answer — the 404 of an absent
+ * image, the 401/403 of a private one, and any redirect off ghcr.io.
+ */
+async function ghcrTags(
+	image: string,
+	token: string,
+	timeoutMs: number,
+): Promise<string[]> {
 	// n=1000: ghcr pages at 100 tags oldest-first, so a bare call loses the newest tags.
 	// ponytail: >1000-tag images truncate; follow Link headers if one ever shows up.
 	// redirect: "manual": the bearer must never follow a redirect off ghcr.io;
@@ -258,22 +280,37 @@ export async function latestImage(
 		return null;
 	});
 	// 404 without an image, 401/403 for private ones; both mean "no chip".
-	if (!tagsRes?.ok) return null;
-	let tagsBody: unknown;
+	if (!tagsRes?.ok) return [];
 	try {
-		tagsBody = await tagsRes.json();
+		const tagsBody = await tagsRes.json();
+		return typeof tagsBody === "object" &&
+			tagsBody !== null &&
+			"tags" in tagsBody &&
+			Array.isArray(tagsBody.tags)
+			? tagsBody.tags
+			: [];
 	} catch (e: unknown) {
 		if (isTimeout(e))
 			throw new Error(`ghcr tags request ${timeoutText(timeoutMs)}`);
 		throw e;
 	}
-	const tags =
-		typeof tagsBody === "object" &&
-		tagsBody !== null &&
-		"tags" in tagsBody &&
-		Array.isArray(tagsBody.tags)
-			? tagsBody.tags
-			: [];
+}
+
+/**
+ * Latest `vX.Y.Z` tag of the repo's public ghcr.io image (the "owner/name" image, lowercased),
+ * with its package page. Anonymous registry pull (the v2 API), so private or absent images
+ * come back null. timeoutMs: per-fetch probe ceiling; tests inject a short one.
+ */
+export async function latestImage(
+	repo: string,
+	timeoutMs: number = GHCR_FETCH_TIMEOUT_MS,
+): Promise<LatestImage | null> {
+	const [owner, name] = repo.split("/");
+	if (owner === undefined || name === undefined) return null;
+	const image = `${owner}/${name}`.toLowerCase();
+	const token = await ghcrToken(image, timeoutMs);
+	if (token === undefined) return null;
+	const tags = await ghcrTags(image, token, timeoutMs);
 	const tag = highestTag(tags);
 	return tag === null
 		? null
@@ -395,6 +432,30 @@ export async function releaseChip(o: {
 	};
 }
 
+/** The task fields includedTasks reads. */
+type IncludableTask = Pick<
+	Task,
+	| "id"
+	| "title"
+	| "stage"
+	| "cancelledAt"
+	| "releaseVersion"
+	| "doneAt"
+	| "commits"
+>;
+
+/** Done, not cancelled, not yet in a release, and merged at a known time. */
+function isUnreleasedDone(t: IncludableTask): t is IncludableTask & {
+	doneAt: number;
+} {
+	return (
+		t.stage === "done" &&
+		t.cancelledAt === null &&
+		t.releaseVersion === null &&
+		t.doneAt !== null
+	);
+}
+
 /**
  * Done tasks whose work is in the next release: merged after `since` (the last release tag's commit
  * time; 0 before the first release). Cards that moved the target by zero commits (question-only or
@@ -402,34 +463,18 @@ export async function releaseChip(o: {
  * task rather than silently hiding it.
  */
 export function includedTasks(
-	tasks: Pick<
-		Task,
-		| "id"
-		| "title"
-		| "stage"
-		| "cancelledAt"
-		| "releaseVersion"
-		| "doneAt"
-		| "commits"
-	>[],
+	tasks: IncludableTask[],
 	since: number,
 ): { id: string; title: string }[] {
 	const done = tasks
-		.filter(
-			(t) =>
-				t.stage === "done" &&
-				t.cancelledAt === null &&
-				t.releaseVersion === null &&
-				t.doneAt !== null,
-		)
-		.sort((a, b) => a.doneAt! - b.doneAt!);
+		.filter(isUnreleasedDone)
+		.sort((a, b) => a.doneAt - b.doneAt);
 	// The last task merged before `since` saw the target at count(from), so its counter is the
 	// delta baseline; from there each task's delta is its own work (merges are serialized).
-	let prev: number =
-		done.filter((t) => t.doneAt! <= since).at(-1)?.commits ?? 0;
+	let prev: number = done.filter((t) => t.doneAt <= since).at(-1)?.commits ?? 0;
 	const out: { id: string; title: string }[] = [];
 	for (const t of done) {
-		if (t.doneAt! <= since) continue;
+		if (t.doneAt <= since) continue;
 		if (t.commits === null || t.commits > prev)
 			out.push({ id: t.id, title: t.title });
 		if (t.commits !== null) prev = t.commits;
@@ -466,6 +511,62 @@ export function releaseBlocked(
 	return null;
 }
 
+/** The commit the release reads at, and why it is not on the target, else null. */
+async function resolveSha(
+	mainPath: string,
+	target: string,
+	wanted: string,
+): Promise<{ sha: string; blocked: string | null }> {
+	const v = await git(
+		["rev-parse", "--verify", "--quiet", `${wanted}^{commit}`],
+		mainPath,
+	);
+	if (v.code !== 0)
+		return {
+			sha: wanted,
+			blocked: `Commit ${wanted.slice(0, 7)} is not on ${target}.`,
+		};
+	const sha = v.stdout.trim();
+	const anc = await git(["merge-base", "--is-ancestor", sha, target], mainPath);
+	return {
+		sha,
+		blocked:
+			anc.code !== 0 ? `Commit ${sha.slice(0, 7)} is not on ${target}.` : null,
+	};
+}
+
+/** The commits the release notes cover: count placeholders before the first release, full
+ * bodies since `from` after it. */
+async function collectCommits(
+	mainPath: string,
+	from: string | null,
+	sha: string,
+): Promise<{ sha?: string; subject: string; body: string }[]> {
+	if (from === null) {
+		const count = await git(
+			["rev-list", "--count", "--no-merges", sha],
+			mainPath,
+		);
+		// First release: only the count is needed (notes are fixed), so don't read every body.
+		return Array.from({ length: Number(count.stdout.trim()) || 0 }, () => ({
+			subject: "",
+			body: "",
+		}));
+	}
+	const log = await git(
+		["log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", `${from}..${sha}`],
+		mainPath,
+	);
+	return log.stdout
+		.split("\x1e")
+		.map((r) => r.trim())
+		.filter(Boolean)
+		.map((r) => {
+			const [hash = "", subject = "", body = ""] = r.split("\x1f");
+			return { sha: hash, subject, body };
+		});
+}
+
 export async function planRelease(o: {
 	mainPath: string;
 	target: string;
@@ -482,60 +583,16 @@ export async function planRelease(o: {
 		(await checkPinnedRemote(o.mainPath, o.originUrl)) === null
 	)
 		await git(["fetch", "--tags", o.originUrl], o.mainPath);
-	let sha: string;
-	let blocked: string | null = null;
-	const v = await git(
-		["rev-parse", "--verify", "--quiet", `${o.sha}^{commit}`],
+	const { sha, blocked: offTarget } = await resolveSha(
 		o.mainPath,
+		o.target,
+		o.sha,
 	);
-	if (v.code === 0) {
-		sha = v.stdout.trim();
-		const anc = await git(
-			["merge-base", "--is-ancestor", sha, o.target],
-			o.mainPath,
-		);
-		if (anc.code !== 0)
-			blocked = `Commit ${sha.slice(0, 7)} is not on ${o.target}.`;
-	} else {
-		sha = o.sha;
-		blocked = `Commit ${o.sha.slice(0, 7)} is not on ${o.target}.`;
-	}
-
 	const tags = await git(["tag", "--list", "v*", "--merged", sha], o.mainPath);
 	const from = highestTag(tags.stdout.split("\n"));
-	const count =
-		from === null
-			? await git(["rev-list", "--count", "--no-merges", sha], o.mainPath)
-			: await git(
-					["rev-list", "--count", "--no-merges", `${from}..${sha}`],
-					o.mainPath,
-				);
-	// First release: only the count is needed (notes are fixed), so don't read every body.
-	const commits =
-		from === null
-			? Array.from({ length: Number(count.stdout.trim()) || 0 }, () => ({
-					subject: "",
-					body: "",
-				}))
-			: (
-					await git(
-						[
-							"log",
-							"--no-merges",
-							"--format=%H%x1f%s%x1f%b%x1e",
-							`${from}..${sha}`,
-						],
-						o.mainPath,
-					)
-				).stdout
-					.split("\x1e")
-					.map((r) => r.trim())
-					.filter(Boolean)
-					.map((r) => {
-						const [hash = "", subject = "", body = ""] = r.split("\x1f");
-						return { sha: hash, subject, body };
-					});
+	const commits = await collectCommits(o.mainPath, from, sha);
 	const { version, notes, releasable } = computeRelease(from, commits);
+	let blocked = offTarget;
 	if (blocked === null) {
 		if (!releasable)
 			blocked =
@@ -699,6 +756,95 @@ export function lateNotes(notes: string, marked: LateCommitInfo[]): string {
 	return [notes.trim(), body].filter(Boolean).join("\n\n");
 }
 
+/** Creates the release tag, or verifies it already sits at `sha`; returns the progress part. */
+async function tagReleasePart(
+	o: {
+		mainPath: string;
+		version: string;
+		sha: string;
+		archReview?: { delta: number } | null;
+	},
+	marked: LateCommitInfo[],
+): Promise<string> {
+	// Every step is idempotent so a failed publish can be retried by replying to the release card.
+	const cur = await git(
+		["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}^{commit}`],
+		o.mainPath,
+	);
+	if (cur.code === 0) {
+		const at = cur.stdout.trim();
+		if (at !== o.sha)
+			throw new Error(
+				`tag ${o.version} already exists at ${at.slice(0, 7)}, not ${o.sha.slice(0, 7)}`,
+			);
+		return `tag ${o.version} already at ${o.sha.slice(0, 7)}`;
+	}
+	const message = o.archReview
+		? `${o.version}\n\narch-review: ${o.archReview.delta}`
+		: o.version;
+	const t = await git(
+		["tag", "-a", o.version, "-m", message, o.sha],
+		o.mainPath,
+	);
+	if (t.code !== 0)
+		throw new Error(`git tag ${o.version} failed: ${t.stderr.trim()}`);
+	return `tagged ${o.version} at ${o.sha.slice(0, 7)}${marked.length > 0 ? ` (late fixes: ${marked.length})` : ""}`;
+}
+
+/** Pushes the tag to the pinned origin when the repo has one; "pushed" as the progress part. */
+async function pushReleaseTag(o: {
+	mainPath: string;
+	originUrl: string | null;
+	version: string;
+}): Promise<string> {
+	if (!(await hasOrigin(o.mainPath))) return "";
+	// R5-1: the push names the pinned origin URL, never the remote name a work turn can
+	// re-point (the named repo's hooks would run here). No pin: fail loudly, never skip.
+	if (o.originUrl === null)
+		throw new Error(
+			"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
+		);
+	const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
+	if (guard !== null) throw new Error(guard);
+	const p = await git(
+		["push", o.originUrl, `refs/tags/${o.version}`],
+		o.mainPath,
+	);
+	if (p.code !== 0)
+		throw new Error(`git push ${o.version} failed: ${p.stderr.trim()}`);
+	return "pushed";
+}
+
+/** Creates the GitHub release, or reports it exists; the release page as the progress part. */
+async function ghReleasePart(
+	o: { github: string | null; version: string; notes: string },
+	gh: (args: string[]) => Promise<GhReply>,
+): Promise<string> {
+	if (o.github === null) return "";
+	const repo = ownerRepo(o.github);
+	if (repo === null)
+		throw new Error(`cannot read owner/name from GitHub remote ${o.github}`);
+	if ((await gh(["release", "view", o.version, "--repo", repo])).code === 0)
+		return `GitHub release ${o.version} already exists`;
+	const c = await gh([
+		"release",
+		"create",
+		o.version,
+		"--repo",
+		repo,
+		"--title",
+		o.version,
+		"--notes",
+		o.notes,
+		"--verify-tag",
+	]);
+	if (c.code !== 0)
+		throw new Error(
+			`gh release create ${o.version} failed: ${c.stderr.trim()}`,
+		);
+	return `GitHub release ${githubHost().webBase}/${repo}/releases/tag/${o.version}`;
+}
+
 export async function publishRelease(o: {
 	mainPath: string;
 	/** The commit the review saw. */
@@ -717,7 +863,6 @@ export async function publishRelease(o: {
 	gh?: typeof runGh;
 }): Promise<string> {
 	const gh = o.gh ?? runGh;
-	const parts: string[] = [];
 	// The release waits for its review's fixes, and the merge hold keeps every other card off the
 	// target, so the commits after `reviewed` are those fixes: the tag holds them, the notes list
 	// them. The findings' mergeHeads anchor the attribution; a commit pushed outside the board
@@ -738,77 +883,13 @@ export async function publishRelease(o: {
 	);
 	if (marked === null) throw new Error("git log for the late fixes failed");
 	const notes = lateNotes(o.notes, marked);
-	// Every step is idempotent so a failed publish can be retried by replying to the release card.
-	const cur = await git(
-		["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}^{commit}`],
-		o.mainPath,
-	);
-	if (cur.code === 0) {
-		const at = cur.stdout.trim();
-		if (at !== o.sha)
-			throw new Error(
-				`tag ${o.version} already exists at ${at.slice(0, 7)}, not ${o.sha.slice(0, 7)}`,
-			);
-		parts.push(`tag ${o.version} already at ${o.sha.slice(0, 7)}`);
-	} else {
-		const message = o.archReview
-			? `${o.version}\n\narch-review: ${o.archReview.delta}`
-			: o.version;
-		const t = await git(
-			["tag", "-a", o.version, "-m", message, o.sha],
-			o.mainPath,
-		);
-		if (t.code !== 0)
-			throw new Error(`git tag ${o.version} failed: ${t.stderr.trim()}`);
-		parts.push(
-			`tagged ${o.version} at ${o.sha.slice(0, 7)}${marked.length > 0 ? ` (late fixes: ${marked.length})` : ""}`,
-		);
-	}
-	if (await hasOrigin(o.mainPath)) {
-		// R5-1: the push names the pinned origin URL, never the remote name a work turn can
-		// re-point (the named repo's hooks would run here). No pin: fail loudly, never skip.
-		if (o.originUrl === null)
-			throw new Error(
-				"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
-			);
-		const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
-		if (guard !== null) throw new Error(guard);
-		const p = await git(
-			["push", o.originUrl, `refs/tags/${o.version}`],
-			o.mainPath,
-		);
-		if (p.code !== 0)
-			throw new Error(`git push ${o.version} failed: ${p.stderr.trim()}`);
-		parts.push("pushed");
-	}
-	if (o.github !== null) {
-		const repo = ownerRepo(o.github);
-		if (!repo)
-			throw new Error(`cannot read owner/name from GitHub remote ${o.github}`);
-		if ((await gh(["release", "view", o.version, "--repo", repo])).code === 0) {
-			parts.push(`GitHub release ${o.version} already exists`);
-		} else {
-			const c = await gh([
-				"release",
-				"create",
-				o.version,
-				"--repo",
-				repo,
-				"--title",
-				o.version,
-				"--notes",
-				notes,
-				"--verify-tag",
-			]);
-			if (c.code !== 0)
-				throw new Error(
-					`gh release create ${o.version} failed: ${c.stderr.trim()}`,
-				);
-			parts.push(
-				`GitHub release ${githubHost().webBase}/${repo}/releases/tag/${o.version}`,
-			);
-		}
-	}
+	const parts: string[] = [];
+	const tagged = await tagReleasePart(o, marked);
+	parts.push(tagged);
+	const pushed = await pushReleaseTag(o);
+	if (pushed !== "") parts.push(pushed);
+	const released = await ghReleasePart({ ...o, notes }, gh);
+	if (released !== "") parts.push(released);
 	return parts.join(", ");
 }
 
@@ -817,6 +898,116 @@ function withoutHostedSecret(
 ): Record<string, string | undefined> {
 	const { OTTR_HOSTED_SECRET: _, ...rest } = env;
 	return rest;
+}
+
+/** Splits the command on spaces; double quotes group a part that holds spaces. No shell, no escapes. */
+function releaseArgv(command: string): string[] {
+	const argv = (command.match(/"[^"]*"|[^\s"]+/g) ?? []).map((a) =>
+		a.startsWith('"') ? a.slice(1, -1) : a,
+	);
+	if (argv.length === 0) throw new Error("the release command is empty");
+	return argv;
+}
+
+/** The command's env: the process env minus the hosted secret, plus the release facts. */
+function releaseEnv(o: {
+	sha: string;
+	version: string;
+	notesFile: string;
+	archReview?: { delta: number } | null;
+}): Record<string, string | undefined> {
+	return {
+		// The hosted signing key never reaches the tenant's command (hosted-mode spec).
+		...withoutHostedSecret(process.env),
+		OTTR_RELEASE_VERSION: o.version,
+		OTTR_RELEASE_COMMIT: o.sha,
+		OTTR_RELEASE_NOTES_FILE: o.notesFile,
+		...(o.archReview ? { OTTR_ARCH_REVIEW: String(o.archReview.delta) } : {}),
+	};
+}
+
+/** Spawns the command's process tree; a missing binary names the command in the error. */
+function spawnRelease(
+	argv: string[],
+	cwd: string,
+	env: Record<string, string | undefined>,
+): Bun.Subprocess<"ignore", "pipe", "pipe"> {
+	try {
+		return Bun.spawn(argv, {
+			cwd,
+			env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			// Stryker disable next-line BooleanLiteral: no test can see a console window
+			windowsHide: true,
+		});
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException).code === "ENOENT")
+			throw new Error(`release command not found: ${argv[0]}`);
+		throw e;
+	}
+}
+
+/** Streams one pipe of the command into `emit`, newline-split; the unterminated tail flushes at EOF. */
+async function pumpLines(
+	stream: ReadableStream<Uint8Array>,
+	emit: (raw: string) => void,
+): Promise<void> {
+	const decoder = new TextDecoder();
+	let buf = "";
+	for await (const chunk of stream) {
+		buf += decoder.decode(chunk, { stream: true });
+		for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+			emit(buf.slice(0, nl));
+			buf = buf.slice(nl + 1);
+		}
+	}
+	emit(buf + decoder.decode());
+}
+
+/** The commit the command's tag points at: from the pinned origin when the repo has one
+ * (and the fetch brings the tag home), else from the local tag. */
+async function claimedTagSha(
+	mainPath: string,
+	originUrl: string | null,
+	version: string,
+): Promise<string> {
+	if (!(await hasOrigin(mainPath))) {
+		const t = await git(
+			["rev-parse", "--verify", "--quiet", `refs/tags/${version}^{commit}`],
+			mainPath,
+		);
+		if (t.code !== 0)
+			throw new Error(`the release command did not create tag ${version}`);
+		return t.stdout.trim();
+	}
+	// R5-1: the claim check reads the pinned origin URL, never the remote name a work
+	// turn can re-point. No pin: fail loudly, never fall back to the local tag.
+	if (originUrl === null)
+		throw new Error(
+			"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
+		);
+	const guard = await checkPinnedRemote(mainPath, originUrl);
+	if (guard !== null) throw new Error(guard);
+	const ls = await git(["ls-remote", "--tags", originUrl], mainPath);
+	if (ls.code !== 0)
+		throw new Error(`git ls-remote ${originUrl} failed: ${ls.stderr.trim()}`);
+	const refs = new Map(
+		ls.stdout.split("\n").map((l) => {
+			const [hash = "", ref = ""] = l.trim().split(/\s+/);
+			return [ref, hash];
+		}),
+	);
+	// An annotated tag's `^{}` line names its commit; a lightweight tag's own line does.
+	const remote =
+		refs.get(`refs/tags/${version}^{}`) ?? refs.get(`refs/tags/${version}`);
+	if (remote === undefined)
+		throw new Error(`the release command did not push tag ${version}`);
+	const f = await git(["fetch", "--quiet", "--tags", originUrl], mainPath);
+	if (f.code !== 0)
+		throw new Error(`git fetch ${originUrl} failed: ${f.stderr.trim()}`);
+	return remote;
 }
 
 /**
@@ -846,38 +1037,8 @@ export async function runReleaseCommand(o: {
 		kill(): Promise<void>;
 	}) => void;
 }): Promise<string> {
-	// Split on spaces; double quotes group a part that holds spaces. No shell, no escapes.
-	const argv = (o.command.match(/"[^"]*"|[^\s"]+/g) ?? []).map((a) =>
-		a.startsWith('"') ? a.slice(1, -1) : a,
-	);
-	if (argv.length === 0) throw new Error("the release command is empty");
-	const spawn = () => {
-		try {
-			return Bun.spawn(argv, {
-				cwd: o.cwd,
-				env: {
-					// The hosted signing key never reaches the tenant's command (hosted-mode spec).
-					...withoutHostedSecret(process.env),
-					OTTR_RELEASE_VERSION: o.version,
-					OTTR_RELEASE_COMMIT: o.sha,
-					OTTR_RELEASE_NOTES_FILE: o.notesFile,
-					...(o.archReview
-						? { OTTR_ARCH_REVIEW: String(o.archReview.delta) }
-						: {}),
-				},
-				stdin: "ignore",
-				stdout: "pipe",
-				stderr: "pipe",
-				// Stryker disable next-line BooleanLiteral: no test can see a console window
-				windowsHide: true,
-			});
-		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code === "ENOENT")
-				throw new Error(`release command not found: ${argv[0]}`);
-			throw e;
-		}
-	};
-	const proc = spawn();
+	const argv = releaseArgv(o.command);
+	const proc = spawnRelease(argv, o.cwd, releaseEnv(o));
 	const pid = proc.pid;
 	o.onSpawn?.({
 		pid,
@@ -885,77 +1046,23 @@ export async function runReleaseCommand(o: {
 		kill: async () => platform.killTree(pid),
 	});
 	let last = "";
-	const emit = (raw: string) => {
+	const emit = (raw: string): void => {
 		const line = raw.replace(/\r$/, "");
 		if (line.trim() === "") return;
 		o.log(line);
 		last = line.trim();
 	};
-	const pump = async (stream: ReadableStream<Uint8Array>) => {
-		const decoder = new TextDecoder();
-		let buf = "";
-		for await (const chunk of stream) {
-			buf += decoder.decode(chunk, { stream: true });
-			for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
-				emit(buf.slice(0, nl));
-				buf = buf.slice(nl + 1);
-			}
-		}
-		emit(buf + decoder.decode());
-	};
 	const [code] = await Promise.all([
 		proc.exited,
-		pump(proc.stdout),
-		pump(proc.stderr),
+		pumpLines(proc.stdout, emit),
+		pumpLines(proc.stderr, emit),
 	]);
 	if (code !== 0)
 		throw new Error(
 			`release command exited with code ${code}${last ? `: ${last}` : ""}`,
 		);
 
-	let at: string;
-	if (await hasOrigin(o.mainPath)) {
-		// R5-1: the claim check reads the pinned origin URL, never the remote name a work
-		// turn can re-point. No pin: fail loudly, never fall back to the local tag.
-		if (o.originUrl === null)
-			throw new Error(
-				"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
-			);
-		const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
-		if (guard !== null) throw new Error(guard);
-		const ls = await git(["ls-remote", "--tags", o.originUrl], o.mainPath);
-		if (ls.code !== 0)
-			throw new Error(
-				`git ls-remote ${o.originUrl} failed: ${ls.stderr.trim()}`,
-			);
-		const refs = new Map(
-			ls.stdout.split("\n").map((l) => {
-				const [hash = "", ref = ""] = l.trim().split(/\s+/);
-				return [ref, hash];
-			}),
-		);
-		// An annotated tag's `^{}` line names its commit; a lightweight tag's own line does.
-		const remote =
-			refs.get(`refs/tags/${o.version}^{}`) ??
-			refs.get(`refs/tags/${o.version}`);
-		if (remote === undefined)
-			throw new Error(`the release command did not push tag ${o.version}`);
-		at = remote;
-		const f = await git(
-			["fetch", "--quiet", "--tags", o.originUrl],
-			o.mainPath,
-		);
-		if (f.code !== 0)
-			throw new Error(`git fetch ${o.originUrl} failed: ${f.stderr.trim()}`);
-	} else {
-		const t = await git(
-			["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}^{commit}`],
-			o.mainPath,
-		);
-		if (t.code !== 0)
-			throw new Error(`the release command did not create tag ${o.version}`);
-		at = t.stdout.trim();
-	}
+	const at = await claimedTagSha(o.mainPath, o.originUrl, o.version);
 	const short = at.slice(0, 7);
 	if (
 		(await git(["merge-base", "--is-ancestor", o.sha, at], o.mainPath)).code !==

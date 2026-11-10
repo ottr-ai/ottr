@@ -29,15 +29,15 @@ test("ask drafts round-trip per task and drop on mismatching fingerprint", () =>
 	localStorage.removeItem(ASK_DRAFTS_KEY);
 	saveAskDraft("t1", { fp: "a\nb", answers: { 0: "one" } });
 	saveAskDraft("t2", { fp: "x", answers: { 0: "two", 1: "three" } });
-	expect(loadAskDrafts()["t1"]).toEqual({ fp: "a\nb", answers: { 0: "one" } });
+	expect(loadAskDrafts().t1).toEqual({ fp: "a\nb", answers: { 0: "one" } });
 	// Overwriting one task leaves the other's draft alone.
 	saveAskDraft("t1", { fp: "a\nb", answers: { 0: "one", 1: "uno" } });
-	expect(loadAskDrafts()["t2"]?.answers[0]).toBe("two");
+	expect(loadAskDrafts().t2?.answers[0]).toBe("two");
 	clearAskDraft("t1");
-	expect(loadAskDrafts()["t1"]).toBeUndefined();
-	expect(loadAskDrafts()["t2"]).toBeDefined();
+	expect(loadAskDrafts().t1).toBeUndefined();
+	expect(loadAskDrafts().t2).toBeDefined();
 	// A changed ask round (fingerprint miss) is the caller's signal to start empty.
-	expect(loadAskDrafts()["t1"]?.fp === "a\nb").toBe(false);
+	expect(loadAskDrafts().t1?.fp === "a\nb").toBe(false);
 });
 
 test("compose drafts round-trip per dialog key and drop on empty text", () => {

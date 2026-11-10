@@ -203,6 +203,47 @@ interface UsageRecord {
 	cost: number;
 }
 
+/** The cost.total of one usage object when it is a rate; 0 otherwise. */
+function parseCost(u: object): number {
+	if ("cost" in u && typeof u.cost === "object" && u.cost !== null) {
+		const c: object = u.cost;
+		if ("total" in c && isRate(c.total)) return c.total;
+	}
+	return 0;
+}
+
+/** One usage record from a parsed message line; fields without values read as 0. */
+function usageFields(d: object, m: object, u: object): UsageRecord {
+	const count = (v: unknown): number => (isCount(v) ? v : 0);
+	const model =
+		"model" in m && typeof m.model === "string" && m.model.length > 0
+			? m.model
+			: "unknown";
+	return {
+		model,
+		timestamp: ts("timestamp" in d ? d.timestamp : undefined),
+		input: count("input" in u ? u.input : undefined),
+		output: count("output" in u ? u.output : undefined),
+		cacheRead: count("cacheRead" in u ? u.cacheRead : undefined),
+		cacheWrite: count("cacheWrite" in u ? u.cacheWrite : undefined),
+		cost: parseCost(u),
+	};
+}
+
+/** One record from one parsed line. Null = malformed (voids the file); undefined = a line
+ *  without usage, skipped. */
+function parseUsageRecord(d: unknown): UsageRecord | null | undefined {
+	if (typeof d !== "object" || d === null) return null;
+	if (!("type" in d) || d.type !== "message") return undefined;
+	if (!("message" in d) || typeof d.message !== "object" || d.message === null)
+		return undefined;
+	const m: object = d.message;
+	if (!("role" in m) || m.role !== "assistant") return undefined;
+	if (!("usage" in m) || typeof m.usage !== "object" || m.usage === null)
+		return undefined;
+	return usageFields(d, m, m.usage as object);
+}
+
 /** Collects the usage records of one transcript text. Null when a non-blank line is not a
  *  JSON object: a skipped record could hide usage, so one malformed line voids the file
  *  (the same strictness the turn-cost backfill applies). */
@@ -216,38 +257,10 @@ function readUsageRecords(text: string): UsageRecord[] | null {
 		} catch {
 			return null;
 		}
-		if (typeof d !== "object" || d === null) return null;
-		if (!("type" in d) || d.type !== "message") continue;
-		if (
-			!("message" in d) ||
-			typeof d.message !== "object" ||
-			d.message === null
-		)
-			continue;
-		const m: object = d.message;
-		if (!("role" in m) || m.role !== "assistant") continue;
-		if (!("usage" in m) || typeof m.usage !== "object" || m.usage === null)
-			continue;
-		const u: object = m.usage;
-		const count = (v: unknown): number => (isCount(v) ? v : 0);
-		const model =
-			"model" in m && typeof m.model === "string" && m.model.length > 0
-				? m.model
-				: "unknown";
-		let cost = 0;
-		if ("cost" in u && typeof u.cost === "object" && u.cost !== null) {
-			const c: object = u.cost;
-			if ("total" in c && isRate(c.total)) cost = c.total;
-		}
-		out.push({
-			model,
-			timestamp: ts("timestamp" in d ? d.timestamp : undefined),
-			input: count("input" in u ? u.input : undefined),
-			output: count("output" in u ? u.output : undefined),
-			cacheRead: count("cacheRead" in u ? u.cacheRead : undefined),
-			cacheWrite: count("cacheWrite" in u ? u.cacheWrite : undefined),
-			cost,
-		});
+		const rec = parseUsageRecord(d);
+		if (rec === undefined) continue;
+		if (rec === null) return null;
+		out.push(rec);
 	}
 	return out;
 }

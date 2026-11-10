@@ -16,7 +16,8 @@ const UNITS: Record<string, number> = {
 export function parseSize(text: string): number | null {
 	const m = /^\s*(\d+)\s*([kmgt]?)\s*$/i.exec(text);
 	if (!m) return null;
-	const n = Number(m[1]) * UNITS[m[2]!.toLowerCase()]!;
+	const unit = m[2] ?? "";
+	const n = Number(m[1]) * (UNITS[unit.toLowerCase()] ?? 0);
 	return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 

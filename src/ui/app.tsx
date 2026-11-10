@@ -20,6 +20,7 @@ import {
 import { createRoot } from "react-dom/client";
 import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
+import type { DeadSignIn } from "../login.ts";
 import type { ModelOption } from "../models.ts";
 import { shortKey, taskEntryKey } from "../notifications.ts";
 import { parseReviewDraft } from "../prInline.ts";
@@ -43,6 +44,7 @@ import {
 	type GhStatus,
 	type KeptChoice,
 	MERGE_HOLD_MISMATCH_REASON,
+	type OrphanProcess,
 	PERF_RANGES,
 	type PerfMetrics,
 	type PerfRange,
@@ -78,6 +80,7 @@ import {
 	readPicks,
 } from "./attach.ts";
 import {
+	type DiffSection,
 	diffLinkParts,
 	lineDiff,
 	numberDiffLines,
@@ -126,6 +129,7 @@ import {
 import { Markdown } from "./markdown.tsx";
 import { loadMermaid } from "./mermaid.ts";
 import {
+	type ModelMenu,
 	ModelMenuBody,
 	ModelMenuTrigger,
 	useModelMenu,
@@ -143,6 +147,7 @@ import {
 	clearAskDraft,
 	clearComposeDraft,
 	type InboxEntry,
+	type InboxLevel,
 	inboxView,
 	loadAskDrafts,
 	loadComposeDraft,
@@ -576,6 +581,15 @@ type CardDrag = {
 	onDragEnd: () => void;
 };
 
+/** A parsed mutation-progress line, the shape strykerProgress returns; null when the card has none. */
+type MutationProgress = {
+	tool: string;
+	pct: number;
+	tested: number;
+	total: number;
+	rest: string;
+};
+
 /** Rank and close-candidate chips, shared by the board card and the overview triage row.
  * Text labels, never color alone; the close badge's tooltip carries the reason. */
 function RankBadges({
@@ -612,6 +626,382 @@ export function triageWait(a: TaskCard, b: TaskCard): number {
 /** Render probe for tests: a test sets `fn` to count Card renders; a memoized Card that skips
  * its render never calls it. Production never sets it, so the call stays a no-op on the board. */
 export const cardRenderProbe: { fn: (() => void) | null } = { fn: null };
+
+/** The card shell's class: drag state, drop marker, reorder lock. */
+function cardClass(
+	drag: CardDrag | undefined,
+	locked: boolean | undefined,
+): string {
+	return `card${drag?.dragging ? " dragging" : ""}${drag?.dropBefore ? " drop-before" : ""}${locked ? " reorder-lock" : ""}`;
+}
+
+/** Values derived once per card render; plain reads of `task`, no hooks. */
+function cardDerived(task: TaskCard): {
+	sp: MutationProgress | null;
+	spLeft: string | null;
+	silent: string | null;
+	commits: number | null;
+	held: string | null;
+} {
+	const commits = task.stage === "done" ? task.commits : null;
+	const sp = task.state === "running" ? strykerProgress(task.progress) : null;
+	// The card shows only the percent and the time left; the full line stays in the tooltip.
+	const spLeft =
+		sp === null
+			? null
+			: (strykerStats(sp.rest).find((x) => x.label === "Left")?.value ?? null);
+	const silent =
+		task.silentSince !== undefined
+			? `No output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
+			: null;
+	// A usage-limit hold names its holder on the face ("held · zai limit · 1d 0h left") and
+	// keeps the full reason one hover away; the sr line reads it out. null = not held now.
+	const held =
+		sp === null &&
+		task.runStartedAt === undefined &&
+		task.state === "queued" &&
+		task.needsReason !== null &&
+		task.holdUntil !== null
+			? holdLeft(task.holdUntil, Date.now(), task.needsReason)
+			: null;
+	return { sp, spLeft, silent, commits, held };
+}
+
+/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. */
+function cardHead(
+	task: TaskCard,
+	unread: boolean,
+	catalog: ModelCatalog | null,
+): ReactNode {
+	return (
+		<span className="card-head">
+			{task.starred && task.cancelledAt === null ? (
+				// A starred report: the star stands in for the done check; the drawer's
+				// icon button toggles it, the card carries only the state.
+				<Mark kind="star" />
+			) : (
+				<Mark kind={cardMark(task)} />
+			)}
+			<span className="card-key" title={`Task ${task.id}`}>
+				{task.id}
+			</span>
+			{unread && (
+				<span
+					className="unread"
+					title={
+						task.kind === "pr_review"
+							? "New PR review"
+							: "Answered; not opened yet"
+					}
+				>
+					new
+				</span>
+			)}
+			{task.research && (
+				<span
+					className="research"
+					title="Research task: answers with a report, nothing to merge"
+				>
+					research
+				</span>
+			)}
+			{task.cancelledAt !== null && (
+				<span
+					className="cancelled"
+					title={`Cancelled ${stamp(task.cancelledAt)}`}
+				>
+					Cancelled · {landed(task.cancelledAt)}
+				</span>
+			)}
+			<RankBadges task={task} />
+			{cardModel(task, catalog)}
+		</span>
+	);
+}
+
+/** The main-loop model chip; pinned to the head's top right without the provider or the
+ *  thinking effort — the tooltip keeps the full id with its level. */
+function cardModel(task: TaskCard, catalog: ModelCatalog | null): ReactNode {
+	if (task.stage === "done") return null;
+	const model = task.model ?? task.lastModel ?? "default";
+	return (
+		<span
+			className="model"
+			title={`Main loop model: ${model}${task.model === null && task.lastModel ? " (last run)" : ""}`}
+		>
+			{displayModel(catalog?.models ?? [], splitLevel(model)[0])}
+		</span>
+	);
+}
+
+/** The line under the title: the needs-you reason, a silence warning, or the original title.
+ *  Needs attention: the error takes the prompt line until the state clears; the card-open
+ *  title also carries it. Ask rounds keep the prompt: their reason just echoes the first
+ *  question the drawer's ask panel shows in full. A live turn whose log went silent past
+ *  the board's limit takes the same line as .card-silent — grey, it reports, it does not
+ *  alarm. A PR review waiting for its Post is no error either, so its reason takes the
+ *  grey line too. */
+function cardErrorLine(task: TaskCard, silent: string | null): ReactNode {
+	if (
+		task.state === "needs_you" &&
+		task.asked === null &&
+		task.needsReason !== null
+	) {
+		return (
+			<span
+				className={
+					task.kind === "pr_review" ? "card-error card-silent" : "card-error"
+				}
+				title={task.needsReason}
+			>
+				{task.needsReason}
+			</span>
+		);
+	}
+	if (silent !== null) {
+		return (
+			<span className="card-error card-silent" title={silent}>
+				{silent}
+			</span>
+		);
+	}
+	if (task.sessionTitle !== task.title) {
+		return (
+			<span className="card-original" title={task.title}>
+				{task.title}
+			</span>
+		);
+	}
+	return null;
+}
+
+/** The meta title: cancelled, done, or created stamp. */
+function cardMetaTitle(task: TaskCard): string {
+	return stamp(
+		task.cancelledAt ??
+			(task.stage === "done" && task.doneAt !== null
+				? task.doneAt
+				: task.createdAt),
+	);
+}
+
+/** The card's age item: landed stamp, live elapsed, or age. */
+function cardMetaAge(
+	task: TaskCard,
+	sp: MutationProgress | null,
+	status: string | undefined,
+): ReactNode {
+	if (task.cancelledAt !== null) return landed(task.cancelledAt);
+	if (task.stage === "done" && task.doneAt !== null) return landed(task.doneAt);
+	if (task.runStartedAt !== undefined) {
+		return (
+			<LiveElapsed
+				since={task.runStartedAt}
+				status={sp === null ? status : null}
+				etaMs={sp === null ? task.etaMs : undefined}
+			/>
+		);
+	}
+	return age(task.createdAt);
+}
+
+/** The status item after the age: the live status words, or a hold label with its reason. */
+function cardMetaStatus(
+	task: TaskCard,
+	status: string | undefined,
+	sp: MutationProgress | null,
+	held: string | null,
+): ReactNode {
+	if (sp !== null || task.runStartedAt !== undefined) return null;
+	if (held !== null && task.needsReason !== null) {
+		// One flex item (.card-meta wraps between items): the separator rides
+		// inside the label, so a wrap never strands a lone "·" at a line end.
+		return (
+			<span title={task.needsReason}>
+				{"·\u00A0"}
+				{held}
+				<span className="sr">{task.needsReason}</span>
+			</span>
+		);
+	}
+	return <>· {status}</>;
+}
+
+/** The commit count chip with its delta. */
+function cardCommits(
+	commits: number | null,
+	delta: number | undefined,
+): ReactNode {
+	if (commits === null) return null;
+	return (
+		<span
+			className="commits"
+			title={
+				delta !== undefined
+					? `Commits on target: ${commits} (+${delta} since the previous task)`
+					: `Commits on target: ${commits}`
+			}
+		>
+			{delta !== undefined ? `+${delta} → ${commits}` : `→ ${commits}`}
+		</span>
+	);
+}
+
+/** A stalled release card's held-merges note. */
+function cardHold(
+	reRelease: { ids: string[]; findings: number } | null | undefined,
+): ReactNode {
+	if (reRelease == null) return null;
+	return (
+		<span
+			className="card-hold"
+			title={`Held merges: ${reRelease.ids.join(", ")}`}
+		>
+			All {reRelease.findings} findings are done. {reRelease.ids.length} merges
+			wait for this release: {reRelease.ids.join(", ")}.
+		</span>
+	);
+}
+
+/** The live mutation-progress chip with its dotted rail. The card's left edge is the
+ *  progress: a dotted rail, filled bottom-up with the percent. One --p var drives the
+ *  fill's scaleY and the end dot's translateY. */
+function cardMutation(
+	task: TaskCard,
+	sp: ReturnType<typeof strykerProgress>,
+	spLeft: string | null,
+): ReactNode {
+	if (sp === null) return null;
+	return (
+		<span className="card-mutation" title={task.progress ?? undefined}>
+			Mutation <span className="card-mutation-value">{sp.pct}%</span>
+			{spLeft !== null && ` · ${spLeft} left`}
+			<span
+				className="mutation-rail"
+				aria-hidden="true"
+				style={{ "--p": clamp(sp.pct, 0, 100) / 100 } as CSSProperties}
+			>
+				<i />
+				<b />
+			</span>
+		</span>
+	);
+}
+
+/** The card tags row: PR link, hold link, re-release button, release link; null renders none. */
+function cardTags(
+	task: TaskCard,
+	github: string | null,
+	release: string | null,
+	holdRelease: { id: string; version: string | null } | null | undefined,
+	onOpenTask: ((id: string) => void) | undefined,
+	onRerelease: ((id: string) => void) | undefined,
+): ReactNode {
+	if (
+		task.prNumber === null &&
+		release === null &&
+		holdRelease == null &&
+		onRerelease === undefined
+	) {
+		return null;
+	}
+	return (
+		<span className="card-tags">
+			{task.prNumber !== null &&
+				(task.prUrl !== null ? (
+					<a
+						className="pr-link"
+						href={task.prUrl}
+						target="_blank"
+						rel="noopener noreferrer"
+						title={`Open PR #${task.prNumber} on GitHub`}
+						aria-label={`PR #${task.prNumber} on GitHub (opens a new tab)`}
+					>
+						PR #{task.prNumber}
+					</a>
+				) : (
+					<span className="pr-link" title={`PR #${task.prNumber}`}>
+						PR #{task.prNumber}
+					</span>
+				))}
+			{holdRelease != null && onOpenTask !== undefined && (
+				<a
+					className="hold-link"
+					href={taskPath(task.project, holdRelease.id)}
+					title={`Task ${holdRelease.id}: the release holding this card${holdRelease.version !== null ? ` (${holdRelease.version})` : ""}`}
+					onClick={(e) => {
+						// The card body is a stretched open link: keep the click off it.
+						e.stopPropagation();
+						navClick(e, () => onOpenTask(holdRelease.id));
+					}}
+				>
+					<Icon name="corner-up-left" size={12} />
+					{holdRelease.id}
+				</a>
+			)}
+			{onRerelease !== undefined && (
+				<button
+					type="button"
+					className="hold-link"
+					title={`Cancel release ${task.releaseVersion ?? ""} and open Create release`}
+					onClick={(e) => {
+						// The card body is a stretched open button: keep the click off it.
+						e.preventDefault();
+						e.stopPropagation();
+						onRerelease(task.id);
+					}}
+				>
+					<Icon name="corner-up-left" size={12} />
+					Release again
+				</button>
+			)}
+			{release !== null &&
+				(github !== null ? (
+					<a
+						className="release"
+						href={`${github}/releases/tag/${release}`}
+						target="_blank"
+						rel="noopener noreferrer"
+						title={`GitHub release ${release}`}
+					>
+						{release}
+					</a>
+				) : (
+					<span className="release" title={`Released ${release}`}>
+						{release}
+					</span>
+				))}
+		</span>
+	);
+}
+
+/** A proposal card's Decide chip beside the card tags: it opens the drawer, where the
+ *  decision panel sits on top. Same click rules as the hold-link chips. */
+function cardDecide(task: TaskCard, onOpen: (id: string) => void): ReactNode {
+	if (
+		task.state !== "needs_you" ||
+		task.cancelledAt !== null ||
+		!isProposalReason(task.needsReason)
+	) {
+		return null;
+	}
+	return (
+		<span className="card-tags">
+			<button
+				type="button"
+				className="decide-link"
+				title="Accept, edit or cancel this proposal"
+				onClick={(e) => {
+					// The card body is a stretched open link: keep the click off it.
+					e.stopPropagation();
+					onOpen(task.id);
+				}}
+			>
+				Decide
+			</button>
+		</span>
+	);
+}
 
 const Card = memo(function Card({
 	task,
@@ -662,32 +1052,12 @@ const Card = memo(function Card({
 	// The model chip names the model as omp does (display name); one cached catalog serves every card.
 	const catalog = useModels();
 	const release = releaseOf(task);
-	const commits = task.stage === "done" ? task.commits : null;
-	const sp = task.state === "running" ? strykerProgress(task.progress) : null;
-	// The card shows only the percent and the time left; the full line stays in the tooltip.
-	const spLeft =
-		sp === null
-			? null
-			: (strykerStats(sp.rest).find((x) => x.label === "Left")?.value ?? null);
-	const silent =
-		task.silentSince !== undefined
-			? `No output for ${duration(Date.now() - task.silentSince)}: the agent may wait on a hung command. Steer, stop or cancel the card.`
-			: null;
-	// A usage-limit hold names its holder on the face ("held · zai limit · 1d 0h left") and
-	// keeps the full reason one hover away; the sr line reads it out. null = not held now.
-	const held =
-		sp === null &&
-		task.runStartedAt === undefined &&
-		task.state === "queued" &&
-		task.needsReason !== null &&
-		task.holdUntil !== null
-			? holdLeft(task.holdUntil, Date.now(), task.needsReason)
-			: null;
+	const { sp, spLeft, silent, commits, held } = cardDerived(task);
 	return (
 		// A stretched link opens the card; the release link sits beside it, never nested in it.
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched link inside
 		<div
-			className={`card${drag?.dragging ? " dragging" : ""}${drag?.dropBefore ? " drop-before" : ""}${locked ? " reorder-lock" : ""}`}
+			className={cardClass(drag, locked)}
 			data-state={task.state}
 			data-task-id={task.id}
 			data-stage={task.stage}
@@ -713,91 +1083,9 @@ const Card = memo(function Card({
 				}
 				onClick={(e) => navClick(e, () => onOpen(task.id))}
 			>
-				<span className="card-head">
-					{task.starred && task.cancelledAt === null ? (
-						// A starred report: the star stands in for the done check; the drawer's
-						// icon button toggles it, the card carries only the state.
-						<Mark kind="star" />
-					) : (
-						<Mark kind={cardMark(task)} />
-					)}
-					<span className="card-key" title={`Task ${task.id}`}>
-						{task.id}
-					</span>
-					{unread && (
-						<span
-							className="unread"
-							title={
-								task.kind === "pr_review"
-									? "New PR review"
-									: "Answered; not opened yet"
-							}
-						>
-							new
-						</span>
-					)}
-					{task.research && (
-						<span
-							className="research"
-							title="Research task: answers with a report, nothing to merge"
-						>
-							research
-						</span>
-					)}
-					{task.cancelledAt !== null && (
-						<span
-							className="cancelled"
-							title={`Cancelled ${stamp(task.cancelledAt)}`}
-						>
-							Cancelled · {landed(task.cancelledAt)}
-						</span>
-					)}
-					<RankBadges task={task} />
-					{/* Pinned to the head's top right without the provider or the thinking effort;
-					    the tooltip keeps the full id with its level. */}
-					{task.stage !== "done" && (
-						<span
-							className="model"
-							title={`Main loop model: ${task.model ?? task.lastModel ?? "default"}${task.model === null && task.lastModel ? " (last run)" : ""}`}
-						>
-							{displayModel(
-								catalog?.models ?? [],
-								splitLevel(task.model ?? task.lastModel ?? "default")[0],
-							)}
-						</span>
-					)}
-				</span>
+				{cardHead(task, unread, catalog)}
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
-				{/* Needs attention: the error takes the prompt line until the state clears; the
-				    card-open title also carries it. Ask rounds keep the prompt: their reason just
-				    echoes the first question the drawer's ask panel shows in full. A live turn
-				    whose log went silent past the board's limit takes the same line as
-				    .card-silent — grey, it reports, it does not alarm. A PR review waiting for
-				    its Post is no error either, so its reason takes the grey line too. */}
-				{task.state === "needs_you" &&
-				task.asked === null &&
-				task.needsReason !== null ? (
-					<span
-						className={
-							task.kind === "pr_review"
-								? "card-error card-silent"
-								: "card-error"
-						}
-						title={task.needsReason}
-					>
-						{task.needsReason}
-					</span>
-				) : silent !== null ? (
-					<span className="card-error card-silent" title={silent}>
-						{silent}
-					</span>
-				) : (
-					task.sessionTitle !== task.title && (
-						<span className="card-original" title={task.title}>
-							{task.title}
-						</span>
-					)
-				)}
+				{cardErrorLine(task, silent)}
 				{/* The two-way follow-up link names its parent on the card itself, like the
 				    drawer's "Follow-up of" chip; a bare glyph made the name hover-only. */}
 				{fuOf != null && (
@@ -806,171 +1094,18 @@ const Card = memo(function Card({
 						<span className="card-fu-title">{fuOf}</span>
 					</span>
 				)}
-				<span
-					className="card-meta"
-					title={stamp(
-						task.cancelledAt ??
-							(task.stage === "done" && task.doneAt !== null
-								? task.doneAt
-								: task.createdAt),
-					)}
-				>
-					{task.cancelledAt !== null ? (
-						landed(task.cancelledAt)
-					) : task.stage === "done" && task.doneAt !== null ? (
-						landed(task.doneAt)
-					) : task.runStartedAt !== undefined ? (
-						<LiveElapsed
-							since={task.runStartedAt}
-							status={sp === null ? status : null}
-							etaMs={sp === null ? task.etaMs : undefined}
-						/>
-					) : (
-						age(task.createdAt)
-					)}{" "}
-					{sp === null &&
-						task.runStartedAt === undefined &&
-						(held !== null && task.needsReason !== null ? (
-							// One flex item (.card-meta wraps between items): the separator rides
-							// inside the label, so a wrap never strands a lone "·" at a line end.
-							<span title={task.needsReason}>
-								{"·\u00A0"}
-								{held}
-								<span className="sr">{task.needsReason}</span>
-							</span>
-						) : (
-							<>· {status}</>
-						))}
-					{commits !== null && (
-						<span
-							className="commits"
-							title={
-								delta !== undefined
-									? `Commits on target: ${commits} (+${delta} since the previous task)`
-									: `Commits on target: ${commits}`
-							}
-						>
-							{delta !== undefined ? `+${delta} → ${commits}` : `→ ${commits}`}
-						</span>
-					)}
+				<span className="card-meta" title={cardMetaTitle(task)}>
+					{cardMetaAge(task, sp, status)}{" "}
+					{cardMetaStatus(task, status, sp, held)}
+					{cardCommits(commits, delta)}
 				</span>
-				{reRelease !== null && reRelease !== undefined && (
-					<span
-						className="card-hold"
-						title={`Held merges: ${reRelease.ids.join(", ")}`}
-					>
-						All {reRelease.findings} findings are done. {reRelease.ids.length}{" "}
-						merges wait for this release: {reRelease.ids.join(", ")}.
-					</span>
-				)}
-				{sp !== null && (
-					<span className="card-mutation" title={task.progress ?? undefined}>
-						Mutation <span className="card-mutation-value">{sp.pct}%</span>
-						{spLeft !== null && ` · ${spLeft} left`}
-						{/* The card's left edge is the progress: a dotted rail, filled bottom-up with the percent.
-						    One --p var drives the fill's scaleY and the end dot's translateY. */}
-						<span
-							className="mutation-rail"
-							aria-hidden="true"
-							style={{ "--p": clamp(sp.pct, 0, 100) / 100 } as CSSProperties}
-						>
-							<i />
-							<b />
-						</span>
-					</span>
-				)}
+				{cardHold(reRelease)}
+				{cardMutation(task, sp, spLeft)}
 			</a>
-			{(task.prNumber !== null ||
-				release !== null ||
-				holdRelease != null ||
-				onRerelease !== undefined) && (
-				<span className="card-tags">
-					{task.prNumber !== null &&
-						(task.prUrl !== null ? (
-							<a
-								className="pr-link"
-								href={task.prUrl}
-								target="_blank"
-								rel="noopener noreferrer"
-								title={`Open PR #${task.prNumber} on GitHub`}
-								aria-label={`PR #${task.prNumber} on GitHub (opens a new tab)`}
-							>
-								PR #{task.prNumber}
-							</a>
-						) : (
-							<span className="pr-link" title={`PR #${task.prNumber}`}>
-								PR #{task.prNumber}
-							</span>
-						))}
-					{holdRelease != null && onOpenTask !== undefined && (
-						<a
-							className="hold-link"
-							href={taskPath(task.project, holdRelease.id)}
-							title={`Task ${holdRelease.id}: the release holding this card${holdRelease.version !== null ? ` (${holdRelease.version})` : ""}`}
-							onClick={(e) => {
-								// The card body is a stretched open link: keep the click off it.
-								e.stopPropagation();
-								navClick(e, () => onOpenTask(holdRelease.id));
-							}}
-						>
-							<Icon name="corner-up-left" size={12} />
-							{holdRelease.id}
-						</a>
-					)}
-					{onRerelease !== undefined && (
-						<button
-							type="button"
-							className="hold-link"
-							title={`Cancel release ${task.releaseVersion ?? ""} and open Create release`}
-							onClick={(e) => {
-								// The card body is a stretched open button: keep the click off it.
-								e.preventDefault();
-								e.stopPropagation();
-								onRerelease(task.id);
-							}}
-						>
-							<Icon name="corner-up-left" size={12} />
-							Release again
-						</button>
-					)}
-					{release !== null &&
-						(github !== null ? (
-							<a
-								className="release"
-								href={`${github}/releases/tag/${release}`}
-								target="_blank"
-								rel="noopener noreferrer"
-								title={`GitHub release ${release}`}
-							>
-								{release}
-							</a>
-						) : (
-							<span className="release" title={`Released ${release}`}>
-								{release}
-							</span>
-						))}
-				</span>
-			)}
+			{cardTags(task, github, release, holdRelease, onOpenTask, onRerelease)}
 			{/* A proposal card gets a Decide chip beside the card tags: it opens the drawer,
 			    where the decision panel sits on top. Same click rules as the hold-link chips. */}
-			{task.state === "needs_you" &&
-				task.cancelledAt === null &&
-				isProposalReason(task.needsReason) && (
-					<span className="card-tags">
-						<button
-							type="button"
-							className="decide-link"
-							title="Accept, edit or cancel this proposal"
-							onClick={(e) => {
-								// The card body is a stretched open link: keep the click off it.
-								e.stopPropagation();
-								onOpen(task.id);
-							}}
-						>
-							Decide
-						</button>
-					</span>
-				)}
+			{cardDecide(task, onOpen)}
 		</div>
 	);
 });
@@ -987,6 +1122,190 @@ function useSystem(): SystemSnapshot | null {
 		return () => liveEvents.removeEventListener("system", onSystem);
 	}, []);
 	return system;
+}
+
+/** The meters button's aria label; hosted mode names agents only. */
+function systemMetersAria(
+	hosted: boolean,
+	used: number,
+	waiting: number,
+	quotaPct: number | null,
+): string {
+	return hosted
+		? `${used} running, ${waiting} waiting. Agent details`
+		: `${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}. Agent and quota details`;
+}
+
+/** The quota group inside the meters button: the tightest limit's twin bar and percent.
+ *  Hosted mode never renders it: provider quota is the operator's concern there. */
+function systemQuotaGrp(
+	tightest: QuotaState["limits"][number] | null,
+	quotaLevel: string,
+	quotaPct: number | null,
+	quotaGone: number | null,
+): ReactNode {
+	return (
+		<>
+			<span className="sb-sep" aria-hidden="true" />
+			<span
+				className="sb-grp"
+				title={
+					tightest === null
+						? undefined
+						: `Tightest limit: ${tightest.provider} ${tightest.label}, ${tightest.usedPct}% used${quotaGone === null ? "" : `, ${Math.round(quotaGone)}% of the window gone`}`
+				}
+			>
+				<span className="sb-lbl sb-hide-phone">Quota</span>
+				{tightest !== null && <QuotaTwin limit={tightest} />}
+				<span className="sb-val" data-level={quotaLevel}>
+					{quotaLevel === "high" && <Mark kind="needs" />}
+					{quotaLevel === "crit" && <Mark kind="crit" />}
+					{quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}
+				</span>
+			</span>
+		</>
+	);
+}
+
+/** The Agents section of the System popover: running, merging, waiting and the slot cap. */
+function systemAgents(
+	slots: SlotCounts,
+	maxTotal: number | null,
+	used: number,
+	waiting: number,
+): ReactNode {
+	return (
+		<section>
+			<h2>Agents</h2>
+			<dl className="ag-nums">
+				<div data-zero={slots.in_progress + slots.todo === 0 || undefined}>
+					<dt>
+						<Mark kind="running" />
+						Running
+					</dt>
+					<dd>{slots.in_progress + slots.todo}</dd>
+				</div>
+				<div data-zero={slots.merging === 0 || undefined}>
+					<dt>
+						<Icon name="git-merge" size={13} />
+						Merging
+					</dt>
+					<dd>{slots.merging}</dd>
+				</div>
+				<div data-zero={waiting === 0 || undefined}>
+					<dt>
+						<Icon name="clock" size={13} />
+						Waiting
+					</dt>
+					<dd>{waiting}</dd>
+				</div>
+			</dl>
+			<div className="ag-cap">
+				{maxTotal === null ? (
+					<span className="caption">No cap on agents across projects.</span>
+				) : (
+					<Meter
+						label="Slots"
+						pct={maxTotal > 0 ? (used / maxTotal) * 100 : null}
+						value={`${used}/${maxTotal}`}
+						band={false}
+					/>
+				)}
+			</div>
+		</section>
+	);
+}
+
+/** One quota window row: its time-over-quota twin bars, percent and reset stamp. */
+function quotaRow(l: QuotaState["limits"][number]): ReactNode {
+	const gone = windowGone(l, Date.now());
+	return (
+		<div key={l.label} className="qt-row" data-level={loadLevel(l.usedPct)}>
+			<span className="qt-label" title={l.label}>
+				{l.label}
+			</span>
+			<span
+				className="qt-bars"
+				role="img"
+				aria-label={`${Math.round(l.usedPct)} % used${gone === null ? "" : `, ${Math.round(gone)} % of the window gone`}`}
+			>
+				{gone !== null && (
+					<span className="qt-time">
+						<i style={{ width: `${gone}%` }} />
+					</span>
+				)}
+				<span className="qt-used">
+					<i
+						style={{
+							transform: `scaleX(${clamp(l.usedPct, 0, 100) / 100})`,
+						}}
+					/>
+				</span>
+			</span>
+			<span className="qt-val">{Math.round(l.usedPct)} %</span>
+			<span
+				className="qt-reset"
+				title={l.resetsAt === null ? undefined : `Resets ${stamp(l.resetsAt)}`}
+			>
+				{l.resetsAt === null ? "–" : until(l.resetsAt)}
+			</span>
+		</div>
+	);
+}
+
+/** The Provider quota section of the System popover; one row per window per provider.
+ *  One row per window: a thin time line over the quota bar, so a quota bar longer than
+ *  its time line means the window burns faster than it runs. */
+function systemQuotaSection(quota: QuotaState | null): ReactNode {
+	return (
+		<section>
+			<h2>Provider quota</h2>
+			{quota === null ? (
+				<p className="caption">Checking omp usage…</p>
+			) : quota.error !== null ? (
+				<p className="caption">omp usage failed: {quota.error}</p>
+			) : quota.limits.length === 0 ? (
+				<p className="caption">
+					omp reports no usage limits for your accounts.
+				</p>
+			) : (
+				<>
+					<div className="qt">
+						<div className="qt-head" aria-hidden="true">
+							<span />
+							<span className="qt-key">
+								<span>
+									<span className="qt-time">
+										<i />
+									</span>
+									time
+								</span>
+								<span>
+									<span className="qt-used">
+										<i />
+									</span>
+									quota
+								</span>
+							</span>
+							<span className="qt-num">used</span>
+							<span className="qt-num">resets</span>
+						</div>
+						{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
+							([provider, limits]) => (
+								<Fragment key={provider}>
+									<h3>{provider}</h3>
+									{limits.map((l) => quotaRow(l))}
+								</Fragment>
+							),
+						)}
+					</div>
+					<p className="caption">
+						Checked {age(quota.at)}. Amber from {BAND_LIMIT} % used.
+					</p>
+				</>
+			)}
+		</section>
+	);
 }
 
 /** Overview indicators in the app bar; the button opens the detail popover (agents and quota).
@@ -1032,11 +1351,7 @@ function SystemBar({
 				type="button"
 				className="meters"
 				popoverTarget="system-detail"
-				aria-label={
-					hosted
-						? `${used} running, ${waiting} waiting. Agent details`
-						: `${used} running, ${waiting} waiting, quota ${quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}. Agent and quota details`
-				}
+				aria-label={systemMetersAria(hosted, used, waiting, quotaPct)}
 				title={hosted ? "Agent details" : "Agent and quota details"}
 			>
 				<span className="sb-grp">
@@ -1050,164 +1365,13 @@ function SystemBar({
 				</span>
 				{/* Hosted mode: provider quota is the operator's concern, so the bar and the
 				    popover show agents only. */}
-				{!hosted && (
-					<>
-						<span className="sb-sep" aria-hidden="true" />
-						<span
-							className="sb-grp"
-							title={
-								tightest === null
-									? undefined
-									: `Tightest limit: ${tightest.provider} ${tightest.label}, ${tightest.usedPct}% used${quotaGone === null ? "" : `, ${Math.round(quotaGone)}% of the window gone`}`
-							}
-						>
-							<span className="sb-lbl sb-hide-phone">Quota</span>
-							{tightest !== null && <QuotaTwin limit={tightest} />}
-							<span className="sb-val" data-level={quotaLevel}>
-								{quotaLevel === "high" && <Mark kind="needs" />}
-								{quotaLevel === "crit" && <Mark kind="crit" />}
-								{quotaPct === null ? "n/a" : `${Math.round(quotaPct)}%`}
-							</span>
-						</span>
-					</>
-				)}
+				{!hosted && systemQuotaGrp(tightest, quotaLevel, quotaPct, quotaGone)}
 			</button>
 			<div id="system-detail" popover="auto" className="popover">
 				{/* Order by urgency: agents first (big figures, no table to read), quota second.
 				    Running counts preparing todo slots too. */}
-				<section>
-					<h2>Agents</h2>
-					<dl className="ag-nums">
-						<div data-zero={slots.in_progress + slots.todo === 0 || undefined}>
-							<dt>
-								<Mark kind="running" />
-								Running
-							</dt>
-							<dd>{slots.in_progress + slots.todo}</dd>
-						</div>
-						<div data-zero={slots.merging === 0 || undefined}>
-							<dt>
-								<Icon name="git-merge" size={13} />
-								Merging
-							</dt>
-							<dd>{slots.merging}</dd>
-						</div>
-						<div data-zero={waiting === 0 || undefined}>
-							<dt>
-								<Icon name="clock" size={13} />
-								Waiting
-							</dt>
-							<dd>{waiting}</dd>
-						</div>
-					</dl>
-					<div className="ag-cap">
-						{maxTotal === null ? (
-							<span className="caption">No cap on agents across projects.</span>
-						) : (
-							<Meter
-								label="Slots"
-								pct={maxTotal > 0 ? (used / maxTotal) * 100 : null}
-								value={`${used}/${maxTotal}`}
-								band={false}
-							/>
-						)}
-					</div>
-				</section>
-				{!hosted && (
-					<section>
-						<h2>Provider quota</h2>
-						{quota === null ? (
-							<p className="caption">Checking omp usage…</p>
-						) : quota.error !== null ? (
-							<p className="caption">omp usage failed: {quota.error}</p>
-						) : quota.limits.length === 0 ? (
-							<p className="caption">
-								omp reports no usage limits for your accounts.
-							</p>
-						) : (
-							<>
-								{/* One row per window: a thin time line over the quota bar, so a quota bar
-							    longer than its time line means the window burns faster than it runs. */}
-								<div className="qt">
-									<div className="qt-head" aria-hidden="true">
-										<span />
-										<span className="qt-key">
-											<span>
-												<span className="qt-time">
-													<i />
-												</span>
-												time
-											</span>
-											<span>
-												<span className="qt-used">
-													<i />
-												</span>
-												quota
-											</span>
-										</span>
-										<span className="qt-num">used</span>
-										<span className="qt-num">resets</span>
-									</div>
-									{[...Map.groupBy(quota.limits, (l) => l.provider)].map(
-										([provider, limits]) => (
-											<Fragment key={provider}>
-												<h3>{provider}</h3>
-												{limits.map((l) => {
-													const gone = windowGone(l, Date.now());
-													return (
-														<div
-															key={l.label}
-															className="qt-row"
-															data-level={loadLevel(l.usedPct)}
-														>
-															<span className="qt-label" title={l.label}>
-																{l.label}
-															</span>
-															<span
-																className="qt-bars"
-																role="img"
-																aria-label={`${Math.round(l.usedPct)} % used${gone === null ? "" : `, ${Math.round(gone)} % of the window gone`}`}
-															>
-																{gone !== null && (
-																	<span className="qt-time">
-																		<i style={{ width: `${gone}%` }} />
-																	</span>
-																)}
-																<span className="qt-used">
-																	<i
-																		style={{
-																			transform: `scaleX(${clamp(l.usedPct, 0, 100) / 100})`,
-																		}}
-																	/>
-																</span>
-															</span>
-															<span className="qt-val">
-																{Math.round(l.usedPct)} %
-															</span>
-															<span
-																className="qt-reset"
-																title={
-																	l.resetsAt === null
-																		? undefined
-																		: `Resets ${stamp(l.resetsAt)}`
-																}
-															>
-																{l.resetsAt === null ? "–" : until(l.resetsAt)}
-															</span>
-														</div>
-													);
-												})}
-											</Fragment>
-										),
-									)}
-								</div>
-								<p className="caption">
-									Checked {age(quota.at)}. Amber from {BAND_LIMIT} % used.
-								</p>
-							</>
-						)}
-					</section>
-				)}
+				{systemAgents(slots, maxTotal, used, waiting)}
+				{!hosted && systemQuotaSection(quota)}
 			</div>
 			{/* Outside the meters button: a link cannot nest in a button. Rendered only while a
 			    container warns, so the bar stays grey at rest. */}
@@ -1380,6 +1544,176 @@ function eventCount(total: number | null, hour: number | null): ReactNode {
  *  Docker VM, and the board-wide holds. Containers and VM come from the 30 s System snapshot;
  *  the holds read the live board state with the top bar's own slotUse and queueOrder, so the
  *  two always show the same numbers. */
+/** One container row of the System table: warn head, metrics or gap, turns, mutation lock. */
+function containerRow(
+	c: SystemSnapshot["containers"][number],
+	tasks: TaskCard[],
+	at: number,
+	links: (cards: SystemCard[]) => ReactNode,
+	openTask: (id: string) => void,
+): ReactNode {
+	const warn = c.warnings.length > 0;
+	return (
+		<tr key={c.name} data-warn={warn || undefined}>
+			{containerWarnHead(c)}
+			{c.reachable ? (
+				containerMetrics(c, at)
+			) : (
+				<td colSpan={4} className="sys-gap">
+					{c.unreachableSince === null
+						? "not reachable"
+						: `not reachable since ${clockTime(c.unreachableSince)}`}
+				</td>
+			)}
+			{containerTurns(c, tasks, openTask)}
+			{containerLock(c, links)}
+		</tr>
+	);
+}
+
+/** A container row's first cell: name, warning mark, and the warning reasons in text —
+ *  amber alone never carries a warning. */
+function containerWarnHead(c: SystemSnapshot["containers"][number]): ReactNode {
+	const warn = c.warnings.length > 0;
+	return (
+		<th scope="row">
+			<span className="sys-name">
+				{warn && <Mark kind="needs" />}
+				{c.name}
+			</span>
+			{warn && (
+				<ul className="sys-warns">
+					{c.warnings.map((w) => (
+						<li key={w}>{w}</li>
+					))}
+				</ul>
+			)}
+		</th>
+	);
+}
+
+/** A reachable container's CPU and memory cells with their sparklines, then the event counts. */
+function containerMetrics(
+	c: SystemSnapshot["containers"][number],
+	at: number,
+): ReactNode {
+	return (
+		<>
+			<td data-label="CPU">
+				<div className="sys-metric">
+					<span>
+						{c.cpuPct === null ? "n/a" : `${Math.round(c.cpuPct)} %`}
+						{c.cpuShare !== null && (
+							<span className="sys-sub">
+								{/* One decimal at most: "16", "1.5". */} of{" "}
+								{Math.round(c.cpuShare * 10) / 10} CPUs
+							</span>
+						)}
+					</span>
+					<Sparkline
+						history={c.history}
+						pick={(p) => p.cpu}
+						end={at}
+						ceiling={c.cpuShare === null ? null : c.cpuShare * 100}
+						label="CPU last hour"
+						format={(v) => `${Math.round(v)} %`}
+					/>
+				</div>
+			</td>
+			<td data-label="Memory">
+				<div className="sys-metric">
+					<span>
+						{c.memUsed === null
+							? "n/a"
+							: c.memLimit !== null && c.memLimit > 0
+								? `${gib(c.memUsed)} / ${gib(c.memLimit)} GiB (${Math.round((c.memUsed / c.memLimit) * 100)} %)`
+								: `${gib(c.memUsed)} GiB · no limit`}
+					</span>
+					<Sparkline
+						history={c.history}
+						pick={(p) => p.mem}
+						end={at}
+						ceiling={c.memLimit}
+						label="Memory last hour"
+						format={(v) => `${gib(v)} GiB`}
+					/>
+				</div>
+			</td>
+			<td data-label="Limit hits">
+				{eventCount(c.memMaxHits, c.memMaxHitsHour)}
+			</td>
+			<td data-label="OOM kills">{eventCount(c.oomKills, c.oomKillsHour)}</td>
+		</>
+	);
+}
+
+/** A container's live-turns cell: none, or the turn list with each turn's usage figures. */
+function containerTurns(
+	c: SystemSnapshot["containers"][number],
+	tasks: TaskCard[],
+	openTask: (id: string) => void,
+): ReactNode {
+	if (c.cards.length === 0) {
+		return (
+			<td data-label="Turns">
+				<span className="sys-sub">none</span>
+			</td>
+		);
+	}
+	return (
+		<td data-label="Turns">
+			{/* Largest memory first (the server's order): the turn to look at
+			    when the container runs full leads the list. */}
+			<ul className="sys-turns">
+				{c.cards.map((t) => (
+					<li key={`${t.project}/${t.id}`}>
+						<SystemCardLink card={t} tasks={tasks} openTask={openTask} />
+						{t.usage !== null && (
+							<span className="sys-sub">
+								{turnUsageParts(t.usage).map((part, i) => (
+									<Fragment key={part}>
+										{i > 0 && " · "}
+										<span>{part}</span>
+									</Fragment>
+								))}
+							</span>
+						)}
+					</li>
+				))}
+			</ul>
+		</td>
+	);
+}
+
+/** A container's mutation-lock cell: free or held, plus the waiting cards. */
+function containerLock(
+	c: SystemSnapshot["containers"][number],
+	links: (cards: SystemCard[]) => ReactNode,
+): ReactNode {
+	return (
+		<td data-label="Mutation lock">
+			<span className="sys-cards">
+				{!c.reachable ? (
+					"n/a"
+				) : c.lock.holderPid === null ? (
+					"free"
+				) : (
+					<>
+						<span>pid {c.lock.holderPid}</span>
+						{c.lock.holderCard !== null && links([c.lock.holderCard])}
+					</>
+				)}
+			</span>
+			{c.lock.waiters.length > 0 && (
+				<span className="sys-cards">
+					<span className="sys-sub">{c.lock.waiters.length} waiting:</span>
+					{links(c.lock.waiters)}
+				</span>
+			)}
+		</td>
+	);
+}
+
 function SystemView({
 	state,
 	openTask,
@@ -1444,143 +1778,9 @@ function SystemView({
 									</tr>
 								</thead>
 								<tbody>
-									{system.containers.map((c) => {
-										const warn = c.warnings.length > 0;
-										return (
-											<tr key={c.name} data-warn={warn || undefined}>
-												<th scope="row">
-													<span className="sys-name">
-														{warn && <Mark kind="needs" />}
-														{c.name}
-													</span>
-													{/* The reasons in text: amber alone never carries a warning. */}
-													{warn && (
-														<ul className="sys-warns">
-															{c.warnings.map((w) => (
-																<li key={w}>{w}</li>
-															))}
-														</ul>
-													)}
-												</th>
-												{c.reachable ? (
-													<>
-														<td data-label="CPU">
-															<div className="sys-metric">
-																<span>
-																	{c.cpuPct === null
-																		? "n/a"
-																		: `${Math.round(c.cpuPct)} %`}
-																	{c.cpuShare !== null && (
-																		<span className="sys-sub">
-																			{/* One decimal at most: "16", "1.5". */}{" "}
-																			of {Math.round(c.cpuShare * 10) / 10} CPUs
-																		</span>
-																	)}
-																</span>
-																<Sparkline
-																	history={c.history}
-																	pick={(p) => p.cpu}
-																	end={system.at}
-																	ceiling={
-																		c.cpuShare === null
-																			? null
-																			: c.cpuShare * 100
-																	}
-																	label="CPU last hour"
-																	format={(v) => `${Math.round(v)} %`}
-																/>
-															</div>
-														</td>
-														<td data-label="Memory">
-															<div className="sys-metric">
-																<span>
-																	{c.memUsed === null
-																		? "n/a"
-																		: c.memLimit !== null && c.memLimit > 0
-																			? `${gib(c.memUsed)} / ${gib(c.memLimit)} GiB (${Math.round((c.memUsed / c.memLimit) * 100)} %)`
-																			: `${gib(c.memUsed)} GiB · no limit`}
-																</span>
-																<Sparkline
-																	history={c.history}
-																	pick={(p) => p.mem}
-																	end={system.at}
-																	ceiling={c.memLimit}
-																	label="Memory last hour"
-																	format={(v) => `${gib(v)} GiB`}
-																/>
-															</div>
-														</td>
-														<td data-label="Limit hits">
-															{eventCount(c.memMaxHits, c.memMaxHitsHour)}
-														</td>
-														<td data-label="OOM kills">
-															{eventCount(c.oomKills, c.oomKillsHour)}
-														</td>
-													</>
-												) : (
-													<td colSpan={4} className="sys-gap">
-														{c.unreachableSince === null
-															? "not reachable"
-															: `not reachable since ${clockTime(c.unreachableSince)}`}
-													</td>
-												)}
-												<td data-label="Turns">
-													{c.cards.length === 0 ? (
-														<span className="sys-sub">none</span>
-													) : (
-														// Largest memory first (the server's order): the turn to look at
-														// when the container runs full leads the list.
-														<ul className="sys-turns">
-															{c.cards.map((t) => (
-																<li key={`${t.project}/${t.id}`}>
-																	<SystemCardLink
-																		card={t}
-																		tasks={tasks}
-																		openTask={openTask}
-																	/>
-																	{t.usage !== null && (
-																		<span className="sys-sub">
-																			{turnUsageParts(t.usage).map(
-																				(part, i) => (
-																					<Fragment key={part}>
-																						{i > 0 && " · "}
-																						<span>{part}</span>
-																					</Fragment>
-																				),
-																			)}
-																		</span>
-																	)}
-																</li>
-															))}
-														</ul>
-													)}
-												</td>
-												<td data-label="Mutation lock">
-													<span className="sys-cards">
-														{!c.reachable ? (
-															"n/a"
-														) : c.lock.holderPid === null ? (
-															"free"
-														) : (
-															<>
-																<span>pid {c.lock.holderPid}</span>
-																{c.lock.holderCard !== null &&
-																	links([c.lock.holderCard])}
-															</>
-														)}
-													</span>
-													{c.lock.waiters.length > 0 && (
-														<span className="sys-cards">
-															<span className="sys-sub">
-																{c.lock.waiters.length} waiting:
-															</span>
-															{links(c.lock.waiters)}
-														</span>
-													)}
-												</td>
-											</tr>
-										);
-									})}
+									{system.containers.map((c) =>
+										containerRow(c, tasks, system.at, links, openTask),
+									)}
 								</tbody>
 							</table>
 						</div>
@@ -1801,7 +2001,6 @@ function MermaidDiagram({ code }: { code: string }) {
 			</>
 		);
 	if (svg === null) return <p className="hint wait">Drawing…</p>;
-	// biome-ignore lint/security/noDangerouslySetInnerHtml: mermaid's strict mode sanitizes the SVG
 	return (
 		<div className="hiw-diagram" dangerouslySetInnerHTML={{ __html: svg }} />
 	);
@@ -1898,6 +2097,45 @@ function HowItWorksModal({
 	);
 }
 
+/** The diff body: loading skeleton, unavailable note, empty note, or the section cards. */
+function diffBody(
+	result: { text: string } | { failed: true } | null,
+	sections: DiffSection[],
+	files: string[] | null,
+): ReactNode {
+	if (result === null)
+		return <Skeleton shape="lines" rows={4} label="Loading the diff" />;
+	if ("failed" in result)
+		return <p className="hint diff-empty">Diff unavailable.</p>;
+	if (sections.length === 0) {
+		return (
+			<p className="hint diff-empty">
+				{files === null ? "No changes." : "No diff for this file."}
+			</p>
+		);
+	}
+	return (
+		<div className="diff-scroll">
+			{sections.map((section) => (
+				<section key={section.names[0]} className="diff-card">
+					<div className="diff-card-head">{section.path}</div>
+					<div className="diff-card-body">
+						{numberDiffLines(section.lines).map((line, i) => (
+							<div key={i} className={`dl-${line.cls}`}>
+								<span className="dl-old">{line.old ?? ""}</span>
+								<span className="dl-new">{line.new ?? ""}</span>
+								<span className="dl-text">
+									{line.text === "" ? " " : line.text}
+								</span>
+							</div>
+						))}
+					</div>
+				</section>
+			))}
+		</div>
+	);
+}
+
 /** The task diff in a lightbox: one card per file, each with a line-number gutter.
  *  Fetched live per open; done cards serve the text captured at merge. */
 function DiffModal({
@@ -1954,39 +2192,7 @@ function DiffModal({
 				<span className="diff-head-path">{head}</span>
 				<CloseButton />
 			</div>
-			{result === null ? (
-				<Skeleton shape="lines" rows={4} label="Loading the diff" />
-			) : "failed" in result ? (
-				<p className="hint diff-empty">Diff unavailable.</p>
-			) : sections.length === 0 ? (
-				<p className="hint diff-empty">
-					{files === null ? "No changes." : "No diff for this file."}
-				</p>
-			) : (
-				<div className="diff-scroll">
-					{sections.map((section) => (
-						<section
-							// biome-ignore lint/suspicious/noArrayIndexKey: section paths are unique within one diff
-							key={section.names[0]}
-							className="diff-card"
-						>
-							<div className="diff-card-head">{section.path}</div>
-							<div className="diff-card-body">
-								{numberDiffLines(section.lines).map((line, i) => (
-									// biome-ignore lint/suspicious/noArrayIndexKey: static split of fetched text; lines are positional
-									<div key={i} className={`dl-${line.cls}`}>
-										<span className="dl-old">{line.old ?? ""}</span>
-										<span className="dl-new">{line.new ?? ""}</span>
-										<span className="dl-text">
-											{line.text === "" ? " " : line.text}
-										</span>
-									</div>
-								))}
-							</div>
-						</section>
-					))}
-				</div>
-			)}
+			{diffBody(result, sections, files)}
 		</Modal>
 	);
 }
@@ -2051,6 +2257,112 @@ function QuotaTwin({ limit }: { limit: QuotaState["limits"][number] }) {
 				/>
 			</span>
 		</span>
+	);
+}
+
+/** The model field's quota chip: every window as a twin bar with its used percent; only a
+ *  window past the band turns amber, a critical one red. */
+function modelQuotaChip(
+	limits: QuotaState["limits"],
+	worst: QuotaState["limits"][number] | null,
+): ReactNode {
+	if (worst === null) return null;
+	return (
+		<span className="model-quota" title={quotaTitle(limits)}>
+			{limits.map((l) => (
+				<span key={l.window ?? l.label} className="quota-win">
+					<span className="quota-name">{l.window ?? l.label}</span>
+					<QuotaTwin limit={l} />
+					<span className="quota-pct" data-level={loadLevel(l.usedPct)}>
+						{Math.round(l.usedPct)}%
+					</span>
+				</span>
+			))}
+		</span>
+	);
+}
+
+/** The Thinking row and its level popover shown under the model menu rows. */
+function modelLevelAfter(
+	menu: ModelMenu,
+	levelPopId: string,
+	levelAnchor: string,
+	levelBase: string,
+	level: string,
+	base: string,
+	runLevel: string,
+	pickLevel: (l: string) => void,
+): ReactNode {
+	return (
+		<>
+			<hr className="model-divider" />
+			<button
+				type="button"
+				className="model-option level-row"
+				popoverTarget={levelPopId}
+				disabled={levelBase === ""}
+				title={levelBase === "" ? "Pick a model first" : undefined}
+				style={{ anchorName: levelAnchor } as React.CSSProperties}
+				onKeyDown={(e) => {
+					if (e.key === "ArrowRight" || e.key === "Enter" || e.key === " ") {
+						e.preventDefault();
+						document.getElementById(levelPopId)?.showPopover();
+						document
+							.getElementById(levelPopId)
+							?.querySelector<HTMLElement>(".model-option")
+							?.focus();
+						return;
+					}
+					menu.keys(e);
+				}}
+			>
+				<span>Thinking</span>
+				<span className="level-value">
+					{level === "" ? "Default" : level}
+					<Icon name="chevron-right" size={14} />
+				</span>
+			</button>
+			<div
+				id={levelPopId}
+				popover="auto"
+				className="popover level-pop"
+				style={{ positionAnchor: levelAnchor } as React.CSSProperties}
+			>
+				<p className="level-hint">
+					More thinking gives deeper answers, but turns take longer and use more
+					quota.
+				</p>
+				{["", ...THINKING_LEVELS].map((l) => (
+					<button
+						key={l || "default"}
+						type="button"
+						className="model-option"
+						aria-pressed={level === l}
+						onClick={() => pickLevel(l)}
+						onKeyDown={(e) => {
+							// ArrowLeft steps back to the Thinking row of the model menu.
+							if (e.key !== "ArrowLeft") return menu.keys(e);
+							e.preventDefault();
+							document.getElementById(levelPopId)?.hidePopover();
+							document
+								.getElementById(menu.popId)
+								?.querySelector<HTMLElement>(".level-row")
+								?.focus();
+						}}
+					>
+						{/* On the default model, "Default" names the level it brings (e.g. max). */}
+						<span>
+							{l !== ""
+								? l
+								: base === "" && runLevel !== ""
+									? `Default (${runLevel})`
+									: "Default"}
+						</span>
+						{level === l && <Icon name="check" size={14} />}
+					</button>
+				))}
+			</div>
+		</>
 	);
 }
 
@@ -2124,22 +2436,7 @@ function ModelField({
 						</span>
 						{/* Every window as the top bar's twin bar (time gone over quota used) plus its used
 						    percent; only a window past the band turns amber, a critical one red. */}
-						{worst !== null && (
-							<span className="model-quota" title={quotaTitle(limits)}>
-								{limits.map((l) => (
-									<span key={l.window ?? l.label} className="quota-win">
-										<span className="quota-name">{l.window ?? l.label}</span>
-										<QuotaTwin limit={l} />
-										<span
-											className="quota-pct"
-											data-level={loadLevel(l.usedPct)}
-										>
-											{Math.round(l.usedPct)}%
-										</span>
-									</span>
-								))}
-							</span>
-						)}
+						{modelQuotaChip(limits, worst)}
 					</span>
 					<ModelMenuTrigger menu={menu} label={fullLabel}>
 						<span className="model-name">
@@ -2165,81 +2462,16 @@ function ModelField({
 				total={allModels.length}
 				loading={catalog === null}
 				onPick={pickModel}
-				after={
-					<>
-						<hr className="model-divider" />
-						<button
-							type="button"
-							className="model-option level-row"
-							popoverTarget={levelPopId}
-							disabled={levelBase === ""}
-							title={levelBase === "" ? "Pick a model first" : undefined}
-							style={{ anchorName: levelAnchor } as React.CSSProperties}
-							onKeyDown={(e) => {
-								if (
-									e.key === "ArrowRight" ||
-									e.key === "Enter" ||
-									e.key === " "
-								) {
-									e.preventDefault();
-									document.getElementById(levelPopId)?.showPopover();
-									document
-										.getElementById(levelPopId)
-										?.querySelector<HTMLElement>(".model-option")
-										?.focus();
-									return;
-								}
-								menu.keys(e);
-							}}
-						>
-							<span>Thinking</span>
-							<span className="level-value">
-								{level === "" ? "Default" : level}
-								<Icon name="chevron-right" size={14} />
-							</span>
-						</button>
-						<div
-							id={levelPopId}
-							popover="auto"
-							className="popover level-pop"
-							style={{ positionAnchor: levelAnchor } as React.CSSProperties}
-						>
-							<p className="level-hint">
-								More thinking gives deeper answers, but turns take longer and
-								use more quota.
-							</p>
-							{["", ...THINKING_LEVELS].map((l) => (
-								<button
-									key={l || "default"}
-									type="button"
-									className="model-option"
-									aria-pressed={level === l}
-									onClick={() => pickLevel(l)}
-									onKeyDown={(e) => {
-										// ArrowLeft steps back to the Thinking row of the model menu.
-										if (e.key !== "ArrowLeft") return menu.keys(e);
-										e.preventDefault();
-										document.getElementById(levelPopId)?.hidePopover();
-										document
-											.getElementById(menu.popId)
-											?.querySelector<HTMLElement>(".level-row")
-											?.focus();
-									}}
-								>
-									{/* On the default model, "Default" names the level it brings (e.g. max). */}
-									<span>
-										{l !== ""
-											? l
-											: base === "" && runLevel !== ""
-												? `Default (${runLevel})`
-												: "Default"}
-									</span>
-									{level === l && <Icon name="check" size={14} />}
-								</button>
-							))}
-						</div>
-					</>
-				}
+				after={modelLevelAfter(
+					menu,
+					levelPopId,
+					levelAnchor,
+					levelBase,
+					level,
+					base,
+					runLevel,
+					pickLevel,
+				)}
 			/>
 		</>
 	);
@@ -2496,7 +2728,7 @@ export function ComposeDialog({
 						)}
 						<button
 							type="submit"
-							className={"primary" + (sendState.failed ? " failed" : "")}
+							className={`primary${sendState.failed ? " failed" : ""}`}
 							disabled={sendState.busy || text.trim().length === 0}
 							aria-busy={sendState.busy || undefined}
 							title={`${submitLabel} (Enter)`}
@@ -2730,7 +2962,7 @@ function BacklogModelDialog({
 					</button>
 					<button
 						type="button"
-						className={"primary" + (send.failed ? " failed" : "")}
+						className={`primary${send.failed ? " failed" : ""}`}
 						disabled={send.busy}
 						aria-busy={send.busy || undefined}
 						onClick={() =>
@@ -2819,7 +3051,7 @@ function ImplementStepsDialog({
 					</button>
 					<button
 						type="button"
-						className={"primary" + (send.failed ? " failed" : "")}
+						className={`primary${send.failed ? " failed" : ""}`}
 						disabled={send.busy}
 						aria-busy={send.busy || undefined}
 						onClick={() =>
@@ -2925,6 +3157,196 @@ const EMPTY_STAGE: Record<Stage, string> = {
 	backlog: "No ideas parked.",
 };
 
+/** The release line: first-release or since-tag summary with the editable version input. */
+function releaseLine(
+	plan: ReleasePlan,
+	first: boolean,
+	short: string,
+	version: string,
+	setVersion: (v: string) => void,
+): ReactNode {
+	if (plan.version === "") return null;
+	return (
+		<p className="release-line">
+			<strong>
+				{first ? "First release:" : `${plan.from} →`}
+				<input
+					className="version-input"
+					value={version}
+					onChange={(e) => setVersion(e.target.value)}
+					spellCheck={false}
+					aria-label="Release version"
+				/>
+				<span className="opt-mark">(optional)</span>
+			</strong>
+			<span>
+				{first
+					? `${plan.commits} commits up to ${short}`
+					: `${plan.commits} commits since ${plan.from} up to ${short}`}
+			</span>
+		</p>
+	);
+}
+
+/** The consolidating busy line with its elapsed time, and the fallback notice. */
+function releaseSummary(
+	summaryBusy: boolean,
+	summarySince: number | null,
+	summaryReason: string | null,
+): ReactNode {
+	return (
+		<>
+			{summaryBusy && (
+				<p className="hint wait" role="status">
+					<span className="spinner" aria-hidden="true" />
+					Consolidating the notes…
+					{summarySince !== null && (
+						<>
+							{" · "}
+							<LiveElapsed since={summarySince} />
+						</>
+					)}
+				</p>
+			)}
+			{summaryReason !== null && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					{`Consolidated notes unavailable: ${summaryReason} — showing the deterministic list.`}
+				</p>
+			)}
+		</>
+	);
+}
+
+/** The notes editor: the proposal textarea, the full-commit-list toggle and its list. */
+function releaseNotes(
+	plan: ReleasePlan,
+	notesDraft: string | null,
+	edited: { current: boolean },
+	setNotesDraft: (v: string | null) => void,
+	showCommits: boolean,
+	setShowCommits: React.Dispatch<React.SetStateAction<boolean>>,
+): ReactNode {
+	return (
+		<>
+			<label htmlFor="release-notes-proposal">Release notes</label>
+			<textarea
+				id="release-notes-proposal"
+				rows={10}
+				spellCheck={false}
+				className="release-notes-input"
+				value={notesDraft ?? plan.notes}
+				onChange={(e) => {
+					setNotesDraft(e.target.value);
+					edited.current = e.target.value !== plan.notes;
+				}}
+			/>
+			{plan.from !== null && (
+				<button
+					type="button"
+					className="release-notes-toggle"
+					aria-pressed={showCommits}
+					onClick={() => setShowCommits((v) => !v)}
+				>
+					{showCommits ? "Hide full commit list" : "Show full commit list"}
+				</button>
+			)}
+			{showCommits && (
+				<div className="release-notes">
+					<Markdown text={plan.notes} />
+				</div>
+			)}
+		</>
+	);
+}
+
+/** What happens on Start: the review runs the release command, or Ottr tags directly. */
+function releaseHint(
+	plan: ReleasePlan,
+	project: ProjectView,
+	short: string,
+): ReactNode {
+	if (plan.blocked !== null) {
+		return (
+			<p className="advisory">
+				<Icon name="info" size={14} />
+				{plan.blocked}
+			</p>
+		);
+	}
+	return (
+		<p className="hint">
+			An agent reviews these commits and runs the full verification, including
+			mutation tests. If nothing blocks,{" "}
+			{project.settings.releaseCommand !== null ? (
+				<>
+					Ottr runs the project's release command for {plan.version} at {short}{" "}
+					and then checks the tag with git.
+				</>
+			) : (
+				<>
+					Ottr tags {short} as {plan.version} and{" "}
+					{project.github !== null
+						? "creates the GitHub release"
+						: "pushes the tag"}
+					.
+				</>
+			)}
+		</p>
+	);
+}
+
+/** The dialog's action row: Cancel and the guarded Start release button. */
+function releaseActions(
+	plan: ReleasePlan | null,
+	versionOk: boolean,
+	send: BusyState,
+	start: () => void,
+): ReactNode {
+	return (
+		<div className="dialog-actions">
+			<button
+				type="button"
+				onClick={(e) => e.currentTarget.closest("dialog")?.close()}
+			>
+				Cancel
+			</button>
+			<button
+				type="button"
+				className={`primary${send.failed ? " failed" : ""}`}
+				disabled={
+					plan === null || plan.blocked !== null || !versionOk || send.busy
+				}
+				aria-busy={send.busy || undefined}
+				title={
+					versionOk ? undefined : "Version must match vX.Y.Z (e.g. v1.2.3)"
+				}
+				onClick={start}
+			>
+				{send.busy && <span className="spinner" aria-hidden="true" />}
+				<Icon name="tag" />
+				Start release
+			</button>
+		</div>
+	);
+}
+
+/** The release summary reply: draft the notes, or record why none came. */
+function summaryReply(
+	res: { summary: string | null; reason: string | null },
+	alive: boolean,
+	edited: { current: boolean },
+	setNotesDraft: (v: string | null) => void,
+	setSummaryReason: (v: string | null) => void,
+): void {
+	if (!alive) return;
+	if (res.summary !== null) {
+		if (!edited.current) setNotesDraft(res.summary);
+	} else {
+		setSummaryReason(res.reason);
+	}
+}
+
 /** "Create release" preview: what accumulated on the target since the last tag, and the Start button. Refetches on every open. */
 function ReleaseDialog({
 	project,
@@ -2984,14 +3406,9 @@ function ReleaseDialog({
 						`/api/projects/${encodeURIComponent(project.name)}/release-summary`,
 						{ sha: data.sha },
 					)
-						.then((res) => {
-							if (!alive) return;
-							if (res.summary !== null) {
-								if (!edited.current) setNotesDraft(res.summary);
-							} else {
-								setSummaryReason(res.reason);
-							}
-						})
+						.then((res) =>
+							summaryReply(res, alive, edited, setNotesDraft, setSummaryReason),
+						)
 						.catch((e) => {
 							if (alive)
 								setSummaryReason(e instanceof Error ? e.message : String(e));
@@ -3050,26 +3467,7 @@ function ReleaseDialog({
 				)}
 				{plan !== null && (
 					<>
-						{plan.version !== "" && (
-							<p className="release-line">
-								<strong>
-									{first ? "First release:" : `${plan.from} →`}
-									<input
-										className="version-input"
-										value={version}
-										onChange={(e) => setVersion(e.target.value)}
-										spellCheck={false}
-										aria-label="Release version"
-									/>
-									<span className="opt-mark">(optional)</span>
-								</strong>
-								<span>
-									{first
-										? `${plan.commits} commits up to ${short}`
-										: `${plan.commits} commits since ${plan.from} up to ${short}`}
-								</span>
-							</p>
-						)}
+						{releaseLine(plan, first, short, version, setVersion)}
 						{plan.tasks.length > 0 && (
 							<ul className="release-tasks" aria-label="Tasks in this release">
 								{plan.tasks.map((t) => (
@@ -3079,78 +3477,16 @@ function ReleaseDialog({
 								))}
 							</ul>
 						)}
-						{summaryBusy && (
-							<p className="hint wait" role="status">
-								<span className="spinner" aria-hidden="true" />
-								Consolidating the notes…
-								{summarySince !== null && (
-									<>
-										{" · "}
-										<LiveElapsed since={summarySince} />
-									</>
-								)}
-							</p>
+						{releaseSummary(summaryBusy, summarySince, summaryReason)}
+						{releaseNotes(
+							plan,
+							notesDraft,
+							edited,
+							setNotesDraft,
+							showCommits,
+							setShowCommits,
 						)}
-						{summaryReason !== null && (
-							<p className="advisory">
-								<Icon name="info" size={14} />
-								{`Consolidated notes unavailable: ${summaryReason} — showing the deterministic list.`}
-							</p>
-						)}
-						<label htmlFor="release-notes-proposal">Release notes</label>
-						<textarea
-							id="release-notes-proposal"
-							rows={10}
-							spellCheck={false}
-							className="release-notes-input"
-							value={notesDraft ?? plan.notes}
-							onChange={(e) => {
-								setNotesDraft(e.target.value);
-								edited.current = e.target.value !== plan.notes;
-							}}
-						/>
-						{plan.from !== null && (
-							<button
-								type="button"
-								className="release-notes-toggle"
-								aria-pressed={showCommits}
-								onClick={() => setShowCommits((v) => !v)}
-							>
-								{showCommits
-									? "Hide full commit list"
-									: "Show full commit list"}
-							</button>
-						)}
-						{showCommits && (
-							<div className="release-notes">
-								<Markdown text={plan.notes} />
-							</div>
-						)}
-						{plan.blocked !== null ? (
-							<p className="advisory">
-								<Icon name="info" size={14} />
-								{plan.blocked}
-							</p>
-						) : (
-							<p className="hint">
-								An agent reviews these commits and runs the full verification,
-								including mutation tests. If nothing blocks,{" "}
-								{project.settings.releaseCommand !== null ? (
-									<>
-										Ottr runs the project's release command for {plan.version}{" "}
-										at {short} and then checks the tag with git.
-									</>
-								) : (
-									<>
-										Ottr tags {short} as {plan.version} and{" "}
-										{project.github !== null
-											? "creates the GitHub release"
-											: "pushes the tag"}
-										.
-									</>
-								)}
-							</p>
-						)}
+						{releaseHint(plan, project, short)}
 						<ModelField
 							catalog={catalog}
 							model={model}
@@ -3170,30 +3506,7 @@ function ReleaseDialog({
 						{err}
 					</p>
 				)}
-				<div className="dialog-actions">
-					<button
-						type="button"
-						onClick={(e) => e.currentTarget.closest("dialog")?.close()}
-					>
-						Cancel
-					</button>
-					<button
-						type="button"
-						className={`primary${send.failed ? " failed" : ""}`}
-						disabled={
-							plan === null || plan.blocked !== null || !versionOk || send.busy
-						}
-						aria-busy={send.busy || undefined}
-						title={
-							versionOk ? undefined : "Version must match vX.Y.Z (e.g. v1.2.3)"
-						}
-						onClick={start}
-					>
-						{send.busy && <span className="spinner" aria-hidden="true" />}
-						<Icon name="tag" />
-						Start release
-					</button>
-				</div>
+				{releaseActions(plan, versionOk, send, start)}
 			</div>
 		</Modal>
 	);
@@ -3282,7 +3595,7 @@ function ArchReviewDialog({
 					</button>
 					<button
 						type="submit"
-						className={"primary" + (send.failed ? " failed" : "")}
+						className={`primary${send.failed ? " failed" : ""}`}
 						disabled={send.busy}
 						aria-busy={send.busy || undefined}
 					>
@@ -3362,6 +3675,413 @@ export function cancelledTopic(
 	];
 }
 
+/** Per-column card list plus the done lane's grouping and paging state, computed once per column. */
+function laneColumnData(
+	key: Stage,
+	shown: readonly TaskCard[],
+	q: string,
+	grouped: boolean,
+	topicLimits: ReadonlyMap<string, number>,
+	doneLimit: number,
+	seenAnswers: ReadonlySet<string>,
+) {
+	const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers);
+	// A kicked backlog card (grill session started) renders as a normal card in the todo lane.
+	const filtered = shown.filter((t) => laneStage(t) === key);
+	// Done: latest landing on top. doneAt stamps each entry into Done (the done clock), so it orders by landing time.
+	if (key === "done") filtered.sort(newestLanded);
+	// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
+	let col = key === "done" ? filtered : laneOrder(filtered);
+	// Done lazy-loads: the newest page renders and "Show more" appends the next page;
+	// a search shows every match. Unread answers always stay above the cut.
+	// ponytail: the state payload still carries every card; paginate /api/state
+	// instead if boards grow into the thousands of done cards.
+	let doneHidden = 0;
+	// Empty search only: the done lane groups into topic sections under sticky heads,
+	// every topic loaded and each one paged by its own "Show more". Cancelled cards
+	// stay out of every topic (no topic count includes one) and ride in their own
+	// trailing "Cancelled" section, paged like a topic.
+	const doneGroups =
+		key === "done" && q === "" && grouped
+			? [
+					...doneTopicPages(
+						col.filter(
+							(t) => t.cancelledAt === null && !unread(t) && !t.starred,
+						),
+						topicLimits,
+					),
+					...cancelledTopic(col, topicLimits),
+				]
+			: null;
+	if (key === "done" && q === "" && !grouped) {
+		const page = donePage(
+			col,
+			(t) => unread(t) || (t.starred && t.cancelledAt === null),
+			doneLimit,
+		);
+		col = page.shown;
+		doneHidden = page.hidden;
+	}
+	return { col, doneGroups, doneHidden };
+}
+
+/** The done lane's head tools: the two view toggles and, while grouped, the collapse-all pair. */
+function DoneLaneTools(p: {
+	grouped: boolean;
+	doneGroups:
+		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
+		| null;
+	setGrouped: (v: boolean) => void;
+	setCollapsed: (v: Record<string, boolean>) => void;
+}) {
+	const groups = p.doneGroups;
+	return (
+		<span className="lane-tools">
+			<button
+				type="button"
+				className="view-toggle"
+				aria-pressed={p.grouped}
+				title="Group done cards by topic"
+				onClick={() => p.setGrouped(true)}
+			>
+				By topic
+			</button>
+			<button
+				type="button"
+				className="view-toggle"
+				aria-pressed={!p.grouped}
+				title="Show one flat list, newest done first"
+				onClick={() => p.setGrouped(false)}
+			>
+				By time
+			</button>
+			{groups !== null && (
+				<>
+					<button
+						type="button"
+						title="Collapse all"
+						aria-label="Collapse all"
+						onClick={() =>
+							p.setCollapsed(
+								Object.fromEntries(groups.map((g) => [g.key, true])),
+							)
+						}
+					>
+						<Icon name="chevrons-up" size={13} />
+					</button>
+					<button
+						type="button"
+						title="Expand all"
+						aria-label="Expand all"
+						onClick={() => p.setCollapsed({})}
+					>
+						<Icon name="chevrons-down" size={13} />
+					</button>
+				</>
+			)}
+		</span>
+	);
+}
+
+/** The project head's overflow menu: review, release and diagrams, plus the popover trigger. */
+function ProjectMenu(p: {
+	project: ProjectView;
+	startReview: () => void;
+	showRelease: () => void;
+	showDiagrams: () => void;
+}) {
+	const project = p.project;
+	return (
+		<>
+			<button
+				type="button"
+				className="project-more"
+				popoverTarget="project-more"
+				aria-label="More project actions"
+				title="More project actions"
+			>
+				<Icon name="more" />
+			</button>
+			{/* biome-ignore lint/a11y/useKeyWithClickEvents lint/a11y/noStaticElementInteractions: the items are buttons; a click on one runs it, then this closes the menu */}
+			<div
+				id="project-more"
+				popover="auto"
+				className="project-menu"
+				onClick={(e) => e.currentTarget.hidePopover()}
+			>
+				{project.archReview !== null &&
+					!(project.archReview.due && !project.archReview.running) &&
+					(project.archReview.running || project.archReview.delta > 0) && (
+						<button
+							type="button"
+							className="ghost"
+							disabled={project.archReview.running}
+							title={
+								project.archReview.running
+									? "A review is still open: one review at a time"
+									: `${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`
+							}
+							onClick={p.startReview}
+						>
+							<Icon name="shield-check" size={13} />
+							Start review
+						</button>
+					)}
+				{!project.gitless && (
+					<button
+						type="button"
+						className="ghost"
+						// Same guard as Review: a release runs that review (releaseBlocked).
+						disabled={project.archReview?.running}
+						onClick={p.showRelease}
+						title={
+							project.archReview?.running
+								? "A release or review is still open: one at a time"
+								: "Release all new commits"
+						}
+					>
+						<Icon name="package" />
+						Create release
+					</button>
+				)}
+				{!project.gitless && (
+					<button
+						type="button"
+						className="ghost"
+						onClick={p.showDiagrams}
+						title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
+					>
+						<Icon name="workflow" />
+						Show diagrams
+					</button>
+				)}
+			</div>
+		</>
+	);
+}
+
+/** The review state chip in the project meta line. */
+function ReviewStateChip(p: {
+	review: ProjectView["archReview"];
+	target: string | null;
+}) {
+	return (
+		<span
+			className={p.review?.running ? "arch-live" : "arch-due"}
+			title={
+				p.review?.running
+					? "A review is queued or running, or its findings are still open"
+					: p.review?.reviewed
+						? `Commits on ${p.target} since the last review`
+						: `No review of ${p.target} yet`
+			}
+		>
+			{p.review?.running
+				? "Review in progress"
+				: p.review?.reviewed
+					? `Review due (${p.review.delta} commits)`
+					: "Un-reviewed — review due"}
+		</span>
+	);
+}
+
+/** The project head's meta line: latest release, latest image, review state, open PRs, repo link. */
+function ProjectMeta(p: { project: ProjectView }) {
+	const project = p.project;
+	return (
+		<p className="project-meta">
+			{project.latestRelease !== null &&
+				(project.latestReleaseUrl != null ? (
+					<a
+						href={project.latestReleaseUrl}
+						target="_blank"
+						rel="noopener noreferrer"
+						title="Latest release"
+					>
+						<Icon name="tag" size={13} />
+						{project.latestRelease}
+					</a>
+				) : project.github !== null ? (
+					<a
+						href={`${project.github}/releases/tag/${project.latestRelease}`}
+						target="_blank"
+						rel="noopener noreferrer"
+						title="Latest release"
+					>
+						<Icon name="tag" size={13} />
+						{project.latestRelease}
+					</a>
+				) : (
+					<span title="Latest release">
+						<Icon name="tag" size={13} />
+						{project.latestRelease}
+					</span>
+				))}
+			{project.latestImage !== null && (
+				<a
+					href={project.latestImage.url}
+					target="_blank"
+					rel="noopener noreferrer"
+					title={`Docker image ${project.latestImage.tag}`}
+				>
+					<Icon name="container" size={13} />
+					{project.latestImage.tag}
+				</a>
+			)}
+			{(project.archReview?.due || project.archReview?.running) && (
+				<ReviewStateChip review={project.archReview} target={project.target} />
+			)}
+			{/* More than three open PRs collapse to one count link, mirroring prs.ts's PR_CHIP_MAX. */}
+			{project.openPrs != null &&
+				project.github !== null &&
+				(project.openPrs.prs.length < project.openPrs.total ? (
+					<a
+						href={`${project.github}/pulls`}
+						target="_blank"
+						rel="noopener noreferrer"
+						title="Open pull requests"
+					>
+						<Icon name="git-pr" size={13} />
+						{project.openPrs.total} open PRs
+					</a>
+				) : (
+					project.openPrs.prs.map((pr) => (
+						<a
+							key={pr.number}
+							href={pr.url}
+							target="_blank"
+							rel="noopener noreferrer"
+							title={`${pr.title}${pr.draft ? " (draft)" : ""}`}
+						>
+							<Icon name="git-pr" size={13} />#{pr.number}
+						</a>
+					))
+				))}
+			{project.github !== null && (
+				<a
+					href={project.github}
+					target="_blank"
+					rel="noopener noreferrer"
+					title="GitHub repository"
+				>
+					<GhMark />
+					{repoSlug(project.github)}
+				</a>
+			)}
+		</p>
+	);
+}
+
+/** The advisory strip under the project head: checkout, branch, rules and search notices. */
+function ProjectAdvisories(p: {
+	project: ProjectView;
+	hosted: boolean;
+	short: string | null;
+	q: string;
+	shown: readonly TaskCard[];
+	pushMain: () => Promise<boolean>;
+	saveCheck: (patchBody: Record<string, unknown>) => Promise<boolean>;
+	interview: (path: string, body: Record<string, unknown>) => Promise<boolean>;
+	rulesTask: TaskCard | null;
+	openTask: (id: string) => void;
+}) {
+	const { project, short, q, rulesTask } = p;
+	return (
+		<>
+			{project.dirty && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					The main checkout has uncommitted changes. Your own pull or stash can
+					collide with commits from tasks.
+				</p>
+			)}
+			{project.mainBranch !== null &&
+				short !== null &&
+				project.mainBranch !== short && (
+					<p className="advisory">
+						<Icon name="info" size={14} />
+						The main checkout is on branch <code>{project.mainBranch}</code>,
+						not {short}. Commit to {short}, never to a task branch.
+					</p>
+				)}
+			{short !== null && project.mainUnpushed && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					Local {short} has commits origin lacks. Merges wait until it reaches
+					origin.
+					<BusyButton run={p.pushMain}>Push to origin</BusyButton>
+				</p>
+			)}
+			{project.prModeSuggestion && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					<span>
+						GitHub requires pull requests into <code>{short}</code>, so the
+						merge turn's push would be refused.{" "}
+						<BusyButton run={() => p.saveCheck({ prMode: true })}>
+							Turn on PR mode
+						</BusyButton>
+					</span>
+				</p>
+			)}
+			{project.githubHostNotice &&
+				!hostedHidden(p.hosted, "github-host-block") && (
+					<p className="advisory">
+						<Icon name="info" size={14} />
+						<span>
+							GitHub features off: set GitHub host to{" "}
+							<code>{project.githubHostNotice}</code> under{" "}
+							<button
+								type="button"
+								className="notif-link"
+								onClick={() => openSettingsSection("github-host-block")}
+							>
+								Settings → Git hosts → GitHub host
+							</button>
+							.
+						</span>
+					</p>
+				)}
+			{!project.hasRules && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					No AGENTS.md yet, so tasks wait in Todo.
+					{rulesTask === null ? (
+						<BusyButton run={() => p.interview("/interview", {})}>
+							Discuss rules
+						</BusyButton>
+					) : (
+						<BusyButton
+							run={async () => {
+								p.openTask(rulesTask.id);
+								return true;
+							}}
+						>
+							Open rules task
+						</BusyButton>
+					)}
+				</p>
+			)}
+			{project.gitless && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					Not a git repository yet, so every action waits.
+					<BusyButton run={() => p.interview("/init", {})}>
+						Create git repo
+					</BusyButton>
+				</p>
+			)}
+			{q !== "" && p.shown.length === 0 && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					No tasks match "{q}".
+				</p>
+			)}
+		</>
+	);
+}
+
+/** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
 /** OTTR-708: the cross-project dependency lookup for one project's board — resolves a
  * dependsOn id through the project's own cards first, then by the projects' id handles
  * (resolveDep, the server's rule). undefined when the project is not among `projects`. */
@@ -3381,7 +4101,6 @@ function depIndexOf(
 	return own === undefined ? undefined : (id) => findDep(id, deps, own);
 }
 
-/** One project's flow: identity and New task, advisories, the queue, then the four stage columns. */
 export function ProjectBoard({
 	project,
 	tasks,
@@ -3526,103 +4245,7 @@ export function ProjectBoard({
 					<ProjectLogo project={project} />
 					<div className="project-id-text">
 						<h1 id="project-title">{projectLabel(project)}</h1>
-						<p className="project-meta">
-							{project.latestRelease !== null &&
-								(project.latestReleaseUrl != null ? (
-									<a
-										href={project.latestReleaseUrl}
-										target="_blank"
-										rel="noopener noreferrer"
-										title="Latest release"
-									>
-										<Icon name="tag" size={13} />
-										{project.latestRelease}
-									</a>
-								) : project.github !== null ? (
-									<a
-										href={`${project.github}/releases/tag/${project.latestRelease}`}
-										target="_blank"
-										rel="noopener noreferrer"
-										title="Latest release"
-									>
-										<Icon name="tag" size={13} />
-										{project.latestRelease}
-									</a>
-								) : (
-									<span title="Latest release">
-										<Icon name="tag" size={13} />
-										{project.latestRelease}
-									</span>
-								))}
-							{project.latestImage !== null && (
-								<a
-									href={project.latestImage.url}
-									target="_blank"
-									rel="noopener noreferrer"
-									title={`Docker image ${project.latestImage.tag}`}
-								>
-									<Icon name="container" size={13} />
-									{project.latestImage.tag}
-								</a>
-							)}
-							{(project.archReview?.due || project.archReview?.running) && (
-								<span
-									className={
-										project.archReview.running ? "arch-live" : "arch-due"
-									}
-									title={
-										project.archReview.running
-											? "A review is queued or running, or its findings are still open"
-											: project.archReview.reviewed
-												? `Commits on ${project.target} since the last review`
-												: `No review of ${project.target} yet`
-									}
-								>
-									{project.archReview.running
-										? "Review in progress"
-										: project.archReview.reviewed
-											? `Review due (${project.archReview.delta} commits)`
-											: "Un-reviewed — review due"}
-								</span>
-							)}
-							{/* More than three open PRs collapse to one count link, mirroring prs.ts's PR_CHIP_MAX. */}
-							{project.openPrs != null &&
-								project.github !== null &&
-								(project.openPrs.prs.length < project.openPrs.total ? (
-									<a
-										href={`${project.github}/pulls`}
-										target="_blank"
-										rel="noopener noreferrer"
-										title="Open pull requests"
-									>
-										<Icon name="git-pr" size={13} />
-										{project.openPrs.total} open PRs
-									</a>
-								) : (
-									project.openPrs.prs.map((pr) => (
-										<a
-											key={pr.number}
-											href={pr.url}
-											target="_blank"
-											rel="noopener noreferrer"
-											title={`${pr.title}${pr.draft ? " (draft)" : ""}`}
-										>
-											<Icon name="git-pr" size={13} />#{pr.number}
-										</a>
-									))
-								))}
-							{project.github !== null && (
-								<a
-									href={project.github}
-									target="_blank"
-									rel="noopener noreferrer"
-									title="GitHub repository"
-								>
-									<GhMark />
-									{repoSlug(project.github)}
-								</a>
-							)}
-						</p>
+						<ProjectMeta project={project} />
 					</div>
 				</div>
 				<div className="project-actions">
@@ -3675,72 +4298,12 @@ export function ProjectBoard({
 					</a>
 					{/* Rules alignment lives in project settings only; the menu lists the remaining actions. */}
 					{(project.archReview !== null || !project.gitless) && (
-						<>
-							<button
-								type="button"
-								className="project-more"
-								popoverTarget="project-more"
-								aria-label="More project actions"
-								title="More project actions"
-							>
-								<Icon name="more" />
-							</button>
-							{/* biome-ignore lint/a11y/useKeyWithClickEvents lint/a11y/noStaticElementInteractions: the items are buttons; a click on one runs it, then this closes the menu */}
-							<div
-								id="project-more"
-								popover="auto"
-								className="project-menu"
-								onClick={(e) => e.currentTarget.hidePopover()}
-							>
-								{project.archReview !== null &&
-									!(project.archReview.due && !project.archReview.running) &&
-									(project.archReview.running ||
-										project.archReview.delta > 0) && (
-										<button
-											type="button"
-											className="ghost"
-											disabled={project.archReview.running}
-											title={
-												project.archReview.running
-													? "A review is still open: one review at a time"
-													: `${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`
-											}
-											onClick={() => setShowReview(true)}
-										>
-											<Icon name="shield-check" size={13} />
-											Start review
-										</button>
-									)}
-								{!project.gitless && (
-									<button
-										type="button"
-										className="ghost"
-										// Same guard as Review: a release runs that review (releaseBlocked).
-										disabled={project.archReview?.running}
-										onClick={() => setShowRelease(true)}
-										title={
-											project.archReview?.running
-												? "A release or review is still open: one at a time"
-												: "Release all new commits"
-										}
-									>
-										<Icon name="package" />
-										Create release
-									</button>
-								)}
-								{!project.gitless && (
-									<button
-										type="button"
-										className="ghost"
-										onClick={() => setShowDiagrams(true)}
-										title="Show docs/how-it-works.md with its Mermaid diagrams, as committed on the target branch"
-									>
-										<Icon name="workflow" />
-										Show diagrams
-									</button>
-								)}
-							</div>
-						</>
+						<ProjectMenu
+							project={project}
+							startReview={() => setShowReview(true)}
+							showRelease={() => setShowRelease(true)}
+							showDiagrams={() => setShowDiagrams(true)}
+						/>
 					)}
 					{!project.gitless && (
 						<button
@@ -3776,95 +4339,18 @@ export function ProjectBoard({
 					open={open}
 				/>
 			)}
-			{project.dirty && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					The main checkout has uncommitted changes. Your own pull or stash can
-					collide with commits from tasks.
-				</p>
-			)}
-			{project.mainBranch !== null &&
-				short !== null &&
-				project.mainBranch !== short && (
-					<p className="advisory">
-						<Icon name="info" size={14} />
-						The main checkout is on branch <code>{project.mainBranch}</code>,
-						not {short}. Commit to {short}, never to a task branch.
-					</p>
-				)}
-			{short !== null && project.mainUnpushed && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					Local {short} has commits origin lacks. Merges wait until it reaches
-					origin.
-					<BusyButton run={pushMain}>Push to origin</BusyButton>
-				</p>
-			)}
-			{project.prModeSuggestion && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					<span>
-						GitHub requires pull requests into <code>{short}</code>, so the
-						merge turn's push would be refused.{" "}
-						<BusyButton run={() => saveCheck({ prMode: true })}>
-							Turn on PR mode
-						</BusyButton>
-					</span>
-				</p>
-			)}
-			{project.githubHostNotice &&
-				!hostedHidden(hosted, "github-host-block") && (
-					<p className="advisory">
-						<Icon name="info" size={14} />
-						<span>
-							GitHub features off: set GitHub host to{" "}
-							<code>{project.githubHostNotice}</code> under{" "}
-							<button
-								type="button"
-								className="notif-link"
-								onClick={() => openSettingsSection("github-host-block")}
-							>
-								Settings → Git hosts → GitHub host
-							</button>
-							.
-						</span>
-					</p>
-				)}
-			{!project.hasRules && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					No AGENTS.md yet, so tasks wait in Todo.
-					{rulesTask === null ? (
-						<BusyButton run={() => interview("/interview", {})}>
-							Discuss rules
-						</BusyButton>
-					) : (
-						<BusyButton
-							run={async () => {
-								open(rulesTask.id);
-								return true;
-							}}
-						>
-							Open rules task
-						</BusyButton>
-					)}
-				</p>
-			)}
-			{project.gitless && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					Not a git repository yet, so every action waits.
-					<BusyButton run={() => interview("/init", {})}>
-						Create git repo
-					</BusyButton>
-				</p>
-			)}
-			{q !== "" && shown.length === 0 && (
-				<p className="advisory">
-					<Icon name="info" size={14} />
-					No tasks match "{q}".
-				</p>
-			)}
+			<ProjectAdvisories
+				project={project}
+				hosted={hosted}
+				short={short}
+				q={q}
+				shown={shown}
+				pushMain={pushMain}
+				saveCheck={saveCheck}
+				interview={interview}
+				rulesTask={rulesTask}
+				openTask={open}
+			/>
 			{project.settings.setupChecklist && (
 				<SetupChecklist
 					project={project}
@@ -3958,44 +4444,17 @@ export function ProjectBoard({
 				}}
 			>
 				{COLUMNS.map((c) => {
+					const { col, doneGroups, doneHidden } = laneColumnData(
+						c.key,
+						shown,
+						q,
+						grouped,
+						topicLimits,
+						doneLimit,
+						seenAnswers,
+					);
 					const count = counts[c.key];
-					// A kicked backlog card (grill session started) renders as a normal card in the todo lane.
-					const filtered = shown.filter((t) => laneStage(t) === c.key);
-					// Done: latest landing on top. doneAt stamps each entry into Done (the done clock), so it orders by landing time.
-					if (c.key === "done") filtered.sort(newestLanded);
-					// Other columns: running/needs_you first, queued cards in queue priority (draggable order).
 					const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers);
-					let col = c.key === "done" ? filtered : laneOrder(filtered);
-					// Done lazy-loads: the newest page renders and "Show more" appends the next page;
-					// a search shows every match. Unread answers always stay above the cut.
-					// ponytail: the state payload still carries every card; paginate /api/state
-					// instead if boards grow into the thousands of done cards.
-					let doneHidden = 0;
-					// Empty search only: the done lane groups into topic sections under sticky heads,
-					// every topic loaded and each one paged by its own "Show more". Cancelled cards
-					// stay out of every topic (no topic count includes one) and ride in their own
-					// trailing "Cancelled" section, paged like a topic.
-					const doneGroups =
-						c.key === "done" && q === "" && grouped
-							? [
-									...doneTopicPages(
-										col.filter(
-											(t) => t.cancelledAt === null && !unread(t) && !t.starred,
-										),
-										topicLimits,
-									),
-									...cancelledTopic(col, topicLimits),
-								]
-							: null;
-					if (c.key === "done" && q === "" && !grouped) {
-						const page = donePage(
-							col,
-							(t) => unread(t) || (t.starred && t.cancelledAt === null),
-							doneLimit,
-						);
-						col = page.shown;
-						doneHidden = page.hidden;
-					}
 					const onReorder = (
 						dragId: string,
 						beforeId: string | null,
@@ -4019,52 +4478,12 @@ export function ProjectBoard({
 							<h2 id={`stage-${c.key}`} className="stage-head">
 								<span className="stage-name">{c.label}</span>
 								{c.key === "done" && q === "" && (
-									<span className="lane-tools">
-										<button
-											type="button"
-											className="view-toggle"
-											aria-pressed={grouped}
-											title="Group done cards by topic"
-											onClick={() => setGrouped(true)}
-										>
-											By topic
-										</button>
-										<button
-											type="button"
-											className="view-toggle"
-											aria-pressed={!grouped}
-											title="Show one flat list, newest done first"
-											onClick={() => setGrouped(false)}
-										>
-											By time
-										</button>
-										{doneGroups !== null && (
-											<>
-												<button
-													type="button"
-													title="Collapse all"
-													aria-label="Collapse all"
-													onClick={() =>
-														setCollapsed(
-															Object.fromEntries(
-																doneGroups.map((g) => [g.key, true]),
-															),
-														)
-													}
-												>
-													<Icon name="chevrons-up" size={13} />
-												</button>
-												<button
-													type="button"
-													title="Expand all"
-													aria-label="Expand all"
-													onClick={() => setCollapsed({})}
-												>
-													<Icon name="chevrons-down" size={13} />
-												</button>
-											</>
-										)}
-									</span>
+									<DoneLaneTools
+										grouped={grouped}
+										doneGroups={doneGroups}
+										setGrouped={setGrouped}
+										setCollapsed={setCollapsed}
+									/>
 								)}
 								{count.fresh > 0 && (
 									<span
@@ -5183,11 +5602,286 @@ function CellBar({
 	);
 }
 
+/** Slide the lane's cards to their new places; the farthest traveler (the dropped card) passes over the neighbours it crosses. */
+function playSlides(
+	els: Map<string, HTMLElement>,
+	slides: Map<string, number>,
+): void {
+	if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+	let lead = "";
+	let far = 0;
+	for (const [id, dy] of slides) {
+		if (Math.abs(dy) > far) {
+			far = Math.abs(dy);
+			lead = id;
+		}
+	}
+	for (const [id, dy] of slides) {
+		const el = els.get(id);
+		if (el === undefined) continue;
+		if (id === lead) el.style.zIndex = "3";
+		const reset = (): void => {
+			if (id === lead) el.style.zIndex = "";
+		};
+		el.animate(
+			[{ transform: `translateY(${dy}px)` }, { transform: "none" }],
+			{ duration: 220, easing: "cubic-bezier(0.2, 0.7, 0.3, 1)" }, // --ease; WAAPI options don't resolve var()
+		).finished.then(reset, reset);
+	}
+}
+
+/** The focused queued card an Alt+Arrow press targets, or null when the key press is not a lane reorder. */
+function queueTarget(
+	e: React.KeyboardEvent,
+	queued: readonly TaskCard[],
+): { id: string; idx: number } | null {
+	if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return null;
+	const el = (e.target as HTMLElement).closest<HTMLElement>(
+		".card[data-task-id]",
+	);
+	if (el === null) return null;
+	const id = el.dataset.taskId;
+	if (id === undefined) return null;
+	const idx = queued.findIndex((t) => t.id === id);
+	if (idx < 0) return null;
+	return { id, idx };
+}
+
+/** One collapsible topic section in a lane: sticky head with chevron and count, then the cards. */
+function TopicSection(p: {
+	id: string;
+	label: string;
+	collapsed: boolean;
+	onToggle: () => void;
+	count: React.ReactNode;
+	children: React.ReactNode;
+}) {
+	return (
+		<section className="topic" data-collapsed={p.collapsed || undefined}>
+			<button
+				type="button"
+				className="topic-head"
+				aria-expanded={!p.collapsed}
+				aria-controls={p.id}
+				onClick={p.onToggle}
+			>
+				<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+					<path d="M2 3l2 2 2-2" />
+				</svg>
+				<span className="lane-label">{p.label}</span>
+				<span className="topic-count">{p.count}</span>
+			</button>
+			<div className="topic-body" id={p.id}>
+				<div className="topic-cards">{p.children}</div>
+			</div>
+		</section>
+	);
+}
+
+/** A lane's card content: the empty state, the done lane's pinned/starred/topic sections or the flat list, then the "Show more" button. */
+function LaneCards(p: {
+	stage: Stage;
+	filtering: boolean;
+	hasTasks: boolean;
+	total: number;
+	unread: (t: TaskCard) => boolean;
+	fresh: TaskCard[];
+	starred: TaskCard[];
+	groups:
+		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
+		| null;
+	view: TaskCard[];
+	more: number;
+	onMore: (() => void) | undefined;
+	collapsed: Record<string, boolean>;
+	uid: string;
+	onToggle: (key: string) => void;
+	onTopicMore: ((key: string) => void) | undefined;
+	showMore: (e: ReactMouseEvent<HTMLButtonElement>, go: () => void) => void;
+	card: (t: TaskCard) => ReactNode;
+}) {
+	const {
+		stage,
+		filtering,
+		hasTasks,
+		total,
+		unread,
+		fresh,
+		starred,
+		groups,
+		view,
+		more,
+		onMore,
+		collapsed,
+		uid,
+		onToggle,
+		onTopicMore,
+		showMore,
+		card,
+	} = p;
+	return (
+		<>
+			{!hasTasks && (
+				<p className="stage-empty">
+					{filtering ? "No matches." : EMPTY_STAGE[stage]}
+				</p>
+			)}
+			{p.fresh.length > 0 && <p className="lane-label">Inbox</p>}
+			{p.fresh.map(p.card)}
+			{p.fresh.length > 0 && p.fresh.length + p.starred.length < p.total && (
+				<hr className="lane-divider" />
+			)}
+			{p.starred.length > 0 && (
+				<TopicSection
+					id={`${p.uid}-topic-starred`}
+					label="Starred"
+					collapsed={p.collapsed.starred === true}
+					onToggle={() => p.onToggle("starred")}
+					count={p.starred.length}
+				>
+					{p.starred.map(p.card)}
+				</TopicSection>
+			)}
+			{/* A collapsed section is just its head, whose own border-bottom already
+			    draws the single divider; the extra rule would double it. */}
+			{starred.length > 0 &&
+				collapsed.starred !== true &&
+				fresh.length + starred.length < total && (
+					<hr className="lane-divider" />
+				)}
+			{groups !== null
+				? groups.map((g) => (
+						<TopicSection
+							key={g.key}
+							id={`${uid}-topic-${g.key}`}
+							label={g.label}
+							collapsed={collapsed[g.key] === true}
+							onToggle={() => onToggle(g.key)}
+							count={`${g.tasks.length}/${g.tasks.length + g.hidden}`}
+						>
+							{g.tasks.map(card)}
+							{g.hidden > 0 && onTopicMore && (
+								<button
+									type="button"
+									className="lane-more"
+									onClick={(e) => showMore(e, () => onTopicMore(g.key))}
+									title={`Show older ${g.label} cards`}
+									aria-label={`Show more, ${g.hidden} older ${g.label} cards`}
+								>
+									Show more
+									<span className="topic-count">{g.hidden}</span>
+								</button>
+							)}
+						</TopicSection>
+					))
+				: // Only the done lane pins unread and starred cards above; other lanes show every card.
+					view
+						.filter(
+							(t) =>
+								stage !== "done" ||
+								t.cancelledAt !== null ||
+								(!unread(t) && !t.starred),
+						)
+						.map(card)}
+			{more > 0 && onMore && (
+				<button
+					type="button"
+					className="lane-more"
+					onClick={(e) => showMore(e, onMore)}
+					title="Show older done cards"
+					aria-label={`Show more, ${more} older cards`}
+				>
+					Show more
+					<span className="topic-count">{more}</span>
+				</button>
+			)}
+		</>
+	);
+}
+
 /**
  * One stage column; every card renders and the column scrolls when they overflow.
  * The browser owns the scroll position: no page state to clamp when the list shrinks,
  * and keyboard focus into an off-screen card scrolls it into view for free.
  */
+/** The drag-and-drop and keyboard props for a lane with queued cards; empty when reorder is off. */
+function laneDndProps(p: {
+	dnd: boolean;
+	busy: boolean;
+	dragId: string | null;
+	setDrop: (v: string | null | undefined) => void;
+	clear: () => void;
+	dropAt: (y: number) => string | null | undefined;
+	sendReorder: (id: string, before: string | null) => void;
+	queueKeydown: (e: React.KeyboardEvent) => void;
+}) {
+	const onKeyDown = p.busy ? undefined : p.queueKeydown;
+	if (!p.dnd) return { onKeyDown };
+	const onDragLeave = (e: React.DragEvent): void => {
+		const rect = e.currentTarget.getBoundingClientRect();
+		if (
+			e.clientX < rect.left ||
+			e.clientX > rect.right ||
+			e.clientY < rect.top ||
+			e.clientY > rect.bottom
+		)
+			p.setDrop(undefined);
+	};
+	if (p.dragId === null) return { onDragLeave, onKeyDown };
+	const dragId = p.dragId;
+	const onDragOver = (e: React.DragEvent): void => {
+		if ((e.target as Element).closest('.card:not([draggable="true"])')) {
+			p.setDrop(undefined);
+			return;
+		}
+		e.preventDefault();
+		e.dataTransfer.dropEffect = "move";
+		p.setDrop(p.dropAt(e.clientY));
+	};
+	const onDrop = (e: React.DragEvent): void => {
+		if ((e.target as Element).closest('.card:not([draggable="true"])')) return;
+		e.preventDefault();
+		const before = p.dropAt(e.clientY);
+		if (before === undefined) {
+			p.clear();
+			return;
+		}
+		// Clearing here, not in onDragEnd: setPending re-renders before the browser
+		// dispatches dragend, which detaches the drag prop and its handler, so a
+		// stale drop would re-send the reorder after the order confirms.
+		p.clear();
+		p.sendReorder(dragId, before);
+	};
+	return { onDragOver, onDrop, onDragLeave, onKeyDown };
+}
+
+/** Which open release holds each queued merge: the inverse of the release cards' heldMerges lists. */
+function heldByMap(
+	projectTasks: readonly TaskCard[],
+): Map<string, { id: string; version: string | null }> {
+	const heldBy = new Map<string, { id: string; version: string | null }>();
+	for (const r of projectTasks) {
+		if (r.heldMerges === undefined) continue;
+		for (const id of r.heldMerges)
+			heldBy.set(id, { id: r.id, version: r.releaseVersion });
+	}
+	return heldBy;
+}
+
+/** The lane's rendered list: with an overlay held, non-queued cards keep their positions first and the queued block follows the client's order (the partition laneOrder draws). */
+function laneView(
+	tasks: readonly TaskCard[],
+	localOrder: readonly string[] | null,
+): TaskCard[] {
+	if (localOrder === null) return [...tasks];
+	return [
+		...tasks.filter((t) => t.state !== "queued"),
+		...localOrder
+			.map((id) => tasks.find((t) => t.id === id))
+			.filter((t) => t !== undefined),
+	];
+}
+
 export function LaneCol({
 	stage,
 	tasks,
@@ -5287,28 +5981,7 @@ export function LaneCol({
 		}
 		const slides = listSlides(tops.current, next);
 		tops.current = next;
-		if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-		// The card that travels farthest, the dropped one, passes over the neighbours it crosses.
-		let lead = "";
-		let far = 0;
-		for (const [id, dy] of slides) {
-			if (Math.abs(dy) > far) {
-				far = Math.abs(dy);
-				lead = id;
-			}
-		}
-		for (const [id, dy] of slides) {
-			const el = els.get(id);
-			if (el === undefined) continue;
-			if (id === lead) el.style.zIndex = "3";
-			const reset = (): void => {
-				if (id === lead) el.style.zIndex = "";
-			};
-			el.animate(
-				[{ transform: `translateY(${dy}px)` }, { transform: "none" }],
-				{ duration: 220, easing: "cubic-bezier(0.2, 0.7, 0.3, 1)" }, // --ease; WAAPI options don't resolve var()
-			).finished.then(reset, reset);
-		}
+		playSlides(els, slides);
 	});
 	// Queued-card facts the drag map keys on: the joined id order changes only when the
 	// queue's membership or order changes, so unchanged frames reuse the drag objects.
@@ -5401,6 +6074,22 @@ export function LaneCol({
 		if (serverQueued === localOrder.join(" ")) setLocalOrder(null);
 	}, [tasks, localOrder]);
 
+	// Keyboard reorder: Alt+Arrow moves the focused queued card within its column's queued block.
+	const queueKeydown = (e: React.KeyboardEvent): void => {
+		const hit = queueTarget(e, queued);
+		if (hit === null) return;
+		const { id, idx } = hit;
+		if (e.key === "ArrowUp" && idx > 0) {
+			const prev = queued[idx - 1];
+			if (prev !== undefined) sendReorder(id, prev.id);
+			e.preventDefault();
+		} else if (e.key === "ArrowDown" && idx < queued.length - 1) {
+			const next = queued[idx + 2];
+			sendReorder(id, next !== undefined ? next.id : null);
+			e.preventDefault();
+		}
+	};
+
 	if (!hasTasks && !showBacklogRow)
 		return (
 			<p className="stage-empty">
@@ -5413,15 +6102,7 @@ export function LaneCol({
 	// targets, so a queued card can never land above a running/needs_you card.
 	// The rendered list: with an overlay held, non-queued cards keep their positions first
 	// and the queued block follows the client's order (the partition laneOrder draws).
-	const view =
-		localOrder === null
-			? tasks
-			: [
-					...tasks.filter((t) => t.state !== "queued"),
-					...localOrder
-						.map((id) => tasks.find((t) => t.id === id))
-						.filter((t) => t !== undefined),
-				];
+	const view = laneView(tasks, localOrder);
 	// One reorder at a time: a second request would be computed from the pre-reorder order and
 	// overwrite the first on the server (last write wins). Every reorder path routes through here.
 	const sendReorder = (id: string, before: string | null): void => {
@@ -5436,6 +6117,7 @@ export function LaneCol({
 			})
 			.finally(() => setPending(null));
 	};
+	// Keyboard reorder: Alt+Arrow moves the focused queued card within its column's queued block.
 	// ponytail: read live card midpoints during drag; cache only if columns reach hundreds of cards.
 	const dropAt = (y: number): string | null | undefined => {
 		const box = boxRef.current;
@@ -5464,14 +6146,7 @@ export function LaneCol({
 		moreFocus.current = { scope, index };
 		go();
 	};
-	// The inverse of the release cards' heldMerges lists: which open release holds each queued
-	// merge, so the held card can link to the release card that parks it.
-	const heldBy = new Map<string, { id: string; version: string | null }>();
-	for (const r of projectTasks) {
-		if (r.heldMerges === undefined) continue;
-		for (const id of r.heldMerges)
-			heldBy.set(id, { id: r.id, version: r.releaseVersion });
-	}
+	const heldBy = heldByMap(projectTasks);
 	const card = (t: TaskCard): ReactNode => (
 		<Card
 			key={t.id}
@@ -5511,195 +6186,40 @@ export function LaneCol({
 			? tasks.filter((t) => t.cancelledAt === null && t.starred && !unread(t))
 			: [];
 	return (
-		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop target for queued cards; keyboard users act through the card buttons
 		<div
 			className={`stage-cards${drop === null ? " drop-end" : ""}`}
 			ref={boxRef}
 			aria-busy={busy || undefined}
-			onDragOver={
-				dnd && dragId !== null
-					? (e) => {
-							if (
-								(e.target as Element).closest('.card:not([draggable="true"])')
-							) {
-								setDrop(undefined);
-								return;
-							}
-							e.preventDefault();
-							e.dataTransfer.dropEffect = "move";
-							setDrop(dropAt(e.clientY));
-						}
-					: undefined
-			}
-			onDrop={
-				dnd && dragId !== null
-					? (e) => {
-							if (
-								(e.target as Element).closest('.card:not([draggable="true"])')
-							)
-								return;
-							e.preventDefault();
-							const before = dropAt(e.clientY);
-							if (before === undefined) {
-								clear();
-								return;
-							}
-							// Clearing here, not in onDragEnd: setPending re-renders before the browser
-							// dispatches dragend, which detaches the drag prop and its handler, so a
-							// stale drop would re-send the reorder after the order confirms.
-							clear();
-							sendReorder(dragId, before);
-						}
-					: undefined
-			}
-			onDragLeave={
-				dnd
-					? (e) => {
-							const rect = e.currentTarget.getBoundingClientRect();
-							if (
-								e.clientX < rect.left ||
-								e.clientX > rect.right ||
-								e.clientY < rect.top ||
-								e.clientY > rect.bottom
-							)
-								setDrop(undefined);
-						}
-					: undefined
-			}
-			// Keyboard reorder: Alt+Arrow moves the focused queued card within its column's queued block.
-			onKeyDown={
-				dnd && !busy
-					? (e) => {
-							if (!e.altKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown"))
-								return;
-							const el = (e.target as HTMLElement).closest<HTMLElement>(
-								".card[data-task-id]",
-							);
-							if (el === null) return;
-							const id = el.dataset.taskId;
-							if (id === undefined) return;
-							const idx = queued.findIndex((t) => t.id === id);
-							if (idx < 0) return;
-							if (e.key === "ArrowUp" && idx > 0) {
-								sendReorder(id, queued[idx - 1]!.id);
-								e.preventDefault();
-							} else if (e.key === "ArrowDown" && idx < queued.length - 1) {
-								sendReorder(
-									id,
-									idx + 2 < queued.length ? queued[idx + 2]!.id : null,
-								);
-								e.preventDefault();
-							}
-						}
-					: undefined
-			}
+			{...laneDndProps({
+				dnd,
+				busy,
+				dragId,
+				setDrop,
+				clear,
+				dropAt,
+				sendReorder,
+				queueKeydown,
+			})}
 		>
-			{!hasTasks && (
-				<p className="stage-empty">
-					{filtering ? "No matches." : EMPTY_STAGE[stage]}
-				</p>
-			)}
-			{fresh.length > 0 && <p className="lane-label">Inbox</p>}
-			{fresh.map(card)}
-			{fresh.length > 0 && fresh.length + starred.length < tasks.length && (
-				<hr className="lane-divider" />
-			)}
-			{starred.length > 0 && (
-				<section
-					className="topic"
-					data-collapsed={collapsed.starred === true || undefined}
-				>
-					<button
-						type="button"
-						className="topic-head"
-						aria-expanded={collapsed.starred !== true}
-						aria-controls={`${uid}-topic-starred`}
-						onClick={() => onToggle("starred")}
-					>
-						<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-							<path d="M2 3l2 2 2-2" />
-						</svg>
-						<span className="lane-label">Starred</span>
-						<span className="topic-count">{starred.length}</span>
-					</button>
-					<div className="topic-body" id={`${uid}-topic-starred`}>
-						<div className="topic-cards">{starred.map(card)}</div>
-					</div>
-				</section>
-			)}
-			{/* A collapsed section is just its head, whose own border-bottom already
-			    draws the single divider; the extra rule would double it. */}
-			{starred.length > 0 &&
-				collapsed.starred !== true &&
-				fresh.length + starred.length < tasks.length && (
-					<hr className="lane-divider" />
-				)}
-			{groups !== null
-				? groups.map((g) => {
-						const bodyId = `${uid}-topic-${g.key}`;
-						const isCollapsed = collapsed[g.key] === true;
-						return (
-							<section
-								key={g.key}
-								className="topic"
-								data-collapsed={isCollapsed || undefined}
-							>
-								<button
-									type="button"
-									className="topic-head"
-									aria-expanded={!isCollapsed}
-									aria-controls={bodyId}
-									onClick={() => onToggle(g.key)}
-								>
-									<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-										<path d="M2 3l2 2 2-2" />
-									</svg>
-									<span className="lane-label">{g.label}</span>
-									<span className="topic-count">
-										{`${g.tasks.length}/${g.tasks.length + g.hidden}`}
-									</span>
-								</button>
-								<div className="topic-body" id={bodyId}>
-									<div className="topic-cards">
-										{g.tasks.map(card)}
-										{g.hidden > 0 && onTopicMore && (
-											<button
-												type="button"
-												className="lane-more"
-												onClick={(e) => showMore(e, () => onTopicMore(g.key))}
-												title={`Show older ${g.label} cards`}
-												aria-label={`Show more, ${g.hidden} older ${g.label} cards`}
-											>
-												Show more
-												<span className="topic-count">{g.hidden}</span>
-											</button>
-										)}
-									</div>
-								</div>
-							</section>
-						);
-					})
-				: // Only the done lane pins unread and starred cards above; other lanes show every card.
-					view
-						.filter(
-							(t) =>
-								stage !== "done" ||
-								t.cancelledAt !== null ||
-								(!unread(t) && !t.starred),
-						)
-						.map(card)}
-			{more > 0 && onMore && (
-				<button
-					type="button"
-					className="lane-more"
-					onClick={(e) => showMore(e, onMore)}
-					title="Show older done cards"
-					aria-label={`Show more, ${more} older cards`}
-				>
-					Show more
-					<span className="topic-count">{more}</span>
-				</button>
-			)}
+			<LaneCards
+				stage={stage}
+				filtering={filtering}
+				hasTasks={hasTasks}
+				total={tasks.length}
+				unread={unread}
+				fresh={fresh}
+				starred={starred}
+				groups={groups}
+				view={view}
+				more={more}
+				onMore={onMore}
+				collapsed={collapsed}
+				uid={uid}
+				onToggle={onToggle}
+				onTopicMore={onTopicMore}
+				showMore={showMore}
+				card={card}
+			/>
 			{parked != null && (
 				<>
 					<hr className="lane-divider" />
@@ -5743,6 +6263,36 @@ function fmtTokens(n: number): string {
 			: String(n);
 }
 
+async function fetchSessionContext(
+	url: string,
+): Promise<SessionContext | null> {
+	const res = await fetch(url);
+	if (!res.ok) throw new Error(String(res.status));
+	const v = (await res.json()) as { context: SessionContext | null };
+	return v.context;
+}
+
+/** One streaming log chunk: appends received bytes and returns true while more of the log remains. */
+async function fetchLogChunk(
+	project: string,
+	taskId: string,
+	offset: { current: number },
+	decoder: TextDecoder,
+	alive: () => boolean,
+	onChunk: (chunk: string) => void,
+): Promise<boolean> {
+	const res = await fetch(
+		`/api/projects/${encodeURIComponent(project)}/tasks/${taskId}/log?from=${offset.current}`,
+	);
+	if (!res.ok || !alive()) return false;
+	const buf = await res.arrayBuffer();
+	if (!alive() || buf.byteLength === 0) return false;
+	offset.current += buf.byteLength; // only bytes actually received
+	const chunk = decoder.decode(buf, { stream: true });
+	if (chunk.length > 0) onChunk(chunk);
+	return offset.current < Number(res.headers.get("X-Log-Size"));
+}
+
 /** Session context usage for a task: one snapshot fetch when the drawer opens, re-polled every
  * 5 s only while the card is running; null when unknown or failing. */
 function useSessionContext(
@@ -5752,17 +6302,13 @@ function useSessionContext(
 	running: boolean,
 ): SessionContext | null {
 	const [ctx, setCtx] = useState<SessionContext | null>(null);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: reloadKey is a refetch trigger, not a body input
 	useEffect(() => {
 		let alive = true;
 		const url = `/api/projects/${encodeURIComponent(project)}/tasks/${taskId}/context`;
 		const load = async (): Promise<void> => {
 			try {
-				const res = await fetch(url);
-				if (!alive) return;
-				if (!res.ok) throw new Error(String(res.status));
-				const v = (await res.json()) as { context: SessionContext | null };
-				if (alive) setCtx(v.context);
+				const v = await fetchSessionContext(url);
+				if (alive) setCtx(v);
 			} catch {
 				if (alive) setCtx(null);
 			}
@@ -5811,6 +6357,20 @@ export function LogView({
 		const decoder = new TextDecoder();
 		offset.current = base;
 		setText("");
+		const drain = async (): Promise<void> => {
+			// Fetch again while behind: one call returns at most 256 KiB, so a long log would otherwise stop after the first chunk.
+			while (alive) {
+				const more = await fetchLogChunk(
+					project.name,
+					taskId,
+					offset,
+					decoder,
+					() => alive,
+					(chunk) => setText((prev) => prev + chunk),
+				);
+				if (!more) return;
+			}
+		};
 		const tick = async (): Promise<void> => {
 			if (fetching) {
 				dirty = true;
@@ -5818,19 +6378,7 @@ export function LogView({
 			}
 			fetching = true;
 			try {
-				// Fetch again while behind: one call returns at most 256 KiB, so a long log would otherwise stop after the first chunk.
-				while (alive) {
-					const res = await fetch(
-						`/api/projects/${encodeURIComponent(project.name)}/tasks/${taskId}/log?from=${offset.current}`,
-					);
-					if (!res.ok || !alive) return;
-					const buf = await res.arrayBuffer();
-					if (!alive || buf.byteLength === 0) return;
-					offset.current += buf.byteLength; // only bytes actually received
-					const chunk = decoder.decode(buf, { stream: true });
-					if (chunk.length > 0) setText((prev) => prev + chunk);
-					if (offset.current >= Number(res.headers.get("X-Log-Size"))) return;
-				}
+				await drain();
 			} catch {
 				// transient network error; the next live event retries
 			} finally {
@@ -5860,7 +6408,6 @@ export function LogView({
 		// decoder lives inside the effect so its streaming state survives across coalesced ticks
 	}, [project.name, taskId, base]);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: re-run pins the log to the bottom on new text
 	useEffect(() => {
 		const el = pre.current;
 		if (el && stick.current) el.scrollTop = el.scrollHeight;
@@ -6148,6 +6695,48 @@ function UpdatesPanel({
 	);
 }
 
+/** The "in progress" link to an update card that already covers this row (U6). */
+function UpdateCardLink({
+	card,
+	openTask,
+}: {
+	card: TaskCard;
+	openTask: (id: string) => void;
+}) {
+	return (
+		<a
+			className="updates-inprogress"
+			href={taskPath(card.project, card.id)}
+			title={card.sessionTitle}
+			onClick={(e) => navClick(e, () => openTask(card.id))}
+		>
+			in progress
+		</a>
+	);
+}
+
+/** Per-file diff links of an update row; spans because an actionable row is a <label>, which allows phrasing content only. */
+function UpdateDiffs({ diffs }: { diffs: UpdateRow["diffs"] }) {
+	if (diffs === undefined || diffs.length === 0) return null;
+	return (
+		<span className="updates-diffs">
+			{diffs.map((d) => (
+				<span key={d.file}>
+					<a
+						href={d.url}
+						target="_blank"
+						rel="noopener noreferrer"
+						aria-label={`Diff of ${d.file}`}
+					>
+						diff
+					</a>{" "}
+					<code>{d.file}</code>
+				</span>
+			))}
+		</span>
+	);
+}
+
 export function UpdateRowLine({
 	row,
 	act,
@@ -6252,28 +6841,14 @@ export function UpdateRowLine({
 							{skipButton}
 						</>
 					) : (
-						<a
-							className="updates-inprogress"
-							href={taskPath(card.project, card.id)}
-							title={card.sessionTitle}
-							onClick={(e) => navClick(e, () => openTask(card.id))}
-						>
-							in progress
-						</a>
+						<UpdateCardLink card={card} openTask={openTask} />
 					)}
 				</span>
 			) : row.managedBy !== undefined ? (
 				<span className="dialog-sub">managed by {row.managedBy}</span>
 			) : card !== null ? (
 				// U6: an open card owns this row; clicking jumps to it instead of offering Skip.
-				<a
-					className="updates-inprogress"
-					href={taskPath(card.project, card.id)}
-					title={card.sessionTitle}
-					onClick={(e) => navClick(e, () => openTask(card.id))}
-				>
-					in progress
-				</a>
+				<UpdateCardLink card={card} openTask={openTask} />
 			) : (
 				skipButton
 			)}
@@ -6286,24 +6861,7 @@ export function UpdateRowLine({
 					origin
 				</a>
 			</span>
-			{row.diffs !== undefined && row.diffs.length > 0 && (
-				// Spans, not ul/li: an actionable row is a <label>, which allows phrasing content only.
-				<span className="updates-diffs">
-					{row.diffs.map((d) => (
-						<span key={d.file}>
-							<a
-								href={d.url}
-								target="_blank"
-								rel="noopener noreferrer"
-								aria-label={`Diff of ${d.file}`}
-							>
-								diff
-							</a>{" "}
-							<code>{d.file}</code>
-						</span>
-					))}
-				</span>
-			)}
+			<UpdateDiffs diffs={row.diffs} />
 		</>
 	);
 	// A row label makes the whole line toggle the checkbox; its own buttons and
@@ -6317,6 +6875,464 @@ export function UpdateRowLine({
 		<div className="updates-row">{body}</div>
 	);
 }
+/** The "Git URL" tab of the Add-project dialog: URL and name fields, the SSH key choice,
+ * and the token fieldset the server demands on a 400 needsToken. */
+function AddUrlPanel({
+	mode,
+	url,
+	onUrl,
+	urlProblem,
+	name,
+	onName,
+	ssh,
+	sshMode,
+	setSshMode,
+	hosts,
+	pendingKey,
+	onPending,
+	runSshTest,
+	onSshTestOk,
+	needsTokenHost,
+	tokUser,
+	onTokUser,
+	tokToken,
+	onTokToken,
+	saveToken,
+	boardTokenUsable,
+	useBoardToken,
+}: {
+	mode: "url" | "new";
+	url: string;
+	onUrl: (u: string) => void;
+	urlProblem: string | null;
+	name: string;
+	onName: (n: string) => void;
+	ssh: boolean;
+	sshMode: "global" | "new";
+	setSshMode: (m: "global" | "new") => void;
+	hosts: GitHostsView | null;
+	pendingKey: PendingKeyInfo | null;
+	onPending: (p: PendingKeyInfo | null) => void;
+	runSshTest: (trust?: string[]) => Promise<TestAnswer>;
+	onSshTestOk: () => void;
+	needsTokenHost: string | null;
+	tokUser: string;
+	onTokUser: (u: string) => void;
+	tokToken: string;
+	onTokToken: (t: string) => void;
+	saveToken: () => void;
+	boardTokenUsable: boolean;
+	useBoardToken: () => void;
+}) {
+	return (
+		<div
+			role="tabpanel"
+			id="add-panel-url"
+			aria-labelledby="add-tab-url"
+			hidden={mode !== "url"}
+		>
+			<label>
+				Git URL
+				<input
+					data-autofocus
+					value={url}
+					onChange={(e) => onUrl(e.target.value)}
+					placeholder="https://gitlab.com/group/repo.git or git@host:group/repo.git"
+					required={mode === "url"}
+					inputMode="url"
+					spellCheck={false}
+					autoComplete="off"
+					aria-invalid={urlProblem !== null || undefined}
+					aria-describedby={
+						urlProblem !== null ? "add-git-url-error" : undefined
+					}
+				/>
+				{urlProblem !== null && (
+					<span className="auth-error" id="add-git-url-error" role="alert">
+						{urlProblem}
+					</span>
+				)}
+				<code>https or SSH git URL</code>
+			</label>
+			<label>
+				Name
+				<input
+					value={name}
+					onChange={(e) => onName(e.target.value)}
+					placeholder="my-project"
+					required={mode === "url"}
+				/>
+			</label>
+			{ssh && (
+				<fieldset>
+					<legend>SSH key</legend>
+					<label className="add-check">
+						<input
+							type="radio"
+							name="add-ssh-key"
+							checked={sshMode === "global"}
+							disabled={(hosts?.globalKey ?? null) === null}
+							onChange={() => setSshMode("global")}
+						/>
+						Global key
+						{(hosts?.globalKey ?? null) === null && (
+							<span className="hint">
+								No global key exists; set one in Settings → Git hosts.
+							</span>
+						)}
+					</label>
+					<label className="add-check">
+						<input
+							type="radio"
+							name="add-ssh-key"
+							checked={sshMode === "new"}
+							onChange={() => setSshMode("new")}
+						/>
+						New key for this project
+					</label>
+					{sshMode === "new" && (
+						<PendingKeyRow pending={pendingKey} onPending={onPending} />
+					)}
+					<SshTestRow send={runSshTest} onOk={onSshTestOk} />
+					<p className="hint">
+						Add stays disabled until the test passed for this URL and key.
+					</p>
+				</fieldset>
+			)}
+			{needsTokenHost !== null && (
+				<fieldset>
+					<legend>
+						Token for <code>{needsTokenHost}</code>
+					</legend>
+					<label>
+						Username
+						<span className="opt-mark">(optional)</span>
+						<input
+							value={tokUser}
+							onChange={(e) => onTokUser(e.target.value)}
+							placeholder={defaultGitUsername(
+								needsTokenHost ?? "",
+								hosts?.githubHost ?? null,
+							)}
+						/>
+					</label>
+					<label>
+						Token
+						<input
+							type="password"
+							value={tokToken}
+							onChange={(e) => onTokToken(e.target.value)}
+							autoComplete="off"
+							required
+						/>
+					</label>
+					<button type="button" disabled={tokToken === ""} onClick={saveToken}>
+						Save token and retry
+					</button>
+					{boardTokenUsable && (
+						<button type="button" onClick={useBoardToken}>
+							Use the board GitHub token
+						</button>
+					)}
+				</fieldset>
+			)}
+		</div>
+	);
+}
+
+/** The private-repo hint line of the "New" tab: the signed-in state plus name availability. */
+function GhRepoHint({
+	gh,
+	free,
+	onClose,
+}: {
+	gh: GhStatus;
+	free: boolean | null;
+	onClose: () => void;
+}) {
+	const hosted = useContext(HostedContext);
+	return gh.authed ? (
+		<p className="hint">
+			Repo will be created under {gh.user}.
+			{free === false
+				? ` That name is already taken on ${gh.host}.`
+				: free === true
+					? ` The name is free on ${gh.host}.`
+					: ""}
+		</p>
+	) : (
+		<p className="hint trust-warn" role="status">
+			{/* Hosted mode hides the Git hosts card: the control plane owns git credentials. */}
+			{hostedHidden(hosted, "github-token-block") ? (
+				<>
+					No Git host is signed in, so Ottr cannot create the repo. Uncheck the
+					box for a local repo only.
+				</>
+			) : (
+				<>
+					No Git host is signed in, so Ottr cannot create the repo. Add a token
+					in Settings → Git hosts, or uncheck the box for a local repo only.{" "}
+					<button
+						type="button"
+						className="notif-link"
+						onClick={() => {
+							onClose();
+							openSettingsSection("github-token-block");
+						}}
+					>
+						Open settings
+					</button>
+				</>
+			)}
+		</p>
+	);
+}
+
+/** The Add-project POST body shared by both submit paths. */
+function addGitProjectRequest(req: {
+	url: string;
+	name: string;
+	sshKey: string | undefined;
+	trust: string[] | undefined;
+}): ReturnType<typeof gitReq> {
+	return gitReq("POST", "/api/projects", {
+		url: req.url,
+		name: req.name === "" ? undefined : req.name,
+		sshKey: req.sshKey,
+		trust: req.trust,
+	});
+}
+
+function reportAddedProject(
+	data: unknown,
+	hooks: {
+		onAdded: (interview: string) => void;
+		setAdded: (v: {
+			project: ProjectView;
+			interview: string;
+			id: string | null;
+		}) => void;
+	},
+): void {
+	const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
+	hooks.onAdded(r.interview);
+	hooks.setAdded({
+		project: r.project,
+		interview: r.interview,
+		id: r.id ?? null,
+	});
+}
+
+/** The Add submit from the form: success reports the project, otherwise it raises
+ * the trust step, the token step or the server's error into the dialog. */
+async function addGitProject(
+	req: {
+		url: string;
+		name: string;
+		sshKey: string | undefined;
+		trust: string[] | undefined;
+	},
+	hooks: {
+		onAdded: (interview: string) => void;
+		setAdded: (v: {
+			project: ProjectView;
+			interview: string;
+			id: string | null;
+		}) => void;
+		setAddTrust: (t: TrustNeeded) => void;
+		setNeedsTokenHost: (h: string) => void;
+	},
+): Promise<void> {
+	const { status, data } = await addGitProjectRequest(req);
+	const t = asTrust(data);
+	if (status < 300) {
+		reportAddedProject(data, hooks);
+		return;
+	}
+	if (t !== null) {
+		hooks.setAddTrust(t);
+		throw new Error(t.error);
+	}
+	if (typeof data.needsToken === "string") {
+		hooks.setNeedsTokenHost(data.needsToken);
+		throw new Error(asError(data, status, "adding the project"));
+	}
+	throw new Error(asError(data, status, "adding the project"));
+}
+
+/** The Add retry after the user confirmed the trust prompt: success clears the prompt. */
+async function addGitProjectTrusted(
+	req: {
+		url: string;
+		name: string;
+		sshKey: string | undefined;
+		trust: string[] | undefined;
+	},
+	hooks: {
+		onAdded: (interview: string) => void;
+		setAdded: (v: {
+			project: ProjectView;
+			interview: string;
+			id: string | null;
+		}) => void;
+		setAddTrust: (t: TrustNeeded | null) => void;
+	},
+): Promise<TestAnswer> {
+	const { status, data } = await addGitProjectRequest(req);
+	const t = asTrust(data);
+	if (status < 300) {
+		reportAddedProject(data, hooks);
+		hooks.setAddTrust(null);
+		return { ok: true } as const;
+	}
+	if (t !== null) return t;
+	return { error: asError(data, status, "adding the project") };
+}
+
+/** The tab strip of the Add-project dialog. */
+function AddTabs({
+	mode,
+	setMode,
+}: {
+	mode: "url" | "new";
+	setMode: (m: "url" | "new") => void;
+}) {
+	return (
+		<div className="add-tabs" role="tablist" aria-label="Project source">
+			<button
+				type="button"
+				role="tab"
+				id="add-tab-url"
+				data-tab="url"
+				aria-selected={mode === "url"}
+				aria-controls="add-panel-url"
+				tabIndex={mode === "url" ? 0 : -1}
+				onClick={() => setMode("url")}
+				onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
+			>
+				<Icon name="branch" />
+				Git URL
+			</button>
+			<button
+				type="button"
+				role="tab"
+				id="add-tab-new"
+				data-tab="new"
+				aria-selected={mode === "new"}
+				aria-controls="add-panel-new"
+				tabIndex={mode === "new" ? 0 : -1}
+				onClick={() => setMode("new")}
+				onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
+			>
+				<Icon name="plus" />
+				New
+			</button>
+		</div>
+	);
+}
+
+/** The dialog's submit row: Add stays disabled until the SSH test passed or the host sign-in blocks it. */
+function AddSubmitButton({
+	busy,
+	failed,
+	mode,
+	ssh,
+	sshTested,
+	noGitHost,
+}: {
+	busy: boolean;
+	failed: boolean;
+	mode: "url" | "new";
+	ssh: boolean;
+	sshTested: boolean;
+	noGitHost: boolean;
+}) {
+	const untested = mode === "url" && ssh && !sshTested;
+	return (
+		<div className="dialog-actions">
+			<button
+				type="submit"
+				disabled={busy || untested || noGitHost}
+				className={`primary${failed ? " failed" : ""}`}
+				aria-busy={busy || undefined}
+				title={
+					untested
+						? "Run the SSH test first"
+						: noGitHost
+							? "Sign in to a Git host in Settings, or uncheck the repo box"
+							: undefined
+				}
+			>
+				{busy && <span className="spinner" aria-hidden="true" />}
+				<Icon name="plus" />
+				Add project
+			</button>
+		</div>
+	);
+}
+
+/** The "new" tab of the Add dialog: the project name plus the optional private repo
+ * push, with host sign-in hints when the repo box is checked. */
+function AddNewPanel({
+	mode,
+	name,
+	setName,
+	ghRepo,
+	setGhRepo,
+	gh,
+	free,
+	repoName,
+	onClose,
+}: {
+	mode: "url" | "new";
+	name: string;
+	setName: (n: string) => void;
+	ghRepo: boolean;
+	setGhRepo: (v: boolean) => void;
+	gh: GhStatus | null;
+	free: boolean | null;
+	repoName: string;
+	onClose: () => void;
+}) {
+	return (
+		<div
+			role="tabpanel"
+			id="add-panel-new"
+			aria-labelledby="add-tab-new"
+			hidden={mode !== "new"}
+		>
+			<label>
+				Name
+				<input
+					value={name}
+					onChange={(e) => setName(e.target.value)}
+					placeholder="my-project"
+					required={mode === "new"}
+				/>
+			</label>
+			<label className="add-check">
+				<input
+					type="checkbox"
+					checked={ghRepo}
+					onChange={(e) => setGhRepo(e.target.checked)}
+				/>
+				Create a private repo on {gh?.host ?? "the configured Git host"} and
+				push
+			</label>
+			{ghRepo &&
+				(gh === null ? null : (
+					<GhRepoHint gh={gh} free={free} onClose={onClose} />
+				))}
+			{!ghRepo && gh !== null && (
+				<p className="hint">
+					Without a repo the project lives in {gh.dir}/{repoName || "…"} on this
+					host; nothing is pushed.
+				</p>
+			)}
+		</div>
+	);
+}
+
 export function AddProjectModal({
 	act,
 	onClose,
@@ -6329,7 +7345,6 @@ export function AddProjectModal({
 	/** Opens the rules interview card in the board drawer: the wizard's "Open rules task". */
 	openTask: (id: string) => void;
 }) {
-	const hosted = useContext(HostedContext);
 	const [mode, setMode] = useState<"url" | "new">("url");
 	const [url, setUrl] = useState("");
 	const [name, setName] = useState("");
@@ -6407,34 +7422,27 @@ export function AddProjectModal({
 	// The Add call: ssh URLs carry the key choice; the server answers with trust or token steps.
 	const addProject = (trust?: string[]): void => {
 		add.start(() =>
-			act(async () => {
-				const { status, data } = await gitReq("POST", "/api/projects", {
-					url: trimmedUrl,
-					name: repoName === "" ? undefined : repoName,
-					sshKey,
-					trust,
-				});
-				const t = asTrust(data);
-				if (status < 300) {
-					const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
-					onAdded(r.interview);
-					setAdded({
-						project: r.project,
-						interview: r.interview,
-						id: r.id ?? null,
-					});
-				} else if (t !== null) {
-					setAddTrust(t);
-					throw new Error(t.error);
-				} else if (typeof data.needsToken === "string") {
-					setNeedsTokenHost(data.needsToken);
-					throw new Error(asError(data, status, "adding the project"));
-				} else {
-					throw new Error(asError(data, status, "adding the project"));
-				}
-			}, setErr),
+			act(
+				async () =>
+					await addGitProject(
+						{ url: trimmedUrl, name: repoName, sshKey, trust },
+						{
+							onAdded,
+							setAdded,
+							setAddTrust: (t) => setAddTrust(t),
+							setNeedsTokenHost: (h) => setNeedsTokenHost(h),
+						},
+					),
+				setErr,
+			),
 		);
 	};
+	// The created project: once set, the dialog shows the setup wizard instead of the form.
+	const [added, setAdded] = useState<{
+		project: ProjectView;
+		interview: string;
+		id: string | null;
+	} | null>(null);
 	// A token save for the host the server named, then the retry of Add.
 	const saveToken = (): void => {
 		void act(async () => {
@@ -6527,12 +7535,6 @@ export function AddProjectModal({
 			clearTimeout(t);
 		};
 	}, [mode, ghRepo, gh?.authed, repoName]);
-	// The created project: once set, the dialog shows the setup wizard instead of the form.
-	const [added, setAdded] = useState<{
-		project: ProjectView;
-		interview: string;
-		id: string | null;
-	} | null>(null);
 
 	return (
 		<Modal onClose={onClose} label="Add project" className="dialog">
@@ -6572,241 +7574,48 @@ export function AddProjectModal({
 							);
 						}}
 					>
-						<div
-							className="add-tabs"
-							role="tablist"
-							aria-label="Project source"
-						>
-							<button
-								type="button"
-								role="tab"
-								id="add-tab-url"
-								data-tab="url"
-								aria-selected={mode === "url"}
-								aria-controls="add-panel-url"
-								tabIndex={mode === "url" ? 0 : -1}
-								onClick={() => setMode("url")}
-								onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
-							>
-								<Icon name="branch" />
-								Git URL
-							</button>
-							<button
-								type="button"
-								role="tab"
-								id="add-tab-new"
-								data-tab="new"
-								aria-selected={mode === "new"}
-								aria-controls="add-panel-new"
-								tabIndex={mode === "new" ? 0 : -1}
-								onClick={() => setMode("new")}
-								onKeyDown={(e) => switchTab(e, ["url", "new"], setMode)}
-							>
-								<Icon name="plus" />
-								New
-							</button>
-						</div>
-						<div
-							role="tabpanel"
-							id="add-panel-url"
-							aria-labelledby="add-tab-url"
-							hidden={mode !== "url"}
-						>
-							<label>
-								Git URL
-								<input
-									data-autofocus
-									value={url}
-									onChange={(e) => onUrl(e.target.value)}
-									placeholder="https://gitlab.com/group/repo.git or git@host:group/repo.git"
-									required={mode === "url"}
-									inputMode="url"
-									spellCheck={false}
-									autoComplete="off"
-									aria-invalid={urlProblem !== null || undefined}
-									aria-describedby={
-										urlProblem !== null ? "add-git-url-error" : undefined
-									}
-								/>
-								{urlProblem !== null && (
-									<span
-										className="auth-error"
-										id="add-git-url-error"
-										role="alert"
-									>
-										{urlProblem}
-									</span>
-								)}
-								<code>https or SSH git URL</code>
-							</label>
-							<label>
-								Name
-								<input
-									value={name}
-									onChange={(e) => {
-										setNameTouched(true);
-										setName(e.target.value);
-									}}
-									placeholder="my-project"
-									required={mode === "url"}
-								/>
-							</label>
-							{ssh && (
-								<fieldset>
-									<legend>SSH key</legend>
-									<label className="add-check">
-										<input
-											type="radio"
-											name="add-ssh-key"
-											checked={sshMode === "global"}
-											disabled={(hosts?.globalKey ?? null) === null}
-											onChange={() => setSshMode("global")}
-										/>
-										Global key
-										{(hosts?.globalKey ?? null) === null && (
-											<span className="hint">
-												No global key exists; set one in Settings → Git hosts.
-											</span>
-										)}
-									</label>
-									<label className="add-check">
-										<input
-											type="radio"
-											name="add-ssh-key"
-											checked={sshMode === "new"}
-											onChange={() => setSshMode("new")}
-										/>
-										New key for this project
-									</label>
-									{sshMode === "new" && (
-										<PendingKeyRow
-											pending={pendingKey}
-											onPending={(p) => {
-												setPendingKey(p);
-												setTested(null);
-											}}
-										/>
-									)}
-									<SshTestRow
-										send={runSshTest}
-										onOk={() => setTested(`${trimmedUrl}\0${sshKey ?? ""}`)}
-									/>
-									<p className="hint">
-										Add stays disabled until the test passed for this URL and
-										key.
-									</p>
-								</fieldset>
-							)}
-							{needsTokenHost !== null && (
-								<fieldset>
-									<legend>
-										Token for <code>{needsTokenHost}</code>
-									</legend>
-									<label>
-										Username
-										<span className="opt-mark">(optional)</span>
-										<input
-											value={tokUser}
-											onChange={(e) => setTokUser(e.target.value)}
-											placeholder={defaultGitUsername(
-												needsTokenHost ?? "",
-												hosts?.githubHost ?? null,
-											)}
-										/>
-									</label>
-									<label>
-										Token
-										<input
-											type="password"
-											value={tokToken}
-											onChange={(e) => setTokToken(e.target.value)}
-											autoComplete="off"
-											required
-										/>
-									</label>
-									<button
-										type="button"
-										disabled={tokToken === ""}
-										onClick={saveToken}
-									>
-										Save token and retry
-									</button>
-									{boardTokenUsable && (
-										<button type="button" onClick={useBoardToken}>
-											Use the board GitHub token
-										</button>
-									)}
-								</fieldset>
-							)}
-						</div>
-						<div
-							role="tabpanel"
-							id="add-panel-new"
-							aria-labelledby="add-tab-new"
-							hidden={mode !== "new"}
-						>
-							<label>
-								Name
-								<input
-									value={name}
-									onChange={(e) => setName(e.target.value)}
-									placeholder="my-project"
-									required={mode === "new"}
-								/>
-							</label>
-							<label className="add-check">
-								<input
-									type="checkbox"
-									checked={ghRepo}
-									onChange={(e) => setGhRepo(e.target.checked)}
-								/>
-								Create a private repo on {gh?.host ?? "the configured Git host"}{" "}
-								and push
-							</label>
-							{ghRepo &&
-								(gh === null ? null : gh.authed ? (
-									<p className="hint">
-										Repo will be created under {gh.user}.
-										{free === false
-											? ` That name is already taken on ${gh.host}.`
-											: free === true
-												? ` The name is free on ${gh.host}.`
-												: ""}
-									</p>
-								) : (
-									<p className="hint trust-warn" role="status">
-										{/* Hosted mode hides the Git hosts card: the control plane owns git credentials. */}
-										{hostedHidden(hosted, "github-token-block") ? (
-											<>
-												No Git host is signed in, so Ottr cannot create the
-												repo. Uncheck the box for a local repo only.
-											</>
-										) : (
-											<>
-												No Git host is signed in, so Ottr cannot create the
-												repo. Add a token in Settings → Git hosts, or uncheck
-												the box for a local repo only.{" "}
-												<button
-													type="button"
-													className="notif-link"
-													onClick={() => {
-														onClose();
-														openSettingsSection("github-token-block");
-													}}
-												>
-													Open settings
-												</button>
-											</>
-										)}
-									</p>
-								))}
-							{!ghRepo && gh !== null && (
-								<p className="hint">
-									Without a repo the project lives in {gh.dir}/{repoName || "…"}{" "}
-									on this host; nothing is pushed.
-								</p>
-							)}
-						</div>
+						<AddTabs mode={mode} setMode={setMode} />
+						<AddUrlPanel
+							mode={mode}
+							url={url}
+							onUrl={onUrl}
+							urlProblem={urlProblem}
+							name={name}
+							onName={(n) => {
+								setNameTouched(true);
+								setName(n);
+							}}
+							ssh={ssh}
+							sshMode={sshMode}
+							setSshMode={setSshMode}
+							hosts={hosts}
+							pendingKey={pendingKey}
+							onPending={(p) => {
+								setPendingKey(p);
+								setTested(null);
+							}}
+							runSshTest={runSshTest}
+							onSshTestOk={() => setTested(`${trimmedUrl}\0${sshKey ?? ""}`)}
+							needsTokenHost={needsTokenHost}
+							tokUser={tokUser}
+							onTokUser={setTokUser}
+							tokToken={tokToken}
+							onTokToken={setTokToken}
+							saveToken={saveToken}
+							boardTokenUsable={boardTokenUsable}
+							useBoardToken={useBoardToken}
+						/>
+						<AddNewPanel
+							mode={mode}
+							name={name}
+							setName={setName}
+							ghRepo={ghRepo}
+							setGhRepo={setGhRepo}
+							gh={gh}
+							free={free}
+							repoName={repoName}
+							onClose={onClose}
+						/>
 						{err !== null && (
 							<p className="auth-error" role="alert">
 								{err}
@@ -6817,53 +7626,25 @@ export function AddProjectModal({
 								label="Add project"
 								success="Project added"
 								send={(trust) =>
-									gitReq("POST", "/api/projects", {
-										url: trimmedUrl,
-										name: repoName === "" ? undefined : repoName,
-										sshKey,
-										trust,
-									}).then(({ status, data }) => {
-										const t = asTrust(data);
-										if (status < 300) {
-											const r = data as unknown as AddProjectResponse; // unchecked cast: the server's documented answer shape
-											onAdded(r.interview);
-											setAdded({
-												project: r.project,
-												interview: r.interview,
-												id: r.id ?? null,
-											});
-											setAddTrust(null);
-											return { ok: true } as const;
-										}
-										if (t !== null) return t;
-										return {
-											error: asError(data, status, "adding the project"),
-										};
-									})
+									addGitProjectTrusted(
+										{ url: trimmedUrl, name: repoName, sshKey, trust },
+										{
+											onAdded,
+											setAdded,
+											setAddTrust: (t) => setAddTrust(t),
+										},
+									)
 								}
 							/>
 						)}
-						<div className="dialog-actions">
-							<button
-								type="submit"
-								disabled={
-									add.busy || (mode === "url" && ssh && !sshTested) || noGitHost
-								}
-								className={`primary${add.failed ? " failed" : ""}`}
-								aria-busy={add.busy || undefined}
-								title={
-									mode === "url" && ssh && !sshTested
-										? "Run the SSH test first"
-										: noGitHost
-											? "Sign in to a Git host in Settings, or uncheck the repo box"
-											: undefined
-								}
-							>
-								{add.busy && <span className="spinner" aria-hidden="true" />}
-								<Icon name="plus" />
-								Add project
-							</button>
-						</div>
+						<AddSubmitButton
+							busy={add.busy}
+							failed={add.failed}
+							mode={mode}
+							ssh={ssh}
+							sshTested={sshTested}
+							noGitHost={noGitHost}
+						/>
 					</form>
 				) : (
 					<ProjectSetupSteps
@@ -6878,6 +7659,125 @@ export function AddProjectModal({
 			</div>
 		</Modal>
 	);
+}
+
+/** The question line: text with inline diff links plus the answered marker. */
+function AskText({
+	q,
+	changed,
+	done,
+	onOpenDiff,
+}: {
+	q: AskQuestion;
+	changed: string[];
+	done: boolean;
+	onOpenDiff: (files: string[]) => void;
+}) {
+	return (
+		<p className="ask-text">
+			{/* Shape carries the per-question state: ? = open, check = answered. */}
+			<Mark kind={done ? "done" : "asked"} />
+			{/* One span keeps the parts in normal inline flow: the paragraph is a flex row, and
+				separate flex items per part would wrap the text out of reading order. */}
+			<span>
+				{diffLinkParts(q.question, changed).map((part, pi) =>
+					part.kind === "text" ? (
+						<Fragment key={pi}>{part.text}</Fragment>
+					) : (
+						<button
+							key={pi}
+							type="button"
+							className="diff-link"
+							title={
+								part.files.length === 1
+									? "View this file's diff"
+									: "View these files' diff"
+							}
+							onClick={() => onOpenDiff(part.files)}
+						>
+							{part.label === "" ? part.files.join(", ") : part.label}
+						</button>
+					),
+				)}
+			</span>
+			<span className="sr">{done ? " (answered)" : " (needs an answer)"}</span>
+		</p>
+	);
+}
+
+/** One preset option row: the whole entry (row + description) is one label, so it is one hover/click target. */
+function AskOption({
+	q,
+	o,
+	oi,
+	name,
+	multi,
+	picked,
+	selected,
+	busy,
+	onToggle,
+	onPreset,
+}: {
+	q: AskQuestion;
+	o: AskQuestion["options"][number];
+	oi: number;
+	name: string;
+	multi: boolean;
+	picked: string[];
+	selected: string | null;
+	busy: boolean;
+	onToggle: (label: string) => void;
+	onPreset: (text: string, preset: boolean) => void;
+}) {
+	const chosen = multi ? picked.includes(o.label) : selected === o.label;
+	return (
+		<label className={`ask-opt${chosen ? " chosen" : ""}${busy ? " off" : ""}`}>
+			<input
+				type={multi ? "checkbox" : "radio"}
+				name={name}
+				checked={chosen}
+				disabled={busy}
+				onChange={() => (multi ? onToggle(o.label) : onPreset(o.label, true))}
+				// aria-label keeps the name the short option text; the wrapped
+				// description would otherwise become part of the radio's name.
+				aria-label={o.label}
+				aria-describedby={
+					o.description === undefined ? undefined : `${name}-opt-${oi}-desc`
+				}
+			/>
+			{o.label}
+			{/* The recommendation is a name, never a fill: filling is what a click looks like. */}
+			{q.recommended === oi && !chosen && (
+				<span className="ask-rec">Recommended</span>
+			)}
+			{/* The description shows under its option: hover titles never reach phones. */}
+			{o.description !== undefined && (
+				<p className="ask-desc" id={`${name}-opt-${oi}-desc`}>
+					{o.description}
+				</p>
+			)}
+		</label>
+	);
+}
+
+/** A multi question's answer text: the checked presets plus the "Other" row (typed text,
+ * or the bare pick when the field stays empty), as one comma list; null when nothing. */
+function askMultiText(
+	picked: string[],
+	otherOn: boolean,
+	text: string,
+): string | null {
+	const v = text.trim();
+	const parts = [...picked];
+	if (v !== "") parts.push(v);
+	else if (otherOn) parts.push("Other");
+	return parts.length === 0 ? null : parts.join(", ");
+}
+
+/** The "Other" row of an ask question: the custom pick control, the text field and the submit button. */
+// The custom row's radio joins the preset group: checked once the saved answer is not a preset.
+function customChosen(q: AskQuestion, selected: string | null): boolean {
+	return selected !== null && !q.options.some((o) => o.label === selected);
 }
 
 /** Board panel above the lanes while setupChecklist is set: only the still-open items. */
@@ -6936,6 +7836,111 @@ function ProjectSub({ project }: { project: ProjectView }) {
 	);
 }
 
+function AskCustom({
+	q,
+	multi,
+	name,
+	busy,
+	selected,
+	picked,
+	customOn,
+	setCustomOn,
+	custom,
+	setCustom,
+	customRef,
+	onDraft,
+	onAnswer,
+	multiTotal,
+}: {
+	q: AskQuestion;
+	multi: boolean;
+	name: string;
+	busy: boolean;
+	selected: string | null;
+	picked: string[];
+	customOn: boolean;
+	setCustomOn: (v: boolean) => void;
+	custom: string;
+	setCustom: (v: string) => void;
+	customRef: React.RefObject<HTMLInputElement | null>;
+	onDraft: (text: string | null) => void;
+	onAnswer: (text: string) => void;
+	multiTotal: number;
+}) {
+	const customJoined = customOn || custom.trim() !== "";
+	// The live picks already are the recorded answer (or both are empty): Answer has nothing to add.
+	const multiRecorded =
+		multi && askMultiText(picked, customOn, custom) === selected;
+	const submitMulti = (): void => {
+		const t = askMultiText(picked, customOn, custom);
+		// The typed text stays in the input: that input is the only place the recorded
+		// custom answer is visible (each preset shows as a check instead).
+		if (t !== null) onAnswer(t);
+	};
+	return (
+		<form
+			className="ask-custom"
+			onSubmit={(e) => {
+				e.preventDefault();
+				if (multi) submitMulti();
+				else {
+					const v = custom.trim();
+					if (v !== "") onAnswer(v);
+				}
+			}}
+		>
+			{/* Single: same radio group as the presets; saving a typed answer checks it. Clicking
+			    the radio moves focus to the text field instead of checking a pick that was never
+			    saved. Multi: the checkbox is a real pick — it joins the answer as "Other" even
+			    when the field stays empty, and typed text checks it on its own. Turning it on
+			    focuses the field; the ref lives on the text input, so the focus lands where
+			    typing goes. */}
+			<input
+				type={multi ? "checkbox" : "radio"}
+				name={name}
+				checked={multi ? customJoined : customChosen(q, selected)}
+				disabled={busy}
+				aria-label="Other"
+				onChange={() => {
+					if (!multi) {
+						customRef.current?.focus();
+						return;
+					}
+					const next = !customOn;
+					setCustomOn(next);
+					onDraft(askMultiText(picked, next, custom));
+					if (next) customRef.current?.focus();
+				}}
+			/>
+			<label>
+				<span>Other</span>
+				<input
+					ref={customRef}
+					value={custom}
+					onChange={(e) => {
+						setCustom(e.target.value);
+						if (multi) onDraft(askMultiText(picked, customOn, e.target.value));
+					}}
+					placeholder="Deploy only the API"
+					disabled={busy}
+				/>
+			</label>
+			<button
+				type="submit"
+				disabled={busy || (multi ? multiRecorded : custom.trim() === "")}
+			>
+				{busy && <span className="spinner" aria-hidden="true" />}
+				{(selected === null
+					? "Answer"
+					: multiRecorded
+						? "Answered"
+						: "Replace answer") +
+					(multi && multiTotal > 0 ? ` (${multiTotal})` : "")}
+			</button>
+		</form>
+	);
+}
+
 /** One ask question: single-choice presets answer in one click; multi questions collect
  * checkbox picks plus an "Other" pick or typed text and answer with one comma list. */
 export function AskBlock({
@@ -6964,18 +7969,12 @@ export function AskBlock({
 	 * a check counts as an answer at once, without the Answer button. */
 	onDraft: (text: string | null) => void;
 }) {
-	const customRef = useRef<HTMLInputElement>(null);
 	const multi = q.multi;
-	// Multi picks accumulate in the block; a saved answer (draft or sent) re-checks its
-	// presets on remount. ponytail: the join is ", ", so a label containing ", " would
-	// split wrong on reload — rename the separator if labels ever carry commas.
+	const customRef = useRef<HTMLInputElement>(null);
 	const savedParts = selected === null ? [] : selected.split(", ");
 	const [picked, setPicked] = useState<string[]>(() =>
 		savedParts.filter((l) => q.options.some((o) => o.label === l)),
 	);
-	// The "Other" checkbox is a real pick: a recorded bare "Other" part re-checks it on
-	// remount (guarded against a preset literally labeled Other), and the non-preset text
-	// re-fills the field — the input is the only place the custom answer part stays visible.
 	const [customOn, setCustomOn] = useState(
 		() =>
 			!q.options.some((o) => o.label === "Other") &&
@@ -6986,183 +7985,59 @@ export function AskBlock({
 			.filter((l) => !q.options.some((o) => o.label === l) && l !== "Other")
 			.join(", "),
 	);
-	// Multi answer = the checked presets plus the "Other" row (typed text, or the bare
-	// pick when the field stays empty), as one comma list; null when nothing is picked.
-	const multiText = (p: string[], on: boolean, text: string): string | null => {
-		const v = text.trim();
-		const parts = [...p];
-		if (v !== "") parts.push(v);
-		else if (on) parts.push("Other");
-		return parts.length === 0 ? null : parts.join(", ");
-	};
 	const togglePick = (label: string): void => {
 		const next = picked.includes(label)
 			? picked.filter((l) => l !== label)
 			: [...picked, label];
 		setPicked(next);
-		onDraft(multiText(next, customOn, custom));
+		onDraft(askMultiText(next, customOn, custom));
 	};
-	// The custom row's radio joins the preset group: checked once the saved answer is not a preset.
-	const customChosen =
-		selected !== null && !q.options.some((o) => o.label === selected);
 	// A preset click clears the custom draft (its answer shows on the radio); a custom submit keeps its
 	// text in the input, because that input is the only place the recorded custom answer is visible.
-	const answer = (text: string, preset: boolean) => {
+	const answer = (text: string, preset: boolean): void => {
 		onAnswer(text);
 		if (preset) setCustom("");
 	};
 	const customJoined = customOn || custom.trim() !== "";
 	const multiTotal = picked.length + (customJoined ? 1 : 0);
-	const submitMulti = (): void => {
-		const t = multiText(picked, customOn, custom);
-		// The typed text stays in the input: that input is the only place the recorded
-		// custom answer is visible (each preset shows as a check instead).
-		if (t !== null) onAnswer(t);
-	};
 	// A multi question counts as answered as soon as anything is checked.
 	const done = answered || (multi && multiTotal > 0);
-	// The live picks already are the recorded answer (or both are empty): Answer has nothing to add.
-	const multiRecorded =
-		multi && multiText(picked, customOn, custom) === selected;
 	return (
-		<div className={"ask-q" + (done ? " answered" : "")}>
-			<p className="ask-text">
-				{/* Shape carries the per-question state: ? = open, check = answered. */}
-				<Mark kind={done ? "done" : "asked"} />
-				{/* One span keeps the parts in normal inline flow: the paragraph is a flex row, and
-					separate flex items per part would wrap the text out of reading order. */}
-				<span>
-					{diffLinkParts(q.question, changed).map((part, pi) =>
-						part.kind === "text" ? (
-							// biome-ignore lint/suspicious/noArrayIndexKey: static split of the question text; parts are positional
-							<Fragment key={pi}>{part.text}</Fragment>
-						) : (
-							<button
-								// biome-ignore lint/suspicious/noArrayIndexKey: static split of the question text; parts are positional
-								key={pi}
-								type="button"
-								className="diff-link"
-								title={
-									part.files.length === 1
-										? "View this file's diff"
-										: "View these files' diff"
-								}
-								onClick={() => onOpenDiff(part.files)}
-							>
-								{part.label === "" ? part.files.join(", ") : part.label}
-							</button>
-						),
-					)}
-				</span>
-				<span className="sr">
-					{done ? " (answered)" : " (needs an answer)"}
-				</span>
-			</p>
+		<div className={`ask-q${done ? " answered" : ""}`}>
+			<AskText q={q} changed={changed} done={done} onOpenDiff={onOpenDiff} />
 			<div className="ask-options">
-				{q.options.map((o, oi) => {
-					const chosen = multi
-						? picked.includes(o.label)
-						: selected === o.label;
-					return (
-						// The whole entry (row + description) is one label: one hover/click target.
-						<label
-							key={o.label}
-							className={
-								"ask-opt" + (chosen ? " chosen" : "") + (busy ? " off" : "")
-							}
-						>
-							<input
-								type={multi ? "checkbox" : "radio"}
-								name={name}
-								checked={chosen}
-								disabled={busy}
-								onChange={() =>
-									multi ? togglePick(o.label) : answer(o.label, true)
-								}
-								// aria-label keeps the name the short option text; the wrapped
-								// description would otherwise become part of the radio's name.
-								aria-label={o.label}
-								aria-describedby={
-									o.description === undefined
-										? undefined
-										: `${name}-opt-${oi}-desc`
-								}
-							/>
-							{o.label}
-							{/* The recommendation is a name, never a fill: filling is what a click looks like. */}
-							{q.recommended === oi && !chosen && (
-								<span className="ask-rec">Recommended</span>
-							)}
-							{/* The description shows under its option: hover titles never reach phones. */}
-							{o.description !== undefined && (
-								<p className="ask-desc" id={`${name}-opt-${oi}-desc`}>
-									{o.description}
-								</p>
-							)}
-						</label>
-					);
-				})}
-			</div>
-			<form
-				className="ask-custom"
-				onSubmit={(e) => {
-					e.preventDefault();
-					if (multi) submitMulti();
-					else {
-						const v = custom.trim();
-						if (v !== "") answer(v, false);
-					}
-				}}
-			>
-				{/* Single: same radio group as the presets; saving a typed answer checks it. Clicking
-				    the radio moves focus to the text field instead of checking a pick that was never
-				    saved. Multi: the checkbox is a real pick — it joins the answer as "Other" even
-				    when the field stays empty, and typed text checks it on its own. Turning it on
-				    focuses the field; the ref lives on the text input, so the focus lands where
-				    typing goes. */}
-				<input
-					type={multi ? "checkbox" : "radio"}
-					name={name}
-					checked={multi ? customJoined : customChosen}
-					disabled={busy}
-					aria-label="Other"
-					onChange={() => {
-						if (!multi) {
-							customRef.current?.focus();
-							return;
-						}
-						const next = !customOn;
-						setCustomOn(next);
-						onDraft(multiText(picked, next, custom));
-						if (next) customRef.current?.focus();
-					}}
-				/>
-				<label>
-					<span>Other</span>
-					<input
-						ref={customRef}
-						value={custom}
-						onChange={(e) => {
-							setCustom(e.target.value);
-							if (multi) onDraft(multiText(picked, customOn, e.target.value));
-						}}
-						placeholder="Deploy only the API"
-						disabled={busy}
+				{q.options.map((o, oi) => (
+					<AskOption
+						key={o.label}
+						q={q}
+						o={o}
+						oi={oi}
+						name={name}
+						multi={multi}
+						picked={picked}
+						selected={selected}
+						busy={busy}
+						onToggle={togglePick}
+						onPreset={answer}
 					/>
-				</label>
-				<button
-					type="submit"
-					disabled={busy || (multi ? multiRecorded : custom.trim() === "")}
-				>
-					{busy && <span className="spinner" aria-hidden="true" />}
-					{(selected === null
-						? "Answer"
-						: multiRecorded
-							? "Answered"
-							: "Replace answer") +
-						(multi && multiTotal > 0 ? ` (${multiTotal})` : "")}
-				</button>
-			</form>
+				))}
+			</div>
+			<AskCustom
+				q={q}
+				multi={multi}
+				name={name}
+				busy={busy}
+				selected={selected}
+				picked={picked}
+				customOn={customOn}
+				setCustomOn={setCustomOn}
+				custom={custom}
+				setCustom={setCustom}
+				customRef={customRef}
+				onDraft={onDraft}
+				onAnswer={onAnswer}
+				multiTotal={multiTotal}
+			/>
 		</div>
 	);
 }
@@ -7277,7 +8152,7 @@ function DrawerSec({
 		</h3>
 	);
 	return (
-		<section className={"dsec" + (className ? ` ${className}` : "")}>
+		<section className={`dsec${className ? ` ${className}` : ""}`}>
 			{head ? (
 				<div className="section-head">
 					{h3}
@@ -7349,7 +8224,6 @@ function AskPanel({
 		<div className="ask-panel">
 			{asked.map((q, qi) => (
 				<AskBlock
-					// biome-ignore lint/suspicious/noArrayIndexKey: answers state is keyed by this index; the ask round is replaced wholesale
 					key={qi}
 					q={q}
 					name={`ask-${qi}`}
@@ -7485,7 +8359,7 @@ function RelatedTasks({
 						<span
 							className={
 								k.state === "needs_you"
-									? "st st-needs_you" + (k.asked !== null ? " st-asked" : "")
+									? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
 									: "st"
 							}
 						>
@@ -7498,6 +8372,41 @@ function RelatedTasks({
 			))}
 		</ul>
 	);
+}
+
+/** The posted-head label; it shows only while the posted head is the reviewed one. */
+function prPostedLabel(pr: PrReviewView): string | null {
+	return pr.state === "open" &&
+		pr.postedHead !== null &&
+		pr.postedHead === pr.reviewedHead
+		? `Posted for ${pr.postedHead.slice(0, 7)}${
+				pr.postedLogin !== null && pr.postedLogin !== ""
+					? ` · Posted as ${pr.postedLogin}`
+					: ""
+			}`
+		: null;
+}
+
+/** The posted-head label and the reason Post review is blocked (null when it may run). */
+function prPostState(
+	pr: PrReviewView,
+	draft: string | null,
+	cancelledAt: number | null,
+	body: string,
+): { postedLabel: string | null; blocked: string | null } {
+	const postedLabel = prPostedLabel(pr);
+	const blocked =
+		pr.state !== "open"
+			? `PR is ${pr.state}`
+			: (postedLabel ??
+				(draft === null
+					? "No review draft yet"
+					: cancelledAt !== null
+						? "The card is cancelled"
+						: body.trim() === ""
+							? "The comment is empty"
+							: null));
+	return { postedLabel, blocked };
 }
 
 /** PR review card: the model's review draft as an editable comment; it reaches GitHub only on the Post click. */
@@ -7526,28 +8435,12 @@ export function PrReviewSection({
 		draft: string | null;
 	} | null>(null);
 	const taskUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}`;
-	// The posted head only shows while it is the reviewed one; postedUrl links the actual GitHub review.
-	const postedLabel =
-		pr.state === "open" &&
-		pr.postedHead !== null &&
-		pr.postedHead === pr.reviewedHead
-			? `Posted for ${pr.postedHead.slice(0, 7)}${
-					pr.postedLogin !== null && pr.postedLogin !== ""
-						? ` · Posted as ${pr.postedLogin}`
-						: ""
-				}`
-			: null;
-	const blocked =
-		pr.state !== "open"
-			? `PR is ${pr.state}`
-			: (postedLabel ??
-				(draft === null
-					? "No review draft yet"
-					: task.cancelledAt !== null
-						? "The card is cancelled"
-						: body.trim() === ""
-							? "The comment is empty"
-							: null));
+	const { postedLabel, blocked } = prPostState(
+		pr,
+		draft,
+		task.cancelledAt,
+		body,
+	);
 	const inlineCount = parseReviewDraft(body).comments.length;
 	const shownError = error ?? pr.postError;
 	return (
@@ -8197,6 +9090,3160 @@ export function ranOnLabel(turns: readonly TurnView[]): string | null {
 	);
 }
 
+/** Drawer Head section: extracted verbatim from the drawer body. */
+function DrawerHead(p: {
+	task: TaskView;
+	project: ProjectView;
+	cancelled: boolean;
+	askedNow: boolean;
+	waiting: TaskCard[];
+	tasks: TaskCard[];
+	draining: boolean;
+	act: Act;
+	copiedId: ReturnType<typeof useFlash>[0];
+	flashCopiedId: ReturnType<typeof useFlash>[1];
+	idCopyError: string | null;
+	setIdCopyError: (v: string | null) => void;
+	setWfOpen: (v: boolean) => void;
+}) {
+	const {
+		task,
+		project,
+		cancelled,
+		askedNow,
+		waiting,
+		tasks,
+		draining,
+		act,
+		copiedId,
+		flashCopiedId,
+		idCopyError,
+		setIdCopyError,
+		setWfOpen,
+	} = p;
+	return (
+		<header className="drawer-top">
+			<div className="drawer-head">
+				<h2>{task.sessionTitle ?? task.title}</h2>
+				<div className="drawer-head-actions">
+					{task.stage === "done" && task.research && !cancelled && (
+						// Optimistic tap: the star flips at once, the POST follows, a
+						// failure rolls it back (The Optimistic-Tap Rule).
+						<StarToggle act={act} task={task} />
+					)}
+					<button
+						type="button"
+						className="icon"
+						aria-label="Workflow overview"
+						title="Workflow overview"
+						onClick={() => setWfOpen(true)}
+					>
+						<Icon name="route" />
+					</button>
+					<CloseButton />
+				</div>
+			</div>
+			<p className="drawer-sub">
+				<span>{projectLabel(project)}</span>
+				<span className="sub-dim">
+					{/* Click copies the id for pasting into another task or an agent session. */}
+					<button
+						type="button"
+						className="task-id"
+						title="Copy task ID"
+						onClick={() => {
+							setIdCopyError(null);
+							copyText(task.id).then(flashCopiedId, (err) =>
+								setIdCopyError(
+									err instanceof Error ? err.message : String(err),
+								),
+							);
+						}}
+					>
+						{copiedId ? "Copied" : task.id}
+					</button>
+					{idCopyError !== null && (
+						<span role="alert" className="auth-error">
+							{idCopyError}
+						</span>
+					)}
+				</span>
+				<span>
+					{COLUMNS.find((c) => c.key === task.stage)?.label ?? task.stage}
+				</span>
+				{/* PR mode: the pull request this card waits on, beside the stage in the
+				    head line; the Meta block keeps the full row. */}
+				{task.prNumber !== null && (
+					<span>
+						{task.prUrl !== null ? (
+							<a
+								className="pr-link"
+								href={task.prUrl}
+								target="_blank"
+								rel="noopener noreferrer"
+								title={`Open PR #${task.prNumber} on GitHub`}
+								aria-label={`PR #${task.prNumber} on GitHub (opens a new tab)`}
+							>
+								PR #{task.prNumber}
+							</a>
+						) : (
+							<span className="pr-link">PR #{task.prNumber}</span>
+						)}
+					</span>
+				)}
+				<span
+					className="sub-dim"
+					title={new Date(task.createdAt).toLocaleString()}
+				>
+					created {stamp(task.createdAt)}
+				</span>
+				{task.cancelledAt !== null && (
+					<span
+						className="sub-dim"
+						title={new Date(task.cancelledAt).toLocaleString()}
+					>
+						cancelled {stamp(task.cancelledAt)}
+					</span>
+				)}
+				{task.stage === "done" && task.doneAt !== null && (
+					<span
+						className="sub-dim"
+						title={new Date(task.doneAt).toLocaleString()}
+					>
+						landed {stamp(task.doneAt)}
+					</span>
+				)}
+				{/* The stage label already says done; the status word only earns its place when it adds state. */}
+				{task.state !== "idle" && (
+					<span className={`st st-${task.state}${askedNow ? " st-asked" : ""}`}>
+						{/* Alarm coding rides in markup, not ::before: the drawer-sub
+						    separator owns that pseudo-element. */}
+						{task.state === "needs_you" && <Mark kind={cardMark(task)} />}
+						{statusLine(
+							task,
+							project.hasRules,
+							// The list below names the cards; the meta line only counts them.
+							waiting.length > 0
+								? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
+								: holdFor(task, tasks),
+							draining,
+						)}
+					</span>
+				)}
+			</p>
+		</header>
+	);
+}
+
+/** Drawer Mut section: extracted verbatim from the drawer body. */
+function DrawerMut(p: { mut: ReturnType<typeof strykerProgress> | null }) {
+	const { mut } = p;
+	return (
+		<>
+			{" "}
+			{mut !== null && (
+				<DrawerSec id="drawer-mut" label="Mutation run">
+					<div className="mut-run">
+						<span className="mut-pct">{Math.round(mut.pct)}%</span>
+						<span className="mut-bar" aria-hidden="true">
+							<i
+								style={{
+									transform: `scaleX(${clamp(mut.pct, 0, 100) / 100})`,
+								}}
+							/>
+						</span>
+						<dl className="mut-figs">
+							<div>
+								<dt>Tested</dt>
+								<dd>
+									{fmtNum(mut.tested)} / {fmtNum(mut.total)}
+								</dd>
+							</div>
+							{/* The tail's parts are known words (survived, elapsed, left, timed out); a part the format grows later keeps its raw text. */}
+							{strykerStats(mut.rest).map((s) => (
+								<div key={s.label === "" ? s.value : s.label}>
+									<dt>{s.label}</dt>
+									<dd>{s.value}</dd>
+								</div>
+							))}
+						</dl>
+					</div>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer Lineage section: extracted verbatim from the drawer body. */
+function DrawerLineage(p: {
+	row: TaskCard;
+	parent: TaskCard | null;
+	retroSource: { id: string; card: TaskCard | null } | null;
+	kids: TaskCard[];
+	proposals: Map<string, TaskCard[]>;
+	branchRow: (k: TaskCard, tag: string) => ReactNode;
+	onOpenTask: (id: string) => void;
+}) {
+	const { row, parent, retroSource, kids, proposals, branchRow, onOpenTask } =
+		p;
+	return (
+		<>
+			{" "}
+			{/* Lineage rail: the parent above, this card as the filled node. Follow-ups run in
+					    parallel, so they hang one level in off this card's node, each on its own elbow. */}
+			{(row.followUpOf !== null || kids.length > 0) && (
+				<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
+					<ol className="lineage-rail">
+						{retroSource !== null &&
+							(retroSource.card === null ? (
+								<li className="lineage-gone">
+									<span
+										className="lineage-row"
+										title={`${retroSource.id} is not on the board`}
+									>
+										<span className="lineage-key">{retroSource.id}</span>
+										<span className="lineage-title">Not on the board</span>
+										<span className="lineage-tag">retro source</span>
+									</span>
+								</li>
+							) : (
+								<li>
+									<LineageCardLink
+										card={retroSource.card}
+										selfProject={row.project}
+										tag="retro source"
+										onOpenTask={onOpenTask}
+									/>
+								</li>
+							))}
+						{row.followUpOf !== null &&
+							(parent === null ? (
+								// The state no longer carries the parent (a cancelled card): the
+								// row keeps the lineage on the bare id, inert like the card's.
+								<li className="lineage-gone">
+									<span
+										className="lineage-row"
+										title={`${row.followUpOf} is not on the board`}
+									>
+										<span className="lineage-key">{row.followUpOf}</span>
+										<span className="lineage-title">Not on the board</span>
+										<span className="lineage-tag">parent</span>
+									</span>
+								</li>
+							) : (
+								<li>
+									<LineageCardLink
+										card={parent}
+										selfProject={row.project}
+										tag={retroSource !== null ? "retro" : "parent"}
+										onOpenTask={onOpenTask}
+									/>
+								</li>
+							))}
+						<li className="lineage-self" aria-current="true">
+							<span className="lineage-row">
+								<span className="lineage-key">{row.id}</span>
+								<span className="lineage-title">
+									{row.sessionTitle ?? row.title}
+								</span>
+								<span className="lineage-tag">this card</span>
+							</span>
+							{kids.length > 0 && (
+								<ol className="lineage-branch" aria-label="Follow-ups">
+									{kids.map((k) => {
+										const props = proposals.get(k.id);
+										return (
+											<li
+												key={k.id}
+												className={
+													props !== undefined && props.length > 0
+														? "lineage-holds"
+														: undefined
+												}
+											>
+												{branchRow(k, k.kind === "retro" ? "retro" : "")}
+												{props !== undefined && props.length > 0 && (
+													<ol className="lineage-branch" aria-label="Proposals">
+														{props.map((p) => (
+															<li key={p.id}>{branchRow(p, "")}</li>
+														))}
+													</ol>
+												)}
+											</li>
+										);
+									})}
+								</ol>
+							)}
+						</li>
+					</ol>
+				</DrawerSec>
+			)}
+			{/* A waiting release card reads its unreviewed commits before it approves,
+					    so this section rides above the ask and the file lists. */}
+		</>
+	);
+}
+
+/** Drawer LateCommits section: extracted verbatim from the drawer body. */
+function DrawerLateCommits(p: { task: TaskView; cancelled: boolean }) {
+	const { task, cancelled } = p;
+	return (
+		<>
+			{" "}
+			{task.releaseVersion !== null &&
+				task.state === "needs_you" &&
+				!cancelled &&
+				task.lateCommits !== undefined &&
+				task.lateCommits.length > 0 && (
+					<DrawerSec id="drawer-late" label="Commits since the review">
+						<ul className="late-commits">
+							{task.lateCommits.map((c) => (
+								<li key={c.sha}>
+									<code>{c.sha.slice(0, 7)}</code>
+									<span className="late-subject">{c.subject}</span>
+									<span className={c.reviewed ? "late-mark" : "late-mark warn"}>
+										{!c.reviewed && <Mark kind="needs" />}
+										{c.reviewed ? "review fix" : "not reviewed"}
+									</span>
+								</li>
+							))}
+						</ul>
+					</DrawerSec>
+				)}
+		</>
+	);
+}
+
+/** Drawer AskPanel section: extracted verbatim from the drawer body. */
+function DrawerAskPanel(p: {
+	task: TaskView;
+	replySend: ReturnType<typeof useBusy>;
+	sendReply: (text: string, draft?: boolean) => Promise<boolean>;
+	diffFiles: NonNullable<TaskView["diffFiles"]>;
+	setDiffView: React.Dispatch<
+		React.SetStateAction<string[] | null | undefined>
+	>;
+}) {
+	const { task, replySend, sendReply, diffFiles, setDiffView } = p;
+	return (
+		<>
+			{" "}
+			{/* The ask leads the body: an outstanding question is the card's one
+					    action item, so it sits right below the lineage, before the file lists. */}
+			{task.asked !== null && task.state === "needs_you" && (
+				<AskPanel
+					asked={task.asked}
+					taskId={task.id}
+					busy={replySend.busy}
+					failed={replySend.failed}
+					changed={diffFiles.map((f) => f.file)}
+					onOpenDiff={setDiffView}
+					onSend={(text) => {
+						replySend.start(async () => {
+							const ok = await sendReply(text);
+							if (ok) clearAskDraft(task.id);
+							return ok;
+						});
+					}}
+				/>
+			)}
+		</>
+	);
+}
+
+/** Drawer Waiting section: extracted verbatim from the drawer body. */
+function DrawerWaiting(p: {
+	waiting: TaskCard[];
+	task: TaskView;
+	askedNow: boolean;
+	proposal: boolean;
+	row: TaskCard;
+	followUp: boolean;
+	prReviewOpen: boolean;
+	project: ProjectView;
+	tasks: TaskCard[];
+	onOpenTask: (id: string) => void;
+	draining: boolean;
+}) {
+	const {
+		waiting,
+		project,
+		tasks,
+		onOpenTask,
+		draining,
+		task,
+		askedNow,
+		proposal,
+		row,
+		followUp,
+		prReviewOpen,
+	} = p;
+	return (
+		<>
+			{" "}
+			{waiting.length > 0 && (
+				<DrawerSec id="drawer-waiting" label="Waiting for">
+					<RelatedTasks
+						items={waiting}
+						project={project}
+						tasks={tasks}
+						onOpenTask={onOpenTask}
+						draining={draining}
+					/>
+				</DrawerSec>
+			)}
+			{/* A live ask round hides its reason: the runner echoes the first question into
+					    it, and the ask panel above already carries the full questions. */}
+			{task.needsReason !== null && !askedNow && !proposal && (
+				<div className="needs-reason">
+					<ProposalReasonLink
+						reason={task.needsReason}
+						selfProject={row.project}
+						tasks={tasks}
+						onOpenTask={onOpenTask}
+					/>
+				</div>
+			)}
+			{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
+					    body pins the message's actions while the report scrolls. The server still
+					    gates the approval. */}
+			{/* A stopped card only interacts through the composer at the very bottom;
+					    the jump link skips the report so no manual scrolling is needed. */}
+			{task.state === "needs_you" &&
+				!askedNow &&
+				!followUp &&
+				!prReviewOpen && (
+					<p className="jump-reply">
+						<button
+							type="button"
+							className="jump-link"
+							onClick={() =>
+								document
+									.getElementById("drawer-reply")
+									?.scrollIntoView({ block: "start" })
+							}
+						>
+							Go to reply ↓
+						</button>
+					</p>
+				)}
+		</>
+	);
+}
+
+/** Drawer Files section: extracted verbatim from the drawer body. */
+function DrawerFiles(p: {
+	wtLoading: boolean;
+	diffLoading: boolean;
+	task: TaskView;
+	diffFiles: NonNullable<TaskView["diffFiles"]>;
+	diffPlus: number;
+	diffMinus: number;
+	setDiffView: React.Dispatch<
+		React.SetStateAction<string[] | null | undefined>
+	>;
+}) {
+	const {
+		wtLoading,
+		diffLoading,
+		task,
+		diffFiles,
+		diffPlus,
+		diffMinus,
+		setDiffView,
+	} = p;
+	return (
+		<>
+			{" "}
+			{/* Loading placeholders in the loaded sections' slots, so the headers stay put. */}
+			{wtLoading && (
+				<DrawerSec id="drawer-wt" label="Worktree files">
+					<DrawerLoading label="Loading the files" />
+				</DrawerSec>
+			)}
+			{diffLoading && (
+				<DrawerSec id="drawer-diff" label="Changed files">
+					<DrawerLoading label="Loading the files" />
+				</DrawerSec>
+			)}
+			{task.worktreeFiles != null && task.worktreeFiles.length > 0 && (
+				<DrawerSec id="drawer-wt" label="Worktree files">
+					<div className="wt-files">
+						<p className="hint">
+							{task.stage === "done"
+								? "Uncommitted files this task produced, captured when it finished. The worktree is gone, so only the names remain."
+								: "Uncommitted files this task produced. Open them before the worktree is removed."}
+						</p>
+						{task.worktreeFiles.slice(0, 50).map((f) =>
+							task.stage === "done" ? (
+								<code key={f} className="kept-path">
+									{f}
+								</code>
+							) : (
+								<a
+									key={f}
+									className="wt-file"
+									href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/files?path=${encodeURIComponent(f)}`}
+									target="_blank"
+									rel="noreferrer"
+								>
+									{f}
+								</a>
+							),
+						)}
+						{task.worktreeFiles.length > 50 && (
+							<p className="hint">…and {task.worktreeFiles.length - 50} more</p>
+						)}
+					</div>
+				</DrawerSec>
+			)}
+			{diffFiles.length > 0 && (
+				<DrawerSec id="drawer-diff" label="Changed files">
+					<div className="wt-files">
+						<p className="hint">
+							+{diffPlus} −{diffMinus} across {diffFiles.length} file
+							{diffFiles.length === 1 ? "" : "s"} ·{" "}
+							<button
+								type="button"
+								className="diff-link"
+								onClick={() => setDiffView(null)}
+							>
+								View diff
+							</button>
+						</p>
+						{diffFiles.slice(0, 50).map((f) => (
+							<div key={f.file} className="diff-file">
+								<button
+									type="button"
+									className="diff-path"
+									title="View this file's diff"
+									onClick={() => setDiffView([f.file])}
+								>
+									{f.file}
+								</button>
+								<span className="diff-num">
+									{f.plus === null ? "binary" : `+${f.plus} −${f.minus ?? 0}`}
+								</span>
+							</div>
+						))}
+						{diffFiles.length > 50 && (
+							<p className="hint">…and {diffFiles.length - 50} more</p>
+						)}
+					</div>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer Notes section: extracted verbatim from the drawer body. */
+/** The release-notes edit form: shown instead of the section body while an edit is open. */
+function ReleaseNotesEditor(p: {
+	value: string;
+	setValue: (v: string | null) => void;
+	valid: boolean;
+	save: ReturnType<typeof useBusy>;
+	submit: (mode: "save" | "append") => void;
+}) {
+	return (
+		<section className="dsec">
+			{/* The editor replaces the section body; the form's label titles it. */}
+			<form
+				className="reply-form"
+				onSubmit={(e) => {
+					e.preventDefault();
+					p.submit("save");
+				}}
+			>
+				<label htmlFor="release-notes-text">Release notes</label>
+				<textarea
+					id="release-notes-text"
+					rows={6}
+					value={p.value}
+					onChange={(e) => p.setValue(e.target.value)}
+					placeholder="Replacement notes — or text appended below the current notes."
+				/>
+				<div className="reply-actions">
+					<button
+						type="button"
+						onClick={() => p.setValue(null)}
+						disabled={p.save.busy}
+					>
+						Cancel
+					</button>
+					<button
+						type="button"
+						className={p.save.failed ? "failed" : undefined}
+						disabled={!p.valid || p.save.busy}
+						aria-busy={p.save.busy || undefined}
+						onClick={() => p.submit("append")}
+					>
+						{p.save.busy && <span className="spinner" aria-hidden="true" />}
+						Add to notes
+					</button>
+					{/* One primary per surface: the notes Save stays stock grey. */}
+					<button
+						type="submit"
+						className={p.save.failed ? "failed" : undefined}
+						disabled={!p.valid || p.save.busy}
+						aria-busy={p.save.busy || undefined}
+					>
+						{p.save.busy && <span className="spinner" aria-hidden="true" />}
+						<Icon name="send" />
+						Save
+					</button>
+				</div>
+			</form>
+		</section>
+	);
+}
+
+function DrawerNotes(p: {
+	task: TaskView;
+	notesEdit: string | null;
+	setNotesEdit: (v: string | null) => void;
+	notesValid: boolean;
+	notesEditable: boolean;
+	notesSubmit: (mode: "save" | "append") => void;
+	notesSave: ReturnType<typeof useBusy>;
+}) {
+	const {
+		task,
+		notesEdit,
+		setNotesEdit,
+		notesValid,
+		notesEditable,
+		notesSubmit,
+		notesSave,
+	} = p;
+	return (
+		<>
+			{" "}
+			{task.releaseVersion !== null &&
+				(notesEdit === null ? (
+					<DrawerSec
+						id="drawer-notes"
+						label="Release notes"
+						head={
+							notesEditable && (
+								<button
+									type="button"
+									className="ghost"
+									title="Edit release notes"
+									aria-label="Edit release notes"
+									onClick={() => setNotesEdit("")}
+								>
+									<Icon name="edit" />
+									Edit
+								</button>
+							)
+						}
+					>
+						{task.releaseNotes === null || task.releaseNotes === "" ? (
+							<p className="dim">No notes yet.</p>
+						) : (
+							<div className="release-notes">
+								<Markdown text={task.releaseNotes} />
+							</div>
+						)}
+					</DrawerSec>
+				) : (
+					<ReleaseNotesEditor
+						value={notesEdit}
+						setValue={setNotesEdit}
+						valid={notesValid}
+						save={notesSave}
+						submit={notesSubmit}
+					/>
+				))}
+		</>
+	);
+}
+
+/** Drawer Prompts section: extracted verbatim from the drawer body. */
+function DrawerPrompts(p: {
+	editable: boolean;
+	proposal: boolean;
+	task: TaskView;
+	edit: string | null;
+	setEdit: (v: string | null) => void;
+	editValid: boolean;
+	editSave: ReturnType<typeof useBusy>;
+	editSubmit: () => void;
+	inputUrls: string[];
+	imgUrl: (name: string) => string;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+}) {
+	const {
+		editable,
+		proposal,
+		task,
+		edit,
+		setEdit,
+		editValid,
+		editSave,
+		editSubmit,
+		inputUrls,
+		imgUrl,
+		setViewing,
+	} = p;
+	return (
+		<>
+			{" "}
+			{!editable && !proposal && (
+				<DrawerSec id="drawer-prompt" label="Prompt">
+					<div className="prompt-text">
+						<Markdown text={task.prompt} />
+					</div>
+				</DrawerSec>
+			)}
+			{!proposal && editable && edit === null && (
+				<DrawerSec id="drawer-prompt" label="Prompt">
+					<div className="task-prompt">
+						<Markdown text={task.prompt} />
+						<button type="button" onClick={() => setEdit(task.prompt)}>
+							<Icon name="edit" />
+							Edit task
+						</button>
+					</div>
+				</DrawerSec>
+			)}
+			{!proposal && editable && edit !== null && (
+				<PromptEditForm
+					edit={edit}
+					onEdit={setEdit}
+					editValid={editValid}
+					editSave={editSave}
+					onSave={editSubmit}
+				/>
+			)}
+			{(task.images.length > 0 || task.pendingImages.length > 0) && (
+				<div className="thumbs">
+					{[...task.images, ...task.pendingImages].map((name, i) => {
+						const url = imgUrl(name);
+						return (
+							<button
+								key={name}
+								type="button"
+								className="thumb"
+								title="Open full size"
+								onClick={() => setViewing({ list: inputUrls, index: i })}
+							>
+								<img src={url} alt={`Attachment ${i + 1}`} loading="lazy" />
+							</button>
+						);
+					})}
+				</div>
+			)}
+		</>
+	);
+}
+
+/** Drawer Result section: extracted verbatim from the drawer body. */
+function DrawerResult(p: {
+	report: TaskView | TurnView;
+	hideDetails: boolean;
+	task: TaskView;
+}) {
+	const { report, hideDetails, task } = p;
+	return (
+		<>
+			{" "}
+			{/* A done research card renders the full report once, in the Research report section below; the Result keeps the summary (tldr) only. */}
+			{(report.summary !== null ||
+				(report.details !== null && !hideDetails)) && (
+				<DrawerSec
+					id="drawer-result"
+					label={task.stage === "done" ? "Result" : "Report"}
+				>
+					{report.summary !== null && (
+						<p className="summary">{report.summary}</p>
+					)}
+					{report.details !== null && !hideDetails && (
+						<Markdown text={report.details} />
+					)}
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer PrSec section: extracted verbatim from the drawer body. */
+function DrawerPrSec(p: {
+	task: TaskView;
+	prDraft: string | null;
+	act: Act;
+	setDetail: React.Dispatch<React.SetStateAction<TaskView | null>>;
+}) {
+	const { task, prDraft, act, setDetail } = p;
+	return (
+		<>
+			{" "}
+			{task.kind === "pr_review" && task.prReview !== undefined && (
+				<DrawerSec id="drawer-pr" label="PR review">
+					<PrReviewSection
+						key={task.prReview.reviewedHead ?? ""}
+						task={task}
+						pr={task.prReview}
+						draft={prDraft}
+						act={act}
+						onLoaded={setDetail}
+					/>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer WorkCheck section: extracted verbatim from the drawer body. */
+function DrawerWorkCheck(p: {
+	task: TaskView;
+	catalog: ReturnType<typeof useModels>;
+}) {
+	const { task, catalog } = p;
+	return (
+		<>
+			{" "}
+			{task.workCheckLog.length > 0 && (
+				<DrawerSec id="drawer-wc" label="Work check" className="work-checks">
+					<ul>
+						{task.workCheckLog.map((run, i) => (
+							<li key={i}>
+								<p className="wc-run">
+									{run.outcome === "pass"
+										? "Passed"
+										: run.outcome === "blockers"
+											? "Blocked"
+											: "Error"}
+									{" · "}
+									{run.model === null
+										? "default model"
+										: displayModel(catalog?.models ?? [], run.model)}
+									{" · "}
+									{stamp(run.at)} · {duration(run.durationMs)}
+								</p>
+								{run.warn !== undefined && (
+									<p className="hint">
+										<Mark kind="warn" /> {run.warn}
+									</p>
+								)}
+								{run.error !== undefined && <p className="dim">{run.error}</p>}
+								{run.blockers.length > 0 && (
+									<ul>
+										{run.blockers.map((b, j) => (
+											<li key={j}>
+												<p>{b.finding}</p>
+												<blockquote>{b.quote}</blockquote>
+												{b.status !== undefined && (
+													<p className="dim">
+														{b.status}
+														{b.statusReason !== undefined
+															? `: ${b.statusReason}`
+															: ""}
+													</p>
+												)}
+											</li>
+										))}
+									</ul>
+								)}
+								{run.notes.length > 0 && (
+									<ul>
+										{run.notes.map((n, j) => (
+											<li key={j} className="dim">
+												{n}
+											</li>
+										))}
+									</ul>
+								)}
+							</li>
+						))}
+					</ul>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer MergeModal section: extracted verbatim from the drawer body. */
+function DrawerMergeModal(p: {
+	mergeOpen: boolean;
+	setMergeOpen: (v: boolean) => void;
+	mergeReason: string;
+	setMergeReason: (v: string) => void;
+	mergeError: string | null;
+	mergeSave: ReturnType<typeof useBusy>;
+	mergeAnyway: () => Promise<boolean>;
+}) {
+	const {
+		mergeOpen,
+		setMergeOpen,
+		mergeReason,
+		setMergeReason,
+		mergeError,
+		mergeSave,
+		mergeAnyway,
+	} = p;
+	return (
+		<>
+			{" "}
+			{mergeOpen && (
+				<Modal
+					label="Merge anyway"
+					className="dialog"
+					onClose={() => setMergeOpen(false)}
+				>
+					<div className="dialog-body">
+						<div className="dialog-head">
+							<h2>Merge anyway</h2>
+							<CloseButton />
+						</div>
+						<p className="hint">
+							The work check found unresolved blockers. Say why the card merges
+							anyway; the reason is kept with the check log.
+						</p>
+						<form
+							className="reply-form"
+							onSubmit={(e) => {
+								e.preventDefault();
+								mergeSave.start(() => mergeAnyway());
+							}}
+						>
+							<label htmlFor="merge-anyway-reason">Reason</label>
+							<textarea
+								id="merge-anyway-reason"
+								data-autofocus
+								required
+								maxLength={2000}
+								value={mergeReason}
+								onChange={(e) => setMergeReason(e.target.value)}
+								placeholder="Why do the blockers not block this merge?"
+							/>
+							{mergeError !== null && (
+								<p role="alert" className="dim">
+									{mergeError}
+								</p>
+							)}
+							<div className="reply-actions">
+								<button
+									type="button"
+									onClick={() => setMergeOpen(false)}
+									disabled={mergeSave.busy}
+								>
+									Cancel
+								</button>
+								<button
+									type="submit"
+									className="danger"
+									disabled={mergeReason.trim().length === 0 || mergeSave.busy}
+									aria-busy={mergeSave.busy || undefined}
+								>
+									{mergeSave.busy && (
+										<span className="spinner" aria-hidden="true" />
+									)}
+									Merge anyway
+								</button>
+							</div>
+						</form>
+					</div>
+				</Modal>
+			)}
+		</>
+	);
+}
+
+/** Drawer Shots section: extracted verbatim from the drawer body. */
+function DrawerShots(p: {
+	shotUrls: string[];
+	task: TaskView;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+	imgUrl: (name: string) => string;
+}) {
+	const { shotUrls, task, setViewing, imgUrl } = p;
+	return (
+		<>
+			{" "}
+			{shotUrls.length > 0 && (
+				<DrawerSec id="drawer-shots" label="Screenshots">
+					<div className="thumbs">
+						{task.shots.map((name, i) => {
+							const url = imgUrl(name);
+							return (
+								<button
+									key={name}
+									type="button"
+									className="thumb shot"
+									title="Open full size"
+									onClick={() =>
+										setViewing({
+											list: shotUrls,
+											index: i,
+											names: task.shots,
+										})
+									}
+								>
+									<img src={url} alt={name} loading="lazy" />
+									<span className="shot-name">{name}</span>
+								</button>
+							);
+						})}
+					</div>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer Research section: extracted verbatim from the drawer body. */
+function DrawerResearch(p: {
+	task: TaskView;
+	mdRef: React.RefObject<HTMLDivElement | null>;
+}) {
+	const { task, mdRef } = p;
+	return (
+		<>
+			{" "}
+			{task.research && task.report !== null && (
+				<DrawerSec
+					id="drawer-research"
+					label="Research report"
+					head={
+						<div style={{ display: "flex", gap: 8 }}>
+							<button
+								type="button"
+								className="ghost"
+								title="Download research-report.html"
+								onClick={() => {
+									downloadBlob(
+										"research-report.html",
+										// The section guard proves non-null; closures lose the narrowing.
+										new Blob(
+											[reportHtml(task.title, mdRef.current?.innerHTML ?? "")],
+											{ type: "text/html" },
+										),
+									);
+								}}
+							>
+								<Icon name="download" />
+								HTML
+							</button>
+							<button
+								type="button"
+								className="ghost"
+								title="Download research-report.md"
+								onClick={() => {
+									downloadBlob(
+										"research-report.md",
+										new Blob([task.report ?? ""], {
+											type: "text/markdown",
+										}),
+									);
+								}}
+							>
+								<Icon name="download" />
+								Download
+							</button>
+						</div>
+					}
+				>
+					<div ref={mdRef}>
+						<Markdown text={task.report} />
+					</div>
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer Steps section: extracted verbatim from the drawer body. */
+/** One Work-steps rail entry: a work check, a filed finding or a turn with its expandable log. */
+type WorkStep = ReturnType<typeof workSteps>[number];
+
+/** One work check run on the rail; not expandable, the Work check section holds the findings. */
+function CheckStep(p: {
+	s: Extract<WorkStep, { kind: "check" }>;
+	catalog: ReturnType<typeof useModels>;
+}) {
+	const { run } = p.s;
+	const nb = run.blockers.length;
+	const nn = run.notes.length;
+	return (
+		<li key={`check-${p.s.n}`} className="turn turn-check">
+			{run.outcome === "pass" ? (
+				<span className="turn-node">
+					<Icon name="check" size={11} />
+				</span>
+			) : (
+				<span className="turn-node ask" aria-hidden="true" />
+			)}
+			<div className="turn-head">
+				<strong>work check</strong>
+				<span
+					className={`outcome${run.outcome === "pass" ? "" : " o-needs_you"}`}
+				>
+					{run.outcome === "pass"
+						? "passed"
+						: run.outcome === "blockers"
+							? "blocked"
+							: "error"}
+				</span>
+				<span className="turn-model" title="model">
+					{run.model === null
+						? "default model"
+						: displayModel(p.catalog?.models ?? [], run.model)}
+				</span>
+				<span className="turn-time">
+					{new Date(run.at).toLocaleTimeString()}
+				</span>
+				<span className="turn-dur">{duration(run.durationMs)}</span>
+			</div>
+			{(run.error !== undefined || nb + nn > 0) && (
+				<div className="dim turn-sum">
+					{run.error ??
+						`${nb} ${nb === 1 ? "blocker" : "blockers"} · ${nn} ${nn === 1 ? "note" : "notes"}`}
+				</div>
+			)}
+			{run.warn !== undefined && (
+				<div className="dim turn-sum">
+					<Mark kind="warn" /> {run.warn}
+				</div>
+			)}
+		</li>
+	);
+}
+
+/** One filed finding on the rail; not expandable, the finding has no turns yet and its card holds the state. */
+function FiledStep(p: { s: Extract<WorkStep, { kind: "filed" }> }) {
+	const f = p.s.finding;
+	return (
+		<li key={`filed-${f.id}`} className="turn turn-check">
+			<span className="turn-node" aria-hidden="true">
+				<Mark kind="queued" />
+			</span>
+			<div className="turn-head">
+				<strong>finding</strong>
+				<span
+					className={
+						"outcome" +
+						(f.cancelledAt !== null || f.state === "needs_you"
+							? " o-needs_you"
+							: "")
+					}
+				>
+					{f.cancelledAt !== null ? "cancelled" : f.state}
+				</span>
+				<span className="turn-time">
+					{new Date(f.createdAt).toLocaleTimeString()}
+				</span>
+			</div>
+			<div className="dim turn-sum">{f.title}</div>
+		</li>
+	);
+}
+
+/** The rail node shape: check = ended, filled dot = live, triangle = needs you (steel when the turn asked a question). */
+function TurnNode(p: { t: TurnView }) {
+	return p.t.endedAt === null ? (
+		<span className="turn-node live" aria-hidden="true" />
+	) : p.t.outcome === "needs_you" ? (
+		<span
+			className={`turn-node ask${p.t.question !== null ? " asked" : ""}`}
+			aria-hidden="true"
+		/>
+	) : (
+		<span className="turn-node">
+			<Icon name="check" size={11} />
+		</span>
+	);
+}
+
+/** The steer/reply bubble this turn delivered: it is what started the turn, and it is display-only. */
+function YouBubble(p: { input: string; inputBy: TurnView["inputBy"] }) {
+	return (
+		<div className="you">
+			<span className="you-head">
+				{p.inputBy === "supervisor" ? "Supervisor" : "You"}
+			</span>
+			<div className="you-bubble">
+				{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
+				{p.input.trim() === "." ? (
+					<span className="you-chip">Resume</span>
+				) : (
+					<div className="you-msg">
+						<Markdown text={p.input} />
+					</div>
+				)}
+			</div>
+		</div>
+	);
+}
+
+/** The turn row's head button: kind, outcome, model, start time and duration. */
+function TurnHead(p: {
+	t: TurnView;
+	sub: string | null;
+	kind: WorkStep["kind"];
+	model: string | null;
+	expanded: boolean;
+}) {
+	const t = p.t;
+	return (
+		<button type="button" className="turn-head" aria-expanded={p.expanded}>
+			<Icon name="chevron-right" size={13} />
+			<strong>
+				{p.sub === null ? t.kind : p.kind === "finding" ? "finding" : "retro"}
+			</strong>
+			{t.outcome !== null && (
+				<span
+					className={
+						"outcome o-" +
+						t.outcome +
+						(t.outcome === "needs_you" && t.question !== null ? " asked" : "")
+					}
+				>
+					{t.outcome === "needs_you" && t.question !== null
+						? "question"
+						: t.outcome.replace("_", " ")}
+				</span>
+			)}
+			{p.model !== null && (
+				<span className="turn-model" title="model">
+					{p.model}
+				</span>
+			)}
+			<span className="turn-time">
+				{new Date(t.startedAt).toLocaleTimeString()}
+			</span>
+			<span className="turn-dur">
+				{t.endedAt === null ? (
+					<LiveElapsed since={t.startedAt} />
+				) : (
+					turnDuration({ startedAt: t.startedAt, endedAt: t.endedAt })
+				)}
+			</span>
+		</button>
+	);
+}
+
+/** A retro or finding turn's id comes from another card: key its open state apart. */
+function turnStepKey(s: WorkStep, t: TurnView): string | number {
+	const sub =
+		s.kind === "retro" ? s.retroId : s.kind === "finding" ? s.finding.id : null;
+	return sub === null ? t.id : `${s.kind}-${sub}-${t.id}`;
+}
+
+/** The turn row's own-card links: open the retro or the finding card. */
+function TurnLinks(p: {
+	s: Extract<WorkStep, Record<"turn", unknown>>;
+	idx: number;
+	task: TaskView;
+	lastRetro: WorkStep | undefined;
+	lastFindingStep: Map<string, number>;
+	onOpenTask: (id: string) => void;
+}) {
+	const { s, idx, task, lastRetro, lastFindingStep, onOpenTask } = p;
+	return (
+		<>
+			{/* The retro card's own drawer keeps reply and cancel for a retro that waits. */}
+			{s.kind === "retro" && s === lastRetro && (
+				<a
+					className="turn-link"
+					href={taskPath(task.project, s.retroId)}
+					// The link is its own target: the row's toggle must not fire.
+					onKeyDown={(e) => e.stopPropagation()}
+					onClick={(e) => {
+						e.stopPropagation();
+						navClick(e, () => onOpenTask(s.retroId));
+					}}
+				>
+					Open retro
+				</a>
+			)}
+			{s.kind === "finding" && lastFindingStep.get(s.finding.id) === idx && (
+				<a
+					className="turn-link"
+					href={taskPath(task.project, s.finding.id)}
+					// The link is its own target: the row's toggle must not fire.
+					onKeyDown={(e) => e.stopPropagation()}
+					onClick={(e) => {
+						e.stopPropagation();
+						navClick(e, () => onOpenTask(s.finding.id));
+					}}
+				>
+					Open finding
+				</a>
+			)}
+		</>
+	);
+}
+
+/** The turn row's error and the retro's waiting reason, shown as needs-reason blocks. */
+function TurnAlerts(p: {
+	t: TurnView;
+	retroWait: NonNullable<TaskView["retro"]> | null;
+}) {
+	return (
+		<>
+			{p.t.error !== null && (
+				<div className={`needs-reason${p.t.question !== null ? " asked" : ""}`}>
+					{p.t.question !== null && <Mark kind="asked" />}
+					{p.t.error}
+				</div>
+			)}
+			{p.retroWait !== null && (
+				<div
+					className={`needs-reason${p.retroWait.asked !== null ? " asked" : ""}`}
+				>
+					{p.retroWait.asked !== null && <Mark kind="asked" />}
+					{p.retroWait.needsReason}
+				</div>
+			)}
+		</>
+	);
+}
+
+/** A running turn's model is only written to the DB when it ends; meanwhile show what it runs with. A retro or finding runs on its own card's model, which this drawer does not carry. */
+function turnModel(
+	s: Extract<WorkStep, Record<"turn", unknown>>,
+	t: TurnView,
+	task: TaskView,
+	catalog: ReturnType<typeof useModels>,
+): string | null {
+	const sub =
+		s.kind === "retro" ? s.retroId : s.kind === "finding" ? s.finding.id : null;
+	return (
+		t.model ??
+		(t.endedAt === null && sub === null
+			? (task.model ?? catalog?.defaultModel ?? null)
+			: null)
+	);
+}
+
+/** One turn (own, retro or finding) with its expandable log. */
+function TurnStep(p: {
+	s: Extract<WorkStep, Record<"turn", unknown>>;
+	idx: number;
+	task: TaskView;
+	project: ProjectView;
+	catalog: ReturnType<typeof useModels>;
+	openTurn: number | string | null;
+	setOpenTurn: React.Dispatch<React.SetStateAction<number | string | null>>;
+	lastRetro: WorkStep | undefined;
+	lastFindingStep: Map<string, number>;
+	onOpenTask: (id: string) => void;
+}) {
+	const {
+		s,
+		idx,
+		task,
+		project,
+		catalog,
+		openTurn,
+		setOpenTurn,
+		lastRetro,
+		lastFindingStep,
+		onOpenTask,
+	} = p;
+	const t = s.turn;
+	// The card that ran the turn: null for this card's own turns.
+	const sub =
+		s.kind === "retro" ? s.retroId : s.kind === "finding" ? s.finding.id : null;
+	// A retro or finding turn's id comes from another card: key its open state apart.
+	const stepKey = turnStepKey(s, t);
+	const expanded = openTurn === stepKey;
+	// The retro's waiting reason, unless its latest turn already shows it.
+	const retroWait =
+		s === lastRetro &&
+		task.retro?.state === "needs_you" &&
+		task.retro.needsReason !== null &&
+		task.retro.needsReason !== t.error
+			? task.retro
+			: null;
+	// A running turn's model is only written to the DB when it ends; meanwhile show what it runs with.
+	// A retro or finding runs on its own card's model, which this drawer does not carry.
+	const model = turnModel(s, t, task, catalog);
+	return (
+		<li
+			key={stepKey}
+			className="turn"
+			// Keyboard support without a second tab stop: the turn-head button
+			// is the only stop, and its Enter/Space keydown bubbles to the
+			// handlers here (preventDefault stops the button's own click).
+			onKeyDown={(e) => {
+				if (e.key !== "Enter" && e.key !== " ") return;
+				e.preventDefault();
+				setOpenTurn(expanded ? null : stepKey);
+			}}
+			onClick={(e) => {
+				// The log stays open while scrolling/selecting in it; selecting summary text must not toggle either.
+				// The input bubble is display-only: clicking or selecting it never toggles the log.
+				if (
+					(e.target as Element).closest(".log, .you") ||
+					!window.getSelection()?.isCollapsed
+				)
+					return;
+				setOpenTurn(expanded ? null : stepKey);
+			}}
+		>
+			<TurnNode t={t} />
+			{t.input !== null && <YouBubble input={t.input} inputBy={t.inputBy} />}
+			{/* The agent's part: the one hover-glow target. The steer/reply bubble
+			    above stays outside it — display-only, like the click. */}
+			<div className="turn-body">
+				<TurnHead
+					t={t}
+					sub={sub}
+					kind={s.kind}
+					model={model}
+					expanded={expanded}
+				/>
+				{s.kind === "finding" && (
+					<div className="dim turn-sum">{s.finding.title}</div>
+				)}
+				{t.summary !== null && <div className="dim turn-sum">{t.summary}</div>}
+				{/* The run fell back to another model than dispatched (provider error,
+				omp's retry chain): name both, so a steered model pick that did not
+				run is legible instead of silent. The card keeps the pick. */}
+				{t.dispatchedModel !== null && t.model !== null && (
+					<div
+						className="dim turn-sum"
+						title={`Dispatched ${t.dispatchedModel}, but the run served ${t.model}: the provider errored and omp's retry chain fell back. The card keeps ${t.dispatchedModel} for its next turn.`}
+					>
+						<Mark kind="warn" /> dispatched{" "}
+						{displayModel(catalog?.models ?? [], t.dispatchedModel)}, ran{" "}
+						{displayModel(catalog?.models ?? [], t.model)}
+					</div>
+				)}
+				<TurnLinks
+					s={s}
+					idx={idx}
+					task={task}
+					lastRetro={lastRetro}
+					lastFindingStep={lastFindingStep}
+					onOpenTask={onOpenTask}
+				/>
+				<TurnAlerts t={t} retroWait={retroWait} />
+				{expanded && (
+					<LogView
+						project={project}
+						taskId={sub ?? task.id}
+						startedAt={t.startedAt}
+						logOffset={t.logOffset}
+					/>
+				)}
+			</div>
+		</li>
+	);
+}
+
+/** One Work-steps rail entry: a work check, a filed finding or a turn with its expandable log. */
+function DrawerStepItem(p: {
+	s: WorkStep;
+	idx: number;
+	task: TaskView;
+	project: ProjectView;
+	catalog: ReturnType<typeof useModels>;
+	openTurn: number | string | null;
+	setOpenTurn: React.Dispatch<React.SetStateAction<number | string | null>>;
+	lastRetro: WorkStep | undefined;
+	lastFindingStep: Map<string, number>;
+	onOpenTask: (id: string) => void;
+}) {
+	if (p.s.kind === "check") return <CheckStep s={p.s} catalog={p.catalog} />;
+	if (p.s.kind === "filed") return <FiledStep s={p.s} />;
+	return (
+		<TurnStep
+			s={p.s}
+			idx={p.idx}
+			task={p.task}
+			project={p.project}
+			catalog={p.catalog}
+			openTurn={p.openTurn}
+			setOpenTurn={p.setOpenTurn}
+			lastRetro={p.lastRetro}
+			lastFindingStep={p.lastFindingStep}
+			onOpenTask={p.onOpenTask}
+		/>
+	);
+}
+
+/** The Work steps head's context meter: prompt tokens over the model's context window. */
+function ContextMeter(p: { ctx: SessionContext; windowTok: number | null }) {
+	const { ctx, windowTok } = p;
+	return (
+		<Meter
+			label="Context"
+			pct={windowTok ? (ctx.promptTokens / windowTok) * 100 : null}
+			band={windowTok !== null}
+			value={
+				fmtTokens(ctx.promptTokens) +
+				(windowTok !== null ? ` / ${fmtTokens(windowTok)}` : "")
+			}
+			title={
+				windowTok === null
+					? ctx.model === null
+						? "Context window"
+						: `Context window — ${ctx.model}`
+					: `Context window — ${ctx.model}` +
+						(ctx.compactions > 0 ? `, compacted ${ctx.compactions}×` : "")
+			}
+		/>
+	);
+}
+
+/** The queued steering edit form: replaces the bubble while an edit is open. */
+function SteerEditForm(p: {
+	steerEdit: string;
+	setSteerEdit: (v: string | null) => void;
+	steerEditSave: ReturnType<typeof useBusy>;
+	saveSteerEdit: (text: string) => Promise<boolean>;
+}) {
+	return (
+		<form
+			className="reply-form"
+			onSubmit={(e) => {
+				e.preventDefault();
+				if (p.steerEdit.trim().length === 0) return;
+				p.steerEditSave.start(() => p.saveSteerEdit(p.steerEdit));
+			}}
+		>
+			<label htmlFor="steer-edit-text">Steering</label>
+			<textarea
+				id="steer-edit-text"
+				rows={4}
+				value={p.steerEdit}
+				onChange={(e) => p.setSteerEdit(e.target.value)}
+			/>
+			<div className="reply-actions">
+				<button type="button" onClick={() => p.setSteerEdit(null)}>
+					Cancel
+				</button>
+				{/* One primary per surface: the edit Save stays stock grey. */}
+				<button
+					type="submit"
+					className={p.steerEditSave.failed ? "failed" : undefined}
+					disabled={p.steerEdit.trim().length === 0 || p.steerEditSave.busy}
+					aria-busy={p.steerEditSave.busy || undefined}
+				>
+					{p.steerEditSave.busy && (
+						<span className="spinner" aria-hidden="true" />
+					)}
+					<Icon name="send" />
+					Save
+				</button>
+			</div>
+		</form>
+	);
+}
+
+/** A queued steer in the timeline under the last turn: the next input the agent will get, with edit and cancel for the server's queued prompt. */
+function QueuedSteer(p: {
+	task: TaskView;
+	localPending: { text: string; images: number } | null;
+	steerEdit: string | null;
+	setSteerEdit: (v: string | null) => void;
+	steerEditSave: ReturnType<typeof useBusy>;
+	saveSteerEdit: (text: string) => Promise<boolean>;
+	cancelSteer: () => Promise<boolean>;
+}) {
+	const {
+		task,
+		localPending,
+		steerEdit,
+		setSteerEdit,
+		steerEditSave,
+		saveSteerEdit,
+		cancelSteer,
+	} = p;
+	const text =
+		localPending !== null ? localPending.text : (task.pendingPrompt ?? "");
+	return (
+		<li className="turn">
+			<span className="turn-node">
+				<Mark kind="queued" />
+			</span>
+			<div className="you">
+				<span className="you-head">
+					Queued
+					{/* Edit/Cancel act on the server's queued prompt: they
+												    wait for the server frame, so they hide while the
+												    optimistic bubble from this client's own send is
+												    still unconfirmed. */}
+					{localPending === null &&
+						task.pendingPrompt !== null &&
+						task.pendingPrompt.trim() !== "." && (
+							<>
+								<BusyButton
+									className="ghost"
+									ariaLabel="Edit the queued steering"
+									run={() => {
+										setSteerEdit(task.pendingPrompt);
+										return Promise.resolve(true);
+									}}
+								>
+									Edit
+								</BusyButton>
+								<BusyButton
+									className="ghost"
+									ariaLabel="Cancel the queued steering"
+									run={async () =>
+										(await confirmDialog("Discard the queued steering?", {
+											ok: "Discard",
+											danger: true,
+										}))
+											? cancelSteer()
+											: Promise.resolve(true)
+									}
+								>
+									Cancel
+								</BusyButton>
+							</>
+						)}
+				</span>
+				<div className="you-bubble">
+					{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
+					{text.trim() === "." ? (
+						<span className="you-chip">Resume</span>
+					) : steerEdit === null || localPending !== null ? (
+						<div className="you-msg">
+							<Markdown text={text} />
+						</div>
+					) : (
+						<SteerEditForm
+							steerEdit={steerEdit}
+							setSteerEdit={setSteerEdit}
+							steerEditSave={steerEditSave}
+							saveSteerEdit={saveSteerEdit}
+						/>
+					)}
+					{(localPending !== null
+						? localPending.images > 0
+						: task.pendingImages.length > 0) && (
+						<p className="you-msg dim">
+							+
+							{localPending !== null
+								? localPending.images
+								: task.pendingImages.length}{" "}
+							image
+							{(localPending !== null
+								? localPending.images
+								: task.pendingImages.length) === 1
+								? ""
+								: "s"}
+						</p>
+					)}
+					{task.state === "queued" && (
+						<p className="you-msg dim">Sends when an agent slot frees.</p>
+					)}
+				</div>
+			</div>
+		</li>
+	);
+}
+
+function DrawerSteps(p: {
+	ctx: SessionContext | null;
+	windowTok: number | null;
+	detail: TaskView | null;
+	steps: ReturnType<typeof workSteps>;
+	catalog: ReturnType<typeof useModels>;
+	openTurn: number | string | null;
+	setOpenTurn: React.Dispatch<React.SetStateAction<number | string | null>>;
+	lastRetro: ReturnType<typeof workSteps>[number] | undefined;
+	lastFindingStep: Map<string, number>;
+	project: ProjectView;
+	task: TaskView;
+	localPending: { text: string; images: number } | null;
+	steerEdit: string | null;
+	setSteerEdit: (v: string | null) => void;
+	steerEditSave: ReturnType<typeof useBusy>;
+	saveSteerEdit: (text: string) => Promise<boolean>;
+	cancelSteer: () => Promise<boolean>;
+	onOpenTask: (id: string) => void;
+}) {
+	const {
+		ctx,
+		windowTok,
+		detail,
+		steps,
+		catalog,
+		openTurn,
+		setOpenTurn,
+		lastRetro,
+		lastFindingStep,
+		project,
+		task,
+		localPending,
+		steerEdit,
+		setSteerEdit,
+		steerEditSave,
+		saveSteerEdit,
+		cancelSteer,
+		onOpenTask,
+	} = p;
+	return (
+		<>
+			{" "}
+			<DrawerSec
+				id="drawer-steps"
+				label="Work steps"
+				head={
+					ctx === null ? undefined : (
+						<ContextMeter ctx={ctx} windowTok={windowTok} />
+					)
+				}
+			>
+				{detail === null ? (
+					<DrawerLoading label="Loading the steps" />
+				) : (
+					steps.length === 0 && <p className="dim">No turns yet.</p>
+				)}
+				<ul className="turns">
+					{steps.map((s, idx) => (
+						<DrawerStepItem
+							key={
+								s.kind === "check"
+									? `check-${s.n}`
+									: s.kind === "filed"
+										? `filed-${s.finding.id}`
+										: s.turn.id
+							}
+							s={s}
+							idx={idx}
+							task={task}
+							project={project}
+							catalog={catalog}
+							openTurn={openTurn}
+							setOpenTurn={setOpenTurn}
+							lastRetro={lastRetro}
+							lastFindingStep={lastFindingStep}
+							onOpenTask={onOpenTask}
+						/>
+					))}
+					{(localPending !== null || task.pendingPrompt !== null) &&
+						(task.state === "running" || task.state === "queued") && (
+							<QueuedSteer
+								task={task}
+								localPending={localPending}
+								steerEdit={steerEdit}
+								setSteerEdit={setSteerEdit}
+								steerEditSave={steerEditSave}
+								saveSteerEdit={saveSteerEdit}
+								cancelSteer={cancelSteer}
+							/>
+						)}
+				</ul>
+			</DrawerSec>
+		</>
+	);
+}
+
+/** Drawer Triage section: extracted verbatim from the drawer body. */
+function DrawerTriage(p: {
+	task: TaskView;
+	cancelled: boolean;
+	rank: ReturnType<typeof useOptimisticValue<string>>;
+	setRank: (p: string) => void;
+	triageSave: ReturnType<typeof useBusy>;
+	triageReason: string;
+	setTriageReason: (v: string) => void;
+	nominateCandidate: () => void;
+	clearCandidate: () => void;
+	triageError: string | null;
+}) {
+	const {
+		task,
+		cancelled,
+		rank,
+		setRank,
+		triageSave,
+		triageReason,
+		setTriageReason,
+		nominateCandidate,
+		clearCandidate,
+		triageError,
+	} = p;
+	return (
+		<>
+			{" "}
+			{/* Collapsible Triage between the turn tree and the Steer composer,
+					    collapsed by default: rank and close-candidate nomination are triage
+					    controls, not the card's story. Done tasks hide it entirely: the
+					    controls have no effect there. A cancelled card hides it too: its
+					    drawer is read-only. */}
+			{task.stage !== "done" && !cancelled && (
+				<DrawerSec id="drawer-triage" label="Triage" defaultOpen={false}>
+					<div className="triage-row">
+						{/* The rank picker: five fixed options show all at once as a
+								    segmented control, never a select (DESIGN.md, Choice controls).
+								    The optimistic wiring is unchanged: rank.set shows the pick at
+								    once, rank.run posts it, a failure rolls the press back. */}
+						<fieldset className="triage-rank">
+							{/* fieldset names the group for assistive tech (the visible
+									    caption stays the span); biome's useSemanticElements
+									    requires the real element over role="group". */}
+							<legend className="sr">Triage rank</legend>
+							<span>Rank</span>
+							<div className="rank-seg">
+								{["", ...PRIORITIES].map((p) => (
+									<button
+										key={p}
+										type="button"
+										aria-pressed={rank.value === p}
+										disabled={triageSave.busy || rank.busy}
+										onClick={() => setRank(p)}
+									>
+										{p === "" ? "Default" : p}
+									</button>
+								))}
+							</div>
+						</fieldset>
+						{task.closeCandidate === null ? (
+							<form
+								className="triage-nominate"
+								onSubmit={(e) => {
+									e.preventDefault();
+									if (triageReason.trim() !== "") nominateCandidate();
+								}}
+							>
+								<label>
+									<span>Close reason</span>
+									<input
+										value={triageReason}
+										maxLength={200}
+										required
+										placeholder="Duplicate of OTTR-640"
+										disabled={triageSave.busy}
+										onChange={(e) => setTriageReason(e.target.value)}
+									/>
+								</label>
+								<button
+									type="submit"
+									disabled={triageSave.busy || triageReason.trim() === ""}
+									aria-busy={triageSave.busy || undefined}
+								>
+									{triageSave.busy && (
+										<span className="spinner" aria-hidden="true" />
+									)}
+									Suggest closing
+								</button>
+							</form>
+						) : (
+							<span className="triage-set">
+								<span className="close-badge" title={task.closeCandidate}>
+									Close
+								</span>
+								<span className="triage-reason" title={task.closeCandidate}>
+									{task.closeCandidate}
+								</span>
+								<button
+									type="button"
+									disabled={triageSave.busy}
+									aria-busy={triageSave.busy || undefined}
+									onClick={clearCandidate}
+								>
+									Clear reason
+								</button>
+							</span>
+						)}
+					</div>
+					{triageError !== null && (
+						<p className="auth-error" role="alert">
+							{triageError}
+						</p>
+					)}
+				</DrawerSec>
+			)}
+		</>
+	);
+}
+
+/** Drawer HoldBar section: extracted verbatim from the drawer body. */
+function DrawerHoldBar(p: {
+	task: TaskView;
+	askedNow: boolean;
+	diffFiles: NonNullable<TaskView["diffFiles"]>;
+	sendReply: (text: string, draft?: boolean) => Promise<boolean>;
+}) {
+	const { task, askedNow, diffFiles, sendReply } = p;
+	return (
+		<>
+			{" "}
+			{/* A parked merge hold (update, fork, mismatch) approves by reply; the fixed bar
+					    carries the hold message's actions and pins to the drawer's bottom edge while
+					    the report scrolls. The server still gates the approval. */}
+			{task.state === "needs_you" && task.holdHead !== null && !askedNow && (
+				<div className="hold-actions">
+					{/* The summary is the ready report an update card parks on; it always
+								    exists, so the button rides the bar's first paint. Before the fetch
+								    lands it scrolls to the drawer top, where the report sits. */}
+					{task.needsReason === UPDATE_HOLD_REASON && (
+						<button
+							type="button"
+							title="Scrolls up to the report summary"
+							onClick={() => {
+								const target = document.getElementById("drawer-result");
+								if (target !== null) target.scrollIntoView({ block: "start" });
+								else
+									document.querySelector("dialog.drawer")?.scrollTo({ top: 0 });
+							}}
+						>
+							Read the summary
+						</button>
+					)}
+					{/* The mismatch park serves its stat only through the drawer fetch, so
+								    the button and the Changed files section appear together. */}
+					{task.needsReason === MERGE_HOLD_MISMATCH_REASON &&
+						diffFiles.length > 0 && (
+							<button
+								type="button"
+								title="Scrolls to the changed files the merge added beyond the approval"
+								onClick={() =>
+									document
+										.getElementById("drawer-diff")
+										?.scrollIntoView({ block: "start" })
+								}
+							>
+								Read the diff
+							</button>
+						)}
+					<BusyButton
+						className="primary"
+						title="Sends the approving reply, so the parked merge can land"
+						run={() => sendReply(APPROVE_REPLY)}
+					>
+						<Icon name="check" />
+						Approve merge
+					</BusyButton>
+				</div>
+			)}
+		</>
+	);
+}
+
+/** Drawer Composer section: extracted verbatim from the drawer body. */
+/** The follow-up call to action: Follow up, optional Implement steps, and the hint. */
+function FollowUpCta(p: {
+	prReviewOpen: boolean;
+	task: TaskView;
+	setFollowOpen: (v: boolean) => void;
+	setStepsOpen: (v: boolean) => void;
+	onMarkSeen: () => void;
+}) {
+	const { prReviewOpen, task, setFollowOpen, setStepsOpen, onMarkSeen } = p;
+	return (
+		<div className="followup-cta">
+			{/* One primary per surface: the PR section's Post review outranks
+							    the generic Follow up, which renders stock grey beside it. */}
+			<button
+				type="button"
+				className={prReviewOpen ? undefined : "primary"}
+				onClick={() => setFollowOpen(true)}
+			>
+				<Icon name="send" />
+				Follow up
+			</button>
+			{task.research && researchSteps(task) === "yes" && (
+				<>
+					<button
+						type="button"
+						title="Picks a model, then creates a follow-up task that implements the report's recommended steps"
+						onClick={() => setStepsOpen(true)}
+					>
+						<Icon name="play" />
+						Implement steps
+					</button>
+					<BusyButton
+						title="Marks the report read and clears it from the Inbox"
+						run={async () => {
+							onMarkSeen();
+							return true;
+						}}
+					>
+						<Icon name="eye-off" />
+						No further steps
+					</BusyButton>
+				</>
+			)}
+			<p className="hint">
+				Creates a new task that continues this one with a full handoff.
+			</p>
+		</div>
+	);
+}
+
+/** The needs_you reply composer; a PR review posts and asks for drafts in its own section, not here. */
+function ReplyComposer(p: {
+	task: TaskView;
+	proposal: boolean;
+	cancelled: boolean;
+	editOpen: boolean;
+	editGuardTitle: string;
+	replySend: ReturnType<typeof useBusy>;
+	sendReply: (text: string, draft?: boolean) => Promise<boolean>;
+	reply: string;
+	setReply: (v: string) => void;
+	replyImages: ReturnType<typeof useAttachedImages>;
+	catalog: ReturnType<typeof useModels>;
+	model: ReturnType<typeof useOptimisticValue<string>>;
+	modelQuery: string;
+	setModelQuery: (v: string) => void;
+	switchModel: (m: string) => void;
+	decisionPrimary: boolean;
+	act: Act;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+}) {
+	const {
+		task,
+		proposal,
+		cancelled,
+		editOpen,
+		editGuardTitle,
+		replySend,
+		sendReply,
+		reply,
+		setReply,
+		replyImages,
+		catalog,
+		model,
+		modelQuery,
+		setModelQuery,
+		switchModel,
+		decisionPrimary,
+		act,
+		setViewing,
+	} = p;
+	return (
+		<form
+			id="drawer-reply"
+			className="reply-form"
+			onSubmit={(e) => {
+				e.preventDefault();
+				replySend.start(() => sendReply(reply, true));
+			}}
+		>
+			<PromptInput
+				label="Reply"
+				value={reply}
+				placeholder="Yes, but keep the old route"
+				onChange={setReply}
+				onEnter={() => replySend.start(() => sendReply(reply, true))}
+				images={replyImages}
+				onView={(i) => {
+					const list = replyImages.images.map((im) => im.url);
+					if (list[i] !== undefined) setViewing({ list, index: i });
+				}}
+			/>
+			<ComposerActions
+				onAddImages={replyImages.addFiles}
+				catalog={catalog}
+				model={model.value}
+				setModel={switchModel}
+				modelQuery={modelQuery}
+				setModelQuery={setModelQuery}
+				secondary={
+					<>
+						{!proposal && (
+							<BusyButton
+								title="Start a fresh omp session in the same worktree; the broken one is abandoned (its files stay in .tasks/sessions)"
+								run={async () =>
+									(await confirmDialog(
+										`Start a fresh omp session for ${task.id} "${task.title}"? The broken session is abandoned (its transcript stays in .tasks/sessions).`,
+										{ ok: "Start fresh session" },
+									))
+										? act(async () => {
+												await post(
+													`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/restart-session`,
+													{},
+												);
+											})
+										: Promise.resolve(true)
+								}
+							>
+								<Icon name="refresh-cw" />
+								New session
+							</BusyButton>
+						)}
+						{/* The Decide section owns Accept while its panel shows (proposal,
+										    needs_you, not cancelled); the composer keeps the button only
+										    when the panel is hidden, so a proposal never offers Accept
+										    twice. */}
+						{(!proposal || cancelled) && (
+							<BusyButton
+								title={
+									editOpen
+										? editGuardTitle
+										: proposal
+											? "Start the proposed task"
+											: "Continue the interrupted session (sends '.')"
+								}
+								disabled={editOpen}
+								run={() => sendReply(".")}
+							>
+								<Icon name="play" />
+								{proposal ? "Accept" : "Resume"}
+							</BusyButton>
+						)}
+					</>
+				}
+				primary={
+					<button
+						type="submit"
+						// One primary per surface: while a decision section owns
+						// the loud slot (hold, proposal, ask, kept files), the
+						// composer's Reply renders stock grey.
+						className={
+							decisionPrimary
+								? replySend.failed
+									? "failed"
+									: undefined
+								: `primary${replySend.failed ? " failed" : ""}`
+						}
+						disabled={replySend.busy}
+						aria-busy={replySend.busy || undefined}
+					>
+						{replySend.busy && <span className="spinner" aria-hidden="true" />}
+						<Icon name="send" />
+						Reply
+					</button>
+				}
+			/>
+			<p className="hint">
+				Enter sends. Shift+Enter starts a new line. Images: paste, drop or
+				browse. A model pick lands with the reply turn.
+			</p>
+		</form>
+	);
+}
+
+/** The running/queued steer composer. */
+function SteerComposer(p: {
+	task: TaskView;
+	steerSend: ReturnType<typeof useBusy>;
+	sendSteer: (text: string) => Promise<boolean>;
+	steer: string;
+	setSteer: (v: string) => void;
+	steerImages: ReturnType<typeof useAttachedImages>;
+	catalog: ReturnType<typeof useModels>;
+	model: ReturnType<typeof useOptimisticValue<string>>;
+	modelQuery: string;
+	setModelQuery: (v: string) => void;
+	switchModel: (m: string) => void;
+	act: Act;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+}) {
+	const {
+		task,
+		steerSend,
+		sendSteer,
+		steer,
+		setSteer,
+		steerImages,
+		catalog,
+		model,
+		modelQuery,
+		setModelQuery,
+		switchModel,
+		act,
+		setViewing,
+	} = p;
+	return (
+		<form
+			className="reply-form steer-form prompt-card"
+			onSubmit={(e) => {
+				e.preventDefault();
+				steerSend.start(() => sendSteer(steer));
+			}}
+		>
+			<PromptInput
+				label="Steer"
+				value={steer}
+				placeholder="Also update the changelog"
+				onChange={setSteer}
+				onEnter={() => steerSend.start(() => sendSteer(steer))}
+				images={steerImages}
+				onView={(i) => {
+					const list = steerImages.images.map((im) => im.url);
+					if (list[i] !== undefined) setViewing({ list, index: i });
+				}}
+			/>
+			<ComposerActions
+				attachIcon="plus"
+				onAddImages={steerImages.addFiles}
+				catalog={catalog}
+				model={model.value}
+				setModel={switchModel}
+				modelQuery={modelQuery}
+				setModelQuery={setModelQuery}
+				secondary={
+					task.state === "running" && (
+						<BusyButton
+							title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
+							run={async () =>
+								(await confirmDialog(
+									`Stop the running turn of ${task.id} "${task.title}"? The card waits for your reply.`,
+									{ ok: "Stop turn" },
+								)) &&
+								(await confirmDialog(
+									`Really stop the running turn of ${task.id} "${task.title}"?`,
+									{ ok: "Stop turn", danger: true },
+								))
+									? act(async () => {
+											await post(
+												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/stop`,
+												{},
+											);
+										})
+									: Promise.resolve(true)
+							}
+						>
+							<Icon name="stop" />
+							Stop turn
+						</BusyButton>
+					)
+				}
+				primary={
+					<button
+						type="submit"
+						className={`primary${steerSend.failed ? " failed" : ""}`}
+						// Nothing to send while the field and the images are empty.
+						disabled={
+							steerSend.busy ||
+							(steer.trim() === "" && steerImages.images.length === 0)
+						}
+						aria-busy={steerSend.busy || undefined}
+						title="Steer (Enter)"
+					>
+						{steerSend.busy ? (
+							<span className="spinner" aria-hidden="true" />
+						) : (
+							<Icon name="helm" />
+						)}
+						Steer
+					</button>
+				}
+			/>
+			<p className="hint">
+				Enter steers. Shift+Enter starts a new line. Images: paste, drop or
+				browse. A model pick lands with the next turn.
+			</p>
+		</form>
+	);
+}
+
+function DrawerComposer(p: {
+	followUp: boolean;
+	prReviewOpen: boolean;
+	task: TaskView;
+	setFollowOpen: (v: boolean) => void;
+	setStepsOpen: (v: boolean) => void;
+	onMarkSeen: () => void;
+	replySend: ReturnType<typeof useBusy>;
+	sendReply: (text: string, draft?: boolean) => Promise<boolean>;
+	reply: string;
+	setReply: (v: string) => void;
+	replyImages: ReturnType<typeof useAttachedImages>;
+	catalog: ReturnType<typeof useModels>;
+	modelQuery: string;
+	setModelQuery: (v: string) => void;
+	switchModel: (m: string) => void;
+	decisionPrimary: boolean;
+	proposal: boolean;
+	cancelled: boolean;
+	editOpen: boolean;
+	editGuardTitle: string;
+	steerSend: ReturnType<typeof useBusy>;
+	sendSteer: (text: string) => Promise<boolean>;
+	steer: string;
+	setSteer: (v: string) => void;
+	steerImages: ReturnType<typeof useAttachedImages>;
+	act: Act;
+	model: ReturnType<typeof useOptimisticValue<string>>;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+}) {
+	const {
+		followUp,
+		prReviewOpen,
+		task,
+		setFollowOpen,
+		setStepsOpen,
+		onMarkSeen,
+		replySend,
+		sendReply,
+		reply,
+		setReply,
+		replyImages,
+		catalog,
+		model,
+		modelQuery,
+		setModelQuery,
+		switchModel,
+		setViewing,
+		decisionPrimary,
+		proposal,
+		cancelled,
+		editOpen,
+		editGuardTitle,
+		steerSend,
+		sendSteer,
+		steer,
+		setSteer,
+		steerImages,
+		act,
+	} = p;
+	return (
+		<>
+			{" "}
+			{followUp ? (
+				<FollowUpCta
+					prReviewOpen={prReviewOpen}
+					task={task}
+					setFollowOpen={setFollowOpen}
+					setStepsOpen={setStepsOpen}
+					onMarkSeen={onMarkSeen}
+				/>
+			) : (
+				task.state === "needs_you" &&
+				!prReviewOpen && (
+					<ReplyComposer
+						task={task}
+						proposal={proposal}
+						cancelled={cancelled}
+						editOpen={editOpen}
+						editGuardTitle={editGuardTitle}
+						replySend={replySend}
+						sendReply={sendReply}
+						reply={reply}
+						setReply={setReply}
+						replyImages={replyImages}
+						catalog={catalog}
+						model={model}
+						modelQuery={modelQuery}
+						setModelQuery={setModelQuery}
+						switchModel={switchModel}
+						decisionPrimary={decisionPrimary}
+						act={act}
+						setViewing={setViewing}
+					/>
+				)
+			)}
+			{(task.state === "running" || task.state === "queued") && (
+				<SteerComposer
+					task={task}
+					steerSend={steerSend}
+					sendSteer={sendSteer}
+					steer={steer}
+					setSteer={setSteer}
+					steerImages={steerImages}
+					catalog={catalog}
+					model={model}
+					modelQuery={modelQuery}
+					setModelQuery={setModelQuery}
+					switchModel={switchModel}
+					act={act}
+					setViewing={setViewing}
+				/>
+			)}
+		</>
+	);
+}
+
+/** Drawer Actions section: extracted verbatim from the drawer body. */
+function DrawerActions(p: {
+	task: TaskView;
+	cancelled: boolean;
+	editOpen: boolean;
+	editGuardTitle: string;
+	setPick: (v: "grill" | "todo" | null) => void;
+	act: Act;
+	read: boolean;
+	onMarkUnread: () => void;
+	wcMergeable: boolean;
+	setMergeReason: (v: string) => void;
+	setMergeError: (v: string | null) => void;
+	setMergeOpen: (v: boolean) => void;
+	rerunUrl: string | null;
+	rerunFailedJobs: () => Promise<boolean>;
+	rerunError: string | null;
+	rerunDone: boolean;
+	runCancel: () => Promise<boolean>;
+}) {
+	const {
+		task,
+		cancelled,
+		editOpen,
+		editGuardTitle,
+		setPick,
+		act,
+		read,
+		onMarkUnread,
+		wcMergeable,
+		setMergeReason,
+		setMergeError,
+		setMergeOpen,
+		rerunUrl,
+		rerunFailedJobs,
+		rerunError,
+		rerunDone,
+		runCancel,
+	} = p;
+	return (
+		<>
+			{" "}
+			{/* The actions row (Cancel task and stage-specific actions) sits between the steer form and meta. */}
+			<div className="drawer-actions">
+				{task.stage === "backlog" && task.state === "idle" && !cancelled && (
+					<>
+						<button
+							type="button"
+							className="primary"
+							title={
+								editOpen
+									? editGuardTitle
+									: "Asks rounds of questions to refine the idea before it runs"
+							}
+							disabled={editOpen}
+							onClick={() => setPick("grill")}
+						>
+							<Icon name="send" />
+							Plan with agent
+						</button>
+						<button
+							type="button"
+							title={
+								editOpen
+									? editGuardTitle
+									: "Puts the card in the todo lane so the agent can start it"
+							}
+							disabled={editOpen}
+							onClick={() => setPick("todo")}
+						>
+							<Icon name="plus" />
+							Move to todo
+						</button>
+					</>
+				)}
+				{task.stage === "todo" &&
+					task.state === "queued" &&
+					task.pendingPrompt === null && (
+						<BusyButton
+							title="Parks the idea in the backlog until it is ready to run"
+							run={() =>
+								act(async () => {
+									await post(
+										`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/backlog`,
+										{ to: "backlog" },
+									);
+								})
+							}
+						>
+							<Icon name="x" />
+							Not ready — park in backlog
+						</BusyButton>
+					)}
+				{task.stage === "done" && read && !cancelled && (
+					<BusyButton
+						title="Puts the new badge back on this card: it counts as not opened again"
+						run={async () => {
+							onMarkUnread();
+							return true;
+						}}
+					>
+						<Icon name="eye-off" />
+						Mark unread
+					</BusyButton>
+				)}
+				{/* Merge anyway overrides the open work-check blockers through the
+						    reason modal. It used to sit in the reply/steer composer bars; it
+						    moved here so no danger button shares a row with the primary
+						    action. The state guard keeps the old bars' exact reachability. */}
+				{wcMergeable &&
+					(task.state === "needs_you" || task.state === "queued") && (
+						<button
+							type="button"
+							className="danger"
+							onClick={() => {
+								setMergeReason("");
+								setMergeError(null);
+								setMergeOpen(true);
+							}}
+						>
+							Merge anyway
+						</button>
+					)}
+				{/* OTTR-604: cards whose text links a GitHub Actions run offer a
+						    re-run of that run's failed jobs; errors surface inline. */}
+				{rerunUrl !== null && !cancelled && (
+					<BusyButton run={rerunFailedJobs}>Re-run failed jobs</BusyButton>
+				)}
+				{/* A cancelled card is final: its drawer is read-only, so the delete
+						    action goes too (an uncancel does not exist). */}
+				{!cancelled && (
+					<BusyButton className="danger" run={runCancel}>
+						<Icon name={task.stage === "done" ? "trash" : "x"} />
+						{task.stage === "done" ? "Delete task" : "Cancel task"}
+					</BusyButton>
+				)}
+			</div>
+			{/* OTTR-604: the re-run error and confirmation render as full-width
+					    lines below the actions row, not as flex items inside it, so they
+					    align with the drawer's content margin and keep their spacing. */}
+			{rerunUrl !== null && !cancelled && rerunError !== null && (
+				<p className="auth-error" role="alert">
+					{rerunError}
+				</p>
+			)}
+			{rerunUrl !== null && !cancelled && rerunDone && rerunError === null && (
+				<p className="hint" role="status">
+					Re-run requested.
+				</p>
+			)}
+		</>
+	);
+}
+
+/** Drawer Meta section: extracted verbatim from the drawer body. */
+function DrawerMeta(p: {
+	task: TaskView;
+	cancelled: boolean;
+	act: Act;
+	project: ProjectView;
+	delta: number | undefined;
+	resumeCmd: string | null;
+	setCmdCopyError: (v: string | null) => void;
+	flashCopied: ReturnType<typeof useFlash>[1];
+	copied: ReturnType<typeof useFlash>[0];
+	cmdCopyError: string | null;
+}) {
+	const {
+		task,
+		cancelled,
+		act,
+		project,
+		delta,
+		resumeCmd,
+		setCmdCopyError,
+		flashCopied,
+		copied,
+		cmdCopyError,
+	} = p;
+	return (
+		<>
+			{" "}
+			{/* The meta section is the drawer's last element: it sits below everything else. */}
+			<details className="meta-block">
+				<summary>Meta</summary>
+				<dl className="meta">
+					{task.research && (
+						<div>
+							<dt>Research</dt>
+							<dd>
+								yes
+								{task.state !== "running" && !cancelled && (
+									<button
+										type="button"
+										className="unmark-research"
+										title="Clear the research flag: the next settle classifies this card from its branch again"
+										onClick={() =>
+											act(async () => {
+												await post(
+													`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/unmark-research`,
+													{},
+												);
+											})
+										}
+									>
+										unmark
+									</button>
+								)}
+							</dd>
+						</div>
+					)}
+					<div>
+						<dt>Branch</dt>
+						<dd>{task.branch ?? "-"}</dd>
+					</div>
+					{task.prNumber !== null && (
+						<div>
+							<dt>PR</dt>
+							<dd>
+								{task.prUrl !== null ? (
+									<a
+										href={task.prUrl}
+										target="_blank"
+										rel="noopener noreferrer"
+									>
+										PR #{task.prNumber}
+									</a>
+								) : (
+									`PR #${task.prNumber}`
+								)}
+							</dd>
+						</div>
+					)}
+					<div>
+						<dt>Worktree</dt>
+						<dd>{task.worktree ?? "-"}</dd>
+					</div>
+					<div>
+						<dt>Session</dt>
+						<dd>{task.sessionId ?? "-"}</dd>
+					</div>
+					<div>
+						<dt>Ran on</dt>
+						<dd>{ranOnLabel(task.turns) ?? "-"}</dd>
+					</div>
+					{project.github !== null && (
+						<div>
+							<dt>GitHub</dt>
+							<dd>
+								<a
+									href={project.github}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									{project.github}
+								</a>
+							</dd>
+						</div>
+					)}
+					<div>
+						<dt>Commits</dt>
+						<dd>
+							{task.commits === null
+								? "-"
+								: delta !== undefined
+									? `${task.commits} (+${delta})`
+									: `${task.commits}`}
+						</dd>
+					</div>
+				</dl>
+				{resumeCmd !== null && (
+					<div className="cmd-row">
+						<code>{resumeCmd}</code>
+						<button
+							type="button"
+							onClick={() => {
+								setCmdCopyError(null);
+								copyText(resumeCmd).then(flashCopied, (err) =>
+									setCmdCopyError(
+										err instanceof Error ? err.message : String(err),
+									),
+								);
+							}}
+						>
+							{copied ? "Copied" : "Copy command"}
+						</button>
+					</div>
+				)}
+				{resumeCmd !== null && cmdCopyError !== null && (
+					<p className="auth-error" role="alert">
+						{cmdCopyError}
+					</p>
+				)}
+			</details>
+		</>
+	);
+}
+
+/** Drawer sibling dialogs: model pick, lightbox, workflow, diff, follow-up and steps. */
+function DrawerDialogs(p: {
+	task: TaskView;
+	pick: "grill" | "todo" | null;
+	setPick: (v: "grill" | "todo" | null) => void;
+	act: Act;
+	viewing: { list: string[]; index: number; names?: string[] } | null;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+	wfOpen: boolean;
+	setWfOpen: (v: boolean) => void;
+	project: ProjectView;
+	tasks: TaskCard[];
+	maxTotal: number | null;
+	usedTotal: number;
+	draining: boolean;
+	diffView: string[] | null | undefined;
+	setDiffView: React.Dispatch<
+		React.SetStateAction<string[] | null | undefined>
+	>;
+	cancelled: boolean;
+	projects: ProjectView[];
+	followOpen: boolean;
+	setFollowOpen: (v: boolean) => void;
+	onFollowed: (id: string, from: string) => void;
+	stepsOpen: boolean;
+	setStepsOpen: (v: boolean) => void;
+	onMarkSeen: () => void;
+}) {
+	const {
+		task,
+		pick,
+		setPick,
+		act,
+		viewing,
+		setViewing,
+		wfOpen,
+		setWfOpen,
+		project,
+		tasks,
+		maxTotal,
+		usedTotal,
+		draining,
+		diffView,
+		setDiffView,
+		cancelled,
+		projects,
+		followOpen,
+		setFollowOpen,
+		onFollowed,
+		stepsOpen,
+		setStepsOpen,
+		onMarkSeen,
+	} = p;
+	return (
+		<>
+			{" "}
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			<BacklogModelDialog
+				project={task.project}
+				taskTitle={task.sessionTitle ?? task.title}
+				taskId={task.id}
+				currentModel={task.model ?? null}
+				mode={pick === "todo" ? "todo" : "grill"}
+				open={pick !== null}
+				onClose={() => setPick(null)}
+				act={act}
+			/>
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			<Modal
+				open={viewing !== null}
+				onClose={() => setViewing(null)}
+				label="Attached image"
+				className="lightbox"
+			>
+				{viewing !== null && (
+					<div className="frame">
+						{/* index is always in range: thumbs set it and turnPage wraps. */}
+						<ZoomableImage
+							src={viewing.list[viewing.index] ?? ""}
+							alt="Attachment, full size"
+						/>
+						{viewing.names?.[viewing.index] !== undefined && (
+							<span className="caption">{viewing.names[viewing.index]}</span>
+						)}
+						{viewing.list.length > 1 && (
+							<>
+								<button
+									type="button"
+									className="page prev"
+									aria-label="Previous image"
+									onClick={() =>
+										setViewing((v) => (v === null ? v : turnPage(v, -1)))
+									}
+								>
+									<Icon name="chevron-left" />
+								</button>
+								<button
+									type="button"
+									className="page next"
+									aria-label="Next image"
+									onClick={() =>
+										setViewing((v) => (v === null ? v : turnPage(v, 1)))
+									}
+								>
+									<Icon name="chevron-right" />
+								</button>
+							</>
+						)}
+					</div>
+				)}
+			</Modal>
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			{wfOpen && (
+				<WorkflowModal
+					kind={workflowKind(task)}
+					stage={task.cancelledAt !== null ? null : task.stage}
+					label={projectLabel(project)}
+					live={{
+						slots: slotUse(tasks),
+						waiting: queueOrder(tasks).length,
+						maxParallel: project.settings.maxParallel,
+						maxTotal,
+						usedTotal,
+						draining,
+					}}
+					onClose={() => setWfOpen(false)}
+				/>
+			)}
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			{diffView !== undefined && (
+				<DiffModal
+					task={task}
+					files={diffView}
+					onClose={() => setDiffView(undefined)}
+				/>
+			)}
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both.
+			    A cancelled card's drawer is read-only: it never opens a follow-up. */}
+			{!cancelled && (
+				<FollowUpDialog
+					task={task}
+					projects={projects}
+					open={followOpen}
+					onClose={() => setFollowOpen(false)}
+					act={act}
+					onFollowed={onFollowed}
+				/>
+			)}
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			{!cancelled && stepsOpen && (
+				<ImplementStepsDialog
+					task={task}
+					onClose={() => setStepsOpen(false)}
+					act={act}
+					onMarkSeen={onMarkSeen}
+					onFollowed={onFollowed}
+				/>
+			)}
+		</>
+	);
+}
+
+/** Fetch one task detail; throws on a non-OK response so the caller's catch handles it. */
+async function readDetail(url: string): Promise<TaskView> {
+	const res = await fetch(url);
+	if (!res.ok) throw new Error(String(res.status));
+	return (await res.json()) as TaskView;
+}
+
+/** A waiting release card: its late-commit list follows the target head, which moves without a row change. */
+const releaseWaits = (v: TaskView): boolean =>
+	v.releaseVersion !== null &&
+	v.state === "needs_you" &&
+	v.cancelledAt === null;
+
+/** The follow-up lineage of a drawer card: its parent row and, for a retro, the source
+ * card above it. Null when the card is a root, or the parent is no retro. */
+function followUpParent(
+	row: TaskCard,
+	tasks: TaskCard[],
+): {
+	parent: TaskCard | null;
+	retroSource: { id: string; card: TaskCard | null } | null;
+} {
+	const parent =
+		row.followUpOf === null
+			? null
+			: (tasks.find(
+					(t) =>
+						t.id === row.followUpOf &&
+						t.project === (row.followUpOfProject ?? row.project),
+				) ?? null);
+	// A retro's proposal card reads its lineage from the retro's source: the parent row is the
+	// retro and the source card sits above it. Null when the parent is no retro.
+	const retroSource =
+		parent === null || parent.kind !== "retro" || parent.followUpOf === null
+			? null
+			: {
+					id: parent.followUpOf,
+					card:
+						tasks.find(
+							(t) =>
+								t.id === parent.followUpOf &&
+								t.project === (parent.followUpOfProject ?? parent.project),
+						) ?? null,
+				};
+	return { parent, retroSource };
+}
+
+/** Every retro under the card, each with every card filed off it (whatever its reason
+ * says now), oldest first. One pass over the board, so the rail never scans it once per
+ * retro. */
+function retroProposals(
+	kids: TaskCard[],
+	tasks: TaskCard[],
+	project: string,
+): Map<string, TaskCard[]> {
+	const proposals = new Map<string, TaskCard[]>();
+	for (const k of kids) if (k.kind === "retro") proposals.set(k.id, []);
+	if (proposals.size > 0)
+		for (const t of tasks)
+			if (
+				t.followUpOf !== null &&
+				(t.followUpOfProject ?? t.project) === project
+			)
+				proposals.get(t.followUpOf)?.push(t);
+	for (const list of proposals.values())
+		list.sort((a, b) => a.createdAt - b.createdAt);
+	return proposals;
+}
+
+/** The model's context window for the drawer's token meter; null while the session or
+ * its model is unknown. ponytail: local cast, an old server's catalog lacks contextWindow. */
+function drawerWindowTok(
+	ctx: SessionContext | null,
+	catalog: ModelCatalog | null,
+): number | null {
+	return ctx === null || ctx.model === null
+		? null
+		: ((
+				catalog?.models.find((m) => m.selector === ctx.model) as
+					| (ModelOption & { contextWindow?: number | null })
+					| undefined
+			)?.contextWindow ?? null);
+}
+
+/** Per-render card flags for the drawer: loading placeholders, reply-vs-follow-up
+ * routing, the live ask round, a running mutation, and the merge-anyway gate. */
+function drawerCardFlags(
+	task: TaskView,
+	row: TaskCard,
+	detail: TaskView | null,
+): {
+	wtLoading: boolean;
+	diffLoading: boolean;
+	cancelled: boolean;
+	followUp: boolean;
+	askedNow: boolean;
+	mut: MutationProgress | null;
+	wcUnresolved: boolean;
+	wcMergeable: boolean;
+} {
+	const wtLoading = detail === null && row.worktree !== null;
+	const diffLoading =
+		detail === null &&
+		row.kind === "work" &&
+		!row.research &&
+		row.releaseVersion === null;
+	/** Done tasks answer with a follow-up task (handoff + fresh session) instead of a reply.
+	 * A cancelled card's drawer is read-only: no follow-up, no edit, no action. */
+	const cancelled = task.cancelledAt !== null;
+	const followUp = task.stage === "done" && !cancelled;
+	// Ask round live right now: drives the accent status word, mark and panel tint (stalls stay amber).
+	const askedNow = task.state === "needs_you" && task.asked !== null;
+	// Live mutation run on a running card: the same parse the board card's meter row uses.
+	// The row (not the fetched detail) carries `progress`, and its changes refetch the detail.
+	const mut = row.state === "running" ? strykerProgress(row.progress) : null;
+	const wcUnresolved =
+		task.workCheckLog
+			.findLast((r) => r.outcome === "blockers")
+			?.blockers.some((b) => b.status === undefined) ?? false;
+	// Merge anyway shows only while the newest blockers run still has an unresolved blocker and
+	// no run is live (a running or preparing card can still pass the check on its own).
+	const wcMergeable =
+		wcUnresolved && task.state !== "running" && task.state !== "preparing";
+	return {
+		wtLoading,
+		diffLoading,
+		cancelled,
+		followUp,
+		askedNow,
+		mut,
+		wcUnresolved,
+		wcMergeable,
+	};
+}
+
+/** Per-render prompt-edit and release-notes flags for the drawer: validity of the
+ * drafts, and the gates that decide whether each editor may open at all. */
+function drawerEditFlags(
+	task: TaskView,
+	cancelled: boolean,
+	notesEdit: string | null,
+	edit: string | null,
+): {
+	notesValid: boolean;
+	notesEditable: boolean;
+	editable: boolean;
+	editValid: boolean;
+} {
+	const notesValid =
+		notesEdit !== null &&
+		notesEdit.trim().length > 0 &&
+		notesEdit.trim().length <= 20000;
+	/** Release cards show the notes section; only needs_you and not-yet-published idle ones may edit. */
+	const notesEditable =
+		task.releaseVersion !== null &&
+		!cancelled &&
+		(task.state === "needs_you" ||
+			(task.state === "idle" && task.stage !== "done"));
+	const editable =
+		((task.stage === "todo" && task.state === "queued") ||
+			(task.stage === "backlog" && task.state === "idle")) &&
+		task.turns.length === 0 &&
+		!cancelled;
+	const editValid =
+		edit !== null && edit.trim().length > 0 && edit.trim().length <= 20000;
+	return { notesValid, notesEditable, editable, editValid };
+}
+
+/** Per-render result-section flags for the drawer: which report leads the done card,
+ * whether the PR review draft replaces the details, and which action is the surface's
+ * one primary. */
+function drawerResultFlags(
+	task: TaskView,
+	askedNow: boolean,
+	proposal: boolean,
+): {
+	report: TaskView | TurnView;
+	prReviewOpen: boolean;
+	prDraft: string | null;
+	hideDetails: boolean;
+	decisionPrimary: boolean;
+} {
+	/** Done tasks lead with the implementation's report; the merge turn's integration output stays in its work step. */
+	const report =
+		(task.stage === "done"
+			? task.turns.findLast((t) => t.kind === "work" && t.summary !== null)
+			: undefined) ?? task;
+	const prReviewOpen = task.kind === "pr_review" && task.prReview !== undefined;
+	// PR review card: the watcher saves each draft as the card's details, both while it
+	// waits for the Post (needs_you) and after it (done).
+	const prDraft =
+		task.kind === "pr_review" && task.prReview !== undefined
+			? task.details
+			: null;
+	// The Result skips details shown elsewhere: the research report section or the PR review draft.
+	const hideDetails =
+		(task.research && task.report !== null) || prDraft !== null;
+	// One primary per surface (DESIGN.md → Buttons): the drawer stacks sections that each
+	// carry a steel button, so at most one may claim the fill. The card's decision wins —
+	// hold approve, proposal accept, ask send, kept-files finish — and the composer's
+	// Reply renders stock grey beside it. On a done PR-review card the section's Post
+	// review outranks the generic Follow up the same way.
+	const decisionPrimary =
+		askedNow ||
+		(task.state === "needs_you" && task.holdHead !== null) ||
+		proposal ||
+		(task.state === "needs_you" && task.keptFiles.length > 0);
+	return { report, prReviewOpen, prDraft, hideDetails, decisionPrimary };
+}
+
+/** Model picker opened from a drawer action on a parked card (grill vs todo mode).
+ * Sibling, not child: a nested dialog's close event would propagate to the drawer's
+ * Modal and close both. */
+function DrawerPickDialog({
+	pick,
+	setPick,
+	task,
+	act,
+}: {
+	pick: "grill" | "todo" | null;
+	setPick: (v: "grill" | "todo" | null) => void;
+	task: TaskView;
+	act: Act;
+}) {
+	return (
+		<BacklogModelDialog
+			project={task.project}
+			taskTitle={task.sessionTitle ?? task.title}
+			taskId={task.id}
+			currentModel={task.model ?? null}
+			mode={pick === "todo" ? "todo" : "grill"}
+			open={pick !== null}
+			onClose={() => setPick(null)}
+			act={act}
+		/>
+	);
+}
+
+/** Full-size image lightbox over the drawer's attachments; pages multi-image lists.
+ * Sibling, not child: a nested dialog's close event would propagate to the drawer's
+ * Modal and close both. */
+function DrawerLightbox({
+	viewing,
+	setViewing,
+}: {
+	viewing: { list: string[]; index: number; names?: string[] } | null;
+	setViewing: React.Dispatch<
+		React.SetStateAction<{
+			list: string[];
+			index: number;
+			names?: string[];
+		} | null>
+	>;
+}) {
+	return (
+		<Modal
+			open={viewing !== null}
+			onClose={() => setViewing(null)}
+			label="Attached image"
+			className="lightbox"
+		>
+			{viewing !== null && (
+				<div className="frame">
+					{/* index is always in range: thumbs set it and turnPage wraps. */}
+					<ZoomableImage
+						src={viewing.list[viewing.index] ?? ""}
+						alt="Attachment, full size"
+					/>
+					{viewing.names?.[viewing.index] !== undefined && (
+						<span className="caption">{viewing.names[viewing.index]}</span>
+					)}
+					{viewing.list.length > 1 && (
+						<>
+							<button
+								type="button"
+								className="page prev"
+								aria-label="Previous image"
+								onClick={() =>
+									setViewing((v) => (v === null ? v : turnPage(v, -1)))
+								}
+							>
+								<Icon name="chevron-left" />
+							</button>
+							<button
+								type="button"
+								className="page next"
+								aria-label="Next image"
+								onClick={() =>
+									setViewing((v) => (v === null ? v : turnPage(v, 1)))
+								}
+							>
+								<Icon name="chevron-right" />
+							</button>
+						</>
+					)}
+				</div>
+			)}
+		</Modal>
+	);
+}
+
 export function Drawer({
 	open = true,
 	task: row,
@@ -8239,28 +12286,7 @@ export function Drawer({
 	usedTotal: number;
 	maxTotal: number | null;
 }) {
-	const parent =
-		row.followUpOf === null
-			? null
-			: (tasks.find(
-					(t) =>
-						t.id === row.followUpOf &&
-						t.project === (row.followUpOfProject ?? row.project),
-				) ?? null);
-	// A retro's proposal card reads its lineage from the retro's source: the parent row is the
-	// retro and the source card sits above it. Null when the parent is no retro.
-	const retroSource =
-		parent === null || parent.kind !== "retro" || parent.followUpOf === null
-			? null
-			: {
-					id: parent.followUpOf,
-					card:
-						tasks.find(
-							(t) =>
-								t.id === parent.followUpOf &&
-								t.project === (parent.followUpOfProject ?? parent.project),
-						) ?? null,
-				};
+	const { parent, retroSource } = followUpParent(row, tasks);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
 	// Retros are follow-up rows too; each retro's proposals hang one more level in under it.
 	const kids = tasks
@@ -8270,19 +12296,7 @@ export function Drawer({
 				(t.followUpOfProject ?? t.project) === row.project,
 		)
 		.sort((a, b) => a.createdAt - b.createdAt);
-	// One pass over the board collects every retro's proposals (any card filed off the retro,
-	// whatever its reason now says), so the rail never scans the board once per retro.
-	const proposals = new Map<string, TaskCard[]>();
-	for (const k of kids) if (k.kind === "retro") proposals.set(k.id, []);
-	if (proposals.size > 0)
-		for (const t of tasks)
-			if (
-				t.followUpOf !== null &&
-				(t.followUpOfProject ?? t.project) === row.project
-			)
-				proposals.get(t.followUpOf)?.push(t);
-	for (const list of proposals.values())
-		list.sort((a, b) => a.createdAt - b.createdAt);
+	const proposals = retroProposals(kids, tasks, row.project);
 	/** A follow-up or proposal row: the linked card with its live state, as the meta line shows it. */
 	const branchRow = (k: TaskCard, tag: string): ReactNode => (
 		<LineageCardLink
@@ -8294,7 +12308,7 @@ export function Drawer({
 				<span
 					className={
 						k.state === "needs_you"
-							? "st st-needs_you" + (k.asked !== null ? " st-asked" : "")
+							? `st st-needs_you${k.asked !== null ? " st-asked" : ""}`
 							: "st"
 					}
 				>
@@ -8362,44 +12376,27 @@ export function Drawer({
 		rowKey,
 		row.state === "running",
 	);
-	// ponytail: local cast, an old server's catalog lacks contextWindow
-	const windowTok =
-		ctx === null || ctx.model === null
-			? null
-			: ((
-					catalog?.models.find((m) => m.selector === ctx.model) as
-						| (ModelOption & { contextWindow?: number | null })
-						| undefined
-				)?.contextWindow ?? null);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: rowKey refetches the detail when the row changes
+	const windowTok = drawerWindowTok(ctx, catalog);
 	useEffect(() => {
 		let alive = true;
 		let retry: ReturnType<typeof setTimeout> | undefined;
 		const url = `/api/projects/${encodeURIComponent(row.project)}/tasks/${row.id}`;
 		const load = async (attempt: number): Promise<void> => {
 			try {
-				const res = await fetch(url);
+				const v = await readDetail(url);
 				if (!alive) return;
-				if (!res.ok) throw new Error(String(res.status));
-				const v = (await res.json()) as TaskView;
-				if (alive) setDetail(v);
+				setDetail(v);
 				// A waiting release card's late-commit list follows the target head, which moves without a
 				// row change of this card; repoll so the list stays fresh while the card waits for approval.
-				if (
-					alive &&
-					v.releaseVersion !== null &&
-					v.state === "needs_you" &&
-					v.cancelledAt === null
-				)
-					retry = setTimeout(() => void load(0), 5000);
+				if (releaseWaits(v)) retry = setTimeout(() => void load(0), 5000);
 			} catch {
 				// Fetch failed or hiccuped: retry with backoff while the drawer is open. A done row never
 				// changes again, so without a retry a blip at open time would show "No turns yet." forever.
-				if (alive)
-					retry = setTimeout(
-						() => void load(attempt + 1),
-						Math.min(1000 * 2 ** attempt, 10000),
-					);
+				if (!alive) return;
+				retry = setTimeout(
+					() => void load(attempt + 1),
+					Math.min(1000 * 2 ** attempt, 10000),
+				);
 			}
 		};
 		void load(0);
@@ -8447,23 +12444,19 @@ export function Drawer({
 	// body down. The row predicts which sections can appear, with the server's detail rules:
 	// worktree files need a live worktree; a diff needs a build card (work kind, not research,
 	// not a release), done cards serve the stat captured at merge start.
-	const wtLoading = detail === null && row.worktree !== null;
-	const diffLoading =
-		detail === null &&
-		row.kind === "work" &&
-		!row.research &&
-		row.releaseVersion === null;
-	/** Done tasks answer with a follow-up task (handoff + fresh session) instead of a reply.
-	 * A cancelled card's drawer is read-only: no follow-up, no edit, no action. */
-	const cancelled = task.cancelledAt !== null;
-	const followUp = task.stage === "done" && !cancelled;
-	// Ask round live right now: drives the accent status word, mark and panel tint (stalls stay amber).
-	const askedNow = task.state === "needs_you" && task.asked !== null;
-	// Live mutation run on a running card: the same parse the board card's meter row uses.
-	// The row (not the fetched detail) carries `progress`, and its changes refetch the detail.
-	const mut = row.state === "running" ? strykerProgress(row.progress) : null;
+	const {
+		wtLoading,
+		diffLoading,
+		cancelled,
+		followUp,
+		askedNow,
+		mut,
+		wcMergeable,
+	} = drawerCardFlags(task, row, detail);
 	// Retro proposal card: Resume acts as Accept, and New session (409 on a never-run card) is hidden.
 	const proposal = isProposalReason(task.needsReason);
+	const { report, prReviewOpen, prDraft, hideDetails, decisionPrimary } =
+		drawerResultFlags(task, askedNow, proposal);
 	// Non-null while the release-notes editor is open, for release cards with a mutable state.
 	const [notesEdit, setNotesEdit] = useState<string | null>(null);
 	const notesSave = useBusy();
@@ -8538,16 +12531,6 @@ export function Drawer({
 			}, setTriageError),
 		);
 	};
-	const notesValid =
-		notesEdit !== null &&
-		notesEdit.trim().length > 0 &&
-		notesEdit.trim().length <= 20000;
-	/** Release cards show the notes section; only needs_you and not-yet-published idle ones may edit. */
-	const notesEditable =
-		task.releaseVersion !== null &&
-		!cancelled &&
-		(task.state === "needs_you" ||
-			(task.state === "idle" && task.stage !== "done"));
 	const notesSubmit = (mode: "save" | "append"): void => {
 		if (notesEdit === null || !notesValid) return;
 		notesSave.start(() =>
@@ -8569,13 +12552,12 @@ export function Drawer({
 	// todo, parked idle in backlog. A preparing claim already consumed the prompt, so
 	// editing it would be lost.
 	const [edit, setEdit] = useState<string | null>(null);
-	const editable =
-		((task.stage === "todo" && task.state === "queued") ||
-			(task.stage === "backlog" && task.state === "idle")) &&
-		task.turns.length === 0 &&
-		!cancelled;
-	const editValid =
-		edit !== null && edit.trim().length > 0 && edit.trim().length <= 20000;
+	const { notesValid, notesEditable, editable, editValid } = drawerEditFlags(
+		task,
+		cancelled,
+		notesEdit,
+		edit,
+	);
 	// A start runs the saved prompt, so while the edit is open the start actions wait:
 	// they disable until the edit finishes (Save or Cancel), or the draft dies silently
 	// once the started turn makes the card uneditable.
@@ -8623,41 +12605,6 @@ export function Drawer({
 			void post(`${url}/stop`, {}).catch(() => {});
 		};
 	}, [editOpen, task.project, task.id]);
-	/** Done tasks lead with the implementation's report; the merge turn's integration output stays in its work step. */
-	const report =
-		(task.stage === "done"
-			? task.turns.findLast((t) => t.kind === "work" && t.summary !== null)
-			: undefined) ?? task;
-	// One primary per surface (DESIGN.md → Buttons): the drawer stacks sections that each
-	// carry a steel button, so at most one may claim the fill. The card's decision wins —
-	// hold approve, proposal accept, ask send, kept-files finish — and the composer's
-	// Reply renders stock grey beside it. On a done PR-review card the section's Post
-	// review outranks the generic Follow up the same way.
-	const decisionPrimary =
-		askedNow ||
-		(task.state === "needs_you" && task.holdHead !== null) ||
-		proposal ||
-		(task.state === "needs_you" && task.keptFiles.length > 0);
-	const prReviewOpen = task.kind === "pr_review" && task.prReview !== undefined;
-	// PR review card: the watcher saves each draft as the card's details, both while it
-	// waits for the Post (needs_you) and after it (done).
-	const prDraft =
-		task.kind === "pr_review" && task.prReview !== undefined
-			? task.details
-			: null;
-	// The Result skips details shown elsewhere: the research report section or the PR review draft.
-	const hideDetails =
-		(task.research && task.report !== null) || prDraft !== null;
-
-	// Merge anyway shows only while the newest blockers run still has an unresolved blocker and
-	// no run is live (a running or preparing card can still pass the check on its own).
-	const wcUnresolved =
-		task.workCheckLog
-			.findLast((r) => r.outcome === "blockers")
-			?.blockers.some((b) => b.status === undefined) ?? false;
-	const wcMergeable =
-		wcUnresolved && task.state !== "running" && task.state !== "preparing";
-
 	const imgUrl = (name: string): string =>
 		`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/images/${encodeURIComponent(name)}`;
 	/** Every task input image (kept + pending) in thumb order; the lightbox pages this list. */
@@ -8847,120 +12794,21 @@ export function Drawer({
 				className="drawer"
 			>
 				<div className="drawer-body">
-					<header className="drawer-top">
-						<div className="drawer-head">
-							<h2>{task.sessionTitle ?? task.title}</h2>
-							<div className="drawer-head-actions">
-								{task.stage === "done" && task.research && !cancelled && (
-									// Optimistic tap: the star flips at once, the POST follows, a
-									// failure rolls it back (The Optimistic-Tap Rule).
-									<StarToggle act={act} task={task} />
-								)}
-								<button
-									type="button"
-									className="icon"
-									aria-label="Workflow overview"
-									title="Workflow overview"
-									onClick={() => setWfOpen(true)}
-								>
-									<Icon name="route" />
-								</button>
-								<CloseButton />
-							</div>
-						</div>
-						<p className="drawer-sub">
-							<span>{projectLabel(project)}</span>
-							<span className="sub-dim">
-								{/* Click copies the id for pasting into another task or an agent session. */}
-								<button
-									type="button"
-									className="task-id"
-									title="Copy task ID"
-									onClick={() => {
-										setIdCopyError(null);
-										copyText(task.id).then(flashCopiedId, (err) =>
-											setIdCopyError(
-												err instanceof Error ? err.message : String(err),
-											),
-										);
-									}}
-								>
-									{copiedId ? "Copied" : task.id}
-								</button>
-								{idCopyError !== null && (
-									<span role="alert" className="auth-error">
-										{idCopyError}
-									</span>
-								)}
-							</span>
-							<span>
-								{COLUMNS.find((c) => c.key === task.stage)?.label ?? task.stage}
-							</span>
-							{/* PR mode: the pull request this card waits on, beside the stage in the
-							    head line; the Meta block keeps the full row. */}
-							{task.prNumber !== null && (
-								<span>
-									{task.prUrl !== null ? (
-										<a
-											className="pr-link"
-											href={task.prUrl}
-											target="_blank"
-											rel="noopener noreferrer"
-											title={`Open PR #${task.prNumber} on GitHub`}
-											aria-label={`PR #${task.prNumber} on GitHub (opens a new tab)`}
-										>
-											PR #{task.prNumber}
-										</a>
-									) : (
-										<span className="pr-link">PR #{task.prNumber}</span>
-									)}
-								</span>
-							)}
-							<span
-								className="sub-dim"
-								title={new Date(task.createdAt).toLocaleString()}
-							>
-								created {stamp(task.createdAt)}
-							</span>
-							{task.cancelledAt !== null && (
-								<span
-									className="sub-dim"
-									title={new Date(task.cancelledAt).toLocaleString()}
-								>
-									cancelled {stamp(task.cancelledAt)}
-								</span>
-							)}
-							{task.stage === "done" && task.doneAt !== null && (
-								<span
-									className="sub-dim"
-									title={new Date(task.doneAt).toLocaleString()}
-								>
-									landed {stamp(task.doneAt)}
-								</span>
-							)}
-							{/* The stage label already says done; the status word only earns its place when it adds state. */}
-							{task.state !== "idle" && (
-								<span
-									className={
-										"st st-" + task.state + (askedNow ? " st-asked" : "")
-									}
-								>
-									{/* Alarm coding rides in markup, not ::before: the drawer-sub
-					    				    separator owns that pseudo-element. */}
-									{task.state === "needs_you" && <Mark kind={cardMark(task)} />}
-									{statusLine(
-										task,
-										project.hasRules,
-										// The list below names the cards; the meta line only counts them.
-										waiting.length > 0
-											? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
-											: holdFor(task, tasks),
-										draining,
-									)}
-								</span>
-							)}
-						</p>
-					</header>
+					<DrawerHead
+						task={task}
+						project={project}
+						cancelled={cancelled}
+						askedNow={askedNow}
+						waiting={waiting}
+						tasks={tasks}
+						draining={draining}
+						act={act}
+						copiedId={copiedId}
+						flashCopiedId={flashCopiedId}
+						idCopyError={idCopyError}
+						setIdCopyError={setIdCopyError}
+						setWfOpen={setWfOpen}
+					/>
 					{/* The decision panel leads the drawer body on a proposal card; the needs-reason
 					    box and the Prompt section below stay hidden because the panel carries both. */}
 					{proposal && task.state === "needs_you" && !cancelled && (
@@ -8982,1844 +12830,225 @@ export function Drawer({
 							/>
 						</DrawerSec>
 					)}
-					{mut !== null && (
-						<DrawerSec id="drawer-mut" label="Mutation run">
-							<div className="mut-run">
-								<span className="mut-pct">{Math.round(mut.pct)}%</span>
-								<span className="mut-bar" aria-hidden="true">
-									<i
-										style={{
-											transform: `scaleX(${clamp(mut.pct, 0, 100) / 100})`,
-										}}
-									/>
-								</span>
-								<dl className="mut-figs">
-									<div>
-										<dt>Tested</dt>
-										<dd>
-											{fmtNum(mut.tested)} / {fmtNum(mut.total)}
-										</dd>
-									</div>
-									{/* The tail's parts are known words (survived, elapsed, left, timed out); a part the format grows later keeps its raw text. */}
-									{strykerStats(mut.rest).map((s) => (
-										<div key={s.label === "" ? s.value : s.label}>
-											<dt>{s.label}</dt>
-											<dd>{s.value}</dd>
-										</div>
-									))}
-								</dl>
-							</div>
-						</DrawerSec>
-					)}
-					{/* Lineage rail: the parent above, this card as the filled node. Follow-ups run in
-					    parallel, so they hang one level in off this card's node, each on its own elbow. */}
-					{(row.followUpOf !== null || kids.length > 0) && (
-						<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
-							<ol className="lineage-rail">
-								{retroSource !== null &&
-									(retroSource.card === null ? (
-										<li className="lineage-gone">
-											<span
-												className="lineage-row"
-												title={`${retroSource.id} is not on the board`}
-											>
-												<span className="lineage-key">{retroSource.id}</span>
-												<span className="lineage-title">Not on the board</span>
-												<span className="lineage-tag">retro source</span>
-											</span>
-										</li>
-									) : (
-										<li>
-											<LineageCardLink
-												card={retroSource.card}
-												selfProject={row.project}
-												tag="retro source"
-												onOpenTask={onOpenTask}
-											/>
-										</li>
-									))}
-								{row.followUpOf !== null &&
-									(parent === null ? (
-										// The state no longer carries the parent (a cancelled card): the
-										// row keeps the lineage on the bare id, inert like the card's.
-										<li className="lineage-gone">
-											<span
-												className="lineage-row"
-												title={`${row.followUpOf} is not on the board`}
-											>
-												<span className="lineage-key">{row.followUpOf}</span>
-												<span className="lineage-title">Not on the board</span>
-												<span className="lineage-tag">parent</span>
-											</span>
-										</li>
-									) : (
-										<li>
-											<LineageCardLink
-												card={parent}
-												selfProject={row.project}
-												tag={retroSource !== null ? "retro" : "parent"}
-												onOpenTask={onOpenTask}
-											/>
-										</li>
-									))}
-								<li className="lineage-self" aria-current="true">
-									<span className="lineage-row">
-										<span className="lineage-key">{row.id}</span>
-										<span className="lineage-title">
-											{row.sessionTitle ?? row.title}
-										</span>
-										<span className="lineage-tag">this card</span>
-									</span>
-									{kids.length > 0 && (
-										<ol className="lineage-branch" aria-label="Follow-ups">
-											{kids.map((k) => {
-												const props = proposals.get(k.id);
-												return (
-													<li
-														key={k.id}
-														className={
-															props !== undefined && props.length > 0
-																? "lineage-holds"
-																: undefined
-														}
-													>
-														{branchRow(k, k.kind === "retro" ? "retro" : "")}
-														{props !== undefined && props.length > 0 && (
-															<ol
-																className="lineage-branch"
-																aria-label="Proposals"
-															>
-																{props.map((p) => (
-																	<li key={p.id}>{branchRow(p, "")}</li>
-																))}
-															</ol>
-														)}
-													</li>
-												);
-											})}
-										</ol>
-									)}
-								</li>
-							</ol>
-						</DrawerSec>
-					)}
-					{/* A waiting release card reads its unreviewed commits before it approves,
-					    so this section rides above the ask and the file lists. */}
-					{task.releaseVersion !== null &&
-						task.state === "needs_you" &&
-						!cancelled &&
-						task.lateCommits !== undefined &&
-						task.lateCommits.length > 0 && (
-							<DrawerSec id="drawer-late" label="Commits since the review">
-								<ul className="late-commits">
-									{task.lateCommits.map((c) => (
-										<li key={c.sha}>
-											<code>{c.sha.slice(0, 7)}</code>
-											<span className="late-subject">{c.subject}</span>
-											<span
-												className={c.reviewed ? "late-mark" : "late-mark warn"}
-											>
-												{!c.reviewed && <Mark kind="needs" />}
-												{c.reviewed ? "review fix" : "not reviewed"}
-											</span>
-										</li>
-									))}
-								</ul>
-							</DrawerSec>
-						)}
-					{/* The ask leads the body: an outstanding question is the card's one
-					    action item, so it sits right below the lineage, before the file lists. */}
-					{task.asked !== null && task.state === "needs_you" && (
-						<AskPanel
-							asked={task.asked}
-							taskId={task.id}
-							busy={replySend.busy}
-							failed={replySend.failed}
-							changed={diffFiles.map((f) => f.file)}
-							onOpenDiff={setDiffView}
-							onSend={(text) => {
-								replySend.start(async () => {
-									const ok = await sendReply(text);
-									if (ok) clearAskDraft(task.id);
-									return ok;
-								});
-							}}
-						/>
-					)}
-					{waiting.length > 0 && (
-						<DrawerSec id="drawer-waiting" label="Waiting for">
-							<RelatedTasks
-								items={waiting}
-								project={project}
-								tasks={tasks}
-								onOpenTask={onOpenTask}
-								draining={draining}
-							/>
-						</DrawerSec>
-					)}
-					{/* A live ask round hides its reason: the runner echoes the first question into
-					    it, and the ask panel above already carries the full questions. */}
-					{task.needsReason !== null && !askedNow && !proposal && (
-						<div className="needs-reason">
-							<ProposalReasonLink
-								reason={task.needsReason}
-								selfProject={row.project}
-								tasks={tasks}
-								onOpenTask={onOpenTask}
-							/>
-						</div>
-					)}
-					{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
-					    body pins the message's actions while the report scrolls. The server still
-					    gates the approval. */}
-					{/* A stopped card only interacts through the composer at the very bottom;
-					    the jump link skips the report so no manual scrolling is needed. */}
-					{task.state === "needs_you" &&
-						!askedNow &&
-						!followUp &&
-						!prReviewOpen && (
-							<p className="jump-reply">
-								<button
-									type="button"
-									className="jump-link"
-									onClick={() =>
-										document
-											.getElementById("drawer-reply")
-											?.scrollIntoView({ block: "start" })
-									}
-								>
-									Go to reply ↓
-								</button>
-							</p>
-						)}
+					<DrawerMut mut={mut} />
+					<DrawerLineage
+						row={row}
+						parent={parent}
+						retroSource={retroSource}
+						kids={kids}
+						proposals={proposals}
+						branchRow={branchRow}
+						onOpenTask={onOpenTask}
+					/>
+					<DrawerLateCommits task={task} cancelled={cancelled} />
+					<DrawerAskPanel
+						task={task}
+						replySend={replySend}
+						sendReply={sendReply}
+						diffFiles={diffFiles}
+						setDiffView={setDiffView}
+					/>
+					<DrawerWaiting
+						waiting={waiting}
+						task={task}
+						askedNow={askedNow}
+						proposal={proposal}
+						row={row}
+						followUp={followUp}
+						prReviewOpen={prReviewOpen}
+						project={project}
+						tasks={tasks}
+						onOpenTask={onOpenTask}
+						draining={draining}
+					/>
 					{task.state === "needs_you" && task.keptFiles.length > 0 && (
 						<KeptFilesPanel task={task} act={act} onClose={onClose} />
 					)}
-					{/* Loading placeholders in the loaded sections' slots, so the headers stay put. */}
-					{wtLoading && (
-						<DrawerSec id="drawer-wt" label="Worktree files">
-							<DrawerLoading label="Loading the files" />
-						</DrawerSec>
-					)}
-					{diffLoading && (
-						<DrawerSec id="drawer-diff" label="Changed files">
-							<DrawerLoading label="Loading the files" />
-						</DrawerSec>
-					)}
-					{(task.worktreeFiles?.length ?? 0) > 0 && (
-						<DrawerSec id="drawer-wt" label="Worktree files">
-							<div className="wt-files">
-								<p className="hint">
-									{task.stage === "done"
-										? "Uncommitted files this task produced, captured when it finished. The worktree is gone, so only the names remain."
-										: "Uncommitted files this task produced. Open them before the worktree is removed."}
-								</p>
-								{task.worktreeFiles!.slice(0, 50).map((f) =>
-									task.stage === "done" ? (
-										<code key={f} className="kept-path">
-											{f}
-										</code>
-									) : (
-										<a
-											key={f}
-											className="wt-file"
-											href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/files?path=${encodeURIComponent(f)}`}
-											target="_blank"
-											rel="noreferrer"
-										>
-											{f}
-										</a>
-									),
-								)}
-								{task.worktreeFiles!.length > 50 && (
-									<p className="hint">
-										…and {task.worktreeFiles!.length - 50} more
-									</p>
-								)}
-							</div>
-						</DrawerSec>
-					)}
-					{diffFiles.length > 0 && (
-						<DrawerSec id="drawer-diff" label="Changed files">
-							<div className="wt-files">
-								<p className="hint">
-									+{diffPlus} −{diffMinus} across {diffFiles.length} file
-									{diffFiles.length === 1 ? "" : "s"} ·{" "}
-									<button
-										type="button"
-										className="diff-link"
-										onClick={() => setDiffView(null)}
-									>
-										View diff
-									</button>
-								</p>
-								{diffFiles.slice(0, 50).map((f) => (
-									<div key={f.file} className="diff-file">
-										<button
-											type="button"
-											className="diff-path"
-											title="View this file's diff"
-											onClick={() => setDiffView([f.file])}
-										>
-											{f.file}
-										</button>
-										<span className="diff-num">
-											{f.plus === null
-												? "binary"
-												: `+${f.plus} −${f.minus ?? 0}`}
-										</span>
-									</div>
-								))}
-								{diffFiles.length > 50 && (
-									<p className="hint">…and {diffFiles.length - 50} more</p>
-								)}
-							</div>
-						</DrawerSec>
-					)}
-					{task.releaseVersion !== null &&
-						(notesEdit === null ? (
-							<DrawerSec
-								id="drawer-notes"
-								label="Release notes"
-								head={
-									notesEditable && (
-										<button
-											type="button"
-											className="ghost"
-											title="Edit release notes"
-											aria-label="Edit release notes"
-											onClick={() => setNotesEdit("")}
-										>
-											<Icon name="edit" />
-											Edit
-										</button>
-									)
-								}
-							>
-								{task.releaseNotes === null || task.releaseNotes === "" ? (
-									<p className="dim">No notes yet.</p>
-								) : (
-									<div className="release-notes">
-										<Markdown text={task.releaseNotes} />
-									</div>
-								)}
-							</DrawerSec>
-						) : (
-							<section className="dsec">
-								{/* The editor replaces the section body; the form's label titles it. */}
-								<form
-									className="reply-form"
-									onSubmit={(e) => {
-										e.preventDefault();
-										notesSubmit("save");
-									}}
-								>
-									<label htmlFor="release-notes-text">Release notes</label>
-									<textarea
-										id="release-notes-text"
-										rows={6}
-										value={notesEdit}
-										onChange={(e) => setNotesEdit(e.target.value)}
-										placeholder="Replacement notes — or text appended below the current notes."
-									/>
-									<div className="reply-actions">
-										<button
-											type="button"
-											onClick={() => setNotesEdit(null)}
-											disabled={notesSave.busy}
-										>
-											Cancel
-										</button>
-										<button
-											type="button"
-											className={notesSave.failed ? "failed" : undefined}
-											disabled={!notesValid || notesSave.busy}
-											aria-busy={notesSave.busy || undefined}
-											onClick={() => notesSubmit("append")}
-										>
-											{notesSave.busy && (
-												<span className="spinner" aria-hidden="true" />
-											)}
-											Add to notes
-										</button>
-										{/* One primary per surface: the notes Save stays stock grey. */}
-										<button
-											type="submit"
-											className={notesSave.failed ? "failed" : undefined}
-											disabled={!notesValid || notesSave.busy}
-											aria-busy={notesSave.busy || undefined}
-										>
-											{notesSave.busy && (
-												<span className="spinner" aria-hidden="true" />
-											)}
-											<Icon name="send" />
-											Save
-										</button>
-									</div>
-								</form>
-							</section>
-						))}
-					{!editable && !proposal && (
-						<DrawerSec id="drawer-prompt" label="Prompt">
-							<div className="prompt-text">
-								<Markdown text={task.prompt} />
-							</div>
-						</DrawerSec>
-					)}
-					{!proposal && editable && edit === null && (
-						<DrawerSec id="drawer-prompt" label="Prompt">
-							<div className="task-prompt">
-								<Markdown text={task.prompt} />
-								<button type="button" onClick={() => setEdit(task.prompt)}>
-									<Icon name="edit" />
-									Edit task
-								</button>
-							</div>
-						</DrawerSec>
-					)}
-					{!proposal && editable && edit !== null && (
-						<PromptEditForm
-							edit={edit}
-							onEdit={setEdit}
-							editValid={editValid}
-							editSave={editSave}
-							onSave={editSubmit}
-						/>
-					)}
-					{(task.images.length > 0 || task.pendingImages.length > 0) && (
-						<div className="thumbs">
-							{[...task.images, ...task.pendingImages].map((name, i) => {
-								const url = imgUrl(name);
-								return (
-									<button
-										key={name}
-										type="button"
-										className="thumb"
-										title="Open full size"
-										onClick={() => setViewing({ list: inputUrls, index: i })}
-									>
-										<img src={url} alt={`Attachment ${i + 1}`} loading="lazy" />
-									</button>
-								);
-							})}
-						</div>
-					)}
-					{/* A done research card renders the full report once, in the Research report section below; the Result keeps the summary (tldr) only. */}
-					{(report.summary !== null ||
-						(report.details !== null && !hideDetails)) && (
-						<DrawerSec
-							id="drawer-result"
-							label={task.stage === "done" ? "Result" : "Report"}
-						>
-							{report.summary !== null && (
-								<p className="summary">{report.summary}</p>
-							)}
-							{report.details !== null && !hideDetails && (
-								<Markdown text={report.details} />
-							)}
-						</DrawerSec>
-					)}
-					{task.kind === "pr_review" && task.prReview !== undefined && (
-						<DrawerSec id="drawer-pr" label="PR review">
-							<PrReviewSection
-								key={task.prReview.reviewedHead ?? ""}
-								task={task}
-								pr={task.prReview}
-								draft={prDraft}
-								act={act}
-								onLoaded={setDetail}
-							/>
-						</DrawerSec>
-					)}
-					{task.workCheckLog.length > 0 && (
-						<DrawerSec
-							id="drawer-wc"
-							label="Work check"
-							className="work-checks"
-						>
-							<ul>
-								{task.workCheckLog.map((run, i) => (
-									// biome-ignore lint/suspicious/noArrayIndexKey: append-only log, runs are positional
-									<li key={i}>
-										<p className="wc-run">
-											{run.outcome === "pass"
-												? "Passed"
-												: run.outcome === "blockers"
-													? "Blocked"
-													: "Error"}
-											{" · "}
-											{run.model === null
-												? "default model"
-												: displayModel(catalog?.models ?? [], run.model)}
-											{" · "}
-											{stamp(run.at)} · {duration(run.durationMs)}
-										</p>
-										{run.warn !== undefined && (
-											<p className="hint">
-												<Mark kind="warn" /> {run.warn}
-											</p>
-										)}
-										{run.error !== undefined && (
-											<p className="dim">{run.error}</p>
-										)}
-										{run.blockers.length > 0 && (
-											<ul>
-												{run.blockers.map((b, j) => (
-													// biome-ignore lint/suspicious/noArrayIndexKey: static list, blockers are positional
-													<li key={j}>
-														<p>{b.finding}</p>
-														<blockquote>{b.quote}</blockquote>
-														{b.status !== undefined && (
-															<p className="dim">
-																{b.status}
-																{b.statusReason !== undefined
-																	? `: ${b.statusReason}`
-																	: ""}
-															</p>
-														)}
-													</li>
-												))}
-											</ul>
-										)}
-										{run.notes.length > 0 && (
-											<ul>
-												{run.notes.map((n, j) => (
-													// biome-ignore lint/suspicious/noArrayIndexKey: static list, notes are positional
-													<li key={j} className="dim">
-														{n}
-													</li>
-												))}
-											</ul>
-										)}
-									</li>
-								))}
-							</ul>
-						</DrawerSec>
-					)}
-					{mergeOpen && (
-						<Modal
-							label="Merge anyway"
-							className="dialog"
-							onClose={() => setMergeOpen(false)}
-						>
-							<div className="dialog-body">
-								<div className="dialog-head">
-									<h2>Merge anyway</h2>
-									<CloseButton />
-								</div>
-								<p className="hint">
-									The work check found unresolved blockers. Say why the card
-									merges anyway; the reason is kept with the check log.
-								</p>
-								<form
-									className="reply-form"
-									onSubmit={(e) => {
-										e.preventDefault();
-										mergeSave.start(() => mergeAnyway());
-									}}
-								>
-									<label htmlFor="merge-anyway-reason">Reason</label>
-									<textarea
-										id="merge-anyway-reason"
-										data-autofocus
-										required
-										maxLength={2000}
-										value={mergeReason}
-										onChange={(e) => setMergeReason(e.target.value)}
-										placeholder="Why do the blockers not block this merge?"
-									/>
-									{mergeError !== null && (
-										<p role="alert" className="dim">
-											{mergeError}
-										</p>
-									)}
-									<div className="reply-actions">
-										<button
-											type="button"
-											onClick={() => setMergeOpen(false)}
-											disabled={mergeSave.busy}
-										>
-											Cancel
-										</button>
-										<button
-											type="submit"
-											className="danger"
-											disabled={
-												mergeReason.trim().length === 0 || mergeSave.busy
-											}
-											aria-busy={mergeSave.busy || undefined}
-										>
-											{mergeSave.busy && (
-												<span className="spinner" aria-hidden="true" />
-											)}
-											Merge anyway
-										</button>
-									</div>
-								</form>
-							</div>
-						</Modal>
-					)}
-					{shotUrls.length > 0 && (
-						<DrawerSec id="drawer-shots" label="Screenshots">
-							<div className="thumbs">
-								{task.shots.map((name, i) => {
-									const url = imgUrl(name);
-									return (
-										<button
-											key={name}
-											type="button"
-											className="thumb shot"
-											title="Open full size"
-											onClick={() =>
-												setViewing({
-													list: shotUrls,
-													index: i,
-													names: task.shots,
-												})
-											}
-										>
-											<img src={url} alt={name} loading="lazy" />
-											<span className="shot-name">{name}</span>
-										</button>
-									);
-								})}
-							</div>
-						</DrawerSec>
-					)}
-					{task.research && task.report !== null && (
-						<DrawerSec
-							id="drawer-research"
-							label="Research report"
-							head={
-								<div style={{ display: "flex", gap: 8 }}>
-									<button
-										type="button"
-										className="ghost"
-										title="Download research-report.html"
-										onClick={() => {
-											downloadBlob(
-												"research-report.html",
-												// The section guard proves non-null; closures lose the narrowing.
-												new Blob(
-													[
-														reportHtml(
-															task.title,
-															mdRef.current?.innerHTML ?? "",
-														),
-													],
-													{ type: "text/html" },
-												),
-											);
-										}}
-									>
-										<Icon name="download" />
-										HTML
-									</button>
-									<button
-										type="button"
-										className="ghost"
-										title="Download research-report.md"
-										onClick={() => {
-											downloadBlob(
-												"research-report.md",
-												new Blob([task.report ?? ""], {
-													type: "text/markdown",
-												}),
-											);
-										}}
-									>
-										<Icon name="download" />
-										Download
-									</button>
-								</div>
-							}
-						>
-							<div ref={mdRef}>
-								<Markdown text={task.report} />
-							</div>
-						</DrawerSec>
-					)}
-
-					<DrawerSec
-						id="drawer-steps"
-						label="Work steps"
-						head={
-							ctx === null ? undefined : (
-								<Meter
-									label="Context"
-									pct={windowTok ? (ctx.promptTokens / windowTok) * 100 : null}
-									band={windowTok !== null}
-									value={
-										fmtTokens(ctx.promptTokens) +
-										(windowTok !== null ? ` / ${fmtTokens(windowTok)}` : "")
-									}
-									title={
-										windowTok === null
-											? ctx.model === null
-												? "Context window"
-												: `Context window — ${ctx.model}`
-											: `Context window — ${ctx.model}` +
-												(ctx.compactions > 0
-													? `, compacted ${ctx.compactions}×`
-													: "")
-									}
-								/>
-							)
-						}
-					>
-						{detail === null ? (
-							<DrawerLoading label="Loading the steps" />
-						) : (
-							steps.length === 0 && <p className="dim">No turns yet.</p>
-						)}
-						<ul className="turns">
-							{steps.map((s, idx) => {
-								if (s.kind === "check") {
-									const { run } = s;
-									const nb = run.blockers.length;
-									const nn = run.notes.length;
-									return (
-										// Not expandable: the Work check section above holds the findings.
-										<li key={`check-${s.n}`} className="turn turn-check">
-											{run.outcome === "pass" ? (
-												<span className="turn-node">
-													<Icon name="check" size={11} />
-												</span>
-											) : (
-												<span className="turn-node ask" aria-hidden="true" />
-											)}
-											<div className="turn-head">
-												<strong>work check</strong>
-												<span
-													className={
-														"outcome" +
-														(run.outcome === "pass" ? "" : " o-needs_you")
-													}
-												>
-													{run.outcome === "pass"
-														? "passed"
-														: run.outcome === "blockers"
-															? "blocked"
-															: "error"}
-												</span>
-												<span className="turn-model" title="model">
-													{run.model === null
-														? "default model"
-														: displayModel(catalog?.models ?? [], run.model)}
-												</span>
-												<span className="turn-time">
-													{new Date(run.at).toLocaleTimeString()}
-												</span>
-												<span className="turn-dur">
-													{duration(run.durationMs)}
-												</span>
-											</div>
-											{(run.error !== undefined || nb + nn > 0) && (
-												<div className="dim turn-sum">
-													{run.error ??
-														`${nb} ${nb === 1 ? "blocker" : "blockers"} · ${nn} ${nn === 1 ? "note" : "notes"}`}
-												</div>
-											)}
-											{run.warn !== undefined && (
-												<div className="dim turn-sum">
-													<Mark kind="warn" /> {run.warn}
-												</div>
-											)}
-										</li>
-									);
-								}
-								if (s.kind === "filed") {
-									const f = s.finding;
-									return (
-										// Not expandable: the finding has no turns yet; its card holds the state.
-										<li key={`filed-${f.id}`} className="turn turn-check">
-											<span className="turn-node" aria-hidden="true">
-												<Mark kind="queued" />
-											</span>
-											<div className="turn-head">
-												<strong>finding</strong>
-												<span
-													className={
-														"outcome" +
-														(f.cancelledAt !== null || f.state === "needs_you"
-															? " o-needs_you"
-															: "")
-													}
-												>
-													{f.cancelledAt !== null ? "cancelled" : f.state}
-												</span>
-												<span className="turn-time">
-													{new Date(f.createdAt).toLocaleTimeString()}
-												</span>
-											</div>
-											<div className="dim turn-sum">{f.title}</div>
-										</li>
-									);
-								}
-								const t = s.turn;
-								// The card that ran the turn: null for this card's own turns.
-								const sub =
-									s.kind === "retro"
-										? s.retroId
-										: s.kind === "finding"
-											? s.finding.id
-											: null;
-								// A retro or finding turn's id comes from another card: key its open state apart.
-								const stepKey =
-									sub === null ? t.id : `${s.kind}-${sub}-${t.id}`;
-								const expanded = openTurn === stepKey;
-								// The retro's waiting reason, unless its latest turn already shows it.
-								const retroWait =
-									s === lastRetro &&
-									task.retro?.state === "needs_you" &&
-									task.retro.needsReason !== null &&
-									task.retro.needsReason !== t.error
-										? task.retro
-										: null;
-								// A running turn's model is only written to the DB when it ends; meanwhile show what it runs with.
-								// A retro or finding runs on its own card's model, which this drawer does not carry.
-								const model =
-									t.model ??
-									(t.endedAt === null && sub === null
-										? (task.model ?? catalog?.defaultModel ?? null)
-										: null);
-								return (
-									<li
-										key={stepKey}
-										className="turn"
-										// Keyboard support without a second tab stop: the turn-head button
-										// is the only stop, and its Enter/Space keydown bubbles to the
-										// handlers here (preventDefault stops the button's own click).
-										onKeyDown={(e) => {
-											if (e.key !== "Enter" && e.key !== " ") return;
-											e.preventDefault();
-											setOpenTurn(expanded ? null : stepKey);
-										}}
-										onClick={(e) => {
-											// The log stays open while scrolling/selecting in it; selecting summary text must not toggle either.
-											// The input bubble is display-only: clicking or selecting it never toggles the log.
-											if (
-												(e.target as Element).closest(".log, .you") ||
-												!window.getSelection()?.isCollapsed
-											)
-												return;
-											setOpenTurn(expanded ? null : stepKey);
-										}}
-									>
-										{/* Shape carries state on the rail: check = ended, filled dot = live, triangle = needs you (steel when the turn asked a question). */}
-										{t.endedAt === null ? (
-											<span className="turn-node live" aria-hidden="true" />
-										) : t.outcome === "needs_you" ? (
-											<span
-												className={
-													"turn-node ask" +
-													(t.question !== null ? " asked" : "")
-												}
-												aria-hidden="true"
-											/>
-										) : (
-											<span className="turn-node">
-												<Icon name="check" size={11} />
-											</span>
-										)}
-										{/* The steer/reply this turn delivered speaks first: it is what started the
-									    turn below, and it is display-only (the row's click-to-toggle skips it). */}
-										{t.input !== null && (
-											<div className="you">
-												<span className="you-head">
-													{t.inputBy === "supervisor" ? "Supervisor" : "You"}
-												</span>
-												<div className="you-bubble">
-													{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
-													{t.input.trim() === "." ? (
-														<span className="you-chip">Resume</span>
-													) : (
-														<div className="you-msg">
-															<Markdown text={t.input} />
-														</div>
-													)}
-												</div>
-											</div>
-										)}
-										{/* The agent's part: the one hover-glow target. The steer/reply bubble
-									    above stays outside it — display-only, like the click. */}
-										<div className="turn-body">
-											<button
-												type="button"
-												className="turn-head"
-												aria-expanded={expanded}
-											>
-												<Icon name="chevron-right" size={13} />
-												<strong>
-													{sub === null
-														? t.kind
-														: s.kind === "finding"
-															? "finding"
-															: "retro"}
-												</strong>
-												{t.outcome !== null && (
-													<span
-														className={
-															"outcome o-" +
-															t.outcome +
-															(t.outcome === "needs_you" && t.question !== null
-																? " asked"
-																: "")
-														}
-													>
-														{t.outcome === "needs_you" && t.question !== null
-															? "question"
-															: t.outcome.replace("_", " ")}
-													</span>
-												)}
-												{model !== null && (
-													<span className="turn-model" title="model">
-														{model}
-													</span>
-												)}
-												<span className="turn-time">
-													{new Date(t.startedAt).toLocaleTimeString()}
-												</span>
-												<span className="turn-dur">
-													{t.endedAt === null ? (
-														<LiveElapsed since={t.startedAt} />
-													) : (
-														turnDuration({
-															startedAt: t.startedAt,
-															endedAt: t.endedAt,
-														})
-													)}
-												</span>
-											</button>
-											{s.kind === "finding" && (
-												<div className="dim turn-sum">{s.finding.title}</div>
-											)}
-											{t.summary !== null && (
-												<div className="dim turn-sum">{t.summary}</div>
-											)}
-											{/* The run fell back to another model than dispatched (provider error,
-											omp's retry chain): name both, so a steered model pick that did not
-											run is legible instead of silent. The card keeps the pick. */}
-											{t.dispatchedModel !== null && t.model !== null && (
-												<div
-													className="dim turn-sum"
-													title={`Dispatched ${t.dispatchedModel}, but the run served ${t.model}: the provider errored and omp's retry chain fell back. The card keeps ${t.dispatchedModel} for its next turn.`}
-												>
-													<Mark kind="warn" /> dispatched{" "}
-													{displayModel(
-														catalog?.models ?? [],
-														t.dispatchedModel,
-													)}
-													, ran {displayModel(catalog?.models ?? [], t.model)}
-												</div>
-											)}
-											{/* The retro card's own drawer keeps reply and cancel for a retro that waits. */}
-											{s.kind === "retro" && s === lastRetro && (
-												<a
-													className="turn-link"
-													href={taskPath(task.project, s.retroId)}
-													// The link is its own target: the row's toggle must not fire.
-													onKeyDown={(e) => e.stopPropagation()}
-													onClick={(e) => {
-														e.stopPropagation();
-														navClick(e, () => onOpenTask(s.retroId));
-													}}
-												>
-													Open retro
-												</a>
-											)}
-											{s.kind === "finding" &&
-												lastFindingStep.get(s.finding.id) === idx && (
-													<a
-														className="turn-link"
-														href={taskPath(task.project, s.finding.id)}
-														// The link is its own target: the row's toggle must not fire.
-														onKeyDown={(e) => e.stopPropagation()}
-														onClick={(e) => {
-															e.stopPropagation();
-															navClick(e, () => onOpenTask(s.finding.id));
-														}}
-													>
-														Open finding
-													</a>
-												)}
-											{t.error !== null && (
-												<div
-													className={
-														"needs-reason" +
-														(t.question !== null ? " asked" : "")
-													}
-												>
-													{t.question !== null && <Mark kind="asked" />}
-													{t.error}
-												</div>
-											)}
-											{retroWait !== null && (
-												<div
-													className={
-														"needs-reason" +
-														(retroWait.asked !== null ? " asked" : "")
-													}
-												>
-													{retroWait.asked !== null && <Mark kind="asked" />}
-													{retroWait.needsReason}
-												</div>
-											)}
-											{expanded && (
-												<LogView
-													project={project}
-													taskId={sub ?? task.id}
-													startedAt={t.startedAt}
-													logOffset={t.logOffset}
-												/>
-											)}
-										</div>
-									</li>
-								);
-							})}
-							{/* A queued steer speaks in the timeline under the last turn: it is the
-						    next input the agent will get, not part of the composer below.
-						    Same visibility as before (running/queued): other states never showed it. */}
-							{(localPending !== null || task.pendingPrompt !== null) &&
-								(task.state === "running" || task.state === "queued") && (
-									<li className="turn">
-										<span className="turn-node">
-											<Mark kind="queued" />
-										</span>
-										<div className="you">
-											<span className="you-head">
-												Queued
-												{/* Edit/Cancel act on the server's queued prompt: they
-												    wait for the server frame, so they hide while the
-												    optimistic bubble from this client's own send is
-												    still unconfirmed. */}
-												{localPending === null &&
-													task.pendingPrompt !== null &&
-													task.pendingPrompt.trim() !== "." && (
-														<>
-															<BusyButton
-																className="ghost"
-																ariaLabel="Edit the queued steering"
-																run={() => {
-																	setSteerEdit(task.pendingPrompt);
-																	return Promise.resolve(true);
-																}}
-															>
-																Edit
-															</BusyButton>
-															<BusyButton
-																className="ghost"
-																ariaLabel="Cancel the queued steering"
-																run={async () =>
-																	(await confirmDialog(
-																		"Discard the queued steering?",
-																		{ ok: "Discard", danger: true },
-																	))
-																		? cancelSteer()
-																		: Promise.resolve(true)
-																}
-															>
-																Cancel
-															</BusyButton>
-														</>
-													)}
-											</span>
-											<div className="you-bubble">
-												{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
-												{(localPending !== null
-													? localPending.text
-													: (task.pendingPrompt ?? "")
-												).trim() === "." ? (
-													<span className="you-chip">Resume</span>
-												) : steerEdit === null || localPending !== null ? (
-													<div className="you-msg">
-														<Markdown
-															text={
-																localPending !== null
-																	? localPending.text
-																	: (task.pendingPrompt ?? "")
-															}
-														/>
-													</div>
-												) : (
-													<form
-														className="reply-form"
-														onSubmit={(e) => {
-															e.preventDefault();
-															if (steerEdit.trim().length === 0) return;
-															steerEditSave.start(() =>
-																saveSteerEdit(steerEdit),
-															);
-														}}
-													>
-														<label htmlFor="steer-edit-text">Steering</label>
-														<textarea
-															id="steer-edit-text"
-															rows={4}
-															value={steerEdit}
-															onChange={(e) => setSteerEdit(e.target.value)}
-														/>
-														<div className="reply-actions">
-															<button
-																type="button"
-																onClick={() => setSteerEdit(null)}
-															>
-																Cancel
-															</button>
-															{/* One primary per surface: the edit Save stays stock grey. */}
-															<button
-																type="submit"
-																className={
-																	steerEditSave.failed ? "failed" : undefined
-																}
-																disabled={
-																	steerEdit.trim().length === 0 ||
-																	steerEditSave.busy
-																}
-																aria-busy={steerEditSave.busy || undefined}
-															>
-																{steerEditSave.busy && (
-																	<span
-																		className="spinner"
-																		aria-hidden="true"
-																	/>
-																)}
-																<Icon name="send" />
-																Save
-															</button>
-														</div>
-													</form>
-												)}
-												{(localPending !== null
-													? localPending.images > 0
-													: task.pendingImages.length > 0) && (
-													<p className="you-msg dim">
-														+
-														{localPending !== null
-															? localPending.images
-															: task.pendingImages.length}{" "}
-														image
-														{(localPending !== null
-															? localPending.images
-															: task.pendingImages.length) === 1
-															? ""
-															: "s"}
-													</p>
-												)}
-												{task.state === "queued" && (
-													<p className="you-msg dim">
-														Sends when an agent slot frees.
-													</p>
-												)}
-											</div>
-										</div>
-									</li>
-								)}
-						</ul>
-					</DrawerSec>
-
-					{/* Collapsible Triage between the turn tree and the Steer composer,
-					    collapsed by default: rank and close-candidate nomination are triage
-					    controls, not the card's story. Done tasks hide it entirely: the
-					    controls have no effect there. A cancelled card hides it too: its
-					    drawer is read-only. */}
-					{task.stage !== "done" && !cancelled && (
-						<DrawerSec id="drawer-triage" label="Triage" defaultOpen={false}>
-							<div className="triage-row">
-								{/* The rank picker: five fixed options show all at once as a
-								    segmented control, never a select (DESIGN.md, Choice controls).
-								    The optimistic wiring is unchanged: rank.set shows the pick at
-								    once, rank.run posts it, a failure rolls the press back. */}
-								<fieldset className="triage-rank">
-									{/* fieldset names the group for assistive tech (the visible
-									    caption stays the span); biome's useSemanticElements
-									    requires the real element over role="group". */}
-									<legend className="sr">Triage rank</legend>
-									<span>Rank</span>
-									<div className="rank-seg">
-										{["", ...PRIORITIES].map((p) => (
-											<button
-												key={p}
-												type="button"
-												aria-pressed={rank.value === p}
-												disabled={triageSave.busy || rank.busy}
-												onClick={() => setRank(p)}
-											>
-												{p === "" ? "Default" : p}
-											</button>
-										))}
-									</div>
-								</fieldset>
-								{task.closeCandidate === null ? (
-									<form
-										className="triage-nominate"
-										onSubmit={(e) => {
-											e.preventDefault();
-											if (triageReason.trim() !== "") nominateCandidate();
-										}}
-									>
-										<label>
-											<span>Close reason</span>
-											<input
-												value={triageReason}
-												maxLength={200}
-												required
-												placeholder="Duplicate of OTTR-640"
-												disabled={triageSave.busy}
-												onChange={(e) => setTriageReason(e.target.value)}
-											/>
-										</label>
-										<button
-											type="submit"
-											disabled={triageSave.busy || triageReason.trim() === ""}
-											aria-busy={triageSave.busy || undefined}
-										>
-											{triageSave.busy && (
-												<span className="spinner" aria-hidden="true" />
-											)}
-											Suggest closing
-										</button>
-									</form>
-								) : (
-									<span className="triage-set">
-										<span className="close-badge" title={task.closeCandidate}>
-											Close
-										</span>
-										<span className="triage-reason" title={task.closeCandidate}>
-											{task.closeCandidate}
-										</span>
-										<button
-											type="button"
-											disabled={triageSave.busy}
-											aria-busy={triageSave.busy || undefined}
-											onClick={clearCandidate}
-										>
-											Clear reason
-										</button>
-									</span>
-								)}
-							</div>
-							{triageError !== null && (
-								<p className="auth-error" role="alert">
-									{triageError}
-								</p>
-							)}
-						</DrawerSec>
-					)}
-					{/* A parked merge hold (update, fork, mismatch) approves by reply; the fixed bar
-					    carries the hold message's actions and pins to the drawer's bottom edge while
-					    the report scrolls. The server still gates the approval. */}
-					{task.state === "needs_you" &&
-						task.holdHead !== null &&
-						!askedNow && (
-							<div className="hold-actions">
-								{/* The summary is the ready report an update card parks on; it always
-								    exists, so the button rides the bar's first paint. Before the fetch
-								    lands it scrolls to the drawer top, where the report sits. */}
-								{task.needsReason === UPDATE_HOLD_REASON && (
-									<button
-										type="button"
-										title="Scrolls up to the report summary"
-										onClick={() => {
-											const target = document.getElementById("drawer-result");
-											if (target !== null)
-												target.scrollIntoView({ block: "start" });
-											else
-												document
-													.querySelector("dialog.drawer")
-													?.scrollTo({ top: 0 });
-										}}
-									>
-										Read the summary
-									</button>
-								)}
-								{/* The mismatch park serves its stat only through the drawer fetch, so
-								    the button and the Changed files section appear together. */}
-								{task.needsReason === MERGE_HOLD_MISMATCH_REASON &&
-									diffFiles.length > 0 && (
-										<button
-											type="button"
-											title="Scrolls to the changed files the merge added beyond the approval"
-											onClick={() =>
-												document
-													.getElementById("drawer-diff")
-													?.scrollIntoView({ block: "start" })
-											}
-										>
-											Read the diff
-										</button>
-									)}
-								<BusyButton
-									className="primary"
-									title="Sends the approving reply, so the parked merge can land"
-									run={() => sendReply(APPROVE_REPLY)}
-								>
-									<Icon name="check" />
-									Approve merge
-								</BusyButton>
-							</div>
-						)}
-					{followUp ? (
-						<div className="followup-cta">
-							{/* One primary per surface: the PR section's Post review outranks
-							    the generic Follow up, which renders stock grey beside it. */}
-							<button
-								type="button"
-								className={prReviewOpen ? undefined : "primary"}
-								onClick={() => setFollowOpen(true)}
-							>
-								<Icon name="send" />
-								Follow up
-							</button>
-							{task.research && researchSteps(task) === "yes" && (
-								<>
-									<button
-										type="button"
-										title="Picks a model, then creates a follow-up task that implements the report's recommended steps"
-										onClick={() => setStepsOpen(true)}
-									>
-										<Icon name="play" />
-										Implement steps
-									</button>
-									<BusyButton
-										title="Marks the report read and clears it from the Inbox"
-										run={async () => {
-											onMarkSeen();
-											return true;
-										}}
-									>
-										<Icon name="eye-off" />
-										No further steps
-									</BusyButton>
-								</>
-							)}
-							<p className="hint">
-								Creates a new task that continues this one with a full handoff.
-							</p>
-						</div>
-					) : (
-						// A PR review posts and asks for drafts in its own section, not this composer.
-						task.state === "needs_you" &&
-						!prReviewOpen && (
-							<form
-								id="drawer-reply"
-								className="reply-form"
-								onSubmit={(e) => {
-									e.preventDefault();
-									replySend.start(() => sendReply(reply, true));
-								}}
-							>
-								<PromptInput
-									label="Reply"
-									value={reply}
-									placeholder="Yes, but keep the old route"
-									onChange={setReply}
-									onEnter={() => replySend.start(() => sendReply(reply, true))}
-									images={replyImages}
-									onView={(i) => {
-										const list = replyImages.images.map((im) => im.url);
-										if (list[i] !== undefined) setViewing({ list, index: i });
-									}}
-								/>
-								<ComposerActions
-									onAddImages={replyImages.addFiles}
-									catalog={catalog}
-									model={model.value}
-									setModel={switchModel}
-									modelQuery={modelQuery}
-									setModelQuery={setModelQuery}
-									secondary={
-										<>
-											{!proposal && (
-												<BusyButton
-													title="Start a fresh omp session in the same worktree; the broken one is abandoned (its files stay in .tasks/sessions)"
-													run={async () =>
-														(await confirmDialog(
-															`Start a fresh omp session for ${task.id} "${task.title}"? The broken session is abandoned (its transcript stays in .tasks/sessions).`,
-															{ ok: "Start fresh session" },
-														))
-															? act(async () => {
-																	await post(
-																		`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/restart-session`,
-																		{},
-																	);
-																})
-															: Promise.resolve(true)
-													}
-												>
-													<Icon name="refresh-cw" />
-													New session
-												</BusyButton>
-											)}
-											{/* The Decide section owns Accept while its panel shows (proposal,
-										    needs_you, not cancelled); the composer keeps the button only
-										    when the panel is hidden, so a proposal never offers Accept
-										    twice. */}
-											{(!proposal || cancelled) && (
-												<BusyButton
-													title={
-														editOpen
-															? editGuardTitle
-															: proposal
-																? "Start the proposed task"
-																: "Continue the interrupted session (sends '.')"
-													}
-													disabled={editOpen}
-													run={() => sendReply(".")}
-												>
-													<Icon name="play" />
-													{proposal ? "Accept" : "Resume"}
-												</BusyButton>
-											)}
-										</>
-									}
-									primary={
-										<button
-											type="submit"
-											// One primary per surface: while a decision section owns
-											// the loud slot (hold, proposal, ask, kept files), the
-											// composer's Reply renders stock grey.
-											className={
-												decisionPrimary
-													? replySend.failed
-														? "failed"
-														: undefined
-													: `primary${replySend.failed ? " failed" : ""}`
-											}
-											disabled={replySend.busy}
-											aria-busy={replySend.busy || undefined}
-										>
-											{replySend.busy && (
-												<span className="spinner" aria-hidden="true" />
-											)}
-											<Icon name="send" />
-											Reply
-										</button>
-									}
-								/>
-								<p className="hint">
-									Enter sends. Shift+Enter starts a new line. Images: paste,
-									drop or browse. A model pick lands with the reply turn.
-								</p>
-							</form>
-						)
-					)}
-
-					{(task.state === "running" || task.state === "queued") && (
-						<form
-							className="reply-form steer-form prompt-card"
-							onSubmit={(e) => {
-								e.preventDefault();
-								steerSend.start(() => sendSteer(steer));
-							}}
-						>
-							<PromptInput
-								label="Steer"
-								value={steer}
-								placeholder="Also update the changelog"
-								onChange={setSteer}
-								onEnter={() => steerSend.start(() => sendSteer(steer))}
-								images={steerImages}
-								onView={(i) => {
-									const list = steerImages.images.map((im) => im.url);
-									if (list[i] !== undefined) setViewing({ list, index: i });
-								}}
-							/>
-							<ComposerActions
-								attachIcon="plus"
-								onAddImages={steerImages.addFiles}
-								catalog={catalog}
-								model={model.value}
-								setModel={switchModel}
-								modelQuery={modelQuery}
-								setModelQuery={setModelQuery}
-								secondary={
-									<>
-										{task.state === "running" && (
-											<BusyButton
-												title="Interrupt this turn like Esc: the worktree, branch and session stay; the card waits for your reply"
-												run={async () =>
-													(await confirmDialog(
-														`Stop the running turn of ${task.id} "${task.title}"? The card waits for your reply.`,
-														{ ok: "Stop turn" },
-													)) &&
-													(await confirmDialog(
-														`Really stop the running turn of ${task.id} "${task.title}"?`,
-														{ ok: "Stop turn", danger: true },
-													))
-														? act(async () => {
-																await post(
-																	`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/stop`,
-																	{},
-																);
-															})
-														: Promise.resolve(true)
-												}
-											>
-												<Icon name="stop" />
-												Stop turn
-											</BusyButton>
-										)}
-									</>
-								}
-								primary={
-									<button
-										type="submit"
-										className={"primary" + (steerSend.failed ? " failed" : "")}
-										// Nothing to send while the field and the images are empty.
-										disabled={
-											steerSend.busy ||
-											(steer.trim() === "" && steerImages.images.length === 0)
-										}
-										aria-busy={steerSend.busy || undefined}
-										title="Steer (Enter)"
-									>
-										{steerSend.busy ? (
-											<span className="spinner" aria-hidden="true" />
-										) : (
-											<Icon name="helm" />
-										)}
-										Steer
-									</button>
-								}
-							/>
-							<p className="hint">
-								Enter steers. Shift+Enter starts a new line. Images: paste, drop
-								or browse. A model pick lands with the next turn.
-							</p>
-						</form>
-					)}
-
-					{/* The actions row (Cancel task and stage-specific actions) sits between the steer form and meta. */}
-					<div className="drawer-actions">
-						{task.stage === "backlog" &&
-							task.state === "idle" &&
-							!cancelled && (
-								<>
-									<button
-										type="button"
-										className="primary"
-										title={
-											editOpen
-												? editGuardTitle
-												: "Asks rounds of questions to refine the idea before it runs"
-										}
-										disabled={editOpen}
-										onClick={() => setPick("grill")}
-									>
-										<Icon name="send" />
-										Plan with agent
-									</button>
-									<button
-										type="button"
-										title={
-											editOpen
-												? editGuardTitle
-												: "Puts the card in the todo lane so the agent can start it"
-										}
-										disabled={editOpen}
-										onClick={() => setPick("todo")}
-									>
-										<Icon name="plus" />
-										Move to todo
-									</button>
-								</>
-							)}
-						{task.stage === "todo" &&
-							task.state === "queued" &&
-							task.pendingPrompt === null && (
-								<BusyButton
-									title="Parks the idea in the backlog until it is ready to run"
-									run={() =>
-										act(async () => {
-											await post(
-												`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/backlog`,
-												{ to: "backlog" },
-											);
-										})
-									}
-								>
-									<Icon name="x" />
-									Not ready — park in backlog
-								</BusyButton>
-							)}
-						{task.stage === "done" && read && !cancelled && (
-							<BusyButton
-								title="Puts the new badge back on this card: it counts as not opened again"
-								run={async () => {
-									onMarkUnread();
-									return true;
-								}}
-							>
-								<Icon name="eye-off" />
-								Mark unread
-							</BusyButton>
-						)}
-						{/* Merge anyway overrides the open work-check blockers through the
-						    reason modal. It used to sit in the reply/steer composer bars; it
-						    moved here so no danger button shares a row with the primary
-						    action. The state guard keeps the old bars' exact reachability. */}
-						{wcMergeable &&
-							(task.state === "needs_you" || task.state === "queued") && (
-								<button
-									type="button"
-									className="danger"
-									onClick={() => {
-										setMergeReason("");
-										setMergeError(null);
-										setMergeOpen(true);
-									}}
-								>
-									Merge anyway
-								</button>
-							)}
-						{/* OTTR-604: cards whose text links a GitHub Actions run offer a
-						    re-run of that run's failed jobs; errors surface inline. */}
-						{rerunUrl !== null && !cancelled && (
-							<BusyButton run={rerunFailedJobs}>Re-run failed jobs</BusyButton>
-						)}
-						{/* A cancelled card is final: its drawer is read-only, so the delete
-						    action goes too (an uncancel does not exist). */}
-						{!cancelled && (
-							<BusyButton className="danger" run={runCancel}>
-								<Icon name={task.stage === "done" ? "trash" : "x"} />
-								{task.stage === "done" ? "Delete task" : "Cancel task"}
-							</BusyButton>
-						)}
-					</div>
-					{/* OTTR-604: the re-run error and confirmation render as full-width
-					    lines below the actions row, not as flex items inside it, so they
-					    align with the drawer's content margin and keep their spacing. */}
-					{rerunUrl !== null && !cancelled && rerunError !== null && (
-						<p className="auth-error" role="alert">
-							{rerunError}
-						</p>
-					)}
-					{rerunUrl !== null &&
-						!cancelled &&
-						rerunDone &&
-						rerunError === null && (
-							<p className="hint" role="status">
-								Re-run requested.
-							</p>
-						)}
-
-					{/* The meta section is the drawer's last element: it sits below everything else. */}
-					<details className="meta-block">
-						<summary>Meta</summary>
-						<dl className="meta">
-							{task.research && (
-								<div>
-									<dt>Research</dt>
-									<dd>
-										yes
-										{task.state !== "running" && !cancelled && (
-											<button
-												type="button"
-												className="unmark-research"
-												title="Clear the research flag: the next settle classifies this card from its branch again"
-												onClick={() =>
-													act(async () => {
-														await post(
-															`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/unmark-research`,
-															{},
-														);
-													})
-												}
-											>
-												unmark
-											</button>
-										)}
-									</dd>
-								</div>
-							)}
-							<div>
-								<dt>Branch</dt>
-								<dd>{task.branch ?? "-"}</dd>
-							</div>
-							{task.prNumber !== null && (
-								<div>
-									<dt>PR</dt>
-									<dd>
-										{task.prUrl !== null ? (
-											<a
-												href={task.prUrl}
-												target="_blank"
-												rel="noopener noreferrer"
-											>
-												PR #{task.prNumber}
-											</a>
-										) : (
-											`PR #${task.prNumber}`
-										)}
-									</dd>
-								</div>
-							)}
-							<div>
-								<dt>Worktree</dt>
-								<dd>{task.worktree ?? "-"}</dd>
-							</div>
-							<div>
-								<dt>Session</dt>
-								<dd>{task.sessionId ?? "-"}</dd>
-							</div>
-							<div>
-								<dt>Ran on</dt>
-								<dd>{ranOnLabel(task.turns) ?? "-"}</dd>
-							</div>
-							{project.github !== null && (
-								<div>
-									<dt>GitHub</dt>
-									<dd>
-										<a
-											href={project.github}
-											target="_blank"
-											rel="noopener noreferrer"
-										>
-											{project.github}
-										</a>
-									</dd>
-								</div>
-							)}
-							<div>
-								<dt>Commits</dt>
-								<dd>
-									{task.commits === null
-										? "-"
-										: delta !== undefined
-											? `${task.commits} (+${delta})`
-											: `${task.commits}`}
-								</dd>
-							</div>
-						</dl>
-						{resumeCmd !== null && (
-							<div className="cmd-row">
-								<code>{resumeCmd}</code>
-								<button
-									type="button"
-									onClick={() => {
-										setCmdCopyError(null);
-										copyText(resumeCmd).then(flashCopied, (err) =>
-											setCmdCopyError(
-												err instanceof Error ? err.message : String(err),
-											),
-										);
-									}}
-								>
-									{copied ? "Copied" : "Copy command"}
-								</button>
-							</div>
-						)}
-						{resumeCmd !== null && cmdCopyError !== null && (
-							<p className="auth-error" role="alert">
-								{cmdCopyError}
-							</p>
-						)}
-					</details>
+					<DrawerFiles
+						wtLoading={wtLoading}
+						diffLoading={diffLoading}
+						task={task}
+						diffFiles={diffFiles}
+						diffPlus={diffPlus}
+						diffMinus={diffMinus}
+						setDiffView={setDiffView}
+					/>
+					<DrawerNotes
+						task={task}
+						notesEdit={notesEdit}
+						setNotesEdit={setNotesEdit}
+						notesValid={notesValid}
+						notesEditable={notesEditable}
+						notesSubmit={notesSubmit}
+						notesSave={notesSave}
+					/>
+					<DrawerPrompts
+						editable={editable}
+						proposal={proposal}
+						task={task}
+						edit={edit}
+						setEdit={setEdit}
+						editValid={editValid}
+						editSave={editSave}
+						editSubmit={editSubmit}
+						inputUrls={inputUrls}
+						imgUrl={imgUrl}
+						setViewing={setViewing}
+					/>
+					<DrawerResult report={report} hideDetails={hideDetails} task={task} />
+					<DrawerPrSec
+						task={task}
+						prDraft={prDraft}
+						act={act}
+						setDetail={setDetail}
+					/>
+					<DrawerWorkCheck task={task} catalog={catalog} />
+					<DrawerMergeModal
+						mergeOpen={mergeOpen}
+						setMergeOpen={setMergeOpen}
+						mergeReason={mergeReason}
+						setMergeReason={setMergeReason}
+						mergeError={mergeError}
+						mergeSave={mergeSave}
+						mergeAnyway={mergeAnyway}
+					/>
+					<DrawerShots
+						shotUrls={shotUrls}
+						task={task}
+						setViewing={setViewing}
+						imgUrl={imgUrl}
+					/>
+					<DrawerResearch task={task} mdRef={mdRef} />
+					<DrawerSteps
+						ctx={ctx}
+						windowTok={windowTok}
+						detail={detail}
+						steps={steps}
+						catalog={catalog}
+						openTurn={openTurn}
+						setOpenTurn={setOpenTurn}
+						lastRetro={lastRetro}
+						lastFindingStep={lastFindingStep}
+						project={project}
+						task={task}
+						localPending={localPending}
+						steerEdit={steerEdit}
+						setSteerEdit={setSteerEdit}
+						steerEditSave={steerEditSave}
+						saveSteerEdit={saveSteerEdit}
+						cancelSteer={cancelSteer}
+						onOpenTask={onOpenTask}
+					/>
+					<DrawerTriage
+						task={task}
+						cancelled={cancelled}
+						rank={rank}
+						setRank={setRank}
+						triageSave={triageSave}
+						triageReason={triageReason}
+						setTriageReason={setTriageReason}
+						nominateCandidate={nominateCandidate}
+						clearCandidate={clearCandidate}
+						triageError={triageError}
+					/>
+					<DrawerHoldBar
+						task={task}
+						askedNow={askedNow}
+						diffFiles={diffFiles}
+						sendReply={sendReply}
+					/>
+					<DrawerComposer
+						followUp={followUp}
+						prReviewOpen={prReviewOpen}
+						task={task}
+						setFollowOpen={setFollowOpen}
+						setStepsOpen={setStepsOpen}
+						onMarkSeen={onMarkSeen}
+						model={model}
+						setViewing={setViewing}
+						replySend={replySend}
+						sendReply={sendReply}
+						reply={reply}
+						setReply={setReply}
+						replyImages={replyImages}
+						catalog={catalog}
+						modelQuery={modelQuery}
+						setModelQuery={setModelQuery}
+						switchModel={switchModel}
+						decisionPrimary={decisionPrimary}
+						proposal={proposal}
+						cancelled={cancelled}
+						editOpen={editOpen}
+						editGuardTitle={editGuardTitle}
+						steerSend={steerSend}
+						sendSteer={sendSteer}
+						steer={steer}
+						setSteer={setSteer}
+						steerImages={steerImages}
+						act={act}
+					/>
+					<DrawerActions
+						task={task}
+						cancelled={cancelled}
+						editOpen={editOpen}
+						editGuardTitle={editGuardTitle}
+						setPick={setPick}
+						act={act}
+						read={read}
+						onMarkUnread={onMarkUnread}
+						wcMergeable={wcMergeable}
+						setMergeReason={setMergeReason}
+						setMergeError={setMergeError}
+						setMergeOpen={setMergeOpen}
+						rerunUrl={rerunUrl}
+						rerunFailedJobs={rerunFailedJobs}
+						rerunError={rerunError}
+						rerunDone={rerunDone}
+						runCancel={runCancel}
+					/>
+					<DrawerMeta
+						task={task}
+						cancelled={cancelled}
+						act={act}
+						project={project}
+						delta={delta}
+						resumeCmd={resumeCmd}
+						setCmdCopyError={setCmdCopyError}
+						flashCopied={flashCopied}
+						copied={copied}
+						cmdCopyError={cmdCopyError}
+					/>
 				</div>
 			</Modal>
 			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
-			<BacklogModelDialog
-				project={task.project}
-				taskTitle={task.sessionTitle ?? task.title}
-				taskId={task.id}
-				currentModel={task.model ?? null}
-				mode={pick === "todo" ? "todo" : "grill"}
-				open={pick !== null}
-				onClose={() => setPick(null)}
+			<DrawerPickDialog pick={pick} setPick={setPick} task={task} act={act} />
+			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
+			<DrawerLightbox viewing={viewing} setViewing={setViewing} />
+			<DrawerDialogs
+				task={task}
+				pick={pick}
+				setPick={setPick}
 				act={act}
+				viewing={viewing}
+				setViewing={setViewing}
+				wfOpen={wfOpen}
+				setWfOpen={setWfOpen}
+				project={project}
+				tasks={tasks}
+				maxTotal={maxTotal}
+				usedTotal={usedTotal}
+				draining={draining}
+				diffView={diffView}
+				setDiffView={setDiffView}
+				cancelled={cancelled}
+				projects={projects}
+				followOpen={followOpen}
+				setFollowOpen={setFollowOpen}
+				onFollowed={onFollowed}
+				stepsOpen={stepsOpen}
+				setStepsOpen={setStepsOpen}
+				onMarkSeen={onMarkSeen}
 			/>
-			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
-			<Modal
-				open={viewing !== null}
-				onClose={() => setViewing(null)}
-				label="Attached image"
-				className="lightbox"
-			>
-				{viewing !== null && (
-					<div className="frame">
-						{/* index is always in range: thumbs set it and turnPage wraps. */}
-						<ZoomableImage
-							src={viewing.list[viewing.index] ?? ""}
-							alt="Attachment, full size"
-						/>
-						{viewing.names?.[viewing.index] !== undefined && (
-							<span className="caption">{viewing.names[viewing.index]}</span>
-						)}
-						{viewing.list.length > 1 && (
-							<>
-								<button
-									type="button"
-									className="page prev"
-									aria-label="Previous image"
-									onClick={() =>
-										setViewing((v) => (v === null ? v : turnPage(v, -1)))
-									}
-								>
-									<Icon name="chevron-left" />
-								</button>
-								<button
-									type="button"
-									className="page next"
-									aria-label="Next image"
-									onClick={() =>
-										setViewing((v) => (v === null ? v : turnPage(v, 1)))
-									}
-								>
-									<Icon name="chevron-right" />
-								</button>
-							</>
-						)}
-					</div>
-				)}
-			</Modal>
-			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
-			{wfOpen && (
-				<WorkflowModal
-					kind={workflowKind(task)}
-					stage={task.cancelledAt !== null ? null : task.stage}
-					label={projectLabel(project)}
-					live={{
-						slots: slotUse(tasks),
-						waiting: queueOrder(tasks).length,
-						maxParallel: project.settings.maxParallel,
-						maxTotal,
-						usedTotal,
-						draining,
-					}}
-					onClose={() => setWfOpen(false)}
-				/>
-			)}
-			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
-			{diffView !== undefined && (
-				<DiffModal
-					task={task}
-					files={diffView}
-					onClose={() => setDiffView(undefined)}
-				/>
-			)}
-			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both.
-			    A cancelled card's drawer is read-only: it never opens a follow-up. */}
-			{!cancelled && (
-				<FollowUpDialog
-					task={task}
-					projects={projects}
-					open={followOpen}
-					onClose={() => setFollowOpen(false)}
-					act={act}
-					onFollowed={onFollowed}
-				/>
-			)}
-			{/* Sibling, not child: a nested dialog's close event would propagate to the drawer's Modal and close both. */}
-			{!cancelled && stepsOpen && (
-				<ImplementStepsDialog
-					task={task}
-					onClose={() => setStepsOpen(false)}
-					act={act}
-					onMarkSeen={onMarkSeen}
-					onFollowed={onFollowed}
-				/>
-			)}
 		</>
 	);
 }
@@ -11008,31 +13237,35 @@ const GIT_URL_FIELD_ERROR =
  * field error shows while typing instead of after a rejected POST. Not the trust
  * boundary: the server re-validates every Add, and a class this mirror is looser
  * about still lands in the dialog-level alert. */
+/** https/ssh form: an optional ssh user, then host[:port]/path. */
+const gitUrlSchemeProblem = (url: string, lower: string): string | null => {
+	const rest = url.slice(lower.startsWith("https://") ? 8 : 6);
+	const at = rest.lastIndexOf("@");
+	// https carries no user in the URL, ever; ssh may name one.
+	if (at !== -1 && !lower.startsWith("ssh://")) return GIT_URL_FIELD_ERROR;
+	const hostPort = at === -1 ? rest : rest.slice(at + 1);
+	const slash = hostPort.indexOf("/");
+	const path = slash === -1 ? "" : hostPort.slice(slash + 1);
+	if (
+		!/^[A-Za-z0-9.-]+(:[0-9]+)?$/.test(
+			slash === -1 ? hostPort : hostPort.slice(0, slash),
+		) ||
+		!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*(\/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$/.test(
+			path,
+		)
+	)
+		return GIT_URL_FIELD_ERROR;
+	return null;
+};
+
 const gitUrlProblem = (raw: string): string | null => {
 	const url = raw.trim();
 	if (url === "") return null; // the input's required check covers empty
 	if (url.startsWith("-") || /[\s\p{Cc}]/u.test(url))
 		return GIT_URL_FIELD_ERROR;
 	const lower = url.toLowerCase();
-	if (lower.startsWith("https://") || lower.startsWith("ssh://")) {
-		const rest = url.slice(lower.startsWith("https://") ? 8 : 6);
-		const at = rest.lastIndexOf("@");
-		// https carries no user in the URL, ever; ssh may name one.
-		if (at !== -1 && !lower.startsWith("ssh://")) return GIT_URL_FIELD_ERROR;
-		const hostPort = at === -1 ? rest : rest.slice(at + 1);
-		const slash = hostPort.indexOf("/");
-		const path = slash === -1 ? "" : hostPort.slice(slash + 1);
-		if (
-			!/^[A-Za-z0-9.-]+(:[0-9]+)?$/.test(
-				slash === -1 ? hostPort : hostPort.slice(0, slash),
-			) ||
-			!/^[A-Za-z0-9_-][A-Za-z0-9_.-]*(\/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$/.test(
-				path,
-			)
-		)
-			return GIT_URL_FIELD_ERROR;
-		return null;
-	}
+	if (lower.startsWith("https://") || lower.startsWith("ssh://"))
+		return gitUrlSchemeProblem(url, lower);
 	// scp form: user@host:path; the path is relative (no leading slash).
 	return /^([A-Za-z0-9_.-]+)@([A-Za-z0-9.-]+):(?!\/)\S+$/.test(url)
 		? null
@@ -11429,6 +13662,1258 @@ export function boardFlipSig(tasks: readonly TaskCard[]): string {
 	return tasks.map((t) => `${t.id}:${t.stage}`).join(" ");
 }
 
+/** Measure every rendered card's position so the FLIP effect can fly it between lanes. */
+function measureCards(): {
+	next: Map<string, CardPos>;
+	els: Map<string, HTMLElement>;
+} {
+	const next = new Map<string, CardPos>();
+	const els = new Map<string, HTMLElement>();
+	for (const el of document.querySelectorAll<HTMLElement>(
+		".card[data-task-id]",
+	)) {
+		const id = el.dataset.taskId as string;
+		const r = el.getBoundingClientRect();
+		next.set(id, {
+			stage: el.dataset.stage as string,
+			left: r.left,
+			top: r.top,
+		});
+		els.set(id, el);
+	}
+	return { next, els };
+}
+
+/** A fresh follow-up starts where its done parent sits, so it visibly grows out of that card. */
+function applyOriginFlight(
+	origin: { current: { id: string; from: string } | null },
+	flights: Map<string, { dx: number; dy: number }>,
+	els: Map<string, HTMLElement>,
+	prev: Map<string, CardPos>,
+	next: Map<string, CardPos>,
+): void {
+	const org = origin.current;
+	if (org === null) return;
+	const el = els.get(org.id);
+	const pos = next.get(org.id);
+	const src = prev.get(org.from);
+	if (el === undefined || pos === undefined || src === undefined) return;
+	flights.set(org.id, {
+		dx: src.left - pos.left,
+		dy: src.top - pos.top,
+	});
+	origin.current = null;
+}
+
+/** Fly the changed cards between lanes and fade the fresh ones in; reduced motion gets the fade only. */
+function animateBoardChanges(
+	els: Map<string, HTMLElement>,
+	flights: Map<string, { dx: number; dy: number }>,
+	fresh: ReadonlySet<string>,
+): void {
+	if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+		// No movement under reduced motion; the appearance itself still gets a fade.
+		for (const id of fresh)
+			els.get(id)?.animate([{ opacity: "0" }, { opacity: "1" }], {
+				duration: 180,
+				easing: "ease-out",
+			});
+		return;
+	}
+	for (const [id, f] of flights) {
+		const el = els.get(id);
+		if (el === undefined) continue;
+		el.style.zIndex = "3";
+		el.animate(
+			[
+				{ transform: `translate(${f.dx}px, ${f.dy}px)` },
+				{ transform: "translate(0, 0)" },
+			],
+			{
+				duration: 340,
+				easing: "cubic-bezier(0.2, 0.7, 0.3, 1)", // --ease; WAAPI options don't resolve var()
+			},
+		).finished.then(
+			() => {
+				el.style.zIndex = "";
+			},
+			() => {
+				el.style.zIndex = "";
+			},
+		);
+	}
+	// Fresh cards whose parent is off screen rise in place instead.
+	for (const id of fresh) {
+		const el = els.get(id);
+		if (el === undefined || flights.has(id)) continue;
+		el.animate(
+			[
+				{ opacity: "0", transform: "translateY(8px)" },
+				{ opacity: "1", transform: "translateY(0)" },
+			],
+			{
+				duration: 220,
+				easing: "cubic-bezier(0.2, 0.7, 0.3, 1)", // --ease
+			},
+		);
+	}
+}
+
+/** Shared guard for the single-letter board shortcuts: true while a modifier, a modal or a text field holds the key. */
+function shortcutInert(
+	e: KeyboardEvent,
+	key: string,
+	blocked: boolean,
+): boolean {
+	if (e.key !== key && e.key !== key.toUpperCase()) return true;
+	if (e.ctrlKey || e.metaKey || e.altKey) return true;
+	if (blocked) return true;
+	if (
+		e.target instanceof HTMLElement &&
+		e.target.closest("input, textarea, select, [contenteditable]")
+	)
+		return true;
+	return false;
+}
+
+/** The board's per-render view selection: the active project (or System/Settings route),
+ * the card the drawer shows, and hosted mode. Pure reads, so the drawer sheet and the
+ * keyboard shortcuts see the same values as the JSX below. */
+function appViewSelection(
+	state: StateResponse | null,
+	view: string,
+	projects: ProjectView[],
+	selectedId: string | null,
+	tasks: TaskCard[],
+	bootHosted: boolean,
+): {
+	hosted: boolean;
+	onSystem: boolean;
+	project: ProjectView | null;
+	settingsRoute: { onSettings: boolean; project: string | null };
+	overviewCurrent: boolean;
+	selected: TaskCard | null;
+	selectedProject: ProjectView | null;
+} {
+	// Hosted mode (docs/specs/hosted-mode.md): the control plane owns the host, so the System
+	// view, the update notices and the identity pages stay hidden.
+	const hosted = bootHosted || state?.hosted === true;
+	// The System view's view string shares the namespace of project names, like "settings":
+	// on /system no project is current. Hosted mode has no System view: /system is a plain view.
+	const onSystem = !hosted && view === SYSTEM_VIEW;
+	const project = onSystem
+		? null
+		: (projects.find((p) => p.name === view) ?? null);
+	const settingsRoute = settingsSub(view);
+	const overviewCurrent =
+		project === null && !settingsRoute.onSettings && !onSystem;
+	const selected =
+		selectedId === null
+			? null
+			: (tasks.find((t) => t.id === selectedId) ?? null);
+	const selectedProject =
+		selected === null
+			? null
+			: (projects.find((p) => p.name === selected.project) ?? null);
+	return {
+		hosted,
+		onSystem,
+		project,
+		settingsRoute,
+		overviewCurrent,
+		selected,
+		selectedProject,
+	};
+}
+
+/** Server-frame notice fields the board's inbox and banner read; defaults while the
+ * first frame is still loading. */
+function appServerNotices(state: StateResponse | null): {
+	draining: boolean;
+	drainCommits: string[];
+	warnings: string[];
+	orphanList: OrphanProcess[];
+	orphansError: string | null;
+	keptCount: { held: number; stale: number };
+} {
+	// An update holds new turns (scripts/update-image.ts): queued cards wait for the restart.
+	const draining = (state?.drainUntil ?? null) !== null;
+	const drainCommits = state?.drainCommits ?? [];
+	// Advisory from the server: unseeded agent layer, provider without an active sign-in.
+	const warnings = state?.warnings ?? [];
+	const orphanList = state?.orphans ?? [];
+	const orphansError = state?.orphansError ?? null;
+	const keptCount = state?.keptWorktrees ?? { held: 0, stale: 0 };
+	return {
+		draining,
+		drainCommits,
+		warnings,
+		orphanList,
+		orphansError,
+		keptCount,
+	};
+}
+
+/** Update-banner values: how far behind the board is, the pending commits, the restart
+ * wait, and the provider sign-in advisories. Hosted mode drops the host-owned ones. */
+function appUpdateNotices(
+	hosted: boolean,
+	update: { behind: number; commits: string[] } | null,
+	state: StateResponse | null,
+): {
+	behind: number;
+	behindCommits: string[];
+	restartWait: RestartWaitView | null;
+	signinAdvisories: DeadSignIn[];
+} {
+	// Shared notification lines: the inbox panel renders the same content the
+	// entries are keyed from, so rows and keys cannot drift apart.
+	const behind = hosted || update === null ? 0 : Math.max(update.behind, 0);
+	const behindCommits = update === null ? [] : update.commits;
+	// OTTR-625: the update task holds the restart until the running turns finish, because
+	// the board runs an older commit than the image it built.
+	const restartWait = hosted ? null : (state?.restartWait ?? null);
+	const signinAdvisories = hosted ? [] : (state?.deadSignIns ?? []);
+	return { behind, behindCommits, restartWait, signinAdvisories };
+}
+
+/** Inbox entry keys for the board's notice lines: occurrence keys so a recurrence
+ * counts as new. shortKey hashes a long body (an error text, an id list), so no key
+ * outgrows the seen route's limit. */
+function appNoticeKeys(
+	state: StateResponse | null,
+	coveredUpdates: Map<string, TaskCard>,
+	error: string | null,
+	notice: string | null,
+	hosted: boolean,
+	behind: number,
+	restartWait: RestartWaitView | null,
+	draining: boolean,
+	orphanList: OrphanProcess[],
+	orphansError: string | null,
+	keptCount: { held: number; stale: number },
+	nowMs: number,
+): {
+	updateIds: string[];
+	updateCount: number;
+	critKey: string | null;
+	noticeKey: string | null;
+	drainNotice: boolean;
+	drainKey: string | null;
+	behindKey: string | null;
+	restartWaitKey: string | null;
+	updatesKey: string | null;
+	orphansErrorKey: string | null;
+	orphansKey: string | null;
+	keptKey: string | null;
+	alatePendingKey: string | null;
+} {
+	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
+	/** Actionable upstream updates (rows with a pin target); drives the inbox entry (U5). */
+	const updateIds =
+		state?.updates?.rows
+			.filter((r) => r.target !== null && !coveredUpdates.has(r.id))
+			.map((r) => r.id) ?? [];
+	const updateCount = updateIds.length;
+	const critKey = error !== null ? shortKey("crit", error) : null;
+	const noticeKey = notice !== null ? shortKey("notice", notice) : null;
+	// Cards still name the hold in their status line; hosted mode drops only the inbox notice.
+	const drainNotice = draining && !hosted;
+	const drainKey = drainNotice ? `drain:${state?.drainUntil}` : null;
+	const behindKey = behind > 0 ? `behind:${behind}` : null;
+	// `since` in the key: a new wait (a later image) counts as new again.
+	const restartWaitKey =
+		restartWait !== null ? `restart-wait:${restartWait.since}` : null;
+	const updatesKey =
+		updateCount > 0 ? shortKey("updates", updateIds.join(",")) : null;
+	const orphansErrorKey =
+		orphansError !== null ? shortKey("orphans-error", orphansError) : null;
+	const orphansKey =
+		orphanList.length > 0
+			? shortKey("orphans", orphanList.map((o) => o.pid).join(","))
+			: null;
+	const keptKey =
+		keptCount.held > 0 ? `kept:${keptCount.held}:${keptCount.stale}` : null;
+	// Hosted mode: Alate and provider sign-ins are the operator's, so neither notice shows.
+	const alatePendingKey = hosted
+		? null
+		: alatePendingEntry(state?.alatePendingSince ?? null, nowMs);
+	return {
+		updateIds,
+		updateCount,
+		critKey,
+		noticeKey,
+		drainNotice,
+		drainKey,
+		behindKey,
+		restartWaitKey,
+		updatesKey,
+		orphansErrorKey,
+		orphansKey,
+		keptKey,
+		alatePendingKey,
+	};
+}
+
+/** What the bell and the notification popover read; the shape inboxView returns. */
+type InboxSummary = {
+	total: number;
+	fresh: InboxEntry[];
+	lit: boolean;
+	level: InboxLevel | null;
+};
+
+/** The board's inbox: one entry per panel row, most urgent first, plus the bell's
+ * tooltip lines. `inboxSeen` is the server's shared list plus this tab's pending acks. */
+function appInboxMeta(
+	state: StateResponse | null,
+	ackLocal: ReadonlySet<string>,
+	error: string | null,
+	critKey: string | null,
+	needTasks: TaskCard[],
+	askCards: TaskCard[],
+	prActivity: TaskCard[],
+	infoKeys: (string | null)[],
+	warnings: string[],
+	alarmCount: number,
+	alarmLine: string,
+): {
+	inboxSeen: ReadonlySet<string>;
+	entries: InboxEntry[];
+	inbox: InboxSummary;
+	inboxSig: string;
+	inboxTitle: string;
+	inboxName: string;
+} {
+	/** Acknowledged inbox entry keys: the server's shared list plus this tab's pending acks. */
+	const inboxSeen: ReadonlySet<string> = new Set([
+		...(state?.inboxSeen ?? []),
+		...ackLocal,
+	]);
+	const entries: InboxEntry[] = [
+		...(critKey === null ? [] : [{ key: critKey, level: "crit" as const }]),
+		...needTasks.map((t) => ({
+			key: taskEntryKey(t),
+			level: "needs" as const,
+		})),
+		...prActivity.map((t) => ({
+			key: `pr:${t.id}:${t.prOccurrence?.comments}`,
+			level: "needs" as const,
+		})),
+		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),
+		...infoKeys
+			.filter((key) => key !== null)
+			.map((key) => ({ key, level: "info" as const })),
+	];
+	const inbox = inboxView(entries, inboxSeen);
+	const inboxSig = JSON.stringify(entries.map((e) => e.key));
+	// Bell tooltip summary: one error, then the alarm split, then the remaining notices.
+	const infoCount = entries.filter((e) => e.level === "info").length;
+	const inboxSummary = [
+		error !== null ? "1 error" : null,
+		warnings.length > 0
+			? `${warnings.length} warning${warnings.length === 1 ? "" : "s"}`
+			: null,
+		alarmCount > 0 ? alarmLine : null,
+		infoCount > 0 ? `${infoCount} notice${infoCount === 1 ? "" : "s"}` : null,
+	]
+		.filter((p) => p !== null)
+		.join(" · ");
+	const inboxTitle =
+		inboxSummary === "" ? "Notifications" : `Notifications: ${inboxSummary}`;
+	const inboxName = inbox.lit
+		? `Notifications, ${inbox.fresh.length} new of ${inbox.total}`
+		: inbox.total > 0
+			? `Notifications, ${inbox.total}`
+			: "Notifications, all clear";
+	return { inboxSeen, entries, inbox, inboxSig, inboxTitle, inboxName };
+}
+
+/** The bell button and its screen-reader summary line. */
+function AppInboxBell({
+	inbox,
+	inboxTitle,
+	inboxName,
+}: {
+	inbox: InboxSummary;
+	inboxTitle: string;
+	inboxName: string;
+}) {
+	return (
+		<>
+			<button
+				type="button"
+				className={inbox.lit ? "icon inbox lit" : "icon inbox"}
+				data-level={inbox.level ?? undefined}
+				popoverTarget="inbox"
+				title={inboxTitle}
+				aria-label={inboxName}
+			>
+				<Icon name="bell" />
+				{inbox.total > 0 && (
+					<span className="inbox-n">
+						{inbox.lit ? inbox.fresh.length : inbox.total}
+						{inbox.lit && <span className="inbox-new"> new</span>}
+					</span>
+				)}
+			</button>
+			<span className="sr" role="status">
+				{inbox.fresh.length > 0
+					? `${inbox.fresh.length} new notification${inbox.fresh.length === 1 ? "" : "s"}`
+					: ""}
+			</span>
+		</>
+	);
+}
+
+/** The board's notification popover: critical line, alarm groups, the upstream-updates
+ * entry, notices, advisories, and the ack footer. */
+function AppInboxPanel(p: {
+	error: string | null;
+	critKey: string | null;
+	needTasks: TaskCard[];
+	askCards: TaskCard[];
+	prActivity: TaskCard[];
+	alarmCount: number;
+	updatesKey: string | null;
+	updateCount: number;
+	isNew: (key: string) => boolean;
+	notice: string | null;
+	noticeKey: string | null;
+	orphansError: string | null;
+	drainNotice: boolean;
+	drainKey: string | null;
+	drainCommits: string[];
+	behind: number;
+	behindKey: string | null;
+	behindCommits: string[];
+	restartWait: RestartWaitView | null;
+	restartWaitKey: string | null;
+	state: StateResponse | null;
+	warnings: string[];
+	orphanList: OrphanProcess[];
+	orphansErrorKey: string | null;
+	orphansKey: string | null;
+	keptCount: { held: number; stale: number };
+	keptKey: string | null;
+	alatePendingKey: string | null;
+	signinAdvisories: DeadSignIn[];
+	projects: ProjectView[];
+	nowMs: number;
+	openTask: (id: string) => void;
+	entries: InboxEntry[];
+	inbox: InboxSummary;
+	ackInbox: (keys: string[]) => void;
+	setShowUpdates: (v: boolean) => void;
+	setError: (v: string | null) => void;
+	setNotice: (v: string | null) => void;
+}) {
+	const {
+		error,
+		critKey,
+		needTasks,
+		askCards,
+		prActivity,
+		alarmCount,
+		updatesKey,
+		updateCount,
+		isNew,
+		notice,
+		noticeKey,
+		orphansError,
+		drainNotice,
+		drainKey,
+		drainCommits,
+		behind,
+		behindKey,
+		behindCommits,
+		restartWait,
+		restartWaitKey,
+		state,
+		warnings,
+		orphanList,
+		orphansErrorKey,
+		orphansKey,
+		keptCount,
+		keptKey,
+		alatePendingKey,
+		signinAdvisories,
+		projects,
+		nowMs,
+		openTask,
+		entries,
+		inbox,
+		ackInbox,
+		setShowUpdates,
+		setError,
+		setNotice,
+	} = p;
+	const critLine =
+		error !== null ? (
+			<p className="notif-line" data-inbox-key={critKey ?? undefined}>
+				<Mark kind="crit" />
+				<span>{error}</span>
+				{critKey !== null && isNew(critKey) && (
+					<span className="new-tag">New</span>
+				)}
+				<button
+					type="button"
+					className="icon"
+					aria-label="Dismiss error"
+					onClick={() => setError(null)}
+				>
+					<Icon name="x" />
+				</button>
+			</p>
+		) : null;
+	const alarmList =
+		alarmCount > 0
+			? [
+					{ heading: "Action required", tasks: needTasks },
+					{ heading: "Questions", tasks: askCards },
+					{
+						heading: "PR review activity",
+						tasks: prActivity,
+						prKey: true,
+					},
+				]
+					.filter((g) => g.tasks.length > 0)
+					.map((g) => (
+						<section key={g.heading}>
+							<h2>
+								{g.heading} · {g.tasks.length}
+							</h2>
+							<ul className="alarm-list">
+								{g.tasks.map((t) => {
+									const owner = projects.find((p) => p.name === t.project);
+									const key = g.prKey
+										? `pr:${t.id}:${t.prOccurrence?.comments}`
+										: taskEntryKey(t);
+									return (
+										<li key={t.id} data-inbox-key={key}>
+											<a
+												className="alarm-link"
+												href={taskPath(t.project, t.id)}
+												onClick={(e) => {
+													navClick(e, () => openTask(t.id));
+													// Hides the inbox panel; hiding a closed one is a no-op.
+													document.getElementById("inbox")?.hidePopover();
+												}}
+											>
+												<Mark kind={cardMark(t)} />
+												<span className="alarm-project">
+													{owner === undefined
+														? t.project
+														: projectLabel(owner)}
+												</span>
+												<span className="alarm-key" title={`Task ${t.id}`}>
+													{t.id}
+												</span>
+												<span className="alarm-title">
+													{t.sessionTitle ?? t.title}
+												</span>
+												{isNew(key) && <span className="new-tag">New</span>}
+											</a>
+										</li>
+									);
+								})}
+							</ul>
+						</section>
+					))
+			: null;
+	return (
+		<div id="inbox" popover="auto" className="popover notif-pop inbox-pop">
+			{critLine !== null && (
+				<section>
+					<h2>Critical</h2>
+					{critLine}
+				</section>
+			)}
+			{alarmList}
+			{updatesKey !== null && (
+				<section>
+					<h2>Upstream updates</h2>
+					<ul className="alarm-list">
+						<li data-inbox-key={updatesKey}>
+							<button
+								type="button"
+								className="alarm-link"
+								onClick={() => {
+									document.getElementById("inbox")?.hidePopover();
+									setShowUpdates(true);
+								}}
+							>
+								<Icon name="download" size={14} />
+								<span className="alarm-title">
+									{updateCount} update
+									{updateCount === 1 ? "" : "s"} ready to review
+								</span>
+								{isNew(updatesKey) && <span className="new-tag">New</span>}
+							</button>
+						</li>
+					</ul>
+				</section>
+			)}
+			<AppInfoLines
+				notice={notice}
+				noticeKey={noticeKey}
+				drainNotice={drainNotice}
+				drainKey={drainKey}
+				drainCommits={drainCommits}
+				behind={behind}
+				behindKey={behindKey}
+				behindCommits={behindCommits}
+				restartWait={restartWait}
+				restartWaitKey={restartWaitKey}
+				isNew={isNew}
+				setNotice={setNotice}
+			/>
+			<AppAdvisoryLines
+				state={state}
+				warnings={warnings}
+				orphanList={orphanList}
+				orphansError={orphansError}
+				orphansErrorKey={orphansErrorKey}
+				orphansKey={orphansKey}
+				keptCount={keptCount}
+				keptKey={keptKey}
+				alatePendingKey={alatePendingKey}
+				signinAdvisories={signinAdvisories}
+				nowMs={nowMs}
+				openTask={openTask}
+				isNew={isNew}
+			/>
+			{inbox.total === 0 && (
+				<section>
+					<h2>All clear</h2>
+					<p className="hint">
+						Tasks that need you, failed actions and Ottr notices appear here.
+					</p>
+				</section>
+			)}
+			{inbox.total > 0 && (
+				<div className="inbox-foot">
+					<button
+						type="button"
+						disabled={!inbox.lit}
+						onClick={() => ackInbox(entries.map((e) => e.key))}
+					>
+						Mark all as read
+					</button>
+				</div>
+			)}
+		</div>
+	);
+}
+
+/** The upstream version notice and the pending commit list. */
+function AppBehindNotice(p: {
+	behind: number;
+	behindKey: string | null;
+	behindCommits: string[];
+	isNew: (key: string) => boolean;
+}) {
+	const { behind, behindKey, behindCommits, isNew } = p;
+	return (
+		behind > 0 && (
+			<>
+				<p className="notif-line" data-inbox-key={behindKey ?? undefined}>
+					<Icon name="info" size={16} />
+					<span>
+						A new Ottr version is available ({behind} commit
+						{behind === 1 ? "" : "s"}). Stop the server, run{" "}
+						<code>bun run update</code>, then start it again.
+					</span>
+					{behindKey !== null && isNew(behindKey) && (
+						<span className="new-tag">New</span>
+					)}
+				</p>
+				{behindCommits.length > 0 && (
+					<ul className="notif-commits">
+						{behindCommits.map((c) => (
+							<li key={c}>{c}</li>
+						))}
+					</ul>
+				)}
+			</>
+		)
+	);
+}
+
+/** The notices section: the running notice, the drain hold, the upstream version
+ * notice and the restart wait. Null while none applies. */
+function AppInfoLines(p: {
+	notice: string | null;
+	noticeKey: string | null;
+	drainNotice: boolean;
+	drainKey: string | null;
+	drainCommits: string[];
+	behind: number;
+	behindKey: string | null;
+	behindCommits: string[];
+	restartWait: RestartWaitView | null;
+	restartWaitKey: string | null;
+	isNew: (key: string) => boolean;
+	setNotice: (v: string | null) => void;
+}) {
+	const {
+		notice,
+		noticeKey,
+		drainNotice,
+		drainKey,
+		drainCommits,
+		behind,
+		behindKey,
+		behindCommits,
+		restartWait,
+		restartWaitKey,
+		isNew,
+		setNotice,
+	} = p;
+	if (!(notice !== null || behind > 0 || drainNotice || restartWait !== null))
+		return null;
+	return (
+		<section>
+			<h2>Notices</h2>
+			{notice !== null && (
+				<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
+					<Icon name="info" size={16} />
+					<span>{notice}</span>
+					{noticeKey !== null && isNew(noticeKey) && (
+						<span className="new-tag">New</span>
+					)}
+					<button
+						type="button"
+						className="icon"
+						aria-label="Dismiss notice"
+						onClick={() => setNotice(null)}
+					>
+						<Icon name="x" />
+					</button>
+				</p>
+			)}
+			{drainNotice && (
+				<>
+					<p className="notif-line" data-inbox-key={drainKey ?? undefined}>
+						<Icon name="info" size={16} />
+						<span>
+							An Ottr update is ready. New turns wait until the running turns
+							finish and Ottr restarts.
+						</span>
+						{drainKey !== null && isNew(drainKey) && (
+							<span className="new-tag">New</span>
+						)}
+					</p>
+					{drainCommits.length > 0 && (
+						<ul className="notif-commits">
+							{drainCommits.map((c) => (
+								<li key={c}>{c}</li>
+							))}
+						</ul>
+					)}
+				</>
+			)}
+			<AppBehindNotice
+				behind={behind}
+				behindKey={behindKey}
+				behindCommits={behindCommits}
+				isNew={isNew}
+			/>
+			<RestartWaitLine
+				wait={restartWait}
+				inboxKey={restartWaitKey ?? undefined}
+				fresh={restartWaitKey !== null && isNew(restartWaitKey)}
+			/>
+		</section>
+	);
+}
+
+/** The kept-worktree backlog line: cancelled cards still holding a worktree. */
+function AppKeptNotice(p: {
+	keptCount: { held: number; stale: number };
+	keptKey: string | null;
+	isNew: (key: string) => boolean;
+}) {
+	const { keptCount, keptKey, isNew } = p;
+	return (
+		keptCount.held > 0 && (
+			<p className="notif-line" data-inbox-key={keptKey ?? undefined}>
+				<Icon name="info" size={16} />
+				<span>
+					{keptCount.held} cancelled card
+					{keptCount.held === 1 ? "" : "s"} still hold
+					{keptCount.held === 1 ? "s" : ""} a worktree
+					{keptCount.stale > 0
+						? `, ${keptCount.stale} past the quarantine threshold`
+						: ""}
+					.
+				</span>
+				{keptKey !== null && isNew(keptKey) && (
+					<span className="new-tag">New</span>
+				)}
+			</p>
+		)
+	);
+}
+
+/** The advisories section: orphan agent processes, the kept-worktree backlog, an
+ * alate import that has waited too long, and disabled provider sign-ins. The tracker
+ * reports them; it never kills processes, deletes worktrees, or runs provisioning on
+ * its own. Null while none applies. */
+function AppAdvisoryLines(p: {
+	state: StateResponse | null;
+	warnings: string[];
+	orphanList: OrphanProcess[];
+	orphansError: string | null;
+	orphansErrorKey: string | null;
+	orphansKey: string | null;
+	keptCount: { held: number; stale: number };
+	keptKey: string | null;
+	alatePendingKey: string | null;
+	signinAdvisories: DeadSignIn[];
+	nowMs: number;
+	openTask: (id: string) => void;
+	isNew: (key: string) => boolean;
+}) {
+	const {
+		state,
+		warnings,
+		orphanList,
+		orphansError,
+		orphansErrorKey,
+		orphansKey,
+		keptCount,
+		keptKey,
+		alatePendingKey,
+		signinAdvisories,
+		nowMs,
+		openTask,
+		isNew,
+	} = p;
+	if (
+		state === null ||
+		(orphanList.length === 0 &&
+			keptCount.held === 0 &&
+			orphansError === null &&
+			alatePendingKey === null &&
+			signinAdvisories.length === 0 &&
+			warnings.length === 0)
+	)
+		return null;
+	return (
+		<section>
+			<h2>Advisories</h2>
+			<WarningLines warnings={warnings} />
+			{orphansError !== null && (
+				<p className="notif-line" data-inbox-key={orphansErrorKey ?? undefined}>
+					<Icon name="info" size={16} />
+					<span>
+						Orphan scan failed: {orphansError} — the agent process list may be
+						empty because no scan succeeded.
+					</span>
+					{orphansErrorKey !== null && isNew(orphansErrorKey) && (
+						<span className="new-tag">New</span>
+					)}
+				</p>
+			)}
+			{orphanList.length > 0 && (
+				<OrphanNotice
+					orphans={orphanList}
+					fresh={orphansKey !== null && isNew(orphansKey)}
+					nowMs={nowMs}
+					openTask={openTask}
+					inboxKey={orphansKey ?? undefined}
+				/>
+			)}
+			<AppKeptNotice keptCount={keptCount} keptKey={keptKey} isNew={isNew} />
+			{alatePendingKey !== null && (
+				<p className="notif-line" data-inbox-key={alatePendingKey}>
+					<Icon name="info" size={16} />
+					<span>
+						Alate is waiting to provision an import.{" "}
+						<button
+							type="button"
+							className="notif-link"
+							onClick={() => openSettingsSection("alate-section")}
+						>
+							Open settings
+						</button>
+					</span>
+					{isNew(alatePendingKey) && <span className="new-tag">New</span>}
+				</p>
+			)}
+			{signinAdvisories.map((d) => (
+				<p
+					className="notif-line"
+					key={`signin:${d.provider}`}
+					data-inbox-key={`signin:${d.provider}`}
+				>
+					<Icon name="info" size={16} />
+					<span>
+						{d.provider}'s sign-in is disabled — {d.cause}. Used by the{" "}
+						{d.roles.join(", ")} model role{d.roles.length === 1 ? "" : "s"}.{" "}
+						<button
+							type="button"
+							className="notif-link"
+							onClick={() => openSettingsSection("signin-section")}
+						>
+							Open settings
+						</button>
+					</span>
+					{isNew(`signin:${d.provider}`) && (
+						<span className="new-tag">New</span>
+					)}
+				</p>
+			))}
+		</section>
+	);
+}
+
+/** The bar's rail fold button: a click shortcut for the "[" keyboard fold. */
+function AppRailToggle({
+	railCollapsed,
+	toggleRail,
+}: {
+	railCollapsed: boolean;
+	toggleRail: () => void;
+}) {
+	return (
+		<button
+			type="button"
+			className="icon rail-toggle"
+			aria-expanded={!railCollapsed}
+			aria-keyshortcuts="["
+			aria-label={railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"}
+			title={`${railCollapsed ? "Expand" : "Collapse"} the sidebar ([)`}
+			onClick={toggleRail}
+		>
+			<Icon name="panel-left" />
+		</button>
+	);
+}
+
+/** The account menu (rail chip on phones, bar button everywhere): identity, settings
+ * link, theme radios, sign out. */
+function AppUserMenu({
+	hosted,
+	state,
+	theme,
+	setTheme,
+	sysLight,
+	navigate,
+	act,
+}: {
+	hosted: boolean;
+	state: StateResponse | null;
+	theme: Theme;
+	setTheme: (t: Theme) => void;
+	sysLight: boolean;
+	navigate: (path: string) => void;
+	act: Act;
+}) {
+	return (
+		<div id="user-menu" popover="auto" className="user-menu">
+			{!hosted && (
+				<p className="menu-who">
+					{state?.user == null
+						? "Local access, no login"
+						: `Signed in as ${state.user}`}
+				</p>
+			)}
+			<a
+				className="menu-row"
+				href={settingsPath(null)}
+				onClick={(e) => {
+					navClick(e, navigate);
+					document.getElementById("user-menu")?.hidePopover();
+				}}
+			>
+				<Icon name="gear" size={14} />
+				Settings
+			</a>
+			{/* Phones only: the bar has no room for the theme button there. */}
+			<fieldset className="menu-theme">
+				<legend className="sr">Theme</legend>
+				<hr />
+				{THEME_ORDER.map((t) => (
+					<button
+						key={t}
+						type="button"
+						className="menu-row"
+						aria-pressed={theme === t}
+						onClick={() => setTheme(t)}
+					>
+						<Icon name={THEME_META[t].icon} size={14} />
+						{t === "system"
+							? `${THEME_META[t].label} (${THEME_META[sysLight ? "light" : "dark"].label})`
+							: THEME_META[t].label}
+						{theme === t && <Icon name="check" size={14} />}
+					</button>
+				))}
+			</fieldset>
+			{state?.user != null && !hosted && (
+				<>
+					<hr />
+					<button
+						type="button"
+						className="menu-row"
+						// act surfaces a failed POST as an error; only a confirmed logout reloads.
+						onClick={() => void act(logOut)}
+					>
+						<Icon name="log-out" size={14} />
+						Sign out
+					</button>
+				</>
+			)}
+		</div>
+	);
+}
+
+/** The board's main pane: skeleton while loading, then the Settings/System/Overview/
+ * project view the URL asks for. */
+function AppMainContent(p: {
+	state: StateResponse | null;
+	view: string;
+	hosted: boolean;
+	settingsRoute: { onSettings: boolean; project: string | null };
+	onSystem: boolean;
+	project: ProjectView | null;
+	projects: ProjectView[];
+	tasks: TaskCard[];
+	seenAnswers: Set<string>;
+	deltas: Map<string, number>;
+	act: Act;
+	openTask: (id: string) => void;
+	navigate: (path: string) => void;
+	setComposeFor: (v: string | null) => void;
+	setDraftFor: (v: string | null) => void;
+	setNotice: (v: string | null) => void;
+	setShowAdd: (v: boolean) => void;
+	draining: boolean;
+	tick: number;
+}) {
+	const {
+		state,
+		view,
+		hosted,
+		settingsRoute,
+		onSystem,
+		project,
+		projects,
+		tasks,
+		seenAnswers,
+		deltas,
+		act,
+		openTask,
+		navigate,
+		setComposeFor,
+		setDraftFor,
+		setNotice,
+		setShowAdd,
+		draining,
+		tick,
+	} = p;
+	return state === null ? (
+		<Skeleton shape="list" rows={6} label="Loading the board" />
+	) : settingsRoute.onSettings ? (
+		<SettingsPage
+			projects={projects}
+			tasks={tasks}
+			maxTotal={state.maxTotal}
+			reviewCheck={state.reviewCheck}
+			workCheck={state.workCheck}
+			idleReviews={state.idleReviews}
+			trendingScan={state.trendingScan}
+			commitIdentity={state.commitIdentity}
+			trendingStatus={state.trendingStatus}
+			act={act}
+			view={view}
+			openTask={openTask}
+			hosted={hosted}
+		/>
+	) : onSystem ? (
+		<SystemView state={state} openTask={openTask} />
+	) : project === null ? (
+		<Overview
+			projects={projects}
+			tasks={tasks}
+			compose={setComposeFor}
+			onAdd={() => setShowAdd(true)}
+			openTask={openTask}
+			navigate={navigate}
+		/>
+	) : (
+		<ProjectBoard
+			key={project.name}
+			project={project}
+			tasks={tasks.filter((t) => t.project === project.name)}
+			foreignDeps={depIndexOf(projects, tasks, project)}
+			deltas={deltas}
+			open={openTask}
+			seenAnswers={seenAnswers}
+			compose={() => {
+				if (project.gitless) return;
+				setComposeFor(project.name);
+			}}
+			composeDraft={() => {
+				if (project.gitless) return;
+				setDraftFor(project.name);
+			}}
+			act={act}
+			onNotice={setNotice}
+			draining={draining}
+			tick={tick}
+		/>
+	);
+}
+
+/** The task drawer and its frozen exit sheet: mounted only while a card and its
+ * project are selected. */
+function AppDrawer(p: {
+	selected: TaskCard | null;
+	selectedProject: ProjectView | null;
+	sheet: { task: TaskCard; project: ProjectView } | null;
+	state: StateResponse | null;
+	projects: ProjectView[];
+	tasks: TaskCard[];
+	deltas: Map<string, number>;
+	draining: boolean;
+	usedTotal: number;
+	seenAnswers: ReadonlySet<string>;
+	origin: React.RefObject<{ id: string; from: string } | null>;
+	act: Act;
+	openTask: (id: string) => void;
+	markSeen: (t: TaskCard | null | undefined) => void;
+	markUnread: (t: TaskCard | null | undefined) => void;
+	closeDrawer: () => void;
+}) {
+	const {
+		selected,
+		selectedProject,
+		sheet,
+		state,
+		projects,
+		tasks,
+		deltas,
+		draining,
+		usedTotal,
+		seenAnswers,
+		origin,
+		act,
+		openTask,
+		markSeen,
+		markUnread,
+		closeDrawer,
+	} = p;
+	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
+	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
+	const drawerTask = selected ?? sheet?.task ?? null;
+	const drawerProject = selectedProject ?? sheet?.project ?? null;
+	if (drawerTask === null || drawerProject === null) return null;
+	return (
+		<Drawer
+			key={drawerTask.id}
+			open={selected !== null}
+			task={drawerTask}
+			project={drawerProject}
+			projects={projects}
+			delta={deltas.get(drawerTask.id)}
+			tasks={tasks.filter(
+				(t) =>
+					t.project === drawerProject.name ||
+					(drawerTask.followUpOf !== null &&
+						drawerTask.followUpOfProject !== null &&
+						t.id === drawerTask.followUpOf &&
+						t.project === drawerTask.followUpOfProject) ||
+					(t.followUpOf === drawerTask.id &&
+						t.followUpOfProject === drawerTask.project),
+			)}
+			onOpenTask={openTask}
+			draining={draining}
+			usedTotal={usedTotal}
+			maxTotal={state?.maxTotal ?? null}
+			act={act}
+			read={seenable(drawerTask) && seenAnswers.has(drawerTask.id)}
+			onMarkUnread={() => {
+				if (selected === null) return; // the deferred native close after an app-driven close
+				void markUnread(selected);
+				closeDrawer(); // close so the board shows the card unread; onClose would re-mark it read
+			}}
+			onMarkSeen={() => {
+				if (selected !== null) markSeen(selected);
+			}}
+			onClose={() => {
+				if (selected === null) return; // same deferred close; do not re-mark it read
+				// An answer that landed while the drawer was open counts as read.
+				if (autoMarkOnOpen(selected)) markSeen(selected);
+				closeDrawer();
+			}}
+			onFollowed={(id, from) => {
+				origin.current = { id, from };
+				closeDrawer(); // close the drawer so the board shows the follow-up fly in
+			}}
+		/>
+	);
+}
+
+/** Board-level overlays: the add-project modal, the upstream-updates panel and the
+ * offline banner. */
+function AppOverlays(p: {
+	showAdd: boolean;
+	showUpdates: boolean;
+	offline: boolean;
+	state: StateResponse | null;
+	tasks: TaskCard[];
+	act: Act;
+	openTask: (id: string) => void;
+	setShowAdd: (v: boolean) => void;
+	setShowUpdates: (v: boolean) => void;
+	setNotice: (v: string | null) => void;
+}) {
+	const {
+		showAdd,
+		showUpdates,
+		offline,
+		state,
+		tasks,
+		act,
+		openTask,
+		setShowAdd,
+		setShowUpdates,
+		setNotice,
+	} = p;
+	return (
+		<>
+			{showAdd && (
+				<AddProjectModal
+					act={act}
+					onClose={() => setShowAdd(false)}
+					onAdded={(i) => setNotice(interviewMsg(i))}
+					openTask={openTask}
+				/>
+			)}
+
+			{showUpdates && (
+				<UpdatesPanel
+					updates={state?.updates ?? null}
+					tasks={tasks}
+					act={act}
+					openTask={openTask}
+					onClose={() => setShowUpdates(false)}
+				/>
+			)}
+
+			{/* Server down kills the whole board, so the warning is a banner, not a bar notice. */}
+			{offline && (
+				<div className="conn-banner" role="status">
+					<Mark kind="crit" />
+					<span>Server connection lost. Retrying…</span>
+				</div>
+			)}
+		</>
+	);
+}
+
 /** The whole board. Exported for the DOM tests; index.html is its only real consumer. */
 export function App() {
 	// One-time client migration: an old hash URL becomes its path URL before the first
@@ -11453,12 +14938,6 @@ export function App() {
 	const tasks = state?.tasks ?? [];
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
 	const coveredUpdates = coveredUpdateIds(tasks);
-	/** Actionable upstream updates (rows with a pin target); drives the inbox entry (U5). */
-	const updateIds =
-		state?.updates?.rows
-			.filter((r) => r.target !== null && !coveredUpdates.has(r.id))
-			.map((r) => r.id) ?? [];
-	const updateCount = updateIds.length;
 	/** Only a card with something to read (an answer, a PR review) counts as seen: opening
 	 * a card before that lands must not hide the "new" badge it earns. */
 	const markSeen = useCallback((t: TaskCard | null | undefined) => {
@@ -11569,13 +15048,6 @@ export function App() {
 	const [ackLocal, setAckLocal] = useState<ReadonlySet<string>>(
 		() => new Set(),
 	);
-	/** Acknowledged inbox entry keys: the server's shared list plus this tab's pending acks. */
-	const inboxSeen: ReadonlySet<string> = new Set([
-		...(state?.inboxSeen ?? []),
-		...ackLocal,
-	]);
-	/** "New" = not acknowledged yet. */
-	const isNew = (key: string): boolean => !inboxSeen.has(key);
 	/** Bumped every 30 s so relative ages re-render; the memoized cards read it as their tick. */
 	const [clockTick, setClockTick] = useState(0);
 	const [update, setUpdate] = useState<{
@@ -11855,84 +15327,14 @@ export function App() {
 		if (sig === flipKey.current.sig && path === flipKey.current.path) return;
 		flipKey.current = { sig, path };
 		const prev = cardPos.current;
-		const next = new Map<string, CardPos>();
-		const els = new Map<string, HTMLElement>();
-		for (const el of document.querySelectorAll<HTMLElement>(
-			".card[data-task-id]",
-		)) {
-			const id = el.dataset.taskId as string;
-			const r = el.getBoundingClientRect();
-			next.set(id, {
-				stage: el.dataset.stage as string,
-				left: r.left,
-				top: r.top,
-			});
-			els.set(id, el);
-		}
+		const { next, els } = measureCards();
 		cardPos.current = next;
 		const fresh = freshTaskIds(seenIds.current, state.tasks);
 		seenIds.current = new Set(state.tasks.map((t) => t.id));
 		const flights = stageFlights(prev, next);
 		// A fresh follow-up starts where its done parent sits, so it visibly grows out of that card.
-		const org = origin.current;
-		if (org !== null) {
-			const el = els.get(org.id);
-			const pos = next.get(org.id);
-			const src = prev.get(org.from);
-			if (el !== undefined && pos !== undefined && src !== undefined) {
-				flights.set(org.id, {
-					dx: src.left - pos.left,
-					dy: src.top - pos.top,
-				});
-				origin.current = null;
-			}
-		}
-		if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-			// No movement under reduced motion; the appearance itself still gets a fade.
-			for (const id of fresh)
-				els.get(id)?.animate([{ opacity: "0" }, { opacity: "1" }], {
-					duration: 180,
-					easing: "ease-out",
-				});
-			return;
-		}
-		for (const [id, f] of flights) {
-			const el = els.get(id);
-			if (el === undefined) continue;
-			el.style.zIndex = "3";
-			el.animate(
-				[
-					{ transform: `translate(${f.dx}px, ${f.dy}px)` },
-					{ transform: "translate(0, 0)" },
-				],
-				{
-					duration: 340,
-					easing: "cubic-bezier(0.2, 0.7, 0.3, 1)", // --ease; WAAPI options don't resolve var()
-				},
-			).finished.then(
-				() => {
-					el.style.zIndex = "";
-				},
-				() => {
-					el.style.zIndex = "";
-				},
-			);
-		}
-		// Fresh cards whose parent is off screen rise in place instead.
-		for (const id of fresh) {
-			const el = els.get(id);
-			if (el === undefined || flights.has(id)) continue;
-			el.animate(
-				[
-					{ opacity: "0", transform: "translateY(8px)" },
-					{ opacity: "1", transform: "translateY(0)" },
-				],
-				{
-					duration: 220,
-					easing: "cubic-bezier(0.2, 0.7, 0.3, 1)", // --ease
-				},
-			);
-		}
+		applyOriginFlight(origin, flights, els, prev, next);
+		animateBoardChanges(els, flights, fresh);
 	}, [state, view]);
 
 	const act = useCallback(
@@ -11961,22 +15363,15 @@ export function App() {
 	// project tracks ottr-ai/ottr (that project holds the check card). Put it behind a release
 	// switch once Ottr ships releases.
 	const checkProject = mapRepo("ottr-ai/ottr", projects);
-	// Hosted mode (docs/specs/hosted-mode.md): the control plane owns the host, so the System
-	// view, the update notices and the identity pages stay hidden.
-	const hosted = bootHosted || state?.hosted === true;
-	// The System view's view string shares the namespace of project names, like "settings":
-	// on /system no project is current. Hosted mode has no System view: /system is a plain view.
-	const onSystem = !hosted && view === SYSTEM_VIEW;
-	const project = onSystem
-		? null
-		: (projects.find((p) => p.name === view) ?? null);
-	const settingsRoute = settingsSub(view);
-	const overviewCurrent =
-		project === null && !settingsRoute.onSettings && !onSystem;
-	const selected =
-		selectedId === null
-			? null
-			: (tasks.find((t) => t.id === selectedId) ?? null);
+	const {
+		hosted,
+		onSystem,
+		project,
+		settingsRoute,
+		overviewCurrent,
+		selected,
+		selectedProject,
+	} = appViewSelection(state, view, projects, selectedId, tasks, bootHosted);
 	// OTTR-566: an open drawer is the read event for the rail's done dot, whatever opened it
 	// (a card click, a pasted/deep-link URL, or the task finishing while its drawer is open).
 	// doneUnread checks seenAnswers, so a mark already made is not posted again.
@@ -11984,10 +15379,6 @@ export function App() {
 		if (selected !== null && doneUnread(selected, seenAnswers, seenDoneSince))
 			markDoneRead(selected);
 	}, [selected, seenAnswers, seenDoneSince, markDoneRead]);
-	const selectedProject =
-		selected === null
-			? null
-			: (projects.find((p) => p.name === selected.project) ?? null);
 	/** The drawer task+project a close froze; held while the exit animation plays, then dropped. */
 	const [sheet, setSheet] = useState<{
 		task: TaskCard;
@@ -11995,8 +15386,6 @@ export function App() {
 	} | null>(null);
 	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
 	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
-	const drawerTask = selected ?? sheet?.task ?? null;
-	const drawerProject = selectedProject ?? sheet?.project ?? null;
 	useEffect(() => {
 		if (selected !== null && selectedProject !== null) {
 			setSheet((s) =>
@@ -12057,287 +15446,46 @@ export function App() {
 		prActivity.length,
 	);
 	const alarmCount = needsShown.length + askCards.length + prActivity.length;
-
-	// Shared notification lines: the inbox panel renders the same content the
-	// entries are keyed from, so rows and keys cannot drift apart.
-	const behind = hosted || update === null ? 0 : Math.max(update.behind, 0);
-	const behindCommits = update === null ? [] : update.commits;
-	// An update holds new turns (scripts/update-image.ts): queued cards wait for the restart.
-	const draining = (state?.drainUntil ?? null) !== null;
-	const drainCommits = state?.drainCommits ?? [];
-	// OTTR-625: the update task holds the restart until the running turns finish, because
-	// the board runs an older commit than the image it built.
-	const restartWait = hosted ? null : (state?.restartWait ?? null);
-	// Advisory from the server: unseeded agent layer, provider without an active sign-in.
-	const warnings = state?.warnings ?? [];
-	const orphanList = state?.orphans ?? [];
-	const orphansError = state?.orphansError ?? null;
-	const keptCount = state?.keptWorktrees ?? { held: 0, stale: 0 };
+	const {
+		draining,
+		drainCommits,
+		warnings,
+		orphanList,
+		orphansError,
+		keptCount,
+	} = appServerNotices(state);
+	const { behind, behindCommits, restartWait, signinAdvisories } =
+		appUpdateNotices(hosted, update, state);
 	// Occurrence keys of the inbox entries; null when the source is absent. shortKey hashes a
 	// long body (an error text, an id list), so no key outgrows the seen route's limit.
-	const critKey = error !== null ? shortKey("crit", error) : null;
-	const noticeKey = notice !== null ? shortKey("notice", notice) : null;
-	// Cards still name the hold in their status line; hosted mode drops only the inbox notice.
-	const drainNotice = draining && !hosted;
-	const drainKey = drainNotice ? `drain:${state?.drainUntil}` : null;
-	const behindKey = behind > 0 ? `behind:${behind}` : null;
-	// `since` in the key: a new wait (a later image) counts as new again.
-	const restartWaitKey =
-		restartWait !== null ? `restart-wait:${restartWait.since}` : null;
-	const updatesKey =
-		updateCount > 0 ? shortKey("updates", updateIds.join(",")) : null;
-	const orphansErrorKey =
-		orphansError !== null ? shortKey("orphans-error", orphansError) : null;
-	const orphansKey =
-		orphanList.length > 0
-			? shortKey("orphans", orphanList.map((o) => o.pid).join(","))
-			: null;
-	const keptKey =
-		keptCount.held > 0 ? `kept:${keptCount.held}:${keptCount.stale}` : null;
-	const critLine =
-		error !== null ? (
-			<p className="notif-line" data-inbox-key={critKey ?? undefined}>
-				<Mark kind="crit" />
-				<span>{error}</span>
-				{critKey !== null && isNew(critKey) && (
-					<span className="new-tag">New</span>
-				)}
-				<button
-					type="button"
-					className="icon"
-					aria-label="Dismiss error"
-					onClick={() => setError(null)}
-				>
-					<Icon name="x" />
-				</button>
-			</p>
-		) : null;
-	const alarmList =
-		alarmCount > 0
-			? [
-					{ heading: "Action required", tasks: needsShown },
-					{ heading: "Questions", tasks: askCards },
-					{
-						heading: "PR review activity",
-						tasks: prActivity,
-						prKey: true,
-					},
-				]
-					.filter((g) => g.tasks.length > 0)
-					.map((g) => (
-						<section key={g.heading}>
-							<h2>
-								{g.heading} · {g.tasks.length}
-							</h2>
-							<ul className="alarm-list">
-								{g.tasks.map((t) => {
-									const owner = projects.find((p) => p.name === t.project);
-									const key = g.prKey
-										? `pr:${t.id}:${t.prOccurrence?.comments}`
-										: taskEntryKey(t);
-									return (
-										<li key={t.id} data-inbox-key={key}>
-											<a
-												className="alarm-link"
-												href={taskPath(t.project, t.id)}
-												onClick={(e) => {
-													navClick(e, () => openTask(t.id));
-													// Hides the inbox panel; hiding a closed one is a no-op.
-													document.getElementById("inbox")?.hidePopover();
-												}}
-											>
-												<Mark kind={cardMark(t)} />
-												<span className="alarm-project">
-													{owner === undefined
-														? t.project
-														: projectLabel(owner)}
-												</span>
-												<span className="alarm-key" title={`Task ${t.id}`}>
-													{t.id}
-												</span>
-												<span className="alarm-title">
-													{t.sessionTitle ?? t.title}
-												</span>
-												{isNew(key) && <span className="new-tag">New</span>}
-											</a>
-										</li>
-									);
-								})}
-							</ul>
-						</section>
-					))
-			: null;
-	const infoLines =
-		notice !== null || behind > 0 || drainNotice || restartWait !== null ? (
-			<>
-				{notice !== null && (
-					<p className="notif-line" data-inbox-key={noticeKey ?? undefined}>
-						<Icon name="info" size={16} />
-						<span>{notice}</span>
-						{noticeKey !== null && isNew(noticeKey) && (
-							<span className="new-tag">New</span>
-						)}
-						<button
-							type="button"
-							className="icon"
-							aria-label="Dismiss notice"
-							onClick={() => setNotice(null)}
-						>
-							<Icon name="x" />
-						</button>
-					</p>
-				)}
-				{drainNotice && (
-					<>
-						<p className="notif-line" data-inbox-key={drainKey ?? undefined}>
-							<Icon name="info" size={16} />
-							<span>
-								An Ottr update is ready. New turns wait until the running turns
-								finish and Ottr restarts.
-							</span>
-							{drainKey !== null && isNew(drainKey) && (
-								<span className="new-tag">New</span>
-							)}
-						</p>
-						{drainCommits.length > 0 && (
-							<ul className="notif-commits">
-								{drainCommits.map((c) => (
-									<li key={c}>{c}</li>
-								))}
-							</ul>
-						)}
-					</>
-				)}
-				{behind > 0 && (
-					<>
-						<p className="notif-line" data-inbox-key={behindKey ?? undefined}>
-							<Icon name="info" size={16} />
-							<span>
-								A new Ottr version is available ({behind} commit
-								{behind === 1 ? "" : "s"}). Stop the server, run{" "}
-								<code>bun run update</code>, then start it again.
-							</span>
-							{behindKey !== null && isNew(behindKey) && (
-								<span className="new-tag">New</span>
-							)}
-						</p>
-						{behindCommits.length > 0 && (
-							<ul className="notif-commits">
-								{behindCommits.map((c) => (
-									<li key={c}>{c}</li>
-								))}
-							</ul>
-						)}
-					</>
-				)}
-				<RestartWaitLine
-					wait={restartWait}
-					inboxKey={restartWaitKey ?? undefined}
-					fresh={restartWaitKey !== null && isNew(restartWaitKey)}
-				/>
-			</>
-		) : null;
-	// Advisory lines: orphan agent processes, the kept-worktree backlog, and an alate import
-	// that has waited too long. The tracker reports them; it never kills processes, deletes
-	// worktrees, or runs provisioning on its own.
 	const nowMs = Date.now();
-	// Hosted mode: Alate and provider sign-ins are the operator's, so neither notice shows.
-	const alatePendingKey = hosted
-		? null
-		: alatePendingEntry(state?.alatePendingSince ?? null, nowMs);
-	const signinAdvisories = hosted ? [] : (state?.deadSignIns ?? []);
-	const advisoryLines =
-		state === null ||
-		(orphanList.length === 0 &&
-			keptCount.held === 0 &&
-			orphansError === null &&
-			alatePendingKey === null &&
-			signinAdvisories.length === 0 &&
-			warnings.length === 0) ? null : (
-			<>
-				<WarningLines warnings={warnings} />
-				{orphansError !== null && (
-					<p
-						className="notif-line"
-						data-inbox-key={orphansErrorKey ?? undefined}
-					>
-						<Icon name="info" size={16} />
-						<span>
-							Orphan scan failed: {orphansError} — the agent process list may be
-							empty because no scan succeeded.
-						</span>
-						{orphansErrorKey !== null && isNew(orphansErrorKey) && (
-							<span className="new-tag">New</span>
-						)}
-					</p>
-				)}
-				{orphanList.length > 0 && (
-					<OrphanNotice
-						orphans={orphanList}
-						fresh={orphansKey !== null && isNew(orphansKey)}
-						nowMs={nowMs}
-						openTask={openTask}
-						inboxKey={orphansKey ?? undefined}
-					/>
-				)}
-				{keptCount.held > 0 && (
-					<p className="notif-line" data-inbox-key={keptKey ?? undefined}>
-						<Icon name="info" size={16} />
-						<span>
-							{keptCount.held} cancelled card
-							{keptCount.held === 1 ? "" : "s"} still hold
-							{keptCount.held === 1 ? "s" : ""} a worktree
-							{keptCount.stale > 0
-								? `, ${keptCount.stale} past the quarantine threshold`
-								: ""}
-							.
-						</span>
-						{keptKey !== null && isNew(keptKey) && (
-							<span className="new-tag">New</span>
-						)}
-					</p>
-				)}
-				{alatePendingKey !== null && (
-					<p className="notif-line" data-inbox-key={alatePendingKey}>
-						<Icon name="info" size={16} />
-						<span>
-							Alate is waiting to provision an import.{" "}
-							<button
-								type="button"
-								className="notif-link"
-								onClick={() => openSettingsSection("alate-section")}
-							>
-								Open settings
-							</button>
-						</span>
-						{isNew(alatePendingKey) && <span className="new-tag">New</span>}
-					</p>
-				)}
-				{signinAdvisories.map((d) => (
-					<p
-						className="notif-line"
-						key={`signin:${d.provider}`}
-						data-inbox-key={`signin:${d.provider}`}
-					>
-						<Icon name="info" size={16} />
-						<span>
-							{d.provider}'s sign-in is disabled — {d.cause}. Used by the{" "}
-							{d.roles.join(", ")} model role{d.roles.length === 1 ? "" : "s"}.{" "}
-							<button
-								type="button"
-								className="notif-link"
-								onClick={() => openSettingsSection("signin-section")}
-							>
-								Open settings
-							</button>
-						</span>
-						{isNew(`signin:${d.provider}`) && (
-							<span className="new-tag">New</span>
-						)}
-					</p>
-				))}
-			</>
-		);
+	const {
+		updateCount,
+		critKey,
+		noticeKey,
+		drainNotice,
+		drainKey,
+		behindKey,
+		restartWaitKey,
+		updatesKey,
+		orphansErrorKey,
+		orphansKey,
+		keptKey,
+		alatePendingKey,
+	} = appNoticeKeys(
+		state,
+		coveredUpdates,
+		error,
+		notice,
+		hosted,
+		behind,
+		restartWait,
+		draining,
+		orphanList,
+		orphansError,
+		keptCount,
+		nowMs,
+	);
 	// One inbox entry per panel row, most urgent first; the bell and the New chips read it.
 	const infoKeys = [
 		updatesKey,
@@ -12351,42 +15499,22 @@ export function App() {
 		alatePendingKey,
 		...signinAdvisories.map((d) => `signin:${d.provider}` as const),
 	];
-	const entries: InboxEntry[] = [
-		...(critKey === null ? [] : [{ key: critKey, level: "crit" as const }]),
-		...needsShown.map((t) => ({
-			key: taskEntryKey(t),
-			level: "needs" as const,
-		})),
-		...prActivity.map((t) => ({
-			key: `pr:${t.id}:${t.prOccurrence?.comments}`,
-			level: "needs" as const,
-		})),
-		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),
-		...infoKeys
-			.filter((key) => key !== null)
-			.map((key) => ({ key, level: "info" as const })),
-	];
-	const inbox = inboxView(entries, inboxSeen);
-	const inboxSig = JSON.stringify(entries.map((e) => e.key));
-	// Bell tooltip summary: one error, then the alarm split, then the remaining notices.
-	const infoCount = entries.filter((e) => e.level === "info").length;
-	const inboxSummary = [
-		error !== null ? "1 error" : null,
-		warnings.length > 0
-			? `${warnings.length} warning${warnings.length === 1 ? "" : "s"}`
-			: null,
-		alarmCount > 0 ? alarmLine : null,
-		infoCount > 0 ? `${infoCount} notice${infoCount === 1 ? "" : "s"}` : null,
-	]
-		.filter((p) => p !== null)
-		.join(" · ");
-	const inboxTitle =
-		inboxSummary === "" ? "Notifications" : `Notifications: ${inboxSummary}`;
-	const inboxName = inbox.lit
-		? `Notifications, ${inbox.fresh.length} new of ${inbox.total}`
-		: inbox.total > 0
-			? `Notifications, ${inbox.total}`
-			: "Notifications, all clear";
+	const { inboxSeen, entries, inbox, inboxSig, inboxTitle, inboxName } =
+		appInboxMeta(
+			state,
+			ackLocal,
+			error,
+			critKey,
+			needsShown,
+			askCards,
+			prActivity,
+			infoKeys,
+			warnings,
+			alarmCount,
+			alarmLine,
+		);
+	/** "New" = not acknowledged yet. */
+	const isNew = (key: string): boolean => !inboxSeen.has(key);
 	const updateLoaded = update !== null;
 
 	// The server prunes task-derived keys (task:, done:, error:) itself; the client drops the
@@ -12413,12 +15541,12 @@ export function App() {
 	// N opens New task for the open project; inert while typing or any modal is up.
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent): void => {
-			if (e.key !== "n" && e.key !== "N") return;
-			if (e.ctrlKey || e.metaKey || e.altKey) return;
-			if (composeFor !== null || selectedId !== null || showAdd) return;
 			if (
-				e.target instanceof HTMLElement &&
-				e.target.closest("input, textarea, select, [contenteditable]")
+				shortcutInert(
+					e,
+					"n",
+					composeFor !== null || selectedId !== null || showAdd,
+				)
 			)
 				return;
 			if (project === null || project.gitless) return;
@@ -12432,13 +15560,15 @@ export function App() {
 	// B opens the draft mask for the open project; inert while typing or any modal is up.
 	useEffect(() => {
 		const onKey = (e: KeyboardEvent): void => {
-			if (e.key !== "b" && e.key !== "B") return;
-			if (e.ctrlKey || e.metaKey || e.altKey) return;
-			if (draftFor !== null) return;
-			if (composeFor !== null || selectedId !== null || showAdd) return;
 			if (
-				e.target instanceof HTMLElement &&
-				e.target.closest("input, textarea, select, [contenteditable]")
+				shortcutInert(
+					e,
+					"b",
+					draftFor !== null ||
+						composeFor !== null ||
+						selectedId !== null ||
+						showAdd,
+				)
 			)
 				return;
 			if (project === null || project.gitless) return;
@@ -12487,19 +15617,7 @@ export function App() {
 						onPick={() => document.getElementById("areas-pop")?.hidePopover()}
 					/>
 				</div>
-				<button
-					type="button"
-					className="icon rail-toggle"
-					aria-expanded={!railCollapsed}
-					aria-keyshortcuts="["
-					aria-label={
-						railCollapsed ? "Expand the sidebar" : "Collapse the sidebar"
-					}
-					title={`${railCollapsed ? "Expand" : "Collapse"} the sidebar ([)`}
-					onClick={toggleRail}
-				>
-					<Icon name="panel-left" />
-				</button>
+				<AppRailToggle railCollapsed={railCollapsed} toggleRail={toggleRail} />
 				<a className="brand" href="/">
 					<img src={logo} alt="" />
 					<span>Ottr</span>
@@ -12536,92 +15654,51 @@ export function App() {
 						<Icon name="activity" />
 					</button>
 				)}
-				<button
-					type="button"
-					className={inbox.lit ? "icon inbox lit" : "icon inbox"}
-					data-level={inbox.level ?? undefined}
-					popoverTarget="inbox"
-					title={inboxTitle}
-					aria-label={inboxName}
-				>
-					<Icon name="bell" />
-					{inbox.total > 0 && (
-						<span className="inbox-n">
-							{inbox.lit ? inbox.fresh.length : inbox.total}
-							{inbox.lit && <span className="inbox-new"> new</span>}
-						</span>
-					)}
-				</button>
-				<span className="sr" role="status">
-					{inbox.fresh.length > 0
-						? `${inbox.fresh.length} new notification${inbox.fresh.length === 1 ? "" : "s"}`
-						: ""}
-				</span>
-				<div id="inbox" popover="auto" className="popover notif-pop inbox-pop">
-					{critLine !== null && (
-						<section>
-							<h2>Critical</h2>
-							{critLine}
-						</section>
-					)}
-					{alarmList}
-					{updatesKey !== null && (
-						<section>
-							<h2>Upstream updates</h2>
-							<ul className="alarm-list">
-								<li data-inbox-key={updatesKey}>
-									<button
-										type="button"
-										className="alarm-link"
-										onClick={() => {
-											document.getElementById("inbox")?.hidePopover();
-											setShowUpdates(true);
-										}}
-									>
-										<Icon name="download" size={14} />
-										<span className="alarm-title">
-											{updateCount} update
-											{updateCount === 1 ? "" : "s"} ready to review
-										</span>
-										{isNew(updatesKey) && <span className="new-tag">New</span>}
-									</button>
-								</li>
-							</ul>
-						</section>
-					)}
-					{infoLines !== null && (
-						<section>
-							<h2>Notices</h2>
-							{infoLines}
-						</section>
-					)}
-					{advisoryLines !== null && (
-						<section>
-							<h2>Advisories</h2>
-							{advisoryLines}
-						</section>
-					)}
-					{inbox.total === 0 && (
-						<section>
-							<h2>All clear</h2>
-							<p className="hint">
-								Tasks that need you, failed actions and Ottr notices appear
-								here.
-							</p>
-						</section>
-					)}
-					{inbox.total > 0 && (
-						<div className="inbox-foot">
-							<button
-								type="button"
-								disabled={!inbox.lit}
-								onClick={() => ackInbox(entries.map((e) => e.key))}
-							>
-								Mark all as read
-							</button>
-						</div>
-					)}
-				</div>
+				<AppInboxBell
+					inbox={inbox}
+					inboxTitle={inboxTitle}
+					inboxName={inboxName}
+				/>
+				<AppInboxPanel
+					error={error}
+					critKey={critKey}
+					needTasks={needsShown}
+					askCards={askCards}
+					prActivity={prActivity}
+					alarmCount={alarmCount}
+					updatesKey={updatesKey}
+					updateCount={updateCount}
+					isNew={isNew}
+					notice={notice}
+					noticeKey={noticeKey}
+					drainNotice={drainNotice}
+					drainKey={drainKey}
+					drainCommits={drainCommits}
+					behind={behind}
+					behindKey={behindKey}
+					behindCommits={behindCommits}
+					restartWait={restartWait}
+					restartWaitKey={restartWaitKey}
+					state={state}
+					warnings={warnings}
+					orphanList={orphanList}
+					orphansError={orphansError}
+					orphansErrorKey={orphansErrorKey}
+					orphansKey={orphansKey}
+					keptCount={keptCount}
+					keptKey={keptKey}
+					alatePendingKey={alatePendingKey}
+					signinAdvisories={signinAdvisories}
+					projects={projects}
+					nowMs={nowMs}
+					openTask={openTask}
+					entries={entries}
+					inbox={inbox}
+					ackInbox={ackInbox}
+					setShowUpdates={setShowUpdates}
+					setError={setError}
+					setNotice={setNotice}
+				/>
 				{/* Desktop keeps theme in the bar; phones reach it through the account menu. */}
 				<button
 					type="button"
@@ -12718,114 +15795,38 @@ export function App() {
 						</button>
 					</RailRows>
 				</nav>
-				<div id="user-menu" popover="auto" className="user-menu">
-					{!hosted && (
-						<p className="menu-who">
-							{state?.user == null
-								? "Local access, no login"
-								: `Signed in as ${state.user}`}
-						</p>
-					)}
-					<a
-						className="menu-row"
-						href={settingsPath(null)}
-						onClick={(e) => {
-							navClick(e, navigate);
-							document.getElementById("user-menu")?.hidePopover();
-						}}
-					>
-						<Icon name="gear" size={14} />
-						Settings
-					</a>
-					{/* Phones only: the bar has no room for the theme button there. */}
-					<fieldset className="menu-theme">
-						<legend className="sr">Theme</legend>
-						<hr />
-						{THEME_ORDER.map((t) => (
-							<button
-								key={t}
-								type="button"
-								className="menu-row"
-								aria-pressed={theme === t}
-								onClick={() => setTheme(t)}
-							>
-								<Icon name={THEME_META[t].icon} size={14} />
-								{t === "system"
-									? `${THEME_META[t].label} (${THEME_META[sysLight ? "light" : "dark"].label})`
-									: THEME_META[t].label}
-								{theme === t && <Icon name="check" size={14} />}
-							</button>
-						))}
-					</fieldset>
-					{state?.user != null && !hosted && (
-						<>
-							<hr />
-							<button
-								type="button"
-								className="menu-row"
-								// act surfaces a failed POST as an error; only a confirmed logout reloads.
-								onClick={() => void act(logOut)}
-							>
-								<Icon name="log-out" size={14} />
-								Sign out
-							</button>
-						</>
-					)}
-				</div>
+				<AppUserMenu
+					hosted={hosted}
+					state={state}
+					theme={theme}
+					setTheme={setTheme}
+					sysLight={sysLight}
+					navigate={navigate}
+					act={act}
+				/>
 
 				<main className="main">
-					{state === null ? (
-						<Skeleton shape="list" rows={6} label="Loading the board" />
-					) : settingsRoute.onSettings ? (
-						<SettingsPage
-							projects={projects}
-							tasks={tasks}
-							maxTotal={state.maxTotal}
-							reviewCheck={state.reviewCheck}
-							workCheck={state.workCheck}
-							idleReviews={state.idleReviews}
-							trendingScan={state.trendingScan}
-							commitIdentity={state.commitIdentity}
-							trendingStatus={state.trendingStatus}
-							act={act}
-							view={view}
-							openTask={openTask}
-							hosted={hosted}
-						/>
-					) : onSystem ? (
-						<SystemView state={state} openTask={openTask} />
-					) : project === null ? (
-						<Overview
-							projects={projects}
-							tasks={tasks}
-							compose={setComposeFor}
-							onAdd={() => setShowAdd(true)}
-							openTask={openTask}
-							navigate={navigate}
-						/>
-					) : (
-						<ProjectBoard
-							key={project.name}
-							project={project}
-							tasks={tasks.filter((t) => t.project === project.name)}
-							foreignDeps={depIndexOf(projects, tasks, project)}
-							deltas={deltas}
-							open={openTask}
-							seenAnswers={seenAnswers}
-							compose={() => {
-								if (project.gitless) return;
-								setComposeFor(project.name);
-							}}
-							composeDraft={() => {
-								if (project.gitless) return;
-								setDraftFor(project.name);
-							}}
-							act={act}
-							onNotice={setNotice}
-							draining={draining}
-							tick={clockTick}
-						/>
-					)}
+					<AppMainContent
+						state={state}
+						view={view}
+						hosted={hosted}
+						settingsRoute={settingsRoute}
+						onSystem={onSystem}
+						project={project}
+						projects={projects}
+						tasks={tasks}
+						seenAnswers={seenAnswers}
+						deltas={deltas}
+						act={act}
+						openTask={openTask}
+						navigate={navigate}
+						setComposeFor={setComposeFor}
+						setDraftFor={setDraftFor}
+						setNotice={setNotice}
+						setShowAdd={setShowAdd}
+						draining={draining}
+						tick={clockTick}
+					/>
 				</main>
 			</div>
 
@@ -12849,77 +15850,37 @@ export function App() {
 				/>
 			))}
 
-			{drawerTask !== null && drawerProject !== null && (
-				<Drawer
-					key={drawerTask.id}
-					open={selected !== null}
-					task={drawerTask}
-					project={drawerProject}
-					projects={projects}
-					delta={deltas.get(drawerTask.id)}
-					tasks={tasks.filter(
-						(t) =>
-							t.project === drawerProject.name ||
-							(drawerTask.followUpOf !== null &&
-								drawerTask.followUpOfProject !== null &&
-								t.id === drawerTask.followUpOf &&
-								t.project === drawerTask.followUpOfProject) ||
-							(t.followUpOf === drawerTask.id &&
-								t.followUpOfProject === drawerTask.project),
-					)}
-					onOpenTask={openTask}
-					draining={draining}
-					usedTotal={usedTotal}
-					maxTotal={state?.maxTotal ?? null}
-					act={act}
-					read={seenable(drawerTask) && seenAnswers.has(drawerTask.id)}
-					onMarkUnread={() => {
-						if (selected === null) return; // the deferred native close after an app-driven close
-						void markUnread(selected);
-						closeDrawer(); // close so the board shows the card unread; onClose would re-mark it read
-					}}
-					onMarkSeen={() => {
-						if (selected !== null) markSeen(selected);
-					}}
-					onClose={() => {
-						if (selected === null) return; // same deferred close; do not re-mark it read
-						// An answer that landed while the drawer was open counts as read.
-						if (autoMarkOnOpen(selected)) markSeen(selected);
-						closeDrawer();
-					}}
-					onFollowed={(id, from) => {
-						origin.current = { id, from };
-						closeDrawer(); // close the drawer so the board shows the follow-up fly in
-					}}
-				/>
-			)}
+			<AppDrawer
+				selected={selected}
+				selectedProject={selectedProject}
+				sheet={sheet}
+				state={state}
+				projects={projects}
+				tasks={tasks}
+				deltas={deltas}
+				draining={draining}
+				usedTotal={usedTotal}
+				seenAnswers={seenAnswers}
+				origin={origin}
+				act={act}
+				openTask={openTask}
+				markSeen={markSeen}
+				markUnread={markUnread}
+				closeDrawer={closeDrawer}
+			/>
 
-			{showAdd && (
-				<AddProjectModal
-					act={act}
-					onClose={() => setShowAdd(false)}
-					onAdded={(i) => setNotice(interviewMsg(i))}
-					openTask={openTask}
-				/>
-			)}
-
-			{showUpdates && (
-				<UpdatesPanel
-					updates={state?.updates ?? null}
-					tasks={tasks}
-					act={act}
-					openTask={openTask}
-					onClose={() => setShowUpdates(false)}
-				/>
-			)}
-
-			{/* Server down kills the whole board, so the warning is a banner, not a bar notice. */}
-			{offline && (
-				<div className="conn-banner" role="status">
-					<Mark kind="crit" />
-					<span>Server connection lost. Retrying…</span>
-				</div>
-			)}
+			<AppOverlays
+				showAdd={showAdd}
+				showUpdates={showUpdates}
+				offline={offline}
+				state={state}
+				tasks={tasks}
+				act={act}
+				openTask={openTask}
+				setShowAdd={setShowAdd}
+				setShowUpdates={setShowUpdates}
+				setNotice={setNotice}
+			/>
 		</HostedContext.Provider>
 	);
 }
@@ -12927,5 +15888,7 @@ export function App() {
 // typeof document: true in the browser, false under bun test, so UI render tests
 // can import this module without a DOM. (import.meta.main is undefined in a
 // browser bundle, so it cannot drive this check.)
-if (typeof document !== "undefined")
-	createRoot(document.getElementById("root")!).render(<App />);
+if (typeof document !== "undefined") {
+	const root = document.getElementById("root");
+	if (root !== null) createRoot(root).render(<App />);
+}

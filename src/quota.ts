@@ -13,46 +13,67 @@ export function parseUsage(text: string): QuotaLimit[] {
 	if (!Array.isArray(reports))
 		throw new Error("omp usage: no reports in output");
 	const out: QuotaLimit[] = [];
-	// ponytail: two accounts of one provider show as two same-named rows; add the account label if that ever happens.
 	for (const r of reports) {
 		const provider = obj(r).provider;
 		const limits = obj(r).limits;
 		if (typeof provider !== "string" || !Array.isArray(limits)) continue;
-		const planType = obj(obj(r).metadata).planType;
-		const plan =
-			typeof planType === "string" && planType !== "" ? planType : null;
-		const shared = new Set<string>(); // one pool reported per model family (e.g. Antigravity "Claude & GPT"): show it once
-		for (const l of limits) {
-			const group = obj(obj(l).scope).sharedGroup;
-			if (typeof group === "string") {
-				if (shared.has(group)) continue;
-				shared.add(group);
-			}
-			const a = obj(obj(l).amount);
-			const used = num(a.used);
-			const cap = num(a.limit);
-			const fraction =
-				num(a.usedFraction) ??
-				(used !== null && cap !== null && cap > 0 ? used / cap : null);
-			if (fraction === null) continue;
-			const label = obj(l).label;
-			const win = obj(obj(l).window);
-			out.push({
-				provider,
-				label:
-					typeof label === "string" && label !== ""
-						? label
-						: String(win.label ?? "limit"),
-				window: typeof win.id === "string" ? win.id : null,
-				windowLabel:
-					typeof win.label === "string" && win.label !== "" ? win.label : null,
-				plan,
-				usedPct: Math.round(fraction * 1000) / 10,
-				resetsAt: num(win.resetsAt),
-			});
-		}
+		out.push(...reportLimits(r, provider, limits));
 	}
 	return out;
+}
+
+// ponytail: two accounts of one provider show as two same-named rows; add the account label if that ever happens.
+/** One account's limits, in omp's order, deduplicated by shared window group. */
+function reportLimits(
+	r: unknown,
+	provider: string,
+	limits: unknown[],
+): QuotaLimit[] {
+	const planType = obj(obj(r).metadata).planType;
+	const plan =
+		typeof planType === "string" && planType !== "" ? planType : null;
+	const shared = new Set<string>(); // one pool reported per model family (e.g. Antigravity "Claude & GPT"): show it once
+	const rows: QuotaLimit[] = [];
+	for (const l of limits) {
+		const group = obj(obj(l).scope).sharedGroup;
+		if (typeof group === "string") {
+			if (shared.has(group)) continue;
+			shared.add(group);
+		}
+		const row = limitRow(l, provider, plan);
+		if (row !== null) rows.push(row);
+	}
+	return rows;
+}
+
+/** One limit row, or null when it has no usable fraction. */
+function limitRow(
+	l: unknown,
+	provider: string,
+	plan: string | null,
+): QuotaLimit | null {
+	const a = obj(obj(l).amount);
+	const used = num(a.used);
+	const cap = num(a.limit);
+	const fraction =
+		num(a.usedFraction) ??
+		(used !== null && cap !== null && cap > 0 ? used / cap : null);
+	if (fraction === null) return null;
+	const label = obj(l).label;
+	const win = obj(obj(l).window);
+	return {
+		provider,
+		label:
+			typeof label === "string" && label !== ""
+				? label
+				: String(win.label ?? "limit"),
+		window: typeof win.id === "string" ? win.id : null,
+		windowLabel:
+			typeof win.label === "string" && win.label !== "" ? win.label : null,
+		plan,
+		usedPct: Math.round(fraction * 1000) / 10,
+		resetsAt: num(win.resetsAt),
+	};
 }
 
 /** omp provider id of a model selector, e.g. "zai" for "zai/glm-5.3-flash"; null without a slash. */

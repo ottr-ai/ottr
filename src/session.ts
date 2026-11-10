@@ -50,20 +50,29 @@ export function sessionModel(
 	}
 	let model: string | null = null;
 	for (const line of text.split("\n")) {
-		if (!line.startsWith('{"type":"model_change"')) continue;
-		try {
-			const rec: unknown = JSON.parse(line);
-			if (typeof rec !== "object" || rec === null || !("model" in rec))
-				continue;
-			const r = rec as { role?: unknown; resolvedModelIsFallback?: unknown };
-			// Fallback and temporary switches name a model omp will not restore on resume.
-			if (r.role !== undefined && r.role !== "default") continue;
-			if (r.resolvedModelIsFallback === true) continue;
-			if (typeof rec.model === "string" && rec.model.trim() !== "")
-				model = rec.model.trim();
-		} catch {}
+		const m = modelChangeLine(line);
+		if (m !== null) model = m;
 	}
 	return model;
+}
+
+/** The restored model one `model_change` line names, or null when the line names none. */
+function modelChangeLine(line: string): string | null {
+	if (!line.startsWith('{"type":"model_change"')) return null;
+	try {
+		const rec: unknown = JSON.parse(line);
+		if (typeof rec !== "object" || rec === null || !("model" in rec))
+			return null;
+		const r = rec as { role?: unknown; resolvedModelIsFallback?: unknown };
+		// Fallback and temporary switches name a model omp will not restore on resume.
+		if (r.role !== undefined && r.role !== "default") return null;
+		if (r.resolvedModelIsFallback === true) return null;
+		return typeof rec.model === "string" && rec.model.trim() !== ""
+			? rec.model.trim()
+			: null;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -127,6 +136,17 @@ export function sessionContext(
 ): SessionContext | null {
 	const file = sessionFile(dir, sessionId);
 	if (file === null) return null;
+	const lines = tailLines(file);
+	if (lines === null) return null;
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const ctx = contextFromLine(lines[i] ?? "");
+		if (ctx !== null) return ctx;
+	}
+	return null;
+}
+
+/** The file's last ≤1 MiB as lines, dropping a partial first line; null when unreadable. */
+function tailLines(file: string): string[] | null {
 	try {
 		const fd = openSync(file, "r");
 		try {
@@ -137,60 +157,71 @@ export function sessionContext(
 			readSync(fd, buf, 0, len, size - len);
 			const lines = buf.toString("utf8").split("\n");
 			if (len < size) lines.shift(); // first line may be partial
-			for (let i = lines.length - 1; i >= 0; i--) {
-				const line = lines[i] ?? "";
-				if (!line.startsWith('{"type":"mess')) continue;
-				try {
-					const parsed = JSON.parse(line) as {
-						message?: {
-							role?: unknown;
-							provider?: unknown;
-							model?: unknown;
-							completedAt?: unknown;
-							timestamp?: unknown;
-							contextSnapshot?: {
-								promptTokens?: unknown;
-								compactionEpoch?: unknown;
-							};
-						};
-					};
-					const m = parsed.message;
-					const tokens = m?.contextSnapshot?.promptTokens;
-					if (m?.role !== "assistant" || typeof tokens !== "number") continue;
-					const provider =
-						typeof m.provider === "string" && m.provider !== ""
-							? m.provider
-							: null;
-					const model =
-						typeof m.model === "string" && m.model !== "" ? m.model : null;
-					const t = Date.parse(
-						typeof m.completedAt === "string"
-							? m.completedAt
-							: typeof m.timestamp === "string"
-								? m.timestamp
-								: "",
-					);
-					return {
-						promptTokens: tokens,
-						model:
-							provider !== null && model !== null
-								? `${provider}/${model}`
-								: (provider ?? model),
-						compactions:
-							typeof m.contextSnapshot?.compactionEpoch === "number"
-								? m.contextSnapshot.compactionEpoch
-								: 0,
-						at: Number.isFinite(t) ? t : 0,
-					};
-				} catch {}
-			}
-			return null;
+			return lines;
 		} finally {
 			closeSync(fd);
 		}
 	} catch {
 		return null; // unreadable file -> no data
 	}
+}
+
+/** The context snapshot one transcript message line carries, or null when it carries none. */
+function contextFromLine(line: string): SessionContext | null {
+	if (!line.startsWith('{"type":"mess')) return null;
+	try {
+		const parsed = JSON.parse(line) as {
+			message?: {
+				role?: unknown;
+				provider?: unknown;
+				model?: unknown;
+				completedAt?: unknown;
+				timestamp?: unknown;
+				contextSnapshot?: {
+					promptTokens?: unknown;
+					compactionEpoch?: unknown;
+				};
+			};
+		};
+		const m = parsed.message;
+		const tokens = m?.contextSnapshot?.promptTokens;
+		if (m?.role !== "assistant" || typeof tokens !== "number") return null;
+		const provider = messageField(m.provider);
+		const model = messageField(m.model);
+		const t = Date.parse(
+			typeof m.completedAt === "string"
+				? m.completedAt
+				: typeof m.timestamp === "string"
+					? m.timestamp
+					: "",
+		);
+		return {
+			promptTokens: tokens,
+			model: modelSelector(provider, model),
+			compactions:
+				typeof m.contextSnapshot?.compactionEpoch === "number"
+					? m.contextSnapshot.compactionEpoch
+					: 0,
+			at: Number.isFinite(t) ? t : 0,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** A message field that holds a usable string, else null. */
+function messageField(v: unknown): string | null {
+	return typeof v === "string" && v !== "" ? v : null;
+}
+
+/** The `provider/model` selector the message names, or whichever half exists. */
+function modelSelector(
+	provider: string | null,
+	model: string | null,
+): string | null {
+	return provider !== null && model !== null
+		? `${provider}/${model}`
+		: (provider ?? model);
 }
 
 /** The full transcript of one omp session: the main session text plus its subagent files.

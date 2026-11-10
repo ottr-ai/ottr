@@ -1960,7 +1960,7 @@ describe("applyEvent", () => {
 				check: "c",
 			},
 		});
-		expect(s.proposed?.summary?.gain).toBe("g".repeat(399) + "…");
+		expect(s.proposed?.summary?.gain).toBe(`${"g".repeat(399)}…`);
 		expect(s.proposed?.summary?.gain).toHaveLength(400);
 	});
 

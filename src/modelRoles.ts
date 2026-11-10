@@ -102,28 +102,14 @@ interface Entry {
 	tail: string;
 }
 
-/** Locates the block; throws RolesLayoutError for every layout the spec does not support. */
-function scan(text: string) {
-	const lines = splitLines(text);
-	const eol = fileEol(lines);
-	const headers = lines.flatMap((l, i) =>
-		l.body.startsWith("modelRoles:") ? [i] : [],
-	);
-	if (headers.length > 1)
-		throw new RolesLayoutError("config.yml has more than one modelRoles key");
-	if (headers.length === 0) {
-		if ("modelRoles" in parse(text))
-			throw new RolesLayoutError(
-				"modelRoles is not a column-0 block in config.yml",
-			);
-		return { lines, eol, header: -1, indent: "  ", entries: [] as Entry[] };
-	}
-	const header = headers[0] as number;
-	const h = lines[header] as Line;
-	if (!HEADER.test(h.body))
-		throw new RolesLayoutError(
-			"modelRoles must be a block of one-line entries (no flow map or anchor)",
-		);
+/** The block's one-line entries below the header, until a column-0 line ends the block. */
+function scanEntries(
+	lines: Line[],
+	header: number,
+): {
+	entries: Entry[];
+	indent: string;
+} {
 	const entries: Entry[] = [];
 	let indent: string | null = null;
 	for (let i = header + 1; i < lines.length; i++) {
@@ -148,11 +134,37 @@ function scan(text: string) {
 			tail: comment ?? "",
 		});
 	}
+	return { entries, indent: indent ?? "  " };
+}
+
+/** Locates the block; throws RolesLayoutError for every layout the spec does not support. */
+function scan(text: string) {
+	const lines = splitLines(text);
+	const eol = fileEol(lines);
+	const headers = lines.flatMap((l, i) =>
+		l.body.startsWith("modelRoles:") ? [i] : [],
+	);
+	if (headers.length > 1)
+		throw new RolesLayoutError("config.yml has more than one modelRoles key");
+	if (headers.length === 0) {
+		if ("modelRoles" in parse(text))
+			throw new RolesLayoutError(
+				"modelRoles is not a column-0 block in config.yml",
+			);
+		return { lines, eol, header: -1, indent: "  ", entries: [] as Entry[] };
+	}
+	const header = headers[0] as number;
+	const h = lines[header] as Line;
+	if (!HEADER.test(h.body))
+		throw new RolesLayoutError(
+			"modelRoles must be a block of one-line entries (no flow map or anchor)",
+		);
+	const { entries, indent } = scanEntries(lines, header);
 	return {
 		lines,
 		eol: h.eol || eol,
 		header,
-		indent: indent ?? "  ",
+		indent,
 		entries,
 	};
 }
@@ -199,46 +211,25 @@ function chainKeyName(text: string): string {
 	}
 }
 
-/**
- * Locates `retry` and `retry.fallbackChains`; throws RolesLayoutError for every layout of them or
- * of a managed key that the spec does not support. An unmanaged key can have any layout.
- */
-function scanRetry(
-	lines: Line[],
-	doc: Doc,
-	managed: ReadonlySet<string>,
-): RetryScan {
-	const eol = fileEol(lines);
+/** The `retry:` header line, -1 when the file has none; throws when the doc disagrees. */
+function retryHeader(lines: Line[], doc: Doc): number {
 	const headers = lines.flatMap((l, i) =>
 		l.body.startsWith("retry:") ? [i] : [],
 	);
 	if (headers.length > 1)
 		throw new RolesLayoutError("config.yml has more than one retry key");
-	const none: RetryScan = {
-		header: -1,
-		childIndent: "  ",
-		retryLast: -1,
-		chains: -1,
-		chainsLast: -1,
-		keyIndent: null,
-		itemIndent: null,
-		keys: [],
-		eol,
-	};
 	if (headers.length === 0) {
 		if (Object.hasOwn(doc, "retry"))
 			throw new RolesLayoutError("retry is not a column-0 block in config.yml");
-		return none;
 	}
-	const header = headers[0] as number;
-	const retry = doc.retry;
-	if (
-		!RETRY.test((lines[header] as Line).body) ||
-		!(retry === null || isMap(retry))
-	)
-		throw new RolesLayoutError(
-			"retry must be a block map in config.yml (no flow map or anchor)",
-		);
+	return (headers[0] as number) ?? -1;
+}
+
+/** The retry block's child indent, last content line, and the `fallbackChains:` lines. */
+function scanRetryBlock(
+	lines: Line[],
+	header: number,
+): { childIndent: string; retryLast: number; found: number[] } {
 	let ci: string | null = null;
 	let retryLast = header;
 	const found: number[] = [];
@@ -252,35 +243,36 @@ function scanRetry(
 		if (ind === ci && body.slice(ind.length).startsWith("fallbackChains:"))
 			found.push(i);
 	}
-	const childIndent = ci ?? "  ";
-	const scanned = {
-		...none,
-		header,
-		childIndent,
-		retryLast,
-		eol: (lines[header] as Line).eol || eol,
+	return { childIndent: ci ?? "  ", retryLast, found };
+}
+
+/** One `name:` key line under fallbackChains; throws for an unsupported key form. */
+function newChainKey(i: number, ind: string, rest: string): ChainKey {
+	const m = CHAIN_KEY.exec(rest);
+	if (m === null)
+		throw new RolesLayoutError(
+			`unsupported fallbackChains key on line ${i + 1} of config.yml`,
+		);
+	const [, text, after] = m as unknown as [string, string, string];
+	return {
+		index: i,
+		body: [],
+		last: i,
+		name: chainKeyName(text),
+		prefix: `${ind}${text}:`,
+		comment: after,
+		empty: false,
+		value: undefined,
 	};
-	if (found.length > 1)
-		throw new RolesLayoutError(
-			"retry has more than one fallbackChains key in config.yml",
-		);
-	if (found.length === 0) {
-		if (isMap(retry) && Object.hasOwn(retry, "fallbackChains"))
-			throw new RolesLayoutError(
-				"retry.fallbackChains is not a one-line key under retry in config.yml",
-			);
-		return scanned;
-	}
-	const fc = found[0] as number;
-	const value = isMap(retry) ? retry.fallbackChains : undefined;
-	if (
-		!CHAINS.test((lines[fc] as Line).body.slice(childIndent.length)) ||
-		!(value === null || isMap(value))
-	)
-		throw new RolesLayoutError(
-			"retry.fallbackChains must be a block map in config.yml (no flow map or anchor)",
-		);
-	const chains: Doc = value ?? {};
+}
+
+/** The fallbackChains block's keys; throws for every unsupported key layout. */
+function scanChainsKeys(
+	lines: Line[],
+	fc: number,
+	retryLast: number,
+	childIndent: string,
+): { keys: ChainKey[]; ki: string | null; chainsLast: number } {
 	const keys: ChainKey[] = [];
 	let ki: string | null = null;
 	let chainsLast = fc;
@@ -306,23 +298,18 @@ function scanRetry(
 			k.last = i;
 			continue;
 		}
-		const m = CHAIN_KEY.exec(rest);
-		if (m === null)
-			throw new RolesLayoutError(
-				`unsupported fallbackChains key on line ${i + 1} of config.yml`,
-			);
-		const [, text, after] = m as unknown as [string, string, string];
-		keys.push({
-			index: i,
-			body: [],
-			last: i,
-			name: chainKeyName(text),
-			prefix: `${ind}${text}:`,
-			comment: after,
-			empty: false,
-			value: undefined,
-		});
+		keys.push(newChainKey(i, ki, rest));
 	}
+	return { keys, ki, chainsLast };
+}
+
+/** The parsed keys must cover exactly the doc's fallbackChains entries; managed keys get their shape check. */
+function checkChainsKeys(
+	chains: Doc,
+	keys: ChainKey[],
+	lines: Line[],
+	managed: ReadonlySet<string>,
+): void {
 	const names = keys.map((k) => k.name);
 	if (
 		new Set(names).size !== names.length ||
@@ -336,19 +323,106 @@ function scanRetry(
 		if (!managed.has(k.name)) continue;
 		checkManaged(k, lines, chains[k.name]);
 	}
+}
+
+/** Validates the `fallbackChains:` line and its doc value; returns the chains doc. */
+function chainsDoc(
+	lines: Line[],
+	fc: number,
+	childIndent: string,
+	value: unknown,
+): Doc {
+	if (
+		!CHAINS.test((lines[fc] as Line).body.slice(childIndent.length)) ||
+		!(value === null || isMap(value))
+	)
+		throw new RolesLayoutError(
+			"retry.fallbackChains must be a block map in config.yml (no flow map or anchor)",
+		);
+	return (value ?? {}) as Doc;
+}
+
+/** The indent of the first block-list item under the keys; null when none has items. */
+function chainItemIndent(lines: Line[], keys: ChainKey[]): string | null {
 	const first = keys
 		.map((k) => k.body[0])
 		.find(
 			(i) =>
 				i !== undefined && SEQ_ITEM.test((lines[i] as Line).body.trimStart()),
 		);
+	return first === undefined ? null : indentOf((lines[first] as Line).body);
+}
+
+/**
+ * Locates `retry` and `retry.fallbackChains`; throws RolesLayoutError for every layout of them or
+ * of a managed key that the spec does not support. An unmanaged key can have any layout.
+ */
+function scanRetry(
+	lines: Line[],
+	doc: Doc,
+	managed: ReadonlySet<string>,
+): RetryScan {
+	const eol = fileEol(lines);
+	const header = retryHeader(lines, doc);
+	const none: RetryScan = {
+		header: -1,
+		childIndent: "  ",
+		retryLast: -1,
+		chains: -1,
+		chainsLast: -1,
+		keyIndent: null,
+		itemIndent: null,
+		keys: [],
+		eol,
+	};
+	if (header === -1) return none;
+	const retry = doc.retry;
+	if (
+		!RETRY.test((lines[header] as Line).body) ||
+		!(retry === null || isMap(retry))
+	)
+		throw new RolesLayoutError(
+			"retry must be a block map in config.yml (no flow map or anchor)",
+		);
+	const { childIndent, retryLast, found } = scanRetryBlock(lines, header);
+	const scanned = {
+		...none,
+		header,
+		childIndent,
+		retryLast,
+		eol: (lines[header] as Line).eol || eol,
+	};
+	if (found.length > 1)
+		throw new RolesLayoutError(
+			"retry has more than one fallbackChains key in config.yml",
+		);
+	if (found.length === 0) {
+		if (isMap(retry) && Object.hasOwn(retry, "fallbackChains"))
+			throw new RolesLayoutError(
+				"retry.fallbackChains is not a one-line key under retry in config.yml",
+			);
+		return scanned;
+	}
+	const fc = found[0] as number;
+	const chains = chainsDoc(
+		lines,
+		fc,
+		childIndent,
+		isMap(retry) ? retry.fallbackChains : undefined,
+	);
+	const { keys, ki, chainsLast } = scanChainsKeys(
+		lines,
+		fc,
+		retryLast,
+		childIndent,
+	);
+	checkChainsKeys(chains, keys, lines, managed);
 	return {
 		...scanned,
 		chains: fc,
 		chainsLast,
 		keyIndent: ki,
-		itemIndent:
-			first === undefined ? null : indentOf((lines[first] as Line).body),
+		itemIndent: chainItemIndent(lines, keys),
 		keys,
 		eol: (lines[fc] as Line).eol || scanned.eol,
 	};
@@ -472,6 +546,67 @@ export function editModelRoles(
 	return out;
 }
 
+/** Rewrites one managed key's list to the requested chain; removes the key when unset. */
+function editChainKey(
+	c: Changes,
+	lines: Line[],
+	k: ChainKey,
+	r: RetryScan,
+	chain: string[] | undefined,
+	blockItem: string,
+): void {
+	if (chain === undefined) {
+		for (let i = k.index; i <= k.last; i++) c.replace.set(i, []);
+		return;
+	}
+	if (Bun.deepEquals(k.value, chain)) return;
+	const eol = (lines[k.index] as Line).eol;
+	if (chain.length === 0) {
+		c.replace.set(k.index, [{ body: `${k.prefix} []${k.comment}`, eol }]);
+		for (const i of k.body) c.replace.set(i, []);
+		return;
+	}
+	const firstItem = k.body[0];
+	if (k.empty) c.replace.set(k.index, [{ body: k.prefix + k.comment, eol }]);
+	if (firstItem === undefined) {
+		insertAfter(c, k.index, items(r, blockItem, chain));
+		return;
+	}
+	const indent = indentOf((lines[firstItem] as Line).body);
+	c.replace.set(firstItem, items(r, indent, chain));
+	for (const i of k.body.slice(1)) c.replace.set(i, []);
+}
+
+/** The list items of one chain at `indent`, using the block's eol. */
+function items(r: RetryScan, indent: string, chain: string[]): Line[] {
+	return chain.map((v) => ({ body: `${indent}- ${scalar(v)}`, eol: r.eol }));
+}
+
+/** The block that adds the managed keys missing from fallbackChains (empty when none). */
+function missingKeysBlock(
+	r: RetryScan,
+	managed: ReadonlySet<string>,
+	want: (k: string) => string[] | undefined,
+	blockItem: string,
+): Line[] {
+	const present = new Set(r.keys.map((k) => k.name));
+	const keyIndent = r.keyIndent ?? `${r.childIndent}  `;
+	const block = [...managed].flatMap((name): Line[] => {
+		const chain = want(name);
+		if (present.has(name) || chain === undefined) return [];
+		const plain = /^[A-Za-z0-9_.-]+$/.test(name);
+		const head = `${keyIndent}${plain ? name : JSON.stringify(name)}:`;
+		return chain.length === 0
+			? [{ body: `${head} []`, eol: r.eol }]
+			: [{ body: head, eol: r.eol }, ...items(r, blockItem, chain)];
+	});
+	if (block.length === 0) return [];
+	if (r.chains === -1)
+		block.unshift({ body: `${r.childIndent}fallbackChains:`, eol: r.eol });
+	if (r.header === -1) block.unshift({ body: "retry:", eol: r.eol });
+	return block;
+}
+
 function editChains(
 	c: Changes,
 	lines: Line[],
@@ -482,47 +617,12 @@ function editChains(
 	const want = (k: string) =>
 		Object.hasOwn(fallbacks, k) ? fallbacks[k] : undefined;
 	const blockItem = r.itemIndent ?? `${r.keyIndent ?? `${r.childIndent}  `}  `;
-	const items = (indent: string, chain: string[]) =>
-		chain.map((v) => ({ body: `${indent}- ${scalar(v)}`, eol: r.eol }));
 	for (const k of r.keys) {
 		if (!managed.has(k.name)) continue;
-		const chain = want(k.name);
-		if (chain === undefined) {
-			for (let i = k.index; i <= k.last; i++) c.replace.set(i, []);
-			continue;
-		}
-		if (Bun.deepEquals(k.value, chain)) continue;
-		const eol = (lines[k.index] as Line).eol;
-		if (chain.length === 0) {
-			c.replace.set(k.index, [{ body: `${k.prefix} []${k.comment}`, eol }]);
-			for (const i of k.body) c.replace.set(i, []);
-			continue;
-		}
-		const firstItem = k.body[0];
-		if (k.empty) c.replace.set(k.index, [{ body: k.prefix + k.comment, eol }]);
-		if (firstItem === undefined) {
-			insertAfter(c, k.index, items(blockItem, chain));
-			continue;
-		}
-		const indent = indentOf((lines[firstItem] as Line).body);
-		c.replace.set(firstItem, items(indent, chain));
-		for (const i of k.body.slice(1)) c.replace.set(i, []);
+		editChainKey(c, lines, k, r, want(k.name), blockItem);
 	}
-	const present = new Set(r.keys.map((k) => k.name));
-	const keyIndent = r.keyIndent ?? `${r.childIndent}  `;
-	const block = [...managed].flatMap((name): Line[] => {
-		const chain = want(name);
-		if (present.has(name) || chain === undefined) return [];
-		const plain = /^[A-Za-z0-9_.-]+$/.test(name);
-		const head = `${keyIndent}${plain ? name : JSON.stringify(name)}:`;
-		return chain.length === 0
-			? [{ body: `${head} []`, eol: r.eol }]
-			: [{ body: head, eol: r.eol }, ...items(blockItem, chain)];
-	});
+	const block = missingKeysBlock(r, managed, want, blockItem);
 	if (block.length === 0) return;
-	if (r.chains === -1)
-		block.unshift({ body: `${r.childIndent}fallbackChains:`, eol: r.eol });
-	if (r.header === -1) block.unshift({ body: "retry:", eol: r.eol });
 	insertAfter(
 		c,
 		r.header === -1
@@ -652,6 +752,32 @@ export function validateRoles(
 
 const MAX_MESSAGE = 500;
 
+/** The subject for exactly one changed role with no removals. */
+function singleChangeMessage(
+	current: Record<string, string>,
+	next: Record<string, string>,
+	nextFallbacks: Fallbacks,
+	role: string,
+): string {
+	const chain = Object.hasOwn(nextFallbacks, role)
+		? nextFallbacks[role]
+		: undefined;
+	if (current[role] !== next[role])
+		return `chore: set the ${role} model role to ${next[role]}`;
+	if (chain === undefined)
+		return `chore: remove the ${role} model role fallbacks`;
+	return `chore: set the ${role} model role fallbacks to ${chain.length > 0 ? chain.join(", ") : "none"}`;
+}
+
+/** The subject for several changes: as many names as fit, then an ellipsis. */
+function multiChangeMessage(names: string[]): string {
+	const fit = (n: string[]) => `chore: update the ${n.join(", ")} model roles`;
+	let k = names.length;
+	while (k > 0 && fit(names.slice(0, k)).length > MAX_MESSAGE) k--;
+	if (k === names.length) return fit(names);
+	return fit([...names.slice(0, Math.max(k - 1, 0)), "…"]);
+}
+
 /** Conventional Commit subject for the save, at most 500 characters. */
 export function commitMessage(
 	current: Record<string, string>,
@@ -668,26 +794,10 @@ export function commitMessage(
 	const [role] = changed as [string];
 	if (changed.length === 0 && removed.length === 1)
 		msg = `chore: remove the ${removed[0]} model role`;
-	else if (changed.length === 1 && removed.length === 0) {
-		const chain = Object.hasOwn(nextFallbacks, role)
-			? nextFallbacks[role]
-			: undefined;
-		msg =
-			current[role] !== next[role]
-				? `chore: set the ${role} model role to ${next[role]}`
-				: chain === undefined
-					? `chore: remove the ${role} model role fallbacks`
-					: `chore: set the ${role} model role fallbacks to ${chain.length > 0 ? chain.join(", ") : "none"}`;
-	} else {
-		const names = [...changed, ...removed];
-		const fit = (n: string[]) =>
-			`chore: update the ${n.join(", ")} model roles`;
-		let k = names.length;
-		while (k > 0 && fit(names.slice(0, k)).length > MAX_MESSAGE) k--;
-		msg =
-			k === names.length
-				? fit(names)
-				: fit([...names.slice(0, Math.max(k - 1, 0)), "…"]);
+	else if (changed.length === 1 && removed.length === 0)
+		msg = singleChangeMessage(current, next, nextFallbacks, role);
+	else {
+		msg = multiChangeMessage([...changed, ...removed]);
 	}
 	return msg.length > MAX_MESSAGE ? `${msg.slice(0, MAX_MESSAGE - 1)}…` : msg;
 }

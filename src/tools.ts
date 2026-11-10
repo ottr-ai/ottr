@@ -108,36 +108,46 @@ export interface ToolEntry {
 	bin?: string;
 }
 
-/** tools.json: an array of pinned entries; throws on the first broken rule. */
-export function parseToolsJson(text: string): ToolEntry[] {
-	const parsed: unknown = JSON.parse(text);
-	if (!Array.isArray(parsed)) throw new Error("tools: not a JSON array");
-	const entries: ToolEntry[] = [];
-	const seen = new Set<string>();
-	for (const raw of parsed) {
-		if (typeof raw !== "object" || raw === null || Array.isArray(raw))
-			throw new Error("tools: entry is not an object");
-		const e = raw as Record<string, unknown>;
-		const name = e.name;
-		if (typeof name !== "string" || !NAME.test(name))
-			throw new Error(`tools: not a tool name: ${JSON.stringify(name)}`);
-		if (seen.has(name)) throw new Error(`tools: duplicate tool name: ${name}`);
-		seen.add(name);
-		if (typeof e.url !== "string" || !e.url.startsWith("https://"))
-			throw new Error(`tools: ${name}: not an https:// url`);
-		if (typeof e.sha256 !== "string" || !SHA256.test(e.sha256))
-			throw new Error(
-				`tools: ${name}: not a sha256: ${JSON.stringify(e.sha256)}`,
-			);
-		if (typeof e.unpack !== "string" || !UNPACK[e.unpack])
-			throw new Error(
-				`tools: ${name}: unpack must be "zip", "tar.gz" or "none"`,
-			);
-		const bin = e.bin;
-		if (e.unpack === "none") {
-			if (bin !== undefined)
-				throw new Error(`tools: ${name}: unpack "none" takes no bin`);
-		} else if (
+/** One validated entry; throws a readable error on the first broken rule. */
+function parseToolEntry(raw: unknown, seen: Set<string>): ToolEntry {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw))
+		throw new Error("tools: entry is not an object");
+	const e = raw as Record<string, unknown>;
+	const name = e.name;
+	if (typeof name !== "string" || !NAME.test(name))
+		throw new Error(`tools: not a tool name: ${JSON.stringify(name)}`);
+	if (seen.has(name)) throw new Error(`tools: duplicate tool name: ${name}`);
+	seen.add(name);
+	if (typeof e.url !== "string" || !e.url.startsWith("https://"))
+		throw new Error(`tools: ${name}: not an https:// url`);
+	if (typeof e.sha256 !== "string" || !SHA256.test(e.sha256))
+		throw new Error(
+			`tools: ${name}: not a sha256: ${JSON.stringify(e.sha256)}`,
+		);
+	if (typeof e.unpack !== "string" || !UNPACK[e.unpack])
+		throw new Error(`tools: ${name}: unpack must be "zip", "tar.gz" or "none"`);
+	const bin = parseBin(e, name);
+	return {
+		name,
+		url: e.url,
+		sha256: e.sha256,
+		unpack: e.unpack as ToolEntry["unpack"],
+		...(bin === undefined ? {} : { bin }),
+	};
+}
+
+/** The entry's `bin` field, checked against the unpack mode; undefined when absent. */
+function parseBin(
+	e: Record<string, unknown>,
+	name: string,
+): string | undefined {
+	const bin = e.bin;
+	let valid: string | undefined;
+	if (e.unpack === "none") {
+		if (bin !== undefined)
+			throw new Error(`tools: ${name}: unpack "none" takes no bin`);
+	} else {
+		if (
 			typeof bin !== "string" ||
 			bin === "" ||
 			bin.startsWith("/") ||
@@ -146,28 +156,22 @@ export function parseToolsJson(text: string): ToolEntry[] {
 			throw new Error(
 				`tools: ${name}: bin must be a relative path inside the archive`,
 			);
-		const known = new Set(["name", "url", "sha256", "unpack"]);
-		if (bin !== undefined) known.add("bin");
-		for (const key of Object.keys(e))
-			if (!known.has(key))
-				throw new Error(`tools: ${name}: unknown key: ${key}`);
-		entries.push(
-			bin === undefined
-				? {
-						name,
-						url: e.url,
-						sha256: e.sha256,
-						unpack: e.unpack as ToolEntry["unpack"],
-					}
-				: {
-						name,
-						url: e.url,
-						sha256: e.sha256,
-						unpack: e.unpack as ToolEntry["unpack"],
-						bin,
-					},
-		);
+		valid = bin;
 	}
+	const known = new Set(["name", "url", "sha256", "unpack"]);
+	if (valid !== undefined) known.add("bin");
+	for (const key of Object.keys(e))
+		if (!known.has(key)) throw new Error(`tools: ${name}: unknown key: ${key}`);
+	return valid;
+}
+
+/** tools.json: an array of pinned entries; throws on the first broken rule. */
+export function parseToolsJson(text: string): ToolEntry[] {
+	const parsed: unknown = JSON.parse(text);
+	if (!Array.isArray(parsed)) throw new Error("tools: not a JSON array");
+	const entries: ToolEntry[] = [];
+	const seen = new Set<string>();
+	for (const raw of parsed) entries.push(parseToolEntry(raw, seen));
 	return entries;
 }
 
@@ -349,12 +353,11 @@ async function unpackInto(
  * the installed folder. Entry names come from readdirSync, so they never hold "..".
  */
 function guardPaths(name: string, dir: string): void {
-	const stack = [""];
-	while (stack.length > 0) {
-		const rel = stack.pop()!;
+	const stack: string[] = [""];
+	for (let rel = stack.pop(); rel !== undefined; rel = stack.pop()) {
 		const full = join(dir, rel);
 		if (lstatSync(full).isSymbolicLink()) {
-			if (!realpathSync(full).startsWith(dir + "/"))
+			if (!realpathSync(full).startsWith(`${dir}/`))
 				throw new Error(
 					`tools: ${name}: archive symlink escapes the dir: ${rel}`,
 				);
@@ -390,13 +393,29 @@ async function exec(argv: string[]): Promise<string> {
  * Links only what is already installed; it never installs anything. The dir is keyed by a
  * hash of its content, so every turn with the same tool set reuses one dir and none leaks.
  */
-export function buildToolsPath(project: string, home = homedir()): string {
-	const root = join(home, ".ottr", "tools");
-	const entries = [...readTools(project, home), ...readTools("_all", home)];
-	// "" = nothing to prepend: the callers skip the PATH prefix for an empty turn.
-	if (entries.length === 0) return "";
-	const links = new Map<string, { target: string; wrapper: string | null }>();
-	for (const e of entries) {
+/** Refuses an installed binary whose bytes no longer match its sha256 pin. */
+function verifyPinnedBinary(
+	name: string,
+	sha256: string,
+	target: string,
+): void {
+	const hash = new Bun.CryptoHasher("sha256")
+		.update(readFileSync(target))
+		.digest("hex");
+	if (hash !== sha256)
+		throw new Error(
+			`tools: ${name}: installed binary does not match its sha256 (${hash.slice(0, 12)})`,
+		);
+}
+
+/** The symlink/wrapper layout for the turn's entries: name → target, godot wrapped. */
+function linkTargets(
+	project: string,
+	home: string,
+	root: string,
+): Map<string, ToolLink> {
+	const links = new Map<string, ToolLink>();
+	for (const e of [...readTools(project, home), ...readTools("_all", home)]) {
 		if (links.has(e.name)) continue;
 		const target = join(root, e.sha256, e.bin ?? e.name);
 		if (!existsSync(target))
@@ -406,23 +425,24 @@ export function buildToolsPath(project: string, home = homedir()): string {
 		// A plain binary must still be the pinned download: a dir someone else wrote under this
 		// sha256 is refused. ponytail: an archive's unpacked files carry no pin to check against;
 		// the server-only root (prepareTurn) is what keeps those trusted.
-		if (e.unpack === "none") {
-			const hash = new Bun.CryptoHasher("sha256")
-				.update(readFileSync(target))
-				.digest("hex");
-			if (hash !== e.sha256)
-				throw new Error(
-					`tools: ${e.name}: installed binary does not match its sha256 (${hash.slice(0, 12)})`,
-				);
-		}
+		if (e.unpack === "none") verifyPinnedBinary(e.name, e.sha256, target);
 		links.set(e.name, {
 			target,
 			wrapper: e.name === "godot" ? headlessWrapper(target) : null,
 		});
 	}
-	const key = new Bun.CryptoHasher("sha256")
-		.update(JSON.stringify([...links]))
-		.digest("hex");
+	return links;
+}
+
+/** One symlink/wrapper plan for a tool name. */
+type ToolLink = { target: string; wrapper: string | null };
+
+/** Materialises the links dir atomically; a concurrent winner's dir is reused. */
+function writeLinksDir(
+	root: string,
+	key: string,
+	links: Map<string, ToolLink>,
+): string {
 	const dir = join(root, `path-${key}`);
 	if (existsSync(dir)) return dir;
 	// Built aside and moved in with one rename, so a reused dir is never half-built.
@@ -443,6 +463,17 @@ export function buildToolsPath(project: string, home = homedir()): string {
 		rmSync(tmp, { recursive: true, force: true });
 	}
 	return dir;
+}
+
+export function buildToolsPath(project: string, home = homedir()): string {
+	const root = join(home, ".ottr", "tools");
+	const links = linkTargets(project, home, root);
+	// "" = nothing to prepend: the callers skip the PATH prefix for an empty turn.
+	if (links.size === 0) return "";
+	const key = new Bun.CryptoHasher("sha256")
+		.update(JSON.stringify([...links]))
+		.digest("hex");
+	return writeLinksDir(root, key, links);
 }
 
 /**

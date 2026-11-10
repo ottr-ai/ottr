@@ -11649,7 +11649,7 @@ describe("work card check", () => {
 						blockers: [
 							{ finding: "scope creep", quote: "also touched README" },
 							{
-								finding: "long finding ".repeat(40).trim() + " end",
+								finding: `${"long finding ".repeat(40).trim()} end`,
 								quote: "also touched README",
 							},
 						],
@@ -11691,7 +11691,7 @@ describe("work card check", () => {
 			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
 		);
 		expect(after.needsReason).toContain("scope creep");
-		const longFinding = "long finding ".repeat(40).trim() + " end";
+		const longFinding = `${"long finding ".repeat(40).trim()} end`;
 		expect(after.needsReason).toContain(longFinding);
 		expect(after.workCheckHead).toBe("sha5");
 		// The user gets clickable choices, not only a reason text.

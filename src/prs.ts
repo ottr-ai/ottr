@@ -165,13 +165,12 @@ export async function openPullRequest(o: {
 		} catch {
 			// unreadable adopt page: fall through to create
 		}
-		if (page.length > 0) {
-			const p = page[0]!;
+		const [p] = page;
+		if (p !== undefined)
 			return {
 				ok: true,
 				pr: { number: p.number, url: prUrl(o.repo, p.number) },
 			};
-		}
 	}
 	const r = await gh([
 		"api",
@@ -325,16 +324,26 @@ export function reviewUserMessage(o: {
 	if (msg.length > PROMPT_CHAR_BUDGET)
 		throw new RangeError(`diff exceeds the prompt budget: ${msg.length} chars`);
 	if (o.earlier === undefined || o.earlier === null) return msg;
-	parts.push(block("EARLIER REVIEW", o.earlier.review));
-	if (o.earlier.rangeDiff === null)
+	return appendReReview(parts, o.earlier, block);
+}
+
+/** Appends the earlier review, the range diff and the comments since it, cut to the budget:
+ * whole oldest comments drop until the message fits, and an unfittable context throws. */
+function appendReReview(
+	parts: string[],
+	earlier: ReReviewContext,
+	block: (label: string, raw: string) => string,
+): string {
+	parts.push(block("EARLIER REVIEW", earlier.review));
+	if (earlier.rangeDiff === null)
 		parts.push(
 			"The range diff between the earlier reviewed head and this head is unavailable (the branch may have been force-pushed); judge against the full diff above.",
 		);
-	else if (o.earlier.rangeDiff !== "")
-		parts.push(block("RANGE DIFF", o.earlier.rangeDiff));
+	else if (earlier.rangeDiff !== "")
+		parts.push(block("RANGE DIFF", earlier.rangeDiff));
 	else parts.push("There are no code changes since the earlier review's head.");
 	// The oldest comments go first: they carry the least news about the current head.
-	const comments = o.earlier.comments.map((c) =>
+	const comments = earlier.comments.map((c) =>
 		block(`COMMENT ${c.author} ${c.date}`, c.body),
 	);
 	let cut = 0;
@@ -396,27 +405,32 @@ async function pullData(
 	};
 }
 
-/** Longest comment body kept: the budget cut drops whole comments long before this binds. */
-const MAX_COMMENT_BODY = 4000;
 /** Page bound of one comment sweep: 30 pages of 100, like the posted inline read. */
 const MAX_SWEEP_PAGES = 30;
-
 /** Pages read at most for one posted review's inline comments (100 comments a page). */
 const MAX_INLINE_PAGES = 30;
 
+/** Longest comment body kept: the budget cut drops whole comments long before this binds. */
+const MAX_COMMENT_BODY = 4000;
+
+/** A positive safe integer, else null: GitHub line numbers are 1-based. */
+function positiveInt(v: unknown): number | null {
+	return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
+}
+
 /**
- * The inline comments of the board's posted review `reviewId`, each as a marker block, read over
- * every page. GitHub data stays untrusted: entries without a usable path and line are skipped.
- * A failed or malformed read throws: the re-review must check every earlier finding, so it
- * stops and a later tick retries, never running without them. Bodies stay whole: an earlier
- * finding is never cut, and the prompt budget check rejects a context that does not fit.
+ * Every entry of the board's posted review `reviewId`'s comments, read over every page.
+ * GitHub data stays untrusted here only in shape: a failed or malformed read throws, the
+ * re-review must check every earlier finding, so it stops and a later tick retries, never
+ * running without them. Bodies stay whole: an earlier finding is never cut, and the prompt
+ * budget check rejects a context that does not fit.
  */
-async function postedInlineComments(
+async function reviewCommentPages(
 	gh: GhFn,
 	repo: string,
 	number: number,
 	reviewId: number,
-): Promise<string[]> {
+): Promise<unknown[]> {
 	const list: unknown[] = [];
 	for (let page = 1; ; page++) {
 		if (page > MAX_INLINE_PAGES)
@@ -441,13 +455,16 @@ async function postedInlineComments(
 		list.push(...body);
 		if (body.length < 100) break;
 	}
-	const lineOf = (v: unknown): number | null =>
-		typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null;
+	return list;
+}
+
+/** Each usable entry as a marker block; entries without a usable path and line are skipped. */
+function inlineCommentBlocks(list: unknown[]): string[] {
 	const out: string[] = [];
 	for (const e of list) {
 		if (typeof e !== "object" || e === null) continue;
 		const x = e as Record<string, unknown>;
-		const line = lineOf(x.line) ?? lineOf(x.original_line);
+		const line = positiveInt(x.line) ?? positiveInt(x.original_line);
 		if (
 			typeof x.path !== "string" ||
 			x.path === "" ||
@@ -458,7 +475,7 @@ async function postedInlineComments(
 			x.body.trim() === ""
 		)
 			continue;
-		const start = lineOf(x.start_line);
+		const start = positiveInt(x.start_line);
 		out.push(
 			formatInlineComment({
 				path: x.path,
@@ -472,12 +489,25 @@ async function postedInlineComments(
 }
 
 /**
- * What a re-review of `head` needs: the board's earlier review (the posted GitHub review, or the
- * saved draft when the first review was never posted), the comments newer than it, and the code
- * range between the earlier and the current head. null on a first review, or when the posted
- * review cannot be found on GitHub anymore.
+ * The inline comments of the board's posted review `reviewId`, each as a marker block, read over
+ * every page. GitHub data stays untrusted: entries without a usable path and line are skipped.
+ * A failed or malformed read throws: the re-review must check every earlier finding, so it
+ * stops and a later tick retries, never running without them. Bodies stay whole: an earlier
+ * finding is never cut, and the prompt budget check rejects a context that does not fit.
  */
-export async function fetchReReviewContext(o: {
+async function postedInlineComments(
+	gh: GhFn,
+	repo: string,
+	number: number,
+	reviewId: number,
+): Promise<string[]> {
+	return inlineCommentBlocks(
+		await reviewCommentPages(gh, repo, number, reviewId),
+	);
+}
+
+/** The inputs fetchReReviewContext reads; `gh` runs every GitHub read. */
+interface ReReviewInput {
 	repo: string;
 	number: number;
 	gh: GhFn;
@@ -488,125 +518,651 @@ export async function fetchReReviewContext(o: {
 	head: string;
 	draftBody: string | null;
 	draftAt: number | null;
-}): Promise<ReReviewContext | null> {
-	let reviewBody: string;
-	let cutoff: number | null;
-	let earlierHead: string;
-	let reviewId: number | null = null;
-	if (o.postedHead !== null) {
-		const r = await o.gh([
-			"api",
-			`repos/${o.repo}/pulls/${o.number}/reviews?per_page=100`,
-		]);
-		if (r.code !== 0)
-			throw new Error(`reviews failed (${r.code}): ${r.stderr.slice(0, 300)}`);
-		let list: unknown;
-		try {
-			list = JSON.parse(r.stdout);
-		} catch {
-			throw new Error("reviews: bad JSON");
-		}
-		// Ours by the posted review's id when the URL carries it, else by the reviewed commit;
-		// the last match wins so a review edited on GitHub keeps its latest body.
-		const wantId = /#pullrequestreview-(\d+)/.exec(o.postedUrl ?? "")?.[1];
-		let picked: { id: unknown; body: unknown; submittedAt: unknown } | null =
-			null;
-		if (Array.isArray(list))
-			for (const e of list) {
-				if (typeof e !== "object" || e === null) continue;
-				const x = e as Record<string, unknown>;
-				if (
-					typeof x.body !== "string" ||
-					x.body === "" ||
-					(wantId !== undefined
-						? `${x.id}` !== wantId
-						: x.commit_id !== o.postedHead)
-				)
-					continue;
-				picked = { id: x.id, body: x.body, submittedAt: x.submitted_at };
-			}
-		if (picked === null || typeof picked.body !== "string") return null;
-		const ts =
-			typeof picked.submittedAt === "string"
-				? Date.parse(picked.submittedAt)
-				: Number.NaN;
-		cutoff = Number.isNaN(ts) ? null : ts;
-		reviewId =
-			typeof picked.id === "number" && Number.isSafeInteger(picked.id)
-				? picked.id
-				: null;
-		const inline =
-			reviewId === null
-				? []
-				: await postedInlineComments(o.gh, o.repo, o.number, reviewId);
-		reviewBody = [picked.body, ...inline].join("\n\n");
-		earlierHead = o.postedHead;
-	} else if (
-		o.reviewedHead !== null &&
-		o.draftBody !== null &&
-		o.draftBody !== ""
-	) {
-		reviewBody = o.draftBody;
-		cutoff = o.draftAt;
-		earlierHead = o.reviewedHead;
-	} else return null;
+}
 
-	// Conversation and review comments since the earlier review; GitHub data stays untrusted.
-	const commentsAfter = async (path: string): Promise<PrComment[]> => {
-		const r = await o.gh(["api", path]);
-		if (r.code !== 0) return [];
-		let list: unknown;
-		try {
-			list = JSON.parse(r.stdout);
-		} catch {
-			return [];
-		}
-		const out: PrComment[] = [];
-		if (!Array.isArray(list)) return out;
-		for (const e of list) {
-			if (typeof e !== "object" || e === null) continue;
-			const x = e as Record<string, unknown>;
-			const user = x.user as Record<string, unknown> | null | undefined;
-			if (
-				typeof x.created_at !== "string" ||
-				typeof x.body !== "string" ||
-				typeof user?.login !== "string"
-			)
-				continue;
-			// The posted review's own inline comments already sit in the earlier review.
-			if (reviewId !== null && x.pull_request_review_id === reviewId) continue;
-			const ts = Date.parse(x.created_at);
-			// An unparseable date may be older than the review: keep it, the model sorts it out.
-			if (cutoff !== null && !Number.isNaN(ts) && ts <= cutoff) continue;
-			out.push({
-				author: user.login,
-				date: x.created_at,
-				body: x.body.slice(0, MAX_COMMENT_BODY),
-			});
-		}
-		return out;
+/** The earlier review a re-review checks the diff against. */
+interface EarlierReview {
+	/** The posted review's body with its inline comments, or the saved draft. */
+	review: string;
+	/** Comments at or before this timestamp are already answered; null keeps every comment. */
+	cutoff: number | null;
+	/** The posted review's id when GitHub gave one: its inline comments sit in the review. */
+	reviewId: number | null;
+	/** The commit the earlier review names. */
+	head: string;
+}
+
+/** The board's posted review, ours by the URL's review id else by the reviewed commit; the
+ * last match wins so a review edited on GitHub keeps its latest body. */
+function pickReview(
+	list: unknown,
+	wantId: string | undefined,
+	postedHead: string,
+): { id: unknown; body: unknown; submittedAt: unknown } | null {
+	if (!Array.isArray(list)) return null;
+	let picked: { id: unknown; body: unknown; submittedAt: unknown } | null =
+		null;
+	for (const e of list) {
+		if (typeof e !== "object" || e === null) continue;
+		const x = e as Record<string, unknown>;
+		if (
+			typeof x.body !== "string" ||
+			x.body === "" ||
+			(wantId !== undefined ? `${x.id}` !== wantId : x.commit_id !== postedHead)
+		)
+			continue;
+		picked = { id: x.id, body: x.body, submittedAt: x.submitted_at };
+	}
+	return picked;
+}
+
+/** The posted-review branch: read the review, then its inline comments; null when GitHub no
+ * longer returns it. */
+async function postedReview(
+	gh: GhFn,
+	repo: string,
+	number: number,
+	postedHead: string,
+	postedUrl: string | null,
+): Promise<EarlierReview | null> {
+	const r = await gh([
+		"api",
+		`repos/${repo}/pulls/${number}/reviews?per_page=100`,
+	]);
+	if (r.code !== 0)
+		throw new Error(`reviews failed (${r.code}): ${r.stderr.slice(0, 300)}`);
+	let list: unknown;
+	try {
+		list = JSON.parse(r.stdout);
+	} catch {
+		throw new Error("reviews: bad JSON");
+	}
+	const wantId = /#pullrequestreview-(\d+)/.exec(postedUrl ?? "")?.[1];
+	const picked = pickReview(list, wantId, postedHead);
+	if (picked === null || typeof picked.body !== "string") return null;
+	const ts =
+		typeof picked.submittedAt === "string"
+			? Date.parse(picked.submittedAt)
+			: Number.NaN;
+	const reviewId =
+		typeof picked.id === "number" && Number.isSafeInteger(picked.id)
+			? picked.id
+			: null;
+	const inline =
+		reviewId === null
+			? []
+			: await postedInlineComments(gh, repo, number, reviewId);
+	return {
+		review: [picked.body, ...inline].join("\n\n"),
+		cutoff: Number.isNaN(ts) ? null : ts,
+		reviewId,
+		head: postedHead,
 	};
+}
+
+/** The board's earlier review, or null on a first review (and on a first draft-less one). */
+async function earlierReview(o: ReReviewInput): Promise<EarlierReview | null> {
+	if (o.postedHead !== null)
+		return postedReview(o.gh, o.repo, o.number, o.postedHead, o.postedUrl);
+	if (o.reviewedHead !== null && o.draftBody !== null && o.draftBody !== "") {
+		return {
+			review: o.draftBody,
+			cutoff: o.draftAt,
+			reviewId: null,
+			head: o.reviewedHead,
+		};
+	}
+	return null;
+}
+
+/** One usable comment, or null when the entry is malformed, already answered, or the posted
+ * review's own inline comment. */
+function parseComment(
+	e: unknown,
+	cutoff: number | null,
+	reviewId: number | null,
+): PrComment | null {
+	if (typeof e !== "object" || e === null) return null;
+	const x = e as Record<string, unknown>;
+	const user = x.user as Record<string, unknown> | null | undefined;
+	if (
+		typeof x.created_at !== "string" ||
+		typeof x.body !== "string" ||
+		typeof user?.login !== "string"
+	)
+		return null;
+	// The posted review's own inline comments already sit in the earlier review.
+	if (reviewId !== null && x.pull_request_review_id === reviewId) return null;
+	const ts = Date.parse(x.created_at);
+	// An unparseable date may be older than the review: keep it, the model sorts it out.
+	if (cutoff !== null && !Number.isNaN(ts) && ts <= cutoff) return null;
+	return {
+		author: user.login,
+		date: x.created_at,
+		body: x.body.slice(0, MAX_COMMENT_BODY),
+	};
+}
+
+/** Conversation and review comments since the earlier review; GitHub data stays untrusted:
+ * an unreadable source or malformed entry is skipped, never thrown on. */
+async function commentsAfter(
+	gh: GhFn,
+	path: string,
+	cutoff: number | null,
+	reviewId: number | null,
+): Promise<PrComment[]> {
+	const r = await gh(["api", path]);
+	if (r.code !== 0) return [];
+	let list: unknown;
+	try {
+		list = JSON.parse(r.stdout);
+	} catch {
+		return [];
+	}
+	const out: PrComment[] = [];
+	if (!Array.isArray(list)) return out;
+	for (const e of list) {
+		const c = parseComment(e, cutoff, reviewId);
+		if (c !== null) out.push(c);
+	}
+	return out;
+}
+
+/** The compare body: GitHub sends the raw diff; a JSON-encoded string (a wrapped endpoint)
+ * is decoded, anything else stays raw. */
+function compareDiff(stdout: string): string {
+	try {
+		const v: unknown = JSON.parse(stdout);
+		if (typeof v === "string") return v;
+	} catch {
+		// Not JSON: keep the raw text.
+	}
+	return stdout;
+}
+
+/**
+ * What a re-review of `head` needs: the board's earlier review (the posted GitHub review, or the
+ * saved draft when the first review was never posted), the comments newer than it, and the code
+ * range between the earlier and the current head. null on a first review, or when the posted
+ * review cannot be found on GitHub anymore.
+ */
+export async function fetchReReviewContext(
+	o: ReReviewInput,
+): Promise<ReReviewContext | null> {
+	const earlier = await earlierReview(o);
+	if (earlier === null) return null;
+	// Conversation and review comments since the earlier review; GitHub data stays untrusted.
 	const comments = [
 		...(await commentsAfter(
+			o.gh,
 			`repos/${o.repo}/issues/${o.number}/comments?per_page=100`,
+			earlier.cutoff,
+			earlier.reviewId,
 		)),
 		...(await commentsAfter(
+			o.gh,
 			`repos/${o.repo}/pulls/${o.number}/comments?per_page=100`,
+			earlier.cutoff,
+			earlier.reviewId,
 		)),
 	].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
 
 	const rangeDiff =
-		earlierHead === o.head
+		earlier.head === o.head
 			? ""
 			: await o
 					.gh([
 						"api",
 						"-H",
 						"Accept: application/vnd.github.diff",
-						`repos/${o.repo}/compare/${earlierHead}...${o.head}`,
+						`repos/${o.repo}/compare/${earlier.head}...${o.head}`,
 					])
-					.then((r) => (r.code === 0 ? r.stdout : null));
-	return { review: reviewBody, comments, rangeDiff };
+					.then((r) => (r.code === 0 ? compareDiff(r.stdout) : null));
+	return { review: earlier.review, comments, rangeDiff };
+}
+
+/** Everything the watcher's scan and review request share. */
+interface PrWatcherCtx {
+	projects: () => Iterable<ForkProject>;
+	log: (m: string) => void;
+	gh: GhFn;
+	now: () => number;
+	review: ReviewFn;
+	/** Called with the card id when a re-review rewrites a draft the user may have read. */
+	forgetSeen?: (taskId: string) => void;
+}
+
+/** The repo id of a project's GitHub remote; throws on a malformed id. */
+function repoForProject(github: string): string {
+	const repo = ownerRepo(`${githubHost().webBase}/${github}.git`) ?? github;
+	if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
+	return repo;
+}
+
+/** Fresh rows for the pulls seen this tick; returns the set of seen numbers. */
+function syncSeenPulls(
+	store: ForkProject["store"],
+	pulls: PullInfo[],
+	t: number,
+): Set<number> {
+	const seen = new Set<number>();
+	for (const p of pulls) {
+		seen.add(p.number);
+		const row = store.getPrReview(p.number);
+		if (!row) {
+			store.savePrReview({
+				number: p.number,
+				taskId: null,
+				head: p.head,
+				firstSeenAt: t,
+				reviewedHead: null,
+				postedHead: null,
+				postedUrl: null,
+				postedLogin: null,
+				state: "open",
+				draft: p.draft,
+				title: p.title,
+				postError: null,
+				commentsAt: null,
+				commentsUnseen: false,
+			});
+			continue;
+		}
+		const moved = row.head !== p.head;
+		store.savePrReview({
+			...row,
+			head: p.head,
+			firstSeenAt: moved ? t : row.firstSeenAt,
+			draft: p.draft,
+			title: p.title,
+			state: "open",
+		});
+	}
+	return seen;
+}
+
+/** Closes rows whose pull left the open list: merged or closed, by GitHub's answer. */
+async function closeGonePulls(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	repo: string,
+	seen: Set<number>,
+): Promise<void> {
+	const store = project.store;
+	for (const row of store.listPrReviews()) {
+		if (row.state !== "open" || seen.has(row.number)) continue;
+		const r = await ctx.gh(["api", `repos/${repo}/pulls/${row.number}`]);
+		if (r.code !== 0) {
+			ctx.log(
+				`prs: ${project.name}: #${row.number} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+			);
+			continue;
+		}
+		let merged = false;
+		try {
+			const b = JSON.parse(r.stdout) as { merged_at?: unknown } | null;
+			merged = typeof b?.merged_at === "string";
+		} catch {
+			ctx.log(`prs: ${project.name}: #${row.number}: bad JSON`);
+			continue;
+		}
+		// Only the state: a Post may have written the row during the await.
+		store.setPrState(row.number, merged ? "merged" : "closed");
+		store.syncPrCard(row.number);
+	}
+}
+
+/** Open, non-draft rows whose head the project has not reviewed yet and whose quiet period is over. */
+function dueReviewRows(store: ForkProject["store"], t: number): PrReviewRow[] {
+	const due: PrReviewRow[] = [];
+	for (const row of store.listPrReviews()) {
+		if (
+			row.state !== "open" ||
+			row.draft ||
+			store.prHeadReviewed(row.number, row.head) ||
+			row.firstSeenAt > t - PR_GATES.QUIET_MS
+		)
+			continue;
+		const card = row.taskId ? store.getTask(row.taskId) : null;
+		// A cancelled card is the user's "never review this PR".
+		if (card?.cancelledAt != null) continue;
+		due.push(row);
+	}
+	return due;
+}
+
+async function scanProject(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	github: string,
+): Promise<void> {
+	const store = project.store;
+	const repo = repoForProject(github);
+	let pulls: PullInfo[];
+	try {
+		pulls = await listPulls(repo, ctx.gh);
+	} catch (e) {
+		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+		return;
+	}
+	const t = ctx.now();
+	const seen = syncSeenPulls(store, pulls, t);
+	await closeGonePulls(ctx, project, repo, seen);
+	// Converges every card to its row: a reopened PR, or a card an older build left in Done.
+	for (const row of store.listPrReviews()) store.syncPrCard(row.number);
+	// The comment watch: every posted open PR reads the comments since its cutoff.
+	if (store.getSettings().prReviewNotify === true)
+		for (const row of store.listPrReviews()) {
+			if (
+				row.state !== "open" ||
+				row.taskId === null ||
+				row.postedHead === null
+			)
+				continue;
+			// A cancelled card is the user's "never review this PR".
+			if (store.getTask(row.taskId)?.cancelledAt != null) continue;
+			try {
+				await sweepComments(ctx, project, repo, row);
+			} catch (e) {
+				ctx.log(
+					`prs: ${project.name}: #${row.number} sweep failed: ${(e as Error).message}`,
+				);
+			}
+		}
+	for (const row of dueReviewRows(store, t)) {
+		if (
+			store.prReviewRunsSince(t - PR_GATES.DAY_MS) >=
+			PR_GATES.PROJECT_DAILY_RUNS
+		) {
+			ctx.log(
+				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+			);
+			return;
+		}
+		await reviewOnce(ctx, project, repo, row, undefined);
+	}
+}
+
+/**
+ * The comment watch of one row: reads the PR's newest conversation and review comments
+ * since the row's cutoff. A null cutoff initializes to now and stays silent, so the
+ * first sweep after a deploy never alerts. Comment data is untrusted: only a parseable
+ * string created_at and a string user.login count, bodies are never read or stored.
+ * No model call and no daily-cap slot: the watch only reads and writes the two columns.
+ */
+async function sweepComments(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	repo: string,
+	row: PrReviewRow,
+): Promise<void> {
+	const store = project.store;
+	if (row.commentsAt === null) {
+		store.setPrComments(row.number, ctx.now(), false);
+		return;
+	}
+	const since = new Date(row.commentsAt).toISOString();
+	// GitHub answers the issue-comments list oldest first and ignores sort there, so the
+	// sweep never trusts the first page: it reads pages until a short page, at most
+	// MAX_SWEEP_PAGES. `since` bounds each page to the cutoff window (it filters by the
+	// updated time, so a comment edited after the cutoff still arrives; the created_at
+	// check below drops it). A cap stop counts what it read; the rest stays after the
+	// cutoff and a later tick reads it.
+	const read = async (base: string): Promise<unknown[]> => {
+		const out: unknown[] = [];
+		for (let page = 1; page <= MAX_SWEEP_PAGES; page++) {
+			const path = page === 1 ? base : `${base}&page=${page}`;
+			const r = await ctx.gh(["api", path]);
+			if (r.code !== 0)
+				throw new Error(
+					`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+				);
+			let body: unknown;
+			try {
+				body = JSON.parse(r.stdout);
+			} catch {
+				throw new Error("comments: bad JSON");
+			}
+			if (!Array.isArray(body)) throw new Error("comments: not a list");
+			out.push(...body);
+			if (body.length < 100) return out;
+		}
+		ctx.log(
+			`prs: ${project.name}: #${row.number}: the comment sweep stopped at ${MAX_SWEEP_PAGES} pages`,
+		);
+		return out;
+	};
+	const entries = [
+		...(await read(
+			`repos/${repo}/issues/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
+		)),
+		...(await read(
+			`repos/${repo}/pulls/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
+		)),
+	];
+	let newest: number | null = null;
+	let count = 0;
+	for (const e of entries) {
+		if (typeof e !== "object" || e === null) continue;
+		const x = e as Record<string, unknown>;
+		const user = x.user as Record<string, unknown> | null | undefined;
+		if (typeof x.created_at !== "string" || typeof user?.login !== "string")
+			continue;
+		const ts = Date.parse(x.created_at);
+		if (
+			Number.isNaN(ts) ||
+			ts <= row.commentsAt ||
+			user.login === row.postedLogin
+		)
+			continue;
+		count++;
+		if (newest === null || ts > newest) newest = ts;
+	}
+	if (count === 0 || newest === null) return;
+	store.setPrComments(row.number, newest, true);
+	// The card may already be read: drop the mark so it wears the unread badge again.
+	if (row.taskId !== null) ctx.forgetSeen?.(row.taskId);
+	ctx.log(`prs: ${project.name}: #${row.number}: ${count} new comment(s)`);
+}
+
+/** Runs one review attempt of `row`'s head: diff, prompt (with the re-review context), model, draft. */
+async function reviewOnce(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	repo: string,
+	row: PrReviewRow,
+	note: string | undefined,
+): Promise<void> {
+	const store = project.store;
+	const t = ctx.now();
+	// Diff fetch, prompt budget and redaction pause fail the same way for the same head on
+	// every tick: run them before the attempt takes a cap slot, so one such PR cannot
+	// starve the others of the project.
+	let user: string;
+	let earlier: ReReviewContext | null;
+	let diff: string;
+	try {
+		const data = await pullData(repo, row.number, row.head, ctx.gh);
+		if (data === null) {
+			ctx.log(`prs: ${project.name}: #${row.number} moved; next tick`);
+			return;
+		}
+		diff = data.diff;
+		earlier = await fetchReReviewContext({
+			repo,
+			number: row.number,
+			gh: ctx.gh,
+			postedHead: row.postedHead,
+			postedUrl: row.postedUrl,
+			postedLogin: row.postedLogin,
+			reviewedHead: row.reviewedHead,
+			head: row.head,
+			draftBody:
+				row.taskId !== null
+					? (store.getTask(row.taskId)?.details ?? null)
+					: null,
+			draftAt: store.lastPrRunAt(row.number, row.reviewedHead),
+		});
+		user = reviewUserMessage({
+			repo,
+			number: row.number,
+			title: row.title,
+			...data,
+			note,
+			earlier,
+		});
+	} catch (e) {
+		ctx.log(
+			`prs: ${project.name}: #${row.number} review skipped: ${(e as Error).message}`,
+		);
+		return;
+	}
+	// The model attempt counts against the cap before the slow call; only a saved draft
+	// marks the head reviewed, so a failed attempt retries on a later tick.
+	const run = store.startPrRun(row.number, row.head, t);
+	try {
+		// Fit before the cap: a block GitHub would reject on this diff moves into the body.
+		const fitted = fitDraftToDiff(
+			stripInvisible(
+				await ctx.review([
+					{ role: "system", content: reviewSystemPrompt(earlier !== null) },
+					{ role: "user", content: user },
+				]),
+			).text,
+			diff,
+		);
+		const draft = parseDraft(fitted.text);
+		if (fitted.moved > 0)
+			ctx.log(
+				`prs: ${project.name}: #${row.number}: ${fitted.moved} inline comment(s) outside the diff moved into the body`,
+			);
+		store.savePrDraft({
+			run,
+			number: row.number,
+			head: row.head,
+			draft,
+			prompt: `Review of pull request #${row.number} of ${repo} at head ${row.head.slice(0, 7)}: ${row.title}\n${prUrl(repo, row.number)}`,
+		});
+		// A re-review rewrites the draft the user may already have read: drop the
+		// read mark so the card wears the unread badge again. `row` predates the
+		// awaits, and only this single-flight watcher writes task_id.
+		if (row.taskId !== null) ctx.forgetSeen?.(row.taskId);
+	} catch (e) {
+		ctx.log(
+			`prs: ${project.name}: #${row.number} review failed: ${(e as Error).message}`,
+		);
+	}
+}
+
+/** One tick over every project with PR reviews on; `manual` restricts the scan to one project. */
+async function scanTick(
+	ctx: PrWatcherCtx,
+	opts?: { manual?: string },
+): Promise<void> {
+	// Fresh iteration per tick: a one-shot iterator would be empty after the first tick.
+	for (const project of ctx.projects()) {
+		if (opts?.manual !== undefined && project.name !== opts.manual) continue;
+		const github = project.github;
+		if (project.store.getSettings().prReviews !== true || github === null)
+			continue;
+		try {
+			await scanProject(ctx, project, github);
+		} catch (e) {
+			ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+		}
+	}
+}
+
+/** The watched fields of one PR body; throws when the head sha is missing or malformed. */
+function prHeadInfo(stdout: string): {
+	head: string;
+	draft: boolean;
+	title: string;
+} {
+	const j = JSON.parse(stdout) as {
+		head?: { sha?: unknown };
+		draft?: unknown;
+		title?: unknown;
+	} | null;
+	if (typeof j?.head?.sha !== "string" || !SHA_RE.test(j.head.sha))
+		throw new Error("no head sha");
+	return {
+		head: j.head.sha,
+		draft: j.draft === true,
+		title:
+			typeof j.title === "string"
+				? stripInvisible(j.title).text.trim().slice(0, 120)
+				: "",
+	};
+}
+
+/** One explicit review request: refreshes the row's head like the scanner's move branch, then
+ * runs one attempt. Logs and swallows every failure, so it never rejects. */
+async function requestReview(
+	ctx: PrWatcherCtx,
+	o: { project: string; number: number; note: string },
+): Promise<void> {
+	const project = [...ctx.projects()].find((p) => p.name === o.project);
+	if (!project || project.github === null) {
+		ctx.log(`prs: ${o.project}: no such project with GitHub reviews`);
+		return;
+	}
+	let repo: string;
+	try {
+		repo = repoForProject(project.github);
+	} catch (e) {
+		ctx.log(`prs: ${project.name}: ${(e as Error).message}`);
+		return;
+	}
+	const store = project.store;
+	const r = await ctx.gh(["api", `repos/${repo}/pulls/${o.number}`]);
+	if (r.code !== 0) {
+		ctx.log(
+			`prs: ${project.name}: #${o.number} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+		);
+		return;
+	}
+	let head: string;
+	let draft: boolean;
+	let title: string;
+	try {
+		({ head, draft, title } = prHeadInfo(r.stdout));
+	} catch (e) {
+		ctx.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
+		return;
+	}
+	const row = store.getPrReview(o.number);
+	if (!row) {
+		ctx.log(`prs: ${project.name}: #${o.number} is not watched`);
+		return;
+	}
+	// Refresh the head first, like the scanner's move branch: the review names this head.
+	const moved = row.head !== head;
+	const updated: PrReviewRow = {
+		...row,
+		head,
+		firstSeenAt: moved ? ctx.now() : row.firstSeenAt,
+		draft,
+		title,
+		state: "open",
+	};
+	store.savePrReview(updated);
+	const card = updated.taskId ? store.getTask(updated.taskId) : null;
+	// A cancelled card is the user's "never review this PR", even on an explicit request.
+	if (card?.cancelledAt != null) {
+		ctx.log(`prs: ${project.name}: #${o.number} card is cancelled`);
+		return;
+	}
+	const t = ctx.now();
+	if (
+		store.prReviewRunsSince(t - PR_GATES.DAY_MS) >= PR_GATES.PROJECT_DAILY_RUNS
+	) {
+		ctx.log(
+			`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+		);
+		return;
+	}
+	await reviewOnce(ctx, project, repo, updated, o.note);
 }
 
 export function createPrWatcher(deps: {
@@ -633,306 +1189,14 @@ export function createPrWatcher(deps: {
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
-
-	async function scanProject(project: ForkProject): Promise<void> {
-		const store = project.store;
-		const repo =
-			ownerRepo(`${githubHost().webBase}/${project.github}.git`) ??
-			project.github!;
-		if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
-		let pulls: PullInfo[];
-		try {
-			pulls = await listPulls(repo, gh);
-		} catch (e) {
-			deps.log(`prs: ${project.name}: ${(e as Error).message}`);
-			return;
-		}
-		const t = now();
-		const seen = new Set<number>();
-		for (const p of pulls) {
-			seen.add(p.number);
-			const row = store.getPrReview(p.number);
-			if (!row) {
-				store.savePrReview({
-					number: p.number,
-					taskId: null,
-					head: p.head,
-					firstSeenAt: t,
-					reviewedHead: null,
-					postedHead: null,
-					postedUrl: null,
-					postedLogin: null,
-					state: "open",
-					draft: p.draft,
-					title: p.title,
-					postError: null,
-					commentsAt: null,
-					commentsUnseen: false,
-				});
-				continue;
-			}
-			const moved = row.head !== p.head;
-			store.savePrReview({
-				...row,
-				head: p.head,
-				firstSeenAt: moved ? t : row.firstSeenAt,
-				draft: p.draft,
-				title: p.title,
-				state: "open",
-			});
-		}
-		for (const row of store.listPrReviews()) {
-			if (row.state !== "open" || seen.has(row.number)) continue;
-			const r = await gh(["api", `repos/${repo}/pulls/${row.number}`]);
-			if (r.code !== 0) {
-				deps.log(
-					`prs: ${project.name}: #${row.number} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-				);
-				continue;
-			}
-			let merged = false;
-			try {
-				const b = JSON.parse(r.stdout) as { merged_at?: unknown } | null;
-				merged = typeof b?.merged_at === "string";
-			} catch {
-				deps.log(`prs: ${project.name}: #${row.number}: bad JSON`);
-				continue;
-			}
-			// Only the state: a Post may have written the row during the await.
-			store.setPrState(row.number, merged ? "merged" : "closed");
-			store.syncPrCard(row.number);
-		}
-		// Converges every card to its row: a reopened PR, or a card an older build left in Done.
-		for (const row of store.listPrReviews()) store.syncPrCard(row.number);
-		// The comment watch: every posted open PR reads the comments since its cutoff.
-		if (store.getSettings().prReviewNotify === true)
-			for (const row of store.listPrReviews()) {
-				if (
-					row.state !== "open" ||
-					row.taskId === null ||
-					row.postedHead === null
-				)
-					continue;
-				// A cancelled card is the user's "never review this PR".
-				if (store.getTask(row.taskId)?.cancelledAt != null) continue;
-				try {
-					await sweepComments(project, repo, row);
-				} catch (e) {
-					deps.log(
-						`prs: ${project.name}: #${row.number} sweep failed: ${(e as Error).message}`,
-					);
-				}
-			}
-		for (const row of store.listPrReviews()) {
-			if (
-				row.state !== "open" ||
-				row.draft ||
-				store.prHeadReviewed(row.number, row.head) ||
-				row.firstSeenAt > t - PR_GATES.QUIET_MS
-			)
-				continue;
-			const card = row.taskId ? store.getTask(row.taskId) : null;
-			// A cancelled card is the user's "never review this PR".
-			if (card?.cancelledAt != null) continue;
-			if (
-				store.prReviewRunsSince(t - PR_GATES.DAY_MS) >=
-				PR_GATES.PROJECT_DAILY_RUNS
-			) {
-				deps.log(
-					`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
-				);
-				return;
-			}
-			await reviewOnce(project, repo, row, undefined);
-		}
-	}
-
-	/**
-	 * The comment watch of one row: reads the PR's newest conversation and review comments
-	 * since the row's cutoff. A null cutoff initializes to now and stays silent, so the
-	 * first sweep after a deploy never alerts. Comment data is untrusted: only a parseable
-	 * string created_at and a string user.login count, bodies are never read or stored.
-	 * No model call and no daily-cap slot: the watch only reads and writes the two columns.
-	 */
-	async function sweepComments(
-		project: ForkProject,
-		repo: string,
-		row: PrReviewRow,
-	): Promise<void> {
-		const store = project.store;
-		if (row.commentsAt === null) {
-			store.setPrComments(row.number, now(), false);
-			return;
-		}
-		const since = new Date(row.commentsAt).toISOString();
-		// GitHub answers the issue-comments list oldest first and ignores sort there, so the
-		// sweep never trusts the first page: it reads pages until a short page, at most
-		// MAX_SWEEP_PAGES. `since` bounds each page to the cutoff window (it filters by the
-		// updated time, so a comment edited after the cutoff still arrives; the created_at
-		// check below drops it). A cap stop counts what it read; the rest stays after the
-		// cutoff and a later tick reads it.
-		const read = async (base: string): Promise<unknown[]> => {
-			const out: unknown[] = [];
-			for (let page = 1; page <= MAX_SWEEP_PAGES; page++) {
-				const path = page === 1 ? base : `${base}&page=${page}`;
-				const r = await gh(["api", path]);
-				if (r.code !== 0)
-					throw new Error(
-						`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-					);
-				let body: unknown;
-				try {
-					body = JSON.parse(r.stdout);
-				} catch {
-					throw new Error("comments: bad JSON");
-				}
-				if (!Array.isArray(body)) throw new Error("comments: not a list");
-				out.push(...body);
-				if (body.length < 100) return out;
-			}
-			deps.log(
-				`prs: ${project.name}: #${row.number}: the comment sweep stopped at ${MAX_SWEEP_PAGES} pages`,
-			);
-			return out;
-		};
-		const entries = [
-			...(await read(
-				`repos/${repo}/issues/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
-			)),
-			...(await read(
-				`repos/${repo}/pulls/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
-			)),
-		];
-		let newest: number | null = null;
-		let count = 0;
-		for (const e of entries) {
-			if (typeof e !== "object" || e === null) continue;
-			const x = e as Record<string, unknown>;
-			const user = x.user as Record<string, unknown> | null | undefined;
-			if (typeof x.created_at !== "string" || typeof user?.login !== "string")
-				continue;
-			const ts = Date.parse(x.created_at);
-			if (
-				Number.isNaN(ts) ||
-				ts <= row.commentsAt ||
-				user.login === row.postedLogin
-			)
-				continue;
-			count++;
-			if (newest === null || ts > newest) newest = ts;
-		}
-		if (count === 0 || newest === null) return;
-		store.setPrComments(row.number, newest, true);
-		// The card may already be read: drop the mark so it wears the unread badge again.
-		if (row.taskId !== null) deps.forgetSeen?.(row.taskId);
-		deps.log(`prs: ${project.name}: #${row.number}: ${count} new comment(s)`);
-	}
-
-	/** Runs one review attempt of `row`'s head: diff, prompt (with the re-review context), model, draft. */
-	async function reviewOnce(
-		project: ForkProject,
-		repo: string,
-		row: PrReviewRow,
-		note: string | undefined,
-	): Promise<void> {
-		const store = project.store;
-		const t = now();
-		// Diff fetch, prompt budget and redaction pause fail the same way for the same head on
-		// every tick: run them before the attempt takes a cap slot, so one such PR cannot
-		// starve the others of the project.
-		let user: string;
-		let earlier: ReReviewContext | null;
-		let diff: string;
-		try {
-			const data = await pullData(repo, row.number, row.head, gh);
-			if (data === null) {
-				deps.log(`prs: ${project.name}: #${row.number} moved; next tick`);
-				return;
-			}
-			diff = data.diff;
-			earlier = await fetchReReviewContext({
-				repo,
-				number: row.number,
-				gh,
-				postedHead: row.postedHead,
-				postedUrl: row.postedUrl,
-				postedLogin: row.postedLogin,
-				reviewedHead: row.reviewedHead,
-				head: row.head,
-				draftBody:
-					row.taskId !== null
-						? (store.getTask(row.taskId)?.details ?? null)
-						: null,
-				draftAt: store.lastPrRunAt(row.number, row.reviewedHead),
-			});
-			user = reviewUserMessage({
-				repo,
-				number: row.number,
-				title: row.title,
-				...data,
-				note,
-				earlier,
-			});
-		} catch (e) {
-			deps.log(
-				`prs: ${project.name}: #${row.number} review skipped: ${(e as Error).message}`,
-			);
-			return;
-		}
-		// The model attempt counts against the cap before the slow call; only a saved draft
-		// marks the head reviewed, so a failed attempt retries on a later tick.
-		const run = store.startPrRun(row.number, row.head, t);
-		try {
-			// Fit before the cap: a block GitHub would reject on this diff moves into the body.
-			const fitted = fitDraftToDiff(
-				stripInvisible(
-					await review([
-						{ role: "system", content: reviewSystemPrompt(earlier !== null) },
-						{ role: "user", content: user },
-					]),
-				).text,
-				diff,
-			);
-			const draft = parseDraft(fitted.text);
-			if (fitted.moved > 0)
-				deps.log(
-					`prs: ${project.name}: #${row.number}: ${fitted.moved} inline comment(s) outside the diff moved into the body`,
-				);
-			store.savePrDraft({
-				run,
-				number: row.number,
-				head: row.head,
-				draft,
-				prompt: `Review of pull request #${row.number} of ${repo} at head ${row.head.slice(0, 7)}: ${row.title}\n${prUrl(repo, row.number)}`,
-			});
-			// A re-review rewrites the draft the user may already have read: drop the
-			// read mark so the card wears the unread badge again. `row` predates the
-			// awaits, and only this single-flight watcher writes task_id.
-			if (row.taskId !== null) deps.forgetSeen?.(row.taskId);
-		} catch (e) {
-			deps.log(
-				`prs: ${project.name}: #${row.number} review failed: ${(e as Error).message}`,
-			);
-		}
-	}
-
-	async function scan(opts?: { manual?: string }): Promise<void> {
-		// Fresh iteration per tick: a one-shot iterator would be empty after the first tick.
-		for (const project of deps.projects()) {
-			if (opts?.manual !== undefined && project.name !== opts.manual) continue;
-			if (
-				project.store.getSettings().prReviews !== true ||
-				project.github === null
-			)
-				continue;
-			try {
-				await scanProject(project);
-			} catch (e) {
-				deps.log(`prs: ${project.name}: ${(e as Error).message}`);
-			}
-		}
-	}
-
+	const ctx: PrWatcherCtx = {
+		projects: deps.projects,
+		log: deps.log,
+		gh,
+		now,
+		review,
+		forgetSeen: deps.forgetSeen,
+	};
 	// Review requests serialize through one chain per watcher; reviewIdle resolves when it drains.
 	let tail: Promise<void> = Promise.resolve();
 	const enqueue = (job: () => Promise<void>): Promise<void> => {
@@ -940,95 +1204,10 @@ export function createPrWatcher(deps: {
 		tail = run.catch(() => {});
 		return run;
 	};
-
-	async function requestReview(o: {
-		project: string;
-		number: number;
-		note: string;
-	}): Promise<void> {
-		const project = [...deps.projects()].find((p) => p.name === o.project);
-		if (!project || project.github === null) {
-			deps.log(`prs: ${o.project}: no such project with GitHub reviews`);
-			return;
-		}
-		let repo: string;
-		try {
-			repo =
-				ownerRepo(`${githubHost().webBase}/${project.github}.git`) ??
-				project.github;
-			if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
-		} catch (e) {
-			deps.log(`prs: ${project.name}: ${(e as Error).message}`);
-			return;
-		}
-		const store = project.store;
-		const r = await gh(["api", `repos/${repo}/pulls/${o.number}`]);
-		if (r.code !== 0) {
-			deps.log(
-				`prs: ${project.name}: #${o.number} failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-			);
-			return;
-		}
-		let head: string;
-		let draft: boolean;
-		let title: string;
-		try {
-			const j = JSON.parse(r.stdout) as {
-				head?: { sha?: unknown };
-				draft?: unknown;
-				title?: unknown;
-			} | null;
-			if (typeof j?.head?.sha !== "string" || !SHA_RE.test(j.head.sha))
-				throw new Error("no head sha");
-			head = j.head.sha;
-			draft = j.draft === true;
-			title =
-				typeof j.title === "string"
-					? stripInvisible(j.title).text.trim().slice(0, 120)
-					: "";
-		} catch (e) {
-			deps.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
-			return;
-		}
-		const row = store.getPrReview(o.number);
-		if (!row) {
-			deps.log(`prs: ${project.name}: #${o.number} is not watched`);
-			return;
-		}
-		// Refresh the head first, like the scanner's move branch: the review names this head.
-		const moved = row.head !== head;
-		const updated: PrReviewRow = {
-			...row,
-			head,
-			firstSeenAt: moved ? now() : row.firstSeenAt,
-			draft,
-			title,
-			state: "open",
-		};
-		store.savePrReview(updated);
-		const card = updated.taskId ? store.getTask(updated.taskId) : null;
-		// A cancelled card is the user's "never review this PR", even on an explicit request.
-		if (card?.cancelledAt != null) {
-			deps.log(`prs: ${project.name}: #${o.number} card is cancelled`);
-			return;
-		}
-		const t = now();
-		if (
-			store.prReviewRunsSince(t - PR_GATES.DAY_MS) >=
-			PR_GATES.PROJECT_DAILY_RUNS
-		) {
-			deps.log(
-				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
-			);
-			return;
-		}
-		await reviewOnce(project, repo, updated, o.note);
-	}
-
 	return {
-		tick: singleFlightTick(scan),
+		tick: singleFlightTick((opts) => scanTick(ctx, opts)),
 		// An explicit request never rejects: requestReview logs every failure and swallows it.
-		reviewNow: (o) => enqueue(() => requestReview(o).catch(() => {})),
+		reviewNow: (o) => enqueue(() => requestReview(ctx, o).catch(() => {})),
 		reviewIdle: () => tail,
 	};
 }

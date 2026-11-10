@@ -1130,6 +1130,17 @@ describe("runReleaseCommand against real repos", () => {
 });
 
 describe("latestImage", () => {
+	/** The stub answer for a URL: the matching route's response, else 404. */
+	function stubRoute(routes: Record<string, unknown>, url: string): Response {
+		for (const [match, res] of Object.entries(routes))
+			if (url.includes(match))
+				return new Response(
+					typeof res === "number" ? "" : JSON.stringify(res),
+					{ status: typeof res === "number" ? res : 200 },
+				);
+		return new Response("", { status: 404 });
+	}
+
 	/** Stub global fetch; routes is a URL-substring → JSON-body-or-status map. Returns calls + restore. */
 	function stubFetch(routes: Record<string, unknown>): {
 		calls: string[];
@@ -1140,13 +1151,7 @@ describe("latestImage", () => {
 		globalThis.fetch = (async (input: RequestInfo | URL) => {
 			const url = String(input);
 			calls.push(url);
-			for (const [match, res] of Object.entries(routes))
-				if (url.includes(match))
-					return new Response(
-						typeof res === "number" ? "" : JSON.stringify(res),
-						{ status: typeof res === "number" ? res : 200 },
-					);
-			return new Response("", { status: 404 });
+			return stubRoute(routes, url);
 		}) as typeof fetch;
 		return {
 			calls,
@@ -1195,6 +1200,27 @@ describe("latestImage", () => {
 		}
 	});
 
+	/** A route hit becomes a 200 response; null when no route matches. */
+	function hangResponse(
+		routes: Record<string, unknown>,
+		input: RequestInfo | URL,
+	): Response | null {
+		const url = String(input);
+		for (const [match, res] of Object.entries(routes))
+			if (url.includes(match))
+				return new Response(JSON.stringify(res), { status: 200 });
+		return null;
+	}
+
+	/** A response promise that never settles on its own, but rejects with the signal's reason on abort. */
+	function hangPending(init?: RequestInit): Promise<Response> {
+		const { promise, reject } = Promise.withResolvers<Response>();
+		init?.signal?.addEventListener("abort", () =>
+			reject((init.signal as AbortSignal).reason),
+		);
+		return promise;
+	}
+
 	/** Stub fetch that never settles on its own, but rejects with the signal's reason on abort. */
 	function hangFetch(routes: Record<string, unknown>): { restore: () => void } {
 		const real = globalThis.fetch;
@@ -1202,15 +1228,9 @@ describe("latestImage", () => {
 			input: RequestInfo | URL,
 			init?: RequestInit,
 		) => {
-			const url = String(input);
-			for (const [match, res] of Object.entries(routes))
-				if (url.includes(match))
-					return new Response(JSON.stringify(res), { status: 200 });
-			const { promise, reject } = Promise.withResolvers<Response>();
-			init?.signal?.addEventListener("abort", () =>
-				reject((init.signal as AbortSignal).reason),
-			);
-			return promise;
+			const hit = hangResponse(routes, input);
+			if (hit !== null) return hit;
+			return hangPending(init);
 		}) as typeof fetch;
 		return {
 			restore: () => {
