@@ -349,6 +349,14 @@ import {
 import board from "./ui/index.html";
 import { SLOT_STAGES, slotUse } from "./ui/queue.ts";
 import {
+	isUpdateCommit,
+	parseUpdateHostHeartbeat,
+	UpdateCycleController,
+	type UpdateCycleView,
+	type UpdateHostHeartbeat,
+	type UpdateHostReply,
+} from "./updateCycle.ts";
+import {
 	addSkip,
 	loadSkips,
 	mapRepo,
@@ -4188,6 +4196,41 @@ export function createApp(deps: AppDeps) {
 	/** OTTR-454 per-runner holds (worker hostname or "local") from POST /api/drain {runner};
 	 * in-memory like drainUntil, no commit subjects, never shown in the notice bar. */
 	const runnerDrains = new Map<string, number>();
+	const updateCycle = new UpdateCycleController();
+
+	/** A failed reader is not proof that the board is idle. */
+	function updateCycleIdle(): boolean {
+		try {
+			const turns = deps.runnerTurns?.();
+			if (turns === undefined) return false;
+			const counts = [
+				turns.local,
+				turns.preparing,
+				...Object.values(turns.workers),
+			];
+			if (!counts.every((count) => Number.isSafeInteger(count) && count === 0))
+				return false;
+			for (const e of deps.projects.values())
+				if (
+					e.store
+						.listTasks()
+						.some(
+							(task) => task.state === "running" || task.state === "preparing",
+						)
+				)
+					return false;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	function updateCycleView(now: number): UpdateCycleView | null {
+		if (deps.hosted !== undefined) return null;
+		const cycle = updateCycle.view(now, false);
+		if (cycle?.phase === "idle") cycle.canStart = updateCycleIdle();
+		return cycle;
+	}
 
 	/** The trending scout's open proposals: proposal card id → repo (one map per project, not
 	 *  a lookup per card). */
@@ -4387,6 +4430,7 @@ export function createApp(deps: AppDeps) {
 
 	function stateResponse(): StateResponse {
 		const now = Date.now();
+		const cycle = updateCycleView(now);
 		const { tasks, keptHeld, keptStale, keptCards } = boardCards(now);
 		const scan = currentOrphanScan();
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
@@ -4460,6 +4504,7 @@ export function createApp(deps: AppDeps) {
 			deadSignIns: dead,
 			restartWait: restartWaitView(),
 			seedFailed: seedFailedView(),
+			updateCycle: cycle,
 		};
 	}
 
@@ -5445,6 +5490,23 @@ export function createApp(deps: AppDeps) {
 	let behind = 0;
 	let behindCommits: string[] = [];
 	let behindAt = 0;
+	function effectiveUpdate(): { behind: number; commits: string[] } {
+		return (
+			updateCycle.available(Date.now()) ?? { behind, commits: behindCommits }
+		);
+	}
+
+	let lastUpdateJson = "";
+	function publishUpdate(): void {
+		const message = {
+			type: "update",
+			...effectiveUpdate(),
+		} satisfies ServerMessage;
+		const text = JSON.stringify(message);
+		if (text === lastUpdateJson) return;
+		lastUpdateJson = text;
+		publish(message);
+	}
 	let quota: QuotaState | null = null;
 	let refreshingQuota = false;
 
@@ -5503,7 +5565,10 @@ export function createApp(deps: AppDeps) {
 			type: "state",
 			state,
 		} satisfies ServerMessage);
-		if (text === lastStateJson) return false;
+		if (text === lastStateJson) {
+			publishUpdate();
+			return false;
+		}
 		// Diff the cards against the kept baseline and push out-of-band (closed phone app).
 		// Fire-and-forget: a push failure never breaks the publish.
 		try {
@@ -5531,6 +5596,7 @@ export function createApp(deps: AppDeps) {
 		lastStateJson = text;
 		if (sockets > 0 && deps.serverRef.current !== undefined)
 			deps.serverRef.current.publish("board", text);
+		publishUpdate();
 		return true;
 	}
 
@@ -5616,13 +5682,16 @@ export function createApp(deps: AppDeps) {
 			.finally(() => {
 				sampling = false;
 			});
-		if (Date.now() - behindAt > 300_000 && !refreshingBehind) {
+		if (
+			updateCycle.available(Date.now()) === null &&
+			Date.now() - behindAt > 300_000 &&
+			!refreshingBehind
+		) {
 			refreshingBehind = true;
-			const prev = behind;
+			const previous = JSON.stringify(effectiveUpdate());
 			void refreshBehind()
 				.then(() => {
-					if (behind !== prev)
-						publish({ type: "update", behind, commits: behindCommits });
+					if (JSON.stringify(effectiveUpdate()) !== previous) publishUpdate();
 				})
 				.catch(() => {
 					// Failed refresh: keep the last value; the next 5 min window retries.
@@ -7002,9 +7071,67 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handleGETUpdate(): Promise<Response> {
-		// Five minutes: the banner tolerates staleness, and each refresh spawns git + network.
-		if (Date.now() - behindAt > 300_000) await refreshBehind();
-		return json({ behind, commits: behindCommits });
+		// A live host reads git for containers without a checkout.
+		if (
+			updateCycle.available(Date.now()) === null &&
+			Date.now() - behindAt > 300_000
+		)
+			await refreshBehind();
+		return json(effectiveUpdate());
+	}
+
+	async function handlePOSTUpdate(req: Request): Promise<Response> {
+		if (deps.hosted !== undefined) return json({ error: "not found" }, 404);
+		const read = await readJson(req, 1_024);
+		if ("error" in read) return read.error;
+		if (Object.keys(read.body).length !== 0)
+			return json(
+				{ error: "The update request must be an empty object." },
+				400,
+			);
+		// No await can let a turn claim a runner between this check and the hold.
+		const idle = updateCycleIdle();
+		const result = updateCycle.request(Date.now(), idle);
+		return json(result, "error" in result ? 409 : 202);
+	}
+
+	function eligibleUpdateHost(req: Request): boolean {
+		return (
+			!walled(req) &&
+			!["x-board-token", "x-api-key", "cookie"].some((name) =>
+				req.headers.has(name),
+			)
+		);
+	}
+
+	function redactUpdateHeartbeat(heartbeat: UpdateHostHeartbeat): void {
+		const secrets = gitSecrets();
+		if (heartbeat.error !== null)
+			heartbeat.error = redact(heartbeat.error, secrets).slice(0, 1_200);
+		if (heartbeat.available !== null)
+			heartbeat.available.commits = heartbeat.available.commits.map((subject) =>
+				redact(subject, secrets).slice(0, 200),
+			);
+	}
+
+	async function handlePOSTUpdateHost(req: Request): Promise<Response> {
+		if (deps.hosted !== undefined) return json({ error: "not found" }, 404);
+		if (!eligibleUpdateHost(req))
+			return json({ error: "The update host requires direct loopback." }, 403);
+		const read = await readJson(req);
+		if ("error" in read) return read.error;
+		const heartbeat = parseUpdateHostHeartbeat(read.body);
+		if (heartbeat === null)
+			return json({ error: "Invalid update host heartbeat." }, 400);
+		redactUpdateHeartbeat(heartbeat);
+		const result = updateCycle.heartbeat(heartbeat, Date.now());
+		if ("error" in result) return json(result, 409);
+		const build = readBoardHomeFile("build-commit");
+		const version = isUpdateCommit(build) ? build : deps.serverVersion;
+		return json({
+			requestId: result.requestId,
+			runningCommit: isUpdateCommit(version) ? version : null,
+		} satisfies UpdateHostReply);
 	}
 
 	async function handlePOSTProviderLogout(req: Request): Promise<Response> {
@@ -10483,6 +10610,10 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/update": {
 			GET: (req) => api(req, () => handleGETUpdate()),
+			POST: (req) => api(req, () => handlePOSTUpdate(req)),
+		},
+		"/api/update/host": {
+			POST: (req) => api(req, () => handlePOSTUpdateHost(req)),
 		},
 		"/api/projects/:project/icon": {
 			GET: (req) => api(req, () => handleGETProjectsIconByProject(req)),
@@ -10732,8 +10863,7 @@ export function createApp(deps: AppDeps) {
 					ws.send(
 						JSON.stringify({
 							type: "update",
-							behind,
-							commits: behindCommits,
+							...effectiveUpdate(),
 						} satisfies ServerMessage),
 					);
 					if (lastSystemJson !== null) ws.send(lastSystemJson);
@@ -10755,7 +10885,8 @@ export function createApp(deps: AppDeps) {
 		publishState,
 		publishSoon,
 		notifyLog,
-		drained: () => Date.now() < drainUntil,
+		drained: () =>
+			Date.now() < Math.max(drainUntil, updateCycle.holdUntil(Date.now())),
 		// OTTR-465: the credential kinds the server's git can use for a push to a URL, for the
 		// card log; never a value. A missing App installation on a repo shows as a permission
 		// failure, and this line is what names the installation token the push went out with.
@@ -10792,7 +10923,9 @@ export function createApp(deps: AppDeps) {
 						timeoutMs: deps.githubAuthProbe?.timeoutMs,
 					}),
 		// OTTR-454: a per-runner hold gates new turns on one runner only.
-		drainedRunner: (id: string) => Date.now() < (runnerDrains.get(id) ?? 0),
+		drainedRunner: (id: string) =>
+			Date.now() <
+			Math.max(runnerDrains.get(id) ?? 0, updateCycle.holdUntil(Date.now())),
 		// OTTR-754: the /tmp free-space warning phrase for this runner ("local" or a worker
 		// hostname), or null when space is fine or unknown; the turn start gate holds on it.
 		tmpFullLine: (runner: string): string | null => {

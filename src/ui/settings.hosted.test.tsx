@@ -666,6 +666,12 @@ describe("hosted app shell", () => {
 	// harness does not open, so these tests cover the two state-driven notices.
 	const updateServer = {
 		state: {
+			updateCycle: {
+				nextCycleAt: Date.now() + 3_600_000,
+				phase: "idle",
+				canStart: true,
+				error: null,
+			},
 			drainUntil: 1_700_000_000_000,
 			drainCommits: ["drain-commit-1"],
 			restartWait: {
@@ -688,6 +694,8 @@ describe("hosted app shell", () => {
 				const text = document.body.textContent ?? "";
 				expect(text).not.toContain("An Ottr update is ready");
 				expect(text).not.toContain("The board runs aaaaaaa");
+				expect(text).not.toContain("Next update cycle");
+				expect(document.querySelector(".update-cycle button")).toBeNull();
 			},
 			updateServer,
 		);
@@ -704,6 +712,9 @@ describe("hosted app shell", () => {
 				expect(text).toContain("drain-commit-1");
 				expect(text).toContain(
 					"The board runs aaaaaaa; the image holds bbbbbbb",
+				);
+				expect(document.querySelectorAll(".update-cycle button")).toHaveLength(
+					1,
 				);
 			},
 			updateServer,

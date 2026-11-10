@@ -1992,6 +1992,33 @@ button.notif-link {
 	min-width: 24px;
 	color: var(--dim);
 }
+.update-cycle {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 4px 8px;
+	margin-top: 4px;
+	min-width: 0;
+}
+.update-cycle-status {
+	font-variant-numeric: tabular-nums;
+}
+.update-cycle > button {
+	flex: none;
+}
+.update-cycle > span:last-child:not(:first-child) {
+	flex-basis: 100%;
+	overflow-wrap: anywhere;
+}
+.update-cycle-error {
+	color: var(--crit-text);
+}
+.update-cycle-restart {
+	margin: 4px 0 0 24px;
+}
+.update-cycle-notice > .update-cycle {
+	margin-left: 24px;
+}
 /* Update banner bullet list: the pending commits, scrollable when a long
    divergence piles up so the popover stays bounded. */
 .notif-commits {
@@ -2004,6 +2031,9 @@ button.notif-link {
 .notif-commits li {
 	margin: 2px 0;
 	overflow-wrap: anywhere;
+}
+.update-cycle-notice > .notif-commits {
+	padding-left: 24px;
 }
 
 /* ---- Shell: area list + main pane ---- */

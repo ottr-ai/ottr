@@ -76,6 +76,7 @@ import {
 	type UpdatesView,
 	VERSION_RE,
 } from "../types.ts";
+import type { UpdateCycleView } from "../updateCycle.ts";
 import { mapRepo } from "../updates.ts";
 import {
 	type AttachedImage,
@@ -14535,6 +14536,8 @@ function AppInboxPanel(p: {
 					provisionErrKey={provisionErrKey}
 					isNew={isNew}
 					setNotice={setNotice}
+					updateCycle={state?.updateCycle ?? null}
+					nowMs={nowMs}
 				/>
 				<AppAdvisoryLines
 					state={state}
@@ -14576,27 +14579,39 @@ function AppInboxPanel(p: {
 }
 
 /** The upstream version notice and the pending commit list. */
-function AppBehindNotice(p: {
+export function AppBehindNotice(p: {
 	behind: number;
 	behindKey: string | null;
 	behindCommits: string[];
 	isNew: (key: string) => boolean;
+	updateCycle: UpdateCycleView | null;
+	nowMs: number;
 }) {
 	const { behind, behindKey, behindCommits, isNew } = p;
 	return (
 		behind > 0 && (
-			<>
-				<p className="notif-line" data-inbox-key={behindKey ?? undefined}>
+			<div
+				className="update-cycle-notice"
+				data-inbox-key={behindKey ?? undefined}
+			>
+				<p className="notif-line">
 					<Icon name="info" size={16} />
 					<span>
 						A new Ottr version is available ({behind} commit
-						{behind === 1 ? "" : "s"}). Stop the server, run{" "}
-						<code>bun run update</code>, then start it again.
+						{behind === 1 ? "" : "s"}).
+						{p.updateCycle === null && (
+							<>
+								{" "}
+								Host control is unavailable. Stop the server, run{" "}
+								<code>bun run update</code>, then start it again.
+							</>
+						)}
 					</span>
 					{behindKey !== null && isNew(behindKey) && (
 						<span className="new-tag">New</span>
 					)}
 				</p>
+				<UpdateCycleControl cycle={p.updateCycle} nowMs={p.nowMs} />
 				{behindCommits.length > 0 && (
 					<ul className="notif-commits">
 						{behindCommits.map((c) => (
@@ -14604,8 +14619,75 @@ function AppBehindNotice(p: {
 						))}
 					</ul>
 				)}
-			</>
+			</div>
 		)
+	);
+}
+
+/** The host owns the schedule. A missing view also covers an expired host lease. */
+export function UpdateCycleControl({
+	cycle,
+	nowMs,
+}: {
+	cycle: UpdateCycleView | null;
+	nowMs: number;
+}) {
+	const [requested, setRequested] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const request = useRef(false);
+	useEffect(() => {
+		if (cycle === null) setError(null);
+		if (cycle === null || cycle.phase !== "idle") {
+			setRequested(false);
+			request.current = false;
+		}
+	}, [cycle]);
+	if (cycle === null) return null;
+	const phase = requested ? "requested" : cycle.phase;
+	let status = "Update cycle in progress.";
+	if (phase === "requested") status = "Update requested. Wait for the host.";
+	else if (phase === "idle") {
+		status =
+			cycle.nextCycleAt <= nowMs
+				? "Next update cycle is due."
+				: `Next update cycle in ${duration(cycle.nextCycleAt - nowMs)}.`;
+	}
+	return (
+		<span className="update-cycle">
+			<span className="update-cycle-status" role="status">
+				{status}
+			</span>
+			<BusyButton
+				disabled={!cycle.canStart || phase !== "idle"}
+				title="Fetch commits, build the image, and update Ottr"
+				run={async () => {
+					if (request.current) return false;
+					request.current = true;
+					setRequested(true);
+					setError(null);
+					try {
+						await post("/api/update", {});
+						refreshState();
+						return true;
+					} catch (e) {
+						request.current = false;
+						setRequested(false);
+						setError(e instanceof Error ? e.message : String(e));
+						return false;
+					}
+				}}
+			>
+				Update
+			</BusyButton>
+			{phase === "idle" && !cycle.canStart && (
+				<span>No turn can run or prepare. Wait until all turns finish.</span>
+			)}
+			{(error ?? cycle.error) !== null && (
+				<span className="update-cycle-error" role="alert">
+					{error ?? cycle.error} Retry when the host is available.
+				</span>
+			)}
+		</span>
 	);
 }
 
@@ -14629,6 +14711,8 @@ function AppInfoLines(p: {
 	provisionErrKey: string | null;
 	isNew: (key: string) => boolean;
 	setNotice: (v: string | null) => void;
+	updateCycle: UpdateCycleView | null;
+	nowMs: number;
 }) {
 	const {
 		notice,
@@ -14648,6 +14732,7 @@ function AppInfoLines(p: {
 		isNew,
 		setNotice,
 	} = p;
+	const showRestartControl = behind <= 0 && restartWait !== null;
 	if (
 		!(
 			notice !== null ||
@@ -14705,12 +14790,19 @@ function AppInfoLines(p: {
 				behindKey={behindKey}
 				behindCommits={behindCommits}
 				isNew={isNew}
+				updateCycle={p.updateCycle}
+				nowMs={p.nowMs}
 			/>
 			<RestartWaitLine
 				wait={restartWait}
 				inboxKey={restartWaitKey ?? undefined}
 				fresh={restartWaitKey !== null && isNew(restartWaitKey)}
 			/>
+			{showRestartControl && (
+				<div className="update-cycle-restart">
+					<UpdateCycleControl cycle={p.updateCycle} nowMs={p.nowMs} />
+				</div>
+			)}
 			<SeedFailedLine
 				fail={seedFailed}
 				inboxKey={seedFailKey ?? undefined}

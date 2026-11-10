@@ -43,7 +43,7 @@ import {
 	workerSignInWarnings,
 	workerTmpWarnings,
 } from "./app.ts";
-import { hashPassword, signSession } from "./auth.ts";
+import { hashPassword, signIdentity, signSession } from "./auth.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
@@ -98,6 +98,12 @@ import {
 	REVIEW_FOOTER,
 	type Task,
 } from "./types.ts";
+import {
+	UPDATE_HOST_LEASE_MS,
+	type UpdateCycleView,
+	type UpdateHostHeartbeat,
+	type UpdateHostReply,
+} from "./updateCycle.ts";
 import { loadSkips } from "./updates.ts";
 import { vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
@@ -424,6 +430,14 @@ function mount(
 		/** Idle-review clock seam (docs/specs/mutation-delta.md §7); defaults to Date.now. */
 		now?: () => number;
 		schedule?: () => void;
+		runnerTurns?: Parameters<typeof createApp>[0]["runnerTurns"];
+		runners?: Parameters<typeof createApp>[0]["runners"];
+		serverVersion?: string;
+		publicHosts?: string[];
+		/** Use the listener's actual port for browser WebSocket handshakes. */
+		realPort?: boolean;
+		hosted?: Parameters<typeof createApp>[0]["hosted"];
+		board?: Parameters<typeof createApp>[0]["board"];
 		/** Gateway spawn seam for the release-summary route; defaults to the real spawn. */
 		releaseSummarySpawn?: Parameters<
 			typeof createApp
@@ -459,7 +473,7 @@ function mount(
 			},
 			sessionSecret: "test-secret",
 		});
-	const created = createApp({
+	const appDeps: Parameters<typeof createApp>[0] = {
 		gstore: g,
 		projects: input.projects ?? new Map(),
 		cancel: async () => ({ removed: true }),
@@ -468,9 +482,9 @@ function mount(
 		claimedPids: () => new Set<number>(),
 		schedule: input.schedule ?? (() => {}),
 		now: input.now,
-		serverVersion: "test",
+		serverVersion: input.serverVersion ?? "test",
 		port: 0,
-		publicHosts: [],
+		publicHosts: input.publicHosts ?? [],
 		shared: {
 			maxTotalRuns: 3,
 			reviewCheck: true,
@@ -498,9 +512,19 @@ function mount(
 		rerunFetch: input.rerunFetch,
 		githubTokenExpiryTimeoutMs: input.githubTokenExpiryTimeoutMs,
 		slowApiMs: input.slowApiMs,
+		runnerTurns: input.runnerTurns,
+		runners: input.runners,
+		hosted: input.hosted,
+		board: input.board,
 		serverRef: { current: undefined },
-	});
+	};
+	const created = createApp(appDeps);
 	const srv = Bun.serve({ port: 0, ...created.serveOptions });
+	if (input.realPort) {
+		if (srv.port === undefined)
+			throw new Error("The test listener needs a port.");
+		appDeps.port = srv.port;
+	}
 	created.serverRef.current = srv;
 	mounted.push(srv);
 	const call = (
@@ -514,8 +538,8 @@ function mount(
 			method: method ?? (body === undefined ? "GET" : "POST"),
 			headers: {
 				...(body === undefined ? {} : { "content-type": "application/json" }),
-				Host: "127.0.0.1:0",
-				Origin: "http://127.0.0.1:0",
+				Host: input.realPort ? srv.url.host : "127.0.0.1:0",
+				Origin: input.realPort ? srv.url.origin : "http://127.0.0.1:0",
 				...rest,
 			},
 			body: body === undefined ? undefined : JSON.stringify(body),
@@ -10572,6 +10596,699 @@ describe("session registry (OTTR-387)", () => {
 		);
 		expect(cross.status).toBe(403);
 		expect(await cross.json()).toEqual({ error: "forbidden origin" });
+	});
+});
+
+describe("update cycle control (OTTR-752)", () => {
+	const stores: ProjectStore[] = [];
+	let fixture = 0;
+	afterAll(() => {
+		for (const s of stores) s.close();
+	});
+
+	const heartbeat = (
+		patch: Partial<UpdateHostHeartbeat> = {},
+	): UpdateHostHeartbeat => ({
+		controller: "host-1",
+		nextCycleAt: Date.now() + 3_600_000,
+		phase: "idle",
+		requestId: null,
+		error: null,
+		available: {
+			behind: 2,
+			commits: ["Fix update control", "Add host schedule"],
+		},
+		...patch,
+	});
+
+	function board(options: Parameters<typeof mount>[0] = {}) {
+		const entries = new Map<string, Entry>();
+		for (const name of ["ottr", "other"]) {
+			const path = join(root, `update-cycle-${fixture++}-${name}`);
+			mkdirSync(path, { recursive: true });
+			const store = ProjectStore.open(path);
+			stores.push(store);
+			entries.set(name, {
+				name,
+				path,
+				store,
+				target: null,
+				gitless: false,
+				github: null,
+				protectedTarget: false,
+				remote: null,
+				dirty: false,
+				mainUnpushed: false,
+				mainBranch: null,
+				latestRelease: null,
+				latestImage: null,
+				archReview: null,
+			});
+		}
+		const counts = {
+			failed: false,
+			turns: { local: 0, workers: {} as Record<string, number>, preparing: 0 },
+		};
+		const m = mount({
+			projects: entries,
+			runners: [
+				{ id: "local", url: null },
+				{ id: "worker-a", url: "http://worker-a:8787" },
+			],
+			runnerTurns: () => {
+				if (counts.failed) throw new Error("The runner state is unreadable.");
+				return counts.turns;
+			},
+			...options,
+		});
+		const view = async () => {
+			const state = (await (await m.call("/api/state")).json()) as {
+				updateCycle: UpdateCycleView | null;
+			};
+			return state.updateCycle;
+		};
+		return { ...m, entries, counts, view };
+	}
+
+	async function request(
+		call: (path: string, body?: unknown) => Promise<Response>,
+	): Promise<string> {
+		expect((await call("/api/update/host", heartbeat())).status).toBe(200);
+		const response = await call("/api/update", {});
+		expect(response.status).toBe(202);
+		const body = (await response.json()) as { requestId: string };
+		expect(body.requestId).toMatch(/^[A-Za-z0-9_-]{1,128}$/);
+		return body.requestId;
+	}
+
+	test("unknown hosts and unknown live counts fail closed", async () => {
+		const m = board();
+		expect(await m.view()).toBeNull();
+		expect((await m.call("/api/update", {})).status).toBe(409);
+		expect(m.app.drainedRunner("local")).toBe(false);
+		const unknown = mount();
+		expect((await unknown.call("/api/update/host", heartbeat())).status).toBe(
+			200,
+		);
+		const state = (await (await unknown.call("/api/state")).json()) as {
+			updateCycle: UpdateCycleView;
+		};
+		expect(state.updateCycle.canStart).toBe(false);
+		expect((await unknown.call("/api/update", {})).status).toBe(409);
+	});
+
+	test("every live runner count prevents a request without a stored card", async () => {
+		const m = board();
+		await m.call(
+			"/api/update/host",
+			heartbeat({ available: { behind: 0, commits: [] } }),
+		);
+		expect((await m.view())?.canStart).toBe(true);
+		const busy: {
+			local: number;
+			workers: Record<string, number>;
+			preparing: number;
+		}[] = [
+			{ local: 1, workers: {}, preparing: 0 },
+			{ local: 0, workers: { "unlisted-worker": 1 }, preparing: 0 },
+			{ local: 0, workers: {}, preparing: 1 },
+			{ local: Number.NaN, workers: {}, preparing: 0 },
+		];
+		for (const turns of busy) {
+			m.counts.turns = turns;
+			expect((await m.view())?.canStart).toBe(false);
+			expect((await m.call("/api/update", {})).status).toBe(409);
+			expect(m.app.drainedRunner("local")).toBe(false);
+		}
+	});
+
+	test("real stores refuse running and preparing cards in every project, even cancelled cards", async () => {
+		const m = board();
+		await m.call("/api/update/host", heartbeat());
+		for (const entry of m.entries.values()) {
+			for (const state of ["running", "preparing"] as const) {
+				const task = entry.store.createTask(`${entry.name} ${state}`);
+				entry.store.updateTask(task.id, { state, cancelledAt: Date.now() });
+				expect((await m.view())?.canStart).toBe(false);
+				expect((await m.call("/api/update", {})).status).toBe(409);
+				expect(m.app.drainedRunner("local")).toBe(false);
+				entry.store.updateTask(task.id, { state: "idle" });
+			}
+		}
+		expect((await m.call("/api/update", {})).status).toBe(202);
+	});
+
+	test("a failed runner reader or project reader never proves idle", async () => {
+		const m = board();
+		await m.call("/api/update/host", heartbeat());
+		m.counts.failed = true;
+		expect((await m.view())?.canStart).toBe(false);
+		expect((await m.call("/api/update", {})).status).toBe(409);
+		m.counts.failed = false;
+		const entry = m.entries.get("other")!;
+		const failed = spyOn(entry.store, "listTasks").mockImplementation(() => {
+			throw new Error("The task store is unreadable.");
+		});
+		try {
+			// The trending status reads this store too, so the state read must fail.
+			const state = await m.call("/api/state");
+			expect(state.status).toBe(500);
+			expect(await state.json()).toEqual({ error: "internal error" });
+			const refused = await m.call("/api/update", {});
+			expect(refused.status).toBe(409);
+			expect(await refused.json()).toEqual({
+				error: "The board is busy or its idle state is unavailable.",
+			});
+			expect(m.app.drained()).toBe(false);
+			for (const runner of ["local", "worker-a"])
+				expect(m.app.drainedRunner(runner)).toBe(false);
+		} finally {
+			failed.mockRestore();
+		}
+		expect((await m.view())?.canStart).toBe(true);
+	});
+
+	test("the final idle check follows the real streamed JSON reader", async () => {
+		const m = board();
+		await m.call("/api/update/host", heartbeat());
+		const req = new Request(new URL("/api/update", m.server.url), {
+			method: "POST",
+			headers: {
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+				"content-type": "application/json",
+			},
+			body: new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode("{"));
+					m.counts.turns.preparing = 1;
+					controller.enqueue(new TextEncoder().encode("}"));
+					controller.close();
+				},
+			}),
+		});
+		const response = await fetch(req);
+		expect(response.status).toBe(409);
+		expect(m.app.drainedRunner("local")).toBe(false);
+	});
+
+	test("the idle check and manual hold share one synchronous operation", async () => {
+		const m = board();
+		await m.call("/api/update/host", heartbeat());
+		const observed: boolean[] = [];
+		Object.defineProperty(m.counts.turns, "preparing", {
+			get() {
+				queueMicrotask(() => observed.push(m.app.drainedRunner("local")));
+				return 0;
+			},
+		});
+		expect((await m.call("/api/update", {})).status).toBe(202);
+		expect(observed.length).toBeGreaterThan(0);
+		expect(observed.every(Boolean)).toBe(true);
+	});
+
+	test("duplicate requests and polls share one id and hold all runner ids", async () => {
+		const m = board();
+		const requestId = await request(m.call);
+		expect((await m.call("/api/update", {})).status).toBe(409);
+		for (const id of ["local", "worker-a", "vm-runner", "new-runner"])
+			expect(m.app.drainedRunner(id)).toBe(true);
+		expect(m.app.drained()).toBe(true);
+		expect((await m.view())?.phase).toBe("requested");
+		for (let i = 0; i < 2; i++) {
+			const poll = await m.call("/api/update/host", heartbeat());
+			expect(((await poll.json()) as UpdateHostReply).requestId).toBe(
+				requestId,
+			);
+			expect((await m.view())?.phase).toBe("requested");
+		}
+		const scheduled = await m.call(
+			"/api/update/host",
+			heartbeat({ phase: "running" }),
+		);
+		expect(((await scheduled.json()) as UpdateHostReply).requestId).toBe(
+			requestId,
+		);
+		expect((await m.view())?.phase).toBe("requested");
+		const wrong = await m.call(
+			"/api/update/host",
+			heartbeat({
+				phase: "running",
+				requestId: "wrong-request",
+			}),
+		);
+		expect(wrong.status).toBe(409);
+		for (let i = 0; i < 2; i++) {
+			const ack = await m.call(
+				"/api/update/host",
+				heartbeat({ phase: "running", requestId }),
+			);
+			expect(((await ack.json()) as UpdateHostReply).requestId).toBe(requestId);
+		}
+		expect((await m.view())?.phase).toBe("running");
+		expect((await m.call("/api/update", {})).status).toBe(409);
+		await m.call(
+			"/api/update/host",
+			heartbeat({ error: "The full update failed." }),
+		);
+		expect(m.app.drainedRunner("local")).toBe(false);
+		expect(await m.view()).toMatchObject({
+			phase: "idle",
+			canStart: true,
+			error: "The full update failed.",
+		});
+		const again = await m.call("/api/update/host", heartbeat());
+		expect(((await again.json()) as UpdateHostReply).requestId).toBeNull();
+	});
+
+	test("manual hold completion and expiry preserve independent board and runner drains", async () => {
+		const m = board();
+		await m.call("/api/drain", { commits: ["Independent deployment"] });
+		await m.call("/api/drain", { runner: "worker-a" });
+		const before = await (await m.call("/api/drain")).json();
+		const requestId = await request(m.call);
+		expect(await (await m.call("/api/drain")).json()).toEqual(before);
+		await m.call(
+			"/api/update/host",
+			heartbeat({ phase: "running", requestId }),
+		);
+		await m.call("/api/update/host", heartbeat());
+		expect(m.app.drained()).toBe(true);
+		expect(m.app.drainedRunner("worker-a")).toBe(true);
+		expect(m.app.drainedRunner("local")).toBe(false);
+		expect(await (await m.call("/api/drain")).json()).toEqual(before);
+		await m.call("/api/update", {});
+		const time = Date.now();
+		try {
+			setSystemTime(time + UPDATE_HOST_LEASE_MS);
+			expect(m.app.drained()).toBe(true);
+			expect(m.app.drainedRunner("worker-a")).toBe(true);
+			expect(m.app.drainedRunner("local")).toBe(false);
+			expect(await m.view()).toBeNull();
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("DELETE drain cannot clear the separate manual hold", async () => {
+		const m = board();
+		await request(m.call);
+		await m.call("/api/drain", undefined, { method: "DELETE" });
+		await m.call("/api/drain?runner=local", undefined, { method: "DELETE" });
+		expect(m.app.drainedRunner("local")).toBe(true);
+		expect(m.app.drained()).toBe(true);
+		expect((await m.view())?.phase).toBe("requested");
+	});
+
+	test("running heartbeat restores and clears the same hold across server and lease recovery", async () => {
+		const m = board();
+		const running = heartbeat({
+			phase: "running",
+			requestId: "recovered-request",
+		});
+		const initial = await m.call("/api/update/host", running);
+		expect(((await initial.json()) as UpdateHostReply).requestId).toBe(
+			"recovered-request",
+		);
+		expect(m.app.drainedRunner("local")).toBe(true);
+		const time = Date.now();
+		try {
+			setSystemTime(time + UPDATE_HOST_LEASE_MS);
+			expect(m.app.drainedRunner("local")).toBe(false);
+			expect(await m.view()).toBeNull();
+			const recovered = await m.call("/api/update/host", running);
+			expect(((await recovered.json()) as UpdateHostReply).requestId).toBe(
+				"recovered-request",
+			);
+			expect(m.app.drainedRunner("local")).toBe(true);
+			await m.call("/api/update/host", heartbeat());
+			expect(m.app.drainedRunner("local")).toBe(false);
+			expect((await m.view())?.phase).toBe("idle");
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("invalid input does not replace the host, clear the request or renew its lease", async () => {
+		const m = board();
+		const time = Date.now();
+		try {
+			setSystemTime(time);
+			const requestId = await request(m.call);
+			const before = await m.view();
+			setSystemTime(time + 20_000);
+			for (const body of [
+				{ ...heartbeat(), controller: "new-host", extra: true },
+				{ ...heartbeat(), nextCycleAt: "later" },
+				{ ...heartbeat(), error: "bad\nline" },
+				{ ...heartbeat(), available: { behind: -1, commits: [] } },
+			])
+				expect((await m.call("/api/update/host", body)).status).toBe(400);
+			expect((await m.call("/api/update", { command: "update" })).status).toBe(
+				400,
+			);
+			expect(await m.view()).toEqual(before);
+			const foreign = await m.call(
+				"/api/update/host",
+				heartbeat({ controller: "foreign-host" }),
+			);
+			expect(foreign.status).toBe(409);
+			const wrong = await m.call(
+				"/api/update/host",
+				heartbeat({ phase: "running", requestId: `${requestId}-other` }),
+			);
+			expect(wrong.status).toBe(409);
+			setSystemTime(time + UPDATE_HOST_LEASE_MS);
+			expect(m.app.drainedRunner("local")).toBe(false);
+			expect(await m.view()).toBeNull();
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("host registration requires direct peer state, not Host, keys, sessions or worker tokens", async () => {
+		const token = crypto.randomUUID();
+		const key = crypto.randomUUID();
+		const sessionSecret = crypto.randomUUID();
+		const cookie = `ottr.session=${signSession(sessionSecret, "ada", 60_000)}`;
+		const g = GlobalStore.open(join(root, `cycle-auth-${fixture++}`));
+		mountStores.push(g);
+		g.set("config", { apiKey: key, sessionSecret });
+		const m = board({
+			gstore: g,
+			publicHosts: ["board.example"],
+			board: { url: "http://turns:0", token },
+		});
+		const refusedHeaders: Record<string, string>[] = [
+			{ "x-forwarded-for": "100.64.0.2", "x-api-key": key },
+			{ "x-forwarded-host": "board.example", "x-api-key": key },
+			{ forwarded: "for=100.64.0.2", "x-api-key": key },
+			{
+				Host: "board.example",
+				Origin: "https://board.example",
+				"x-api-key": key,
+			},
+			{ "x-board-token": token },
+			{ cookie: "ottr.session=untrusted" },
+			{ cookie },
+		];
+		for (const headers of refusedHeaders)
+			expect(
+				(await m.call("/api/update/host", heartbeat(), headers)).status,
+			).toBe(403);
+		expect(
+			(
+				await m.call("/api/update/host", heartbeat(), {
+					Host: "turns:0",
+					Origin: "http://turns:0",
+					"x-board-token": token,
+				})
+			).status,
+		).toBe(403);
+		for (const address of ["172.18.0.1", undefined]) {
+			const peer = spyOn(m.server, "requestIP").mockReturnValue(
+				address === undefined ? null : { address, family: "IPv4", port: 1 },
+			);
+			try {
+				expect(
+					(await m.call("/api/update/host", heartbeat(), { "x-api-key": key }))
+						.status,
+				).toBe(403);
+			} finally {
+				peer.mockRestore();
+			}
+		}
+		expect(await m.view()).toBeNull();
+		expect((await m.call("/api/update/host", heartbeat())).status).toBe(200);
+		expect(
+			(
+				await m.call(
+					"/api/update",
+					{},
+					{
+						Host: "board.example",
+						Origin: "https://board.example",
+					},
+				)
+			).status,
+		).toBe(401);
+		expect(
+			(
+				await m.call(
+					"/api/update",
+					{},
+					{
+						Host: "board.example",
+						Origin: "https://board.example",
+						"x-api-key": key,
+					},
+				)
+			).status,
+		).toBe(202);
+	});
+
+	test("host metadata fits the body cap and redacts known secrets before any live reader sees it", async () => {
+		const m = board();
+		const secret = crypto.randomUUID();
+		const previous = gitSecrets();
+		setGitSecrets([...previous, secret]);
+		try {
+			const commits = Array.from({ length: 50 }, () => "界".repeat(200));
+			commits[0] = `Change ${secret}`;
+			const response = await m.call(
+				"/api/update/host",
+				heartbeat({
+					error: `The update failed: ${secret}`,
+					available: { behind: 50, commits },
+				}),
+			);
+			expect(response.status).toBe(200);
+			const state = await m.view();
+			expect(state?.error).toContain("[REDACTED]");
+			expect(state?.error).not.toContain(secret);
+			const available = (await (await m.call("/api/update")).json()) as {
+				behind: number;
+				commits: string[];
+			};
+			expect(available.commits).toHaveLength(50);
+			expect(available.commits[0]).toContain("[REDACTED]");
+			expect(available.commits[0]).not.toContain(secret);
+			expect(
+				(
+					await m.call(
+						"/api/update/host",
+						heartbeat({ error: "x".repeat(70_000) }),
+					)
+				).status,
+			).toBe(413);
+			expect(await m.view()).toEqual(state);
+		} finally {
+			setGitSecrets(previous);
+		}
+	});
+
+	test("Origin and JSON guards protect both routes before any mutation", async () => {
+		const m = board();
+		for (const path of ["/api/update", "/api/update/host"]) {
+			expect(
+				(await m.call(path, heartbeat(), { Origin: "https://evil.example" }))
+					.status,
+			).toBe(403);
+			const noOrigin = await fetch(new URL(path, m.server.url), {
+				method: "POST",
+				headers: { Host: "127.0.0.1:0", "content-type": "application/json" },
+				body: "{}",
+			});
+			expect(noOrigin.status).toBe(403);
+			expect(
+				(await m.call(path, {}, { "content-type": "text/plain" })).status,
+			).toBe(415);
+			expect((await m.call(path, [])).status).toBe(400);
+		}
+		expect(await m.view()).toBeNull();
+	});
+
+	test("hosted mode refuses even a signed owner and exposes no controller view", async () => {
+		const secret = crypto.randomUUID();
+		const m = board({
+			hosted: {
+				config: {
+					tenant: "acme",
+					secret,
+					controlUrl: "http://127.0.0.1:9",
+					wording: {
+						workSuffix: "",
+						mergeSuffix: "",
+						resumeSuffix: "",
+						creditReason: "No credit.",
+					},
+				},
+				hooks: {
+					reportUsage: () => {},
+					creditOk: async () => true,
+					gitToken: async () => null,
+				},
+			},
+		});
+		for (const path of ["/api/update", "/api/update/host"]) {
+			const response = await m.call(
+				path,
+				path.endsWith("/host") ? heartbeat() : {},
+				{
+					"x-ottr-identity": signIdentity(secret, "acme", "owner"),
+				},
+			);
+			expect(response.status).toBe(404);
+		}
+		const state = (await (
+			await m.call("/api/state", undefined, {
+				"x-ottr-identity": signIdentity(secret, "acme", "owner"),
+			})
+		).json()) as { updateCycle: UpdateCycleView | null };
+		expect(state.updateCycle).toBeNull();
+	});
+
+	test("the real build-commit reader wins and only sha versions provide a fallback", async () => {
+		const home = join(root, `cycle-build-${fixture++}`);
+		mkdirSync(home, { recursive: true });
+		const previous = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp");
+		try {
+			const m = board({ serverVersion: "abcdef0" });
+			writeFileSync(join(home, "build-commit"), "1234567\n");
+			const recorded = (await (
+				await m.call("/api/update/host", heartbeat())
+			).json()) as UpdateHostReply;
+			expect(recorded.runningCommit).toBe("1234567");
+			writeFileSync(join(home, "build-commit"), "not-a-sha\n");
+			const fallback = (await (
+				await m.call("/api/update/host", heartbeat())
+			).json()) as UpdateHostReply;
+			expect(fallback.runningCommit).toBe("abcdef0");
+			const tag = board({ serverVersion: "v1.2.3" });
+			expect(
+				(
+					(await (
+						await tag.call("/api/update/host", heartbeat())
+					).json()) as UpdateHostReply
+				).runningCommit,
+			).toBeNull();
+		} finally {
+			if (previous === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = previous;
+		}
+	});
+
+	test("GET and existing socket update frames use live host availability and discard stale values", async () => {
+		const m = board({ realPort: true });
+		const initial = heartbeat();
+		expect((await m.call("/api/update/host", initial)).status).toBe(200);
+		expect(await (await m.call("/api/update")).json()).toEqual(
+			initial.available,
+		);
+		const socketUrl = new URL("/api/ws", m.server.url);
+		socketUrl.protocol = "ws:";
+		// lib.dom hides Bun's documented constructor options.
+		const BunWebSocket = WebSocket as typeof WebSocket & {
+			new (url: string | URL, options: Bun.WebSocketOptions): WebSocket;
+		};
+		const socket = new BunWebSocket(socketUrl, {
+			headers: { Origin: m.server.url.origin },
+		});
+		type Frame = { type: string; behind?: number; commits?: string[] };
+		const frames: Frame[] = [];
+		socket.addEventListener("message", (event) =>
+			frames.push(JSON.parse(String(event.data))),
+		);
+		async function until(
+			label: string,
+			predicate: (frame: Frame) => boolean,
+		): Promise<Frame> {
+			const previous = frames.find(predicate);
+			if (previous !== undefined) return previous;
+			if (socket.readyState >= WebSocket.CLOSING)
+				throw new Error(`WebSocket closed before ${label}.`);
+			const { promise, resolve, reject } = Promise.withResolvers<Frame>();
+			const receive = (event: MessageEvent) => {
+				const frame = JSON.parse(String(event.data)) as Frame;
+				if (predicate(frame)) resolve(frame);
+			};
+			const closed = (event: CloseEvent) =>
+				reject(
+					new Error(
+						`WebSocket closed before ${label} (${event.code}: ${event.reason}).`,
+					),
+				);
+			const errored = (event: Event) =>
+				reject(
+					new Error(
+						`WebSocket failed before ${label}: ${"message" in event ? String(event.message) : event.type}.`,
+					),
+				);
+			// This deadline bounds real socket I/O; a fake clock cannot complete the handshake.
+			const timer = setTimeout(
+				() =>
+					reject(
+						new Error(
+							`WebSocket did not send ${label} (readyState ${socket.readyState}).`,
+						),
+					),
+				1_000,
+			);
+			socket.addEventListener("message", receive);
+			socket.addEventListener("close", closed);
+			socket.addEventListener("error", errored);
+			try {
+				return await promise;
+			} finally {
+				clearTimeout(timer);
+				socket.removeEventListener("message", receive);
+				socket.removeEventListener("close", closed);
+				socket.removeEventListener("error", errored);
+			}
+		}
+		const time = Date.now();
+		try {
+			expect(
+				await until(
+					"the initial update",
+					(frame) => frame.type === "update" && frame.behind === 2,
+				),
+			).toEqual({ type: "update", ...initial.available });
+			expect(socket.readyState).toBe(WebSocket.OPEN);
+			expect(
+				(
+					await m.call(
+						"/api/update/host",
+						heartbeat({ available: { behind: 2, commits: ["New subject"] } }),
+					)
+				).status,
+			).toBe(200);
+			m.app.publishState();
+			expect(
+				await until(
+					"the changed update",
+					(frame) =>
+						frame.type === "update" && frame.commits?.[0] === "New subject",
+				),
+			).toEqual({ type: "update", behind: 2, commits: ["New subject"] });
+			expect(await (await m.call("/api/update")).json()).toEqual({
+				behind: 2,
+				commits: ["New subject"],
+			});
+			setSystemTime(time + UPDATE_HOST_LEASE_MS + 1_000);
+			m.app.publishState();
+			expect(
+				await until(
+					"the expired update",
+					(frame) => frame.type === "update" && frame.behind === 0,
+				),
+			).toEqual({ type: "update", behind: 0, commits: [] });
+			expect(await m.view()).toBeNull();
+		} finally {
+			setSystemTime();
+			socket.close();
+		}
 	});
 });
 

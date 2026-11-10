@@ -3,6 +3,7 @@
 import type { CommitIdentity } from "./gitIdentity.ts";
 import type { TokenUsage } from "./hosted.ts";
 import type { DeadSignIn } from "./login.ts";
+import type { UpdateCycleView } from "./updateCycle.ts";
 import type { VmRunnerHealth } from "./vmState.ts";
 import type { VmOutcome } from "./workers.ts";
 
@@ -1187,6 +1188,8 @@ export interface StateResponse {
 	/** Advisory: the last failed alate provision attempt (the U9 trigger or the manual
 	 *  button); null after a success, or when alate reports no pending import. */
 	alateProvisionError: string | null;
+	/** Live host schedule and manual-cycle control; absent on older state frames. */
+	updateCycle?: UpdateCycleView | null;
 }
 
 /** A deferred server restart the board surfaces after the notice threshold (OTTR-625). */

@@ -87,12 +87,11 @@ omp. Two parts do the work:
 
    The pin sits above the omp layer, near the end of the file, so a bump rebuilds only the
    last layers.
-2. Each host that runs the stack deploys `main` with `scripts/update-image.ts`, from
-   a clean `main` checkout — this rolling flow serves only that deployment. A
-   deployment that runs a published release image (`OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>`,
-   README quick start) updates by moving its image tag: the script never runs
-   there (`scripts/` is not copied into the image), so it needs no per-runner
-   drain and no part of this flow. It fast-forwards `main` and builds the image, then it
+2. Each source-based host runs `scripts/update-host.ts` from a clean `main` checkout.
+   This persistent command runs the current `scripts/update-image.ts` once per cycle.
+   A deployment that runs a published release image (`OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>`,
+   README quick start) updates by moving its image tag. Neither host script runs there.
+   The one-shot updater fast-forwards `main` and builds the image, then it
    rolls the stack one runner at a time. A runner is a worker (its hostname, the
    compose service name) or the server itself (`local`). It stops when the
    checkout has uncommitted changes or commits that origin lacks, when
@@ -141,10 +140,9 @@ omp. Two parts do the work:
      a local turn still runs then, the script ends the holds (DELETE
      `?runner=` for `local` and every worker), so the queued cards start, and a
      later run tries the restart again. If the board refuses a renewal, the
-     script stops waiting the same way. While it waits, the scheduled task
-     starts no second run (`-MultipleInstances IgnoreNew` below), so the
-     restart uses the image that this run built, and a later run deploys newer
-     commits.
+     script stops waiting the same way. The host command starts no second cycle
+     while this cycle runs. The restart uses the image that this cycle built.
+     A later cycle deploys newer commits.
    - The script then holds every worker runner. The holds stop new dispatches
      for the seconds of the restart window; the cards stay queued, and no
      board-wide notice shows, because these are per-runner holds.
@@ -217,34 +215,100 @@ omp. Two parts do the work:
    fast-forwards to `origin/main` only when it is clean and on `main`. Else it stays as it
    is, with one log line.
 
-The deploy also brings new Ottr commits from `main`. The run also seeds the board's agent
-layer when the env file sets `ALATE_DATA` or `ALATE_DATA_REPO`
-([Seed the board config](#seed-the-board-config)). The seed installs a layer and switches
-it with one atomic rename, so it does not wait for turns; only the restart that follows
-still drains running turns. The script's arguments go to
-every `docker compose` call. Run it every hour. On Windows:
+The deploy also brings new Ottr commits from `main`. It repeats the board seed when
+the env file sets `ALATE_DATA` or `ALATE_DATA_REPO`
+([Seed the board config](#seed-the-board-config)). The seed switches the agent layer
+with one atomic rename. Only the restart that follows waits for running turns.
+The command passes its arguments to every `docker compose` call as separate arguments.
 
-```powershell
-$run = 'bun scripts\update-image.ts -f docker-compose.yml -f <override> --env-file <env> >> "%LOCALAPPDATA%\ottr-update-image.log" 2>&1'
-Register-ScheduledTask -TaskName 'Ottr image update' `
-  -Action (New-ScheduledTaskAction -Execute conhost.exe -Argument "--headless cmd /c $run" -WorkingDirectory <checkout>) `
-  -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 1)) `
-  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew)
-```
+### Persistent host control
 
-On Linux, from the crontab of a user in the `docker` group (cron has a short `PATH`,
-so name bun in full):
+The persistent host command owns an hourly schedule. Its first cycle starts one hour
+after the command starts. The bell shows the next cycle time while the host connection
+is live. The **Update** action requests a complete cycle when every project is idle.
+It fetches commits, builds the image, and uses the safe deployment flow above.
+A manual cycle does not move the hourly schedule. A long cycle skips missed slots.
+Cycles never overlap.
+
+The host sends a heartbeat every five seconds through `docker compose exec -T server bun -e`.
+The request uses the server's direct loopback address and normal Origin guard.
+The host opens no network listener and stores no credential.
+It compares the running image commit with real `origin/main` commits.
+It refreshes git at most once per five minutes. A failed read means unknown, not zero commits.
+An exclusive SQLite lock outside the checkout refuses a second controller for the same canonical path.
+The operating system releases the lock after the process exits.
+The controller continues heartbeats during each update and registers again after a server restart.
+A due scheduled cycle can recover a stopped board through the existing updater.
+A manual cycle requires the board's acknowledgement before the child starts.
+
+Use one persistent command per checkout. Disable the old hourly task or cron entry
+before you enable this command. Do not run both commands at the same time.
+These examples describe setup only. Ottr does not change a host scheduler.
+The host needs Bun, git read access, and access to the Docker Compose stack.
+Keep the same Compose files and env file as the original deployment.
+
+To run the command in a terminal:
 
 ```sh
-0 * * * * cd /srv/ottr && $HOME/.bun/bin/bun scripts/update-image.ts -f docker-compose.yml --env-file <env> >> $HOME/ottr-update-image.log 2>&1
+bun scripts/update-host.ts -f docker-compose.yml --env-file <env>
 ```
 
-The containers take provider keys from the
-environment that runs compose, else from the env file. Cron has almost no
-environment, so on Linux put them in the env file. To stay on an older omp, leave its
-fail card open or cancel its bump card. Do not pin omp by hand. To undo a bump that
-shipped, revert the bump commit. The omp watch files no new card for that version, only
-for a higher one.
+On Windows, use Task Scheduler at user logon. Bun must be on that user's `PATH`.
+Replace each path placeholder before you run these commands:
+
+```powershell
+$run = 'bun scripts\update-host.ts -f docker-compose.yml -f "<override>" --env-file "<env>" >> "%LOCALAPPDATA%\ottr-update-host.log" 2>&1'
+Register-ScheduledTask -TaskName 'Ottr update host' `
+  -Action (New-ScheduledTaskAction -Execute conhost.exe -Argument "--headless cmd /c $run" -WorkingDirectory '<checkout>') `
+  -Trigger (New-ScheduledTaskTrigger -AtLogOn) `
+  -Settings (New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1))
+Start-ScheduledTask -TaskName 'Ottr update host'
+```
+
+Read `%LOCALAPPDATA%\ottr-update-host.log` for cycle output. The task runs continuously,
+not once per hour. A `SIGINT` or `SIGTERM` request lets the current cycle finish.
+
+On Linux, use a user service. The user needs Docker access, for example through the
+`docker` group. Save this unit as `~/.config/systemd/user/ottr-update-host.service`:
+
+```ini
+[Unit]
+Description=Ottr host update controller
+
+[Service]
+WorkingDirectory=/srv/ottr
+ExecStart=/home/<you>/.bun/bin/bun scripts/update-host.ts -f docker-compose.yml --env-file /path/to/ottr.env
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=infinity
+
+[Install]
+WantedBy=default.target
+```
+
+Replace the paths in the unit. Then enable the service:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now ottr-update-host.service
+journalctl --user -u ottr-update-host.service -f
+```
+
+To retain the user service after logout, enable user linger with `loginctl enable-linger <you>`.
+The service needs no hourly timer. Put provider keys in the Compose env file because
+a service has a limited environment. A shell value overrides the same env-file value.
+
+### Legacy one-shot updates
+
+`bun scripts/update-image.ts <your Compose arguments>` still runs one complete cycle and exits.
+Existing hourly tasks and cron entries retain that behavior.
+They do not register host control. Until you enable `update-host.ts`, the bell has no
+host countdown or **Update** action. It keeps the existing manual instructions.
+Published release-image deployments also have no source-update controller.
+
+To stay on an older omp, leave its fail card open or cancel its bump card.
+Do not pin omp by hand. To undo a shipped bump, revert the bump commit.
+The omp watch files no new card for that version, only for a higher one.
 
 Only omp has automation. Every other pin is a hand bump: edit the `ARG <TOOL>_VERSION`
 and its `*_SHA256` in `Dockerfile.worker`, commit, and let `update-image.ts` deploy the

@@ -44,6 +44,8 @@ const {
 	triageWait,
 	WarningLines,
 	RestartWaitLine,
+	UpdateCycleControl,
+	AppBehindNotice,
 	doneTopicPages,
 	cancelledTopic,
 	Overview,
@@ -1829,6 +1831,180 @@ describe("RestartWaitLine", () => {
 				<RestartWaitLine wait={null} inboxKey={undefined} fresh={false} />,
 			),
 		).toBe("");
+	});
+});
+
+describe("UpdateCycleControl", () => {
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const originals = new Map<string, unknown>();
+	const now = 1_700_000_000_000;
+	const idle = {
+		nextCycleAt: now + 120_000,
+		phase: "idle" as const,
+		canStart: true,
+		error: null,
+	};
+	beforeAll(() => {
+		for (const [key, value] of Object.entries({
+			window,
+			document: window.document,
+			navigator: window.navigator,
+			HTMLElement: window.HTMLElement,
+			IS_REACT_ACT_ENVIRONMENT: true,
+		})) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+		originals.set("fetch", host.fetch);
+	});
+	afterAll(() => {
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	test("an absent or expired controller provides no countdown or action", () => {
+		expect(
+			renderToStaticMarkup(<UpdateCycleControl cycle={null} nowMs={now} />),
+		).toBe("");
+	});
+	test("a missing controller preserves manual instructions and the notification key", () => {
+		const html = renderToStaticMarkup(
+			<AppBehindNotice
+				behind={2}
+				behindKey="behind:2"
+				behindCommits={["A real change"]}
+				isNew={() => false}
+				updateCycle={null}
+				nowMs={now}
+			/>,
+		);
+		expect(html).toContain("bun run update");
+		expect(html).toContain("Host control is unavailable");
+		expect(html).toContain('data-inbox-key="behind:2"');
+		expect(html).not.toContain("<button");
+	});
+	test("busy and preparing turns disable the action and explain the idle rule", () => {
+		const html = renderToStaticMarkup(
+			<UpdateCycleControl cycle={{ ...idle, canStart: false }} nowMs={now} />,
+		);
+		expect(html).toContain("disabled");
+		expect(html).toContain("No turn can run or prepare");
+	});
+	test("requested and running cycles prevent duplicate actions", () => {
+		for (const phase of ["requested", "running"] as const) {
+			const html = renderToStaticMarkup(
+				<UpdateCycleControl
+					cycle={{ ...idle, phase, canStart: false }}
+					nowMs={now}
+				/>,
+			);
+			expect(html).toContain("disabled");
+			expect(html).toContain(
+				phase === "requested" ? "Update requested" : "Update cycle in progress",
+			);
+		}
+	});
+	test("the live clock updates the countdown and never shows a negative duration", async () => {
+		const container = document.createElement("div");
+		const root = createRoot(container);
+		try {
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={idle} nowMs={now} />),
+			);
+			expect(container.textContent).toContain("2m");
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={idle} nowMs={now + 60_000} />),
+			);
+			expect(container.textContent).toContain("1m");
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={idle} nowMs={now + 180_000} />),
+			);
+			expect(container.textContent).toContain("is due");
+			expect(container.textContent).not.toContain("-1");
+		} finally {
+			await act(async () => root.unmount());
+		}
+	});
+	test("an idle request posts an empty object once and gives immediate feedback", async () => {
+		const response = Promise.withResolvers<void>();
+		const calls: { url: string; body: unknown }[] = [];
+		host.fetch = async (url: string, init?: RequestInit) => {
+			calls.push({ url, body: JSON.parse(String(init?.body)) });
+			await response.promise;
+			return Response.json({});
+		};
+		const container = document.createElement("div");
+		const root = createRoot(container);
+		try {
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={idle} nowMs={now} />),
+			);
+			const button = container.querySelector("button")!;
+			await act(async () => button.click());
+			expect(button.disabled).toBe(true);
+			expect(container.textContent).toContain("Update requested");
+			await act(async () => button.click());
+			expect(calls).toEqual([{ url: "/api/update", body: {} }]);
+			await act(async () => response.resolve());
+			expect(button.disabled).toBe(true);
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={null} nowMs={now} />),
+			);
+			expect(container.textContent).toBe("");
+		} finally {
+			await act(async () => root.unmount());
+		}
+	});
+	test("request and host failures stay beside the action with a retry step", async () => {
+		host.fetch = async () =>
+			Response.json({ error: "Host is unavailable" }, { status: 409 });
+		const container = document.createElement("div");
+		const root = createRoot(container);
+		try {
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={idle} nowMs={now} />),
+			);
+			await act(async () => container.querySelector("button")!.click());
+			expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+				"Host is unavailable",
+			);
+			expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+				"Retry",
+			);
+			expect(container.querySelector("button")!.disabled).toBe(false);
+			await act(async () =>
+				root.render(
+					<UpdateCycleControl cycle={{ ...idle }} nowMs={now + 5_000} />,
+				),
+			);
+			expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+				"Host is unavailable",
+			);
+			await act(async () =>
+				root.render(<UpdateCycleControl cycle={null} nowMs={now} />),
+			);
+			expect(container.textContent).toBe("");
+			await act(async () =>
+				root.render(
+					<UpdateCycleControl
+						cycle={{ ...idle, error: "Build failed" }}
+						nowMs={now}
+					/>,
+				),
+			);
+			expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+				"Build failed",
+			);
+			expect(
+				container.querySelector('[role="alert"]')?.textContent,
+			).not.toContain("Host is unavailable");
+			expect(container.querySelector("button")!.textContent).toBe("Update");
+			expect(container.querySelector("button")!.disabled).toBe(false);
+		} finally {
+			await act(async () => root.unmount());
+		}
 	});
 });
 
