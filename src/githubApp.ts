@@ -7,7 +7,6 @@ import {
 } from "node:crypto";
 import { noRedirectFetch } from "./alate.ts";
 import { githubHost } from "./githubHost.ts";
-import { withGithubRetry } from "./githubRetry.ts";
 import type { AppCheck } from "./types.ts";
 
 /** Ceiling for every GitHub API call below; a stalled server must never hang a check. */
@@ -124,7 +123,9 @@ export class AppTokenSource {
 		this.keyObject = deps.keyObject;
 		this.apiBase = deps.apiBase;
 		this.timeoutMs = deps.timeoutMs ?? APP_FETCH_TIMEOUT_MS;
-		this.fetchImpl = withGithubRetry(deps.fetchImpl ?? noRedirectFetch);
+		// No retry wrap here: the caller owns the policy. app.ts passes a fetch already
+		// wrapped by withGithubRetry, and wrapping again would multiply the attempts.
+		this.fetchImpl = deps.fetchImpl ?? noRedirectFetch;
 		this.now = deps.now ?? (() => Date.now());
 	}
 
@@ -327,7 +328,9 @@ export async function checkAppInstalls(deps: {
 	timeoutMs?: number;
 }): Promise<AppCheck> {
 	const base = deps.apiBase ?? githubHost().apiBase;
-	const fetchImpl = withGithubRetry(deps.fetchImpl ?? noRedirectFetch);
+	// No retry wrap here either: the caller (app.ts) passes a fetch already wrapped
+	// by withGithubRetry; wrapping again would multiply the attempts.
+	const fetchImpl = deps.fetchImpl ?? noRedirectFetch;
 	const now = deps.now ?? (() => Date.now());
 	const timeoutMs = deps.timeoutMs ?? APP_FETCH_TIMEOUT_MS;
 	const out: AppCheck = {

@@ -13,6 +13,7 @@ import {
 	signAppJwt,
 	validateAppCredentials,
 } from "./githubApp.ts";
+import { withGithubRetry } from "./githubRetry.ts";
 
 const { privateKey, publicKey } = generateKeyPairSync("rsa", {
 	modulusLength: 2048,
@@ -213,6 +214,77 @@ const INSTALL_URL = `https://api.github.com/repos/${OWNER}/${REPO}/installation`
 const TOKEN_URL = "https://api.github.com/app/installations/777/access_tokens";
 const INSTALLATION = { id: 777 };
 const NOW = 1_700_000_000_000;
+
+/** A fetch app.ts-shaped: the same withGithubRetry wrap createAppNetworkDefaults applies. */
+function appWiredFetch(respond: (url: string) => Response): {
+	fetchImpl: (url: string, init?: RequestInit) => Promise<Response>;
+	calls: { url: string; init?: RequestInit }[];
+} {
+	const calls: { url: string; init?: RequestInit }[] = [];
+	const base = async (url: string, init?: RequestInit): Promise<Response> => {
+		calls.push({ url, init });
+		return respond(url);
+	};
+	return {
+		// The no-op sleep keeps the retry's waits out of the test's wall clock.
+		fetchImpl: withGithubRetry(base, {
+			sleep: async () => {},
+			random: () => 0.5,
+			now: () => NOW,
+		}),
+		calls,
+	};
+}
+
+describe("retry wiring (OTTR-792)", () => {
+	// app.ts passes a withGithubRetry-wrapped fetch as fetchImpl. These tests pin the
+	// attempt count through that exact composition, so a second wrap inside
+	// githubApp.ts (which would give 3 x 3 = 9 attempts) fails here.
+	test("AppTokenSource retries a pre-wrapped fetch once, not nested", async () => {
+		const { calls, fetchImpl } = appWiredFetch(
+			() => new Response("{}", { status: 503 }),
+		);
+		const source = new AppTokenSource({
+			appId: APP_ID,
+			keyObject: privateKey,
+			apiBase: "https://api.github.com",
+			fetchImpl,
+			now: () => NOW,
+		});
+		await expect(source.tokenFor(OWNER, REPO)).rejects.toThrow(
+			"github app: installation lookup answered 503",
+		);
+		expect(calls).toHaveLength(3);
+		expect(calls.every((c) => c.url === INSTALL_URL)).toBe(true);
+	});
+
+	test("checkAppInstalls retries a pre-wrapped fetch once, not nested", async () => {
+		const { calls, fetchImpl } = appWiredFetch((url) =>
+			url.endsWith("/app")
+				? okResponse({
+						name: "ottr-ai",
+						html_url: "https://github.com/apps/ottr-ai",
+					})
+				: new Response("{}", { status: 503 }),
+		);
+		const check = await checkAppInstalls({
+			appId: APP_ID,
+			keyObject: privateKey,
+			repos: [`${OWNER}/${REPO}`],
+			apiBase: "https://api.github.com",
+			fetchImpl,
+			now: () => NOW,
+		});
+		// /app answers once; the installation lookup GET gets the 3 attempts of one wrap.
+		expect(calls.filter((c) => c.url === INSTALL_URL)).toHaveLength(3);
+		expect(check.failed).toEqual([
+			{
+				repo: `${OWNER}/${REPO}`,
+				detail: "installation lookup answered 503",
+			},
+		]);
+	});
+});
 
 describe("AppTokenSource", () => {
 	test("happy path: exact URLs, headers and body, returns the token", async () => {
