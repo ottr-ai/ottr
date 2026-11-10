@@ -259,6 +259,41 @@ button.primary:hover {
 button.primary:disabled:hover {
 	background: var(--accent);
 }
+.spinner {
+	width: 13px;
+	height: 13px;
+	flex: none;
+	border: 2px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
+}
+button > .icon-svg,
+button > .gh-mark,
+button > kbd,
+button > .spinner {
+	margin-top: 2px;
+}
+/* The B shortcut badge: the New task kbd's shape in the quiet button's neutral ink. */
+.lane-add kbd {
+	font-family: inherit;
+	font-size: 11px;
+	line-height: 1;
+	padding: 3px 5px;
+	margin: 0 0 0 2px; /* .lane-add has no 2px bottom padding to offset, unlike button > kbd */
+	color: inherit;
+	border: 1px solid var(--line-hover);
+	border-radius: 3px;
+}
+.compose-keys kbd {
+	font-family: var(--mono);
+	font-size: 11px;
+	padding: 0 5px;
+	border: 1px solid var(--line);
+	border-radius: 3px;
+	background: var(--well);
+	color: var(--text);
+}
 button.primary kbd {
 	font-family: inherit;
 	font-size: 11px;
@@ -304,6 +339,164 @@ button.icon:hover {
 button.icon[aria-pressed="true"] {
 	color: var(--accent);
 }
+.model-trigger .icon-svg {
+	flex: none;
+	transform: rotate(90deg); /* the right-chevron points down */
+}
+.mark {
+	width: 14px;
+	height: 14px;
+	flex: none;
+}
+.area-ind .mark {
+	width: 9px;
+	height: 9px;
+}
+.rail-badge .mark {
+	width: 9px;
+	height: 9px;
+}
+.card-head .mark {
+	flex: none;
+	width: 12px;
+	height: 12px;
+	margin-right: 2px;
+}
+.ov-tabs .mark {
+	width: 12px;
+	height: 12px;
+}
+.prov-callout .mark {
+	flex: none;
+	width: 16px;
+	height: 16px;
+}
+.sys-name .mark {
+	width: 12px;
+	height: 12px;
+}
+.stage-tabs .mark {
+	/* The alarm rides its tab as a bare mark (see .mark-needs / .mark-asked); the
+	   overview tabs' 12px precedent keeps it level with the 13px digits. */
+	width: 12px;
+	height: 12px;
+}
+.st .mark {
+	width: 11px;
+	height: 11px;
+}
+.ask-text .mark {
+	width: 12px;
+	height: 12px;
+	margin-top: 3px;
+}
+.role-steps .mark {
+	vertical-align: -2px;
+	margin-right: 6px;
+}
+.notif-line > .mark {
+	margin-top: 3px;
+}
+.meter-value .mark {
+	width: 12px;
+	height: 12px;
+}
+.sb-val .mark {
+	width: 12px;
+	height: 12px;
+}
+.notif-line > .icon-svg {
+	flex: none;
+	margin-top: 2px;
+	color: var(--accent);
+	stroke-width: 2.2;
+}
+.rail-user-caret .icon-svg {
+	transform: rotate(90deg);
+	transition: transform 160ms var(--ease);
+}
+.menu-row .icon-svg {
+	color: var(--dim);
+}
+.advisory > .icon-svg {
+	color: var(--dim);
+}
+.card-fu .icon-svg {
+	flex: none;
+	margin-top: 1px;
+}
+.turn-head .icon-svg {
+	color: var(--dim);
+	transition: transform 120ms var(--ease);
+}
+.turn-head > .icon-svg,
+button.icon > .icon-svg,
+button.thumb > .icon-svg {
+	margin-top: 0;
+}
+.ag-nums dt .icon-svg,
+.ag-nums dt .mark {
+	flex: none;
+	width: 13px;
+	height: 13px;
+	color: var(--dim);
+}
+.dialog-head h2 .icon-svg {
+	vertical-align: -2px;
+	margin-right: 8px;
+}
+.model-option[aria-pressed="true"] > .icon-svg {
+	color: var(--accent);
+}
+.inbox.lit > .icon-svg {
+	fill: currentColor;
+}
+.turn-head[aria-expanded="true"] .icon-svg {
+	transform: rotate(
+		90deg
+	); /* the right-chevron turns down when the log is open */
+}
+/* Bar icons: a 16px glyph on a firmer line reads at a glance. Idle icons sit at
+   text grey, not dim; a lit inbox bell overrides this with its solid fill. */
+.bar > button.icon > .icon-svg {
+	width: 16px;
+	height: 16px;
+	stroke-width: 2;
+}
+.area-ind.needs .mark {
+	width: 13px;
+	height: 13px;
+}
+.area-ind.asked .mark {
+	width: 13px;
+	height: 13px;
+}
+.kpi .l .mark {
+	width: 12px;
+	height: 12px;
+}
+.needs-reason.asked .mark {
+	flex: none;
+	width: 13px;
+	height: 13px;
+	margin-top: 1px;
+}
+.ag-nums div:not([data-zero]) dt .icon-svg,
+.ag-nums div:not([data-zero]) dt .mark {
+	color: var(--text);
+}
+.theme-choice[aria-pressed="true"] > .icon-svg:last-child {
+	color: var(--accent);
+}
+/* No mark on the bell: the bell itself carries the level. While an alarm tops the inbox it
+   fills in the alarm's hue and the count stays white; a new ask or notice fills grey and the bell turns ink. */
+.inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
+		.lit
+	)
+	> .icon-svg {
+	color: var(--lit);
+	fill: var(--lit);
+}
 /* The drawer's star toggle reads as filled when pressed, like the old card button did. */
 .drawer-head-actions button.icon[aria-pressed="true"] .icon-svg {
 	fill: currentColor;
@@ -347,27 +540,7 @@ button.attention {
 button {
 	padding-bottom: 2px;
 }
-button > .icon-svg,
-button > .gh-mark,
-button > kbd,
-button > .spinner {
-	margin-top: 2px;
-}
-button.icon > .icon-svg,
-button.thumb > .icon-svg,
-.turn-head > .icon-svg {
-	margin-top: 0;
-}
 
-.spinner {
-	width: 13px;
-	height: 13px;
-	flex: none;
-	border: 2px solid currentColor;
-	border-right-color: transparent;
-	border-radius: 50%;
-	animation: spin 0.7s linear infinite;
-}
 @keyframes spin {
 	to {
 		transform: rotate(360deg);
@@ -528,11 +701,6 @@ textarea {
 
 /* ---- State marks: shape carries the state, colour only the alarms ---- */
 
-.mark {
-	width: 14px;
-	height: 14px;
-	flex: none;
-}
 .mark-needs {
 	fill: var(--alarm);
 }
@@ -542,6 +710,12 @@ textarea {
 /* OTTR-566: a finished task nobody opened yet — the rail's steel dot. */
 .mark-unread {
 	fill: var(--accent);
+}
+.mark-ink {
+	fill: none;
+	stroke: var(--mark-ink);
+	stroke-width: 1.9;
+	stroke-linecap: round;
 }
 .mark-asked .mark-ink {
 	stroke: var(--accent-ink);
@@ -557,12 +731,6 @@ textarea {
 }
 .mark-crit {
 	fill: var(--crit);
-}
-.mark-ink {
-	fill: none;
-	stroke: var(--mark-ink);
-	stroke-width: 1.9;
-	stroke-linecap: round;
 }
 .mark-crit .mark-ink {
 	stroke: var(--mark-ink-crit);
@@ -704,9 +872,9 @@ textarea {
 	color: var(--text-strong);
 	font-variant-numeric: tabular-nums;
 }
-.meter-value .mark {
-	width: 12px;
-	height: 12px;
+.providers-meters .meter-value {
+	grid-area: meta;
+	justify-self: end;
 }
 .meter[data-level="high"] .meter-value {
 	color: var(--alarm);
@@ -743,10 +911,6 @@ textarea {
 	color: var(--text-strong);
 	font-variant-numeric: tabular-nums;
 }
-.sb-val .mark {
-	width: 12px;
-	height: 12px;
-}
 .sb-val[data-level="high"] {
 	color: var(--alarm);
 }
@@ -773,12 +937,72 @@ textarea {
 	height: 2px;
 	background: var(--line-soft);
 }
+.qt-time i {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	background: var(--text);
+}
+.qt-used i {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
+}
+.mutation-rail > i {
+	position: absolute;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	width: 3px;
+	background: var(--text-strong);
+	border-bottom-left-radius: 3px;
+	/* The fill scales up from the bottom instead of growing its height (a layout
+	   transition); the rail's --p drives it and the end dot alike. */
+	transform: scaleY(var(--p, 0));
+	transform-origin: bottom;
+	transition: transform 0.4s var(--ease);
+}
+.cell-bar i {
+	position: relative;
+	display: inline-block;
+	width: 64px;
+	height: 6px;
+	background: var(--well);
+	border-radius: 1px;
+}
+.mut-bar > i {
+	position: absolute;
+	inset: 0;
+	background: var(--normal-fill);
+	transform-origin: left;
+	transition: transform 0.4s var(--ease);
+}
 .sb-twin .t i {
 	position: absolute;
 	top: 0;
 	bottom: 0;
 	left: 0;
 	background: var(--text);
+}
+.qt-time i::after {
+	content: "";
+	position: absolute;
+	top: -2px;
+	right: -3px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--text);
+}
+.cell-bar i::after {
+	content: "";
+	position: absolute;
+	inset: 0 auto 0 0;
+	width: var(--v);
+	background: var(--normal-fill);
 }
 .sb-twin .t i::after {
 	content: "";
@@ -802,6 +1026,9 @@ textarea {
 	background: var(--normal-fill);
 	transform-origin: left;
 	transition: transform 0.4s var(--ease);
+}
+.qt-key .qt-time i {
+	right: 3px;
 }
 .sb-twin[data-level="high"] .q i {
 	background: var(--alarm);
@@ -835,13 +1062,6 @@ textarea {
    The notification bell is the same on every viewport. */
 .areas-toggle {
 	display: none;
-}
-/* Bar icons: a 16px glyph on a firmer line reads at a glance. Idle icons sit at
-   text grey, not dim; a lit inbox bell overrides this with its solid fill. */
-.bar > button.icon > .icon-svg {
-	width: 16px;
-	height: 16px;
-	stroke-width: 2;
 }
 .bar > button.icon {
 	color: var(--text);
@@ -916,13 +1136,17 @@ textarea {
 	background: var(--card);
 	border-color: transparent;
 }
-.theme-choice[aria-pressed="true"] > .icon-svg:last-child {
-	color: var(--accent);
-}
 /* The model field: caption with the quota above the one picker that sets model and thinking. */
 .model-fields {
 	display: flex;
 	gap: 10px;
+}
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	font-size: 13px;
+	color: var(--text);
 }
 .model-fields .field {
 	flex: 1;
@@ -1001,10 +1225,6 @@ textarea {
 	white-space: nowrap;
 	text-overflow: ellipsis;
 }
-.model-trigger .icon-svg {
-	flex: none;
-	transform: rotate(90deg); /* the right-chevron points down */
-}
 .model-pop {
 	/* No anchor support: fall back to the popover's centered default placement. */
 	top: auto;
@@ -1051,9 +1271,6 @@ textarea {
 }
 .model-option[aria-pressed="true"] {
 	color: var(--text-strong);
-}
-.model-option[aria-pressed="true"] > .icon-svg {
-	color: var(--accent);
 }
 /* Divider between the omp role rows and the provider-grouped catalog, and above the Thinking row. */
 .model-divider {
@@ -1259,16 +1476,28 @@ textarea {
 	font-size: 12px;
 	color: var(--dim);
 }
-.ag-nums dt .icon-svg,
-.ag-nums dt .mark {
-	flex: none;
-	width: 13px;
-	height: 13px;
-	color: var(--dim);
+.sys-kv dd {
+	margin: 0;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
 }
-.ag-nums div:not([data-zero]) dt .icon-svg,
-.ag-nums div:not([data-zero]) dt .mark {
-	color: var(--text);
+.mut-figs dd {
+	margin: 0;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+.decide-facts dd {
+	margin: 0;
+	min-width: 0;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.meta dd {
+	margin: 0;
+	font-family: var(--mono);
+	font-size: 12px;
+	overflow-wrap: anywhere;
 }
 .ag-nums div[data-zero] dd {
 	font-weight: 400;
@@ -1347,36 +1576,12 @@ textarea {
 	height: 2px;
 	background: var(--line-soft);
 }
-.qt-time i {
-	position: absolute;
-	top: 0;
-	bottom: 0;
-	left: 0;
-	background: var(--text);
-}
-.qt-time i::after {
-	content: "";
-	position: absolute;
-	top: -2px;
-	right: -3px;
-	width: 6px;
-	height: 6px;
-	border-radius: 50%;
-	background: var(--text);
-}
 .qt-used {
 	position: relative;
 	height: 7px;
 	background: var(--well);
 	border: 1px solid var(--line-soft);
 	border-radius: 1px;
-}
-.qt-used i {
-	position: absolute;
-	inset: 0;
-	background: var(--normal-fill);
-	transform-origin: left;
-	transition: transform 0.4s var(--ease);
 }
 .qt-row[data-level="high"] .qt-used i,
 .meter[data-level="high"] .qt-used i {
@@ -1402,9 +1607,6 @@ textarea {
 .qt-key .qt-used {
 	width: 14px;
 }
-.qt-key .qt-time i {
-	right: 3px;
-}
 /* Provider quota: one grid for every provider, so tracks and values line up; Meter parts become cells. */
 .quota {
 	display: grid;
@@ -1419,6 +1621,130 @@ textarea {
 	font-size: 12px;
 	font-weight: 600;
 	color: var(--text);
+}
+.project-id h1,
+.overview h1,
+.system-view h1,
+.empty h1 {
+	font-size: 20px;
+	font-weight: 600;
+	line-height: 1.25;
+	letter-spacing: -0.01em;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.dialog-head h2 {
+	font-size: 16px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.dialog-body h3 {
+	margin-top: 4px;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+/* The name takes the free space, so the chip, Open setup and Save group at the right. */
+.settings-head h2 {
+	margin: 0 auto 0 0;
+}
+.sec-title h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.sec-block > h4 {
+	margin: 0;
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.setup-sec h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.setup-checklist h3 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+/* Two lines at most, so the band stays short; the full title is the dialog's name. */
+.drawer-head h2 {
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow: hidden;
+	font-size: 17px;
+	font-weight: 600;
+	line-height: 1.25;
+	color: var(--text-strong);
+	overflow-wrap: anywhere;
+}
+.wf-head h3 {
+	margin: 0;
+	font-size: 15px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+/* Section labels: small HMI caps; the content below speaks for itself. */
+.drawer h3 {
+	margin: 22px 0 8px;
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+/* A section head with a trailing action: caps label left, one quiet ghost button right. */
+.section-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin: 22px 0 8px;
+}
+/* Inside a section the section's top margin owns the spacing; the head keeps only its
+   label-to-content gap. */
+.dsec > h3,
+.dsec > .section-head {
+	margin: 0 0 8px;
+}
+.section-head h3 {
+	margin: 0;
+}
+.kept-panel h3 {
+	margin: 0 0 4px;
+}
+.md h1,
+.md h2,
+.md h3,
+.md h4,
+.md h5,
+.md h6 {
+	margin: 0;
+	font-size: 13.5px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+/* Repo heads pin while their rows scroll past. */
+.updates-group h3 {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	margin: 0 -8px;
+	padding: 8px 8px 5px;
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--text-strong);
+	background: var(--field);
+	border-bottom: 1px solid var(--line-soft);
 }
 .quota-group + .quota-group h3 {
 	margin-top: 7px;
@@ -1475,6 +1801,9 @@ textarea {
 	font-variant-numeric: tabular-nums;
 	color: var(--text-strong);
 }
+.inbox.lit .inbox-n {
+	color: inherit;
+}
 .inbox[data-level="info"]:not(.lit) .inbox-n {
 	color: var(--dim); /* grey is normal */
 }
@@ -1487,21 +1816,6 @@ textarea {
 	color: var(--lit-ink);
 	background: var(--lit);
 	border-color: var(--text-strong);
-}
-.inbox.lit .inbox-n {
-	color: inherit;
-}
-/* No mark on the bell: the bell itself carries the level. While an alarm tops the inbox it
-   fills in the alarm's hue and the count stays white; a new ask or notice fills grey and the bell turns ink. */
-.inbox:is([data-level="needs"], [data-level="crit"], [data-level="asked"]):not(
-		.lit
-	)
-	> .icon-svg {
-	color: var(--lit);
-	fill: var(--lit);
-}
-.inbox.lit > .icon-svg {
-	fill: currentColor;
 }
 .new-tag {
 	flex: none;
@@ -1619,15 +1933,6 @@ button.notif-link {
 .notif-line > span {
 	flex: 1;
 }
-.notif-line > .mark {
-	margin-top: 3px;
-}
-.notif-line > .icon-svg {
-	flex: none;
-	margin-top: 2px;
-	color: var(--accent);
-	stroke-width: 2.2;
-}
 .notif-line button.icon {
 	flex: none;
 	min-height: 24px;
@@ -1711,25 +2016,13 @@ button.notif-link {
 	color: var(--dim);
 	font-variant-numeric: tabular-nums;
 }
-.area-ind .mark {
-	width: 9px;
-	height: 9px;
-}
 .area-ind.needs {
 	color: var(--alarm);
 	font-weight: 600;
 }
-.area-ind.needs .mark {
-	width: 13px;
-	height: 13px;
-}
 .area-ind.asked {
 	color: var(--accent);
 	font-weight: 600;
-}
-.area-ind.asked .mark {
-	width: 13px;
-	height: 13px;
 }
 /* "Projects" in sentence case at the rows' dim colour, no rule: the 10px gap above divides. */
 .areas-label {
@@ -1822,6 +2115,38 @@ button.notif-link {
 	border: 1px solid transparent;
 	border-radius: 3px;
 }
+/* Project tag: a two-letter plate that tells projects apart by letter shape. Grey stock,
+   never a hue (Grey-Is-Normal): the same plate marks the header and the New task
+   dialog, so the eye can match them before it reads the name. Rail rows show the
+   icon bare — only the row itself carries a highlight. */
+.ptag {
+	display: inline-grid;
+	flex-shrink: 0;
+	place-items: center;
+	width: 22px;
+	height: 22px;
+	font-size: 12px;
+	font-weight: 700;
+	line-height: 1;
+	letter-spacing: 0.02em;
+	color: var(--text-strong);
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.project-id .ptag {
+	width: 44px;
+	height: 44px;
+	font-size: 20px;
+	border-radius: 4px;
+}
+/* Settings icon section: the tag at header size, then the upload/remove actions beside it. */
+.icon-preview .ptag {
+	width: 44px;
+	height: 44px;
+	font-size: 20px;
+	border-radius: 4px;
+}
 /* The row highlight is the only marker an area needs: its icon shows bare, so a
    transparent project icon sits straight on the row and the monogram loses its
    plate here (the header and the New task dialog keep it). */
@@ -1838,10 +2163,6 @@ button.notif-link {
 	line-height: 0;
 	background: var(--well);
 	border-radius: 50%;
-}
-.rail-badge .mark {
-	width: 9px;
-	height: 9px;
 }
 /* Two rows: the centered "Ottr <version>" line, then the account chip (with its name).
    Collapsed, the version and chip stack in one centered column. Settings lives in the
@@ -1894,10 +2215,6 @@ button.notif-link {
 .rail-user-caret {
 	display: grid;
 	color: var(--dim);
-}
-.rail-user-caret .icon-svg {
-	transform: rotate(90deg);
-	transition: transform 160ms var(--ease);
 }
 .shell:has(#user-menu:popover-open) .rail-user-caret .icon-svg {
 	transform: rotate(-90deg);
@@ -1972,9 +2289,6 @@ button.notif-link {
 .menu-row:focus-visible {
 	outline: 2px solid var(--accent);
 	outline-offset: -2px;
-}
-.menu-row .icon-svg {
-	color: var(--dim);
 }
 .rail-ver {
 	color: var(--dim);
@@ -2141,31 +2455,6 @@ button.notif-link {
 .project-id-text {
 	min-width: 0;
 }
-/* Project tag: a two-letter plate that tells projects apart by letter shape. Grey stock,
-   never a hue (Grey-Is-Normal): the same plate marks the header and the New task
-   dialog, so the eye can match them before it reads the name. Rail rows show the
-   icon bare — only the row itself carries a highlight. */
-.ptag {
-	display: inline-grid;
-	flex-shrink: 0;
-	place-items: center;
-	width: 22px;
-	height: 22px;
-	font-size: 12px;
-	font-weight: 700;
-	line-height: 1;
-	letter-spacing: 0.02em;
-	color: var(--text-strong);
-	background: var(--well);
-	border: 1px solid var(--line);
-	border-radius: 3px;
-}
-.project-id .ptag {
-	width: 44px;
-	height: 44px;
-	font-size: 20px;
-	border-radius: 4px;
-}
 .ptag img {
 	width: 100%;
 	height: 100%;
@@ -2173,6 +2462,23 @@ button.notif-link {
 	/* Concentric with the plate: the image sits inside its 1px border, so one step
 	   under the plate's radius — inherit lands 1px large. */
 	border-radius: 2px;
+}
+.lightbox img {
+	display: block;
+	max-width: 94vw;
+	max-height: 90dvh;
+	border-radius: 4px;
+}
+.thumb img {
+	display: block;
+	max-height: 64px;
+	object-fit: contain;
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.auth-brand img {
+	height: 34px;
 }
 .project-id .ptag img,
 .icon-preview .ptag img {
@@ -2188,13 +2494,6 @@ button.notif-link {
 .ptag.tag-img img {
 	object-fit: contain;
 	border-radius: 0;
-}
-/* Settings icon section: the tag at header size, then the upload/remove actions beside it. */
-.icon-preview .ptag {
-	width: 44px;
-	height: 44px;
-	font-size: 20px;
-	border-radius: 4px;
 }
 .icon-row {
 	display: flex;
@@ -2237,6 +2536,57 @@ button.notif-link {
 	clip-path: inset(50%);
 	white-space: nowrap;
 }
+/* Release and image links read as links: accent like every other anchor, no rest
+   underline (the icon already marks them), underline on hover. */
+.project-meta a {
+	color: var(--accent);
+	text-decoration: none;
+}
+.card-tags a {
+	pointer-events: auto;
+}
+/* Read-only identity values (folder path, GitHub link): wrap instead of overflow. */
+.settings-field > code,
+.settings-field > a {
+	width: fit-content;
+	max-width: 100%;
+	overflow-wrap: anywhere;
+}
+.fu-list a {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 12px;
+	width: 100%;
+	min-height: 32px;
+	padding: 5px 10px;
+	border: 1px solid transparent;
+	border-radius: 4px;
+	background: none;
+	font: inherit;
+	font-size: 13px;
+	color: var(--text);
+	text-align: left;
+	text-decoration: none;
+	cursor: pointer;
+}
+/* The source card id inside a proposal reason: a real link, underlined so it reads
+   as one; the accent carries the hover and focus states. */
+.needs-reason a,
+.decide-reason a {
+	color: var(--accent);
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+.md a {
+	color: var(--accent);
+}
+.updates-links a {
+	color: var(--accent);
+}
+.updates-diffs a {
+	color: var(--accent);
+}
 .ov th a {
 	display: inline-flex;
 	align-items: center;
@@ -2249,17 +2599,6 @@ button.notif-link {
 	vertical-align: middle;
 	font-weight: 600;
 	color: var(--text-strong);
-}
-.project-id h1,
-.overview h1,
-.system-view h1,
-.empty h1 {
-	font-size: 20px;
-	font-weight: 600;
-	line-height: 1.25;
-	letter-spacing: -0.01em;
-	color: var(--text-strong);
-	overflow-wrap: anywhere;
 }
 .project-meta {
 	display: flex;
@@ -2274,12 +2613,6 @@ button.notif-link {
 	display: inline-flex;
 	align-items: center;
 	gap: 5px;
-}
-/* Release and image links read as links: accent like every other anchor, no rest
-   underline (the icon already marks them), underline on hover. */
-.project-meta a {
-	color: var(--accent);
-	text-decoration: none;
 }
 .project-meta a:hover {
 	text-decoration: underline;
@@ -2497,9 +2830,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .advisory + .advisory {
 	margin-top: 8px;
 }
-.advisory > .icon-svg {
-	color: var(--dim);
-}
 /* The advisory's one action reads as a steel link at the line's end; touch keeps its 40px target. */
 .advisory > button {
 	margin-left: auto;
@@ -2681,8 +3011,28 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	outline: 1px dashed var(--line);
 	outline-offset: -1px;
 }
+/* One column, top to bottom (Option A): stacked sections with even spacing. */
+.overview > * + * {
+	margin-top: 20px;
+}
 .card.dragging > * {
 	opacity: 0;
+}
+.card-open {
+	display: inline-flex;
+	flex-direction: column;
+	align-items: stretch;
+	justify-content: flex-start;
+	gap: 3px;
+	min-height: 0;
+	padding: 9px 10px 8px;
+	color: inherit;
+	font-weight: 400;
+	text-align: left;
+	text-decoration: none;
+	background: none;
+	border: 0;
+	border-radius: 0;
 }
 /* The stretched open-button paints the whole card, so it must follow the card's
    drag cursor instead of the button pointer; its ::after inherits from it. */
@@ -2725,22 +3075,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	outline: 2px solid var(--accent);
 	outline-offset: 2px;
 }
-.card-open {
-	display: inline-flex;
-	flex-direction: column;
-	align-items: stretch;
-	justify-content: flex-start;
-	gap: 3px;
-	min-height: 0;
-	padding: 9px 10px 8px;
-	color: inherit;
-	font-weight: 400;
-	text-align: left;
-	text-decoration: none;
-	background: none;
-	border: 0;
-	border-radius: 0;
-}
 .card-open:hover,
 .card-open:active {
 	background: none;
@@ -2761,12 +3095,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	align-items: center;
 	gap: 6px;
 	min-height: 20px;
-}
-.card-head .mark {
-	flex: none;
-	width: 12px;
-	height: 12px;
-	margin-right: 2px;
 }
 .card-title {
 	display: -webkit-box;
@@ -2821,10 +3149,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	line-height: 1.35;
 	color: var(--dim);
 }
-.card-fu .icon-svg {
-	flex: none;
-	margin-top: 1px;
-}
 .card-fu-title {
 	min-width: 0;
 	overflow: hidden;
@@ -2838,6 +3162,17 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	column-gap: 6px;
 	font-size: 12.5px;
 	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.release,
+.commits,
+.model {
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 3px;
 	font-variant-numeric: tabular-nums;
 }
 .card-meta .commits {
@@ -2893,20 +3228,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	pointer-events: none;
 	/* Size container: the end dot rides the rail's height through cqh units. */
 	container-type: size;
-}
-.mutation-rail > i {
-	position: absolute;
-	top: 0;
-	bottom: 0;
-	left: 0;
-	width: 3px;
-	background: var(--text-strong);
-	border-bottom-left-radius: 3px;
-	/* The fill scales up from the bottom instead of growing its height (a layout
-	   transition); the rail's --p drives it and the end dot alike. */
-	transform: scaleY(var(--p, 0));
-	transform-origin: bottom;
-	transition: transform 0.4s var(--ease);
 }
 /* The head: the twin bar's 6px end dot, centred on the 3px fill. A sibling of the fill,
    not its ::before, so the fill's scaleY cannot stretch it; it rides the same --p. */
@@ -2988,20 +3309,6 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	gap: 6px;
 	padding: 0 10px 8px;
 	pointer-events: none;
-}
-.card-tags a {
-	pointer-events: auto;
-}
-.release,
-.commits,
-.model {
-	padding: 0 6px;
-	font-family: var(--mono);
-	font-size: 11.5px;
-	color: var(--text);
-	border: 1px solid var(--line);
-	border-radius: 3px;
-	font-variant-numeric: tabular-nums;
 }
 a.release {
 	color: var(--accent);
@@ -3210,17 +3517,6 @@ a.pr-link:hover {
 	border-style: solid;
 	border-color: var(--line-hover);
 }
-/* The B shortcut badge: the New task kbd's shape in the quiet button's neutral ink. */
-.lane-add kbd {
-	font-family: inherit;
-	font-size: 11px;
-	line-height: 1;
-	padding: 3px 5px;
-	margin: 0 0 0 2px; /* .lane-add has no 2px bottom padding to offset, unlike button > kbd */
-	color: inherit;
-	border: 1px solid var(--line-hover);
-	border-radius: 3px;
-}
 /* Done lane "Show more": a quiet full-width button under the last page of cards. */
 .lane-more {
 	display: flex;
@@ -3298,6 +3594,15 @@ a.pr-link:hover {
 	outline-offset: 2px;
 }
 .chev {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.5;
+	flex-shrink: 0;
+	transition: transform 160ms var(--ease);
+}
+.fu-head .chev {
 	width: 12px;
 	height: 12px;
 	fill: none;
@@ -3396,9 +3701,11 @@ a.pr-link:hover {
 
 /* ---- Overview (Level 1) ---- */
 
-/* One column, top to bottom (Option A): stacked sections with even spacing. */
-.overview > * + * {
-	margin-top: 20px;
+.ov-wrap {
+	overflow-x: auto;
+	background: var(--panel);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
 }
 .overview > .ov-wrap {
 	/* The live table sits directly under its "Projects now" heading. */
@@ -3406,12 +3713,6 @@ a.pr-link:hover {
 }
 .overview h1 {
 	margin: 0;
-}
-.ov-wrap {
-	overflow-x: auto;
-	background: var(--panel);
-	border: 1px solid var(--line-soft);
-	border-radius: 6px;
 }
 .ov {
 	width: 100%;
@@ -3435,20 +3736,95 @@ a.pr-link:hover {
 .ov tr:last-child > * {
 	border-bottom: 0;
 }
-.ov thead th {
-	font-size: 12.5px;
-	font-weight: 600;
-	color: var(--dim);
+.md th {
+	background: var(--well);
+	color: var(--text-strong);
 }
 .ov thead th:first-child,
 .ov th[scope="row"] {
 	width: 100%;
 	text-align: left;
 }
+.ov td:last-child {
+	padding: 4px 8px;
+}
+/* The live table's last column is the New task button; the perf table's Spend column is data,
+   so it keeps full cell padding. */
+.perf td:last-child {
+	padding: 10px 14px;
+}
+.prov-matrix thead th:not(:first-child),
+.prov-matrix td,
+.prov-matrix td:last-child {
+	width: 1%;
+	padding: 10px 18px;
+	text-align: center;
+}
+.sys th,
+.sys td {
+	padding: 10px 14px;
+	text-align: left;
+	vertical-align: top;
+	white-space: nowrap;
+	border-bottom: 1px solid var(--line-soft);
+}
+.setup-forks td {
+	padding: 3px 0;
+	border-top: 1px solid var(--line-soft);
+}
+.md th,
+.md td {
+	border: 1px solid var(--line-soft);
+	padding: 3px 8px;
+	text-align: left;
+	vertical-align: top;
+}
+.ov thead th {
+	font-size: 12.5px;
+	font-weight: 600;
+	color: var(--dim);
+}
+.meta dd a {
+	text-decoration: none;
+}
 .ov th[scope="row"] a {
 	font-weight: 600;
 	color: var(--text-strong);
 	text-decoration: none;
+}
+.perf-range button:first-of-type {
+	/* The strip clips nothing, so the end pills round themselves under the border. */
+	border-top-left-radius: 5px;
+	border-bottom-left-radius: 5px;
+}
+.perf-range button:last-of-type {
+	border-top-right-radius: 5px;
+	border-bottom-right-radius: 5px;
+}
+.perf-range button:hover {
+	color: var(--text-strong);
+	background: var(--card);
+}
+.rank-seg button:hover {
+	background: var(--card-hover);
+}
+/* A warning row: amber tint, the warning mark, and the reasons as text under the name, so
+   the hue never carries the warning alone. */
+.sys tr[data-warn] > * {
+	background: var(--alarm-bg);
+}
+.fu-list a:hover {
+	background: var(--card);
+	color: var(--text-strong);
+}
+.needs-reason a:hover,
+.needs-reason a:focus-visible,
+.decide-reason a:hover,
+.decide-reason a:focus-visible {
+	color: var(--accent-hover);
+}
+.meta dd a:hover {
+	text-decoration: underline;
 }
 .ov th[scope="row"] a:hover {
 	color: var(--accent);
@@ -3476,9 +3852,6 @@ a.pr-link:hover {
 .ov td > .mark-needs {
 	vertical-align: -2px;
 	margin-right: 6px;
-}
-.ov td:last-child {
-	padding: 4px 8px;
 }
 .needs-count {
 	display: inline-flex;
@@ -3535,27 +3908,83 @@ a.pr-link:hover {
 	border-radius: 0;
 	color: var(--dim);
 }
-.perf-range button:first-of-type {
-	/* The strip clips nothing, so the end pills round themselves under the border. */
-	border-top-left-radius: 5px;
-	border-bottom-left-radius: 5px;
-}
-.perf-range button:last-of-type {
-	border-top-right-radius: 5px;
-	border-bottom-right-radius: 5px;
-}
 .perf-range .spinner {
 	position: absolute;
 	right: 100%;
 	top: 50%;
 	margin: -6.5px 6px 0 0;
 }
+.ov-tabs button {
+	gap: 6px;
+}
+.dialog-actions > button {
+	white-space: nowrap;
+}
+.ask-custom > button {
+	align-self: stretch; /* same height as the field beside it */
+}
+.prov-callout button {
+	flex: none;
+}
+.rank-seg button {
+	flex: 1 1 0; /* segmented control: equal segments, not content width */
+	min-height: 32px;
+	padding: 0 8px;
+	font-size: 13.5px;
+	white-space: nowrap;
+}
+.add-tabs button,
+.stage-tabs button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex: 1 1 0; /* segmented control: equal segments, not content width */
+	min-height: 32px;
+	padding: 0 14px;
+	margin-bottom: -1px;
+	background: transparent;
+	border: 0;
+	border-bottom: 2px solid transparent;
+	border-radius: 0;
+	color: var(--dim);
+	transition:
+		color 120ms cubic-bezier(0.2, 0.7, 0.3, 1),
+		border-color 120ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+.stage-tabs button {
+	/* Equal segments (shared rule above); min-width:auto keeps the label whole,
+	   so a strip too tight for all four scrolls instead of cutting a label. */
+	padding: 0 10px; /* phones: more of the four tabs fit before the strip scrolls */
+	gap: 6px;
+	white-space: nowrap;
+}
+/* Collapsible Follow-ups head: the h3 keeps the drawer label's caps look (margins, size and
+   color come from `.drawer h3`), the button inside is the click target. The chevron reuses the
+   done-lane topic head's arrow: points down when open, right when collapsed. */
+.fu-head button {
+	display: flex;
+	align-items: center;
+	justify-content: flex-start; /* the global button rule centers; section labels sit left */
+	gap: 6px;
+	width: 100%;
+	padding: 0;
+	border: 0;
+	background: none;
+	font: inherit;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.section-head button {
+	flex: none;
+	padding: 2px 7px;
+	font-size: 12px;
+}
+.followup-cta > button {
+	flex: none; /* the label must not wrap at narrow drawer widths */
+}
 .perf-range button + button {
 	border-left: 1px solid var(--line-soft);
-}
-.perf-range button:hover {
-	color: var(--text-strong);
-	background: var(--card);
 }
 .perf-range button[aria-pressed="true"] {
 	color: var(--accent);
@@ -3572,15 +4001,26 @@ a.pr-link:hover {
 	color: var(--text-strong);
 	font-weight: 600;
 }
-/* The live table's last column is the New task button; the perf table's Spend column is data,
-   so it keeps full cell padding. */
-.perf td:last-child {
-	padding: 10px 14px;
+/* Section head: bold label with a count note or the range pills on the same line. */
+.ov-head {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin: 0 0 8px;
 }
 /* Performance is one card like Projects: the KPI strip, a hairline, then the per-project table.
    The tiles drop their own frame inside the card; the card is the frame. */
 .perf > .ov-head {
 	margin-bottom: 8px;
+}
+/* KPI strip: five tiles over 1px hairline gaps; value, sub-line, delta, sparkline. */
+.kpis {
+	display: grid;
+	grid-template-columns: repeat(5, minmax(0, 1fr));
+	background: var(--line-soft);
+	border: 1px solid var(--line-soft);
+	border-radius: 6px;
+	overflow: hidden;
 }
 .perf .ov-wrap .kpis {
 	border: 0;
@@ -3595,13 +4035,6 @@ a.pr-link:hover {
    cards waiting on you; Setup carries the warning mark while provisioning needs a look. */
 .ov-tabs {
 	margin-top: 4px;
-}
-.ov-tabs button {
-	gap: 6px;
-}
-.ov-tabs .mark {
-	width: 12px;
-	height: 12px;
 }
 .ov-tab-n {
 	font-size: 12px;
@@ -3624,6 +4057,12 @@ a.pr-link:hover {
 .perf > .ov-head {
 	justify-content: flex-end;
 }
+.prov {
+	margin-top: 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
 /* Setup (provisioning) sits bare in its tab: its own table is already the card. */
 .ov-panel > .prov {
 	margin: 0;
@@ -3639,12 +4078,6 @@ a.pr-link:hover {
 	border-radius: 6px;
 	color: var(--dim);
 	font-size: 13px;
-}
-.prov {
-	margin-top: 16px;
-	display: flex;
-	flex-direction: column;
-	gap: 8px;
 }
 /* Heading and server state share one line; the state wraps under the heading on a phone. */
 .prov-head {
@@ -3675,11 +4108,6 @@ a.pr-link:hover {
 	border: 1px solid var(--alarm-line);
 	border-radius: 6px;
 }
-.prov-callout .mark {
-	flex: none;
-	width: 16px;
-	height: 16px;
-}
 .prov-callout-text {
 	display: grid;
 	flex: 1;
@@ -3693,9 +4121,6 @@ a.pr-link:hover {
 .prov-callout small {
 	font-size: 12.5px;
 	color: var(--text);
-}
-.prov-callout button {
-	flex: none;
 }
 /* The Setup tab carries the same amber while no agent server is set, selected or not
    (the second selector outranks the later .add-tabs selected rule). */
@@ -3713,13 +4138,6 @@ a.pr-link:hover {
 .prov-matrix th[scope="row"] {
 	font-weight: 600;
 	color: var(--text-strong);
-}
-.prov-matrix thead th:not(:first-child),
-.prov-matrix td,
-.prov-matrix td:last-child {
-	width: 1%;
-	padding: 10px 18px;
-	text-align: center;
 }
 .prov-yes {
 	display: inline-flex;
@@ -3745,13 +4163,6 @@ a.pr-link:hover {
 
 /* ---- Overview sections (Option A): triage list, KPI strip, per-project inline bars. ---- */
 
-/* Section head: bold label with a count note or the range pills on the same line. */
-.ov-head {
-	display: flex;
-	align-items: center;
-	gap: 12px;
-	margin: 0 0 8px;
-}
 .ov-sec {
 	margin: 0 0 8px;
 	font-size: 13.5px;
@@ -3914,16 +4325,6 @@ a.pr-link:hover {
 	min-width: 0;
 	overflow-x: auto;
 }
-.rank-seg button {
-	flex: 1 1 0; /* segmented control: equal segments, not content width */
-	min-height: 32px;
-	padding: 0 8px;
-	font-size: 13.5px;
-	white-space: nowrap;
-}
-.rank-seg button:hover {
-	background: var(--card-hover);
-}
 .rank-seg button[aria-pressed="true"] {
 	background: var(--card-active);
 	border-color: var(--line-hover);
@@ -3947,6 +4348,10 @@ a.pr-link:hover {
 	gap: 6px;
 	flex: 1;
 	min-width: 0;
+}
+.setup-facts span {
+	color: var(--dim);
+	font-size: 12px;
 }
 .triage-nominate > label > span {
 	font-size: 13px;
@@ -3979,15 +4384,6 @@ a.pr-link:hover {
 	color: var(--dim);
 }
 
-/* KPI strip: five tiles over 1px hairline gaps; value, sub-line, delta, sparkline. */
-.kpis {
-	display: grid;
-	grid-template-columns: repeat(5, minmax(0, 1fr));
-	background: var(--line-soft);
-	border: 1px solid var(--line-soft);
-	border-radius: 6px;
-	overflow: hidden;
-}
 /* Flex column: tiles in one row share a height, so margin-top:auto pins every sparkline to the
    bottom edge whether or not the tile shows a delta line. */
 .kpi {
@@ -4004,10 +4400,6 @@ a.pr-link:hover {
 	align-items: center;
 	color: var(--dim);
 	font-size: 12.5px;
-}
-.kpi .l .mark {
-	width: 12px;
-	height: 12px;
 }
 .kpi .v {
 	color: var(--text-strong);
@@ -4067,6 +4459,12 @@ a.pr-link:hover {
 	background: var(--alarm-bg);
 	box-shadow: inset 0 0 0 1px var(--alarm-line);
 }
+.spark polyline {
+	fill: none;
+	stroke: var(--text);
+	stroke-width: 1.5;
+	stroke-linejoin: round;
+}
 .kpi.alarm .sp polyline {
 	stroke: var(--alarm);
 }
@@ -4082,21 +4480,6 @@ a.pr-link:hover {
 	gap: 8px;
 	align-items: center;
 	justify-content: flex-end;
-}
-.cell-bar i {
-	position: relative;
-	display: inline-block;
-	width: 64px;
-	height: 6px;
-	background: var(--well);
-	border-radius: 1px;
-}
-.cell-bar i::after {
-	content: "";
-	position: absolute;
-	inset: 0 auto 0 0;
-	width: var(--v);
-	background: var(--normal-fill);
 }
 .cell-bar.alarm i::after {
 	background: var(--alarm);
@@ -4156,12 +4539,6 @@ dialog.lightbox {
 	border: 0;
 	box-shadow: none;
 	overflow: visible;
-}
-.lightbox img {
-	display: block;
-	max-width: 94vw;
-	max-height: 90dvh;
-	border-radius: 4px;
 }
 .lightbox .frame {
 	position: relative;
@@ -4310,15 +4687,6 @@ dialog.diff-view {
 	font-size: 12px;
 	color: var(--dim);
 }
-.compose-keys kbd {
-	font-family: var(--mono);
-	font-size: 11px;
-	padding: 0 5px;
-	border: 1px solid var(--line);
-	border-radius: 3px;
-	background: var(--well);
-	color: var(--text);
-}
 /* Deepen review: the block under the composer and its scrollable diff. */
 .deepen-review {
 	display: flex;
@@ -4397,15 +4765,6 @@ dialog.diff-view {
 	justify-content: space-between;
 	gap: 10px;
 }
-.dialog-head h2 {
-	font-size: 16px;
-	font-weight: 600;
-	color: var(--text-strong);
-}
-.dialog-head h2 .icon-svg {
-	vertical-align: -2px;
-	margin-right: 8px;
-}
 .dialog-sub {
 	margin-left: 10px;
 	font-weight: 400;
@@ -4423,19 +4782,6 @@ dialog.confirm-dialog {
 	line-height: 1.5;
 	white-space: pre-line;
 	overflow-wrap: anywhere;
-}
-.dialog-body h3 {
-	margin-top: 4px;
-	font-size: 13.5px;
-	font-weight: 600;
-	color: var(--text-strong);
-}
-.field {
-	display: flex;
-	flex-direction: column;
-	gap: 6px;
-	font-size: 13px;
-	color: var(--text);
 }
 /* Shared prompt inputs (New task, Reply/follow-up, Steer): label, textarea, attachments. */
 .prompt-field {
@@ -4481,9 +4827,6 @@ dialog.confirm-dialog {
 	gap: 8px;
 	margin-top: 8px;
 }
-.dialog-actions > button {
-	white-space: nowrap;
-}
 /* The image picker sits apart on the row's left edge; Cancel and the primary stay right. */
 .dialog-actions .browse {
 	margin-right: auto;
@@ -4496,6 +4839,12 @@ dialog.confirm-dialog {
 	align-self: stretch;
 	align-items: flex-start;
 	gap: 8px;
+}
+.settings-sec .alate-def-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 10px;
+	margin-top: 12px;
 }
 /* A form's action row spans the card so its Save sits at the right, like a card footer. */
 .settings-sec .settings-form > .alate-def-actions {
@@ -4562,14 +4911,6 @@ dialog.confirm-dialog {
 	font-size: 13px;
 	font-variant-numeric: tabular-nums;
 }
-.sys th,
-.sys td {
-	padding: 10px 14px;
-	text-align: left;
-	vertical-align: top;
-	white-space: nowrap;
-	border-bottom: 1px solid var(--line-soft);
-}
 .sys tr:last-child > * {
 	border-bottom: 0;
 }
@@ -4593,15 +4934,6 @@ dialog.confirm-dialog {
 	display: inline-flex;
 	align-items: center;
 	gap: 6px;
-}
-.sys-name .mark {
-	width: 12px;
-	height: 12px;
-}
-/* A warning row: amber tint, the warning mark, and the reasons as text under the name, so
-   the hue never carries the warning alone. */
-.sys tr[data-warn] > * {
-	background: var(--alarm-bg);
 }
 .sys-warns {
 	margin: 4px 0 0;
@@ -4637,6 +4969,11 @@ dialog.confirm-dialog {
 .sys-turns .sys-sub {
 	display: block;
 }
+.ask-custom > label > span {
+	font-size: 13px;
+	color: var(--dim);
+	white-space: nowrap;
+}
 .sys-turns .sys-sub > span {
 	white-space: nowrap;
 }
@@ -4661,6 +4998,13 @@ dialog.confirm-dialog {
 		overflow: hidden;
 		clip-path: inset(50%);
 	}
+	.sys th,
+	.sys td {
+		border-bottom: 0;
+		padding: 6px 14px;
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
 	.sys tr,
 	.sys tbody th,
 	.sys td {
@@ -4671,13 +5015,6 @@ dialog.confirm-dialog {
 	}
 	.sys tr:last-child {
 		border-bottom: 0;
-	}
-	.sys th,
-	.sys td {
-		border-bottom: 0;
-		padding: 6px 14px;
-		white-space: normal;
-		overflow-wrap: anywhere;
 	}
 	.sys tbody th {
 		padding-top: 10px;
@@ -4710,12 +5047,6 @@ dialog.confirm-dialog {
 	background: var(--well);
 	border-radius: 1px;
 }
-.spark polyline {
-	fill: none;
-	stroke: var(--text);
-	stroke-width: 1.5;
-	stroke-linejoin: round;
-}
 .spark circle {
 	fill: var(--text);
 }
@@ -4738,11 +5069,6 @@ dialog.confirm-dialog {
 }
 .sys-kv dt {
 	color: var(--dim);
-}
-.sys-kv dd {
-	margin: 0;
-	color: var(--text-strong);
-	overflow-wrap: anywhere;
 }
 .sys-commits {
 	margin: 4px 0 0;
@@ -4832,10 +5158,6 @@ dialog.confirm-dialog {
 	gap: 8px;
 	margin: 0;
 }
-/* The name takes the free space, so the chip, Open setup and Save group at the right. */
-.settings-head h2 {
-	margin: 0 auto 0 0;
-}
 .settings-sec {
 	display: flex;
 	flex-direction: column;
@@ -4873,12 +5195,6 @@ dialog.confirm-dialog {
 	align-items: center;
 	flex-wrap: wrap;
 	gap: 8px;
-}
-.sec-title h3 {
-	margin: 0;
-	font-size: 13.5px;
-	font-weight: 600;
-	color: var(--text-strong);
 }
 /* "?" badge beside a setting's name: a ghost icon button that opens a short explanation. */
 .help-badge {
@@ -4984,12 +5300,6 @@ dialog.confirm-dialog {
 .sec-block + .sec-block {
 	padding-top: 12px;
 	border-top: 1px solid var(--line-soft);
-}
-.sec-block > h4 {
-	margin: 0;
-	font-size: 12.5px;
-	font-weight: 600;
-	color: var(--text-strong);
 }
 .sec-foot {
 	display: flex;
@@ -5100,6 +5410,15 @@ dialog.confirm-dialog {
 .smap-tree > li:first-child::before {
 	top: calc(var(--row) / 2);
 }
+.lineage-rail li:first-child::before {
+	top: 50%;
+}
+.lineage-rail li:last-child::before {
+	bottom: 50%;
+}
+.lineage-rail li:only-child::before {
+	display: none;
+}
 .smap-tree > li:last-child::before,
 .smap-tree ol > li:last-child::before {
 	bottom: auto;
@@ -5112,6 +5431,16 @@ dialog.confirm-dialog {
 }
 .smap-tree ol > li:only-child::before {
 	height: var(--row);
+}
+/* The thread runs from the first node's centre to the last node's centre. */
+.lineage-rail li::before {
+	content: "";
+	position: absolute;
+	left: 6px;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background: var(--line);
 }
 .smap-tree ol > li::before {
 	left: calc(0px - var(--indent));
@@ -5198,11 +5527,54 @@ dialog.confirm-dialog {
 	font-size: 12.5px;
 	color: var(--dim);
 }
+.settings-numbers label {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+/* The visible caption in front of the free-text answer, matching the triage caption. */
+.ask-custom > label {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	flex: 1;
+	min-width: 0;
+}
+.reply-form label,
+.prompt-field > label,
+.meta-block > summary {
+	font-size: 12px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+/* Same caption and width cap as .settings-field. */
+.pending-key label {
+	display: grid;
+	gap: 4px;
+	width: 100%;
+	max-width: 460px;
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.check-row label {
+	cursor: pointer;
+}
 /* In a settings card, fields and key boxes span the card like the definition rows, and the
    key and test buttons sit at the right like the other card actions. Dialogs keep the cap. */
 .settings-sec .settings-field,
 .settings-sec .pending-key label {
 	max-width: none;
+}
+/* Pending SSH key: one control per line, so the paste box never floats beside its buttons. */
+.pending-key {
+	display: grid;
+	gap: 0.5rem;
+	justify-items: start;
+	align-self: stretch;
 }
 .settings-sec .pending-key {
 	justify-items: stretch;
@@ -5234,13 +5606,6 @@ dialog.confirm-dialog {
 .settings-field input[type="number"] {
 	font-variant-numeric: tabular-nums;
 	width: 7ch;
-}
-/* Read-only identity values (folder path, GitHub link): wrap instead of overflow. */
-.settings-field > code,
-.settings-field > a {
-	width: fit-content;
-	max-width: 100%;
-	overflow-wrap: anywhere;
 }
 /* Danger zone: the one red-lined section, last on a project page. The red border and the
    red button carry the warning; the title keeps the normal heading colour. */
@@ -5391,13 +5756,6 @@ dialog.confirm-dialog {
 	flex-wrap: wrap;
 	gap: 16px;
 }
-.settings-numbers label {
-	display: flex;
-	flex-direction: column;
-	gap: 4px;
-	font-size: 12.5px;
-	color: var(--dim);
-}
 .settings-numbers input {
 	width: 72px;
 }
@@ -5405,24 +5763,6 @@ dialog.confirm-dialog {
 	display: flex;
 	gap: 2px;
 	border-bottom: 1px solid var(--line-soft);
-}
-.add-tabs button,
-.stage-tabs button {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	flex: 1 1 0; /* segmented control: equal segments, not content width */
-	min-height: 32px;
-	padding: 0 14px;
-	margin-bottom: -1px;
-	background: transparent;
-	border: 0;
-	border-bottom: 2px solid transparent;
-	border-radius: 0;
-	color: var(--dim);
-	transition:
-		color 120ms cubic-bezier(0.2, 0.7, 0.3, 1),
-		border-color 120ms cubic-bezier(0.2, 0.7, 0.3, 1);
 }
 .add-tabs button:hover,
 .stage-tabs button:hover {
@@ -5438,13 +5778,6 @@ dialog.confirm-dialog {
 	outline: 1px solid var(--accent);
 	outline-offset: -1px;
 }
-.stage-tabs button {
-	/* Equal segments (shared rule above); min-width:auto keeps the label whole,
-	   so a strip too tight for all four scrolls instead of cutting a label. */
-	padding: 0 10px; /* phones: more of the four tabs fit before the strip scrolls */
-	gap: 6px;
-	white-space: nowrap;
-}
 .stage-tabs .tabs-digits {
 	/* Bare digits, not chips: they read as part of the label and keep the strip inside
 	   a 320px phone even with an alarm mark riding along. */
@@ -5452,12 +5785,6 @@ dialog.confirm-dialog {
 	font-weight: 500;
 	color: var(--dim);
 	font-variant-numeric: tabular-nums;
-}
-.stage-tabs .mark {
-	/* The alarm rides its tab as a bare mark (see .mark-needs / .mark-asked); the
-	   overview tabs' 12px precedent keeps it level with the 13px digits. */
-	width: 12px;
-	height: 12px;
 }
 @media (prefers-reduced-motion: reduce) {
 	.add-tabs button,
@@ -5509,12 +5836,6 @@ dialog.confirm-dialog {
 	border: 1px solid var(--line-soft);
 	border-radius: 4px;
 }
-.setup-sec h3 {
-	margin: 0;
-	font-size: 13.5px;
-	font-weight: 600;
-	color: var(--text-strong);
-}
 .setup-sec .settings-field {
 	width: 100%;
 }
@@ -5527,6 +5848,21 @@ dialog.confirm-dialog {
 	gap: 4px 8px;
 	font-size: 13px;
 	color: var(--text);
+}
+.wt-files .hint {
+	color: var(--dim);
+	font-size: 12px;
+}
+.followup-cta .hint {
+	margin: 0;
+}
+.role-notes .hint {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+.drawer-body > .reply-form .hint {
+	display: none;
 }
 .setup-sec label.add-check .hint,
 .settings-sec label.add-check .hint {
@@ -5563,18 +5899,10 @@ label.add-check:has(input:disabled) {
 	font-weight: 600;
 	font-variant-numeric: tabular-nums;
 }
-.setup-facts span {
-	color: var(--dim);
-	font-size: 12px;
-}
 .setup-forks {
 	width: 100%;
 	border-collapse: collapse;
 	font-size: 12.5px;
-}
-.setup-forks td {
-	padding: 3px 0;
-	border-top: 1px solid var(--line-soft);
 }
 .setup-forks td:first-child {
 	font-family: var(--mono);
@@ -5603,12 +5931,6 @@ label.add-check:has(input:disabled) {
 	background: var(--panel);
 	border: 1px solid var(--accent-line);
 	border-radius: 6px;
-}
-.setup-checklist h3 {
-	margin: 0;
-	font-size: 13.5px;
-	font-weight: 600;
-	color: var(--text-strong);
 }
 .setup-checklist ul {
 	display: flex;
@@ -5678,14 +6000,6 @@ button.thumb:hover,
 button.thumb-open:hover {
 	background: none;
 	border-color: transparent;
-}
-.thumb img {
-	display: block;
-	max-height: 64px;
-	object-fit: contain;
-	background: var(--card);
-	border: 1px solid var(--line);
-	border-radius: 4px;
 }
 .thumb .thumb-x {
 	position: absolute;
@@ -5796,6 +6110,11 @@ dialog.drawer[open]::backdrop {
 	background: var(--panel);
 	border-bottom: 1px solid var(--line-soft);
 }
+/* Every drawer section is a .dsec wrapper. Sections are read-only, so space alone
+   separates them: no rules. Collapsible heads (fu-head) toggle the body below. */
+.drawer-body > .dsec {
+	margin-top: 22px;
+}
 /* The band's edge closes the header: the first section keeps one 14px step below it. */
 .drawer-body > .drawer-top + .dsec {
 	margin-top: 14px;
@@ -5805,18 +6124,6 @@ dialog.drawer[open]::backdrop {
 	align-items: flex-start;
 	justify-content: space-between;
 	gap: 10px;
-}
-/* Two lines at most, so the band stays short; the full title is the dialog's name. */
-.drawer-head h2 {
-	display: -webkit-box;
-	-webkit-box-orient: vertical;
-	-webkit-line-clamp: 2;
-	overflow: hidden;
-	font-size: 17px;
-	font-weight: 600;
-	line-height: 1.25;
-	color: var(--text-strong);
-	overflow-wrap: anywhere;
 }
 .drawer-head-actions {
 	display: flex;
@@ -5852,12 +6159,6 @@ dialog.drawer[open]::backdrop {
 	justify-content: space-between;
 	gap: 10px;
 	margin: 0 0 10px;
-}
-.wf-head h3 {
-	margin: 0;
-	font-size: 15px;
-	font-weight: 600;
-	color: var(--text-strong);
 }
 /* The Diagrams modal's right-side head group: the create/update button plus the close X. */
 .hiw-actions {
@@ -5933,13 +6234,6 @@ dialog.drawer[open]::backdrop {
 	background: var(--well);
 	border-radius: 2px;
 }
-.mut-bar > i {
-	position: absolute;
-	inset: 0;
-	background: var(--normal-fill);
-	transform-origin: left;
-	transition: transform 0.4s var(--ease);
-}
 .mut-figs {
 	display: grid;
 	grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -5953,12 +6247,6 @@ dialog.drawer[open]::backdrop {
 .mut-figs dt {
 	font-size: 12px;
 	color: var(--dim);
-}
-.mut-figs dd {
-	margin: 0;
-	color: var(--text-strong);
-	font-variant-numeric: tabular-nums;
-	white-space: nowrap;
 }
 @media (max-width: 480px) {
 	.mut-figs {
@@ -5991,25 +6279,6 @@ dialog.drawer[open]::backdrop {
 .lineage-rail li {
 	position: relative;
 	padding-left: 22px;
-}
-/* The thread runs from the first node's centre to the last node's centre. */
-.lineage-rail li::before {
-	content: "";
-	position: absolute;
-	left: 6px;
-	top: 0;
-	bottom: 0;
-	width: 1px;
-	background: var(--line);
-}
-.lineage-rail li:first-child::before {
-	top: 50%;
-}
-.lineage-rail li:last-child::before {
-	bottom: 50%;
-}
-.lineage-rail li:only-child::before {
-	display: none;
 }
 .lineage-rail li::after {
 	content: "";
@@ -6111,16 +6380,6 @@ button.lineage-row:hover,
 a.lineage-row:hover {
 	background: var(--card);
 }
-button.lineage-row:hover .lineage-title,
-a.lineage-row:hover .lineage-title {
-	color: var(--accent-hover);
-}
-.lineage-key {
-	font-family: var(--mono);
-	font-size: 11.5px;
-	color: var(--dim);
-	font-variant-numeric: tabular-nums;
-}
 .lineage-title {
 	min-width: 0;
 	overflow: hidden;
@@ -6128,13 +6387,48 @@ a.lineage-row:hover .lineage-title {
 	text-overflow: ellipsis;
 	color: var(--accent);
 }
+.lineage-gone .lineage-title {
+	color: var(--dim);
+}
+.lineage-key {
+	font-family: var(--mono);
+	font-size: 11.5px;
+	color: var(--dim);
+	font-variant-numeric: tabular-nums;
+}
+.lineage-self > .lineage-row .lineage-key,
+.lineage-self > .lineage-row .lineage-title {
+	color: var(--text-strong);
+}
+.lineage-self > .lineage-row .lineage-title {
+	font-weight: 600;
+}
+button.lineage-row:hover .lineage-title,
+a.lineage-row:hover .lineage-title {
+	color: var(--accent-hover);
+}
+.st {
+	color: var(--dim);
+}
 .lineage-tag,
 .lineage-row .st {
 	font-size: 12px;
 	color: var(--dim);
 }
+.st-needs_you {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	color: var(--alarm);
+	font-weight: 600;
+}
 .lineage-row .st-needs_you {
 	color: var(--alarm);
+}
+/* Redundant alarm coding: the triangle or question mark rides in markup (<Mark>), like on the
+   cards — never on ::before, which carries the drawer-sub separator dot. */
+.st-needs_you.st-asked {
+	color: var(--accent);
 }
 .lineage-row .st-needs_you.st-asked {
 	color: var(--accent);
@@ -6145,37 +6439,8 @@ a.lineage-row:hover .lineage-title {
 	align-items: baseline;
 	gap: 6px;
 }
-.lineage-self > .lineage-row .lineage-key,
-.lineage-self > .lineage-row .lineage-title {
-	color: var(--text-strong);
-}
-.lineage-self > .lineage-row .lineage-title {
-	font-weight: 600;
-}
-.lineage-gone .lineage-title {
-	color: var(--dim);
-}
-.st {
-	color: var(--dim);
-}
 .st-running {
 	color: var(--text-strong);
-}
-.st-needs_you {
-	display: inline-flex;
-	align-items: center;
-	gap: 5px;
-	color: var(--alarm);
-	font-weight: 600;
-}
-/* Redundant alarm coding: the triangle or question mark rides in markup (<Mark>), like on the
-   cards — never on ::before, which carries the drawer-sub separator dot. */
-.st-needs_you.st-asked {
-	color: var(--accent);
-}
-.st .mark {
-	width: 11px;
-	height: 11px;
 }
 /* Related-task rows (dependencies, follow-ups): one quiet list, a full-row click target per task;
    the status word reuses the meta line's coding (dim, amber only for needs-you, steel for an asked
@@ -6189,28 +6454,6 @@ a.lineage-row:hover .lineage-title {
 	/* The track shrinks to the drawer, so a long title ellipsizes instead of pushing the status
 	   off a phone screen (the auto track grew to the title's full width). */
 	grid-template-columns: minmax(0, 1fr);
-}
-.fu-list a {
-	display: flex;
-	align-items: baseline;
-	justify-content: space-between;
-	gap: 12px;
-	width: 100%;
-	min-height: 32px;
-	padding: 5px 10px;
-	border: 1px solid transparent;
-	border-radius: 4px;
-	background: none;
-	font: inherit;
-	font-size: 13px;
-	color: var(--text);
-	text-align: left;
-	text-decoration: none;
-	cursor: pointer;
-}
-.fu-list a:hover {
-	background: var(--card);
-	color: var(--text-strong);
 }
 .fu-title {
 	min-width: 0;
@@ -6235,73 +6478,11 @@ a.lineage-row:hover .lineage-title {
 	flex: none;
 	font-size: 12px;
 }
-/* Collapsible Follow-ups head: the h3 keeps the drawer label's caps look (margins, size and
-   color come from `.drawer h3`), the button inside is the click target. The chevron reuses the
-   done-lane topic head's arrow: points down when open, right when collapsed. */
-.fu-head button {
-	display: flex;
-	align-items: center;
-	justify-content: flex-start; /* the global button rule centers; section labels sit left */
-	gap: 6px;
-	width: 100%;
-	padding: 0;
-	border: 0;
-	background: none;
-	font: inherit;
-	color: inherit;
-	text-align: left;
-	cursor: pointer;
-}
 .fu-head button:hover {
 	color: var(--text-strong);
 }
-.fu-head .chev {
-	width: 12px;
-	height: 12px;
-	fill: none;
-	stroke: var(--dim);
-	stroke-width: 1.5;
-	flex-shrink: 0;
-	transition: transform 160ms var(--ease);
-}
 .fu-head[data-collapsed] .chev {
 	transform: rotate(-90deg);
-}
-/* Section labels: small HMI caps; the content below speaks for itself. */
-.drawer h3 {
-	margin: 22px 0 8px;
-	font-size: 12px;
-	font-weight: 600;
-	letter-spacing: 0.06em;
-	text-transform: uppercase;
-	color: var(--dim);
-}
-/* Every drawer section is a .dsec wrapper. Sections are read-only, so space alone
-   separates them: no rules. Collapsible heads (fu-head) toggle the body below. */
-.drawer-body > .dsec {
-	margin-top: 22px;
-}
-/* Inside a section the section's top margin owns the spacing; the head keeps only its
-   label-to-content gap. */
-.dsec > h3,
-.dsec > .section-head {
-	margin: 0 0 8px;
-}
-/* A section head with a trailing action: caps label left, one quiet ghost button right. */
-.section-head {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 8px;
-	margin: 22px 0 8px;
-}
-.section-head h3 {
-	margin: 0;
-}
-.section-head button {
-	flex: none;
-	padding: 2px 7px;
-	font-size: 12px;
 }
 /* The ask round is one quiet region: hairline box, no tint. Steel is spent only on the
    per-question marks, the picked answer, and the send button. */
@@ -6327,11 +6508,6 @@ a.lineage-row:hover .lineage-title {
 	margin: 0 0 6px;
 	font-weight: 600;
 	color: var(--text-strong);
-}
-.ask-text .mark {
-	width: 12px;
-	height: 12px;
-	margin-top: 3px;
 }
 /* Answered work recedes: lighter weight and text, the check mark carries the state. */
 .ask-q.answered .ask-text {
@@ -6423,25 +6599,17 @@ a.lineage-row:hover .lineage-title {
 	flex: none;
 	accent-color: var(--accent);
 }
-/* The visible caption in front of the free-text answer, matching the triage caption. */
-.ask-custom > label {
-	display: inline-flex;
-	align-items: center;
-	gap: 6px;
-	flex: 1;
-	min-width: 0;
+.kept-choice input {
+	margin: 0;
+	accent-color: var(--accent);
 }
-.ask-custom > label > span {
-	font-size: 13px;
-	color: var(--dim);
-	white-space: nowrap;
+.pw-wrap input {
+	flex: 1;
+	padding-right: 36px;
 }
 .ask-custom > label > input {
 	flex: 1;
 	min-width: 0;
-}
-.ask-custom > button {
-	align-self: stretch; /* same height as the field beside it */
 }
 .kept-panel {
 	margin: 8px 0;
@@ -6449,9 +6617,6 @@ a.lineage-row:hover .lineage-title {
 	background: var(--alarm-bg);
 	border: 1px solid var(--alarm-line);
 	border-radius: 4px;
-}
-.kept-panel h3 {
-	margin: 0 0 4px;
 }
 .kept-hint {
 	margin: 0 0 8px;
@@ -6464,10 +6629,6 @@ a.lineage-row:hover .lineage-title {
 	background: var(--card);
 	border: 1px solid var(--line);
 	border-radius: 4px;
-}
-.wt-files .hint {
-	color: var(--dim);
-	font-size: 12px;
 }
 .wt-file {
 	display: block;
@@ -6556,10 +6717,6 @@ button.diff-path {
 	border-color: var(--accent);
 	background: var(--card);
 }
-.kept-choice input {
-	margin: 0;
-	accent-color: var(--accent);
-}
 .kept-actions {
 	margin-top: 10px;
 }
@@ -6587,20 +6744,6 @@ button.diff-path {
 	background: var(--alarm);
 	clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
-/* The source card id inside a proposal reason: a real link, underlined so it reads
-   as one; the accent carries the hover and focus states. */
-.needs-reason a,
-.decide-reason a {
-	color: var(--accent);
-	text-decoration: underline;
-	text-underline-offset: 2px;
-}
-.needs-reason a:hover,
-.needs-reason a:focus-visible,
-.decide-reason a:hover,
-.decide-reason a:focus-visible {
-	color: var(--accent-hover);
-}
 /* The proposal card's decision panel: .decide-reason shares the amber box above; the five
    summary rows sit in a compact two-column grid (labels dim, values bright, per the
    values-read-first rule), stacking to one column under 720px so the panel fits without
@@ -6617,16 +6760,14 @@ button.diff-path {
 .decide-facts dt {
 	color: var(--dim);
 }
-.decide-facts dd {
-	margin: 0;
-	min-width: 0;
-	color: var(--text-strong);
-	overflow-wrap: anywhere;
-}
 .decide-fallback {
 	margin: 10px 0 0;
 	color: var(--text-strong);
 	overflow-wrap: anywhere;
+}
+.meta div {
+	display: flex;
+	gap: 8px;
 }
 .decide-fallback > div + div {
 	margin-top: 3px;
@@ -6645,6 +6786,11 @@ button.diff-path {
 }
 .decide-prompt summary:hover {
 	color: var(--text-strong);
+}
+.prompt-text {
+	margin: 0 0 10px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 .decide-prompt .prompt-text {
 	margin: 6px 0 0;
@@ -6669,12 +6815,6 @@ button.diff-path {
 .needs-reason.asked::before {
 	content: none;
 }
-.needs-reason.asked .mark {
-	flex: none;
-	width: 13px;
-	height: 13px;
-	margin-top: 1px;
-}
 /* Fixed action bar for a parked merge hold (update, fork, mismatch): the hold message's
    actions pin to the drawer's bottom edge while the report scrolls; fully scrolled, the
    bar rests above the reply form. The band-bleed margins match .drawer-top's pattern, and
@@ -6695,11 +6835,6 @@ button.diff-path {
 .summary {
 	margin: 0 0 8px;
 	white-space: pre-wrap;
-}
-.prompt-text {
-	margin: 0 0 10px;
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
 }
 .task-prompt {
 	margin: 0;
@@ -6774,17 +6909,6 @@ button.log-mode[aria-pressed="true"] {
 	max-width: 75ch;
 	overflow-wrap: anywhere;
 }
-.md h1,
-.md h2,
-.md h3,
-.md h4,
-.md h5,
-.md h6 {
-	margin: 0;
-	font-size: 13.5px;
-	font-weight: 600;
-	color: var(--text-strong);
-}
 .md h1 {
 	font-size: 14px;
 }
@@ -6797,6 +6921,16 @@ button.log-mode[aria-pressed="true"] {
 	padding-left: 22px;
 	display: grid;
 	gap: 4px;
+}
+/* Work check history: one compact entry per second-model run; quotes read as evidence. */
+.work-checks ul {
+	margin: 4px 0;
+	padding-left: 18px;
+}
+.trust-warn ul {
+	margin: 0.25rem 0;
+	font-family: var(--mono);
+	font-size: 12px;
 }
 .md li > ul,
 .md li > ol {
@@ -6817,6 +6951,34 @@ button.log-mode[aria-pressed="true"] {
 	border-radius: 3px;
 	overflow-x: auto;
 }
+/* The PR review hint names marker lines: each marker stays whole on one line. */
+.pr-inline-hint code {
+	white-space: nowrap;
+}
+.cmd-row code {
+	flex: 1;
+	padding: 6px 8px;
+	font-size: 12px;
+	background: var(--well);
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	overflow-wrap: anywhere;
+}
+.access-key > code {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.updates-ver code {
+	font-size: 12px;
+	color: var(--text);
+	overflow-wrap: anywhere;
+}
+.updates-diffs code {
+	overflow-wrap: anywhere;
+}
 .md pre code {
 	background: none;
 	padding: 0;
@@ -6826,9 +6988,6 @@ button.log-mode[aria-pressed="true"] {
 	padding: 2px 0 2px 12px;
 	border-left: 2px solid var(--line-soft);
 	color: var(--dim);
-}
-.md a {
-	color: var(--accent);
 }
 .md hr {
 	border: none;
@@ -6841,24 +7000,8 @@ button.log-mode[aria-pressed="true"] {
 	overflow-x: auto;
 	border-collapse: collapse;
 }
-.md th,
-.md td {
-	border: 1px solid var(--line-soft);
-	padding: 3px 8px;
-	text-align: left;
-	vertical-align: top;
-}
-.md th {
-	background: var(--well);
-	color: var(--text-strong);
-}
 .md del {
 	color: var(--dim);
-}
-/* Work check history: one compact entry per second-model run; quotes read as evidence. */
-.work-checks ul {
-	margin: 4px 0;
-	padding-left: 18px;
 }
 .work-checks blockquote {
 	margin: 2px 0;
@@ -6983,15 +7126,6 @@ button.log-mode[aria-pressed="true"] {
 .turn-head:active {
 	background: none; /* the turn-body hover is the one glow; the stretched button adds none, like .card-open */
 }
-.turn-head .icon-svg {
-	color: var(--dim);
-	transition: transform 120ms var(--ease);
-}
-.turn-head[aria-expanded="true"] .icon-svg {
-	transform: rotate(
-		90deg
-	); /* the right-chevron turns down when the log is open */
-}
 .turn-head strong {
 	font-weight: 600;
 	color: var(--text-strong);
@@ -7050,6 +7184,12 @@ button.log-mode[aria-pressed="true"] {
 	margin-top: 4px;
 	font-size: 12px;
 }
+.you {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 4px;
+}
 /* User input (reply, steering, resume) speaks from the right: right-aligned bubble,
    worker turns keep the left rail. Grey surfaces only — user input is not an alarm,
    and steel is reserved for interaction (One-Edge Rule). */
@@ -7081,9 +7221,6 @@ button.log-mode[aria-pressed="true"] {
 	padding: 12px 22px 18px;
 	background: var(--panel);
 }
-.drawer-body > .reply-form .hint {
-	display: none;
-}
 /* Prompt card (Claude style), shared by the steer composer and the compose dialogs (New task,
    Add draft, Follow up): the field and one tool row share a recessed box, with + at the left and
    the model picker next to the icon-only submit at the right, all 8px from the box walls; the
@@ -7112,6 +7249,10 @@ button.log-mode[aria-pressed="true"] {
 }
 .prompt-card:has(textarea:focus-visible)::before {
 	border-color: var(--accent);
+}
+.composer-actions .field {
+	min-width: 0;
+	gap: 4px;
 }
 .prompt-card .prompt-field,
 .prompt-card .model-fields,
@@ -7233,10 +7374,49 @@ button.log-mode[aria-pressed="true"] {
 		"plus . model send"
 		"stop quota quota quota";
 }
+/* Reply and Steer rows (ComposerActions): the run settings over one button bar. The model
+   field takes the wide column, Thinking the narrow one; every control shares the 32px button
+   height, and a long model name ellipsizes instead of wrapping the trigger to two lines. */
+.composer-actions {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+.composer-actions .model-fields {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	gap: 10px;
+}
+/* Add image hugs the left edge; the secondaries and the primary stay on the right, also when
+   the narrow drawer wraps them to a second line. */
+.composer-bar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+}
 .drawer-body > .steer-form .composer-actions,
 .drawer-body > .steer-form .composer-bar,
 .drawer-body > .steer-form .model-fields {
 	display: contents;
+}
+/* The caption style of .reply-form labels must not reach the controls inside them. */
+.composer-actions .model-trigger,
+.composer-actions select {
+	width: 100%;
+	height: 32px;
+	font-size: 13.5px;
+	font-weight: 400;
+	letter-spacing: normal;
+	text-transform: none;
+	color: var(--text-strong);
+}
+.composer-actions .model-trigger {
+	padding: 0 9px 2px;
+}
+.fallback-row > .model-trigger {
+	grid-column: 3;
 }
 .drawer-body > .steer-form .model-trigger {
 	width: auto;
@@ -7265,25 +7445,6 @@ button.log-mode[aria-pressed="true"] {
 	gap: 10px;
 	margin-top: 20px;
 }
-.followup-cta > button {
-	flex: none; /* the label must not wrap at narrow drawer widths */
-}
-.followup-cta .hint {
-	margin: 0;
-}
-.reply-form label,
-.prompt-field > label,
-.meta-block > summary {
-	font-size: 12px;
-	font-weight: 600;
-	letter-spacing: 0.06em;
-	text-transform: uppercase;
-	color: var(--dim);
-}
-/* The PR review hint names marker lines: each marker stays whole on one line. */
-.pr-inline-hint code {
-	white-space: nowrap;
-}
 .reply-actions {
 	display: flex;
 	flex-wrap: wrap;
@@ -7295,57 +7456,11 @@ button.log-mode[aria-pressed="true"] {
 .reply-actions .primary {
 	margin-left: auto;
 }
-/* Reply and Steer rows (ComposerActions): the run settings over one button bar. The model
-   field takes the wide column, Thinking the narrow one; every control shares the 32px button
-   height, and a long model name ellipsizes instead of wrapping the trigger to two lines. */
-.composer-actions {
-	display: flex;
-	flex-direction: column;
-	gap: 10px;
-}
-.composer-actions .model-fields {
-	display: grid;
-	grid-template-columns: minmax(0, 1fr);
-	gap: 10px;
-}
-.composer-actions .field {
-	min-width: 0;
-	gap: 4px;
-}
-/* The caption style of .reply-form labels must not reach the controls inside them. */
-.composer-actions .model-trigger,
-.composer-actions select {
-	width: 100%;
-	height: 32px;
-	font-size: 13.5px;
-	font-weight: 400;
-	letter-spacing: normal;
-	text-transform: none;
-	color: var(--text-strong);
-}
-.composer-actions .model-trigger {
-	padding: 0 9px 2px;
-}
 .composer-actions select {
 	padding: 0 9px;
 }
-/* Add image hugs the left edge; the secondaries and the primary stay on the right, also when
-   the narrow drawer wraps them to a second line. */
-.composer-bar {
-	display: flex;
-	flex-wrap: wrap;
-	align-items: center;
-	justify-content: flex-end;
-	gap: 8px;
-}
 .composer-bar > .browse {
 	margin-right: auto;
-}
-.you {
-	display: flex;
-	flex-direction: column;
-	align-items: flex-end;
-	gap: 4px;
 }
 .you-head {
 	display: inline-flex;
@@ -7425,25 +7540,9 @@ button.log-mode[aria-pressed="true"] {
 	gap: 4px;
 	margin: 8px 0 0;
 }
-.meta div {
-	display: flex;
-	gap: 8px;
-}
 .meta dt {
 	min-width: 76px;
 	color: var(--dim);
-}
-.meta dd {
-	margin: 0;
-	font-family: var(--mono);
-	font-size: 12px;
-	overflow-wrap: anywhere;
-}
-.meta dd a {
-	text-decoration: none;
-}
-.meta dd a:hover {
-	text-decoration: underline;
 }
 /* Unmark-research control: a small action on the metadata line, quiet until hover. */
 .meta dd .unmark-research {
@@ -7464,15 +7563,6 @@ button.log-mode[aria-pressed="true"] {
 	align-items: center;
 	gap: 8px;
 	margin-top: 8px;
-}
-.cmd-row code {
-	flex: 1;
-	padding: 6px 8px;
-	font-size: 12px;
-	background: var(--well);
-	border: 1px solid var(--line-soft);
-	border-radius: 4px;
-	overflow-wrap: anywhere;
 }
 
 /* ---- Narrow windows and phones ---- */
@@ -7663,13 +7753,6 @@ button.log-mode[aria-pressed="true"] {
 	border-radius: 4px;
 	font-size: 12px;
 }
-.access-key > code {
-	flex: 1;
-	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-}
 /* The reveal toggle sits inside the field, so it drops its own chrome. */
 .access-key button.icon {
 	border: none;
@@ -7758,9 +7841,6 @@ button.log-mode[aria-pressed="true"] {
 	font-size: 20px;
 	font-weight: 600;
 }
-.auth-brand img {
-	height: 34px;
-}
 /* .add-form's dialog chrome and column labels are wrong inside the auth box. */
 .auth-box .add-form {
 	padding: 0;
@@ -7792,10 +7872,6 @@ button.log-mode[aria-pressed="true"] {
 	position: relative;
 	display: flex;
 }
-.pw-wrap input {
-	flex: 1;
-	padding-right: 36px;
-}
 .pw-toggle {
 	position: absolute;
 	top: 50%;
@@ -7823,27 +7899,6 @@ button.log-mode[aria-pressed="true"] {
 .trust-warn {
 	border-left: 2px solid var(--dim);
 	padding-left: 0.75rem;
-}
-.trust-warn ul {
-	margin: 0.25rem 0;
-	font-family: var(--mono);
-	font-size: 12px;
-}
-/* Pending SSH key: one control per line, so the paste box never floats beside its buttons. */
-.pending-key {
-	display: grid;
-	gap: 0.5rem;
-	justify-items: start;
-	align-self: stretch;
-}
-/* Same caption and width cap as .settings-field. */
-.pending-key label {
-	display: grid;
-	gap: 4px;
-	width: 100%;
-	max-width: 460px;
-	font-size: 12.5px;
-	color: var(--dim);
 }
 
 /* ---- Touch targets ---- */
@@ -7938,11 +7993,41 @@ button.log-mode[aria-pressed="true"] {
 	gap: 10px;
 	align-items: start;
 }
+.updates-all input[type="checkbox"] {
+	width: 15px;
+	height: 15px;
+	margin: 0;
+}
+.updates-pick input[type="checkbox"],
+.updates-box {
+	width: 15px;
+	height: 15px;
+	margin: 0;
+	accent-color: var(--accent);
+	cursor: pointer;
+}
+/* A checkbox value starts on the column edge, not at the native 4px inset. */
+.settings-sec .alate-def-row input[type="checkbox"] {
+	margin: 0;
+	vertical-align: middle;
+}
 .settings-sec .alate-def-row.check-row > input[type="checkbox"] {
 	margin: 4px 0 0;
 }
-.check-row label {
-	cursor: pointer;
+.settings-sec .alate-field-stack > label {
+	display: flex;
+	width: 100%;
+}
+.settings-sec .alate-def-row > .alate-def-actions > input,
+.settings-sec .alate-def-row > .alate-def-actions > label {
+	flex: 1;
+	min-width: 0;
+}
+.settings-sec .alate-def-row > .alate-def-actions > label {
+	display: flex;
+}
+.settings-sec.providers .providers-form label {
+	display: flex;
 }
 .check-row > input:disabled + .alate-def-name label {
 	cursor: default;
@@ -7973,10 +8058,6 @@ button.log-mode[aria-pressed="true"] {
 	gap: 4px;
 	min-width: 0;
 }
-.settings-sec .alate-field-stack > label {
-	display: flex;
-	width: 100%;
-}
 .settings-sec .alate-field-stack > label > input:not([type="checkbox"]),
 .settings-sec .alate-field-stack > label > textarea {
 	flex: 1;
@@ -8003,26 +8084,12 @@ button.log-mode[aria-pressed="true"] {
 	font-size: 11px;
 	color: var(--dim);
 }
-.settings-sec .alate-def-actions {
-	display: flex;
-	justify-content: flex-end;
-	gap: 10px;
-	margin-top: 12px;
-}
 /* Inside a row (Env value + Save, a single field + its Save, a provider's Sign out) the
    actions sit on the row's center line; the field takes the free width, the button keeps its own.
    The group stretches its items, and the label passes that height to its input, so a field and
    the button beside it are always one height (the touch floor makes both 44px on phones). */
 .settings-sec .alate-def-row > .alate-def-actions {
 	margin-top: 0;
-}
-.settings-sec .alate-def-row > .alate-def-actions > input,
-.settings-sec .alate-def-row > .alate-def-actions > label {
-	flex: 1;
-	min-width: 0;
-}
-.settings-sec .alate-def-row > .alate-def-actions > label {
-	display: flex;
 }
 .settings-sec
 	.alate-def-row
@@ -8048,12 +8115,21 @@ button.log-mode[aria-pressed="true"] {
 	> label:has(> input[type="number"]) {
 	flex: 0 0 auto;
 }
+/* A DefRow without a Save on its row renders the value bare in the grid, where the
+   width: 100% rule above stretches it: number answers hug the answer here too,
+   with the same width-follows-max scheme as the actions rows. */
+.settings-sec .alate-def-row > label > input[type="number"] {
+	width: 8ch;
+}
 .settings-sec
 	.alate-def-row
 	> .alate-def-actions
 	> label
 	> input[type="number"] {
 	width: 8ch;
+}
+.settings-sec .alate-def-row > label > input[type="number"][max="365"] {
+	width: 9ch;
 }
 .settings-sec
 	.alate-def-row
@@ -8068,15 +8144,6 @@ button.log-mode[aria-pressed="true"] {
 	> label
 	> input[type="number"][max="10000"] {
 	width: 12ch;
-}
-/* A DefRow without a Save on its row renders the value bare in the grid, where the
-   width: 100% rule above stretches it: number answers hug the answer here too,
-   with the same width-follows-max scheme as the actions rows. */
-.settings-sec .alate-def-row > label > input[type="number"] {
-	width: 8ch;
-}
-.settings-sec .alate-def-row > label > input[type="number"][max="365"] {
-	width: 9ch;
 }
 /* Usage windows inside a sign-in row: span both columns of the row grid. */
 .settings-sec .alate-def-row .quota {
@@ -8140,10 +8207,6 @@ button.log-mode[aria-pressed="true"] {
 	overflow: hidden;
 	text-overflow: ellipsis;
 }
-.providers-meters .meter-value {
-	grid-area: meta;
-	justify-self: end;
-}
 .providers-meters .qt-bars {
 	grid-area: track;
 	min-width: 0;
@@ -8161,6 +8224,9 @@ button.log-mode[aria-pressed="true"] {
 	width: 100%;
 	margin-top: 12px;
 }
+.settings-sec .notify-group > legend + .alate-def-row {
+	border-top: 1px solid var(--line-soft);
+}
 .settings-sec.providers .providers-form .alate-def-row {
 	display: grid;
 	grid-template-columns: 260px minmax(0, 1fr) auto;
@@ -8170,9 +8236,6 @@ button.log-mode[aria-pressed="true"] {
 	padding: 0;
 	border-top: none;
 	border-bottom: none;
-}
-.settings-sec.providers .providers-form label {
-	display: flex;
 }
 .settings-sec.providers .providers-form label input {
 	width: 100%;
@@ -8228,11 +8291,6 @@ button.log-mode[aria-pressed="true"] {
 		grid-column: 2;
 	}
 }
-/* A checkbox value starts on the column edge, not at the native 4px inset. */
-.settings-sec .alate-def-row input[type="checkbox"] {
-	margin: 0;
-	vertical-align: middle;
-}
 /* On touch, the label around a checkbox is the 44px hit target; the negative
    margin spends its extra height on the row's gap and padding, not on blank space. */
 @media (pointer: coarse) {
@@ -8266,11 +8324,6 @@ button.log-mode[aria-pressed="true"] {
 	display: grid;
 	gap: 4px;
 }
-.role-notes .hint {
-	display: flex;
-	align-items: center;
-	gap: 6px;
-}
 .role-add {
 	display: flex;
 	flex-wrap: wrap;
@@ -8283,10 +8336,6 @@ button.log-mode[aria-pressed="true"] {
 	padding: 0;
 	list-style: none;
 	overflow-wrap: anywhere;
-}
-.role-steps .mark {
-	vertical-align: -2px;
-	margin-right: 6px;
 }
 /* A role's fallbacks: under the row, indented behind a soft rule and headed by a small dim
    label, so the chain reads as part of its role. The entries share one set of columns
@@ -8345,9 +8394,6 @@ button.log-mode[aria-pressed="true"] {
 }
 .fallback-up {
 	grid-column: 2;
-}
-.fallback-row > .model-trigger {
-	grid-column: 3;
 }
 .fallback-row > select {
 	grid-column: 4;
@@ -8422,11 +8468,6 @@ dialog.updates {
 	color: var(--dim);
 	cursor: pointer;
 }
-.updates-all input[type="checkbox"] {
-	width: 15px;
-	height: 15px;
-	margin: 0;
-}
 .updates-count {
 	margin-right: auto;
 	font-size: 12px;
@@ -8444,21 +8485,8 @@ dialog.updates {
 .updates-group + .updates-group {
 	margin-top: 8px;
 }
-/* Repo heads pin while their rows scroll past. */
-.updates-group h3 {
-	position: sticky;
-	top: 0;
-	z-index: 1;
-	display: flex;
-	align-items: baseline;
-	gap: 8px;
-	margin: 0 -8px;
-	padding: 8px 8px 5px;
-	font-size: 13px;
-	font-weight: 600;
-	color: var(--text-strong);
-	background: var(--field);
-	border-bottom: 1px solid var(--line-soft);
+.updates-row > .dialog-sub {
+	margin-left: 0;
 }
 .updates-group h3 .dialog-sub {
 	margin-left: 0;
@@ -8481,9 +8509,6 @@ dialog.updates {
 }
 .updates-row + .updates-row {
 	margin-top: 1px;
-}
-.updates-row > .dialog-sub {
-	margin-left: 0;
 }
 .updates-name {
 	display: flex;
@@ -8508,11 +8533,6 @@ dialog.updates {
 	align-items: baseline;
 	gap: 2px 6px;
 }
-.updates-ver code {
-	font-size: 12px;
-	color: var(--text);
-	overflow-wrap: anywhere;
-}
 .updates-qualifies {
 	font-size: 12px;
 }
@@ -8527,9 +8547,6 @@ dialog.updates {
 	font-size: 12px;
 	white-space: nowrap;
 }
-.updates-links a {
-	color: var(--accent);
-}
 /* Changed files of the pinned path: a full-width list under the row, one diff link each. */
 .updates-diffs {
 	grid-column: 2 / -1;
@@ -8537,12 +8554,6 @@ dialog.updates {
 	flex-direction: column;
 	margin-top: 2px;
 	font-size: 12px;
-}
-.updates-diffs a {
-	color: var(--accent);
-}
-.updates-diffs code {
-	overflow-wrap: anywhere;
 }
 /* Phone tier: rows stack to two lines; the pick cell spans both, links drop under the action. */
 @media (max-width: 640px) {
@@ -8566,14 +8577,14 @@ dialog.updates {
 	.updates-versions {
 		grid-area: versions;
 	}
+	.updates-removed {
+		flex-wrap: wrap;
+		row-gap: 2px;
+	}
 	.updates-inprogress,
 	.updates-row > .dialog-sub,
 	.updates-row > .updates-removed {
 		grid-area: action;
-	}
-	.updates-removed {
-		flex-wrap: wrap;
-		row-gap: 2px;
 	}
 	.updates-links {
 		grid-area: links;
@@ -8582,14 +8593,6 @@ dialog.updates {
 /* U6: checkbox cell; the spacer keeps covered rows aligned with actionable ones. */
 .updates-pick {
 	min-width: 15px;
-}
-.updates-pick input[type="checkbox"],
-.updates-box {
-	width: 15px;
-	height: 15px;
-	margin: 0;
-	accent-color: var(--accent);
-	cursor: pointer;
 }
 /* U6: link-styled pointer to the open card covering the row. */
 .updates-inprogress {
@@ -8622,9 +8625,6 @@ dialog.updates {
 .notify-group > legend {
 	padding: 8px 0 0;
 	font-weight: 600;
-}
-.settings-sec .notify-group > legend + .alate-def-row {
-	border-top: 1px solid var(--line-soft);
 }
 .notify-hint {
 	color: var(--dim);
