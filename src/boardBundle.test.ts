@@ -46,6 +46,29 @@ describe("board bundle", () => {
 		expect(html).toMatch(/(?:src|href)="\/(chunk|manifest|icon)-/);
 	});
 
+	test("code-imported asset refs in the js/css outputs are root-absolute too", () => {
+		// The bundler emits a code import ("import logo from './icon-192.png'") as a
+		// relative string ("./icon-192-<hash>.png") inside the js chunk; the browser
+		// would resolve it against the page URL, which breaks every nested route
+		// (OTTR-756). No emitted asset name may appear in a relative ref form.
+		const names = [...bundle.assets.keys()].map((p) => p.slice(1));
+		for (const [path, asset] of bundle.assets) {
+			if (!/\.(js|css)$/.test(path)) continue;
+			const text = new TextDecoder().decode(asset.identity);
+			for (const name of names) {
+				expect(text.includes(`"./${name}"`), `${path} holds "./${name}"`).toBe(
+					false,
+				);
+				expect(text.includes(`'./${name}'`), `${path} holds './${name}'`).toBe(
+					false,
+				);
+				expect(text.includes(`(./${name})`), `${path} holds (./${name})`).toBe(
+					false,
+				);
+			}
+		}
+	});
+
 	test("assets hold the hashed js, css and binaries; the html serves by route only", () => {
 		expect([...bundle.assets.keys()].some((p) => /chunk-.*\.js$/.test(p))).toBe(
 			true,

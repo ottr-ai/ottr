@@ -50,20 +50,50 @@ interface BuiltAsset {
 	asset: BundleAsset;
 }
 
-/** Convert one built output into a servable asset. */
-async function builtAsset(out: BuildOutput): Promise<BuiltAsset> {
-	// Bun.build emits relative names ("./chunk-x.js"); serve at the root so the
-	// nested client routes resolve them (rewriteBundleHtml does the HTML side).
-	const name = out.path.replace(/^\.\//, "");
+/** The URL name of one output: Bun.build emits relative paths ("./chunk-x.js"); a
+ * nested path cannot serve from the root asset map. */
+function outputName(outPath: string): string {
+	const name = outPath.replace(/^\.\//, "");
 	if (name.includes("/") || name.includes("\\"))
-		throw new Error(`ui bundle emitted a nested path: ${out.path}`);
+		throw new Error(`ui bundle emitted a nested path: ${outPath}`);
+	return name;
+}
+
+/** Relative refs the bundler emits inside js/css for code imports
+ * ("./icon-192-<hash>.png"): the browser would resolve them against the page
+ * URL, and the board serves nested client routes, so every emitted asset name
+ * must appear root-absolute (rewriteBundleHtml does the html side; OTTR-756). */
+function absolutizeAssetRefs(text: string, names: string[]): string {
+	let out = text;
+	for (const name of names) {
+		out = out
+			.split(`"./${name}"`)
+			.join(`"/${name}"`)
+			.split(`'./${name}'`)
+			.join(`'/${name}'`)
+			.split(`(./${name})`)
+			.join(`(/${name})`);
+	}
+	return out;
+}
+
+/** Convert one built output into a servable asset. */
+async function builtAsset(
+	out: BuildOutput,
+	names: string[],
+): Promise<BuiltAsset> {
+	const name = outputName(out.path);
 	const bytes = new Uint8Array(await out.arrayBuffer());
 	// The board serves the HTML at /projects/p/tasks/i and friends, so the built
 	// refs must be absolute before any variant of it is compressed.
 	const identity =
 		name === "index.html"
 			? textEncoder.encode(rewriteBundleHtml(textDecoder.decode(bytes)))
-			: bytes;
+			: /\.(js|css)$/.test(name)
+				? textEncoder.encode(
+						absolutizeAssetRefs(textDecoder.decode(bytes), names),
+					)
+				: bytes;
 	const compressible = /\.(html|js|css)$/.test(name);
 	// Variant suffixes stay inside the quotes: an ETag must be one opaque tag.
 	const hex = Bun.hash(identity).toString(16).padStart(16, "0");
@@ -91,10 +121,11 @@ async function buildBoard(): Promise<BoardBundle> {
 	});
 	if (!built.success)
 		throw new Error(`ui bundle failed: ${built.logs.map(String).join("; ")}`);
+	const names = built.outputs.map((out) => outputName(out.path));
 	const assets = new Map<string, BundleAsset>();
 	let html: BundleAsset | null = null;
 	for (const out of built.outputs) {
-		const { name, asset } = await builtAsset(out);
+		const { name, asset } = await builtAsset(out, names);
 		if (name === "index.html") {
 			html = asset;
 			continue; // The html serves by route; the fallback map holds hashed outputs only.

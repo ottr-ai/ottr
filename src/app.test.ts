@@ -14443,6 +14443,46 @@ describe("fixed-path view routes (OTTR-405)", () => {
 	});
 });
 
+describe("asset-like client paths (OTTR-756)", () => {
+	test("the served chunk references the imported logo root-absolute and the URL serves the image", async () => {
+		const html = await (await get("/")).text();
+		const chunk = html.match(/src="(\/chunk-[^"]+\.js)"/)?.[1];
+		expect(chunk, "the html loads one hashed chunk").toBeTruthy();
+		const js = await (await get(chunk!)).text();
+		const png = js.match(/"(\/[A-Za-z0-9._-]+\.png)"/)?.[1];
+		expect(
+			png,
+			"the chunk references the hashed logo root-absolute",
+		).toBeTruthy();
+		expect(js.includes(`".${png}"`)).toBe(false);
+		const img = await get(png!);
+		expect(img.status).toBe(200);
+		expect(img.headers.get("content-type")).toContain("image/png");
+	});
+
+	test("an asset path that lands on a client route 404s instead of the app html", async () => {
+		for (const path of [
+			// The first three match a view route on the extension segment itself.
+			"/projects/missing.png",
+			"/settings/logo.png",
+			"/projects/p1/tasks/broken.svg",
+			// No route matches this shape; the fetch fallback answers 404 either way.
+			"/projects/x/missing.png",
+		]) {
+			const res = await get(path);
+			expect(res.status, path).toBe(404);
+			expect(res.headers.get("content-type"), path).not.toContain("text/html");
+		}
+		// The client routes still serve the app.
+		const board = await get("/projects/p1");
+		expect(board.status).toBe(200);
+		expect(board.headers.get("content-type")).toContain("text/html");
+		const deep = await get("/projects/p1/tasks/OTTR-1");
+		expect(deep.status).toBe(200);
+		expect(deep.headers.get("content-type")).toContain("text/html");
+	});
+});
+
 describe("project order route", () => {
 	// Own names: earlier describes add and delete "p2"/"p3" on the shared map, so
 	// these tests register their own entries and clean them up after themselves.

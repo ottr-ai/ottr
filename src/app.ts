@@ -3578,8 +3578,17 @@ export function createApp(deps: AppDeps) {
 	// api() plants it here per request; concurrent requests cannot cross encodings.
 	const requestEnc = new AsyncLocalStorage<{ enc: string | null }>();
 
-	/** The board HTML from the memory bundle, 304-aware; build failure answers 500 (spec "Error cases"). */
+	/** Static asset extensions: a view-route path ending in one is a wrong asset
+	 *  URL, not a client view (OTTR-756) — it must 404 visibly, not serve the app
+	 *  HTML as an image. */
+	const ASSET_PATH =
+		/\.(?:png|jpe?g|gif|webp|avif|svg|ico|js|mjs|css|map|woff2?|ttf|otf|eot|json|txt|xml|webmanifest)$/i;
+
+	/** The board HTML from the memory bundle, 304-aware; build failure answers 500 (spec "Error cases").
+	 *  An asset-like path that lands on a view route answers 404 instead. */
 	async function boardHtml(req: Request): Promise<Response> {
+		if (ASSET_PATH.test(new URL(req.url).pathname))
+			return json({ error: "not found" }, 404);
 		try {
 			return bundleResponse((await boardBundle()).html, req);
 		} catch (err) {

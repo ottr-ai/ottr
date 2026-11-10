@@ -15,6 +15,15 @@ the board sent no `Content-Encoding` on any response. Board JS 550,624 B raw /
 - The built HTML keeps its refs but with absolute paths: every `src="./…"` and
   `href="./…"` becomes `src="/…"` / `href="/…"`, so the nested client routes
   (`/projects/:project/tasks/:id`, `/settings/:project`) resolve assets.
+- The JS and CSS outputs rewrite the relative refs the bundler emits for code
+  imports (`import logo from "./icon-192.png"` becomes the string
+  `"./icon-192-<hash>.png"` inside the chunk): every emitted asset name appears
+  root-absolute (a quoted `"./name"` / `'./name'` string or a `url(./name)`
+  token becomes `/name`), so the browser resolves it from any nested route
+  (OTTR-756).
+- A view-route path that ends in a static asset extension (`.png`, `.svg`,
+  `.js`, `.css`, and friends) answers a 404 JSON error instead of the app HTML:
+  a wrong asset URL must fail visibly, not return HTML as an image (OTTR-756).
 - Routes `"/"`, `/projects/:project`, `/projects/:project/tasks/:id`,
   `/settings`, `/system`, `/settings/:project` serve the HTML from memory.
 - Hashed outputs (JS chunk, CSS chunk, hashed icon and manifest copies) are
