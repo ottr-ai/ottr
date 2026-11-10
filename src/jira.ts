@@ -1,5 +1,6 @@
 import { lookup as dnsLookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { request as httpsRequest } from "node:https";
+import { isIP, type LookupFunction } from "node:net";
 import type { JiraIssue } from "./jiraCards.ts";
 import { adfToMarkdown, fieldText, wikiToMarkdown } from "./jiraMarkup.ts";
 import type { JiraType } from "./types.ts";
@@ -32,13 +33,82 @@ export class JiraError extends Error {
 	}
 }
 
+/**
+ * The HTTP call. `pin` is the address the hosted SSRF check approved: the transport must
+ * connect to exactly that address (no second DNS lookup), and keep the TLS name check on
+ * the URL's hostname. `pin` is null when nothing was checked (not hosted).
+ */
+export type JiraTransport = (
+	url: string,
+	init: RequestInit & { signal: AbortSignal },
+	pin: string | null,
+) => Promise<Response>;
+
 export interface JiraNet {
-	fetch?: typeof fetch;
+	/** Tests replace the transport; the default is `pinnedFetch`. */
+	fetch?: JiraTransport;
 	/** Hosted mode: refuse hosts that resolve to private, loopback or link-local addresses. */
 	hosted: boolean;
 	lookup?: (host: string) => Promise<string[]>;
 	/** Default 15000. */
 	timeoutMs?: number;
+}
+
+/**
+ * Plain fetch when `pin` is null. With a pin, a node:https request whose `lookup` answers
+ * only the pinned address, so a DNS change after the check cannot move the connection;
+ * SNI and certificate checks still use the URL's hostname. `tls` adds trust (tests only).
+ */
+export function pinnedFetch(
+	url: string,
+	init: RequestInit & { signal: AbortSignal },
+	pin: string | null,
+	tls: { ca?: string } = {},
+): Promise<Response> {
+	if (pin === null) return fetch(url, { ...init, redirect: "manual" });
+	const family = isIP(pin);
+	const lookup: LookupFunction = (_host, opts, cb) => {
+		if (opts.all) cb(null, [{ address: pin, family }]);
+		else cb(null, pin, family);
+	};
+	const u = new URL(url);
+	const { promise, resolve, reject } = Promise.withResolvers<Response>();
+	const req = httpsRequest(
+		{
+			method: init.method ?? "GET",
+			host: u.hostname.replace(/^\[(.*)\]$/, "$1"),
+			port: u.port === "" ? 443 : Number(u.port),
+			path: `${u.pathname}${u.search}`,
+			headers: init.headers as Record<string, string>,
+			lookup,
+			signal: init.signal,
+			...tls,
+		},
+		(res) => {
+			const chunks: Buffer[] = [];
+			res.on("data", (c: Buffer) => chunks.push(c));
+			res.on("error", reject);
+			res.on("end", () => {
+				const headers = new Headers();
+				for (const [k, v] of Object.entries(res.headers))
+					if (v !== undefined)
+						headers.set(k, Array.isArray(v) ? v.join(", ") : v);
+				const status = res.statusCode ?? 502;
+				// A Response cannot carry a body for these statuses.
+				const empty = status === 204 || status === 304;
+				resolve(
+					new Response(empty ? null : Buffer.concat(chunks), {
+						status,
+						headers,
+					}),
+				);
+			});
+		},
+	);
+	req.on("error", reject);
+	if (typeof init.body === "string") req.write(init.body);
+	req.end();
+	return promise;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -156,12 +226,16 @@ function blockedAddress(ip: string): boolean {
 const defaultLookup = async (host: string): Promise<string[]> =>
 	(await dnsLookup(host, { all: true })).map((a) => a.address);
 
-/** Hosted mode only: throws JiraError "blocked" when the site's host is or resolves to a non-public address. */
+/**
+ * Hosted mode only: throws JiraError "blocked" when the site's host is or resolves to a
+ * non-public address. Returns the checked address that the request must connect to, or
+ * null when not hosted (nothing checked, nothing pinned).
+ */
 export async function assertAllowedHost(
 	site: string,
 	net: JiraNet,
-): Promise<void> {
-	if (!net.hosted) return;
+): Promise<string | null> {
+	if (!net.hosted) return null;
 	let host: string;
 	try {
 		host = new URL(site).hostname.replace(/^\[(.*)\]$/, "$1");
@@ -190,6 +264,7 @@ export async function assertAllowedHost(
 			null,
 			"blocked",
 		);
+	return addresses[0] ?? host;
 }
 
 function authHeader(c: JiraConn): string {
@@ -225,7 +300,7 @@ async function send(
 	body: unknown,
 	net: JiraNet,
 ): Promise<unknown> {
-	await assertAllowedHost(site, net);
+	const pin = await assertAllowedHost(site, net);
 	const timeoutMs = net.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const signal = AbortSignal.timeout(timeoutMs);
 	const headers: Record<string, string> = { Accept: "application/json" };
@@ -234,13 +309,17 @@ async function send(
 	let res: Response;
 	let text: string;
 	try {
-		res = await (net.fetch ?? fetch)(`${site}${path}`, {
-			method,
-			headers,
-			body: body === undefined ? undefined : JSON.stringify(body),
-			redirect: "manual",
-			signal,
-		});
+		res = await (net.fetch ?? pinnedFetch)(
+			`${site}${path}`,
+			{
+				method,
+				headers,
+				body: body === undefined ? undefined : JSON.stringify(body),
+				redirect: "manual",
+				signal,
+			},
+			pin,
+		);
 		text = await res.text();
 	} catch (err) {
 		if (signal.aborted)

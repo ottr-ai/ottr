@@ -1,11 +1,16 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	assertAllowedHost,
 	detectType,
 	type JiraConn,
 	JiraError,
 	type JiraNet,
+	type JiraTransport,
 	normalizeSiteUrl,
+	pinnedFetch,
 	searchIssues,
 	testConnection,
 } from "./jira.ts";
@@ -591,5 +596,111 @@ describe("assertAllowedHost", () => {
 		answer = () => Response.json({ displayName: "Ada" });
 		const n = net({ hosted: true, lookup: async () => ["93.184.216.34"] });
 		expect(await testConnection(dc, n)).toEqual({ displayName: "Ada" });
+	});
+
+	test("hosted: the request connects to the checked address, resolved once", async () => {
+		answer = () => Response.json({ displayName: "Ada" });
+		// A rebinding resolver: public at the check, loopback on any later lookup.
+		const answers = [["93.184.216.34"], ["127.0.0.1"]];
+		let lookups = 0;
+		const pins: (string | null)[] = [];
+		const capture: JiraTransport = (url, init, pin) => {
+			pins.push(pin);
+			return toStub(url, init);
+		};
+		await testConnection(dc, {
+			hosted: true,
+			fetch: capture,
+			lookup: async () => answers[lookups++] ?? ["127.0.0.1"],
+		});
+		expect(lookups).toBe(1);
+		expect(pins).toEqual(["93.184.216.34"]);
+	});
+
+	test("not hosted: the transport gets no pin", async () => {
+		answer = () => Response.json({ displayName: "Ada" });
+		const pins: (string | null)[] = [];
+		await testConnection(dc, {
+			hosted: false,
+			fetch: (url, init, pin) => {
+				pins.push(pin);
+				return toStub(url, init);
+			},
+		});
+		expect(pins).toEqual([null]);
+	});
+});
+
+describe("pinnedFetch", () => {
+	// A TLS stub with a certificate for jira.test, a name no resolver answers.
+	const dir = mkdtempSync(join(tmpdir(), "ottr-jira-tls-"));
+	const r = Bun.spawnSync([
+		"openssl",
+		"req",
+		"-x509",
+		"-newkey",
+		"rsa:2048",
+		"-nodes",
+		"-days",
+		"1",
+		"-subj",
+		"/CN=jira.test",
+		"-addext",
+		"subjectAltName=DNS:jira.test",
+		"-keyout",
+		join(dir, "key.pem"),
+		"-out",
+		join(dir, "cert.pem"),
+	]);
+	if (r.exitCode !== 0) throw new Error(`openssl failed: ${r.stderr}`);
+	const cert = readFileSync(join(dir, "cert.pem"), "utf8");
+	const got: { host: string | null; auth: string | null; body: string }[] = [];
+	const tls = Bun.serve({
+		port: 0,
+		hostname: "127.0.0.1",
+		tls: { cert, key: readFileSync(join(dir, "key.pem"), "utf8") },
+		async fetch(req) {
+			got.push({
+				host: req.headers.get("host"),
+				auth: req.headers.get("authorization"),
+				body: await req.text(),
+			});
+			return Response.json({ ok: true }, { status: 201 });
+		},
+	});
+	afterAll(() => tls.stop(true));
+	const init = () => ({
+		method: "POST",
+		headers: { Authorization: "Bearer t", "Content-Type": "application/json" },
+		body: '{"a":1}',
+		signal: AbortSignal.timeout(5000),
+	});
+
+	test("connects to the pin without a DNS lookup and keeps the TLS name", async () => {
+		got.length = 0;
+		const res = await pinnedFetch(
+			`https://jira.test:${tls.port}/rest/api/2/search`,
+			init(),
+			"127.0.0.1",
+			{ ca: cert },
+		);
+		expect(res.status).toBe(201);
+		expect(await res.json()).toEqual({ ok: true });
+		expect(got).toEqual([
+			{ host: `jira.test:${tls.port}`, auth: "Bearer t", body: '{"a":1}' },
+		]);
+	});
+
+	test("a certificate for another name is refused and sends nothing", async () => {
+		got.length = 0;
+		const err = await pinnedFetch(
+			`https://evil.test:${tls.port}/x`,
+			init(),
+			"127.0.0.1",
+			{ ca: cert },
+		).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(Error);
+		expect(String(err)).toContain("evil.test");
+		expect(got).toHaveLength(0);
 	});
 });
