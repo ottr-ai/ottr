@@ -17939,6 +17939,22 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
 		expect(store.getTask(task.id)?.state).toBe("queued");
+		// OTTR-754: the queued card carries the hold reason with the runner's free space.
+		expect(store.getTask(task.id)?.needsReason).toBe(
+			"/tmp of worker-a is full (512 MiB)",
+		);
+	});
+
+	test("a drain-only hold writes no /tmp reason on the queued card", async () => {
+		const { store, record, loop } = setup({
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			drainedRunner: (id) => id === "worker-a",
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		expect(store.getTask(task.id)?.state).toBe("queued");
+		expect(store.getTask(task.id)?.needsReason).toBeNull();
 	});
 
 	test("a tmp-full local runner defers the board check", async () => {
@@ -17950,6 +17966,31 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		await loop.runTurn(store.name, check.id);
 		expect(record.runs).toHaveLength(0);
 		expect(store.getTask(check.id)?.state).toBe("queued");
+		expect(store.getTask(check.id)?.needsReason).toBe(
+			"/tmp of local is full (512 MiB)",
+		);
+	});
+
+	test("a /tmp hold that lands while the turn prepares parks with the runner's space", async () => {
+		// Race path, mirror of the drain test: the hold covers the only worker after
+		// the claim, so the prepared turn parks and the reason names the runner's space.
+		let full = false;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			tmpFullLine: (r) =>
+				full && r === "worker-a" ? "/tmp of worker-a is full (512 MiB)" : null,
+			resolveTarget: async () => {
+				full = true; // the /tmp limit reaches the runner mid-prepare
+				return { target: "origin/main", sha: "sha0", warning: null };
+			},
+		});
+		const task = store.createTask("queued work");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		const card = store.getTask(task.id);
+		expect(card?.state).toBe("needs_you");
+		expect(card?.needsReason).toContain("/tmp of worker-a is full (512 MiB)");
 	});
 
 	test("an apt disk-failure reason names the free /tmp of the runner it ran on", async () => {

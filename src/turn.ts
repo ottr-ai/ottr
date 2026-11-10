@@ -3013,8 +3013,22 @@ export function createTurnLoop(
 		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
 		const preRetro = isRetro(task);
 		const preBoardCheck = store.boardCheckId() === id;
-		if (startGatesHold(e, task, key, kind, preRetro, preBoardCheck))
+		if (startGatesHold(e, task, key, kind, preRetro, preBoardCheck)) {
+			// OTTR-754: a /tmp hold names the runner and its free space on the queued card,
+			// so the card shows why it waits. A drain-only hold keeps its silent surface
+			// (the board's drain view carries that cause). One write per text change: the
+			// phrase is stable across schedule ticks while the space stays below the limit.
+			const tmpReason = startGateTmpReason(
+				e,
+				task,
+				kind,
+				preRetro,
+				preBoardCheck,
+			);
+			if (tmpReason !== null && task.needsReason !== tmpReason)
+				store.updateTask(id, { needsReason: tmpReason });
 			return null;
+		}
 		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
 		store.updateTask(id, {
 			state: "preparing",
@@ -3094,6 +3108,39 @@ export function createTurnLoop(
 					)
 				: ops.drainedRunner("local") || ops.tmpFullLine?.("local") != null;
 		return runnerDrained;
+	}
+
+	/** OTTR-754: the /tmp part of the same hold poolStartGateHolds answers, null when no
+	 * runner's /tmp is below the limit (a drain-only hold carries no card reason; the
+	 * board's drain view and the update notice carry that cause). A microVM hold keeps
+	 * the vmHoldFor surface. Each line is the tmpFullLine phrase, so the card reason
+	 * names the runner and its free space exactly like the bell notice. */
+	function startGateTmpReason(
+		e: TurnProject,
+		task: Task,
+		kind: TurnKind,
+		preRetro: boolean,
+		preBoardCheck: boolean,
+	): string | null {
+		if (
+			microVmTurn({
+				microVm: getSettingsLogged(e).microVm === true,
+				kind,
+				retro: preRetro,
+				boardCheck: preBoardCheck,
+				task,
+			})
+		)
+			return null;
+		const target = ops.workerTarget ?? null;
+		const toWorker =
+			kind !== "merge" && !preRetro && !preBoardCheck && target !== null;
+		const urls = toWorker && target !== null ? target.urls : null;
+		if (urls === null) return ops.tmpFullLine?.("local") ?? null;
+		const full = urls
+			.map((u) => ops.tmpFullLine?.(new URL(u).hostname) ?? null)
+			.filter((line) => line !== null);
+		return full.length === 0 ? null : full.join("; ");
 	}
 
 	/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
@@ -4000,11 +4047,70 @@ export function createTurnLoop(
 		store.updateTask(id, { state: "needs_you", needsReason: reason });
 	}
 
+	/** OTTR-754: one cause line per unavailable worker url; the tmpFullLine phrase already
+	 * carries the runner name and its free space, a drain names the image update. */
+	function unavailableWorkerCauses(worker: WorkerTarget | null): string[] {
+		const causes: string[] = [];
+		for (const u of worker?.urls ?? []) {
+			const host = new URL(u).hostname;
+			if (ops.drainedRunner(host))
+				causes.push(`${host} is drained for an image update`);
+			const tmpLine = ops.tmpFullLine?.(host);
+			if (tmpLine !== null && tmpLine !== undefined) causes.push(tmpLine);
+		}
+		return causes;
+	}
+
+	/** OTTR-754: a runner url is usable when it is not drained and its /tmp is not below
+	 * the free-space limit; the limit keeps new turns off a runner that cannot hold the
+	 * run's temp writes. */
+	function workerUrlUsable(u: string): boolean {
+		return (
+			!ops.drainedRunner(new URL(u).hostname) &&
+			ops.tmpFullLine?.(new URL(u).hostname) == null
+		);
+	}
+
+	/** The prepared turn's workers all dropped out (drained, or /tmp below the free-space
+	 * limit): park for a human instead of dispatching to a dead pool or falling back to the
+	 * server. A hold that lands after this point cannot strand the turn: the update script
+	 * counts every live run on the runner (the entry's url) before it recreates.
+	 * True when the card parked. */
+	function parkUnavailableWorkers(
+		store: ProjectStore,
+		id: string,
+		vmTurn: boolean,
+		worker: WorkerTarget | null,
+		log: (line: string) => void,
+	): boolean {
+		if (worker === null || worker.urls.some(workerUrlUsable)) return false;
+		if (vmTurn) {
+			parkBeforeRun(
+				store,
+				id,
+				"The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry.",
+				log,
+			);
+			return true;
+		}
+		// OTTR-754: the park names each runner's cause, so the card reports the
+		// space problem itself instead of a generic "unavailable".
+		const causes = unavailableWorkerCauses(worker);
+		const why =
+			causes.length > 0 ? causes.join("; ") : "no runner is available";
+		parkBeforeRun(
+			store,
+			id,
+			`Every worker is unavailable, so the turn did not start: ${why}. The update undrains a drained worker when its roll ends, and the /tmp warning clears when space returns; reply to retry.`,
+			log,
+		);
+		return true;
+	}
+
 	/** The worker target with drained runners dropped; fail closed on an empty list
 	 * (a drain landed while the turn prepared): park instead of dispatching to a drained
-	 * worker or falling back to the server. A drain that lands after this point cannot strand
-	 * the turn: the update script counts every live run on the runner (the entry's url) before
-	 * it recreates. Null: the turn stopped. Null `liveWorker`: a local run, the turn goes on. */
+	 * worker or falling back to the server. Null: the turn stopped. Null `liveWorker`:
+	 * a local run, the turn goes on. */
 	async function gateTurnStart(
 		store: ProjectStore,
 		id: string,
@@ -4013,20 +4119,6 @@ export function createTurnLoop(
 		execModel: string | null,
 		log: (line: string) => void,
 	): Promise<{ liveWorker: TurnLiveWorker | null } | null> {
-		const liveWorker =
-			worker === null
-				? null
-				: {
-						// OTTR-754: a runner whose /tmp is below the free-space limit drops out
-						// like a drained one; the free-space limit keeps new turns off a
-						// runner that cannot hold the run's temp writes.
-						urls: worker.urls.filter(
-							(u) =>
-								!ops.drainedRunner(new URL(u).hostname) &&
-								ops.tmpFullLine?.(new URL(u).hostname) == null,
-						),
-						token: worker.token,
-					};
 		if (vmTurn && (worker === null || ops.vmTokens === undefined)) {
 			// Fail closed: never the classic pool or the server for a microVM turn.
 			parkBeforeRun(
@@ -4037,17 +4129,14 @@ export function createTurnLoop(
 			);
 			return null;
 		}
-		if (liveWorker !== null && liveWorker.urls.length === 0) {
-			parkBeforeRun(
-				store,
-				id,
-				vmTurn
-					? "The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry."
-					: "Every worker is unavailable, so the turn did not start: a runner is drained for an image update, or a runner's /tmp is below the free-space limit (OTTR-754). The update undrains the worker when its roll ends, and the /tmp warning clears when space returns; reply to retry.",
-				log,
-			);
-			return null;
-		}
+		if (parkUnavailableWorkers(store, id, vmTurn, worker, log)) return null;
+		const liveWorker =
+			worker === null
+				? null
+				: {
+						urls: worker.urls.filter(workerUrlUsable),
+						token: worker.token,
+					};
 		if (worker !== null && execModel === null) {
 			parkBeforeRun(
 				store,
