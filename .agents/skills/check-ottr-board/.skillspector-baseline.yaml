@@ -1,0 +1,14 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 2
+scanner_version: 2.13.0
+rules: []
+fingerprints:
+- hash: sha256:f913ed4e9011f25c869f2b00ca2aeb9940ebc6f914c70759714585265c307338
+  rule_id: TM1
+  file: SKILL.md
+  reason: "Accepted 2026-11-06: the step 4 row 'local main diverged' is prose for a manual repair that the user approves first (drain, rebase onto origin/main, push with a token, end the drain); the skill runs no tool with these parameters itself."
+- hash: sha256:ad002305978f1c101421005bcd9bc7e6e7916053de9d474e9fd5b893c2acad27
+  rule_id: LP3
+  file: SKILL.md
+  reason: "Accepted 2026-11-06: an omp managed skill has no allowed-tools frontmatter; the tool scope comes from the session, and the skill text asks the user before every write outside the board API (same family as impeccable LP3)."

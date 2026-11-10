@@ -1,0 +1,14 @@
+# SkillSpector baseline — findings listed here are suppressed on future scans.
+# Edit 'reason' fields and add glob 'rules' as needed. See docs/SUPPRESSION.md.
+version: 2
+scanner_version: 2.13.0
+rules: []
+fingerprints:
+- hash: sha256:100e4da8b89d540b87f0f2594dfcc8698350cf4132b0c182bdf15de4b5542986
+  rule_id: EA3
+  file: SKILL.md
+  reason: Accepted finding (auto-generated baseline)
+- hash: sha256:80da7e55d0cd7aa9f685ac9d52ab2df664a41c63a386119ac5a0f3cf81e6322f
+  rule_id: TM3
+  file: SKILL.md
+  reason: Accepted finding (auto-generated baseline)
