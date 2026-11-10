@@ -727,8 +727,17 @@ const integratedRule: ClassifyRule = (o, stage) => {
 	const { kind, git, target } = o;
 	const oc = o.result.outcome;
 	if (oc === null || oc.status !== "integrated") return null;
-	if (kind === "work")
+	if (kind === "work") {
+		// OTTR-766: a head already on the target is an out-of-turn merge — the park
+		// names it (and that a work turn never merges) instead of the generic text, so
+		// the rejection note the resumed turn reads says what actually happened.
+		if (git.integrated)
+			return needsAt(
+				stage,
+				`Out-of-turn merge: the branch head is already on ${target ?? "the integration target"}. A work turn never merges; report ready.`,
+			);
 		return needsAt(stage, "Work turns do not merge; report ready.");
+	}
 	if (git.integrated)
 		return { stage: "done", state: "idle", needsReason: null };
 	return needsAt(

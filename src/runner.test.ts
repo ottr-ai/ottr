@@ -1626,19 +1626,31 @@ describe("classify", () => {
 
 	test("7. a work turn that reports integrated is rejected", () => {
 		// Merging is the merge turn's job (rebase, gates, server push): a work turn's
-		// integrated report is rejected regardless of what git shows (AGEN-33).
-		for (const integrated of [true, false])
-			expect(
-				run(
-					"work",
-					result({ outcome: outcome({ status: "integrated" }) }),
-					git({ integrated }),
-				),
-			).toEqual({
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: "Work turns do not merge; report ready.",
-			});
+		// integrated report is rejected regardless of what git shows (AGEN-33). A head
+		// already on the target names the out-of-turn merge instead of the generic text.
+		expect(
+			run(
+				"work",
+				result({ outcome: outcome({ status: "integrated" }) }),
+				git({ integrated: false }),
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "Work turns do not merge; report ready.",
+		});
+		expect(
+			run(
+				"work",
+				result({ outcome: outcome({ status: "integrated" }) }),
+				git({ integrated: true }),
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason:
+				"Out-of-turn merge: the branch head is already on origin/main. A work turn never merges; report ready.",
+		});
 	});
 
 	test("8. merge integrated verified against git", () => {

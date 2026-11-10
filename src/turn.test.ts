@@ -10446,6 +10446,129 @@ describe("turn fork-born merge hold", () => {
 	});
 });
 
+describe("fork-born work check before the hold", () => {
+	// A fork-born card whose ready report carries commits classifies merging/queued; the
+	// fork hold would park it, and the second-model check must judge the head first
+	// (OTTR-766: the park must not preempt the check).
+	function forkCheckCase(
+		head: { sha: string },
+		checks: RunResult[],
+		overrides: Partial<TurnOps> = {},
+		works: RunResult[] = [],
+	) {
+		const record = baseRecord();
+		const s = setupWith(record, {
+			// Holds the chained send-back turn so each test asserts the settle instant.
+			maxTotalRuns: () => 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			startRun: checkedRun(record, checks, works),
+			workCheck: () => true,
+			diffText: async () => "const x = 1;\n",
+			...overrides,
+		});
+		const parent = s.store.createTask("fork research: weekly digest");
+		s.store.updateTask(parent.id, {
+			topic: "fork research",
+			research: true,
+			stage: "done",
+			state: "idle",
+		});
+		const task = s.store.createTask("adopt fork idea");
+		s.store.updateTask(task.id, { followUpOf: parent.id });
+		return { ...s, task };
+	}
+
+	test("a fork-born ready report starts a work check before the hold parks", async () => {
+		const { store, record, loop, task } = forkCheckCase({ sha: "sha-1" }, [
+			pass(["small nit"]),
+		]);
+		await loop.runTurn(store.name, task.id);
+
+		// The work run and the check ran; the park never preempted the check.
+		expect(record.runs).toHaveLength(2);
+		expect(record.runs[1]!.prompt).toContain("You are the second model");
+		const after = store.getTask(task.id)!;
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckLog[0]!.outcome).toBe("pass");
+		expect(after.workCheckHead).toBe("sha-1");
+	});
+
+	test("a passed fork-born check parks the hold at the checked head", async () => {
+		const { store, record, loop, task } = forkCheckCase({ sha: "sha-1" }, [
+			pass(),
+		]);
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(FORK_HOLD_REASON);
+		// The park is the check's verdict, not a pre-check hold: the head was judged.
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckLog[0]!.outcome).toBe("pass");
+		// The approval covers exactly the head the check judged.
+		expect(after.holdHead).toBe("sha-1");
+		// A check pass spends no fork approval.
+		expect(after.forkMergeHead).toBeNull();
+		expect(record.removeWorktree).toHaveLength(0);
+	});
+
+	test("a blocking fork-born check sends the work back instead of parking", async () => {
+		const { store, record, loop, task } = forkCheckCase({ sha: "sha-1" }, [
+			block("tests were weakened", "const x = 1;"),
+		]);
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2); // work run + check run; no park, no merge turn
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBeNull();
+		expect(after.holdHead).toBeNull();
+		expect(after.workCheckSendbacks).toBe(1);
+		expect(after.workCheckLog[0]!.outcome).toBe("blockers");
+		expect(after.pendingPrompt).toContain("tests were weakened");
+	});
+
+	test("an approval routes the checked fork-born card through the merge queue", async () => {
+		const { store, loop, task } = forkCheckCase(
+			{ sha: "sha-1" },
+			[pass()],
+			{ maxTotalRuns: () => 10 },
+			[
+				runResult({ outcome: { status: "ready", summary: "did it" } }),
+				runResult({
+					outcome: {
+						status: "integrated",
+						summary: "pushed",
+					} satisfies Outcome,
+				}),
+			],
+		);
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.needsReason).toBe(FORK_HOLD_REASON);
+		// The head the approval will cover is the head the check passed.
+		expect(store.getTask(task.id)!.workCheckLog[0]!.outcome).toBe("pass");
+
+		// The drawer's approval reply spends the parked head and queues the merge turn
+		// (the exact write holdApprovalReply makes on APPROVE_REPLY).
+		store.updateTask(task.id, {
+			stage: "merging",
+			state: "queued",
+			needsReason: null,
+			holdHead: null,
+			forkMergeHead: "sha-1",
+		});
+		await loop.runTurn(store.name, task.id);
+
+		// The merge turn integrated; the work turn never merged by itself.
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).toBeNull();
+	});
+});
+
 describe("trusted kind, not prompt text", () => {
 	test("a work card with a privileged marker prompt gets no privileged kind", () => {
 		const { store } = setup();
@@ -11372,39 +11495,55 @@ describe("review findings check", () => {
 	});
 });
 
-describe("work card check", () => {
-	// startRun fake: work-agent runs report ready, check runs (spotted by the check prompt's
-	// first words) are served from `checks` in order — one turn appends exactly one work run
-	// plus its check runs, so absolute run indexes would hand a check verdict to a work run.
-	const checkedRun = (
-		record: Recorded,
-		checks: RunResult[],
-		works: RunResult[] = [],
-	) => {
-		let checkIndex = 0;
-		let workIndex = 0;
-		return (o: Parameters<TurnOps["startRun"]>[0]) => {
-			record.runs.push(o);
-			o.onSession?.(`sess-${record.runs.length}`);
-			const isCheck = o.prompt.startsWith("You are the second model");
-			return {
-				pid: 4242,
-				done: Promise.resolve(
-					isCheck
-						? (checks[checkIndex++] ?? runResult({}))
-						: (works[workIndex++] ??
-								runResult({
-									outcome: {
-										status: "ready",
-										summary: "did it",
-									} satisfies Outcome,
-								})),
-				),
-				kill: async () => {},
-			};
+// startRun fake: work-agent runs report ready, check runs (spotted by the check prompt's
+// first words) are served from `checks` in order — one turn appends exactly one work run
+// plus its check runs, so absolute run indexes would hand a check verdict to a work run.
+const checkedRun = (
+	record: Recorded,
+	checks: RunResult[],
+	works: RunResult[] = [],
+) => {
+	let checkIndex = 0;
+	let workIndex = 0;
+	return (o: Parameters<TurnOps["startRun"]>[0]) => {
+		record.runs.push(o);
+		o.onSession?.(`sess-${record.runs.length}`);
+		const isCheck = o.prompt.startsWith("You are the second model");
+		return {
+			pid: 4242,
+			done: Promise.resolve(
+				isCheck
+					? (checks[checkIndex++] ?? runResult({}))
+					: (works[workIndex++] ??
+							runResult({
+								outcome: {
+									status: "ready",
+									summary: "did it",
+								} satisfies Outcome,
+							})),
+			),
+			kill: async () => {},
 		};
 	};
+};
 
+const pass = (notes: string[] = []) =>
+	runResult({
+		finalText: JSON.stringify({ blockers: [], fixed: [], notes }),
+	});
+const block = (finding: string, quote: string, bugClass?: string) =>
+	runResult({
+		finalText: JSON.stringify({
+			blockers:
+				bugClass === undefined
+					? [{ finding, quote }]
+					: [{ finding, quote, bugClass }],
+			fixed: [],
+			notes: [],
+		}),
+	});
+
+describe("work card check", () => {
 	// A ready work turn classifies merging/queued (commitsAhead 1, clean), which is the
 	// check block's gate. maxTotalRuns 0 holds the chained merge turn so each test asserts
 	// the settle instant; head.sha is mutable so later turns can push "new commits".
@@ -11424,22 +11563,6 @@ describe("work card check", () => {
 			...overrides,
 		});
 	}
-
-	const pass = (notes: string[] = []) =>
-		runResult({
-			finalText: JSON.stringify({ blockers: [], fixed: [], notes }),
-		});
-	const block = (finding: string, quote: string, bugClass?: string) =>
-		runResult({
-			finalText: JSON.stringify({
-				blockers:
-					bugClass === undefined
-						? [{ finding, quote }]
-						: [{ finding, quote, bugClass }],
-				fixed: [],
-				notes: [],
-			}),
-		});
 
 	test("a ready card with commits ahead runs the check once, and a pass keeps it merging/queued", async () => {
 		const head = { sha: "sha1" };
@@ -17423,11 +17546,14 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
-		// The report is rejected (AGEN-33), so no settle runs and no CI watch starts:
-		// the card never records a push sha it did not earn through a merge turn.
+		// The report is rejected (AGEN-33): the park names the out-of-turn merge, and no
+		// settle runs and no CI watch starts — the card never records a push sha it did
+		// not earn through a merge turn.
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toBe("Work turns do not merge; report ready.");
+		expect(after.needsReason).toBe(
+			"Out-of-turn merge: the branch head is already on origin/main. A work turn never merges; report ready.",
+		);
 		expect(after.pushSha).toBeNull();
 		expect(logText(store, task.id)).not.toContain("CI watch skipped");
 	});

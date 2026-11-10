@@ -1587,6 +1587,8 @@ type TurnSettle = {
 	mergeHead: string | null | undefined;
 	keptFiles: string[] | undefined;
 	holdReason: string | null;
+	/** OTTR-766: a merge-hold park deferred until the work check passed (planMergeHolds). */
+	holdPark: Next | null;
 	// checks
 	workCard: boolean;
 	reviewFindings: RecordedFinding[];
@@ -4905,6 +4907,7 @@ export function createTurnLoop(
 			mergeHead: undefined,
 			keptFiles: undefined,
 			holdReason: null,
+			holdPark: null,
 			workCard: false,
 			reviewFindings: [],
 			checkWillRun: false,
@@ -6888,11 +6891,39 @@ export function createTurnLoop(
 		st.holdHead = head;
 		st.holdReason = holdReason;
 		st.commits = undefined; // not done: the approving settle re-measures
+		// OTTR-766: on a merging-bound settle the work check judges the head before the
+		// hold parks the card — the user approves a checked head. The park rides holdPark
+		// and lands after the check's verdict (writePostCheckState); a send-back or a
+		// failed check wins instead, and the next ready re-settles the hold.
+		if (next.stage === "merging" && isWorkCard(st)) {
+			st.holdPark = {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: holdReason,
+			};
+			return next;
+		}
 		return {
 			stage: "in_progress",
 			state: "needs_you",
 			needsReason: holdReason,
 		};
+	}
+
+	/** The plain work-card predicate planTurnChecks stamps on the settle: a merge-hold park
+	 * that a work check must precede (OTTR-766) shares it, so a deferred park happens only
+	 * where the check gate fires too. */
+	function isWorkCard(st: TurnSettle): boolean {
+		return (
+			st.kind === "work" &&
+			!st.research &&
+			!st.idn.reviewCard &&
+			!st.idn.releaseCard &&
+			!st.idn.interview &&
+			!st.idn.grill &&
+			!st.idn.scout &&
+			!st.idn.retroCard
+		);
 	}
 
 	/** The HEAD the hold pins and whether the approved merge already landed: AGEN-24 — the
@@ -7026,15 +7057,7 @@ export function createTurnLoop(
 	 * verdict — or a skipped check — is in, so the schedule tick can neither pick the card for
 	 * a merge turn nor settle a parked review early. */
 	function planTurnChecks(st: TurnSettle, next: Next): void {
-		st.workCard =
-			st.kind === "work" &&
-			!st.research &&
-			!st.idn.reviewCard &&
-			!st.idn.releaseCard &&
-			!st.idn.interview &&
-			!st.idn.grill &&
-			!st.idn.scout &&
-			!st.idn.retroCard;
+		st.workCard = isWorkCard(st);
 		st.reviewFindings =
 			st.idn.reviewCard &&
 			st.result.recorded.length > 0 &&
@@ -7126,7 +7149,10 @@ export function createTurnLoop(
 			report: st.report,
 			steps: st.steps,
 			keptFiles: st.keptFiles,
-			holdHead: st.holdHead, // every settle rewrites it: only a hold this settle parked keeps a head to approve
+			// Every settle rewrites it: only a hold this settle parked keeps a head to
+			// approve. A deferred park (holdPark) writes its head only when the park
+			// lands after the check (writePostCheckState); a send-back keeps no head.
+			holdHead: st.holdPark === null ? st.holdHead : null,
 			// A merge-hold mismatch park serves the reviewer the exact push-side delta it
 			// flagged (undefined keeps the column): the live worktree diff no longer speaks
 			// for the push set once the branch is integrated.
@@ -7134,9 +7160,16 @@ export function createTurnLoop(
 			diffText: st.holdDiff ?? undefined,
 			// A park spends that hold's approval (undefined keeps the column): a stale approval never
 			// carries into a later settle. Only the parked hold's column clears, so an approved
-			// update hold survives a fork-hold park of the same card.
-			updateMergeHead: st.holdReason === UPDATE_HOLD_REASON ? null : undefined,
-			forkMergeHead: st.holdReason === FORK_HOLD_REASON ? null : undefined,
+			// update hold survives a fork-hold park of the same card. A deferred park spends
+			// nothing here — its park write below does, and only when it lands.
+			updateMergeHead:
+				st.holdPark === null && st.holdReason === UPDATE_HOLD_REASON
+					? null
+					: undefined,
+			forkMergeHead:
+				st.holdPark === null && st.holdReason === FORK_HOLD_REASON
+					? null
+					: undefined,
 		});
 	}
 
@@ -8044,23 +8077,43 @@ export function createTurnLoop(
 		});
 	}
 
+	/** The hold columns a settle that parked a hold writes: the parked hold's head to
+	 * approve, and the approval spend its landing implies. */
+	function holdParkColumns(st: TurnSettle): {
+		holdHead: string | null;
+		updateMergeHead: string | null | undefined;
+		forkMergeHead: string | null | undefined;
+	} {
+		return {
+			holdHead: st.holdHead,
+			updateMergeHead: st.holdReason === UPDATE_HOLD_REASON ? null : undefined,
+			forkMergeHead: st.holdReason === FORK_HOLD_REASON ? null : undefined,
+		};
+	}
+
 	/** A check block above ran while the card was still in_progress/running: store the final
 	 * state now, if the card is still ours. The overrides the checks wrote (send-back,
 	 * needs_you, a failed check) moved the state away from running; this write must not
 	 * clobber them, so it fires only on the still-running card. */
 	function writePostCheckState(st: TurnSettle, next: Next): void {
 		if (!st.checkWillRun) return;
+		// A merge hold deferred for the check (OTTR-766) parks here, after a passed check
+		// stamped its head. A send-back or a failed check left the card not running, so
+		// the guard below skips the park and their own write stands.
+		const final = st.holdPark ?? next;
 		const afterCheck = st.store.getTask(st.id);
-		if (
-			afterCheck &&
+		const live =
+			afterCheck !== null &&
 			afterCheck.cancelledAt === null &&
-			(afterCheck.state === "running" || afterCheck.state === "preparing")
-		)
+			(afterCheck.state === "running" || afterCheck.state === "preparing");
+		if (live)
 			st.store.updateTask(st.id, {
-				stage: next.stage,
-				state: next.state,
-				needsReason: next.needsReason,
-				queuedAt: next.state === "queued" ? Date.now() : undefined,
+				stage: final.stage,
+				state: final.state,
+				needsReason: final.needsReason,
+				queuedAt: final.state === "queued" ? Date.now() : undefined,
+				// On a plain check settle these ride as the no-op they always were.
+				...holdParkColumns(st),
 			});
 	}
 
