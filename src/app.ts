@@ -6399,16 +6399,15 @@ export function createApp(deps: AppDeps) {
 		// step adopts the PR instead of opening a duplicate.
 		const prefix = dependabotHeadPrefix(task.prompt.split("\n", 1)[0] ?? "");
 		if (prefix === null) return json({ error: "not a Dependabot card" }, 400);
-		// Any still-open card covering the same PR blocks the refile: the refiled card
-		// itself while it runs, and a done card too (the update already landed). The
-		// cancelled source card never blocks (it is cancelled).
+		// Any non-cancelled card covering the same PR blocks the refile: the refiled card
+		// while it runs, and a done card too (the update already landed). The cancelled
+		// source card never blocks (it is cancelled).
 		const blocker = e.store
 			.listTasks()
 			.find(
 				(t) =>
 					(t.prompt.split("\n", 1)[0] ?? "").startsWith(prefix) &&
-					t.cancelledAt === null &&
-					t.stage !== "done",
+					t.cancelledAt === null,
 			);
 		if (blocker !== undefined)
 			return json(

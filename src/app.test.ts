@@ -5591,6 +5591,27 @@ describe("refile route (OTTR-781)", () => {
 		expect(await errorOf(res)).toContain("already covers");
 		expect(store.listTasks().length).toBe(before);
 	});
+
+	test("a done card covering the same PR blocks the refile too (OTTR-781)", async () => {
+		// The update already landed through another card: a fresh card would wait on a
+		// merge that happened, so the done card refuses the refile like an open one.
+		const landed = store.createTask(
+			"Dependabot PR #60 (https://github.com/acme/repo/pull/60): Bump ts from 5 to 6",
+		);
+		store.updateTask(landed.id, {
+			stage: "done",
+			state: "idle",
+		});
+		const t = store.createTask(
+			"Dependabot PR #60 (https://github.com/acme/repo/pull/60): Bump ts from 5 to 6",
+		);
+		store.updateTask(t.id, { cancelledAt: Date.now() });
+		const before = store.listTasks().length;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/refile`, {});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toContain(landed.id);
+		expect(store.listTasks().length).toBe(before);
+	});
 });
 
 describe("dependabotHeadPrefix (OTTR-781)", () => {
