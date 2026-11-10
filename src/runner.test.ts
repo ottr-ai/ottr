@@ -2654,7 +2654,7 @@ describe("startRun", () => {
 		}
 	});
 
-	test("a local run carries the plugin-skills overlay of its home; a plugin-free home keeps today's argv", async () => {
+	test("a local run carries the plugin-skills overlay of its home; a plugin-free home carries the pins-only overlay", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-plugin-skills-"));
 		const dataDir = join(dir, "data");
 		mkdirSync(dataDir, { recursive: true });
