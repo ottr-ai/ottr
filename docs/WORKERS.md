@@ -1191,7 +1191,16 @@ A worktree's own `.omp` tree is untrusted the same way, so every board-side omp 
 (`buildOmpArgs`) passes `--no-extensions --no-lsp` and the
 `extension/no-discovery.yml` overlay (`mcp.enableProjectConfig: false`): discovered
 extensions, plugins, language servers, and project MCP servers from the worktree never
-load, and the explicit tracker extension still does.
+load, and the explicit tracker extension still does. `--no-extensions` also closes the
+plugins, so their skills went dark with it — and a worker-planted
+`.agents/skills/<name>/SKILL.md` in the worktree still loaded (verified on omp
+18.15.0). Every run therefore carries one more generated overlay
+(`src/pluginSkills.ts`, docs/specs/turn-home-plugin-skills.md) that pins the three
+project-level skill enables off and lists the run home's enabled plugins' skill
+directories as `skills.customDirectories`: omp reads those `SKILL.md` files as prompt
+content and still runs no plugin code. The run home is the pinned agent layer or the
+flat home, never the board home, so the board's privileged turns keep their R5-1
+isolation.
 
 ### The data boundary
 

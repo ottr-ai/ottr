@@ -348,6 +348,40 @@ describe("buildOmpArgs", () => {
 		]);
 	});
 
+	test("the plugin-skills overlay rides after NO_DISCOVERY_CONFIG and before the memory overlay", () => {
+		expect(
+			buildOmpArgs({
+				sessionDir: "S",
+				extensionPath: "E",
+				resumeId: null,
+				pluginSkillsConfig: "/data/omp-plugin-skills.yml",
+				memoryConfig: "/data/omp-memory.yml",
+			}),
+		).toEqual([
+			"-p",
+			"--mode",
+			"json",
+			"--session-dir",
+			"S",
+			"--extension",
+			"E",
+			"--config",
+			"run.yml",
+			"--no-extensions",
+			"--no-lsp",
+			"--config",
+			NO_DISCOVERY_CONFIG,
+			"--config",
+			"/data/omp-plugin-skills.yml",
+			"--config",
+			"/data/omp-memory.yml",
+		]);
+		// A home with no plugin skills (null) keeps today's argv: no extra --config pair.
+		expect(
+			buildOmpArgs({ sessionDir: "S", extensionPath: "E", resumeId: null }),
+		).not.toContain("/data/omp-plugin-skills.yml");
+	});
+
 	test("with resumeId", () => {
 		expect(
 			buildOmpArgs({ sessionDir: "S", extensionPath: "E", resumeId: "R" }),
@@ -2620,6 +2654,96 @@ describe("startRun", () => {
 		}
 	});
 
+	test("a local run carries the plugin-skills overlay of its home; a plugin-free home keeps today's argv", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugin-skills-"));
+		const dataDir = join(dir, "data");
+		mkdirSync(dataDir, { recursive: true });
+		// The fixture home stands in for the shared home: one enabled plugin whose
+		// pi.skills names ./skills (docs/specs/turn-home-plugin-skills.md).
+		const home = join(dir, "home");
+		const pkgDir = join(
+			home,
+			".omp",
+			"plugins",
+			"node_modules",
+			"@acme",
+			"cool",
+		);
+		mkdirSync(join(pkgDir, "skills", "wizard"), { recursive: true });
+		writeFileSync(
+			join(pkgDir, "package.json"),
+			JSON.stringify({ pi: { skills: ["./skills"] } }),
+		);
+		writeFileSync(
+			join(home, ".omp", "plugins", "omp-plugins.lock.json"),
+			JSON.stringify({
+				plugins: {
+					"@acme/cool": { version: "1", enabledFeatures: null, enabled: true },
+				},
+			}),
+		);
+		const ambientDataDir = process.env.OTTR_DATA_DIR;
+		process.env.OTTR_DATA_DIR = dataDir;
+		try {
+			const seen: (readonly string[])[] = [];
+			const launcher: RunLauncher = (_c, args) => {
+				seen.push(args);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const base = {
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+			};
+			const handle = startRun({ ...base, pluginSkillsHome: home });
+			await handle.done;
+			// The overlay rides as the --config pair after NO_DISCOVERY_CONFIG.
+			const overlay = seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
+			expect(seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 1]).toBe(
+				"--config",
+			);
+			expect(overlay).toBe(join(dataDir, "omp-plugin-skills.yml"));
+			expect(readFileSync(overlay, "utf8")).toBe(
+				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(join(pkgDir, "skills"))}\n`,
+			);
+			// The worktree cwd enters no path: no planted .omp dir is loaded.
+			expect(seen[0]!.join(" ")).not.toContain(join(dir, ".omp"));
+
+			// A home without plugins still carries the overlay: the project-skill
+			// pins ride on every run, only customDirectories stays empty.
+			const empty = join(dir, "empty-home");
+			mkdirSync(empty, { recursive: true });
+			seen.length = 0;
+			await startRun({ ...base, pluginSkillsHome: empty }).done;
+			const pinsOverlay = seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
+			expect(pinsOverlay).toBe(join(dataDir, "omp-plugin-skills.yml"));
+			expect(readFileSync(pinsOverlay, "utf8")).toBe(
+				"skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n",
+			);
+			expect(seen[0]!.filter((a) => a === "--config")).toEqual([
+				"--config",
+				"--config",
+				"--config",
+			]);
+			expect(seen[0]!.filter((a) => a.endsWith(".yml"))).toEqual([
+				NO_DISCOVERY_CONFIG,
+				join(dataDir, "omp-plugin-skills.yml"),
+				join(dataDir, "omp-memory.yml"),
+			]);
+		} finally {
+			if (ambientDataDir === undefined) delete process.env.OTTR_DATA_DIR;
+			else process.env.OTTR_DATA_DIR = ambientDataDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a local run settles with the provision drift its audit reports", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-provision-drift-"));
 		try {
@@ -2699,10 +2823,9 @@ describe("startRun", () => {
 				memoryConfigPath: overlay,
 			});
 			await handle.done;
-			const i = seen[0]!.indexOf(
-				"--config",
-				seen[0]!.indexOf(NO_DISCOVERY_CONFIG),
-			);
+			// The plugin-skills overlay rides between the hardening and memory overlays
+			// (docs/specs/turn-home-plugin-skills.md); locate the memory pair by path.
+			const i = seen[0]!.indexOf(overlay) - 1;
 			expect(seen[0]!.slice(i, i + 2)).toEqual(["--config", overlay]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
@@ -2735,10 +2858,9 @@ describe("startRun", () => {
 			});
 			await handle.done;
 			const overlay = join(dir, "omp-memory.yml");
-			const i = seen[0]!.indexOf(
-				"--config",
-				seen[0]!.indexOf(NO_DISCOVERY_CONFIG),
-			);
+			// The plugin-skills overlay rides between the hardening and memory overlays
+			// (docs/specs/turn-home-plugin-skills.md); locate the memory pair by path.
+			const i = seen[0]!.indexOf(overlay) - 1;
 			expect(seen[0]!.slice(i, i + 2)).toEqual(["--config", overlay]);
 			expect(readFileSync(overlay, "utf8")).toBe(
 				"memory:\n  backend: hindsight\n",

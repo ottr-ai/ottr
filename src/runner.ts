@@ -31,6 +31,7 @@ import {
 } from "./login.ts";
 import { ensureMemoryOverlay, memoryBackendFromEnv } from "./memory.ts";
 import { platform } from "./platform/index.ts";
+import { ensurePluginSkillsOverlay } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
 import type {
@@ -149,6 +150,8 @@ export function buildOmpArgs(o: {
 	maxTime?: string | null;
 	/** Memory backend overlay path; null/omitted omits the `--config` pair (tests pin exact argv without it). */
 	memoryConfig?: string | null;
+	/** Plugin-skills overlay path (docs/specs/turn-home-plugin-skills.md); null omits the pair (tests pin exact argv without it). Production runs always carry it: the home's plugin skill dirs plus the project-level skill enables pinned off. */
+	pluginSkillsConfig?: string | null;
 }): string[] {
 	return [
 		"-p",
@@ -181,6 +184,10 @@ export function buildOmpArgs(o: {
 		"--no-lsp",
 		"--config",
 		NO_DISCOVERY_CONFIG,
+		// The plugin-skills overlay (docs/specs/turn-home-plugin-skills.md): the run home's
+		// enabled plugins' SKILL.md dirs, no plugin code. Its key is unique to this overlay,
+		// so the per-key overlay order cannot clash; the memory overlay stays last.
+		...(o.pluginSkillsConfig ? ["--config", o.pluginSkillsConfig] : []),
 		// The memory overlay rides last among the configs: later overlays win per key, so the
 		// board's backend choice beats any stale `memory:` line in the extension's run.yml.
 		...(o.memoryConfig ? ["--config", o.memoryConfig] : []),
@@ -1550,6 +1557,9 @@ interface StartOptions {
 	maxTime?: string | null;
 	/** Memory overlay path; computed from the deployment env when omitted (null skips the overlay — tests only). */
 	memoryConfigPath?: string | null;
+	/** Test seam: the home the plugin-skills overlay reads (docs/specs/turn-home-plugin-skills.md);
+	 * unset derives the run's pinned home (layerEnv.HOME, else the flat layer home). */
+	pluginSkillsHome?: string;
 	/** Hosted mode only: capture token usage for metering (createRunSink). */
 	meter?: boolean;
 	/** Post-run guard (docs/specs/turn-provision-guard.md): audits the shared home's provisioned
@@ -1576,6 +1586,8 @@ interface RunStart {
 	sink: RunSink;
 	args: string[];
 	memoryConfig: string | null;
+	/** The plugin-skills overlay path; startRun always sets it (the project-skill pins ride on every run). */
+	pluginSkillsConfig: string | null;
 	startedAt: number;
 	/** Shared-state overrides a pinned run carries on top of its dispatch's base env. */
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null;
@@ -1584,6 +1596,23 @@ interface RunStart {
 	layerId: string | null;
 	unregisterLayer: () => void;
 	identityEnv: Record<string, string>;
+}
+
+/** The plugin-skills overlay for one run: the enabled plugins of the run's home
+ * (docs/specs/turn-home-plugin-skills.md). A VM run scopes the overlay dir to the
+ * project data dir, the only tree vm-runner copies in (resolveMemoryConfig). */
+function pluginSkillsConfigFor(
+	o: StartOptions,
+	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
+	layerHome: string,
+): string | null {
+	const home = o.pluginSkillsHome ?? layerEnv?.HOME ?? layerHome;
+	return ensurePluginSkillsOverlay(
+		o.vm
+			? { ...process.env, OTTR_DATA_DIR: dirname(o.sessionDir) }
+			: process.env,
+		home,
+	);
 }
 
 /** Context a no-stderr death reports (classify folds it into the failure reason): how the
@@ -1892,6 +1921,7 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 		sink,
 		args,
 		memoryConfig,
+		pluginSkillsConfig,
 		startedAt,
 		layerEnv,
 		identityEnv,
@@ -1934,7 +1964,7 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 	const workerHandle = runWorker(
 		{
 			id: runId,
-			argv: buildOmpArgs({ ...o, memoryConfig }),
+			argv: buildOmpArgs({ ...o, memoryConfig, pluginSkillsConfig }),
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env,
@@ -1994,20 +2024,28 @@ export function startRun(o: StartOptions): RunHandle {
 		onUsage: o.onUsage,
 		onRecorded: o.onRecorded,
 	});
-	const memoryConfig = resolveMemoryConfig(o);
-	const args = buildOmpArgs({ ...o, memoryConfig });
 	const startedAt = Date.now();
 	// Pin the agent layer once per call, before any spawn: the env carries the resolved layer
 	// directory, so a later atomic switch of `.alate/current` never touches a live run. Worker
 	// runs resolve the shared home (alate provisions it), the board's own runs the board home.
 	const layerHome = o.worker || o.vm ? homedir() : boardOmpHome();
 	const layerPin = resolveLayerPin(layerHome, sink);
+	const memoryConfig = resolveMemoryConfig(o);
+	// The plugin-skills overlay reads the run's pinned home, so a layer run gets its own
+	// layer's plugins (docs/specs/turn-home-plugin-skills.md).
+	const pluginSkillsConfig = pluginSkillsConfigFor(
+		o,
+		layerPin.layerEnv,
+		layerHome,
+	);
+	const args = buildOmpArgs({ ...o, memoryConfig, pluginSkillsConfig });
 	const identityEnv = resolveIdentityEnv(o, layerPin.layerEnv);
 	const s: RunStart = {
 		o,
 		sink,
 		args,
 		memoryConfig,
+		pluginSkillsConfig,
 		startedAt,
 		...layerPin,
 		identityEnv,
