@@ -7706,20 +7706,26 @@ button.log-mode[aria-pressed="true"] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-	*,
-	*::before,
-	*::after {
-		animation-duration: 0.01ms !important;
-		animation-iteration-count: 1 !important;
-		transition-duration: 0.01ms !important;
+	/* The overrides must beat the file's class-qualified animation and transition rules,
+	   up to dialog.drawer:not([open]) at specificity (0,2,1), and lint bans important
+	   declarations. A class-prefixed universal like html * tops out below (0,2,0), so
+	   each override carries a :not(#specificity-boost) clause instead: the reserved id
+	   matches no element in src/ui, and only its (1,0,0) specificity counts. */
+	*:not(#specificity-boost),
+	*:not(#specificity-boost)::before,
+	*:not(#specificity-boost)::after {
+		animation-duration: 0.01ms;
+		animation-iteration-count: 1;
+		transition-duration: 0.01ms;
 	}
 	/* Progress feedback stays legible: the spinner keeps turning. The values address the
 	   animations by position (spin first, a trailing wait-show second): the wait collapses
 	   to an instant fade whose delay still holds the element back, so reduced motion keeps
-	   both the turning and the nothing-under-a-second rule. */
-	.spinner {
-		animation-duration: 0.7s, 0.01ms !important;
-		animation-iteration-count: infinite, 1 !important;
+	   both the turning and the nothing-under-a-second rule. The clause lifts this rule to
+	   (1,1,0), where the important marker used to win the important-vs-important tie. */
+	.spinner:not(#specificity-boost) {
+		animation-duration: 0.7s, 0.01ms;
+		animation-iteration-count: infinite, 1;
 	}
 	.skeleton-bone {
 		animation: none; /* the shimmer collapses to a static fill */
