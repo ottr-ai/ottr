@@ -455,6 +455,8 @@ function mount(
 		>[0]["githubTokenExpiryTimeoutMs"];
 		/** OTTR-715 slow-request log ceiling; defaults to 500 inside createApp. */
 		slowApiMs?: Parameters<typeof createApp>[0]["slowApiMs"];
+		/** Live-run seam for the system sampler (OTTR-793); tests inject to force a sample failure. */
+		liveRuns?: Parameters<typeof createApp>[0]["liveRuns"];
 	} = {},
 ) {
 	const g =
@@ -513,6 +515,7 @@ function mount(
 		rerunFetch: input.rerunFetch,
 		githubTokenExpiryTimeoutMs: input.githubTokenExpiryTimeoutMs,
 		slowApiMs: input.slowApiMs,
+		liveRuns: input.liveRuns,
 		runnerTurns: input.runnerTurns,
 		runners: input.runners,
 		hosted: input.hosted,
@@ -16621,5 +16624,49 @@ describe("compressed serving (docs/specs/compressed-serving.md)", () => {
 		expect(res.headers.get("vary")).toBe("Accept-Encoding");
 		expect(res.headers.get("connection")).toBe("close");
 		await res.body?.cancel();
+	});
+});
+
+describe("failed system sampler logging (OTTR-793)", () => {
+	// The sample tick settles on the microtask queue once no worker fetch is in
+	// flight, so a short real wait is the only completion signal (no exposed one).
+	const settle = async (ms = 20): Promise<void> => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setTimeout(resolve, ms);
+		await promise;
+	};
+
+	test("a failed sample logs one line and the next tick still samples", async () => {
+		let broken = true;
+		const m = mount({
+			liveRuns: () => {
+				if (broken) throw new Error("stats walk failed");
+				return [];
+			},
+		});
+		const lines: string[] = [];
+		const origError = console.error;
+		console.error = (...parts: unknown[]) => lines.push(parts.join(" "));
+		try {
+			void m.app.sampleStats();
+			await settle();
+			expect(
+				lines.some(
+					(l) =>
+						l.includes("system sampler failed") &&
+						l.includes("stats walk failed"),
+				),
+			).toBe(true);
+			// The sampling flag reset: the next tick runs end to end, and its
+			// recovery line proves the sampler kept working after the failure.
+			broken = false;
+			void m.app.sampleStats();
+			await settle();
+			expect(lines.some((l) => l.includes("system sampler recovered"))).toBe(
+				true,
+			);
+		} finally {
+			console.error = origError;
+		}
 	});
 });

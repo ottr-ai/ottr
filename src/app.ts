@@ -282,6 +282,7 @@ import {
 import type { SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
 import { type BoardTurnFacts, ProjectStore } from "./store.ts";
+import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
 	createSystemSampler,
 	fetchWorkerStats,
@@ -5573,6 +5574,11 @@ export function createApp(deps: AppDeps) {
 	/** The last "system" frame, replayed to a socket on open so the view renders before the next tick. */
 	let lastSystemJson: string | null = null;
 	let sampling = false; // one 30 s system sample in flight (worker fetches can take seconds)
+	// OTTR-793: failed samples log to stderr, rate-limited in src/systemSampleLog.ts.
+	const sampleLog = createSystemSampleLog(
+		() => Date.now(),
+		(line) => console.error(line),
+	);
 	let refreshingBehind = false;
 
 	function publish(msg: ServerMessage): void {
@@ -5731,9 +5737,13 @@ export function createApp(deps: AppDeps) {
 				// Publish every sample: publish() no-ops with 0 sockets, and /api/system in
 				// polling mode builds a fresh snapshot.
 				publish(msg);
+				// Last, so a failed snapshot/publish counts as a failed tick (OTTR-793).
+				sampleLog.success();
 			})
-			.catch(() => {
-				// A failed sample skips one tick.
+			.catch((err) => {
+				// OTTR-793: a failed sample logs one rate-limited stderr line instead of
+				// dropping silently; it still skips one tick.
+				sampleLog.failure(err);
 			})
 			.finally(() => {
 				sampling = false;
