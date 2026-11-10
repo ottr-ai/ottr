@@ -909,6 +909,7 @@ describe("handoffMarkdown research report", () => {
 		holdWindow: null,
 		pendingBy: null,
 		pushRetries: 0,
+		findingsCheckedAt: null,
 	};
 
 	test("carries the full report markdown", () => {

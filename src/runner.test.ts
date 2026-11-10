@@ -44,7 +44,14 @@ import {
 	WORKER_LOST,
 	workerFromEnv,
 } from "./runner.ts";
-import type { GitFacts, Next, Outcome, RunResult, TurnKind } from "./types.ts";
+import type {
+	GitFacts,
+	Next,
+	Outcome,
+	RecordedFinding,
+	RunResult,
+	TurnKind,
+} from "./types.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
 	serveWorker,
@@ -2073,6 +2080,92 @@ describe("applyEvent", () => {
 		expect(s.recorded).toEqual([
 			{ prompt: "Good", model: null, rank: 3, security: null },
 		]);
+	});
+
+	test("createRunSink() fires onRecorded per propose_task finding, in order, before the run resolves", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-sink-"));
+		try {
+			const recorded: RecordedFinding[] = [];
+			const sink = createRunSink({
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				onRecorded: (finding) => recorded.push(finding),
+			});
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "p1",
+					args: { prompt: "First", model: "", rank: 1, security: "critical" },
+				}),
+			);
+			// An unrelated event line between findings must not change the order.
+			sink.line(
+				JSON.stringify({
+					type: "agent_end",
+					isTerminal: false,
+					messages: [
+						{ role: "assistant", content: [{ type: "text", text: "note" }] },
+					],
+				}),
+			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "p2",
+					args: { prompt: "Second", model: "m2", rank: 0, security: "low" },
+				}),
+			);
+			// An empty prompt and a missing prompt fire nothing.
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "p3",
+					args: { prompt: "" },
+				}),
+			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "p4",
+					args: { rank: 2 },
+				}),
+			);
+			sink.line(
+				JSON.stringify({
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "p5",
+					args: { prompt: "Third", rank: 1.5 },
+				}),
+			);
+			sink.line(
+				JSON.stringify({
+					type: "agent_end",
+					isTerminal: true,
+					messages: [
+						{ role: "assistant", content: [{ type: "text", text: "done" }] },
+					],
+				}),
+			);
+			const r = sink.result({
+				exitCode: 0,
+				killed: false,
+				stderrTail: sink.tail(),
+				dispatch: "local, argv 6, cwd d, pid 1, 2s",
+			});
+			expect(r.exitCode).toBe(0);
+			expect(recorded).toEqual([
+				{ prompt: "First", model: null, rank: 1, security: "critical" },
+				{ prompt: "Second", model: "m2", rank: null, security: null },
+				{ prompt: "Third", model: null, rank: null, security: null },
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("a. errored bash end with approval text flags approvalRefused even when not remembered", () => {

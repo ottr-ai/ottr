@@ -26,7 +26,7 @@ import {
 	shortTitle,
 	tasksDirFor,
 } from "./store.ts";
-import { answeredCard } from "./types.ts";
+import { answeredCard, type RecordedFinding } from "./types.ts";
 
 const root = mkdtempSync(join(tmpdir(), "store-model-"));
 const opened: ProjectStore[] = [];
@@ -4561,6 +4561,146 @@ describe("turn log offset", () => {
 			null,
 			42,
 		]);
+		store.close();
+	});
+});
+
+describe("review findings storage", () => {
+	// A database from before review findings existed: the current tasks DDL
+	// minus the migrated findings_checked_at column, and no review_findings table.
+	const PRE_FINDINGS_TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
+		id TEXT PRIMARY KEY,
+		title TEXT,
+		prompt TEXT,
+		stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done','backlog')),
+		state TEXT NOT NULL CHECK (state IN ('queued','preparing','running','needs_you','idle')),
+		needs_reason TEXT,
+		pending_prompt TEXT,
+		branch TEXT,
+		base TEXT,
+		worktree TEXT,
+		session_id TEXT,
+		summary TEXT,
+		details TEXT,
+		report TEXT,
+		research INTEGER NOT NULL DEFAULT 0,
+		research_steps TEXT NOT NULL DEFAULT 'unknown',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		queued_at INTEGER,
+		cancelled_at INTEGER,
+		images TEXT NOT NULL DEFAULT '[]',
+		pending_images TEXT NOT NULL DEFAULT '[]',
+		shots TEXT NOT NULL DEFAULT '[]',
+		release_version TEXT,
+		release_notes TEXT,
+		session_title TEXT,
+		asked TEXT,
+		model TEXT,
+		kept_files TEXT NOT NULL DEFAULT '[]',
+		follow_up_of TEXT,
+		push_sha TEXT,
+		update_ids TEXT NOT NULL DEFAULT '[]',
+		update_merge_approved INTEGER NOT NULL DEFAULT 0
+	)`;
+
+	const finding = (prompt: string): RecordedFinding => ({
+		prompt,
+		model: "zai/glm-5.3-flash",
+		rank: 2,
+		security: null,
+	});
+
+	test("open converges an old-schema database: rows survive, review_findings exists, findingsCheckedAt is null", () => {
+		const dir = join(root, "review-findings-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(PRE_FINDINGS_TASKS_DDL);
+		db.exec(
+			"INSERT INTO tasks (id, title, stage, state, created_at, updated_at) VALUES ('seed1', 'seeded review', 'in_progress', 'running', 1, 1)",
+		);
+		db.close();
+
+		const store = open(dir);
+		// The seeded row survives the migration.
+		expect(store.getTask("seed1")?.title).toBe("seeded review");
+		expect(store.getTask("seed1")?.state).toBe("running");
+		// The migrated column exists and maps to a null stamp.
+		expect(store.getTask("seed1")?.findingsCheckedAt).toBeNull();
+		// The new table accepts rows.
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.exec(
+			"INSERT INTO review_findings (card_id, prompt, model, rank, security, created_at) VALUES ('seed1', 'Needs validation: suspicious retry loop', 'zai/glm-5.3-flash', 3, NULL, 1)",
+		);
+		expect(
+			raw
+				.query<{ n: number }, []>(
+					"SELECT COUNT(*) AS n FROM review_findings WHERE card_id = 'seed1'",
+				)
+				.get()?.n,
+		).toBe(1);
+		raw.close();
+	});
+
+	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", () => {
+		const dir = join(root, "review-findings-roundtrip");
+		const store = open(dir);
+		const card = store.createTask("review card");
+		store.updateTask(card.id, { stage: "in_progress" });
+
+		const first = finding("Needs validation: flaky session replay");
+		const second = finding("Unchecked error path in applyEvent");
+		expect(store.appendReviewFinding(card.id, first)).toBe(true);
+		expect(store.appendReviewFinding(card.id, second)).toBe(true);
+
+		expect(store.listReviewFindings(card.id)).toEqual([first, second]);
+		// Another card sees none of them.
+		const other = store.createTask("other card");
+		expect(store.listReviewFindings(other.id)).toEqual([]);
+		store.close();
+	});
+
+	test("a duplicate prompt stores once, returns false, and does not reset a set findingsCheckedAt", () => {
+		const dir = join(root, "review-findings-duplicate");
+		const store = open(dir);
+		const card = store.createTask("review card");
+		store.updateTask(card.id, { stage: "in_progress" });
+
+		const findingText = "Needs validation: retry swallows errors";
+		expect(store.appendReviewFinding(card.id, finding(findingText))).toBe(true);
+		store.updateTask(card.id, { findingsCheckedAt: Date.now() });
+		expect(store.getTask(card.id)?.findingsCheckedAt).not.toBeNull();
+
+		// The duplicate is rejected and leaves the stamp alone.
+		expect(store.appendReviewFinding(card.id, finding(findingText))).toBe(
+			false,
+		);
+		expect(store.listReviewFindings(card.id)).toHaveLength(1);
+		expect(store.getTask(card.id)?.findingsCheckedAt).not.toBeNull();
+		store.close();
+	});
+
+	test("a new finding resets a set findingsCheckedAt to null", () => {
+		const dir = join(root, "review-findings-stamp-reset");
+		const store = open(dir);
+		const card = store.createTask("review card");
+		store.updateTask(card.id, { stage: "in_progress" });
+
+		store.appendReviewFinding(
+			card.id,
+			finding("Needs validation: lost report"),
+		);
+		store.updateTask(card.id, { findingsCheckedAt: Date.now() });
+		expect(store.getTask(card.id)?.findingsCheckedAt).not.toBeNull();
+
+		expect(
+			store.appendReviewFinding(
+				card.id,
+				finding("Confirmed: unbounded workpool queue"),
+			),
+		).toBe(true);
+		expect(store.getTask(card.id)?.findingsCheckedAt).toBeNull();
 		store.close();
 	});
 });

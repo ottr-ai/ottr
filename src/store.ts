@@ -47,6 +47,7 @@ import type {
 	ProposalSummary,
 	PrReviewRow,
 	PrState,
+	RecordedFinding,
 	RunState,
 	Stage,
 	Task,
@@ -243,6 +244,16 @@ CREATE TABLE IF NOT EXISTS issue_watch (
   filed_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_issue_watch_filed_at ON issue_watch (filed_at);
+CREATE TABLE IF NOT EXISTS review_findings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  model TEXT,
+  rank INTEGER,
+  security TEXT,
+  created_at INTEGER NOT NULL,
+  UNIQUE(card_id, prompt)
+);
 -- Retired and unused: review conventions live in the project's AGENTS.md.
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -321,6 +332,7 @@ interface TaskRow {
 	hold_provider: string | null;
 	hold_window: string | null;
 	proposal_summary: string | null;
+	findings_checked_at: number | null;
 	kind: string;
 }
 
@@ -540,6 +552,7 @@ function toListedTask(
 		holdProvider: r.hold_provider,
 		holdWindow: r.hold_window,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
+		findingsCheckedAt: r.findings_checked_at,
 	};
 }
 
@@ -802,6 +815,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	holdProvider: "hold_provider",
 	holdWindow: "hold_window",
 	proposalSummary: "proposal_summary",
+	findingsCheckedAt: "findings_checked_at",
 };
 
 // listTasks reads every column but the raw diff (up to 200 KB per card): the board, the
@@ -2022,6 +2036,14 @@ export class ProjectStore {
 			cols,
 			"proposal_summary",
 			"ALTER TABLE tasks ADD COLUMN proposal_summary TEXT",
+		);
+		// OTTR-769: the review-check stamp over the card's stored findings. ALTER-only after
+		// every rebuild, like the columns above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"findings_checked_at",
+			"ALTER TABLE tasks ADD COLUMN findings_checked_at INTEGER",
 		);
 		ProjectStore.convergeProposalReasons(db);
 		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
@@ -3556,6 +3578,55 @@ export class ProjectStore {
 				cost: t.cost,
 			})),
 		};
+	}
+
+	/** Stores one arrived review finding; returns true when it was new (not a duplicate of a
+	 * stored prompt). A new finding clears the card's findingsCheckedAt in the same
+	 * transaction, so the next landing re-runs the review check. */
+	appendReviewFinding(cardId: string, finding: RecordedFinding): boolean {
+		const inserted = this.db.transaction(() => {
+			const result = this.db.run(
+				"INSERT OR IGNORE INTO review_findings (card_id, prompt, model, rank, security, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+				[
+					cardId,
+					finding.prompt,
+					finding.model,
+					finding.rank,
+					finding.security,
+					Date.now(),
+				],
+			);
+			if (result.changes === 0) return false;
+			this.db.run(
+				"UPDATE tasks SET findings_checked_at = NULL WHERE id = ? AND findings_checked_at IS NOT NULL",
+				[cardId],
+			);
+			return true;
+		});
+		return inserted();
+	}
+
+	/** The card's stored review findings in arrival order. */
+	listReviewFindings(cardId: string): RecordedFinding[] {
+		return this.db
+			.query<
+				{
+					prompt: string;
+					model: string | null;
+					rank: number | null;
+					security: string | null;
+				},
+				[string]
+			>(
+				"SELECT prompt, model, rank, security FROM review_findings WHERE card_id = ? ORDER BY id",
+			)
+			.all(cardId)
+			.map((r) => ({
+				prompt: r.prompt,
+				model: r.model,
+				rank: r.rank,
+				security: (r.security as RecordedFinding["security"]) ?? null,
+			}));
 	}
 
 	close(): void {

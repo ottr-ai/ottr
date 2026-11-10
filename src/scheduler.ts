@@ -156,13 +156,16 @@ export function reviewFindings<T extends ReviewTask>(
 	return found;
 }
 
-/** True while a finding of `review` is not done; a cancelled finding counts as done. */
+/** True while a finding of `review` is not done; a cancelled finding counts as done.
+ * A child in `backlog` stage (an unverified lead filed without a check verdict) is
+ * optional work, not a commitment, so it never holds the review's Done. */
 function findingsOpen(
 	tasks: readonly ReviewTask[],
 	review: Pick<Task, "id" | "doneAt">,
 ): boolean {
 	return reviewFindings(tasks, review).some(
-		(f) => f.cancelledAt === null && f.stage !== "done",
+		(f) =>
+			f.cancelledAt === null && f.stage !== "done" && f.stage !== "backlog",
 	);
 }
 
@@ -239,6 +242,11 @@ export function mergeHold(
  * only once the findings it filed are done, and a release publishes only then. */
 export const FINDINGS_HOLD =
 	"waiting for the review's findings to be implemented";
+
+/** Why a review card parks while its stored findings were never run through the
+ * second-model check: the findings exist on the card but no check stamp covers them. */
+export const UNCHECKED_FINDINGS_HOLD =
+	"waiting for the review's stored findings to be checked";
 
 export function findingsHold(
 	tasks: readonly ReviewTask[],

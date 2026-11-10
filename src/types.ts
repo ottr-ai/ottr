@@ -484,6 +484,9 @@ export interface Task {
 	priority: Priority | null;
 	/** Close-candidate nomination: the reason this card is a duplicate, superseded, or drifted; null = not nominated. */
 	closeCandidate: string | null;
+	/** The review-check stamp over the card's stored review findings (findingsCheckedAt in the
+	 * store): set when a check pass completes over them, cleared when a new finding arrives. */
+	findingsCheckedAt: number | null;
 }
 
 /** A task from a list read (ProjectStore.listTasks): every field but the raw diff, which only

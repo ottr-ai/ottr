@@ -49,6 +49,7 @@ import {
 	liveCard,
 	PROMPT_EDIT_HELD,
 	pickRunnable,
+	UNCHECKED_FINDINGS_HOLD,
 } from "./scheduler.ts";
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
@@ -20970,5 +20971,249 @@ describe("turn checkout guard (other projects)", () => {
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
 		expect(loop.checkoutNotices()).toHaveLength(0);
+	});
+});
+
+describe("stored review findings", () => {
+	type StartOpts = Parameters<TurnOps["startRun"]>[0];
+	const mkFinding = (
+		prompt: string,
+		rank: number | null = null,
+		security: "critical" | "high" | null = null,
+	): RecordedFinding => ({ prompt, model: null, rank, security });
+	const reviewCard = (store: ProjectStore) => {
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, { base: "shaR" });
+		return review;
+	};
+	const kidsOf = (store: ProjectStore, id: string) =>
+		store.listTasks().filter((t) => t.followUpOf === id);
+	const verdicts = (...v: [number, boolean, string][]) =>
+		runResult({
+			finalText: JSON.stringify(
+				v.map(([id, keep, reason]) => ({ id, keep, reason })),
+			),
+		});
+	const checkInput = (prompt: string) =>
+		JSON.parse(
+			prompt
+				.split("Findings:\n")[1]!
+				.split("\n\nOpen cards of the project:")[0]!,
+		) as { id: number; prompt: string }[];
+
+	/** A review run that delivers findings through the spec's onRecorded callback as they
+	 * arrive, then serves `result` (or rejects when `fail` is set). Later runs are checks
+	 * served from `checks` in order and captured in `checkRuns`. */
+	function storedReviewSetup(
+		record: Recorded,
+		findings: RecordedFinding[],
+		result: RunResult | { fail: Error },
+		checks: RunResult[],
+		overrides: Partial<TurnOps> = {},
+	) {
+		const checkRuns: StartOpts[] = [];
+		const s = setupWith(record, {
+			commitsAhead: async () => 0,
+			maxTotalRuns: () => 0,
+			startRun: (o: StartOpts) => {
+				let done: Promise<RunResult>;
+				if (o.maxTime) {
+					// The second-model check over the stored set: a fresh capped session.
+					checkRuns.push(o);
+					done = Promise.resolve(
+						checks.shift() ?? runResult({ finalText: "[]" }),
+					);
+				} else {
+					record.runs.push(o);
+					o.onSession?.("sess");
+					// The run "parses" each propose_task as it arrives, before settling.
+					for (const f of findings) o.onRecorded?.(f);
+					done =
+						record.runs.length === 1
+							? "fail" in result
+								? Promise.reject(result.fail)
+								: Promise.resolve(result)
+							: Promise.resolve(
+									runResult({
+										outcome: { status: "answered", summary: "reply" },
+									}),
+								);
+				}
+				return { pid: 4242, done, kill: async () => {} };
+			},
+			...overrides,
+		});
+		return { ...s, checkRuns };
+	}
+
+	test("findings persist through a never-settling run and a later answered turn checks and files them", async () => {
+		const record = baseRecord();
+		const { store, loop, checkRuns } = storedReviewSetup(
+			record,
+			[mkFinding("Bug A", 1), mkFinding("Bug B", 2)],
+			{ fail: new Error("worker dispatch failed") },
+			// The check over the STORED set keeps both, even though turn 2's own
+			// run reported nothing recorded.
+			[verdicts([1, true, ""], [2, true, ""])],
+		);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		// Turn 1 never settled, yet both findings are on the card in arrival order.
+		expect(store.listReviewFindings(review.id).map((f) => f.prompt)).toEqual([
+			"Bug A",
+			"Bug B",
+		]);
+
+		// Turn 2: a reply on the same card; its run records nothing and answers.
+		store.updateTask(review.id, { state: "queued" });
+		await loop.runTurn(store.name, review.id);
+
+		// The check ran as a fresh session over the stored set and filed both findings.
+		// record.runs holds review runs only; the check run is checkRuns[0].
+		expect(record.runs).toHaveLength(2);
+		expect(checkInput(checkRuns[0]!.prompt).map((f) => f.prompt)).toEqual([
+			"Bug A",
+			"Bug B",
+		]);
+		const kids = kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt).sort()).toEqual(["Bug A", "Bug B"]);
+		expect(kids.every((k) => k.stage === "todo")).toBe(true);
+		// The card waits at merging for its findings, not done.
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(FINDINGS_HOLD);
+	});
+
+	test("done is refused while stored findings are unchecked; the stamp lets a done settle through", async () => {
+		const record = baseRecord();
+		const { store, loop, projects, checkRuns } = storedReviewSetup(
+			record,
+			[mkFinding("Bug A", 1), mkFinding("Bug B", 2)],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			// The in-settle check keeps both; their cards hold the review at merging.
+			[verdicts([1, true, ""], [2, true, ""])],
+			// A null run cap so schedule()'s tick reaches settleReviews (a 0 cap
+			// makes every tick return the cap bit before the settle).
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		store.appendReviewFinding(review.id, mkFinding("Bug A", 1));
+		store.appendReviewFinding(review.id, mkFinding("Bug B", 2));
+		await loop.runTurn(store.name, review.id);
+
+		// The done-classified settle parked instead: the stored set was unchecked,
+		// so the check ran in the same settle and its kept cards hold the review.
+		let after = store.getTask(review.id)!;
+		expect(after.stage).not.toBe("done");
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(FINDINGS_HOLD);
+		expect(checkRuns).toHaveLength(1);
+		const kids = kidsOf(store, review.id);
+		expect(kids).toHaveLength(2);
+
+		// Second half: the scheduled settle finishes the held review once the stamp
+		// is in and the filed cards are done; no agent run, no re-check.
+		for (const k of kids)
+			store.updateTask(k.id, { stage: "done", state: "idle" });
+		projects.get(store.name)!.target = "origin/main";
+		loop.schedule();
+		await flushPromises();
+		after = store.getTask(review.id)!;
+		expect(record.runs).toHaveLength(1); // the tick runs no agent
+		expect(checkRuns).toHaveLength(1);
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+
+		// A finding that arrives after the check re-opens the refusal: park the card
+		// back in the held shape (the needsReason is the tick's held marker), append,
+		// and the tick refuses done until stamped.
+		store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+		});
+		store.appendReviewFinding(review.id, mkFinding("Bug C", 3));
+		loop.schedule();
+		await flushPromises();
+		after = store.getTask(review.id)!;
+		expect(after.stage).not.toBe("done");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(UNCHECKED_FINDINGS_HOLD);
+		expect(checkRuns).toHaveLength(1);
+	});
+
+	test("lead findings file as unverified backlog cards and never enter the check or the cap", async () => {
+		const record = baseRecord();
+		const confirmed = Array.from({ length: 12 }, (_, i) =>
+			mkFinding(`Bug ${i + 1}`, i + 1),
+		);
+		const leads = [
+			mkFinding("Needs validation: maybe a race in the scheduler"),
+			mkFinding("Needs validation: config load may double-read"),
+			mkFinding("Needs validation: flaky retry on push"),
+		];
+		const { store, loop, checkRuns } = storedReviewSetup(
+			record,
+			[...confirmed, ...leads],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			// The check sees only the cap-10 confirmed selection and drops every one.
+			[
+				verdicts(
+					...Array.from(
+						{ length: 10 },
+						(_, i) => [i + 1, false, "not real"] as [number, boolean, string],
+					),
+				),
+			],
+		);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		// The check input holds exactly the cap-10 confirmed selection: no leads,
+		// no below-cap ranks.
+		expect(checkRuns).toHaveLength(1);
+		const input = checkInput(checkRuns[0]!.prompt);
+		expect(input.map((f) => f.prompt)).toEqual(
+			Array.from({ length: 10 }, (_, i) => `Bug ${i + 1}`),
+		);
+
+		// Each lead filed as a backlog card marked unverified, linked to the review.
+		const kids = kidsOf(store, review.id);
+		const leadKids = kids.filter((k) =>
+			k.prompt.startsWith("Needs validation:"),
+		);
+		expect(leadKids).toHaveLength(3);
+		for (const k of leadKids) {
+			expect(k.stage).toBe("backlog");
+			expect(k.state).toBe("idle");
+			expect(k.queuedAt).toBeNull();
+			expect(k.followUpOf).toBe(review.id);
+			expect(k.details).toContain("Unverified lead from review");
+		}
+
+		// Below-cap confirmed findings stay logged, never filed.
+		const filed = kids.map((k) => k.prompt);
+		expect(filed).not.toContain("Bug 11");
+		expect(filed).not.toContain("Bug 12");
+		const after = store.getTask(review.id)!;
+		expect(after.details).toContain("below the cap of 10: Bug 11");
+		expect(after.details).toContain("below the cap of 10: Bug 12");
+
+		// The check dropped all 10 confirmed findings and leads never hold Done:
+		// the review is not held by its open backlog lead cards.
+		expect(after.stage).toBe("done");
+		expect(after.needsReason).not.toBe(FINDINGS_HOLD);
 	});
 });

@@ -99,6 +99,7 @@ import {
 	pickRunnable,
 	reviewFindings,
 	selectFindings,
+	UNCHECKED_FINDINGS_HOLD,
 	WORK_CHECK_ASK_BLOCK,
 	workCheckAsk,
 } from "./scheduler.ts";
@@ -2777,6 +2778,20 @@ export function createTurnLoop(
 		target: string,
 		cancelled: () => boolean,
 	): Promise<void> {
+		// Stored findings the review check never covered refuse the done write.
+		const cur = e.store.getTask(t.id);
+		if (
+			cur !== null &&
+			e.store.listReviewFindings(t.id).length > 0 &&
+			cur.findingsCheckedAt === null
+		) {
+			e.store.updateTask(t.id, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: UNCHECKED_FINDINGS_HOLD,
+			});
+			return;
+		}
 		// A release publishes from its worktree.
 		if (t.worktree === null) return;
 		const err = await publishReleaseCard(
@@ -2825,6 +2840,21 @@ export function createTurnLoop(
 		cancelled: () => boolean,
 	): Promise<void> {
 		if (findingsHold(e.store.listTasks(), t) !== null) return;
+		// Stored findings the review check never covered refuse the done write: park for
+		// a human; a reply resumes the review and the next settle runs the check.
+		const cur = e.store.getTask(t.id);
+		if (
+			cur !== null &&
+			e.store.listReviewFindings(t.id).length > 0 &&
+			cur.findingsCheckedAt === null
+		) {
+			e.store.updateTask(t.id, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: UNCHECKED_FINDINGS_HOLD,
+			});
+			return;
+		}
 		if (t.releaseVersion === null) {
 			// The Review button's card has nothing to publish.
 			const commits = await ops.targetCommits(e.path, target);
@@ -4556,6 +4586,13 @@ export function createTurnLoop(
 			onLog: () => ops.notifyLog(name, id),
 			onProgress: (text) => dispatchProgressEntry(mx, ops, text),
 			onSession: (sid) => dispatchSessionEntry(store, id, kind, sid),
+			// A review run stores each finding the moment the runner parses it (the
+			// spec's arrival persistence); other cards store nothing.
+			...(idn.reviewCard && {
+				onRecorded: (finding: RecordedFinding) => {
+					store.appendReviewFinding(id, finding);
+				},
+			}),
 		};
 	}
 
@@ -5021,6 +5058,10 @@ export function createTurnLoop(
 	 * server-only secret (OTTR-233). */
 	function readRunReport(st: TurnSettle, result0: RunResult): void {
 		const report = readReportFile(st);
+		// First capture wins: persist the report the moment it is read, so any settle that
+		// can read the file keeps its text even when the turn parks before the card write.
+		if (report.text !== null && st.task.report === null)
+			st.store.updateTask(st.id, { report: report.text });
 		const autoResearch =
 			!st.idn.releaseCard && !st.task.research && report.text !== null;
 		if (autoResearch) st.store.updateTask(st.id, { research: true });
@@ -6637,14 +6678,28 @@ export function createTurnLoop(
 	}
 
 	/** A review card classified done: findings recorded this run hold the card at merging/idle
-	 * with FINDINGS_HOLD; the check below files the kept ones while the card is still
+	 * with FINDINGS_HOLD; stored findings the check never covered hold it with
+	 * UNCHECKED_FINDINGS_HOLD. The check below files the kept ones while the card is still
 	 * in_progress/running, and only then is the parked state stored: settleReviews never sees
 	 * a parked card whose findings are missing. */
 	async function parkReviewDone(st: TurnSettle, next: Next): Promise<Next> {
+		// Stored findings that have no card yet will be checked this settle (planTurnChecks
+		// selects them); if that check never completes, the parked hold keeps them visible.
+		const stored = st.store.listReviewFindings(st.id);
 		const hold =
-			st.result.recorded.length > 0
-				? FINDINGS_HOLD
-				: findingsHold(st.store.listTasks(), st.task);
+			!st.idn.releaseCard &&
+			st.task.findingsCheckedAt === null &&
+			stored.length > 0 &&
+			stored.some(
+				(f) =>
+					!st.store
+						.listTasks()
+						.some((x) => x.followUpOf === st.id && x.prompt === f.prompt),
+			)
+				? UNCHECKED_FINDINGS_HOLD
+				: st.result.recorded.length > 0
+					? FINDINGS_HOLD
+					: findingsHold(st.store.listTasks(), st.task);
 		if (hold !== null)
 			return { stage: "merging", state: "idle", needsReason: hold };
 		if (st.idn.releaseCard && st.task.releaseVersion !== null) {
@@ -7066,14 +7121,28 @@ export function createTurnLoop(
 		st.workCard = isWorkCard(st);
 		st.reviewFindings =
 			st.idn.reviewCard &&
-			st.result.recorded.length > 0 &&
+			st.task.findingsCheckedAt === null &&
 			(next.stage === "merging" || next.state === "needs_you")
-				? st.result.recorded.filter((f) => {
-						const linked = st.store
-							.listTasks()
-							.some((x) => x.followUpOf === st.id && x.prompt === f.prompt);
-						return !linked;
-					})
+				? // The union of the card's stored findings (arrival persistence) and this
+					// run's recorded ones, deduped by prompt with the stored entries first;
+					// the stored set alone is the source in production, the union keeps
+					// run-result delivery working.
+					(() => {
+						const stored = st.store.listReviewFindings(st.id);
+						const seen = new Set(stored.map((f) => f.prompt));
+						const all = [...stored];
+						for (const f of st.result.recorded)
+							if (!seen.has(f.prompt)) {
+								seen.add(f.prompt);
+								all.push(f);
+							}
+						return all.filter((f) => {
+							const linked = st.store
+								.listTasks()
+								.some((x) => x.followUpOf === st.id && x.prompt === f.prompt);
+							return !linked;
+						});
+					})()
 				: [];
 		st.checkWillRun =
 			st.reviewFindings.length > 0 || (st.workCard && next.stage === "merging");
@@ -7152,7 +7221,9 @@ export function createTurnLoop(
 			...settledCardText(st, next),
 			commits: st.commits,
 			mergeHead: st.mergeHead,
-			report: st.report,
+			// A research card's write is exact (null clears a report the card cleared
+			// itself); any other settle that harvested nothing keeps the stored text.
+			report: st.research ? st.report : (st.report ?? undefined),
 			steps: st.steps,
 			keptFiles: st.keptFiles,
 			// Every settle rewrites it: only a hold this settle parked keeps a head to
@@ -7254,9 +7325,17 @@ export function createTurnLoop(
 	async function runReviewCheck(st: TurnSettle): Promise<boolean> {
 		if (st.reviewFindings.length === 0) return false;
 		const checkOn = ops.reviewCheck?.() ?? true;
-		const selected = selectFindings(st.reviewFindings);
+		// Leads (the prompt's "Needs validation" tag) never enter the selection or the cap:
+		// they file as unverified backlog cards without a second-model opinion.
+		const confirmed = st.reviewFindings.filter(
+			(f) => !f.prompt.startsWith("Needs validation"),
+		);
+		const leads = st.reviewFindings.filter((f) =>
+			f.prompt.startsWith("Needs validation"),
+		);
+		const selected = selectFindings(confirmed);
 		const selectedSet = new Set(selected);
-		const belowCap = st.reviewFindings.filter((f) => !selectedSet.has(f));
+		const belowCap = confirmed.filter((f) => !selectedSet.has(f));
 		let kept: { id: number; finding: RecordedFinding }[] = selected.map(
 			(finding, i) => ({ id: i + 1, finding }),
 		);
@@ -7289,12 +7368,17 @@ export function createTurnLoop(
 			kept,
 			dropped,
 			belowCap,
+			leads,
 			checkOn,
 			checkMs,
 			checkFailed,
 			checkModel,
 			checkWarn,
 		});
+		// Only a completed pass (check on or off, trail written) stamps the set: a failed
+		// or stopped attempt leaves the findings unchecked for the next landing.
+		if (checkFailed === null)
+			st.store.updateTask(st.id, { findingsCheckedAt: Date.now() });
 		return false;
 	}
 
@@ -7594,6 +7678,7 @@ export function createTurnLoop(
 			kept: { id: number; finding: RecordedFinding }[];
 			dropped: { id: number; finding: RecordedFinding; reason: string }[];
 			belowCap: RecordedFinding[];
+			leads: RecordedFinding[];
 			checkOn: boolean;
 			checkMs: number;
 			checkFailed: string | null;
@@ -7612,6 +7697,24 @@ export function createTurnLoop(
 					model: k.finding.model,
 				});
 				filed.push(child.id);
+			}
+		// Leads file with or without a check verdict: they are unverified by definition
+		// (the second-model check never ran on them), so they hold no cap slot.
+		if (live !== null && live.cancelledAt === null)
+			for (const lead of args.leads) {
+				const child = st.store.createTask(lead.prompt);
+				st.store.updateTask(child.id, {
+					followUpOf: st.id,
+					model: lead.model,
+					stage: "backlog",
+					state: "idle",
+					queuedAt: null,
+					details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).`,
+				});
+				filed.push(child.id);
+				st.log(
+					`- filed lead as backlog card #${child.id} (unverified): ${findingHead(lead)}`,
+				);
 			}
 		st.log(
 			`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${

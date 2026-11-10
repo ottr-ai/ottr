@@ -35,6 +35,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		summary: null,
 		details: null,
 		report: null,
+		findingsCheckedAt: null,
 		research: false,
 		steps: "unknown",
 		starred: false,

@@ -1208,6 +1208,8 @@ function handleEventLine(
 		meter?: boolean;
 		/** Hosted mode only (needs `meter`): interim usage of the active run. */
 		onUsage?: (usage: TokenUsage, model: string | null) => void;
+		/** Fired once per newly parsed propose_task finding, in arrival order. */
+		onRecorded?: (finding: RecordedFinding) => void;
 	},
 	es: EventState,
 	log: { write(text: string): void },
@@ -1228,8 +1230,11 @@ function handleEventLine(
 	}
 	log.write(renderEvent(ev));
 	const before = es.usage;
+	const recordedBefore = es.recorded.length;
 	const { sessionStarted } = applyEvent(es, ev, o.meter === true);
 	if (sessionStarted !== undefined) o.onSession?.(sessionStarted);
+	for (let i = recordedBefore; i < es.recorded.length; i++)
+		o.onRecorded?.(es.recorded[i]!);
 	if (es.usage !== null && !sameUsage(before, es.usage))
 		o.onUsage?.({ ...es.usage }, es.model);
 }
@@ -1249,6 +1254,8 @@ export function createRunSink(o: {
 	/** Hosted mode only (needs `meter`): the run's cumulative usage and model after each assistant
 	 * message_end that changed the usage; turn.ts sends the interim metering records from it. */
 	onUsage?: (usage: TokenUsage, model: string | null) => void;
+	/** Fired once per newly parsed propose_task finding, in arrival order, before the run resolves. */
+	onRecorded?: (finding: RecordedFinding) => void;
 }): RunSink {
 	const es = newEventState();
 	let stderrTail = "";
@@ -1558,6 +1565,9 @@ interface StartOptions {
 	rulesAtStart?: () => readonly string[];
 	/** Hosted mode only: interim usage of the active run (createRunSink). */
 	onUsage?: (usage: TokenUsage, model: string | null) => void;
+	/** Fired once per newly parsed propose_task finding (createRunSink); a review card's
+	 * main run stores each finding at parse time. */
+	onRecorded?: (finding: RecordedFinding) => void;
 }
 
 /** Shared state the local, worker and microVM dispatch paths read. */
@@ -1982,6 +1992,7 @@ export function startRun(o: StartOptions): RunHandle {
 		secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
 		meter: o.meter,
 		onUsage: o.onUsage,
+		onRecorded: o.onRecorded,
 	});
 	const memoryConfig = resolveMemoryConfig(o);
 	const args = buildOmpArgs({ ...o, memoryConfig });
