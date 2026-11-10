@@ -4679,6 +4679,7 @@ export function createTurnLoop(
 			mx,
 			handle,
 			header,
+			runStartedAt,
 		);
 		return { handle, runMeter, runStartedAt, turn };
 	}
@@ -4773,6 +4774,7 @@ export function createTurnLoop(
 		mx: TurnRunShared,
 		handle: TurnRunHandle,
 		header: TurnHeader,
+		runStartedAt: number,
 	): Turn {
 		const turnInput =
 			input.pending &&
@@ -4799,6 +4801,10 @@ export function createTurnLoop(
 			handle.layerId ?? null,
 			// The card-log byte offset captured with the header write; the drawer fetches the turn's section from it.
 			header.turnLogOffset,
+			// The row's window starts at the dispatch start: the guard attributes a change to
+			// every turn whose true run window holds it, and startRun's caller may commit
+			// before this row is written (OTTR-772).
+			runStartedAt,
 		);
 		mx.turn = turn;
 		return turn;

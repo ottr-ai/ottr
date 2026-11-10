@@ -20501,7 +20501,15 @@ describe("turn checkout guard (other projects)", () => {
 				const done = (async () => {
 					if (second) {
 						bothIn.resolve();
-						change(Date.now());
+						// OTTR-772: the commit time predates the row write by a few
+						// milliseconds, the race CI lost: startTurn wrote the row after
+						// startRun returned, so its Date.now() could land past the commit
+						// time the guard was attributing, and the guard blamed the wrong
+						// turn. The row's started_at is the dispatch start, so the window
+						// holds the commit regardless of the write lag.
+						const at = Date.now();
+						Bun.sleepSync(3);
+						change(at);
 						changed.resolve();
 					} else {
 						await changed.promise;

@@ -3134,11 +3134,26 @@ export class ProjectStore {
 		inputBy: "user" | "supervisor" | null = null,
 		layer: string | null = null,
 		logOffset: number | null = null,
+		// The run's dispatch start, not the row-write time: the row is written after
+		// startRun returns, so the write time can lag the true window start past a commit
+		// that landed during startRun — the checkout guard's attribution would then
+		// exclude the very turn that made the change (OTTR-772).
+		startedAt: number = Date.now(),
 	): Turn {
-		const now = Date.now();
 		const { lastInsertRowid } = this.db.run(
 			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model, layer, log_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			[taskId, kind, prompt, input, inputBy, now, pid, model, layer, logOffset],
+			[
+				taskId,
+				kind,
+				prompt,
+				input,
+				inputBy,
+				startedAt,
+				pid,
+				model,
+				layer,
+				logOffset,
+			],
 		);
 		// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
 		const row = this.db
