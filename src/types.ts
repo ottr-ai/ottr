@@ -1154,6 +1154,13 @@ export interface StateResponse {
 	 *  update); null when nothing waits, the server already runs the image commit, or the
 	 *  wait is younger than the notice threshold. */
 	restartWait: RestartWaitView | null;
+	/** Advisory: the hourly board seed of the agent layer failed (the update script's
+	 *  record next to the board home); null when no record exists, the seed succeeded,
+	 *  or the record fails to sanitize. */
+	seedFailed: SeedFailedView | null;
+	/** Advisory: the last failed alate provision attempt (the U9 trigger or the manual
+	 *  button); null after a success, or when alate reports no pending import. */
+	alateProvisionError: string | null;
 }
 
 /** A deferred server restart the board surfaces after the notice threshold (OTTR-625). */
@@ -1172,6 +1179,19 @@ export interface RestartWaitView {
 	 *  script's server step runs, with the deployment's own compose arguments);
 	 *  the canonical plain form when the record names none. */
 	command: string;
+}
+
+/** A failed board seed of the agent layer the update script records next to the board
+ *  home (/etc/ottr/seed-failed, OTTR-753). */
+export interface SeedFailedView {
+	/** Epoch ms of the first failure in this episode; the record keeps it across runs. */
+	since: number;
+	/** The data-repo sha the seed tried; "" when the run could not read one (a
+	 *  ls-remote or data-checkout failure seeds before it knows a sha). */
+	commit: string;
+	/** The redacted tail of the failure text (the script cuts it to about 1000
+	 *  characters); "" when nothing readable survived the cut. */
+	text: string;
 }
 
 /** One provider usage window, e.g. Anthropic's 5-hour or 7-day limit. */

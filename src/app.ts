@@ -333,6 +333,7 @@ import {
 	type ReleasePlan,
 	type RestartWaitView,
 	recommendsSteps,
+	type SeedFailedView,
 	type ServerMessage,
 	type StateResponse,
 	type SystemHolds,
@@ -2961,6 +2962,38 @@ export function createApp(deps: AppDeps) {
 			command: restartWaitCommand(record as Record<string, unknown>),
 		};
 	}
+	/** The failed board seed the update script records next to the board home: a notice
+	 *  only once every field sanitizes; any read or parse failure stays advisory null.
+	 *  Host-written file content, so the text never reaches the UI with control
+	 *  characters or an unbounded length, and a stored secret redacts out anyway. */
+	function seedFailedView(): SeedFailedView | null {
+		let record: unknown;
+		try {
+			record = JSON.parse(readBoardHomeFile("seed-failed") ?? "");
+		} catch {
+			return null;
+		}
+		if (record === null || typeof record !== "object") return null;
+		const r = record as Record<string, unknown>;
+		const since = r.since;
+		const rawCommit = r.commit;
+		const rawText = r.text;
+		if (
+			typeof since !== "number" ||
+			!Number.isInteger(since) ||
+			since <= 0 ||
+			typeof rawText !== "string" ||
+			rawText.length > 1200 ||
+			/[\p{Cc}]/u.test(rawText)
+		)
+			return null;
+		const commit =
+			typeof rawCommit === "string" && /^[0-9a-f]{7,40}$/.test(rawCommit)
+				? rawCommit
+				: "";
+		const text = redact(rawText.trim(), gitSecrets());
+		return { since, commit, text };
+	}
 	/** Maps an editor layout refusal to 422; anything else stays a 500 in api(). */
 	async function layout422(fn: () => Promise<Response>): Promise<Response> {
 		try {
@@ -4331,8 +4364,10 @@ export function createApp(deps: AppDeps) {
 			],
 			updates: updatesView(),
 			alatePendingSince,
+			alateProvisionError,
 			deadSignIns: dead,
 			restartWait: restartWaitView(),
+			seedFailed: seedFailedView(),
 		};
 	}
 

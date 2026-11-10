@@ -60,6 +60,7 @@ import {
 	type ReleasePlan,
 	type RestartWaitView,
 	recommendsSteps,
+	type SeedFailedView,
 	type Stage,
 	type StateResponse,
 	type SystemCard,
@@ -13713,6 +13714,75 @@ export function RestartWaitLine({
 	);
 }
 
+/** The skill folder a SkillSpector rejection names, e.g. "egm-review-loop" from the
+ *  alate install output's ".../user/omp/agent/skills/egm-review-loop"; null otherwise. */
+export function seedFailSkill(text: string): string | null {
+	const m = /skills\/([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(text);
+	return m === null ? null : (m[1] ?? null);
+}
+
+/** OTTR-753: the update script's hourly seed of the agent layer failed (the record it
+ *  writes next to the board home). One red line: the first failure's time, the commit
+ *  it tried, the redacted failure text, and the next step. A SkillSpector rejection
+ *  names the skill folder and its baseline file. Null renders nothing. */
+export function SeedFailedLine({
+	fail,
+	inboxKey,
+	fresh,
+}: {
+	fail: SeedFailedView | null;
+	inboxKey?: string;
+	fresh: boolean;
+}) {
+	if (fail === null) return null;
+	const skill = seedFailSkill(fail.text);
+	// The recorded tail often ends mid-sentence (the script cuts it), so the next
+	// step starts on a clean sentence boundary.
+	const text =
+		fail.text !== "" && !/[.!?;:]$/.test(fail.text)
+			? `${fail.text}.`
+			: fail.text;
+	return (
+		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+			<Mark kind="crit" />
+			<span>
+				Agent layer seed failed since {stamp(fail.since)}.{" "}
+				{fail.commit !== "" && <>Tried commit {fail.commit.slice(0, 12)}. </>}
+				{text !== "" && <>{text} </>}
+				{skill !== null
+					? `Fix the skill ${skill}, or accept the findings in its .skillspector-baseline.yaml in the data repo.`
+					: "The next update run seeds the agent layer again."}
+			</span>
+			{fresh && <span className="new-tag">New</span>}
+		</p>
+	);
+}
+
+/** OTTR-753: the last failed provision attempt (Settings → Alate → Provision now, or
+ *  the board's own trigger). One red line, so a failed provision is not settings-only;
+ *  a success or a settled health poll drops it. Null renders nothing. */
+export function ProvisionErrorLine({
+	error,
+	inboxKey,
+	fresh,
+}: {
+	error: string | null;
+	inboxKey?: string;
+	fresh: boolean;
+}) {
+	if (error === null) return null;
+	return (
+		<p className="notif-line" role="note" data-inbox-key={inboxKey}>
+			<Mark kind="crit" />
+			<span>
+				Agent layer provision failed: {error} Run Provision again, and check
+				that the alate server is up.
+			</span>
+			{fresh && <span className="new-tag">New</span>}
+		</p>
+	);
+}
+
 /** True when two wire copies of one card carry equal content. The server re-serializes every
  * frame, so array and object fields never keep reference identity; a shallow primitive compare
  * first, then a JSON compare for the fields where references differ. Key counts differ when
@@ -13948,7 +14018,8 @@ function appServerNotices(state: StateResponse | null): {
 }
 
 /** Update-banner values: how far behind the board is, the pending commits, the restart
- * wait, and the provider sign-in advisories. Hosted mode drops the host-owned ones. */
+ * wait, the failed seed, and the provider sign-in advisories. Hosted mode drops the
+ * host-owned ones. */
 function appUpdateNotices(
 	hosted: boolean,
 	update: { behind: number; commits: string[] } | null,
@@ -13957,6 +14028,7 @@ function appUpdateNotices(
 	behind: number;
 	behindCommits: string[];
 	restartWait: RestartWaitView | null;
+	seedFailed: SeedFailedView | null;
 	signinAdvisories: DeadSignIn[];
 } {
 	// Shared notification lines: the inbox panel renders the same content the
@@ -13966,8 +14038,11 @@ function appUpdateNotices(
 	// OTTR-625: the update task holds the restart until the running turns finish, because
 	// the board runs an older commit than the image it built.
 	const restartWait = hosted ? null : (state?.restartWait ?? null);
+	// OTTR-753: the update task's hourly seed of the agent layer failed; the host owns
+	// the record, so hosted mode drops it like the restart wait.
+	const seedFailed = hosted ? null : (state?.seedFailed ?? null);
 	const signinAdvisories = hosted ? [] : (state?.deadSignIns ?? []);
-	return { behind, behindCommits, restartWait, signinAdvisories };
+	return { behind, behindCommits, restartWait, seedFailed, signinAdvisories };
 }
 
 /** Inbox entry keys for the board's notice lines: occurrence keys so a recurrence
@@ -13981,6 +14056,7 @@ function appNoticeKeys(
 	hosted: boolean,
 	behind: number,
 	restartWait: RestartWaitView | null,
+	seedFailed: SeedFailedView | null,
 	draining: boolean,
 	orphanList: OrphanProcess[],
 	orphansError: string | null,
@@ -13995,6 +14071,8 @@ function appNoticeKeys(
 	drainKey: string | null;
 	behindKey: string | null;
 	restartWaitKey: string | null;
+	seedFailKey: string | null;
+	provisionErrKey: string | null;
 	updatesKey: string | null;
 	orphansErrorKey: string | null;
 	orphansKey: string | null;
@@ -14017,6 +14095,14 @@ function appNoticeKeys(
 	// `since` in the key: a new wait (a later image) counts as new again.
 	const restartWaitKey =
 		restartWait !== null ? `restart-wait:${restartWait.since}` : null;
+	// OTTR-753: `since` in the key too, so a new failure episode counts as new again.
+	const seedFailKey =
+		seedFailed !== null ? `seed-failed:${seedFailed.since}` : null;
+	// The last failed provision attempt: shortKey hashes the error text, so a
+	// changed failure is a new occurrence, and the same failure stays one.
+	const provisionErr = hosted ? null : (state?.alateProvisionError ?? null);
+	const provisionErrKey =
+		provisionErr !== null ? shortKey("provision-error", provisionErr) : null;
 	const updatesKey =
 		updateCount > 0 ? shortKey("updates", updateIds.join(",")) : null;
 	const orphansErrorKey =
@@ -14040,6 +14126,8 @@ function appNoticeKeys(
 		drainKey,
 		behindKey,
 		restartWaitKey,
+		seedFailKey,
+		provisionErrKey,
 		updatesKey,
 		orphansErrorKey,
 		orphansKey,
@@ -14182,6 +14270,10 @@ function AppInboxPanel(p: {
 	behindCommits: string[];
 	restartWait: RestartWaitView | null;
 	restartWaitKey: string | null;
+	seedFailed: SeedFailedView | null;
+	seedFailKey: string | null;
+	provisionError: string | null;
+	provisionErrKey: string | null;
 	state: StateResponse | null;
 	warnings: string[];
 	orphanList: OrphanProcess[];
@@ -14222,6 +14314,10 @@ function AppInboxPanel(p: {
 		behindCommits,
 		restartWait,
 		restartWaitKey,
+		seedFailed,
+		seedFailKey,
+		provisionError,
+		provisionErrKey,
 		state,
 		warnings,
 		orphanList,
@@ -14358,6 +14454,10 @@ function AppInboxPanel(p: {
 				behindCommits={behindCommits}
 				restartWait={restartWait}
 				restartWaitKey={restartWaitKey}
+				seedFailed={seedFailed}
+				seedFailKey={seedFailKey}
+				provisionError={provisionError}
+				provisionErrKey={provisionErrKey}
 				isNew={isNew}
 				setNotice={setNotice}
 			/>
@@ -14434,7 +14534,8 @@ function AppBehindNotice(p: {
 }
 
 /** The notices section: the running notice, the drain hold, the upstream version
- * notice and the restart wait. Null while none applies. */
+ * notice, the restart wait, the failed seed and the failed provision. Null while none
+ * applies. */
 function AppInfoLines(p: {
 	notice: string | null;
 	noticeKey: string | null;
@@ -14446,6 +14547,10 @@ function AppInfoLines(p: {
 	behindCommits: string[];
 	restartWait: RestartWaitView | null;
 	restartWaitKey: string | null;
+	seedFailed: SeedFailedView | null;
+	seedFailKey: string | null;
+	provisionError: string | null;
+	provisionErrKey: string | null;
 	isNew: (key: string) => boolean;
 	setNotice: (v: string | null) => void;
 }) {
@@ -14460,10 +14565,23 @@ function AppInfoLines(p: {
 		behindCommits,
 		restartWait,
 		restartWaitKey,
+		seedFailed,
+		seedFailKey,
+		provisionError,
+		provisionErrKey,
 		isNew,
 		setNotice,
 	} = p;
-	if (!(notice !== null || behind > 0 || drainNotice || restartWait !== null))
+	if (
+		!(
+			notice !== null ||
+			behind > 0 ||
+			drainNotice ||
+			restartWait !== null ||
+			seedFailed !== null ||
+			provisionError !== null
+		)
+	)
 		return null;
 	return (
 		<section>
@@ -14516,6 +14634,16 @@ function AppInfoLines(p: {
 				wait={restartWait}
 				inboxKey={restartWaitKey ?? undefined}
 				fresh={restartWaitKey !== null && isNew(restartWaitKey)}
+			/>
+			<SeedFailedLine
+				fail={seedFailed}
+				inboxKey={seedFailKey ?? undefined}
+				fresh={seedFailKey !== null && isNew(seedFailKey)}
+			/>
+			<ProvisionErrorLine
+				error={provisionError}
+				inboxKey={provisionErrKey ?? undefined}
+				fresh={provisionErrKey !== null && isNew(provisionErrKey)}
 			/>
 		</section>
 	);
@@ -15548,7 +15676,7 @@ export function App() {
 		orphansError,
 		keptCount,
 	} = appServerNotices(state);
-	const { behind, behindCommits, restartWait, signinAdvisories } =
+	const { behind, behindCommits, restartWait, seedFailed, signinAdvisories } =
 		appUpdateNotices(hosted, update, state);
 	// Occurrence keys of the inbox entries; null when the source is absent. shortKey hashes a
 	// long body (an error text, an id list), so no key outgrows the seen route's limit.
@@ -15561,6 +15689,8 @@ export function App() {
 		drainKey,
 		behindKey,
 		restartWaitKey,
+		seedFailKey,
+		provisionErrKey,
 		updatesKey,
 		orphansErrorKey,
 		orphansKey,
@@ -15574,6 +15704,7 @@ export function App() {
 		hosted,
 		behind,
 		restartWait,
+		seedFailed,
 		draining,
 		orphanList,
 		orphansError,
@@ -15587,6 +15718,8 @@ export function App() {
 		drainKey,
 		behindKey,
 		restartWaitKey,
+		seedFailKey,
+		provisionErrKey,
 		orphansErrorKey,
 		orphansKey,
 		keptKey,
@@ -15773,6 +15906,10 @@ export function App() {
 					behindCommits={behindCommits}
 					restartWait={restartWait}
 					restartWaitKey={restartWaitKey}
+					seedFailed={seedFailed}
+					seedFailKey={seedFailKey}
+					provisionError={hosted ? null : (state?.alateProvisionError ?? null)}
+					provisionErrKey={provisionErrKey}
 					state={state}
 					warnings={warnings}
 					orphanList={orphanList}

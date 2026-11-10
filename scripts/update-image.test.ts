@@ -95,6 +95,12 @@ interface FakeOptions {
 	imagesCode?: number;
 	/** The seed commit the server volume records (the `cat` exec's output). */
 	seedRecord?: string;
+	/** The seed-failed record the server volume already holds (the `cat` exec's answer; "" = none). */
+	seedFailRecord?: string;
+	/** Exit code of the seed-failed record write. */
+	seedFailWriteCode?: number;
+	/** Exit code of `rm -f /etc/ottr/seed-failed`. */
+	seedFailRmCode?: number;
 	/** Exit code of the board-seed run. */
 	seedCode?: number;
 	/** Output of `compose ps -q alate` (a container id when the project's alate runs). */
@@ -221,6 +227,10 @@ interface FakeRecord {
 	seedImages: (string | undefined)[];
 	seedWrites: string[];
 	restartWaits: string[];
+	/** The seed-failed record writes (`printf %s '<json>' > /etc/ottr/seed-failed`), in order. */
+	seedFailRecords: string[];
+	/** The stored seed-failed record: the `cat` answers it, the write sets it, the rm clears it. */
+	seedFailState: { value: string };
 	built: FakeRun["built"];
 }
 
@@ -254,6 +264,22 @@ function recordExec(
 	o: FakeOptions,
 	rec: FakeRecord,
 ): ExecResult | null {
+	if (line.includes("seed-failed")) {
+		rec.calls.push(line);
+		if (line.includes("cat "))
+			return {
+				code: rec.seedFailState.value === "" ? 1 : 0,
+				out: `${rec.seedFailState.value}\n`,
+			};
+		if (line.includes("rm -f")) {
+			rec.seedFailState.value = "";
+			return { code: o.seedFailRmCode ?? 0, out: "" };
+		}
+		rec.seedFailRecords.push(line);
+		const m = /printf %s '(.*)' > \/etc\/ottr\/seed-failed$/.exec(line);
+		rec.seedFailState.value = m?.[1] ?? "";
+		return { code: o.seedFailWriteCode ?? 0, out: "" };
+	}
 	if (
 		line.includes("seed-commit") ||
 		line.includes("seed-token-expires") ||
@@ -546,6 +572,8 @@ function fakes(o: FakeOptions = {}): FakeRun {
 	const seedWrites: string[] = [];
 	/** The restart-wait record writes (`printf %s '<json>' > /etc/ottr/restart-wait`), in order. */
 	const restartWaits: string[] = [];
+	const seedFailRecords: string[] = [];
+	const seedFailState = { value: o.seedFailRecord ?? "" };
 	const logs: string[] = [];
 	const waits: number[] = [];
 	const built: FakeRun["built"] = [];
@@ -570,6 +598,8 @@ function fakes(o: FakeOptions = {}): FakeRun {
 		seedImages,
 		seedWrites,
 		restartWaits,
+		seedFailRecords,
+		seedFailState,
 		built,
 	};
 	const n: PollCounters = {
@@ -622,6 +652,8 @@ function fakes(o: FakeOptions = {}): FakeRun {
 		seedImages,
 		seedWrites,
 		restartWaits,
+		seedFailRecords,
+		seedFailState,
 	};
 }
 
@@ -642,6 +674,27 @@ const COMPARE = [
 	"image inspect -f {{.Id}} ottr-worker:local",
 ];
 const CFGJSON = "compose -f c.yml config --format json";
+const CAT_SEEDFAIL =
+	"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-failed";
+const RM_SEEDFAIL =
+	"compose -f c.yml exec -T server sh -c rm -f /etc/ottr/seed-failed";
+const SEEDFAIL_WRITE = (record: {
+	since: number;
+	commit: string;
+	text: string;
+}) =>
+	`compose -f c.yml exec -T server sh -c printf %s '${JSON.stringify(record)}' > /etc/ottr/seed-failed`;
+/** The JSON payload of the n-th seed-failed record write, parsed. */
+function seedFailRecordOf(
+	f: FakeRun,
+	n = 0,
+): { since: number; commit: string; text: string } {
+	const m = /printf %s '(.*)' > \/etc\/ottr\/seed-failed$/.exec(
+		f.seedFailRecords[n] ?? "",
+	);
+	expect(m).toBeTruthy();
+	return JSON.parse(m![1]!);
+}
 const SIDE_BUILD = "compose -f c.yml -f <tree>.yml build sidecar";
 const SIDE_UP = "compose -f c.yml up -d --no-deps --wait sidecar";
 /** Exactly one sidecar build, from origin/main after the 2.0.0 bump. */
@@ -765,6 +818,10 @@ interface FakeRun {
 	seedImages: (string | undefined)[];
 	/** The record writes (`printf %s <sha> > /etc/ottr/seed-commit`), in order. */
 	seedWrites: string[];
+	/** The seed-failed record writes (`printf %s '<json>' > /etc/ottr/seed-failed`), in order. */
+	seedFailRecords: string[];
+	/** The stored seed-failed record: the `cat` answers it, a write sets it, the rm clears it. */
+	seedFailState: { value: string };
 	/** The restart-wait record writes (`printf %s '<json>' > /etc/ottr/restart-wait`), in order. */
 	restartWaits: string[];
 }
@@ -2199,6 +2256,7 @@ describe("rolling restart", () => {
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
 			seedRun,
+			RM_SEEDFAIL,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
@@ -2250,6 +2308,7 @@ describe("rolling restart", () => {
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
 			seedRun,
+			RM_SEEDFAIL,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
@@ -3293,6 +3352,7 @@ describe("board seed", () => {
 			ALATE_PS,
 			ALATE_INSPECT,
 			seedRun,
+			RM_SEEDFAIL,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -3389,6 +3449,7 @@ describe("board seed", () => {
 	test("a seed with no alate image anywhere fails and names the env file", async () => {
 		const { main } = checkout();
 		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
 		const f = fakes({ seedRecord: unrecorded });
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -3405,6 +3466,12 @@ describe("board seed", () => {
 			DATA_READ,
 			ALATE_PS,
 			DOCKER_PS,
+			CAT_SEEDFAIL,
+			SEEDFAIL_WRITE({
+				since: Date.UTC(2026, 9, 16),
+				commit: head,
+				text: "no alate image found; set ALATE_IMAGE in the env file",
+			}),
 			GET,
 			...COMPARE,
 			COUNT,
@@ -3697,6 +3764,12 @@ describe("board seed", () => {
 				BUILD,
 				CFGJSON,
 				PS,
+				CAT_SEEDFAIL,
+				SEEDFAIL_WRITE({
+					since: Date.UTC(2026, 9, 16),
+					commit: "",
+					text: `git ls-remote ${repo.split("@")[0]} failed`,
+				}),
 				GET,
 				...COMPARE,
 				COUNT,
@@ -4333,6 +4406,119 @@ describe("deploy flow survivor kills", () => {
 		expect(f.logs).toContain("board seed failed: l2\nl3\nl4");
 	}, 60_000);
 
+	const SEED_FAIL_OUT =
+		"installing agent layer\n" +
+		"SkillSpector rejected /tmp/alate-data-9f34/user/omp/agent/skills/egm-review-loop (exit 1); nothing was installed; the skill won't seed\n";
+
+	test("a failed seed writes the seed-failed record with the redacted failure text", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = overriding(seedFakes(), (line) =>
+			line.includes("board-seed") ? { code: 1, out: SEED_FAIL_OUT } : undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+				GH_TOKEN: "ghp_secrettokenvalue123",
+			}),
+		).toBe(1);
+		expect(f.seedFailRecords).toHaveLength(1);
+		const record = seedFailRecordOf(f);
+		expect(record.since).toBe(Date.UTC(2026, 9, 16));
+		expect(record.commit).toBe(head);
+		expect(record.text).toContain("SkillSpector rejected");
+		expect(record.text).toContain("skills/egm-review-loop");
+		expect(record.text).not.toContain("ghp_secrettokenvalue123");
+		expect(record.text).not.toContain("'");
+		// The read and the write rode the server exec path, and the write succeeded.
+		expect(f.calls).toContain(CAT_SEEDFAIL);
+		expect(f.calls).toContain(SEEDFAIL_WRITE(record));
+		expect(f.seedFailState.value).toBe(JSON.stringify(record));
+		expect(f.logs.join("\n")).not.toContain(
+			"the seed-failed record write failed",
+		);
+	}, 60_000);
+
+	test("a second failed seed keeps the first failure time and updates the text", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		let failOut = "first failure\n";
+		const f = overriding(seedFakes(), (line) =>
+			line.includes("board-seed") ? { code: 1, out: failOut } : undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		const first = seedFailRecordOf(f);
+		await f.deps.wait(3 * 60 * 60_000); // the clock moves 3 h between the runs
+		failOut = "second failure\n";
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.seedFailRecords).toHaveLength(2);
+		const second = seedFailRecordOf(f, 1);
+		expect(second.since).toBe(first.since); // the first failure's time is kept
+		expect(second.text).toBe("second failure");
+		expect(second.commit).toBe(first.commit);
+		expect(second.since).toBe(Date.UTC(2026, 9, 16)); // not the advanced clock
+	}, 60_000);
+
+	test("a successful seed removes the record", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const stale = {
+			since: 5,
+			commit: "a".repeat(40),
+			text: "old failure",
+		};
+		const f = seedFakes({
+			seedFailRecord: JSON.stringify(stale),
+		});
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.calls).toContain(RM_SEEDFAIL);
+		expect(f.seedFailState.value).toBe("");
+		expect(f.seedFailRecords).toEqual([]); // the success never writes the record
+		expect(f.logs.join("\n")).not.toContain(
+			"the seed-failed record removal failed",
+		);
+	}, 60_000);
+
+	test("a failed record write or removal never changes the exit code", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// A failed seed whose own record write fails still exits 1 (the seed's own code).
+		const f1 = overriding(seedFakes({ seedFailWriteCode: 1 }), (line) =>
+			line.includes("board-seed") ? { code: 1, out: "boom\n" } : undefined,
+		);
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f1.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f1.logs.join("\n")).toContain(
+			"the seed-failed record write failed: the board cannot show a notice",
+		);
+		// A successful seed whose record removal fails still exits 0.
+		const f2 = seedFakes({ seedFailRmCode: 1 });
+		expect(
+			await updateImage(main, ["-f", "c.yml"], f2.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f2.logs.join("\n")).toContain(
+			"the seed-failed record removal failed: the board keeps the notice",
+		);
+	}, 60_000);
+
 	test("a failed restart after a seed stops with docker's trimmed error and records nothing", async () => {
 		const { main } = checkout();
 		const data = checkout();
@@ -4656,7 +4842,18 @@ describe("sidecar and seed survivor kills", () => {
 				await updateImage(main, ["-f", "c.yml"], f.deps, { ALATE_DATA: empty }),
 			).toBe(1);
 			expect(f.seedRuns).toEqual([]);
-			expect(f.calls).toEqual(NO_SIDECAR(main));
+			expect(f.calls).toEqual([
+				BUILD,
+				CFGJSON,
+				PS,
+				CAT_SEEDFAIL,
+				SEEDFAIL_WRITE({
+					since: Date.UTC(2026, 9, 16),
+					commit: "",
+					text: `git rev-parse HEAD failed in ${empty}`,
+				}),
+				...NO_SIDECAR(main).slice(3),
+			]);
 			expect(f.logs).toContain(
 				`board seed failed: git rev-parse HEAD failed in ${empty}`,
 			);
@@ -4683,7 +4880,18 @@ describe("sidecar and seed survivor kills", () => {
 				},
 			);
 			expect(f.seedRuns).toEqual([]);
-			expect(f.calls).toEqual(NO_SIDECAR(main));
+			expect(f.calls).toEqual([
+				BUILD,
+				CFGJSON,
+				PS,
+				CAT_SEEDFAIL,
+				SEEDFAIL_WRITE({
+					since: Date.UTC(2026, 9, 16),
+					commit: "",
+					text: "git ls-remote example/data failed",
+				}),
+				...NO_SIDECAR(main).slice(3),
+			]);
 			expect(f.logs).toContain(
 				"board seed failed: git ls-remote example/data failed",
 			);
@@ -4735,6 +4943,7 @@ describe("sidecar and seed survivor kills", () => {
 						ALATE_PS,
 						DOCKER_PS,
 						seedRun,
+						RM_SEEDFAIL,
 						GET,
 						...COMPARE,
 						HOLD,

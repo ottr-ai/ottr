@@ -65,6 +65,8 @@ const {
 	DeepenReview,
 	AddProjectModal,
 	OrphanNotice,
+	SeedFailedLine,
+	ProvisionErrorLine,
 	ranOnLabel,
 	AuthPage,
 	PrReviewSection,
@@ -1824,6 +1826,94 @@ describe("RestartWaitLine", () => {
 		expect(
 			renderToStaticMarkup(
 				<RestartWaitLine wait={null} inboxKey={undefined} fresh={false} />,
+			),
+		).toBe("");
+	});
+});
+
+describe("SeedFailedLine", () => {
+	const fail = {
+		since: 1730990000000,
+		commit: "d".repeat(40),
+		text: "SkillSpector rejected /tmp/alate-data-9f34/user/omp/agent/skills/egm-review-loop (exit 1); nothing was installed",
+	};
+
+	test("the red notice names the time, the commit, the failure, and the baseline next step", () => {
+		const html = renderToStaticMarkup(
+			<SeedFailedLine fail={fail} inboxKey="seed-failed:1730990000000" fresh />,
+		);
+		expect(html).toContain('role="note"');
+		expect(html).toContain('data-inbox-key="seed-failed:1730990000000"');
+		expect(html).toContain("mark-crit");
+		// stamp() is locale-dependent, so only the stable prefix is asserted.
+		expect(html).toContain("Agent layer seed failed since");
+		expect(html).toContain(`Tried commit ${"d".repeat(12)}.`);
+		expect(html).toContain("SkillSpector rejected");
+		// The recorded tail ends mid-sentence; the next step starts on a clean boundary.
+		expect(html).toContain("nothing was installed. Fix the skill");
+		expect(html).toContain(
+			"Fix the skill egm-review-loop, or accept the findings in its .skillspector-baseline.yaml in the data repo.",
+		);
+		expect(html).toContain('class="new-tag"');
+	});
+
+	test("without a SkillSpector rejection the next step is the generic retry", () => {
+		const html = renderToStaticMarkup(
+			<SeedFailedLine
+				fail={{ ...fail, text: "git ls-remote example/data failed" }}
+				inboxKey="seed-failed:1"
+				fresh={false}
+			/>,
+		);
+		expect(html).toContain("The next update run seeds the agent layer again.");
+		expect(html).not.toContain("skillspector-baseline");
+		expect(html).not.toContain("new-tag");
+	});
+
+	test("an empty commit and text render only the header and the retry", () => {
+		const html = renderToStaticMarkup(
+			<SeedFailedLine
+				fail={{ since: 1730990000000, commit: "", text: "" }}
+				inboxKey={undefined}
+				fresh={false}
+			/>,
+		);
+		expect(html).toContain("Agent layer seed failed since");
+		expect(html).not.toContain("Tried commit");
+		expect(html).toContain("The next update run seeds the agent layer again.");
+	});
+
+	test("a null fail renders nothing", () => {
+		expect(
+			renderToStaticMarkup(
+				<SeedFailedLine fail={null} inboxKey={undefined} fresh={false} />,
+			),
+		).toBe("");
+	});
+});
+
+describe("ProvisionErrorLine", () => {
+	test("the red notice names the failure and the retry", () => {
+		const html = renderToStaticMarkup(
+			<ProvisionErrorLine
+				error="alate did not answer the provision request within 110 s"
+				inboxKey="provision-error:abc"
+				fresh={false}
+			/>,
+		);
+		expect(html).toContain("mark-crit");
+		expect(html).toContain("Agent layer provision failed:");
+		expect(html).toContain(
+			"alate did not answer the provision request within 110 s",
+		);
+		expect(html).toContain("Run Provision again");
+		expect(html).not.toContain("new-tag");
+	});
+
+	test("a null error renders nothing", () => {
+		expect(
+			renderToStaticMarkup(
+				<ProvisionErrorLine error={null} inboxKey={undefined} fresh={false} />,
 			),
 		).toBe("");
 	});

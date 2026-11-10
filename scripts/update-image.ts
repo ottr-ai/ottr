@@ -23,7 +23,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { $ } from "bun";
-import { type GitResult, git } from "../src/worktree.ts";
+import { type GitResult, git, redact } from "../src/worktree.ts";
 
 export interface Deps {
 	/** `docker <args>` in the checkout: exit code and output. */
@@ -822,6 +822,87 @@ async function readSeedRecord(
 	return read !== "" ? read : null;
 }
 
+/**
+ * The seed-failure record the board reads for its red bell notice: the first failure's
+ * time (a later failed run keeps it, like the wait clock), the data-repo sha the seed
+ * tried, and the redacted tail of the failure text. Secret-shaped env values are
+ * redacted out, quotes and control characters never reach the printf's shell string,
+ * and the tail holds about 1000 characters. Advisory: a failed read or write only
+ * loses or restarts the notice, and never fails the run.
+ */
+async function seedFailRecord(
+	d: Deps,
+	compose: string[],
+	wantedSha: string,
+	failText: string,
+	env: Record<string, string | undefined>,
+): Promise<void> {
+	const exec = (code: string) =>
+		d.docker("compose", ...compose, "exec", "-T", "server", "sh", "-c", code);
+	const prev = await exec("cat /etc/ottr/seed-failed");
+	let since = d.now();
+	if (prev.code === 0) {
+		try {
+			const kept: unknown = JSON.parse(prev.out.trim());
+			if (
+				typeof kept === "object" &&
+				kept !== null &&
+				"since" in kept &&
+				typeof kept.since === "number" &&
+				Number.isInteger(kept.since) &&
+				kept.since > 0
+			)
+				since = kept.since;
+		} catch {
+			// An unreadable record restarts the first-failure clock.
+		}
+	}
+	const secrets = Object.entries(env)
+		.filter(
+			([name, value]) =>
+				value !== undefined &&
+				value.length >= 8 &&
+				/TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIAL|KEY/i.test(name),
+		)
+		.map(([, value]) => value as string);
+	const text = redact(failText, secrets)
+		// Control characters become spaces so a multi-line failure stays one readable
+		// line, and a single quote is dropped: it would end the printf's shell string.
+		.replace(/[\p{Cc}]+/gu, " ")
+		.replaceAll("'", "")
+		.trim()
+		.slice(-1000);
+	const record = {
+		since,
+		commit: /^[0-9a-f]{7,40}$/.test(wantedSha) ? wantedSha : "",
+		text,
+	};
+	const w = await exec(
+		`printf %s '${JSON.stringify(record)}' > /etc/ottr/seed-failed`,
+	);
+	if (w.code !== 0)
+		d.log(
+			"the seed-failed record write failed: the board cannot show a notice",
+		);
+}
+
+/** A successful seed removes the record, so the notice goes with the failure. Advisory:
+ * a failed removal only keeps a stale notice until the next successful seed. */
+async function seedFailClear(d: Deps, compose: string[]): Promise<void> {
+	const w = await d.docker(
+		"compose",
+		...compose,
+		"exec",
+		"-T",
+		"server",
+		"sh",
+		"-c",
+		"rm -f /etc/ottr/seed-failed",
+	);
+	if (w.code !== 0)
+		d.log("the seed-failed record removal failed: the board keeps the notice");
+}
+
 /** Runs the board-seed service once, discovering ALATE_IMAGE for the child when needed. */
 async function runSeed(
 	d: Deps,
@@ -835,6 +916,13 @@ async function runSeed(
 		d.log(
 			"board seed failed: no alate image found; set ALATE_IMAGE in the env file",
 		);
+		await seedFailRecord(
+			d,
+			compose,
+			outcome.wantedSha,
+			"no alate image found; set ALATE_IMAGE in the env file",
+			env,
+		);
 		return { ...outcome, failed: true };
 	}
 	// A discovered image must reach the compose child, or the board-seed service
@@ -847,9 +935,11 @@ async function runSeed(
 			d.log(
 				`board seed failed: ${run.out.trim().split("\n").slice(-3).join("\n")}`,
 			);
+			await seedFailRecord(d, compose, outcome.wantedSha, run.out, env);
 			return { ...outcome, failed: true };
 		}
 		d.log(`board agent layer seeded at ${seed.wanted.slice(0, 12)}`);
+		await seedFailClear(d, compose);
 		return { ...outcome, seeded: true };
 	} finally {
 		if (found.discovered) {
@@ -882,6 +972,7 @@ async function seedBoard(
 	if (seed === null) return untouched; // seedSource already logged the skip.
 	if ("failed" in seed) {
 		d.log(`board seed failed: ${seed.failed}`);
+		await seedFailRecord(d, compose, "", seed.failed, env);
 		return { ...untouched, failed: true };
 	}
 	const outcome: SeedOutcome = {
@@ -1666,6 +1757,7 @@ async function recordSeed(
 	seeded: boolean,
 	wantedSha: string,
 	seedExpires: string | null | undefined,
+	env: Record<string, string | undefined>,
 ): Promise<boolean> {
 	let seedFailed = false;
 	// The record lands only after the board took the seed (recreate or restart): a run
@@ -1685,6 +1777,13 @@ async function recordSeed(
 		if (w.code !== 0) {
 			d.log(
 				"board seed failed: the seed commit cannot be recorded; the next run seeds again",
+			);
+			await seedFailRecord(
+				d,
+				compose,
+				wantedSha,
+				"the seed commit cannot be recorded; the next run seeds again",
+				env,
 			);
 			seedFailed = true;
 		}
@@ -1917,6 +2016,7 @@ export async function updateImage(
 			seed.seeded,
 			seed.wantedSha,
 			seed.expires,
+			env,
 		);
 		await recordDeployed(d, compose, meta.head);
 	}

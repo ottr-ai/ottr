@@ -102,6 +102,7 @@ import {
 	git,
 	gitSecrets,
 	networkGitAuth,
+	setGitSecrets,
 } from "./worktree.ts";
 
 // The push tests observe sends and VAPID details (R1-1, R2-3). The mock must be registered
@@ -14636,6 +14637,91 @@ describe("restart wait notice", () => {
 		rmSync(join(home, "restart-wait"));
 		rmSync(join(home, "build-commit"));
 		expect((await state()).restartWait).toBeNull();
+	});
+});
+
+describe("seed failed notice", () => {
+	// Pinned board home: the seed-failed record lands next to it, as the update
+	// script writes it (dirname of the home).
+	const home = mkdtempSync(join(tmpdir(), "ottr-seed-failed-"));
+	const savedOmp = process.env.OTTR_BOARD_OMP_HOME;
+	const SHA = "d".repeat(40);
+	const SKILL_TEXT =
+		"SkillSpector rejected /tmp/alate-data-9f34/user/omp/agent/skills/egm-review-loop (exit 1); nothing was installed";
+	const write = (name: string, content: string) =>
+		writeFileSync(join(home, name), content);
+	const record = (
+		over: Partial<{ since: number; commit: string; text: string }> = {},
+	) =>
+		JSON.stringify({
+			since: Date.now() - 60_000,
+			commit: SHA,
+			text: SKILL_TEXT,
+			...over,
+		});
+	beforeAll(() => {
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+	});
+	afterAll(() => {
+		if (savedOmp === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+		else process.env.OTTR_BOARD_OMP_HOME = savedOmp;
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	const state = async () =>
+		(await (await get("/api/state")).json()) as {
+			seedFailed: {
+				since: number;
+				commit: string;
+				text: string;
+			} | null;
+			alateProvisionError: string | null;
+		};
+
+	test("the notice when the record exists", async () => {
+		write("seed-failed", `${record()}\n`);
+		const view = (await state()).seedFailed;
+		expect(view).toEqual({
+			since: expect.any(Number) as number,
+			commit: SHA,
+			text: SKILL_TEXT,
+		});
+	});
+
+	test("no notice when the record is absent, malformed, or out of shape", async () => {
+		rmSync(join(home, "seed-failed"), { force: true });
+		expect((await state()).seedFailed).toBeNull();
+		write("seed-failed", "{not json");
+		expect((await state()).seedFailed).toBeNull();
+		write("seed-failed", record({ since: 0 }));
+		expect((await state()).seedFailed).toBeNull();
+		write("seed-failed", record({ text: `${SKILL_TEXT}\u0007` }));
+		expect((await state()).seedFailed).toBeNull(); // a control character never reaches the UI
+		write("seed-failed", record({ text: "x".repeat(1300) }));
+		expect((await state()).seedFailed).toBeNull();
+	});
+
+	test("a commit that is no sha reads as empty, not as no notice", async () => {
+		write("seed-failed", record({ commit: "zz" }));
+		const view = (await state()).seedFailed;
+		expect(view?.commit).toBe("");
+		expect(view?.text).toBe(SKILL_TEXT);
+	});
+
+	test("the text holds no secret", async () => {
+		// Appending a secret no other test uses is inert for later tests.
+		setGitSecrets([...gitSecrets(), "super-secret-token-9f8e"]);
+		write(
+			"seed-failed",
+			record({ text: `${SKILL_TEXT} token super-secret-token-9f8e leaked` }),
+		);
+		const view = (await state()).seedFailed;
+		expect(view?.text).not.toContain("super-secret-token-9f8e");
+		expect(view?.text).toContain("[REDACTED]");
+	});
+
+	test("the state ships a null provision error while none failed", async () => {
+		expect((await state()).alateProvisionError).toBeNull();
 	});
 });
 

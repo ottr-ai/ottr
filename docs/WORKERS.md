@@ -173,6 +173,10 @@ omp. Two parts do the work:
      `docker compose <your compose arguments> up -d --no-deps --wait server`,
      which stops the named turns; the notice clears once the server runs the
      image commit.
+   - A failed board seed surfaces the same way, at once: the script writes the
+     first failure's time, the data-repo commit it tried, and the redacted
+     failure text to `/etc/ottr/seed-failed`, and the bell shows a red notice
+     with the next step until a seed succeeds and removes the record.
 
    The last step runs `up -d --wait` for the whole stack: it starts a service
    that is not running and waits for the server's health; it recreates nothing.
