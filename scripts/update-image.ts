@@ -314,6 +314,7 @@ async function sidecarCheckouts(
 	d: Deps,
 	compose: string[],
 	repo: string,
+	running: string[],
 ): Promise<{ service: string; dir: string }[]> {
 	const cfg = await d.docker(
 		"compose",
@@ -350,6 +351,14 @@ async function sidecarCheckouts(
 		d.log("compose config is not JSON: deploying no foreign checkouts");
 		return [];
 	}
+	// compose config keeps only the active services, while compose ps lists every
+	// container of the project: a service whose profile the env file does not enable
+	// runs, but this run would never see it in the config and never rebuild it.
+	for (const service of running)
+		if (!Object.hasOwn(services, service))
+			d.log(
+				`${service} runs but its compose profile is not active; set COMPOSE_PROFILES so updates reach it`,
+			);
 	const found: { service: string; dir: string }[] = [];
 	for (const [service, s] of Object.entries(services)) {
 		const ctx = s.build?.context;
@@ -739,6 +748,7 @@ async function buildAndSidecars(
 	d: Deps,
 	compose: string[],
 	repo: string,
+	running: string[],
 	stop: (why: string) => number,
 ): Promise<number | null> {
 	const build = await d.docker("compose", ...compose, "build", "server");
@@ -748,7 +758,7 @@ async function buildAndSidecars(
 	}
 	// Services a host-only override builds from another local git checkout (the compose
 	// files in this repo name none) deploy on their own (deploySidecar).
-	for (const s of await sidecarCheckouts(d, compose, repo))
+	for (const s of await sidecarCheckouts(d, compose, repo, running))
 		await deploySidecar(d, compose, s);
 	return null;
 }
@@ -790,7 +800,10 @@ async function runningServices(
 	);
 	if (running.code !== 0)
 		return stop(`docker compose ps failed: ${running.out.trim()}`);
-	return running.out.trim().split("\n");
+	return running.out
+		.trim()
+		.split("\n")
+		.map((s) => s.trim());
 }
 
 /** What the seed phase leaves for the later phases. */
@@ -1974,13 +1987,16 @@ export async function updateImage(
 	const meta = await preflightAndRead(repo, g, stop);
 	if (typeof meta === "number") return meta;
 
-	const built = await buildAndSidecars(d, compose, repo, stop);
-	if (built !== null) return built;
-
-	// One ps lists the running services. A board that does not run cannot be counted,
-	// and that must not block every later deploy; a failed ps fails closed.
+	// One ps lists the running services, before the builds: the sidecar phase
+	// cross-checks it against compose config, and a failed ps fails closed before
+	// any build work. A board that does not run cannot be counted, and that must
+	// not block every later deploy.
 	const services = await runningServices(d, compose, stop);
 	if (typeof services === "number") return services;
+
+	const built = await buildAndSidecars(d, compose, repo, services, stop);
+	if (built !== null) return built;
+
 	const serverWasRunning = services.includes("server");
 	const vmBuilt = await buildVmRunner(d, compose, services, stop);
 	if (vmBuilt !== null) return vmBuilt;

@@ -213,7 +213,10 @@ omp. Two parts do the work:
    board either (on an alate without layer support it still waits for one). The checkout
    itself
    fast-forwards to `origin/main` only when it is clean and on `main`. Else it stays as it
-   is, with one log line.
+   is, with one log line. A service behind a compose profile needs that profile in
+   `COMPOSE_PROFILES` in the env file: `compose config` then lists the service, and each
+   run builds it. Without it, the run logs `<service> runs but its compose profile is not
+   active; set COMPOSE_PROFILES so updates reach it` and skips the service.
 
 The deploy also brings new Ottr commits from `main`. It repeats the board seed when
 the env file sets `ALATE_DATA` or `ALATE_DATA_REPO`

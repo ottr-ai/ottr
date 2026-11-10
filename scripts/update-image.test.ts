@@ -846,9 +846,9 @@ describe("updateImage", () => {
 		// The hold comes before the first count, so no turn starts between the last count and up;
 		// each poll renews it.
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -893,9 +893,9 @@ describe("updateImage", () => {
 		const f = fakes({ turns: "2" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -919,9 +919,9 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			SERVER,
 			MANIFEST,
@@ -952,9 +952,9 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			SERVER,
 			MANIFEST,
@@ -1025,9 +1025,9 @@ describe("updateImage", () => {
 		const f = fakes({ newImage: true, hold: [0, 1], turns: "1" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -1050,9 +1050,9 @@ describe("updateImage", () => {
 		const f = fakes({ newImage: true, hold: 1, turns: "2" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -1074,7 +1074,7 @@ describe("updateImage", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
 		// The runner probe runs first; no board answers it (404), so the legacy flow
 		// compares the server and stops before any hold or restart.
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE]);
+		expect(f.calls).toEqual([PS, BUILD, CFGJSON, GET, ...COMPARE]);
 		expect(f.logs.join("\n")).toContain("cannot be compared with the build");
 	}, 60_000);
 
@@ -1083,7 +1083,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ build: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD]);
+		expect(f.calls).toEqual([PS, BUILD]);
 	}, 60_000);
 
 	test("work someone left in the checkout stops the run before any build", async () => {
@@ -1114,7 +1114,7 @@ describe("updateImage", () => {
 		const { main } = checkout();
 		const f = fakes({ turns: "" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT]);
+		expect(f.calls).toEqual([PS, BUILD, CFGJSON, GET, ...COMPARE, COUNT]);
 	}, 60_000);
 
 	test("a compose warning ahead of a two-digit count still holds the restart", async () => {
@@ -1126,9 +1126,9 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1146,7 +1146,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ running: "" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, UP, DEPLOYED(main), PRUNE]);
+		expect(f.calls).toEqual([PS, BUILD, CFGJSON, UP, DEPLOYED(main), PRUNE]);
 		expect(f.logs.join("\n")).toContain("no running board");
 	}, 60_000);
 
@@ -1155,7 +1155,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ up: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, GET, ...COMPARE, COUNT, UP]);
+		expect(f.calls).toEqual([PS, BUILD, CFGJSON, GET, ...COMPARE, COUNT, UP]);
 		expect(f.logs.join("\n")).toContain("up --wait failed");
 		expect(f.logs.join("\n")).not.toContain("the stack runs main");
 	}, 60_000);
@@ -1165,7 +1165,7 @@ describe("updateImage", () => {
 		bump(ci, "1.1.0");
 		const f = fakes({ psCode: 1 });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS]);
+		expect(f.calls).toEqual([PS]);
 		expect(f.logs.join("\n")).toContain("docker compose ps failed");
 	}, 60_000);
 
@@ -1175,9 +1175,9 @@ describe("updateImage", () => {
 		const f = fakes({ newImage: true, turns: ["1", "0"] });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -1283,12 +1283,12 @@ describe("updateImage", () => {
 		const head = must(side.origin, "rev-parse", "main");
 		expect(must(side.main, "rev-parse", "HEAD")).toBe(head);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
 			SIDE_BUILD,
 			...SIDE_COMPARE,
 			SIDE_UP,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1305,6 +1305,17 @@ describe("updateImage", () => {
 		// The worktree is gone again, from the disk and from the checkout's list.
 		expect(f.built.map((b) => existsSync(b.tree))).toEqual([false]);
 		expect(must(side.main, "worktree", "list").split("\n")).toHaveLength(1);
+	}, 60_000);
+
+	test("a running service the plain config omits (its profile is not active) warns", async () => {
+		const { main } = checkout();
+		// docker compose ps lists every project container, so an alate that runs
+		// behind an inactive profile is in the ps listing; the plain config omits it.
+		const f = fakes({ turns: "0", running: "server\nalate" });
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.logs).toContain(
+			"alate runs but its compose profile is not active; set COMPOSE_PROFILES so updates reach it",
+		);
 	}, 60_000);
 
 	test("a commit made in the checkout itself deploys, though no fast-forward moves its HEAD", async () => {
@@ -1330,11 +1341,11 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
 			SIDE_BUILD,
 			...SIDE_COMPARE,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1374,12 +1385,12 @@ describe("updateImage", () => {
 			}),
 		]);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
 			SIDE_BUILD,
 			...SIDE_COMPARE,
 			SIDE_UP,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -1403,9 +1414,9 @@ describe("updateImage", () => {
 			"skipping sidecar: git fetch origin main failed in",
 		);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1442,9 +1453,9 @@ describe("updateImage", () => {
 		const log = f.logs.join("\n");
 		expect(log).not.toContain("skipping");
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -1463,9 +1474,9 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f1.deps)).toBe(0);
 		expect(f1.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1479,9 +1490,9 @@ describe("updateImage", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f2.deps)).toBe(0);
 		expect(f2.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1509,11 +1520,11 @@ describe("updateImage", () => {
 		expect(must(side.main, "rev-parse", "HEAD")).toBe(local);
 		expect(f.built).toEqual(BUILT_BUMP);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
 			SIDE_BUILD,
 			...SIDE_COMPARE,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1552,10 +1563,10 @@ describe("updateImage", () => {
 			"skipping sidecar: the image does not build; the stack keeps the old one",
 		);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
 			SIDE_BUILD,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1599,11 +1610,11 @@ describe("updateImage", () => {
 			"sidecar: the rebuild matches the running image",
 		);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
 			SIDE_BUILD,
 			...SIDE_COMPARE,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -1669,9 +1680,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -1735,9 +1746,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -1837,9 +1848,9 @@ describe("rolling restart", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
 		// Fail closed: the roll ends at once, and no container recreates.
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -2101,9 +2112,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -2145,9 +2156,9 @@ describe("rolling restart", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		// The probe ran, but no runner hold: the whole-board flow holds and restarts all.
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -2180,9 +2191,9 @@ describe("rolling restart", () => {
 		const f = fakes({ newImage: true, running: RUNNING3, gets: [onlyA] });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -2215,9 +2226,9 @@ describe("rolling restart", () => {
 		const f = fakes({ running: RUNNING3, gets: [st(0, 0)] });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
@@ -2249,9 +2260,9 @@ describe("rolling restart", () => {
 			}),
 		).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			`compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit`,
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
@@ -2301,9 +2312,9 @@ describe("rolling restart", () => {
 		// The busy worker detaches in its own container; the idle worker-b gets no
 		// detach call, and no board-wide count ever runs.
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			`compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit`,
 			"compose -f c.yml ps -q alate",
 			"inspect -f {{.Config.Image}} alate123",
@@ -2359,9 +2370,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -2448,9 +2459,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
@@ -2655,9 +2666,9 @@ describe("rolling restart", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		// The probe failed to answer runners, so the legacy whole-board hold ran.
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -2678,9 +2689,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			HOLD,
@@ -2974,9 +2985,9 @@ describe("rolling restart", () => {
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			// The server build leaves the vm-runner image untouched: without its own
 			// build the compare below reads its old image and it never rolls.
 			VM_BUILD,
@@ -3011,7 +3022,7 @@ describe("rolling restart", () => {
 			gets: [vmBoard(0)],
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		expect(f.calls).toEqual([BUILD, CFGJSON, PS, VM_BUILD]);
+		expect(f.calls).toEqual([PS, BUILD, CFGJSON, VM_BUILD]);
 		expect(f.logs).toContain("kvm build failed");
 		expect(f.logs).toContain(
 			"stopped: the vm-runner image does not build; the stack keeps the old one",
@@ -3287,9 +3298,9 @@ describe("arch-review survivor kills", () => {
 		const f = fakes({ running: "worker\nserver" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			SERVER,
 			MANIFEST,
@@ -3345,9 +3356,9 @@ describe("board seed", () => {
 		// A seeded layer joins the image change as a restart reason: the hold happens, and
 		// a server that keeps its image restarts after up.
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			DATA_READ,
 			ALATE_PS,
 			ALATE_INSPECT,
@@ -3388,9 +3399,9 @@ describe("board seed", () => {
 		expect(f.seedRuns).toEqual([]);
 		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			DATA_READ,
 			GET,
 			...COMPARE,
@@ -3460,9 +3471,9 @@ describe("board seed", () => {
 		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.logs.join("\n")).toContain("set ALATE_IMAGE in the env file");
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			DATA_READ,
 			ALATE_PS,
 			DOCKER_PS,
@@ -3588,9 +3599,9 @@ describe("board seed", () => {
 		expect(f.seedRuns).toEqual([]);
 		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -3617,9 +3628,9 @@ describe("board seed", () => {
 		expect(f.seedRuns).toEqual([]);
 		expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			DATA_READ,
 			GET,
 			...COMPARE,
@@ -3761,9 +3772,9 @@ describe("board seed", () => {
 			expect(f.seedRuns).toEqual([]);
 			expect(f.seedWrites).toEqual([DEPLOYED(main)]);
 			expect(f.calls).toEqual([
+				PS,
 				BUILD,
 				CFGJSON,
-				PS,
 				CAT_SEEDFAIL,
 				SEEDFAIL_WRITE({
 					since: Date.UTC(2026, 9, 16),
@@ -4080,9 +4091,9 @@ describe("helpers survivor kills", () => {
 		const f = fakes({ turns: "WARN[0000] a warning\n 0\n" });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -4097,9 +4108,9 @@ describe("helpers survivor kills", () => {
 		const f = fakes({ manifest: { runs: "", built: "sha256:m" } });
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE,
 			COUNT,
@@ -4120,9 +4131,9 @@ describe("helpers survivor kills", () => {
 			await updateImage(main, ["-f", "c.yml"], { ...f.deps, docker }),
 		).toBe(0);
 		expect(f.calls).toEqual([
+			PS,
 			BUILD,
 			CFGJSON,
-			PS,
 			GET,
 			...COMPARE.slice(2),
 			COUNT,
@@ -4593,9 +4604,9 @@ describe("sidecar and seed survivor kills", () => {
 		return seen;
 	}
 	const NO_SIDECAR = (main: string) => [
+		PS,
 		BUILD,
 		CFGJSON,
-		PS,
 		GET,
 		...COMPARE,
 		COUNT,
@@ -4604,11 +4615,11 @@ describe("sidecar and seed survivor kills", () => {
 		PRUNE,
 	];
 	const WITH_SIDECAR = (main: string) => [
+		PS,
 		BUILD,
 		CFGJSON,
 		SIDE_BUILD,
 		...SIDE_COMPARE,
-		PS,
 		GET,
 		...COMPARE,
 		COUNT,
@@ -4843,9 +4854,9 @@ describe("sidecar and seed survivor kills", () => {
 			).toBe(1);
 			expect(f.seedRuns).toEqual([]);
 			expect(f.calls).toEqual([
+				PS,
 				BUILD,
 				CFGJSON,
-				PS,
 				CAT_SEEDFAIL,
 				SEEDFAIL_WRITE({
 					since: Date.UTC(2026, 9, 16),
@@ -4881,9 +4892,9 @@ describe("sidecar and seed survivor kills", () => {
 			);
 			expect(f.seedRuns).toEqual([]);
 			expect(f.calls).toEqual([
+				PS,
 				BUILD,
 				CFGJSON,
-				PS,
 				CAT_SEEDFAIL,
 				SEEDFAIL_WRITE({
 					since: Date.UTC(2026, 9, 16),
@@ -4936,9 +4947,9 @@ describe("sidecar and seed survivor kills", () => {
 					o: { containers: alate },
 					image: "alate:ps",
 					calls: [
+						PS,
 						BUILD,
 						CFGJSON,
-						PS,
 						DATA_READ,
 						ALATE_PS,
 						DOCKER_PS,
