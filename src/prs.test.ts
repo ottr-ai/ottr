@@ -142,7 +142,7 @@ function reviewRoute(state: FakeGhState, path: string): FakeGhOut | null {
 	if (path.includes("/compare/")) {
 		if (state.compare === null)
 			return { code: 1, stdout: "", stderr: "HTTP 404" };
-		return ghJson(state.compare);
+		return { code: 0, stdout: state.compare, stderr: "" };
 	}
 	return null;
 }

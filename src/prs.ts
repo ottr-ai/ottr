@@ -673,18 +673,6 @@ async function commentsAfter(
 	return out;
 }
 
-/** The compare body: GitHub sends the raw diff; a JSON-encoded string (a wrapped endpoint)
- * is decoded, anything else stays raw. */
-function compareDiff(stdout: string): string {
-	try {
-		const v: unknown = JSON.parse(stdout);
-		if (typeof v === "string") return v;
-	} catch {
-		// Not JSON: keep the raw text.
-	}
-	return stdout;
-}
-
 /**
  * What a re-review of `head` needs: the board's earlier review (the posted GitHub review, or the
  * saved draft when the first review was never posted), the comments newer than it, and the code
@@ -722,7 +710,7 @@ export async function fetchReReviewContext(
 						"Accept: application/vnd.github.diff",
 						`repos/${o.repo}/compare/${earlier.head}...${o.head}`,
 					])
-					.then((r) => (r.code === 0 ? compareDiff(r.stdout) : null));
+					.then((r) => (r.code === 0 ? r.stdout : null));
 	return { review: earlier.review, comments, rangeDiff };
 }
 
