@@ -9,6 +9,13 @@ export interface ProcessInfo {
 	started: number;
 }
 
+/** A process whose working directory sits inside a tree a caller is about to destroy (OTTR-697). */
+export interface CwdProcess {
+	pid: number;
+	/** Full command line; the comm name when the kernel reports no argv; "(unknown)" when neither is readable. */
+	cmd: string;
+}
+
 export interface Platform {
 	/**
 	 * Kills `pid` and every process descended from it. Synchronous, so it also works inside a process
@@ -25,6 +32,15 @@ export interface Platform {
 	 * no permission, or the OS exposes no cwd). Advisory input for orphan facts only.
 	 */
 	cwdOf(pid: number): string;
+	/**
+	 * Read-only snapshot of every process whose working directory is `root` or below — the
+	 * discovery half of a reap before destroying `root` (worktrunk's `wt remove --reap`).
+	 * Never names the calling process, its descendants (the tracker's own turn tree), or a
+	 * process holding a controlling terminal (interactive shells and editors are never safe
+	 * to signal from a sweep). [] on platforms with no read-only foreign-cwd discovery
+	 * (Windows, non-Linux unix targets). Never throws.
+	 */
+	processesWithCwdUnder(root: string): CwdProcess[];
 	/** True when two absolute, slash-normalized paths name the same folder under the OS's case rules. */
 	samePath(a: string, b: string): boolean;
 }

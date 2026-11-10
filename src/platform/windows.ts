@@ -1,6 +1,6 @@
 // Windows implementation of the Platform contract (see index.ts).
 import { spawnSync } from "node:child_process";
-import type { Platform, ProcessInfo } from "./index.ts";
+import type { CwdProcess, Platform, ProcessInfo } from "./index.ts";
 
 // One parsed JSON entry -> ProcessInfo, or null when the entry is not a real user process.
 function toProcess(e: unknown): ProcessInfo | null {
@@ -72,5 +72,11 @@ export const windows = {
 	// facts resolve only through --session-dir there; "" is the documented "unknown".
 	cwdOf(_pid: number): string {
 		return "";
+	},
+
+	// No read-only foreign cwd (see cwdOf), so reap discovery has no data: [] keeps
+	// removeWorktree's retry loop at its plain sleep-and-retry behavior here.
+	processesWithCwdUnder(_root: string): CwdProcess[] {
+		return [];
 	},
 } satisfies Platform;

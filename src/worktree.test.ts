@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
 	appendFileSync,
 	chmodSync,
@@ -18,7 +19,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { removeBelow } from "./confine.ts";
 import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
+import { platform } from "./platform/index.ts";
 import { archReviewDue } from "./scheduler.ts";
 import fc from "./test/properties.ts";
 import {
@@ -4827,4 +4830,146 @@ describe("commitMeta (OTTR-763)", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+});
+
+// OTTR-697: worktrunk's wt remove --reap pattern. A process a turn left behind and that
+// reparented to init (a leftover dev server) escapes killTree's descendant walk and keeps
+// removeWorktree's retry loop failing with EBUSY. The first blocked retry reaps holders
+// whose cwd sits under the worktree, then the removal proceeds. Real processes throughout:
+// `setsid -f` gives a new session (no controlling tty) and an init parent — the exact
+// leftover shape; script(1) gives a pty holder the sweep must spare. The sleeps below poll
+// real process state: a spawned process's /proc entry has no promise or event to await,
+// so the loops exit on the condition, never on a guessed duration.
+describe("removeWorktree reap (OTTR-697)", () => {
+	const hasSetsid =
+		spawnSync("setsid", ["--version"], { stdio: "ignore" }).status === 0;
+	const hasScript =
+		spawnSync("script", ["--version"], { stdio: "ignore" }).status === 0;
+	const gate = process.platform !== "linux" || !hasSetsid || !hasScript;
+
+	/** A main checkout with one commit; returns it. */
+	async function checkout(): Promise<{ main: string }> {
+		const main = repo();
+		await must(main, "init", "-q", "-b", "main");
+		await must(main, "commit", "-q", "--allow-empty", "-m", "init");
+		return { main };
+	}
+
+	/** True once pid is dead or (Linux) a SIGKILLed zombie; same shape as platform.test.ts. */
+	function isGone(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return true;
+		}
+		try {
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			return (
+				stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) === "Z"
+			);
+		} catch {
+			return true; // vanished between kill(0) and the read
+		}
+	}
+
+	/** Polls the sweep until it names a holder under root; null after 5s. */
+	async function holdersIn(root: string) {
+		for (let ms = 0; ms < 5000; ms += 100) {
+			const found = platform.processesWithCwdUnder(root);
+			if (found.length > 0) return found;
+			await Bun.sleep(100);
+		}
+		return null;
+	}
+
+	/** The removeDir seam: EBUSY on the first attempt, then confine's real remover. */
+	function busyThenRemove() {
+		let calls = 0;
+		const run = (anchor: string, target: string) => {
+			if (calls++ === 0)
+				throw Object.assign(new Error("EBUSY: held by a leftover process"), {
+					code: "EBUSY",
+				});
+			removeBelow(anchor, target);
+		};
+		return { run, calls: () => calls };
+	}
+
+	test.skipIf(gate)(
+		"reaps a detached holder inside the worktree and removes the tree",
+		async () => {
+			const { main } = await checkout();
+			// An unregistered dir, so git's own remove fails and removeBelow does the work.
+			const wt = join(main, ".worktrees", "OTTR-697");
+			mkdirSync(wt, { recursive: true });
+			writeFileSync(join(wt, "file.txt"), "x");
+			Bun.spawn(["setsid", "-f", "sleep", "300"], {
+				cwd: wt,
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+			const holders = await holdersIn(wt);
+			expect(holders).not.toBeNull();
+			const log: string[] = [];
+			const removeDir = busyThenRemove();
+			await removeWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: null,
+				log: (line) => log.push(line),
+				removeDir: removeDir.run,
+			});
+			expect(existsSync(wt)).toBe(false);
+			// One blocked attempt, one clean attempt after the reap — not the exhausted ladder.
+			expect(removeDir.calls()).toBe(2);
+			for (const holder of holders!) {
+				expect(isGone(holder.pid)).toBe(true);
+				expect(
+					log.some(
+						(l) => l.includes(String(holder.pid)) && l.includes("sleep"),
+					),
+				).toBe(true);
+			}
+		},
+		60_000,
+	);
+
+	test.skipIf(gate)(
+		"holders beside the worktree and holders with a tty survive the sweep",
+		async () => {
+			const { main } = await checkout();
+			const wt = join(main, ".worktrees", "OTTR-697b");
+			mkdirSync(wt, { recursive: true });
+			writeFileSync(join(wt, "file.txt"), "x");
+			const sibling = join(main, ".sibling");
+			mkdirSync(sibling, { recursive: true });
+			Bun.spawn(["setsid", "-f", "sleep", "300"], {
+				cwd: sibling,
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+			// A pty holder inside the worktree: the path matches, the tty guard must spare it.
+			const pty = Bun.spawn(["script", "-qec", "sleep 300", "/dev/null"], {
+				cwd: wt,
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+			const siblingHolders = await holdersIn(sibling);
+			expect(siblingHolders).not.toBeNull();
+			const log: string[] = [];
+			await removeWorktree({
+				mainPath: main,
+				worktreePath: wt,
+				branch: null,
+				log: (line) => log.push(line),
+				removeDir: busyThenRemove().run,
+			});
+			expect(existsSync(wt)).toBe(false);
+			expect(log.some((l) => l.startsWith("reap:"))).toBe(false);
+			for (const holder of siblingHolders!)
+				expect(isGone(holder.pid)).toBe(false);
+			expect(isGone(pty.pid)).toBe(false);
+			// Cleanup the survivors with the platform's own killer, as platform.test.ts does.
+			for (const holder of siblingHolders!) platform.killTree(holder.pid);
+			platform.killTree(pty.pid);
+		},
+		60_000,
+	);
 });

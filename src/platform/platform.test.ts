@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Readable } from "node:stream";
-import { platform } from "./index.ts";
+import { type CwdProcess, platform } from "./index.ts";
 import { unix } from "./unix.ts";
 
 /** First stdout line of a long-lived child; the pipe stays open, so read incrementally. */
@@ -165,4 +167,115 @@ describe.skipIf(process.platform === "win32")("unix platform", () => {
 test("cwdOf reads /proc/<pid>/cwd and empty-strings a gone pid", () => {
 	expect(unix.cwdOf(process.pid)).toBe(process.cwd());
 	expect(unix.cwdOf(2_000_000_000)).toBe("");
+});
+
+// OTTR-697: the reap discovery behind removeWorktree's blocked retry. Real processes: a
+// `setsid -f` sleeper's cwd lands under the root and it reparents to init — the exact
+// leftover shape the sweep must name. script(1) allocates a pty, so its child holds a
+// controlling terminal and must stay unnamed; a `setsid` (no -f) sleeper stays our own
+// child, so only the own-tree guard can leave it unnamed.
+const hasSetsid =
+	spawnSync("setsid", ["--version"], { stdio: "ignore" }).status === 0;
+const hasScript =
+	spawnSync("script", ["--version"], { stdio: "ignore" }).status === 0;
+
+describe.skipIf(process.platform !== "linux" || !hasSetsid || !hasScript)(
+	"processesWithCwdUnder (OTTR-697 reap discovery)",
+	() => {
+		function reapRoot(): string {
+			return mkdtempSync(join(tmpdir(), "ott-reap-"));
+		}
+
+		/** Polls the sweep until it names a holder under root; null after 5s. */
+		async function waitNamed(root: string): Promise<CwdProcess[] | null> {
+			for (let ms = 0; ms < 5000; ms += 100) {
+				const found = platform.processesWithCwdUnder(root);
+				if (found.length > 0) return found;
+				await Bun.sleep(100);
+			}
+			return null;
+		}
+
+		const spawnLeftover = (cwd: string) =>
+			Bun.spawn(["setsid", "-f", "sleep", "300"], {
+				cwd,
+				stdio: ["ignore", "ignore", "ignore"],
+			});
+
+		/** After the control is named, keep sweeping: the excluded holder must never appear. */
+		async function sweepRounds(root: string, excluded: number) {
+			for (let round = 0; round < 10; round++) {
+				await Bun.sleep(200);
+				const named = platform.processesWithCwdUnder(root);
+				expect(named).toHaveLength(1);
+				expect(named[0]!.pid).not.toBe(excluded);
+			}
+		}
+
+		test("names a detached holder inside root, and only inside", async () => {
+			const root = reapRoot();
+			const sibling = reapRoot();
+			try {
+				spawnLeftover(root);
+				spawnLeftover(sibling);
+				const inRoot = await waitNamed(root);
+				expect(inRoot).not.toBeNull();
+				expect(inRoot).toHaveLength(1);
+				expect(inRoot![0]!.cmd).toContain("sleep");
+				const inSibling = await waitNamed(sibling);
+				expect(inSibling).not.toBeNull();
+				expect(inSibling).toHaveLength(1);
+				expect(inSibling![0]!.pid).not.toBe(inRoot![0]!.pid);
+				platform.killTree(inRoot![0]!.pid);
+				platform.killTree(inSibling![0]!.pid);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+				rmSync(sibling, { recursive: true, force: true });
+			}
+		}, 30_000);
+
+		test("spares a holder with a controlling terminal", async () => {
+			const root = reapRoot();
+			try {
+				spawnLeftover(root); // positive control: the sweep names tty-free holders
+				const pty = Bun.spawn(["script", "-qec", "sleep 300", "/dev/null"], {
+					cwd: root,
+					stdio: ["ignore", "ignore", "ignore"],
+				});
+				const named = await waitNamed(root);
+				expect(named).not.toBeNull();
+				expect(named).toHaveLength(1);
+				await sweepRounds(root, pty.pid);
+				platform.killTree(pty.pid);
+				platform.killTree(named![0]!.pid);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}, 30_000);
+
+		test("never names the calling process's own tree", async () => {
+			const root = reapRoot();
+			try {
+				// setsid without -f: fresh session (no controlling tty), still our direct child.
+				const child = Bun.spawn(["setsid", "sleep", "300"], {
+					cwd: root,
+					stdio: ["ignore", "ignore", "ignore"],
+				});
+				spawnLeftover(root); // positive control
+				const named = await waitNamed(root);
+				expect(named).not.toBeNull();
+				expect(named).toHaveLength(1);
+				await sweepRounds(root, child.pid);
+				platform.killTree(child.pid);
+				platform.killTree(named![0]!.pid);
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}, 30_000);
+	},
+);
+
+test("processesWithCwdUnder never names the calling process itself", () => {
+	const named = platform.processesWithCwdUnder(process.cwd());
+	expect(named.some((p) => p.pid === process.pid)).toBe(false);
 });

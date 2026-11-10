@@ -3625,6 +3625,7 @@ export function createTurnLoop(
 					mainPath: e.path,
 					worktreePath: wt,
 					branch,
+					log,
 				})
 				.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
 			return null;
@@ -3809,6 +3810,7 @@ export function createTurnLoop(
 					mainPath: e.path,
 					worktreePath: wt,
 					branch,
+					log,
 				})
 				.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
 			return true;
@@ -8329,6 +8331,7 @@ export function createTurnLoop(
 				mainPath: st.e.path,
 				worktreePath: st.loc.wt,
 				branch,
+				log: st.log,
 			});
 			st.log("- worktree removed");
 		} catch (err) {
@@ -8579,6 +8582,7 @@ export function createTurnLoop(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: keepBranch ? null : task.branch,
+				log: (line) => appendLog(store, id, line),
 			});
 		} catch (err) {
 			appendLog(store, id, `! cancel removeWorktree: ${errmsg(err)}`);
@@ -8747,6 +8751,7 @@ export function createTurnLoop(
 					mainPath: e.path,
 					worktreePath: task.worktree,
 					branch: task.branch,
+					log: (line) => appendLog(store, id, line),
 				});
 		} catch (err) {
 			appendLog(store, id, `! removeWorktree: ${errmsg(err)}`);

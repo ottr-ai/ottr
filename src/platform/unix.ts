@@ -1,7 +1,8 @@
 // Unix (Linux today, macOS later) implementation of the Platform contract (see index.ts).
 import { spawnSync } from "node:child_process";
-import { readlinkSync } from "node:fs";
-import type { Platform, ProcessInfo } from "./index.ts";
+import type { Dirent } from "node:fs";
+import { readdirSync, readFileSync, readlinkSync } from "node:fs";
+import type { CwdProcess, Platform, ProcessInfo } from "./index.ts";
 
 // ponytail: 32 MiB caps the ps snapshots (~1 MiB today under Stryker load, full argv listing >1 MiB).
 // Ceiling: a host with a process table beyond 32 MiB of output still fails; upgrade: stream via async spawn.
@@ -39,6 +40,47 @@ export function descendants(pid: number): number[] | null {
 	}
 	return out;
 }
+
+/** Fields of /proc/<pid>/stat after "comm)": state, ppid, pgrp, session, tty_nr, ... */
+function statTail(pid: number): string[] | null {
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+	} catch {
+		return null;
+	}
+}
+
+/** True when the process holds a controlling terminal (interactive shells, editors) — or when
+ * its stat is unreadable: a sweep must spare what it cannot read, never guess. */
+function holdsTty(pid: number): boolean {
+	const fields = statTail(pid);
+	if (fields === null) return true;
+	return Number(fields[4]) !== 0;
+}
+
+/** Full command line; comm fallback; "(unknown)" when the kernel reports neither. */
+function commandOf(pid: number): string {
+	try {
+		const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+		const cmd = argv.replaceAll("\0", " ").trim();
+		if (cmd !== "") return cmd;
+	} catch {
+		// fall through to comm
+	}
+	try {
+		const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+		if (comm !== "") return comm;
+	} catch {
+		// vanished mid-sweep
+	}
+	return "(unknown)";
+}
+
+const underRoot = (cwd: string, root: string): boolean => {
+	const base = root.length > 1 && root.endsWith("/") ? root.slice(0, -1) : root;
+	return cwd === base || cwd.startsWith(`${base}/`);
+};
 
 export const unix = {
 	killTree(
@@ -100,5 +142,39 @@ export const unix = {
 		} catch {
 			return "";
 		}
+	},
+
+	// OTTR-697 (worktrunk's wt remove --reap discovery): one read-only /proc walk. A process
+	// that reparented to init escapes killTree's ps snapshot, so a leftover dev server with
+	// its cwd under a worktree is named here instead. Linux only: readdir("/proc") fails
+	// elsewhere and yields [].
+	processesWithCwdUnder(root: string): CwdProcess[] {
+		let entries: Dirent[];
+		try {
+			entries = readdirSync("/proc", { withFileTypes: true });
+		} catch {
+			return [];
+		}
+		// Never name the tracker's own turn tree: the calling process and everything it spawned.
+		const own = new Set<number>([
+			process.pid,
+			...(descendants(process.pid) ?? []),
+		]);
+		const out: CwdProcess[] = [];
+		for (const entry of entries) {
+			const pid = Number(entry.name);
+			if (!entry.isDirectory() || !Number.isInteger(pid) || pid <= 0) continue;
+			if (own.has(pid)) continue;
+			let cwd: string;
+			try {
+				cwd = readlinkSync(`/proc/${pid}/cwd`);
+			} catch {
+				continue; // gone or kernel-internal
+			}
+			if (!underRoot(cwd, root)) continue;
+			if (holdsTty(pid)) continue;
+			out.push({ pid, cmd: commandOf(pid) });
+		}
+		return out;
 	},
 } satisfies Platform;

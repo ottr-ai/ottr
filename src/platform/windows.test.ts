@@ -123,6 +123,10 @@ describe("windows platform", () => {
 			maxBuffer: 64 * 1024 * 1024,
 		});
 	});
+
+	test("processesWithCwdUnder is []: Windows has no read-only foreign cwd", () => {
+		expect(windows.processesWithCwdUnder("C:\\tmp\\wt")).toEqual([]);
+	});
 });
 
 test("cwdOf is always empty: Windows exposes no cwd of a foreign process", () => {

@@ -292,6 +292,7 @@ describe("worktree cleanup", () => {
 				mainPath: join(root, "main"),
 				worktreePath: join(dir, ".wt"),
 				branch: null,
+				log: expect.any(Function),
 			},
 		]);
 		const log = await Bun.file(store.logPath(t.id)).text();
@@ -925,7 +926,12 @@ describe("kept-worktree hygiene", () => {
 			},
 		]);
 		expect(ops.calls.remove).toEqual([
-			{ mainPath: join(root, "main"), worktreePath: wt, branch: null },
+			{
+				mainPath: join(root, "main"),
+				worktreePath: wt,
+				branch: null,
+				log: expect.any(Function),
+			},
 		]);
 		const after = store.getTask(t.id)!;
 		expect(after.state).toBe("idle");
@@ -1054,7 +1060,12 @@ describe("kept-worktree hygiene", () => {
 			},
 		]);
 		expect(ops.calls.remove).toEqual([
-			{ mainPath: join(root, "main"), worktreePath: wt, branch: null },
+			{
+				mainPath: join(root, "main"),
+				worktreePath: wt,
+				branch: null,
+				log: expect.any(Function),
+			},
 		]);
 		expect(store.getTask(t.id)!.state).toBe("idle");
 		store.close();
@@ -1831,7 +1842,12 @@ describe("arch-review changed-line coverage", () => {
 			},
 		]);
 		expect(ops.calls.remove).toEqual([
-			{ mainPath: join(root, "main"), worktreePath: wt, branch: null },
+			{
+				mainPath: join(root, "main"),
+				worktreePath: wt,
+				branch: null,
+				log: expect.any(Function),
+			},
 		]);
 		const after = store.getTask(t.id)!;
 		expect(after).toMatchObject({
@@ -2987,6 +3003,7 @@ describe("prPass", () => {
 				mainPath: join(root, "main"),
 				worktreePath: join(root, "pr-merged", ".wt"),
 				branch: "ottr/552",
+				log: expect.any(Function),
 			},
 		]);
 		const log = await Bun.file(store.logPath(t.id)).text();

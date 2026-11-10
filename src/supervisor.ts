@@ -56,6 +56,8 @@ export interface SupervisorOps {
 		mainPath: string;
 		worktreePath: string;
 		branch: string | null;
+		/** Card-log hook: reap kills land here; the supervisor passes appendLog. */
+		log?: (line: string) => void;
 	}): Promise<void>;
 	unsavedWork(worktreePath: string, target: string): Promise<string | null>;
 	statusRows(worktreePath: string): Promise<string[]>;
@@ -522,6 +524,7 @@ export function createSupervisor(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: t.branch,
+				log: (line) => ops.appendLog(e.store, t.id, line),
 			});
 			cleanup.delete(key);
 			ops.appendLog(
@@ -863,6 +866,7 @@ export function createSupervisor(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: t.branch,
+				log: (line) => ops.appendLog(e.store, t.id, line),
 			});
 		} catch (err) {
 			ops.appendLog(
@@ -1699,6 +1703,7 @@ export function createSupervisor(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: t.branch,
+				log: (line) => ops.appendLog(e.store, t.id, line),
 			});
 			ops.appendLog(e.store, t.id, "supervisor: worktree removed");
 		} catch (err) {

@@ -9074,6 +9074,7 @@ describe("arch-review survivor kills", () => {
 				mainPath: store.path,
 				worktreePath: join(store.worktreesDir, task.id),
 				branch: `ott/${task.id}`,
+				log: expect.any(Function),
 			},
 		]);
 	});
@@ -9325,6 +9326,7 @@ describe("arch-review survivor kills", () => {
 				mainPath: store.path,
 				worktreePath: join(store.worktreesDir, task.id),
 				branch: store.getTask(task.id)!.branch,
+				log: expect.any(Function),
 			},
 		]);
 	});
@@ -14392,6 +14394,7 @@ describe("turn survivor round 5 — run setup", () => {
 				mainPath: store.path,
 				worktreePath: join(store.worktreesDir, task.id),
 				branch,
+				log: expect.any(Function),
 			},
 		]);
 		expect(record.runs).toHaveLength(0);

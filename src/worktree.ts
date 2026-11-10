@@ -27,6 +27,7 @@ import {
 import { githubHost, hostMatcher } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
 import { HOSTED_SECRET_ENV } from "./hosted.ts";
+import { platform } from "./platform/index.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
 export interface GitResult {
@@ -1365,25 +1366,70 @@ export async function createWorktree(o: {
 	}
 }
 
+/**
+ * OTTR-697, worktrunk's `wt remove --reap` pattern: a process a turn left behind and that
+ * reparented to init (a leftover dev server) escapes killTree's descendant walk, and one with
+ * its working directory under the worktree keeps every removal retry failing. Discovery is the
+ * platform's read-only sweep; it never names the tracker's own tree or a process holding a
+ * controlling terminal (interactive shells, editors), so the sweep signals only real leftovers.
+ * Every kill lands in the task log with pid, command and reason. No-op on platforms whose
+ * discovery has no data (Windows, non-Linux).
+ */
+function reapHolders(root: string, log?: (line: string) => void): void {
+	for (const holder of platform.processesWithCwdUnder(root)) {
+		log?.(
+			`reap: killing ${holder.pid} (${holder.cmd}): its working directory sits inside the worktree being removed`,
+		);
+		platform.killTree(holder.pid);
+	}
+}
+
+/**
+ * The removal retry ladder: up to four attempts to delete the tree below the anchor. The
+ * first EBUSY/EPERM failure reaps the holders once (OTTR-697), so the next attempt starts
+ * clean instead of burning the ladder against a process that never lets go.
+ */
+async function removeTreeWithReap(
+	anchor: string,
+	root: string,
+	log: ((line: string) => void) | undefined,
+	removeDir: (anchor: string, target: string) => void,
+): Promise<void> {
+	let reaped = false;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			removeDir(anchor, root);
+			return;
+		} catch (e) {
+			const code = (e as { code?: string }).code;
+			if (attempt >= 3 || (code !== "EBUSY" && code !== "EPERM")) throw e;
+			if (!reaped) {
+				reaped = true;
+				reapHolders(root, log);
+			}
+			await Bun.sleep(500);
+		}
+	}
+}
+
 export async function removeWorktree(o: {
 	mainPath: string;
 	worktreePath: string;
 	branch: string | null;
+	/** Task-log hook: reap kills land here; callers pass their card log. */
+	log?: (line: string) => void;
+	/** Test seam: the retry loop's tree remover; defaults to confine's removeBelow. */
+	removeDir?: (anchor: string, target: string) => void;
 }): Promise<void> {
 	await guardAdminEntries(o.mainPath, null);
 	await git(["worktree", "remove", "--force", o.worktreePath], o.mainPath); // best effort
 	if (existsSync(o.worktreePath)) {
-		const anchor = worktreeAnchor(o.mainPath, o.worktreePath);
-		for (let attempt = 0; ; attempt++) {
-			try {
-				removeBelow(anchor, o.worktreePath);
-				break;
-			} catch (e) {
-				const code = (e as { code?: string }).code;
-				if (attempt >= 3 || (code !== "EBUSY" && code !== "EPERM")) throw e;
-				await Bun.sleep(500);
-			}
-		}
+		await removeTreeWithReap(
+			worktreeAnchor(o.mainPath, o.worktreePath),
+			o.worktreePath,
+			o.log,
+			o.removeDir ?? removeBelow,
+		);
 	}
 	await guardAdminEntries(o.mainPath, o.worktreePath);
 	if (o.branch) await git(["branch", "-D", o.branch], o.mainPath); // best effort
