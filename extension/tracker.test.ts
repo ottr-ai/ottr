@@ -616,11 +616,12 @@ describe("propose_task tool", () => {
 		expect(tool?.loadMode).toBe("essential");
 	});
 
-	test("declares exactly prompt, model and the five summary fields", () => {
+	test("declares exactly prompt, model, project and the five summary fields", () => {
 		process.env.OTTR_RETRO = "1";
 		expect(Object.keys(fakePi().propose_task?.parameters ?? {})).toEqual([
 			"prompt",
 			"model",
+			"project",
 			"whatChanges",
 			"why",
 			"gain",
@@ -642,6 +643,13 @@ describe("propose_task tool", () => {
 			const out = await tools.propose_task!.execute("t1", params);
 			expect(text(out)).toMatch(/^Error: /);
 		}
+		const blank = await tools.propose_task!.execute("t1", {
+			prompt: "p",
+			project: "   ",
+		});
+		expect(text(blank)).toBe(
+			"Error: project must be a non-empty string when given.",
+		);
 	});
 
 	test("rejects non-string, blank and over-400 summary fields", async () => {
@@ -673,6 +681,7 @@ describe("propose_task tool", () => {
 		const tools = fakePi();
 		const out = await tools.propose_task!.execute("t1", {
 			prompt: "  improve the thing  ",
+			project: "agent-data",
 			whatChanges: "edit prompts.ts",
 			why: "OTTR-1 duplicated text",
 			gain: "200 characters per card",

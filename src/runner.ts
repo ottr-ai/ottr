@@ -893,6 +893,8 @@ export interface EventState {
 			risk: string;
 			check: string;
 		} | null;
+		/** The board project the card files on; null files on the retro's own project. */
+		project: string | null;
 	} | null;
 	/** Every valid `propose_task` call, in order: a retro records at most one, a review one per finding. */
 	recorded: RecordedFinding[];
@@ -999,6 +1001,10 @@ function applyProposeTask(state: EventState, e: AnyRec): void {
 			prompt: call.prompt,
 			model: call.model,
 			summary: proposedSummary(args),
+			project:
+				typeof args.project === "string" && args.project.trim() !== ""
+					? args.project.trim()
+					: null,
 		};
 }
 

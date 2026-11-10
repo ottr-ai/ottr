@@ -156,6 +156,16 @@ function modelValidationError(params: CreateTaskParams): string | null {
 	return null;
 }
 
+// The project: a non-empty string when given. The known-name check runs at the
+// settle, which holds the board's projects; a retro run carries no board env to
+// list them here.
+function projectValidationError(params: CreateTaskParams): string | null {
+	if (params.project !== undefined && trimmed(params.project) === "") {
+		return "Error: project must be a non-empty string when given.";
+	}
+	return null;
+}
+
 // The five summary fields: 1-400 trimmed characters each, when given.
 function summaryFieldsValidationError(params: CreateTaskParams): string | null {
 	const summaryFields = [
@@ -201,6 +211,7 @@ function proposeValidationError(
 	return (
 		promptValidationError(params) ??
 		modelValidationError(params) ??
+		projectValidationError(params) ??
 		summaryFieldsValidationError(params) ??
 		rankValidationError(params, reviewMode)
 	);
@@ -735,6 +746,12 @@ export default function (pi: Pi) {
 								.string()
 								.optional()
 								.describe("Model override for the task (provider/model)"),
+							project: z
+								.string()
+								.optional()
+								.describe(
+									"Project on the board to file the proposal card in; omit to file in the retro's own project",
+								),
 							whatChanges: z
 								.string()
 								.optional()

@@ -149,6 +149,7 @@ interface Recorded {
 		prompt: string;
 		model: string | null;
 		summary: ProposalSummary | null;
+		project: string | null;
 	} | null;
 	/** The fake run resolves `done` with these findings (a review run's propose_task calls). */
 	recorded: RecordedFinding[];
@@ -538,6 +539,7 @@ describe("turn loop", () => {
 				risk: "none found",
 				check: "bun test src/merge-bench.test.ts passes.",
 			},
+			project: null,
 		};
 		const task = store.createTask(
 			`${RETRO_MARKER}the weekly retro`,
@@ -655,6 +657,7 @@ describe("turn loop", () => {
 			prompt: "Add a benchmark for the merge path",
 			model: null,
 			summary: null,
+			project: null,
 		};
 
 		await loop.runTurn(store.name, retro.id);
@@ -691,7 +694,12 @@ describe("turn loop", () => {
 						: `${PROPOSED_REASON_PREFIX}an older retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 			});
 		}
-		record.proposal = { prompt: "one too many", model: null, summary: null };
+		record.proposal = {
+			prompt: "one too many",
+			model: null,
+			summary: null,
+			project: null,
+		};
 
 		await loop.runTurn(store.name, retro.id);
 
@@ -718,6 +726,7 @@ describe("turn loop", () => {
 			prompt: "fits under the cap",
 			model: null,
 			summary: null,
+			project: null,
 		};
 
 		await loop.runTurn(store.name, retro.id);
@@ -725,6 +734,92 @@ describe("turn loop", () => {
 		const kid = store.listTasks().find((t) => t.followUpOf === retro.id);
 		expect(kid).toBeDefined();
 		expect(kid!.prompt).toContain("fits under the cap");
+	});
+
+	test("a retro proposal with a project files the card on that project's store", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		// A second board project named by the proposal, like agent-data for a
+		// rules, skills or AGENTS.md change.
+		const root = mkdtempSync(join(tmpdir(), "turn-test-"));
+		dirs.push(root);
+		const agent = ProjectStore.open(join(root, "agent-data"));
+		stores.push(agent);
+		const projects = new Map([
+			[store.name, fakeProject(store)],
+			[agent.name, fakeProject(agent)],
+		]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, { commitsAhead: async () => 0 }),
+		);
+		record.proposal = {
+			prompt: "Add the targeting rule to the retro skill",
+			model: null,
+			summary: {
+				whatChanges: "Add the agent-data targeting rule to retro SKILL.md.",
+				why: "Retro proposals for agent-data landed on the retro's own project.",
+				gain: "No cross-project checkout guard park per proposal.",
+				risk: "none found",
+				check: "bun test src/turn.test.ts passes.",
+			},
+			project: agent.name,
+		};
+		const retro = store.createTask(
+			`${RETRO_MARKER}the weekly retro`,
+			null,
+			"retro",
+		);
+
+		await loop.runTurn(store.name, retro.id);
+
+		// The card lands on the named project, held and linked to the retro.
+		const kids = agent.listTasks().filter((t) => t.followUpOf === retro.id);
+		expect(kids).toHaveLength(1);
+		const kid = kids[0]!;
+		expect(kid.state).toBe("needs_you");
+		expect(kid.needsReason?.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
+		// The parent link names the retro's project, so the lineage rail
+		// resolves it across the board.
+		expect(kid.followUpOfProject).toBe(store.name);
+		// The five decision fields ride along for the Decide panel.
+		expect(kid.proposalSummary).toEqual(record.proposal!.summary);
+		expect(kid.prompt).toContain("handoffs");
+		// The handoff file lives under the filing project's store.
+		const handoff = readFileSync(
+			join(agent.tasksDir, "handoffs", `${kid.id}.md`),
+			"utf8",
+		);
+		expect(handoff).toContain("the weekly retro");
+		// The retro's own store holds no proposal card.
+		expect(
+			store.listTasks().filter((t) => t.followUpOf === retro.id),
+		).toHaveLength(0);
+		expect(logText(store, retro.id)).toContain(
+			`filed proposal ${kid.id} in project ${agent.name} (held for approval)`,
+		);
+	});
+
+	test("a retro proposal naming an unknown project drops with the known project names", async () => {
+		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		record.proposal = {
+			prompt: "an idea for a project that does not exist",
+			model: null,
+			summary: null,
+			project: "no-such-project",
+		};
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+
+		await loop.runTurn(store.name, retro.id);
+
+		expect(
+			store.listTasks().filter((t) => t.followUpOf === retro.id),
+		).toHaveLength(0);
+		expect(logText(store, retro.id)).toContain(
+			`retro: proposal dropped: unknown project "no-such-project" (known projects: ${store.name})`,
+		);
+		// The retro itself still settles done.
+		expect(store.getTask(retro.id)!.stage).toBe("done");
 	});
 
 	test("retro reply resumes with retroReplyPrompt, not the work reply", async () => {
@@ -10692,7 +10787,12 @@ describe("turn fork-born merge hold", () => {
 
 	test("a retro filed below fork-born work settles done and files its proposal", async () => {
 		const { store, record, loop, task } = forkCase();
-		record.proposal = { prompt: "Add a benchmark", model: null, summary: null };
+		record.proposal = {
+			prompt: "Add a benchmark",
+			model: null,
+			summary: null,
+			project: null,
+		};
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 		store.updateTask(retro.id, { followUpOf: task.id });
 		await loop.runTurn(store.name, retro.id);
@@ -16394,6 +16494,7 @@ describe("turn survivor round 5 — run finish", () => {
 			prompt: "not a retro idea",
 			model: null,
 			summary: null,
+			project: null,
 		};
 		const task = store.createTask("work please");
 
@@ -16422,7 +16523,12 @@ describe("turn survivor round 5 — run finish", () => {
 			commitsAhead: async () => 0,
 			startRun: runReturning(record, {
 				...askOutcome("which week?"),
-				proposed: { prompt: "premature idea", model: null, summary: null },
+				proposed: {
+					prompt: "premature idea",
+					model: null,
+					summary: null,
+					project: null,
+				},
 			}),
 		});
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
@@ -16449,6 +16555,7 @@ describe("turn survivor round 5 — run finish", () => {
 			prompt: "fits under the cap",
 			model: null,
 			summary: null,
+			project: null,
 		};
 
 		await loop.runTurn(store.name, retro.id);
@@ -16474,6 +16581,7 @@ describe("turn survivor round 5 — run finish", () => {
 			prompt: "fits under the cap",
 			model: null,
 			summary: null,
+			project: null,
 		};
 
 		await loop.runTurn(store.name, retro.id);
@@ -16486,7 +16594,12 @@ describe("turn survivor round 5 — run finish", () => {
 	test("a proposal filed when the handoffs folder already exists still gets its handoff", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
 		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
-		record.proposal = { prompt: "second idea", model: null, summary: null };
+		record.proposal = {
+			prompt: "second idea",
+			model: null,
+			summary: null,
+			project: null,
+		};
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 
 		await loop.runTurn(store.name, retro.id);
@@ -16499,7 +16612,12 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("the proposal handoff describes the settled retro: its summary and session", async () => {
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		record.proposal = { prompt: "an idea", model: null, summary: null };
+		record.proposal = {
+			prompt: "an idea",
+			model: null,
+			summary: null,
+			project: null,
+		};
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 
 		await loop.runTurn(store.name, retro.id);
@@ -16518,7 +16636,12 @@ describe("turn survivor round 5 — run finish", () => {
 		mkdirSync(store.tasksDir, { recursive: true });
 		// A plain file where the handoffs folder belongs: mkdir fails.
 		writeFileSync(join(store.tasksDir, "handoffs"), "not a folder");
-		record.proposal = { prompt: "bare idea", model: null, summary: null };
+		record.proposal = {
+			prompt: "bare idea",
+			model: null,
+			summary: null,
+			project: null,
+		};
 		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
 
 		await loop.runTurn(store.name, retro.id);

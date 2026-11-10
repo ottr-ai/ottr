@@ -1888,6 +1888,7 @@ describe("applyEvent", () => {
 			prompt: "Add tests for X",
 			model: "zai/glm",
 			summary: null,
+			project: null,
 		});
 		feed(s, {
 			type: "tool_execution_start",
@@ -1913,7 +1914,36 @@ describe("applyEvent", () => {
 			toolCallId: "p2",
 			args: { prompt: "Good" },
 		});
-		expect(s.proposed).toEqual({ prompt: "Good", model: null, summary: null });
+		expect(s.proposed).toEqual({
+			prompt: "Good",
+			model: null,
+			summary: null,
+			project: null,
+		});
+	});
+
+	test("a propose_task project names the filing project; blank or non-string stays null", () => {
+		const s = newEventState();
+		feed(s, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: { prompt: "P", project: "  agent-data  " },
+		});
+		expect(s.proposed).toEqual({
+			prompt: "P",
+			model: null,
+			summary: null,
+			project: "agent-data",
+		});
+		const t = newEventState();
+		feed(t, {
+			type: "tool_execution_start",
+			toolName: "propose_task",
+			toolCallId: "p1",
+			args: { prompt: "P", project: 42 },
+		});
+		expect(t.proposed?.project).toBeNull();
 	});
 
 	test("a model-less or non-string model propose becomes null", () => {
@@ -1924,7 +1954,12 @@ describe("applyEvent", () => {
 			toolCallId: "p1",
 			args: { prompt: "P", model: 42 },
 		});
-		expect(s.proposed).toEqual({ prompt: "P", model: null, summary: null });
+		expect(s.proposed).toEqual({
+			prompt: "P",
+			model: null,
+			summary: null,
+			project: null,
+		});
 	});
 
 	test("all five summary fields are captured, trimmed", () => {
@@ -2075,7 +2110,12 @@ describe("applyEvent", () => {
 			{ prompt: "Second", model: null, rank: 2, security: null },
 		]);
 		// Retro semantics keep the first valid call as the proposal.
-		expect(s.proposed).toEqual({ prompt: "First", model: null, summary: null });
+		expect(s.proposed).toEqual({
+			prompt: "First",
+			model: null,
+			summary: null,
+			project: null,
+		});
 	});
 
 	test("a bad rank, a fractional rank, and an unknown security fall back to null", () => {

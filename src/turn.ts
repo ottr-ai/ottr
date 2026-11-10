@@ -7498,7 +7498,11 @@ export function createTurnLoop(
 	}
 
 	/** A retro's proposal is filed as a held card (needs_you, followUpOf this retro): the
-	 * settle recheck above confirmed the card is still ours, so this write is safe. */
+	 * settle recheck above confirmed the card is still ours, so this write is safe.
+	 * A proposal whose call named a project files on that project's store (OTTR-787):
+	 * a change to rules, skills or AGENTS.md sources targets agent-data, and a card
+	 * there edits that checkout without tripping the cross-project checkout guard.
+	 * followUpOf keeps pointing at the retro, so the Decide panel works unchanged. */
 	async function fileRetroProposal(st: TurnSettle, next: Next): Promise<void> {
 		if (
 			!(
@@ -7508,21 +7512,33 @@ export function createTurnLoop(
 			)
 		)
 			return;
-		const openProposals = st.store
+		const targetName = st.result.proposed.project;
+		let store = st.store;
+		if (targetName !== null && targetName !== st.store.name) {
+			const tp = projects.get(targetName);
+			if (tp === undefined) {
+				st.log(
+					`retro: proposal dropped: unknown project "${targetName}" (known projects: ${[...projects.keys()].join(", ")})`,
+				);
+				return;
+			}
+			store = tp.store;
+		}
+		const openProposals = store
 			.listTasks()
 			.filter(
 				(x) =>
 					!x.cancelledAt &&
 					x.state === "needs_you" &&
 					isRetroProposalReason(x.needsReason) &&
-					st.store.listTurns(x.id).length === 0,
+					store.listTurns(x.id).length === 0,
 			).length;
 		if (openProposals >= 3) {
 			st.log("retro: proposal dropped: cap of 3 open proposals reached");
 			return;
 		}
-		const child = st.store.createTask(st.result.proposed.prompt);
-		const handoffPath = join(st.store.tasksDir, "handoffs", `${child.id}.md`);
+		const child = store.createTask(st.result.proposed.prompt);
+		const handoffPath = join(store.tasksDir, "handoffs", `${child.id}.md`);
 		let prompt = followUpPrompt({
 			text: st.result.proposed.prompt,
 			title: st.task.title,
@@ -7530,7 +7546,7 @@ export function createTurnLoop(
 		});
 		try {
 			writeBelow(
-				st.store.dataRoot,
+				store.dataRoot,
 				handoffPath,
 				handoffMarkdown({
 					task: st.store.getTask(st.id) ?? st.task,
@@ -7543,9 +7559,12 @@ export function createTurnLoop(
 			prompt = st.result.proposed.prompt;
 			st.log(`! handoff write failed: ${errmsg(err)}`);
 		}
-		st.store.updateTask(child.id, {
+		store.updateTask(child.id, {
 			prompt,
 			followUpOf: st.id,
+			// A foreign filing stores the retro's project, so the lineage rail
+			// links the parent across the board (null keeps the own project).
+			followUpOfProject: store === st.store ? null : st.store.name,
 			// A null model means the proposal card runs on the default role.
 			model: st.result.proposed.model,
 			state: "needs_you",
@@ -7559,7 +7578,11 @@ export function createTurnLoop(
 			// The drawer's decision panel reads it; older proposals keep null.
 			proposalSummary: st.result.proposed.summary,
 		});
-		st.log(`- filed proposal ${child.id} (held for approval)`);
+		st.log(
+			store === st.store
+				? `- filed proposal ${child.id} (held for approval)`
+				: `- filed proposal ${child.id} in project ${store.name} (held for approval)`,
+		);
 	}
 
 	/** A review's recorded findings: Ottr caps them, checks the selection with a second model

@@ -602,11 +602,13 @@ export interface RunResult {
 	/** The agent's outstanding `ask` call (last one seen), or null. */
 	asked: AskQuestion[] | null;
 	/** A retro run's first valid `propose_task` call (proposal held for approval), or null.
-	 * summary holds the five decision fields the call carried, or null when it sent none. */
+	 * summary holds the five decision fields the call carried, or null when it sent none.
+	 * project names the board project the card files on; null files on the retro's own. */
 	proposed: {
 		prompt: string;
 		model: string | null;
 		summary: ProposalSummary | null;
+		project: string | null;
 	} | null;
 	/** Every valid `propose_task` call of the run, in order: a retro records at most one (the
 	 * extension refuses a second), a review records one per finding. */
