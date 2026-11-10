@@ -5008,9 +5008,14 @@ export function createTurnLoop(
 
 	/** The env marks a retro, review or scout run carries (the extension registers its
 	 * per-kind tools from them; the board env is stripped for a retro, whose proposal
-	 * files here). */
+	 * files here). A retro also carries the board's project names: the proposal's
+	 * project check must fail the call with the list, not the settle (OTTR-787). */
 	function retroEnvMarks(idn: TurnIdentity): Record<string, string> {
-		if (idn.retroCard) return { OTTR_RETRO: "1" };
+		if (idn.retroCard)
+			return {
+				OTTR_RETRO: "1",
+				OTTR_PROJECTS: [...projects.keys()].join("\n"),
+			};
 		if (idn.reviewCard) return { OTTR_REVIEW: "1" };
 		if (idn.scout) return { OTTR_TRENDING: "1" };
 		return {};

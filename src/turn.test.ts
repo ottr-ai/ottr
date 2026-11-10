@@ -553,7 +553,10 @@ describe("turn loop", () => {
 		const run = record.runs[0]!;
 		expect(run.prompt).toContain("the weekly retro");
 		expect(run.board).toBeNull();
-		expect(run.env).toEqual({ OTTR_RETRO: "1" });
+		expect(run.env).toEqual({
+			OTTR_RETRO: "1",
+			OTTR_PROJECTS: store.name,
+		});
 		expect(run.stripBoard).toBe(true);
 		expect(run.tools).toBe("read,grep,glob,report_outcome,propose_task");
 		expect(run.config).toBe(join(dirname("ext.ts"), "retro.yml"));
@@ -801,6 +804,9 @@ describe("turn loop", () => {
 	});
 
 	test("a retro proposal naming an unknown project drops with the known project names", async () => {
+		// The extension rejects an unknown name at the call when the run carries
+		// the board's list; this settle check guards a list that is missing or
+		// went stale (a project removed while the retro ran).
 		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
 		record.proposal = {
 			prompt: "an idea for a project that does not exist",

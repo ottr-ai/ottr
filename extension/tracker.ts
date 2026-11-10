@@ -156,12 +156,32 @@ function modelValidationError(params: CreateTaskParams): string | null {
 	return null;
 }
 
-// The project: a non-empty string when given. The known-name check runs at the
-// settle, which holds the board's projects; a retro run carries no board env to
-// list them here.
-function projectValidationError(params: CreateTaskParams): string | null {
-	if (params.project !== undefined && trimmed(params.project) === "") {
+// The board's project names a retro run's env carries (OTTR_PROJECTS, newline
+// separated): the proposal's project must name one of them, or the call fails
+// with the list and spends no proposal lock. Read per call like pinnedName: the
+// env is fixed for the run, but tests set it after load. Empty when no list was
+// injected (an old board or a direct run): the check then cannot run here and
+// the settle still guards the name.
+function retroKnownProjects(): string[] {
+	return (process.env.OTTR_PROJECTS ?? "")
+		.split("\n")
+		.map((n) => n.trim())
+		.filter((n) => n !== "");
+}
+
+// The project: a non-empty string when given, and one of the board's projects
+// when the run carries their names (OTTR-787).
+function projectValidationError(
+	params: CreateTaskParams,
+	known: string[],
+): string | null {
+	if (params.project === undefined) return null;
+	const target = trimmed(params.project);
+	if (target === "") {
 		return "Error: project must be a non-empty string when given.";
+	}
+	if (known.length > 0 && !known.includes(target)) {
+		return `Error: unknown project "${target}". Known projects: ${known.join(", ")}. Propose again with one of these projects, or without one.`;
 	}
 	return null;
 }
@@ -207,11 +227,12 @@ function rankValidationError(
 function proposeValidationError(
 	params: CreateTaskParams,
 	reviewMode: boolean,
+	knownProjects: string[] = [],
 ): string | null {
 	return (
 		promptValidationError(params) ??
 		modelValidationError(params) ??
-		projectValidationError(params) ??
+		projectValidationError(params, knownProjects) ??
 		summaryFieldsValidationError(params) ??
 		rankValidationError(params, reviewMode)
 	);
@@ -809,7 +830,11 @@ export default function (pi: Pi) {
 						"Error: propose_task was already called in this retro; only one proposal is allowed.",
 					);
 				}
-				const error = proposeValidationError(params, reviewMode);
+				const error = proposeValidationError(
+					params,
+					reviewMode,
+					retroKnownProjects(),
+				);
 				if (error !== null) return textResult(error);
 				if (retroMode) proposed = true;
 				return textResult(

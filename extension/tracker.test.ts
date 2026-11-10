@@ -632,6 +632,9 @@ describe("propose_task tool", () => {
 
 	test("rejects a missing, blank, oversized prompt and a blank model", async () => {
 		process.env.OTTR_RETRO = "1";
+		// The board injects the project names a retro run checks proposal
+		// projects against; the list stays set for the accept test below.
+		process.env.OTTR_PROJECTS = "alate\nagent-data\nottr";
 		const tools = fakePi();
 		const bad: Record<string, unknown>[] = [
 			{},
@@ -679,6 +682,15 @@ describe("propose_task tool", () => {
 			return new Response("{}", { status: 200 });
 		}) as unknown as typeof fetch;
 		const tools = fakePi();
+		// An unknown name fails the call with the board's list and spends no
+		// proposal lock: the retry with a listed name records below.
+		const unknown = await tools.propose_task!.execute("t1", {
+			prompt: "improve the thing",
+			project: "no-such-project",
+		});
+		expect(text(unknown)).toBe(
+			'Error: unknown project "no-such-project". Known projects: alate, agent-data, ottr. Propose again with one of these projects, or without one.',
+		);
 		const out = await tools.propose_task!.execute("t1", {
 			prompt: "  improve the thing  ",
 			project: "agent-data",
@@ -694,6 +706,7 @@ describe("propose_task tool", () => {
 		expect(fetched).toBe(false);
 		const again = await tools.propose_task!.execute("t2", { prompt: "p" });
 		expect(text(again)).toContain("only one proposal is allowed");
+		delete process.env.OTTR_PROJECTS;
 	});
 });
 
