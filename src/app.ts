@@ -23,6 +23,7 @@ import {
 	type AlateOut,
 	alateHealth,
 	alateRotateKey,
+	alateUrlError,
 	commitConfigYml,
 	loadConfigYml,
 	noRedirectFetch,
@@ -2880,6 +2881,11 @@ export function createApp(deps: AppDeps) {
 	function refreshUpdates(): Promise<void> {
 		if (updatesInFlight !== null) return updatesInFlight;
 		if (alate.url === null || alate.key === null) return Promise.resolve();
+		const refused = alateUrlError(alate.url);
+		if (refused !== null) {
+			logError("updates pull", new Error(refused));
+			return Promise.resolve();
+		}
 		updatesInFlight = (async () => {
 			try {
 				let res: Response;
@@ -3037,6 +3043,8 @@ export function createApp(deps: AppDeps) {
 				status: 400,
 				error: "alate api key is not configured",
 			};
+		const refused = alateUrlError(alate.url);
+		if (refused !== null) return { ok: false, status: 400, error: refused };
 		if (provisioning)
 			return { ok: false, status: 409, error: "provisioning already running" };
 		provisioning = true;
@@ -3557,10 +3565,15 @@ export function createApp(deps: AppDeps) {
 		// HINDSIGHT_API_URL seeds the memory backend. A value saved under Settings -> Alate
 		// wins at every boot, and a saved null clears the seed until the next boot. The key
 		// never reaches a log or a view: alateView reports keySet only; GET /api/settings/alate-key
-		// is the one route that returns it.
+		// is the one route that returns it. A seed that alateUrlError refuses is dropped and logged.
 		if (alate.url === null) {
 			const seedUrl = process.env.ALATE_URL?.trim();
-			if (seedUrl) alate.url = seedUrl.replace(/\/+$/, "");
+			if (seedUrl) {
+				const stripped = seedUrl.replace(/\/+$/, "");
+				const refused = alateUrlError(stripped);
+				if (refused === null) alate.url = stripped;
+				else console.warn(`alate: refusing the ALATE_URL seed: ${refused}`);
+			}
 		}
 		if (alate.key === null) {
 			const seedKey = process.env.ALATE_API_KEY?.trim();
@@ -9878,15 +9891,10 @@ export function createApp(deps: AppDeps) {
 	}
 
 	function validateAlateUrl(trimmed: string): string | Response {
-		let parsed: URL;
-		try {
-			parsed = new URL(trimmed);
-		} catch {
-			return json({ error: "url must be a valid http(s) URL" }, 400);
-		}
-		return parsed.protocol !== "http:" && parsed.protocol !== "https:"
-			? json({ error: "url must be a valid http(s) URL" }, 400)
-			: trimmed.replace(/\/+$/, "");
+		const refused = alateUrlError(trimmed);
+		return refused === null
+			? trimmed.replace(/\/+$/, "")
+			: json({ error: refused }, 400);
 	}
 
 	function validateAlateValue(

@@ -3,6 +3,7 @@ import {
 	alateApi,
 	alateHealth,
 	alateRotateKey,
+	alateUrlError,
 	CONFIG_YML,
 	commitConfigYml,
 	ghApi,
@@ -13,6 +14,7 @@ import {
 	refreshAlateSnapshot,
 	saveConfigYml,
 } from "./alate.ts";
+import fc from "./test/properties.ts";
 
 type Hit = {
 	method: string;
@@ -56,6 +58,33 @@ describe("alateApi", () => {
 			ok: false,
 			status: 400,
 			error: "alate api key is not configured",
+		});
+	});
+	test("refuses a plain http url on a public host before any fetch", async () => {
+		serve(() => Response.json({}));
+		expect(
+			await alateApi(
+				{ url: "http://alate.example.com:4570", key: "k" },
+				"/x",
+				1000,
+			),
+		).toEqual({
+			ok: false,
+			status: 400,
+			error:
+				"url must use https:// (http:// is allowed only for loopback, private-network addresses and single-label host names)",
+		});
+		expect(hits.length).toBe(0);
+		// Contrast: an accepted url still passes the guard (happy path covered above).
+		expect(
+			await alateApi(
+				{ url: `http://127.0.0.1:${server.port}`, key: "k" },
+				"/api/state",
+				1000,
+			),
+		).toEqual({
+			ok: true,
+			body: expect.anything(),
 		});
 	});
 	test("GET sends the bearer, no body or content-type", async () => {
@@ -889,6 +918,18 @@ describe("commitConfigYml", () => {
 });
 
 describe("alateRotateKey", () => {
+	test("refuses a plain http url on a public host before any fetch", async () => {
+		serve(() => Response.json({}));
+		expect(
+			await alateRotateKey({ url: "http://alate.example.com:4570", key: "k" }),
+		).toEqual({
+			ok: false,
+			status: 400,
+			error:
+				"url must use https:// (http:// is allowed only for loopback, private-network addresses and single-label host names)",
+		});
+		expect(hits.length).toBe(0);
+	});
 	test("posts bearer auth to /api/key with no body and returns the key", async () => {
 		serve(() => Response.json({ key: "rotated" }));
 		expect(await alateRotateKey(alate)).toEqual({
@@ -951,4 +992,107 @@ describe("alateRotateKey", () => {
 		});
 	});
 	// The 10 s timeout case is skipped: it would wait the real 10 s.
+});
+
+describe("alateUrlError", () => {
+	// Contract-pinned strings.
+	const httpsMsg =
+		"url must use https:// (http:// is allowed only for loopback, private-network addresses and single-label host names)";
+	const invalidMsg = "url must be a valid http(s) URL";
+
+	test("accepts safe URLs (null)", () => {
+		for (const url of [
+			"https://alate.example.com",
+			"https://8.8.8.8",
+			"https://[fe80::1]",
+			"http://localhost:4570",
+			"http://LOCALHOST:4570/",
+			"http://127.0.0.1:4570",
+			"http://127.255.254.253/",
+			"http://[::1]:4570",
+			"http://alate:4570",
+			"http://foo/",
+			"http://alate:4570///",
+			"http://10.0.0.1",
+			"http://10.255.255.255",
+			"http://172.16.0.1",
+			"http://172.31.255.255",
+			"http://192.168.0.0",
+			"http://192.168.1.1",
+			"http://169.254.1.1",
+			"http://100.64.0.1",
+			"http://100.127.255.255",
+			"http://[fe80::1]",
+			"http://[febf::1]",
+		])
+			expect(alateUrlError(url)).toBeNull();
+	});
+
+	test("refuses plain http where the public internet can reach", () => {
+		for (const url of [
+			"http://alate.example.com:4570",
+			"http://example.com",
+			"http://alate.local",
+			"http://ottr.ai",
+			"http://8.8.8.8",
+			"http://1.1.1.1",
+			"http://11.0.0.1",
+			"http://100.63.255.255",
+			"http://100.128.0.0",
+			"http://172.15.255.255",
+			"http://172.32.0.0",
+			"http://[fe7f::1]",
+			"http://[fec0::1]",
+			// Mapped form; use the plain IPv4 literal instead.
+			"http://[::ffff:127.0.0.1]",
+		])
+			expect(alateUrlError(url)).toBe(httpsMsg);
+	});
+
+	test("refuses URLs that are not valid http(s)", () => {
+		for (const url of [
+			"ftp://x",
+			"file:///tmp",
+			"wss://x",
+			"about:blank",
+			"",
+			"not a url",
+			"://x",
+			"http://",
+			"a b",
+			"http://[",
+		])
+			expect(alateUrlError(url)).toBe(invalidMsg);
+	});
+});
+
+describe("alateUrlError property", () => {
+	// Gate: 200 runs, fixed seed (src/test/properties.ts), so the mutation runs see the same inputs.
+	// Multi-label hostnames: >=3 labels from a safe alphabet, no all-numeric labels (an
+	// all-numeric last label would canonicalize to an IP, which has its own ranges).
+	const labelArb = fc
+		.array(fc.constantFrom(..."abcdefghij".split("")), {
+			minLength: 1,
+			maxLength: 8,
+		})
+		.map((chars) => chars.join(""));
+	const hostArb = fc
+		.tuple(labelArb, labelArb, labelArb)
+		.map(([a, b, c]) => `${a}.${b}.${c}`);
+
+	test("arbitrary strings never throw", () => {
+		const prop = fc.property(fc.string(), (s) => {
+			const result = alateUrlError(s);
+			expect(result === null || typeof result === "string").toBe(true);
+		});
+		fc.assert(prop, { seed: 42, numRuns: 200 });
+	});
+
+	test("never accepts http: with a public DNS name; https: is never refused", () => {
+		const prop = fc.property(hostArb, (h) => {
+			expect(alateUrlError(`http://${h}`)).not.toBeNull();
+			expect(alateUrlError(`https://${h}`)).toBeNull();
+		});
+		fc.assert(prop, { seed: 42, numRuns: 200 });
+	});
 });

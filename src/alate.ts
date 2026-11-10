@@ -6,6 +6,69 @@ import { redirectProxyHint } from "./proxyHint.ts";
 
 type Alate = { url: string | null; key: string | null };
 
+/** An IPv4 dotted quad that WHATWG already canonicalized: its octets. */
+const ipv4Octets = (h: string): number[] | null => {
+	if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return null;
+	const octets = h.split(".").map(Number);
+	return octets.every((o) => o <= 255) ? octets : null;
+};
+
+/** Link-local / private-range checks for the lowercased, bracket-stripped IPv6 hostname. */
+const isLinkLocalV6 = (h: string): boolean => {
+	const first = h.match(/^([0-9a-f]{1,4}):/)?.[1];
+	return (
+		first !== undefined &&
+		Number.parseInt(first, 16) >= 0xfe80 &&
+		Number.parseInt(first, 16) <= 0xfebf
+	);
+};
+
+/** Is the host one of the ranges where the public internet cannot reach, so plain http is safe? */
+function isPrivateHost(rawHostname: string): boolean {
+	// WHATWG lowercases; Bun (and some implementations) keep IPv6 brackets, so strip them.
+	const hostname = rawHostname.replace(/^\[|\]$/g, "");
+	if (hostname === "localhost" || hostname === "::1") return true;
+	const v4 = ipv4Octets(hostname);
+	if (v4) {
+		// The anchored regex in ipv4Octets guarantees length 4, so the fallback is unreachable.
+		const a = v4[0] ?? -1;
+		const b = v4[1] ?? -1;
+		return (
+			a === 127 ||
+			a === 10 ||
+			(a === 172 && b >= 16 && b <= 31) ||
+			(a === 192 && b === 168) ||
+			(a === 169 && b === 254) ||
+			(a === 100 && b >= 64 && b <= 127)
+		);
+	}
+	if (hostname.includes(":"))
+		return isLinkLocalV6(hostname.replace(/^\[|\]$/g, ""));
+	// Single-label name: the compose service name (e.g. "alate"), never a public DNS name.
+	return !hostname.includes(".");
+}
+
+/**
+ * null when the URL may serve the alate API, else the reason. Pure: never throws, no I/O.
+ * The bearer key crosses the network, so plain http is safe only where the public internet
+ * cannot reach: loopback, RFC 1918, link-local, CGNAT/Tailscale and single-label host names.
+ * https:// is always allowed.
+ */
+export function alateUrlError(url: string): string | null {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return "url must be a valid http(s) URL";
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+		return "url must be a valid http(s) URL";
+	if (parsed.protocol === "https:") return null;
+	return isPrivateHost(parsed.hostname)
+		? null
+		: "url must use https:// (http:// is allowed only for loopback, private-network addresses and single-label host names)";
+}
+
 /**
  * Fetch that never follows a redirect: fetch keeps the Authorization header on a
  * redirect chain, so a redirecting endpoint could bounce the bearer off-host.
@@ -121,6 +184,9 @@ export async function alateApi(
 			status: 400,
 			error: "alate api key is not configured",
 		};
+	// The bearer key must not reach a refused url, so no fetch is built.
+	const refused = alateUrlError(alate.url);
+	if (refused !== null) return { ok: false, status: 400, error: refused };
 	let res: Response;
 	try {
 		res = await noRedirectFetch(
@@ -184,6 +250,9 @@ export async function alateRotateKey(
 			status: 400,
 			error: "alate api key is not configured",
 		};
+	// The bearer key must not reach a refused url, so no fetch is built.
+	const refused = alateUrlError(alate.url);
+	if (refused !== null) return { ok: false, status: 400, error: refused };
 	let res: Response;
 	try {
 		res = await noRedirectFetch(

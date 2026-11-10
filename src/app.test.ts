@@ -2684,6 +2684,19 @@ describe("alate routes", () => {
 		await post("/api/alate", { key: "alate_secret" });
 	});
 
+	test("POST refuses a public http url and the saved setting does not change", async () => {
+		await post("/api/alate", { url: alateUrl, key: "alate_secret" });
+		const refused = await post("/api/alate", {
+			url: "http://alate.example.com:4570",
+		});
+		expect(refused.status).toBe(400);
+		expect(await errorOf(refused)).toContain("https://");
+		expect((await (await get("/api/alate")).json()).url).toBe(alateUrl);
+		const ok = await post("/api/alate", { url: "https://alate.example.com" });
+		expect(ok.status).toBe(200);
+		await post("/api/alate", { url: alateUrl });
+	});
+
 	test("alate non-2xx error is forwarded with status and error", async () => {
 		alateStatus = 401;
 		alateBody = { error: "unauthorized" };
@@ -4019,6 +4032,70 @@ describe("alate env seeding", () => {
 			lastProvisionError: null,
 		});
 		expect((await m2.call("/api/alate/provision", {})).status).toBe(502);
+	});
+
+	test("a refused ALATE_URL seed is dropped and logged; without a url the seeded key cannot leave", async () => {
+		process.env.ALATE_URL = "http://alate.example.com:4570";
+		process.env.ALATE_API_KEY = "seed-key";
+		const warnings: string[] = [];
+		const originalWarn = console.warn;
+		console.warn = (msg?: unknown): void => {
+			warnings.push(String(msg));
+		};
+		try {
+			const m = mount();
+			// The key seed stays: nothing sends it without a url.
+			expect(await (await m.call("/api/alate")).json()).toEqual({
+				url: null,
+				keySet: true,
+				lastProvisionError: null,
+			});
+			const res = await m.call("/api/alate/provision", {});
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toBe("alate server url is not configured");
+			expect(warnings.some((w) => w.includes("https://"))).toBe(true);
+		} finally {
+			console.warn = originalWarn;
+		}
+	});
+});
+
+describe("alate url policy", () => {
+	// A config row saved before the https policy existed still holds a public
+	// http url; the board must show it but never send the key to it.
+	test("a stale saved http url never receives the key over the wire", async () => {
+		let standInReqs = 0;
+		const standIn = Bun.serve({
+			port: 0,
+			fetch: () => {
+				standInReqs++;
+				return Response.json({ ok: true, results: [] });
+			},
+		});
+		try {
+			const g = GlobalStore.open(
+				join(root, `g-alate-policy-${Math.random().toString(36).slice(2)}`),
+			);
+			mountStores.push(g);
+			g.set("config", {
+				alate: { url: "http://alate.example.com:4570", key: "stale-key" },
+			});
+			const m = mount({ gstore: g });
+			expect(await (await m.call("/api/alate")).json()).toEqual({
+				url: "http://alate.example.com:4570",
+				keySet: true,
+				lastProvisionError: null,
+			});
+			const res = await m.call("/api/alate/provision", {});
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toContain("https://");
+			expect(standInReqs).toBe(0);
+			expect((await (await m.call("/api/alate")).json()).url).toBe(
+				"http://alate.example.com:4570",
+			);
+		} finally {
+			standIn.stop(true);
+		}
 	});
 });
 
