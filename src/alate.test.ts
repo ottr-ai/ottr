@@ -1034,6 +1034,9 @@ describe("alateUrlError", () => {
 			"http://example.com",
 			"http://alate.local",
 			"http://ottr.ai",
+			// "localhost." has a dot, so it is not the loopback literal — but a request to it
+			// still resolves to loopback, which is why the route test uses it as the refused host.
+			"http://localhost.",
 			"http://8.8.8.8",
 			"http://1.1.1.1",
 			"http://11.0.0.1",

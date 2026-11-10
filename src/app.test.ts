@@ -4062,7 +4062,10 @@ describe("alate env seeding", () => {
 
 describe("alate url policy", () => {
 	// A config row saved before the https policy existed still holds a public
-	// http url; the board must show it but never send the key to it.
+	// http url; the board must show it but never send the key to it. The saved
+	// host is refused (a name with a dot counts as public — the trailing-dot
+	// form is not the loopback literal) but resolves to the standIn, so a
+	// request attempt is observable on the wire.
 	test("a stale saved http url never receives the key over the wire", async () => {
 		let standInReqs = 0;
 		const standIn = Bun.serve({
@@ -4073,16 +4076,17 @@ describe("alate url policy", () => {
 			},
 		});
 		try {
+			const staleUrl = `http://localhost.:${standIn.port}`;
 			const g = GlobalStore.open(
 				join(root, `g-alate-policy-${Math.random().toString(36).slice(2)}`),
 			);
 			mountStores.push(g);
 			g.set("config", {
-				alate: { url: "http://alate.example.com:4570", key: "stale-key" },
+				alate: { url: staleUrl, key: "stale-key" },
 			});
 			const m = mount({ gstore: g });
 			expect(await (await m.call("/api/alate")).json()).toEqual({
-				url: "http://alate.example.com:4570",
+				url: staleUrl,
 				keySet: true,
 				lastProvisionError: null,
 			});
@@ -4090,9 +4094,7 @@ describe("alate url policy", () => {
 			expect(res.status).toBe(400);
 			expect(await errorOf(res)).toContain("https://");
 			expect(standInReqs).toBe(0);
-			expect((await (await m.call("/api/alate")).json()).url).toBe(
-				"http://alate.example.com:4570",
-			);
+			expect((await (await m.call("/api/alate")).json()).url).toBe(staleUrl);
 		} finally {
 			standIn.stop(true);
 		}
