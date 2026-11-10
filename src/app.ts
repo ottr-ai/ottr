@@ -7023,6 +7023,12 @@ export function createApp(deps: AppDeps) {
 		// Past the transport bound with alate's health reporting the run: 202
 		// Accepted, not an error — the health poll delivers the outcome.
 		if (!r.ok && r.running) return json({ running: true }, 202);
+		// A real failure lands in the bell state like the trigger's own failures
+		// (applyProvisionHealth clears it once alate reports no pending import).
+		if (!r.ok) {
+			alateProvisionError = r.error;
+			publishSoon();
+		}
 		return r.ok ? json(r.body, 200) : json({ error: r.error }, r.status);
 	}
 

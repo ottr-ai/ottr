@@ -2682,6 +2682,53 @@ describe("alate routes", () => {
 		await post("/api/alate", { url: alateUrl });
 	});
 
+	/** The provision error the bell state carries (/api/state), or null. */
+	const bellError = async (): Promise<string | null> =>
+		(
+			(await (await get("/api/state")).json()) as {
+				alateProvisionError: string | null;
+			}
+		).alateProvisionError;
+
+	test("a failed manual provision reaches the bell state, a success clears it", async () => {
+		// The happy body answers, so any failure an earlier test recorded clears.
+		const happy = {
+			ok: true,
+			results: [
+				{ script: "sync.mjs", code: 0, output: "out", truncated: false },
+			],
+		};
+		expect((await post("/api/alate/provision", {})).status).toBe(200);
+		expect(await bellError()).toBeNull();
+		// Still running on alate (202) is not a failure: the health poll delivers
+		// the outcome, so the bell state stays clean.
+		const prev = alateBody;
+		alateBody = { ok: true, running: true };
+		try {
+			const running = await provisionAfterTimeout();
+			expect(running.status).toBe(202);
+		} finally {
+			alateBody = prev;
+		}
+		expect(await bellError()).toBeNull();
+		// A real failure lands in the bell state with the error text.
+		alateStatus = 503;
+		alateBody = {};
+		try {
+			const failed = await post("/api/alate/provision", {});
+			expect(failed.status).toBe(503);
+			expect(await bellError()).toBe(
+				"The alate provision request failed (unavailable): check that the alate server is up, then run Provision again",
+			);
+		} finally {
+			alateStatus = 200;
+			alateBody = happy;
+		}
+		// The next success clears the recorded failure again.
+		expect((await post("/api/alate/provision", {})).status).toBe(200);
+		expect(await bellError()).toBeNull();
+	});
+
 	test("a status-only updates pull logs the request", async () => {
 		alateStatus = 503;
 		alateBody = {};
