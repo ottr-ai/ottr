@@ -147,7 +147,9 @@ ff-only merge flow is untouched.
 ## While the PR is open
 
 - Stage Merging, state idle (no `!` badge). The drawer shows the PR link
-  ("PR #N") from new task fields. The worktree stays.
+  ("PR #N") from new task fields. The worktree stays. The one exception is
+  an open PR that conflicts with its target branch: see "Open PR that cannot
+  merge".
 - No ottr write touches the PR: no merge, close, comment, review event,
   label or reviewer. Humans merge on GitHub under the repo's protection
   rules.
@@ -158,7 +160,10 @@ The supervisor gains a PR pass (`prPass`, server process, alongside
 `ciPass`): one open-PR list call per project per poll window (5 minutes, the
 Dependabot cadence pattern), response parsed with the `parsePullPage`
 untrusted-data rules; a tracked PR that left the open list gets one
-per-PR `gh api repos/{repo}/pulls/N` call to read its settled state.
+per-PR `gh api repos/{repo}/pulls/N` call to read its settled state. A
+tracked PR that is still in the open list gets the same per-PR call when its
+card waits `idle` or holds the conflict reason (see "Open PR that cannot
+merge").
 
 - `merged_at` set: the tracker fetches the target and finishes the card with
   the today-shaped done write — `pushSha` pinned to the PR's merge commit
@@ -170,6 +175,72 @@ per-PR `gh api repos/{repo}/pulls/N` call to read its settled state.
   reply can iterate; `pushSha` clears. A later merge turn pushes the branch
   again and opens a fresh PR (GitHub opens a new PR for a branch whose old
   PR is closed). Cancelling the card ends it as today.
+
+## Open PR that cannot merge (OTTR-789)
+
+An open PR can conflict with its target branch. GitHub then cannot merge the
+PR, and the card must show that it needs a human. The open-PR list carries
+no `mergeable` field. Only the per-PR response
+(`gh api repos/{repo}/pulls/N`) carries it: `true`, `false`, or `null` while
+GitHub still computes the value.
+
+The conflict reason is one fixed text for each PR number:
+
+```
+PR #N cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.
+```
+
+In each PR poll window, `prPass` looks at each tracked card whose PR is in
+the open list. The supervisor reads the PR once with the per-PR call when
+one of these conditions is true:
+
+- The state of the card is `idle`.
+- The state of the card is `needs_you` and its reason is exactly the
+  conflict reason.
+
+A card in any other state gets no read. The cost is one more read for each
+such card in each 5-minute window.
+
+The result of the read decides the write:
+
+- `mergeable` is `false` and the card is `merging`/`idle`: the card goes to
+  `merging`/`needs_you` with the conflict reason. The stage, the PR fields,
+  `pushSha`, the branch and the worktree stay unchanged. The card log gets
+  one line (`supervisor: PR #N has merge conflicts; card parked`).
+- `mergeable` is `true` and the card holds exactly the conflict reason: the
+  card returns to `merging`/`idle` with `needsReason` null. The card log
+  gets one line (`supervisor: PR #N can merge again; card waits on GitHub`).
+- `mergeable` is `false` and the card already holds the conflict reason, or
+  `mergeable` is `true` and the card is `idle`: no write.
+- `mergeable` is `null`, absent, or not a boolean (GitHub still computes
+  it, or the body is untrusted): no write. The next window reads again.
+- The per-PR read says that the PR is no longer open (it settled between
+  the list and the read): no write in this window. The next window settles
+  the card through the merged and closed rules of "PR close without merge".
+- A read failure or an unparseable body logs and skips, like the settled
+  read.
+
+A parked card stays tracked. When its PR merges, the card finishes `done`
+through the merged rule of "PR close without merge". When its PR closes
+without a merge, the card parks `in_progress`/`needs_you` with the closed
+reason. A CI failure on the PR head of a parked card requeues the card as
+for an idle card and clears the conflict reason.
+
+Recovery: a human resolves the conflict on the pull request. When GitHub
+can merge the PR again, the next poll window returns the card to
+`merging`/`idle`. A reply on the card does not rebase and push the branch
+today. The scheduler does not pick a card in Merging that carries a PR
+(`mergeSlot`, src/scheduler.ts), and a merge turn does not ship such a card
+again (`shipPrCard`, src/turn.ts). The re-merge path, where a reply pushes
+the rebased branch to the open PR, is a separate card.
+
+Non-goals of this section:
+
+- No automatic rebase. The non-goal below stands.
+- No reaction to `mergeable_state` values such as `blocked`, `behind`,
+  `unstable` or `draft`. Pending reviews and checks are normal waits.
+- No write to the pull request.
+- No new task column, no UI change and no prompt change.
 
 ## CI watch on the PR head
 
@@ -254,6 +325,19 @@ server remains the only writer of origin.
   the fixed push updates the same PR.
 - A failed push or gh call parks `needs_you` with the output; a reply
   retries without opening a second PR.
+- Open PR with `mergeable: false`: the card is `merging`/`needs_you` with
+  the conflict reason. The PR fields, `pushSha`, the branch and the worktree
+  stay unchanged, and the card log gets one line. A later window with the
+  same answer writes nothing and logs nothing.
+- Parked card and `mergeable: true`: the card returns to `merging`/`idle`
+  with `needsReason` null, and the card log gets one line.
+- `mergeable` `null`, absent or not a boolean, a failed read, and a per-PR
+  read that says the PR is no longer open: no write.
+- A card in any other state (`queued`, `running`, or `needs_you` with a
+  different reason) gets no per-PR read while its PR is open.
+- A parked card stays tracked: a merged PR finishes the card `done`, and a
+  PR closed without a merge parks it `in_progress`/`needs_you` with the
+  closed reason.
 - Fresh and migrated databases converge on the new columns; no CHECK
   migration.
 - `bun run check` and `bun test` exit 0 from the worktree root.

@@ -21,6 +21,7 @@ import {
 	scratchShotsTend,
 	tendFamily,
 } from "./supervisor.ts";
+import fc from "./test/properties.ts";
 import type { ListedTask, ProjectSettings, Task } from "./types.ts";
 import type { SweptProcess } from "./workers.ts";
 
@@ -2960,12 +2961,15 @@ function pullBody(o: {
 	state?: string;
 	mergedAt?: string | null;
 	mergeSha?: string | null;
+	// undefined leaves the field out of the body
+	mergeable?: unknown;
 }): string {
 	return JSON.stringify({
 		number: 7,
 		state: o.state ?? "closed",
 		merged_at: o.mergedAt ?? null,
 		merge_commit_sha: o.mergeSha ?? null,
+		mergeable: o.mergeable,
 	});
 }
 
@@ -2974,6 +2978,25 @@ const openList = (ns: number[]) => ({
 	stdout: openPage(ns),
 	stderr: "",
 });
+
+const PR7_CONFLICT =
+	"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.";
+const PR_LIST = ["api", "repos/acme/widget/pulls?state=open&per_page=100"];
+const PR7_READ = ["api", "repos/acme/widget/pulls/7"];
+const PR8_READ = ["api", "repos/acme/widget/pulls/8"];
+
+/** `gh api` stub: `pull` answers every per-PR read, every other call gets the open-PR list. */
+function prApi(pull: string, open: number[] = [7]) {
+	return (url: string) =>
+		/\/pulls\/\d+$/.test(url)
+			? { code: 0, stdout: pull, stderr: "" }
+			: openList(open);
+}
+
+/** The tick's `gh api` calls without the CI watch's runs poll (prCard pins pushSha). */
+function pullCalls(ops: FakeOps): string[][] {
+	return ops.apiCalls.filter((a) => !a[1]!.includes("/actions/runs?"));
+}
 
 describe("prPass", () => {
 	test("PR merged finishes the card done and removes the worktree", async () => {
@@ -3127,19 +3150,227 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("PR still open: no write and no gh call beyond the list", async () => {
+	// OTTR-789 changed this test: an open PR of an idle card now gets one per-PR read (the
+	// list carries no `mergeable`), so "no gh call beyond the list" is no longer true.
+	test("PR still open and mergeable: one per-PR read, no write", async () => {
 		const store = prModeProject("pr-open");
 		const t = prCard(store);
-		const ops = fakeOps({ apiResult: () => openList([7]) });
+		const before = store.getTask(t.id)!;
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: true })),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)!).toEqual(before);
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		expect(ops.calls.fetches).toEqual([]);
+		store.close();
+	});
+
+	test("open PR with a merge conflict parks the idle card and keeps the PR, branch and worktree", async () => {
+		const store = prModeProject("pr-conflict");
+		const wt = join(root, "pr-conflict", ".wt");
+		mkdirSync(wt, { recursive: true });
+		const t = prCard(store);
+		store.updateTask(t.id, { worktree: wt });
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: false })),
+		});
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(PR7_CONFLICT);
+		expect(after.prNumber).toBe(7);
+		expect(after.prUrl).toBe("https://github.com/acme/widget/pull/7");
+		expect(after.prHeadSha).toBe("abc1234567890");
 		expect(after.pushSha).toBe("abc1234567890");
-		const polls = ops.apiCalls.filter((a) =>
-			a[1]!.includes("pulls?state=open"),
-		);
-		expect(polls).toHaveLength(1);
+		expect(after.branch).toBe("ottr/552");
+		expect(after.worktree).toBe(wt);
+		expect(existsSync(wt)).toBe(true);
+		expect(ops.calls.remove).toEqual([]);
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 has merge conflicts; card parked");
+		store.close();
+	});
+
+	test("a later window with the same conflict reads again, writes nothing and logs nothing", async () => {
+		const store = prModeProject("pr-conflict-again");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: false })),
+		});
+		const projects = new Map([["proj", entry(store)]]);
+		await tick(projects, ops);
+		const parked = store.getTask(t.id)!;
+		expect(parked.needsReason).toBe(PR7_CONFLICT);
+		ops.time += 6 * 60_000; // past the PR poll window
+		await tick(projects, ops);
+		expect(store.getTask(t.id)!).toEqual(parked);
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ, PR_LIST, PR7_READ]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log.match(/has merge conflicts/g)).toHaveLength(1);
+		store.close();
+	});
+
+	test("parked card returns to idle when GitHub can merge the PR again", async () => {
+		const store = prModeProject("pr-conflict-cleared");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "needs_you", needsReason: PR7_CONFLICT });
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: true })),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.prNumber).toBe(7);
+		expect(after.prHeadSha).toBe("abc1234567890");
+		expect(after.pushSha).toBe("abc1234567890");
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 can merge again; card waits on GitHub");
+		store.close();
+	});
+
+	const NO_VERDICT = [
+		["null", null],
+		["absent", undefined],
+		["non-boolean", "false"],
+	] as const;
+	for (const [name, mergeable] of NO_VERDICT) {
+		test(`mergeable ${name}: one per-PR read, no write on an idle or a parked card`, async () => {
+			const store = prModeProject(`pr-mergeable-${name}`);
+			const idle = prCard(store, 7);
+			const parked = prCard(store, 8);
+			store.updateTask(parked.id, {
+				state: "needs_you",
+				needsReason: PR7_CONFLICT.replace("#7", "#8"),
+			});
+			const before = [store.getTask(idle.id)!, store.getTask(parked.id)!];
+			const ops = fakeOps({
+				apiResult: prApi(pullBody({ state: "open", mergeable }), [7, 8]),
+			});
+			await tick(new Map([["proj", entry(store)]]), ops);
+			const after = [store.getTask(idle.id)!, store.getTask(parked.id)!];
+			expect(after).toEqual(before);
+			// listTasks is newest first, so PR #8 is read before PR #7.
+			expect(pullCalls(ops)).toEqual([PR_LIST, PR8_READ, PR7_READ]);
+			store.close();
+		});
+	}
+
+	test("a card parked for another reason, or queued, gets no per-PR read", async () => {
+		const store = prModeProject("pr-conflict-other-state");
+		const other = prCard(store, 7);
+		// Near miss on purpose: the un-park matches the whole reason, not its start.
+		store.updateTask(other.id, {
+			state: "needs_you",
+			needsReason: `${PR7_CONFLICT} Then reply.`,
+		});
+		const queued = prCard(store, 8);
+		store.updateTask(queued.id, { state: "queued" });
+		const before = [store.getTask(other.id)!, store.getTask(queued.id)!];
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: false }), [7, 8]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(pullCalls(ops)).toEqual([PR_LIST]);
+		const after = [store.getTask(other.id)!, store.getTask(queued.id)!];
+		expect(after).toEqual(before);
+		store.close();
+	});
+
+	test("a parked card finishes done when its PR merges", async () => {
+		const store = prModeProject("pr-conflict-merged");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "needs_you", needsReason: PR7_CONFLICT });
+		const merged = pullBody({
+			mergedAt: "2026-11-06T00:00:00Z",
+			mergeSha: MERGE_SHA,
+		});
+		const ops = fakeOps({
+			apiResult: prApi(merged, []),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBe(MERGE_SHA);
+		store.close();
+	});
+
+	test("a parked card gets the closed reason when its PR closes unmerged", async () => {
+		const store = prModeProject("pr-conflict-closed");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "needs_you", needsReason: PR7_CONFLICT });
+		const ops = fakeOps({ apiResult: prApi(pullBody({}), []) });
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("PR #7 closed without merging");
+		expect(after.pushSha).toBeNull();
+		store.close();
+	});
+
+	test("per-PR read says closed although the list still had the PR: no write in that tick", async () => {
+		const store = prModeProject("pr-conflict-settled-between");
+		const t = prCard(store);
+		const before = store.getTask(t.id)!;
+		// mergeable false on purpose: only the state check keeps the card from parking.
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "closed", mergeable: false })),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)!).toEqual(before);
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
 		expect(ops.calls.fetches).toEqual([]);
+		store.close();
+	});
+
+	test("prMode off: no gh api call for a card that carries an open PR", async () => {
+		const store = ProjectStore.open(join(root, "pr-mode-off"));
+		const t = prCard(store);
+		// No pushSha: the CI watch stays out of the tick.
+		store.updateTask(t.id, { pushSha: null });
+		const before = store.getTask(t.id)!;
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: false })),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(ops.apiCalls).toEqual([]);
+		expect(store.getTask(t.id)!).toEqual(before);
+		store.close();
+	});
+
+	test("property: an open PR parks the idle card if and only if mergeable is exactly false", async () => {
+		const store = prModeProject("pr-conflict-property");
+		const t = prCard(store);
+		const projects = new Map([["proj", entry(store)]]);
+		const verdict = fc.oneof(fc.boolean(), fc.constant(null), fc.jsonValue());
+		await fc.assert(
+			fc.asyncProperty(verdict, async (mergeable) => {
+				// One card for all runs: each run starts from the waiting state.
+				store.updateTask(t.id, { state: "idle", needsReason: null });
+				const ops = fakeOps({
+					apiResult: prApi(pullBody({ state: "open", mergeable })),
+				});
+				// A fresh supervisor for each run, so each tick is a new poll window.
+				await createSupervisor(projects, ops).tick();
+				const after = store.getTask(t.id)!;
+				const parks = mergeable === false;
+				expect(after.stage).toBe("merging");
+				expect(after.state).toBe(parks ? "needs_you" : "idle");
+				expect(after.needsReason).toBe(parks ? PR7_CONFLICT : null);
+				expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+			}),
+			// Gate: the shared fixed-seed helper; 100 runs here, below the 200 gate.
+			{ numRuns: 100 },
+		);
 		store.close();
 	});
 
@@ -3254,6 +3485,37 @@ describe("CI on the PR head", () => {
 		await tick(new Map([["proj", entry(store)]]), ops);
 		expect(store.getTask(t.id)!.pendingPrompt).toBe(prompt);
 		expect(ops.calls.scheduled).toBe(scheduled);
+		store.close();
+	});
+
+	test("failed run on a card parked for a merge conflict requeues it and clears the reason", async () => {
+		const store = prModeProject("ci-pr-head-parked");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "needs_you", needsReason: PR7_CONFLICT });
+		const failed = runsJson([
+			{
+				id: 42,
+				status: "completed",
+				conclusion: "failure",
+				name: "build",
+				html_url: "https://example.com/run/42",
+			},
+		]);
+		// The PR is still open and still in conflict; ciPass runs before prPass.
+		const open = prApi(pullBody({ state: "open", mergeable: false }));
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.includes("/actions/runs?")
+					? { code: 0, stdout: failed, stderr: "" }
+					: open(url),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBeNull();
+		expect(after.pendingPrompt).toMatch(/^CI failed on the PR head/);
 		store.close();
 	});
 });

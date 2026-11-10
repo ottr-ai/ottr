@@ -272,6 +272,9 @@ interface PrDetail {
 	state: "open" | "closed";
 	merged: boolean;
 	mergeCommit: string | null;
+	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
+	 * still computes it, the field is absent, or the value is not a boolean. */
+	mergeable: boolean | null;
 }
 
 function parsePull(body: unknown): PrDetail | null {
@@ -285,7 +288,16 @@ function parsePull(body: unknown): PrDetail | null {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
 		mergeCommit: typeof sha === "string" ? sha : null,
+		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
+		// mergeable value must not turn a readable PR into null.
+		mergeable: typeof x.mergeable === "boolean" ? x.mergeable : null,
 	};
+}
+
+/** The needs_you reason of a card whose open PR conflicts with its target branch (OTTR-789).
+ * prConflictCard parks with it and un-parks only on this exact text. Pure. */
+function prConflictReason(n: number): string {
+	return `PR #${n} cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.`;
 }
 
 /** The tracker's own git-proof rejection strings and the outcome each expects in the last
@@ -1371,6 +1383,7 @@ export function createSupervisor(
 		e.store.updateTask(t.id, {
 			stage: "in_progress",
 			state: "queued",
+			needsReason: null,
 			queuedAt: ops.now(),
 			pendingPrompt: text,
 			pendingBy: "supervisor",
@@ -1824,7 +1837,7 @@ export function createSupervisor(
 		return page;
 	}
 
-	/** The settled PR state for one card, or null (logged) when it cannot be read. */
+	/** The PR's own state for one card, or null (logged) when it cannot be read. */
 	async function prState(
 		e: SupervisorEntry,
 		t: ListedTask,
@@ -1890,7 +1903,43 @@ export function createSupervisor(
 		ops.schedule();
 	}
 
-	/** Settle every tracked Merging card whose PR left the open set. */
+	/** One tracked Merging card whose PR is still open (OTTR-789). An idle card, or a card parked
+	 * with exactly the conflict reason, gets one per-PR read: mergeable false parks the idle card
+	 * needs_you, mergeable true returns the parked card to idle. A null mergeable (GitHub still
+	 * computes it), a PR that settled since the list, and a failed read write nothing. The stage,
+	 * the PR fields, pushSha, the branch and the worktree stay. Never throws. */
+	async function prConflictCard(
+		e: SupervisorEntry,
+		t: ListedTask,
+		repo: string,
+		reason: string,
+	): Promise<void> {
+		const parked = t.state === "needs_you" && t.needsReason === reason;
+		if (t.state !== "idle" && !parked) return;
+		const pr = await prState(e, t, repo);
+		if (pr === null || pr.state !== "open") return;
+		// A write needs a verdict that contradicts the card: false (conflict) while it waits
+		// idle, true (can merge) while it is parked. Null (GitHub still computes it) equals
+		// neither flag, so it writes nothing.
+		if (pr.mergeable !== parked) return;
+		if (wentStale(e.store, t)) return;
+		e.store.updateTask(
+			t.id,
+			parked
+				? { state: "idle", needsReason: null }
+				: { state: "needs_you", needsReason: reason },
+		);
+		ops.appendLog(
+			e.store,
+			t.id,
+			parked
+				? `supervisor: PR #${t.prNumber} can merge again; card waits on GitHub`
+				: `supervisor: PR #${t.prNumber} has merge conflicts; card parked`,
+		);
+	}
+
+	/** Every tracked Merging card: settle the card whose PR left the open set, and check the
+	 * card whose PR is still open for a merge conflict. */
 	async function prSettleMerging(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -1904,15 +1953,18 @@ export function createSupervisor(
 				t.cancelledAt !== null
 			)
 				continue;
-			if (open.has(t.prNumber)) continue;
-			await settlePrCard(e, settings, t, repo);
+			if (open.has(t.prNumber))
+				await prConflictCard(e, t, repo, prConflictReason(t.prNumber));
+			else await settlePrCard(e, settings, t, repo);
 		}
 	}
 
 	/** One PR pass per project, at most one open-PR list per poll window: a tracked Merging card
 	 * whose PR left the open set gets one per-PR call to read its settled state — merged finishes
-	 * the card, closed unmerged parks it needs_you. The pass never merges or closes anything and
-	 * never throws; a failed poll retries at the next window. */
+	 * the card, closed unmerged parks it needs_you. A tracked card whose PR is still open gets the
+	 * same per-PR call while it waits idle or holds the conflict reason — a PR that GitHub cannot
+	 * merge parks the card needs_you until GitHub can merge it again. The pass never merges or
+	 * closes anything and never throws; a failed poll retries at the next window. */
 	async function prPass(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
