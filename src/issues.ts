@@ -128,9 +128,12 @@ const FENCE_RE = /<<<DATA|DATA>>>/g;
 /**
  * Untrusted text through clean(), with every DATA fence marker removed so the text cannot
  * end its block and pose as trusted prompt text; a redaction pause withholds the text instead
- * of failing.
+ * of failing. `readHint` tells the agent where to read the withheld text.
  */
-function cleanOrWithheld(raw: string): { text: string; withheld: boolean } {
+export function cleanOrWithheld(
+	raw: string,
+	readHint = "read the issue on GitHub",
+): { text: string; withheld: boolean } {
 	try {
 		return {
 			text: clean(raw).replace(FENCE_RE, "[fence marker removed]"),
@@ -139,7 +142,7 @@ function cleanOrWithheld(raw: string): { text: string; withheld: boolean } {
 	} catch (err) {
 		// clean throws only its own pause Error.
 		return {
-			text: `(withheld: ${(err as Error).message}; read the issue on GitHub)`,
+			text: `(withheld: ${(err as Error).message}; ${readHint})`,
 			withheld: true,
 		};
 	}
@@ -154,7 +157,7 @@ export function cardTitle(number: number, raw: string): string {
 		: `Issue #${number}: ${text}`;
 }
 
-const dataBlock = (label: string, text: string): string =>
+export const dataBlock = (label: string, text: string): string =>
 	`${label}\n<<<DATA\n${text}\nDATA>>>`;
 
 /**

@@ -127,6 +127,8 @@ import {
 	sniffImage,
 } from "./images.ts";
 import { createIssueWatcher } from "./issues.ts";
+import type { JiraNet } from "./jira.ts";
+import { createJiraRoutes } from "./jiraRoutes.ts";
 import { rebuildLayerUse } from "./layers.ts";
 import { handleHindsight, handleLlm } from "./llmProxy.ts";
 import {
@@ -277,6 +279,7 @@ import {
 	WORK_CHECK_ASK_MERGE,
 	WORK_CHECK_ASK_SEND_BACK,
 } from "./scheduler.ts";
+import type { SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
 import { type BoardTurnFacts, ProjectStore } from "./store.ts";
 import {
@@ -677,6 +680,14 @@ interface AppDeps {
 	 * (always log) or a large value (never log). Defaults to 500.
 	 */
 	slowApiMs?: number;
+	/**
+	 * Seals the Jira connection tokens (docs/specs/jira-import.md section 1); server.ts loads it
+	 * at boot. Undefined (a malformed OTTR_SECRET_KEY) = every Jira route answers 503.
+	 */
+	secretBox?: SecretBox;
+	/** Jira request seams (fetch, DNS lookup, timeout, hosted); tests inject a stub. Default
+	 * hosted = deps.hosted is set. */
+	jiraNet?: Partial<JiraNet>;
 }
 
 /** How far the checkout at `dir` is behind origin/main, for the update banner. The banner is a
@@ -1450,6 +1461,35 @@ function parseTaskIdPrefix(
 	return null;
 }
 
+/** Shape only: whether the named connection exists is checked by the settings route. */
+function parseJiraSettings(
+	body: Record<string, unknown>,
+	patch: Partial<ProjectSettings>,
+): Response | null {
+	const c = body.jiraConnection;
+	if (c !== undefined) {
+		if (c !== null && (typeof c !== "string" || c === "" || c.length > 100))
+			return json(
+				{ error: "jiraConnection must be a connection name or null" },
+				400,
+			);
+		patch.jiraConnection = c;
+	}
+	const q = body.jiraLastJql;
+	if (q !== undefined) {
+		if (q !== null && (typeof q !== "string" || q.length > 2000))
+			return json(
+				{
+					error:
+						"jiraLastJql must be a string of at most 2000 characters or null",
+				},
+				400,
+			);
+		patch.jiraLastJql = q;
+	}
+	return null;
+}
+
 function parseReleaseCommand(
 	body: Record<string, unknown>,
 	patch: Partial<ProjectSettings>,
@@ -1660,6 +1700,7 @@ const settingParsers: FieldParser[] = [
 	parseBooleanSettings,
 	parseAutoTendLimit,
 	parseTendChurnGlobs,
+	parseJiraSettings,
 ];
 
 /** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
@@ -9770,6 +9811,26 @@ export function createApp(deps: AppDeps) {
 			patch.issueWatchSince = Date.now();
 	}
 
+	/** Jira connections, search and import (src/jiraRoutes.ts). */
+	const jira = createJiraRoutes({
+		gstore: deps.gstore,
+		projects: deps.projects,
+		box: deps.secretBox,
+		net: { hosted: deps.hosted !== undefined, ...deps.jiraNet },
+		schedule: deps.schedule,
+		now,
+		json,
+	});
+
+	/** Reads the JSON body, then runs a Jira handler on it. */
+	async function jiraPost(
+		req: Request,
+		fn: (body: Record<string, unknown>) => Promise<Response>,
+	): Promise<Response> {
+		const r = await readJson(req);
+		return "error" in r ? r.error : fn(r.body);
+	}
+
 	async function handlePOSTProjectsSettingsByProject(
 		req: BunRequest<"/api/projects/:project/settings">,
 	): Promise<Response> {
@@ -9782,7 +9843,9 @@ export function createApp(deps: AppDeps) {
 		// so a 400 never leaves a half-applied settings save behind.
 		const patch = parseSettingsPatch(r.body);
 		if (patch instanceof Response) return patch;
-		const guard = checkSettingsGuards(e, patch);
+		const guard =
+			jira.settingsRefusal(patch.jiraConnection) ??
+			checkSettingsGuards(e, patch);
 		if (guard instanceof Response) return guard;
 		applyRetroSince(e, patch, r.body.retro);
 		const resolved = await resolveSettingsTarget(e, patch);
@@ -10679,6 +10742,31 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/settings": {
 			POST: (req) => api(req, () => handlePOSTProjectsSettingsByProject(req)),
+		},
+		"/api/jira/connections": {
+			GET: (req) => api(req, () => jira.list()),
+			POST: (req) => api(req, () => jiraPost(req, jira.save)),
+		},
+		"/api/jira/connections/:name": {
+			DELETE: (req) => api(req, () => jira.remove(req.params.name)),
+		},
+		"/api/jira/connections/:name/test": {
+			POST: (req) => api(req, () => jira.test(req.params.name)),
+		},
+		"/api/jira/detect": {
+			POST: (req) => api(req, () => jiraPost(req, jira.detect)),
+		},
+		"/api/projects/:project/jira/search": {
+			POST: (req) =>
+				api(req, () =>
+					jiraPost(req, (b) => jira.search(req.params.project, b)),
+				),
+		},
+		"/api/projects/:project/jira/import": {
+			POST: (req) =>
+				api(req, () =>
+					jiraPost(req, (b) => jira.importIssues(req.params.project, b)),
+				),
 		},
 		// Board "Push to origin" (OTTR-531): the standing-approval push, the exact
 		// authenticated path the merge flow uses. Moves refs/heads/<target> on origin only;

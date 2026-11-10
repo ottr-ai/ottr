@@ -24,6 +24,8 @@ import type {
 	ArchReview,
 	GitHubAppView,
 	GithubFacts,
+	JiraConnectionView,
+	JiraType,
 	ProjectView,
 	ProvisioningResponse,
 	QuotaState,
@@ -3059,6 +3061,447 @@ export function GitHostsSection() {
 				gSave={gSave}
 				onRemove={removeGlobal}
 			/>
+			{error !== null && (
+				<p className="auth-error" role="alert">
+					{error}
+				</p>
+			)}
+		</SettingsCard>
+	);
+}
+
+const JIRA_TYPE_LABEL: Record<JiraType, string> = {
+	cloud: "Cloud",
+	datacenter: "Data Center",
+};
+
+/** The site URL check under the field: a detected type, a reason with the manual pick, or a
+ *  refused URL (`invalid`, which marks the field). `site` is the URL it answered for. */
+type JiraDetect = { site: string; text: string; invalid: boolean };
+
+/** Settings "Jira connections" (docs/specs/jira-import.md section 1): named board-level
+ *  connections that projects pick in their own settings. The token is write-only: the
+ *  API never returns it, so editing shows only whether one is set. */
+export function JiraConnectionsSection() {
+	const [list, setList] = useState<JiraConnectionView[] | null>(null);
+	const [error, setError] = useState<string | null>(null);
+	const [note, setNote] = useState<string | null>(null);
+	// The form; `editing` holds the saved name being edited, null while adding a new one.
+	const [editing, setEditing] = useState<string | null>(null);
+	const [name, setName] = useState("");
+	const [site, setSite] = useState("");
+	const [type, setType] = useState<JiraType>("cloud");
+	const [email, setEmail] = useState("");
+	const [token, setToken] = useState("");
+	const [fields, setFields] = useState("");
+	const [detect, setDetect] = useState<JiraDetect | null>(null);
+	const saveBusy = useBusy();
+	const detectBusy = useBusy();
+	const ids = useId();
+	const load = useCallback(async (): Promise<void> => {
+		const { status, data } = await gitReq("GET", "/api/jira/connections");
+		if (status !== 200)
+			throw new Error(asError(data, status, "loading the Jira connections"));
+		setList(data as unknown as JiraConnectionView[]); // server-shaped view; no token in it
+	}, []);
+	useEffect(() => {
+		load().catch((err) =>
+			setError(err instanceof Error ? err.message : String(err)),
+		);
+	}, [load]);
+	// One guarded call: the error lands on the section's alert line, the answer tells the caller.
+	const run = async (fn: () => Promise<boolean>): Promise<boolean> => {
+		setError(null);
+		setNote(null);
+		try {
+			return await fn();
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+			return false;
+		}
+	};
+	const reset = (): void => {
+		setEditing(null);
+		setName("");
+		setSite("");
+		setType("cloud");
+		setEmail("");
+		setToken("");
+		setFields("");
+		setDetect(null);
+	};
+	const edit = (c: JiraConnectionView): void => {
+		setEditing(c.name);
+		setName(c.name);
+		setSite(c.site);
+		setType(c.type);
+		setEmail(c.email ?? "");
+		setToken("");
+		setFields(c.customFields.join(", "));
+		setDetect(null);
+		setError(null);
+		setNote(null);
+	};
+	const editingView = list?.find((c) => c.name === editing) ?? null;
+	// Asks the server for the deployment type; the type select stays editable either way.
+	const runDetect = (): void => {
+		const s = site.trim();
+		if (s === "") return;
+		detectBusy.start(async () => {
+			try {
+				const { status, data } = await gitReq("POST", "/api/jira/detect", {
+					site: s,
+				});
+				if (status !== 200) {
+					setDetect({
+						site: s,
+						text: asError(data, status, "checking the site URL"),
+						invalid: true,
+					});
+					return false;
+				}
+				if (data.type === "cloud" || data.type === "datacenter") {
+					setType(data.type);
+					setDetect({
+						site: s,
+						text: `Detected: ${JIRA_TYPE_LABEL[data.type]}`,
+						invalid: false,
+					});
+					return true;
+				}
+				setDetect({
+					site: s,
+					text: `No type detected: ${typeof data.reason === "string" ? data.reason : "the site gave no deployment type"}. Pick Cloud or Data Center below.`,
+					invalid: false,
+				});
+				return true;
+			} catch (err) {
+				setDetect({
+					site: s,
+					text: `Checking the site URL failed: ${err instanceof Error ? err.message : String(err)}. Pick Cloud or Data Center below.`,
+					invalid: false,
+				});
+				return false;
+			}
+		});
+	};
+	const save = (): void => {
+		const n = name.trim();
+		saveBusy.start(() =>
+			run(async () => {
+				const { status, data } = await gitReq("POST", "/api/jira/connections", {
+					name: n,
+					site: site.trim(),
+					type,
+					email: type === "cloud" ? email.trim() : undefined,
+					token: token === "" ? undefined : token,
+					customFields: fields
+						.split(",")
+						.map((f) => f.trim())
+						.filter((f) => f !== ""),
+				});
+				if (status !== 200)
+					throw new Error(asError(data, status, `saving the connection ${n}`));
+				reset();
+				setNote(`Saved ${n}`);
+				await load();
+				return true;
+			}),
+		);
+	};
+	const test = (n: string): Promise<boolean> =>
+		run(async () => {
+			const { status, data } = await gitReq(
+				"POST",
+				`/api/jira/connections/${encodeURIComponent(n)}/test`,
+			);
+			if (status !== 200)
+				throw new Error(asError(data, status, `testing the connection ${n}`));
+			setNote(`${n}: signed in as ${String(data.displayName)}`);
+			return true;
+		});
+	const remove = (n: string): Promise<boolean> =>
+		run(async () => {
+			if (
+				!(await confirmDialog(`Delete the Jira connection ${n}?`, {
+					ok: "Delete connection",
+					danger: true,
+				}))
+			)
+				return true;
+			const { status, data } = await gitReq(
+				"DELETE",
+				`/api/jira/connections/${encodeURIComponent(n)}`,
+			);
+			if (status === 409 && Array.isArray(data.projects))
+				throw new Error(
+					`${n} is in use by ${data.projects.join(", ")}. Pick another Jira connection in the settings of these projects first.`,
+				);
+			if (status !== 200)
+				throw new Error(asError(data, status, `deleting the connection ${n}`));
+			if (editing === n) reset();
+			setNote(`Deleted ${n}`);
+			await load();
+			return true;
+		});
+	const detectId = `${ids}-detect`;
+	const tokenNoteId = `${ids}-token`;
+	return (
+		<SettingsCard
+			id="jira-section"
+			title="Jira connections"
+			status={
+				list === null
+					? undefined
+					: list.length === 0
+						? { label: "None", tone: "off" }
+						: list.some((c) => !c.tokenReadable)
+							? { label: "Token unreadable", tone: "warn" }
+							: {
+									label: `${list.length} connection${list.length === 1 ? "" : "s"}`,
+									tone: "ok",
+								}
+			}
+			hint="Named Jira sites that projects import tickets from. Ottr reads from Jira only. It stores each token encrypted and never shows it again."
+		>
+			{list !== null && list.length > 0 && (
+				<ul className="jira-conns">
+					{list.map((c) => (
+						<li key={c.name} className="jira-conn">
+							<div className="jira-conn-text">
+								<b>{c.name}</b>
+								<span>
+									<code>{c.site}</code> · {JIRA_TYPE_LABEL[c.type]}
+									{c.email !== null && ` · ${c.email}`}
+								</span>
+								<span className="hint">
+									{!c.tokenReadable ? (
+										<span className="jira-conn-warn">
+											<Mark kind="warn" />
+											Token unreadable, enter it again
+										</span>
+									) : c.tokenSet ? (
+										"Token set"
+									) : (
+										"No token"
+									)}
+									{" · "}
+									{c.usedBy.length === 0
+										? "Used by no project"
+										: `Used by ${c.usedBy.join(", ")}`}
+								</span>
+							</div>
+							<div className="jira-conn-actions">
+								<button
+									type="button"
+									aria-label={`Edit ${c.name}`}
+									onClick={() => edit(c)}
+								>
+									Edit
+								</button>
+								<BusyButton
+									ariaLabel={`Test ${c.name}`}
+									run={() => test(c.name)}
+								>
+									Test
+								</BusyButton>
+								<BusyButton
+									className="danger"
+									ariaLabel={`Delete ${c.name}`}
+									run={() => remove(c.name)}
+								>
+									Delete
+								</BusyButton>
+							</div>
+						</li>
+					))}
+				</ul>
+			)}
+			<form
+				className="settings-form"
+				aria-label={
+					editing === null
+						? "Add a Jira connection"
+						: `Edit the Jira connection ${editing}`
+				}
+				onSubmit={(e) => {
+					e.preventDefault();
+					save();
+				}}
+			>
+				<h4>{editing === null ? "Add connection" : `Edit ${editing}`}</h4>
+				<div className="alate-def-rows">
+					<DefRow
+						name="Name"
+						help="The name that projects pick in their settings, for example work. It cannot change after the save."
+						shape="unique name"
+					>
+						<label>
+							<input
+								value={name}
+								onChange={(e) => setName(e.target.value)}
+								readOnly={editing !== null}
+								required
+								spellCheck={false}
+								autoComplete="off"
+								aria-label="Name"
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Site URL"
+						help="The Jira address, with a context path when Jira has one. Ottr asks the site for its type when you leave the field."
+						shape="https URL"
+						action={
+							<button
+								type="button"
+								disabled={detectBusy.busy || site.trim() === ""}
+								aria-busy={detectBusy.busy || undefined}
+								onClick={runDetect}
+							>
+								{detectBusy.busy && (
+									<span className="spinner" aria-hidden="true" />
+								)}
+								Detect type
+							</button>
+						}
+					>
+						<div className="alate-field-stack jira-site-stack">
+							<label>
+								<input
+									value={site}
+									onChange={(e) => setSite(e.target.value)}
+									onBlur={() => {
+										if (site.trim() !== "" && detect?.site !== site.trim())
+											runDetect();
+									}}
+									placeholder="https://acme.atlassian.net"
+									inputMode="url"
+									spellCheck={false}
+									autoComplete="off"
+									required
+									aria-label="Site URL"
+									aria-invalid={detect?.invalid === true || undefined}
+									aria-describedby={detect === null ? undefined : detectId}
+								/>
+							</label>
+							{detect !== null && (
+								<p
+									id={detectId}
+									className={detect.invalid ? "auth-error" : "hint"}
+									role={detect.invalid ? "alert" : "status"}
+								>
+									{detect.text}
+								</p>
+							)}
+						</div>
+					</DefRow>
+					<DefRow
+						name="Type"
+						help="Cloud signs in with an email and an API token. Data Center signs in with a personal access token."
+					>
+						<label>
+							<select
+								value={type}
+								onChange={(e) => setType(e.target.value as JiraType)}
+								aria-label="Type"
+							>
+								<option value="cloud">Cloud</option>
+								<option value="datacenter">Data Center</option>
+							</select>
+						</label>
+					</DefRow>
+					{type === "cloud" && (
+						<DefRow
+							name="Email"
+							help="The email of the Atlassian account that owns the API token."
+							shape="email"
+						>
+							<label>
+								<input
+									type="email"
+									value={email}
+									onChange={(e) => setEmail(e.target.value)}
+									autoComplete="off"
+									spellCheck={false}
+									required
+									aria-label="Email"
+								/>
+							</label>
+						</DefRow>
+					)}
+					<DefRow
+						name="Token"
+						help={
+							type === "cloud"
+								? "An Atlassian API token. Ottr stores it encrypted and never shows it again."
+								: "A personal access token. Ottr stores it encrypted and never shows it again."
+						}
+						shape="secret · stored, never shown"
+					>
+						<div className="alate-field-stack">
+							<label>
+								<input
+									type="password"
+									value={token}
+									onChange={(e) => setToken(e.target.value)}
+									autoComplete="off"
+									spellCheck={false}
+									required={editing === null}
+									aria-label="Token"
+									aria-describedby={
+										editingView === null ? undefined : tokenNoteId
+									}
+								/>
+							</label>
+							{editingView !== null && (
+								<p id={tokenNoteId} className="hint">
+									{editingView.tokenReadable
+										? editingView.tokenSet
+											? "Token is set. Leave empty to keep it."
+											: "No token is set. Enter one."
+										: "Token unreadable, enter it again."}
+								</p>
+							)}
+						</div>
+					</DefRow>
+					<DefRow
+						name="Custom field IDs"
+						help="Jira fields to copy into each card prompt, comma-separated, for example customfield_10042."
+						shape="empty = none"
+					>
+						<label>
+							<input
+								value={fields}
+								onChange={(e) => setFields(e.target.value)}
+								placeholder="customfield_10042, customfield_10043"
+								spellCheck={false}
+								autoComplete="off"
+								aria-label="Custom field IDs"
+							/>
+						</label>
+					</DefRow>
+				</div>
+				<div className="alate-def-actions">
+					<button
+						type="submit"
+						disabled={saveBusy.busy}
+						aria-busy={saveBusy.busy || undefined}
+						className={saveBusy.failed ? "failed" : ""}
+					>
+						{saveBusy.busy && <span className="spinner" aria-hidden="true" />}
+						Save connection
+					</button>{" "}
+					{editing !== null && (
+						<button type="button" onClick={reset}>
+							Cancel
+						</button>
+					)}
+				</div>
+			</form>
+			<p className="hint" role="status">
+				{note}
+			</p>
 			{error !== null && (
 				<p className="auth-error" role="alert">
 					{error}
@@ -6195,6 +6638,7 @@ export const SETTINGS_TOC = [
 			},
 			{ id: "commit-identity-section", label: "Commit identity" },
 			{ id: "env-section", label: "Env" },
+			{ id: "jira-section", label: "Jira connections" },
 		],
 	},
 	{
@@ -6226,6 +6670,7 @@ const PROJECT_TOC = [
 			{ id: "project-runners-section", label: "Runners" },
 			{ id: "project-worktrees-section", label: "Worktrees" },
 			{ id: "project-messages-section", label: "Messages" },
+			{ id: "project-jira-section", label: "Jira" },
 		],
 	},
 	{
@@ -6563,6 +7008,7 @@ function GeneralSettingsContent({
 						<CommitIdentitySection commitIdentity={commitIdentity} act={act} />
 					)}
 					<EnvSection />
+					<JiraConnectionsSection />
 				</section>
 			)}
 			{groupShown("agents-group") && (
@@ -7519,7 +7965,112 @@ function ProjectSlotsSection({
 					</>
 				)}
 			</SaveCard>
+			<ProjectJiraSection project={project} send={send} act={act} />
 		</section>
+	);
+}
+
+/** Project settings "Jira": the board connection the Import from Jira dialog searches.
+ *  A pick saves at once; None hides the board's Import from Jira button. */
+function ProjectJiraSection({
+	project,
+	send,
+	act,
+}: {
+	project: ProjectView;
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+	act: Act;
+}) {
+	const [names, setNames] = useState<string[] | null>(null);
+	const [loadError, setLoadError] = useState<string | null>(null);
+	const pick = useOptimisticValue(project.settings.jiraConnection, act);
+	useEffect(() => {
+		let live = true;
+		void (async () => {
+			const { status, data } = await gitReq("GET", "/api/jira/connections");
+			if (!live) return;
+			if (status !== 200)
+				setLoadError(asError(data, status, "loading the Jira connections"));
+			else
+				setNames((data as unknown as JiraConnectionView[]).map((c) => c.name));
+		})().catch((err) => {
+			if (live) setLoadError(err instanceof Error ? err.message : String(err));
+		});
+		return () => {
+			live = false;
+		};
+	}, []);
+	const current = pick.value;
+	// A saved name the list no longer has still shows, so the select never lies about it.
+	const options =
+		names === null || current === null || names.includes(current)
+			? (names ?? [])
+			: [current, ...names];
+	return (
+		<SettingsCard
+			id="project-jira-section"
+			title="Jira"
+			status={
+				project.settings.jiraConnection === null
+					? { label: "Off", tone: "off" }
+					: { label: project.settings.jiraConnection, tone: "ok" }
+			}
+		>
+			<div className="alate-def-rows">
+				<DefRow
+					name="Jira connection"
+					help="The board connection that Import from Jira on this board searches. None hides the button."
+					shape="empty = none"
+					action={
+						<SaveTick
+							busy={pick.busy}
+							saved={pick.saved}
+							failed={pick.failed}
+							reason={pick.reason}
+						/>
+					}
+				>
+					<label>
+						<select
+							value={current ?? ""}
+							disabled={names === null}
+							onChange={(e) => {
+								const v = e.target.value === "" ? null : e.target.value;
+								pick.set(v);
+								pick.run(() => send({ jiraConnection: v }));
+							}}
+							aria-label="Jira connection"
+						>
+							<option value="">None</option>
+							{options.map((n) => (
+								<option key={n} value={n}>
+									{n}
+								</option>
+							))}
+						</select>
+					</label>
+				</DefRow>
+			</div>
+			{names !== null && names.length === 0 && (
+				<p className="hint">
+					No Jira connection exists yet. Add one in{" "}
+					<a
+						href={`${settingsPath(null)}#jira-section`}
+						onClick={(e) =>
+							navClick(e, () => openSettingsSection("jira-section"))
+						}
+					>
+						General settings
+					</a>
+					.
+				</p>
+			)}
+			{loadError !== null && (
+				<p className="auth-error" role="alert">
+					{loadError}
+				</p>
+			)}
+		</SettingsCard>
 	);
 }
 

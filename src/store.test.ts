@@ -450,6 +450,8 @@ describe("settings", () => {
 			trendingScout: false,
 			issueWatch: false,
 			issueWatchSince: null,
+			jiraConnection: null,
+			jiraLastJql: null,
 			ompWatch: false,
 			setupChecklist: false,
 			targetBranch: null,
@@ -482,6 +484,8 @@ describe("settings", () => {
 			trendingScout: false,
 			issueWatch: false,
 			issueWatchSince: null,
+			jiraConnection: null,
+			jiraLastJql: null,
 			ompWatch: false,
 			setupChecklist: false,
 			targetBranch: null,
@@ -4702,5 +4706,176 @@ describe("review findings storage", () => {
 		).toBe(true);
 		expect(store.getTask(card.id)?.findingsCheckedAt).toBeNull();
 		store.close();
+	});
+});
+
+describe("jira imports", () => {
+	const site = "https://acme.atlassian.net";
+	const items = (...keys: string[]) =>
+		keys.map((key) => ({ key, title: `${key}: t`, prompt: `prompt ${key}` }));
+
+	test("settings default to null and round-trip", () => {
+		const store = open(join(root, "jira-settings"));
+		const s = store.getSettings();
+		expect(s.jiraConnection).toBeNull();
+		expect(s.jiraLastJql).toBeNull();
+		store.setSettings({ jiraConnection: "acme", jiraLastJql: "project = X" });
+		store.close();
+		const again = open(join(root, "jira-settings")).getSettings();
+		expect(again.jiraConnection).toBe("acme");
+		expect(again.jiraLastJql).toBe("project = X");
+	});
+
+	test("files backlog cards idle and todo cards queued", () => {
+		const store = open(join(root, "jira-file"));
+		const r = store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1", "A-2", "A-3"),
+			now: 1,
+		});
+		expect(r.skipped).toEqual([]);
+		expect(r.filed).toHaveLength(3);
+		r.filed.forEach((t, i) => {
+			expect(t).toMatchObject({
+				stage: "backlog",
+				state: "idle",
+				topic: "jira",
+				queuedAt: null,
+				title: `A-${i + 1}: t`,
+				prompt: `prompt A-${i + 1}`,
+			});
+			expect(store.getTask(t.id)?.stage).toBe("backlog");
+		});
+		const todo = store.fileJiraCards({
+			site,
+			stage: "todo",
+			items: items("B-1"),
+			now: 2,
+		});
+		expect(todo.filed[0]).toMatchObject({
+			stage: "todo",
+			state: "queued",
+			topic: "jira",
+		});
+		expect(store.jiraImported(site, ["A-1", "B-1", "Z-9"])).toEqual(
+			new Map([
+				["A-1", r.filed[0]?.id ?? ""],
+				["B-1", todo.filed[0]?.id ?? ""],
+			]),
+		);
+	});
+
+	test("a second import of the same site and keys skips them; another site does not", () => {
+		const store = open(join(root, "jira-dup"));
+		store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1", "A-2"),
+			now: 1,
+		});
+		const before = store.listTasks().length;
+		const again = store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1", "A-2", "A-1"),
+			now: 2,
+		});
+		expect(again).toEqual({ filed: [], skipped: ["A-1", "A-2", "A-1"] });
+		expect(store.listTasks()).toHaveLength(before);
+		const other = store.fileJiraCards({
+			site: "https://jira.corp",
+			stage: "backlog",
+			items: items("A-1"),
+			now: 3,
+		});
+		expect(other.filed).toHaveLength(1);
+		expect(other.skipped).toEqual([]);
+	});
+
+	test("a key repeated in one call files one card", () => {
+		const store = open(join(root, "jira-repeat"));
+		const r = store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1", "A-1"),
+			now: 1,
+		});
+		expect(r.filed).toHaveLength(1);
+		expect(r.skipped).toEqual(["A-1"]);
+	});
+
+	test("a cancelled card still counts as imported", () => {
+		const store = open(join(root, "jira-cancel"));
+		const [card] = store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1"),
+			now: 1,
+		}).filed;
+		if (!card) throw new Error("no card");
+		store.updateTask(card.id, { cancelledAt: 5 });
+		expect(store.jiraImported(site, ["A-1"]).get("A-1")).toBe(card.id);
+		expect(
+			store.fileJiraCards({ site, stage: "todo", items: items("A-1"), now: 2 })
+				.skipped,
+		).toEqual(["A-1"]);
+	});
+
+	test("a key whose task row is gone imports again", () => {
+		const dir = join(root, "jira-gone");
+		let store = open(dir);
+		const [card] = store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1"),
+			now: 1,
+		}).filed;
+		if (!card) throw new Error("no card");
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.run("DELETE FROM tasks WHERE id = ?", [card.id]);
+		raw.close();
+		store = open(dir);
+		expect(store.jiraImported(site, ["A-1"]).size).toBe(0);
+		const again = store.fileJiraCards({
+			site,
+			stage: "backlog",
+			items: items("A-1"),
+			now: 2,
+		});
+		expect(again.filed).toHaveLength(1);
+		expect(again.filed[0]?.id).not.toBe(card.id);
+		expect(store.jiraImported(site, ["A-1"]).get("A-1")).toBe(
+			again.filed[0]?.id ?? "",
+		);
+	});
+
+	test("an old database gains the jira_imports table on open", () => {
+		const dir = join(root, "jira-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.close();
+		const store = open(dir);
+		expect(
+			store.fileJiraCards({
+				site,
+				stage: "backlog",
+				items: items("A-1"),
+				now: 1,
+			}).filed,
+		).toHaveLength(1);
+		store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const t = raw
+			.query<{ name: string }, []>(
+				"SELECT name FROM sqlite_master WHERE name = 'jira_imports'",
+			)
+			.all();
+		raw.close();
+		expect(t).toEqual([{ name: "jira_imports" }]);
 	});
 });

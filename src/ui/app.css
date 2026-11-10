@@ -4830,6 +4830,153 @@ dialog.diff-view {
 .dialog.release-dialog {
 	max-height: min(94dvh, 960px);
 }
+/* Import from Jira: head and JQL at the top, stage and actions pinned at the bottom; only the
+   result list scrolls. Each row stacks key, summary and facts in one column, so a 320px phone
+   needs no sideways scroll. With no room left for the list (a short phone, 200% zoom), the
+   body scrolls as a whole, so the actions stay reachable. */
+.dialog.jira-dialog {
+	width: min(720px, calc(100vw - 24px));
+	max-height: min(calc(100dvh - 24px), 900px);
+}
+.dialog.jira-dialog[open] {
+	display: flex;
+	flex-direction: column;
+}
+.jira-dialog > .dialog-body {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+}
+.jira-search {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.jira-search textarea {
+	field-sizing: content;
+	min-height: 4.5em;
+	max-height: 30vh;
+	font-family: var(--mono);
+}
+.jira-search-actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+.jira-all {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: fit-content;
+	font-size: 12px;
+	color: var(--dim);
+}
+.jira-rows {
+	flex: 1 1 auto;
+	min-height: min(120px, 30dvh);
+	max-height: min(45dvh, 420px);
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	overflow-y: auto;
+	border-block: 1px solid var(--line-soft);
+}
+.jira-row {
+	display: flex;
+	align-items: flex-start;
+	gap: 10px;
+	padding: 6px 4px;
+	font-size: 13px;
+}
+.jira-row + .jira-row {
+	border-top: 1px solid var(--line-soft);
+}
+.jira-row > input {
+	flex: none;
+	margin-top: 2px;
+}
+.jira-row-text {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.jira-summary {
+	color: var(--text-strong);
+}
+.jira-row.imported .jira-summary {
+	color: var(--text);
+}
+.jira-facts {
+	font-size: 12px;
+	color: var(--dim);
+}
+.jira-more {
+	align-self: flex-start;
+}
+.jira-stage {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px 16px;
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+.jira-stage legend {
+	padding: 0;
+	margin-bottom: 4px;
+	font-size: 12px;
+	color: var(--dim);
+}
+.jira-stage label {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+}
+/* Settings "Jira connections": one row per connection, facts left, actions right; the
+   actions wrap under the facts on a narrow card. */
+.jira-conns {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.jira-conn {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px 12px;
+	padding: 8px 0;
+}
+.jira-conn + .jira-conn {
+	border-top: 1px solid var(--line-soft);
+}
+.jira-conn-text {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+.jira-conn-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.jira-conn-warn {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	color: var(--text);
+}
+/* The site URL field and its type-check note share the row with Detect type: the stack
+   takes the free width, the button keeps its own. */
+.settings-sec .jira-site-stack {
+	flex: 1;
+}
 /* Settings: the head stays put; only the body scrolls under it. */
 .dialog-body {
 	display: flex;

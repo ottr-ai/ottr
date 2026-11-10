@@ -226,6 +226,10 @@ export interface ProjectSettings {
 	pushSyncCommits: boolean;
 	/** Task id handle like OTTR; null = derived from the folder name. Uppercase letters and digits, at most 8. */
 	taskIdPrefix: string | null;
+	/** Name of the board-level Jira connection this project imports from; null = none. */
+	jiraConnection: string | null;
+	/** The last JQL query that searched successfully, restored in the import dialog; null = none yet. */
+	jiraLastJql: string | null;
 }
 
 /** One task's touched file with its +/- line counts; null counts mark a binary file. */
@@ -1524,3 +1528,47 @@ export type ServerMessage =
 	| { type: "update"; behind: number; commits: string[] }
 	| { type: "log"; project: string; id: string }
 	| { type: "ping" };
+
+export type JiraType = "cloud" | "datacenter";
+
+/** What the API returns for a Jira connection: never the token. */
+export interface JiraConnectionView {
+	name: string;
+	/** Normalized site URL, e.g. "https://acme.atlassian.net" or "https://jira.corp/jira". */
+	site: string;
+	type: JiraType;
+	/** Cloud only. */
+	email: string | null;
+	/** Custom field ids, e.g. ["customfield_10042"]. */
+	customFields: string[];
+	tokenSet: boolean;
+	/** false => the stored token cannot be decrypted; the user must enter it again. */
+	tokenReadable: boolean;
+	/** Project names whose settings.jiraConnection names this connection. */
+	usedBy: string[];
+}
+
+export interface JiraRow {
+	key: string;
+	/** `${site}/browse/${key}` */
+	url: string;
+	summary: string;
+	issueType: string;
+	status: string;
+	/** "" when none. */
+	priority: string;
+	/** Task id of the existing card, or null. */
+	importedCard: string | null;
+}
+
+export interface JiraSearchResult {
+	rows: JiraRow[];
+	next: string | null;
+	total: number | null;
+}
+
+/** filed = task ids filed; skipped = issue keys already imported. */
+export interface JiraImportResult {
+	filed: string[];
+	skipped: string[];
+}

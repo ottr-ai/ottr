@@ -91,6 +91,8 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	originUrl: null,
 	pushSyncCommits: false,
 	taskIdPrefix: null,
+	jiraConnection: null,
+	jiraLastJql: null,
 };
 
 /** The tasks table DDL, kept separate so the CHECK migration below reuses the exact shape. */
@@ -253,6 +255,13 @@ CREATE TABLE IF NOT EXISTS review_findings (
   security TEXT,
   created_at INTEGER NOT NULL,
   UNIQUE(card_id, prompt)
+);
+CREATE TABLE IF NOT EXISTS jira_imports (
+  site TEXT NOT NULL,
+  issue_key TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  filed_at INTEGER NOT NULL,
+  PRIMARY KEY (site, issue_key)
 );
 -- Retired and unused: review conventions live in the project's AGENTS.md.
 CREATE TABLE IF NOT EXISTS learnings (
@@ -1105,6 +1114,8 @@ const SETTINGS_SHAPES = {
 	originUrl: "string|null",
 	pushSyncCommits: "boolean",
 	taskIdPrefix: "string|null",
+	jiraConnection: "string|null",
+	jiraLastJql: "string|null",
 } as const satisfies Record<keyof ProjectSettings, string>;
 
 /** Validates one stored settings value; undefined when corrupt or of the wrong shape (keep default). */
@@ -2756,6 +2767,64 @@ export class ProjectStore {
 		const task = this.getTask(id);
 		if (task === null) throw new Error(`unknown task: ${id}`);
 		return task;
+	}
+
+	/** key -> task id for keys already imported from site whose task row still exists (any stage, cancelled too). Rows for missing tasks are ignored. */
+	jiraImported(site: string, keys: string[]): Map<string, string> {
+		const out = new Map<string, string>();
+		const q = this.db.query<{ task_id: string }, [string, string]>(
+			"SELECT j.task_id FROM jira_imports j JOIN tasks t ON t.id = j.task_id WHERE j.site = ? AND j.issue_key = ?",
+		);
+		for (const key of keys) {
+			const r = q.get(site, key);
+			if (r) out.set(key, r.task_id);
+		}
+		return out;
+	}
+
+	/** Files one card for each Jira issue not yet imported from site, in one transaction; backlog cards wait idle like fileIssueCard, todo cards queue like createTask. */
+	fileJiraCards(o: {
+		site: string;
+		stage: "backlog" | "todo";
+		items: { key: string; title: string; prompt: string }[];
+		now: number;
+	}): { filed: Task[]; skipped: string[] } {
+		const tx = this.db.transaction(() => {
+			const done = this.jiraImported(
+				o.site,
+				o.items.map((i) => i.key),
+			);
+			const ids: string[] = [];
+			const skipped: string[] = [];
+			for (const item of o.items) {
+				if (done.has(item.key)) {
+					skipped.push(item.key);
+					continue;
+				}
+				const card = this.createTask(item.prompt, null, "work");
+				this.updateTask(card.id, {
+					title: item.title,
+					topic: "jira",
+					...(o.stage === "backlog"
+						? { stage: "backlog", state: "idle", queuedAt: null }
+						: {}),
+				});
+				this.db.run(
+					"INSERT OR REPLACE INTO jira_imports (site, issue_key, task_id, filed_at) VALUES (?, ?, ?, ?)",
+					[o.site, item.key, card.id, o.now],
+				);
+				done.set(item.key, card.id);
+				ids.push(card.id);
+			}
+			return { ids, skipped };
+		});
+		const { ids, skipped } = tx();
+		const filed = ids.map((id) => {
+			const task = this.getTask(id);
+			if (task === null) throw new Error(`unknown task: ${id}`);
+			return task;
+		});
+		return { filed, skipped };
 	}
 
 	/** Issue numbers filed but not yet labelled on GitHub, ascending. */

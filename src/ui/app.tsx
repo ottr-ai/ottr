@@ -94,6 +94,7 @@ import {
 import type { CardPos } from "./flight.ts";
 import { freshTaskIds, listSlides, stageFlights } from "./flight.ts";
 import logo from "./icon-192.png";
+import { JiraImportButton, JiraImportDialog } from "./jiraImport.tsx";
 import {
 	type Act,
 	BAND_LIMIT,
@@ -4209,6 +4210,7 @@ export function ProjectBoard({
 		[act],
 	);
 	const [showDiagrams, setShowDiagrams] = useState(false);
+	const [showJira, setShowJira] = useState(false);
 	// The search box takes each keystroke uncontrolled; the filter lands after the
 	// pause (SEARCH_APPLY_MS), so a big board does not re-render per keypress.
 	const [applied, applySearch] = useDelayedState(SEARCH_APPLY_MS);
@@ -4321,6 +4323,10 @@ export function ProjectBoard({
 							{reviewNote !== null && <SkillGapMark note={reviewNote} />}
 						</button>
 					)}
+					<JiraImportButton
+						project={project}
+						onOpen={() => setShowJira(true)}
+					/>
 					{/* Project settings now lives in the menu, so every project gets the menu;
 					    review, release and diagrams stay conditional inside it. */}
 					<ProjectMenu
@@ -4363,6 +4369,13 @@ export function ProjectBoard({
 					onClose={() => setShowDiagrams(false)}
 					act={act}
 					open={open}
+				/>
+			)}
+			{showJira && project.settings.jiraConnection !== null && (
+				<JiraImportDialog
+					project={project}
+					onClose={() => setShowJira(false)}
+					openTask={open}
 				/>
 			)}
 			<ProjectAdvisories

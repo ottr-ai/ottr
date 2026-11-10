@@ -10,6 +10,7 @@ import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
+import { errmsg } from "./errmsg.ts";
 import { defaultSshDir } from "./gitHosts.ts";
 import { syncWorktreeTo } from "./gitHttp.ts";
 import { githubHost } from "./githubHost.ts";
@@ -43,6 +44,7 @@ import {
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
 import { archReviewView, lastFullReview, reviewBlocked } from "./scheduler.ts";
+import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import {
 	type AdoptResult,
 	adoptSharedProjectData,
@@ -144,6 +146,14 @@ const ROOTS = process.env.OMP_TRACKER_ROOTS
 // opens (and locks) the checkout's own tracker.db.
 const STATE_DIR = process.env.OTTR_STATE_DIR ?? resolve(import.meta.dir, "..");
 const gstore = GlobalStore.open(STATE_DIR);
+/** Jira token sealing (docs/specs/jira-import.md section 1): the key file sits next to tracker.db.
+ * A malformed key never stops the boot: the Jira routes answer 503 until it is fixed. */
+let secretBox: SecretBox | undefined;
+try {
+	secretBox = loadSecretBox({ dir: join(resolve(STATE_DIR), ".tasks") });
+} catch (err) {
+	console.error(`jira: secret key: ${errmsg(err)}; Jira routes are off`);
+}
 
 // Mutable settings shared with createApp: /api/settings writes them, the scheduler and
 // discovery read them. The persisted project lists load here, before boot discovery: a
@@ -806,6 +816,7 @@ const app = createApp({
 	vmTokens,
 	llmGateway: () => llmGateway,
 	hosted,
+	secretBox,
 	ompStats: { info: ompStatsInfo, dashboard: ompStatsDashboard },
 });
 

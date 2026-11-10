@@ -199,6 +199,7 @@ describe("hosted settings TOC", () => {
 					"project-runners-section",
 					"project-worktrees-section",
 					"project-messages-section",
+					"project-jira-section",
 				],
 			},
 			{
@@ -218,7 +219,7 @@ describe("hosted settings TOC", () => {
 	test("hosted: the general page keeps only the tenant cards, and empty groups go", () => {
 		expect(tree(pageToc(true, true))).toEqual([
 			{ group: "board-group", cards: ["notifications-section"] },
-			{ group: "git-group", cards: ["env-section"] },
+			{ group: "git-group", cards: ["env-section", "jira-section"] },
 		]);
 	});
 
