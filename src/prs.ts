@@ -44,48 +44,53 @@ export function prUrl(repo: string, n: number): string {
 	return `${githubHost().webBase}/${repo}/pull/${n}`;
 }
 
+/** One entry of a pull page: a PullInfo when every field checks out, else null. */
+function parsePullEntry(e: unknown): PullInfo | null {
+	if (typeof e !== "object" || e === null) return null;
+	const x = e as Record<string, unknown>;
+	const head = x.head as Record<string, unknown> | null | undefined;
+	const sha = typeof head === "object" && head !== null ? head.sha : undefined;
+	if (
+		typeof x.number !== "number" ||
+		!Number.isInteger(x.number) ||
+		x.number <= 0 ||
+		typeof sha !== "string" ||
+		!SHA_RE.test(sha) ||
+		typeof x.draft !== "boolean" ||
+		x.state !== "open"
+	)
+		return null;
+	const title =
+		typeof x.title === "string"
+			? stripInvisible(x.title).text.trim().slice(0, 120)
+			: "";
+	const repo = (head as Record<string, unknown>).repo as
+		| Record<string, unknown>
+		| null
+		| undefined;
+	const repoId =
+		typeof repo === "object" && repo !== null ? repo.id : undefined;
+	const ref = (head as Record<string, unknown>).ref;
+	return {
+		number: x.number,
+		head: sha,
+		draft: x.draft,
+		title,
+		headRepoId:
+			typeof repoId === "number" && Number.isInteger(repoId) && repoId > 0
+				? repoId
+				: null,
+		headRef: typeof ref === "string" && ref.length > 0 ? ref : null,
+	};
+}
+
 /** GitHub data is untrusted: malformed entries are skipped, never thrown on. */
 export function parsePullPage(body: unknown): PullInfo[] {
 	if (!Array.isArray(body)) return [];
 	const out: PullInfo[] = [];
 	for (const e of body) {
-		if (typeof e !== "object" || e === null) continue;
-		const x = e as Record<string, unknown>;
-		const head = x.head as Record<string, unknown> | null | undefined;
-		const sha =
-			typeof head === "object" && head !== null ? head.sha : undefined;
-		if (
-			typeof x.number !== "number" ||
-			!Number.isInteger(x.number) ||
-			x.number <= 0 ||
-			typeof sha !== "string" ||
-			!SHA_RE.test(sha) ||
-			typeof x.draft !== "boolean" ||
-			x.state !== "open"
-		)
-			continue;
-		const title =
-			typeof x.title === "string"
-				? stripInvisible(x.title).text.trim().slice(0, 120)
-				: "";
-		const repo = (head as Record<string, unknown>).repo as
-			| Record<string, unknown>
-			| null
-			| undefined;
-		const repoId =
-			typeof repo === "object" && repo !== null ? repo.id : undefined;
-		const ref = (head as Record<string, unknown>).ref;
-		out.push({
-			number: x.number,
-			head: sha,
-			draft: x.draft,
-			title,
-			headRepoId:
-				typeof repoId === "number" && Number.isInteger(repoId) && repoId > 0
-					? repoId
-					: null,
-			headRef: typeof ref === "string" && ref.length > 0 ? ref : null,
-		});
+		const info = parsePullEntry(e);
+		if (info !== null) out.push(info);
 	}
 	return out;
 }
@@ -831,6 +836,50 @@ function dueReviewRows(store: ForkProject["store"], t: number): PrReviewRow[] {
 	return due;
 }
 
+/** The comment watch: every posted open PR reads the comments since its cutoff. */
+async function sweepNotifiedRows(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	repo: string,
+): Promise<void> {
+	const store = project.store;
+	for (const row of store.listPrReviews()) {
+		if (row.state !== "open" || row.taskId === null || row.postedHead === null)
+			continue;
+		// A cancelled card is the user's "never review this PR".
+		if (store.getTask(row.taskId)?.cancelledAt != null) continue;
+		try {
+			await sweepComments(ctx, project, repo, row);
+		} catch (e) {
+			ctx.log(
+				`prs: ${project.name}: #${row.number} sweep failed: ${(e as Error).message}`,
+			);
+		}
+	}
+}
+
+/** Runs the due reviews under the project's daily cap. */
+async function runDueReviews(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	repo: string,
+	store: ForkProject["store"],
+	t: number,
+): Promise<void> {
+	for (const row of dueReviewRows(store, t)) {
+		if (
+			store.prReviewRunsSince(t - PR_GATES.DAY_MS) >=
+			PR_GATES.PROJECT_DAILY_RUNS
+		) {
+			ctx.log(
+				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+			);
+			return;
+		}
+		await reviewOnce(ctx, project, repo, row, undefined);
+	}
+}
+
 async function scanProject(
 	ctx: PrWatcherCtx,
 	project: ForkProject,
@@ -850,37 +899,9 @@ async function scanProject(
 	await closeGonePulls(ctx, project, repo, seen);
 	// Converges every card to its row: a reopened PR, or a card an older build left in Done.
 	for (const row of store.listPrReviews()) store.syncPrCard(row.number);
-	// The comment watch: every posted open PR reads the comments since its cutoff.
 	if (store.getSettings().prReviewNotify === true)
-		for (const row of store.listPrReviews()) {
-			if (
-				row.state !== "open" ||
-				row.taskId === null ||
-				row.postedHead === null
-			)
-				continue;
-			// A cancelled card is the user's "never review this PR".
-			if (store.getTask(row.taskId)?.cancelledAt != null) continue;
-			try {
-				await sweepComments(ctx, project, repo, row);
-			} catch (e) {
-				ctx.log(
-					`prs: ${project.name}: #${row.number} sweep failed: ${(e as Error).message}`,
-				);
-			}
-		}
-	for (const row of dueReviewRows(store, t)) {
-		if (
-			store.prReviewRunsSince(t - PR_GATES.DAY_MS) >=
-			PR_GATES.PROJECT_DAILY_RUNS
-		) {
-			ctx.log(
-				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
-			);
-			return;
-		}
-		await reviewOnce(ctx, project, repo, row, undefined);
-	}
+		await sweepNotifiedRows(ctx, project, repo);
+	await runDueReviews(ctx, project, repo, store, t);
 }
 
 /**
@@ -902,46 +923,72 @@ async function sweepComments(
 		return;
 	}
 	const since = new Date(row.commentsAt).toISOString();
-	// GitHub answers the issue-comments list oldest first and ignores sort there, so the
-	// sweep never trusts the first page: it reads pages until a short page, at most
-	// MAX_SWEEP_PAGES. `since` bounds each page to the cutoff window (it filters by the
-	// updated time, so a comment edited after the cutoff still arrives; the created_at
-	// check below drops it). A cap stop counts what it read; the rest stays after the
-	// cutoff and a later tick reads it.
-	const read = async (base: string): Promise<unknown[]> => {
-		const out: unknown[] = [];
-		for (let page = 1; page <= MAX_SWEEP_PAGES; page++) {
-			const path = page === 1 ? base : `${base}&page=${page}`;
-			const r = await ctx.gh(["api", path]);
-			if (r.code !== 0)
-				throw new Error(
-					`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-				);
-			let body: unknown;
-			try {
-				body = JSON.parse(r.stdout);
-			} catch {
-				throw new Error("comments: bad JSON");
-			}
-			if (!Array.isArray(body)) throw new Error("comments: not a list");
-			out.push(...body);
-			if (body.length < 100) return out;
-		}
-		ctx.log(
-			`prs: ${project.name}: #${row.number}: the comment sweep stopped at ${MAX_SWEEP_PAGES} pages`,
-		);
-		return out;
-	};
 	const entries = [
-		...(await read(
+		...(await readCommentPages(
+			ctx,
+			project,
+			row,
 			`repos/${repo}/issues/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
 		)),
-		...(await read(
+		...(await readCommentPages(
+			ctx,
+			project,
+			row,
 			`repos/${repo}/pulls/${row.number}/comments?per_page=100&since=${encodeURIComponent(since)}`,
 		)),
 	];
+	const { newest, count } = countNewComments(entries, row);
+	if (count === 0 || newest === null) return;
+	store.setPrComments(row.number, newest, true);
+	// The card may already be read: drop the mark so it wears the unread badge again.
+	if (row.taskId !== null) ctx.forgetSeen?.(row.taskId);
+	ctx.log(`prs: ${project.name}: #${row.number}: ${count} new comment(s)`);
+}
+
+/** Reads the comment pages of one base path until a short page, at most MAX_SWEEP_PAGES.
+ * GitHub answers the issue-comments list oldest first and ignores sort there, so the
+ * sweep never trusts the first page. `since` bounds each page to the cutoff window (it
+ * filters by the updated time, so a comment edited after the cutoff still arrives; the
+ * created_at check in countNewComments drops it). A cap stop counts what it read; the
+ * rest stays after the cutoff and a later tick reads it. */
+async function readCommentPages(
+	ctx: PrWatcherCtx,
+	project: ForkProject,
+	row: PrReviewRow,
+	base: string,
+): Promise<unknown[]> {
+	const out: unknown[] = [];
+	for (let page = 1; page <= MAX_SWEEP_PAGES; page++) {
+		const path = page === 1 ? base : `${base}&page=${page}`;
+		const r = await ctx.gh(["api", path]);
+		if (r.code !== 0)
+			throw new Error(`comments failed (${r.code}): ${r.stderr.slice(0, 300)}`);
+		let body: unknown;
+		try {
+			body = JSON.parse(r.stdout);
+		} catch {
+			throw new Error("comments: bad JSON");
+		}
+		if (!Array.isArray(body)) throw new Error("comments: not a list");
+		out.push(...body);
+		if (body.length < 100) return out;
+	}
+	ctx.log(
+		`prs: ${project.name}: #${row.number}: the comment sweep stopped at ${MAX_SWEEP_PAGES} pages`,
+	);
+	return out;
+}
+
+/** Counts the trusted entries newer than the row's cutoff, with the newest stamp.
+ * Comment data is untrusted: only a parseable string created_at and a string
+ * user.login count, bodies are never read or stored. */
+function countNewComments(
+	entries: unknown[],
+	row: PrReviewRow,
+): { newest: number | null; count: number } {
 	let newest: number | null = null;
 	let count = 0;
+	if (row.commentsAt === null) return { newest, count };
 	for (const e of entries) {
 		if (typeof e !== "object" || e === null) continue;
 		const x = e as Record<string, unknown>;
@@ -958,11 +1005,7 @@ async function sweepComments(
 		count++;
 		if (newest === null || ts > newest) newest = ts;
 	}
-	if (count === 0 || newest === null) return;
-	store.setPrComments(row.number, newest, true);
-	// The card may already be read: drop the mark so it wears the unread badge again.
-	if (row.taskId !== null) ctx.forgetSeen?.(row.taskId);
-	ctx.log(`prs: ${project.name}: #${row.number}: ${count} new comment(s)`);
+	return { newest, count };
 }
 
 /** Runs one review attempt of `row`'s head: diff, prompt (with the re-review context), model, draft. */

@@ -1535,18 +1535,74 @@ async function integrationHead(
 	return taskBranch === "" ? null : sha(`refs/heads/${taskBranch}`);
 }
 
-export async function serverMergePush(
+/** Result of serverMergePush and its helpers. */
+type MergePushResult =
+	| { status: "skipped" }
+	| { status: "pushed"; output: string }
+	| { status: "failed"; error: string; output?: string }
+	| { status: "rejected"; error: string; output?: string };
+
+/** The bookkeeping a landed push runs: record the tip (R5-1) and track the branch on
+ * origin (OTTR-605). Shared by the direct-success path and the OTTR-743 landed-before-attempt
+ * path. */
+async function recordLandedPush(
+	mainPath: string,
+	branch: string,
+	tip: string,
+): Promise<void> {
+	await git(["update-ref", `refs/remotes/origin/${branch}`, tip], mainPath);
+	await git(["branch", "-u", `origin/${branch}`, branch], mainPath);
+}
+
+/** OTTR-743: a "cannot lock ref" rejection is the remote's race wording — another writer
+ * moved the ref between this push's negotiation and its update (an earlier attempt of
+ * the same push landed, or a parallel push carried the head). When the fetched target
+ * already contains the pushed head, the push's goal is already met: run the same
+ * bookkeeping a successful push runs and land the card instead of parking it. A fetch
+ * that fails, or a remote tip that does not contain the head, keeps today's
+ * retry-then-park behavior with the full output. */
+async function lockRefAlreadyLanded(
+	mainPath: string,
+	branch: string,
+	originUrl: string,
+	local: string,
+): Promise<MergePushResult | null> {
+	const fetchError = await fetchOriginBranch(mainPath, branch, originUrl);
+	if (fetchError !== null) return null;
+	const tip = await git(
+		[
+			"rev-parse",
+			"--verify",
+			"--quiet",
+			`refs/remotes/origin/${branch}^{commit}`,
+		],
+		mainPath,
+	);
+	const remoteTip = tip.code === 0 ? tip.stdout.trim() : null;
+	if (remoteTip === null) return null;
+	const landed = await git(
+		["merge-base", "--is-ancestor", local, remoteTip],
+		mainPath,
+	);
+	if (landed.code !== 0) return null;
+	await recordLandedPush(mainPath, branch, remoteTip);
+	return {
+		status: "pushed",
+		output: `${PUSH_LANDED_BEFORE_ATTEMPT}: the remote ref moved while the push ran ("cannot lock ref"), and the fetched ${branch} already contains the pushed head ${local}`,
+	};
+}
+
+/** The pre-flight gates of a server merge push: the branch and local tip to push and the
+ * pinned origin to push to. A result means the push is skipped or failed outright. */
+async function mergePushPreflight(
 	mainPath: string,
 	worktreePath: string,
 	target: string,
 	taskBranch: string,
-	leaseTip: string | null = null,
-	originUrl: string | null = null,
+	leaseTip: string | null,
+	originUrl: string | null,
 ): Promise<
-	| { status: "skipped" }
-	| { status: "pushed"; output: string }
-	| { status: "failed"; error: string; output?: string }
-	| { status: "rejected"; error: string; output?: string }
+	{ branch: string; local: string; originUrl: string } | MergePushResult
 > {
 	if (!target.startsWith("origin/")) return { status: "skipped" };
 	const branch = target.slice("origin/".length);
@@ -1580,6 +1636,32 @@ export async function serverMergePush(
 		};
 	const guard = await checkPinnedRemote(mainPath, originUrl);
 	if (guard !== null) return { status: "failed", error: guard };
+	return { branch, local, originUrl };
+}
+
+export async function serverMergePush(
+	mainPath: string,
+	worktreePath: string,
+	target: string,
+	taskBranch: string,
+	leaseTip: string | null = null,
+	originUrl: string | null = null,
+): Promise<
+	| { status: "skipped" }
+	| { status: "pushed"; output: string }
+	| { status: "failed"; error: string; output?: string }
+	| { status: "rejected"; error: string; output?: string }
+> {
+	const pre = await mergePushPreflight(
+		mainPath,
+		worktreePath,
+		target,
+		taskBranch,
+		leaseTip,
+		originUrl,
+	);
+	if ("status" in pre) return pre;
+	const { branch, local, originUrl: pinnedUrl } = pre;
 	const r = await git(
 		[
 			"push",
@@ -1589,7 +1671,7 @@ export async function serverMergePush(
 			...(leaseTip !== null
 				? [`--force-with-lease=refs/heads/${branch}:${leaseTip}`]
 				: []),
-			originUrl,
+			pinnedUrl,
 			`refs/heads/${branch}:refs/heads/${branch}`,
 		],
 		mainPath,
@@ -1598,14 +1680,13 @@ export async function serverMergePush(
 		// A push by URL moves no remote-tracking ref (and a planted fetch refspec could point
 		// it anywhere), so record the tip this push landed: the next merge's skip check and
 		// the gate's `refs/remotes/origin/<branch>` compare stay exact (R5-1).
-		await git(["update-ref", `refs/remotes/origin/${branch}`, local], mainPath);
 		// OTTR-605: a first push to an origin that lacked the branch leaves no upstream, and
 		// the next target derivation would fall back to the bare local branch — a target the
 		// board never pushes. Track the branch this push just created on origin (best
 		// effort: the tracking ref above already carries the push's state; a project whose
 		// derivation came from origin/HEAD loses nothing), so origin/<branch> stays the
 		// resolved target after "Push to origin".
-		await git(["branch", "-u", `origin/${branch}`, branch], mainPath);
+		await recordLandedPush(mainPath, branch, local);
 		return { status: "pushed", output: `${r.stdout}${r.stderr}`.trim() };
 	}
 	// OTTR-465: the card log gets git's complete output (URL credentials redacted), and
@@ -1623,35 +1704,14 @@ export async function serverMergePush(
 		)
 	)
 		return { status: "rejected", error, output };
-	// OTTR-743: a "cannot lock ref" rejection is the remote's race wording — another writer
-	// moved the ref between this push's negotiation and its update (an earlier attempt of
-	// the same push landed, or a parallel push carried the head). When the fetched target
-	// already contains the pushed head, the push's goal is already met: run the same
-	// bookkeeping a successful push runs and land the card instead of parking it. A fetch
-	// that fails, or a remote tip that does not contain the head, keeps today's
-	// retry-then-park behavior with the full output.
 	if (CANNOT_LOCK_REF_RE.test(r.stderr)) {
-		const fetchError = await fetchOriginBranch(mainPath, branch, originUrl);
-		if (fetchError === null) {
-			const remoteTip = await sha(`refs/remotes/origin/${branch}`);
-			if (remoteTip !== null) {
-				const landed = await git(
-					["merge-base", "--is-ancestor", local, remoteTip],
-					mainPath,
-				);
-				if (landed.code === 0) {
-					await git(
-						["update-ref", `refs/remotes/origin/${branch}`, remoteTip],
-						mainPath,
-					);
-					await git(["branch", "-u", `origin/${branch}`, branch], mainPath);
-					return {
-						status: "pushed",
-						output: `${PUSH_LANDED_BEFORE_ATTEMPT}: the remote ref moved while the push ran ("cannot lock ref"), and the fetched ${branch} already contains the pushed head ${local}`,
-					};
-				}
-			}
-		}
+		const landed = await lockRefAlreadyLanded(
+			mainPath,
+			branch,
+			pinnedUrl,
+			local,
+		);
+		if (landed !== null) return landed;
 	}
 	return { status: "failed", error, output };
 }

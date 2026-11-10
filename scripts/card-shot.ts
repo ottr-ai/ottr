@@ -69,6 +69,13 @@ interface Planted {
 	doneId: string;
 }
 
+const VIEWS = ["card", "done", "board"];
+
+function parseView(raw: string | undefined, usage: string, views: string[]) {
+	if (raw === undefined || !VIEWS.includes(raw)) fail("card-shot", usage);
+	if (!views.includes(raw)) views.push(raw);
+}
+
 function parseArgs(argv: string[]): { pr: number | null; views: string[] } {
 	const usage =
 		"usage: bun scripts/card-shot.ts --pr <number> [--view card|done|board]...";
@@ -81,10 +88,7 @@ function parseArgs(argv: string[]): { pr: number | null; views: string[] } {
 			if (!Number.isInteger(value) || value <= 0) fail("card-shot", usage);
 			pr = value;
 		} else if (arg === "--view") {
-			const value = argv[++i];
-			if (value !== "card" && value !== "done" && value !== "board")
-				fail("card-shot", usage);
-			if (!views.includes(value)) views.push(value);
+			parseView(argv[++i], usage, views);
 		} else {
 			fail("card-shot", usage);
 		}

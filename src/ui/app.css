@@ -4308,12 +4308,6 @@ a.pr-link:hover {
 	color: var(--dim);
 	white-space: nowrap;
 }
-/* One caption slot for both wrapped rows, so the strip and the close-reason
-   field start at the same x. */
-.triage-row > .triage-rank > span,
-.triage-row .triage-nominate > label > span {
-	flex: 0 0 92px;
-}
 /* Drawer triage rank (DESIGN.md, Segmented controls): five peer choices, every
    segment the same width. The stock button grey carries the press state —
    grey/steel only. min-width:auto plus nowrap keeps each label whole, so a
@@ -8256,6 +8250,12 @@ button.log-mode[aria-pressed="true"] {
 	padding: 0;
 	border-bottom: none;
 	flex: 1;
+}
+/* One caption slot for both wrapped rows, so the strip and the close-reason
+   field start at the same x. Kept after the caption rules it must not outrank. */
+.triage-row > .triage-rank > span,
+.triage-row .triage-nominate > label > span {
+	flex: 0 0 92px;
 }
 @container (max-width: 640px) {
 	.settings-sec.providers .alate-def-row.providers-row {

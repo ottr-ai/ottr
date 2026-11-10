@@ -517,6 +517,76 @@ async function snapshotOtherCheckouts(
  * its main checkout belongs to that turn right now. Merges of other projects run
  * concurrently with work turns by design. Returns the needs_you reason, null when every
  * other checkout reads unchanged. */
+/** OTTR-708: the change parts one other project's checkout shows against its before
+ * snapshot. Null: nothing to report — nothing changed, or a HEAD advance the board's
+ * own merge machinery recorded. */
+async function checkoutGuardChangeParts(
+	other: TurnProject,
+	ops: TurnOps,
+	boardPushedHeads: Map<string, string>,
+	was: { head: string | null; status: string },
+	now: { head: string | null; status: string },
+): Promise<string[] | null> {
+	const head = now.head;
+	const headMoved = head !== null && head !== was.head;
+	const recorded = headMoved && boardPushedHeads.get(other.name) === head;
+	const files =
+		now.status !== was.status
+			? now.status
+					.split("\n")
+					.map((l) => l.slice(3).trim())
+					.filter((l) => l !== "")
+			: [];
+	if (files.length === 0 && (!headMoved || recorded)) return null;
+	const commits =
+		headMoved && head !== null && was.head !== null
+			? await (ops.commitSubjects ?? commitSubjects)(
+					other.path,
+					was.head,
+					head,
+				).catch(() => [] as string[])
+			: [];
+	const parts: string[] = [];
+	if (headMoved && !recorded)
+		parts.push(
+			commits.length > 0
+				? `new commits ${listed(commits)}`
+				: `HEAD moved to ${head.slice(0, 7)}`,
+		);
+	if (files.length > 0) parts.push(`changed files ${listed(files)}`);
+	return parts;
+}
+
+/** One other project's checkout-guard read. Null: skip the project (its own merge turn
+ * is mid-flight, no before snapshot, an unreadable checkout) or nothing changed. */
+async function checkoutGuardProjectReason(
+	other: TurnProject,
+	ops: TurnOps,
+	boardPushedHeads: Map<string, string>,
+	before: Map<string, { head: string | null; status: string }>,
+): Promise<string | null> {
+	// The other project's own merge turn is mid-flight: its agent fast-forwards its
+	// main checkout legitimately, and the settle records the head it advanced. Skip
+	// the project until that turn is over.
+	const mergingInFlight = other.store
+		.listTasks()
+		.some((t) => t.stage === "merging" && t.state === "running");
+	if (mergingInFlight) return null;
+	const was = before.get(other.name);
+	if (was === undefined) return null;
+	const now = await ops.checkoutState(other.path).catch(() => null);
+	if (now === null) return null;
+	const parts = await checkoutGuardChangeParts(
+		other,
+		ops,
+		boardPushedHeads,
+		was,
+		now,
+	);
+	if (parts === null) return null;
+	return `The ${other.name} main checkout changed while this turn ran (${parts.join("; ")}). Those changes do not belong to this card: file a card in ${other.name} (create_task with its project parameter) and move the commits and files there, then reply to resume this card.`;
+}
+
 async function checkoutGuardReason(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -526,44 +596,13 @@ async function checkoutGuardReason(
 ): Promise<string | null> {
 	for (const other of projects.values()) {
 		if (other.name === self || other.gitless) continue;
-		// The other project's own merge turn is mid-flight: its agent fast-forwards its
-		// main checkout legitimately, and the settle records the head it advanced. Skip
-		// the project until that turn is over.
-		const mergingInFlight = other.store
-			.listTasks()
-			.some((t) => t.stage === "merging" && t.state === "running");
-		if (mergingInFlight) continue;
-		const was = before.get(other.name);
-		if (was === undefined) continue;
-		const now = await ops.checkoutState(other.path).catch(() => null);
-		if (now === null) continue;
-		const headMoved = now.head !== null && now.head !== was.head;
-		const recorded = headMoved && boardPushedHeads.get(other.name) === now.head;
-		const files =
-			now.status !== was.status
-				? now.status
-						.split("\n")
-						.map((l) => l.slice(3).trim())
-						.filter((l) => l !== "")
-				: [];
-		if (files.length === 0 && (!headMoved || recorded)) continue;
-		const commits =
-			headMoved && was.head !== null
-				? await (ops.commitSubjects ?? commitSubjects)(
-						other.path,
-						was.head,
-						now.head!,
-					).catch(() => [] as string[])
-				: [];
-		const parts: string[] = [];
-		if (headMoved && !recorded)
-			parts.push(
-				commits.length > 0
-					? `new commits ${listed(commits)}`
-					: `HEAD moved to ${now.head!.slice(0, 7)}`,
-			);
-		if (files.length > 0) parts.push(`changed files ${listed(files)}`);
-		return `The ${other.name} main checkout changed while this turn ran (${parts.join("; ")}). Those changes do not belong to this card: file a card in ${other.name} (create_task with its project parameter) and move the commits and files there, then reply to resume this card.`;
+		const reason = await checkoutGuardProjectReason(
+			other,
+			ops,
+			boardPushedHeads,
+			before,
+		);
+		if (reason !== null) return reason;
 	}
 	return null;
 }
@@ -2815,6 +2854,61 @@ export function createTurnLoop(
 	 * taken-over check is the same case), the publishing claim, and each run's usage report
 	 * (also of a stopped or failed run; no interim record goes out after this point, also for
 	 * a run whose result never came). */
+	/** The board-visible outcome this settle ships with the metering record (M10): the
+	 * settled turn row's outcome, with a parked card reading needs_you even when the run
+	 * reported none, and a card the settle requeues (a dependency hold, steering, a queued
+	 * rebase retry) reading "queued" — the control plane would otherwise email the owner
+	 * about a card nobody must act on. A value outside /^[a-z_]{1,40}$/ (null included)
+	 * sends nothing. */
+	function settledOutcome(
+		row: string | null,
+		settledTask: Task | null | undefined,
+	): string | null {
+		const rowOutcome = row !== null && /^[a-z_]{1,40}$/.test(row) ? row : null;
+		if (settledTask?.state === "needs_you") return "needs_you";
+		if (settledTask?.state === "queued" && rowOutcome === "needs_you")
+			return "queued";
+		return rowOutcome;
+	}
+
+	/** The card prompt's first line, trimmed and cut to 200 characters; an empty line
+	 * sends nothing. */
+	function meteringTitle(task: Task): string | null {
+		const firstLine = task.prompt.split("\n")[0]?.trim() ?? "";
+		return firstLine === "" ? null : firstLine.slice(0, 200);
+	}
+
+	/** The final metering record of each metered run of one finished run: the outcome and
+	 * the title ride the main run's record only. */
+	function reportRunMetering(
+		hosted: Hosted,
+		turn: Turn,
+		name: string,
+		id: string,
+		kind: TurnKind,
+		task: Task,
+		e: TurnProject,
+		metered: MeteredRun[],
+	): void {
+		const settledTask = e.store.getTask(id);
+		const row = e.store.listTurns(id).at(-1)?.outcome ?? null;
+		const outcome = settledOutcome(row, settledTask);
+		const title = meteringTitle(task);
+		for (const entry of metered) {
+			const { main, ...r } = entry;
+			sendMetering(hosted, {
+				project: name,
+				taskId: id,
+				turnId: turn.id,
+				kind,
+				...r,
+				final: true,
+				...(main === true && outcome !== null ? { outcome } : {}),
+				...(main === true && title !== null ? { title } : {}),
+			});
+		}
+	}
+
 	function releaseRunClaim(
 		name: string,
 		e: TurnProject,
@@ -2837,38 +2931,9 @@ export function createTurnLoop(
 		publishing.delete(key);
 		for (const interim of interims) interim.close();
 		if (ops.hosted !== undefined && mx.turn !== null) {
-			// M10: the outcome is the state the board shows after this settle. A parked card
-			// (credit stop, Esc stop, tracker error, check blockers) reads needs_you even when
-			// the run reported none, and the reverse holds: a card the settle requeues (a
-			// dependency hold, steering, a queued rebase retry) waits on the board's queue, so
-			// its needs_you row outcome ships as "queued" — the control plane would otherwise
-			// email the owner about a card nobody must act on. Every other settle keeps the
-			// settled turn row's outcome (ready, answered, integrated). A value outside
-			// /^[a-z_]{1,40}$/ (null included) sends nothing. The title is the card prompt's
-			// first line, trimmed and cut to 200 characters; an empty line sends nothing.
-			const settledTask = e.store.getTask(id);
-			const row = e.store.listTurns(id).at(-1)?.outcome ?? null;
-			const rowOutcome =
-				row !== null && /^[a-z_]{1,40}$/.test(row) ? row : null;
-			let outcome: string | null = rowOutcome;
-			if (settledTask?.state === "needs_you") outcome = "needs_you";
-			else if (settledTask?.state === "queued" && rowOutcome === "needs_you")
-				outcome = "queued";
-			const firstLine = task.prompt.split("\n")[0]?.trim() ?? "";
-			const title = firstLine === "" ? null : firstLine.slice(0, 200);
-			for (const entry of metered) {
-				const { main, ...r } = entry;
-				sendMetering(ops.hosted, {
-					project: name,
-					taskId: id,
-					turnId: mx.turn.id,
-					kind,
-					...r,
-					final: true,
-					...(main === true && outcome !== null ? { outcome } : {}),
-					...(main === true && title !== null ? { title } : {}),
-				});
-			}
+			// M10: the outcome is the state the board shows after this settle; see
+			// settledOutcome for the parked and requeued cases.
+			reportRunMetering(ops.hosted, mx.turn, name, id, kind, task, e, metered);
 		}
 		schedule();
 	}
@@ -4103,47 +4168,24 @@ export function createTurnLoop(
 			: null;
 	}
 
-	/** Starts the agent run (startRun), claims its slot in `running`, waits out a microVM
-	 * busy answer, consumes this turn's pending text and images, and records the turn row.
-	 * Null: vm-runner answered busy — the card went back to the queue untouched. */
-	async function dispatchTurnRun(
+	/** The options object one turn's agent run starts with: identity, location, prompt and
+	 * images, routing, metering, and the live progress/session entries. */
+	function turnRunStartOptions(
+		ops: TurnOps,
+		runMeter: ReturnType<OpenRunMeter>,
 		name: string,
 		e: TurnProject,
-		store: ProjectStore,
 		id: string,
-		task: Task,
-		key: string,
-		kind: TurnKind,
 		header: TurnHeader,
-		idn: TurnIdentity,
 		loc: RunLocation,
 		input: TurnInput,
 		route: TurnRoute,
+		idn: TurnIdentity,
+		store: ProjectStore,
+		kind: TurnKind,
 		mx: TurnRunShared,
-		openMeter: OpenRunMeter,
-		log: (line: string) => void,
-	): Promise<TurnDispatch | null> {
-		// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
-		const runStartedAt = Date.now();
-		// OTTR-708: work turns that receive workPrompt (work and research cards; the
-		// interview, grill, scout, board-check, release, and retro variants take other
-		// prompts) snapshot every other project's main checkout and re-check it at settle:
-		// the agent must not touch another project's checkout.
-		const checkoutGuard =
-			kind === "work" &&
-			!idn.releaseCard &&
-			!idn.interview &&
-			!idn.retroCard &&
-			!idn.boardCheck &&
-			!idn.grill &&
-			!idn.scout;
-		if (checkoutGuard)
-			mx.guardBefore = await snapshotOtherCheckouts(projects, ops, name);
-		// The work or merge run resolves its model from the default role, also when the card
-		// or session names its own model (docs/specs/hosted-mode.md section 4). It is the
-		// turn's main run: its final record carries the card outcome and title (M10).
-		const runMeter = openMeter("default", true);
-		const handle = ops.startRun({
+	): Parameters<TurnOps["startRun"]>[0] {
+		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
 				auditProvisioned(homedir(), sinceMs, rulesAtStart),
@@ -4183,30 +4225,113 @@ export function createTurnLoop(
 			dataRoot: store.dataRoot,
 			logPath: store.logPath(id),
 			onLog: () => ops.notifyLog(name, id),
-			onProgress: (text) => {
-				if (mx.entry === null) return;
-				// Only a movement of the numbers is live activity: a repeated line (elapsed
-				// ticks of a frozen run, a lock wait) proves nothing and must not reset the
-				// silent-log clock (ALAT-23).
-				const key = text === null ? null : progressKey(text);
-				if (key !== null && key !== mx.entry.progressKey)
-					mx.entry.progressAt = Date.now();
-				mx.entry.progressKey = key ?? undefined;
-				mx.entry.progress = text ?? undefined;
-				ops.publishSoon();
-			},
-			onSession: (sid) => {
-				const cur = store.getTask(id);
-				if (cur?.state !== "preparing" || cur.cancelledAt !== null) return;
-				store.updateTask(id, {
-					sessionId: sid,
-					state: "running",
-					...(kind === "work" && cur.stage === "todo"
-						? { stage: "in_progress" }
-						: {}),
-				});
-			},
+			onProgress: (text) => dispatchProgressEntry(mx, ops, text),
+			onSession: (sid) => dispatchSessionEntry(store, id, kind, sid),
+		};
+	}
+
+	/** OTTR-708: work turns that receive workPrompt (work and research cards; the
+	 * interview, grill, scout, board-check, release, and retro variants take other
+	 * prompts) snapshot every other project's main checkout and re-check it at settle:
+	 * the agent must not touch another project's checkout. */
+	function checkoutGuardApplies(kind: TurnKind, idn: TurnIdentity): boolean {
+		return (
+			kind === "work" &&
+			!idn.releaseCard &&
+			!idn.interview &&
+			!idn.retroCard &&
+			!idn.boardCheck &&
+			!idn.grill &&
+			!idn.scout
+		);
+	}
+
+	/** The run's live progress entry: only a movement of the numbers is live activity; a
+	 * repeated line (elapsed ticks of a frozen run, a lock wait) proves nothing and must not
+	 * reset the silent-log clock (ALAT-23). */
+	function dispatchProgressEntry(
+		mx: TurnRunShared,
+		ops: TurnOps,
+		text: string | null,
+	): void {
+		if (mx.entry === null) return;
+		const key = text === null ? null : progressKey(text);
+		if (key !== null && key !== mx.entry.progressKey)
+			mx.entry.progressAt = Date.now();
+		mx.entry.progressKey = key ?? undefined;
+		mx.entry.progress = text ?? undefined;
+		ops.publishSoon();
+	}
+
+	/** The run's session entry: a session id only lands while the card still reads preparing
+	 * and uncancelled; the first work run of a todo card moves the stage. */
+	function dispatchSessionEntry(
+		store: ProjectStore,
+		id: string,
+		kind: TurnKind,
+		sid: string,
+	): void {
+		const cur = store.getTask(id);
+		if (cur?.state !== "preparing" || cur.cancelledAt !== null) return;
+		store.updateTask(id, {
+			sessionId: sid,
+			state: "running",
+			...(kind === "work" && cur.stage === "todo"
+				? { stage: "in_progress" }
+				: {}),
 		});
+	}
+
+	/** Starts the agent run (startRun), claims its slot in `running`, waits out a microVM
+	 * busy answer, consumes this turn's pending text and images, and records the turn row.
+	 * Null: vm-runner answered busy — the card went back to the queue untouched. */
+	async function dispatchTurnRun(
+		name: string,
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		key: string,
+		kind: TurnKind,
+		header: TurnHeader,
+		idn: TurnIdentity,
+		loc: RunLocation,
+		input: TurnInput,
+		route: TurnRoute,
+		mx: TurnRunShared,
+		openMeter: OpenRunMeter,
+		log: (line: string) => void,
+	): Promise<TurnDispatch | null> {
+		// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
+		const runStartedAt = Date.now();
+		// OTTR-708: work turns that receive workPrompt (work and research cards; the
+		// interview, grill, scout, board-check, release, and retro variants take other
+		// prompts) snapshot every other project's main checkout and re-check it at settle:
+		// the agent must not touch another project's checkout.
+		const checkoutGuard = checkoutGuardApplies(kind, idn);
+		if (checkoutGuard)
+			mx.guardBefore = await snapshotOtherCheckouts(projects, ops, name);
+		// The work or merge run resolves its model from the default role, also when the card
+		// or session names its own model (docs/specs/hosted-mode.md section 4). It is the
+		// turn's main run: its final record carries the card outcome and title (M10).
+		const runMeter = openMeter("default", true);
+		const handle = ops.startRun(
+			turnRunStartOptions(
+				ops,
+				runMeter,
+				name,
+				e,
+				id,
+				header,
+				loc,
+				input,
+				route,
+				idn,
+				store,
+				kind,
+				mx,
+			),
+		);
 		mx.entry = handle;
 		running.set(key, mx.entry);
 		// Awaited only where the original awaited (a microVM dispatch): the sync path must
@@ -5780,6 +5905,23 @@ export function createTurnLoop(
 	/** The verdict fixes after classify and recovery: hold parks, the lost-worktree rewrite,
 	 * the dispatch-context log, image quarantine, the model-restore requeue, mid-run steering,
 	 * reported dependencies, and the review/scout card parks. */
+	/** OTTR-708: records the head the merge machinery left in the project's main checkout,
+	 * so the checkout guard of a concurrent work turn in another project discounts the
+	 * board's own advance. Merge turns only; the interview, grill, and release variants
+	 * touch no merge machinery. */
+	async function recordBoardPushedHead(st: TurnSettle): Promise<void> {
+		if (
+			st.kind !== "merge" ||
+			st.idn.interview ||
+			st.idn.grill ||
+			st.idn.releaseCard
+		)
+			return;
+		const s = await ops.checkoutState(st.e.path).catch(() => null);
+		if (s === null || s.head === null) return;
+		boardPushedHeads.set(st.name, s.head);
+	}
+
 	async function stabilizeNext(
 		st: TurnSettle,
 		facts: GitFacts,
@@ -5800,15 +5942,7 @@ export function createTurnLoop(
 		// failed, rejected, or skipped, or was refused outright, or never ran. Record
 		// the head it left behind, whatever the path took, so the checkout guard of a
 		// concurrent work turn in another project discounts the board's own advance.
-		if (
-			st.kind === "merge" &&
-			!st.idn.interview &&
-			!st.idn.grill &&
-			!st.idn.releaseCard
-		) {
-			const s = await ops.checkoutState(st.e.path).catch(() => null);
-			if (s !== null && s.head !== null) boardPushedHeads.set(st.name, s.head);
-		}
+		await recordBoardPushedHead(st);
 		if (
 			st.fromMain &&
 			!facts.integrated &&

@@ -3111,6 +3111,14 @@ export class ProjectStore {
 		/** Per pr_review card: the draft run stamp and the unseen comment stamp. */
 		pr: Map<string, { draft: number | null; comments: number | null }>;
 	} {
+		const turns = this.boardTurnFacts();
+		const titles = this.boardTitleFacts(turns);
+		const pr = this.boardPrFacts();
+		return { turns, titles, pr };
+	}
+
+	/** Turn facts per task: first open turn, newest model, last work outcome. */
+	private boardTurnFacts(): Map<string, BoardTurnFacts> {
 		const turns = new Map<string, BoardTurnFacts>();
 		const factsFor = (taskId: string): BoardTurnFacts => {
 			let f = turns.get(taskId);
@@ -3148,6 +3156,14 @@ export class ProjectStore {
 			if (r.kind === "work")
 				f.lastWorkOutcome = r.outcome as OutcomeStatus | null;
 		}
+		return turns;
+	}
+
+	/** Raw stored session_title per task; also seeds an all-null fact row per task,
+	 * so a turn-less task reads as all-null, not missing. */
+	private boardTitleFacts(
+		turns: Map<string, BoardTurnFacts>,
+	): Map<string, string | null> {
 		const titles = new Map<string, string | null>();
 		for (const r of this.db
 			.query<{ id: string; session_title: string | null }, []>(
@@ -3156,10 +3172,22 @@ export class ProjectStore {
 			.all()) {
 			titles.set(r.id, r.session_title);
 			// Total over the task rows: a turn-less task reads as all-null, not missing.
-			factsFor(r.id);
+			if (!turns.has(r.id))
+				turns.set(r.id, {
+					openTurn: null,
+					lastModel: null,
+					lastWorkOutcome: null,
+				});
 		}
-		// One grouped query and one row scan per project: the occurrence stamps the board
-		// build and the alert diff read for pr_review cards.
+		return titles;
+	}
+
+	/** One grouped query and one row scan per project: the occurrence stamps the board
+	 * build and the alert diff read for pr_review cards. */
+	private boardPrFacts(): Map<
+		string,
+		{ draft: number | null; comments: number | null }
+	> {
 		const pr = new Map<
 			string,
 			{ draft: number | null; comments: number | null }
@@ -3179,7 +3207,7 @@ export class ProjectStore {
 					row.commentsUnseen && row.commentsAt !== null ? row.commentsAt : null,
 			});
 		}
-		return { turns, titles, pr };
+		return pr;
 	}
 
 	/** The task's newest settled turn (id, error, reported outcome, exit code), or null; one

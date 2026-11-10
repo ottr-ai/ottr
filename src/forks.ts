@@ -638,6 +638,9 @@ function openProposals(store: ProjectStore): number {
 /** Cache ref prefix of an upstream PR head; the suffix is the validated PR number. */
 const PR_REF = "refs/heads/pr-";
 
+/** Internal signal: the project's pull list failed, so the scan stops the project. */
+class PullListFailed extends Error {}
+
 /**
  * A branch's hold after its cursor moves: the PRs held before plus the PRs that removed work
  * in this run, each with the PR head it was judged against. The base stays the cursor from
@@ -697,6 +700,62 @@ export function createForkWatcher(deps: {
 	 * - once every held PR is merged and no rerun waits, the hold ends.
 	 * A PR whose state GitHub does not give keeps the row unchanged until a later check.
 	 */
+	/** GitHub's current state of one held PR: from the open list, else the cached closed
+	 *  answer (fetched once), else null when GitHub does not answer. */
+	async function heldPrState(
+		e: { n: number; head: string },
+		openHead: Map<number, string>,
+		closed: Map<number, { merged: boolean; head: string } | null>,
+		repo: string,
+	): Promise<{ head: string; open: boolean; merged: boolean } | null> {
+		const head = openHead.get(e.n);
+		if (head !== undefined) return { head, open: true, merged: false };
+		if (!closed.has(e.n)) {
+			try {
+				closed.set(e.n, await pullState(repo, e.n, gh));
+			} catch (err) {
+				deps.log(`forks: ${repo}#${e.n}: ${(err as Error).message}`);
+				closed.set(e.n, null);
+			}
+		}
+		const s = closed.get(e.n);
+		return s ? { head: s.head, open: false, merged: s.merged } : null;
+	}
+
+	/** One hold row's outcome once every held PR has a state: rerun, hold-end, or nothing. */
+	function applyHoldStates(
+		store: ProjectStore,
+		r: ForkBranchState,
+		fork: ForkInfo,
+		states: Array<{
+			n: number;
+			held: string;
+			head: string;
+			open: boolean;
+			merged: boolean;
+		}>,
+	): void {
+		const merged = states.filter((s) => s.merged);
+		if (states.some((s) => s.head !== s.held || (!s.open && !s.merged))) {
+			const keep = merged.map((s) => ({ n: s.n, head: s.head }));
+			store.saveForkBranch({
+				...r,
+				analyzedHead: r.holdBase,
+				firstPendingAt: null,
+				holdPrs: keep.length > 0 ? keep : null,
+				holdBase: keep.length > 0 ? r.holdBase : null,
+			});
+			deps.log(
+				`forks: ${fork.owner}/${fork.name}: a held PR changed or closed, its work is checked again`,
+			);
+		} else if (
+			merged.length === states.length &&
+			(r.analyzedHead !== r.holdBase || r.head === r.analyzedHead)
+		) {
+			store.saveForkBranch({ ...r, holdPrs: null, holdBase: null });
+		}
+	}
+
 	async function releaseHolds(
 		store: ProjectStore,
 		holding: ForkBranchState[],
@@ -715,50 +774,67 @@ export function createForkWatcher(deps: {
 				merged: boolean;
 			}> = [];
 			for (const e of r.holdPrs ?? []) {
-				const head = openHead.get(e.n);
-				if (head !== undefined) {
-					states.push({
-						n: e.n,
-						held: e.head,
-						head,
-						open: true,
-						merged: false,
-					});
-					continue;
-				}
-				if (!closed.has(e.n)) {
-					try {
-						closed.set(e.n, await pullState(repo, e.n, gh));
-					} catch (err) {
-						deps.log(`forks: ${repo}#${e.n}: ${(err as Error).message}`);
-						closed.set(e.n, null);
-					}
-				}
-				const s = closed.get(e.n);
-				if (!s) break;
-				states.push({ n: e.n, held: e.head, ...s, open: false });
+				const s = await heldPrState(e, openHead, closed, repo);
+				if (s === null) break;
+				states.push({ n: e.n, held: e.head, ...s });
 			}
 			if (states.length < (r.holdPrs ?? []).length) continue;
-			const merged = states.filter((s) => s.merged);
-			if (states.some((s) => s.head !== s.held || (!s.open && !s.merged))) {
-				const keep = merged.map((s) => ({ n: s.n, head: s.head }));
-				store.saveForkBranch({
-					...r,
-					analyzedHead: r.holdBase,
-					firstPendingAt: null,
-					holdPrs: keep.length > 0 ? keep : null,
-					holdBase: keep.length > 0 ? r.holdBase : null,
-				});
-				deps.log(
-					`forks: ${fork.owner}/${fork.name}: a held PR changed or closed, its work is checked again`,
-				);
-			} else if (
-				merged.length === states.length &&
-				(r.analyzedHead !== r.holdBase || r.head === r.analyzedHead)
-			) {
-				store.saveForkBranch({ ...r, holdPrs: null, holdBase: null });
-			}
+			applyHoldStates(store, r, fork, states);
 		}
+	}
+
+	/** Fetches the fork's pending branches plus the upstream repo's pull refs, and
+	 *  returns the cache path and the head of every PR. Server-only state dir
+	 *  (OTTR_SERVER_DATA_DIR, docker: ottr-state volume), never the worker-shared
+	 *  OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay out of
+	 *  workers' reach. PR heads come from the upstream repo's pull refs, so a PR from any
+	 *  fork (or a branch of the repo itself) is covered. Ref names use only the validated
+	 *  number. Merged PRs still in a hold keep their final head out of a rerun. */
+	async function prepareForkFetch(
+		store: ProjectStore,
+		fork: ForkInfo,
+		pending: Array<ForkBranchState & { head: string }>,
+		pulls: PullInfo[],
+		repo: string,
+	): Promise<{ cachePath: string; prHeadOf: Map<number, string> }> {
+		const cachePath = await ensureCache(store.serverDir, fork, runGit);
+		const refspecs = pending.map(
+			(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
+		);
+		await fetchFork(cachePath, forkUrl(fork), refspecs, runGit);
+		const prHeadOf = new Map(pulls.map((p) => [p.number, p.head]));
+		for (const r of pending)
+			for (const e of r.holdPrs ?? [])
+				if (!prHeadOf.has(e.n)) prHeadOf.set(e.n, e.head);
+		if (prHeadOf.size > 0) {
+			if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
+			await fetchFork(
+				cachePath,
+				`${githubHost().webBase}/${repo}.git`,
+				[...prHeadOf.keys()].map((n) => `+refs/pull/${n}/head:${PR_REF}${n}`),
+				runGit,
+			);
+		}
+		return { cachePath, prHeadOf };
+	}
+
+	/** Nothing new to analyze: move the cursors without a model call, a run record, or a
+	 *  fork pause, so later work is not held back. */
+	function recordClearedRows(
+		store: ProjectStore,
+		pending: Array<ForkBranchState & { head: string }>,
+		held: Map<string, string[]>,
+		prHeadOf: Map<number, string>,
+	): void {
+		for (const r of pending)
+			store.saveForkBranch({
+				...r,
+				...holdAfter(r, held.get(r.branchHash) ?? [], prHeadOf),
+				analyzedHead: r.head,
+				firstPendingAt: null,
+				lastError: null,
+				retries: 0,
+			});
 	}
 
 	/** One head of one fork: insert its row when new, refresh a changed head, clear the
@@ -1013,30 +1089,13 @@ export function createForkWatcher(deps: {
 		repo: string,
 	): Promise<void> {
 		try {
-			// Server-only state dir (OTTR_SERVER_DATA_DIR, docker: ottr-state volume), never the
-			// worker-shared OTTR_DATA_DIR or checkout: fork objects and the fetch config must stay
-			// out of workers' reach.
-			const cachePath = await ensureCache(store.serverDir, fork, runGit);
-			const refspecs = pending.map(
-				(r) => `+refs/heads/${r.branch}:refs/heads/${r.branchHash}`,
+			const { cachePath, prHeadOf } = await prepareForkFetch(
+				store,
+				fork,
+				pending,
+				pulls,
+				repo,
 			);
-			await fetchFork(cachePath, forkUrl(fork), refspecs, runGit);
-			// PR heads come from the upstream repo's pull refs, so a PR from any fork (or a
-			// branch of the repo itself) is covered. Ref names use only the validated number.
-			// Merged PRs still in a hold keep their final head out of a rerun.
-			const prHeadOf = new Map(pulls.map((p) => [p.number, p.head]));
-			for (const r of pending)
-				for (const e of r.holdPrs ?? [])
-					if (!prHeadOf.has(e.n)) prHeadOf.set(e.n, e.head);
-			if (prHeadOf.size > 0) {
-				if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
-				await fetchFork(
-					cachePath,
-					`${githubHost().webBase}/${repo}.git`,
-					[...prHeadOf.keys()].map((n) => `+refs/pull/${n}/head:${PR_REF}${n}`),
-					runGit,
-				);
-			}
 			const { range, held } = await collectRange({
 				cachePath,
 				mainPath: project.path,
@@ -1052,17 +1111,7 @@ export function createForkWatcher(deps: {
 			});
 			const byHash = new Map(pending.map((r) => [r.branchHash, r]));
 			if (range.commits.length === 0 && range.merges.length === 0) {
-				// Nothing new to analyze: move the cursors without a model call, a run
-				// record, or a fork pause, so later work is not held back.
-				for (const r of pending)
-					store.saveForkBranch({
-						...r,
-						...holdAfter(r, held.get(r.branchHash) ?? [], prHeadOf),
-						analyzedHead: r.head,
-						firstPendingAt: null,
-						lastError: null,
-						retries: 0,
-					});
+				recordClearedRows(store, pending, held, prHeadOf);
 				return;
 			}
 			store.recordForkRun(fork.id, now());
@@ -1083,6 +1132,101 @@ export function createForkWatcher(deps: {
 				new Set(pending.map((r) => r.branchHash)),
 			);
 			deps.log(`forks: ${fork.owner}/${fork.name}: ${msg}`);
+		}
+	}
+
+	/** One fork of the project scan: hold checks, then the due analysis under the gates.
+	 *  Returns false to stop the project's scan (the daily cap is reached) and true to go on. */
+	async function scanOneFork(
+		project: ForkProject,
+		store: ProjectStore,
+		fork: ForkInfo,
+		rows: ForkBranchState[],
+		isManual: boolean,
+		pulls: () => Promise<PullInfo[]>,
+		closed: Map<number, { merged: boolean; head: string } | null>,
+		repo: string,
+	): Promise<boolean> {
+		if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
+			deps.log(
+				`forks: ${fork.owner}/${fork.name}: skipped, ${fork.sizeKb} KB over the size gate`,
+			);
+			return true;
+		}
+		const holding = rows.filter((r) => r.holdPrs !== null);
+		if (
+			holding.length === 0 &&
+			!rows.some((r) => r.head !== null && r.head !== r.analyzedHead)
+		)
+			return true;
+		const freshPulls = await pulls();
+		if (holding.length > 0) {
+			await releaseHolds(store, holding, freshPulls, closed, repo, fork);
+			rows = store.listAllForkBranches().filter((r) => r.forkId === fork.id);
+		}
+		const prHeads = new Set(
+			freshPulls.map((p) => `${p.headRepoId}:${p.headRef}`),
+		);
+		const pending = duePending(rows, isManual, prHeads, fork.id);
+		if (pending === null) return true;
+		if (
+			store.forkRunsSince(now() - FORK_GATES.FORK_RUN_SPACING_MS) >=
+			FORK_GATES.PROJECT_DAILY_RUNS
+		) {
+			deps.log(
+				`forks: ${project.name}: daily cap of ${FORK_GATES.PROJECT_DAILY_RUNS} runs reached, stopping analysis`,
+			);
+			return false;
+		}
+		await analyzeFork(project, store, fork, pending, freshPulls, repo);
+		return true;
+	}
+
+	/** The forks of a synced project: per fork, hold checks then the due analysis, until
+	 *  the daily cap stops the scan. The commits of every open PR into this repo arrive
+	 *  through that PR; porting them would duplicate it, in any fork. Listed once per
+	 *  project, only when a fork has pending work or a hold to check. A cursor that moves
+	 *  past such commits keeps a hold (ForkBranchState.holdPrs), so a PR that changes its
+	 *  head or closes without its work brings that work back for a new check. */
+	async function scanForkList(
+		project: ForkProject,
+		store: ProjectStore,
+		forks: ForkInfo[],
+		fresh: ForkBranchState[],
+		isManual: boolean,
+		repo: string,
+	): Promise<void> {
+		let cachedPulls: PullInfo[] | null = null;
+		const pulls = async (): Promise<PullInfo[]> => {
+			if (cachedPulls !== null) return cachedPulls;
+			try {
+				cachedPulls = await listPulls(repo, gh);
+			} catch (e) {
+				deps.log(`forks: ${project.name}: ${(e as Error).message}`);
+				// The scan cannot judge PR holds without the pull list: stop this project's scan.
+				throw new PullListFailed();
+			}
+			return cachedPulls;
+		};
+		const closed = new Map<number, { merged: boolean; head: string } | null>();
+		for (const fork of forks) {
+			let goOn: boolean;
+			try {
+				goOn = await scanOneFork(
+					project,
+					store,
+					fork,
+					fresh.filter((r) => r.forkId === fork.id),
+					isManual,
+					pulls,
+					closed,
+					repo,
+				);
+			} catch (e) {
+				if (e instanceof PullListFailed) break;
+				throw e;
+			}
+			if (!goOn) break;
 		}
 	}
 
@@ -1110,55 +1254,14 @@ export function createForkWatcher(deps: {
 		// this project's own store, so absent ids are this project's vanished forks.
 		store.deleteForkBranchesNotIn(forkIds);
 
-		const fresh = store.listAllForkBranches();
-		const isManual = manual !== undefined;
-		// The commits of every open PR into this repo arrive through that PR; porting them
-		// would duplicate it, in any fork. Listed once per project, only when a fork has
-		// pending work or a hold to check. A cursor that moves past such commits keeps a
-		// hold (ForkBranchState.holdPrs), so a PR that changes its head or closes without its
-		// work brings that work back for a new check.
-		let pulls: PullInfo[] | null = null;
-		const closed = new Map<number, { merged: boolean; head: string } | null>();
-		for (const fork of forks) {
-			if ((fork.sizeKb ?? 0) > FORK_GATES.MAX_SIZE_KB) {
-				deps.log(
-					`forks: ${fork.owner}/${fork.name}: skipped, ${fork.sizeKb} KB over the size gate`,
-				);
-				continue;
-			}
-			let rows = fresh.filter((r) => r.forkId === fork.id);
-			const holding = rows.filter((r) => r.holdPrs !== null);
-			if (
-				holding.length === 0 &&
-				!rows.some((r) => r.head !== null && r.head !== r.analyzedHead)
-			)
-				continue;
-			if (pulls === null) {
-				try {
-					pulls = await listPulls(repo, gh);
-				} catch (e) {
-					deps.log(`forks: ${project.name}: ${(e as Error).message}`);
-					break;
-				}
-			}
-			if (holding.length > 0) {
-				await releaseHolds(store, holding, pulls, closed, repo, fork);
-				rows = store.listAllForkBranches().filter((r) => r.forkId === fork.id);
-			}
-			const prHeads = new Set(pulls.map((p) => `${p.headRepoId}:${p.headRef}`));
-			const pending = duePending(rows, isManual, prHeads, fork.id);
-			if (pending === null) continue;
-			if (
-				store.forkRunsSince(now() - FORK_GATES.FORK_RUN_SPACING_MS) >=
-				FORK_GATES.PROJECT_DAILY_RUNS
-			) {
-				deps.log(
-					`forks: ${project.name}: daily cap of ${FORK_GATES.PROJECT_DAILY_RUNS} runs reached, stopping analysis`,
-				);
-				break;
-			}
-			await analyzeFork(project, store, fork, pending, pulls, repo);
-		}
+		await scanForkList(
+			project,
+			store,
+			forks,
+			store.listAllForkBranches(),
+			manual !== undefined,
+			repo,
+		);
 	}
 
 	async function scan(opts?: { manual?: string }): Promise<void> {

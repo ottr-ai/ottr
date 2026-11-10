@@ -446,12 +446,13 @@ export function resolveDep(
 	if (local !== null) return { task: local, project: own.name };
 	const m = DEP_PREFIX_RE.exec(id);
 	if (m === null) return { why: "own", id };
-	const prefix = m[1]!;
+	const prefix = m[1] ?? "";
 	const hits = [...projects].filter((p) => p.prefix === prefix);
 	if (hits.length === 0) return { why: "project", id, prefix };
 	if (hits.length > 1)
 		return { why: "ambiguous", id, prefix, projects: hits.map((p) => p.name) };
-	const foreign = hits[0]!;
+	const [foreign] = hits;
+	if (foreign === undefined) return { why: "project", id, prefix };
 	const task = foreign.getTask(id);
 	if (task === null) return { why: "task", id, project: foreign.name };
 	return { task, project: foreign.name };

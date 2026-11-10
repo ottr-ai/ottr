@@ -437,35 +437,12 @@ interface TaskSeed {
 	spec: Spec;
 }
 
-export function insertTaskRow(
-	db: Database,
+/** Resolves a follow-up's source card id and a pending proposal's reason. */
+function seedLinks(
+	prefix: string,
 	project: ProjectSpec,
 	t: Spec,
-	i: number,
-	now: number,
-): TaskSeed {
-	// Real task keys (store.ts nextTaskId): the task routes answer 400 "bad task id" to anything else.
-	const prefix = project.name
-		.replaceAll(/[^A-Za-z0-9]/g, "")
-		.toUpperCase()
-		.slice(0, 4);
-	// A retro is a child of its source card (`<source id>-retro`) and consumes no counter
-	// value (store.ts createTask), so the next numbered card keeps a gap-free id.
-	const id = t.retro
-		? `${prefix}-${(t.followUpOf ?? 0) + 1}-retro`
-		: `${prefix}-${project.tasks.slice(0, i).filter((x) => !x.retro).length + 1}`;
-	// A retro's prompt and title carry the marker once, over the source card's title
-	// (src/prompts.ts retroPrompt); the pool spec's title stays bare.
-	const retroPrompt = `${RETRO_MARKER}${t.title}`;
-	const prompt = t.prompt ?? (t.retro ? retroPrompt : `fix: ${t.title}`);
-	const createdAt = now - t.age * DAY - i * 7 * MIN;
-	const isDone = t.stage === "done";
-	const doneAt = taskDoneAt(t, now);
-	const commits = taskCommits(t, i);
-	const dependsOn = JSON.stringify(
-		(t.deps ?? []).map((d) => `${prefix}-${d + 1}`),
-	);
-	// A proposal links its retro; a follow-up links the card it continues.
+): { followUpOf: string | null; proposalReason: string | null } {
 	let followUpOf: string | null = null;
 	let proposalReason: string | null = null;
 	if (t.followUpOf !== undefined) {
@@ -479,6 +456,55 @@ export function insertTaskRow(
 		// (prompts.ts proposedReason).
 		proposalReason = proposedReason({ id: retroId });
 	}
+	return { followUpOf, proposalReason };
+}
+
+/** Task kind column: reviews and retros are marked, everything else is work. */
+function taskKind(t: Spec): string {
+	if (t.review === true) return "review";
+	if (t.retro === true) return "retro";
+	return "work";
+}
+
+/** Real task keys (store.ts nextTaskId): the task routes answer 400 "bad task id" to anything else. */
+function seedTaskId(
+	prefix: string,
+	project: ProjectSpec,
+	t: Spec,
+	i: number,
+): string {
+	// A retro is a child of its source card (`<source id>-retro`) and consumes no counter
+	// value (store.ts createTask), so the next numbered card keeps a gap-free id.
+	if (t.retro) return `${prefix}-${(t.followUpOf ?? 0) + 1}-retro`;
+	return `${prefix}-${project.tasks.slice(0, i).filter((x) => !x.retro).length + 1}`;
+}
+
+export function insertTaskRow(
+	db: Database,
+	project: ProjectSpec,
+	t: Spec,
+	i: number,
+	now: number,
+): TaskSeed {
+	// Real task keys (store.ts nextTaskId): the task routes answer 400 "bad task id" to anything else.
+	const prefix = project.name
+		.replaceAll(/[^A-Za-z0-9]/g, "")
+		.toUpperCase()
+		.slice(0, 4);
+	const id = seedTaskId(prefix, project, t, i);
+	// A retro's prompt and title carry the marker once, over the source card's title
+	// (src/prompts.ts retroPrompt); the pool spec's title stays bare.
+	const retroPrompt = `${RETRO_MARKER}${t.title}`;
+	const prompt = t.prompt ?? (t.retro ? retroPrompt : `fix: ${t.title}`);
+	const createdAt = now - t.age * DAY - i * 7 * MIN;
+	const isDone = t.stage === "done";
+	const doneAt = taskDoneAt(t, now);
+	const commits = taskCommits(t, i);
+	const dependsOn = JSON.stringify(
+		(t.deps ?? []).map((d) => `${prefix}-${d + 1}`),
+	);
+	// A proposal links its retro; a follow-up links the card it continues.
+	const { followUpOf, proposalReason } = seedLinks(prefix, project, t);
 	const needs = proposalReason ?? t.needs ?? null;
 	// queued_at marks cards that sit in a queue right now.
 	const queuedAt = t.state === "queued" ? createdAt : null;
@@ -512,10 +538,34 @@ export function insertTaskRow(
 			commits,
 			`demo-${id}`,
 			(t.retro ? retroPrompt : t.title).slice(0, 60),
-			t.review === true ? "review" : t.retro === true ? "retro" : "work",
+			taskKind(t),
 		],
 	);
 	return { id, prompt, createdAt, isDone, spec: t };
+}
+
+interface TurnResult {
+	exitCode: number | null;
+	outcome: string | null;
+	summary: string | null;
+}
+
+/** A finished turn's exit code, outcome, and summary for the spec. */
+function closedTurnResult(t: Spec, isDone: boolean): TurnResult {
+	const exitCode = t.crashed ? 1 : 0;
+	if (t.retro) {
+		// A retro turn answers with its lessons, not a merge-ready report.
+		return {
+			exitCode,
+			outcome: "answered",
+			summary: "Filed one proposal from the lessons.",
+		};
+	}
+	return {
+		exitCode,
+		outcome: isDone || t.stage === "merging" ? "ready" : null,
+		summary: isDone ? "Implemented and committed." : null,
+	};
 }
 
 function insertWorkTurn(
@@ -528,20 +578,9 @@ function insertWorkTurn(
 	isDone: boolean,
 ): void {
 	const open = wEnd === null;
-	let exitCode: number | null = null;
-	let outcome: string | null = null;
-	let summary: string | null = null;
-	if (!open) {
-		exitCode = t.crashed ? 1 : 0;
-		if (t.retro) {
-			// A retro turn answers with its lessons, not a merge-ready report.
-			outcome = "answered";
-			summary = "Filed one proposal from the lessons.";
-		} else {
-			outcome = isDone || t.stage === "merging" ? "ready" : null;
-			summary = isDone ? "Implemented and committed." : null;
-		}
-	}
+	const closed = open
+		? { exitCode: null, outcome: null, summary: null }
+		: closedTurnResult(t, isDone);
 	db.run(
 		`INSERT INTO turns (task_id, kind, prompt, started_at, ended_at, pid, exit_code, outcome, summary, question, error, model)
 			 VALUES (?, 'work', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'demo/seed')`,
@@ -551,9 +590,9 @@ function insertWorkTurn(
 			wStart,
 			wEnd,
 			t.state === "preparing" ? null : 41000,
-			exitCode,
-			outcome,
-			summary,
+			closed.exitCode,
+			closed.outcome,
+			closed.summary,
 			t.asked?.q ?? null,
 			t.crashed ? STALE_ERROR : null,
 		],
