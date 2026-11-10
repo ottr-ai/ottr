@@ -7,6 +7,7 @@ import {
 	lstatSync,
 	mkdirSync,
 	readdirSync,
+	readFileSync,
 	renameSync,
 	rmSync,
 	writeFileSync,
@@ -21,6 +22,8 @@ export const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_KEEP = 7;
 const PARTIAL = ".partial";
 const TRACKER_FILE = "tracker.db";
+/** The record of one snapshot: which databases it holds and which copies failed. */
+export const SNAPSHOT_MANIFEST = "snapshot.json";
 const PROJECTS_DIR = "projects";
 const PROJECT_DB = "tasks.db";
 const STAMP = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
@@ -28,6 +31,8 @@ const STAMP = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
 export type BackupSource = { file: string; backupTo: (dest: string) => void };
 
 type Failure = { file: string; error: string };
+
+export type Manifest = { copied: string[]; failed: Failure[] };
 
 const errorText = (err: unknown): string =>
 	err instanceof Error ? err.message : String(err);
@@ -112,10 +117,15 @@ export function resolveBackup(
 const projectFile = (name: string): string =>
 	`${PROJECTS_DIR}/${name}/${PROJECT_DB}`;
 
-/** The snapshot layout that restoreSnapshot reads: `tracker.db` and `projects/<name>/tasks.db`. */
+/**
+ * The snapshot layout that restoreSnapshot reads: `tracker.db` and `projects/<name>/tasks.db`.
+ * `unopened` names the projects whose database the board could not open: each one is a source
+ * that fails, so the snapshot records the failure and retention keeps the last good copy.
+ */
 export function backupSources(
 	tracker: { backupTo(dest: string): void },
 	projects: Iterable<{ name: string; backupTo(dest: string): void }>,
+	unopened: Iterable<{ name: string; error: string }> = [],
 ): BackupSource[] {
 	const sources: BackupSource[] = [
 		{ file: TRACKER_FILE, backupTo: (dest) => tracker.backupTo(dest) },
@@ -124,6 +134,16 @@ export function backupSources(
 		sources.push({
 			file: projectFile(project.name),
 			backupTo: (dest) => project.backupTo(dest),
+		});
+	}
+	for (const project of unopened) {
+		sources.push({
+			file: projectFile(project.name),
+			backupTo: () => {
+				throw new Error(
+					`the board did not open this database: ${project.error}`,
+				);
+			},
 		});
 	}
 	return sources;
@@ -147,6 +167,46 @@ function isSafeRelative(file: string): boolean {
 	return (
 		file !== "" && !isAbsolute(file) && !file.split(/[\\/]/).includes("..")
 	);
+}
+
+function parseFailure(raw: unknown): Failure | null {
+	if (typeof raw !== "object" || raw === null) return null;
+	const { file, error } = raw as { file?: unknown; error?: unknown };
+	if (typeof file !== "string" || !isSafeRelative(file)) return null;
+	return typeof error === "string" ? { file, error } : null;
+}
+
+function parseManifest(text: string): Manifest | null {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(text);
+	} catch {
+		return null; // not JSON: the caller reports a snapshot that cannot be proven complete
+	}
+	if (typeof raw !== "object" || raw === null) return null;
+	const { copied, failed } = raw as { copied?: unknown; failed?: unknown };
+	if (!Array.isArray(copied) || !Array.isArray(failed)) return null;
+	const files: string[] = [];
+	for (const file of copied) {
+		if (typeof file !== "string" || !isSafeRelative(file)) return null;
+		files.push(file);
+	}
+	const failures: Failure[] = [];
+	for (const entry of failed) {
+		const failure = parseFailure(entry);
+		if (failure === null) return null;
+		failures.push(failure);
+	}
+	return { copied: files, failed: failures };
+}
+
+/**
+ * The manifest that runBackup wrote into the snapshot `stamp`. Null when the file is missing
+ * or not valid: such a snapshot cannot be proven complete, and each caller must say so.
+ */
+export function readManifest(dir: string, stamp: string): Manifest | null {
+	const path = join(dir, stamp, SNAPSHOT_MANIFEST);
+	return isRealFile(path) ? parseManifest(readFileSync(path, "utf8")) : null;
 }
 
 function copySource(partial: string, source: BackupSource): void {
@@ -210,6 +270,12 @@ export function runBackup(o: {
 		rmSync(partial, { recursive: true, force: true });
 		return { stamp: null, copied, failed, pruned: [] };
 	}
+	// Written before the rename: a snapshot with a stamp name always says what it does not hold.
+	const manifest: Manifest = { copied, failed };
+	writeFileSync(
+		join(partial, SNAPSHOT_MANIFEST),
+		`${JSON.stringify(manifest, null, "\t")}\n`,
+	);
 	renameSync(partial, final);
 	const pruned = failed.length === 0 ? prune(o.dir, o.keep) : [];
 	return { stamp, copied, failed, pruned };
@@ -246,7 +312,7 @@ export function backupTick(o: {
 
 type SnapshotFile = { file: string; from: string; project: string | null };
 
-function snapshotFiles(root: string): SnapshotFile[] {
+function restorableFiles(root: string): SnapshotFile[] {
 	const files: SnapshotFile[] = [];
 	const tracker = join(root, TRACKER_FILE);
 	if (isRealFile(tracker))
@@ -343,10 +409,42 @@ function writeMarkerIfMissing(marker: string, now: Date): void {
 	writeFileSync(marker, `${now.toISOString()}\n`);
 }
 
+function copyHint(dir: string, stamp: string, file: string): string {
+	const other = listSnapshots(dir).find(
+		(s) => s !== stamp && isRealFile(join(dir, s, file)),
+	);
+	return other === undefined
+		? "No other snapshot holds a copy"
+		: `The newest snapshot with a copy is ${other}: ${join(dir, other, file)}`;
+}
+
+/** The databases that the snapshot should hold but does not, from its manifest. */
+function missingFiles(dir: string, stamp: string, found: string[]): Failure[] {
+	const manifest = readManifest(dir, stamp);
+	if (manifest === null) {
+		const error = `missing or not valid: the snapshot ${stamp} cannot be proven complete`;
+		return [{ file: SNAPSHOT_MANIFEST, error }];
+	}
+	const missing: Failure[] = [];
+	for (const file of manifest.copied) {
+		if (found.includes(file)) continue;
+		const error = `not in the snapshot ${stamp}, but its manifest lists it. ${copyHint(dir, stamp, file)}`;
+		missing.push({ file, error });
+	}
+	for (const f of manifest.failed) {
+		if (found.includes(f.file)) continue;
+		const error = `not in the snapshot ${stamp}: the copy failed at backup time (${f.error}). ${copyHint(dir, stamp, f.file)}`;
+		missing.push({ file: f.file, error });
+	}
+	return missing;
+}
+
 /**
  * Restores the snapshot `o.stamp`. Throws when the stamp is not a snapshot in `o.dir`, and
  * throws StoreLockedError, before each change, when a live board holds a target. It deletes
  * no database file: it renames an existing target to `<file>.before-restore-<stamp of now>`.
+ * `failed` also holds each database that the snapshot's manifest names but the snapshot does
+ * not hold: a restore of an incomplete snapshot is never a clean result.
  */
 export function restoreSnapshot(o: {
 	dir: string;
@@ -361,11 +459,18 @@ export function restoreSnapshot(o: {
 	failed: Failure[];
 	movedAside: string[];
 } {
-	if (!listSnapshots(o.dir).includes(o.stamp))
+	const dir = resolve(o.dir);
+	if (!listSnapshots(dir).includes(o.stamp))
 		throw new Error(`no snapshot ${o.stamp} in ${o.dir}`);
 	const manual: { file: string; from: string }[] = [];
 	const jobs: { file: string; from: string; to: string }[] = [];
-	for (const f of snapshotFiles(resolve(o.dir, o.stamp))) {
+	const files = restorableFiles(join(dir, o.stamp));
+	const missing = missingFiles(
+		dir,
+		o.stamp,
+		files.map((f) => f.file),
+	);
+	for (const f of files) {
 		const to = f.project === null ? o.trackerDb : o.projectDbFor(f.project);
 		if (to === null) manual.push({ file: f.file, from: f.from });
 		else jobs.push({ file: f.file, from: f.from, to });
@@ -378,6 +483,7 @@ export function restoreSnapshot(o: {
 		movedAside: [] as string[],
 	};
 	for (const job of jobs) restoreOne(job, o.now, result);
+	result.failed.push(...missing);
 	if (o.adoptedMarker !== null) writeMarkerIfMissing(o.adoptedMarker, o.now);
 	return result;
 }

@@ -16,16 +16,24 @@ history and settings (OTTR-736, topics 83 and 84).
    - `tracker.db`: a copy of the global store.
    - `projects/<project name>/tasks.db`: a copy of each project database that the board
      has open.
+   - `snapshot.json`: the manifest. It lists the files that the snapshot holds (`copied`)
+     and each database whose copy failed, with the error text (`failed`).
 2. The board makes each copy with `VACUUM INTO` on its own open connection. The
    connection holds the file with an exclusive lock, so no second process can read it.
    After the copy, the board compares the row counts of the main tables (`kv`, or `tasks`
    and `turns`) and runs `PRAGMA integrity_check` on the copy. A difference is a failure.
 3. The board writes a snapshot into `<stamp>.partial/` and renames it to `<stamp>/` after
-   the last copy. Thus a directory with a stamp name is always complete. A run removes
+   the last copy and the manifest. Thus the write of a directory with a stamp name is
+   always finished, and its manifest says which databases it does not hold. A run removes
    each `*.partial` directory that an earlier run left.
 4. One database that fails does not stop the others. The snapshot then holds the copies
-   that passed. The board logs each failure with the file name and the error text.
-5. A snapshot with no good copy is not kept: the board removes its `.partial` directory,
+   that passed, and it is incomplete. The board logs each failure with the file name and
+   the error text.
+5. A project whose `tasks.db` the board did not open at boot (a corrupt file) stays off
+   the board. Each backup run counts it as a failed database with the open error, until a
+   project with that name is open. Without this rule, the snapshots would omit the
+   project with no failure, and retention would remove its last good copy.
+6. A snapshot with no good copy is not kept: the board removes its `.partial` directory,
    and the next tick tries again.
 
 ### Schedule
@@ -66,7 +74,8 @@ history and settings (OTTR-736, topics 83 and 84).
 `bun src/restore.ts` is the restore tool. It is in the image (`/app/src/restore.ts`).
 
 1. With no argument, it lists the snapshots, newest first, with the files of each and
-   their sizes in bytes. It changes nothing.
+   their sizes in bytes. A line of an incomplete snapshot ends with `; incomplete:` and
+   the databases that failed, or `no valid snapshot.json`. It changes nothing.
 2. With `latest` or a stamp, it restores that snapshot:
    - `tracker.db` goes to `<state dir>/.tasks/tracker.db`.
    - `projects/<name>/tasks.db` goes to `<OTTR_SERVER_DATA_DIR>/<name>/tasks.db`, or to
@@ -89,8 +98,15 @@ history and settings (OTTR-736, topics 83 and 84).
    `<OTTR_SERVER_DATA_DIR>/.adopted` if it is missing. Thus the restored board does not
    adopt a `tasks.db` that a worker wrote into the shared data dir
    (docs/specs/server-only-project-state.md).
-7. The exit code is 0 when all files of the snapshot went to their targets or to a
-   printed manual line. It is 1 for each other result, with the reason on stderr.
+7. The tool reads the manifest of the snapshot. Each database that the manifest names as
+   failed, and each file that the manifest lists but the snapshot does not hold, is a
+   failure of the restore. The error line names the newest other snapshot that holds a
+   copy and the path of that copy, or says that no snapshot holds one. A snapshot with no
+   valid manifest gives one failure: the tool cannot prove that it is complete. In each
+   of these cases the tool still restores the files that the snapshot holds.
+8. The exit code is 0 when the manifest proves the snapshot complete and all its files
+   went to their targets or to a printed manual line. It is 1 for each other result, with
+   the reason on stderr.
 
 A snapshot does not hold the SSH keys (`OTTR_SSH_DIR`), the Jira sealing key
 (`.tasks/secret.key`, when `OTTR_SECRET_KEY` is not set), the fork mirror caches, or the
@@ -113,13 +129,20 @@ call it on the store's own connection.
 
     formatStamp(at: Date): string
     parseStamp(name: string): Date | null        // null unless `name` is a canonical stamp
-    listSnapshots(dir: string): string[]         // complete snapshots, newest first
+    listSnapshots(dir: string): string[]         // finished snapshots, newest first
     resolveBackup(env, stateDir: string, workerRoots: readonly string[]):
       { dir: string; keep: number; errors: string[] }
     type BackupSource = { file: string; backupTo: (dest: string) => void }
     backupSources(tracker: { backupTo(dest: string): void },
-      projects: Iterable<{ name: string; backupTo(dest: string): void }>): BackupSource[]
-      // files `tracker.db` and `projects/<name>/tasks.db`: the layout that restore reads
+      projects: Iterable<{ name: string; backupTo(dest: string): void }>,
+      unopened?: Iterable<{ name: string; error: string }>): BackupSource[]
+      // files `tracker.db` and `projects/<name>/tasks.db`: the layout that restore reads.
+      // Each `unopened` project is a source that throws with its open error.
+    SNAPSHOT_MANIFEST = "snapshot.json"
+    type Manifest = { copied: string[]; failed: { file: string; error: string }[] }
+    readManifest(dir: string, stamp: string): Manifest | null
+      // null when the file is missing or not valid (a file name that is not a relative
+      // path inside the snapshot makes the whole manifest not valid)
     backupDue(dir: string, now: Date): boolean
     runBackup(o: { dir: string; keep: number; now: Date; sources: BackupSource[] }):
       { stamp: string | null; copied: string[];
@@ -143,7 +166,12 @@ err: string[] }` and the `import.meta.main` entry that prints it.
 - The backup dir is not writable: the tick logs the error and tries again at the next
   hourly tick.
 - The board stops during a snapshot: the `.partial` directory stays, and the next run
-  removes it. No snapshot with a stamp name is incomplete.
+  removes it. No directory with a stamp name is half written.
+- A project that is not on the board any more (the user removed it, or its `tasks.db` is
+  missing, so discovery does not find it) gets no new copy and no failure. Retention
+  removes its old copies after `OTTR_BACKUP_KEEP` days.
+- While a database fails, retention removes nothing, so the backup dir grows by one
+  snapshot each day. The server log names the failure at each run.
 - Two snapshots in the same second: the second run fails with an error and leaves the
   first snapshot as it is.
 - A stamp argument of the restore tool that is not a snapshot in the backup dir: exit
@@ -165,6 +193,14 @@ err: string[] }` and the `import.meta.main` entry that prints it.
 - A second run inside 24 hours makes no snapshot. A run at 24 hours makes one.
 - With `keep` 2, the third good snapshot removes the oldest. A foreign entry in the
   backup dir stays. A snapshot with a failed source removes nothing.
+- A real `ProjectStore.open` on a corrupt `tasks.db` throws. With that project as an
+  `unopened` source and `keep` 1, the next run reports the database as failed, removes
+  nothing, and the last good copy still opens.
+- After a complete snapshot and then a snapshot in which a project copy failed, the
+  restore tool with `latest` gives exit code 1, names the database and the older snapshot
+  with its copy on stderr, and marks the snapshot as incomplete in the list.
+- A snapshot with no valid manifest, and a snapshot that does not hold a file of its
+  manifest, each give a failure of the restore.
 - The restore tool stops with no change while a store holds a target. It renames an
   existing target and never deletes it.
 - `resolveBackup` refuses an `OTTR_BACKUP_DIR` below a worker root, accepts the compose
@@ -172,8 +208,9 @@ err: string[] }` and the `import.meta.main` entry that prints it.
   default dir.
 - `childEnv` removes `OTTR_BACKUP_DIR`.
 - Property tests: `parseStamp(formatStamp(t))` gives `t` in whole seconds, each name
-  that `parseStamp` accepts formats to itself, and retention keeps each entry that is
-  not a stamp.
+  that `parseStamp` accepts formats to itself, retention keeps each entry that is
+  not a stamp, a valid manifest reads back as written, and arbitrary manifest text never
+  throws and never gives an unsafe file name.
 - README and docs/WORKERS.md describe the settings, the snapshot layout and the restore
   steps for compose and for a native start.
 

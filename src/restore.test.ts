@@ -331,6 +331,49 @@ describe("runRestore", () => {
 		expect(kIn(d.state)).toBe("live");
 	});
 
+	test("a snapshot in which a database copy failed gives code 1 and names the newest snapshot with a copy", () => {
+		const d = dirs("incomplete");
+		const server = join(d.base, "server");
+		snapshot(d.dir, T0, "complete", ["demo"]);
+		const gstore = track(GlobalStore.open(tmp("source-state")));
+		gstore.set("k", "newest");
+		const failing = {
+			name: "demo",
+			backupTo: () => {
+				throw new Error("disk full");
+			},
+		};
+		const made = runBackup({
+			dir: d.dir,
+			keep: 7,
+			now: T1,
+			sources: backupSources(gstore, [failing]),
+		});
+		gstore.close();
+		expect(made.failed).toEqual([
+			{ file: "projects/demo/tasks.db", error: "disk full" },
+		]);
+
+		const env = { ...d.env, OTTR_SERVER_DATA_DIR: server };
+		const older = join(d.dir, S0, "projects", "demo", "tasks.db");
+		expect(runRestore(["latest"], env)).toEqual({
+			code: 1,
+			out: [`restored tracker.db -> ${d.trackerDb}`],
+			err: [
+				`projects/demo/tasks.db failed: not in the snapshot ${S1}: the copy failed at backup time (disk full). The newest snapshot with a copy is ${S0}: ${older}`,
+			],
+		});
+		expect(kIn(d.state)).toBe("newest");
+		expect(existsSync(join(server, "demo", "tasks.db"))).toBe(false);
+
+		const list = runRestore([], env);
+		expect(list.out.length).toBe(2);
+		expect(list.out[0]).toEndWith(
+			"; incomplete: projects/demo/tasks.db failed",
+		);
+		expect(list.out[1]).not.toContain("incomplete");
+	});
+
 	test("a snapshot file that fails the check gives code 1, and the other files still restore", () => {
 		const d = dirs("bad-file");
 		const server = join(d.base, "server");

@@ -3,7 +3,7 @@
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
 import { constants, homedir } from "node:os";
-import { delimiter, join, resolve } from "node:path";
+import { basename, delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
 import { createApp, ompSessionStores, storedProjectPaths } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
@@ -373,6 +373,9 @@ const workerRoots = process.env.OTTR_DATA_DIR
 	: [];
 if (process.env.OTTR_DATA_DIR) setWorkerRoots(workerRoots);
 
+/** Projects whose tasks.db did not open at boot: the backup records each as a failed database,
+ * so retention keeps the last good copy (docs/specs/db-backup.md). */
+const unopenedProjects: { name: string; error: string }[] = [];
 for (const p of discoverProjects(
 	ROOTS,
 	shared.projectPaths,
@@ -391,6 +394,7 @@ for (const p of discoverProjects(
 		}
 		// One unreadable project database must not keep the whole board from booting.
 		console.error(`skipping project ${p}:`, err);
+		unopenedProjects.push({ name: basename(p), error: errmsg(err) });
 		continue;
 	}
 	const e: Entry = {
@@ -871,10 +875,12 @@ if (backup.keep !== 0) {
 			dir: backup.dir,
 			keep: backup.keep,
 			now: new Date(),
+			// A project that opened later (added again from the board) is a live source, not a failure.
 			sources: () =>
 				backupSources(
 					gstore,
 					[...projects.values()].map((e) => e.store),
+					unopenedProjects.filter((u) => !projects.has(u.name)),
 				),
 			log: (line) => console.log(line),
 		});

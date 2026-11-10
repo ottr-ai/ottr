@@ -5,13 +5,27 @@
 import { readdirSync, statSync } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 
-import { listSnapshots, resolveBackup, restoreSnapshot } from "./backup.ts";
+import {
+	listSnapshots,
+	readManifest,
+	resolveBackup,
+	restoreSnapshot,
+	SNAPSHOT_MANIFEST,
+} from "./backup.ts";
 import { StoreLockedError } from "./dblock.ts";
 import { ADOPTED_MARKER } from "./store.ts";
 
 type RestoreRun = { code: number; out: string[]; err: string[] };
 
 const USAGE = "usage: bun src/restore.ts [latest|<stamp>]";
+
+/** The note of a list line for a snapshot that does not hold each database; empty when it does. */
+function incompleteNote(dir: string, stamp: string): string {
+	const manifest = readManifest(dir, stamp);
+	if (manifest === null) return `; incomplete: no valid ${SNAPSHOT_MANIFEST}`;
+	if (manifest.failed.length === 0) return "";
+	return `; incomplete: ${manifest.failed.map((f) => `${f.file} failed`).join(", ")}`;
+}
 
 /** One list line: the stamp and each file with its size, `tracker.db` before the project files. */
 function snapshotLine(dir: string, stamp: string): string {
@@ -25,13 +39,14 @@ function snapshotLine(dir: string, stamp: string): string {
 				size: statSync(path).size,
 			};
 		})
+		.filter((f) => f.name !== SNAPSHOT_MANIFEST)
 		.sort(
 			(a, b) =>
 				a.name.split("/").length - b.name.split("/").length ||
 				(a.name < b.name ? -1 : 1),
 		);
 	const list = files.map((f) => `${f.name} (${f.size} bytes)`).join(", ");
-	return `${stamp}  ${list}`;
+	return `${stamp}  ${list}${incompleteNote(dir, stamp)}`;
 }
 
 function restore(

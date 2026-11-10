@@ -1346,10 +1346,14 @@ A snapshot:
   `YYYYMMDDTHHMMSSZ`, for example `20261110T031500Z`.
 - It holds `tracker.db` (the global store) and `projects/<project>/tasks.db` for each
   project that the board has open.
+- It holds the manifest `snapshot.json`. The manifest lists the files of the snapshot and
+  each database whose copy failed, with the error text.
 - The board makes each copy with `VACUUM INTO`. Then it compares the row counts of the main
   tables and runs `PRAGMA integrity_check` on the copy.
-- The board writes into `<stamp>.partial/` and renames it to `<stamp>/` when the snapshot
-  is complete. Thus a directory with a stamp name is always complete.
+- The board writes into `<stamp>.partial/` and renames it to `<stamp>/` after the last
+  copy and the manifest. Thus no directory with a stamp name is half written.
+- A snapshot is incomplete when a database copy failed. It then holds the copies that
+  passed.
 
 Schedule and retention:
 
@@ -1358,7 +1362,13 @@ Schedule and retention:
 - The newest `OTTR_BACKUP_KEEP` snapshots stay (default `7`). The board removes the older
   ones. `OTTR_BACKUP_KEEP=0` turns the backups off.
 - A snapshot with a failed database removes nothing. Thus the last good copy of that
-  database stays.
+  database stays. While the failure continues, the backup dir grows by one snapshot each
+  day: repair the cause.
+- A project whose `tasks.db` did not open at boot (the boot log says `skipping project`)
+  counts as a failed database in each run. Thus retention does not remove its last good
+  copy while the project is off the board.
+- A project that you removed from the board, or whose `tasks.db` is missing, gets no new
+  copy and no failure. Retention removes its old copies after `OTTR_BACKUP_KEEP` days.
 - The server log names each failure with the prefix `backup:`.
 
 Location:
@@ -1385,7 +1395,16 @@ Restore in the compose stack:
    different snapshot, give its stamp instead of `latest`.
    - The tool renames each existing database to `<file>.before-restore-<stamp>`. It deletes
      nothing.
-   - The tool stops and changes nothing when a live board holds a database.
+   - The tool stops and replaces no database when a live board holds a database.
+   - When the snapshot is incomplete, the list line ends with `; incomplete:` and the
+     databases that failed. The tool restores the databases that the snapshot holds. For
+     each missing database it prints an error line with the newest snapshot that holds a
+     copy and the path of that copy, and its exit code is 1. To get that database, restore
+     the older snapshot, or copy that one file to its target by hand (the target is
+     `/app/.tasks/projects/<project>/tasks.db`): first move an existing target and its
+     `-wal` and `-shm` files to a different name.
+   - A snapshot with no valid `snapshot.json` also gives exit code 1: the tool cannot
+     prove that it is complete.
 4. Start the stack: `docker compose up -d`.
 5. Examine the board. Then delete the `.before-restore-*` files when you do not need them.
 

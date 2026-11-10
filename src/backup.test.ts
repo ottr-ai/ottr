@@ -11,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	BACKUP_INTERVAL_MS,
 	type BackupSource,
@@ -20,13 +20,16 @@ import {
 	backupTick,
 	formatStamp,
 	listSnapshots,
+	type Manifest,
 	parseStamp,
+	readManifest,
 	resolveBackup,
 	restoreSnapshot,
 	runBackup,
 } from "./backup.ts";
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
 import { GlobalStore } from "./globalStore.ts";
+import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
 
 // docs/specs/db-backup.md. Each test passes `now`: no test reads the clock.
@@ -77,6 +80,9 @@ const rowIn = (path: string): string | undefined => {
 		db.close();
 	}
 };
+
+const writeManifest = (snap: string, manifest: Manifest): void =>
+	writeFileSync(join(snap, "snapshot.json"), JSON.stringify(manifest));
 
 describe("formatStamp and parseStamp", () => {
 	test("a stamp is the UTC time in whole seconds", () => {
@@ -317,6 +323,86 @@ describe("backupSources", () => {
 			"beta -> /x/projects/beta/tasks.db",
 		]);
 	});
+
+	test("a project that the board did not open is a source that fails with the open error", () => {
+		const never = { backupTo: () => expect.unreachable() };
+		const sources = backupSources(never, [], [{ name: "demo", error: "boom" }]);
+		expect(sources.map((source) => source.file)).toEqual([
+			"tracker.db",
+			"projects/demo/tasks.db",
+		]);
+		expect(() => sources[1]?.backupTo("/x/never")).toThrow(
+			"the board did not open this database: boom",
+		);
+	});
+
+	test("a corrupt project database counts as failed, and retention keeps its last good copy", () => {
+		const base = tmp("unopened");
+		const dir = join(base, "backups");
+		const projectPath = join(base, "roots", "demo");
+		mkdirSync(projectPath, { recursive: true });
+		const gstore = GlobalStore.open(join(base, "state"));
+		try {
+			const store = ProjectStore.open(projectPath);
+			const dbFile = join(store.serverDir, "tasks.db");
+			try {
+				store.createTask("the card of the last good copy");
+				const first = runBackup({
+					dir,
+					keep: 1,
+					now: T0,
+					sources: backupSources(gstore, [store]),
+				});
+				expect(first.failed).toEqual([]);
+			} finally {
+				store.close();
+			}
+
+			// The board's boot path: the open throws, and the project stays off the board.
+			writeFileSync(dbFile, "not a sqlite file at all");
+			let openError = "";
+			try {
+				ProjectStore.open(projectPath).close();
+			} catch (err) {
+				openError = (err as Error).message;
+			}
+			expect(openError).not.toBe("");
+
+			const result = runBackup({
+				dir,
+				keep: 1,
+				now: after(DAY),
+				sources: backupSources(
+					gstore,
+					[],
+					[{ name: "demo", error: openError }],
+				),
+			});
+			expect(result).toEqual({
+				stamp: S1,
+				copied: ["tracker.db"],
+				failed: [
+					{
+						file: "projects/demo/tasks.db",
+						error: `the board did not open this database: ${openError}`,
+					},
+				],
+				pruned: [],
+			});
+			expect(listSnapshots(dir)).toEqual([S1, S0]);
+			const copy = new Database(join(dir, S0, "projects", "demo", "tasks.db"));
+			try {
+				const rows = copy
+					.query<{ prompt: string }, []>("SELECT prompt FROM tasks")
+					.all();
+				expect(rows).toEqual([{ prompt: "the card of the last good copy" }]);
+			} finally {
+				copy.close();
+			}
+		} finally {
+			gstore.close();
+		}
+	});
 });
 
 describe("backupDue and backupTick", () => {
@@ -347,7 +433,10 @@ describe("backupDue and backupTick", () => {
 		expect(backupDue(dir, T0)).toBe(true);
 		t.tick(T0);
 		expect(listSnapshots(dir)).toEqual([S0]);
-		expect(readdirSync(join(dir, S0))).toEqual(["tracker.db"]);
+		expect(readdirSync(join(dir, S0)).sort()).toEqual([
+			"snapshot.json",
+			"tracker.db",
+		]);
 		expect(t.lines).toEqual([
 			`backup: snapshot ${S0}: 1 databases, removed 0 old snapshots`,
 		]);
@@ -541,6 +630,23 @@ describe("runBackup", () => {
 		expect(listSnapshots(dir)).toEqual([S2]);
 	});
 
+	test("a snapshot holds a manifest of the copies that passed and the copies that failed", () => {
+		const dir = tmp("manifest");
+		run(dir, T0, 7);
+		expect(readManifest(dir, S0)).toEqual({
+			copied: ["tracker.db"],
+			failed: [],
+		});
+		run(dir, after(DAY), 7, [
+			good("tracker.db"),
+			bad("projects/down/tasks.db", "disk full"),
+		]);
+		expect(readManifest(dir, S1)).toEqual({
+			copied: ["tracker.db"],
+			failed: [{ file: "projects/down/tasks.db", error: "disk full" }],
+		});
+	});
+
 	test("a run in which all sources fail leaves no new dir", () => {
 		const dir = tmp("all-fail");
 		run(dir, T0, 1);
@@ -597,7 +703,10 @@ describe("runBackup", () => {
 		expect(called).toEqual(["tracker.db"]);
 		expect(readdirSync(dirname(dir))).toEqual(["backups"]);
 		expect(readdirSync(dir)).toEqual([S0]);
-		expect(readdirSync(join(dir, S0))).toEqual(["tracker.db"]);
+		expect(readdirSync(join(dir, S0)).sort()).toEqual([
+			"snapshot.json",
+			"tracker.db",
+		]);
 	});
 
 	test("a second source for one file fails and keeps the first copy", () => {
@@ -692,6 +801,113 @@ describe("runBackup", () => {
 	});
 });
 
+describe("readManifest", () => {
+	const dir = tmp("manifest-read");
+	mkdirSync(join(dir, S0));
+	const read = (text: string): Manifest | null => {
+		writeFileSync(join(dir, S0, "snapshot.json"), text);
+		return readManifest(dir, S0);
+	};
+	const unsafe = (file: string): boolean =>
+		file === "" || isAbsolute(file) || file.split(/[\\/]/).includes("..");
+	const segmentArb = fc
+		.array(fc.constantFrom(..."abcxyz019._-".split("")), {
+			minLength: 1,
+			maxLength: 8,
+		})
+		.map((chars) => chars.join(""))
+		.filter((segment) => segment !== "..");
+	const fileArb = fc
+		.array(segmentArb, { minLength: 1, maxLength: 3 })
+		.map((segments) => segments.join("/"));
+	const manifestArb = fc.record({
+		copied: fc.array(fileArb, { maxLength: 4 }),
+		failed: fc.array(fc.record({ file: fileArb, error: fc.string() }), {
+			maxLength: 4,
+		}),
+	});
+
+	test("a missing manifest and a symlink in its place give null", () => {
+		const other = tmp("manifest-none");
+		mkdirSync(join(other, S0));
+		expect(readManifest(other, S0)).toBeNull();
+		expect(readManifest(other, S1)).toBeNull();
+		if (process.platform === "win32") return;
+		const real = join(other, "real.json");
+		writeFileSync(real, JSON.stringify({ copied: [], failed: [] }));
+		symlinkSync(real, join(other, S0, "snapshot.json"));
+		expect(readManifest(other, S0)).toBeNull();
+	});
+
+	test("text that is not a valid manifest gives null", () => {
+		for (const text of [
+			"",
+			"not json",
+			"null",
+			"[]",
+			"{}",
+			'{"copied":[]}',
+			'{"failed":[]}',
+			'{"copied":"tracker.db","failed":[]}',
+			'{"copied":[],"failed":{}}',
+			'{"copied":[1],"failed":[]}',
+			'{"copied":[""],"failed":[]}',
+			'{"copied":["../x"],"failed":[]}',
+			'{"copied":["/abs"],"failed":[]}',
+			'{"copied":[],"failed":[null]}',
+			'{"copied":[],"failed":["a"]}',
+			'{"copied":[],"failed":[{"file":"a"}]}',
+			'{"copied":[],"failed":[{"file":"a","error":1}]}',
+			'{"copied":[],"failed":[{"file":1,"error":"e"}]}',
+			'{"copied":[],"failed":[{"file":"a/../b","error":"e"}]}',
+		])
+			expect(read(text)).toBeNull();
+	});
+
+	test("property: a valid manifest reads back as it was written", () => {
+		fc.assert(
+			fc.property(manifestArb, (manifest) => {
+				expect(read(JSON.stringify(manifest))).toEqual(manifest);
+			}),
+		);
+	});
+
+	test("property: one unsafe file name makes the whole manifest not valid", () => {
+		fc.assert(
+			fc.property(
+				manifestArb,
+				fc.oneof(fc.string(), fileArb),
+				fc.boolean(),
+				(manifest, file, inFailed) => {
+					const changed = inFailed
+						? {
+								...manifest,
+								failed: [...manifest.failed, { file, error: "e" }],
+							}
+						: { ...manifest, copied: [...manifest.copied, file] };
+					expect(read(JSON.stringify(changed))).toEqual(
+						unsafe(file) ? null : changed,
+					);
+				},
+			),
+		);
+	});
+
+	test("property: arbitrary text never throws and gives null or only safe file names", () => {
+		fc.assert(
+			fc.property(fc.oneof(fc.string(), fc.json()), (text) => {
+				const manifest = read(text);
+				if (manifest === null) return;
+				const files = [
+					...manifest.copied,
+					...manifest.failed.map((failure) => failure.file),
+				];
+				expect(files.filter(unsafe)).toEqual([]);
+			}),
+		);
+	});
+});
+
 describe("restoreSnapshot", () => {
 	const RESTORE_AT = new Date("2026-11-12T08:00:00.250Z");
 	const ASIDE = ".before-restore-20261112T080000Z";
@@ -703,6 +919,10 @@ describe("restoreSnapshot", () => {
 		const snap = join(dir, S0);
 		sqliteFile(join(snap, "tracker.db"), "snap-tracker");
 		sqliteFile(join(snap, "projects", "proj", "tasks.db"), "snap-proj");
+		writeManifest(snap, {
+			copied: ["tracker.db", "projects/proj/tasks.db"],
+			failed: [],
+		});
 		const trackerDb = join(base, "state", ".tasks", "tracker.db");
 		const projDb = join(base, "server", "proj", "tasks.db");
 		const marker = join(base, "server", ".adopted");
@@ -888,6 +1108,73 @@ describe("restoreSnapshot", () => {
 			movedAside: [],
 		});
 		expect(existsSync(join(f.base, "server"))).toBe(false);
+	});
+
+	test("a snapshot with no valid manifest restores its files and says that it cannot be proven complete", () => {
+		for (const text of [null, "not json"]) {
+			const f = fixture();
+			const manifest = join(f.snap, "snapshot.json");
+			if (text === null) rmSync(manifest);
+			else writeFileSync(manifest, text);
+			const result = f.restore();
+			expect(result.restored.map((r) => r.file)).toEqual([
+				"tracker.db",
+				"projects/proj/tasks.db",
+			]);
+			expect(result.failed).toEqual([
+				{
+					file: "snapshot.json",
+					error: `missing or not valid: the snapshot ${S0} cannot be proven complete`,
+				},
+			]);
+		}
+	});
+
+	test("a database that the manifest lists but the snapshot does not hold is a failure", () => {
+		const f = fixture();
+		rmSync(join(f.snap, "projects", "proj", "tasks.db"));
+		const other = join(f.dir, S1, "projects", "proj", "tasks.db");
+		sqliteFile(other, "in a different snapshot");
+		const result = f.restore();
+		expect(result.restored).toEqual([{ file: "tracker.db", to: f.trackerDb }]);
+		expect(result.failed).toEqual([
+			{
+				file: "projects/proj/tasks.db",
+				error: `not in the snapshot ${S0}, but its manifest lists it. The newest snapshot with a copy is ${S1}: ${other}`,
+			},
+		]);
+		expect(existsSync(f.projDb)).toBe(false);
+	});
+
+	test("a database whose copy failed at backup time is a failure of the restore", () => {
+		const f = fixture();
+		writeManifest(f.snap, {
+			copied: ["tracker.db", "projects/proj/tasks.db"],
+			failed: [{ file: "projects/down/tasks.db", error: "disk full" }],
+		});
+		const result = f.restore();
+		expect(result.restored.map((r) => r.file)).toEqual([
+			"tracker.db",
+			"projects/proj/tasks.db",
+		]);
+		expect(result.failed).toEqual([
+			{
+				file: "projects/down/tasks.db",
+				error: `not in the snapshot ${S0}: the copy failed at backup time (disk full). No other snapshot holds a copy`,
+			},
+		]);
+
+		// With a copy in an older snapshot, the failure names that snapshot and the file.
+		const older = join(f.dir, "20261109T031500Z", "projects", "down");
+		sqliteFile(join(older, "tasks.db"), "older copy");
+		expect(f.restore({ now: new Date("2026-11-12T09:00:00Z") }).failed).toEqual(
+			[
+				{
+					file: "projects/down/tasks.db",
+					error: `not in the snapshot ${S0}: the copy failed at backup time (disk full). The newest snapshot with a copy is 20261109T031500Z: ${join(older, "tasks.db")}`,
+				},
+			],
+		);
 	});
 
 	test("a stamp that is not a snapshot throws and changes nothing", () => {
