@@ -17,7 +17,13 @@ import { mergeHold } from "../src/scheduler.ts";
 import { ProjectStore } from "../src/store.ts";
 import type { RunState, Stage, TaskKind } from "../src/types.ts";
 import { strykerProgress } from "../src/ui/status.ts";
-import { demoProgressMap, heldDb, seedDemo } from "./demo-data.ts";
+import {
+	demoProgressMap,
+	heldDb,
+	insertTaskRow,
+	type ProjectSpec,
+	seedDemo,
+} from "./demo-data.ts";
 
 // The columns of tasks, turns, and events this file reads, with the schema's types.
 type TaskRow = {
@@ -413,3 +419,74 @@ test("force reseed replaces the pool and drops stale projects", () => {
 	expect(store.get<GlobalConfig>("config")?.admin.passHash).toBe(adminPassHash);
 	store.close();
 }, 20_000);
+
+// plantCards regression (OTTR-776): a fixture spec with an empty tasks array routes
+// through seedTaskId's index counting, which cannot see the rows the pool seed wrote
+// and derives the same first id for every plant. A plant passes explicit ids instead.
+test("insertTaskRow honors an explicit id for fixture plants", () => {
+	const dir = mkdtempSync(join(tmpdir(), "demo-plant-"));
+	try {
+		ProjectStore.init(dir).close();
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		try {
+			const lumen: ProjectSpec = {
+				name: "lumen",
+				displayName: "Lumen",
+				rules: true,
+				tasks: [],
+			};
+			const now = Date.now();
+			const pr = insertTaskRow(
+				db,
+				lumen,
+				{
+					title: "Move the thermostat scheduler to the rules engine",
+					stage: "merging",
+					state: "queued",
+					age: 0.2,
+					work: 12,
+				},
+				12,
+				now,
+				"LUME-13",
+			);
+			const done = insertTaskRow(
+				db,
+				lumen,
+				{
+					title: "Fix the sensor polling backoff on reconnect",
+					stage: "done",
+					state: "idle",
+					age: 0.3,
+					work: 9,
+					merge: 2,
+				},
+				13,
+				now,
+				"LUME-14",
+			);
+			expect(pr.id).toBe("LUME-13");
+			expect(done.id).toBe("LUME-14");
+			// Without an override the id still comes from seedTaskId's index counting.
+			const seeded: ProjectSpec = {
+				name: "lumen",
+				displayName: "Lumen",
+				rules: false,
+				tasks: [
+					{
+						title: "Add a room presence heatmap to the dashboard",
+						stage: "todo",
+						state: "idle",
+						age: 1,
+					},
+				],
+			};
+			const plain = insertTaskRow(db, seeded, seeded.tasks[0]!, 0, now);
+			expect(plain.id).toBe("LUME-1");
+		} finally {
+			db.close();
+		}
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

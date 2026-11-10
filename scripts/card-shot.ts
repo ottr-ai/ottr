@@ -116,7 +116,17 @@ function plantCards(root: string, pr: number): Planted {
 		const next = (used.length > 0 ? Math.max(...used) : 0) + 1;
 		const now = Date.now();
 
-		const prSeed = insertTaskRow(db, LUMEN, PR_SPEC, next - 1, now);
+		// Explicit ids from the counted free numbers: LUMEN.tasks is empty, so
+		// seedTaskId's index counting would derive LUME-1 for both cards and collide
+		// with the pool's seeded rows (OTTR-776).
+		const prSeed = insertTaskRow(
+			db,
+			LUMEN,
+			PR_SPEC,
+			next - 1,
+			now,
+			`${prefix}-${next}`,
+		);
 		seedTaskEvents(db, prSeed);
 		// Parked PR mode (OTTR-552): the merge turn ended, the PR is open, the card
 		// reads "PR #N open · waiting for merge" — never "done".
@@ -133,7 +143,14 @@ function plantCards(root: string, pr: number): Planted {
 			prSeed.createdAt + 16 * MIN,
 		);
 
-		const doneSeed = insertTaskRow(db, LUMEN, DONE_SPEC, next, now);
+		const doneSeed = insertTaskRow(
+			db,
+			LUMEN,
+			DONE_SPEC,
+			next,
+			now,
+			`${prefix}-${next + 1}`,
+		);
 		seedTaskEvents(db, doneSeed);
 		// Cards created later on this board continue the id sequence.
 		db.run(

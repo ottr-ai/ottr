@@ -485,13 +485,16 @@ export function insertTaskRow(
 	t: Spec,
 	i: number,
 	now: number,
+	overrideId?: string,
 ): TaskSeed {
 	// Real task keys (store.ts nextTaskId): the task routes answer 400 "bad task id" to anything else.
 	const prefix = project.name
 		.replaceAll(/[^A-Za-z0-9]/g, "")
 		.toUpperCase()
 		.slice(0, 4);
-	const id = seedTaskId(prefix, project, t, i);
+	// A fixture plant passes overrideId: seedTaskId counts spec indexes, which cannot
+	// see the rows a pool seed or an earlier plant already wrote (OTTR-776).
+	const id = overrideId ?? seedTaskId(prefix, project, t, i);
 	// A retro's prompt and title carry the marker once, over the source card's title
 	// (src/prompts.ts retroPrompt); the pool spec's title stays bare.
 	const retroPrompt = `${RETRO_MARKER}${t.title}`;
