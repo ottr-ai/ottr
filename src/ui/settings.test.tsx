@@ -21,6 +21,7 @@ import {
 	GitHostsSection,
 	HindsightSection,
 	ModelRolesSection,
+	missingRequiredLine,
 	NotificationsSection,
 	OmpStatsSection,
 	openSettingsSection,
@@ -3950,6 +3951,7 @@ describe("AlateSection user layer", () => {
 			fetchMockFor({
 				skills: ["blast-radius", "correct"],
 				plugins: ["caveman-installer"],
+				rules: ["lang-typescript.md"],
 				mcp: ["chrome-devtools", "context-mode"],
 			}),
 		);
@@ -3965,7 +3967,7 @@ describe("AlateSection user layer", () => {
 
 	test("an empty layer shows the callout with the sync hint", async () => {
 		const { container, unmount } = await mountAlate(
-			fetchMockFor({ skills: [], plugins: [], mcp: [] }),
+			fetchMockFor({ skills: [], plugins: [], rules: [], mcp: [] }),
 		);
 		try {
 			expect(container.textContent).toContain("User layer is empty");
@@ -3979,12 +3981,98 @@ describe("AlateSection user layer", () => {
 		}
 	});
 
-	test("the line helpers pluralize counts and treat MCP-only layers as empty", () => {
-		expect(userLayerLine({ skills: ["a"], plugins: [], mcp: [] })).toBe(
-			"User layer: 1 skill, 0 plugins, MCP servers: none",
+	test("a layer that lacks prompt-required entries shows one missing line in shipped order", async () => {
+		const { container, unmount } = await mountAlate(
+			fetchMockFor({
+				skills: ["ui-ux-check", "retro"],
+				plugins: [],
+				rules: ["codeguard-1-input-validation.md"],
+				mcp: [],
+			}),
 		);
-		expect(userLayerEmpty({ skills: [], plugins: [], mcp: ["x"] })).toBe(true);
-		expect(userLayerEmpty({ skills: ["a"], plugins: [], mcp: [] })).toBe(false);
+		try {
+			expect(container.textContent).toContain(
+				"Missing on workers: security-audit, codebase-design, ponytail-audit, diff-security-review, explain-project, check-ottr-board",
+			);
+			// One line, in the section's warn style: the grey warning mark rides a hint line.
+			const lines = [...container.querySelectorAll("p.hint.notif-line")].map(
+				(p) => p.textContent ?? "",
+			);
+			expect(
+				lines.filter((t) => t.includes("Missing on workers")),
+			).toHaveLength(1);
+			expect(lines[0]!.startsWith("Missing on workers: ")).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a layer that holds every prompt-required entry renders no missing line", async () => {
+		const { container, unmount } = await mountAlate(
+			fetchMockFor({
+				skills: [
+					"security-audit",
+					"codebase-design",
+					"ponytail",
+					"ui-ux-check",
+					"diff-security-review",
+					"explain-project",
+					"check-ottr-board",
+					"retro",
+				],
+				plugins: [],
+				rules: ["codeguard-1-crypto-algorithms.md"],
+				mcp: [],
+			}),
+		);
+		try {
+			expect(container.textContent).toContain("User layer: 8 skills");
+			expect(container.textContent).not.toContain("Missing on workers");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("missingRequiredLine names the gaps or returns null", () => {
+		expect(
+			missingRequiredLine({
+				skills: ["ui-ux-check"],
+				plugins: [],
+				rules: [],
+				mcp: [],
+			}),
+		).toBe(
+			"Missing on workers: security-audit, codeguard, codebase-design, ponytail-audit, diff-security-review, explain-project, check-ottr-board, retro",
+		);
+		expect(
+			missingRequiredLine({
+				skills: [
+					"security-audit",
+					"codebase-design",
+					"ponytail",
+					"ui-ux-check",
+					"diff-security-review",
+					"explain-project",
+					"check-ottr-board",
+					"retro",
+				],
+				plugins: [],
+				rules: ["codeguard-1-hardcoded-credentials.md"],
+				mcp: [],
+			}),
+		).toBe(null);
+	});
+
+	test("the line helpers pluralize counts and treat MCP-only layers as empty", () => {
+		expect(
+			userLayerLine({ skills: ["a"], plugins: [], rules: [], mcp: [] }),
+		).toBe("User layer: 1 skill, 0 plugins, MCP servers: none");
+		expect(
+			userLayerEmpty({ skills: [], plugins: [], rules: [], mcp: ["x"] }),
+		).toBe(true);
+		expect(
+			userLayerEmpty({ skills: ["a"], plugins: [], rules: [], mcp: [] }),
+		).toBe(false);
 	});
 });
 

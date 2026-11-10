@@ -3761,7 +3761,7 @@ describe("alate routes", () => {
 						env: true,
 					},
 				],
-				userLayer: { skills: [], plugins: [], mcp: [] },
+				userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
 			});
 		} finally {
 			provCleanup();
@@ -3813,7 +3813,7 @@ describe("alate routes", () => {
 						env: true,
 					},
 				],
-				userLayer: { skills: [], plugins: [], mcp: [] },
+				userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
 			});
 		} finally {
 			alateStatus = 200;

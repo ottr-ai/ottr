@@ -62,11 +62,13 @@ const objectKeys = (value: unknown): string[] =>
 /** The user layer a provisioned home holds: names, sorted. Each piece reads fail-soft:
  *  alate installs an item only when the data repo has it, so a missing dir or file is an
  *  empty list, never an error. A skill is a folder with a SKILL.md; plugins come from
- *  omp-plugins.lock.json's `plugins` map; MCP servers from mcp.json's `mcpServers`. */
+ *  omp-plugins.lock.json's `plugins` map; MCP servers from mcp.json's `mcpServers`; rules
+ *  are the .md files in .omp/agent/rules (dot-prefixed files stay out). */
 export function readUserLayer(home: string): {
 	skills: string[];
 	plugins: string[];
 	mcp: string[];
+	rules: string[];
 } {
 	const skills = new Set<string>();
 	for (const dir of USER_SKILL_DIRS) {
@@ -86,10 +88,20 @@ export function readUserLayer(home: string): {
 		join(home, ".omp", "plugins", "omp-plugins.lock.json"),
 	);
 	const mcpFile = readJsonObject(join(home, ".omp", "agent", "mcp.json"));
+	let ruleFiles: string[];
+	try {
+		ruleFiles = readdirSync(join(home, ".omp", "agent", "rules"));
+	} catch {
+		ruleFiles = [];
+	}
+	const rules = ruleFiles
+		.filter((name) => !name.startsWith(".") && name.endsWith(".md"))
+		.sort();
 	return {
 		skills: [...skills].sort(),
 		plugins: objectKeys(lock?.plugins).sort(),
 		mcp: objectKeys(mcpFile?.mcpServers).sort(),
+		rules,
 	};
 }
 

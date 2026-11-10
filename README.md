@@ -78,7 +78,25 @@ While a review is open, only its finding cards merge — a release ships reviewe
 
 A release card that waits for you with every finding done shows the held merges on the card and offers **Release again**: it cancels the release and opens Create release, so a new review covers the fixes. A card that waits for such a release shows the hold and links to the release card. The board warnings name a release that holds merges for more than an hour after its last finding landed.
 
-**Show diagrams** opens `docs/how-it-works.md` as committed on the target branch, with each Mermaid block drawn as a diagram. **Create/update diagrams** at the top of that window asks for confirmation, then creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project; if the file already exists, the task updates it to match the code. The skill comes from agent-data, so the host and the workers must have it.
+**Show diagrams** opens `docs/how-it-works.md` as committed on the target branch, with each Mermaid block drawn as a diagram. **Create/update diagrams** at the top of that window asks for confirmation, then creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project; if the file already exists, the task updates it to match the code. See [Required skills](#required-skills) for where each skill lives.
+
+## Required skills
+
+The board's prompts name skills and rules. A prompt stops with a `needs_you` report when its runner lacks one. The board compares the workers' installed skills with this list and shows the missing ones in **Settings → Alate** and on the affected buttons.
+
+| Skill or rules | Source | Used by |
+| --- | --- | --- |
+| `check-ottr-board` | ships in this repo: `.agents/skills/check-ottr-board` | the **Check the board** button |
+| `diff-security-review` | ships in this repo: `.agents/skills/diff-security-review`; ported from [anthropics/claude-code-security-review](https://github.com/anthropics/claude-code-security-review) (MIT) | every merge turn |
+| `explain-project` | ships in this repo: `.agents/skills/explain-project` | the **Create/update diagrams** button |
+| `ui-ux-check` | ships in this repo: `.agents/skills/ui-ux-check` | reviews of projects with a UI |
+| `security-audit` | [cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill); Ottr substitutes its own `security-audit-harness` when present | every review |
+| codeguard rules | [cosai-oasis/project-codeguard](https://github.com/cosai-oasis/project-codeguard) | every review |
+| `codebase-design` | [mattpocock/skills](https://github.com/mattpocock/skills) | review architecture lens |
+| `ponytail-audit` | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) | review architecture lens |
+| `retro` | private agent-data repo | the end-of-task retro |
+
+omp loads `.agents/skills/` from the repo for runs in this checkout. Install a shipped skill into another home with the skills CLI (`npx skills add`). The third-party skills come from their repos with the skills CLI or a data repo.
 
 ## Requirements
 

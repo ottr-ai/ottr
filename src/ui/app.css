@@ -182,6 +182,15 @@ code {
 	text-transform: none;
 	color: var(--dim);
 }
+/* The skill-gap mark after a control label. */
+.skill-gap-mark {
+	margin-left: 4px;
+}
+/* A settings notif-line wraps long name lists: let the span shrink and break cleanly. */
+.settings-sec .notif-line > span {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
 
 /* Review-model nudge in the Start review dialog: visible recommendation, not a warning. */
 .model-notice {

@@ -22,6 +22,7 @@ import {
 	listedEnvNames,
 	parseEnvTxt,
 	parseToolsJson,
+	readUserLayer,
 	type ToolEntry,
 	toolsListPath,
 	turnEnvValues,
@@ -651,5 +652,41 @@ describe("turnEnvValues", () => {
 			if (saved === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
 			else process.env.OTTR_BOARD_OMP_HOME = saved;
 		}
+	});
+});
+
+describe("readUserLayer", () => {
+	test("the rules read returns the sorted .md names and keeps the other lists", () => {
+		const h = mkdtempSync(join(home, "rules-"));
+		const rules = join(h, ".omp", "agent", "rules");
+		mkdirSync(rules, { recursive: true });
+		writeFileSync(join(rules, "codeguard-1-input-validation.md"), "x\n");
+		writeFileSync(join(rules, "lang-typescript.md"), "x\n");
+		// Not a rule: wrong extension; dot-prefixed files stay out too.
+		writeFileSync(join(rules, "notes.txt"), "x\n");
+		writeFileSync(join(rules, ".secret.md"), "x\n");
+		expect(readUserLayer(h)).toEqual({
+			skills: [],
+			plugins: [],
+			mcp: [],
+			rules: ["codeguard-1-input-validation.md", "lang-typescript.md"],
+		});
+	});
+
+	test("a home without a rules dir reads fail-soft as an empty rules list", () => {
+		const h = mkdtempSync(join(home, "norules-"));
+		mkdirSync(join(h, ".omp", "agent", "skills", "correct"), {
+			recursive: true,
+		});
+		writeFileSync(
+			join(h, ".omp", "agent", "skills", "correct", "SKILL.md"),
+			"x\n",
+		);
+		expect(readUserLayer(h)).toEqual({
+			skills: ["correct"],
+			plugins: [],
+			mcp: [],
+			rules: [],
+		});
 	});
 });

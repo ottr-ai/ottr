@@ -28,6 +28,7 @@ import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import { isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
+import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
 	type DepIndex,
 	type DepProject,
@@ -2013,11 +2014,14 @@ function MermaidDiagram({ code }: { code: string }) {
  *  task which writes that file. */
 function HowItWorksModal({
 	project,
+	userLayer,
 	onClose,
 	act,
 	open,
 }: {
 	project: string;
+	/** The provisioned user layer; null before the first provisioning answer. */
+	userLayer: ProvisioningResponse["userLayer"] | null;
 	onClose: () => void;
 	act: Act;
 	open: (id: string) => void;
@@ -2041,6 +2045,7 @@ function HowItWorksModal({
 			alive = false;
 		};
 	}, [project]);
+	const diagramsNote = skillGapNote(userLayer, "diagrams");
 	return (
 		<Modal
 			open
@@ -2068,10 +2073,11 @@ function HowItWorksModal({
 								open(t.id);
 							})
 						}
-						title="Create a task that writes docs/how-it-works.md with Mermaid diagrams of this project"
+						title={`Create a task that writes docs/how-it-works.md with Mermaid diagrams of this project${diagramsNote === null ? "" : `. ${diagramsNote}`}`}
 					>
 						<Icon name="grid" />
 						Create/update diagrams
+						{diagramsNote !== null && <SkillGapMark note={diagramsNote} />}
 					</button>
 					<CloseButton />
 				</span>
@@ -3613,7 +3619,7 @@ function ArchReviewDialog({
 
 /** Prompt behind the Diagrams window's "Create/update diagrams" button. */
 const EXPLAIN_PROJECT =
-	"Explain how this project works: load the explain-project skill and follow it. Write docs/how-it-works.md with Mermaid diagrams (architecture, the main use case, and the life cycle if the project has one). Map every node to its source path. If docs/how-it-works.md already exists, update it to match the code. Commit the file.";
+	"Explain how this project works: load the explain-project skill and follow it. Write docs/how-it-works.md with Mermaid diagrams (architecture, the main use case, and the life cycle if the project has one). Map every node to its source path. If docs/how-it-works.md already exists, update it to match the code. If this runner lacks the skill, report needs_you: Alate provisioning installs it. Commit the file.";
 
 /** Done lane page size: the cards shown before "Show more", and the step each click adds. */
 const DONE_PAGE = 20;
@@ -3788,11 +3794,14 @@ function DoneLaneTools(p: {
 /** The project head's overflow menu: review, release and diagrams, plus the popover trigger. */
 function ProjectMenu(p: {
 	project: ProjectView;
+	/** The provisioned user layer; null before the first provisioning answer. */
+	userLayer: ProvisioningResponse["userLayer"] | null;
 	startReview: () => void;
 	showRelease: () => void;
 	showDiagrams: () => void;
 }) {
 	const project = p.project;
+	const reviewNote = skillGapNote(p.userLayer, "review");
 	return (
 		<>
 			<button
@@ -3819,14 +3828,16 @@ function ProjectMenu(p: {
 							className="ghost"
 							disabled={project.archReview.running}
 							title={
-								project.archReview.running
+								(project.archReview.running
 									? "A review is still open: one review at a time"
-									: `${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`
+									: `${project.archReview.delta} commits on ${project.target} since the last review — start one early, the same review a release runs`) +
+								(reviewNote === null ? "" : `. ${reviewNote}`)
 							}
 							onClick={p.startReview}
 						>
 							<Icon name="shield-check" size={13} />
 							Start review
+							{reviewNote !== null && <SkillGapMark note={reviewNote} />}
 						</button>
 					)}
 				{!project.gitless && (
@@ -3837,13 +3848,15 @@ function ProjectMenu(p: {
 						disabled={project.archReview?.running}
 						onClick={p.showRelease}
 						title={
-							project.archReview?.running
+							(project.archReview?.running
 								? "A release or review is still open: one at a time"
-								: "Release all new commits"
+								: "Release all new commits") +
+							(reviewNote === null ? "" : `. ${reviewNote}`)
 						}
 					>
 						<Icon name="package" />
 						Create release
+						{reviewNote !== null && <SkillGapMark note={reviewNote} />}
 					</button>
 				)}
 				{!project.gitless && (
@@ -4116,6 +4129,7 @@ export function ProjectBoard({
 	draining,
 	tick,
 	foreignDeps,
+	userLayer,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
@@ -4133,6 +4147,9 @@ export function ProjectBoard({
 	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
 	 * foreign card; absent before the first state frame or for an unknown project. */
 	foreignDeps?: DepIndex;
+	/** The provisioned user layer; absent before the first provisioning answer, and absent
+	 * in hosted mode (the operator owns the workers' layer), so the markers stay out. */
+	userLayer?: ProvisioningResponse["userLayer"] | null;
 }) {
 	const hosted = useContext(HostedContext);
 	const [showRelease, setShowRelease] = useState(false);
@@ -4178,6 +4195,9 @@ export function ProjectBoard({
 	// The search box takes each keystroke uncontrolled; the filter lands after the
 	// pause (SEARCH_APPLY_MS), so a big board does not re-render per keypress.
 	const [applied, applySearch] = useDelayedState(SEARCH_APPLY_MS);
+	// The review prompt's skill gap: the overdue Start review button and the menu's
+	// review and release controls share it.
+	const reviewNote = skillGapNote(userLayer ?? null, "review");
 	// Mobile stage tabs: which column the single-column tier shows; the desktop grid ignores it.
 	const [stage, setStage] = useState<Stage>("todo");
 	// Horizontal swipe on the board flips to the neighbor column; touch start point.
@@ -4276,11 +4296,12 @@ export function ProjectBoard({
 						<button
 							type="button"
 							className="arch-start"
-							title="Pick a model and create a task that reviews the whole repo, the same review a release runs"
+							title={`Pick a model and create a task that reviews the whole repo, the same review a release runs${reviewNote === null ? "" : `. ${reviewNote}`}`}
 							onClick={() => setShowReview(true)}
 						>
 							<Icon name="shield-check" size={13} />
 							Start review
+							{reviewNote !== null && <SkillGapMark note={reviewNote} />}
 						</button>
 					)}
 					{/* Settings shortcut: a real link, so a middle click opens the project's
@@ -4302,6 +4323,7 @@ export function ProjectBoard({
 					{(project.archReview !== null || !project.gitless) && (
 						<ProjectMenu
 							project={project}
+							userLayer={userLayer ?? null}
 							startReview={() => setShowReview(true)}
 							showRelease={() => setShowRelease(true)}
 							showDiagrams={() => setShowDiagrams(true)}
@@ -4336,6 +4358,7 @@ export function ProjectBoard({
 			{showDiagrams && (
 				<HowItWorksModal
 					project={project.name}
+					userLayer={userLayer ?? null}
 					onClose={() => setShowDiagrams(false)}
 					act={act}
 					open={open}
@@ -4686,6 +4709,7 @@ export function Overview({
 	onAdd,
 	openTask,
 	navigate,
+	prov,
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
@@ -4694,13 +4718,14 @@ export function Overview({
 	openTask: (id: string) => void;
 	/** Plain-click navigation to a view path (see navClick). */
 	navigate: (path: string) => void;
+	/** The provisioning poll App owns; null data before the first answer (hosted mode keeps it null). */
+	prov: { data: ProvisioningResponse | null; err: string | null };
 }) {
 	const hosted = useContext(HostedContext);
 	const [range, setRange] = useState<PerfRange>("all");
 	const { perf, err, refreshing } = usePerf(range);
-	// Hosted mode: Alate, provisioning and the workers are the operator's, so the Setup tab
-	// (the Provisioning panel only) is gone, and no probe runs.
-	const prov = useProvisioning(!hosted);
+	// The provisioning poll lives in App: the Setup tab reads it here, and the skill-gap
+	// markers on the Diagrams, review and release controls read it on the project view.
 	// Tabs: Now (what waits on you, the live projects), Performance and Setup.
 	const [picked, setTab] = useState<OverviewTab>("now");
 	const tabs: readonly OverviewTab[] = hosted
@@ -5030,9 +5055,32 @@ export function setupHints(
 	return line.kind === "ok" ? [] : [{ text: line.text, kind: line.kind }];
 }
 
+/** The note for a control whose prompt needs skills or rules the workers lack: the missing
+ *  names on one line, or null when the workers hold everything (or no layer loaded yet).
+ *  The control appends the note to its title and shows the marker next to it. */
+export function skillGapNote(
+	userLayer: ProvisioningResponse["userLayer"] | null,
+	use: SkillUse,
+): string | null {
+	if (userLayer === null) return null;
+	const names = missingByUse(userLayer)[use];
+	return names.length === 0 ? null : `Missing on workers: ${names.join(", ")}`;
+}
+
+/** The always-visible warning mark for such a control; the note rides the aria-label and
+ *  the title, so the gap reaches keyboard and screen-reader users, not only the mouse. */
+function SkillGapMark({ note }: { note: string }) {
+	return (
+		<span role="img" aria-label={note} title={note} className="skill-gap-mark">
+			<Mark kind="warn" />
+		</span>
+	);
+}
+
 /** Polls GET /api/provisioning every 60 s (the endpoint runs a live probe, so it must not ride
- *  the 1 s state push). The Overview reads it once for both Your turn and the Setup section.
- *  Off while `enabled` is false: hosted mode has no Setup tab. */
+ *  the 1 s state push). App reads it once for the Setup panel, Your turn and the skill-gap
+ *  markers on the prompts' controls. Off while `enabled` is false: hosted mode has no Setup
+ *  tab, and the operator owns the workers' layer. */
 function useProvisioning(enabled: boolean): {
 	data: ProvisioningResponse | null;
 	err: string | null;
@@ -14967,6 +15015,8 @@ function AppMainContent(p: {
 	setShowAdd: (v: boolean) => void;
 	draining: boolean;
 	tick: number;
+	/** The provisioning poll App owns; the Overview Setup panel and the skill-gap markers read it. */
+	prov: { data: ProvisioningResponse | null; err: string | null };
 }) {
 	const {
 		state,
@@ -14988,6 +15038,7 @@ function AppMainContent(p: {
 		setShowAdd,
 		draining,
 		tick,
+		prov,
 	} = p;
 	return state === null ? (
 		<Skeleton shape="list" rows={6} label="Loading the board" />
@@ -15017,6 +15068,7 @@ function AppMainContent(p: {
 			onAdd={() => setShowAdd(true)}
 			openTask={openTask}
 			navigate={navigate}
+			prov={prov}
 		/>
 	) : (
 		<ProjectBoard
@@ -15039,6 +15091,7 @@ function AppMainContent(p: {
 			onNotice={setNotice}
 			draining={draining}
 			tick={tick}
+			userLayer={prov.data?.userLayer ?? null}
 		/>
 	);
 }
@@ -15649,6 +15702,12 @@ export function App() {
 		selected,
 		selectedProject,
 	} = appViewSelection(state, view, projects, selectedId, tasks, bootHosted);
+	// Hosted mode: Alate, provisioning and the workers are the operator's, so no probe runs
+	// and the user layer stays unknown (the skill-gap markers stay out). The gate waits for
+	// the first state frame: `hosted` is false before it lands, and a mount-time fetch would
+	// probe in hosted mode before the flag arrives.
+	const prov = useProvisioning(state !== null && !hosted);
+	const boardNote = skillGapNote(prov.data?.userLayer ?? null, "board-check");
 	// OTTR-566: an open drawer is the read event for the rail's done dot, whatever opened it
 	// (a card click, a pasted/deep-link URL, or the task finishing while its drawer is open).
 	// doneUnread checks seenAnswers, so a mark already made is not posted again.
@@ -15914,27 +15973,34 @@ export function App() {
 					/>
 				)}
 				{checkProject !== null && (
-					<button
-						type="button"
-						className="icon"
-						title="Check the board with the check-ottr-board skill (dev tool)"
-						aria-label="Check the board"
-						onClick={async () =>
-							(await confirmDialog(
-								"Check the board? This creates a task that runs an agent over every open card. When a check card is still open, it opens that card instead.",
-								{ ok: "Create task" },
-							)) &&
-							void act(async () => {
-								const card = await post<{ id: string }>(
-									`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
-									{},
-								);
-								openTask(card.id);
-							})
-						}
-					>
-						<Icon name="activity" />
-					</button>
+					<>
+						<button
+							type="button"
+							className="icon"
+							title={`Check the board with the check-ottr-board skill (dev tool)${boardNote === null ? "" : `. ${boardNote}`}`}
+							aria-label={
+								boardNote === null
+									? "Check the board"
+									: `Check the board. ${boardNote}`
+							}
+							onClick={async () =>
+								(await confirmDialog(
+									"Check the board? This creates a task that runs an agent over every open card. When a check card is still open, it opens that card instead.",
+									{ ok: "Create task" },
+								)) &&
+								void act(async () => {
+									const card = await post<{ id: string }>(
+										`/api/projects/${encodeURIComponent(checkProject)}/board-check`,
+										{},
+									);
+									openTask(card.id);
+								})
+							}
+						>
+							<Icon name="activity" />
+						</button>
+						{boardNote !== null && <SkillGapMark note={boardNote} />}
+					</>
 				)}
 				<AppInboxBell
 					inbox={inbox}
@@ -16113,6 +16179,7 @@ export function App() {
 						setShowAdd={setShowAdd}
 						draining={draining}
 						tick={clockTick}
+						prov={prov}
 					/>
 				</main>
 			</div>

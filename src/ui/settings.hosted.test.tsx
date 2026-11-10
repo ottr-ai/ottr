@@ -809,6 +809,7 @@ describe("hosted app shell", () => {
 					onAdd={() => {}}
 					openTask={() => {}}
 					navigate={() => {}}
+					prov={{ data: null, err: null }}
 				/>
 			</HostedContext.Provider>
 		);

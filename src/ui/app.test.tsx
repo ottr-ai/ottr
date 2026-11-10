@@ -73,6 +73,7 @@ const {
 	boardFlipSig,
 	cardRenderProbe,
 	reuseCards,
+	skillGapNote,
 } = await import("./app.tsx");
 const {
 	monogram,
@@ -1243,7 +1244,7 @@ describe("setupHints", () => {
 				{
 					server: null,
 					workers: [],
-					userLayer: { skills: [], plugins: [], mcp: [] },
+					userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
 				},
 				null,
 			),
@@ -1253,7 +1254,7 @@ describe("setupHints", () => {
 				{
 					server: { ...server, lastError: "boom" },
 					workers: [],
-					userLayer: { skills: [], plugins: [], mcp: [] },
+					userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
 				},
 				null,
 			),
@@ -1270,7 +1271,7 @@ describe("setupHints", () => {
 				{
 					server,
 					workers: [],
-					userLayer: { skills: [], plugins: [], mcp: [] },
+					userLayer: { skills: [], plugins: [], rules: [], mcp: [] },
 				},
 				null,
 			),
@@ -3829,6 +3830,7 @@ describe("cancelled cards on the board", () => {
 				onAdd={() => {}}
 				openTask={() => {}}
 				navigate={() => {}}
+				prov={{ data: null, err: null }}
 			/>,
 		);
 		// The project row's stage cells in column order: the cancelled card leaves
@@ -5341,6 +5343,285 @@ describe("ProjectBoard settings shortcut", () => {
 			expect(popped).toBe(1);
 			expect(window.location.pathname).toBe("/settings/proj");
 		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("skillGapNote", () => {
+	// The full layer: every REQUIRED_SKILLS entry a worker home can hold, the rules
+	// entry by its file-name prefix.
+	const complete = {
+		skills: [
+			"security-audit",
+			"codebase-design",
+			"ponytail",
+			"ui-ux-check",
+			"diff-security-review",
+			"explain-project",
+			"check-ottr-board",
+			"retro",
+		],
+		plugins: [],
+		rules: ["codeguard-1-hardcoded-credentials.md"],
+		mcp: [],
+	};
+	test("a null layer and a complete layer name no gap", () => {
+		expect(skillGapNote(null, "review")).toBe(null);
+		expect(skillGapNote(null, "diagrams")).toBe(null);
+		expect(skillGapNote(complete, "review")).toBe(null);
+		expect(skillGapNote(complete, "diagrams")).toBe(null);
+		expect(skillGapNote(complete, "board-check")).toBe(null);
+	});
+	test("an incomplete layer names the missing entries of one use, in shipped order", () => {
+		expect(skillGapNote({ ...complete, skills: [], rules: [] }, "review")).toBe(
+			"Missing on workers: security-audit, codeguard, codebase-design, ponytail-audit, ui-ux-check",
+		);
+		expect(skillGapNote(complete, "board-check")).toBe(null);
+		// The bar's check control reads its own group: the shipped skill, not the rules entry.
+		expect(skillGapNote({ ...complete, skills: [] }, "board-check")).toBe(
+			"Missing on workers: check-ottr-board",
+		);
+	});
+});
+
+describe("ProjectBoard skill-gap markers", () => {
+	// React interaction needs browser globals; the same happy-dom swap as the
+	// settings shortcut tests above, plus the dialog pair the Diagrams modal shows.
+	const window = new Window({ url: "http://localhost/projects/proj" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		HTMLDialogElement: window.HTMLDialogElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+		history: window.history,
+		location: window.location,
+		PopStateEvent: window.PopStateEvent,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	/** The production onClick React rendered onto the node (see the settings shortcut tests). */
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+
+	/** An arch review with unreviewed commits: the menu's Start review button shows. */
+	const archReview = {
+		delta: 2,
+		reviewed: true,
+		base: "abc123",
+		reviewCardId: null,
+		cap: 3,
+		due: false,
+		running: false,
+	};
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		gitless: false,
+		dirty: false,
+		archReview,
+		latestRelease: null,
+		latestImage: null,
+		target: "origin/main",
+		settings: { setupChecklist: false },
+		sessionsDir: "/tmp/s",
+	} as unknown as ProjectView;
+
+	/** The review group the fake layer lacks: every review entry except the shipped ui-ux-check. */
+	const REVIEW_NOTE =
+		"Missing on workers: security-audit, codeguard, codebase-design, ponytail-audit";
+
+	type UserLayer = Parameters<typeof ProjectBoard>[0]["userLayer"];
+
+	async function mountBoard(
+		userLayer: UserLayer,
+		due = false,
+	): Promise<{
+		container: HTMLDivElement;
+		unmount: () => Promise<void>;
+	}> {
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const boardProject = { ...project, archReview: { ...archReview, due } };
+		await act(async () => {
+			root.render(
+				<ProjectBoard
+					project={boardProject}
+					tasks={[]}
+					deltas={new Map()}
+					open={() => {}}
+					seenAnswers={new Set()}
+					compose={() => {}}
+					composeDraft={() => {}}
+					act={async () => true}
+					onNotice={() => {}}
+					draining={false}
+					userLayer={userLayer}
+				/>,
+			);
+		});
+		return {
+			container,
+			unmount: async () => {
+				await act(async () => {
+					root.unmount();
+				});
+				container.remove();
+			},
+		};
+	}
+
+	const buttonWithText = (
+		container: HTMLDivElement,
+		text: string,
+	): HTMLButtonElement => {
+		const b = [...container.querySelectorAll("button")].find((x) =>
+			(x.textContent ?? "").includes(text),
+		);
+		if (b === undefined) throw new Error(`no "${text}" button`);
+		return b;
+	};
+
+	test("an incomplete layer appends the note to the review and release titles and shows the marks", async () => {
+		const { container, unmount } = await mountBoard({
+			skills: ["ui-ux-check"],
+			plugins: [],
+			rules: [],
+			mcp: [],
+		});
+		try {
+			const review = buttonWithText(container, "Start review");
+			const release = buttonWithText(container, "Create release");
+			expect(review.getAttribute("title")).toContain(`. ${REVIEW_NOTE}`);
+			expect(release.getAttribute("title")).toContain(`. ${REVIEW_NOTE}`);
+			// The mark is a visible span on the button, with the note as its accessible name.
+			for (const b of [review, release]) {
+				const mark = b.querySelector('[role="img"]');
+				expect(mark?.getAttribute("aria-label")).toBe(REVIEW_NOTE);
+				expect(mark?.querySelector("svg")?.getAttribute("class")).toContain(
+					"mark-warn",
+				);
+			}
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an overdue review's Start review button carries the same note and mark", async () => {
+		// due: true moves Start review out of the menu onto the head's arch-start button.
+		const { container, unmount } = await mountBoard(
+			{ skills: [], plugins: [], rules: [], mcp: [] },
+			true,
+		);
+		try {
+			const review =
+				container.querySelector<HTMLButtonElement>("button.arch-start");
+			if (review === null) throw new Error("no arch-start button");
+			expect(review.textContent).toContain("Start review");
+			expect(review.getAttribute("title")).toContain(
+				". Missing on workers: security-audit, codeguard, codebase-design, ponytail-audit, ui-ux-check",
+			);
+			expect(
+				review.querySelector('[role="img"]')?.getAttribute("aria-label"),
+			).toBe(
+				"Missing on workers: security-audit, codeguard, codebase-design, ponytail-audit, ui-ux-check",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a complete layer keeps the plain titles and renders no marks", async () => {
+		const { container, unmount } = await mountBoard({
+			skills: [
+				"security-audit",
+				"codebase-design",
+				"ponytail",
+				"ui-ux-check",
+				"diff-security-review",
+				"explain-project",
+				"check-ottr-board",
+				"retro",
+			],
+			plugins: [],
+			rules: ["codeguard-1-hardcoded-credentials.md"],
+			mcp: [],
+		});
+		try {
+			expect(
+				buttonWithText(container, "Start review").getAttribute("title"),
+			).toBe(
+				"2 commits on origin/main since the last review — start one early, the same review a release runs",
+			);
+			expect(
+				buttonWithText(container, "Create release").getAttribute("title"),
+			).toBe("Release all new commits");
+			expect(container.querySelector('[role="img"]')).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the Diagrams window names the gap on Create/update diagrams", async () => {
+		// The modal fetches the file on mount; 404 keeps the create-hint body, which is enough.
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response("no file", {
+				status: 404,
+			})) as unknown as typeof fetch;
+		const { container, unmount } = await mountBoard({
+			skills: [],
+			plugins: [],
+			rules: [],
+			mcp: [],
+		});
+		try {
+			const show = buttonWithText(container, "Show diagrams");
+			await act(async () => {
+				onClickOf(show)({});
+			});
+			const create = buttonWithText(container, "Create/update diagrams");
+			const note = "Missing on workers: explain-project";
+			expect(create.getAttribute("title")).toContain(`. ${note}`);
+			expect(
+				create.querySelector('[role="img"]')?.getAttribute("aria-label"),
+			).toBe(note);
+		} finally {
+			globalThis.fetch = realFetch;
 			await unmount();
 		}
 	});

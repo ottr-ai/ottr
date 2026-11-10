@@ -17,6 +17,7 @@ import type { OmpStatsReport } from "../ompStats.ts";
 import type { OmpStatsDashboardInfo } from "../ompStatsDashboard.ts";
 import { orderBy } from "../projectOrder.ts";
 import { forProvider } from "../quota.ts";
+import { missingRequired } from "../requiredSkills.ts";
 import { liveCardOf } from "../scheduler.ts";
 import type {
 	AppCheck,
@@ -5256,6 +5257,15 @@ export function userLayerEmpty(
 	return layer.skills.length === 0 && layer.plugins.length === 0;
 }
 
+/** The prompt-required skills and rules the workers lack, as one line: names in the shipped
+ *  order. Null when the workers hold everything, so the caller renders nothing. */
+export function missingRequiredLine(
+	layer: ProvisioningResponse["userLayer"],
+): string | null {
+	const names = missingRequired(layer).map((entry) => entry.name);
+	return names.length === 0 ? null : `Missing on workers: ${names.join(", ")}`;
+}
+
 /** Consecutive `down` health probes (15 s apart) after which Settings stops following a provision. */
 export const ALATE_WATCH_MAX_DOWN = 4;
 /** Longest time Settings follows a provision that alate keeps reporting as running. */
@@ -5450,13 +5460,15 @@ function AlateActions({
 	);
 }
 
-/** The user-layer note after a provision: why it is empty and the sync command that fills it. */
+/** The user-layer note after a provision: why it is empty, the sync command that fills it,
+ *  and the prompt-required skills or rules the workers still lack. */
 function UserLayerNote({
 	layer,
 }: {
 	layer: ProvisioningResponse["userLayer"] | null;
 }) {
 	if (layer === null) return null;
+	const missing = missingRequiredLine(layer);
 	if (userLayerEmpty(layer))
 		return (
 			<>
@@ -5473,9 +5485,25 @@ function UserLayerNote({
 						</small>
 					</span>
 				</div>
+				{missing !== null && (
+					<p className="hint notif-line">
+						<Mark kind="warn" />
+						<span>{missing}</span>
+					</p>
+				)}
 			</>
 		);
-	return <p className="hint">{userLayerLine(layer)}</p>;
+	return (
+		<>
+			<p className="hint">{userLayerLine(layer)}</p>
+			{missing !== null && (
+				<p className="hint notif-line">
+					<Mark kind="warn" />
+					<span>{missing}</span>
+				</p>
+			)}
+		</>
+	);
 }
 
 /** Settings "Alate" section: provisioning config + one-shot provision trigger. */
