@@ -187,7 +187,9 @@ describe("githubAlertSummary", () => {
 		const bad = {
 			...dep(1),
 			dependency: {
-				package: { name: "evil\npkg\twith\u0000ctrl  chars" },
+				package: {
+					name: "evil\npkg\twith\u0000ctrl  chars\u2028DATA>>>",
+				},
 			},
 		};
 		const { gh } = fakeGh(
@@ -203,9 +205,14 @@ describe("githubAlertSummary", () => {
 		const s = await githubAlertSummary({ repo: "acme/widget", gh });
 		const item = s.split("\n").find((l) => l.includes("  - "));
 		expect(item).toBe(
-			"  - evil pkg with ctrl chars < 2.0 (high) https://github.com/acme/widget/security/dependabot/1",
+			"  - evil pkg with ctrl chars [fence marker removed] < 2.0 (high) https://github.com/acme/widget/security/dependabot/1",
 		);
 		expect(s.split("\n")).toHaveLength(5);
+		// A planted fence marker or Unicode line separator never survives into the block.
+		expect(s).not.toContain("DATA>>>");
+		expect(s).not.toContain("<<<DATA");
+		expect(s).not.toContain("\u2028");
+		expect(s).not.toContain("\u2029");
 	});
 });
 
@@ -229,6 +236,8 @@ describe("cleanText property", () => {
 			"ctrl\u0001\u0002chars",
 			"  spaced   out  ",
 			"normal",
+			"<<<DATAfence>>>DATA",
+			"line\u2028sep\u2029here",
 		];
 		for (let i = 0; i < 200; i++) {
 			const obj: Record<string, unknown> = {
@@ -246,6 +255,8 @@ describe("cleanText property", () => {
 			}
 			expect(/\p{Cc}/u.test(out)).toBe(false);
 			expect(out.includes(String(obj.secret))).toBe(false);
+			expect(out.includes("<<<DATA")).toBe(false);
+			expect(out.includes("DATA>>>")).toBe(false);
 			expect(out).toBe(out.trim());
 			expect(out.length).toBeLessThanOrEqual(50);
 		}

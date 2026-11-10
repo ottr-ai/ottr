@@ -18,10 +18,13 @@ const SEVERITY_RANK: Record<string, number> = {
 	low: 3,
 };
 
-/** Control chars, newlines and tabs become single spaces; runs of spaces collapse. */
+/** Control chars, newlines and tabs become single spaces; runs of spaces collapse.
+ * The DATA fence markers and the Unicode line separators die too: untrusted text must
+ * never carry one, or it could end its DATA block early (forkAnalysis.ts clean()). */
 export function cleanText(v: unknown, max = LABEL_MAX): string {
 	const s = String(v ?? "")
-		.replace(/\p{Cc}/gu, " ")
+		.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ")
+		.replace(/<<<DATA|DATA>>>/g, "[fence marker removed]")
 		.replace(/ +/g, " ")
 		.trim();
 	return s.length > max ? s.slice(0, max) : s;
