@@ -22,6 +22,14 @@ ARG RTK_SHA256=9454ad1b9489daa57ab0a9f4ebe2faaf4dc82b8a0f26c9e5135151abd7c9378d
 ARG RIPWIRE_VERSION=0.6.8
 # sha256 of ripwire-${RIPWIRE_VERSION}-linux-x64.tar.gz, the release asset's GitHub digest.
 ARG RIPWIRE_SHA256=aa09e8c43acd2104db91a80f2824a36c314ea4a72fd565cd2e579e043e09b03b
+# gitleaks secret scanner: review gates that name it (e.g. ottr-cloud's AGENTS.md) run
+# `gitleaks git .` on workers. Keep the version and checksum equal to the CI pin in
+# .github/workflows/ci.yml ("Install gitleaks 8.30.1"). A bump changes both places.
+# A wrong pin 404s the download or fails the checksum (fails the build loudly).
+ARG GITLEAKS_VERSION=8.30.1
+# sha256 of gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz, the release asset's GitHub digest
+# (equal to ci.yml's GITLEAKS_SHA256).
+ARG GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
 # GitHub CLI: the board publishes releases and creates repos with it, server-side, with its
 # GitHub token (D6). Host runs 2.103.3. A wrong pin 404s the download (fails the build loudly).
 ARG GH_VERSION=2.103.3
@@ -96,6 +104,14 @@ RUN bun -e "await Bun.write('/tmp/ripwire.tar.gz', await (await fetch('https://g
     && install -m 0755 "/tmp/ripwire-${RIPWIRE_VERSION}-linux-x64/ripwire" /usr/local/bin/ripwire \
     && rm -rf "/tmp/ripwire-${RIPWIRE_VERSION}-linux-x64" /tmp/ripwire.tar.gz \
     && ripwire --version
+
+# gitleaks on PATH (pinned, checksum-verified) so review gates that name it run on workers.
+RUN bun -e "await Bun.write('/tmp/gitleaks.tar.gz', await (await fetch('https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz')).bytes())" \
+    && echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gitleaks.tar.gz -C /tmp \
+    && install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks \
+    && rm -f /tmp/gitleaks.tar.gz /tmp/gitleaks \
+    && gitleaks version
 
 # gh on PATH (pinned, checksum-verified). Workers get no GitHub token (D6), so there it reads
 # public data only.

@@ -1,7 +1,7 @@
 # Workers
 
 Work turns run inside disposable containers built from `Dockerfile.worker`
-omp, bun, node, git, git-lfs, gh, procps (`ps`), curl, rtk, ripwire, Chrome for Testing and
+omp, bun, node, git, git-lfs, gh, procps (`ps`), curl, rtk, ripwire, gitleaks, Chrome for Testing and
 the language servers for omp's `lsp` tool (TypeScript 7's `tsc`, typescript-language-server, pyright)
 are pinned at build time, so a turn's toolchain is a property of the image, not the host.
 Chrome sits at `/opt/google/chrome/chrome`, where the agent layer's chrome-devtools MCP
@@ -316,6 +316,8 @@ build. Each pin's comment names the release asset, where its checksum comes from
 host version it mirrors — a host tool upgrade is the reminder to bump the pin. A wrong
 pin or sha fails the image build loudly. To update ripwire: take the new version's
 `ripwire-<v>-linux-x64.tar.gz` digest from the GitHub release and move both ARGs.
+To update gitleaks: bump the CI pin first (.github/workflows/ci.yml, `Install gitleaks`),
+then move both ARGs to the same version and asset digest.
 
 ## System packages per project
 
