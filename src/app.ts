@@ -10376,6 +10376,10 @@ export function createApp(deps: AppDeps) {
 							hash: f.body.hash,
 							roles: readRoles(f.body.content),
 							fallbacks: readFallbacks(f.body.content),
+							// The data source: `repo` null arms the editor's up-front Save
+							// disable for a folder source, before any failed save says it.
+							repo: f.body.repo,
+							path: f.body.path,
 							// One sign-in, on the board (docs/specs/provider-credentials.md): the
 							// board store's active providers; null when it cannot be read.
 							signIns: (() => {

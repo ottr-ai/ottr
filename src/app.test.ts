@@ -4722,6 +4722,8 @@ extensions:
 			base: string | null;
 			hash: string;
 			roles: Record<string, string>;
+			repo: { name: string; ref: string } | null;
+			path: string | null;
 			signIns: string[] | null;
 			seed: { needed: boolean };
 		};
@@ -4731,6 +4733,9 @@ extensions:
 			["default", "zai/glm-5.3-flash:max"],
 			["slow", "anthropic/claude-opus-5-5:medium"],
 		]);
+		// The source fields the editor's Save disable reads: this fake alate is a repo.
+		expect(b.repo).toEqual({ name: "o/data", ref: "main" });
+		expect(b.path).toBeNull();
 		// The board store pinned by PI_CODING_AGENT_DIR decides the list: none there reads as null.
 		expect(b.signIns).toBeNull();
 		expect(typeof b.seed.needed).toBe("boolean");
@@ -4765,6 +4770,16 @@ extensions:
 			else process.env.PI_CODING_AGENT_DIR = saved;
 			rmSync(agent, { recursive: true, force: true });
 		}
+	});
+
+	test("GET reports a folder source, the Save disable's input", async () => {
+		reset();
+		pathMode = true;
+		const res = await m.call("/api/model-roles");
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as { repo: unknown; path: unknown };
+		expect(b.repo).toBeNull();
+		expect(b.path).toBe("/data");
 	});
 
 	test("an unknown model or level is refused and nothing is committed", async () => {

@@ -124,6 +124,10 @@ export type RolesState = {
 	roles: Record<string, string>;
 	/** retry.fallbackChains in file order: role keys and model-selector keys alike. */
 	fallbacks: Record<string, string[]>;
+	/** Alate's GitHub data source; null when alate serves a data folder or nothing. */
+	repo: { name: string; ref: string } | null;
+	/** The data folder's path when alate serves a folder instead of a repo, else null. */
+	path: string | null;
 	/** The providers with an active sign-in on the board; null when the board cannot read its store. */
 	signIns: string[] | null;
 	/** `roles` and `fallbacks`: the board copy's values, which tell whether the seed holds a save. */

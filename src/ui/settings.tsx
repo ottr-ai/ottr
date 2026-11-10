@@ -4206,12 +4206,20 @@ const rolesStatus = (
 					tone: "ok",
 				};
 
-/** The card hint: where a save lands, with or without a GitHub remote for the data repo. */
-function ModelRolesHint({ state }: { state: RolesState | null }) {
+/** The card hint: where a save lands, or why it cannot on a folder source. */
+function ModelRolesHint({
+	state,
+	folderSource,
+}: {
+	state: RolesState | null;
+	folderSource: boolean;
+}) {
 	return (
 		<>
 			omp runs each role with its model, then with its fallbacks in order.{" "}
-			{state?.base === null ? (
+			{folderSource ? (
+				<>Alate serves the data folder, so the board cannot save roles here.</>
+			) : state?.base === null ? (
 				<>
 					Save writes <code>user/omp/agent/config.yml</code> through Alate's
 					file editor: Alate commits the folder itself when it is a git repo (no
@@ -4559,31 +4567,40 @@ function SeedStepLine({
 	);
 }
 
-/** The section's Save button: accent fill unless read-only, disabled while clean or busy. */
+/** The section's Save button: accent fill unless the source cannot take saves,
+ *  disabled while clean, busy, read-only, or a folder source. */
 function ModelRolesSaveButton({
 	ro,
+	folderSource,
+	folderHintId,
 	save,
 	dirty,
 	locked,
 	onClick,
 }: {
 	ro: { path: string; cause: "plain" | "mount" } | null;
+	folderSource: boolean;
+	folderHintId: string | null;
 	save: BusyState;
 	dirty: boolean;
 	locked: boolean;
 	onClick: () => void;
 }) {
+	const dead = ro !== null || folderSource;
 	return (
 		<div className="alate-def-actions">
 			<button
 				type="button"
-				// Plain button while read-only: the accent fill reads clickable even at
-				// the disabled opacity, and the editor must read locked.
-				className={
-					ro !== null ? undefined : `primary${save.failed ? " failed" : ""}`
-				}
+				// Plain button while the source cannot take saves: the accent fill reads
+				// clickable even at the disabled opacity, and the editor must read locked.
+				className={dead ? undefined : `primary${save.failed ? " failed" : ""}`}
 				onClick={onClick}
-				disabled={!dirty || locked}
+				disabled={!dirty || locked || dead}
+				// The hint paragraph sits next to the button in the reading order; the
+				// description repeats it for a screen reader that lands on the button.
+				aria-describedby={
+					folderSource ? (folderHintId ?? undefined) : undefined
+				}
 			>
 				{save.busy && <span className="spinner" aria-hidden="true" />}
 				Save
@@ -4605,6 +4622,7 @@ function ModelRolesContent({
 	first,
 	missing,
 	ro,
+	folderSource,
 	fields,
 	fallbackFields,
 	addErr,
@@ -4630,6 +4648,8 @@ function ModelRolesContent({
 	first: string | undefined;
 	missing: string[];
 	ro: { path: string; cause: "plain" | "mount" } | null;
+	/** Alate serves a data folder: Save stays off before any edit, with the fix hint. */
+	folderSource: boolean;
 	fields: Record<string, string>;
 	fallbackFields: Record<string, string>;
 	addErr: string | null;
@@ -4694,8 +4714,18 @@ function ModelRolesContent({
 						locked={locked}
 						onAdd={onAdd}
 					/>
+					{folderSource && (
+						<p className="hint" id={`${uid}-folder-save`}>
+							A folder data source cannot take saves from the board. Edit{" "}
+							<code>user/omp/agent/config.yml</code> in the data folder, then
+							run "Import now" and "Provision now" in Alate, and reload the
+							settings.
+						</p>
+					)}
 					<ModelRolesSaveButton
 						ro={ro}
+						folderSource={folderSource}
+						folderHintId={`${uid}-folder-save`}
 						save={save}
 						dirty={dirty}
 						locked={locked}
@@ -4834,6 +4864,9 @@ export function ModelRolesSection() {
 	const first = models[0]?.selector;
 	// Every editor disables while a save runs or the source is read-only.
 	const locked = save.busy || ro !== null;
+	// Alate serves a data folder: a save takes alate's editor PUT and fails on a
+	// read-only mount or an unversioned folder, so Save stays off before any edit.
+	const folderSource = state !== null && state.repo === null;
 	const dirty =
 		state !== null &&
 		(rolesDirty(rows, state.roles) ||
@@ -4990,7 +5023,7 @@ export function ModelRolesSection() {
 			className="model-roles"
 			title="Model roles"
 			status={rolesStatus(loadErr, state)}
-			hint={<ModelRolesHint state={state} />}
+			hint={<ModelRolesHint state={state} folderSource={folderSource} />}
 		>
 			<ModelRolesContent
 				loadErr={loadErr}
@@ -5003,6 +5036,7 @@ export function ModelRolesSection() {
 				first={first}
 				missing={missing}
 				ro={ro}
+				folderSource={folderSource}
 				fields={fields}
 				fallbackFields={fallbackFields}
 				addErr={addErr}

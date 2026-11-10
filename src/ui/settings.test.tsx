@@ -2963,88 +2963,88 @@ describe("NotificationsSection", () => {
 	});
 });
 
-describe("ModelRolesSection model picker", () => {
-	/** Mounts the section against `fetchMock`; the cleanup puts fetch and the catalog back. */
-	async function mountRoles(fetchMock: typeof fetch): Promise<{
-		container: HTMLDivElement;
-		unmount: () => Promise<void>;
-	}> {
-		const realFetch = globalThis.fetch;
-		globalThis.fetch = fetchMock;
-		const container = window.document.createElement(
-			"div",
-		) as unknown as HTMLDivElement;
-		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(<ModelRolesSection />);
-		});
-		return {
-			container,
-			unmount: async () => {
-				await act(async () => {
-					root.unmount();
-				});
-				container.remove();
-				globalThis.fetch = realFetch;
-				resetCatalogCache();
-			},
-		};
-	}
+/** Mounts the section against `fetchMock`; the cleanup puts fetch and the catalog back. */
+async function mountRoles(fetchMock: typeof fetch): Promise<{
+	container: HTMLDivElement;
+	unmount: () => Promise<void>;
+}> {
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchMock;
+	const container = window.document.createElement(
+		"div",
+	) as unknown as HTMLDivElement;
+	window.document.body.appendChild(container as unknown as HappyNode);
+	const root = createRoot(container);
+	await act(async () => {
+		root.render(<ModelRolesSection />);
+	});
+	return {
+		container,
+		unmount: async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+			resetCatalogCache();
+		},
+	};
+}
 
-	const rolesFetch = (
-		roles: Record<string, string>,
-		fallbacks: Record<string, string[]> = {},
-	): typeof fetch =>
-		(async (input: RequestInfo | URL) => {
-			const ok = (body: unknown): Response =>
-				new Response(JSON.stringify(body), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				});
-			const url = String(input);
-			if (url.endsWith("/api/model-roles"))
-				return ok({
-					base: "abc1234",
-					hash: "h1",
-					roles,
-					fallbacks,
-					signIns: ["zai", "anthropic"],
-					seed: {
-						needed: false,
-						commit: null,
-						roles: null,
-						fallbacks: null,
-						expiresAt: null,
+const rolesFetch = (
+	roles: Record<string, string>,
+	fallbacks: Record<string, string[]> = {},
+): typeof fetch =>
+	(async (input: RequestInfo | URL) => {
+		const ok = (body: unknown): Response =>
+			new Response(JSON.stringify(body), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		const url = String(input);
+		if (url.endsWith("/api/model-roles"))
+			return ok({
+				base: "abc1234",
+				hash: "h1",
+				roles,
+				fallbacks,
+				signIns: ["zai", "anthropic"],
+				seed: {
+					needed: false,
+					commit: null,
+					roles: null,
+					fallbacks: null,
+					expiresAt: null,
+				},
+			});
+		if (url.endsWith("/api/models"))
+			return ok({
+				models: [
+					{
+						id: "anthropic/claude-opus-5-5",
+						selector: "anthropic/claude-opus-5-5",
+						name: "Claude Opus 5.5",
+						contextWindow: null,
 					},
-				});
-			if (url.endsWith("/api/models"))
-				return ok({
-					models: [
-						{
-							id: "anthropic/claude-opus-5-5",
-							selector: "anthropic/claude-opus-5-5",
-							name: "Claude Opus 5.5",
-							contextWindow: null,
-						},
-						{
-							id: "zai/glm-5.3-flash",
-							selector: "zai/glm-5.3-flash",
-							name: "GLM 5.3 Flash",
-							contextWindow: null,
-						},
-						{
-							id: "openai/gpt-5",
-							selector: "openai/gpt-5",
-							name: "GPT 5",
-							contextWindow: null,
-						},
-					],
-					roles: {},
-				});
-			throw new Error(`unexpected fetch ${url}`);
-		}) as typeof fetch;
+					{
+						id: "zai/glm-5.3-flash",
+						selector: "zai/glm-5.3-flash",
+						name: "GLM 5.3 Flash",
+						contextWindow: null,
+					},
+					{
+						id: "openai/gpt-5",
+						selector: "openai/gpt-5",
+						name: "GPT 5",
+						contextWindow: null,
+					},
+				],
+				roles: {},
+			});
+		throw new Error(`unexpected fetch ${url}`);
+	}) as typeof fetch;
 
+describe("ModelRolesSection model picker", () => {
 	test("typing narrows the picker list; picking a model arms Save", async () => {
 		resetCatalogCache();
 		const { container, unmount } = await mountRoles(
@@ -3287,6 +3287,144 @@ describe("ModelRolesSection model picker", () => {
 			await settle();
 			expect(posts.length).toBe(2);
 			expect(posts[1]!.fallbacks).toEqual({});
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("ModelRolesSection save source", () => {
+	/** The picker fixture's GET with alate's data-source fields merged in, and an
+	 *  optional POST /api/model-roles answer. */
+	const sourceFetch = (
+		source: { repo: unknown; path: unknown },
+		post?: () => Response,
+	): typeof fetch => {
+		const read = rolesFetch({ plan: "zai/glm-5.3-flash" });
+		return (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (init?.method === "POST" && url.endsWith("/api/model-roles")) {
+				if (post === undefined)
+					return new Response(
+						JSON.stringify({ error: "unexpected model roles save" }),
+						{ status: 500, headers: { "Content-Type": "application/json" } },
+					);
+				return post();
+			}
+			if (url.endsWith("/api/alate/provision"))
+				return new Response(JSON.stringify({ ok: true, results: [] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			const res = await read(input, init);
+			if (url.endsWith("/api/model-roles")) {
+				const body = (await res.json()) as Record<string, unknown>;
+				return new Response(JSON.stringify({ ...body, ...source }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			return res;
+		}) as typeof fetch;
+	};
+	/** Adds a fallback entry, the smallest edit that arms Save. */
+	const armDirty = async (container: HTMLDivElement): Promise<void> => {
+		const add = container.querySelector<HTMLButtonElement>(
+			"button.fallback-add",
+		);
+		if (add === null) throw new Error("Add fallback did not render");
+		await act(async () => {
+			onClickOf(add)({});
+		});
+	};
+	const saveButton = (container: HTMLDivElement): HTMLButtonElement => {
+		const save = container.querySelector<HTMLButtonElement>(
+			".alate-def-actions button",
+		);
+		if (save === null) throw new Error("Save button did not render");
+		return save;
+	};
+
+	test("a folder source disables Save before any edit, with the fix hint", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			sourceFetch({ repo: null, path: "/data" }),
+		);
+		try {
+			await act(async () => {});
+			// The edit arms dirty, but the folder source keeps Save off: the save
+			// would take alate's editor PUT and fail on the folder.
+			await armDirty(container);
+			const save = saveButton(container);
+			expect(save.disabled).toBe(true);
+
+			// The hint names the file and the Alate steps next to the dead button,
+			// and the button points at it for screen readers.
+			const hintId = save.getAttribute("aria-describedby");
+			const hint = [...container.querySelectorAll("p")].find(
+				(p) => p.id === hintId,
+			);
+			if (hint === null || hint === undefined)
+				throw new Error("folder hint did not render");
+			expect(hint.tagName).toBe("P");
+			expect(hint.textContent).toContain("user/omp/agent/config.yml");
+			expect(hint.textContent).toContain("Import now");
+			expect(hint.textContent).toContain("Provision now");
+			// The card hint says the same: the save-flow copy contradicts nothing.
+			expect(container.textContent).toContain(
+				"Alate serves the data folder, so the board cannot save roles",
+			);
+			expect(container.textContent).not.toContain(
+				"through Alate's file editor",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a repo source keeps Save working as today", async () => {
+		resetCatalogCache();
+		const NEW = "c".repeat(40);
+		const { container, unmount } = await mountRoles(
+			sourceFetch(
+				{ repo: { name: "o/data", ref: "main" }, path: null },
+				() =>
+					new Response(
+						JSON.stringify({
+							commit: NEW,
+							base: NEW,
+							hash: "h2",
+							roles: { plan: "anthropic/claude-opus-5-5" },
+							fallbacks: { plan: ["openai/gpt-5"] },
+							seed: {
+								needed: false,
+								commit: null,
+								roles: null,
+								fallbacks: null,
+								expiresAt: null,
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					),
+			),
+		);
+		try {
+			await act(async () => {});
+			await armDirty(container);
+			const save = saveButton(container);
+			expect(save.disabled).toBe(false);
+
+			// The save commits and the steps line reports it, like any repo save.
+			await act(async () => {
+				onClickOf(save)({});
+			});
+			for (let i = 0; i < 3; i++)
+				await act(async () => {
+					await Bun.sleep(0);
+				});
+			expect(container.textContent).toContain(
+				`Committed ${NEW.slice(0, 7)} to the data repo.`,
+			);
 		} finally {
 			await unmount();
 		}
