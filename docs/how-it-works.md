@@ -177,3 +177,9 @@ stateDiagram-v2
 - User reply, restart session, grill, promote — `reply`, `restart-session`, `grill`, `backlog` under `POST /api/projects/<project>/tasks/<id>/` in `src/app.ts`
 - Auto-tend, `hygienePass`, `reclassifyPass` — `src/supervisor.ts`
 - `needs_you` shows as the `!` badge on the card — `src/ui/status.ts`
+
+### Restart recovery
+
+`server.ts` runs `recoverRestarted` once at boot (`src/turn.ts`). The sweep settles each open turn row whose run died with the old process and requeues the card through `settleLostTurn`.
+
+One card skips the requeue. A tracker death can land between the server merge push and the settle write: the push already put the merge on origin, the SQLite write never ran, and the card stays `merging` and `running`. The sweep proves the landing the same way the settle's integration proof does: the card branch's head is an ancestor of the pushed target's remote-tracking ref (`finishPushedMergeAtBoot`, `src/turn.ts`). When the proof holds, the card finishes integrated with the settle's writes — the row outcome, `done` and `idle`, the push-sha pin, and the worktree removal. The repair never pushes, and a merge that never pushed fails the proof and keeps the normal requeue. A second sweep pass skips the card at the `running`/`preparing` filter.

@@ -2051,6 +2051,90 @@ export function createTurnLoop(
 		return false;
 	}
 
+	/** True when this sweep pass finished a merge card whose push already landed. The
+	 * crash window between the server merge push and the settle's SQLite writes leaves
+	 * the card at merging/running with its commits already on origin: the requeue below
+	 * would spend a full resume merge turn on work the pushed target holds. The proof
+	 * is the ancestor read the settle's own integration proof uses: the card branch's
+	 * head is contained in the pushed target's remote-tracking ref, which the landed
+	 * push itself recorded (worktree.ts recordLandedPush). A merge that never pushed
+	 * fails the proof and keeps the requeue. The writes mirror the integrated settle:
+	 * the row outcome, the done/idle state, the push-sha pin (same local-tip-equals-
+	 * pushed-tip condition as the CI-watch pin), and the worktree removal. Idempotent:
+	 * the pass writes done/idle, so a second pass skips the card at the state filter.
+	 * Never pushes. */
+	async function finishPushedMergeAtBoot(
+		e: TurnProject,
+		t: ListedTask,
+		turn: Turn | undefined,
+	): Promise<boolean> {
+		if (t.stage !== "merging" || t.cancelledAt !== null) return false;
+		// A worker run's push state is not provable from the main checkout's refs.
+		if (!t.branch || !t.worktree || turn === undefined || turn.pid === null)
+			return false;
+		const settings = e.store.getSettings();
+		const resolved = await ops
+			.resolveTarget(e.path, false, settings.originUrl, settings.targetBranch)
+			.catch(() => null);
+		const target = resolved?.target ?? null;
+		if (target === null || !target.startsWith("origin/")) return false;
+		const short = target.slice("origin/".length);
+		const pushedRef = `refs/remotes/origin/${short}`;
+		const branchTip = await ops
+			.targetSha(e.path, `refs/heads/${t.branch}`)
+			.catch(() => null);
+		const pushedTip = await ops.targetSha(e.path, pushedRef).catch(() => null);
+		if (
+			branchTip === null ||
+			pushedTip === null ||
+			!(await ops
+				.targetContains(e.path, branchTip, pushedRef)
+				.catch(() => false))
+		)
+			return false;
+		const store = e.store;
+		appendLog(
+			store,
+			t.id,
+			`- ${target} already holds ${t.branch} on origin: the merge push landed before the restart; finishing the card integrated`,
+		);
+		if (turn.endedAt === null)
+			store.finishTurn(turn.id, {
+				endedAt: Date.now(),
+				exitCode: null,
+				outcome: "integrated",
+				error: null,
+			});
+		const localTargetTip = await ops
+			.targetSha(e.path, `refs/heads/${short}`)
+			.catch(() => null);
+		store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+			...(localTargetTip !== null && localTargetTip === pushedTip
+				? { pushSha: pushedTip }
+				: {}),
+		});
+		// Same done cleanup as the settle's stampDoneCard: capture what the run left
+		// uncommitted, then remove the worktree and its branch (best effort there too).
+		store.updateTask(t.id, {
+			uncommittedFiles: await ops.statusFiles(t.worktree).catch(() => []),
+		});
+		try {
+			await ops.removeWorktree({
+				mainPath: e.path,
+				worktreePath: t.worktree,
+				branch: t.branch,
+				log: (line) => appendLog(store, t.id, line),
+			});
+			appendLog(store, t.id, "- worktree removed");
+		} catch (err) {
+			appendLog(store, t.id, `! removeWorktree: ${errmsg(err)}`);
+		}
+		return true;
+	}
+
 	/** One card of the boot restart sweep: settle the open row of a card whose run died with
 	 * the tracker and requeue it through the resume route. */
 	async function restartSweepTask(
@@ -2080,6 +2164,14 @@ export function createTurnLoop(
 			return;
 		}
 		if (await rebindDetachedRestart(e, t, turn)) return;
+		// A merge card the crash window left unrecorded (the push landed after the
+		// tracker died, the settle write never ran) finishes integrated here instead
+		// of spending a resume turn on commits origin already holds.
+		try {
+			if (await finishPushedMergeAtBoot(e, t, turn)) return;
+		} catch (err) {
+			logStoreError(e.store.name, err);
+		}
 		// null turnId: the crash landed before store.startTurn created the row (git/apt
 		// preparation), or the last row is already settled — requeue without finishing a row.
 		try {

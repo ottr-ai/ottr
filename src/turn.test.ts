@@ -94,8 +94,11 @@ import {
 	isClean as gitIsClean,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	checkoutState as realCheckoutState,
+	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
+	serverMergePush as realServerMergePush,
 	statusFiles as realStatusFiles,
+	targetContains as realTargetContains,
 	trackedFiles as realTrackedFiles,
 	unsavedWork as realUnsavedWork,
 	worktreeHusk as realWorktreeHusk,
@@ -8249,6 +8252,144 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		const turn = store.listTurns(task.id)[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
+	});
+
+	test("recoverRestarted finishes a merge card whose push already landed on origin", async () => {
+		// The merge-turn crash window, with real git and a real store: the server push
+		// lands the merge on origin (the real serverMergePush against a bare origin),
+		// then the settle flow stops before any SQLite write (the injected fault
+		// suspends the first post-push tree read; no process is signalled). The boot
+		// sweep on a reopened store must finish the card integrated with the settle's
+		// writes, not requeue a merge the pushed target already holds.
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const store = freshStore();
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
+		run(dir, "remote", "add", "origin", origin);
+		// origin/main sits at the seed; the tracking ref the push later moves is exact.
+		run(dir, "push", "-q", "origin", "main:main");
+		const task = store.createTask("merge please");
+		store.setSettings({ originUrl: origin });
+		// The card's worktree holds the card branch one commit past the seed.
+		const wt = join(dir, "wt-card");
+		run(dir, "branch", "ott/m");
+		run(dir, "worktree", "add", "-q", wt, "ott/m");
+		run(wt, "commit", "-q", "--allow-empty", "-m", "the card's work");
+		// The merge the merge agent performed in the main checkout before the push.
+		run(dir, "checkout", "-q", "main");
+		run(dir, "merge", "-q", "--ff-only", "ott/m");
+		store.updateTask(task.id, {
+			stage: "merging",
+			worktree: wt,
+			branch: "ott/m",
+		});
+
+		// The merge turn runs until the push lands; the fault then suspends the flow
+		// at the first post-push tree read, so the settle never writes.
+		const reached = Promise.withResolvers<void>();
+		let pushed = false;
+		const record = baseRecord();
+		const loop = createTurnLoop(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, {
+				serverMergePush: async (
+					...args: Parameters<TurnOps["serverMergePush"]>
+				) => {
+					const p = await realServerMergePush(...args);
+					if (p.status === "pushed") pushed = true;
+					return p;
+				},
+				isClean: () => {
+					if (!pushed) return Promise.resolve(true);
+					reached.resolve();
+					return new Promise<boolean>(() => {});
+				},
+			}),
+		);
+		void loop.runTurn(store.name, task.id);
+		await reached.promise;
+
+		// The window: the merge is on origin, the settle write never ran.
+		const pushedTip = run(dir, "rev-parse", "refs/remotes/origin/main");
+		expect(pushedTip).toBe(run(dir, "rev-parse", "refs/heads/main"));
+		const mid = store.getTask(task.id)!;
+		expect(mid.stage).toBe("merging");
+		expect(mid.state).toBe("running");
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect(store.listTurns(task.id)[0]!.outcome).toBeNull();
+
+		// The boot path: the dead tracker's process is gone, so its store handle and
+		// its in-memory settle state are lost with it. Close the suspended store (the
+		// flow never resumes, so nothing writes again) and reopen as the new boot does.
+		store.close();
+		const reopened = ProjectStore.open(store.path);
+		stores.push(reopened);
+		const record2 = baseRecord();
+		const loop2 = createTurnLoop(
+			new Map([
+				[reopened.name, { ...fakeProject(reopened), target: "origin/main" }],
+			]),
+			fakeOps(record2, {
+				pidAlive: () => false,
+				resolveTarget: realResolveTarget,
+				targetSha: async (mainPath: string, ref: string) => {
+					const r = Bun.spawnSync(
+						["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+						{ cwd: mainPath, stdout: "pipe", stderr: "pipe" },
+					);
+					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+				},
+				targetContains: realTargetContains,
+				statusFiles: realStatusFiles,
+				removeWorktree: async (o: Parameters<TurnOps["removeWorktree"]>[0]) => {
+					await realRemoveWorktree(o);
+					record2.removeWorktree.push(o);
+				},
+			}),
+		);
+		await loop2.recoverRestarted();
+
+		const after = reopened.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBe(pushedTip);
+		expect(after.pendingPrompt ?? null).toBeNull();
+		const turn = reopened.listTurns(task.id)[0]!;
+		expect(turn.endedAt).not.toBeNull();
+		expect(turn.outcome).toBe("integrated");
+		// The done write removed the worktree, like the settle's own done write.
+		expect(existsSync(wt)).toBe(false);
+		expect(record2.removeWorktree).toHaveLength(1);
+		// No second push: origin still holds exactly the tip the first push carried.
+		expect(run(origin, "rev-parse", "main")).toBe(pushedTip);
+		expect(logText(reopened, task.id)).toContain(
+			"the merge push landed before the restart",
+		);
+
+		// A second boot recovery run on the same store changes nothing.
+		const taskSnap = JSON.stringify(reopened.getTask(task.id));
+		const turnsSnap = JSON.stringify(reopened.listTurns(task.id));
+		const logSnap = logText(reopened, task.id);
+		await loop2.recoverRestarted();
+		expect(JSON.stringify(reopened.getTask(task.id))).toBe(taskSnap);
+		expect(JSON.stringify(reopened.listTurns(task.id))).toBe(turnsSnap);
+		expect(logText(reopened, task.id)).toBe(logSnap);
 	});
 
 	test("the demo switch keeps seeded cards through both sweeps and starts no queued card", async () => {
