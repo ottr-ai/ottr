@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
 	ARCH_REVIEW_MARKER,
 	deepenPrompt,
@@ -28,6 +29,7 @@ import {
 	workCheckSendBack,
 	workPrompt,
 } from "./prompts.ts";
+import { REQUIRED_SKILLS } from "./requiredSkills.ts";
 
 describe("no-destruction rule", () => {
 	test("every worker prompt carries it", () => {
@@ -974,5 +976,45 @@ describe("deepen prompt contract", () => {
 		);
 		expect(work).toContain("do not guess and do not change any file");
 		expect(work).toContain("end the turn with needs_you");
+	});
+});
+
+describe("prompt skill-name coverage", () => {
+	test("every skill name the prompts use is listed in REQUIRED_SKILLS", () => {
+		const text = [
+			readFileSync(new URL("./prompts.ts", import.meta.url), "utf8"),
+			readFileSync(new URL("./ui/app.tsx", import.meta.url), "utf8"),
+		].join("\n");
+		const found = new Set<string>();
+		const captures = (re: RegExp): string[] =>
+			[...text.matchAll(re)].flatMap((m) =>
+				m.slice(1).filter((v): v is string => v !== undefined),
+			);
+		for (const n of captures(/\bthe\s+([a-z][a-z0-9-]+)\s+skill\b/gi))
+			found.add(n);
+		for (const n of captures(/\bskill:\/\/([a-z0-9-]+)/g)) found.add(n);
+		for (const n of captures(
+			/\b([a-z][a-z0-9-]+)\s+and\s+([a-z][a-z0-9-]+)\s+lenses\b/gi,
+		))
+			found.add(n);
+		for (const n of captures(/rule:\/\/([a-z0-9-]+)/g))
+			found.add(n.replace(/-+\*?$/, ""));
+		const listed = new Set(REQUIRED_SKILLS.map((s) => s.name));
+		const unlisted = [...found].filter((n) => !listed.has(n));
+		expect(
+			unlisted,
+			`prompts name skills that REQUIRED_SKILLS does not list: ${unlisted.join(", ")}`,
+		).toEqual([]);
+		expect([...found].sort()).toEqual([
+			"check-ottr-board",
+			"codebase-design",
+			"codeguard",
+			"diff-security-review",
+			"explain-project",
+			"ponytail-audit",
+			"retro",
+			"security-audit",
+			"ui-ux-check",
+		]);
 	});
 });
