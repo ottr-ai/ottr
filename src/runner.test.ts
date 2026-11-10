@@ -20,6 +20,7 @@ import { basename, dirname, join } from "node:path";
 import type { IdentProbeEnv } from "./gitIdentity.ts";
 import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
+import { pluginSkillsOverlayPath } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import type { EventState, RunLauncher } from "./runner.ts";
 import {
@@ -2709,7 +2710,9 @@ describe("startRun", () => {
 			expect(seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 1]).toBe(
 				"--config",
 			);
-			expect(overlay).toBe(join(dataDir, "omp-plugin-skills.yml"));
+			expect(overlay).toBe(
+				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, home),
+			);
 			expect(readFileSync(overlay, "utf8")).toBe(
 				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(join(pkgDir, "skills"))}\n`,
 			);
@@ -2723,7 +2726,9 @@ describe("startRun", () => {
 			seen.length = 0;
 			await startRun({ ...base, pluginSkillsHome: empty }).done;
 			const pinsOverlay = seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
-			expect(pinsOverlay).toBe(join(dataDir, "omp-plugin-skills.yml"));
+			expect(pinsOverlay).toBe(
+				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
+			);
 			expect(readFileSync(pinsOverlay, "utf8")).toBe(
 				"skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n",
 			);
@@ -2734,7 +2739,7 @@ describe("startRun", () => {
 			]);
 			expect(seen[0]!.filter((a) => a.endsWith(".yml"))).toEqual([
 				NO_DISCOVERY_CONFIG,
-				join(dataDir, "omp-plugin-skills.yml"),
+				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
 				join(dataDir, "omp-memory.yml"),
 			]);
 		} finally {

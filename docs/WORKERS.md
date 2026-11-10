@@ -1198,9 +1198,12 @@ plugins, so their skills went dark with it — and a worker-planted
 (`src/pluginSkills.ts`, docs/specs/turn-home-plugin-skills.md) that pins the three
 project-level skill enables off and lists the run home's enabled plugins' skill
 directories as `skills.customDirectories`: omp reads those `SKILL.md` files as prompt
-content and still runs no plugin code. The run home is the pinned agent layer or the
-flat home, never the board home, so the board's privileged turns keep their R5-1
-isolation.
+content and still runs no plugin code. The run home is the run's pinned agent layer or
+its flat home: the board home (or its layer) for the board's own runs, the shared home
+(or its layer) for worker and VM runs. The overlay file name carries the home path's
+sha256, so the homes share the data dir but never the file — every run reads and
+converges only its own home's list (the ensure step runs before the spawn, the same
+guard as the memory overlay).
 
 ### The data boundary
 

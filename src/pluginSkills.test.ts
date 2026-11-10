@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
 	ensurePluginSkillsOverlay,
 	pluginSkillDirs,
+	pluginSkillsOverlayPath,
 	pluginSkillsOverlayYaml,
 } from "./pluginSkills.ts";
 
@@ -144,7 +145,7 @@ describe("ensurePluginSkillsOverlay", () => {
 		mkdirSync(home, { recursive: true });
 		try {
 			const path = ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, home);
-			expect(path).toBe(join(dir, "omp-plugin-skills.yml"));
+			expect(path).toBe(pluginSkillsOverlayPath({ OTTR_DATA_DIR: dir }, home));
 			expect(readFileSync(path!, "utf8")).toBe(
 				"skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n",
 			);
@@ -165,7 +166,7 @@ describe("ensurePluginSkillsOverlay", () => {
 				cool: { version: "1", enabledFeatures: null, enabled: true },
 			});
 			const path = ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, home)!;
-			expect(path).toBe(join(dir, "omp-plugin-skills.yml"));
+			expect(path).toBe(pluginSkillsOverlayPath({ OTTR_DATA_DIR: dir }, home));
 			expect(readFileSync(path, "utf8")).toBe(
 				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(join(pkgDir, "skills"))}\n`,
 			);
@@ -177,6 +178,44 @@ describe("ensurePluginSkillsOverlay", () => {
 			expect(readFileSync(path, "utf8")).toBe(
 				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(join(pkgDir, "skills"))}\n`,
 			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("two homes write two files; neither clobbers the other", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-two-"));
+		try {
+			const boardHome = join(dir, "board-home");
+			const sharedHome = join(dir, "shared-home");
+			const homes: [string, string][] = [
+				[boardHome, "pony"],
+				[sharedHome, "cool"],
+			];
+			for (const [home, plugin] of homes) {
+				const pkgDir = writePlugin(home, plugin, {
+					pi: { skills: ["./skills"] },
+				});
+				mkdirSync(join(pkgDir, "skills"), { recursive: true });
+				writeLock(home, {
+					[plugin]: { version: "1", enabledFeatures: null, enabled: true },
+				});
+			}
+			const boardFile = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dir },
+				boardHome,
+			)!;
+			const sharedFile = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dir },
+				sharedHome,
+			)!;
+			// A board-side run and a worker run share the data dir, not the file.
+			expect(boardFile).not.toBe(sharedFile);
+			expect(readFileSync(boardFile, "utf8")).toContain("pony");
+			expect(readFileSync(boardFile, "utf8")).not.toContain("cool");
+			ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, sharedHome);
+			expect(readFileSync(boardFile, "utf8")).toContain("pony");
+			expect(readFileSync(sharedFile, "utf8")).not.toContain("pony");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -215,7 +254,10 @@ describe("ensurePluginSkillsOverlay", () => {
 			});
 			const target = join(dir, "target.yml");
 			writeFileSync(target, "keep me\n");
-			symlinkSync(target, join(dir, "omp-plugin-skills.yml"));
+			symlinkSync(
+				target,
+				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dir }, home),
+			);
 			expect(() =>
 				ensurePluginSkillsOverlay({ OTTR_DATA_DIR: dir }, home),
 			).toThrow(/refusing/);

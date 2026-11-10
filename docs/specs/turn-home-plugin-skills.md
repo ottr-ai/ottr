@@ -93,16 +93,27 @@ error, same contract as `tools.ts readUserLayer`):
 
 Both homes carry the lock: the flat shared home (`/root/.omp/plugins`) and every agent
 layer (the layer allowlist holds `.omp/plugins`, docs/specs/agent-layer-switch.md). The
-board home (`OTTR_BOARD_OMP_HOME`) carries none today, so board-side runs get an empty
-`customDirectories` — the pins-only overlay still rides, and no shared-home read
-happens, so R5-1 isolation stays unchanged.
+board home (`OTTR_BOARD_OMP_HOME`, compose `/etc/ottr/home`) carries its own plugins
+too: the board seed provisions it with the same allowlist, and the merge review's
+second-model check found its lock enabling five plugins with the ponytail skills
+installed (2026-11-10; this shell runs in a worker container, which mounts no
+board-config volume, so the finding is recorded from that check plus the seed
+contract, not read here directly). Every run therefore enumerates its own home:
+board-side runs (merge, retro, board check, the check runs) read the board home or its
+current layer, worker and VM runs read the shared home or theirs. Each run reads only
+its own home's lock — no cross-home read.
 
 ### Overlay write
 
 `ensurePluginSkillsOverlay(env, home)` mirrors `ensureMemoryOverlay` (`src/memory.ts`):
 
-- Path: `<overlayDirFor(env)>/omp-plugin-skills.yml` (`OTTR_DATA_DIR`, else
-  `tmpdir()/ottr-omp-memory`, dir 0700).
+- Path: `<overlayDirFor(env)>/omp-plugin-skills-<sha256(home).slice(0, 16)>.yml`
+  (`OTTR_DATA_DIR`, else `tmpdir()/ottr-omp-memory`, dir 0700). One file per home: a
+  board-side run and a worker run share the data dir but never share a file, so the
+  two homes cannot overwrite each other's directory list, and a pinned run keeps its
+  own home's content for its whole life. Stale files of retired layers stay behind
+  (each under 400 bytes, written only on content change) — accepted, the data dir
+  already holds per-project trees.
 - Content (`pluginSkillsOverlayYaml`) — the three project pins ride on every run, the
   plugin directories only when the home has them:
 
@@ -121,12 +132,17 @@ happens, so R5-1 isolation stays unchanged.
   follow: the data dir is worker-writable, R5-1).
 - Every run carries the overlay: a home with no plugin skills gets the pins-only
   file, so the worktree stays inert even there.
+- The data dir is worker-writable, so a worker could plant a file at the computed
+  name. The ensure step runs in the spawning process before the spawn: a planted file
+  converges back to the freshly computed content before omp reads it, and the plant
+  window is the milliseconds between write and read. This is the same accepted
+  residual as the memory overlay (`omp-memory.yml`, same dir, same convergence).
 
-The overlay file lives in the data dir, which the server, the workers and the VM copy
+The overlay files live in the data dir, which the server, the workers and the VM copy
 mount at the same absolute path, so the argv path resolves in every container
 (docs/WORKERS.md, "Server: `OTTR_DATA_DIR=/data` …"). Content is deterministic per
-home, so concurrent runs sharing the file write identical bytes; `writeBelow` gives the
-atomicity.
+home, so concurrent runs of the same home write identical bytes; different homes write
+different files; `writeBelow` gives the atomicity.
 
 ### Spawn wiring (`src/runner.ts`)
 
@@ -172,7 +188,9 @@ change removes the cause (the skill never loaded); the reporting duty stays as i
 
 - No plugin code loads: no `--plugin-dir`, no extension entry points, no LSP, no MCP.
 - No change to `--no-extensions`, `--no-lsp` or the no-discovery overlay.
-- No change to the board home's R5-1 isolation; no shared-home read from board-side runs.
+- No change to either home's R5-1 isolation: each run reads only its own home's plugin
+  lock (board-side runs the board home or its layer, worker and VM runs the shared home
+  or theirs), and the overlay converges before the spawn reads it.
 - No prompt wording change in `reviewBody`; the gap note stays.
 - No UI change; Settings → Alate already lists the plugins.
 
@@ -184,6 +202,8 @@ change removes the cause (the skill never loaded); the reporting duty stays as i
   worktree `.omp` or `.agents` path appears nowhere in argv or overlay.
 - A fixture home without plugins yields the pins-only overlay (no
   `customDirectories` key).
+- Two homes sharing the data dir write two distinct overlay files, each listing only
+  its own home's directories; neither write changes the other's bytes.
 - On the stack, a run with the shipped argv reads `skill://ponytail-audit`, and
   planted `.omp/agent/skills` and `.agents/skills` skills in the run's cwd both stay
   unloaded (command and output in the card report).

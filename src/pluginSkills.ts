@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { readBelow, writeBelow } from "./confine.ts";
@@ -93,15 +94,24 @@ export function pluginSkillsOverlayYaml(dirs: readonly string[]): string {
 	return [...lines, ""].join("\n");
 }
 
+/** One file per home, named by the home path's sha256: a board-side run (board home)
+ * and a worker run (shared home or its layer) share the data dir but never share a
+ * file, so the two homes cannot overwrite each other's directory list and a pinned run
+ * keeps its own home's content for its whole life
+ * (docs/specs/turn-home-plugin-skills.md). */
 export function pluginSkillsOverlayPath(
 	env: Record<string, string | undefined>,
+	home: string,
 ): string {
-	return join(overlayDirFor(env), "omp-plugin-skills.yml");
+	const hash = createHash("sha256").update(home).digest("hex").slice(0, 16);
+	return join(overlayDirFor(env), `omp-plugin-skills-${hash}.yml`);
 }
 
 /** Writes the overlay only when its content differs. The project-skill pins ride on
  * every run, plugin skills or none, so the worktree stays inert even when the home
- * carries no plugins. A write failure fails the run loudly, like the memory overlay. */
+ * carries no plugins. The data dir is worker-writable, so a planted file converges
+ * back to the computed content here, before the spawn reads it — the same accepted
+ * residual as the memory overlay. A write failure fails the run loudly. */
 export function ensurePluginSkillsOverlay(
 	env: Record<string, string | undefined>,
 	home: string,
@@ -110,7 +120,7 @@ export function ensurePluginSkillsOverlay(
 	const anchor = overlayDirFor(env);
 	// The tmp fallback dir is the board's own (0700); the data dir is a mount point.
 	if (!env.OTTR_DATA_DIR) mkdirSync(anchor, { recursive: true, mode: 0o700 });
-	const path = pluginSkillsOverlayPath(env);
+	const path = pluginSkillsOverlayPath(env, home);
 	const content = pluginSkillsOverlayYaml(dirs);
 	try {
 		const cur = readBelow(anchor, path, 65536);
