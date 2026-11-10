@@ -444,6 +444,40 @@ describe("JiraImportDialog", () => {
 		}
 	});
 
+	test("the import result stays shown when the refresh after it matches nothing", async () => {
+		let imported = false;
+		const { container, unmount } = await dialog(({ url }) => {
+			if (url === IMPORT) {
+				imported = true;
+				return json(200, {
+					filed: [],
+					skipped: [],
+					unavailable: ["PROJ-1", "PROJ-2"],
+				});
+			}
+			// Both tickets vanished from Jira: the refresh after the import is empty.
+			return json(200, {
+				rows: imported ? [] : [row("PROJ-1"), row("PROJ-2")],
+				next: null,
+				total: imported ? 0 : 2,
+			});
+		});
+		try {
+			await submit(q(container, "form.jira-search"));
+			await fire(q(container, ".jira-all input"), "onChange");
+			await fire(importButton(container), "onClick");
+			expect(imported).toBe(true);
+			expect(status(container)).toBe(
+				"Filed 0 cards. 2 not available in Jira (deleted or no access): PROJ-1, PROJ-2",
+			);
+			// A new search clears the import result, and an empty result says so again.
+			await submit(q(container, "form.jira-search"));
+			expect(status(container)).toBe("No tickets match.");
+		} finally {
+			await unmount();
+		}
+	});
+
 	test("Backlog is the default stage", async () => {
 		const { container, unmount } = await dialog(() =>
 			json(200, { rows: [], next: null, total: 0 }),

@@ -176,9 +176,9 @@ export function JiraImportDialog({
 				? "Loading more tickets…"
 				: busy === "import"
 					? "Importing…"
-					: rows !== null && rows.length === 0
-						? "No tickets match."
-						: (note ?? "");
+					: // The import result wins: the refresh after an import can match nothing.
+						(note ??
+						(rows !== null && rows.length === 0 ? "No tickets match." : ""));
 
 	return (
 		<Modal
