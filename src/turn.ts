@@ -177,7 +177,7 @@ import type {
 	worktreeLinked,
 } from "./worktree.ts";
 import {
-	type commitMeta,
+	commitMeta,
 	commitSubjects,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	parseKeptChoices,
@@ -540,35 +540,11 @@ const GUARD_NOTICE_TTL_MS = 24 * 60 * 60_000;
 /** OTTR-763: most bell notices the guard keeps; a burst of ambiguous changes cannot flood the bell. */
 const GUARD_NOTICE_MAX = 20;
 
-/** OTTR-763: commitMeta fallback for test fakes that predate it: the commitSubjects
- * stubs answer `sha subject` lines with no time and no file list, so the display stays
- * identical and the time defaults to now (every live turn window holds it). */
-async function fallbackCommitMeta(
-	ops: TurnOps,
-	path: string,
-	from: string,
-	head: string,
-): Promise<GuardCommit[]> {
-	const now = Date.now();
-	const lines = await (ops.commitSubjects ?? commitSubjects)(
-		path,
-		from,
-		head,
-	).catch(() => [] as string[]);
-	return lines.map((line) => {
-		const sep = line.indexOf(" ");
-		return {
-			sha: sep === -1 ? line : line.slice(0, sep),
-			subject: sep === -1 ? line : line.slice(sep + 1),
-			time: now,
-			files: [] as string[],
-		};
-	});
-}
-
 /** OTTR-763: the unrecorded new commits between the guard's before head and now, with
  * metadata. Empty when either head is unreadable; a HEAD advance the board recorded
- * never contributes commits: its own machinery made that change. */
+ * never contributes commits: its own machinery made that change. An unwired ops member
+ * resolves to the real reader (the commitSubjects pattern): production always reads
+ * real commit times and file lists, and only tests may stub the member. */
 async function guardNewCommits(
 	ops: TurnOps,
 	other: TurnProject,
@@ -576,11 +552,9 @@ async function guardNewCommits(
 	now: { head: string | null },
 ): Promise<GuardCommit[]> {
 	if (now.head === null || was.head === null) return [];
-	return (
-		ops.commitMeta
-			? ops.commitMeta(other.path, was.head, now.head)
-			: fallbackCommitMeta(ops, other.path, was.head, now.head)
-	).catch(() => [] as GuardCommit[]);
+	return (ops.commitMeta ?? commitMeta)(other.path, was.head, now.head).catch(
+		() => [] as GuardCommit[],
+	);
 }
 
 /** OTTR-708/OTTR-763: the change one other project's checkout shows against its before
@@ -855,7 +829,8 @@ export interface TurnOps {
 	/** OTTR-763: per-commit metadata (sha, subject, committer time, changed files) the
 	 * cross-project checkout guard uses to attribute a change to a turn window and to
 	 * exempt the AGENTS.md sync rule's provisioned-copy commits by their file set.
-	 * Absent in test fakes that predate it: the guard falls back to commitSubjects. */
+	 * Optional like commitSubjects: the guard resolves an absent member to the real
+	 * reader, so production reads real metadata; only tests stub it. */
 	commitMeta?: typeof commitMeta;
 	/** True while an update holds new turns (POST /api/drain): running turns finish, nothing new starts. */
 	drained(): boolean;

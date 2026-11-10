@@ -53,7 +53,7 @@ import {
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
 import { turnEnv } from "./tokens.ts";
-import type { TurnOps, TurnProject } from "./turn.ts";
+import type { TurnLoop, TurnOps, TurnProject } from "./turn.ts";
 import {
 	appendLog,
 	cancelKeptReason,
@@ -90,6 +90,7 @@ import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
 	isClean as gitIsClean,
 	PUSH_LANDED_BEFORE_ATTEMPT,
+	checkoutState as realCheckoutState,
 	resolveTarget as realResolveTarget,
 	statusFiles as realStatusFiles,
 	trackedFiles as realTrackedFiles,
@@ -1419,6 +1420,30 @@ async function flushPromises() {
 	await new Promise((r) => setImmediate(r));
 	await Promise.resolve();
 	await new Promise((r) => setImmediate(r));
+}
+
+/** Polls until the predicate holds, bounded. The concurrent-turn tests drain real
+ * async settle chains whose round count varies (real git reads), so a fixed flush
+ * count would race; this awaits the real condition instead of a guessed duration. */
+async function eventually(cond: () => boolean, ms = 10_000): Promise<void> {
+	const end = Date.now() + ms;
+	while (!cond()) {
+		if (Date.now() > end) throw new Error("eventually: condition never held");
+		await Bun.sleep(2);
+	}
+}
+
+/** Settled read of one card: done/idle, or needs_you with its reason. */
+async function settled(
+	store: ProjectStore,
+	id: string,
+): Promise<{ stage: string; state: string; needsReason: string | null }> {
+	await eventually(() => {
+		const t = store.getTask(id)!;
+		return t.stage === "done" || t.state === "needs_you";
+	});
+	const t = store.getTask(id)!;
+	return { stage: t.stage, state: t.state, needsReason: t.needsReason };
 }
 
 /** startRun override whose run reports integrated: the release-approve path. */
@@ -19809,7 +19834,14 @@ describe("turn checkout guard (other projects)", () => {
 	test("a work turn whose other project gains a commit and a dirty file parks needs_you", async () => {
 		const record = baseRecord();
 		const { store, other, states, loop } = twoProjectCase({
-			commitSubjects: async () => ["abc1234 add widget"],
+			commitMeta: async () => [
+				{
+					sha: "abc1234",
+					subject: "add widget",
+					time: Date.now(),
+					files: ["src/widget.ts"],
+				},
+			],
 			...changingRun(record, () => {
 				states.set(other.path, {
 					head: "abc1234",
@@ -20400,10 +20432,8 @@ describe("turn checkout guard (other projects)", () => {
 			loop.runTurn(store.name, a.id),
 			loop.runTurn(guilty.name, b.id),
 		]);
-		await flushPromises();
-
-		const afterA = store.getTask(a.id)!;
-		const afterB = guilty.getTask(b.id)!;
+		const afterA = await settled(store, a.id);
+		const afterB = await settled(guilty, b.id);
 		expect(afterA.stage).toBe("done");
 		expect(afterA.state).toBe("idle");
 		expect(afterA.needsReason).toBeNull();
@@ -20541,10 +20571,8 @@ describe("turn checkout guard (other projects)", () => {
 			loop.runTurn(store.name, a.id),
 			loop.runTurn(guilty.name, b.id),
 		]);
-		await flushPromises();
-
-		const afterA = store.getTask(a.id)!;
-		const afterB = guilty.getTask(b.id)!;
+		const afterA = await settled(store, a.id);
+		const afterB = await settled(guilty, b.id);
 		expect(afterA.needsReason).toBeNull();
 		expect(afterB.needsReason).toBeNull();
 		const notices = loop.checkoutNotices();
@@ -20552,5 +20580,261 @@ describe("turn checkout guard (other projects)", () => {
 		expect(notices[0]).toContain("changed files stray.txt");
 		expect(notices[0]).toContain(`${store.name}#${a.id}`);
 		expect(notices[0]).toContain(`${guilty.name}#${b.id}`);
+	});
+
+	// The two tests below drive the REAL checkout reads and the REAL commit reader:
+	// ops omits commitMeta, so guardNewCommits resolves to the real commitMeta through
+	// the commitSubjects fallback pattern. They fail whenever the fallback answers
+	// stub-shaped metadata (time = now, files = []), which is how the production wiring
+	// broke before the send-back fix.
+
+	/** A real git repository as the watched checkout; its guard reads are live. The
+	 * first `workRuns` runs (one per project with a card) are the work runs: the last
+	 * of them fires `change` while every work run is still live, and every work run
+	 * finishes only after `change` completed, so each turn window holds the change.
+	 * Later runs are a card's chained merge run and report integrated. */
+	function realSharedRepoCase(
+		record: Recorded,
+		change: () => void | Promise<void>,
+		workRuns = 1,
+	): {
+		store: ProjectStore;
+		guilty: ProjectStore;
+		repo: string;
+		loop: TurnLoop;
+	} {
+		const store = freshStore();
+		const guilty = freshStore();
+		const other = freshStore();
+		const repo = mkdtempSync(join(tmpdir(), "ottr-guard-repo-"));
+		dirs.push(repo);
+		const seenWorkRuns = new Set<string>();
+		let entered = 0;
+		let changed = false;
+		const changeDone = Promise.withResolvers<void>();
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		run(repo, "init", "-q", "-b", "main");
+		const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+		run(repo, ...id, "commit", "-q", "--allow-empty", "-m", "base");
+		const projects = new Map<string, TurnProject>([
+			[store.name, fakeProject(store)],
+			[guilty.name, fakeProject(guilty)],
+			// The watched checkout is the real repository; every read is live.
+			[other.name, { ...fakeProject(other), path: repo }],
+		]);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				checkoutState: (path: string) => realCheckoutState(path),
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess-1");
+					const key = o.board?.project ?? o.cwd;
+					const workRun = !seenWorkRuns.has(key);
+					seenWorkRuns.add(key);
+					const outcome: Outcome = workRun
+						? { status: "answered", summary: "did it" }
+						: { status: "integrated", summary: "landed" };
+					const done = (async () => {
+						if (workRun) {
+							entered += 1;
+							if (entered === workRuns && !changed) {
+								changed = true;
+								await change();
+								changeDone.resolve();
+							} else {
+								await changeDone.promise;
+							}
+						}
+						return runResult({ outcome });
+					})();
+					return {
+						pid: 4242,
+						done,
+						kill: async () => {
+							record.killed = true;
+						},
+					};
+				},
+			}),
+		);
+		return { store, guilty, repo, loop };
+	}
+
+	test("overlapping turns committing in a real watched checkout: no card parks, one notice", async () => {
+		// The ALAT-104/OTTR-748 shape with a real repository and the real commit reader.
+		// Fails whenever the guard's commit metadata goes stub-shaped: with time = now
+		// and no files, the finished committer turn's window never holds the change, so
+		// the innocent card parked needs_you.
+		let sha = "";
+		const record = baseRecord();
+		const { store, guilty, repo, loop } = realSharedRepoCase(
+			record,
+			async () => {
+				const git = (args: string[], env?: Record<string, string>): string => {
+					const r = Bun.spawnSync(["git", ...args], {
+						cwd: repo,
+						stdout: "pipe",
+						stderr: "pipe",
+						env: env === undefined ? process.env : { ...process.env, ...env },
+					});
+					if (r.exitCode !== 0)
+						throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+					return r.stdout.toString().trim();
+				};
+				// Real commit times carry whole-second granularity, and this test runs in
+				// well under a second: commit at a whole-second boundary the wait has
+				// passed, so the parsed committer time sits inside both turn windows.
+				// A genuine wall-clock wait is the point here: the behavior under test is
+				// git's committer-time granularity against the platform clock, which no
+				// fake timer can produce.
+				const at = Math.ceil((Date.now() + 50) / 1000) * 1000;
+				await Bun.sleep(Math.max(at - Date.now(), 1));
+				writeFileSync(join(repo, "src.ts"), "one\n");
+				git(["add", "src.ts"]);
+				git(
+					[
+						"-c",
+						"user.name=t",
+						"-c",
+						"user.email=t@t",
+						"commit",
+						"-q",
+						"-m",
+						"sneak edit",
+					],
+					{ GIT_COMMITTER_DATE: new Date(at).toISOString() },
+				);
+				sha = git(["rev-parse", "--short", "HEAD"]);
+			},
+		);
+		const a = store.createTask("work please");
+		const b = guilty.createTask("work please");
+
+		await Promise.all([
+			loop.runTurn(store.name, a.id),
+			loop.runTurn(guilty.name, b.id),
+		]);
+		const afterA = await settled(store, a.id);
+		const afterB = await settled(guilty, b.id);
+		expect(afterA.needsReason).toBeNull();
+		expect(afterB.needsReason).toBeNull();
+		const notices = loop.checkoutNotices();
+		expect(notices).toHaveLength(1);
+		// The notice names the REAL commit: the short sha git answered and its subject.
+		expect(notices[0]).toContain(`${sha} sneak edit`);
+		expect(notices[0]).toContain(`${store.name}#${a.id}`);
+		expect(notices[0]).toContain(`${guilty.name}#${b.id}`);
+	});
+
+	test("a real provisioned-copy sync commit exempts without an injected commitMeta", async () => {
+		// The AGENTS.md sync shape against a real repository: the commit adds
+		// projects/<this project>/AGENTS.md, the real reader answers its file list, and
+		// the exemption fires. Fails whenever the reader goes stub-shaped (no files),
+		// which parked the syncing card before the send-back fix.
+		const record = baseRecord();
+		const store = freshStore();
+		const other = freshStore();
+		const repo = mkdtempSync(join(tmpdir(), "ottr-guard-sync-"));
+		dirs.push(repo);
+		const git = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		git(repo, "init", "-q", "-b", "main");
+		git(
+			repo,
+			"-c",
+			"user.name=t",
+			"-c",
+			"user.email=t@t",
+			"commit",
+			"-q",
+			"--allow-empty",
+			"-m",
+			"base",
+		);
+		const projects = new Map<string, TurnProject>([
+			[store.name, fakeProject(store)],
+			[other.name, { ...fakeProject(other), path: repo }],
+		]);
+		let committed = false;
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				checkoutState: (path: string) => realCheckoutState(path),
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess-1");
+					// First run: the work run commits the sync; later runs are the card's
+					// chained merge run and report integrated, like the other fakes.
+					const workRun = !committed;
+					committed = true;
+					if (workRun) {
+						mkdirSync(join(repo, "projects", store.name), {
+							recursive: true,
+						});
+						writeFileSync(
+							join(repo, "projects", store.name, "AGENTS.md"),
+							"rules\n",
+						);
+						git(repo, "add", "-A");
+						git(
+							repo,
+							"-c",
+							"user.name=t",
+							"-c",
+							"user.email=t@t",
+							"commit",
+							"-q",
+							"-m",
+							`sync: capture ${store.name} AGENTS.md`,
+						);
+					}
+					return {
+						pid: 4242,
+						done: Promise.resolve(
+							runResult({
+								outcome: workRun
+									? ({
+											status: "answered",
+											summary: "did it",
+										} satisfies Outcome)
+									: ({
+											status: "integrated",
+											summary: "landed",
+										} satisfies Outcome),
+							}),
+						),
+						kill: async () => {
+							record.killed = true;
+						},
+					};
+				},
+			}),
+		);
+		const task = store.createTask("work please");
+
+		await loop.runTurn(store.name, task.id);
+		const after = await settled(store, task.id);
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(loop.checkoutNotices()).toHaveLength(0);
 	});
 });
