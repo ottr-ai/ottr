@@ -41,13 +41,23 @@ export function boardBundle(): Promise<BoardBundle> {
 	return building;
 }
 
-/** One Bun.build output artifact. */
-type BuildOutput = Awaited<ReturnType<typeof Bun.build>>["outputs"][number];
-
-/** One servable output plus its URL-keyed name; throws on a nested path. */
+/** One servable output plus its URL-keyed name. */
 interface BuiltAsset {
 	name: string;
 	asset: BundleAsset;
+}
+
+/** One staged output: the bundler's bytes and name, plus the text outputs'
+ * rewrite in progress. `served` starts at the bundler name and moves to a
+ * content-derived name when the rewrites change the bytes. */
+interface Staged {
+	name: string;
+	served: string;
+	/** Text outputs (html, js, css): the rewritten stage string. Binary: null. */
+	text: string | null;
+	/** The bundler's own bytes, before any rewrite. */
+	raw: Uint8Array<ArrayBuffer>;
+	contentType: string;
 }
 
 /** The URL name of one output: Bun.build emits relative paths ("./chunk-x.js"); a
@@ -77,29 +87,45 @@ function absolutizeAssetRefs(text: string, names: string[]): string {
 	return out;
 }
 
-/** Convert one built output into a servable asset. */
-async function builtAsset(
-	out: BuildOutput,
-	names: string[],
-): Promise<BuiltAsset> {
-	const name = outputName(out.path);
-	const bytes = new Uint8Array(await out.arrayBuffer());
-	// The board serves the HTML at /projects/p/tasks/i and friends, so the built
-	// refs must be absolute before any variant of it is compressed.
-	const identity =
-		name === "index.html"
-			? textEncoder.encode(rewriteBundleHtml(textDecoder.decode(bytes)))
-			: /\.(js|css)$/.test(name)
-				? textEncoder.encode(
-						absolutizeAssetRefs(textDecoder.decode(bytes), names),
-					)
-				: bytes;
-	const compressible = /\.(html|js|css)$/.test(name);
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+/** A content-derived URL name for one output: when the rewrites change an
+ * output's bytes, Bun's pre-rewrite hash in the bundler name no longer
+ * describes the content, and the old copy lives on in `immutable` browser
+ * caches forever. The new name carries the hash of the final bytes (the ETag
+ * hex), so a deploy that changes the bytes changes the URL and stale caches
+ * re-fetch (OTTR-756). */
+function contentName(name: string, bytes: Uint8Array): string {
+	const dot = name.lastIndexOf(".");
+	const hex = Bun.hash(bytes).toString(16).padStart(16, "0");
+	return `${name.slice(0, dot)}-${hex}${name.slice(dot)}`;
+}
+
+/** Refs to one output inside text outputs: the quoted root-absolute forms
+ * rewriteBundleHtml and absolutizeAssetRefs produce, plus css url(). */
+function replaceNameRefs(text: string, from: string, to: string): string {
+	return text
+		.split(`"${from}"`)
+		.join(`"${to}"`)
+		.split(`'${from}'`)
+		.join(`'${to}'`)
+		.split(`(${from})`)
+		.join(`(${to})`);
+}
+
+/** Convert one staged output into a servable asset under its served name. */
+function stagedAsset(s: Staged): BuiltAsset {
+	const identity = s.text === null ? s.raw : textEncoder.encode(s.text);
+	const compressible = /\.(html|js|css)$/.test(s.served);
 	// Variant suffixes stay inside the quotes: an ETag must be one opaque tag.
 	const hex = Bun.hash(identity).toString(16).padStart(16, "0");
 	const asset: BundleAsset = {
-		contentType: out.type ?? "application/octet-stream",
-		cacheControl: name === "index.html" ? NO_CACHE : IMMUTABLE_CACHE,
+		contentType: s.contentType,
+		cacheControl: s.name === "index.html" ? NO_CACHE : IMMUTABLE_CACHE,
 		identity,
 		gzip: compressible ? (gzipSync(identity) as Uint8Array<ArrayBuffer>) : null,
 		br: compressible
@@ -111,7 +137,7 @@ async function builtAsset(
 			br: compressible ? `"${hex}-br"` : null,
 		},
 	};
-	return { name, asset };
+	return { name: s.served, asset };
 }
 
 async function buildBoard(): Promise<BoardBundle> {
@@ -122,10 +148,53 @@ async function buildBoard(): Promise<BoardBundle> {
 	if (!built.success)
 		throw new Error(`ui bundle failed: ${built.logs.map(String).join("; ")}`);
 	const names = built.outputs.map((out) => outputName(out.path));
+	// Stage 1: the bundler's bytes plus the first rewrites. The board serves the
+	// HTML at /projects/p/tasks/i and friends, so all built refs must be
+	// absolute before any variant is compressed.
+	const staged: Staged[] = [];
+	for (const out of built.outputs) {
+		const name = outputName(out.path);
+		const raw = new Uint8Array(await out.arrayBuffer());
+		const text =
+			name === "index.html"
+				? rewriteBundleHtml(textDecoder.decode(raw))
+				: /\.(js|css)$/.test(name)
+					? absolutizeAssetRefs(textDecoder.decode(raw), names)
+					: null;
+		staged.push({
+			name,
+			served: name,
+			text,
+			raw,
+			contentType: out.type ?? "application/octet-stream",
+		});
+	}
+	// Stage 2: an output whose bytes the rewrites changed gets a content-derived
+	// name, and every text output's refs move to it. Names are recomputed until
+	// they match the bytes — a rename changes the referencing outputs' bytes too
+	// — and the rounds bound a pathological rename cascade.
+	for (let round = 0; round < 4; round++) {
+		const renames: [string, string][] = [];
+		for (const s of staged) {
+			// The html serves by route with no-cache, so its bytes never need a name.
+			if (s.text === null || s.name === "index.html") continue;
+			const bytes = textEncoder.encode(s.text);
+			if (bytesEqual(bytes, s.raw)) continue;
+			const renamed = contentName(s.name, bytes);
+			if (renamed !== s.served) renames.push([s.served, renamed]);
+			s.served = renamed;
+		}
+		if (renames.length === 0) break;
+		for (const s of staged) {
+			if (s.text === null) continue;
+			for (const [from, to] of renames)
+				s.text = replaceNameRefs(s.text, `/${from}`, `/${to}`);
+		}
+	}
 	const assets = new Map<string, BundleAsset>();
 	let html: BundleAsset | null = null;
-	for (const out of built.outputs) {
-		const { name, asset } = await builtAsset(out, names);
+	for (const s of staged) {
+		const { name, asset } = stagedAsset(s);
 		if (name === "index.html") {
 			html = asset;
 			continue; // The html serves by route; the fallback map holds hashed outputs only.

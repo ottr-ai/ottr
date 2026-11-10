@@ -21,6 +21,12 @@ the board sent no `Content-Encoding` on any response. Board JS 550,624 B raw /
   root-absolute (a quoted `"./name"` / `'./name'` string or a `url(./name)`
   token becomes `/name`), so the browser resolves it from any nested route
   (OTTR-756).
+- A hashed output whose bytes the rewrites changed is renamed from the hash of
+  its final bytes (`chunk-<bundler hash>-<content hash>.js`), and every text
+  output's refs move to the new name. Bun's own hash covers the pre-rewrite
+  bytes, so serving under it would let a browser that cached the old copy
+  under `immutable` keep the pre-fix refs forever. Outputs whose bytes did not
+  change keep their bundler name.
 - A view-route path that ends in a static asset extension (`.png`, `.svg`,
   `.js`, `.css`, and friends) answers a 404 JSON error instead of the app HTML:
   a wrong asset URL must fail visibly, not return HTML as an image (OTTR-756).

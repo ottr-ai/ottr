@@ -69,6 +69,25 @@ describe("board bundle", () => {
 		}
 	});
 
+	test("a rewritten output's served name is content-derived, so stale immutable caches re-fetch", () => {
+		// The js chunk's bytes changed (the relative logo ref became absolute), so
+		// its served name can no longer be Bun's pre-rewrite hash: a browser that
+		// cached the old chunk under immutable would keep the broken ref forever
+		// (OTTR-756 send-back). The name must carry the hash of the final bytes.
+		const jsPath = assetPath("js");
+		const asset = bundle.assets.get(jsPath)!;
+		const hex = Bun.hash(asset.identity).toString(16).padStart(16, "0");
+		expect(
+			jsPath.endsWith(`-${hex}.js`),
+			`${jsPath} is not content-derived`,
+		).toBe(true);
+	});
+
+	test("the html refs point at the served names of the rewritten outputs", () => {
+		expect(html).toContain(`src="${assetPath("js")}"`);
+		expect(html).toContain(`href="${assetPath("css")}"`);
+	});
+
 	test("assets hold the hashed js, css and binaries; the html serves by route only", () => {
 		expect([...bundle.assets.keys()].some((p) => /chunk-.*\.js$/.test(p))).toBe(
 			true,
