@@ -2055,14 +2055,16 @@ export function createTurnLoop(
 	 * crash window between the server merge push and the settle's SQLite writes leaves
 	 * the card at merging/running with its commits already on origin: the requeue below
 	 * would spend a full resume merge turn on work the pushed target holds. The proof
-	 * is the ancestor read the settle's own integration proof uses: the card branch's
-	 * head is contained in the pushed target's remote-tracking ref, which the landed
-	 * push itself recorded (worktree.ts recordLandedPush). A merge that never pushed
-	 * fails the proof and keeps the requeue. The writes mirror the integrated settle:
-	 * the row outcome, the done/idle state, the push-sha pin (same local-tip-equals-
-	 * pushed-tip condition as the CI-watch pin), and the worktree removal. Idempotent:
-	 * the pass writes done/idle, so a second pass skips the card at the state filter.
-	 * Never pushes. */
+	 * fetches the pinned origin branch first — the tracker can die before the push
+	 * helper's recordLandedPush writes the tracking ref, so the cached ref can lag the
+	 * remote — and then uses the ancestor read the settle's own integration proof uses:
+	 * the card branch's head contained in the pushed target's remote-tracking ref. A
+	 * merge that never pushed fails the proof and keeps the requeue. The writes mirror
+	 * the integrated settle: the row outcome, the done/idle state, the Done metadata
+	 * measureSettleGit stamps (target commit count, merge head), the push-sha pin (same
+	 * local-tip-equals-pushed-tip condition as the CI-watch pin), and the worktree
+	 * removal. Idempotent: the pass writes done/idle, so a second pass skips the card
+	 * at the state filter. Never pushes. */
 	async function finishPushedMergeAtBoot(
 		e: TurnProject,
 		t: ListedTask,
@@ -2080,6 +2082,16 @@ export function createTurnLoop(
 		if (target === null || !target.startsWith("origin/")) return false;
 		const short = target.slice("origin/".length);
 		const pushedRef = `refs/remotes/origin/${short}`;
+		// The proof reads origin itself, never only the cached tracking ref: the tracker
+		// can die in the interval between the push landing on origin and the push
+		// helper's recordLandedPush writing the tracking ref, so the cached ref can lag
+		// the remote. This is the same pinned-URL re-check the push retry runs; a fetch
+		// failure fails closed into the normal requeue.
+		if (settings.originUrl === null) return false;
+		const fetchError = await ops
+			.fetchOriginBranch(e.path, short, settings.originUrl)
+			.catch(() => "fetch failed");
+		if (fetchError !== null) return false;
 		const branchTip = await ops
 			.targetSha(e.path, `refs/heads/${t.branch}`)
 			.catch(() => null);
@@ -2112,6 +2124,10 @@ export function createTurnLoop(
 			stage: "done",
 			state: "idle",
 			needsReason: null,
+			// The Done metadata measureSettleGit stamps: the target commit count and the
+			// target head anchor the release's late-commit attribution to this merge.
+			commits: await ops.targetCommits(e.path, target),
+			mergeHead: await ops.targetSha(e.path, target).catch(() => null),
 			...(localTargetTip !== null && localTargetTip === pushedTip
 				? { pushSha: pushedTip }
 				: {}),

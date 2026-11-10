@@ -94,10 +94,12 @@ import {
 	isClean as gitIsClean,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	checkoutState as realCheckoutState,
+	fetchOriginBranch as realFetchOriginBranch,
 	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
 	serverMergePush as realServerMergePush,
 	statusFiles as realStatusFiles,
+	targetCommits as realTargetCommits,
 	targetContains as realTargetContains,
 	trackedFiles as realTrackedFiles,
 	unsavedWork as realUnsavedWork,
@@ -8254,13 +8256,10 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(turn.error).toBe("tracker restarted");
 	});
 
-	test("recoverRestarted finishes a merge card whose push already landed on origin", async () => {
-		// The merge-turn crash window, with real git and a real store: the server push
-		// lands the merge on origin (the real serverMergePush against a bare origin),
-		// then the settle flow stops before any SQLite write (the injected fault
-		// suspends the first post-push tree read; no process is signalled). The boot
-		// sweep on a reopened store must finish the card integrated with the settle's
-		// writes, not requeue a merge the pushed target already holds.
+	/** The merge-turn crash-window fixture: real bare origin, a real main checkout
+	 * whose target holds the merge, the card's real worktree, and a merging card with
+	 * branch and worktree stored. Returns the paths the window assertions read. */
+	function mergeCrashFixture() {
 		const run = (cwd: string, ...args: string[]): string => {
 			const r = Bun.spawnSync(["git", ...args], {
 				cwd,
@@ -8283,6 +8282,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		run(dir, "remote", "add", "origin", origin);
 		// origin/main sits at the seed; the tracking ref the push later moves is exact.
 		run(dir, "push", "-q", "origin", "main:main");
+		const seedTip = run(dir, "rev-parse", "refs/remotes/origin/main");
 		const task = store.createTask("merge please");
 		store.setSettings({ originUrl: origin });
 		// The card's worktree holds the card branch one commit past the seed.
@@ -8298,9 +8298,19 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 			worktree: wt,
 			branch: "ott/m",
 		});
+		return { run, store, dir, origin, task, wt, seedTip };
+	}
 
-		// The merge turn runs until the push lands; the fault then suspends the flow
-		// at the first post-push tree read, so the settle never writes.
+	/** Runs the merge turn with the real serverMergePush until the push has landed, then
+	 * suspends the settle at the first post-push tree read — the injected fault, so the
+	 * settle never writes and no process is signalled. onPushed runs after the push
+	 * helper returned "pushed" (a test uses it to rewind the tracking ref and simulate a
+	 * death inside the helper). */
+	function suspendAfterPush(
+		store: ProjectStore,
+		task: { id: string },
+		onPushed?: () => void,
+	): Promise<void> {
 		const reached = Promise.withResolvers<void>();
 		let pushed = false;
 		const record = baseRecord();
@@ -8311,7 +8321,10 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 					...args: Parameters<TurnOps["serverMergePush"]>
 				) => {
 					const p = await realServerMergePush(...args);
-					if (p.status === "pushed") pushed = true;
+					if (p.status === "pushed") {
+						pushed = true;
+						onPushed?.();
+					}
 					return p;
 				},
 				isClean: () => {
@@ -8322,7 +8335,47 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 			}),
 		);
 		void loop.runTurn(store.name, task.id);
-		await reached.promise;
+		return reached.promise;
+	}
+
+	/** The boot-side loop: the reopened store swept with the real git readers (target
+	 * resolution, ref reads, containment, commit count, worktree removal). */
+	function recoveryLoop(store: ProjectStore, overrides: Partial<TurnOps> = {}) {
+		const record = baseRecord();
+		const loop = createTurnLoop(
+			new Map([[store.name, { ...fakeProject(store), target: "origin/main" }]]),
+			fakeOps(record, {
+				pidAlive: () => false,
+				resolveTarget: realResolveTarget,
+				targetSha: async (mainPath: string, ref: string) => {
+					const r = Bun.spawnSync(
+						["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+						{ cwd: mainPath, stdout: "pipe", stderr: "pipe" },
+					);
+					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+				},
+				targetContains: realTargetContains,
+				targetCommits: realTargetCommits,
+				statusFiles: realStatusFiles,
+				removeWorktree: async (o: Parameters<TurnOps["removeWorktree"]>[0]) => {
+					await realRemoveWorktree(o);
+					record.removeWorktree.push(o);
+				},
+				...overrides,
+			}),
+		);
+		return { loop, record };
+	}
+
+	test("recoverRestarted finishes a merge card whose push already landed on origin", async () => {
+		// The merge-turn crash window, with real git and a real store: the server push
+		// lands the merge on origin (the real serverMergePush against a bare origin),
+		// then the settle flow stops before any SQLite write (the injected fault
+		// suspends the first post-push tree read; no process is signalled). The boot
+		// sweep on a reopened store must finish the card integrated with the settle's
+		// writes, not requeue a merge the pushed target already holds.
+		const { run, store, dir, origin, task, wt } = mergeCrashFixture();
+		await suspendAfterPush(store, task);
 
 		// The window: the merge is on origin, the settle write never ran.
 		const pushedTip = run(dir, "rev-parse", "refs/remotes/origin/main");
@@ -8339,29 +8392,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		store.close();
 		const reopened = ProjectStore.open(store.path);
 		stores.push(reopened);
-		const record2 = baseRecord();
-		const loop2 = createTurnLoop(
-			new Map([
-				[reopened.name, { ...fakeProject(reopened), target: "origin/main" }],
-			]),
-			fakeOps(record2, {
-				pidAlive: () => false,
-				resolveTarget: realResolveTarget,
-				targetSha: async (mainPath: string, ref: string) => {
-					const r = Bun.spawnSync(
-						["git", "rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
-						{ cwd: mainPath, stdout: "pipe", stderr: "pipe" },
-					);
-					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
-				},
-				targetContains: realTargetContains,
-				statusFiles: realStatusFiles,
-				removeWorktree: async (o: Parameters<TurnOps["removeWorktree"]>[0]) => {
-					await realRemoveWorktree(o);
-					record2.removeWorktree.push(o);
-				},
-			}),
-		);
+		const { loop: loop2, record: record2 } = recoveryLoop(reopened);
 		await loop2.recoverRestarted();
 
 		const after = reopened.getTask(task.id)!;
@@ -8369,6 +8400,10 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
 		expect(after.pushSha).toBe(pushedTip);
+		// The Done metadata the settle stamps: the target's commit count (seed plus the
+		// card's work) and the target head anchor release attribution to this merge.
+		expect(after.commits).toBe(2);
+		expect(after.mergeHead).toBe(pushedTip);
 		expect(after.pendingPrompt ?? null).toBeNull();
 		const turn = reopened.listTurns(task.id)[0]!;
 		expect(turn.endedAt).not.toBeNull();
@@ -8390,6 +8425,54 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(JSON.stringify(reopened.getTask(task.id))).toBe(taskSnap);
 		expect(JSON.stringify(reopened.listTurns(task.id))).toBe(turnsSnap);
 		expect(logText(reopened, task.id)).toBe(logSnap);
+	});
+
+	test("recoverRestarted finishes the card when the crash cut before the tracking-ref write", async () => {
+		// The earlier boundary of the same window: the push landed on origin, but the
+		// tracker died inside the push helper before recordLandedPush wrote the
+		// remote-tracking ref. The cached ref lags the remote, so the proof must fetch
+		// the pinned origin before it judges containment.
+		const { run, store, dir, origin, task, wt, seedTip } = mergeCrashFixture();
+		await suspendAfterPush(store, task, () => {
+			run(dir, "update-ref", "refs/remotes/origin/main", seedTip);
+		});
+
+		// The sub-window: origin holds the merge, the cached tracking ref lags it.
+		const pushedTip = run(origin, "rev-parse", "main");
+		expect(pushedTip).toBe(run(dir, "rev-parse", "refs/heads/main"));
+		expect(run(dir, "rev-parse", "refs/remotes/origin/main")).toBe(seedTip);
+		expect(store.getTask(task.id)!.state).toBe("running");
+		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+
+		store.close();
+		const reopened = ProjectStore.open(store.path);
+		stores.push(reopened);
+		const fetches: [string, string, string][] = [];
+		const { loop: loop2 } = recoveryLoop(reopened, {
+			fetchOriginBranch: async (
+				mainPath: string,
+				branch: string,
+				url: string,
+			) => {
+				fetches.push([mainPath, branch, url]);
+				return realFetchOriginBranch(mainPath, branch, url);
+			},
+		});
+		await loop2.recoverRestarted();
+
+		const after = reopened.getTask(task.id)!;
+		// The proof fetched the pinned origin before it judged containment, and the
+		// fetch refreshed the tracking ref to the pushed tip.
+		expect(fetches).toEqual([[dir, "main", origin]]);
+		expect(run(dir, "rev-parse", "refs/remotes/origin/main")).toBe(pushedTip);
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.commits).toBe(2);
+		expect(after.mergeHead).toBe(pushedTip);
+		expect(after.pushSha).toBe(pushedTip);
+		// No second push: origin still holds exactly the tip the first push carried.
+		expect(run(origin, "rev-parse", "main")).toBe(pushedTip);
+		expect(existsSync(wt)).toBe(false);
 	});
 
 	test("the demo switch keeps seeded cards through both sweeps and starts no queued card", async () => {
