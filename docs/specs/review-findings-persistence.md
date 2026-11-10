@@ -44,16 +44,24 @@ checks the stored set and run-result delivery keeps working.
 
 ### 3. Done is refused while stored findings are unchecked
 
-Both Done write paths get the guard:
+Both Done write paths get the guard, release reviews included:
 
 - `parkReviewDone` (live turn): stored unchecked findings park the card at
-  `merging`/`idle` with `UNCHECKED_FINDINGS_HOLD` instead of proceeding to Done.
+  `merging`/`idle` with `UNCHECKED_FINDINGS_HOLD` instead of proceeding to
+  Done. For a release card this hold precedes the publish, so the release
+  publishes only after the check ran and filed its cards.
 - `settleReviewCard` and `settleReleaseCard` (scheduled ticks): they refuse to
   write `stage: "done"` when the stored set has unchecked findings; they park
   needs_you with a reason that names the problem. A reply resumes the review and
   the next settle runs the check.
 
 A shared predicate reads the stored findings and the stamp; both paths call it.
+
+The check settle never writes Done directly: a review parked at merging lands
+Done (and a release publishes) through `settleReviewCard` on a later tick,
+which does the full Done bookkeeping — commits, mergeHead, uncommitted files,
+worktree removal. The post-check write keeps the planned stage and state and
+recomputes only the parked reason from the live cards.
 
 ### 4. "Needs validation" findings file as backlog cards marked unverified
 

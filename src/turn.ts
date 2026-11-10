@@ -6685,9 +6685,9 @@ export function createTurnLoop(
 	async function parkReviewDone(st: TurnSettle, next: Next): Promise<Next> {
 		// Stored findings that have no card yet will be checked this settle (planTurnChecks
 		// selects them); if that check never completes, the parked hold keeps them visible.
+		// Release reviews hold too: the publish below only runs once the hold is clear.
 		const stored = st.store.listReviewFindings(st.id);
 		const hold =
-			!st.idn.releaseCard &&
 			st.task.findingsCheckedAt === null &&
 			stored.length > 0 &&
 			stored.some(
@@ -8203,7 +8203,11 @@ export function createTurnLoop(
 	/** A check block above ran while the card was still in_progress/running: store the final
 	 * state now, if the card is still ours. The overrides the checks wrote (send-back,
 	 * needs_you, a failed check) moved the state away from running; this write must not
-	 * clobber them, so it fires only on the still-running card. */
+	 * clobber them, so it fires only on the still-running card. The stage and state stay the
+	 * planned ones: a review parked at merging lands Done (and a release publishes) through
+	 * settleReviewCard on the next tick, which does the full Done bookkeeping — commits,
+	 * mergeHead, uncommitted files, worktree removal. Only the reason is recomputed: the
+	 * check filed (or logged) the findings above, so the reason comes from the live cards. */
 	function writePostCheckState(st: TurnSettle, next: Next): void {
 		if (!st.checkWillRun) return;
 		// A merge hold deferred for the check (OTTR-766) parks here, after a passed check
@@ -8219,7 +8223,15 @@ export function createTurnLoop(
 			st.store.updateTask(st.id, {
 				stage: final.stage,
 				state: final.state,
-				needsReason: final.needsReason,
+				// The check filed (or logged) the findings above: a parked review's reason
+				// comes from the live cards — open kept cards hold with FINDINGS_HOLD, and
+				// with nothing open the held marker stays so the next tick (a plain review
+				// lands done, a release publishes) finishes the card with the full Done
+				// bookkeeping. A deferred merge hold keeps its own reason.
+				needsReason:
+					!st.holdPark && st.idn.reviewCard && final.stage === "merging"
+						? (findingsHold(st.store.listTasks(), st.task) ?? FINDINGS_HOLD)
+						: final.needsReason,
 				queuedAt: final.state === "queued" ? Date.now() : undefined,
 				// On a plain check settle these ride as the no-op they always were.
 				...holdParkColumns(st),

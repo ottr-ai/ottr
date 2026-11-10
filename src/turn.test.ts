@@ -21162,7 +21162,7 @@ describe("stored review findings", () => {
 			mkFinding("Needs validation: config load may double-read"),
 			mkFinding("Needs validation: flaky retry on push"),
 		];
-		const { store, loop, checkRuns } = storedReviewSetup(
+		const { store, loop, projects, checkRuns } = storedReviewSetup(
 			record,
 			[...confirmed, ...leads],
 			runResult({
@@ -21177,6 +21177,9 @@ describe("stored review findings", () => {
 					),
 				),
 			],
+			// A null run cap so schedule()'s tick reaches settleReviews (a 0 cap
+			// makes every tick return the cap bit before the settle).
+			{ maxTotalRuns: () => null },
 		);
 		const review = reviewCard(store);
 		await loop.runTurn(store.name, review.id);
@@ -21212,8 +21215,70 @@ describe("stored review findings", () => {
 		expect(after.details).toContain("below the cap of 10: Bug 12");
 
 		// The check dropped all 10 confirmed findings and leads never hold Done:
-		// the review is not held by its open backlog lead cards.
-		expect(after.stage).toBe("done");
-		expect(after.needsReason).not.toBe(FINDINGS_HOLD);
+		// the settle parks the review at merging/idle with the held marker, and the
+		// scheduled tick lands Done with the full Done bookkeeping even though the
+		// backlog lead cards stay open.
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		projects.get(store.name)!.target = "origin/main";
+		loop.schedule();
+		await flushPromises();
+		const doneAfter = store.getTask(review.id)!;
+		expect(doneAfter.stage).toBe("done");
+		expect(doneAfter.needsReason).toBeNull();
+		expect(leadKids.every((k) => k.stage === "backlog")).toBe(true);
+	});
+
+	test("a release review refuses to publish while its stored findings are unchecked", async () => {
+		const record = baseRecord();
+		// Stored findings from an earlier (lost) turn; this turn records nothing.
+		const { store, projects, loop, checkRuns } = storedReviewSetup(
+			record,
+			[],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+				recorded: [],
+			}),
+			[verdicts([1, true, ""], [2, true, ""])],
+			{ publishRelease: publishingRelease(record), maxTotalRuns: () => null },
+		);
+		projects.get(store.name)!.target = "origin/main";
+		const review = store.createTask(
+			`${ARCH_REVIEW_MARKER}release v1.0.0`,
+			null,
+			"review",
+		);
+		store.updateTask(review.id, {
+			releaseVersion: "v1.0.0",
+			base: "shaR",
+			worktree: "wt-rel",
+			branch: "ott/rel",
+			releaseNotes: "notes body",
+		});
+		store.appendReviewFinding(review.id, mkFinding("Bug A", 1));
+		store.appendReviewFinding(review.id, mkFinding("Bug B", 2));
+
+		await loop.runTurn(store.name, review.id);
+
+		// The live settle refuses Done: no publish, and the check ran on the
+		// stored set in the same settle and filed both findings.
+		expect(record.publishRelease).toHaveLength(0);
+		expect(checkRuns).toHaveLength(1);
+		const kids = kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt).sort()).toEqual(["Bug A", "Bug B"]);
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(FINDINGS_HOLD);
+
+		// Findings implemented: the tick publishes and lands Done.
+		for (const k of kids)
+			store.updateTask(k.id, { stage: "done", state: "idle" });
+		loop.schedule();
+		await flushPromises();
+		expect(record.publishRelease).toHaveLength(1);
+		const done = store.getTask(review.id)!;
+		expect(done.stage).toBe("done");
+		expect(done.summary).toBe("Released v1.0.0");
 	});
 });
