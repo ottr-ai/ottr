@@ -476,11 +476,13 @@ sidecar runs without privileged mode. The sidecar holds no credentials and
 publishes no port; it sits on its own compose network together with the workers.
 The server never joins that network.
 
-Turn and daemon authenticate each other with mutual TLS. The `buildkit-certs`
+To turn and daemon authenticate each other with mutual TLS. The `buildkit-certs`
 one-off generates a CA, the daemon certificate and one client certificate into
 named volumes on first start. The CA private key never lands in a volume. The
 daemon answers only with the server certificate. A turn reaches it only with the
-client certificate, which the workers mount read-only.
+client certificate, which the workers mount read-only. The client key is 0400
+root, so a client that runs as another user gets a permission error on the key.
+Workers run as root, so turns are unaffected.
 
 To turn builds on, set the profile and the client env in your env file:
 
