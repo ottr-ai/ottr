@@ -279,3 +279,12 @@ test("processesWithCwdUnder never names the calling process itself", () => {
 	const named = platform.processesWithCwdUnder(process.cwd());
 	expect(named.some((p) => p.pid === process.pid)).toBe(false);
 });
+
+test("processesWithCwdUnder names nothing when the own-tree walk fails", () => {
+	// Fail closed: with no tree listing the sweep cannot tell a leftover from the tracker's
+	// own turn child, so it must spare everything. The null walk fires before the /proc read,
+	// so a missing root also exercises it.
+	expect(
+		unix.processesWithCwdUnder(join(tmpdir(), "ottr-no-such-root"), null),
+	).toEqual([]);
+});

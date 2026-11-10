@@ -31,7 +31,12 @@ afterAll(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }));
 
 interface FakeOps extends SupervisorOps {
 	calls: {
-		remove: { mainPath: string; worktreePath: string; branch: string | null }[];
+		remove: {
+			mainPath: string;
+			worktreePath: string;
+			branch: string | null;
+			log?: (line: string) => void;
+		}[];
 		quarantine: { worktreePath: string; quarantineDir: string }[];
 		fetches: string[];
 		prFetches: { mainPath: string; n: number; url: string }[];

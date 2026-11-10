@@ -148,7 +148,14 @@ export const unix = {
 	// that reparented to init escapes killTree's ps snapshot, so a leftover dev server with
 	// its cwd under a worktree is named here instead. Linux only: readdir("/proc") fails
 	// elsewhere and yields [].
-	processesWithCwdUnder(root: string): CwdProcess[] {
+	processesWithCwdUnder(
+		root: string,
+		// Injectable for tests, like killTree's kill: null when the own-tree walk fails.
+		ownTree: number[] | null = descendants(process.pid),
+	): CwdProcess[] {
+		// Fail closed like holdsTty: when the tree cannot be listed, the sweep cannot tell a
+		// leftover from the tracker's own turn child, so it names nothing at all.
+		if (ownTree === null) return [];
 		let entries: Dirent[];
 		try {
 			entries = readdirSync("/proc", { withFileTypes: true });
@@ -156,10 +163,7 @@ export const unix = {
 			return [];
 		}
 		// Never name the tracker's own turn tree: the calling process and everything it spawned.
-		const own = new Set<number>([
-			process.pid,
-			...(descendants(process.pid) ?? []),
-		]);
+		const own = new Set<number>([process.pid, ...ownTree]);
 		const out: CwdProcess[] = [];
 		for (const entry of entries) {
 			const pid = Number(entry.name);

@@ -19,7 +19,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { removeBelow } from "./confine.ts";
 import { GIT_AUTH_ENV_RE, gitAuthEnv } from "./gitHosts.ts";
 import { platform } from "./platform/index.ts";
 import { archReviewDue } from "./scheduler.ts";
@@ -4833,9 +4832,9 @@ describe("commitMeta (OTTR-763)", () => {
 });
 
 // OTTR-697: worktrunk's wt remove --reap pattern. A process a turn left behind and that
-// reparented to init (a leftover dev server) escapes killTree's descendant walk and keeps
-// removeWorktree's retry loop failing with EBUSY. The first blocked retry reaps holders
-// whose cwd sits under the worktree, then the removal proceeds. Real processes throughout:
+// reparented to init (a leftover dev server) escapes killTree's descendant walk. The reap
+// runs before the first removal attempt, not on an errno: a held cwd does not fail rmdir on
+// Linux, so EBUSY never names the holder there. Real processes throughout:
 // `setsid -f` gives a new session (no controlling tty) and an init parent — the exact
 // leftover shape; script(1) gives a pty holder the sweep must spare. The sleeps below poll
 // real process state: a spawned process's /proc entry has no promise or event to await,
@@ -4882,21 +4881,8 @@ describe("removeWorktree reap (OTTR-697)", () => {
 		return null;
 	}
 
-	/** The removeDir seam: EBUSY on the first attempt, then confine's real remover. */
-	function busyThenRemove() {
-		let calls = 0;
-		const run = (anchor: string, target: string) => {
-			if (calls++ === 0)
-				throw Object.assign(new Error("EBUSY: held by a leftover process"), {
-					code: "EBUSY",
-				});
-			removeBelow(anchor, target);
-		};
-		return { run, calls: () => calls };
-	}
-
 	test.skipIf(gate)(
-		"reaps a detached holder inside the worktree and removes the tree",
+		"reaps a detached holder before removing the worktree",
 		async () => {
 			const { main } = await checkout();
 			// An unregistered dir, so git's own remove fails and removeBelow does the work.
@@ -4910,17 +4896,13 @@ describe("removeWorktree reap (OTTR-697)", () => {
 			const holders = await holdersIn(wt);
 			expect(holders).not.toBeNull();
 			const log: string[] = [];
-			const removeDir = busyThenRemove();
 			await removeWorktree({
 				mainPath: main,
 				worktreePath: wt,
 				branch: null,
 				log: (line) => log.push(line),
-				removeDir: removeDir.run,
 			});
 			expect(existsSync(wt)).toBe(false);
-			// One blocked attempt, one clean attempt after the reap — not the exhausted ladder.
-			expect(removeDir.calls()).toBe(2);
 			for (const holder of holders!) {
 				expect(isGone(holder.pid)).toBe(true);
 				expect(
@@ -4959,7 +4941,6 @@ describe("removeWorktree reap (OTTR-697)", () => {
 				worktreePath: wt,
 				branch: null,
 				log: (line) => log.push(line),
-				removeDir: busyThenRemove().run,
 			});
 			expect(existsSync(wt)).toBe(false);
 			expect(log.some((l) => l.startsWith("reap:"))).toBe(false);
