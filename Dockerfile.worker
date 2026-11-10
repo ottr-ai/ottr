@@ -66,6 +66,12 @@ ARG GIT_LFS_VERSION=3.6.1-1+deb13u1
 # the build loudly (D1).
 ARG OPENSSH_CLIENT_VERSION=1:10.0p1-7+deb13u4
 
+# Debian trixie openssl version: the buildkit-certs one-off (compose `build` profile,
+# docs/specs/turn-image-builds.md) generates the BuildKit TLS material with it.
+# ca-certificates pulls openssl in as a dependency; the pin makes that load-bearing
+# dependency loud. A wrong pin fails the build loudly (D1).
+ARG OPENSSL_VERSION=3.5.7-1~deb13u3
+
 # Keep bun's global bin outside /root — the HOME volume would shadow it.
 ENV BUN_INSTALL=/usr/local/bun
 ENV PATH="/usr/local/bun/bin:${PATH}"
@@ -78,6 +84,7 @@ RUN apt-get update \
       "procps=${PROCPS_VERSION}" \
       "curl=${CURL_VERSION}" \
       "openssh-client=${OPENSSH_CLIENT_VERSION}" \
+      "openssl=${OPENSSL_VERSION}" \
       ca-certificates \
       python3 python3-venv make g++ pkg-config unzip \
     && rm -rf /var/lib/apt/lists \
@@ -87,6 +94,7 @@ RUN apt-get update \
     && jq --version \
     && ps --version \
     && curl --version \
+    && openssl version \
     && ssh -V
 
 # rtk on PATH (pinned, checksum-verified) so pix-optimizer's bash rewrite is active.
@@ -121,6 +129,20 @@ RUN bun -e "await Bun.write('/tmp/gh.tar.gz', await (await fetch('https://github
     && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
     && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_amd64" \
     && gh --version
+
+# buildctl on PATH (pinned, checksum-verified): the client for the rootless BuildKit
+# sidecar (compose `build` profile, docs/specs/turn-image-builds.md). The daemon runs
+# in the compose stack; the image carries only the client. The release names the asset
+# with dots (buildkit-v<version>.linux-amd64.tar.gz) and publishes no checksums file:
+# the SHA-256 was computed when pinned (release day 2026-11-03), like the Chrome pin.
+ARG BUILDKIT_VERSION=0.34.2
+ARG BUILDKIT_SHA256=b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13
+RUN bun -e "await Bun.write('/tmp/buildkit.tar.gz', await (await fetch('https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz')).bytes())" \
+    && echo "${BUILDKIT_SHA256}  /tmp/buildkit.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/buildkit.tar.gz -C /tmp bin/buildctl \
+    && install -m 0755 /tmp/bin/buildctl /usr/local/bin/buildctl \
+    && rm -rf /tmp/buildkit.tar.gz /tmp/bin \
+    && buildctl --version
 
 # node, npm and npx on PATH (pinned, checksum-verified); they shadow bun's node fallback.
 RUN bun -e "await Bun.write('/tmp/node.tar.gz', await (await fetch('https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz')).bytes())" \

@@ -466,6 +466,78 @@ installs only. The image carries no JDK and no Maven; it carries `python3` and
     openjdk-21-jdk-headless
     maven
 
+## Image builds in turns
+
+A work turn builds container images when the compose `build` profile runs: the
+rootless BuildKit sidecar (the `buildkit` service, specified in
+[docs/specs/turn-image-builds.md](docs/specs/turn-image-builds.md)). No worker
+ever talks to the host Docker daemon. No host socket enters the stack, and the
+sidecar runs without privileged mode. The sidecar holds no credentials and
+publishes no port; it sits on its own compose network together with the workers.
+The server never joins that network.
+
+Turn and daemon authenticate each other with mutual TLS. The `buildkit-certs`
+one-off generates a CA, the daemon certificate and one client certificate into
+named volumes on first start. The CA private key never lands in a volume. The
+daemon answers only with the server certificate. A turn reaches it only with the
+client certificate, which the workers mount read-only.
+
+To turn builds on, set the profile and the client env in your env file:
+
+    COMPOSE_PROFILES=build
+    BUILDKIT_HOST=tcp://buildkit:1234
+    BUILDKIT_TLS_CA=/certs/buildkit/ca/ca.pem
+    BUILDKIT_TLS_CERT=/certs/buildkit/client/cert.pem
+    BUILDKIT_TLS_KEY=/certs/buildkit/client/key.pem
+
+Then recreate the stack so the workers get the env and the mounts.
+
+Certificates carry no expiry marker that the stack renews: rotate them by
+removing the four cert volumes (`buildkit-ca`, `buildkit-daemon-certs`,
+`buildkit-client-certs`, `buildkit-config`) and recreating buildkit and the
+workers:
+
+    docker compose --profile build up -d --force-recreate buildkit worker-a worker-b
+
+To verify a turn path from a worker, run this inside a project checkout that
+carries a Dockerfile:
+
+    docker compose --profile build exec worker-a sh -c '
+      cd /workspace/<project> &&
+      buildctl --tlscacert "$BUILDKIT_TLS_CA" --tlscert "$BUILDKIT_TLS_CERT" \
+        --tlskey "$BUILDKIT_TLS_KEY" build --frontend dockerfile.v0 \
+        --local context=. --local dockerfile=. \
+        --opt filename=Dockerfile.worker --opt target=worker'
+    echo $?
+
+Exit 0 means the daemon built the target. Point `--opt target=` at a stage with
+a failing `RUN`, and buildctl exits non-zero. A client without the client
+certificate is refused in the TLS handshake. The server has no route to the
+daemon: it joins only the default network, and Docker isolates its bridge
+networks from each other.
+
+Limits keep a build from starving the host: `OTTR_BUILDKIT_MEM_LIMIT` (default
+8g) and `OTTR_BUILDKIT_CPUS` (default 4) cap the daemon, and the cache cap
+`OTTR_BUILDKIT_CACHE_CAP` (default 20 GB) makes buildkit garbage-collect its
+cache above the cap. Build steps run inside the daemon's cgroup. No registry
+credentials exist: a build exports nothing by default, or a local tar with
+`--output type=docker,dest=<file>.tar`; a push fails at the registry.
+
+Two rules keep a build a build:
+
+- Put test steps in a Dockerfile stage (`RUN`), and build to that stage with
+  `--opt target=`. buildctl cannot run containers.
+- No `docker run` and no compose stacks in turns. Builds stay local: no push,
+  no host docker, no socket.
+
+Known residuals: the daemon pulls base images from docker.io, so the `buildkit`
+network is not compose-internal. The snapshotter is auto: overlayfs where the
+kernel allows unprivileged mounts (kernel 5.11 and newer, Docker Desktop
+included), native (slower) elsewhere. Podman has no `systempaths=unconfined`, so
+keep the profile off on a Podman host. On a host with `/dev/kvm`, the upgrade
+path is [podman inside the Firecracker VM](#microvm-workers), where a VM owns a
+real podman.
+
 ## Env settings
 
 - Server: `OTTR_WORKER_URLS` (comma-separated, e.g.

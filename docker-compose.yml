@@ -60,6 +60,13 @@ x-worker: &worker
     # omp keeps provider auth in agent.db: one file for the stack, seeded once from the host
     # db (VACUUM INTO) and never baked; the stack then logs in by itself (docs/WORKERS.md).
     - ${OTTR_AGENT_DB:?set OTTR_AGENT_DB to a snapshot file of the host omp agent.db}:/root/.omp/agent/agent.db
+    # BuildKit sidecar (the `build` profile below, OTTR-785): the client certificate
+    # and CA only, read-only. Never the daemon key (buildkit-daemon-certs) or the CA
+    # key, which lives only inside the buildkit-certs one-off and dies with it. The
+    # volumes stay empty until the profile runs; a turn without the profile then has
+    # no client certificate, and buildctl is absent from the turn env.
+    - buildkit-client-certs:/certs/buildkit/client:ro
+    - buildkit-ca:/certs/buildkit/ca:ro
   environment:
     # Server-to-worker auth, required and random: turns share this network, so a known
     # value would let them drive any worker (workers strip it from every turn's env).
@@ -80,6 +87,22 @@ x-worker: &worker
     # each turn's env, so a token set here would never reach a turn.
     # Project tools and env names come from the data repo instead
     # (workers/<project>/tools.json and env.txt, docs/WORKERS.md).
+    # BuildKit sidecar (the `build` profile): empty keeps every turn without image
+    # builds. The compose env file sets all four together with COMPOSE_PROFILES=build
+    # (the OTTR_VM_RUNNER_URL pattern). buildctl reads the address from BUILDKIT_HOST;
+    # the TLS paths have no env form, so turns pass the BUILDKIT_TLS_* values as flags:
+    #   buildctl --tlscacert "$BUILDKIT_TLS_CA" --tlscert "$BUILDKIT_TLS_CERT" \
+    #     --tlskey "$BUILDKIT_TLS_KEY" build ...
+    # (docs/WORKERS.md "Image builds in turns", spec docs/specs/turn-image-builds.md).
+    BUILDKIT_HOST: ${BUILDKIT_HOST:-}
+    BUILDKIT_TLS_CA: ${BUILDKIT_TLS_CA:-}
+    BUILDKIT_TLS_CERT: ${BUILDKIT_TLS_CERT:-}
+    BUILDKIT_TLS_KEY: ${BUILDKIT_TLS_KEY:-}
+  # Every worker joins the buildkit network, so a build turn reaches the daemon over
+  # mTLS. The server never joins it: no route from the board's container (acceptance).
+  networks:
+    - default
+    - buildkit
 
 services:
   server:
@@ -244,6 +267,141 @@ services:
     # Do NOT use `compose --scale`: round-robin DNS breaks cancel routing —
     # per-run addressability requires stable per-worker names.
 
+  # Rootless BuildKit sidecar (OTTR-785, spec docs/specs/turn-image-builds.md): lets a
+  # work turn build container images (Dockerfile.worker, project Dockerfiles) with no
+  # host docker access, no host socket and no privileged mode. Off unless the env file
+  # sets COMPOSE_PROFILES=build together with the BUILDKIT_* values the x-worker anchor
+  # passes through. The daemon holds no credentials, publishes no port, and answers
+  # only workers that present the client certificate (mTLS). Podman has no
+  # systempaths=unconfined, so the profile is Docker-only (README, Podman).
+  buildkit:
+    # Digest-pinned 2026-11-10 (multiarch index). The image runs as uid 1000; its
+    # rootlesskit entrypoint sets up the user namespace, so build steps never run as
+    # real root on the host.
+    image: moby/buildkit:v0.34.2-rootless@sha256:c8252268760e1baba80780d63d738ef9f260fb7c7c0973c78494cb9ddd99eda1
+    profiles: [build]
+    restart: unless-stopped
+    logging: *logging
+    # One build cannot starve turns: build steps run inside this cgroup.
+    mem_limit: ${OTTR_BUILDKIT_MEM_LIMIT:-8g}
+    cpus: "${OTTR_BUILDKIT_CPUS:-4}"
+    depends_on:
+      buildkit-certs:
+        condition: service_completed_successfully
+    # The BuildKit rootless docs' container mode (moby/buildkit docs/rootless.md):
+    # runc inside the daemon's user namespace needs unshare and mount (seccomp,
+    # apparmor), and each build step needs its own /proc (systempaths). The alternative
+    # the docs name, --oci-worker-no-process-sandbox, is discouraged there: it cannot
+    # kill build steps that fail to exit, and it lets a build step kill or ptrace daemon
+    # processes. This daemon runs untrusted build steps from agent turns, so the docs'
+    # primary mode wins, and the tradeoff lands on a secretless sidecar: uid 1000, no
+    # credentials, reachable only from workers over mTLS.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    networks:
+      - buildkit
+    volumes:
+      # The daemon key lives only here; no worker mounts this volume. The gc policy
+      # (OTTR_BUILDKIT_CACHE_CAP, default 20 GB) is in buildkit-config.
+      - buildkit-config:/config:ro
+      - buildkit-ca:/certs/ca:ro
+      - buildkit-daemon-certs:/certs/daemon:ro
+      - buildkit-state:/home/user/.local/share/buildkit
+    command:
+      # buildkitd flags (the image entrypoint is `rootlesskit buildkitd`): mTLS on tcp
+      # 1234 only, and the cache-cap config the one-off wrote. A partial config is safe:
+      # the rootless defaults (state under $HOME) come from the user namespace, not
+      # from the file.
+      - --config
+      - /config/buildkitd.toml
+      - --addr
+      - tcp://0.0.0.0:1234
+      - --tlscacert
+      - /certs/ca/ca.pem
+      - --tlscert
+      - /certs/daemon/cert.pem
+      - --tlskey
+      - /certs/daemon/key.pem
+
+  # One-shot seed of the BuildKit TLS material (the `build` profile): generates the CA,
+  # the daemon (server) cert and the one client cert, plus the cache-cap config, into
+  # the named volumes. Idempotent: with all six outputs present it chowns the state
+  # volume for the daemon user and exits 0, so `up` can rerun it. The CA key is
+  # generated in /tmp and discarded there: it never lands in a volume, so no container
+  # can mint more certificates. Rotation: remove the four cert volumes, then
+  #   docker compose --profile build up -d --force-recreate buildkit worker-a worker-b
+  # (docs/WORKERS.md "Image builds in turns").
+  buildkit-certs:
+    image: ${OTTR_IMAGE:-ottr-worker:local}
+    profiles: [build]
+    restart: "no"
+    logging: *logging
+    mem_limit: ${OTTR_BUILDKIT_CERTS_MEM_LIMIT:-1g}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        openssl version
+        if [ -f /certs/ca/ca.pem ] && [ -f /certs/daemon/cert.pem ] && \
+           [ -f /certs/daemon/key.pem ] && [ -f /certs/client/cert.pem ] && \
+           [ -f /certs/client/key.pem ] && [ -f /config/buildkitd.toml ]; then
+          chown 1000:1000 /state
+          echo "buildkit certs and config exist; keeping them"
+          exit 0
+        fi
+        umask 077
+        mkdir -p /certs/ca /certs/daemon /certs/client /config /state
+        rm -f /certs/ca/ca.pem /certs/daemon/cert.pem /certs/daemon/key.pem \
+          /certs/client/cert.pem /certs/client/key.pem /config/buildkitd.toml
+        # CA. The key stays in /tmp and dies with the one-off container.
+        openssl genrsa -out /tmp/ca.key 4096
+        openssl req -x509 -new -sha256 -days 3650 -key /tmp/ca.key \
+          -subj /CN=ottr-buildkit-ca -out /certs/ca/ca.pem
+        # Daemon (server) cert: the compose DNS name is the SAN, so the workers'
+        # buildctl verifies the daemon it reached as "buildkit".
+        openssl genrsa -out /tmp/daemon.key 4096
+        openssl req -new -sha256 -key /tmp/daemon.key -subj /CN=buildkit -out /tmp/daemon.csr
+        printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:buildkit,IP:127.0.0.1\n' > /tmp/daemon.ext
+        openssl x509 -req -sha256 -days 3650 -in /tmp/daemon.csr \
+          -CA /certs/ca/ca.pem -CAkey /tmp/ca.key -CAcreateserial \
+          -extfile /tmp/daemon.ext -out /certs/daemon/cert.pem
+        install -o 1000 -g 1000 -m 0400 /tmp/daemon.key /certs/daemon/key.pem
+        # Client cert: the one certificate a turn can hold. Workers run as root.
+        openssl genrsa -out /tmp/client.key 4096
+        openssl req -new -sha256 -key /tmp/client.key -subj /CN=ottr-buildctl -out /tmp/client.csr
+        printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' > /tmp/client.ext
+        openssl x509 -req -sha256 -days 3650 -in /tmp/client.csr \
+          -CA /certs/ca/ca.pem -CAkey /tmp/ca.key -CAcreateserial \
+          -extfile /tmp/client.ext -out /certs/client/cert.pem
+        install -m 0400 /tmp/client.key /certs/client/key.pem
+        chmod 0444 /certs/ca/ca.pem /certs/daemon/cert.pem /certs/client/cert.pem
+        openssl verify -CAfile /certs/ca/ca.pem /certs/daemon/cert.pem /certs/client/cert.pem
+        # One fleet-wide gc policy keeps the cache under the cap (default 20 GB).
+        cat > /config/buildkitd.toml <<EOF
+        # Generated by buildkit-certs. Do not edit in place: rotate the cert volumes
+        # and rerun the one-off (docs/WORKERS.md "Image builds in turns").
+        [worker.oci]
+          gc = true
+          [worker.oci.gcpolicy]
+            reservedSpace = "4GB"
+            maxUsedSpace = "${OTTR_BUILDKIT_CACHE_CAP:-20GB}"
+            minFreeSpace = "5GB"
+            keepDuration = 172800
+        EOF
+        chown 1000:1000 /state
+        rm -f /tmp/ca.key /tmp/daemon.key /tmp/client.key /tmp/daemon.csr \
+          /tmp/client.csr /tmp/daemon.ext /tmp/client.ext
+        echo "buildkit certs and config written"
+    volumes:
+      - buildkit-ca:/certs/ca
+      - buildkit-daemon-certs:/certs/daemon
+      - buildkit-client-certs:/certs/client
+      - buildkit-config:/config
+      - buildkit-state:/state
+
   # The microVM runner (OTTR-532): runs every work turn of a project with microVMs on
   # (Settings) in its own Firecracker microVM, so a turn sees its own clone and nothing of
   # the other projects, the shared home or the credentials. It speaks the worker protocol
@@ -382,6 +540,14 @@ services:
     ports:
       - "127.0.0.1:4570:4570"
 
+# The buildkit network belongs to the `build` profile (services above). Not compose-
+# internal on purpose: buildkitd pulls base images from docker.io, and an internal
+# network has no egress. Isolation still holds: only the workers join it besides the
+# daemon, and Docker isolates bridge networks from each other, so the server (default
+# network only) has no route to buildkit.
+networks:
+  buildkit: {}
+
 volumes:
   workspace:
   home:
@@ -390,3 +556,10 @@ volumes:
   board-config:
   alate-state:
   vm-state:
+  # BuildKit TLS material and state (the `build` profile). The CA key is never stored:
+  # buildkit-certs signs in /tmp and discards it.
+  buildkit-ca:
+  buildkit-daemon-certs:
+  buildkit-client-certs:
+  buildkit-config:
+  buildkit-state:
