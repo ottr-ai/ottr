@@ -4115,7 +4115,7 @@ export function createApp(deps: AppDeps) {
 			icon: icon ?? null,
 			path: e.path,
 			sessionsDir: e.store.sessionsDir,
-			hasRules: hasRules(e.path),
+			hasRules: hasRules(e.path, e.targetRules === true),
 			target: e.target,
 			gitless: e.gitless,
 			dirty: e.dirty,
@@ -4575,7 +4575,7 @@ export function createApp(deps: AppDeps) {
 		interview: string;
 		id: string | null;
 	} {
-		const has = hasRules(e.path);
+		const has = hasRules(e.path, e.targetRules === true);
 		if (has && !fix) return { interview: "not-needed", id: null };
 		const live = liveCardOf(e.store.listTasks(), "interview");
 		if (live !== null) return { interview: "running", id: live.id };

@@ -845,7 +845,7 @@ export interface ProjectView {
 	path: string;
 	/** Absolute omp session dir of the project's turns: `<path>/.tasks/sessions`, or under OTTR_DATA_DIR. */
 	sessionsDir: string;
-	/** AGENTS.md exists in the main checkout (tracked or untracked). */
+	/** Rules are available: AGENTS.md or .omp/AGENTS.md in the main checkout, or the target tracks AGENTS.md. */
 	hasRules: boolean;
 	/** Integration target ref, e.g. "origin/main", or null if unresolved. */
 	target: string | null;

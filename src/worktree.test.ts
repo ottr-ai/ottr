@@ -40,6 +40,7 @@ import {
 	gitExe,
 	githubRepoName,
 	githubUrl,
+	hasRules,
 	headVersion,
 	httpsRemote,
 	ignoreInMain,
@@ -71,6 +72,7 @@ import {
 	statusFiles,
 	statusRows,
 	targetCommits,
+	targetTracksRules,
 	trackedFiles,
 	unsavedWork,
 	validateCopyPath,
@@ -2080,6 +2082,139 @@ describe("against real repos", () => {
 				await must(wt, "status", "--porcelain", "--untracked-files=all"),
 			).toBe("");
 		}
+		// The exclude line lands once whatever the attempt count (exact-line dedupe).
+		const excludeLines = readFileSync(
+			join(checkout, ".git", "info", "exclude"),
+			"utf8",
+		).split("\n");
+		expect(
+			excludeLines.filter((l) => l === "/scripts/release.mjs"),
+		).toHaveLength(1);
+	}, 60_000);
+
+	test("createWorktree skips a rules file the base tracks and names the conflict", async () => {
+		const checkout = repo();
+		await must(checkout, "init", "-q", "-b", "main");
+		writeFileSync(join(checkout, "README.md"), "readme\n");
+		await must(checkout, "add", "README.md");
+		await must(checkout, "commit", "-q", "-m", "init");
+		const behind = await must(checkout, "rev-parse", "HEAD");
+		// The target gains its own AGENTS.md while the main checkout stays behind it.
+		writeFileSync(join(checkout, "AGENTS.md"), "tracked rules\n");
+		await must(checkout, "add", "AGENTS.md");
+		await must(checkout, "commit", "-q", "-m", "rules");
+		const base = await must(checkout, "rev-parse", "HEAD");
+		await must(checkout, "update-ref", "refs/heads/target", base);
+		// The main checkout's local AGENTS.md is untracked (index back at `behind`)
+		// and differs from the base's.
+		writeFileSync(join(checkout, "AGENTS.md"), "local rules\n");
+		await must(checkout, "reset", "-q", "--mixed", behind);
+		const lines: string[] = [];
+		const wt = join(repo(), "wt");
+		await createWorktree({
+			mainPath: checkout,
+			worktreePath: wt,
+			branch: "ott/skip",
+			base,
+			copyExtra: [],
+			log: (line) => lines.push(line),
+		});
+		// The base's tracked file survives; the local copy never lands.
+		expect(readFileSync(join(wt, "AGENTS.md"), "utf8")).toBe("tracked rules\n");
+		expect(
+			await must(wt, "status", "--porcelain", "--untracked-files=all"),
+		).toBe("");
+		// The card log names the skip and the conflict.
+		expect(lines.some((l) => l.includes("skipped AGENTS.md"))).toBe(true);
+		expect(
+			lines.some((l) =>
+				l.includes(
+					"the target now tracks AGENTS.md; move your local rules to .omp/AGENTS.md",
+				),
+			),
+		).toBe(true);
+		// A skipped tracked file never becomes an exclude line.
+		const excludePath = join(checkout, ".git", "info", "exclude");
+		expect(
+			!existsSync(excludePath) ||
+				!readFileSync(excludePath, "utf8").includes("/AGENTS.md"),
+		).toBe(true);
+	}, 60_000);
+
+	test("createWorktree retries cleanly and adds no exclude line when the base tracks the rules", async () => {
+		const checkout = repo();
+		await must(checkout, "init", "-q", "-b", "main");
+		writeFileSync(join(checkout, "README.md"), "readme\n");
+		await must(checkout, "add", "README.md");
+		await must(checkout, "commit", "-q", "-m", "init");
+		const behind = await must(checkout, "rev-parse", "HEAD");
+		// The target gains its own AGENTS.md while the main checkout stays behind it.
+		writeFileSync(join(checkout, "AGENTS.md"), "same rules\n");
+		await must(checkout, "add", "AGENTS.md");
+		await must(checkout, "commit", "-q", "-m", "rules");
+		const base = await must(checkout, "rev-parse", "HEAD");
+		await must(checkout, "update-ref", "refs/heads/target", base);
+		// Identical content: the skip stays quiet (no conflict line) on every attempt.
+		writeFileSync(join(checkout, "AGENTS.md"), "same rules\n");
+		await must(checkout, "reset", "-q", "--mixed", behind);
+		const lines: string[] = [];
+		const wts = repo();
+		for (const id of ["one", "two"]) {
+			const wt = join(wts, id);
+			await createWorktree({
+				mainPath: checkout,
+				worktreePath: wt,
+				branch: `ott/${id}`,
+				base,
+				copyExtra: [],
+				log: (line) => lines.push(line),
+			});
+			expect(readFileSync(join(wt, "AGENTS.md"), "utf8")).toBe("same rules\n");
+			expect(
+				await must(wt, "status", "--porcelain", "--untracked-files=all"),
+			).toBe("");
+		}
+		expect(lines.filter((l) => l.includes("skipped AGENTS.md"))).toHaveLength(
+			2,
+		);
+		expect(lines.some((l) => l.includes("the target now tracks"))).toBe(false);
+		const excludePath = join(checkout, ".git", "info", "exclude");
+		const excludeLines = existsSync(excludePath)
+			? readFileSync(excludePath, "utf8").split("\n")
+			: [];
+		expect(excludeLines.filter((l) => l === "/AGENTS.md")).toHaveLength(0);
+	}, 60_000);
+
+	test("hasRules counts .omp/AGENTS.md and the target's tracked AGENTS.md", async () => {
+		const checkout = repo();
+		await must(checkout, "init", "-q", "-b", "main");
+		writeFileSync(join(checkout, "README.md"), "readme\n");
+		await must(checkout, "add", "README.md");
+		await must(checkout, "commit", "-q", "-m", "init");
+		// No rules anywhere yet.
+		expect(hasRules(checkout)).toBe(false);
+		expect(await targetTracksRules(checkout, "main")).toBe(false);
+		expect(await targetTracksRules(checkout, null)).toBe(false);
+		expect(hasRules(checkout, await targetTracksRules(checkout, "main"))).toBe(
+			false,
+		);
+		// Local .omp rules count even when the main checkout has no AGENTS.md.
+		mkdirSync(join(checkout, ".omp"), { recursive: true });
+		writeFileSync(join(checkout, ".omp", "AGENTS.md"), "omp rules\n");
+		expect(hasRules(checkout)).toBe(true);
+		rmSync(join(checkout, ".omp", "AGENTS.md"));
+		// The target tracks AGENTS.md while the local copy sits moved aside.
+		writeFileSync(join(checkout, "AGENTS.md"), "tracked rules\n");
+		await must(checkout, "add", "AGENTS.md");
+		await must(checkout, "commit", "-q", "-m", "rules");
+		rmSync(join(checkout, "AGENTS.md"));
+		expect(hasRules(checkout)).toBe(false);
+		expect(await targetTracksRules(checkout, "main")).toBe(true);
+		expect(hasRules(checkout, await targetTracksRules(checkout, "main"))).toBe(
+			true,
+		);
+		// The commit before the rules file still counts as no rules.
+		expect(await targetTracksRules(checkout, "main~1")).toBe(false);
 	}, 60_000);
 
 	test("resolveTarget fetches the upstream only when asked (before a new worktree)", async () => {

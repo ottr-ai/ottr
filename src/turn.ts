@@ -184,6 +184,7 @@ import {
 	planKeptFinish,
 	type quarantineUntracked,
 	slugify,
+	targetTracksRules,
 	worktreeAnchor,
 } from "./worktree.ts";
 
@@ -765,6 +766,9 @@ export interface TurnProject {
 	 * failed. Refreshed by the scheduler tick like dirty and mainUnpushed (a failed check
 	 * keeps the last value); the off-default banner and turn finding read it. */
 	mainBranch: string | null;
+	/** OTTR-768: true when the target ref tracks AGENTS.md. Refreshed by the scheduler tick
+	 * like dirty and mainUnpushed (a failed check keeps the last value); hasRules reads it. */
+	targetRules?: boolean;
 	/** Latest release: the repo's latest GitHub release (its name when the tag is not
 	 * `vX.Y.Z`), else the highest `vX.Y.Z` tag merged into the target; refreshed by the
 	 * scheduler tick, read-only elsewhere. */
@@ -870,6 +874,8 @@ export interface TurnOps {
 	quarantineUntracked: typeof quarantineUntracked;
 	trackedFiles: typeof trackedFiles;
 	hasRules: typeof hasRules;
+	/** True when the target ref's tree holds AGENTS.md (hasRules's git fact); absent = the real read. */
+	targetTracksRules?: typeof targetTracksRules;
 	targetCommits(
 		mainPath: string,
 		target: string | null,
@@ -2421,6 +2427,15 @@ export function createTurnLoop(
 			.catch(() => {
 				// git failed: keep the last mainBranch; the next tick retries.
 			});
+		// OTTR-768: the rules gate's git fact — does the target track AGENTS.md? A failed
+		// check keeps the last targetRules flag; the next tick retries (like mainBranch).
+		void (ops.targetTracksRules ?? targetTracksRules)(e.path, e.target)
+			.then((tracks) => {
+				e.targetRules = tracks;
+			})
+			.catch(() => {
+				// git failed: keep the last targetRules flag; the next tick retries.
+			});
 		void ops.refreshRelease(e);
 		void ops.refreshArchReview(e);
 		void ops.refreshOpenPrs?.(e);
@@ -2438,7 +2453,7 @@ export function createTurnLoop(
 		const settings = getSettingsLogged(e);
 		const runnable = pickRunnable(e.store.listTasks(), {
 			maxParallel: settings.maxParallel,
-			hasRules: ops.hasRules(e.path),
+			hasRules: ops.hasRules(e.path, e.targetRules === true),
 			only: drained ? e.store.boardCheckId() : undefined,
 			mainUnpushed: e.mainUnpushed === true,
 			prMode: settings.prMode === true,
@@ -2494,7 +2509,7 @@ export function createTurnLoop(
 			if (scout !== null) return null;
 			const t = pickLowPriority(tasks, {
 				maxParallel: getSettingsLogged(e).maxParallel,
-				hasRules: ops.hasRules(e.path),
+				hasRules: ops.hasRules(e.path, e.targetRules === true),
 				only: drained ? e.store.boardCheckId() : undefined,
 				mainUnpushed: e.mainUnpushed === true,
 				crossDeps: (did) => findDep(did, depProjects, depProjectOf(e.store)),

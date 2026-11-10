@@ -19,6 +19,7 @@ import {
 	appendLineBelow,
 	copyBelow,
 	moveBelow,
+	readBelow,
 	readRegular,
 	removeBelow,
 	trustedAnchor,
@@ -633,8 +634,26 @@ export function slugify(text: string): string {
 	return s === "" ? "task" : s;
 }
 
-export function hasRules(mainPath: string): boolean {
-	return existsSync(path.join(mainPath, "AGENTS.md"));
+/** Rules are available: the main checkout has AGENTS.md or .omp/AGENTS.md, or the target
+ * tracks AGENTS.md (targetRules is the scheduler tick's cached git fact, Entry.targetRules;
+ * a fresh worktree then carries the file from the checkout). */
+export function hasRules(mainPath: string, targetRules = false): boolean {
+	return (
+		existsSync(path.join(mainPath, "AGENTS.md")) ||
+		existsSync(path.join(mainPath, ".omp", "AGENTS.md")) ||
+		targetRules === true
+	);
+}
+
+/** True when the target ref's tree holds AGENTS.md; a null target and a failed read (the
+ * ref or the path missing) count as no. Reads real git state. */
+export async function targetTracksRules(
+	mainPath: string,
+	target: string | null,
+): Promise<boolean> {
+	if (target === null || target === "") return false;
+	const r = await git(["cat-file", "-e", `${target}:AGENTS.md`], mainPath);
+	return r.code === 0;
 }
 
 /** HTTPS URL of the main checkout's GitHub remote on the configured host (origin preferred);
@@ -1179,10 +1198,29 @@ async function checkoutFresh(worktreePath: string): Promise<void> {
 		throw new Error(`git checkout of the worktree failed: ${co.stderr.trim()}`);
 }
 
+/** Logs the skip of a candidate the base already tracks, naming the rules conflict when
+ * the local AGENTS.md differs from the base's (the target ships its own rules now). */
+async function logSkippedTracked(
+	o: { mainPath: string; base: string; log: (line: string) => void },
+	relFwd: string,
+): Promise<void> {
+	o.log(`skipped ${relFwd}: ${o.base} tracks it`);
+	if (relFwd !== "AGENTS.md") return;
+	const local = readRegular(path.join(o.mainPath, relFwd)).toString("utf8");
+	const atBase = await git(["show", `${o.base}:AGENTS.md`], o.mainPath);
+	if (atBase.code !== 0)
+		throw new Error(`git show failed: ${atBase.stderr.trim()}`);
+	if (local.replaceAll("\r\n", "\n") !== atBase.stdout.replaceAll("\r\n", "\n"))
+		o.log(
+			"! the target now tracks AGENTS.md; move your local rules to .omp/AGENTS.md",
+		);
+}
+
 /** Copies the untracked candidate files (rules, .omp, copy extras) into the worktree; returns the copied paths. */
 async function copyUntracked(o: {
 	mainPath: string;
 	worktreePath: string;
+	base: string;
 	copyExtra: string[];
 	log: (line: string) => void;
 }): Promise<string[]> {
@@ -1201,10 +1239,25 @@ async function copyUntracked(o: {
 	);
 	if (ls.code !== 0)
 		throw new Error(`git ls-files failed: ${ls.stderr.trim()}`);
+	// A path the base already tracks comes with the checkout: overwriting it with the
+	// main checkout's stale local copy would dirty every fresh worktree (the main
+	// checkout can sit behind the target that just started shipping its own rules).
+	const tree = await git(
+		["ls-tree", "-r", "--name-only", "-z", o.base],
+		o.mainPath,
+	);
+	if (tree.code !== 0)
+		throw new Error(`git ls-tree failed: ${tree.stderr.trim()}`);
+	const trackedAtBase = new Set(tree.stdout.split("\0"));
 	for (const rel of ls.stdout.split("\0")) {
 		if (rel === "") continue;
 		if (/^\.env/i.test(path.posix.basename(rel.replaceAll("\\", "/"))))
 			continue;
+		const relFwd = rel.replaceAll("\\", "/");
+		if (trackedAtBase.has(relFwd)) {
+			await logSkippedTracked(o, relFwd);
+			continue;
+		}
 		copyBelow(
 			{
 				anchor: trustedAnchor(o.mainPath),
@@ -1233,12 +1286,22 @@ async function excludeAndVerify(
 ): Promise<void> {
 	if (copied.length === 0) return;
 	const exclude = await excludeFile(o.mainPath);
+	// Exclude lines accumulate across attempts (a repeated add appends the same line
+	// again); append only when the exact line is not there yet.
+	const excludeLines = new Set(
+		(readBelow(exclude.anchor, exclude.file, 1024 * 1024) ?? Buffer.alloc(0))
+			.toString("utf8")
+			.split("\n"),
+	);
 	for (const rel of copied) {
 		const relFwd = rel.replaceAll("\\", "/");
 		const ci = await git(["check-ignore", "-q", "--", rel], o.worktreePath);
 		if (ci.code === 1) {
-			appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
-			o.log(`added /${relFwd} to .git/info/exclude`);
+			if (!excludeLines.has(`/${relFwd}`)) {
+				appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
+				excludeLines.add(`/${relFwd}`);
+				o.log(`added /${relFwd} to .git/info/exclude`);
+			}
 		} else if (ci.code > 1) {
 			throw new Error(
 				`git check-ignore failed for ${rel}: ${ci.stderr.trim()}`,
