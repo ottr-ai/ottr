@@ -295,7 +295,7 @@ function parsePull(body: unknown): PrDetail | null {
 }
 
 /** The needs_you reason of a card whose open PR conflicts with its target branch (OTTR-789).
- * prConflictCard parks with it and un-parks only on this exact text. Pure. */
+ * prConflictVerdict parks with it and un-parks only on this exact text. Pure. */
 function prConflictReason(n: number): string {
 	return `PR #${n} cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.`;
 }
@@ -1866,17 +1866,23 @@ export function createSupervisor(
 		}
 	}
 
-	/** Settle one tracked Merging card whose PR left the open set: merged finishes the card,
-	 * closed unmerged parks it needs_you. Never throws; read failures log and skip. */
+	/** Settle one tracked Merging card whose PR is not in the open list: merged finishes the
+	 * card, closed unmerged parks it needs_you. The list is one page of 100, so the read can
+	 * also say open (an older PR, or a reopen since the list): the card then takes the merge
+	 * verdict like a listed one. Never throws; read failures log and skip. */
 	async function settlePrCard(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
 		t: ListedTask,
 		repo: string,
+		reason: string,
 	): Promise<void> {
 		const pr = await prState(e, t, repo);
 		if (pr === null) return;
-		if (pr.state === "open") return; // reopened between the list and this read
+		if (pr.state === "open") {
+			prConflictVerdict(e, t, pr.mergeable, reason);
+			return;
+		}
 		if (pr.merged && pr.mergeCommit !== null) {
 			await finishPrMerge(e, settings, t, pr.mergeCommit);
 			return;
@@ -1903,25 +1909,21 @@ export function createSupervisor(
 		ops.schedule();
 	}
 
-	/** One tracked Merging card whose PR is still open (OTTR-789). An idle card, or a card parked
-	 * with exactly the conflict reason, gets one per-PR read: mergeable false parks the idle card
-	 * needs_you, mergeable true returns the parked card to idle. A null mergeable (GitHub still
-	 * computes it), a PR that settled since the list, and a failed read write nothing. The stage,
-	 * the PR fields, pushSha, the branch and the worktree stay. Never throws. */
-	async function prConflictCard(
+	/** GitHub's merge verdict for the open PR of one tracked Merging card (OTTR-789): false
+	 * parks the idle card needs_you with the conflict reason, true returns a card parked with
+	 * exactly that reason to idle. Null (GitHub still computes it) and a card in any other
+	 * state write nothing. The stage, the PR fields, pushSha, the branch and the worktree stay. */
+	function prConflictVerdict(
 		e: SupervisorEntry,
 		t: ListedTask,
-		repo: string,
+		mergeable: boolean | null,
 		reason: string,
-	): Promise<void> {
+	): void {
 		const parked = t.state === "needs_you" && t.needsReason === reason;
 		if (t.state !== "idle" && !parked) return;
-		const pr = await prState(e, t, repo);
-		if (pr === null || pr.state !== "open") return;
 		// A write needs a verdict that contradicts the card: false (conflict) while it waits
-		// idle, true (can merge) while it is parked. Null (GitHub still computes it) equals
-		// neither flag, so it writes nothing.
-		if (pr.mergeable !== parked) return;
+		// idle, true (can merge) while it is parked. Null equals neither flag.
+		if (mergeable !== parked) return;
 		if (wentStale(e.store, t)) return;
 		e.store.updateTask(
 			t.id,
@@ -1938,8 +1940,25 @@ export function createSupervisor(
 		);
 	}
 
-	/** Every tracked Merging card: settle the card whose PR left the open set, and check the
-	 * card whose PR is still open for a merge conflict. */
+	/** One tracked Merging card whose PR is in the open list. The read exists only for the
+	 * merge verdict, so a card that cannot take one (not idle, not parked with the conflict
+	 * reason) gets no read. A PR that settled since the list and a failed read write nothing.
+	 * Never throws. */
+	async function prConflictCard(
+		e: SupervisorEntry,
+		t: ListedTask,
+		repo: string,
+		reason: string,
+	): Promise<void> {
+		const parked = t.state === "needs_you" && t.needsReason === reason;
+		if (t.state !== "idle" && !parked) return;
+		const pr = await prState(e, t, repo);
+		if (pr === null || pr.state !== "open") return;
+		prConflictVerdict(e, t, pr.mergeable, reason);
+	}
+
+	/** Every tracked Merging card: settle the card whose PR is not in the open list, and check
+	 * the card whose PR is in it for a merge conflict. */
 	async function prSettleMerging(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -1953,18 +1972,19 @@ export function createSupervisor(
 				t.cancelledAt !== null
 			)
 				continue;
-			if (open.has(t.prNumber))
-				await prConflictCard(e, t, repo, prConflictReason(t.prNumber));
-			else await settlePrCard(e, settings, t, repo);
+			const reason = prConflictReason(t.prNumber);
+			if (open.has(t.prNumber)) await prConflictCard(e, t, repo, reason);
+			else await settlePrCard(e, settings, t, repo, reason);
 		}
 	}
 
 	/** One PR pass per project, at most one open-PR list per poll window: a tracked Merging card
-	 * whose PR left the open set gets one per-PR call to read its settled state — merged finishes
-	 * the card, closed unmerged parks it needs_you. A tracked card whose PR is still open gets the
-	 * same per-PR call while it waits idle or holds the conflict reason — a PR that GitHub cannot
-	 * merge parks the card needs_you until GitHub can merge it again. The pass never merges or
-	 * closes anything and never throws; a failed poll retries at the next window. */
+	 * whose PR is not in the open list gets one per-PR call to read its state — merged finishes
+	 * the card, closed unmerged parks it needs_you. A tracked card whose PR is in the list gets
+	 * the same per-PR call while it waits idle or holds the conflict reason. An open PR that
+	 * GitHub cannot merge parks the card needs_you until GitHub can merge it again, in the list
+	 * or beyond its one page. The pass never merges or closes anything and never throws; a
+	 * failed poll retries at the next window. */
 	async function prPass(
 		e: SupervisorEntry,
 		settings: ProjectSettings,

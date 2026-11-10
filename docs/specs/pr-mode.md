@@ -159,10 +159,11 @@ ff-only merge flow is untouched.
 The supervisor gains a PR pass (`prPass`, server process, alongside
 `ciPass`): one open-PR list call per project per poll window (5 minutes, the
 Dependabot cadence pattern), response parsed with the `parsePullPage`
-untrusted-data rules; a tracked PR that left the open list gets one
-per-PR `gh api repos/{repo}/pulls/N` call to read its settled state. A
-tracked PR that is still in the open list gets the same per-PR call when its
-card waits `idle` or holds the conflict reason (see "Open PR that cannot
+untrusted-data rules; a tracked PR that is not in the open list gets one
+per-PR `gh api repos/{repo}/pulls/N` call to read its state. The list is one
+page of 100 pull requests, so that read can also say that the PR is open. A
+tracked PR that is in the open list gets the same per-PR call when its card
+waits `idle` or holds the conflict reason (see "Open PR that cannot
 merge").
 
 - `merged_at` set: the tracker fetches the target and finishes the card with
@@ -200,6 +201,11 @@ one of these conditions is true:
 
 A card in any other state gets no read. The cost is one more read for each
 such card in each 5-minute window.
+
+The open list is one page of 100 pull requests. A tracked PR that is not in
+the list always gets the per-PR read of "PR close without merge". When that
+read says that the PR is open (an older PR beyond the page, or a reopen
+since the list), the write rules below apply to it in the same way.
 
 The result of the read decides the write:
 
@@ -333,8 +339,12 @@ server remains the only writer of origin.
   with `needsReason` null, and the card log gets one line.
 - `mergeable` `null`, absent or not a boolean, a failed read, and a per-PR
   read that says the PR is no longer open: no write.
+- An open PR that is not in the open list (beyond its one page of 100): the
+  per-PR read parks the idle card on `mergeable: false` and returns the
+  parked card to `idle` on `mergeable: true`.
 - A card in any other state (`queued`, `running`, or `needs_you` with a
-  different reason) gets no per-PR read while its PR is open.
+  different reason) gets no per-PR read while its PR is in the open list,
+  and no write for an open PR in any case.
 - A parked card stays tracked: a merged PR finishes the card `done`, and a
   PR closed without a merge parks it `in_progress`/`needs_you` with the
   closed reason.

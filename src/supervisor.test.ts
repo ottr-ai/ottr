@@ -3332,6 +3332,65 @@ describe("prPass", () => {
 		store.close();
 	});
 
+	// The open list is one page of 100: an older open PR is not in it, and only the per-PR
+	// read knows that it is open. The merge verdict must still reach its card.
+	test("an open PR beyond the list page with a merge conflict parks the idle card", async () => {
+		const store = prModeProject("pr-conflict-beyond-page");
+		const t = prCard(store);
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: false }), []),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(PR7_CONFLICT);
+		expect(after.prNumber).toBe(7);
+		expect(after.pushSha).toBe("abc1234567890");
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 has merge conflicts; card parked");
+		store.close();
+	});
+
+	test("a parked card whose open PR is beyond the list page returns to idle when GitHub can merge it", async () => {
+		const store = prModeProject("pr-conflict-cleared-beyond-page");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "needs_you", needsReason: PR7_CONFLICT });
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: true }), []),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBe("abc1234567890");
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 can merge again; card waits on GitHub");
+		store.close();
+	});
+
+	test("an open PR beyond the list page writes nothing on a card parked for another reason, or queued", async () => {
+		const store = prModeProject("pr-conflict-beyond-page-other-state");
+		const other = prCard(store, 7);
+		store.updateTask(other.id, {
+			state: "needs_you",
+			needsReason: `${PR7_CONFLICT} Then reply.`,
+		});
+		const queued = prCard(store, 8);
+		store.updateTask(queued.id, { state: "queued" });
+		const before = [store.getTask(other.id)!, store.getTask(queued.id)!];
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: false }), []),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = [store.getTask(other.id)!, store.getTask(queued.id)!];
+		expect(after).toEqual(before);
+		store.close();
+	});
+
 	test("prMode off: no gh api call for a card that carries an open PR", async () => {
 		const store = ProjectStore.open(join(root, "pr-mode-off"));
 		const t = prCard(store);
