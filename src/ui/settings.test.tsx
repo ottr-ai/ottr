@@ -3346,45 +3346,58 @@ describe("ModelRolesSection save source", () => {
 	};
 
 	test("a learned read-only verdict locks Save before any edit", async () => {
-		resetCatalogCache();
-		const { container, unmount } = await mountRoles(
-			sourceFetch({
-				repo: null,
-				path: "/data",
-				ro: { path: "/data", cause: "mount" },
-			}),
-		);
-		try {
-			await act(async () => {});
-			// No edit yet: the verdict a refused save left locks the section on
-			// its own, so the user never clicks into the refused write again.
-			const save = saveButton(container);
-			expect(save.disabled).toBe(true);
-			const input =
-				container.querySelector<HTMLInputElement>(".role-add input");
-			expect(input?.disabled).toBe(true);
+		// Both causes lock: a read-only mount (EROFS/EACCES) and a plain
+		// unversioned folder (commit ""). Each hint must name the file and the
+		// Alate steps, so the acceptance holds for either verdict.
+		for (const cause of ["mount", "plain"] as const) {
+			resetCatalogCache();
+			const { container, unmount } = await mountRoles(
+				sourceFetch({
+					repo: null,
+					path: "/data",
+					ro: { path: "/data", cause },
+				}),
+			);
+			try {
+				await act(async () => {});
+				// No edit yet: the verdict a refused save left locks the section
+				// on its own, so the user never clicks into the refused write again.
+				const save = saveButton(container);
+				expect(save.disabled).toBe(true);
+				const input =
+					container.querySelector<HTMLInputElement>(".role-add input");
+				expect(input?.disabled).toBe(true);
 
-			// The note names the cause and the fix, and the button points at it
-			// for screen readers.
-			const hintId = save.getAttribute("aria-describedby");
-			const hint = [...container.querySelectorAll("p")].find(
-				(p) => p.id === hintId,
-			);
-			if (hint === null || hint === undefined)
-				throw new Error("read-only hint did not render");
-			expect(hint.tagName).toBe("P");
-			expect(hint.textContent).toContain("user/omp/agent/config.yml");
-			expect(hint.textContent).toContain("Import now");
-			expect(hint.textContent).toContain("Provision now");
-			// The card hint states the fact, not the save flow.
-			expect(container.textContent).toContain(
-				"Alate serves the data folder, so the board cannot save roles",
-			);
-			expect(container.textContent).not.toContain(
-				"through Alate's file editor",
-			);
-		} finally {
-			await unmount();
+				// The note names the cause and the fix, and the button points at
+				// it for screen readers.
+				const hintId = save.getAttribute("aria-describedby");
+				const hint = [...container.querySelectorAll("p")].find(
+					(p) => p.id === hintId,
+				);
+				if (hint === null || hint === undefined)
+					throw new Error(`read-only hint did not render (${cause})`);
+				expect(hint.tagName).toBe("P");
+				expect(hint.textContent).toContain("user/omp/agent/config.yml");
+				expect(hint.textContent).toContain("Import now");
+				expect(hint.textContent).toContain("Provision now");
+				if (cause === "mount")
+					expect(hint.textContent).toContain(
+						"The data folder is mounted read-only into Alate.",
+					);
+				else
+					expect(hint.textContent).toContain(
+						"Alate's data folder is not a git repo",
+					);
+				// The card hint states the fact, not the save flow.
+				expect(container.textContent).toContain(
+					"Alate serves the data folder, so the board cannot save roles",
+				);
+				expect(container.textContent).not.toContain(
+					"through Alate's file editor",
+				);
+			} finally {
+				await unmount();
+			}
 		}
 	});
 

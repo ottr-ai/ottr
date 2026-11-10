@@ -4398,7 +4398,12 @@ function RoleReadonlyNote({
 						reload the settings.
 					</>
 				) : (
-					"Alate's data folder is not a git repo, so a save cannot commit. Make the folder a git repo or point Alate at a GitHub repo, then reload the settings."
+					<>
+						Alate's data folder is not a git repo, so a save cannot commit. Make
+						the folder a git repo or point Alate at a GitHub repo, or edit{" "}
+						<code>user/omp/agent/config.yml</code> in the folder, then run
+						"Import now" and "Provision now" in Alate, and reload the settings.
+					</>
 				)}
 			</p>
 		</>
