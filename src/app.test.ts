@@ -9849,9 +9849,11 @@ describe("cancel keeps the worktree (R5-2)", () => {
 		// finish-kept and the board's held count still cover it (isKeptReason).
 		const state = await get("/api/state");
 		const b = (await state.json()) as {
-			keptWorktrees?: { held?: number; stale?: number };
+			keptWorktrees?: { held?: number; stale?: number; cards?: string[] };
 		};
 		expect(b.keptWorktrees?.held ?? 0).toBeGreaterThanOrEqual(1);
+		// The advisory names the card: the id rides with the counts so the bell can link it.
+		expect(b.keptWorktrees?.cards).toContain(t.id);
 	});
 });
 

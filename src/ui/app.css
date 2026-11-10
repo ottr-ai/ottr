@@ -1872,14 +1872,23 @@ button.notif-link {
 	display: inline;
 	min-height: 0;
 }
-/* The inbox footer ("Mark all as read") under the entries. Sticky at the panel's bottom
-   edge so a long, scrolling list never cuts it off; the negative margins cancel the
-   panel padding so its background covers the rows scrolling beneath it. */
+/* The inbox panel is a column: the rows scroll in .notif-scroll, the ack footer
+   ("Mark all as read") sits below it, so the footer never covers a row. */
+.popover.inbox-pop {
+	display: flex;
+	flex-direction: column;
+	overflow: hidden; /* the scroll region scrolls, not the panel; radius clips the footer */
+	padding-bottom: 0; /* the footer carries its own bottom padding */
+}
+.inbox-pop .notif-scroll {
+	min-height: 0; /* lets the column shrink below its content and scroll instead */
+	overflow-y: auto;
+	padding-bottom: 16px; /* the last row keeps its gap above the footer's border */
+}
 .inbox-foot {
-	position: sticky;
-	bottom: 0;
-	margin: 12px -16px -16px;
-	padding: 8px 16px 16px;
+	flex: none;
+	margin: 0 -16px; /* full-bleed under the panel's side padding, like before */
+	padding: 10px 16px 14px;
 	background: var(--field);
 	border-top: 1px solid var(--line-soft);
 }

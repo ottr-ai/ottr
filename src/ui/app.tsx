@@ -13997,7 +13997,7 @@ function appServerNotices(state: StateResponse | null): {
 	warnings: string[];
 	orphanList: OrphanProcess[];
 	orphansError: string | null;
-	keptCount: { held: number; stale: number };
+	keptCount: StateResponse["keptWorktrees"];
 } {
 	// An update holds new turns (scripts/update-image.ts): queued cards wait for the restart.
 	const draining = (state?.drainUntil ?? null) !== null;
@@ -14060,7 +14060,7 @@ function appNoticeKeys(
 	draining: boolean,
 	orphanList: OrphanProcess[],
 	orphansError: string | null,
-	keptCount: { held: number; stale: number },
+	keptCount: StateResponse["keptWorktrees"],
 	nowMs: number,
 ): {
 	updateIds: string[];
@@ -14304,7 +14304,7 @@ function AppInboxPanel(p: {
 	orphanList: OrphanProcess[];
 	orphansErrorKey: string | null;
 	orphansKey: string | null;
-	keptCount: { held: number; stale: number };
+	keptCount: StateResponse["keptWorktrees"];
 	keptKey: string | null;
 	alatePendingKey: string | null;
 	signinAdvisories: DeadSignIn[];
@@ -14437,78 +14437,81 @@ function AppInboxPanel(p: {
 			: null;
 	return (
 		<div id="inbox" popover="auto" className="popover notif-pop inbox-pop">
-			{critLine !== null && (
-				<section>
-					<h2>Critical</h2>
-					{critLine}
-				</section>
-			)}
-			{alarmList}
-			{updatesKey !== null && (
-				<section>
-					<h2>Upstream updates</h2>
-					<ul className="alarm-list">
-						<li data-inbox-key={updatesKey}>
-							<button
-								type="button"
-								className="alarm-link"
-								onClick={() => {
-									document.getElementById("inbox")?.hidePopover();
-									setShowUpdates(true);
-								}}
-							>
-								<Icon name="download" size={14} />
-								<span className="alarm-title">
-									{updateCount} update
-									{updateCount === 1 ? "" : "s"} ready to review
-								</span>
-								{isNew(updatesKey) && <span className="new-tag">New</span>}
-							</button>
-						</li>
-					</ul>
-				</section>
-			)}
-			<AppInfoLines
-				notice={notice}
-				noticeKey={noticeKey}
-				drainNotice={drainNotice}
-				drainKey={drainKey}
-				drainCommits={drainCommits}
-				behind={behind}
-				behindKey={behindKey}
-				behindCommits={behindCommits}
-				restartWait={restartWait}
-				restartWaitKey={restartWaitKey}
-				seedFailed={seedFailed}
-				seedFailKey={seedFailKey}
-				provisionError={provisionError}
-				provisionErrKey={provisionErrKey}
-				isNew={isNew}
-				setNotice={setNotice}
-			/>
-			<AppAdvisoryLines
-				state={state}
-				warnings={warnings}
-				orphanList={orphanList}
-				orphansError={orphansError}
-				orphansErrorKey={orphansErrorKey}
-				orphansKey={orphansKey}
-				keptCount={keptCount}
-				keptKey={keptKey}
-				alatePendingKey={alatePendingKey}
-				signinAdvisories={signinAdvisories}
-				nowMs={nowMs}
-				openTask={openTask}
-				isNew={isNew}
-			/>
-			{inbox.total === 0 && (
-				<section>
-					<h2>All clear</h2>
-					<p className="hint">
-						Tasks that need you, failed actions and Ottr notices appear here.
-					</p>
-				</section>
-			)}
+			{/* The rows scroll here; the ack footer sits outside, so it never covers a row. */}
+			<div className="notif-scroll">
+				{critLine !== null && (
+					<section>
+						<h2>Critical</h2>
+						{critLine}
+					</section>
+				)}
+				{alarmList}
+				{updatesKey !== null && (
+					<section>
+						<h2>Upstream updates</h2>
+						<ul className="alarm-list">
+							<li data-inbox-key={updatesKey}>
+								<button
+									type="button"
+									className="alarm-link"
+									onClick={() => {
+										document.getElementById("inbox")?.hidePopover();
+										setShowUpdates(true);
+									}}
+								>
+									<Icon name="download" size={14} />
+									<span className="alarm-title">
+										{updateCount} update
+										{updateCount === 1 ? "" : "s"} ready to review
+									</span>
+									{isNew(updatesKey) && <span className="new-tag">New</span>}
+								</button>
+							</li>
+						</ul>
+					</section>
+				)}
+				<AppInfoLines
+					notice={notice}
+					noticeKey={noticeKey}
+					drainNotice={drainNotice}
+					drainKey={drainKey}
+					drainCommits={drainCommits}
+					behind={behind}
+					behindKey={behindKey}
+					behindCommits={behindCommits}
+					restartWait={restartWait}
+					restartWaitKey={restartWaitKey}
+					seedFailed={seedFailed}
+					seedFailKey={seedFailKey}
+					provisionError={provisionError}
+					provisionErrKey={provisionErrKey}
+					isNew={isNew}
+					setNotice={setNotice}
+				/>
+				<AppAdvisoryLines
+					state={state}
+					warnings={warnings}
+					orphanList={orphanList}
+					orphansError={orphansError}
+					orphansErrorKey={orphansErrorKey}
+					orphansKey={orphansKey}
+					keptCount={keptCount}
+					keptKey={keptKey}
+					alatePendingKey={alatePendingKey}
+					signinAdvisories={signinAdvisories}
+					nowMs={nowMs}
+					openTask={openTask}
+					isNew={isNew}
+				/>
+				{inbox.total === 0 && (
+					<section>
+						<h2>All clear</h2>
+						<p className="hint">
+							Tasks that need you, failed actions and Ottr notices appear here.
+						</p>
+					</section>
+				)}
+			</div>
 			{inbox.total > 0 && (
 				<div className="inbox-foot">
 					<button
@@ -14674,13 +14677,16 @@ function AppInfoLines(p: {
 	);
 }
 
-/** The kept-worktree backlog line: cancelled cards still holding a worktree. */
+/** The kept-worktree backlog line: cancelled cards still holding a worktree, each named
+ * with a link into its card. */
 function AppKeptNotice(p: {
-	keptCount: { held: number; stale: number };
+	keptCount: StateResponse["keptWorktrees"];
 	keptKey: string | null;
+	openTask: (id: string) => void;
 	isNew: (key: string) => boolean;
 }) {
-	const { keptCount, keptKey, isNew } = p;
+	const { keptCount, keptKey, openTask, isNew } = p;
+	const cards = keptCount.cards ?? [];
 	return (
 		keptCount.held > 0 && (
 			<p className="notif-line" data-inbox-key={keptKey ?? undefined}>
@@ -14692,6 +14698,25 @@ function AppKeptNotice(p: {
 					{keptCount.stale > 0
 						? `, ${keptCount.stale} past the quarantine threshold`
 						: ""}
+					{cards.map((id, i) => (
+						<Fragment key={id}>
+							{i === 0 && ": "}
+							{i > 0 && ", "}
+							<button
+								type="button"
+								className="notif-link"
+								title={`Open card ${id}`}
+								onClick={() => {
+									// Navigation rows leave the panel: hiding first keeps the
+									// drawer unobstructed, like the alarm rows above.
+									document.getElementById("inbox")?.hidePopover();
+									openTask(id);
+								}}
+							>
+								{id}
+							</button>
+						</Fragment>
+					))}
 					.
 				</span>
 				{keptKey !== null && isNew(keptKey) && (
@@ -14713,7 +14738,7 @@ function AppAdvisoryLines(p: {
 	orphansError: string | null;
 	orphansErrorKey: string | null;
 	orphansKey: string | null;
-	keptCount: { held: number; stale: number };
+	keptCount: StateResponse["keptWorktrees"];
 	keptKey: string | null;
 	alatePendingKey: string | null;
 	signinAdvisories: DeadSignIn[];
@@ -14771,7 +14796,12 @@ function AppAdvisoryLines(p: {
 					inboxKey={orphansKey ?? undefined}
 				/>
 			)}
-			<AppKeptNotice keptCount={keptCount} keptKey={keptKey} isNew={isNew} />
+			<AppKeptNotice
+				keptCount={keptCount}
+				keptKey={keptKey}
+				openTask={openTask}
+				isNew={isNew}
+			/>
 			{alatePendingKey !== null && (
 				<p className="notif-line" data-inbox-key={alatePendingKey}>
 					<Icon name="info" size={16} />

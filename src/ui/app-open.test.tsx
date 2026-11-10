@@ -333,6 +333,30 @@ test("the bell opens another project's card and the board follows it", async () 
 	}
 });
 
+test("the kept-worktree advisory names its card and the link opens it", async () => {
+	const before = state.keptWorktrees;
+	// One cancelled card holds a worktree; the frame names it so the line can link it.
+	state.keptWorktrees = { held: 1, stale: 0, cards: ["BE-2"] };
+	await mountAt("/projects/alpha");
+	try {
+		const line = document.querySelector('[data-inbox-key^="kept:"]');
+		expect(line?.textContent).toContain(
+			"1 cancelled card still holds a worktree: BE-2.",
+		);
+		const link = line?.querySelector<HTMLButtonElement>("button.notif-link");
+		expect(link?.getAttribute("title")).toBe("Open card BE-2");
+		// The link is a real open: the drawer shows the card over its own project.
+		await click(link!);
+		await waitFor(drawerOpen);
+		expect(window.location.pathname).toBe("/projects/beta/tasks/BE-2");
+		expect(header()).toBe("Beta");
+		expect(drawer()?.querySelector("h2")?.textContent).toBe("Beta follow-up");
+	} finally {
+		state.keptWorktrees = before;
+		await unmountApp();
+	}
+});
+
 test("a cross-project lineage link switches the board to the linked card's project", async () => {
 	await mountAt("/projects/beta");
 	try {

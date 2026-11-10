@@ -1150,8 +1150,9 @@ export interface StateResponse {
 	orphans: OrphanProcess[];
 	/** Error from the last orphan process scan; null when the scan succeeded. Advisory only. */
 	orphansError: string | null;
-	/** Cancelled cards still holding a kept worktree: held total, stale past the keptWorktreeDays threshold. */
-	keptWorktrees: { held: number; stale: number };
+	/** Cancelled cards still holding a kept worktree: held total, stale past the keptWorktreeDays threshold,
+	 *  cards naming each held card so the advisory can link it (absent on frames from an older server). */
+	keptWorktrees: { held: number; stale: number; cards?: string[] };
 	/** While an update holds new turns (POST /api/drain): when the hold lapses unless the update renews it; null otherwise. */
 	drainUntil: number | null;
 	/** Commit subjects the pending update brings (POST /api/drain), sanitized; null when no hold. */

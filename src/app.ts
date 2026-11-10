@@ -4328,10 +4328,12 @@ export function createApp(deps: AppDeps) {
 		tasks: TaskCard[];
 		keptHeld: number;
 		keptStale: number;
+		keptCards: string[];
 	} {
 		const tasks: TaskCard[] = [];
 		let keptHeld = 0;
 		let keptStale = 0;
+		const keptCards: string[] = [];
 		for (const e of deps.projects.values()) {
 			try {
 				const settings = e.store.getSettings();
@@ -4344,6 +4346,8 @@ export function createApp(deps: AppDeps) {
 					const kept = keptCounts(t, now, days);
 					keptHeld += kept.held;
 					keptStale += kept.stale;
+					// One kept card is one held worktree (keptCounts), so its id names the advisory's link.
+					if (kept.held === 1) keptCards.push(t.id);
 					// Cancelled cards ride in the list too: the done lane shows them with a
 					// "Cancelled" chip. Every counter (slots, alarms, holds, coverage) either
 					// filters cancelledAt or reads state/stage facts a cancelled card no longer has.
@@ -4361,7 +4365,7 @@ export function createApp(deps: AppDeps) {
 			}
 		}
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
-		return { tasks, keptHeld, keptStale };
+		return { tasks, keptHeld, keptStale, keptCards };
 	}
 
 	/** The /system holds, from the same drain values and cards the state frame ships. */
@@ -4383,7 +4387,7 @@ export function createApp(deps: AppDeps) {
 
 	function stateResponse(): StateResponse {
 		const now = Date.now();
-		const { tasks, keptHeld, keptStale } = boardCards(now);
+		const { tasks, keptHeld, keptStale, keptCards } = boardCards(now);
 		const scan = currentOrphanScan();
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
 		let list: SignIn[] = [];
@@ -4430,7 +4434,7 @@ export function createApp(deps: AppDeps) {
 			inboxSeen: loadInboxSeen(),
 			orphans: scan.orphans,
 			orphansError: scan.error,
-			keptWorktrees: { held: keptHeld, stale: keptStale },
+			keptWorktrees: { held: keptHeld, stale: keptStale, cards: keptCards },
 			drainUntil: drainUntil > now ? drainUntil : null,
 			drainCommits: drainUntil > now ? drainCommits : null,
 			warnings: [
