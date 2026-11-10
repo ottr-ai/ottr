@@ -10941,6 +10941,7 @@ function DrawerSteps(p: {
 			<DrawerSec
 				id="drawer-steps"
 				label="Work steps"
+				defaultOpen={false}
 				head={
 					ctx === null ? undefined : (
 						<ContextMeter ctx={ctx} windowTok={windowTok} />
