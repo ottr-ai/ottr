@@ -8913,7 +8913,13 @@ describe("web push (R1-1, R2-3)", () => {
 
 	test("a comment wave pushes one pr: request event; the drawer ack clears the stamp", async () => {
 		const b = alertBoard("alert-pr-comments");
-		await b.subscribe("https://push.example/pr");
+		// Saved directly, not through the subscribe route: that POST arms a publishSoon
+		// timer (guarded fires it after every mutation), and when the timer wins the race
+		// against this test it publishes the still empty board, moves the diff baseline
+		// off null, and the baseline frame then pushes the card's own needs_you entry —
+		// a second key in the payload asserted below. Direct saveSubs keeps every
+		// publishState call here explicit: prev is null at the baseline, always.
+		saveSubs(b.m.g, [{ ...pushSub, endpoint: "https://push.example/pr" }]);
 		const s = b.s;
 		const HEAD = "c".repeat(40);
 		s.savePrReview({
@@ -8988,7 +8994,9 @@ describe("web push (R1-1, R2-3)", () => {
 
 	test("a rewritten draft is a fresh needs_you occurrence keyed by the run id", async () => {
 		const b = alertBoard("alert-pr-draft");
-		await b.subscribe("https://push.example/draft");
+		// Direct saveSubs, same reason as the comment-wave test above: the subscribe
+		// route's publishSoon timer must not publish the empty board before the baseline.
+		saveSubs(b.m.g, [{ ...pushSub, endpoint: "https://push.example/draft" }]);
 		const s = b.s;
 		const HEAD = "d".repeat(40);
 		s.savePrReview({
