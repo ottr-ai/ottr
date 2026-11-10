@@ -3792,7 +3792,7 @@ function DoneLaneTools(p: {
 	);
 }
 
-/** The project head's overflow menu: review, release and diagrams, plus the popover trigger. */
+/** The project head's overflow menu: review, release, diagrams and settings, plus the popover trigger. */
 function ProjectMenu(p: {
 	project: ProjectView;
 	/** The provisioned user layer; null before the first provisioning answer. */
@@ -3836,7 +3836,7 @@ function ProjectMenu(p: {
 							}
 							onClick={p.startReview}
 						>
-							<Icon name="shield-check" size={13} />
+							<Icon name="shield-check" />
 							Start review
 							{reviewNote !== null && <SkillGapMark note={reviewNote} />}
 						</button>
@@ -3871,6 +3871,22 @@ function ProjectMenu(p: {
 						Show diagrams
 					</button>
 				)}
+				{/* A real link, so a middle click opens the project's settings page in a
+				    new tab; a plain click walks the popstate path. */}
+				<a
+					className="ghost"
+					href={settingsPath(project.name)}
+					aria-label="Project settings"
+					title="Project settings"
+					onClick={(e) =>
+						navClick(e, () =>
+							settingsNavigate(`${SETTINGS_HASH}/${project.name}`),
+						)
+					}
+				>
+					<Icon name="gear" />
+					Project settings
+				</a>
 			</div>
 		</>
 	);
@@ -4305,31 +4321,15 @@ export function ProjectBoard({
 							{reviewNote !== null && <SkillGapMark note={reviewNote} />}
 						</button>
 					)}
-					{/* Settings shortcut: a real link, so a middle click opens the project's
-					    settings page in a new tab; a plain click walks the popstate path. */}
-					<a
-						className="project-settings"
-						href={settingsPath(project.name)}
-						aria-label="Project settings"
-						title="Project settings"
-						onClick={(e) =>
-							navClick(e, () =>
-								settingsNavigate(`${SETTINGS_HASH}/${project.name}`),
-							)
-						}
-					>
-						<Icon name="gear" size={14} />
-					</a>
-					{/* Rules alignment lives in project settings only; the menu lists the remaining actions. */}
-					{(project.archReview !== null || !project.gitless) && (
-						<ProjectMenu
-							project={project}
-							userLayer={userLayer ?? null}
-							startReview={() => setShowReview(true)}
-							showRelease={() => setShowRelease(true)}
-							showDiagrams={() => setShowDiagrams(true)}
-						/>
-					)}
+					{/* Project settings now lives in the menu, so every project gets the menu;
+					    review, release and diagrams stay conditional inside it. */}
+					<ProjectMenu
+						project={project}
+						userLayer={userLayer ?? null}
+						startReview={() => setShowReview(true)}
+						showRelease={() => setShowRelease(true)}
+						showDiagrams={() => setShowDiagrams(true)}
+					/>
 					{!project.gitless && (
 						<button
 							type="button"

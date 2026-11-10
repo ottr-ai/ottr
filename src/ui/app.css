@@ -2710,43 +2710,21 @@ button.notif-link {
 	color: var(--dim);
 	font-weight: 600;
 }
-/* The settings shortcut: the header's square control look on a link, so the
-   project's settings page also opens from a middle click or a new tab. */
-a.project-settings {
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	aspect-ratio: 1;
-	padding: 0;
-	font: inherit;
-	color: var(--text-strong);
-	background: var(--card);
-	border: 1px solid var(--line);
-	border-radius: 4px;
-	cursor: pointer;
-	transition:
-		background-color 0.12s var(--ease),
-		border-color 0.12s var(--ease),
-		transform 0.12s var(--ease);
-}
-a.project-settings:hover {
-	background: var(--card-hover);
-	border-color: var(--line-hover);
-}
-a.project-settings:active {
-	background: var(--card-active);
-	transform: scale(0.97);
-}
 /* Header actions: one square "more" button opens a menu of the project's actions, so
-   the bar holds only the search, the settings link, the menu and New task. An overdue
-   review stays out as the one nudge; the status span next to the name carries the
-   words. The button keeps grey stock: a review due is a nudge, not an alarm
-   (Grey-Is-Normal). */
+   the bar holds only the search, the menu and New task. Project settings lives in the
+   menu too. An overdue review stays out as the one nudge; the status span next to the
+   name carries the words. The button keeps grey stock: a review due is a nudge, not an
+   alarm (Grey-Is-Normal). */
 .project-more {
 	anchor-name: --project-more;
 	aspect-ratio: 1;
 	justify-content: center;
 	padding: 0;
+}
+/* The menu is open: the trigger reads as held, the same tie the bell menu gives .meters. */
+.project-more:has(+ :popover-open) {
+	background: var(--card-hover);
+	border-color: var(--line-hover);
 }
 .project-menu {
 	position-anchor: --project-more;
@@ -2767,14 +2745,37 @@ a.project-settings:active {
 	display: grid;
 	gap: 2px;
 }
-.project-menu button {
+.project-menu :is(button, a) {
 	justify-content: flex-start;
 	background: transparent;
 	border-color: transparent;
 }
-.project-menu button:hover:not(:disabled) {
+.project-menu :is(button, a):hover:not(:disabled) {
 	background: var(--card-hover);
 	border-color: var(--line-hover);
+}
+/* The settings row is the menu's one link: anchors miss the button base, so it
+   repeats the box a menu button gets, in the ghost colors. */
+.project-menu a {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 32px;
+	padding: 0 12px;
+	font: inherit;
+	font-size: 13.5px;
+	color: var(--text);
+	border: 1px solid transparent;
+	border-radius: 4px;
+	cursor: pointer;
+	text-decoration: none;
+	transition:
+		background-color 0.12s var(--ease),
+		border-color 0.12s var(--ease),
+		color 0.12s var(--ease);
+}
+.project-menu a:hover {
+	color: var(--text-strong);
 }
 .project-actions {
 	display: flex;

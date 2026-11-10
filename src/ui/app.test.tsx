@@ -5479,10 +5479,10 @@ describe("ProjectBoard settings shortcut", () => {
 		};
 	}
 
-	test("the header links to the project's settings page", async () => {
+	test("the project menu links to the project's settings page", async () => {
 		const { container, unmount } = await mountBoard();
 		try {
-			const link = container.querySelector("a.project-settings");
+			const link = container.querySelector(".project-menu a");
 			expect(link?.getAttribute("href")).toBe("/settings/proj");
 			expect(link?.getAttribute("aria-label")).toBe("Project settings");
 		} finally {
@@ -5493,7 +5493,7 @@ describe("ProjectBoard settings shortcut", () => {
 	test("a plain click walks the project's settings view", async () => {
 		const { container, unmount } = await mountBoard();
 		try {
-			const link = container.querySelector("a.project-settings");
+			const link = container.querySelector(".project-menu a");
 			if (link === null) throw new Error("settings shortcut missing");
 			let popped = 0;
 			window.addEventListener("popstate", () => {
