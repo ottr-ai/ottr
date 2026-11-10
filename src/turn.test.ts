@@ -93,6 +93,7 @@ import type { DetachedRun, WorkerTarget } from "./workers.ts";
 import {
 	isClean as gitIsClean,
 	PUSH_LANDED_BEFORE_ATTEMPT,
+	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
 	fetchOriginBranch as realFetchOriginBranch,
 	removeWorktree as realRemoveWorktree,
@@ -19854,7 +19855,73 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prNumber).toBe(null);
 	});
 
-	test("a card already carrying a PR never re-ships", async () => {
+	test("OTTR-799: a CI fix re-ships — the push updates the same PR, no second PR opens", async () => {
+		const pushes: unknown[][] = [];
+		let openPrCalls = 0;
+		const { store, loop, task } = prMergeSetup({
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async () => {
+				openPrCalls += 1;
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+		});
+		// The card as ciPrHeadReply requeued it: the open PR kept, the old head
+		// unpinned, a fix commit landed and reported integrated.
+		store.updateTask(task.id, {
+			prNumber: 12,
+			prUrl: "https://github.com/acme/repo/pull/12",
+			prHeadSha: "sha-old",
+			pushSha: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(pushes).toEqual([
+			[store.path, "ott/m", "https://github.com/acme/repo.git"],
+		]);
+		// One adopt-or-create call: the same PR is adopted, never a second one.
+		expect(openPrCalls).toBe(1);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		expect(after.prNumber).toBe(12);
+		expect(after.prHeadSha).toBe("sha-tip");
+		expect(after.pushSha).toBe("sha-tip");
+	});
+
+	test("OTTR-799: after a closed PR the second ship opens a fresh PR and stores the new number", async () => {
+		const { store, loop, task } = prMergeSetup({
+			openPr: async () => ({
+				ok: true as const,
+				pr: { number: 9, url: "https://github.com/acme/repo/pull/9" },
+			}),
+		});
+		// The card as settlePrCard parked it, then a reply ran the work and merge
+		// turns: the old PR #7 is closed, the card still carries its number.
+		store.updateTask(task.id, {
+			prNumber: 7,
+			prUrl: "https://github.com/acme/repo/pull/7",
+			prHeadSha: "sha-old",
+			pushSha: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(9);
+		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/9");
+		expect(after.prHeadSha).toBe("sha-tip");
+		expect(after.pushSha).toBe("sha-tip");
+	});
+
+	test("OTTR-799: a reply on a conflict-parked PR card merges and pushes again", async () => {
+		// The conflict park itself lands with OTTR-789's card; this proves the
+		// reply path (state queued, stage merging kept) re-ships.
 		const pushes: unknown[][] = [];
 		const { store, loop, task } = prMergeSetup({
 			pushBranch: async (...args: unknown[]) => {
@@ -19862,13 +19929,129 @@ describe("turn PR-mode merge settle", () => {
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		store.updateTask(task.id, { prNumber: 12 });
+		store.updateTask(task.id, {
+			prNumber: 12,
+			prUrl: "https://github.com/acme/repo/pull/12",
+			prHeadSha: "sha-old",
+			pushSha: null,
+			needsReason:
+				"PR #12 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.",
+		});
 		await loop.runTurn(store.name, task.id);
-		expect(pushes).toHaveLength(0);
+		expect(pushes).toHaveLength(1);
 		const after = store.getTask(task.id)!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(null);
+		expect(after.prHeadSha).toBe("sha-tip");
+	});
+
+	test("OTTR-799: a source-PR card's second ship never opens a second PR", async () => {
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 21, url: null } };
+			},
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "pr-head" : "sha-old",
+		});
+		store.updateTask(task.id, {
+			// A same-repo, non-Dependabot source PR already adopted as the card's PR.
+			...sourcePr({
+				sourcePrDependabot: false,
+				sourcePrHeadRef: "contrib/fix-branch",
+			}),
+			prNumber: 20,
+			prUrl: "https://github.com/acme/repo/pull/20",
+			prHeadSha: "pr-head",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(20);
+		expect(after.prHeadSha).toBe("pr-head");
+	});
+
+	test("OTTR-799: the re-ship pushes through the real pushBranch against a bare origin", async () => {
+		// Fixtures use their own spawn, never git() under test.
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+		const dir = mkdtempSync(join(tmpdir(), "ottr-799-"));
+		const bare = join(dir, "origin.git");
+		const main = join(dir, "main");
+		try {
+			run(dir, "init", "-q", "--bare", "-b", "main", bare);
+			run(dir, "clone", "-q", bare, main);
+			writeFileSync(join(main, "a.txt"), "a");
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "base");
+			run(main, "push", "-q", "origin", "main");
+			run(main, "switch", "-q", "-c", "ott/m");
+			writeFileSync(join(main, "fix.txt"), "f");
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "the fix");
+			const tip = run(main, "rev-parse", "HEAD");
+			const { store, loop, task } = prMergeSetup({
+				// The store fixture is not a git checkout; the real pushBranch runs
+				// against the bare-origin fixture. The URL is the bare path so the
+				// pinned-remote guard sees the clone's own origin.
+				pushBranch: async (_m: string, branch: string, _o: string) =>
+					pushBranchReal(main, branch, bare),
+				targetSha: async (_m: string, ref: string) =>
+					ref === "refs/heads/ott/m" ? tip : "sha-old",
+			});
+			store.updateTask(task.id, {
+				prNumber: 12,
+				prUrl: "https://github.com/acme/repo/pull/12",
+				prHeadSha: "sha-old",
+				pushSha: null,
+			});
+			await loop.runTurn(store.name, task.id);
+			const after = store.getTask(task.id)!;
+			expect(after.stage).toBe("merging");
+			expect(after.state).toBe("idle");
+			expect(after.prNumber).toBe(12);
+			expect(after.prHeadSha).toBe(tip);
+			expect(after.pushSha).toBe(tip);
+			expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
+				`${tip}\trefs/heads/ott/m`,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("OTTR-799: a PR merged mid-turn fails the ship closed into needs_you", async () => {
+		const { store, loop, task } = prMergeSetup({
+			openPr: async () => ({
+				ok: false as const,
+				// What GitHub answers when the merged PR left nothing to compare.
+				error: "HTTP 422: No commits between main and ott/m",
+			}),
+		});
+		store.updateTask(task.id, {
+			prNumber: 12,
+			prHeadSha: "sha-old",
+			pushSha: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("HTTP 422");
+		// The stale number stays; the next prPass settles by the merged rule.
 		expect(after.prNumber).toBe(12);
 	});
 

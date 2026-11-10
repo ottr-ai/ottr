@@ -101,9 +101,8 @@ steps change:
      PR).
   - Success: the card is `merging`/`idle` with the PR number, URL and head
     SHA stored, and `pushSha` pinned to the PR head so the CI watch takes
-    over. The card is not pickable while its PR is open (a gate in
-    `pickRunnable`), and it occupies no merge slot: a project may hold
-    several open PRs at once.
+    over. An idle card takes no merge slot, so a project may hold several
+    open PRs at once; only a queued card merges again (see below).
   - Failure: a failed push or a failed gh call parks the card at
     `merging`/`needs_you` with the command output, like today's push-failure
     park. Any user reply re-runs the merge turn; the agent sees a rebased
@@ -116,6 +115,42 @@ run for PR-mode cards: nothing local is pushed to the target. The
 `mainUnpushed` hold (`pushHold` / "waiting for main to reach origin/main")
 does not gate PR-mode cards either — the local target branch is never
 written.
+
+### The second merge turn (OTTR-799)
+
+A PR-carrying card merges again like any other card. The merge slot takes
+a queued `merging` card whether or not it carries a PR (`mergeSlot` gates
+on the queued state only, never on `prNumber`); an idle card is never
+picked, because it is not queued. The `integrated` settle re-runs the ship
+step: the server pushes the branch (`--force-with-lease`) and
+`openPullRequest` (src/prs.ts) adopts the open PR of the head, else creates
+one. The card stores the PR number and URL the step returned, and
+`prHeadSha` and `pushSha` pin the new branch tip, so the CI watch follows
+the new head.
+
+The paths that reach the second merge turn (each was stuck before
+OTTR-799):
+
+- CI failed on the PR head: the `ciPrHeadReply` requeue runs a work turn,
+  then the merge turn re-ships; the push updates the same PR.
+- PR closed without merge: the reply's merge turn pushes the branch and
+  opens a fresh PR; the card stores the new number, and `prPass` watches
+  only the new PR.
+- Any reply on a `merging` card with a `prNumber` (for example the conflict
+  park of OTTR-789, or a push-failure park): the merge turn re-ships under
+  the normal holds.
+
+While a merge turn is live, the supervisor passes stay off the card:
+`prPass` and the PR-head CI watch skip a card whose state is
+`running`/`preparing`, and the turn's own settle decides. `prPass` also
+skips a card in state `queued`: since OTTR-799 that state on a card with a
+`prNumber` is exactly a recovery card waiting for its merge dispatch, and
+a settle against the old PR (closed, merged, or conflicting) would park
+the recovery before the ship can run. The ship step never probes a PR's
+state: when GitHub cannot take the ship (for example the PR merged
+mid-turn and the branch adds no new commits), the ship fails closed into
+the `needs_you` park, and the next `prPass` settles the card by the merged
+or closed rule.
 
 ### Cards filed from an existing pull request
 
@@ -188,7 +223,7 @@ GitHub still computes the value.
 The conflict reason is one fixed text for each PR number:
 
 ```
-PR #N cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.
+PR #N cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.
 ```
 
 In each PR poll window, `prPass` looks at each tracked card whose PR is in
@@ -232,13 +267,15 @@ without a merge, the card parks `in_progress`/`needs_you` with the closed
 reason. A CI failure on the PR head of a parked card requeues the card as
 for an idle card and clears the conflict reason.
 
-Recovery: a human resolves the conflict on the pull request. When GitHub
-can merge the PR again, the next poll window returns the card to
-`merging`/`idle`. A reply on the card does not rebase and push the branch
-today. The scheduler does not pick a card in Merging that carries a PR
-(`mergeSlot`, src/scheduler.ts), and a merge turn does not ship such a card
-again (`shipPrCard`, src/turn.ts). The re-merge path, where a reply pushes
-the rebased branch to the open PR, is a separate card.
+Recovery: a reply is the recovery path (OTTR-799). The reply queues the
+card, the scheduler picks the queued card for the merge slot, the merge
+turn rebases the branch, and the ship step pushes it and updates the same
+pull request ("The second merge turn (OTTR-799)"). When GitHub can merge
+the PR again without a reply — the human resolved the conflict on GitHub —
+the next poll window returns the parked card to `merging`/`idle`. While
+the card is `queued` for its recovery merge turn, `prPass` skips it: a
+settle against the old PR state would park the recovery before the ship
+can run.
 
 Non-goals of this section:
 
@@ -329,6 +366,10 @@ server remains the only writer of origin.
   and worktree kept; a reply re-merges and opens a new PR.
 - CI failure on the PR head: one supervisor reply per head, card requeued;
   the fixed push updates the same PR.
+- OTTR-799: a queued `merging` card with a `prNumber` is pickable and
+  re-ships — the push updates the same PR (or opens a fresh one after a
+  close), and `prHeadSha`/`pushSha` pin the new tip; an idle PR card is
+  never picked; a source-PR card's second ship never opens a second PR.
 - A failed push or gh call parks `needs_you` with the output; a reply
   retries without opening a second PR.
 - Open PR with `mergeable: false`: the card is `merging`/`needs_you` with

@@ -340,15 +340,28 @@ describe("push hold (OTTR-506)", () => {
 		).toEqual([held, todo]);
 	});
 
-	test("prMode picks a merging card with prNumber null but not one with an open PR", () => {
+	test("a queued merging card re-merges even with an open PR; an idle one never does", () => {
+		// OTTR-799: the merge slot gates on the queued state only, never on
+		// prNumber — a PR-carrying card queued for a second merge turn (a CI
+		// fix, a reply on a closed PR) must not strand in the queue.
 		const withPr = task({ stage: "merging", queuedAt: 100, prNumber: 42 });
 		const noPr = task({ stage: "merging", queuedAt: 200 });
 		expect(pickRunnable([withPr, noPr], { ...opts, prMode: true })).toEqual([
+			withPr,
+		]);
+		// No prMode condition: the rule is the merge slot's alone.
+		expect(pickRunnable([withPr], opts)).toEqual([withPr]);
+		// An idle PR card is not queued, so it never takes the slot; the
+		// queued card behind it still merges.
+		const idle = task({
+			stage: "merging",
+			state: "idle",
+			queuedAt: 300,
+			prNumber: 42,
+		});
+		expect(pickRunnable([idle, noPr], { ...opts, prMode: true })).toEqual([
 			noPr,
 		]);
-		// The prNumber gate applies outside PR mode too.
-		expect(pickRunnable([withPr, noPr], opts)).toEqual([noPr]);
-		expect(pickRunnable([withPr], { ...opts, prMode: true })).toEqual([]);
 	});
 
 	test("pushHold: queued merges wait, the retry card and every other stage run", () => {

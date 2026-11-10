@@ -5628,7 +5628,10 @@ export function createTurnLoop(
 	 * rebases before the gates and the security review, so a clean rebased tree
 	 * alone proves nothing about their verdict. A needs_you report (a blocking
 	 * finding, a failed gate) must reach classify and park with the agent's
-	 * question — prNext stays null so classify decides. */
+	 * question — prNext stays null so classify decides. A queued merge turn on a
+	 * PR-carrying card re-ships (OTTR-799): the branch push updates the same PR or
+	 * opens a fresh one after a close, and the stored PR fields and pushSha pin
+	 * the new head. */
 	async function shipPrCard(st: TurnSettle): Promise<void> {
 		const outcome = st.result.outcome;
 		if (outcome?.status !== "integrated") {
@@ -5640,12 +5643,6 @@ export function createTurnLoop(
 					state: "needs_you",
 					needsReason: "The agent finished without calling report_outcome.",
 				};
-			return;
-		}
-		if (st.task.prNumber !== null) {
-			// A card already carrying a PR never re-ships: its PR is open and the
-			// tracker waits on GitHub; the card just stays merging/idle.
-			st.prNext = { stage: "merging", state: "idle", needsReason: null };
 			return;
 		}
 		if (st.task.sourcePrNumber !== null) {

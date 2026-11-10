@@ -294,10 +294,11 @@ function parsePull(body: unknown): PrDetail | null {
 	};
 }
 
-/** The needs_you reason of a card whose open PR conflicts with its target branch (OTTR-789).
- * prConflictVerdict parks with it and un-parks only on this exact text. Pure. */
+/** The needs_you reason of a card whose open PR conflicts with its target branch (OTTR-789;
+ * OTTR-799 added the reply recovery). prConflictVerdict parks with it and un-parks only on
+ * this exact text. Pure. */
 function prConflictReason(n: number): string {
-	return `PR #${n} cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.`;
+	return `PR #${n} cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.`;
 }
 
 /** The tracker's own git-proof rejection strings and the outcome each expects in the last
@@ -1547,6 +1548,14 @@ export function createSupervisor(
 
 	async function ciPass(e: SupervisorEntry, t: ListedTask): Promise<void> {
 		if (t.pushSha === null) return;
+		// OTTR-799: a PR card's second merge turn runs with the previous ship's
+		// pushSha still pinned; the turn's settle re-pins it. A CI reply here would
+		// queue a work turn under a live merge turn — next tick re-decides.
+		if (
+			t.stage === "merging" &&
+			(t.state === "running" || t.state === "preparing")
+		)
+			return;
 		const key = `${e.name}/${t.id}`;
 		const pushSha = t.pushSha;
 		const stop = (line?: string): void => {
@@ -1972,6 +1981,15 @@ export function createSupervisor(
 				t.cancelledAt !== null
 			)
 				continue;
+			// OTTR-799: a live merge turn settles its own card; a mid-turn settle would
+			// fight the ship step. wentStale cannot catch this: the snapshot and the row
+			// read the same state.
+			if (t.state === "running" || t.state === "preparing") continue;
+			// OTTR-799: a queued card with a PR is a recovery card (a reply on a closed
+			// PR or a conflict park, a CI fix); its merge turn re-ships and replaces the
+			// number. Settling it against the old PR parks the recovery before the ship
+			// can run.
+			if (t.state === "queued") continue;
 			const reason = prConflictReason(t.prNumber);
 			if (open.has(t.prNumber)) await prConflictCard(e, t, repo, reason);
 			else await settlePrCard(e, settings, t, repo, reason);

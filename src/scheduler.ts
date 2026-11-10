@@ -591,8 +591,8 @@ export interface PickOptions {
 	 * rejected server push). Every queued merge but the rejected card's rebase retry waits
 	 * (pushHold); the retry runs first, and its push ends the hold. */
 	mainUnpushed?: boolean;
-	/** True while the project merges via PR: a card with an open PR is never picked for
-	 * another merge turn, and mainUnpushed's hold is inert (mergeHold). */
+	/** True while the project merges via PR: a queued card re-runs its merge turn even with
+	 * an open PR (OTTR-799), and mainUnpushed's hold is inert (mergeHold). */
 	prMode?: boolean;
 	/** OTTR-708: looks a dependsOn id up across every project's store (findDep); null
 	 * counts the dependency as satisfied, like one missing from the own list. */
@@ -600,7 +600,9 @@ export interface PickOptions {
 }
 
 /** The oldest queued merge that no open review holds and whose dependencies are done; null
- * when a merge turn already runs or nothing qualifies. */
+ * when a merge turn already runs or nothing qualifies. A queued merge re-runs even while the
+ * card carries an open PR (OTTR-799's re-ship); an idle PR card never qualifies because it
+ * is not queued. */
 function mergeSlot(
 	live: ListedTask[],
 	running: ListedTask[],
@@ -612,7 +614,6 @@ function mergeSlot(
 		queued.find(
 			(t) =>
 				t.stage === "merging" &&
-				t.prNumber === null &&
 				mergeHold(live, t, {
 					mainUnpushed: o.mainUnpushed === true,
 					prMode: o.prMode === true,

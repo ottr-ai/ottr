@@ -9,6 +9,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
+import { classify } from "./runner.ts";
+import { pickRunnable } from "./scheduler.ts";
 import { ProjectStore, type TaskPatch } from "./store.ts";
 import {
 	churnTend,
@@ -22,7 +24,8 @@ import {
 	tendFamily,
 } from "./supervisor.ts";
 import fc from "./test/properties.ts";
-import type { ListedTask, ProjectSettings, Task } from "./types.ts";
+import { replyPatch } from "./turn.ts";
+import type { ListedTask, ProjectSettings, RunResult, Task } from "./types.ts";
 import type { SweptProcess } from "./workers.ts";
 
 const root = mkdtempSync(join(tmpdir(), "supervisor-"));
@@ -2980,7 +2983,7 @@ const openList = (ns: number[]) => ({
 });
 
 const PR7_CONFLICT =
-	"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.";
+	"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.";
 const PR_LIST = ["api", "repos/acme/widget/pulls?state=open&per_page=100"];
 const PR7_READ = ["api", "repos/acme/widget/pulls/7"];
 const PR8_READ = ["api", "repos/acme/widget/pulls/8"];
@@ -3147,6 +3150,137 @@ describe("prPass", () => {
 		expect(ops.calls.remove).toEqual([]);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 closed without merging");
+		store.close();
+	});
+
+	test("OTTR-799: prPass skips a card whose merge turn is live", async () => {
+		const store = prModeProject("pr-live-turn");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "running" });
+		const ops = fakeOps({ apiResult: () => openList([]) });
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("running");
+		expect(after.pushSha).toBe("abc1234567890");
+		expect(after.needsReason).toBeNull();
+		store.close();
+	});
+
+	test("OTTR-799: a failed re-ship park settles when the tracked PR merged", async () => {
+		const store = prModeProject("pr-reship-merged");
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "Opening the pull request failed: HTTP 422",
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-10T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		store.close();
+	});
+
+	test("OTTR-799: the fresh PR number is watched; nothing parks for the old closed PR", async () => {
+		const store = prModeProject("pr-fresh-number");
+		const t = prCard(store, 9);
+		const ops = fakeOps({ apiResult: () => openList([9]) });
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		// Old PR #7 is closed, but the card carries #9: no per-PR read of #7.
+		expect(ops.apiCalls.filter((a) => a[1]!.includes("pulls/7"))).toEqual([]);
+		store.close();
+	});
+
+	test("OTTR-799: the poll between the work turn and merge dispatch leaves the recovery queued", async () => {
+		// The card as settlePrCard parked it when PR #7 closed unmerged.
+		const store = prModeProject("pr-recover-poll");
+		const t = store.createTask("fix and re-land");
+		store.updateTask(t.id, {
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "PR #7 closed without merging",
+			prNumber: 7,
+			prUrl: "https://github.com/acme/widget/pull/7",
+			prHeadSha: "sha-old",
+			pushSha: null,
+			branch: "ott/m",
+			worktree: "wt-recover",
+		});
+		// The owner's reply: the real reply write queues the card, stage kept.
+		const parked = store.getTask(t.id)!;
+		store.updateTask(t.id, replyPatch(parked, "rebase onto main and re-land"));
+		// The work turn reports ready with a commit on the branch: the real
+		// classify decides merging/queued, and the settle write consumes the
+		// reply text and stamps queuedAt.
+		const next = classify({
+			kind: "work",
+			result: {
+				exitCode: 0,
+				sessionId: "s1",
+				model: null,
+				outcome: { status: "ready", summary: "rebased onto main" },
+				asked: null,
+				proposed: null,
+				recorded: [],
+				approvalRefused: false,
+				sawTerminalEnd: true,
+				finalText: "",
+				killed: false,
+				stderrTail: "",
+			} satisfies RunResult,
+			git: { commitsAhead: 1, clean: true, integrated: false },
+			target: "origin/main",
+			previousError: null,
+		});
+		expect(next).toEqual({
+			stage: "merging",
+			state: "queued",
+			needsReason: null,
+		});
+		store.updateTask(t.id, {
+			...next,
+			queuedAt: 1,
+			pendingPrompt: null, // the turn consumed the reply text
+		});
+		// The poll between the work turn and the merge dispatch: PR #7 is
+		// closed and the card is merging/queued. Settling it here parks the
+		// recovery before its ship can run — the pass must skip it.
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? { code: 0, stdout: pullBody({}), stderr: "" }
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const mid = store.getTask(t.id)!;
+		expect(mid.stage).toBe("merging");
+		expect(mid.state).toBe("queued");
+		expect(mid.needsReason).toBeNull();
+		// The merge dispatch picks the queued recovery card (the ship itself is
+		// covered by the turn tests: the fresh PR replaces #7).
+		const picked = pickRunnable(store.listTasks(), {
+			maxParallel: 1,
+			hasRules: true,
+			prMode: true,
+		});
+		expect(picked.map((p) => p.id)).toEqual([t.id]);
 		store.close();
 	});
 
