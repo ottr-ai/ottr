@@ -9864,6 +9864,19 @@ export function createApp(deps: AppDeps) {
 
 	// A folder source saves through alate's editor PUT: alate checks `base`
 	// (the sha256 the editor loaded) against the folder before writing.
+	// Alate's state and health carry no git-ness or writability field for a
+	// folder, so the board learns "cannot save" only from a refused save.
+	// The verdicts below remember that per folder path, in memory: they
+	// survive page reloads and clear at a server restart, so a mount that
+	// becomes writable re-arms Save instead of staying locked forever.
+	const folderSaveVerdicts = new Map<string, "plain" | "mount">();
+	function folderSaveVerdict(
+		path: string | null,
+	): { path: string; cause: "plain" | "mount" } | null {
+		if (path === null) return null;
+		const cause = folderSaveVerdicts.get(path);
+		return cause ? { path, cause } : null;
+	}
 	async function saveRolesFolder(
 		f: RolesSource,
 		content: string,
@@ -9876,8 +9889,11 @@ export function createApp(deps: AppDeps) {
 			// A read-only mount fails alate's PUT before any byte: alate
 			// answers its raw fs error (EROFS/EACCES). Map it to the
 			// read-only answer with the mount cause, so the editor locks
-			// with the mount hint instead of showing the raw code.
-			if (readOnlyMountError(w.error))
+			// with the mount hint instead of showing the raw code, and
+			// remember the verdict: the next GET locks the editor before
+			// any edit.
+			if (readOnlyMountError(w.error)) {
+				if (path !== null) folderSaveVerdicts.set(path, "mount");
 				return json(
 					{
 						error: "read-only: folder source",
@@ -9886,12 +9902,15 @@ export function createApp(deps: AppDeps) {
 					},
 					400,
 				);
+			}
 			return json({ error: w.error }, w.status);
 		}
 		if (w.body.commit === "") {
 			// Plain folder: alate wrote the bytes without a commit. Read-only
 			// must not leave an uncommitted write in an unversioned folder, so
-			// undo byte for byte with the hash the PUT gave us.
+			// undo byte for byte with the hash the PUT gave us, and remember
+			// the verdict for the next GET.
+			folderSaveVerdicts.set(path ?? "", "plain");
 			const back = await saveConfigYml(
 				alate,
 				f.content,
@@ -9907,6 +9926,9 @@ export function createApp(deps: AppDeps) {
 				400,
 			);
 		}
+		// A git folder saved: clear a stale verdict, so a folder that became
+		// writable (or was never refused) keeps Save armed.
+		if (path !== null) folderSaveVerdicts.delete(path);
 		// No refresh here: alate imported the new file inside its PUT. `base`
 		// stays null — a path source reports importedSha "" forever, so a
 		// commit as base would 409 every later save.
@@ -10376,10 +10398,13 @@ export function createApp(deps: AppDeps) {
 							hash: f.body.hash,
 							roles: readRoles(f.body.content),
 							fallbacks: readFallbacks(f.body.content),
-							// The data source: `repo` null arms the editor's up-front Save
-							// disable for a folder source, before any failed save says it.
+							// The data source: repo for Alate's GitHub source, path for a
+							// local folder.
 							repo: f.body.repo,
 							path: f.body.path,
+							// A folder the board saw refuse a save locks the editor on
+							// load, before any edit; null until such a save.
+							ro: folderSaveVerdict(f.body.path),
 							// One sign-in, on the board (docs/specs/provider-credentials.md): the
 							// board store's active providers; null when it cannot be read.
 							signIns: (() => {

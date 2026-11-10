@@ -4724,6 +4724,7 @@ extensions:
 			roles: Record<string, string>;
 			repo: { name: string; ref: string } | null;
 			path: string | null;
+			ro: { path: string; cause: string } | null;
 			signIns: string[] | null;
 			seed: { needed: boolean };
 		};
@@ -4736,6 +4737,7 @@ extensions:
 		// The source fields the editor's Save disable reads: this fake alate is a repo.
 		expect(b.repo).toEqual({ name: "o/data", ref: "main" });
 		expect(b.path).toBeNull();
+		expect(b.ro).toBeNull();
 		// The board store pinned by PI_CODING_AGENT_DIR decides the list: none there reads as null.
 		expect(b.signIns).toBeNull();
 		expect(typeof b.seed.needed).toBe("boolean");
@@ -4772,14 +4774,20 @@ extensions:
 		}
 	});
 
-	test("GET reports a folder source, the Save disable's input", async () => {
+	test("GET reports a folder source with no verdict before any save", async () => {
 		reset();
 		pathMode = true;
 		const res = await m.call("/api/model-roles");
 		expect(res.status).toBe(200);
-		const b = (await res.json()) as { repo: unknown; path: unknown };
+		const b = (await res.json()) as {
+			repo: unknown;
+			path: unknown;
+			ro: unknown;
+		};
 		expect(b.repo).toBeNull();
 		expect(b.path).toBe("/data");
+		// The board never saw this folder refuse a save, so nothing locks it.
+		expect(b.ro).toBeNull();
 	});
 
 	test("an unknown model or level is refused and nothing is committed", async () => {
@@ -5069,6 +5077,10 @@ extensions:
 		// One import for the conflict check; alate imports inside the PUT, so the route
 		// makes no import call of its own after it.
 		expect(imports()).toHaveLength(1);
+		// The folder saved, so no verdict locks it: the next GET keeps Save armed.
+		const armed = await m.call("/api/model-roles");
+		expect(armed.status).toBe(200);
+		expect(await armed.json()).toMatchObject({ ro: null });
 	});
 
 	test("a plain folder source answers read-only and restores the file", async () => {
@@ -5108,6 +5120,9 @@ extensions:
 				default: "zai/glm-5.3-flash:max",
 				slow: "anthropic/claude-opus-5-5:medium",
 			},
+			// The refused save left its verdict: the next load locks the editor
+			// before any edit.
+			ro: { path: "/data", cause: "plain" },
 		});
 	});
 
@@ -5137,6 +5152,21 @@ extensions:
 		expect(puts).toEqual([]);
 		expect(ghCalls).toEqual([]);
 		expect(snapshot).toBe(ORIGINAL);
+		// The mount verdict reaches the next GET, so the editor locks on load.
+		const get = await m.call("/api/model-roles");
+		expect(get.status).toBe(200);
+		expect(await get.json()).toMatchObject({
+			ro: { path: "/data", cause: "mount" },
+		});
+	});
+
+	test("a repo source never carries a folder verdict", async () => {
+		// The plain-folder and mount verdicts above are about /data; a repo
+		// source has no folder path, so nothing locks it.
+		reset();
+		const res = await m.call("/api/model-roles");
+		expect(res.status).toBe(200);
+		expect(await res.json()).toMatchObject({ ro: null });
 	});
 
 	test("an alate editor conflict passes through", async () => {

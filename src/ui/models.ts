@@ -128,6 +128,9 @@ export type RolesState = {
 	repo: { name: string; ref: string } | null;
 	/** The data folder's path when alate serves a folder instead of a repo, else null. */
 	path: string | null;
+	/** The folder verdict a refused save left: the board locks the editor on load.
+	    Null for a repo source, an untried folder, or a folder whose last save worked. */
+	ro: { path: string; cause: "plain" | "mount" } | null;
 	/** The providers with an active sign-in on the board; null when the board cannot read its store. */
 	signIns: string[] | null;
 	/** `roles` and `fallbacks`: the board copy's values, which tell whether the seed holds a save. */

@@ -4206,18 +4206,13 @@ const rolesStatus = (
 					tone: "ok",
 				};
 
-/** The card hint: where a save lands, or why it cannot on a folder source. */
-function ModelRolesHint({
-	state,
-	folderSource,
-}: {
-	state: RolesState | null;
-	folderSource: boolean;
-}) {
+/** The card hint: where a save lands, with or without a GitHub remote for the data
+    repo; a refused folder save replaces the flow with the fact. */
+function ModelRolesHint({ state }: { state: RolesState | null }) {
 	return (
 		<>
 			omp runs each role with its model, then with its fallbacks in order.{" "}
-			{folderSource ? (
+			{state?.ro ? (
 				<>Alate serves the data folder, so the board cannot save roles here.</>
 			) : state?.base === null ? (
 				<>
@@ -4384,21 +4379,23 @@ function RoleRows({
 /** The read-only note: why a save cannot commit, with the fix for each cause. */
 function RoleReadonlyNote({
 	ro,
+	uid,
 }: {
 	ro: { path: string; cause: "plain" | "mount" };
+	uid: string;
 }) {
 	return (
 		<>
 			<p className="auth-error" role="alert">
 				read-only: folder source {ro.path}
 			</p>
-			<p className="hint">
+			<p className="hint" id={`${uid}-ro-hint`}>
 				{ro.cause === "mount" ? (
 					<>
 						The data folder is mounted read-only into Alate. Make the mount
 						writable, or edit <code>user/omp/agent/config.yml</code> in the
-						folder, then run Import and Provision in Alate, and reload the
-						settings.
+						folder, then run "Import now" and "Provision now" in Alate, and
+						reload the settings.
 					</>
 				) : (
 					"Alate's data folder is not a git repo, so a save cannot commit. Make the folder a git repo or point Alate at a GitHub repo, then reload the settings."
@@ -4567,40 +4564,37 @@ function SeedStepLine({
 	);
 }
 
-/** The section's Save button: accent fill unless the source cannot take saves,
- *  disabled while clean, busy, read-only, or a folder source. */
+/** The section's Save button: accent fill unless read-only, disabled while clean or
+    busy; the read-only note's hint doubles as its screen-reader description. */
 function ModelRolesSaveButton({
 	ro,
-	folderSource,
-	folderHintId,
+	roHintId,
 	save,
 	dirty,
 	locked,
 	onClick,
 }: {
 	ro: { path: string; cause: "plain" | "mount" } | null;
-	folderSource: boolean;
-	folderHintId: string | null;
+	roHintId: string | null;
 	save: BusyState;
 	dirty: boolean;
 	locked: boolean;
 	onClick: () => void;
 }) {
-	const dead = ro !== null || folderSource;
 	return (
 		<div className="alate-def-actions">
 			<button
 				type="button"
-				// Plain button while the source cannot take saves: the accent fill reads
-				// clickable even at the disabled opacity, and the editor must read locked.
-				className={dead ? undefined : `primary${save.failed ? " failed" : ""}`}
-				onClick={onClick}
-				disabled={!dirty || locked || dead}
-				// The hint paragraph sits next to the button in the reading order; the
-				// description repeats it for a screen reader that lands on the button.
-				aria-describedby={
-					folderSource ? (folderHintId ?? undefined) : undefined
+				// Plain button while read-only: the accent fill reads clickable even at
+				// the disabled opacity, and the editor must read locked.
+				className={
+					ro !== null ? undefined : `primary${save.failed ? " failed" : ""}`
 				}
+				onClick={onClick}
+				disabled={!dirty || locked}
+				// The note above the button explains the lock; the description
+				// repeats it for a screen reader that lands on the button.
+				aria-describedby={ro !== null ? (roHintId ?? undefined) : undefined}
 			>
 				{save.busy && <span className="spinner" aria-hidden="true" />}
 				Save
@@ -4622,7 +4616,6 @@ function ModelRolesContent({
 	first,
 	missing,
 	ro,
-	folderSource,
 	fields,
 	fallbackFields,
 	addErr,
@@ -4648,8 +4641,6 @@ function ModelRolesContent({
 	first: string | undefined;
 	missing: string[];
 	ro: { path: string; cause: "plain" | "mount" } | null;
-	/** Alate serves a data folder: Save stays off before any edit, with the fix hint. */
-	folderSource: boolean;
 	fields: Record<string, string>;
 	fallbackFields: Record<string, string>;
 	addErr: string | null;
@@ -4704,7 +4695,7 @@ function ModelRolesContent({
 							checks Anthropic models, adversary the rest.
 						</p>
 					)}
-					{ro !== null && <RoleReadonlyNote ro={ro} />}
+					{ro !== null && <RoleReadonlyNote ro={ro} uid={uid} />}
 					<RoleAddForm
 						newName={newName}
 						setNewName={setNewName}
@@ -4714,18 +4705,9 @@ function ModelRolesContent({
 						locked={locked}
 						onAdd={onAdd}
 					/>
-					{folderSource && (
-						<p className="hint" id={`${uid}-folder-save`}>
-							A folder data source cannot take saves from the board. Edit{" "}
-							<code>user/omp/agent/config.yml</code> in the data folder, then
-							run "Import now" and "Provision now" in Alate, and reload the
-							settings.
-						</p>
-					)}
 					<ModelRolesSaveButton
 						ro={ro}
-						folderSource={folderSource}
-						folderHintId={`${uid}-folder-save`}
+						roHintId={`${uid}-ro-hint`}
 						save={save}
 						dirty={dirty}
 						locked={locked}
@@ -4797,10 +4779,7 @@ export function ModelRolesSection() {
 		{},
 	);
 	const [error, setError] = useState<string | null>(null);
-	const [ro, setRo] = useState<{
-		path: string;
-		cause: "plain" | "mount";
-	} | null>(null);
+	const [ro, setRo] = useState<RolesState["ro"]>(null);
 	const [newName, setNewName] = useState("");
 	const [addErr, setAddErr] = useState<string | null>(null);
 	const [commit, setCommit] = useState<string | null>(null);
@@ -4827,6 +4806,9 @@ export function ModelRolesSection() {
 			(s) => {
 				if (!live) return;
 				setState(s);
+				// A folder the board saw refuse a save locks the section before
+				// any edit; `?? null` keeps stale payloads from arming `ro`.
+				setRo(s.ro ?? null);
 				setRows(Object.entries(s.roles));
 				setChains(rowChains(Object.keys(s.roles), s.fallbacks));
 			},
@@ -4864,9 +4846,6 @@ export function ModelRolesSection() {
 	const first = models[0]?.selector;
 	// Every editor disables while a save runs or the source is read-only.
 	const locked = save.busy || ro !== null;
-	// Alate serves a data folder: a save takes alate's editor PUT and fails on a
-	// read-only mount or an unversioned folder, so Save stays off before any edit.
-	const folderSource = state !== null && state.repo === null;
 	const dirty =
 		state !== null &&
 		(rolesDirty(rows, state.roles) ||
@@ -5023,7 +5002,7 @@ export function ModelRolesSection() {
 			className="model-roles"
 			title="Model roles"
 			status={rolesStatus(loadErr, state)}
-			hint={<ModelRolesHint state={state} folderSource={folderSource} />}
+			hint={<ModelRolesHint state={state} />}
 		>
 			<ModelRolesContent
 				loadErr={loadErr}
@@ -5036,7 +5015,6 @@ export function ModelRolesSection() {
 				first={first}
 				missing={missing}
 				ro={ro}
-				folderSource={folderSource}
 				fields={fields}
 				fallbackFields={fallbackFields}
 				addErr={addErr}

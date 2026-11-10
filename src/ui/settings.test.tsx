@@ -3297,7 +3297,7 @@ describe("ModelRolesSection save source", () => {
 	/** The picker fixture's GET with alate's data-source fields merged in, and an
 	 *  optional POST /api/model-roles answer. */
 	const sourceFetch = (
-		source: { repo: unknown; path: unknown },
+		source: { repo: unknown; path: unknown; ro: unknown },
 		post?: () => Response,
 	): typeof fetch => {
 		const read = rolesFetch({ plan: "zai/glm-5.3-flash" });
@@ -3345,32 +3345,38 @@ describe("ModelRolesSection save source", () => {
 		return save;
 	};
 
-	test("a folder source disables Save before any edit, with the fix hint", async () => {
+	test("a learned read-only verdict locks Save before any edit", async () => {
 		resetCatalogCache();
 		const { container, unmount } = await mountRoles(
-			sourceFetch({ repo: null, path: "/data" }),
+			sourceFetch({
+				repo: null,
+				path: "/data",
+				ro: { path: "/data", cause: "mount" },
+			}),
 		);
 		try {
 			await act(async () => {});
-			// The edit arms dirty, but the folder source keeps Save off: the save
-			// would take alate's editor PUT and fail on the folder.
-			await armDirty(container);
+			// No edit yet: the verdict a refused save left locks the section on
+			// its own, so the user never clicks into the refused write again.
 			const save = saveButton(container);
 			expect(save.disabled).toBe(true);
+			const input =
+				container.querySelector<HTMLInputElement>(".role-add input");
+			expect(input?.disabled).toBe(true);
 
-			// The hint names the file and the Alate steps next to the dead button,
-			// and the button points at it for screen readers.
+			// The note names the cause and the fix, and the button points at it
+			// for screen readers.
 			const hintId = save.getAttribute("aria-describedby");
 			const hint = [...container.querySelectorAll("p")].find(
 				(p) => p.id === hintId,
 			);
 			if (hint === null || hint === undefined)
-				throw new Error("folder hint did not render");
+				throw new Error("read-only hint did not render");
 			expect(hint.tagName).toBe("P");
 			expect(hint.textContent).toContain("user/omp/agent/config.yml");
 			expect(hint.textContent).toContain("Import now");
 			expect(hint.textContent).toContain("Provision now");
-			// The card hint says the same: the save-flow copy contradicts nothing.
+			// The card hint states the fact, not the save flow.
 			expect(container.textContent).toContain(
 				"Alate serves the data folder, so the board cannot save roles",
 			);
@@ -3382,12 +3388,63 @@ describe("ModelRolesSection save source", () => {
 		}
 	});
 
+	test("a folder source without a refused save keeps Save working", async () => {
+		resetCatalogCache();
+		const NEW = "d".repeat(40);
+		const { container, unmount } = await mountRoles(
+			sourceFetch(
+				{ repo: null, path: "/data", ro: null },
+				() =>
+					// The git-folder success: alate's PUT answers a local commit.
+					new Response(
+						JSON.stringify({
+							commit: NEW,
+							base: null,
+							hash: "h2",
+							roles: { plan: "anthropic/claude-opus-5-5" },
+							fallbacks: { plan: ["openai/gpt-5"] },
+							seed: {
+								needed: false,
+								commit: null,
+								roles: null,
+								fallbacks: null,
+								expiresAt: null,
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					),
+			),
+		);
+		try {
+			await act(async () => {});
+			// A folder alone does not lock anything: alate commits a git folder
+			// itself, and the board cannot tell git-ness without alate saying it.
+			await armDirty(container);
+			const save = saveButton(container);
+			expect(save.disabled).toBe(false);
+
+			// The save lands and the steps line reports the local commit.
+			await act(async () => {
+				onClickOf(save)({});
+			});
+			for (let i = 0; i < 3; i++)
+				await act(async () => {
+					await Bun.sleep(0);
+				});
+			expect(container.textContent).toContain(
+				`Committed ${NEW.slice(0, 7)} to the data repo.`,
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
 	test("a repo source keeps Save working as today", async () => {
 		resetCatalogCache();
 		const NEW = "c".repeat(40);
 		const { container, unmount } = await mountRoles(
 			sourceFetch(
-				{ repo: { name: "o/data", ref: "main" }, path: null },
+				{ repo: { name: "o/data", ref: "main" }, path: null, ro: null },
 				() =>
 					new Response(
 						JSON.stringify({
