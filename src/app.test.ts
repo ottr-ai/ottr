@@ -6512,7 +6512,7 @@ describe("hindsight settings", () => {
 				await booted.call("/api/settings/hindsight")
 			).json()) as { memoryReason: string | null };
 			expect(v.memoryReason).toBeNull();
-			expect(await stateWarnings(booted.call)).not.toContain(
+			expect(await stateWarnings(booted.call)).not.toContainEqual(
 				expect.stringMatching(/^omp runs with no memory:/),
 			);
 		} finally {
@@ -6552,7 +6552,7 @@ describe("hindsight settings", () => {
 				backend: "hindsight",
 				memoryReason: null,
 			});
-			expect(await stateWarnings(booted.call)).not.toContain(
+			expect(await stateWarnings(booted.call)).not.toContainEqual(
 				expect.stringMatching(/^omp runs with no memory:/),
 			);
 		} finally {
