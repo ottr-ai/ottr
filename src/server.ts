@@ -76,6 +76,7 @@ import {
 	diffStat,
 	diffText,
 	fetchOriginBranch,
+	fetchPrHead,
 	git,
 	githubUrl,
 	hasRules,
@@ -681,6 +682,7 @@ const supervisor = createSupervisor(
 		targetCommits,
 		targetSha,
 		fetchOriginBranch,
+		fetchPrHead,
 	},
 	workerTarget,
 );

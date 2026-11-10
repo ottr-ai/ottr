@@ -1844,6 +1844,36 @@ export async function fetchOriginBranch(
 }
 
 /**
+ * OTTR-755: fetches one pull request's head into the main checkout with the board's git
+ * env (git() adds the host auth), so a Dependabot card's turn needs no git credentials of
+ * its own: card worktrees share the main checkout's refs. The caller builds the URL (the
+ * GitHub web base plus a validated owner/repo slug, forks.ts prepareForkFetch's shape —
+ * never remote names a work turn can re-point, R5-1) and keeps untrusted JSON out of it.
+ * The `+` refspec force-updates the ref, so a re-fetch always names the current head.
+ * Returns the error text, else null.
+ */
+export async function fetchPrHead(
+	mainPath: string,
+	/** Validated PR number: the refspec is built from it alone. */
+	n: number,
+	url: string,
+): Promise<string | null> {
+	if (!Number.isSafeInteger(n) || n <= 0) return `invalid PR number: ${n}`;
+	const guard = await checkPinnedRemote(mainPath, url);
+	if (guard !== null) return guard;
+	const r = await git(
+		["fetch", "--no-tags", url, `+refs/pull/${n}/head:refs/ottr/pr/${n}`],
+		mainPath,
+	);
+	return r.code === 0
+		? null
+		: redactUrlCredentials(
+				r.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git fetch exited ${r.code}`,
+			);
+}
+
+/**
  * OTTR-510: the server-side rebase behind an automatic push retry. A rejected merge push means
  * origin moved mid-merge; the server now runs this rebase itself — and the merge gates on the
  * result (runMergeGates) — before it retries the push, so the automatic path skips no gate and

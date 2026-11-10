@@ -32,6 +32,7 @@ import {
 	diffStat,
 	diffText,
 	fetchOriginBranch,
+	fetchPrHead,
 	GIT_AUTH_ENV_NAME,
 	git,
 	gitEnv,
@@ -4466,4 +4467,74 @@ describe("empty origin", () => {
 		expect(after.unpushed).toBeUndefined();
 		expect(await branchUnpushed(repo, "main")).toBe(false);
 	}, 60_000);
+});
+
+describe("fetchPrHead (OTTR-755)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-prh-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "a.txt"), "a");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		run(main, "push", "-q", "origin", "main");
+		return { dir, bare, main };
+	};
+
+	test("fetches a PR head into refs/ottr/pr/N and a linked worktree reads the ref", async () => {
+		const f = fixture();
+		try {
+			// The remote grows a pull ref like GitHub's refs/pull/N/head.
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "pr work");
+			const head = run(f.main, "rev-parse", "HEAD");
+			run(f.main, "push", "-q", "origin", "HEAD:refs/pull/5/head");
+			expect(await fetchPrHead(f.main, 5, f.bare)).toBeNull();
+			expect(run(f.main, "rev-parse", "refs/ottr/pr/5")).toBe(head);
+			// The force refspec moves the ref on a re-fetch, so a later card reads the
+			// current head, never a stale one.
+			run(f.main, ...id, "commit", "-q", "--allow-empty", "-m", "more pr work");
+			const moved = run(f.main, "rev-parse", "HEAD");
+			run(f.main, "push", "-q", "origin", "HEAD:refs/pull/5/head");
+			expect(await fetchPrHead(f.main, 5, f.bare)).toBeNull();
+			expect(run(f.main, "rev-parse", "refs/ottr/pr/5")).toBe(moved);
+			// A card worktree shares the main checkout's refs: the card's agent reads the
+			// PR head there without a fetch and without git credentials.
+			const wt = join(f.dir, "card");
+			run(f.main, "worktree", "add", "-q", wt, "-b", "ott/card");
+			expect(run(wt, "rev-parse", "refs/ottr/pr/5")).toBe(moved);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a missing PR ref fails without writing the ref, and a bad number is refused", async () => {
+		const f = fixture();
+		try {
+			const err = await fetchPrHead(f.main, 6, f.bare);
+			expect(err).toContain("refs/pull/6/head");
+			expect(() => run(f.main, "rev-parse", "refs/ottr/pr/6")).toThrow();
+			// The number alone builds the refspec: a non-positive or non-integer number
+			// never reaches git.
+			expect(await fetchPrHead(f.main, 0, f.bare)).toBe("invalid PR number: 0");
+			expect(await fetchPrHead(f.main, 1.5, f.bare)).toBe(
+				"invalid PR number: 1.5",
+			);
+			expect(() => run(f.main, "rev-parse", "refs/ottr/pr/0")).toThrow();
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
 });
