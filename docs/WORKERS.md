@@ -511,10 +511,21 @@ carries a Dockerfile:
     echo $?
 
 Exit 0 means the daemon built the target. Point `--opt target=` at a stage with
-a failing `RUN`, and buildctl exits non-zero. A client without the client
-certificate is refused in the TLS handshake. The server has no route to the
+a failing `RUN`, and buildctl exits non-zero. The server has no route to the
 daemon: it joins only the default network, and Docker isolates its bridge
 networks from each other.
+
+A check without a build proves the mutual TLS. Drop `--tlscert` and `--tlskey`
+from the command, and the daemon refuses the handshake. The command exits
+non-zero, and its error names the failed handshake:
+
+    docker compose --profile build exec worker-a sh -c '
+      buildctl --tlscacert "$BUILDKIT_TLS_CA" debug workers 2>&1 | tail -1'
+    # error: failed to list workers: Unavailable: ... remote error: tls: certificate required
+
+The observed text varies with the TLS version: `tls: certificate required`, or a
+connection reset when the daemon closes the handshake first. A client that
+carries the client certificate gets the worker table and exit 0.
 
 Limits keep a build from starving the host: `OTTR_BUILDKIT_MEM_LIMIT` (default
 8g) and `OTTR_BUILDKIT_CPUS` (default 4) cap the daemon, and the cache cap

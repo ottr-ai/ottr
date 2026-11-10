@@ -132,6 +132,12 @@ describe("the buildkit sidecar compose shape", () => {
 		);
 		expect(composeText).toContain("gcpolicy");
 		expect(composeText).toContain("gc = true");
+		// gcpolicy is an ARRAY of tables in buildkitd's config (upstream
+		// docs/buildkitd.toml.md); the single-table form is not the documented shape.
+		expect(composeText).toContain("[[worker.oci.gcpolicy]]");
+		// The daemon reads the config as uid 1000; a 0600 root file would stop it
+		// with "failed to load config from /config/buildkitd.toml".
+		expect(composeText).toContain("chmod 0444 /config/buildkitd.toml");
 	});
 
 	test("the worker image installs a pinned, checksummed buildctl", () => {
