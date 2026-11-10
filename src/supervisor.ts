@@ -16,7 +16,7 @@ import { classify } from "./runner.ts";
 import { isRetro, isReview, liveCard } from "./scheduler.ts";
 import { readTranscript } from "./session.ts";
 import type { ProjectStore } from "./store.ts";
-import { isKeptReason, parseReleaseVersion } from "./turn.ts";
+import { dependabotHead, isKeptReason, parseReleaseVersion } from "./turn.ts";
 import type {
 	GitFacts,
 	ListedTask,
@@ -173,11 +173,6 @@ function fenceSafe(log: string): string {
 		.split("\n")
 		.map((l) => (l.startsWith("```") ? ` ${l}` : l))
 		.join("\n");
-}
-
-/** First line prefix of a Dependabot card prompt; also the dedupe key, so #1 never matches #12. Pure. */
-function dependabotHead(n: number, repo: string): string {
-	return `Dependabot PR #${n} (${githubHost().webBase}/${repo}/pull/${n})`;
 }
 
 /** Full card prompt for an open Dependabot PR; the title comes from GitHub JSON, so it is

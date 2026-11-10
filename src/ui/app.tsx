@@ -11638,6 +11638,10 @@ function DrawerActions(p: {
 	rerunUrl: string | null;
 	rerunFailedJobs: () => Promise<boolean>;
 	rerunError: string | null;
+	/** OTTR-781: true on a cancelled Dependabot card; shows the Refile action. */
+	refileAvailable: boolean;
+	runRefile: () => Promise<boolean>;
+	refileError: string | null;
 	rerunDone: boolean;
 	runCancel: () => Promise<boolean>;
 }) {
@@ -11657,6 +11661,9 @@ function DrawerActions(p: {
 		rerunUrl,
 		rerunFailedJobs,
 		rerunError,
+		refileAvailable,
+		runRefile,
+		refileError,
 		rerunDone,
 		runCancel,
 	} = p;
@@ -11757,10 +11764,26 @@ function DrawerActions(p: {
 						{task.stage === "done" ? "Delete task" : "Cancel task"}
 					</BusyButton>
 				)}
+				{/* OTTR-781: a cancelled Dependabot card blocks its PR; Refile files a
+						    fresh card for the same PR so the ship step can adopt it. */}
+				{refileAvailable && (
+					<BusyButton
+						title="Files a fresh card for this Dependabot PR with the same prompt and source-PR fields; a card that still covers the PR blocks the refile"
+						run={runRefile}
+					>
+						<Icon name="refresh-cw" />
+						Refile
+					</BusyButton>
+				)}
 			</div>
 			{/* OTTR-604: the re-run error and confirmation render as full-width
 					    lines below the actions row, not as flex items inside it, so they
 					    align with the drawer's content margin and keep their spacing. */}
+			{refileError !== null && (
+				<p className="auth-error" role="alert">
+					{refileError}
+				</p>
+			)}
 			{rerunUrl !== null && !cancelled && rerunError !== null && (
 				<p className="auth-error" role="alert">
 					{rerunError}
@@ -12647,6 +12670,36 @@ export function Drawer({
 			return false;
 		}
 	};
+	// OTTR-781: a cancelled Dependabot card can be refiled — the fresh card copies the
+	// prompt and source-PR fields, so the ship step adopts the PR instead of opening a
+	// duplicate. Available only on a cancelled card whose prompt head names a Dependabot PR.
+	const refileAvailable =
+		cancelled &&
+		(task.prompt.split("\n", 1)[0] ?? "").startsWith("Dependabot PR #");
+	const [refileError, setRefileError] = useState<string | null>(null);
+	useEffect(() => {
+		setRefileError(null);
+	}, [rerunTaskId]);
+	const runRefile = async (): Promise<boolean> => {
+		setRefileError(null);
+		if (
+			!(await confirmDialog(
+				`File a fresh card for this Dependabot PR? ${task.id} stays cancelled; a card that still covers the PR blocks the refile.`,
+				{ ok: "Refile" },
+			))
+		)
+			return true;
+		try {
+			await post<{ id: string }>(
+				`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/refile`,
+				{},
+			);
+			return true;
+		} catch (e) {
+			setRefileError(e instanceof Error ? e.message : String(e));
+			return false;
+		}
+	};
 	// The rank strip leads: the picked segment presses at once, the triage POST
 	// follows, a failure rolls the strip back and lands in the inline alert
 	// (onError).
@@ -13147,6 +13200,9 @@ export function Drawer({
 						rerunUrl={rerunUrl}
 						rerunFailedJobs={rerunFailedJobs}
 						rerunError={rerunError}
+						refileAvailable={refileAvailable}
+						runRefile={runRefile}
+						refileError={refileError}
 						rerunDone={rerunDone}
 						runCancel={runCancel}
 					/>

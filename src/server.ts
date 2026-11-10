@@ -607,6 +607,9 @@ const loop = createTurnLoop(projects, {
 	// OTTR-760: the ship step comments on a card's source PR ("@dependabot rebase", or the
 	// fixes note) when the work cannot ride a push to the PR's head branch.
 	prComment: commentOnPullRequest,
+	// OTTR-781: the ship step fetches a legacy Dependabot card's source PR head to
+	// adopt the PR instead of opening a duplicate one.
+	fetchPrHead,
 	prIntegrated,
 	// OTTR-465: late-bound — app exists below the loop, like drained().
 	pushAuthKind: (url) => app.pushAuthKind(url),

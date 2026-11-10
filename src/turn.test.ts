@@ -60,6 +60,7 @@ import {
 	cancelKeptReason,
 	checkRunError,
 	createTurnLoop,
+	dependabotHead,
 	FORK_HOLD_REASON,
 	generateTitle,
 	getSettingsLogged,
@@ -68,6 +69,7 @@ import {
 	logStoreError,
 	MERGE_HOLD_MISMATCH_REASON,
 	modelSwap,
+	parseDependabotHeadLine,
 	parseReleaseVersion,
 	parseTopicReport,
 	tmpEnrichNeedsReason,
@@ -1490,6 +1492,42 @@ describe("turn helpers", () => {
 		expect(parseReleaseVersion("no version here")).toBe(null);
 		expect(parseReleaseVersion("v1 is not semantic")).toBe(null);
 		expect(parseReleaseVersion("xv1.2.3 has no word boundary")).toBe(null);
+	});
+
+	test("parseDependabotHeadLine: this repo's head line only (OTTR-781)", () => {
+		expect(
+			parseDependabotHeadLine(dependabotHead(30, "acme/repo"), "acme/repo"),
+		).toBe(30);
+		// The real card shape: the head line carries a `: title` suffix.
+		expect(
+			parseDependabotHeadLine(
+				`${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+				"acme/repo",
+			),
+		).toBe(30);
+		expect(
+			parseDependabotHeadLine(dependabotHead(30, "other/repo"), "acme/repo"),
+		).toBe(null);
+		expect(
+			parseDependabotHeadLine(
+				"Dependabot PR #030 (https://github.com/acme/repo/pull/030)",
+				"acme/repo",
+			),
+		).toBe(null);
+		expect(
+			parseDependabotHeadLine(
+				"Dependabot PR #0 (https://github.com/acme/repo/pull/0)",
+				"acme/repo",
+			),
+		).toBe(null);
+		expect(
+			parseDependabotHeadLine(
+				"Dependabot PR #30 (https://ghe.acme.com/acme/repo/pull/30)",
+				"acme/repo",
+			),
+		).toBe(null);
+		expect(parseDependabotHeadLine("merge please", "acme/repo")).toBe(null);
+		expect(parseDependabotHeadLine("", "acme/repo")).toBe(null);
 	});
 
 	test("parseTopicReport: last line wins, normalized", () => {
@@ -19210,6 +19248,94 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prHeadSha).toBe("pr-head");
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
+	});
+
+	test("a legacy Dependabot card adopts its PR instead of opening a second one (OTTR-781)", async () => {
+		const fetches: unknown[][] = [];
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			// OTTR-781: the ship step fetches the legacy card's source PR head itself.
+			fetchPrHead: async (...args: unknown[]) => {
+				fetches.push(args);
+				return null;
+			},
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" || ref === "refs/ottr/pr/30"
+					? "head30"
+					: "sha-old",
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a Dependabot PR");
+			},
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		// A pre-OTTR-760 card: no source PR fields, only the prompt's first line.
+		store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		expect(fetches).toEqual([
+			[store.path, 30, "https://github.com/acme/repo.git"],
+		]);
+		const after = store.getTask(task.id)!;
+		expect(after.prNumber).toBe(30);
+		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/30");
+		expect(after.prHeadSha).toBe("head30");
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(logText(store, task.id)).toContain(
+			"- source PR #30 stays the card's PR",
+		);
+	});
+
+	test("a Dependabot head line for another repo does not adopt (OTTR-781)", async () => {
+		const fetches: unknown[][] = [];
+		const opens: unknown[] = [];
+		const { store, loop, task } = prMergeSetup({
+			fetchPrHead: async (...args: unknown[]) => {
+				fetches.push(args);
+				return "unreachable";
+			},
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 99, url: "https://github.com/acme/repo/pull/99" },
+				};
+			},
+		});
+		store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "other/repo")}: Bump x`,
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(fetches).toEqual([]);
+		expect(opens).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.prNumber).toBe(99);
+	});
+
+	test("a failed source-PR head fetch parks instead of opening a PR (OTTR-781)", async () => {
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			fetchPrHead: async () => "network down",
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("Source PR #30 head fetch failed");
+		expect(after.needsReason).toContain("network down");
 	});
 
 	test("fixes on a cross-repo source PR park with the PR named and never open a PR (OTTR-760)", async () => {

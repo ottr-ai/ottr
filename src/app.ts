@@ -1763,6 +1763,21 @@ function bootReconcileLayers(deps: AppDeps): void {
 	}
 }
 
+/** OTTR-781: head-line prefix of a Dependabot card prompt, e.g.
+ * `Dependabot PR #58 (https://github.com/acme/repo/pull/58)`, else null: the first line
+ * must match the exact format with a positive safe integer n written without leading
+ * zeros. Prompt text is untrusted; the prefix is only ever compared against other
+ * cards' first lines, never fetched. Pure. */
+export function dependabotHeadPrefix(line: string): string | null {
+	const m = /^Dependabot PR #(\d+) \(([^)\s]+)\)/.exec(line);
+	if (m === null) return null;
+	const digits = m[1];
+	const n = Number(digits);
+	if (!Number.isSafeInteger(n) || n < 1 || digits !== String(n) || m[2] === "")
+		return null;
+	return `Dependabot PR #${n} (${m[2]})`;
+}
+
 export function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
 		createAppNetworkDefaults(deps);
@@ -6370,6 +6385,49 @@ export function createApp(deps: AppDeps) {
 		return json({ ok: true });
 	}
 
+	async function handlePOSTProjectsTasksRefileByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/refile">,
+	): Promise<Response> {
+		// No body: this route takes no options (api()'s Origin wall still covers the POST).
+		const found = resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		const { e, task } = found;
+		if (task.cancelledAt === null)
+			return json({ error: "only a cancelled card can be refiled" }, 409);
+		// OTTR-781: a cancelled Dependabot card blocks its PR in the supervisor's dedupe;
+		// refile files a fresh card with the same prompt and source-PR fields so the ship
+		// step adopts the PR instead of opening a duplicate.
+		const prefix = dependabotHeadPrefix(task.prompt.split("\n", 1)[0] ?? "");
+		if (prefix === null) return json({ error: "not a Dependabot card" }, 400);
+		// Any still-open card covering the same PR blocks the refile: the refiled card
+		// itself while it runs, and a done card too (the update already landed). The
+		// cancelled source card never blocks (it is cancelled).
+		const blocker = e.store
+			.listTasks()
+			.find(
+				(t) =>
+					(t.prompt.split("\n", 1)[0] ?? "").startsWith(prefix) &&
+					t.cancelledAt === null &&
+					t.stage !== "done",
+			);
+		if (blocker !== undefined)
+			return json(
+				{ error: `${blocker.id} already covers this Dependabot PR` },
+				409,
+			);
+		const child = e.store.createTask(task.prompt);
+		e.store.updateTask(child.id, {
+			sourcePrNumber: task.sourcePrNumber,
+			sourcePrUrl: task.sourcePrUrl,
+			sourcePrHeadRef: task.sourcePrHeadRef,
+			sourcePrHeadSha: task.sourcePrHeadSha,
+			sourcePrCrossRepo: task.sourcePrCrossRepo,
+			sourcePrDependabot: task.sourcePrDependabot,
+		});
+		deps.schedule();
+		return json({ ok: true, id: child.id });
+	}
+
 	async function handlePOSTProjectsTasksModelByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/model">,
 	): Promise<Response> {
@@ -10763,6 +10821,10 @@ export function createApp(deps: AppDeps) {
 		"/api/projects/:project/tasks/:id/cancel": {
 			POST: (req) =>
 				api(req, () => handlePOSTProjectsTasksCancelByProjectAndId(req)),
+		},
+		"/api/projects/:project/tasks/:id/refile": {
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsTasksRefileByProjectAndId(req)),
 		},
 		"/api/projects/:project/tasks/:id/stop": {
 			POST: (req) =>

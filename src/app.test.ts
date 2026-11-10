@@ -34,6 +34,7 @@ import type { Server } from "bun";
 import {
 	behindMain,
 	boardWarnings,
+	dependabotHeadPrefix,
 	type Entry,
 	pickEncoding,
 	reconcileLayerUse,
@@ -5512,6 +5513,105 @@ describe("steer cancel route", () => {
 			{},
 		);
 		expect(unknown.status).toBe(404);
+	});
+});
+
+describe("refile route (OTTR-781)", () => {
+	// A cancelled Dependabot card whose head line names PR #58, with the source-PR
+	// fields the refile must copy onto the fresh card.
+	function makeCancelledDependabotCard(): Task {
+		const t = store.createTask(
+			"Dependabot PR #58 (https://github.com/acme/repo/pull/58): Bump vite from 5 to 7",
+		);
+		store.updateTask(t.id, {
+			cancelledAt: Date.now(),
+			sourcePrNumber: 58,
+			sourcePrUrl: "https://github.com/acme/repo/pull/58",
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+			sourcePrHeadSha: "abc123",
+			sourcePrCrossRepo: false,
+			sourcePrDependabot: true,
+		});
+		return t;
+	}
+
+	test(
+		"refile on a cancelled Dependabot card files one card with the source PR " +
+			"fields (OTTR-781)",
+		async () => {
+			const t = makeCancelledDependabotCard();
+			const before = store.listTasks().length;
+			const res = await post(`/api/projects/p1/tasks/${t.id}/refile`, {});
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { ok: boolean; id: string };
+			expect(body.ok).toBe(true);
+			// Exactly one new card, with the same prompt and all six source-PR fields.
+			expect(store.listTasks().length).toBe(before + 1);
+			const child = store.getTask(body.id)!;
+			expect(child.prompt).toBe(store.getTask(t.id)!.prompt);
+			expect(child.sourcePrNumber).toBe(58);
+			expect(child.sourcePrUrl).toBe("https://github.com/acme/repo/pull/58");
+			expect(child.sourcePrHeadRef).toBe("dependabot/npm_and_yarn/vite-7.1.2");
+			expect(child.sourcePrHeadSha).toBe("abc123");
+			expect(child.sourcePrCrossRepo).toBe(false);
+			expect(child.sourcePrDependabot).toBe(true);
+			// The fresh-card default: todo, queued.
+			expect(child.stage).toBe("todo");
+			expect(child.state).toBe("queued");
+			// A second refile files nothing while the refiled card is open.
+			const again = await post(`/api/projects/p1/tasks/${t.id}/refile`, {});
+			expect(again.status).toBe(409);
+			expect(await errorOf(again)).toContain(child.id);
+			expect(store.listTasks().length).toBe(before + 1);
+		},
+	);
+
+	test("refile refuses a cancelled non-Dependabot card (OTTR-781)", async () => {
+		const t = store.createTask("fix the flake");
+		store.updateTask(t.id, { cancelledAt: Date.now() });
+		const before = store.listTasks().length;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/refile`, {});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe("not a Dependabot card");
+		expect(store.listTasks().length).toBe(before);
+	});
+
+	test("an open card covering the same PR blocks the refile (OTTR-781)", async () => {
+		// Another card with the same head line, still open: it owns the PR already.
+		store.createTask(
+			"Dependabot PR #59 (https://github.com/acme/repo/pull/59): Bump esbuild from 1 to 2",
+		);
+		const t = store.createTask(
+			"Dependabot PR #59 (https://github.com/acme/repo/pull/59): Bump esbuild from 1 to 2",
+		);
+		store.updateTask(t.id, { cancelledAt: Date.now() });
+		const before = store.listTasks().length;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/refile`, {});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toContain("already covers");
+		expect(store.listTasks().length).toBe(before);
+	});
+});
+
+describe("dependabotHeadPrefix (OTTR-781)", () => {
+	test("exact format yields the prefix, with or without a title suffix", () => {
+		const line =
+			"Dependabot PR #58 (https://github.com/acme/repo/pull/58): Bump vite";
+		expect(dependabotHeadPrefix(line)).toBe(
+			"Dependabot PR #58 (https://github.com/acme/repo/pull/58)",
+		);
+		expect(
+			dependabotHeadPrefix("Dependabot PR #7 (https://github.com/a/b/pull/7)"),
+		).toBe("Dependabot PR #7 (https://github.com/a/b/pull/7)");
+	});
+	test("leading zeros, zero, and a missing URL are null", () => {
+		expect(dependabotHeadPrefix("Dependabot PR #030 (https://x/pull/30)")).toBe(
+			null,
+		);
+		expect(dependabotHeadPrefix("Dependabot PR #0 (https://x/pull/0)")).toBe(
+			null,
+		);
+		expect(dependabotHeadPrefix("Dependabot PR #58 no url here")).toBe(null);
 	});
 });
 

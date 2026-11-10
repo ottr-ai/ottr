@@ -19,6 +19,7 @@ import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { BRANCH_RULE_REJECTION, GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
+import { githubHost } from "./githubHost.ts";
 import type { CommitIdentity } from "./gitIdentity.ts";
 import {
 	DEFAULT_CREDIT_REASON,
@@ -156,6 +157,7 @@ import type {
 	diffStat,
 	diffText,
 	fetchOriginBranch,
+	fetchPrHead,
 	hasRules,
 	ignoreInMain,
 	isClean,
@@ -919,6 +921,8 @@ export interface TurnOps {
 	treesEqual?: typeof treesEqual;
 	/** OTTR-760: posts one comment on a pull request (gh via runGh); the "@dependabot rebase" handoff and the fixes note. */
 	prComment?: typeof commentOnPullRequest;
+	/** OTTR-781: fetches a legacy Dependabot card's source PR head into refs/ottr/pr/N at ship time. */
+	fetchPrHead?: typeof fetchPrHead;
 	/** OTTR-465: wait before the single origin-unchanged push retry (default 30 s); tests pass 0. */
 	pushRetryDelayMs?: number;
 	/** OTTR-274: true when the push set of a hold-approved merge carries patches beyond the approval. */
@@ -1320,6 +1324,30 @@ export function parseReleaseVersion(text: string): string | null {
 	);
 }
 
+/** First line prefix of a Dependabot card prompt; also the dedupe key, so #1 never matches #12. Pure. */
+export function dependabotHead(n: number, repo: string): string {
+	return `Dependabot PR #${n} (${githubHost().webBase}/${repo}/pull/${n})`;
+}
+
+/** PR number parsed from a Dependabot card's first line, else null: the line must start
+ * with dependabotHead(n, repo) for THIS repo, with n a positive safe integer written
+ * without leading zeros (the prompt is untrusted text; the URL comes from the configured
+ * repo, never from the line). Pure. */
+export function parseDependabotHeadLine(
+	line: string,
+	repo: string,
+): number | null {
+	const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const re = new RegExp(
+		`^Dependabot PR #(\\d+) \\(${esc(githubHost().webBase)}/${esc(repo)}/pull/(\\d+)\\)`,
+	);
+	const m = re.exec(line);
+	if (m === null || m[1] !== m[2]) return null;
+	const n = Number(m[1]);
+	if (!Number.isSafeInteger(n) || n <= 0 || m[1] !== String(n)) return null;
+	return n;
+}
+
 /** Last `topic:` line in a turn report, whitespace-collapsed, trailing period gone, max 40 chars; null when the report names none. */
 export function parseTopicReport(
 	details: string | null | undefined,
@@ -1595,6 +1623,27 @@ type TurnSettle = {
 	reviewFindings: RecordedFinding[];
 	checkWillRun: boolean;
 };
+
+/** The source PR facts a ship needs (OTTR-760 stored on the row; OTTR-781 resolved for a
+ * legacy Dependabot card at ship time): null headRef/url mean "not known yet". */
+interface SourcePrRef {
+	headSha: string | null;
+	headRef: string | null;
+	url: string | null;
+	crossRepo: boolean;
+	dependabot: boolean;
+}
+
+/** The five stored source-PR fields off the task row (OTTR-760). */
+function storedSourcePr(st: TurnSettle): SourcePrRef {
+	return {
+		headSha: st.task.sourcePrHeadSha,
+		headRef: st.task.sourcePrHeadRef,
+		url: st.task.sourcePrUrl,
+		crossRepo: st.task.sourcePrCrossRepo === true,
+		dependabot: st.task.sourcePrDependabot === true,
+	};
+}
 
 /** First line of a finding, for logs and the card report (the body can be long). */
 function findingHead(f: RecordedFinding): string {
@@ -5489,9 +5538,19 @@ export function createTurnLoop(
 		if (st.task.sourcePrNumber !== null) {
 			// OTTR-760: a card filed from an existing pull request never opens a
 			// second one; the source PR is the card's PR of record.
-			await shipSourcePrCard(st, st.task.sourcePrNumber);
+			await shipSourcePrCard(st, st.task.sourcePrNumber, storedSourcePr(st));
 			return;
 		}
+		// OTTR-781: a Dependabot card filed before the source PR fields existed names
+		// its PR in the prompt's first line; adopt that PR instead of opening a
+		// duplicate one at ship time.
+		const legacy = await resolveLegacyDependabotPr(st);
+		if (legacy.kind === "parked") return;
+		if (legacy.kind === "match") {
+			await shipSourcePrCard(st, legacy.n, legacy.src);
+			return;
+		}
+		// "none": not a legacy Dependabot card for this repo — fall through to openPullRequest.
 		const pushBranch = ops.pushBranch;
 		const openPr = ops.openPr;
 		if (pushBranch === undefined || openPr === undefined) {
@@ -5513,9 +5572,13 @@ export function createTurnLoop(
 	 * a push happens only when that branch lives on origin and Dependabot does not own it
 	 * (the bot abandons a PR once someone else pushes to it) — else the ship comments on
 	 * the PR and parks the card with the reason. */
-	async function shipSourcePrCard(st: TurnSettle, n: number): Promise<void> {
+	async function shipSourcePrCard(
+		st: TurnSettle,
+		n: number,
+		src: SourcePrRef,
+	): Promise<void> {
 		const prBranch = st.task.branch ?? "";
-		const head = st.task.sourcePrHeadSha;
+		const head = src.headSha;
 		if (head === null) {
 			// Filing always writes the head sha with the number; null is a corrupt row.
 			st.prNext = {
@@ -5539,7 +5602,7 @@ export function createTurnLoop(
 		const sameTree =
 			tip === head || ((await ops.treesEqual?.(st.e.path, head, tip)) ?? false);
 		if (sameTree) {
-			adoptSourcePr(st, n, head);
+			adoptSourcePr(st, n, head, src.url);
 			return;
 		}
 		// The branch holds work beyond the PR head: fixes on top, or a cherry-pick that
@@ -5548,27 +5611,93 @@ export function createTurnLoop(
 			.targetContains(st.e.path, head, tip)
 			.catch(() => false);
 		const pushable =
-			onHead &&
-			st.task.sourcePrCrossRepo !== true &&
-			st.task.sourcePrDependabot !== true;
+			onHead && src.crossRepo !== true && src.dependabot !== true;
 		if (pushable) {
-			await pushToSourcePr(st, n, prBranch, tip);
+			await pushToSourcePr(st, n, src, prBranch, tip);
 			return;
 		}
-		await parkOnSourcePr(st, n);
+		await parkOnSourcePr(st, n, src);
+	}
+
+	/** OTTR-781: resolves a legacy Dependabot card (filed before the source-PR fields
+	 * existed) to the PR its prompt's first line names, fetching the head at ship time.
+	 * A match never falls through to openPullRequest — opening a second PR is exactly
+	 * the duplicate-PR bug; an unresolvable ship parks with the reason instead. */
+	async function resolveLegacyDependabotPr(
+		st: TurnSettle,
+	): Promise<
+		| { kind: "none" }
+		| { kind: "parked" }
+		| { kind: "match"; n: number; src: SourcePrRef }
+	> {
+		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
+		if (repo === null) return { kind: "none" };
+		const n = parseDependabotHeadLine(
+			st.task.prompt.split("\n")[0] ?? "",
+			repo,
+		);
+		if (n === null) return { kind: "none" };
+		if (ops.fetchPrHead === undefined) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Source PR #${n} needs its head fetched, but the server's ship step is not wired; restart the board`,
+			};
+			return { kind: "parked" };
+		}
+		const fetchErr = await ops
+			.fetchPrHead(st.e.path, n, `${githubHost().webBase}/${repo}.git`)
+			.catch((err: unknown) => errmsg(err));
+		if (fetchErr !== null) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Source PR #${n} head fetch failed: ${fetchErr.slice(0, 200)}`,
+			};
+			return { kind: "parked" };
+		}
+		const sha = await ops
+			.targetSha(st.e.path, `refs/ottr/pr/${n}`)
+			.catch(() => null);
+		if (sha === null) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Source PR #${n} head sha unreadable; file the card again`,
+			};
+			return { kind: "parked" };
+		}
+		// dependabot: true keeps shipSourcePrCard's push path off (a Dependabot PR
+		// must never get a board push) and makes parkOnSourcePr comment "@dependabot rebase".
+		return {
+			kind: "match",
+			n,
+			src: {
+				headSha: sha,
+				headRef: null,
+				url: `${githubHost().webBase}/${repo}/pull/${n}`,
+				crossRepo: false,
+				dependabot: true,
+			},
+		};
 	}
 
 	/** Stamps the source PR as the card's PR (merging/idle): the supervisor's merge watch
 	 * finishes the card when GitHub merges it, and the drawer's PR badge links the original
 	 * PR. pushSha stays null — the PR's CI runs on a head the author can rebase any time,
 	 * so the board watches the PR, never a pinned sha. */
-	function adoptSourcePr(st: TurnSettle, n: number, prHeadSha: string): void {
+	function adoptSourcePr(
+		st: TurnSettle,
+		n: number,
+		prHeadSha: string,
+		url: string | null,
+	): void {
 		st.store.updateTask(st.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: null,
 			prNumber: n,
-			prUrl: st.task.sourcePrUrl,
+			prUrl: url,
 			prHeadSha,
 		});
 		appendLog(
@@ -5584,10 +5713,11 @@ export function createTurnLoop(
 	async function pushToSourcePr(
 		st: TurnSettle,
 		n: number,
+		src: SourcePrRef,
 		prBranch: string,
 		tip: string,
 	): Promise<void> {
-		const dst = st.task.sourcePrHeadRef;
+		const dst = src.headRef;
 		const pushBranch = ops.pushBranch;
 		if (pushBranch === undefined || dst === null) {
 			st.prNext = {
@@ -5611,20 +5741,24 @@ export function createTurnLoop(
 			return;
 		}
 		st.log(`- pushed the card's fixes to ${dst} (source PR #${n})`);
-		adoptSourcePr(st, n, tip);
+		adoptSourcePr(st, n, tip, src.url);
 	}
 
 	/** Comments on the source PR and parks the card with the reason: the turn's work must
 	 * not become a second PR and cannot ride a push. A Dependabot PR gets the
 	 * "@dependabot rebase" command — the bot refreshes its own branch and would abandon
 	 * the PR if the board pushed to it; any other PR gets a note about the parked fixes. */
-	async function parkOnSourcePr(st: TurnSettle, n: number): Promise<void> {
-		await commentSourcePr(st, n);
-		const dependabot = st.task.sourcePrDependabot === true;
+	async function parkOnSourcePr(
+		st: TurnSettle,
+		n: number,
+		src: SourcePrRef,
+	): Promise<void> {
+		await commentSourcePr(st, n, src.dependabot);
+		const dependabot = src.dependabot;
 		st.prNext = {
 			stage: "merging",
 			state: "needs_you",
-			needsReason: `Fixes beyond source PR #${n} (${st.task.sourcePrUrl ?? "URL unknown"}) sit on the card branch and were not pushed${dependabot ? "; the board asked @dependabot to rebase instead" : ""}. Carry them onto the PR by hand.`,
+			needsReason: `Fixes beyond source PR #${n} (${src.url ?? "URL unknown"}) sit on the card branch and were not pushed${dependabot ? "; the board asked @dependabot to rebase instead" : ""}. Carry them onto the PR by hand.`,
 		};
 	}
 
@@ -5632,11 +5766,14 @@ export function createTurnLoop(
 	 * Dependabot PR (the bot refreshes its own branch and would abandon the PR if the board
 	 * pushed to it), else a note about the parked fixes. Best-effort — a failed comment
 	 * logs and the park reason still lands. */
-	async function commentSourcePr(st: TurnSettle, n: number): Promise<void> {
+	async function commentSourcePr(
+		st: TurnSettle,
+		n: number,
+		dependabot: boolean,
+	): Promise<void> {
 		const comment = ops.prComment;
 		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
 		if (comment === undefined || repo === null) return;
-		const dependabot = st.task.sourcePrDependabot === true;
 		const res = await comment({
 			repo,
 			number: n,
