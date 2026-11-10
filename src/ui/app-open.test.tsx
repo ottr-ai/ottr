@@ -381,6 +381,86 @@ test("a cross-project lineage link switches the board to the linked card's proje
 	}
 });
 
+// A retro's proposal filed in another project (the OTTR-787 filing): the source
+// card's lineage still nests it, and the proposal's drawer still reads the chain.
+const pushRetroProposal = (): number => {
+	const base = state.tasks.length;
+	state.tasks.push(
+		card({
+			id: "SR-1",
+			title: "Alpha retro",
+			sessionTitle: "Alpha retro",
+			stage: "done",
+			state: "idle",
+			kind: "retro",
+			followUpOf: "AL-2",
+			createdAt: 2000,
+		}),
+		card({
+			id: "BP-1",
+			title: "Beta proposal",
+			sessionTitle: "Beta proposal",
+			project: "beta",
+			state: "needs_you",
+			needsReason:
+				"Retro proposal from AL-2. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
+			followUpOf: "SR-1",
+			followUpOfProject: "alpha",
+			createdAt: 3000,
+		}),
+	);
+	return base;
+};
+
+test("a retro's cross-project proposal nests under the retro in the source card's drawer", async () => {
+	const base = pushRetroProposal();
+	try {
+		await mountAt("/projects/alpha/tasks/AL-2");
+		// The retro is a follow-up row, and the foreign proposal nests under it
+		// with its own project's path.
+		const retro = document.querySelector<HTMLAnchorElement>(
+			'dialog.drawer a.lineage-row[href="/projects/alpha/tasks/SR-1"]',
+		);
+		expect(retro).not.toBeNull();
+		const proposal = document.querySelector<HTMLAnchorElement>(
+			'dialog.drawer a.lineage-row[href="/projects/beta/tasks/BP-1"]',
+		);
+		expect(proposal).not.toBeNull();
+	} finally {
+		state.tasks.length = base;
+		await unmountApp();
+	}
+});
+
+test("a foreign proposal's drawer links its retro and the retro's source", async () => {
+	const base = pushRetroProposal();
+	try {
+		await mountAt("/projects/beta/tasks/BP-1");
+		// The retro parent links across projects...
+		expect(
+			document.querySelector<HTMLAnchorElement>(
+				'dialog.drawer a.lineage-row[href="/projects/alpha/tasks/SR-1"]',
+			),
+		).not.toBeNull();
+		// ...and the retro's source links too: no "Not on the board" row for it.
+		expect(
+			document.querySelector<HTMLAnchorElement>(
+				'dialog.drawer a.lineage-row[href="/projects/alpha/tasks/AL-2"]',
+			),
+		).not.toBeNull();
+		expect(document.querySelector("dialog.drawer .lineage-gone")).toBeNull();
+		// The proposal reason names the source as a card link, not bare text.
+		expect(
+			document.querySelector<HTMLAnchorElement>(
+				'dialog.drawer a.reason-card-link[href="/projects/alpha/tasks/AL-2"]',
+			),
+		).not.toBeNull();
+	} finally {
+		state.tasks.length = base;
+		await unmountApp();
+	}
+});
+
 test("a pasted card URL loads that project's board with the drawer open", async () => {
 	await mountAt("/projects/beta/tasks/BE-1");
 	try {

@@ -15301,6 +15301,43 @@ function AppDrawer(p: {
 	const drawerTask = selected ?? sheet?.task ?? null;
 	const drawerProject = selectedProject ?? sheet?.project ?? null;
 	if (drawerTask === null || drawerProject === null) return null;
+	// The drawer's context: the project's cards plus the cross-project links the
+	// lineage rail resolves (OTTR-787) — the drawer card's foreign parent, that
+	// parent's own source (a retro's source card), the drawer card's foreign
+	// children, and a foreign proposal whose retro is this card or a retro filed
+	// off it. The source card's drawer nests such a proposal under its retro, and
+	// the proposal's drawer links the retro and the source instead of a bare id.
+	const linkedParent =
+		drawerTask.followUpOf !== null && drawerTask.followUpOfProject !== null
+			? (tasks.find(
+					(t) =>
+						t.id === drawerTask.followUpOf &&
+						t.project === drawerTask.followUpOfProject,
+				) ?? null)
+			: null;
+	const drawerTasks = tasks.filter(
+		(t) =>
+			t.project === drawerProject.name ||
+			(drawerTask.followUpOf !== null &&
+				drawerTask.followUpOfProject !== null &&
+				t.id === drawerTask.followUpOf &&
+				t.project === drawerTask.followUpOfProject) ||
+			(linkedParent !== null &&
+				linkedParent.followUpOf !== null &&
+				t.id === linkedParent.followUpOf &&
+				t.project ===
+					(linkedParent.followUpOfProject ?? linkedParent.project)) ||
+			(t.followUpOf === drawerTask.id &&
+				t.followUpOfProject === drawerTask.project) ||
+			(t.followUpOfProject === drawerTask.project &&
+				tasks.some(
+					(x) =>
+						x.id === t.followUpOf &&
+						x.project === drawerProject.name &&
+						(x.id === drawerTask.id ||
+							(x.kind === "retro" && x.followUpOf === drawerTask.id)),
+				)),
+	);
 	return (
 		<Drawer
 			key={drawerTask.id}
@@ -15309,16 +15346,7 @@ function AppDrawer(p: {
 			project={drawerProject}
 			projects={projects}
 			delta={deltas.get(drawerTask.id)}
-			tasks={tasks.filter(
-				(t) =>
-					t.project === drawerProject.name ||
-					(drawerTask.followUpOf !== null &&
-						drawerTask.followUpOfProject !== null &&
-						t.id === drawerTask.followUpOf &&
-						t.project === drawerTask.followUpOfProject) ||
-					(t.followUpOf === drawerTask.id &&
-						t.followUpOfProject === drawerTask.project),
-			)}
+			tasks={drawerTasks}
 			onOpenTask={openTask}
 			draining={draining}
 			usedTotal={usedTotal}
