@@ -1,5 +1,6 @@
 // Model catalog (`omp models`) and role assignments (the board's omp agent config.yml —
-// PI_CODING_AGENT_DIR when pinned, else ~/.omp/agent).
+// the board home's current agent layer when one resolves, else PI_CODING_AGENT_DIR when
+// pinned, else ~/.omp/agent under the board home).
 
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -85,7 +86,9 @@ export function modelList(
  * The board's omp agent config.yml a roles read targets: the current agent layer's copy when
  * the board home resolves one, else the flat agent dir
  * (docs/specs/agent-layer-switch.md, "Layer-following reads"). Read-only: a roles read never
- * prepares or pins.
+ * prepares or pins. Without a layer the fallback is agentDir(): the PI_CODING_AGENT_DIR pin
+ * wins over the board home's flat dir — the precedence src/login.ts documents for the agent
+ * dir (R5-1).
  */
 function defaultRolesPath(): string {
 	const layer = resolveAgentLayer(boardOmpHome());
