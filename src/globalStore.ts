@@ -5,7 +5,7 @@ import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { closeLocked, openLocked } from "./dblock.ts";
+import { closeLocked, openLocked, vacuumInto } from "./dblock.ts";
 
 export class GlobalStore {
 	/** Set by close(): a second close must not run the lock release on a dead handle. */
@@ -51,6 +51,11 @@ export class GlobalStore {
 				"INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 			)
 			.run(key, JSON.stringify(value));
+	}
+
+	/** Snapshot copy of tracker.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
+	backupTo(dest: string): void {
+		vacuumInto(this.db, dest, ["kv"]);
 	}
 
 	close(): void {

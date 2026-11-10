@@ -2,6 +2,7 @@
   "$schema": "./node_modules/knip/schema.json",
   "entry": [
     "src/worker.ts",
+    "src/restore.ts",
     "src/ui/app.tsx",
     "src/stryker-tap.cjs",
     "scripts/**/*.{js,mjs,ts}",

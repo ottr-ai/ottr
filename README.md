@@ -103,7 +103,7 @@ omp loads `.agents/skills/` from the repo for runs in this checkout. Install a s
 - Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)
 - `gh` ([GitHub CLI](https://cli.github.com)) only for releases, when **Settings** holds no GitHub token.
 - omp must run its tools without approval prompts; a one-shot `omp -p` run cannot answer them.
-- Ottr stores tokens and keys (GitHub, API key, session secret, and more) in plaintext in `.tasks/tracker.db`. Treat that file as a credential store.
+- Ottr stores tokens and keys (GitHub, API key, session secret, and more) in plaintext in `.tasks/tracker.db`. Treat that file as a credential store. The database snapshots hold the same data, so protect the backup dir the same way.
 
 ## Quick start
 
@@ -339,6 +339,7 @@ The alate URL carries the API key on every call, so the board refuses a plain `h
 | Project folders | Ottr's parent folder | env `OMP_TRACKER_ROOTS` |
 | Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
 | Server-only project state (each `tasks.db`, fork caches) | same dir as task data | env `OTTR_SERVER_DATA_DIR` (the compose stack sets `/app/.tasks/projects`) |
+| Database backups | one snapshot each day in `<state dir>/.tasks/backups`, 7 kept | env `OTTR_BACKUP_DIR` (the compose stack sets `/backup` on the server-only `ottr-backup` volume; `OTTR_BACKUP_MOUNT` in the compose env file puts it on a host path) and `OTTR_BACKUP_KEEP` (`0` turns the backups off). Restore with `bun src/restore.ts`. Steps: [Backups and restore](docs/WORKERS.md#backups-and-restore). Spec: [docs/specs/db-backup.md](docs/specs/db-backup.md) |
 | GitHub token | none | asked at onboarding; **Settings → Git hosts → GitHub token** replaces it; stored in `.tasks/tracker.db`. Settings shows the expiry date of this token and of the compose seed token, and the board pushes a reminder from 30 days before an expiry (spec: [docs/specs/token-expiry.md](docs/specs/token-expiry.md)). Which token serves what, and which permissions to give it: [GitHub tokens](#github-tokens) |
 | GitHub host | `github.com` | env `OTTR_GITHUB_HOST` (a bare hostname), or **Settings → Git hosts → GitHub host**; a saved value wins over the env until cleared. A host under `*.ghe.com` is GitHub Enterprise Cloud with data residency (API at `api.<host>`); any other host is GitHub Enterprise Server (API at `<host>/api/v3`). Spec: [docs/specs/github-host.md](docs/specs/github-host.md) |
 | GitHub App | none | optional; **Settings → Git hosts → GitHub App**; when set, posted PR reviews show as the app identity (`ottr[bot]` with a bot badge) instead of your own account; stored in `.tasks/tracker.db`; the key is write-only. Spec: [docs/specs/github-app.md](docs/specs/github-app.md); setup steps below |

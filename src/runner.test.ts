@@ -214,6 +214,7 @@ describe("childEnv", () => {
 					PATH: "/bin",
 					OTTR_DATA_DIR: "/data",
 					OTTR_SERVER_DATA_DIR: "/app/.tasks/projects",
+					OTTR_BACKUP_DIR: "/backup",
 					GH_TOKEN: "ghp_x",
 				},
 			}),

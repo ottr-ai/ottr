@@ -567,6 +567,10 @@ real podman.
   project state (each `tasks.db` and the fork mirror caches) on the
   `ottr-state` volume. No worker mounts this volume. Refer to "The data
   boundary" below.
+- Server: `OTTR_BACKUP_DIR=/backup` keeps the database snapshots on the
+  `ottr-backup` volume, which no worker mounts. `OTTR_BACKUP_KEEP` (default
+  `7`) is the number of snapshots that stay, and `0` turns the backups off.
+  Refer to "Backups and restore" below.
 - `OTTR_BOARD_URL` is the address task sessions' `create_task` tool POSTs to;
   the default is `http://127.0.0.1:<port>`, which in a worker container is the
   worker itself, so compose sets `http://ottr:<port>` (`ottr` is the server's
@@ -1331,6 +1335,95 @@ run makes a new cache in the server dir.
 
 Residual risk: session files stay worker-written, and later turns resume them. This is by
 design. Without `OTTR_SERVER_DATA_DIR`, the board logs a warning and keeps the old layout.
+
+### Backups and restore
+
+The spec is `docs/specs/db-backup.md`.
+
+A snapshot:
+
+- It is one directory `<backup dir>/<stamp>/`. `<stamp>` is the UTC time of the run as
+  `YYYYMMDDTHHMMSSZ`, for example `20261110T031500Z`.
+- It holds `tracker.db` (the global store) and `projects/<project>/tasks.db` for each
+  project that the board has open.
+- The board makes each copy with `VACUUM INTO`. Then it compares the row counts of the main
+  tables and runs `PRAGMA integrity_check` on the copy.
+- The board writes into `<stamp>.partial/` and renames it to `<stamp>/` when the snapshot
+  is complete. Thus a directory with a stamp name is always complete.
+
+Schedule and retention:
+
+- The board examines the backup dir at boot and then each hour. It makes one snapshot when
+  no snapshot exists or when the newest snapshot is 24 hours old or older.
+- The newest `OTTR_BACKUP_KEEP` snapshots stay (default `7`). The board removes the older
+  ones. `OTTR_BACKUP_KEEP=0` turns the backups off.
+- A snapshot with a failed database removes nothing. Thus the last good copy of that
+  database stays.
+- The server log names each failure with the prefix `backup:`.
+
+Location:
+
+- Compose mounts the volume `ottr-backup` at `/backup` in the server only and sets
+  `OTTR_BACKUP_DIR=/backup`. No worker mounts this volume.
+- For a host path, set `OTTR_BACKUP_MOUNT=/path/on/another/disk` in the env file.
+- The `ottr-backup` volume is on the same host as `ottr-state`. It protects against a lost
+  or corrupt state volume. It does not protect against a lost host or disk. For that, copy
+  the backup dir off the host.
+- The board refuses an `OTTR_BACKUP_DIR` that is equal to or below a worker-mounted root
+  (`/workspace`, `/data`, `/root`). It logs one error at boot and makes no backups.
+- A snapshot holds the tokens and keys of `tracker.db`. Protect the backup dir the same way
+  as that file.
+
+Restore in the compose stack:
+
+1. Stop the board: `docker compose stop server`.
+2. List the snapshots, newest first, with the size of each file:
+   `docker compose run --rm --no-deps server bun /app/src/restore.ts`. This command changes
+   nothing.
+3. Restore the newest snapshot:
+   `docker compose run --rm --no-deps server bun /app/src/restore.ts latest`. To restore a
+   different snapshot, give its stamp instead of `latest`.
+   - The tool renames each existing database to `<file>.before-restore-<stamp>`. It deletes
+     nothing.
+   - The tool stops and changes nothing when a live board holds a database.
+4. Start the stack: `docker compose up -d`.
+5. Examine the board. Then delete the `.before-restore-*` files when you do not need them.
+
+After a lost `ottr-state` volume, the new empty board also makes snapshots, and retention
+then removes the good ones. Thus, when possible, do the restore before the first long run
+of the empty board. In all cases, do it before `OTTR_BACKUP_KEEP` days go by. When the
+empty board made a snapshot, `latest` is that empty snapshot: give the stamp of a snapshot
+from before the loss. The file sizes in the list show which snapshot is empty.
+
+Restore for a native start (no compose):
+
+1. Stop the board.
+2. Use the same env as the board: `OTTR_STATE_DIR`, `OTTR_DATA_DIR` and `OTTR_BACKUP_DIR`,
+   when they are set.
+3. In the Ottr checkout, run `bun src/restore.ts` to list the snapshots.
+4. Run `bun src/restore.ts latest` (or give a stamp) to restore.
+5. With no `OTTR_SERVER_DATA_DIR` and no `OTTR_DATA_DIR`, the tool restores `tracker.db`
+   only. For each project, it prints the snapshot file to copy to
+   `<checkout>/.tasks/tasks.db`. Before the copy, move the old `tasks.db` and its `-wal`
+   and `-shm` files to a different name.
+6. Start the board.
+
+A snapshot does not hold these items. After a restore, do this for each:
+
+- SSH keys and `known_hosts`: they are files in `OTTR_SSH_DIR` (`/app/.tasks/ssh` on
+  `ottr-state` in compose). When they are lost, add the keys again under
+  **Settings → Git hosts** (a project key: in the **Settings** of the project) and confirm
+  the host-key fingerprints again.
+- The Jira sealing key `.tasks/secret.key` (used when `OTTR_SECRET_KEY` is not set): when
+  the file is lost, the board makes a new key at boot. The new key cannot open the Jira
+  tokens in the restored `tracker.db`. **Settings → Jira connections** then shows "Token
+  unreadable, enter it again", and each Jira call for that connection answers `409`. Enter
+  the token of each connection again. With the old key file or the same `OTTR_SECRET_KEY`,
+  the tokens open as before.
+- The fork mirror caches (`forks/<id>.git`): the next fork run makes them again.
+- The task data on the `ottr-data` volume (sessions, logs, images, handoffs): it is a
+  different volume. The restore does not change it, and a lost `ottr-data` volume does not
+  come back from a snapshot.
 
 ### Writes on the shared volumes
 

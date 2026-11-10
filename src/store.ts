@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import type { Dirent } from "node:fs";
 import {
 	existsSync,
@@ -11,7 +11,12 @@ import {
 } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { mkdirBelow, writeBelow } from "./confine.ts";
-import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
+import {
+	closeLocked,
+	openLocked,
+	StoreLockedError,
+	vacuumInto,
+} from "./dblock.ts";
 import type { PerfFacts } from "./perf.ts";
 import { platform } from "./platform/index.ts";
 import { derivedTaskPrefix } from "./prefix.ts";
@@ -891,23 +896,6 @@ export type AdoptResult = {
 	error?: string;
 };
 
-/** Copies the open db into `tmp` via VACUUM and verifies the tasks/turns row counts match; throws on a mismatch. */
-function vacuumCopyAndVerify(db: Database, tmp: string): void {
-	db.query("VACUUM INTO ?").run(tmp);
-	const copy = new Database(tmp);
-	try {
-		for (const table of ["tasks", "turns"]) {
-			const sql = `SELECT COUNT(*) AS n FROM ${table}`;
-			const a = db.query<{ n: number }, []>(sql).get()?.n;
-			const b = copy.query<{ n: number }, []>(sql).get()?.n;
-			if (a !== b)
-				throw new Error(`${table} count mismatch: ${a} vs ${b} in copy`);
-		}
-	} finally {
-		copy.close();
-	}
-}
-
 /** Adopts one old per-task DB into the server dir; null when the dir holds no adoptable
  * tasks.db or the server already has one. A StoreLockedError (a live board holds the DB)
  * propagates; any other failure comes back as a failed AdoptResult. */
@@ -941,7 +929,7 @@ function adoptOne(
 		mkdirSync(newDir, { recursive: true });
 		const tmp = join(newDir, "tasks.db.adopting");
 		rmSync(tmp, { force: true });
-		vacuumCopyAndVerify(db, tmp);
+		vacuumInto(db, tmp, ["tasks", "turns"]);
 		renameSync(tmp, newDb);
 		open = false;
 		closeLocked(db);
@@ -957,6 +945,9 @@ function adoptOne(
 	}
 }
 
+/** The adoption marker's file name below OTTR_SERVER_DATA_DIR; the restore tool writes it too. */
+export const ADOPTED_MARKER = ".adopted";
+
 /**
  * One-time move of the task DBs that older boards kept on the worker-shared data dir into
  * the server-only dir. The marker makes it one-time: a tasks.db a worker plants later is
@@ -966,7 +957,7 @@ export function adoptSharedProjectData(
 	dataDir: string,
 	serverDataDir: string,
 ): AdoptResult[] {
-	const marker = join(serverDataDir, ".adopted");
+	const marker = join(serverDataDir, ADOPTED_MARKER);
 	if (existsSync(marker)) return [];
 	const results: AdoptResult[] = [];
 	const names = existsSync(dataDir) ? readdirSync(dataDir) : [];
@@ -3705,6 +3696,11 @@ export class ProjectStore {
 				rank: r.rank,
 				security: (r.security as RecordedFinding["security"]) ?? null,
 			}));
+	}
+
+	/** Snapshot copy of tasks.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
+	backupTo(dest: string): void {
+		vacuumInto(this.db, dest, ["tasks", "turns"]);
 	}
 
 	close(): void {

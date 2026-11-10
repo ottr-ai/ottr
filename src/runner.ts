@@ -78,7 +78,9 @@ interface BoardEnv {
  * an inherited token never does, since only this board's token opens it. Undefined
  * values are dropped so spawn never sees them. OTTR_DATA_DIR and OTTR_SERVER_DATA_DIR stay behind:
  * a turn that runs ottr's own test suite must not open the live board's task stores, and a turn
- * must not learn the server-only state path. The worker dispatch
+ * must not learn the server-only state path. OTTR_BACKUP_DIR stays behind too: a turn that
+ * starts a scratch board (ottr's own tests, the boot smoke) must not write into the live
+ * backup dir or remove live snapshots. The worker dispatch
  * credentials (OTTR_WORKER_URLS, OTTR_WORKER_TOKEN) are stripped too: a turn that held them
  * could drive any worker (WORKERS.md), so no local child ever inherits them.
  */
@@ -92,6 +94,7 @@ export function childEnv(o: {
 	const env = { ...(o.base ?? process.env) } as Record<string, string>;
 	delete env.OTTR_DATA_DIR;
 	delete env.OTTR_SERVER_DATA_DIR;
+	delete env.OTTR_BACKUP_DIR;
 	delete env.OTTR_WORKER_URLS;
 	delete env.OTTR_WORKER_TOKEN;
 	// The alate bearer key drives provisioning of the agent layer every turn executes;

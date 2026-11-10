@@ -8,6 +8,7 @@ import type { Server } from "bun";
 import { createApp, ompSessionStores, storedProjectPaths } from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
+import { backupSources, backupTick, resolveBackup } from "./backup.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { errmsg } from "./errmsg.ts";
@@ -367,8 +368,10 @@ if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 // shared `home` volume at /root into the server and every worker (docker-compose.yml). The
 // pinned-URL check refuses those pins at every use. Native single-user boards (no
 // OTTR_DATA_DIR) check nothing, as before.
-if (process.env.OTTR_DATA_DIR)
-	setWorkerRoots([...ROOTS, resolve(process.env.OTTR_DATA_DIR), homedir()]);
+const workerRoots = process.env.OTTR_DATA_DIR
+	? [...ROOTS, resolve(process.env.OTTR_DATA_DIR), homedir()]
+	: [];
+if (process.env.OTTR_DATA_DIR) setWorkerRoots(workerRoots);
 
 for (const p of discoverProjects(
 	ROOTS,
@@ -857,6 +860,27 @@ setInterval(() => {
 	if (++stateTick % 5 === 0) app.publish({ type: "ping" });
 	app.publishState();
 }, 1000);
+
+// Backups (docs/specs/db-backup.md): daily snapshot of tracker.db and each tasks.db, hourly
+// check; the boot call lets a board that was down catch up.
+const backup = resolveBackup(process.env, STATE_DIR, workerRoots);
+for (const text of backup.errors) console.error(`backup: ${text}`);
+if (backup.keep !== 0) {
+	const backupNow = () =>
+		backupTick({
+			dir: backup.dir,
+			keep: backup.keep,
+			now: new Date(),
+			sources: () =>
+				backupSources(
+					gstore,
+					[...projects.values()].map((e) => e.store),
+				),
+			log: (line) => console.log(line),
+		});
+	backupNow();
+	setInterval(backupNow, 3_600_000);
+}
 
 // System sampler, one for all tabs (and for /api/system in polling mode): container and VM
 // readings, self-update checks and the usage quota live behind sampleStats() in the request layer.

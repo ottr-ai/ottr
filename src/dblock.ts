@@ -88,3 +88,32 @@ export function openLocked(dbPath: string): Database {
 export function closeLocked(db: Database): void {
 	db.close();
 }
+
+/**
+ * Copies the open db into `dest` with VACUUM INTO (`dest` must not exist), then proves the
+ * copy: equal row counts for `tables` and a clean integrity_check. Throws on a difference.
+ * The holder's own connection is the only one that can read a file under the exclusive lock.
+ */
+export function vacuumInto(
+	db: Database,
+	dest: string,
+	tables: readonly string[],
+): void {
+	db.query("VACUUM INTO ?").run(dest);
+	const copy = new Database(dest);
+	try {
+		for (const table of tables) {
+			const sql = `SELECT COUNT(*) AS n FROM ${table}`;
+			const a = db.query<{ n: number }, []>(sql).get()?.n;
+			const b = copy.query<{ n: number }, []>(sql).get()?.n;
+			if (a !== b)
+				throw new Error(`${table} count mismatch: ${a} vs ${b} in copy`);
+		}
+		const check = copy
+			.query<{ integrity_check: string }, []>("PRAGMA integrity_check")
+			.get()?.integrity_check;
+		if (check !== "ok") throw new Error(`integrity check failed: ${check}`);
+	} finally {
+		copy.close();
+	}
+}
