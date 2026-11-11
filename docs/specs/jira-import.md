@@ -37,8 +37,10 @@ Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acce
   - description, converted to Markdown: Cloud ADF (headings, paragraphs, lists, code blocks, links, emphasis, tables as plain rows) and Data Center wiki markup (`h1.`, `*`/`#` lists, `{code}`, `[text|url]`, `*bold*`, `_italic_`). An unknown node or markup becomes its plain text.
   - fixed fields: issue type, status, priority, labels, components, parent or epic key
   - each custom field ID that the connection lists: its value as text (string, number, option value, array joined, ADF converted). An empty or missing field is skipped.
-- Prompt limit: cut the summary and each fixed-field and custom-field value to 2000 characters, then cut the description so the whole prompt fits the 20000-character card prompt limit, with a "(truncated; read the full ticket in Jira)" marker. If the prompt is still too long with an empty description, drop custom fields from the last one back and add a "(fields omitted)" marker. Header + summary + the six fixed fields stay below 20000 after these cuts, so import never fails only for size.
-- No comments, attachments, or worklogs.
+  - the last comments, fetched at import with `GET /rest/api/<v>/issue/<KEY>/comment`: the board reads the comment total, then fetches the last page with `startAt`, so no order parameter is needed. The last 5 comments, oldest first, each as author, date and body, the body converted to Markdown like the description. A comment whose body is empty after cleaning is skipped; a missing author shows "(unknown)".
+  - the issue links, fetched at import with `GET /rest/api/<v>/issue/<KEY>?fields=issuelinks`, one line per link: the link type's inward or outward verb (fall back to the type name), the other issue's key, summary and status.
+- Prompt limit: cut the summary, each fixed-field and custom-field value, each comment's author, date and body, and each link's parts to 2000 characters, at most 5 comments and 20 links; then cut the description so the whole prompt fits the 20000-character card prompt limit, with a "(truncated; read the full ticket in Jira)" marker. If the prompt is still too long with an empty description, drop custom fields from the last one back and add a "(fields omitted)" marker; after that the COMMENTS block is cut with the same marker and then dropped, and the LINKS block last. A ticket with no comments or links gets no such blocks. Header + summary + the six fixed fields stay below 20000 after these cuts, so import never fails only for size.
+- No attachments or worklogs.
 
 ## 5. Duplicate tracking
 - Per project, record (site host + context path, issue key) → card id for each imported ticket.
@@ -67,7 +69,7 @@ Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acce
 7. Importing 3 of 5 tickets into Backlog files 3 backlog cards with the right titles and prompts. Todo files todo cards.
 8. A second search shows the 3 tickets as already imported, not selectable. A cancelled card still blocks. After a card is deleted, its ticket is selectable again.
 9. Two parallel import calls for one ticket file one card.
-10. ADF and wiki markup fixtures convert to the expected Markdown. Ticket text that holds `DATA>>>` cannot close its block. A long description is cut and the prompt stays at or below 20000 characters.
+10. ADF and wiki markup fixtures convert to the expected Markdown. Ticket text that holds `DATA>>>` cannot close its block. A long description is cut and the prompt stays at or below 20000 characters. A ticket with a last comment and one issue link imports with a COMMENTS block (author, date, body cut to 2000 characters) and a LINKS block (type verb, key, summary, status) in the prompt; the comment fetch runs through the HTTP stub and the test asserts the exact method and URL (`GET /rest/api/3/issue/<KEY>/comment?maxResults=5&startAt=0`). A ticket with no comments or links gets no such blocks.
 11. A property-based test (fast-check, if already present; else a seeded loop) for the ADF and wiki converters and the prompt builder: no exception on random input, no fence marker in output, length within limit.
 12. The dialog opens with the project's last JQL. A JQL syntax error shows Jira's message.
 13. `bun run check` and `bun test` pass. Screenshot proofs of the settings form and the import dialog.
@@ -79,11 +81,12 @@ Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acce
 - Read-only toward Jira: no labels, comments, transitions, or other writes. Write-back is a non-goal.
 - No automatic or scheduled import; the user starts each import.
 - No sync after import: a later change to the ticket does not change the card, and a card change does not change the ticket.
-- No comments, attachments, or worklogs in the prompt.
+- No attachments or worklogs in the prompt; comments and issue links are in the prompt (section 4).
 - No named saved JQL queries. The project dialog keeps its last JQL per project; the board-wide import keeps none (section 6).
 - No component-to-project mapping: the board-wide import never derives a project from a ticket's components; the user names each row's project.
 - No OAuth 2.0 (3LO) apps; only API token (Cloud) and PAT (Data Center).
 - No key-rotation UI (the key ID only makes a later rotation possible).
+- No refresh of comments or links after import: the card keeps what the import fetched, also when a backlog card moves to Todo.
 - No new npm dependency (use `fetch` and `node:crypto`); if one seems needed, stop and ask.
 
 ## Risks
