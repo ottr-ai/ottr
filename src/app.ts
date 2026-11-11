@@ -4193,15 +4193,16 @@ export function createApp(deps: AppDeps) {
 		return { body: parsed as Record<string, unknown> };
 	}
 
-	/** Body of a POST whose JSON body is optional: {} when no JSON body arrives, so
-	 * body-less callers (the extension's steer cancel) keep today's behavior. */
+	/** Body of a POST whose JSON body is optional: a body-less request reads as an
+	 * empty body, so body-less callers (the extension's steer cancel) keep today's
+	 * behavior. An arriving JSON body that fails to parse or exceeds the size limit
+	 * surfaces the parser's error instead of degrading to an unconditional write. */
 	async function readOptionalJson(
 		req: Request,
-	): Promise<Record<string, unknown>> {
+	): Promise<{ body: Record<string, unknown> } | { error: Response }> {
 		if (!(req.headers.get("content-type") ?? "").startsWith("application/json"))
-			return {};
-		const r = await readJson(req);
-		return "error" in r ? {} : r.body;
+			return { body: {} };
+		return readJson(req);
 	}
 
 	function projectView(e: Entry): ProjectView {
@@ -4626,6 +4627,30 @@ export function createApp(deps: AppDeps) {
 				409,
 			);
 		return res.task;
+	}
+
+	/** The stale-edit precheck for routes whose state preconditions must not shadow a
+	 * stale revision: answers 400 for a malformed revision and 409 with the current
+	 * card when the revision is stale, so the drawer's conflict flow keeps the draft
+	 * even when the newer state would refuse the edit on its own. Null when the
+	 * revision is absent or current: the task was read synchronously and is written
+	 * synchronously below, so the preconditions after this check run on the row the
+	 * revision was checked against. */
+	function staleEditResponse(
+		e: Entry,
+		task: Task,
+		body: Record<string, unknown>,
+	): Response | null {
+		const rev = body.revision;
+		if (rev === undefined) return null;
+		if (typeof rev !== "number" || !Number.isInteger(rev) || rev < 1)
+			return json({ error: "revision must be a positive integer" }, 400);
+		if (rev !== task.revision)
+			return json(
+				{ error: "card changed since it was loaded", task: taskView(e, task) },
+				409,
+			);
+		return null;
 	}
 
 	/** One task with its turns for the drawer; turns ship without the prompt text and the raw
@@ -6586,6 +6611,11 @@ export function createApp(deps: AppDeps) {
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
 			return json({ error: "task is cancelled" }, 404);
+		// The revision guard outranks the state preconditions below: a stale edit
+		// answers 409 with the current card, so the drawer's conflict flow keeps the
+		// draft even when the newer state would refuse the edit on its own.
+		const stale = staleEditResponse(e, task, r.body);
+		if (stale !== null) return stale;
 		if (task.pendingPrompt === null)
 			return json({ error: "no steering is queued" }, 409);
 		// "." is the auto-resume marker, not user steering; rewriting it would
@@ -6623,11 +6653,17 @@ export function createApp(deps: AppDeps) {
 		// earlier snapshot, so the checks and the guarded write below stay one sync
 		// block, like every other user-edit route.
 		const body = await readOptionalJson(req);
+		if ("error" in body) return body.error;
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
 			return json({ error: "task is cancelled" }, 404);
+		// The revision guard outranks the state preconditions below: a stale discard
+		// answers 409 with the current card, so the drawer's conflict flow keeps the
+		// draft even when the newer state would refuse the cancel on its own.
+		const stale = staleEditResponse(e, task, body.body);
+		if (stale !== null) return stale;
 		if (task.pendingPrompt === null)
 			return json({ error: "no steering is queued" }, 409);
 		// "." is the auto-resume marker, not user steering; canceling it would
@@ -6657,7 +6693,7 @@ export function createApp(deps: AppDeps) {
 						}
 					: {}),
 			},
-			body,
+			body.body,
 		);
 		if (res instanceof Response) return res;
 		return json(taskView(e, res));
@@ -7070,6 +7106,7 @@ export function createApp(deps: AppDeps) {
 		// Body before the task, like every guarded user-edit route: a slow body must
 		// not hide the card's state behind an older snapshot.
 		const body = await readOptionalJson(req);
+		if ("error" in body) return body.error;
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
@@ -7099,7 +7136,7 @@ export function createApp(deps: AppDeps) {
 		// editor's load and this claim refuses the claim, so the editor never arms a
 		// stale draft with a fresh revision. Body-less callers keep the unconditional
 		// claim, like every guarded route's no-revision path.
-		const rev = body.revision;
+		const rev = body.body.revision;
 		if (
 			rev !== undefined &&
 			(typeof rev !== "number" || !Number.isInteger(rev) || rev < 1)

@@ -6043,6 +6043,167 @@ describe("revision guard", () => {
 		expect(row.revision).toBe(rev);
 	});
 
+	test("a stale steer edit against a consumed steer answers 409 with the card", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		// Another writer consumed the steer before this edit landed.
+		store.updateTask(t.id, {
+			pendingPrompt: null,
+			pendingBy: null,
+			state: "running",
+		});
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "my draft",
+			revision: 2,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as {
+			task: { pendingPrompt: string | null; revision: number };
+		};
+		expect(b.task.pendingPrompt).toBeNull();
+		expect(b.task.revision).toBe(3);
+		const row = store.getTask(t.id)!;
+		expect(row.pendingPrompt).toBeNull();
+		expect(row.state).toBe("running");
+	});
+
+	test("a current steer edit against a consumed steer still refuses honestly", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		store.updateTask(t.id, {
+			pendingPrompt: null,
+			pendingBy: null,
+			state: "running",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "my draft",
+			revision: 3,
+		});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("no steering is queued");
+		expect(store.getTask(t.id)!.state).toBe("running");
+	});
+
+	test("a stale steer edit against the resume marker answers 409 with the card", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		store.updateTask(t.id, { pendingPrompt: ".", pendingBy: null });
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "my draft",
+			revision: 2,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as { task: { pendingPrompt: string } };
+		expect(b.task.pendingPrompt).toBe(".");
+		expect(store.getTask(t.id)!.pendingPrompt).toBe(".");
+	});
+
+	test("a current steer edit against the resume marker refuses honestly", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		store.updateTask(t.id, { pendingPrompt: ".", pendingBy: null });
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "my draft",
+			revision: 3,
+		});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe(
+			"the queued turn is an automatic resume, not steering",
+		);
+	});
+
+	test("a stale steer cancel against a consumed steer answers 409 with the card", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		store.updateTask(t.id, {
+			pendingPrompt: null,
+			pendingBy: null,
+			state: "running",
+		});
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/steer/cancel`, {
+			revision: 2,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as {
+			task: { pendingPrompt: string | null };
+		};
+		expect(b.task.pendingPrompt).toBeNull();
+		expect(store.getTask(t.id)!.state).toBe("running");
+	});
+
+	test("a current steer cancel against a consumed steer still refuses honestly", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		store.updateTask(t.id, {
+			pendingPrompt: null,
+			pendingBy: null,
+			state: "running",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/cancel`, {
+			revision: 3,
+		});
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("no steering is queued");
+	});
+
+	test("a malformed steer-cancel body answers 400 and keeps the steering", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		const res = await post(
+			`/api/projects/p1/tasks/${t.id}/steer/cancel`,
+			"not json{",
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe("invalid JSON body");
+		expect(store.getTask(t.id)!.pendingPrompt).toBe("my steering");
+	});
+
+	test("an oversized steer-cancel body answers 413 and keeps the steering", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		const big = JSON.stringify({ revision: 1, pad: "x".repeat(70_000) });
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/cancel`, big);
+		expect(res.status).toBe(413);
+		expect(await errorOf(res)).toBe("body too large");
+		expect(store.getTask(t.id)!.pendingPrompt).toBe("my steering");
+	});
+
+	test("a malformed /edit/start body answers 400 and claims nothing", async () => {
+		const t = store.createTask("draft");
+		const res = await post(
+			`/api/projects/p1/tasks/${t.id}/edit/start`,
+			"not json{",
+		);
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe("invalid JSON body");
+		expect(store.getTask(t.id)!.holdUntil).toBeNull();
+	});
+
+	test("an oversized /edit/start body answers 413 and claims nothing", async () => {
+		const t = store.createTask("draft");
+		const big = JSON.stringify({ revision: 1, pad: "x".repeat(70_000) });
+		const res = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, big);
+		expect(res.status).toBe(413);
+		expect(await errorOf(res)).toBe("body too large");
+		expect(store.getTask(t.id)!.holdUntil).toBeNull();
+	});
+
+	test("a bodyless /edit/start still claims", async () => {
+		const t = store.createTask("draft");
+		const res = await fetch(
+			new URL(`/api/projects/p1/tasks/${t.id}/edit/start`, server.url),
+			{
+				method: "POST",
+				headers: {
+					Host: "127.0.0.1:0",
+					Origin: "http://127.0.0.1:0",
+				},
+			},
+		);
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.holdUntil).not.toBeNull();
+	});
+
 	test("a slow cancel body cannot act on a stale queued snapshot", async () => {
 		// The body read finishes before the task is resolved: a body that pauses
 		// mid-read must not let the turn loop's queued→running flip hide behind the
