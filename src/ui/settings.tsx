@@ -2760,13 +2760,17 @@ export function GitHostsSection() {
 			}),
 		);
 	};
-	// The proactive offer: the board token is set and the configured GitHub host has
-	// no git-host entry yet, so a first clone on that host would fail. The offer
-	// names that one host only, and applying stays the user's explicit click.
+	// The proactive offer: the board token is set and the configured GitHub host is
+	// neither github.com nor carrying a git-host entry yet, so a first clone on that
+	// host would fail. On github.com the board token already serves git — the worker
+	// image pins its credential helper for https://github.com and gitAuthEnv adds the
+	// ambient helpers — so there is nothing to offer there. The offer names that one
+	// host only, and applying stays the user's explicit click.
 	const boardTokenOffer =
 		state !== null &&
 		state.githubTokenSet === true &&
 		state.githubHost !== null &&
+		state.githubHost.toLowerCase() !== "github.com" &&
 		!state.tokens.some((t) => t.host === state.githubHost);
 	const applyOfferBoardToken = (): void => {
 		offerBusy.start(() =>

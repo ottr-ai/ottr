@@ -2496,28 +2496,53 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		return block !== null && (block.textContent?.includes(host) ?? false);
 	};
 
-	test("the offer shows only while the configured host has no stored token", async () => {
+	test("the offer shows only for a non-github.com host with no stored token", async () => {
 		const cases: {
 			name: string;
 			view: GitHostsFixture;
+			host: string;
 			shown: boolean;
 		}[] = [
-			{ name: "token set, host has no entry", view: viewWith([]), shown: true },
 			{
-				name: "token set, host already has an entry",
+				name: "token set, github.com: the board token already serves git there",
+				view: viewWith([]),
+				host: "github.com",
+				shown: false,
+			},
+			{
+				name: "token set, Enterprise host, no entry",
+				view: viewWith([], true, "git.acme.ghe.com"),
+				host: "git.acme.ghe.com",
+				shown: true,
+			},
+			{
+				name: "token set, Enterprise host already has an entry",
 				view: viewWith([
-					{ host: "github.com", username: "x-access-token", tokenSet: true },
+					{
+						host: "git.acme.ghe.com",
+						username: "x-access-token",
+						tokenSet: true,
+					},
 				]),
+				host: "git.acme.ghe.com",
 				shown: false,
 			},
 			{
 				name: "token set, only another host has an entry",
-				view: viewWith([
-					{ host: "gitlab.com", username: "oauth2", tokenSet: true },
-				]),
+				view: viewWith(
+					[{ host: "gitlab.com", username: "oauth2", tokenSet: true }],
+					true,
+					"git.acme.ghe.com",
+				),
+				host: "git.acme.ghe.com",
 				shown: true,
 			},
-			{ name: "no board token", view: viewWith([], false), shown: false },
+			{
+				name: "no board token",
+				view: viewWith([], false, "git.acme.ghe.com"),
+				host: "git.acme.ghe.com",
+				shown: false,
+			},
 		];
 		for (const c of cases) {
 			const loaded = { calls: 0 };
@@ -2525,7 +2550,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 				baseMock(c.view, loaded, () => undefined),
 			);
 			try {
-				expect(`${c.name}: ${offerShown(container, "github.com")}`).toBe(
+				expect(`${c.name}: ${offerShown(container, c.host)}`).toBe(
 					`${c.name}: ${c.shown}`,
 				);
 			} finally {
@@ -2558,7 +2583,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 
 	test("the offer's click stores the board token for the configured host", async () => {
 		const loaded = { calls: 0 };
-		const fixture = viewWith([]);
+		const fixture = viewWith([], true, "git.acme.ghe.com");
 		const posts: { url: string; body: unknown }[] = [];
 		const { container, unmount } = await mountSection(
 			baseMock(fixture, loaded, (url, init) => {
@@ -2569,7 +2594,11 @@ describe("GitHostsSection board GitHub token reuse", () => {
 					posts.push({ url, body: JSON.parse(String(init.body)) });
 					// The stored entry drops the offer on the reload below.
 					fixture.tokens = [
-						{ host: "github.com", username: "x-access-token", tokenSet: true },
+						{
+							host: "git.acme.ghe.com",
+							username: "x-access-token",
+							tokenSet: true,
+						},
 					];
 					return ok(fixture);
 				}
@@ -2583,7 +2612,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			if (input === null)
 				throw new Error("offer test URL input did not render");
 			await act(async () => {
-				typeInto(input, "https://github.com/octo/repo.git");
+				typeInto(input, "https://git.acme.ghe.com/octo/repo.git");
 				onChangeOf(input)({ target: input, currentTarget: input });
 			});
 			const offerForm = container.querySelector<HTMLFormElement>(
@@ -2598,14 +2627,14 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			expect(posts).toEqual([
 				{
 					url: "/api/git-hosts/github-token",
-					body: { testUrl: "https://github.com/octo/repo.git" },
+					body: { testUrl: "https://git.acme.ghe.com/octo/repo.git" },
 				},
 			]);
 			// The reload shows the stored entry and drops the offer.
 			expect(
 				Array.from(
 					container.querySelectorAll("#host-tokens-block td code"),
-				).some((c) => c.textContent === "github.com"),
+				).some((c) => c.textContent === "git.acme.ghe.com"),
 			).toBe(true);
 			expect(
 				container.querySelector("#host-tokens-block .board-token-offer"),
@@ -2619,13 +2648,13 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		const loaded = { calls: 0 };
 		const posts: string[] = [];
 		const { container, unmount } = await mountSection(
-			baseMock(viewWith([]), loaded, (url, init) => {
+			baseMock(viewWith([], true, "git.acme.ghe.com"), loaded, (url, init) => {
 				if (
 					url.endsWith("/api/git-hosts/github-token") &&
 					init?.method === "POST"
 				) {
 					posts.push(url);
-					return ok(viewWith([]));
+					return ok(viewWith([], true, "git.acme.ghe.com"));
 				}
 				return undefined;
 			}),
