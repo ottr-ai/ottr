@@ -15,8 +15,10 @@ mkdirSync(join(SCRATCH, "roots"), { recursive: true });
 mkdirSync(join(SCRATCH, "bin"), { recursive: true });
 
 // Fake omp: logs argv+stdin, then answers by invocation kind, matching the server's real omp
-// calls: `auth-gateway stdio` (the prepare phase's title generation) gets one chat completion;
-// other non-agent calls (the `usage --json` quota probe) exit 0 quietly; an agent run (-p) emits
+// calls: `auth-gateway stdio` gets one chat completion — the prompt gate's tool-free check
+// (OTTR-823) gets a passing strict-JSON gate answer so a clear task starts its turn, and every
+// other gateway call (title generation) keeps the plain title; other non-agent calls (the
+// `usage --json` quota probe) exit 0 quietly; an agent run (-p) emits
 // a session event, saves the session file like real omp, stays alive 6s and exits 0 without
 // agent_end (background-wait) — except from the third agent run on, where it ends terminally so
 // a task can settle and steer-after-settle can be proven.
@@ -28,10 +30,38 @@ const log = process.env.OMP_SHIM_LOG;
 const countFile = process.env.OMP_SHIM_COUNT;
 const exitLog = () => fs.appendFileSync(log, JSON.stringify({ t: Date.now(), ev: "exit" }) + "\\n");
 const argv = process.argv.slice(1);
-fs.appendFileSync(log, JSON.stringify({ t: Date.now(), ev: "start", argv, stdin: fs.readFileSync(0, "utf8") }) + "\\n");
+const stdin = fs.readFileSync(0, "utf8");
+fs.appendFileSync(log, JSON.stringify({ t: Date.now(), ev: "start", argv, stdin }) + "\\n");
 if (argv.includes("auth-gateway")) {
   process.stdout.write(JSON.stringify({ ready: true }) + "\\n");
-  process.stdout.write(JSON.stringify({ id: 1, status: 200, body: { choices: [{ message: { content: "steering flow proof" } }] } }) + "\\n");
+  // The prompt gate rides auth-gateway stdio too; its system prompt is unique ("task prompt is
+  // ready to build"), so answer it with a passing strict-JSON gate check and keep the title
+  // answer for the other gateway calls.
+  let content = "steering flow proof";
+  try {
+    const req = JSON.parse(stdin);
+    const sys = ((req.body ?? {}).messages ?? []).find(
+      (m) => (m ?? {}).role === "system",
+    );
+    if (
+      typeof (sys ?? {}).content === "string" &&
+      sys.content.includes("task prompt is ready to build")
+    ) {
+      content = JSON.stringify({
+        builds: "the task as prompted",
+        checks: "run the project's checks and report the observable result",
+        points: [
+          { covered: true, reason: "the goal is stated" },
+          { covered: true, reason: "the method is stated" },
+          { covered: true, reason: "the raw material is stated" },
+          { covered: true, reason: "the tools are stated" },
+          { covered: true, reason: "an outside check is stated" },
+        ],
+        questions: [],
+      });
+    }
+  } catch {}
+  process.stdout.write(JSON.stringify({ id: 1, status: 200, body: { choices: [{ message: { content } }] } }) + "\\n");
   exitLog();
 } else if (!argv.includes("-p")) {
   exitLog();
