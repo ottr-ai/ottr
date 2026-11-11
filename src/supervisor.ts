@@ -281,6 +281,9 @@ interface PrDetail {
 	/** The merge time in ms; null when absent or unparseable. Two PRs merging inside one
 	 * poll window order by it (OTTR-809). */
 	mergedAt: number | null;
+	/** The base branch name at merge time (a merged PR keeps the base it merged into);
+	 * null when absent or malformed. Decides target-based vs bump-branch-based (OTTR-809). */
+	base: string | null;
 	mergeCommit: string | null;
 	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
 	 * still computes it, the field is absent, or the value is not a boolean. */
@@ -296,10 +299,16 @@ function parsePull(body: unknown): PrDetail | null {
 	if (sha !== null && sha !== undefined && typeof sha !== "string") return null;
 	const mergedAt =
 		typeof x.merged_at === "string" ? Date.parse(x.merged_at) : null;
+	const base = x.base as Record<string, unknown> | null | undefined;
+	const baseRef =
+		typeof base === "object" && base !== null && typeof base.ref === "string"
+			? base.ref
+			: null;
 	return {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
 		mergedAt: mergedAt !== null && !Number.isNaN(mergedAt) ? mergedAt : null,
+		base: baseRef,
 		mergeCommit: typeof sha === "string" ? sha : null,
 		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
 		// mergeable value must not turn a readable PR into null.
@@ -2117,19 +2126,21 @@ export function createSupervisor(
 				return;
 			}
 			if (s.merged && s.mergeCommit !== null) {
-				// The follow-up based on the bump branch reaches the target only through
-				// the source's merge, so the source's commit is the later one there. A
-				// target-based follow-up (a legacy card without the head branch name)
-				// puts its own commit straight onto the target.
-				const bumpBased = t.sourcePrHeadRef !== null;
+				// A merged PR keeps the base it merged into, so pr.base says where the
+				// follow-up's commit landed. GitHub retargets an open follow-up onto the
+				// target when the bump PR merges and its branch is deleted, which makes
+				// a headRef-known card target-based at merge time.
+				const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
+				const targetBased = pr.base !== null && pr.base === targetShort;
+				const bumpBased = !targetBased && t.sourcePrHeadRef !== null;
 				if (
 					bumpBased &&
 					s.mergedAt !== null &&
 					pr.mergedAt !== null &&
 					s.mergedAt < pr.mergedAt
 				) {
-					// The source merged first and the follow-up then landed on the
-					// already-merged bump branch: those fixes never reach the target.
+					// The follow-up still based on the bump branch when it merged after
+					// the source: those fixes never reach the target.
 					if (wentStale(e.store, t)) return;
 					e.store.updateTask(t.id, {
 						state: "needs_you",

@@ -6112,7 +6112,7 @@ export function createTurnLoop(
 	): Promise<void> {
 		if (!canShipPr(st)) return;
 		const prBranch = st.task.branch ?? "";
-		const head = src.headSha;
+		const head = await refreshedSourceHead(st, n, src);
 		if (head === null) {
 			// Filing always writes the head sha with the number; null is a corrupt row.
 			st.prNext = {
@@ -6161,6 +6161,38 @@ export function createTurnLoop(
 			return;
 		}
 		await parkOnSourcePr(st, n, src);
+	}
+
+	/** Re-reads the source PR's current head before the ship judges the card branch: a
+	 * rebase between the filing (or the last park) and this ship moves the bot's branch,
+	 * and the row's sha goes dead. Best-effort — an unwired fetch, a non-GitHub project
+	 * or a failed fetch keeps the stored sha; a fresh sha replaces it on the row so the
+	 * next ship and the park stamp name the live head. Null only on a corrupt row. */
+	async function refreshedSourceHead(
+		st: TurnSettle,
+		n: number,
+		src: SourcePrRef,
+	): Promise<string | null> {
+		if (src.headSha === null) return null;
+		const fetchPrHead = ops.fetchPrHead;
+		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
+		if (fetchPrHead === undefined || repo === null) return src.headSha;
+		const err = await fetchPrHead(
+			st.e.path,
+			n,
+			`${githubHost().webBase}/${repo}.git`,
+		).catch((e: unknown) => errmsg(e));
+		if (err !== null) {
+			st.log(`! refreshing the source PR #${n} head failed: ${err}`);
+			return src.headSha;
+		}
+		const sha = await ops
+			.targetSha(st.e.path, `refs/ottr/pr/${n}`)
+			.catch(() => null);
+		if (sha === null || sha === src.headSha) return src.headSha;
+		st.store.updateTask(st.id, { sourcePrHeadSha: sha });
+		st.log(`- source PR #${n} head refreshed to ${sha.slice(0, 7)}`);
+		return sha;
 	}
 
 	/** OTTR-781: resolves a legacy Dependabot card (filed before the source-PR fields

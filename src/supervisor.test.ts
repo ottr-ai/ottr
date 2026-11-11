@@ -3136,6 +3136,8 @@ function pullBody(o: {
 	mergeSha?: string | null;
 	// undefined leaves the field out of the body
 	mergeable?: unknown;
+	/** The base branch name; GitHub omits nothing here, tests only when it matters. */
+	base?: string;
 }): string {
 	return JSON.stringify({
 		number: 7,
@@ -3143,6 +3145,7 @@ function pullBody(o: {
 		merged_at: o.mergedAt ?? null,
 		merge_commit_sha: o.mergeSha ?? null,
 		mergeable: o.mergeable,
+		...(o.base !== undefined && { base: { ref: o.base } }),
 	});
 }
 
@@ -3917,6 +3920,7 @@ describe("prPass", () => {
 		mergedAt?: string | null;
 		mergeSha?: string | null;
 		mergeable?: unknown;
+		base?: string;
 	}) =>
 		JSON.stringify({
 			number: 9,
@@ -3924,6 +3928,7 @@ describe("prPass", () => {
 			merged_at: o.mergedAt ?? null,
 			merge_commit_sha: o.mergeSha ?? null,
 			mergeable: o.mergeable,
+			...(o.base !== undefined && { base: { ref: o.base } }),
 		});
 
 	function followUpCard(store: ProjectStore): Task {
@@ -4008,6 +4013,7 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-06T00:00:00Z",
 								mergeSha: OTHER_SHA,
+								base: "ottr/552",
 							}),
 							stderr: "",
 						}
@@ -4017,6 +4023,7 @@ describe("prPass", () => {
 								stdout: pullBody({
 									mergedAt: "2026-11-07T00:00:00Z",
 									mergeSha: MERGE_SHA,
+									base: "main",
 								}),
 								stderr: "",
 							}
@@ -4058,6 +4065,8 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-07T00:00:00Z",
 								mergeSha: MERGE_SHA,
+								// The follow-up still based on the bump branch at its merge.
+								base: "ottr/552",
 							}),
 							stderr: "",
 						}
@@ -4067,6 +4076,7 @@ describe("prPass", () => {
 								stdout: pullBody({
 									mergedAt: "2026-11-06T00:00:00Z",
 									mergeSha: OTHER_SHA,
+									base: "main",
 								}),
 								stderr: "",
 							}
@@ -4083,6 +4093,51 @@ describe("prPass", () => {
 		expect(after.needsReason).toContain("not on the target branch");
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("the fixes are stranded on the bump branch");
+		store.close();
+	});
+
+	test("a retargeted follow-up finishes with its own commit", async () => {
+		// GitHub retargets an open follow-up onto the target when the bump PR merges
+		// and its branch is deleted: the follow-up's own commit then lands on the
+		// target, even though the card knows the bump branch's name.
+		const store = prModeProject("pr-fu-retarget");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-07T00:00:00Z",
+								mergeSha: MERGE_SHA,
+								base: "main",
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-06T00:00:00Z",
+									mergeSha: OTHER_SHA,
+									base: "main",
+								}),
+								stderr: "",
+							}
+						: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		store.close();
 	});
 

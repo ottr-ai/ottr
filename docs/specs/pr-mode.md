@@ -247,12 +247,16 @@ step checks the source before it ever opens a PR:
   with a reason that names the PR and the card branch. The park stamps the
   resolved source PR fields onto the row (a legacy card carries none until
   now): the PR pass reads Dependabot's rebase answer off the row, and a
-  re-ship re-judges the branch against the same source PR. When Dependabot
-  answers that comment with a cannot-rebase reply (an orphaned PR or one a
-  hand edit took over), the pass rewrites the park reason to: close the
-  pull request, Dependabot reopens it from the current config. The read and
-  the settle stay independent: a carry-parked card whose PR is already
-  adopted still finishes when that PR merges.
+  re-ship re-judges the branch against the same source PR. The ship step
+  re-reads the source PR's current head before it judges the card branch —
+  a rebase between the park and the reply moves the bot's branch and the
+  stamped sha goes dead — and replaces it on the row; an unwired or failed
+  fetch keeps the stored sha. When Dependabot answers that comment with a
+  cannot-rebase reply (an orphaned PR or one a hand edit took over), the
+  pass rewrites the park reason to: close the pull request, Dependabot
+  reopens it from the current config. The read and the settle stay
+  independent: a carry-parked card whose PR is already adopted still
+  finishes when that PR merges.
 
 Cards without a source PR keep the adopt-or-create ship step above; the
 ff-only merge flow is untouched.
@@ -298,17 +302,19 @@ The PR pass watches both PRs of a follow-up card. Each window: the conflict
 verdict runs for each PR still in the open list; a PR that left it gets one
 per-PR read. The follow-up PR merged: its fields clear, and the card keeps
 waiting on the source PR. Both merged: the pinned merge commit is the one
-that sits on the target — the source's merge commit for a follow-up based on
-the bump branch (its own commit reaches the target only through the
-source's merge), the follow-up's own commit for a target-based follow-up (a
-legacy card without the head branch name). A bump-branch follow-up that
-merges after its source parked the card needs_you: its fixes sit on the
-already-merged bump branch and never reach the target. The follow-up closed
-without merge parks the card needs_you ("follow-up PR #F closed without
-merging"); the source closed without merge parks it the same way while the
-follow-up waits. The remote card-branch delete still runs only at the
-finish: the follow-up PR's head is the card branch, and it may go only once
-both PRs merged.
+that sits on the target. The single-PR read's `base.ref` decides — a merged
+PR keeps the base it merged into: the follow-up's own commit for a
+follow-up whose base is the target at merge time (a legacy card without the
+head branch name, or GitHub's retarget of an open follow-up onto the target
+after the bump merged and its branch was deleted), the source's merge
+commit for a follow-up that still based on the bump branch. A bump-branch
+follow-up that merges after its source parks the card needs_you: its fixes
+sit on the already-merged bump branch and never reach the target. The
+follow-up closed without merge parks the card needs_you ("follow-up PR #F
+closed without merging"); the source closed without merge parks it the same
+way while the follow-up waits. The remote card-branch delete still runs
+only at the finish: the follow-up PR's head is the card branch, and it may
+go only once both PRs merged.
 
 A Dependabot card parked on the rebase handoff (its reason carries "the
 board asked @dependabot to rebase") reads its source PR's comments once per

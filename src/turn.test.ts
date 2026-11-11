@@ -20781,7 +20781,10 @@ describe("turn PR-mode merge settle", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
+		// Two fetches: the resolve reads the head in, then the ship's refresh re-reads
+		// it (the same idempotent ref read) before judging the branch.
 		expect(fetches).toEqual([
+			[store.path, 30, "https://github.com/acme/repo.git"],
 			[store.path, 30, "https://github.com/acme/repo.git"],
 		]);
 		const after = store.getTask(task.id)!;
@@ -21020,6 +21023,59 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.sourcePrHeadRef).toBe(null);
 		expect(after.sourcePrCrossRepo).toBe(false);
 		expect(after.sourcePrDependabot).toBe(true);
+	});
+
+	test("a legacy re-ship after a rebase refreshes the head and adopts the PR (OTTR-809)", async () => {
+		const fetches: unknown[][] = [];
+		const { store, loop, task } = prMergeSetup({
+			fetchPrHead: async (...args: unknown[]) => {
+				fetches.push(args);
+				return null;
+			},
+			// Dependabot rebased since the park: the row's head sha is dead, the fetched
+			// ref and the card branch hold the fresh head.
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/ottr/pr/30" || ref === "refs/heads/ott/m"
+					? "fresh-head"
+					: "sha-old",
+			treesEqual: async (_m: string, a: string, b: string) =>
+				a === "fresh-head" && b === "fresh-head",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "stale-head" && tip === "fresh-head",
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a clean source bump");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run for a source-PR card");
+			},
+		});
+		// The card parked once (parkOnSourcePr stamped the row) and Dependabot rebased
+		// its branch since; a re-ship must judge the fresh head, not the stamped one.
+		store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+			sourcePrNumber: 30,
+			sourcePrUrl: "https://github.com/acme/repo/pull/30",
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+			sourcePrHeadSha: "stale-head",
+			sourcePrCrossRepo: false,
+			sourcePrDependabot: true,
+		});
+		await loop.runTurn(store.name, task.id);
+		// One fetch: the stamped row skips the legacy resolve, and the ship's refresh
+		// reads the head in before judging the branch.
+		expect(fetches).toEqual([
+			[store.path, 30, "https://github.com/acme/repo.git"],
+		]);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(30);
+		expect(after.prHeadSha).toBe("fresh-head");
+		// The refreshed head replaces the dead one on the row for the next ship.
+		expect(after.sourcePrHeadSha).toBe("fresh-head");
+		expect(logText(store, task.id)).toContain(
+			"- source PR #30 head refreshed to fresh-h",
+		);
 	});
 
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {
