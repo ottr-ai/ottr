@@ -57,26 +57,72 @@ const KIND_LABEL: Record<AlertKind, string> = {
 	"secret-scanning": "secret scanning",
 };
 
-/** One gh page's parsed array, or the reason the page failed. */
+/** One fetched page plus the next page's cursor (set only when headers were read). */
+type Page = Fetch & { nextAfter: string | null };
+
+/** gh api -i prints the response headers, a blank line, then the body. */
+function splitBody(stdout: string): { headers: string; body: string } {
+	const m = /\r?\n\r?\n/.exec(stdout);
+	if (m === null || m.index === undefined) return { headers: "", body: stdout };
+	return {
+		headers: stdout.slice(0, m.index),
+		body: stdout.slice(m.index + m[0].length),
+	};
+}
+
+/** A cursor token we are willing to reuse in a request URL: stays percent-encoded. */
+const CURSOR_RE = /^[A-Za-z0-9_%.~+=:-]{1,300}$/;
+
+/** The after cursor of the Link header's rel="next" URL, or null when none is usable. */
+function nextAfterFromLink(headers: string): string | null {
+	for (const line of headers.split(/\r?\n/)) {
+		if (!/^link:/i.test(line)) continue;
+		const next = line
+			.slice(5)
+			.split(",")
+			.find((part) => part.includes('rel="next"'));
+		const url = /<([^>]+)>/.exec(next ?? "")?.[1] ?? "";
+		const cursor = /[?&]after=([^&\s>]+)/.exec(url)?.[1];
+		return cursor !== undefined && CURSOR_RE.test(cursor) ? cursor : null;
+	}
+	return null;
+}
+
+/** One gh page's parsed array, or the reason the page failed. Dependabot reads
+ * headers too: it rejected offset pagination (page, HTTP 400) and its Link
+ * header carries the next page's after cursor. */
 async function fetchPage(
 	gh: GhFn,
 	path: string,
 	kind: AlertKind,
-): Promise<Fetch> {
+): Promise<Page> {
+	const withHeaders = kind === "dependabot";
+	const args = withHeaders ? ["api", "-i", path] : ["api", path];
 	let res: { code: number; stdout: string; stderr: string };
 	try {
-		res = await gh(["api", path], 30_000);
+		res = await gh(args, 30_000);
 	} catch (e) {
-		return { alerts: [], reason: cleanText((e as Error).message, 200) };
+		return {
+			alerts: [],
+			reason: cleanText((e as Error).message, 200),
+			nextAfter: null,
+		};
 	}
 	if (res.code !== 0) {
 		const line = res.stderr.split("\n")[0] ?? "";
 		const reason = cleanText(line, 200) || `exit ${res.code}`;
-		return { alerts: [], reason };
+		return { alerts: [], reason, nextAfter: null };
+	}
+	let stdout = res.stdout;
+	let nextAfter: string | null = null;
+	if (withHeaders) {
+		const head = splitBody(stdout);
+		stdout = head.body;
+		nextAfter = nextAfterFromLink(head.headers);
 	}
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(res.stdout);
+		parsed = JSON.parse(stdout);
 	} catch {
 		parsed = "not json";
 	}
@@ -84,12 +130,15 @@ async function fetchPage(
 		return {
 			alerts: [],
 			reason: `could not parse the ${KIND_LABEL[kind]} response`,
+			nextAfter: null,
 		};
 	}
-	return { alerts: parsed, reason: null };
+	return { alerts: parsed, reason: null, nextAfter };
 }
 
-/** All open alerts of one endpoint: whole pages until a short page, capped at MAX_PAGES. */
+/** All open alerts of one endpoint, capped at MAX_PAGES. Dependabot pages by the
+ * after cursor until its Link header runs out; the scanning endpoints keep
+ * whole offset pages until a short one. */
 async function fetchEndpoint(
 	gh: GhFn,
 	id: string,
@@ -97,6 +146,22 @@ async function fetchEndpoint(
 ): Promise<Fetch> {
 	const base = `repos/${id}/${kind}/alerts`;
 	const all: Record<string, unknown>[] = [];
+	if (kind === "dependabot") {
+		let after: string | null = null;
+		for (let page = 1; page <= MAX_PAGES; page++) {
+			const cursor = after === null ? "" : `&after=${after}`;
+			const r = await fetchPage(
+				gh,
+				`${base}?state=open&per_page=${PAGE_SIZE}${cursor}`,
+				kind,
+			);
+			if (r.reason !== null) return r;
+			all.push(...r.alerts);
+			if (r.nextAfter === null) break;
+			after = r.nextAfter;
+		}
+		return { alerts: all, reason: null };
+	}
 	for (let page = 1; page <= MAX_PAGES; page++) {
 		const r = await fetchPage(
 			gh,

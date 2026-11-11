@@ -8901,7 +8901,8 @@ describe("review and release cards carry the board's GitHub alerts", () => {
 
 	test("a good fetch lands the summary on the review card, never a secret value", async () => {
 		const { m, e } = await alertMount(async (args) => {
-			const path = args[1] ?? "";
+			// gh api's path is always the last argument (dependabot adds -i before it).
+			const path = args.at(-1) ?? "";
 			const stdout = path.includes("dependabot/alerts")
 				? JSON.stringify([
 						{

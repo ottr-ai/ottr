@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { GhFn } from "./forks.ts";
 import { cleanText, githubAlertSummary } from "./githubAlerts.ts";
 
-/** Fake gh: answers API paths from a map; records every call. */
+/** Fake gh: answers API paths from a map; records every call. The route key is
+ * the path, always gh api's last argument (dependabot reads headers via -i). */
 function fakeGh(routes: Record<string, string | Error>): {
 	gh: GhFn;
 	calls: string[];
@@ -10,7 +11,7 @@ function fakeGh(routes: Record<string, string | Error>): {
 	const calls: string[] = [];
 	const gh: GhFn = async (args) => {
 		calls.push(args.join(" "));
-		const key = args[1] ?? "";
+		const key = args.at(-1) ?? "";
 		const route = routes[key];
 		if (route instanceof Error) throw route;
 		if (route === undefined)
@@ -47,8 +48,9 @@ const secret = (n: number, extra: Record<string, unknown> = {}) => ({
 });
 
 const baseRoutes = (overrides: Record<string, string | Error> = {}) => ({
-	"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
-		JSON.stringify([dep(1, "critical"), dep(2, "low"), dep(3, "critical")]),
+	"repos/acme/widget/dependabot/alerts?state=open&per_page=100": JSON.stringify(
+		[dep(1, "critical"), dep(2, "low"), dep(3, "critical")],
+	),
 	"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 		JSON.stringify([code(1, "high"), code(2, "high"), code(3, "low")]),
 	"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
@@ -85,10 +87,11 @@ describe("githubAlertSummary", () => {
 		expect(s.match(/\(active\)/g)).toHaveLength(1);
 		expect(calls).toHaveLength(3);
 		// The real REST endpoints, hyphen-free: repos/<owner>/<repo>/<kind>/alerts.
+		// Dependabot never carries page (offset pagination is gone); the scanners do.
 		expect([...calls].sort()).toEqual(
 			[
 				"api repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1",
-				"api repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1",
+				"api -i repos/acme/widget/dependabot/alerts?state=open&per_page=100",
 				"api repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1",
 			].sort(),
 		);
@@ -97,7 +100,7 @@ describe("githubAlertSummary", () => {
 	test("one failing endpoint -> per-type line, other types still listed", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/dependabot/alerts?state=open&per_page=100":
 					"ERR:gh: Forbidden (HTTP 403)\nsecond line",
 			}),
 		);
@@ -116,8 +119,7 @@ describe("githubAlertSummary", () => {
 	test("gh runner throws on every endpoint -> unavailable with the error message", async () => {
 		const boom = new Error("gh binary missing");
 		const { gh } = fakeGh({
-			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
-				boom,
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100": boom,
 			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 				boom,
 			"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
@@ -199,7 +201,7 @@ describe("githubAlertSummary", () => {
 
 	test("all three endpoints fail -> one unavailable line", async () => {
 		const { gh } = fakeGh({
-			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100":
 				"ERR:gh: Not Found (HTTP 404)",
 			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 				"ERR:gh: Not Found (HTTP 404)",
@@ -227,27 +229,93 @@ describe("githubAlertSummary", () => {
 		);
 	});
 
-	test("pagination: full pages fetched until a short page", async () => {
+	test("code scanning paginates offset pages until a short page", async () => {
+		const page = (n: number) =>
+			JSON.stringify(Array.from({ length: n }, (_, i) => code(i + 1)));
+		const { gh, calls } = fakeGh({
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100": page(1),
+			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
+				page(100),
+			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=2":
+				page(1),
+			"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
+				"[]",
+		});
+		const s = await githubAlertSummary({ repo: "acme/widget", gh });
+		expect(s).toContain(": 102 open.");
+		expect(calls.filter((c) => c.includes("code-scanning/alerts"))).toEqual([
+			"api repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1",
+			"api repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=2",
+		]);
+	});
+
+	test("dependabot paginates by the after cursor; page is never sent to it", async () => {
+		const pageOne = JSON.stringify(
+			Array.from({ length: 100 }, (_, i) => dep(i + 1)),
+		);
+		// A GHES host that still rejects offset pagination on this endpoint.
+		const pageRejected: {
+			code: number;
+			stdout: string;
+			stderr: string;
+		} = {
+			code: 1,
+			stdout: "",
+			stderr:
+				"gh: Pagination using the 'page' parameter is not supported. (HTTP 400)",
+		};
+		const nextLink =
+			'link: <https://api.github.com/repos/acme/widget/dependabot/alerts?after=v2-Ab%2Bcd_9&per_page=100>; rel="next"';
+		const lastLink =
+			'link: <https://api.github.com/repos/acme/widget/dependabot/alerts?before=v2-old&per_page=100>; rel="prev"';
+		const seen: string[] = [];
+		const gh: GhFn = async (args) => {
+			const path = args.at(-1) ?? "";
+			seen.push(args.join(" "));
+			if (path.includes("dependabot/alerts")) {
+				if (/[?&]page=/.test(path)) return pageRejected;
+				const headers = path.includes("&after=") ? lastLink : nextLink;
+				const body = path.includes("&after=")
+					? JSON.stringify([dep(101, "low")])
+					: pageOne;
+				return { code: 0, stdout: `${headers}\r\n\r\n${body}`, stderr: "" };
+			}
+			return { code: 0, stdout: "[]", stderr: "" };
+		};
+		const s = await githubAlertSummary({ repo: "acme/widget", gh });
+		expect(s).toContain("- Dependabot: 101 open (100 high, 1 low)");
+		expect(s).not.toContain("alerts unavailable");
+		expect(s).not.toContain("not available");
+		// Exact requests: no page param ever rides the dependabot path, the cursor
+		// rides the second call, and the scanners keep their offset pages.
+		expect(seen.filter((c) => c.includes("dependabot/alerts"))).toEqual([
+			"api -i repos/acme/widget/dependabot/alerts?state=open&per_page=100",
+			"api -i repos/acme/widget/dependabot/alerts?state=open&per_page=100&after=v2-Ab%2Bcd_9",
+		]);
+		expect(seen.filter((c) => c.includes("code-scanning/alerts"))).toEqual([
+			"api repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1",
+		]);
+		expect(seen.filter((c) => c.includes("secret-scanning/alerts"))).toEqual([
+			"api repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1",
+		]);
+	});
+
+	test("a dependabot page without a usable next cursor ends pagination", async () => {
 		const page = (n: number) =>
 			JSON.stringify(Array.from({ length: n }, (_, i) => dep(i + 1)));
 		const { gh, calls } = fakeGh({
-			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
-				page(100),
-			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=2":
-				page(1),
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100": page(100),
 			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 				"[]",
 			"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
 				"[]",
 		});
 		const s = await githubAlertSummary({ repo: "acme/widget", gh });
-		expect(s).toContain(": 101 open.");
-		expect(calls.filter((c) => c.endsWith("page=1")).length).toBe(3);
-		expect(
-			calls.some((c) =>
-				c.includes("dependabot/alerts?state=open&per_page=100&page=2"),
-			),
-		).toBe(true);
+		expect(s).toContain(": 100 open.");
+		expect(s).not.toContain("alerts unavailable");
+		expect(calls.filter((c) => c.includes("dependabot/alerts"))).toHaveLength(
+			1,
+		);
 	});
 
 	test("untrusted strings collapse to single lines", async () => {
@@ -261,7 +329,7 @@ describe("githubAlertSummary", () => {
 		};
 		const { gh } = fakeGh(
 			baseRoutes({
-				"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
+				"repos/acme/widget/dependabot/alerts?state=open&per_page=100":
 					JSON.stringify([bad]),
 				"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
 					"[]",
