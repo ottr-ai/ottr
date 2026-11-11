@@ -3574,6 +3574,14 @@ describe("NotificationsSection stale push recovery", () => {
 			failPostSubscribe?: boolean;
 			newEndpoint?: string;
 			prefsClasses?: unknown;
+			/** The subscribe-POST-failure undo (the new subscription's unsubscribe) rejects. */
+			undoRejects?: boolean;
+			failPrefsGet?: boolean;
+			failPrefsPost?: boolean;
+			/** Initial subscription endpoint (default the old fixture endpoint). */
+			initialEndpoint?: string;
+			/** Seeds the pending-subscribe localStorage record before mount. */
+			seedPending?: string;
 		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
@@ -3587,13 +3595,15 @@ describe("NotificationsSection stale push recovery", () => {
 		const subscribedKeys: string[] = [];
 		const posts: Array<{ url: string; body: unknown }> = [];
 		let permissionCalls = 0;
+		const initialEndpoint =
+			options.initialEndpoint ?? "https://push.example.com/old";
 		let currentSub: {
 			endpoint: string;
 			toJSON: () => unknown;
 			unsubscribe: () => Promise<void>;
 		} | null = {
-			endpoint: "https://push.example.com/old",
-			toJSON: () => ({ endpoint: "https://push.example.com/old" }),
+			endpoint: initialEndpoint,
+			toJSON: () => ({ endpoint: initialEndpoint }),
 			unsubscribe: async () => {
 				if (options.unsubscribeRejects) throw new Error("unsubscribe failed");
 				currentSub = null;
@@ -3605,13 +3615,14 @@ describe("NotificationsSection stale push recovery", () => {
 				subscribe: async (opts: { applicationServerKey: string }) => {
 					subscribedKeys.push(opts.applicationServerKey);
 					if (subscribeRejects) throw new Error("subscribe failed");
+					const newEndpoint =
+						options.newEndpoint ?? "https://push.example.com/new";
 					currentSub = {
-						endpoint: options.newEndpoint ?? "https://push.example.com/new",
-						toJSON: () => ({
-							endpoint: options.newEndpoint ?? "https://push.example.com/new",
-						}),
+						endpoint: newEndpoint,
+						toJSON: () => ({ endpoint: newEndpoint }),
 						// The POST-failure undo must leave no browser subscription.
 						unsubscribe: async () => {
+							if (options.undoRejects) throw new Error("undo failed");
 							currentSub = null;
 						},
 					};
@@ -3633,6 +3644,8 @@ describe("NotificationsSection stale push recovery", () => {
 				posts.push({ url: target, body: JSON.parse(String(init.body)) });
 				if (options.failPostSubscribe && target === "/api/push/subscribe")
 					return Response.json({ error: "boom" }, { status: 500 });
+				if (options.failPrefsPost && target === "/api/notifications/prefs")
+					return Response.json({ error: "prefs post failed" }, { status: 500 });
 				return Response.json({ ok: true });
 			}
 			if (target.startsWith("/api/push/config")) {
@@ -3641,15 +3654,19 @@ describe("NotificationsSection stale push recovery", () => {
 					stale: target.includes("endpoint=") ? stale : false,
 				});
 			}
-			if (target.startsWith("/api/notifications/prefs"))
+			if (target.startsWith("/api/notifications/prefs")) {
+				if (options.failPrefsGet)
+					return Response.json({ error: "prefs get failed" }, { status: 500 });
 				return Response.json({
 					classes: options.prefsClasses ?? null,
 					mutedProjects: [],
 				});
+			}
 			return Response.json({ classes: null, mutedProjects: [] });
 		}) as unknown as typeof fetch;
 		Object.defineProperty(globalThis, "navigator", {
 			value: fakeNavigator,
+			writable: true,
 			configurable: true,
 		});
 		Object.defineProperty(globalThis, "Notification", {
@@ -3660,6 +3677,7 @@ describe("NotificationsSection stale push recovery", () => {
 					return "granted";
 				},
 			},
+			writable: true,
 			configurable: true,
 		});
 		Object.defineProperty(globalThis.window, "isSecureContext", {
@@ -3679,6 +3697,25 @@ describe("NotificationsSection stale push recovery", () => {
 					settings: { displayName: null, iconText: null },
 				}) as unknown as ProjectView,
 		);
+		// The pending-subscribe key mirrors the section's constant. The component
+		// reads bare localStorage, so the stub lives on globalThis.
+		const PENDING_KEY = "ottr.push.pendingSubscribe";
+		const realStorage = globalThis.localStorage;
+		const storageData = new Map<string, string>();
+		Object.defineProperty(globalThis, "localStorage", {
+			value: {
+				getItem: (k: string) => storageData.get(k) ?? null,
+				setItem: (k: string, v: string) => void storageData.set(k, v),
+				removeItem: (k: string) => void storageData.delete(k),
+			},
+			writable: true,
+			configurable: true,
+		});
+		if (options.seedPending !== undefined)
+			globalThis.localStorage.setItem(
+				PENDING_KEY,
+				JSON.stringify({ endpoint: options.seedPending }),
+			);
 		const container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
@@ -3709,6 +3746,12 @@ describe("NotificationsSection stale push recovery", () => {
 				currentSubscription: () => currentSub,
 			});
 		} finally {
+			globalThis.localStorage.removeItem("ottr.push.pendingSubscribe");
+			Object.defineProperty(globalThis, "localStorage", {
+				value: realStorage,
+				writable: true,
+				configurable: true,
+			});
 			await act(async () => {
 				root.unmount();
 			});
@@ -3716,10 +3759,12 @@ describe("NotificationsSection stale push recovery", () => {
 			globalThis.fetch = realFetch;
 			Object.defineProperty(globalThis, "navigator", {
 				value: realNavigator,
+				writable: true,
 				configurable: true,
 			});
 			Object.defineProperty(globalThis, "Notification", {
 				value: realNotification,
+				writable: true,
 				configurable: true,
 			});
 			Object.defineProperty(globalThis.window, "isSecureContext", {
@@ -3781,6 +3826,9 @@ describe("NotificationsSection stale push recovery", () => {
 				expect(probe.posts[2]!.body).toEqual({
 					endpoint: "https://push.example.com/old",
 				});
+				// The switches match the carried preferences immediately.
+				expect(probe.containerText()).toContain("This device");
+				expect(probe.containerText()).toContain("Request");
 			},
 			false,
 			{ prefsClasses: classes },
@@ -3842,6 +3890,107 @@ describe("NotificationsSection stale push recovery", () => {
 			},
 			false,
 			{ failPostSubscribe: true },
+		);
+	});
+
+	test("a failed subscribe POST whose undo fails keeps the live subscription and queues a retry", async () => {
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				expect(probe.posts.map((p) => p.url)).toEqual(["/api/push/subscribe"]);
+				// The browser keeps the live-but-unregistered subscription: the
+				// section shows it as on and never drops the old row blind.
+				expect(probe.currentSubscription()).not.toBeNull();
+				expect(probe.containerText()).toContain("Turn off");
+				expect(probe.containerText()).toContain("boom");
+				// The payload is queued for the next load's retry.
+				expect(
+					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
+				).not.toBeNull();
+			},
+			false,
+			{ failPostSubscribe: true, undoRejects: true },
+		);
+	});
+
+	test("a queued pending subscribe retries once on the next load and clears the record", async () => {
+		await withPushBrowser(
+			false,
+			async (probe) => {
+				const subscribePosts = probe.posts.filter(
+					(p) => p.url === "/api/push/subscribe",
+				);
+				expect(subscribePosts).toHaveLength(1);
+				expect(subscribePosts[0]!.body).toEqual({
+					endpoint: "https://push.example.com/queued",
+				});
+				expect(
+					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
+				).toBeNull();
+			},
+			false,
+			{
+				seedPending: "https://push.example.com/queued",
+				initialEndpoint: "https://push.example.com/queued",
+			},
+		);
+	});
+
+	test("a failed pending subscribe retry keeps the queued record", async () => {
+		await withPushBrowser(
+			false,
+			async (probe) => {
+				expect(
+					probe.posts.filter((p) => p.url === "/api/push/subscribe"),
+				).toHaveLength(1);
+				expect(
+					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
+				).not.toBeNull();
+			},
+			false,
+			{
+				seedPending: "https://push.example.com/queued",
+				initialEndpoint: "https://push.example.com/queued",
+				failPostSubscribe: true,
+			},
+		);
+	});
+
+	test("a failed prefs read stops recovery before anything is mutated", async () => {
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				// No subscribe, no unsubscribe: the stale row and the browser
+				// subscription both stay for a retry on the next load.
+				expect(probe.posts).toEqual([]);
+				expect(probe.currentSubscription()).not.toBeNull();
+				expect(probe.containerText()).toContain("prefs get failed");
+				expect(probe.containerText()).toContain("Turn off");
+			},
+			false,
+			{ failPrefsGet: true },
+		);
+	});
+
+	test("a failed classes transfer keeps the old row and reports the error", async () => {
+		const classes = { request: true, error: false, complete: true };
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				expect(probe.posts.map((p) => p.url)).toEqual([
+					"/api/push/subscribe",
+					"/api/notifications/prefs",
+				]);
+				// The old row was NOT dropped: a later load can retry the transfer.
+				expect(
+					probe.posts.find((p) => p.url === "/api/push/unsubscribe"),
+				).toBeUndefined();
+				expect(probe.containerText()).toContain("prefs post failed");
+				// The browser holds the fresh subscription: the section reads on.
+				expect(probe.containerText()).toContain("Turn off");
+			},
+			false,
+			{ prefsClasses: classes, failPrefsPost: true },
 		);
 	});
 

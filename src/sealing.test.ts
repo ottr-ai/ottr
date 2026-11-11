@@ -574,6 +574,50 @@ describe("ADR-0011 config row sealing", () => {
 		expect(stale.json.stale).toBe(true);
 	});
 
+	test("a wrong-key boot keeps the stored vapid row through a config save and rebinds after a restart", async () => {
+		const g = GlobalStore.open(join(root, "g-vapid-save"));
+		stores.push(g);
+		const seeded = sealedRow(box);
+		const OLD_PUBLIC = "old-pub";
+		const SEALED_PRIVATE = box.seal("vapid-private-plain-7b1d");
+		seeded.vapid = {
+			publicKey: OLD_PUBLIC,
+			// Sealed under key A: a wrong-key boot cannot read it.
+			privateKey: SEALED_PRIVATE,
+			subject: "https://github.com/ottr-ai/ottr",
+		};
+		const legacyEndpoint = "https://push.example.com/legacy-save";
+		g.set("config", seeded);
+		// NO push_vapid_key kv: recovery must capture the outgoing key itself.
+		g.set("push_subs", [
+			{
+				endpoint: legacyEndpoint,
+				keys: { p256dh: "p", auth: "a" },
+				addedAt: 1,
+				classes: { request: true, error: true, complete: true },
+			},
+		]);
+		const app = boot(g, wrongBox);
+		// Any config save must not erase the unreadable stored row: the outgoing
+		// key is plaintext inside it and a later boot needs it to rebind subs.
+		const saved = await app.call("/api/settings", {});
+		expect(saved.status).toBe(200);
+		const row = storedRow(g);
+		expect(row.vapid).toEqual({
+			publicKey: OLD_PUBLIC,
+			privateKey: SEALED_PRIVATE,
+			subject: "https://github.com/ottr-ai/ottr",
+		});
+		// The marker was persisted at capture, before the save could drop the row.
+		expect(g.get<string | null>("push_vapid_key")).toBe(OLD_PUBLIC);
+		// A restart on the same store (wrong key again) still rebinds: stale.
+		const app2 = boot(g, wrongBox);
+		const stale = await app2.call(
+			`/api/push/config?endpoint=${encodeURIComponent(legacyEndpoint)}`,
+		);
+		expect(stale.json.stale).toBe(true);
+	});
+
 	test("a no-box fresh board answers push config and never persists the generated pair", async () => {
 		const g = GlobalStore.open(join(root, "g-nobox-vapid"));
 		stores.push(g);

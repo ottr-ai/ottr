@@ -1116,6 +1116,11 @@ export function NotificationsSection({
 	const busy = useBusy();
 	// Endpoints recovery already ran for: one pass per subscription, no loop.
 	const recoveredRef = useRef<Set<string>>(new Set());
+	// Queued subscribe POST from a failed flow whose browser undo also failed:
+	// the browser still holds the subscription, so the next load retries the
+	// registration once (ADR-0011). typeof guard: server-side render in tests.
+	const PENDING_SUBSCRIBE_KEY = "ottr.push.pendingSubscribe";
+	const pendingRetriedRef = useRef(false);
 	// The enable flow's core, shared with stale-sub recovery (ADR-0011): ready →
 	// key → subscribe under the current public key → POST. No permission prompt here.
 	const subscribeNew = async (): Promise<string> => {
@@ -1135,8 +1140,31 @@ export function NotificationsSection({
 		} catch (err) {
 			// ADR-0011 recovery: a subscription without a server row sends to a dead
 			// address and never reports stale — undo it so the UI shows the truth.
-			await sub.unsubscribe().catch(() => {});
-			throw err;
+			// When the browser refuses the undo, queue the payload: a retry on the
+			// next load can register the live-but-unaddressable subscription.
+			const failure = new Error(
+				err instanceof Error ? err.message : String(err),
+			);
+			try {
+				await sub.unsubscribe();
+			} catch {
+				const kept = failure as Error & {
+					keptSubscription?: boolean;
+					endpoint?: string;
+				};
+				kept.keptSubscription = true;
+				kept.endpoint = sub.endpoint;
+				try {
+					localStorage.setItem(
+						PENDING_SUBSCRIBE_KEY,
+						JSON.stringify(sub.toJSON()),
+					);
+				} catch {
+					// No storage: nothing to queue; the kept-subscription state still reports.
+				}
+				throw kept;
+			}
+			throw failure;
 		}
 		return sub.endpoint;
 	};
@@ -1167,6 +1195,26 @@ export function NotificationsSection({
 				if (sub != null) await post("/api/push/subscribe", sub.toJSON());
 				setEnabled(sub != null);
 				setEndpoint(sub?.endpoint ?? null);
+				// ADR-0011 recovery: a queued subscribe POST from a failed flow retries
+				// once per load, before anything else touches the subscription.
+				// Storage may be absent (test DOM): a missing store means nothing queued.
+				const pendingRaw =
+					typeof localStorage !== "undefined"
+						? localStorage.getItem(PENDING_SUBSCRIBE_KEY)
+						: null;
+				if (!pendingRetriedRef.current && pendingRaw !== null) {
+					pendingRetriedRef.current = true;
+					try {
+						const payload = JSON.parse(
+							localStorage.getItem(PENDING_SUBSCRIBE_KEY) ?? "null",
+						) as unknown;
+						if (payload !== null && typeof payload === "object")
+							await post("/api/push/subscribe", payload);
+						localStorage.removeItem(PENDING_SUBSCRIBE_KEY);
+					} catch {
+						// Silent: the next load retries the same queued payload.
+					}
+				}
 				if (sub == null) return;
 				// ADR-0011 recovery: a subscription bound to a replaced VAPID key can
 				// never receive. When the server reports it stale and permission was
@@ -1184,17 +1232,9 @@ export function NotificationsSection({
 				)
 					return;
 				recoveredRef.current.add(endpoint);
-				// ADR-0011 recovery: browser first, server row last. A failed browser
-				// unsubscribe leaves the real subscription in place, so "Turn off"
-				// stays and the kept stale row re-offers recovery on the next load.
-				try {
-					await sub.unsubscribe();
-				} catch (err) {
-					setError(err instanceof Error ? err.message : String(err));
-					return;
-				}
-				// A moved endpoint loses the per-endpoint classes unless carried over
-				// explicitly: fetch them from the old row before it goes.
+				// ADR-0011 recovery: read the old row's classes first — a failed read
+				// mutates nothing, so the browser subscription and the stale row both
+				// stay and the whole recovery retries on the next load.
 				let carried: ClassPrefs | null = null;
 				try {
 					const p = await unwrap<{
@@ -1205,24 +1245,57 @@ export function NotificationsSection({
 						),
 					);
 					carried = p.classes;
-				} catch {
-					carried = null;
+				} catch (err) {
+					setError(err instanceof Error ? err.message : String(err));
+					return;
+				}
+				// A failed browser unsubscribe leaves the real subscription in place,
+				// so "Turn off" stays and the kept stale row re-offers recovery.
+				try {
+					await sub.unsubscribe();
+				} catch (err) {
+					setError(err instanceof Error ? err.message : String(err));
+					return;
 				}
 				try {
 					const fresh = await subscribeNew();
-					setEnabled(true);
-					setEndpoint(fresh);
 					if (fresh !== endpoint) {
-						if (carried !== null)
-							void post("/api/notifications/prefs", {
-								endpoint: fresh,
-								classes: carried,
-							}).catch(() => {});
-						// Same endpoint: the subscribe replaced the row in place.
+						// Same endpoint: the subscribe replaced the row in place, classes
+						// kept server-side. A moved endpoint must carry the classes before
+						// the old row drops: a failed transfer leaves the old row
+						// stale-bound, so a later load can retry the whole recovery.
+						if (carried !== null) {
+							try {
+								await post("/api/notifications/prefs", {
+									endpoint: fresh,
+									classes: carried,
+								});
+							} catch (err) {
+								setEnabled(true);
+								setEndpoint(fresh);
+								setError(err instanceof Error ? err.message : String(err));
+								return;
+							}
+						}
+						// A leftover here is a dead row a later send-prune can drop.
 						void post("/api/push/unsubscribe", { endpoint }).catch(() => {});
 					}
+					// Server truth last: the switches match the restored preferences
+					// immediately; the prefs effect refetches and confirms.
+					setEnabled(true);
+					setEndpoint(fresh);
+					setClasses(carried);
 				} catch (err) {
-					markRecoveryFailed(err);
+					const kept = err as Error & { keptSubscription?: boolean };
+					if (kept.keptSubscription) {
+						setEnabled(true);
+						setEndpoint(
+							(err as Error & { endpoint?: string }).endpoint ?? null,
+						);
+						setError(err instanceof Error ? err.message : String(err));
+					} else {
+						markRecoveryFailed(err);
+					}
 				}
 			})
 			.catch((err) => {

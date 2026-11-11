@@ -3487,8 +3487,12 @@ export function createApp(deps: AppDeps) {
 						// boot seals it), and a legacy plaintext row writes its own value
 						// back byte-identical — no plaintext private key is ever created.
 						(stored?.vapid ?? null)
-					: vapid === null
-						? null
+					: // ADR-0011 recovery: a null runtime pair with an unreadable stored
+						// row keeps the stored object (sealed private key + plaintext public
+						// key) so a save does not erase the outgoing key before ensureVapid()
+						// regenerates; a regenerated pair writes the fresh sealed pair.
+						vapid === null
+						? (keptUnreadable.get("vapidKey") ?? null)
 						: {
 								...vapid,
 								privateKey: sealForStore("vapidKey", vapid.privateKey),
@@ -3752,9 +3756,14 @@ export function createApp(deps: AppDeps) {
 					subject: p.vapid.subject,
 				};
 			} else {
-				// ADR-0011 recovery: the outgoing key is plaintext, so a board without
-				// the push_vapid_key kv (upgraded/restored) can still rebind its subs.
+				// ADR-0011 recovery: keep the whole stored object (sealed private key +
+				// plaintext public key) so a config save writes it back instead of
+				// erasing the row, and persist the outgoing key immediately — the kv
+				// must exist before any config save can drop the row.
+				keptUnreadable.set("vapidKey", p.vapid);
 				previousVapidPublicKey = p.vapid.publicKey;
+				if (deps.gstore.get<string | null>("push_vapid_key") == null)
+					deps.gstore.set("push_vapid_key", previousVapidPublicKey);
 			}
 		}
 		if (typeof p.alate === "object" && p.alate !== null) {
