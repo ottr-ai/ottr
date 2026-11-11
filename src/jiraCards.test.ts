@@ -134,7 +134,7 @@ describe("jiraCardPrompt", () => {
 		expect(p).toContain(`Status: ${"t".repeat(2000)}\nDATA>>>`);
 	});
 
-	test("the last comments and the issue links are capped untrusted blocks", () => {
+	test("the comments and the issue links are capped untrusted blocks", () => {
 		const comment = (i: number): JiraIssue["comments"][number] => ({
 			author: `Author ${i}`,
 			date: `2026-10-0${i + 1}T10:00:00.000+0000`,
@@ -143,10 +143,7 @@ describe("jiraCardPrompt", () => {
 		const p = jiraCardPrompt(
 			SITE,
 			issue({
-				comments: [
-					comment(0),
-					...Array.from({ length: 8 }, (_, i) => comment(i + 1)),
-				],
+				comments: Array.from({ length: 9 }, (_, i) => comment(i)),
 				links: [
 					{
 						type: "blocks",
@@ -158,13 +155,13 @@ describe("jiraCardPrompt", () => {
 				],
 			}),
 		);
-		// Only the last 5 comments enter the prompt, oldest first.
-		expect(p).toContain("COMMENTS\n<<<DATA\nAuthor 4");
+		// Every comment enters the prompt, oldest first.
+		expect(p).toContain(
+			"COMMENTS\n<<<DATA\nAuthor 0 (2026-10-01T10:00:00.000+0000):\nbody 0\n\nAuthor 1",
+		);
 		expect(p).toContain(
 			"Author 8 (2026-10-09T10:00:00.000+0000):\nbody 8\nDATA>>>",
 		);
-		expect(p).not.toContain("body 3\n");
-		expect(p).not.toContain("Author 3 (");
 		// A keyless link is dropped, a real one shows type, key, summary and status.
 		expect(p).toContain(
 			"LINKS\n<<<DATA\nblocks: CMIS-8343: the follow-up (Done)\nDATA>>>",
@@ -240,8 +237,8 @@ describe("jiraCardPrompt", () => {
 			.map(([s, n]) => s.repeat(n));
 		const str = fc.oneof(small, big, fc.string());
 		// The same survival rules as the prompt builder: a comment without body text and
-		// a link without key characters are dropped, and only the last 5 comments and the
-		// first 20 links enter the prompt.
+		// a link without key characters are dropped, and at most the first 20 links enter
+		// the prompt.
 		const READ_HINT = "read the ticket in Jira";
 		const comment = fc.record({ author: str, date: str, body: str });
 		const link = fc.record({ type: str, key: str, summary: str, status: str });
@@ -263,9 +260,9 @@ describe("jiraCardPrompt", () => {
 			fc.property(ticket, (t) => {
 				const p = jiraCardPrompt(SITE, t);
 				expect(p.length).toBeLessThanOrEqual(20_000);
-				const comments = t.comments
-					.slice(-5)
-					.filter((m) => cleanOrWithheld(m.body, READ_HINT).text.trim() !== "");
+				const comments = t.comments.filter(
+					(m) => cleanOrWithheld(m.body, READ_HINT).text.trim() !== "",
+				);
 				const links = t.links
 					.slice(0, 20)
 					.filter((l) => l.key.replace(/[^\w.-]/g, "") !== "");

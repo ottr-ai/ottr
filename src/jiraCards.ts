@@ -35,7 +35,7 @@ export interface JiraIssue {
 	parent: string;
 	/** In connection order, empty values already dropped. */
 	custom: { id: string; text: string }[];
-	/** The last comments, oldest first; empty until the import fetches them. */
+	/** All comments, oldest first; empty until the import fetches them. */
 	comments: JiraComment[];
 	/** The issue links; empty until the import fetches them. */
 	links: JiraLink[];
@@ -44,8 +44,7 @@ export interface JiraIssue {
 /** The board's prompt limit (the card routes refuse longer prompts). */
 const PROMPT_LIMIT = 20_000;
 const VALUE_MAX = 2000;
-/** How many of the last comments and how many links enter the prompt. */
-export const COMMENT_COUNT = 5;
+/** How many links enter the prompt. */
 const LINK_COUNT = 20;
 const TRUNCATED = "\n… (truncated; read the full ticket in Jira)";
 const OMITTED = "(fields omitted)";
@@ -83,10 +82,9 @@ function fieldsText(i: JiraIssue): string {
 	return kept.length === 0 ? "(none)" : kept.join("\n");
 }
 
-/** The last COMMENT_COUNT comments, oldest first, one author/date/body chunk each. */
+/** Every comment, oldest first, one author/date/body chunk each. */
 function commentsText(i: JiraIssue): string {
 	const kept = i.comments
-		.slice(-COMMENT_COUNT)
 		.map((m): string | null => {
 			const body = value(m.body);
 			if (body.trim() === "") return null;

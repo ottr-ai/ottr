@@ -107,7 +107,7 @@ const jira = Bun.serve({
 			if (issueRead?.[3] === "/comment") {
 				const all = commentsByKey.get(stubKey) ?? [];
 				const startAt = Number(url.searchParams.get("startAt") ?? "0");
-				const maxResults = Number(url.searchParams.get("maxResults") ?? "5");
+				const maxResults = Number(url.searchParams.get("maxResults") ?? "100");
 				return Response.json({
 					comments: all.slice(startAt, startAt + maxResults),
 					startAt,
@@ -485,7 +485,7 @@ describe("search and import", () => {
 		expect(r.json.filed).toHaveLength(1);
 		const calls = seen.map((s) => `${s.method} ${s.path}`);
 		expect(calls).toContain(
-			"GET /jira/rest/api/2/issue/PROJ-1/comment?maxResults=5&startAt=0",
+			"GET /jira/rest/api/2/issue/PROJ-1/comment?maxResults=100&startAt=0",
 		);
 		expect(calls).toContain(
 			"GET /jira/rest/api/2/issue/PROJ-1?fields=issuelinks",
@@ -549,7 +549,7 @@ describe("search and import", () => {
 		expect(r.json.unavailable).toEqual(["PROJ-99"]);
 	});
 
-	test("the import reads the last comments and the issue links into the prompt", async () => {
+	test("the import reads all comments and the issue links into the prompt", async () => {
 		const adfText = (text: string): unknown => ({
 			type: "doc",
 			version: 1,
@@ -562,11 +562,12 @@ describe("search and import", () => {
 				body: adfText("Root cause found in the spike"),
 			},
 		]);
+		// 130 comments: two pages of 100 at the COMMENT_PAGE size.
 		commentsByKey.set(
 			"BULK-9002",
-			Array.from({ length: 7 }, (_, i) => ({
+			Array.from({ length: 130 }, (_, i) => ({
 				author: { displayName: `Author ${i}` },
-				created: `2026-10-0${i + 1}T10:00:00.000+0000`,
+				created: "2026-10-01T10:00:00.000+0000",
 				body: adfText(`body ${i}`),
 			})),
 		);
@@ -582,16 +583,22 @@ describe("search and import", () => {
 		seen.length = 0;
 		const r = await importKeys(["BULK-9001", "BULK-9002"]);
 		expect(r.status).toBe(200);
-		// The exact reads: the comment total comes first, the last page second.
+		// The exact reads: one page for a fresh ticket, two pages past the page size.
 		expect(seen).toContainEqual({
 			method: "GET",
-			path: "/rest/api/3/issue/BULK-9001/comment?maxResults=5&startAt=0",
+			path: "/rest/api/3/issue/BULK-9001/comment?maxResults=100&startAt=0",
 			auth: expect.any(String),
 			body: {},
 		});
 		expect(seen).toContainEqual({
 			method: "GET",
-			path: "/rest/api/3/issue/BULK-9002/comment?maxResults=5&startAt=2",
+			path: "/rest/api/3/issue/BULK-9002/comment?maxResults=100&startAt=0",
+			auth: expect.any(String),
+			body: {},
+		});
+		expect(seen).toContainEqual({
+			method: "GET",
+			path: "/rest/api/3/issue/BULK-9002/comment?maxResults=100&startAt=100",
 			auth: expect.any(String),
 			body: {},
 		});
@@ -608,15 +615,14 @@ describe("search and import", () => {
 		expect(single?.prompt).toContain(
 			"LINKS\n<<<DATA\nblocks: CMIS-8343: the follow-up (Done)\nDATA>>>",
 		);
-		// BULK-9002 keeps only the last 5 of its 7 comments, oldest first.
+		// BULK-9002 keeps every one of its 130 comments, oldest first.
 		const paged = p1.getTask(r.json.filed[1] ?? "");
 		expect(paged?.prompt).toContain(
-			"Author 2 (2026-10-03T10:00:00.000+0000):\nbody 2",
+			"Author 0 (2026-10-01T10:00:00.000+0000):\nbody 0",
 		);
 		expect(paged?.prompt).toContain(
-			"Author 6 (2026-10-07T10:00:00.000+0000):\nbody 6",
+			"Author 129 (2026-10-01T10:00:00.000+0000):\nbody 129",
 		);
-		expect(paged?.prompt).not.toContain("Author 1 (");
 		commentsByKey.clear();
 		linksByKey.clear();
 	});

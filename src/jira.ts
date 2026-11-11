@@ -559,27 +559,32 @@ function toComment(type: JiraType, raw: unknown): JiraComment | null {
 	return { author: author || "(unknown)", date, body };
 }
 
+/** Comment page size; a fresh ticket's comments fit one page. */
+const COMMENT_PAGE = 100;
+
 /**
- * The last `count` comments of one issue, oldest first. Jira's comment list is oldest
- * first, so the last page is `startAt: total - count`; a second call runs only when the
- * ticket has more comments than the cap. No order parameter: not every deployment has it.
+ * All comments of one issue, oldest first (Jira's page order), read in pages of
+ * COMMENT_PAGE with `startAt` until Jira's comment total is reached. No order
+ * parameter: not every deployment has it.
  */
-export async function lastComments(
+export async function allComments(
 	c: JiraConn,
 	key: string,
-	count: number,
 	net: JiraNet,
 ): Promise<JiraComment[]> {
 	const v = c.type === "cloud" ? 3 : 2;
 	const path = (startAt: number): string =>
-		`/rest/api/${v}/issue/${key}/comment?maxResults=${count}&startAt=${startAt}`;
-	const first = obj(await request(c.site, c, "GET", path(0), net));
-	const total = typeof first.total === "number" ? first.total : 0;
-	const page =
-		total <= count
-			? first
-			: obj(await request(c.site, c, "GET", path(total - count), net));
-	const raw = Array.isArray(page.comments) ? page.comments : [];
+		`/rest/api/${v}/issue/${key}/comment?maxResults=${COMMENT_PAGE}&startAt=${startAt}`;
+	const raw: unknown[] = [];
+	let startAt = 0;
+	for (;;) {
+		const page = obj(await request(c.site, c, "GET", path(startAt), net));
+		const total = typeof page.total === "number" ? page.total : 0;
+		const batch = Array.isArray(page.comments) ? page.comments : [];
+		raw.push(...batch);
+		if (batch.length === 0 || raw.length >= total) break;
+		startAt += batch.length;
+	}
 	return raw.map((r) => toComment(c.type, r)).filter((m) => m !== null);
 }
 

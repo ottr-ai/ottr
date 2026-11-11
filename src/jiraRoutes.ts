@@ -3,23 +3,18 @@
 
 import type { GlobalStore } from "./globalStore.ts";
 import {
+	allComments,
 	assertAllowedHost,
 	detectType,
 	issueLinks,
 	type JiraConn,
 	JiraError,
 	type JiraNet,
-	lastComments,
 	normalizeSiteUrl,
 	searchIssues,
 	testConnection,
 } from "./jira.ts";
-import {
-	COMMENT_COUNT,
-	type JiraIssue,
-	jiraCardPrompt,
-	jiraCardTitle,
-} from "./jiraCards.ts";
+import { type JiraIssue, jiraCardPrompt, jiraCardTitle } from "./jiraCards.ts";
 import type { SecretBox } from "./secretBox.ts";
 import type { ProjectStore } from "./store.ts";
 import type {
@@ -415,12 +410,7 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		// the import with Jira's message, like any other Jira call.
 		try {
 			for (const issue of issues.values()) {
-				issue.comments = await lastComments(
-					p.conn,
-					issue.key,
-					COMMENT_COUNT,
-					d.net,
-				);
+				issue.comments = await allComments(p.conn, issue.key, d.net);
 				issue.links = await issueLinks(p.conn, issue.key, d.net);
 			}
 		} catch (err) {
