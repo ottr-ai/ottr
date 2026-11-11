@@ -1147,6 +1147,11 @@ export function NotificationsSection({
 			// No storage: nothing to queue; the kept-subscription state still reports.
 		}
 	};
+	// Shared read of the queue: the prefs 404 branch uses it to tell a pending
+	// registration (suppress the error) from a genuinely unknown endpoint.
+	const hasPendingSubscribe = (): boolean =>
+		typeof localStorage !== "undefined" &&
+		localStorage.getItem(PENDING_SUBSCRIBE_KEY) !== null;
 	// The enable flow's core, shared with stale-sub recovery (ADR-0011): ready →
 	// key → subscribe under the current public key → POST. No permission prompt here.
 	// Returns the subscription so the caller can queue its context on a failure.
@@ -1354,25 +1359,27 @@ export function NotificationsSection({
 		let live = true;
 		void fetch(`/api/notifications/prefs${q}`)
 			.then((res) => {
-				// ADR-0011: on the kept path the fresh endpoint has no row yet — a 404
-				// means "no stored preferences", not a failure. Other statuses fail.
-				if (res.status === 404)
-					return { classes: null, mutedProjects: [] } as {
+				if (res.status !== 404)
+					return unwrap<{
 						classes: ClassPrefs | null;
 						mutedProjects: string[];
-					};
-				return unwrap<{
-					classes: ClassPrefs | null;
-					mutedProjects: string[];
-				}>(res);
+					}>(res);
+				// ADR-0011: the server 404s an endpoint with no row. That row is
+				// unknown, not empty: the board-wide mute list loaded before this
+				// fetch stays the truth (it drives saveMute), so no mute ref is
+				// touched. With no queued pending record the endpoint is genuinely
+				// unknown; a queued record means the row is registered on the next
+				// replay, so the missing row stays quiet.
+				if (live && !hasPendingSubscribe()) setError("unknown endpoint");
+				return null;
 			})
 			.then((p) => {
-				if (!live) return;
+				if (!live || p === null) return;
 				classesRef.current = p.classes;
-				mutedRef.current = p.mutedProjects;
 				savedClassesRef.current = p.classes;
-				savedMutedRef.current = p.mutedProjects;
 				setClasses(p.classes);
+				mutedRef.current = p.mutedProjects;
+				savedMutedRef.current = p.mutedProjects;
 				setMuted(p.mutedProjects);
 			})
 			.catch((err) => {

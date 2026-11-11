@@ -3564,6 +3564,10 @@ describe("NotificationsSection stale push recovery", () => {
 		run: (probe: {
 			subscribedKeys: string[];
 			posts: Array<{ url: string; body: unknown }>;
+			prefsReads: Array<{
+				endpoint: string | null;
+				classes: Record<string, boolean> | null | "unknown";
+			}>;
 			requestPermissionCalls: () => number;
 			containerText: () => string;
 			containerNode: () => HTMLDivElement;
@@ -3587,6 +3591,8 @@ describe("NotificationsSection stale push recovery", () => {
 			initialEndpoint?: string;
 			/** Seeds the pending-subscribe localStorage record before mount. */
 			seedPending?: unknown;
+			/** The server's board-wide muted projects (default ["alpha"]). */
+			mutedProjects?: string[];
 		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
@@ -3601,10 +3607,21 @@ describe("NotificationsSection stale push recovery", () => {
 		const posts: Array<{ url: string; body: unknown }> = [];
 		// failPostSubscribe fails only the FIRST subscribe POST: a remount's
 		// replay must be able to succeed (the queued record then clears).
+		// Every prefs GET, in order: endpoint = the query's endpoint or null,
+		// classes = the row's classes or "unknown" when the answer is the 404
+		// branch. Recorded at response-build time, so a test can assert the
+		// post-replay refetch really happened.
+		const prefsReads: Array<{
+			endpoint: string | null;
+			classes: Record<string, boolean> | null | "unknown";
+		}> = [];
 		let subscribePosts = 0;
 		let permissionCalls = 0;
 		const initialEndpoint =
 			options.initialEndpoint ?? "https://push.example.com/old";
+		// The server's board-wide muted projects. The no-endpoint and any
+		// known-endpoint prefs GET return them; the 404 branch returns no mutes.
+		const muted = [...(options.mutedProjects ?? ["alpha"])];
 		// The server's stored rows, endpoint → classes. The mock answers prefs GETs
 		// from this map, so a test sees exactly what a real server would hold. Only
 		// the old fixture row exists; a fresh or queued endpoint has none until the
@@ -3668,6 +3685,14 @@ describe("NotificationsSection stale push recovery", () => {
 			const target = String(url);
 			if (init?.method === "POST") {
 				posts.push({ url: target, body: JSON.parse(String(init.body)) });
+				// Server truth for the mute save: the board-wide list is replaced.
+				if (target === "/api/notifications/prefs") {
+					const body = JSON.parse(String(init.body)) as {
+						mutedProjects?: string[];
+					};
+					if (body.mutedProjects !== undefined)
+						muted.splice(0, muted.length, ...body.mutedProjects);
+				}
 				if (target === "/api/push/subscribe") {
 					subscribePosts++;
 					if (options.failPostSubscribe && subscribePosts === 1)
@@ -3698,12 +3723,17 @@ describe("NotificationsSection stale push recovery", () => {
 					target,
 					"https://push.example",
 				).searchParams.get("endpoint");
-				if (endpoint === null)
-					return Response.json({ classes: null, mutedProjects: [] });
+				if (endpoint === null) {
+					prefsReads.push({ endpoint: null, classes: null });
+					return Response.json({ classes: null, mutedProjects: muted });
+				}
 				const row = rows.get(endpoint);
-				if (row === undefined)
+				if (row === undefined) {
+					prefsReads.push({ endpoint, classes: "unknown" });
 					return Response.json({ error: "unknown endpoint" }, { status: 404 });
-				return Response.json({ classes: row, mutedProjects: [] });
+				}
+				prefsReads.push({ endpoint, classes: row });
+				return Response.json({ classes: row, mutedProjects: muted });
 			}
 			return Response.json({ classes: null, mutedProjects: [] });
 		}) as unknown as typeof fetch;
@@ -3732,7 +3762,7 @@ describe("NotificationsSection stale push recovery", () => {
 			configurable: true,
 		});
 		globalThis.fetch = fetchMock;
-		const projects = ["alpha"].map(
+		const projects = ["alpha", "beta"].map(
 			(name) =>
 				({
 					name,
@@ -3787,6 +3817,7 @@ describe("NotificationsSection stale push recovery", () => {
 			await run({
 				subscribedKeys,
 				posts,
+				prefsReads,
 				requestPermissionCalls: () => permissionCalls,
 				containerText: () => container.textContent ?? "",
 				containerNode: () => container,
@@ -4141,9 +4172,82 @@ describe("NotificationsSection stale push recovery", () => {
 				expect(
 					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
 				).toBeNull();
+				// Regression guard: the queued endpoint starts with no row, so the
+				// pre-replay prefs reads can only 404 ("unknown"). The replay's
+				// setPrefsReload bump must trigger a post-replay refetch that sees
+				// the row the replay created. Deleting the bump leaves one unknown
+				// read and fails this assertion.
+				const queuedReads = probe.prefsReads.filter(
+					(r) => r.endpoint === "https://push.example.com/new",
+				);
+				expect(queuedReads.length).toBeGreaterThanOrEqual(2);
+				expect(queuedReads[0]!.classes).toBe("unknown");
+				expect(queuedReads[queuedReads.length - 1]!.classes).toEqual({
+					request: true,
+					error: true,
+					complete: true,
+				});
 			},
 			false,
 			{ noInitialSub: true, failPostSubscribe: true, undoRejects: true },
+		);
+	});
+
+	test("a kept subscription keeps the board-wide mutes when the prefs read 404s", async () => {
+		await withPushBrowser(
+			false,
+			async (probe) => {
+				const on = [...probe.containerNode().querySelectorAll("button")].find(
+					(x) => x.textContent?.trim() === "Turn on",
+				);
+				if (on === undefined) throw new Error("no Turn on button");
+				await act(async () => {
+					(on as HTMLButtonElement).click();
+				});
+				// Kept path: the browser holds the subscription, the server has no
+				// row, and the prefs GET 404s.
+				expect(probe.containerText()).toContain("boom");
+				expect(probe.containerText()).toContain("Turn off");
+				// The board-wide mute list stays the truth: alpha still muted, beta
+				// not. The 404 must not fabricate an empty list.
+				const alpha = rowFor(probe.containerNode(), "Mute alpha");
+				const beta = rowFor(probe.containerNode(), "Mute beta");
+				expect(alpha?.checked).toBe(true);
+				expect(beta?.checked).toBe(false);
+				// Toggling beta must send the full board-wide list, not the
+				// fabricated empty set plus beta.
+				await act(async () => {
+					onChangeOf(beta!)({ target: { checked: true } });
+				});
+				const mutePosts = probe.posts.filter(
+					(p) => p.url === "/api/notifications/prefs",
+				);
+				expect(mutePosts).toHaveLength(1);
+				// The harness built this body, so the shape is known: read it
+				// through one named, reasoned cast.
+				const muteBody = mutePosts[0]!.body as { mutedProjects: string[] };
+				expect([...muteBody.mutedProjects].sort()).toEqual(["alpha", "beta"]);
+			},
+			false,
+			{ noInitialSub: true, failPostSubscribe: true, undoRejects: true },
+		);
+	});
+
+	test("an unknown endpoint with no queued record shows the error and keeps the mutes", async () => {
+		await withPushBrowser(
+			false,
+			async (probe) => {
+				// A pruned row (or an older snapshot): the endpoint is genuinely
+				// unknown, so the section reports it.
+				expect(probe.containerText()).toContain("unknown endpoint");
+				// The board-wide mutes still load and show: nothing was fabricated.
+				expect(rowFor(probe.containerNode(), "Mute alpha")?.checked).toBe(true);
+				expect(rowFor(probe.containerNode(), "Mute beta")?.checked).toBe(false);
+			},
+			false,
+			{
+				initialEndpoint: "https://push.example.com/ghost",
+			},
 		);
 	});
 
