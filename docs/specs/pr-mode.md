@@ -250,13 +250,14 @@ step checks the source before it ever opens a PR:
   re-ship re-judges the branch against the same source PR. The ship step
   re-reads the source PR's current head before it judges the card branch —
   a rebase between the park and the reply moves the bot's branch and the
-  stamped sha goes dead — and replaces it on the row; an unwired or failed
-  fetch keeps the stored sha. When Dependabot answers that comment with a
-  cannot-rebase reply (an orphaned PR or one a hand edit took over), the
-  pass rewrites the park reason to: close the pull request, Dependabot
-  reopens it from the current config. The read and the settle stay
-  independent: a carry-parked card whose PR is already adopted still
-  finishes when that PR merges.
+  stamped sha goes dead — and replaces it on the row and in the park's
+  stamp, so a failed later fetch falls back to the refreshed sha, not a
+  dead one; an unwired or failed fetch in the same ship keeps the stored
+  sha. When Dependabot answers that comment with a cannot-rebase reply (an
+  orphaned PR or one a hand edit took over), the pass rewrites the park
+  reason to: close the pull request, Dependabot reopens it from the current
+  config. The read and the settle stay independent: a carry-parked card
+  whose PR is already adopted still finishes when that PR merges.
 
 Cards without a source PR keep the adopt-or-create ship step above; the
 ff-only merge flow is untouched.

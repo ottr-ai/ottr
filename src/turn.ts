@@ -6191,6 +6191,9 @@ export function createTurnLoop(
 			.catch(() => null);
 		if (sha === null || sha === src.headSha) return src.headSha;
 		st.store.updateTask(st.id, { sourcePrHeadSha: sha });
+		// Keep the fresh sha in the ref too: the park's stamp below must not
+		// overwrite it with the stale one the ship started from.
+		src.headSha = sha;
 		st.log(`- source PR #${n} head refreshed to ${sha.slice(0, 7)}`);
 		return sha;
 	}

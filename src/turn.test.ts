@@ -21078,6 +21078,73 @@ describe("turn PR-mode merge settle", () => {
 		);
 	});
 
+	test("a refreshed head survives the park and a later failed fetch (OTTR-809)", async () => {
+		const fetches: unknown[][] = [];
+		let fetchFails = false;
+		let branchTip = "sha-fixed";
+		const opens: unknown[] = [];
+		const { store, loop, task } = prMergeSetup({
+			fetchPrHead: async (...args: unknown[]) => {
+				fetches.push(args);
+				return fetchFails ? "network down" : null;
+			},
+			// Round 1: the bot rebased to "fresh-head" but the card branch holds fixes
+			// on the old head, so the branch diverged and the ship parks.
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/ottr/pr/30"
+					? "fresh-head"
+					: ref === "refs/heads/ott/m"
+						? branchTip
+						: "sha-old",
+			treesEqual: async () => false,
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "stale-head" && tip === "fresh-head",
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a Dependabot PR");
+			},
+			openPr: async (o) => {
+				opens.push(o);
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		// The card parked once with a stale head; Dependabot rebased since.
+		store.updateTask(task.id, {
+			sourcePrNumber: 30,
+			sourcePrUrl: "https://github.com/acme/repo/pull/30",
+			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
+			sourcePrHeadSha: "stale-head",
+			sourcePrCrossRepo: false,
+			sourcePrDependabot: true,
+		});
+		await loop.runTurn(store.name, task.id);
+		const parked = store.getTask(task.id)!;
+		expect(parked.state).toBe("needs_you");
+		expect(parked.needsReason).toContain("@dependabot");
+		// The park keeps the refreshed sha; it does not restore the stale one.
+		expect(parked.sourcePrHeadSha).toBe("fresh-head");
+		expect(fetches).toHaveLength(1);
+		expect(opens).toEqual([]);
+
+		// A reply requeues the card; this time the fetch fails, so the ship falls
+		// back to the preserved head. The branch has since rebased onto the fresh
+		// head, and the ship adopts the PR instead of parking again.
+		fetchFails = true;
+		branchTip = "fresh-head";
+		store.updateTask(task.id, {
+			state: "queued",
+			queuedAt: 2,
+			needsReason: null,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(fetches).toHaveLength(2);
+		expect(opens).toEqual([]);
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(30);
+		expect(after.prHeadSha).toBe("fresh-head");
+	});
+
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {
 		const pushes: unknown[][] = [];
 		let opened = false;
