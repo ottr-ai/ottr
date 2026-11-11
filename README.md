@@ -98,6 +98,11 @@ The board's prompts name skills and rules. A prompt stops with a `needs_you` rep
 
 omp loads `.agents/skills/` from the repo for runs in this checkout. Install a shipped skill into another home with the skills CLI (`npx skills add`). The third-party skills come from their repos with the skills CLI or a data repo.
 
+**Optional shipped skills** — no board prompt needs them; install one into another home with the skills CLI when you want it:
+
+- `llm-to-code` ships in this repo: `.agents/skills/llm-to-code` — moves the fixed steps of an agent workflow into a script and keeps the model only where real interpretation stays, with `scripts/profile-session.ts` as a session cost profiler.
+- `web-perf-audit` ships in this repo: `.agents/skills/web-perf-audit` — verifies generic performance tips against the code with file:line evidence and real size and header measurements, then writes a verdict report.
+
 ## Requirements
 
 - Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)
