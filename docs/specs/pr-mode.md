@@ -314,10 +314,12 @@ that sits on the target. The single-PR read's `base.ref` decides — a merged
 PR keeps the base it merged into: the follow-up's own commit for a
 follow-up whose base is the target at merge time (a legacy card without the
 head branch name, or GitHub's retarget of an open follow-up onto the target
-after the bump merged and its branch was deleted), the source's merge
-commit for a follow-up that still based on the bump branch. A bump-branch
-follow-up that merges after its source parks the card needs_you: its fixes
-sit on the already-merged bump branch and never reach the target. The
+after the bump merged and its branch was deleted); for a follow-up that
+still based on the bump branch, the source's merge commit, and only when
+the follow-up's commit sits in the source merge's history (`targetContains`
+— ancestry, not second-resolution timestamps). A bump-branch follow-up
+whose commit the source merge never carried parks the card needs_you: its
+fixes sit on the already-merged bump branch and never reach the target. The
 follow-up closed without merge parks the card needs_you ("follow-up PR #F
 closed without merging"); the source closed without merge parks it the same
 way while the follow-up waits. The remote card-branch delete still runs
@@ -326,8 +328,9 @@ go only once both PRs merged.
 
 A Dependabot card parked on the rebase handoff (its reason carries "the
 board asked @dependabot to rebase") reads its source PR's comments once per
-window (`listPrComments`, paged up to 1000 comments, parsed as untrusted
-data) so a reply beyond the first page is still seen. When a
+window (`listPrComments`, newest first, paged up to the latest 1000
+comments, parsed as untrusted data) so a reply behind newer comments is
+still seen. When a
 `dependabot[bot]` comment says Dependabot cannot rebase
 (`dependabotCannotRebase` — "That means Dependabot can't rebase it"), the
 park reason becomes: close the pull request, Dependabot reopens it from the

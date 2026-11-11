@@ -445,7 +445,9 @@ describe("listPrComments", () => {
 		const gh: GhFn = async (a) => {
 			calls.push(a);
 			expect(a[0]).toBe("api");
-			expect(a[1]).toBe("repos/o/r/issues/7/comments?per_page=100&page=1");
+			expect(a[1]).toBe(
+				"repos/o/r/issues/7/comments?sort=created&direction=desc&per_page=100&page=1",
+			);
 			return {
 				code: 0,
 				stdout: JSON.stringify([
@@ -485,8 +487,8 @@ describe("listPrComments", () => {
 		expect(out).toHaveLength(101);
 		expect(dependabotCannotRebase(out)).toBe(true);
 		expect(calls.map((c) => c[1])).toEqual([
-			"repos/o/r/issues/7/comments?per_page=100&page=1",
-			"repos/o/r/issues/7/comments?per_page=100&page=2",
+			"repos/o/r/issues/7/comments?sort=created&direction=desc&per_page=100&page=1",
+			"repos/o/r/issues/7/comments?sort=created&direction=desc&per_page=100&page=2",
 		]);
 	});
 

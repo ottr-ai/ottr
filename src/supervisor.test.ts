@@ -64,6 +64,10 @@ interface FakeOps extends SupervisorOps {
 		| null;
 	// prPass: ref -> sha; missing refs read null (git failure / absent ref)
 	targetShas: Record<string, string | null>;
+	// OTTR-809 prPass: "from to" -> targetContains verdict; missing pairs read false
+	containsResults: Record<string, boolean>;
+	// OTTR-809 prPass: every targetContains call's [from, to], in order
+	containsCalls: [string, string][];
 	// prPass: fetchOriginBranch returns this error text instead of null when set
 	fetchErr: string | null;
 	// dependabotPass: fetchPrHead returns this error text instead of null when set
@@ -144,6 +148,8 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		apiCalls: [],
 		apiResult: null,
 		targetShas: {},
+		containsResults: {},
+		containsCalls: [],
 		fetchErr: null,
 		prFetchErr: null,
 		unsaved: null,
@@ -225,6 +231,10 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			ops.targetShas[ref] ??
 			// OTTR-760: a successful dependabot fetch leaves the PR head ref readable.
 			(ref.startsWith("refs/ottr/pr/") ? DEP_PR_SHA : null),
+		targetContains: async (_mainPath, sha, tip) => {
+			ops.containsCalls.push([sha, tip]);
+			return ops.containsResults[`${sha} ${tip}`] ?? false;
+		},
 		fetchOriginBranch: async (_mainPath, branch) => {
 			ops.calls.fetches.push(branch);
 			return ops.fetchErr;
@@ -4000,7 +4010,11 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("both merged in one window, follow-up first finishes with the source's commit", async () => {
+	test("equal merge times finish when the source carries the follow-up", async () => {
+		// Both merges land inside one second: timestamps prove nothing. The ancestry
+		// check does — the follow-up's commit sits in the source merge's history, so
+		// the fixes reached the target and the card finishes with the source's commit
+		// (the one pinned to the CI watch).
 		const store = prModeProject("pr-fu-one-window");
 		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
 		const t = followUpCard(store);
@@ -4021,7 +4035,7 @@ describe("prPass", () => {
 						? {
 								code: 0,
 								stdout: pullBody({
-									mergedAt: "2026-11-07T00:00:00Z",
+									mergedAt: "2026-11-06T00:00:00Z",
 									mergeSha: MERGE_SHA,
 									base: "main",
 								}),
@@ -4029,16 +4043,17 @@ describe("prPass", () => {
 							}
 						: openList([]),
 			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+			containsResults: { [`${OTHER_SHA} ${MERGE_SHA}`]: true },
 		});
 		await tick(
 			new Map([["proj", entry(store, { target: "origin/main" })]]),
 			ops,
 		);
 		const after = store.getTask(t.id)!;
-		// The follow-up's commit reaches the target only through the source's merge,
-		// so the source's commit is the one pinned to the CI watch.
 		expect(after.stage).toBe("done");
 		expect(after.pushSha).toBe(MERGE_SHA);
+		// The ancestry read asked exactly the follow-up-in-source question.
+		expect(ops.containsCalls).toEqual([[OTHER_SHA, MERGE_SHA]]);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		// The follow-up's head is the card's own branch, so it goes; the source head stays.
@@ -4053,7 +4068,10 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("a follow-up that merges after its source parks stranded", async () => {
+	test("equal merge times park stranded when the source never carried the follow-up", async () => {
+		// Same-second merges with the follow-up NOT in the source merge's history:
+		// the source merged first and the follow-up landed on the already-merged bump
+		// branch, so the fixes never reach the target — the card parks, never done.
 		const store = prModeProject("pr-fu-stranded");
 		const t = followUpCard(store);
 		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
@@ -4063,7 +4081,7 @@ describe("prPass", () => {
 					? {
 							code: 0,
 							stdout: pr9Body({
-								mergedAt: "2026-11-07T00:00:00Z",
+								mergedAt: "2026-11-06T00:00:00Z",
 								mergeSha: MERGE_SHA,
 								// The follow-up still based on the bump branch at its merge.
 								base: "ottr/552",

@@ -97,6 +97,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		changedFiles: async () => [],
 		diffStat: async () => [],
 		diffText: async () => null,
+		patchText: async () => null,
 		isClean: async () => true,
 		isIntegrated: async () => true,
 		unsavedWork: async () => null,

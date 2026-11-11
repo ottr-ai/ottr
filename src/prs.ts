@@ -275,11 +275,12 @@ function parsePrComments(body: unknown): IssueComment[] {
 	return out;
 }
 
-/** Reads a pull request's comments (the issues endpoint, oldest first), paging until a
- * short page or the page bound so a reply beyond the first 100 comments is still seen
- * (OTTR-809: the orphan answer may sit late in a long thread). Every field is parsed as
- * untrusted data. Throws on a failed gh call or an unparseable body — the caller (the
- * supervisor's rebase-answer watch) logs and skips. */
+/** Reads a pull request's comments (the issues endpoint), newest first, paging until a
+ * short page or the page bound. Newest-first is the point: a bounded read must see the
+ * recent replies, not the thread's head, so a cannot-rebase reply behind a thousand
+ * older comments is still found (OTTR-809). Every field is parsed as untrusted data.
+ * Throws on a failed gh call or an unparseable body — the caller (the supervisor's
+ * rebase-answer watch) logs and skips. */
 export async function listPrComments(o: {
 	repo: string;
 	number: number;
@@ -293,7 +294,7 @@ export async function listPrComments(o: {
 	for (let page = 1; page <= maxPages; page++) {
 		const r = await gh([
 			"api",
-			`repos/${o.repo}/issues/${o.number}/comments?per_page=100&page=${page}`,
+			`repos/${o.repo}/issues/${o.number}/comments?sort=created&direction=desc&per_page=100&page=${page}`,
 		]);
 		if (r.code !== 0)
 			throw new Error(

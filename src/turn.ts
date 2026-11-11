@@ -961,8 +961,10 @@ export interface TurnOps {
 	/** OTTR-760: true when two commits hold identical trees — the card branch carries exactly the source PR's content. */
 	treesEqual?: typeof treesEqual;
 	/** OTTR-809: the two-dot patch between two commits, or null on failure; reads no HEAD
-	 * and no worktree state, so the fixless-bump compare cannot move with a checkout. */
-	patchText?: typeof patchText;
+	 * and no worktree state, so the fixless-bump compare cannot move with a checkout.
+	 * Required: an unwired op silently reads every rebased bump as fix-bearing and
+	 * duplicates Dependabot PRs. */
+	patchText: typeof patchText;
 	/** OTTR-760: posts one comment on a pull request (gh via runGh); the "@dependabot rebase" handoff and the fixes note. */
 	prComment?: typeof commentOnPullRequest;
 	/** OTTR-781: fetches a legacy Dependabot card's source PR head into refs/ottr/pr/N at ship time. */
@@ -6179,13 +6181,33 @@ export function createTurnLoop(
 		await parkOnSourcePr(st, n, src);
 	}
 
+	/** The patch's content shape: the ordered changed and context lines, without the
+	 * headers, blob hashes and hunk ranges that move when the target advances (an
+	 * unrelated edit elsewhere in the same file changes the post-image blob and the
+	 * line offsets, but not the change). Null when the shape proves nothing (git
+	 * trouble, or a binary-only patch whose body carries no lines). */
+	function patchShape(patch: string | null): string | null {
+		if (patch === null) return null;
+		const lines = patch
+			.split("\n")
+			.filter(
+				(line) =>
+					line.startsWith(" ") ||
+					(line.startsWith("+") && !line.startsWith("+++")) ||
+					(line.startsWith("-") && !line.startsWith("---")),
+			)
+			.join("\n");
+		return lines === "" ? null : lines;
+	}
+
 	/** True when the card branch's patch against the target tip equals the source PR's
 	 * own patch (head^..head) — a cherry-picked or rebased bump with no fixes beyond
 	 * it. Both sides are pure commit-tree diffs (patchText reads no HEAD and no
-	 * worktree state), so neither checkout's position can skew the compare, and the
-	 * card checkout is where the read runs. The two-dot card side is right for the
-	 * promoted paths: the merge prompt rebases or cherry-picks onto the target, so the
-	 * card descends from the target tip and its patch holds exactly the carried work.
+	 * worktree state), compared by content shape, so neither checkout's position nor
+	 * an unrelated edit elsewhere in the same file can skew the compare, and the card
+	 * checkout is where the read runs. The two-dot card side is right for the promoted
+	 * paths: the merge prompt rebases or cherry-picks onto the target, so the card
+	 * descends from the target tip and its patch holds exactly the carried work.
 	 * Git trouble or an unwired op reads as fixes: the follow-up path is the safe
 	 * delivery for work we cannot prove empty. */
 	async function carriesNoFixes(
@@ -6193,8 +6215,6 @@ export function createTurnLoop(
 		head: string,
 		tip: string,
 	): Promise<boolean> {
-		const patchText = ops.patchText;
-		if (patchText === undefined) return false;
 		const headParent = await ops
 			.targetSha(st.e.path, `${head}^`)
 			.catch(() => null);
@@ -6205,8 +6225,12 @@ export function createTurnLoop(
 		// The card checkout is the subject of the read; when it exists, the patch
 		// compare runs there (same object store, never the main checkout's branch).
 		const path = existsSync(st.loc.wt) ? st.loc.wt : st.e.path;
-		const bump = await patchText(path, headParent, head).catch(() => null);
-		const carried = await patchText(path, targetTip, tip).catch(() => null);
+		const bump = patchShape(
+			await ops.patchText(path, headParent, head).catch(() => null),
+		);
+		const carried = patchShape(
+			await ops.patchText(path, targetTip, tip).catch(() => null),
+		);
 		return bump !== null && carried !== null && bump === carried;
 	}
 

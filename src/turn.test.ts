@@ -259,6 +259,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		changedFiles: async () => [],
 		diffStat: async () => [],
 		diffText: async () => null,
+		patchText: async () => null,
 		isClean: async () => true,
 		isIntegrated: async () => true,
 		// OTTR-708: a static snapshot reads unchanged, so the checkout guard never fires
@@ -21427,7 +21428,28 @@ describe("turn PR-mode merge settle", () => {
 		// from the bot head — but the card's diff against the target equals the bump,
 		// so there are no fixes and no second PR: the card adopts and waits.
 		let opened = false;
-		const BUMP = "diff --git a/pkg.lock b/pkg.lock\n+vite 7";
+		// Real-shaped patches whose headers and hunk ranges differ (the unrelated
+		// advance moved them): only the content shape may compare, never the bytes.
+		const bumpPatch = [
+			"diff --git a/pkg.lock b/pkg.lock",
+			"index 1111111..2222222 100644",
+			"--- a/pkg.lock",
+			"+++ b/pkg.lock",
+			"@@ -4,3 +4,3 @@",
+			" c",
+			"-vite 5",
+			"+vite 7",
+		].join("\n");
+		const carriedPatch = [
+			"diff --git a/pkg.lock b/pkg.lock",
+			"index 1111111..3333333 100644",
+			"--- a/pkg.lock",
+			"+++ b/pkg.lock",
+			"@@ -9,3 +9,3 @@",
+			" c",
+			"-vite 5",
+			"+vite 7",
+		].join("\n");
 		const { store, loop, task } = prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/ottr/pr/20"
@@ -21442,10 +21464,11 @@ describe("turn PR-mode merge settle", () => {
 			treesEqual: async () => false,
 			targetContains: async () => false,
 			patchText: async (_m: string, a: string, b: string) =>
-				(a === "pr-head-parent" && b === "pr-head") ||
-				(a === "target-tip" && b === "sha-cherry")
-					? BUMP
-					: "other patch",
+				a === "pr-head-parent" && b === "pr-head"
+					? bumpPatch
+					: a === "target-tip" && b === "sha-cherry"
+						? carriedPatch
+						: "diff --git a/x b/x\n+other",
 			pushBranch: async () => {
 				throw new Error("pushBranch must not run for a clean source bump");
 			},
