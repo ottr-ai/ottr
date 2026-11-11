@@ -8,10 +8,13 @@ accepted
 
 ## Context
 
-Ottr keeps its credentials as plaintext rows in `.tasks/tracker.db`: the GitHub
-token, the API key, the session secret, the per-host git tokens, the GitHub App
-key, and the Alate and Hindsight keys. The per-project `tasks.db` files hold no
-credential fields today. The database snapshots (OTTR-790, `docs/specs/db-backup.md`)
+Ottr keeps its credentials as plaintext fields of the `config` row in
+`.tasks/tracker.db` (src/app.ts, `saveConfig`). The operator enters the GitHub
+token, the per-host git tokens, the GitHub App private key, the Alate key, and
+the Hindsight token. It also enters the secret env values of Settings → Env.
+Each secret env value is the only copy. The board generates the session secret,
+the board API key, and the VAPID key pair of Web Push. The per-project
+`tasks.db` files hold no credential fields today. The database snapshots (OTTR-790, `docs/specs/db-backup.md`)
 copy both databases verbatim, so every snapshot holds the same plaintext. The SSH
 keys live as files under `OTTR_SSH_DIR`. The admin password is a salted scrypt
 hash (src/auth.ts). Only the Jira connection tokens are sealed today, with the
@@ -26,7 +29,8 @@ encrypted, or what the operator must do instead (OTTR-736, topics 67 and 72).
 Two layers protect the data at rest. The user chose both.
 
 1. Field sealing. The token and key fields in `tracker.db` are sealed with the
-   existing `SecretBox`, as the Jira tokens already are. The key stays where it
+   existing `SecretBox`, as the Jira tokens already are. This covers the
+   operator-entered values and the board-generated ones. The key stays where it
    is today: env `OTTR_SECRET_KEY` wins, and `.tasks/secret.key` next to
    `tracker.db` stays as the fallback. When a field is sealed in `tracker.db`,
    the snapshots hold the sealed value too.
@@ -52,7 +56,14 @@ Refused options:
   plaintext values and names this ADR. Until it ships, `tracker.db` and the
   snapshots stay plaintext, and the README keeps the credential-store warning.
 - A lost key, or a changed `OTTR_SECRET_KEY`, makes sealed values unreadable.
-  The board still starts, and the value shows the Jira behavior: enter it again.
+  Operator-entered values show the Jira behavior: the field reads unreadable,
+  and the operator enters the value again. Nothing is deleted.
+- The session secret, the board API key, and the VAPID keys are board-generated.
+  The operator cannot enter them again. When their stored value is unreadable,
+  the board generates new values, saves them sealed, and stays loginable. The
+  operator then copies the new API key to the API clients. New VAPID keys make
+  the browsers re-subscribe for Web Push: a subscription binds to the public
+  key it registered with.
 - A restored snapshot is usable only with its sealing key. The operator backs up
   `.tasks/secret.key` or sets `OTTR_SECRET_KEY` (docs/WORKERS.md).
 - The per-project `tasks.db` files hold no credential fields today. A future
