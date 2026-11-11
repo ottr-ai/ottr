@@ -192,6 +192,10 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		// A neutral default role (no provider lends it) unless a test sets one: the real
 		// modelRoles reads this machine's config.yml, and a worker turn needs a model to run.
 		modelRoles: () => ({ default: "fake/default-model" }),
+		// An empty catalog unless a test sets one: the real modelList spawns this
+		// machine's omp and caches its answer process-wide, which would leak into
+		// every other modelList call in this file and its neighbors.
+		modelList: async () => [],
 		// The work-card check defaults off here: only the work-check tests switch it on, so a
 		// ready work turn settles to merging/queued exactly as before OTTR-28.
 		workCheck: () => false,
@@ -547,7 +551,17 @@ describe("turn loop", () => {
 	});
 
 	test("retro card runs raw prompt with the retro flags and no board, and files its proposal as a held card", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			modelList: async () => [
+				{
+					id: "zai/glm-5.3-flash",
+					selector: "zai/glm-5.3-flash",
+					name: "zai/glm-5.3-flash",
+					contextWindow: null,
+				},
+			],
+		});
 		record.proposal = {
 			prompt: "Add a benchmark for the merge path",
 			model: "zai/glm",
@@ -575,6 +589,8 @@ describe("turn loop", () => {
 		expect(run.env).toEqual({
 			OTTR_RETRO: "1",
 			OTTR_PROJECTS: store.name,
+			// The catalog the proposal's model is checked against at record time.
+			OTTR_MODELS: "zai/glm-5.3-flash",
 		});
 		expect(run.stripBoard).toBe(true);
 		expect(run.tools).toBe("read,grep,glob,report_outcome,propose_task");
@@ -14960,7 +14976,17 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a Review-button review run gets OTTR_REVIEW=1", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			modelList: async () => [
+				{
+					id: "zai/glm-5.3-flash",
+					selector: "zai/glm-5.3-flash",
+					name: "zai/glm-5.3-flash",
+					contextWindow: null,
+				},
+			],
+		});
 		const review = store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
@@ -14968,7 +14994,23 @@ describe("turn survivor round 5 — run setup", () => {
 		);
 		store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
-		expect(record.runs[0]!.env).toEqual({ OTTR_REVIEW: "1" });
+		expect(record.runs[0]!.env).toEqual({
+			OTTR_REVIEW: "1",
+			OTTR_MODELS: "zai/glm-5.3-flash",
+		});
+	});
+
+	test("an unreadable catalog sends no OTTR_MODELS: the record-time check stays shape-only", async () => {
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			modelList: async () => [],
+		});
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		await loop.runTurn(store.name, retro.id);
+		expect(record.runs[0]!.env).toEqual({
+			OTTR_RETRO: "1",
+			OTTR_PROJECTS: store.name,
+		});
 	});
 
 	test("a cancel during worktree creation removes exactly that worktree and starts nothing", async () => {

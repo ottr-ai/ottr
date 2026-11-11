@@ -37,7 +37,7 @@ import {
 	visuallyIdentical,
 } from "./images.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
-import { modelRoles } from "./models.ts";
+import { modelList, modelRoles } from "./models.ts";
 import {
 	DEP_HELD_PROMPT,
 	depResumePrompt,
@@ -824,6 +824,8 @@ export interface TurnOps {
 	workCheck?: () => boolean;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
 	modelRoles?: typeof modelRoles;
+	/** The chat catalog a retro or review run's propose_task checks a model against; overridable for tests. */
+	modelList?: typeof modelList;
 	/** Prepare-phase title generator; overridable for tests. */
 	genTitle?: (
 		prompt: string,
@@ -4715,6 +4717,7 @@ export function createTurnLoop(
 		store: ProjectStore,
 		kind: TurnKind,
 		mx: TurnRunShared,
+		marks: Record<string, string>,
 	): Parameters<TurnOps["startRun"]>[0] {
 		return {
 			meter: ops.hosted !== undefined,
@@ -4742,7 +4745,7 @@ export function createTurnLoop(
 			// and the findings are recorded, not filed — Ottr files them after the run.
 			env: {
 				...route.turnEnv.env,
-				...retroEnvMarks(idn),
+				...marks,
 				// PATH last, so an env.txt value can never shadow the tools link dir.
 				...(route.prep?.pathDir
 					? { PATH: `${route.prep.pathDir}:${process.env.PATH ?? ""}` }
@@ -4853,6 +4856,14 @@ export function createTurnLoop(
 		// or session names its own model (docs/specs/hosted-mode.md section 4). It is the
 		// turn's main run: its final record carries the card outcome and title (M10).
 		const runMeter = openMeter("default", true);
+		// A retro, review or scout run carries its env marks (a retro or review adds
+		// OTTR_MODELS: its proposal files past the card-filing routes' catalog check,
+		// so propose_task must check at record time). Awaited only for these rare
+		// turns; a work turn's spawn path stays synchronous.
+		const marks =
+			idn.retroCard || idn.reviewCard || idn.scout
+				? await retroEnvMarks(idn)
+				: {};
 		const handle = ops.startRun(
 			turnRunStartOptions(
 				ops,
@@ -4868,6 +4879,7 @@ export function createTurnLoop(
 				store,
 				kind,
 				mx,
+				marks,
 			),
 		);
 		mx.entry = handle;
@@ -5022,16 +5034,33 @@ export function createTurnLoop(
 	/** The env marks a retro, review or scout run carries (the extension registers its
 	 * per-kind tools from them; the board env is stripped for a retro, whose proposal
 	 * files here). A retro also carries the board's project names: the proposal's
-	 * project check must fail the call with the list, not the settle (OTTR-787). */
-	function retroEnvMarks(idn: TurnIdentity): Record<string, string> {
+	 * project check must fail the call with the list, not the settle (OTTR-787). A
+	 * retro and a review carry the board's model catalog (OTTR_MODELS): their
+	 * proposals file after the run, past the card-filing routes' catalog check, so
+	 * propose_task must apply the full model rule at record time. */
+	async function retroEnvMarks(
+		idn: TurnIdentity,
+	): Promise<Record<string, string>> {
 		if (idn.retroCard)
 			return {
 				OTTR_RETRO: "1",
 				OTTR_PROJECTS: [...projects.keys()].join("\n"),
+				...(await retroModelsEnv()),
 			};
-		if (idn.reviewCard) return { OTTR_REVIEW: "1" };
+		if (idn.reviewCard)
+			return { OTTR_REVIEW: "1", ...(await retroModelsEnv()) };
 		if (idn.scout) return { OTTR_TRENDING: "1" };
 		return {};
+	}
+
+	/** OTTR_MODELS for a retro or review run: the catalog selectors, newline
+	 *  separated. Absent when the board cannot read the catalog (an empty list):
+	 *  propose_task then checks the selector's shape only. */
+	async function retroModelsEnv(): Promise<Record<string, string>> {
+		const list = await (ops.modelList ?? modelList)();
+		return list.length === 0
+			? {}
+			: { OTTR_MODELS: list.map((m) => m.selector).join("\n") };
 	}
 
 	/** The pinned per-kind run config: the retro skill and yml, the scout's two verdict

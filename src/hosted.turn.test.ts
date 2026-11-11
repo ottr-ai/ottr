@@ -72,6 +72,10 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		drained: () => false,
 		drainedRunner: () => false,
 		modelRoles: () => ({ default: "fake/default-model" }),
+		// An empty catalog unless a test sets one: the real modelList spawns this
+		// machine's omp and caches its answer process-wide, which would leak into
+		// every other modelList call and stall the flushPromises-driven tests.
+		modelList: async () => [],
 		workCheck: () => false,
 		publishSoon: () => {},
 		notifyLog: () => {},

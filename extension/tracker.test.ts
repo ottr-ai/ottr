@@ -99,6 +99,7 @@ const envKeys = [
 	"OTTR_RETRO",
 	"OTTR_REVIEW",
 	"OTTR_TRENDING",
+	"OTTR_MODELS",
 ] as const;
 function setEnv(v: Partial<Record<(typeof envKeys)[number], string>>) {
 	for (const k of envKeys) if (v[k] !== undefined) process.env[k] = v[k];
@@ -709,6 +710,26 @@ describe("propose_task tool", () => {
 		);
 	});
 
+	test("refuses a shaped model the run's catalog does not name, level misses included", async () => {
+		process.env.OTTR_RETRO = "1";
+		process.env.OTTR_MODELS = "zai/glm-5.3-flash\nanthropic/claude-opus-5-5";
+		const tools = fakePi();
+		const unknown = await tools.propose_task!.execute("t1", {
+			prompt: "p",
+			model: "zai/no-such-model",
+		});
+		expect(text(unknown)).toBe(
+			"Error: model zai/no-such-model: unknown model zai/no-such-model. Omit model to use the board default, or pick provider/model from the New task model list.",
+		);
+		const level = await tools.propose_task!.execute("t1", {
+			prompt: "p",
+			model: "zai/glm-5.3-flash:turbo",
+		});
+		expect(text(level)).toContain(
+			"unknown thinking level (use one of off, minimal",
+		);
+	});
+
 	test("rejects non-string, blank and over-400 summary fields", async () => {
 		process.env.OTTR_RETRO = "1";
 		const tools = fakePi();
@@ -773,6 +794,27 @@ describe("propose_task tool in review runs", () => {
 		expect(fakePi().propose_task?.description).toBe(
 			REVIEW_PROPOSE_TOOL_DESCRIPTION,
 		);
+	});
+
+	test("a catalog model with a thinking level records; without the catalog env the shape check stands alone", async () => {
+		process.env.OTTR_REVIEW = "1";
+		process.env.OTTR_MODELS = "zai/glm-5.3-flash\nanthropic/claude-opus-5-5";
+		const tools = fakePi();
+		const levelled = await tools.propose_task!.execute("t1", {
+			prompt: "Bug in src/a.ts",
+			model: "zai/glm-5.3-flash:high",
+			rank: 1,
+		});
+		expect(text(levelled)).toContain("Recorded.");
+		// An old board injects no OTTR_MODELS: the record-time check degrades to the
+		// shape rule, and turn start remains the backstop.
+		delete process.env.OTTR_MODELS;
+		const shaped = await tools.propose_task!.execute("t2", {
+			prompt: "Another",
+			model: "zai/no-such-model",
+			rank: 2,
+		});
+		expect(text(shaped)).toContain("Recorded.");
 	});
 
 	test("absent without either mode env", () => {

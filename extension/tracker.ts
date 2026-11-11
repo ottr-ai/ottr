@@ -147,19 +147,64 @@ function promptValidationError(params: CreateTaskParams): string | null {
 	return null;
 }
 
-// The model name: non-empty when given, and a model id (provider/model). The
-// board's catalog is unknowable here (the extension loads standalone), so the
-// tool checks the turn-start shape rule (src/tokens.ts); the board route checks
-// the catalog and refuses the card with the same fix.
+// The model name: non-empty when given, and a model id the board's catalog names
+// when the run carries it (OTTR_MODELS). create_task files through the board's
+// tasks route, whose filing check applies the catalog rule there; a retro or
+// review run's propose_task files after the run (src/turn.ts), past that route,
+// so the run carries the catalog and this check is the only one.
 function modelValidationError(params: CreateTaskParams): string | null {
 	const model = trimmed(params.model);
 	if (params.model !== undefined && model === "") {
 		return "Error: model must be a non-empty string when given.";
 	}
-	if (model !== "" && model.indexOf("/") <= 0) {
-		return `Error: ${model} is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5.`;
-	}
-	return null;
+	const why =
+		model === "" ? null : modelSelectorError(model, retroKnownModels());
+	return why === null ? null : `Error: ${why}`;
+}
+
+// The board's catalog selectors a retro or review run carries (OTTR_MODELS,
+// newline separated, injected by src/turn.ts). Read per call like
+// retroKnownProjects: the env is fixed for the run, but tests set it after load.
+function retroKnownModels(): string[] {
+	return (process.env.OTTR_MODELS ?? "")
+		.split("\n")
+		.map((n) => n.trim())
+		.filter((n) => n !== "");
+}
+
+// omp thinking levels in model selectors (src/levels.ts THINKING_LEVELS).
+const THINKING_LEVELS = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+	"auto",
+] as const;
+
+// The rule of cardModelError (src/models.ts), inlined because the extension loads
+// standalone: the turn-start shape rule (src/tokens.ts) plus the roles editor's
+// catalog rule against the run's OTTR_MODELS. An empty catalog (an old board, or
+// omp unreadable) checks the shape only, and a bad model then parks at turn start
+// with the reason naming the model and the fix.
+function modelSelectorError(model: string, catalog: string[]): string | null {
+	if (model.indexOf("/") <= 0)
+		return `${model} is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5.`;
+	if (catalog.length === 0) return null;
+	const inCatalog = (s: string) => catalog.includes(s);
+	if (inCatalog(model)) return null;
+	const i = model.lastIndexOf(":");
+	const level = i > 0 ? model.slice(i + 1) : "";
+	const levelKnown = (THINKING_LEVELS as readonly string[]).includes(level);
+	const base = levelKnown ? model.slice(0, i) : model;
+	if (levelKnown && inCatalog(base)) return null;
+	const why =
+		i > 0 && inCatalog(model.slice(0, i))
+			? `unknown thinking level (use one of ${THINKING_LEVELS.join(", ")})`
+			: `unknown model ${base}`;
+	return `model ${model}: ${why}. Omit model to use the board default, or pick provider/model from the New task model list.`;
 }
 
 // The board's project names a retro run's env carries (OTTR_PROJECTS, newline

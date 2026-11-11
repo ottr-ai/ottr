@@ -550,6 +550,9 @@ function mountBoard(
 		workCheck: () => shared.workCheck,
 		// The check role's model; the board reads omp's role config otherwise.
 		modelRoles: () => ({ default: WORK_MODEL, [CHECK_ROLE]: CHECK_MODEL }),
+		// An empty catalog: the real modelList spawns this machine's omp and caches
+		// its answer process-wide, which would leak into the other test files here.
+		modelList: async () => [],
 		// Titles come from another omp run: a fixed title keeps the fake runs to work + check.
 		genTitle: async () => "Add hello file",
 		titleRetryDelayMs: 5,
