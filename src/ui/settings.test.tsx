@@ -16,6 +16,7 @@ import {
 	appChip,
 	asError,
 	dashboardLink,
+	EnvSection,
 	fmtCost,
 	fmtCount,
 	fmtPct,
@@ -2208,6 +2209,7 @@ describe("ProjectsOrderSection", () => {
 type HindsightView = {
 	url: string | null;
 	tokenSet: boolean;
+	tokenReadable: boolean;
 	backend: "hindsight" | "mnemopi";
 	memoryReason: string | null;
 };
@@ -2650,6 +2652,7 @@ describe("HindsightSection memory backend", () => {
 		const { container, unmount } = await mountHindsight({
 			url: null,
 			tokenSet: false,
+			tokenReadable: true,
 			backend: "mnemopi",
 			memoryReason: "mnemopi store not writable: /data/home",
 		});
@@ -2671,6 +2674,7 @@ describe("HindsightSection memory backend", () => {
 		const { container, unmount } = await mountHindsight({
 			url: null,
 			tokenSet: false,
+			tokenReadable: true,
 			backend: "mnemopi",
 			memoryReason: null,
 		});
@@ -2688,6 +2692,7 @@ describe("HindsightSection memory backend", () => {
 		const { container, unmount } = await mountHindsight({
 			url: "http://hindsight.local:8888",
 			tokenSet: true,
+			tokenReadable: true,
 			backend: "hindsight",
 			memoryReason: null,
 		});
@@ -4158,6 +4163,7 @@ type AlateMockHandlers = {
 	config?: {
 		url: string | null;
 		keySet: boolean;
+		keyReadable?: boolean;
 		lastProvisionError?: string | null;
 	};
 	// A Response is handed out on every fetch; a factory builds a fresh one per call
@@ -4216,6 +4222,7 @@ function alateFetchMock(handlers: AlateMockHandlers): typeof fetch {
 			return okJson({
 				url: null,
 				keySet: false,
+				keyReadable: true,
 				lastProvisionError: null,
 				...handlers.config,
 			});
@@ -5344,6 +5351,320 @@ describe("AlateSection provision result", () => {
 			);
 		} finally {
 			await unmount();
+		}
+	});
+});
+
+// OTTR-806: every stored-secret surface says "Token unreadable, enter it again"
+// when the server reports the stored value as unreadable, and stays quiet when
+// it is readable. The wording mirrors the Jira connections' warn chip.
+describe("Unreadable stored secrets", () => {
+	const MSG = "Token unreadable, enter it again";
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+
+	test("GitHub token form shows the message when set and unreadable", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok({
+					tokens: [],
+					globalKey: null,
+					githubApp: null,
+					githubHost: "github.com",
+					githubTokenSet: true,
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: true, tokenReadable: false, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			expect(container.textContent).toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("GitHub token form stays quiet when the token is readable", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok({
+					tokens: [],
+					globalKey: null,
+					githubApp: null,
+					githubHost: "github.com",
+					githubTokenSet: true,
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: true, tokenReadable: true, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			expect(container.textContent).not.toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an unreadable git-host token row shows the message per row", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok({
+					tokens: [
+						{
+							host: "git.corp",
+							username: "bot",
+							tokenSet: true,
+							tokenReadable: false,
+						},
+					],
+					globalKey: null,
+					githubApp: null,
+					githubHost: "github.com",
+					githubTokenSet: true,
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			expect(container.textContent).toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a readable git-host token row shows no message", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok({
+					tokens: [
+						{
+							host: "git.corp",
+							username: "bot",
+							tokenSet: true,
+							tokenReadable: true,
+						},
+					],
+					globalKey: null,
+					githubApp: null,
+					githubHost: "github.com",
+					githubTokenSet: true,
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			expect(container.textContent).not.toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a GitHub App with an unreadable key shows the message and tolerates a null fingerprint", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok({
+					tokens: [],
+					globalKey: null,
+					githubApp: {
+						id: "123456",
+						fingerprint: null,
+						check: null,
+						keyReadable: false,
+					},
+					githubHost: "github.com",
+					githubTokenSet: true,
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			const app = container.querySelector("#github-app-block");
+			expect(app?.textContent).toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a GitHub App with a readable key shows the fingerprint and no message", async () => {
+		const fetchMock = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok({
+					tokens: [],
+					globalKey: null,
+					githubApp: {
+						id: "123456",
+						fingerprint: "SHA256:abc",
+						check: null,
+						keyReadable: true,
+					},
+					githubHost: "github.com",
+					githubTokenSet: true,
+				});
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+		const { container, unmount } = await mountSection(fetchMock);
+		try {
+			const app = container.querySelector("#github-app-block");
+			expect(app?.textContent).toContain("SHA256:abc");
+			expect(app?.textContent).not.toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Hindsight key shows the message when set and unreadable", async () => {
+		const { container, unmount } = await mountHindsight({
+			url: "http://hindsight.local",
+			tokenSet: true,
+			tokenReadable: false,
+			backend: "hindsight",
+			memoryReason: null,
+		});
+		try {
+			expect(container.textContent).toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Hindsight key stays quiet when readable", async () => {
+		const { container, unmount } = await mountHindsight({
+			url: "http://hindsight.local",
+			tokenSet: true,
+			tokenReadable: true,
+			backend: "hindsight",
+			memoryReason: null,
+		});
+		try {
+			expect(container.textContent).not.toContain(MSG);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Alate stored key hides reveal and copy and shows the message when unreadable", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://alate.local", keySet: true, keyReadable: false },
+			}),
+		);
+		try {
+			expect(container.textContent).toContain(MSG);
+			expect(
+				container.querySelector('button[aria-label="Reveal Alate API key"]'),
+			).toBeNull();
+			expect(
+				container.querySelector('button[aria-label="Copy Alate API key"]'),
+			).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Alate stored key keeps the reveal control when readable", async () => {
+		const { container, unmount } = await mountAlate(
+			alateFetchMock({
+				config: { url: "http://alate.local", keySet: true, keyReadable: true },
+			}),
+		);
+		try {
+			expect(container.textContent).not.toContain(MSG);
+			expect(
+				container.querySelector('button[aria-label="Reveal Alate API key"]'),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an unreadable env value shows the message", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (): Promise<Response> =>
+			ok({
+				names: [
+					{ name: "FOO_TOKEN", projects: ["_all"], set: true, readable: false },
+				],
+			})) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<EnvSection />);
+		});
+		try {
+			expect(container.textContent).toContain(MSG);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a readable env value shows no message", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (): Promise<Response> =>
+			ok({
+				names: [
+					{ name: "FOO_TOKEN", projects: ["_all"], set: true, readable: true },
+				],
+			})) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<EnvSection />);
+		});
+		try {
+			expect(container.textContent).not.toContain(MSG);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
 		}
 	});
 });

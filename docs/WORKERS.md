@@ -1472,8 +1472,9 @@ Location:
   the backup dir off the host.
 - The board refuses an `OTTR_BACKUP_DIR` that is equal to or below a worker-mounted root
   (`/workspace`, `/data`, `/root`). It logs one error at boot and makes no backups.
-- A snapshot holds the tokens and keys of `tracker.db`. Protect the backup dir the same way
-  as that file.
+- A snapshot holds the sealed fields of `tracker.db`. Protect the backup dir, and also the
+  sealing key: a restored snapshot is usable only with its sealing key. Back up
+  `.tasks/secret.key` or set `OTTR_SECRET_KEY`.
 
 Restore in the compose stack:
 
@@ -1524,12 +1525,13 @@ A snapshot does not hold these items. After a restore, do this for each:
   `ottr-state` in compose). When they are lost, add the keys again under
   **Settings → Git identity → SSH key** (a project key: in the **Settings** of the project) and confirm
   the host-key fingerprints again.
-- The Jira sealing key `.tasks/secret.key` (used when `OTTR_SECRET_KEY` is not set): when
-  the file is lost, the board makes a new key at boot. The new key cannot open the Jira
-  tokens in the restored `tracker.db`. **Settings → Jira connections** then shows "Token
-  unreadable, enter it again", and each Jira call for that connection answers `409`. Enter
-  the token of each connection again. With the old key file or the same `OTTR_SECRET_KEY`,
-  the tokens open as before.
+- The sealing key `.tasks/secret.key` (used when `OTTR_SECRET_KEY` is not set): when the
+  file is lost, the board makes a new key at boot. The new key cannot open the sealed
+  fields in the restored `tracker.db`. Operator-entered fields show "token unreadable,
+  enter it again", and enter each value again. Board-generated values (API key, session
+  secret, Web Push keys) regenerate at boot: copy the new API key to your API clients, and
+  browsers re-subscribe for Web Push. With the old key file or the same `OTTR_SECRET_KEY`,
+  everything opens as before.
 - The fork mirror caches (`forks/<id>.git`): the next fork run makes them again.
 - The task data on the `ottr-data` volume (sessions, logs, images, handoffs): it is a
   different volume. The restore does not change it, and a lost `ottr-data` volume does not

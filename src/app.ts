@@ -311,7 +311,8 @@ import {
 	WORK_CHECK_ASK_SEND_BACK,
 	workCheckBlockerCounts,
 } from "./scheduler.ts";
-import type { SecretBox } from "./secretBox.ts";
+import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
+import { isSealed, type SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
 import { type BoardTurnFacts, ProjectStore, type TaskPatch } from "./store.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
@@ -2401,12 +2402,12 @@ export function createApp(deps: AppDeps) {
 	/** VAPID keys for Web Push; generated lazily on the first push path so boot stays silent. */
 	let vapid: { publicKey: string; privateKey: string; subject: string } | null =
 		null;
-	/** Alate server settings; key is stored plaintext like apiKey (same trust level). */
+	/** Alate server settings; key is sealed at rest like apiKey (ADR-0011). */
 	let alate: { url: string | null; key: string | null } = {
 		url: null,
 		key: null,
 	};
-	/** GitHub token from onboarding or Settings; stored plaintext like apiKey (same trust level). */
+	/** GitHub token from onboarding or Settings; sealed at rest like apiKey (ADR-0011). */
 	let githubToken: string | null = null;
 	/**
 	 * GitHub host saved in Settings; null = nothing saved, so the env decides. The app
@@ -2416,19 +2417,25 @@ export function createApp(deps: AppDeps) {
 	let savedGithubHost: string | null = null;
 	const bootGithubHostEnv = process.env[GITHUB_HOST_ENV];
 	/**
-	 * Per-host HTTPS tokens for every git host; stored plaintext like
-	 * githubToken (same trust level). One entry per host; the token is handed to git through a
-	 * credential helper env, never through a URL or .git/config.
+	 * Per-host HTTPS tokens for every git host; stored sealed like githubToken (ADR-0011).
+	 * One entry per host; the token is handed to git through a credential helper env, never
+	 * through a URL or .git/config. `unreadable` marks a stored sealed token this boot's box
+	 * cannot open: the row stays in the list (kept blob re-stored by saveConfig) but its
+	 * empty token is never used as a credential.
 	 */
-	let gitTokens: GitToken[] = [];
+	type StoredGitToken = GitToken & { unreadable?: true };
+	let gitTokens: StoredGitToken[] = [];
 	/**
-	 * GitHub App for PR review posts; stored plaintext in the config file like githubToken
-	 * (same trust level), never served back after save. The key joins the git secret set.
+	 * GitHub App for PR review posts; stored sealed in the config file like githubToken
+	 * (ADR-0011), never served back after save. The key joins the git secret set.
+	 * `unreadable` marks a stored sealed key this boot cannot open: fingerprint null, no
+	 * token mint, never a credential; re-entering the pair replaces it.
 	 */
 	let githubApp = null as {
 		id: string;
 		key: string;
-		fingerprint: string;
+		fingerprint: string | null;
+		unreadable?: true;
 	} | null;
 	/** Installation-token mint for githubApp; null whenever the app is unset. Memory only. */
 	let appTokens = null as AppTokenSource | null;
@@ -2574,8 +2581,8 @@ export function createApp(deps: AppDeps) {
 	const GITHUB_TOKEN_ERROR =
 		"a GitHub token is required (ghp_… or github_pat_…, with repo access)";
 	/**
-	 * Hindsight server URL and API key from Settings; stored plaintext like apiKey (same trust
-	 * level). omp reads HINDSIGHT_API_URL and HINDSIGHT_API_TOKEN over the env, and the runner
+	 * Hindsight server URL and API key from Settings; the key is sealed at rest like apiKey
+	 * (ADR-0011, same trust level). omp reads HINDSIGHT_API_URL and HINDSIGHT_API_TOKEN over the env, and the runner
 	 * forwards the board's env to workers, so saved values reach every new turn and beat the
 	 * compose env that seeds them. Without either, the board leaves the env alone: its turns keep
 	 * omp's settings.
@@ -2682,7 +2689,10 @@ export function createApp(deps: AppDeps) {
 	function hindsightView() {
 		return {
 			url: process.env.HINDSIGHT_API_URL || null,
-			tokenSet: Boolean(process.env.HINDSIGHT_API_TOKEN),
+			// The flags read the stored/runtime token, not the env the runner forwards: a
+			// kept-unreadable token counts as set with tokenReadable false (ADR-0011).
+			tokenSet: hindsightToken !== null || keptUnreadable.has("hindsightToken"),
+			tokenReadable: hindsightToken !== null,
 			backend: memoryBackendFromEnv(process.env).backend,
 			memoryReason: memoryHealth?.reason ?? null,
 		};
@@ -3001,7 +3011,10 @@ export function createApp(deps: AppDeps) {
 	function alateView() {
 		return {
 			url: alate.url,
-			keySet: alate.key !== null,
+			// A kept-unreadable key still counts as set; keyReadable says this boot can use
+			// it (ADR-0011).
+			keySet: alate.key !== null || keptUnreadable.has("alateKey"),
+			keyReadable: alate.key !== null,
 			lastProvisionError: alateProvisionError,
 		};
 	}
@@ -3401,7 +3414,12 @@ export function createApp(deps: AppDeps) {
 		if (filedId !== null) idleReviewCardId = filedId;
 	}
 	function saveConfig(): void {
-		deps.gstore.set("config", {
+		// ADR-0011: runtime plaintext goes into the row as-is; sealForStore swaps a null
+		// runtime value back to the kept blob when this boot cannot open the stored one, so
+		// an unrelated save never deletes a credential it cannot read. The walker below is
+		// the only place that produces sealed strings; with no box the row stays plaintext
+		// (legacy degraded mode; the boot migration converges it at the next good boot).
+		const row: Record<string, unknown> = {
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
 			workCheck: deps.shared.workCheck,
@@ -3412,22 +3430,91 @@ export function createApp(deps: AppDeps) {
 			projects: deps.shared.projectPaths,
 			projectOrder: deps.shared.projectOrder,
 			admin,
-			apiKey,
-			sessionSecret,
+			apiKey: sealForStore("apiKey", apiKey),
+			sessionSecret: sealForStore("sessionSecret", sessionSecret),
 			sessions,
-			vapid,
-			alate,
-			githubToken,
+			vapid:
+				vapid === null
+					? null
+					: {
+							...vapid,
+							privateKey: sealForStore("vapidKey", vapid.privateKey),
+						},
+			alate: { url: alate.url, key: sealForStore("alateKey", alate.key) },
+			githubToken: sealForStore("githubToken", githubToken),
 			githubHost: savedGithubHost,
-			gitTokens,
+			gitTokens: gitTokens.map((t) =>
+				t.unreadable === true
+					? {
+							host: t.host,
+							username: t.username,
+							token: keptUnreadable.get(`git:${t.host}`) ?? t.token,
+						}
+					: { ...t, token: sealForStore(`git:${t.host}`, t.token) },
+			),
 			githubApp:
-				githubApp === null ? null : { id: githubApp.id, key: githubApp.key },
-			envValues: deps.shared.envValues,
-			hindsightToken,
+				githubApp === null
+					? null
+					: githubApp.unreadable === true
+						? { id: githubApp.id, key: keptUnreadable.get("githubAppKey") }
+						: {
+								id: githubApp.id,
+								key: sealForStore("githubAppKey", githubApp.key),
+							},
+			envValues: (() => {
+				// Kept-unreadable env blobs go back first: an unrelated save must not delete
+				// a value this boot cannot read. A re-entered value then overwrites its blob.
+				const vals: Record<string, unknown> = {};
+				for (const [key, blob] of keptUnreadable)
+					if (key.startsWith("env:")) vals[key.slice(4)] = blob;
+				for (const [name, value] of Object.entries(deps.shared.envValues))
+					vals[name] = sealForStore(`env:${name}`, value);
+				return vals;
+			})(),
+			hindsightToken: sealForStore("hindsightToken", hindsightToken),
 			hindsightUrl,
-		});
+		};
+		const out =
+			deps.secretBox === undefined
+				? { row: row as unknown, changed: false }
+				: sealStoredConfigRow(row, deps.secretBox);
+		deps.gstore.set("config", out.row);
 	}
+	// ADR-0011 kept-unreadable bookkeeping: when this boot's box cannot open a stored sealed
+	// blob, the blob lands here keyed by field, and saveConfig puts it back so nothing is
+	// deleted. Keys: githubToken, apiKey, sessionSecret, hindsightToken, alateKey,
+	// githubAppKey, git:<host>, env:<name>.
+	const keptUnreadable = new Map<string, unknown>();
+	/** Runtime plaintext of a stored value, or null when absent or unreadable; an unreadable sealed blob is kept in keptUnreadable. Legacy plaintext passes through unsealed. */
+	function loadSecret(field: string, stored: unknown): string | null {
+		if (typeof stored !== "string" || stored === "") return null;
+		if (!isSealed(stored)) return stored;
+		const plain =
+			deps.secretBox === undefined ? null : deps.secretBox.open(stored);
+		if (plain === null) {
+			keptUnreadable.set(field, stored);
+			return null;
+		}
+		return plain;
+	}
+	/** Stored value for saveConfig: the runtime plaintext, or the kept blob when the runtime value is null because this boot cannot read it. Never seals — the walker does. */
+	function sealForStore(field: string, plain: string | null): string | null {
+		if (plain !== null) {
+			keptUnreadable.delete(field);
+			return plain;
+		}
+		return (keptUnreadable.get(field) as string | undefined) ?? null;
+	}
+	// ADR-0011 boot migration: seal every plaintext spot of the stored row before the
+	// restore below reads it. Converge, never destructive; a no-box boot skips it.
+	migrateSealedConfig(deps.gstore, deps.secretBox);
 	loadStoredConfig();
+	// Board-generated secrets this boot could not read are regenerated once: the kept blob
+	// proved a real board wrote them, so a fresh board (no kept blob) keeps onboarding's
+	// "generate on first save" behavior unchanged.
+	if (apiKey === null && keptUnreadable.has("apiKey")) apiKey = newSecret();
+	if (sessionSecret === null && keptUnreadable.has("sessionSecret"))
+		sessionSecret = newSecret();
 
 	/** Shape of the stored "config" row; every field is re-validated at boot. */
 	type StoredConfig = {
@@ -3527,8 +3614,9 @@ export function createApp(deps: AppDeps) {
 		) {
 			admin = { name: p.admin.name, passHash: p.admin.passHash };
 		}
-		if (typeof p.apiKey === "string") apiKey = p.apiKey;
-		if (typeof p.sessionSecret === "string") sessionSecret = p.sessionSecret;
+		if (typeof p.apiKey === "string") apiKey = loadSecret("apiKey", p.apiKey);
+		if (typeof p.sessionSecret === "string")
+			sessionSecret = loadSecret("sessionSecret", p.sessionSecret);
 		if (
 			typeof p.vapid === "object" &&
 			p.vapid !== null &&
@@ -3539,25 +3627,47 @@ export function createApp(deps: AppDeps) {
 			typeof p.vapid.privateKey === "string" &&
 			typeof p.vapid.subject === "string"
 		) {
-			vapid = {
-				publicKey: p.vapid.publicKey,
-				privateKey: p.vapid.privateKey,
-				subject: p.vapid.subject,
-			};
+			// An unreadable private key leaves vapid null: ensureVapid() regenerates the
+			// board-generated pair on the first push path (ADR-0011).
+			const privateKey = loadSecret("vapidKey", p.vapid.privateKey);
+			if (privateKey !== null) {
+				vapid = {
+					publicKey: p.vapid.publicKey,
+					privateKey,
+					subject: p.vapid.subject,
+				};
+			}
 		}
 		if (typeof p.alate === "object" && p.alate !== null) {
 			const a = p.alate as Record<string, unknown>;
 			const str = (v: unknown): string | null =>
 				typeof v === "string" ? v : null;
-			alate = { url: str(a.url), key: str(a.key) };
+			alate = { url: str(a.url), key: loadSecret("alateKey", a.key) };
 		}
 	}
-	/** Restores the git token rows; a malformed row is dropped. */
+	/** Restores the git token rows; a malformed row is dropped, a kept-unreadable sealed token stays as an unusable row (ADR-0011). */
 	function restoreGitTokens(v: unknown): void {
 		if (!Array.isArray(v)) return;
-		const toks: GitToken[] = [];
+		const toks: StoredGitToken[] = [];
 		for (const row of v) {
 			if (typeof row !== "object" || row === null) continue;
+			const raw = (row as Record<string, unknown>).token;
+			if (typeof raw === "string" && isSealed(raw)) {
+				// A sealed blob fails parseGitToken's printable 8-512 rule for longer tokens,
+				// so the shape check runs on a placeholder and the real token opens below.
+				const t = parseGitToken({
+					...(row as Record<string, unknown>),
+					token: "00000000",
+				});
+				if ("error" in t) continue;
+				const token = loadSecret(`git:${t.host}`, raw);
+				toks.push(
+					token === null
+						? { ...t, token: "", unreadable: true }
+						: { ...t, token },
+				);
+				continue;
+			}
 			const t = parseGitToken(row as Record<string, unknown>);
 			if ("error" in t) continue;
 			toks.push(t);
@@ -3566,7 +3676,8 @@ export function createApp(deps: AppDeps) {
 	}
 	/** Restores the GitHub token, host and the app pair. */
 	function restoreGithub(p: StoredConfig): void {
-		if (typeof p.githubToken === "string") githubToken = p.githubToken;
+		if (typeof p.githubToken === "string")
+			githubToken = loadSecret("githubToken", p.githubToken);
 		if (typeof p.githubHost === "string") savedGithubHost = p.githubHost;
 		restoreGitTokens(p.gitTokens);
 		if (
@@ -3575,6 +3686,32 @@ export function createApp(deps: AppDeps) {
 			"id" in p.githubApp &&
 			"key" in p.githubApp
 		) {
+			const stored = p.githubApp as { id: unknown; key: unknown };
+			if (typeof stored.key === "string" && isSealed(stored.key)) {
+				// Sealed key: open it, then validate the plaintext like a legacy pair. A key
+				// this boot cannot open stays as an unreadable row (ADR-0011): the view keeps
+				// the id with a null fingerprint, no token mint is built, and saveConfig
+				// re-stores the kept blob until the pair is re-entered.
+				const plain = loadSecret("githubAppKey", stored.key);
+				if (plain === null) {
+					if (typeof stored.id === "string" && /^\d{1,32}$/.test(stored.id))
+						githubApp = {
+							id: stored.id,
+							key: "",
+							fingerprint: null,
+							unreadable: true,
+						};
+				} else {
+					const v = validateAppCredentials({ ...stored, key: plain });
+					if ("error" in v)
+						logError(
+							"dropping stored GitHub App credentials",
+							new Error(v.error),
+						);
+					else githubApp = v;
+				}
+				return;
+			}
 			// A saved pair re-runs validateAppCredentials; a key that no longer parses is
 			// dropped like a malformed git token row. The log names the drop, never the key.
 			const v = validateAppCredentials(p.githubApp);
@@ -3585,18 +3722,21 @@ export function createApp(deps: AppDeps) {
 			}
 		}
 	}
-	/** Restores the secret env values; a corrupt entry is dropped. */
+	/** Restores the secret env values; a corrupt entry is dropped, a kept-unreadable value is skipped (ADR-0011). */
 	function restoreEnvValues(p: StoredConfig): void {
 		if (typeof p.envValues !== "object" || p.envValues === null) return;
 		const vals: Record<string, string> = {};
 		for (const [name, value] of Object.entries(p.envValues)) {
-			if (ENV_NAME.test(name) && typeof value === "string") vals[name] = value;
+			if (!ENV_NAME.test(name)) continue;
+			const v = loadSecret(`env:${name}`, value);
+			if (v !== null) vals[name] = v;
 		}
 		deps.shared.envValues = vals;
 	}
 	/** Restores the memory token and URL; a wrong type keeps the default. */
 	function restoreHindsight(p: StoredConfig): void {
-		if (typeof p.hindsightToken === "string") hindsightToken = p.hindsightToken;
+		if (typeof p.hindsightToken === "string")
+			hindsightToken = loadSecret("hindsightToken", p.hindsightToken);
 		if (typeof p.hindsightUrl === "string") hindsightUrl = p.hindsightUrl;
 	}
 	/** Boot config load: reads the stored "config" row, validates every field (a wrong type keeps the default), seeds the Alate URL/key from the compose env, and re-applies the GitHub token/host. */
@@ -3626,7 +3766,10 @@ export function createApp(deps: AppDeps) {
 				else console.warn(`alate: refusing the ALATE_URL seed: ${refused}`);
 			}
 		}
-		if (alate.key === null) {
+		// A kept-unreadable alate key blob means the saved value wins over the env seed
+		// until it is re-entered (ADR-0011): seeding here would silently overwrite the
+		// saved pairing the board cannot read this boot.
+		if (alate.key === null && !keptUnreadable.has("alateKey")) {
 			const seedKey = process.env.ALATE_API_KEY?.trim();
 			if (seedKey) alate.key = seedKey;
 		}
@@ -3639,10 +3782,14 @@ export function createApp(deps: AppDeps) {
 	// GIT_SSH_COMMAND names it with forward slashes) and the secret env values. Kept in sync
 	// on each token or env change.
 	function applyGitSecrets(): void {
+		// Kept-unreadable rows contribute nothing: an empty token and no app key are never
+		// credentials (ADR-0011).
 		setGitSecrets([
-			...gitTokens.map((t) => t.token),
+			...gitTokens.filter((t) => t.unreadable !== true).map((t) => t.token),
 			// The app's PEM key redacts out of every git/gh log line and error text.
-			...(githubApp === null ? [] : [githubApp.key]),
+			...(githubApp === null || githubApp.unreadable === true
+				? []
+				: [githubApp.key]),
 			...Object.values(deps.shared.envValues),
 			sshDir,
 			sshDir.replaceAll("\\", "/"),
@@ -3650,7 +3797,9 @@ export function createApp(deps: AppDeps) {
 	}
 	applyGitSecrets();
 	// A boot-adopted app pair gets its token mint here; a route save/reset rebuilds it.
-	if (githubApp !== null) {
+	// An unreadable stored key builds none: parseAppPem would reject the empty key, and
+	// the mint must never run on a credential this boot cannot read.
+	if (githubApp !== null && githubApp.unreadable !== true) {
 		const pem = parseAppPem(githubApp.key);
 		if (pem !== null)
 			appTokens = new AppTokenSource({
@@ -3675,7 +3824,8 @@ export function createApp(deps: AppDeps) {
 		}
 		return gitAuthEnv({
 			ambientHelpers,
-			tokens: gitTokens,
+			// Kept-unreadable token rows stay out of the auth env (ADR-0011).
+			tokens: gitTokens.filter((t) => t.unreadable !== true),
 			key,
 			knownHosts: paths.knownHosts,
 		});
@@ -4906,12 +5056,17 @@ export function createApp(deps: AppDeps) {
 				host: t.host,
 				username: t.username,
 				tokenSet: true,
+				// False when the stored sealed token is kept unreadable this boot (ADR-0011).
+				tokenReadable: t.unreadable !== true,
 			})),
 			// Whether the board itself has a GitHub token, so Settings can offer the click
-			// that stores it as the git-host entry for the configured host.
-			githubTokenSet: githubToken !== null,
+			// that stores it as the git-host entry for the configured host. A kept-unreadable
+			// token still counts as set; tokenReadable says this boot can actually use it.
+			githubTokenSet: githubToken !== null || keptUnreadable.has("githubToken"),
+			githubTokenReadable: githubToken !== null,
 			globalKey: await keyInfo(sshPaths(sshDir).global),
 			// Never the key: the fingerprint is what the user compares against GitHub's.
+			// A kept-unreadable stored key reports fingerprint null and keyReadable false.
 			githubApp:
 				githubApp === null
 					? null
@@ -4919,6 +5074,7 @@ export function createApp(deps: AppDeps) {
 							id: githubApp.id,
 							fingerprint: githubApp.fingerprint,
 							check: appCheck,
+							keyReadable: githubApp.unreadable !== true,
 						},
 			githubHost: githubHostView(),
 		};
@@ -5561,7 +5717,8 @@ export function createApp(deps: AppDeps) {
 	/** A token for the remote's GitHub host: the matching stored git token, else GH_TOKEN on the board host. */
 	function branchRulesToken(host: string, hostKey: string): string | null {
 		return (
-			gitTokens.find((t) => t.host === hostKey)?.token ??
+			gitTokens.find((t) => t.host === hostKey && t.unreadable !== true)
+				?.token ??
 			(host === githubHost().host ? (process.env.GH_TOKEN ?? null) : null)
 		);
 	}
@@ -10960,7 +11117,8 @@ export function createApp(deps: AppDeps) {
 			GET: (req) =>
 				api(req, async () =>
 					json({
-						tokenSet: githubToken !== null,
+						tokenSet: githubToken !== null || keptUnreadable.has("githubToken"),
+						tokenReadable: githubToken !== null,
 						expiresAt: loadReminders().board.expiresAt,
 					}),
 				),
@@ -10980,7 +11138,10 @@ export function createApp(deps: AppDeps) {
 					json({
 						names: listedEnvNames(workersHome).map((row) => ({
 							...row,
-							set: deps.shared.envValues[row.name] !== undefined,
+							set:
+								deps.shared.envValues[row.name] !== undefined ||
+								keptUnreadable.has(`env:${row.name}`),
+							readable: deps.shared.envValues[row.name] !== undefined,
 						})),
 					}),
 				),

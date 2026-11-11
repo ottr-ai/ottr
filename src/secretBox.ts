@@ -48,6 +48,14 @@ function fileKey(dir: string): Buffer {
 	return Buffer.from(t, "hex");
 }
 
+/** Sealed-blob shape check: `v1:<16-hex key id>:<iv>:<tag>:<ct>`. Never proves openability — only that the string carries the seal format. */
+export function isSealed(v: unknown): boolean {
+	if (typeof v !== "string") return false;
+	const parts = v.split(":");
+	if (parts.length !== 5) return false;
+	return parts[0] === "v1" && /^[0-9a-f]{16}$/.test(parts[1] ?? "");
+}
+
 /** Key: env OTTR_SECRET_KEY (32 bytes as 64 hex chars or base64) else `<dir>/secret.key` (created once, 32 random bytes, hex, mode 0o600). Throws on a malformed OTTR_SECRET_KEY. */
 export function loadSecretBox(o: {
 	dir: string;

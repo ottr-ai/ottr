@@ -2039,8 +2039,21 @@ export function expiryLine(expiresAt: string | null): string | null {
 	return `Expires on ${d.toISOString().slice(0, 10)} (in ${n} days)`;
 }
 
+/** Warn note for a stored secret the server cannot decrypt; same wording as the Jira connections. */
+function UnreadableSecretNote() {
+	return (
+		<p className="hint">
+			<span className="jira-conn-warn">
+				<Mark kind="warn" />
+				Token unreadable, enter it again
+			</span>
+		</p>
+	);
+}
 /** Shared write-only secret form: loads whether it is set, saves a pasted value, flashes "Saved". */
-function SecretTokenForm<T extends { tokenSet: boolean }>({
+function SecretTokenForm<
+	T extends { tokenSet: boolean; tokenReadable?: boolean },
+>({
 	endpoint,
 	title,
 	help,
@@ -2069,6 +2082,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 }) {
 	// null until the load answers: a failed check must not claim "Not set".
 	const [tokenSet, setTokenSet] = useState<boolean | null>(null);
+	const [tokenReadable, setTokenReadable] = useState(true);
 	const [expiryText, setExpiryText] = useState<string | null>(null);
 	const [token, setToken] = useState("");
 	const [error, setError] = useState<string | null>(null);
@@ -2081,6 +2095,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 			.then((cfg) => {
 				if (!live) return;
 				setTokenSet(cfg.tokenSet);
+				setTokenReadable(cfg.tokenReadable !== false);
 				setExpiryText(expiry?.(cfg) ?? null);
 				onLoaded?.(cfg);
 			})
@@ -2097,6 +2112,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 			try {
 				const cfg = await post<T>(endpoint, { token: token.trim() });
 				setTokenSet(cfg.tokenSet);
+				setTokenReadable(cfg.tokenReadable !== false);
 				setExpiryText(expiry?.(cfg) ?? null);
 				setToken("");
 				onLoaded?.(cfg);
@@ -2157,6 +2173,7 @@ function SecretTokenForm<T extends { tokenSet: boolean }>({
 							</button>
 						</div>
 					</div>
+					{tokenSet === true && !tokenReadable && <UnreadableSecretNote />}
 				</div>
 			</form>
 			{error !== null && (
@@ -2187,11 +2204,25 @@ export type PendingKeyInfo = {
 	fingerprint: string;
 };
 export type GitHostsView = {
-	tokens: { host: string; username: string; tokenSet: boolean }[];
+	/** The saved app as this view reports it: the fingerprint may be unknown and the key unreadable. */
+	githubApp:
+		| (Omit<GitHubAppView, "fingerprint"> & {
+				fingerprint: string | null;
+				keyReadable: boolean;
+		  })
+		| null;
+	tokens: {
+		host: string;
+		username: string;
+		tokenSet: boolean;
+		/** false => the stored token cannot be decrypted; the user must enter it again. */
+		tokenReadable: boolean;
+	}[];
 	globalKey: KeyInfo | null;
-	githubApp: GitHubAppView | null;
 	githubHost: string | null;
 	githubTokenSet: boolean;
+	/** false => the stored GitHub token cannot be decrypted; the user must enter it again. */
+	githubTokenReadable: boolean;
 };
 
 /** Fetch that keeps the status with the parsed body, so a caller can read a 409's trust data
@@ -2526,6 +2557,8 @@ function gitHostsChip(
 	s: GitHostsView | null,
 ): { label: string; tone: ChipTone } | undefined {
 	if (s === null) return undefined;
+	if (s.tokens.some((t) => t.tokenSet && !t.tokenReadable))
+		return { label: "Token unreadable", tone: "warn" };
 	const n = s.tokens.filter((t) => t.tokenSet).length;
 	return n === 0
 		? { label: "None", tone: "off" }
@@ -2615,9 +2648,19 @@ function GitHubAppBlock({
 						App ID <code>{state.githubApp.id}</code>
 					</div>
 					<AppCheckLines check={state.githubApp.check} />
-					<p className="hint">
-						Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
-					</p>
+					{!state.githubApp.keyReadable ? (
+						<p className="hint">
+							<span className="jira-conn-warn">
+								<Mark kind="warn" />
+								Token unreadable, enter it again
+							</span>
+						</p>
+					) : null}
+					{state.githubApp.fingerprint !== null && (
+						<p className="hint">
+							Key set. Fingerprint <code>{state.githubApp.fingerprint}</code>
+						</p>
+					)}
 					<button type="button" onClick={() => setFormOpen(true)}>
 						Replace key
 					</button>{" "}
@@ -2670,6 +2713,9 @@ function GitHubAppBlock({
 							</label>
 						</DefRow>
 					</div>
+					{state?.githubApp != null && !state.githubApp.keyReadable && (
+						<UnreadableSecretNote />
+					)}
 					<div className="alate-def-actions">
 						{state !== null && state.githubApp !== null && (
 							<button type="button" onClick={() => setFormOpen(false)}>
@@ -2712,7 +2758,11 @@ function GitHubConnectionBlock({
 	token: string;
 	setToken: (v: string) => void;
 	/** The board token check; null while it loads or after it failed (never claim "Not set"). */
-	tokenCfg: { tokenSet: boolean; expiresAt: string | null } | null;
+	tokenCfg: {
+		tokenSet: boolean;
+		tokenReadable?: boolean;
+		expiresAt: string | null;
+	} | null;
 	busy: BusyState;
 	saved: boolean;
 	dirty: boolean;
@@ -2769,6 +2819,9 @@ function GitHubConnectionBlock({
 								/>
 							</label>
 						</DefRow>
+						{tokenCfg?.tokenSet === true && tokenCfg.tokenReadable === false && (
+							<UnreadableSecretNote />
+						)}
 					</div>
 				</div>
 				<div className="alate-def-actions">
@@ -3145,6 +3198,7 @@ export function GitHostsSection({
 	const [ghToken, setGhToken] = useState("");
 	const [ghTokenCfg, setGhTokenCfg] = useState<{
 		tokenSet: boolean;
+		tokenReadable?: boolean;
 		expiresAt: string | null;
 	} | null>(null);
 	const [ghSaved, flashGhSaved] = useFlash(1500);
@@ -3152,7 +3206,11 @@ export function GitHostsSection({
 		let live = true;
 		fetch("/api/settings/github-token")
 			.then((res) =>
-				unwrap<{ tokenSet: boolean; expiresAt: string | null }>(res),
+				unwrap<{
+					tokenSet: boolean;
+					tokenReadable?: boolean;
+					expiresAt: string | null;
+				}>(res),
 			)
 			.then((cfg) => {
 				if (live) setGhTokenCfg(cfg);
@@ -3183,6 +3241,7 @@ export function GitHostsSection({
 				if (ghToken.trim() !== "") {
 					const cfg = await post<{
 						tokenSet: boolean;
+						tokenReadable?: boolean;
 						expiresAt: string | null;
 					}>("/api/settings/github-token", { token: ghToken.trim() });
 					setGhTokenCfg(cfg);
@@ -3293,6 +3352,12 @@ export function GitHostsSection({
 								</td>
 								<td>{t.username}</td>
 								<td>
+									{t.tokenSet && !t.tokenReadable ? (
+										<span className="jira-conn-warn">
+											<Mark kind="warn" />
+											Token unreadable, enter it again
+										</span>
+									) : null}{" "}
 									<button
 										type="button"
 										onClick={() => {
@@ -4065,10 +4130,16 @@ function SshKeySection({ project }: { project: ProjectView }) {
 }
 
 /** One env name as GET /api/settings/env reports it. */
-type EnvNameRow = { name: string; projects: string[]; set: boolean };
+type EnvNameRow = {
+	name: string;
+	projects: string[];
+	set: boolean;
+	/** false => the stored value cannot be decrypted; the user must enter it again. */
+	readable: boolean;
+};
 
 /** Settings "Env" section: one secret value per env.txt name; values never come back after save. */
-function EnvSection() {
+export function EnvSection() {
 	const [rows, setRows] = useState<EnvNameRow[] | null>(null);
 	const [values, setValues] = useState<Record<string, string>>({});
 	const [error, setError] = useState<string | null>(null);
@@ -4104,10 +4175,12 @@ function EnvSection() {
 			status={
 				rows === null || rows.length === 0
 					? undefined
-					: {
-							label: `${rows.filter((r) => r.set).length} of ${rows.length} set`,
-							tone: rows.every((r) => r.set) ? "ok" : "warn",
-						}
+					: rows.some((r) => r.set && !r.readable)
+						? { label: "Value unreadable", tone: "warn" }
+						: {
+								label: `${rows.filter((r) => r.set).length} of ${rows.length} set`,
+								tone: rows.every((r) => r.set) ? "ok" : "warn",
+							}
 			}
 			hint={
 				<>
@@ -4170,6 +4243,7 @@ function EnvSection() {
 										Save
 									</button>
 								</div>
+								{row.set && !row.readable && <UnreadableSecretNote />}
 							</div>
 						))}
 					</div>
@@ -5899,6 +5973,8 @@ export function ModelRolesSection() {
 type HindsightView = {
 	url: string | null;
 	tokenSet: boolean;
+	/** false => the stored key cannot be decrypted; the user must enter it again. */
+	tokenReadable: boolean;
 	backend: "hindsight" | "mnemopi";
 	memoryReason: string | null;
 };
@@ -6358,6 +6434,7 @@ export function AlateSection() {
 	const [conn, setConn] = useState("");
 	const [health, setHealth] = useState<AlateHealthState | null>(null);
 	const [keySet, setKeySet] = useState(false);
+	const [keyReadable, setKeyReadable] = useState(true);
 	const [key, setKey] = useState("");
 	const [lastErr, setLastErr] = useState<string | null>(null);
 	const [saved, flashSaved] = useFlash(1500);
@@ -6541,6 +6618,7 @@ export function AlateSection() {
 				unwrap<{
 					url: string | null;
 					keySet: boolean;
+					keyReadable: boolean;
 					lastProvisionError: string | null;
 				}>(res),
 			)
@@ -6549,6 +6627,7 @@ export function AlateSection() {
 				setUrl(cfg.url ?? "");
 				setConn(cfg.url ?? "");
 				setKeySet(cfg.keySet);
+				setKeyReadable(cfg.keyReadable);
 				setLoaded(true);
 				setLastErr(cfg.lastProvisionError);
 				loadHealth(cfg.url ?? "", () => live);
@@ -6571,11 +6650,13 @@ export function AlateSection() {
 			const cfg = await post<{
 				url: string | null;
 				keySet: boolean;
+				keyReadable: boolean;
 				lastProvisionError: string | null;
 			}>("/api/alate", body);
 			setUrl(cfg.url ?? "");
 			setConn(cfg.url ?? "");
 			setKeySet(cfg.keySet);
+			setKeyReadable(cfg.keyReadable);
 			setLastErr(cfg.lastProvisionError);
 			loadHealth(cfg.url ?? "");
 			setKey("");
@@ -6702,7 +6783,8 @@ export function AlateSection() {
 							/>
 						</label>
 					</div>
-					{conn !== "" && keySet && (
+					{conn !== "" && keySet && !keyReadable && <UnreadableSecretNote />}
+					{conn !== "" && keySet && keyReadable && (
 						<StoredKeyRow
 							storedKey={storedKey}
 							reveal={reveal}

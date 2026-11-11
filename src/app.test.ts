@@ -2964,6 +2964,7 @@ describe("alate routes", () => {
 		expect(await res.json()).toEqual({
 			url: null,
 			keySet: false,
+			keyReadable: false,
 			lastProvisionError: null,
 		});
 	});
@@ -2977,6 +2978,7 @@ describe("alate routes", () => {
 		expect(await res.json()).toEqual({
 			url: alateUrl,
 			keySet: true,
+			keyReadable: true,
 			lastProvisionError: null,
 		});
 		const raw = await (await get("/api/alate")).text();
@@ -4498,6 +4500,7 @@ describe("alate env seeding", () => {
 			expect(await (await m.call("/api/alate")).json()).toEqual({
 				url: standIn.url.origin,
 				keySet: true,
+				keyReadable: true,
 				lastProvisionError: null,
 			});
 			// Write-only: the view says the key is set, never what it is.
@@ -4528,6 +4531,7 @@ describe("alate env seeding", () => {
 		expect(await (await m2.call("/api/alate")).json()).toEqual({
 			url: "http://127.0.0.1:9",
 			keySet: true,
+			keyReadable: true,
 			lastProvisionError: null,
 		});
 		expect((await m2.call("/api/alate/provision", {})).status).toBe(502);
@@ -4547,6 +4551,7 @@ describe("alate env seeding", () => {
 			expect(await (await m.call("/api/alate")).json()).toEqual({
 				url: null,
 				keySet: true,
+				keyReadable: true,
 				lastProvisionError: null,
 			});
 			const res = await m.call("/api/alate/provision", {});
@@ -4587,6 +4592,7 @@ describe("alate url policy", () => {
 			expect(await (await m.call("/api/alate")).json()).toEqual({
 				url: staleUrl,
 				keySet: true,
+				keyReadable: true,
 				lastProvisionError: null,
 			});
 			const res = await m.call("/api/alate/provision", {});
@@ -7543,6 +7549,7 @@ describe("github token", () => {
 		// Write-only: the views say whether it is set, never what it is.
 		expect(await (await call("/api/settings/github-token")).json()).toEqual({
 			tokenSet: true,
+			tokenReadable: true,
 			expiresAt: null,
 		});
 		expect(await (await call("/api/state")).text()).not.toContain(first);
@@ -7579,8 +7586,8 @@ describe("settings env", () => {
 		expect(before.status).toBe(200);
 		expect(await before.json()).toEqual({
 			names: [
-				{ name: "API_KEY", projects: ["_all", "p1"], set: false },
-				{ name: "DB_PASS", projects: ["_all"], set: false },
+				{ name: "API_KEY", projects: ["_all", "p1"], set: false, readable: false },
+				{ name: "DB_PASS", projects: ["_all"], set: false, readable: false },
 			],
 		});
 		const value = "s3cret-env-value";
@@ -7598,8 +7605,8 @@ describe("settings env", () => {
 		// The parsed answer and its raw body never hold the value.
 		expect(JSON.parse(text)).toEqual({
 			names: [
-				{ name: "API_KEY", projects: ["_all", "p1"], set: true },
-				{ name: "DB_PASS", projects: ["_all"], set: false },
+				{ name: "API_KEY", projects: ["_all", "p1"], set: true, readable: true },
+				{ name: "DB_PASS", projects: ["_all"], set: false, readable: false },
 			],
 		});
 		expect(text).not.toContain(value);
@@ -7738,6 +7745,7 @@ describe("hindsight settings", () => {
 		expect(await (await get("/api/settings/hindsight")).json()).toEqual({
 			url,
 			tokenSet: true,
+			tokenReadable: true,
 			// The save's fresh check against the stand-in answered 2xx.
 			backend: "hindsight",
 			memoryReason: null,
@@ -7802,6 +7810,7 @@ describe("hindsight settings", () => {
 		expect(await (await get("/api/settings/hindsight")).json()).toEqual({
 			url: otherUrl,
 			tokenSet: true,
+			tokenReadable: true,
 			backend: "hindsight",
 			memoryReason: null,
 		});
@@ -7815,6 +7824,7 @@ describe("hindsight settings", () => {
 		expect(await (await get("/api/settings/hindsight")).json()).toEqual({
 			url: firstUrl,
 			tokenSet: true,
+			tokenReadable: true,
 			backend: "hindsight",
 			memoryReason: null,
 		});
@@ -7842,7 +7852,8 @@ describe("hindsight settings", () => {
 				await (await booted.call("/api/settings/hindsight")).json(),
 			).toEqual({
 				url: standInUrl,
-				tokenSet: true,
+				tokenSet: false,
+				tokenReadable: false,
 				backend: "hindsight",
 				memoryReason: null,
 			});
@@ -7859,7 +7870,8 @@ describe("hindsight settings", () => {
 				await (await booted.call("/api/settings/hindsight")).json(),
 			).toEqual({
 				url: null,
-				tokenSet: true,
+				tokenSet: false,
+				tokenReadable: false,
 				backend: "mnemopi",
 				memoryReason: null,
 			});
@@ -7974,6 +7986,7 @@ describe("hindsight settings", () => {
 			expect(await res.json()).toEqual({
 				url: `http://127.0.0.1:${healthy.port}`,
 				tokenSet: true,
+				tokenReadable: true,
 				backend: "hindsight",
 				memoryReason: null,
 			});
@@ -15022,7 +15035,7 @@ describe("git-host tokens", () => {
 		expect(res.status).toBe(200);
 		const saved = (await res.json()) as HostsView;
 		expect(saved.tokens).toEqual([
-			{ host: "gitlab.com", username: "oauth2", tokenSet: true },
+			{ host: "gitlab.com", username: "oauth2", tokenSet: true, tokenReadable: true },
 		]);
 		// Write-only: no view ever carries the token itself.
 		expect(await (await m.call("/api/git-hosts")).text()).not.toContain(
@@ -15038,7 +15051,7 @@ describe("git-host tokens", () => {
 		expect(again.status).toBe(200);
 		const replaced = (await again.json()) as HostsView;
 		expect(replaced.tokens).toEqual([
-			{ host: "gitlab.com", username: "deploy", tokenSet: true },
+			{ host: "gitlab.com", username: "deploy", tokenSet: true, tokenReadable: true },
 		]);
 		const del = await m.call("/api/git-hosts/tokens/gitlab.com", undefined, {
 			method: "DELETE",
@@ -15316,7 +15329,7 @@ describe("POST /api/git-hosts/github-token", () => {
 			expect(res.status).toBe(200);
 			const view = (await res.json()) as HostsView;
 			expect(view.tokens).toEqual([
-				{ host: "github.com", username: "x-access-token", tokenSet: true },
+				{ host: "github.com", username: "x-access-token", tokenSet: true, tokenReadable: true },
 			]);
 		});
 	});
@@ -15356,7 +15369,7 @@ describe("POST /api/git-hosts/github-token", () => {
 			expect(res.status).toBe(200);
 			const view = (await res.json()) as HostsView;
 			expect(view.tokens).toEqual([
-				{ host: "acme.ghe.com", username: "x-access-token", tokenSet: true },
+				{ host: "acme.ghe.com", username: "x-access-token", tokenSet: true, tokenReadable: true },
 			]);
 		} finally {
 			globalThis.fetch = realFetch;
@@ -16569,6 +16582,7 @@ describe("token expiry reminders", () => {
 		expect(await save.json()).toEqual({ tokenSet: true, expiresAt: EXP });
 		expect(await (await call("/api/settings/github-token")).json()).toEqual({
 			tokenSet: true,
+			tokenReadable: true,
 			expiresAt: EXP,
 		});
 		pushSends.length = 0;
@@ -16623,6 +16637,7 @@ describe("token expiry reminders", () => {
 		probeFail = false;
 		expect(await (await call("/api/settings/github-token")).json()).toEqual({
 			tokenSet: true,
+			tokenReadable: true,
 			expiresAt: EXP,
 		});
 		const kept = JSON.parse(readFileSync(remindersFile, "utf8")) as {
@@ -16660,6 +16675,7 @@ describe("token expiry reminders", () => {
 		}
 		expect(await (await m.call("/api/settings/github-token")).json()).toEqual({
 			tokenSet: true,
+			tokenReadable: true,
 			expiresAt: EXP,
 		});
 	});
@@ -16699,6 +16715,7 @@ describe("token expiry reminders", () => {
 		// A failed probe keeps the stored date; the log says what failed, why and what to do.
 		expect(await (await m.call("/api/settings/github-token")).json()).toEqual({
 			tokenSet: true,
+			tokenReadable: true,
 			expiresAt: EXP,
 		});
 		expect(seen.map(String).join("\n")).toContain(

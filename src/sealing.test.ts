@@ -1,0 +1,373 @@
+import { Database } from "bun:sqlite";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Server } from "bun";
+import { createApp } from "./app.ts";
+import { GlobalStore } from "./globalStore.ts";
+import { isSealed, loadSecretBox, type SecretBox } from "./secretBox.ts";
+
+// ADR-0011 app-level sealing: the config row's token/key fields are sealed at rest with the
+// real SecretBox + GlobalStore, booted through createApp (loopback, so no auth wall).
+
+const root = mkdtempSync(join(tmpdir(), "ottr-sealing-"));
+const home = mkdtempSync(join(tmpdir(), "ottr-sealing-home-"));
+// Pinned board omp home and agent dir: boot never touches the real ~/.omp.
+process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+mkdirSync(join(home, "agent"), { recursive: true });
+writeFileSync(join(home, "agent", "config.yml"), "modelRoles: {}\n");
+process.env.PI_CODING_AGENT_DIR = join(home, "agent");
+// One project env list naming HS_TOKEN, so the env route lists the stored spot.
+const workersHome = join(root, "workers");
+mkdirSync(join(workersHome, ".ottr", "workers", "w1"), { recursive: true });
+writeFileSync(
+	join(workersHome, ".ottr", "workers", "w1", "env.txt"),
+	"HS_TOKEN\n",
+);
+
+const box = loadSecretBox({
+	dir: join(root, "board"),
+	env: { OTTR_SECRET_KEY: "ab".repeat(32) },
+});
+// A different board key: a boot with this box cannot open what the first one sealed.
+const wrongBox = loadSecretBox({
+	dir: join(root, "other"),
+	env: { OTTR_SECRET_KEY: "ef".repeat(32) },
+});
+
+const API_KEY = "board-api-plain-9f3a";
+const SESSION = "session-secret-plain-9f3a";
+const GH_TOKEN = `ghp_${"a".repeat(36)}`;
+const ALATE_KEY = "alate-key-plain-9f3a";
+const GIT_TOKEN = "git-token-plain-9f3a";
+const ENV_VALUE = "env-value-plain-9f3a";
+const HS_TOKEN = "hindsight-plain-9f3a";
+
+/** A fully populated plaintext config row. */
+function plainRow(): Record<string, unknown> {
+	return {
+		maxTotal: 3,
+		reviewCheck: true,
+		workCheck: true,
+		idleReviews: true,
+		trendingScan: true,
+		commitIdentity: null,
+		removed: [],
+		projects: [],
+		projectOrder: [],
+		admin: { name: "op", passHash: "scrypt-hash" },
+		apiKey: API_KEY,
+		sessionSecret: SESSION,
+		sessions: [],
+		vapid: null,
+		alate: { url: "http://127.0.0.1:9", key: ALATE_KEY },
+		githubToken: GH_TOKEN,
+		githubHost: "github.com",
+		gitTokens: [{ host: "github.com", username: "u", token: GIT_TOKEN }],
+		githubApp: null,
+		envValues: { HS_TOKEN: ENV_VALUE },
+		hindsightToken: HS_TOKEN,
+		hindsightUrl: "http://127.0.0.1:9",
+	};
+}
+
+/** The row with every ADR-0011 spot sealed under the given box. */
+function sealedRow(b: SecretBox): Record<string, unknown> {
+	const r = plainRow();
+	r.apiKey = b.seal(API_KEY);
+	r.sessionSecret = b.seal(SESSION);
+	r.githubToken = b.seal(GH_TOKEN);
+	r.hindsightToken = b.seal(HS_TOKEN);
+	r.alate = { url: "http://127.0.0.1:9", key: b.seal(ALATE_KEY) };
+	r.gitTokens = [
+		{ host: "github.com", username: "u", token: b.seal(GIT_TOKEN) },
+	];
+	r.envValues = { HS_TOKEN: b.seal(ENV_VALUE) };
+	return r;
+}
+
+function storedRow(g: GlobalStore): Record<string, unknown> {
+	const row = g.get<Record<string, unknown>>("config");
+	if (typeof row !== "object" || row === null)
+		throw new Error("no config row stored");
+	return row;
+}
+
+const servers: Server<undefined>[] = [];
+const stores: GlobalStore[] = [];
+const databases: Database[] = [];
+
+interface Boot {
+	call: (
+		path: string,
+		body?: unknown,
+		method?: string,
+	) => Promise<{
+		status: number;
+		text: string;
+		json: Record<string, unknown>;
+	}>;
+}
+
+function boot(gstore: GlobalStore, secretBox?: SecretBox): Boot {
+	const app = createApp({
+		gstore,
+		defaultDir: root,
+		// Server-only ssh state and env.txt lists: root subdirs, never the real home.
+		sshDir: join(root, "ssh"),
+		workersHome,
+		projects: new Map(),
+		cancel: async () => ({ removed: true }),
+		stopTurn: async () => ({ ok: true }),
+		finishKept: async () => ({ ok: true }),
+		claimedPids: () => new Set<number>(),
+		schedule: () => {},
+		serverVersion: "test",
+		port: 0,
+		publicHosts: [],
+		shared: {
+			maxTotalRuns: 3,
+			reviewCheck: true,
+			workCheck: true,
+			idleReviews: true,
+			trendingScan: true,
+			commitIdentity: null,
+			removedPaths: [],
+			projectPaths: [],
+			projectOrder: [],
+			envValues: {},
+		},
+		serverRef: { current: undefined },
+		secretBox,
+		githubTokenExpiry: async () => null,
+	});
+	const srv = Bun.serve({ port: 0, ...app.serveOptions });
+	app.serverRef.current = srv;
+	servers.push(srv);
+	return {
+		call: async (path, body, method) => {
+			const res = await fetch(new URL(path, srv.url), {
+				method: method ?? (body === undefined ? "GET" : "POST"),
+				headers: {
+					"content-type": "application/json",
+					Host: "127.0.0.1:0",
+					Origin: "http://127.0.0.1:0",
+				},
+				body: body === undefined ? undefined : JSON.stringify(body),
+			});
+			const text = await res.text();
+			return {
+				status: res.status,
+				text,
+				json: text ? (JSON.parse(text) as Record<string, unknown>) : {},
+			};
+		},
+	};
+}
+
+/** A git token row's readable flag from the git-hosts view. */
+function tokenRow(json: Record<string, unknown>): Record<string, unknown> {
+	const tokens = json.tokens as Record<string, unknown>[];
+	return tokens[0]!;
+}
+
+afterAll(() => {
+	for (const s of servers) s.stop(true);
+	for (const d of databases) d.close();
+	for (const g of stores) g.close();
+	delete process.env.OTTR_BOARD_OMP_HOME;
+	delete process.env.PI_CODING_AGENT_DIR;
+	delete process.env.GH_TOKEN;
+	delete process.env.HINDSIGHT_API_URL;
+	delete process.env.HINDSIGHT_API_TOKEN;
+	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	rmSync(home, { recursive: true, force: true, maxRetries: 5 });
+});
+
+describe("ADR-0011 config row sealing", () => {
+	test("a plaintext row is sealed in the store after a boxed boot", () => {
+		const g = GlobalStore.open(join(root, "g-plain"));
+		stores.push(g);
+		g.set("config", plainRow());
+		boot(g, box);
+		const row = storedRow(g);
+		expect(isSealed(row.apiKey as string)).toBe(true);
+		expect(isSealed(row.sessionSecret as string)).toBe(true);
+		expect(isSealed(row.githubToken as string)).toBe(true);
+		expect(isSealed(row.hindsightToken as string)).toBe(true);
+		expect(isSealed((row.alate as Record<string, string>).key)).toBe(true);
+		expect(row.vapid).toBeNull();
+		for (const t of row.gitTokens as Record<string, string>[])
+			expect(isSealed(t.token)).toBe(true);
+		for (const v of Object.values(row.envValues as Record<string, string>))
+			expect(isSealed(v)).toBe(true);
+		// The runtime opened the row: the stored values come back as plaintext.
+		expect(box.open(row.apiKey as string)).toBe(API_KEY);
+		expect(box.open((row.alate as Record<string, string>).key as string)).toBe(
+			ALATE_KEY,
+		);
+		expect(
+			box.open((row.gitTokens as Record<string, string>[])[0]!.token as string),
+		).toBe(GIT_TOKEN);
+	});
+
+	test("the stored apiKey is live at runtime after boot", async () => {
+		const g = GlobalStore.open(join(root, "g-apikey"));
+		stores.push(g);
+		g.set("config", plainRow());
+		const app = boot(g, box);
+		const res = await app.call("/api/settings/api-key");
+		expect(res.status).toBe(200);
+		expect(res.json.apiKey).toBe(API_KEY);
+	});
+
+	test("a wrong-key boot reports set+unreadable and regenerates apiKey", async () => {
+		const g = GlobalStore.open(join(root, "g-wrong"));
+		stores.push(g);
+		const seeded = sealedRow(box);
+		g.set("config", seeded);
+		const app = boot(g, wrongBox);
+
+		// The board still starts: an open GET answers 200.
+		expect((await app.call("/api/boot")).status).toBe(200);
+
+		const gh = await app.call("/api/settings/github-token");
+		expect(gh.json.tokenSet).toBe(true);
+		expect(gh.json.tokenReadable).toBe(false);
+
+		const hosts = await app.call("/api/git-hosts");
+		expect(tokenRow(hosts.json).tokenSet).toBe(true);
+		expect(tokenRow(hosts.json).tokenReadable).toBe(false);
+		expect(hosts.json.githubTokenSet).toBe(true);
+		expect(hosts.json.githubTokenReadable).toBe(false);
+
+		const env = await app.call("/api/settings/env");
+		const envRow = (env.json.names as Record<string, unknown>[]).find(
+			(r) => r.name === "HS_TOKEN",
+		);
+		expect(envRow).toBeDefined();
+		expect(envRow?.set).toBe(true);
+		expect(envRow?.readable).toBe(false);
+
+		const alate = await app.call("/api/alate");
+		expect(alate.json.keySet).toBe(true);
+		expect(alate.json.keyReadable).toBe(false);
+
+		const hs = await app.call("/api/settings/hindsight");
+		expect(hs.json.tokenSet).toBe(true);
+		expect(hs.json.tokenReadable).toBe(false);
+
+		// No settings response holds an operator-entered plaintext or a stored sealed blob.
+		const blobs = [
+			seeded.githubToken,
+			seeded.hindsightToken,
+			(seeded.alate as Record<string, string>).key,
+			(seeded.gitTokens as Record<string, string>[])[0]!.token,
+			(seeded.envValues as Record<string, string>).HS_TOKEN,
+		];
+		for (const body of [gh.text, hosts.text, env.text, alate.text, hs.text]) {
+			for (const secret of [
+				GH_TOKEN,
+				ALATE_KEY,
+				GIT_TOKEN,
+				ENV_VALUE,
+				HS_TOKEN,
+			])
+				expect(body).not.toContain(secret);
+			for (const blob of blobs) expect(body).not.toContain(blob as string);
+		}
+
+		// An unrelated save (session-secret rotation) keeps every unreadable blob.
+		const rotation = await app.call("/api/settings/session-secret", {}, "POST");
+		expect(rotation.status).toBe(200);
+		const row = storedRow(g);
+		expect(row.githubToken).toBe(seeded.githubToken);
+		expect((row.alate as Record<string, string>).key).toBe(
+			(seeded.alate as Record<string, string>).key,
+		);
+		expect((row.gitTokens as Record<string, string>[])[0]!.token).toBe(
+			(seeded.gitTokens as Record<string, string>[])[0]!.token,
+		);
+		expect((row.envValues as Record<string, string>).HS_TOKEN).toBe(
+			(seeded.envValues as Record<string, string>).HS_TOKEN,
+		);
+		expect(row.hindsightToken).toBe(seeded.hindsightToken);
+		// The board-generated apiKey was regenerated: it opens under the new key and
+		// differs from the old plaintext.
+		expect(isSealed(row.apiKey as string)).toBe(true);
+		const fresh = wrongBox.open(row.apiKey as string);
+		expect(fresh).not.toBeNull();
+		expect(fresh).not.toBe(API_KEY);
+	});
+
+	test("re-entering the GitHub token replaces an unreadable one", async () => {
+		const g = GlobalStore.open(join(root, "g-reenter"));
+		stores.push(g);
+		g.set("config", sealedRow(box));
+		const app = boot(g, wrongBox);
+		const NEW = `ghp_${"b".repeat(36)}`;
+		const save = await app.call("/api/settings/github-token", { token: NEW });
+		expect(save.status).toBe(200);
+		const gh = await app.call("/api/settings/github-token");
+		expect(gh.json.tokenSet).toBe(true);
+		expect(gh.json.tokenReadable).toBe(true);
+		const blob = storedRow(g).githubToken as string;
+		expect(isSealed(blob)).toBe(true);
+		expect(wrongBox.open(blob)).toBe(NEW);
+	});
+
+	test("backupTo keeps the snapshot sealed", () => {
+		const g = GlobalStore.open(join(root, "g-backup"));
+		stores.push(g);
+		g.set("config", sealedRow(box));
+		boot(g, box);
+		const snapshot = join(root, "snapshot.db");
+		g.backupTo(snapshot);
+		const db = new Database(snapshot);
+		databases.push(db);
+		const value = db
+			.query<{ value: string }, [string]>("SELECT value FROM kv WHERE key = ?")
+			.get("config")?.value;
+		expect(value).toBeDefined();
+		const row = JSON.parse(value as string) as Record<string, unknown>;
+		expect(isSealed(row.githubToken as string)).toBe(true);
+		expect(box.open(row.githubToken as string)).toBe(GH_TOKEN);
+	});
+
+	test("a no-box boot leaves sealed blobs and plaintext spots alone; a boxed boot seals", async () => {
+		const g = GlobalStore.open(join(root, "g-nobox"));
+		stores.push(g);
+		const seeded = plainRow();
+		// Mixed row: githubToken, alate key and the env value sealed; the rest plaintext.
+		seeded.githubToken = box.seal(GH_TOKEN);
+		seeded.alate = { url: "http://127.0.0.1:9", key: box.seal(ALATE_KEY) };
+		seeded.envValues = { HS_TOKEN: box.seal(ENV_VALUE) };
+		g.set("config", { ...seeded });
+
+		// Legacy degraded boot: no box anywhere.
+		const app = boot(g, undefined);
+		// An unrelated save must not delete the unreadable blobs.
+		const rotation = await app.call("/api/settings/session-secret", {}, "POST");
+		expect(rotation.status).toBe(200);
+		let row = storedRow(g);
+		expect(row.githubToken).toBe(seeded.githubToken);
+		expect((row.alate as Record<string, string>).key).toBe(
+			(seeded.alate as Record<string, string>).key,
+		);
+		expect((row.envValues as Record<string, string>).HS_TOKEN).toBe(
+			(seeded.envValues as Record<string, string>).HS_TOKEN,
+		);
+		// Plaintext spots stay plaintext in legacy mode.
+		expect(row.apiKey).toBe(API_KEY);
+		expect(row.sessionSecret).not.toBe(SESSION);
+
+		// The next good boot converges the row to sealed.
+		boot(g, box);
+		row = storedRow(g);
+		expect(isSealed(row.apiKey as string)).toBe(true);
+		expect(isSealed(row.sessionSecret as string)).toBe(true);
+		expect(box.open(row.apiKey as string)).toBe(API_KEY);
+		expect(row.githubToken).toBe(seeded.githubToken);
+	});
+});
