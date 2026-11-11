@@ -253,6 +253,68 @@ export async function commentOnPullRequest(o: {
 	return { ok: false, error: "gh comment create returned an unreadable body" };
 }
 
+/** One pull-request comment (OTTR-809): the author's login and the raw markdown body. */
+export interface IssueComment {
+	login: string;
+	body: string;
+}
+
+/** GitHub data is untrusted: entries without a login or a body are skipped. */
+function parsePrComments(body: unknown): IssueComment[] {
+	if (!Array.isArray(body)) return [];
+	const out: IssueComment[] = [];
+	for (const e of body) {
+		if (typeof e !== "object" || e === null) continue;
+		const x = e as Record<string, unknown>;
+		const user = x.user as Record<string, unknown> | null | undefined;
+		const login =
+			typeof user === "object" && user !== null ? user.login : undefined;
+		if (typeof login !== "string" || typeof x.body !== "string") continue;
+		out.push({ login, body: x.body });
+	}
+	return out;
+}
+
+/** Reads a pull request's comments (the issues endpoint, one page of 100); every field
+ * is parsed as untrusted data. Throws on a failed gh call or an unparseable body — the
+ * caller (the supervisor's rebase-answer watch) logs and skips. */
+export async function listPrComments(o: {
+	repo: string;
+	number: number;
+	gh?: GhFn;
+}): Promise<IssueComment[]> {
+	const gh = o.gh ?? runGh;
+	const r = await gh([
+		"api",
+		`repos/${o.repo}/issues/${o.number}/comments?per_page=100`,
+	]);
+	if (r.code !== 0)
+		throw new Error(
+			`gh comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+		);
+	let j: unknown;
+	try {
+		j = JSON.parse(r.stdout);
+	} catch {
+		throw new Error("gh comments returned an unparseable body");
+	}
+	return parsePrComments(j);
+}
+
+/** OTTR-809: true when a Dependabot comment answers that it cannot rebase the pull
+ * request — GitHub's reply to "@dependabot rebase" on an orphaned PR (its dependabot.yml
+ * entry was deleted) or one a hand edit took over ("That means Dependabot can't rebase
+ * it"). The conflicts reply ("Dependabot tried to update this pull request, but
+ * couldn't ... because of conflicts") does not match, so a plain conflict never reads
+ * as an orphaned PR. */
+export function dependabotCannotRebase(comments: IssueComment[]): boolean {
+	return comments.some(
+		(c) =>
+			c.login === "dependabot[bot]" &&
+			/can(?:'|’)?t (?:be )?rebase/i.test(c.body),
+	);
+}
+
 /** The repo's open pull requests, newest first, every field parsed as untrusted. Shared by
  * the review watcher and the header chip refresh (server.ts). */
 export async function listPulls(repo: string, gh: GhFn): Promise<PullInfo[]> {

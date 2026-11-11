@@ -20717,6 +20717,8 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prHeadSha).toBe("pr-head");
 		// The PR's CI runs on a head its author can rebase; the board watches the PR.
 		expect(after.pushSha).toBe(null);
+		// A card without fixes opens no follow-up PR.
+		expect(after.followUpPrNumber).toBe(null);
 		expect(store.listTurns(task.id).at(-1)).toMatchObject({
 			error: null,
 			outcome: "integrated",
@@ -20882,13 +20884,13 @@ describe("turn PR-mode merge settle", () => {
 		]);
 	});
 
-	test("fixes on a Dependabot PR comment @dependabot rebase instead of pushing (OTTR-760)", async () => {
+	test("a diverged Dependabot card branch comments @dependabot rebase and parks (OTTR-760)", async () => {
 		const comments: { repo: string; number: number; body: string }[] = [];
 		const { store, loop, task } = prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
-			targetContains: async (_m: string, sha: string, tip: string) =>
-				sha === "pr-head" && tip === "sha-fixed",
+			// Diverged: "pr-head" is not an ancestor of "sha-fixed", so no push or PR.
+			targetContains: async () => false,
 			treesEqual: async () => false,
 			pushBranch: async () => {
 				throw new Error("pushBranch must never push to a Dependabot branch");
@@ -20909,6 +20911,67 @@ describe("turn PR-mode merge settle", () => {
 		expect(comments).toEqual([
 			{ repo: "acme/repo", number: 20, body: "@dependabot rebase" },
 		]);
+		expect(after.followUpPrNumber).toBe(null);
+	});
+
+	test("a Dependabot card with fixes opens one follow-up PR based on the Dependabot branch and comments its link on the source PR", async () => {
+		const pushes: unknown[][] = [];
+		const opens: unknown[] = [];
+		const comments: unknown[] = [];
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
+			},
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 33, url: "https://github.com/acme/repo/pull/33" },
+				};
+			},
+			prComment: async (o) => {
+				comments.push(o);
+				return { ok: true as const };
+			},
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			repo: "acme/repo",
+			owner: "acme",
+			branch: "ott/m",
+			base: "dependabot/npm_and_yarn/vite-7.1.2",
+		});
+		// No dst argument: the bot's own branch is never pushed.
+		expect(pushes).toEqual([
+			[store.path, "ott/m", "https://github.com/acme/repo.git"],
+		]);
+		expect(comments).toEqual([
+			{
+				repo: "acme/repo",
+				number: 20,
+				body: expect.stringContaining("#33"),
+			},
+		]);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(null);
+		expect(after.prNumber).toBe(20);
+		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/20");
+		expect(after.prHeadSha).toBe("sha-fixed");
+		expect(after.followUpPrNumber).toBe(33);
+		expect(after.followUpPrUrl).toBe("https://github.com/acme/repo/pull/33");
+		expect(logText(store, task.id)).toContain(
+			"follow-up PR #33 opened (base dependabot/npm_and_yarn/vite-7.1.2)",
+		);
 	});
 
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {
@@ -20959,6 +21022,126 @@ describe("turn PR-mode merge settle", () => {
 		});
 		expect(after.summary).toBe("rebased");
 		expect(after.details).toBe("gates green");
+	});
+
+	test("a legacy Dependabot card with fixes bases the follow-up PR on the target", async () => {
+		const opens: { base: string }[] = [];
+		const { store, loop, task } = prMergeSetup({
+			// A pre-OTTR-760 card has no stored head branch name; the ship fetches the head.
+			fetchPrHead: async () => null,
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/ottr/pr/30"
+					? "head30"
+					: ref === "refs/heads/ott/m"
+						? "sha-fixed"
+						: "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "head30" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 34, url: "https://github.com/acme/repo/pull/34" },
+				};
+			},
+			prComment: async () => ({ ok: true as const }),
+		});
+		store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]!.base).toBe("main");
+		const after = store.getTask(task.id)!;
+		expect(after.prNumber).toBe(30);
+		expect(after.followUpPrNumber).toBe(34);
+	});
+
+	test("a failed follow-up push parks and never opens the PR", async () => {
+		let opened = false;
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => ({
+				status: "failed" as const,
+				error: "denied",
+				output: "denied",
+			}),
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("denied");
+		expect(after.followUpPrNumber).toBe(null);
+	});
+
+	test("a failed follow-up open parks with the gh error", async () => {
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async () => ({
+				ok: false as const,
+				error: "HTTP 422: Validation Failed",
+			}),
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(
+			"Opening the follow-up pull request failed",
+		);
+		expect(after.followUpPrNumber).toBe(null);
+	});
+
+	test("a cross-repo Dependabot PR still opens the follow-up PR", async () => {
+		const opens: unknown[] = [];
+		const comments: unknown[] = [];
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
+			targetContains: async (_m: string, sha: string, tip: string) =>
+				sha === "pr-head" && tip === "sha-fixed",
+			treesEqual: async () => false,
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 35, url: "https://github.com/acme/repo/pull/35" },
+				};
+			},
+			prComment: async (o) => {
+				comments.push(o);
+				return { ok: true as const };
+			},
+		});
+		store.updateTask(task.id, sourcePr({ sourcePrCrossRepo: true }));
+		await loop.runTurn(store.name, task.id);
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			branch: "ott/m",
+			base: "dependabot/npm_and_yarn/vite-7.1.2",
+		});
+		expect(comments).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("idle");
+		expect(after.followUpPrNumber).toBe(35);
 	});
 
 	test("a failed branch push parks merging/needs_you and never opens the PR", async () => {

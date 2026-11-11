@@ -9,7 +9,9 @@ import type { PerfFinding } from "./perfLens.ts";
 import { parseReviewDraft } from "./prInline.ts";
 import {
 	createPrWatcher,
+	dependabotCannotRebase,
 	fetchReReviewContext,
+	listPrComments,
 	openPrsView,
 	openPullRequest,
 	PR_CHIP_MAX,
@@ -427,6 +429,87 @@ describe("parsePullPage", () => {
 			[null, null],
 			[null, null],
 		]);
+	});
+});
+
+describe("listPrComments", () => {
+	const comment = (login: string, body: string) => ({
+		user: { login },
+		body,
+	});
+
+	test("parses logins and bodies and skips malformed entries", async () => {
+		const gh: GhFn = async (a) => {
+			expect(a).toEqual(["api", "repos/o/r/issues/7/comments?per_page=100"]);
+			return {
+				code: 0,
+				stdout: JSON.stringify([
+					comment("dependabot[bot]", "Dependabot can't rebase it - sorry!"),
+					{ user: { login: "x" } },
+					{ body: "no login" },
+					{ user: null, body: "b" },
+					"junk",
+					null,
+				]),
+				stderr: "",
+			};
+		};
+		const out = await listPrComments({ repo: "o/r", number: 7, gh });
+		expect(out).toEqual([
+			{ login: "dependabot[bot]", body: "Dependabot can't rebase it - sorry!" },
+		]);
+	});
+
+	test("a failed gh call throws with the capped stderr", async () => {
+		const gh: GhFn = async () => ({
+			code: 1,
+			stdout: "",
+			stderr: `line1\n${"x".repeat(400)}`,
+		});
+		expect(listPrComments({ repo: "o/r", number: 7, gh })).rejects.toThrow(
+			/^gh comments failed \(1\): line1\nx{0,300}/,
+		);
+	});
+
+	test("an unparseable body throws", async () => {
+		const gh: GhFn = async () => ({ code: 0, stdout: "{", stderr: "" });
+		expect(listPrComments({ repo: "o/r", number: 7, gh })).rejects.toThrow(
+			"unparseable body",
+		);
+	});
+});
+
+describe("dependabotCannotRebase", () => {
+	test("matches Dependabot's cannot-rebase answers", () => {
+		for (const body of [
+			"Looks like this PR has been edited by someone other than Dependabot. That means Dependabot can't rebase it - sorry!",
+			"Dependabot can't be rebased because its head branch was deleted.",
+			"Sorry, Dependabot can’t rebase this PR.",
+			"**Dependabot can't rebase as the manifest file is no longer present**",
+		]) {
+			expect(dependabotCannotRebase([{ login: "dependabot[bot]", body }])).toBe(
+				true,
+			);
+		}
+	});
+
+	test("never matches other authors or other replies", () => {
+		const body = "That means Dependabot can't rebase it - sorry!";
+		expect(dependabotCannotRebase([{ login: "someone", body }])).toBe(false);
+		expect(
+			dependabotCannotRebase([
+				{
+					login: "dependabot[bot]",
+					body: "Dependabot tried to update this pull request, but couldn't do so because of conflicts. You will need to update it by hand.",
+				},
+			]),
+		).toBe(false);
+		expect(
+			dependabotCannotRebase([
+				{ login: "dependabot[bot]", body: " Rebasing your pull request! " },
+			]),
+		).toBe(false);
+		expect(dependabotCannotRebase([])).toBe(false);
 	});
 });
 

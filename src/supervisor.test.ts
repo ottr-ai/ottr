@@ -3910,6 +3910,290 @@ describe("prPass", () => {
 		expect(store.getTask(t.id)!.stage).toBe("merging");
 		store.close();
 	});
+
+	// A merged follow-up PR leaves a number-9 pull body (pullBody hardcodes 7).
+	const pr9Body = (o: {
+		state?: string;
+		mergedAt?: string | null;
+		mergeSha?: string | null;
+		mergeable?: unknown;
+	}) =>
+		JSON.stringify({
+			number: 9,
+			state: o.state ?? "closed",
+			merged_at: o.mergedAt ?? null,
+			merge_commit_sha: o.mergeSha ?? null,
+			mergeable: o.mergeable,
+		});
+
+	function followUpCard(store: ProjectStore): Task {
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			followUpPrNumber: 9,
+			followUpPrUrl: "https://github.com/acme/widget/pull/9",
+		});
+		return t;
+	}
+
+	test("the follow-up PR merged and the source open clears the follow-up and keeps waiting", async () => {
+		const store = prModeProject("pr-fu-merged");
+		const t = followUpCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: OTHER_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([7]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.followUpPrNumber).toBeNull();
+		expect(after.followUpPrUrl).toBeNull();
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(7);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("follow-up PR #9 merged; the card waits on PR #7");
+		// The card waits on the source alone: PR #7 is not read this pass.
+		expect(ops.apiCalls.filter((a) => a[1]!.endsWith("/pulls/7"))).toHaveLength(
+			0,
+		);
+		store.close();
+	});
+
+	test("the source merged first, then the follow-up merge finishes the card", async () => {
+		const store = prModeProject("pr-fu-both");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: OTHER_SHA,
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/9")
+						? {
+								code: 0,
+								stdout: pr9Body({
+									state: "open",
+									mergeable: true,
+								}),
+								stderr: "",
+							}
+						: openList([9]),
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		let after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.followUpPrNumber).toBe(9);
+
+		// Second window: the follow-up merged too — the card finishes. The source read
+		// needs its own merged body: the open-list page is not a single-PR body.
+		const ops2 = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-07T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-06T00:00:00Z",
+									mergeSha: OTHER_SHA,
+								}),
+								stderr: "",
+							}
+						: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops2,
+		);
+		after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
+		// The follow-up's head is the card's own branch, so it goes; the source head stays.
+		expect(ops2.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main", "ottr/552"],
+			},
+		]);
+		store.close();
+	});
+
+	test("a closed follow-up PR parks the card and the park is idempotent", async () => {
+		const store = prModeProject("pr-fu-closed");
+		const t = followUpCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? { code: 0, stdout: pr9Body({ state: "closed" }), stderr: "" }
+					: openList([7]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		let after = store.getTask(t.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(
+			"follow-up PR #9 closed without merging",
+		);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(
+			log.split("\n").filter((l) => l.includes("closed without merging")),
+		).toHaveLength(1);
+
+		// Same answer again: no second park line.
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const log2 = await Bun.file(store.logPath(t.id)).text();
+		expect(
+			log2.split("\n").filter((l) => l.includes("closed without merging")),
+		).toHaveLength(1);
+		store.close();
+	});
+
+	test("an open follow-up PR takes the conflict verdict both ways", async () => {
+		const store = prModeProject("pr-fu-conflict");
+		const t = followUpCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({ state: "open", mergeable: false }),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({ state: "open", mergeable: true }),
+								stderr: "",
+							}
+						: openList([7, 9]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		let after = store.getTask(t.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(prConflictReason(9));
+
+		// GitHub can merge again: the card returns to idle.
+		const ops2 = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({ state: "open", mergeable: true }),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({ state: "open", mergeable: true }),
+								stderr: "",
+							}
+						: openList([7, 9]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops2);
+		after = store.getTask(t.id)!;
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		store.close();
+	});
+
+	const CARRY_REASON =
+		"Fixes beyond source PR #7 (https://github.com/acme/widget/pull/7) sit on the card branch and were not pushed; the board asked @dependabot to rebase instead. Carry them onto the PR by hand.";
+	const COMMENTS_URL = "repos/acme/widget/issues/7/comments";
+
+	function dependabotCard(store: ProjectStore): Task {
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: CARRY_REASON,
+			sourcePrDependabot: true,
+		});
+		return t;
+	}
+
+	test("Dependabot's cannot-rebase answer flips the park reason", async () => {
+		const store = prModeProject("pr-dep-rebase-answer");
+		const t = dependabotCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.includes(COMMENTS_URL)
+					? {
+							code: 0,
+							stdout: JSON.stringify([
+								{
+									user: { login: "dependabot[bot]" },
+									body: "Looks like this PR has been edited by someone other than Dependabot. That means Dependabot can't rebase it - sorry!",
+								},
+							]),
+							stderr: "",
+						}
+					: openList([7]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.needsReason).toContain("Close the pull request");
+		expect(after.needsReason).toContain(
+			"Dependabot reopens it from the current config",
+		);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("supervisor: Dependabot cannot rebase PR #7");
+		store.close();
+	});
+
+	test("a conflicts reply or another author leaves the carry reason", async () => {
+		const store = prModeProject("pr-dep-conflicts-reply");
+		const t = dependabotCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.includes(COMMENTS_URL)
+					? {
+							code: 0,
+							stdout: JSON.stringify([
+								{
+									user: { login: "dependabot[bot]" },
+									body: "Dependabot tried to update this pull request, but couldn't do so because of conflicts.",
+								},
+								{
+									user: { login: "someone-else" },
+									body: "Dependabot can't rebase it",
+								},
+							]),
+							stderr: "",
+						}
+					: openList([7]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(store.getTask(t.id)!.needsReason).toBe(CARRY_REASON);
+		store.close();
+	});
 });
 
 // ---- CI watch on the PR head ------------------------------------------------

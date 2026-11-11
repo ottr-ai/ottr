@@ -219,6 +219,8 @@ function task(p: Partial<Task> = {}): Task {
 		sourcePrHeadSha: null,
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
+		followUpPrNumber: null,
+		followUpPrUrl: null,
 		pushSha: null,
 		pushRetries: 0,
 		mergeHead: null,

@@ -60,7 +60,7 @@ flowchart LR
 - **Docker worker (POST /run, POST /sweep)** — `src/workers.ts` (`serveWorker`, `runWorker`, `sweepWorker`), entry point `src/worker.ts`, stack in `docker-compose.yml` and `Dockerfile.worker`, guide in `docs/WORKERS.md`
 - **omp agent (omp -p)** — the external `omp` CLI. Prompts come from `src/prompts.ts` (`workPrompt`, `mergePrompt`, `workCheckPrompt`). Transcripts are read by `src/session.ts`.
 - **Tracker extension (report_outcome)** — `extension/tracker.ts` (`pi.registerTool({ name: "report_outcome" })`)
-- **Git and worktrees** — `src/worktree.ts` (`resolveTarget`, `createWorktree`, `isClean`, `serverMergePush`), host credentials in `src/gitHosts.ts`. With `prMode` the server pushes the card branch and opens the PR instead of the target push (docs/specs/pr-mode.md)
+- **Git and worktrees** — `src/worktree.ts` (`resolveTarget`, `createWorktree`, `isClean`, `serverMergePush`), host credentials in `src/gitHosts.ts`. With `prMode` the server pushes the card branch and opens the PR instead of the target push (docs/specs/pr-mode.md). A Dependabot card's fixes beyond its PR's head go out as a follow-up PR against the Dependabot branch, and the PR pass waits for both PRs (docs/specs/pr-mode.md, "The follow-up PR and the rebase answer")
 - **Git remote (origin)** — the project's upstream repository. Only the server pushes to it (`serverMergePush`; with `prMode`, the card branch — docs/specs/pr-mode.md).
 
 ## A task from card to merge

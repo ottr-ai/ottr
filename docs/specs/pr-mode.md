@@ -230,11 +230,24 @@ step checks the source before it ever opens a PR:
   branch lives on origin and Dependabot does not own it: the push is a plain
   fast-forward (a moved remote branch rejects instead of overwriting the
   author's commits) and the card adopts the PR afterwards.
-- Everything else — a fork head, a Dependabot branch (the bot abandons a PR
-  once someone else pushes to it), a diverged branch — comments on the
-  source PR (`@dependabot rebase` for Dependabot, a note about the parked
-  fixes otherwise) and parks the card `merging`/`needs_you` with a reason
-  that names the PR and the card branch.
+- Fixes beyond a Dependabot PR's head (OTTR-809) ship as a follow-up pull
+  request. The ship step pushes the card branch to origin under its own
+  name (never to the bot's branch) and opens one PR with the card branch as
+  the head and the Dependabot branch as the base, so the fixes merge with
+  the bump. When the head branch name is unknown (a legacy card resolved at
+  ship time), the base is the target branch instead, and the fixes land
+  after the bump merges. One comment on the source PR links the follow-up.
+  The card stores the follow-up in `follow_up_pr_number`/`follow_up_pr_url`
+  (additive columns migrated like the PR fields above) and waits in
+  `merging`/`idle` until both PRs merge; a re-ship adopts the open
+  follow-up instead of opening another one.
+- Everything else — a fork head without Dependabot, a diverged branch —
+  comments on the source PR (`@dependabot rebase` for Dependabot, a note
+  about the parked fixes otherwise) and parks the card `merging`/`needs_you`
+  with a reason that names the PR and the card branch. When Dependabot
+  answers that comment with a cannot-rebase reply (an orphaned PR or one a
+  hand edit took over), the pass rewrites the park reason to: close the
+  pull request, Dependabot reopens it from the current config.
 
 Cards without a source PR keep the adopt-or-create ship step above; the
 ff-only merge flow is untouched.
@@ -273,6 +286,29 @@ merge").
   PR is closed). Cancelling the card ends it as today and deletes the remote
   card branch (the delete section below); with a still-open PR, GitHub closes
   the PR when its head branch goes.
+
+## The follow-up PR and the rebase answer (OTTR-809)
+
+The PR pass watches both PRs of a follow-up card. Each window: the conflict
+verdict runs for each PR still in the open list; a PR that left it gets one
+per-PR read. The follow-up PR merged: its fields clear, and the card keeps
+waiting on the source PR. Both merged: the card finishes with the later
+merge commit — the follow-up's when the source merged first, the source's
+when the follow-up merged first; a double merge inside one window finishes
+with the follow-up's. The follow-up closed without merge parks the card
+needs_you ("follow-up PR #F closed without merging"); the source closed
+without merge parks it the same way while the follow-up waits. The remote
+card-branch delete still runs only at the finish: the follow-up PR's head is
+the card branch, and it may go only once both PRs merged.
+
+A Dependabot card parked on the rebase handoff (its reason carries "the
+board asked @dependabot to rebase") reads its source PR's comments once per
+window (`listPrComments`, one page of 100, parsed as untrusted data). When a
+`dependabot[bot]` comment says Dependabot cannot rebase
+(`dependabotCannotRebase` — "That means Dependabot can't rebase it"), the
+park reason becomes: close the pull request, Dependabot reopens it from the
+current config. A plain conflicts reply never matches, the reason rewrite
+happens once, and a failed comment read retries at the next window.
 
 ## Remote card-branch delete (OTTR-800)
 

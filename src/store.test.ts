@@ -2335,6 +2335,55 @@ describe("preparing migration", () => {
 		done_at INTEGER
 	)`;
 
+	test("open adds the follow-up PR columns to an old-schema tasks table", () => {
+		const dir = join(root, "followup-pr-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			prompt TEXT,
+			stage TEXT NOT NULL,
+			state TEXT NOT NULL,
+			needs_reason TEXT,
+			pending_prompt TEXT,
+			branch TEXT,
+			base TEXT,
+			worktree TEXT,
+			session_id TEXT,
+			summary TEXT,
+			details TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`);
+		db.exec(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at) VALUES ('seed1', 'merging', 'idle', 1, 1)",
+		);
+		db.exec(
+			"INSERT INTO tasks (id, stage, state, created_at, updated_at) VALUES ('seed2', 'merging', 'idle', 2, 2)",
+		);
+		db.close();
+
+		const store = open(dir);
+		store.updateTask("seed1", {
+			followUpPrNumber: 33,
+			followUpPrUrl: "https://github.com/acme/repo/pull/33",
+		});
+		const after = store.getTask("seed1");
+		expect(after?.followUpPrNumber).toBe(33);
+		expect(after?.followUpPrUrl).toBe("https://github.com/acme/repo/pull/33");
+		// The columns read null for a row that never held a follow-up PR.
+		const plain = store.getTask("seed2");
+		expect(plain?.followUpPrNumber).toBe(null);
+		expect(plain?.followUpPrUrl).toBe(null);
+		store.close();
+
+		// The columns are durable across a reopen.
+		const reopened = open(dir);
+		expect(reopened.getTask("seed1")?.followUpPrNumber).toBe(33);
+		reopened.close();
+	});
+
 	test("open rebuilds the old state CHECK without losing rows and accepts preparing", () => {
 		const dir = join(root, "preparing-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });

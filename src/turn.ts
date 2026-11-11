@@ -6101,8 +6101,10 @@ export function createTurnLoop(
 	 * the source PR (prNumber/prUrl take its values) and the tracker waits on GitHub like
 	 * on any PR-mode card. Fixes beyond the PR head must land on the PR's own head branch;
 	 * a push happens only when that branch lives on origin and Dependabot does not own it
-	 * (the bot abandons a PR once someone else pushes to it) — else the ship comments on
-	 * the PR and parks the card with the reason. */
+	 * (the bot abandons a PR once someone else pushes to it). Dependabot is the exception:
+	 * a card branch that descends from the PR head ships its fixes as a follow-up PR based
+	 * on the Dependabot branch — else the ship comments on the PR and parks the card with
+	 * the reason. */
 	async function shipSourcePrCard(
 		st: TurnSettle,
 		n: number,
@@ -6149,6 +6151,13 @@ export function createTurnLoop(
 			onHead && src.crossRepo !== true && src.dependabot !== true;
 		if (pushable) {
 			await pushToSourcePr(st, n, src, prBranch, tip);
+			return;
+		}
+		// A Dependabot PR with fixes on top of its head cannot take a board push (the bot
+		// would abandon the PR), but the fixes are ready work: ship them as their own PR
+		// instead of parking them for a manual carry.
+		if (onHead && src.dependabot) {
+			await openFollowUpPr(st, n, src, prBranch, tip);
 			return;
 		}
 		await parkOnSourcePr(st, n, src);
@@ -6235,6 +6244,9 @@ export function createTurnLoop(
 			prNumber: n,
 			prUrl: url,
 			prHeadSha,
+			// A clean bump leaves no follow-up PR; a stale stamp from an earlier ship must go.
+			followUpPrNumber: null,
+			followUpPrUrl: null,
 		});
 		appendLog(
 			st.store,
@@ -6280,6 +6292,131 @@ export function createTurnLoop(
 		}
 		st.log(`- pushed the card's fixes to ${dst} (source PR #${n})`);
 		adoptSourcePr(st, n, tip, src.url);
+	}
+
+	/** Ships a Dependabot card's fixes as a follow-up PR: the bot owns the source PR's
+	 * branch (a board push would make it abandon the PR), so the card branch pushes to
+	 * its own origin name and opens a PR against the Dependabot branch (fixes land with
+	 * the bump) or the target branch (a legacy card without the head name; fixes land
+	 * after the bump merges). The source PR gets one best-effort comment with the link. */
+	async function openFollowUpPr(
+		st: TurnSettle,
+		n: number,
+		src: SourcePrRef,
+		prBranch: string,
+		tip: string,
+	): Promise<void> {
+		const pushBranch = ops.pushBranch;
+		if (pushBranch === undefined) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Source PR #${n} needs its fixes pushed, but the ship step cannot push branches; restart the board`,
+			};
+			return;
+		}
+		// openPullRequest parked on a null origin before this call, so the pinned URL is set.
+		const originUrl = st.header.settings.originUrl;
+		if (originUrl === null) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"no pinned origin URL; restart the board (or set it in project settings) so the server pins the origin remote before pushing the branch",
+			};
+			return;
+		}
+		const pr = await pushBranch(st.e.path, prBranch, originUrl).catch(
+			(err: unknown) => ({
+				status: "failed" as const,
+				error: errmsg(err),
+			}),
+		);
+		if (pr.status !== "pushed") {
+			logPrPushFailure(st, prBranch, pr);
+			return;
+		}
+		st.log(`- pushed ${prBranch} (the fixes beyond source PR #${n})`);
+		// With the head branch known, the fixes land with the bump; a legacy card falls
+		// back to the target, where they land after the bump merges.
+		const base = src.headRef ?? st.header.target.replace(/^origin\//, "");
+		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
+		if (repo === null) {
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason:
+					"PR mode requires a GitHub remote on the project; disable PR mode or add the remote",
+			};
+			return;
+		}
+		const opened = await ops
+			.openPr?.({
+				repo,
+				owner: repo.slice(0, repo.indexOf("/")),
+				branch: prBranch,
+				base,
+				title: st.task.title,
+				body: `${prBody(st.task, st.result.outcome)}\n\nFixes beyond source PR #${n} (${src.url ?? "URL unknown"}); base ${base} so they land with the bump.`,
+				// Hosted: gh takes the project's minted token, never GH_TOKEN.
+				...(ops.hosted !== undefined && {
+					gh: await hostedGh(st.e.path, st.header.settings.originUrl),
+				}),
+			})
+			.catch((err: unknown) => ({
+				ok: false as const,
+				error: errmsg(err),
+			}));
+		if (opened === undefined || !opened.ok) {
+			const error = opened === undefined ? "openPr is not wired" : opened.error;
+			st.log(`! opening the follow-up pull request failed: ${error}`);
+			st.prNext = {
+				stage: "merging",
+				state: "needs_you",
+				needsReason: `Opening the follow-up pull request failed: ${error}`,
+			};
+			return;
+		}
+		// The comment only links the follow-up; the PR itself is the delivery, so a
+		// failed comment logs and never parks (same pattern as commentSourcePr).
+		const res = await ops
+			.prComment?.({
+				repo,
+				number: n,
+				body: `The board opened #${opened.pr.number} with this card's fixes on top of this PR's branch; merging it carries them into the bump.`,
+				...(ops.hosted !== undefined && {
+					gh: await hostedGh(st.e.path, st.header.settings.originUrl),
+				}),
+			})
+			.catch((err: unknown) => ({
+				ok: false as const,
+				error: errmsg(err),
+			}));
+		if (res !== undefined && !res.ok)
+			st.log(`! commenting on source PR #${n} failed: ${res.error}`);
+		// pushSha stays null: the bot may rebase its branch, so the board watches the
+		// PRs, never a pinned sha.
+		st.store.updateTask(st.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: null,
+			prNumber: n,
+			prUrl: src.url,
+			prHeadSha: tip,
+			pushSha: null,
+			followUpPrNumber: opened.pr.number,
+			followUpPrUrl: opened.pr.url,
+		});
+		appendLog(
+			st.store,
+			st.id,
+			`- follow-up PR #${opened.pr.number} opened (base ${base}); the card waits on PR #${n} and PR #${opened.pr.number}`,
+		);
+		st.prNext = {
+			stage: "merging",
+			state: "idle",
+			needsReason: null,
+		};
 	}
 
 	/** Comments on the source PR and parks the card with the reason: the turn's work must

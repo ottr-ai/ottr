@@ -4,7 +4,11 @@ import { writeBelow } from "./confine.ts";
 import { errmsg } from "./errmsg.ts";
 import { githubHost } from "./githubHost.ts";
 import { followUpPrompt, handoffMarkdown, retroPrompt } from "./prompts.ts";
-import { parsePullPage } from "./prs.ts";
+import {
+	dependabotCannotRebase,
+	listPrComments,
+	parsePullPage,
+} from "./prs.ts";
 import { ownerRepo } from "./release.ts";
 import {
 	collectRetroFacts,
@@ -1861,7 +1865,9 @@ export function createSupervisor(
 		ops.appendLog(
 			e.store,
 			t.id,
-			`supervisor: PR #${t.prNumber} merged; card done`,
+			t.followUpPrNumber !== null
+				? `supervisor: PR #${t.prNumber} and follow-up PR #${t.followUpPrNumber} merged; card done`
+				: `supervisor: PR #${t.prNumber} merged; card done`,
 		);
 	}
 
@@ -1908,11 +1914,11 @@ export function createSupervisor(
 	/** The PR's own state for one card, or null (logged) when it cannot be read. */
 	async function prState(
 		e: SupervisorEntry,
-		t: ListedTask,
 		repo: string,
+		number: number,
 	): Promise<PrDetail | null> {
 		const r = await ops
-			.gh(["api", `repos/${repo}/pulls/${t.prNumber}`])
+			.gh(["api", `repos/${repo}/pulls/${number}`])
 			.catch((err: unknown) => ({
 				code: 1,
 				stdout: "",
@@ -1920,7 +1926,7 @@ export function createSupervisor(
 			}));
 		if (r.code !== 0) {
 			console.error(
-				`supervisor: project ${e.name}: PR #${t.prNumber} read failed: ${(r.stderr || "unknown error").slice(0, 200)}`,
+				`supervisor: project ${e.name}: PR #${number} read failed: ${(r.stderr || "unknown error").slice(0, 200)}`,
 			);
 			return null;
 		}
@@ -1928,7 +1934,7 @@ export function createSupervisor(
 			return parsePull(JSON.parse(r.stdout));
 		} catch {
 			console.error(
-				`supervisor: project ${e.name}: PR #${t.prNumber}: unparseable body; skipped`,
+				`supervisor: project ${e.name}: PR #${number}: unparseable body; skipped`,
 			);
 			return null;
 		}
@@ -1945,7 +1951,7 @@ export function createSupervisor(
 		repo: string,
 		reason: string,
 	): Promise<void> {
-		const pr = await prState(e, t, repo);
+		const pr = await prState(e, repo, t.prNumber!);
 		if (pr === null) return;
 		if (pr.state === "open") {
 			prConflictVerdict(e, t, pr.mergeable, reason);
@@ -2016,17 +2022,182 @@ export function createSupervisor(
 		e: SupervisorEntry,
 		t: ListedTask,
 		repo: string,
+		number: number,
 		reason: string,
 	): Promise<void> {
 		const parked = t.state === "needs_you" && t.needsReason === reason;
 		if (t.state !== "idle" && !parked) return;
-		const pr = await prState(e, t, repo);
+		const pr = await prState(e, repo, number);
 		if (pr === null || pr.state !== "open") return;
 		prConflictVerdict(e, t, pr.mergeable, reason);
 	}
 
+	/** OTTR-809: a parked Dependabot carry card reads its source PR's comments once per
+	 * window. Dependabot's cannot-rebase answer means the PR is orphaned or hand-edited:
+	 * the card's reason flips to "close the PR". A failed or unparseable read logs nothing
+	 * and returns — the next window retries. Never throws. */
+	async function prRebaseAnswer(
+		e: SupervisorEntry,
+		t: ListedTask,
+		repo: string,
+	): Promise<void> {
+		const comments = await listPrComments({
+			repo,
+			number: t.prNumber!,
+			gh: ops.gh,
+		}).catch(() => null);
+		if (comments === null) return;
+		if (!dependabotCannotRebase(comments)) return;
+		if (wentStale(e.store, t)) return;
+		e.store.updateTask(t.id, {
+			needsReason: `Source PR #${t.prNumber} cannot be rebased: Dependabot answered it can't rebase this PR (orphaned or edited). Close the pull request; Dependabot reopens it from the current config.`,
+		});
+		ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: Dependabot cannot rebase PR #${t.prNumber}; the card asks to close it so Dependabot reopens it from the current config`,
+		);
+		ops.schedule();
+	}
+
+	/** One tracked Merging follow-up card whose follow-up PR is not in the open list. The
+	 * follow-up merged moves the card's wait onto the source PR alone; both merged finishes
+	 * the card with the follow-up's merge commit (the later one on the target); a closed PR
+	 * parks the card needs_you. Never throws; read failures log and skip. */
+	async function settleFollowUpPr(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+		t: ListedTask,
+		repo: string,
+		sOpen: boolean,
+		F: number,
+		S: number,
+	): Promise<void> {
+		const pr = await prState(e, repo, F);
+		if (pr === null) return;
+		if (pr.state === "open") {
+			// Left the list since, or a re-list edge: take the merge verdict like a listed one.
+			prConflictVerdict(e, t, pr.mergeable, prConflictReason(F));
+			return;
+		}
+		if (pr.merged && pr.mergeCommit !== null) {
+			// A state flip, so it writes once: afterwards followUpPrNumber is null and the
+			// single-PR path owns the card.
+			const clearFollowUp = () => {
+				if (wentStale(e.store, t)) return;
+				e.store.updateTask(t.id, {
+					followUpPrNumber: null,
+					followUpPrUrl: null,
+				});
+				ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: follow-up PR #${F} merged; the card waits on PR #${S}`,
+				);
+				ops.schedule();
+			};
+			if (sOpen) {
+				clearFollowUp();
+				return;
+			}
+			const s = await prState(e, repo, S);
+			if (s === null) return;
+			if (s.state === "open") {
+				clearFollowUp();
+				return;
+			}
+			if (s.merged && s.mergeCommit !== null) {
+				await finishPrMerge(e, settings, t, pr.mergeCommit);
+				return;
+			}
+			if (wentStale(e.store, t)) return;
+			e.store.updateTask(t.id, {
+				state: "needs_you",
+				needsReason: `PR #${S} closed without merging`,
+				pushSha: null,
+			});
+			ops.appendLog(
+				e.store,
+				t.id,
+				`supervisor: PR #${S} closed without merging; card parked`,
+			);
+			ops.schedule();
+			return;
+		}
+		// The follow-up closed unmerged: an idempotent park, so a second pass with the
+		// same answer rewrites nothing.
+		const reason = `follow-up PR #${F} closed without merging`;
+		if (t.state === "needs_you" && t.needsReason === reason) return;
+		if (wentStale(e.store, t)) return;
+		e.store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: reason,
+			pushSha: null,
+		});
+		ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: follow-up PR #${F} closed without merging; card parked`,
+		);
+		ops.schedule();
+	}
+
+	/** One tracked Merging follow-up card whose follow-up PR is open but whose source PR
+	 * left the open list. A merged source writes nothing: the pass repeats until the
+	 * follow-up settles and finishPrMerge names both PRs. A closed unmerged source parks
+	 * the card like settlePrCard. Never throws; read failures log and skip. */
+	async function settleOpenFollowUpsSource(
+		e: SupervisorEntry,
+		t: ListedTask,
+		repo: string,
+		S: number,
+	): Promise<void> {
+		const s = await prState(e, repo, S);
+		if (s === null) return;
+		if (s.merged || s.state === "open") return;
+		if (wentStale(e.store, t)) return;
+		e.store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: `PR #${S} closed without merging`,
+			pushSha: null,
+		});
+		ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: PR #${S} closed without merging; card parked`,
+		);
+		ops.schedule();
+	}
+
+	/** OTTR-809: a follow-up card watches both its PRs. The conflict verdict runs on each
+	 * open PR; the not-listed side settles first (the follow-up merged shifts the wait to
+	 * the source, both merged finishes the card). Never throws. */
+	async function prFollowUp(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+		t: ListedTask,
+		repo: string,
+		open: Set<number>,
+	): Promise<void> {
+		const F = t.followUpPrNumber!;
+		const S = t.prNumber!;
+		const fOpen = open.has(F);
+		const sOpen = open.has(S);
+		// Settle the not-listed side first: once the follow-up merged the card waits on the
+		// source alone, and the conflict watch below must not re-read a settled PR this pass.
+		if (!fOpen) await settleFollowUpPr(e, settings, t, repo, sOpen, F, S);
+		else if (!sOpen) await settleOpenFollowUpsSource(e, t, repo, S);
+		// Conflict watch on each open PR for idle cards (or cards parked with that PR's
+		// own conflict reason) — only while the card still tracks the follow-up.
+		const row = e.store.getTask(t.id);
+		if (row === null || row.followUpPrNumber === null) return;
+		if (fOpen) await prConflictCard(e, t, repo, F, prConflictReason(F));
+		if (sOpen) await prConflictCard(e, t, repo, S, prConflictReason(S));
+	}
+
 	/** Every tracked Merging card: settle the card whose PR is not in the open list, and check
-	 * the card whose PR is in it for a merge conflict. */
+	 * the card whose PR is in it for a merge conflict. A Dependabot carry card parked for a
+	 * rebase reads Dependabot's answer instead; a follow-up card watches both its PRs. */
 	async function prSettleMerging(
 		e: SupervisorEntry,
 		settings: ProjectSettings,
@@ -2049,8 +2220,25 @@ export function createSupervisor(
 			// number. Settling it against the old PR parks the recovery before the ship
 			// can run.
 			if (t.state === "queued") continue;
+			// OTTR-809: a Dependabot carry card parked for a rebase waits for Dependabot's
+			// answer, not for a merge; it never has a follow-up PR (the follow-up path
+			// replaced this park for linear branches). The reason no longer holds the
+			// marker once the answer landed, so the intercept fires once per park.
+			if (
+				t.state === "needs_you" &&
+				t.sourcePrDependabot === true &&
+				(t.needsReason ?? "").includes("the board asked @dependabot to rebase")
+			) {
+				await prRebaseAnswer(e, t, repo);
+				continue;
+			}
+			if (t.followUpPrNumber !== null) {
+				await prFollowUp(e, settings, t, repo, open);
+				continue;
+			}
 			const reason = prConflictReason(t.prNumber);
-			if (open.has(t.prNumber)) await prConflictCard(e, t, repo, reason);
+			if (open.has(t.prNumber))
+				await prConflictCard(e, t, repo, t.prNumber, reason);
 			else await settlePrCard(e, settings, t, repo, reason);
 		}
 	}

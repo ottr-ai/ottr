@@ -475,6 +475,11 @@ export interface Task {
 	sourcePrCrossRepo: boolean;
 	/** True when the source PR came from Dependabot: the bot stops updating a branch someone else pushed to, so the board comments "@dependabot rebase" instead of pushing. */
 	sourcePrDependabot: boolean;
+	/** OTTR-809: the follow-up pull request the ship step opened for a Dependabot card's
+	 * fixes beyond the source PR's head (base = the Dependabot branch); null otherwise.
+	 * The card waits for this PR and the source PR to merge before it finishes. */
+	followUpPrNumber: number | null;
+	followUpPrUrl: string | null;
 	/** OTTR-394: automatic rebase retries a rejected server push has spent (budget 2 per card). */
 	pushRetries: number;
 	/** Integration target head when the task finished (stamped with `commits`); the anchor that attributes a release's late commits to the card that merged them. null when unmeasured or not done. */

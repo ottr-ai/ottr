@@ -25,6 +25,8 @@ function done(id: string, project: string, commits: number | null): Task {
 		sourcePrHeadSha: null,
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
+		followUpPrNumber: null,
+		followUpPrUrl: null,
 		images: [],
 		pendingImages: [],
 		shots: [],

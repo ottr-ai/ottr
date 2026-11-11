@@ -935,6 +935,8 @@ describe("handoffMarkdown research report", () => {
 		sourcePrHeadSha: null,
 		sourcePrCrossRepo: false,
 		sourcePrDependabot: false,
+		followUpPrNumber: null,
+		followUpPrUrl: null,
 		pushSha: null,
 		mergeHead: null,
 		kind: "work" as const,
