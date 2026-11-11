@@ -407,6 +407,8 @@ export interface Task {
 	/** Epoch milliseconds. */
 	createdAt: number;
 	updatedAt: number;
+	/** Optimistic-locking counter (OTTR-795): bumps on every store write; guarded edits send the value they loaded and get a 409 with the current card when it moved. Never caller-settable. */
+	revision: number;
 	/** When the task last entered state `queued`; scheduling order. */
 	queuedAt: number | null;
 	/** When the task last entered stage `done`; backfilled from the last turn's end for pre-existing cards. */

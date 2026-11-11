@@ -41,6 +41,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		starred: false,
 		createdAt: 0,
 		updatedAt: 0,
+		revision: 1,
 		queuedAt: null,
 		holdUntil: null,
 		holdProvider: null,

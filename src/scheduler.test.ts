@@ -189,6 +189,7 @@ function task(p: Partial<Task> = {}): Task {
 		starred: false,
 		createdAt: now,
 		updatedAt: now,
+		revision: p.revision ?? 1,
 		queuedAt: now,
 		holdUntil: null,
 		holdProvider: null,

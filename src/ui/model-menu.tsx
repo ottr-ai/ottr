@@ -25,7 +25,7 @@ export interface ModelMenu {
     popover over the catalogue (New task's picker and the Settings Model roles rows).
     The hook owns the mechanics, the two components own the markup; the caller
     builds the rows and keeps any wrappers it needs (labels, grid cells). */
-export function useModelMenu(): ModelMenu {
+export function useModelMenu(onOpen?: () => void): ModelMenu {
 	// One menu per component instance: several New task dialogs (one per project)
 	// and several role rows stay mounted at once, each with its own popover id.
 	const popId = useId();
@@ -37,6 +37,14 @@ export function useModelMenu(): ModelMenu {
 	// focus on the first role row instead of the search box.
 	const arrowOpen = useRef(false);
 	const [open, setOpen] = useState(false);
+	// The caller's open hook rides the same setOpen the popover's onToggle calls (every
+	// open and close path lands here). Ref-held: the handler outlives renders.
+	const onOpenRef = useRef(onOpen);
+	onOpenRef.current = onOpen;
+	const setOpenTracked = (v: boolean): void => {
+		setOpen(v);
+		if (v) onOpenRef.current?.();
+	};
 	// Native light-dismiss misses pointerdowns on the dialog backdrop / inert page behind the
 	// popover (both sit in the top layer), so some engines never close on "click somewhere else".
 	// A nested popover (the Thinking level menu) is a DOM descendant, so one `contains` covers it.
@@ -97,7 +105,7 @@ export function useModelMenu(): ModelMenu {
 		trigger,
 		search,
 		arrowOpen,
-		setOpen,
+		setOpen: setOpenTracked,
 		keys,
 		openFromTrigger,
 		close,

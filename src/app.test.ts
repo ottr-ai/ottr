@@ -5926,6 +5926,133 @@ describe("release notes route", () => {
 	});
 });
 
+describe("revision guard", () => {
+	// Optimistic locking: a guarded write only lands when the revision the client
+	// loaded is still current. Covers the editTask path (/edit) and the
+	// applyUserEdit path (/release-notes).
+	test("a stale /edit answers 409 with the current card and keeps the first write", async () => {
+		const t = store.createTask("draft");
+		const rev = store.getTask(t.id)!.revision;
+		const first = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+			prompt: "tab one",
+			revision: rev,
+		});
+		expect(first.status).toBe(200);
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+			prompt: "tab two",
+			revision: rev,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as {
+			error: string;
+			task: { id: string; prompt: string; revision: number };
+		};
+		expect(b.error).toBe("card changed since it was loaded");
+		expect(b.task.id).toBe(t.id);
+		expect(b.task.prompt).toBe("tab one");
+		expect(b.task.revision).toBe(rev + 1);
+		expect(store.getTask(t.id)!.prompt).toBe("tab one");
+	});
+
+	test("an /edit without a revision still works", async () => {
+		const t = store.createTask("draft");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+			prompt: "no revision sent",
+		});
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.prompt).toBe("no revision sent");
+	});
+
+	test("an /edit with the current revision works", async () => {
+		const t = store.createTask("draft");
+		const rev = store.getTask(t.id)!.revision;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+			prompt: "current",
+			revision: rev,
+		});
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.prompt).toBe("current");
+	});
+
+	test("an invalid revision answers 400", async () => {
+		const t = store.createTask("draft");
+		for (const revision of ["1", 0, -1, 1.5]) {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+				prompt: "x",
+				revision,
+			});
+			expect(res.status).toBe(400);
+			expect(await errorOf(res)).toBe("revision must be a positive integer");
+		}
+	});
+
+	test("a stale release-notes edit answers 409 and keeps the first write", async () => {
+		const t = store.createTask("release card");
+		store.updateTask(t.id, {
+			releaseVersion: "v1.0.0",
+			releaseNotes: "old notes",
+			state: "needs_you",
+			stage: "done",
+		});
+		const rev = store.getTask(t.id)!.revision;
+		const first = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "tab one notes",
+			revision: rev,
+		});
+		expect(first.status).toBe(200);
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "tab two notes",
+			revision: rev,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as {
+			error: string;
+			task: { id: string; releaseNotes: string; revision: number };
+		};
+		expect(b.error).toBe("card changed since it was loaded");
+		expect(b.task.id).toBe(t.id);
+		expect(b.task.releaseNotes).toBe("tab one notes");
+		expect(b.task.revision).toBe(rev + 1);
+		expect(store.getTask(t.id)!.releaseNotes).toBe("tab one notes");
+	});
+
+	test("a release-notes edit without a revision still works", async () => {
+		const t = store.createTask("release card");
+		store.updateTask(t.id, {
+			releaseVersion: "v1.0.0",
+			state: "needs_you",
+			stage: "done",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "no revision sent",
+		});
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.releaseNotes).toBe("no revision sent");
+	});
+
+	test("a release-notes edit with the current revision works, an invalid one is 400", async () => {
+		const t = store.createTask("release card");
+		store.updateTask(t.id, {
+			releaseVersion: "v1.0.0",
+			state: "needs_you",
+			stage: "done",
+		});
+		const rev = store.getTask(t.id)!.revision;
+		const ok = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "current",
+			revision: rev,
+		});
+		expect(ok.status).toBe(200);
+		expect(store.getTask(t.id)!.releaseNotes).toBe("current");
+		const bad = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "x",
+			revision: "1",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("revision must be a positive integer");
+	});
+});
+
 describe("release-summary route", () => {
 	// The route plans a real release, so the project needs a git repo; each test builds its
 	// own checkout under root and removes it afterwards (same pattern as the drawer tests).

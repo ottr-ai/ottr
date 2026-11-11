@@ -416,6 +416,10 @@ Spec: [docs/specs/github-app.md](docs/specs/github-app.md).
 
 Public hostnames need a login (first visit creates the admin user) or the API key from **Settings**. Loopback access needs no login. Serve HTTPS with `tailscale serve --bg --https=443 http://127.0.0.1:4747`, set `OMP_TRACKER_PUBLIC_HOSTS`, and the board installs to a phone's home screen; Web Push (**Settings → Notifications**) then delivers alerts. It is the only OS notification channel: desktop browsers subscribe the same way as phones. Each device picks its classes (Request, Error, Complete), and project mutes apply to every device. Push pauses while a board tab is focused. When an alert's cause clears or you acknowledge it, Ottr retracts the notification, and a bell acknowledgement is shared by every device. **Settings → Session → Sign out everywhere** rotates the session secret and revokes all login sessions. **Settings → Session** lists the login sessions, marks the current browser, and can sign out a single session. Non-GET API requests must send an `Origin` header matching the board URL.
 
+### Card edit conflicts
+
+Two browser tabs can edit one card at the same time. The card edit routes accept an optional `revision` field: the task text edit, the steer edit, the steer cancel, the model choice, and the release notes edit. Send the `revision` value that the card carried when you loaded it. The write lands only when the card still carries that revision. A stale write answers `409`, and the body holds the card's current state, so your client can re-read and retry. A request without `revision` behaves as before. The board sends `revision` on every edit; on a `409` it keeps your text and shows the card's current version beside it.
+
 ## Development
 
 The commands are the same in bash and PowerShell:

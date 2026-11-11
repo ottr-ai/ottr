@@ -8126,6 +8126,40 @@ button.log-mode[aria-pressed="true"] {
 	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
 	white-space: pre-line;
 }
+/* OTTR-795: a revision-guarded edit was refused — the card changed while the editor held
+   it. The kept text stays in the editor; the board's current version shows in this block,
+   beside it. The grey attention edge like .trust-warn, the crit text like .auth-error. */
+.edit-conflict {
+	display: grid;
+	gap: 4px;
+	/* Clear of the textarea's resize grip above; pad so the block does not read top-heavy. */
+	margin: 10px 0 4px;
+	padding: 3px 0;
+	border-left: 2px solid var(--crit-text);
+	padding-left: 0.75rem;
+}
+.edit-conflict .auth-error {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+}
+.edit-conflict .hint,
+.edit-conflict .conflict-current {
+	/* Align under the heading text: clear of the 14px crit mark + its gap. */
+	margin: 0;
+	padding-left: 20px;
+}
+.edit-conflict .conflict-label {
+	margin: 0;
+	padding-left: 20px;
+	font-weight: 600;
+	color: var(--crit-text);
+}
+.edit-conflict .conflict-current {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	font-size: 12.5px;
+}
 /* A changed SSH host key: a warning, not an error — the app's grey attention edge. */
 .trust-warn {
 	border-left: 2px solid var(--dim);

@@ -27,7 +27,7 @@ import {
 	tasksDirFor,
 } from "./store.ts";
 import { prConflictReason } from "./supervisor.ts";
-import { answeredCard, type RecordedFinding } from "./types.ts";
+import { answeredCard, type RecordedFinding, type Task } from "./types.ts";
 
 const root = mkdtempSync(join(tmpdir(), "store-model-"));
 const opened: ProjectStore[] = [];
@@ -266,10 +266,146 @@ describe("editTask", () => {
 		const task = store.createTask("first line\nsecond line");
 		expect(task.title).toBe("first line");
 		const edited = store.editTask(task.id, "renamed lead\nnew body");
-		expect(edited.prompt).toBe("renamed lead\nnew body");
-		expect(edited.title).toBe("renamed lead");
-		expect(edited.stage).toBe("todo");
+		expect(edited.ok).toBe(true);
+		expect(edited.task.prompt).toBe("renamed lead\nnew body");
+		expect(edited.task.title).toBe("renamed lead");
+		expect(edited.task.stage).toBe("todo");
 		store.close();
+	});
+});
+
+describe("revision (optimistic locking)", () => {
+	test("a write with the current revision passes and moves the revision", () => {
+		const store = open(join(root, "revision-current"));
+		const task = store.createTask("original prompt");
+		expect(task.revision).toBe(1);
+		const result = store.updateTaskIfCurrent(
+			task.id,
+			{ prompt: "edit one" },
+			1,
+		);
+		expect(result.ok).toBe(true);
+		expect(result.task.revision).toBe(2);
+		expect(result.task.prompt).toBe("edit one");
+		store.close();
+	});
+
+	test("a write with a stale revision changes nothing and reports the conflict with the current row", () => {
+		const store = open(join(root, "revision-stale"));
+		const task = store.createTask("original prompt");
+		// First writer wins: bumps the row to revision 2 with its own prompt and updated_at.
+		const first = store.updateTaskIfCurrent(
+			task.id,
+			{ prompt: "first edit" },
+			1,
+		);
+		expect(first.ok).toBe(true);
+		const winner = store.getTask(task.id) as Task;
+		// Second tab still holds revision 1: the write must not land.
+		const second = store.updateTaskIfCurrent(
+			task.id,
+			{ prompt: "second edit" },
+			1,
+		);
+		expect(second.ok).toBe(false);
+		expect(second.task).toEqual(winner);
+		// The first writer's values survive untouched.
+		const row = store.getTask(task.id) as Task;
+		expect(row.prompt).toBe("first edit");
+		expect(row.updatedAt).toBe(winner.updatedAt);
+		expect(row.revision).toBe(2);
+		store.close();
+	});
+
+	test("an internal updateTask always passes and bumps the revision", () => {
+		const store = open(join(root, "revision-internal"));
+		const task = store.createTask("internal");
+		store.updateTask(task.id, { summary: "one" });
+		expect(store.getTask(task.id)?.revision).toBe(2);
+		store.updateTask(task.id, { summary: "two" });
+		expect(store.getTask(task.id)?.revision).toBe(3);
+		store.close();
+	});
+
+	test("editTask passes with the current revision and conflicts with a stale one", () => {
+		const store = open(join(root, "revision-edit"));
+		const task = store.createTask("first line\nsecond line");
+		const current = store.editTask(task.id, "renamed lead\nnew body", 1);
+		expect(current.ok).toBe(true);
+		expect(current.task.title).toBe("renamed lead");
+		expect(current.task.revision).toBe(2);
+		// The stale editor's revision 1 no longer matches.
+		const stale = store.editTask(task.id, "lost edit", 1);
+		expect(stale.ok).toBe(false);
+		expect(stale.task.prompt).toBe("renamed lead\nnew body");
+		expect((store.getTask(task.id) as Task).revision).toBe(2);
+		store.close();
+	});
+
+	test("an unknown id still throws before any write", () => {
+		const store = open(join(root, "revision-unknown"));
+		expect(() => store.updateTaskIfCurrent("nope", { prompt: "x" }, 1)).toThrow(
+			"unknown task: nope",
+		);
+		store.close();
+	});
+
+	test("an old-schema database without the column converges on open and starts writing revisions", () => {
+		const dir = join(root, "revision-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		// Shape of a database created before revision existed: full post-backfill column
+		// set minus the new column.
+		db.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done','backlog','parked')),
+			state TEXT NOT NULL CHECK (state IN ('queued','running','needs_you','idle')),
+			needs_reason TEXT,
+			pending_prompt TEXT,
+			branch TEXT,
+			base TEXT,
+			worktree TEXT,
+			session_id TEXT,
+			summary TEXT,
+			details TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			queued_at INTEGER,
+			cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]',
+			pending_images TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT,
+			release_notes TEXT,
+			session_title TEXT,
+			asked TEXT,
+			model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]',
+			follow_up_of TEXT,
+			push_sha TEXT,
+			update_ids TEXT NOT NULL DEFAULT '[]',
+			update_merge_approved INTEGER NOT NULL DEFAULT 0
+		)`);
+		db.exec(
+			"INSERT INTO tasks (id, title, stage, state, created_at, updated_at) VALUES ('seed1', 'seeded', 'in_progress', 'running', 1, 1)",
+		);
+		db.close();
+
+		const store = open(dir);
+		// The seeded row survives and reads the default revision.
+		const seeded = store.getTask("seed1") as Task;
+		expect(seeded.title).toBe("seeded");
+		expect(seeded.revision).toBe(1);
+		// The first write moves the revision.
+		const result = store.updateTaskIfCurrent("seed1", { prompt: "edited" }, 1);
+		expect(result.ok).toBe(true);
+		expect(result.task.revision).toBe(2);
+		// No duplicate column on the next open: convergence is done.
+		store.close();
+		const reopened = open(dir);
+		expect((reopened.getTask("seed1") as Task).revision).toBe(2);
+		reopened.close();
 	});
 });
 
@@ -297,7 +433,7 @@ describe("deriveTitle", () => {
 		const task = store.createTask("# Goal\nfirst title");
 		expect(task.title).toBe("first title");
 		const edited = store.editTask(task.id, "# Goal\nsecond title");
-		expect(edited.title).toBe("second title");
+		expect(edited.task.title).toBe("second title");
 		store.close();
 	});
 });

@@ -104,6 +104,7 @@ import {
 	clamp,
 	confirmDialog,
 	copyText,
+	EditConflict,
 	Help,
 	Icon,
 	type IconName,
@@ -118,6 +119,7 @@ import {
 	ProjectLogo,
 	ProjectTag,
 	post,
+	postEdit,
 	projectLabel,
 	repoSlug,
 	Skeleton,
@@ -459,6 +461,8 @@ function ComposerActions({
 	setModel,
 	modelQuery,
 	setModelQuery,
+	onModelMenuOpen,
+	modelConflict,
 	secondary,
 	primary,
 	attachIcon,
@@ -469,6 +473,9 @@ function ComposerActions({
 	setModel: (m: string) => void;
 	modelQuery: string;
 	setModelQuery: (q: string) => void;
+	/** Fires when the model menu opens (OTTR-795: the drawer captures the card revision there). */
+	onModelMenuOpen?: () => void;
+	modelConflict?: { current: string | null } | null;
 	secondary?: ReactNode;
 	primary: ReactNode;
 	/** Glyph of the Add image button (the steer composer uses "plus"). */
@@ -482,6 +489,8 @@ function ComposerActions({
 				setModel={setModel}
 				modelQuery={modelQuery}
 				setModelQuery={setModelQuery}
+				onOpen={onModelMenuOpen}
+				conflict={modelConflict}
 			/>
 			<div className="composer-bar">
 				<ImageBrowseButton onAdd={onAddImages} icon={attachIcon} />
@@ -2376,23 +2385,30 @@ function modelLevelAfter(
 	);
 }
 
-/** The shared model picker behind New task and Follow up: a trigger button opening a searchable popover. */
+/** The shared model picker behind New task and Follow up: a trigger button opening a searchable popover.
+ *  Optional `onOpen` fires when the menu opens (OTTR-795: the drawer captures the card revision
+ *  there, so a poll mid-choice cannot hand a stale pick a passing revision) and `conflict` shows
+ *  the notice of a refused pick beside the menu. */
 function ModelField({
 	catalog,
 	model,
 	setModel,
 	modelQuery,
 	setModelQuery,
+	onOpen,
+	conflict,
 }: {
 	catalog: ModelCatalog | null;
 	model: string;
 	setModel: (m: string) => void;
 	modelQuery: string;
 	setModelQuery: (q: string) => void;
+	onOpen?: () => void;
+	conflict?: { current: string | null } | null;
 }) {
 	// One picker per dialog instance; several New task dialogs (one per project) stay mounted at once.
 	// The thinking level opens as a nested menu beside the model menu (like Claude's effort row).
-	const menu = useModelMenu();
+	const menu = useModelMenu(onOpen);
 	// The level menu anchors the Thinking row; a fixed name would collide across dialogs.
 	const levelAnchor = `--model-level-${useId().replace(/[^a-zA-Z0-9]/g, "")}`;
 	const levelPopId = useId();
@@ -2458,6 +2474,13 @@ function ModelField({
 					</ModelMenuTrigger>
 				</label>
 			</div>
+			{conflict != null && (
+				<EditConflictNotice
+					heading="The card changed while you were choosing. Your pick was not applied; pick again to set it on the current card."
+					current={conflict.current}
+					gone="The card runs the default model on the board now."
+				/>
+			)}
 			{/* Sibling, not child: label click-forwarding must not fight the popover's focus. */}
 			<ModelMenuBody
 				menu={menu}
@@ -9025,6 +9048,36 @@ function CardIdLinks({
 	return <>{parts}</>;
 }
 
+/** OTTR-795: a revision-guarded save was refused with 409 — the card changed while the
+ *  editor held it. The notice names that, and shows the board's current version of the
+ *  edited content beside the kept text (the editor still holds the user's draft), so the
+ *  user can compare and re-apply. Polite region: the refusal lands after the user's own
+ *  Save press, never while they type. Reuses the crit and hint text styles (WCAG AA). */
+function EditConflictNotice(p: {
+	heading: string;
+	/** The board's current value of the edited content; null when there is none anymore. */
+	current: string | null;
+	/** Said instead of the current version when it is gone. */
+	gone: string;
+}) {
+	return (
+		<div className="edit-conflict" aria-live="polite">
+			<p className="auth-error">
+				<Mark kind="crit" />
+				<span>{p.heading}</span>
+			</p>
+			{p.current === null ? (
+				<p className="hint">{p.gone}</p>
+			) : (
+				<>
+					<p className="conflict-label">Current version on the board</p>
+					<div className="conflict-current">{p.current}</div>
+				</>
+			)}
+		</div>
+	);
+}
+
 /** The prompt editor form, shared by the panel on a proposal card and the Prompt section on
  * an ordinary unstarted card: same ids and handlers either way, and never both at once. */
 function PromptEditForm({
@@ -9033,12 +9086,15 @@ function PromptEditForm({
 	editValid,
 	editSave,
 	onSave,
+	conflict,
 }: {
 	edit: string;
 	onEdit: (value: string | null) => void;
 	editValid: boolean;
 	editSave: BusyState;
 	onSave: () => void;
+	/** Non-null after a refused save: the board's row, shown beside the kept text. */
+	conflict: TaskView | null;
 }) {
 	return (
 		<form
@@ -9056,6 +9112,13 @@ function PromptEditForm({
 				onChange={(e) => onEdit(e.target.value)}
 				placeholder="Task"
 			/>
+			{conflict !== null && (
+				<EditConflictNotice
+					heading="The card changed while you were editing. Your text is kept; edit and save again to re-apply it."
+					current={conflict.prompt}
+					gone="The board's version is empty now."
+				/>
+			)}
 			<div className="reply-actions">
 				<button type="button" onClick={() => onEdit(null)}>
 					Cancel
@@ -9096,6 +9159,7 @@ function ProposalPanel({
 	editValid,
 	editSave,
 	onSaveEdit,
+	editConflict,
 }: {
 	task: TaskView;
 	selfProject: string;
@@ -9110,6 +9174,7 @@ function ProposalPanel({
 	editValid: boolean;
 	editSave: BusyState;
 	onSaveEdit: () => void;
+	editConflict: TaskView | null;
 }) {
 	// Older proposals and partial fixtures carry no summary: undefined reads as the fallback.
 	const s = task.proposalSummary ?? null;
@@ -9187,6 +9252,7 @@ function ProposalPanel({
 					editValid={editValid}
 					editSave={editSave}
 					onSave={onSaveEdit}
+					conflict={editConflict}
 				/>
 			) : (
 				<details className="decide-prompt">
@@ -9800,6 +9866,8 @@ function ReleaseNotesEditor(p: {
 	valid: boolean;
 	save: ReturnType<typeof useBusy>;
 	submit: (mode: "save" | "append") => void;
+	/** Non-null after a refused save: the board's row, shown beside the kept text. */
+	conflict: TaskView | null;
 }) {
 	return (
 		<section className="dsec">
@@ -9819,6 +9887,13 @@ function ReleaseNotesEditor(p: {
 					onChange={(e) => p.setValue(e.target.value)}
 					placeholder="Replacement notes — or text appended below the current notes."
 				/>
+				{p.conflict !== null && (
+					<EditConflictNotice
+						heading="The card changed while you were editing. Your text is kept; edit and save again to re-apply it."
+						current={p.conflict.releaseNotes || null}
+						gone="The board's notes are empty now."
+					/>
+				)}
 				<div className="reply-actions">
 					<button
 						type="button"
@@ -9858,19 +9933,23 @@ function DrawerNotes(p: {
 	task: TaskView;
 	notesEdit: string | null;
 	setNotesEdit: (v: string | null) => void;
+	openNotes: () => void;
 	notesValid: boolean;
 	notesEditable: boolean;
 	notesSubmit: (mode: "save" | "append") => void;
 	notesSave: ReturnType<typeof useBusy>;
+	notesConflict: TaskView | null;
 }) {
 	const {
 		task,
 		notesEdit,
 		setNotesEdit,
+		openNotes,
 		notesValid,
 		notesEditable,
 		notesSubmit,
 		notesSave,
+		notesConflict,
 	} = p;
 	return (
 		<>
@@ -9887,7 +9966,7 @@ function DrawerNotes(p: {
 									className="ghost"
 									title="Edit release notes"
 									aria-label="Edit release notes"
-									onClick={() => setNotesEdit("")}
+									onClick={openNotes}
 								>
 									<Icon name="edit" />
 									Edit
@@ -9910,6 +9989,7 @@ function DrawerNotes(p: {
 						valid={notesValid}
 						save={notesSave}
 						submit={notesSubmit}
+						conflict={notesConflict}
 					/>
 				))}
 		</>
@@ -9923,9 +10003,11 @@ function DrawerPrompts(p: {
 	task: TaskView;
 	edit: string | null;
 	setEdit: (v: string | null) => void;
+	openEdit: () => void;
 	editValid: boolean;
 	editSave: ReturnType<typeof useBusy>;
 	editSubmit: () => void;
+	editConflict: TaskView | null;
 	inputUrls: string[];
 	imgUrl: (name: string) => string;
 	setViewing: React.Dispatch<
@@ -9942,9 +10024,11 @@ function DrawerPrompts(p: {
 		task,
 		edit,
 		setEdit,
+		openEdit,
 		editValid,
 		editSave,
 		editSubmit,
+		editConflict,
 		inputUrls,
 		imgUrl,
 		setViewing,
@@ -9963,7 +10047,7 @@ function DrawerPrompts(p: {
 				<DrawerSec id="drawer-prompt" label="Prompt">
 					<div className="task-prompt">
 						<Markdown text={task.prompt} />
-						<button type="button" onClick={() => setEdit(task.prompt)}>
+						<button type="button" onClick={openEdit}>
 							<Icon name="edit" />
 							Edit task
 						</button>
@@ -9977,6 +10061,7 @@ function DrawerPrompts(p: {
 					editValid={editValid}
 					editSave={editSave}
 					onSave={editSubmit}
+					conflict={editConflict}
 				/>
 			)}
 			{(task.images.length > 0 || task.pendingImages.length > 0) && (
@@ -10809,18 +10894,22 @@ function QueuedSteer(p: {
 	localPending: { text: string; images: number } | null;
 	steerEdit: string | null;
 	setSteerEdit: (v: string | null) => void;
+	openSteerEdit: (text: string) => void;
 	steerEditSave: ReturnType<typeof useBusy>;
 	saveSteerEdit: (text: string) => Promise<boolean>;
-	cancelSteer: () => Promise<boolean>;
+	cancelSteer: (expectedRevision: number) => Promise<boolean>;
+	steerConflict: { current: string | null; cancel: boolean } | null;
 }) {
 	const {
 		task,
 		localPending,
 		steerEdit,
 		setSteerEdit,
+		openSteerEdit,
 		steerEditSave,
 		saveSteerEdit,
 		cancelSteer,
+		steerConflict,
 	} = p;
 	const text =
 		localPending !== null ? localPending.text : (task.pendingPrompt ?? "");
@@ -10844,7 +10933,9 @@ function QueuedSteer(p: {
 									className="ghost"
 									ariaLabel="Edit the queued steering"
 									run={() => {
-										setSteerEdit(task.pendingPrompt);
+										const pending = task.pendingPrompt;
+										if (pending === null) return Promise.resolve(false);
+										openSteerEdit(pending);
 										return Promise.resolve(true);
 									}}
 								>
@@ -10853,14 +10944,21 @@ function QueuedSteer(p: {
 								<BusyButton
 									className="ghost"
 									ariaLabel="Cancel the queued steering"
-									run={async () =>
-										(await confirmDialog("Discard the queued steering?", {
-											ok: "Discard",
-											danger: true,
-										}))
-											? cancelSteer()
-											: Promise.resolve(true)
-									}
+									run={async () => {
+										// OTTR-795: the discard carries the revision the user decided
+										// on, captured before the confirm waits — a poll during the
+										// dialog must not hand it a passing revision.
+										const expectedRevision = task.revision;
+										return (await confirmDialog(
+											"Discard the queued steering?",
+											{
+												ok: "Discard",
+												danger: true,
+											},
+										))
+											? cancelSteer(expectedRevision)
+											: true;
+									}}
 								>
 									Cancel
 								</BusyButton>
@@ -10902,6 +11000,17 @@ function QueuedSteer(p: {
 					{task.state === "queued" && (
 						<p className="you-msg dim">Sends when an agent slot frees.</p>
 					)}
+					{steerConflict !== null && (
+						<EditConflictNotice
+							heading={
+								steerConflict.cancel
+									? "The card changed while you were confirming. Nothing was discarded; cancel again to discard the current steering."
+									: "The card changed while you were editing. Your text is kept; edit and save again to re-apply it."
+							}
+							current={steerConflict.current}
+							gone="Nothing is queued on the board now."
+						/>
+					)}
 				</div>
 			</div>
 		</li>
@@ -10923,9 +11032,11 @@ function DrawerSteps(p: {
 	localPending: { text: string; images: number } | null;
 	steerEdit: string | null;
 	setSteerEdit: (v: string | null) => void;
+	openSteerEdit: (text: string) => void;
 	steerEditSave: ReturnType<typeof useBusy>;
 	saveSteerEdit: (text: string) => Promise<boolean>;
-	cancelSteer: () => Promise<boolean>;
+	cancelSteer: (expectedRevision: number) => Promise<boolean>;
+	steerConflict: { current: string | null; cancel: boolean } | null;
 	onOpenTask: (id: string) => void;
 }) {
 	const {
@@ -10943,9 +11054,11 @@ function DrawerSteps(p: {
 		localPending,
 		steerEdit,
 		setSteerEdit,
+		openSteerEdit,
 		steerEditSave,
 		saveSteerEdit,
 		cancelSteer,
+		steerConflict,
 		onOpenTask,
 	} = p;
 	return (
@@ -10995,9 +11108,11 @@ function DrawerSteps(p: {
 								localPending={localPending}
 								steerEdit={steerEdit}
 								setSteerEdit={setSteerEdit}
+								openSteerEdit={openSteerEdit}
 								steerEditSave={steerEditSave}
 								saveSteerEdit={saveSteerEdit}
 								cancelSteer={cancelSteer}
+								steerConflict={steerConflict}
 							/>
 						)}
 				</ul>
@@ -11257,6 +11372,8 @@ function ReplyComposer(p: {
 	modelQuery: string;
 	setModelQuery: (v: string) => void;
 	switchModel: (m: string) => void;
+	onModelMenuOpen: () => void;
+	modelConflict: { current: string | null } | null;
 	decisionPrimary: boolean;
 	act: Act;
 	setViewing: React.Dispatch<
@@ -11283,6 +11400,8 @@ function ReplyComposer(p: {
 		modelQuery,
 		setModelQuery,
 		switchModel,
+		onModelMenuOpen,
+		modelConflict,
 		decisionPrimary,
 		act,
 		setViewing,
@@ -11315,6 +11434,8 @@ function ReplyComposer(p: {
 				setModel={switchModel}
 				modelQuery={modelQuery}
 				setModelQuery={setModelQuery}
+				onModelMenuOpen={onModelMenuOpen}
+				modelConflict={modelConflict}
 				secondary={
 					<>
 						{!proposal && (
@@ -11403,6 +11524,8 @@ function SteerComposer(p: {
 	modelQuery: string;
 	setModelQuery: (v: string) => void;
 	switchModel: (m: string) => void;
+	onModelMenuOpen: () => void;
+	modelConflict: { current: string | null } | null;
 	act: Act;
 	setViewing: React.Dispatch<
 		React.SetStateAction<{
@@ -11424,6 +11547,8 @@ function SteerComposer(p: {
 		modelQuery,
 		setModelQuery,
 		switchModel,
+		onModelMenuOpen,
+		modelConflict,
 		act,
 		setViewing,
 	} = p;
@@ -11455,6 +11580,8 @@ function SteerComposer(p: {
 				setModel={switchModel}
 				modelQuery={modelQuery}
 				setModelQuery={setModelQuery}
+				onModelMenuOpen={onModelMenuOpen}
+				modelConflict={modelConflict}
 				secondary={
 					task.state === "running" && (
 						<BusyButton
@@ -11527,6 +11654,8 @@ function DrawerComposer(p: {
 	modelQuery: string;
 	setModelQuery: (v: string) => void;
 	switchModel: (m: string) => void;
+	onModelMenuOpen: () => void;
+	modelConflict: { current: string | null } | null;
 	decisionPrimary: boolean;
 	proposal: boolean;
 	cancelled: boolean;
@@ -11564,6 +11693,8 @@ function DrawerComposer(p: {
 		modelQuery,
 		setModelQuery,
 		switchModel,
+		onModelMenuOpen,
+		modelConflict,
 		setViewing,
 		decisionPrimary,
 		proposal,
@@ -11607,6 +11738,8 @@ function DrawerComposer(p: {
 						modelQuery={modelQuery}
 						setModelQuery={setModelQuery}
 						switchModel={switchModel}
+						onModelMenuOpen={onModelMenuOpen}
+						modelConflict={modelConflict}
 						decisionPrimary={decisionPrimary}
 						act={act}
 						setViewing={setViewing}
@@ -11626,6 +11759,8 @@ function DrawerComposer(p: {
 					modelQuery={modelQuery}
 					setModelQuery={setModelQuery}
 					switchModel={switchModel}
+					onModelMenuOpen={onModelMenuOpen}
+					modelConflict={modelConflict}
 					act={act}
 					setViewing={setViewing}
 				/>
@@ -12640,6 +12775,25 @@ export function Drawer({
 	// Non-null while the release-notes editor is open, for release cards with a mutable state.
 	const [notesEdit, setNotesEdit] = useState<string | null>(null);
 	const notesSave = useBusy();
+	// OTTR-795: the card revision each open editor guards its write with, captured when
+	// the editor loaded the card. The drawer refetches the card while it sits open (the
+	// rowKey poll), so a save must send the captured revision, not the live one — a poll
+	// must never hand a stale edit a passing one. A refused save (409) keeps the editor
+	// and the user's text, stores the 409's current row as the conflict shown beside the
+	// kept text, and re-arms on the row the user just saw, so Save can re-apply it.
+	const [editRevision, setEditRevision] = useState<number | null>(null);
+	const [editConflict, setEditConflict] = useState<TaskView | null>(null);
+	const [notesRevision, setNotesRevision] = useState<number | null>(null);
+	const [notesConflict, setNotesConflict] = useState<TaskView | null>(null);
+	const [steerRevision, setSteerRevision] = useState<number | null>(null);
+	const [steerConflict, setSteerConflict] = useState<{
+		current: string | null;
+		cancel: boolean;
+	} | null>(null);
+	const [modelRevision, setModelRevision] = useState<number | null>(null);
+	const [modelConflict, setModelConflict] = useState<{
+		current: string | null;
+	} | null>(null);
 	// Merge anyway: one modal run at a time; the reason is required, so it starts empty.
 	const [mergeOpen, setMergeOpen] = useState(false);
 	const [mergeReason, setMergeReason] = useState("");
@@ -12741,20 +12895,38 @@ export function Drawer({
 			}, setTriageError),
 		);
 	};
+	/** Opens the notes editor and captures the loaded row's revision for the guarded
+	 *  save: a poll that refreshes the card mid-edit must not hand stale text a pass. */
+	const openNotes = (): void => {
+		setNotesRevision(task.revision);
+		setNotesConflict(null);
+		setNotesEdit("");
+	};
 	const notesSubmit = (mode: "save" | "append"): void => {
 		if (notesEdit === null || !notesValid) return;
 		notesSave.start(() =>
 			act(async () => {
-				await post(
-					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/release-notes`,
-					{
-						notes:
-							mode === "append"
-								? `${task.releaseNotes ?? ""}\n\n${notesEdit}`
-								: notesEdit,
-					},
-				);
-				setNotesEdit(null);
+				try {
+					await postEdit(
+						`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/release-notes`,
+						{
+							notes:
+								mode === "append"
+									? `${task.releaseNotes ?? ""}\n\n${notesEdit}`
+									: notesEdit,
+							revision: notesRevision ?? undefined,
+						},
+					);
+					setNotesEdit(null);
+					setNotesConflict(null);
+					setNotesRevision(null);
+				} catch (e) {
+					if (e instanceof EditConflict) {
+						setNotesConflict(e.task);
+						setNotesRevision(e.task.revision);
+					}
+					throw e;
+				}
 			}),
 		);
 	};
@@ -12773,15 +12945,32 @@ export function Drawer({
 	// once the started turn makes the card uneditable.
 	const editOpen = edit !== null;
 	const editGuardTitle = "Save or cancel the prompt edit first";
+	/** Opens the prompt editor and captures the loaded row's revision for the guarded
+	 *  save: a poll that refreshes the card mid-edit must not hand stale text a pass. */
+	const openEdit = (): void => {
+		setEditRevision(task.revision);
+		setEditConflict(null);
+		setEdit(task.prompt);
+	};
 	const editSubmit = (): void => {
 		if (edit === null || !editValid) return;
 		editSave.start(() =>
 			act(async () => {
-				await post(
-					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`,
-					{ prompt: edit },
-				);
-				setEdit(null);
+				try {
+					await postEdit(
+						`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`,
+						{ prompt: edit, revision: editRevision ?? undefined },
+					);
+					setEdit(null);
+					setEditConflict(null);
+					setEditRevision(null);
+				} catch (e) {
+					if (e instanceof EditConflict) {
+						setEditConflict(e.task);
+						setEditRevision(e.task.revision);
+					}
+					throw e;
+				}
 			}),
 		);
 	};
@@ -12944,30 +13133,77 @@ export function Drawer({
 			return ok;
 		});
 	};
-	/** Withdraws the queued steering before the agent's next turn delivers it. */
-	const cancelSteer = (): Promise<boolean> =>
+	/** Withdraws the queued steering before the agent's next turn delivers it.
+	 *  `expectedRevision` is the row the user decided on, captured before the confirm
+	 *  dialog; a poll during the dialog must not hand the discard a passing revision. */
+	const cancelSteer = (expectedRevision: number): Promise<boolean> =>
 		act(async () => {
-			await post(
-				`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/steer/cancel`,
-				{},
-			);
+			try {
+				await postEdit(
+					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/steer/cancel`,
+					{ revision: expectedRevision },
+				);
+				setSteerConflict(null);
+			} catch (e) {
+				if (e instanceof EditConflict) {
+					setSteerConflict({ current: e.task.pendingPrompt, cancel: true });
+				}
+				throw e;
+			}
 		});
 	/** Saves an edit of the queued steering: replaces its text before the agent's next turn sends it. */
 	const saveSteerEdit = (text: string): Promise<boolean> =>
 		act(async () => {
-			await post(
-				`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/steer/edit`,
-				{ text },
-			);
-			setSteerEdit(null);
+			try {
+				await postEdit(
+					`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/steer/edit`,
+					{ text, revision: steerRevision ?? undefined },
+				);
+				setSteerEdit(null);
+				setSteerConflict(null);
+				setSteerRevision(null);
+			} catch (e) {
+				if (e instanceof EditConflict) {
+					setSteerConflict({ current: e.task.pendingPrompt, cancel: false });
+					setSteerRevision(e.task.revision);
+				}
+				throw e;
+			}
 		});
+	/** Opens the steering editor and captures the loaded row's revision for the guarded
+	 *  save: a poll that refreshes the card mid-edit must not hand stale text a pass. */
+	const openSteerEdit = (text: string): void => {
+		setSteerRevision(task.revision);
+		setSteerConflict(null);
+		setSteerEdit(text);
+	};
 	/** Switches the model the agent's next turn runs with; lands in-between turns like a steer.
 	 *  The picker leads: the picked name shows at once, the POST follows, a failure rolls back. */
 	const modelUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`;
 	const model = useOptimisticValue(task.model ?? "", act);
+	/** OTTR-795: the model menu's open edge captures the loaded row's revision, so a poll
+	 *  between open and pick cannot hand a stale choice a passing one. */
+	const captureModelMenu = (): void => {
+		setModelRevision(task.revision);
+		setModelConflict(null);
+	};
 	const switchModel = (m: string): void => {
 		model.set(m);
-		model.run(() => post(modelUrl, { model: m }));
+		model.run(async () => {
+			try {
+				await postEdit(modelUrl, {
+					model: m,
+					revision: modelRevision ?? undefined,
+				});
+				setModelConflict(null);
+			} catch (e) {
+				if (e instanceof EditConflict) {
+					setModelConflict({ current: e.task.model });
+					setModelRevision(e.task.revision);
+				}
+				throw e;
+			}
+		});
 	};
 	const editSave = useBusy();
 	const steerEditSave = useBusy();
@@ -13032,11 +13268,12 @@ export function Drawer({
 								editGuardTitle={editGuardTitle}
 								edit={edit}
 								onAccept={() => sendReply(".")}
-								onEdit={() => setEdit(task.prompt)}
+								onEdit={openEdit}
 								onEditChange={setEdit}
 								editValid={editValid}
 								editSave={editSave}
 								onSaveEdit={editSubmit}
+								editConflict={editConflict}
 							/>
 						</DrawerSec>
 					)}
@@ -13087,10 +13324,12 @@ export function Drawer({
 						task={task}
 						notesEdit={notesEdit}
 						setNotesEdit={setNotesEdit}
+						openNotes={openNotes}
 						notesValid={notesValid}
 						notesEditable={notesEditable}
 						notesSubmit={notesSubmit}
 						notesSave={notesSave}
+						notesConflict={notesConflict}
 					/>
 					<DrawerPrompts
 						editable={editable}
@@ -13098,9 +13337,11 @@ export function Drawer({
 						task={task}
 						edit={edit}
 						setEdit={setEdit}
+						openEdit={openEdit}
 						editValid={editValid}
 						editSave={editSave}
 						editSubmit={editSubmit}
+						editConflict={editConflict}
 						inputUrls={inputUrls}
 						imgUrl={imgUrl}
 						setViewing={setViewing}
@@ -13144,9 +13385,11 @@ export function Drawer({
 						localPending={localPending}
 						steerEdit={steerEdit}
 						setSteerEdit={setSteerEdit}
+						openSteerEdit={openSteerEdit}
 						steerEditSave={steerEditSave}
 						saveSteerEdit={saveSteerEdit}
 						cancelSteer={cancelSteer}
+						steerConflict={steerConflict}
 						onOpenTask={onOpenTask}
 					/>
 					<DrawerTriage
@@ -13185,6 +13428,8 @@ export function Drawer({
 						modelQuery={modelQuery}
 						setModelQuery={setModelQuery}
 						switchModel={switchModel}
+						onModelMenuOpen={captureModelMenu}
+						modelConflict={modelConflict}
 						decisionPrimary={decisionPrimary}
 						proposal={proposal}
 						cancelled={cancelled}

@@ -8,7 +8,12 @@ import {
 	useState,
 } from "react";
 import { createRoot } from "react-dom/client";
-import type { ProjectView, QuotaLimit, QuotaState } from "../types.ts";
+import type {
+	ProjectView,
+	QuotaLimit,
+	QuotaState,
+	TaskView,
+} from "../types.ts";
 import { latestQuota, liveEvents } from "./socket.ts";
 import { etaLeft } from "./status.ts";
 import { duration, stamp, until } from "./time.ts";
@@ -435,6 +440,39 @@ export async function post<T>(url: string, body: unknown): Promise<T> {
 			body: JSON.stringify(body),
 		}),
 	);
+}
+
+/** A revision-guarded edit was refused with 409: the card changed since the editor
+ *  loaded it. `task` is the board's current row from the response body, shown beside
+ *  the kept text. Message is the server's error string, so the bell line reads the same. */
+export class EditConflict extends Error {
+	readonly task: TaskView;
+	constructor(task: TaskView) {
+		super("card changed since it was loaded");
+		this.task = task;
+	}
+}
+
+/** POST for the revision-guarded card edits (OTTR-795): like `post`, but a 409 body
+ *  carrying the current card throws `EditConflict` so the editor can keep the user's
+ *  text and show the board's version. Every other failure keeps `post`'s error shape. */
+export async function postEdit<T>(url: string, body: unknown): Promise<T> {
+	const res = await fetch(url, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	if (res.status === 409) {
+		let conflict: EditConflict | null = null;
+		try {
+			const data = (await res.json()) as { task?: TaskView };
+			if (data.task !== undefined) conflict = new EditConflict(data.task);
+		} catch {
+			// non-JSON or task-less body: keep the plain error path below
+		}
+		if (conflict !== null) throw conflict;
+	}
+	return unwrap<T>(res);
 }
 
 /** Clipboard write that rejects with a user-ready message; browsers refuse it on insecure origins or without permission. */

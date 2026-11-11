@@ -134,7 +134,8 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   follow_up_of TEXT,
   push_sha TEXT,
   update_ids TEXT NOT NULL DEFAULT '[]',
-  update_merge_approved INTEGER NOT NULL DEFAULT 0
+  update_merge_approved INTEGER NOT NULL DEFAULT 0,
+  revision INTEGER NOT NULL DEFAULT 1
 )`;
 /** The pr_review_runs table DDL, kept separate so the shape migration below reuses the exact shape. */
 const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
@@ -302,6 +303,7 @@ interface TaskRow {
 	starred: number;
 	created_at: number;
 	updated_at: number;
+	revision: number;
 	queued_at: number | null;
 	done_at: number | null;
 	cancelled_at: number | null;
@@ -523,6 +525,7 @@ function toListedTask(
 		mergeHead: r.merge_head,
 		createdAt: r.created_at,
 		updatedAt: r.updated_at,
+		revision: r.revision,
 		queuedAt: r.queued_at,
 		doneAt: r.done_at,
 		cancelledAt: r.cancelled_at,
@@ -760,9 +763,25 @@ function toTurn(r: TurnRow): Turn {
 // Column names for dynamic UPDATEs are this hardcoded whitelist only — values always bind via `?`.
 // Keyed by the patch fields (R4-8): a new Task/Turn field extends TaskPatch/TurnPatch, so a
 // missing column mapping here is a compile error instead of a silently dropped write.
+/** Result of a revision-guarded write: ok carries the written task, a conflict
+ * carries the row as it stands now (the route answers 409 with it). */
+export type RevisionResult =
+	| { ok: true; task: Task }
+	| { ok: false; task: Task };
+
 export type TaskPatch = Partial<
 	// kind stays out of TaskPatch: it is set once by createTask and never patched.
-	Omit<Task, "id" | "project" | "createdAt" | "updatedAt" | "doneAt" | "kind">
+	// revision stays out too: it moves only inside the UPDATE (optimistic-lock counter).
+	Omit<
+		Task,
+		| "id"
+		| "project"
+		| "createdAt"
+		| "updatedAt"
+		| "doneAt"
+		| "kind"
+		| "revision"
+	>
 >;
 export type TurnPatch = Partial<
 	Omit<Turn, "id" | "taskId" | "kind" | "prompt" | "startedAt">
@@ -841,6 +860,9 @@ const TASK_LIST_COLUMNS = [
 	"updated_at",
 	"done_at",
 	"kind",
+	// revision is not in TASK_COLUMNS (never caller-settable), so the board still gets it
+	// on list rows and can send it back with guarded edits.
+	"revision",
 	...Object.values(TASK_COLUMNS).filter((c) => c !== "diff_text"),
 ].join(", ");
 
@@ -1630,6 +1652,17 @@ export class ProjectStore {
 			cols,
 			"update_merge_approved",
 			"ALTER TABLE tasks ADD COLUMN update_merge_approved INTEGER NOT NULL DEFAULT 0",
+		);
+		// OTTR-795 optimistic-locking revision: lives in TASKS_DDL, so its ALTER runs here,
+		// before the CHECK rebuilds, like the shots column. The stale cols list fires the
+		// ALTER once on an old database; a rebuild afterwards recreates the table from
+		// TASKS_DDL, which already carries the column, so no open re-queues the ALTER
+		// (a column living in DDL but migrated after the rebuilds would dupe here instead).
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"revision",
+			"ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
 		);
 		// Backfill runs on every open and is idempotent (only null rows): a process stop
 		// between the ALTER above and the UPDATE converges here on the next open instead
@@ -3142,15 +3175,24 @@ export class ProjectStore {
 	}
 
 	/** Rewrites an unstarted task's prompt; the title re-derives like on create. Clears the
-	 * prompt-edit hold in the same write: the edit finished, so the card may start. */
-	editTask(id: string, prompt: string): Task {
-		return this.updateTask(id, {
-			prompt,
-			title: deriveTitle(prompt),
-			holdUntil: null,
-			holdProvider: null,
-			holdWindow: null,
-		});
+	 * prompt-edit hold in the same write: the edit finished, so the card may start. With
+	 * expectedRevision the write only lands when the row's revision still matches. */
+	editTask(
+		id: string,
+		prompt: string,
+		expectedRevision?: number,
+	): RevisionResult {
+		return this.runTaskUpdate(
+			id,
+			{
+				prompt,
+				title: deriveTitle(prompt),
+				holdUntil: null,
+				holdProvider: null,
+				holdWindow: null,
+			},
+			expectedRevision,
+		);
 	}
 
 	getTask(id: string): Task | null {
@@ -3170,9 +3212,34 @@ export class ProjectStore {
 	}
 
 	updateTask(id: string, patch: TaskPatch): Task {
+		// Unguarded: internal writers (scheduler, turn loop, quota sweep) never fail on a
+		// revision; the write itself still bumps it.
+		return this.runTaskUpdate(id, patch).task;
+	}
+
+	/** Optimistic write for user edits from routes: lands only while the row's revision
+	 * still equals expectedRevision. On a conflict nothing is written and the current
+	 * row comes back for the 409 body. */
+	updateTaskIfCurrent(
+		id: string,
+		patch: TaskPatch,
+		expectedRevision: number,
+	): RevisionResult {
+		return this.runTaskUpdate(id, patch, expectedRevision);
+	}
+
+	/** The one task UPDATE builder: unconditional for internal writers, and with an
+	 * expectedRevision a single atomic `WHERE id = ? AND revision = ?` statement — the
+	 * compare and the write never split, so a concurrent writer's bump (revision + 1 in
+	 * the same UPDATE) makes this one's changes count 0 and nothing is written. */
+	private runTaskUpdate(
+		id: string,
+		patch: TaskPatch,
+		expectedRevision?: number,
+	): RevisionResult {
 		const before = this.getTask(id);
 		if (before === null) throw new Error(`unknown task: ${id}`);
-		const sets: string[] = ["updated_at = ?"];
+		const sets: string[] = ["updated_at = ?", "revision = revision + 1"];
 		const values: (string | number | null)[] = [Date.now()];
 		// Entering Done stamps done_at; it overwrites, so a release card that bounced to needs_you re-lands with a fresh time.
 		if (patch.stage === "done") {
@@ -3187,15 +3254,26 @@ export class ProjectStore {
 			}
 		}
 		values.push(id);
-		this.db.run(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`, values);
-		const task = this.getTask(id);
-		if (!task) throw new Error(`unknown task: ${id}`);
-		// Every stage/state write funnels through here, so this is the one place transitions get recorded.
+		const { changes } =
+			expectedRevision === undefined
+				? this.db.run(
+						`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`,
+						values,
+					)
+				: this.db.run(
+						`UPDATE tasks SET ${sets.join(", ")} WHERE id = ? AND revision = ?`,
+						[...values, expectedRevision],
+					);
+		// Guarded and stale: changes 0 means another writer moved the revision first.
+		if (expectedRevision !== undefined && changes === 0)
+			return { ok: false, task: this.getTask(id) as Task };
+		const task = this.getTask(id) as Task;
+		// Every stage/state write funnels through here, so this is the one place transitions get recorded — on success only.
 		if (patch.stage !== undefined && patch.stage !== before.stage)
 			this.recordEvent("stage", id, before.stage, patch.stage, null);
 		if (patch.state !== undefined && patch.state !== before.state)
 			this.recordEvent("state", id, before.state, patch.state, null);
-		return task;
+		return { ok: true, task };
 	}
 
 	queueIds(): string[] {

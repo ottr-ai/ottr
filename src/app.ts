@@ -283,7 +283,7 @@ import {
 } from "./scheduler.ts";
 import type { SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
-import { type BoardTurnFacts, ProjectStore } from "./store.ts";
+import { type BoardTurnFacts, ProjectStore, type TaskPatch } from "./store.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
 	createSystemSampler,
@@ -4193,6 +4193,17 @@ export function createApp(deps: AppDeps) {
 		return { body: parsed as Record<string, unknown> };
 	}
 
+	/** Body of a POST whose JSON body is optional: {} when no JSON body arrives, so
+	 * body-less callers (the extension's steer cancel) keep today's behavior. */
+	async function readOptionalJson(
+		req: Request,
+	): Promise<Record<string, unknown>> {
+		if (!(req.headers.get("content-type") ?? "").startsWith("application/json"))
+			return {};
+		const r = await readJson(req);
+		return "error" in r ? {} : r.body;
+	}
+
 	function projectView(e: Entry): ProjectView {
 		const file = iconFile(e.store.tasksDir);
 		const icon = file
@@ -4587,6 +4598,34 @@ export function createApp(deps: AppDeps) {
 			seedFailed: seedFailedView(),
 			updateCycle: cycle,
 		};
+	}
+
+	/** Applies a user card edit guarded by the revision the client loaded. */
+	function applyUserEdit(
+		e: Entry,
+		task: Task,
+		patch: TaskPatch,
+		body: Record<string, unknown>,
+	): Response | Task {
+		const revision = body.revision;
+		// Absent keeps today's behavior: extension and API-key clients do not send it.
+		if (revision === undefined) return e.store.updateTask(task.id, patch);
+		if (
+			typeof revision !== "number" ||
+			!Number.isInteger(revision) ||
+			revision < 1
+		)
+			return json({ error: "revision must be a positive integer" }, 400);
+		const res = e.store.updateTaskIfCurrent(task.id, patch, revision);
+		if (!res.ok)
+			return json(
+				{
+					error: "card changed since it was loaded",
+					task: taskView(e, res.task),
+				},
+				409,
+			);
+		return res.task;
 	}
 
 	/** One task with its turns for the drawer; turns ship without the prompt text and the raw
@@ -6532,7 +6571,9 @@ export function createApp(deps: AppDeps) {
 		// card has no live run: the pick pre-stages the model its reply turn spawns with.
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
-		return json(taskView(e, e.store.updateTask(task.id, { model })));
+		const res = applyUserEdit(e, task, { model }, r.body);
+		if (res instanceof Response) return res;
+		return json(taskView(e, res));
 	}
 
 	async function handlePOSTProjectsTasksSteerEditByProjectAndId(
@@ -6561,11 +6602,17 @@ export function createApp(deps: AppDeps) {
 		// turn in between: the queued text never changes after the pre-edit read.
 		// Queued images stay; this edits the words. A human rewrote the text, so it is
 		// no longer the supervisor's park even when the queue carried one.
-		const t = e.store.updateTask(task.id, {
-			pendingPrompt: text.trim(),
-			pendingBy: "user",
-		});
-		return json(taskView(e, t));
+		const res = applyUserEdit(
+			e,
+			task,
+			{
+				pendingPrompt: text.trim(),
+				pendingBy: "user",
+			},
+			r.body,
+		);
+		if (res instanceof Response) return res;
+		return json(taskView(e, res));
 	}
 
 	async function handlePOSTProjectsTasksSteerCancelByProjectAndId(
@@ -6590,19 +6637,25 @@ export function createApp(deps: AppDeps) {
 		// card, or runTurn would re-send the whole task prompt as a fresh turn.
 		const queuedOnlyForTheSteer =
 			task.state === "queued" && task.stage !== "todo";
-		const t = e.store.updateTask(task.id, {
-			pendingPrompt: null,
-			pendingBy: null,
-			pendingImages: [],
-			...(queuedOnlyForTheSteer
-				? {
-						state: "needs_you",
-						needsReason:
-							"Steering canceled before the agent saw it. Reply to continue, or cancel the card.",
-					}
-				: {}),
-		});
-		return json(taskView(e, t));
+		const res = applyUserEdit(
+			e,
+			task,
+			{
+				pendingPrompt: null,
+				pendingBy: null,
+				pendingImages: [],
+				...(queuedOnlyForTheSteer
+					? {
+							state: "needs_you",
+							needsReason:
+								"Steering canceled before the agent saw it. Reply to continue, or cancel the card.",
+						}
+					: {}),
+			},
+			await readOptionalJson(req),
+		);
+		if (res instanceof Response) return res;
+		return json(taskView(e, res));
 	}
 
 	async function handleGETProjectsTasksLogByProjectAndId(
@@ -7994,9 +8047,9 @@ export function createApp(deps: AppDeps) {
 		const trimmed = r.body.notes.trim();
 		if (!trimmed || trimmed.length > 20000)
 			return json({ error: "notes must be 1-20000 characters" }, 400);
-		return json(
-			taskView(e, e.store.updateTask(task.id, { releaseNotes: r.body.notes })),
-		);
+		const res = applyUserEdit(e, task, { releaseNotes: r.body.notes }, r.body);
+		if (res instanceof Response) return res;
+		return json(taskView(e, res));
 	}
 
 	/** Posts the review as the GitHub App through an installation token; null when no app or no installation, so the board token path runs. */
@@ -9137,8 +9190,25 @@ export function createApp(deps: AppDeps) {
 		const { e, task } = found;
 		const edit = editPromptRefusal(e, task, r.body.prompt);
 		if (edit instanceof Response) return edit;
-		const t = e.store.editTask(task.id, edit.trimmed);
-		return json(taskView(e, t));
+		// Same shape rule as applyUserEdit: an absent revision keeps today's behavior.
+		const revision = r.body.revision;
+		if (
+			revision !== undefined &&
+			(typeof revision !== "number" ||
+				!Number.isInteger(revision) ||
+				revision < 1)
+		)
+			return json({ error: "revision must be a positive integer" }, 400);
+		const t = e.store.editTask(task.id, edit.trimmed, revision);
+		if (!t.ok)
+			return json(
+				{
+					error: "card changed since it was loaded",
+					task: taskView(e, t.task),
+				},
+				409,
+			);
+		return json(taskView(e, t.task));
 	}
 
 	/** Fills the release card's late-commit list: the commits the publish ships past the reviewed commit, with the review's finding merges marked. */
