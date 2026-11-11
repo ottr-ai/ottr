@@ -2488,11 +2488,13 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		githubTokenSet,
 	});
 
-	const offerShown = (container: HTMLDivElement, host: string): boolean =>
-		Array.from(container.querySelectorAll("#host-tokens-block button")).some(
-			(b) =>
-				b.textContent?.startsWith(`Use the board GitHub token for ${host}`),
+	/** The offer block shows and its text carries `host`: the offer targets that one host. */
+	const offerShown = (container: HTMLDivElement, host: string): boolean => {
+		const block = container.querySelector(
+			"#host-tokens-block .board-token-offer",
 		);
+		return block !== null && (block.textContent?.includes(host) ?? false);
+	};
 
 	test("the offer shows only while the configured host has no stored token", async () => {
 		const cases: {
@@ -2540,6 +2542,15 @@ describe("GitHostsSection board GitHub token reuse", () => {
 		try {
 			expect(offerShown(container, "git.acme.ghe.com")).toBe(true);
 			expect(offerShown(container, "github.com")).toBe(false);
+			// The button's label stays free of the host: a 63-label *.ghe.com host
+			// in the label cannot wrap and clipped the control off the 320px card.
+			// The hint above the button carries the host instead.
+			const button = container.querySelector(
+				"#host-tokens-block .board-token-offer .alate-def-actions button",
+			);
+			expect(button?.textContent?.trim()).toBe(
+				"Store the board token for this host",
+			);
 		} finally {
 			await unmount();
 		}

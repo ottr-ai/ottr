@@ -2990,7 +2990,7 @@ export function GitHostsSection() {
 									{offerBusy.busy && (
 										<span className="spinner" aria-hidden="true" />
 									)}
-									Use the board GitHub token for {state.githubHost}
+									Store the board token for this host
 								</button>
 							</div>
 						</form>
