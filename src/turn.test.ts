@@ -109,7 +109,6 @@ import {
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
-	diffText as realDiffText,
 	fetchOriginBranch as realFetchOriginBranch,
 	fetchPrHead as realFetchPrHead,
 	prIntegrated as realPrIntegrated,
@@ -21247,8 +21246,8 @@ describe("turn PR-mode merge settle", () => {
 					realTargetContains(main, sha, tip),
 				treesEqual: (_m: string, a: string, b: string) =>
 					realTreesEqual(main, a, b),
-				diffText: (_m: string, a: string, b: string) =>
-					realDiffText(main, a, b),
+				patchText: (_m: string, a: string, b: string) =>
+					realPatchText(main, a, b),
 				pushBranch: async (_m: string, branch: string, _o: string) =>
 					pushBranchReal(main, branch, bare),
 				fetchPrHead: async (_m: string, n: number, _url: string) =>
@@ -21310,6 +21309,119 @@ describe("turn PR-mode merge settle", () => {
 		}
 	});
 
+	test("a fixless rebased bump adopts on real git, in the card checkout (OTTR-809)", async () => {
+		// Real git end to end: the target advances, the card branch cherry-picks the
+		// bump onto it and holds NOTHING else. The tree differs from the bot head and
+		// the ancestor check fails, but the patch compare — run in the card checkout,
+		// a real linked worktree — proves the carried work is exactly the bump, and
+		// the card adopts the open Dependabot PR instead of opening a second one.
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+		const dir = mkdtempSync(join(tmpdir(), "ottr-809-fixless-"));
+		const bare = join(dir, "origin.git");
+		const main = join(dir, "main");
+		const wt = join(dir, "wt");
+		try {
+			run(dir, "init", "-q", "--bare", "-b", "main", bare);
+			run(dir, "clone", "-q", bare, main);
+			writeFileSync(join(main, "pkg.json"), '{"v":1}\n');
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "base");
+			run(main, "push", "-q", "origin", "main");
+			run(main, "switch", "-q", "-c", "dep");
+			writeFileSync(join(main, "pkg.json"), '{"v":2}\n');
+			run(main, ...id, "commit", "-am", "bump vite from 5 to 7");
+			const botHead = run(main, "rev-parse", "HEAD");
+			run(main, "push", "-q", "origin", `${botHead}:refs/pull/30/head`);
+			// The bump objects must exist before the card checkout cherry-picks them.
+			run(main, "fetch", "-q", "origin", `+refs/pull/30/head:refs/ottr/pr/30`);
+			run(main, "switch", "-q", "main");
+			writeFileSync(join(main, "other.txt"), "advance\n");
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "advance");
+			// The advance is on origin: the merge prompt rebases onto origin/<target>,
+			// so the target tip the ship reads is the advanced commit.
+			run(main, "push", "-q", "origin", "main");
+			// The card checkout: a linked worktree on the card branch, carrying the
+			// cherry-picked bump and nothing else.
+			run(main, "worktree", "add", "-q", "-b", "ott/m", wt, "main");
+			run(wt, ...id, "cherry-pick", botHead);
+
+			const opens: unknown[] = [];
+			const pushes: unknown[][] = [];
+			const comments: unknown[] = [];
+			const { store, loop, task } = prMergeSetup({
+				targetSha: async (_m: string, ref: string) => {
+					const r = Bun.spawnSync(
+						["git", "rev-parse", "--verify", "--quiet", ref],
+						{ cwd: main },
+					);
+					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+				},
+				targetContains: (_m: string, sha: string, tip: string) =>
+					realTargetContains(main, sha, tip),
+				treesEqual: (_m: string, a: string, b: string) =>
+					realTreesEqual(main, a, b),
+				patchText: (wtPath: string, a: string, b: string) =>
+					realPatchText(wtPath, a, b),
+				pushBranch: async (...args: unknown[]) => {
+					pushes.push(args);
+					return { status: "pushed" as const, output: "" };
+				},
+				fetchPrHead: async (_m: string, n: number, _url: string) =>
+					realFetchPrHead(main, n, bare),
+				openPr: async (o) => {
+					opens.push(o);
+					return {
+						ok: true as const,
+						pr: { number: 34, url: "https://github.com/acme/repo/pull/34" },
+					};
+				},
+				prComment: async (o) => {
+					comments.push(o);
+					return { ok: true as const };
+				},
+			});
+			store.setSettings({ prMode: true, originUrl: bare });
+			store.updateTask(task.id, {
+				// The card checkout the diff check reads.
+				worktree: wt,
+				sourcePrNumber: 30,
+				sourcePrUrl: "https://github.com/acme/repo/pull/30",
+				sourcePrHeadSha: botHead,
+				sourcePrHeadRef: "dep",
+				sourcePrCrossRepo: false,
+				sourcePrDependabot: true,
+			});
+			await loop.runTurn(store.name, task.id);
+			const after = store.getTask(task.id)!;
+			expect(after.stage).toBe("merging");
+			expect(after.state).toBe("idle");
+			// The patch compare adopted the source PR: no second PR, no push, no
+			// comment, and the follow-up fields stay null.
+			expect(after.prNumber).toBe(30);
+			expect(after.prHeadSha).toBe(botHead);
+			expect(after.followUpPrNumber).toBe(null);
+			expect(opens).toEqual([]);
+			expect(pushes).toEqual([]);
+			expect(comments).toEqual([]);
+			expect(logText(store, task.id)).toContain(
+				"- source PR #30 stays the card's PR",
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
 	test("a clean cherry-picked bump with an unrelated target advance adopts (OTTR-809)", async () => {
 		// The target advanced (an unrelated file), so the cherry-picked bump differs
 		// from the bot head — but the card's diff against the target equals the bump,
@@ -21329,7 +21441,7 @@ describe("turn PR-mode merge settle", () => {
 								: "sha-old",
 			treesEqual: async () => false,
 			targetContains: async () => false,
-			diffText: async (_m: string, a: string, b: string) =>
+			patchText: async (_m: string, a: string, b: string) =>
 				(a === "pr-head-parent" && b === "pr-head") ||
 				(a === "target-tip" && b === "sha-cherry")
 					? BUMP
@@ -21371,7 +21483,7 @@ describe("turn PR-mode merge settle", () => {
 								: "sha-old",
 			treesEqual: async () => false,
 			targetContains: async () => false,
-			diffText: async (_m: string, a: string, b: string) =>
+			patchText: async (_m: string, a: string, b: string) =>
 				a === "pr-head-parent" && b === "pr-head" ? BUMP : `${BUMP}\n+fix`,
 			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
 			openPr: async (o) => {

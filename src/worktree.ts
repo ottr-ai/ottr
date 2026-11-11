@@ -2668,6 +2668,22 @@ export async function diffStat(
 	return files;
 }
 
+/** The two-dot patch between two commits (`git diff <from> <to>`), or null on failure.
+ * Pure commit-tree diff: unlike diffText it reads no HEAD and no worktree state, so the
+ * result cannot move with whatever the checkout holds. OTTR-809's fix detection compares
+ * the source PR's bump with the card branch's carried work through it. */
+export async function patchText(
+	mainPath: string,
+	from: string,
+	to: string,
+): Promise<string | null> {
+	const r = await git(
+		["diff", "--ignore-submodules=dirty", from, to],
+		mainPath,
+	);
+	return r.code === 0 ? r.stdout : null;
+}
+
 /** The branch's unified diff (same base as diffStat), or null when git fails. */
 export async function diffText(
 	worktreePath: string,

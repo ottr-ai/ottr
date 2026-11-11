@@ -238,10 +238,12 @@ step checks the source before it ever opens a PR:
   rebased branch that no longer descends from the head, and a legacy card
   without the head name, base on the target branch instead — the PR carries
   the rebased work, and once the bump merges the diff reduces to the fixes.
-  A branch whose diff against the target equals the source PR's own diff
-  holds no fixes (an unrelated target advance under a clean cherry-pick) and
-  adopts the source PR instead of opening a second one; git trouble reads as
-  fixes and ships. One comment on the source PR links the follow-up. The
+  A branch whose patch against the target tip equals the source PR's own
+  patch holds no fixes (an unrelated target advance under a clean
+  cherry-pick) and adopts the source PR instead of opening a second one; the
+  compare reads the two commit trees' patches directly (no HEAD, no worktree
+  state) and runs in the card checkout, and git trouble reads as fixes and
+  ships. One comment on the source PR links the follow-up. The
   card stores the follow-up in `follow_up_pr_number`/`follow_up_pr_url`
   (additive columns migrated like the PR fields above) and waits in
   `merging`/`idle` until both PRs merge; a re-ship adopts the open
