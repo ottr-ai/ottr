@@ -1,7 +1,7 @@
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
 import { isIP, type LookupFunction } from "node:net";
-import type { JiraIssue } from "./jiraCards.ts";
+import type { JiraComment, JiraIssue, JiraLink } from "./jiraCards.ts";
 import { adfToMarkdown, fieldText, wikiToMarkdown } from "./jiraMarkup.ts";
 import type { JiraType } from "./types.ts";
 
@@ -479,6 +479,8 @@ function toIssue(raw: unknown, c: JiraConn): JiraIssue | null {
 		custom: c.customFields
 			.map((id) => ({ id, text: fieldText(f[id]) }))
 			.filter((x) => x.text.trim() !== ""),
+		comments: [],
+		links: [],
 	};
 }
 
@@ -540,4 +542,81 @@ export async function searchIssues(
 	const next =
 		total !== null && raw.length > 0 && end < total ? String(end) : null;
 	return { issues: map(raw), next, total };
+}
+
+/** One comment as author, date and Markdown body; null when nothing survives. */
+function toComment(type: JiraType, raw: unknown): JiraComment | null {
+	const m = obj(raw);
+	const body =
+		m.body == null
+			? ""
+			: type === "cloud"
+				? adfToMarkdown(m.body)
+				: wikiToMarkdown(str(m.body));
+	const author = str(obj(m.author).displayName);
+	const date = str(m.created);
+	if (body === "" && author === "" && date === "") return null;
+	return { author: author || "(unknown)", date, body };
+}
+
+/**
+ * The last `count` comments of one issue, oldest first. Jira's comment list is oldest
+ * first, so the last page is `startAt: total - count`; a second call runs only when the
+ * ticket has more comments than the cap. No order parameter: not every deployment has it.
+ */
+export async function lastComments(
+	c: JiraConn,
+	key: string,
+	count: number,
+	net: JiraNet,
+): Promise<JiraComment[]> {
+	const v = c.type === "cloud" ? 3 : 2;
+	const path = (startAt: number): string =>
+		`/rest/api/${v}/issue/${key}/comment?maxResults=${count}&startAt=${startAt}`;
+	const first = obj(await request(c.site, c, "GET", path(0), net));
+	const total = typeof first.total === "number" ? first.total : 0;
+	const page =
+		total <= count
+			? first
+			: obj(await request(c.site, c, "GET", path(total - count), net));
+	const raw = Array.isArray(page.comments) ? page.comments : [];
+	return raw.map((r) => toComment(c.type, r)).filter((m) => m !== null);
+}
+
+/** One issue link as type verb, other key, summary and status; null without a key. */
+function toLink(raw: unknown): JiraLink | null {
+	const l = obj(raw);
+	const type = obj(l.type);
+	const outward = l.outwardIssue !== undefined;
+	const end = obj(outward ? l.outwardIssue : l.inwardIssue);
+	const key = str(end.key);
+	if (key === "") return null;
+	const verb = str(outward ? type.outward : type.inward) || str(type.name);
+	const f = obj(end.fields);
+	return {
+		type: verb,
+		key,
+		summary: str(f.summary),
+		status: str(obj(f.status).name),
+	};
+}
+
+/** The issue links of one issue, in Jira's order. */
+export async function issueLinks(
+	c: JiraConn,
+	key: string,
+	net: JiraNet,
+): Promise<JiraLink[]> {
+	const v = c.type === "cloud" ? 3 : 2;
+	const body = obj(
+		await request(
+			c.site,
+			c,
+			"GET",
+			`/rest/api/${v}/issue/${key}?fields=issuelinks`,
+			net,
+		),
+	);
+	const raw = Array.isArray(body.issuelinks) ? body.issuelinks : [];
+	return raw.map(toLink).filter((l) => l !== null);
 }

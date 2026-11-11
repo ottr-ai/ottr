@@ -5,14 +5,21 @@ import type { GlobalStore } from "./globalStore.ts";
 import {
 	assertAllowedHost,
 	detectType,
+	issueLinks,
 	type JiraConn,
 	JiraError,
 	type JiraNet,
+	lastComments,
 	normalizeSiteUrl,
 	searchIssues,
 	testConnection,
 } from "./jira.ts";
-import { type JiraIssue, jiraCardPrompt, jiraCardTitle } from "./jiraCards.ts";
+import {
+	COMMENT_COUNT,
+	type JiraIssue,
+	jiraCardPrompt,
+	jiraCardTitle,
+} from "./jiraCards.ts";
 import type { SecretBox } from "./secretBox.ts";
 import type { ProjectStore } from "./store.ts";
 import type {
@@ -404,6 +411,21 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 			jiraFailure(project, err),
 		);
 		if (issues instanceof Response) return issues;
+		// The last comments and the issue links are read per ticket; a failing call fails
+		// the import with Jira's message, like any other Jira call.
+		try {
+			for (const issue of issues.values()) {
+				issue.comments = await lastComments(
+					p.conn,
+					issue.key,
+					COMMENT_COUNT,
+					d.net,
+				);
+				issue.links = await issueLinks(p.conn, issue.key, d.net);
+			}
+		} catch (err) {
+			return jiraFailure(project, err);
+		}
 		const missing = keys.filter((k) => !issues.has(k));
 		const items = keys.flatMap((k) => {
 			const issue = issues.get(k);

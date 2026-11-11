@@ -252,6 +252,8 @@ describe("searchIssues: Data Center", () => {
 					{ id: "customfield_2", text: "two" },
 					{ id: "customfield_1", text: "one" },
 				],
+				comments: [],
+				links: [],
 			},
 		]);
 	});

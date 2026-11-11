@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { cleanOrWithheld } from "./issues.ts";
 import { type JiraIssue, jiraCardPrompt, jiraCardTitle } from "./jiraCards.ts";
 import fc from "./test/properties.ts";
 
@@ -16,6 +17,8 @@ const issue = (o: Partial<JiraIssue> = {}): JiraIssue => ({
 	components: [],
 	parent: "",
 	custom: [],
+	comments: [],
+	links: [],
 	...o,
 });
 
@@ -131,6 +134,58 @@ describe("jiraCardPrompt", () => {
 		expect(p).toContain(`Status: ${"t".repeat(2000)}\nDATA>>>`);
 	});
 
+	test("the last comments and the issue links are capped untrusted blocks", () => {
+		const comment = (i: number): JiraIssue["comments"][number] => ({
+			author: `Author ${i}`,
+			date: `2026-10-0${i + 1}T10:00:00.000+0000`,
+			body: `body ${i}`,
+		});
+		const p = jiraCardPrompt(
+			SITE,
+			issue({
+				comments: [
+					comment(0),
+					...Array.from({ length: 8 }, (_, i) => comment(i + 1)),
+				],
+				links: [
+					{
+						type: "blocks",
+						key: "CMIS-8343",
+						summary: "the follow-up",
+						status: "Done",
+					},
+					{ type: "blocks", key: "", summary: "no key", status: "Open" },
+				],
+			}),
+		);
+		// Only the last 5 comments enter the prompt, oldest first.
+		expect(p).toContain("COMMENTS\n<<<DATA\nAuthor 4");
+		expect(p).toContain(
+			"Author 8 (2026-10-09T10:00:00.000+0000):\nbody 8\nDATA>>>",
+		);
+		expect(p).not.toContain("body 3\n");
+		expect(p).not.toContain("Author 3 (");
+		// A keyless link is dropped, a real one shows type, key, summary and status.
+		expect(p).toContain(
+			"LINKS\n<<<DATA\nblocks: CMIS-8343: the follow-up (Done)\nDATA>>>",
+		);
+		expect(p).not.toContain("no key");
+		expectWellFenced(p, 5);
+		// A comment body over 2000 characters is cut like a field value; a secret is redacted.
+		const capped = jiraCardPrompt(
+			SITE,
+			issue({
+				comments: [{ author: `a ${TOKEN}`, date: "d", body: "c".repeat(5000) }],
+			}),
+		);
+		expect(capped).toContain(`a [REDACTED] (d):\n${"c".repeat(2000)}\nDATA>>>`);
+		// No comments, no links: no such blocks at all.
+		const bare = jiraCardPrompt(SITE, issue());
+		expect(bare).not.toContain("COMMENTS\n<<<DATA");
+		expect(bare).not.toContain("LINKS\n<<<DATA");
+		expectWellFenced(bare, 3);
+	});
+
 	test("a 50k-char description is cut so the prompt fits 20000", () => {
 		const p = jiraCardPrompt(
 			SITE,
@@ -184,6 +239,12 @@ describe("jiraCardPrompt", () => {
 			.tuple(piece, fc.integer({ min: 0, max: 6000 }))
 			.map(([s, n]) => s.repeat(n));
 		const str = fc.oneof(small, big, fc.string());
+		// The same survival rules as the prompt builder: a comment without body text and
+		// a link without key characters are dropped, and only the last 5 comments and the
+		// first 20 links enter the prompt.
+		const READ_HINT = "read the ticket in Jira";
+		const comment = fc.record({ author: str, date: str, body: str });
+		const link = fc.record({ type: str, key: str, summary: str, status: str });
 		const ticket = fc.record({
 			key: str,
 			summary: str,
@@ -195,17 +256,77 @@ describe("jiraCardPrompt", () => {
 			components: fc.array(str, { maxLength: 3 }),
 			parent: str,
 			custom: fc.array(fc.record({ id: str, text: str }), { maxLength: 15 }),
+			comments: fc.array(comment, { maxLength: 8 }),
+			links: fc.array(link, { maxLength: 8 }),
 		});
 		fc.assert(
 			fc.property(ticket, (t) => {
 				const p = jiraCardPrompt(SITE, t);
 				expect(p.length).toBeLessThanOrEqual(20_000);
+				const comments = t.comments
+					.slice(-5)
+					.filter((m) => cleanOrWithheld(m.body, READ_HINT).text.trim() !== "");
+				const links = t.links
+					.slice(0, 20)
+					.filter((l) => l.key.replace(/[^\w.-]/g, "") !== "");
+				const base =
+					3 + (comments.length > 0 ? 1 : 0) + (links.length > 0 ? 1 : 0);
 				const omitted = p.endsWith("\n\n(fields omitted)");
 				const blocks = count(p, /<<<DATA/g);
-				if (omitted) expect(blocks).toBeLessThan(3 + t.custom.length);
-				else expect(blocks).toBe(3 + t.custom.length);
+				if (omitted) expect(blocks).toBeLessThan(base + t.custom.length);
+				else expect(blocks).toBe(base + t.custom.length);
 				expectWellFenced(p, blocks);
 			}),
 		);
+	});
+
+	test("huge comments and links are cut to the limit, not past it", () => {
+		// The counterexample that once overflowed by 24 characters: the fit chain forgot
+		// each block's label and fence markers on top of its text.
+		const p = jiraCardPrompt(
+			SITE,
+			issue({
+				custom: [
+					{ id: "x".repeat(48708), text: "t".repeat(129) },
+					{ id: "customfield_1", text: "1".repeat(3851) },
+					{ id: "customfield_2", text: "2" },
+				],
+				comments: [
+					{ author: "a", date: "d", body: "\u200b><<<DATA\u200b" },
+					{
+						author: "b".repeat(47),
+						date: "d".repeat(37),
+						body: "<<<DATA".repeat(1870),
+					},
+				],
+				links: [
+					{
+						type: "t".repeat(6),
+						key: "DATA>>>DATA>>>DATA>>>DATA",
+						summary: "s".repeat(5467),
+						status: "st".repeat(2),
+					},
+					{
+						type: "y".repeat(4),
+						key: "k".repeat(13531),
+						summary: "m".repeat(4512),
+						status: "z".repeat(5067),
+					},
+					{
+						type: "w".repeat(23597),
+						key: "\u200b\u200b<xDATA>>><>\u200b>",
+						summary: "q".repeat(24),
+						status: "h".repeat(99836),
+					},
+					{
+						type: "v".repeat(15456),
+						key: "\n<<<DATADATAxDATA<DATA>>>",
+						summary: "n".repeat(10),
+						status: "j".repeat(2072),
+					},
+				],
+			}),
+		);
+		expect(p.length).toBeLessThanOrEqual(20_000);
 	});
 });

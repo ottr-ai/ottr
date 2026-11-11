@@ -42,6 +42,9 @@ interface Seen {
 	body: Record<string, unknown>;
 }
 const seen: Seen[] = [];
+/** Raw Jira comment and link answers per key; the default is none of either. */
+const commentsByKey = new Map<string, unknown[]>();
+const linksByKey = new Map<string, unknown[]>();
 const issues = [1, 2, 3, 4, 5].map((n) => ({
 	key: `PROJ-${n}`,
 	fields: {
@@ -66,14 +69,15 @@ const extraIssues = ["P-1", "P-2"].map((key) => ({
 const jira = Bun.serve({
 	port: 0,
 	async fetch(req) {
-		const path = new URL(req.url).pathname;
+		const url = new URL(req.url);
+		const path = url.pathname;
 		const body =
 			req.method === "POST"
 				? ((await req.json()) as Record<string, unknown>)
 				: {};
 		seen.push({
 			method: req.method,
-			path,
+			path: path + url.search,
 			auth: req.headers.get("authorization"),
 			body,
 		});
@@ -93,6 +97,26 @@ const jira = Bun.serve({
 				},
 				{ status: 400 },
 			);
+		// Comment and issue-link reads of the import: the comment list is paged with
+		// startAt/maxResults, the link read fetches only the issuelinks field.
+		const issueRead = /\/rest\/api\/(\d+)\/issue\/([^/]+)(\/comment)?$/.exec(
+			path,
+		);
+		const stubKey = issueRead?.[2];
+		if (stubKey !== undefined) {
+			if (issueRead?.[3] === "/comment") {
+				const all = commentsByKey.get(stubKey) ?? [];
+				const startAt = Number(url.searchParams.get("startAt") ?? "0");
+				const maxResults = Number(url.searchParams.get("maxResults") ?? "5");
+				return Response.json({
+					comments: all.slice(startAt, startAt + maxResults),
+					startAt,
+					maxResults,
+					total: all.length,
+				});
+			}
+			return Response.json({ issuelinks: linksByKey.get(stubKey) ?? [] });
+		}
 		const inKeys = (
 			/^key in \((.*)\)$/.exec(jql)?.[1] ?? /^key = (.*)$/.exec(jql)?.[1]
 		)?.split(",");
@@ -152,6 +176,10 @@ const p1Store = p1Entry.store;
 if (!(p1Store instanceof ProjectStore))
 	throw new Error("p1 store is not a ProjectStore");
 const p1 = p1Store;
+const p2Entry = projects.get("p2");
+if (!(p2Entry?.store instanceof ProjectStore))
+	throw new Error("p2 store is not a ProjectStore");
+const p2 = p2Entry.store;
 
 /** The first request the Jira stub saw since the test cleared `seen`. */
 function firstSeen(): Seen {
@@ -441,6 +469,34 @@ describe("search and import", () => {
 		expect(r.json.total).toBe(5);
 	});
 
+	test("a data center import reads comments and links over REST v2", async () => {
+		commentsByKey.set("PROJ-1", [
+			{
+				author: { displayName: "Dan" },
+				created: "2026-10-06T08:00:00.000+0000",
+				body: "*done* quickly",
+			},
+		]);
+		const r = await call("/api/projects/p2/jira/import", {
+			keys: ["PROJ-1"],
+			stage: "backlog",
+		});
+		expect(r.status).toBe(200);
+		expect(r.json.filed).toHaveLength(1);
+		const calls = seen.map((s) => `${s.method} ${s.path}`);
+		expect(calls).toContain(
+			"GET /jira/rest/api/2/issue/PROJ-1/comment?maxResults=5&startAt=0",
+		);
+		expect(calls).toContain(
+			"GET /jira/rest/api/2/issue/PROJ-1?fields=issuelinks",
+		);
+		// The wiki body went through the converter: the author and date line is in the prompt.
+		expect(p2.getTask(r.json.filed[0] ?? "")?.prompt).toContain(
+			"COMMENTS\n<<<DATA\nDan (2026-10-06T08:00:00.000+0000):\n",
+		);
+		commentsByKey.clear();
+	});
+
 	test("import validates keys and stage", async () => {
 		expect((await importKeys([])).status).toBe(400);
 		expect((await importKeys(["proj-1"])).status).toBe(400);
@@ -491,6 +547,78 @@ describe("search and import", () => {
 		expect(r.json.filed).toEqual([]);
 		expect(r.json.skipped).toEqual([]);
 		expect(r.json.unavailable).toEqual(["PROJ-99"]);
+	});
+
+	test("the import reads the last comments and the issue links into the prompt", async () => {
+		const adfText = (text: string): unknown => ({
+			type: "doc",
+			version: 1,
+			content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+		});
+		commentsByKey.set("BULK-9001", [
+			{
+				author: { displayName: "Ada" },
+				created: "2026-10-07T09:00:00.000+0000",
+				body: adfText("Root cause found in the spike"),
+			},
+		]);
+		commentsByKey.set(
+			"BULK-9002",
+			Array.from({ length: 7 }, (_, i) => ({
+				author: { displayName: `Author ${i}` },
+				created: `2026-10-0${i + 1}T10:00:00.000+0000`,
+				body: adfText(`body ${i}`),
+			})),
+		);
+		linksByKey.set("BULK-9001", [
+			{
+				type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+				outwardIssue: {
+					key: "CMIS-8343",
+					fields: { summary: "the follow-up", status: { name: "Done" } },
+				},
+			},
+		]);
+		seen.length = 0;
+		const r = await importKeys(["BULK-9001", "BULK-9002"]);
+		expect(r.status).toBe(200);
+		// The exact reads: the comment total comes first, the last page second.
+		expect(seen).toContainEqual({
+			method: "GET",
+			path: "/rest/api/3/issue/BULK-9001/comment?maxResults=5&startAt=0",
+			auth: expect.any(String),
+			body: {},
+		});
+		expect(seen).toContainEqual({
+			method: "GET",
+			path: "/rest/api/3/issue/BULK-9002/comment?maxResults=5&startAt=2",
+			auth: expect.any(String),
+			body: {},
+		});
+		expect(seen).toContainEqual({
+			method: "GET",
+			path: "/rest/api/3/issue/BULK-9001?fields=issuelinks",
+			auth: expect.any(String),
+			body: {},
+		});
+		const single = p1.getTask(r.json.filed[0] ?? "");
+		expect(single?.prompt).toContain(
+			"COMMENTS\n<<<DATA\nAda (2026-10-07T09:00:00.000+0000):\nRoot cause found in the spike\nDATA>>>",
+		);
+		expect(single?.prompt).toContain(
+			"LINKS\n<<<DATA\nblocks: CMIS-8343: the follow-up (Done)\nDATA>>>",
+		);
+		// BULK-9002 keeps only the last 5 of its 7 comments, oldest first.
+		const paged = p1.getTask(r.json.filed[1] ?? "");
+		expect(paged?.prompt).toContain(
+			"Author 2 (2026-10-03T10:00:00.000+0000):\nbody 2",
+		);
+		expect(paged?.prompt).toContain(
+			"Author 6 (2026-10-07T10:00:00.000+0000):\nbody 6",
+		);
+		expect(paged?.prompt).not.toContain("Author 1 (");
+		commentsByKey.clear();
+		linksByKey.clear();
 	});
 
 	test("a key Jira rejects in the batch query is skipped and the others are filed", async () => {
