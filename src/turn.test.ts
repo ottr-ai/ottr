@@ -109,6 +109,7 @@ import {
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
+	cleanMergeTree as realCleanMergeTree,
 	fetchOriginBranch as realFetchOriginBranch,
 	fetchPrHead as realFetchPrHead,
 	prIntegrated as realPrIntegrated,
@@ -261,6 +262,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		diffStat: async () => [],
 		diffText: async () => null,
 		revListCount: async () => null,
+		cleanMergeTree: async () => null,
 		isClean: async () => true,
 		isIntegrated: async () => true,
 		// OTTR-708: a static snapshot reads unchanged, so the checkout guard never fires
@@ -21191,19 +21193,28 @@ describe("turn PR-mode merge settle", () => {
 
 	test.each([
 		{ name: "nothing beyond the source head", apply: "none" },
-		{ name: "a fixless cherry-pick onto the advanced target", apply: "cherry" },
+		{
+			name: "a fixless cherry-pick with an unrelated file advance",
+			apply: "cherry-unrelated",
+		},
+		{
+			name: "a fixless cherry-pick with a distant same-file advance",
+			apply: "cherry-same-file",
+		},
 		{ name: "a content fix", apply: "fix" },
 		{ name: "a rename-only fix", apply: "rename" },
 		{ name: "a binary-only fix", apply: "binary" },
 	])(
-		"a rebased bump with $name ships per the rev-list count on real git (OTTR-809)",
+		"a rebased bump with $name ships per rev-list and the merge-tree proof on real git (OTTR-809)",
 		async ({ apply }) => {
 			// Real git everywhere the ship reads: a bare origin, an advanced target
 			// pushed to origin, the bot head on refs/pull/30/head, and the card
 			// checkout — a real linked worktree — holding the cherry-picked bump plus
-			// the shape's commits. The rev-list count is pure commit graph: rename,
-			// mode and binary fixes count like any other commit. Only the GitHub
-			// calls (openPr, prComment) are stubbed.
+			// the shape's commits. Fixless shapes adopt through the rev-list count
+			// (empty) or the merge-tree proof (merging the bump onto the advanced
+			// target reproduces the card tree); any real fix — rename, mode, binary,
+			// content — makes the trees differ and ships the follow-up. Only the
+			// GitHub calls (openPr, prComment) are stubbed.
 			const run = (cwd: string, ...args: string[]): string => {
 				const r = Bun.spawnSync(["git", ...args], {
 					cwd,
@@ -21222,13 +21233,22 @@ describe("turn PR-mode merge settle", () => {
 			try {
 				run(dir, "init", "-q", "--bare", "-b", "main", bare);
 				run(dir, "clone", "-q", bare, main);
-				writeFileSync(join(main, "pkg.json"), '{"v":1}\n');
+				// Multi-line on purpose: the distant same-file shape edits the name
+				// line while the bump edits the v line, more than a context window
+				// apart, so the cherry-pick applies cleanly.
+				writeFileSync(
+					join(main, "pkg.json"),
+					'{\n  "name": "a",\n  "x": 1,\n  "y": 2,\n  "z": 3,\n  "v": 1\n}\n',
+				);
 				run(main, ...id, "add", ".");
 				run(main, ...id, "commit", "-qm", "base");
 				run(main, "push", "-q", "origin", "main");
 				run(main, "switch", "-q", "-c", "dep");
-				writeFileSync(join(main, "pkg.json"), '{"v":2}\n');
-				run(main, ...id, "commit", "-am", "bump vite from 5 to 7");
+				writeFileSync(
+					join(main, "pkg.json"),
+					'{\n  "name": "a",\n  "x": 1,\n  "y": 2,\n  "z": 3,\n  "v": 2\n}\n',
+				);
+				run(main, ...id, "commit", "-am", "bump vite from 1 to 2");
 				const botHead = run(main, "rev-parse", "HEAD");
 				run(main, "push", "-q", "origin", `${botHead}:refs/pull/30/head`);
 				// The bump objects must exist before the card checkout cherry-picks.
@@ -21240,7 +21260,14 @@ describe("turn PR-mode merge settle", () => {
 					`+refs/pull/30/head:refs/ottr/pr/30`,
 				);
 				run(main, "switch", "-q", "main");
-				writeFileSync(join(main, "other.txt"), "advance\n");
+				if (apply === "cherry-same-file") {
+					writeFileSync(
+						join(main, "pkg.json"),
+						'{\n  "name": "b",\n  "x": 1,\n  "y": 2,\n  "z": 3,\n  "v": 1\n}\n',
+					);
+				} else {
+					writeFileSync(join(main, "other.txt"), "advance\n");
+				}
 				run(main, ...id, "add", ".");
 				run(main, ...id, "commit", "-qm", "advance");
 				// The advance is on origin: the merge prompt rebases onto
@@ -21261,7 +21288,10 @@ describe("turn PR-mode merge settle", () => {
 				);
 				if (apply !== "none") run(wt, ...id, "cherry-pick", botHead);
 				if (apply === "fix") {
-					writeFileSync(join(wt, "pkg.json"), '{"v":3}\n');
+					writeFileSync(
+						join(wt, "pkg.json"),
+						'{\n  "name": "a",\n  "x": 1,\n  "y": 2,\n  "z": 3,\n  "v": 3\n}\n',
+					);
 					run(wt, ...id, "commit", "-am", "fix: migrate the biome config");
 				} else if (apply === "rename") {
 					run(wt, "mv", "pkg.json", "package-lock.json");
@@ -21287,6 +21317,8 @@ describe("turn PR-mode merge settle", () => {
 						realTargetContains(main, sha, tip),
 					treesEqual: (_m: string, a: string, b: string) =>
 						realTreesEqual(main, a, b),
+					cleanMergeTree: (_m: string, a: string, b: string) =>
+						realCleanMergeTree(main, a, b),
 					revListCount: (wtPath: string, a: string, b: string) =>
 						realRevListCount(wtPath, a, b),
 					pushBranch: async (...args: unknown[]) => {
@@ -21309,7 +21341,7 @@ describe("turn PR-mode merge settle", () => {
 				});
 				store.setSettings({ prMode: true, originUrl: bare });
 				store.updateTask(task.id, {
-					// The card checkout the rev-list read runs in.
+					// The card checkout the reads run in.
 					worktree: wt,
 					sourcePrNumber: 30,
 					sourcePrUrl: "https://github.com/acme/repo/pull/30",
@@ -21322,9 +21354,10 @@ describe("turn PR-mode merge settle", () => {
 				const after = store.getTask(task.id)!;
 				expect(after.stage).toBe("merging");
 				expect(after.prNumber).toBe(30);
-				if (apply === "none") {
-					// Empty rev-list: the branch holds nothing beyond the source PR's
-					// head, so the card adopts — no second PR, no push, no comment.
+				if (apply === "none" || apply.startsWith("cherry")) {
+					// Fixless: an empty rev-list, or a merge-tree proof that merging
+					// the bump onto the advanced target reproduces the card tree.
+					// No second PR, no push, no comment.
 					expect(after.state).toBe("idle");
 					expect(after.prHeadSha).toBe(botHead);
 					expect(after.followUpPrNumber).toBe(null);
@@ -21335,8 +21368,8 @@ describe("turn PR-mode merge settle", () => {
 						"- source PR #30 stays the card's PR",
 					);
 				} else {
-					// A non-empty rev-list ships those commits: one follow-up PR based
-					// on the target, linked from the source PR.
+					// A real fix ships: one follow-up PR based on the target, linked
+					// from the source PR.
 					expect(after.state).toBe("idle");
 					expect(after.followUpPrNumber).toBe(33);
 					expect(opens).toHaveLength(1);
@@ -21363,22 +21396,32 @@ describe("turn PR-mode merge settle", () => {
 		},
 	);
 
-	test("a clean cherry-picked bump with an unrelated target advance adopts (OTTR-809)", async () => {
+	test("a fixless cherry-pick onto an advanced target adopts via merge-tree (OTTR-809)", async () => {
 		// The target advanced (an unrelated file), so the cherry-picked bump differs
-		// from the bot head — but the rev-list beyond it is empty, so there are no
-		// fixes and no second PR: the card adopts and waits.
+		// from the bot head and the rev-list counts the copy — but merging the bump
+		// onto the target tip reproduces the card tree exactly: no fixes, no second
+		// PR. The card adopts and waits.
 		let opened = false;
 		const { store, loop, task } = prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/ottr/pr/20"
 					? "pr-head"
-					: ref === "refs/heads/ott/m"
-						? "sha-cherry"
-						: "sha-old",
-			treesEqual: async () => false,
+					: ref === "pr-head^"
+						? "pr-head-parent"
+						: ref === "origin/main"
+							? "target-tip"
+							: ref === "refs/heads/ott/m"
+								? "sha-cherry"
+								: "sha-old",
+			treesEqual: async (_m: string, a: string, b: string) =>
+				a === "merged-tree" && b === "sha-cherry",
 			targetContains: async () => false,
+			// The cherry-picked copy counts as a commit; the merge-tree proof then
+			// shows it carries nothing beyond the bump.
 			revListCount: async (_m: string, a: string, b: string) =>
-				a === "pr-head" && b === "sha-cherry" ? 0 : null,
+				a === "pr-head" && b === "sha-cherry" ? 1 : null,
+			cleanMergeTree: async (_m: string, _ours: string, _theirs: string) =>
+				"merged-tree",
 			pushBranch: async () => {
 				throw new Error("pushBranch must not run for a clean source bump");
 			},
@@ -21399,8 +21442,9 @@ describe("turn PR-mode merge settle", () => {
 	});
 
 	test("a cherry-picked bump with a fix commit ships the follow-up on the target (OTTR-809)", async () => {
-		// The card branch holds one commit beyond the source PR head: the rev-list
-		// count is non-empty, so the follow-up PR delivers it, based on the target.
+		// The card branch holds one commit beyond the source PR head, and merging the
+		// bump onto the target produces a different tree (the fix changed it): the
+		// follow-up PR delivers the fix, based on the target.
 		const opens: { repo: string; branch: string; base: string }[] = [];
 		const { store, loop, task } = prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
@@ -21413,6 +21457,8 @@ describe("turn PR-mode merge settle", () => {
 			targetContains: async () => false,
 			revListCount: async (_m: string, a: string, b: string) =>
 				a === "pr-head" && b === "sha-cherry" ? 1 : null,
+			cleanMergeTree: async (_m: string, _ours: string, _theirs: string) =>
+				"merged-tree",
 			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
 			openPr: async (o) => {
 				opens.push(o);

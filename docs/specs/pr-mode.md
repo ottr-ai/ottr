@@ -232,20 +232,25 @@ step checks the source before it ever opens a PR:
   author's commits) and the card adopts the PR afterwards.
 - Fixes beyond a Dependabot PR's head (OTTR-809) ship as a follow-up pull
   request. The card's fixes are the commits on the card branch after the
-  source PR's head: `git rev-list --count <source-head>..<card-branch>`, run
-  in the card checkout. An empty count means fixless — however the target
-  moved — and the card adopts the source PR. A non-empty count ships those
-  commits: the ship step pushes the card branch to origin under its own
-  name (never to the bot's branch) and opens one PR with the card branch as
-  the head. The base is the Dependabot branch when the card branch descends
-  from the PR head, so the fixes merge with the bump; a cherry-picked or
-  rebased branch that no longer descends from the head, and a legacy card
-  without the head name, base on the target branch instead — the PR carries
-  the rebased work, and once the bump merges the diff reduces to the fixes.
-  The count is a pure commit-graph read (no HEAD, no worktree state, no
-  patch shape), so rename, mode and binary fixes all count as commits, and
-  git trouble reads as fixes and ships. One comment on the source PR links
-  the follow-up. The card stores the follow-up in
+  source PR's head, answered by two git reads in the card checkout. An
+  empty `git rev-list --count <source-head>..<card-branch>` means fixless
+  (the branch fast-forwarded with nothing after it) and the card adopts the
+  source PR. A non-empty count may still be just the rebased bump: git
+  merges the bump onto the target tip (`git merge-tree --write-tree`, needs
+  git >= 2.38) and a clean merge reproducing the card branch's tree exactly
+  proves the card holds nothing but the bump, however the target moved — an
+  unrelated file and a distant edit in the same file included — and the
+  card adopts too. Anything else — a content fix, a conflicting resolution,
+  a rename, a mode or a binary change, or git trouble — ships those commits
+  as the follow-up. The ship step pushes the card branch to origin under
+  its own name (never to the bot's branch) and opens one PR with the card
+  branch as the head. The base is the Dependabot branch when the card
+  branch descends from the PR head, so the fixes merge with the bump; a
+  cherry-picked or rebased branch that no longer descends from the head,
+  and a legacy card without the head name, base on the target branch
+  instead — the PR carries the rebased work, and once the bump merges the
+  diff reduces to the fixes. One comment on the source PR links the
+  follow-up. The card stores the follow-up in
   `follow_up_pr_number`/`follow_up_pr_url` (additive columns migrated like
   the PR fields above) and waits in `merging`/`idle` until both PRs merge; a
   re-ship adopts the open follow-up instead of opening another one.

@@ -2684,6 +2684,23 @@ export async function revListCount(
 	return Number.isSafeInteger(n) && n >= 0 ? n : null;
 }
 
+/** OTTR-809: the tree a clean three-way merge of `theirs` into `ours` (merge base
+ * discovered by git) produces — `git merge-tree --write-tree <ours> <theirs>` — or
+ * null when the merge conflicts (exit 1) or git is too old for the subcommand (usage
+ * error). Pure commit-tree read: no HEAD, no worktree state. Needs git >= 2.38; older
+ * git reads as null and the caller treats the work as fix-bearing, never adopting on
+ * an unproven compare. */
+export async function cleanMergeTree(
+	mainPath: string,
+	ours: string,
+	theirs: string,
+): Promise<string | null> {
+	const r = await git(["merge-tree", "--write-tree", ours, theirs], mainPath);
+	if (r.code !== 0) return null;
+	const tree = r.stdout.trim().split("\n")[0] ?? "";
+	return /^[0-9a-f]{40}$/.test(tree) ? tree : null;
+}
+
 /** The branch's unified diff (same base as diffStat), or null when git fails. */
 export async function diffText(
 	worktreePath: string,

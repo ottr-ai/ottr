@@ -98,6 +98,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		diffStat: async () => [],
 		diffText: async () => null,
 		revListCount: async () => null,
+		cleanMergeTree: async () => null,
 		isClean: async () => true,
 		isIntegrated: async () => true,
 		unsavedWork: async () => null,

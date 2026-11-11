@@ -181,6 +181,7 @@ import type {
 	changedFiles,
 	checkedOutBranch,
 	checkoutState,
+	cleanMergeTree,
 	commitsAhead,
 	createWorktree,
 	deleteRemoteBranch,
@@ -965,6 +966,10 @@ export interface TurnOps {
 	 * Required: an unwired op silently reads every rebased bump as fix-bearing and
 	 * duplicates Dependabot PRs. */
 	revListCount: typeof revListCount;
+	/** OTTR-809: the tree a clean three-way merge produces, or null on conflict or git
+	 * trouble. Required for the same reason: without it a rebased fixless bump cannot
+	 * prove fixless and duplicates the Dependabot PR. */
+	cleanMergeTree: typeof cleanMergeTree;
 	/** OTTR-760: posts one comment on a pull request (gh via runGh); the "@dependabot rebase" handoff and the fixes note. */
 	prComment?: typeof commentOnPullRequest;
 	/** OTTR-781: fetches a legacy Dependabot card's source PR head into refs/ottr/pr/N at ship time. */
@@ -6148,14 +6153,25 @@ export function createTurnLoop(
 			return;
 		}
 		// The card's fixes are the commits after the source PR's head: an empty
-		// rev-list means fixless — a rebased or cherry-picked bump, however the target
-		// moved — and the card adopts. Any commit ships: a fix, a rename, a mode or
-		// binary change all count. Git trouble reads as fixes, so the follow-up stays
-		// the safe delivery for work we cannot prove empty.
+		// rev-list means fixless — a fast-forwarded bump with nothing after it — and
+		// the card adopts. A non-empty count may still be just the rebased bump: git
+		// merges the bump onto the target tip, and a clean merge reproducing the card
+		// tree exactly proves the card holds nothing but the bump, however the target
+		// moved — a distant edit in the same file included — so the card adopts too.
+		// A conflict or a tree mismatch is a fix and ships. Git trouble reads as
+		// fixes, so the follow-up stays the safe delivery for work we cannot prove
+		// empty.
 		const beyond = await commitsBeyondHead(st, head, tip);
 		if (beyond === 0) {
 			adoptSourcePr(st, n, head, src.url);
 			return;
+		}
+		if (beyond !== null) {
+			const reproduced = await bumpReproducesCard(st, head, tip);
+			if (reproduced) {
+				adoptSourcePr(st, n, head, src.url);
+				return;
+			}
 		}
 		// The branch holds work beyond the PR head: fixes on top, or a cherry-pick that
 		// resolved conflicts against a moved base.
@@ -6185,7 +6201,8 @@ export function createTurnLoop(
 	/** How many commits the card branch holds beyond the source PR's head
 	 * (`rev-list <head>..<tip>` in the card checkout); null on git trouble. The count
 	 * is pure commit graph — no HEAD, no worktree state, no patch shape — so rename,
-	 * mode and binary fixes all count, and neither checkout's position can skew it. */
+	 * mode and binary fixes all count as commits, and neither checkout's position can
+	 * skew it. */
 	async function commitsBeyondHead(
 		st: TurnSettle,
 		head: string,
@@ -6195,6 +6212,34 @@ export function createTurnLoop(
 		// runs there (same object store, never the main checkout's branch).
 		const path = existsSync(st.loc.wt) ? st.loc.wt : st.e.path;
 		return ops.revListCount(path, head, tip).catch(() => null);
+	}
+
+	/** True when merging the source PR's bump onto the target tip reproduces the card
+	 * branch's tree exactly (`cleanMergeTree` + tree compare): a cherry-picked or
+	 * rebased bump with no fixes beyond it, however the target moved — an unrelated
+	 * file and a distant edit in the same file included. A conflicting resolution, a
+	 * rename, a mode or a binary change makes the trees differ, and git trouble or an
+	 * unwired op reads as fixes: the follow-up path is the safe delivery for work we
+	 * cannot prove empty. The read runs in the card checkout (same object store,
+	 * never the main checkout's branch). */
+	async function bumpReproducesCard(
+		st: TurnSettle,
+		head: string,
+		tip: string,
+	): Promise<boolean> {
+		const headParent = await ops
+			.targetSha(st.e.path, `${head}^`)
+			.catch(() => null);
+		const targetTip = await ops
+			.targetSha(st.e.path, st.header.target)
+			.catch(() => null);
+		if (headParent === null || targetTip === null) return false;
+		const path = existsSync(st.loc.wt) ? st.loc.wt : st.e.path;
+		const merged = await ops
+			.cleanMergeTree(path, targetTip, head)
+			.catch(() => null);
+		if (merged === null) return false;
+		return ops.treesEqual?.(path, merged, tip).catch(() => false) ?? false;
 	}
 
 	/** Re-reads the source PR's current head before the ship judges the card branch: a
