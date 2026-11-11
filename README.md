@@ -310,7 +310,12 @@ backend from the deployment: set `HINDSIGHT_API_URL` (or save the URL under
 **Settings → Hindsight**), and every worker on every machine reads and writes the same
 memory on a [Hindsight](https://github.com/vectorize-io/hindsight) server. Without it,
 omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only
-containers on the same host see it. The board checks memory at boot and every 60 seconds;
+containers on the same host see it. That store is separate from your local mnemopi store
+on this machine: your existing memories never reach the workers. Two supported paths
+close the gap: copy your local mnemopi store into the `home` volume once, as a snapshot,
+or point your local omp and Ottr at the same Hindsight server. Never bind-mount the host
+mnemopi folder into the volume: SQLite over the WSL file share with concurrent writers
+can corrupt the store. The board checks memory at boot and every 60 seconds;
 when omp runs with no memory, it warns with the reason. See
 [docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
 
