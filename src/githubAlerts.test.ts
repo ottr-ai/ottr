@@ -94,7 +94,7 @@ describe("githubAlertSummary", () => {
 		);
 	});
 
-	test("dependabot endpoint fails -> unavailable with sanitized reason", async () => {
+	test("one failing endpoint -> per-type line, other types still listed", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
 				"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
@@ -102,18 +102,27 @@ describe("githubAlertSummary", () => {
 			}),
 		);
 		const s = await githubAlertSummary({ repo: "acme/widget", gh });
-		expect(s.startsWith("alerts unavailable: ")).toBe(true);
-		expect(s).toContain("403");
-		expect(s).not.toContain("open (");
+		expect(s).toContain(
+			"- Dependabot: not available (gh: Forbidden (HTTP 403))",
+		);
+		// sanitized: only the first stderr line survives
+		expect(s).not.toContain("second line");
+		expect(s).not.toContain("alerts unavailable");
+		expect(s).toContain("GitHub security alerts for acme/widget: 5 open.");
+		expect(s).toContain("- Code scanning: 3 open (2 high, 1 low)");
+		expect(s).toContain("- Secret scanning: 2 open");
 	});
 
-	test("gh runner throws -> unavailable with the error message", async () => {
-		const { gh } = fakeGh(
-			baseRoutes({
-				"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
-					new Error("gh binary missing"),
-			}),
-		);
+	test("gh runner throws on every endpoint -> unavailable with the error message", async () => {
+		const boom = new Error("gh binary missing");
+		const { gh } = fakeGh({
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
+				boom,
+			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
+				boom,
+			"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
+				boom,
+		});
 		const s = await githubAlertSummary({ repo: "acme/widget", gh });
 		expect(s).toBe("alerts unavailable: gh binary missing");
 	});
@@ -130,7 +139,7 @@ describe("githubAlertSummary", () => {
 		expect(s).not.toContain("ghp_SUPERSECRETVALUE123");
 	});
 
-	test("non-JSON stdout -> parse reason naming the endpoint", async () => {
+	test("non-JSON stdout -> per-type parse reason naming the endpoint", async () => {
 		const { gh } = fakeGh(
 			baseRoutes({
 				"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
@@ -138,9 +147,67 @@ describe("githubAlertSummary", () => {
 			}),
 		);
 		const s = await githubAlertSummary({ repo: "acme/widget", gh });
-		expect(s).toBe(
-			"alerts unavailable: could not parse the code scanning response",
+		expect(s).toContain(
+			"- Code scanning: not available (could not parse the code scanning response)",
 		);
+		expect(s).toContain("- Dependabot: 3 open");
+		expect(s).not.toContain("alerts unavailable");
+	});
+
+	test("disabled code and secret scanning leave the dependabot alerts visible", async () => {
+		const { gh } = fakeGh(
+			baseRoutes({
+				"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
+					"ERR:gh: Advanced Security must be enabled for this repository to use code scanning. (HTTP 403)",
+				"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
+					"ERR:gh: Secret scanning is disabled (HTTP 403)",
+			}),
+		);
+		const s = await githubAlertSummary({ repo: "acme/widget", gh });
+		expect(s).toContain("GitHub security alerts for acme/widget: 3 open.");
+		expect(s).toContain("- Dependabot: 3 open (2 critical, 1 low)");
+		expect(s).toContain(
+			"  - pkg-1 < 2.0 (critical) https://github.com/acme/widget/security/dependabot/1",
+		);
+		expect(s).toContain(
+			"  - pkg-2 < 2.0 (low) https://github.com/acme/widget/security/dependabot/2",
+		);
+		expect(s).toContain(
+			"  - pkg-3 < 2.0 (critical) https://github.com/acme/widget/security/dependabot/3",
+		);
+		expect(s).toContain("- Code scanning: not enabled");
+		expect(s).toContain("- Secret scanning: not enabled");
+		expect(s).not.toContain("alerts unavailable");
+		// the raw GitHub phrases collapse into the short line
+		expect(s).not.toContain("Advanced Security");
+		expect(s).not.toContain("Secret scanning is disabled");
+	});
+
+	test("secret scanning 404 -> not enabled, others still listed", async () => {
+		const { gh } = fakeGh(
+			baseRoutes({
+				"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
+					"ERR:gh: Not Found (HTTP 404)",
+			}),
+		);
+		const s = await githubAlertSummary({ repo: "acme/widget", gh });
+		expect(s).toContain("- Secret scanning: not enabled");
+		expect(s).not.toContain("Not Found");
+		expect(s).toContain("- Dependabot: 3 open");
+		expect(s).toContain("- Code scanning: 3 open");
+	});
+
+	test("all three endpoints fail -> one unavailable line", async () => {
+		const { gh } = fakeGh({
+			"repos/acme/widget/dependabot/alerts?state=open&per_page=100&page=1":
+				"ERR:gh: Not Found (HTTP 404)",
+			"repos/acme/widget/code-scanning/alerts?state=open&per_page=100&page=1":
+				"ERR:gh: Not Found (HTTP 404)",
+			"repos/acme/widget/secret-scanning/alerts?state=open&per_page=100&page=1":
+				"ERR:gh: Not Found (HTTP 404)",
+		});
+		const s = await githubAlertSummary({ repo: "acme/widget", gh });
+		expect(s).toBe("alerts unavailable: gh: Not Found (HTTP 404)");
 	});
 
 	test("repo normalization and null repo", async () => {

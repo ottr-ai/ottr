@@ -3280,7 +3280,7 @@ export function createApp(deps: AppDeps) {
 		).catch(() => null);
 		// Network before the guard, like the git spawns, so the guard and createTask below
 		// stay one synchronous block (R1-8). Never throws: a failed fetch lands in the
-		// prompt as "alerts unavailable: <reason>".
+		// prompt as a per-type unavailable line or "alerts unavailable: <reason>".
 		const alerts = await githubAlertSummary({ repo: e.github, gh });
 		// The git spawns run BEFORE the guard, so the guard and createTask below sit in one
 		// synchronous block: two overlapping requests cannot both pass it (R1-8).
@@ -9854,7 +9854,7 @@ export function createApp(deps: AppDeps) {
 		if (semverGate instanceof Response) return semverGate;
 		// Network before the guard: resolveReleaseOverrides keeps the R1-8 ordering with no
 		// await between the guard and createTask. Never throws: a failed fetch lands in the
-		// prompt as "alerts unavailable: <reason>".
+		// prompt as a per-type unavailable line or "alerts unavailable: <reason>".
 		const alerts = await githubAlertSummary({ repo: e.github, gh });
 		const overrides = await resolveReleaseOverrides(e, planned.plan, r.body);
 		if (overrides instanceof Response) return overrides;

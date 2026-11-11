@@ -47,11 +47,11 @@ function severity(a: Record<string, unknown>): string {
 const countsLabel = (s: string): string =>
 	SEVERITY_RANK[s] === undefined ? "others" : s;
 
+/** One alert endpoint's GitHub kind. */
+type AlertKind = "dependabot" | "code-scanning" | "secret-scanning";
+
 /** Human name for one endpoint kind, used in the parse-failure reason. */
-const KIND_LABEL: Record<
-	"dependabot" | "code-scanning" | "secret-scanning",
-	string
-> = {
+const KIND_LABEL: Record<AlertKind, string> = {
 	dependabot: "dependabot",
 	"code-scanning": "code scanning",
 	"secret-scanning": "secret scanning",
@@ -61,7 +61,7 @@ const KIND_LABEL: Record<
 async function fetchPage(
 	gh: GhFn,
 	path: string,
-	kind: "dependabot" | "code-scanning" | "secret-scanning",
+	kind: AlertKind,
 ): Promise<Fetch> {
 	let res: { code: number; stdout: string; stderr: string };
 	try {
@@ -93,7 +93,7 @@ async function fetchPage(
 async function fetchEndpoint(
 	gh: GhFn,
 	id: string,
-	kind: "dependabot" | "code-scanning" | "secret-scanning",
+	kind: AlertKind,
 ): Promise<Fetch> {
 	const base = `repos/${id}/${kind}/alerts`;
 	const all: Record<string, unknown>[] = [];
@@ -112,7 +112,8 @@ async function fetchEndpoint(
 
 type Category = {
 	name: string;
-	alerts: Record<string, unknown>[];
+	kind: AlertKind;
+	fetch: Fetch;
 	severities: boolean;
 	item: (a: Record<string, unknown>) => string;
 };
@@ -149,6 +150,21 @@ function countsLine(
 		if (c) parts.push(`${c} ${s}`);
 	}
 	return `- ${name}: ${n} open (${parts.join(", ")})`;
+}
+
+/** GitHub's fixed answers for a disabled feature; they collapse to "not enabled". */
+const NOT_ENABLED_RE = [
+	/Advanced Security must be enabled/i,
+	/Secret scanning is disabled/i,
+];
+
+/** One category's failure line: "not enabled" for a disabled feature, the redacted reason otherwise. */
+function alertTypeLine(name: string, kind: AlertKind, reason: string): string {
+	const disabled =
+		NOT_ENABLED_RE.some((re) => re.test(reason)) ||
+		(kind === "secret-scanning" && reason.includes("HTTP 404"));
+	if (disabled) return `- ${name}: not enabled`;
+	return `- ${name}: not available (${reason})`;
 }
 
 function itemLines(
@@ -202,7 +218,9 @@ const secretItem = (a: Record<string, unknown>): string => {
 /**
  * Short untrusted-DATA summary of a project repo's open GitHub security alerts.
  * Never throws. Every API-derived string is sanitized; values under keys named
- * "secret" are never read or emitted.
+ * "secret" are never read or emitted. A failed endpoint becomes one line for its
+ * type ("not enabled" for a disabled feature, the redacted reason otherwise);
+ * only a failure of all three types returns the single "alerts unavailable" line.
  */
 export async function githubAlertSummary(o: {
 	repo: string | null;
@@ -224,30 +242,45 @@ export async function githubAlertSummary(o: {
 		fetchEndpoint(gh, id, "code-scanning"),
 		fetchEndpoint(gh, id, "secret-scanning"),
 	]);
-	for (const r of results) {
-		if (r.reason !== null) return `alerts unavailable: ${r.reason}`;
-	}
 	const [dep, code, secret] = results;
+	// Only a total failure collapses to one line: a single disabled feature must not
+	// hide the other types' alerts.
+	if (dep.reason !== null && code.reason !== null && secret.reason !== null) {
+		return `alerts unavailable: ${dep.reason}`;
+	}
 	const total = dep.alerts.length + code.alerts.length + secret.alerts.length;
 	const categories: Category[] = [
-		{ name: "Dependabot", alerts: dep.alerts, severities: true, item: depItem },
+		{
+			name: "Dependabot",
+			kind: "dependabot",
+			fetch: dep,
+			severities: true,
+			item: depItem,
+		},
 		{
 			name: "Code scanning",
-			alerts: code.alerts,
+			kind: "code-scanning",
+			fetch: code,
 			severities: true,
 			item: codeItem,
 		},
 		{
 			name: "Secret scanning",
-			alerts: secret.alerts,
+			kind: "secret-scanning",
+			fetch: secret,
 			severities: false,
 			item: secretItem,
 		},
 	];
 	const lines: string[] = [`GitHub security alerts for ${id}: ${total} open.`];
 	for (const c of categories) {
-		lines.push(countsLine(c.name, c.alerts, c.severities));
-		if (c.alerts.length > 0) lines.push(...itemLines(c.alerts, topN, c.item));
+		if (c.fetch.reason !== null) {
+			lines.push(alertTypeLine(c.name, c.kind, c.fetch.reason));
+			continue;
+		}
+		lines.push(countsLine(c.name, c.fetch.alerts, c.severities));
+		if (c.fetch.alerts.length > 0)
+			lines.push(...itemLines(c.fetch.alerts, topN, c.item));
 	}
 	return lines.join("\n");
 }
