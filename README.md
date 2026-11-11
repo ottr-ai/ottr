@@ -257,6 +257,19 @@ project has no Windows machine to verify them.
   podman ps --format "{{.ImageID}}"
   ```
 
+- A proxy on the host's `localhost` breaks `podman compose build` on macOS (reported on
+  a colleague's Mac; not reproduced here): Podman passes the host's `HTTP_PROXY`/`HTTPS_PROXY`
+  into the machine and the build, and there `localhost` is the build container, not the Mac.
+  The apt step fails with `Could not connect to localhost:3128`, then `Unable to locate
+  package` for every package. Use one of these fixes:
+  - point the proxy at Podman's host name instead: `HTTP_PROXY=http://host.containers.internal:3128`,
+    or use the corporate proxy URL directly;
+  - add the compose service names to `NO_PROXY`, so calls between the stack's services do
+    not go through the proxy — the stack's entry scripts already append them at container
+    start (`docker/no-proxy.sh`), so set them yourself only for containers you run by hand;
+  - skip the build: set `OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>` and run `podman compose pull`,
+    then `podman compose up -d --no-build` (the [latest release](#latest-release-no-clone-no-build) path).
+
 - `board-seed` under podman-compose: `COMPOSE_PROFILES=alate` leaves the `seed` profile off, so `podman compose run --rm board-seed` fails with `missing services [board-seed]`. Activate the profile (Docker Compose v2 starts the service you run without the flag):
 
   ```sh
@@ -378,7 +391,7 @@ The alate URL carries the API key on every call, so the board refuses a plain `h
 | Weekly trending scan | on | **Settings**; Monday 06:00 server time (or the first check after it, if the board was down), the server fetches GitHub trending (weekly: all languages, TypeScript, JavaScript) and the repos' metadata with the board token, then files one scout card per project with **Trending scout** on. **Scan trending now** runs a scan at once without moving the weekly one. A failed fetch files no card, shows "Last trending scan failed" on Settings, and retries for 24 hours |
 | Release command | tag, push, GitHub release | **Settings**, one line; runs instead of those steps |
 | Kept-worktree quarantine | 7 days | **Settings** |
-| Proxy variables | inherited from the board's env | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case names. Ottr strips the userinfo (`user:pass@`) from these URLs before it builds a turn's environment, so the proxy's credentials never reach an agent; the host and port stay. If a turn then cannot reach the network, use a proxy whose URL carries no credentials (for example one that allow-lists the stack's addresses instead) |
+| Proxy variables | inherited from the board's env | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case names. Ottr strips the userinfo (`user:pass@`) from these URLs before it builds a turn's environment, so the proxy's credentials never reach an agent; the host and port stay. If a turn then cannot reach the network, use a proxy whose URL carries no credentials (for example one that allow-lists the stack's addresses instead). Under Podman, a proxy on `localhost` breaks the image build — point it at `host.containers.internal` instead ([Podman](#podman)) |
 
 ## GitHub tokens
 
