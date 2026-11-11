@@ -94,7 +94,12 @@ import {
 import type { CardPos } from "./flight.ts";
 import { freshTaskIds, listSlides, stageFlights } from "./flight.ts";
 import logo from "./icon-192.png";
-import { JiraImportButton, JiraImportDialog } from "./jiraImport.tsx";
+import {
+	JiraBoardImportButton,
+	JiraBoardImportDialog,
+	JiraImportButton,
+	JiraImportDialog,
+} from "./jiraImport.tsx";
 import {
 	type Act,
 	BAND_LIMIT,
@@ -4765,6 +4770,7 @@ export function Overview({
 	// markers on the Diagrams, review and release controls read it on the project view.
 	// Tabs: Now (what waits on you, the live projects), Performance and Setup.
 	const [picked, setTab] = useState<OverviewTab>("now");
+	const [showBoardJira, setShowBoardJira] = useState(false);
 	const tabs: readonly OverviewTab[] = hosted
 		? OVERVIEW_TABS.filter((t) => t !== "setup")
 		: OVERVIEW_TABS;
@@ -4841,9 +4847,12 @@ export function Overview({
 	);
 	const projectsNow = (
 		<>
-			<h2 className="ov-sec" id="live-title">
-				Projects
-			</h2>
+			<div className="ov-head">
+				<h2 className="ov-sec" id="live-title">
+					Projects
+				</h2>
+				<JiraBoardImportButton onOpen={() => setShowBoardJira(true)} />
+			</div>
 			<div className="ov-wrap">
 				<table className="ov">
 					<thead>
@@ -5034,6 +5043,13 @@ export function Overview({
 					setup={setup}
 				/>
 				{projectsNow}
+				{showBoardJira && (
+					<JiraBoardImportDialog
+						projects={projects}
+						onClose={() => setShowBoardJira(false)}
+						navigate={navigate}
+					/>
+				)}
 			</div>
 			<div {...panelProps("perf")}>{performance}</div>
 			{tabs.includes("setup") && (

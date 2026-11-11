@@ -3,8 +3,18 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { JiraConnectionView, JiraRow, ProjectView } from "../types.ts";
-import { JiraImportButton, JiraImportDialog } from "./jiraImport.tsx";
+import type {
+	JiraBoardRow,
+	JiraConnectionView,
+	JiraRow,
+	ProjectView,
+} from "../types.ts";
+import {
+	JiraBoardImportButton,
+	JiraBoardImportDialog,
+	JiraImportButton,
+	JiraImportDialog,
+} from "./jiraImport.tsx";
 import { JiraConnectionsSection } from "./settings.tsx";
 
 // React interaction needs browser globals; bun test has none. happy-dom registers them
@@ -731,6 +741,262 @@ describe("JiraConnectionsSection", () => {
 			await act(async () => {
 				await Bun.sleep(50);
 			});
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+const CONNS = "/api/jira/connections";
+const BSEARCH = "/api/jira/search";
+const BIMPORT = "/api/jira/import";
+
+const boardRow = (
+	key: string,
+	importedIn: { project: string; task: string }[] = [],
+): JiraBoardRow => ({
+	key,
+	url: `https://acme.atlassian.net/browse/${key}`,
+	summary: `Summary of ${key}`,
+	issueType: "Story",
+	status: "To Do",
+	priority: "Medium",
+	importedIn,
+});
+
+const boardDialog = (route: Route) =>
+	mount(
+		<JiraBoardImportDialog
+			projects={[{ name: "p1" }, { name: "p2" }] as unknown as ProjectView[]}
+			onClose={() => {}}
+			navigate={() => {}}
+		/>,
+		route,
+	);
+
+const boardSearch = (root: Element): HTMLTextAreaElement => {
+	const area = q<HTMLTextAreaElement>(root, "form.jira-search textarea");
+	return area;
+};
+
+const rowSelects = (root: Element): HTMLSelectElement[] =>
+	[...root.querySelectorAll("li.jira-row select")] as HTMLSelectElement[];
+
+const boardImportButton = importButton;
+
+describe("JiraBoardImportButton", () => {
+	test("renders the entry and opens on click", async () => {
+		let opened = 0;
+		const { container, unmount } = await mount(
+			<JiraBoardImportButton onOpen={() => (opened += 1)} />,
+			() => json(200, {}),
+		);
+		try {
+			const b = [...container.querySelectorAll("button")].find(
+				(x) => x.textContent === "Import from Jira",
+			);
+			if (b === undefined) throw new Error("button missing");
+			expect(b.getAttribute("title")).toContain("whole board");
+			await fire(b, "onClick");
+			expect(opened).toBe(1);
+		} finally {
+			await unmount();
+		}
+	});
+});
+
+describe("JiraBoardImportDialog", () => {
+	test("with no connections it points at Settings", async () => {
+		const { container, calls, unmount } = await boardDialog(
+			({ url, method }) =>
+				url.endsWith(CONNS) && method === "GET"
+					? json(200, [])
+					: json(500, { error: "unexpected" }),
+		);
+		try {
+			expect(calls.map((c) => c.url)).toEqual([CONNS]);
+			expect(container.textContent).toContain("No Jira connection yet.");
+			const link = q<HTMLAnchorElement>(container, "a");
+			expect(link.getAttribute("href")).toBe("/settings");
+			expect(link.textContent).toContain("Open Settings to add one");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("searches the chosen connection and renders rows with picks at 0", async () => {
+		const { container, calls, unmount } = await boardDialog(
+			({ url, method }) =>
+				url.endsWith(CONNS) && method === "GET"
+					? json(200, [
+							{
+								name: "work",
+								site: "https://acme.atlassian.net",
+								type: "cloud",
+								email: "me@acme.test",
+								customFields: [],
+								tokenSet: true,
+								tokenReadable: true,
+								usedBy: [],
+							},
+						])
+					: json(200, {
+							rows: [
+								boardRow("BRD-1"),
+								boardRow("BRD-2", [{ project: "p1", task: "t1" }]),
+							],
+							next: null,
+							total: 2,
+						}),
+		);
+		try {
+			expect(calls.map((c) => c.url)).toEqual([CONNS]);
+			const conn = q<HTMLSelectElement>(container, "form.jira-search select");
+			expect(conn.value).toBe("work");
+			const area = boardSearch(container);
+			expect(area.value).toBe("");
+			expect(area.getAttribute("placeholder")).toContain("project = PROJ");
+			await fire(area, "onChange", { target: { value: "order by key" } });
+			await submit(q(container, "form.jira-search"));
+			expect(calls[1]).toEqual({
+				method: "POST",
+				url: BSEARCH,
+				body: { connection: "work", jql: "order by key", cursor: null },
+			});
+			expect(container.querySelectorAll("li.jira-row")).toHaveLength(2);
+			// Every row starts unpicked.
+			for (const sel of rowSelects(container)) expect(sel.value).toBe("");
+			const sel0 = rowSelects(container)[0];
+			if (sel0 === undefined) throw new Error("row select missing");
+			expect(sel0.getAttribute("aria-label")).toBe("BRD-1: choose project");
+			// The already-imported row names the project and links to its card.
+			const li = rowSelects(container)[1]?.closest("li");
+			expect(li?.textContent).toContain("already in");
+			expect(
+				li?.querySelector('a[href="/projects/p1/tasks/t1"]'),
+			).not.toBeNull();
+			expect(loadMore(container)).toBeUndefined();
+			expect(boardImportButton(container).disabled).toBe(true);
+			expect(boardImportButton(container).textContent).toBe("Import 0");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a project pick arms the import and files into that project", async () => {
+		const { container, calls, unmount } = await boardDialog(
+			({ url, method, body }) => {
+				if (url.endsWith(CONNS) && method === "GET")
+					return json(200, [
+						{
+							name: "work",
+							site: "https://acme.atlassian.net",
+							type: "cloud",
+							email: "me@acme.test",
+							customFields: [],
+							tokenSet: true,
+							tokenReadable: true,
+							usedBy: [],
+						},
+					]);
+				if (url.endsWith(BIMPORT))
+					return json(200, {
+						filed: [{ project: "p2", key: "BRD-1", task: "t9" }],
+						skipped: [],
+						unavailable: [],
+					});
+				const cursor =
+					typeof body === "object" && body !== null && "cursor" in body
+						? body.cursor
+						: null;
+				return cursor === null
+					? json(200, { rows: [boardRow("BRD-1")], next: null, total: 1 })
+					: json(200, { rows: [], next: null, total: 1 });
+			},
+		);
+		try {
+			const area = boardSearch(container);
+			await fire(area, "onChange", { target: { value: "order by key" } });
+			await submit(q(container, "form.jira-search"));
+			const sel0 = rowSelects(container)[0];
+			if (sel0 === undefined) throw new Error("row select missing");
+			await fire(sel0, "onChange", {
+				target: { value: "p2" },
+			});
+			expect(boardImportButton(container).textContent).toBe("Import 1");
+			await fire(boardImportButton(container), "onClick");
+			const imp = calls.find((c) => c.url === BIMPORT);
+			if (imp === undefined) throw new Error("import call missing");
+			expect(imp.body).toEqual({
+				connection: "work",
+				stage: "backlog",
+				assignments: [{ key: "BRD-1", project: "p2" }],
+			});
+			expect(status(container)).toBe("Filed 1 card");
+			// The refresh re-ran the search so importedIn updates.
+			expect(calls.filter((c) => c.url === BSEARCH)).toHaveLength(2);
+			expect(boardImportButton(container).disabled).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("skip keeps the row out of the assignments", async () => {
+		const { container, calls, unmount } = await boardDialog(
+			({ url, method, body }) => {
+				if (url.endsWith(CONNS) && method === "GET")
+					return json(200, [
+						{
+							name: "work",
+							site: "https://acme.atlassian.net",
+							type: "cloud",
+							email: "me@acme.test",
+							customFields: [],
+							tokenSet: true,
+							tokenReadable: true,
+							usedBy: [],
+						},
+					]);
+				if (url.endsWith(BIMPORT))
+					return json(200, {
+						filed: [{ project: "p2", key: "BRD-1", task: "t9" }],
+						skipped: [],
+						unavailable: [],
+					});
+				const cursor =
+					typeof body === "object" && body !== null && "cursor" in body
+						? body.cursor
+						: null;
+				return cursor === null
+					? json(200, {
+							rows: [boardRow("BRD-1"), boardRow("BRD-2")],
+							next: null,
+							total: 2,
+						})
+					: json(200, { rows: [], next: null, total: 2 });
+			},
+		);
+		try {
+			const area = boardSearch(container);
+			await fire(area, "onChange", { target: { value: "order by key" } });
+			await submit(q(container, "form.jira-search"));
+			const sel0 = rowSelects(container)[0];
+			if (sel0 === undefined) throw new Error("row select missing");
+			await fire(sel0, "onChange", {
+				target: { value: "p2" },
+			});
+			const sel1 = rowSelects(container)[1];
+			if (sel1 === undefined) throw new Error("row select missing");
+			await fire(sel1, "onChange", {
+				target: { value: "/" },
+			});
+			expect(boardImportButton(container).textContent).toBe("Import 1");
+			await fire(boardImportButton(container), "onClick");
+			const imp = calls.find((c) => c.url === BIMPORT);
+			if (imp === undefined) throw new Error("import call missing");
+			expect((imp.body as { assignments: unknown[] }).assignments).toEqual([
+				{ key: "BRD-1", project: "p2" },
+			]);
 		} finally {
 			await unmount();
 		}

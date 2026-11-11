@@ -1577,3 +1577,44 @@ export interface JiraImportResult {
 	skipped: string[];
 	unavailable: string[];
 }
+
+/** One project that holds a card for a key (board-wide search, spec section 6). */
+export interface JiraBoardImported {
+	/** Project name. */
+	project: string;
+	/** Task id of the card in that project. */
+	task: string;
+}
+
+/** One row of the board-wide search: the facts of JiraRow, plus every project holding a card. */
+export interface JiraBoardRow {
+	key: string;
+	/** `${site}/browse/${key}` */
+	url: string;
+	summary: string;
+	issueType: string;
+	status: string;
+	/** "" when none. */
+	priority: string;
+	/** Sorted by project name; empty when no project holds a card. */
+	importedIn: JiraBoardImported[];
+}
+
+export interface JiraBoardSearchResult {
+	rows: JiraBoardRow[];
+	next: string | null;
+	total: number | null;
+}
+
+/** One row's deliberate choice (spec section 6): this key files into this project. */
+export interface JiraBoardAssignment {
+	key: string;
+	project: string;
+}
+
+/** filed names the project and the new task; skipped = already imported in that project; unavailable = keys Jira did not return (gone or no access). */
+export interface JiraBoardImportResult {
+	filed: { project: string; key: string; task: string }[];
+	skipped: { project: string; key: string }[];
+	unavailable: string[];
+}

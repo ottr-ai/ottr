@@ -9,6 +9,8 @@ import type { JiraNet } from "./jira.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import { ProjectStore } from "./store.ts";
 import type {
+	JiraBoardImportResult,
+	JiraBoardSearchResult,
 	JiraConnectionView,
 	JiraImportResult,
 	JiraSearchResult,
@@ -146,7 +148,10 @@ for (const name of ["p1", "p2"]) {
 }
 const p1Entry = projects.get("p1");
 if (p1Entry === undefined) throw new Error("p1 was not registered");
-const p1 = p1Entry.store;
+const p1Store = p1Entry.store;
+if (!(p1Store instanceof ProjectStore))
+	throw new Error("p1 store is not a ProjectStore");
+const p1 = p1Store;
 
 /** The first request the Jira stub saw since the test cleared `seen`. */
 function firstSeen(): Seen {
@@ -518,6 +523,161 @@ describe("search and import", () => {
 		]);
 		expect(a.json.filed.length + b.json.filed.length).toBe(1);
 		expect(a.json.skipped.length + b.json.skipped.length).toBe(1);
+	});
+});
+
+describe("board-wide search and import", () => {
+	const p2Entry = projects.get("p2");
+	if (p2Entry === undefined) throw new Error("p2 was not registered");
+	const p2Store = p2Entry.store;
+	if (!(p2Store instanceof ProjectStore))
+		throw new Error("p2 store is not a ProjectStore");
+	const p2 = p2Store;
+	const boardSearch = (jql: string, connection = "work") =>
+		call<JiraBoardSearchResult>("/api/jira/search", { connection, jql });
+	const boardImport = (assignments: unknown, stage = "backlog") =>
+		call<JiraBoardImportResult>("/api/jira/import", {
+			connection: "work",
+			stage,
+			assignments,
+		});
+
+	test("board search hits Jira live and writes no project settings", async () => {
+		await call("/api/projects/p2/settings", { jiraConnection: "work" });
+		const p1Jql = p1.getSettings().jiraLastJql;
+		const p2Jql = p2.getSettings().jiraLastJql;
+		seen.length = 0;
+		const r = await boardSearch("project = PROJ");
+		expect(r.status).toBe(200);
+		const req = firstSeen();
+		expect(req.method).toBe("POST");
+		expect(req.path).toBe("/rest/api/3/search/jql");
+		expect(req.auth).toBe(
+			`Basic ${Buffer.from(`me@example.com:${CLOUD_TOKEN}`).toString("base64")}`,
+		);
+		const card = p1.jiraImported("https://jira.test", ["PROJ-1"]).get("PROJ-1");
+		expect(r.json.rows[0]?.importedIn).toEqual(
+			card === undefined ? [] : [{ project: "p1", task: card }],
+		);
+		expect(p1.getSettings().jiraLastJql).toBe(p1Jql);
+		expect(p2.getSettings().jiraLastJql).toBe(p2Jql);
+	});
+
+	test("one key can be imported into two projects on purpose; a repeat skips", async () => {
+		const first = await boardImport([{ key: "BULK-2001", project: "p1" }]);
+		expect(first.status).toBe(200);
+		const filed = first.json.filed;
+		expect(filed).toEqual([
+			{ project: "p1", key: "BULK-2001", task: filed[0]?.task ?? "" },
+		]);
+		expect(first.json.skipped).toEqual([]);
+		expect(first.json.unavailable).toEqual([]);
+		const task = p1.getTask(filed[0]?.task ?? "");
+		expect(task?.title).toBe("BULK-2001: Summary BULK-2001");
+		expect(task?.stage).toBe("backlog");
+
+		const s1 = await boardSearch("key in (BULK-2001)");
+		expect(s1.json.rows[0]?.importedIn).toEqual([
+			{ project: "p1", task: filed[0]?.task ?? "" },
+		]);
+
+		const second = await boardImport([{ key: "BULK-2001", project: "p2" }]);
+		expect(second.json.filed).toHaveLength(1);
+		const p2Card = second.json.filed[0]?.task ?? "";
+		expect(p2.getTask(p2Card)?.title).toBe("BULK-2001: Summary BULK-2001");
+
+		const s2 = await boardSearch("key in (BULK-2001)");
+		expect(s2.json.rows[0]?.importedIn).toEqual([
+			{ project: "p1", task: filed[0]?.task ?? "" },
+			{ project: "p2", task: p2Card },
+		]);
+
+		const repeat = await boardImport([{ key: "BULK-2001", project: "p1" }]);
+		expect(repeat.status).toBe(200);
+		expect(repeat.json.filed).toEqual([]);
+		expect(repeat.json.skipped).toEqual([{ project: "p1", key: "BULK-2001" }]);
+	});
+
+	test("one request can file the same key into two projects", async () => {
+		const r = await boardImport([
+			{ key: "BULK-2002", project: "p2" },
+			{ key: "BULK-2002", project: "p1" },
+		]);
+		expect(r.status).toBe(200);
+		expect(r.json.filed).toHaveLength(2);
+		expect(r.json.skipped).toEqual([]);
+		expect(p1.jiraImported("https://jira.test", ["BULK-2002"]).size).toBe(1);
+		expect(p2.jiraImported("https://jira.test", ["BULK-2002"]).size).toBe(1);
+	});
+
+	test("a project without its own connection imports from the board connection", async () => {
+		await call("/api/projects/p2/settings", { jiraConnection: null });
+		const r = await boardImport([{ key: "BULK-2003", project: "p2" }]);
+		expect(r.status).toBe(200);
+		expect(r.json.filed).toEqual([
+			{ project: "p2", key: "BULK-2003", task: r.json.filed[0]?.task ?? "" },
+		]);
+		const none = await call("/api/projects/p2/jira/search", { jql: "x" });
+		expect(none.status).toBe(409);
+		expect(none.json.error).toBe("no Jira connection for this project");
+	});
+
+	test("the whole request is validated before anything files", async () => {
+		const bad = (body: Record<string, unknown>) =>
+			call<JiraBoardImportResult>("/api/jira/import", body);
+		const bulkP1 = { key: "BULK-2010", project: "p1" };
+		expect(
+			(await bad({ connection: 7, stage: "backlog", assignments: [bulkP1] }))
+				.status,
+		).toBe(400);
+		expect(
+			(
+				await bad({
+					connection: "nope",
+					stage: "backlog",
+					assignments: [bulkP1],
+				})
+			).status,
+		).toBe(404);
+		expect(
+			(await bad({ connection: "work", stage: "done", assignments: [bulkP1] }))
+				.status,
+		).toBe(400);
+		expect(
+			(await bad({ connection: "work", stage: "backlog", assignments: [] }))
+				.status,
+		).toBe(400);
+		expect(
+			(
+				await bad({
+					connection: "work",
+					stage: "backlog",
+					assignments: [{ key: "proj-1", project: "p1" }],
+				})
+			).status,
+		).toBe(400);
+		const unknownProject = await call<
+			JiraBoardImportResult & { error: string }
+		>("/api/jira/import", {
+			connection: "work",
+			stage: "backlog",
+			assignments: [{ key: "BULK-2010", project: "nope" }],
+		});
+		expect(unknownProject.status).toBe(400);
+		expect(unknownProject.json.error).toBe("unknown project: nope");
+		for (const store of [p1, p2])
+			expect(store.jiraImported("https://jira.test", ["BULK-2010"]).size).toBe(0);
+		const ok = await boardImport([{ key: "BULK-2011", project: "p1" }]);
+		expect(ok.status).toBe(200);
+		expect(ok.json.filed).toHaveLength(1);
+	});
+
+	test("a key Jira does not return is unavailable", async () => {
+		const r = await boardImport([{ key: "PROJ-99", project: "p1" }]);
+		expect(r.status).toBe(200);
+		expect(r.json.filed).toEqual([]);
+		expect(r.json.skipped).toEqual([]);
+		expect(r.json.unavailable).toEqual(["PROJ-99"]);
 	});
 });
 

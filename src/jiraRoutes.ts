@@ -16,6 +16,11 @@ import { type JiraIssue, jiraCardPrompt, jiraCardTitle } from "./jiraCards.ts";
 import type { SecretBox } from "./secretBox.ts";
 import type { ProjectStore } from "./store.ts";
 import type {
+	JiraBoardAssignment,
+	JiraBoardImported,
+	JiraBoardImportResult,
+	JiraBoardRow,
+	JiraBoardSearchResult,
 	JiraConnectionView,
 	JiraImportResult,
 	JiraRow,
@@ -427,6 +432,166 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		} satisfies JiraImportResult);
 	}
 
+	/** Per key, every project holding a card for it at the connection's site (spec section 6). */
+	function aggregateImported(
+		site: string,
+		keys: string[],
+	): Map<string, JiraBoardImported[]> {
+		const aggregated = new Map<string, JiraBoardImported[]>();
+		for (const [project, e] of d.projects)
+			for (const [key, task] of e.store.jiraImported(site, keys)) {
+				const list = aggregated.get(key) ?? [];
+				list.push({ project, task });
+				aggregated.set(key, list);
+			}
+		for (const list of aggregated.values())
+			list.sort((a, b) =>
+				a.project < b.project ? -1 : a.project > b.project ? 1 : 0,
+			);
+		return aggregated;
+	}
+
+	/** Board-wide search (spec section 6): one Jira query, no project settings written. */
+	async function boardSearch(body: Record<string, unknown>): Promise<Response> {
+		const box = d.box;
+		if (box === undefined) return noBox();
+		const name = body.connection;
+		if (typeof name !== "string" || name === "")
+			return json({ error: "connection must be a Jira connection name" }, 400);
+		const q = parseSearch(body);
+		if (typeof q === "string") return json({ error: q }, 400);
+		const { jql, cursor } = q;
+		const conn = openConnection(name, box);
+		if (conn instanceof Response) return conn;
+		const page = await searchIssues(conn, jql, cursor, d.net).catch((err) =>
+			jiraFailure(name, err),
+		);
+		if (page instanceof Response) return page;
+		const aggregated = aggregateImported(
+			conn.site,
+			page.issues.map((i) => i.key),
+		);
+		const rows: JiraBoardRow[] = page.issues.map((i) => ({
+			key: i.key,
+			url: `${conn.site}/browse/${i.key}`,
+			summary: i.summary,
+			issueType: i.issueType,
+			status: i.status,
+			priority: i.priority,
+			importedIn: aggregated.get(i.key) ?? [],
+		}));
+		return json({
+			rows,
+			next: page.next,
+			total: page.total,
+		} satisfies JiraBoardSearchResult);
+	}
+
+	/** Board-wide import (spec section 6): validate everything, then one transaction per project. */
+	async function boardImport(body: Record<string, unknown>): Promise<Response> {
+		const box = d.box;
+		if (box === undefined) return noBox();
+		const name = body.connection;
+		if (typeof name !== "string" || name === "")
+			return json({ error: "connection must be a Jira connection name" }, 400);
+		const stage = body.stage;
+		if (stage !== "backlog" && stage !== "todo")
+			return json({ error: 'stage must be "backlog" or "todo"' }, 400);
+		const raw = body.assignments;
+		if (
+			!Array.isArray(raw) ||
+			raw.length === 0 ||
+			raw.some(
+				(a) =>
+					a === null ||
+					typeof a !== "object" ||
+					typeof (a as JiraBoardAssignment).key !== "string" ||
+					!ISSUE_KEY.test((a as JiraBoardAssignment).key) ||
+					typeof (a as JiraBoardAssignment).project !== "string" ||
+					(a as JiraBoardAssignment).project === "",
+			)
+		)
+			return json(
+				{
+					error:
+						'assignments must be key/project pairs like {key: "PROJ-1", project: "p1"}',
+				},
+				400,
+			);
+		const assignments = raw as JiraBoardAssignment[];
+		for (const a of assignments)
+			if (!d.projects.has(a.project))
+				return json({ error: `unknown project: ${a.project}` }, 400);
+		const conn = openConnection(name, box);
+		if (conn instanceof Response) return conn;
+		// First-seen key order, deduped per (key, project).
+		const order: string[] = [];
+		const seen = new Set<string>();
+		const byProject = new Map<string, string[]>(); // project -> keys, first-seen
+		for (const { key, project } of assignments) {
+			if (!seen.has(key)) {
+				seen.add(key);
+				order.push(key);
+			}
+			const keys = byProject.get(project) ?? [];
+			if (!keys.includes(key)) {
+				keys.push(key);
+				byProject.set(project, keys);
+			}
+		}
+		const issues = await fetchIssues(conn, order).catch((err) =>
+			jiraFailure(name, err),
+		);
+		if (issues instanceof Response) return issues;
+		const unavailable = order.filter((k) => !issues.has(k));
+		const filed: { project: string; key: string; task: string }[] = [];
+		const skipped: { project: string; key: string }[] = [];
+		let anyFiled = false;
+		// One transaction per project group; the store re-checks inside its transaction.
+		for (const project of [...byProject.keys()].sort()) {
+			const items = byProject.get(project)!.flatMap((k) => {
+				const issue = issues.get(k);
+				return issue === undefined
+					? []
+					: [
+							{
+								key: k,
+								title: jiraCardTitle(k, issue.summary),
+								prompt: jiraCardPrompt(conn.site, issue),
+							},
+						];
+			});
+			const e = d.projects.get(project)!;
+			const result = e.store.fileJiraCards({
+				site: conn.site,
+				stage,
+				items,
+				now: d.now(),
+			});
+			// Both lists follow items' order: skipped names the passed-over key, filed the created task.
+			let si = 0;
+			let fi = 0;
+			for (const item of items) {
+				if (result.skipped[si] === item.key) {
+					si++;
+					skipped.push({ project, key: item.key });
+				} else {
+					const task = result.filed[fi++];
+					if (task === undefined)
+						throw new Error("fileJiraCards returned no task for " + item.key);
+					filed.push({ project, key: item.key, task: task.id });
+					anyFiled = true;
+				}
+			}
+		}
+		if (stage === "todo" && anyFiled) d.schedule();
+		return json({
+			filed,
+			skipped,
+			unavailable,
+		} satisfies JiraBoardImportResult);
+	}
+
 	/** Settings POST: a jiraConnection string must name a stored connection. */
 	function settingsRefusal(name: string | null | undefined): Response | null {
 		if (typeof name !== "string") return null;
@@ -443,6 +608,8 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		test,
 		search,
 		importIssues,
+		boardSearch,
+		boardImport,
 		settingsRefusal,
 	};
 }

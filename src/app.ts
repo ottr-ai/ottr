@@ -10988,6 +10988,15 @@ export function createApp(deps: AppDeps) {
 		"/api/jira/detect": {
 			POST: (req) => api(req, () => jiraPost(req, jira.detect)),
 		},
+		"/api/jira/search": {
+			POST: (req) => api(req, () => jiraPost(req, jira.boardSearch)),
+		},
+		"/api/jira/import": {
+			POST: (req) =>
+				api(req, () => jiraPost(req, jira.boardImport), {
+					costly: true,
+				}),
+		},
 		"/api/projects/:project/jira/search": {
 			POST: (req) =>
 				api(req, () =>

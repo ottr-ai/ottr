@@ -4897,6 +4897,12 @@ dialog.diff-view {
 	flex: none;
 	margin-top: 2px;
 }
+/* Board-wide import (spec section 6): the per-row project pick sits at the row's end. */
+.jira-row > select {
+	flex: none;
+	margin-top: 2px;
+	margin-left: auto;
+}
 .jira-row-text {
 	display: flex;
 	flex-direction: column;
