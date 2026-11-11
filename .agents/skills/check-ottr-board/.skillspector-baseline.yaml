@@ -4,11 +4,11 @@ version: 2
 scanner_version: 2.13.0
 rules: []
 fingerprints:
-- hash: sha256:f913ed4e9011f25c869f2b00ca2aeb9940ebc6f914c70759714585265c307338
+- hash: sha256:018bd30a544b06427f9c7711fecb8d5e0972139e4ca9472ded59fb7d24cc8753
   rule_id: TM1
   file: SKILL.md
-  reason: "Accepted 2026-11-06: the step 4 row 'local main diverged' is prose for a manual repair that the user approves first (drain, rebase onto origin/main, push with a token, end the drain); the skill runs no tool with these parameters itself."
-- hash: sha256:ad002305978f1c101421005bcd9bc7e6e7916053de9d474e9fd5b893c2acad27
+  reason: "Accepted 2026-11-06: the step 4 row 'local main diverged' is prose for a manual repair that the user approves first (drain, rebase onto origin/main, push with a token, end the drain); the skill runs no tool with these parameters itself. Hash regenerated 2026-11-11 against the shipped SKILL.md bytes."
+- hash: sha256:a065fd4c4a664817cbc2744c6b9422651a004224e2c58e223342910419c64913
   rule_id: LP3
   file: SKILL.md
-  reason: "Accepted 2026-11-06: an omp managed skill has no allowed-tools frontmatter; the tool scope comes from the session, and the skill text asks the user before every write outside the board API (same family as impeccable LP3)."
+  reason: "Accepted 2026-11-06: an omp managed skill has no allowed-tools frontmatter; the tool scope comes from the session, and the skill text asks the user before every write outside the board API (same family as impeccable LP3). Hash regenerated 2026-11-11 against the shipped SKILL.md bytes."
