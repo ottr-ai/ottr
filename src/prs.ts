@@ -275,30 +275,42 @@ function parsePrComments(body: unknown): IssueComment[] {
 	return out;
 }
 
-/** Reads a pull request's comments (the issues endpoint, one page of 100); every field
- * is parsed as untrusted data. Throws on a failed gh call or an unparseable body — the
- * caller (the supervisor's rebase-answer watch) logs and skips. */
+/** Reads a pull request's comments (the issues endpoint, oldest first), paging until a
+ * short page or the page bound so a reply beyond the first 100 comments is still seen
+ * (OTTR-809: the orphan answer may sit late in a long thread). Every field is parsed as
+ * untrusted data. Throws on a failed gh call or an unparseable body — the caller (the
+ * supervisor's rebase-answer watch) logs and skips. */
 export async function listPrComments(o: {
 	repo: string;
 	number: number;
+	/** Upper bound on pages of 100; the default caps the read at 1000 comments. */
+	maxPages?: number;
 	gh?: GhFn;
 }): Promise<IssueComment[]> {
 	const gh = o.gh ?? runGh;
-	const r = await gh([
-		"api",
-		`repos/${o.repo}/issues/${o.number}/comments?per_page=100`,
-	]);
-	if (r.code !== 0)
-		throw new Error(
-			`gh comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
-		);
-	let j: unknown;
-	try {
-		j = JSON.parse(r.stdout);
-	} catch {
-		throw new Error("gh comments returned an unparseable body");
+	const maxPages = o.maxPages ?? 10;
+	const out: IssueComment[] = [];
+	for (let page = 1; page <= maxPages; page++) {
+		const r = await gh([
+			"api",
+			`repos/${o.repo}/issues/${o.number}/comments?per_page=100&page=${page}`,
+		]);
+		if (r.code !== 0)
+			throw new Error(
+				`gh comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
+			);
+		let j: unknown;
+		try {
+			j = JSON.parse(r.stdout);
+		} catch {
+			throw new Error("gh comments returned an unparseable body");
+		}
+		out.push(...parsePrComments(j));
+		// The raw length decides the end: parsePrComments skips malformed entries,
+		// so a parsed count under 100 must not read as the last page.
+		if (!Array.isArray(j) || j.length < 100) break;
 	}
-	return parsePrComments(j);
+	return out;
 }
 
 /** OTTR-809: true when a Dependabot comment answers that it cannot rebase the pull

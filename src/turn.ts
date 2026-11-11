@@ -6141,6 +6141,15 @@ export function createTurnLoop(
 			adoptSourcePr(st, n, head, src.url);
 			return;
 		}
+		// A cherry-picked or rebased branch may still hold nothing but the bump: its
+		// diff against the target then equals the source PR's own diff, and the card
+		// adopts — a follow-up PR would carry the same content twice. Unrelated target
+		// changes are not fixes; a conflicting resolution or a real fix changes the
+		// patch and ships.
+		if (await carriesNoFixes(st, head, tip)) {
+			adoptSourcePr(st, n, head, src.url);
+			return;
+		}
 		// The branch holds work beyond the PR head: fixes on top, or a cherry-pick that
 		// resolved conflicts against a moved base.
 		const onHead = await ops
@@ -6164,6 +6173,35 @@ export function createTurnLoop(
 			return;
 		}
 		await parkOnSourcePr(st, n, src);
+	}
+
+	/** True when the card branch's diff against the target tip equals the source PR's
+	 * own diff — a cherry-picked or rebased bump with no fixes beyond it. The two-dot
+	 * diffs are right for the promoted paths: the merge prompt rebases or cherry-picks
+	 * onto the target, so the card branch descends from the target tip and its diff
+	 * holds exactly the carried work. Git trouble or an unwired diff op reads as fixes:
+	 * the follow-up path is the safe delivery for work we cannot prove empty. */
+	async function carriesNoFixes(
+		st: TurnSettle,
+		head: string,
+		tip: string,
+	): Promise<boolean> {
+		const diffText = ops.diffText;
+		if (diffText === undefined) return false;
+		const headParent = await ops
+			.targetSha(st.e.path, `${head}^`)
+			.catch(() => null);
+		const targetTip = await ops
+			.targetSha(st.e.path, st.header.target)
+			.catch(() => null);
+		if (headParent === null || targetTip === null) return false;
+		const srcDiff = await diffText(st.e.path, headParent, head).catch(
+			() => null,
+		);
+		const cardDiff = await diffText(st.e.path, targetTip, tip).catch(
+			() => null,
+		);
+		return srcDiff !== null && cardDiff !== null && srcDiff === cardDiff;
 	}
 
 	/** Re-reads the source PR's current head before the ship judges the card branch: a

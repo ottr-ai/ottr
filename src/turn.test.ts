@@ -109,6 +109,7 @@ import {
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
+	diffText as realDiffText,
 	fetchOriginBranch as realFetchOriginBranch,
 	fetchPrHead as realFetchPrHead,
 	prIntegrated as realPrIntegrated,
@@ -21246,6 +21247,8 @@ describe("turn PR-mode merge settle", () => {
 					realTargetContains(main, sha, tip),
 				treesEqual: (_m: string, a: string, b: string) =>
 					realTreesEqual(main, a, b),
+				diffText: (_m: string, a: string, b: string) =>
+					realDiffText(main, a, b),
 				pushBranch: async (_m: string, branch: string, _o: string) =>
 					pushBranchReal(main, branch, bare),
 				fetchPrHead: async (_m: string, n: number, _url: string) =>
@@ -21305,6 +21308,94 @@ describe("turn PR-mode merge settle", () => {
 		} finally {
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
+	});
+
+	test("a clean cherry-picked bump with an unrelated target advance adopts (OTTR-809)", async () => {
+		// The target advanced (an unrelated file), so the cherry-picked bump differs
+		// from the bot head — but the card's diff against the target equals the bump,
+		// so there are no fixes and no second PR: the card adopts and waits.
+		let opened = false;
+		const BUMP = "diff --git a/pkg.lock b/pkg.lock\n+vite 7";
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/ottr/pr/20"
+					? "pr-head"
+					: ref === "pr-head^"
+						? "pr-head-parent"
+						: ref === "origin/main"
+							? "target-tip"
+							: ref === "refs/heads/ott/m"
+								? "sha-cherry"
+								: "sha-old",
+			treesEqual: async () => false,
+			targetContains: async () => false,
+			diffText: async (_m: string, a: string, b: string) =>
+				(a === "pr-head-parent" && b === "pr-head") ||
+				(a === "target-tip" && b === "sha-cherry")
+					? BUMP
+					: "other patch",
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a clean source bump");
+			},
+			openPr: async () => {
+				opened = true;
+				return { ok: true as const, pr: { number: 99, url: null } };
+			},
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		expect(opened).toBe(false);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.prNumber).toBe(20);
+		expect(after.prHeadSha).toBe("pr-head");
+		expect(after.followUpPrNumber).toBe(null);
+	});
+
+	test("a cherry-picked bump whose patch differs ships the follow-up on the target (OTTR-809)", async () => {
+		// Same shape as the adopt case, but the card's patch carries more than the
+		// bump (one fix commit): the follow-up PR delivers it, based on the target.
+		const opens: { repo: string; branch: string; base: string }[] = [];
+		const BUMP = "diff --git a/pkg.lock b/pkg.lock\n+vite 7";
+		const { store, loop, task } = prMergeSetup({
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/ottr/pr/20"
+					? "pr-head"
+					: ref === "pr-head^"
+						? "pr-head-parent"
+						: ref === "origin/main"
+							? "target-tip"
+							: ref === "refs/heads/ott/m"
+								? "sha-cherry"
+								: "sha-old",
+			treesEqual: async () => false,
+			targetContains: async () => false,
+			diffText: async (_m: string, a: string, b: string) =>
+				a === "pr-head-parent" && b === "pr-head" ? BUMP : `${BUMP}\n+fix`,
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 36, url: "https://github.com/acme/repo/pull/36" },
+				};
+			},
+			prComment: async () => ({ ok: true as const }),
+		});
+		store.updateTask(task.id, sourcePr());
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			repo: "acme/repo",
+			branch: "ott/m",
+			base: "main",
+		});
+		expect(after.prNumber).toBe(20);
+		expect(after.followUpPrNumber).toBe(36);
 	});
 
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {

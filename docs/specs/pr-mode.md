@@ -238,11 +238,14 @@ step checks the source before it ever opens a PR:
   rebased branch that no longer descends from the head, and a legacy card
   without the head name, base on the target branch instead — the PR carries
   the rebased work, and once the bump merges the diff reduces to the fixes.
-  One comment on the source PR links the follow-up. The card stores the
-  follow-up in `follow_up_pr_number`/`follow_up_pr_url` (additive columns
-  migrated like the PR fields above) and waits in `merging`/`idle` until
-  both PRs merge; a re-ship adopts the open follow-up instead of opening
-  another one.
+  A branch whose diff against the target equals the source PR's own diff
+  holds no fixes (an unrelated target advance under a clean cherry-pick) and
+  adopts the source PR instead of opening a second one; git trouble reads as
+  fixes and ships. One comment on the source PR links the follow-up. The
+  card stores the follow-up in `follow_up_pr_number`/`follow_up_pr_url`
+  (additive columns migrated like the PR fields above) and waits in
+  `merging`/`idle` until both PRs merge; a re-ship adopts the open
+  follow-up instead of opening another one.
 - Everything else — a fork head without Dependabot —
   comments on the source PR (a note
   about the parked fixes otherwise) and parks the card `merging`/`needs_you`
@@ -321,7 +324,8 @@ go only once both PRs merged.
 
 A Dependabot card parked on the rebase handoff (its reason carries "the
 board asked @dependabot to rebase") reads its source PR's comments once per
-window (`listPrComments`, one page of 100, parsed as untrusted data). When a
+window (`listPrComments`, paged up to 1000 comments, parsed as untrusted
+data) so a reply beyond the first page is still seen. When a
 `dependabot[bot]` comment says Dependabot cannot rebase
 (`dependabotCannotRebase` — "That means Dependabot can't rebase it"), the
 park reason becomes: close the pull request, Dependabot reopens it from the
