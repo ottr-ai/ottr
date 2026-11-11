@@ -4519,6 +4519,38 @@ describe("Drawer approve button", () => {
 		expect(html).toContain("captured when it finished");
 		expect(html).not.toContain("/files?path=");
 	});
+
+	test("a done card with saved files renders the saved files section", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+			savedFiles: [
+				{ name: "mockup.html", size: 63210 },
+				{ name: "nested/style.css", size: 17 },
+			],
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-saved"');
+		expect(html).toContain("Saved files");
+		expect(html).toContain("saved-files?path=mockup.html");
+		expect(html).toContain("63.2 kB");
+		expect(html).toContain("Kept copies are under Saved files.");
+	});
+
+	test("a done card without saved files renders no saved section and keeps the old hint", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).not.toContain('id="drawer-saved"');
+		expect(html).toContain("The worktree is gone, so only the names remain.");
+		expect(html).not.toContain("Kept copies are under Saved files.");
+	});
 });
 
 describe("cancelled cards on the board", () => {

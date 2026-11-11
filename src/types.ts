@@ -931,6 +931,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	sessionTitle: string;
 	/** Repo-relative uncommitted worktree files; present on the drawer detail view only. */
 	worktreeFiles?: string[];
+	/** Repo-relative files kept when the worktree was removed; present on the drawer detail view only. */
+	savedFiles?: { name: string; size: number }[];
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences. */

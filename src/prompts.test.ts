@@ -980,6 +980,27 @@ describe("handoffMarkdown research report", () => {
 			}),
 		).not.toContain("## Research report");
 	});
+
+	test("renders the saved-files bullet when savedDir is set", () => {
+		expect(
+			handoffMarkdown({
+				task: base,
+				turns: [],
+				sessionsDir: "/s",
+				savedDir: "/p/.tasks/quarantine/t1",
+			}),
+		).toContain("- Saved files: `/p/.tasks/quarantine/t1`");
+	});
+
+	test("renders no saved-files bullet without savedDir", () => {
+		expect(
+			handoffMarkdown({
+				task: base,
+				turns: [],
+				sessionsDir: "/s",
+			}),
+		).not.toContain("Saved files:");
+	});
 });
 
 describe("deepen prompt contract", () => {

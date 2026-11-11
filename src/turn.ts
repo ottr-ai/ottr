@@ -209,6 +209,7 @@ import {
 	parseKeptChoices,
 	planKeptFinish,
 	type quarantineUntracked,
+	type saveDoneFiles,
 	slugify,
 	targetTracksRules,
 	worktreeAnchor,
@@ -902,6 +903,7 @@ export interface TurnOps {
 	ignoreInMain: typeof ignoreInMain;
 	branchMergedOrGone: typeof branchMergedOrGone;
 	quarantineUntracked: typeof quarantineUntracked;
+	saveDoneFiles: typeof saveDoneFiles;
 	trackedFiles: typeof trackedFiles;
 	hasRules: typeof hasRules;
 	/** True when the target ref's tree holds AGENTS.md (hasRules's git fact); absent = the real read. */
@@ -8882,6 +8884,7 @@ export function createTurnLoop(
 		st.store.updateTask(st.id, {
 			uncommittedFiles: await ops.statusFiles(st.loc.wt),
 		});
+		await saveDoneArtifacts(st);
 		try {
 			await ops.removeWorktree({
 				mainPath: st.e.path,
@@ -8892,6 +8895,31 @@ export function createTurnLoop(
 			st.log("- worktree removed");
 		} catch (err) {
 			st.log(`! removeWorktree: ${errmsg(err)}`);
+		}
+	}
+
+	/** Saves every file the done worktree leaves behind into the card's quarantine folder,
+	 * before removeWorktree deletes it. A save failure never blocks the removal: it is only
+	 * logged, the pre-change behavior (files lost) must not regress into a stuck settle. */
+	async function saveDoneArtifacts(st: TurnSettle): Promise<void> {
+		try {
+			const r = await ops.saveDoneFiles(
+				st.loc.wt,
+				join(st.store.tasksDir, "quarantine", st.id),
+				st.store.dataRoot,
+				REPORT_MAX_BYTES,
+			);
+			const names = [...r.moved, ...r.copied];
+			if (names.length > 0)
+				appendLog(
+					st.store,
+					st.id,
+					`saved ${names.length} file(s) to .tasks/quarantine/${st.id}: ${names.slice(0, 20).join(", ")}${names.length > 20 ? " …" : ""}`,
+				);
+			for (const f of r.tooLarge)
+				appendLog(st.store, st.id, `${f}: too large, not kept`);
+		} catch (err) {
+			appendLog(st.store, st.id, `saving done files failed: ${errmsg(err)}`);
 		}
 	}
 

@@ -533,6 +533,7 @@ export function handoffMarkdown(o: {
 	task: ListedTask;
 	turns: Turn[];
 	sessionsDir: string;
+	savedDir?: string | null;
 }): string {
 	const t = o.task;
 	const last = o.turns.at(-1);
@@ -554,12 +555,13 @@ export function handoffMarkdown(o: {
 	// A research card's deliverable is the report: the worktree is gone, so the follow-up
 	// must carry the full markdown, not just the summary.
 	const report = t.report ? `\n## Research report\n\n${t.report}\n` : "";
+	const saved = o.savedDir ? `\n- Saved files: \`${o.savedDir}\`` : "";
 	return `# Handoff: ${t.title}
 
 Task \`${t.id}\` in project \`${t.project}\` is completed. This handoff continues it in a new session; its worktree was already removed.
 
 - Branch: \`${t.branch ?? "none"}\`
-- Started: ${fmt(t.createdAt)} · Finished: ${fmt(last?.endedAt ?? null)}${session}
+- Started: ${fmt(t.createdAt)} · Finished: ${fmt(last?.endedAt ?? null)}${session}${saved}
 
 ## Original task
 

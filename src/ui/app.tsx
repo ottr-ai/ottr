@@ -6461,6 +6461,14 @@ function fmtTokens(n: number): string {
 			: String(n);
 }
 
+function fmtBytes(n: number): string {
+	return n >= 1e6
+		? `${(n / 1e6).toFixed(1)} MB`
+		: n >= 1e3
+			? `${(n / 1e3).toFixed(1)} kB`
+			: `${n} B`;
+}
+
 async function fetchSessionContext(
 	url: string,
 ): Promise<SessionContext | null> {
@@ -9937,7 +9945,9 @@ function DrawerFiles(p: {
 					<div className="wt-files">
 						<p className="hint">
 							{task.stage === "done"
-								? "Uncommitted files this task produced, captured when it finished. The worktree is gone, so only the names remain."
+								? task.savedFiles != null && task.savedFiles.length > 0
+									? "Uncommitted files this task produced, captured when it finished. Kept copies are under Saved files."
+									: "Uncommitted files this task produced, captured when it finished. The worktree is gone, so only the names remain."
 								: "Uncommitted files this task produced. Open them before the worktree is removed."}
 						</p>
 						{task.worktreeFiles.slice(0, 50).map((f) =>
@@ -9959,6 +9969,31 @@ function DrawerFiles(p: {
 						)}
 						{task.worktreeFiles.length > 50 && (
 							<p className="hint">…and {task.worktreeFiles.length - 50} more</p>
+						)}
+					</div>
+				</DrawerSec>
+			)}
+			{task.savedFiles != null && task.savedFiles.length > 0 && (
+				<DrawerSec id="drawer-saved" label="Saved files">
+					<div className="wt-files">
+						<p className="hint">
+							Files this task left uncommitted, kept when its worktree was
+							removed.
+						</p>
+						{task.savedFiles.slice(0, 50).map((f) => (
+							<a
+								key={f.name}
+								className="wt-file"
+								href={`/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/saved-files?path=${encodeURIComponent(f.name)}`}
+								target="_blank"
+								rel="noreferrer"
+							>
+								{f.name}
+								<span className="saved-size">{fmtBytes(f.size)}</span>
+							</a>
+						))}
+						{task.savedFiles.length > 50 && (
+							<p className="hint">…and {task.savedFiles.length - 50} more</p>
 						)}
 					</div>
 				</DrawerSec>

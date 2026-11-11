@@ -837,6 +837,68 @@ describe("task routes", () => {
 		).toBe(404);
 	});
 
+	test("drawer detail lists saved files and serves them safely", async () => {
+		const t = store.createTask("with saved files");
+		store.updateTask(t.id, { stage: "done", state: "idle" });
+		const qdir = join(store.tasksDir, "quarantine", t.id);
+		mkdirSync(join(qdir, "nested"), { recursive: true });
+		writeFileSync(join(qdir, "mockup.html"), "<h1>hi</h1>");
+		writeFileSync(join(qdir, "nested", "style.css"), "h1 { color: red }");
+		const outside = join(root, "outside.txt");
+		writeFileSync(outside, "keep me");
+		symlinkSync(outside, join(qdir, "link.txt"));
+		const open = store.createTask("still open");
+
+		const detail = await get(`/api/projects/p1/tasks/${t.id}`);
+		expect(detail.status).toBe(200);
+		const b = (await detail.json()) as {
+			savedFiles?: { name: string; size: number }[];
+		};
+		expect(b.savedFiles).toEqual([
+			{ name: "mockup.html", size: 11 },
+			{ name: "nested/style.css", size: "h1 { color: red }".length },
+		]);
+
+		const html = await get(
+			`/api/projects/p1/tasks/${t.id}/saved-files?path=mockup.html`,
+		);
+		expect(html.status).toBe(200);
+		expect(await html.text()).toBe("<h1>hi</h1>");
+		expect(html.headers.get("content-type")).toContain("text/html");
+		expect(html.headers.get("content-security-policy")).toBe(
+			"sandbox allow-scripts",
+		);
+		expect(html.headers.get("x-content-type-options")).toBe("nosniff");
+		expect(html.headers.get("cache-control")).toBe("no-store");
+
+		const css = await get(
+			`/api/projects/p1/tasks/${t.id}/saved-files?path=nested/style.css`,
+		);
+		expect(css.status).toBe(200);
+
+		const traversal = await get(
+			`/api/projects/p1/tasks/${t.id}/saved-files?path=${encodeURIComponent("../outside.txt")}`,
+		);
+		expect(traversal.status).toBe(400);
+		const empty = await get(`/api/projects/p1/tasks/${t.id}/saved-files?path=`);
+		expect(empty.status).toBe(400);
+		const link = await get(
+			`/api/projects/p1/tasks/${t.id}/saved-files?path=link.txt`,
+		);
+		expect(link.status).toBe(404);
+		expect(
+			(
+				await get(
+					"/api/projects/p1/tasks/00000000/saved-files?path=mockup.html",
+				)
+			).status,
+		).toBe(404);
+
+		const openDetail = await get(`/api/projects/p1/tasks/${open.id}`);
+		const ob = (await openDetail.json()) as { savedFiles?: unknown };
+		expect("savedFiles" in ob).toBe(false);
+	});
+
 	test("drawer detail serves the captured uncommitted files for done cards", async () => {
 		// A merged card keeps its worktree path after the merge turn removed the directory.
 		const t = store.createTask("merged earlier");

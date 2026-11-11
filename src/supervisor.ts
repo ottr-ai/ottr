@@ -1491,6 +1491,9 @@ export function createSupervisor(
 				task: t,
 				turns: e.store.listTurns(t.id),
 				sessionsDir: e.store.sessionsDir,
+				savedDir: existsSync(join(e.store.tasksDir, "quarantine", t.id))
+					? join(e.store.tasksDir, "quarantine", t.id)
+					: null,
 			});
 			if (logs) handoff += logs;
 			writeBelow(e.store.dataRoot, handoffPath, handoff);

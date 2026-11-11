@@ -109,6 +109,7 @@ import {
 	fetchOriginBranch as realFetchOriginBranch,
 	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
+	saveDoneFiles as realSaveDoneFiles,
 	serverMergePush as realServerMergePush,
 	statusFiles as realStatusFiles,
 	targetCommits as realTargetCommits,
@@ -266,6 +267,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			record.quarantine.push({ worktreePath, quarantineDir });
 			return [];
 		},
+		saveDoneFiles: async () => ({ moved: [], copied: [], tooLarge: [] }),
 		worktreeHusk: async () => false,
 		trackedFiles: async () => [],
 		worktreeLinked: async () => true,
@@ -6213,6 +6215,102 @@ describe("turn research cards", () => {
 		expect(record.removeWorktree).toHaveLength(1);
 		// The run got the work prompt with the research hatch (the flag no longer picks a prompt).
 		expect(record.runs[0]!.prompt).toContain("only researches a topic");
+	});
+
+	test("done settle saves untracked files and logs the saved list (fake op)", async () => {
+		const { store, record, projects } = researchStore();
+		const saved: Array<{ wt: string; dir: string; root: string; max: number }> =
+			[];
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				createWorktree: async (o: { worktreePath: string }) => {
+					record.createWorktree.push(o);
+					mkdirSync(o.worktreePath, { recursive: true });
+					writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "# findings");
+				},
+				saveDoneFiles: async (wt, dir, root, max) => {
+					saved.push({ wt, dir, root, max });
+					return { moved: ["mockup.html"], copied: [], tooLarge: ["big.bin"] };
+				},
+			}),
+		);
+		const task = researchTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		// The save ran against the card's quarantine folder before the removal.
+		expect(saved).toHaveLength(1);
+		expect(saved[0]!.dir).toBe(join(store.tasksDir, "quarantine", after.id));
+		expect(saved[0]!.max).toBe(4 * 1024 * 1024);
+		// A save failure must never block the removal: removeWorktree still ran.
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(after.stage).toBe("done");
+		const log = logText(store, after.id);
+		expect(log).toContain(
+			`saved 1 file(s) to .tasks/quarantine/${after.id}: mockup.html`,
+		);
+		expect(log).toContain("big.bin: too large, not kept");
+	});
+
+	test("done settle runs the real saveDoneFiles: untracked files land in quarantine", async () => {
+		const { store, record, projects } = researchStore();
+		let wtPath = "";
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				createWorktree: async (o: { worktreePath: string }) => {
+					record.createWorktree.push(o);
+					wtPath = o.worktreePath;
+					mkdirSync(o.worktreePath, { recursive: true });
+					// The real saveDoneFiles runs git ls-files/status: a repo, not a plain dir.
+					execSync(`git init -q "${o.worktreePath}"`, { stdio: "ignore" });
+					writeFileSync(
+						join(o.worktreePath, RESEARCH_REPORT),
+						"# findings\n\nthe body",
+					);
+					writeFileSync(join(o.worktreePath, "mockup.md"), "mockup text");
+					writeFileSync(join(o.worktreePath, "mockup.html"), "<p>hi</p>");
+				},
+				// The real op: the fake worktree dir is a real directory, so containment holds.
+				saveDoneFiles: (wt, dir, root, max) =>
+					realSaveDoneFiles(wt, dir, root, max),
+				removeWorktree: async (o: { worktreePath: string }) => {
+					record.removeWorktree.push(o);
+					rmSync(o.worktreePath, { recursive: true, force: true });
+				},
+			}),
+		);
+		const task = researchTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("done");
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(existsSync(wtPath)).toBe(false);
+		expect(after.report).toBe("# findings\n\nthe body");
+		const savedHtml = join(
+			store.tasksDir,
+			"quarantine",
+			after.id,
+			"mockup.html",
+		);
+		expect(existsSync(savedHtml)).toBe(true);
+		expect(readFileSync(savedHtml, "utf8")).toBe("<p>hi</p>");
+		expect(
+			readFileSync(
+				join(store.tasksDir, "quarantine", after.id, RESEARCH_REPORT),
+				"utf8",
+			),
+		).toBe("# findings\n\nthe body");
+		const log = logText(store, after.id);
+		expect(log).toContain(`saved 3 file(s) to .tasks/quarantine/${after.id}: `);
+		for (const name of [RESEARCH_REPORT, "mockup.html", "mockup.md"])
+			expect(log).toContain(name);
 	});
 
 	test("a harvested report with a Recommended steps heading stores steps yes", async () => {

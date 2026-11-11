@@ -5,7 +5,7 @@
 // exits once the shots verify. Reuses the readme-screenshot machinery via shot-lib.ts;
 // adds no npm dependency. Spec: docs/specs/card-shot.md.
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -157,6 +157,16 @@ function plantCards(root: string, pr: number): Planted {
 			"INSERT INTO settings (key, value) VALUES ('next-task-num', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 			[JSON.stringify(next + 2)],
 		);
+		// OTTR-826: the done drawer's Saved files section reads the card's kept
+		// quarantine folder; plant two files and the captured uncommitted names for it.
+		db.run("UPDATE tasks SET uncommitted_files = ? WHERE id = ?", [
+			JSON.stringify(["mockup.html", "data/notes.csv"]),
+			doneSeed.id,
+		]);
+		const savedDir = join(root, PROJECT, ".tasks", "quarantine", doneSeed.id);
+		mkdirSync(join(savedDir, "data"), { recursive: true });
+		writeFileSync(join(savedDir, "mockup.html"), "<h1>Backoff mock</h1>\n");
+		writeFileSync(join(savedDir, "data", "notes.csv"), "t,ms\n0,250\n1,480\n");
 		return { prId: prSeed.id, doneId: doneSeed.id };
 	} finally {
 		db.close();

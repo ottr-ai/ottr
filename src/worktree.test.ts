@@ -67,6 +67,7 @@ import {
 	resetBranchTo,
 	resolveTarget,
 	runMergeGates,
+	saveDoneFiles,
 	serverMergePush,
 	setGitSecrets,
 	setNetworkGitAuth,
@@ -5079,4 +5080,100 @@ describe("removeWorktree reap (OTTR-697)", () => {
 		},
 		60_000,
 	);
+});
+
+/** A real git repo doubles as the worktree: git status and ls-files answer for any checkout. */
+function saveFixture(): { wt: string; saveDir: string; dataRoot: string } {
+	const root = mkdtempSync(join(tmpdir(), "ott-save-done-"));
+	const wt = join(root, "wt");
+	const id = ["-c", "user.name=ott", "-c", "user.email=ott@example.invalid"];
+	const mustGit = (...args: string[]): void => {
+		const r = Bun.spawnSync([gitExe(), ...id, ...args], {
+			cwd: wt,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0)
+			throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
+	};
+	mkdirSync(wt, { recursive: true });
+	mustGit("init", "-q", "-b", "main");
+	writeFileSync(join(wt, "tracked.txt"), "committed\n");
+	mustGit("add", ".");
+	mustGit("commit", "-q", "-m", "a");
+	const dataRoot = join(root, "store");
+	mkdirSync(dataRoot, { recursive: true });
+	return { wt, saveDir: join(dataRoot, "quarantine", "t1"), dataRoot };
+}
+
+describe("saveDoneFiles (OTTR-826 P2)", () => {
+	test("moves nested untracked files and copies tracked-modified content in place", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		writeFileSync(join(wt, "tracked.txt"), "modified\n");
+		mkdirSync(join(wt, "a"), { recursive: true });
+		writeFileSync(join(wt, "a", "b.txt"), "nested\n");
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		expect(r.moved).toEqual(["a/b.txt"]);
+		expect(r.copied).toEqual(["tracked.txt"]);
+		expect(r.tooLarge).toEqual([]);
+		// The untracked file moved; the tracked file was copied, never moved.
+		expect(existsSync(join(wt, "a", "b.txt"))).toBe(false);
+		expect(readFileSync(join(saveDir, "a", "b.txt"), "utf8")).toBe("nested\n");
+		expect(readFileSync(join(wt, "tracked.txt"), "utf8")).toBe("modified\n");
+		expect(readFileSync(join(saveDir, "tracked.txt"), "utf8")).toBe(
+			"modified\n",
+		);
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
+
+	test("moves an untracked symlink as a link", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		symlinkSync("tracked.txt", join(wt, "link"));
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		expect(r.moved).toEqual(["link"]);
+		const at = lstatSync(join(saveDir, "link"));
+		expect(at.isSymbolicLink()).toBe(true);
+		expect(readlinkSync(join(saveDir, "link"))).toBe("tracked.txt");
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
+
+	test("keeps an oversize file out of the save and lists it in tooLarge", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		writeFileSync(join(wt, "big.bin"), "x".repeat(100));
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 8);
+
+		expect(r.tooLarge).toEqual(["big.bin"]);
+		expect(r.moved).toEqual([]);
+		expect(existsSync(join(saveDir, "big.bin"))).toBe(false);
+		expect(existsSync(join(wt, "big.bin"))).toBe(true);
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
+
+	test("skips a tracked file that vanished between status and the save", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		// Staged add, then deleted from the worktree: status answers "AD", the read is null.
+		writeFileSync(join(wt, "gone.txt"), "soon\n");
+		const id = ["-c", "user.name=ott", "-c", "user.email=ott@example.invalid"];
+		const add = Bun.spawnSync([gitExe(), ...id, "add", "gone.txt"], {
+			cwd: wt,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(add.exitCode).toBe(0);
+		rmSync(join(wt, "gone.txt"));
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		expect(r.copied).toEqual([]);
+		expect(r.moved).toEqual([]);
+		expect(r.tooLarge).toEqual([]);
+		expect(existsSync(join(saveDir, "gone.txt"))).toBe(false);
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
 });

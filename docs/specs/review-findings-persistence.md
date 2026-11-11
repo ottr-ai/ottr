@@ -93,6 +93,11 @@ exists in the worktree, before `stampDoneCard` removes the Done worktree. The
 still reaches Done. If a review card already has a stored `report`, a later
 harvest keeps the existing text (first capture wins).
 
+Since OTTR-826 (docs/specs/saved-files.md), the report is no longer the only
+survivor: every uncommitted file of a done card is kept under
+`.tasks/quarantine/<id>` and listed as Saved files in the done drawer; the
+report also stays in `task.report`.
+
 ## Schema (additive, no destructive change)
 
 New table in `SCHEMA` (created on every open, so existing databases converge;

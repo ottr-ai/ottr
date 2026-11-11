@@ -23,6 +23,7 @@ import {
 	readRegular,
 	removeBelow,
 	trustedAnchor,
+	writeBelow,
 } from "./confine.ts";
 import { githubHost, hostMatcher } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
@@ -2837,6 +2838,96 @@ export async function quarantineUntracked(
 		moved.push(rel.replaceAll("\\", "/"));
 	}
 	return moved;
+}
+
+/**
+ * Saves every file a done worktree leaves behind into `saveDir`: untracked files MOVE
+ * (repo-relative paths preserved, symlinks move as links), tracked files with staged or
+ * unstaged content changes COPY their current content (a symlink entry copies as a link).
+ * A regular file larger than `maxBytes` is not saved and its repo-relative path lands in
+ * `tooLarge`. A path that vanishes between status and save is skipped. Returns
+ * { moved, copied, tooLarge } (repo-relative, forward slashes). Throws when git fails;
+ * a symlinked parent on either side throws from the confine helpers.
+ */
+export async function saveDoneFiles(
+	worktreePath: string,
+	saveDir: string,
+	dataRoot: string,
+	maxBytes: number,
+): Promise<{ moved: string[]; copied: string[]; tooLarge: string[] }> {
+	const moved: string[] = [];
+	const copied: string[] = [];
+	const tooLarge: string[] = [];
+	const anchor = trustedAnchor(worktreePath);
+
+	// Untracked files move; a symlink entry moves as a link, so readBelow's refusals are
+	// expected and acted on instead of thrown.
+	const r = await git(
+		["ls-files", "-z", "--others", "--exclude-standard"],
+		worktreePath,
+	);
+	if (r.code !== 0) throw new Error(r.stderr || "git ls-files failed");
+	for (const rel of r.stdout.split("\0")) {
+		if (rel === "") continue;
+		let bytes: Buffer | null;
+		let isLink = false;
+		try {
+			bytes = readBelow(anchor, path.join(worktreePath, rel), maxBytes);
+		} catch (err) {
+			const msg = String((err as Error)?.message ?? err);
+			if (msg.endsWith(`: larger than ${maxBytes} bytes`)) {
+				tooLarge.push(rel.replaceAll("\\", "/"));
+				continue;
+			}
+			if (msg.endsWith(": a symlink")) {
+				isLink = true;
+				bytes = null;
+			} else throw err;
+		}
+		if (bytes === null && !isLink) continue; // vanished between listing and reading
+		moveBelow(
+			{ anchor, file: path.join(worktreePath, rel) },
+			{ anchor: dataRoot, file: path.join(saveDir, rel) },
+		);
+		moved.push(rel.replaceAll("\\", "/"));
+	}
+
+	// Tracked files with content changes copy; they stay in the worktree until it goes away.
+	const s = await git(
+		["status", "--porcelain", "-z", "--untracked-files=no"],
+		worktreePath,
+	);
+	if (s.code !== 0) throw new Error(s.stderr || "git status failed");
+	const tokens = s.stdout.split("\0");
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i];
+		if (token === undefined || token === "") continue;
+		const rel = token.slice(3);
+		const xy = token.slice(0, 2);
+		// A staged rename row is "R <new>\0<old>": consume the old path, never save it.
+		if (xy[0] === "R") i++;
+		if (!/[AMTURC]/.test(xy)) continue;
+		try {
+			const bytes = readBelow(anchor, path.join(worktreePath, rel), maxBytes);
+			if (bytes === null) continue;
+			writeBelow(dataRoot, path.join(saveDir, rel), bytes, "truncate");
+			copied.push(rel.replaceAll("\\", "/"));
+		} catch (err) {
+			const msg = String((err as Error)?.message ?? err);
+			if (msg.endsWith(`: larger than ${maxBytes} bytes`)) {
+				tooLarge.push(rel.replaceAll("\\", "/"));
+				continue;
+			}
+			if (!msg.endsWith(": a symlink")) throw err;
+			copyBelow(
+				{ anchor, file: path.join(worktreePath, rel) },
+				{ anchor: dataRoot, file: path.join(saveDir, rel) },
+				worktreePath,
+			);
+			copied.push(rel.replaceAll("\\", "/"));
+		}
+	}
+	return { moved, copied, tooLarge };
 }
 
 /**

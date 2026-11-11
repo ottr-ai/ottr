@@ -4,11 +4,15 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	closeSync,
+	type Dirent,
 	existsSync,
 	fstatSync,
+	lstatSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	readSync,
+	type Stats,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -6899,6 +6903,40 @@ export function createApp(deps: AppDeps) {
 		});
 	}
 
+	async function handleGETProjectsTasksSavedFilesByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/saved-files">,
+	): Promise<Response> {
+		const found = resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		const { e, task } = found;
+		const rel = new URL(req.url).searchParams.get("path") ?? "";
+		if (!rel || rel.split(/[\\/]/).includes("..") || isAbsolute(rel)) {
+			return json({ error: "bad path" }, 400);
+		}
+		const dir = join(e.store.tasksDir, "quarantine", task.id);
+		const file = join(dir, rel);
+		if (!resolve(file).startsWith(resolve(dir) + sep))
+			return json({ error: "bad path" }, 400);
+		let st: Stats;
+		try {
+			st = lstatSync(file);
+		} catch {
+			return json({ error: "unknown file" }, 404);
+		}
+		if (st.isSymbolicLink() || !st.isFile())
+			return json({ error: "unknown file" }, 404);
+		const f = Bun.file(file);
+		return new Response(f, {
+			headers: {
+				"Content-Type": f.type || "application/octet-stream",
+				"Content-Security-Policy": "sandbox allow-scripts",
+				"X-Content-Type-Options": "nosniff",
+				"Cache-Control": "no-store",
+				Connection: "close",
+			},
+		});
+	}
+
 	async function handlePOSTProjectsQueueByProject(
 		req: BunRequest<"/api/projects/:project/queue">,
 	): Promise<Response> {
@@ -9511,6 +9549,35 @@ export function createApp(deps: AppDeps) {
 			reviewed,
 		}));
 	}
+	// Repo-relative files kept under quarantine/<id> when the worktree was removed:
+	// regular files only (dirent.isFile() is false for symlinks, so links drop out),
+	// sorted by name; [] when the folder is absent or unreadable.
+	const savedDirFiles = (dir: string): { name: string; size: number }[] => {
+		const out: { name: string; size: number }[] = [];
+		const walk = (d: string, prefix: string) => {
+			let entries: Dirent[];
+			try {
+				entries = readdirSync(d, { withFileTypes: true });
+			} catch {
+				return;
+			}
+			for (const de of entries) {
+				const name = prefix ? `${prefix}/${de.name}` : de.name;
+				const child = join(d, de.name);
+				if (de.isDirectory()) walk(child, name);
+				else if (de.isFile()) {
+					try {
+						out.push({ name, size: statSync(child).size });
+					} catch {
+						// vanished between readdir and stat
+					}
+				}
+			}
+		};
+		walk(dir, "");
+		out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+		return out;
+	};
 	async function handleGETProjectsTasksByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id">,
 	): Promise<Response> {
@@ -9526,6 +9593,10 @@ export function createApp(deps: AppDeps) {
 				: task.worktree === null
 					? []
 					: await statusFiles(task.worktree);
+		if (task.stage === "done")
+			view.savedFiles = savedDirFiles(
+				join(e.store.tasksDir, "quarantine", task.id),
+			);
 		// Finished cards read the stat captured at merge start (the worktree and branch are
 		// gone); open cards read the branch live, uncommitted edits included. A merge-hold
 		// mismatch park also serves the stored stat: it is the push-side numstat the gate
@@ -11242,6 +11313,10 @@ export function createApp(deps: AppDeps) {
 		"/api/projects/:project/tasks/:id/files": {
 			GET: (req) =>
 				api(req, () => handleGETProjectsTasksFilesByProjectAndId(req)),
+		},
+		"/api/projects/:project/tasks/:id/saved-files": {
+			GET: (req) =>
+				api(req, () => handleGETProjectsTasksSavedFilesByProjectAndId(req)),
 		},
 		"/api/projects/:project/tasks/:id/diff": {
 			GET: (req) =>
