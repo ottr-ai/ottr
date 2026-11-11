@@ -43,6 +43,7 @@ import {
 	newSecret,
 	newSessionId,
 	parseCookies,
+	RequestLimiter,
 	SESSION_COOKIE,
 	SESSION_MS,
 	type SessionEntry,
@@ -1362,13 +1363,18 @@ type FieldParser = (
 /** Module-level JSON response for the settings field parsers. Their error bodies are tiny
  * (one line of text), so createApp's gzip path can never trigger for them; the headers stay
  * the same. createApp declares its own richer json() that shadows this one inside it. */
-function json(v: unknown, status = 200): Response {
+function json(
+	v: unknown,
+	status = 200,
+	headers: Record<string, string> = {},
+): Response {
 	return new Response(JSON.stringify(v), {
 		status,
 		headers: {
 			"Content-Type": "application/json",
 			Vary: "Accept-Encoding",
 			Connection: "close",
+			...headers,
 		},
 	});
 }
@@ -2354,6 +2360,9 @@ export function createApp(deps: AppDeps) {
 	let sessions: SessionEntry[] = [];
 	// Login failures: 10 per source, 100 global, sliding 15 min window.
 	const loginLimiter = new LoginLimiter(15 * 60 * 1000, 10, 100);
+	// Costly routes (docs/specs/public-api-request-limit.md): public-host requests that
+	// start a model call, a git operation or card creation share one bucket per source.
+	const costlyLimiter = new RequestLimiter(10 * 60 * 1000, 60, 600);
 	/** VAPID keys for Web Push; generated lazily on the first push path so boot stays silent. */
 	let vapid: { publicKey: string; privateKey: string; subject: string } | null =
 		null;
@@ -3711,13 +3720,18 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 
-	function json(v: unknown, status = 200): Response {
+	function json(
+		v: unknown,
+		status = 200,
+		extra: Record<string, string> = {},
+	): Response {
 		// Connection: close works around a Bun 1.3.14 Windows bug: while an agent turn runs, a request
 		// that arrives on a reused keep-alive connection is not dispatched until the agent's process
 		// exits, so the "Add task" spinner spins for the length of a turn. Fresh connections dispatch
 		// fine, so the browser must never reuse one. The WebSocket is unaffected.
 		const text = JSON.stringify(v);
 		const headers: Record<string, string> = {
+			...extra,
 			"Content-Type": "application/json",
 			// Encodings differ per request even below the threshold, where the same URL
 			// can cross the size line later: caches must key on Accept-Encoding.
@@ -3944,7 +3958,11 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** Guards every /api request (host allowlist + auth wall); wraps handlers so unexpected errors become 500. */
-	function api(req: Request, fn: () => Promise<Response>): Promise<Response> {
+	function api(
+		req: Request,
+		fn: () => Promise<Response>,
+		opts: { costly?: boolean } = {},
+	): Promise<Response> {
 		// OTTR-715: a handler that runs at least slowApiMs logs one line with its route
 		// pattern (`api slow: GET /api/projects/:project/tasks/:id/log took 612ms`), so a
 		// slow endpoint shows up in the board log without ids or query values. The wall
@@ -3972,7 +3990,32 @@ export function createApp(deps: AppDeps) {
 		}
 		const wall = wallRefusal(req, req.headers.get("host"));
 		if (wall !== null) return Promise.resolve(wall);
+		// The costly-route cap runs after every wall: unauthorized or wrong-origin traffic
+		// burns nothing, and a blocked request never reaches the handler.
+		if (opts.costly === true) {
+			const limited = costlyRefusal(req);
+			if (limited !== null) return Promise.resolve(limited);
+		}
 		return timed();
+	}
+
+	/**
+	 * The per-source cap for the costly routes (docs/specs/public-api-request-limit.md):
+	 * public-host requests only — loopback desktop use stays unlimited, and hosted mode
+	 * walls it off entirely (every tenant arrives from the proxy peer, so one key would
+	 * bucket tenants together). Runs after the walls, before the handler.
+	 */
+	function costlyRefusal(req: Request): Response | null {
+		if (!viaPublicHost(req)) return null;
+		const source = requestSource(req, deps.serverRef.current);
+		const verdict = costlyLimiter.admit(source);
+		if (verdict.ok) return null;
+		console.warn(
+			`api limit: ${req.method} ${routePattern(new URL(req.url).pathname)} is over the costly-route cap (Retry-After ${verdict.retryAfterS}s)`,
+		);
+		return json({ error: "too many costly requests, try again later" }, 429, {
+			"Retry-After": String(verdict.retryAfterS),
+		});
 	}
 
 	/** Runs a handler whose request passed the walls (see api()); unexpected errors become 500. */
@@ -5975,13 +6018,16 @@ export function createApp(deps: AppDeps) {
 		);
 	}
 
-	/** Login rate-limit key: the first XFF hop only from a loopback peer, else the peer address. */
-	function loginSource(
+	/** Rate-limit key for a request: the first XFF hop only from a loopback peer, else the peer address. */
+	function requestSource(
 		req: Request,
-		server: { requestIP(req: Request): { address: string } | null },
+		server:
+			| { requestIP(req: Request): { address: string } | null }
+			| undefined
+			| null,
 	): string {
 		const xff = req.headers.get("x-forwarded-for");
-		const peer = server.requestIP(req)?.address;
+		const peer = server?.requestIP(req)?.address;
 		return (
 			(loopbackIp(peer) && xff?.split(",")[0]?.trim()) || peer || "unknown"
 		);
@@ -5994,7 +6040,7 @@ export function createApp(deps: AppDeps) {
 		// X-Forwarded-For is trusted only from a direct-loopback peer (tailscale serve
 		// forwards from 127.0.0.1 and sets it); any other peer can fake a fresh XFF
 		// per attempt and get a fresh bucket (R2-5).
-		const source = loginSource(req, server);
+		const source = requestSource(req, server);
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		// Checked after the body is read, so the check, scrypt and recordFailed run in
@@ -10783,31 +10829,41 @@ export function createApp(deps: AppDeps) {
 			GET: (req) => api(req, () => handleGETGh(req)),
 		},
 		"/api/projects/order": {
-			POST: (req) => api(req, () => handlePOSTProjectsOrder(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsOrder(req), { costly: true }),
 		},
 		"/api/projects": {
 			// OTTR-715: a clone-on-add request runs a real `git clone` that can stay quiet
 			// past the 120 s idle cut (see vmRoute): lift it for this request before readJson.
 			POST: (req, server) => {
 				server.timeout(req, 0);
-				return api(req, () => handlePOSTProjects(req));
+				return api(req, () => handlePOSTProjects(req), { costly: true });
 			},
 		},
 		"/api/projects/:project/init": {
-			POST: (req) => api(req, () => handlePOSTProjectsInitByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsInitByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/interview": {
-			POST: (req) => api(req, () => handlePOSTProjectsInterviewByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsInterviewByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/remove": {
-			POST: (req) => api(req, () => handlePOSTProjectsRemoveByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsRemoveByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/settings": {
 			POST: (req) => api(req, () => handlePOSTSettings(req)),
 		},
 		// Settings → "Scan trending now": the weekly trending scan, run at once. Body optional.
 		"/api/trending/scan": {
-			POST: (req) => api(req, () => handlePOSTTrendingScan()),
+			POST: (req) => api(req, () => handlePOSTTrendingScan(), { costly: true }),
 		},
 		// The update script holds new turns here while a new image waits, so the running turns
 		// finish and the restart finds the board idle (docs/WORKERS.md, "Updates").
@@ -10940,15 +10996,20 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/jira/import": {
 			POST: (req) =>
-				api(req, () =>
-					jiraPost(req, (b) => jira.importIssues(req.params.project, b)),
+				api(
+					req,
+					() => jiraPost(req, (b) => jira.importIssues(req.params.project, b)),
+					{ costly: true },
 				),
 		},
 		// Board "Push to origin" (OTTR-531): the standing-approval push, the exact
 		// authenticated path the merge flow uses. Moves refs/heads/<target> on origin only;
 		// never depends on the checked-out branch, never forces.
 		"/api/projects/:project/push-main": {
-			POST: (req) => api(req, () => handlePOSTProjectsPushByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsPushByProject(req), {
+					costly: true,
+				}),
 		},
 		// The board's Diagrams button: docs/how-it-works.md as committed on the target branch.
 		"/api/projects/:project/how-it-works": {
@@ -10956,36 +11017,58 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/release": {
 			GET: (req) => api(req, () => handleGETProjectsReleaseByProject(req)),
-			POST: (req) => api(req, () => handlePOSTProjectsReleaseByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsReleaseByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/release-summary": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsReleaseSummaryByProject(req)),
+				api(req, () => handlePOSTProjectsReleaseSummaryByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/arch-review": {
-			POST: (req) => api(req, () => handlePOSTProjectsArchByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsArchByProject(req), {
+					costly: true,
+				}),
 		},
 		// The dev-only Check the board button: files the card that runs the check-ottr-board
 		// skill in the server's own container (turn.ts keeps it off the workers).
 		"/api/projects/:project/board-check": {
-			POST: (req) => api(req, () => handlePOSTProjectsBoardByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsBoardByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/queue": {
-			POST: (req) => api(req, () => handlePOSTProjectsQueueByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsQueueByProject(req), {
+					costly: true,
+				}),
 		},
 		// The composer's opt-in Deepen: a model rewrites the draft; the user accepts before anything runs.
 		"/api/projects/:project/deepen": {
-			POST: (req) => api(req, () => handlePOSTProjectsDeepenByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsDeepenByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks": {
-			POST: (req) => api(req, () => handlePOSTProjectsTasksByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsTasksByProject(req), {
+					costly: true,
+				}),
 		},
 		// The trending scout's two tools (extension/tracker.ts): "filed" files a backlog proposal
 		// card (at most TRENDING_CAP per scan, the store enforces it), no_fit and deferred record
 		// the verdict. The turns' host reaches it with the board token like card filing (agentRefusal).
 		"/api/projects/:project/trending/verdicts": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTrendingVerdictsByProject(req)),
+				api(req, () => handlePOSTProjectsTrendingVerdictsByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id": {
 			GET: (req) => api(req, () => handleGETProjectsTasksByProjectAndId(req)),
@@ -11022,7 +11105,9 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/tasks/:id/triage": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksTriageByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksTriageByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/log": {
 			GET: (req) =>
@@ -11034,23 +11119,33 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/tasks/:id/reply": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksReplyByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksReplyByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/merge-anyway": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksMergeByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksMergeByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/rerun-failed-jobs": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksRerunByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksRerunByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/follow-up": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksFollowByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksFollowByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/steer": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksSteerByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksSteerByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/steer/cancel": {
 			POST: (req) =>
@@ -11070,16 +11165,22 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/tasks/:id/restart-session": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksRestartByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksRestartByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		// Parked backlog cards: a grill session refines the prompt, promote moves it to todo.
 		"/api/projects/:project/tasks/:id/grill": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksGrillByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksGrillByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/backlog": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksBacklogByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksBacklogByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/cancel": {
 			POST: (req) =>
@@ -11087,7 +11188,9 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/tasks/:id/refile": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksRefileByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksRefileByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/stop": {
 			POST: (req) =>
@@ -11095,20 +11198,33 @@ export function createApp(deps: AppDeps) {
 		},
 		"/api/projects/:project/tasks/:id/finish-kept": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksFinishByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksFinishByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/forks/check": {
-			POST: (req) => api(req, () => handlePOSTProjectsForksCheckByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsForksCheckByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/prs/check": {
-			POST: (req) => api(req, () => handlePOSTProjectsPrsCheckByProject(req)),
+			POST: (req) =>
+				api(req, () => handlePOSTProjectsPrsCheckByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/tasks/:id/pr-review/post": {
 			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksPrPostByProjectAndId(req)),
+				api(req, () => handlePOSTProjectsTasksPrPostByProjectAndId(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/github": {
-			GET: (req) => api(req, () => handleGETProjectsGithubByProject(req)),
+			GET: (req) =>
+				api(req, () => handleGETProjectsGithubByProject(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects/:project/github/visibility": {
 			GET: (req) =>

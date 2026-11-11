@@ -9258,6 +9258,156 @@ describe("login limiter (R2-5)", () => {
 	});
 });
 
+describe("costly-route limit (public boards)", () => {
+	/** A public-host mount with the API key set; `peer` decides which XFF the limiter trusts. */
+	const costlyMount = (peerAddress = "127.0.0.1") => {
+		const key = crypto.randomUUID();
+		const g = GlobalStore.open(
+			join(root, `g-costly-${Math.random().toString(36).slice(2)}`),
+		);
+		mountStores.push(g);
+		g.set("config", { apiKey: key, sessionSecret: crypto.randomUUID() });
+		const m = mount({ gstore: g, publicHosts: ["board.example"] });
+		const peer = spyOn(m.server, "requestIP").mockReturnValue({
+			address: peerAddress,
+			family: "IPv4",
+			port: 1,
+		});
+		const call = (path: string, xff: string, withKey = true) =>
+			m.call(
+				path,
+				{ prompt: "do it" },
+				{
+					Host: "board.example",
+					Origin: "https://board.example",
+					...(withKey ? { "x-api-key": key } : {}),
+					"x-forwarded-for": xff,
+				},
+			);
+		return { key, peer, call };
+	};
+
+	test("60 costly requests pass, the 61st answers 429 with Retry-After", async () => {
+		const { peer, call } = costlyMount();
+		try {
+			for (let i = 0; i < 60; i++)
+				expect(
+					(await call("/api/projects/p1/tasks", "100.64.0.5")).status,
+				).toBe(404); // unknown project: past the walls, never limited
+			const blocked = await call("/api/projects/p1/tasks", "100.64.0.5");
+			expect(blocked.status).toBe(429);
+			const body: unknown = await blocked.json();
+			expect(
+				typeof body === "object" &&
+					body !== null &&
+					"error" in body &&
+					body.error === "too many costly requests, try again later",
+			).toBe(true);
+			const retry = Number(blocked.headers.get("retry-after"));
+			expect(Number.isInteger(retry) && retry >= 1 && retry <= 600).toBe(true);
+			// Buckets are per source: a second source still passes.
+			expect((await call("/api/projects/p1/tasks", "100.64.0.6")).status).toBe(
+				404,
+			);
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("costly routes share one bucket", async () => {
+		const { peer, call } = costlyMount();
+		try {
+			for (let i = 0; i < 30; i++) {
+				expect(
+					(await call("/api/projects/p1/tasks", "100.64.0.5")).status,
+				).toBe(404);
+				expect(
+					(await call("/api/projects/p1/push-main", "100.64.0.5")).status,
+				).toBe(404);
+			}
+			expect((await call("/api/projects/p1/tasks", "100.64.0.5")).status).toBe(
+				429,
+			);
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("a fresh XFF per request from a non-loopback peer mints no fresh buckets", async () => {
+		const { peer, call } = costlyMount("172.18.0.9");
+		try {
+			for (let i = 0; i < 60; i++)
+				expect(
+					(await call("/api/projects/p1/tasks", `100.64.0.${i}`)).status,
+				).toBe(404);
+			expect(
+				(await call("/api/projects/p1/tasks", "100.64.0.999")).status,
+			).toBe(429);
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("unauthorized requests burn nothing", async () => {
+		const { peer, call } = costlyMount();
+		try {
+			for (let i = 0; i < 61; i++)
+				expect(
+					(await call("/api/projects/p1/tasks", "100.64.0.5", false)).status,
+				).toBe(401);
+			// The bucket is still empty: the key-holding request passes.
+			expect((await call("/api/projects/p1/tasks", "100.64.0.5")).status).toBe(
+				404,
+			);
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("loopback mounts stay unlimited and cheap routes stay out of the bucket", async () => {
+		const key = crypto.randomUUID();
+		const g = GlobalStore.open(
+			join(root, `g-costly-loop-${Math.random().toString(36).slice(2)}`),
+		);
+		mountStores.push(g);
+		g.set("config", { apiKey: key, sessionSecret: crypto.randomUUID() });
+		const m = mount({ gstore: g });
+		// No public host: 61 costly requests all pass.
+		for (let i = 0; i < 61; i++)
+			expect(
+				(await m.call("/api/projects/p1/tasks", { prompt: "do it" })).status,
+			).toBe(404);
+		// On the public host the cheap model switch burns nothing: it would 429 a costly route.
+		const { peer, call } = costlyMount();
+		try {
+			for (let i = 0; i < 61; i++)
+				expect(
+					(await call("/api/projects/p1/tasks/t1/model", "100.64.0.5")).status,
+				).toBe(404);
+		} finally {
+			peer.mockRestore();
+		}
+	});
+
+	test("the window slides: time passing frees the bucket", async () => {
+		const { peer, call } = costlyMount();
+		try {
+			for (let i = 0; i < 60; i++)
+				await call("/api/projects/p1/tasks", "100.64.0.5");
+			expect((await call("/api/projects/p1/tasks", "100.64.0.5")).status).toBe(
+				429,
+			);
+			setSystemTime(new Date(Date.now() + 11 * 60 * 1000));
+			expect((await call("/api/projects/p1/tasks", "100.64.0.5")).status).toBe(
+				404,
+			);
+		} finally {
+			setSystemTime();
+			peer.mockRestore();
+		}
+	});
+});
+
 describe("web push (R1-1, R2-3)", () => {
 	const pushSub = {
 		endpoint: "https://push.example/abc",

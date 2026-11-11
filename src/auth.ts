@@ -80,6 +80,53 @@ export class LoginLimiter {
 	}
 }
 
+/**
+ * Sliding-window limit for the costly API routes (docs/specs/public-api-request-limit.md):
+ * per source and global, so one busy address stalls before it starts unbounded model or
+ * git work. Unlike LoginLimiter every admitted request records a hit; a blocked request
+ * records nothing, so hammering neither extends the block nor grows the array.
+ */
+export class RequestLimiter {
+	#hits: { at: number; source: string }[] = [];
+
+	constructor(
+		private readonly windowMs: number,
+		private readonly maxPerSource: number,
+		private readonly maxGlobal: number,
+	) {}
+
+	/**
+	 * Records one hit for `source` when it fits the window; prunes hits that left it.
+	 * Blocked: retryAfterS counts whole seconds until the later of the two lift times
+	 * (the per-source and the global cap each lift when their oldest hit leaves the window).
+	 */
+	admit(
+		source: string,
+		now = Date.now(),
+	): { ok: true } | { ok: false; retryAfterS: number } {
+		const live = this.#hits.filter((h) => now - h.at < this.windowMs);
+		this.#hits = live;
+		const perSource = live.filter((h) => h.source === source);
+		const sourceBound = perSource.length >= this.maxPerSource;
+		const globalBound = live.length >= this.maxGlobal;
+		if (!sourceBound && !globalBound) {
+			this.#hits.push({ at: now, source });
+			return { ok: true };
+		}
+		let liftAt = 0;
+		const oldestSource = perSource[0];
+		const oldestAny = live[0];
+		if (sourceBound && oldestSource !== undefined)
+			liftAt = oldestSource.at + this.windowMs;
+		if (globalBound && oldestAny !== undefined)
+			liftAt = Math.max(liftAt, oldestAny.at + this.windowMs);
+		return {
+			ok: false,
+			retryAfterS: Math.max(1, Math.ceil((liftAt - now) / 1000)),
+		};
+	}
+}
+
 function mac(secret: string, base: string): string {
 	return createHmac("sha256", secret).update(base).digest("base64url");
 }

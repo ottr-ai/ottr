@@ -9,6 +9,7 @@ import {
 	newSecret,
 	newSessionId,
 	parseCookies,
+	RequestLimiter,
 	SESSION_COOKIE,
 	SESSION_MAX_AGE,
 	SESSIONS_CAP,
@@ -273,6 +274,48 @@ describe("LoginLimiter", () => {
 		l.recordFailed("a", 0);
 		expect(l.allowed("a", 59_999)).toBe(false);
 		expect(l.allowed("a", 60_000)).toBe(true);
+	});
+});
+
+describe("RequestLimiter", () => {
+	test("caps hits per source and leaves other sources free", () => {
+		const l = new RequestLimiter(60_000, 3, 100);
+		for (let i = 0; i < 3; i++) expect(l.admit("a", i)).toEqual({ ok: true });
+		expect(l.admit("a", 3)).toEqual({ ok: false, retryAfterS: 60 });
+		expect(l.admit("b", 3)).toEqual({ ok: true });
+	});
+	test("caps hits globally across sources", () => {
+		const l = new RequestLimiter(60_000, 100, 5);
+		for (let i = 0; i < 5; i++) l.admit(`s${i}`, 0);
+		expect(l.admit("new", 1)).toEqual({ ok: false, retryAfterS: 60 });
+	});
+	test("blocked requests record nothing, so hammering does not extend the block", () => {
+		const l = new RequestLimiter(60_000, 1, 100);
+		expect(l.admit("a", 0)).toEqual({ ok: true });
+		for (let i = 1; i < 4; i++) l.admit("a", i);
+		// The block lifts when the single hit leaves the window, not one hit per denied retry.
+		expect(l.admit("a", 59_999)).toEqual({ ok: false, retryAfterS: 1 });
+		expect(l.admit("a", 60_000)).toEqual({ ok: true });
+	});
+	test("retryAfterS names the later lift when both caps bind", () => {
+		const l = new RequestLimiter(60_000, 2, 3);
+		expect(l.admit("b", 0)).toEqual({ ok: true });
+		expect(l.admit("a", 1000)).toEqual({ ok: true });
+		expect(l.admit("a", 2000)).toEqual({ ok: true });
+		// Both caps hold: the source's oldest hit lifts at 61_000, the global at 60_000.
+		expect(l.admit("a", 6000)).toEqual({ ok: false, retryAfterS: 55 });
+	});
+	test("a sub-second remainder rounds up to at least one second", () => {
+		const l = new RequestLimiter(1000, 1, 100);
+		expect(l.admit("a", 0)).toEqual({ ok: true });
+		expect(l.admit("a", 999)).toEqual({ ok: false, retryAfterS: 1 });
+	});
+	test("hits leave the sliding window", () => {
+		const l = new RequestLimiter(60_000, 2, 100);
+		expect(l.admit("a", 0)).toEqual({ ok: true });
+		expect(l.admit("a", 0)).toEqual({ ok: true });
+		expect(l.admit("a", 59_999).ok).toBe(false);
+		expect(l.admit("a", 60_000)).toEqual({ ok: true });
 	});
 });
 
