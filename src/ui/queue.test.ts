@@ -5,7 +5,6 @@ import {
 	autoMarkOnOpen,
 	donePage,
 	doneReadable,
-	doneUnread,
 	dropBeforeId,
 	isUnread,
 	laneCounts,
@@ -45,6 +44,7 @@ const card = (
 			| "kind"
 			| "research"
 			| "steps"
+			| "doneAt"
 		>
 	> = {},
 ) => ({
@@ -61,6 +61,7 @@ const card = (
 	kind: over.kind ?? "work",
 	research: over.research ?? false,
 	steps: over.steps ?? "unknown",
+	doneAt: over.doneAt ?? null,
 });
 
 test("slotUse counts running tasks per stage", () => {
@@ -180,11 +181,11 @@ test("a cancelled card counts in no lane total but the done one, and never as fr
 test("a cancelled card is never seenable, so never unread", () => {
 	const dead = card("dead", "done", "idle", { cancelledAt: 5, answered: true });
 	expect(seenable(dead)).toBe(false);
-	expect(isUnread(dead, new Set())).toBe(false);
-	// The live twin keeps its badge behavior.
-	const live = card("live", "done", "idle", { answered: true });
+	expect(isUnread(dead, new Set(), 0)).toBe(false);
+	// The live twin keeps its badge behavior (its completion sits past the baseline).
+	const live = card("live", "done", "idle", { answered: true, doneAt: 1 });
 	expect(seenable(live)).toBe(true);
-	expect(isUnread(live, new Set())).toBe(true);
+	expect(isUnread(live, new Set(), 0)).toBe(true);
 });
 
 test("researchSteps resolves the stored steps value first, then falls back to the report regex", () => {
@@ -443,12 +444,13 @@ test("laneCounts filters by query across id, titles, prompt and summary", () => 
 });
 
 test("laneCounts counts shown, total, fresh and waiting per stage", () => {
-	const seen = new Set(["t3"]);
+	// A done card's read mark keys per completion (OTTR-827): t3 was opened.
+	const seen = new Set(["t3@1"]);
 	const tasks = [
 		card("t1", "todo", "queued"),
 		card("t2", "todo", "running", { title: "wrong" }),
-		card("t3", "done", "idle", { answered: true }), // opened: not fresh
-		card("t4", "done", "idle", { answered: true }), // unopened: fresh
+		card("t3", "done", "idle", { answered: true, doneAt: 1 }), // opened: not fresh
+		card("t4", "done", "idle", { answered: true, doneAt: 1 }), // unopened: fresh
 	];
 	const { counts } = laneCounts(tasks, "", seen);
 	expect(counts.todo).toEqual({
@@ -474,9 +476,11 @@ test("laneCounts counts shown, total, fresh and waiting per stage", () => {
 });
 
 test("a PR review card counts as unread until opened, like an answered card", () => {
-	const tasks = [card("p1", "done", "idle", { kind: "pr_review" })];
+	const tasks = [card("p1", "done", "idle", { kind: "pr_review", doneAt: 1 })];
 	expect(laneCounts(tasks, "", new Set()).counts.done.fresh).toBe(1);
-	expect(laneCounts(tasks, "", new Set(["p1"])).counts.done.fresh).toBe(0);
+	expect(laneCounts(tasks, "", new Set(["p1@1"])).counts.done.fresh).toBe(0);
+	// A plain mark alone never reads a done card (the pre-Done open).
+	expect(laneCounts(tasks, "", new Set(["p1"])).counts.done.fresh).toBe(1);
 	// A done work card without an answer never counts, even unseen.
 	expect(
 		laneCounts([card("w1", "done", "idle")], "", new Set()).counts.done.fresh,
@@ -594,78 +598,55 @@ describe("railTop", () => {
 	});
 });
 
-describe("doneUnread", () => {
+describe("isUnread (OTTR-827: one rule for the face badge and the rail dot)", () => {
 	const since = 1000;
 	const done = (
 		id: string,
 		doneAt: number | null,
 		over: Parameters<typeof card>[3] = {},
 	) => ({ ...card(id, "done", "idle", over), doneAt });
-	test("only post-baseline, uncancelled, on-board seenable done cards count", () => {
-		const none = new Set<string>();
-		const answered = { answered: true };
-		expect(doneUnread(done("a", since, answered), none, since)).toBe(false);
-		expect(doneUnread(done("a", since + 1, answered), none, since)).toBe(true);
-		expect(doneUnread(done("a", null, answered), none, since)).toBe(false);
+	test("a done card reads its per-completion key; a plain mark alone never reads it", () => {
+		const a = done("a", since + 1, { answered: true });
+		expect(isUnread(a, new Set(), since)).toBe(true);
+		// The card was opened before it landed in Done: the plain id carries that
+		// old mark, the new completion does not. Badge and rail count it alike.
+		expect(isUnread(a, new Set(["a"]), since)).toBe(true);
+		expect(isUnread(a, new Set([`a@${since + 1}`]), since)).toBe(false);
+		expect(isUnread(a, new Set(["a", `a@${since + 1}`]), since)).toBe(false);
+	});
+	test("the baseline reads an old done card on the face as well as the rail", () => {
+		const old = done("o", since, { answered: true });
+		expect(doneReadable(old, since)).toBe(false);
+		expect(isUnread(old, new Set(), since)).toBe(false);
+		// The live twin past the baseline stays unread with no marks at all.
 		expect(
-			doneUnread(
-				done("a", since + 1, { ...answered, cancelledAt: 5 }),
-				none,
-				since,
-			),
-		).toBe(false);
-		expect(
-			doneUnread(
-				done("a", since + 1, { ...answered, kind: "retro" }),
-				none,
-				since,
-			),
-		).toBe(false);
-		expect(
-			doneUnread(
-				{ ...card("a", "todo", "idle", answered), doneAt: since + 1 },
-				none,
-				since,
-			),
-		).toBe(false);
-		expect(
-			doneUnread(
-				done("a", since + 1, answered),
-				new Set([`a@${since + 1}`]),
-				since,
-			),
-		).toBe(false);
-		expect(
-			doneUnread(done("a", since + 1, answered), new Set(["a"]), since),
+			isUnread(done("n", since + 1, { answered: true }), new Set(), since),
 		).toBe(true);
-		expect(
-			doneUnread(
-				done("a", since + 2, answered),
-				new Set([`a@${since + 1}`]),
-				since,
-			),
-		).toBe(true);
-		expect(doneReadable(done("a", since + 1), since)).toBe(true);
+	});
+	test("a card outside Done reads its plain id", () => {
+		const live = card("p", "merging", "running", { kind: "pr_review" });
+		expect(isUnread(live, new Set(), since)).toBe(true);
+		expect(isUnread(live, new Set(["p"]), since)).toBe(false);
 	});
 	test("OTTR-827: a card that shows nothing never counts (merged work, quiet research)", () => {
 		const none = new Set<string>();
-		expect(doneUnread(done("m", since + 1), none, since)).toBe(false);
+		expect(isUnread(done("m", since + 1), none, since)).toBe(false);
 		expect(
-			doneUnread(
+			isUnread(
 				done("m", since + 1),
 				new Set([doneReadKey({ id: "m", doneAt: since + 1 })]),
 				since,
 			),
 		).toBe(false);
 		expect(
-			doneUnread(
+			isUnread(
 				done("q", since + 1, { research: true, steps: "unknown" }),
 				none,
 				since,
 			),
 		).toBe(false);
 	});
-	test("OTTR-827: the rail count equals the number of cards whose face shows New", () => {
+	test("OTTR-827: the New count holds in every mark state, mixed keys included", () => {
 		const cards = [
 			done("m", since + 1), // merged work card
 			done("q", since + 1, { answered: true }), // answered card
@@ -675,32 +656,38 @@ describe("doneUnread", () => {
 			done("t", since + 1, { kind: "retro" }), // retro
 			{ ...done("c", since + 1), cancelledAt: 5 }, // cancelled
 		];
-		const none = new Set<string>();
-		// New badges: the answered card, the PR review, the research report. No badge
-		// on a merged card, quiet research, a retro or a cancelled card.
-		expect(cards.filter((c) => isUnread(c, none)).map((c) => c.id)).toEqual([
-			"q",
-			"p",
-			"r",
-		]);
-		// Empty seen set and a fully read set agree: the rail counts exactly the badges.
-		const read = new Set([
-			...cards.map((c) => c.id),
-			...cards.map((c) => doneReadKey({ id: c.id, doneAt: since + 1 })),
-		]);
-		for (const seen of [none, read]) {
-			expect(cards.filter((c) => doneUnread(c, seen, since)).length).toBe(
-				cards.filter((c) => isUnread(c, seen)).length,
-			);
+		const keyOf = (id: string): string =>
+			doneReadKey({ id, doneAt: since + 1 });
+		// The four states a card's marks can sit in: nothing; the plain id only (an
+		// open that predates the card landing in Done); the completion key only (a
+		// mark that outlived the card's lane); and both (today's mark paths). The
+		// rail counts exactly the cards whose face shows New, so one list serves
+		// both marks; the explicit sets pin the mixed states where a key split
+		// would make them diverge.
+		const states: Array<[string, ReadonlySet<string>, string[]]> = [
+			["nothing", new Set<string>(), ["q", "p", "r"]],
+			["plain only", new Set(cards.map((c) => c.id)), ["q", "p", "r"]],
+			["key only", new Set(cards.map((c) => keyOf(c.id))), []],
+			["both", new Set(cards.flatMap((c) => [c.id, keyOf(c.id)])), []],
+		];
+		for (const [, seen, expected] of states) {
+			const news = cards
+				.filter((c) => isUnread(c, seen, since))
+				.map((c) => c.id);
+			expect(news).toEqual(expected);
 		}
 	});
-	test("a steps report's rail dot follows its done key, its Inbox pin the plain id", () => {
+	test("a steps report reads its completion key; opening marks nothing, so the pin and the dot agree", () => {
 		const r = done("r", since + 1, { research: true, steps: "yes" });
 		const key = doneReadKey({ id: "r", doneAt: since + 1 });
-		expect(doneUnread(r, new Set(), since)).toBe(true);
-		expect(doneUnread(r, new Set(["r"]), since)).toBe(true);
-		expect(doneUnread(r, new Set([key]), since)).toBe(false);
-		expect(isUnread(r, new Set([key]))).toBe(true);
-		expect(isUnread(r, new Set(["r"]))).toBe(false);
+		expect(isUnread(r, new Set(), since)).toBe(true);
+		expect(isUnread(r, new Set(["r"]), since)).toBe(true);
+		expect(isUnread(r, new Set([key]), since)).toBe(false);
+		// The pin is the unmarked key, not a second predicate: opening marks
+		// nothing, so the badge stays and the rail keeps counting the card.
+		expect(autoMarkOnOpen(r)).toBe(false);
+		expect(
+			autoMarkOnOpen(done("n", since + 1, { research: true, steps: "no" })),
+		).toBe(true);
 	});
 });

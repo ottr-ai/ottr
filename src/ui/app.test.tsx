@@ -6035,6 +6035,7 @@ test("OTTR-827: the rail dot counts exactly the cards whose face shows New", () 
 			deltas={new Map()}
 			open={() => {}}
 			seenAnswers={new Set()}
+			seenDoneSince={since}
 			compose={() => {}}
 			composeDraft={() => {}}
 			act={async () => true}
@@ -6142,6 +6143,7 @@ describe("ProjectBoard search delay", () => {
 					deltas={new Map()}
 					open={() => {}}
 					seenAnswers={new Set()}
+					seenDoneSince={0}
 					compose={() => {}}
 					composeDraft={() => {}}
 					act={async () => true}
@@ -6301,6 +6303,7 @@ describe("ProjectBoard settings shortcut", () => {
 					deltas={new Map()}
 					open={() => {}}
 					seenAnswers={new Set()}
+					seenDoneSince={0}
 					compose={() => {}}
 					composeDraft={() => {}}
 					act={async () => true}
@@ -6502,6 +6505,7 @@ describe("ProjectBoard skill-gap markers", () => {
 					deltas={new Map()}
 					open={() => {}}
 					seenAnswers={new Set()}
+					seenDoneSince={0}
 					compose={() => {}}
 					composeDraft={() => {}}
 					act={async () => true}
@@ -7638,6 +7642,7 @@ describe("ProjectBoard sync-commit advisories", () => {
 				deltas={new Map()}
 				open={() => {}}
 				seenAnswers={new Set()}
+				seenDoneSince={0}
 				compose={() => {}}
 				composeDraft={() => {}}
 				act={async () => true}
@@ -7715,6 +7720,7 @@ describe("ProjectBoard repo link", () => {
 				deltas={new Map()}
 				open={() => {}}
 				seenAnswers={new Set()}
+				seenDoneSince={0}
 				compose={() => {}}
 				composeDraft={() => {}}
 				act={async () => true}
@@ -7767,6 +7773,7 @@ describe("ProjectBoard rules interview action", () => {
 				deltas={new Map()}
 				open={() => {}}
 				seenAnswers={new Set()}
+				seenDoneSince={0}
 				compose={() => {}}
 				composeDraft={() => {}}
 				act={async () => true}
@@ -7901,6 +7908,7 @@ describe("ProjectBoard PR-mode suggestion action", () => {
 						deltas={new Map()}
 						open={() => {}}
 						seenAnswers={new Set()}
+						seenDoneSince={0}
 						compose={() => {}}
 						composeDraft={() => {}}
 						act={async (fn) => {
@@ -10407,6 +10415,7 @@ describe("Release card re-release confirm names its target", () => {
 						deltas={new Map()}
 						open={() => {}}
 						seenAnswers={new Set()}
+						seenDoneSince={0}
 						compose={() => {}}
 						composeDraft={() => {}}
 						act={async (fn) => {

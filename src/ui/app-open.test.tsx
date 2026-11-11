@@ -546,9 +546,9 @@ test("a failed mark-unread rolls back: the card counts as read again", async () 
 		answered: true,
 	});
 	state.tasks.push(answered);
-	// The server frame confirms the read, so the local mark is not the only
-	// thing keeping the badge off.
-	state.seenAnswers = ["AL-10"];
+	// The server frame confirms the read with both keys (OTTR-827: the plain id and
+	// the completion key), so the local mark is not the only thing keeping the badge off.
+	state.seenAnswers = ["AL-10", "AL-10@1000"];
 	const realFetch = host.fetch;
 	host.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input);

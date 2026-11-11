@@ -18,6 +18,7 @@ type LaneTask = Pick<
 	| "kind"
 	| "research"
 	| "steps"
+	| "doneAt"
 >;
 
 /** Cards a read mark can stick to: answered question cards, PR review cards, and done research
@@ -37,15 +38,37 @@ export function seenable(
 	);
 }
 
-/** Unread: has something to read and no read mark yet. */
+/** Unread (OTTR-827): the one rule behind the card face's New badge and the rail's dot, so the
+ * two marks can never diverge. A card is unread when it has something to read (seenable) and
+ * its read mark is absent. A done work card keys the mark per completion (`id@doneAt`,
+ * OTTR-566), so a card that returns to Done is New again even though the plain id stayed
+ * marked, and a card done at or before the server's baseline (`since`) counts as read on the
+ * face as well as the rail, so history lights neither. Mark paths move both keys (markRead,
+ * markUnread, forgetSeen), so a mark made on either side reads on both. */
 export function isUnread(
 	t: Pick<
 		TaskCard,
-		"id" | "answered" | "cancelledAt" | "kind" | "stage" | "research" | "steps"
+		| "id"
+		| "answered"
+		| "cancelledAt"
+		| "kind"
+		| "stage"
+		| "research"
+		| "steps"
+		| "doneAt"
 	>,
 	seen: ReadonlySet<string>,
+	since: number,
 ): boolean {
-	return seenable(t) && !seen.has(t.id);
+	if (!seenable(t)) return false;
+	if (t.stage === "done" && t.cancelledAt === null && t.kind !== "retro") {
+		// A done work card: the mark keys per completion (OTTR-566). A card done at
+		// or before the server's baseline counts as read on the face as well as the
+		// rail, so history lights neither.
+		if (!doneReadable(t, since) || t.doneAt === null) return false;
+		return !seen.has(doneReadKey({ id: t.id, doneAt: t.doneAt }));
+	}
+	return !seen.has(t.id);
 }
 
 /** OTTR-488 resolution: how a card's research report treats steps. 'yes' = steps report (pinned until a drawer button clears it), 'no' = pure info (pinned until opened), 'quiet' = nothing to pin (legacy report without steps, or no report). Server views ship resolved steps (app.ts viewSteps), so cards normally carry the stored value; the regex fallback covers direct TaskView reads and keeps the table testable. */
@@ -68,11 +91,12 @@ export function autoMarkOnOpen(
 	return seenable(t) && researchSteps(t) !== "yes";
 }
 
-/** OTTR-566: a done card whose opening counts as a read for the rail's unread dot. Cancelled and
- * retro cards never count; cards done at or before the server's baseline (`since`) count as read,
- * so the feature does not light every project with history on first load. */
+/** OTTR-566: whether a card's completion key carries the read mark for the unread rule (the
+ * card face's done branch and the rail's dot). Cancelled and retro cards never count; cards
+ * done at or before the server's baseline (`since`) count as read, so the feature does not
+ * light every project with history on first load. */
 export function doneReadable(
-	t: Pick<TaskCard, "stage" | "cancelledAt" | "kind" | "state" | "doneAt">,
+	t: Pick<TaskCard, "stage" | "cancelledAt" | "kind" | "doneAt">,
 	since: number,
 ): boolean {
 	return (
@@ -86,36 +110,7 @@ export function doneReadable(
 	);
 }
 
-/** OTTR-566: a newly done card nobody has opened yet (drives the rail's steel dot). OTTR-827: the
- * dot counts a card only when its face shows the New badge's content (seenable) — a merged work
- * card, quiet research, a retro or a cancelled card shows nothing, so it never lights the dot.
- * The read mark is keyed by completion (`id@doneAt`), so a card that returns to Done is unread
- * again; opening marks both this key and the plain id, so the marks move together. */
-export function doneUnread(
-	t: Pick<
-		TaskCard,
-		| "id"
-		| "answered"
-		| "cancelledAt"
-		| "kind"
-		| "stage"
-		| "research"
-		| "steps"
-		| "state"
-		| "doneAt"
-	>,
-	seen: ReadonlySet<string>,
-	since: number,
-): boolean {
-	return (
-		doneReadable(t, since) &&
-		seenable(t) &&
-		t.doneAt !== null &&
-		!seen.has(doneReadKey({ id: t.id, doneAt: t.doneAt }))
-	);
-}
-
-/** The one mark a rail row shows, by rank: needs action > asked > running > unread done. */
+/** The one mark a rail row shows, by rank: needs action > asked > running > unread. */
 export function railTop(c: {
 	needs: number;
 	asks: number;
@@ -178,6 +173,8 @@ export function laneCounts<T extends LaneTask>(
 	tasks: readonly T[],
 	query: string,
 	seen: ReadonlySet<string>,
+	/** The server's done baseline; 0 keeps every done card post-baseline (OTTR-827). */
+	since: number = 0,
 ): { shown: T[]; counts: Record<Stage, LaneCount> } {
 	const board = tasks.filter(onBoard);
 	const q = query.trim().toLowerCase();
@@ -200,7 +197,9 @@ export function laneCounts<T extends LaneTask>(
 			shown: visible.length,
 			total: board.filter((t) => laneStage(t) === stage).length,
 			fresh:
-				stage === "done" ? visible.filter((t) => isUnread(t, seen)).length : 0,
+				stage === "done"
+					? visible.filter((t) => isUnread(t, seen, since)).length
+					: 0,
 			waiting: waiting.length,
 			alarm:
 				waiting.length === 0

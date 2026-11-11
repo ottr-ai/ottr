@@ -176,7 +176,6 @@ import {
 	autoMarkOnOpen,
 	donePage,
 	doneReadable,
-	doneUnread,
 	dropBeforeId,
 	isUnread,
 	laneCounts,
@@ -3817,8 +3816,9 @@ function laneColumnData(
 	topicLimits: ReadonlyMap<string, number>,
 	doneLimit: number,
 	seenAnswers: ReadonlySet<string>,
+	since: number,
 ) {
-	const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers);
+	const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers, since);
 	// A kicked backlog card (grill session started) renders as a normal card in the todo lane.
 	const filtered = shown.filter((t) => laneStage(t) === key);
 	// Done: latest landing on top. doneAt stamps each entry into Done (the done clock), so it orders by landing time.
@@ -4263,6 +4263,7 @@ export function ProjectBoard({
 	deltas,
 	open,
 	seenAnswers,
+	seenDoneSince,
 	compose,
 	composeDraft,
 	act,
@@ -4277,6 +4278,8 @@ export function ProjectBoard({
 	deltas: Map<string, number>;
 	open: (id: string) => void;
 	seenAnswers: Set<string>;
+	/** The server's done baseline; the unread rule reads it (OTTR-827). */
+	seenDoneSince: number;
 	compose: () => void;
 	composeDraft: () => void;
 	act: Act;
@@ -4399,7 +4402,12 @@ export function ProjectBoard({
 	// instead of a second "Discuss rules" that would only answer "queued".
 	const rulesTask = liveCardOf(tasks, "interview");
 	// Search filter and per-stage counts (unit-tested in queue.ts): the tab strip and lane heads read them.
-	const { shown, counts } = laneCounts(tasks, applied, seenAnswers);
+	const { shown, counts } = laneCounts(
+		tasks,
+		applied,
+		seenAnswers,
+		seenDoneSince,
+	);
 	// The search count matches the lanes: a retro off the board is no task to count.
 	const boardTotal = tasks.filter(onBoard).length;
 	return (
@@ -4614,9 +4622,11 @@ export function ProjectBoard({
 						topicLimits,
 						doneLimit,
 						seenAnswers,
+						seenDoneSince,
 					);
 					const count = counts[c.key];
-					const unread = (t: TaskCard): boolean => isUnread(t, seenAnswers);
+					const unread = (t: TaskCard): boolean =>
+						isUnread(t, seenAnswers, seenDoneSince);
 					const onReorder = (
 						dragId: string,
 						beforeId: string | null,
@@ -14007,8 +14017,8 @@ function railRow(
 	const needs = split.needs.length;
 	const asks = split.asks.length;
 	const waiting = own.filter((t) => t.state === "queued").length;
-	const unread = own.filter((t) => doneUnread(t, seen, since)).length;
-	// The one mark a row shows, by rank: needs action > asked > running > unread done. Waiting has no mark.
+	const unread = own.filter((t) => isUnread(t, seen, since)).length;
+	// The one mark a row shows, by rank: needs action > asked > running > unread. Waiting has no mark.
 	const top = railTop({ needs, asks, running, unread });
 	const summary = [
 		needs > 0 ? `${needs} need action` : "",
@@ -14043,7 +14053,7 @@ export function RailRows({
 }: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
-	/** Read marks and the server's done baseline, for the unread-done dot. */
+	/** Read marks and the server's done baseline, for the unread dot. */
 	seenAnswers: Set<string>;
 	seenDoneSince: number;
 	project: ProjectView | null;
@@ -15654,6 +15664,8 @@ function AppMainContent(p: {
 	projects: ProjectView[];
 	tasks: TaskCard[];
 	seenAnswers: Set<string>;
+	/** The server's done baseline; the unread rule reads it (OTTR-827). */
+	seenDoneSince: number;
 	deltas: Map<string, number>;
 	act: Act;
 	openTask: (id: string) => void;
@@ -15677,6 +15689,7 @@ function AppMainContent(p: {
 		projects,
 		tasks,
 		seenAnswers,
+		seenDoneSince,
 		deltas,
 		act,
 		openTask,
@@ -15728,6 +15741,7 @@ function AppMainContent(p: {
 			deltas={deltas}
 			open={openTask}
 			seenAnswers={seenAnswers}
+			seenDoneSince={seenDoneSince}
 			compose={() => {
 				if (project.gitless) return;
 				setComposeFor(project.name);
@@ -15761,9 +15775,11 @@ function AppDrawer(p: {
 	origin: React.RefObject<{ id: string; from: string } | null>;
 	act: Act;
 	openTask: (id: string) => void;
-	markSeen: (t: TaskCard | null | undefined) => void;
+	markRead: (t: TaskCard | null | undefined) => void;
 	markUnread: (t: TaskCard | null | undefined) => void;
 	closeDrawer: () => void;
+	/** The server's done baseline; the drawer's read state reads it (OTTR-827). */
+	seenDoneSince: number;
 }) {
 	const {
 		selected,
@@ -15779,9 +15795,10 @@ function AppDrawer(p: {
 		origin,
 		act,
 		openTask,
-		markSeen,
+		markRead,
 		markUnread,
 		closeDrawer,
+		seenDoneSince,
 	} = p;
 	// While open, the drawer renders the live selection; on a close (X, Esc, backdrop,
 	// Back, mark-unread) it freezes into `sheet` so the dialog can animate out mounted.
@@ -15839,19 +15856,22 @@ function AppDrawer(p: {
 			usedTotal={usedTotal}
 			maxTotal={state?.maxTotal ?? null}
 			act={act}
-			read={seenable(drawerTask) && seenAnswers.has(drawerTask.id)}
+			read={
+				seenable(drawerTask) &&
+				!isUnread(drawerTask, seenAnswers, seenDoneSince)
+			}
 			onMarkUnread={() => {
 				if (selected === null) return; // the deferred native close after an app-driven close
 				void markUnread(selected);
 				closeDrawer(); // close so the board shows the card unread; onClose would re-mark it read
 			}}
 			onMarkSeen={() => {
-				if (selected !== null) markSeen(selected);
+				if (selected !== null) markRead(selected);
 			}}
 			onClose={() => {
 				if (selected === null) return; // same deferred close; do not re-mark it read
 				// An answer that landed while the drawer was open counts as read.
-				if (autoMarkOnOpen(selected)) markSeen(selected);
+				if (autoMarkOnOpen(selected)) markRead(selected);
 				closeDrawer();
 			}}
 			onFollowed={(id, from) => {
@@ -15941,53 +15961,43 @@ export function App() {
 	const [seenDoneSince, setSeenDoneSince] = useState(Number.POSITIVE_INFINITY);
 	/** One-shot localStorage → server migration of seen answers, run after the first state load. */
 	const migratedSeen = useRef(false);
-	// Hoisted above markSeen/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
+	// Hoisted above markRead/openTask: openTask looks cards up here, and a plain const is not a hook, so order with the useState lines is free.
 	const tasks = state?.tasks ?? [];
 	// U6: rows an open (non-done, non-cancelled) update card already carries are not pending for the user.
 	const coveredUpdates = coveredUpdateIds(tasks);
-	/** Only a card with something to read (an answer, a PR review) counts as seen: opening
-	 * a card before that lands must not hide the "new" badge it earns. */
-	const markSeen = useCallback((t: TaskCard | null | undefined) => {
-		if (t == null || !seenable(t)) return;
-		setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
-		void post("/api/seen", { ids: [t.id] }).catch(() => {
-			// Roll the optimistic mark back: the card reads as unread again here too.
+	/** OTTR-827: marks a card read — the plain id always, and (OTTR-566) the completion key
+	 * `id@doneAt` beside it for a done work card, so the face badge and the rail dot clear
+	 * together. A failed POST rolls both keys back and records them as failed: the read-mark
+	 * effect does not re-post them until something clears the failure. */
+	const markRead = useCallback(
+		(t: TaskCard | null | undefined) => {
+			if (t == null || !seenable(t)) return;
+			const keys = [t.id];
+			if (t.doneAt !== null && doneReadable(t, seenDoneSince))
+				keys.push(doneReadKey({ id: t.id, doneAt: t.doneAt }));
+			if (keys.every((k) => failedDoneReads.current.has(k))) return;
 			setSeenAnswers((s) => {
-				if (!s.has(t.id)) return s;
+				if (keys.every((k) => s.has(k))) return s;
 				const next = new Set(s);
-				next.delete(t.id);
+				for (const k of keys) next.add(k);
 				return next;
 			});
-			setNotice(
-				"Saving the read state failed; this card may show as unread on your other devices.",
-			);
-		});
-	}, []);
-	/** OTTR-566: marks this completion of a done card read for the rail's dot. The key carries
-	 * doneAt, so a card that returns to Done later is unread again. A failed auto-mark records
-	 * the key as failed: the read-mark effect does not re-post it until something clears it. */
-	const markDoneRead = useCallback(
-		(t: TaskCard) => {
-			if (!doneReadable(t, seenDoneSince) || t.doneAt === null) return;
-			const key = doneReadKey({ id: t.id, doneAt: t.doneAt });
-			if (failedDoneReads.current.has(key)) return;
-			setSeenAnswers((s) => (s.has(key) ? s : new Set(s).add(key)));
-			void post("/api/seen", { ids: [key] })
+			void post("/api/seen", { ids: keys })
 				.then(() => {
-					failedDoneReads.current = ((prev) => {
-						if (!prev.has(key)) return prev;
-						const next = new Set(prev);
-						next.delete(key);
-						return next;
-					})(failedDoneReads.current);
+					failedDoneReads.current = new Set(
+						[...failedDoneReads.current].filter((k) => !keys.includes(k)),
+					);
 				})
 				.catch(() => {
-					// Roll the optimistic mark back: the done dot returns to unread.
-					failedDoneReads.current = new Set(failedDoneReads.current).add(key);
+					// Roll the optimistic marks back: the card reads as unread again.
+					failedDoneReads.current = new Set([
+						...failedDoneReads.current,
+						...keys,
+					]);
 					setSeenAnswers((s) => {
-						if (!s.has(key)) return s;
+						if (!keys.some((k) => s.has(k))) return s;
 						const next = new Set(s);
-						next.delete(key);
+						for (const k of keys) next.delete(k);
 						return next;
 					});
 					setNotice(
@@ -15997,18 +16007,28 @@ export function App() {
 		},
 		[seenDoneSince],
 	);
-	/** The reverse of markSeen: puts a read answer back to unread, locally and on the server. */
+	/** The reverse of markRead: puts a read card back to unread, locally and on the server. A
+	 * done card's completion key goes too, or the rail would stay read while the face shows New. */
 	const markUnread = useCallback((t: TaskCard | null | undefined) => {
 		if (t == null || !seenable(t)) return;
+		const keys =
+			t.stage === "done" && t.doneAt !== null
+				? [t.id, doneReadKey({ id: t.id, doneAt: t.doneAt })]
+				: [t.id];
 		setSeenAnswers((s) => {
-			if (!s.has(t.id)) return s;
+			if (!keys.some((k) => s.has(k))) return s;
 			const next = new Set(s);
-			next.delete(t.id);
+			for (const k of keys) next.delete(k);
 			return next;
 		});
-		void post("/api/seen", { ids: [t.id], unread: true }).catch(() => {
+		void post("/api/seen", { ids: keys, unread: true }).catch(() => {
 			// Roll the optimistic unmark back: the answer reads as read again.
-			setSeenAnswers((s) => (s.has(t.id) ? s : new Set(s).add(t.id)));
+			setSeenAnswers((s) => {
+				if (keys.every((k) => s.has(k))) return s;
+				const next = new Set(s);
+				for (const k of keys) next.add(k);
+				return next;
+			});
 			setNotice(
 				"Saving the read state failed; this card may show as read on your other devices.",
 			);
@@ -16030,9 +16050,9 @@ export function App() {
 				setView(card.project);
 			}
 			setSelectedId(id);
-			if (card !== undefined && autoMarkOnOpen(card)) markSeen(card);
+			if (card !== undefined && autoMarkOnOpen(card)) markRead(card);
 		},
-		[tasks, markSeen],
+		[tasks, markRead],
 	);
 	/** Plain-click navigation for the view links: pushes the path and swaps the view. The
 	 * drawer selection stays untouched, like the hashchange listener did. */
@@ -16385,13 +16405,19 @@ export function App() {
 	// probe in hosted mode before the flag arrives.
 	const prov = useProvisioning(state !== null && !hosted);
 	const boardNote = skillGapNote(prov.data?.userLayer ?? null, "board-check");
-	// OTTR-566: an open drawer is the read event for the rail's done dot, whatever opened it
-	// (a card click, a pasted/deep-link URL, or the task finishing while its drawer is open).
-	// doneUnread checks seenAnswers, so a mark already made is not posted again.
+	// OTTR-566/OTTR-827: an open drawer is the read event for a card the user is looking
+	// at, whatever opened it (a card click, a pasted/deep-link URL, or the task finishing
+	// while its drawer is open). A steps report stays pinned: only its drawer buttons
+	// clear it, so the effect marks nothing there. isUnread checks seenAnswers, so a mark
+	// already made is not posted again.
 	useEffect(() => {
-		if (selected !== null && doneUnread(selected, seenAnswers, seenDoneSince))
-			markDoneRead(selected);
-	}, [selected, seenAnswers, seenDoneSince, markDoneRead]);
+		if (
+			selected !== null &&
+			autoMarkOnOpen(selected) &&
+			isUnread(selected, seenAnswers, seenDoneSince)
+		)
+			markRead(selected);
+	}, [selected, seenAnswers, seenDoneSince, markRead]);
 	/** The drawer task+project a close froze; held while the exit animation plays, then dropped. */
 	const [sheet, setSheet] = useState<{
 		task: TaskCard;
@@ -16846,6 +16872,7 @@ export function App() {
 						projects={projects}
 						tasks={tasks}
 						seenAnswers={seenAnswers}
+						seenDoneSince={seenDoneSince}
 						deltas={deltas}
 						act={act}
 						openTask={openTask}
@@ -16895,9 +16922,10 @@ export function App() {
 				origin={origin}
 				act={act}
 				openTask={openTask}
-				markSeen={markSeen}
+				markRead={markRead}
 				markUnread={markUnread}
 				closeDrawer={closeDrawer}
+				seenDoneSince={seenDoneSince}
 			/>
 
 			<AppOverlays

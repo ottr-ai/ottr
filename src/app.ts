@@ -2781,8 +2781,15 @@ export function createApp(deps: AppDeps) {
 		gh,
 		spawn: deps.prReviewSpawn,
 		// A re-review rewrites a draft the user may have read: the mark must go,
-		// or the updated card never wears the unread badge again.
-		forgetSeen: (taskId) => saveSeen(loadSeen().filter((id) => id !== taskId)),
+		// or the updated card never wears the unread badge again. OTTR-827: the
+		// completion key goes with the plain id, or a done card's rail mark would
+		// outlive the badge the new comments earn.
+		forgetSeen: (taskId) =>
+			saveSeen(
+				loadSeen().filter(
+					(id) => id !== taskId && !id.startsWith(`${taskId}@`),
+				),
+			),
 	});
 
 	// Issue watcher: same live project Map; files new open GitHub issues as backlog cards.
