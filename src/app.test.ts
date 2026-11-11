@@ -6204,6 +6204,134 @@ describe("revision guard", () => {
 		expect(store.getTask(t.id)!.holdUntil).not.toBeNull();
 	});
 
+	test("a stale /edit against a preparing card answers 409 with the card", async () => {
+		const t = store.createTask("draft");
+		store.updateTask(t.id, { state: "preparing" });
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+			prompt: "my draft",
+			revision: 1,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as {
+			task: { state: string; revision: number };
+		};
+		expect(b.task.state).toBe("preparing");
+		expect(b.task.revision).toBe(2);
+		// The current revision reaches the honest refusal.
+		const cur = await post(`/api/projects/p1/tasks/${t.id}/edit`, {
+			prompt: "my draft",
+			revision: 2,
+		});
+		expect(cur.status).toBe(409);
+		expect(await errorOf(cur)).toBe(
+			"only a queued todo task or a parked backlog task can be edited",
+		);
+	});
+
+	test("a stale /edit/start claim against a preparing card answers 409 with the card", async () => {
+		const t = store.createTask("draft");
+		store.updateTask(t.id, { state: "preparing" });
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, {
+			revision: 1,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as { task: { state: string } };
+		expect(b.task.state).toBe("preparing");
+		expect(store.getTask(t.id)!.holdUntil).toBeNull();
+		const cur = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, {
+			revision: 2,
+		});
+		expect(cur.status).toBe(409);
+		expect(await errorOf(cur)).toBe(
+			"only a queued todo task or a parked backlog task can be edited",
+		);
+	});
+
+	test("a stale /model pick answers 409 with the card", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { state: "running" });
+		store.updateTask(t.id, { state: "idle" });
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "glm",
+			revision: 2,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as {
+			task: { state: string; revision: number };
+		};
+		expect(b.task.state).toBe("idle");
+		expect(b.task.revision).toBe(3);
+		const cur = await post(`/api/projects/p1/tasks/${t.id}/model`, {
+			model: "glm",
+			revision: 3,
+		});
+		expect(cur.status).toBe(409);
+		expect(await errorOf(cur)).toBe(
+			"only a running, preparing, queued, or needs-you task can switch model",
+		);
+	});
+
+	test("a stale /release-notes edit answers 409 with the card", async () => {
+		const t = store.createTask("release card");
+		store.updateTask(t.id, {
+			releaseVersion: "v1.0.0",
+			releaseNotes: "notes",
+			state: "needs_you",
+			stage: "done",
+		});
+		store.updateTask(t.id, { state: "running" });
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "my addition",
+			revision: 2,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as { task: { state: string } };
+		expect(b.task.state).toBe("running");
+		const cur = await post(`/api/projects/p1/tasks/${t.id}/release-notes`, {
+			notes: "my addition",
+			revision: 3,
+		});
+		expect(cur.status).toBe(409);
+		expect(await errorOf(cur)).toBe(
+			"only an idle or needs-you release card can edit release notes",
+		);
+	});
+
+	test("a bodyless json /steer/cancel still cancels", async () => {
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		const res = await fetch(
+			new URL(`/api/projects/p1/tasks/${t.id}/steer/cancel`, server.url),
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					Host: "127.0.0.1:0",
+					Origin: "http://127.0.0.1:0",
+				},
+			},
+		);
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.pendingPrompt).toBeNull();
+	});
+
+	test("a bodyless json /edit/start still claims", async () => {
+		const t = store.createTask("draft");
+		const res = await fetch(
+			new URL(`/api/projects/p1/tasks/${t.id}/edit/start`, server.url),
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					Host: "127.0.0.1:0",
+					Origin: "http://127.0.0.1:0",
+				},
+			},
+		);
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.holdUntil).not.toBeNull();
+	});
+
 	test("a slow cancel body cannot act on a stale queued snapshot", async () => {
 		// The body read finishes before the task is resolved: a body that pauses
 		// mid-read must not let the turn loop's queued→running flip hide behind the

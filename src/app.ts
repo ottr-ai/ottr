@@ -4162,10 +4162,14 @@ export function createApp(deps: AppDeps) {
 
 	type JsonBody = { body: Record<string, unknown> } | { error: Response };
 
-	/** Validates a POST request per the security contract and parses its JSON body. */
+	/** Validates a POST request per the security contract and parses its JSON body.
+	 *  `emptyAsAbsent` reads a zero-length body as `{}` for the optional-body routes:
+	 *  body-less callers may send the JSON header with no bytes at all, and that is an
+	 *  absent body, not a malformed one. */
 	async function readJson(
 		req: Request,
 		maxBytes = MAX_BODY_BYTES,
+		emptyAsAbsent = false,
 	): Promise<JsonBody> {
 		const ct = req.headers.get("content-type") ?? "";
 		if (!ct.startsWith("application/json"))
@@ -4176,6 +4180,7 @@ export function createApp(deps: AppDeps) {
 		// readJson too (R1-2).
 		const read = await readBytes(req, maxBytes);
 		if ("error" in read) return read;
+		if (emptyAsAbsent && read.bytes.length === 0) return { body: {} };
 		const text = new TextDecoder().decode(read.bytes);
 		let parsed: unknown;
 		try {
@@ -4193,16 +4198,17 @@ export function createApp(deps: AppDeps) {
 		return { body: parsed as Record<string, unknown> };
 	}
 
-	/** Body of a POST whose JSON body is optional: a body-less request reads as an
-	 * empty body, so body-less callers (the extension's steer cancel) keep today's
-	 * behavior. An arriving JSON body that fails to parse or exceeds the size limit
-	 * surfaces the parser's error instead of degrading to an unconditional write. */
+	/** Body of a POST whose JSON body is optional: an absent body (no bytes at all,
+	 * whatever the headers say) reads as an empty body, so body-less callers (the
+	 * extension's steer cancel) keep today's behavior. An arriving body still goes
+	 * through the full parse-and-size contract: malformed or oversized bytes surface
+	 * the parser's error instead of degrading to an unconditional write. */
 	async function readOptionalJson(
 		req: Request,
 	): Promise<{ body: Record<string, unknown> } | { error: Response }> {
 		if (!(req.headers.get("content-type") ?? "").startsWith("application/json"))
 			return { body: {} };
-		return readJson(req);
+		return readJson(req, MAX_BODY_BYTES, true);
 	}
 
 	function projectView(e: Entry): ProjectView {
@@ -6576,6 +6582,10 @@ export function createApp(deps: AppDeps) {
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
 			return json({ error: "task is cancelled" }, 404);
+		// The revision guard outranks the state refusal below: a stale pick answers
+		// 409 with the current card instead of a bare precondition error.
+		const stale = staleEditResponse(e, task, r.body);
+		if (stale !== null) return stale;
 		if (
 			task.state !== "running" &&
 			task.state !== "preparing" &&
@@ -7110,6 +7120,11 @@ export function createApp(deps: AppDeps) {
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
+		// The revision guard outranks the state refusal below: a stale claim answers
+		// 409 with the current card, so the editor can show the current version
+		// through the conflict flow instead of a bare precondition error.
+		const stale = staleEditResponse(e, task, body.body);
+		if (stale !== null) return stale;
 		// Same rule as /edit: only a queued todo card, a parked backlog card, or a held
 		// proposal parked needs_you has a prompt worth guarding — and a hold on a started
 		// card could stall a later reply turn.
@@ -7135,13 +7150,9 @@ export function createApp(deps: AppDeps) {
 		// revision the claim itself is guarded: a content edit that landed between the
 		// editor's load and this claim refuses the claim, so the editor never arms a
 		// stale draft with a fresh revision. Body-less callers keep the unconditional
-		// claim, like every guarded route's no-revision path.
+		// claim, like every guarded route's no-revision path. staleEditResponse has
+		// already validated the revision, so only absence reaches the null path.
 		const rev = body.body.revision;
-		if (
-			rev !== undefined &&
-			(typeof rev !== "number" || !Number.isInteger(rev) || rev < 1)
-		)
-			return json({ error: "revision must be a positive integer" }, 400);
 		const res = e.store.claimPromptHold(
 			task.id,
 			PROMPT_EDIT_HELD,
@@ -8098,6 +8109,10 @@ export function createApp(deps: AppDeps) {
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
+		// The revision guard outranks the refusal below: a stale notes edit answers
+		// 409 with the current card instead of a bare precondition error.
+		const stale = staleEditResponse(e, task, r.body);
+		if (stale !== null) return stale;
 		const refusal = releaseNotesRefusal(task);
 		if (refusal !== null) return refusal;
 		if (typeof r.body.notes !== "string")
@@ -9246,6 +9261,10 @@ export function createApp(deps: AppDeps) {
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
+		// The revision guard outranks the refusal below: a stale prompt edit answers
+		// 409 with the current card instead of a bare precondition error.
+		const stale = staleEditResponse(e, task, r.body);
+		if (stale !== null) return stale;
 		const edit = editPromptRefusal(e, task, r.body.prompt);
 		if (edit instanceof Response) return edit;
 		// Same shape rule as applyUserEdit: an absent revision keeps today's behavior.

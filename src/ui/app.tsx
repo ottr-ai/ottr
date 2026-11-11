@@ -13215,6 +13215,11 @@ export function Drawer({
 				if (e instanceof EditConflict) {
 					setSteerConflict({ current: e.task.pendingPrompt, cancel: false });
 					setSteerRevision(e.task.revision);
+					// A detail refresh may have landed before this 409 and cleared the
+					// draft (no conflict existed yet to guard it): restore the submitted
+					// text, so the notice's "your text is kept" holds even after that
+					// race. When the editor still holds text, the user's own edits win.
+					setSteerEdit((prev) => (prev === null ? text : prev));
 				}
 				throw e;
 			}

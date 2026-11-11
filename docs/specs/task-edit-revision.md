@@ -99,14 +99,14 @@ Request bodies of the guarded routes accept an optional `revision` field:
   positive integer" }`.
 - Present and stale: `409` with the current card in the body:
   `{ "error": "card changed since it was loaded", "task": <current TaskView> }`.
-  State preconditions never shadow a stale revision: when the sent revision is
-  stale, the guarded routes answer this conflict even if the newer state would
-  refuse the edit on its own (the steer routes' "no steering is queued" and
-  resume-marker checks); only a current revision reaches those honest
-  precondition errors. A body that arrives as JSON but fails to parse or
-  exceeds the size limit surfaces the parser's error (400/413) instead of
-  degrading to an unconditional write; a body-less request keeps today's
-  behavior.
+  State preconditions never shadow a stale revision: on every guarded route
+  (steer edit, steer cancel, prompt edit, hold claim, model choice, release
+  notes), a stale revision answers this conflict with the current card even if
+  the newer state would refuse the edit on its own; only a current revision
+  reaches the honest precondition errors. An absent body — no bytes at all,
+  whatever the headers say — reads as the no-revision path; a body that
+  arrives and fails to parse or exceeds the size limit surfaces the parser's
+  error (400/413) instead of degrading to an unconditional write.
 
 Shared helper, used by the guarded routes:
 

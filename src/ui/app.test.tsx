@@ -3349,6 +3349,95 @@ describe("Drawer queued steering edit (client)", () => {
 			globalThis.fetch = realFetch;
 		}
 	});
+
+	test("a refused steer edit restores the draft a pre-409 refresh cleared", async () => {
+		const realFetch = globalThis.fetch;
+		const gate = Promise.withResolvers<void>();
+		let refused = false;
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes("/steer/edit")) {
+				if (!refused) {
+					refused = true;
+					// The 409 lands after the refresh below, so no conflict exists
+					// while the refresh clears the editor.
+					await gate.promise;
+				}
+				return new Response(
+					JSON.stringify({
+						error: "card changed since it was loaded",
+						task: { id: "t1", revision: 9, pendingPrompt: "second steer" },
+					}),
+					{ status: 409 },
+				);
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const task = (prompt: string) =>
+			cardFixture({
+				...drawerFields,
+				stage: "todo",
+				state: "queued",
+				pendingPrompt: prompt,
+			});
+		const editButton = (): Element => {
+			const node = container.querySelector(
+				'button[aria-label="Edit the queued steering"]',
+			);
+			if (node === null) throw new Error("no Edit button");
+			return node;
+		};
+		const editor = (): HTMLTextAreaElement | null =>
+			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		try {
+			await act(async () => {
+				root.render(
+					<Drawer {...base} act={runAct} task={task("first steer")} />,
+				);
+			});
+			await act(async () => {
+				onClickOf(editButton())({});
+			});
+			expect(editor()?.value).toBe("first steer");
+			await act(async () => {
+				const form = editor()?.closest("form");
+				if (form == null) throw new Error("no steer edit form");
+				form.dispatchEvent(
+					new window.Event("submit", {
+						bubbles: true,
+						cancelable: true,
+					}) as unknown as Event,
+				);
+			});
+			// The refresh lands while the 409 is still in flight: with no conflict
+			// yet, the pendingPrompt change clears the editor.
+			await act(async () => {
+				root.render(
+					<Drawer {...base} act={runAct} task={task("second steer")} />,
+				);
+			});
+			expect(editor()).toBeNull();
+			// The refused answer arrives: the conflict flow restores the submitted
+			// draft, so the notice's "your text is kept" holds after the race.
+			gate.resolve();
+			await act(async () => {});
+			expect(container.textContent).toContain("changed while you were editing");
+			expect(container.textContent).toContain("second steer");
+			expect(editor()?.value).toBe("first steer");
+		} finally {
+			gate.resolve();
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
 });
 
 describe("Drawer start actions wait for the prompt edit (client)", () => {
