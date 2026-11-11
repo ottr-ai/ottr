@@ -26,6 +26,7 @@ import {
 	shortTitle,
 	tasksDirFor,
 } from "./store.ts";
+import { prConflictReason } from "./supervisor.ts";
 import { answeredCard, type RecordedFinding } from "./types.ts";
 
 const root = mkdtempSync(join(tmpdir(), "store-model-"));
@@ -705,6 +706,34 @@ describe("done_at", () => {
 		store.updateTask(task.id, { stage: "done", state: "idle" });
 		expect(store.getTask(task.id)?.doneAt).toBeGreaterThan(first);
 		store.close();
+	});
+
+	test("open migrates a pre-update conflict park reason to the reply-recovery text", () => {
+		const dir = join(root, "conflict-reason-migration");
+		const store = open(dir);
+		const t = store.createTask("conflicted");
+		// The park exactly as the shipped OTTR-789 code wrote it.
+		store.updateTask(t.id, {
+			stage: "merging",
+			state: "needs_you",
+			needsReason:
+				"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.",
+		});
+		// A human-written reason must survive untouched.
+		const other = store.createTask("not a conflict park");
+		store.updateTask(other.id, {
+			needsReason: "Resolve the conflict on the pull request.",
+		});
+		store.close();
+		const reopened = open(dir);
+		expect(reopened.getTask(t.id)?.needsReason).toBe(prConflictReason(7));
+		expect(reopened.getTask(other.id)?.needsReason).toBe(
+			"Resolve the conflict on the pull request.",
+		);
+		// Idempotent: the migrated text no longer matches the migration.
+		reopened.close();
+		const again = open(dir);
+		expect(again.getTask(t.id)?.needsReason).toBe(prConflictReason(7));
 	});
 
 	test("open backfills done_at from the last turn's end on a pre-existing database", () => {

@@ -1646,6 +1646,15 @@ export class ProjectStore {
 		db.exec(
 			"UPDATE tasks SET done_at = (SELECT ended_at FROM turns WHERE turns.task_id = tasks.id ORDER BY turns.id DESC LIMIT 1) WHERE stage = 'done' AND done_at IS NULL",
 		);
+		// OTTR-799: the conflict park's reason text grew the reply recovery, and
+		// prConflictVerdict un-parks only on the exact current text. Rewrite stored
+		// pre-update parks (the old text ends at "…pull request."), so cards parked
+		// before the update take the automatic recovery again. Idempotent: the
+		// migrated text no longer ends with the matched literal. Only the supervisor's
+		// own park shape matches (the LIKE pins the full literal around the number).
+		db.exec(
+			"UPDATE tasks SET needs_reason = REPLACE(needs_reason, 'Resolve the conflict on the pull request.', 'Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.') WHERE needs_reason LIKE 'PR #% cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.'",
+		);
 		// A CHECK constraint can only change by rebuilding the table: databases created before
 		// `preparing` carry the old state list, and the scheduler writes 'preparing' on every
 		// claim. Runs after the column backfills so old and new shapes have the same named

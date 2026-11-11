@@ -18,6 +18,7 @@ import {
 	createSupervisor,
 	dependabotPrompt,
 	failedCheckNames,
+	prConflictReason,
 	type SupervisorEntry,
 	type SupervisorOps,
 	scratchShotsTend,
@@ -2982,8 +2983,7 @@ const openList = (ns: number[]) => ({
 	stderr: "",
 });
 
-const PR7_CONFLICT =
-	"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.";
+const PR7_CONFLICT = prConflictReason(7);
 const PR_LIST = ["api", "repos/acme/widget/pulls?state=open&per_page=100"];
 const PR7_READ = ["api", "repos/acme/widget/pulls/7"];
 const PR8_READ = ["api", "repos/acme/widget/pulls/8"];
@@ -3206,6 +3206,32 @@ describe("prPass", () => {
 		// Old PR #7 is closed, but the card carries #9: no per-PR read of #7.
 		expect(ops.apiCalls.filter((a) => a[1]!.includes("pulls/7"))).toEqual([]);
 		store.close();
+	});
+
+	test("OTTR-799: a pre-update conflict park migrates and un-parks when GitHub can merge again", async () => {
+		// A row parked by the shipped OTTR-789 code holds the old reason text.
+		// The reopen runs the ProjectStore.open migration, so the exact-text
+		// un-park matches the stored row again.
+		const store = prModeProject("pr-old-conflict");
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason:
+				"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.",
+		});
+		store.close();
+		const reopened = ProjectStore.open(join(root, "pr-old-conflict"));
+		const migrated = reopened.getTask(t.id)!;
+		expect(migrated.needsReason).toBe(PR7_CONFLICT);
+		const ops = fakeOps({
+			apiResult: prApi(pullBody({ state: "open", mergeable: true })),
+		});
+		await tick(new Map([["proj", entry(reopened)]]), ops);
+		const after = reopened.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		reopened.close();
 	});
 
 	test("OTTR-799: the poll between the work turn and merge dispatch leaves the recovery queued", async () => {

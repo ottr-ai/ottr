@@ -277,6 +277,15 @@ the card is `queued` for its recovery merge turn, `prPass` skips it: a
 settle against the old PR state would park the recovery before the ship
 can run.
 
+The reason text changed with OTTR-799, and the un-park match is exact.
+`ProjectStore.open` runs one idempotent migration on every open: a stored
+`needs_reason` that matches the pre-update text (`PR #N cannot merge: it
+conflicts with the target branch. Resolve the conflict on the pull
+request.`) is rewritten to the current text, so cards parked before the
+update take the automatic recovery again. The statement is an additive
+value backfill in the `ProjectStore.open` pattern; no row is dropped,
+deleted or altered in shape.
+
 Non-goals of this section:
 
 - No automatic rebase. The non-goal below stands.

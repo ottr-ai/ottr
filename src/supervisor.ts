@@ -295,9 +295,9 @@ function parsePull(body: unknown): PrDetail | null {
 }
 
 /** The needs_you reason of a card whose open PR conflicts with its target branch (OTTR-789;
- * OTTR-799 added the reply recovery). prConflictVerdict parks with it and un-parks only on
- * this exact text. Pure. */
-function prConflictReason(n: number): string {
+ * OTTR-799 added the reply recovery and the store.ts migration of the stored pre-update
+ * text). prConflictVerdict parks with it and un-parks only on this exact text. Pure. */
+export function prConflictReason(n: number): string {
 	return `PR #${n} cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.`;
 }
 
