@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { jiraCardPrompt } from "../jiraCards.ts";
 import fc from "../test/properties.ts";
 import { Markdown } from "./markdown.tsx";
 
@@ -100,6 +101,48 @@ describe("Markdown", () => {
 		).toBe(
 			'<div class="md"><p><a href="https://example.com/a" target="_blank" rel="noreferrer">docs</a> and <a href="https://example.com/b" target="_blank" rel="noreferrer">https://example.com/b</a></p></div>',
 		);
+	});
+
+	test("a bare URL drops trailing colon and period", () => {
+		expect(render("of https://example.com/jira: next")).toBe(
+			'<div class="md"><p>of <a href="https://example.com/jira" target="_blank" rel="noreferrer">https://example.com/jira</a>: next</p></div>',
+		);
+		expect(render("see https://x.io/a.")).toBe(
+			'<div class="md"><p>see <a href="https://x.io/a" target="_blank" rel="noreferrer">https://x.io/a</a>.</p></div>',
+		);
+	});
+
+	test("a bare URL inside parentheses keeps the paren outside the link", () => {
+		expect(render("(see https://x.io/a)")).toBe(
+			'<div class="md"><p>(see <a href="https://x.io/a" target="_blank" rel="noreferrer">https://x.io/a</a>)</p></div>',
+		);
+	});
+
+	test("a bare URL with port and query string stays whole", () => {
+		expect(render("open http://h:8080/p?q=1 now")).toBe(
+			'<div class="md"><p>open <a href="http://h:8080/p?q=1" target="_blank" rel="noreferrer">http://h:8080/p?q=1</a> now</p></div>',
+		);
+	});
+
+	test("the jira card prompt head renders both links without trailing punctuation", () => {
+		const prompt = jiraCardPrompt("https://atc.bmwgroup.net/jira", {
+			key: "CMIS-5991",
+			summary: "Add export",
+			description: "",
+			issueType: "Story",
+			status: "To Do",
+			priority: "Medium",
+			labels: [],
+			components: [],
+			parent: "",
+			custom: [],
+		});
+		const out = render(prompt);
+		expect(out).toContain('<a href="https://atc.bmwgroup.net/jira"');
+		expect(out).toContain(
+			'<a href="https://atc.bmwgroup.net/jira/browse/CMIS-5991"',
+		);
+		expect(out).not.toContain('href="https://atc.bmwgroup.net/jira:"');
 	});
 
 	test("javascript: URLs render as plain text", () => {

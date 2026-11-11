@@ -6,9 +6,11 @@ import { Fragment, type ReactNode } from "react";
 // remote http(s) srcs render as links).
 // No reference links; swap in a real parser if reports start needing them.
 
-/** Inline tokens; alternation order is precedence: code first so markup inside stays literal. */
+/** Inline tokens; alternation order is precedence: code first so markup inside stays literal.
+ *  The bare-URL group stops before trailing punctuation (GFM autolink style): "…/jira:" and
+ *  "…/a." must link without the final : or . — interior : and . still match via backtracking. */
 const INLINE_RE =
-	/(`[^`\n]+`)|(\*\*[^*]+?\*\*)|(__[^_]+?__)|(\*[^*\n]+\*)|(_[^_\n]+_)|(~~[^~\n]+~~)|(\[([^\]\n]*)\]\(([^()\s]+)\))|(https?:\/\/[^\s<>")\]]+)|(!\[([^\]\n]*)\]\(([^()\s]+)\))|(<img\s[^>]*>)/g;
+	/(`[^`\n]+`)|(\*\*[^*]+?\*\*)|(__[^_]+?__)|(\*[^*\n]+\*)|(_[^_\n]+_)|(~~[^~\n]+~~)|(\[([^\]\n]*)\]\(([^()\s]+)\))|(https?:\/\/[^\s<>")\]]*[^\s<>")\].,:;!?'])|(!\[([^\]\n]*)\]\(([^()\s]+)\))|(<img\s[^>]*>)/g;
 
 /** Only http(s) links become anchors; anything else renders as plain text. */
 function safeHref(url: string): string | null {
