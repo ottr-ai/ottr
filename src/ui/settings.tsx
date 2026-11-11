@@ -2657,6 +2657,10 @@ export function GitHostsSection() {
 	const [tUserEdited, setTUserEdited] = useState(false);
 	const [tToken, setTToken] = useState("");
 	const [tUrl, setTUrl] = useState("");
+	// The reuse offer's own test URL and busy lane, so a save in the add form
+	// never spins the offer's button.
+	const [offerUrl, setOfferUrl] = useState("");
+	const offerBusy = useBusy();
 	const tBusy = useBusy();
 	// GitHub App flow: the key is write-only, the server never returns it.
 	const [appFormOpen, setAppFormOpen] = useState(false);
@@ -2751,6 +2755,30 @@ export function GitHostsSection() {
 					throw new Error(asError(data, status, "testing the token"));
 				setTToken("");
 				setTUser(defaultGitUsername(tHost.trim(), state?.githubHost ?? null));
+				await load();
+				return true;
+			}),
+		);
+	};
+	// The proactive offer: the board token is set and the configured GitHub host has
+	// no git-host entry yet, so a first clone on that host would fail. The offer
+	// names that one host only, and applying stays the user's explicit click.
+	const boardTokenOffer =
+		state !== null &&
+		state.githubTokenSet === true &&
+		state.githubHost !== null &&
+		!state.tokens.some((t) => t.host === state.githubHost);
+	const applyOfferBoardToken = (): void => {
+		offerBusy.start(() =>
+			run(async () => {
+				const { status, data } = await gitReq(
+					"POST",
+					"/api/git-hosts/github-token",
+					{ testUrl: offerUrl.trim() },
+				);
+				if (status !== 200)
+					throw new Error(asError(data, status, "testing the token"));
+				setOfferUrl("");
 				await load();
 				return true;
 			}),
@@ -2916,6 +2944,58 @@ export function GitHostsSection() {
 					HTTPS tokens for git hosts, one for each host. Ottr tests each token
 					with git ls-remote before it saves the token.
 				</p>
+				{boardTokenOffer && state !== null && (
+					<div className="board-token-offer">
+						<p className="hint">
+							The board GitHub token serves the API and gh. Git on{" "}
+							<code>{state.githubHost}</code> needs its own entry here. Without
+							one, a first clone fails with a login prompt. Applying stores the
+							same token for git on <code>{state.githubHost}</code>. The token's
+							scopes must also grant repository read there. Ottr tests that with
+							git ls-remote before it saves.
+						</p>
+						<form
+							className="settings-form"
+							onSubmit={(e) => {
+								e.preventDefault();
+								applyOfferBoardToken();
+							}}
+						>
+							<div className="alate-def-rows">
+								<DefRow
+									name="Test URL"
+									help="A repository on the host that the token can read. Ottr runs git ls-remote against it before it saves."
+									shape="https URL"
+								>
+									<label>
+										<input
+											value={offerUrl}
+											onChange={(e) => setOfferUrl(e.target.value)}
+											placeholder={`https://${state.githubHost}/org/repo.git`}
+											inputMode="url"
+											spellCheck={false}
+											autoComplete="off"
+											required
+											aria-label="Test URL for the board token"
+										/>
+									</label>
+								</DefRow>
+							</div>
+							<div className="alate-def-actions">
+								<button
+									type="submit"
+									disabled={offerBusy.busy}
+									className={`primary${offerBusy.failed ? " failed" : ""}`}
+								>
+									{offerBusy.busy && (
+										<span className="spinner" aria-hidden="true" />
+									)}
+									Use the board GitHub token for {state.githubHost}
+								</button>
+							</div>
+						</form>
+					</div>
+				)}
 				{state !== null && state.tokens.length > 0 && (
 					<table>
 						<tbody>

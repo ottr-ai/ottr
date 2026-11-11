@@ -397,7 +397,7 @@ The alate URL carries the API key on every call, so the board refuses a plain `h
 
 ## GitHub tokens
 
-Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. The board token also serves the board's own git fetches and pushes on `github.com` itself: the worker image's git credential helper is pinned to `https://github.com` (`Dockerfile.worker`). Git on every other host — a `*.ghe.com` Enterprise Cloud host, GitHub Enterprise Server, or any non-GitHub git host — needs its own per-host token under **Settings → Git hosts**.
+Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. The board token also serves the board's own git fetches and pushes on `github.com` itself: the worker image's git credential helper is pinned to `https://github.com` (`Dockerfile.worker`). Git on every other host — a `*.ghe.com` Enterprise Cloud host, GitHub Enterprise Server, or any non-GitHub git host — needs its own per-host token under **Settings → Git hosts**. When the configured GitHub host has no stored token, that section offers to store the board token for it; the button only stores after a live test, never on its own.
 
 The server's GitHub API fetches (GitHub App, trending scan, releases watch, branch-rule and auth probes, expiry probe) retry a `429`, a `502`/`503`/`504`, or a `403` that carries `Retry-After` or `x-ratelimit-remaining: 0`. The wait follows `Retry-After` or `x-ratelimit-reset`, capped at 4 seconds, with jittered exponential backoff and 3 attempts at most. Only repeat-safe requests (GET, HEAD) retry; a POST that creates something never retries. A wait above the cap stops, and the caller's next poll handles the error.
 
@@ -421,7 +421,7 @@ A classic token also works: the `repo` scope covers everything above, plus the `
 
 - A fine-grained token reaches only the repositories of its resource owner, so for an org repository the token must be owned by (or authorized for) the org. If the org does not allow org-owned fine-grained tokens for members, use a classic token.
 - With SAML SSO enforced, authorize the token for the org under **Settings → Developer settings → Tokens (classic) → Configure SSO → Authorize**. Without that step, git shows a bare `403`.
-- Git over HTTPS to a `*.ghe.com` host with no Git hosts token fails with `fatal: could not read Username for 'https://<host>': terminal prompts disabled` — the fix is the per-host token under **Settings → Git hosts**.
+- Git over HTTPS to a `*.ghe.com` host with no Git hosts token fails with `fatal: could not read Username for 'https://<host>': terminal prompts disabled` — the fix is the per-host token under **Settings → Git hosts**; with a board token set, that section offers to store it for the host.
 
 ### GitHub App setup
 

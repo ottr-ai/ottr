@@ -2397,6 +2397,15 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			status: 200,
 			headers: { "Content-Type": "application/json" },
 		});
+	/** The /api/git-hosts view shape these tests serve; tokens carry no secrets. */
+	type GitHostsFixture = {
+		tokens: { host: string; username: string; tokenSet: boolean }[];
+		globalKey: null;
+		githubApp: null;
+		githubHost: string;
+		githubTokenSet: boolean;
+	};
+
 	const view = (githubTokenSet: boolean) => ({
 		tokens: [],
 		globalKey: null,
@@ -2407,7 +2416,7 @@ describe("GitHostsSection board GitHub token reuse", () => {
 
 	/** Mock for /api/git-hosts and the GitHub token check; `extra` handles the rest. */
 	const baseMock = (
-		fixture: ReturnType<typeof view>,
+		fixture: GitHostsFixture,
 		loaded: { calls: number },
 		extra: (url: string, init?: RequestInit) => Response | undefined,
 	): typeof fetch =>
@@ -2461,6 +2470,161 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			expect(
 				buttons().some((b) => b.textContent === "Use the board GitHub token"),
 			).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	/** A view fixture with named tokens; `view` keeps `[]`. */
+	const viewWith = (
+		tokens: { host: string; username: string; tokenSet: boolean }[],
+		githubTokenSet = true,
+		githubHost = "github.com",
+	): GitHostsFixture => ({
+		tokens,
+		globalKey: null,
+		githubApp: null,
+		githubHost,
+		githubTokenSet,
+	});
+
+	const offerShown = (container: HTMLDivElement, host: string): boolean =>
+		Array.from(container.querySelectorAll("#host-tokens-block button")).some(
+			(b) =>
+				b.textContent?.startsWith(`Use the board GitHub token for ${host}`),
+		);
+
+	test("the offer shows only while the configured host has no stored token", async () => {
+		const cases: {
+			name: string;
+			view: GitHostsFixture;
+			shown: boolean;
+		}[] = [
+			{ name: "token set, host has no entry", view: viewWith([]), shown: true },
+			{
+				name: "token set, host already has an entry",
+				view: viewWith([
+					{ host: "github.com", username: "x-access-token", tokenSet: true },
+				]),
+				shown: false,
+			},
+			{
+				name: "token set, only another host has an entry",
+				view: viewWith([
+					{ host: "gitlab.com", username: "oauth2", tokenSet: true },
+				]),
+				shown: true,
+			},
+			{ name: "no board token", view: viewWith([], false), shown: false },
+		];
+		for (const c of cases) {
+			const loaded = { calls: 0 };
+			const { container, unmount } = await mountSection(
+				baseMock(c.view, loaded, () => undefined),
+			);
+			try {
+				expect(`${c.name}: ${offerShown(container, "github.com")}`).toBe(
+					`${c.name}: ${c.shown}`,
+				);
+			} finally {
+				await unmount();
+			}
+		}
+	});
+
+	test("the offer names the configured GitHub host, not github.com", async () => {
+		const loaded = { calls: 0 };
+		const { container, unmount } = await mountSection(
+			baseMock(viewWith([], true, "git.acme.ghe.com"), loaded, () => undefined),
+		);
+		try {
+			expect(offerShown(container, "git.acme.ghe.com")).toBe(true);
+			expect(offerShown(container, "github.com")).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the offer's click stores the board token for the configured host", async () => {
+		const loaded = { calls: 0 };
+		const fixture = viewWith([]);
+		const posts: { url: string; body: unknown }[] = [];
+		const { container, unmount } = await mountSection(
+			baseMock(fixture, loaded, (url, init) => {
+				if (
+					url.endsWith("/api/git-hosts/github-token") &&
+					init?.method === "POST"
+				) {
+					posts.push({ url, body: JSON.parse(String(init.body)) });
+					// The stored entry drops the offer on the reload below.
+					fixture.tokens = [
+						{ host: "github.com", username: "x-access-token", tokenSet: true },
+					];
+					return ok(fixture);
+				}
+				return undefined;
+			}),
+		);
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				"#host-tokens-block input[aria-label='Test URL for the board token']",
+			);
+			if (input === null)
+				throw new Error("offer test URL input did not render");
+			await act(async () => {
+				typeInto(input, "https://github.com/octo/repo.git");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			const offerForm = container.querySelector<HTMLFormElement>(
+				"#host-tokens-block .board-token-offer form",
+			);
+			if (offerForm === null) throw new Error("offer form did not render");
+			await act(async () => {
+				offerForm.dispatchEvent(submitEvent());
+			});
+			// The click went to the reuse endpoint with only the test URL; the
+			// server resolves the host itself.
+			expect(posts).toEqual([
+				{
+					url: "/api/git-hosts/github-token",
+					body: { testUrl: "https://github.com/octo/repo.git" },
+				},
+			]);
+			// The reload shows the stored entry and drops the offer.
+			expect(
+				Array.from(
+					container.querySelectorAll("#host-tokens-block td code"),
+				).some((c) => c.textContent === "github.com"),
+			).toBe(true);
+			expect(
+				container.querySelector("#host-tokens-block .board-token-offer"),
+			).toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("rendering the section never applies the board token on its own", async () => {
+		const loaded = { calls: 0 };
+		const posts: string[] = [];
+		const { container, unmount } = await mountSection(
+			baseMock(viewWith([]), loaded, (url, init) => {
+				if (
+					url.endsWith("/api/git-hosts/github-token") &&
+					init?.method === "POST"
+				) {
+					posts.push(url);
+					return ok(viewWith([]));
+				}
+				return undefined;
+			}),
+		);
+		try {
+			// The qualifying view renders the offer; nothing clicked, nothing stored.
+			expect(
+				container.querySelector("#host-tokens-block .board-token-offer"),
+			).not.toBeNull();
+			expect(posts).toEqual([]);
 		} finally {
 			await unmount();
 		}
