@@ -7883,8 +7883,8 @@ describe("hindsight settings", () => {
 				await (await booted.call("/api/settings/hindsight")).json(),
 			).toEqual({
 				url: standInUrl,
-				tokenSet: false,
-				tokenReadable: false,
+				tokenSet: true,
+				tokenReadable: true,
 				backend: "hindsight",
 				memoryReason: null,
 			});
@@ -7895,6 +7895,7 @@ describe("hindsight settings", () => {
 			mkdirSync(dirname(flipCfg), { recursive: true });
 			writeFileSync(flipCfg, "memory:\n  backend: hindsight\n");
 			delete process.env.HINDSIGHT_API_URL;
+			delete process.env.HINDSIGHT_API_TOKEN;
 			booted = boot();
 			await booted.tick();
 			expect(

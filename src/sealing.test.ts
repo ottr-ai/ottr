@@ -257,6 +257,13 @@ describe("ADR-0011 config row sealing", () => {
 		const hs = await app.call("/api/settings/hindsight");
 		expect(hs.json.tokenSet).toBe(true);
 		expect(hs.json.tokenReadable).toBe(false);
+		// An env-only token with the stored blob kept: set but unreadable —
+		// entering the stored token restores persistence (ADR-0011).
+		process.env.HINDSIGHT_API_TOKEN = "env-only-token";
+		const hsEnv = await app.call("/api/settings/hindsight");
+		delete process.env.HINDSIGHT_API_TOKEN;
+		expect(hsEnv.json.tokenSet).toBe(true);
+		expect(hsEnv.json.tokenReadable).toBe(false);
 
 		// No settings response holds an operator-entered plaintext or a stored sealed blob.
 		const blobs = [
@@ -531,6 +538,40 @@ describe("ADR-0011 config row sealing", () => {
 			(s) => s.endpoint === "https://push.example.com/new",
 		);
 		expect(fresh?.vapidPublicKey).toBe(config.json.publicKey);
+	});
+
+	test("a restored board without the kv marker rebinds legacy subs to the stored public key", async () => {
+		const g = GlobalStore.open(join(root, "g-vapid-nokv"));
+		stores.push(g);
+		const seeded = sealedRow(box);
+		const OLD_PUBLIC = "old-public-key-C" + "1".repeat(56);
+		seeded.vapid = {
+			publicKey: OLD_PUBLIC,
+			// Sealed under key A: a wrong-key boot cannot read it, but the
+			// outgoing public key is plaintext and still binds the subs.
+			privateKey: box.seal("vapid-private-plain-4c7e"),
+			subject: "https://github.com/ottr-ai/ottr",
+		};
+		const legacyEndpoint = "https://push.example.com/legacy-nokv";
+		g.set("config", seeded);
+		g.set("push_subs", [
+			{
+				endpoint: legacyEndpoint,
+				keys: { p256dh: "p", auth: "a" },
+				addedAt: 1,
+				classes: { request: true, error: true, complete: true },
+			},
+		]);
+		const app = boot(g, wrongBox);
+		const config = await app.call("/api/push/config");
+		expect(config.status).toBe(200);
+		const subs = g.get<Record<string, unknown>[]>("push_subs") ?? [];
+		const legacy = subs.find((s) => s.endpoint === legacyEndpoint)!;
+		expect(legacy.vapidPublicKey).toBe(OLD_PUBLIC);
+		const stale = await app.call(
+			`/api/push/config?endpoint=${encodeURIComponent(legacyEndpoint)}`,
+		);
+		expect(stale.json.stale).toBe(true);
 	});
 
 	test("a no-box fresh board answers push config and never persists the generated pair", async () => {

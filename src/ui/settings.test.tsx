@@ -3566,8 +3566,15 @@ describe("NotificationsSection stale push recovery", () => {
 			posts: Array<{ url: string; body: unknown }>;
 			requestPermissionCalls: () => number;
 			containerText: () => string;
+			currentSubscription: () => unknown;
 		}) => Promise<void>,
 		subscribeRejects = false,
+		options: {
+			unsubscribeRejects?: boolean;
+			failPostSubscribe?: boolean;
+			newEndpoint?: string;
+			prefsClasses?: unknown;
+		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
 		const realNavigator = globalThis.navigator;
@@ -3588,6 +3595,7 @@ describe("NotificationsSection stale push recovery", () => {
 			endpoint: "https://push.example.com/old",
 			toJSON: () => ({ endpoint: "https://push.example.com/old" }),
 			unsubscribe: async () => {
+				if (options.unsubscribeRejects) throw new Error("unsubscribe failed");
 				currentSub = null;
 			},
 		};
@@ -3598,9 +3606,14 @@ describe("NotificationsSection stale push recovery", () => {
 					subscribedKeys.push(opts.applicationServerKey);
 					if (subscribeRejects) throw new Error("subscribe failed");
 					currentSub = {
-						endpoint: "https://push.example.com/new",
-						toJSON: () => ({ endpoint: "https://push.example.com/new" }),
-						unsubscribe: async () => {},
+						endpoint: options.newEndpoint ?? "https://push.example.com/new",
+						toJSON: () => ({
+							endpoint: options.newEndpoint ?? "https://push.example.com/new",
+						}),
+						// The POST-failure undo must leave no browser subscription.
+						unsubscribe: async () => {
+							currentSub = null;
+						},
 					};
 					return currentSub;
 				},
@@ -3618,6 +3631,8 @@ describe("NotificationsSection stale push recovery", () => {
 			const target = String(url);
 			if (init?.method === "POST") {
 				posts.push({ url: target, body: JSON.parse(String(init.body)) });
+				if (options.failPostSubscribe && target === "/api/push/subscribe")
+					return Response.json({ error: "boom" }, { status: 500 });
 				return Response.json({ ok: true });
 			}
 			if (target.startsWith("/api/push/config")) {
@@ -3626,6 +3641,11 @@ describe("NotificationsSection stale push recovery", () => {
 					stale: target.includes("endpoint=") ? stale : false,
 				});
 			}
+			if (target.startsWith("/api/notifications/prefs"))
+				return Response.json({
+					classes: options.prefsClasses ?? null,
+					mutedProjects: [],
+				});
 			return Response.json({ classes: null, mutedProjects: [] });
 		}) as unknown as typeof fetch;
 		Object.defineProperty(globalThis, "navigator", {
@@ -3686,6 +3706,7 @@ describe("NotificationsSection stale push recovery", () => {
 				posts,
 				requestPermissionCalls: () => permissionCalls,
 				containerText: () => container.textContent ?? "",
+				currentSubscription: () => currentSub,
 			});
 		} finally {
 			await act(async () => {
@@ -3710,13 +3731,15 @@ describe("NotificationsSection stale push recovery", () => {
 	}
 
 	test("a stale subscription re-subscribes with no permission prompt and stays enabled", async () => {
+		// Moved endpoint (the fake subscribe mints a new one): the browser
+		// unsubscribes first with no server call, then the subscribe POST, then
+		// the old row cleanup.
 		await withPushBrowser(true, async (probe) => {
-			// Recovery drops the old endpoint on the server, then subscribes again.
 			expect(probe.posts.map((p) => p.url)).toEqual([
-				"/api/push/unsubscribe",
 				"/api/push/subscribe",
+				"/api/push/unsubscribe",
 			]);
-			expect(probe.posts[0]!.body).toEqual({
+			expect(probe.posts[1]!.body).toEqual({
 				endpoint: "https://push.example.com/old",
 			});
 			expect(probe.subscribedKeys).toEqual(["new-public-key"]);
@@ -3727,23 +3750,68 @@ describe("NotificationsSection stale push recovery", () => {
 		});
 	});
 
-	test("stale: false leaves the subscription alone", async () => {
-		await withPushBrowser(false, async (probe) => {
-			expect(probe.posts).toEqual([]);
-			expect(probe.subscribedKeys).toEqual([]);
-			expect(probe.requestPermissionCalls()).toBe(0);
-		});
-	});
-
-	test("a failed recovery re-subscribe reports the error and offers Turn on", async () => {
+	test("a stable-endpoint recovery re-subscribes without touching the server row", async () => {
 		await withPushBrowser(
 			true,
 			async (probe) => {
-				// The recovery dropped the old subscription, then the re-subscribe
-				// itself rejected: no subscribe POST can follow.
+				expect(probe.posts.map((p) => p.url)).toEqual(["/api/push/subscribe"]);
+				expect(probe.subscribedKeys).toEqual(["new-public-key"]);
+				expect(probe.requestPermissionCalls()).toBe(0);
+				expect(probe.containerText()).toContain("Turn off");
+			},
+			false,
+			{ newEndpoint: "https://push.example.com/old" },
+		);
+	});
+
+	test("a moved-endpoint recovery carries the old endpoint's classes over", async () => {
+		const classes = { request: true, error: false, complete: true };
+		await withPushBrowser(
+			true,
+			async (probe) => {
 				expect(probe.posts.map((p) => p.url)).toEqual([
+					"/api/push/subscribe",
+					"/api/notifications/prefs",
 					"/api/push/unsubscribe",
 				]);
+				expect(probe.posts[1]!.body).toEqual({
+					endpoint: "https://push.example.com/new",
+					classes,
+				});
+				expect(probe.posts[2]!.body).toEqual({
+					endpoint: "https://push.example.com/old",
+				});
+			},
+			false,
+			{ prefsClasses: classes },
+		);
+	});
+
+	test("a failed browser unsubscribe keeps the real state and the stale row", async () => {
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				// The browser still holds the subscription: no server calls at all.
+				expect(probe.posts).toEqual([]);
+				expect(probe.requestPermissionCalls()).toBe(0);
+				expect(probe.containerText()).toContain("unsubscribe failed");
+				// The real state: subscribed, so "Turn off" stays and the browser
+				// still holds the old subscription (the endpoint text never renders).
+				expect(probe.containerText()).toContain("Turn off");
+				expect(probe.currentSubscription()).not.toBeNull();
+			},
+			false,
+			{ unsubscribeRejects: true },
+		);
+	});
+
+	test("a failed recovery browser subscribe reports the error and offers Turn on", async () => {
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				// The browser unsubscribed first; the re-subscribe itself rejected
+				// before any POST: no server row was touched.
+				expect(probe.posts).toEqual([]);
 				expect(probe.requestPermissionCalls()).toBe(0);
 				// The real state: no browser subscription, so the section shows the
 				// failure and the Turn on control, never the dead endpoint.
@@ -3756,6 +3824,33 @@ describe("NotificationsSection stale push recovery", () => {
 			},
 			true,
 		);
+	});
+
+	test("a failed subscribe POST undoes the browser subscription and offers Turn on", async () => {
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				expect(probe.posts.map((p) => p.url)).toEqual(["/api/push/subscribe"]);
+				expect(probe.requestPermissionCalls()).toBe(0);
+				// The undo ran: no browser subscription, no ghost endpoint.
+				expect(probe.currentSubscription()).toBeNull();
+				expect(probe.containerText()).toContain("Turn on");
+				expect(probe.containerText()).not.toContain("Turn off");
+				expect(probe.containerText()).not.toContain(
+					"https://push.example.com/new",
+				);
+			},
+			false,
+			{ failPostSubscribe: true },
+		);
+	});
+
+	test("stale: false leaves the subscription alone", async () => {
+		await withPushBrowser(false, async (probe) => {
+			expect(probe.posts).toEqual([]);
+			expect(probe.subscribedKeys).toEqual([]);
+			expect(probe.requestPermissionCalls()).toBe(0);
+		});
 	});
 });
 

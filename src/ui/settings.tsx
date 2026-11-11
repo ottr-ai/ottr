@@ -1130,7 +1130,14 @@ export function NotificationsSection({
 			userVisibleOnly: true,
 			applicationServerKey: publicKey,
 		});
-		await post("/api/push/subscribe", sub.toJSON());
+		try {
+			await post("/api/push/subscribe", sub.toJSON());
+		} catch (err) {
+			// ADR-0011 recovery: a subscription without a server row sends to a dead
+			// address and never reports stale — undo it so the UI shows the truth.
+			await sub.unsubscribe().catch(() => {});
+			throw err;
+		}
 		return sub.endpoint;
 	};
 	// A failed recovery must show the real state: no browser subscription, so
@@ -1177,20 +1184,43 @@ export function NotificationsSection({
 				)
 					return;
 				recoveredRef.current.add(endpoint);
-				// The server row is secondary here: the browser subscription decides
-				// what follows, so only the browser's own unsubscribe failure counts
-				// (ADR-0011).
+				// ADR-0011 recovery: browser first, server row last. A failed browser
+				// unsubscribe leaves the real subscription in place, so "Turn off"
+				// stays and the kept stale row re-offers recovery on the next load.
 				try {
-					await post("/api/push/unsubscribe", { endpoint }).catch(() => {});
 					await sub.unsubscribe();
 				} catch (err) {
-					markRecoveryFailed(err);
+					setError(err instanceof Error ? err.message : String(err));
 					return;
+				}
+				// A moved endpoint loses the per-endpoint classes unless carried over
+				// explicitly: fetch them from the old row before it goes.
+				let carried: ClassPrefs | null = null;
+				try {
+					const p = await unwrap<{
+						classes: ClassPrefs | null;
+					}>(
+						await fetch(
+							`/api/notifications/prefs?endpoint=${encodeURIComponent(endpoint)}`,
+						),
+					);
+					carried = p.classes;
+				} catch {
+					carried = null;
 				}
 				try {
 					const fresh = await subscribeNew();
 					setEnabled(true);
 					setEndpoint(fresh);
+					if (fresh !== endpoint) {
+						if (carried !== null)
+							void post("/api/notifications/prefs", {
+								endpoint: fresh,
+								classes: carried,
+							}).catch(() => {});
+						// Same endpoint: the subscribe replaced the row in place.
+						void post("/api/push/unsubscribe", { endpoint }).catch(() => {});
+					}
 				} catch (err) {
 					markRecoveryFailed(err);
 				}

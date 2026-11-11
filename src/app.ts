@@ -1966,7 +1966,9 @@ export function createApp(deps: AppDeps) {
 			// while the previous pair was current. Rebinding keeps the per-sub
 			// stale rule covering both and never deletes the evidence a
 			// recovering device needs.
-			const previous = deps.gstore.get<string | null>("push_vapid_key") ?? null;
+			const previous =
+				deps.gstore.get<string | null>("push_vapid_key") ??
+				previousVapidPublicKey;
 			const subs = loadSubs(deps.gstore);
 			if (
 				previous !== null &&
@@ -2428,6 +2430,9 @@ export function createApp(deps: AppDeps) {
 	/** VAPID keys for Web Push; generated lazily on the first push path so boot stays silent. */
 	let vapid: { publicKey: string; privateKey: string; subject: string } | null =
 		null;
+	/** Outgoing public key recovered from a stored vapid row whose private key is unreadable
+	 * (ADR-0011 recovery): covers upgraded/restored boards that predate the push_vapid_key kv. */
+	let previousVapidPublicKey: string | null = null;
 	/** Alate server settings; key is sealed at rest like apiKey (ADR-0011). */
 	let alate: { url: string | null; key: string | null } = {
 		url: null,
@@ -2713,12 +2718,17 @@ export function createApp(deps: AppDeps) {
 			process.env.HINDSIGHT_API_TOKEN = hindsightToken;
 	}
 	function hindsightView() {
+		// The flags read the stored/runtime token, not just the env: a kept-unreadable
+		// token counts as set with tokenReadable false, and an env-only token (stored
+		// wins over env, like applyHindsight) counts as set and readable (ADR-0011).
+		const kept = keptUnreadable.has("hindsightToken");
+		const envToken =
+			process.env.HINDSIGHT_API_TOKEN !== undefined &&
+			process.env.HINDSIGHT_API_TOKEN !== "";
 		return {
 			url: process.env.HINDSIGHT_API_URL || null,
-			// The flags read the stored/runtime token, not the env the runner forwards: a
-			// kept-unreadable token counts as set with tokenReadable false (ADR-0011).
-			tokenSet: hindsightToken !== null || keptUnreadable.has("hindsightToken"),
-			tokenReadable: hindsightToken !== null,
+			tokenSet: hindsightToken !== null || kept || envToken,
+			tokenReadable: hindsightToken !== null || (!kept && envToken),
 			backend: memoryBackendFromEnv(process.env).backend,
 			memoryReason: memoryHealth?.reason ?? null,
 		};
@@ -3741,6 +3751,10 @@ export function createApp(deps: AppDeps) {
 					privateKey,
 					subject: p.vapid.subject,
 				};
+			} else {
+				// ADR-0011 recovery: the outgoing key is plaintext, so a board without
+				// the push_vapid_key kv (upgraded/restored) can still rebind its subs.
+				previousVapidPublicKey = p.vapid.publicKey;
 			}
 		}
 		if (typeof p.alate === "object" && p.alate !== null) {
