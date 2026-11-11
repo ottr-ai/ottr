@@ -7797,6 +7797,7 @@ export function createTurnLoop(
 			handoffPath,
 		});
 		try {
+			const savedDir = join(st.store.tasksDir, "quarantine", st.id);
 			writeBelow(
 				store.dataRoot,
 				handoffPath,
@@ -7804,6 +7805,7 @@ export function createTurnLoop(
 					task: st.store.getTask(st.id) ?? st.task,
 					turns: st.store.listTurns(st.id),
 					sessionsDir: st.store.sessionsDir,
+					savedDir: existsSync(savedDir) ? savedDir : null,
 				}),
 			);
 		} catch (err) {

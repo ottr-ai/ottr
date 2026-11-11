@@ -7,12 +7,10 @@ import {
 	type Dirent,
 	existsSync,
 	fstatSync,
-	lstatSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
 	readSync,
-	type Stats,
 	statSync,
 	writeFileSync,
 } from "node:fs";
@@ -61,7 +59,7 @@ import {
 } from "./auth.ts";
 import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
-import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
+import { openRegular, readBelow, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
 import { checkDeepened, type DeepenCheck, deepenDraft } from "./deepen.ts";
 import { errmsg, requestFailed } from "./errmsg.ts";
@@ -6917,16 +6915,21 @@ export function createApp(deps: AppDeps) {
 		const file = join(dir, rel);
 		if (!resolve(file).startsWith(resolve(dir) + sep))
 			return json({ error: "bad path" }, 400);
-		let st: Stats;
+		// readBelow refuses a symlink at EVERY path component (O_NOFOLLOW per component),
+		// so an untracked link that points out of the card's folder cannot widen the read.
+		// The cap only bounds the buffer: saveDoneFiles caps new saves at 4 MiB, but the
+		// quarantine also holds older uncapped entries (scratch, image retries).
+		let bytes: Buffer | null;
 		try {
-			st = lstatSync(file);
+			bytes = readBelow(dir, file, 64 * 1024 * 1024);
 		} catch {
+			// refused: a symlink at any component, a non-regular entry, or oversize
 			return json({ error: "unknown file" }, 404);
 		}
-		if (st.isSymbolicLink() || !st.isFile())
-			return json({ error: "unknown file" }, 404);
-		const f = Bun.file(file);
-		return new Response(f, {
+		if (bytes === null) return json({ error: "unknown file" }, 404);
+		const f = Bun.file(file); // extension-based Content-Type only; no disk access
+		// readBelow returns a subarray view; BodyInit wants a standalone buffer.
+		return new Response(new Uint8Array(bytes), {
 			headers: {
 				"Content-Type": f.type || "application/octet-stream",
 				"Content-Security-Policy": "sandbox allow-scripts",
@@ -8830,6 +8833,8 @@ export function createApp(deps: AppDeps) {
 				"handoffs",
 				`${newTaskId}.md`,
 			);
+			// The kept-files folder, when the finished card has one (done cards only).
+			const savedDir = join(source.store.tasksDir, "quarantine", sourceTask.id);
 			writeBelow(
 				target.store.dataRoot,
 				handoffPath,
@@ -8837,6 +8842,7 @@ export function createApp(deps: AppDeps) {
 					task: sourceTask,
 					turns: source.store.listTurns(sourceTask.id),
 					sessionsDir: source.store.sessionsDir,
+					savedDir: existsSync(savedDir) ? savedDir : null,
 				}),
 			);
 			target.store.updateTask(newTaskId, {

@@ -886,6 +886,13 @@ describe("task routes", () => {
 			`/api/projects/p1/tasks/${t.id}/saved-files?path=link.txt`,
 		);
 		expect(link.status).toBe(404);
+		// A symlinked parent must not widen the read either: x -> / would make
+		// x/etc/passwd resolve outside the card's folder.
+		symlinkSync("/", join(qdir, "x"));
+		const viaLink = await get(
+			`/api/projects/p1/tasks/${t.id}/saved-files?path=${encodeURIComponent("x/etc/passwd")}`,
+		);
+		expect(viaLink.status).toBe(404);
 		expect(
 			(
 				await get(
@@ -912,6 +919,25 @@ describe("task routes", () => {
 		expect(detail.status).toBe(200);
 		const b = (await detail.json()) as { worktreeFiles?: string[] };
 		expect(b.worktreeFiles).toEqual(["report.md"]);
+	});
+
+	test("a follow-up handoff names the source card's saved files folder", async () => {
+		const parent = store.createTask("done parent with files");
+		store.updateTask(parent.id, { stage: "done", state: "idle" });
+		const saved = join(store.tasksDir, "quarantine", parent.id);
+		mkdirSync(saved, { recursive: true });
+		writeFileSync(join(saved, "mockup.html"), "<h1>hi</h1>");
+		const res = await post(`/api/projects/p1/tasks/${parent.id}/follow-up`, {
+			text: "continue this",
+		});
+		expect(res.status).toBe(200);
+		const kid = store.listTasks().find((t) => t.followUpOf === parent.id);
+		expect(kid).toBeDefined();
+		const handoff = readFileSync(
+			join(store.tasksDir, "handoffs", `${kid!.id}.md`),
+			"utf8",
+		);
+		expect(handoff).toContain(`Saved files: \`${saved}\``);
 	});
 
 	test("diff endpoint serves the captured stat and text for finished cards", async () => {

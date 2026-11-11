@@ -31,6 +31,11 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
     returned in `tooLarge`. The chosen cap is `REPORT_MAX_BYTES` (4 MiB, `src/turn.ts`),
     the existing report-reader cap. Note: `quarantineUntracked` itself applies no size
     cap today; this cap is new and applies only to the done-save path.
+  - A missing worktree directory (a merged card keeps its worktree path after the
+    directory is gone) saves nothing and returns empty — no failure log.
+  - An untracked entry that is not a regular file (a nested repository, which git lists
+    as `dir/`; git never lists FIFOs or sockets) moves whole instead of stopping the
+    save, so entries that sort after it are still saved.
   - Vanished paths (deleted between status and save) are skipped.
   - Returns `{ moved, copied, tooLarge }` (repo-relative, forward slashes).
 - `removeDoneWorktree` logs, mirroring `quarantineUntrackedFiles`' style, and never lets a
@@ -54,9 +59,11 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Connection: close`,
   `Content-Type: Bun.file type || application/octet-stream`.
 - Refusals: empty `path`, `..` segments (either separator), absolute paths → 400
-  `{"error":"bad path"}`; resolved path leaving the card's folder → 400; symlink or
-  non-regular entry (lstat, never followed) → 404 `{"error":"unknown file"}`; missing
-  entry → 404.
+  `{"error":"bad path"}`; resolved path leaving the card's folder → 400; a symlink at
+  ANY path component, a non-regular entry, or an over-cap file (readBelow's O_NOFOLLOW
+  walk, so an untracked link cannot widen the read) → 404 `{"error":"unknown file"}`;
+  missing entry → 404. The read is capped at 64 MiB (bounds the buffer; older quarantine
+  entries are uncapped).
 
 ### Drawer (ui/app.tsx)
 - New `DrawerSec` `id="drawer-saved"` label `Saved files` inside `DrawerFiles`, shown when
@@ -66,13 +73,15 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
 - The done-card hint of "Worktree files" changes from "only the names remain" to point at
   Saved files when a saved list exists.
 
-### Follow-up handoff (prompts.ts, supervisor.ts)
+### Follow-up handoff (prompts.ts, app.ts, turn.ts, supervisor.ts)
 - `handoffMarkdown` gains optional `savedDir?: string | null`; when set it renders a
   `- Saved files: \`<dir>\`` bullet in the metadata list (the worktree is gone; the folder
   keeps the card's uncommitted files).
-- `ciFileFollowUp` (supervisor.ts ~1490) passes
-  `join(e.store.tasksDir, "quarantine", t.id)` when that folder exists. Other
-  `handoffMarkdown` callers stay unchanged.
+- Three call sites pass it when the card's `quarantine/<id>` folder exists:
+  the drawer's Follow-up handoff (`followUpHandoff`, `src/app.ts`), the retro proposal
+  handoff (`src/turn.ts`), and the CI follow-up (`ciFileFollowUp`,
+  `src/supervisor.ts`). A research card's follow-up (the drawer button) therefore names
+  the folder.
 
 ## Error cases
 - Save failure (git failure, refusing symlinked parent): logged, removal proceeds — the

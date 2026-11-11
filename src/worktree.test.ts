@@ -5155,6 +5155,40 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		rmSync(join(wt, ".."), { recursive: true, force: true });
 	});
 
+	test("returns empty when the worktree directory is gone", async () => {
+		// A merged card keeps its worktree path after the directory is gone: saving
+		// must answer empty instead of logging a false failure.
+		const r = await saveDoneFiles(
+			"/nonexistent-ottr-826-wt",
+			"/nonexistent-ottr-826-save",
+			"/nonexistent-ottr-826-store",
+			1024,
+		);
+		expect(r).toEqual({ moved: [], copied: [], tooLarge: [] });
+	});
+
+	test("moves an untracked nested repository whole and keeps saving after it", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		// git lists a nested repository as "clone/" — an entry that is not a regular
+		// file. Moving it must not stop the entries that sort after it.
+		mkdirSync(join(wt, "clone"));
+		const init = Bun.spawnSync([gitExe(), "init", "-q", "clone"], {
+			cwd: wt,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(init.exitCode).toBe(0);
+		writeFileSync(join(wt, "zzz.txt"), "after\n");
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		expect(r.moved).toContain("clone/");
+		expect(r.moved).toContain("zzz.txt");
+		expect(existsSync(join(saveDir, "clone"))).toBe(true);
+		expect(readFileSync(join(saveDir, "zzz.txt"), "utf8")).toBe("after\n");
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
+
 	test("skips a tracked file that vanished between status and the save", async () => {
 		const { wt, saveDir, dataRoot } = saveFixture();
 		// Staged add, then deleted from the worktree: status answers "AD", the read is null.

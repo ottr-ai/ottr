@@ -2845,7 +2845,10 @@ export async function quarantineUntracked(
  * (repo-relative paths preserved, symlinks move as links), tracked files with staged or
  * unstaged content changes COPY their current content (a symlink entry copies as a link).
  * A regular file larger than `maxBytes` is not saved and its repo-relative path lands in
- * `tooLarge`. A path that vanishes between status and save is skipped. Returns
+ * `tooLarge`. A path that vanishes between status and save is skipped. A missing worktree
+ * directory (a merged card keeps its worktree path after the directory is gone) saves
+ * nothing. An untracked entry that is not a regular file (a nested repository, which git
+ * lists as `dir/`) moves whole instead of stopping the save. Returns
  * { moved, copied, tooLarge } (repo-relative, forward slashes). Throws when git fails;
  * a symlinked parent on either side throws from the confine helpers.
  */
@@ -2855,6 +2858,7 @@ export async function saveDoneFiles(
 	dataRoot: string,
 	maxBytes: number,
 ): Promise<{ moved: string[]; copied: string[]; tooLarge: string[] }> {
+	if (!existsSync(worktreePath)) return { moved: [], copied: [], tooLarge: [] };
 	const moved: string[] = [];
 	const copied: string[] = [];
 	const tooLarge: string[] = [];
@@ -2879,7 +2883,9 @@ export async function saveDoneFiles(
 				tooLarge.push(rel.replaceAll("\\", "/"));
 				continue;
 			}
-			if (msg.endsWith(": a symlink")) {
+			if (msg.endsWith(": a symlink") || msg.endsWith(": not a regular file")) {
+				// A symlink moves as a link; a nested repository or FIFO moves whole.
+				// Neither stops the files that sort after it.
 				isLink = true;
 				bytes = null;
 			} else throw err;
