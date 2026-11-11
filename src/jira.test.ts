@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	assertAllowedHost,
 	detectType,
+	issueLinks,
 	type JiraConn,
 	JiraError,
 	type JiraNet,
@@ -262,6 +263,60 @@ describe("searchIssues: Data Center", () => {
 		const e = await jiraError(searchIssues(dc, "x", "abc", net()));
 		expect(e.kind).toBe("jql");
 		expect(seen).toHaveLength(0);
+	});
+
+	test("issueLinks reads Jira's fields.issuelinks wrapper and both directions", async () => {
+		answer = () =>
+			Response.json({
+				id: "10001",
+				key: "D-1",
+				fields: {
+					issuelinks: [
+						{
+							type: {
+								name: "Blocks",
+								inward: "is blocked by",
+								outward: "blocks",
+							},
+							outwardIssue: {
+								id: "10002",
+								key: "D-2",
+								fields: {
+									summary: "the fix",
+									status: { name: "Done" },
+								},
+							},
+						},
+						{
+							type: {
+								name: "Relates",
+								inward: "relates to",
+								outward: "relates to",
+							},
+							inwardIssue: {
+								id: "10003",
+								key: "D-3",
+								fields: {
+									summary: "the other ticket",
+									status: { name: "Open" },
+								},
+							},
+						},
+					],
+				},
+			});
+		const links = await issueLinks(cloud, "D-1", net());
+		expect(links).toEqual([
+			{ type: "blocks", key: "D-2", summary: "the fix", status: "Done" },
+			{
+				type: "relates to",
+				key: "D-3",
+				summary: "the other ticket",
+				status: "Open",
+			},
+		]);
+		expect(seen[0]?.method).toBe("GET");
+		expect(seen[0]?.path).toBe("/rest/api/3/issue/D-1");
 	});
 
 	test("an answer without an issue list is a bad response", async () => {

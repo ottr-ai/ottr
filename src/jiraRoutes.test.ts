@@ -115,7 +115,11 @@ const jira = Bun.serve({
 					total: all.length,
 				});
 			}
-			return Response.json({ issuelinks: linksByKey.get(stubKey) ?? [] });
+			return Response.json({
+				id: `10000-${stubKey}`,
+				key: stubKey,
+				fields: { issuelinks: linksByKey.get(stubKey) ?? [] },
+			});
 		}
 		const inKeys = (
 			/^key in \((.*)\)$/.exec(jql)?.[1] ?? /^key = (.*)$/.exec(jql)?.[1]

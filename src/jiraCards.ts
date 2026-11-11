@@ -47,6 +47,10 @@ const VALUE_MAX = 2000;
 /** How many links enter the prompt. */
 const LINK_COUNT = 20;
 const TRUNCATED = "\n… (truncated; read the full ticket in Jira)";
+/** The inline marker when one value is cut: same text as TRUNCATED, no leading newline. */
+const VALUE_TRUNCATED = "… (truncated; read the full ticket in Jira)";
+/** The marker when whole comments are dropped: the newest stay. */
+const OLDER_OMITTED = "(older comments omitted; read the ticket in Jira)";
 const OMITTED = "(fields omitted)";
 const READ_HINT = "read the ticket in Jira";
 
@@ -82,18 +86,29 @@ function fieldsText(i: JiraIssue): string {
 	return kept.length === 0 ? "(none)" : kept.join("\n");
 }
 
+/**
+ * The cleaned comment body, cut to the cap with the truncation marker when anything
+ * was lost, so a stopped comment is visible; null when nothing readable survives.
+ */
+const markedBody = (raw: string): string | null => {
+	const text = cleanOrWithheld(raw, READ_HINT).text;
+	if (text.trim() === "") return null;
+	return text.length <= VALUE_MAX
+		? text
+		: `${text.slice(0, VALUE_MAX - VALUE_TRUNCATED.length)}${VALUE_TRUNCATED}`;
+};
+
 /** Every comment, oldest first, one author/date/body chunk each. */
-function commentsText(i: JiraIssue): string {
-	const kept = i.comments
+function commentChunks(i: JiraIssue): string[] {
+	return i.comments
 		.map((m): string | null => {
-			const body = value(m.body);
-			if (body.trim() === "") return null;
+			const body = markedBody(m.body);
+			if (body === null) return null;
 			const author = value(m.author || "(unknown)");
 			const date = value(m.date);
 			return `${date === "" ? author : `${author} (${date})`}:\n${body}`;
 		})
 		.filter((t): t is string => t !== null);
-	return kept.join("\n\n");
 }
 
 /** Up to LINK_COUNT links, one line each: type verb, key, summary, status. */
@@ -110,7 +125,8 @@ function linksText(i: JiraIssue): string {
  * The card prompt: fixed header, then summary, description, fixed fields, comments, links
  * and each custom field as cleaned DATA blocks. The description is cut to fit the board's
  * prompt limit; when even an empty description does not fit, custom fields drop from the
- * last one back, then the comments and the links are cut and finally dropped.
+ * last one back, the links are cut and then dropped, and the comments drop oldest-first
+ * (the newest stay).
  */
 export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 	const key = safeId(issue.key);
@@ -130,7 +146,7 @@ export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 		issue.description || "(none)",
 		READ_HINT,
 	).text;
-	const comments = commentsText(issue);
+	const chunks = commentChunks(issue);
 	const links = linksText(issue);
 	const cutTo = (text: string, room: number): string =>
 		`${text.slice(0, Math.max(0, room - TRUNCATED.length))}${TRUNCATED}`;
@@ -144,14 +160,23 @@ export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 			...custom.slice(0, n),
 			...(n < custom.length ? [OMITTED] : []),
 		].join("\n\n");
+	/** The newest `k` comment chunks; the marker counts what was dropped. */
+	const commentBlock = (k: number): string => {
+		if (k === 0) return "";
+		const body = chunks.slice(-k).join("\n\n");
+		return chunks.length > k ? `${OLDER_OMITTED}\n\n${body}` : body;
+	};
+	const fullComments = commentBlock(chunks.length);
 	// Cut the description first; drop custom fields from the last one back while even the
-	// truncated description does not fit. Comments and links are cut, then dropped, in that
-	// order. n === 0 always fits: header, summary and the six fixed fields stay below the limit.
+	// truncated description does not fit. The links then give way (cut, then dropped)
+	// while the comments drop their OLDEST entries — the newest stay, the last comment
+	// holds the latest state. n === 0 always fits: header, summary and the six fixed
+	// fields stay below the limit.
 	let n = custom.length;
-	let room = PROMPT_LIMIT - build(n, "", comments, links).length;
+	let room = PROMPT_LIMIT - build(n, "", fullComments, links).length;
 	while (room < TRUNCATED.length && n > 0) {
 		n -= 1;
-		room = PROMPT_LIMIT - build(n, "", comments, links).length;
+		room = PROMPT_LIMIT - build(n, "", fullComments, links).length;
 	}
 	const desc =
 		description.length <= room ? description : cutTo(description, room);
@@ -169,14 +194,25 @@ export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 		if (text.length <= rest) return withBlock(text);
 		return rest >= TRUNCATED.length ? withBlock(cutTo(text, rest)) : without;
 	};
-	const withComments = (com: string): string =>
+	// Links give way first: they are cut, then dropped, while the comments keep as much
+	// as fits. The prompt grows strictly with k (dropping an oldest comment chunk always
+	// removes content), so the largest kept count is found by binary search.
+	const withComments = (k: number): string =>
 		fit(
 			"LINKS",
 			links,
-			(lnk) => build(n, desc, com, lnk),
-			build(n, desc, com, ""),
+			(lnk) => build(n, desc, commentBlock(k), lnk),
+			build(n, desc, commentBlock(k), ""),
 		);
-	return comments === ""
-		? withComments("")
-		: fit("COMMENTS", comments, withComments, withComments(""));
+	let k = chunks.length;
+	let lo = 0;
+	while (lo < k) {
+		const mid = Math.ceil((lo + k) / 2);
+		if (withComments(mid).length > PROMPT_LIMIT) {
+			k = mid - 1;
+		} else {
+			lo = mid;
+		}
+	}
+	return withComments(lo);
 }

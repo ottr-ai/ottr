@@ -613,6 +613,7 @@ export async function issueLinks(
 	net: JiraNet,
 ): Promise<JiraLink[]> {
 	const v = c.type === "cloud" ? 3 : 2;
+	// Jira answers the issue itself: { id, key, fields: { issuelinks: [...] } }.
 	const body = obj(
 		await request(
 			c.site,
@@ -622,6 +623,7 @@ export async function issueLinks(
 			net,
 		),
 	);
-	const raw = Array.isArray(body.issuelinks) ? body.issuelinks : [];
+	const fields = obj(body.fields);
+	const raw = Array.isArray(fields.issuelinks) ? fields.issuelinks : [];
 	return raw.map(toLink).filter((l) => l !== null);
 }

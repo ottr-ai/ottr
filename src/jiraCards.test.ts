@@ -168,19 +168,44 @@ describe("jiraCardPrompt", () => {
 		);
 		expect(p).not.toContain("no key");
 		expectWellFenced(p, 5);
-		// A comment body over 2000 characters is cut like a field value; a secret is redacted.
+		// A comment body over 2000 characters is cut with the truncation marker, so a
+		// stopped comment is visible; a secret is redacted before the cut.
 		const capped = jiraCardPrompt(
 			SITE,
 			issue({
 				comments: [{ author: `a ${TOKEN}`, date: "d", body: "c".repeat(5000) }],
 			}),
 		);
-		expect(capped).toContain(`a [REDACTED] (d):\n${"c".repeat(2000)}\nDATA>>>`);
+		const MARKER = "… (truncated; read the full ticket in Jira)";
+		expect(capped).toContain(
+			`a [REDACTED] (d):\n${"c".repeat(2000 - MARKER.length)}${MARKER}\nDATA>>>`,
+		);
 		// No comments, no links: no such blocks at all.
 		const bare = jiraCardPrompt(SITE, issue());
 		expect(bare).not.toContain("COMMENTS\n<<<DATA");
 		expect(bare).not.toContain("LINKS\n<<<DATA");
 		expectWellFenced(bare, 3);
+	});
+
+	test("a cut COMMENTS block drops the oldest comments and keeps the newest", () => {
+		// Twelve big comments overflow the limit: the oldest leave, the newest stay —
+		// the last comment is the one that holds the latest state.
+		const p = jiraCardPrompt(
+			SITE,
+			issue({
+				comments: Array.from({ length: 12 }, (_, i) => ({
+					author: `Author ${i}`,
+					date: "2026-10-01T10:00:00.000+0000",
+					body: `body ${i} ${"c".repeat(3000)}`,
+				})),
+			}),
+		);
+		expect(p.length).toBeLessThanOrEqual(20_000);
+		expect(p).toContain("(older comments omitted; read the ticket in Jira)");
+		expect(p).toContain("Author 11 (2026-10-01T10:00:00.000+0000):\nbody 11");
+		expect(p).not.toContain("Author 0 (");
+		expect(p).not.toContain("body 0 ");
+		expectWellFenced(p, 4);
 	});
 
 	test("a 50k-char description is cut so the prompt fits 20000", () => {
