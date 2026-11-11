@@ -556,7 +556,10 @@ services:
 # network has no egress. Isolation still holds: only the workers join it besides the
 # daemon, and Docker isolates bridge networks from each other, so the server (default
 # network only) has no route to buildkit.
+# `default` is declared only so podman-compose sees it (it raises "missing networks"
+# on a service network absent from this block); Docker Compose adds it implicitly.
 networks:
+  default: {}
   buildkit: {}
 
 volumes:
