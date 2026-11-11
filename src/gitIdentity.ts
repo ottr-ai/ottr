@@ -16,8 +16,8 @@ export interface CommitIdentity {
 }
 
 /**
- * `-c` args that pin an identity on one board git call (app.ts git-init, worktree.ts
- * rebase). `identity === null` keeps the built-in Ottr identity.
+ * `-c` args that pin an identity on the board's rebase call (worktree.ts). `identity === null`
+ * keeps the built-in Ottr identity.
  */
 export function identityArgs(identity: CommitIdentity | null): string[] {
 	const id = identity ?? {

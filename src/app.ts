@@ -116,8 +116,11 @@ import {
 import { withGithubRetry } from "./githubRetry.ts";
 import {
 	type CommitIdentity,
-	identityArgs,
+	commitIdentityEnv,
+	DEFAULT_COMMIT_EMAIL,
+	DEFAULT_COMMIT_NAME,
 	parseCommitField,
+	probeGitIdent,
 } from "./gitIdentity.ts";
 import type { GlobalStore } from "./globalStore.ts";
 import type { Hosted } from "./hosted.ts";
@@ -5212,7 +5215,19 @@ export function createApp(deps: AppDeps) {
 	async function gitInitWithCommit(p: string): Promise<string | null> {
 		const r = await git(["init", "-q", "-b", "main"], p);
 		if (r.code !== 0) return `git init failed: ${r.stderr.trim()}`;
-		let c = await git(
+		// A bare commit does not prove an identity: with no config scope naming one,
+		// git falls back to the passwd entry (root@hostname), and that fallback
+		// succeeds or fails with the host's name resolution — a success silently
+		// buries the Settings identity (OTTR-829). Probe the config scopes instead
+		// and pin the Settings identity, or the built-in Ottr identity, per field
+		// the config leaves empty, the same way the turn path does.
+		const probe = probeGitIdent({
+			cwd: p,
+			home: process.env.HOME ?? null,
+			gitConfigGlobal: process.env.GIT_CONFIG_GLOBAL ?? null,
+			baseEnv: process.env,
+		});
+		const c = await git(
 			[
 				"commit",
 				"-q",
@@ -5221,21 +5236,18 @@ export function createApp(deps: AppDeps) {
 				"docs(arch-review): initial commit",
 			],
 			p,
+			10 * 60_000,
+			undefined,
+			probe.name && probe.email
+				? {}
+				: commitIdentityEnv(
+						deps.shared.commitIdentity ?? {
+							name: DEFAULT_COMMIT_NAME,
+							email: DEFAULT_COMMIT_EMAIL,
+						},
+						probe,
+					),
 		);
-		if (c.code !== 0)
-			// No configured git identity: commit once with the Settings identity, falling
-			// back to the built-in Ottr identity, rather than failing the add.
-			c = await git(
-				[
-					...identityArgs(deps.shared.commitIdentity),
-					"commit",
-					"-q",
-					"--allow-empty",
-					"-m",
-					"docs(arch-review): initial commit",
-				],
-				p,
-			);
 		if (c.code !== 0) return `initial commit failed: ${c.stderr.trim()}`;
 		return null;
 	}
