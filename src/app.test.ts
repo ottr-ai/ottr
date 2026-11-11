@@ -1875,11 +1875,17 @@ describe("settings routes", () => {
 
 		test("the git-init fallback commit uses the Settings identity", async () => {
 			// A configured global identity would win before the fallback ran, so the app's
-			// git reads an empty pinned config here and the -c args decide the author.
-			const emptyConfig = join(root, `empty-gitconfig-${Date.now()}`);
-			writeFileSync(emptyConfig, "");
+			// git reads a pinned config here and the -c args decide the author. The pin
+			// carries user.useConfigOnly: where git accepts the passwd ident, the plain
+			// commit would succeed as that ident and the fallback would never run, so the
+			// pin forbids that fallback on every host. GIT_CONFIG_NOSYSTEM keeps a
+			// system-wide identity out of the plain commit too.
+			const pinConfig = join(root, `gitconfig-pin-${Date.now()}`);
+			writeFileSync(pinConfig, "[user]\n\tuseConfigOnly = true\n");
 			const oldGlobal = process.env.GIT_CONFIG_GLOBAL;
-			process.env.GIT_CONFIG_GLOBAL = emptyConfig;
+			const oldNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+			process.env.GIT_CONFIG_GLOBAL = pinConfig;
+			process.env.GIT_CONFIG_NOSYSTEM = "1";
 			try {
 				const dir = join(root, `identity-proj-${Date.now()}`);
 				mkdirSync(dir, { recursive: true });
@@ -1900,6 +1906,8 @@ describe("settings routes", () => {
 			} finally {
 				if (oldGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
 				else process.env.GIT_CONFIG_GLOBAL = oldGlobal;
+				if (oldNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+				else process.env.GIT_CONFIG_NOSYSTEM = oldNoSystem;
 			}
 		});
 	});
