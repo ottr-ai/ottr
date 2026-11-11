@@ -103,7 +103,7 @@ omp loads `.agents/skills/` from the repo for runs in this checkout. Install a s
 - Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)
 - `gh` ([GitHub CLI](https://cli.github.com)) only for releases, when **Settings** holds no GitHub token.
 - omp must run its tools without approval prompts; a one-shot `omp -p` run cannot answer them.
-- Ottr stores tokens and keys (GitHub, API key, session secret, and more) in plaintext in `.tasks/tracker.db`. Treat that file as a credential store. The database snapshots hold the same data, so protect the backup dir the same way.
+- Ottr stores tokens and keys (GitHub, API key, session secret, and more) in plaintext in `.tasks/tracker.db`. Treat that file as a credential store. The database snapshots hold the same data, so protect the backup dir the same way. [ADR-0011](docs/adr/0011-sealed-token-fields-encrypted-volumes.md) records the decision: seal these fields with the `SecretBox` key (`OTTR_SECRET_KEY` env wins, `.tasks/secret.key` stays as the fallback) and run the state volume, the backup dir, and the SSH key dir on an encrypted volume. The field sealing ships in a follow-up card.
 
 ## Quick start
 
