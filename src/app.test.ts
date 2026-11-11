@@ -45,6 +45,7 @@ import {
 	workerTmpWarnings,
 } from "./app.ts";
 import { hashPassword, signIdentity, signSession } from "./auth.ts";
+import type { DeepenCheck } from "./deepen.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
@@ -69,6 +70,7 @@ import {
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { PR_GATES } from "./prs.ts";
+import { gateCompareText, gateFingerprint } from "./promptGate.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	archReviewDue,
@@ -288,6 +290,14 @@ let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
 	async () => {
 		throw new Error("deepen not stubbed");
 	};
+// Deepen check seam: the route tests swap deepenCheckImpl per test; unstubbed calls fail loudly.
+let deepenCheckImpl:
+	| ((
+			draft: string,
+			rewrite: string,
+			model: string | null,
+	  ) => Promise<unknown>)
+	| null = null;
 // Live progress the /api/state silent tests set ({ text, at }); null is the default:
 // no progress at all, the log-only warning rule.
 let fakeProgress: { text: string; at?: number } | null = null;
@@ -311,6 +321,11 @@ const app = createApp({
 	projects,
 	...loopStubs(),
 	deepen: (prompt, model) => deepenImpl(prompt, model),
+	deepenCheck: (draft, rewrite, model) => {
+		if (!deepenCheckImpl)
+			return Promise.reject(new Error("deepenCheck not stubbed"));
+		return deepenCheckImpl(draft, rewrite, model) as Promise<DeepenCheck>;
+	},
 	progressOf: () => fakeProgress,
 	checkoutNotices: () => checkoutNoticesImpl(),
 	schedule: () => {
@@ -3794,6 +3809,62 @@ describe("alate routes", () => {
 			expect(cres.status).toBe(200);
 			expect(p1.store.getTask(control.id)!.updateMergeHead).toBeNull();
 			expect(p1.store.getTask(control.id)!.holdHead).toBe("sha-parked");
+		});
+
+		test("a Start anyway reply approves a gate park; other replies queue under it", async () => {
+			const p1 = projects.get("p1")!;
+			const parked = p1.store.createTask("gate park");
+			p1.store.updateTask(parked.id, {
+				needsReason: "Prompt gate: 2 open questions",
+				state: "needs_you",
+				asked: [{ question: "Which store?", options: [{ label: "SQLite" }], multi: false, recommended: null }],
+				gate: { hash: null, seen: null, fails: 2, sig: "Which store?", parked: true },
+			});
+			const res = await post(`/api/projects/p1/tasks/${parked.id}/reply`, {
+				text: "Start anyway",
+			});
+			expect(res.status).toBe(200);
+			const started = p1.store.getTask(parked.id)!;
+			expect(started.state).toBe("queued");
+			expect(started.needsReason).toBeNull();
+			expect(started.asked).toBeNull();
+			// The fingerprint covers the prompt with no pending, so the next start skips the gate.
+			expect(started.gate).toEqual({
+				hash: gateFingerprint(gateCompareText(parked.prompt, null, null)),
+				seen: null,
+				fails: 0,
+				sig: null,
+				parked: false,
+			});
+			expect(started.pendingPrompt).toBeNull();
+			// A real answer keeps the normal reply path: queued under the park, gate still parked.
+			const answered = p1.store.createTask("gate park");
+			p1.store.updateTask(answered.id, {
+				needsReason: "Prompt gate: 2 open questions",
+				state: "needs_you",
+				gate: { hash: null, seen: null, fails: 1, sig: "Which store?", parked: true },
+			});
+			const ares = await post(`/api/projects/p1/tasks/${answered.id}/reply`, {
+				text: "use SQLite",
+			});
+			expect(ares.status).toBe(200);
+			const revised = p1.store.getTask(answered.id)!;
+			expect(revised.state).toBe("queued");
+			expect(revised.pendingPrompt).toBe("use SQLite");
+			expect(revised.gate?.parked).toBe(true);
+			// A non-parked card takes the plain reply path even with the marker text.
+			const plain = p1.store.createTask("no gate park");
+			p1.store.updateTask(plain.id, {
+				needsReason: "the agent asked",
+				state: "needs_you",
+			});
+			const pres = await post(`/api/projects/p1/tasks/${plain.id}/reply`, {
+				text: "Start anyway",
+			});
+			expect(pres.status).toBe(200);
+			const plained = p1.store.getTask(plain.id)!;
+			expect(plained.pendingPrompt).toBe("Start anyway");
+			expect(plained.gate).toBeNull();
 		});
 
 		test("a reply on a parked merge-mismatch card approves the parked push head", async () => {
@@ -14097,10 +14168,49 @@ describe("backlog routes", () => {
 
 	test("deepen returns the rewrite through the seam", async () => {
 		const seen: Array<{ prompt: string; model: string | null }> = [];
+		const checkSeen: Array<{
+			draft: string;
+			rewrite: string;
+			model: string | null;
+		}> = [];
 		const prev = deepenImpl;
 		deepenImpl = async (prompt, model) => {
 			seen.push({ prompt, model });
 			return "  deeper draft  ";
+		};
+		const prevCheck = deepenCheckImpl;
+		deepenCheckImpl = async (draft, rewrite, model) => {
+			checkSeen.push({ draft, rewrite, model });
+			return {
+				points: [
+					{
+						draft: "missing",
+						rewrite: "covered",
+						reason: "the rewrite names the goal",
+					},
+					{
+						draft: "missing",
+						rewrite: "missing",
+						reason: "no method yet",
+					},
+					{
+						draft: "missing",
+						rewrite: "missing",
+						reason: "no material yet",
+					},
+					{
+						draft: "missing",
+						rewrite: "missing",
+						reason: "no tools yet",
+					},
+					{
+						draft: "missing",
+						rewrite: "missing",
+						reason: "no check yet",
+					},
+				],
+				additions: [],
+			};
 		};
 		try {
 			const res = await post("/api/projects/p1/deepen", {
@@ -14108,16 +14218,99 @@ describe("backlog routes", () => {
 				model: "openai/gpt-5",
 			});
 			expect(res.status).toBe(200);
-			expect(await res.json()).toEqual({ deepened: "  deeper draft  " });
-			// The seam sees the trimmed prompt and the model passthrough.
+			expect(await res.json()).toEqual({
+				deepened: "  deeper draft  ",
+				check: {
+					points: [
+						{
+							draft: "missing",
+							rewrite: "covered",
+							reason: "the rewrite names the goal",
+						},
+						{
+							draft: "missing",
+							rewrite: "missing",
+							reason: "no method yet",
+						},
+						{
+							draft: "missing",
+							rewrite: "missing",
+							reason: "no material yet",
+						},
+						{
+							draft: "missing",
+							rewrite: "missing",
+							reason: "no tools yet",
+						},
+						{
+							draft: "missing",
+							rewrite: "missing",
+							reason: "no check yet",
+						},
+					],
+					additions: [],
+				},
+				checkError: null,
+			});
+			// The seams see the trimmed prompt, the rewrite, and the model passthrough.
 			expect(seen).toEqual([{ prompt: "my draft", model: "openai/gpt-5" }]);
+			expect(checkSeen).toEqual([
+				{
+					draft: "my draft",
+					rewrite: "  deeper draft  ",
+					model: "openai/gpt-5",
+				},
+			]);
 			const noModel = await post("/api/projects/p1/deepen", {
 				prompt: "my draft",
 			});
 			expect(noModel.status).toBe(200);
 			expect(seen[1]).toEqual({ prompt: "my draft", model: null });
+			expect(checkSeen[1]).toEqual({
+				draft: "my draft",
+				rewrite: "  deeper draft  ",
+				model: null,
+			});
 		} finally {
 			deepenImpl = prev;
+			deepenCheckImpl = prevCheck;
+		}
+	});
+
+	test("deepen keeps the rewrite when the check seam throws", async () => {
+		const prev = deepenImpl;
+		deepenImpl = async () => "the rewrite";
+		const prevCheck = deepenCheckImpl;
+		deepenCheckImpl = async () => {
+			throw new Error("gateway exploded");
+		};
+		try {
+			const res = await post("/api/projects/p1/deepen", { prompt: "x" });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				deepened: "the rewrite",
+				check: null,
+				checkError: "gateway exploded",
+			});
+			deepenCheckImpl = async () => {
+				throw "not an error";
+			};
+			const res2 = await post("/api/projects/p1/deepen", { prompt: "x" });
+			expect(res2.status).toBe(200);
+			expect(await res2.json()).toEqual({
+				deepened: "the rewrite",
+				check: null,
+				checkError: "unknown error",
+			});
+			deepenCheckImpl = async () => {
+				throw new Error("x".repeat(600));
+			};
+			const res3 = await post("/api/projects/p1/deepen", { prompt: "x" });
+			expect(res3.status).toBe(200);
+			expect((await res3.json()).checkError).toBe("x".repeat(500));
+		} finally {
+			deepenImpl = prev;
+			deepenCheckImpl = prevCheck;
 		}
 	});
 

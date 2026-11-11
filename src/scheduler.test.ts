@@ -238,6 +238,7 @@ function task(p: Partial<Task> = {}): Task {
 		priority: null,
 		closeCandidate: null,
 		kind: "work",
+		gate: null,
 		...p,
 	};
 }

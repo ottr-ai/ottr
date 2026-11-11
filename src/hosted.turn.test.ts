@@ -18,7 +18,7 @@ import type {
 	MeteringRecord,
 	TokenUsage,
 } from "./hosted.ts";
-import { ARCH_REVIEW_MARKER } from "./prompts.ts";
+import { ARCH_REVIEW_MARKER, DEEPEN_POINTS } from "./prompts.ts";
 import { applyEvent, createRunSink, newEventState } from "./runner.ts";
 import { ProjectStore } from "./store.ts";
 import type { TurnOps, TurnProject } from "./turn.ts";
@@ -144,6 +144,14 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		},
 		ensurePackages: async () => [],
 		genTitle: async () => null,
+		// The comprehension gate defaults to a clean pass here: only the prompt-gate tests inject
+		// a seam, so ordinary turn tests exercise the run loop, not the gate (OTTR-823).
+		gateCheck: async () => ({
+			builds: "the task",
+			checks: "the recorded run",
+			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+			questions: [],
+		}),
 		titleRetryDelayMs: 5,
 		publishRelease: async () => "published",
 		runReleaseCommand: async () => "ran",
@@ -1309,6 +1317,14 @@ describe("hosted credit stop", () => {
 				if (genCalls > 1) sawSecondGen();
 				return null;
 			},
+			// The comprehension gate defaults to a clean pass here: only the prompt-gate tests inject
+			// a seam, so ordinary turn tests exercise the run loop, not the gate (OTTR-823).
+			gateCheck: async () => ({
+				builds: "the task",
+				checks: "the recorded run",
+				points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+				questions: [],
+			}),
 			startRun: (o: StartArgs) => {
 				record.runs.push(o);
 				o.onSession?.("sess-1");

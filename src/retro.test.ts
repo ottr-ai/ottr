@@ -110,6 +110,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		workCheckReport: null,
 		priority: null,
 		closeCandidate: null,
+		gate: null,
 		...p,
 	};
 }

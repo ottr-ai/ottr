@@ -26,6 +26,12 @@ import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
 import { GlobalStore } from "./globalStore.ts";
+import { DEEPEN_POINTS } from "./prompts.ts";
+import {
+	gateFingerprint,
+	START_ANYWAY,
+	type GateCheck,
+} from "./promptGate.ts";
 import {
 	ARCH_REVIEW_MARKER,
 	BOARD_CHECK_PROMPT,
@@ -202,6 +208,14 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		// The work-card check defaults off here: only the work-check tests switch it on, so a
 		// ready work turn settles to merging/queued exactly as before OTTR-28.
 		workCheck: () => false,
+		// The comprehension gate defaults to a clean pass here: only the prompt-gate tests inject
+		// a seam, so ordinary turn tests exercise the run loop, not the gate (OTTR-823).
+		gateCheck: async () => ({
+			builds: "the task",
+			checks: "the recorded run",
+			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+			questions: [],
+		}),
 		publishSoon: () => {
 			record.publishSoon += 1;
 		},
@@ -22401,5 +22415,204 @@ describe("stored review findings", () => {
 		const done = store.getTask(review.id)!;
 		expect(done.stage).toBe("done");
 		expect(done.summary).toBe("Released v1.0.0");
+	});
+});
+
+describe("prompt gate", () => {
+	/** A GateCheck with one open question and every point covered. */
+	function questionCheck(question = "Which database?"): GateCheck {
+		return {
+			builds: "a small service",
+			checks: "run the test suite",
+			points: DEEPEN_POINTS.map(() => ({
+				covered: true,
+				reason: "covered",
+			})),
+			questions: [{ question, options: ["sqlite", "postgres"] }],
+		};
+	}
+
+	/** A clear answer: no questions, the outside check covered. */
+	function clearCheck(): GateCheck {
+		return {
+			builds: "a small service",
+			checks: "run the test suite",
+			points: DEEPEN_POINTS.map(() => ({
+				covered: true,
+				reason: "covered",
+			})),
+			questions: [],
+		};
+	}
+
+	test("a vague card parks needs_you with the model's questions, no omp session and no worktree", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return questionCheck();
+			},
+		});
+		const task = store.createTask("build a thing");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("Prompt gate: the gate still has open questions");
+		expect(after.asked).toEqual([
+			{
+				question: "Which database?",
+				options: [{ label: "sqlite" }, { label: "postgres" }],
+				multi: false,
+				recommended: null,
+			},
+		]);
+		expect(after.gate?.parked).toBe(true);
+		expect(after.gate?.fails).toBe(1);
+		expect(after.gate?.sig).toBe("Which database?");
+		expect(after.gate?.hash).toBeNull();
+		// No worktree, no omp session, no turn row: the gate parked before all of them.
+		expect(calls).toBe(1);
+		expect(record.runs).toHaveLength(0);
+		expect(record.createWorktree).toHaveLength(0);
+		expect(after.worktree).toBeNull();
+		expect(store.listTurns(task.id)).toHaveLength(0);
+	});
+
+	test("a clear card with an outside check starts its turn", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return clearCheck();
+			},
+		});
+		const task = store.createTask("clear work");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(calls).toBe(1);
+		expect(record.runs).toHaveLength(1);
+		expect(after.state).toBe("idle");
+		// The fingerprint stamps the compared text; a repeat start skips the seam.
+		expect(after.gate?.hash).toBe(gateFingerprint("clear work"));
+		expect(after.gate?.parked).toBe(false);
+		expect(after.gate?.fails).toBe(0);
+	});
+
+	test("a gate check that fails twice parks with the error and makes no third call", async () => {
+		let calls = 0;
+		const { store, loop } = setup({
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("gateway down");
+			},
+		});
+		const task = store.createTask("flaky gate");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(calls).toBe(2);
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("Prompt gate: gateway down");
+		expect(after.asked).toBeNull();
+		expect(after.gate?.sig).toBe("error");
+		expect(after.gate?.fails).toBe(1);
+		expect(after.gate?.parked).toBe(true);
+	});
+
+	test("two identical question parks carry the Start-anyway question on the second", async () => {
+		let calls = 0;
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return questionCheck("Which database?");
+			},
+		});
+		const task = store.createTask("loopy gate");
+
+		await loop.runTurn(store.name, task.id);
+		const first = store.getTask(task.id)!;
+		expect(first.gate?.fails).toBe(1);
+
+		// Requeue: the same questions come back, so the second park gains Start anyway.
+		store.updateTask(task.id, { state: "queued" });
+		await loop.runTurn(store.name, task.id);
+
+		const second = store.getTask(task.id)!;
+		expect(second.state).toBe("needs_you");
+		expect(second.gate?.fails).toBe(2);
+		expect(second.gate?.sig).toBe("Which database?");
+		const asked = second.asked!;
+		expect(asked.at(0)?.question).toBe("Which database?");
+		const final = asked.at(-1)!;
+		expect(final.options).toEqual([{ label: START_ANYWAY }]);
+		expect(final.recommended).toBeNull();
+		expect(calls).toBe(2);
+	});
+
+	test("a hash match skips the gate seam entirely", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = store.createTask("already passed");
+		store.updateTask(task.id, {
+			gate: {
+				hash: gateFingerprint("already passed"),
+				seen: null,
+				fails: 0,
+				sig: null,
+				parked: false,
+			},
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(calls).toBe(0);
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.gate?.parked).toBe(false);
+	});
+
+	test("merge-kind and retro turns skip the gate", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return questionCheck();
+			},
+		});
+		// Merge kind: stage merging.
+		const merge = store.createTask("merge me");
+		store.updateTask(merge.id, { stage: "merging" });
+		await loop.runTurn(store.name, merge.id);
+		expect(calls).toBe(0);
+		expect(store.getTask(merge.id)?.gate).toBeNull();
+
+		// Retro flag.
+		const source = store.createTask("the source card");
+		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		store.updateTask(retro.id, { followUpOf: source.id });
+		record.proposal = {
+			prompt: "file this",
+			model: null,
+			summary: null,
+			project: null,
+		};
+		await loop.runTurn(store.name, retro.id);
+		expect(calls).toBe(0);
+		expect(store.getTask(retro.id)?.gate).toBeNull();
 	});
 });

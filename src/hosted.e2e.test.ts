@@ -33,6 +33,7 @@ import {
 import { type RunLauncher, startRun } from "./runner.ts";
 import { checkRoleFor } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
+import { DEEPEN_POINTS } from "./prompts.ts";
 import { createTurnLoop, type TurnLoop, type TurnOps } from "./turn.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
@@ -555,6 +556,14 @@ function mountBoard(
 		modelList: async () => [],
 		// Titles come from another omp run: a fixed title keeps the fake runs to work + check.
 		genTitle: async () => "Add hello file",
+		// The comprehension gate defaults to a clean pass here: only the prompt-gate tests inject
+		// a seam, so ordinary turn tests exercise the run loop, not the gate (OTTR-823).
+		gateCheck: async () => ({
+			builds: "the task",
+			checks: "the recorded run",
+			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+			questions: [],
+		}),
 		titleRetryDelayMs: 5,
 		drained: () => app.drained(),
 		drainedRunner: (id) => app.drainedRunner(id),

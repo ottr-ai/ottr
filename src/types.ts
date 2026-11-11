@@ -66,6 +66,20 @@ export interface AskQuestion {
 	recommended: number | null;
 }
 
+/** The comprehension gate's persisted state for one card (OTTR-823, JSON in the DB). */
+export interface PromptGateState {
+	/** sha256 hex of the compared effective text this gate passed (or the user started anyway); null = never passed. */
+	hash: string | null;
+	/** The user text the gate last saw (a reply the run has since consumed); keeps the skip rule stable across consumption. */
+	seen: string | null;
+	/** Consecutive failed gate evaluations with the same failure signature. */
+	fails: number;
+	/** The last park's failure signature: the question texts joined, or "error". */
+	sig: string | null;
+	/** True while the card sits in a gate park; the drawer shows Start anyway. */
+	parked: boolean;
+}
+
 /** Normalizes an ask tool call's `{ questions: [...] }` args; null when no usable question is inside. */
 export function askQuestions(args: unknown): AskQuestion[] | null {
 	if (typeof args !== "object" || args === null || !("questions" in args))
@@ -422,6 +436,8 @@ export interface Task {
 	releaseNotes: string | null;
 	/** Outstanding agent ask (JSON in the DB): the "?" badge and the clickable choices in the drawer. */
 	asked: AskQuestion[] | null;
+	/** Comprehension-gate state (JSON in the DB, OTTR-823); null = the gate never ran on this card. */
+	gate: PromptGateState | null;
 	/** Model every turn of this task runs with, e.g. "openai/gpt-5.2"; null = omp default. */
 	model: string | null;
 	/** Worktree files (repo-relative) the delete check kept; [] once a later check passed or the card is resolved. */

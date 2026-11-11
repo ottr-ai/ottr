@@ -41,6 +41,7 @@ import { modelList, modelRoles } from "./models.ts";
 import {
 	DEP_HELD_PROMPT,
 	depResumePrompt,
+	DEEPEN_POINTS,
 	followUpPrompt,
 	grillPrompt,
 	handoffMarkdown,
@@ -61,6 +62,17 @@ import {
 } from "./prompts.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
+import {
+	GATE_REASON,
+	gateAskQuestions,
+	gateCompareText,
+	gateFingerprint,
+	hasOpenQuestionsSection,
+	missingCheckQuestion,
+	openQuestionsLines,
+	promptGateCheck,
+	startAnywayQuestion,
+} from "./promptGate.ts";
 import { usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
 import { hostedGh, ownerRepo } from "./release.ts";
@@ -122,8 +134,11 @@ import {
 	type TaskPatch,
 } from "./store.ts";
 import { progressKey } from "./stryker.ts";
+import type { GateCheck } from "./promptGate.ts";
 import type {
 	ArchReview,
+	AskQuestion,
+	PromptGateState,
 	DiffFileStat,
 	GitFacts,
 	LatestImage,
@@ -840,6 +855,8 @@ export interface TurnOps {
 	) => Promise<string | null>;
 	/** Delay before the single retry of a failed title generation (OTTR-486); overridable for tests. */
 	titleRetryDelayMs?: number;
+	/** OTTR-823 preparation gate: the comprehension check model call; overridable for tests so none spawns a gateway. */
+	gateCheck?: typeof promptGateCheck;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
 	commitSubjects?: typeof commitSubjects;
 	/** OTTR-763: per-commit metadata (sha, subject, committer time, changed files) the
@@ -3169,6 +3186,8 @@ export function createTurnLoop(
 			const flags = turnIdentityFlags(store, id, task);
 			const idn = await resolveTurnIdentity(store, id, task, key, flags, log);
 			if (idn === null) return;
+			if (!(await promptGateTurnStart(store, id, task, kind, idn, log)))
+				return;
 			const loc = await prepareTurnWorktree(
 				e,
 				store,
@@ -3369,6 +3388,30 @@ export function createTurnLoop(
 			reportRunMetering(ops.hosted, mx.turn, name, id, kind, task, e, metered);
 		}
 		schedule();
+	}
+
+	/** True when the comprehension gate runs on this turn (OTTR-823 scope): plain work turns only —
+	 * no identity flag set, no research card, no PR adopt, no pr_review kind. Every skip is silent. */
+	function gateApplies(
+		kind: TurnKind,
+		flags: TurnIdentityFlags,
+		task: Task,
+	): boolean {
+		if (kind !== "work") return false;
+		if (
+			flags.interview ||
+			flags.grill ||
+			flags.scout ||
+			flags.retroCard ||
+			flags.reviewCard ||
+			flags.releaseCard ||
+			flags.boardCheck
+		)
+			return false;
+		if (task.research) return false;
+		if (task.sourcePrNumber !== null) return false;
+		if (task.kind === "pr_review") return false;
+		return true;
 	}
 
 	/** The synchronous claim of one queued turn: re-entrancy and drain gates, the preparing
@@ -3611,6 +3654,157 @@ export function createTurnLoop(
 			// board's GitHub token, also on a local run.
 			scout: task.kind === "trending",
 		};
+	}
+
+	/** OTTR-823 comprehension gate, phase before the worktree: false parks the card needs_you
+	 * (no worktree, no file change, no omp spawn); true proceeds. Runs only on gated work turns. */
+	async function promptGateTurnStart(
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		kind: TurnKind,
+		idn: TurnIdentity,
+		log: (line: string) => void,
+	): Promise<boolean> {
+		if (!gateApplies(kind, idn, task)) return true;
+		const live = store.getTask(id) ?? task;
+		const pending =
+			live.pendingPrompt !== null && live.pendingPrompt !== "."
+				? live.pendingPrompt
+				: null;
+		const seen = live.gate?.seen ?? null;
+		// Skip rule: the gate passed for exactly this compared text.
+		if (live.gate?.hash === gateFingerprint(gateCompareText(live.prompt, pending, seen))) {
+			log("+ prompt gate: passed earlier for this text");
+			return true;
+		}
+		// Deterministic park: the Deepen rewrite left an Open questions section and no user
+		// answers exist yet. No model call; the section's lines become the ask questions.
+		if (pending === null && seen === null && hasOpenQuestionsSection(live.prompt)) {
+			const lines = openQuestionsLines(live.prompt);
+			const asked = lines.map((question) => ({
+				question,
+				options: [],
+				multi: false,
+				recommended: null,
+			}));
+			const sig = lines.join("\n");
+			const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
+			parkGate(
+				store,
+				id,
+				{
+					needsReason: `${GATE_REASON}the prompt still carries an Open questions section`,
+					asked,
+					gate: { hash: null, seen, fails, sig, parked: true },
+				},
+				log,
+			);
+			return false;
+		}
+		// Model evaluation; one immediate retry on any failure.
+		let check: GateCheck | null = null;
+		let err: Error | null = null;
+		for (let attempt = 0; attempt < 2; attempt++) {
+			try {
+				check = await (ops.gateCheck ?? promptGateCheck)({
+					prompt: live.prompt,
+					userMessages: pending ?? seen,
+				});
+				err = null;
+				break;
+			} catch (e) {
+				err = e as Error;
+			}
+		}
+		if (err !== null || check === null) {
+			const cause = err?.message ?? "unknown failure";
+			log(`! prompt gate: ${cause}`);
+			parkGate(
+				store,
+				id,
+				{
+					needsReason: `${GATE_REASON}${cause}`,
+					asked: null,
+					gate: {
+						hash: null,
+						seen,
+						fails: live.gate?.sig === "error" ? live.gate.fails + 1 : 1,
+						sig: "error",
+						parked: true,
+					},
+				},
+				log,
+			);
+			return false;
+		}
+		const missing = !check.points[4]?.covered;
+		if (check.questions.length === 0 && !missing) {
+			// Pass: restate what the gate understood, stamp the fingerprint, start.
+			log(`+ prompt gate: would build: ${check.builds}`);
+			log(`+ prompt gate: check: ${check.checks}`);
+			const missingPoints = check.points
+				.map((p, i) => ({ p, i }))
+				.filter(({ p }) => !p.covered);
+			if (missingPoints.length === 0)
+				log("+ prompt gate: all five points covered");
+			for (const { p, i } of missingPoints)
+				log(`+ prompt gate: missing: ${DEEPEN_POINTS[i]} — ${p.reason}`);
+			store.updateTask(id, {
+				gate: {
+					hash: gateFingerprint(gateCompareText(live.prompt, pending, seen)),
+					seen: pending ?? seen,
+					fails: 0,
+					sig: null,
+					parked: false,
+				},
+			});
+			return true;
+		}
+		// Park with the gate's questions (and a missing outside check, named).
+		const modelQs = gateAskQuestions(check);
+		const sig = check.questions.map((q) => q.question).join("\n");
+		const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
+		let asked = modelQs;
+		if (missing) asked = [...asked, missingCheckQuestion()];
+		if (fails >= 3 && live.gate?.sig === sig)
+			asked = [startAnywayQuestion()];
+		else if (fails >= 2)
+			asked = [...asked.slice(0, 4), startAnywayQuestion()];
+		const cause = missing && modelQs.length === 0
+			? "the prompt names no outside check"
+			: "the gate still has open questions";
+		parkGate(
+			store,
+			id,
+			{
+				needsReason: `${GATE_REASON}${cause}`,
+				asked,
+				gate: { hash: null, seen, fails, sig, parked: true },
+			},
+			log,
+		);
+		return false;
+	}
+
+	/** The one gate park write: needs_you with the reason, the ask questions and the gate state. */
+	function parkGate(
+		store: ProjectStore,
+		id: string,
+		write: {
+			needsReason: string;
+			asked: AskQuestion[] | null;
+			gate: PromptGateState;
+		},
+		log: (line: string) => void,
+	): void {
+		log(`! ${write.needsReason}`);
+		store.updateTask(id, {
+			state: "needs_you",
+			needsReason: write.needsReason,
+			asked: write.asked,
+			gate: write.gate,
+		});
 	}
 
 	/** Fixes the session name before the run: the fixed name of a release-review, review or

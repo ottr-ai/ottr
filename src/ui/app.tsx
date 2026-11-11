@@ -19,6 +19,7 @@ import {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { defaultGitUsername } from "../githubHost.ts";
+import type { DeepenCheck, DeepenPointCheck } from "../deepen.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { DeadSignIn } from "../login.ts";
 import type { ModelOption } from "../models.ts";
@@ -26,7 +27,7 @@ import { shortKey, taskEntryKey } from "../notifications.ts";
 import { derivedTaskPrefix } from "../prefix.ts";
 import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
-import { isProposalReason } from "../prompts.ts";
+import { isProposalReason, DEEPEN_POINTS } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
@@ -2515,20 +2516,41 @@ function ModelField({
 	);
 }
 
-/** The deepen rewrite review: the line diff of draft vs rewrite with +/- glyphs, plus Use rewrite and Discard. */
+/** The deepen rewrite review: the line diff of draft vs rewrite with +/- glyphs, the
+ * five-point verdict panel, plus Use rewrite and Discard. */
 export function DeepenReview({
 	original,
 	deepened,
+	check,
+	checkError,
 	onUse,
 	onDiscard,
 }: {
 	original: string;
 	deepened: string;
+	check: DeepenCheck | null;
+	checkError: string | null;
 	onUse: () => void;
 	onDiscard: () => void;
 }) {
 	const rows = lineDiff(original, deepened);
 	const changed = rows.some((r) => r.kind !== "same");
+	// One row per canonical point: the label reads only the draft/rewrite pair, so the
+	// model cannot drift the names or the verdicts.
+	const pointLabel = (p: DeepenPointCheck): string =>
+		p.rewrite === "missing"
+			? "still missing"
+			: p.draft === "missing"
+				? "improved"
+				: "already present";
+	const improved =
+		check === null
+			? 0
+			: check.points.filter((p) => pointLabel(p) === "improved").length;
+	// A rewrite that improves nothing, or invents work, must not be the default action:
+	// Use rewrite keeps working but Discard carries the visual weight.
+	const weak =
+		check !== null && (improved === 0 || check.additions.length > 0);
 	return (
 		<section className="deepen-review" aria-label="Deepen review">
 			{changed ? (
@@ -2556,11 +2578,61 @@ export function DeepenReview({
 					The rewrite matches the draft line for line; nothing to change.
 				</p>
 			)}
+			{check === null ? (
+				<p className="hint deepen-check-error">
+					Check unavailable: {checkError ?? "unknown error"}
+				</p>
+			) : (
+				<div className="deepen-points">
+					<p className="deepen-points-summary">
+						{improved === 0
+							? "The rewrite improves no deepen point."
+							: `Improves ${improved} of ${DEEPEN_POINTS.length} deepen points.`}
+					</p>
+					<ul className="deepen-points-list">
+						{DEEPEN_POINTS.map((point, i) => {
+							const pc = check.points[i];
+							const label = pc === undefined ? "" : pointLabel(pc);
+							return (
+								<li key={point} className="deepen-point">
+									<span
+										className={`dp-label${label === "improved" ? " dp-improved" : ""}`}
+									>
+										{label}
+									</span>
+									<span className="dp-body">
+										<span className="dp-name">{point}</span>
+										{pc !== undefined && (
+											<span className="dp-reason">{pc.reason}</span>
+										)}
+									</span>
+								</li>
+							);
+						})}
+					</ul>
+					{check.additions.length > 0 && (
+						<div className="deepen-additions">
+							<p className="deepen-additions-head">
+								Adds what the draft did not ask for
+							</p>
+							<ul>
+								{check.additions.map((a, i) => (
+									<li key={i}>{a}</li>
+								))}
+							</ul>
+						</div>
+					)}
+				</div>
+			)}
 			<div className="dialog-actions">
 				<button type="button" onClick={onDiscard}>
 					Discard
 				</button>
-				<button type="button" className="primary" onClick={onUse}>
+				<button
+					type="button"
+					className={weak ? undefined : "primary"}
+					onClick={onUse}
+				>
 					Use rewrite
 				</button>
 			</div>
@@ -2627,7 +2699,14 @@ export function ComposeDialog({
 		model: string;
 	}) => Promise<void>;
 	/** Deepen the draft: POST /api/projects/:project/deepen. Absent on the backlog draft dialog. */
-	deepen?: (text: string, model: string) => Promise<{ deepened: string }>;
+	deepen?: (
+		text: string,
+		model: string,
+	) => Promise<{
+		deepened: string;
+		check: DeepenCheck | null;
+		checkError: string | null;
+	}>;
 	showModel?: boolean;
 	field?: ReactNode;
 }) {
@@ -2638,10 +2717,12 @@ export function ComposeDialog({
 	const images = useAttachedImages();
 	const sendState = useBusy();
 	const deepenState = useBusy();
-	/** Deepen result awaiting accept/edit: the diffed pair; null while no review is open. */
+	/** Deepen result awaiting accept/edit: the diffed pair plus its five-point check; null while no review is open. */
 	const [review, setReview] = useState<{
 		original: string;
 		deepened: string;
+		check: DeepenCheck | null;
+		checkError: string | null;
 	} | null>(null);
 	const [deepenErr, setDeepenErr] = useState<string | null>(null);
 	/** Full-size URL of a pasted image shown in the lightbox; null while closed. */
@@ -2686,8 +2767,13 @@ export function ComposeDialog({
 		setDeepenErr(null);
 		deepenState.start(async () => {
 			try {
-				const { deepened } = await deepen(text, model);
-				setReview({ original: text, deepened });
+				const r = await deepen(text, model);
+				setReview({
+					original: text,
+					deepened: r.deepened,
+					check: r.check,
+					checkError: r.checkError,
+				});
 				return true;
 			} catch (e) {
 				setDeepenErr(e instanceof Error ? e.message : String(e));
@@ -2809,6 +2895,8 @@ export function ComposeDialog({
 						<DeepenReview
 							original={review.original}
 							deepened={review.deepened}
+							check={review.check}
+							checkError={review.checkError}
 							onUse={useRewrite}
 							onDiscard={() => setReview(null)}
 						/>
@@ -2868,7 +2956,11 @@ function NewTaskDialog({
 			icon="send"
 			submitLabel="Add task"
 			deepen={async (text, model) =>
-				post<{ deepened: string }>(
+				post<{
+					deepened: string;
+					check: DeepenCheck | null;
+					checkError: string | null;
+				}>(
 					`/api/projects/${encodeURIComponent(project.name)}/deepen`,
 					{ prompt: text, model: model || undefined },
 				)
@@ -3165,7 +3257,11 @@ export function FollowUpDialog({
 				)
 			}
 			deepen={async (text, model) =>
-				post<{ deepened: string }>(
+				post<{
+					deepened: string;
+					check: DeepenCheck | null;
+					checkError: string | null;
+				}>(
 					`/api/projects/${encodeURIComponent(target)}/deepen`,
 					{ prompt: text, model: model || undefined },
 				)
@@ -9693,6 +9789,27 @@ function DrawerAskPanel(p: {
 					}}
 				/>
 			)}
+			{/* A parked prompt gate: the reason line sits above the one-tap escape hatch;
+			    it answers through the same reply endpoint as the ask. */}
+			{task.state === "needs_you" && task.gate?.parked === true && (
+				<div className="gate-start">
+					{task.needsReason !== null && (
+						<div className="needs-reason">{task.needsReason}</div>
+					)}
+					<button
+						type="button"
+						className="ghost gate-start-btn"
+						disabled={replySend.busy}
+						onClick={() => {
+							replySend.start(() => sendReply("Start anyway"));
+						}}
+						title='Replies "Start anyway" to the waiting session'
+					>
+						{replySend.busy && <span className="spinner" aria-hidden="true" />}
+						Start anyway
+					</button>
+				</div>
+			)}
 		</>
 	);
 }
@@ -9739,8 +9856,12 @@ function DrawerWaiting(p: {
 				</DrawerSec>
 			)}
 			{/* A live ask round hides its reason: the runner echoes the first question into
-					    it, and the ask panel above already carries the full questions. */}
-			{task.needsReason !== null && !askedNow && !proposal && (
+					    it, and the ask panel above already carries the full questions. A parked
+					    gate shows its reason inside the gate-start block above, not twice. */}
+			{task.needsReason !== null &&
+				!askedNow &&
+				!proposal &&
+				task.gate?.parked !== true && (
 				<div className="needs-reason">
 					<ProposalReasonLink
 						reason={task.needsReason}

@@ -59,7 +59,7 @@ import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
-import { deepenDraft } from "./deepen.ts";
+import { checkDeepened, deepenDraft, type DeepenCheck } from "./deepen.ts";
 import { errmsg, requestFailed } from "./errmsg.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
@@ -240,6 +240,11 @@ import {
 	workCheckSendBackDirection,
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
+import {
+	gateCompareText,
+	gateFingerprint,
+	START_ANYWAY,
+} from "./promptGate.ts";
 import { requirementsListPath } from "./python.ts";
 import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
 import {
@@ -537,6 +542,12 @@ interface AppDeps {
 	latestRelease?: (repo: string) => Promise<LatestGhRelease | null>;
 	/** Deepen seam for the composer route; defaults to deepenDraft (one gateway call). Tests inject a stub so no spawn happens. */
 	deepen?: (prompt: string, model: string | null) => Promise<string>;
+	/** Deepen check seam; defaults to checkDeepened (one gateway call judging draft vs rewrite against the five deepen points). Tests inject a stub so no spawn happens. */
+	deepenCheck?: (
+		draft: string,
+		rewrite: string,
+		model: string | null,
+	) => Promise<DeepenCheck>;
 	/** Server-side projects root (compose: /workspace via OMP_TRACKER_ROOTS[0]); Add project clones/creates under it. */
 	defaultDir: string;
 	projects: Map<string, Entry>;
@@ -9214,6 +9225,37 @@ export function createApp(deps: AppDeps) {
 		}
 		return null;
 	}
+	/** The gate park's Start anyway reply (docs/specs/prompt-gate.md): it approves the parked
+	 * prompt without a gate pass, so the next start skips the gate for this exact text. Any
+	 * other reply falls through to the queue and the gate re-runs on the next start. The
+	 * fingerprint covers prompt plus any pending steer, so a queued user text still gates. */
+	function gateStartReply(
+		e: Entry,
+		task: Task,
+		trimmed: string,
+		hasImages: boolean,
+	): Response | null {
+		const gate = task.gate;
+		if (gate?.parked !== true || trimmed !== START_ANYWAY || hasImages)
+			return null;
+		e.store.updateTask(task.id, {
+			state: "queued",
+			queuedAt: Date.now(),
+			needsReason: null,
+			asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
+			gate: {
+				hash: gateFingerprint(
+					gateCompareText(task.prompt, task.pendingPrompt, gate.seen),
+				),
+				seen: gate.seen,
+				fails: 0,
+				sig: null,
+				parked: false,
+			},
+		});
+		deps.schedule();
+		return taskResponse(e, task.id);
+	}
 	/** The reply payload refusals: not needs-you, bad images, or text over the cap. */
 	function replyRefusal(
 		e: Entry,
@@ -9282,6 +9324,8 @@ export function createApp(deps: AppDeps) {
 				: [];
 		const approval = holdApprovalReply(e, task, trimmed, images.length > 0);
 		if (approval !== null) return approval;
+		const start = gateStartReply(e, task, trimmed, images.length > 0);
+		if (start !== null) return start;
 		e.store.updateTask(task.id, {
 			// "." keeps pendingPrompt non-null for a picture-only reply (see steer). A steer
 			// queued before the stop stays: the reply goes under it, and Resume (".") sends it alone.
@@ -9832,7 +9876,19 @@ export function createApp(deps: AppDeps) {
 			const deepened = await (
 				deps.deepen ?? ((prompt, model) => deepenDraft({ prompt, model }))
 			)(trimmedRes, model);
-			return json({ deepened });
+			let check: DeepenCheck | null = null;
+			let checkError: string | null = null;
+			try {
+				check = await (
+					deps.deepenCheck ??
+					((draft, rewrite, m) => checkDeepened({ draft, rewrite, model: m }))
+				)(trimmedRes, deepened, model);
+			} catch (err) {
+				// A failed or malformed check never blocks the rewrite.
+				checkError = err instanceof Error ? err.message : "unknown error";
+				if (checkError.length > 500) checkError = checkError.slice(0, 500);
+			}
+			return json({ deepened, check, checkError });
 		} catch (err) {
 			logError("deepen", err);
 			return json(

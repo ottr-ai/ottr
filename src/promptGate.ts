@@ -1,0 +1,193 @@
+import { createHash } from "node:crypto";
+import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
+import { gatePrompt, gateSystem } from "./prompts.ts";
+import type { AskQuestion } from "./types.ts";
+
+/** The exact trimmed reply text (and drawer button label) that overrides a gate park. */
+export const START_ANYWAY = "Start anyway";
+
+/** Prefix of the needs-you reason every gate park writes. */
+export const GATE_REASON = "Prompt gate: ";
+
+/** The strict shape the gate model must answer with. */
+export interface GateCheck {
+	builds: string;
+	checks: string;
+	points: { covered: boolean; reason: string }[];
+	questions: { question: string; options: string[] }[];
+}
+
+/** The effective prompt the gate judges: the task text plus queued user text; the supervisor's Resume marker (".") is not user text. */
+export function gateEffectiveText(
+	prompt: string,
+	pending: string | null,
+): string {
+	if (pending === null || pending === ".") return prompt;
+	return `${prompt}\n\n${pending}`;
+}
+
+/** The text a gate fingerprint compares: consumed replies compare through `seen`. */
+export function gateCompareText(
+	prompt: string,
+	pending: string | null,
+	seen: string | null,
+): string {
+	return gateEffectiveText(prompt, pending ?? seen);
+}
+
+/** sha256 hex of the compared text. */
+export function gateFingerprint(text: string): string {
+	return createHash("sha256").update(text).digest("hex");
+}
+
+/** Strips one optional markdown fence wrapper, like the Deepen check parser. */
+function stripFence(raw: string): string {
+	const trimmed = raw.trim();
+	if (!trimmed.startsWith("```")) return trimmed;
+	const lines = trimmed.split("\n");
+	if (lines.length < 2) return trimmed;
+	const body = lines.slice(1);
+	if (body.at(-1)?.trim() === "```") body.pop();
+	return body.join("\n").trim();
+}
+
+/** Kept strings cap, matching parseDeepenCheck. */
+const CAP = 500;
+
+/** Parses and validates the gate model's strict JSON answer. A shape violation throws a RangeError naming it; kept strings cap at 500 chars, questions at 5, options at 5 per question. */
+export function parseGateCheck(raw: string): GateCheck {
+	const text = stripFence(raw);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch (err) {
+		throw new RangeError(
+			`gate check is not valid JSON: ${(err as Error).message}`,
+		);
+	}
+	if (typeof parsed !== "object" || parsed === null)
+		throw new RangeError("gate check is not a JSON object");
+	const o = parsed as Record<string, unknown>;
+	if (typeof o.builds !== "string" || o.builds.trim() === "")
+		throw new RangeError('gate check "builds" is missing or empty');
+	if (typeof o.checks !== "string" || o.checks.trim() === "")
+		throw new RangeError('gate check "checks" is missing or empty');
+	if (!Array.isArray(o.points) || o.points.length !== 5)
+		throw new RangeError(
+			`gate check "points" must hold exactly 5 items, got ${Array.isArray(o.points) ? o.points.length : String(o.points)}`,
+		);
+	const points = o.points.map((p, i) => {
+		if (typeof p !== "object" || p === null)
+			throw new RangeError(`gate check points[${i}] is not an object`);
+		const pt = p as Record<string, unknown>;
+		if (typeof pt.covered !== "boolean")
+			throw new RangeError(`gate check points[${i}].covered is not a boolean`);
+		if (typeof pt.reason !== "string")
+			throw new RangeError(`gate check points[${i}].reason is not a string`);
+		return { covered: pt.covered, reason: pt.reason.slice(0, CAP) };
+	});
+	if (!Array.isArray(o.questions))
+		throw new RangeError('gate check "questions" is not an array');
+	const questions = o.questions.slice(0, 5).map((q, i) => {
+		if (typeof q !== "object" || q === null)
+			throw new RangeError(`gate check questions[${i}] is not an object`);
+		const qo = q as Record<string, unknown>;
+		if (typeof qo.question !== "string" || qo.question.trim() === "")
+			throw new RangeError(
+				`gate check questions[${i}].question is missing or empty`,
+			);
+		if (!Array.isArray(qo.options))
+			throw new RangeError(
+				`gate check questions[${i}].options is not an array`,
+			);
+		const options = qo.options
+			.filter((opt): opt is string => typeof opt === "string")
+			.slice(0, 5)
+			.map((opt) => opt.slice(0, CAP));
+		return { question: qo.question.slice(0, CAP), options };
+	});
+	return { builds: o.builds.slice(0, CAP), checks: o.checks.slice(0, CAP), points, questions };
+}
+
+/** The one tool-free gate model call: `@plan` selector, 120 s timeout. */
+export async function promptGateCheck(o: {
+	prompt: string;
+	userMessages: string | null;
+	spawn?: SpawnFn;
+	timeoutMs?: number;
+}): Promise<GateCheck> {
+	const raw = await runGateway(
+		[
+			{ role: "system", content: gateSystem },
+			{ role: "user", content: gatePrompt(o.prompt, o.userMessages) },
+		],
+		o.spawn,
+		o.timeoutMs ?? 120_000,
+		"@plan",
+	);
+	return parseGateCheck(raw);
+}
+
+/** True when the text carries an "Open questions" section (a `#`–`######` heading or a bold `**Open questions**` line, case-insensitive). */
+export function hasOpenQuestionsSection(text: string): boolean {
+	for (const line of text.split("\n")) {
+		const t = line.trim();
+		if (/^#{1,6}\s+open questions\s*$/i.test(t)) return true;
+		if (/^\*\*\s*open questions\s*\*\*:?\s*$/i.test(t)) return true;
+	}
+	return false;
+}
+
+/** The non-empty body lines of the text's "Open questions" section, max 5. Empty when no section exists. */
+export function openQuestionsLines(text: string): string[] {
+	const lines = text.split("\n");
+	const out: string[] = [];
+	let inside = false;
+	for (const line of lines) {
+		const t = line.trim();
+		const heading = /^#{1,6}\s+open questions\s*$/i.test(t);
+		const bold = /^\*\*\s*open questions\s*\*\*:?\s*$/i.test(t);
+		if (heading || bold) {
+			inside = true;
+			continue;
+		}
+		if (!inside) continue;
+		// A next heading of any level ends the section.
+		if (/^#{1,6}\s/.test(t) || /^\*\*[^*]+\*\*/.test(t)) break;
+		if (t !== "") out.push(t);
+		if (out.length >= 5) break;
+	}
+	return out;
+}
+
+/** Maps the gate model's questions to ask questions the drawer renders: max 5, max 5 options each, single choice, no recommendation. */
+export function gateAskQuestions(check: GateCheck): AskQuestion[] {
+	return check.questions.slice(0, 5).map((q) => ({
+		question: q.question,
+		options: q.options.slice(0, 5).map((label) => ({ label })),
+		multi: false,
+		recommended: null,
+	}));
+}
+
+/** The final question a repeated-failure park gains (fails >= 2). */
+export function startAnywayQuestion(): AskQuestion {
+	return {
+		question:
+			'The gate asked the same questions twice. Pick "Start anyway" to run without the gate, or type your answers to the questions above.',
+		options: [{ label: START_ANYWAY }],
+		multi: false,
+		recommended: null,
+	};
+}
+
+/** The single ask question a missing outside check parks with. */
+export function missingCheckQuestion(): AskQuestion {
+	return {
+		question:
+			"The gate found no outside check in the prompt: name the test, command, number, or another observable result that shows the work is right.",
+		options: [],
+		multi: false,
+		recommended: null,
+	};
+}

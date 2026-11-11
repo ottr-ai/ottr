@@ -4807,6 +4807,90 @@ dialog.diff-view {
 .dl-meta {
 	color: var(--dim);
 }
+/* The five-point verdict panel under the diff: label column plus point text and reason. */
+.deepen-points {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+.deepen-points-summary {
+	margin: 0;
+	font-size: 13px;
+	color: var(--dim);
+}
+.deepen-points-list,
+.deepen-additions ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+.deepen-point {
+	display: grid;
+	grid-template-columns: 11em 1fr;
+	gap: 10px;
+	align-items: baseline;
+	font-size: 12.5px;
+}
+.dp-label {
+	color: var(--dim);
+}
+.dp-improved {
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.dp-body {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+}
+.dp-name {
+	color: var(--text-strong);
+}
+.dp-reason {
+	color: var(--dim);
+}
+.deepen-additions {
+	border: 1px solid var(--line-soft);
+	border-radius: 4px;
+	padding: 8px 10px;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	font-size: 12.5px;
+}
+.deepen-additions-head {
+	margin: 0;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.deepen-additions li {
+	color: var(--dim);
+}
+.deepen-check-error {
+	margin: 0;
+}
+/* A parked prompt gate's one-tap escape hatch under the ask panel. */
+.gate-start {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: 8px;
+	margin: 4px 0 8px;
+}
+.gate-start .gate-start-btn {
+	gap: 6px;
+	/* A visible edge: the ghost base alone reads as plain text next to the ask panel. */
+	border: 1px solid var(--line);
+	border-radius: 4px;
+	padding: 0 10px;
+	min-height: 30px;
+}
+.gate-start .needs-reason {
+	margin: 0;
+}
 .diff-empty {
 	padding: 18px 14px;
 }

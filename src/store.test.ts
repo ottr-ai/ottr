@@ -5086,3 +5086,101 @@ describe("jira imports", () => {
 		expect(t).toEqual([{ name: "jira_imports" }]);
 	});
 });
+
+describe("gate column", () => {
+	test("a fresh database carries the gate column via TASKS_DDL", () => {
+		const store = open(join(root, "gate-fresh"));
+		const task = store.createTask("gated");
+		expect(task.gate).toBeNull();
+		store.updateTask(task.id, {
+			gate: {
+				hash: "abc",
+				seen: null,
+				fails: 1,
+				sig: "q",
+				parked: true,
+			},
+		});
+		expect(store.getTask(task.id)?.gate).toEqual({
+			hash: "abc",
+			seen: null,
+			fails: 1,
+			sig: "q",
+			parked: true,
+		});
+		// undefined keeps the stored value; null clears it.
+		store.updateTask(task.id, { title: "renamed" });
+		expect(store.getTask(task.id)?.gate?.hash).toBe("abc");
+		store.updateTask(task.id, { gate: null });
+		expect(store.getTask(task.id)?.gate).toBeNull();
+		store.close();
+	});
+
+	test("an old-schema database without the gate column converges on open", () => {
+		const dir = join(root, "gate-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		// Shape of a database created before gate existed: the current DDL minus the column.
+		db.exec(`CREATE TABLE tasks (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			prompt TEXT,
+			stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done','backlog')),
+			state TEXT NOT NULL CHECK (state IN ('queued','preparing','running','needs_you','idle')),
+			needs_reason TEXT,
+			pending_prompt TEXT,
+			branch TEXT,
+			base TEXT,
+			worktree TEXT,
+			session_id TEXT,
+			summary TEXT,
+			details TEXT,
+			report TEXT,
+			research INTEGER NOT NULL DEFAULT 0,
+			research_steps TEXT NOT NULL DEFAULT 'unknown',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			queued_at INTEGER,
+			cancelled_at INTEGER,
+			images TEXT NOT NULL DEFAULT '[]',
+			pending_images TEXT NOT NULL DEFAULT '[]',
+			shots TEXT NOT NULL DEFAULT '[]',
+			release_version TEXT,
+			release_notes TEXT,
+			session_title TEXT,
+			asked TEXT,
+			model TEXT,
+			kept_files TEXT NOT NULL DEFAULT '[]',
+			follow_up_of TEXT,
+			push_sha TEXT,
+			update_ids TEXT NOT NULL DEFAULT '[]',
+			update_merge_approved INTEGER NOT NULL DEFAULT 0,
+			revision INTEGER NOT NULL DEFAULT 1
+		)`);
+		db.exec(
+			"INSERT INTO tasks (id, title, stage, state, created_at, updated_at) VALUES ('seed1', 'seeded', 'in_progress', 'idle', 1, 1)",
+		);
+		db.close();
+
+		const store = open(dir);
+		// The seeded row survives and reads a null gate; a write lands in the new column.
+		const seeded = store.getTask("seed1") as Task;
+		expect(seeded.gate).toBeNull();
+		store.updateTask("seed1", {
+			gate: { hash: null, seen: null, fails: 0, sig: null, parked: false },
+		});
+		expect(store.getTask("seed1")?.gate?.parked).toBe(false);
+		store.close();
+		// Reopening is idempotent: the ALTER no longer fires on a converged database.
+		const again = open(dir);
+		expect(again.getTask("seed1")?.gate?.parked).toBe(false);
+		again.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const cols = raw
+			.query<{ name: string }, []>("SELECT name FROM pragma_table_info('tasks')")
+			.all()
+			.map((c) => c.name);
+		raw.close();
+		expect(cols).toContain("gate");
+	});
+});

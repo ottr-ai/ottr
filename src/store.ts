@@ -63,6 +63,7 @@ import type {
 	TurnKind,
 	WorkCheckBlocker,
 	WorkCheckRun,
+	PromptGateState,
 } from "./types.ts";
 import { askQuestions, PR_REVIEW_WAITING } from "./types.ts";
 
@@ -129,6 +130,7 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   release_notes TEXT,
   session_title TEXT,
   asked TEXT,
+  gate TEXT,
   model TEXT,
   kept_files TEXT NOT NULL DEFAULT '[]',
   follow_up_of TEXT,
@@ -315,6 +317,7 @@ interface TaskRow {
 	release_version: string | null;
 	release_notes: string | null;
 	asked: string | null;
+	gate: string | null;
 	model: string | null;
 	kept_files: string;
 	follow_up_of: string | null;
@@ -536,6 +539,7 @@ function toListedTask(
 		releaseVersion: r.release_version,
 		releaseNotes: r.release_notes,
 		asked: parseAsked(r.asked),
+		gate: parseGate(r.gate),
 		model: r.model,
 		keptFiles: parseStringList(r.kept_files),
 		followUpOf: r.follow_up_of,
@@ -645,6 +649,25 @@ function parseAsked(raw: string | null): AskQuestion[] | null {
 	if (raw === null) return null;
 	try {
 		return askQuestions({ questions: JSON.parse(raw) });
+	} catch {
+		return null;
+	}
+}
+
+/** Parses the stored gate JSON (OTTR-823); invalid or absent -> null. */
+function parseGate(raw: string | null): PromptGateState | null {
+	if (raw === null) return null;
+	try {
+		const value: unknown = JSON.parse(raw);
+		if (typeof value !== "object" || value === null) return null;
+		const g = value as Partial<PromptGateState>;
+		return {
+			hash: typeof g.hash === "string" ? g.hash : null,
+			seen: typeof g.seen === "string" ? g.seen : null,
+			fails: typeof g.fails === "number" ? g.fails : 0,
+			sig: typeof g.sig === "string" ? g.sig : null,
+			parked: g.parked === true,
+		};
 	} catch {
 		return null;
 	}
@@ -816,6 +839,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	releaseVersion: "release_version",
 	releaseNotes: "release_notes",
 	asked: "asked",
+	gate: "gate",
 	model: "model",
 	keptFiles: "kept_files",
 	followUpOf: "follow_up_of",
@@ -1653,6 +1677,12 @@ export class ProjectStore {
 			cols,
 			"update_merge_approved",
 			"ALTER TABLE tasks ADD COLUMN update_merge_approved INTEGER NOT NULL DEFAULT 0",
+		);
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"gate",
+			"ALTER TABLE tasks ADD COLUMN gate TEXT",
 		);
 		// OTTR-795 optimistic-locking revision: lives in TASKS_DDL, so its ALTER runs here,
 		// before the CHECK rebuilds, like the shots column. The stale cols list fires the

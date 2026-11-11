@@ -73,6 +73,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		workCheckReport: null,
 		priority: null,
 		closeCandidate: null,
+		gate: null,
 	};
 }
 

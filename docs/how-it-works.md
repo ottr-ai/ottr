@@ -160,7 +160,7 @@ stateDiagram-v2
   [*] --> queued: createTask
   queued --> preparing: pickRunnable, runTurn claims the card
   preparing --> running: omp session starts
-  preparing --> needs_you: stopBeforeRun
+  preparing --> needs_you: stopBeforeRun, prompt gate
   running --> queued: next stage, retry, lost turn
   running --> needs_you: needs_you report, failed proof, stopTurn
   running --> idle: done, or review waits for findings
@@ -174,6 +174,7 @@ stateDiagram-v2
 
 - **queued**, **preparing**, **running**, **needs_you**, **idle** — `RunState` in `src/types.ts`
 - `pickRunnable` — `src/scheduler.ts`. `runTurn`, `stopBeforeRun`, `stopTurn`, `cancel`, `finishKept`, `settleLostTurn` — `src/turn.ts`
+- **Prompt gate** — before the omp session of a gate-scoped work turn starts (`runTurn` after the claim, before the worktree; `src/promptGate.ts`, spec `docs/specs/prompt-gate.md`), one tool-free model call on the `@plan` role gets only the card's effective prompt (prompt plus queued replies and steers) and answers strict JSON: what it would build, how it would check it, the five deepen points coverage, and each open question. Open questions or a missing outside check park the card `needs_you` with those questions as clickable asks; no omp session spawns and no file changes. A clear answer starts the turn and the restatement lands in the card log. A gateway failure, timeout, or malformed JSON parks with the reason and a **Start anyway** action after one retry; the same questions twice carry that action in the ask itself. The gate re-runs whenever the effective prompt changes (edit, reply, steer) and skips merge, retro, review, release, board-check, grill, interview, scout, research, PR-adopt (Dependabot) and pr_review turns. The composer's Deepen review shows the matching five-point proof next to its diff (`checkDeepened`, `src/deepen.ts`).
 - Next stage and retries — `classify` in `src/runner.ts`
 - User reply, restart session, grill, promote — `reply`, `restart-session`, `grill`, `backlog` under `POST /api/projects/<project>/tasks/<id>/` in `src/app.ts`
 - Auto-tend, `hygienePass`, `reclassifyPass` — `src/supervisor.ts`

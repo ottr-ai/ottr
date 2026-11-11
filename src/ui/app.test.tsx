@@ -4,6 +4,8 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseUsage } from "../quota.ts";
+import { DEEPEN_POINTS } from "../prompts.ts";
+import type { DeepenCheck } from "../deepen.ts";
 import type {
 	PerfMetrics,
 	PerfStat,
@@ -6557,7 +6559,8 @@ describe("ComposeDialog deepen", () => {
 		const html = renderToStaticMarkup(
 			<ComposeDialog
 				{...compose({
-					deepen: () => Promise.resolve({ deepened: "x" }),
+					deepen: () =>
+					Promise.resolve({ deepened: "x", check: null, checkError: null }),
 				})}
 			/>,
 		);
@@ -6578,15 +6581,35 @@ describe("ComposeDialog deepen", () => {
 });
 
 describe("DeepenReview", () => {
-	const review = (original: string, deepened: string) =>
+	const review = (
+		original: string,
+		deepened: string,
+		check: DeepenCheck | null = null,
+		checkError: string | null = null,
+	) =>
 		renderToStaticMarkup(
 			<DeepenReview
 				original={original}
 				deepened={deepened}
+				check={check}
+				checkError={checkError}
 				onUse={() => {}}
 				onDiscard={() => {}}
 			/>,
 		);
+	/** A check over the five canonical points from per-point verdict lists. */
+	const checkOf = (
+		draft: ("covered" | "missing")[],
+		rewrite: ("covered" | "missing")[],
+		additions: string[] = [],
+	): DeepenCheck => ({
+		points: DEEPEN_POINTS.map((point, i) => ({
+			draft: draft[i]!,
+			rewrite: rewrite[i]!,
+			reason: `reason ${i + 1}`,
+		})),
+		additions,
+	});
 	test("a mixed rewrite renders add and del rows, each with its +/- glyph", () => {
 		const html = review("keep\nold", "keep\nnew");
 		expect(html).toContain("dl-add");
@@ -6603,6 +6626,217 @@ describe("DeepenReview", () => {
 		expect(html).not.toContain("dl-add");
 		expect(html).toContain("matches the draft line for line");
 		expect(html).toContain("Use rewrite");
+	});
+	test("exactly two improved points render two improved rows and the 2-of-5 summary", () => {
+		// Points 1 and 2 improve (draft missing, rewrite covered); 3-5 are covered
+		// by both, so they read "already present".
+		const check = checkOf(
+			["missing", "missing", "covered", "covered", "covered"],
+			["covered", "covered", "covered", "covered", "covered"],
+		);
+		const html = review("draft", "rewrite", check, null);
+		expect(html).toContain("Improves 2 of 5 deepen points.");
+		expect(html.match(/>improved<\/span>/g)).toHaveLength(2);
+		expect(html.match(/>already present<\/span>/g)).toHaveLength(3);
+		expect(html).not.toContain("still missing");
+		expect(html).toContain("reason 1");
+		// Two improved points and no additions: Use rewrite stays the default action.
+		expect(html).toContain('class="primary"');
+	});
+	test("an addition renders under its own heading and demotes Use rewrite", () => {
+		const check = checkOf(
+			["missing", "missing", "covered", "covered", "covered"],
+			["covered", "covered", "covered", "covered", "covered"],
+			["Deploy to staging"],
+		);
+		const html = review("draft", "rewrite", check, null);
+		expect(html).toContain("Adds what the draft did not ask for");
+		expect(html).toContain(">Deploy to staging</li>");
+		expect(html).not.toContain('class="primary"');
+		expect(html).toContain(">Use rewrite</button>");
+	});
+	test("a rewrite that improves no point demotes Use rewrite even with no additions", () => {
+		const check = checkOf(
+			["missing", "missing", "covered", "covered", "covered"],
+			["missing", "missing", "covered", "missing", "covered"],
+		);
+		const html = review("draft", "rewrite", check, null);
+		expect(html).toContain("The rewrite improves no deepen point.");
+		expect(html.match(/>still missing<\/span>/g)).toHaveLength(3);
+		expect(html).not.toContain('class="primary"');
+	});
+	test("a failed check replaces the panel with the unavailable line", () => {
+		const html = review("draft", "rewrite", null, "bad JSON: expected 5 points");
+		expect(html).toContain("Check unavailable: bad JSON: expected 5 points");
+		expect(html).not.toContain("deepen-points");
+		expect(html).not.toContain("Improves");
+	});
+});
+
+describe("Drawer prompt gate Start anyway", () => {
+	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+	const drawerFields = {
+		kind: "work",
+		research: false,
+		report: null,
+		details: null,
+		branch: null,
+		model: null,
+		worktree: null,
+		sessionId: null,
+		images: [],
+		pendingImages: [],
+		shots: [],
+		keptFiles: [],
+		workCheckLog: [],
+	} as unknown as Partial<TaskCard>;
+	const project = {
+		name: "proj",
+		hasRules: true,
+		github: null,
+		sessionsDir: "/tmp/sessions",
+		settings: { maxParallel: 1 },
+	} as unknown as ProjectView;
+	const base = {
+		project,
+		// sendReply wraps its POST in this act: it must run the fn (the App act
+		// executes it; a no-op would swallow the reply and the POST never fires).
+		act: async (fn: () => Promise<unknown>) => {
+			await fn();
+			return true;
+		},
+		onClose: () => {},
+		onFollowed: () => {},
+		projects: [],
+		read: true,
+		onMarkUnread: () => {},
+		onMarkSeen: () => {},
+		tasks: [],
+		onOpenTask: () => {},
+		draining: false,
+		usedTotal: 0,
+		maxTotal: null,
+	};
+	// React interaction needs browser globals; the setup mirrors settings.test.tsx.
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		Node: window.Node,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	// happy-dom clicks never reach React's plugin: call the rendered onClick instead.
+	const onClickOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onClick?: (e: unknown) => void;
+		};
+		if (props.onClick === undefined) throw new Error("node has no onClick");
+		return props.onClick;
+	};
+	const gateTask = (gate: Task["gate"]) =>
+		cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "Prompt gate: two open questions",
+			asked: [
+				{
+					question: "Which environment deploys this?",
+					options: [],
+					multi: false,
+					recommended: null,
+				},
+			],
+			gate,
+		});
+
+	test("a gate park renders the reason and Start anyway; its click replies with the exact marker", async () => {
+		const realFetch = globalThis.fetch;
+		const posts: { url: string; body: unknown }[] = [];
+		// The drawer's detail, session and catalog fetches degrade to null on a 404;
+		// only the reply POST is captured.
+		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (url.endsWith("/tasks/t1/reply")) {
+				posts.push({ url, body: String(init?.body ?? "") });
+				return new Response(JSON.stringify({ ok: true }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<Drawer
+						{...base}
+						task={gateTask({
+							hash: null,
+							seen: null,
+							fails: 1,
+							sig: "Which environment deploys this?",
+							parked: true,
+						})}
+					/>,
+				);
+			});
+			const reason = container.querySelectorAll(".gate-start .needs-reason");
+			expect(reason).toHaveLength(1);
+			expect(reason[0]!.textContent).toContain(
+				"Prompt gate: two open questions",
+			);
+			const btn = container.querySelector<HTMLButtonElement>(
+				".gate-start .gate-start-btn",
+			);
+			if (btn === null) throw new Error("no Start anyway button");
+			await act(async () => {
+				onClickOf(btn)({});
+			});
+			await act(async () => {});
+			const post = posts.at(-1);
+			expect(post?.url).toContain("/api/projects/proj/tasks/t1/reply");
+			// The exact serialized form: the marker text verbatim, no images.
+			expect(post?.body).toBe(JSON.stringify({ text: "Start anyway", images: [] }));
+		} finally {
+			globalThis.fetch = realFetch;
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("a needs_you card without a parked gate renders no Start anyway", () => {
+		const html = renderToStaticMarkup(
+			<Drawer {...base} task={gateTask(null)} />,
+		);
+		expect(html).not.toContain("Start anyway");
+		expect(html).not.toContain("gate-start");
 	});
 });
 
