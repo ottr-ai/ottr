@@ -314,19 +314,26 @@ merge").
 
 The PR pass watches both PRs of a follow-up card. Each window: the conflict
 verdict runs for each PR still in the open list; a PR that left it gets one
-per-PR read (`GET repos/{repo}/pulls/{n}`). The follow-up PR merged: its
+per-PR read (`GET repos/{repo}/pulls/{n}`), which carries `merged`,
+`merge_commit_sha`, `base.ref` and `merged_at`. The follow-up PR merged: its
 fields clear, and the card keeps waiting on the source PR. Both merged: the
-card finishes with the source PR's `merge_commit_sha` — the commit on the
-target — falling back to the follow-up's when GitHub gives no source merge
-commit. Merge, squash and rebase merges all set the field, so no git
-ancestry, fetch order or merge-base read is involved; a follow-up that
-merged into an already-merged bump branch after the source is covered too
-(the target then holds everything the card made). The follow-up closed
+two reads decide which commit pins the card and whether delivery is proven.
+A follow-up whose merge-time `base.ref` is the target — a legacy card
+without the head branch name, or GitHub's retarget after the bump merged
+and its branch was deleted — delivered its own commit straight to the
+target: the later merge's commit pins the CI watch, and the follow-up's on
+a tie or an unreadable `merged_at`. A follow-up still based on the bump
+branch delivered through the source's merge, provable only when it merged
+strictly before the source; the source's `merge_commit_sha` then pins the
+watch. Equal or unreadable times are unresolved — the target may not hold
+the fixes — and the card parks needs_you once ("Follow-up PR #F merged
+without proof its fixes reached the target ..."), with the park guarded so
+the same reason never rewrites the row or the log. The follow-up closed
 without merge parks the card needs_you ("follow-up PR #F closed without
-merging"); the source closed without merge parks it the same way while the
-follow-up waits. The remote card-branch delete still runs only at the
-finish: the follow-up PR's head is the card branch, and it may go only once
-both PRs merged.
+merging", same guard); the source closed without merge parks it the same
+way while the follow-up waits. The remote card-branch delete still runs
+only at the finish: the follow-up PR's head is the card branch, and it may
+go only once both PRs merged.
 
 A Dependabot card parked on the rebase handoff (its reason carries "the
 board asked @dependabot to rebase") reads its source PR's comments once per

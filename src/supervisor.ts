@@ -2157,10 +2157,14 @@ export function createSupervisor(
 					await finishPrMerge(e, settings, t, s.mergeCommit);
 					return;
 				}
+				// The unresolved park repeats in every window unless the guard stops
+				// it: the same reason, the same write, one log line, once.
+				const unresolved = `Follow-up PR #${F} merged without proof its fixes reached the target (it still bases on the bump branch, or merged after PR #${S}). Carry them onto a new pull request.`;
+				if (t.state === "needs_you" && t.needsReason === unresolved) return;
 				if (wentStale(e.store, t)) return;
 				e.store.updateTask(t.id, {
 					state: "needs_you",
-					needsReason: `Follow-up PR #${F} merged without proof its fixes reached the target (it still bases on the bump branch, or merged after PR #${S}). Carry them onto a new pull request.`,
+					needsReason: unresolved,
 					pushSha: null,
 				});
 				ops.appendLog(
@@ -2216,10 +2220,14 @@ export function createSupervisor(
 		const s = await prState(e, repo, S);
 		if (s === null) return;
 		if (s.merged || s.state === "open") return;
+		const reason = `PR #${S} closed without merging`;
+		// The park repeats in every window unless the guard stops it: the same
+		// reason, the same write, one log line, once.
+		if (t.state === "needs_you" && t.needsReason === reason) return;
 		if (wentStale(e.store, t)) return;
 		e.store.updateTask(t.id, {
 			state: "needs_you",
-			needsReason: `PR #${S} closed without merging`,
+			needsReason: reason,
 			pushSha: null,
 		});
 		ops.appendLog(

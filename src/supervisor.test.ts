@@ -4105,6 +4105,14 @@ describe("prPass", () => {
 		);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("no proof of delivery");
+
+		// A second window reads the same answer: the park stays, and the log gains
+		// no second line.
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const log2 = await Bun.file(store.logPath(t.id)).text();
+		expect(
+			log2.split("\n").filter((l) => l.includes("no proof of delivery")),
+		).toHaveLength(1);
 		store.close();
 	});
 
@@ -4199,6 +4207,41 @@ describe("prPass", () => {
 		expect(after.pushSha).toBe(MERGE_SHA);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
+		store.close();
+	});
+
+	test("a closed source parks the card while the follow-up waits, idempotently", async () => {
+		// The source closed unmerged while the follow-up is still open: the card
+		// parks needs_you and one log line says so, however many windows pass.
+		const store = prModeProject("pr-fu-src-closed");
+		const t = followUpCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({ state: "closed" }),
+							stderr: "",
+						}
+					: openList([9]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("PR #7 closed without merging");
+		expect(after.followUpPrNumber).toBe(9);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain(
+			"supervisor: PR #7 closed without merging; card parked",
+		);
+
+		// Same answer again: the park does not rewrite the row or the log.
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const log2 = await Bun.file(store.logPath(t.id)).text();
+		expect(
+			log2.split("\n").filter((l) => l.includes("closed without merging")),
+		).toHaveLength(1);
 		store.close();
 	});
 
