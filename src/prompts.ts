@@ -379,6 +379,20 @@ ${o.blockers.map((b, i) => `${i + 1}. ${b.bugClass ? `[${b.bugClass}] ` : ""}${b
 ${premise}Do not weaken, delete or special-case tests to make them pass: fix the code the tests check.`;
 }
 
+/** The direction section a diverging park's send-back may carry: the user's typed reply, or
+ * the board's rethink instruction when the user only clicked. routeWorkCheck extracts the
+ * section back out of the sent-back turn, so the next check judges the directed approach
+ * instead of the old one. */
+export const WORK_CHECK_DIRECTION_HEADER = "New direction for the approach:";
+export function workCheckSendBackDirection(direction: string): string {
+	return `${WORK_CHECK_DIRECTION_HEADER}\n${direction}`;
+}
+export function workCheckDirectionOf(text: string): string | null {
+	const marker = `\n${WORK_CHECK_DIRECTION_HEADER}\n`;
+	const i = text.indexOf(marker);
+	return i === -1 ? null : text.slice(i + marker.length);
+}
+
 export function releasePrompt(o: {
 	version: string;
 	from: string | null;

@@ -55,6 +55,7 @@ import {
 	reviewCheckPrompt,
 	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
+	workCheckDirectionOf,
 	workCheckPrompt,
 	workCheckSendBack,
 	workPrompt,
@@ -98,12 +99,14 @@ import {
 	parseWorkCheck,
 	pickLowPriority,
 	pickRunnable,
+	repeatedBugClasses,
 	reviewFindings,
 	selectFindings,
 	UNCHECKED_FINDINGS_HOLD,
 	WORK_CHECK_ASK_BLOCK,
 	workCheckAsk,
 	workCheckBlockerCounts,
+	workCheckCountsDiverged,
 	workCheckDivergeAsk,
 	workCheckDiverged,
 	workCheckDivergeReason,
@@ -8113,15 +8116,22 @@ export function createTurnLoop(
 		// extra check run, not a wrong verdict.
 		const lastRun = priorLog[priorLog.length - 1];
 		const lastCheckAt = lastRun === undefined ? 0 : lastRun.at;
-		const replies = st.store
-			.listTurns(st.id)
-			.filter(
-				(t) =>
-					t.input !== null &&
-					t.startedAt > lastCheckAt &&
-					!t.input.startsWith(WORK_CHECK_SENDBACK_OPENING),
-			)
-			.map((t) => t.input as string);
+		const replies: string[] = [];
+		for (const t of st.store.listTurns(st.id)) {
+			if (t.input === null || t.startedAt <= lastCheckAt) continue;
+			if (t.input.startsWith(WORK_CHECK_SENDBACK_OPENING)) {
+				// A tracker send-back is not a human reply, but a directed send-back
+				// carries the user's or the board's new direction in its trailing
+				// section; the next check must judge that directed approach.
+				const direction = workCheckDirectionOf(t.input);
+				if (direction !== null) replies.push(direction);
+				continue;
+			}
+			// ponytail: only the send-back prefix is filtered; a tracker prompt from
+			// another flow (rare here) would cost one extra check run, not a wrong
+			// verdict.
+			replies.push(t.input);
+		}
 		// Every ready report after a send-back gets a fresh check, even at an
 		// unchanged head with no new report text: the update may be new evidence
 		// (a run the transcript now shows) or a corrected claim, and only a fresh
@@ -8168,9 +8178,17 @@ export function createTurnLoop(
 				workCheckHead: head,
 				...reportStamp,
 			});
-			st.log(
-				`- work check: blockers did not drop (counts ${workCheckBlockerCounts(runs).join(", ")}); parked instead of another send-back`,
-			);
+			const counts = workCheckBlockerCounts(runs);
+			const repeated = repeatedBugClasses(runs);
+			const why = [
+				workCheckCountsDiverged(runs)
+					? `counts ${counts.join(", ")} did not drop`
+					: null,
+				repeated.length > 0
+					? `repeated bug class${repeated.length > 1 ? "es" : ""} ${repeated.map((c) => `"${c}"`).join(", ")}`
+					: null,
+			].filter((part) => part !== null);
+			st.log(`- work check: diverging loop parked (${why.join("; ")})`);
 			return;
 		}
 		if (sendbacks >= WORK_CHECK_MAX_SENDBACKS) {

@@ -1109,19 +1109,23 @@ export function repeatedBugClasses(log: readonly WorkCheckRun[]): string[] {
 	return out;
 }
 
+/** The counts clause of workCheckDiverged: the blocker count did not drop across the last
+ * two send-backs (three blocking checks, each not lower than the one before). Pure. */
+export function workCheckCountsDiverged(log: readonly WorkCheckRun[]): boolean {
+	const counts = workCheckBlockerCounts(log);
+	if (counts.length < 3) return false;
+	const [a, b, c] = counts.slice(-3);
+	return (
+		a !== undefined && b !== undefined && c !== undefined && c >= b && b >= a
+	);
+}
+
 /** A diverging loop: the blocker count did not drop across the last two send-backs, or one
  * bugClass repeats in two consecutive checks. Both signal a shared wrong premise the agent
  * keeps patching around (GUARDRAILS 14a), so the board parks instead of sending back again.
  * Pure. */
 export function workCheckDiverged(log: readonly WorkCheckRun[]): boolean {
-	const counts = workCheckBlockerCounts(log);
-	if (counts.length >= 3) {
-		const [a, b, c] = counts.slice(-3);
-		if (a !== undefined && b !== undefined && c !== undefined) {
-			if (c >= b && b >= a) return true;
-		}
-	}
-	return repeatedBugClasses(log).length > 0;
+	return workCheckCountsDiverged(log) || repeatedBugClasses(log).length > 0;
 }
 
 /** Opening of the needs_you reason a diverging work-check loop sets; the reply route reads
@@ -1130,17 +1134,30 @@ export const WORK_CHECK_ASK_DIVERGE = "The work-check loop is diverging";
 export const WORK_CHECK_ASK_NEW_APPROACH = "Send back with a new approach";
 export const WORK_CHECK_ASK_CANCEL = "Cancel";
 
-/** The needs_you reason for a diverging loop: the blocker counts per round, then each
- * repeated bug class with its blockers. Pure. */
+/** The needs_you reason for a diverging loop: the blocker counts per round, then the rule(s)
+ * that fired — the did-not-drop claim only when the counts rule fired, plus each repeated
+ * bug class with its blockers. Pure. */
 export function workCheckDivergeReason(log: readonly WorkCheckRun[]): string {
-	let text = `${WORK_CHECK_ASK_DIVERGE}: the blocker count did not drop over the last send-backs (blockers per check: ${workCheckBlockerCounts(log).join(", ")})`;
-	const runs = log.filter((r) => r.outcome === "blockers");
-	const last = runs[runs.length - 1];
-	for (const cls of repeatedBugClasses(log)) {
-		const bs = (last?.blockers ?? []).filter((b) => b.bugClass === cls);
-		text += `. Repeated bug class "${cls}": ${bs
-			.map((b, i) => `${i + 1}. ${b.finding}`)
-			.join(" ")}`;
+	const counts = workCheckBlockerCounts(log);
+	const repeated = repeatedBugClasses(log);
+	const countsDiverged = workCheckCountsDiverged(log);
+	let text = `${WORK_CHECK_ASK_DIVERGE} (blockers per check: ${counts.join(", ")})`;
+	if (countsDiverged)
+		text += ": the blocker count did not drop over the last send-backs";
+	if (repeated.length > 0) {
+		const runs = log.filter((r) => r.outcome === "blockers");
+		const last = runs.at(-1);
+		const list = repeated
+			.map((cls) => {
+				const bs = (last?.blockers ?? []).filter((b) => b.bugClass === cls);
+				return `bug class "${cls}": ${bs
+					.map((b, i) => `${i + 1}. ${b.finding}`)
+					.join(" ")}`;
+			})
+			.join("; ");
+		text += countsDiverged
+			? `. It also re-raises the ${list}`
+			: `: it re-raises the ${list}`;
 	}
 	return `${text}. Reply with a new direction to send the card back with it, or click Merge anyway or Cancel.`;
 }
@@ -1158,7 +1175,7 @@ export function workCheckDivergeAsk(
 				{
 					label: WORK_CHECK_ASK_NEW_APPROACH,
 					description:
-						"Send the blockers back once more; the send-back names the repeated class and asks the agent to rethink the approach instead of fixing one more instance.",
+						"Send the blockers back once more; the send-back asks the agent to rethink the approach instead of fixing one more instance, and names the repeated class when there is one.",
 				},
 				{
 					label: WORK_CHECK_ASK_MERGE,

@@ -40,6 +40,8 @@ import {
 	replyPrompt,
 	restartResumePrompt,
 	WORK_CHECK_MAX_SENDBACKS,
+	workCheckSendBack,
+	workCheckSendBackDirection,
 } from "./prompts.ts";
 import { hitUsageLimit, WORKER_LOST } from "./runner.ts";
 import {
@@ -12571,10 +12573,10 @@ describe("work card check", () => {
 		expect(after.needsReason!.startsWith(WORK_CHECK_ASK_BLOCK)).toBe(false);
 		expect(after.needsReason).toContain("blockers per check: 1, 2, 2");
 		expect(after.needsReason).toContain(
-			'Repeated bug class "lossy-patch-compare"',
+			'the blocker count did not drop over the last send-backs. It also re-raises the bug class "lossy-patch-compare"',
 		);
 		expect(after.needsReason).toContain(
-			'Repeated bug class "false-stranded-park"',
+			'; bug class "false-stranded-park": 1. park judged stranded again',
 		);
 		expect(after.asked).toHaveLength(1);
 		expect(after.asked![0]!.options.map((o) => o.label)).toEqual([
@@ -12725,6 +12727,37 @@ describe("work card check", () => {
 		expect(after.state).toBe("queued");
 		expect(after.workCheckReport).toBe(
 			"first report\n\nClaims the widget works on this branch.",
+		);
+	});
+
+	test("a directed send-back reaches the next check as a reply", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = workCheckCase(
+			head,
+			[block("tests were weakened", "const x = 1;"), pass()],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+
+		// The divergence-park flow queues send-back + direction as the next turn's input.
+		const sendback = workCheckSendBack({
+			blockers: [{ finding: "tests were weakened", quote: "const x = 1;" }],
+			attempt: 2,
+			max: WORK_CHECK_MAX_SENDBACKS,
+		});
+		store.updateTask(task.id, {
+			pendingPrompt: `${sendback}\n${workCheckSendBackDirection("compare git rev-list output instead of parsing the diff")}`,
+		});
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		// The check run's prompt carries the direction as reply data (replies render as
+		// numbered lines, so the raw header is not in the prompt).
+		const checkPrompt = record.runs[3]!.prompt;
+		expect(checkPrompt).toContain(
+			"compare git rev-list output instead of parsing the diff",
 		);
 	});
 

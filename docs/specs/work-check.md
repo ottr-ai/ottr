@@ -57,7 +57,12 @@ classes, and the strict-JSON verdict format are unchanged.
 - Past the cap, the card asks the user: **Send it back** (one more send-back, still counted) or
   **Merge anyway** (override with a reason). Unchanged.
 - Human replies since the last check still ride along as numbered data; a tracker send-back
-  text (the `WORK_CHECK_SENDBACK_OPENING` prefix) is not a human reply.
+  text (the `WORK_CHECK_SENDBACK_OPENING` prefix) is not a human reply; a directed send-back's
+  `New direction for the approach:` section is (it changes the approach the next check judges).
+- A diverging loop parks at once when the blocker count did not drop over two consecutive
+  send-backs or one bug class repeats in two consecutive checks; the park asks **Send back
+  with a new approach** (a typed reply carries the user's direction; the click alone attaches
+  the board's rethink direction), **Merge anyway**, or **Cancel**.
 
 ## Error cases
 

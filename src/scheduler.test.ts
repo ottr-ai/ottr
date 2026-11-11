@@ -50,6 +50,7 @@ import {
 	silentSince,
 	waitingOn,
 	workCheckBlockerCounts,
+	workCheckCountsDiverged,
 	workCheckDivergeAsk,
 	workCheckDiverged,
 	workCheckDivergeReason,
@@ -1930,15 +1931,71 @@ describe("work-check divergence trend", () => {
 			},
 		];
 		const reason = workCheckDivergeReason(log);
-		expect(reason.startsWith("The work-check loop is diverging")).toBe(true);
-		expect(reason).toContain("blockers per check: 1, 2, 2");
-		expect(reason).toContain('Repeated bug class "lossy-patch-compare"');
-		expect(reason).toContain("patch compare loses hunks");
 		expect(
-			reason.endsWith(
-				"Reply with a new direction to send the card back with it, or click Merge anyway or Cancel.",
+			reason.startsWith(
+				"The work-check loop is diverging (blockers per check: 1, 2, 2)",
 			),
 		).toBe(true);
+		expect(reason).toContain(
+			': the blocker count did not drop over the last send-backs. It also re-raises the bug class "lossy-patch-compare": 1. patch compare loses hunks',
+		);
+		expect(
+			reason.endsWith(
+				". Reply with a new direction to send the card back with it, or click Merge anyway or Cancel.",
+			),
+		).toBe(true);
+	});
+
+	test("the reason names the class rule alone when the counts dropped", () => {
+		const log = [
+			{
+				...blockersRun(3, ["off-by-one", "off-by-one", "off-by-one"]),
+				blockers: [
+					{
+						finding: "off by one in the loop",
+						quote: "q0",
+						bugClass: "off-by-one",
+					},
+					{
+						finding: "off by one in the loop",
+						quote: "q1",
+						bugClass: "off-by-one",
+					},
+					{
+						finding: "off by one in the loop",
+						quote: "q2",
+						bugClass: "off-by-one",
+					},
+				],
+			},
+			{
+				...blockersRun(1, ["off-by-one"]),
+				blockers: [
+					{
+						finding: "off by one again",
+						quote: "q0",
+						bugClass: "off-by-one",
+					},
+				],
+			},
+		];
+		expect(workCheckCountsDiverged(log)).toBe(false);
+		expect(workCheckDiverged(log)).toBe(true);
+		const reason = workCheckDivergeReason(log);
+		expect(reason).toContain("(blockers per check: 3, 1)");
+		expect(reason).toContain(
+			': it re-raises the bug class "off-by-one": 1. off by one again',
+		);
+		expect(reason).not.toContain("did not drop");
+	});
+
+	test("the counts clause needs three blocking checks", () => {
+		const log = [blockersRun(1, ["x"]), blockersRun(2, ["x", "y"])];
+		expect(workCheckCountsDiverged(log)).toBe(false);
+		expect(workCheckDiverged(log)).toBe(true);
+		const reason = workCheckDivergeReason(log);
+		expect(reason).toContain('it re-raises the bug class "x"');
+		expect(reason).not.toContain("did not drop");
 	});
 
 	test("workCheckDivergeAsk asks one question with the three options, new approach recommended", () => {
@@ -1950,6 +2007,9 @@ describe("work-check divergence trend", () => {
 			"Cancel",
 		]);
 		expect(ask[0]!.recommended).toBe(0);
+		expect(ask[0]!.options[0]!.description).toBe(
+			"Send the blockers back once more; the send-back asks the agent to rethink the approach instead of fixing one more instance, and names the repeated class when there is one.",
+		);
 	});
 });
 

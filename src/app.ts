@@ -237,6 +237,7 @@ import {
 	rulesInterviewPrompt,
 	WORK_CHECK_MAX_SENDBACKS,
 	workCheckSendBack,
+	workCheckSendBackDirection,
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
@@ -289,6 +290,7 @@ import {
 	WORK_CHECK_ASK_MERGE,
 	WORK_CHECK_ASK_NEW_APPROACH,
 	WORK_CHECK_ASK_SEND_BACK,
+	workCheckBlockerCounts,
 } from "./scheduler.ts";
 import type { SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
@@ -9050,7 +9052,9 @@ export function createApp(deps: AppDeps) {
 	}
 	/** Queues the work-check send-back under any pending steer. A null direction
 	 * is a plain send-back; on a diverging park, any other text is the user's new
-	 * direction and goes out with it. */
+	 * direction and goes out with it. On a diverging park a click without text
+	 * attaches the board's rethink direction, so the send-back always pushes the
+	 * rethink. */
 	function applyWorkCheckSendBack(
 		e: Entry,
 		task: Task,
@@ -9058,19 +9062,28 @@ export function createApp(deps: AppDeps) {
 		direction: string | null = null,
 	): Response {
 		const n = task.workCheckSendbacks + 1;
+		const repeated = repeatedBugClasses(task.workCheckLog);
+		const divergePark =
+			task.needsReason?.startsWith(WORK_CHECK_ASK_DIVERGE) === true;
+		const directionSection =
+			direction !== null
+				? workCheckSendBackDirection(direction)
+				: divergePark && repeated.length === 0
+					? workCheckSendBackDirection(
+							`The blocker count did not drop over the last send-backs (blockers per check: ${workCheckBlockerCounts(task.workCheckLog).join(", ")}), so the fixes share a wrong premise. Before you fix one more instance: write down the premise that your fixes share, test the premise against the blockers above, and replace the approach when the premise is wrong.`,
+						)
+					: null;
 		const text = workCheckSendBack({
 			blockers: open,
 			attempt: n,
 			max: WORK_CHECK_MAX_SENDBACKS,
-			repeatedClasses: repeatedBugClasses(task.workCheckLog),
+			repeatedClasses: repeated,
 		});
 		e.store.updateTask(task.id, {
 			// A steer queued before the stop stays: the send-back goes under it.
 			pendingPrompt: queuedReply(
 				task.pendingPrompt,
-				direction === null
-					? text
-					: `${text}\nThe user's new direction for the approach:\n${direction}`,
+				directionSection === null ? text : `${text}\n${directionSection}`,
 			),
 			pendingBy: "supervisor",
 			workCheckSendbacks: n,

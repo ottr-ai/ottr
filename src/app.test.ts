@@ -8130,13 +8130,57 @@ describe("diverging work-check ask", () => {
 		});
 		expect(res.status).toBe(200);
 		const row = store.getTask(t.id)!;
-		expect(row.pendingPrompt).toContain(
-			"The user's new direction for the approach:",
-		);
+		expect(row.pendingPrompt).toContain("New direction for the approach:");
 		expect(row.pendingPrompt).toContain(
 			"compare git rev-list output instead of parsing the diff",
 		);
 		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+	});
+
+	test("a counts-only park's new-approach click attaches the board's rethink direction", async () => {
+		const classless = (n: number) => ({
+			at: Date.now(),
+			model: null,
+			outcome: "blockers" as const,
+			blockers: Array.from({ length: n }, (_, i) => ({
+				finding: `f${i}`,
+				quote: `q${i}`,
+			})),
+			notes: [],
+			durationMs: 1,
+		});
+		const t = inProgress([classless(1), classless(2), classless(2)]);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: workCheckDivergeReason(store.getTask(t.id)!.workCheckLog),
+			asked: workCheckDivergeAsk(store.getTask(t.id)!.workCheckLog),
+			workCheckSendbacks: 2,
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: WORK_CHECK_ASK_NEW_APPROACH,
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.state).toBe("queued");
+		expect(row.pendingPrompt).toContain("New direction for the approach:");
+		expect(row.pendingPrompt).toContain(
+			"did not drop over the last send-backs (blockers per check: 1, 2, 2)",
+		);
+		expect(row.pendingPrompt).toContain(
+			"replace the approach when the premise is wrong",
+		);
+		expect(row.pendingPrompt).not.toContain("repeated from the previous check");
+	});
+
+	test("a click on a repeated-class park adds only the premise paragraph", async () => {
+		const t = divergePark();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: WORK_CHECK_ASK_NEW_APPROACH,
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.pendingPrompt).toContain("repeated from the previous check");
+		expect(row.pendingPrompt).not.toContain("New direction for the approach:");
 	});
 
 	test("Merge anyway overrides the blockers and queues the merge", async () => {
