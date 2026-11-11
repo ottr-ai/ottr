@@ -49,6 +49,7 @@ import type { DeepenCheck } from "./deepen.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
 import { defaultSshDir, GIT_URL_ERROR, type Keyscan } from "./gitHosts.ts";
+import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { MAX_IMAGE_BYTES } from "./images.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
@@ -2097,49 +2098,106 @@ describe("settings routes", () => {
 			expect((await stateOf(m)).commitIdentity).toBeNull();
 		});
 
-		test("the git-init fallback commit uses the Settings identity", async () => {
-			// A configured global identity would win before the fallback ran, so the app's
-			// git reads a pinned config here and the -c args decide the author. The pin
-			// carries user.useConfigOnly: where git accepts the passwd ident, the plain
-			// commit would succeed as that ident and the fallback would never run, so the
-			// pin forbids that fallback on every host. GIT_CONFIG_NOSYSTEM keeps a
-			// system-wide identity out of the plain commit too.
-			const pinConfig = join(root, `gitconfig-pin-${Date.now()}`);
-			writeFileSync(pinConfig, "[user]\n\tuseConfigOnly = true\n");
+		// OTTR-831: the init commit's identity precedence is Settings > the host's own
+		// git config > the built-in Ottr fallback, decided on the first commit attempt.
+		/** Writes a git config file under root; the label keeps runs apart. */
+		const configFile = (label: string, body: string) => {
+			const p = join(root, `gitconfig-${label}`);
+			writeFileSync(p, body);
+			return p;
+		};
+		/** The author of a New-tab init commit, with both outer git config levels pinned,
+		 * so the result does not depend on the host's own config or auto-detected ident. */
+		const initAuthor = async (o: {
+			label: string;
+			global: string;
+			system?: string;
+			settings?: { name: string; email: string };
+		}) => {
 			const oldGlobal = process.env.GIT_CONFIG_GLOBAL;
-			const oldNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
-			process.env.GIT_CONFIG_GLOBAL = pinConfig;
-			process.env.GIT_CONFIG_NOSYSTEM = "1";
+			const oldSystem = process.env.GIT_CONFIG_SYSTEM;
+			process.env.GIT_CONFIG_GLOBAL = o.global;
+			if (o.system === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+			else process.env.GIT_CONFIG_SYSTEM = o.system;
 			try {
-				const dir = join(root, `identity-proj-${Date.now()}`);
+				const dir = join(root, `identity-proj-${o.label}`);
 				mkdirSync(dir, { recursive: true });
 				const m = mount({ projects: new Map(), defaultDir: dir });
-				const set = await m.call("/api/settings", {
-					commitName: "Ada",
-					commitEmail: "ada@example.invalid",
+				if (o.settings) {
+					const set = await m.call("/api/settings", {
+						commitName: o.settings.name,
+						commitEmail: o.settings.email,
+					});
+					expect(set.status).toBe(200);
+				}
+				const add = await m.call("/api/projects", {
+					name: `identity-proj-${o.label}`,
 				});
-				expect(set.status).toBe(200);
-				const add = await m.call("/api/projects", { name: "identity-proj" });
 				expect(add.status).toBe(200);
-				const log = execSync("git log -1 --format=%an%n%ae", {
-					cwd: join(dir, "identity-proj"),
+				return execSync("git log -1 --format=%an%n%ae", {
+					cwd: join(dir, `identity-proj-${o.label}`),
 				})
 					.toString()
 					.trim();
-				expect(log).toBe("Ada\nada@example.invalid");
 			} finally {
 				if (oldGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
 				else process.env.GIT_CONFIG_GLOBAL = oldGlobal;
-				if (oldNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
-				else process.env.GIT_CONFIG_NOSYSTEM = oldNoSystem;
+				if (oldSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+				else process.env.GIT_CONFIG_SYSTEM = oldSystem;
 			}
+		};
+		const hosty = "[user]\n\tname = Hosty\n\temail = hosty@example.invalid\n";
+
+		test("the Settings identity authors the init commit even when a host git config supplies one", async () => {
+			expect(
+				await initAuthor({
+					label: "settings-over-host",
+					global: configFile("settings-over-host-global", hosty),
+					system: configFile("settings-over-host-system", hosty),
+					settings: { name: "Ada", email: "ada@example.invalid" },
+				}),
+			).toBe("Ada\nada@example.invalid");
+		});
+
+		test("without a Settings identity, the host git config still authors the init commit", async () => {
+			expect(
+				await initAuthor({
+					label: "host-without-settings",
+					global: configFile("host-without-settings-global", hosty),
+					system: configFile("host-without-settings-system", hosty),
+				}),
+			).toBe("Hosty\nhosty@example.invalid");
+		});
+
+		test("the Settings identity authors the init commit with no outer identity", async () => {
+			expect(
+				await initAuthor({
+					label: "settings-empty-host",
+					global: configFile("settings-empty-host-global", ""),
+					system: configFile("settings-empty-host-system", ""),
+					settings: { name: "Ada", email: "ada@example.invalid" },
+				}),
+			).toBe("Ada\nada@example.invalid");
+		});
+
+		test("with no identity anywhere, the fallback retry pins the built-in Ottr identity", async () => {
+			// user.useConfigOnly without a name/email makes the bare commit fail on any
+			// host, so the retry (Settings null keeps the built-in identity) is reachable.
+			const strict = "[user]\n\tuseConfigOnly = true\n";
+			expect(
+				await initAuthor({
+					label: "built-in-fallback",
+					global: configFile("built-in-fallback-global", strict),
+					system: configFile("built-in-fallback-system", strict),
+				}),
+			).toBe(`${DEFAULT_COMMIT_NAME}\n${DEFAULT_COMMIT_EMAIL}`);
 		});
 
 		test("the git-init commit pins the Settings identity over the passwd fallback", async () => {
 			// EMAIL makes git's own identity fallback succeed on every host (author
-			// "root <EMAIL>"), so the failure-triggered retry never ran and the bare
-			// commit buried the Settings identity (OTTR-829). With both config scopes
-			// pinned empty, the commit must pin the Settings ident env instead.
+			// "root <EMAIL>"), so a bare commit can author as the passwd entry and bury
+			// the Settings identity (OTTR-829). With both config scopes pinned empty,
+			// the commit's -c args must pin the Settings identity over it.
 			const emptyConfig = join(root, `empty-gitconfig-${Date.now()}-pw`);
 			writeFileSync(emptyConfig, "");
 			const saved: Record<string, string | undefined> = {};

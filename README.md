@@ -114,7 +114,7 @@ omp loads `.agents/skills/` from the repo for runs in this checkout. Install a s
 
 Docker Compose is the preferred way to run Ottr: the board and its worker containers share one image, so every turn gets the same pinned toolchain, and a restart of the host machine brings the whole stack back. The stack is one file, [`docker-compose.yml`](docker-compose.yml).
 
-Every turn and the board's own git calls commit with a default identity (`Ottr <ottr@localhost>`) when the project or the home's git config names none. Change it under **Settings → Git and secrets → Commit identity**; a configured `~/.gitconfig` identity wins over the default.
+Every turn and the board's own git calls commit with a default identity (`Ottr <ottr@localhost>`) when the project or the home's git config names none. Change it under **Settings → Git and secrets → Commit identity**; a configured `~/.gitconfig` identity wins over the default, and the Settings identity wins over the home's git config when the board git-inits a project.
 
 ### Latest release (no clone, no build)
 

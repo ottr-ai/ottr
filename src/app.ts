@@ -132,11 +132,8 @@ import {
 import { withGithubRetry } from "./githubRetry.ts";
 import {
 	type CommitIdentity,
-	commitIdentityEnv,
-	DEFAULT_COMMIT_EMAIL,
-	DEFAULT_COMMIT_NAME,
+	identityArgs,
 	parseCommitField,
-	probeGitIdent,
 } from "./gitIdentity.ts";
 import type { GlobalStore } from "./globalStore.ts";
 import type { Hosted } from "./hosted.ts";
@@ -5264,20 +5261,15 @@ export function createApp(deps: AppDeps) {
 	async function gitInitWithCommit(p: string): Promise<string | null> {
 		const r = await git(["init", "-q", "-b", "main"], p);
 		if (r.code !== 0) return `git init failed: ${r.stderr.trim()}`;
-		// A bare commit does not prove an identity: with no config scope naming one,
-		// git falls back to the passwd entry (root@hostname), and that fallback
-		// succeeds or fails with the host's name resolution — a success silently
-		// buries the Settings identity (OTTR-829). Probe the config scopes instead
-		// and pin the Settings identity, or the built-in Ottr identity, per field
-		// the config leaves empty, the same way the turn path does.
-		const probe = probeGitIdent({
-			cwd: p,
-			home: process.env.HOME ?? null,
-			gitConfigGlobal: process.env.GIT_CONFIG_GLOBAL ?? null,
-			baseEnv: process.env,
-		});
-		const c = await git(
+		// Identity precedence on the watermark: a Settings identity wins over every host
+		// git config level (a bare commit would take the host's), Settings null keeps
+		// the host's own resolution, and a host with no identity at all falls to the
+		// built-in Ottr identity on the retry rather than failing the add.
+		let c = await git(
 			[
+				...(deps.shared.commitIdentity
+					? identityArgs(deps.shared.commitIdentity)
+					: []),
 				"commit",
 				"-q",
 				"--allow-empty",
@@ -5286,17 +5278,21 @@ export function createApp(deps: AppDeps) {
 			],
 			p,
 			10 * 60_000,
-			undefined,
-			probe.name && probe.email
-				? {}
-				: commitIdentityEnv(
-						deps.shared.commitIdentity ?? {
-							name: DEFAULT_COMMIT_NAME,
-							email: DEFAULT_COMMIT_EMAIL,
-						},
-						probe,
-					),
 		);
+		if (c.code !== 0)
+			// No usable identity on this host: retry with the Settings identity, null
+			// keeping the built-in Ottr identity.
+			c = await git(
+				[
+					...identityArgs(deps.shared.commitIdentity),
+					"commit",
+					"-q",
+					"--allow-empty",
+					"-m",
+					"docs(arch-review): initial commit",
+				],
+				p,
+			);
 		if (c.code !== 0) return `initial commit failed: ${c.stderr.trim()}`;
 		return null;
 	}
