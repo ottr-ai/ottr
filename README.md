@@ -261,14 +261,16 @@ project has no Windows machine to verify them.
   a colleague's Mac; not reproduced here): Podman passes the host's `HTTP_PROXY`/`HTTPS_PROXY`
   into the machine and the build, and there `localhost` is the build container, not the Mac.
   The apt step fails with `Could not connect to localhost:3128`, then `Unable to locate
-  package` for every package. Use one of these fixes:
+  package` for every package. Two fixes for the build:
   - point the proxy at Podman's host name instead: `HTTP_PROXY=http://host.containers.internal:3128`,
     or use the corporate proxy URL directly;
-  - add the compose service names to `NO_PROXY`, so calls between the stack's services do
-    not go through the proxy — the stack's entry scripts already append them at container
-    start (`docker/no-proxy.sh`), so set them yourself only for containers you run by hand;
   - skip the build: set `OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>` and run `podman compose pull`,
     then `podman compose up -d --no-build` (the [latest release](#latest-release-no-clone-no-build) path).
+  A separate runtime rule applies whenever a host proxy is set: calls between the stack's
+  services must bypass the proxy, so `NO_PROXY` must name the compose services. The stack's
+  entry scripts append those names at container start (`docker/no-proxy.sh`); set them
+  yourself only for containers you run by hand. That rule fixes the runtime calls only —
+  it cannot help the build failure above.
 
 - `board-seed` under podman-compose: `COMPOSE_PROFILES=alate` leaves the `seed` profile off, so `podman compose run --rm board-seed` fails with `missing services [board-seed]`. Activate the profile (Docker Compose v2 starts the service you run without the flag):
 
