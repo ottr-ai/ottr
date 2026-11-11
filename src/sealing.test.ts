@@ -462,7 +462,7 @@ describe("ADR-0011 config row sealing", () => {
 		expect((storedRow(g).alate as Record<string, unknown>).key).toBeNull();
 	});
 
-	test("VAPID regeneration prunes subs bound to the old key and reports stale", async () => {
+	test("VAPID regeneration rebinds subs to the outgoing key and reports stale", async () => {
 		const g = GlobalStore.open(join(root, "g-vapid"));
 		stores.push(g);
 		const seeded = sealedRow(box);
@@ -472,46 +472,52 @@ describe("ADR-0011 config row sealing", () => {
 			privateKey: box.seal("vapid-private-plain-9f3a"),
 			subject: "https://github.com/ottr-ai/ottr",
 		};
-		const staleEndpoint = "https://push.example.com/stale";
-		const liveEndpoint = "https://push.example.com/legacy";
+		const boundEndpoint = "https://push.example.com/bound";
+		const legacyEndpoint = "https://push.example.com/legacy";
 		g.set("config", seeded);
+		g.set("push_vapid_key", OLD_PUBLIC);
 		g.set("push_subs", [
 			{
-				endpoint: staleEndpoint,
+				endpoint: boundEndpoint,
 				keys: { p256dh: "p", auth: "a" },
 				addedAt: 1,
 				classes: { request: true, error: true, complete: true },
 				vapidPublicKey: OLD_PUBLIC,
 			},
 			{
-				// Legacy sub without a bound key: the current pair still works for it.
-				endpoint: liveEndpoint,
+				// Legacy sub without a bound key: recovery rebinds it to the
+				// outgoing key so the stale rule covers it too.
+				endpoint: legacyEndpoint,
 				keys: { p256dh: "p", auth: "a" },
 				addedAt: 2,
 				classes: { request: true, error: true, complete: true },
 			},
 		]);
 		const app = boot(g, wrongBox);
-		// First push path regenerates the pair and prunes the stale-bound sub.
+		// The first push path regenerates the pair and rebinds, never deletes:
+		// both rows remain in the store.
 		const config = await app.call("/api/push/config");
 		expect(config.status).toBe(200);
 		const subs = g.get<Record<string, unknown>[]>("push_subs") ?? [];
-		expect(subs.map((s) => s.endpoint)).toEqual([liveEndpoint]);
-		// A fresh sub bound to the old key reports stale; an unknown endpoint does not.
-		g.set("push_subs", [
-			...subs,
-			{
-				endpoint: staleEndpoint,
-				keys: { p256dh: "p", auth: "a" },
-				addedAt: 3,
-				classes: { request: true, error: true, complete: true },
-				vapidPublicKey: OLD_PUBLIC,
-			},
-		]);
-		const stale = await app.call(
-			`/api/push/config?endpoint=${encodeURIComponent(staleEndpoint)}`,
+		expect([...subs].map((s) => s.endpoint).sort()).toEqual(
+			[boundEndpoint, legacyEndpoint].sort(),
 		);
-		expect(stale.json.stale).toBe(true);
+		// The bound sub keeps its own stamp; the legacy sub is rebound to the
+		// outgoing key, the only key it could have been created under.
+		const bound = subs.find((s) => s.endpoint === boundEndpoint)!;
+		const legacy = subs.find((s) => s.endpoint === legacyEndpoint)!;
+		expect(bound.vapidPublicKey).toBe(OLD_PUBLIC);
+		expect(legacy.vapidPublicKey).toBe(OLD_PUBLIC);
+		// Both now report stale, so a recovering device re-subscribes; an
+		// unknown endpoint does not.
+		const staleBound = await app.call(
+			`/api/push/config?endpoint=${encodeURIComponent(boundEndpoint)}`,
+		);
+		expect(staleBound.json.stale).toBe(true);
+		const staleLegacy = await app.call(
+			`/api/push/config?endpoint=${encodeURIComponent(legacyEndpoint)}`,
+		);
+		expect(staleLegacy.json.stale).toBe(true);
 		const unknown = await app.call("/api/push/config?endpoint=nope");
 		expect(unknown.json.stale).toBe(false);
 		// A new subscribe stamps the current public key.
@@ -525,5 +531,36 @@ describe("ADR-0011 config row sealing", () => {
 			(s) => s.endpoint === "https://push.example.com/new",
 		);
 		expect(fresh?.vapidPublicKey).toBe(config.json.publicKey);
+	});
+
+	test("a no-box fresh board answers push config and never persists the generated pair", async () => {
+		const g = GlobalStore.open(join(root, "g-nobox-vapid"));
+		stores.push(g);
+		g.set("config", plainRow());
+		const app = boot(g, undefined);
+		const config = await app.call("/api/push/config");
+		expect(config.status).toBe(200);
+		expect(typeof config.json.publicKey).toBe("string");
+		// The generated pair stays in memory only: no plaintext private key at
+		// rest (the next good boot seals it).
+		expect(storedRow(g).vapid).toBeNull();
+	});
+
+	test("an empty-string alate key normalizes to a real clear", async () => {
+		for (const [name, appBox] of [
+			["wrong-key", wrongBox],
+			["no-box", undefined],
+		] as const) {
+			const g = GlobalStore.open(join(root, `g-alate-empty-${name}`));
+			stores.push(g);
+			g.set("config", sealedRow(box));
+			const app = boot(g, appBox);
+			const view = await app.call("/api/alate");
+			expect(view.json.keySet).toBe(true);
+			const clear = await app.call("/api/alate", { key: "" });
+			expect(clear.status).toBe(200);
+			expect(clear.json.keySet).toBe(false);
+			expect((storedRow(g).alate as Record<string, unknown>).key).toBeNull();
+		}
 	});
 });

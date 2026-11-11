@@ -3567,6 +3567,7 @@ describe("NotificationsSection stale push recovery", () => {
 			requestPermissionCalls: () => number;
 			containerText: () => string;
 		}) => Promise<void>,
+		subscribeRejects = false,
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
 		const realNavigator = globalThis.navigator;
@@ -3595,6 +3596,7 @@ describe("NotificationsSection stale push recovery", () => {
 				getSubscription: async () => currentSub,
 				subscribe: async (opts: { applicationServerKey: string }) => {
 					subscribedKeys.push(opts.applicationServerKey);
+					if (subscribeRejects) throw new Error("subscribe failed");
 					currentSub = {
 						endpoint: "https://push.example.com/new",
 						toJSON: () => ({ endpoint: "https://push.example.com/new" }),
@@ -3731,6 +3733,29 @@ describe("NotificationsSection stale push recovery", () => {
 			expect(probe.subscribedKeys).toEqual([]);
 			expect(probe.requestPermissionCalls()).toBe(0);
 		});
+	});
+
+	test("a failed recovery re-subscribe reports the error and offers Turn on", async () => {
+		await withPushBrowser(
+			true,
+			async (probe) => {
+				// The recovery dropped the old subscription, then the re-subscribe
+				// itself rejected: no subscribe POST can follow.
+				expect(probe.posts.map((p) => p.url)).toEqual([
+					"/api/push/unsubscribe",
+				]);
+				expect(probe.requestPermissionCalls()).toBe(0);
+				// The real state: no browser subscription, so the section shows the
+				// failure and the Turn on control, never the dead endpoint.
+				expect(probe.containerText()).toContain("subscribe failed");
+				expect(probe.containerText()).toContain("Turn on");
+				expect(probe.containerText()).not.toContain("Turn off");
+				expect(probe.containerText()).not.toContain(
+					"https://push.example.com/old",
+				);
+			},
+			true,
+		);
 	});
 });
 

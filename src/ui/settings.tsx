@@ -1133,6 +1133,15 @@ export function NotificationsSection({
 		await post("/api/push/subscribe", sub.toJSON());
 		return sub.endpoint;
 	};
+	// A failed recovery must show the real state: no browser subscription, so
+	// the section reports the failure and offers the "Turn on" control
+	// (ADR-0011) instead of a dead endpoint.
+	const markRecoveryFailed = (err: unknown): void => {
+		setEnabled(false);
+		setEndpoint(null);
+		setClasses(null);
+		setError(err instanceof Error ? err.message : String(err));
+	};
 	// Real state, not last-click: the flag reflects whether this device holds a subscription.
 	// The browser's subscription is registered again before the prefs load: a board that lost
 	// it (a new data folder, a restored backup) would answer "unknown endpoint" and hide the
@@ -1168,11 +1177,23 @@ export function NotificationsSection({
 				)
 					return;
 				recoveredRef.current.add(endpoint);
-				await post("/api/push/unsubscribe", { endpoint });
-				await sub.unsubscribe();
-				const fresh = await subscribeNew();
-				setEnabled(true);
-				setEndpoint(fresh);
+				// The server row is secondary here: the browser subscription decides
+				// what follows, so only the browser's own unsubscribe failure counts
+				// (ADR-0011).
+				try {
+					await post("/api/push/unsubscribe", { endpoint }).catch(() => {});
+					await sub.unsubscribe();
+				} catch (err) {
+					markRecoveryFailed(err);
+					return;
+				}
+				try {
+					const fresh = await subscribeNew();
+					setEnabled(true);
+					setEndpoint(fresh);
+				} catch (err) {
+					markRecoveryFailed(err);
+				}
 			})
 			.catch((err) => {
 				setError(err instanceof Error ? err.message : String(err));

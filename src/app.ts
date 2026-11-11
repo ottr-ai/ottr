@@ -411,7 +411,6 @@ import {
 	pruneSubs,
 	saveSubs,
 	sendAll,
-	staleSubs,
 } from "./webpush.ts";
 import type { WorkerTarget } from "./workers.ts";
 import {
@@ -1961,19 +1960,34 @@ export function createApp(deps: AppDeps) {
 		if (vapid === null) {
 			const keys = generateVAPIDKeys();
 			vapid = { ...keys, subject: PUSH_SUBJECT };
-			// ADR-0011 recovery: a fresh pair means the old one is gone, so subs bound to a
-			// previous public key can never receive again and are dropped. Legacy subs
-			// without a bound key stay: the current pair still works for them. A
-			// same-endpoint re-subscribe restores the device's class switches.
+			// ADR-0011 recovery: rebind, never delete. After a pair change every
+			// pre-existing subscription binds to the outgoing key — bound subs by
+			// their stamp, legacy subs because they could only have been created
+			// while the previous pair was current. Rebinding keeps the per-sub
+			// stale rule covering both and never deletes the evidence a
+			// recovering device needs.
+			const previous = deps.gstore.get<string | null>("push_vapid_key") ?? null;
 			const subs = loadSubs(deps.gstore);
-			const stale = staleSubs(subs, vapid.publicKey);
-			if (stale.length > 0)
+			if (
+				previous !== null &&
+				previous !== vapid.publicKey &&
+				subs.some((s) => s.vapidPublicKey === undefined)
+			)
 				saveSubs(
 					deps.gstore,
-					subs.filter((s) => !stale.includes(s)),
+					subs.map((s) =>
+						s.vapidPublicKey === undefined
+							? { ...s, vapidPublicKey: previous }
+							: s,
+					),
 				);
 			saveConfig();
 		}
+		// Recording the load path too: an upgraded board's first ensure records the
+		// stored pair's key, so a later recovery can rebind subs created before
+		// the upgrade.
+		if (deps.gstore.get<string | null>("push_vapid_key") !== vapid.publicKey)
+			deps.gstore.set("push_vapid_key", vapid.publicKey);
 		// Keys loaded from config at boot skip the branch above, but web-push's module state
 		// is per-process: without this, sends go out unsigned and FCM answers 401. The
 		// constant subject, not the stored one, heals configs saved before R2-3 (Apple
@@ -3458,13 +3472,11 @@ export function createApp(deps: AppDeps) {
 			sessions,
 			vapid:
 				deps.secretBox === undefined
-					? // No box: keep the stored blob when this boot cannot read it; a runtime
-						// pair here only exists on a legacy plaintext row, where it equals stored.
-						keptUnreadable.has("vapidKey")
-						? (stored?.vapid ?? null)
-						: vapid !== null
-							? { ...vapid, privateKey: vapid.privateKey }
-							: (stored?.vapid ?? null)
+					? // ADR-0011: no box keeps the stored spot verbatim. A generated pair
+						// stays in memory only (pushes still work this boot; the next good
+						// boot seals it), and a legacy plaintext row writes its own value
+						// back byte-identical — no plaintext private key is ever created.
+						(stored?.vapid ?? null)
 					: vapid === null
 						? null
 						: {
@@ -10678,9 +10690,10 @@ export function createApp(deps: AppDeps) {
 			if (valid instanceof Response) return valid;
 			next[key] = valid;
 		}
-		// The body carried the key: an explicit null is an operator clear, and it must
-		// win over a kept-unreadable blob (ADR-0011).
-		if (next.key === null && body.key === null) clearSecret("alateKey");
+		// The body carried the key: a value that normalizes to null (an explicit
+		// null or an empty string) is an operator clear, and it must win over a
+		// kept-unreadable blob (ADR-0011).
+		if (next.key === null && body.key !== undefined) clearSecret("alateKey");
 		alate = next;
 		saveConfig();
 		return json(alateView());
