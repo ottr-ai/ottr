@@ -195,8 +195,10 @@ export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 		return rest >= TRUNCATED.length ? withBlock(cutTo(text, rest)) : without;
 	};
 	// Links give way first: they are cut, then dropped, while the comments keep as much
-	// as fits. The prompt grows strictly with k (dropping an oldest comment chunk always
-	// removes content), so the largest kept count is found by binary search.
+	// as fits. At the full count no omitted-marker is present, so dropping one comment
+	// there can GROW the prompt by the marker; the full count is tested first. Below it
+	// the marker is constant and the prompt shrinks strictly as comments drop, so the
+	// largest kept count is found by binary search.
 	const withComments = (k: number): string =>
 		fit(
 			"LINKS",
@@ -204,8 +206,10 @@ export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 			(lnk) => build(n, desc, commentBlock(k), lnk),
 			build(n, desc, commentBlock(k), ""),
 		);
-	let k = chunks.length;
+	if (withComments(chunks.length).length <= PROMPT_LIMIT)
+		return withComments(chunks.length);
 	let lo = 0;
+	let k = chunks.length - 1;
 	while (lo < k) {
 		const mid = Math.ceil((lo + k) / 2);
 		if (withComments(mid).length > PROMPT_LIMIT) {

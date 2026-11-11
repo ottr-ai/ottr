@@ -208,6 +208,27 @@ describe("jiraCardPrompt", () => {
 		expectWellFenced(p, 4);
 	});
 
+	test("a cut description and a short first comment keep every comment", () => {
+		// The 50k description is cut so the prompt exactly fits with the full comment
+		// list. Dropping the short oldest comment would add the omitted marker and grow
+		// the prompt past the limit, so the full list must stay, without the marker.
+		const p = jiraCardPrompt(
+			SITE,
+			issue({
+				description: "y".repeat(50_000),
+				comments: [
+					{ author: "Bob", date: "2026-10-01T10:00:00.000+0000", body: "+1" },
+					{ author: "Ada", date: "2026-10-02T10:00:00.000+0000", body: "done" },
+				],
+			}),
+		);
+		expect(p.length).toBeLessThanOrEqual(20_000);
+		expect(p).toContain("Bob (2026-10-01T10:00:00.000+0000):\n+1");
+		expect(p).toContain("Ada (2026-10-02T10:00:00.000+0000):\ndone\nDATA>>>");
+		expect(p).not.toContain("(older comments omitted");
+		expectWellFenced(p, 4);
+	});
+
 	test("a 50k-char description is cut so the prompt fits 20000", () => {
 		const p = jiraCardPrompt(
 			SITE,
