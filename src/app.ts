@@ -166,6 +166,7 @@ import {
 	validateRoles,
 } from "./modelRoles.ts";
 import {
+	cardModelError,
 	type ModelOption,
 	modelFallbacks,
 	modelList,
@@ -3774,6 +3775,20 @@ export function createApp(deps: AppDeps) {
 		return m.trim().slice(0, 200) || null;
 	}
 
+	/** 400 for a card model that would park the card's first turn, or null when it may file.
+	 *  cardModelError holds the rule (shape plus catalog, src/models.ts); an empty catalog
+	 *  (omp missing) still refuses a selector that names no provider. */
+	async function cardModelResponse(
+		model: string | null,
+	): Promise<Response | null> {
+		if (model === null) return null;
+		const catalog = new Set(
+			(await (deps.models ?? modelList)()).map((m) => m.selector),
+		);
+		const why = cardModelError(model, catalog);
+		return why === null ? null : json({ error: why }, 400);
+	}
+
 	// PWA statics: the manifest lists icons by URL, and Bun's HTML bundler would hash those away,
 	// so they are served at stable root paths straight from the ui directory. The icons change
 	// only with a new name in the manifest, so they cache for a day (OTTR-662 tip 27); the
@@ -7285,6 +7300,8 @@ export function createApp(deps: AppDeps) {
 		if (!e) return json({ error: "unknown project" }, 404);
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
+		const badModel = await cardModelResponse(model);
+		if (badModel !== null) return badModel;
 		// The helper keeps the R1-8 ordering (git spawns before the guard; guard
 		// and createTask in one synchronous block); the manual route files
 		// without a due check, as today.
@@ -8871,6 +8888,8 @@ export function createApp(deps: AppDeps) {
 		const { e, task } = found;
 		const facts = followUpFacts(task, r.body);
 		if (facts instanceof Response) return facts;
+		const badModel = await cardModelResponse(facts.model);
+		if (badModel !== null) return badModel;
 		const landed = landFollowUp(
 			e,
 			task,
@@ -9634,10 +9653,10 @@ export function createApp(deps: AppDeps) {
 		return null;
 	}
 
-	function validateTaskCreate(
+	async function validateTaskCreate(
 		e: Entry,
 		body: Record<string, unknown>,
-	):
+	): Promise<
 		| {
 				prompt: string;
 				followUpOf: string | null;
@@ -9646,7 +9665,8 @@ export function createApp(deps: AppDeps) {
 				dependsOn: string[];
 				model: string | null;
 		  }
-		| Response {
+		| Response
+	> {
 		const promptRes = validateTaskPrompt(body);
 		if (promptRes instanceof Response) return promptRes;
 		// Agents filing cards from another task's run pass that task here; the link renders in both drawers.
@@ -9668,6 +9688,8 @@ export function createApp(deps: AppDeps) {
 		}
 		const model = modelParam(body);
 		if (model instanceof Response) return model;
+		const badModel = await cardModelResponse(model);
+		if (badModel !== null) return badModel;
 		return {
 			prompt: promptRes,
 			followUpOf,
@@ -9713,7 +9735,7 @@ export function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		const prep = validateTaskCreate(e, r.body);
+		const prep = await validateTaskCreate(e, r.body);
 		if (prep instanceof Response) return prep;
 		const decoded = decodeImages(
 			r.body.images,

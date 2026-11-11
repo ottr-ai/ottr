@@ -339,6 +339,49 @@ describe("create_task tool", () => {
 		expect(body).toEqual({ prompt: "p", followUpOf: "t" });
 	});
 
+	test("refuses a model that is an agent type, not a model id, and fetches nothing", async () => {
+		setEnv({
+			OTTR_BOARD_URL: "http://127.0.0.1:4747",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "t",
+		});
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: "p",
+			model: "sonic",
+		});
+		expect(text(out)).toBe(
+			"Error: sonic is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5.",
+		);
+		expect(called).toBe(false);
+	});
+
+	test("surfaces the board's catalog refusal with its fix", async () => {
+		setEnv({
+			OTTR_BOARD_URL: "http://127.0.0.1:4747",
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "t",
+		});
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					error:
+						"model zai/retired: unknown model zai/retired. Omit model to use the board default, or pick provider/model from the New task model list",
+				}),
+				{ status: 400 },
+			)) as unknown as typeof fetch;
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: "p",
+			model: "zai/retired",
+		});
+		expect(text(out)).toContain("HTTP 400");
+		expect(text(out)).toContain("unknown model zai/retired");
+	});
+
 	test("project param files into the named project's route and still links back", async () => {
 		setEnv({
 			OTTR_BOARD_URL: "http://127.0.0.1:4747",
@@ -652,6 +695,17 @@ describe("propose_task tool", () => {
 		});
 		expect(text(blank)).toBe(
 			"Error: project must be a non-empty string when given.",
+		);
+	});
+
+	test("refuses a model that is an agent type, not a model id, and spends no proposal", async () => {
+		process.env.OTTR_RETRO = "1";
+		const out = await fakePi().propose_task!.execute("t1", {
+			prompt: "p",
+			model: "sonic",
+		});
+		expect(text(out)).toBe(
+			"Error: sonic is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5.",
 		);
 	});
 

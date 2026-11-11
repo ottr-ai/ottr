@@ -2,7 +2,9 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { modelFallbacks, modelRoles } from "./models.ts";
+import { splitLevel } from "./levels.ts";
+import { cardModelError, modelFallbacks, modelRoles } from "./models.ts";
+import fc from "./test/properties.ts";
 
 const dir = join(tmpdir(), `ottr-modelroles-${process.pid}`);
 mkdirSync(dir, { recursive: true });
@@ -110,6 +112,67 @@ cycleOrder:
 		expect(modelFallbacks(join(dir, "missing.yml"))).toEqual({});
 		expect(modelFallbacks(config("modelRoles: {default: a/b}\n"))).toEqual({});
 		expect(modelFallbacks(config("retry:\n  fallbackChains:\n"))).toEqual({});
+	});
+});
+
+describe("cardModelError", () => {
+	const catalog = new Set(["zai/glm-5.3-flash", "anthropic/claude-opus-5-5"]);
+
+	test("a selector with no provider is refused with the fix, whatever the catalog", () => {
+		for (const c of [catalog, new Set<string>()]) {
+			expect(cardModelError("sonic", c)).toBe(
+				"sonic is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5",
+			);
+			// A role name is refused too: the board stores selectors, never role names.
+			expect(cardModelError("@plan", c)).toContain("is not a model");
+			expect(cardModelError("plan", c)).toContain("is not a model");
+		}
+	});
+
+	test("a catalog selector passes, with or without a known thinking level", () => {
+		expect(cardModelError("zai/glm-5.3-flash", catalog)).toBeNull();
+		expect(cardModelError("zai/glm-5.3-flash:high", catalog)).toBeNull();
+		expect(
+			cardModelError("anthropic/claude-opus-5-5:medium", catalog),
+		).toBeNull();
+	});
+
+	test("a shaped selector outside the catalog names it and the picker", () => {
+		expect(cardModelError("zai/no-such-model", catalog)).toBe(
+			"model zai/no-such-model: unknown model zai/no-such-model. Omit model to use the board default, or pick provider/model from the New task model list",
+		);
+		expect(cardModelError("zai/glm-5.3-flash:turbo", catalog)).toContain(
+			"unknown thinking level (use one of off, minimal",
+		);
+	});
+
+	test("an empty catalog checks the shape only: a broken omp never blocks filing", () => {
+		expect(cardModelError("zai/anything", new Set())).toBeNull();
+		expect(cardModelError("provider/model:high", new Set())).toBeNull();
+	});
+
+	test("property: accepted means shaped and catalog-backed; a known level keeps acceptance", () => {
+		const prop = fc.property(
+			fc.array(
+				fc.constantFrom("zai/glm-5.3-flash", "anthropic/claude-opus-5-5"),
+				{ maxLength: 4 },
+			),
+			fc.string({ maxLength: 60 }),
+			(list, s) => {
+				const c: ReadonlySet<string> = new Set(list);
+				const why = cardModelError(s, c);
+				expect(why === null || typeof why === "string").toBe(true);
+				if (why !== null) return;
+				const slash = s.indexOf("/");
+				expect(slash).toBeGreaterThan(0);
+				if (c.size === 0) return;
+				const [base, level] = splitLevel(s);
+				expect(c.has(s) || (level !== "" && c.has(base))).toBe(true);
+				// A known level never breaks an accepted base.
+				expect(cardModelError(`${base}:high`, c)).toBeNull();
+			},
+		);
+		fc.assert(prop, { seed: 42, numRuns: 200 });
 	});
 });
 

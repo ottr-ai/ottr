@@ -971,6 +971,8 @@ export interface TurnOps {
 		credentialError?: string | null;
 		/** The credential error was a busy board store: a reply retries, no new sign-in. */
 		busy?: boolean;
+		/** The model named no provider: the fix is switching the model on the card. */
+		badModel?: string;
 		/** Values the run redacts from its log (the lent provider token). */
 		secrets?: string[];
 	}>;
@@ -997,13 +999,17 @@ export interface TurnOps {
 }
 
 /**
- * The card's reason for a credential-stopped turn: a busy store names the retry (the sign-in is
- * not the cause), any other credential fault says to sign in again.
+ * The card's reason for a credential-stopped turn: a model that names no provider is not a
+ * sign-in fault, so the reason names the model and the card's switch; a busy store names the
+ * retry; any other credential fault says to sign in again.
  */
 function signInNeedsReason(
 	credentialError: string | null | undefined,
 	busy: boolean,
+	badModel?: string,
 ): string {
+	if (badModel !== undefined && badModel !== "")
+		return `Model: ${badModel} names no provider (expected provider/model). The turn did not start. Switch the model on the card (provider/model), then reply to retry.`;
 	const cause = credentialError || "the board cannot lend a credential";
 	return busy
 		? `Sign-in: ${cause}. The turn did not start. Reply to retry; do not sign in again.`
@@ -4550,7 +4556,11 @@ export function createTurnLoop(
 			parkBeforeRun(
 				store,
 				id,
-				signInNeedsReason(turnEnv.credentialError, turnEnv.busy === true),
+				signInNeedsReason(
+					turnEnv.credentialError,
+					turnEnv.busy === true,
+					turnEnv.badModel,
+				),
 				log,
 			);
 			return null;

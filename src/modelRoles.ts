@@ -659,8 +659,10 @@ function sameChains(
 	);
 }
 
-/** The message for a value that is not `<catalog selector>[:<level>]`, or null when it is. */
-function selectorError(
+/** The message for a value that is not `<catalog selector>[:<level>]`, or null when it is.
+ *  Exported for cardModelError (src/models.ts), which applies the same catalog rule to a
+ *  filed card's model. */
+export function selectorError(
 	v: unknown,
 	catalog: ReadonlySet<string>,
 ): string | null {

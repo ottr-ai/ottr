@@ -557,6 +557,108 @@ function mount(
 	return { g, app: created, server: srv, call };
 }
 
+describe("card model validation at the filing routes", () => {
+	const model = (selector: string) => ({
+		id: selector,
+		selector,
+		name: selector,
+		contextWindow: null,
+	});
+	let reads = 0;
+	const m = mount({
+		projects,
+		models: async () => {
+			reads += 1;
+			return [model("zai/glm-5.3-flash"), model("anthropic/claude-opus-5-5")];
+		},
+	});
+	afterEach(() => {
+		reads = 0;
+	});
+
+	test("a model that names no provider is refused and files nothing", async () => {
+		const before = store.listTasks().length;
+		const res = await m.call("/api/projects/p1/tasks", {
+			prompt: "bad model card",
+			model: "sonic",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe(
+			"sonic is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5",
+		);
+		expect(store.listTasks().length).toBe(before);
+	});
+
+	test("a catalog model with a thinking level files the card", async () => {
+		const res = await m.call("/api/projects/p1/tasks", {
+			prompt: "levelled card",
+			model: "zai/glm-5.3-flash:high",
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as { id: string };
+		expect(store.getTask(b.id)!.model).toBe("zai/glm-5.3-flash:high");
+		expect(reads).toBe(1);
+	});
+
+	test("a shaped model outside the catalog is refused naming the picker", async () => {
+		const res = await m.call("/api/projects/p1/tasks", {
+			prompt: "unknown card",
+			model: "zai/no-such-model",
+		});
+		expect(res.status).toBe(400);
+		const why = await errorOf(res);
+		expect(why).toContain("unknown model zai/no-such-model");
+		expect(why).toContain("New task model list");
+	});
+
+	test("an omitted model files with the board default and reads no catalog", async () => {
+		const before = store.listTasks().length;
+		const res = await m.call("/api/projects/p1/tasks", {
+			prompt: "default card",
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as { id: string };
+		expect(store.getTask(b.id)!.model).toBeNull();
+		expect(store.listTasks().length).toBe(before + 1);
+		expect(reads).toBe(0);
+	});
+
+	test("the follow-up route refuses a provider-less model and files nothing", async () => {
+		const parent = store.createTask("done parent for model check");
+		store.updateTask(parent.id, { stage: "done", state: "idle" });
+		const before = store.listTasks().length;
+		const bad = await m.call(`/api/projects/p1/tasks/${parent.id}/follow-up`, {
+			text: "carry on",
+			model: "scout",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toContain("scout is not a model");
+		expect(store.listTasks().length).toBe(before);
+		const ok = await m.call(`/api/projects/p1/tasks/${parent.id}/follow-up`, {
+			text: "carry on",
+			model: "anthropic/claude-opus-5-5",
+		});
+		expect(ok.status).toBe(200);
+		const b = (await ok.json()) as { id: string };
+		expect(store.getTask(b.id)!.model).toBe("anthropic/claude-opus-5-5");
+	});
+
+	test("an empty catalog files a shaped model and refuses a provider-less one", async () => {
+		const empty = mount({ projects, models: async () => [] });
+		const ok = await empty.call("/api/projects/p1/tasks", {
+			prompt: "omp is down",
+			model: "zai/anything",
+		});
+		expect(ok.status).toBe(200);
+		const bad = await empty.call("/api/projects/p1/tasks", {
+			prompt: "still shaped",
+			model: "sonic",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toContain("sonic is not a model");
+	});
+});
+
 describe("task routes", () => {
 	test("create returns a queued task with a PREFIX-n id and kicks the scheduler", async () => {
 		const before = calls;

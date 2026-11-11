@@ -459,6 +459,7 @@ describe("lentProviderEnv", () => {
 			env: {},
 			error:
 				"the model claude-opus-5-5 names no provider (expected provider/model)",
+			badModel: "claude-opus-5-5",
 		});
 	});
 

@@ -184,6 +184,9 @@ interface Lent {
 	error: string | null;
 	/** The error was a busy store: a reply retries, a new sign-in does not help. */
 	busy?: boolean;
+	/** The model named no provider: switching the model on the card is the fix,
+	 *  not a sign-in. Set only with the names-no-provider error. */
+	badModel?: string;
 }
 
 /** The lent env for the model's provider; a null model (a local run) lends nothing. */
@@ -205,6 +208,7 @@ export async function lentProviderEnv(
 		return {
 			env: {},
 			error: `the model ${model} names no provider (expected provider/model)`,
+			badModel: model,
 		};
 	const provider = model.slice(0, slash);
 	const name = Object.hasOwn(LENT_ENV, provider)
@@ -273,6 +277,8 @@ export async function turnEnv(
 	credentialError: string | null;
 	/** The error was a busy board store: a reply retries, no new sign-in. */
 	busy?: boolean;
+	/** The model named no provider: the fix is switching the model on the card. */
+	badModel?: string;
 	secrets: string[];
 }> {
 	const base = turnEnvValues(project, envValues, opts.home);
@@ -285,6 +291,7 @@ export async function turnEnv(
 		missing: base.missing,
 		credentialError: lent.error,
 		busy: lent.busy,
+		badModel: lent.badModel,
 		secrets: Object.values(lent.env),
 	};
 }

@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveAgentLayer } from "./layers.ts";
 import { agentDir, boardOmpEnv, boardOmpHome } from "./login.ts";
+import { selectorError } from "./modelRoles.ts";
 
 export interface ModelOption {
 	id: string;
@@ -146,4 +147,24 @@ export function modelFallbacks(
 	} catch {
 		return {}; // no config: no chains
 	}
+}
+
+/** The reason `selector` cannot be a filed card's model, or null when it can. The shape rule is
+ *  the turn-start rule (src/tokens.ts: a selector with no provider part would park the card's
+ *  first turn), the catalog rule is the model-roles editor's selector rule against the board's
+ *  `omp models --json` selectors. A role name ("plan", "@plan") is refused: the board never
+ *  resolves role names in a card's model, it stores the selector. An empty catalog (omp missing
+ *  or junk output, the Default-only picker state) checks the shape only, so a broken omp never
+ *  blocks card filing. Pure. */
+export function cardModelError(
+	selector: string,
+	catalog: ReadonlySet<string>,
+): string | null {
+	if (selector.indexOf("/") <= 0)
+		return `${selector} is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5`;
+	if (catalog.size === 0) return null;
+	const why = selectorError(selector, catalog);
+	return why === null
+		? null
+		: `model ${selector}: ${why}. Omit model to use the board default, or pick provider/model from the New task model list`;
 }

@@ -147,11 +147,17 @@ function promptValidationError(params: CreateTaskParams): string | null {
 	return null;
 }
 
-// The model name: non-empty when given.
+// The model name: non-empty when given, and a model id (provider/model). The
+// board's catalog is unknowable here (the extension loads standalone), so the
+// tool checks the turn-start shape rule (src/tokens.ts); the board route checks
+// the catalog and refuses the card with the same fix.
 function modelValidationError(params: CreateTaskParams): string | null {
 	const model = trimmed(params.model);
 	if (params.model !== undefined && model === "") {
 		return "Error: model must be a non-empty string when given.";
+	}
+	if (model !== "" && model.indexOf("/") <= 0) {
+		return `Error: ${model} is not a model; omit model to use the board default, or pass provider/model such as anthropic/claude-opus-5-5.`;
 	}
 	return null;
 }
@@ -688,7 +694,9 @@ export default function (pi: Pi) {
 			model: z
 				.string()
 				.optional()
-				.describe("Model override for the new card (provider/model)"),
+				.describe(
+					"Model id (provider/model) for the new card — never an omp agent type such as sonic, scout or task; omit to use the board default",
+				),
 			project: z
 				.string()
 				.optional()
@@ -719,6 +727,8 @@ export default function (pi: Pi) {
 					"Error: project must be a non-empty string when given.",
 				);
 			}
+			const modelError = modelValidationError(params);
+			if (modelError !== null) return textResult(modelError);
 			const filed = await fileCard({
 				base,
 				project: target === "" ? project : target,
@@ -766,7 +776,9 @@ export default function (pi: Pi) {
 							model: z
 								.string()
 								.optional()
-								.describe("Model override for the task (provider/model)"),
+								.describe(
+									"Model id (provider/model) for the task — never an omp agent type such as sonic, scout or task; omit to use the board default",
+								),
 							project: z
 								.string()
 								.optional()
@@ -808,7 +820,7 @@ export default function (pi: Pi) {
 								.string()
 								.optional()
 								.describe(
-									"Model override for the finding's card (provider/model)",
+									"Model id (provider/model) for the finding's card — never an omp agent type such as sonic, scout or task; omit to use the board default",
 								),
 							rank: z
 								.number()

@@ -7312,6 +7312,18 @@ describe("prepareTurn", () => {
 		);
 	});
 
+	test("a stored model that names no provider parks naming the model and the switch", async () => {
+		const { store, record, loop } = lendingSetup(boardStore({}));
+		const task = store.createTask("work please", "sonic");
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(0);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Model: sonic names no provider (expected provider/model). The turn did not start. Switch the model on the card (provider/model), then reply to retry.",
+		);
+	});
+
 	test("an empty credential error still stops the worker turn", async () => {
 		const { store, record, loop } = setup({
 			maxTotalRuns: () => 0,
