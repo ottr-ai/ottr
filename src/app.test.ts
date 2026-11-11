@@ -5986,6 +5986,63 @@ describe("revision guard", () => {
 		}
 	});
 
+	test("a stale /edit/start claim refuses without arming or writing", async () => {
+		const t = store.createTask("draft");
+		// Another tab's content edit lands between this editor's load and its claim.
+		store.updateTask(t.id, { prompt: "tab one", title: "tab one" });
+		const stale = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, {
+			revision: 1,
+		});
+		expect(stale.status).toBe(409);
+		const b = (await stale.json()) as { task: { prompt: string } };
+		expect(b.task.prompt).toBe("tab one");
+		const row = store.getTask(t.id)!;
+		expect(row.holdUntil).toBeNull();
+		expect(row.revision).toBe(2);
+	});
+
+	test("a current /edit/start claim succeeds without moving the revision", async () => {
+		const t = store.createTask("draft");
+		const rev = store.getTask(t.id)!.revision;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, {
+			revision: rev,
+		});
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as { ok: boolean; revision: number };
+		expect(b.ok).toBe(true);
+		expect(b.revision).toBe(rev);
+		const row = store.getTask(t.id)!;
+		expect(row.holdUntil).not.toBeNull();
+		expect(row.revision).toBe(rev);
+	});
+
+	test("an invalid claim revision answers 400", async () => {
+		const t = store.createTask("draft");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, {
+			revision: "1",
+		});
+		expect(res.status).toBe(400);
+		expect(await errorOf(res)).toBe("revision must be a positive integer");
+	});
+
+	test("a claim without a revision still claims", async () => {
+		const t = store.createTask("draft");
+		const res = await post(`/api/projects/p1/tasks/${t.id}/edit/start`, {});
+		expect(res.status).toBe(200);
+		expect(store.getTask(t.id)!.holdUntil).not.toBeNull();
+	});
+
+	test("edit/stop clears the hold without moving the revision", async () => {
+		const t = store.createTask("draft");
+		const rev = store.getTask(t.id)!.revision;
+		await post(`/api/projects/p1/tasks/${t.id}/edit/start`, { revision: rev });
+		const stop = await post(`/api/projects/p1/tasks/${t.id}/edit/stop`, {});
+		expect(stop.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.holdUntil).toBeNull();
+		expect(row.revision).toBe(rev);
+	});
+
 	test("a slow cancel body cannot act on a stale queued snapshot", async () => {
 		// The body read finishes before the task is resolved: a body that pauses
 		// mid-read must not let the turn loop's queued→running flip hide behind the

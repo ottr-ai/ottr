@@ -3228,18 +3228,51 @@ export class ProjectStore {
 		return this.runTaskUpdate(id, patch, expectedRevision);
 	}
 
+	/** The prompt-edit hold: contentless bookkeeping, so it never moves the revision —
+	 * the editor's guarded save must not 409 against its own hold claim. With
+	 * expectedRevision the claim lands only while that revision is current, so a
+	 * content edit that landed between the editor's load and the claim refuses the
+	 * claim (and the stale draft never arms); null claims unconditionally for
+	 * body-less compatibility callers. */
+	claimPromptHold(
+		id: string,
+		holdUntil: number,
+		expectedRevision: number | null,
+	): RevisionResult {
+		return this.runTaskUpdate(
+			id,
+			{ holdUntil, holdProvider: null, holdWindow: null },
+			expectedRevision ?? undefined,
+			false,
+		);
+	}
+
+	/** Clears the prompt-edit hold; contentless like the claim, so no revision bump. */
+	releasePromptHold(id: string): void {
+		this.runTaskUpdate(
+			id,
+			{ holdUntil: null, holdProvider: null, holdWindow: null },
+			undefined,
+			false,
+		);
+	}
+
 	/** The one task UPDATE builder: unconditional for internal writers, and with an
 	 * expectedRevision a single atomic `WHERE id = ? AND revision = ?` statement — the
 	 * compare and the write never split, so a concurrent writer's bump (revision + 1 in
-	 * the same UPDATE) makes this one's changes count 0 and nothing is written. */
+	 * the same UPDATE) makes this one's changes count 0 and nothing is written.
+	 * `bumpRevision: false` is for the prompt-edit hold claim/release only: contentless
+	 * bookkeeping must not move the revision the editor's guarded save arms from. */
 	private runTaskUpdate(
 		id: string,
 		patch: TaskPatch,
 		expectedRevision?: number,
+		bumpRevision = true,
 	): RevisionResult {
 		const before = this.getTask(id);
 		if (before === null) throw new Error(`unknown task: ${id}`);
-		const sets: string[] = ["updated_at = ?", "revision = revision + 1"];
+		const sets: string[] = ["updated_at = ?"];
+		if (bumpRevision) sets.push("revision = revision + 1");
 		const values: (string | number | null)[] = [Date.now()];
 		// Entering Done stamps done_at; it overwrites, so a release card that bounced to needs_you re-lands with a fresh time.
 		if (patch.stage === "done") {

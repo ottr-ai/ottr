@@ -290,6 +290,48 @@ describe("revision (optimistic locking)", () => {
 		store.close();
 	});
 
+	test("the prompt-edit hold claim is guarded and contentless", () => {
+		const store = open(join(root, "hold-claim-current"));
+		const task = store.createTask("original prompt");
+		const rev = store.getTask(task.id)!.revision;
+		const result = store.claimPromptHold(task.id, 12345, rev);
+		expect(result.ok).toBe(true);
+		expect(result.task.holdUntil).toBe(12345);
+		// The hold is bookkeeping, not content: the revision the editor armed its
+		// save from stays current, so the save never 409s against its own claim.
+		expect(result.task.revision).toBe(rev);
+		expect(store.getTask(task.id)!.revision).toBe(rev);
+		store.close();
+	});
+
+	test("a stale prompt-edit hold claim conflicts without writing", () => {
+		const store = open(join(root, "hold-claim-stale"));
+		const task = store.createTask("original prompt");
+		// Another tab's content edit lands between this editor's load and its claim.
+		store.updateTask(task.id, { prompt: "first edit" });
+		const result = store.claimPromptHold(task.id, 12345, 1);
+		expect(result.ok).toBe(false);
+		expect(result.task.prompt).toBe("first edit");
+		// The stale draft must not arm, and the hold must not land.
+		expect(result.task.holdUntil).toBeNull();
+		expect(store.getTask(task.id)!.holdUntil).toBeNull();
+		store.close();
+	});
+
+	test("releasing the prompt-edit hold is contentless too", () => {
+		const store = open(join(root, "hold-release"));
+		const task = store.createTask("original prompt");
+		const rev = store.getTask(task.id)!.revision;
+		store.claimPromptHold(task.id, 12345, rev);
+		store.releasePromptHold(task.id);
+		const after = store.getTask(task.id) as Task;
+		expect(after.holdUntil).toBeNull();
+		expect(after.holdProvider).toBeNull();
+		expect(after.holdWindow).toBeNull();
+		expect(after.revision).toBe(rev);
+		store.close();
+	});
+
 	test("a write with a stale revision changes nothing and reports the conflict with the current row", () => {
 		const store = open(join(root, "revision-stale"));
 		const task = store.createTask("original prompt");

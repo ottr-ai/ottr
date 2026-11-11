@@ -418,7 +418,7 @@ Public hostnames need a login (first visit creates the admin user) or the API ke
 
 ### Card edit conflicts
 
-Two browser tabs can edit one card at the same time. The card edit routes accept an optional `revision` field: the task text edit, the steer edit, the steer cancel, the model choice, and the release notes edit. Send the `revision` value that the card carried when you loaded it. The write lands only when the card still carries that revision. A stale write answers `409`, and the body holds the card's current state, so your client can re-read and retry. A request without `revision` behaves as before. The board sends `revision` on every edit; on a `409` it keeps your text and shows the card's current version beside it.
+Two browser tabs can edit one card at the same time. The card edit routes accept an optional `revision` field: the task text edit, the steer edit, the steer cancel, the model choice, the release notes edit, and the editor's hold claim (`/edit/start`). Send the `revision` value that the card carried when you loaded it. The write lands only when the card still carries that revision. A stale write answers `409`, and the body holds the card's current state, so your client can re-read and retry. A request without `revision` behaves as before. The hold claim and its release never move the revision: they are bookkeeping, not content. The board sends `revision` on every edit; on a `409` it keeps your text and shows the card's current version beside it.
 
 ## Development
 

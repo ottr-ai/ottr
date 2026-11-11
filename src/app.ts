@@ -7059,18 +7059,17 @@ export function createApp(deps: AppDeps) {
 		const { e, task } = found;
 		// Idempotent, and guard-free on purpose: the drawer posts it on every editor
 		// close (a save already cleared the hold), and clearing can only let a card
-		// start sooner — it never stalls one.
-		e.store.updateTask(task.id, {
-			holdUntil: null,
-			holdProvider: null,
-			holdWindow: null,
-		});
+		// start sooner — it never stalls one. Contentless: it never moves the revision.
+		e.store.releasePromptHold(task.id);
 		return json({ ok: true });
 	}
 
 	async function handlePOSTProjectsTasksEditStartByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/edit/start">,
 	): Promise<Response> {
+		// Body before the task, like every guarded user-edit route: a slow body must
+		// not hide the card's state behind an older snapshot.
+		const body = await readOptionalJson(req);
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
@@ -7095,17 +7094,31 @@ export function createApp(deps: AppDeps) {
 				},
 				409,
 			);
-		const held = e.store.updateTask(task.id, {
-			holdUntil: PROMPT_EDIT_HELD,
-			// Not a usage hold: the owner clears so the quota refresh never releases
-			// a card whose editor is open (OTTR-688).
-			holdProvider: null,
-			holdWindow: null,
-		});
-		// The hold claim bumps the revision like any write, so the editor arms its
-		// guarded save from this row: a save in the tab that opened the editor must
-		// not 409 against the board's own hold claim.
-		return json({ ok: true, revision: held.revision });
+		// The hold is contentless bookkeeping (it never moves the revision), and with a
+		// revision the claim itself is guarded: a content edit that landed between the
+		// editor's load and this claim refuses the claim, so the editor never arms a
+		// stale draft with a fresh revision. Body-less callers keep the unconditional
+		// claim, like every guarded route's no-revision path.
+		const rev = body.revision;
+		if (
+			rev !== undefined &&
+			(typeof rev !== "number" || !Number.isInteger(rev) || rev < 1)
+		)
+			return json({ error: "revision must be a positive integer" }, 400);
+		const res = e.store.claimPromptHold(
+			task.id,
+			PROMPT_EDIT_HELD,
+			typeof rev === "number" ? rev : null,
+		);
+		if (!res.ok)
+			return json(
+				{
+					error: "card changed since it was loaded",
+					task: taskView(e, res.task),
+				},
+				409,
+			);
+		return json({ ok: true, revision: res.task.revision });
 	}
 
 	async function handleGETProjectsTasksImagesByProjectAndIdAndName(

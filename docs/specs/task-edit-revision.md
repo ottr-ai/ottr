@@ -18,6 +18,14 @@ millisecond `Date.now()`, so two writes in the same millisecond produce the
 same value, and a stale-edit check could pass across an intervening write.
 The store therefore adds a per-row counter.
 
+One exception keeps the editor honest: the prompt-edit hold claim
+(`/edit/start`) and its release (`/edit/stop`) are contentless bookkeeping and
+never move the revision. The claim itself accepts an optional guarded
+`revision` (same rules as the five edit routes), so a content edit that lands
+between the editor's load and the claim refuses the claim — a stale draft
+never arms with a fresh revision. The editor keeps Save disabled until its
+claim lands, and a failed claim disarms the save.
+
 - `TASKS_DDL` gains `revision INTEGER NOT NULL DEFAULT 1` (last column, after
   `update_merge_approved`).
 - `ProjectStore.open` gains the matching additive migration next to the other
@@ -41,8 +49,9 @@ export type RevisionResult =
 	| { ok: true; task: Task }
 	| { ok: false; task: Task };
 
-// Signature and behavior unchanged for every internal writer; the write now
-// also bumps revision (`revision = revision + 1` in the same UPDATE).
+// Signature unchanged for every internal writer; the write bumps revision
+// (`revision = revision + 1` in the same UPDATE) — except the prompt-edit hold
+// claim and release below, which are contentless and never move it.
 updateTask(id: string, patch: TaskPatch): Task;
 
 // Rewrites the prompt like today (title re-derives, prompt-edit hold clears in
@@ -52,6 +61,11 @@ editTask(id: string, prompt: string, expectedRevision?: number): RevisionResult;
 
 // Optimistic write for user edits from routes.
 updateTaskIfCurrent(id: string, patch: TaskPatch, expectedRevision: number): RevisionResult;
+
+// The prompt-edit hold: guarded (when expectedRevision is given) and contentless
+// (never moves the revision); release clears it unconditionally, also contentless.
+claimPromptHold(id: string, holdUntil: number, expectedRevision: number | null): RevisionResult;
+releasePromptHold(id: string): void;
 ```
 
 Rules:
@@ -111,8 +125,8 @@ and hold clears — stays in the store) and passes the revision through it.
 | `handlePOSTProjectsTasksUnmarkByProjectAndId` (6841) | research flag off | No — boolean toggle |
 | `handlePOSTProjectsTasksRestartByProjectAndId` (6922) | session reset | No — session management |
 | `handlePOSTProjectsTasksStarByProjectAndId` (6948) | star | No — boolean toggle |
-| `handlePOSTProjectsTasksEditStopByProjectAndId` (6971) | editor closed, hold clears | No — editor lifecycle |
-| `handlePOSTProjectsTasksEditStartByProjectAndId` (7006) | editor opened, hold set | No — editor lifecycle |
+| `handlePOSTProjectsTasksEditStopByProjectAndId` (6971) | editor closed, hold clears | No — contentless release |
+| `handlePOSTProjectsTasksEditStartByProjectAndId` (7006) | editor opened, hold claimed | **Yes** (optional guard, like the five) |
 | `handlePOSTProjectsTasksReleaseByProjectAndId` (7964) `/tasks/:id/release-notes` | release notes | **Yes** |
 | `backlogToTodo` (8301) | stage move + server-derived prompt fold | No — stage precondition already rejects the second writer |
 | `backlogToPark` (8327) | park to backlog | No — state transition |
@@ -132,13 +146,21 @@ and hold clears — stays in the store) and passes the revision through it.
 
 Guarded routes: prompt edit (`/edit`), steer edit (`/steer/edit`), steer
 cancel (`/steer/cancel`), model choice (`/model`), release notes
-(`/release-notes`). These are the routes where a person writes card content.
+(`/release-notes`), and the editor's hold claim (`/edit/start`, optional
+guard). These are the routes where a person writes card content — or, for the
+hold claim, where the write must not slip past a content edit that landed
+first.
 
 ## Board UI (`src/ui`)
 
 - Every guarded edit request sends `revision: task.revision` — the value the
   card had when the editor loaded it (list rows carry it via
-  `TASK_LIST_COLUMNS`).
+  `TASK_LIST_COLUMNS`). The prompt editor arms from the row it opened on and
+  its hold claim carries that same revision; because the hold is contentless,
+  the armed revision stays the draft's snapshot until a real content edit
+  conflicts.
+- The prompt editor's Save stays disabled until its hold claim landed, and a
+  failed claim disarms the save: a stale draft never saves silently.
 - On a 409 answer the editor stays open with the user's text intact, a visible
   notice says the card changed while the user was editing, and the notice
   shows the board's current version of the edited content (from the 409 body's

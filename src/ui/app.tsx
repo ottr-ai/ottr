@@ -9084,6 +9084,7 @@ function PromptEditForm({
 	edit,
 	onEdit,
 	editValid,
+	saveArmed,
 	editSave,
 	onSave,
 	conflict,
@@ -9091,6 +9092,9 @@ function PromptEditForm({
 	edit: string;
 	onEdit: (value: string | null) => void;
 	editValid: boolean;
+	/** False until the editor's hold claim landed: the guarded save needs the armed
+	 *  revision, and an unconditional save could silently overwrite another tab. */
+	saveArmed: boolean;
 	editSave: BusyState;
 	onSave: () => void;
 	/** Non-null after a refused save: the board's row, shown beside the kept text. */
@@ -9128,7 +9132,8 @@ function PromptEditForm({
 					// One primary per surface: edit saves stay stock grey; the decision
 					// (or nothing) owns the loud slot.
 					className={editSave.failed ? "failed" : undefined}
-					disabled={!editValid || editSave.busy}
+					disabled={!editValid || !saveArmed || editSave.busy}
+					title={saveArmed ? undefined : "Claiming the edit hold…"}
 					aria-busy={editSave.busy || undefined}
 				>
 					{editSave.busy && <span className="spinner" aria-hidden="true" />}
@@ -9157,6 +9162,7 @@ function ProposalPanel({
 	onEdit,
 	onEditChange,
 	editValid,
+	editSaveArmed,
 	editSave,
 	onSaveEdit,
 	editConflict,
@@ -9172,6 +9178,7 @@ function ProposalPanel({
 	onEdit: () => void;
 	onEditChange: (value: string | null) => void;
 	editValid: boolean;
+	editSaveArmed: boolean;
 	editSave: BusyState;
 	onSaveEdit: () => void;
 	editConflict: TaskView | null;
@@ -9250,6 +9257,7 @@ function ProposalPanel({
 					edit={edit}
 					onEdit={onEditChange}
 					editValid={editValid}
+					saveArmed={editSaveArmed}
 					editSave={editSave}
 					onSave={onSaveEdit}
 					conflict={editConflict}
@@ -10005,6 +10013,7 @@ function DrawerPrompts(p: {
 	setEdit: (v: string | null) => void;
 	openEdit: () => void;
 	editValid: boolean;
+	editSaveArmed: boolean;
 	editSave: ReturnType<typeof useBusy>;
 	editSubmit: () => void;
 	editConflict: TaskView | null;
@@ -10026,6 +10035,7 @@ function DrawerPrompts(p: {
 		setEdit,
 		openEdit,
 		editValid,
+		editSaveArmed,
 		editSave,
 		editSubmit,
 		editConflict,
@@ -10059,6 +10069,7 @@ function DrawerPrompts(p: {
 					edit={edit}
 					onEdit={setEdit}
 					editValid={editValid}
+					saveArmed={editSaveArmed}
 					editSave={editSave}
 					onSave={editSubmit}
 					conflict={editConflict}
@@ -12778,6 +12789,17 @@ export function Drawer({
 	// and the user's text, stores the 409's current row as the conflict shown beside the
 	// kept text, and re-arms on the row the user just saw, so Save can re-apply it.
 	const [editRevision, setEditRevision] = useState<number | null>(null);
+	// The prompt editor's Save stays disabled until its hold claim landed: the claim is
+	// guarded by the draft's snapshot revision, so saving before it resolves could send
+	// no revision at all (the unconditional path) and silently overwrite another tab.
+	const [editHoldPending, setEditHoldPending] = useState(false);
+	// The claim/reclaim run in effects and page events with stale closures, so the
+	// armed revision is mirrored here for them to read at call time.
+	const editRevisionRef = useRef<number | null>(null);
+	const armEditRevision = (value: number | null): void => {
+		editRevisionRef.current = value;
+		setEditRevision(value);
+	};
 	const [editConflict, setEditConflict] = useState<TaskView | null>(null);
 	const [notesRevision, setNotesRevision] = useState<number | null>(null);
 	const [notesConflict, setNotesConflict] = useState<TaskView | null>(null);
@@ -12946,15 +12968,19 @@ export function Drawer({
 	// once the started turn makes the card uneditable.
 	const editOpen = edit !== null;
 	const editGuardTitle = "Save or cancel the prompt edit first";
-	/** Opens the prompt editor. The guarded save arms from the hold claim's response
-	 *  (the claim itself bumps the revision), not from the row the editor opened on. */
+	/** Opens the prompt editor on the loaded row's snapshot. The hold claim below is
+	 *  guarded by that same revision and the hold is contentless (it never moves the
+	 *  revision), so the armed revision stays the draft's snapshot until a real
+	 *  content edit conflicts. Save stays disabled until the claim landed. */
 	const openEdit = (): void => {
-		setEditRevision(null);
+		armEditRevision(task.revision);
+		setEditHoldPending(true);
 		setEditConflict(null);
 		setEdit(task.prompt);
 	};
+	const editSaveArmed = editRevision !== null && !editHoldPending;
 	const editSubmit = (): void => {
-		if (edit === null || !editValid) return;
+		if (edit === null || !editValid || !editSaveArmed) return;
 		editSave.start(() =>
 			act(async () => {
 				try {
@@ -12964,11 +12990,11 @@ export function Drawer({
 					);
 					setEdit(null);
 					setEditConflict(null);
-					setEditRevision(null);
+					armEditRevision(null);
 				} catch (e) {
 					if (e instanceof EditConflict) {
 						setEditConflict(e.task);
-						setEditRevision(e.task.revision);
+						armEditRevision(e.task.revision);
 					}
 					throw e;
 				}
@@ -12985,14 +13011,27 @@ export function Drawer({
 	useEffect(() => {
 		if (!editOpen) return;
 		const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`;
-		// The hold claim bumps the revision, so its response arms the guarded save;
-		// a claim that fails leaves the save unguarded, like before OTTR-795.
+		// The claim is guarded by the draft's snapshot revision, and the hold itself is
+		// contentless (it never moves the revision), so the armed revision stays the
+		// draft's snapshot until a real content edit conflicts. A claim 409 means such
+		// an edit landed since the load: the conflict state shows the board's prompt
+		// beside the kept draft, and only an explicit re-save applies it. Any other
+		// claim failure disarms the save — a stale draft never saves silently.
 		const claim = (): void => {
-			void post<{ ok: true; revision?: number }>(`${url}/start`, {})
-				.then((res) => {
-					if (typeof res.revision === "number") setEditRevision(res.revision);
-				})
-				.catch(() => {});
+			setEditHoldPending(true);
+			void postEdit(`${url}/start`, {
+				revision: editRevisionRef.current ?? undefined,
+			})
+				.then(() => setEditHoldPending(false))
+				.catch((err) => {
+					if (err instanceof EditConflict) {
+						setEditConflict(err.task);
+						armEditRevision(err.task.revision);
+					} else {
+						armEditRevision(null);
+					}
+					setEditHoldPending(false);
+				});
 		};
 		claim();
 		const release = (): void => {
@@ -13295,6 +13334,7 @@ export function Drawer({
 								onEdit={openEdit}
 								onEditChange={setEdit}
 								editValid={editValid}
+								editSaveArmed={editSaveArmed}
 								editSave={editSave}
 								onSaveEdit={editSubmit}
 								editConflict={editConflict}
@@ -13363,6 +13403,7 @@ export function Drawer({
 						setEdit={setEdit}
 						openEdit={openEdit}
 						editValid={editValid}
+						editSaveArmed={editSaveArmed}
 						editSave={editSave}
 						editSubmit={editSubmit}
 						editConflict={editConflict}

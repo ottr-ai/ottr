@@ -3548,32 +3548,128 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		}
 	};
 
-	test("the hold claim arms the guarded save, so the board's own bump never 409s", async () => {
+	// The prompt editor's Save button, scoped to its form: the drawer-actions row
+	// holds buttons whose text also matches.
+	const promptSaveButton = (box: ParentNode): HTMLButtonElement => {
+		const form = box.querySelector("#edit-text")?.closest("form");
+		if (form == null) throw new Error("no prompt edit form");
+		const node = [...form.querySelectorAll("button")].find(
+			(b) => b.type === "submit",
+		);
+		if (node === undefined) throw new Error("no prompt save button");
+		return node as HTMLButtonElement;
+	};
+	const submitPromptEdit = async (container: HTMLDivElement): Promise<void> => {
+		await act(async () => {
+			const form = container.querySelector("#edit-text")?.closest("form");
+			if (form == null) throw new Error("no prompt edit form");
+			form.dispatchEvent(
+				new window.Event("submit", {
+					bubbles: true,
+					cancelable: true,
+				}) as unknown as Event,
+			);
+		});
+	};
+
+	test("the hold claim is guarded by the draft's revision and the save carries it", async () => {
 		const realFetch = globalThis.fetch;
-		// The live smoke: the editor opened on revision 1, /edit/start bumped the
-		// row to 2, and the first save carried the stale 1. The guard must arm from
-		// the claim's response instead, so this mock refuses exactly that stale 1.
+		// The claim carries the draft's snapshot revision: the server refuses a claim
+		// whose revision is stale (another tab's content edit landed), and the save
+		// carries the same snapshot revision the claim confirmed.
+		const claims: Array<{ revision?: unknown }> = [];
 		const saves: Array<{ revision?: unknown }> = [];
 		globalThis.fetch = (async (
 			input: RequestInfo | URL,
 			init?: RequestInit,
 		) => {
 			const url = String(input);
-			if (url.endsWith("/edit/start"))
-				return new Response(JSON.stringify({ ok: true, revision: 2 }), {
-					status: 200,
-				});
+			if (url.endsWith("/edit/start") && init?.method === "POST") {
+				const body = JSON.parse(String(init.body)) as { revision?: unknown };
+				claims.push(body);
+				if (body.revision === 1)
+					return new Response(JSON.stringify({ ok: true, revision: 1 }), {
+						status: 200,
+					});
+				return new Response(
+					JSON.stringify({
+						error: "card changed since it was loaded",
+						task: { id: "t1", revision: 5, prompt: "other tab text" },
+					}),
+					{ status: 409 },
+				);
+			}
 			if (url.endsWith("/edit") && init?.method === "POST") {
 				const body = JSON.parse(String(init.body)) as { revision?: unknown };
 				saves.push(body);
-				if (body.revision === 1)
-					return new Response(
-						JSON.stringify({
-							error: "card changed since it was loaded",
-							task: { id: "t1", revision: 2 },
-						}),
-						{ status: 409 },
-					);
+				if (body.revision === 1) return new Response("{}", { status: 200 });
+				return new Response(
+					JSON.stringify({
+						error: "card changed since it was loaded",
+						task: { id: "t1", revision: 5 },
+					}),
+					{ status: 409 },
+				);
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			prompt: "queued idea",
+			revision: 1,
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} act={runAct} task={card} />);
+			});
+			await act(async () => {
+				onClickOf(button(container, "Edit task"))({});
+			});
+			expect(container.querySelector("#edit-text")).not.toBeNull();
+			await act(async () => {});
+			await submitPromptEdit(container);
+			expect(claims).toHaveLength(1);
+			expect(claims[0]?.revision).toBe(1);
+			expect(saves).toHaveLength(1);
+			expect(saves[0]?.revision).toBe(1);
+			expect(container.querySelector("#edit-text")).toBeNull();
+			expect(container.textContent).not.toContain(
+				"changed while you were editing",
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("Save waits for the hold claim before it enables", async () => {
+		const realFetch = globalThis.fetch;
+		const gate = Promise.withResolvers<void>();
+		const saves: Array<{ revision?: unknown }> = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/edit/start")) {
+				await gate.promise;
+				return new Response(JSON.stringify({ ok: true, revision: 1 }), {
+					status: 200,
+				});
+			}
+			if (url.endsWith("/edit") && init?.method === "POST") {
+				const body = JSON.parse(String(init.body)) as { revision?: unknown };
+				saves.push(body);
 				return new Response("{}", { status: 200 });
 			}
 			return new Response("{}", { status: 404 });
@@ -3588,6 +3684,64 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			stage: "todo",
 			state: "queued",
 			prompt: "queued idea",
+			revision: 1,
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} act={runAct} task={card} />);
+			});
+			await act(async () => {
+				onClickOf(button(container, "Edit task"))({});
+			});
+			expect(container.querySelector("#edit-text")).not.toBeNull();
+			// The claim is still in flight: Save cannot fire the unconditional path.
+			expect(promptSaveButton(container).disabled).toBe(true);
+			await submitPromptEdit(container);
+			expect(saves).toHaveLength(0);
+			// The claim landed: the armed revision enables Save.
+			gate.resolve();
+			await act(async () => {});
+			expect(promptSaveButton(container).disabled).toBe(false);
+			await submitPromptEdit(container);
+			expect(saves).toHaveLength(1);
+			expect(saves[0]?.revision).toBe(1);
+		} finally {
+			gate.resolve();
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a failed hold claim keeps Save disabled", async () => {
+		const realFetch = globalThis.fetch;
+		const saves: Array<unknown> = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/edit/start"))
+				return new Response("{}", { status: 500 });
+			if (url.endsWith("/edit") && init?.method === "POST") {
+				saves.push(JSON.parse(String(init.body)));
+				return new Response("{}", { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			prompt: "queued idea",
+			revision: 1,
 		});
 		try {
 			await act(async () => {
@@ -3598,24 +3752,76 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			});
 			expect(container.querySelector("#edit-text")).not.toBeNull();
 			await act(async () => {});
+			expect(promptSaveButton(container).disabled).toBe(true);
+			await submitPromptEdit(container);
+			expect(saves).toHaveLength(0);
+			expect(container.querySelector("#edit-text")).not.toBeNull();
+		} finally {
 			await act(async () => {
-				const form = container.querySelector("#edit-text")?.closest("form");
-				if (form == null) throw new Error("no prompt edit form");
-				form.dispatchEvent(
-					new window.Event("submit", {
-						bubbles: true,
-						cancelable: true,
-					}) as unknown as Event,
-				);
+				root.unmount();
 			});
-			// The save carried the claim's revision and landed: the editor closed
-			// and no conflict notice appeared.
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a refused hold claim shows the conflict and keeps the draft", async () => {
+		const realFetch = globalThis.fetch;
+		const saves: Array<{ prompt: string; revision?: unknown }> = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/edit/start"))
+				return new Response(
+					JSON.stringify({
+						error: "card changed since it was loaded",
+						task: { id: "t1", revision: 5, prompt: "other tab text" },
+					}),
+					{ status: 409 },
+				);
+			if (url.endsWith("/edit") && init?.method === "POST") {
+				const body = JSON.parse(String(init.body)) as {
+					prompt: string;
+					revision?: unknown;
+				};
+				saves.push(body);
+				return new Response("{}", { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			prompt: "queued idea",
+			revision: 1,
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} act={runAct} task={card} />);
+			});
+			await act(async () => {
+				onClickOf(button(container, "Edit task"))({});
+			});
+			await act(async () => {});
+			// The claim refused: the board's current prompt shows beside the kept
+			// draft, and the re-armed revision makes an explicit re-save possible.
+			expect(container.textContent).toContain("changed while you were editing");
+			expect(container.textContent).toContain("other tab text");
+			expect(container.querySelector("#edit-text")).not.toBeNull();
+			expect(promptSaveButton(container).disabled).toBe(false);
+			await submitPromptEdit(container);
 			expect(saves).toHaveLength(1);
-			expect(saves[0]?.revision).toBe(2);
+			expect(saves[0]?.prompt).toBe("queued idea");
+			expect(saves[0]?.revision).toBe(5);
 			expect(container.querySelector("#edit-text")).toBeNull();
-			expect(container.textContent).not.toContain(
-				"changed while you were editing",
-			);
 		} finally {
 			await act(async () => {
 				root.unmount();
