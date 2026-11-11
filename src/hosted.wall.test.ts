@@ -14,6 +14,7 @@ import {
 } from "./auth.ts";
 import { GlobalStore } from "./globalStore.ts";
 import type { Hosted } from "./hosted.ts";
+import { loadSecretBox } from "./secretBox.ts";
 import { ProjectStore } from "./store.ts";
 import { turnEnv } from "./tokens.ts";
 import { VmTokens } from "./vmTokens.ts";
@@ -113,6 +114,11 @@ function mount(
 	const releases: number[] = [];
 	const app = createApp({
 		gstore: g,
+		secretBox: (() => {
+			const dir = join(root, `boxes-${name}`);
+			mkdirSync(dir, { recursive: true });
+			return loadSecretBox({ dir, env: {} });
+		})(),
 		defaultDir: root,
 		projects,
 		cancel: async () => ({ removed: true }),
@@ -373,11 +379,16 @@ describe("hosted mode request wall", () => {
 			expect(await res.json()).toEqual({ error: "not found" });
 		}
 		// Neither the API key nor the session secret rotated, and no admin was created.
-		expect(board.g.get("config")).toMatchObject({
-			apiKey: "wall-key",
-			sessionSecret: "wall-secret",
+		// The row holds sealed values: under the mount's box (same key dir) they open
+		// to the seeded credentials.
+		const row = board.g.get<Record<string, unknown>>("config");
+		const wallBox = loadSecretBox({
+			dir: join(root, "boxes-hosted"),
+			env: {},
 		});
-		expect(board.g.get("config")).not.toHaveProperty("admin");
+		expect(wallBox.open(row?.apiKey as string)).toBe("wall-key");
+		expect(wallBox.open(row?.sessionSecret as string)).toBe("wall-secret");
+		expect(row).not.toHaveProperty("admin");
 	});
 
 	test("the boot token still files a card, whatever the Host, and nothing else", async () => {

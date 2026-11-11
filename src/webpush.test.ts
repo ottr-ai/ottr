@@ -11,6 +11,7 @@ import {
 	pruneSubs,
 	saveSubs,
 	sendAll,
+	staleSubs,
 } from "./webpush.ts";
 
 const pushRoots: string[] = [];
@@ -112,6 +113,51 @@ describe("saveSubs/loadSubs", () => {
 		]);
 		expect(loadSubs(store)[0]?.classes).toEqual(classes);
 		store.close();
+	});
+	test("vapidPublicKey round-trips; subs without one stay without", () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
+		const store = GlobalStore.open(root);
+		saveSubs(store, [
+			{
+				endpoint: "https://x/1",
+				keys: { p256dh: "p", auth: "a" },
+				addedAt: 1,
+				classes: { ...ALL_CLASSES_ON },
+				vapidPublicKey: "pub-1",
+			},
+			{
+				endpoint: "https://x/2",
+				keys: { p256dh: "p", auth: "a" },
+				addedAt: 2,
+				classes: { ...ALL_CLASSES_ON },
+			},
+		]);
+		const subs = loadSubs(store);
+		expect(subs[0]?.vapidPublicKey).toBe("pub-1");
+		expect(subs[1]?.vapidPublicKey).toBeUndefined();
+		store.close();
+	});
+	test("staleSubs selects only subs bound to a different key", () => {
+		const bound = (endpoint: string, key?: string): PushSub => ({
+			endpoint,
+			keys: { p256dh: "p", auth: "a" },
+			addedAt: 1,
+			classes: { ...ALL_CLASSES_ON },
+			...(key === undefined ? {} : { vapidPublicKey: key }),
+		});
+		const subs = [
+			bound("https://x/old", "old"),
+			bound("https://x/current", "current"),
+			bound("https://x/legacy"),
+		];
+		expect(staleSubs(subs, "current").map((s) => s.endpoint)).toEqual([
+			"https://x/old",
+		]);
+		expect(staleSubs(subs, "other").map((s) => s.endpoint)).toEqual([
+			"https://x/old",
+			"https://x/current",
+		]);
 	});
 });
 

@@ -17,6 +17,16 @@ export interface PushSub {
 	addedAt: number;
 	/** Alert classes this device receives; legacy subs without the field read as all on. */
 	classes: ClassPrefs;
+	/** Public VAPID key this subscription was created under; absent on legacy subs.
+	 * A sub bound to a different key than the current one can never receive (ADR-0011 recovery). */
+	vapidPublicKey?: string;
+}
+
+/** Subs whose bound VAPID key differs from the current one; legacy subs without a bound key stay. */
+export function staleSubs(subs: PushSub[], publicKey: string): PushSub[] {
+	return subs.filter(
+		(s) => s.vapidPublicKey !== undefined && s.vapidPublicKey !== publicKey,
+	);
 }
 
 /** One stored sub entry; null when the shape is unusable. */
@@ -27,12 +37,15 @@ function parseSub(s: unknown): PushSub | null {
 		return null;
 	if (!("p256dh" in s.keys) || typeof s.keys.p256dh !== "string") return null;
 	if (!("auth" in s.keys) || typeof s.keys.auth !== "string") return null;
-	return {
+	const out: PushSub = {
 		endpoint: s.endpoint,
 		keys: { p256dh: s.keys.p256dh, auth: s.keys.auth },
 		addedAt: "addedAt" in s && typeof s.addedAt === "number" ? s.addedAt : 0,
 		classes: parseClasses("classes" in s ? s.classes : undefined),
 	};
+	if ("vapidPublicKey" in s && typeof s.vapidPublicKey === "string")
+		out.vapidPublicKey = s.vapidPublicKey;
+	return out;
 }
 
 export function loadSubs(store: GlobalStore): PushSub[] {

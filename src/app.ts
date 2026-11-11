@@ -411,6 +411,7 @@ import {
 	pruneSubs,
 	saveSubs,
 	sendAll,
+	staleSubs,
 } from "./webpush.ts";
 import type { WorkerTarget } from "./workers.ts";
 import {
@@ -1960,6 +1961,17 @@ export function createApp(deps: AppDeps) {
 		if (vapid === null) {
 			const keys = generateVAPIDKeys();
 			vapid = { ...keys, subject: PUSH_SUBJECT };
+			// ADR-0011 recovery: a fresh pair means the old one is gone, so subs bound to a
+			// previous public key can never receive again and are dropped. Legacy subs
+			// without a bound key stay: the current pair still works for them. A
+			// same-endpoint re-subscribe restores the device's class switches.
+			const subs = loadSubs(deps.gstore);
+			const stale = staleSubs(subs, vapid.publicKey);
+			if (stale.length > 0)
+				saveSubs(
+					deps.gstore,
+					subs.filter((s) => !stale.includes(s)),
+				);
 			saveConfig();
 		}
 		// Keys loaded from config at boot skip the branch above, but web-push's module state
@@ -3417,8 +3429,19 @@ export function createApp(deps: AppDeps) {
 		// ADR-0011: runtime plaintext goes into the row as-is; sealForStore swaps a null
 		// runtime value back to the kept blob when this boot cannot open the stored one, so
 		// an unrelated save never deletes a credential it cannot read. The walker below is
-		// the only place that produces sealed strings; with no box the row stays plaintext
-		// (legacy degraded mode; the boot migration converges it at the next good boot).
+		// the only place that produces sealed strings; with no box every secret spot comes
+		// from the stored row instead (writes of plaintext are refused at the routes), so an
+		// allowed save can neither write plaintext over a sealed blob nor drop one.
+		const stored = deps.gstore.get<Record<string, unknown> | null>("config");
+		const storedSpot = (field: string, plain: string | null): string | null => {
+			if (deps.secretBox !== undefined) return sealForStore(field, plain);
+			if (clearedSecrets.has(field)) return null;
+			return (
+				(keptUnreadable.get(field) as string | undefined) ??
+				(stored?.[field] as string | undefined) ??
+				null
+			);
+		};
 		const row: Record<string, unknown> = {
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
@@ -3430,38 +3453,94 @@ export function createApp(deps: AppDeps) {
 			projects: deps.shared.projectPaths,
 			projectOrder: deps.shared.projectOrder,
 			admin,
-			apiKey: sealForStore("apiKey", apiKey),
-			sessionSecret: sealForStore("sessionSecret", sessionSecret),
+			apiKey: storedSpot("apiKey", apiKey),
+			sessionSecret: storedSpot("sessionSecret", sessionSecret),
 			sessions,
 			vapid:
-				vapid === null
-					? null
-					: {
-							...vapid,
-							privateKey: sealForStore("vapidKey", vapid.privateKey),
-						},
-			alate: { url: alate.url, key: sealForStore("alateKey", alate.key) },
-			githubToken: sealForStore("githubToken", githubToken),
-			githubHost: savedGithubHost,
-			gitTokens: gitTokens.map((t) =>
-				t.unreadable === true
-					? {
-							host: t.host,
-							username: t.username,
-							token: keptUnreadable.get(`git:${t.host}`) ?? t.token,
-						}
-					: { ...t, token: sealForStore(`git:${t.host}`, t.token) },
-			),
-			githubApp:
-				githubApp === null
-					? null
-					: githubApp.unreadable === true
-						? { id: githubApp.id, key: keptUnreadable.get("githubAppKey") }
+				deps.secretBox === undefined
+					? // No box: keep the stored blob when this boot cannot read it; a runtime
+						// pair here only exists on a legacy plaintext row, where it equals stored.
+						keptUnreadable.has("vapidKey")
+						? (stored?.vapid ?? null)
+						: vapid !== null
+							? { ...vapid, privateKey: vapid.privateKey }
+							: (stored?.vapid ?? null)
+					: vapid === null
+						? null
 						: {
-								id: githubApp.id,
-								key: sealForStore("githubAppKey", githubApp.key),
+								...vapid,
+								privateKey: sealForStore("vapidKey", vapid.privateKey),
 							},
+			alate:
+				deps.secretBox !== undefined
+					? { url: alate.url, key: sealForStore("alateKey", alate.key) }
+					: (() => {
+							const storedAlate = stored?.alate;
+							const storedKey =
+								typeof storedAlate === "object" &&
+								storedAlate !== null &&
+								"key" in storedAlate &&
+								typeof storedAlate.key === "string"
+									? storedAlate.key
+									: null;
+							return {
+								url: alate.url,
+								key: clearedSecrets.has("alateKey")
+									? null
+									: ((keptUnreadable.get("alateKey") as string | undefined) ??
+										storedKey),
+							};
+						})(),
+			githubToken: storedSpot("githubToken", githubToken),
+			githubHost: savedGithubHost,
+			gitTokens:
+				deps.secretBox !== undefined
+					? gitTokens.map((t) =>
+							t.unreadable === true
+								? {
+										host: t.host,
+										username: t.username,
+										token: keptUnreadable.get(`git:${t.host}`) ?? t.token,
+									}
+								: { ...t, token: sealForStore(`git:${t.host}`, t.token) },
+						)
+					: // Runtime token additions are impossible (guarded routes): the stored
+						// rows pass through verbatim, minus the hosts cleared this boot.
+						(() => {
+							const storedTokens = stored?.gitTokens;
+							if (!Array.isArray(storedTokens)) return [];
+							return storedTokens.filter((t) => {
+								if (typeof t !== "object" || t === null) return false;
+								if (!("host" in t) || typeof t.host !== "string") return false;
+								return !clearedSecrets.has(`git:${t.host}`);
+							});
+						})(),
+			githubApp:
+				deps.secretBox === undefined
+					? clearedSecrets.has("githubAppKey")
+						? null
+						: (stored?.githubApp ?? null)
+					: githubApp === null
+						? null
+						: githubApp.unreadable === true
+							? { id: githubApp.id, key: keptUnreadable.get("githubAppKey") }
+							: {
+									id: githubApp.id,
+									key: sealForStore("githubAppKey", githubApp.key),
+								},
 			envValues: (() => {
+				if (deps.secretBox === undefined) {
+					// Kept-unreadable env blobs go back first; with no box the stored values
+					// pass through verbatim, minus names cleared this boot.
+					const storedEnv = stored?.envValues;
+					const vals: Record<string, unknown> = {};
+					for (const [key, blob] of keptUnreadable)
+						if (key.startsWith("env:")) vals[key.slice(4)] = blob;
+					if (typeof storedEnv === "object" && storedEnv !== null)
+						for (const [name, value] of Object.entries(storedEnv))
+							if (!clearedSecrets.has(`env:${name}`)) vals[name] = value;
+					return vals;
+				}
 				// Kept-unreadable env blobs go back first: an unrelated save must not delete
 				// a value this boot cannot read. A re-entered value then overwrites its blob.
 				const vals: Record<string, unknown> = {};
@@ -3471,7 +3550,7 @@ export function createApp(deps: AppDeps) {
 					vals[name] = sealForStore(`env:${name}`, value);
 				return vals;
 			})(),
-			hindsightToken: sealForStore("hindsightToken", hindsightToken),
+			hindsightToken: storedSpot("hindsightToken", hindsightToken),
 			hindsightUrl,
 		};
 		const out =
@@ -3504,6 +3583,20 @@ export function createApp(deps: AppDeps) {
 			return plain;
 		}
 		return (keptUnreadable.get(field) as string | undefined) ?? null;
+	}
+	// ADR-0011: an explicit clear must win over a kept blob, or an unreadable-key boot
+	// would resurrect a credential the operator deleted.
+	const clearedSecrets = new Set<string>();
+	function clearSecret(field: string): void {
+		keptUnreadable.delete(field);
+		clearedSecrets.add(field);
+	}
+	// ADR-0011: with no box a credential write would land as plaintext, so it is refused
+	// with the same body as Jira's degraded-mode answer; clears and non-secret saves stay allowed.
+	function sealGuard(): Response | null {
+		return deps.secretBox === undefined
+			? json({ error: "OTTR_SECRET_KEY is invalid" }, 503)
+			: null;
 	}
 	// ADR-0011 boot migration: seal every plaintext spot of the stored row before the
 	// restore below reads it. Converge, never destructive; a no-box boot skips it.
@@ -6200,6 +6293,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function setup(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		// Re-checked with the body already read: readJson can hold the request open
@@ -6453,6 +6548,11 @@ export function createApp(deps: AppDeps) {
 		// A wrong key fails every turn's memory without a sign (dev-token did for two
 		// days), so the server must accept the key before the board keeps it.
 		const { token, provided } = hindsightTokenOf(r.body);
+		if (provided) {
+			// A url-only save writes no secret and stays allowed.
+			const noBox = sealGuard();
+			if (noBox !== null) return noBox;
+		}
 		if (provided && !/^[\x21-\x7E]{1,500}$/.test(token))
 			return json(
 				{
@@ -8104,15 +8204,28 @@ export function createApp(deps: AppDeps) {
 				keys: { p256dh: b.keys.p256dh, auth: b.keys.auth },
 				addedAt: Date.now(),
 				classes: { ...classes },
+				// ADR-0011: the sub only receives under the key it was created with.
+				vapidPublicKey: ensureVapid().publicKey,
 			},
 		]);
 		return json({ ok: true });
 	}
 
-	async function handleGETPushConfig(): Promise<Response> {
+	async function handleGETPushConfig(req: Request): Promise<Response> {
 		// Lazy: the first push path pays the VAPID keygen, boot stays silent.
 		const v = ensureVapid();
-		return json({ publicKey: v.publicKey });
+		// An endpoint whose stored sub carries a bound key differing from the current one
+		// is stale: Settings recovers it by re-subscribing (ADR-0011 recovery).
+		const endpoint = new URL(req.url).searchParams.get("endpoint");
+		const sub =
+			endpoint === null
+				? undefined
+				: loadSubs(deps.gstore).find((s) => s.endpoint === endpoint);
+		const stale =
+			sub !== undefined &&
+			sub.vapidPublicKey !== undefined &&
+			sub.vapidPublicKey !== v.publicKey;
+		return json({ publicKey: v.publicKey, stale });
 	}
 
 	async function handleDELETEProjectsSshByProject(
@@ -8148,6 +8261,7 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handleDELETEGitGithub(): Promise<Response> {
+		clearSecret("githubAppKey");
 		githubApp = null;
 		appTokens = null;
 		appCheck = null;
@@ -8157,6 +8271,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTGitGithub(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		const v = validateAppCredentials(r.body);
@@ -8211,6 +8327,8 @@ export function createApp(deps: AppDeps) {
 	async function handleDELETEGitTokensByHost(
 		req: BunRequest<"/api/git-hosts/tokens/:host">,
 	): Promise<Response> {
+		// Same normalized form the rows and the kept map use, so the kept blob drops too.
+		clearSecret(`git:${req.params.host}`);
 		gitTokens = gitTokens.filter((x) => x.host !== req.params.host);
 		saveConfig();
 		applyGitSecrets();
@@ -8218,6 +8336,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTGitGithub2(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		if (githubToken === null)
@@ -8236,6 +8356,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTGitTokens(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		const cand = parseGitToken(r.body);
@@ -8244,6 +8366,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTSettingsEnv(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		const name = r.body.name;
@@ -8290,6 +8414,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTSettingsGithub2(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		const token = githubTokenParam(r.body.token);
@@ -8339,6 +8465,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTSettingsSession(): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		if (sessionSecret === null)
 			return json({ error: "no admin configured" }, 400);
 		sessionSecret = newSecret();
@@ -8349,6 +8477,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTSettingsAlate(): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		if (alate.url === null)
 			return json({ error: "alate server url is not configured" }, 400);
 		if (alate.key === null)
@@ -8376,6 +8506,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTSettingsApi(): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		if (apiKey === null) return json({ error: "no admin configured" }, 400);
 		apiKey = newSecret();
 		saveConfig();
@@ -10529,6 +10661,12 @@ export function createApp(deps: AppDeps) {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		const body = r.body as Record<string, unknown>;
+		// A non-empty key would land as plaintext with no box; an explicit null clear
+		// stays allowed (ADR-0011).
+		if (typeof body.key === "string" && body.key !== "") {
+			const noBox = sealGuard();
+			if (noBox !== null) return noBox;
+		}
 		// Validate into a copy (R1-10): a bad later key must not leave the earlier
 		// key live — health, provision and the turns read the old config until the
 		// whole body validates.
@@ -10540,6 +10678,9 @@ export function createApp(deps: AppDeps) {
 			if (valid instanceof Response) return valid;
 			next[key] = valid;
 		}
+		// The body carried the key: an explicit null is an operator clear, and it must
+		// win over a kept-unreadable blob (ADR-0011).
+		if (next.key === null && body.key === null) clearSecret("alateKey");
 		alate = next;
 		saveConfig();
 		return json(alateView());
@@ -11195,7 +11336,7 @@ export function createApp(deps: AppDeps) {
 		},
 		// --- Web Push (begin) ---
 		"/api/push/config": {
-			GET: (req) => api(req, () => handleGETPushConfig()),
+			GET: (req) => api(req, () => handleGETPushConfig(req)),
 		},
 		"/api/push/subscribe": {
 			POST: (req) => api(req, () => handlePOSTPushSubscribe(req)),

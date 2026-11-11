@@ -1529,8 +1529,10 @@ A snapshot does not hold these items. After a restore, do this for each:
   file is lost, the board makes a new key at boot. The new key cannot open the sealed
   fields in the restored `tracker.db`. Operator-entered fields show "token unreadable,
   enter it again", and enter each value again. Board-generated values (API key, session
-  secret, Web Push keys) regenerate at boot: copy the new API key to your API clients, and
-  browsers re-subscribe for Web Push. With the old key file or the same `OTTR_SECRET_KEY`,
+  secret, Web Push keys) regenerate at boot: copy the new API key to your API clients.
+  Web Push recovery is automatic: the board drops subscriptions bound to the old key,
+  and a device whose Settings page loads again subscribes again with the new key. With
+  the old key file or the same `OTTR_SECRET_KEY`,
   everything opens as before.
 - The fork mirror caches (`forks/<id>.git`): the next fork run makes them again.
 - The task data on the `ottr-data` volume (sessions, logs, images, handoffs): it is a

@@ -1114,6 +1114,25 @@ export function NotificationsSection({
 	const [sent, flashSent] = useFlash(2000);
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
+	// Endpoints recovery already ran for: one pass per subscription, no loop.
+	const recoveredRef = useRef<Set<string>>(new Set());
+	// The enable flow's core, shared with stale-sub recovery (ADR-0011): ready →
+	// key → subscribe under the current public key → POST. No permission prompt here.
+	const subscribeNew = async (): Promise<string> => {
+		// ready waits for the worker to be ACTIVE: subscribing on an installing
+		// worker rejects with InvalidStateError on a first-run device.
+		const reg = await navigator.serviceWorker.ready;
+		const { publicKey } = await unwrap<{ publicKey: string }>(
+			await fetch("/api/push/config"),
+		);
+		// The spec takes the key as a string; the old hand-decode duplicated it.
+		const sub = await reg.pushManager.subscribe({
+			userVisibleOnly: true,
+			applicationServerKey: publicKey,
+		});
+		await post("/api/push/subscribe", sub.toJSON());
+		return sub.endpoint;
+	};
 	// Real state, not last-click: the flag reflects whether this device holds a subscription.
 	// The browser's subscription is registered again before the prefs load: a board that lost
 	// it (a new data folder, a restored backup) would answer "unknown endpoint" and hide the
@@ -1122,11 +1141,38 @@ export function NotificationsSection({
 		if (!supported) return;
 		void navigator.serviceWorker
 			.getRegistration()
-			.then((reg) => reg?.pushManager.getSubscription())
-			.then(async (sub) => {
+			.then(async (reg) => {
+				const sub = await reg?.pushManager.getSubscription();
+				// The browser's subscription is registered again before the prefs load: a
+				// board that lost its row (a new data folder, a restored backup) would
+				// answer "unknown endpoint" and hide the event switches. A re-subscribe
+				// keeps the device's saved switches on the server. The ADR-0011 kept
+				// path below still queues a full completion when this POST fails.
 				if (sub != null) await post("/api/push/subscribe", sub.toJSON());
 				setEnabled(sub != null);
 				setEndpoint(sub?.endpoint ?? null);
+				if (sub == null) return;
+				// ADR-0011 recovery: a subscription bound to a replaced VAPID key can
+				// never receive. When the server reports it stale and permission was
+				// already granted, re-subscribe under the new key without a prompt.
+				const endpoint = sub.endpoint;
+				const { stale } = await unwrap<{ stale: boolean }>(
+					await fetch(
+						`/api/push/config?endpoint=${encodeURIComponent(endpoint)}`,
+					),
+				);
+				if (
+					!stale ||
+					Notification.permission !== "granted" ||
+					recoveredRef.current.has(endpoint)
+				)
+					return;
+				recoveredRef.current.add(endpoint);
+				await post("/api/push/unsubscribe", { endpoint });
+				await sub.unsubscribe();
+				const fresh = await subscribeNew();
+				setEnabled(true);
+				setEndpoint(fresh);
 			})
 			.catch((err) => {
 				setError(err instanceof Error ? err.message : String(err));
@@ -1164,20 +1210,9 @@ export function NotificationsSection({
 				if ((await Notification.requestPermission()) !== "granted")
 					throw new Error("Notification permission was denied.");
 				await navigator.serviceWorker.register("/sw.js");
-				// ready waits for the worker to be ACTIVE: subscribing on an installing
-				// worker rejects with InvalidStateError on a first-run device.
-				const reg = await navigator.serviceWorker.ready;
-				const { publicKey } = await unwrap<{ publicKey: string }>(
-					await fetch("/api/push/config"),
-				);
-				// The spec takes the key as a string; the old hand-decode duplicated it.
-				const sub = await reg.pushManager.subscribe({
-					userVisibleOnly: true,
-					applicationServerKey: publicKey,
-				});
-				await post("/api/push/subscribe", sub.toJSON());
+				const endpoint = await subscribeNew();
 				setEnabled(true);
-				setEndpoint(sub.endpoint);
+				setEndpoint(endpoint);
 				return true;
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));

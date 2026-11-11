@@ -3554,6 +3554,186 @@ describe("NotificationsSection", () => {
 	});
 });
 
+/** Stale-sub recovery (ADR-0011): a fake push browser environment, the section's own
+ * fetch mock, and a probe of what the section POSTs. */
+describe("NotificationsSection stale push recovery", () => {
+	/** Installs a secure-context fake browser: an existing subscription on `oldEndpoint`,
+	 * a registration whose subscribe() records the applicationServerKey it got. */
+	async function withPushBrowser(
+		stale: boolean,
+		run: (probe: {
+			subscribedKeys: string[];
+			posts: Array<{ url: string; body: unknown }>;
+			requestPermissionCalls: () => number;
+			containerText: () => string;
+		}) => Promise<void>,
+	): Promise<void> {
+		const realFetch = globalThis.fetch;
+		const realNavigator = globalThis.navigator;
+		const realNotification = globalThis.Notification;
+		// The test env's Window type lacks the DOM property; a real window always has it.
+		const realSecureContext: boolean | undefined = Reflect.get(
+			window,
+			"isSecureContext",
+		);
+		const subscribedKeys: string[] = [];
+		const posts: Array<{ url: string; body: unknown }> = [];
+		let permissionCalls = 0;
+		let currentSub: {
+			endpoint: string;
+			toJSON: () => unknown;
+			unsubscribe: () => Promise<void>;
+		} | null = {
+			endpoint: "https://push.example.com/old",
+			toJSON: () => ({ endpoint: "https://push.example.com/old" }),
+			unsubscribe: async () => {
+				currentSub = null;
+			},
+		};
+		const registration = {
+			pushManager: {
+				getSubscription: async () => currentSub,
+				subscribe: async (opts: { applicationServerKey: string }) => {
+					subscribedKeys.push(opts.applicationServerKey);
+					currentSub = {
+						endpoint: "https://push.example.com/new",
+						toJSON: () => ({ endpoint: "https://push.example.com/new" }),
+						unsubscribe: async () => {},
+					};
+					return currentSub;
+				},
+			},
+		};
+		const fakeNavigator = {
+			...realNavigator,
+			serviceWorker: {
+				getRegistration: async () => registration,
+				ready: Promise.resolve(registration),
+				register: async () => registration,
+			},
+		} as unknown as Navigator;
+		const fetchMock = (async (url: string | URL, init?: RequestInit) => {
+			const target = String(url);
+			if (init?.method === "POST") {
+				posts.push({ url: target, body: JSON.parse(String(init.body)) });
+				return Response.json({ ok: true });
+			}
+			if (target.startsWith("/api/push/config")) {
+				return Response.json({
+					publicKey: "new-public-key",
+					stale: target.includes("endpoint=") ? stale : false,
+				});
+			}
+			return Response.json({ classes: null, mutedProjects: [] });
+		}) as unknown as typeof fetch;
+		Object.defineProperty(globalThis, "navigator", {
+			value: fakeNavigator,
+			configurable: true,
+		});
+		Object.defineProperty(globalThis, "Notification", {
+			value: {
+				permission: "granted",
+				requestPermission: async () => {
+					permissionCalls++;
+					return "granted";
+				},
+			},
+			configurable: true,
+		});
+		Object.defineProperty(globalThis.window, "isSecureContext", {
+			value: true,
+			configurable: true,
+		});
+		Object.defineProperty(globalThis.window, "PushManager", {
+			value: function PushManager() {},
+			configurable: true,
+		});
+		globalThis.fetch = fetchMock;
+		const projects = ["alpha"].map(
+			(name) =>
+				({
+					name,
+					icon: null,
+					settings: { displayName: null, iconText: null },
+				}) as unknown as ProjectView,
+		);
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(
+				<NotificationsSection
+					projects={projects}
+					act={async (fn) => {
+						try {
+							await fn();
+							return true;
+						} catch {
+							return false;
+						}
+					}}
+				/>,
+			);
+		});
+		await act(async () => {});
+		try {
+			await run({
+				subscribedKeys,
+				posts,
+				requestPermissionCalls: () => permissionCalls,
+				containerText: () => container.textContent ?? "",
+			});
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+			Object.defineProperty(globalThis, "navigator", {
+				value: realNavigator,
+				configurable: true,
+			});
+			Object.defineProperty(globalThis, "Notification", {
+				value: realNotification,
+				configurable: true,
+			});
+			Object.defineProperty(globalThis.window, "isSecureContext", {
+				value: realSecureContext,
+				configurable: true,
+			});
+			Reflect.deleteProperty(globalThis.window, "PushManager");
+		}
+	}
+
+	test("a stale subscription re-subscribes with no permission prompt and stays enabled", async () => {
+		await withPushBrowser(true, async (probe) => {
+			// Recovery drops the old endpoint on the server, then subscribes again.
+			expect(probe.posts.map((p) => p.url)).toEqual([
+				"/api/push/unsubscribe",
+				"/api/push/subscribe",
+			]);
+			expect(probe.posts[0]!.body).toEqual({
+				endpoint: "https://push.example.com/old",
+			});
+			expect(probe.subscribedKeys).toEqual(["new-public-key"]);
+			// Permission was already granted: recovery never prompts.
+			expect(probe.requestPermissionCalls()).toBe(0);
+			// The toggle reads on: the section still holds a subscription.
+			expect(probe.containerText()).toContain("Turn off");
+		});
+	});
+
+	test("stale: false leaves the subscription alone", async () => {
+		await withPushBrowser(false, async (probe) => {
+			expect(probe.posts).toEqual([]);
+			expect(probe.subscribedKeys).toEqual([]);
+			expect(probe.requestPermissionCalls()).toBe(0);
+		});
+	});
+});
+
 /** Mounts the section against `fetchMock`; the cleanup puts fetch and the catalog back. */
 async function mountRoles(fetchMock: typeof fetch): Promise<{
 	container: HTMLDivElement;

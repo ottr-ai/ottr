@@ -90,6 +90,7 @@ import {
 	workCheckDivergeAsk,
 	workCheckDivergeReason,
 } from "./scheduler.ts";
+import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
 import type { TmpDiskSpace } from "./tmpsweep.ts";
@@ -156,6 +157,21 @@ mock.module("web-push", () => ({
 const { createApp, releaseUsageHolds } = await import("./app.ts");
 
 const root = mkdtempSync(join(tmpdir(), "app-routes-"));
+
+const testBoxes = new WeakMap<object, SecretBox>();
+/** One stable SecretBox per store: mounts that share a gstore share a key, so a
+ * re-mount of a sealed row opens it again instead of regenerating (ADR-0011). */
+function testBox(gstore: object): SecretBox {
+	let box = testBoxes.get(gstore);
+	if (box === undefined) {
+		box = loadSecretBox({
+			dir: mkdtempSync(join(tmpdir(), "app-box-")),
+			env: {},
+		});
+		testBoxes.set(gstore, box);
+	}
+	return box;
+}
 
 // Clone tests point github.com URLs at local fixture repos via git's insteadOf, so no
 // network and no real clone ever runs; file:// maps the URL prefix to fixtureRepos. A
@@ -314,6 +330,7 @@ let branchRulesImpl: (url: string, init?: RequestInit) => Promise<Response> =
 		});
 const app = createApp({
 	gstore,
+	secretBox: testBox(gstore),
 	defaultDir: root,
 	// Server-only ssh state for the git-hosts routes; a root subdir, not a project checkout.
 	sshDir: join(root, "ssh"),
@@ -502,6 +519,7 @@ function mount(
 		});
 	const appDeps: Parameters<typeof createApp>[0] = {
 		gstore: g,
+		secretBox: testBox(g),
 		projects: input.projects ?? new Map(),
 		cancel: async () => ({ removed: true }),
 		stopTurn: async () => ({ ok: true }),
@@ -2863,6 +2881,7 @@ describe("production mode", () => {
 		port: 0,
 		...createApp({
 			gstore,
+			secretBox: testBox(gstore),
 			defaultDir: root,
 			projects,
 			...loopStubs(),
@@ -7480,6 +7499,7 @@ describe("github token", () => {
 	const boot = () =>
 		createApp({
 			gstore: g,
+			secretBox: testBox(g),
 			defaultDir: root,
 			projects: new Map(),
 			...loopStubs(),
@@ -7586,7 +7606,12 @@ describe("settings env", () => {
 		expect(before.status).toBe(200);
 		expect(await before.json()).toEqual({
 			names: [
-				{ name: "API_KEY", projects: ["_all", "p1"], set: false, readable: false },
+				{
+					name: "API_KEY",
+					projects: ["_all", "p1"],
+					set: false,
+					readable: false,
+				},
 				{ name: "DB_PASS", projects: ["_all"], set: false, readable: false },
 			],
 		});
@@ -7605,7 +7630,12 @@ describe("settings env", () => {
 		// The parsed answer and its raw body never hold the value.
 		expect(JSON.parse(text)).toEqual({
 			names: [
-				{ name: "API_KEY", projects: ["_all", "p1"], set: true, readable: true },
+				{
+					name: "API_KEY",
+					projects: ["_all", "p1"],
+					set: true,
+					readable: true,
+				},
 				{ name: "DB_PASS", projects: ["_all"], set: false, readable: false },
 			],
 		});
@@ -7689,6 +7719,7 @@ describe("hindsight settings", () => {
 	const boot = () => {
 		const created = createApp({
 			gstore,
+			secretBox: testBox(gstore),
 			defaultDir: root,
 			projects: new Map(),
 			...loopStubs(),
@@ -8152,6 +8183,7 @@ describe("loopback Host from another machine or container", () => {
 	});
 	const wall = createApp({
 		gstore: g,
+		secretBox: testBox(g),
 		defaultDir: root,
 		projects: new Map(),
 		...loopStubs(),
@@ -10106,7 +10138,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const m = mount({ gstore: g });
 		const res = await m.call("/api/push/config");
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ publicKey: "stored-pub" });
+		expect(await res.json()).toEqual({ publicKey: "stored-pub", stale: false });
 		// ensureVapid stamps the constant https subject, not the stored mailto one:
 		// Apple answers 403 BadJwtToken for @localhost.
 		expect(vapidApplied).toEqual({
@@ -11586,6 +11618,7 @@ describe("orphan scan failures", () => {
 	let failScan = true;
 	const failing = createApp({
 		gstore,
+		secretBox: testBox(gstore),
 		defaultDir: root,
 		projects,
 		...loopStubs(),
@@ -11674,6 +11707,7 @@ describe("orphan facts and stop (OTTR-463)", () => {
 	const killed: number[] = [];
 	const appO = createApp({
 		gstore: g,
+		secretBox: testBox(g),
 		defaultDir: root,
 		projects: projs,
 		...loopStubs(),
@@ -11821,6 +11855,7 @@ describe("sign out everywhere", () => {
 	});
 	const app = createApp({
 		gstore: g,
+		secretBox: testBox(g),
 		projects: new Map(),
 		defaultDir: root,
 		cancel: async () => ({ removed: true }),
@@ -11944,6 +11979,7 @@ describe("session registry (OTTR-387)", () => {
 		});
 		const app = createApp({
 			gstore: g,
+			secretBox: testBox(g),
 			projects: new Map(),
 			defaultDir: root,
 			cancel: async () => ({ removed: true }),
@@ -12967,6 +13003,7 @@ describe("per-runner drain routes (OTTR-454)", () => {
 	// headers as the main mount (port 0).
 	const runnerApp = createApp({
 		gstore,
+		secretBox: testBox(gstore),
 		projects,
 		defaultDir: root,
 		cancel: async () => ({ removed: true }),
@@ -14738,11 +14775,21 @@ type TrustBody = {
 type PendingBody = { id: string; publicKey: string; fingerprint: string };
 type KeyBody = { publicKey: string; fingerprint: string };
 type HostsView = {
-	tokens: Array<{ host: string; username: string; tokenSet: boolean }>;
+	tokens: Array<{
+		host: string;
+		username: string;
+		tokenSet: boolean;
+		tokenReadable: boolean;
+	}>;
 	globalKey: KeyBody | null;
-	githubApp: { id: string; fingerprint: string } | null;
+	githubApp: {
+		id: string;
+		fingerprint: string | null;
+		keyReadable: boolean;
+	} | null;
 	githubHost: string | null;
 	githubTokenSet: boolean;
+	githubTokenReadable: boolean;
 };
 
 describe("git-host urls on add project", () => {
@@ -15035,7 +15082,12 @@ describe("git-host tokens", () => {
 		expect(res.status).toBe(200);
 		const saved = (await res.json()) as HostsView;
 		expect(saved.tokens).toEqual([
-			{ host: "gitlab.com", username: "oauth2", tokenSet: true, tokenReadable: true },
+			{
+				host: "gitlab.com",
+				username: "oauth2",
+				tokenSet: true,
+				tokenReadable: true,
+			},
 		]);
 		// Write-only: no view ever carries the token itself.
 		expect(await (await m.call("/api/git-hosts")).text()).not.toContain(
@@ -15051,7 +15103,12 @@ describe("git-host tokens", () => {
 		expect(again.status).toBe(200);
 		const replaced = (await again.json()) as HostsView;
 		expect(replaced.tokens).toEqual([
-			{ host: "gitlab.com", username: "deploy", tokenSet: true, tokenReadable: true },
+			{
+				host: "gitlab.com",
+				username: "deploy",
+				tokenSet: true,
+				tokenReadable: true,
+			},
 		]);
 		const del = await m.call("/api/git-hosts/tokens/gitlab.com", undefined, {
 			method: "DELETE",
@@ -15329,7 +15386,12 @@ describe("POST /api/git-hosts/github-token", () => {
 			expect(res.status).toBe(200);
 			const view = (await res.json()) as HostsView;
 			expect(view.tokens).toEqual([
-				{ host: "github.com", username: "x-access-token", tokenSet: true, tokenReadable: true },
+				{
+					host: "github.com",
+					username: "x-access-token",
+					tokenSet: true,
+					tokenReadable: true,
+				},
 			]);
 		});
 	});
@@ -15369,7 +15431,12 @@ describe("POST /api/git-hosts/github-token", () => {
 			expect(res.status).toBe(200);
 			const view = (await res.json()) as HostsView;
 			expect(view.tokens).toEqual([
-				{ host: "acme.ghe.com", username: "x-access-token", tokenSet: true, tokenReadable: true },
+				{
+					host: "acme.ghe.com",
+					username: "x-access-token",
+					tokenSet: true,
+					tokenReadable: true,
+				},
 			]);
 		} finally {
 			globalThis.fetch = realFetch;
@@ -16504,6 +16571,7 @@ describe("token expiry reminders", () => {
 	const boot = () =>
 		createApp({
 			gstore: g,
+			secretBox: testBox(g),
 			defaultDir: root,
 			projects: new Map(),
 			...loopStubs(),
