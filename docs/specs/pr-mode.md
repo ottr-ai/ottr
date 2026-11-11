@@ -229,7 +229,8 @@ The server now deletes the remote card branch when the card ends:
   still open, deleting its head branch makes GitHub close the pull request —
   the one way an Ottr action ends a PR, and a deliberate exception to the
   "never closes" rule below: no API call closes anything; the card's own
-  branch delete does. The card log names the branch and the PR number. With
+  branch delete does. The card log names the branch, and the PR number when
+  the card's own open PR closes with the branch. With
   no PR open (closed unmerged earlier, or the push landed and the PR creation
   failed), the delete runs the same way.
 - The delete is the push's mirror (src/worktree.ts, next to `pushBranch`):

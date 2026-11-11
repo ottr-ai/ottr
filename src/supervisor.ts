@@ -1790,8 +1790,11 @@ export function createSupervisor(
 		const originUrl = settings.originUrl;
 		if (branch === null || originUrl === null || settings.prMode !== true)
 			return;
-		const keep = [e.target ?? t.base, t.sourcePrHeadRef].filter(
-			(b): b is string => b !== null,
+		// The target reads origin/<branch> (resolveTarget); the keep-list refusal compares
+		// short branch names, so strip the prefix. The base is a commit sha, never a name.
+		const target = (e.target ?? "").replace(/^origin\//, "");
+		const keep = [target, t.sourcePrHeadRef].filter(
+			(b): b is string => b !== "" && b !== null,
 		);
 		const err = await ops
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)

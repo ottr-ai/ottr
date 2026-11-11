@@ -8892,8 +8892,11 @@ export function createTurnLoop(
 			return;
 		if (settings.prMode !== true || ops.deleteRemoteBranch === undefined)
 			return;
-		const keep = [e.target ?? task.base, task.sourcePrHeadRef].filter(
-			(b): b is string => b !== null,
+		// The target reads origin/<branch> (resolveTarget); the keep-list refusal compares
+		// short branch names, so strip the prefix. The base is a commit sha, never a name.
+		const target = (e.target ?? "").replace(/^origin\//, "");
+		const keep = [target, task.sourcePrHeadRef].filter(
+			(b): b is string => b !== "" && b !== null,
 		);
 		const err = await ops
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)
@@ -8902,10 +8905,18 @@ export function createTurnLoop(
 			appendLog(e.store, id, `! cancel remote branch delete failed: ${err}`);
 			return;
 		}
+		// prNumber alone does not name an open PR on this branch: an adopted source PR keeps
+		// its own number (sourcePrNumber), and a PR closed unmerged earlier or a done card
+		// keeps theirs after the stage left Merging. Only a card still waiting in Merging on
+		// its own PR loses that PR with the branch.
+		const prOpen =
+			task.stage === "merging" &&
+			task.prNumber !== null &&
+			task.sourcePrNumber === null;
 		appendLog(
 			e.store,
 			id,
-			task.prNumber !== null
+			prOpen
 				? `cancel: removed remote branch ${branch}; PR #${task.prNumber} closed with it`
 				: `cancel: removed remote branch ${branch}`,
 		);

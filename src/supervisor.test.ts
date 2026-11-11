@@ -3042,7 +3042,10 @@ describe("prPass", () => {
 					: openList([]),
 			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
 		});
-		await tick(new Map([["proj", entry(store)]]), ops);
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
 		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
@@ -3127,7 +3130,10 @@ describe("prPass", () => {
 					: openList([]),
 			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
 		});
-		await tick(new Map([["proj", entry(store)]]), ops);
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
 		// The card still finished, and the delete call carries the head the card does
 		// not own: the real deleteRemoteBranch refuses a kept name (worktree tests).
 		expect(store.getTask(t.id)!.stage).toBe("done");

@@ -9488,15 +9488,19 @@ describe("arch-review survivor kills", () => {
 			branch: "ott/card",
 			base: "abc",
 		});
+		// Production shape: resolveTarget returns origin/<branch>; the keep list must
+		// carry the short name, never the prefix or the base sha.
+		const e = fakeProject(store);
+		e.target = "origin/main";
 
-		await loop.cancel(fakeProject(store), task.id, false);
+		await loop.cancel(e, task.id, false);
 
 		expect(record.deletes).toEqual([
 			{
 				mainPath: store.path,
 				branch: "ott/card",
 				originUrl: "https://github.com/acme/widget.git",
-				keep: ["abc"],
+				keep: ["main"],
 			},
 		]);
 		const log = await Bun.file(store.logPath(task.id)).text();
@@ -9521,20 +9525,74 @@ describe("arch-review survivor kills", () => {
 			branch: "ott/card",
 			base: "abc",
 		});
+		const e = fakeProject(store);
+		e.target = "origin/main";
 
-		await loop.cancel(fakeProject(store), task.id, false);
+		await loop.cancel(e, task.id, false);
 
 		expect(record.deletes).toEqual([
 			{
 				mainPath: store.path,
 				branch: "ott/card",
 				originUrl: "https://github.com/acme/widget.git",
-				keep: ["abc"],
+				keep: ["main"],
 			},
 		]);
 		const log = await Bun.file(store.logPath(task.id)).text();
 		expect(log).toContain("cancel: removed remote branch ott/card");
 		expect(log).not.toContain("closed with it");
+	});
+
+	test("the cancel log claims no PR close without an open PR on the branch", async () => {
+		const { store, loop } = setup();
+		store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		// A PR closed unmerged earlier keeps its prNumber after the park (in_progress).
+		const closed = store.createTask("closed pr");
+		store.updateTask(closed.id, {
+			stage: "in_progress",
+			state: "needs_you",
+			prNumber: 7,
+			worktree: join(store.worktreesDir, closed.id),
+			branch: "ott/closed",
+			base: "abc",
+		});
+		// An adopted source PR keeps the source PR's number; the card branch was never
+		// pushed, and deleting it does not close the source PR.
+		const adopted = store.createTask("adopted pr");
+		store.updateTask(adopted.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 20,
+			sourcePrNumber: 20,
+			worktree: join(store.worktreesDir, adopted.id),
+			branch: "ott/adopted",
+			base: "abc",
+		});
+		// A done card keeps the merged PR's number.
+		const done = store.createTask("merged pr");
+		store.updateTask(done.id, {
+			stage: "done",
+			state: "idle",
+			prNumber: 7,
+			worktree: join(store.worktreesDir, done.id),
+			branch: "ott/done",
+			base: "abc",
+		});
+
+		await loop.cancel(fakeProject(store), closed.id, false);
+		await loop.cancel(fakeProject(store), adopted.id, false);
+		await loop.cancel(fakeProject(store), done.id, false);
+
+		const log = (id: string) => Bun.file(store.logPath(id)).text();
+		expect(await Bun.file(store.logPath(closed.id)).text()).toContain(
+			"cancel: removed remote branch ott/closed",
+		);
+		expect(await log(closed.id)).not.toContain("closed with it");
+		expect(await log(adopted.id)).not.toContain("closed with it");
+		expect(await log(done.id)).not.toContain("closed with it");
 	});
 
 	test("a kept-worktree cancel runs no remote branch delete", async () => {

@@ -31,6 +31,7 @@ import {
 	checkedOutBranch,
 	commitMeta,
 	createWorktree,
+	deleteFailureText,
 	deleteRemoteBranch,
 	describeVersion,
 	diffStat,
@@ -4895,6 +4896,20 @@ describe("deleteRemoteBranch (OTTR-800)", () => {
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
+	});
+
+	test("a failed delete with no output reports the exit code, never success", () => {
+		// deleteFailureText backs deleteRemoteBranch's failure path: a hung push the
+		// runner killed exits non-zero with empty output, and that must stay a failure.
+		expect(deleteFailureText("", 143)).toBe("git push exited 143");
+		expect(deleteFailureText("", 1)).toBe("git push exited 1");
+		const text = deleteFailureText(
+			"fatal: https://user:secret@github.com/acme/widget.git denied\n",
+			128,
+		);
+		// Non-empty output passes through, trimmed and credential-redacted.
+		expect(text).toContain("fatal:");
+		expect(text).not.toContain("secret");
 	});
 });
 

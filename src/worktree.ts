@@ -1938,7 +1938,19 @@ export async function deleteRemoteBranch(
 	const out = `${r.stdout}${r.stderr}`;
 	// The wanted end state already happened (GitHub's auto-delete, a second delete).
 	if (out.includes("remote ref does not exist")) return null;
-	return cappedPushOutput(redactUrlCredentials(out.trim())) ?? null;
+	return deleteFailureText(out, r.code);
+}
+
+/**
+ * The delete's failure text: the redacted, capped push output, else git's exit code — a
+ * push killed with no output (a hung child the runner killed) must not read as success.
+ * Exported for the empty-output test: a fixture cannot make real git fail silently.
+ */
+export function deleteFailureText(out: string, code: number): string {
+	return (
+		cappedPushOutput(redactUrlCredentials(out.trim())) ??
+		`git push exited ${code}`
+	);
 }
 
 /**
