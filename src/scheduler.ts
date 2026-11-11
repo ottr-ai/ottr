@@ -1077,6 +1077,105 @@ export function workCheckAsk(
 	];
 }
 
+/** Blocker counts of the blocking checks, oldest first. The trend datum for the divergence
+ * rule below; error and pass runs contribute nothing (a pass ends the loop anyway). Pure. */
+export function workCheckBlockerCounts(log: readonly WorkCheckRun[]): number[] {
+	return log
+		.filter((r) => r.outcome === "blockers")
+		.map((r) => r.blockers.length);
+}
+
+/** Bug classes present in both of the last two blocking checks, in the latest run's order.
+ * Blockers without a class (old records) never repeat. Pure. */
+export function repeatedBugClasses(log: readonly WorkCheckRun[]): string[] {
+	const runs = log.filter((r) => r.outcome === "blockers");
+	const prev = runs.at(-2);
+	const last = runs.at(-1);
+	if (prev === undefined || last === undefined) return [];
+	const classes = new Set(
+		prev.blockers
+			.map((b) => b.bugClass)
+			.filter((c): c is string => c !== undefined),
+	);
+	const out: string[] = [];
+	for (const b of last.blockers) {
+		if (
+			b.bugClass !== undefined &&
+			classes.has(b.bugClass) &&
+			!out.includes(b.bugClass)
+		)
+			out.push(b.bugClass);
+	}
+	return out;
+}
+
+/** A diverging loop: the blocker count did not drop across the last two send-backs, or one
+ * bugClass repeats in two consecutive checks. Both signal a shared wrong premise the agent
+ * keeps patching around (GUARDRAILS 14a), so the board parks instead of sending back again.
+ * Pure. */
+export function workCheckDiverged(log: readonly WorkCheckRun[]): boolean {
+	const counts = workCheckBlockerCounts(log);
+	if (counts.length >= 3) {
+		const [a, b, c] = counts.slice(-3);
+		if (a !== undefined && b !== undefined && c !== undefined) {
+			if (c >= b && b >= a) return true;
+		}
+	}
+	return repeatedBugClasses(log).length > 0;
+}
+
+/** Opening of the needs_you reason a diverging work-check loop sets; the reply route reads
+ * the ask answers below only on a card parked with it. */
+export const WORK_CHECK_ASK_DIVERGE = "The work-check loop is diverging";
+export const WORK_CHECK_ASK_NEW_APPROACH = "Send back with a new approach";
+export const WORK_CHECK_ASK_CANCEL = "Cancel";
+
+/** The needs_you reason for a diverging loop: the blocker counts per round, then each
+ * repeated bug class with its blockers. Pure. */
+export function workCheckDivergeReason(log: readonly WorkCheckRun[]): string {
+	let text = `${WORK_CHECK_ASK_DIVERGE}: the blocker count did not drop over the last send-backs (blockers per check: ${workCheckBlockerCounts(log).join(", ")})`;
+	const runs = log.filter((r) => r.outcome === "blockers");
+	const last = runs[runs.length - 1];
+	for (const cls of repeatedBugClasses(log)) {
+		const bs = (last?.blockers ?? []).filter((b) => b.bugClass === cls);
+		text += `. Repeated bug class "${cls}": ${bs
+			.map((b, i) => `${i + 1}. ${b.finding}`)
+			.join(" ")}`;
+	}
+	return `${text}. Reply with a new direction to send the card back with it, or click Merge anyway or Cancel.`;
+}
+
+/** The clickable question a diverging loop puts on the card. A reply with other text is the
+ * user's new direction and sends the card back with it (app.ts). */
+export function workCheckDivergeAsk(
+	log: readonly WorkCheckRun[],
+): AskQuestion[] {
+	const repeated = repeatedBugClasses(log);
+	return [
+		{
+			question: `${WORK_CHECK_ASK_DIVERGE} (blockers per check: ${workCheckBlockerCounts(log).join(", ")}${repeated.length > 0 ? `; repeated class${repeated.length > 1 ? "es" : ""}: ${repeated.map((c) => `"${c}"`).join(", ")}` : ""}). Reply with your new direction to send the card back with it, or choose below. How do you want to continue?`,
+			options: [
+				{
+					label: WORK_CHECK_ASK_NEW_APPROACH,
+					description:
+						"Send the blockers back once more; the send-back names the repeated class and asks the agent to rethink the approach instead of fixing one more instance.",
+				},
+				{
+					label: WORK_CHECK_ASK_MERGE,
+					description:
+						"Override the open blockers and queue the merge, for example when a blocker only asks for a human review.",
+				},
+				{
+					label: WORK_CHECK_ASK_CANCEL,
+					description: "Cancel the card; no further work runs.",
+				},
+			],
+			multi: false,
+			recommended: 0,
+		},
+	];
+}
+
 /** The log with every open blocker marked overridden with `reason` (Merge anyway). Copies only:
  * the store's change detection needs a new log. Pure. */
 export function overrideWorkBlockers(

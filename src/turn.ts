@@ -103,6 +103,10 @@ import {
 	UNCHECKED_FINDINGS_HOLD,
 	WORK_CHECK_ASK_BLOCK,
 	workCheckAsk,
+	workCheckBlockerCounts,
+	workCheckDivergeAsk,
+	workCheckDiverged,
+	workCheckDivergeReason,
 } from "./scheduler.ts";
 import {
 	cleanTitle,
@@ -8149,6 +8153,26 @@ export function createTurnLoop(
 		const readyReport = readyReportText(st.result.outcome, st.result.finalText);
 		const reportStamp =
 			cur.workCheckReport === null ? { workCheckReport: readyReport } : {};
+		// The divergence park precedes the cap: a loop whose counts never drop, or
+		// that keeps re-raising one bug class, signals a wrong shared premise
+		// (GUARDRAILS 14a), so no further send-back goes out and the user picks the
+		// new direction, a merge, or a cancel. The cap stays the outer bound for
+		// loops that still improve.
+		if (workCheckDiverged(runs)) {
+			st.store.updateTask(st.id, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: workCheckDivergeReason(runs),
+				asked: workCheckDivergeAsk(runs),
+				workCheckLog: runs,
+				workCheckHead: head,
+				...reportStamp,
+			});
+			st.log(
+				`- work check: blockers did not drop (counts ${workCheckBlockerCounts(runs).join(", ")}); parked instead of another send-back`,
+			);
+			return;
+		}
 		if (sendbacks >= WORK_CHECK_MAX_SENDBACKS) {
 			st.store.updateTask(st.id, {
 				stage: "in_progress",

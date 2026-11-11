@@ -77,7 +77,11 @@ import {
 	type ReviewTask,
 	SILENT_LOG_MS,
 	WORK_CHECK_ASK_BLOCK,
+	WORK_CHECK_ASK_CANCEL,
+	WORK_CHECK_ASK_NEW_APPROACH,
 	workCheckAsk,
+	workCheckDivergeAsk,
+	workCheckDivergeReason,
 } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
@@ -8063,6 +8067,111 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.stage).toBe("in_progress");
 		expect(row.pendingPrompt).toBe("Merge anyway, but fix the README first");
 		expect(row.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
+	});
+});
+
+describe("diverging work-check ask", () => {
+	const run = (classes: string[]) => ({
+		at: Date.now(),
+		model: null,
+		outcome: "blockers" as const,
+		blockers: classes.map((c, i) => ({
+			finding: `${c} finding`,
+			quote: `q${i}`,
+			bugClass: c,
+		})),
+		notes: [],
+		durationMs: 1,
+	});
+	const inProgress = (log: unknown[]) => {
+		const t = store.createTask("diverging card");
+		store.updateTask(t.id, {
+			stage: "in_progress",
+			state: "idle",
+			workCheckLog: log as Task["workCheckLog"],
+		});
+		return t;
+	};
+	const divergePark = () => {
+		const t = inProgress([
+			run(["lossy-patch-compare", "false-stranded-park"]),
+			run(["lossy-patch-compare", "false-stranded-park"]),
+		]);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: workCheckDivergeReason(store.getTask(t.id)!.workCheckLog),
+			asked: workCheckDivergeAsk(store.getTask(t.id)!.workCheckLog),
+			workCheckSendbacks: 2,
+		});
+		return t;
+	};
+
+	test("the new-approach answer sends the blockers back with the premise paragraph", async () => {
+		const t = divergePark();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: WORK_CHECK_ASK_NEW_APPROACH,
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.state).toBe("queued");
+		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+		expect(row.pendingPrompt).toContain(
+			`Bug classes "lossy-patch-compare" and "false-stranded-park" repeated from the previous check.`,
+		);
+		expect(row.pendingPrompt).toContain("write down the premise");
+		expect(row.workCheckSendbacks).toBe(3);
+		expect(row.asked).toBeNull();
+	});
+
+	test("a typed reply becomes the new direction", async () => {
+		const t = divergePark();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "compare git rev-list output instead of parsing the diff",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.pendingPrompt).toContain(
+			"The user's new direction for the approach:",
+		);
+		expect(row.pendingPrompt).toContain(
+			"compare git rev-list output instead of parsing the diff",
+		);
+		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+	});
+
+	test("Merge anyway overrides the blockers and queues the merge", async () => {
+		const t = divergePark();
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "Merge anyway",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.stage).toBe("merging");
+		expect(row.state).toBe("queued");
+		expect(row.asked).toBeNull();
+		const open = row.workCheckLog[1]!.blockers;
+		expect(open.every((b) => b.status === "overridden")).toBe(true);
+	});
+
+	test("Cancel cancels the card", async () => {
+		const t = divergePark();
+		const previousCancel = cancelImpl;
+		let cancels = 0;
+		cancelImpl = async (_e, id) => {
+			cancels += 1;
+			store.updateTask(id, { cancelledAt: Date.now(), state: "idle" });
+			return { removed: true };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: WORK_CHECK_ASK_CANCEL,
+			});
+			expect(res.status).toBe(200);
+			expect(cancels).toBe(1);
+			expect(store.getTask(t.id)!.cancelledAt).not.toBeNull();
+		} finally {
+			cancelImpl = previousCancel;
+		}
 	});
 });
 

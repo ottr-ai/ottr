@@ -41,6 +41,7 @@ import {
 	pushHold,
 	queueOrder,
 	releaseHeldMerges,
+	repeatedBugClasses,
 	resolveDep,
 	reviewBlocked,
 	reviewFindings,
@@ -48,6 +49,10 @@ import {
 	selectFindings,
 	silentSince,
 	waitingOn,
+	workCheckBlockerCounts,
+	workCheckDivergeAsk,
+	workCheckDiverged,
+	workCheckDivergeReason,
 } from "./scheduler.ts";
 import type { Task, WorkCheckRun } from "./types.ts";
 
@@ -1829,6 +1834,122 @@ describe("work check helpers", () => {
 		];
 		expect(openWorkBlockers(runs)).toEqual([{ finding: "live", quote: "q2" }]);
 		expect(openWorkBlockers([])).toEqual([]);
+	});
+});
+
+describe("work-check divergence trend", () => {
+	const blockersRun = (n: number, classes?: string[]) => ({
+		at: 1,
+		model: null,
+		outcome: "blockers" as const,
+		blockers: Array.from({ length: n }, (_, i) => ({
+			finding: `f${i}`,
+			quote: `q${i}`,
+			...(classes?.[i] !== undefined ? { bugClass: classes[i] } : {}),
+		})),
+		notes: [],
+		durationMs: 1,
+	});
+	const otherRun = (outcome: "pass" | "error") => ({
+		at: 1,
+		model: null,
+		outcome,
+		blockers: [],
+		notes: [],
+		durationMs: 1,
+		...(outcome === "error" ? { error: "quota" } : {}),
+	});
+
+	test("flat counts 1,2,2 diverge", () => {
+		const log = [blockersRun(1), blockersRun(2), blockersRun(2)];
+		expect(workCheckDiverged(log)).toBe(true);
+	});
+
+	test("dropping counts 3,2,1 do not diverge", () => {
+		const log = [blockersRun(3), blockersRun(2), blockersRun(1)];
+		expect(workCheckDiverged(log)).toBe(false);
+	});
+
+	test("the same bugClass in two consecutive checks diverges even with dropping counts", () => {
+		const log = [
+			blockersRun(1, ["off-by-one"]),
+			blockersRun(1, ["off-by-one"]),
+		];
+		expect(workCheckDiverged(log)).toBe(true);
+	});
+
+	test("a new class each round never diverges; that loop parks on the cap instead", () => {
+		const log = [
+			blockersRun(2, ["r1a", "r1b"]),
+			blockersRun(1, ["r2"]),
+			blockersRun(2, ["r3a", "r3b"]),
+			blockersRun(1, ["r4"]),
+			blockersRun(2, ["r5a", "r5b"]),
+		];
+		expect(workCheckDiverged(log)).toBe(false);
+	});
+
+	test("workCheckBlockerCounts skips pass and error runs", () => {
+		const log = [
+			otherRun("error"),
+			blockersRun(2),
+			otherRun("pass"),
+			blockersRun(2),
+		];
+		expect(workCheckBlockerCounts(log)).toEqual([2, 2]);
+	});
+
+	test("repeatedBugClasses lists the latest run's first-occurrence order, deduped", () => {
+		const log = [blockersRun(2, ["x", "y"]), blockersRun(3, ["y", "x", "y"])];
+		expect(repeatedBugClasses(log)).toEqual(["y", "x"]);
+	});
+
+	test("repeatedBugClasses never repeats a blocker without a bugClass", () => {
+		const log = [blockersRun(1), blockersRun(1)];
+		expect(repeatedBugClasses(log)).toEqual([]);
+	});
+
+	test("workCheckDivergeReason names the counts, the repeated class and the finding, and invites a reply", () => {
+		const log = [
+			blockersRun(1),
+			blockersRun(2, ["lossy-patch-compare", "lossy-patch-compare"]),
+			{
+				...blockersRun(2, ["lossy-patch-compare", "lossy-patch-compare"]),
+				blockers: [
+					{
+						finding: "patch compare loses hunks",
+						quote: "q0",
+						bugClass: "lossy-patch-compare",
+					},
+					{
+						finding: "patch compare drops hunks",
+						quote: "q1",
+						bugClass: "lossy-patch-compare",
+					},
+				],
+			},
+		];
+		const reason = workCheckDivergeReason(log);
+		expect(reason.startsWith("The work-check loop is diverging")).toBe(true);
+		expect(reason).toContain("blockers per check: 1, 2, 2");
+		expect(reason).toContain('Repeated bug class "lossy-patch-compare"');
+		expect(reason).toContain("patch compare loses hunks");
+		expect(
+			reason.endsWith(
+				"Reply with a new direction to send the card back with it, or click Merge anyway or Cancel.",
+			),
+		).toBe(true);
+	});
+
+	test("workCheckDivergeAsk asks one question with the three options, new approach recommended", () => {
+		const ask = workCheckDivergeAsk([blockersRun(1), blockersRun(2)]);
+		expect(ask).toHaveLength(1);
+		expect(ask[0]!.options.map((o) => o.label)).toEqual([
+			"Send back with a new approach",
+			"Merge anyway",
+			"Cancel",
+		]);
+		expect(ask[0]!.recommended).toBe(0);
 	});
 });
 

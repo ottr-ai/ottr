@@ -50,6 +50,8 @@ import {
 	PROMPT_EDIT_HELD,
 	pickRunnable,
 	UNCHECKED_FINDINGS_HOLD,
+	WORK_CHECK_ASK_BLOCK,
+	WORK_CHECK_ASK_DIVERGE,
 } from "./scheduler.ts";
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
@@ -12402,10 +12404,46 @@ describe("work card check", () => {
 		const { store, record, loop } = workCheckCase(
 			head,
 			[
-				block("tests were weakened", "const x = 1;"),
-				block("scope creep", "also touched README"),
-				block("tests were weakened", "const x = 1;"),
-				block("scope creep", "also touched README"),
+				// Counts 2,1,2,1,2 with fresh bug classes each round keep the loop off the
+				// divergence park, so the send-back cap is what parks the card here.
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "tests were weakened",
+								quote: "const x = 1;",
+								bugClass: "round-1a",
+							},
+							{
+								finding: "scope creep",
+								quote: "also touched README",
+								bugClass: "round-1b",
+							},
+						],
+						fixed: [],
+						notes: [],
+					}),
+				}),
+				block("scope creep", "also touched README", "round-2"),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "tests were weakened",
+								quote: "const x = 1;",
+								bugClass: "round-3a",
+							},
+							{
+								finding: "scope creep",
+								quote: "also touched README",
+								bugClass: "round-3b",
+							},
+						],
+						fixed: [],
+						notes: [],
+					}),
+				}),
+				block("scope creep", "also touched README", "round-4"),
 				runResult({
 					finalText: JSON.stringify({
 						blockers: [
@@ -12464,6 +12502,88 @@ describe("work card check", () => {
 		]);
 	});
 
+	test("an OTTR-809-shaped loop parks after the third check, not the fifth", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = workCheckCase(
+			head,
+			[
+				block("parses diff text", "const a = 1;", "diff-parse"),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "patch compare loses hunks",
+								quote: "const a = 1;",
+								severity: "important",
+								bugClass: "lossy-patch-compare",
+							},
+							{
+								finding: "park judged stranded",
+								quote: "also touched README",
+								severity: "important",
+								bugClass: "false-stranded-park",
+							},
+						],
+						fixed: [],
+						notes: [],
+					}),
+				}),
+				runResult({
+					finalText: JSON.stringify({
+						blockers: [
+							{
+								finding: "patch compare drops hunks again",
+								quote: "const a = 1;",
+								severity: "important",
+								bugClass: "lossy-patch-compare",
+							},
+							{
+								finding: "park judged stranded again",
+								quote: "also touched README",
+								severity: "important",
+								bugClass: "false-stranded-park",
+							},
+						],
+						fixed: [],
+						notes: [],
+					}),
+				}),
+			],
+			{ diffText: async () => "const a = 1;\nalso touched README\n" },
+		);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(2);
+
+		head.sha = "sha3";
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(record.runs).toHaveLength(6); // three work runs, three checks; 4 and 5 never run
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckSendbacks).toBe(2);
+		expect(after.needsReason!.startsWith(WORK_CHECK_ASK_DIVERGE)).toBe(true);
+		expect(after.needsReason!.startsWith(WORK_CHECK_ASK_BLOCK)).toBe(false);
+		expect(after.needsReason).toContain("blockers per check: 1, 2, 2");
+		expect(after.needsReason).toContain(
+			'Repeated bug class "lossy-patch-compare"',
+		);
+		expect(after.needsReason).toContain(
+			'Repeated bug class "false-stranded-park"',
+		);
+		expect(after.asked).toHaveLength(1);
+		expect(after.asked![0]!.options.map((o) => o.label)).toEqual([
+			"Send back with a new approach",
+			"Merge anyway",
+			"Cancel",
+		]);
+	});
+
 	test("with the switch off no check run starts and the card stays merging/queued", async () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = workCheckCase(head, [], {
@@ -12480,7 +12600,7 @@ describe("work card check", () => {
 		expect(after.workCheckLog).toEqual([]);
 	});
 
-	test("a re-ready at an unchanged head after a send-back reruns the check, and the fifth block parks", async () => {
+	test("a re-ready at an unchanged head after a send-back reruns the check, and a flat loop parks after the third check", async () => {
 		const head = { sha: "sha1" };
 		const diffs: string[] = [];
 		const { store, record, loop } = workCheckCase(
@@ -12528,27 +12648,26 @@ describe("work card check", () => {
 		// The rerun re-cited the quote, so the first blocker stays open.
 		expect(after.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
 
-		// Reruns three and four add one work run and one check run each.
+		// A third identical check diverges: park now, not at the cap.
 		await loop.runTurn(store.name, task.id);
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(8);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
-			WORK_CHECK_MAX_SENDBACKS,
-		);
-
-		// The fifth failing check at the same head hits the cap: needs_you.
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(10); // five work runs, five checks
+		expect(record.runs).toHaveLength(6); // three work runs, three checks; 4 and 5 never run
 		const parked = store.getTask(task.id)!;
 		expect(parked.state).toBe("needs_you");
-		expect(parked.needsReason).toContain(
-			`blocked the merge ${WORK_CHECK_MAX_SENDBACKS + 1} times`,
-		);
-		expect(parked.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS);
+		expect(parked.stage).toBe("in_progress");
+		expect(parked.workCheckSendbacks).toBe(2);
+		expect(parked.needsReason!.startsWith(WORK_CHECK_ASK_DIVERGE)).toBe(true);
+		expect(parked.needsReason!.startsWith(WORK_CHECK_ASK_BLOCK)).toBe(false);
+		expect(parked.needsReason).toContain("blockers per check: 1, 1, 1");
+		expect(parked.asked).toHaveLength(1);
 		expect(parked.asked![0]!.options.map((o) => o.label)).toEqual([
-			"Send it back",
+			"Send back with a new approach",
 			"Merge anyway",
+			"Cancel",
 		]);
+		expect(parked.workCheckLog).toHaveLength(3);
+		expect(parked.workCheckLog.every((run) => run.outcome === "blockers")).toBe(
+			true,
+		);
 	});
 
 	test("the re-check input holds the original report, the sent-back blockers, and the new report", async () => {

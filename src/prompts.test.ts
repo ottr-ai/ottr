@@ -709,6 +709,50 @@ describe("workCheckSendBack", () => {
 		});
 		expect(text).toContain("1. [off-by-one] Off by one");
 	});
+
+	test("the plain send-back does not name the premise exercise", () => {
+		const text = workCheckSendBack({
+			blockers: [{ finding: "still open", quote: "q" }],
+			attempt: 2,
+			max: 4,
+		});
+		expect(text).not.toContain("write down the premise");
+	});
+
+	test("repeated classes add the premise paragraph before the final line", () => {
+		const text = workCheckSendBack({
+			blockers: [{ finding: "f", quote: "q", bugClass: "off-by-one" }],
+			attempt: 2,
+			max: 4,
+			repeatedClasses: ["off-by-one"],
+		});
+		expect(text).toContain(
+			`Bug class "off-by-one" repeated from the previous check.`,
+		);
+		expect(text).toContain("write down the premise that your fixes share");
+		expect(text).toContain("replace the approach when the premise is wrong");
+		expect(text).toContain(
+			"Report the premise and your decision in the ready report.",
+		);
+		const premiseAt = text.indexOf("Bug class");
+		expect(premiseAt).toBeGreaterThan(-1);
+		expect(text.indexOf("Do not weaken")).toBeGreaterThan(premiseAt);
+	});
+
+	test("two repeated classes are named together", () => {
+		const text = workCheckSendBack({
+			blockers: [
+				{ finding: "a", quote: "q", bugClass: "a" },
+				{ finding: "b", quote: "q2", bugClass: "b" },
+			],
+			attempt: 2,
+			max: 4,
+			repeatedClasses: ["a", "b"],
+		});
+		expect(text).toContain(
+			`Bug classes "a" and "b" repeated from the previous check.`,
+		);
+	});
 });
 
 describe("retro prompts", () => {

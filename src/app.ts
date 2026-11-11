@@ -278,12 +278,16 @@ import {
 	queueOrder,
 	type ReviewTask,
 	releaseHeldMerges,
+	repeatedBugClasses,
 	resolveDep,
 	reviewBlocked,
 	reviewFindings,
 	silentSince,
 	WORK_CHECK_ASK_BLOCK,
+	WORK_CHECK_ASK_CANCEL,
+	WORK_CHECK_ASK_DIVERGE,
 	WORK_CHECK_ASK_MERGE,
+	WORK_CHECK_ASK_NEW_APPROACH,
 	WORK_CHECK_ASK_SEND_BACK,
 } from "./scheduler.ts";
 import type { SecretBox } from "./secretBox.ts";
@@ -9044,22 +9048,29 @@ export function createApp(deps: AppDeps) {
 			.catch(() => {});
 		return taskResponse(e, task.id);
 	}
-	/** Queues the work-check send-back under any pending steer. */
+	/** Queues the work-check send-back under any pending steer. A null direction
+	 * is a plain send-back; on a diverging park, any other text is the user's new
+	 * direction and goes out with it. */
 	function applyWorkCheckSendBack(
 		e: Entry,
 		task: Task,
 		open: ReturnType<typeof openWorkBlockers>,
+		direction: string | null = null,
 	): Response {
 		const n = task.workCheckSendbacks + 1;
+		const text = workCheckSendBack({
+			blockers: open,
+			attempt: n,
+			max: WORK_CHECK_MAX_SENDBACKS,
+			repeatedClasses: repeatedBugClasses(task.workCheckLog),
+		});
 		e.store.updateTask(task.id, {
 			// A steer queued before the stop stays: the send-back goes under it.
 			pendingPrompt: queuedReply(
 				task.pendingPrompt,
-				workCheckSendBack({
-					blockers: open,
-					attempt: n,
-					max: WORK_CHECK_MAX_SENDBACKS,
-				}),
+				direction === null
+					? text
+					: `${text}\nThe user's new direction for the approach:\n${direction}`,
 			),
 			pendingBy: "supervisor",
 			workCheckSendbacks: n,
@@ -9072,17 +9083,22 @@ export function createApp(deps: AppDeps) {
 		deps.schedule();
 		return taskResponse(e, task.id);
 	}
-	/** A click on the cap-exceeded work-check block's ask: the send-back or the merge. Null is a plain reply. */
-	function workCheckAskReply(
+	/** A click on the cap-exceeded work-check block's ask: the send-back or the merge. On a
+	 * diverging park, a click does the chosen action; any other text is the user's new
+	 * direction and sends the card back with it. Null is a plain reply. */
+	async function workCheckAskReply(
 		e: Entry,
 		task: Task,
 		trimmed: string,
 		open: ReturnType<typeof openWorkBlockers>,
 		hasImages: boolean,
-	): Response | null {
+	): Promise<Response | null> {
+		const capPark = task.needsReason?.startsWith(WORK_CHECK_ASK_BLOCK) === true;
+		const divergePark =
+			task.needsReason?.startsWith(WORK_CHECK_ASK_DIVERGE) === true;
 		if (
+			!(capPark || divergePark) ||
 			task.asked === null ||
-			task.needsReason?.startsWith(WORK_CHECK_ASK_BLOCK) !== true ||
 			open.length === 0 ||
 			hasImages
 		)
@@ -9095,8 +9111,19 @@ export function createApp(deps: AppDeps) {
 			deps.schedule();
 			return taskResponse(e, task.id);
 		}
-		if (trimmed === WORK_CHECK_ASK_SEND_BACK)
+		if (capPark && trimmed === WORK_CHECK_ASK_SEND_BACK)
 			return applyWorkCheckSendBack(e, task, open);
+		if (divergePark) {
+			if (trimmed === WORK_CHECK_ASK_CANCEL) {
+				const out = await deps.cancel(e, task.id, false);
+				if ("error" in out) return json({ error: out.error }, out.status);
+				if ("kept" in out) return json({ ok: false, kept: out.kept });
+				return taskResponse(e, task.id);
+			}
+			const direction =
+				trimmed === WORK_CHECK_ASK_NEW_APPROACH ? null : trimmed;
+			return applyWorkCheckSendBack(e, task, open, direction);
+		}
 		return null;
 	}
 	/** Which parked merge holds the card carries: update, fork, or none. */
@@ -9205,10 +9232,17 @@ export function createApp(deps: AppDeps) {
 		const payload = replyRefusal(e, task, text, body.images);
 		if (payload instanceof Response) return payload;
 		const { trimmed, images } = payload;
-		// A click on the cap-exceeded work-check block's ask: the send-back or the
-		// merge, done here. Any other text, or a picture, is a plain reply to the agent below.
+		// A click on the cap-exceeded work-check block's ask, or on a diverging
+		// work-check park: the chosen action, done here. Any other text, or a
+		// picture, is a plain reply to the agent below.
 		const open = openWorkBlockers(task.workCheckLog);
-		const ask = workCheckAskReply(e, task, trimmed, open, images.length > 0);
+		const ask = await workCheckAskReply(
+			e,
+			task,
+			trimmed,
+			open,
+			images.length > 0,
+		);
 		if (ask !== null) return ask;
 		const names =
 			images.length > 0
