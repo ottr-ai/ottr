@@ -611,12 +611,15 @@ export function JiraBoardImportDialog({
 							<select
 								id={`${jqlId}-conn`}
 								value={connection}
+								disabled={busy !== null}
 								onChange={(e) => {
 									setConnection(e.target.value);
 									// The loaded rows belong to the connection that searched them:
 									// their cursor, urls and importedIn facts are that site's. A
 									// switch drops them, so Load more and Import can never pair
 									// one site's cursor with another connection (spec section 6).
+									// The select locks while a request is in flight, so a late
+									// answer can never land after a switch either.
 									setRows(null);
 									setNext(null);
 									setPages(0);

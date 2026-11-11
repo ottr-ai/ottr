@@ -1016,6 +1016,60 @@ describe("JiraBoardImportDialog", () => {
 		}
 	});
 
+	test("the connection select locks while a request is in flight", async () => {
+		// A switch mid-flight would strand the answer of the old connection beside
+		// the new one, so the select must stay disabled until the request settles.
+		let searches = 0;
+		const gate = Promise.withResolvers<Response>();
+		const { container, unmount } = await boardDialog(({ url, method }) => {
+			if (url.endsWith(CONNS) && method === "GET")
+				return json(200, [
+					{
+						name: "work",
+						site: "https://acme.atlassian.net",
+						type: "cloud",
+						email: "me@acme.test",
+						customFields: [],
+						tokenSet: true,
+						tokenReadable: true,
+						usedBy: [],
+					},
+					{
+						name: "other",
+						site: "https://jira.corp.test",
+						type: "datacenter",
+						email: null,
+						customFields: [],
+						tokenSet: true,
+						tokenReadable: true,
+						usedBy: [],
+					},
+				]);
+			if (url.endsWith(BSEARCH)) {
+				searches += 1;
+				if (searches > 1) return json(200, { rows: [], next: null, total: 0 });
+				// Hold the first search open until the test releases it.
+				return gate.promise as unknown as Response;
+			}
+			return json(500, { error: "unexpected" });
+		});
+		try {
+			const area = boardSearch(container);
+			await fire(area, "onChange", { target: { value: "order by key" } });
+			await submit(q(container, "form.jira-search"));
+			const conn = q<HTMLSelectElement>(container, "form.jira-search select");
+			expect(conn.disabled).toBe(true);
+			gate.resolve(
+				json(200, { rows: [boardRow("BRD-1")], next: null, total: 1 }),
+			);
+			await settle();
+			expect(conn.disabled).toBe(false);
+			expect(container.querySelectorAll("li.jira-row")).toHaveLength(1);
+		} finally {
+			await unmount();
+		}
+	});
+
 	test("skip keeps the row out of the assignments", async () => {
 		const { container, calls, unmount } = await boardDialog(
 			({ url, method, body }) => {
