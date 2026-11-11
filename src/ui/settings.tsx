@@ -1116,14 +1116,41 @@ export function NotificationsSection({
 	const busy = useBusy();
 	// Endpoints recovery already ran for: one pass per subscription, no loop.
 	const recoveredRef = useRef<Set<string>>(new Set());
-	// Queued subscribe POST from a failed flow whose browser undo also failed:
-	// the browser still holds the subscription, so the next load retries the
-	// registration once (ADR-0011). typeof guard: server-side render in tests.
+	// Queued completion work from a failed flow (ADR-0011): the next load
+	// retries the whole completion — subscribe, classes transfer, old-row
+	// drop — until every step succeeds. typeof guard: server-side render in tests.
 	const PENDING_SUBSCRIBE_KEY = "ottr.push.pendingSubscribe";
+	// One best-effort replay pass per load: no loop.
 	const pendingRetriedRef = useRef(false);
+	type PendingSubscribeRecord = {
+		subscription: unknown;
+		oldEndpoint: string | null;
+		classes: ClassPrefs | null;
+	};
+	const queuePendingSubscribe = (
+		sub: { toJSON(): unknown },
+		oldEndpoint: string | null,
+		classes: ClassPrefs | null,
+	): void => {
+		if (typeof localStorage === "undefined") return;
+		try {
+			const record: PendingSubscribeRecord = {
+				subscription: sub.toJSON(),
+				oldEndpoint,
+				classes,
+			};
+			localStorage.setItem(PENDING_SUBSCRIBE_KEY, JSON.stringify(record));
+		} catch {
+			// No storage: nothing to queue; the kept-subscription state still reports.
+		}
+	};
 	// The enable flow's core, shared with stale-sub recovery (ADR-0011): ready →
 	// key → subscribe under the current public key → POST. No permission prompt here.
-	const subscribeNew = async (): Promise<string> => {
+	// Returns the subscription so the caller can queue its context on a failure.
+	const subscribeNew = async (): Promise<{
+		endpoint: string;
+		toJSON(): unknown;
+	}> => {
 		// ready waits for the worker to be ACTIVE: subscribing on an installing
 		// worker rejects with InvalidStateError on a first-run device.
 		const reg = await navigator.serviceWorker.ready;
@@ -1140,8 +1167,8 @@ export function NotificationsSection({
 		} catch (err) {
 			// ADR-0011 recovery: a subscription without a server row sends to a dead
 			// address and never reports stale — undo it so the UI shows the truth.
-			// When the browser refuses the undo, queue the payload: a retry on the
-			// next load can register the live-but-unaddressable subscription.
+			// When the browser refuses the undo, the caller queues the full
+			// completion record for a retry on the next load.
 			const failure = new Error(
 				err instanceof Error ? err.message : String(err),
 			);
@@ -1151,22 +1178,16 @@ export function NotificationsSection({
 				const kept = failure as Error & {
 					keptSubscription?: boolean;
 					endpoint?: string;
+					keptSub?: { toJSON(): unknown };
 				};
 				kept.keptSubscription = true;
 				kept.endpoint = sub.endpoint;
-				try {
-					localStorage.setItem(
-						PENDING_SUBSCRIBE_KEY,
-						JSON.stringify(sub.toJSON()),
-					);
-				} catch {
-					// No storage: nothing to queue; the kept-subscription state still reports.
-				}
+				kept.keptSub = sub;
 				throw kept;
 			}
 			throw failure;
 		}
-		return sub.endpoint;
+		return sub;
 	};
 	// A failed recovery must show the real state: no browser subscription, so
 	// the section reports the failure and offers the "Turn on" control
@@ -1205,14 +1226,34 @@ export function NotificationsSection({
 				if (!pendingRetriedRef.current && pendingRaw !== null) {
 					pendingRetriedRef.current = true;
 					try {
-						const payload = JSON.parse(
+						const record = JSON.parse(
 							localStorage.getItem(PENDING_SUBSCRIBE_KEY) ?? "null",
-						) as unknown;
-						if (payload !== null && typeof payload === "object")
-							await post("/api/push/subscribe", payload);
-						localStorage.removeItem(PENDING_SUBSCRIBE_KEY);
+						) as PendingSubscribeRecord | null;
+						if (record !== null && typeof record === "object") {
+							// ADR-0011: replay the whole completion in order; every step
+							// is idempotent, so any failure keeps the record for the next load.
+							const queued = record.subscription as {
+								endpoint?: string;
+							};
+							await post("/api/push/subscribe", record.subscription);
+							if (
+								record.oldEndpoint !== null &&
+								record.oldEndpoint !== queued.endpoint
+							) {
+								if (record.classes !== null) {
+									await post("/api/notifications/prefs", {
+										endpoint: queued.endpoint,
+										classes: record.classes,
+									});
+								}
+								await post("/api/push/unsubscribe", {
+									endpoint: record.oldEndpoint,
+								});
+							}
+							localStorage.removeItem(PENDING_SUBSCRIBE_KEY);
+						}
 					} catch {
-						// Silent: the next load retries the same queued payload.
+						// Silent: the next load retries the same queued record.
 					}
 				}
 				if (sub == null) return;
@@ -1259,7 +1300,7 @@ export function NotificationsSection({
 				}
 				try {
 					const fresh = await subscribeNew();
-					if (fresh !== endpoint) {
+					if (fresh.endpoint !== endpoint) {
 						// Same endpoint: the subscribe replaced the row in place, classes
 						// kept server-side. A moved endpoint must carry the classes before
 						// the old row drops: a failed transfer leaves the old row
@@ -1267,12 +1308,17 @@ export function NotificationsSection({
 						if (carried !== null) {
 							try {
 								await post("/api/notifications/prefs", {
-									endpoint: fresh,
+									endpoint: fresh.endpoint,
 									classes: carried,
 								});
 							} catch (err) {
+								// ADR-0011: queue the completion — the next load transfers
+								// the classes and drops the old row. The switches show the
+								// preferences the retry will restore.
+								queuePendingSubscribe(fresh, endpoint, carried);
 								setEnabled(true);
-								setEndpoint(fresh);
+								setEndpoint(fresh.endpoint);
+								setClasses(carried);
 								setError(err instanceof Error ? err.message : String(err));
 								return;
 							}
@@ -1283,15 +1329,21 @@ export function NotificationsSection({
 					// Server truth last: the switches match the restored preferences
 					// immediately; the prefs effect refetches and confirms.
 					setEnabled(true);
-					setEndpoint(fresh);
+					setEndpoint(fresh.endpoint);
 					setClasses(carried);
 				} catch (err) {
-					const kept = err as Error & { keptSubscription?: boolean };
-					if (kept.keptSubscription) {
+					const kept = err as Error & {
+						keptSubscription?: boolean;
+						endpoint?: string;
+						keptSub?: { toJSON(): unknown };
+					};
+					if (kept.keptSubscription && kept.keptSub) {
+						// ADR-0011: the browser holds the subscription and the server has
+						// no row — queue the completion and report the truth: subscribed,
+						// registration pending.
+						queuePendingSubscribe(kept.keptSub, endpoint, carried);
 						setEnabled(true);
-						setEndpoint(
-							(err as Error & { endpoint?: string }).endpoint ?? null,
-						);
+						setEndpoint(kept.endpoint ?? null);
 						setError(err instanceof Error ? err.message : String(err));
 					} else {
 						markRecoveryFailed(err);
@@ -1336,7 +1388,7 @@ export function NotificationsSection({
 				await navigator.serviceWorker.register("/sw.js");
 				const endpoint = await subscribeNew();
 				setEnabled(true);
-				setEndpoint(endpoint);
+				setEndpoint(endpoint.endpoint);
 				return true;
 			} catch (err) {
 				setError(err instanceof Error ? err.message : String(err));

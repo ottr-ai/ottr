@@ -3566,6 +3566,7 @@ describe("NotificationsSection stale push recovery", () => {
 			posts: Array<{ url: string; body: unknown }>;
 			requestPermissionCalls: () => number;
 			containerText: () => string;
+			containerNode: () => HTMLDivElement;
 			currentSubscription: () => unknown;
 		}) => Promise<void>,
 		subscribeRejects = false,
@@ -3581,7 +3582,7 @@ describe("NotificationsSection stale push recovery", () => {
 			/** Initial subscription endpoint (default the old fixture endpoint). */
 			initialEndpoint?: string;
 			/** Seeds the pending-subscribe localStorage record before mount. */
-			seedPending?: string;
+			seedPending?: unknown;
 		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
@@ -3714,7 +3715,7 @@ describe("NotificationsSection stale push recovery", () => {
 		if (options.seedPending !== undefined)
 			globalThis.localStorage.setItem(
 				PENDING_KEY,
-				JSON.stringify({ endpoint: options.seedPending }),
+				JSON.stringify(options.seedPending),
 			);
 		const container = window.document.createElement(
 			"div",
@@ -3743,6 +3744,7 @@ describe("NotificationsSection stale push recovery", () => {
 				posts,
 				requestPermissionCalls: () => permissionCalls,
 				containerText: () => container.textContent ?? "",
+				containerNode: () => container,
 				currentSubscription: () => currentSub,
 			});
 		} finally {
@@ -3894,6 +3896,7 @@ describe("NotificationsSection stale push recovery", () => {
 	});
 
 	test("a failed subscribe POST whose undo fails keeps the live subscription and queues a retry", async () => {
+		const classes = { request: true, error: false, complete: true };
 		await withPushBrowser(
 			true,
 			async (probe) => {
@@ -3903,26 +3906,45 @@ describe("NotificationsSection stale push recovery", () => {
 				expect(probe.currentSubscription()).not.toBeNull();
 				expect(probe.containerText()).toContain("Turn off");
 				expect(probe.containerText()).toContain("boom");
-				// The payload is queued for the next load's retry.
+				// The whole completion is queued: the recovery read the old row's
+				// classes before the failure, so the retry can restore them.
 				expect(
-					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
-				).not.toBeNull();
+					JSON.parse(
+						globalThis.localStorage.getItem("ottr.push.pendingSubscribe") ??
+							"null",
+					),
+				).toEqual({
+					subscription: { endpoint: "https://push.example.com/new" },
+					oldEndpoint: "https://push.example.com/old",
+					classes,
+				});
 			},
 			false,
-			{ failPostSubscribe: true, undoRejects: true },
+			{ failPostSubscribe: true, undoRejects: true, prefsClasses: classes },
 		);
 	});
 
 	test("a queued pending subscribe retries once on the next load and clears the record", async () => {
+		const classes = { request: true, error: false, complete: true };
 		await withPushBrowser(
 			false,
 			async (probe) => {
-				const subscribePosts = probe.posts.filter(
-					(p) => p.url === "/api/push/subscribe",
-				);
-				expect(subscribePosts).toHaveLength(1);
-				expect(subscribePosts[0]!.body).toEqual({
+				// The replay runs the whole completion in order: register the queued
+				// subscription, carry the classes, drop the old row.
+				expect(probe.posts.map((p) => p.url)).toEqual([
+					"/api/push/subscribe",
+					"/api/notifications/prefs",
+					"/api/push/unsubscribe",
+				]);
+				expect(probe.posts[0]!.body).toEqual({
 					endpoint: "https://push.example.com/queued",
+				});
+				expect(probe.posts[1]!.body).toEqual({
+					endpoint: "https://push.example.com/queued",
+					classes,
+				});
+				expect(probe.posts[2]!.body).toEqual({
+					endpoint: "https://push.example.com/old",
 				});
 				expect(
 					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
@@ -3930,8 +3952,40 @@ describe("NotificationsSection stale push recovery", () => {
 			},
 			false,
 			{
-				seedPending: "https://push.example.com/queued",
+				seedPending: {
+					subscription: { endpoint: "https://push.example.com/queued" },
+					oldEndpoint: "https://push.example.com/old",
+					classes,
+				},
 				initialEndpoint: "https://push.example.com/queued",
+			},
+		);
+	});
+
+	test("a failed classes POST in the replay keeps the record for the next load", async () => {
+		const classes = { request: true, error: false, complete: true };
+		await withPushBrowser(
+			false,
+			async (probe) => {
+				// The subscribe ran, the classes POST failed, the old row was not
+				// dropped: the record stays and the next load retries from the top.
+				expect(probe.posts.map((p) => p.url)).toEqual([
+					"/api/push/subscribe",
+					"/api/notifications/prefs",
+				]);
+				expect(
+					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
+				).not.toBeNull();
+			},
+			false,
+			{
+				seedPending: {
+					subscription: { endpoint: "https://push.example.com/queued" },
+					oldEndpoint: "https://push.example.com/old",
+					classes,
+				},
+				initialEndpoint: "https://push.example.com/queued",
+				failPrefsPost: true,
 			},
 		);
 	});
@@ -3949,7 +4003,11 @@ describe("NotificationsSection stale push recovery", () => {
 			},
 			false,
 			{
-				seedPending: "https://push.example.com/queued",
+				seedPending: {
+					subscription: { endpoint: "https://push.example.com/queued" },
+					oldEndpoint: null,
+					classes: null,
+				},
 				initialEndpoint: "https://push.example.com/queued",
 				failPostSubscribe: true,
 			},
@@ -3988,6 +4046,28 @@ describe("NotificationsSection stale push recovery", () => {
 				expect(probe.containerText()).toContain("prefs post failed");
 				// The browser holds the fresh subscription: the section reads on.
 				expect(probe.containerText()).toContain("Turn off");
+				// The completion is queued so the next load transfers and drops.
+				expect(
+					JSON.parse(
+						globalThis.localStorage.getItem("ottr.push.pendingSubscribe") ??
+							"null",
+					),
+				).toEqual({
+					subscription: { endpoint: "https://push.example.com/new" },
+					oldEndpoint: "https://push.example.com/old",
+					classes,
+				});
+				// The switches show the carried preferences the retry will restore.
+				const rows = [
+					...(probe.containerNode().querySelectorAll(".check-row") ?? []),
+				];
+				const rowFor = (name: string): HTMLInputElement | null => {
+					const row = rows.find((el) => el.textContent?.includes(name));
+					return row?.querySelector("input") ?? null;
+				};
+				expect(rowFor("Request")?.checked).toBe(true);
+				expect(rowFor("Error")?.checked).toBe(false);
+				expect(rowFor("Complete")?.checked).toBe(true);
 			},
 			false,
 			{ prefsClasses: classes, failPrefsPost: true },
