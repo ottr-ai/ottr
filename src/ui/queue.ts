@@ -86,18 +86,30 @@ export function doneReadable(
 	);
 }
 
-/** OTTR-566: a newly done card nobody has opened yet (drives the rail's steel dot). The read mark
- * is keyed by completion (`id@doneAt`), so a card that returns to Done is unread again. */
+/** OTTR-566: a newly done card nobody has opened yet (drives the rail's steel dot). OTTR-827: the
+ * dot counts a card only when its face shows the New badge's content (seenable) — a merged work
+ * card, quiet research, a retro or a cancelled card shows nothing, so it never lights the dot.
+ * The read mark is keyed by completion (`id@doneAt`), so a card that returns to Done is unread
+ * again; opening marks both this key and the plain id, so the marks move together. */
 export function doneUnread(
 	t: Pick<
 		TaskCard,
-		"id" | "stage" | "cancelledAt" | "kind" | "state" | "doneAt"
+		| "id"
+		| "answered"
+		| "cancelledAt"
+		| "kind"
+		| "stage"
+		| "research"
+		| "steps"
+		| "state"
+		| "doneAt"
 	>,
 	seen: ReadonlySet<string>,
 	since: number,
 ): boolean {
 	return (
 		doneReadable(t, since) &&
+		seenable(t) &&
 		t.doneAt !== null &&
 		!seen.has(doneReadKey({ id: t.id, doneAt: t.doneAt }))
 	);

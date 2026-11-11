@@ -601,32 +601,98 @@ describe("doneUnread", () => {
 		doneAt: number | null,
 		over: Parameters<typeof card>[3] = {},
 	) => ({ ...card(id, "done", "idle", over), doneAt });
-	test("only post-baseline, uncancelled, on-board done cards count", () => {
+	test("only post-baseline, uncancelled, on-board seenable done cards count", () => {
 		const none = new Set<string>();
-		expect(doneUnread(done("a", since), none, since)).toBe(false);
-		expect(doneUnread(done("a", since + 1), none, since)).toBe(true);
-		expect(doneUnread(done("a", null), none, since)).toBe(false);
-		expect(
-			doneUnread(done("a", since + 1, { cancelledAt: 5 }), none, since),
-		).toBe(false);
-		expect(
-			doneUnread(done("a", since + 1, { kind: "retro" }), none, since),
-		).toBe(false);
+		const answered = { answered: true };
+		expect(doneUnread(done("a", since, answered), none, since)).toBe(false);
+		expect(doneUnread(done("a", since + 1, answered), none, since)).toBe(true);
+		expect(doneUnread(done("a", null, answered), none, since)).toBe(false);
 		expect(
 			doneUnread(
-				{ ...card("a", "todo", "idle"), doneAt: since + 1 },
+				done("a", since + 1, { ...answered, cancelledAt: 5 }),
 				none,
 				since,
 			),
 		).toBe(false);
 		expect(
-			doneUnread(done("a", since + 1), new Set([`a@${since + 1}`]), since),
+			doneUnread(
+				done("a", since + 1, { ...answered, kind: "retro" }),
+				none,
+				since,
+			),
 		).toBe(false);
-		expect(doneUnread(done("a", since + 1), new Set(["a"]), since)).toBe(true);
 		expect(
-			doneUnread(done("a", since + 2), new Set([`a@${since + 1}`]), since),
+			doneUnread(
+				{ ...card("a", "todo", "idle", answered), doneAt: since + 1 },
+				none,
+				since,
+			),
+		).toBe(false);
+		expect(
+			doneUnread(
+				done("a", since + 1, answered),
+				new Set([`a@${since + 1}`]),
+				since,
+			),
+		).toBe(false);
+		expect(
+			doneUnread(done("a", since + 1, answered), new Set(["a"]), since),
+		).toBe(true);
+		expect(
+			doneUnread(
+				done("a", since + 2, answered),
+				new Set([`a@${since + 1}`]),
+				since,
+			),
 		).toBe(true);
 		expect(doneReadable(done("a", since + 1), since)).toBe(true);
+	});
+	test("OTTR-827: a card that shows nothing never counts (merged work, quiet research)", () => {
+		const none = new Set<string>();
+		expect(doneUnread(done("m", since + 1), none, since)).toBe(false);
+		expect(
+			doneUnread(
+				done("m", since + 1),
+				new Set([doneReadKey({ id: "m", doneAt: since + 1 })]),
+				since,
+			),
+		).toBe(false);
+		expect(
+			doneUnread(
+				done("q", since + 1, { research: true, steps: "unknown" }),
+				none,
+				since,
+			),
+		).toBe(false);
+	});
+	test("OTTR-827: the rail count equals the number of cards whose face shows New", () => {
+		const cards = [
+			done("m", since + 1), // merged work card
+			done("q", since + 1, { answered: true }), // answered card
+			done("p", since + 1, { kind: "pr_review" }), // PR review
+			done("r", since + 1, { research: true, steps: "yes" }), // research with steps
+			done("s", since + 1, { research: true, steps: "unknown" }), // research without steps
+			done("t", since + 1, { kind: "retro" }), // retro
+			{ ...done("c", since + 1), cancelledAt: 5 }, // cancelled
+		];
+		const none = new Set<string>();
+		// New badges: the answered card, the PR review, the research report. No badge
+		// on a merged card, quiet research, a retro or a cancelled card.
+		expect(cards.filter((c) => isUnread(c, none)).map((c) => c.id)).toEqual([
+			"q",
+			"p",
+			"r",
+		]);
+		// Empty seen set and a fully read set agree: the rail counts exactly the badges.
+		const read = new Set([
+			...cards.map((c) => c.id),
+			...cards.map((c) => doneReadKey({ id: c.id, doneAt: since + 1 })),
+		]);
+		for (const seen of [none, read]) {
+			expect(cards.filter((c) => doneUnread(c, seen, since)).length).toBe(
+				cards.filter((c) => isUnread(c, seen)).length,
+			);
+		}
 	});
 	test("a steps report's rail dot follows its done key, its Inbox pin the plain id", () => {
 		const r = done("r", since + 1, { research: true, steps: "yes" });

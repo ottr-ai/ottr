@@ -63,6 +63,7 @@ const {
 	Drawer,
 	LogView,
 	ProjectBoard,
+	RailRows,
 	SEARCH_APPLY_MS,
 	ComposeDialog,
 	FollowUpDialog,
@@ -5967,6 +5968,81 @@ describe("LogView log slice controls", () => {
 		expect(html).toContain('aria-pressed="true"');
 		expect(html).toContain("(no log output yet)");
 	});
+});
+
+test("OTTR-827: the rail dot counts exactly the cards whose face shows New", () => {
+	const since = 1000;
+	const mkProject = (name: string): ProjectView =>
+		({
+			name,
+			hasRules: true,
+			github: null,
+			sessionsDir: `/tmp/${name}`,
+			settings: { maxParallel: 1 },
+			latestImage: null,
+			archReview: null,
+			dirty: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestReleaseUrl: null,
+			openPrs: null,
+			target: null,
+		}) as unknown as ProjectView;
+	// Solari: one merged work card done after the baseline — its face shows nothing.
+	const merged = cardFixture({
+		id: "m1",
+		project: "solari",
+		stage: "done",
+		state: "idle",
+		doneAt: since + 1,
+		kind: "work",
+	});
+	// Velvarr: one answered card, never opened — its face shows New.
+	const answered = cardFixture({
+		id: "q1",
+		project: "velvarr",
+		stage: "done",
+		state: "idle",
+		doneAt: since + 1,
+		answered: true,
+		kind: "work",
+	});
+	const rail = renderToStaticMarkup(
+		<RailRows
+			projects={[mkProject("solari"), mkProject("velvarr")]}
+			tasks={[merged, answered]}
+			seenAnswers={new Set()}
+			seenDoneSince={since}
+			project={null}
+			overviewCurrent={false}
+			systemCurrent={false}
+			hosted={false}
+			version={null}
+			collapsed={false}
+			navigate={() => {}}
+			onAdd={() => {}}
+		/>,
+	);
+	// The merged-only project lights no dot; the answered card lights exactly one.
+	expect(rail.match(/area-ind unread/g)).toEqual(["area-ind unread"]);
+	expect(rail).toContain('title="1 unread"');
+	expect(rail).not.toContain("0 unread");
+	// The same empty seen set drives the card face badge on the board.
+	const board = renderToStaticMarkup(
+		<ProjectBoard
+			project={mkProject("velvarr")}
+			tasks={[answered]}
+			deltas={new Map()}
+			open={() => {}}
+			seenAnswers={new Set()}
+			compose={() => {}}
+			composeDraft={() => {}}
+			act={async () => true}
+			onNotice={() => {}}
+			draining={false}
+		/>,
+	);
+	expect(board).toContain('class="unread"');
 });
 
 describe("ProjectBoard search delay", () => {

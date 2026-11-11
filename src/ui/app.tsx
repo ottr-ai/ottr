@@ -14014,7 +14014,7 @@ function railRow(
 		needs > 0 ? `${needs} need action` : "",
 		asks > 0 ? `${asks} asked` : "",
 		running > 0 ? `${running} running` : "",
-		unread > 0 ? `${unread} done unread` : "",
+		unread > 0 ? `${unread} unread` : "",
 		waiting > 0 ? `${waiting} waiting` : "",
 	]
 		.filter((s) => s !== "")
@@ -14025,7 +14025,7 @@ function railRow(
 /** The project rail's rows: Overview, System, Add project, one link per project with its one
  * ranked mark, and the "Ottr <version>" footer line. The desktop rail renders it, and the phone
  * popout under the bar's grid button reuses it (always expanded there). */
-function RailRows({
+export function RailRows({
 	projects,
 	tasks,
 	seenAnswers,
