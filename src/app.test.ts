@@ -893,6 +893,21 @@ describe("task routes", () => {
 			`/api/projects/p1/tasks/${t.id}/saved-files?path=${encodeURIComponent("x/etc/passwd")}`,
 		);
 		expect(viaLink.status).toBe(404);
+		// A worker can replace the card folder itself with a link (compose mounts the
+		// data volume read-write for workers): listing and serving must refuse it.
+		const linked = store.createTask("linked card folder");
+		store.updateTask(linked.id, { stage: "done", state: "idle" });
+		const realDir = join(root, "real-saved");
+		mkdirSync(realDir, { recursive: true });
+		writeFileSync(join(realDir, "leak.txt"), "secret");
+		symlinkSync(realDir, join(store.tasksDir, "quarantine", linked.id));
+		const linkedDetail = await get(`/api/projects/p1/tasks/${linked.id}`);
+		const lb = (await linkedDetail.json()) as { savedFiles?: unknown[] };
+		expect(lb.savedFiles).toEqual([]);
+		const leak = await get(
+			`/api/projects/p1/tasks/${linked.id}/saved-files?path=leak.txt`,
+		);
+		expect(leak.status).toBe(404);
 		expect(
 			(
 				await get(

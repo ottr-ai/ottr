@@ -4,19 +4,27 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	closeSync,
-	type Dirent,
 	existsSync,
 	fstatSync,
+	lstatSync,
 	mkdirSync,
-	readdirSync,
 	readFileSync,
 	readSync,
+	type Stats,
 	statSync,
 	writeFileSync,
 } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
 import { promisify } from "node:util";
 import { brotliCompress, gzip, gzipSync } from "node:zlib";
 import type { BunRequest, Serve, Server, ServerWebSocket } from "bun";
@@ -59,7 +67,13 @@ import {
 } from "./auth.ts";
 import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
-import { openRegular, readBelow, unlinkBelow, writeBelow } from "./confine.ts";
+import {
+	openRegular,
+	readBelow,
+	unlinkBelow,
+	withDir,
+	writeBelow,
+} from "./confine.ts";
 import { logError } from "./crash.ts";
 import { checkDeepened, type DeepenCheck, deepenDraft } from "./deepen.ts";
 import { errmsg, requestFailed } from "./errmsg.ts";
@@ -6915,13 +6929,14 @@ export function createApp(deps: AppDeps) {
 		const file = join(dir, rel);
 		if (!resolve(file).startsWith(resolve(dir) + sep))
 			return json({ error: "bad path" }, 400);
-		// readBelow refuses a symlink at EVERY path component (O_NOFOLLOW per component),
-		// so an untracked link that points out of the card's folder cannot widen the read.
-		// The cap only bounds the buffer: saveDoneFiles caps new saves at 4 MiB, but the
+		// readBelow anchors at the trusted data root (no worker can replace it) and
+		// refuses a symlink at EVERY component below it with O_NOFOLLOW, so a
+		// worker-planted link at the card folder or below cannot widen the read. The
+		// cap only bounds the buffer: saveDoneFiles caps new saves at 4 MiB, but the
 		// quarantine also holds older uncapped entries (scratch, image retries).
 		let bytes: Buffer | null;
 		try {
-			bytes = readBelow(dir, file, 64 * 1024 * 1024);
+			bytes = readBelow(e.store.dataRoot, file, 64 * 1024 * 1024);
 		} catch {
 			// refused: a symlink at any component, a non-regular entry, or oversize
 			return json({ error: "unknown file" }, 404);
@@ -9555,34 +9570,41 @@ export function createApp(deps: AppDeps) {
 			reviewed,
 		}));
 	}
-	// Repo-relative files kept under quarantine/<id> when the worktree was removed:
-	// regular files only (dirent.isFile() is false for symlinks, so links drop out),
-	// sorted by name; [] when the folder is absent or unreadable.
-	const savedDirFiles = (dir: string): { name: string; size: number }[] => {
+	// Repo-relative files kept under quarantine/<id> when the worktree was removed.
+	// The walk anchors at the trusted data root and opens every component with
+	// O_NOFOLLOW (withDir), so a worker-planted link at the card folder or below lists
+	// nothing instead of the link target; sizes come from fd-based lstat, never
+	// following the entry itself. Regular files only; [] when absent or refused.
+	const savedDirFiles = (
+		anchor: string,
+		dirRel: string,
+	): { name: string; size: number }[] => {
 		const out: { name: string; size: number }[] = [];
-		const walk = (d: string, prefix: string) => {
-			let entries: Dirent[];
+		// confine's parts() resolves `dir` against the process cwd, so the walk passes
+		// absolute paths and keeps each one below the anchor itself.
+		const walk = (rel: string, prefix: string): void => {
+			const abs = resolve(anchor, rel);
+			if (relative(anchor, abs).startsWith(`..${sep}`)) return;
 			try {
-				entries = readdirSync(d, { withFileTypes: true });
-			} catch {
-				return;
-			}
-			for (const de of entries) {
-				const name = prefix ? `${prefix}/${de.name}` : de.name;
-				const child = join(d, de.name);
-				if (de.isDirectory()) walk(child, name);
-				else if (de.isFile()) {
-					try {
-						out.push({ name, size: statSync(child).size });
-					} catch {
-						// vanished between readdir and stat
+				withDir(anchor, abs, {}, (d) => {
+					for (const name of d.list()) {
+						const relName = prefix ? `${prefix}/${name}` : name;
+						let st: Stats;
+						try {
+							st = lstatSync(d.at(name));
+						} catch {
+							continue; // vanished between list and lstat
+						}
+						if (st.isDirectory()) walk(join(rel, name), relName);
+						else if (st.isFile()) out.push({ name: relName, size: st.size });
 					}
-				}
+				});
+			} catch {
+				// refused (a symlink at any component) or missing: nothing to list
 			}
 		};
-		walk(dir, "");
-		out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-		return out;
+		walk(dirRel, "");
+		return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 	};
 	async function handleGETProjectsTasksByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id">,
@@ -9599,10 +9621,14 @@ export function createApp(deps: AppDeps) {
 				: task.worktree === null
 					? []
 					: await statusFiles(task.worktree);
-		if (task.stage === "done")
-			view.savedFiles = savedDirFiles(
+		if (task.stage === "done") {
+			const rel = relative(
+				e.store.dataRoot,
 				join(e.store.tasksDir, "quarantine", task.id),
 			);
+			if (rel !== "" && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+				view.savedFiles = savedDirFiles(e.store.dataRoot, rel);
+		}
 		// Finished cards read the stat captured at merge start (the worktree and branch are
 		// gone); open cards read the branch live, uncommitted edits included. A merge-hold
 		// mismatch park also serves the stored stat: it is the push-side numstat the gate

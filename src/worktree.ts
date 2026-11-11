@@ -2848,20 +2848,33 @@ export async function quarantineUntracked(
  * `tooLarge`. A path that vanishes between status and save is skipped. A missing worktree
  * directory (a merged card keeps its worktree path after the directory is gone) saves
  * nothing. An untracked entry that is not a regular file (a nested repository, which git
- * lists as `dir/`) moves whole instead of stopping the save. Returns
- * { moved, copied, tooLarge } (repo-relative, forward slashes). Throws when git fails;
- * a symlinked parent on either side throws from the confine helpers.
+ * lists as `dir/`) moves whole when it can and lands in `failed` with a reason when it
+ * cannot (a directory cannot cross a mount point); a tracked gitlink (a submodule) is
+ * skipped — the submodule pins its own content. Either way the save continues, so
+ * entries after them are still saved. Returns
+ * { moved, copied, tooLarge, failed } (repo-relative, forward slashes). Throws when git
+ * fails; a symlinked parent on either side throws from the confine helpers.
  */
 export async function saveDoneFiles(
 	worktreePath: string,
 	saveDir: string,
 	dataRoot: string,
 	maxBytes: number,
-): Promise<{ moved: string[]; copied: string[]; tooLarge: string[] }> {
-	if (!existsSync(worktreePath)) return { moved: [], copied: [], tooLarge: [] };
+): Promise<{
+	moved: string[];
+	copied: string[];
+	tooLarge: string[];
+	failed: { path: string; reason: string }[];
+}> {
 	const moved: string[] = [];
 	const copied: string[] = [];
 	const tooLarge: string[] = [];
+	const failed: { path: string; reason: string }[] = [];
+	const fwd = (rel: string): string => rel.replaceAll("\\", "/");
+	const reason = (err: unknown): string =>
+		err instanceof Error ? err.message : String(err);
+	if (!existsSync(worktreePath))
+		return { moved: [], copied: [], tooLarge: [], failed: [] };
 	const anchor = trustedAnchor(worktreePath);
 
 	// Untracked files move; a symlink entry moves as a link, so readBelow's refusals are
@@ -2874,28 +2887,33 @@ export async function saveDoneFiles(
 	for (const rel of r.stdout.split("\0")) {
 		if (rel === "") continue;
 		let bytes: Buffer | null;
-		let isLink = false;
+		let moveAsIs = false;
 		try {
 			bytes = readBelow(anchor, path.join(worktreePath, rel), maxBytes);
 		} catch (err) {
 			const msg = String((err as Error)?.message ?? err);
 			if (msg.endsWith(`: larger than ${maxBytes} bytes`)) {
-				tooLarge.push(rel.replaceAll("\\", "/"));
+				tooLarge.push(fwd(rel));
 				continue;
 			}
 			if (msg.endsWith(": a symlink") || msg.endsWith(": not a regular file")) {
-				// A symlink moves as a link; a nested repository or FIFO moves whole.
-				// Neither stops the files that sort after it.
-				isLink = true;
+				// A symlink moves as a link; a nested repository moves whole.
+				moveAsIs = true;
 				bytes = null;
 			} else throw err;
 		}
-		if (bytes === null && !isLink) continue; // vanished between listing and reading
-		moveBelow(
-			{ anchor, file: path.join(worktreePath, rel) },
-			{ anchor: dataRoot, file: path.join(saveDir, rel) },
-		);
-		moved.push(rel.replaceAll("\\", "/"));
+		if (bytes === null && !moveAsIs) continue; // vanished between listing and reading
+		try {
+			moveBelow(
+				{ anchor, file: path.join(worktreePath, rel) },
+				{ anchor: dataRoot, file: path.join(saveDir, rel) },
+			);
+			moved.push(fwd(rel));
+		} catch (err) {
+			// A directory entry cannot cross a mount point (EXDEV's copy refuses
+			// non-regular entries): skip it, keep saving the rest, and name it.
+			failed.push({ path: fwd(rel), reason: reason(err) });
+		}
 	}
 
 	// Tracked files with content changes copy; they stay in the worktree until it goes away.
@@ -2917,23 +2935,24 @@ export async function saveDoneFiles(
 			const bytes = readBelow(anchor, path.join(worktreePath, rel), maxBytes);
 			if (bytes === null) continue;
 			writeBelow(dataRoot, path.join(saveDir, rel), bytes, "truncate");
-			copied.push(rel.replaceAll("\\", "/"));
+			copied.push(fwd(rel));
 		} catch (err) {
 			const msg = String((err as Error)?.message ?? err);
 			if (msg.endsWith(`: larger than ${maxBytes} bytes`)) {
-				tooLarge.push(rel.replaceAll("\\", "/"));
+				tooLarge.push(fwd(rel));
 				continue;
 			}
+			if (msg.endsWith(": not a regular file")) continue; // a gitlink (submodule)
 			if (!msg.endsWith(": a symlink")) throw err;
 			copyBelow(
 				{ anchor, file: path.join(worktreePath, rel) },
 				{ anchor: dataRoot, file: path.join(saveDir, rel) },
 				worktreePath,
 			);
-			copied.push(rel.replaceAll("\\", "/"));
+			copied.push(fwd(rel));
 		}
 	}
-	return { moved, copied, tooLarge };
+	return { moved, copied, tooLarge, failed };
 }
 
 /**

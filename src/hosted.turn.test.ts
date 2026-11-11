@@ -102,7 +102,12 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		unsavedWork: async () => null,
 		statusFiles: async () => [],
 		quarantineUntracked: async () => [],
-		saveDoneFiles: async () => ({ moved: [], copied: [], tooLarge: [] }),
+		saveDoneFiles: async () => ({
+			moved: [],
+			copied: [],
+			tooLarge: [],
+			failed: [],
+		}),
 		worktreeHusk: async () => false,
 		trackedFiles: async () => [],
 		worktreeLinked: async () => true,

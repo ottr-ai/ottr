@@ -5164,7 +5164,7 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 			"/nonexistent-ottr-826-store",
 			1024,
 		);
-		expect(r).toEqual({ moved: [], copied: [], tooLarge: [] });
+		expect(r).toEqual({ moved: [], copied: [], tooLarge: [], failed: [] });
 	});
 
 	test("moves an untracked nested repository whole and keeps saving after it", async () => {
@@ -5186,6 +5186,68 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		expect(r.moved).toContain("zzz.txt");
 		expect(existsSync(join(saveDir, "clone"))).toBe(true);
 		expect(readFileSync(join(saveDir, "zzz.txt"), "utf8")).toBe("after\n");
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
+
+	test("names an unmovable entry and keeps saving the entries after it", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		writeFileSync(join(wt, "aaa-conflict.txt"), "x\n");
+		writeFileSync(join(wt, "zzz.txt"), "after\n");
+		// A directory already sitting at the destination makes the move fail (rename
+		// cannot replace a directory with a file), the same failure EXDEV's copy path
+		// produces for a directory crossing mount points in compose.
+		mkdirSync(join(saveDir, "aaa-conflict.txt"), { recursive: true });
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		expect(r.failed).toHaveLength(1);
+		expect(r.failed[0]!.path).toBe("aaa-conflict.txt");
+		expect(r.failed[0]!.reason).not.toBe("");
+		expect(r.moved).toContain("zzz.txt");
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	});
+
+	test("skips a tracked submodule gitlink and keeps copying after it", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		const id = ["-c", "user.name=ott", "-c", "user.email=ott@example.invalid"];
+		const git = (cwd: string, args: string[]): void => {
+			const run = Bun.spawnSync([gitExe(), ...id, ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(run.exitCode).toBe(0);
+		};
+		// A real submodule: once the submodule's HEAD moves past the recorded
+		// gitlink, status answers " M sub" and the entry is a directory, not a
+		// regular file. The save must skip it and still copy what sorts after it.
+		mkdirSync(join(wt, "child"));
+		git(join(wt, "child"), ["init", "-q", "-b", "main"]);
+		writeFileSync(join(wt, "child", "c.txt"), "c\n");
+		git(join(wt, "child"), ["add", "c.txt"]);
+		git(join(wt, "child"), ["commit", "-qm", "c1"]);
+		git(wt, [
+			"-c",
+			"protocol.file.allow=always",
+			"submodule",
+			"add",
+			"./child",
+			"sub",
+		]);
+		git(wt, ["commit", "-qm", "sub"]);
+		writeFileSync(join(wt, "child", "c2.txt"), "c2\n");
+		git(join(wt, "child"), ["add", "c2.txt"]);
+		git(join(wt, "child"), ["commit", "-qm", "c2"]);
+		writeFileSync(join(wt, "tracked.txt"), "modified\n");
+		writeFileSync(join(wt, "zz-mod.txt"), "zz\n");
+		git(wt, ["add", "zz-mod.txt"]);
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		expect(r.copied).toContain("tracked.txt");
+		expect(r.copied).toContain("zz-mod.txt");
+		expect(r.copied).not.toContain("sub");
+		expect(r.failed).toEqual([]);
 		rmSync(join(wt, ".."), { recursive: true, force: true });
 	});
 

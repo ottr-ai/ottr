@@ -267,7 +267,12 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			record.quarantine.push({ worktreePath, quarantineDir });
 			return [];
 		},
-		saveDoneFiles: async () => ({ moved: [], copied: [], tooLarge: [] }),
+		saveDoneFiles: async () => ({
+			moved: [],
+			copied: [],
+			tooLarge: [],
+			failed: [],
+		}),
 		worktreeHusk: async () => false,
 		trackedFiles: async () => [],
 		worktreeLinked: async () => true,
@@ -6232,7 +6237,12 @@ describe("turn research cards", () => {
 				},
 				saveDoneFiles: async (wt, dir, root, max) => {
 					saved.push({ wt, dir, root, max });
-					return { moved: ["mockup.html"], copied: [], tooLarge: ["big.bin"] };
+					return {
+						moved: ["mockup.html"],
+						copied: [],
+						tooLarge: ["big.bin"],
+						failed: [{ path: "dir/clone", reason: "cross-device" }],
+					};
 				},
 			}),
 		);
@@ -6253,6 +6263,7 @@ describe("turn research cards", () => {
 			`saved 1 file(s) to .tasks/quarantine/${after.id}: mockup.html`,
 		);
 		expect(log).toContain("big.bin: too large, not kept");
+		expect(log).toContain("dir/clone: not kept (cross-device)");
 	});
 
 	test("done settle runs the real saveDoneFiles: untracked files land in quarantine", async () => {

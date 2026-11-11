@@ -34,10 +34,14 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   - A missing worktree directory (a merged card keeps its worktree path after the
     directory is gone) saves nothing and returns empty — no failure log.
   - An untracked entry that is not a regular file (a nested repository, which git lists
-    as `dir/`; git never lists FIFOs or sockets) moves whole instead of stopping the
-    save, so entries that sort after it are still saved.
+    as `dir/`; git never lists FIFOs or sockets) moves whole when the move succeeds and
+    lands in `failed` with a reason when it cannot (a directory cannot cross a mount
+    point: compose keeps the worktree on `/workspace` and the save folder on `/data`).
+    A tracked gitlink (a submodule) is skipped — the submodule pins its own content.
+    Either way the save continues, so entries after them are still saved.
   - Vanished paths (deleted between status and save) are skipped.
-  - Returns `{ moved, copied, tooLarge }` (repo-relative, forward slashes).
+  - Returns `{ moved, copied, tooLarge, failed }` (repo-relative, forward slashes);
+    the caller logs each `failed` entry as `<path>: not kept (<reason>)`.
 - `removeDoneWorktree` logs, mirroring `quarantineUntrackedFiles`' style, and never lets a
   save failure block the removal:
   - `saved <n> file(s) to .tasks/quarantine/<id>: <up to 20 names>` (n = moved + copied)
@@ -57,7 +61,9 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   from `quarantine/<id>` with the exact header pattern of the existing
   `tasks/:id/files` route: `Content-Security-Policy: sandbox allow-scripts`,
   `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Connection: close`,
-  `Content-Type: Bun.file type || application/octet-stream`.
+  `Content-Type: Bun.file type || application/octet-stream`. The read anchors at the
+  trusted `dataRoot` (a mount point no worker can replace), so a worker-planted symlink
+  at the card folder or below is refused with the rest.
 - Refusals: empty `path`, `..` segments (either separator), absolute paths → 400
   `{"error":"bad path"}`; resolved path leaving the card's folder → 400; a symlink at
   ANY path component, a non-regular entry, or an over-cap file (readBelow's O_NOFOLLOW
@@ -70,6 +76,9 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   `task.savedFiles?.length`, for research and work cards alike. Each entry: download link
   to the saved-files route (`target="_blank"`) with name and human-readable size
   (new `fmtBytes`: B / kB / MB), capped at 50 rows + "…and N more" like Worktree files.
+  The listing walks `quarantine/<id>` through the same trusted-anchor confinement
+  (`withDir`, per-component O_NOFOLLOW, fd-based lstat): a worker-planted symlink at the
+  card folder or below lists nothing instead of the link target.
 - The done-card hint of "Worktree files" changes from "only the names remain" to point at
   Saved files when a saved list exists.
 

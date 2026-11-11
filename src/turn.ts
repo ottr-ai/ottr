@@ -8920,6 +8920,8 @@ export function createTurnLoop(
 				);
 			for (const f of r.tooLarge)
 				appendLog(st.store, st.id, `${f}: too large, not kept`);
+			for (const f of r.failed)
+				appendLog(st.store, st.id, `${f.path}: not kept (${f.reason})`);
 		} catch (err) {
 			appendLog(st.store, st.id, `saving done files failed: ${errmsg(err)}`);
 		}
