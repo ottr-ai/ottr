@@ -1910,6 +1910,59 @@ describe("settings routes", () => {
 				else process.env.GIT_CONFIG_NOSYSTEM = oldNoSystem;
 			}
 		});
+
+		test("the git-init commit pins the Settings identity over the passwd fallback", async () => {
+			// EMAIL makes git's own identity fallback succeed on every host (author
+			// "root <EMAIL>"), so the failure-triggered retry never ran and the bare
+			// commit buried the Settings identity (OTTR-829). With both config scopes
+			// pinned empty, the commit must pin the Settings ident env instead.
+			const emptyConfig = join(root, `empty-gitconfig-${Date.now()}-pw`);
+			writeFileSync(emptyConfig, "");
+			const saved: Record<string, string | undefined> = {};
+			for (const k of [
+				"EMAIL",
+				"GIT_CONFIG_GLOBAL",
+				"GIT_CONFIG_SYSTEM",
+				"GIT_AUTHOR_NAME",
+				"GIT_AUTHOR_EMAIL",
+				"GIT_COMMITTER_NAME",
+				"GIT_COMMITTER_EMAIL",
+			])
+				saved[k] = process.env[k];
+			process.env.GIT_CONFIG_GLOBAL = emptyConfig;
+			process.env.GIT_CONFIG_SYSTEM = emptyConfig;
+			process.env.EMAIL = "root@passwd.invalid";
+			for (const k of [
+				"GIT_AUTHOR_NAME",
+				"GIT_AUTHOR_EMAIL",
+				"GIT_COMMITTER_NAME",
+				"GIT_COMMITTER_EMAIL",
+			])
+				delete process.env[k];
+			try {
+				const dir = join(root, `identity-proj-${Date.now()}-pw`);
+				mkdirSync(dir, { recursive: true });
+				const m = mount({ projects: new Map(), defaultDir: dir });
+				const set = await m.call("/api/settings", {
+					commitName: "Ada",
+					commitEmail: "ada@example.invalid",
+				});
+				expect(set.status).toBe(200);
+				const add = await m.call("/api/projects", { name: "identity-proj" });
+				expect(add.status).toBe(200);
+				const log = execSync("git log -1 --format=%an%n%ae", {
+					cwd: join(dir, "identity-proj"),
+				})
+					.toString()
+					.trim();
+				expect(log).toBe("Ada\nada@example.invalid");
+			} finally {
+				for (const [k, v] of Object.entries(saved)) {
+					if (v === undefined) delete process.env[k];
+					else process.env[k] = v;
+				}
+			}
+		});
 	});
 
 	test("trendingStatus reads the stored scan state; a malformed one reads as empty", async () => {
