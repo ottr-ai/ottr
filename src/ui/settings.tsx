@@ -7344,7 +7344,8 @@ const pickActiveToc = (
 	setActive(cur);
 };
 
-/** The machine-wide settings groups: Board, Access, Git and secrets, Agents. A group
+/** The machine-wide settings groups: Board, Agents, Workflow, Agent environment, Git and
+ *  integrations, Access and usage. A group
  *  renders only while the TOC keeps it; hosted mode drops a group with no card left. */
 function GeneralSettingsContent({
 	map,
