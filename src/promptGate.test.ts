@@ -1,17 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import { DEEPEN_POINTS, gatePrompt, gateSystem } from "./prompts.ts";
 import {
 	gateAskQuestions,
 	gateCompareText,
 	gateEffectiveText,
 	gateFingerprint,
+	gateUserText,
 	hasOpenQuestionsSection,
+	isStartAnywayReply,
 	missingCheckQuestion,
 	openQuestionsLines,
 	parseGateCheck,
 	START_ANYWAY,
 	startAnywayQuestion,
 } from "./promptGate.ts";
+import { DEEPEN_POINTS, gatePrompt, gateSystem } from "./prompts.ts";
 
 /** A minimal valid gate answer. */
 function validRaw(overrides: Record<string, unknown> = {}): string {
@@ -34,11 +36,43 @@ describe("gateEffectiveText", () => {
 	});
 });
 
+describe("gateUserText", () => {
+	test("joins seen and pending; the Resume marker is not user text; null when both are null", () => {
+		expect(gateUserText("new", "old")).toBe("old\n\nnew");
+		expect(gateUserText("new", null)).toBe("new");
+		expect(gateUserText(null, "old")).toBe("old");
+		expect(gateUserText(".", "old")).toBe("old");
+		expect(gateUserText(".", null)).toBeNull();
+		expect(gateUserText(null, null)).toBeNull();
+	});
+});
+
 describe("gateCompareText", () => {
-	test("pending wins; a consumed reply compares through seen", () => {
-		expect(gateCompareText("p", "pending", "seen")).toBe("p\n\npending");
+	test("a queued answer compares on top of seen; a consumed reply compares through seen", () => {
+		expect(gateCompareText("p", "pending", "seen")).toBe(
+			"p\n\nseen\n\npending",
+		);
 		expect(gateCompareText("p", null, "seen")).toBe("p\n\nseen");
 		expect(gateCompareText("p", null, null)).toBe("p");
+	});
+	test("a queued answer compares on top of the answers already seen", () => {
+		expect(gateCompareText("p", "new answers", "old answers")).toBe(
+			"p\n\nold answers\n\nnew answers",
+		);
+	});
+});
+
+describe("isStartAnywayReply", () => {
+	test("exact marker and composed ask-format lines; a real answer line is a normal reply", () => {
+		const q = startAnywayQuestion();
+		expect(isStartAnywayReply(START_ANYWAY)).toBe(true);
+		expect(isStartAnywayReply(`  ${START_ANYWAY}  `)).toBe(true);
+		expect(isStartAnywayReply(`For "${q.question}": Start anyway`)).toBe(true);
+		expect(isStartAnywayReply("")).toBe(false);
+		expect(isStartAnywayReply("Start anyway please")).toBe(false);
+		expect(
+			isStartAnywayReply(`use SQLite\n\nFor "${q.question}": Start anyway`),
+		).toBe(false);
 	});
 });
 
@@ -132,8 +166,14 @@ describe("open questions section", () => {
 			"## Notes",
 			"later",
 		].join("\n");
-		expect(openQuestionsLines(text)).toEqual(["Which database?", "Which port?"]);
-		const many = ["**Open questions**", ...Array.from({ length: 7 }, (_, i) => `q${i}`)];
+		expect(openQuestionsLines(text)).toEqual([
+			"Which database?",
+			"Which port?",
+		]);
+		const many = [
+			"**Open questions**",
+			...Array.from({ length: 7 }, (_, i) => `q${i}`),
+		];
 		expect(openQuestionsLines(many.join("\n"))).toHaveLength(5);
 	});
 });
@@ -142,9 +182,7 @@ describe("ask mapping", () => {
 	test("questions map to single-choice asks with no recommendation", () => {
 		const check = parseGateCheck(
 			validRaw({
-				questions: [
-					{ question: "Which db?", options: ["sqlite", "postgres"] },
-				],
+				questions: [{ question: "Which db?", options: ["sqlite", "postgres"] }],
 			}),
 		);
 		const asked = gateAskQuestions(check);

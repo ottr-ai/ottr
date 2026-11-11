@@ -5177,7 +5177,9 @@ describe("gate column", () => {
 		again.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const cols = raw
-			.query<{ name: string }, []>("SELECT name FROM pragma_table_info('tasks')")
+			.query<{ name: string }, []>(
+				"SELECT name FROM pragma_table_info('tasks')",
+			)
 			.all()
 			.map((c) => c.name);
 		raw.close();

@@ -59,6 +59,11 @@ import type { OmpStats, OmpStatsAnswer, OmpUsageTotals } from "./ompStats.ts";
 import type { DashboardState, OmpStatsDashboard } from "./ompStatsDashboard.ts";
 import { summarizeCmd } from "./orphans.ts";
 import {
+	gateCompareText,
+	gateFingerprint,
+	startAnywayQuestion,
+} from "./promptGate.ts";
+import {
 	ARCH_REVIEW_MARKER,
 	BOARD_CHECK_PROMPT,
 	FORK_PROPOSED_REASON_PREFIX,
@@ -70,7 +75,6 @@ import {
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
 import { PR_GATES } from "./prs.ts";
-import { gateCompareText, gateFingerprint } from "./promptGate.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	archReviewDue,
@@ -292,11 +296,7 @@ let deepenImpl: (prompt: string, model: string | null) => Promise<string> =
 	};
 // Deepen check seam: the route tests swap deepenCheckImpl per test; unstubbed calls fail loudly.
 let deepenCheckImpl:
-	| ((
-			draft: string,
-			rewrite: string,
-			model: string | null,
-	  ) => Promise<unknown>)
+	| ((draft: string, rewrite: string, model: string | null) => Promise<unknown>)
 	| null = null;
 // Live progress the /api/state silent tests set ({ text, at }); null is the default:
 // no progress at all, the log-only warning rule.
@@ -3817,8 +3817,21 @@ describe("alate routes", () => {
 			p1.store.updateTask(parked.id, {
 				needsReason: "Prompt gate: 2 open questions",
 				state: "needs_you",
-				asked: [{ question: "Which store?", options: [{ label: "SQLite" }], multi: false, recommended: null }],
-				gate: { hash: null, seen: null, fails: 2, sig: "Which store?", parked: true },
+				asked: [
+					{
+						question: "Which store?",
+						options: [{ label: "SQLite" }],
+						multi: false,
+						recommended: null,
+					},
+				],
+				gate: {
+					hash: null,
+					seen: null,
+					fails: 2,
+					sig: "Which store?",
+					parked: true,
+				},
 			});
 			const res = await post(`/api/projects/p1/tasks/${parked.id}/reply`, {
 				text: "Start anyway",
@@ -3837,12 +3850,46 @@ describe("alate routes", () => {
 				parked: false,
 			});
 			expect(started.pendingPrompt).toBeNull();
+			// A parked gate with a queued answer: the Start anyway hash covers the pending text
+			// and the answer folds into seen, so the skip survives the run consuming the reply.
+			const steered = p1.store.createTask("gate park with answer");
+			p1.store.updateTask(steered.id, {
+				needsReason: "Prompt gate: 2 open questions",
+				state: "needs_you",
+				pendingPrompt: "use Postgres",
+				gate: {
+					hash: null,
+					seen: null,
+					fails: 1,
+					sig: "Which store?",
+					parked: true,
+				},
+			});
+			const sres = await post(`/api/projects/p1/tasks/${steered.id}/reply`, {
+				text: "Start anyway",
+			});
+			expect(sres.status).toBe(200);
+			const steeredDone = p1.store.getTask(steered.id)!;
+			expect(steeredDone.gate?.hash).toBe(
+				gateFingerprint(gateCompareText(steered.prompt, "use Postgres", null)),
+			);
+			expect(steeredDone.gate?.seen).toBe("use Postgres");
+			p1.store.updateTask(steered.id, { pendingPrompt: null });
+			expect(p1.store.getTask(steered.id)!.gate?.hash).toBe(
+				gateFingerprint(gateCompareText(steered.prompt, null, "use Postgres")),
+			);
 			// A real answer keeps the normal reply path: queued under the park, gate still parked.
 			const answered = p1.store.createTask("gate park");
 			p1.store.updateTask(answered.id, {
 				needsReason: "Prompt gate: 2 open questions",
 				state: "needs_you",
-				gate: { hash: null, seen: null, fails: 1, sig: "Which store?", parked: true },
+				gate: {
+					hash: null,
+					seen: null,
+					fails: 1,
+					sig: "Which store?",
+					parked: true,
+				},
 			});
 			const ares = await post(`/api/projects/p1/tasks/${answered.id}/reply`, {
 				text: "use SQLite",
@@ -3865,6 +3912,59 @@ describe("alate routes", () => {
 			const plained = p1.store.getTask(plain.id)!;
 			expect(plained.pendingPrompt).toBe("Start anyway");
 			expect(plained.gate).toBeNull();
+		});
+
+		test("the composed ask-format Start-anyway line approves a gate park; a mixed reply does not", async () => {
+			const p1 = projects.get("p1")!;
+			const q = startAnywayQuestion();
+			const parked = p1.store.createTask("gate park composed");
+			p1.store.updateTask(parked.id, {
+				needsReason: "Prompt gate: the gate still has open questions",
+				state: "needs_you",
+				asked: [q],
+				gate: {
+					hash: null,
+					seen: null,
+					fails: 3,
+					sig: "Which store?",
+					parked: true,
+				},
+			});
+			const res = await post(`/api/projects/p1/tasks/${parked.id}/reply`, {
+				text: `For "${q.question}": Start anyway`,
+			});
+			expect(res.status).toBe(200);
+			const started = p1.store.getTask(parked.id)!;
+			expect(started.state).toBe("queued");
+			expect(started.asked).toBeNull();
+			expect(started.gate?.parked).toBe(false);
+			expect(started.gate?.hash).not.toBeNull();
+			// A real answer line plus the start-anyway line is a normal reply: it queues
+			// under the park with both lines, and the gate stays parked.
+			const mixed = p1.store.createTask("gate park mixed");
+			p1.store.updateTask(mixed.id, {
+				needsReason: "Prompt gate: the gate still has open questions",
+				state: "needs_you",
+				asked: [q],
+				gate: {
+					hash: null,
+					seen: null,
+					fails: 3,
+					sig: "Which store?",
+					parked: true,
+				},
+			});
+			const mres = await post(`/api/projects/p1/tasks/${mixed.id}/reply`, {
+				text: `use SQLite\n\nFor "${q.question}": Start anyway`,
+			});
+			expect(mres.status).toBe(200);
+			const revised = p1.store.getTask(mixed.id)!;
+			expect(revised.state).toBe("queued");
+			expect(revised.pendingPrompt).toBe(
+				`use SQLite\n\nFor "${q.question}": Start anyway`,
+			);
+			expect(revised.gate?.parked).toBe(true);
+			expect(revised.gate?.hash).toBeNull();
 		});
 
 		test("a reply on a parked merge-mismatch card approves the parked push head", async () => {

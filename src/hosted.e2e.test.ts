@@ -30,10 +30,10 @@ import {
 	readHostedConfig,
 	type TokenUsage,
 } from "./hosted.ts";
+import { DEEPEN_POINTS } from "./prompts.ts";
 import { type RunLauncher, startRun } from "./runner.ts";
 import { checkRoleFor } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
-import { DEEPEN_POINTS } from "./prompts.ts";
 import { createTurnLoop, type TurnLoop, type TurnOps } from "./turn.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {

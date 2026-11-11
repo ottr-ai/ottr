@@ -26,15 +26,17 @@ import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
 import { GlobalStore } from "./globalStore.ts";
-import { DEEPEN_POINTS } from "./prompts.ts";
 import {
+	type GateCheck,
+	gateCompareText,
 	gateFingerprint,
 	START_ANYWAY,
-	type GateCheck,
+	startAnywayQuestion,
 } from "./promptGate.ts";
 import {
 	ARCH_REVIEW_MARKER,
 	BOARD_CHECK_PROMPT,
+	DEEPEN_POINTS,
 	DEP_HELD_PROMPT,
 	followUpPrompt,
 	LOST_SESSION,
@@ -22460,7 +22462,9 @@ describe("prompt gate", () => {
 
 		const after = store.getTask(task.id)!;
 		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toBe("Prompt gate: the gate still has open questions");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the gate still has open questions",
+		);
 		expect(after.asked).toEqual([
 			{
 				question: "Which database?",
@@ -22583,6 +22587,124 @@ describe("prompt gate", () => {
 		expect(record.runs).toHaveLength(1);
 		const after = store.getTask(task.id)!;
 		expect(after.gate?.parked).toBe(false);
+	});
+
+	test("a pass folds the queued answer into seen and keeps earlier answers", async () => {
+		let calls = 0;
+		let userMessages: string | null | undefined;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				calls += 1;
+				userMessages = o.userMessages;
+				return clearCheck();
+			},
+		});
+		const task = store.createTask("clear work");
+		store.updateTask(task.id, {
+			pendingPrompt: "new answers",
+			gate: {
+				hash: null,
+				seen: "old answers",
+				fails: 0,
+				sig: null,
+				parked: false,
+			},
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(calls).toBe(1);
+		expect(record.runs).toHaveLength(1);
+		// The gate model sees the answers from earlier rounds too.
+		expect(userMessages).toBe("old answers\n\nnew answers");
+		expect(after.gate?.seen).toBe("old answers\n\nnew answers");
+		expect(after.gate?.hash).toBe(
+			gateFingerprint("clear work\n\nold answers\n\nnew answers"),
+		);
+	});
+
+	test("a Start-anyway approval still matches after the run consumes the queued answer", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = store.createTask("approved with answer");
+		// Simulate a Start anyway given while "use Postgres" was queued: the hash covers
+		// prompt + pending and the answer sat in seen.
+		store.updateTask(task.id, {
+			pendingPrompt: "use Postgres",
+			gate: {
+				hash: gateFingerprint(
+					gateCompareText(task.prompt, "use Postgres", null),
+				),
+				seen: "use Postgres",
+				fails: 0,
+				sig: null,
+				parked: false,
+			},
+		});
+		// The run consumes the queued answer.
+		store.updateTask(task.id, { pendingPrompt: null });
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(calls).toBe(0);
+		expect(record.runs).toHaveLength(1);
+		expect(store.getTask(task.id)!.gate?.parked).toBe(false);
+	});
+
+	test("the third identical park carries only the Start-anyway question", async () => {
+		let calls = 0;
+		const check: GateCheck = {
+			builds: "a small service",
+			checks: "run the test suite",
+			points: DEEPEN_POINTS.map(() => ({
+				covered: true,
+				reason: "covered",
+			})),
+			questions: ["a?", "b?", "c?", "d?", "e?"].map((question) => ({
+				question,
+				options: ["yes", "no"],
+			})),
+		};
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return check;
+			},
+		});
+		const task = store.createTask("stubborn gate");
+
+		await loop.runTurn(store.name, task.id);
+		store.updateTask(task.id, { state: "queued" });
+		await loop.runTurn(store.name, task.id);
+
+		const second = store.getTask(task.id)!;
+		expect(second.gate?.fails).toBe(2);
+		expect(second.asked).toHaveLength(5);
+		expect(second.asked!.slice(0, 4).map((q) => q.question)).toEqual([
+			"a?",
+			"b?",
+			"c?",
+			"d?",
+		]);
+		expect(second.asked!.at(-1)).toEqual(startAnywayQuestion());
+
+		store.updateTask(task.id, { state: "queued" });
+		await loop.runTurn(store.name, task.id);
+
+		const third = store.getTask(task.id)!;
+		expect(third.state).toBe("needs_you");
+		expect(third.gate?.fails).toBe(3);
+		expect(third.asked).toEqual([startAnywayQuestion()]);
+		expect(calls).toBe(3);
 	});
 
 	test("merge-kind and retro turns skip the gate", async () => {

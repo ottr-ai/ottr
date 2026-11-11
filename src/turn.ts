@@ -38,10 +38,23 @@ import {
 } from "./images.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
 import { modelList, modelRoles } from "./models.ts";
+import type { GateCheck } from "./promptGate.ts";
 import {
+	GATE_REASON,
+	gateAskQuestions,
+	gateCompareText,
+	gateFingerprint,
+	gateUserText,
+	hasOpenQuestionsSection,
+	missingCheckQuestion,
+	openQuestionsLines,
+	promptGateCheck,
+	startAnywayQuestion,
+} from "./promptGate.ts";
+import {
+	DEEPEN_POINTS,
 	DEP_HELD_PROMPT,
 	depResumePrompt,
-	DEEPEN_POINTS,
 	followUpPrompt,
 	grillPrompt,
 	handoffMarkdown,
@@ -62,17 +75,6 @@ import {
 } from "./prompts.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
-import {
-	GATE_REASON,
-	gateAskQuestions,
-	gateCompareText,
-	gateFingerprint,
-	hasOpenQuestionsSection,
-	missingCheckQuestion,
-	openQuestionsLines,
-	promptGateCheck,
-	startAnywayQuestion,
-} from "./promptGate.ts";
 import { usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
 import { hostedGh, ownerRepo } from "./release.ts";
@@ -134,11 +136,9 @@ import {
 	type TaskPatch,
 } from "./store.ts";
 import { progressKey } from "./stryker.ts";
-import type { GateCheck } from "./promptGate.ts";
 import type {
 	ArchReview,
 	AskQuestion,
-	PromptGateState,
 	DiffFileStat,
 	GitFacts,
 	LatestImage,
@@ -147,6 +147,7 @@ import type {
 	OpenPrsView,
 	Outcome,
 	ProjectSettings,
+	PromptGateState,
 	QuotaState,
 	RecordedFinding,
 	RunResult,
@@ -3186,8 +3187,7 @@ export function createTurnLoop(
 			const flags = turnIdentityFlags(store, id, task);
 			const idn = await resolveTurnIdentity(store, id, task, key, flags, log);
 			if (idn === null) return;
-			if (!(await promptGateTurnStart(store, id, task, kind, idn, log)))
-				return;
+			if (!(await promptGateTurnStart(store, id, task, kind, idn, log))) return;
 			const loc = await prepareTurnWorktree(
 				e,
 				store,
@@ -3674,13 +3674,20 @@ export function createTurnLoop(
 				: null;
 		const seen = live.gate?.seen ?? null;
 		// Skip rule: the gate passed for exactly this compared text.
-		if (live.gate?.hash === gateFingerprint(gateCompareText(live.prompt, pending, seen))) {
+		if (
+			live.gate?.hash ===
+			gateFingerprint(gateCompareText(live.prompt, pending, seen))
+		) {
 			log("+ prompt gate: passed earlier for this text");
 			return true;
 		}
 		// Deterministic park: the Deepen rewrite left an Open questions section and no user
 		// answers exist yet. No model call; the section's lines become the ask questions.
-		if (pending === null && seen === null && hasOpenQuestionsSection(live.prompt)) {
+		if (
+			pending === null &&
+			seen === null &&
+			hasOpenQuestionsSection(live.prompt)
+		) {
 			const lines = openQuestionsLines(live.prompt);
 			const asked = lines.map((question) => ({
 				question,
@@ -3709,7 +3716,7 @@ export function createTurnLoop(
 			try {
 				check = await (ops.gateCheck ?? promptGateCheck)({
 					prompt: live.prompt,
-					userMessages: pending ?? seen,
+					userMessages: gateUserText(pending, seen),
 				});
 				err = null;
 				break;
@@ -3753,7 +3760,7 @@ export function createTurnLoop(
 			store.updateTask(id, {
 				gate: {
 					hash: gateFingerprint(gateCompareText(live.prompt, pending, seen)),
-					seen: pending ?? seen,
+					seen: gateUserText(pending, seen),
 					fails: 0,
 					sig: null,
 					parked: false,
@@ -3767,13 +3774,12 @@ export function createTurnLoop(
 		const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
 		let asked = modelQs;
 		if (missing) asked = [...asked, missingCheckQuestion()];
-		if (fails >= 3 && live.gate?.sig === sig)
-			asked = [startAnywayQuestion()];
-		else if (fails >= 2)
-			asked = [...asked.slice(0, 4), startAnywayQuestion()];
-		const cause = missing && modelQs.length === 0
-			? "the prompt names no outside check"
-			: "the gate still has open questions";
+		if (fails >= 3 && live.gate?.sig === sig) asked = [startAnywayQuestion()];
+		else if (fails >= 2) asked = [...asked.slice(0, 4), startAnywayQuestion()];
+		const cause =
+			missing && modelQs.length === 0
+				? "the prompt names no outside check"
+				: "the gate still has open questions";
 		parkGate(
 			store,
 			id,

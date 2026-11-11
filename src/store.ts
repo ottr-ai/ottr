@@ -49,6 +49,7 @@ import type {
 	ListedTask,
 	OutcomeStatus,
 	ProjectSettings,
+	PromptGateState,
 	ProposalSummary,
 	PrReviewRow,
 	PrState,
@@ -63,7 +64,6 @@ import type {
 	TurnKind,
 	WorkCheckBlocker,
 	WorkCheckRun,
-	PromptGateState,
 } from "./types.ts";
 import { askQuestions, PR_REVIEW_WAITING } from "./types.ts";
 

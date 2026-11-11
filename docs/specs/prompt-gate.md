@@ -198,7 +198,7 @@ reader and `updateTask` (stringify object, null clears).
 export interface PromptGateState {
   /** sha256 hex of the compared effective text this gate passed (or the user started anyway); null = never passed. */
   hash: string | null;
-  /** The user text the gate last saw (a reply the run has since consumed); keeps the skip rule stable across consumption. */
+  /** Every user text the gate has seen so far, "\n\n"-joined; each pass and each Start anyway appends the newest queued text (a "." marker never counts). Keeps the skip rule stable across consumption and never drops earlier answers. */
   seen: string | null;
   /** Consecutive failed gate evaluations with the same failure signature. */
   fails: number;
@@ -215,12 +215,19 @@ export interface PromptGateState {
 ### Fingerprint and skip rule (`src/promptGate.ts`, new module)
 
 - `gateEffectiveText(prompt, pending)` — the effective text above.
-- `gateCompareText(prompt, pending, seen)` — `prompt + (pending ?? seen ??
-  "")` with the same separator; consumed replies compare through `seen`.
+- `gateUserText(pending, seen)` — the accumulated user text: the non-null
+  values of `seen` and `pending` (a pending of `"."` counts as null) joined
+  with `"\n\n"`; null when both are null. Earlier answers are never dropped:
+  a pass or Start anyway folds the newest queued text into `seen`.
+- `gateCompareText(prompt, pending, seen)` — `gateEffectiveText(prompt,
+  gateUserText(pending, seen))`; consumed replies compare through `seen`.
 - `gateFingerprint(text)` — sha256 hex.
 - Skip the gate exactly when `gate.hash === gateFingerprint(gateCompareText(...))`.
   A prompt edit changes the hash; a queued reply/steer changes the text; a
   consumed reply matches through `seen`. No `pendingRecheck` flag.
+- The model's `userMessages` input is `gateUserText(pending, seen)` — the same
+  accumulated text the fingerprint covers, so answers from earlier rounds stay
+  in view and the gate cannot re-ask them.
 
 ### Scope (`gateApplies`)
 
@@ -271,8 +278,8 @@ logs under it. Parked gate turns write no turn row (rows appear at startRun).
 - **Pass** (no questions AND point 5 "outside check" `covered === true`):
   log the restatement (`+ prompt gate: would build: ...`, `+ prompt gate:
   check: ...`, one line per missing point or `all five points covered`), then
-  write `gate: { hash, seen: pending ?? gate.seen, fails: 0, sig: null,
-  parked: false }` and start the turn as today.
+  write `gate: { hash, seen: gateUserText(pending, gate.seen), fails: 0,
+  sig: null, parked: false }` and start the turn as today.
 - **Open questions or missing outside check**: park `preparing -> needs_you`
   with `needsReason: "Prompt gate: <short cause>"`, `asked` = the model's
   questions mapped to `AskQuestion` (max 5 questions, max 5 options each,
@@ -303,13 +310,24 @@ logs under it. Parked gate turns write no turn row (rows appear at startRun).
 ### Start anyway (`src/app.ts` reply route)
 
 Before `replyPatch`, a handler modeled on `workCheckAskReply`: when
-`task.gate?.parked === true && trimmed === "Start anyway"` (no images), write
-`gate: { hash: gateFingerprint(gateCompareText(task.prompt, null, task.gate.seen)),
-seen: task.gate.seen, fails: 0, sig: null, parked: false }`, `state: "queued"`,
-`queuedAt`, `needsReason: null`, `asked: null`, then `schedule()`. The next
-start skips the gate (hash matches). Any other reply falls through to the
-normal queue; the gate re-runs on the next start (the reply text is in the
-effective prompt).
+`task.gate?.parked === true` (no images) and the reply is a start-anyway
+reply, write `gate: { hash: gateFingerprint(gateCompareText(task.prompt,
+task.pendingPrompt, task.gate.seen)), seen: gateUserText(task.pendingPrompt,
+task.gate.seen), fails: 0, sig: null, parked: false }`, `state: "queued"`,
+`queuedAt`, `needsReason: null`, `asked: null`, then `schedule()`. Because the
+stored `seen` accumulates the pending text, the approval holds after the run
+consumes the text: a later start compares `prompt + seen` against the stored
+hash and skips the gate. A start-anyway reply is:
+
+- the exact trimmed text `Start anyway`, or
+- a reply whose every non-empty line matches the ask panel's answer format
+  `For "<question>": <answer>` with the start-anyway question as the question
+  and `Start anyway` as the answer (`isStartAnywayReply` in
+  `src/promptGate.ts`), so a click on the offered ask option routes the same
+  way as the drawer button.
+
+Any other reply falls through to the normal queue; the gate re-runs on the
+next start (the reply text rides the accumulated user text).
 
 ### UI (`src/ui/app.tsx`)
 

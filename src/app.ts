@@ -59,7 +59,7 @@ import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
 import { openRegular, unlinkBelow, writeBelow } from "./confine.ts";
 import { logError } from "./crash.ts";
-import { checkDeepened, deepenDraft, type DeepenCheck } from "./deepen.ts";
+import { checkDeepened, type DeepenCheck, deepenDraft } from "./deepen.ts";
 import { errmsg, requestFailed } from "./errmsg.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
@@ -227,6 +227,12 @@ import {
 } from "./prInline.ts";
 import { mergeProjectOrder, rankInOrder } from "./projectOrder.ts";
 import {
+	gateCompareText,
+	gateFingerprint,
+	gateUserText,
+	isStartAnywayReply,
+} from "./promptGate.ts";
+import {
 	BOARD_CHECK_PROMPT,
 	followUpPrompt,
 	handoffMarkdown,
@@ -240,11 +246,6 @@ import {
 	workCheckSendBackDirection,
 } from "./prompts.ts";
 import { createPrWatcher, PR_GATES, prUrl } from "./prs.ts";
-import {
-	gateCompareText,
-	gateFingerprint,
-	START_ANYWAY,
-} from "./promptGate.ts";
 import { requirementsListPath } from "./python.ts";
 import { fetchQuota, forProvider, providerBlocked } from "./quota.ts";
 import {
@@ -9236,7 +9237,7 @@ export function createApp(deps: AppDeps) {
 		hasImages: boolean,
 	): Response | null {
 		const gate = task.gate;
-		if (gate?.parked !== true || trimmed !== START_ANYWAY || hasImages)
+		if (gate?.parked !== true || !isStartAnywayReply(trimmed) || hasImages)
 			return null;
 		e.store.updateTask(task.id, {
 			state: "queued",
@@ -9247,7 +9248,7 @@ export function createApp(deps: AppDeps) {
 				hash: gateFingerprint(
 					gateCompareText(task.prompt, task.pendingPrompt, gate.seen),
 				),
-				seen: gate.seen,
+				seen: gateUserText(task.pendingPrompt, gate.seen),
 				fails: 0,
 				sig: null,
 				parked: false,

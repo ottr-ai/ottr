@@ -26,13 +26,26 @@ export function gateEffectiveText(
 	return `${prompt}\n\n${pending}`;
 }
 
-/** The text a gate fingerprint compares: consumed replies compare through `seen`. */
+/** The accumulated user text the gate has seen: earlier answers stay;
+ * the supervisor's Resume marker (".") is not user text. */
+export function gateUserText(
+	pending: string | null,
+	seen: string | null,
+): string | null {
+	const parts: string[] = [];
+	if (seen !== null) parts.push(seen);
+	if (pending !== null && pending !== ".") parts.push(pending);
+	return parts.length === 0 ? null : parts.join("\n\n");
+}
+
+/** The text a gate fingerprint compares: consumed replies compare through
+ * `seen`; a queued answer compares on top of it. */
 export function gateCompareText(
 	prompt: string,
 	pending: string | null,
 	seen: string | null,
 ): string {
-	return gateEffectiveText(prompt, pending ?? seen);
+	return gateEffectiveText(prompt, gateUserText(pending, seen));
 }
 
 /** sha256 hex of the compared text. */
@@ -106,7 +119,12 @@ export function parseGateCheck(raw: string): GateCheck {
 			.map((opt) => opt.slice(0, CAP));
 		return { question: qo.question.slice(0, CAP), options };
 	});
-	return { builds: o.builds.slice(0, CAP), checks: o.checks.slice(0, CAP), points, questions };
+	return {
+		builds: o.builds.slice(0, CAP),
+		checks: o.checks.slice(0, CAP),
+		points,
+		questions,
+	};
 }
 
 /** The one tool-free gate model call: `@plan` selector, 120 s timeout. */
@@ -179,6 +197,23 @@ export function startAnywayQuestion(): AskQuestion {
 		multi: false,
 		recommended: null,
 	};
+}
+
+/** True when the reply overrides a gate park: the exact marker, or the ask panel's composed
+ * "For \"<question>\": Start anyway" line for every non-empty line. A real answer line makes
+ * it a normal reply, and it falls through to the queue. */
+export function isStartAnywayReply(text: string): boolean {
+	if (text.trim() === START_ANYWAY) return true;
+	const lines = text
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line !== "");
+	if (lines.length === 0) return false;
+	const question = startAnywayQuestion().question;
+	return lines.every((line) => {
+		const m = line.match(/^For "(.*)": (.*)$/);
+		return m !== null && m[1] === question && m[2] === START_ANYWAY;
+	});
 }
 
 /** The single ask question a missing outside check parks with. */

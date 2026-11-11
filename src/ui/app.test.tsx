@@ -3,9 +3,9 @@ import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
-import { parseUsage } from "../quota.ts";
-import { DEEPEN_POINTS } from "../prompts.ts";
 import type { DeepenCheck } from "../deepen.ts";
+import { DEEPEN_POINTS } from "../prompts.ts";
+import { parseUsage } from "../quota.ts";
 import type {
 	PerfMetrics,
 	PerfStat,
@@ -6560,7 +6560,7 @@ describe("ComposeDialog deepen", () => {
 			<ComposeDialog
 				{...compose({
 					deepen: () =>
-					Promise.resolve({ deepened: "x", check: null, checkError: null }),
+						Promise.resolve({ deepened: "x", check: null, checkError: null }),
 				})}
 			/>,
 		);
@@ -6603,7 +6603,7 @@ describe("DeepenReview", () => {
 		rewrite: ("covered" | "missing")[],
 		additions: string[] = [],
 	): DeepenCheck => ({
-		points: DEEPEN_POINTS.map((point, i) => ({
+		points: DEEPEN_POINTS.map((_point, i) => ({
 			draft: draft[i]!,
 			rewrite: rewrite[i]!,
 			reason: `reason ${i + 1}`,
@@ -6666,7 +6666,12 @@ describe("DeepenReview", () => {
 		expect(html).not.toContain('class="primary"');
 	});
 	test("a failed check replaces the panel with the unavailable line", () => {
-		const html = review("draft", "rewrite", null, "bad JSON: expected 5 points");
+		const html = review(
+			"draft",
+			"rewrite",
+			null,
+			"bad JSON: expected 5 points",
+		);
 		expect(html).toContain("Check unavailable: bad JSON: expected 5 points");
 		expect(html).not.toContain("deepen-points");
 		expect(html).not.toContain("Improves");
@@ -6777,7 +6782,10 @@ describe("Drawer prompt gate Start anyway", () => {
 		const posts: { url: string; body: unknown }[] = [];
 		// The drawer's detail, session and catalog fetches degrade to null on a 404;
 		// only the reply POST is captured.
-		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
 			const url = String(input);
 			if (url.endsWith("/tasks/t1/reply")) {
 				posts.push({ url, body: String(init?.body ?? "") });
@@ -6821,7 +6829,9 @@ describe("Drawer prompt gate Start anyway", () => {
 			const post = posts.at(-1);
 			expect(post?.url).toContain("/api/projects/proj/tasks/t1/reply");
 			// The exact serialized form: the marker text verbatim, no images.
-			expect(post?.body).toBe(JSON.stringify({ text: "Start anyway", images: [] }));
+			expect(post?.body).toBe(
+				JSON.stringify({ text: "Start anyway", images: [] }),
+			);
 		} finally {
 			globalThis.fetch = realFetch;
 			await act(async () => {

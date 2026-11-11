@@ -18,8 +18,8 @@ import {
 	useState,
 } from "react";
 import { createRoot } from "react-dom/client";
-import { defaultGitUsername } from "../githubHost.ts";
 import type { DeepenCheck, DeepenPointCheck } from "../deepen.ts";
+import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { DeadSignIn } from "../login.ts";
 import type { ModelOption } from "../models.ts";
@@ -27,7 +27,7 @@ import { shortKey, taskEntryKey } from "../notifications.ts";
 import { derivedTaskPrefix } from "../prefix.ts";
 import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
-import { isProposalReason, DEEPEN_POINTS } from "../prompts.ts";
+import { DEEPEN_POINTS, isProposalReason } from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
@@ -2549,8 +2549,7 @@ export function DeepenReview({
 			: check.points.filter((p) => pointLabel(p) === "improved").length;
 	// A rewrite that improves nothing, or invents work, must not be the default action:
 	// Use rewrite keeps working but Discard carries the visual weight.
-	const weak =
-		check !== null && (improved === 0 || check.additions.length > 0);
+	const weak = check !== null && (improved === 0 || check.additions.length > 0);
 	return (
 		<section className="deepen-review" aria-label="Deepen review">
 			{changed ? (
@@ -2960,10 +2959,10 @@ function NewTaskDialog({
 					deepened: string;
 					check: DeepenCheck | null;
 					checkError: string | null;
-				}>(
-					`/api/projects/${encodeURIComponent(project.name)}/deepen`,
-					{ prompt: text, model: model || undefined },
-				)
+				}>(`/api/projects/${encodeURIComponent(project.name)}/deepen`, {
+					prompt: text,
+					model: model || undefined,
+				})
 			}
 			send={async ({ text, images, model }) => {
 				await post(`/api/projects/${encodeURIComponent(project.name)}/tasks`, {
@@ -3261,10 +3260,10 @@ export function FollowUpDialog({
 					deepened: string;
 					check: DeepenCheck | null;
 					checkError: string | null;
-				}>(
-					`/api/projects/${encodeURIComponent(target)}/deepen`,
-					{ prompt: text, model: model || undefined },
-				)
+				}>(`/api/projects/${encodeURIComponent(target)}/deepen`, {
+					prompt: text,
+					model: model || undefined,
+				})
 			}
 			send={async ({ text, images, model }) => {
 				const next = await post<TaskView>(
@@ -9862,15 +9861,15 @@ function DrawerWaiting(p: {
 				!askedNow &&
 				!proposal &&
 				task.gate?.parked !== true && (
-				<div className="needs-reason">
-					<ProposalReasonLink
-						reason={task.needsReason}
-						selfProject={row.project}
-						tasks={tasks}
-						onOpenTask={onOpenTask}
-					/>
-				</div>
-			)}
+					<div className="needs-reason">
+						<ProposalReasonLink
+							reason={task.needsReason}
+							selfProject={row.project}
+							tasks={tasks}
+							onOpenTask={onOpenTask}
+						/>
+					</div>
+				)}
 			{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
 					    body pins the message's actions while the report scrolls. The server still
 					    gates the approval. */}
