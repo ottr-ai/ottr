@@ -194,12 +194,12 @@ import type {
 	isIntegrated,
 	mergeHoldLanded,
 	mergeHoldMismatch,
-	patchText,
 	pushBranch,
 	rebaseTargetBranch,
 	removeWorktree,
 	resetBranchTo,
 	resolveTarget,
+	revListCount,
 	runMergeGates,
 	serverMergePush,
 	statusFiles,
@@ -960,11 +960,11 @@ export interface TurnOps {
 	) => Promise<boolean>;
 	/** OTTR-760: true when two commits hold identical trees — the card branch carries exactly the source PR's content. */
 	treesEqual?: typeof treesEqual;
-	/** OTTR-809: the two-dot patch between two commits, or null on failure; reads no HEAD
-	 * and no worktree state, so the fixless-bump compare cannot move with a checkout.
+	/** OTTR-809: how many commits the card branch holds beyond a ref (`git rev-list
+	 * --count <from>..<to>`), or null on failure; reads no HEAD and no worktree state.
 	 * Required: an unwired op silently reads every rebased bump as fix-bearing and
 	 * duplicates Dependabot PRs. */
-	patchText: typeof patchText;
+	revListCount: typeof revListCount;
 	/** OTTR-760: posts one comment on a pull request (gh via runGh); the "@dependabot rebase" handoff and the fixes note. */
 	prComment?: typeof commentOnPullRequest;
 	/** OTTR-781: fetches a legacy Dependabot card's source PR head into refs/ottr/pr/N at ship time. */
@@ -6147,12 +6147,13 @@ export function createTurnLoop(
 			adoptSourcePr(st, n, head, src.url);
 			return;
 		}
-		// A cherry-picked or rebased branch may still hold nothing but the bump: its
-		// diff against the target then equals the source PR's own diff, and the card
-		// adopts — a follow-up PR would carry the same content twice. Unrelated target
-		// changes are not fixes; a conflicting resolution or a real fix changes the
-		// patch and ships.
-		if (await carriesNoFixes(st, head, tip)) {
+		// The card's fixes are the commits after the source PR's head: an empty
+		// rev-list means fixless — a rebased or cherry-picked bump, however the target
+		// moved — and the card adopts. Any commit ships: a fix, a rename, a mode or
+		// binary change all count. Git trouble reads as fixes, so the follow-up stays
+		// the safe delivery for work we cannot prove empty.
+		const beyond = await commitsBeyondHead(st, head, tip);
+		if (beyond === 0) {
 			adoptSourcePr(st, n, head, src.url);
 			return;
 		}
@@ -6181,57 +6182,19 @@ export function createTurnLoop(
 		await parkOnSourcePr(st, n, src);
 	}
 
-	/** The patch's content shape: the ordered changed and context lines, without the
-	 * headers, blob hashes and hunk ranges that move when the target advances (an
-	 * unrelated edit elsewhere in the same file changes the post-image blob and the
-	 * line offsets, but not the change). Null when the shape proves nothing (git
-	 * trouble, or a binary-only patch whose body carries no lines). */
-	function patchShape(patch: string | null): string | null {
-		if (patch === null) return null;
-		const lines = patch
-			.split("\n")
-			.filter(
-				(line) =>
-					line.startsWith(" ") ||
-					(line.startsWith("+") && !line.startsWith("+++")) ||
-					(line.startsWith("-") && !line.startsWith("---")),
-			)
-			.join("\n");
-		return lines === "" ? null : lines;
-	}
-
-	/** True when the card branch's patch against the target tip equals the source PR's
-	 * own patch (head^..head) — a cherry-picked or rebased bump with no fixes beyond
-	 * it. Both sides are pure commit-tree diffs (patchText reads no HEAD and no
-	 * worktree state), compared by content shape, so neither checkout's position nor
-	 * an unrelated edit elsewhere in the same file can skew the compare, and the card
-	 * checkout is where the read runs. The two-dot card side is right for the promoted
-	 * paths: the merge prompt rebases or cherry-picks onto the target, so the card
-	 * descends from the target tip and its patch holds exactly the carried work.
-	 * Git trouble or an unwired op reads as fixes: the follow-up path is the safe
-	 * delivery for work we cannot prove empty. */
-	async function carriesNoFixes(
+	/** How many commits the card branch holds beyond the source PR's head
+	 * (`rev-list <head>..<tip>` in the card checkout); null on git trouble. The count
+	 * is pure commit graph — no HEAD, no worktree state, no patch shape — so rename,
+	 * mode and binary fixes all count, and neither checkout's position can skew it. */
+	async function commitsBeyondHead(
 		st: TurnSettle,
 		head: string,
 		tip: string,
-	): Promise<boolean> {
-		const headParent = await ops
-			.targetSha(st.e.path, `${head}^`)
-			.catch(() => null);
-		const targetTip = await ops
-			.targetSha(st.e.path, st.header.target)
-			.catch(() => null);
-		if (headParent === null || targetTip === null) return false;
-		// The card checkout is the subject of the read; when it exists, the patch
-		// compare runs there (same object store, never the main checkout's branch).
+	): Promise<number | null> {
+		// The card checkout is the subject of the read; when it exists, the count
+		// runs there (same object store, never the main checkout's branch).
 		const path = existsSync(st.loc.wt) ? st.loc.wt : st.e.path;
-		const bump = patchShape(
-			await ops.patchText(path, headParent, head).catch(() => null),
-		);
-		const carried = patchShape(
-			await ops.patchText(path, targetTip, tip).catch(() => null),
-		);
-		return bump !== null && carried !== null && bump === carried;
+		return ops.revListCount(path, head, tip).catch(() => null);
 	}
 
 	/** Re-reads the source PR's current head before the ship judges the card branch: a

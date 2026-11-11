@@ -437,27 +437,32 @@ describe("listPrComments", () => {
 		user: { login },
 		body,
 	});
-	const junkPage = () =>
-		Array.from({ length: 100 }, (_v, i) => comment("dev", `c${i}`));
+	/** A gh --include response: status line, headers, blank line, JSON body. */
+	const included = (headers: string[], body: unknown): string =>
+		`HTTP/2 200\n${headers.join("\n")}\n\n${JSON.stringify(body)}`;
+	const junkPage = (from: number) =>
+		Array.from({ length: 100 }, (_v, i) => comment("dev", `c${from + i}`));
 
 	test("parses logins and bodies and skips malformed entries", async () => {
 		const calls: string[][] = [];
 		const gh: GhFn = async (a) => {
 			calls.push(a);
 			expect(a[0]).toBe("api");
-			expect(a[1]).toBe(
-				"repos/o/r/issues/7/comments?sort=created&direction=desc&per_page=100&page=1",
-			);
+			expect(a[1]).toBe("--include");
+			expect(a[2]).toBe("repos/o/r/issues/7/comments?per_page=100");
 			return {
 				code: 0,
-				stdout: JSON.stringify([
-					comment("dependabot[bot]", "Dependabot can't rebase it - sorry!"),
-					{ user: { login: "x" } },
-					{ body: "no login" },
-					{ user: null, body: "b" },
-					"junk",
-					null,
-				]),
+				stdout: included(
+					[],
+					[
+						comment("dependabot[bot]", "Dependabot can't rebase it - sorry!"),
+						{ user: { login: "x" } },
+						{ body: "no login" },
+						{ user: null, body: "b" },
+						"junk",
+						null,
+					],
+				),
 				stderr: "",
 			};
 		};
@@ -465,45 +470,75 @@ describe("listPrComments", () => {
 		expect(out).toEqual([
 			{ login: "dependabot[bot]", body: "Dependabot can't rebase it - sorry!" },
 		]);
-		// A short first page is the last page: no second call.
+		// No Link header: one page is all there is, one call.
 		expect(calls).toHaveLength(1);
 	});
 
-	test("a reply past the first hundred comments is still read", async () => {
+	test('a reply behind a full newest page is read backwards via rel="last"', async () => {
 		const calls: string[][] = [];
+		const link =
+			'<https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=2>; rel="last"';
 		const gh: GhFn = async (a) => {
 			calls.push(a);
+			if (calls.length === 1) {
+				expect(a).toEqual([
+					"api",
+					"--include",
+					"repos/o/r/issues/7/comments?per_page=100",
+				]);
+				return {
+					code: 0,
+					stdout: included([`link: ${link}`], junkPage(1)),
+					stderr: "",
+				};
+			}
+			expect(a).toEqual([
+				"api",
+				"repos/o/r/issues/7/comments?per_page=100&page=1",
+			]);
 			return {
 				code: 0,
-				stdout: JSON.stringify(
-					calls.length === 1
-						? junkPage()
-						: [comment("dependabot[bot]", "Dependabot can't rebase it!")],
-				),
+				stdout: JSON.stringify([
+					comment("dependabot[bot]", "Dependabot can't rebase it!"),
+				]),
 				stderr: "",
 			};
 		};
 		const out = await listPrComments({ repo: "o/r", number: 7, gh });
 		expect(out).toHaveLength(101);
 		expect(dependabotCannotRebase(out)).toBe(true);
-		expect(calls.map((c) => c[1])).toEqual([
-			"repos/o/r/issues/7/comments?sort=created&direction=desc&per_page=100&page=1",
-			"repos/o/r/issues/7/comments?sort=created&direction=desc&per_page=100&page=2",
-		]);
+		expect(calls).toHaveLength(2);
 	});
 
 	test("a full thread stops at the page bound", async () => {
-		const gh: GhFn = async () => ({
-			code: 0,
-			stdout: JSON.stringify(junkPage()),
-			stderr: "",
-		});
+		const calls: string[][] = [];
+		const gh: GhFn = async (a) => {
+			calls.push(a);
+			if (a[1] === "--include")
+				return {
+					code: 0,
+					stdout: included(
+						[
+							'link: <https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=9>; rel="next"',
+							'link: <https://api.github.com/repos/o/r/issues/7/comments?per_page=100&page=9>; rel="last"',
+						],
+						junkPage(1),
+					),
+					stderr: "",
+				};
+			return { code: 0, stdout: JSON.stringify(junkPage(100)), stderr: "" };
+		};
 		const out = await listPrComments({
 			repo: "o/r",
 			number: 7,
 			maxPages: 2,
 			gh,
 		});
+		// The bound walks backwards from the last page: pages 9 and 8 only.
+		expect(calls.map((c) => c[1])).toEqual([
+			"--include",
+			"repos/o/r/issues/7/comments?per_page=100&page=8",
+		]);
 		expect(out).toHaveLength(200);
 	});
 
@@ -519,7 +554,11 @@ describe("listPrComments", () => {
 	});
 
 	test("an unparseable body throws", async () => {
-		const gh: GhFn = async () => ({ code: 0, stdout: "{", stderr: "" });
+		const gh: GhFn = async () => ({
+			code: 0,
+			stdout: "HTTP/2 200\n\n{",
+			stderr: "",
+		});
 		expect(listPrComments({ repo: "o/r", number: 7, gh })).rejects.toThrow(
 			"unparseable body",
 		);

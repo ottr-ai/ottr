@@ -231,23 +231,24 @@ step checks the source before it ever opens a PR:
   fast-forward (a moved remote branch rejects instead of overwriting the
   author's commits) and the card adopts the PR afterwards.
 - Fixes beyond a Dependabot PR's head (OTTR-809) ship as a follow-up pull
-  request. The ship step pushes the card branch to origin under its own
+  request. The card's fixes are the commits on the card branch after the
+  source PR's head: `git rev-list --count <source-head>..<card-branch>`, run
+  in the card checkout. An empty count means fixless — however the target
+  moved — and the card adopts the source PR. A non-empty count ships those
+  commits: the ship step pushes the card branch to origin under its own
   name (never to the bot's branch) and opens one PR with the card branch as
   the head. The base is the Dependabot branch when the card branch descends
   from the PR head, so the fixes merge with the bump; a cherry-picked or
   rebased branch that no longer descends from the head, and a legacy card
   without the head name, base on the target branch instead — the PR carries
   the rebased work, and once the bump merges the diff reduces to the fixes.
-  A branch whose patch against the target tip equals the source PR's own
-  patch holds no fixes (an unrelated target advance under a clean
-  cherry-pick) and adopts the source PR instead of opening a second one; the
-  compare reads the two commit trees' patches directly (no HEAD, no worktree
-  state) and runs in the card checkout, and git trouble reads as fixes and
-  ships. One comment on the source PR links the follow-up. The
-  card stores the follow-up in `follow_up_pr_number`/`follow_up_pr_url`
-  (additive columns migrated like the PR fields above) and waits in
-  `merging`/`idle` until both PRs merge; a re-ship adopts the open
-  follow-up instead of opening another one.
+  The count is a pure commit-graph read (no HEAD, no worktree state, no
+  patch shape), so rename, mode and binary fixes all count as commits, and
+  git trouble reads as fixes and ships. One comment on the source PR links
+  the follow-up. The card stores the follow-up in
+  `follow_up_pr_number`/`follow_up_pr_url` (additive columns migrated like
+  the PR fields above) and waits in `merging`/`idle` until both PRs merge; a
+  re-ship adopts the open follow-up instead of opening another one.
 - Everything else — a fork head without Dependabot —
   comments on the source PR (a note
   about the parked fixes otherwise) and parks the card `merging`/`needs_you`
@@ -308,29 +309,27 @@ merge").
 
 The PR pass watches both PRs of a follow-up card. Each window: the conflict
 verdict runs for each PR still in the open list; a PR that left it gets one
-per-PR read. The follow-up PR merged: its fields clear, and the card keeps
-waiting on the source PR. Both merged: the pinned merge commit is the one
-that sits on the target. The single-PR read's `base.ref` decides — a merged
-PR keeps the base it merged into: the follow-up's own commit for a
-follow-up whose base is the target at merge time (a legacy card without the
-head branch name, or GitHub's retarget of an open follow-up onto the target
-after the bump merged and its branch was deleted); for a follow-up that
-still based on the bump branch, the source's merge commit, and only when
-the follow-up's commit sits in the source merge's history (`targetContains`
-— ancestry, not second-resolution timestamps). A bump-branch follow-up
-whose commit the source merge never carried parks the card needs_you: its
-fixes sit on the already-merged bump branch and never reach the target. The
-follow-up closed without merge parks the card needs_you ("follow-up PR #F
-closed without merging"); the source closed without merge parks it the same
-way while the follow-up waits. The remote card-branch delete still runs
-only at the finish: the follow-up PR's head is the card branch, and it may
-go only once both PRs merged.
+per-PR read (`GET repos/{repo}/pulls/{n}`). The follow-up PR merged: its
+fields clear, and the card keeps waiting on the source PR. Both merged: the
+card finishes with the source PR's `merge_commit_sha` — the commit on the
+target — falling back to the follow-up's when GitHub gives no source merge
+commit. Merge, squash and rebase merges all set the field, so no git
+ancestry, fetch order or merge-base read is involved; a follow-up that
+merged into an already-merged bump branch after the source is covered too
+(the target then holds everything the card made). The follow-up closed
+without merge parks the card needs_you ("follow-up PR #F closed without
+merging"); the source closed without merge parks it the same way while the
+follow-up waits. The remote card-branch delete still runs only at the
+finish: the follow-up PR's head is the card branch, and it may go only once
+both PRs merged.
 
 A Dependabot card parked on the rebase handoff (its reason carries "the
 board asked @dependabot to rebase") reads its source PR's comments once per
-window (`listPrComments`, newest first, paged up to the latest 1000
-comments, parsed as untrusted data) so a reply behind newer comments is
-still seen. When a
+window. GitHub's issues-comments endpoint ignores sort and direction and
+returns ascending ids, so `listPrComments` reads with `gh api --include`
+and follows the response's `Link: rel="last"` page backwards (the newest
+comments sit on the last page), bounded at 1000 comments — a cannot-rebase
+reply behind newer comments is still seen. When a
 `dependabot[bot]` comment says Dependabot cannot rebase
 (`dependabotCannotRebase` — "That means Dependabot can't rebase it"), the
 park reason becomes: close the pull request, Dependabot reopens it from the

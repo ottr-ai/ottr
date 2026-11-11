@@ -2668,20 +2668,20 @@ export async function diffStat(
 	return files;
 }
 
-/** The two-dot patch between two commits (`git diff <from> <to>`), or null on failure.
- * Pure commit-tree diff: unlike diffText it reads no HEAD and no worktree state, so the
- * result cannot move with whatever the checkout holds. OTTR-809's fix detection compares
- * the source PR's bump with the card branch's carried work through it. */
-export async function patchText(
+/** OTTR-809: how many commits `to` holds beyond `from` (`git rev-list --count
+ * <from>..<to>`), or null on git trouble. Zero means the card branch carries nothing
+ * but the source PR's content, however the target moved — a pure commit-graph read:
+ * no HEAD, no worktree state, and rename, mode and binary changes all count as
+ * commits, so no patch shape can misjudge them. */
+export async function revListCount(
 	mainPath: string,
 	from: string,
 	to: string,
-): Promise<string | null> {
-	const r = await git(
-		["diff", "--ignore-submodules=dirty", from, to],
-		mainPath,
-	);
-	return r.code === 0 ? r.stdout : null;
+): Promise<number | null> {
+	const r = await git(["rev-list", "--count", `${from}..${to}`], mainPath);
+	if (r.code !== 0) return null;
+	const n = Number.parseInt(r.stdout.trim(), 10);
+	return Number.isSafeInteger(n) && n >= 0 ? n : null;
 }
 
 /** The branch's unified diff (same base as diffStat), or null when git fails. */

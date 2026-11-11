@@ -40,7 +40,6 @@ import type {
 	isClean,
 	isIntegrated,
 	quarantineUntracked,
-	targetContains,
 	worktreeHusk,
 	worktreeLinked,
 } from "./worktree.ts";
@@ -78,9 +77,6 @@ export interface SupervisorOps {
 	quarantineUntracked: typeof quarantineUntracked;
 	/** OTTR-552 prPass: reads a ref in the main checkout; null on git failure. */
 	targetSha(mainPath: string, ref: string): Promise<string | null>;
-	/** OTTR-809 prPass: true when the follow-up's merge commit sits in the source
-	 * merge's history — the ancestry proof that its fixes reached the target. */
-	targetContains: typeof targetContains;
 	/** OTTR-552 prPass: fetches a branch from the pinned origin (git() adds the host auth). */
 	fetchOriginBranch: typeof fetchOriginBranch;
 	/** OTTR-755 dependabotPass: fetches one PR head ref into the main checkout (git() adds the host auth). */
@@ -282,9 +278,6 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 interface PrDetail {
 	state: "open" | "closed";
 	merged: boolean;
-	/** The base branch name at merge time (a merged PR keeps the base it merged into);
-	 * null when absent or malformed. Decides target-based vs bump-branch-based (OTTR-809). */
-	base: string | null;
 	mergeCommit: string | null;
 	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
 	 * still computes it, the field is absent, or the value is not a boolean. */
@@ -298,15 +291,9 @@ function parsePull(body: unknown): PrDetail | null {
 	if (x.state !== "open" && x.state !== "closed") return null;
 	if (x.merged_at !== null && typeof x.merged_at !== "string") return null;
 	if (sha !== null && sha !== undefined && typeof sha !== "string") return null;
-	const base = x.base as Record<string, unknown> | null | undefined;
-	const baseRef =
-		typeof base === "object" && base !== null && typeof base.ref === "string"
-			? base.ref
-			: null;
 	return {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
-		base: baseRef,
 		mergeCommit: typeof sha === "string" ? sha : null,
 		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
 		// mergeable value must not turn a readable PR into null.
@@ -2124,41 +2111,12 @@ export function createSupervisor(
 				return;
 			}
 			if (s.merged && s.mergeCommit !== null) {
-				// A merged PR keeps the base it merged into, so pr.base says where the
-				// follow-up's commit landed. GitHub retargets an open follow-up onto the
-				// target when the bump PR merges and its branch is deleted, which makes
-				// a headRef-known card target-based at merge time.
-				const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
-				const targetBased = pr.base !== null && pr.base === targetShort;
-				const bumpBased = !targetBased && t.sourcePrHeadRef !== null;
-				if (bumpBased) {
-					// The follow-up's commit reaches the target only through the source's
-					// merge: it must sit in that merge's history. Second-resolution
-					// timestamps prove nothing — ancestry decides delivery.
-					const delivered = await ops
-						.targetContains(e.path, pr.mergeCommit, s.mergeCommit)
-						.catch(() => false);
-					if (!delivered) {
-						// The source merged first and the follow-up then landed on the
-						// already-merged bump branch: those fixes never reach the target.
-						if (wentStale(e.store, t)) return;
-						e.store.updateTask(t.id, {
-							state: "needs_you",
-							needsReason: `Follow-up PR #${F} merged after PR #${S}: its fixes sit on the merged bump branch and are not on the target branch. Carry them onto a new pull request.`,
-							pushSha: null,
-						});
-						ops.appendLog(
-							e.store,
-							t.id,
-							`supervisor: follow-up PR #${F} merged after PR #${S}; the fixes are stranded on the bump branch; card parked`,
-						);
-						ops.schedule();
-						return;
-					}
-					await finishPrMerge(e, settings, t, s.mergeCommit);
-					return;
-				}
-				await finishPrMerge(e, settings, t, pr.mergeCommit);
+				// Both PRs report merged with their merge commits straight from
+				// GET repos/{repo}/pulls/{n} — merge, squash and rebase merges all
+				// set them, and no git ancestry or fetch order is involved. The
+				// source's commit is the one on the target; when GitHub gives none,
+				// the follow-up's is the only anchor there is.
+				await finishPrMerge(e, settings, t, s.mergeCommit ?? pr.mergeCommit);
 				return;
 			}
 			if (wentStale(e.store, t)) return;

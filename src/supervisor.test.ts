@@ -64,10 +64,6 @@ interface FakeOps extends SupervisorOps {
 		| null;
 	// prPass: ref -> sha; missing refs read null (git failure / absent ref)
 	targetShas: Record<string, string | null>;
-	// OTTR-809 prPass: "from to" -> targetContains verdict; missing pairs read false
-	containsResults: Record<string, boolean>;
-	// OTTR-809 prPass: every targetContains call's [from, to], in order
-	containsCalls: [string, string][];
 	// prPass: fetchOriginBranch returns this error text instead of null when set
 	fetchErr: string | null;
 	// dependabotPass: fetchPrHead returns this error text instead of null when set
@@ -126,7 +122,9 @@ function ghApi(
 	args: string[],
 ): { code: number; stdout: string; stderr: string } | undefined {
 	ops.apiCalls.push(args);
-	const r = ops.apiResult?.(args[1] ?? "");
+	// The comments read args are ["api", "--include", <url>]; every other api call
+	// carries the url at index 1. The stub keys on the url either way.
+	const r = ops.apiResult?.(args[2] ?? args[1] ?? "");
 	if (r === undefined || r === null) return undefined;
 	if (r instanceof Error) throw r;
 	return r;
@@ -148,8 +146,6 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		apiCalls: [],
 		apiResult: null,
 		targetShas: {},
-		containsResults: {},
-		containsCalls: [],
 		fetchErr: null,
 		prFetchErr: null,
 		unsaved: null,
@@ -231,10 +227,6 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			ops.targetShas[ref] ??
 			// OTTR-760: a successful dependabot fetch leaves the PR head ref readable.
 			(ref.startsWith("refs/ottr/pr/") ? DEP_PR_SHA : null),
-		targetContains: async (_mainPath, sha, tip) => {
-			ops.containsCalls.push([sha, tip]);
-			return ops.containsResults[`${sha} ${tip}`] ?? false;
-		},
 		fetchOriginBranch: async (_mainPath, branch) => {
 			ops.calls.fetches.push(branch);
 			return ops.fetchErr;
@@ -3169,6 +3161,7 @@ const PR7_CONFLICT = prConflictReason(7);
 const PR_LIST = ["api", "repos/acme/widget/pulls?state=open&per_page=100"];
 const PR7_READ = ["api", "repos/acme/widget/pulls/7"];
 const PR8_READ = ["api", "repos/acme/widget/pulls/8"];
+const PR9_READ = ["api", "repos/acme/widget/pulls/9"];
 
 /** `gh api` stub: `pull` answers every per-PR read, every other call gets the open-PR list. */
 function prApi(pull: string, open: number[] = [7]) {
@@ -4010,11 +4003,11 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("equal merge times finish when the source carries the follow-up", async () => {
-		// Both merges land inside one second: timestamps prove nothing. The ancestry
-		// check does — the follow-up's commit sits in the source merge's history, so
-		// the fixes reached the target and the card finishes with the source's commit
-		// (the one pinned to the CI watch).
+	test("both merged in one window finishes with the source's merge commit", async () => {
+		// Both PRs report merged with their merge commits straight from
+		// GET repos/{repo}/pulls/{n} — merge, squash and rebase merges all set them,
+		// whatever the timestamps and whatever GitHub did to the follow-up's base.
+		// The source's commit is the one on the target, so it pins the CI watch.
 		const store = prModeProject("pr-fu-one-window");
 		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
 		const t = followUpCard(store);
@@ -4027,7 +4020,6 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-06T00:00:00Z",
 								mergeSha: OTHER_SHA,
-								base: "ottr/552",
 							}),
 							stderr: "",
 						}
@@ -4037,13 +4029,11 @@ describe("prPass", () => {
 								stdout: pullBody({
 									mergedAt: "2026-11-06T00:00:00Z",
 									mergeSha: MERGE_SHA,
-									base: "main",
 								}),
 								stderr: "",
 							}
 						: openList([]),
 			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
-			containsResults: { [`${OTHER_SHA} ${MERGE_SHA}`]: true },
 		});
 		await tick(
 			new Map([["proj", entry(store, { target: "origin/main" })]]),
@@ -4052,8 +4042,9 @@ describe("prPass", () => {
 		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
 		expect(after.pushSha).toBe(MERGE_SHA);
-		// The ancestry read asked exactly the follow-up-in-source question.
-		expect(ops.containsCalls).toEqual([[OTHER_SHA, MERGE_SHA]]);
+		// The merge proof is two plain REST reads, exactly these URLs.
+		expect(ops.apiCalls).toContainEqual(PR9_READ);
+		expect(ops.apiCalls).toContainEqual(PR7_READ);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		// The follow-up's head is the card's own branch, so it goes; the source head stays.
@@ -4068,56 +4059,12 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("equal merge times park stranded when the source never carried the follow-up", async () => {
-		// Same-second merges with the follow-up NOT in the source merge's history:
-		// the source merged first and the follow-up landed on the already-merged bump
-		// branch, so the fixes never reach the target — the card parks, never done.
-		const store = prModeProject("pr-fu-stranded");
-		const t = followUpCard(store);
-		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
-		const ops = fakeOps({
-			apiResult: (url) =>
-				url.endsWith("/pulls/9")
-					? {
-							code: 0,
-							stdout: pr9Body({
-								mergedAt: "2026-11-06T00:00:00Z",
-								mergeSha: MERGE_SHA,
-								// The follow-up still based on the bump branch at its merge.
-								base: "ottr/552",
-							}),
-							stderr: "",
-						}
-					: url.endsWith("/pulls/7")
-						? {
-								code: 0,
-								stdout: pullBody({
-									mergedAt: "2026-11-06T00:00:00Z",
-									mergeSha: OTHER_SHA,
-									base: "main",
-								}),
-								stderr: "",
-							}
-						: openList([]),
-		});
-		await tick(
-			new Map([["proj", entry(store, { target: "origin/main" })]]),
-			ops,
-		);
-		const after = store.getTask(t.id)!;
-		expect(after.stage).toBe("merging");
-		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toContain("merged after PR #7");
-		expect(after.needsReason).toContain("not on the target branch");
-		const log = await Bun.file(store.logPath(t.id)).text();
-		expect(log).toContain("the fixes are stranded on the bump branch");
-		store.close();
-	});
-
-	test("a retargeted follow-up finishes with its own commit", async () => {
+	test("a retargeted follow-up finishes with the source's merge commit", async () => {
 		// GitHub retargets an open follow-up onto the target when the bump PR merges
-		// and its branch is deleted: the follow-up's own commit then lands on the
-		// target, even though the card knows the bump branch's name.
+		// and its branch is deleted: both PRs report merged, and the card finishes
+		// with the source's merge commit. The follow-up's own commit is the newer
+		// origin tip, so the exact-tip CI pin opts out (pushSha null) instead of
+		// pinning a sha CI never watched.
 		const store = prModeProject("pr-fu-retarget");
 		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
 		const t = followUpCard(store);
@@ -4130,7 +4077,6 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-07T00:00:00Z",
 								mergeSha: MERGE_SHA,
-								base: "main",
 							}),
 							stderr: "",
 						}
@@ -4140,7 +4086,6 @@ describe("prPass", () => {
 								stdout: pullBody({
 									mergedAt: "2026-11-06T00:00:00Z",
 									mergeSha: OTHER_SHA,
-									base: "main",
 								}),
 								stderr: "",
 							}
@@ -4153,17 +4098,18 @@ describe("prPass", () => {
 		);
 		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
-		expect(after.pushSha).toBe(MERGE_SHA);
+		expect(after.pushSha).toBeNull();
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		store.close();
 	});
 
-	test("a target-based follow-up finishes with its own merge commit", async () => {
+	test("a legacy card's follow-up finishes with the source's merge commit", async () => {
+		// A legacy card holds no head branch name, so its follow-up based on the
+		// target branch. Both PRs report merged; the source's commit finishes the
+		// card, and the newer origin tip opts the exact-tip CI pin out.
 		const store = prModeProject("pr-fu-target-base");
 		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
-		// No sourcePrHeadRef: a legacy card whose follow-up based on the target branch,
-		// so the follow-up's own commit is the later one on the target.
 		const t = followUpCard(store);
 		const ops = fakeOps({
 			apiResult: (url) =>
@@ -4194,7 +4140,9 @@ describe("prPass", () => {
 		);
 		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
-		expect(after.pushSha).toBe(MERGE_SHA);
+		expect(after.pushSha).toBeNull();
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		store.close();
 	});
 
@@ -4208,7 +4156,7 @@ describe("prPass", () => {
 					: openList([7]),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		let after = store.getTask(t.id)!;
+		const after = store.getTask(t.id)!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(
 			"follow-up PR #9 closed without merging",

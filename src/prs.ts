@@ -275,12 +275,42 @@ function parsePrComments(body: unknown): IssueComment[] {
 	return out;
 }
 
-/** Reads a pull request's comments (the issues endpoint), newest first, paging until a
- * short page or the page bound. Newest-first is the point: a bounded read must see the
- * recent replies, not the thread's head, so a cannot-rebase reply behind a thousand
- * older comments is still found (OTTR-809). Every field is parsed as untrusted data.
- * Throws on a failed gh call or an unparseable body — the caller (the supervisor's
- * rebase-answer watch) logs and skips. */
+/** The last page number a gh --include response's Link header names (`rel="last"`),
+ * or null when the response has no headers (older gh prints none), no Link, or an
+ * unreadable page number. GitHub's issues-comments endpoint ignores sort and
+ * direction and returns ascending ids, so the newest comments sit on that page. */
+function lastPageFromLink(stdout: string): number | null {
+	const sep = stdout.indexOf("\n\n");
+	if (sep < 0) return null;
+	const headers = stdout.slice(0, sep);
+	const line = headers
+		.split("\n")
+		.filter((l) => l.toLowerCase().startsWith("link:"))
+		.map((l) => l.slice(5))
+		.find((value) => /<[^>]*>; rel="last"/i.test(value));
+	if (line === undefined) return null;
+	const last = /<([^>]*)>; rel="last"/i.exec(line);
+	const url = last === null ? undefined : last[1];
+	if (url === undefined) return null;
+	const page = /([?&]page=(\d+))/.exec(url);
+	const n = page === null || page[2] === undefined ? null : page[2];
+	return n === null ? null : Number.parseInt(n, 10);
+}
+
+/** Splits a gh --include response into headers and body: the body starts after the
+ * first empty line. A response without the separator is pure body. */
+function ghBody(stdout: string): string {
+	const sep = stdout.indexOf("\n\n");
+	return sep < 0 ? stdout : stdout.slice(sep + 2);
+}
+
+/** Reads a pull request's comments, newest first: GitHub's issues-comments endpoint
+ * ignores sort and direction and returns ascending ids, so the read follows the
+ * response's Link rel="last" page backwards (the newest comments sit on the last
+ * page), bounded at 1000 comments — a cannot-rebase reply behind newer comments is
+ * still found (OTTR-809). Every field is parsed as untrusted data. Throws on a failed
+ * gh call or an unparseable body — the caller (the supervisor's rebase-answer watch)
+ * logs and skips. */
 export async function listPrComments(o: {
 	repo: string;
 	number: number;
@@ -291,25 +321,37 @@ export async function listPrComments(o: {
 	const gh = o.gh ?? runGh;
 	const maxPages = o.maxPages ?? 10;
 	const out: IssueComment[] = [];
-	for (let page = 1; page <= maxPages; page++) {
+	const push = (stdout: string): void => {
+		let j: unknown;
+		try {
+			j = JSON.parse(ghBody(stdout));
+		} catch {
+			throw new Error("gh comments returned an unparseable body");
+		}
+		out.push(...parsePrComments(j));
+	};
+	const first = await gh([
+		"api",
+		"--include",
+		`repos/${o.repo}/issues/${o.number}/comments?per_page=100`,
+	]);
+	if (first.code !== 0)
+		throw new Error(
+			`gh comments failed (${first.code}): ${first.stderr.slice(0, 300)}`,
+		);
+	push(first.stdout);
+	const lastPage = lastPageFromLink(first.stdout) ?? 1;
+	const floor = Math.max(1, lastPage - maxPages + 1);
+	for (let page = lastPage - 1; page >= floor; page--) {
 		const r = await gh([
 			"api",
-			`repos/${o.repo}/issues/${o.number}/comments?sort=created&direction=desc&per_page=100&page=${page}`,
+			`repos/${o.repo}/issues/${o.number}/comments?per_page=100&page=${page}`,
 		]);
 		if (r.code !== 0)
 			throw new Error(
 				`gh comments failed (${r.code}): ${r.stderr.slice(0, 300)}`,
 			);
-		let j: unknown;
-		try {
-			j = JSON.parse(r.stdout);
-		} catch {
-			throw new Error("gh comments returned an unparseable body");
-		}
-		out.push(...parsePrComments(j));
-		// The raw length decides the end: parsePrComments skips malformed entries,
-		// so a parsed count under 100 must not read as the last page.
-		if (!Array.isArray(j) || j.length < 100) break;
+		push(r.stdout);
 	}
 	return out;
 }
