@@ -136,6 +136,8 @@ describe("Markdown", () => {
 			components: [],
 			parent: "",
 			custom: [],
+			comments: [],
+			links: [],
 		});
 		const out = render(prompt);
 		expect(out).toContain('<a href="https://atc.bmwgroup.net/jira"');
