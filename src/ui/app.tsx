@@ -11096,7 +11096,8 @@ function DrawerSteps(p: {
 			<DrawerSec
 				id="drawer-steps"
 				label="Work steps"
-				defaultOpen={false}
+				// A live ticket shows its rail; only a done card starts it collapsed.
+				defaultOpen={task.stage !== "done"}
 				head={
 					ctx === null ? undefined : (
 						<ContextMeter ctx={ctx} windowTok={windowTok} />

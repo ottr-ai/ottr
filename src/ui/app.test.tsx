@@ -4898,6 +4898,51 @@ describe("Drawer research report button", () => {
 		await unmount();
 	});
 
+	test("Work steps opens on a live ticket and starts collapsed on a done one", async () => {
+		const live = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "in_progress",
+			state: "running",
+			...rowFields,
+		});
+		const open = await mountDrawer(live);
+		try {
+			const btn = open.container.querySelector<HTMLButtonElement>(
+				'button[aria-controls="drawer-steps"]',
+			);
+			expect(btn?.getAttribute("aria-expanded")).toBe("true");
+			expect(btn?.closest("h3")?.hasAttribute("data-collapsed")).toBe(false);
+			expect(
+				open.container.querySelector("#drawer-steps")?.hasAttribute("hidden"),
+			).toBe(false);
+		} finally {
+			await open.unmount();
+		}
+		const done = cardFixture({
+			id: "R-2",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const shut = await mountDrawer(done);
+		try {
+			const btn = shut.container.querySelector<HTMLButtonElement>(
+				'button[aria-controls="drawer-steps"]',
+			);
+			expect(btn?.getAttribute("aria-expanded")).toBe("false");
+			expect(btn?.closest("h3")?.getAttribute("data-collapsed")).toBe("true");
+			expect(
+				shut.container.querySelector("#drawer-steps")?.hasAttribute("hidden"),
+			).toBe(true);
+		} finally {
+			await shut.unmount();
+		}
+	});
+
 	test("a turn that served another model than dispatched names the swap", async () => {
 		// The provider-error fallback: the timeline row says what was dispatched and
 		// what ran, so a steered model pick that did not run is legible, not silent.
