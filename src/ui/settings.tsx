@@ -1112,19 +1112,11 @@ export function NotificationsSection({
 	const [muted, setMuted] = useState<string[]>([]);
 	// "Test sent" is a short confirmation; the button reads "Send test" again after it.
 	const [sent, flashSent] = useFlash(2000);
-	// Bumps the prefs refetch when the queued replay registers a row outside the
-	// normal endpoint-driven load (ADR-0011).
-	const [prefsReload, setPrefsReload] = useState(0);
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
-	// Endpoints recovery already ran for: one pass per subscription, no loop.
-	const recoveredRef = useRef<Set<string>>(new Set());
 	// Queued completion work from a failed flow (ADR-0011): the next load
-	// retries the whole completion — subscribe with the carried classes,
-	// old-row drop — until every step succeeds. typeof guard: server-side render in tests.
+	// folds the queued classes into the register and drops the old row.
 	const PENDING_SUBSCRIBE_KEY = "ottr.push.pendingSubscribe";
-	// One best-effort replay pass per load: no loop.
-	const pendingRetriedRef = useRef(false);
 	type PendingSubscribeRecord = {
 		subscription: unknown;
 		oldEndpoint: string | null;
@@ -1204,155 +1196,98 @@ export function NotificationsSection({
 		}
 		return sub;
 	};
-	// A failed recovery must show the real state: no browser subscription, so
-	// the section reports the failure and offers the "Turn on" control
-	// (ADR-0011) instead of a dead endpoint.
-	const markRecoveryFailed = (err: unknown): void => {
-		setEnabled(false);
-		setEndpoint(null);
-		setClasses(null);
-		setError(err instanceof Error ? err.message : String(err));
-	};
+	// A failed Turn on reports the error; the kept path queues the retry above.
 	// Real state, not last-click: the flag reflects whether this device holds a subscription.
 	// The browser's subscription is registered again before the prefs load: a board that lost
-	// it (a new data folder, a restored backup) would answer "unknown endpoint" and hide the
-	// event switches. A re-subscribe keeps the device's saved switches on the server.
+	// its row (a new data folder, a restored backup, a replaced VAPID key) would answer
+	// "unknown endpoint" and hide the event switches. The re-subscribe keeps the device's
+	// saved switches (the server matches the endpoint) and stamps the current key, so a
+	// stale-bound row heals on the next load without a separate recovery flow.
 	useEffect(() => {
 		if (!supported) return;
 		void navigator.serviceWorker
 			.getRegistration()
 			.then(async (reg) => {
 				const sub = await reg?.pushManager.getSubscription();
-				// The browser's subscription is registered again before the prefs load: a
-				// board that lost its row (a new data folder, a restored backup) would
-				// answer "unknown endpoint" and hide the event switches. A re-subscribe
-				// keeps the device's saved switches on the server. The ADR-0011 kept
-				// path below still queues a full completion when this POST fails.
-				if (sub != null) await post("/api/push/subscribe", sub.toJSON());
-				setEnabled(sub != null);
-				setEndpoint(sub?.endpoint ?? null);
-				// ADR-0011 recovery: a queued subscribe POST from a failed flow retries
-				// once per load, before anything else touches the subscription.
-				// Storage may be absent (test DOM): a missing store means nothing queued.
-				const pendingRaw =
-					typeof localStorage !== "undefined"
-						? localStorage.getItem(PENDING_SUBSCRIBE_KEY)
-						: null;
-				if (!pendingRetriedRef.current && pendingRaw !== null) {
-					pendingRetriedRef.current = true;
+				// The register call precedes the state set so the prefs load that the
+				// endpoint change triggers reads an existing row. A failed register is
+				// retried by the next load (the browser keeps the subscription).
+				// A queued record from a failed flow folds its classes into this
+				// load's register: one atomic call creates the row with them, so the
+				// first prefs read already sees the carried preferences.
+				const record = hasPendingSubscribe()
+					? (() => {
+							try {
+								return JSON.parse(
+									localStorage.getItem(PENDING_SUBSCRIBE_KEY) ?? "null",
+								) as PendingSubscribeRecord | null;
+							} catch {
+								return null;
+							}
+						})()
+					: null;
+				if (sub != null) {
+					const body =
+						record !== null && record.classes !== null
+							? { ...sub.toJSON(), classes: record.classes }
+							: sub.toJSON();
 					try {
-						const record = JSON.parse(
-							localStorage.getItem(PENDING_SUBSCRIBE_KEY) ?? "null",
-						) as PendingSubscribeRecord | null;
-						if (record !== null && typeof record === "object") {
-							// ADR-0011: replay the whole completion in order; every step
-							// is idempotent, so any failure keeps the record for the next load.
-							// The queued classes ride inside the subscribe body: one atomic
-							// call creates the fresh row with them.
-							const queued = record.subscription as {
-								endpoint?: string;
-							};
-							await post(
-								"/api/push/subscribe",
-								record.classes !== null
-									? {
-											...(record.subscription as Record<string, unknown>),
-											classes: record.classes,
-										}
-									: record.subscription,
-							);
+						await post("/api/push/subscribe", body);
+						// Registered: the completion is done — drop the old row when
+						// the endpoint moved, and clear the record. A failure keeps
+						// both: the browser holds the subscription and the record
+						// retries on the next load.
+						if (record !== null) {
 							if (
 								record.oldEndpoint !== null &&
-								record.oldEndpoint !== queued.endpoint
-							) {
+								record.oldEndpoint !== sub.endpoint
+							)
 								await post("/api/push/unsubscribe", {
 									endpoint: record.oldEndpoint,
 								});
-							}
-							localStorage.removeItem(PENDING_SUBSCRIBE_KEY);
-							setPrefsReload((n) => n + 1);
+							if (typeof localStorage !== "undefined")
+								localStorage.removeItem(PENDING_SUBSCRIBE_KEY);
 						}
 					} catch {
-						// Silent: the next load retries the same queued record.
+						// Silent: the browser keeps the subscription; the record and
+						// the register retry on the next load.
 					}
-				}
-				if (sub == null) return;
-				// ADR-0011 recovery: a subscription bound to a replaced VAPID key can
-				// never receive. When the server reports it stale and permission was
-				// already granted, re-subscribe under the new key without a prompt.
-				const endpoint = sub.endpoint;
-				const { stale } = await unwrap<{ stale: boolean }>(
-					await fetch(
-						`/api/push/config?endpoint=${encodeURIComponent(endpoint)}`,
-					),
-				);
-				if (
-					!stale ||
-					Notification.permission !== "granted" ||
-					recoveredRef.current.has(endpoint)
-				)
-					return;
-				recoveredRef.current.add(endpoint);
-				// ADR-0011 recovery: read the old row's classes first — a failed read
-				// mutates nothing, so the browser subscription and the stale row both
-				// stay and the whole recovery retries on the next load.
-				let carried: ClassPrefs | null = null;
-				try {
-					const p = await unwrap<{
-						classes: ClassPrefs | null;
-					}>(
-						await fetch(
-							`/api/notifications/prefs?endpoint=${encodeURIComponent(endpoint)}`,
-						),
-					);
-					carried = p.classes;
-				} catch (err) {
-					setError(err instanceof Error ? err.message : String(err));
-					return;
-				}
-				// A failed browser unsubscribe leaves the real subscription in place,
-				// so "Turn off" stays and the kept stale row re-offers recovery.
-				try {
-					await sub.unsubscribe();
-				} catch (err) {
-					setError(err instanceof Error ? err.message : String(err));
-					return;
-				}
-				try {
-					const fresh = await subscribeNew(carried ?? undefined);
-					if (fresh.endpoint !== endpoint) {
-						// ADR-0011: the subscribe created the fresh row with the carried
-						// classes atomically; only the dead old row remains to drop.
-						void post("/api/push/unsubscribe", { endpoint }).catch(() => {});
-					}
-					// Server truth last: the prefs effect refetches the fresh row and
-					// shows the carried preferences; no local stamp needed.
 					setEnabled(true);
-					setEndpoint(fresh.endpoint);
-				} catch (err) {
-					const kept = err as Error & {
-						keptSubscription?: boolean;
-						endpoint?: string;
-						keptSub?: { toJSON(): unknown };
-					};
-					if (kept.keptSubscription && kept.keptSub) {
-						// ADR-0011: the browser holds the subscription and the server has
-						// no row — queue the completion and report the truth: subscribed,
-						// registration pending.
-						queuePendingSubscribe(kept.keptSub, endpoint, carried);
-						setEnabled(true);
-						setEndpoint(kept.endpoint ?? null);
-						setError(err instanceof Error ? err.message : String(err));
-					} else {
-						markRecoveryFailed(err);
-					}
+					setEndpoint(sub.endpoint);
+				} else {
+					setEnabled(false);
+					setEndpoint(null);
 				}
 			})
 			.catch((err) => {
 				setError(err instanceof Error ? err.message : String(err));
 			});
 	}, [supported]);
-	// Prefs follow the endpoint: without one only the shared mutes load.
+	// The board-wide mute list is device-independent: one mount-time load, never
+	// re-fetched by endpoint changes. An endpoint effect that also wrote the mutes
+	// would let a canceled or 404 response replace the shared list (ADR-0011).
+	useEffect(() => {
+		if (!supported) return;
+		let live = true;
+		void fetch("/api/notifications/prefs")
+			.then((res) => unwrap<{ mutedProjects: string[] }>(res))
+			.then((p) => {
+				if (!live) return;
+				mutedRef.current = p.mutedProjects;
+				savedMutedRef.current = p.mutedProjects;
+				setMuted(p.mutedProjects);
+			})
+			.catch(() => {
+				// A mute write before this load lands rolls back to savedMutedRef
+				// (empty); the user retries the change once the list is visible.
+			});
+		return () => {
+			live = false;
+		};
+	}, [supported]);
+	// The event switches follow the endpoint's row: a 404 (a row the board does
+	// not know — a pending registration, a pruned row, a restored older snapshot)
+	// hides the switches and never invents a mute list.
 	useEffect(() => {
 		const q =
 			endpoint === null ? "" : `?endpoint=${encodeURIComponent(endpoint)}`;
@@ -1360,16 +1295,11 @@ export function NotificationsSection({
 		void fetch(`/api/notifications/prefs${q}`)
 			.then((res) => {
 				if (res.status !== 404)
-					return unwrap<{
-						classes: ClassPrefs | null;
-						mutedProjects: string[];
-					}>(res);
-				// ADR-0011: the server 404s an endpoint with no row. That row is
-				// unknown, not empty: the board-wide mute list loaded before this
-				// fetch stays the truth (it drives saveMute), so no mute ref is
-				// touched. With no queued pending record the endpoint is genuinely
-				// unknown; a queued record means the row is registered on the next
-				// replay, so the missing row stays quiet.
+					return unwrap<{ classes: ClassPrefs | null }>(res);
+				// ADR-0011: the server 404s an endpoint with no row. The row is
+				// unknown, not empty. With no queued pending record the endpoint is
+				// genuinely unknown; a queued record means the row is registered on
+				// the next replay, so the missing row stays quiet.
 				if (live && !hasPendingSubscribe()) setError("unknown endpoint");
 				return null;
 			})
@@ -1378,9 +1308,6 @@ export function NotificationsSection({
 				classesRef.current = p.classes;
 				savedClassesRef.current = p.classes;
 				setClasses(p.classes);
-				mutedRef.current = p.mutedProjects;
-				savedMutedRef.current = p.mutedProjects;
-				setMuted(p.mutedProjects);
 			})
 			.catch((err) => {
 				if (live) setError(err instanceof Error ? err.message : String(err));
@@ -1388,7 +1315,7 @@ export function NotificationsSection({
 		return () => {
 			live = false;
 		};
-	}, [endpoint, prefsReload]);
+	}, [endpoint]);
 	const enable = (): void =>
 		busy.start(async () => {
 			setError(null);
@@ -1494,6 +1421,7 @@ export function NotificationsSection({
 		}
 	};
 	const saveMute = async (name: string, v: boolean): Promise<void> => {
+		console.log("DBG saveMute called", name, v);
 		mutedRef.current = v
 			? [...mutedRef.current.filter((m) => m !== name), name]
 			: mutedRef.current.filter((m) => m !== name);
