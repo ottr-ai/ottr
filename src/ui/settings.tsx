@@ -2436,14 +2436,16 @@ export type PendingKeyInfo = {
 	publicKey: string;
 	fingerprint: string;
 };
+/** The saved app as the git-hosts view reports it: the fingerprint may be unknown and
+ *  the key unreadable (ADR-0011 recovery), while GitHubAppView is the strict shape. */
+export type GitHubAppViewRead = Omit<GitHubAppView, "fingerprint"> & {
+	fingerprint: string | null;
+	/** Absent on the strict shape: an absent flag reads as readable. */
+	keyReadable?: boolean;
+};
 export type GitHostsView = {
 	/** The saved app as this view reports it: the fingerprint may be unknown and the key unreadable. */
-	githubApp:
-		| (Omit<GitHubAppView, "fingerprint"> & {
-				fingerprint: string | null;
-				keyReadable: boolean;
-		  })
-		| null;
+	githubApp: GitHubAppViewRead | null;
 	tokens: {
 		host: string;
 		username: string;
@@ -2815,7 +2817,7 @@ function githubChip(
 /** The "GitHub App" block: the saved app's card, or the id and key form while it is open. */
 /** The App block's chip: not set, still checking, the check failed, repos it does not
  *  reach, or working (the name lookup passed and every board repo has an install). */
-export function appChip(app: GitHubAppView | null): {
+export function appChip(app: GitHubAppViewRead | null): {
 	label: string;
 	tone: ChipTone;
 } {
@@ -2881,7 +2883,7 @@ function GitHubAppBlock({
 						App ID <code>{state.githubApp.id}</code>
 					</div>
 					<AppCheckLines check={state.githubApp.check} />
-					{!state.githubApp.keyReadable ? (
+					{state.githubApp.keyReadable === false ? (
 						<p className="hint">
 							<span className="jira-conn-warn">
 								<Mark kind="warn" />
@@ -2946,9 +2948,8 @@ function GitHubAppBlock({
 							</label>
 						</DefRow>
 					</div>
-					{state?.githubApp != null && !state.githubApp.keyReadable && (
-						<UnreadableSecretNote />
-					)}
+					{state?.githubApp != null &&
+						state.githubApp.keyReadable === false && <UnreadableSecretNote />}
 					<div className="alate-def-actions">
 						{state !== null && state.githubApp !== null && (
 							<button type="button" onClick={() => setFormOpen(false)}>
@@ -3052,9 +3053,8 @@ function GitHubConnectionBlock({
 								/>
 							</label>
 						</DefRow>
-						{tokenCfg?.tokenSet === true && tokenCfg.tokenReadable === false && (
-							<UnreadableSecretNote />
-						)}
+						{tokenCfg?.tokenSet === true &&
+							tokenCfg.tokenReadable === false && <UnreadableSecretNote />}
 					</div>
 				</div>
 				<div className="alate-def-actions">
