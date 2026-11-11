@@ -142,6 +142,13 @@ interface Recorded {
 	runReleaseCommand: unknown[];
 	quarantine: { worktreePath: string; quarantineDir: string }[];
 	ignoreInMain: { mainPath: string; rel: string }[];
+	/** OTTR-800: the cancel-path remote branch delete calls, in order. */
+	deletes: {
+		mainPath: string;
+		branch: string;
+		originUrl: string;
+		keep: readonly string[];
+	}[];
 	publishSoon: number;
 	notifyLog: [string, string][];
 	killed: boolean;
@@ -207,6 +214,16 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		},
 		removeWorktree: async (o: unknown) => {
 			record.removeWorktree.push(o);
+		},
+		// OTTR-800: the cancel's remote branch delete records like removeWorktree.
+		deleteRemoteBranch: async (
+			mainPath: string,
+			branch: string,
+			originUrl: string,
+			keep: readonly string[] = [],
+		) => {
+			record.deletes.push({ mainPath, branch, originUrl, keep });
+			return null;
 		},
 		commitsAhead: async () => 1,
 		changedFiles: async () => [],
@@ -394,6 +411,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -857,6 +875,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -901,6 +920,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -936,6 +956,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -990,6 +1011,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -1178,6 +1200,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -1233,6 +1256,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -1289,6 +1313,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -1358,6 +1383,7 @@ describe("turn loop", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -1476,6 +1502,7 @@ function baseRecord(): Recorded {
 		killed: false,
 		quarantine: [],
 		ignoreInMain: [],
+		deletes: [],
 		proposal: null,
 		recorded: [],
 	};
@@ -6109,6 +6136,7 @@ describe("turn research cards", () => {
 			runReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
+			deletes: [],
 			publishSoon: 0,
 			notifyLog: [],
 			killed: false,
@@ -9441,6 +9469,133 @@ describe("arch-review survivor kills", () => {
 				log: expect.any(Function),
 			},
 		]);
+	});
+
+	// ---- OTTR-800: the cancel's remote branch delete --------------------------------
+
+	test("a prMode cancel with an open PR deletes the remote branch and names the PR", async () => {
+		const { store, record, loop } = setup();
+		store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const task = store.createTask("pr work");
+		store.updateTask(task.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 7,
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+
+		await loop.cancel(fakeProject(store), task.id, false);
+
+		expect(record.deletes).toEqual([
+			{
+				mainPath: store.path,
+				branch: "ott/card",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["abc"],
+			},
+		]);
+		const log = await Bun.file(store.logPath(task.id)).text();
+		expect(log).toContain(
+			"cancel: removed remote branch ott/card; PR #7 closed with it",
+		);
+		expect(store.getTask(task.id)!.state).toBe("idle");
+	});
+
+	test("a prMode cancel without an open PR deletes the remote branch", async () => {
+		const { store, record, loop } = setup();
+		store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const task = store.createTask("pr work");
+		store.updateTask(task.id, {
+			stage: "in_progress",
+			state: "needs_you",
+			prNumber: null,
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+
+		await loop.cancel(fakeProject(store), task.id, false);
+
+		expect(record.deletes).toEqual([
+			{
+				mainPath: store.path,
+				branch: "ott/card",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["abc"],
+			},
+		]);
+		const log = await Bun.file(store.logPath(task.id)).text();
+		expect(log).toContain("cancel: removed remote branch ott/card");
+		expect(log).not.toContain("closed with it");
+	});
+
+	test("a kept-worktree cancel runs no remote branch delete", async () => {
+		const { store, record, loop } = setup({
+			unsavedWork: async () => "M a.txt",
+		});
+		store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const task = store.createTask("kept work");
+		store.updateTask(task.id, {
+			state: "running",
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+
+		await loop.cancel(fakeProject(store), task.id, false);
+
+		expect(record.deletes).toEqual([]);
+		expect(store.getTask(task.id)!.state).toBe("needs_you");
+	});
+
+	test("with prMode off a cancel runs no remote branch delete", async () => {
+		const { store, record, loop } = setup();
+		const task = store.createTask("plain work");
+		store.updateTask(task.id, {
+			state: "running",
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+
+		await loop.cancel(fakeProject(store), task.id, false);
+
+		expect(record.deletes).toEqual([]);
+		expect(store.getTask(task.id)!.state).toBe("idle");
+	});
+
+	test("a failing cancel delete is logged and never blocks the cancel", async () => {
+		const { store, loop } = setup({
+			deleteRemoteBranch: async () => "git boom",
+		});
+		store.setSettings({
+			prMode: true,
+			originUrl: "https://github.com/acme/widget.git",
+		});
+		const task = store.createTask("pr work");
+		store.updateTask(task.id, {
+			state: "running",
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/card",
+			base: "abc",
+		});
+
+		await loop.cancel(fakeProject(store), task.id, false);
+
+		const log = await Bun.file(store.logPath(task.id)).text();
+		expect(log).toContain("! cancel remote branch delete failed: git boom");
+		expect(store.getTask(task.id)!.state).toBe("idle");
 	});
 
 	test("a failing cancel removal is logged, not thrown", async () => {

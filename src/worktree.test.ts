@@ -31,6 +31,7 @@ import {
 	checkedOutBranch,
 	commitMeta,
 	createWorktree,
+	deleteRemoteBranch,
 	describeVersion,
 	diffStat,
 	diffText,
@@ -4780,6 +4781,116 @@ describe("pushBranch destination ref (OTTR-760)", () => {
 			expect(res.status).toBe("pushed");
 			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).toContain(
 				tip,
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+// OTTR-800: the end-of-card remote branch delete, the mirror of pushBranch.
+describe("deleteRemoteBranch (OTTR-800)", () => {
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	const fixture = () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-delbr-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "a.txt"), "a");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "base");
+		run(main, "push", "-q", "origin", "main");
+		return { dir, bare, main };
+	};
+	const pushCardBranch = (f: { main: string }) => {
+		run(f.main, "switch", "-q", "-c", "ott/card");
+		writeFileSync(join(f.main, "fix.txt"), "f");
+		run(f.main, ...id, "add", ".");
+		run(f.main, ...id, "commit", "-qm", "the fix");
+		run(f.main, "push", "-q", "origin", "ott/card");
+	};
+
+	test("deletes the pushed card branch on origin and clears the tracking ref", async () => {
+		const f = fixture();
+		try {
+			pushCardBranch(f);
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).toContain(
+				"refs/heads/ott/card",
+			);
+
+			const err = await deleteRemoteBranch(f.main, "ott/card", f.bare);
+			expect(err).toBeNull();
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).toBe("");
+			// The stale remote-tracking ref goes with the branch.
+			expect(() =>
+				run(f.main, "rev-parse", "refs/remotes/origin/ott/card"),
+			).toThrow();
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a second delete of the same branch reports success", async () => {
+		const f = fixture();
+		try {
+			pushCardBranch(f);
+			expect(await deleteRemoteBranch(f.main, "ott/card", f.bare)).toBeNull();
+			// GitHub's auto-delete or an earlier pass already removed the ref: the wanted
+			// end state, never a failure.
+			expect(await deleteRemoteBranch(f.main, "ott/card", f.bare)).toBeNull();
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a branch the card does not own (target, source-PR head) is refused", async () => {
+		const f = fixture();
+		try {
+			pushCardBranch(f);
+			const target = run(f.main, "rev-parse", "refs/remotes/origin/main");
+
+			const refused = await deleteRemoteBranch(f.main, "main", f.bare, [
+				"main",
+			]);
+			expect(refused).toContain("refusing to delete refs/heads/main");
+			const srcHead = await deleteRemoteBranch(f.main, "ott/card", f.bare, [
+				"main",
+				"ott/card",
+			]);
+			expect(srcHead).toContain("refusing to delete refs/heads/ott/card");
+			// Both branches survived the refusals untouched.
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/main")).toContain(
+				target,
+			);
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).not.toBe(
+				"",
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a failed delete returns the redacted error text", async () => {
+		const f = fixture();
+		try {
+			pushCardBranch(f);
+			const missing = join(f.dir, "missing-origin.git");
+			const err = await deleteRemoteBranch(f.main, "ott/card", missing);
+			expect(err).toContain(missing);
+			// The branch is still there: the failed delete changed nothing.
+			expect(run(f.main, "ls-remote", f.bare, "refs/heads/ott/card")).not.toBe(
+				"",
 			);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });

@@ -210,7 +210,40 @@ merge").
   reason "PR #N closed without merging". The branch and worktree stay so a
   reply can iterate; `pushSha` clears. A later merge turn pushes the branch
   again and opens a fresh PR (GitHub opens a new PR for a branch whose old
-  PR is closed). Cancelling the card ends it as today.
+  PR is closed). Cancelling the card ends it as today and deletes the remote
+  card branch (the delete section below); with a still-open PR, GitHub closes
+  the PR when its head branch goes.
+
+## Remote card-branch delete (OTTR-800)
+
+The ship step pushes the card branch to origin; until now nothing deleted it
+again, so every finished PR-mode card left one branch on origin for ever
+unless the repo's "Automatically delete head branches" setting cleaned up.
+The server now deletes the remote card branch when the card ends:
+
+- PR merged: after the done write (`finishPrMerge`), the server deletes
+  `refs/heads/<card branch>` on the pinned origin URL. A ref that is already
+  gone (GitHub's auto-delete ran first) counts as success.
+- Cancel: the cancel flow deletes the remote card branch after the worktree
+  disposal, with an open PR and without one. When the card's pull request is
+  still open, deleting its head branch makes GitHub close the pull request —
+  the one way an Ottr action ends a PR, and a deliberate exception to the
+  "never closes" rule below: no API call closes anything; the card's own
+  branch delete does. The card log names the branch and the PR number. With
+  no PR open (closed unmerged earlier, or the push landed and the PR creation
+  failed), the delete runs the same way.
+- The delete is the push's mirror (src/worktree.ts, next to `pushBranch`):
+  the same pinned-origin-URL guard, the same credential plumbing (`git()`
+  adds the host auth), a refspec of exactly `refs/heads/<card branch>`, and
+  the stale remote-tracking ref cleaned up. A missing remote ref is success;
+  a failed delete never blocks the done write or the cancel — it logs one
+  line on the card.
+- Never deleted: the project's target branch, and an OTTR-760 source PR's
+  head branch (`sourcePrHeadRef`) — the card does not own them; the delete
+  refuses them by name and the refusal lands in the card log.
+- `prMode` off: no delete ever runs (the non-PR flow pushes no card branch).
+  A cancel that kept the worktree (unsaved work) is not a card end: no
+  delete. Branches that earlier cards left on origin are not swept.
 
 ## Open PR that cannot merge (OTTR-789)
 
@@ -338,7 +371,10 @@ server remains the only writer of origin.
 
 ## Non-goals
 
-- Ottr never merges, closes, approves or comments on a pull request.
+- Ottr never merges, closes, approves or comments on a pull request through
+  the GitHub API. The one exception is mechanical (OTTR-800): cancelling a
+  card deletes its own remote branch, and GitHub closes an open PR whose
+  head branch disappears.
 - No GitLab, Bitbucket or other forge; one GitHub host per board
   (docs/specs/github-host.md).
 - Same-repo PR heads only — no fork-based PRs.
@@ -398,6 +434,13 @@ server remains the only writer of origin.
 - A parked card stays tracked: a merged PR finishes the card `done`, and a
   PR closed without a merge parks it `in_progress`/`needs_you` with the
   closed reason.
+- Remote card-branch delete (OTTR-800): the delete runs real git against a
+  bare origin — the branch is gone, a second delete of the same branch
+  reports success, a target-branch name or a source-PR head is refused.
+  Call-site tests assert the exact git arguments for merged, cancel without
+  an open PR, and cancel with an open PR. A failed delete leaves the card
+  done (or cancelled) and adds one log line. With `prMode` off, no delete
+  runs.
 - Fresh and migrated databases converge on the new columns; no CHECK
   migration.
 - `bun run check` and `bun test` exit 0 from the worktree root.

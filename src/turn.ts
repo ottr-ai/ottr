@@ -154,6 +154,7 @@ import type {
 	checkoutState,
 	commitsAhead,
 	createWorktree,
+	deleteRemoteBranch,
 	diffStat,
 	diffText,
 	fetchOriginBranch,
@@ -909,6 +910,8 @@ export interface TurnOps {
 	pushAuthKind?: (url: string) => string | null;
 	/** PR mode: pushes the card branch to the pinned origin from the main checkout (same plumbing as serverMergePush). */
 	pushBranch?: typeof pushBranch;
+	/** OTTR-800: deletes the pushed remote card branch when a PR-mode card ends (git() adds the host auth). */
+	deleteRemoteBranch?: typeof deleteRemoteBranch;
 	/** PR mode: adopts or opens the pull request for the card branch (gh via runGh). */
 	openPr?: typeof openPullRequest;
 	/** PR mode: the integrated proof — clean worktree tree and origin/<target> an ancestor of HEAD. */
@@ -8866,6 +8869,48 @@ export function createTurnLoop(
 		return null;
 	}
 
+	/** OTTR-800: the cancel's remote branch delete. The cancel removed the local branch;
+	 * the remote card branch the ship step pushed would stay on origin for ever. Runs only
+	 * in PR mode with a pinned origin, names exactly the card's own branch, and the target
+	 * branch and an OTTR-760 source-PR head are refused (the card does not own them). A
+	 * missing remote ref is success; a failed delete never blocks the cancel — it logs one
+	 * line. A cancel that kept the worktree never reaches this: the card did not end. */
+	async function deleteCancelledRemoteBranch(
+		e: TurnProject,
+		id: string,
+		task: ListedTask | null | undefined,
+	): Promise<void> {
+		const branch = task?.branch ?? null;
+		const settings = e.store.getSettings();
+		const originUrl = settings.originUrl;
+		if (
+			task === null ||
+			task === undefined ||
+			branch === null ||
+			originUrl === null
+		)
+			return;
+		if (settings.prMode !== true || ops.deleteRemoteBranch === undefined)
+			return;
+		const keep = [e.target ?? task.base, task.sourcePrHeadRef].filter(
+			(b): b is string => b !== null,
+		);
+		const err = await ops
+			.deleteRemoteBranch(e.path, branch, originUrl, keep)
+			.catch((err: unknown) => errmsg(err));
+		if (err !== null) {
+			appendLog(e.store, id, `! cancel remote branch delete failed: ${err}`);
+			return;
+		}
+		appendLog(
+			e.store,
+			id,
+			task.prNumber !== null
+				? `cancel: removed remote branch ${branch}; PR #${task.prNumber} closed with it`
+				: `cancel: removed remote branch ${branch}`,
+		);
+	}
+
 	/**
 	 * Stops the task and deletes its worktree and branch. Unless forced, work they hold that isn't on the
 	 * target is kept and the card asks you instead; returns what was kept.
@@ -8900,6 +8945,7 @@ export function createTurnLoop(
 			);
 			if (kept !== null) return kept;
 		}
+		await deleteCancelledRemoteBranch(e, id, task);
 		store.updateTask(id, { state: "idle" });
 		return { removed: true };
 	}

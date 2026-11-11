@@ -30,6 +30,7 @@ import type { SweptProcess, WorkerTarget } from "./workers.ts";
 import type {
 	branchMergedOrGone,
 	commitsAhead,
+	deleteRemoteBranch,
 	fetchOriginBranch,
 	fetchPrHead,
 	isClean,
@@ -76,6 +77,8 @@ export interface SupervisorOps {
 	fetchOriginBranch: typeof fetchOriginBranch;
 	/** OTTR-755 dependabotPass: fetches one PR head ref into the main checkout (git() adds the host auth). */
 	fetchPrHead: typeof fetchPrHead;
+	/** OTTR-800 prPass: deletes the pushed remote card branch when a PR merge finishes the card (git() adds the host auth). */
+	deleteRemoteBranch: typeof deleteRemoteBranch;
 	targetCommits(
 		mainPath: string,
 		target: string | null,
@@ -1774,6 +1777,36 @@ export function createSupervisor(
 		return true;
 	}
 
+	/** PR merged: deletes the remote card branch the ship step pushed (OTTR-800). The done
+	 * write already landed, so a failed delete only logs one line. The target branch and an
+	 * OTTR-760 source-PR head are refused (the card does not own them); a missing remote ref
+	 * (GitHub's auto-delete) is success. */
+	async function finishPrDeleteRemote(
+		e: SupervisorEntry,
+		settings: ProjectSettings,
+		t: ListedTask,
+	): Promise<void> {
+		const branch = t.branch;
+		const originUrl = settings.originUrl;
+		if (branch === null || originUrl === null || settings.prMode !== true)
+			return;
+		const keep = [e.target ?? t.base, t.sourcePrHeadRef].filter(
+			(b): b is string => b !== null,
+		);
+		const err = await ops
+			.deleteRemoteBranch(e.path, branch, originUrl, keep)
+			.catch((err: unknown) => errmsg(err));
+		if (err !== null) {
+			ops.appendLog(
+				e.store,
+				t.id,
+				`supervisor: remote branch delete failed: ${err}`,
+			);
+			return;
+		}
+		ops.appendLog(e.store, t.id, `supervisor: removed remote branch ${branch}`);
+	}
+
 	/** PR merged on GitHub: finish the card like a merge turn's done write — fetch the target,
 	 * pin pushSha to the merge commit when it is the fetched origin tip, stamp the release when
 	 * a tag points at that commit, remove the worktree. A reply, steer or cancel landing during
@@ -1799,6 +1832,7 @@ export function createSupervisor(
 		const wt = t.worktree;
 		await finishPrMergeStamp(e, t, mergeCommit, onOrigin);
 		if (wt !== null && existsSync(wt)) await finishPrMergeRemove(e, t, wt);
+		await finishPrDeleteRemote(e, settings, t);
 		ops.appendLog(
 			e.store,
 			t.id,

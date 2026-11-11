@@ -45,6 +45,13 @@ interface FakeOps extends SupervisorOps {
 		quarantine: { worktreePath: string; quarantineDir: string }[];
 		fetches: string[];
 		prFetches: { mainPath: string; n: number; url: string }[];
+		/** OTTR-800: the prPass remote branch delete calls, in order. */
+		deletes: {
+			mainPath: string;
+			branch: string;
+			originUrl: string;
+			keep: readonly string[];
+		}[];
 		scheduled: number;
 	};
 	// prPass: every `gh api ...` call's args, in order
@@ -65,6 +72,8 @@ interface FakeOps extends SupervisorOps {
 	status: string[];
 	failUnsaved: boolean;
 	removeErr: Error | null;
+	// OTTR-800: deleteRemoteBranch returns this error text instead of null when set
+	deleteErr: string | null;
 	ghResult: { code: number; stdout: string; stderr: string } | Error | null;
 	ghCalls: number;
 	runViewResult:
@@ -129,6 +138,7 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			quarantine: [],
 			fetches: [],
 			prFetches: [],
+			deletes: [],
 			scheduled: 0,
 		},
 		apiCalls: [],
@@ -140,6 +150,7 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		status: [],
 		failUnsaved: false,
 		removeErr: null,
+		deleteErr: null,
 		ghResult: null,
 		ghCalls: 0,
 		runViewResult: null,
@@ -168,6 +179,15 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		removeWorktree: async (o) => {
 			ops.calls.remove.push(o);
 			if (ops.removeErr) throw ops.removeErr;
+		},
+		deleteRemoteBranch: async (
+			mainPath: string,
+			branch: string,
+			originUrl: string,
+			keep: readonly string[] = [],
+		) => {
+			ops.calls.deletes.push({ mainPath, branch, originUrl, keep });
+			return ops.deleteErr;
 		},
 		unsavedWork: async () => {
 			if (ops.failUnsaved) throw new Error("git boom");
@@ -3039,6 +3059,86 @@ describe("prPass", () => {
 		]);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 merged; card done");
+		// OTTR-800: the pushed remote card branch goes when the done write landed.
+		expect(ops.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main"],
+			},
+		]);
+		expect(log).toContain("supervisor: removed remote branch ottr/552");
+		store.close();
+	});
+
+	test("a failed remote branch delete logs one line and leaves the card done", async () => {
+		const store = prModeProject("pr-merged-del-fail");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = prCard(store);
+		const ops = fakeOps({
+			deleteErr: "git boom",
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		expect(ops.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main"],
+			},
+		]);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("supervisor: remote branch delete failed: git boom");
+		store.close();
+	});
+
+	test("a source-PR head branch is never deleted", async () => {
+		const store = prModeProject("pr-merged-src-head");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = prCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/7")
+					? {
+							code: 0,
+							stdout: pullBody({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		// The card still finished, and the delete call carries the head the card does
+		// not own: the real deleteRemoteBranch refuses a kept name (worktree tests).
+		expect(store.getTask(t.id)!.stage).toBe("done");
+		expect(ops.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main", "ottr/552"],
+			},
+		]);
 		store.close();
 	});
 
@@ -3148,6 +3248,8 @@ describe("prPass", () => {
 		expect(after.prNumber).toBe(7);
 		expect(after.prUrl).toContain("/pull/7");
 		expect(ops.calls.remove).toEqual([]);
+		// OTTR-800: the card did not end — no remote branch delete.
+		expect(ops.calls.deletes).toEqual([]);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 closed without merging");
 		store.close();

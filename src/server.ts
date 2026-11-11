@@ -80,6 +80,7 @@ import {
 	checkoutState,
 	commitsAhead,
 	createWorktree,
+	deleteRemoteBranch,
 	describeVersion,
 	diffStat,
 	diffText,
@@ -621,6 +622,9 @@ const loop = createTurnLoop(projects, {
 	// clean worktree with origin/<target> an ancestor of HEAD.
 	pushBranch,
 	openPr: openPullRequest,
+	// OTTR-800: when a PR-mode card ends (PR merged, cancel), the server deletes the remote
+	// card branch the ship step pushed; the target branch and a source-PR head are refused.
+	deleteRemoteBranch,
 	// OTTR-760: the ship step comments on a card's source PR ("@dependabot rebase", or the
 	// fixes note) when the work cannot ride a push to the PR's head branch.
 	prComment: commentOnPullRequest,
@@ -715,6 +719,7 @@ const supervisor = createSupervisor(
 		targetSha,
 		fetchOriginBranch,
 		fetchPrHead,
+		deleteRemoteBranch,
 	},
 	workerTarget,
 );

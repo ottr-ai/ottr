@@ -1906,6 +1906,42 @@ export async function pushBranch(
 }
 
 /**
+ * OTTR-800, PR mode's end-of-card remote branch delete: the mirror of pushBranch. When a
+ * PR-mode card ends (the PR merged, or the card is cancelled), the remote card branch the
+ * ship step pushed would otherwise stay on origin for ever. The delete runs the same
+ * pinned-origin-URL guard and credential plumbing as the push (git() adds the host auth)
+ * and names exactly `refs/heads/<branch>`. `keep` lists branch names the card does not own
+ * (the target branch, an OTTR-760 source PR head); a branch on that list is refused
+ * without touching git. A missing remote ref (GitHub's auto-delete ran first, a second
+ * delete) is success, and on success the stale remote-tracking ref goes too (best effort,
+ * like pushBranch's write). Returns the redacted error text, else null; callers log it
+ * and never treat a failed delete as a card-end failure.
+ */
+export async function deleteRemoteBranch(
+	mainPath: string,
+	branch: string,
+	originUrl: string,
+	keep: readonly string[] = [],
+): Promise<string | null> {
+	if (keep.includes(branch))
+		return `refusing to delete refs/heads/${branch}: the card does not own it (target branch or source-PR head)`;
+	const guard = await checkPinnedRemote(mainPath, originUrl);
+	if (guard !== null) return guard;
+	const r = await git(
+		["push", originUrl, "--delete", `refs/heads/${branch}`],
+		mainPath,
+	);
+	if (r.code === 0) {
+		await git(["update-ref", "-d", `refs/remotes/origin/${branch}`], mainPath); // best effort
+		return null;
+	}
+	const out = `${r.stdout}${r.stderr}`;
+	// The wanted end state already happened (GitHub's auto-delete, a second delete).
+	if (out.includes("remote ref does not exist")) return null;
+	return cappedPushOutput(redactUrlCredentials(out.trim())) ?? null;
+}
+
+/**
  * OTTR-394: the server-side fetch that backs an automatic rebase retry. A rejected merge
  * push means origin moved while the merge ran; the queued rebase turn needs a current
  * origin/<branch> to rebase onto, and the merge agent holds no git credentials (D6). The

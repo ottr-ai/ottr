@@ -38,5 +38,12 @@ the server remains the only writer of origin.
   at once.
 - Ottr never merges, closes, approves or comments on a PR; humans merge under
   the repo's protection rules.
+- When a PR-mode card ends, the server deletes the remote card branch it
+  pushed: after the done write when the PR merged, and on a cancel — with an
+  open PR too, whose head branch's deletion makes GitHub close the PR. No
+  API call ever merges or closes anything; the rule above governs API actions
+  only (docs/specs/pr-mode.md, Remote card-branch delete, OTTR-800). The
+  delete names only the card's own branch — the target branch and a
+  source-PR head are refused — and the server remains origin's only writer.
 - ADR 0002 stays authoritative for the default path and for "only the server
   pushes"; this ADR supersedes it only for projects that opt in.
