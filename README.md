@@ -94,7 +94,7 @@ The board's prompts name skills and rules. A prompt stops with a `needs_you` rep
 | codeguard rules | [cosai-oasis/project-codeguard](https://github.com/cosai-oasis/project-codeguard) | every review |
 | `codebase-design` | [mattpocock/skills](https://github.com/mattpocock/skills) | review architecture lens |
 | `ponytail-audit` | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) | review architecture lens |
-| `retro` | private agent-data repo | the end-of-task retro |
+| `retro` | ships in this repo: `.agents/skills/retro` | the end-of-task retro |
 
 omp loads `.agents/skills/` from the repo for runs in this checkout. Install a shipped skill into another home with the skills CLI (`npx skills add`). The third-party skills come from their repos with the skills CLI or a data repo.
 

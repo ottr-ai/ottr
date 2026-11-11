@@ -17,7 +17,7 @@ export interface RequiredSkill {
 	kind: "skill" | "rules";
 	/** Which prompt or button names it. */
 	usedBy: SkillUse;
-	/** True when this repo ships the text under skills/<name>/. */
+	/** True when this repo ships the text under .agents/skills/<name>/. */
 	shipped: boolean;
 	/** Public repo that holds the text, or "private data repo" when none is public. */
 	source: string;
@@ -63,7 +63,7 @@ export const REQUIRED_SKILLS: RequiredSkill[] = [
 		kind: "skill",
 		usedBy: "review",
 		shipped: true,
-		source: "skills/ui-ux-check (this repo)",
+		source: ".agents/skills/ui-ux-check (this repo)",
 	},
 	{
 		name: "diff-security-review",
@@ -71,28 +71,28 @@ export const REQUIRED_SKILLS: RequiredSkill[] = [
 		usedBy: "merge",
 		shipped: true,
 		source:
-			"skills/diff-security-review (this repo; ported from anthropics/claude-code-security-review, MIT)",
+			".agents/skills/diff-security-review (this repo; ported from anthropics/claude-code-security-review, MIT)",
 	},
 	{
 		name: "explain-project",
 		kind: "skill",
 		usedBy: "diagrams",
 		shipped: true,
-		source: "skills/explain-project (this repo)",
+		source: ".agents/skills/explain-project (this repo)",
 	},
 	{
 		name: "check-ottr-board",
 		kind: "skill",
 		usedBy: "board-check",
 		shipped: true,
-		source: "skills/check-ottr-board (this repo)",
+		source: ".agents/skills/check-ottr-board (this repo)",
 	},
 	{
 		name: "retro",
 		kind: "skill",
 		usedBy: "retro",
-		shipped: false,
-		source: "private data repo",
+		shipped: true,
+		source: ".agents/skills/retro (this repo)",
 	},
 ];
 

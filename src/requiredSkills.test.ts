@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import {
 	missingByUse,
 	missingRequired,
@@ -82,6 +84,17 @@ describe("REQUIRED_SKILLS", () => {
 	test("shipped entries carry this repo as their source", () => {
 		for (const entry of REQUIRED_SKILLS.filter((e) => e.shipped))
 			expect(entry.source).toContain("(this repo");
+	});
+
+	test("every this-repo source path exists in the repo tree", () => {
+		for (const entry of REQUIRED_SKILLS.filter((e) => e.shipped)) {
+			const path = entry.source.slice(0, entry.source.indexOf(" ("));
+			// The README names .agents/skills/<name>; a bare skills/<name> is stale.
+			expect(path.startsWith(".agents/skills/")).toBe(true);
+			expect(existsSync(join(import.meta.dir, "..", path, "SKILL.md"))).toBe(
+				true,
+			);
+		}
 	});
 
 	test("unshipped entries name where the text lives", () => {
