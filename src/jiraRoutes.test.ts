@@ -666,7 +666,9 @@ describe("board-wide search and import", () => {
 		expect(unknownProject.status).toBe(400);
 		expect(unknownProject.json.error).toBe("unknown project: nope");
 		for (const store of [p1, p2])
-			expect(store.jiraImported("https://jira.test", ["BULK-2010"]).size).toBe(0);
+			expect(store.jiraImported("https://jira.test", ["BULK-2010"]).size).toBe(
+				0,
+			);
 		const ok = await boardImport([{ key: "BULK-2011", project: "p1" }]);
 		expect(ok.status).toBe(200);
 		expect(ok.json.filed).toHaveLength(1);

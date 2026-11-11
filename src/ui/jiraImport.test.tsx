@@ -941,6 +941,81 @@ describe("JiraBoardImportDialog", () => {
 		}
 	});
 
+	test("switching the connection drops the loaded rows and their cursor", async () => {
+		const { container, calls, unmount } = await boardDialog(
+			({ url, method, body }) => {
+				if (url.endsWith(CONNS) && method === "GET")
+					return json(200, [
+						{
+							name: "work",
+							site: "https://acme.atlassian.net",
+							type: "cloud",
+							email: "me@acme.test",
+							customFields: [],
+							tokenSet: true,
+							tokenReadable: true,
+							usedBy: [],
+						},
+						{
+							name: "other",
+							site: "https://jira.corp.test",
+							type: "datacenter",
+							email: null,
+							customFields: [],
+							tokenSet: true,
+							tokenReadable: true,
+							usedBy: [],
+						},
+					]);
+				const cursor =
+					typeof body === "object" && body !== null && "cursor" in body
+						? body.cursor
+						: null;
+				const conn =
+					typeof body === "object" && body !== null && "connection" in body
+						? String(body.connection)
+						: "";
+				return cursor === null
+					? json(200, {
+							rows: [boardRow(conn === "work" ? "BRD-1" : "BRD-9")],
+							next: "page-2",
+							total: 2,
+						})
+					: json(200, { rows: [], next: null, total: 2 });
+			},
+		);
+		try {
+			const area = boardSearch(container);
+			await fire(area, "onChange", { target: { value: "order by key" } });
+			await submit(q(container, "form.jira-search"));
+			expect(container.querySelectorAll("li.jira-row")).toHaveLength(1);
+			expect(loadMore(container)).toBeDefined();
+			// A switch starts over: the old rows and their cursor belong to the old
+			// site, so Load more can never send them to the other connection.
+			const conn = q<HTMLSelectElement>(container, "form.jira-search select");
+			await fire(conn, "onChange", { target: { value: "other" } });
+			expect(container.querySelectorAll("li.jira-row")).toHaveLength(0);
+			expect(loadMore(container)).toBeUndefined();
+			expect(boardImportButton(container).disabled).toBe(true);
+			// The next search goes to the new connection with no stale cursor.
+			await fire(area, "onChange", { target: { value: "order by key" } });
+			await submit(q(container, "form.jira-search"));
+			expect(calls[1]?.body).toEqual({
+				connection: "work",
+				jql: "order by key",
+				cursor: null,
+			});
+			expect(calls[2]?.body).toEqual({
+				connection: "other",
+				jql: "order by key",
+				cursor: null,
+			});
+			expect(container.querySelectorAll("li.jira-row")).toHaveLength(1);
+		} finally {
+			await unmount();
+		}
+	});
+
 	test("skip keeps the row out of the assignments", async () => {
 		const { container, calls, unmount } = await boardDialog(
 			({ url, method, body }) => {

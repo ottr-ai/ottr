@@ -611,7 +611,18 @@ export function JiraBoardImportDialog({
 							<select
 								id={`${jqlId}-conn`}
 								value={connection}
-								onChange={(e) => setConnection(e.target.value)}
+								onChange={(e) => {
+									setConnection(e.target.value);
+									// The loaded rows belong to the connection that searched them:
+									// their cursor, urls and importedIn facts are that site's. A
+									// switch drops them, so Load more and Import can never pair
+									// one site's cursor with another connection (spec section 6).
+									setRows(null);
+									setNext(null);
+									setPages(0);
+									setPicks({});
+									setNote(null);
+								}}
 							>
 								{conns.map((c) => (
 									<option key={c.name} value={c.name}>
