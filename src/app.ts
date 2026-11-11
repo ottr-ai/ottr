@@ -6618,6 +6618,11 @@ export function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsTasksSteerCancelByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/steer/cancel">,
 	): Promise<Response> {
+		// The body read finishes before the task is resolved: a body that pauses
+		// mid-read must not let the turn loop's queued→running flip hide behind the
+		// earlier snapshot, so the checks and the guarded write below stay one sync
+		// block, like every other user-edit route.
+		const body = await readOptionalJson(req);
 		const found = resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
@@ -6652,7 +6657,7 @@ export function createApp(deps: AppDeps) {
 						}
 					: {}),
 			},
-			await readOptionalJson(req),
+			body,
 		);
 		if (res instanceof Response) return res;
 		return json(taskView(e, res));

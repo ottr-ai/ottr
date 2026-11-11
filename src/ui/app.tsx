@@ -12727,13 +12727,6 @@ export function Drawer({
 		report: null,
 		diffFiles: null,
 	};
-	// The drawer live-polls the server: the queued text the steering editor was opened
-	// with can be delivered or appended to while the editor sits open. A stale draft
-	// must never open over — and a later Save replace — newer steering, so any
-	// pendingPrompt change clears it.
-	useEffect(() => {
-		setSteerEdit(null);
-	}, [task.pendingPrompt]);
 	// Work steps rail: this card's turns, its work check runs, its retro's turns and its
 	// review's finding turns by start time.
 	const steps = workSteps(
@@ -13177,6 +13170,20 @@ export function Drawer({
 		setSteerConflict(null);
 		setSteerEdit(text);
 	};
+	// The drawer live-polls the server: the queued text the steering editor was opened
+	// with can be delivered or appended to while the editor sits open. A stale draft
+	// must never open over — and a later Save replace — newer steering, so a
+	// pendingPrompt change clears it. A refused save is the exception: the conflict
+	// flow keeps the user's text across refreshes and re-arms the revision, so the
+	// poll's own pendingPrompt change must not wipe the draft the notice says is
+	// kept. The last-seen ref keeps the conflict flip itself (openSteerEdit clearing
+	// it to re-open the editor) from reading as a change.
+	const lastPendingPrompt = useRef(task.pendingPrompt);
+	useEffect(() => {
+		const changed = task.pendingPrompt !== lastPendingPrompt.current;
+		lastPendingPrompt.current = task.pendingPrompt;
+		if (changed && steerConflict === null) setSteerEdit(null);
+	}, [task.pendingPrompt, steerConflict]);
 	/** Switches the model the agent's next turn runs with; lands in-between turns like a steer.
 	 *  The picker leads: the picked name shows at once, the POST follows, a failure rolls back. */
 	const modelUrl = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/model`;

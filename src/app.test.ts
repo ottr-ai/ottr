@@ -5986,6 +5986,62 @@ describe("revision guard", () => {
 		}
 	});
 
+	test("a slow cancel body cannot act on a stale queued snapshot", async () => {
+		// The body read finishes before the task is resolved: a body that pauses
+		// mid-read must not let the turn loop's queued→running flip hide behind the
+		// earlier snapshot, or the stale patch would park a running card.
+		const t = store.createTask("steered");
+		store.updateTask(t.id, { pendingPrompt: "my steering", pendingBy: "user" });
+		const enc = new TextEncoder();
+		const held = Promise.withResolvers<void>();
+		const pulled = Promise.withResolvers<void>();
+		let gated = false;
+		const body = new ReadableStream<Uint8Array>({
+			start(c) {
+				c.enqueue(enc.encode('{"revision"'));
+			},
+			async pull(c) {
+				if (!gated) {
+					gated = true;
+					// The server consumed the first chunk and waits for more: the route
+					// is inside its body read right now.
+					pulled.resolve();
+					await held.promise;
+					c.enqueue(enc.encode(":3}"));
+				}
+				c.close();
+			},
+		});
+		const resP = fetch(
+			new URL(`/api/projects/p1/tasks/${t.id}/steer/cancel`, server.url),
+			{
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					Host: "127.0.0.1:0",
+					Origin: "http://127.0.0.1:0",
+				},
+				body: body as unknown as BodyInit,
+				duplex: "half",
+			} as RequestInit,
+		);
+		await pulled.promise;
+		// The turn consumes the steer while the body sits open.
+		store.updateTask(t.id, {
+			state: "running",
+			pendingPrompt: null,
+			pendingBy: null,
+		});
+		held.resolve();
+		const res = await resP;
+		expect(res.status).toBe(409);
+		expect(await errorOf(res)).toBe("no steering is queued");
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("running");
+		expect(after.needsReason).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
+	});
+
 	test("a stale release-notes edit answers 409 and keeps the first write", async () => {
 		const t = store.createTask("release card");
 		store.updateTask(t.id, {

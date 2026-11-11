@@ -3149,6 +3149,111 @@ describe("Drawer queued steering edit (client)", () => {
 			globalThis.fetch = realFetch;
 		}
 	});
+
+	test("a refused steer edit keeps the draft across the detail refresh", async () => {
+		const realFetch = globalThis.fetch;
+		// The save flows through the act prop; the stub base.act never runs the
+		// body, so this test passes an act with the production contract: run the
+		// body, swallow its error, report false.
+		const runAct = async (fn: () => Promise<void>): Promise<boolean> => {
+			try {
+				await fn();
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		// The steer edit save is refused with the board's current row; every other
+		// fetch (task detail, session context, catalog) degrades to null like the
+		// replaced-steer test above, so the row's own fields stay authoritative.
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.includes("/steer/edit")) {
+				return new Response(
+					JSON.stringify({
+						error: "card changed since it was loaded",
+						task: { id: "t1", revision: 9, pendingPrompt: "second steer" },
+					}),
+					{ status: 409 },
+				);
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const task = (prompt: string) =>
+			cardFixture({
+				...drawerFields,
+				stage: "todo",
+				state: "queued",
+				pendingPrompt: prompt,
+			});
+		const editButton = (): Element => {
+			const node = container.querySelector(
+				'button[aria-label="Edit the queued steering"]',
+			);
+			if (node === null) throw new Error("no Edit button");
+			return node;
+		};
+		const editor = (): HTMLTextAreaElement | null =>
+			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		try {
+			await act(async () => {
+				root.render(
+					<Drawer {...base} act={runAct} task={task("first steer")} />,
+				);
+			});
+			await act(async () => {
+				onClickOf(editButton())({});
+			});
+			expect(editor()?.value).toBe("first steer");
+			// The save is refused with the board's newer steering: the conflict flow
+			// keeps the draft and re-arms the revision.
+			const form = editor()?.closest("form");
+			if (form == null) throw new Error("no steer edit form");
+			await act(async () => {
+				form.dispatchEvent(
+					new window.Event("submit", {
+						bubbles: true,
+						cancelable: true,
+					}) as unknown as Event,
+				);
+			});
+			expect(container.textContent).toContain("changed while you were editing");
+			expect(container.textContent).toContain("second steer");
+			expect(editor()?.value).toBe("first steer");
+			// A detail refresh lands the board's newer pendingPrompt while the
+			// conflict is shown: the draft the notice says is kept must survive it.
+			await act(async () => {
+				root.render(
+					<Drawer {...base} act={runAct} task={task("second steer")} />,
+				);
+			});
+			expect(container.textContent).toContain("changed while you were editing");
+			expect(editor()?.value).toBe("first steer");
+			// Re-opening the editor clears the conflict, and the old behavior
+			// resumes: a pendingPrompt change with no conflict closes the editor.
+			await act(async () => {
+				onClickOf(editButton())({});
+			});
+			expect(editor()?.value).toBe("second steer");
+			await act(async () => {
+				root.render(
+					<Drawer {...base} act={runAct} task={task("fourth steer")} />,
+				);
+			});
+			expect(editor()).toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
 });
 
 describe("Drawer start actions wait for the prompt edit (client)", () => {
