@@ -714,6 +714,7 @@ function parseWorkCheckRun(r: unknown): WorkCheckRun | null {
 		durationMs: typeof e.durationMs === "number" ? e.durationMs : 0,
 		error: typeof e.error === "string" ? e.error : undefined,
 		warn: typeof e.warn === "string" ? e.warn : undefined,
+		direction: typeof e.direction === "string" ? e.direction : undefined,
 	};
 }
 

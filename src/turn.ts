@@ -55,7 +55,6 @@ import {
 	reviewCheckPrompt,
 	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
-	workCheckDirectionOf,
 	workCheckPrompt,
 	workCheckSendBack,
 	workPrompt,
@@ -8116,21 +8115,24 @@ export function createTurnLoop(
 		// extra check run, not a wrong verdict.
 		const lastRun = priorLog[priorLog.length - 1];
 		const lastCheckAt = lastRun === undefined ? 0 : lastRun.at;
-		const replies: string[] = [];
-		for (const t of st.store.listTurns(st.id)) {
-			if (t.input === null || t.startedAt <= lastCheckAt) continue;
-			if (t.input.startsWith(WORK_CHECK_SENDBACK_OPENING)) {
-				// A tracker send-back is not a human reply, but a directed send-back
-				// carries the user's or the board's new direction in its trailing
-				// section; the next check must judge that directed approach.
-				const direction = workCheckDirectionOf(t.input);
-				if (direction !== null) replies.push(direction);
-				continue;
-			}
-			// ponytail: only the send-back prefix is filtered; a tracker prompt from
-			// another flow (rare here) would cost one extra check run, not a wrong
-			// verdict.
-			replies.push(t.input);
+		const replies = st.store
+			.listTurns(st.id)
+			.filter(
+				(t) =>
+					t.input !== null &&
+					t.startedAt > lastCheckAt &&
+					!t.input.startsWith(WORK_CHECK_SENDBACK_OPENING),
+			)
+			.map((t) => t.input as string);
+		// A directed send-back (the user's typed direction, or the board's rethink on a
+		// counts-only park) rides in the log, out of band — never parsed from the sent-back
+		// text, which carries agent-controlled quotes. The last blockers run holds it until a
+		// newer run supersedes it, so it reaches exactly the checks that follow that send-back.
+		for (let i = priorLog.length - 1; i >= 0; i--) {
+			const run = priorLog[i];
+			if (run === undefined || run.outcome !== "blockers") continue;
+			if (run.direction !== undefined) replies.push(run.direction);
+			break;
 		}
 		// Every ready report after a send-back gets a fresh check, even at an
 		// unchanged head with no new report text: the update may be new evidence

@@ -380,17 +380,12 @@ ${premise}Do not weaken, delete or special-case tests to make them pass: fix the
 }
 
 /** The direction section a diverging park's send-back may carry: the user's typed reply, or
- * the board's rethink instruction when the user only clicked. routeWorkCheck extracts the
- * section back out of the sent-back turn, so the next check judges the directed approach
- * instead of the old one. */
+ * the board's rethink instruction when the user only clicked. This section is for the work
+ * agent's eyes; the next check reads the same direction out of band from the stored
+ * workCheckLog entry, never by parsing this text. */
 export const WORK_CHECK_DIRECTION_HEADER = "New direction for the approach:";
 export function workCheckSendBackDirection(direction: string): string {
 	return `${WORK_CHECK_DIRECTION_HEADER}\n${direction}`;
-}
-export function workCheckDirectionOf(text: string): string | null {
-	const marker = `\n${WORK_CHECK_DIRECTION_HEADER}\n`;
-	const i = text.indexOf(marker);
-	return i === -1 ? null : text.slice(i + marker.length);
 }
 
 export function releasePrompt(o: {

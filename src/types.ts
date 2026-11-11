@@ -539,6 +539,11 @@ export interface WorkCheckRun {
 	/** Why the check gives no second-model opinion: it ran on the checked run's own model
 	 *  or at least its vendor (checkModelWarning). Absent when the check differs in vendor. */
 	warn?: string;
+	/** The direction this send-back round carries: a user's typed reply, or the board's rethink
+	 *  instruction on a counts-only park. Stamped when the send-back queues (app.ts), so the next
+	 *  check judges the directed approach without parsing the sent-back text. Absent on plain
+	 *  rounds and on old records. */
+	direction?: string;
 }
 
 /** What to do with one kept worktree file when finishing the card without an agent turn. */

@@ -9054,7 +9054,8 @@ export function createApp(deps: AppDeps) {
 	 * is a plain send-back; on a diverging park, any other text is the user's new
 	 * direction and goes out with it. On a diverging park a click without text
 	 * attaches the board's rethink direction, so the send-back always pushes the
-	 * rethink. */
+	 * rethink. The direction goes out with the send-back for the agent and into
+	 * the log for the next check. */
 	function applyWorkCheckSendBack(
 		e: Entry,
 		task: Task,
@@ -9065,14 +9066,31 @@ export function createApp(deps: AppDeps) {
 		const repeated = repeatedBugClasses(task.workCheckLog);
 		const divergePark =
 			task.needsReason?.startsWith(WORK_CHECK_ASK_DIVERGE) === true;
+		const rethink = `The blocker count did not drop over the last send-backs (blockers per check: ${workCheckBlockerCounts(task.workCheckLog).join(", ")}), so the fixes share a wrong premise. Before you fix one more instance: write down the premise that your fixes share, test the premise against the blockers above, and replace the approach when the premise is wrong.`;
 		const directionSection =
 			direction !== null
 				? workCheckSendBackDirection(direction)
 				: divergePark && repeated.length === 0
-					? workCheckSendBackDirection(
-							`The blocker count did not drop over the last send-backs (blockers per check: ${workCheckBlockerCounts(task.workCheckLog).join(", ")}), so the fixes share a wrong premise. Before you fix one more instance: write down the premise that your fixes share, test the premise against the blockers above, and replace the approach when the premise is wrong.`,
-						)
+					? workCheckSendBackDirection(rethink)
 					: null;
+		// The direction goes out with the send-back for the work agent and into the log
+		// for the next check: it stamps the send-back round's entry so the check reads it
+		// out of band, never by parsing the sent-back text (a copy, so the store's change
+		// detection sees the update).
+		const lastIdx = task.workCheckLog.findLastIndex(
+			(r) => r.outcome === "blockers",
+		);
+		const stampedLog =
+			directionSection === null || lastIdx === -1
+				? null
+				: task.workCheckLog.map((r, i) =>
+						i === lastIdx
+							? {
+									...r,
+									direction: direction !== null ? direction : rethink,
+								}
+							: r,
+					);
 		const text = workCheckSendBack({
 			blockers: open,
 			attempt: n,
@@ -9085,6 +9103,7 @@ export function createApp(deps: AppDeps) {
 				task.pendingPrompt,
 				directionSection === null ? text : `${text}\n${directionSection}`,
 			),
+			...(stampedLog === null ? {} : { workCheckLog: stampedLog }),
 			pendingBy: "supervisor",
 			workCheckSendbacks: n,
 			state: "queued",

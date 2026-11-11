@@ -8135,6 +8135,11 @@ describe("diverging work-check ask", () => {
 			"compare git rev-list output instead of parsing the diff",
 		);
 		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
+		const log = row.workCheckLog;
+		const lastRun = log[log.findLastIndex((r) => r.outcome === "blockers")]!;
+		expect(lastRun.direction).toBe(
+			"compare git rev-list output instead of parsing the diff",
+		);
 	});
 
 	test("a counts-only park's new-approach click attaches the board's rethink direction", async () => {
@@ -8170,6 +8175,14 @@ describe("diverging work-check ask", () => {
 			"replace the approach when the premise is wrong",
 		);
 		expect(row.pendingPrompt).not.toContain("repeated from the previous check");
+		const log = row.workCheckLog;
+		const lastRun = log[log.findLastIndex((r) => r.outcome === "blockers")]!;
+		expect(lastRun.direction).toContain(
+			"did not drop over the last send-backs (blockers per check: 1, 2, 2)",
+		);
+		expect(lastRun.direction).toContain(
+			"replace the approach when the premise is wrong.",
+		);
 	});
 
 	test("a click on a repeated-class park adds only the premise paragraph", async () => {
@@ -8181,6 +8194,9 @@ describe("diverging work-check ask", () => {
 		const row = store.getTask(t.id)!;
 		expect(row.pendingPrompt).toContain("repeated from the previous check");
 		expect(row.pendingPrompt).not.toContain("New direction for the approach:");
+		const log = row.workCheckLog;
+		const lastRun = log[log.findLastIndex((r) => r.outcome === "blockers")]!;
+		expect(lastRun.direction).toBeUndefined();
 	});
 
 	test("Merge anyway overrides the blockers and queues the merge", async () => {
