@@ -5235,9 +5235,23 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 			"sub",
 		]);
 		git(wt, ["commit", "-qm", "sub"]);
-		writeFileSync(join(wt, "child", "c2.txt"), "c2\n");
-		git(join(wt, "child"), ["add", "c2.txt"]);
-		git(join(wt, "child"), ["commit", "-qm", "c2"]);
+		// Advance the submodule CHECKOUT (wt/sub), not the upstream ./child: its HEAD
+		// then differs from the recorded gitlink, so status answers " M sub".
+		writeFileSync(join(wt, "sub", "c2.txt"), "c2\n");
+		git(join(wt, "sub"), ["add", "c2.txt"]);
+		git(join(wt, "sub"), ["commit", "-qm", "c2"]);
+		// Precondition: without the " M sub" row this test exercises nothing.
+		const st = Bun.spawnSync(
+			[gitExe(), "status", "--porcelain", "-z", "--untracked-files=no"],
+			{ cwd: wt, stdout: "pipe", stderr: "pipe" },
+		);
+		expect(st.exitCode).toBe(0);
+		expect(
+			st.stdout
+				.toString()
+				.split("\0")
+				.filter((row) => row !== ""),
+		).toContain(" M sub");
 		writeFileSync(join(wt, "tracked.txt"), "modified\n");
 		writeFileSync(join(wt, "zz-mod.txt"), "zz\n");
 		git(wt, ["add", "zz-mod.txt"]);
