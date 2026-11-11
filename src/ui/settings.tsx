@@ -1112,13 +1112,16 @@ export function NotificationsSection({
 	const [muted, setMuted] = useState<string[]>([]);
 	// "Test sent" is a short confirmation; the button reads "Send test" again after it.
 	const [sent, flashSent] = useFlash(2000);
+	// Bumps the prefs refetch when the queued replay registers a row outside the
+	// normal endpoint-driven load (ADR-0011).
+	const [prefsReload, setPrefsReload] = useState(0);
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
 	// Endpoints recovery already ran for: one pass per subscription, no loop.
 	const recoveredRef = useRef<Set<string>>(new Set());
 	// Queued completion work from a failed flow (ADR-0011): the next load
-	// retries the whole completion — subscribe, classes transfer, old-row
-	// drop — until every step succeeds. typeof guard: server-side render in tests.
+	// retries the whole completion — subscribe with the carried classes,
+	// old-row drop — until every step succeeds. typeof guard: server-side render in tests.
 	const PENDING_SUBSCRIBE_KEY = "ottr.push.pendingSubscribe";
 	// One best-effort replay pass per load: no loop.
 	const pendingRetriedRef = useRef(false);
@@ -1147,7 +1150,9 @@ export function NotificationsSection({
 	// The enable flow's core, shared with stale-sub recovery (ADR-0011): ready →
 	// key → subscribe under the current public key → POST. No permission prompt here.
 	// Returns the subscription so the caller can queue its context on a failure.
-	const subscribeNew = async (): Promise<{
+	const subscribeNew = async (
+		classes?: ClassPrefs,
+	): Promise<{
 		endpoint: string;
 		toJSON(): unknown;
 	}> => {
@@ -1162,8 +1167,13 @@ export function NotificationsSection({
 			userVisibleOnly: true,
 			applicationServerKey: publicKey,
 		});
+		// ADR-0011: the row is created with the carried classes in this one atomic
+		// call, so no second transfer step can race or clobber the switches.
 		try {
-			await post("/api/push/subscribe", sub.toJSON());
+			await post(
+				"/api/push/subscribe",
+				classes !== undefined ? { ...sub.toJSON(), classes } : sub.toJSON(),
+			);
 		} catch (err) {
 			// ADR-0011 recovery: a subscription without a server row sends to a dead
 			// address and never reports stale — undo it so the UI shows the truth.
@@ -1232,25 +1242,30 @@ export function NotificationsSection({
 						if (record !== null && typeof record === "object") {
 							// ADR-0011: replay the whole completion in order; every step
 							// is idempotent, so any failure keeps the record for the next load.
+							// The queued classes ride inside the subscribe body: one atomic
+							// call creates the fresh row with them.
 							const queued = record.subscription as {
 								endpoint?: string;
 							};
-							await post("/api/push/subscribe", record.subscription);
+							await post(
+								"/api/push/subscribe",
+								record.classes !== null
+									? {
+											...(record.subscription as Record<string, unknown>),
+											classes: record.classes,
+										}
+									: record.subscription,
+							);
 							if (
 								record.oldEndpoint !== null &&
 								record.oldEndpoint !== queued.endpoint
 							) {
-								if (record.classes !== null) {
-									await post("/api/notifications/prefs", {
-										endpoint: queued.endpoint,
-										classes: record.classes,
-									});
-								}
 								await post("/api/push/unsubscribe", {
 									endpoint: record.oldEndpoint,
 								});
 							}
 							localStorage.removeItem(PENDING_SUBSCRIBE_KEY);
+							setPrefsReload((n) => n + 1);
 						}
 					} catch {
 						// Silent: the next load retries the same queued record.
@@ -1299,38 +1314,16 @@ export function NotificationsSection({
 					return;
 				}
 				try {
-					const fresh = await subscribeNew();
+					const fresh = await subscribeNew(carried ?? undefined);
 					if (fresh.endpoint !== endpoint) {
-						// Same endpoint: the subscribe replaced the row in place, classes
-						// kept server-side. A moved endpoint must carry the classes before
-						// the old row drops: a failed transfer leaves the old row
-						// stale-bound, so a later load can retry the whole recovery.
-						if (carried !== null) {
-							try {
-								await post("/api/notifications/prefs", {
-									endpoint: fresh.endpoint,
-									classes: carried,
-								});
-							} catch (err) {
-								// ADR-0011: queue the completion — the next load transfers
-								// the classes and drops the old row. The switches show the
-								// preferences the retry will restore.
-								queuePendingSubscribe(fresh, endpoint, carried);
-								setEnabled(true);
-								setEndpoint(fresh.endpoint);
-								setClasses(carried);
-								setError(err instanceof Error ? err.message : String(err));
-								return;
-							}
-						}
-						// A leftover here is a dead row a later send-prune can drop.
+						// ADR-0011: the subscribe created the fresh row with the carried
+						// classes atomically; only the dead old row remains to drop.
 						void post("/api/push/unsubscribe", { endpoint }).catch(() => {});
 					}
-					// Server truth last: the switches match the restored preferences
-					// immediately; the prefs effect refetches and confirms.
+					// Server truth last: the prefs effect refetches the fresh row and
+					// shows the carried preferences; no local stamp needed.
 					setEnabled(true);
 					setEndpoint(fresh.endpoint);
-					setClasses(carried);
 				} catch (err) {
 					const kept = err as Error & {
 						keptSubscription?: boolean;
@@ -1360,9 +1353,19 @@ export function NotificationsSection({
 			endpoint === null ? "" : `?endpoint=${encodeURIComponent(endpoint)}`;
 		let live = true;
 		void fetch(`/api/notifications/prefs${q}`)
-			.then((res) =>
-				unwrap<{ classes: ClassPrefs | null; mutedProjects: string[] }>(res),
-			)
+			.then((res) => {
+				// ADR-0011: on the kept path the fresh endpoint has no row yet — a 404
+				// means "no stored preferences", not a failure. Other statuses fail.
+				if (res.status === 404)
+					return { classes: null, mutedProjects: [] } as {
+						classes: ClassPrefs | null;
+						mutedProjects: string[];
+					};
+				return unwrap<{
+					classes: ClassPrefs | null;
+					mutedProjects: string[];
+				}>(res);
+			})
 			.then((p) => {
 				if (!live) return;
 				classesRef.current = p.classes;
@@ -1378,7 +1381,7 @@ export function NotificationsSection({
 		return () => {
 			live = false;
 		};
-	}, [endpoint]);
+	}, [endpoint, prefsReload]);
 	const enable = (): void =>
 		busy.start(async () => {
 			setError(null);
@@ -1391,6 +1394,18 @@ export function NotificationsSection({
 				setEndpoint(endpoint.endpoint);
 				return true;
 			} catch (err) {
+				const kept = err as Error & {
+					keptSubscription?: boolean;
+					endpoint?: string;
+					keptSub?: { toJSON(): unknown };
+				};
+				if (kept.keptSubscription && kept.keptSub) {
+					// ADR-0011: the browser holds the subscription and the server has no
+					// row — queue the completion for the next load and report the truth.
+					queuePendingSubscribe(kept.keptSub, null, null);
+					setEnabled(true);
+					setEndpoint(kept.endpoint ?? null);
+				}
 				setError(err instanceof Error ? err.message : String(err));
 				return false;
 			}

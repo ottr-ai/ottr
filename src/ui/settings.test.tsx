@@ -3568,17 +3568,21 @@ describe("NotificationsSection stale push recovery", () => {
 			containerText: () => string;
 			containerNode: () => HTMLDivElement;
 			currentSubscription: () => unknown;
+			/** Unmounts and mounts the section again (a second page load). */
+			remount: () => Promise<void>;
 		}) => Promise<void>,
 		subscribeRejects = false,
 		options: {
 			unsubscribeRejects?: boolean;
 			failPostSubscribe?: boolean;
 			newEndpoint?: string;
-			prefsClasses?: unknown;
+			/** The old fixture row's classes (the set recovery carries over). */
+			oldRowClasses?: Record<string, boolean>;
 			/** The subscribe-POST-failure undo (the new subscription's unsubscribe) rejects. */
 			undoRejects?: boolean;
 			failPrefsGet?: boolean;
-			failPrefsPost?: boolean;
+			/** Mounts with no browser subscription, for the enable flow. */
+			noInitialSub?: boolean;
 			/** Initial subscription endpoint (default the old fixture endpoint). */
 			initialEndpoint?: string;
 			/** Seeds the pending-subscribe localStorage record before mount. */
@@ -3595,21 +3599,42 @@ describe("NotificationsSection stale push recovery", () => {
 		);
 		const subscribedKeys: string[] = [];
 		const posts: Array<{ url: string; body: unknown }> = [];
+		// failPostSubscribe fails only the FIRST subscribe POST: a remount's
+		// replay must be able to succeed (the queued record then clears).
+		let subscribePosts = 0;
 		let permissionCalls = 0;
 		const initialEndpoint =
 			options.initialEndpoint ?? "https://push.example.com/old";
+		// The server's stored rows, endpoint → classes. The mock answers prefs GETs
+		// from this map, so a test sees exactly what a real server would hold. Only
+		// the old fixture row exists; a fresh or queued endpoint has none until the
+		// subscribe POST creates it (its prefs GET 404s until then).
+		const ALL_ON = { request: true, error: true, complete: true };
+		const rows = new Map<string, Record<string, boolean>>([
+			[
+				"https://push.example.com/old",
+				options.oldRowClasses ?? {
+					request: true,
+					error: false,
+					complete: true,
+				},
+			],
+		]);
 		let currentSub: {
 			endpoint: string;
 			toJSON: () => unknown;
 			unsubscribe: () => Promise<void>;
-		} | null = {
-			endpoint: initialEndpoint,
-			toJSON: () => ({ endpoint: initialEndpoint }),
-			unsubscribe: async () => {
-				if (options.unsubscribeRejects) throw new Error("unsubscribe failed");
-				currentSub = null;
-			},
-		};
+		} | null = options.noInitialSub
+			? null
+			: {
+					endpoint: initialEndpoint,
+					toJSON: () => ({ endpoint: initialEndpoint }),
+					unsubscribe: async () => {
+						if (options.unsubscribeRejects)
+							throw new Error("unsubscribe failed");
+						currentSub = null;
+					},
+				};
 		const registration = {
 			pushManager: {
 				getSubscription: async () => currentSub,
@@ -3643,10 +3668,21 @@ describe("NotificationsSection stale push recovery", () => {
 			const target = String(url);
 			if (init?.method === "POST") {
 				posts.push({ url: target, body: JSON.parse(String(init.body)) });
-				if (options.failPostSubscribe && target === "/api/push/subscribe")
-					return Response.json({ error: "boom" }, { status: 500 });
-				if (options.failPrefsPost && target === "/api/notifications/prefs")
-					return Response.json({ error: "prefs post failed" }, { status: 500 });
+				if (target === "/api/push/subscribe") {
+					subscribePosts++;
+					if (options.failPostSubscribe && subscribePosts === 1)
+						return Response.json({ error: "boom" }, { status: 500 });
+					// Server truth: carried classes create the row with them; without
+					// classes a new endpoint starts all-on, a known one keeps its classes.
+					const body = JSON.parse(String(init.body)) as {
+						endpoint: string;
+						classes?: Record<string, boolean>;
+					};
+					rows.set(
+						body.endpoint,
+						body.classes ?? rows.get(body.endpoint) ?? ALL_ON,
+					);
+				}
 				return Response.json({ ok: true });
 			}
 			if (target.startsWith("/api/push/config")) {
@@ -3658,10 +3694,16 @@ describe("NotificationsSection stale push recovery", () => {
 			if (target.startsWith("/api/notifications/prefs")) {
 				if (options.failPrefsGet)
 					return Response.json({ error: "prefs get failed" }, { status: 500 });
-				return Response.json({
-					classes: options.prefsClasses ?? null,
-					mutedProjects: [],
-				});
+				const endpoint = new URL(
+					target,
+					"https://push.example",
+				).searchParams.get("endpoint");
+				if (endpoint === null)
+					return Response.json({ classes: null, mutedProjects: [] });
+				const row = rows.get(endpoint);
+				if (row === undefined)
+					return Response.json({ error: "unknown endpoint" }, { status: 404 });
+				return Response.json({ classes: row, mutedProjects: [] });
 			}
 			return Response.json({ classes: null, mutedProjects: [] });
 		}) as unknown as typeof fetch;
@@ -3717,27 +3759,30 @@ describe("NotificationsSection stale push recovery", () => {
 				PENDING_KEY,
 				JSON.stringify(options.seedPending),
 			);
-		const container = window.document.createElement(
+		let container = window.document.createElement(
 			"div",
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
-		const root = createRoot(container);
-		await act(async () => {
-			root.render(
-				<NotificationsSection
-					projects={projects}
-					act={async (fn) => {
-						try {
-							await fn();
-							return true;
-						} catch {
-							return false;
-						}
-					}}
-				/>,
-			);
-		});
-		await act(async () => {});
+		let root = createRoot(container);
+		const renderSection = async (): Promise<void> => {
+			await act(async () => {
+				root.render(
+					<NotificationsSection
+						projects={projects}
+						act={async (fn) => {
+							try {
+								await fn();
+								return true;
+							} catch {
+								return false;
+							}
+						}}
+					/>,
+				);
+			});
+			await act(async () => {});
+		};
+		await renderSection();
 		try {
 			await run({
 				subscribedKeys,
@@ -3746,6 +3791,19 @@ describe("NotificationsSection stale push recovery", () => {
 				containerText: () => container.textContent ?? "",
 				containerNode: () => container,
 				currentSubscription: () => currentSub,
+				// A second load: unmount, mount fresh, and let the pending replay run.
+				remount: async () => {
+					await act(async () => {
+						root.unmount();
+					});
+					container.remove();
+					container = window.document.createElement(
+						"div",
+					) as unknown as HTMLDivElement;
+					window.document.body.appendChild(container as unknown as HappyNode);
+					root = createRoot(container);
+					await renderSection();
+				},
 			});
 		} finally {
 			globalThis.localStorage.removeItem("ottr.push.pendingSubscribe");
@@ -3797,7 +3855,7 @@ describe("NotificationsSection stale push recovery", () => {
 		});
 	});
 
-	test("a stable-endpoint recovery re-subscribes without touching the server row", async () => {
+	test("a stable-endpoint recovery re-subscribes atomically in one POST", async () => {
 		await withPushBrowser(
 			true,
 			async (probe) => {
@@ -3811,29 +3869,42 @@ describe("NotificationsSection stale push recovery", () => {
 		);
 	});
 
+	/** Reads the class switches from the rendered section. */
+	const rowFor = (
+		container: HTMLDivElement,
+		name: string,
+	): HTMLInputElement | null => {
+		const rows = [...(container.querySelectorAll(".check-row") ?? [])];
+		const row = rows.find((el) => el.textContent?.includes(name));
+		return row?.querySelector("input") ?? null;
+	};
+
 	test("a moved-endpoint recovery carries the old endpoint's classes over", async () => {
 		const classes = { request: true, error: false, complete: true };
 		await withPushBrowser(
 			true,
 			async (probe) => {
+				// One atomic subscribe carries the classes; only the old row drops.
 				expect(probe.posts.map((p) => p.url)).toEqual([
 					"/api/push/subscribe",
-					"/api/notifications/prefs",
 					"/api/push/unsubscribe",
 				]);
-				expect(probe.posts[1]!.body).toEqual({
+				expect(probe.posts[0]!.body).toEqual({
 					endpoint: "https://push.example.com/new",
 					classes,
 				});
-				expect(probe.posts[2]!.body).toEqual({
+				expect(probe.posts[1]!.body).toEqual({
 					endpoint: "https://push.example.com/old",
 				});
-				// The switches match the carried preferences immediately.
-				expect(probe.containerText()).toContain("This device");
-				expect(probe.containerText()).toContain("Request");
+				// The switches show the carried set: the fresh row was created with
+				// it, so the prefs refetch returns it (the row starts all-on, so this
+				// fails if the classes never reached the row).
+				expect(rowFor(probe.containerNode(), "Request")?.checked).toBe(true);
+				expect(rowFor(probe.containerNode(), "Error")?.checked).toBe(false);
+				expect(rowFor(probe.containerNode(), "Complete")?.checked).toBe(true);
 			},
 			false,
-			{ prefsClasses: classes },
+			{ oldRowClasses: classes },
 		);
 	});
 
@@ -3920,7 +3991,7 @@ describe("NotificationsSection stale push recovery", () => {
 				});
 			},
 			false,
-			{ failPostSubscribe: true, undoRejects: true, prefsClasses: classes },
+			{ failPostSubscribe: true, undoRejects: true, oldRowClasses: classes },
 		);
 	});
 
@@ -3929,26 +4000,29 @@ describe("NotificationsSection stale push recovery", () => {
 		await withPushBrowser(
 			false,
 			async (probe) => {
-				// The replay runs the whole completion in order: register the queued
-				// subscription, carry the classes, drop the old row.
+				// Before the replay the fresh endpoint has no row: its prefs GET 404s
+				// and shows no error for it.
+				expect(probe.containerText()).not.toContain("unknown endpoint");
+				// The replay registers the queued subscription with its classes in
+				// the one atomic call, then drops the old row.
 				expect(probe.posts.map((p) => p.url)).toEqual([
 					"/api/push/subscribe",
-					"/api/notifications/prefs",
 					"/api/push/unsubscribe",
 				]);
 				expect(probe.posts[0]!.body).toEqual({
 					endpoint: "https://push.example.com/queued",
-				});
-				expect(probe.posts[1]!.body).toEqual({
-					endpoint: "https://push.example.com/queued",
 					classes,
 				});
-				expect(probe.posts[2]!.body).toEqual({
+				expect(probe.posts[1]!.body).toEqual({
 					endpoint: "https://push.example.com/old",
 				});
 				expect(
 					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
 				).toBeNull();
+				// The reload refetch shows the carried classes on the switches.
+				expect(rowFor(probe.containerNode(), "Request")?.checked).toBe(true);
+				expect(rowFor(probe.containerNode(), "Error")?.checked).toBe(false);
+				expect(rowFor(probe.containerNode(), "Complete")?.checked).toBe(true);
 			},
 			false,
 			{
@@ -3958,34 +4032,6 @@ describe("NotificationsSection stale push recovery", () => {
 					classes,
 				},
 				initialEndpoint: "https://push.example.com/queued",
-			},
-		);
-	});
-
-	test("a failed classes POST in the replay keeps the record for the next load", async () => {
-		const classes = { request: true, error: false, complete: true };
-		await withPushBrowser(
-			false,
-			async (probe) => {
-				// The subscribe ran, the classes POST failed, the old row was not
-				// dropped: the record stays and the next load retries from the top.
-				expect(probe.posts.map((p) => p.url)).toEqual([
-					"/api/push/subscribe",
-					"/api/notifications/prefs",
-				]);
-				expect(
-					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
-				).not.toBeNull();
-			},
-			false,
-			{
-				seedPending: {
-					subscription: { endpoint: "https://push.example.com/queued" },
-					oldEndpoint: "https://push.example.com/old",
-					classes,
-				},
-				initialEndpoint: "https://push.example.com/queued",
-				failPrefsPost: true,
 			},
 		);
 	});
@@ -4030,23 +4076,20 @@ describe("NotificationsSection stale push recovery", () => {
 		);
 	});
 
-	test("a failed classes transfer keeps the old row and reports the error", async () => {
+	test("a failed recovery subscribe POST with a rejecting undo queues the carried classes", async () => {
 		const classes = { request: true, error: false, complete: true };
 		await withPushBrowser(
 			true,
 			async (probe) => {
-				expect(probe.posts.map((p) => p.url)).toEqual([
-					"/api/push/subscribe",
-					"/api/notifications/prefs",
-				]);
-				// The old row was NOT dropped: a later load can retry the transfer.
-				expect(
-					probe.posts.find((p) => p.url === "/api/push/unsubscribe"),
-				).toBeUndefined();
-				expect(probe.containerText()).toContain("prefs post failed");
+				expect(probe.posts.map((p) => p.url)).toEqual(["/api/push/subscribe"]);
+				expect(probe.containerText()).toContain("boom");
 				// The browser holds the fresh subscription: the section reads on.
 				expect(probe.containerText()).toContain("Turn off");
-				// The completion is queued so the next load transfers and drops.
+				// The fresh endpoint has no server row yet: its prefs GET 404s and
+				// shows no error for it.
+				expect(probe.containerText()).not.toContain("unknown endpoint");
+				// The whole completion is queued: the carried classes replay inside
+				// the subscribe body on the next load.
 				expect(
 					JSON.parse(
 						globalThis.localStorage.getItem("ottr.push.pendingSubscribe") ??
@@ -4057,20 +4100,50 @@ describe("NotificationsSection stale push recovery", () => {
 					oldEndpoint: "https://push.example.com/old",
 					classes,
 				});
-				// The switches show the carried preferences the retry will restore.
-				const rows = [
-					...(probe.containerNode().querySelectorAll(".check-row") ?? []),
-				];
-				const rowFor = (name: string): HTMLInputElement | null => {
-					const row = rows.find((el) => el.textContent?.includes(name));
-					return row?.querySelector("input") ?? null;
-				};
-				expect(rowFor("Request")?.checked).toBe(true);
-				expect(rowFor("Error")?.checked).toBe(false);
-				expect(rowFor("Complete")?.checked).toBe(true);
 			},
 			false,
-			{ prefsClasses: classes, failPrefsPost: true },
+			{ failPostSubscribe: true, undoRejects: true, oldRowClasses: classes },
+		);
+	});
+
+	test("a failed enable with a rejecting undo queues the kept subscription and the replay registers it on the next load", async () => {
+		await withPushBrowser(
+			false,
+			async (probe) => {
+				const on = [...probe.containerNode().querySelectorAll("button")].find(
+					(x) => x.textContent?.trim() === "Turn on",
+				);
+				if (on === undefined) throw new Error("no Turn on button");
+				await act(async () => {
+					(on as HTMLButtonElement).click();
+				});
+				// The POST failed and the undo was refused: the section reports the
+				// truth — subscribed, registration pending — and queues the retry.
+				expect(probe.posts.map((p) => p.url)).toEqual(["/api/push/subscribe"]);
+				expect(probe.containerText()).toContain("boom");
+				expect(probe.containerText()).toContain("Turn off");
+				expect(
+					JSON.parse(
+						globalThis.localStorage.getItem("ottr.push.pendingSubscribe") ??
+							"null",
+					),
+				).toEqual({
+					subscription: { endpoint: "https://push.example.com/new" },
+					oldEndpoint: null,
+					classes: null,
+				});
+				// The next load replays the record: the subscribe POST fires again
+				// (no classes to carry) and succeeds, so the record clears.
+				await probe.remount();
+				expect(
+					probe.posts.filter((p) => p.url === "/api/push/subscribe"),
+				).toHaveLength(2);
+				expect(
+					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
+				).toBeNull();
+			},
+			false,
+			{ noInitialSub: true, failPostSubscribe: true, undoRejects: true },
 		);
 	});
 

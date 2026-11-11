@@ -10322,6 +10322,53 @@ describe("web push (R1-1, R2-3)", () => {
 		}
 	});
 
+	test("subscribe accepts optional classes: valid carried set lands in the row; invalid shape is 400; absent keeps endpoint match", async () => {
+		const b = alertBoard("alert-subscribe-classes");
+		const carried = { request: true, error: false, complete: true };
+		const phone = "https://push.example/phone";
+		// Valid classes on a brand-new endpoint: the row is created with them.
+		expect(
+			(
+				await b.m.call("/api/push/subscribe", {
+					endpoint: phone,
+					keys: { p256dh: "k", auth: "a" },
+					classes: carried,
+				})
+			).status,
+		).toBe(200);
+		const prefsOf = async (endpoint?: string) => {
+			const res = await b.m.call(
+				endpoint === undefined
+					? "/api/notifications/prefs"
+					: `/api/notifications/prefs?endpoint=${encodeURIComponent(endpoint)}`,
+			);
+			return { status: res.status, body: await res.json() };
+		};
+		expect((await prefsOf(phone)).body.classes).toEqual(carried);
+		// A re-subscribe without classes keeps the row's classes (endpoint match).
+		await b.subscribe(phone);
+		expect((await prefsOf(phone)).body.classes).toEqual(carried);
+		// Invalid shapes are rejected without touching the row.
+		for (const classes of [
+			{ request: "yes" },
+			{ request: true, bogus: true },
+			"all on",
+			null,
+		]) {
+			const res = await b.m.call("/api/push/subscribe", {
+				endpoint: phone,
+				keys: { p256dh: "k", auth: "a" },
+				classes,
+			});
+			expect(res.status).toBe(400);
+		}
+		expect((await prefsOf(phone)).body.classes).toEqual(carried);
+		// A new endpoint without classes starts all-on as before.
+		const fresh = "https://push.example/fresh";
+		await b.subscribe(fresh);
+		expect((await prefsOf(fresh)).body.classes).toEqual(ALL_CLASSES_ON);
+	});
+
 	test("a device with complete off gets no Complete push; an all-on device does", async () => {
 		const b = alertBoard("alert-complete");
 		const quiet = "https://push.example/quiet";

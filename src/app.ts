@@ -8220,6 +8220,7 @@ export function createApp(deps: AppDeps) {
 		const b = r.body as {
 			endpoint?: unknown;
 			keys?: { p256dh?: unknown; auth?: unknown };
+			classes?: unknown;
 		};
 		if (
 			typeof b?.endpoint !== "string" ||
@@ -8227,11 +8228,30 @@ export function createApp(deps: AppDeps) {
 			typeof b?.keys?.auth !== "string"
 		)
 			return json({ error: "invalid subscription" }, 400);
+		// ADR-0011 recovery: the re-subscribe can carry the old row's classes so the
+		// fresh row is created with them in one atomic call. Any other shape is a 400.
+		let carriedClasses: ClassPrefs | undefined;
+		if (b.classes !== undefined) {
+			if (typeof b.classes !== "object" || b.classes === null)
+				return json({ error: "invalid classes" }, 400);
+			const c = b.classes as Record<string, unknown>;
+			for (const key of Object.keys(c)) {
+				if (
+					!(ALERT_CLASSES as readonly string[]).includes(key) ||
+					typeof c[key] !== "boolean"
+				)
+					return json({ error: "invalid classes" }, 400);
+			}
+			carriedClasses = c as ClassPrefs;
+		}
 		const subs = loadSubs(deps.gstore);
 		// A re-subscribe (key rotation, permission re-grant) keeps the device's class
-		// switches; a new device starts with every class on.
+		// switches; a new device starts with every class on. Carried classes win:
+		// the recovery read the old row and must override the endpoint-match default.
 		const classes =
-			subs.find((s) => s.endpoint === b.endpoint)?.classes ?? ALL_CLASSES_ON;
+			carriedClasses ??
+			subs.find((s) => s.endpoint === b.endpoint)?.classes ??
+			ALL_CLASSES_ON;
 		saveSubs(deps.gstore, [
 			...subs.filter((s) => s.endpoint !== b.endpoint),
 			{
