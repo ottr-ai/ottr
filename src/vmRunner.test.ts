@@ -951,7 +951,7 @@ describe("sizes and env", () => {
 		const cfg = readVmRunnerEnv({});
 		expect(cfg).toEqual({
 			port: 8787,
-			max: 2,
+			max: 10,
 			vcpus: 2,
 			memMiB: 8192,
 			diskBytes: 20 * 1024 ** 3,
