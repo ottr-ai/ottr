@@ -106,15 +106,15 @@ Read, in this order: the `needsReason`, the last turns (outcome, error), the end
 
 | Sign | Cause | Fix |
 |---|---|---|
-| "Reported answered, but the branch has N commit(s) that were never integrated." and `research: true` | An earlier turn wrote `research-report.md`, so the board marked the card as research. A research card never merges (OTTR-55). | If the commits are the work of the card, POST `/api/projects/<p>/tasks/<id>/unmark-research`. The supervisor then queues the merge within 60 s. |
+| "Reported answered, but the branch has N commit(s) that were never integrated." and `research: true` | An earlier turn wrote `research-report.md`, so the board marked the card as research. A research card never merges. | If the commits are the work of the card, POST `/api/projects/<p>/tasks/<id>/unmark-research`. The supervisor then queues the merge within 60 s. |
 | The same reason with `research: false`, or "Reported ready, but git shows …" | Uncommitted files, or no commits | Look at `git status`. Reply that the agent must move scratch files out of the worktree, commit its work, and report again. |
 | "Kept the worktree: uncommitted changes …" | Uncommitted files at the end of a turn | The supervisor answers the cases with only scratch files. For real changes, ask the user. |
 | "The agent finished without calling report_outcome." | The run stopped early, for example a provider error or a time limit | Read the end of the log. Reply "Continue the task, then call report_outcome." |
 | "Tracker error: …" | An exception in the board | Read the message. In host mode, also read `docker logs --since 2h ottr-server-1`. Fix the cause, then reply to retry. |
 | "Release failed: …" | The release command failed | Read the command output in the log. Fix the cause, then reply to retry. |
-| `main` of the project is `ahead` (and maybe `behind`) of `origin/main`; merge cards show `pushRetries` or a merge agent asks about a diverged `main` | A server push failed (for example the omp-bump workflow moved origin during a merge), and later merges built on the unpushed `main` | Ask the user first (a push outside a merge turn). Then hold new turns (`POST /api/drain`), wait until no merge turn of the project runs, rebase the local `main` onto `origin/main` (duplicates drop), push with a token, end the drain (`DELETE /api/drain`), and reply to the card that asked. OTTR-506 makes the board hold merges by itself. |
+| `main` of the project is `ahead` (and maybe `behind`) of `origin/main`; merge cards show `pushRetries` or a merge agent asks about a diverged `main` | A server push failed (for example the omp-bump workflow moved origin during a merge), and later merges built on the unpushed `main` | Ask the user first (a push outside a merge turn). Then hold new turns (`POST /api/drain`), wait until no merge turn of the project runs, rebase the local `main` onto `origin/main` (duplicates drop), push with a token, end the drain (`DELETE /api/drain`), and reply to the card that asked. The board holds merges by itself. |
 | "The work check failed twice: …" or "The review check failed twice: …" | The check model failed | Read the check lines in the log. When the provider works again, reply to run it again. |
-| "The work check blocked the merge a third time: …" | For the same head, the check sends its old blockers again. A blocker that only asks for a human review stays open after the user approves in a reply (OTTR-56). | If the user approved the merge and the blockers name only the missing review, POST `/api/projects/<p>/tasks/<id>/merge-anyway` with `{ reason }`. If a blocker is about the code, ask the user. |
+| "The work check blocked the merge a third time: …" | For the same head, the check sends its old blockers again. A blocker that only asks for a human review stays open after the user approves in a reply. | If the user approved the merge and the blockers name only the missing review, POST `/api/projects/<p>/tasks/<id>/merge-anyway` with `{ reason }`. If a blocker is about the code, ask the user. |
 | A CI follow-up card says that the agent cannot read the CI logs | Board agents have no GitHub login | In host mode, run `gh run view <run> -R <owner>/<repo> --log-failed`. In board mode, ask the user to run it. Reply with the failed job, step and tests, and a way to reproduce the failure. Give facts only. |
 | The agent committed to repos or branches that the card does not own | The board merges only the branch of the card | Ask the user how to land the work, for example with one integration card for each repo. |
 
@@ -134,8 +134,10 @@ if (text.includes("\r")) throw new Error("CRLF in the reply");
 console.log(await board(HEAD + `
 const r = await post('/api/projects/' + input.p + '/tasks/' + input.id + '/reply', { text: input.text });
 console.log(r.status);
-`, { p: "ottr", id: "OTTR-1", text }));
+`, { p: "ottr", id: "<task-id>", text }));
 ```
+
+The id in the example is the card's handle on the board. `<task-id>` stands for it.
 
 ## 6. Prevent
 
