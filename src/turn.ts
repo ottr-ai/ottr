@@ -6431,6 +6431,17 @@ export function createTurnLoop(
 		await commentSourcePr(st, n, src.dependabot);
 		if (!canShipPr(st)) return;
 		const dependabot = src.dependabot;
+		// Stamp the source fields before the park (a legacy card carries none until
+		// now): the watch reads Dependabot's rebase answer off the row, and a re-ship
+		// re-judges the branch against the same source PR instead of re-resolving it.
+		st.store.updateTask(st.id, {
+			sourcePrNumber: n,
+			sourcePrUrl: src.url,
+			sourcePrHeadRef: src.headRef,
+			sourcePrHeadSha: src.headSha,
+			sourcePrCrossRepo: src.crossRepo,
+			sourcePrDependabot: src.dependabot,
+		});
 		st.prNext = {
 			stage: "merging",
 			state: "needs_you",

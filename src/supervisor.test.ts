@@ -3967,9 +3967,8 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("the source merged first, then the follow-up merge finishes the card", async () => {
-		const store = prModeProject("pr-fu-both");
-		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+	test("the source merged first keeps the card waiting while the follow-up is open", async () => {
+		const store = prModeProject("pr-fu-src-first");
 		const t = followUpCard(store);
 		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
 		const ops = fakeOps({
@@ -3983,29 +3982,117 @@ describe("prPass", () => {
 							}),
 							stderr: "",
 						}
-					: url.endsWith("/pulls/9")
-						? {
-								code: 0,
-								stdout: pr9Body({
-									state: "open",
-									mergeable: true,
-								}),
-								stderr: "",
-							}
-						: openList([9]),
+					: openList([9]),
 		});
 		await tick(
 			new Map([["proj", entry(store, { target: "origin/main" })]]),
 			ops,
 		);
-		let after = store.getTask(t.id)!;
+		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.followUpPrNumber).toBe(9);
+		store.close();
+	});
 
-		// Second window: the follow-up merged too — the card finishes. The source read
-		// needs its own merged body: the open-list page is not a single-PR body.
-		const ops2 = fakeOps({
+	test("both merged in one window, follow-up first finishes with the source's commit", async () => {
+		const store = prModeProject("pr-fu-one-window");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: OTHER_SHA,
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-07T00:00:00Z",
+									mergeSha: MERGE_SHA,
+								}),
+								stderr: "",
+							}
+						: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		// The follow-up's commit reaches the target only through the source's merge,
+		// so the source's commit is the one pinned to the CI watch.
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
+		// The follow-up's head is the card's own branch, so it goes; the source head stays.
+		expect(ops.calls.deletes).toEqual([
+			{
+				mainPath: join(root, "main"),
+				branch: "ottr/552",
+				originUrl: "https://github.com/acme/widget.git",
+				keep: ["main", "ottr/552"],
+			},
+		]);
+		store.close();
+	});
+
+	test("a follow-up that merges after its source parks stranded", async () => {
+		const store = prModeProject("pr-fu-stranded");
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-07T00:00:00Z",
+								mergeSha: MERGE_SHA,
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-06T00:00:00Z",
+									mergeSha: OTHER_SHA,
+								}),
+								stderr: "",
+							}
+						: openList([]),
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("merged after PR #7");
+		expect(after.needsReason).toContain("not on the target branch");
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("the fixes are stranded on the bump branch");
+		store.close();
+	});
+
+	test("a target-based follow-up finishes with its own merge commit", async () => {
+		const store = prModeProject("pr-fu-target-base");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		// No sourcePrHeadRef: a legacy card whose follow-up based on the target branch,
+		// so the follow-up's own commit is the later one on the target.
+		const t = followUpCard(store);
+		const ops = fakeOps({
 			apiResult: (url) =>
 				url.endsWith("/pulls/9")
 					? {
@@ -4030,21 +4117,11 @@ describe("prPass", () => {
 		});
 		await tick(
 			new Map([["proj", entry(store, { target: "origin/main" })]]),
-			ops2,
+			ops,
 		);
-		after = store.getTask(t.id)!;
+		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
-		const log = await Bun.file(store.logPath(t.id)).text();
-		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
-		// The follow-up's head is the card's own branch, so it goes; the source head stays.
-		expect(ops2.calls.deletes).toEqual([
-			{
-				mainPath: join(root, "main"),
-				branch: "ottr/552",
-				originUrl: "https://github.com/acme/widget.git",
-				keep: ["main", "ottr/552"],
-			},
-		]);
+		expect(after.pushSha).toBe(MERGE_SHA);
 		store.close();
 	});
 
@@ -4134,6 +4211,9 @@ describe("prPass", () => {
 		store.updateTask(t.id, {
 			state: "needs_you",
 			needsReason: CARRY_REASON,
+			// parkOnSourcePr stamps these; the watch reads the source PR off the row.
+			sourcePrNumber: 7,
+			sourcePrUrl: "https://github.com/acme/widget/pull/7",
 			sourcePrDependabot: true,
 		});
 		return t;
@@ -4192,6 +4272,89 @@ describe("prPass", () => {
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
 		expect(store.getTask(t.id)!.needsReason).toBe(CARRY_REASON);
+		store.close();
+	});
+
+	test("a first-ship park with no adopted PR still reads the comments", async () => {
+		// parkOnSourcePr never writes prNumber; the watch reads the row's stamped
+		// source PR instead.
+		const store = prModeProject("pr-dep-no-adopt");
+		const t = store.createTask("bump");
+		store.updateTask(t.id, {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: CARRY_REASON,
+			prNumber: null,
+			sourcePrNumber: 7,
+			sourcePrUrl: "https://github.com/acme/widget/pull/7",
+			sourcePrDependabot: true,
+		});
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.includes(COMMENTS_URL)
+					? {
+							code: 0,
+							stdout: JSON.stringify([
+								{
+									user: { login: "dependabot[bot]" },
+									body: "Dependabot can't rebase as the manifest is no longer in the config.",
+								},
+							]),
+							stderr: "",
+						}
+					: openList([]),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.needsReason).toContain("Close the pull request");
+		expect(after.needsReason).toContain(
+			"Dependabot reopens it from the current config",
+		);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("supervisor: Dependabot cannot rebase PR #7");
+		store.close();
+	});
+
+	test("a carry-parked card with an adopted PR still settles", async () => {
+		// The rebase-answer read must not stop the merge settle: once the carried
+		// fixes merged with the PR, the card finishes like any PR-mode card.
+		const store = prModeProject("pr-dep-carry-settles");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = dependabotCard(store);
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.includes(COMMENTS_URL)
+					? {
+							code: 0,
+							stdout: JSON.stringify([
+								{
+									user: { login: "dependabot[bot]" },
+									body: "Dependabot tried to update this pull request, but couldn't do so because of conflicts.",
+								},
+							]),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-06T00:00:00Z",
+									mergeSha: MERGE_SHA,
+								}),
+								stderr: "",
+							}
+						: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("supervisor: PR #7 merged; card done");
 		store.close();
 	});
 });

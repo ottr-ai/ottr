@@ -20912,6 +20912,11 @@ describe("turn PR-mode merge settle", () => {
 			{ repo: "acme/repo", number: 20, body: "@dependabot rebase" },
 		]);
 		expect(after.followUpPrNumber).toBe(null);
+		expect(after.prNumber).toBe(null);
+		// The park stamps the source fields: the watch reads Dependabot's rebase
+		// answer off the row even though the card adopted no PR.
+		expect(after.sourcePrNumber).toBe(20);
+		expect(after.sourcePrDependabot).toBe(true);
 	});
 
 	test("a Dependabot card with fixes opens one follow-up PR based on the Dependabot branch and comments its link on the source PR", async () => {
@@ -20972,6 +20977,49 @@ describe("turn PR-mode merge settle", () => {
 		expect(logText(store, task.id)).toContain(
 			"follow-up PR #33 opened (base dependabot/npm_and_yarn/vite-7.1.2)",
 		);
+	});
+
+	test("a diverged legacy Dependabot card parks and stamps the source fields (OTTR-781)", async () => {
+		const comments: { repo: string; number: number; body: string }[] = [];
+		const { store, loop, task } = prMergeSetup({
+			fetchPrHead: async () => null,
+			targetSha: async (_m: string, ref: string) =>
+				ref === "refs/ottr/pr/30" ? "head30" : "sha-fixed",
+			// Diverged: "head30" is not an ancestor of "sha-fixed".
+			targetContains: async () => false,
+			treesEqual: async () => false,
+			pushBranch: async () => {
+				throw new Error("pushBranch must not run for a Dependabot PR");
+			},
+			openPr: async () => {
+				throw new Error("openPr must not run for a source-PR card");
+			},
+			prComment: async (o) => {
+				comments.push(o);
+				return { ok: true as const };
+			},
+		});
+		// A pre-OTTR-760 card: no source PR fields, only the prompt's first line.
+		store.updateTask(task.id, {
+			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
+		});
+		await loop.runTurn(store.name, task.id);
+		const after = store.getTask(task.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("@dependabot");
+		expect(comments).toEqual([
+			{ repo: "acme/repo", number: 30, body: "@dependabot rebase" },
+		]);
+		// The park carries the resolved source onto the row, so the watch can read
+		// Dependabot's answer and a re-ship re-judges the same base.
+		expect(after.prNumber).toBe(null);
+		expect(after.sourcePrNumber).toBe(30);
+		expect(after.sourcePrUrl).toBe("https://github.com/acme/repo/pull/30");
+		expect(after.sourcePrHeadSha).toBe("head30");
+		expect(after.sourcePrHeadRef).toBe(null);
+		expect(after.sourcePrCrossRepo).toBe(false);
+		expect(after.sourcePrDependabot).toBe(true);
 	});
 
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {

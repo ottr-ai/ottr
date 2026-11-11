@@ -278,6 +278,9 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 interface PrDetail {
 	state: "open" | "closed";
 	merged: boolean;
+	/** The merge time in ms; null when absent or unparseable. Two PRs merging inside one
+	 * poll window order by it (OTTR-809). */
+	mergedAt: number | null;
 	mergeCommit: string | null;
 	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
 	 * still computes it, the field is absent, or the value is not a boolean. */
@@ -291,9 +294,12 @@ function parsePull(body: unknown): PrDetail | null {
 	if (x.state !== "open" && x.state !== "closed") return null;
 	if (x.merged_at !== null && typeof x.merged_at !== "string") return null;
 	if (sha !== null && sha !== undefined && typeof sha !== "string") return null;
+	const mergedAt =
+		typeof x.merged_at === "string" ? Date.parse(x.merged_at) : null;
 	return {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
+		mergedAt: mergedAt !== null && !Number.isNaN(mergedAt) ? mergedAt : null,
 		mergeCommit: typeof sha === "string" ? sha : null,
 		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
 		// mergeable value must not turn a readable PR into null.
@@ -2041,21 +2047,25 @@ export function createSupervisor(
 		t: ListedTask,
 		repo: string,
 	): Promise<void> {
+		// A first-ship park never adopted the PR (prNumber stays null), so the watch
+		// reads the row's source PR, which parkOnSourcePr stamps.
+		const n = t.sourcePrNumber;
+		if (n === null) return;
 		const comments = await listPrComments({
 			repo,
-			number: t.prNumber!,
+			number: n,
 			gh: ops.gh,
 		}).catch(() => null);
 		if (comments === null) return;
 		if (!dependabotCannotRebase(comments)) return;
 		if (wentStale(e.store, t)) return;
 		e.store.updateTask(t.id, {
-			needsReason: `Source PR #${t.prNumber} cannot be rebased: Dependabot answered it can't rebase this PR (orphaned or edited). Close the pull request; Dependabot reopens it from the current config.`,
+			needsReason: `Source PR #${n} cannot be rebased: Dependabot answered it can't rebase this PR (orphaned or edited). Close the pull request; Dependabot reopens it from the current config.`,
 		});
 		ops.appendLog(
 			e.store,
 			t.id,
-			`supervisor: Dependabot cannot rebase PR #${t.prNumber}; the card asks to close it so Dependabot reopens it from the current config`,
+			`supervisor: Dependabot cannot rebase PR #${n}; the card asks to close it so Dependabot reopens it from the current config`,
 		);
 		ops.schedule();
 	}
@@ -2107,7 +2117,39 @@ export function createSupervisor(
 				return;
 			}
 			if (s.merged && s.mergeCommit !== null) {
-				await finishPrMerge(e, settings, t, pr.mergeCommit);
+				// The follow-up based on the bump branch reaches the target only through
+				// the source's merge, so the source's commit is the later one there. A
+				// target-based follow-up (a legacy card without the head branch name)
+				// puts its own commit straight onto the target.
+				const bumpBased = t.sourcePrHeadRef !== null;
+				if (
+					bumpBased &&
+					s.mergedAt !== null &&
+					pr.mergedAt !== null &&
+					s.mergedAt < pr.mergedAt
+				) {
+					// The source merged first and the follow-up then landed on the
+					// already-merged bump branch: those fixes never reach the target.
+					if (wentStale(e.store, t)) return;
+					e.store.updateTask(t.id, {
+						state: "needs_you",
+						needsReason: `Follow-up PR #${F} merged after PR #${S}: its fixes sit on the merged bump branch and are not on the target branch. Carry them onto a new pull request.`,
+						pushSha: null,
+					});
+					ops.appendLog(
+						e.store,
+						t.id,
+						`supervisor: follow-up PR #${F} merged after PR #${S}; the fixes are stranded on the bump branch; card parked`,
+					);
+					ops.schedule();
+					return;
+				}
+				await finishPrMerge(
+					e,
+					settings,
+					t,
+					bumpBased ? s.mergeCommit : pr.mergeCommit,
+				);
 				return;
 			}
 			if (wentStale(e.store, t)) return;
@@ -2205,12 +2247,7 @@ export function createSupervisor(
 		open: Set<number>,
 	): Promise<void> {
 		for (const t of e.store.listTasks()) {
-			if (
-				t.stage !== "merging" ||
-				t.prNumber === null ||
-				t.cancelledAt !== null
-			)
-				continue;
+			if (t.stage !== "merging" || t.cancelledAt !== null) continue;
 			// OTTR-799: a live merge turn settles its own card; a mid-turn settle would
 			// fight the ship step. wentStale cannot catch this: the snapshot and the row
 			// read the same state.
@@ -2220,18 +2257,21 @@ export function createSupervisor(
 			// number. Settling it against the old PR parks the recovery before the ship
 			// can run.
 			if (t.state === "queued") continue;
-			// OTTR-809: a Dependabot carry card parked for a rebase waits for Dependabot's
-			// answer, not for a merge; it never has a follow-up PR (the follow-up path
-			// replaced this park for linear branches). The reason no longer holds the
-			// marker once the answer landed, so the intercept fires once per park.
+			// OTTR-809: a carry-parked Dependabot card reads Dependabot's answer before the
+			// settle below — the park may hold no PR number (a first-ship park never
+			// adopted, prNumber stays null) and a park with an adopted PR still settles
+			// after the read. The reason no longer holds the marker once the answer
+			// landed, so the read fires once per park.
 			if (
 				t.state === "needs_you" &&
 				t.sourcePrDependabot === true &&
 				(t.needsReason ?? "").includes("the board asked @dependabot to rebase")
 			) {
 				await prRebaseAnswer(e, t, repo);
-				continue;
 			}
+			// A card with no PR of record has nothing to settle: its park stamped the
+			// source PR fields on the row (parkOnSourcePr) and the watch above owns it.
+			if (t.prNumber === null) continue;
 			if (t.followUpPrNumber !== null) {
 				await prFollowUp(e, settings, t, repo, open);
 				continue;
