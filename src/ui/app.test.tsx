@@ -3006,6 +3006,17 @@ describe("Drawer queued steering edit", () => {
 });
 
 describe("Drawer queued steering edit (client)", () => {
+	// The save flows through the act prop; the stub base.act never runs the body,
+	// so save-driven tests pass an act with the production contract: run the body,
+	// swallow its error, report false.
+	const runAct = async (fn: () => Promise<void>): Promise<boolean> => {
+		try {
+			await fn();
+			return true;
+		} catch {
+			return false;
+		}
+	};
 	const project = {
 		name: "proj",
 		github: null,
@@ -3152,17 +3163,6 @@ describe("Drawer queued steering edit (client)", () => {
 
 	test("a refused steer edit keeps the draft across the detail refresh", async () => {
 		const realFetch = globalThis.fetch;
-		// The save flows through the act prop; the stub base.act never runs the
-		// body, so this test passes an act with the production contract: run the
-		// body, swallow its error, report false.
-		const runAct = async (fn: () => Promise<void>): Promise<boolean> => {
-			try {
-				await fn();
-				return true;
-			} catch {
-				return false;
-			}
-		};
 		// The steer edit save is refused with the board's current row; every other
 		// fetch (task detail, session context, catalog) degrades to null like the
 		// replaced-steer test above, so the row's own fields stay authoritative.
@@ -3246,6 +3246,101 @@ describe("Drawer queued steering edit (client)", () => {
 				);
 			});
 			expect(editor()).toBeNull();
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a refused steer edit keeps its draft when the queue empties or resumes", async () => {
+		const realFetch = globalThis.fetch;
+		// The steer edit save is refused with the board's current row; every other
+		// fetch degrades to null like the replaced-steer test above.
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			if (String(input).includes("/steer/edit"))
+				return new Response(
+					JSON.stringify({
+						error: "card changed since it was loaded",
+						task: { id: "t1", revision: 9, pendingPrompt: "second steer" },
+					}),
+					{ status: 409 },
+				);
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const task = (prompt: string) =>
+			cardFixture({
+				...drawerFields,
+				stage: "todo",
+				state: "queued",
+				pendingPrompt: prompt,
+			});
+		const editButton = (): Element => {
+			const node = container.querySelector(
+				'button[aria-label="Edit the queued steering"]',
+			);
+			if (node === null) throw new Error("no Edit button");
+			return node;
+		};
+		const editor = (): HTMLTextAreaElement | null =>
+			container.querySelector<HTMLTextAreaElement>("#steer-edit-text");
+		const submit = async (): Promise<void> => {
+			await act(async () => {
+				const form = editor()?.closest("form");
+				if (form == null) throw new Error("no steer edit form");
+				form.dispatchEvent(
+					new window.Event("submit", {
+						bubbles: true,
+						cancelable: true,
+					}) as unknown as Event,
+				);
+			});
+		};
+		try {
+			await act(async () => {
+				root.render(
+					<Drawer {...base} act={runAct} task={task("first steer")} />,
+				);
+			});
+			await act(async () => {
+				onClickOf(editButton())({});
+			});
+			expect(editor()?.value).toBe("first steer");
+			await submit();
+			expect(container.textContent).toContain("changed while you were editing");
+			// The turn consumed the steer while the conflict sat open: the queue is
+			// empty, but the kept draft and the notice must stay reachable.
+			await act(async () => {
+				root.render(
+					<Drawer
+						{...base}
+						act={runAct}
+						task={cardFixture({
+							...drawerFields,
+							stage: "todo",
+							state: "needs_you",
+							pendingPrompt: null,
+						})}
+					/>,
+				);
+			});
+			expect(editor()?.value).toBe("first steer");
+			expect(container.textContent).toContain("changed while you were editing");
+			expect(container.textContent).toContain("second steer");
+			// An automatic resume marker replaces the queued text: the draft still
+			// outranks the marker chip.
+			await act(async () => {
+				root.render(<Drawer {...base} act={runAct} task={task(".")} />);
+			});
+			expect(editor()?.value).toBe("first steer");
+			expect(container.textContent).toContain("changed while you were editing");
 		} finally {
 			await act(async () => {
 				root.unmount();
@@ -3352,6 +3447,20 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 		if (node === undefined) throw new Error(`no ${name} button`);
 		return node as HTMLButtonElement;
 	};
+	// The production onChange React rendered onto the node; textareas are typed by
+	// calling it with a minimal event object, since happy-dom's dispatched input
+	// event never reaches React's ChangeEventPlugin.
+	const onChangeOf = (node: Element): ((e: unknown) => void) => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const props = (node as unknown as Record<string, unknown>)[key] as {
+			onChange?: (e: unknown) => void;
+		};
+		if (props.onChange === undefined) throw new Error("node has no onChange");
+		return props.onChange;
+	};
 	/** Renders the task, opens the prompt editor, and runs `check` against the
 	 * guarded start action with the editor open and after Cancel finishes it. */
 	const expectGuard = async (
@@ -3425,6 +3534,183 @@ describe("Drawer start actions wait for the prompt edit (client)", () => {
 			"Move to todo",
 			"Puts the card in the todo lane so the agent can start it",
 		);
+	});
+
+	// The save flows through the act prop; the stub base.act never runs the body,
+	// so these tests pass an act with the production contract: run the body,
+	// swallow its error, report false.
+	const runAct = async (fn: () => Promise<void>): Promise<boolean> => {
+		try {
+			await fn();
+			return true;
+		} catch {
+			return false;
+		}
+	};
+
+	test("the hold claim arms the guarded save, so the board's own bump never 409s", async () => {
+		const realFetch = globalThis.fetch;
+		// The live smoke: the editor opened on revision 1, /edit/start bumped the
+		// row to 2, and the first save carried the stale 1. The guard must arm from
+		// the claim's response instead, so this mock refuses exactly that stale 1.
+		const saves: Array<{ revision?: unknown }> = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/edit/start"))
+				return new Response(JSON.stringify({ ok: true, revision: 2 }), {
+					status: 200,
+				});
+			if (url.endsWith("/edit") && init?.method === "POST") {
+				const body = JSON.parse(String(init.body)) as { revision?: unknown };
+				saves.push(body);
+				if (body.revision === 1)
+					return new Response(
+						JSON.stringify({
+							error: "card changed since it was loaded",
+							task: { id: "t1", revision: 2 },
+						}),
+						{ status: 409 },
+					);
+				return new Response("{}", { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const card = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "queued",
+			prompt: "queued idea",
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} act={runAct} task={card} />);
+			});
+			await act(async () => {
+				onClickOf(button(container, "Edit task"))({});
+			});
+			expect(container.querySelector("#edit-text")).not.toBeNull();
+			await act(async () => {});
+			await act(async () => {
+				const form = container.querySelector("#edit-text")?.closest("form");
+				if (form == null) throw new Error("no prompt edit form");
+				form.dispatchEvent(
+					new window.Event("submit", {
+						bubbles: true,
+						cancelable: true,
+					}) as unknown as Event,
+				);
+			});
+			// The save carried the claim's revision and landed: the editor closed
+			// and no conflict notice appeared.
+			expect(saves).toHaveLength(1);
+			expect(saves[0]?.revision).toBe(2);
+			expect(container.querySelector("#edit-text")).toBeNull();
+			expect(container.textContent).not.toContain(
+				"changed while you were editing",
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("a refused notes append retries onto the board's current notes", async () => {
+		const realFetch = globalThis.fetch;
+		const calls: Array<{ notes: string; revision?: unknown }> = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			if (url.endsWith("/release-notes") && init?.method === "POST") {
+				const body = JSON.parse(String(init.body)) as {
+					notes: string;
+					revision?: unknown;
+				};
+				calls.push(body);
+				// The first append is refused with the other tab's row; the retry
+				// must carry that row's notes as its base.
+				if (calls.length === 1)
+					return new Response(
+						JSON.stringify({
+							error: "card changed since it was loaded",
+							task: {
+								id: "t1",
+								revision: 9,
+								releaseNotes: "other tab notes",
+							},
+						}),
+						{ status: 409 },
+					);
+				return new Response("{}", { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const card = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "needs_you",
+			releaseVersion: "v1.0.0",
+			releaseNotes: "original notes",
+		});
+		try {
+			await act(async () => {
+				root.render(<Drawer {...base} act={runAct} task={card} />);
+			});
+			const editNotes = container.querySelector(
+				'button[aria-label="Edit release notes"]',
+			);
+			if (editNotes === null) throw new Error("no Edit release notes button");
+			await act(async () => {
+				onClickOf(editNotes)({});
+			});
+			const notes = container.querySelector("#release-notes-text");
+			if (notes === null) throw new Error("no notes editor");
+			await act(async () => {
+				onChangeOf(notes)({ target: { value: "my addition" } });
+			});
+			const addNotes = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent?.trim() === "Add to notes",
+			);
+			if (addNotes === undefined) throw new Error("no Add to notes button");
+			await act(async () => {
+				onClickOf(addNotes)({});
+			});
+			expect(container.textContent).toContain("changed while you were editing");
+			// The retry before any refresh: base and revision come from the same
+			// current row, so the other tab's notes stay in the payload.
+			await act(async () => {
+				onClickOf(addNotes)({});
+			});
+			expect(calls).toHaveLength(2);
+			expect(calls[1]?.notes).toBe("other tab notes\n\nmy addition");
+			expect(calls[1]?.revision).toBe(9);
+			expect(container.textContent).not.toContain(
+				"changed while you were editing",
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
 	});
 
 	// The Plan with agent / Move to todo dialogs read the shared model catalog.

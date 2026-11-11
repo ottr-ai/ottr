@@ -7095,14 +7095,17 @@ export function createApp(deps: AppDeps) {
 				},
 				409,
 			);
-		e.store.updateTask(task.id, {
+		const held = e.store.updateTask(task.id, {
 			holdUntil: PROMPT_EDIT_HELD,
 			// Not a usage hold: the owner clears so the quota refresh never releases
 			// a card whose editor is open (OTTR-688).
 			holdProvider: null,
 			holdWindow: null,
 		});
-		return json({ ok: true });
+		// The hold claim bumps the revision like any write, so the editor arms its
+		// guarded save from this row: a save in the tab that opened the editor must
+		// not 409 against the board's own hold claim.
+		return json({ ok: true, revision: held.revision });
 	}
 
 	async function handleGETProjectsTasksImagesByProjectAndIdAndName(

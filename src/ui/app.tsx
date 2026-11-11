@@ -10967,19 +10967,21 @@ function QueuedSteer(p: {
 				</span>
 				<div className="you-bubble">
 					{/* "." is the resume marker (Resume button, restart, background-wait), never prose: show it as a badge. */}
-					{text.trim() === "." ? (
-						<span className="you-chip">Resume</span>
-					) : steerEdit === null || localPending !== null ? (
-						<div className="you-msg">
-							<Markdown text={text} />
-						</div>
-					) : (
+					{steerEdit !== null && localPending === null ? (
+						// A kept draft outranks the resume marker and the bubble: the
+						// notice says the text is kept, so the editor must be reachable.
 						<SteerEditForm
 							steerEdit={steerEdit}
 							setSteerEdit={setSteerEdit}
 							steerEditSave={steerEditSave}
 							saveSteerEdit={saveSteerEdit}
 						/>
+					) : text.trim() === "." ? (
+						<span className="you-chip">Resume</span>
+					) : (
+						<div className="you-msg">
+							<Markdown text={text} />
+						</div>
 					)}
 					{(localPending !== null
 						? localPending.images > 0
@@ -11101,20 +11103,21 @@ function DrawerSteps(p: {
 							onOpenTask={onOpenTask}
 						/>
 					))}
-					{(localPending !== null || task.pendingPrompt !== null) &&
-						(task.state === "running" || task.state === "queued") && (
-							<QueuedSteer
-								task={task}
-								localPending={localPending}
-								steerEdit={steerEdit}
-								setSteerEdit={setSteerEdit}
-								openSteerEdit={openSteerEdit}
-								steerEditSave={steerEditSave}
-								saveSteerEdit={saveSteerEdit}
-								cancelSteer={cancelSteer}
-								steerConflict={steerConflict}
-							/>
-						)}
+					{(steerConflict !== null ||
+						((localPending !== null || task.pendingPrompt !== null) &&
+							(task.state === "running" || task.state === "queued"))) && (
+						<QueuedSteer
+							task={task}
+							localPending={localPending}
+							steerEdit={steerEdit}
+							setSteerEdit={setSteerEdit}
+							openSteerEdit={openSteerEdit}
+							steerEditSave={steerEditSave}
+							saveSteerEdit={saveSteerEdit}
+							cancelSteer={cancelSteer}
+							steerConflict={steerConflict}
+						/>
+					)}
 				</ul>
 			</DrawerSec>
 		</>
@@ -12897,6 +12900,11 @@ export function Drawer({
 	};
 	const notesSubmit = (mode: "save" | "append"): void => {
 		if (notesEdit === null || !notesValid) return;
+		// The append base is the row the armed revision belongs to: after a refused
+		// save the conflict row holds the board's current notes, and a retry before
+		// the next refresh would otherwise append onto the stale snapshot and drop
+		// the other writer's text.
+		const base = notesConflict ?? task;
 		notesSave.start(() =>
 			act(async () => {
 				try {
@@ -12905,7 +12913,7 @@ export function Drawer({
 						{
 							notes:
 								mode === "append"
-									? `${task.releaseNotes ?? ""}\n\n${notesEdit}`
+									? `${base.releaseNotes ?? ""}\n\n${notesEdit}`
 									: notesEdit,
 							revision: notesRevision ?? undefined,
 						},
@@ -12938,10 +12946,10 @@ export function Drawer({
 	// once the started turn makes the card uneditable.
 	const editOpen = edit !== null;
 	const editGuardTitle = "Save or cancel the prompt edit first";
-	/** Opens the prompt editor and captures the loaded row's revision for the guarded
-	 *  save: a poll that refreshes the card mid-edit must not hand stale text a pass. */
+	/** Opens the prompt editor. The guarded save arms from the hold claim's response
+	 *  (the claim itself bumps the revision), not from the row the editor opened on. */
 	const openEdit = (): void => {
-		setEditRevision(task.revision);
+		setEditRevision(null);
 		setEditConflict(null);
 		setEdit(task.prompt);
 	};
@@ -12977,7 +12985,16 @@ export function Drawer({
 	useEffect(() => {
 		if (!editOpen) return;
 		const url = `/api/projects/${encodeURIComponent(task.project)}/tasks/${task.id}/edit`;
-		void post(`${url}/start`, {}).catch(() => {});
+		// The hold claim bumps the revision, so its response arms the guarded save;
+		// a claim that fails leaves the save unguarded, like before OTTR-795.
+		const claim = (): void => {
+			void post<{ ok: true; revision?: number }>(`${url}/start`, {})
+				.then((res) => {
+					if (typeof res.revision === "number") setEditRevision(res.revision);
+				})
+				.catch(() => {});
+		};
+		claim();
 		const release = (): void => {
 			void fetch(`${url}/stop`, {
 				method: "POST",
@@ -12987,7 +13004,7 @@ export function Drawer({
 			}).catch(() => {});
 		};
 		const reclaim = (): void => {
-			void post(`${url}/start`, {}).catch(() => {});
+			claim();
 		};
 		window.addEventListener("pagehide", release);
 		window.addEventListener("pageshow", reclaim);
