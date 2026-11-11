@@ -174,6 +174,7 @@ import {
 import { fmtNum } from "./numbers.ts";
 import {
 	autoMarkOnOpen,
+	canMarkUnread,
 	donePage,
 	doneReadable,
 	dropBeforeId,
@@ -15856,9 +15857,12 @@ function AppDrawer(p: {
 			usedTotal={usedTotal}
 			maxTotal={state?.maxTotal ?? null}
 			act={act}
+			// OTTR-827: `read` doubles as the reverse action's offer — a card the
+			// baseline reads has no removable marks, so the drawer hides the control.
 			read={
 				seenable(drawerTask) &&
-				!isUnread(drawerTask, seenAnswers, seenDoneSince)
+				!isUnread(drawerTask, seenAnswers, seenDoneSince) &&
+				canMarkUnread(drawerTask, seenDoneSince)
 			}
 			onMarkUnread={() => {
 				if (selected === null) return; // the deferred native close after an app-driven close
@@ -15967,15 +15971,19 @@ export function App() {
 	const coveredUpdates = coveredUpdateIds(tasks);
 	/** OTTR-827: marks a card read — the plain id always, and (OTTR-566) the completion key
 	 * `id@doneAt` beside it for a done work card, so the face badge and the rail dot clear
-	 * together. A failed POST rolls both keys back and records them as failed: the read-mark
-	 * effect does not re-post them until something clears the failure. */
+	 * together. A failed POST rolls both keys back and records them as failed; the failed set
+	 * silences only the automatic effect, so an explicit user action can always retry. */
 	const markRead = useCallback(
-		(t: TaskCard | null | undefined) => {
+		(t: TaskCard | null | undefined, automatic = false) => {
 			if (t == null || !seenable(t)) return;
 			const keys = [t.id];
 			if (t.doneAt !== null && doneReadable(t, seenDoneSince))
 				keys.push(doneReadKey({ id: t.id, doneAt: t.doneAt }));
-			if (keys.every((k) => failedDoneReads.current.has(k))) return;
+			// The failed set only silences the automatic read-mark effect: one failed
+			// POST must never wedge a card. An explicit user action always retries,
+			// and its success clears the failure so the effect resumes.
+			if (automatic && keys.every((k) => failedDoneReads.current.has(k)))
+				return;
 			setSeenAnswers((s) => {
 				if (keys.every((k) => s.has(k))) return s;
 				const next = new Set(s);
@@ -16416,7 +16424,7 @@ export function App() {
 			autoMarkOnOpen(selected) &&
 			isUnread(selected, seenAnswers, seenDoneSince)
 		)
-			markRead(selected);
+			markRead(selected, true);
 	}, [selected, seenAnswers, seenDoneSince, markRead]);
 	/** The drawer task+project a close froze; held while the exit animation plays, then dropped. */
 	const [sheet, setSheet] = useState<{

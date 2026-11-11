@@ -588,6 +588,134 @@ test("a failed mark-unread rolls back: the card counts as read again", async () 
 	}
 });
 
+// --- OTTR-827: recovery and the unread control policy ------------------------
+
+test("a failed read mark recovers on the next explicit open", async () => {
+	const answered = card({
+		id: "AL-12",
+		title: "Alpha answered again",
+		sessionTitle: "Alpha answered again",
+		stage: "done",
+		state: "idle",
+		doneAt: 1000,
+		answered: true,
+	});
+	state.tasks.push(answered);
+	let seenPosts = 0;
+	let failSeen = true;
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/seen") {
+			seenPosts++;
+			if (failSeen) return new Response("{}", { status: 500 });
+		}
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountAt("/projects/alpha/tasks/AL-12");
+		await waitFor(drawerOpen);
+		// The automatic mark on open fails once: the badge stays, the failure
+		// surfaces, and the failed keys silence the automatic effect — no loop.
+		await waitFor(() =>
+			document.body.textContent!.includes("Saving the read state failed"),
+		);
+		expect(cardEl("AL-12")!.hasAttribute("data-unread")).toBe(true);
+		const afterFailure = seenPosts;
+		expect(afterFailure).toBeGreaterThan(0);
+		await act(async () => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			setTimeout(resolve, 30);
+			await promise;
+		});
+		expect(seenPosts).toBe(afterFailure);
+		// Recovery: reopening the card is an explicit action, so it retries; the
+		// POST succeeds and the badge clears.
+		failSeen = false;
+		const open = cardEl("AL-12")!.querySelector("a.card-open");
+		expect(open).not.toBeNull();
+		await click(open!);
+		await waitFor(() => {
+			const el = cardEl("AL-12");
+			return el !== null && !el.hasAttribute("data-unread");
+		});
+		expect(seenPosts).toBe(afterFailure + 1);
+	} finally {
+		state.tasks.pop();
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("a card the baseline reads offers no Mark unread control", async () => {
+	const answered = card({
+		id: "AL-13",
+		title: "Alpha old answer",
+		sessionTitle: "Alpha old answer",
+		stage: "done",
+		state: "idle",
+		doneAt: 500,
+		answered: true,
+	});
+	state.tasks.push(answered);
+	state.seenDoneSince = 1000;
+	let seenPosts = 0;
+	const realFetch = host.fetch;
+	host.fetch = (async (input: RequestInfo | URL) => {
+		if (String(input) === "/api/seen") seenPosts++;
+		return (fetchMock as (input: RequestInfo | URL) => Promise<Response>)(
+			input,
+		);
+	}) as typeof fetch;
+	try {
+		await mountAt("/projects/alpha/tasks/AL-13");
+		await waitFor(drawerOpen);
+		// The baseline reads the card: the automatic effect marks nothing, and
+		// the drawer offers no reverse action — removing marks (none exist that
+		// count) could never re-light it.
+		expect(seenPosts).toBe(0);
+		expect(
+			document.querySelector(
+				'dialog.drawer button[title^="Puts the new badge back"]',
+			),
+		).toBeNull();
+	} finally {
+		state.tasks.pop();
+		state.seenDoneSince = 0;
+		host.fetch = realFetch;
+		await unmountApp();
+	}
+});
+
+test("an opened post-baseline card offers Mark unread", async () => {
+	const answered = card({
+		id: "AL-14",
+		title: "Alpha fresh answer",
+		sessionTitle: "Alpha fresh answer",
+		stage: "done",
+		state: "idle",
+		doneAt: 500,
+		answered: true,
+	});
+	state.tasks.push(answered);
+	try {
+		await mountAt("/projects/alpha/tasks/AL-14");
+		await waitFor(drawerOpen);
+		// The automatic open mark lands (the frame baseline is 0), so the drawer
+		// offers the reverse action for the card the user just read.
+		await waitFor(
+			() =>
+				document.querySelector(
+					'dialog.drawer button[title^="Puts the new badge back"]',
+				) !== null,
+		);
+	} finally {
+		state.tasks.pop();
+		await unmountApp();
+	}
+});
+
 // --- System view ---------------------------------------------------------------
 
 test("the System view's Turns cell shows each worker turn's memory and CPU", async () => {

@@ -3,6 +3,7 @@ import type { AskQuestion, RunState, Stage, TaskCard } from "../types.ts";
 import { doneReadKey } from "../types.ts";
 import {
 	autoMarkOnOpen,
+	canMarkUnread,
 	donePage,
 	doneReadable,
 	dropBeforeId,
@@ -676,6 +677,26 @@ describe("isUnread (OTTR-827: one rule for the face badge and the rail dot)", ()
 				.map((c) => c.id);
 			expect(news).toEqual(expected);
 		}
+	});
+	test("mark-unread can only re-light cards whose marks count (OTTR-827)", () => {
+		// A card outside Done always can: its plain id is removable.
+		expect(
+			canMarkUnread(
+				card("p", "merging", "running", { kind: "pr_review" }),
+				since,
+			),
+		).toBe(true);
+		// A done card past the baseline can.
+		expect(canMarkUnread(done("a", since + 1, { answered: true }), since)).toBe(
+			true,
+		);
+		// A done card the baseline reads cannot: removing marks lights nothing.
+		expect(canMarkUnread(done("o", since, { answered: true }), since)).toBe(
+			false,
+		);
+		expect(canMarkUnread(done("n", null, { answered: true }), since)).toBe(
+			false,
+		);
 	});
 	test("a steps report reads its completion key; opening marks nothing, so the pin and the dot agree", () => {
 		const r = done("r", since + 1, { research: true, steps: "yes" });

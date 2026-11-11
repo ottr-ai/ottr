@@ -110,6 +110,17 @@ export function doneReadable(
 	);
 }
 
+/** Whether marking the card unread can re-light it (OTTR-827): the drawer offers "Mark unread"
+ * only when read marks exist whose removal turns the card New. A done card the baseline reads
+ * (or one with no completion stamp) has no such marks — history stays read, so the control
+ * would be a no-op. */
+export function canMarkUnread(
+	t: Pick<TaskCard, "stage" | "cancelledAt" | "kind" | "doneAt">,
+	since: number,
+): boolean {
+	return t.stage !== "done" || doneReadable(t, since);
+}
+
 /** The one mark a rail row shows, by rank: needs action > asked > running > unread. */
 export function railTop(c: {
 	needs: number;
