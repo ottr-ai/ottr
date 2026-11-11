@@ -1,7 +1,7 @@
 # Jira import: list tickets with JQL, select some or all, import them as cards
 
 ## Goal
-A user writes a JQL query on a project board, sees the matching Jira tickets, selects all or some of them, and imports each selected ticket as one card in that project. The import is read-only toward Jira.
+A user writes a JQL query on a project board, sees the matching Jira tickets, selects all or some of them, and imports each selected ticket as one card in that project. The import is read-only toward Jira. Section 6 adds a board-wide entry on Overview: one search for the whole board, one project named per row.
 
 Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acceptance checks, non-goals: this text), then implement against it. Follow AGENTS.md (schema changes are additive with a migration in `ProjectStore.open`; no new npm dependency without approval; UI keeps WCAG 2.1 AA; screenshot proofs for UI).
 
@@ -46,6 +46,16 @@ Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acce
 - Storage: the per-project table `jira_imports (site, issue_key, task_id, filed_at)`, primary key `(site, issue_key)`. Board connections live in the board store key `jira-connections`. The token key file is `.tasks/secret.key` next to `tracker.db`.
 - The match uses the site, not the connection name: a second connection to the same site sees the same tickets as imported.
 - The import call re-checks on the server inside the transaction, so a double click or two open dialogs cannot file one ticket twice.
+- The table is per project: the same issue key can hold cards in several projects. Each import names its project (the project dialog names its own project; the board-wide import names one per row, section 6). The board-wide search lists every project that holds a card for a key.
+
+## 6. Board-wide import (Overview)
+- The Overview page (Now tab, next to the projects heading) holds an "Import from Jira" button. It opens the board-wide import dialog. When the board holds no connection, the dialog says so and links to the settings' Jira section.
+- The dialog holds a connection select (the first connection is preselected; the user can switch), an empty JQL field, a Search button, and the same paging and row facts as section 3. The board-wide dialog has no saved JQL: each open starts with an empty field, and a search writes no project's `jiraLastJql`.
+- Each result row holds a project dropdown with the options "choose project" (the default), every project name, and "skip". The board never picks a project: no component mapping, no default. Only rows with a named project are imported; rows left at "choose project" or marked "skip" are not.
+- Each row also shows every project that already holds a card for (site, key): "already in <project>" with a link to the card. The row stays importable into another project. Importing the same key into a second project is a deliberate choice: the user names that project in the dropdown, and the board files the card. The board never blocks it silently and never guesses.
+- One stage choice (Backlog or Todo, Backlog the default) applies to all cards of one import.
+- Import: the server validates the whole request before it files anything (connection, stage, every assignment carries one existing project), fetches the assigned keys once through the chosen connection, then files each project's group through that project's store with `fileJiraCards`, each group in its own transaction. The `jira_imports` site value is the chosen connection's site, so a project without its own Jira connection receives cards this way. The in-transaction re-check of section 5 still holds inside each project: a second import of the same key into the same project is skipped.
+- Errors as in section 3. After the import the dialog stays open, shows "Filed N cards", "M skipped: already imported in that project" when M > 0, "K not available in Jira (deleted or no access): KEY, …" when K > 0, and refreshes the loaded rows.
 
 ## Acceptance checks
 1. A Cloud connection (email + token) and a Data Center connection (PAT) both save, test, search, and import. Tests stub Jira over HTTP and assert the exact method and URL: Cloud `POST /rest/api/3/search/jql`, Data Center `POST /rest/api/2/search`, plus the correct `Authorization` header.
@@ -61,13 +71,17 @@ Write the spec first as `docs/specs/jira-import.md` (behavior, error cases, acce
 11. A property-based test (fast-check, if already present; else a seeded loop) for the ADF and wiki converters and the prompt builder: no exception on random input, no fence marker in output, length within limit.
 12. The dialog opens with the project's last JQL. A JQL syntax error shows Jira's message.
 13. `bun run check` and `bun test` pass. Screenshot proofs of the settings form and the import dialog.
+14. The Overview shows the board-wide entry. A board-wide search answers rows whose dropdown starts at "choose project"; "skip" and "choose project" rows never import. A project without its own Jira connection receives cards through the board-wide import, and a board-wide search writes no project's `jiraLastJql`.
+15. The deliberate second import: a test imports one untagged ticket into project A (the test names A), then again into project B (the test names B); both file, a repeat into A is skipped, and the board-wide search shows "already in A" before the second import and "already in A and B" after. No row imports without a named project.
+16. The board-wide request validates before it files: an unknown project, a bad key, a bad stage, an unknown connection, and an empty assignment list each fail with a 4xx answer and no card filed.
 
 ## Boundaries and non-goals
 - Read-only toward Jira: no labels, comments, transitions, or other writes. Write-back is a non-goal.
 - No automatic or scheduled import; the user starts each import.
 - No sync after import: a later change to the ticket does not change the card, and a card change does not change the ticket.
 - No comments, attachments, or worklogs in the prompt.
-- No named saved JQL queries; only the last JQL per project.
+- No named saved JQL queries. The project dialog keeps its last JQL per project; the board-wide import keeps none (section 6).
+- No component-to-project mapping: the board-wide import never derives a project from a ticket's components; the user names each row's project.
 - No OAuth 2.0 (3LO) apps; only API token (Cloud) and PAT (Data Center).
 - No key-rotation UI (the key ID only makes a later rotation possible).
 - No new npm dependency (use `fetch` and `node:crypto`); if one seems needed, stop and ask.
