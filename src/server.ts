@@ -184,7 +184,7 @@ const shared: {
 	maxTotalRuns:
 		process.env.OMP_TRACKER_MAX_TOTAL === "none"
 			? null
-			: Number(process.env.OMP_TRACKER_MAX_TOTAL ?? 3),
+			: Number(process.env.OMP_TRACKER_MAX_TOTAL ?? 20),
 	reviewCheck: true,
 	workCheck: true,
 	idleReviews: true,

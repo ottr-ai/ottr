@@ -203,14 +203,17 @@ Add-project clone gets no GitHub API diagnostic: that probe uses only board-glob
 
 When hosted mode is on, the UI hides these host-level surfaces:
 
-- Board → Runners, Board → Projects order.
-- Access → API key, Access → Session, Access → omp usage.
-- Git and secrets → Git hosts, the whole card: GitHub host, GitHub token, GitHub App, Other
-  host tokens, and Global SSH key. Hosted git uses only the per-project control-plane tokens
-  (section 6), so no setting on this card has an effect.
-- Agents → Provider sign-in, Model roles, Alate, Hindsight. The operator manages the model
-  roles.
-- Project → Updates (CI watch, Dependabot, PR reviews, issue watch, trending).
+- Board → Projects order.
+- Agents → Provider sign-in, Model roles, Runners. The operator manages the model roles.
+- Workflow → Checks and Automation, the whole group.
+- Agent environment → Alate, Hindsight.
+- Git and integrations → GitHub (host, token, App), Other git hosts (HTTPS tokens) and Git
+  identity (global SSH key, commit identity), the three whole cards. Hosted git uses only the
+  per-project control-plane tokens (section 6), so no setting on these cards has an effect.
+- Access and usage → API key, Session, omp usage.
+- Project → Merging, Watches and Proposals (merge holds, PR mode, push sync commits, PR
+  reviews, issue watch, fork research, omp watch, retro, trending scout), and the "Run work
+  turns in microVMs" switch on the Runners card.
 - The provider quota in the app bar and in its detail popover. Provider quota is the
   operator's concern.
 - The `/system` page and its navigation entry, and the worker drain and image update surfaces.
@@ -228,7 +231,7 @@ Details:
 - `HostedContext` (`src/ui/settings.tsx`) gives the mode to the board components. A link to a
   settings card renders only when `hostedHidden` keeps its target:
   - A server warning shows a phrase that names a hidden card as plain text.
-  - The board shows no "GitHub features off" advisory, which names the Git hosts card.
+  - The board shows no "GitHub features off" advisory, which names the GitHub card.
   - The Overview shows no setup rows that open the Alate card.
   - The Add project dialog shows no Open settings button. Its hint says only to uncheck the
     repo box.

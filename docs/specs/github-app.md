@@ -67,7 +67,7 @@ posted the review. The footer stays on the board-token path only. Spec: [pr-revi
 - `state.warnings` gains one line while the app is set and the check has an error or a
   missing repo. The error line wins. The missing line names the app, the public repos
   without an installation, and `<url>/installations/new`.
-- Settings → Git hosts shows the app name (a link to `url`), then one line: "Installed on all
+- Settings → GitHub shows the app name (a link to `url`), then one line: "Installed on all
   N board repos", "Not installed on …" with an install link, or "Check failed: …".
 - Cost: 1 + one call per repo plus one repo lookup per repo without an installation,
   every 10 minutes, far below the app rate limit.
@@ -98,7 +98,7 @@ the release and the `post_error` handling it has today. The GitHub call changes:
 
 ## UI
 
-- Settings → Git hosts gains a "GitHub App" block under "GitHub token": when unset, an
+- Settings → GitHub gains a "GitHub App" block under "GitHub token": when unset, an
   App ID field and a write-only private-key textarea with Save; when set, the App ID,
   `key set`, the fingerprint, and Replace and Remove actions. The key is never shown.
 - The PR review drawer appends `· Posted as <login>` to the posted label when a login

@@ -58,7 +58,7 @@ export function readVmRunnerEnv(
 		throw new Error(`OTTR_VM_MEM=${env.OTTR_VM_MEM} is below 128m`);
 	return {
 		port: count("WORKER_PORT", 8787),
-		max: count("OTTR_VM_MAX", 2),
+		max: count("OTTR_VM_MAX", 10),
 		vcpus: count("OTTR_VM_VCPUS", 2),
 		memMiB: Math.floor(memBytes / 1024 ** 2),
 		diskBytes: size("OTTR_VM_DISK", "20g"),

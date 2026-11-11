@@ -80,6 +80,9 @@ const ICON_PATHS = {
 	"chevron-left": <path d="M15 18l-6-6 6-6" />,
 	"chevron-right": <path d="M9 18l6-6-6-6" />,
 	"chevron-up": <path d="M18 15l-6-6-6 6" />,
+	"chevron-down": <path d="M6 9l6 6 6-6" />,
+	// lucide minus (ISC): a stepper's one-less button
+	minus: <path d="M5 12h14" />,
 	clock: (
 		<>
 			<circle cx="12" cy="12" r="10" />

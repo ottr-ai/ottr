@@ -219,7 +219,7 @@ const sshFixture = () => {
 			: { error: `no route to ${host}` };
 	return { dir, keyscan };
 };
-/** A global ssh key file in an ssh dir, as Settings → Git hosts would leave it. */
+/** A global ssh key file in an ssh dir, as Settings → Git identity → SSH key would leave it. */
 const seedGlobalKey = (dir: string): void => {
 	execSync(`ssh-keygen -t ed25519 -N "" -q -f ${join(dir, "global")}`);
 };

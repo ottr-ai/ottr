@@ -15,6 +15,8 @@ describe("dev board bootstrap", () => {
 		seedDemo: (root: string) => {
 			seeded.push(root);
 		},
+		seedDemoOmp: (root: string) => join(root, "omp-agent"),
+		startDemoAlate: () => "http://127.0.0.1:9",
 	}));
 	mock.module("./server.ts", () => {
 		serverLoads.push(1);

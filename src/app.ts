@@ -4975,7 +4975,7 @@ export function createApp(deps: AppDeps) {
 	}
 
 	const NO_GLOBAL_KEY =
-		"no global SSH key: add one in Settings → Git hosts, or pick a new key for this project";
+		"no global SSH key: add one in Settings → Git identity → SSH key, or pick a new key for this project";
 	/** Key file for a test selector ("global", "pending:<id>", "project:<name>"); a string error for a 400. */
 	function resolveTestKey(sel: unknown): { key: string } | { error: string } {
 		const paths = sshPaths(sshDir);
@@ -10966,7 +10966,7 @@ export function createApp(deps: AppDeps) {
 				),
 			POST: (req) => api(req, () => handlePOSTSettingsGithub2(req)),
 		},
-		// Settings → Git hosts → GitHub host. An empty host is the reset: the boot env value
+		// Settings → GitHub → GitHub host. An empty host is the reset: the boot env value
 		// comes back, or github.com when the env had none. A save re-probes the token so the
 		// expiry notice follows the new host at once.
 		"/api/settings/github-host": {

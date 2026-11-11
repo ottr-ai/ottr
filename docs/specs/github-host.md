@@ -8,7 +8,7 @@ GitHub App. Plain git needs no setting: it already works on any host (src/gitHos
 
 One host per board, set in either place; a saved Settings value wins while it exists:
 
-- Settings → Git hosts → **GitHub host**: an input field that shows the host in effect
+- Settings → GitHub → **GitHub host**: an input field that shows the host in effect
   (`github.com` when nothing is set). Saving calls `POST /api/settings/github-host` with
   `{host}`; an empty `host` clears the saved value. The answer is
   `{host, expiresAt}`: the host now in effect (`null` only for an invalid env) and the
@@ -99,7 +99,7 @@ check at boot.
 - More than one GitHub host per board.
 - GitLab or another forge gets no GitHub features (unchanged; src/gitHosts.ts stays plain
   git plus ssh).
-- Git authentication to the host stays with the Settings → Git hosts tokens and SSH keys;
+- Git authentication to the host stays with the Settings → Other git hosts tokens and the SSH keys;
   `GH_ENTERPRISE_TOKEN` serves gh only. The board's own upstream checks (`ottr-ai/ottr`
   updates) stay on github.com.
 - No delete endpoint for the host: an empty save is the reset, as `github.com` in the field

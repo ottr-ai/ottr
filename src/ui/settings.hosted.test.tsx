@@ -83,7 +83,11 @@ const HIDDEN = [
 	"model-roles-section",
 	"alate-section",
 	"hindsight-section",
-	"project-updates-section",
+	"checks-section",
+	"automation-section",
+	"project-merging-section",
+	"project-watches-section",
+	"project-proposals-section",
 ];
 
 type Toc = readonly TocGroup[];
@@ -174,14 +178,14 @@ const tocLabels = (html: string): string[] => {
 	);
 };
 
+/** The map's rows: groups and their cards; a group with one card shows only its group row,
+ *  and sub-blocks are deep-link targets, not map rows. */
 const labelsOf = (toc: Toc): string[] =>
-	toc.flatMap((g) => [
-		g.label,
-		...g.sections.flatMap((s) => [
-			s.label,
-			...(s.blocks ?? []).map((b) => b.label),
-		]),
-	]);
+	toc.flatMap((g) =>
+		g.sections.length === 1
+			? [g.label]
+			: [g.label, ...g.sections.map((s) => s.label)],
+	);
 
 // --- settings TOC -----------------------------------------------------------
 
@@ -191,7 +195,7 @@ describe("hosted settings TOC", () => {
 		expect(tree(pageToc(false, false))).toEqual([
 			{
 				group: "project-group",
-				cards: ["project-icon-section", "project-identity-section"],
+				cards: ["project-identity-section", "project-icon-section"],
 			},
 			{
 				group: "project-work-group",
@@ -199,18 +203,21 @@ describe("hosted settings TOC", () => {
 					"project-runners-section",
 					"project-worktrees-section",
 					"project-messages-section",
-					"project-jira-section",
 				],
 			},
+			{ group: "project-merging-group", cards: ["project-merging-section"] },
 			{
 				group: "project-reviews-group",
-				cards: [
-					"project-releases-section",
-					"project-reviews-section",
-					"project-updates-section",
-				],
+				cards: ["project-releases-section", "project-reviews-section"],
 			},
-			{ group: "project-git-group", cards: ["project-ssh-section"] },
+			{
+				group: "project-cards-group",
+				cards: ["project-watches-section", "project-proposals-section"],
+			},
+			{
+				group: "project-integrations-group",
+				cards: ["project-jira-section", "project-ssh-section"],
+			},
 			{ group: "project-danger-group", cards: ["project-remove-section"] },
 		]);
 		for (const id of HIDDEN) expect(hostedHidden(false, id)).toBe(false);
@@ -219,14 +226,22 @@ describe("hosted settings TOC", () => {
 	test("hosted: the general page keeps only the tenant cards, and empty groups go", () => {
 		expect(tree(pageToc(true, true))).toEqual([
 			{ group: "board-group", cards: ["notifications-section"] },
-			{ group: "git-group", cards: ["env-section", "jira-section"] },
+			{ group: "environment-group", cards: ["env-section"] },
+			{ group: "git-group", cards: ["jira-section"] },
 		]);
 	});
 
-	test("hosted: the project page drops only the Updates card", () => {
+	test("hosted: the project page drops only the merge, watch and proposal cards", () => {
+		const gone = [
+			"project-merging-group",
+			"project-cards-group",
+			"project-merging-section",
+			"project-watches-section",
+			"project-proposals-section",
+		];
 		const full = tocTargets(pageToc(false, false));
 		expect(tocTargets(pageToc(false, true))).toEqual(
-			full.filter((id) => id !== "project-updates-section"),
+			full.filter((id) => !gone.includes(id)),
 		);
 	});
 
@@ -304,13 +319,18 @@ describe("hosted settings page render", () => {
 		}
 	});
 
-	test("the project page hides the Updates card only in hosted mode", () => {
+	test("the project page hides the merge, watch and proposal cards only in hosted mode", () => {
 		const hosted = renderToStaticMarkup(page("settings/proj", true));
-		expect(hosted).not.toContain('id="project-updates-section"');
+		for (const id of ["merging", "watches", "proposals"])
+			expect(hosted).not.toContain(`id="project-${id}-section"`);
+		// The vm-runner switch sat on the hidden Updates card; it stays hidden in hosted mode.
+		expect(hosted).not.toContain("Run work turns in microVMs");
 		expect(hosted).toContain('id="project-releases-section"');
 		expect(hosted).toContain('id="project-reviews-section"');
 		const off = renderToStaticMarkup(page("settings/proj"));
-		expect(off).toContain('id="project-updates-section"');
+		for (const id of ["merging", "watches", "proposals"])
+			expect(off).toContain(`id="project-${id}-section"`);
+		expect(off).toContain("Run work turns in microVMs");
 	});
 
 	test("hosted: a deep link to a hidden card opens the page without a pin", async () => {
@@ -357,7 +377,7 @@ const boardState = (
 				sessionsDir: "/tmp/proj/.tasks/sessions",
 				target: "origin/main",
 				dirty: false,
-				// The board's advisory points at Settings → Git hosts → GitHub host.
+				// The board's advisory points at Settings → GitHub → GitHub host.
 				githubHostNotice: "acme.ghe.com",
 			},
 		],
@@ -643,7 +663,7 @@ describe("hosted app shell", () => {
 		);
 	});
 
-	test("flag off: the Add dialog's unauthed hint links to the Git hosts settings", async () => {
+	test("flag off: the Add dialog's unauthed hint links to the Other git hosts settings", async () => {
 		await withApp(
 			"/projects/proj",
 			false,
@@ -655,7 +675,7 @@ describe("hosted app shell", () => {
 				);
 				const hint =
 					dialog.querySelector("p.hint.trust-warn")?.textContent ?? "";
-				expect(hint).toContain("Add a token in Settings → Git hosts");
+				expect(hint).toContain("Add a token in Settings → Other git hosts");
 				expect(hint).toContain("Open settings");
 				expect(dialog.querySelector("button.notif-link")).not.toBeNull();
 			},
@@ -793,7 +813,7 @@ describe("hosted app shell", () => {
 	test("flag off: the board and the overview link their setup cards", async () => {
 		await withApp("/projects/proj", false, boardShown, () => {
 			expect(document.body.textContent).toContain(
-				"Settings → Git hosts → GitHub host",
+				"Settings → GitHub → GitHub host",
 			);
 		});
 		await withApp("/", false, provisioningFailed, () => {

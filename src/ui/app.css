@@ -530,7 +530,7 @@ button.primary.failed {
 	}
 }
 button.attention {
-	animation: attention-pulse 1.6s ease-in-out infinite;
+	animation: attention-pulse 1.6s var(--ease) infinite;
 }
 @media (prefers-reduced-motion: reduce) {
 	button.attention {
@@ -1668,6 +1668,70 @@ textarea {
 	font-size: 12.5px;
 	font-weight: 600;
 	color: var(--text-strong);
+}
+/* A block title with its state chip beside it, as a card head carries one. */
+.sec-block > h4.block-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.sec-block > h4.block-head .state-chip {
+	font-weight: 400;
+}
+/* A titled sub-section of a settings card (GitHub's Connection and App, Git identity's SSH key
+   and Commit identity): its small-caps title, and the title's chip, sit in a 140px left column
+   beside the rows, and a full line in the stronger rule colour opens each one after the first.
+   Below 640px the title goes back above its rows. Untitled blocks keep the plain row flow. */
+.settings-sec .sec-block:has(> h4) {
+	display: grid;
+	grid-template-columns: 140px minmax(0, 1fr);
+	column-gap: 16px;
+	row-gap: 0;
+	align-items: start;
+}
+.settings-sec .sec-block:has(> h4) > * {
+	grid-column: 2;
+}
+.settings-sec .sec-block:has(> h4) > :not(h4) + :not(h4) {
+	margin-top: 8px;
+}
+.settings-sec .sec-block:has(> h4) > h4 {
+	grid-column: 1;
+	grid-row: 1 / span 9;
+	padding-top: 12px;
+	font-size: 11.5px;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--dim);
+}
+.settings-sec .sec-block:has(> h4) > h4.block-head {
+	flex-direction: column;
+	align-items: flex-start;
+}
+.settings-sec .sec-block > h4 .state-chip {
+	text-transform: none;
+	letter-spacing: 0;
+	font-size: 11.5px;
+}
+.settings-sec .sec-block:has(> h4) > .hint {
+	padding-top: 12px;
+}
+.settings-sec .sec-block:has(> h4) .alate-def-row:first-child {
+	border-top: none;
+}
+.settings-sec .sec-block + .sec-block:has(> h4) {
+	padding-top: 0;
+	border-top: 1px solid var(--line);
+}
+@container (max-width: 640px) {
+	.settings-sec .sec-block:has(> h4) {
+		grid-template-columns: minmax(0, 1fr);
+	}
+	.settings-sec .sec-block:has(> h4) > *,
+	.settings-sec .sec-block:has(> h4) > h4 {
+		grid-column: 1;
+		grid-row: auto;
+	}
 }
 .setup-sec h3 {
 	margin: 0;
@@ -4192,6 +4256,12 @@ a.pr-link:hover {
 	border: 1px solid var(--alarm-line);
 	border-radius: 6px;
 }
+/* In a settings card (a column flex that starts its children) the callout takes the full
+   width, bleeding 9px into the card padding like the expired sign-in and missing-role boxes. */
+.settings-sec > .prov-callout {
+	align-self: stretch;
+	margin-inline: -9px;
+}
 .prov-callout-text {
 	display: grid;
 	flex: 1;
@@ -5615,6 +5685,12 @@ dialog.confirm-dialog {
 .sec-block + .sec-block {
 	padding-top: 12px;
 	border-top: 1px solid var(--line-soft);
+}
+/* A block without its own title (a single row that names itself, e.g. GitHub's Host and
+   Token) joins the previous block's rows: its row line is the only divider between them. */
+.sec-block + .sec-block:not(:has(> h4)) {
+	padding-top: 0;
+	border-top: none;
 }
 .sec-foot {
 	display: flex;
@@ -8356,6 +8432,16 @@ button.log-mode[aria-pressed="true"] {
 	gap: 10px;
 	align-items: start;
 }
+/* A check row with its own action (Scan trending now): the button takes a third column. */
+.settings-sec .alate-def-row.check-row:has(> .alate-def-actions) {
+	grid-template-columns: auto minmax(0, 1fr) auto;
+}
+@container (max-width: 640px) {
+	.settings-sec .alate-def-row.check-row > .alate-def-actions {
+		grid-column: 2;
+		justify-content: flex-start;
+	}
+}
 .updates-all input[type="checkbox"] {
 	width: 15px;
 	height: 15px;
@@ -8508,16 +8594,109 @@ button.log-mode[aria-pressed="true"] {
 	> input[type="number"][max="10000"] {
 	width: 12ch;
 }
+/* Runner cap: a stepper beside the label column that saves on its own (the save tick sits
+   after the name, as on the checkbox rows). Minus | figure | plus share one recessed frame;
+   the figure is bright and tabular, a dash with "unlimited" beside it when there is no cap.
+   The figure clips so its roll stays inside. */
+.cap-ctl {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+}
+.cap-step {
+	display: inline-flex;
+	align-items: stretch;
+	height: 32px;
+	overflow: hidden;
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.cap-step:focus-within {
+	border-color: var(--accent);
+}
+.cap-step button {
+	display: grid;
+	place-items: center;
+	min-width: 32px;
+	min-height: 0;
+	padding: 0;
+	color: var(--dim);
+	background: transparent;
+	border: 0;
+	border-radius: 0;
+}
+.cap-step button:hover:not(:disabled) {
+	color: var(--text-strong);
+	background: var(--card-hover);
+}
+.cap-step input {
+	width: 7ch;
+	height: 100%;
+	padding: 0;
+	color: var(--text-strong);
+	font-weight: 600;
+	font-variant-numeric: tabular-nums;
+	text-align: center;
+	background: transparent;
+	border: 0;
+	border-inline: 1px solid var(--line-soft);
+	border-radius: 0;
+	appearance: textfield;
+}
+.cap-step input::-webkit-inner-spin-button,
+.cap-step input::-webkit-outer-spin-button {
+	appearance: none;
+	margin: 0;
+}
+.cap-step input::placeholder {
+	color: var(--text-strong);
+}
+.cap-step input:focus-visible {
+	outline: none;
+}
+.cap-unlimited {
+	color: var(--dim);
+	font-size: 12.5px;
+}
+/* Runs at once: the board's real limit as a bright tabular figure (Values-Read-First),
+ * in the control column under the stepper; "No limit" reads as plain text. */
+.runs-fig {
+	justify-self: start;
+	font-size: 22px;
+	font-weight: 600;
+	line-height: 1.1;
+	color: var(--text-strong);
+	font-variant-numeric: tabular-nums;
+}
+.runs-fig.none {
+	font-size: 14px;
+	font-weight: 400;
+	color: var(--text);
+}
+@media (pointer: coarse) {
+	.cap-step {
+		height: 44px;
+	}
+	.cap-step button {
+		min-width: 44px;
+	}
+}
 /* Usage windows inside a sign-in row: span both columns of the row grid. */
 .settings-sec .alate-def-row .quota {
 	grid-column: 1 / -1;
 }
-/* Provider sign-in: a three-column status table - identity, live quota meters,
-   actions. Every quota row shares one grid, so label, track, value and reset
-   sit on shared vertical edges across all providers. */
+/* Provider sign-in: a compact status table. Above 640px each provider is one line -
+   name, state words and id on shared columns, actions at the end - and its usage
+   meters take a line of their own under it. Grey is normal: a healthy sign-in has no
+   mark, and Sign out stays a quiet ghost until hover. An expired sign-in is the one
+   needs-you row: the amber triangle and an amber box that keeps the table's columns. */
 .settings-sec.providers {
 	width: 100%;
 	align-items: stretch;
+}
+.settings-sec.providers .sec-head .hint {
+	max-width: 72ch;
 }
 .settings-sec.providers .alate-def-row.providers-row {
 	grid-template-columns: 260px minmax(0, 1fr) auto;
@@ -8530,18 +8709,68 @@ button.log-mode[aria-pressed="true"] {
 	gap: 7px;
 	min-width: 0;
 }
-.status-dot {
-	flex: none;
-	width: 7px;
-	height: 7px;
-	border-radius: 50%;
-	background: var(--dim);
+.providers-row .alate-def-name > span {
+	color: var(--dim);
 }
-.status-dot.ok {
-	background: var(--diff-add);
+.settings-sec.providers .providers-row button.danger {
+	color: var(--dim);
+	background: transparent;
+	border-color: transparent;
 }
-.status-dot.crit {
-	background: var(--crit);
+.settings-sec.providers .providers-row button.danger:hover:not(:disabled) {
+	color: var(--crit-text);
+	background: var(--crit-bg);
+	border-color: var(--crit-line);
+}
+/* The box bleeds 9px into the card's 18px padding, so 9px of card stays on each side; its
+   8px padding plus the 1px line put the row's columns back on the table's edges. */
+.settings-sec.providers .alate-def-row.providers-row.expired {
+	margin: 4px -9px;
+	padding: 10px 8px;
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 6px;
+}
+/* The row above the box drops its divider: the box's own line is the boundary (no double line). */
+.settings-sec.providers
+	.alate-def-row.providers-row:has(+ .providers-row.expired) {
+	border-bottom-color: transparent;
+}
+.providers-row.expired .alate-def-name > span {
+	color: var(--text-strong);
+	font-weight: 600;
+}
+.providers-row.expired button:not(.danger) {
+	color: var(--text-strong);
+	border-color: var(--alarm-line);
+}
+@container (min-width: 641px) {
+	.settings-sec.providers .alate-def-row.providers-row {
+		grid-template-columns: minmax(0, 1fr) auto;
+		padding-block: 8px;
+		row-gap: 6px;
+	}
+	.providers-row .alate-def-name {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) 220px;
+		align-items: baseline;
+		column-gap: 16px;
+	}
+	.providers-row .providers-meters {
+		grid-column: 1 / -1;
+		grid-row: 2;
+	}
+	.providers-row .providers-meters:empty {
+		display: none;
+	}
+	/* One action width for every row, so the text columns line up across rows. */
+	.settings-sec.providers .providers-row .alate-def-actions {
+		grid-row: 1;
+		grid-column: 2;
+		display: flex;
+		justify-content: flex-end;
+		min-width: 196px;
+	}
 }
 .providers-meters {
 	display: flex;
@@ -8586,9 +8815,6 @@ button.log-mode[aria-pressed="true"] {
 	display: flex;
 	width: 100%;
 	margin-top: 12px;
-}
-.settings-sec .notify-group > legend + .alate-def-row {
-	border-top: 1px solid var(--line-soft);
 }
 .settings-sec.providers .providers-form .alate-def-row {
 	display: grid;
@@ -8670,8 +8896,11 @@ button.log-mode[aria-pressed="true"] {
 		margin: -10px 0;
 	}
 }
-/* Model roles: name, model, thinking and remove on one line; the notes span the row below.
-   At 480px the name and the remove button share the first line, each picker takes a full line. */
+/* Model roles, an outlined table: name, model, thinking and remove on one line; the notes
+   span the row below. The pickers carry a thin outline and no fill, so the role name leads
+   the row. Above 480px each fallback picker hangs in the role picker's column (see the
+   container block after the phone rules). At 480px the name and the remove button share
+   the first line, each picker takes a full line. */
 .settings-sec.model-roles {
 	width: 100%;
 	align-items: stretch;
@@ -8684,8 +8913,20 @@ button.log-mode[aria-pressed="true"] {
 	width: 100%;
 	min-width: 0;
 }
+.role-row :is(.model-trigger, select) {
+	background: transparent;
+	border-color: var(--line-soft);
+}
+.role-row :is(.model-trigger, select):hover:not(:disabled) {
+	border-color: var(--line-hover);
+}
+.role-row :is(.model-trigger, select):focus-visible {
+	border-color: var(--accent);
+}
 .role-name {
 	color: var(--text-strong);
+	font-size: 14px;
+	font-weight: 600;
 	overflow-wrap: anywhere;
 }
 .role-notes {
@@ -8693,11 +8934,98 @@ button.log-mode[aria-pressed="true"] {
 	display: grid;
 	gap: 4px;
 }
-.role-add {
+/* A missing check role: the needs-you box of an expired sign-in. It bleeds into the card's
+   padding like that row (9px, the same inset), and its buttons sit at the right end like that
+   row's actions. Each button adds its role directly. Below 640px the buttons take their own line. */
+.role-warn {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 4px 10px;
+	margin: 4px -9px 0;
+	padding: 10px 8px;
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 6px;
+}
+.role-warn > .mark {
+	align-self: start;
+	margin-top: 3px;
+}
+.role-warn > b {
+	color: var(--text-strong);
+	font-weight: 600;
+}
+.role-warn > p {
+	grid-column: 2;
+	margin: 0;
+	font-size: 12.5px;
+	line-height: 1.5;
+}
+.role-warn-actions {
+	grid-column: 3;
+	grid-row: 1 / span 2;
 	display: flex;
 	flex-wrap: wrap;
-	align-items: flex-end;
+	justify-content: flex-end;
 	gap: 8px;
+	margin-inline-start: 8px;
+}
+.role-warn-actions button {
+	color: var(--text-strong);
+	border-color: var(--alarm-line);
+}
+@container (max-width: 640px) {
+	.role-warn {
+		grid-template-columns: auto minmax(0, 1fr);
+	}
+	.role-warn-actions {
+		grid-column: 2;
+		grid-row: auto;
+		justify-content: flex-start;
+		margin: 4px 0 0;
+	}
+}
+/* Add role: the table's last row - the field in the name column, a quiet button under the
+   pickers. */
+.role-add {
+	display: grid;
+	grid-template-columns: 160px minmax(0, 1fr);
+	gap: 8px 12px;
+	align-items: center;
+	padding-block: 10px;
+}
+.role-add input {
+	width: 100%;
+	background: transparent;
+	border-color: var(--line-soft);
+}
+.role-add input:hover:not(:disabled) {
+	border-color: var(--line-hover);
+}
+.role-add input:focus-visible {
+	border-color: var(--accent);
+}
+.role-add-btn {
+	justify-self: start;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 28px;
+	padding: 0 9px;
+	color: var(--dim);
+	background: transparent;
+	border-color: transparent;
+}
+.role-add-btn:hover:not(:disabled) {
+	color: var(--text-strong);
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+@container (max-width: 480px) {
+	.role-add {
+		grid-template-columns: 1fr;
+	}
 }
 .role-steps {
 	display: grid;
@@ -8706,9 +9034,9 @@ button.log-mode[aria-pressed="true"] {
 	list-style: none;
 	overflow-wrap: anywhere;
 }
-/* A role's fallbacks: under the row, indented behind a soft rule and headed by a small dim
-   label, so the chain reads as part of its role. The entries share one set of columns
-   through the list's subgrid. */
+/* A role's fallbacks: tight under the row, so the chain reads as part of its role. The
+   "Fallbacks" legend and the empty-chain hint stay for screen readers only; the numbers
+   say what the rows are. The entries share one set of columns through the list's subgrid. */
 .role-fallbacks {
 	grid-column: 1 / -1;
 	display: grid;
@@ -8728,12 +9056,21 @@ button.log-mode[aria-pressed="true"] {
 	margin: 0;
 }
 .role-fallbacks > legend {
+	position: absolute;
+	width: 1px;
+	height: 1px;
 	padding: 0;
-	margin-block-end: 6px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
 }
-.role-fallbacks-head {
-	color: var(--dim);
-	font-size: 12px;
+.role-fallbacks > p.hint {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
 }
 .fallback-list {
 	justify-self: stretch;
@@ -8742,7 +9079,7 @@ button.log-mode[aria-pressed="true"] {
 	   role row's, so the fallback controls line up under the role's. Move up keeps its
 	   track on the first entry too. */
 	grid-template-columns: auto 28px minmax(0, 1fr) minmax(100px, 140px) auto;
-	gap: 6px 12px;
+	gap: 4px 12px;
 	margin: 0;
 	padding: 0;
 	list-style: none;
@@ -8753,6 +9090,22 @@ button.log-mode[aria-pressed="true"] {
 	grid-template-columns: subgrid;
 	row-gap: 6px;
 	align-items: center;
+}
+.fallback-row :is(.model-trigger, select) {
+	color: var(--text);
+}
+/* Add fallback: a quiet text button; the frame shows on hover only. */
+.fallback-add {
+	min-height: 28px;
+	padding: 0 9px;
+	color: var(--dim);
+	background: transparent;
+	border-color: transparent;
+}
+.fallback-add:hover:not(:disabled) {
+	color: var(--text-strong);
+	background: var(--card-hover);
+	border-color: var(--line-hover);
 }
 .fallback-num {
 	min-width: 1.5ch;
@@ -8805,6 +9158,26 @@ button.log-mode[aria-pressed="true"] {
 	.fallback-remove {
 		grid-row: 1;
 		grid-column: 4;
+	}
+}
+/* Above 480px every picker sits in one column system: the name column is 160px, and the
+   chain starts 60px earlier, so its number (20px) and Move up (28px) fill the gap and each
+   fallback picker lands exactly under the role's. Add fallback lines up with them too. */
+@container (min-width: 481px) {
+	.settings-sec .alate-def-row.role-row {
+		grid-template-columns: 160px minmax(0, 1fr) 140px 28px;
+		gap: 6px 12px;
+	}
+	.role-fallbacks {
+		margin-inline-start: 100px;
+		padding-inline-start: 0;
+		border-inline-start: 0;
+	}
+	.fallback-list {
+		grid-template-columns: 20px 28px minmax(0, 1fr) 140px 28px;
+	}
+	.fallback-add {
+		margin-inline-start: 72px;
 	}
 }
 
@@ -8990,10 +9363,6 @@ dialog.updates {
 	margin: 0;
 	padding: 0;
 	border: 0;
-}
-.notify-group > legend {
-	padding: 8px 0 0;
-	font-weight: 600;
 }
 .notify-hint {
 	color: var(--dim);

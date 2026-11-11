@@ -13,6 +13,7 @@ import { resetCatalogCache } from "./models.ts";
 import {
 	AlateSection,
 	AppCheckLines,
+	appChip,
 	asError,
 	dashboardLink,
 	fmtCost,
@@ -24,16 +25,17 @@ import {
 	missingRequiredLine,
 	NotificationsSection,
 	OmpStatsSection,
+	onChip,
 	openSettingsSection,
 	ProjectSettingsForm,
 	ProjectSetupSteps,
 	ProjectsOrderSection,
 	type ProvisionResult,
 	provisionChangeSummary,
+	runCeiling,
 	SessionSection,
 	SettingsPage,
 	shortProvisionLines,
-	updatesChip,
 	userLayerEmpty,
 	userLayerLine,
 } from "./settings.tsx";
@@ -91,7 +93,9 @@ afterAll(() => {
 
 /** The rendered GitHub App block, isolated from the other sec-blocks. */
 const appBlock = (): string => {
-	const html = renderToStaticMarkup(<GitHostsSection />);
+	const html = renderToStaticMarkup(
+		<GitHostsSection commitIdentity={null} act={async () => true} />,
+	);
 	const start = html.indexOf('id="github-app-block"');
 	const end = html.indexOf('id="host-tokens-block"');
 	expect(start).toBeGreaterThan(-1);
@@ -190,7 +194,9 @@ async function mountSection(fetchMock: typeof fetch): Promise<{
 	window.document.body.appendChild(container as unknown as HappyNode);
 	const root = createRoot(container);
 	await act(async () => {
-		root.render(<GitHostsSection />);
+		root.render(
+			<GitHostsSection commitIdentity={null} act={async () => true} />,
+		);
 	});
 	return {
 		container,
@@ -434,6 +440,78 @@ describe("GitHostsSection GitHub host", () => {
 			);
 			if (refetched === null) throw new Error("input gone after refetch");
 			expect(refetched.value).toBe("acme.ghe.com");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("one Save sends the edited host and then the pasted token; a token alone skips the host", async () => {
+		const loaded = { calls: 0 };
+		const posts: { url: string; body: unknown }[] = [];
+		const base = baseMock(loaded, (url, init) =>
+			url.endsWith("/api/settings/github-host") && init?.method === "POST"
+				? ok({ host: "acme.ghe.com" })
+				: undefined,
+		);
+		// Record every POST before the base mock answers it (it serves the token route itself).
+		const { container, unmount } = await mountSection((async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			if (init?.method === "POST")
+				posts.push({ url: String(input), body: JSON.parse(String(init.body)) });
+			return base(input, init);
+		}) as typeof fetch);
+		try {
+			const host = container.querySelector<HTMLInputElement>(
+				'#github-host-block input[aria-label="GitHub host"]',
+			);
+			const token = container.querySelector<HTMLInputElement>(
+				'#github-host-block input[aria-label="GitHub token"]',
+			);
+			const form = container.querySelector("#github-host-block form");
+			const saves = container.querySelectorAll(
+				'#github-host-block button[type="submit"]',
+			);
+			if (host === null || token === null || form === null)
+				throw new Error("connection form did not render");
+			expect(saves.length).toBe(1);
+			await act(async () => {
+				typeInto(host, "acme.ghe.com");
+				onChangeOf(host)({ target: host, currentTarget: host });
+				typeInto(token, "ghp_new");
+				onChangeOf(token)({ target: token, currentTarget: token });
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			// The save chains two requests and a refetch: let them all land.
+			for (let k = 0; k < 5; k++)
+				await act(async () => {
+					await new Promise((r) => setTimeout(r, 0));
+				});
+			expect(posts.map((p) => p.url.replace(/^.*\/api/, "/api"))).toEqual([
+				"/api/settings/github-host",
+				"/api/settings/github-token",
+			]);
+			expect(posts[1]?.body).toEqual({ token: "ghp_new" });
+			expect(token.value).toBe("");
+			posts.length = 0;
+			await act(async () => {
+				typeInto(token, "ghp_other");
+				onChangeOf(token)({ target: token, currentTarget: token });
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			// The save chains two requests and a refetch: let them all land.
+			for (let k = 0; k < 5; k++)
+				await act(async () => {
+					await new Promise((r) => setTimeout(r, 0));
+				});
+			expect(posts.map((p) => p.url.replace(/^.*\/api/, "/api"))).toEqual([
+				"/api/settings/github-token",
+			]);
 		} finally {
 			await unmount();
 		}
@@ -717,7 +795,7 @@ describe("ProjectSettingsForm target branch", () => {
 		}) as typeof fetch;
 		const { container, unmount } = await mountForm(fetchMock);
 		try {
-			const card = container.querySelector("#project-updates-section");
+			const card = container.querySelector("#project-merging-section");
 			expect(card).not.toBeNull();
 			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
 				l.textContent?.includes("Push sync commits"),
@@ -768,7 +846,7 @@ describe("ProjectSettingsForm target branch", () => {
 		}) as typeof fetch;
 		const { container, unmount } = await mountForm(fetchMock);
 		try {
-			const card = container.querySelector("#project-updates-section");
+			const card = container.querySelector("#project-merging-section");
 			expect(card).not.toBeNull();
 			const label = [...(card?.querySelectorAll("label") ?? [])].find((l) =>
 				l.textContent?.includes("Hold fork-born merges"),
@@ -1592,7 +1670,7 @@ describe("ProjectSettingsForm review counter", () => {
 	});
 });
 
-describe("Updates card", () => {
+describe("Project switch cards", () => {
 	const settings = (
 		over: Partial<ProjectView["settings"]>,
 	): ProjectView["settings"] =>
@@ -1612,37 +1690,35 @@ describe("Updates card", () => {
 			...over,
 		}) as unknown as ProjectView["settings"];
 
-	test("the chip counts all twelve checkboxes", () => {
-		expect(
-			updatesChip(
-				settings({
-					retroSince: 1,
-					retroFilter: true,
-					forkResearch: true,
-					trendingScout: true,
-					prReviews: true,
-					issueWatch: true,
-					ompWatch: true,
-				}),
-			),
-		).toEqual({ label: "7 of 12 on", tone: "ok" });
-		expect(
-			updatesChip(
-				settings({
-					holdUpdateMerges: true,
-					prMode: true,
-					microVm: true,
-					pushSyncCommits: true,
-				}),
-			).label,
-		).toBe("4 of 12 on");
+	test("a switch card's chip counts the checkboxes that are on", () => {
+		expect(onChip([true, false, true])).toEqual({
+			label: "2 of 3 on",
+			tone: "ok",
+		});
+		expect(onChip([false, false])).toEqual({ label: "0 of 2 on", tone: "off" });
 	});
 
-	test("the friction filter does not count while retro is off", () => {
-		expect(updatesChip(settings({ retroFilter: true }))).toEqual({
-			label: "0 of 12 on",
-			tone: "off",
-		});
+	test("the Proposals chip does not count the friction filter while retro is off", async () => {
+		const html = renderToStaticMarkup(
+			<ProjectSettingsForm
+				project={
+					{
+						...project(),
+						settings: {
+							...project().settings,
+							retroFilter: true,
+							trendingScout: true,
+						},
+					} as unknown as ProjectView
+				}
+				tasks={[]}
+				trendingScan={true}
+				act={async () => true}
+				openTask={() => {}}
+			/>,
+		);
+		const card = html.slice(html.indexOf('id="project-proposals-section"'));
+		expect(card.slice(0, 600)).toContain("1 of 3 on");
 	});
 
 	const TAG = "Not needed: private repo";
@@ -1719,7 +1795,7 @@ describe("Updates card", () => {
 				await settled.promise;
 			});
 			return [
-				...container.querySelectorAll("#project-updates-section .check-row"),
+				...container.querySelectorAll("#project-watches-section .check-row"),
 			]
 				.filter((row) => row.textContent?.includes(TAG))
 				.map((row) => row.querySelector("label")?.textContent ?? "");
@@ -1734,9 +1810,9 @@ describe("Updates card", () => {
 
 	test("a private repo marks fork research, PR reviews and issue watch", async () => {
 		expect(await taggedRows(json(200, { private: true }))).toEqual([
-			"Fork research",
-			"PR reviews",
 			"Issue watch",
+			"PR reviews",
+			"Fork research",
 		]);
 	});
 
@@ -1825,7 +1901,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 			);
 		});
 		const row = [
-			...container.querySelectorAll("#project-updates-section .check-row"),
+			...container.querySelectorAll("#project-proposals-section .check-row"),
 		].find((r) => r.querySelector("label")?.textContent === "Trending scout");
 		return {
 			row: row as Element,
@@ -1846,7 +1922,7 @@ describe("Trending scout depends on the general weekly scan", () => {
 			expect(box?.disabled).toBe(true);
 			const link = row.querySelector("a");
 			expect(link?.textContent).toBe("General settings");
-			expect(link?.getAttribute("href")).toBe("/settings#runners-section");
+			expect(link?.getAttribute("href")).toBe("/settings#automation-section");
 		} finally {
 			await unmount();
 		}
@@ -2161,22 +2237,24 @@ async function mountHindsight(view: HindsightView) {
 	};
 }
 
-/** Mounts the full General settings page; the fetch stub never resolves, so the
- *  sections stay idle and the test stays deterministic. Cleanup unmounts and
- *  puts fetch back. `trendingStatus` defaults to a board that never scanned. */
+/** Mounts General settings with an optional fetch mock and act. By default, requests stay
+ * pending and act runs nothing, so sections remain idle. Cleanup unmounts and restores fetch. */
 async function mountPage(
 	trendingStatus: TrendingStatus = {
 		lastRunAt: null,
 		lastError: null,
 		running: false,
 	},
+	fetchMock?: typeof fetch,
+	actFn: (fn: () => Promise<void>) => Promise<boolean> = async () => true,
 ): Promise<{
 	container: HTMLDivElement;
 	unmount: () => Promise<void>;
 }> {
 	const realFetch = globalThis.fetch;
-	globalThis.fetch = (async () =>
-		new Promise<Response>(() => {})) as unknown as typeof fetch;
+	globalThis.fetch =
+		fetchMock ??
+		((async () => new Promise<Response>(() => {})) as unknown as typeof fetch);
 	const container = window.document.createElement(
 		"div",
 	) as unknown as HTMLDivElement;
@@ -2194,7 +2272,7 @@ async function mountPage(
 				trendingScan={true}
 				commitIdentity={null}
 				trendingStatus={trendingStatus}
-				act={async () => true}
+				act={actFn}
 				view="settings"
 				openTask={() => {}}
 			/>,
@@ -2211,6 +2289,146 @@ async function mountPage(
 		},
 	};
 }
+
+describe("provider sign-in actions", () => {
+	for (const [active, label] of [
+		[true, "Sign out"],
+		[false, "Remove"],
+	] as const) {
+		test(`${label} confirms the matching action and Cancel keeps the sign-in`, async () => {
+			const { container, unmount } = await mountPage(undefined, (async (
+				input,
+			) =>
+				String(input) === "/api/provider-login"
+					? Response.json({
+							signIns: [
+								{
+									provider: "anthropic",
+									kind: "oauth",
+									active,
+									cause: active ? null : "refresh failed",
+									lent: active,
+								},
+							],
+							providers: [{ id: "anthropic", name: "Anthropic" }],
+							pending: null,
+							error: null,
+						})
+					: new Promise<Response>(() => {})) as typeof fetch);
+			try {
+				const action = container.querySelector<HTMLButtonElement>(
+					"#signin-section button.danger",
+				);
+				if (action === null) throw new Error("sign-in action missing");
+				expect(action.textContent).toBe(label);
+				expect(action.getAttribute("aria-label")).toBe(
+					active ? "Sign out of Anthropic" : "Remove sign-in for Anthropic",
+				);
+				await act(async () => action.click());
+				const confirm = document.querySelector(
+					"dialog .dialog-actions button.danger",
+				);
+				const cancel = document.querySelector<HTMLButtonElement>(
+					"dialog .dialog-actions button:not(.danger)",
+				);
+				if (cancel === null) throw new Error("Cancel button missing");
+				const confirmedLabel = confirm?.textContent;
+				const title = document.querySelector("dialog h2")?.textContent;
+				await act(async () => cancel.click());
+				await settleDialog();
+				expect(confirmedLabel).toBe(label);
+				expect(title).toBe(
+					active
+						? "Sign omp out of Anthropic?"
+						: "Remove the expired sign-in for Anthropic?",
+				);
+				expect(container.querySelector(".providers-row")).not.toBeNull();
+				expect(document.querySelector("dialog")).toBeNull();
+			} finally {
+				await unmount();
+			}
+		});
+	}
+});
+
+describe("runner cap stepper", () => {
+	test("no cap shows a dash and unlimited; plus starts at 1, minus from 1 goes back", async () => {
+		const { container, unmount } = await mountPage();
+		try {
+			const row = container.querySelector(".cap-row");
+			if (row === null) throw new Error("runner cap row missing");
+			const field = row.querySelector<HTMLInputElement>("input");
+			const fewer = row.querySelector<HTMLButtonElement>(
+				'[aria-label="One runner fewer"]',
+			);
+			const more = row.querySelector<HTMLButtonElement>(
+				'[aria-label="One runner more"]',
+			);
+			if (!field || !fewer || !more) throw new Error("stepper parts missing");
+			// No Save: the cap saves on its own, like the checkbox rows.
+			expect(row.querySelector("button.settings-save")).toBeNull();
+			const unlimited = (): string | null =>
+				row.querySelector(".cap-unlimited")?.textContent ?? null;
+			expect(field.value).toBe("");
+			expect(field.placeholder).toBe("–");
+			expect(unlimited()).toBe("unlimited");
+			expect(fewer.disabled).toBe(true);
+
+			await act(async () => more.click());
+			expect(field.value).toBe("1");
+			expect(unlimited()).toBeNull();
+
+			await act(async () => more.click());
+			expect(field.value).toBe("2");
+			await act(async () => fewer.click());
+			await act(async () => fewer.click());
+			expect(field.value).toBe("");
+			expect(unlimited()).toBe("unlimited");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a burst of steps sends one save with the last figure, after the wait", async () => {
+		const posts: unknown[] = [];
+		const { container, unmount } = await mountPage(
+			undefined,
+			(async (input: RequestInfo | URL, init?: RequestInit) => {
+				if (String(input) === "/api/settings" && init?.method === "POST") {
+					posts.push(JSON.parse(String(init.body)));
+					return Response.json({});
+				}
+				return new Promise<Response>(() => {});
+			}) as typeof fetch,
+			async (fn) => {
+				await fn();
+				return true;
+			},
+		);
+		try {
+			const row = container.querySelector(".cap-row");
+			const more = row?.querySelector<HTMLButtonElement>(
+				'[aria-label="One runner more"]',
+			);
+			if (!row || !more) throw new Error("stepper parts missing");
+			await act(async () => more.click());
+			await act(async () => more.click());
+			await act(async () => more.click());
+			// Inside the wait nothing is sent yet.
+			expect(posts).toEqual([]);
+			await act(async () => {
+				await Bun.sleep(700);
+			});
+			expect(posts).toEqual([{ maxTotal: 3 }]);
+			// The checkbox rows' tick confirms it beside the name.
+			expect(
+				row.querySelector('.save-tick svg[aria-label="Saved"]'),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+});
 
 /** The TOC row (a .smap-row button) currently pinned as `aria-current="location"`. */
 const pinnedRow = (container: HTMLDivElement): string | null =>
@@ -2251,7 +2469,7 @@ describe("settings deep links", () => {
 			window.location.hash = "#git-hosts-section";
 			const { container, unmount } = await mountPage();
 			try {
-				expect(pinnedRow(container)).toBe("Git hosts");
+				expect(pinnedRow(container)).toBe("GitHub");
 				expect(
 					container.querySelector('[id="git-hosts-section"]'),
 				).not.toBeNull();
@@ -2262,11 +2480,30 @@ describe("settings deep links", () => {
 		},
 	);
 
+	test("a sub-block fragment pins its card: the map shows no block rows", async () => {
+		window.location.hash = "#github-token-block";
+		const { container, unmount } = await mountPage();
+		try {
+			expect(pinnedRow(container)).toBe("GitHub");
+			const rows = [...container.querySelectorAll(".smap-row")].map(
+				(r) => r.textContent,
+			);
+			expect(rows).not.toContain("GitHub token");
+			expect(rows).toContain("Git and integrations");
+			expect(
+				container.querySelector('[id="github-token-block"]'),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+			window.location.hash = "";
+		}
+	});
+
 	test("a popstate to another fragment moves the pin to that row", async () => {
 		window.location.hash = "#git-hosts-section";
 		const { container, unmount } = await mountPage();
 		try {
-			expect(pinnedRow(container)).toBe("Git hosts");
+			expect(pinnedRow(container)).toBe("GitHub");
 			await act(async () => {
 				window.location.hash = "#env-section";
 				window.dispatchEvent(
@@ -2289,7 +2526,7 @@ describe("settings deep links", () => {
 			const current = [
 				...container.querySelectorAll('.smap-row[aria-current="location"]'),
 			].map((r) => r.textContent);
-			expect(current).not.toContain("Git hosts");
+			expect(current).not.toContain("GitHub");
 			expect(
 				container.querySelector('[id="git-hosts-section"]'),
 			).not.toBeNull();
@@ -2303,24 +2540,31 @@ describe("settings deep links", () => {
 describe("General settings trending scan", () => {
 	test("a failed scan shows its reason and time; a running scan disables Scan trending now", async () => {
 		const at = 1_730_634_000_000;
-		const { container, unmount } = await mountPage({
+		const failed = await mountPage({
 			lastRunAt: at - 7 * 86_400_000,
 			lastError: { reason: "GitHub answered 502", at },
+			running: false,
+		});
+		try {
+			// The failure replaces the last-run time until a scan succeeds.
+			expect(failed.container.textContent).toContain(
+				`Last scan: Failed: GitHub answered 502 (${stamp(at)})`,
+			);
+		} finally {
+			await failed.unmount();
+		}
+		const { container, unmount } = await mountPage({
+			lastRunAt: at - 7 * 86_400_000,
+			lastError: null,
 			running: true,
 		});
 		try {
-			const text = container.textContent ?? "";
-			expect(text).toContain(
-				`Last trending scan failed: GitHub answered 502 (${stamp(at)})`,
-			);
-			// The failure replaces the last-run line until a scan succeeds.
-			expect(text).not.toContain("Last scan:");
-			expect(text).toContain("A scan is running.");
+			expect(container.textContent).toContain("A scan is running");
 			const button = Array.from(container.querySelectorAll("button")).find(
 				(b) => b.textContent?.trim() === "Scan trending now",
 			);
 			expect(button?.disabled).toBe(true);
-			// The weekly switch is a labelled checkbox in the same card.
+			// The weekly switch is the labelled checkbox of the same row.
 			const label = Array.from(container.querySelectorAll("label")).find(
 				(l) => l.textContent === "Weekly trending scan",
 			);
@@ -2332,6 +2576,72 @@ describe("General settings trending scan", () => {
 		} finally {
 			await unmount();
 		}
+	});
+});
+
+describe("appChip", () => {
+	const check = (over: Partial<AppCheck>): AppCheck => ({
+		at: 0,
+		name: "ottr",
+		url: null,
+		repos: ["o/a", "o/b"],
+		missing: [],
+		private: [],
+		failed: [],
+		error: null,
+		...over,
+	});
+	const app = (c: AppCheck | null) => ({
+		id: "1",
+		fingerprint: "SHA256:x",
+		check: c,
+	});
+	test("no app, a pending check, a failed check, gaps and a clean check each get their chip", () => {
+		expect(appChip(null)).toEqual({ label: "Not set", tone: "off" });
+		expect(appChip(app(null))).toEqual({ label: "Checking", tone: "off" });
+		expect(appChip(app(check({ error: "401" })))).toEqual({
+			label: "Check failed",
+			tone: "warn",
+		});
+		expect(
+			appChip(
+				app(
+					check({ missing: ["o/a"], failed: [{ repo: "o/b", detail: "500" }] }),
+				),
+			),
+		).toEqual({ label: "Not on 2 repos", tone: "warn" });
+		// A private repo without an install gets no outside PRs: not a gap.
+		expect(appChip(app(check({ private: ["o/a"] })))).toEqual({
+			label: "Working",
+			tone: "ok",
+		});
+	});
+});
+
+describe("runCeiling", () => {
+	const p = (name: string, maxParallel: number | null) =>
+		({ name, settings: { maxParallel } }) as unknown as ProjectView;
+	test("the board cap wins while it is the smaller limit", () => {
+		expect(runCeiling(4, [p("a", 2), p("b", 3)])).toEqual({
+			limit: 4,
+			why: "The board cap sets it",
+		});
+	});
+	test("the project caps add up when they are smaller or there is no board cap", () => {
+		const two = [p("a", 2), p("b", 3)];
+		expect(runCeiling(9, two).limit).toBe(5);
+		expect(runCeiling(null, two)).toEqual({
+			limit: 5,
+			why: "The project caps add up to it",
+		});
+	});
+	test("a project without its own cap leaves only the board cap", () => {
+		const open = [p("a", 2), p("b", null)];
+		expect(runCeiling(3, open).limit).toBe(3);
+		const none = runCeiling(null, open);
+		expect(none.limit).toBeNull();
+		expect(none.why).toBe("No board cap, and b has no project cap");
+		expect(runCeiling(null, []).limit).toBeNull();
 	});
 });
 
@@ -3059,6 +3369,77 @@ describe("GitHostsSection board GitHub token reuse", () => {
 });
 
 describe("NotificationsSection", () => {
+	test("a browser subscription the board lost is registered again, then the event switches load", async () => {
+		const endpoint = "https://push.example/dev-1";
+		const calls: string[] = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+			const u = String(url);
+			calls.push(`${init?.method ?? "GET"} ${u}`);
+			if (u === "/api/push/subscribe") return Response.json({ ok: true });
+			return Response.json({
+				classes: u.includes("endpoint=")
+					? { request: true, error: true, complete: false }
+					: null,
+				mutedProjects: [],
+			});
+		}) as unknown as typeof fetch;
+		// A secure context with a service worker that already holds a subscription.
+		const nav = window.navigator as unknown as Record<string, unknown>;
+		const win = window as unknown as Record<string, unknown>;
+		const sub = {
+			endpoint,
+			toJSON: () => ({ endpoint, keys: { p256dh: "p", auth: "a" } }),
+		};
+		Object.defineProperty(win, "isSecureContext", {
+			value: true,
+			configurable: true,
+		});
+		Object.defineProperty(nav, "serviceWorker", {
+			value: {
+				getRegistration: async () => ({
+					pushManager: { getSubscription: async () => sub },
+				}),
+			},
+			configurable: true,
+		});
+		win.PushManager = function PushManager() {};
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		try {
+			await act(async () => {
+				root.render(
+					<NotificationsSection projects={[]} act={async () => true} />,
+				);
+			});
+			for (let k = 0; k < 5; k++)
+				await act(async () => {
+					await new Promise((r) => setTimeout(r, 0));
+				});
+			const subscribe = calls.indexOf("POST /api/push/subscribe");
+			const prefs = calls.findIndex((c) => c.includes("endpoint="));
+			expect(subscribe).toBeGreaterThanOrEqual(0);
+			expect(prefs).toBeGreaterThan(subscribe);
+			// The event switches render with the device's saved values.
+			const labels = [...container.querySelectorAll("label")].map(
+				(l) => l.textContent,
+			);
+			expect(labels).toEqual(["Request", "Error", "Complete"]);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+			delete win.isSecureContext;
+			delete nav.serviceWorker;
+			delete win.PushManager;
+		}
+	});
+
 	/** Mounts the section with two projects; each POST waits until the test answers it. */
 	async function mountMutes(): Promise<{
 		boxes: () => HTMLInputElement[];
@@ -3248,6 +3629,45 @@ const rolesFetch = (
 			});
 		throw new Error(`unexpected fetch ${url}`);
 	}) as typeof fetch;
+
+describe("ModelRolesSection missing check roles", () => {
+	test("Add critic adds the role and drops only its own button", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			rolesFetch({ default: "zai/glm-5.3-flash" }),
+		);
+		try {
+			await act(async () => {});
+			const buttons = (): string[] =>
+				[...container.querySelectorAll(".role-warn-actions button")].map(
+					(b) => b.textContent ?? "",
+				);
+			expect(buttons()).toEqual(["Add critic", "Add adversary"]);
+			const critic = container.querySelector<HTMLButtonElement>(
+				".role-warn-actions button",
+			);
+			if (critic === null) throw new Error("Add critic did not render");
+			const field =
+				container.querySelector<HTMLInputElement>(".role-add input");
+			if (field === null) throw new Error("role field did not render");
+			await act(async () => onChangeOf(field)({ target: { value: "draft" } }));
+			await act(async () => critic.click());
+			expect(
+				[...container.querySelectorAll(".role-row .role-name")].map(
+					(n) => n.textContent,
+				),
+			).toEqual(["default", "critic"]);
+			expect(buttons()).toEqual(["Add adversary"]);
+			expect(container.querySelector(".role-warn b")?.textContent).toBe(
+				"No adversary role",
+			);
+			// A typed draft survives: the button adds its own name, not the field's.
+			expect(field.value).toBe("draft");
+		} finally {
+			await unmount();
+		}
+	});
+});
 
 describe("ModelRolesSection model picker", () => {
 	test("typing narrows the picker list; picking a model arms Save", async () => {
@@ -4532,7 +4952,9 @@ describe("Error-Says-Fix messages", () => {
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
 		await act(async () => {
-			root.render(<GitHostsSection />);
+			root.render(
+				<GitHostsSection commitIdentity={null} act={async () => true} />,
+			);
 		});
 		try {
 			const urls = [

@@ -68,7 +68,8 @@ import type {
 import { askQuestions, PR_REVIEW_WAITING } from "./types.ts";
 
 export const DEFAULT_SETTINGS: ProjectSettings = {
-	maxParallel: 2,
+	// No per-project cap: the board-wide runner cap is the one limit by default.
+	maxParallel: null,
 	copyExtra: [],
 	displayName: null,
 	iconText: null,

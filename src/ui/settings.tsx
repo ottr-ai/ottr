@@ -51,7 +51,6 @@ import {
 	LiveElapsed,
 	logOut,
 	Mark,
-	Meter,
 	Modal,
 	ProjectTag,
 	post,
@@ -96,6 +95,15 @@ import {
 } from "./route.ts";
 import { refreshState } from "./socket.ts";
 import { age, stamp } from "./time.ts";
+
+/** Projects A to Z by the name the user reads. Settings lists sort this way; only the
+ *  Project order card keeps the board's own order, because it edits that order. */
+const byLabel = (projects: readonly ProjectView[]): ProjectView[] =>
+	[...projects].sort((a, b) =>
+		projectLabel(a).localeCompare(projectLabel(b), undefined, {
+			sensitivity: "base",
+		}),
+	);
 
 /** Save-button body: the brief saved confirmation, else the plain label. */
 function SaveLabel({ saved }: { saved: boolean }) {
@@ -662,35 +670,223 @@ function SaveButton({
 	);
 }
 
+/** A stepper's figure rolls in from the side it moves toward (the 400ms indicator ramp,
+ *  DESIGN.md Motion); typing never rolls, and reduced motion keeps it still. */
+function rollFigure(button: HTMLElement, dir: 1 | -1): void {
+	const figure = button.parentElement?.querySelector("input");
+	if (!figure || window.matchMedia("(prefers-reduced-motion: reduce)").matches)
+		return;
+	figure.animate(
+		[
+			{ transform: `translateY(${dir * 40}%)`, opacity: 0 },
+			{ transform: "none", opacity: 1 },
+		],
+		{ duration: 400, easing: "cubic-bezier(0.2, 0.7, 0.3, 1)" },
+	);
+}
+
+/** How many agent turns can run at once: the board cap, else what the project caps add up
+ *  to; a project without its own cap lifts the project limit. `limit` null means no limit;
+ *  `why` names what sets it. */
+export function runCeiling(
+	maxTotal: number | null,
+	projects: readonly ProjectView[],
+): { limit: number | null; why: string } {
+	const uncapped = projects
+		.filter((p) => p.settings.maxParallel === null)
+		.map((p) => projectLabel(p));
+	const projectLimit =
+		projects.length === 0 || uncapped.length > 0
+			? null
+			: projects.reduce((sum, p) => sum + (p.settings.maxParallel ?? 0), 0);
+	if (maxTotal !== null && (projectLimit === null || maxTotal <= projectLimit))
+		return { limit: maxTotal, why: "The board cap sets it" };
+	if (projectLimit !== null)
+		return { limit: projectLimit, why: "The project caps add up to it" };
+	return {
+		limit: null,
+		why:
+			uncapped.length > 0
+				? `No board cap, and ${uncapped.join(", ")} ${uncapped.length === 1 ? "has" : "have"} no project cap`
+				: "No board cap and no projects",
+	};
+}
+
+/** How long the runner cap waits after the last click or keystroke before it saves. */
+const CAP_SAVE_DELAY_MS = 500;
+
 function TotalRunnersForm({
 	maxTotal,
-	reviewCheck,
-	workCheck,
-	idleReviews,
-	trendingScan,
-	trendingStatus,
-	allocated,
+	projects,
 	act,
 }: {
 	maxTotal: number | null;
-	reviewCheck: boolean;
-	workCheck: boolean;
-	idleReviews: boolean;
-	trendingScan: boolean;
-	trendingStatus: TrendingStatus;
-	allocated: number;
+	projects: ProjectView[];
 	act: Act;
 }) {
 	const [n, setN] = useState(maxTotal === null ? "" : String(maxTotal));
 	const s = useInstantSave(act);
-	const formId = useId();
-	const next =
-		n.trim() === "" ? null : clamp(Math.trunc(Number(n)), 1, Infinity);
+	// "below 1 = no cap": an empty field or a figure under 1 clears the cap.
+	const typed = Math.trunc(Number(n));
+	const next = n.trim() === "" || !(typed >= 1) ? null : typed;
 	// The cap counts as edited only when the input moved off the server value: an
 	// untouched input must not save its clamped form (a server cap below 1, e.g.
-	// OMP_TRACKER_MAX_TOTAL=0, would otherwise jump to 1). An empty input means "no cap".
+	// OMP_TRACKER_MAX_TOTAL=0, would otherwise jump to 1).
 	const capEdited = n !== (maxTotal === null ? "" : String(maxTotal));
 	const dirty = capEdited && next !== maxTotal;
+	// Saves on its own, like a checkbox row: each click or keystroke restarts a short wait, so
+	// a burst of steps sends one save. A save never overlaps a running one, and a value that
+	// was already sent (even one that failed) waits for the next change instead of retrying.
+	const sent = useRef<number | null | undefined>(undefined);
+	// s.run is a new function each render; a board refresh must not restart the wait.
+	const run = useRef(s.run);
+	useEffect(() => {
+		run.current = s.run;
+	});
+	useEffect(() => {
+		if (!dirty || s.busy || next === sent.current) return;
+		const t = setTimeout(() => {
+			sent.current = next;
+			run.current(() => post("/api/settings", { maxTotal: next }));
+		}, CAP_SAVE_DELAY_MS);
+		return () => clearTimeout(t);
+	}, [dirty, next, s.busy]);
+	const ceiling = runCeiling(maxTotal, projects);
+	return (
+		<SettingsCard
+			id="runners-section"
+			title="Runners"
+			status={
+				maxTotal === null
+					? { label: "No cap", tone: "off" }
+					: { label: `Cap ${maxTotal}`, tone: "ok" }
+			}
+			hint={
+				maxTotal === null
+					? "No cap: agents start whenever projects need them."
+					: `At most ${maxTotal} agents run at once across all projects; project caps can set a lower limit.`
+			}
+		>
+			<form className="alate-def-rows" onSubmit={(e) => e.preventDefault()}>
+				<div className="alate-def-row cap-row">
+					<div className="alate-def-name">
+						<b>
+							Runner cap
+							<Help
+								label="Runner cap"
+								text="The most agent turns that run at the same time on this board. Other tasks wait in Todo until a slot is free. Each project can also set its own cap."
+							/>
+							<SaveTick
+								busy={s.busy}
+								saved={s.saved}
+								failed={s.failed}
+								reason={s.reason}
+							/>
+						</b>
+						<code>below 1 = no cap</code>
+					</div>
+					<div className="cap-ctl">
+						<div className="cap-step">
+							<button
+								type="button"
+								aria-label="One runner fewer"
+								disabled={n === ""}
+								onClick={(e) => {
+									setN((v) => (Number(v) <= 1 ? "" : String(Number(v) - 1)));
+									rollFigure(e.currentTarget, -1);
+								}}
+							>
+								<Icon name="minus" size={14} />
+							</button>
+							<input
+								type="number"
+								min={1}
+								value={n}
+								placeholder="–"
+								onChange={(e) => setN(e.target.value)}
+								aria-label="Runner cap across all projects (empty = no cap)"
+							/>
+							<button
+								type="button"
+								aria-label="One runner more"
+								onClick={(e) => {
+									setN((v) => String(v === "" ? 1 : Number(v) + 1));
+									rollFigure(e.currentTarget, 1);
+								}}
+							>
+								<Icon name="plus" size={14} />
+							</button>
+						</div>
+						{n === "" && <span className="cap-unlimited">unlimited</span>}
+					</div>
+				</div>
+				<div className="alate-def-row">
+					<div className="alate-def-name">
+						<b>Runs at once</b>
+						<span>{ceiling.why}</span>
+					</div>
+					<span
+						className={ceiling.limit === null ? "runs-fig none" : "runs-fig"}
+					>
+						{ceiling.limit ?? "No limit"}
+					</span>
+				</div>
+			</form>
+		</SettingsCard>
+	);
+}
+
+/** Board-wide switches that check an agent's work with a second model before it moves on. */
+function ChecksSection({
+	reviewCheck,
+	workCheck,
+	act,
+}: {
+	reviewCheck: boolean;
+	workCheck: boolean;
+	act: Act;
+}) {
+	const send = (body: Record<string, unknown>): Promise<unknown> =>
+		post("/api/settings", body);
+	return (
+		<SettingsCard
+			id="checks-section"
+			title="Checks"
+			status={onChip([reviewCheck, workCheck])}
+		>
+			<div className="alate-def-rows">
+				<CheckRow
+					name="Review check"
+					desc="Check a review's findings with a second model before they become cards"
+					checked={reviewCheck}
+					save={(v) => send({ reviewCheck: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Work check"
+					desc="Check a work card with a second model before it enters the merge queue"
+					checked={workCheck}
+					save={(v) => send({ workCheck: v })}
+					act={act}
+				/>
+			</div>
+		</SettingsCard>
+	);
+}
+
+/** Board-wide jobs that start on their own: idle architecture reviews and the weekly
+ *  trending scan (whose button runs a scan now, whether or not the schedule is on). */
+function AutomationSection({
+	idleReviews,
+	trendingScan,
+	trendingStatus,
+	act,
+}: {
+	idleReviews: boolean;
+	trendingScan: boolean;
+	trendingStatus: TrendingStatus;
+	act: Act;
+}) {
 	const send = (body: Record<string, unknown>): Promise<unknown> =>
 		post("/api/settings", body);
 	// Scan trending now: the reply lands inline, the server's error text as is.
@@ -713,71 +909,17 @@ function TotalRunnersForm({
 	};
 	const lastScan =
 		trendingStatus.lastError !== null
-			? `Last trending scan failed: ${trendingStatus.lastError.reason} (${stamp(trendingStatus.lastError.at)})`
+			? `Failed: ${trendingStatus.lastError.reason} (${stamp(trendingStatus.lastError.at)})`
 			: trendingStatus.lastRunAt !== null
-				? `Last scan: ${stamp(trendingStatus.lastRunAt)}`
-				: "No scan yet";
+				? stamp(trendingStatus.lastRunAt)
+				: "Never";
 	return (
 		<SettingsCard
-			id="runners-section"
-			title="Runners"
-			status={
-				maxTotal === null
-					? { label: "No cap", tone: "off" }
-					: { label: `Cap ${maxTotal}`, tone: "ok" }
-			}
-			hint={
-				maxTotal === null
-					? "No cap: agents start whenever projects need them."
-					: `At most ${maxTotal} agents run at once across all projects; configured slots beyond the cap wait.`
-			}
+			id="automation-section"
+			title="Automation"
+			status={onChip([idleReviews, trendingScan])}
 		>
-			<form
-				id={formId}
-				className="alate-def-rows"
-				onSubmit={(e) => {
-					e.preventDefault();
-					if (dirty) s.run(() => send({ maxTotal: next }));
-				}}
-			>
-				<div className="alate-def-row">
-					<div className="alate-def-name">
-						<b>
-							Runner cap
-							<Help
-								label="Runner cap"
-								text="The most agent turns that run at the same time on this board. Other tasks wait in Todo until a slot is free. Each project can also set its own cap."
-							/>
-						</b>
-						<code>empty = no cap</code>
-					</div>
-					<div className="alate-def-actions">
-						<label>
-							<input
-								type="number"
-								min={1}
-								value={n}
-								onChange={(e) => setN(e.target.value)}
-								aria-label="Runner cap across all projects (empty = no cap)"
-							/>
-						</label>
-						<SaveButton form={formId} s={s} dirty={dirty} />
-					</div>
-				</div>
-				<CheckRow
-					name="Review check"
-					desc="Check a review's findings with a second model before they become cards"
-					checked={reviewCheck}
-					save={(v) => send({ reviewCheck: v })}
-					act={act}
-				/>
-				<CheckRow
-					name="Work check"
-					desc="Check a work card with a second model before it enters the merge queue"
-					checked={workCheck}
-					save={(v) => send({ workCheck: v })}
-					act={act}
-				/>
+			<div className="alate-def-rows">
 				<CheckRow
 					name="Run due reviews while idle"
 					desc="After two hours without input, and while no turn runs, the board files the architecture review card of the first project whose review is due, by itself"
@@ -785,57 +927,55 @@ function TotalRunnersForm({
 					save={(v) => send({ idleReviews: v })}
 					act={act}
 				/>
+				{/* The checkbox is the weekly schedule only; Scan trending now runs a scan
+				    whether or not it is checked. */}
 				<CheckRow
 					name="Weekly trending scan"
-					desc="Every Monday at 06:00 (server time), scan GitHub trending and file up to 3 backlog proposals per project with Trending scout on"
+					desc={
+						<>
+							Mondays at 06:00 (server time): up to 3 backlog proposals per
+							project with Trending scout on.{" "}
+							{trendingStatus.running
+								? "A scan is running."
+								: `Last scan: ${lastScan}.`}{" "}
+							<span role="status">
+								{scanResult?.ok === true ? "Scan started." : ""}
+							</span>
+						</>
+					}
 					checked={trendingScan}
 					save={(v) => send({ trendingScan: v })}
 					act={act}
-				/>
-				<div className="alate-def-row">
-					<div className="alate-def-name">
-						<b>Trending scan</b>
-						<span>{lastScan}</span>
-						{trendingStatus.running && <span>A scan is running.</span>}
-						<span role="status">
-							{scanResult?.ok === true ? "Scan started" : ""}
-						</span>
-					</div>
-					<div className="alate-def-actions">
+					action={
 						<BusyButton run={scanNow} disabled={trendingStatus.running}>
 							Scan trending now
 						</BusyButton>
-					</div>
-				</div>
-			</form>
+					}
+				/>
+			</div>
 			{scanResult?.ok === false && (
 				<p className="auth-error" role="alert">
 					{scanResult.error}
 				</p>
 			)}
-			{/* ponytail: configured slots is informational, so the meter stays grey even when over cap — the cap binds, it is not an alarm */}
-			<Meter
-				label="Configured"
-				pct={
-					maxTotal === null || maxTotal === 0
-						? null
-						: Math.min(100, (allocated / maxTotal) * 100)
-				}
-				value={`${maxTotal === null ? "no cap" : `cap ${maxTotal}`} · ${allocated} configured`}
-				band={false}
-			/>
 		</SettingsCard>
 	);
 }
 
-/** OTTR-693: the name and email git commits with when the project or the home's own git
- *  config names none. Empty fields keep the built-in Ottr and ottr@localhost; a configured
- *  ~/.gitconfig identity wins over the default. */
-function CommitIdentitySection({
+/** The Git identity card: who the board is to git hosts (the global SSH key block, passed in
+ *  by the git hosts state) and on commits. OTTR-693: the name and email git commits with when
+ *  the project or the home's own git config names none. Empty fields keep the built-in Ottr
+ *  and ottr@localhost; a configured ~/.gitconfig identity wins over the default. */
+function GitIdentitySection({
 	commitIdentity,
+	sshKey,
+	keySet,
 	act,
 }: {
 	commitIdentity: CommitIdentity | null;
+	sshKey: ReactNode;
+	/** The global SSH key exists; null while the git hosts state loads. */
+	keySet: boolean | null;
 	act: Act;
 }) {
 	const [name, setName] = useState(commitIdentity?.name ?? "");
@@ -850,76 +990,87 @@ function CommitIdentitySection({
 	return (
 		<SettingsCard
 			id="commit-identity-section"
-			title="Commit identity"
-			status={
-				commitIdentity === null
-					? { label: "Default", tone: "off" }
-					: { label: commitIdentity.name, tone: "ok" }
-			}
-			hint="The name and email git commits with when the project or the home's own git config names none. Empty keeps the built-in Ottr and ottr@localhost; a configured ~/.gitconfig identity wins over the default."
+			title="Git identity"
+			status={{
+				label: [
+					...(keySet === null ? [] : [keySet ? "SSH key" : "No SSH key"]),
+					commitIdentity === null ? "Default author" : commitIdentity.name,
+				].join(" · "),
+				tone: keySet === true || commitIdentity !== null ? "ok" : "off",
+			}}
 		>
-			<form
-				id={formId}
-				className="alate-def-rows"
-				onSubmit={(e) => {
-					e.preventDefault();
-					if (!dirty) return;
-					const n = name.trim();
-					const m = email.trim();
-					s.run(() =>
-						post("/api/settings", {
-							commitName: n === "" ? null : n,
-							commitEmail: m === "" ? null : m,
-						}),
-					);
-				}}
-			>
-				<div className="alate-def-row">
-					<div className="alate-def-name">
-						<b>
-							Commit name
-							<Help
-								label="Commit name"
-								text="Labels every commit a turn or the board makes when no other git config names an author."
-							/>
-						</b>
-						<code>empty = Ottr</code>
+			{sshKey}
+			<div className="sec-block" id="commit-identity-block" tabIndex={-1}>
+				<h4>Commit identity</h4>
+				<p className="hint">
+					The name and email git commits with when the project or the home's own
+					git config names none. Empty keeps the built-in Ottr and
+					ottr@localhost; a configured ~/.gitconfig identity wins over the
+					default.
+				</p>
+				<form
+					id={formId}
+					className="alate-def-rows"
+					onSubmit={(e) => {
+						e.preventDefault();
+						if (!dirty) return;
+						const n = name.trim();
+						const m = email.trim();
+						s.run(() =>
+							post("/api/settings", {
+								commitName: n === "" ? null : n,
+								commitEmail: m === "" ? null : m,
+							}),
+						);
+					}}
+				>
+					<div className="alate-def-row">
+						<div className="alate-def-name">
+							<b>
+								Commit name
+								<Help
+									label="Commit name"
+									text="Labels every commit a turn or the board makes when no other git config names an author."
+								/>
+							</b>
+							<code>empty = Ottr</code>
+						</div>
+						<div className="alate-def-actions">
+							<label>
+								<input
+									type="text"
+									value={name}
+									onChange={(e) => setName(e.target.value)}
+									aria-label="Commit name (empty = Ottr)"
+								/>
+							</label>
+						</div>
 					</div>
-					<div className="alate-def-actions">
-						<label>
-							<input
-								type="text"
-								value={name}
-								onChange={(e) => setName(e.target.value)}
-								aria-label="Commit name (empty = Ottr)"
-							/>
-						</label>
+					<div className="alate-def-row">
+						<div className="alate-def-name">
+							<b>
+								Commit email
+								<Help
+									label="Commit email"
+									text="The address on every commit a turn or the board makes when no other git config names one."
+								/>
+							</b>
+							<code>empty = ottr@localhost</code>
+						</div>
+						<div className="alate-def-actions">
+							<label>
+								<input
+									type="text"
+									value={email}
+									onChange={(e) => setEmail(e.target.value)}
+									aria-label="Commit email (empty = ottr@localhost)"
+								/>
+							</label>
+							<SaveButton form={formId} s={s} dirty={dirty} />
+						</div>
 					</div>
-				</div>
-				<div className="alate-def-row">
-					<div className="alate-def-name">
-						<b>
-							Commit email
-							<Help
-								label="Commit email"
-								text="The address on every commit a turn or the board makes when no other git config names one."
-							/>
-						</b>
-						<code>empty = ottr@localhost</code>
-					</div>
-					<div className="alate-def-actions">
-						<label>
-							<input
-								type="text"
-								value={email}
-								onChange={(e) => setEmail(e.target.value)}
-								aria-label="Commit email (empty = ottr@localhost)"
-							/>
-						</label>
-						<SaveButton form={formId} s={s} dirty={dirty} />
-					</div>
-				</div>
-			</form>
+				</form>
+			</div>
 		</SettingsCard>
 	);
 }
@@ -944,6 +1095,8 @@ export function NotificationsSection({
 	projects: ProjectView[];
 	act: Act;
 }) {
+	// Ties each titled part (a fieldset) to its title for screen readers.
+	const uid = useId();
 	// Web Push needs a secure context, a service worker and PushManager; without them the
 	// section explains why and disables every control (the in-app bell still works).
 	// typeof guard: settings render server-side in tests, where window is absent.
@@ -962,16 +1115,22 @@ export function NotificationsSection({
 	const [error, setError] = useState<string | null>(null);
 	const busy = useBusy();
 	// Real state, not last-click: the flag reflects whether this device holds a subscription.
+	// The browser's subscription is registered again before the prefs load: a board that lost
+	// it (a new data folder, a restored backup) would answer "unknown endpoint" and hide the
+	// event switches. A re-subscribe keeps the device's saved switches on the server.
 	useEffect(() => {
 		if (!supported) return;
 		void navigator.serviceWorker
 			.getRegistration()
 			.then((reg) => reg?.pushManager.getSubscription())
-			.then((sub) => {
+			.then(async (sub) => {
+				if (sub != null) await post("/api/push/subscribe", sub.toJSON());
 				setEnabled(sub != null);
 				setEndpoint(sub?.endpoint ?? null);
 			})
-			.catch(() => {});
+			.catch((err) => {
+				setError(err instanceof Error ? err.message : String(err));
+			});
 	}, [supported]);
 	// Prefs follow the endpoint: without one only the shared mutes load.
 	useEffect(() => {
@@ -1152,7 +1311,6 @@ export function NotificationsSection({
 					) : (
 						<button
 							type="button"
-							className="primary"
 							onClick={run("on", enable)}
 							disabled={!supported || busy.busy}
 						>
@@ -1170,8 +1328,11 @@ export function NotificationsSection({
 				</p>
 			)}
 			{enabled && classes !== null && (
-				<fieldset className="notify-group">
-					<legend>This device</legend>
+				<fieldset
+					className="notify-group sec-block"
+					aria-labelledby={`${uid}-events`}
+				>
+					<h4 id={`${uid}-events`}>This device</h4>
 					{CLASS_ROWS.map((r) => (
 						<CheckRow
 							key={r.cls}
@@ -1186,9 +1347,12 @@ export function NotificationsSection({
 				</fieldset>
 			)}
 			{projects.length > 0 && (
-				<fieldset className="notify-group">
-					<legend>Muted projects</legend>
-					{projects.map((p) => (
+				<fieldset
+					className="notify-group sec-block"
+					aria-labelledby={`${uid}-muted`}
+				>
+					<h4 id={`${uid}-muted`}>Muted projects</h4>
+					{byLabel(projects).map((p) => (
 						<CheckRow
 							key={p.name}
 							name={`Mute ${projectLabel(p)}`}
@@ -2363,16 +2527,50 @@ function gitHostsChip(
 ): { label: string; tone: ChipTone } | undefined {
 	if (s === null) return undefined;
 	const n = s.tokens.filter((t) => t.tokenSet).length;
-	const parts = [
-		...(n > 0 ? [`${n} token${n === 1 ? "" : "s"}`] : []),
-		...(s.globalKey !== null ? ["SSH key"] : []),
-	];
-	return parts.length === 0
+	return n === 0
 		? { label: "None", tone: "off" }
-		: { label: parts.join(" · "), tone: "ok" };
+		: { label: `${n} token${n === 1 ? "" : "s"}`, tone: "ok" };
+}
+
+/** The GitHub card's chip: the board token, then the App when one is set. */
+function githubChip(
+	s: GitHostsView | null,
+): { label: string; tone: ChipTone } | undefined {
+	if (s === null) return undefined;
+	return {
+		label: [
+			s.githubTokenSet ? "Token set" : "No token",
+			...(s.githubApp !== null ? ["App"] : []),
+		].join(" · "),
+		tone: s.githubTokenSet ? "ok" : "off",
+	};
 }
 
 /** The "GitHub App" block: the saved app's card, or the id and key form while it is open. */
+/** The App block's chip: not set, still checking, the check failed, repos it does not
+ *  reach, or working (the name lookup passed and every board repo has an install). */
+export function appChip(app: GitHubAppView | null): {
+	label: string;
+	tone: ChipTone;
+} {
+	if (app === null) return { label: "Not set", tone: "off" };
+	const c = app.check;
+	if (c === null) return { label: "Checking", tone: "off" };
+	if (c.error !== null) return { label: "Check failed", tone: "warn" };
+	const gaps = c.missing.length + c.failed.length;
+	if (gaps > 0)
+		return {
+			label: `Not on ${gaps} repo${gaps === 1 ? "" : "s"}`,
+			tone: "warn",
+		};
+	return { label: "Working", tone: "ok" };
+}
+
+/** A state chip outside a card head (a block title), same look as the card's. */
+function StateChip({ label, tone }: { label: string; tone: ChipTone }) {
+	return <span className={`state-chip ${tone}`}>{label}</span>;
+}
+
 function GitHubAppBlock({
 	state,
 	formOpen,
@@ -2384,6 +2582,7 @@ function GitHubAppBlock({
 	busy,
 	onSave,
 	onRemove,
+	heading,
 }: {
 	state: GitHostsView | null;
 	formOpen: boolean;
@@ -2395,10 +2594,17 @@ function GitHubAppBlock({
 	busy: BusyState;
 	onSave: () => void;
 	onRemove: () => Promise<boolean>;
+	/** The block title; null hides it where the card title or the row name already says it. */
+	heading?: string | null;
 }) {
 	return (
 		<div className="sec-block" id="github-app-block" tabIndex={-1}>
-			<h4>GitHub App</h4>
+			{heading !== null && (
+				<h4 className="block-head">
+					{heading ?? "GitHub App"}
+					{state !== null && <StateChip {...appChip(state.githubApp)} />}
+				</h4>
+			)}
 			<p className="hint">
 				Optional. When it is set, posted PR reviews show as the app (a bot
 				account) instead of your own GitHub account.
@@ -2486,23 +2692,36 @@ function GitHubAppBlock({
 	);
 }
 
-/** The "GitHub host" block: the field that saves the hostname, plus the invalid-env hint. */
-function GitHubHostBlock({
+/** The GitHub card's "Connection" block: where GitHub lives and the board token, saved
+ *  together by one Save (a host change, a pasted token, or both). */
+function GitHubConnectionBlock({
 	state,
 	draft,
 	setDraft,
+	token,
+	setToken,
+	tokenCfg,
 	busy,
+	saved,
+	dirty,
 	onSave,
 }: {
 	state: GitHostsView | null;
 	draft: string | null;
 	setDraft: (v: string) => void;
+	token: string;
+	setToken: (v: string) => void;
+	/** The board token check; null while it loads or after it failed (never claim "Not set"). */
+	tokenCfg: { tokenSet: boolean; expiresAt: string | null } | null;
 	busy: BusyState;
+	saved: boolean;
+	dirty: boolean;
 	onSave: () => void;
 }) {
+	const expiry = tokenCfg === null ? null : expiryLine(tokenCfg.expiresAt);
 	return (
 		<div className="sec-block" id="github-host-block" tabIndex={-1}>
-			<h4>GitHub host</h4>
+			<h4>Connection</h4>
 			<form
 				className="settings-form"
 				onSubmit={(e) => {
@@ -2512,19 +2731,9 @@ function GitHubHostBlock({
 			>
 				<div className="alate-def-rows">
 					<DefRow
-						name="GitHub host"
+						name="Host"
 						help="Where GitHub lives for this board: github.com, a *.ghe.com Enterprise Cloud host, or an Enterprise Server host. It steers the API calls, gh, PR links, releases and fork research. A saved value wins over the OTTR_GITHUB_HOST env. Empty resets to the env value or github.com."
 						shape="bare hostname"
-						action={
-							<button
-								type="submit"
-								disabled={busy.busy}
-								className={`primary${busy.failed ? " failed" : ""}`}
-							>
-								{busy.busy && <span className="spinner" aria-hidden="true" />}
-								Save
-							</button>
-						}
 					>
 						<label>
 							<input
@@ -2536,6 +2745,41 @@ function GitHubHostBlock({
 							/>
 						</label>
 					</DefRow>
+					<div id="github-token-block" tabIndex={-1}>
+						<DefRow
+							name="Token"
+							help="The board uses this token for its own git fetches, pushes and GitHub releases. Agents on workers never get it."
+							shape={`secret · stored, never shown${expiry === null ? "" : ` · ${expiry}`}`}
+						>
+							<label>
+								<input
+									type="password"
+									value={token}
+									onChange={(e) => setToken(e.target.value)}
+									placeholder={
+										tokenCfg === null
+											? "Unknown: the check failed"
+											: tokenCfg.tokenSet
+												? "Set · paste a new token to replace it"
+												: "Not set: fetch and push fail"
+									}
+									autoComplete="off"
+									spellCheck={false}
+									aria-label="GitHub token"
+								/>
+							</label>
+						</DefRow>
+					</div>
+				</div>
+				<div className="alate-def-actions">
+					<button
+						type="submit"
+						disabled={busy.busy || !dirty}
+						className={busy.failed ? "failed" : undefined}
+					>
+						{busy.busy && <span className="spinner" aria-hidden="true" />}
+						<SaveLabel saved={saved} />
+					</button>
 				</div>
 			</form>
 			{state !== null && state.githubHost === null && (
@@ -2559,6 +2803,7 @@ function GlobalKeyBlock({
 	gTest,
 	gSave,
 	onRemove,
+	heading,
 }: {
 	state: GitHostsView | null;
 	pending: PendingKeyInfo | null;
@@ -2568,10 +2813,12 @@ function GlobalKeyBlock({
 	gTest: { button: ReactNode; result: ReactNode };
 	gSave: { button: ReactNode; result: ReactNode };
 	onRemove: () => Promise<boolean>;
+	/** The block title; null hides it where the card title or the row name already says it. */
+	heading?: string | null;
 }) {
 	return (
 		<div className="sec-block" id="ssh-key-block" tabIndex={-1}>
-			<h4>Global SSH key</h4>
+			{heading !== null && <h4>{heading ?? "Global SSH key"}</h4>}
 			<p className="hint">
 				The server-side SSH key for clones, fetches and pushes over SSH. Each
 				project without its own key uses this key.
@@ -2648,7 +2895,15 @@ function GlobalKeyBlock({
 
 /** Settings "Git hosts" section: per-host HTTPS tokens and the server-side global SSH key.
  *  Token values are write-only: the server never returns them and the UI never shows one. */
-export function GitHostsSection() {
+/** The board's git credentials as three cards: GitHub (host, token, App), the HTTPS tokens of
+ *  other git hosts, and the Git identity card (global SSH key and commit identity). */
+export function GitHostsSection({
+	commitIdentity,
+	act,
+}: {
+	commitIdentity: CommitIdentity | null;
+	act: Act;
+}) {
 	const [state, setState] = useState<GitHostsView | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	// Add-token form; `replace` pre-fills it from a listed token.
@@ -2886,271 +3141,327 @@ export function GitHostsSection() {
 			await load();
 			return true;
 		});
-	// Guarded save for the GitHub host; an empty field clears the saved value.
-	const saveHost = (): void => {
+	// The Connection block: a typed GitHub token (never shown back) and its check.
+	const [ghToken, setGhToken] = useState("");
+	const [ghTokenCfg, setGhTokenCfg] = useState<{
+		tokenSet: boolean;
+		expiresAt: string | null;
+	} | null>(null);
+	const [ghSaved, flashGhSaved] = useFlash(1500);
+	useEffect(() => {
+		let live = true;
+		fetch("/api/settings/github-token")
+			.then((res) =>
+				unwrap<{ tokenSet: boolean; expiresAt: string | null }>(res),
+			)
+			.then((cfg) => {
+				if (live) setGhTokenCfg(cfg);
+			})
+			.catch((err) => {
+				if (live) setError(err instanceof Error ? err.message : String(err));
+			});
+		return () => {
+			live = false;
+		};
+	}, []);
+	const ghDirty = ghHostDraft !== null || ghToken.trim() !== "";
+	// One Save for the Connection block: the host when edited (an empty field clears the saved
+	// value), then the token when one is pasted. A failed host save stops before the token.
+	const saveConnection = (): void => {
 		ghBusy.start(() =>
 			run(async () => {
-				const { status, data } = await gitReq(
-					"POST",
-					"/api/settings/github-host",
-					{ host: (ghHostDraft ?? state?.githubHost ?? "").trim() },
-				);
-				if (status !== 200)
-					throw new Error(asError(data, status, "saving the GitHub host"));
-				setGhHostDraft(null);
+				if (ghHostDraft !== null) {
+					const { status, data } = await gitReq(
+						"POST",
+						"/api/settings/github-host",
+						{ host: ghHostDraft.trim() },
+					);
+					if (status !== 200)
+						throw new Error(asError(data, status, "saving the GitHub host"));
+					setGhHostDraft(null);
+				}
+				if (ghToken.trim() !== "") {
+					const cfg = await post<{
+						tokenSet: boolean;
+						expiresAt: string | null;
+					}>("/api/settings/github-token", { token: ghToken.trim() });
+					setGhTokenCfg(cfg);
+					setGhToken("");
+				}
 				await load();
+				flashGhSaved();
 				return true;
 			}),
 		);
 	};
-	return (
-		<SettingsCard
-			id="git-hosts-section"
-			title="Git hosts"
-			status={gitHostsChip(state)}
-			hint="The GitHub token serves the board's own git and releases. Other HTTPS tokens and the server-side SSH key serve clones, fetches and pushes on any git host. Agents on workers never receive them."
-		>
-			<GitHubHostBlock
-				state={state}
-				draft={ghHostDraft}
-				setDraft={setGhHostDraft}
-				busy={ghBusy}
-				onSave={saveHost}
-			/>
-			<div className="sec-block" id="github-token-block" tabIndex={-1}>
-				<h4>GitHub token</h4>
-				<SecretTokenForm<{ tokenSet: boolean; expiresAt: string | null }>
-					endpoint="/api/settings/github-token"
-					title="GitHub token"
-					help="The board uses this token for its own git fetches, pushes and GitHub releases. Agents on workers never get it."
-					label="GitHub token"
-					captionSet="Set · paste a new token to replace it"
-					captionUnset="Not set: fetch and push fail"
-					captionUnknown="Unknown: the check failed"
-					expiry={(cfg) => expiryLine(cfg.expiresAt)}
-				/>
-			</div>
-			<GitHubAppBlock
-				state={state}
-				formOpen={appFormOpen}
-				setFormOpen={setAppFormOpen}
-				appId={appId}
-				setAppId={setAppId}
-				appKey={appKey}
-				setAppKey={setAppKey}
-				busy={appBusy}
-				onSave={saveApp}
-				onRemove={removeApp}
-			/>
-			<div className="sec-block" id="host-tokens-block" tabIndex={-1}>
-				<h4>Other host tokens</h4>
-				<p className="hint">
-					HTTPS tokens for git hosts, one for each host. Ottr tests each token
-					with git ls-remote before it saves the token.
-				</p>
-				{boardTokenOffer && state !== null && (
-					<div className="board-token-offer">
-						<p className="hint">
-							The board GitHub token serves the API and gh. Git on{" "}
-							<code>{state.githubHost}</code> needs its own entry here. Without
-							one, a first clone fails with a login prompt. Applying stores the
-							same token for git on <code>{state.githubHost}</code>. The token's
-							scopes must also grant repository read there. Ottr tests that with
-							git ls-remote before it saves.
-						</p>
-						<form
-							className="settings-form"
-							onSubmit={(e) => {
-								e.preventDefault();
-								applyOfferBoardToken();
-							}}
-						>
-							<div className="alate-def-rows">
-								<DefRow
-									name="Test URL"
-									help="A repository on the host that the token can read. Ottr runs git ls-remote against it before it saves."
-									shape="https URL"
-								>
-									<label>
-										<input
-											value={offerUrl}
-											onChange={(e) => setOfferUrl(e.target.value)}
-											placeholder={`https://${state.githubHost}/org/repo.git`}
-											inputMode="url"
-											spellCheck={false}
-											autoComplete="off"
-											required
-											aria-label="Test URL for the board token"
-										/>
-									</label>
-								</DefRow>
-							</div>
-							<div className="alate-def-actions">
-								<button
-									type="submit"
-									disabled={offerBusy.busy}
-									className={`primary${offerBusy.failed ? " failed" : ""}`}
-								>
-									{offerBusy.busy && (
-										<span className="spinner" aria-hidden="true" />
-									)}
-									Store the board token for this host
-								</button>
-							</div>
-						</form>
-					</div>
-				)}
-				{state !== null && state.tokens.length > 0 && (
-					<table>
-						<tbody>
-							{state.tokens.map((t) => (
-								<tr key={t.host}>
-									<td>
-										<code>{t.host}</code>
-									</td>
-									<td>{t.username}</td>
-									<td>
-										<button
-											type="button"
-											onClick={() => {
-												setTHost(t.host);
-												setTUser(t.username);
-												setTUserEdited(true);
-											}}
-										>
-											Replace token
-										</button>{" "}
-										<BusyButton
-											className="danger"
-											run={() => removeToken(t.host)}
-										>
-											Remove
-										</BusyButton>
-									</td>
-								</tr>
-							))}
-						</tbody>
-					</table>
-				)}
-				<form
-					className="settings-form"
-					onSubmit={(e) => {
-						e.preventDefault();
-						saveToken();
-					}}
-				>
-					<div className="alate-def-rows">
-						<DefRow
-							name="Host"
-							help="The git host this token is for. Ottr keeps one token for each host."
-							shape="hostname"
-						>
-							<label>
-								<input
-									value={tHost}
-									onChange={(e) => {
-										const v = e.target.value;
-										setTHost(v);
-										if (!tUserEdited)
-											setTUser(
-												defaultGitUsername(v.trim(), state?.githubHost ?? null),
-											);
-									}}
-									placeholder="gitlab.com"
-									required
-									aria-label="Host"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
-							name="Username"
-							optional
-							help="The username that git sends with the token. GitHub hosts use x-access-token; most other hosts accept oauth2."
-						>
-							<label>
-								<input
-									value={tUser}
-									onChange={(e) => {
-										setTUser(e.target.value);
-										setTUserEdited(true);
-									}}
-									placeholder={defaultGitUsername(
-										tHost.trim(),
-										state?.githubHost ?? null,
-									)}
-									aria-label="Username"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
-							name="Token"
-							help="An HTTPS access token for the host. Ottr stores it and never shows it again."
-							shape="secret · stored, never shown"
-						>
-							<label>
-								<input
-									type="password"
-									value={tToken}
-									onChange={(e) => setTToken(e.target.value)}
-									autoComplete="off"
-									spellCheck={false}
-									required
-									aria-label="Token"
-								/>
-							</label>
-						</DefRow>
-						<DefRow
-							name="Test URL"
-							help="A repository that the token can read. Ottr runs git ls-remote against it before it saves the token."
-							shape="https URL"
-						>
-							<label>
-								<input
-									value={tUrl}
-									onChange={(e) => setTUrl(e.target.value)}
-									placeholder="https://gitlab.com/group/repo.git"
-									inputMode="url"
-									spellCheck={false}
-									autoComplete="off"
-									required
-									aria-label="Test URL (a repository the token can read)"
-								/>
-							</label>
-						</DefRow>
-					</div>
-					<div className="alate-def-actions">
-						<button
-							type="submit"
-							disabled={tBusy.busy}
-							className={tBusy.failed ? "failed" : ""}
-						>
-							{tBusy.busy && <span className="spinner" aria-hidden="true" />}
-							Save token
-						</button>{" "}
-						{boardTokenUsable && (
-							<button type="button" onClick={useBoardToken}>
-								Use the board GitHub token
+	// The cards' blocks; a heading null drops a title the card or the row name already says.
+	const connectionB = (
+		<GitHubConnectionBlock
+			state={state}
+			draft={ghHostDraft}
+			setDraft={setGhHostDraft}
+			token={ghToken}
+			setToken={setGhToken}
+			tokenCfg={ghTokenCfg}
+			busy={ghBusy}
+			saved={ghSaved}
+			dirty={ghDirty}
+			onSave={saveConnection}
+		/>
+	);
+	const appB = (h?: string | null) => (
+		<GitHubAppBlock
+			heading={h}
+			state={state}
+			formOpen={appFormOpen}
+			setFormOpen={setAppFormOpen}
+			appId={appId}
+			setAppId={setAppId}
+			appKey={appKey}
+			setAppKey={setAppKey}
+			busy={appBusy}
+			onSave={saveApp}
+			onRemove={removeApp}
+		/>
+	);
+	const othersB = (h?: string | null) => (
+		<div className="sec-block" id="host-tokens-block" tabIndex={-1}>
+			{h !== null && <h4>{h ?? "Other host tokens"}</h4>}
+			<p className="hint">
+				HTTPS tokens for git hosts, one for each host. Ottr tests each token
+				with git ls-remote before it saves the token.
+			</p>
+			{boardTokenOffer && state !== null && (
+				<div className="board-token-offer">
+					<p className="hint">
+						The board GitHub token serves the API and gh. Git on{" "}
+						<code>{state.githubHost}</code> needs its own entry here. Without
+						one, a first clone fails with a login prompt. Applying stores the
+						same token for git on <code>{state.githubHost}</code>. The token's
+						scopes must also grant repository read there. Ottr tests that with
+						git ls-remote before it saves.
+					</p>
+					<form
+						className="settings-form"
+						onSubmit={(e) => {
+							e.preventDefault();
+							applyOfferBoardToken();
+						}}
+					>
+						<div className="alate-def-rows">
+							<DefRow
+								name="Test URL"
+								help="A repository on the host that the token can read. Ottr runs git ls-remote against it before it saves."
+								shape="https URL"
+							>
+								<label>
+									<input
+										value={offerUrl}
+										onChange={(e) => setOfferUrl(e.target.value)}
+										placeholder={`https://${state.githubHost}/org/repo.git`}
+										inputMode="url"
+										spellCheck={false}
+										autoComplete="off"
+										required
+										aria-label="Test URL for the board token"
+									/>
+								</label>
+							</DefRow>
+						</div>
+						<div className="alate-def-actions">
+							<button
+								type="submit"
+								disabled={offerBusy.busy}
+								className={`primary${offerBusy.failed ? " failed" : ""}`}
+							>
+								{offerBusy.busy && (
+									<span className="spinner" aria-hidden="true" />
+								)}
+								Store the board token for this host
 							</button>
-						)}
-					</div>
-				</form>
-			</div>
-			<GlobalKeyBlock
-				state={state}
-				pending={pending}
-				setPending={setPending}
-				gUrl={gUrl}
-				setGUrl={setGUrl}
-				gTest={gTest}
-				gSave={gSave}
-				onRemove={removeGlobal}
-			/>
-			{error !== null && (
-				<p className="auth-error" role="alert">
-					{error}
-				</p>
+						</div>
+					</form>
+				</div>
 			)}
-		</SettingsCard>
+			{state !== null && state.tokens.length > 0 && (
+				<table>
+					<tbody>
+						{state.tokens.map((t) => (
+							<tr key={t.host}>
+								<td>
+									<code>{t.host}</code>
+								</td>
+								<td>{t.username}</td>
+								<td>
+									<button
+										type="button"
+										onClick={() => {
+											setTHost(t.host);
+											setTUser(t.username);
+											setTUserEdited(true);
+										}}
+									>
+										Replace token
+									</button>{" "}
+									<BusyButton
+										className="danger"
+										run={() => removeToken(t.host)}
+									>
+										Remove
+									</BusyButton>
+								</td>
+							</tr>
+						))}
+					</tbody>
+				</table>
+			)}
+			<form
+				className="settings-form"
+				onSubmit={(e) => {
+					e.preventDefault();
+					saveToken();
+				}}
+			>
+				<div className="alate-def-rows">
+					<DefRow
+						name="Host"
+						help="The git host this token is for. Ottr keeps one token for each host."
+						shape="hostname"
+					>
+						<label>
+							<input
+								value={tHost}
+								onChange={(e) => {
+									const v = e.target.value;
+									setTHost(v);
+									if (!tUserEdited)
+										setTUser(
+											defaultGitUsername(v.trim(), state?.githubHost ?? null),
+										);
+								}}
+								placeholder="gitlab.com"
+								required
+								aria-label="Host"
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Username"
+						optional
+						help="The username that git sends with the token. GitHub hosts use x-access-token; most other hosts accept oauth2."
+					>
+						<label>
+							<input
+								value={tUser}
+								onChange={(e) => {
+									setTUser(e.target.value);
+									setTUserEdited(true);
+								}}
+								placeholder={defaultGitUsername(
+									tHost.trim(),
+									state?.githubHost ?? null,
+								)}
+								aria-label="Username"
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Token"
+						help="An HTTPS access token for the host. Ottr stores it and never shows it again."
+						shape="secret · stored, never shown"
+					>
+						<label>
+							<input
+								type="password"
+								value={tToken}
+								onChange={(e) => setTToken(e.target.value)}
+								autoComplete="off"
+								spellCheck={false}
+								required
+								aria-label="Token"
+							/>
+						</label>
+					</DefRow>
+					<DefRow
+						name="Test URL"
+						help="A repository that the token can read. Ottr runs git ls-remote against it before it saves the token."
+						shape="https URL"
+					>
+						<label>
+							<input
+								value={tUrl}
+								onChange={(e) => setTUrl(e.target.value)}
+								placeholder="https://gitlab.com/group/repo.git"
+								inputMode="url"
+								spellCheck={false}
+								autoComplete="off"
+								required
+								aria-label="Test URL (a repository the token can read)"
+							/>
+						</label>
+					</DefRow>
+				</div>
+				<div className="alate-def-actions">
+					<button
+						type="submit"
+						disabled={tBusy.busy}
+						className={tBusy.failed ? "failed" : ""}
+					>
+						{tBusy.busy && <span className="spinner" aria-hidden="true" />}
+						Save token
+					</button>{" "}
+					{boardTokenUsable && (
+						<button type="button" onClick={useBoardToken}>
+							Use the board GitHub token
+						</button>
+					)}
+				</div>
+			</form>
+		</div>
+	);
+	const sshB = (h?: string | null) => (
+		<GlobalKeyBlock
+			heading={h}
+			state={state}
+			pending={pending}
+			setPending={setPending}
+			gUrl={gUrl}
+			setGUrl={setGUrl}
+			gTest={gTest}
+			gSave={gSave}
+			onRemove={removeGlobal}
+		/>
+	);
+	const errorEl = error !== null && (
+		<p className="auth-error" role="alert">
+			{error}
+		</p>
+	);
+	return (
+		<>
+			<SettingsCard
+				id="git-hosts-section"
+				title="GitHub"
+				status={githubChip(state)}
+			>
+				{connectionB}
+				{appB("App")}
+			</SettingsCard>
+			<SettingsCard
+				id="git-other-section"
+				title="Other git hosts"
+				status={gitHostsChip(state)}
+			>
+				{othersB(null)}
+				{errorEl}
+			</SettingsCard>
+			<GitIdentitySection
+				commitIdentity={commitIdentity}
+				sshKey={sshB("SSH key")}
+				keySet={state === null ? null : state.globalKey !== null}
+				act={act}
+			/>
+		</>
 	);
 }
 
@@ -3349,240 +3660,245 @@ export function JiraConnectionsSection() {
 			hint="Named Jira sites that projects import tickets from. Ottr reads from Jira only. It stores each token encrypted and never shows it again."
 		>
 			{list !== null && list.length > 0 && (
-				<ul className="jira-conns">
-					{list.map((c) => (
-						<li key={c.name} className="jira-conn">
-							<div className="jira-conn-text">
-								<b>{c.name}</b>
-								<span>
-									<code>{c.site}</code> · {JIRA_TYPE_LABEL[c.type]}
-									{c.email !== null && ` · ${c.email}`}
-								</span>
-								<span className="hint">
-									{!c.tokenReadable ? (
-										<span className="jira-conn-warn">
-											<Mark kind="warn" />
-											Token unreadable, enter it again
-										</span>
-									) : c.tokenSet ? (
-										"Token set"
-									) : (
-										"No token"
-									)}
-									{" · "}
-									{c.usedBy.length === 0
-										? "Used by no project"
-										: `Used by ${c.usedBy.join(", ")}`}
-								</span>
-							</div>
-							<div className="jira-conn-actions">
-								<button
-									type="button"
-									aria-label={`Edit ${c.name}`}
-									onClick={() => edit(c)}
-								>
-									Edit
-								</button>
-								<BusyButton
-									ariaLabel={`Test ${c.name}`}
-									run={() => test(c.name)}
-								>
-									Test
-								</BusyButton>
-								<BusyButton
-									className="danger"
-									ariaLabel={`Delete ${c.name}`}
-									run={() => remove(c.name)}
-								>
-									Delete
-								</BusyButton>
-							</div>
-						</li>
-					))}
-				</ul>
+				<div className="sec-block">
+					<h4>Connections</h4>
+					<ul className="jira-conns">
+						{list.map((c) => (
+							<li key={c.name} className="jira-conn">
+								<div className="jira-conn-text">
+									<b>{c.name}</b>
+									<span>
+										<code>{c.site}</code> · {JIRA_TYPE_LABEL[c.type]}
+										{c.email !== null && ` · ${c.email}`}
+									</span>
+									<span className="hint">
+										{!c.tokenReadable ? (
+											<span className="jira-conn-warn">
+												<Mark kind="warn" />
+												Token unreadable, enter it again
+											</span>
+										) : c.tokenSet ? (
+											"Token set"
+										) : (
+											"No token"
+										)}
+										{" · "}
+										{c.usedBy.length === 0
+											? "Used by no project"
+											: `Used by ${c.usedBy.join(", ")}`}
+									</span>
+								</div>
+								<div className="jira-conn-actions">
+									<button
+										type="button"
+										aria-label={`Edit ${c.name}`}
+										onClick={() => edit(c)}
+									>
+										Edit
+									</button>
+									<BusyButton
+										ariaLabel={`Test ${c.name}`}
+										run={() => test(c.name)}
+									>
+										Test
+									</BusyButton>
+									<BusyButton
+										className="danger"
+										ariaLabel={`Delete ${c.name}`}
+										run={() => remove(c.name)}
+									>
+										Delete
+									</BusyButton>
+								</div>
+							</li>
+						))}
+					</ul>
+				</div>
 			)}
-			<form
-				className="settings-form"
-				aria-label={
-					editing === null
-						? "Add a Jira connection"
-						: `Edit the Jira connection ${editing}`
-				}
-				onSubmit={(e) => {
-					e.preventDefault();
-					save();
-				}}
-			>
+			<div className="sec-block">
 				<h4>{editing === null ? "Add connection" : `Edit ${editing}`}</h4>
-				<div className="alate-def-rows">
-					<DefRow
-						name="Name"
-						help="The name that projects pick in their settings, for example work. It cannot change after the save."
-						shape="unique name"
-					>
-						<label>
-							<input
-								value={name}
-								onChange={(e) => setName(e.target.value)}
-								readOnly={editing !== null}
-								required
-								spellCheck={false}
-								autoComplete="off"
-								aria-label="Name"
-							/>
-						</label>
-					</DefRow>
-					<DefRow
-						name="Site URL"
-						help="The Jira address, with a context path when Jira has one. Ottr asks the site for its type when you leave the field."
-						shape="https URL"
-						action={
-							<button
-								type="button"
-								disabled={detectBusy.busy || site.trim() === ""}
-								aria-busy={detectBusy.busy || undefined}
-								onClick={runDetect}
-							>
-								{detectBusy.busy && (
-									<span className="spinner" aria-hidden="true" />
-								)}
-								Detect type
-							</button>
-						}
-					>
-						<div className="alate-field-stack jira-site-stack">
-							<label>
-								<input
-									value={site}
-									onChange={(e) => setSite(e.target.value)}
-									onBlur={() => {
-										if (site.trim() !== "" && detect?.site !== site.trim())
-											runDetect();
-									}}
-									placeholder="https://acme.atlassian.net"
-									inputMode="url"
-									spellCheck={false}
-									autoComplete="off"
-									required
-									aria-label="Site URL"
-									aria-invalid={detect?.invalid === true || undefined}
-									aria-describedby={detect === null ? undefined : detectId}
-								/>
-							</label>
-							{detect !== null && (
-								<p
-									id={detectId}
-									className={detect.invalid ? "auth-error" : "hint"}
-									role={detect.invalid ? "alert" : "status"}
-								>
-									{detect.text}
-								</p>
-							)}
-						</div>
-					</DefRow>
-					<DefRow
-						name="Type"
-						help="Cloud signs in with an email and an API token. Data Center signs in with a personal access token."
-					>
-						<label>
-							<select
-								value={type}
-								onChange={(e) => setType(e.target.value as JiraType)}
-								aria-label="Type"
-							>
-								<option value="cloud">Cloud</option>
-								<option value="datacenter">Data Center</option>
-							</select>
-						</label>
-					</DefRow>
-					{type === "cloud" && (
+				<form
+					className="settings-form"
+					aria-label={
+						editing === null
+							? "Add a Jira connection"
+							: `Edit the Jira connection ${editing}`
+					}
+					onSubmit={(e) => {
+						e.preventDefault();
+						save();
+					}}
+				>
+					<div className="alate-def-rows">
 						<DefRow
-							name="Email"
-							help="The email of the Atlassian account that owns the API token."
-							shape="email"
+							name="Name"
+							help="The name that projects pick in their settings, for example work. It cannot change after the save."
+							shape="unique name"
 						>
 							<label>
 								<input
-									type="email"
-									value={email}
-									onChange={(e) => setEmail(e.target.value)}
-									autoComplete="off"
-									spellCheck={false}
+									value={name}
+									onChange={(e) => setName(e.target.value)}
+									readOnly={editing !== null}
 									required
-									aria-label="Email"
+									spellCheck={false}
+									autoComplete="off"
+									aria-label="Name"
 								/>
 							</label>
 						</DefRow>
-					)}
-					<DefRow
-						name="Token"
-						help={
-							type === "cloud"
-								? "An Atlassian API token. Ottr stores it encrypted and never shows it again."
-								: "A personal access token. Ottr stores it encrypted and never shows it again."
-						}
-						shape="secret · stored, never shown"
-					>
-						<div className="alate-field-stack">
+						<DefRow
+							name="Site URL"
+							help="The Jira address, with a context path when Jira has one. Ottr asks the site for its type when you leave the field."
+							shape="https URL"
+							action={
+								<button
+									type="button"
+									disabled={detectBusy.busy || site.trim() === ""}
+									aria-busy={detectBusy.busy || undefined}
+									onClick={runDetect}
+								>
+									{detectBusy.busy && (
+										<span className="spinner" aria-hidden="true" />
+									)}
+									Detect type
+								</button>
+							}
+						>
+							<div className="alate-field-stack jira-site-stack">
+								<label>
+									<input
+										value={site}
+										onChange={(e) => setSite(e.target.value)}
+										onBlur={() => {
+											if (site.trim() !== "" && detect?.site !== site.trim())
+												runDetect();
+										}}
+										placeholder="https://acme.atlassian.net"
+										inputMode="url"
+										spellCheck={false}
+										autoComplete="off"
+										required
+										aria-label="Site URL"
+										aria-invalid={detect?.invalid === true || undefined}
+										aria-describedby={detect === null ? undefined : detectId}
+									/>
+								</label>
+								{detect !== null && (
+									<p
+										id={detectId}
+										className={detect.invalid ? "auth-error" : "hint"}
+										role={detect.invalid ? "alert" : "status"}
+									>
+										{detect.text}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						<DefRow
+							name="Type"
+							help="Cloud signs in with an email and an API token. Data Center signs in with a personal access token."
+						>
+							<label>
+								<select
+									value={type}
+									onChange={(e) => setType(e.target.value as JiraType)}
+									aria-label="Type"
+								>
+									<option value="cloud">Cloud</option>
+									<option value="datacenter">Data Center</option>
+								</select>
+							</label>
+						</DefRow>
+						{type === "cloud" && (
+							<DefRow
+								name="Email"
+								help="The email of the Atlassian account that owns the API token."
+								shape="email"
+							>
+								<label>
+									<input
+										type="email"
+										value={email}
+										onChange={(e) => setEmail(e.target.value)}
+										autoComplete="off"
+										spellCheck={false}
+										required
+										aria-label="Email"
+									/>
+								</label>
+							</DefRow>
+						)}
+						<DefRow
+							name="Token"
+							help={
+								type === "cloud"
+									? "An Atlassian API token. Ottr stores it encrypted and never shows it again."
+									: "A personal access token. Ottr stores it encrypted and never shows it again."
+							}
+							shape="secret · stored, never shown"
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										type="password"
+										value={token}
+										onChange={(e) => setToken(e.target.value)}
+										autoComplete="off"
+										spellCheck={false}
+										required={editing === null}
+										aria-label="Token"
+										aria-describedby={
+											editingView === null ? undefined : tokenNoteId
+										}
+									/>
+								</label>
+								{editingView !== null && (
+									<p id={tokenNoteId} className="hint">
+										{editingView.tokenReadable
+											? editingView.tokenSet
+												? "Token is set. Leave empty to keep it."
+												: "No token is set. Enter one."
+											: "Token unreadable, enter it again."}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						<DefRow
+							name="Custom field IDs"
+							help="Jira fields to copy into each card prompt, comma-separated, for example customfield_10042."
+							shape="empty = none"
+						>
 							<label>
 								<input
-									type="password"
-									value={token}
-									onChange={(e) => setToken(e.target.value)}
-									autoComplete="off"
+									value={fields}
+									onChange={(e) => setFields(e.target.value)}
+									placeholder="customfield_10042, customfield_10043"
 									spellCheck={false}
-									required={editing === null}
-									aria-label="Token"
-									aria-describedby={
-										editingView === null ? undefined : tokenNoteId
-									}
+									autoComplete="off"
+									aria-label="Custom field IDs"
 								/>
 							</label>
-							{editingView !== null && (
-								<p id={tokenNoteId} className="hint">
-									{editingView.tokenReadable
-										? editingView.tokenSet
-											? "Token is set. Leave empty to keep it."
-											: "No token is set. Enter one."
-										: "Token unreadable, enter it again."}
-								</p>
-							)}
-						</div>
-					</DefRow>
-					<DefRow
-						name="Custom field IDs"
-						help="Jira fields to copy into each card prompt, comma-separated, for example customfield_10042."
-						shape="empty = none"
-					>
-						<label>
-							<input
-								value={fields}
-								onChange={(e) => setFields(e.target.value)}
-								placeholder="customfield_10042, customfield_10043"
-								spellCheck={false}
-								autoComplete="off"
-								aria-label="Custom field IDs"
-							/>
-						</label>
-					</DefRow>
-				</div>
-				<div className="alate-def-actions">
-					<button
-						type="submit"
-						disabled={saveBusy.busy}
-						aria-busy={saveBusy.busy || undefined}
-						className={saveBusy.failed ? "failed" : ""}
-					>
-						{saveBusy.busy && <span className="spinner" aria-hidden="true" />}
-						Save connection
-					</button>{" "}
-					{editing !== null && (
-						<button type="button" onClick={reset}>
-							Cancel
-						</button>
-					)}
-				</div>
-			</form>
+						</DefRow>
+					</div>
+					<div className="alate-def-actions">
+						<button
+							type="submit"
+							disabled={saveBusy.busy}
+							aria-busy={saveBusy.busy || undefined}
+							className={saveBusy.failed ? "failed" : ""}
+						>
+							{saveBusy.busy && <span className="spinner" aria-hidden="true" />}
+							Save connection
+						</button>{" "}
+						{editing !== null && (
+							<button type="button" onClick={reset}>
+								Cancel
+							</button>
+						)}
+					</div>
+				</form>
+			</div>
 			<p className="hint" role="status">
 				{note}
 			</p>
@@ -3906,14 +4222,15 @@ const signinStatus = (
 			? { label: `${signedIn} signed in`, tone: "ok" }
 			: { label: "None signed in", tone: "warn" };
 
-/** The status-dot class and the state words for one stored sign-in: expired ones lead,
- *  OAuth sign-ins read as signed in, anything else holds an API key. */
-const signinState = (signIn: SignIn): { led: string; words: string } =>
+/** The state words for one stored sign-in: expired ones lead, OAuth sign-ins read as
+ *  signed in, anything else holds an API key. Grey is normal: only an expired sign-in
+ *  carries a mark (the amber needs-you triangle) and the amber row box. */
+const signinWords = (signIn: SignIn): string =>
 	signIn.active
 		? signIn.kind === "oauth"
-			? { led: "ok", words: "Signed in" }
-			: { led: "", words: "API key stored" }
-		: { led: "crit", words: "Sign-in expired: sign in again" };
+			? "Signed in"
+			: "API key stored"
+		: "Sign-in expired";
 
 /** The stored sign-ins, one row per provider: status words, quota meters, and the
  *  sign-in-again and sign-out actions. */
@@ -3941,16 +4258,19 @@ function SignInRows({
 				const limits = forProvider(quota?.limits ?? [], id);
 				const plan = limits.find((l) => l.plan !== null)?.plan ?? null;
 				const needs = !signIn.active;
-				const state = signinState(signIn);
+				const words = signinWords(signIn);
 				return (
-					<div className="alate-def-row providers-row" key={id}>
+					<div
+						className={`alate-def-row providers-row${needs ? " expired" : ""}`}
+						key={id}
+					>
 						<div className="alate-def-name">
 							<b className="provider-name">
-								<i className={`status-dot ${state.led}`} aria-hidden="true" />
+								{needs && <Mark kind="needs" />}
 								{providerName(id)}
 							</b>
 							<span>
-								{state.words}
+								{words}
 								{signIn.active &&
 									(signIn.lent
 										? " · Lent to workers"
@@ -3958,7 +4278,6 @@ function SignInRows({
 								{plan !== null &&
 									` · ${plan.charAt(0).toUpperCase()}${plan.slice(1)} plan`}
 							</span>
-							<code>{id}</code>
 						</div>
 						<div className="providers-meters">
 							{limits.map((l) => (
@@ -3981,9 +4300,13 @@ function SignInRows({
 								className="danger"
 								onClick={() => onSignOut(id)}
 								disabled={busy}
-								aria-label={`Sign out of ${providerName(id)}`}
+								aria-label={
+									needs
+										? `Remove sign-in for ${providerName(id)}`
+										: `Sign out of ${providerName(id)}`
+								}
 							>
-								Sign out
+								{needs ? "Remove" : "Sign out"}
 							</button>
 						</div>
 					</div>
@@ -4133,7 +4456,7 @@ function SignInStartForm({
 				<button
 					type="submit"
 					disabled={busy}
-					className={failed ? "failed" : "primary"}
+					className={failed ? "failed" : undefined}
 				>
 					{busy && <span className="spinner" aria-hidden="true" />}
 					Sign in
@@ -4219,10 +4542,15 @@ function ProviderLoginSection() {
 			return true;
 		});
 	const signOutOf = async (id: string): Promise<void> => {
+		const expired = state?.signIns?.some(
+			(signIn) => signIn.provider === id && !signIn.active,
+		);
 		if (
 			!(await confirmDialog(
-				`Sign omp out of ${providerName(id)}? Turns that use it fail until you sign in again.`,
-				{ ok: "Sign out", danger: true },
+				expired
+					? `Remove the expired sign-in for ${providerName(id)}? This also removes this provider's sign-in from the worker store.`
+					: `Sign omp out of ${providerName(id)}? Turns that use it fail until you sign in again.`,
+				{ ok: expired ? "Remove" : "Sign out", danger: true },
 			))
 		)
 			return;
@@ -4241,7 +4569,7 @@ function ProviderLoginSection() {
 			className="providers"
 			title="Provider sign-in"
 			status={signinStatus(state, signedIn)}
-			hint="One sign-in per provider, stored on the board's machine. For OAuth sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get a short-lived token in their env. Other providers are not lent: workers use their own sign-in, or the provider's key under Settings, Env. A sign-in works the same from a phone or another machine: finish the provider's page there, copy the address it ends on, or the code it shows, and paste it below."
+			hint="The board stores one sign-in per provider. Anthropic, ChatGPT (Codex), and Z.AI OAuth sign-ins share access tokens with worker turns automatically. Workers receive no refresh token. Other providers use worker credentials or a key under Settings, Env. From another device, complete the provider's page there. Paste its final address or code below."
 		>
 			{signIns.length > 0 && (
 				<SignInRows
@@ -4938,62 +5266,6 @@ function RoleReadonlyNote({
 	);
 }
 
-/** The add-role form: the name field with its inline error line. */
-function RoleAddForm({
-	newName,
-	setNewName,
-	setAddErr,
-	addErr,
-	uid,
-	locked,
-	onAdd,
-}: {
-	newName: string;
-	setNewName: (v: string) => void;
-	setAddErr: (v: string | null) => void;
-	addErr: string | null;
-	uid: string;
-	locked: boolean;
-	onAdd: () => void;
-}) {
-	return (
-		<>
-			<form
-				className="role-add"
-				onSubmit={(e) => {
-					e.preventDefault();
-					onAdd();
-				}}
-			>
-				<label className="field">
-					New role name
-					<input
-						type="text"
-						value={newName}
-						onChange={(e) => {
-							setNewName(e.target.value);
-							setAddErr(null);
-						}}
-						spellCheck={false}
-						autoComplete="off"
-						aria-invalid={addErr !== null}
-						aria-describedby={addErr !== null ? `${uid}-add` : undefined}
-						disabled={locked}
-					/>
-				</label>
-				<button type="submit" disabled={locked}>
-					Add role
-				</button>
-			</form>
-			{addErr !== null && (
-				<p className="auth-error" id={`${uid}-add`} role="alert">
-					{addErr}
-				</p>
-			)}
-		</>
-	);
-}
-
 /** The provision line of the save steps: running with its elapsed timer, the handed-off
  *  "still" note, the success note, or the failure with its error or failed-script count. */
 function ProvisionLine({
@@ -5118,11 +5390,9 @@ function ModelRolesSaveButton({
 		<div className="alate-def-actions">
 			<button
 				type="button"
-				// Plain button while read-only: the accent fill reads clickable even at
-				// the disabled opacity, and the editor must read locked.
-				className={
-					ro !== null ? undefined : `primary${save.failed ? " failed" : ""}`
-				}
+				// Stock grey like every settings Save: a settings page stacks cards, and the
+				// steel fill marks one action per screen (DESIGN.md, One primary per surface).
+				className={save.failed ? "failed" : undefined}
 				onClick={onClick}
 				disabled={!dirty || locked}
 				// The note above the button explains the lock; the description
@@ -5186,7 +5456,8 @@ function ModelRolesContent({
 	onSetValue: (name: string, value: string) => void;
 	onRemoveRole: (name: string) => void;
 	onEditChain: (name: string, fn: (chain: string[]) => string[]) => void;
-	onAdd: () => void;
+	/** Adds the typed name, or `name` (a missing check role's button). */
+	onAdd: (name?: string) => void;
 	onSubmit: () => void;
 }) {
 	return (
@@ -5221,23 +5492,67 @@ function ModelRolesContent({
 						onEditChain={onEditChain}
 					/>
 					{missing.length > 0 && (
-						<p className="hint">
-							<Mark kind="warn" /> No {missing.join(" or ")} role
-							{missing.length > 1 ? "s" : ""}: second-model checks fall back to
-							the default model, which is often the model they check. critic
-							checks Anthropic models, adversary the rest.
-						</p>
+						<div className="role-warn" role="note">
+							<Mark kind="needs" />
+							<b>
+								No {missing.join(" or ")} role
+								{missing.length > 1 ? "s" : ""}
+							</b>
+							<p>
+								Second-model checks fall back to the default model, which is
+								often the model they check. critic checks Anthropic models,
+								adversary the rest.
+							</p>
+							<div className="role-warn-actions">
+								{missing.map((m) => (
+									<button
+										key={m}
+										type="button"
+										disabled={locked || first === undefined}
+										onClick={() => onAdd(m)}
+									>
+										Add {m}
+									</button>
+								))}
+							</div>
+						</div>
 					)}
 					{ro !== null && <RoleReadonlyNote ro={ro} uid={uid} />}
-					<RoleAddForm
-						newName={newName}
-						setNewName={setNewName}
-						setAddErr={setAddErr}
-						addErr={addErr}
-						uid={uid}
-						locked={locked}
-						onAdd={onAdd}
-					/>
+					<form
+						className="role-add"
+						onSubmit={(e) => {
+							e.preventDefault();
+							onAdd();
+						}}
+					>
+						<label className="sr" htmlFor={`${uid}-new`}>
+							New role name
+						</label>
+						<input
+							id={`${uid}-new`}
+							type="text"
+							placeholder="New role"
+							value={newName}
+							onChange={(e) => {
+								setNewName(e.target.value);
+								setAddErr(null);
+							}}
+							spellCheck={false}
+							autoComplete="off"
+							aria-invalid={addErr !== null}
+							aria-describedby={addErr !== null ? `${uid}-add` : undefined}
+							disabled={locked}
+						/>
+						<button type="submit" className="role-add-btn" disabled={locked}>
+							<Icon name="plus" size={14} />
+							Add role
+						</button>
+					</form>
+					{addErr !== null && (
+						<p className="auth-error" id={`${uid}-add`} role="alert">
+							{addErr}
+						</p>
+					)}
 					<ModelRolesSaveButton
 						ro={ro}
 						roHintId={`${uid}-ro-hint`}
@@ -5409,8 +5724,8 @@ export function ModelRolesSection() {
 		setChains((c) => withoutKey(c, name));
 		setFallbackFields((f) => withoutKey(f, name));
 	};
-	const add = (): void => {
-		const name = newName.trim();
+	const add = (picked?: string): void => {
+		const name = (picked ?? newName).trim();
 		const err = addRoleError(name, rows, first);
 		setAddErr(err);
 		if (err === null && first !== undefined) {
@@ -5420,7 +5735,7 @@ export function ModelRolesSection() {
 				state !== null ? ownField(state.fallbacks, name) : undefined;
 			if (loaded !== undefined)
 				setChains((c) => ({ ...c, [name]: [...loaded] }));
-			setNewName("");
+			if (picked === undefined) setNewName("");
 		}
 	};
 	const provision = async (): Promise<void> => {
@@ -5976,7 +6291,11 @@ function AlateActions({
 				type="button"
 				onClick={onProvision}
 				disabled={prov.busy || awaiting}
-				className={`primary${health?.state === "ok" && health.pending ? " attention" : ""}`}
+				// Stock grey like every settings action: a settings page stacks cards, and the steel
+				// fill marks one action per screen (DESIGN.md, One primary per surface).
+				className={
+					health?.state === "ok" && health.pending ? "attention" : undefined
+				}
 			>
 				{(prov.busy || awaiting) && (
 					<span className="spinner" aria-hidden="true" />
@@ -6514,6 +6833,7 @@ function CheckRow({
 	checked,
 	disabled,
 	sub,
+	action,
 	save,
 	act,
 }: {
@@ -6527,6 +6847,8 @@ function CheckRow({
 	checked: boolean;
 	disabled?: boolean;
 	sub?: boolean;
+	/** A button at the row's right end that acts without the checkbox (e.g. run it now). */
+	action?: ReactNode;
 	save: (checked: boolean) => Promise<unknown>;
 	act: Act;
 }) {
@@ -6565,6 +6887,9 @@ function CheckRow({
 				</b>
 				<span id={`${id}-desc`}>{desc}</span>
 			</div>
+			{action !== undefined && (
+				<div className="alate-def-actions">{action}</div>
+			)}
 		</div>
 	);
 }
@@ -6606,27 +6931,12 @@ function SaveCard({
 	);
 }
 
-/** Updates chip: how many of the Updates card's checkboxes are on (saved values, not the
- *  draft). Friction filter counts only while Retro is on, as it is disabled otherwise. */
-export function updatesChip(s: ProjectView["settings"]): {
+/** A switch card's chip: how many of its checkboxes are on (saved values, not a draft).
+ *  The caller passes a sub-switch as `parent && sub`, as it is disabled while its parent is off. */
+export function onChip(flags: readonly boolean[]): {
 	label: string;
 	tone: ChipTone;
 } {
-	const retro = s.retroSince !== null;
-	const flags = [
-		s.holdUpdateMerges,
-		s.forkMergeHold,
-		retro,
-		retro && s.retroFilter,
-		s.forkResearch,
-		s.trendingScout,
-		s.prReviews,
-		s.prMode,
-		s.issueWatch,
-		s.ompWatch,
-		s.microVm,
-		s.pushSyncCommits,
-	];
 	const on = flags.filter(Boolean).length;
 	return {
 		label: `${on} of ${flags.length} on`,
@@ -6691,38 +7001,8 @@ export const SETTINGS_TOC = [
 		id: "board-group",
 		label: "Board",
 		sections: [
-			{ id: "runners-section", label: "Runners" },
 			{ id: "projects-section", label: "Projects" },
 			{ id: "notifications-section", label: "Notifications" },
-		],
-	},
-	{
-		id: "access-group",
-		label: "Access",
-		sections: [
-			{ id: "api-key-section", label: "API key" },
-			{ id: "session-section", label: "Session" },
-			{ id: "omp-stats-section", label: "omp usage" },
-		],
-	},
-	{
-		id: "git-group",
-		label: "Git and secrets",
-		sections: [
-			{
-				id: "git-hosts-section",
-				label: "Git hosts",
-				blocks: [
-					{ id: "github-host-block", label: "GitHub host" },
-					{ id: "github-token-block", label: "GitHub token" },
-					{ id: "github-app-block", label: "GitHub App" },
-					{ id: "host-tokens-block", label: "Other host tokens" },
-					{ id: "ssh-key-block", label: "Global SSH key" },
-				],
-			},
-			{ id: "commit-identity-section", label: "Commit identity" },
-			{ id: "env-section", label: "Env" },
-			{ id: "jira-section", label: "Jira connections" },
 		],
 	},
 	{
@@ -6731,8 +7011,62 @@ export const SETTINGS_TOC = [
 		sections: [
 			{ id: "signin-section", label: "Provider sign-in" },
 			{ id: "model-roles-section", label: "Model roles" },
+			{ id: "runners-section", label: "Runners" },
+		],
+	},
+	{
+		id: "workflow-group",
+		label: "Workflow",
+		sections: [
+			{ id: "checks-section", label: "Checks" },
+			{ id: "automation-section", label: "Automation" },
+		],
+	},
+	{
+		id: "environment-group",
+		label: "Agent environment",
+		sections: [
+			{ id: "env-section", label: "Env" },
 			{ id: "alate-section", label: "Alate" },
 			{ id: "hindsight-section", label: "Hindsight" },
+		],
+	},
+	{
+		id: "git-group",
+		label: "Git and integrations",
+		sections: [
+			{
+				id: "git-hosts-section",
+				label: "GitHub",
+				blocks: [
+					{ id: "github-host-block", label: "GitHub host" },
+					{ id: "github-token-block", label: "GitHub token" },
+					{ id: "github-app-block", label: "GitHub App" },
+				],
+			},
+			{
+				id: "git-other-section",
+				label: "Other git hosts",
+				blocks: [{ id: "host-tokens-block", label: "HTTPS tokens" }],
+			},
+			{
+				id: "commit-identity-section",
+				label: "Git identity",
+				blocks: [
+					{ id: "ssh-key-block", label: "SSH key" },
+					{ id: "commit-identity-block", label: "Commit identity" },
+				],
+			},
+			{ id: "jira-section", label: "Jira connections" },
+		],
+	},
+	{
+		id: "access-group",
+		label: "Access and usage",
+		sections: [
+			{ id: "api-key-section", label: "API key" },
+			{ id: "session-section", label: "Session" },
+			{ id: "omp-stats-section", label: "omp usage" },
 		],
 	},
 ] as const;
@@ -6743,8 +7077,8 @@ const PROJECT_TOC = [
 		id: "project-group",
 		label: "Project",
 		sections: [
-			{ id: "project-icon-section", label: "Icon" },
 			{ id: "project-identity-section", label: "Identity" },
+			{ id: "project-icon-section", label: "Icon" },
 		],
 	},
 	{
@@ -6754,8 +7088,12 @@ const PROJECT_TOC = [
 			{ id: "project-runners-section", label: "Runners" },
 			{ id: "project-worktrees-section", label: "Worktrees" },
 			{ id: "project-messages-section", label: "Messages" },
-			{ id: "project-jira-section", label: "Jira" },
 		],
+	},
+	{
+		id: "project-merging-group",
+		label: "Merging",
+		sections: [{ id: "project-merging-section", label: "Merging" }],
 	},
 	{
 		id: "project-reviews-group",
@@ -6763,13 +7101,23 @@ const PROJECT_TOC = [
 		sections: [
 			{ id: "project-releases-section", label: "Releases" },
 			{ id: "project-reviews-section", label: "Reviews" },
-			{ id: "project-updates-section", label: "Updates" },
 		],
 	},
 	{
-		id: "project-git-group",
-		label: "Git",
-		sections: [{ id: "project-ssh-section", label: "SSH key" }],
+		id: "project-cards-group",
+		label: "New cards",
+		sections: [
+			{ id: "project-watches-section", label: "Watches" },
+			{ id: "project-proposals-section", label: "Proposals" },
+		],
+	},
+	{
+		id: "project-integrations-group",
+		label: "Integrations",
+		sections: [
+			{ id: "project-jira-section", label: "Jira" },
+			{ id: "project-ssh-section", label: "SSH key" },
+		],
 	},
 	{
 		id: "project-danger-group",
@@ -6805,6 +7153,9 @@ export type TocGroup = {
  *  the control plane and the operator own them, so the tenant never sees them. */
 const HOSTED_HIDDEN: ReadonlySet<string> = new Set([
 	"runners-section",
+	// The board-wide checks and automation switches sat on the runners card; the operator owns them.
+	"checks-section",
+	"automation-section",
 	"projects-section",
 	"api-key-section",
 	"session-section",
@@ -6812,12 +7163,21 @@ const HOSTED_HIDDEN: ReadonlySet<string> = new Set([
 	// Hosted git uses per-project control-plane tokens only (section 6), so no host token,
 	// GitHub setting or server SSH key on this card does anything there.
 	"git-hosts-section",
+	"git-other-section",
 	"commit-identity-section",
 	"signin-section",
 	"model-roles-section",
 	"alate-section",
 	"hindsight-section",
-	"project-updates-section",
+	// The cards that split the old Updates card (watch, merge-hold and proposal switches).
+	"project-merging-section",
+	"project-watches-section",
+	"project-proposals-section",
+]);
+
+/** Card ids a deep link may still name after a card moved or split: the new home. */
+const MOVED_IDS: ReadonlyMap<string, string> = new Map([
+	["project-updates-section", "project-merging-section"],
 ]);
 
 /** The card that holds each sub-block: a block hides with its card. */
@@ -6861,9 +7221,10 @@ export function pageToc(
 		.filter((g) => g.sections.length > 0);
 }
 
-/** The settings map: the page as a lineage-style tree (groups, their cards one indent in,
- *  sub-blocks one more): hollow nodes on a 1px thread, an elbow into each level, and the
- *  current entry as the one steel node. One group (a project page) drops the group level. */
+/** The settings map: the page as a lineage-style tree (groups, then their cards one indent in):
+ *  hollow nodes on a 1px thread, an elbow into each level, and the current entry as the one
+ *  steel node. One group (a project page) drops the group level. Sub-blocks are not on the
+ *  map: a block's deep link still scrolls to it, and its card stands in as the current entry. */
 function SettingsMap({
 	groups,
 	hash,
@@ -6872,20 +7233,13 @@ function SettingsMap({
 }: TocProps & { groups: readonly TocGroup[] }) {
 	const named = groups.length > 1;
 	const flat = groups.flatMap((g) =>
-		g.sections.flatMap((s) => [
-			{ g, s, id: s.id, label: s.label, depth: 1 },
-			...(s.blocks ?? []).map((b) => ({
-				g,
-				s,
-				id: b.id,
-				label: b.label,
-				depth: 2,
-			})),
-		]),
+		g.sections.map((s) => ({ g, s, id: s.id, label: s.label, depth: 1 })),
 	);
 	const hi = Math.max(
 		0,
-		flat.findIndex((x) => x.id === active),
+		flat.findIndex(
+			(x) => x.id === active || (x.s.blocks ?? []).some((b) => b.id === active),
+		),
 	);
 	if (flat.length === 0) return null;
 	const state = (i: number) => (i < hi ? "past" : i === hi ? "here" : "ahead");
@@ -6909,22 +7263,21 @@ function SettingsMap({
 		kids,
 	});
 	const cards = (g: TocGroup): MapNode[] =>
-		g.sections.map((s) =>
-			node(
-				s.id,
-				s.label,
-				1,
-				(s.blocks ?? []).map((b) => node(b.id, b.label, 2)),
-			),
-		);
+		g.sections.map((s) => node(s.id, s.label, 1, []));
+	// A group with one card shows only the group row, which opens that card and carries its state.
 	const tree: MapNode[] = named
-		? groups.map((g) => ({
-				id: g.sections[0]?.id ?? "",
-				label: g.label,
-				depth: 0,
-				state: "group",
-				kids: cards(g),
-			}))
+		? groups.map((g) => {
+				const only = g.sections.length === 1 ? g.sections[0] : undefined;
+				return only === undefined
+					? {
+							id: g.sections[0]?.id ?? "",
+							label: g.label,
+							depth: 0,
+							state: "group",
+							kids: cards(g),
+						}
+					: { ...node(only.id, g.label, 0), kids: [] };
+			})
 		: groups.flatMap(cards);
 	const branch = (nodes: MapNode[]) =>
 		nodes.map((n) => (
@@ -7004,7 +7357,6 @@ function GeneralSettingsContent({
 	idleReviews,
 	trendingScan,
 	trendingStatus,
-	allocated,
 	commitIdentity,
 	act,
 }: {
@@ -7018,7 +7370,6 @@ function GeneralSettingsContent({
 	idleReviews: boolean;
 	trendingScan: boolean;
 	trendingStatus: TrendingStatus;
-	allocated: number;
 	commitIdentity: CommitIdentity | null;
 	act: Act;
 }) {
@@ -7044,55 +7395,10 @@ function GeneralSettingsContent({
 					<h2 className="settings-group-title" id="board-group-title">
 						Board
 					</h2>
-					{shown("runners-section") && (
-						<TotalRunnersForm
-							maxTotal={maxTotal}
-							reviewCheck={reviewCheck}
-							workCheck={workCheck}
-							idleReviews={idleReviews}
-							trendingScan={trendingScan}
-							trendingStatus={trendingStatus}
-							allocated={allocated}
-							act={act}
-						/>
-					)}
 					{shown("projects-section") && (
 						<ProjectsOrderSection projects={projects} act={act} />
 					)}
 					<NotificationsSection projects={projects} act={act} />
-				</section>
-			)}
-			{groupShown("access-group") && (
-				<section
-					className="settings-group"
-					id="access-group"
-					aria-labelledby="access-group-title"
-					tabIndex={-1}
-				>
-					<h2 className="settings-group-title" id="access-group-title">
-						Access
-					</h2>
-					{shown("api-key-section") && <ApiKeySection />}
-					{shown("session-section") && <SessionSection />}
-					{shown("omp-stats-section") && <OmpStatsSection />}
-				</section>
-			)}
-			{groupShown("git-group") && (
-				<section
-					className="settings-group"
-					id="git-group"
-					aria-labelledby="git-group-title"
-					tabIndex={-1}
-				>
-					<h2 className="settings-group-title" id="git-group-title">
-						Git and secrets
-					</h2>
-					{shown("git-hosts-section") && <GitHostsSection />}
-					{shown("commit-identity-section") && (
-						<CommitIdentitySection commitIdentity={commitIdentity} act={act} />
-					)}
-					<EnvSection />
-					<JiraConnectionsSection />
 				</section>
 			)}
 			{groupShown("agents-group") && (
@@ -7107,8 +7413,86 @@ function GeneralSettingsContent({
 					</h2>
 					{shown("signin-section") && <ProviderLoginSection />}
 					{shown("model-roles-section") && <ModelRolesSection />}
+					{shown("runners-section") && (
+						<TotalRunnersForm
+							maxTotal={maxTotal}
+							projects={projects}
+							act={act}
+						/>
+					)}
+				</section>
+			)}
+			{groupShown("workflow-group") && (
+				<section
+					className="settings-group"
+					id="workflow-group"
+					aria-labelledby="workflow-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="workflow-group-title">
+						Workflow
+					</h2>
+					{shown("checks-section") && (
+						<ChecksSection
+							reviewCheck={reviewCheck}
+							workCheck={workCheck}
+							act={act}
+						/>
+					)}
+					{shown("automation-section") && (
+						<AutomationSection
+							idleReviews={idleReviews}
+							trendingScan={trendingScan}
+							trendingStatus={trendingStatus}
+							act={act}
+						/>
+					)}
+				</section>
+			)}
+			{groupShown("environment-group") && (
+				<section
+					className="settings-group"
+					id="environment-group"
+					aria-labelledby="environment-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="environment-group-title">
+						Agent environment
+					</h2>
+					<EnvSection />
 					{shown("alate-section") && <AlateSection />}
 					{shown("hindsight-section") && <HindsightSection />}
+				</section>
+			)}
+			{groupShown("git-group") && (
+				<section
+					className="settings-group"
+					id="git-group"
+					aria-labelledby="git-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="git-group-title">
+						Git and integrations
+					</h2>
+					{shown("git-hosts-section") && (
+						<GitHostsSection commitIdentity={commitIdentity} act={act} />
+					)}
+					<JiraConnectionsSection />
+				</section>
+			)}
+			{groupShown("access-group") && (
+				<section
+					className="settings-group"
+					id="access-group"
+					aria-labelledby="access-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="access-group-title">
+						Access and usage
+					</h2>
+					{shown("api-key-section") && <ApiKeySection />}
+					{shown("session-section") && <SessionSection />}
+					{shown("omp-stats-section") && <OmpStatsSection />}
 				</section>
 			)}
 		</>
@@ -7151,10 +7535,6 @@ export function SettingsPage({
 		sub.project === null
 			? null
 			: (projects.find((p) => p.name === sub.project) ?? null);
-	const allocated = projects.reduce(
-		(sum, p) => sum + (p.settings.maxParallel ?? 0),
-		0,
-	);
 	const general = project === null;
 	const host = hosted === true;
 	const [active, setActive] = useState<string | null>(null);
@@ -7206,6 +7586,7 @@ export function SettingsPage({
 				// A malformed escape names nothing; give up.
 				return;
 			}
+			id = MOVED_IDS.get(id) ?? id;
 			if (
 				!tocIds(
 					pageToc(general, host).flatMap(
@@ -7247,7 +7628,7 @@ export function SettingsPage({
 				</a>
 				{general && map}
 				<p className="snb-label">Projects</p>
-				{projects.map((p) => (
+				{byLabel(projects).map((p) => (
 					<Fragment key={p.name}>
 						<a
 							className="snb"
@@ -7279,7 +7660,6 @@ export function SettingsPage({
 						idleReviews={idleReviews}
 						trendingScan={trendingScan}
 						trendingStatus={trendingStatus}
-						allocated={allocated}
 						commitIdentity={commitIdentity}
 						act={act}
 					/>
@@ -7377,31 +7757,38 @@ const privateTagFor = (privateRepo: boolean | null): string | undefined =>
 const privateNoteFor = (privateRepo: boolean | null, what: string): string =>
 	privateRepo === true ? `Private repo: no outside ${what}. ` : "";
 
-/** The Updates card: the per-project watch and merge-hold switches. Hosted mode drops it. */
-function ProjectUpdatesCard({
+/** The Merging card: how a finished card reaches the target branch, and when the board waits for you. */
+function ProjectMergingCard({
 	project,
 	st,
 	send,
-	privateTag,
-	privateNote,
-	trendingScan,
 	act,
 }: {
 	project: ProjectView;
 	st: ProjectView["settings"];
 	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
-	privateTag: string | undefined;
-	privateNote: (what: string) => string;
-	trendingScan: boolean;
 	act: Act;
 }) {
 	return (
 		<SettingsCard
-			id="project-updates-section"
-			title="Updates"
-			status={updatesChip(project.settings)}
+			id="project-merging-section"
+			title="Merging"
+			status={onChip([
+				st.prMode,
+				st.holdUpdateMerges,
+				st.forkMergeHold,
+				st.pushSyncCommits,
+			])}
 		>
 			<div className="alate-def-rows">
+				<CheckRow
+					name="PR mode"
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
+					checked={st.prMode}
+					disabled={project.github === null && !st.prMode}
+					save={(v) => send({ prMode: v })}
+					act={act}
+				/>
 				{/* U7: hold update-card merges at needs_you until a reply approves them. */}
 				<CheckRow
 					name="Hold update merges"
@@ -7419,54 +7806,53 @@ function ProjectUpdatesCard({
 					act={act}
 				/>
 				<CheckRow
-					name="Retro"
-					desc="After each done task the supervisor proposes follow-up cards from its retro"
-					checked={st.retroSince !== null}
-					save={(v) => send({ retro: v })}
+					name="Push sync commits"
+					desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
+					checked={st.pushSyncCommits}
+					save={(v) => send({ pushSyncCommits: v })}
 					act={act}
 				/>
+			</div>
+		</SettingsCard>
+	);
+}
+
+/** The Watches card: hourly watches that turn outside activity into cards. */
+function ProjectWatchesCard({
+	project,
+	st,
+	send,
+	privateTag,
+	privateNote,
+	act,
+}: {
+	project: ProjectView;
+	st: ProjectView["settings"];
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+	privateTag: string | undefined;
+	privateNote: (what: string) => string;
+	act: Act;
+}) {
+	return (
+		<SettingsCard
+			id="project-watches-section"
+			title="Watches"
+			status={onChip([
+				st.issueWatch,
+				st.prReviews,
+				st.prReviews && st.prReviewNotify,
+				st.forkResearch,
+				st.ompWatch,
+			])}
+		>
+			<div className="alate-def-rows">
 				<CheckRow
-					sub
-					name="Friction filter"
-					desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
-					checked={st.retroFilter}
-					disabled={st.retroSince === null}
-					save={(v) => send({ retroFilter: v })}
-					act={act}
-				/>
-				<CheckRow
-					name="Fork research"
-					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
+					name="Issue watch"
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
 					tag={privateTag}
-					checked={st.forkResearch}
-					save={(v) => send({ forkResearch: v })}
-					act={act}
-				/>
-				<CheckRow
-					name="Trending scout"
-					desc={
-						!trendingScan ? (
-							<>
-								The general 'Weekly trending scan' switch is off, so the scout
-								never runs — turn it on in{" "}
-								<a
-									href={`${settingsPath(null)}#runners-section`}
-									onClick={(e) =>
-										navClick(e, () => openSettingsSection("runners-section"))
-									}
-								>
-									General settings
-								</a>
-								. Weekly: an agent judges GitHub trending repos for this project
-								and files up to 3 backlog proposals
-							</>
-						) : (
-							"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
-						)
-					}
-					checked={st.trendingScout}
-					disabled={!trendingScan && !st.trendingScout}
-					save={(v) => send({ trendingScout: v })}
+					checked={st.issueWatch}
+					disabled={project.github === null && !st.issueWatch}
+					save={(v) => send({ issueWatch: v })}
 					act={act}
 				/>
 				<CheckRow
@@ -7488,20 +7874,11 @@ function ProjectUpdatesCard({
 					act={act}
 				/>
 				<CheckRow
-					name="PR mode"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Push finished card branches and open a pull request to the target branch instead of merging; the card waits in Merging until the pull request merges on GitHub`}
-					checked={st.prMode}
-					disabled={project.github === null && !st.prMode}
-					save={(v) => send({ prMode: v })}
-					act={act}
-				/>
-				<CheckRow
-					name="Issue watch"
-					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}${privateNote("issues to watch")}Hourly watch of GitHub issues opened after you turn this on; each new issue becomes a backlog card and gets the ottr-tracked label`}
+					name="Fork research"
+					desc={`${privateNote("forks to watch")}Hourly watch of the project's GitHub forks; analysis files held proposals; fork-born merges need approval`}
 					tag={privateTag}
-					checked={st.issueWatch}
-					disabled={project.github === null && !st.issueWatch}
-					save={(v) => send({ issueWatch: v })}
+					checked={st.forkResearch}
+					save={(v) => send({ forkResearch: v })}
 					act={act}
 				/>
 				<CheckRow
@@ -7511,19 +7888,72 @@ function ProjectUpdatesCard({
 					save={(v) => send({ ompWatch: v })}
 					act={act}
 				/>
+			</div>
+		</SettingsCard>
+	);
+}
+
+/** The Proposals card: agents that propose backlog cards (retro follow-ups, trending repos). */
+function ProjectProposalsCard({
+	st,
+	send,
+	trendingScan,
+	act,
+}: {
+	st: ProjectView["settings"];
+	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
+	trendingScan: boolean;
+	act: Act;
+}) {
+	const retro = st.retroSince !== null;
+	return (
+		<SettingsCard
+			id="project-proposals-section"
+			title="Proposals"
+			status={onChip([retro, retro && st.retroFilter, st.trendingScout])}
+		>
+			<div className="alate-def-rows">
 				<CheckRow
-					name="Run work turns in microVMs"
-					desc={microVmDesc(project, st.microVm)}
-					checked={st.microVm}
-					disabled={!project.vmRunner.ok && !st.microVm}
-					save={(v) => send({ microVm: v })}
+					name="Retro"
+					desc="After each done task the supervisor proposes follow-up cards from its retro"
+					checked={st.retroSince !== null}
+					save={(v) => send({ retro: v })}
 					act={act}
 				/>
 				<CheckRow
-					name="Push sync commits"
-					desc="When the local target branch holds commits origin lacks, the board pushes it to origin on its own (OTTR-531); off needs the board's Push to origin button"
-					checked={st.pushSyncCommits}
-					save={(v) => send({ pushSyncCommits: v })}
+					sub
+					name="Friction filter"
+					desc="Keep only retro proposals that fix a friction the task hit; needs Retro"
+					checked={st.retroFilter}
+					disabled={st.retroSince === null}
+					save={(v) => send({ retroFilter: v })}
+					act={act}
+				/>
+				<CheckRow
+					name="Trending scout"
+					desc={
+						!trendingScan ? (
+							<>
+								The general 'Weekly trending scan' switch is off, so the scout
+								never runs — turn it on in{" "}
+								<a
+									href={`${settingsPath(null)}#automation-section`}
+									onClick={(e) =>
+										navClick(e, () => openSettingsSection("automation-section"))
+									}
+								>
+									General settings
+								</a>
+								. Weekly: an agent judges GitHub trending repos for this project
+								and files up to 3 backlog proposals
+							</>
+						) : (
+							"Weekly, when the general 'Weekly trending scan' is on: an agent judges GitHub trending repos for this project and files up to 3 backlog proposals"
+						)
+					}
+					checked={st.trendingScout}
+					disabled={!trendingScan && !st.trendingScout}
+					save={(v) => send({ trendingScout: v })}
 					act={act}
 				/>
 			</div>
@@ -7579,6 +8009,124 @@ function ProjectIdentitySection({
 			<h2 className="settings-group-title" id="project-group-title">
 				Project
 			</h2>
+			{/* Both typed fields save through one footer Save: a prefix change renames the
+				project route, so one deliberate save for the card fits. */}
+			<SaveCard
+				id="project-identity-section"
+				act={act}
+				dirty={
+					label.trim() !== (st.displayName ?? "") ||
+					prefix.trim().toUpperCase() !== (st.taskIdPrefix ?? "")
+				}
+				save={async () => {
+					const r = await send({
+						displayName: label.trim() || null,
+						taskIdPrefix: prefix.trim() || null,
+					});
+					if (r.name !== project.name)
+						settingsNavigate(`${SETTINGS_HASH}/${r.name}`);
+				}}
+				title="Identity"
+				status={
+					project.github !== null
+						? { label: "GitHub", tone: "ok" }
+						: project.gitless
+							? { label: "No git", tone: "off" }
+							: { label: "Local git", tone: "off" }
+				}
+			>
+				{(save, ident) => (
+					<>
+						<DefRow
+							name="Display name"
+							optional
+							help="A friendly name for the board. The folder and the repo keep their real names."
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										id={labelFieldId}
+										type="text"
+										maxLength={60}
+										value={label}
+										onChange={(e) => setLabel(e.target.value)}
+										placeholder={project.name}
+										aria-label="Display name"
+										aria-invalid={ident.failed || undefined}
+										aria-describedby={
+											ident.failed ? `${labelFieldId}-err` : undefined
+										}
+									/>
+								</label>
+								{ident.failed && (
+									<p
+										className="auth-error"
+										id={`${labelFieldId}-err`}
+										role="alert"
+									>
+										{ident.reason ?? "Not saved"}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						<DefRow
+							name="Task ID prefix"
+							help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle. Cards that already exist keep their ids."
+							shape="empty = from folder name"
+						>
+							<div className="alate-field-stack">
+								<label>
+									<input
+										id={prefixFieldId}
+										type="text"
+										maxLength={8}
+										value={prefix}
+										onChange={(e) => setPrefix(e.target.value)}
+										placeholder={project.taskPrefix}
+										aria-label="Task ID prefix"
+										aria-invalid={ident.failed || undefined}
+										aria-describedby={
+											ident.failed ? `${prefixFieldId}-err` : undefined
+										}
+									/>
+								</label>
+								{ident.failed && (
+									<p
+										className="auth-error"
+										id={`${prefixFieldId}-err`}
+										role="alert"
+									>
+										{ident.reason ?? "Not saved"}
+									</p>
+								)}
+							</div>
+						</DefRow>
+						{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
+						<DefRow
+							name="Folder path"
+							desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
+						>
+							<code>{project.path}</code>
+						</DefRow>
+						{project.github !== null && (
+							<DefRow
+								name="GitHub"
+								desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
+							>
+								<a
+									href={project.github}
+									target="_blank"
+									rel="noopener noreferrer"
+								>
+									{project.github}
+								</a>
+							</DefRow>
+						)}
+						{/* One save for the card (OTTR-679): the action row closes the form. */}
+						<div className="alate-def-actions">{save}</div>
+					</>
+				)}
+			</SaveCard>
 			<SettingsCard
 				id="project-icon-section"
 				title="Icon"
@@ -7712,124 +8260,6 @@ function ProjectIdentitySection({
 					</DefRow>
 				</div>
 			</SettingsCard>
-			{/* Both typed fields save through one footer Save: a prefix change renames the
-				project route, so one deliberate save for the card fits. */}
-			<SaveCard
-				id="project-identity-section"
-				act={act}
-				dirty={
-					label.trim() !== (st.displayName ?? "") ||
-					prefix.trim().toUpperCase() !== (st.taskIdPrefix ?? "")
-				}
-				save={async () => {
-					const r = await send({
-						displayName: label.trim() || null,
-						taskIdPrefix: prefix.trim() || null,
-					});
-					if (r.name !== project.name)
-						settingsNavigate(`${SETTINGS_HASH}/${r.name}`);
-				}}
-				title="Identity"
-				status={
-					project.github !== null
-						? { label: "GitHub", tone: "ok" }
-						: project.gitless
-							? { label: "No git", tone: "off" }
-							: { label: "Local git", tone: "off" }
-				}
-			>
-				{(save, ident) => (
-					<>
-						<DefRow
-							name="Display name"
-							optional
-							help="A friendly name for the board. The folder and the repo keep their real names."
-						>
-							<div className="alate-field-stack">
-								<label>
-									<input
-										id={labelFieldId}
-										type="text"
-										maxLength={60}
-										value={label}
-										onChange={(e) => setLabel(e.target.value)}
-										placeholder={project.name}
-										aria-label="Display name"
-										aria-invalid={ident.failed || undefined}
-										aria-describedby={
-											ident.failed ? `${labelFieldId}-err` : undefined
-										}
-									/>
-								</label>
-								{ident.failed && (
-									<p
-										className="auth-error"
-										id={`${labelFieldId}-err`}
-										role="alert"
-									>
-										{ident.reason ?? "Not saved"}
-									</p>
-								)}
-							</div>
-						</DefRow>
-						<DefRow
-							name="Task ID prefix"
-							help="The handle in task ids, like OTTR in OTTR-429. Empty uses the folder-derived handle. Cards that already exist keep their ids."
-							shape="empty = from folder name"
-						>
-							<div className="alate-field-stack">
-								<label>
-									<input
-										id={prefixFieldId}
-										type="text"
-										maxLength={8}
-										value={prefix}
-										onChange={(e) => setPrefix(e.target.value)}
-										placeholder={project.taskPrefix}
-										aria-label="Task ID prefix"
-										aria-invalid={ident.failed || undefined}
-										aria-describedby={
-											ident.failed ? `${prefixFieldId}-err` : undefined
-										}
-									/>
-								</label>
-								{ident.failed && (
-									<p
-										className="auth-error"
-										id={`${prefixFieldId}-err`}
-										role="alert"
-									>
-										{ident.reason ?? "Not saved"}
-									</p>
-								)}
-							</div>
-						</DefRow>
-						{/* Facts, not fields: the folder and the GitHub repo are fixed at add time. */}
-						<DefRow
-							name="Folder path"
-							desc="Where the project lives on the board's machine. Ottr sets it when you add the project."
-						>
-							<code>{project.path}</code>
-						</DefRow>
-						{project.github !== null && (
-							<DefRow
-								name="GitHub"
-								desc="The project's GitHub repository. GitHub-only features, such as PR reviews and fork research, use it."
-							>
-								<a
-									href={project.github}
-									target="_blank"
-									rel="noopener noreferrer"
-								>
-									{project.github}
-								</a>
-							</DefRow>
-						)}
-						{/* One save for the card (OTTR-679): the action row closes the form. */}
-						<div className="alate-def-actions">{save}</div>
-					</>
-				)}
-			</SaveCard>
 		</section>
 	);
 }
@@ -7855,6 +8285,7 @@ function ProjectSlotsSection({
 	imagesMax,
 	keepDays,
 	branchFieldId,
+	hosted,
 }: {
 	project: ProjectView;
 	st: ProjectView["settings"];
@@ -7875,6 +8306,8 @@ function ProjectSlotsSection({
 	imagesMax: number;
 	keepDays: number;
 	branchFieldId: string;
+	/** Hosted mode runs no vm-runner switch (it sat on the hidden Updates card). */
+	hosted: boolean;
 }) {
 	return (
 		<section
@@ -7916,6 +8349,16 @@ function ProjectSlotsSection({
 								/>
 							</label>
 						</DefRow>
+						{!hosted && (
+							<CheckRow
+								name="Run work turns in microVMs"
+								desc={microVmDesc(project, st.microVm)}
+								checked={st.microVm}
+								disabled={!project.vmRunner.ok && !st.microVm}
+								save={(v) => send({ microVm: v })}
+								act={act}
+							/>
+						)}
 					</>
 				)}
 			</SaveCard>
@@ -8049,7 +8492,6 @@ function ProjectSlotsSection({
 					</>
 				)}
 			</SaveCard>
-			<ProjectJiraSection project={project} send={send} act={act} />
 		</section>
 	);
 }
@@ -8286,9 +8728,10 @@ export function ProjectSettingsForm({
 	act: Act;
 	/** Opens a card in the board drawer: the Reviews card's counter links its review card. */
 	openTask: (id: string) => void;
-	/** Hosted mode (docs/specs/hosted-mode.md): the Updates card is hidden. */
+	/** Hosted mode (docs/specs/hosted-mode.md): the merge, watch and proposal cards are hidden. */
 	hosted?: boolean;
 }) {
+	const shownP = (id: string): boolean => !hostedHidden(hosted === true, id);
 	const [mp, setMp] = useState(
 		project.settings.maxParallel === null
 			? ""
@@ -8417,7 +8860,21 @@ export function ProjectSettingsForm({
 				imagesMax={imagesMax}
 				keepDays={keepDays}
 				branchFieldId={branchFieldId}
+				hosted={hosted === true}
 			/>
+			{shownP("project-merging-section") && (
+				<section
+					className="settings-group"
+					id="project-merging-group"
+					aria-labelledby="project-merging-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="project-merging-group-title">
+						Merging
+					</h2>
+					<ProjectMergingCard project={project} st={st} send={send} act={act} />
+				</section>
+			)}
 			<section
 				className="settings-group"
 				id="project-reviews-group"
@@ -8440,18 +8897,33 @@ export function ProjectSettingsForm({
 					tasks={tasks}
 					openTask={openTask}
 				/>
-				{!hostedHidden(hosted === true, "project-updates-section") && (
-					<ProjectUpdatesCard
+			</section>
+			{shownP("project-watches-section") && (
+				<section
+					className="settings-group"
+					id="project-cards-group"
+					aria-labelledby="project-cards-group-title"
+					tabIndex={-1}
+				>
+					<h2 className="settings-group-title" id="project-cards-group-title">
+						New cards
+					</h2>
+					<ProjectWatchesCard
 						project={project}
 						st={st}
 						send={send}
 						privateTag={privateTag}
 						privateNote={privateNote}
+						act={act}
+					/>
+					<ProjectProposalsCard
+						st={st}
+						send={send}
 						trendingScan={trendingScan}
 						act={act}
 					/>
-				)}
-			</section>
+				</section>
+			)}
 			{setupOpen && (
 				<SetupWizardModal
 					project={project}
@@ -8468,13 +8940,17 @@ export function ProjectSettingsForm({
 			)}
 			<section
 				className="settings-group"
-				id="project-git-group"
-				aria-labelledby="project-git-group-title"
+				id="project-integrations-group"
+				aria-labelledby="project-integrations-group-title"
 				tabIndex={-1}
 			>
-				<h2 className="settings-group-title" id="project-git-group-title">
-					Git
+				<h2
+					className="settings-group-title"
+					id="project-integrations-group-title"
+				>
+					Integrations
 				</h2>
+				<ProjectJiraSection project={project} send={send} act={act} />
 				<SshKeySection project={project} />
 			</section>
 			<section

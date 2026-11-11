@@ -435,7 +435,7 @@ services:
     logging: *logging
     healthcheck: *worker-healthcheck
     # Guest memory is firecracker's own memory, counted in this container: the limit must
-    # cover OTTR_VM_MAX x OTTR_VM_MEM (2 x 8g by default) plus the runner and its disk
+    # cover OTTR_VM_MAX x OTTR_VM_MEM (10 x 8g by default) plus the runner and its disk
     # builds, or the kernel kills a VM mid-turn. Raise it with either value.
     mem_limit: ${OTTR_VM_RUNNER_MEM_LIMIT:-20g}
     # The only privileges it gets, no `privileged`:
@@ -460,7 +460,7 @@ services:
       # The same server-to-worker auth as the workers (x-otwr-token on every call).
       OTTR_WORKER_TOKEN: ${OTTR_WORKER_TOKEN:?set OTTR_WORKER_TOKEN to a random secret}
       # VMs at once; one more /run answers 503 busy, and the card waits for a free slot.
-      OTTR_VM_MAX: ${OTTR_VM_MAX:-2}
+      OTTR_VM_MAX: ${OTTR_VM_MAX:-10}
       OTTR_VM_VCPUS: ${OTTR_VM_VCPUS:-2}
       OTTR_VM_MEM: ${OTTR_VM_MEM:-8g} # per VM: 8g, 8192m or bytes
       OTTR_VM_DISK: ${OTTR_VM_DISK:-20g} # per VM scratch disk (sparse)

@@ -896,7 +896,7 @@ export interface ProjectView {
 	vmRunner: VmRunnerHealth;
 	/** The origin remote sits on a *.ghe.com tenant the configured GitHub host does not name,
 	 * so every GitHub feature stays off: the notice names that tenant, to set under
-	 * Settings → Git hosts → GitHub host. Null when the features are on or the origin is
+	 * Settings → GitHub → GitHub host. Null when the features are on or the origin is
 	 * not a ghe.com tenant. */
 	githubHostNotice: string | null;
 	/** OTTR-675: true when the target branch requires pull requests (a pull_request

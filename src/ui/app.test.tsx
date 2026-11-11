@@ -2103,18 +2103,22 @@ describe("settings TOC", () => {
 	test("groups and sections follow the contract order", () => {
 		expect(SETTINGS_TOC.map((g) => g.label)).toEqual([
 			"Board",
-			"Access",
-			"Git and secrets",
 			"Agents",
+			"Workflow",
+			"Agent environment",
+			"Git and integrations",
+			"Access and usage",
 		]);
 		expect(SETTINGS_TOC.map((g) => g.sections.map((s) => s.label))).toEqual([
-			["Runners", "Projects", "Notifications"],
+			["Projects", "Notifications"],
+			["Provider sign-in", "Model roles", "Runners"],
+			["Checks", "Automation"],
+			["Env", "Alate", "Hindsight"],
+			["GitHub", "Other git hosts", "Git identity", "Jira connections"],
 			["API key", "Session", "omp usage"],
-			["Git hosts", "Commit identity", "Env", "Jira connections"],
-			["Provider sign-in", "Model roles", "Alate", "Hindsight"],
 		]);
 	});
-	test("General page renders each id once, one h1, TOC in order, no GitHub card title", () => {
+	test("General page renders each id once, one h1, TOC in order, a GitHub card title", () => {
 		const html = renderToStaticMarkup(
 			<SettingsPage
 				projects={[]}
@@ -2148,16 +2152,12 @@ describe("settings TOC", () => {
 		const tocLabels = [
 			...nav.matchAll(/class="smap-row"[^>]*>([^<]*)<\/button>/g),
 		].map((m) => m[1]);
+		// The map shows groups and cards only; sub-blocks stay deep-link targets.
 		expect(tocLabels).toEqual(
-			SETTINGS_TOC.flatMap((g) => [
-				g.label,
-				...g.sections.flatMap((s) => [
-					s.label,
-					...blocks(s).map((b) => b.label),
-				]),
-			]),
+			SETTINGS_TOC.flatMap((g) => [g.label, ...g.sections.map((s) => s.label)]),
 		);
-		expect(html).not.toMatch(/<h[23][^>]*>GitHub<\/h[23]>/);
+		// GitHub is its own card; the other git hosts and the Git identity follow it.
+		expect(html).toMatch(/<h3[^>]*>GitHub<\/h3>/);
 	});
 });
 
@@ -7681,7 +7681,7 @@ describe("ProjectBoard sync-commit advisories", () => {
 		expect(html).toContain("GitHub features off: set GitHub host to");
 		expect(html).toContain("<code>acme.ghe.com</code>");
 		expect(html).toContain('class="notif-link"');
-		expect(html).toContain("Settings → Git hosts → GitHub host");
+		expect(html).toContain("Settings → GitHub → GitHub host");
 	});
 
 	test("a clean project renders neither advisory", () => {
@@ -8552,7 +8552,9 @@ describe("AuthPage setup form", () => {
 			const hints = [...container.querySelectorAll(".hint")].map(
 				(h) => h.textContent ?? "",
 			);
-			expect(hints.some((t) => t.includes("Settings → Git hosts"))).toBe(true);
+			expect(hints.some((t) => t.includes("Settings → Other git hosts"))).toBe(
+				true,
+			);
 		} finally {
 			await unmount();
 		}
@@ -8641,7 +8643,9 @@ describe("AuthPage setup form", () => {
 			expect(hostPosts(posts)).toHaveLength(1);
 			const alert = container.querySelector('[role="alert"]');
 			expect(alert?.textContent ?? "").toContain("bare hostname");
-			expect(alert?.textContent ?? "").toContain("Settings → Git hosts");
+			expect(alert?.textContent ?? "").toContain(
+				"Settings → GitHub → GitHub host",
+			);
 			expect(reloadCalls.n).toBe(0);
 		} finally {
 			await unmount();

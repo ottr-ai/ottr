@@ -359,7 +359,7 @@ export async function checkAppInstalls(deps: {
 export function appCheckWarning(check: AppCheck | null): string | null {
 	if (check === null) return null;
 	if (check.error !== null)
-		return `The GitHub App check failed (${check.error}). PR reviews can post under your own identity: check the App ID and key under Settings - Git hosts.`;
+		return `The GitHub App check failed (${check.error}). PR reviews can post under your own identity: check the App ID and key under Settings - GitHub App.`;
 	const parts: string[] = [];
 	if (check.missing.length > 0) {
 		const app = check.name ?? "The GitHub App";

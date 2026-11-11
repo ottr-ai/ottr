@@ -956,6 +956,107 @@ export function seedDemo(
 	ensureAdmin(stateDir);
 }
 
+/** The data repo's omp config.yml on the demo board: the roles the Model roles editor shows,
+ * also written as the fixture agent dir's own config, so the pickers mark the same roles. */
+const DEMO_CONFIG_YML = `modelRoles:
+  default: anthropic/claude-sonnet-5-5:high
+  slow: anthropic/claude-opus-5-5:medium
+  plan: anthropic/claude-opus-5-5:medium
+  smol: openai-codex/gpt-6-luna:max
+  commit: openai-codex/gpt-6-luna:max
+  task: anthropic/claude-sonnet-5-5
+retry:
+  fallbackChains:
+    slow:
+      - openai-codex/gpt-6.1-sol:max
+`;
+
+/**
+ * A fixture omp agent dir for Settings → Provider sign-in: an agent.db with invented sign-ins
+ * (two lent OAuth logins, two API keys, one OAuth login that omp disabled) and DEMO_CONFIG_YML.
+ * The dev board pins PI_CODING_AGENT_DIR here, so a demo Log out never signs the real home out.
+ * Rebuilt on every boot; returns the dir.
+ */
+export function seedDemoOmp(root: string): string {
+	const dir = join(root, "omp-agent");
+	rmSync(dir, { recursive: true, force: true });
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(join(dir, "config.yml"), DEMO_CONFIG_YML);
+	const db = new Database(join(dir, "agent.db"));
+	db.run(
+		"CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT, data TEXT, disabled_cause TEXT, created_at INTEGER, updated_at INTEGER)",
+	);
+	const at = Math.floor(Date.now() / 1000) - 3 * 24 * 3600;
+	const rows: Array<[string, string, string | null]> = [
+		["anthropic", "oauth", null],
+		["openai-codex", "oauth", null],
+		["zai", "api_key", null],
+		["deepseek", "api_key", null],
+		[
+			"kimi-code",
+			"oauth",
+			'oauth refresh failed: 400 {"error":"invalid_grant"}',
+		],
+	];
+	for (const [provider, kind, cause] of rows)
+		db.run(
+			"INSERT INTO auth_credentials (provider, credential_type, data, disabled_cause, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+			[
+				provider,
+				kind,
+				JSON.stringify({ demo: true, authorizedAt: at * 1000 }),
+				cause,
+				at,
+				at,
+			],
+		);
+	db.close();
+	return dir;
+}
+
+/**
+ * A stand-in alate server on loopback for Settings → Model roles: a git-folder data source
+ * holding DEMO_CONFIG_YML in memory. A save checks `base` like alate does and answers a fake
+ * commit; nothing touches disk or a real data repo. Returns its URL.
+ */
+export function startDemoAlate(root: string): string {
+	const path = join(root, "agent-data");
+	const source = { kind: "path", name: path, importedSha: "" };
+	const file = "user/omp/agent/config.yml";
+	const sha = (s: string): string =>
+		new Bun.CryptoHasher("sha256").update(s).digest("hex");
+	let content = DEMO_CONFIG_YML;
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(req) {
+			const url = new URL(req.url);
+			const route = `${req.method} ${url.pathname}`;
+			if (route === "GET /health") return Response.json({ ok: true, path });
+			if (route === "GET /api/state") return Response.json({ source });
+			if (route === "POST /api/import")
+				return Response.json({ state: { source } });
+			if (route === "GET /api/file" && url.searchParams.get("path") === file)
+				return Response.json({ content, hash: sha(content) });
+			if (route === "PUT /api/file") {
+				const body = (await req.json()) as { content?: string; base?: string };
+				if (body.base !== sha(content))
+					return Response.json({ error: "file changed" }, { status: 409 });
+				content = String(body.content);
+				return Response.json({
+					commit: sha(content).slice(0, 40),
+					pushed: true,
+				});
+			}
+			return Response.json(
+				{ error: `demo alate does not simulate ${route}` },
+				{ status: 404 },
+			);
+		},
+	});
+	return `http://127.0.0.1:${server.port}`;
+}
+
 if (import.meta.main) {
 	const positional = process.argv.slice(2).find((a) => !a.startsWith("--"));
 	const root = resolveRoot(positional);

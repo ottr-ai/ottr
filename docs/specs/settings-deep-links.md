@@ -37,7 +37,7 @@ the URL and moves the settings links that still speak the removed hash scheme.
 - Server warning lines linkify phrases of the form `Settings → <label>` and
   `Settings - <label>` (separators `→`, `->`, `-`, `–`, `—`). A label resolves by
   exact match against the General page's TOC labels, sections and blocks. A chain
-  like `Settings → Git hosts → GitHub token` links the whole phrase to the deepest
+  like `Settings → GitHub → GitHub token` links the whole phrase to the deepest
   resolved id. An unresolvable label stays plain text. The existing `https://` rule
   is unchanged. An internal link navigates in-tab on a plain click; middle and
   modifier clicks open the href, so the URL must be a real deep link.
@@ -56,10 +56,11 @@ the URL and moves the settings links that still speak the removed hash scheme.
   matching TOC row (`aria-current="location"`) and scrolls to it; a popstate to
   another fragment moves the pin; `openSettingsSection` pushes `path#fragment`.
 - `app.test.tsx`: `warningLinks` renders the GitHub App check message's
-  `Settings - Git hosts` as an anchor to `/settings#git-hosts-section` with the
-  trailing period outside; a nested arrow chain links to the block id; an unknown
+  `Settings - GitHub App` as an anchor to `/settings#github-app-block` with the
+  trailing period outside, and the renamed-card label `Settings - Git hosts` of a
+  stored notice still links to `/settings#git-hosts-section`; a nested arrow chain links to the block id; an unknown
   label stays text; `https://` links keep `target="_blank"`.
-- Browser: a cold `/settings#git-hosts-section` lands on General at Git hosts; the
+- Browser: a cold `/settings#git-hosts-section` lands on General at GitHub; the
   advisory link opens it; the sidebar switches pages; Back walks the entries.
 
 ## Non-goals

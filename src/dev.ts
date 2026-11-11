@@ -28,7 +28,9 @@ export function devRoot(): string {
  */
 export async function bootstrap(): Promise<void> {
 	process.env.PORT ??= "5747"; // outside 4700-4899, where scripts/e2e-steer.js picks its ports
-	const { heldDb, seedDemo } = await import("../scripts/demo-data.ts");
+	const { heldDb, seedDemo, seedDemoOmp, startDemoAlate } = await import(
+		"../scripts/demo-data.ts"
+	);
 	let root = devRoot();
 	// A board that still runs on a pinned OTTR_DEV_ROOT holds its dbs under an exclusive
 	// lock, and server.ts refuses a second instance. This board then seeds its own root
@@ -61,6 +63,11 @@ export async function bootstrap(): Promise<void> {
 			writeFileSync(resolve(dir, "env.txt"), `${names.join("\n")}\n`);
 		}
 	}
+	// Settings → Provider sign-in reads omp's store and Model roles reads alate: the dev board
+	// gets an invented store and a loopback stand-in alate, never the real home's sign-ins.
+	process.env.PI_CODING_AGENT_DIR = seedDemoOmp(root);
+	process.env.ALATE_URL = startDemoAlate(root);
+	process.env.ALATE_API_KEY = "demo-key";
 	// Fabricated running/preparing cards must survive recoverRestarted and sweepLostTurns, and
 	// queued ones must never start: no agent processes exist here. OTTR_DEMO blocks all three.
 	process.env.OTTR_DEMO = "1";

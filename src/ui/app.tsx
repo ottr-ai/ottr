@@ -4193,7 +4193,7 @@ function ProjectAdvisories(p: {
 								className="notif-link"
 								onClick={() => openSettingsSection("github-host-block")}
 							>
-								Settings → Git hosts → GitHub host
+								Settings → GitHub → GitHub host
 							</button>
 							.
 						</span>
@@ -7194,7 +7194,8 @@ function AddUrlPanel({
 						Global key
 						{(hosts?.globalKey ?? null) === null && (
 							<span className="hint">
-								No global key exists; set one in Settings → Git hosts.
+								No global key exists; set one in Settings → Git identity → SSH
+								key.
 							</span>
 						)}
 					</label>
@@ -7279,7 +7280,7 @@ function GhRepoHint({
 		</p>
 	) : (
 		<p className="hint trust-warn" role="status">
-			{/* Hosted mode hides the Git hosts card: the control plane owns git credentials. */}
+			{/* Hosted mode hides the git credential cards: the control plane owns git credentials. */}
 			{hostedHidden(hosted, "github-token-block") ? (
 				<>
 					No Git host is signed in, so Ottr cannot create the repo. Uncheck the
@@ -7288,7 +7289,8 @@ function GhRepoHint({
 			) : (
 				<>
 					No Git host is signed in, so Ottr cannot create the repo. Add a token
-					in Settings → Git hosts, or uncheck the box for a local repo only.{" "}
+					in Settings → Other git hosts, or uncheck the box for a local repo
+					only.{" "}
 					<button
 						type="button"
 						className="notif-link"
@@ -13804,7 +13806,7 @@ export function AuthPage({
 							// The admin exists and the session works; only the host save failed.
 							const msg = err instanceof Error ? err.message : "Request failed";
 							throw new Error(
-								`${msg} You can set the GitHub host later under Settings → Git hosts.`,
+								`${msg} You can set the GitHub host later under Settings → GitHub → GitHub host.`,
 							);
 						},
 					);
@@ -13885,7 +13887,8 @@ export function AuthPage({
 							<span className="hint" id={tokenHint}>
 								Serves the GitHub API features (PR reviews, CI watch,
 								Dependabot, releases, token expiry) and gh. Git on hosts other
-								than github.com needs its own token under Settings → Git hosts.
+								than github.com needs its own token under Settings → Other git
+								hosts.
 							</span>
 						</label>
 					)}
@@ -14187,8 +14190,8 @@ export function RailRows({
 
 /** General-page TOC labels (sections and blocks) mapped to their scroll-target ids;
  * the warning-link grammar below matches exactly these labels. */
-const SETTINGS_LABEL_IDS: ReadonlyMap<string, string> = new Map(
-	SETTINGS_TOC.flatMap((group) =>
+const SETTINGS_LABEL_IDS: ReadonlyMap<string, string> = new Map([
+	...SETTINGS_TOC.flatMap((group) =>
 		group.sections.flatMap((section) => [
 			[section.label, section.id] as const,
 			...("blocks" in section
@@ -14196,7 +14199,11 @@ const SETTINGS_LABEL_IDS: ReadonlyMap<string, string> = new Map(
 				: []),
 		]),
 	),
-);
+	// Labels of renamed cards: stored notices still name them.
+	["Git hosts", "git-hosts-section"],
+	["Other host tokens", "host-tokens-block"],
+	["Global SSH key", "ssh-key-block"],
+]);
 
 const SETTINGS_SEP = String.raw`\s*(?:→|->|–|—|-)\s*`;
 const SETTINGS_LABELS = [...SETTINGS_LABEL_IDS.keys()]
@@ -14233,7 +14240,7 @@ function settingsPhraseId(phrase: string): string {
 
 /** Links inside a server warning: https:// URLs open in a new tab, and a
  * `Settings <sep> <label>` phrase opens that General settings section in-tab (a
- * chain like `Settings → Git hosts → GitHub token` anchors the whole phrase to
+ * chain like `Settings → GitHub → GitHub token` anchors the whole phrase to
  * the deepest step). A trailing sentence period stays outside the anchor so the
  * href stays valid. In hosted mode a phrase that names a hidden card stays plain text. */
 export function warningLinks(text: string, hosted = false): ReactNode {
@@ -16234,6 +16241,8 @@ export function App() {
 			return () => mq.removeEventListener("change", apply);
 		}
 	}, [theme]);
+	const applied = theme === "system" ? (sysLight ? "light" : "dark") : theme;
+	const themeName = `Theme: ${THEME_META[applied].label}${theme === "system" ? " (match system)" : ""}`;
 
 	// Back/Forward walk the entries pushState()d by openTask and the view links; both the
 	// view and the drawer follow the entry. A vanished card id self-cleans: the drawer only
@@ -16768,10 +16777,11 @@ export function App() {
 					type="button"
 					className="icon bar-theme"
 					popoverTarget="theme-pop"
-					title="Theme"
-					aria-label="Theme"
+					title={themeName}
+					aria-label={themeName}
 				>
-					<Icon name="monitor" />
+					{/* The applied theme, also while "Match system" decides it. */}
+					<Icon name={THEME_META[applied].icon} />
 				</button>
 				<div
 					id="theme-pop"

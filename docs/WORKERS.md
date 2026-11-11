@@ -36,7 +36,7 @@ or running. A failed attempt waits an hour before it tries
 again; the error shows in the Alate settings section.
 
 At run time git authenticates with the board's GitHub token (asked for at
-onboarding, replaced under **Settings → Git hosts → GitHub token**): the server exports it as
+onboarding, replaced under **Settings → GitHub → GitHub token**): the server exports it as
 `GH_TOKEN`, and the image's git credential helper hands it to git for
 github.com remotes.
 
@@ -673,7 +673,7 @@ real podman.
   with 401.
 - Server: `OTTR_GITHUB_HOST` names the GitHub host of the board. The default
   is `github.com`, and an empty value keeps the default. You can also set it
-  in Settings → Git hosts → GitHub host; a saved value wins over the env
+  in Settings → GitHub → GitHub host; a saved value wins over the env
   until cleared. Compose reads the
   value from the host shell or the compose env file and passes it to the
   server only; workers never use it. Refer to the README row "GitHub host".
@@ -794,7 +794,7 @@ Runner env (on the `vm-runner` service), with defaults:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `OTTR_VM_MAX` | `2` | VMs that run at once; one more turn gets the busy answer |
+| `OTTR_VM_MAX` | `10` | VMs that run at once; one more turn gets the busy answer |
 | `OTTR_VM_VCPUS` | `2` | vCPUs per VM |
 | `OTTR_VM_MEM` | `8g` | guest RAM per VM (`8g`, `8192m` or bytes) |
 | `OTTR_VM_DISK` | `20g` | size of each VM's scratch disk, the turn's whole writable space |
@@ -1006,7 +1006,7 @@ and `GITHUB_TOKEN`.
 
 A project on a git host other than GitHub clones, fetches and pushes with the
 same rule: credentials stay on the server. Two credential kinds exist (both
-configured under **Settings → Git hosts**):
+configured under **Settings → Other git hosts** and **Settings → Git identity**):
 
 - HTTPS tokens: stored per host in the global config row. Server-side git
   reaches them through env-scoped credential helpers — `GIT_CONFIG_COUNT`,
@@ -1130,7 +1130,7 @@ is on the board-config volume no worker mounts), so a turn's git reads the share
 home's `~/.gitconfig` and falls back to a default commit identity in its env (git
 author and committer `Ottr <ottr@localhost>`), set only for the fields the turn's git
 config leaves empty, so a configured `~/.gitconfig` or project identity wins.
-Settings → "Git and secrets" →
+Settings → "Git identity" →
 "Commit identity" changes it for the board's git calls and every turn.
 gh starts empty on purpose, because gh config can name
 commands. When a pinned path is inside `$HOME`, the entry script refuses to start. It
@@ -1522,7 +1522,7 @@ A snapshot does not hold these items. After a restore, do this for each:
 
 - SSH keys and `known_hosts`: they are files in `OTTR_SSH_DIR` (`/app/.tasks/ssh` on
   `ottr-state` in compose). When they are lost, add the keys again under
-  **Settings → Git hosts** (a project key: in the **Settings** of the project) and confirm
+  **Settings → Git identity → SSH key** (a project key: in the **Settings** of the project) and confirm
   the host-key fingerprints again.
 - The Jira sealing key `.tasks/secret.key` (used when `OTTR_SECRET_KEY` is not set): when
   the file is lost, the board makes a new key at boot. The new key cannot open the Jira
