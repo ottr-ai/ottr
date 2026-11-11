@@ -6153,11 +6153,14 @@ export function createTurnLoop(
 			await pushToSourcePr(st, n, src, prBranch, tip);
 			return;
 		}
-		// A Dependabot PR with fixes on top of its head cannot take a board push (the bot
-		// would abandon the PR), but the fixes are ready work: ship them as their own PR
-		// instead of parking them for a manual carry.
-		if (onHead && src.dependabot) {
-			await openFollowUpPr(st, n, src, prBranch, tip);
+		// A Dependabot PR cannot take a board push (the bot would abandon the PR), but
+		// the card's work is ready: ship it as its own PR — on top of the PR head the
+		// follow-up bases on the bot branch, so the fixes land with the bump; a
+		// cherry-picked or rebased branch no longer descends from the head, so it
+		// bases on the target and carries the rebased work — once the bump merges,
+		// the diff reduces to the fixes.
+		if (src.dependabot) {
+			await openFollowUpPr(st, n, src, prBranch, tip, onHead);
 			return;
 		}
 		await parkOnSourcePr(st, n, src);
@@ -6331,15 +6334,19 @@ export function createTurnLoop(
 
 	/** Ships a Dependabot card's fixes as a follow-up PR: the bot owns the source PR's
 	 * branch (a board push would make it abandon the PR), so the card branch pushes to
-	 * its own origin name and opens a PR against the Dependabot branch (fixes land with
-	 * the bump) or the target branch (a legacy card without the head name; fixes land
-	 * after the bump merges). The source PR gets one best-effort comment with the link. */
+	 * its own origin name and opens a PR. Fixes on top of the PR head base on the
+	 * Dependabot branch, so they land with the bump; a cherry-picked or rebased branch
+	 * (no longer descended from the head) and a legacy card without the head name base
+	 * on the target branch — the PR carries the rebased work, and once the bump merges
+	 * the diff reduces to the fixes. The source PR gets one best-effort comment with
+	 * the link. */
 	async function openFollowUpPr(
 		st: TurnSettle,
 		n: number,
 		src: SourcePrRef,
 		prBranch: string,
 		tip: string,
+		onHead: boolean,
 	): Promise<void> {
 		const pushBranch = ops.pushBranch;
 		if (pushBranch === undefined) {
@@ -6372,9 +6379,14 @@ export function createTurnLoop(
 			return;
 		}
 		st.log(`- pushed ${prBranch} (the fixes beyond source PR #${n})`);
-		// With the head branch known, the fixes land with the bump; a legacy card falls
-		// back to the target, where they land after the bump merges.
-		const base = src.headRef ?? st.header.target.replace(/^origin\//, "");
+		// On top of the PR head the fixes land with the bump; a diverged branch or a
+		// legacy card without the head name bases on the target, where they land after
+		// the bump merges.
+		const base =
+			onHead && src.headRef !== null
+				? src.headRef
+				: st.header.target.replace(/^origin\//, "");
+		const withBump = onHead && src.headRef !== null;
 		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
 		if (repo === null) {
 			st.prNext = {
@@ -6392,7 +6404,7 @@ export function createTurnLoop(
 				branch: prBranch,
 				base,
 				title: st.task.title,
-				body: `${prBody(st.task, st.result.outcome)}\n\nFixes beyond source PR #${n} (${src.url ?? "URL unknown"}); base ${base} so they land with the bump.`,
+				body: `${prBody(st.task, st.result.outcome)}\n\nFixes beyond source PR #${n} (${src.url ?? "URL unknown"}); base ${base} so they land ${withBump ? "with the bump" : "after the bump merges"}.`,
 				// Hosted: gh takes the project's minted token, never GH_TOKEN.
 				...(ops.hosted !== undefined && {
 					gh: await hostedGh(st.e.path, st.header.settings.originUrl),

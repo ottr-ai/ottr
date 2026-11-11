@@ -233,16 +233,18 @@ step checks the source before it ever opens a PR:
 - Fixes beyond a Dependabot PR's head (OTTR-809) ship as a follow-up pull
   request. The ship step pushes the card branch to origin under its own
   name (never to the bot's branch) and opens one PR with the card branch as
-  the head and the Dependabot branch as the base, so the fixes merge with
-  the bump. When the head branch name is unknown (a legacy card resolved at
-  ship time), the base is the target branch instead, and the fixes land
-  after the bump merges. One comment on the source PR links the follow-up.
-  The card stores the follow-up in `follow_up_pr_number`/`follow_up_pr_url`
-  (additive columns migrated like the PR fields above) and waits in
-  `merging`/`idle` until both PRs merge; a re-ship adopts the open
-  follow-up instead of opening another one.
-- Everything else — a fork head without Dependabot, a diverged branch —
-  comments on the source PR (`@dependabot rebase` for Dependabot, a note
+  the head. The base is the Dependabot branch when the card branch descends
+  from the PR head, so the fixes merge with the bump; a cherry-picked or
+  rebased branch that no longer descends from the head, and a legacy card
+  without the head name, base on the target branch instead — the PR carries
+  the rebased work, and once the bump merges the diff reduces to the fixes.
+  One comment on the source PR links the follow-up. The card stores the
+  follow-up in `follow_up_pr_number`/`follow_up_pr_url` (additive columns
+  migrated like the PR fields above) and waits in `merging`/`idle` until
+  both PRs merge; a re-ship adopts the open follow-up instead of opening
+  another one.
+- Everything else — a fork head without Dependabot —
+  comments on the source PR (a note
   about the parked fixes otherwise) and parks the card `merging`/`needs_you`
   with a reason that names the PR and the card branch. The park stamps the
   resolved source PR fields onto the row (a legacy card carries none until

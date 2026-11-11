@@ -110,6 +110,7 @@ import {
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
 	fetchOriginBranch as realFetchOriginBranch,
+	fetchPrHead as realFetchPrHead,
 	prIntegrated as realPrIntegrated,
 	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
@@ -119,6 +120,7 @@ import {
 	targetCommits as realTargetCommits,
 	targetContains as realTargetContains,
 	trackedFiles as realTrackedFiles,
+	treesEqual as realTreesEqual,
 	unsavedWork as realUnsavedWork,
 	worktreeHusk as realWorktreeHusk,
 	setNetworkGitAuth,
@@ -20887,19 +20889,32 @@ describe("turn PR-mode merge settle", () => {
 		]);
 	});
 
-	test("a diverged Dependabot card branch comments @dependabot rebase and parks (OTTR-760)", async () => {
+	test("a diverged Dependabot card branch ships its fixes as a follow-up PR on the target (OTTR-809)", async () => {
 		const comments: { repo: string; number: number; body: string }[] = [];
+		const opens: {
+			repo: string;
+			owner: string;
+			branch: string;
+			base: string;
+		}[] = [];
+		const pushes: unknown[][] = [];
 		const { store, loop, task } = prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
-			// Diverged: "pr-head" is not an ancestor of "sha-fixed", so no push or PR.
+			// Diverged: the branch cherry-picked the bump onto an advanced target, so
+			// "pr-head" is not an ancestor of "sha-fixed" — no push to the bot branch.
 			targetContains: async () => false,
 			treesEqual: async () => false,
-			pushBranch: async () => {
-				throw new Error("pushBranch must never push to a Dependabot branch");
+			pushBranch: async (...args: unknown[]) => {
+				pushes.push(args);
+				return { status: "pushed" as const, output: "" };
 			},
-			openPr: async () => {
-				throw new Error("openPr must not run for a source-PR card");
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 34, url: "https://github.com/acme/repo/pull/34" },
+				};
 			},
 			prComment: async (o) => {
 				comments.push(o);
@@ -20909,17 +20924,29 @@ describe("turn PR-mode merge settle", () => {
 		store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
-		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toContain("@dependabot");
-		expect(comments).toEqual([
-			{ repo: "acme/repo", number: 20, body: "@dependabot rebase" },
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("idle");
+		// The follow-up bases on the target: the PR carries the rebased work, and
+		// once the bump merges the diff reduces to the fixes.
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			repo: "acme/repo",
+			owner: "acme",
+			branch: "ott/m",
+			base: "main",
+		});
+		expect(pushes).toEqual([
+			[store.path, "ott/m", "https://github.com/acme/repo.git"],
 		]);
-		expect(after.followUpPrNumber).toBe(null);
-		expect(after.prNumber).toBe(null);
-		// The park stamps the source fields: the watch reads Dependabot's rebase
-		// answer off the row even though the card adopted no PR.
-		expect(after.sourcePrNumber).toBe(20);
-		expect(after.sourcePrDependabot).toBe(true);
+		expect(comments).toEqual([
+			{
+				repo: "acme/repo",
+				number: 20,
+				body: expect.stringContaining("#34"),
+			},
+		]);
+		expect(after.prNumber).toBe(20);
+		expect(after.followUpPrNumber).toBe(34);
 	});
 
 	test("a Dependabot card with fixes opens one follow-up PR based on the Dependabot branch and comments its link on the source PR", async () => {
@@ -20982,8 +21009,9 @@ describe("turn PR-mode merge settle", () => {
 		);
 	});
 
-	test("a diverged legacy Dependabot card parks and stamps the source fields (OTTR-781)", async () => {
+	test("a diverged legacy Dependabot card opens the follow-up on the target (OTTR-809)", async () => {
 		const comments: { repo: string; number: number; body: string }[] = [];
+		const opens: { repo: string; branch: string; base: string }[] = [];
 		const { store, loop, task } = prMergeSetup({
 			fetchPrHead: async () => null,
 			targetSha: async (_m: string, ref: string) =>
@@ -20991,11 +21019,13 @@ describe("turn PR-mode merge settle", () => {
 			// Diverged: "head30" is not an ancestor of "sha-fixed".
 			targetContains: async () => false,
 			treesEqual: async () => false,
-			pushBranch: async () => {
-				throw new Error("pushBranch must not run for a Dependabot PR");
-			},
-			openPr: async () => {
-				throw new Error("openPr must not run for a source-PR card");
+			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
+			openPr: async (o) => {
+				opens.push(o);
+				return {
+					ok: true as const,
+					pr: { number: 35, url: "https://github.com/acme/repo/pull/35" },
+				};
 			},
 			prComment: async (o) => {
 				comments.push(o);
@@ -21009,20 +21039,28 @@ describe("turn PR-mode merge settle", () => {
 		await loop.runTurn(store.name, task.id);
 		const after = store.getTask(task.id)!;
 		expect(after.stage).toBe("merging");
-		expect(after.state).toBe("needs_you");
-		expect(after.needsReason).toContain("@dependabot");
+		expect(after.state).toBe("idle");
+		// The legacy path holds no head branch name, so the follow-up bases on the
+		// target branch.
+		expect(opens).toHaveLength(1);
+		expect(opens[0]).toMatchObject({
+			repo: "acme/repo",
+			branch: "ott/m",
+			base: "main",
+		});
 		expect(comments).toEqual([
-			{ repo: "acme/repo", number: 30, body: "@dependabot rebase" },
+			{
+				repo: "acme/repo",
+				number: 30,
+				body: expect.stringContaining("#35"),
+			},
 		]);
-		// The park carries the resolved source onto the row, so the watch can read
-		// Dependabot's answer and a re-ship re-judges the same base.
-		expect(after.prNumber).toBe(null);
-		expect(after.sourcePrNumber).toBe(30);
-		expect(after.sourcePrUrl).toBe("https://github.com/acme/repo/pull/30");
-		expect(after.sourcePrHeadSha).toBe("head30");
-		expect(after.sourcePrHeadRef).toBe(null);
-		expect(after.sourcePrCrossRepo).toBe(false);
-		expect(after.sourcePrDependabot).toBe(true);
+		expect(after.prNumber).toBe(30);
+		expect(after.prHeadSha).toBe("sha-fixed");
+		expect(after.followUpPrNumber).toBe(35);
+		// The card adopted its PR, so the row needs no resolved source fields: a
+		// re-ship resolves the legacy head line again.
+		expect(after.sourcePrNumber).toBe(null);
 	});
 
 	test("a legacy re-ship after a rebase refreshes the head and adopts the PR (OTTR-809)", async () => {
@@ -21079,6 +21117,8 @@ describe("turn PR-mode merge settle", () => {
 	});
 
 	test("a refreshed head survives the park and a later failed fetch (OTTR-809)", async () => {
+		// A cross-repo fork PR parks on a diverged branch (the board can never push
+		// the fork's head), and that park is where the refreshed sha must survive.
 		const fetches: unknown[][] = [];
 		let fetchFails = false;
 		let branchTip = "sha-fixed";
@@ -21088,10 +21128,10 @@ describe("turn PR-mode merge settle", () => {
 				fetches.push(args);
 				return fetchFails ? "network down" : null;
 			},
-			// Round 1: the bot rebased to "fresh-head" but the card branch holds fixes
+			// Round 1: the fork rebased to "fresh-head" but the card branch holds fixes
 			// on the old head, so the branch diverged and the ship parks.
 			targetSha: async (_m: string, ref: string) =>
-				ref === "refs/ottr/pr/30"
+				ref === "refs/ottr/pr/20"
 					? "fresh-head"
 					: ref === "refs/heads/ott/m"
 						? branchTip
@@ -21100,33 +21140,35 @@ describe("turn PR-mode merge settle", () => {
 			targetContains: async (_m: string, sha: string, tip: string) =>
 				sha === "stale-head" && tip === "fresh-head",
 			pushBranch: async () => {
-				throw new Error("pushBranch must not run for a Dependabot PR");
+				throw new Error("pushBranch must not run for a cross-repo source PR");
 			},
 			openPr: async (o) => {
 				opens.push(o);
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
+			prComment: async () => ({ ok: true as const }),
 		});
-		// The card parked once with a stale head; Dependabot rebased since.
-		store.updateTask(task.id, {
-			sourcePrNumber: 30,
-			sourcePrUrl: "https://github.com/acme/repo/pull/30",
-			sourcePrHeadRef: "dependabot/npm_and_yarn/vite-7.1.2",
-			sourcePrHeadSha: "stale-head",
-			sourcePrCrossRepo: false,
-			sourcePrDependabot: true,
-		});
+		store.updateTask(
+			task.id,
+			sourcePr({
+				sourcePrCrossRepo: true,
+				sourcePrDependabot: false,
+				sourcePrHeadRef: "feature",
+				sourcePrNumber: 20,
+			}),
+		);
+		store.updateTask(task.id, { sourcePrHeadSha: "stale-head" });
 		await loop.runTurn(store.name, task.id);
 		const parked = store.getTask(task.id)!;
 		expect(parked.state).toBe("needs_you");
-		expect(parked.needsReason).toContain("@dependabot");
+		expect(parked.needsReason).toContain("Carry them onto the PR by hand.");
 		// The park keeps the refreshed sha; it does not restore the stale one.
 		expect(parked.sourcePrHeadSha).toBe("fresh-head");
 		expect(fetches).toHaveLength(1);
 		expect(opens).toEqual([]);
 
 		// A reply requeues the card; this time the fetch fails, so the ship falls
-		// back to the preserved head. The branch has since rebased onto the fresh
+		// back to the preserved head. The branch has since reset onto the fresh
 		// head, and the ship adopts the PR instead of parking again.
 		fetchFails = true;
 		branchTip = "fresh-head";
@@ -21141,8 +21183,128 @@ describe("turn PR-mode merge settle", () => {
 		expect(opens).toEqual([]);
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
-		expect(after.prNumber).toBe(30);
+		expect(after.prNumber).toBe(20);
 		expect(after.prHeadSha).toBe("fresh-head");
+	});
+
+	test("a cherry-picked bump plus a fix ships as a follow-up PR on real git (OTTR-809)", async () => {
+		// Real git everywhere the ship reads: a bare origin, an advanced target, a
+		// bot head, and a card branch that cherry-picked the bump onto the advanced
+		// target plus one fix commit. The real ops run against the fixture repos
+		// (the store fixture is not a git checkout); only the GitHub calls (openPr,
+		// prComment) are stubbed. Fixtures use their own spawn, never git() under test.
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+		const dir = mkdtempSync(join(tmpdir(), "ottr-809-"));
+		const bare = join(dir, "origin.git");
+		const main = join(dir, "main");
+		try {
+			run(dir, "init", "-q", "--bare", "-b", "main", bare);
+			run(dir, "clone", "-q", bare, main);
+			writeFileSync(join(main, "pkg.json"), '{"v":1}\n');
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "base");
+			run(main, "push", "-q", "origin", "main");
+			run(main, "switch", "-q", "-c", "dep");
+			writeFileSync(join(main, "pkg.json"), '{"v":2}\n');
+			run(main, ...id, "commit", "-am", "bump vite from 5 to 7");
+			const botHead = run(main, "rev-parse", "HEAD");
+			run(main, "push", "-q", "origin", `${botHead}:refs/pull/30/head`);
+			run(main, "switch", "-q", "main");
+			writeFileSync(join(main, "other.txt"), "advance\n");
+			run(main, ...id, "add", ".");
+			run(main, ...id, "commit", "-qm", "advance");
+			// The merge prompt's cherry-pick path: bring the bump onto the advanced
+			// target, then land one fix commit on top.
+			run(main, "switch", "-q", "-c", "ott/m");
+			run(main, ...id, "cherry-pick", botHead);
+			writeFileSync(join(main, "pkg.json"), '{"v":3}\n');
+			run(main, ...id, "commit", "-am", "fix: migrate the biome config");
+			const tip = run(main, "rev-parse", "HEAD");
+
+			const opens: { repo: string; branch: string; base: string }[] = [];
+			const comments: { repo: string; number: number; body: string }[] = [];
+			const { store, loop, task } = prMergeSetup({
+				// Real reads against the fixture repo, however the harness paths them.
+				targetSha: async (_m: string, ref: string) => {
+					const r = Bun.spawnSync(
+						["git", "rev-parse", "--verify", "--quiet", ref],
+						{ cwd: main },
+					);
+					return r.exitCode === 0 ? r.stdout.toString().trim() : null;
+				},
+				targetContains: (_m: string, sha: string, tip: string) =>
+					realTargetContains(main, sha, tip),
+				treesEqual: (_m: string, a: string, b: string) =>
+					realTreesEqual(main, a, b),
+				pushBranch: async (_m: string, branch: string, _o: string) =>
+					pushBranchReal(main, branch, bare),
+				fetchPrHead: async (_m: string, n: number, _url: string) =>
+					realFetchPrHead(main, n, bare),
+				openPr: async (o) => {
+					opens.push(o);
+					return {
+						ok: true as const,
+						pr: { number: 33, url: "https://github.com/acme/repo/pull/33" },
+					};
+				},
+				prComment: async (o) => {
+					comments.push(o);
+					return { ok: true as const };
+				},
+			});
+			store.setSettings({ prMode: true, originUrl: bare });
+			store.updateTask(task.id, {
+				sourcePrNumber: 30,
+				sourcePrUrl: "https://github.com/acme/repo/pull/30",
+				sourcePrHeadSha: botHead,
+				sourcePrHeadRef: "dep",
+				sourcePrCrossRepo: false,
+				sourcePrDependabot: true,
+			});
+			await loop.runTurn(store.name, task.id);
+			const after = store.getTask(task.id)!;
+			// The cherry-picked branch does not descend from the bot head, so the
+			// ancestor check fails — and the fixes still ship as a follow-up PR,
+			// based on the target branch.
+			expect(after.stage).toBe("merging");
+			expect(after.state).toBe("idle");
+			expect(opens).toHaveLength(1);
+			expect(opens[0]).toMatchObject({
+				repo: "acme/repo",
+				owner: "acme",
+				branch: "ott/m",
+				base: "main",
+			});
+			expect(comments).toEqual([
+				{
+					repo: "acme/repo",
+					number: 30,
+					body: expect.stringContaining("#33"),
+				},
+			]);
+			expect(after.prNumber).toBe(30);
+			expect(after.followUpPrNumber).toBe(33);
+			expect(after.prHeadSha).toBe(tip);
+			// The pushed remote branch holds the real card tip.
+			expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
+				`${tip}\trefs/heads/ott/m`,
+			);
+			expect(logText(store, task.id)).toContain(
+				"- follow-up PR #33 opened (base main)",
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
 	});
 
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {
