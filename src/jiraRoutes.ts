@@ -406,8 +406,8 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 			jiraFailure(project, err),
 		);
 		if (issues instanceof Response) return issues;
-		// The last comments and the issue links are read per ticket; a failing call fails
-		// the import with Jira's message, like any other Jira call.
+		// The ticket's comments and the issue links are read per ticket; a failing call
+		// fails the import with Jira's message, like any other Jira call.
 		try {
 			for (const issue of issues.values()) {
 				issue.comments = await allComments(p.conn, issue.key, d.net);
@@ -555,6 +555,16 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 			jiraFailure(name, err),
 		);
 		if (issues instanceof Response) return issues;
+		// The ticket's comments and the issue links are read per ticket, exactly as the
+		// project import does; a failing call fails the import with Jira's message.
+		try {
+			for (const issue of issues.values()) {
+				issue.comments = await allComments(conn, issue.key, d.net);
+				issue.links = await issueLinks(conn, issue.key, d.net);
+			}
+		} catch (err) {
+			return jiraFailure(name, err);
+		}
 		const unavailable = order.filter((k) => !issues.has(k));
 		const filed: { project: string; key: string; task: string }[] = [];
 		const skipped: { project: string; key: string }[] = [];

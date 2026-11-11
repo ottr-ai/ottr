@@ -736,6 +736,56 @@ describe("board-wide search and import", () => {
 		expect(repeat.json.skipped).toEqual([{ project: "p1", key: "BULK-2001" }]);
 	});
 
+	test("a board-wide import reads comments and links into the prompt too", async () => {
+		commentsByKey.set("BULK-3001", [
+			{
+				author: { displayName: "Ada" },
+				created: "2026-10-07T09:00:00.000+0000",
+				body: {
+					type: "doc",
+					version: 1,
+					content: [
+						{
+							type: "paragraph",
+							content: [
+								{ type: "text", text: "Root cause found in the spike" },
+							],
+						},
+					],
+				},
+			},
+		]);
+		linksByKey.set("BULK-3001", [
+			{
+				type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+				outwardIssue: {
+					key: "CMIS-8343",
+					fields: { summary: "the follow-up", status: { name: "Done" } },
+				},
+			},
+		]);
+		seen.length = 0;
+		const r = await boardImport([{ key: "BULK-3001", project: "p1" }]);
+		expect(r.status).toBe(200);
+		expect(r.json.filed).toHaveLength(1);
+		const calls = seen.map((s) => `${s.method} ${s.path}`);
+		expect(calls).toContain(
+			"GET /rest/api/3/issue/BULK-3001/comment?maxResults=100&startAt=0",
+		);
+		expect(calls).toContain(
+			"GET /rest/api/3/issue/BULK-3001?fields=issuelinks",
+		);
+		const task = p1.getTask(r.json.filed[0]?.task ?? "");
+		expect(task?.prompt).toContain(
+			"COMMENTS\n<<<DATA\nAda (2026-10-07T09:00:00.000+0000):\nRoot cause found in the spike\nDATA>>>",
+		);
+		expect(task?.prompt).toContain(
+			"LINKS\n<<<DATA\nblocks: CMIS-8343: the follow-up (Done)\nDATA>>>",
+		);
+		commentsByKey.clear();
+		linksByKey.clear();
+	});
+
 	test("one request can file the same key into two projects", async () => {
 		const r = await boardImport([
 			{ key: "BULK-2002", project: "p2" },
