@@ -280,13 +280,14 @@ function parsePrComments(body: unknown): IssueComment[] {
  * unreadable page number. GitHub's issues-comments endpoint ignores sort and
  * direction and returns ascending ids, so the newest comments sit on that page. */
 function lastPageFromLink(stdout: string): number | null {
-	const sep = stdout.indexOf("\n\n");
+	// gh prints header lines with \r\n and ends the header block with \r\n.
+	const sep = stdout.search(/\r?\n\r?\n/);
 	if (sep < 0) return null;
 	const headers = stdout.slice(0, sep);
 	const line = headers
-		.split("\n")
+		.split(/\r?\n/)
 		.filter((l) => l.toLowerCase().startsWith("link:"))
-		.map((l) => l.slice(5))
+		.map((l) => l.replace(/\r$/, "").slice(5))
 		.find((value) => /<[^>]*>; rel="last"/i.test(value));
 	if (line === undefined) return null;
 	const last = /<([^>]*)>; rel="last"/i.exec(line);
@@ -298,10 +299,10 @@ function lastPageFromLink(stdout: string): number | null {
 }
 
 /** Splits a gh --include response into headers and body: the body starts after the
- * first empty line. A response without the separator is pure body. */
+ * first (CRLF or LF) empty line. A response without the separator is pure body. */
 function ghBody(stdout: string): string {
-	const sep = stdout.indexOf("\n\n");
-	return sep < 0 ? stdout : stdout.slice(sep + 2);
+	const sep = stdout.search(/\r?\n\r?\n/);
+	return sep < 0 ? stdout : stdout.slice(sep).replace(/^\r?\n\r?\n/, "");
 }
 
 /** Reads a pull request's comments, newest first: GitHub's issues-comments endpoint
@@ -340,9 +341,13 @@ export async function listPrComments(o: {
 			`gh comments failed (${first.code}): ${first.stderr.slice(0, 300)}`,
 		);
 	push(first.stdout);
+	// The first request has no page parameter, so GitHub returns page 1 — the OLDEST
+	// comments. The newest sit on the rel="last" page: request that page first, then
+	// walk backwards. Page 1 is never read twice; its comments are already pushed.
 	const lastPage = lastPageFromLink(first.stdout) ?? 1;
 	const floor = Math.max(1, lastPage - maxPages + 1);
-	for (let page = lastPage - 1; page >= floor; page--) {
+	for (let page = lastPage; page >= floor; page--) {
+		if (page === 1) continue;
 		const r = await gh([
 			"api",
 			`repos/${o.repo}/issues/${o.number}/comments?per_page=100&page=${page}`,

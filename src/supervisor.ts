@@ -278,6 +278,11 @@ function dependabotPrs(stdout: string): DependabotPr[] | string {
 interface PrDetail {
 	state: "open" | "closed";
 	merged: boolean;
+	/** When the PR merged (ms); null when unmerged, absent or unparseable. */
+	mergedAt: number | null;
+	/** The base branch name at merge time (a merged PR keeps the base it merged
+	 * into); null when absent or malformed. Says where the merge commit landed. */
+	base: string | null;
 	mergeCommit: string | null;
 	/** GitHub's merge verdict for an open PR: false = it conflicts with its base. Null = GitHub
 	 * still computes it, the field is absent, or the value is not a boolean. */
@@ -291,9 +296,18 @@ function parsePull(body: unknown): PrDetail | null {
 	if (x.state !== "open" && x.state !== "closed") return null;
 	if (x.merged_at !== null && typeof x.merged_at !== "string") return null;
 	if (sha !== null && sha !== undefined && typeof sha !== "string") return null;
+	const mergedAt =
+		typeof x.merged_at === "string" ? Date.parse(x.merged_at) : null;
+	const base = x.base as Record<string, unknown> | null | undefined;
+	const baseRef =
+		typeof base === "object" && base !== null && typeof base.ref === "string"
+			? base.ref
+			: null;
 	return {
 		state: x.state,
 		merged: typeof x.merged_at === "string",
+		mergedAt: mergedAt !== null && !Number.isNaN(mergedAt) ? mergedAt : null,
+		base: baseRef,
 		mergeCommit: typeof sha === "string" ? sha : null,
 		// Tolerant on purpose: the merged/closed settle uses this parser too, so a strange
 		// mergeable value must not turn a readable PR into null.
@@ -2111,12 +2125,50 @@ export function createSupervisor(
 				return;
 			}
 			if (s.merged && s.mergeCommit !== null) {
-				// Both PRs report merged with their merge commits straight from
-				// GET repos/{repo}/pulls/{n} — merge, squash and rebase merges all
-				// set them, and no git ancestry or fetch order is involved. The
-				// source's commit is the one on the target; when GitHub gives none,
-				// the follow-up's is the only anchor there is.
-				await finishPrMerge(e, settings, t, s.mergeCommit ?? pr.mergeCommit);
+				// Which commit finished the card? The two plain reads carry base.ref
+				// and merged_at, so the answer needs no git. A follow-up whose base is
+				// the target delivered its own commit straight to the target; a
+				// follow-up still based on the bump branch delivered through the
+				// source's merge, provable only when it merged strictly before the
+				// source. Equal or unreadable times are unresolved — the target may
+				// not hold the fixes — and the card parks instead of finishing.
+				const targetShort = (e.target ?? t.base ?? "").replace(/^origin\//, "");
+				const targetBased = pr.base !== null && pr.base === targetShort;
+				if (targetBased) {
+					// Both commits sit on the target; pin the later merge, and the
+					// follow-up's on a tie or an unreadable time.
+					const followUpLast =
+						s.mergedAt === null ||
+						(pr.mergedAt !== null && pr.mergedAt > s.mergedAt);
+					await finishPrMerge(
+						e,
+						settings,
+						t,
+						followUpLast ? (pr.mergeCommit ?? s.mergeCommit) : s.mergeCommit,
+					);
+					return;
+				}
+				const delivered =
+					t.sourcePrHeadRef !== null &&
+					pr.mergedAt !== null &&
+					s.mergedAt !== null &&
+					pr.mergedAt < s.mergedAt;
+				if (delivered) {
+					await finishPrMerge(e, settings, t, s.mergeCommit);
+					return;
+				}
+				if (wentStale(e.store, t)) return;
+				e.store.updateTask(t.id, {
+					state: "needs_you",
+					needsReason: `Follow-up PR #${F} merged without proof its fixes reached the target (it still bases on the bump branch, or merged after PR #${S}). Carry them onto a new pull request.`,
+					pushSha: null,
+				});
+				ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: follow-up PR #${F} has no proof of delivery; the fixes may sit on the bump branch; card parked`,
+				);
+				ops.schedule();
 				return;
 			}
 			if (wentStale(e.store, t)) return;

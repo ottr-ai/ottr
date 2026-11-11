@@ -437,9 +437,10 @@ describe("listPrComments", () => {
 		user: { login },
 		body,
 	});
-	/** A gh --include response: status line, headers, blank line, JSON body. */
+	/** A gh --include response, in the format gh actually prints: status line and
+	 * headers each ending \r\n, an empty \r\n line, then the JSON body. */
 	const included = (headers: string[], body: unknown): string =>
-		`HTTP/2 200\n${headers.join("\n")}\n\n${JSON.stringify(body)}`;
+		`HTTP/2 200\r\n${headers.join("\r\n")}\r\n\r\n${JSON.stringify(body)}`;
 	const junkPage = (from: number) =>
 		Array.from({ length: 100 }, (_v, i) => comment("dev", `c${from + i}`));
 
@@ -494,7 +495,7 @@ describe("listPrComments", () => {
 			}
 			expect(a).toEqual([
 				"api",
-				"repos/o/r/issues/7/comments?per_page=100&page=1",
+				"repos/o/r/issues/7/comments?per_page=100&page=2",
 			]);
 			return {
 				code: 0,
@@ -537,9 +538,11 @@ describe("listPrComments", () => {
 		// The bound walks backwards from the last page: pages 9 and 8 only.
 		expect(calls.map((c) => c[1])).toEqual([
 			"--include",
+			"repos/o/r/issues/7/comments?per_page=100&page=9",
 			"repos/o/r/issues/7/comments?per_page=100&page=8",
 		]);
-		expect(out).toHaveLength(200);
+		// Page 1 (the oldest comments) came with the first --include read.
+		expect(out).toHaveLength(300);
 	});
 
 	test("a failed gh call throws with the capped stderr", async () => {
@@ -556,7 +559,7 @@ describe("listPrComments", () => {
 	test("an unparseable body throws", async () => {
 		const gh: GhFn = async () => ({
 			code: 0,
-			stdout: "HTTP/2 200\n\n{",
+			stdout: "HTTP/2 200\r\n\r\n{",
 			stderr: "",
 		});
 		expect(listPrComments({ repo: "o/r", number: 7, gh })).rejects.toThrow(

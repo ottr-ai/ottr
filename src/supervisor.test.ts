@@ -4004,10 +4004,10 @@ describe("prPass", () => {
 	});
 
 	test("both merged in one window finishes with the source's merge commit", async () => {
-		// Both PRs report merged with their merge commits straight from
-		// GET repos/{repo}/pulls/{n} — merge, squash and rebase merges all set them,
-		// whatever the timestamps and whatever GitHub did to the follow-up's base.
-		// The source's commit is the one on the target, so it pins the CI watch.
+		// Both PRs report merged with base.ref and merged_at straight from
+		// GET repos/{repo}/pulls/{n}. The follow-up still based on the bump branch
+		// merged strictly before the source, so the source's merge carried the fixes
+		// onto the target and the source's commit pins the CI watch.
 		const store = prModeProject("pr-fu-one-window");
 		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
 		const t = followUpCard(store);
@@ -4020,6 +4020,7 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-06T00:00:00Z",
 								mergeSha: OTHER_SHA,
+								base: "ottr/552",
 							}),
 							stderr: "",
 						}
@@ -4027,8 +4028,9 @@ describe("prPass", () => {
 						? {
 								code: 0,
 								stdout: pullBody({
-									mergedAt: "2026-11-06T00:00:00Z",
+									mergedAt: "2026-11-07T00:00:00Z",
 									mergeSha: MERGE_SHA,
+									base: "main",
 								}),
 								stderr: "",
 							}
@@ -4059,6 +4061,53 @@ describe("prPass", () => {
 		store.close();
 	});
 
+	test("equal merge times park unresolved for a bump-branch follow-up", async () => {
+		// Second-resolution timestamps cannot say whether the source's merge carried
+		// the follow-up's fixes: equal times are unresolved, and the target may not
+		// hold the fixes — the card parks instead of finishing.
+		const store = prModeProject("pr-fu-unresolved");
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+								// The follow-up still based on the bump branch at its merge.
+								base: "ottr/552",
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-06T00:00:00Z",
+									mergeSha: OTHER_SHA,
+									base: "main",
+								}),
+								stderr: "",
+							}
+						: openList([]),
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain(
+			"without proof its fixes reached the target",
+		);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("no proof of delivery");
+		store.close();
+	});
+
 	test("a retargeted follow-up finishes with the source's merge commit", async () => {
 		// GitHub retargets an open follow-up onto the target when the bump PR merges
 		// and its branch is deleted: both PRs report merged, and the card finishes
@@ -4077,6 +4126,8 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-07T00:00:00Z",
 								mergeSha: MERGE_SHA,
+								// The retargeted follow-up based on the target at its merge.
+								base: "main",
 							}),
 							stderr: "",
 						}
@@ -4086,6 +4137,7 @@ describe("prPass", () => {
 								stdout: pullBody({
 									mergedAt: "2026-11-06T00:00:00Z",
 									mergeSha: OTHER_SHA,
+									base: "main",
 								}),
 								stderr: "",
 							}
@@ -4097,8 +4149,10 @@ describe("prPass", () => {
 			ops,
 		);
 		const after = store.getTask(t.id)!;
+		// The target-based follow-up delivered its own commit straight to the
+		// target, and it is the later merge: its commit pins the CI watch.
 		expect(after.stage).toBe("done");
-		expect(after.pushSha).toBeNull();
+		expect(after.pushSha).toBe(MERGE_SHA);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		store.close();
@@ -4106,8 +4160,8 @@ describe("prPass", () => {
 
 	test("a legacy card's follow-up finishes with the source's merge commit", async () => {
 		// A legacy card holds no head branch name, so its follow-up based on the
-		// target branch. Both PRs report merged; the source's commit finishes the
-		// card, and the newer origin tip opts the exact-tip CI pin out.
+		// target branch. Both PRs report merged; the follow-up's commit is the
+		// later merge on the target and pins the CI watch.
 		const store = prModeProject("pr-fu-target-base");
 		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
 		const t = followUpCard(store);
@@ -4119,6 +4173,7 @@ describe("prPass", () => {
 							stdout: pr9Body({
 								mergedAt: "2026-11-07T00:00:00Z",
 								mergeSha: MERGE_SHA,
+								base: "main",
 							}),
 							stderr: "",
 						}
@@ -4128,6 +4183,7 @@ describe("prPass", () => {
 								stdout: pullBody({
 									mergedAt: "2026-11-06T00:00:00Z",
 									mergeSha: OTHER_SHA,
+									base: "main",
 								}),
 								stderr: "",
 							}
@@ -4140,7 +4196,7 @@ describe("prPass", () => {
 		);
 		const after = store.getTask(t.id)!;
 		expect(after.stage).toBe("done");
-		expect(after.pushSha).toBeNull();
+		expect(after.pushSha).toBe(MERGE_SHA);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
 		store.close();
