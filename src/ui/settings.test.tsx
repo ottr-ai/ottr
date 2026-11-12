@@ -3592,8 +3592,8 @@ describe("NotificationsSection stale push recovery", () => {
 			mutedProjects?: string[];
 			/** Holds every no-endpoint prefs GET until releaseMuteLoad runs. */
 			deferMuteLoad?: boolean;
-			/** The no-endpoint prefs GET answers 500 (a failed board-wide mute load). */
-			failMuteLoad?: boolean;
+			/** The first N no-endpoint prefs GETs answer 500 (failed mute loads). */
+			failMuteLoads?: number;
 		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
@@ -3616,6 +3616,7 @@ describe("NotificationsSection stale push recovery", () => {
 		}> = [];
 		let subscribePosts = 0;
 		let permissionCalls = 0;
+		let bareMuteReads = 0;
 		// Resolvers of mute reads a deferMuteLoad test holds back: the board
 		// answered at request time, the network delivers on release.
 		const heldMuteLoads: Array<() => void> = [];
@@ -3722,7 +3723,8 @@ describe("NotificationsSection stale push recovery", () => {
 					"https://push.example",
 				).searchParams.get("endpoint");
 				if (endpoint === null) {
-					if (options.failMuteLoad)
+					bareMuteReads++;
+					if (bareMuteReads <= (options.failMuteLoads ?? 0))
 						return Response.json({ error: "boom" }, { status: 500 });
 					// The snapshot is the list the board served at request time; the
 					// deferral is transport delay, not a later server answer.
@@ -4156,28 +4158,60 @@ describe("NotificationsSection stale push recovery", () => {
 		);
 	});
 
-	test("a failed mute load keeps the switches off and writes nothing", async () => {
+	test("a failed mute load keeps the switches off until Retry succeeds", async () => {
 		await withPushBrowser(
 			async (probe) => {
 				// The board-wide mute load failed: the list stays unknown, the
 				// boxes stay disabled, and no change can replace the shared list
-				// with a partial guess. A reload is the retry.
+				// with a partial guess. Retry is manual only; when the retried
+				// load answers, the switches unlock with the real list.
 				const node = probe.containerNode();
 				const beta = switchOf(node, "Mute beta");
 				expect(beta?.disabled).toBe(true);
 				await act(async () => {
 					onChangeOf(beta!)({ target: { checked: true } });
 				});
-				for (let k = 0; k < 5; k++)
-					await act(async () => {
-						await new Promise((r) => setTimeout(r, 0));
-					});
+				await act(async () => {});
 				expect(
 					probe.posts.filter((p) => p.url === "/api/notifications/prefs"),
 				).toEqual([]);
 				expect(probe.containerText()).toContain("could not be loaded");
+				const retry = [...node.querySelectorAll("button")].find(
+					(b) => b.textContent?.trim() === "Retry",
+				);
+				expect(retry).toBeDefined();
+				await act(async () => {
+					retry?.click();
+				});
+				for (let k = 0; k < 5; k++)
+					await act(async () => {
+						await new Promise((r) => setTimeout(r, 0));
+					});
+				const after = probe.containerNode();
+				expect(after.textContent ?? "").not.toContain("could not be loaded");
+				expect(switchOf(after, "Mute beta")?.disabled).toBe(false);
+				expect(switchOf(after, "Mute alpha")?.checked).toBe(true);
+				const unlocked = switchOf(after, "Mute beta");
+				expect(unlocked).toBeDefined();
+				await act(async () => {
+					onChangeOf(unlocked!)({ target: { checked: true } });
+				});
+				for (let k = 0; k < 5; k++)
+					await act(async () => {
+						await new Promise((r) => setTimeout(r, 0));
+					});
+				const mutePost = probe.posts.find(
+					(p) =>
+						p.url === "/api/notifications/prefs" &&
+						(p.body as { mutedProjects?: string[] }).mutedProjects !==
+							undefined,
+				);
+				expect(mutePost).toBeDefined();
+				expect(
+					(mutePost!.body as { mutedProjects: string[] }).mutedProjects.sort(),
+				).toEqual(["alpha", "beta"]);
 			},
-			{ failMuteLoad: true },
+			{ failMuteLoads: 2 },
 		);
 	});
 });

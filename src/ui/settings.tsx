@@ -1116,6 +1116,9 @@ export function NotificationsSection({
 	// there; the load gate rules the supported path.
 	const [mutesKnown, setMutesKnown] = useState(!supported);
 	const [mutesError, setMutesError] = useState(false);
+	// Retry is manual only: the load re-runs when the button bumps this, never
+	// on a timer.
+	const [mutesRetry, setMutesRetry] = useState(0);
 	// "Test sent" is a short confirmation; the button reads "Send test" again after it.
 	const [sent, flashSent] = useFlash(2000);
 	const [error, setError] = useState<string | null>(null);
@@ -1294,7 +1297,7 @@ export function NotificationsSection({
 		return () => {
 			live = false;
 		};
-	}, [supported]);
+	}, [supported, mutesRetry]);
 	// The event switches follow the endpoint's row: a 404 (a row the board does
 	// not know — a pending registration, a pruned row, a restored older snapshot)
 	// hides the switches and never invents a mute list.
@@ -1430,6 +1433,12 @@ export function NotificationsSection({
 			throw err;
 		}
 	};
+	// The failure hint's Retry: one manual re-run of the mute load; no
+	// automatic retry exists.
+	const retryMutes = (): void => {
+		setMutesError(false);
+		setMutesRetry((n) => n + 1);
+	};
 	const saveMute = async (name: string, v: boolean): Promise<void> => {
 		// Board-wide mutes write only once a load answered (ADR-0011): an empty
 		// mutedRef is a guess, never the list, and a save would replace what
@@ -1529,7 +1538,10 @@ export function NotificationsSection({
 					{mutesError && (
 						<p className="notify-hint">
 							The project mute list could not be loaded, so the switches stay
-							off. Reload the page to try again.
+							off.{" "}
+							<button type="button" onClick={retryMutes}>
+								Retry
+							</button>
 						</p>
 					)}
 					{byLabel(projects).map((p) => (
