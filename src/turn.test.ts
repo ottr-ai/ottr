@@ -2405,6 +2405,153 @@ describe("turn schedule", () => {
 	});
 });
 
+// OTTR-866: the tick's refresh fan-out runs coalesced and bounded. Overlapping ticks used
+// to stack a whole board's git reads per tick (1,200 spawned children in 665 ms on a
+// simulated 100-project board), because the raw per-tick loop had no in-flight guard.
+describe("turn refresh coalescing", () => {
+	/** A board of n projects; each test wires its own flag-op stubs over it. */
+	function coalesceBoard(n: number) {
+		const stores = Array.from({ length: n }, () => freshStore());
+		const projects = new Map(stores.map((s) => [s.name, fakeProject(s)]));
+		return { stores, projects, record: baseRecord() };
+	}
+
+	test("overlapping ticks coalesce into one in-flight cycle plus one queued follow-up", async () => {
+		const { stores, projects, record } = coalesceBoard(2);
+		const calls: string[] = [];
+		const gates: (() => void)[] = [];
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				targetTracksRules: async () => false,
+				isClean: async (path: string) => {
+					calls.push(path);
+					const { promise, resolve } = Promise.withResolvers<void>();
+					gates.push(resolve);
+					await promise;
+					return true;
+				},
+			}),
+		);
+		const allPaths = stores.map((s) => s.path).sort();
+		const settle = () => {
+			for (const resolve of gates.splice(0)) resolve();
+		};
+
+		// Cycle 1 is in flight: every project's refresh parked on the test's gates.
+		loop.schedule();
+		expect(calls).toHaveLength(2);
+		expect(calls.slice().sort()).toEqual(allPaths);
+
+		// Two ticks land mid-cycle: they only queue, neither stacks a fan-out.
+		loop.schedule();
+		loop.schedule();
+		expect(calls).toHaveLength(2);
+
+		// Cycle 1 settles: exactly one queued follow-up runs, covering both projects again.
+		settle();
+		await flushPromises();
+		expect(calls).toHaveLength(4);
+		expect(calls.slice(2).sort()).toEqual(allPaths);
+
+		// The follow-up settles: nothing queued behind it, so no third cycle runs.
+		settle();
+		await flushPromises();
+		expect(calls).toHaveLength(4);
+	});
+
+	test("a cycle walks the board through the pool, at most four projects at once", async () => {
+		const n = 12;
+		const { projects, record } = coalesceBoard(n);
+		const calls: string[] = [];
+		let inFlight = 0;
+		let maxInFlight = 0;
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				targetTracksRules: async () => false,
+				isClean: async (path: string) => {
+					calls.push(path);
+					inFlight += 1;
+					maxInFlight = Math.max(maxInFlight, inFlight);
+					const { promise, resolve } = Promise.withResolvers<void>();
+					setImmediate(resolve);
+					await promise;
+					inFlight -= 1;
+					return true;
+				},
+			}),
+		);
+		loop.schedule();
+		await eventually(() => calls.length === n && inFlight === 0);
+		// Every project refreshed exactly once, and the pool held the burst at four.
+		expect(calls).toHaveLength(n);
+		expect(inFlight).toBe(0);
+		expect(maxInFlight).toBe(4);
+	});
+
+	test("a project whose git fails does not stop the others' flags in the same cycle", async () => {
+		const { stores, projects, record } = coalesceBoard(2);
+		const sick = projects.get(stores[0]!.name)!;
+		const healthy = projects.get(stores[1]!.name)!;
+		let cleanCalls = 0;
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				targetTracksRules: async () => false,
+				checkedOutBranch: async () => "main",
+				isClean: async (path: string) => {
+					cleanCalls += 1;
+					if (path === stores[0]!.path) throw new Error("git gone");
+					return true;
+				},
+			}),
+		);
+		sick.dirty = true;
+		healthy.dirty = true;
+		loop.schedule();
+		await flushPromises();
+		// The healthy project's flags refreshed; the sick project kept its last flag.
+		expect(healthy.dirty).toBe(false);
+		expect(healthy.mainBranch).toBe("main");
+		expect(sick.dirty).toBe(true);
+		expect(sick.mainBranch).toBe("main");
+
+		// The cycle settled despite the rejection: the next tick runs a full new cycle.
+		loop.schedule();
+		await flushPromises();
+		expect(cleanCalls).toBe(4);
+	});
+
+	test("a settled cycle lands the refreshed flags on the projects", async () => {
+		const { projects, record } = coalesceBoard(2);
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				targetTracksRules: async () => false,
+				isClean: async () => true,
+				checkedOutBranch: async () => "main",
+				refreshRelease: async (e) => {
+					e.latestRelease = "v9.9.9";
+				},
+			}),
+		);
+		for (const e of projects.values()) {
+			e.dirty = true;
+			e.mainBranch = "old";
+			e.targetRules = true;
+		}
+		loop.schedule();
+		await flushPromises();
+		for (const e of projects.values()) {
+			expect(e.dirty).toBe(false);
+			expect(e.mainBranch).toBe("main");
+			expect(e.targetRules).toBe(false);
+			expect(e.latestRelease).toBe("v9.9.9");
+		}
+	});
+});
+
 describe("turn runTurn guards", () => {
 	test("cancelled task never starts", async () => {
 		const { store, record, loop } = await setup();

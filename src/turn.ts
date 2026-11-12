@@ -545,6 +545,13 @@ const GUARD_NOTICE_TTL_MS = 24 * 60 * 60_000;
 /** OTTR-763: most bell notices the guard keeps; a burst of ambiguous changes cannot flood the bell. */
 const GUARD_NOTICE_MAX = 20;
 
+// OTTR-866: how many projects' flag refreshes one cycle runs at once. Measured on a
+// simulated 100-project board (OTTR-807): the unguarded per-tick fan-out let overlapping
+// ticks stack whole boards of git reads — 1,200 spawned children in 665 ms with a
+// 316 ms median max timer lag. The pool bounds a cycle's burst; the coalescer in
+// createTurnLoop bounds the cycles (one in flight, one queued).
+const REFRESH_PROJECT_CONCURRENCY = 4;
+
 /** OTTR-763: the unrecorded new commits between the guard's before head and now, with
  * metadata. Empty when either head is unreadable; a HEAD advance the board recorded
  * never contributes commits: its own machinery made that change. An unwired ops member
@@ -2831,16 +2838,21 @@ export function createTurnLoop(
 	}
 
 	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (with the standing
-	 * pushSyncCommits approval above), mainBranch, release/arch-review/PR flags. */
-	function refreshProjectFlags(e: TurnProject): void {
-		void ops
-			.isClean(e.path)
-			.then((clean) => {
-				e.dirty = !clean;
-			})
-			.catch(() => {
-				// git failed (e.g. the folder vanished): keep the last dirty flag; the next tick retries.
-			});
+	 * pushSyncCommits approval above), mainBranch, release/arch-review/PR flags. Resolves when
+	 * the project's flag ops settle; every op keeps its own failure isolation (a failed op
+	 * keeps the last flag, the next tick retries), so the promise never rejects. */
+	async function refreshProjectFlags(e: TurnProject): Promise<void> {
+		const settling: Promise<void>[] = [];
+		settling.push(
+			ops
+				.isClean(e.path)
+				.then((clean) => {
+					e.dirty = !clean;
+				})
+				.catch(() => {
+					// git failed (e.g. the folder vanished): keep the last dirty flag; the next tick retries.
+				}),
+		);
 		// OTTR-506: the merge hold's git fact, refreshed like the dirty flag — a failed
 		// check keeps the last value and the next tick retries.
 		const branch =
@@ -2848,34 +2860,92 @@ export function createTurnLoop(
 				? (e.target?.slice("origin/".length) ?? null)
 				: null;
 		if (branch !== null)
-			void ops
-				.branchUnpushed(e.path, branch)
-				.then(async (unpushed) => await syncUnpushedMain(e, branch, unpushed))
-				.catch(() => {
-					// git failed: keep the last mainUnpushed flag; the next tick retries.
-				});
+			settling.push(
+				ops
+					.branchUnpushed(e.path, branch)
+					.then((unpushed) => syncUnpushedMain(e, branch, unpushed))
+					.catch(() => {
+						// git failed: keep the last mainUnpushed flag; the next tick retries.
+					}),
+			);
 		// OTTR-531: the off-default finding's git fact, refreshed like the dirty flag —
 		// a failed check keeps the last mainBranch; the next tick retries.
-		void ops
-			.checkedOutBranch(e.path)
-			.then((b) => {
-				e.mainBranch = b;
-			})
-			.catch(() => {
-				// git failed: keep the last mainBranch; the next tick retries.
-			});
+		settling.push(
+			ops
+				.checkedOutBranch(e.path)
+				.then((b) => {
+					e.mainBranch = b;
+				})
+				.catch(() => {
+					// git failed: keep the last mainBranch; the next tick retries.
+				}),
+		);
 		// OTTR-768: the rules gate's git fact — does the target track AGENTS.md? A failed
 		// check keeps the last targetRules flag; the next tick retries (like mainBranch).
-		void (ops.targetTracksRules ?? targetTracksRules)(e.path, e.target)
-			.then((tracks) => {
-				e.targetRules = tracks;
-			})
-			.catch(() => {
-				// git failed: keep the last targetRules flag; the next tick retries.
-			});
-		void ops.refreshRelease(e);
-		void ops.refreshArchReview(e);
+		settling.push(
+			(ops.targetTracksRules ?? targetTracksRules)(e.path, e.target)
+				.then((tracks) => {
+					e.targetRules = tracks;
+				})
+				.catch(() => {
+					// git failed: keep the last targetRules flag; the next tick retries.
+				}),
+		);
+		// The release/arch-review readers stamp no flag this loop owns: swallow their failure
+		// so the cycle's await never rejects (the next tick retries them like the flags).
+		settling.push(ops.refreshRelease(e).catch(() => {}));
+		settling.push(ops.refreshArchReview(e).catch(() => {}));
 		void ops.refreshOpenPrs?.(e);
+		await Promise.all(settling);
+	}
+
+	// OTTR-866: the tick's refresh fan-out, coalesced. Every board write fires schedule(),
+	// so the raw per-tick loop let overlapping ticks stack whole boards of git reads
+	// (1,200 children in 665 ms on a simulated 100-project board, OTTR-807). One cycle
+	// runs at a time; a tick that lands mid-cycle only queues one follow-up, and the
+	// cycle walks the board through the REFRESH_PROJECT_CONCURRENCY pool.
+	let refreshRunning = false;
+	let refreshQueued = false;
+
+	/** One coalesced cycle: every project's flag refresh, at most REFRESH_PROJECT_CONCURRENCY
+	 * projects at once. Never rejects: one project's failure is logged and the others go on. */
+	async function refreshCycle(): Promise<void> {
+		const list = [...projects.values()];
+		let next = 0;
+		const worker = async (): Promise<void> => {
+			for (;;) {
+				const e = list[next++];
+				if (e === undefined) return;
+				try {
+					await refreshProjectFlags(e);
+				} catch (err) {
+					// One sick project must not stop the others' flags (dispatchProject's isolation).
+					logStoreError(e.store.name, err);
+				}
+			}
+		};
+		await Promise.all(
+			Array.from(
+				{ length: Math.min(REFRESH_PROJECT_CONCURRENCY, list.length) },
+				() => worker(),
+			),
+		);
+	}
+
+	/** The schedule tick's refresh kickoff: starts a cycle, or marks the queued follow-up
+	 * when one is in flight. At most one cycle runs plus one queued, whatever the tick rate. */
+	function scheduleRefresh(): void {
+		if (refreshRunning) {
+			refreshQueued = true;
+			return;
+		}
+		refreshRunning = true;
+		void refreshCycle().then(() => {
+			refreshRunning = false;
+			if (!refreshQueued) return;
+			refreshQueued = false;
+			scheduleRefresh();
+		});
 	}
 
 	/** Keep unrelated projects available, but fail any dependency lookup that needs unavailable data. */
@@ -3009,8 +3079,9 @@ export function createTurnLoop(
 		ops.publishSoon(); // board diffs from dirty/release flags and new turns ship without polling
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
 		// Refresh every project first: a full cap must not skip the later projects' dirty and
-		// release flags (they gate the board and the merge queue).
-		for (const e of projects.values()) refreshProjectFlags(e);
+		// release flags (they gate the board and the merge queue). Coalesced (OTTR-866): a
+		// tick landing mid-cycle queues one follow-up instead of stacking a second fan-out.
+		scheduleRefresh();
 		// An update waits for an idle board: the running turns finish, and no new turn, merge or
 		// release publish starts until the restart (scripts/update-image.ts). The board check is
 		// the one exception: it only reads the board, so it never waits for the update, and the
