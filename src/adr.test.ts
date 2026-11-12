@@ -98,6 +98,7 @@ describe("docs/adr registry", () => {
 		expect(statusLine(file).startsWith("accepted")).toBe(true);
 		const text = readFileSync(join(adrDir, file), "utf8");
 		expect(text).toContain("Ottr stays on TypeScript and Bun");
+		expect(text).toContain("thresholds are proposed");
 		const rows = indexRows();
 		expect(rows.get("0012") ?? "").toBe("accepted");
 	});

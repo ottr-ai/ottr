@@ -4,7 +4,10 @@ Date: 2026-11-12
 
 ## Status
 
-accepted
+accepted — the stack decision is in force. The gate thresholds in the
+Decision are proposed, not confirmed, until the owner's workload agreement
+records them in docs/specs/rust-decision-gates.md. A threshold change does
+not reopen this decision.
 
 ## Context
 
@@ -45,10 +48,16 @@ Alate, whose own repo records that decision.
    loop, publication derived from state changes, and prebuilt compressed UI
    assets. Every change preserves state freshness, authorization, git
    isolation, the Windows Bun platform workaround and scheduler ownership.
-3. Rust returns to consideration only through the four decision gates below,
-   measured after the design work on an isolated host with repeated,
-   alternating runs. A failed gate permits one bounded-component prototype
-   comparison; it never approves a rewrite by itself.
+3. Rust returns to consideration only through decision gates, measured after
+   the design work on an isolated host with repeated, alternating runs. A
+   failed gate permits one bounded-component prototype comparison; it never
+   approves a rewrite by itself.
+
+The table's thresholds are proposed: the OTTR-807 report marks them assumed
+and pending the owner's confirmation of the expected workload per board and
+per Alate instance. The confirmed workloads and thresholds belong in
+docs/specs/rust-decision-gates.md, and a change there updates the gate
+numbers, not this decision.
 
 | Gate | Measurement | What reopens Rust |
 | --- | --- | --- |
