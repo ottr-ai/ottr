@@ -8158,9 +8158,9 @@ button.log-mode[aria-pressed="true"] {
 	/* Sits at the bubble's tail corner: 1px stays under the bubble's 2px tail. */
 	border-bottom-right-radius: 1px;
 }
-/* Meta and the card actions sit above the docked composer. */
+/* The card actions, then Meta as the drawer's last block, both above the docked composer. */
 .meta-block {
-	order: 1;
+	order: 2;
 	margin: 14px 0 10px;
 }
 .meta-block[open] > summary {
@@ -8171,9 +8171,12 @@ button.log-mode[aria-pressed="true"] {
 	flex-wrap: wrap;
 	justify-content: flex-end;
 	gap: 8px;
-	order: 2;
-	/* Flex margins add up: 8px here plus Meta's 10px keep the old 18px step. */
-	margin: 8px 0 10px;
+	order: 1;
+	margin: 18px 0 0;
+}
+/* A proposal's decision card carries Cancel task, which can leave the row empty. */
+.drawer-actions:empty {
+	display: none;
 }
 /* The danger actions sit apart on the row's left edge; the constructive cluster
    stays right, the same grammar as a dialog footer's image picker. The auto margin
