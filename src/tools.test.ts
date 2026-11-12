@@ -19,6 +19,7 @@ import {
 	ensureAllTools,
 	ensureProjectTools,
 	envListPath,
+	envValuesByKind,
 	listedEnvNames,
 	parseEnvTxt,
 	parseToolsJson,
@@ -169,12 +170,50 @@ describe("parseEnvTxt", () => {
 	test("comments, blank lines and repeats drop out", () => {
 		expect(
 			parseEnvTxt("# tools\nOTTR_TOKEN\r\n\n OTTR_HOME # home\nOTTR_TOKEN\n"),
-		).toEqual(["OTTR_TOKEN", "OTTR_HOME"]);
+		).toEqual([
+			{ name: "OTTR_TOKEN", plain: false },
+			{ name: "OTTR_HOME", plain: false },
+		]);
 	});
 
-	test("refuses anything that is not an env var name", () => {
-		for (const bad of ["lower", "1START", "HAS-DASH", "HAS SPACE"])
+	test("refuses anything that is not an env var name or the plain mark", () => {
+		for (const bad of [
+			"lower",
+			"1START",
+			"HAS-DASH",
+			"HAS SPACE",
+			"HOST secret",
+			"HOST plain extra",
+		])
 			expect(() => parseEnvTxt(bad)).toThrow("not an env var name");
+	});
+
+	test("a trailing plain marks a non-secret value; a secret listing of the same name wins", () => {
+		expect(parseEnvTxt("MQTT_HOST plain\nTOKEN\nPORT  plain # x\n")).toEqual([
+			{ name: "MQTT_HOST", plain: true },
+			{ name: "TOKEN", plain: false },
+			{ name: "PORT", plain: true },
+		]);
+		expect(parseEnvTxt("HOST plain\nHOST\n")).toEqual([
+			{ name: "HOST", plain: false },
+		]);
+	});
+});
+
+describe("envValuesByKind", () => {
+	test("a plain name takes its plain value, a secret name keeps its secret", () => {
+		const listed = [
+			{ name: "HOST", plain: true },
+			{ name: "TOKEN", plain: false },
+			{ name: "MOVED", plain: true },
+		];
+		expect(
+			envValuesByKind(
+				{ TOKEN: "t", MOVED: "old-secret", UNLISTED: "u" },
+				{ HOST: "h", TOKEN: "ignored" },
+				listed,
+			),
+		).toEqual({ TOKEN: "t", HOST: "h", UNLISTED: "u" });
 	});
 });
 
@@ -196,9 +235,19 @@ describe("paths", () => {
 		provision("a-proj", null, ["A_ONE", "SHARED"], h);
 		mkdirSync(join(h, ".ottr", "workers", "not a list"));
 		expect(listedEnvNames(h)).toEqual([
-			{ name: "A_ONE", projects: ["a-proj"] },
-			{ name: "B_ONE", projects: ["b-proj"] },
-			{ name: "SHARED", projects: ["a-proj", "b-proj"] },
+			{ name: "A_ONE", projects: ["a-proj"], plain: false },
+			{ name: "B_ONE", projects: ["b-proj"], plain: false },
+			{ name: "SHARED", projects: ["a-proj", "b-proj"], plain: false },
+		]);
+	});
+
+	test("a name is plain only when every project lists it as plain", () => {
+		const h = mkdtempSync(join(home, "kinds-"));
+		provision("a-proj", null, ["HOST plain", "MIXED plain"], h);
+		provision("b-proj", null, ["HOST plain", "MIXED"], h);
+		expect(listedEnvNames(h)).toEqual([
+			{ name: "HOST", projects: ["a-proj", "b-proj"], plain: true },
+			{ name: "MIXED", projects: ["a-proj", "b-proj"], plain: false },
 		]);
 	});
 
@@ -207,7 +256,7 @@ describe("paths", () => {
 		provision("good", null, ["GOOD_ONE"], h);
 		provision("bad", null, ["OK_NAME", "my-key"], h);
 		expect(listedEnvNames(h)).toEqual([
-			{ name: "GOOD_ONE", projects: ["good"] },
+			{ name: "GOOD_ONE", projects: ["good"], plain: false },
 		]);
 	});
 
@@ -233,7 +282,7 @@ describe("paths", () => {
 			join(layer, ".ottr", "workers", "p", "env.txt"),
 		);
 		expect(listedEnvNames(h)).toEqual([
-			{ name: "LAYER_ONLY", projects: ["p"] },
+			{ name: "LAYER_ONLY", projects: ["p"], plain: false },
 		]);
 		expect(turnEnvValues("p", { LAYER_ONLY: "v", FLAT_ONLY: "x" }, h)).toEqual({
 			env: { LAYER_ONLY: "v" },
@@ -247,7 +296,9 @@ describe("paths", () => {
 		symlinkSync(join("layers", "gone"), join(h, ".alate", "current"));
 		rmSync(join(h, ".alate", "layers", "gone"), { recursive: true });
 		provision("p", [], ["FLAT_ONLY"], h);
-		expect(listedEnvNames(h)).toEqual([{ name: "FLAT_ONLY", projects: ["p"] }]);
+		expect(listedEnvNames(h)).toEqual([
+			{ name: "FLAT_ONLY", projects: ["p"], plain: false },
+		]);
 		expect(toolsListPath("p", h)).toBe(
 			join(h, ".ottr", "workers", "p", "tools.json"),
 		);
@@ -647,7 +698,9 @@ describe("turnEnvValues", () => {
 			const values = { A_SECRET: "s" };
 			expect(turnEnvValues("b", values)).toEqual({ env: {}, missing: [] });
 			expect(turnEnvValues("a", values).env).toEqual({ A_SECRET: "s" });
-			expect(listedEnvNames()).toEqual([{ name: "A_SECRET", projects: ["a"] }]);
+			expect(listedEnvNames()).toEqual([
+				{ name: "A_SECRET", projects: ["a"], plain: false },
+			]);
 		} finally {
 			if (saved === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
 			else process.env.OTTR_BOARD_OMP_HOME = saved;

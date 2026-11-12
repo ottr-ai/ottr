@@ -278,6 +278,7 @@ const shared = {
 	projectPaths: [] as string[],
 	projectOrder: [] as string[],
 	envValues: {} as Record<string, string>,
+	envPlain: {} as Record<string, string>,
 };
 // Compose turns reach the board at OTTR_BOARD_URL, a host no allowlist covers ("turns' own host").
 const BOARD_TOKEN = "boot-token-test";
@@ -544,6 +545,7 @@ function mount(
 			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
+			envPlain: {},
 			projectPaths: [],
 			projectOrder: [],
 		},
@@ -7553,6 +7555,7 @@ describe("github token", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -7631,7 +7634,10 @@ describe("settings env", () => {
 	beforeAll(() => {
 		mkdirSync(join(workersDir, "_all"), { recursive: true });
 		mkdirSync(join(workersDir, "p1"), { recursive: true });
-		writeFileSync(join(workersDir, "_all", "env.txt"), "API_KEY\nDB_PASS\n");
+		writeFileSync(
+			join(workersDir, "_all", "env.txt"),
+			"API_KEY\nDB_PASS\nMQTT_HOST plain\n",
+		);
 		writeFileSync(join(workersDir, "p1", "env.txt"), "API_KEY\n");
 	});
 	afterAll(() => {
@@ -7646,10 +7652,25 @@ describe("settings env", () => {
 				{
 					name: "API_KEY",
 					projects: ["_all", "p1"],
+					plain: false,
 					set: false,
 					readable: false,
 				},
-				{ name: "DB_PASS", projects: ["_all"], set: false, readable: false },
+				{
+					name: "DB_PASS",
+					projects: ["_all"],
+					plain: false,
+					set: false,
+					readable: false,
+				},
+				{
+					name: "MQTT_HOST",
+					projects: ["_all"],
+					plain: true,
+					set: false,
+					readable: true,
+					value: null,
+				},
 			],
 		});
 		const value = "s3cret-env-value";
@@ -7670,13 +7691,58 @@ describe("settings env", () => {
 				{
 					name: "API_KEY",
 					projects: ["_all", "p1"],
+					plain: false,
 					set: true,
 					readable: true,
 				},
-				{ name: "DB_PASS", projects: ["_all"], set: false, readable: false },
+				{
+					name: "DB_PASS",
+					projects: ["_all"],
+					plain: false,
+					set: false,
+					readable: false,
+				},
+				{
+					name: "MQTT_HOST",
+					projects: ["_all"],
+					plain: true,
+					set: false,
+					readable: true,
+					value: null,
+				},
 			],
 		});
 		expect(text).not.toContain(value);
+	});
+
+	test("a plain name stores its value apart, answers with it, never redacts it, and persists", async () => {
+		const host = "mqtt.home.example";
+		const saved = await post("/api/settings/env", {
+			name: "MQTT_HOST",
+			value: host,
+		});
+		expect(saved.status).toBe(200);
+		expect(shared.envPlain.MQTT_HOST).toBe(host);
+		expect(shared.envValues.MQTT_HOST).toBeUndefined();
+		expect(gitSecrets()).not.toContain(host);
+		const {
+			names,
+		}: { names: { name: string; set: boolean; value?: unknown }[] } = await (
+			await get("/api/settings/env")
+		).json();
+		expect(names.find((n) => n.name === "MQTT_HOST")).toMatchObject({
+			set: true,
+			value: host,
+		});
+		// A secret row never answers with a value field.
+		expect(names.find((n) => n.name === "API_KEY")).not.toHaveProperty("value");
+		// Persisted as plain text in the config row, apart from the sealed secrets.
+		const row: unknown = gstore.get("config");
+		expect(
+			row !== null && typeof row === "object" && "envPlain" in row
+				? row.envPlain
+				: null,
+		).toEqual({ MQTT_HOST: host });
 	});
 
 	test("POST rejects an unlisted name and a bad name", async () => {
@@ -7773,6 +7839,7 @@ describe("hindsight settings", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -8238,6 +8305,7 @@ describe("loopback Host from another machine or container", () => {
 			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
+			envPlain: {},
 			projectPaths: [],
 			projectOrder: [],
 		},
@@ -11960,6 +12028,7 @@ describe("sign out everywhere", () => {
 			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
+			envPlain: {},
 			projectPaths: [],
 			projectOrder: [],
 		},
@@ -12084,6 +12153,7 @@ describe("session registry (OTTR-387)", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -16741,6 +16811,7 @@ describe("worker sign-in warnings", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -16872,6 +16943,7 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -16988,6 +17060,7 @@ describe("GET /api/settings/omp-stats", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -17111,6 +17184,7 @@ describe("token expiry reminders", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},
@@ -18216,6 +18290,7 @@ describe("omp stats dashboard proxy (docs/specs/omp-stats-dashboard.md)", () => 
 			commitIdentity: null,
 			removedPaths: [],
 			envValues: {},
+			envPlain: {},
 			projectPaths: [],
 			projectOrder: [],
 		},

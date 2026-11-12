@@ -220,6 +220,7 @@ function boot(o: { secretBox?: SecretBox; jiraNet?: Partial<JiraNet> }) {
 			projectPaths: [],
 			projectOrder: [],
 			envValues: {},
+			envPlain: {},
 		},
 		serverRef: { current: undefined },
 		secretBox: o.secretBox,

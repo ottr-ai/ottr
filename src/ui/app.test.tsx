@@ -1156,8 +1156,9 @@ describe("alateChip", () => {
 			"Unreachable",
 		);
 		expect(label("http://a", true, ok, "boom")).toBe("Provision failed");
+		// A connected chip also names the update state, so no hint line repeats it.
 		expect(alateChip("http://a", true, ok, null)).toEqual({
-			label: "Connected",
+			label: "Connected · up to date",
 			tone: "ok",
 		});
 	});

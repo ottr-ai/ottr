@@ -507,9 +507,14 @@ worker turn can write the shared home, so a binary there must never run in the
 server. Until a seed runs, server-side turns get no tools.
 
 An env var name a project's turns need goes into `env.txt` beside the other two
-files: one name per line, `#` comments allowed, never a value. The value is a
-secret and lives on the board: save it once under **Settings → Env**, and every
-turn of a project whose `env.txt` (or `_all/env.txt`) lists the name receives it.
+files: one name per line, `#` comments allowed, never a value. The value lives on
+the board: save it once under **Settings → Env**, and every turn of a project whose
+`env.txt` (or `_all/env.txt`) lists the name receives it. By default the value is a
+secret: sealed at rest, never shown again, and redacted from every log. A value that
+is not a secret, such as a host or a port, gets the word `plain` after its name
+(`MQTT_HOST plain`): Settings then shows the value in its field after save, and logs
+keep it. When one listing of a name lacks `plain`, the name stays a secret. Spec:
+[docs/specs/env-plain-values.md](specs/env-plain-values.md).
 A listed name with no value does not stop the turn; the card log names it.
 The board reads these lists only from its own home (`OTTR_BOARD_OMP_HOME`,
 `/etc/ottr/home` on compose), never from the shared home volume. The reason is
@@ -567,7 +572,8 @@ Rules:
 - Put only names in `workers/<project>/env.txt` (or `workers/_all/env.txt`), one
   name per line, never a value. The value lives on the board: save it once under
   **Settings → Env**. Every turn of the project then receives the name as an
-  environment variable.
+  environment variable. A registry token stays a secret; only a non-secret value,
+  such as a mirror host, may get the word `plain` after its name.
 - Never put a token in the data repo. The data repo is a git repo, not a secret
   store.
 - In `settings.xml`, read the credentials from the turn env, for example

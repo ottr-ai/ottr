@@ -5754,6 +5754,203 @@ dialog.confirm-dialog {
 	background: var(--alarm-bg);
 	border-color: var(--alarm-line);
 }
+/* Settings → Alate: the user-layer note is one box. An empty layer is amber (needs you: workers
+   get no skills); a partial one is grey with its counts. The missing prompt-required names sit
+   under a divider as code chips. The box bleeds 9px into the card padding like the expired
+   sign-in row. */
+.layer-note {
+	display: grid;
+	grid-template-columns: 16px minmax(0, 1fr);
+	gap: 4px 10px;
+	align-self: stretch;
+	margin: 4px -9px 0;
+	padding: 10px 14px;
+	font-size: 12.5px;
+	color: var(--text);
+	background: var(--alarm-bg);
+	border: 1px solid var(--alarm-line);
+	border-radius: 6px;
+}
+.layer-note.calm {
+	background: var(--well);
+	border-color: var(--line);
+}
+.layer-note > .mark {
+	width: 16px;
+	height: 16px;
+	margin-top: 1px;
+}
+.layer-note > b {
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--text-strong);
+}
+.layer-note > p {
+	grid-column: 2;
+	margin: 0;
+}
+.layer-note > .layer-missing {
+	margin-top: 6px;
+	padding-top: 8px;
+	border-top: 1px solid var(--alarm-line);
+}
+.layer-note.calm > .layer-missing {
+	border-top-color: var(--line);
+}
+.layer-chips {
+	display: inline-flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+.layer-chips code {
+	padding: 0 5px;
+	font-size: 12px;
+	color: var(--text);
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+/* Settings → Alate: the dashboard opens from one stock button at the right of the card; the
+   chip carries the connection and update state, so no hint line repeats it. */
+/* The card is a flex column that starts its children: stretch the row so the button can sit right. */
+.alate-dash {
+	display: flex;
+	align-self: stretch;
+	justify-content: flex-end;
+}
+.alate-dash-link {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 32px;
+	padding: 0 10px;
+	font-size: 13px;
+	color: var(--text);
+	text-decoration: none;
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 4px;
+}
+.alate-dash-link:hover {
+	color: var(--text-strong);
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+.alate-dash-link .icon-svg {
+	color: var(--dim);
+}
+@media (pointer: coarse) {
+	.alate-dash-link {
+		min-height: 40px;
+	}
+}
+/* Settings → Env: one table - name (plus a "plain" tag for a non-secret), the projects that
+   use it, its state (grey check when set; amber triangle and words when missing: a turn runs
+   without it) and its value field. Below 640px each row stacks: name and state, then the
+   projects, then the full-width field. */
+.env-table {
+	width: 100%;
+	border-collapse: collapse;
+	font-size: 13px;
+}
+.env-table th {
+	padding: 0 10px 6px 0;
+	font-size: 12px;
+	font-weight: 600;
+	text-align: left;
+	color: var(--dim);
+}
+.env-table td {
+	padding: 8px 10px 8px 0;
+	border-top: 1px solid var(--line-soft);
+	vertical-align: middle;
+}
+/* The value column takes the free width and its field fills it; the button column sizes
+   to its widest button, and every button fills that column, so Save and Replace line up
+   at one width. */
+.env-table td.env-val {
+	width: 100%;
+}
+.env-table td.env-val input {
+	width: 100%;
+	min-width: 120px;
+}
+.env-table td.env-btn {
+	padding-right: 0;
+	white-space: nowrap;
+}
+.env-table td.env-btn > button {
+	width: 100%;
+}
+.env-hidden {
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.env-kind {
+	margin-left: 6px;
+	padding: 0 5px;
+	font-family: var(--mono);
+	font-size: 11px;
+	color: var(--dim);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
+.env-used {
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.env-state {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	font-size: 12.5px;
+	color: var(--dim);
+	white-space: nowrap;
+}
+.env-state .mark {
+	width: 12px;
+	height: 12px;
+}
+.env-state:is([data-state="missing"], [data-state="unreadable"]) {
+	color: var(--alarm);
+	font-weight: 600;
+}
+/* Name, projects and state keep to their content; the value column gets the rest. */
+.env-table td:not(.env-val, .env-btn) {
+	white-space: nowrap;
+}
+@media (max-width: 640px) {
+	.env-table thead {
+		display: none;
+	}
+	.env-table tr {
+		display: grid;
+		padding: 8px 0;
+		/* One fixed second column: the state words and every button line up across rows. */
+		grid-template-columns: minmax(0, 1fr) 96px;
+		border-top: 1px solid var(--line-soft);
+	}
+	.env-table td {
+		padding: 2px 0;
+		border: 0;
+	}
+	/* Name and state share the first line; the projects, then the field and its button. */
+	.env-table td.env-used {
+		grid-column: 1 / -1;
+		order: 1;
+	}
+	.env-table td.env-val {
+		order: 2;
+		width: auto;
+		padding-right: 8px;
+	}
+	.env-table td.env-btn {
+		order: 3;
+	}
+	.env-table td:not(.env-val, .env-btn) {
+		white-space: normal;
+	}
+}
 .sec-block {
 	gap: 8px;
 }

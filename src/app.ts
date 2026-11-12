@@ -612,6 +612,9 @@ interface AppDeps {
 		 * in the config file like githubToken (same trust level), never served back after save.
 		 * The turn loop reads it for redaction and env seeding. */
 		envValues: Record<string, string>;
+		/** Plain env values, one per env.txt name marked `plain`: stored as plain text, served
+		 *  back to Settings and never redacted (docs/specs/env-plain-values.md). */
+		envPlain: Record<string, string>;
 	};
 	serverRef: { current: Server<undefined> | undefined };
 	/** NODE_ENV=production: the board serves the static bundle and refuses live updates. */
@@ -3624,6 +3627,8 @@ export function createApp(deps: AppDeps) {
 					vals[name] = sealForStore(`env:${name}`, value);
 				return vals;
 			})(),
+			// Plain values are not secrets: stored as plain text, never sealed.
+			envPlain: deps.shared.envPlain,
 			hindsightToken: storedSpot("hindsightToken", hindsightToken),
 			hindsightUrl,
 		};
@@ -3705,6 +3710,7 @@ export function createApp(deps: AppDeps) {
 		turnReadTokens?: unknown;
 		githubApp?: unknown;
 		envValues?: unknown;
+		envPlain?: unknown;
 		hindsightToken?: unknown;
 		hindsightUrl?: unknown;
 	};
@@ -3924,16 +3930,26 @@ export function createApp(deps: AppDeps) {
 			}
 		}
 	}
-	/** Restores the secret env values; a corrupt entry is dropped, a kept-unreadable value is skipped (ADR-0011). */
+	/** Restores the env values: secrets (a corrupt entry is dropped, a kept-unreadable value is
+	 *  skipped, ADR-0011) and plain values (a name off the A_Z format or a non-string value is
+	 *  dropped). */
 	function restoreEnvValues(p: StoredConfig): void {
-		if (typeof p.envValues !== "object" || p.envValues === null) return;
-		const vals: Record<string, string> = {};
-		for (const [name, value] of Object.entries(p.envValues)) {
-			if (!ENV_NAME.test(name)) continue;
-			const v = loadSecret(`env:${name}`, value);
-			if (v !== null) vals[name] = v;
+		if (typeof p.envValues === "object" && p.envValues !== null) {
+			const vals: Record<string, string> = {};
+			for (const [name, value] of Object.entries(p.envValues)) {
+				if (!ENV_NAME.test(name)) continue;
+				const v = loadSecret(`env:${name}`, value);
+				if (v !== null) vals[name] = v;
+			}
+			deps.shared.envValues = vals;
 		}
-		deps.shared.envValues = vals;
+		if (typeof p.envPlain === "object" && p.envPlain !== null) {
+			const plain: Record<string, string> = {};
+			for (const [name, value] of Object.entries(p.envPlain))
+				if (ENV_NAME.test(name) && typeof value === "string")
+					plain[name] = value;
+			deps.shared.envPlain = plain;
+		}
 	}
 	/** Restores the memory token and URL; a wrong type keeps the default. */
 	function restoreHindsight(p: StoredConfig): void {
@@ -8570,17 +8586,15 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function handlePOSTSettingsEnv(req: Request): Promise<Response> {
-		const noBox = sealGuard();
-		if (noBox !== null) return noBox;
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
 		const name = r.body.name;
 		const value = r.body.value;
 		// Listed names already passed parseEnvTxt's ENV_NAME check.
-		const listed = listedEnvNames(workersHome).some((row) => row.name === name);
+		const row = listedEnvNames(workersHome).find((row) => row.name === name);
 		if (
 			typeof name !== "string" ||
-			!listed ||
+			row === undefined ||
 			typeof value !== "string" ||
 			value === ""
 		)
@@ -8591,6 +8605,14 @@ export function createApp(deps: AppDeps) {
 				},
 				400,
 			);
+		// A plain value is not a secret: no secret box, no redaction (env-plain-values.md).
+		if (row.plain) {
+			deps.shared.envPlain[name] = value;
+			saveConfig();
+			return json({ ok: true });
+		}
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
 		deps.shared.envValues[name] = value;
 		saveConfig();
 		applyGitSecrets();
@@ -11599,19 +11621,28 @@ export function createApp(deps: AppDeps) {
 		"/api/settings/turn-github-token/recheck": {
 			POST: (req) => api(req, () => handlePOSTSettingsTurnTokenRecheck(req)),
 		},
-		// Secret env values, one per env.txt name. No answer ever holds a value; a re-save
-		// replaces it (parity with the GitHub token: no delete).
+		// Env values, one per env.txt name. A secret answer never holds its value; a plain
+		// name (env.txt `plain`) answers with it. A re-save replaces it (no delete).
 		"/api/settings/env": {
 			GET: (req) =>
 				api(req, async () =>
 					json({
-						names: listedEnvNames(workersHome).map((row) => ({
-							...row,
-							set:
-								deps.shared.envValues[row.name] !== undefined ||
-								keptUnreadable.has(`env:${row.name}`),
-							readable: deps.shared.envValues[row.name] !== undefined,
-						})),
+						names: listedEnvNames(workersHome).map((row) =>
+							row.plain
+								? {
+										...row,
+										set: deps.shared.envPlain[row.name] !== undefined,
+										readable: true,
+										value: deps.shared.envPlain[row.name] ?? null,
+									}
+								: {
+										...row,
+										set:
+											deps.shared.envValues[row.name] !== undefined ||
+											keptUnreadable.has(`env:${row.name}`),
+										readable: deps.shared.envValues[row.name] !== undefined,
+									},
+						),
 					}),
 				),
 			POST: (req) => api(req, () => handlePOSTSettingsEnv(req)),

@@ -157,6 +157,7 @@ function boot(gstore: GlobalStore, secretBox?: SecretBox): Boot {
 			projectPaths: [],
 			projectOrder: [],
 			envValues: {},
+			envPlain: {},
 		},
 		serverRef: { current: undefined },
 		secretBox,

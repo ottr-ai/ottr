@@ -3878,6 +3878,7 @@ describe("turn release cards", () => {
 				commitIdentity: null,
 				removedPaths: [],
 				envValues: {},
+				envPlain: {},
 				projectPaths: [],
 				projectOrder: [],
 			},

@@ -198,16 +198,36 @@ export function toolsListPath(project: string, home = homedir()): string {
 	return join(layerHome(home), ".ottr", "workers", project, "tools.json");
 }
 
-/** env.txt: one env var name per line; `#` comments and blank lines are ignored. */
-export function parseEnvTxt(text: string): string[] {
-	const names = text
+/** One env.txt entry: the name, and whether its value is plain (not a secret). */
+export type EnvEntry = { name: string; plain: boolean };
+
+/**
+ * env.txt: one env var name per line, optionally followed by `plain` (the value is not a
+ * secret, e.g. a host); `#` comments and blank lines are ignored. A name listed twice is
+ * plain only when both lines say so: a secret listing wins (docs/specs/env-plain-values.md).
+ */
+export function parseEnvTxt(text: string): EnvEntry[] {
+	const lines = text
 		.split("\n")
 		.map((l) => l.replace(/#.*/, "").trim())
 		.filter((l) => l !== "");
-	const bad = names.filter((n) => !ENV_NAME.test(n));
+	const bad: string[] = [];
+	const byName = new Map<string, boolean>();
+	for (const line of lines) {
+		const [name = "", kind, ...rest] = line.split(/\s+/);
+		if (
+			!ENV_NAME.test(name) ||
+			(kind !== undefined && kind !== "plain") ||
+			rest.length > 0
+		) {
+			bad.push(line);
+			continue;
+		}
+		byName.set(name, (byName.get(name) ?? true) && kind === "plain");
+	}
 	if (bad.length > 0)
 		throw new Error(`env: not an env var name: ${bad.join(", ")}`);
-	return [...new Set(names)];
+	return [...byName].map(([name, plain]) => ({ name, plain }));
 }
 
 /**
@@ -223,43 +243,65 @@ export function envListPath(project: string, home = boardOmpHome()): string {
 	return join(layerHome(home), ".ottr", "workers", project, "env.txt");
 }
 
-/** The names a project's env.txt lists (envListPath resolves the layer); a missing file lists nothing. */
-function readEnvNames(project: string, home = boardOmpHome()): string[] {
+/** The entries a project's env.txt lists (envListPath resolves the layer); a missing file lists nothing. */
+function readEnvNames(project: string, home = boardOmpHome()): EnvEntry[] {
 	const file = envListPath(project, home);
 	if (!existsSync(file)) return [];
 	return parseEnvTxt(readFileSync(file, "utf8"));
 }
 
 /**
- * Every name provisioned for any project, with the projects that list it. A malformed env.txt
- * is logged and skipped, so one bad list does not hide every other project's names.
+ * Every name provisioned for any project, with the projects that list it and its kind: plain
+ * only when every listing says `plain`. A malformed env.txt is logged and skipped, so one bad
+ * list does not hide every other project's names.
  */
 export function listedEnvNames(
 	home = boardOmpHome(),
-): { name: string; projects: string[] }[] {
-	const byName = new Map<string, string[]>();
+): { name: string; projects: string[]; plain: boolean }[] {
+	const byName = new Map<string, { projects: string[]; plain: boolean }>();
 	// One resolve for the folder list and the reads: workerProjects has no layer
 	// resolution of its own (apt.ts), and a switch mid-read must not mix two layers.
 	home = layerHome(home);
 	for (const project of workerProjects(home)) {
-		let names: string[];
+		let entries: EnvEntry[];
 		try {
-			names = readEnvNames(project, home);
+			entries = readEnvNames(project, home);
 		} catch (err) {
 			console.warn(
 				`env: ${project}: ${err instanceof Error ? err.message : err}`,
 			);
 			continue;
 		}
-		for (const name of names) {
-			const projects = byName.get(name) ?? [];
-			projects.push(project);
-			byName.set(name, projects);
+		for (const { name, plain } of entries) {
+			const row = byName.get(name) ?? { projects: [], plain: true };
+			row.projects.push(project);
+			row.plain &&= plain;
+			byName.set(name, row);
 		}
 	}
 	return [...byName.entries()]
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-		.map(([name, projects]) => ({ name, projects }));
+		.map(([name, row]) => ({ name, ...row }));
+}
+
+/**
+ * The values a turn may use: each listed name takes the value of its current kind (a plain
+ * name its plain value, a secret name its secret), so a kind change never leaks the other
+ * store's value. Unlisted names keep their secret, as before.
+ */
+export function envValuesByKind(
+	secret: Record<string, string>,
+	plain: Record<string, string>,
+	listed: readonly { name: string; plain: boolean }[],
+): Record<string, string> {
+	const out = { ...secret };
+	for (const row of listed) {
+		if (!row.plain) continue;
+		delete out[row.name];
+		const v = plain[row.name];
+		if (v !== undefined) out[row.name] = v;
+	}
+	return out;
 }
 
 let queue: Promise<unknown> = Promise.resolve();
@@ -510,7 +552,11 @@ export function turnEnvValues(
 	// a switch mid-read must not mix two layers' name lists.
 	home = layerHome(home);
 	const names = [
-		...new Set([...readEnvNames("_all", home), ...readEnvNames(project, home)]),
+		...new Set(
+			[...readEnvNames("_all", home), ...readEnvNames(project, home)].map(
+				(e) => e.name,
+			),
+		),
 	];
 	const env: Record<string, string> = {};
 	const missing: string[] = [];

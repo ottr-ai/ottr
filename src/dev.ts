@@ -55,7 +55,7 @@ export async function bootstrap(): Promise<void> {
 	{
 		const home = process.env.OTTR_WORKERS_HOME;
 		for (const [project, names] of [
-			["_all", ["GODOT_EXPERIMENT"]],
+			["_all", ["GODOT_EXPERIMENT", "MQTT_HOST plain"]],
 			["pixelforge", ["PIXELLAB_API_KEY"]],
 		] as const) {
 			const dir = resolve(home, ".ottr", "workers", project);

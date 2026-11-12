@@ -4563,16 +4563,25 @@ function SshKeySection({ project }: { project: ProjectView }) {
 type EnvNameRow = {
 	name: string;
 	projects: string[];
+	/** env.txt marks the name `plain`: the value is not a secret and comes back in `value`. */
+	plain: boolean;
 	set: boolean;
 	/** false => the stored value cannot be decrypted; the user must enter it again. */
 	readable: boolean;
+	/** A plain row's stored value (null when missing); a secret row never has it. */
+	value?: string | null;
 };
 
-/** Settings "Env" section: one secret value per env.txt name; values never come back after save. */
+/** Settings "Env" section: one table of the env.txt names, their projects, their state and
+ *  their value field. A secret never comes back after save; a plain value (env.txt `plain`)
+ *  shows in its field (docs/specs/env-plain-values.md). */
 export function EnvSection() {
 	const [rows, setRows] = useState<EnvNameRow[] | null>(null);
+	// Unsaved edits by name; a plain row without an edit shows its stored value.
 	const [values, setValues] = useState<Record<string, string>>({});
 	const [error, setError] = useState<string | null>(null);
+	// The set secret whose Replace click opened an empty field.
+	const [replacing, setReplacing] = useState<string | null>(null);
 	const saveState = useBusy();
 	const load = useCallback(async (): Promise<void> => {
 		setRows(
@@ -4585,12 +4594,15 @@ export function EnvSection() {
 			setError(err instanceof Error ? err.message : String(err)),
 		);
 	}, [load]);
-	const save = (name: string): void =>
+	const shown = (row: EnvNameRow): string =>
+		values[row.name] ?? (row.plain ? (row.value ?? "") : "");
+	const save = (row: EnvNameRow): void =>
 		saveState.start(async () => {
 			setError(null);
 			try {
-				await post("/api/settings/env", { name, value: values[name] ?? "" });
-				setValues((v) => ({ ...v, [name]: "" }));
+				await post("/api/settings/env", { name: row.name, value: shown(row) });
+				setValues(({ [row.name]: _, ...rest }) => rest);
+				setReplacing(null);
 				await load();
 				return true;
 			} catch (err) {
@@ -4598,6 +4610,56 @@ export function EnvSection() {
 				return false;
 			}
 		});
+	const stateOf = (row: EnvNameRow): "set" | "missing" | "unreadable" =>
+		!row.set ? "missing" : row.readable ? "set" : "unreadable";
+	// Missing and unreadable values lead: they are the rows that need a value.
+	const byState = (list: EnvNameRow[]): EnvNameRow[] =>
+		[...list].sort(
+			(a, b) => Number(stateOf(a) === "set") - Number(stateOf(b) === "set"),
+		);
+	const usedBy = (row: EnvNameRow): string =>
+		row.projects.map((p) => (p === "_all" ? "every project" : p)).join(", ");
+	// A set secret shows no field until its Replace click: the value never comes back.
+	const editing = (row: EnvNameRow): boolean =>
+		row.plain || stateOf(row) !== "set" || replacing === row.name;
+	const valueInput = (row: EnvNameRow): ReactNode => (
+		<input
+			type={row.plain ? "text" : "password"}
+			value={shown(row)}
+			onChange={(e) => setValues((v) => ({ ...v, [row.name]: e.target.value }))}
+			placeholder={
+				row.plain
+					? "Value"
+					: row.set
+						? "Paste a new value to replace it"
+						: "Secret value"
+			}
+			autoComplete="off"
+			spellCheck={false}
+			aria-label={`Env value for ${row.name}`}
+			required
+		/>
+	);
+	const rowButton = (row: EnvNameRow): ReactNode =>
+		editing(row) ? (
+			<button
+				type="button"
+				disabled={saveState.busy}
+				className={saveState.failed ? "failed" : undefined}
+				onClick={() => save(row)}
+			>
+				{saveState.busy && <span className="spinner" aria-hidden="true" />}
+				Save
+			</button>
+		) : (
+			<button
+				type="button"
+				aria-label={`Replace ${row.name}`}
+				onClick={() => setReplacing(row.name)}
+			>
+				Replace
+			</button>
+		);
 	return (
 		<SettingsCard
 			id="env-section"
@@ -4616,8 +4678,10 @@ export function EnvSection() {
 				<>
 					Names come from the data repo's{" "}
 					<code>workers/&lt;project&gt;/env.txt</code> files (alate provisions
-					them into the home volume). One secret value per name serves every
-					project that lists it. Values are never shown after save.
+					them into the home volume). One value per name serves every project
+					that lists it. A secret is never shown after save; a name marked{" "}
+					<code>plain</code> in env.txt (a host, a port) keeps its value
+					visible.
 				</>
 			}
 		>
@@ -4625,58 +4689,52 @@ export function EnvSection() {
 				<p className="hint">No env.txt file declares a name yet.</p>
 			)}
 			{rows !== null && rows.length > 0 && (
-				<form
-					className="settings-form"
-					onSubmit={(e) => {
-						e.preventDefault();
-					}}
-				>
-					<div className="alate-def-rows">
-						{rows.map((row) => (
-							<div className="alate-def-row" key={row.name}>
-								<div className="alate-def-name">
-									<b>
+				<form className="settings-form" onSubmit={(e) => e.preventDefault()}>
+					<table className="env-table">
+						<thead>
+							<tr>
+								<th>Name</th>
+								<th>Used by</th>
+								<th>State</th>
+								<th>Value</th>
+								<th>
+									<span className="sr">Action</span>
+								</th>
+							</tr>
+						</thead>
+						<tbody>
+							{byState(rows).map((row) => (
+								<tr key={row.name}>
+									<td>
 										<code>{row.name}</code>
-										<Help
-											label={row.name}
-											text={`A secret value that workers get as the environment variable ${row.name}. Used by ${row.projects.map((p) => (p === "_all" ? "every project" : p)).join(", ")}.`}
-										/>
-									</b>
-									<code>secret · {row.set ? "set" : "missing"}</code>
-								</div>
-								<div className="alate-def-actions">
-									<input
-										type="password"
-										value={values[row.name] ?? ""}
-										onChange={(e) =>
-											setValues((v) => ({ ...v, [row.name]: e.target.value }))
-										}
-										placeholder={
-											row.set
-												? "Paste a new value to replace it"
-												: "Secret value"
-										}
-										autoComplete="off"
-										spellCheck={false}
-										aria-label={`Env value for ${row.name}`}
-										required
-									/>
-									<button
-										type="button"
-										disabled={saveState.busy}
-										className={saveState.failed ? "failed" : undefined}
-										onClick={() => save(row.name)}
-									>
-										{saveState.busy && (
-											<span className="spinner" aria-hidden="true" />
+										{row.plain && <span className="env-kind">plain</span>}
+									</td>
+									<td className="env-used">{usedBy(row)}</td>
+									<td>
+										<span className="env-state" data-state={stateOf(row)}>
+											<Mark kind={stateOf(row) === "set" ? "done" : "needs"} />
+											{
+												{
+													set: "Set",
+													missing: "Missing",
+													unreadable: "Unreadable",
+												}[stateOf(row)]
+											}
+										</span>
+									</td>
+									<td className="env-val">
+										{editing(row) ? (
+											valueInput(row)
+										) : (
+											<span className="env-hidden">Hidden after save</span>
 										)}
-										Save
-									</button>
-								</div>
-								{row.set && !row.readable && <UnreadableSecretNote />}
-							</div>
-						))}
-					</div>
+										{stateOf(row) === "unreadable" && <UnreadableSecretNote />}
+									</td>
+									<td className="env-btn">{rowButton(row)}</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
 				</form>
 			)}
 			{error !== null && (
@@ -6559,7 +6617,9 @@ type AlateHealthState =
 	  }
 	| { state: "down" };
 
-/** Alate state chip: configuration first (URL, API key), then the health probe, then the last provision. */
+/** Alate state chip: configuration first (URL, API key), then the health probe, then the last
+ *  provision. A connected server's chip also names its update state (alateHint), so the card
+ *  has one status, not a chip plus a hint line. */
 export function alateChip(
 	conn: string,
 	keySet: boolean,
@@ -6571,7 +6631,7 @@ export function alateChip(
 	if (health === null) return { label: "Checking…", tone: "off" };
 	if (health.state === "down") return { label: "Unreachable", tone: "warn" };
 	if (lastErr !== null) return { label: "Provision failed", tone: "warn" };
-	return { label: "Connected", tone: "ok" };
+	return { label: `Connected · ${alateHint(health)}`, tone: "ok" };
 }
 
 /** One-line hint for the connected alate instance: its version when the server reports one, else its data-repo update state; names a pending import or a running provision. */
@@ -6603,15 +6663,6 @@ export function userLayerEmpty(
 	layer: ProvisioningResponse["userLayer"],
 ): boolean {
 	return layer.skills.length === 0 && layer.plugins.length === 0;
-}
-
-/** The prompt-required skills and rules the workers lack, as one line: names in the shipped
- *  order. Null when the workers hold everything, so the caller renders nothing. */
-export function missingRequiredLine(
-	layer: ProvisioningResponse["userLayer"],
-): string | null {
-	const names = missingRequired(layer).map((entry) => entry.name);
-	return names.length === 0 ? null : `Missing on workers: ${names.join(", ")}`;
 }
 
 /** Consecutive `down` health probes (15 s apart) after which Settings stops following a provision. */
@@ -6812,48 +6863,50 @@ function AlateActions({
 	);
 }
 
-/** The user-layer note after a provision: why it is empty, the sync command that fills it,
- *  and the prompt-required skills or rules the workers still lack. */
+/** The user-layer note after a provision, as one box: the layer's state (empty: amber, with the
+ *  sync command that fills it; else grey, with its counts), then the prompt-required skills and
+ *  rules the workers still lack as name chips under a divider. A complete layer is one hint line. */
 function UserLayerNote({
 	layer,
 }: {
 	layer: ProvisioningResponse["userLayer"] | null;
 }) {
 	if (layer === null) return null;
-	const missing = missingRequiredLine(layer);
-	if (userLayerEmpty(layer))
-		return (
-			<>
-				{layer.mcp.length > 0 && <p className="hint">{userLayerLine(layer)}</p>}
-				<div className="prov-callout" role="status">
-					<Mark kind="needs" />
-					<span className="prov-callout-text">
-						<b>User layer is empty</b>
-						<small>
+	const empty = userLayerEmpty(layer);
+	const names = missingRequired(layer).map((entry) => entry.name);
+	if (!empty && names.length === 0)
+		return <p className="hint">{userLayerLine(layer)}</p>;
+	return (
+		<>
+			{empty && layer.mcp.length > 0 && (
+				<p className="hint">{userLayerLine(layer)}</p>
+			)}
+			<div className={`layer-note${empty ? "" : " calm"}`} role="status">
+				<Mark kind={empty ? "needs" : "warn"} />
+				<b>{empty ? "User layer is empty" : "User layer"}</b>
+				<p>
+					{empty ? (
+						<>
 							Workers get none of your skills or plugins. In a checkout of the
 							alate repo run{" "}
 							<code>node sync-user.mjs --data &lt;data-repo&gt;</code>, then
 							provision again.
-						</small>
-					</span>
-				</div>
-				{missing !== null && (
-					<p className="hint notif-line">
-						<Mark kind="warn" />
-						<span>{missing}</span>
+						</>
+					) : (
+						userLayerLine(layer).replace(/^User layer: /, "")
+					)}
+				</p>
+				{names.length > 0 && (
+					<p className="layer-missing">
+						Missing on workers:{" "}
+						<span className="layer-chips">
+							{names.map((n) => (
+								<code key={n}>{n}</code>
+							))}
+						</span>
 					</p>
 				)}
-			</>
-		);
-	return (
-		<>
-			<p className="hint">{userLayerLine(layer)}</p>
-			{missing !== null && (
-				<p className="hint notif-line">
-					<Mark kind="warn" />
-					<span>{missing}</span>
-				</p>
-			)}
+			</div>
 		</>
 	);
 }
@@ -7146,13 +7199,20 @@ export function AlateSection() {
 			status={loaded ? alateChip(conn, keySet, health, lastErr) : undefined}
 			hint="alate provisions omp rules, settings, skills and plugins from the data repo it is configured with; provisioning asks the alate server API, so the server must be running."
 		>
+			{/* The chip already carries the connection and update state; the dashboard opens
+			    from one board button at the right, not an inline link. */}
 			{conn !== "" && (
-				<p className="hint">
-					<a href={conn} target="_blank" rel="noreferrer">
-						Open the alate dashboard
+				<div className="alate-dash">
+					<a
+						className="alate-dash-link"
+						href={conn}
+						target="_blank"
+						rel="noreferrer"
+					>
+						<Icon name="external-link" size={14} />
+						Open dashboard
 					</a>
-					{health !== null && <> · {alateHint(health)}</>}
-				</p>
+				</div>
 			)}
 			{lastErr !== null && (
 				<p className="auth-error" role="alert">

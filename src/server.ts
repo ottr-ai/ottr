@@ -54,7 +54,12 @@ import {
 } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
 import { turnEnv } from "./tokens.ts";
-import { buildToolsPath, ensureProjectTools } from "./tools.ts";
+import {
+	buildToolsPath,
+	ensureProjectTools,
+	envValuesByKind,
+	listedEnvNames,
+} from "./tools.ts";
 import {
 	appendLog,
 	createTurnLoop,
@@ -179,6 +184,8 @@ const shared: {
 	projectOrder: string[];
 	/** /api/settings/env writes saved values here; the loop reads them per turn. */
 	envValues: Record<string, string>;
+	/** Plain (not secret) env values, one per env.txt name marked `plain`; never redacted. */
+	envPlain: Record<string, string>;
 } = {
 	// "none" starts the board with no global cap, like the Settings choice.
 	maxTotalRuns:
@@ -191,6 +198,7 @@ const shared: {
 	trendingScan: true,
 	commitIdentity: null,
 	envValues: {},
+	envPlain: {},
 	...storedProjectPaths(gstore),
 };
 
@@ -664,11 +672,20 @@ const loop = createTurnLoop(projects, {
 	killDetached: (url, token, id) => killDetachedRequest(url, token, id),
 	ensurePackages: (project) => ensureProjectPackages(project, workersHome),
 	turnEnv: (project, model) =>
-		turnEnv(project, model, shared.envValues, {
-			home: workersHome,
-			// Hosted model access is API keys only: no provider OAuth token is lent to turns.
-			lend: hosted === undefined,
-		}),
+		turnEnv(
+			project,
+			model,
+			envValuesByKind(
+				shared.envValues,
+				shared.envPlain,
+				listedEnvNames(workersHome),
+			),
+			{
+				home: workersHome,
+				// Hosted model access is API keys only: no provider OAuth token is lent to turns.
+				lend: hosted === undefined,
+			},
+		),
 	// R5-1: a server-local turn reads tools.json and requirements.txt and installs under the
 	// board's server-only home (the board-seed copy), never the shared home a worker turn can
 	// write. The project venv's bin dir joins the tools link dir on the turn PATH, so a merge

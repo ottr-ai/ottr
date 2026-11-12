@@ -534,6 +534,7 @@ function mountBoard(
 		commitIdentity: null,
 		removedPaths: [] as string[],
 		envValues: {} as Record<string, string>,
+		envPlain: {} as Record<string, string>,
 		projectPaths: [] as string[],
 		projectOrder: [] as string[],
 	};

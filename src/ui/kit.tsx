@@ -190,6 +190,14 @@ const ICON_PATHS = {
 			<line x1="12" x2="12" y1="15" y2="3" />
 		</>
 	),
+	// lucide external-link (ISC): a link that opens another app in a new tab.
+	"external-link": (
+		<>
+			<path d="M15 3h6v6" />
+			<path d="M10 14 21 3" />
+			<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+		</>
+	),
 	"refresh-cw": (
 		<>
 			<polyline points="23 4 23 10 17 10" />

@@ -24,7 +24,6 @@ import {
 	HindsightSection,
 	hostedHidden,
 	ModelRolesSection,
-	missingRequiredLine,
 	NotificationsSection,
 	OmpStatsSection,
 	onChip,
@@ -5265,8 +5264,10 @@ describe("AlateSection user layer", () => {
 			}),
 		);
 		try {
-			expect(container.textContent).toContain(
-				"User layer: 2 skills, 1 plugin, MCP servers: chrome-devtools, context-mode",
+			// Required entries are missing, so the counts ride the grey box, not a hint line.
+			const box = container.querySelector(".layer-note.calm");
+			expect(box?.textContent).toContain(
+				"2 skills, 1 plugin, MCP servers: chrome-devtools, context-mode",
 			);
 			expect(container.textContent).not.toContain("User layer is empty");
 		} finally {
@@ -5282,35 +5283,9 @@ describe("AlateSection user layer", () => {
 			expect(container.textContent).toContain("User layer is empty");
 			expect(container.textContent).toContain("sync-user.mjs --data");
 			expect(container.textContent).not.toContain("User layer: ");
-			const callout = container.querySelector(".prov-callout");
+			const callout = container.querySelector(".layer-note");
 			expect(callout).not.toBeNull();
 			expect(callout?.getAttribute("role")).toBe("status");
-		} finally {
-			await unmount();
-		}
-	});
-
-	test("a layer that lacks prompt-required entries shows one missing line in shipped order", async () => {
-		const { container, unmount } = await mountAlate(
-			fetchMockFor({
-				skills: ["ui-ux-check", "retro"],
-				plugins: [],
-				rules: ["codeguard-1-input-validation.md"],
-				mcp: [],
-			}),
-		);
-		try {
-			expect(container.textContent).toContain(
-				"Missing on workers: security-audit, codebase-design, ponytail-audit, diff-security-review, explain-project, check-ottr-board",
-			);
-			// One line, in the section's warn style: the grey warning mark rides a hint line.
-			const lines = [...container.querySelectorAll("p.hint.notif-line")].map(
-				(p) => p.textContent ?? "",
-			);
-			expect(
-				lines.filter((t) => t.includes("Missing on workers")),
-			).toHaveLength(1);
-			expect(lines[0]!.startsWith("Missing on workers: ")).toBe(true);
 		} finally {
 			await unmount();
 		}
@@ -5342,34 +5317,40 @@ describe("AlateSection user layer", () => {
 		}
 	});
 
-	test("missingRequiredLine names the gaps or returns null", () => {
-		expect(
-			missingRequiredLine({
+	test("a partial layer renders one grey box: the counts, then the missing names as chips", async () => {
+		const { container, unmount } = await mountAlate(
+			fetchMockFor({
 				skills: ["ui-ux-check"],
 				plugins: [],
 				rules: [],
 				mcp: [],
 			}),
-		).toBe(
-			"Missing on workers: security-audit, codeguard, codebase-design, ponytail-audit, diff-security-review, explain-project, check-ottr-board, retro",
 		);
-		expect(
-			missingRequiredLine({
-				skills: [
-					"security-audit",
-					"codebase-design",
-					"ponytail",
-					"ui-ux-check",
-					"diff-security-review",
-					"explain-project",
-					"check-ottr-board",
-					"retro",
-				],
-				plugins: [],
-				rules: ["codeguard-1-hardcoded-credentials.md"],
-				mcp: [],
-			}),
-		).toBe(null);
+		try {
+			const box = container.querySelector(".layer-note");
+			if (box === null) throw new Error("layer note missing");
+			expect(box.classList.contains("calm")).toBe(true);
+			expect(box.getAttribute("role")).toBe("status");
+			expect(box.textContent).toContain("1 skill, 0 plugins");
+			expect(
+				[...box.querySelectorAll(".layer-chips code")].map(
+					(c) => c.textContent,
+				),
+			).toEqual([
+				"security-audit",
+				"codeguard",
+				"codebase-design",
+				"ponytail-audit",
+				"diff-security-review",
+				"explain-project",
+				"check-ottr-board",
+				"retro",
+			]);
+			// One layout: no separate missing line beside the box.
+			expect(container.querySelector(".notif-line")).toBeNull();
+		} finally {
+			await unmount();
+		}
 	});
 
 	test("the line helpers pluralize counts and treat MCP-only layers as empty", () => {
@@ -6628,6 +6609,80 @@ describe("Unreadable stored secrets", () => {
 		});
 		try {
 			expect(container.textContent).not.toContain(MSG);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	test("the env table leads with missing values, hides set secrets behind Replace, and shows plain values", async () => {
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async (): Promise<Response> =>
+			ok({
+				names: [
+					{
+						name: "API_TOKEN",
+						projects: ["_all"],
+						plain: false,
+						set: true,
+						readable: true,
+					},
+					{
+						name: "MQTT_HOST",
+						projects: ["p1"],
+						plain: true,
+						set: true,
+						readable: true,
+						value: "mqtt.home.example",
+					},
+					{
+						name: "NEW_KEY",
+						projects: ["p1"],
+						plain: false,
+						set: false,
+						readable: false,
+					},
+				],
+			})) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<EnvSection />);
+		});
+		try {
+			const rows = [...container.querySelectorAll(".env-table tbody tr")];
+			// The missing value leads; set rows keep env.txt order after it.
+			expect(rows.map((r) => r.querySelector("code")?.textContent)).toEqual([
+				"NEW_KEY",
+				"API_TOKEN",
+				"MQTT_HOST",
+			]);
+			const state = (r: Element) => r.querySelector(".env-state");
+			expect(state(rows[0] as Element)?.textContent).toBe("Missing");
+			expect(
+				state(rows[0] as Element)?.querySelector(".mark-needs"),
+			).not.toBeNull();
+			expect(state(rows[1] as Element)?.textContent).toBe("Set");
+			// A set secret shows no field until Replace; its value never renders.
+			expect(rows[1]?.querySelector("input")).toBeNull();
+			expect(
+				rows[1]?.querySelector('button[aria-label="Replace API_TOKEN"]'),
+			).not.toBeNull();
+			// The plain row shows its stored value in a text field, with its tag.
+			const plain = rows[2]?.querySelector("input");
+			expect(plain?.getAttribute("type")).toBe("text");
+			expect(plain?.value).toBe("mqtt.home.example");
+			expect(rows[2]?.querySelector(".env-kind")?.textContent).toBe("plain");
+			// The missing secret gets a password field.
+			expect(rows[0]?.querySelector("input")?.getAttribute("type")).toBe(
+				"password",
+			);
 		} finally {
 			await act(async () => {
 				root.unmount();
