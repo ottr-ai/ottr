@@ -802,6 +802,8 @@ interface PrWatcherCtx {
 	gh: GhFn;
 	now: () => number;
 	review: ReviewFn;
+	/** The deterministic lens over one PR diff; defaults to perfFindings. */
+	perfScan: (diff: string, labels: string[]) => PerfFinding[];
 	/** Called with the card id when a re-review rewrites a draft the user may have read. */
 	forgetSeen?: (taskId: string) => void;
 }
@@ -1102,7 +1104,16 @@ async function reviewOnce(
 		}
 		diff = data.diff;
 		const { body, labels } = data;
-		candidates = perfFindings(diff, labels);
+		// The lens only adds candidates: an isolated scan failure logs and leaves the
+		// review to continue without candidates, never skipping it (the same try also
+		// holds steps that legitimately skip the review for this head).
+		try {
+			candidates = ctx.perfScan(diff, labels);
+		} catch (e) {
+			ctx.log(
+				`prs: ${project.name}: #${row.number} perf lens failed: ${(e as Error).message}`,
+			);
+		}
 		earlier = await fetchReReviewContext({
 			repo,
 			number: row.number,
@@ -1299,6 +1310,8 @@ export function createPrWatcher(deps: {
 	review?: ReviewFn;
 	/** The process spawner for the default review. */
 	spawn?: SpawnFn;
+	/** The deterministic perf lens over one PR diff; defaults to perfFindings. */
+	perfScan?: (diff: string, labels: string[]) => PerfFinding[];
 }): {
 	tick(opts?: { manual?: string }): Promise<void>;
 	reviewNow(o: {
@@ -1318,6 +1331,7 @@ export function createPrWatcher(deps: {
 		gh,
 		now,
 		review,
+		perfScan: deps.perfScan ?? perfFindings,
 		forgetSeen: deps.forgetSeen,
 	};
 	// Review requests serialize through one chain per watcher; reviewIdle resolves when it drains.

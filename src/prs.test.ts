@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import { PROMPT_CHAR_BUDGET } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
+import type { PerfFinding } from "./perfLens.ts";
 import { parseReviewDraft } from "./prInline.ts";
 import {
 	createPrWatcher,
@@ -162,7 +163,12 @@ function reviewRoute(state: FakeGhState, path: string): FakeGhOut | null {
 }
 
 function setup(
-	opts: { on?: boolean; github?: string | null; spawn?: SpawnFn } = {},
+	opts: {
+		on?: boolean;
+		github?: string | null;
+		spawn?: SpawnFn;
+		perfScan?: (diff: string, labels: string[]) => PerfFinding[];
+	} = {},
 ) {
 	const dir = join(root, `p${++seq}`);
 	mkdirSync(dir, { recursive: true });
@@ -221,6 +227,7 @@ function setup(
 		forgetSeen: (id) => forgotten.push(id),
 		now: () => t,
 		spawn: opts.spawn,
+		perfScan: opts.perfScan,
 		review: opts.spawn
 			? undefined
 			: async (messages) => {
@@ -1895,5 +1902,22 @@ describe("createPrWatcher", () => {
 		const system = joined.slice(0, joined.length - expected.length - 1);
 		expect(system.startsWith("You review one GitHub pull request")).toBe(true);
 		expect(system.endsWith("summary and the inline blocks.")).toBe(true);
+	});
+
+	test("a failed perf scan logs and the review continues without candidates", async () => {
+		const s = setup({
+			perfScan: () => {
+				throw new Error("scan blew up");
+			},
+		});
+		s.diffs.set(14, dbNPlusOne);
+		s.setOpen([pr(14, sha("b"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The review ran: the scan failure must not skip it for this head.
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]).not.toContain("PERF LENS");
+		expect(s.logs).toContain("prs: p: #14 perf lens failed: scan blew up");
 	});
 });

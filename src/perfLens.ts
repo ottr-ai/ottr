@@ -182,6 +182,10 @@ function* scanLines(diff: string): Generator<ScanLine> {
 			continue;
 		}
 		if (raw.startsWith("-")) continue;
+		// The `\ No newline at end of file` marker annotates the line above it: it is
+		// no line of either file, so it advances nothing, matches nothing, and closes
+		// no loop (prInline.ts handles the same marker in its hunk walk).
+		if (raw.startsWith("\\")) continue;
 		const added = raw.startsWith("+");
 		const content = added ? raw.slice(1) : raw;
 		const trimmed = content.trim();

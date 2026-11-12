@@ -131,6 +131,60 @@ describe("perfFindings", () => {
 		expect(perfFindings(CLEAN_DIFF, [])).toEqual([]);
 	});
 
+	test("a no-newline marker annotates the line above it: it never counts, matches, or closes a loop", () => {
+		// The file had no trailing newline, so git places the marker between the
+		// deleted tail and the additions, and again after the last addition. The
+		// marker is not blank and not a comment: without its skip it would advance
+		// the counter one line high and its indent 0 would close the open loop.
+		const diff = [
+			"diff --git a/src/db/orders.ts b/src/db/orders.ts",
+			"--- a/src/db/orders.ts",
+			"+++ b/src/db/orders.ts",
+			"@@ -1,3 +1,5 @@",
+			" export function tail(db: Db, xs: number[]) {",
+			"-  return null;",
+			"\\ No newline at end of file",
+			"+  for (const x of xs) {",
+			"+    db.query(sql(x));",
+			"+  }",
+			"+  return null;",
+			"\\ No newline at end of file",
+		].join("\n");
+		expect(perfFindings(diff, [])).toEqual([
+			{
+				kind: "n+1",
+				path: "src/db/orders.ts",
+				line: 3,
+				snippet: "db.query(sql(x));",
+			},
+		]);
+	});
+
+	test("a no-newline marker does not close a loop opened above it", () => {
+		// The loop opens on a context line; the marker after the deleted line sits at
+		// indent 0, and treating it as a code line would close the loop before the
+		// addition, losing the candidate.
+		const diff = [
+			"diff --git a/src/db/orders.ts b/src/db/orders.ts",
+			"--- a/src/db/orders.ts",
+			"+++ b/src/db/orders.ts",
+			"@@ -1,3 +1,3 @@",
+			" for (const x of xs) {",
+			"-  log(x);",
+			"\\ No newline at end of file",
+			"+  db.query(sql(x));",
+			" }",
+		].join("\n");
+		expect(perfFindings(diff, [])).toEqual([
+			{
+				kind: "n+1",
+				path: "src/db/orders.ts",
+				line: 2,
+				snippet: "db.query(sql(x));",
+			},
+		]);
+	});
+
 	test("an untriggered diff returns no findings without a scan", () => {
 		// The n+1 diff's path matches no glob and no label arms the lens.
 		expect(perfFindings(N_PLUS_ONE_DIFF, [])).toEqual([]);
