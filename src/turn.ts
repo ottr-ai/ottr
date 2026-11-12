@@ -87,6 +87,7 @@ import {
 	findHttp400Rejection,
 	hitUsageLimit,
 	MODEL_RESTORE,
+	OOM_KILL,
 	QUOTA_LIMIT,
 	rateLimitWaitMs,
 	rejectedReport,
@@ -7079,6 +7080,18 @@ export function createTurnLoop(
 			settled.needsReason.includes(" (dispatch ")
 		)
 			appendLog(st.store, st.id, settled.needsReason);
+		// A worker OOM death names its cause in the reason; the card log gets the same line
+		// with the worker's name (the dispatch URL hostname), so an operator tailing the log
+		// sees which worker hit its memory wall. An OOM reason never starts with
+		// "omp exited with code ", so the two branches never double-log.
+		if (settled.needsReason?.startsWith(OOM_KILL))
+			appendLog(
+				st.store,
+				st.id,
+				st.dispatch?.handle?.url
+					? `${settled.needsReason} (worker ${new URL(st.dispatch.handle.url).hostname})`
+					: settled.needsReason,
+			);
 		// OTTR-754: an apt disk-failure signature names the runner's /tmp free space (the
 		// apt error itself never says "no space"); the runner comes from the dispatch
 		// record's url, undefined = a local run.

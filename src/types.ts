@@ -671,6 +671,13 @@ export interface RunResult {
 	 * manifest, audited when the run settled (docs/specs/turn-provision-guard.md). Non-empty
 	 * fails the turn: the only path for layer changes is agent-data -> import -> provision. */
 	provisionDrift?: string[];
+	/** True when the worker container's memory limit killed the run: the run ended with
+	 * no exit code (a signal) while the cgroup v2 memory.events oom_kill count grew.
+	 * Classic workers only; absent otherwise (docs/specs/worker-oom-continue.md). */
+	oomKilled?: boolean;
+	/** The worker container's memory.max byte limit read beside the oom_kill counters;
+	 * null when the container has no limit ("max") or the cgroup files were unreadable. */
+	memoryLimitBytes?: number | null;
 }
 
 /** Git checks the tracker runs in the worktree after a turn. */

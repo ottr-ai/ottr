@@ -21036,6 +21036,105 @@ describe("turn PR-mode merge settle", () => {
 	});
 });
 
+describe("worker OOM kill: one automatic continue, then a park", () => {
+	const oomResult = (): RunResult =>
+		runResult({
+			exitCode: null,
+			sessionId: null,
+			sawTerminalEnd: false,
+			finalText: "",
+			oomKilled: true,
+			memoryLimitBytes: 8589934592,
+		});
+	/** A fake worker run whose done carries `result`; the handle url mirrors the real
+	 * worker dispatch's (the settle log reads its hostname). */
+	const oomRun =
+		(record: Recorded, result: RunResult) =>
+		(o: Parameters<TurnOps["startRun"]>[0]) => {
+			record.runs.push(o);
+			o.onSession?.("sess");
+			return {
+				pid: null,
+				...(o.worker ? { url: o.worker.urls[0]! } : {}),
+				done: Promise.resolve(result),
+				kill: async () => {},
+			};
+		};
+	/** Drains the loop's own background turns until the card leaves the given states. */
+	const untilSettled = async (
+		store: ProjectStore,
+		id: string,
+		inFlight: (state: string, stage: string) => boolean,
+	) => {
+		for (let i = 0; i < 100; i++) {
+			const t = store.getTask(id)!;
+			if (!inFlight(t.state, t.stage)) return;
+			await flushPromises();
+		}
+	};
+
+	test("a worker OOM death queues the card once and logs the cause with the worker name", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			// Cap 0: the settle's own schedule() starts no follow-up turn behind the test.
+			maxTotalRuns: () => 0,
+			workerTarget: { urls: ["http://worker-b:8787"] },
+			startRun: oomRun(record, oomResult()),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		const card = store.getTask(task.id)!;
+		expect(card.state).toBe("queued");
+		expect(card.pendingPrompt).toBe(".");
+		expect(card.needsReason).toStartWith(
+			"The worker ran out of memory (OOM kill, limit 8 GiB)",
+		);
+		expect(card.needsReason).toContain("continuing automatically");
+		// The card log names the cause and the worker, not just "omp exited with code unknown".
+		expect(logText(store, task.id)).toContain(
+			`${card.needsReason} (worker worker-b)`,
+		);
+	});
+
+	test("a second OOM death parks the card for a human", async () => {
+		const record = baseRecord();
+		const { store, loop } = setupWith(record, {
+			workerTarget: { urls: ["http://worker-b:8787"] },
+			startRun: oomRun(record, oomResult()),
+		});
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		// The first settle queued a continue: the loop's schedule() starts it, it dies the
+		// same way, and the streak rule parks for a human.
+		await untilSettled(
+			store,
+			task.id,
+			(state, stage) =>
+				state === "preparing" ||
+				state === "running" ||
+				(state === "queued" && stage === "in_progress"),
+		);
+
+		expect(record.runs).toHaveLength(2);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toStartWith(
+			"The worker ran out of memory (OOM kill, limit 8 GiB)",
+		);
+		expect(after.needsReason).toContain("again after the automatic continue");
+		expect(after.pendingPrompt).toBeNull();
+		// The turn row carries the reason, so the next classify sees the streak.
+		const rows = store.listTurns(task.id);
+		expect(rows).toHaveLength(2);
+		expect(rows[0]!.error).toBe(
+			"The worker ran out of memory (OOM kill, limit 8 GiB) - continuing automatically. Cancel to stop it instead.",
+		);
+		// Both settles logged the cause with the worker name.
+		expect(logText(store, task.id)).toContain("worker worker-b");
+	});
+});
+
 describe("microVM dispatch (OTTR-532)", () => {
 	const VM_URL = "http://vm-runner:8787";
 	const savedHealth = vmState.health;

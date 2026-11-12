@@ -34,6 +34,7 @@ import { platform } from "./platform/index.ts";
 import { ensurePluginSkillsOverlay } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
 import { PROGRESS_EVENT, watchProgress } from "./stryker.ts";
+import { formatBytes } from "./tmpsweep.ts";
 import type {
 	AskQuestion,
 	GitFacts,
@@ -385,6 +386,10 @@ export const MODEL_RESTORE = "This board cannot load the session's model";
 /** Opens the usage-limit continue reason; classify matches it in the previous turn's error. */
 export const QUOTA_LIMIT = "The run stopped at the provider's usage limit";
 
+/** Opens the worker OOM kill reason; classify matches it in the previous turn's error, and
+ * the settle log in turn.ts matches it to add the worker name. */
+export const OOM_KILL = "The worker ran out of memory (OOM kill";
+
 /**
  * omp writes one JSON file per rejected HTTP 400 request under its state root:
  * $HOME/.omp/logs/http-400-requests/<millis>-<id>.json. R5-1: that root stays under the HOME omp
@@ -658,6 +663,29 @@ const usageLimitRule: ClassifyRule = (o, stage) => {
 			};
 };
 
+/** The worker container's memory limit killed the run (kernel OOM): the run ended with no
+ * exit code while the cgroup's oom_kill count grew. Same one-auto-continue-per-streak
+ * pattern as the usage-limit rule; the settle log names the worker. */
+const oomRule: ClassifyRule = (o, stage) => {
+	if (o.result.oomKilled !== true) return null;
+	const bytes = o.result.memoryLimitBytes;
+	const sentence =
+		bytes === null || bytes === undefined
+			? `${OOM_KILL})`
+			: `${OOM_KILL}, limit ${formatBytes(bytes)})`;
+	return o.previousError?.startsWith(OOM_KILL)
+		? needsAt(
+				stage,
+				`${sentence} again after the automatic continue. Free memory or raise the worker limit, then reply.`,
+			)
+		: {
+				stage,
+				state: "queued",
+				needsReason: `${sentence} - continuing automatically. Cancel to stop it instead.`,
+				pendingPrompt: ".",
+			};
+};
+
 /** The death block: omp exited without a terminal report; every sub-rule shares the
  * `last` context for the final generic failure. */
 function deathRule(o: ClassifyInput, stage: Next["stage"]): Next | null {
@@ -669,6 +697,8 @@ function deathRule(o: ClassifyInput, stage: Next["stage"]): Next | null {
 		)
 	)
 		return null;
+	const oom = oomRule(o, stage);
+	if (oom !== null) return oom;
 	const reject = providerRejectionRule(o, stage);
 	if (reject !== null) return reject;
 	const restore = modelRestoreRule(o, stage);

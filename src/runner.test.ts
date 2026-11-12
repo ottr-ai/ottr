@@ -34,6 +34,7 @@ import {
 	hitUsageLimit,
 	NO_DISCOVERY_CONFIG,
 	newEventState,
+	OOM_KILL,
 	QUOTA_LIMIT,
 	rateLimitWaitMs,
 	rejectedReport,
@@ -1389,6 +1390,50 @@ describe("classify", () => {
 			state: "needs_you",
 			needsReason:
 				"omp exited with code 1 before finishing: rate limit exceeded (429), retrying in 2s.",
+		});
+	});
+
+	test("2j. a worker OOM kill continues once, then parks", () => {
+		// A signal death with the cgroup oom_kill counter grown: the limit lands in the reason.
+		const oom = run(
+			"work",
+			result({ exitCode: null, oomKilled: true, memoryLimitBytes: 8589934592 }),
+		);
+		expect(oom).toEqual({
+			stage: "in_progress",
+			state: "queued",
+			needsReason: `${OOM_KILL}, limit 8 GiB) - continuing automatically. Cancel to stop it instead.`,
+			pendingPrompt: ".",
+		});
+		// The continue fired once already and the same wall killed the retry: a human decides.
+		expect(
+			run(
+				"work",
+				result({
+					exitCode: null,
+					oomKilled: true,
+					memoryLimitBytes: 8589934592,
+				}),
+				git(),
+				"origin/main",
+				oom.needsReason ?? null,
+			),
+		).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: `${OOM_KILL}, limit 8 GiB) again after the automatic continue. Free memory or raise the worker limit, then reply.`,
+		});
+		// A container with no memory.max (or unreadable cgroup files) drops the limit clause.
+		expect(
+			run("work", result({ exitCode: null, oomKilled: true })).needsReason,
+		).toBe(
+			`${OOM_KILL}) - continuing automatically. Cancel to stop it instead.`,
+		);
+		// A signal death with no oom_kill growth keeps today's generic park.
+		expect(run("work", result({ exitCode: null }))).toEqual({
+			stage: "in_progress",
+			state: "needs_you",
+			needsReason: "omp exited with code unknown before finishing.",
 		});
 	});
 

@@ -89,6 +89,31 @@ process.stderr.write("detach tail\\n");
 setTimeout(() => process.exit(7), 2000);`,
 );
 
+// OOM grow + self-kill omp: rewrites the memory.events fixture it receives as argv[2]
+// to a grown oom_kill count, then kills itself with SIGKILL — the end shape a kernel
+// OOM kill gives the daemon (close with no exit code). A child the test created may
+// signal itself.
+const oomGrowKillPath = join(dir, "oom-grow-kill-omp.js");
+writeFileSync(
+	oomGrowKillPath,
+	`require("node:fs").writeFileSync(process.argv[2], "low 0\\nhigh 0\\nmax 0\\noom 0\\noom_kill 7\\n");
+process.kill(process.pid, "SIGKILL");`,
+);
+
+// OOM grow + exit omp: grows the same fixture, then ends with an exit code — the
+// shape that must never flag OOM even when the count grew.
+const oomGrowExitPath = join(dir, "oom-grow-exit-omp.js");
+writeFileSync(
+	oomGrowExitPath,
+	`require("node:fs").writeFileSync(process.argv[2], "low 0\\nhigh 0\\nmax 0\\noom 0\\noom_kill 7\\n");
+process.exit(3);`,
+);
+
+// OOM self-kill omp: kills itself without touching the fixture, so the count never
+// grows while the run lives.
+const oomKillPath = join(dir, "oom-kill-omp.js");
+writeFileSync(oomKillPath, `process.kill(process.pid, "SIGKILL");`);
+
 // Every test below that runs one of these fakes through serveWorker or runWorker spawns a real
 // bun child, and child boot is unbounded under concurrent machine load (past 4 s observed).
 // Such tests carry a 30 s budget: the 5 s default bounds the machine, not the assertions.
@@ -950,6 +975,94 @@ describe("GET /stats", () => {
 	);
 });
 
+describe("run OOM detection", () => {
+	// The live-path proof: the real readCgroup reader over a real temp cgroup dir
+	// around a real spawned child. Each fixture starts at oom_kill 5 under an 8 GiB
+	// memory.max; the child rewrites memory.events mid-run to grow the count like a
+	// real kernel would, then ends the way the kernel's OOM killer ends a run
+	// (SIGKILL, close with no exit code) or with an exit code.
+	let oomCgroupN = 0;
+	function cgroupFixture(): string {
+		const root = join(dir, `oom-cgroup-${oomCgroupN++}`);
+		mkdirSync(root, { recursive: true });
+		writeFileSync(join(root, "memory.max"), "8589934592\n");
+		writeFileSync(
+			join(root, "memory.events"),
+			"low 0\nhigh 0\nmax 0\noom 0\noom_kill 5\n",
+		);
+		return root;
+	}
+
+	async function runOom(
+		url: string,
+		id: string,
+		argv: string[],
+	): Promise<{
+		exitCode: number | null;
+		stderrTail: string;
+		oomKilled?: boolean;
+		memoryLimitBytes?: number | null;
+	}> {
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id, argv, cwd: dir, stdin: "", env: {} }),
+		});
+		expect(res.status).toBe(200);
+		const lines = await readLines(res);
+		const sentinel = JSON.parse(lines[lines.length - 1]!) as {
+			[WORKER_DONE]: { exitCode: number | null; stderrTail: string };
+		};
+		return sentinel[WORKER_DONE];
+	}
+
+	test("a signal death whose oom_kill grew carries oomKilled and the memory limit", async () => {
+		const cgroupRoot = cgroupFixture();
+		const url = start({ ompPath: process.execPath, cgroupRoot });
+		const sentinel = await runOom(url, "oom1", [
+			oomGrowKillPath,
+			join(cgroupRoot, "memory.events"),
+		]);
+		expect(sentinel.exitCode).toBeNull();
+		expect(sentinel.oomKilled).toBe(true);
+		expect(sentinel.memoryLimitBytes).toBe(8589934592);
+	}, 30_000);
+
+	test("an exit-code end with a grown oom_kill count carries no OOM fields", async () => {
+		const cgroupRoot = cgroupFixture();
+		const url = start({ ompPath: process.execPath, cgroupRoot });
+		const sentinel = await runOom(url, "oom2", [
+			oomGrowExitPath,
+			join(cgroupRoot, "memory.events"),
+		]);
+		expect(sentinel.exitCode).toBe(3);
+		expect(sentinel.oomKilled).toBeUndefined();
+		expect(sentinel.memoryLimitBytes).toBeUndefined();
+	}, 30_000);
+
+	test("a signal death without oom_kill growth carries no OOM fields", async () => {
+		const cgroupRoot = cgroupFixture();
+		const url = start({ ompPath: process.execPath, cgroupRoot });
+		const sentinel = await runOom(url, "oom3", [oomKillPath]);
+		expect(sentinel.exitCode).toBeNull();
+		expect(sentinel.oomKilled).toBeUndefined();
+		expect(sentinel.memoryLimitBytes).toBeUndefined();
+	}, 30_000);
+
+	test("a signal death with an unreadable cgroup root carries no OOM fields", async () => {
+		// Degraded, never thrown: both snapshots null, today's sentinel shape.
+		const url = start({
+			ompPath: process.execPath,
+			cgroupRoot: join(dir, "oom-cgroup-missing"),
+		});
+		const sentinel = await runOom(url, "oom4", [oomKillPath]);
+		expect(sentinel.exitCode).toBeNull();
+		expect(sentinel.stderrTail).toBe("");
+		expect(sentinel.oomKilled).toBeUndefined();
+		expect(sentinel.memoryLimitBytes).toBeUndefined();
+	}, 30_000);
+});
+
 describe("runWorker", () => {
 	test("non-sentinel lines go to the sink; sentinel settles the result and logs the stderr tail", async () => {
 		const errPath = join(dir, "err2-omp.js");
@@ -1044,6 +1157,44 @@ describe("runWorker", () => {
 		);
 		const result = await done;
 		expect(result.provisionDrift).toBeUndefined();
+	}, 30_000);
+
+	test("a sentinel with the OOM fields settles them onto the result", async () => {
+		const oomSentinelPath = join(dir, "oom-sentinel-omp.js");
+		writeFileSync(
+			oomSentinelPath,
+			`process.stdout.write(JSON.stringify({ ${JSON.stringify(WORKER_DONE)}: { exitCode: null, stderrTail: "", oomKilled: true, memoryLimitBytes: 8589934592 } }) + "\\n");\nprocess.exit(0);`,
+		);
+		const url = start({ ompPath: process.execPath });
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "oom-r1", argv: [oomSentinelPath], cwd: dir, stdin: "", env: {} },
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBeNull();
+		expect(result.oomKilled).toBe(true);
+		expect(result.memoryLimitBytes).toBe(8589934592);
+	}, 30_000);
+
+	test("a sentinel without the OOM fields leaves them absent", async () => {
+		const noOomSentinelPath = join(dir, "no-oom-sentinel-omp.js");
+		writeFileSync(
+			noOomSentinelPath,
+			`process.stdout.write(JSON.stringify({ ${JSON.stringify(WORKER_DONE)}: { exitCode: 0, stderrTail: "" } }) + "\\n");\nprocess.exit(0);`,
+		);
+		const url = start({ ompPath: process.execPath });
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "oom-r2", argv: [noOomSentinelPath], cwd: dir, stdin: "", env: {} },
+			{ urls: [url] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		expect(result.oomKilled).toBeUndefined();
+		expect(result.memoryLimitBytes).toBeUndefined();
 	}, 30_000);
 
 	test("round-robins across urls", async () => {

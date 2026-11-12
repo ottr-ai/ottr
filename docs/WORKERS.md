@@ -56,6 +56,9 @@ worker, and `4g` for the `board-seed` one-off. The values are estimates. Measure
 with `docker stats` under load, then set about 2x the peak in the compose env file:
 `OTTR_SERVER_MEM_LIMIT`, `OTTR_WORKER_MEM_LIMIT`, and `OTTR_SEED_MEM_LIMIT`. When a container gets to its limit,
 the kernel stops a process in that container (OOM kill), not a process on the whole host.
+When the kill ends a worker turn, the card's reason names the memory limit, the board
+logs the kill on the card, and the board continues the turn once by itself. A second
+OOM death of the same card parks it for you (docs/specs/worker-oom-continue.md).
 The board's **System** view (`/system`) shows each container's CPU, memory against its limit,
 memory limit hits and OOM kills from its own cgroup (workers report theirs on `GET /stats`),
 plus the Docker VM's CPU, load and free memory, over the last hour. `GET /stats` also lists the

@@ -117,6 +117,13 @@ export interface DetachedRun {
 		vm?: VmOutcome;
 		/** The shared home's provisioned-layer drift the daemon's close audit found. */
 		provisionDrift?: string[];
+		/** The kernel OOM kill the run died by: set only when the child ended with no
+		 * exit code and memory.events' oom_kill count grew between spawn and close
+		 * (docs/specs/worker-oom-continue.md). */
+		oomKilled?: boolean;
+		/** The container's memory.max byte limit read beside the oom_kill counters;
+		 * null without a limit ("max") or when the cgroup files were unreadable. */
+		memoryLimitBytes?: number | null;
 	};
 	killed?: boolean;
 }
@@ -158,7 +165,8 @@ export function serveWorker(opts: {
 	detachedTtlMs?: number;
 	/** Only for tests: the sign-ins GET /signins reports instead of reading the worker's own store. */
 	readSignIns?: () => SignIn[];
-	/** Only for tests: the cgroup v2 directory GET /stats reads instead of /sys/fs/cgroup. */
+	/** Only for tests: the cgroup v2 directory GET /stats and the runs' OOM snapshots
+	 * read instead of /sys/fs/cgroup (docs/specs/worker-oom-continue.md). */
 	cgroupRoot?: string;
 	/** Only for tests: the mutation lock file GET /stats reads instead of tmpdir()/ott-stryker.lock. */
 	lockPath?: string;
@@ -363,6 +371,10 @@ export function serveWorker(opts: {
 		// The provision guard's untracked scan compares against the rules dir as it
 		// stood before omp started (docs/specs/turn-provision-guard.md).
 		const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
+		// The OOM detection window opens here: the oom_kill count before the spawn,
+		// so a kernel kill that lands during this run is distinguishable from one
+		// the container already carried (docs/specs/worker-oom-continue.md).
+		const oomBefore = oomSnapshot(opts.cgroupRoot);
 		let child: ChildProcess;
 		try {
 			child = spawn(opts.ompPath ?? "omp", body.argv, {
@@ -430,6 +442,8 @@ export function serveWorker(opts: {
 			forgetEntry,
 			auditProvisioned: opts.auditProvisioned,
 			rulesAtStart,
+			cgroupRoot: opts.cgroupRoot,
+			oomBefore,
 		});
 		request.signal.addEventListener("abort", killTree);
 		return new Response(stream, {
@@ -560,6 +574,12 @@ interface RunStreamArgs {
 		rulesAtStart?: readonly string[],
 	) => readonly string[];
 	rulesAtStart: readonly string[] | undefined;
+	/** The run's cgroup v2 root: the after-close OOM snapshot reads the same seam
+	 * GET /stats reads (docs/specs/worker-oom-continue.md). */
+	cgroupRoot: string | undefined;
+	/** The OOM snapshot taken before the spawn; null when the container had no
+	 * readable memory.events at spawn time. */
+	oomBefore: OomSnapshot | null;
 }
 
 /** Feeds one omp stdout chunk through push a full line at a time; the tail stays in `state`. */
@@ -575,6 +595,26 @@ function pushLines(
 		state.partial = state.partial.slice(idx + 1);
 		idx = state.partial.indexOf("\n");
 	}
+}
+
+/** One OOM snapshot of the worker container's cgroup v2 files
+ * (docs/specs/worker-oom-continue.md): the memory.events oom_kill count and the
+ * memory.max byte limit ("max" and unreadable files degrade to null). Null when the
+ * container had no readable memory.events, so a run without cgroup v2 never flags.
+ * readCgroup never throws, and neither does this. */
+interface OomSnapshot {
+	oomKill: number;
+	limitBytes: number | null;
+}
+
+function oomSnapshot(cgroupRoot: string | undefined): OomSnapshot | null {
+	const reading = readCgroup({ root: cgroupRoot });
+	if (reading.memoryEvents === null) return null;
+	return {
+		oomKill: reading.memoryEvents.oomKill,
+		limitBytes:
+			typeof reading.memoryMax === "number" ? reading.memoryMax : null,
+	};
 }
 
 /** The run's end: forget the child, audit the shared home's drift, then either park the
@@ -597,6 +637,17 @@ function finishRun(
 	const driftField = provisionDrift.length
 		? { provisionDrift: [...provisionDrift] }
 		: {};
+	// OOM naming (docs/specs/worker-oom-continue.md): a child that ended with no exit
+	// code while the container's oom_kill count grew between the snapshots died by the
+	// kernel OOM killer, and the limit rides along. An exit-code end never flags, and a
+	// null snapshot keeps today's shape. Sync reads only (readCgroup is readFileSync
+	// based), so finishRun stays sync.
+	let oomField: { oomKilled: true; memoryLimitBytes: number | null } | {} = {};
+	if (code === null && args.oomBefore !== null) {
+		const after = oomSnapshot(args.cgroupRoot);
+		if (after !== null && after.oomKill > args.oomBefore.oomKill)
+			oomField = { oomKilled: true, memoryLimitBytes: after.limitBytes };
+	}
 	if (entry.detached) {
 		// No client listens any more: the result waits in /detached for boot
 		// recovery instead of a sentinel on a gone stream.
@@ -605,12 +656,13 @@ function finishRun(
 			exitCode: code ?? null,
 			stderrTail: state.stderrTail,
 			...driftField,
+			...oomField,
 		};
 		return;
 	}
 	if (state.partial.length > 0) push(`${state.partial}\n`);
 	push(
-		`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail: state.stderrTail, host: hostname(), ...driftField } })}\n`,
+		`${JSON.stringify({ [WORKER_DONE]: { exitCode: code ?? null, stderrTail: state.stderrTail, host: hostname(), ...driftField, ...oomField } })}\n`,
 	);
 	closeController();
 }
@@ -685,9 +737,15 @@ function parseSentinel(line: string): {
 	host?: string;
 	vm?: VmOutcome;
 	provisionDrift?: string[];
+	oomKilled?: boolean;
+	memoryLimitBytes?: number | null;
 } | null {
 	const stringList = (v: unknown): v is string[] =>
 		Array.isArray(v) && v.length > 0 && v.every((l) => typeof l === "string");
+	// Loose checks like the rest of the sentinel: a field with the wrong type is
+	// dropped, never trusted (docs/specs/worker-oom-continue.md).
+	const byteLimit = (v: unknown): v is number | null =>
+		v === null || (typeof v === "number" && Number.isSafeInteger(v) && v >= 0);
 	try {
 		const v = JSON.parse(line) as Record<string, unknown>;
 		const done = v[WORKER_DONE] as Record<string, unknown> | undefined;
@@ -706,6 +764,12 @@ function parseSentinel(line: string): {
 				...(isVmOutcome(done.vm) ? { vm: vmOutcome(done.vm) } : {}),
 				...(stringList(done.provisionDrift)
 					? { provisionDrift: done.provisionDrift }
+					: {}),
+				...(typeof done.oomKilled === "boolean"
+					? { oomKilled: done.oomKilled }
+					: {}),
+				...(byteLimit(done.memoryLimitBytes)
+					? { memoryLimitBytes: done.memoryLimitBytes }
 					: {}),
 			};
 	} catch {
@@ -809,6 +873,12 @@ function settleSentinel(
 			...(sentinel.vm ? { vm: sentinel.vm } : {}),
 			...(sentinel.provisionDrift
 				? { provisionDrift: sentinel.provisionDrift }
+				: {}),
+			...(sentinel.oomKilled !== undefined
+				? { oomKilled: sentinel.oomKilled }
+				: {}),
+			...(sentinel.memoryLimitBytes !== undefined
+				? { memoryLimitBytes: sentinel.memoryLimitBytes }
 				: {}),
 		}),
 	);
