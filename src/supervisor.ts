@@ -2183,9 +2183,15 @@ export function createSupervisor(
 				return;
 			}
 			if (wentStale(e.store, t)) return;
+			// stage in_progress: the card leaves the merging watch, so no later
+			// window re-reads the PRs or re-writes the park until a reply
+			// re-queues it. The exact-reason guard stays as defense in depth.
+			const reason = `PR #${S} closed without merging`;
+			if (t.state === "needs_you" && t.needsReason === reason) return;
 			e.store.updateTask(t.id, {
+				stage: "in_progress",
 				state: "needs_you",
-				needsReason: `PR #${S} closed without merging`,
+				needsReason: reason,
 				pushSha: null,
 			});
 			ops.appendLog(

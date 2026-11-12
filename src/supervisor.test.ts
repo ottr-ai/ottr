@@ -4260,6 +4260,71 @@ describe("prPass", () => {
 		store.close();
 	});
 
+	test("a closed source parks the card out of the merging watch, idempotently", async () => {
+		// The follow-up settled (merged) and the source closed unmerged: the park
+		// moves the card out of the merging watch — stage in_progress, follow-up
+		// fields kept — so no later window re-reads the PRs or rewrites the park
+		// until a reply re-queues it.
+		const store = prModeProject("pr-fu-src-closed-settled");
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+								base: "ottr/552",
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({ state: "closed", base: "main" }),
+								stderr: "",
+							}
+						: openList([]),
+		});
+		const perPrReads = () =>
+			ops.apiCalls.filter((a) => /pulls\/[79]$/.test(a[1] ?? "")).length;
+		const listReads = () =>
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")).length;
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("PR #7 closed without merging");
+		expect(after.followUpPrNumber).toBe(9);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain(
+			"supervisor: PR #7 closed without merging; card parked",
+		);
+		const perPrAfterFirstWindow = perPrReads();
+		const listReadsAfterFirstWindow = listReads();
+
+		// A second window runs its poll (the clock advances past PR_POLL_MS): the
+		// card left the merging watch, so the PRs are not re-read and the park does
+		// not rewrite the row or the log.
+		ops.time += 6 * 60_000; // past the PR poll window
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		expect(listReads()).toBeGreaterThan(listReadsAfterFirstWindow);
+		expect(perPrReads()).toBe(perPrAfterFirstWindow);
+		const log2 = await Bun.file(store.logPath(t.id)).text();
+		expect(
+			log2.split("\n").filter((l) => l.includes("closed without merging")),
+		).toHaveLength(1);
+		store.close();
+	});
+
 	test("a closed source parks the card while the follow-up waits, idempotently", async () => {
 		// The source closed unmerged while the follow-up is still open: the card
 		// parks needs_you and one log line says so, however many windows pass.
