@@ -7989,6 +7989,176 @@ describe("turn ownership, cap and settle regressions", () => {
 		);
 	});
 
+	for (const metadata of ["saved", "absent"] as const) {
+		test(`recoverRestarted parks a stranded PR-mode merge with ${metadata} metadata and stays stable`, async () => {
+			const ship = jest.fn(async () => {
+				throw new Error("restart recovery must not ship or rebase");
+			});
+			const { store, projects, record, loop } = setup({
+				pushBranch: ship,
+				openPr: ship,
+				serverMergePush: ship,
+				rebaseTargetBranch: ship,
+			});
+			store.setSettings({
+				prMode: true,
+				originUrl: "https://github.com/acme/repo.git",
+			});
+			projects.get(store.name)!.github = "https://github.com/acme/repo.git";
+			const task = store.createTask("stranded PR-mode merge");
+			store.updateTask(task.id, {
+				stage: "merging",
+				state: "idle",
+				branch: metadata === "saved" ? "ott/stranded" : null,
+				worktree:
+					metadata === "saved" ? join(store.worktreesDir, task.id) : null,
+				prNumber: null,
+				prUrl:
+					metadata === "saved" ? "https://github.com/acme/repo/pull/12" : null,
+				prHeadSha: metadata === "saved" ? "old-pr-head" : null,
+				pushSha: metadata === "saved" ? "pushed-head" : null,
+				pendingPrompt: "preserve the user's reply",
+				keptFiles: metadata === "saved" ? ["notes.txt", "src/fix.ts"] : [],
+				needsReason: metadata === "saved" ? keptReason("M notes.txt") : null,
+			});
+			const before = store.getTask(task.id)!;
+			if (before.worktree) {
+				mkdirSync(before.worktree, { recursive: true });
+				writeFileSync(join(before.worktree, "notes.txt"), "retained work");
+			}
+
+			await loop.recoverRestarted();
+
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("needs_you");
+			expect(after.needsReason).toMatch(/no (?:PR|pull request).*recorded/i);
+			expect(after.needsReason).toMatch(/reply.*retry.*merge/i);
+			expect(after).toMatchObject({
+				stage: before.stage,
+				branch: before.branch,
+				worktree: before.worktree,
+				prNumber: before.prNumber,
+				prUrl: before.prUrl,
+				prHeadSha: before.prHeadSha,
+				pushSha: before.pushSha,
+				pendingPrompt: before.pendingPrompt,
+				keptFiles: before.keptFiles,
+			});
+
+			await loop.recoverRestarted();
+
+			expect(store.getTask(task.id)).toEqual(after);
+			expect(store.listTurns(task.id)).toHaveLength(0);
+			expect(record.runs).toHaveLength(0);
+			expect(record.createWorktree).toHaveLength(0);
+			expect(record.removeWorktree).toHaveLength(0);
+			expect(record.quarantine).toHaveLength(0);
+			expect(record.deletes).toHaveLength(0);
+			expect(ship).not.toHaveBeenCalled();
+			if (before.worktree) {
+				expect(readFileSync(join(before.worktree, "notes.txt"), "utf8")).toBe(
+					"retained work",
+				);
+			}
+		});
+	}
+
+	for (const boundary of [
+		{
+			name: "a cancelled idle merge without a PR",
+			prMode: true,
+			stage: "merging",
+			state: "idle",
+			prNumber: null,
+			cancelledAt: 12345,
+		},
+		{
+			name: "a non-PR idle merge without a PR",
+			prMode: false,
+			stage: "merging",
+			state: "idle",
+			prNumber: null,
+			cancelledAt: null,
+		},
+		{
+			name: "an idle merge with a valid PR",
+			prMode: true,
+			stage: "merging",
+			state: "idle",
+			prNumber: 12,
+			cancelledAt: null,
+		},
+		...(["backlog", "in_progress", "done"] as const).map((stage) => ({
+			name: `an idle PR-mode card at ${stage}`,
+			prMode: true,
+			stage,
+			state: "idle" as const,
+			prNumber: null,
+			cancelledAt: null,
+		})),
+		...(["queued", "needs_you", "running", "preparing"] as const).map(
+			(state) => ({
+				name: `a PR-mode merge at ${state}`,
+				prMode: true,
+				stage: "merging" as const,
+				state,
+				prNumber: null,
+				cancelledAt: null,
+			}),
+		),
+	] as const) {
+		test(`recoverRestarted preserves ${boundary.name}`, async () => {
+			const ship = jest.fn(async () => {
+				throw new Error("restart recovery must not ship or rebase");
+			});
+			const { store, projects, record, loop } = setup({
+				pushBranch: ship,
+				openPr: ship,
+				serverMergePush: ship,
+				rebaseTargetBranch: ship,
+			});
+			store.setSettings({
+				prMode: boundary.prMode,
+				originUrl: "https://github.com/acme/repo.git",
+			});
+			projects.get(store.name)!.github = "https://github.com/acme/repo.git";
+			const task = store.createTask(boundary.name);
+			store.updateTask(task.id, {
+				stage: boundary.stage,
+				state: boundary.state,
+				cancelledAt: boundary.cancelledAt,
+				prNumber: boundary.prNumber,
+				branch: "ott/preserved",
+				worktree: join(store.worktreesDir, task.id),
+				prUrl:
+					boundary.prNumber === null
+						? null
+						: "https://github.com/acme/repo/pull/12",
+				prHeadSha: "pr-head",
+				pushSha: "pushed-head",
+				pendingPrompt: "manual recovery note",
+				keptFiles: ["notes.txt"],
+				needsReason: "preserve this reason",
+			});
+			if (boundary.state === "running" || boundary.state === "preparing")
+				store.startTurn(task.id, "merge", "live merge prompt", 4344);
+			const before = store.getTask(task.id)!;
+			const turns = store.listTurns(task.id);
+
+			await loop.recoverRestarted();
+			await loop.recoverRestarted();
+
+			expect(store.getTask(task.id)).toEqual(before);
+			expect(store.listTurns(task.id)).toEqual(turns);
+			expect(record.runs).toHaveLength(0);
+			expect(record.createWorktree).toHaveLength(0);
+			expect(record.removeWorktree).toHaveLength(0);
+			expect(record.quarantine).toHaveLength(0);
+			expect(record.deletes).toHaveLength(0);
+			expect(ship).not.toHaveBeenCalled();
+		});
+	}
+
 	test("recoverRestarted ends a cancelled card idle and never requeues it", async () => {
 		const store = freshStore();
 		const record = baseRecord();

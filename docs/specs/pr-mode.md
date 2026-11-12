@@ -116,6 +116,29 @@ run for PR-mode cards: nothing local is pushed to the target. The
 does not gate PR-mode cards either — the local target branch is never
 written.
 
+### Stranded merge safeguard (OTTR-860)
+
+The designed PR ship stores `merging`/`idle` and `prNumber` in one atomic
+write. A non-cancelled PR-mode card must not wait in `merging`/`idle`
+without a PR number. This state has no PR for the supervisor to watch.
+
+- When kept-worktree hygiene reaches a non-cancelled `merging` card without
+  `prNumber`, it parks the card at `needs_you` with a clear recovery reason.
+  It preserves the branch, worktree, kept files, and PR fields before cleanup.
+- At restart, `recoverRestarted` parks an existing non-cancelled PR-mode
+  `merging`/`idle` card without `prNumber` as stranded. The reason states
+  that no PR is recorded and asks for a reply to retry the merge turn.
+  The branch, worktree, and PR fields stay unchanged.
+- Neither safeguard ships the branch, rebases it, opens a PR, or queues a turn.
+  A user reply remains the recovery path.
+- Cancelled cards, non-PR projects, and idle cards with a PR number keep
+  their existing behavior.
+
+Acceptance: restart and hygiene regression tests fail without the safeguards.
+After the fix, each affected card reads `merging`/`needs_you` with a recovery
+reason and retains its branch, worktree, and PR fields. Tests also prove that
+cancelled cards, non-PR projects, and valid idle PR cards keep their behavior.
+
 ### The second merge turn (OTTR-799)
 
 A PR-carrying card merges again like any other card. The merge slot takes

@@ -981,6 +981,149 @@ describe("kept-worktree hygiene", () => {
 		store.close();
 	});
 
+	test("stale PR-mode merging card without a PR stays parked for reply recovery", async () => {
+		const { store, t, wt } = keptCard("hyg-pr-missing");
+		store.setSettings({ prMode: true });
+		store.updateTask(t.id, {
+			stage: "merging",
+			branch: "ottr/hyg-pr-missing",
+			base: "main",
+			prNumber: null,
+			prUrl: "https://github.com/acme/widget/pull/7",
+			prHeadSha: "a".repeat(40),
+		});
+		const before = store.getTask(t.id)!;
+		const ops = fakeOps({
+			time: Date.now() + 8 * 86_400_000,
+			apiResult: () => ({ code: 0, stdout: "[]", stderr: "" }),
+		});
+		const projects = new Map([["proj", entry(store)]]);
+
+		await tick(projects, ops);
+
+		const after = store.getTask(t.id)!;
+		expect(after).toMatchObject({
+			stage: "merging",
+			state: "needs_you",
+			branch: before.branch,
+			base: before.base,
+			worktree: wt,
+			keptFiles: ["scratch.txt"],
+			prNumber: null,
+			prUrl: before.prUrl,
+			prHeadSha: before.prHeadSha,
+			pushSha: before.pushSha,
+			pendingPrompt: null,
+		});
+		expect(after.needsReason).not.toBe(before.needsReason);
+		expect(after.needsReason).toMatch(
+			/(?:no|missing|without).*?(?:PR|pull request)/i,
+		);
+		expect(after.needsReason).toMatch(/reply/i);
+		expect(after.needsReason).toMatch(/retry.*merge/i);
+		expect(ops.calls.quarantine).toEqual([]);
+		expect(ops.calls.remove).toEqual([]);
+		expect(ops.calls.scheduled).toBe(0);
+		expect(store.listTurns(t.id)).toEqual([]);
+
+		ops.time += 8 * 86_400_000;
+		await tick(projects, ops);
+
+		expect(store.getTask(t.id)).toEqual(after);
+		expect(ops.calls.quarantine).toEqual([]);
+		expect(ops.calls.remove).toEqual([]);
+		expect(ops.calls.scheduled).toBe(0);
+		expect(store.listTurns(t.id)).toEqual([]);
+		store.close();
+	});
+
+	for (const [name, prMode, cancelledAt, prNumber] of [
+		["cancelled PR-mode merging card without a PR", true, 1, null],
+		["non-PR merging card without a PR", false, null, null],
+		["PR-mode merging card with a PR number", true, null, 7],
+	] as const) {
+		test(`stale ${name} keeps the existing hygiene cleanup`, async () => {
+			const { store, t, wt } = keptCard(
+				`hyg-merge-${prMode}-${cancelledAt}-${prNumber}`,
+			);
+			store.setSettings({ prMode });
+			store.updateTask(t.id, {
+				stage: "merging",
+				branch: "ottr/hyg-merge",
+				cancelledAt,
+				prNumber,
+				prUrl:
+					prNumber === null ? null : "https://github.com/acme/widget/pull/7",
+				...(cancelledAt === null
+					? {}
+					: { needsReason: "Cancel kept the worktree: uncommitted changes." }),
+			});
+			const ops = fakeOps({
+				time: Date.now() + 8 * 86_400_000,
+				// The normal cleanup pass keeps the cancelled card for hygiene.
+				unsaved: "uncommitted changes",
+				apiResult: prApi(pullBody({ state: "open", mergeable: true })),
+			});
+
+			await tick(new Map([["proj", entry(store)]]), ops);
+
+			expect(ops.calls.quarantine).toEqual([
+				{
+					worktreePath: wt,
+					quarantineDir: join(store.tasksDir, "quarantine", t.id),
+				},
+			]);
+			expect(ops.calls.remove).toEqual([
+				{
+					mainPath: join(root, "main"),
+					worktreePath: wt,
+					branch: "ottr/hyg-merge",
+					log: expect.any(Function),
+				},
+			]);
+			expect(store.getTask(t.id)).toMatchObject({
+				stage: "merging",
+				state: "idle",
+				cancelledAt,
+				worktree: null,
+				keptFiles: [],
+				needsReason: null,
+				prNumber,
+				pendingPrompt: null,
+			});
+			expect(ops.calls.scheduled).toBe(0);
+			store.close();
+		});
+	}
+
+	test("stale idle PR-mode merging card with an open PR stays unchanged", async () => {
+		const { store, t } = keptCard("hyg-idle-open-pr");
+		store.setSettings({ prMode: true });
+		store.updateTask(t.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: null,
+			branch: "ottr/hyg-idle-open-pr",
+			prNumber: 7,
+			prUrl: "https://github.com/acme/widget/pull/7",
+			prHeadSha: "a".repeat(40),
+		});
+		const before = store.getTask(t.id)!;
+		const ops = fakeOps({
+			time: Date.now() + 8 * 86_400_000,
+			apiResult: prApi(pullBody({ state: "open", mergeable: true })),
+		});
+
+		await tick(new Map([["proj", entry(store)]]), ops);
+
+		expect(store.getTask(t.id)).toEqual(before);
+		expect(ops.calls.quarantine).toEqual([]);
+		expect(ops.calls.remove).toEqual([]);
+		expect(ops.calls.scheduled).toBe(0);
+		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		store.close();
+	});
+
 	test("fresh kept card is untouched", async () => {
 		const { store, t, wt } = keptCard("hyg-fresh");
 		const ops = fakeOps();

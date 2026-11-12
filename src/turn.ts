@@ -2228,6 +2228,19 @@ export function createTurnLoop(
 		e: TurnProject,
 		t: ListedTask,
 	): Promise<void> {
+		if (
+			t.cancelledAt === null &&
+			t.stage === "merging" &&
+			t.state === "idle" &&
+			t.prNumber === null &&
+			e.store.getSettings().prMode === true
+		) {
+			const needsReason =
+				"PR-mode merge is stranded: no pull request is recorded. Reply to retry the merge turn.";
+			e.store.updateTask(t.id, { state: "needs_you", needsReason });
+			appendLog(e.store, t.id, `! ${needsReason}`);
+			return;
+		}
 		if (t.state !== "running" && t.state !== "preparing") return;
 		const turn = e.store.listTurns(t.id).at(-1);
 		// An agent process is a child and can outlive the tracker restart: a still-alive

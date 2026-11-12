@@ -893,6 +893,25 @@ export function createSupervisor(
 	async function hygienePass(e: SupervisorEntry, t: ListedTask): Promise<void> {
 		const cand = hygieneCandidate(e, t);
 		if (cand === null) return;
+		if (
+			e.store.getSettings().prMode &&
+			t.cancelledAt === null &&
+			t.stage === "merging" &&
+			t.prNumber === null
+		) {
+			if (wentStale(e.store, t)) return;
+			e.store.updateTask(t.id, {
+				state: "needs_you",
+				needsReason:
+					"PR-mode merge is stranded: no pull request is recorded. Reply to retry the merge turn.",
+			});
+			ops.appendLog(
+				e.store,
+				t.id,
+				"hygiene: PR-mode merge is stranded without a recorded pull request; preserved the worktree for a retry.",
+			);
+			return;
+		}
 		const key = `${e.name}/${t.id}`;
 		const keep = await hygieneKeepReason(cand.wt, cand.target);
 		if (keep !== null) {
