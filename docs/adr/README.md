@@ -68,3 +68,4 @@ existing number plus one.
 | 0009 | Work turns can run in a Firecracker microVM per turn | accepted (experimental) |
 | 0010 | The omp bump follows a changelog review | accepted |
 | 0011 | Token fields are sealed and deployments use encrypted volumes | accepted |
+| 0012 | Ottr keeps TypeScript and Bun | accepted |
