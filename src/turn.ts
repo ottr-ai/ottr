@@ -44,6 +44,8 @@ import {
 	gateAskQuestions,
 	gateCompareText,
 	gateFingerprint,
+	gateHandoff,
+	gateJudgedPrompt,
 	gateUserText,
 	hasOpenQuestionsSection,
 	missingCheckQuestion,
@@ -3675,10 +3677,23 @@ export function createTurnLoop(
 				? live.pendingPrompt
 				: null;
 		const seen = live.gate?.seen ?? null;
+		// OTTR-844: the prompt may name its own handoff file ("Read the handoff file
+		// first: @<path>"), and the handoff holds the checks the gate would otherwise
+		// miss. Judge the prompt plus the file's text; the fingerprint covers the file,
+		// so a changed handoff runs the gate again. A path outside the handoffs folder,
+		// a missing file, or an unreadable file adds nothing: the reason is logged and
+		// the gate judges the prompt alone.
+		const handoff = gateHandoff({
+			prompt: live.prompt,
+			handoffsDir: join(store.tasksDir, "handoffs"),
+		});
+		for (const reason of handoff.reasons)
+			log(`! prompt gate: handoff not judged: ${reason}`);
+		const judged = gateJudgedPrompt(live.prompt, handoff);
 		// Skip rule: the gate passed for exactly this compared text.
 		if (
 			live.gate?.hash ===
-			gateFingerprint(gateCompareText(live.prompt, pending, seen))
+			gateFingerprint(gateCompareText(judged, pending, seen))
 		) {
 			log("+ prompt gate: passed earlier for this text");
 			return true;
@@ -3717,7 +3732,7 @@ export function createTurnLoop(
 		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
 				check = await (ops.gateCheck ?? promptGateCheck)({
-					prompt: live.prompt,
+					prompt: judged,
 					userMessages: gateUserText(pending, seen),
 				});
 				err = null;
@@ -3761,7 +3776,7 @@ export function createTurnLoop(
 				log(`+ prompt gate: missing: ${DEEPEN_POINTS[i]} — ${p.reason}`);
 			store.updateTask(id, {
 				gate: {
-					hash: gateFingerprint(gateCompareText(live.prompt, pending, seen)),
+					hash: gateFingerprint(gateCompareText(judged, pending, seen)),
 					seen: gateUserText(pending, seen),
 					fails: 0,
 					sig: null,

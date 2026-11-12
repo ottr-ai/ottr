@@ -242,6 +242,8 @@ import { mergeProjectOrder, rankInOrder } from "./projectOrder.ts";
 import {
 	gateCompareText,
 	gateFingerprint,
+	gateHandoff,
+	gateJudgedPrompt,
 	gateUserText,
 	isStartAnywayReply,
 } from "./promptGate.ts";
@@ -9635,7 +9637,8 @@ export function createApp(deps: AppDeps) {
 	/** The gate park's Start anyway reply (docs/specs/prompt-gate.md): it approves the parked
 	 * prompt without a gate pass, so the next start skips the gate for this exact text. Any
 	 * other reply falls through to the queue and the gate re-runs on the next start. The
-	 * fingerprint covers prompt plus any pending steer, so a queued user text still gates. */
+	 * fingerprint covers the judged prompt (the handoff the prompt names included,
+	 * OTTR-844) plus any pending steer, so a queued user text still gates. */
 	function gateStartReply(
 		e: Entry,
 		task: Task,
@@ -9645,6 +9648,10 @@ export function createApp(deps: AppDeps) {
 		const gate = task.gate;
 		if (gate?.parked !== true || !isStartAnywayReply(trimmed) || hasImages)
 			return null;
+		const handoff = gateHandoff({
+			prompt: task.prompt,
+			handoffsDir: join(e.store.tasksDir, "handoffs"),
+		});
 		e.store.updateTask(task.id, {
 			state: "queued",
 			queuedAt: Date.now(),
@@ -9652,7 +9659,11 @@ export function createApp(deps: AppDeps) {
 			asked: null, // the answer to a "?" ask is queued; the badge goes back to plain needs-you flow
 			gate: {
 				hash: gateFingerprint(
-					gateCompareText(task.prompt, task.pendingPrompt, gate.seen),
+					gateCompareText(
+						gateJudgedPrompt(task.prompt, handoff),
+						task.pendingPrompt,
+						gate.seen,
+					),
 				),
 				seen: gateUserText(task.pendingPrompt, gate.seen),
 				fails: 0,

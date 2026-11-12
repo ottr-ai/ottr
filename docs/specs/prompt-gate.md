@@ -229,6 +229,27 @@ export interface PromptGateState {
   accumulated text the fingerprint covers, so answers from earlier rounds stay
   in view and the gate cannot re-ask them.
 
+### The prompt-named handoff (OTTR-844)
+
+A follow-up prompt names its handoff file (`Read the handoff file first:
+@<path>`, `followUpPrompt`), and the handoff holds the checks the gate would
+otherwise miss. The gate judges the prompt plus that file:
+
+- `gateHandoff` (src/promptGate.ts) takes the prompt and the project's
+  handoffs folder (`join(store.tasksDir, "handoffs")`). The first `@<path>`
+  in the prompt that resolves strictly inside the folder decides; the text
+  comes through `realpathSync` (the folder's own real path included), so a
+  symlink cannot lead the read out of the folder. A path outside the folder,
+  a missing file, or an unreadable file adds nothing: the gate judges the
+  prompt alone, and each rejected path logs one
+  `! prompt gate: handoff not judged: <path>: <reason>` line.
+- `gateJudgedPrompt` appends the capped text (`HANDOFF_CAP`, 20 000 chars,
+  the board's prompt limit) after the prompt as one untrusted data block in
+  the `<handoff>` label style.
+- The gate model call and both fingerprints (the turn pass stamp and the
+  Start-anyway stamp in `gateStartReply`) cover the judged prompt, so a
+  changed handoff runs the gate again.
+
 ### Scope (`gateApplies`)
 
 The gate runs only when **all** hold:

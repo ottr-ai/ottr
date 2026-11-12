@@ -22617,6 +22617,135 @@ describe("prompt gate", () => {
 		expect(after.gate?.fails).toBe(0);
 	});
 
+	test("a follow-up prompt's named handoff rides with the prompt through the gate", async () => {
+		const seen: string[] = [];
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				seen.push(o.prompt);
+				return clearCheck();
+			},
+		});
+		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
+		const task = store.createTask("seed");
+		const handoffPath = join(store.tasksDir, "handoffs", `${task.id}.md`);
+		writeFileSync(
+			handoffPath,
+			[
+				"# Handoff: Research report",
+				"",
+				"## Recommended steps",
+				"",
+				"1. Add the benchmark.",
+				"",
+				"Test: `bun test src/merge.test.ts` must pass.",
+				"",
+			].join("\n"),
+		);
+		const prompt = followUpPrompt({
+			text: "Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff.",
+			title: "Research report",
+			handoffPath,
+		});
+		store.updateTask(task.id, { prompt });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		// A clear gate pass starts the turn.
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(record.runs).toHaveLength(1);
+		// The gate model saw the handoff text; before the fix it received the prompt alone.
+		expect(seen).toHaveLength(1);
+		expect(seen[0]).toContain("<handoff>");
+		expect(seen[0]).toContain("## Recommended steps");
+		expect(seen[0]).toContain("bun test src/merge.test.ts");
+		// The fingerprint covers the judged prompt: the handoff text, not the bare prompt.
+		expect(seen[0]).toBeDefined();
+		expect(after.gate?.hash).toBe(
+			gateFingerprint(gateCompareText(seen[0]!, null, null)),
+		);
+		expect(after.gate?.hash).not.toBe(
+			gateFingerprint(gateCompareText(prompt, null, null)),
+		);
+	});
+
+	test("a @-path outside the handoffs folder is never judged; the log names the reason", async () => {
+		const seen: string[] = [];
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				seen.push(o.prompt);
+				return clearCheck();
+			},
+		});
+		const passwd = store.createTask(
+			followUpPrompt({
+				text: "Implement the recommended steps from the research report in the handoff.",
+				title: "Research report",
+				handoffPath: "/etc/passwd",
+			}),
+		);
+
+		await loop.runTurn(store.name, passwd.id);
+
+		expect(record.runs).toHaveLength(1);
+		// The passwd content never reached the gate model.
+		expect(seen[0]).not.toContain("root:x:0:0");
+		expect(seen[0]).not.toContain("<handoff>");
+		expect(readFileSync(store.logPath(passwd.id), "utf8")).toContain(
+			"/etc/passwd: outside the handoffs folder",
+		);
+
+		// A .. path that escapes the folder is refused the same way.
+		const escapePath = join(store.tasksDir, "handoffs", "..", "secrets.md");
+		const escapeTask = store.createTask(
+			followUpPrompt({
+				text: "Implement the recommended steps from the research report in the handoff.",
+				title: "Research report",
+				handoffPath: escapePath,
+			}),
+		);
+		await loop.runTurn(store.name, escapeTask.id);
+		expect(readFileSync(store.logPath(escapeTask.id), "utf8")).toContain(
+			"outside the handoffs folder",
+		);
+	});
+
+	test("a missing handoff file falls back to the prompt alone and logs the reason", async () => {
+		const seen: string[] = [];
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				seen.push(o.prompt);
+				return clearCheck();
+			},
+		});
+		const missing = join(store.tasksDir, "handoffs", "absent.md");
+		const task = store.createTask(
+			followUpPrompt({
+				text: "Implement the recommended steps from the research report in the handoff.",
+				title: "Research report",
+				handoffPath: missing,
+			}),
+		);
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(1);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("idle");
+		// The gate judged the prompt alone: no handoff block, bare-prompt fingerprint.
+		expect(seen[0]).toBe(after.prompt);
+		expect(after.gate?.hash).toBe(
+			gateFingerprint(gateCompareText(after.prompt, null, null)),
+		);
+		expect(readFileSync(store.logPath(task.id), "utf8")).toContain(
+			`${missing}: the handoff file is missing`,
+		);
+	});
+
 	test("a gate check that fails twice parks with the error and makes no third call", async () => {
 		let calls = 0;
 		const { store, loop } = setup({
