@@ -22946,6 +22946,46 @@ describe("stored review findings", () => {
 		expect(store.getTask(other.id)!.details ?? "").not.toContain("Seen again");
 	});
 
+	test("two leads with one new fingerprint file once; the second marks the first seen again", async () => {
+		const record = baseRecord();
+		const first = mkFinding(
+			"Needs validation: maybe a race in the scheduler\nFingerprint: fp-new",
+		);
+		const second = mkFinding(
+			"Needs validation: the same race, phrased differently\nFingerprint: fp-new",
+		);
+		const { store, loop } = storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), first, second],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+
+		await loop.runTurn(store.name, review.id);
+
+		// The first lead files a card; no card held the fingerprint before, yet the
+		// second lead matches the card the first lead just filed.
+		const holders = store
+			.listTasks()
+			.filter((t) => t.prompt.includes("Fingerprint: fp-new"));
+		expect(holders).toHaveLength(1);
+		const kids = kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt)).toEqual([first.prompt]);
+		const filed = kids[0]!;
+		expect(filed.details).not.toContain("came back");
+		expect(filed.details).toMatch(
+			new RegExp(
+				`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.$`,
+			),
+		);
+		const reviewAfter = store.getTask(review.id)!;
+		expect(reviewAfter.details).toContain(`already open: #${filed.id}`);
+	});
+
 	test("a release review refuses to publish while its stored findings are unchecked", async () => {
 		const record = baseRecord();
 		// Stored findings from an earlier (lost) turn; this turn records nothing.

@@ -8380,11 +8380,14 @@ export function createTurnLoop(
 				});
 				filed.push(child.id);
 				// A card filed in this pass joins the index: two leads with one
-				// fingerprint file once.
+				// fingerprint file once, also when no card held the value before.
 				if (fp !== null) {
 					const fresh = st.store.getTask(child.id);
-					const list = byFingerprint.get(fp);
-					if (fresh !== null && list !== undefined) list.push(fresh);
+					if (fresh !== null) {
+						const list = byFingerprint.get(fp);
+						if (list === undefined) byFingerprint.set(fp, [fresh]);
+						else list.push(fresh);
+					}
 				}
 				st.log(
 					`- filed lead as backlog card #${child.id} (unverified): ${findingHead(lead)}`,
