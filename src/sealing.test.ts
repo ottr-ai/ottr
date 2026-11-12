@@ -42,7 +42,7 @@ const GH_TOKEN = `ghp_${"a".repeat(36)}`;
 const ALATE_KEY = "alate-key-plain-9f3a";
 const GIT_TOKEN = "git-token-plain-9f3a";
 const ENV_VALUE = "env-value-plain-9f3a";
-const HS_TOKEN = "hindsight-plain-9f3a";
+const HS_TOKEN = "hindsight-plain-0000";
 
 /** A fully populated plaintext config row. */
 function plainRow(): Record<string, unknown> {
