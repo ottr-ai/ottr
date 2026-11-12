@@ -470,6 +470,13 @@ server remains the only writer of origin.
   re-ships — the push updates the same PR (or opens a fresh one after a
   close), and `prHeadSha`/`pushSha` pin the new tip; an idle PR card is
   never picked; a source-PR card's second ship never opens a second PR.
+- OTTR-841 extends OTTR-799 without a second ship path. After a PR-head
+  CI failure, the fix and merge turns update the same PR. Both
+  `prHeadSha` and `pushSha` equal the new branch tip. A failed run on that
+  tip queues another fix on the same card, with no separate follow-up card.
+  A cleared watch after a give-up also resumes after the next successful
+  ship pins a new tip. These checks use the turn loop, the supervisor and
+  the same store.
 - A failed push or gh call parks `needs_you` with the output; a reply
   retries without opening a second PR.
 - Cancel during the PR ship: use `createTurnLoop().runTurn` and `.cancel`

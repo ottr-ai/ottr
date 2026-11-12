@@ -50,6 +50,7 @@ import {
 	WORK_CHECK_MAX_SENDBACKS,
 	workCheckSendBack,
 } from "./prompts.ts";
+import { openPullRequest } from "./prs.ts";
 import { hitUsageLimit, WORKER_LOST } from "./runner.ts";
 import {
 	FINDINGS_HOLD,
@@ -63,6 +64,7 @@ import {
 	WORK_CHECK_ASK_DIVERGE,
 } from "./scheduler.ts";
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
+import { createSupervisor } from "./supervisor.ts";
 import fc from "./test/properties.ts";
 import { turnEnv } from "./tokens.ts";
 import type { TurnLoop, TurnOps, TurnProject } from "./turn.ts";
@@ -83,6 +85,7 @@ import {
 	parseDependabotHeadLine,
 	parseReleaseVersion,
 	parseTopicReport,
+	replyPatch,
 	tmpEnrichNeedsReason,
 	turnModel,
 	UI_SHOT_WARNING,
@@ -107,6 +110,7 @@ import {
 	pushBranch as pushBranchReal,
 	checkoutState as realCheckoutState,
 	fetchOriginBranch as realFetchOriginBranch,
+	prIntegrated as realPrIntegrated,
 	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
 	saveDoneFiles as realSaveDoneFiles,
@@ -21056,63 +21060,276 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prHeadSha).toBe("pr-head");
 	});
 
-	test("OTTR-799: the re-ship pushes through the real pushBranch against a bare origin", async () => {
-		// Fixtures use their own spawn, never git() under test.
-		const run = (cwd: string, ...args: string[]): string => {
-			const r = Bun.spawnSync(["git", ...args], {
-				cwd,
-				stdout: "pipe",
-				stderr: "pipe",
-			});
-			if (r.exitCode !== 0)
-				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
-			return r.stdout.toString().trim();
-		};
-		const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
-		const dir = mkdtempSync(join(tmpdir(), "ottr-799-"));
-		const bare = join(dir, "origin.git");
-		const main = join(dir, "main");
-		try {
-			run(dir, "init", "-q", "--bare", "-b", "main", bare);
-			run(dir, "clone", "-q", bare, main);
-			writeFileSync(join(main, "a.txt"), "a");
-			run(main, ...id, "add", ".");
-			run(main, ...id, "commit", "-qm", "base");
-			run(main, "push", "-q", "origin", "main");
-			run(main, "switch", "-q", "-c", "ott/m");
-			writeFileSync(join(main, "fix.txt"), "f");
-			run(main, ...id, "add", ".");
-			run(main, ...id, "commit", "-qm", "the fix");
-			const tip = run(main, "rev-parse", "HEAD");
-			const { store, loop, task } = prMergeSetup({
-				// The store fixture is not a git checkout; the real pushBranch runs
-				// against the bare-origin fixture. The URL is the bare path so the
-				// pinned-remote guard sees the clone's own origin.
-				pushBranch: async (_m: string, branch: string, _o: string) =>
-					pushBranchReal(main, branch, bare),
-				targetSha: async (_m: string, ref: string) =>
-					ref === "refs/heads/ott/m" ? tip : "sha-old",
-			});
-			store.updateTask(task.id, {
-				prNumber: 12,
-				prUrl: "https://github.com/acme/repo/pull/12",
-				prHeadSha: "sha-old",
-				pushSha: null,
-			});
-			await loop.runTurn(store.name, task.id);
-			const after = store.getTask(task.id)!;
-			expect(after.stage).toBe("merging");
-			expect(after.state).toBe("idle");
-			expect(after.prNumber).toBe(12);
-			expect(after.prHeadSha).toBe(tip);
-			expect(after.pushSha).toBe(tip);
-			expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
-				`${tip}\trefs/heads/ott/m`,
-			);
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
+	test.each(["failure", "give-up"] as const)(
+		"OTTR-841: a real re-ship resumes CI after %s on the same PR",
+		async (initial) => {
+			// Fixtures use their own spawn, never git() under test.
+			const run = (cwd: string, ...args: string[]): string => {
+				const r = Bun.spawnSync(["git", ...args], {
+					cwd,
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				if (r.exitCode !== 0)
+					throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+				return r.stdout.toString().trim();
+			};
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			const dir = mkdtempSync(join(tmpdir(), "ottr-841-"));
+			const bare = join(dir, "origin.git");
+			const main = join(dir, "main");
+			try {
+				run(dir, "init", "-q", "--bare", "-b", "main", bare);
+				run(dir, "clone", "-q", bare, main);
+				writeFileSync(join(main, "a.txt"), "a");
+				run(main, ...id, "add", ".");
+				run(main, ...id, "commit", "-qm", "base");
+				run(main, "push", "-q", "origin", "main");
+				run(main, "switch", "-q", "-c", "ott/m");
+				run(main, ...id, "commit", "--allow-empty", "-qm", "first ship");
+				run(main, "push", "-q", "origin", "ott/m");
+				const oldHead = run(main, "rev-parse", "HEAD");
+				const adoptCalls: string[][] = [];
+				let fixed = false;
+				const { store, record, loop, task, e, projects } = prMergeSetup({
+					// Keep dispatch explicit: settle must not start the next turn.
+					maxTotalRuns: () => 0,
+					pushBranch: pushBranchReal,
+					prIntegrated: realPrIntegrated,
+					targetSha: async (path, ref) => run(path, "rev-parse", ref),
+					openPr: (o) =>
+						openPullRequest({
+							...o,
+							gh: async (args) => {
+								adoptCalls.push(args);
+								return {
+									code: 0,
+									stdout: JSON.stringify([
+										{
+											number: 12,
+											state: "open",
+											draft: false,
+											title: "existing PR",
+											head: { sha: run(bare, "rev-parse", "refs/heads/ott/m") },
+										},
+									]),
+									stderr: "",
+								};
+							},
+						}),
+					startRun: (o) => {
+						record.runs.push(o);
+						if (!fixed) {
+							writeFileSync(join(main, "fix.txt"), "fix");
+							run(main, ...id, "add", "fix.txt");
+							run(main, ...id, "commit", "-qm", "CI fix");
+							fixed = true;
+						}
+						o.onSession?.("sess-1");
+						return {
+							pid: 4242,
+							done: Promise.resolve(
+								runResult({
+									outcome: {
+										status:
+											store.getTask(task.id)!.stage === "in_progress"
+												? "ready"
+												: "integrated",
+										summary: "CI fix",
+									},
+								}),
+							),
+							kill: async () => {},
+						};
+					},
+				});
+				e.path = main;
+				store.setSettings({ originUrl: bare });
+				// Only the first ship is seeded. The next pin must come from settle.
+				store.updateTask(task.id, {
+					state: "idle",
+					worktree: main,
+					prNumber: 12,
+					prUrl: "https://github.com/acme/repo/pull/12",
+					prHeadSha: oldHead,
+					pushSha: oldHead,
+				});
+				const ciCalls: string[][] = [];
+				let scheduled = 0;
+				let failedRun = {
+					id: 101,
+					status: "completed",
+					conclusion: "failure",
+					name: "initial check",
+					html_url: "https://github.com/acme/repo/actions/runs/101",
+				};
+				let giveUp = initial === "give-up";
+				const supervisor = createSupervisor(projects, {
+					appendLog,
+					schedule: () => {
+						scheduled += 1;
+					},
+					now: () => Date.now() + 3 * 60 * 60 * 1000,
+					sweepWorker: async () => [],
+					removeWorktree: async () => {
+						throw new Error("the open PR must keep its worktree");
+					},
+					deleteRemoteBranch: async () => {
+						throw new Error("the open PR must keep its branch");
+					},
+					unsavedWork: async () => null,
+					statusRows: async () => [],
+					statusFiles: async () => [],
+					commitsAhead: async () => 1,
+					isClean: async () => true,
+					isIntegrated: async () => false,
+					worktreeHusk: async () => false,
+					worktreeLinked: async () => true,
+					branchMergedOrGone: async () => false,
+					quarantineUntracked: async () => [],
+					targetSha: async (path, ref) => run(path, "rev-parse", ref),
+					fetchOriginBranch: async () => null,
+					fetchPrHead: async () => null,
+					targetCommits: async () => 3,
+					gh: async (args) => {
+						if (args[0] === "pr") return { code: 0, stdout: "[]", stderr: "" };
+						if (args[1] === "repos/acme/repo/pulls?state=open&per_page=100")
+							return { code: 0, stdout: "[]", stderr: "" };
+						if (args[1] === "repos/acme/repo/pulls/12")
+							return {
+								code: 0,
+								stdout: JSON.stringify({
+									state: "open",
+									merged_at: null,
+									merge_commit_sha: null,
+									mergeable: true,
+								}),
+								stderr: "",
+							};
+						ciCalls.push(args);
+						if (args[0] === "run") {
+							return {
+								code: 0,
+								stdout: `failure details for run ${failedRun.id}`,
+								stderr: "",
+							};
+						}
+						return {
+							code: 0,
+							stdout: JSON.stringify({
+								workflow_runs: giveUp ? [] : [failedRun],
+							}),
+							stderr: "",
+						};
+					},
+				});
+				await supervisor.tick();
+				const cleared = store.getTask(task.id)!;
+				expect(cleared.pushSha).toBeNull();
+				expect(cleared.prNumber).toBe(12);
+				expect(cleared.prHeadSha).toBe(oldHead);
+				if (giveUp) {
+					expect(cleared.stage).toBe("merging");
+					expect(cleared.state).toBe("idle");
+					expect(cleared.pendingPrompt).toBeNull();
+					expect(scheduled).toBe(0);
+				} else {
+					expect(cleared.stage).toBe("in_progress");
+					expect(cleared.state).toBe("queued");
+					expect(cleared.pendingBy).toBe("supervisor");
+					expect(cleared.pendingPrompt).toContain(failedRun.html_url);
+					expect(cleared.pendingPrompt).toContain(failedRun.name);
+					expect(scheduled).toBe(1);
+				}
+				const firstCalls = [...ciCalls];
+				expect(firstCalls).toEqual([
+					[
+						"api",
+						`repos/acme/repo/actions/runs?head_sha=${oldHead}&per_page=20`,
+					],
+					...(giveUp
+						? []
+						: [["run", "view", "101", "--log-failed", "--repo", "acme/repo"]]),
+				]);
+				await supervisor.tick();
+				expect(store.getTask(task.id)).toEqual(cleared);
+				expect(ciCalls).toEqual(firstCalls);
+				if (giveUp)
+					store.updateTask(task.id, replyPatch(cleared, "Ship the next fix"));
+				else {
+					await loop.runTurn(store.name, task.id);
+					expect(store.getTask(task.id)).toMatchObject({
+						stage: "merging",
+						state: "queued",
+						pushSha: null,
+						pendingPrompt: null,
+					});
+					await supervisor.tick();
+					expect(scheduled).toBe(1);
+				}
+				await loop.runTurn(store.name, task.id);
+				const tip = run(bare, "rev-parse", "refs/heads/ott/m");
+				expect(tip).not.toBe(oldHead);
+				expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
+					`${tip}\trefs/heads/ott/m`,
+				);
+				expect(store.getTask(task.id)).toMatchObject({
+					stage: "merging",
+					state: "idle",
+					needsReason: null,
+					prNumber: 12,
+					prUrl: "https://github.com/acme/repo/pull/12",
+					prHeadSha: tip,
+					pushSha: tip,
+				});
+				expect(adoptCalls).toEqual([
+					[
+						"api",
+						"repos/acme/repo/pulls?state=open&head=acme:ott/m&per_page=1",
+					],
+				]);
+				giveUp = false;
+				failedRun = {
+					...failedRun,
+					id: 202,
+					name: "new head check",
+					html_url: "https://github.com/acme/repo/actions/runs/202",
+				};
+				await supervisor.tick();
+				const requeued = store.getTask(task.id)!;
+				expect(scheduled).toBe(initial === "failure" ? 2 : 1);
+				expect(requeued).toMatchObject({
+					stage: "in_progress",
+					state: "queued",
+					pendingBy: "supervisor",
+					prNumber: 12,
+					prHeadSha: tip,
+					pushSha: null,
+				});
+				expect(requeued.pendingPrompt).toContain(failedRun.name);
+				expect(requeued.pendingPrompt).toContain(failedRun.html_url);
+				expect(requeued.pendingPrompt).toContain("failure details for run 202");
+				expect(requeued.pendingPrompt).not.toContain(
+					"failure details for run 101",
+				);
+				expect(ciCalls).toEqual([
+					...firstCalls,
+					["api", `repos/acme/repo/actions/runs?head_sha=${tip}&per_page=20`],
+					["run", "view", "202", "--log-failed", "--repo", "acme/repo"],
+				]);
+				const callsAfterFailure = [...ciCalls];
+				const replies = scheduled;
+				await supervisor.tick();
+				await supervisor.tick();
+				expect(store.getTask(task.id)).toEqual(requeued);
+				expect(ciCalls).toEqual(callsAfterFailure);
+				expect(scheduled).toBe(replies);
+				expect(store.listTasks().map((t) => t.id)).toEqual([task.id]);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		},
+	);
 
 	test("OTTR-799: a PR merged mid-turn fails the ship closed into needs_you", async () => {
 		const { store, loop, task } = prMergeSetup({
@@ -22971,7 +23188,7 @@ describe("stored review findings", () => {
 		for (const k of kids)
 			store.updateTask(k.id, { stage: "done", state: "idle" });
 		projects.get(store.name)!.target = "origin/main";
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		after = store.getTask(review.id)!;
 		expect(record.runs).toHaveLength(1); // the tick runs no agent
@@ -22988,7 +23205,7 @@ describe("stored review findings", () => {
 			needsReason: FINDINGS_HOLD,
 		});
 		store.appendReviewFinding(review.id, mkFinding("Bug C", 3));
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		after = store.getTask(review.id)!;
 		expect(after.stage).not.toBe("done");
@@ -23066,7 +23283,7 @@ describe("stored review findings", () => {
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		projects.get(store.name)!.target = "origin/main";
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		const doneAfter = store.getTask(review.id)!;
 		expect(doneAfter.stage).toBe("done");
@@ -23324,7 +23541,7 @@ describe("stored review findings", () => {
 		// Findings implemented: the tick publishes and lands Done.
 		for (const k of kids)
 			store.updateTask(k.id, { stage: "done", state: "idle" });
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(record.publishRelease).toHaveLength(1);
 		const done = store.getTask(review.id)!;
