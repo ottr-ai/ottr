@@ -2137,9 +2137,12 @@ export function createSupervisor(
 				if (targetBased) {
 					// Both commits sit on the target; pin the later merge, and the
 					// follow-up's on a tie or an unreadable time.
+					// The later merge pins the watch, and the follow-up's on a tie or
+					// an unreadable merged_at — as the spec states.
 					const followUpLast =
 						s.mergedAt === null ||
-						(pr.mergedAt !== null && pr.mergedAt > s.mergedAt);
+						pr.mergedAt === null ||
+						pr.mergedAt >= s.mergedAt;
 					await finishPrMerge(
 						e,
 						settings,
@@ -2162,7 +2165,11 @@ export function createSupervisor(
 				const unresolved = `Follow-up PR #${F} merged without proof its fixes reached the target (it still bases on the bump branch, or merged after PR #${S}). Carry them onto a new pull request.`;
 				if (t.state === "needs_you" && t.needsReason === unresolved) return;
 				if (wentStale(e.store, t)) return;
+				// stage in_progress: the card leaves the merging watch, so no later
+				// window re-reads the PRs or re-writes the park until a reply
+				// re-queues it. The guard stays as defense in depth.
 				e.store.updateTask(t.id, {
+					stage: "in_progress",
 					state: "needs_you",
 					needsReason: unresolved,
 					pushSha: null,
@@ -2194,7 +2201,10 @@ export function createSupervisor(
 		const reason = `follow-up PR #${F} closed without merging`;
 		if (t.state === "needs_you" && t.needsReason === reason) return;
 		if (wentStale(e.store, t)) return;
+		// stage in_progress: the card leaves the merging watch, so no later window
+		// re-reads the PRs or re-writes the park until a reply re-queues it.
 		e.store.updateTask(t.id, {
+			stage: "in_progress",
 			state: "needs_you",
 			needsReason: reason,
 			pushSha: null,
@@ -2225,7 +2235,10 @@ export function createSupervisor(
 		// reason, the same write, one log line, once.
 		if (t.state === "needs_you" && t.needsReason === reason) return;
 		if (wentStale(e.store, t)) return;
+		// stage in_progress: the card leaves the merging watch, so no later window
+		// re-reads the PRs or re-writes the park until a reply re-queues it.
 		e.store.updateTask(t.id, {
+			stage: "in_progress",
 			state: "needs_you",
 			needsReason: reason,
 			pushSha: null,

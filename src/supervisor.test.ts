@@ -4098,17 +4098,23 @@ describe("prPass", () => {
 			ops,
 		);
 		const after = store.getTask(t.id)!;
-		expect(after.stage).toBe("merging");
+		// The park leaves the merging watch: stage in_progress, follow-up kept.
+		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(
 			"without proof its fixes reached the target",
 		);
+		const listReads = () =>
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")).length;
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("no proof of delivery");
+		const readsAfterFirstWindow = listReads();
 
-		// A second window reads the same answer: the park stays, and the log gains
-		// no second line.
+		// A second window runs its poll (the clock advances past PR_POLL_MS) and
+		// the guard adds no write: the same log line count, no re-reads of the PRs.
+		ops.time += 6 * 60_000; // past the PR poll window
 		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(listReads()).toBeGreaterThan(readsAfterFirstWindow);
 		const log2 = await Bun.file(store.logPath(t.id)).text();
 		expect(
 			log2.split("\n").filter((l) => l.includes("no proof of delivery")),
@@ -4210,6 +4216,50 @@ describe("prPass", () => {
 		store.close();
 	});
 
+	test("a tie on merge times pins the follow-up's commit for a target-based follow-up", async () => {
+		// The spec's tie rule: equal second-resolution merge times pin the
+		// follow-up's own commit — here the origin tip, so the CI watch stays on.
+		const store = prModeProject("pr-fu-tie");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const t = followUpCard(store);
+		store.updateTask(t.id, { sourcePrHeadRef: "ottr/552" });
+		const ops = fakeOps({
+			apiResult: (url) =>
+				url.endsWith("/pulls/9")
+					? {
+							code: 0,
+							stdout: pr9Body({
+								mergedAt: "2026-11-06T00:00:00Z",
+								mergeSha: MERGE_SHA,
+								base: "main",
+							}),
+							stderr: "",
+						}
+					: url.endsWith("/pulls/7")
+						? {
+								code: 0,
+								stdout: pullBody({
+									mergedAt: "2026-11-06T00:00:00Z",
+									mergeSha: OTHER_SHA,
+									base: "main",
+								}),
+								stderr: "",
+							}
+						: openList([]),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		await tick(
+			new Map([["proj", entry(store, { target: "origin/main" })]]),
+			ops,
+		);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.pushSha).toBe(MERGE_SHA);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 and follow-up PR #9 merged; card done");
+		store.close();
+	});
+
 	test("a closed source parks the card while the follow-up waits, idempotently", async () => {
 		// The source closed unmerged while the follow-up is still open: the card
 		// parks needs_you and one log line says so, however many windows pass.
@@ -4227,17 +4277,24 @@ describe("prPass", () => {
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = store.getTask(t.id)!;
-		expect(after.stage).toBe("merging");
+		// The park leaves the merging watch: stage in_progress, follow-up kept.
+		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("PR #7 closed without merging");
 		expect(after.followUpPrNumber).toBe(9);
+		const listReads = () =>
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")).length;
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain(
 			"supervisor: PR #7 closed without merging; card parked",
 		);
+		const readsAfterFirstWindow = listReads();
 
-		// Same answer again: the park does not rewrite the row or the log.
+		// A second window runs its poll (the clock advances past PR_POLL_MS) and
+		// the guard adds no write: the same log line count, no re-reads of the PRs.
+		ops.time += 6 * 60_000; // past the PR poll window
 		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(listReads()).toBeGreaterThan(readsAfterFirstWindow);
 		const log2 = await Bun.file(store.logPath(t.id)).text();
 		expect(
 			log2.split("\n").filter((l) => l.includes("closed without merging")),
@@ -4260,13 +4317,19 @@ describe("prPass", () => {
 		expect(after.needsReason).toContain(
 			"follow-up PR #9 closed without merging",
 		);
+		const listReads = () =>
+			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")).length;
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(
 			log.split("\n").filter((l) => l.includes("closed without merging")),
 		).toHaveLength(1);
+		const readsAfterFirstWindow = listReads();
 
-		// Same answer again: no second park line.
+		// Same answer again, in a new poll window (the clock advances past
+		// PR_POLL_MS): the guard adds no write and no re-read of the PRs.
+		ops.time += 6 * 60_000; // past the PR poll window
 		await tick(new Map([["proj", entry(store)]]), ops);
+		expect(listReads()).toBeGreaterThan(readsAfterFirstWindow);
 		const log2 = await Bun.file(store.logPath(t.id)).text();
 		expect(
 			log2.split("\n").filter((l) => l.includes("closed without merging")),
