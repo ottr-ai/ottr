@@ -5289,11 +5289,9 @@ export async function createApp(deps: AppDeps) {
 		keptHeld: number;
 		keptStale: number;
 		keptCards: string[];
-
-		/** Per-card JSON text in tasks order; the state text splices these into the
-		 * tasks array in place of one giant stringify. */
-		tasksPieces: string[];
-
+		/** Per-chunk JSON bytes of the tasks array in tasks order, commas between
+		 * chunks; the state build splices these into the tasks array slots. */
+		tasksBufs: Buffer[];
 	}> {
 		const tasks: TaskCard[] = [];
 		let keptHeld = 0;
@@ -5342,15 +5340,19 @@ export async function createApp(deps: AppDeps) {
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
 		// Card-by-card JSON in slices: one stringify over the whole list was the
 		// largest single block of the old build (OTTR-866). A plain object
-		// stringifies identically alone and inside an array, so the state text's
-		// splice of these pieces is byte-equal to a stringify of the array.
-		const tasksPieces: string[] = [];
+		// stringifies identically alone and inside an array, so splicing these
+		// chunk buffers into the state bytes is byte-equal to a stringify of the
+		// array. Buffers, not one joined 30 MB string: the string form cost a
+		// second full copy on every build (OTTR-884).
+		const tasksBufs: Buffer[] = [];
 		for (let i = 0; i < tasks.length; i += 100) {
-			for (const card of tasks.slice(i, i + 100))
-				tasksPieces.push(JSON.stringify(card));
+			const cards = tasks.slice(i, i + 100);
+			const chunk = cards.map((card) => JSON.stringify(card)).join(",");
+			tasksBufs.push(Buffer.from(chunk, "utf8"));
+			if (i + 100 < tasks.length) tasksBufs.push(COMMA_BUF);
 			await yieldLoop();
 		}
-		return { tasks, keptHeld, keptStale, keptCards, tasksPieces };
+		return { tasks, keptHeld, keptStale, keptCards, tasksBufs };
 	}
 
 
@@ -5375,16 +5377,16 @@ export async function createApp(deps: AppDeps) {
 
 
 	/** One state frame, chunked: the card loop yields to the loop (OTTR-866). The small
-	 * views stay one step after the cards. Returns the object and the card-by-card
-	 * JSON text of its tasks array (without brackets) so the cached state text can
-	 * splice it in place of a whole-array stringify. */
+	 * views stay one step after the cards. Returns the object and the tasks array's
+	 * JSON as chunk buffers (without brackets) so the cached state bytes can splice
+	 * them in place of a whole-array stringify. */
 	async function stateResponse(): Promise<{
 		state: StateResponse;
-		tasksText: string;
+		tasksBufs: Buffer[];
 	}> {
 		const now = Date.now();
 		const cycle = await updateCycleView(now);
-		const { tasks, keptHeld, keptStale, keptCards, tasksPieces } =
+		const { tasks, keptHeld, keptStale, keptCards, tasksBufs } =
 			await boardCards(now);
 		const scan = await currentOrphanScan();
 
@@ -5469,7 +5471,7 @@ export async function createApp(deps: AppDeps) {
 			seedFailed: seedFailedView(),
 			updateCycle: cycle,
 		};
-		return { state, tasksText: tasksPieces.join(",") };
+		return { state, tasksBufs };
 	}
 
 	/** Applies a user card edit guarded by the revision the client loaded. */
@@ -6845,6 +6847,10 @@ export async function createApp(deps: AppDeps) {
 	// The tasks slot in the state text is spliced card by card; text this rare cannot
 	// collide with a real property value.
 	const STATE_TASKS_SENTINEL = "\u0000ottr-state-tasks\u0000";
+	// Shared bytes for splicing the tasks chunk buffers into the state bytes.
+	const COMMA_BUF = Buffer.from(",");
+	const BRACKET_OPEN_BUF = Buffer.from("[");
+	const BRACKET_CLOSE_BUF = Buffer.from("]");
 	// The wrapped "state" ServerMessage frame's fixed bytes around the state JSON:
 	// JSON.stringify({type:"state", state}) is exactly this prefix, the state's own
 	// JSON, and this suffix (OTTR-884).
@@ -6859,16 +6865,17 @@ export async function createApp(deps: AppDeps) {
 		if (stateBuilding !== null) return stateBuilding;
 		const built = (async (): Promise<StateCacheEntry> => {
 			const version = stateVersion;
-			const { state, tasksText } = await stateResponse();
+			const { state, tasksBufs } = await stateResponse();
 			// Byte-identity by construction: every property except tasks is one
-			// JSON.stringify; only the tasks array is spliced with the text the chunked
+			// JSON.stringify; only the tasks array is spliced with the chunk bytes the
 			// card loop serialized — the same bytes JSON.stringify produces for plain
-			// objects, alone or inside an array. Buffer assembly instead of
-			// String.replace keeps the build's one big copy a plain memcpy (the string
-			// surgery measured 60+ ms per build, OTTR-884), and gzip consumes the
-			// buffer without a second copy. Level 6 over 9: the rebuild's gzip wall
-			// dropped about 3x measured and the response grows about 2%; -9's marginal
-			// bytes were OTTR-662's one-time mermaid trade, not a per-rebuild one.
+			// objects, alone or inside an array. The tasks chunks never exist as one
+			// joined string: the string form measured a second full copy on every
+			// build (OTTR-884), while this concat is one memcpy pass. Gzip consumes
+			// the buffer without another copy, at level 6: the rebuild's gzip wall
+			// dropped about 3x measured and the response grows about 2%; -9's
+			// marginal bytes were OTTR-662's one-time mermaid trade, not a
+			// per-rebuild one.
 			const frame = JSON.stringify({
 				...state,
 				tasks: [STATE_TASKS_SENTINEL],
@@ -6877,7 +6884,9 @@ export async function createApp(deps: AppDeps) {
 			const at = frame.indexOf(needle);
 			const stateBuf = Buffer.concat([
 				Buffer.from(frame.slice(0, at), "utf8"),
-				Buffer.from(`[${tasksText}]`, "utf8"),
+				BRACKET_OPEN_BUF,
+				...tasksBufs,
+				BRACKET_CLOSE_BUF,
 				Buffer.from(frame.slice(at + needle.length), "utf8"),
 			]);
 			const gz =
