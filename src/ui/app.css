@@ -8345,17 +8345,23 @@ button.log-mode[aria-pressed="true"] {
 	button.icon {
 		min-width: 40px;
 	}
-	/* 16px stops iOS Safari zooming the field on focus. The model trigger stands in for a
-	   select, so it keeps the same type size as the Thinking select beside it. */
+	/* The composer's narrow select matches the 40px trigger beside it on phones. */
+	.composer-actions select {
+		height: 40px;
+	}
+}
+
+/* 16px prevents iOS Safari focus zoom on phones, including landscape and touch tablets.
+   Model triggers replace selects. Explicit control sizes must beat caption and composer rules. */
+@media (max-width: 720px), (pointer: coarse) {
 	input,
 	select,
 	textarea,
-	.model-trigger {
-		font-size: 16px;
-	}
-	/* The composer's narrow select keeps 16px (no iOS zoom) and matches the 40px trigger beside it. */
+	.model-trigger,
+	.version-input,
+	.release-notes-input,
+	.composer-actions .model-trigger,
 	.composer-actions select {
-		height: 40px;
 		font-size: 16px;
 	}
 }
