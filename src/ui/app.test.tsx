@@ -4732,13 +4732,18 @@ describe("cancelled cards on the board", () => {
 		);
 		// The project row's stage cells in column order: the cancelled card leaves
 		// In progress empty and lands in Done, like the board lanes show it.
-		const body = /<tbody>[\s\S]*<\/tbody>/.exec(html)![0]!;
-		const cells = [...body.matchAll(/<td[^>]*>(\d+)<\/td>/g)].map((m) => m[1]);
-		expect(cells).toEqual(["1", "0", "0", "1"]);
+		const window = new Window({ url: "http://localhost/" });
+		const container = window.document.createElement("div");
+		container.innerHTML = html;
+		const cellText = (label: string) =>
+			container.querySelector(`td[data-label="${label}"]`)!.textContent;
+		expect(cellText("Todo")).toBe("1");
+		expect(cellText("In progress")).toBe("0");
+		expect(cellText("Merging")).toBe("0");
+		expect(cellText("Done")).toBe("1");
 		// Last activity counts the cancel stamp: updateTask bumps updated_at, so the
 		// cell shows a relative time instead of the empty dash.
-		const ageCell = /<td class="age">([^<]*)<\/td>/.exec(body)![1]!;
-		expect(ageCell).not.toBe("–");
+		expect(cellText("Last activity")).not.toBe("–");
 	});
 });
 

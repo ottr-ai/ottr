@@ -3873,6 +3873,9 @@ a.pr-link:hover {
 	font-weight: 400;
 	color: var(--dim);
 }
+.ov-none {
+	display: none;
+}
 
 .ov th,
 .ov td {
@@ -3997,7 +4000,8 @@ a.pr-link:hover {
 	margin-right: 6px;
 }
 /* An svg has no text baseline, so a bare mark rides high: drop it onto the row's text. */
-.ov td > .mark-needs {
+.ov td > .mark-needs,
+.ov-phone td > span > .mark-needs {
 	vertical-align: -2px;
 	margin-right: 6px;
 }
@@ -5372,11 +5376,15 @@ dialog.confirm-dialog {
 .sys-dur {
 	white-space: nowrap;
 }
-/* Phones: each container row becomes a block and each data cell carries its column name, so
-   no column is cut off. The table, its <th scope> headers and its caption stay for screen
-   readers; the visual header row is hidden (the cell labels repeat it). */
+/* Phones: System and opt-in Overview rows become labelled blocks.
+   Native headers remain for screen readers; only the visual header row is hidden. */
 @media (max-width: 720px) {
-	.sys thead {
+	.ov-phone,
+	.ov-phone tbody {
+		display: block;
+	}
+	.sys thead,
+	.ov-phone thead {
 		position: absolute;
 		width: 1px;
 		height: 1px;
@@ -5384,7 +5392,9 @@ dialog.confirm-dialog {
 		clip-path: inset(50%);
 	}
 	.sys th,
-	.sys td {
+	.sys td,
+	.ov.ov-phone th,
+	.ov.ov-phone td {
 		border-bottom: 0;
 		padding: 6px 14px;
 		white-space: normal;
@@ -5392,35 +5402,77 @@ dialog.confirm-dialog {
 	}
 	.sys tr,
 	.sys tbody th,
-	.sys td {
+	.sys td,
+	.ov-phone tr,
+	.ov-phone tbody th,
+	.ov-phone td {
 		display: block;
 	}
-	.sys tr {
+	.sys tr,
+	.ov-phone tr {
 		border-bottom: 1px solid var(--line-soft);
 	}
-	.sys tr:last-child {
+	.sys tr:last-child,
+	.ov-phone tr:last-child {
 		border-bottom: 0;
 	}
-	.sys tbody th {
+	.sys tbody th,
+	.ov.ov-phone tbody th {
 		padding-top: 10px;
 	}
-	.sys td:last-child {
+	.sys td:last-child,
+	.ov.ov-phone td:last-child {
 		padding-bottom: 10px;
 	}
-	.sys td[data-label] {
+	.sys td[data-label],
+	.ov-phone td[data-label] {
 		display: grid;
 		grid-template-columns: 7.5em minmax(0, 1fr);
 		gap: 14px;
 	}
-	.sys td[data-label]::before {
+	.sys td[data-label]::before,
+	.ov-phone td[data-label]::before {
 		/* Empty alt text: the <th scope> header already names the cell for screen readers. */
 		content: attr(data-label) / "";
 		color: var(--dim);
 	}
 	/* A cell's value can be several nodes (a count and its "+N in 1 h" span): every node after
 	   the label stays in the value column instead of wrapping into the label column. */
-	.sys td[data-label] > * {
+	.sys td[data-label] > *,
+	.ov-phone td[data-label] > * {
 		grid-column: 2;
+	}
+	.ov-phone td[data-label]::before {
+		text-align: left;
+	}
+	.ov-phone td[data-label="New task"] {
+		align-items: center;
+	}
+	.ov-phone td[data-label] > * {
+		min-width: 0;
+		max-width: 100%;
+		justify-self: end;
+	}
+	.ov.ov-phone th[scope="row"] {
+		width: auto;
+	}
+	.ov.ov-phone th[scope="row"] .p {
+		max-width: 100%;
+	}
+	.ov-phone .cell-bar,
+	.ov-phone .v-link,
+	.ov-phone .needs-count {
+		max-width: 100%;
+		flex-wrap: wrap;
+	}
+	.ov-phone .cell-bar > span {
+		min-width: 0;
+	}
+	.ov-phone .cell-bar i {
+		max-width: 100%;
+	}
+	.ov-phone .ov-none {
+		display: inline;
 	}
 }
 /* One hour on a recessed strip; a gap in the line is a gap in the samples. */

@@ -4960,7 +4960,7 @@ export function Overview({
 				<JiraBoardImportButton onOpen={() => setShowBoardJira(true)} />
 			</div>
 			<div className="ov-wrap">
-				<table className="ov">
+				<table className="ov ov-phone">
 					<thead>
 						<tr>
 							<th scope="col">Project</th>
@@ -5028,21 +5028,26 @@ export function Overview({
 											</span>
 										)}
 									</th>
-									<td>
-										{split.needs.length > 0 && (
-											<span className="needs-count">
-												<Mark kind="needs" />
-												{split.needs.length}
-												<span className="sr"> need action</span>
-											</span>
-										)}
-										{split.asks.length > 0 && (
-											<span className="needs-count ask-n">
-												<Mark kind="asked" />
-												{split.asks.length}
-												<span className="sr"> asked</span>
-											</span>
-										)}
+									<td data-label="Action required">
+										<span>
+											{split.needs.length > 0 && (
+												<span className="needs-count">
+													<Mark kind="needs" />
+													{split.needs.length}
+													<span className="sr"> need action</span>
+												</span>
+											)}
+											{split.asks.length > 0 && (
+												<span className="needs-count ask-n">
+													<Mark kind="asked" />
+													{split.asks.length}
+													<span className="sr"> asked</span>
+												</span>
+											)}
+											{split.needs.length === 0 && split.asks.length === 0 && (
+												<span className="ov-none">None</span>
+											)}
+										</span>
 									</td>
 									{COLUMNS.map((c) => {
 										// Count what the board lanes show: laneStage sends a cancelled
@@ -5052,20 +5057,25 @@ export function Overview({
 										return (
 											<td
 												key={c.key}
+												data-label={c.label}
 												className={inStage.length === 0 ? "zero" : undefined}
 											>
-												{running > 0 && (
-													<>
-														<Mark kind="running" />
-														<span className="sr">{running} running of </span>
-													</>
-												)}
-												{inStage.length}
+												<span>
+													{running > 0 && (
+														<>
+															<Mark kind="running" />
+															<span className="sr">{running} running of </span>
+														</>
+													)}
+													{inStage.length}
+												</span>
 											</td>
 										);
 									})}
-									<td className="age">{last > 0 ? age(last) : "–"}</td>
-									<td>
+									<td className="age" data-label="Last activity">
+										<span>{last > 0 ? age(last) : "–"}</span>
+									</td>
+									<td data-label="New task">
 										<button
 											type="button"
 											className="icon"
@@ -5678,7 +5688,7 @@ export function PerfTable({
 		Math.max(...rows.map((r) => get(r) ?? 0), 0) || 1;
 	// Bare table: the Performance section frames it, and the same range buttons drive it.
 	return (
-		<table className="ov">
+		<table className="ov ov-phone">
 			<thead>
 				<tr>
 					<th scope="col">{firstCol}</th>
@@ -5705,7 +5715,7 @@ export function PerfTable({
 									{labelOf(p.name)}
 								</span>
 							</th>
-							<td>
+							<td data-label="Throughput">
 								<CellBar
 									text={p.throughput.value ?? "–"}
 									ratio={
@@ -5713,7 +5723,7 @@ export function PerfTable({
 									}
 								/>
 							</td>
-							<td>
+							<td data-label="Lead time (median / p90)">
 								<CellBar
 									text={
 										<>
@@ -5727,7 +5737,7 @@ export function PerfTable({
 									}
 								/>
 							</td>
-							<td>
+							<td data-label="First-pass">
 								<CellBar
 									text={pctFmt(p.firstPass.value)}
 									ratio={
@@ -5735,21 +5745,25 @@ export function PerfTable({
 									}
 								/>
 							</td>
-							<td>
-								{alarm && <Mark kind="needs" />}
-								<CellBar
-									text={pctFmt(p.failure.value)}
-									ratio={(p.failure.value ?? 0) / maxOf((m) => m.failure.value)}
-									alarm={alarm}
-								/>
+							<td data-label="Failure rate">
+								<span>
+									{alarm && <Mark kind="needs" />}
+									<CellBar
+										text={pctFmt(p.failure.value)}
+										ratio={
+											(p.failure.value ?? 0) / maxOf((m) => m.failure.value)
+										}
+										alarm={alarm}
+									/>
+								</span>
 							</td>
-							<td>
+							<td data-label="Spend">
 								<CellBar
 									text={usdFmt(p.spend.value)}
 									ratio={(p.spend.value ?? 0) / maxOf((m) => m.spend.value)}
 								/>
 							</td>
-							<td>
+							<td data-label="Context (avg)">
 								<CellBar
 									text={tokFmt(p.contextAvgTokens.value)}
 									ratio={
@@ -5758,7 +5772,7 @@ export function PerfTable({
 									}
 								/>
 							</td>
-							<td>
+							<td data-label="Context (max)">
 								<CellBar
 									text={
 										maxTask === null ? (
