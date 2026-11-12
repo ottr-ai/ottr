@@ -15291,6 +15291,41 @@ describe("the board token serves git on the configured GitHub host", () => {
 			if (k.startsWith("OTTR_GIT_TOKEN_")) expect(v).not.toBe(BOARD);
 	});
 
+	test("a kept-unreadable row does not shadow the board token", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const g = GlobalStore.open(
+			join(root, "g-board-unreadable", Math.random().toString(36).slice(2)),
+		);
+		// A row sealed by another box: this boot cannot open it, so it restores as an
+		// unusable row with an empty token (ADR-0011). Its helper for the host must not
+		// stand between git and the board token: git stops at the first helper that
+		// answers, and an empty password counts as an answer.
+		const foreign = loadSecretBox({
+			dir: mkdtempSync(join(tmpdir(), "ottr-foreign-box-")),
+			env: {},
+		});
+		g.set("config", {
+			gitTokens: [
+				{
+					host: "bmw.ghe.com",
+					username: "x-access-token",
+					token: foreign.seal("ghp_bbbb0000bbbb0000"),
+				},
+			],
+		});
+		const m = mount({ gstore: g, sshDir: join(root, "ssh-board-unreadable") });
+		await setup(m);
+		const env = networkGitAuth(
+			join(root, "board-unreadable", ".worktrees", "w"),
+		);
+		const helper = pairFor(env, "credential.https://bmw.ghe.com.helper");
+		expect(helper).toContain('"$OTTR_GIT_TOKEN_0"');
+		// The helper's credential is the board token; no empty-token helper exists.
+		expect(env.OTTR_GIT_TOKEN_0).toBe(BOARD);
+		for (const [k, v] of Object.entries(env))
+			if (k.startsWith("OTTR_GIT_TOKEN_")) expect(v).not.toBe("");
+	});
+
 	test("git to another host carries no board token", async () => {
 		const m = mount({ sshDir: join(root, "ssh-board-other") });
 		await setup(m);

@@ -3953,6 +3953,19 @@ export function createApp(deps: AppDeps) {
 		const cand = parseGitToken({ host: h.host, token: githubToken });
 		return "error" in cand ? null : cand;
 	}
+	/** The credential rows for one https git call: the readable stored tokens, plus the
+	 * board token when it covers the configured host. One builder for the resolver (D6)
+	 * and the Add-project clone (hostedCloneEnv), so the clone gets exactly the list the
+	 * resolver promises. Kept-unreadable rows stay out (ADR-0011): their helper would
+	 * answer with an empty password, and git stops at the first helper that answers, so
+	 * it would shadow a board-token helper for the same host. */
+	function networkGitTokens(): GitToken[] {
+		const board = boardGitToken();
+		return [
+			...gitTokens.filter((t) => t.unreadable !== true),
+			...(board === null ? [] : [board]),
+		];
+	}
 	// D6: every network git call (clone/fetch/ls-remote/pull/push, merge turns included) picks
 	// up the auth of the project that owns cwd. Workers get none of these names: the runner
 	// strips them from the env it forwards (GIT_AUTH_ENV_RE in src/worktree.ts).
@@ -3967,14 +3980,9 @@ export function createApp(deps: AppDeps) {
 				break;
 			}
 		}
-		const board = boardGitToken();
 		return gitAuthEnv({
 			ambientHelpers,
-			// Kept-unreadable token rows stay out of the auth env (ADR-0011).
-			tokens: [
-				...gitTokens.filter((t) => t.unreadable !== true),
-				...(board === null ? [] : [board]),
-			],
+			tokens: networkGitTokens(),
 			key,
 			knownHosts: paths.knownHosts,
 		});
@@ -5504,10 +5512,9 @@ export function createApp(deps: AppDeps) {
 		authEnv: Record<string, string>;
 		hostedSecrets: readonly string[];
 	}> {
-		const board = boardGitToken();
 		let authEnv = gitAuthEnv({
 			ambientHelpers,
-			tokens: [...gitTokens, ...(board === null ? [] : [board])],
+			tokens: networkGitTokens(),
 			key,
 			knownHosts: paths.knownHosts,
 		});
