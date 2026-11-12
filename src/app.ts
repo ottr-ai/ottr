@@ -575,6 +575,9 @@ interface AppDeps {
 	gstore: GlobalStore;
 	/** gh CLI seam; defaults to runGh. Tests inject a stub for the /github route. */
 	gh?: GhFn;
+	/** The local /tmp free-space probe (OTTR-754's local warning); defaults to the real
+	 * statfs probe of /tmp. Tests inject one, so warning assertions never read the host. */
+	tmpSpace?: () => TmpDiskSpace | null;
 	/** Latest GitHub release seam; defaults to the cached probe in release.ts. Tests inject
 	 * a stub for the release chip and the Create release routes. */
 	latestRelease?: (repo: string) => Promise<LatestGhRelease | null>;
@@ -2765,11 +2768,15 @@ export async function createApp(deps: AppDeps) {
 	 *  a --config overlay (src/runner.ts); config.yml no longer matters (a stale backend line is
 	 *  inert). Health of the backend in effect, refreshed on boot, on save, and on a 60 s tick. */
 	let memoryHealth: MemoryHealth | null = null;
-	async function memoryHealthTick(): Promise<void> {
+	async function memoryHealthTick(boot = false): Promise<void> {
+		const prev = memoryHealth;
 		try {
 			memoryHealth = await checkMemoryHealth(memoryBackendFromEnv(process.env));
 			// A changed reason lights the bell's warning: publish now, not on the sweep.
-			publishSoon();
+			// The boot load publishes nothing: the first state frame carries the fresh
+			// value, and no client is connected to hold a stale one.
+			if (!boot && (prev?.reason ?? null) !== (memoryHealth?.reason ?? null))
+				publishSoon();
 		} catch (err) {
 			// checkMemoryHealth reports reasons instead of throwing; a throw is a bug in the
 			// plumbing, and it must never take the board down.
@@ -4366,7 +4373,10 @@ export async function createApp(deps: AppDeps) {
 		logError("hindsight env seed", err);
 	}
 	// Boot + interval (src/server.ts), never per turn (docs/specs/memory-backend.md).
-	void (await memoryHealthTick());
+
+		void (await memoryHealthTick(true));
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	// OTTR-548: the workers' sign-in self-reports boot + interval (src/server.ts), advisory only.
 	void (await workerSignInTick());
 	const logins = providerLogin();
@@ -5261,13 +5271,35 @@ export async function createApp(deps: AppDeps) {
 		}
 	}
 
-	/** Every project's cards, newest first, plus the kept-worktree counts: the card slice of
-	 * stateResponse, shared with the /system holds so both count the same cards. */
+
+	/** One event-loop turn released: a build chunk hands control back so requests,
+	 * timers and sockets run between slices (OTTR-866). Every build slice yields
+	 * through this one helper, so the cadence stays in lockstep. */
+	const yieldLoop = (): Promise<void> => {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		setImmediate(resolve);
+		return promise;
+	};
+
+	/** Every project's cards, newest first, plus the kept-worktree counts and the
+	 * per-card JSON text: the card slice of the state build, shared with the /system
+	 * holds so both count the same cards. Chunked (OTTR-866): yields to the loop
+	 * between projects and every 100 cards, so no single block exceeds ~50 ms. */
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	async function boardCards(now: number): Promise<{
 		tasks: TaskCard[];
 		keptHeld: number;
 		keptStale: number;
 		keptCards: string[];
+
+		/** Per-card JSON text in tasks order; the state text splices these into the
+		 * tasks array in place of one giant stringify. */
+		tasksPieces: string[];
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	}> {
 		const tasks: TaskCard[] = [];
 		let keptHeld = 0;
@@ -5281,7 +5313,11 @@ export async function createApp(deps: AppDeps) {
 				const medians = turnMedians(await e.store.turnDurations());
 				const trendingRepos = await trendingReposOf(e);
 				const cards: TaskCard[] = [];
-				for (const t of await e.store.listTasks()) {
+
+			let built = 0;
+			for (const t of await e.store.listTasks()) {
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 					const kept = keptCounts(t, now, days);
 					keptHeld += kept.held;
 					keptStale += kept.stale;
@@ -5298,6 +5334,7 @@ export async function createApp(deps: AppDeps) {
 							now,
 						),
 					);
+					if (++built % 100 === 0) await yieldLoop();
 				}
 				stampReleaseHolds(cards);
 				await stampPushHolds(e, cards);
@@ -5307,16 +5344,33 @@ export async function createApp(deps: AppDeps) {
 				// A sick store skips its own cards; the rest of the board still renders.
 				logStoreError(e.store.name, err);
 			}
+			// The next store's reads must not extend this block.
+			await yieldLoop();
 		}
 		tasks.sort((a, b) => b.createdAt - a.createdAt);
-		return { tasks, keptHeld, keptStale, keptCards };
+		// Card-by-card JSON in slices: one stringify over the whole list was the
+		// largest single block of the old build (OTTR-866). A plain object
+		// stringifies identically alone and inside an array, so the state text's
+		// splice of these pieces is byte-equal to a stringify of the array.
+		const tasksPieces: string[] = [];
+		for (let i = 0; i < tasks.length; i += 100) {
+			for (const card of tasks.slice(i, i + 100))
+				tasksPieces.push(JSON.stringify(card));
+			await yieldLoop();
+		}
+		return { tasks, keptHeld, keptStale, keptCards, tasksPieces };
 	}
 
-	/** The /system holds, from the same drain values and cards the state frame ships. */
+
+	/** The /system holds: the cached state frame's cards, so /api/system counts the
+	 * same cards the board ships (OTTR-866). Drain and ceiling stay live reads. */
 	async function systemHolds(now: number): Promise<SystemHolds> {
-		const { tasks } = await boardCards(now);
-		const slots = slotUse(tasks);
-		const queue = queueOrder(tasks);
+		const entry = await stateEntry();
+		const slots = slotUse(entry.state.tasks);
+		const queue = queueOrder(entry.state.tasks);
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		const first = queue[0];
 		return {
 			drainUntil: drainUntil > now ? drainUntil : null,
@@ -5329,11 +5383,23 @@ export async function createApp(deps: AppDeps) {
 		};
 	}
 
-	async function stateResponse(): Promise<StateResponse> {
+
+	/** One state frame, chunked: the card loop yields to the loop (OTTR-866). The small
+	 * views stay one step after the cards. Returns the object and the card-by-card
+	 * JSON text of its tasks array (without brackets) so the cached state text can
+	 * splice it in place of a whole-array stringify. */
+	async function stateResponse(): Promise<{
+		state: StateResponse;
+		tasksText: string;
+	}> {
 		const now = Date.now();
 		const cycle = await updateCycleView(now);
-		const { tasks, keptHeld, keptStale, keptCards } = await boardCards(now);
+		const { tasks, keptHeld, keptStale, keptCards, tasksPieces } =
+			await boardCards(now);
 		const scan = await currentOrphanScan();
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
 		let list: SignIn[] = [];
 		try {
@@ -5361,7 +5427,7 @@ export async function createApp(deps: AppDeps) {
 					rankInOrder(a.name, deps.shared.projectOrder) -
 					rankInOrder(b.name, deps.shared.projectOrder),
 			);
-		return {
+		const state: StateResponse = {
 			projects,
 			tasks,
 			maxTotal: deps.shared.maxTotalRuns,
@@ -5391,8 +5457,12 @@ export async function createApp(deps: AppDeps) {
 				// OTTR-548: the workers' self-reported sign-ins; reads only the tick's cache.
 				...workerSignInWarnings(workerSignInReports, list, roles),
 				// OTTR-754: one bell warning per runner whose /tmp is below the free-space
-				// limit; recomputed per poll, so it disappears when space returns.
-				...workerTmpWarnings(workerSignInReports, tmpDiskSpace()),
+				// limit; recomputed per poll, so it disappears when space returns. The
+				// local probe is the injected seam (tests) or the real /tmp statfs.
+				...workerTmpWarnings(
+					workerSignInReports,
+					deps.tmpSpace?.() ?? tmpDiskSpace(),
+				),
 				// OTTR-763: the checkout guard's ambiguous-change notices; one per change,
 				// naming the commit and the running cards; bounded and expiring in the loop.
 				...(deps.checkoutNotices?.() ?? []),
@@ -5411,6 +5481,7 @@ export async function createApp(deps: AppDeps) {
 			seedFailed: seedFailedView(),
 			updateCycle: cycle,
 		};
+		return { state, tasksText: tasksPieces.join(",") };
 	}
 
 	/** Applies a user card edit guarded by the revision the client loaded. */
@@ -6612,6 +6683,7 @@ export async function createApp(deps: AppDeps) {
 		}
 	}
 
+
 	let publishTail: Promise<void> = Promise.resolve();
 	function publishState(): Promise<boolean> {
 		if (closing) return Promise.resolve(false);
@@ -6628,6 +6700,9 @@ export async function createApp(deps: AppDeps) {
 	}
 
 	async function publishStateNow(): Promise<boolean> {
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		if (deps.serverRef.current === undefined) return false;
 		const consumers = sockets > 0 || (await loadSubs(deps.gstore)).length > 0;
 		// Without a consumer the frame exists only for the seen prune below; skip the state
@@ -6645,9 +6720,23 @@ export async function createApp(deps: AppDeps) {
 			publishUpdate();
 			return false;
 		}
-		const state = await stateResponse();
-		builtVersion = stateVersion;
-		builds++;
+
+		let entry: StateCacheEntry;
+		try {
+			entry = await stateBuild();
+		} catch (err) {
+			// A failed build leaves the cache untouched: the next caller rebuilds.
+			logError("state build", err);
+			return false;
+		}
+		// The version the build observed at its start, not the live one: a mutation
+		// landing mid-build bumped stateVersion, so the gate must stay open for the
+		// next call (OTTR-866).
+		builtVersion = entry.version;
+		const state = entry.state;
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
 		const inputs = await alertInputs(state.tasks, lastAlertInputs);
 		// The prune runs on every publish, consumers or not: a card that leaves needs_you and
@@ -6708,7 +6797,8 @@ export async function createApp(deps: AppDeps) {
 	let stateVersion = 0;
 	/** Version of the last built frame; -1 = nothing built yet, so the first build always runs. */
 	let builtVersion = -1;
-	/** Test seam: how often publishState() rebuilt the state (OTTR-866). */
+	/** Test seam: how often the state rebuilt (GET-triggered or publish-triggered,
+	 * one increment per completed build; OTTR-866). */
 	let builds = 0;
 	let stateTimer: Timer | null = null;
 	function publishSoon(): void {
@@ -6716,34 +6806,17 @@ export async function createApp(deps: AppDeps) {
 		// Bump before the queue check: a change arriving while a publish is queued must
 		// not be lost behind the already queued build.
 		stateVersion++;
+
 		if (stateTimer !== null) return;
 		stateTimer = setTimeout(() => {
 			stateTimer = null;
-			void publishState();
->>>>>>> 880329a (perf: derive websocket publication from state changes)
+			// A failed publish logs and leaves the cache untouched: the next caller
+			// rebuilds. Never an unhandled rejection (OTTR-866).
+			publishState().catch((err) => logError("state publish", err));
 		}, 0);
 	}
 
-	/** Stop admission, then drain accepted work before the stores close. */
-	function close(): Promise<void> {
-		if (closePromise !== null) return closePromise;
-		closing = true;
-		if (stateTimer !== null) {
-			clearTimeout(stateTimer);
-			stateTimer = null;
-		}
-		closePromise = (async () => {
-			const errors: unknown[] = [];
-			while (internalWork.size > 0) {
-				const results = await Promise.allSettled([...internalWork]);
-				for (const result of results)
-					if (result.status === "rejected") errors.push(result.reason);
-			}
-			await publishTail;
-			if (errors.length > 0)
-				throw new AggregateError(errors, "app background work failed");
-		})();
-		return closePromise;
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	}
 
 	const logThrottle = keyedThrottle<{ project: string; id: string }>(250, (a) =>
@@ -6799,6 +6872,7 @@ export async function createApp(deps: AppDeps) {
 		if (closing) return Promise.resolve();
 		if (sampling) return sampleInFlight ?? Promise.resolve();
 		sampling = true;
+
 		const jobs: Promise<unknown>[] = [
 			measureSystem()
 				.then(async () => {
@@ -6821,6 +6895,9 @@ export async function createApp(deps: AppDeps) {
 					sampling = false;
 				}),
 		];
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		if (
 			updateCycle.available(Date.now()) === null &&
 			Date.now() - behindAt > 300_000 &&
@@ -12726,8 +12803,11 @@ export async function createApp(deps: AppDeps) {
 				),
 		},
 		"/api/state": {
-			GET: async (req) =>
-				await api(req, async () => json(await stateResponse())),
+
+			GET: (req) => api(req, () => stateJsonResponse()),
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		},
 		"/api/orphans": {
 			GET: async (req) => await api(req, async () => await handleGETOrphans()),
@@ -13457,9 +13537,13 @@ export async function createApp(deps: AppDeps) {
 					// OTTR-866: the replayed frame must be the current state, so open the gate —
 					// a build may have run for a consumerless publish and left lastStateJson behind.
 					stateVersion++;
+
 					const published = await publishState();
 					if (closing) return;
 					if (!published) ws.send(lastStateJson);
+
+
+>>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 					ws.send(
 						JSON.stringify({
 							type: "update",
@@ -13491,8 +13575,25 @@ export async function createApp(deps: AppDeps) {
 		publish,
 		publishState,
 		publishSoon,
-		/** Test seam (OTTR-866): how often publishState() rebuilt the state. */
+		/** Test seam (OTTR-866): how often the state rebuilt (one per completed build). */
 		stateBuilds: () => builds,
+		/** Test seam (OTTR-866): the current cached state build, or null before the first. */
+		stateCacheForTest: (): {
+			version: number;
+			builtAt: number;
+			state: StateResponse;
+			stateText: string;
+		} | null => {
+			const c = stateCache;
+			return c === null
+				? null
+				: {
+						version: c.version,
+						builtAt: c.builtAt,
+						state: c.state,
+						stateText: c.stateText,
+					};
+		},
 		notifyLog,
 		drained: () =>
 			Date.now() < Math.max(drainUntil, updateCycle.holdUntil(Date.now())),

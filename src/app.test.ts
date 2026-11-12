@@ -395,6 +395,9 @@ const app = await createTestApp({
 	},
 	progressOf: () => fakeProgress,
 	checkoutNotices: () => checkoutNoticesImpl(),
+	// The local /tmp probe is host state: stubbed, so exact warning assertions in the
+	// state payload never depend on the machine's free space (OTTR-754).
+	tmpSpace: () => null,
 	schedule: () => {
 		calls++;
 	},
@@ -487,11 +490,16 @@ const errorOf = async (res: Response): Promise<string> => {
 		: "";
 };
 
-// Same guard headers as post(): api() matches Host and Origin on deps.port (0 here).
-const get = async (path: string) =>
-	fetch(new URL(path, server.url), {
+// Same guard headers as post(): api() matches Host and Origin on deps.port (0).
+const get = async (path: string) => {
+	// Test writes bypass production's publishSoon (direct store/seam/file edits), so a
+	// state/system read opens the gate itself: it must never serve a frame older than
+	// the writes above it (OTTR-866 state cache).
+	if (path === "/api/state" || path === "/api/system") app.publishSoon();
+	return fetch(new URL(path, server.url), {
 		headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
 	});
+};
 
 /**
  * Fresh isolated app+server for one describe (own global store, own limiter/limiter buckets,
@@ -632,6 +640,10 @@ async function mount(
 		body?: unknown,
 		headers: Record<string, string> = {},
 	) => {
+		// Test writes bypass production's publishSoon (direct store/seam/file edits),
+		// so a state/system read opens the gate itself: it must never serve a frame
+		// older than the writes above it (OTTR-866 state cache).
+		if (path === "/api/state" || path === "/api/system") created.publishSoon();
 		// An explicit headers.method (PUT/DELETE) wins; it is consumed, not sent as a header.
 		const { method, ...rest } = headers;
 		return fetch(new URL(path, srv.url), {
@@ -649,12 +661,19 @@ async function mount(
 }
 
 /** OTTR-866: publishState() rebuilds the state only after a publishSoon() bumped the state
- *  version. The publish tests drive the store directly (no route, no guarded publishSoon),
- *  so every explicit publish goes through this: bump, then publish synchronously. The
- *  queued sweep timer later finds the version consumed and skips the rebuild. */
-function publishNow(a: App): boolean {
+
+ *  version, and the build is async. The publish tests drive the store directly (no route,
+ *  no guarded publishSoon), so every explicit publish goes through this: bump, then await
+ *  the publish. The queued sweep timer later finds the version consumed and skips.
+ *  A publishSoon timer armed by an earlier route can fire between the bump and the
+ *  build and swallow this frame's diff (its stale build started before the writes,
+ *  and the gate stays open for the next call). The second publish rebuilds: its build
+ *  starts after this test's writes, so the frame's diff always ran when it returns. */
+async function publishNow(a: BoardApp): Promise<boolean> {
+
 	a.publishSoon();
-	return a.publishState();
+	const first = await a.publishState();
+	return (await a.publishState()) || first;
 }
 
 describe(
@@ -1454,8 +1473,14 @@ describe("task routes", () => {
 	});
 
 	test("state lists a cancelled card with its cancelledAt", async () => {
+
 		const t = await store.createTask("cancelled card stays visible");
 		await store.updateTask(t.id, { cancelledAt: 1760000000000, state: "idle" });
+		// The direct write bypasses production's publishSoon; publish drains the gate
+		// (and any in-flight build an earlier test's timer started), so the GET below
+		// cannot serve the frame from before the cancellation (OTTR-866 state cache).
+		await publishNow(app);
+
 		const res = await get("/api/state");
 		const b = (await res.json()) as {
 			tasks: Array<{ id: string; cancelledAt: number | null; state: string }>;
@@ -11227,6 +11252,172 @@ describe("costly-route limit (public boards)", () => {
 	});
 });
 
+describe("state cache and single-flight build (OTTR-866)", () => {
+	// Raw fetch, not the get()/call() helpers: those open the version gate for
+	// state/system reads so harness writes ship. These tests must exercise the gate,
+	// the cache and the TTL exactly as production sees them.
+	const rawGet = (
+		srv: Server<undefined>,
+		path = "/api/state",
+		headers: Record<string, string> = {},
+	) =>
+		fetch(new URL(path, srv.url), {
+			headers: {
+				Host: "127.0.0.1:0",
+				Origin: "http://127.0.0.1:0",
+				...headers,
+			},
+		});
+
+	test("the built state text is byte-equal to JSON.stringify of the state", async () => {
+		const m = mount({ projects });
+		// Varied cards: unicode text, nulls, a cancelled card, a turn with a model,
+		// and a needs_you card with a reason.
+		const uni = store.createTask("ünïcode ✨ 卡片 — dash");
+		store.updateTask(uni.id, { details: null, report: null });
+		const cancelled = store.createTask("cancelled card");
+		store.updateTask(cancelled.id, {
+			cancelledAt: 1_760_000_000_000,
+			state: "idle",
+		});
+		const ask = store.createTask("needs you");
+		store.updateTask(ask.id, {
+			state: "needs_you",
+			needsReason: "Proposed ✅",
+		});
+		const turn = store.startTurn(uni.id, "work", "p", null);
+		store.finishTurn(turn.id, { model: "zai/glm-5.3-flash" });
+		const res = await rawGet(m.server);
+		expect(res.status).toBe(200);
+		const entry = m.app.stateCacheForTest();
+		expect(entry).not.toBeNull();
+		// The card-by-card spliced tasks text must equal the whole-object stringify.
+		expect(entry!.stateText).toBe(JSON.stringify(entry!.state));
+		// The served bytes are that text, and the varied fields survived the splice.
+		const b = JSON.parse(await res.text()) as {
+			tasks: Array<{ id: string; needsReason?: string | null }>;
+		};
+		expect(b.tasks.find((t) => t.id === ask.id)?.needsReason).toBe(
+			"Proposed ✅",
+		);
+		// json()'s exact headers on this route: the Windows Connection: close
+		// workaround must stay byte-identical (OTTR-866 preservation).
+		expect(res.headers.get("content-type")).toBe("application/json");
+		expect(res.headers.get("vary")).toBe("Accept-Encoding");
+		expect(res.headers.get("connection")).toBe("close");
+	});
+
+	test("two GETs with no change between serve the same cached bytes and build once", async () => {
+		const m = mount({ projects });
+		const r1 = await rawGet(m.server);
+		const text1 = await r1.text();
+		expect(m.app.stateBuilds()).toBe(1);
+		const r2 = await rawGet(m.server);
+		const text2 = await r2.text();
+		// Served from the cache: no second build, identical bytes.
+		expect(m.app.stateBuilds()).toBe(1);
+		expect(text2).toBe(text1);
+	});
+
+	test("a card filed through its route ships in the very next GET", async () => {
+		const m = mount({ projects });
+		await rawGet(m.server);
+		const before = m.app.stateBuilds();
+		// The filing route's guarded() fires publishSoon, so the version gate opens:
+		// a cache that ignored the bump would serve the frame from before the card.
+		const created = await m.call("/api/projects/p1/tasks", {
+			prompt: "fresh card",
+		});
+		expect(created.status).toBe(200);
+		const { id } = (await created.json()) as { id: string };
+		const res = await rawGet(m.server);
+		const b = JSON.parse(await res.text()) as {
+			tasks: Array<{ id: string }>;
+		};
+		expect(b.tasks.some((t) => t.id === id)).toBe(true);
+		expect(m.app.stateBuilds()).toBe(before + 1);
+	});
+
+	test("five concurrent GETs on a cold cache share one build", async () => {
+		const m = mount({ projects });
+		const responses = await Promise.all(
+			Array.from({ length: 5 }, () => rawGet(m.server)),
+		);
+		expect(m.app.stateBuilds()).toBe(1);
+		const texts = await Promise.all(responses.map((r) => r.text()));
+		expect(new Set(texts).size).toBe(1);
+	});
+
+	test("a GET after the 10 s TTL rebuilds once and serves fresh bytes", async () => {
+		// An isolated board: the shared store's cards carry time-derived fields
+		// (silentSince, ETA), and the clock jump below would change them.
+		const m = mount({});
+		await rawGet(m.server);
+		expect(m.app.stateBuilds()).toBe(1);
+		const first = m.app.stateCacheForTest()!;
+		// Past the TTL: the next read rebuilds once even with the version unchanged.
+		setSystemTime(new Date(Date.now() + 10_001));
+		try {
+			const res = await rawGet(m.server);
+			expect(m.app.stateBuilds()).toBe(2);
+			// Nothing changed, so the bytes stay identical.
+			expect(await res.text()).toBe(first.stateText);
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	test("/api/system reuses the cached build and keeps its shape", async () => {
+		const m = mount({ projects });
+		const t = store.createTask("system holds card");
+		store.updateTask(t.id, { state: "queued" });
+		await rawGet(m.server);
+		expect(m.app.stateBuilds()).toBe(1);
+		// A /system read right after a GET consumes the same cache: no rebuild.
+		const sys = await rawGet(m.server, "/api/system");
+		expect(sys.status).toBe(200);
+		expect(m.app.stateBuilds()).toBe(1);
+		const b = (await sys.json()) as {
+			at: number;
+			holds: { running: number; queued: number };
+		};
+		expect(typeof b.at).toBe("number");
+		expect(b.holds.queued).toBeGreaterThanOrEqual(1);
+	});
+
+	test("a large board serves cached gzip bytes with json()'s exact headers", async () => {
+		const m = mount({ projects });
+		// Past the 32 KiB threshold json() gzips on, so the cache must carry gzip too.
+		const long = "filler ".repeat(20);
+		for (let i = 0; i < 400; i++) store.createTask(`${long}${i}`);
+		const res = await rawGet(m.server, "/api/state", {
+			"accept-encoding": "gzip",
+		});
+		expect(res.headers.get("content-type")).toBe("application/json");
+		expect(res.headers.get("vary")).toBe("Accept-Encoding");
+		expect(res.headers.get("connection")).toBe("close");
+		expect(res.headers.get("content-encoding")).toBe("gzip");
+		expect(m.app.stateBuilds()).toBe(1);
+		// One read of res's body: fetch bodies are single-use, and the comparisons
+		// below compare both later clients against these exact cached bytes.
+		const gzipText = await res.text();
+		// A second gzip client is served the same cached bytes with no rebuild.
+		const r2 = await rawGet(m.server, "/api/state", {
+			"accept-encoding": "gzip",
+		});
+		expect(r2.headers.get("content-encoding")).toBe("gzip");
+		expect(await r2.text()).toBe(gzipText);
+		expect(m.app.stateBuilds()).toBe(1);
+		// An identity client gets the plain text, like json()'s negotiation.
+		const r3 = await rawGet(m.server, "/api/state", {
+			"accept-encoding": "identity",
+		});
+		expect(r3.headers.get("content-encoding")).toBeNull();
+		expect(await r3.text()).toBe(gzipText);
+		expect(m.app.stateBuilds()).toBe(1);
+	});
+});
+
 describe("web push (R1-1, R2-3)", () => {
 	let timersControlled = false;
 	afterEach(() => {
@@ -11243,26 +11434,26 @@ describe("web push (R1-1, R2-3)", () => {
 		classes: ALL_CLASSES_ON,
 	};
 
-	test("publishState rebuilds only after a publishSoon bumped the version (OTTR-866)", () => {
+	test("publishState rebuilds only after a publishSoon bumped the version (OTTR-866)", async () => {
 		const g = GlobalStore.open(join(root, "g-gate"));
 		const m = mount({ gstore: g });
 		// One push consumer, so publishState takes the full path instead of the
 		// no-consumer early-out that skips the build for its own reason.
 		saveSubs(g, [pushSub]);
 		// First call: nothing built yet, so the gate starts open and the build runs.
-		expect(m.app.publishState()).toBe(true);
+		expect(await m.app.publishState()).toBe(true);
 		expect(m.app.stateBuilds()).toBe(1);
 		// The 1 s tick's call: no publishSoon between two publishState calls, so the
 		// frame is reused — no rebuild, no publish (the gate-skip path). Ungated, this
 		// call rebuilds the whole state a second time and the build count below fails.
-		expect(m.app.publishState()).toBe(false);
+		expect(await m.app.publishState()).toBe(false);
 		expect(m.app.stateBuilds()).toBe(1);
 		// A publishSoon opens the gate: exactly one rebuild, and the changed content
 		// (a notice key in inboxSeen) publishes. The timer it queued finds the version
 		// already consumed and skips.
 		g.set("inbox_seen", ["notice:x"]);
 		m.app.publishSoon();
-		expect(m.app.publishState()).toBe(true);
+		expect(await m.app.publishState()).toBe(true);
 		expect(m.app.stateBuilds()).toBe(2);
 		// The publishSoon above arms a timer that outlives this test; the shared afterAll
 		// closes the store (mountStores), like every other test that arms one.
@@ -11295,6 +11486,7 @@ describe("web push (R1-1, R2-3)", () => {
 	test("a needs-you transition pushes with zero open sockets", async () => {
 
 		saveSubs(gstore, [pushSub]);
+
 		const t = await store.createTask("push me");
 		await publishNow(app); // baseline: prev = null is silent
 
@@ -11538,10 +11730,10 @@ describe("web push (R1-1, R2-3)", () => {
 			classes: { request: true, error: true, complete: false },
 		});
 
-		const t = await b.s.createTask("finish me");
+		const t = b.s.createTask("finish me");
 		await publishNow(b.m.app); // baseline: the first frame alerts nothing
 		const from = pushSends.length;
-		await b.s.updateTask(t.id, { stage: "done", state: "idle" });
+		b.s.updateTask(t.id, { stage: "done", state: "idle" });
 		expect(await publishNow(b.m.app)).toBe(true);
 
 		const sent = b.sentSince(from);
@@ -11562,6 +11754,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const turn = b.s.startTurn(t.id, "work", ".", null);
 		await publishNow(b.m.app); // baseline: the turn is still open
 
+
 		const from = pushSends.length;
 		await b.s.finishTurn(turn.id, {
 			endedAt: Date.now(),
@@ -11569,7 +11762,7 @@ describe("web push (R1-1, R2-3)", () => {
 			error: "boom",
 		});
 
-		await b.s.updateTask(t.id, { state: "queued" });
+		b.s.updateTask(t.id, { state: "queued" });
 		await publishNow(b.m.app);
 
 		const sent = b.sentSince(from);
@@ -11588,11 +11781,13 @@ describe("web push (R1-1, R2-3)", () => {
 			mutedProjects: ["alert-muted"],
 		});
 
-		const t = await b.s.createTask("ask quietly");
+		const t = b.s.createTask("ask quietly");
+
 		await publishNow(b.m.app);
 		const from = pushSends.length;
 		b.needsYou(t.id);
 		expect(await publishNow(b.m.app)).toBe(true);
+
 
 		expect(b.sentSince(from)).toEqual([]);
 		const state = (await (await b.m.call("/api/state")).json()) as {
@@ -11640,6 +11835,7 @@ describe("web push (R1-1, R2-3)", () => {
 		s.setPrComments(4242, 6_000, true);
 		expect(await publishNow(b.m.app)).toBe(true);
 
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload).toMatchObject({
@@ -11673,14 +11869,17 @@ describe("web push (R1-1, R2-3)", () => {
 		const r = (await s.getPrReview(4242))!;
 		expect(r.commentsUnseen).toBe(false);
 		expect(r.commentsAt).toBe(6000);
-		let keys = (
-			(await (await b.m.call("/api/inbox/seen")).json()) as { keys: string[] }
-		).keys;
+		// The ack POST armed its own publishSoon timer, and the prune on that publish
+		// removes the pr key again (the wave cleared). Reading the store the route
+		// wrote stays synchronous, so the race cannot drop the key from this snapshot;
+		// the route read below asserts the prune itself.
+		let keys = (b.m.g.get<unknown>("inbox_seen") as string[] | undefined) ?? [];
 		expect(keys).toContain(`pr:${t.id}:6000`);
 		expect(keys).toContain(`task:${t.id}:needs-pr${run}`);
 
 		// The cleared stamp is over: the next publish prunes the acked key.
 		await publishNow(b.m.app);
+
 
 		keys = (
 			(await (await b.m.call("/api/inbox/seen")).json()) as { keys: string[] }
@@ -11722,6 +11921,7 @@ describe("web push (R1-1, R2-3)", () => {
 		b.needsYou(t.id);
 		await publishNow(b.m.app); // baseline: the first draft is already in the frame
 
+
 		const from = pushSends.length;
 		const run2 = await s.startPrRun(4243, HEAD, 2);
 		await s.savePrDraft({
@@ -11735,6 +11935,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 		b.needsYou(t.id);
 		expect(await publishNow(b.m.app)).toBe(true);
+
 
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
@@ -11781,6 +11982,7 @@ describe("web push (R1-1, R2-3)", () => {
 		b.needsYou(t.id);
 		await publishNow(b.m.app); // baseline
 
+
 		const occOf = (await (await b.m.call("/api/state")).json()) as {
 			tasks: Array<{
 				id: string;
@@ -11803,6 +12005,7 @@ describe("web push (R1-1, R2-3)", () => {
 		s.setPrComments(4244, 7_000, true);
 		expect(await publishNow(b.m.app)).toBe(true);
 
+
 		expect(b.sentSince(from)).toEqual([]);
 		// No stamp in the frame: the bell and the event diff see no occurrence at all.
 		const quietFrame = (await (await b.m.call("/api/state")).json()) as {
@@ -11820,9 +12023,9 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-presence");
 		await b.subscribe("https://push.example/presence");
 
-		const held = await b.s.createTask("held ask");
-		const later = await b.s.createTask("later ask");
-		const last = await b.s.createTask("last ask");
+		const held = b.s.createTask("held ask");
+		const later = b.s.createTask("later ask");
+		const last = b.s.createTask("last ask");
 		await publishNow(b.m.app);
 
 		const beat = (focused: boolean, tab = "tab-1") =>
@@ -11839,6 +12042,7 @@ describe("web push (R1-1, R2-3)", () => {
 		b.needsYou(later.id);
 		await publishNow(b.m.app);
 
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload.keys).toEqual([
@@ -11852,7 +12056,8 @@ describe("web push (R1-1, R2-3)", () => {
 		await publishNow(b.m.app);
 		expect(b.sentSince(from).length).toBe(2);
 		// Nothing ever re-sends the held card's alert.
-		await b.s.createTask("unrelated");
+
+		b.s.createTask("unrelated");
 		await publishNow(b.m.app);
 
 		expect(
@@ -11877,7 +12082,7 @@ describe("web push (R1-1, R2-3)", () => {
 		await b.subscribe(fcm);
 		await b.subscribe(apple);
 
-		const t = await b.s.createTask("ask me");
+		const t = b.s.createTask("ask me");
 		await publishNow(b.m.app);
 		b.needsYou(t.id);
 		await publishNow(b.m.app);
@@ -11904,9 +12109,9 @@ describe("web push (R1-1, R2-3)", () => {
 		const apple = "https://web.push.apple.com/later";
 		await b.subscribe(apple);
 
-		const asked = await b.s.createTask("ask");
-		const done = await b.s.createTask("finish");
-		const third = await b.s.createTask("ask later");
+		const asked = b.s.createTask("ask");
+		const done = b.s.createTask("finish");
+		const third = b.s.createTask("ask later");
 		await publishNow(b.m.app);
 		b.needsYou(asked.id);
 		await publishNow(b.m.app);
@@ -11916,7 +12121,7 @@ describe("web push (R1-1, R2-3)", () => {
 		// No data-only push to Apple.
 		expect(b.sentSince(from)).toEqual([]);
 
-		await b.s.updateTask(done.id, { stage: "done", state: "idle" });
+		b.s.updateTask(done.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
 
 		const sent = b.sentSince(from);
@@ -11930,6 +12135,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 		b.needsYou(third.id);
 		await publishNow(b.m.app);
+
 
 		expect(b.sentSince(from)[1]!.payload).toMatchObject({
 			tag: "request",
@@ -11955,11 +12161,13 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-fast-fail");
 		await b.subscribe("https://push.example/fast");
 
-		const t = await b.s.createTask("fails fast");
+		const t = b.s.createTask("fails fast");
+
 		await publishNow(b.m.app);
 		const from = pushSends.length;
 		const turn = failTurn(b, t.id, "boom", "queued"); // same state and stage as before
 		await publishNow(b.m.app);
+
 
 		expect(b.sentSince(from).map((x) => x.payload.keys)).toEqual([
 			[`error:${t.id}:${turn.id}`],
@@ -11970,11 +12178,13 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-cancel-turn");
 		await b.subscribe("https://push.example/cancel-turn");
 
-		const t = await b.s.createTask("stopped");
+		const t = b.s.createTask("stopped");
+
 		await publishNow(b.m.app);
 		const from = pushSends.length;
 		failTurn(b, t.id, "cancelled", "queued");
 		await publishNow(b.m.app);
+
 
 		expect(b.sentSince(from)).toEqual([]);
 	});
@@ -11984,12 +12194,14 @@ describe("web push (R1-1, R2-3)", () => {
 		const fcm = "https://push.example/error-ack";
 		await b.subscribe(fcm);
 
-		const t = await b.s.createTask("fails then waits");
+		const t = b.s.createTask("fails then waits");
+
 		await publishNow(b.m.app);
 		const turn = failTurn(b, t.id, "boom", "queued");
 		await publishNow(b.m.app); // Error as error:<id>:<turn>
 		b.needsYou(t.id);
 		await publishNow(b.m.app); // same failed turn: no Request
+
 
 		const from = pushSends.length;
 		// "Mark all as read" acknowledges the bell's entry key, not the error key.
@@ -12014,7 +12226,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-hold");
 		await b.subscribe("https://push.example/hold");
 
-		const t = await b.s.createTask("holds for the user");
+		const t = b.s.createTask("holds for the user");
 		await publishNow(b.m.app);
 
 		const from = pushSends.length;
@@ -12041,7 +12253,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-hold-crash");
 		await b.subscribe("https://push.example/hold-crash");
 
-		const t = await b.s.createTask("reports then dies");
+		const t = b.s.createTask("reports then dies");
 		await publishNow(b.m.app);
 
 		const from = pushSends.length;
@@ -12068,8 +12280,9 @@ describe("web push (R1-1, R2-3)", () => {
 		const fcm = "https://push.example/muted-tag";
 		await b.subscribe(fcm);
 
-		const first = await b.s.createTask("delivered");
-		const second = await b.s.createTask("muted later");
+		const first = b.s.createTask("delivered");
+		const second = b.s.createTask("muted later");
+
 		await publishNow(b.m.app);
 		b.needsYou(first.id);
 		await publishNow(b.m.app);
@@ -12078,6 +12291,7 @@ describe("web push (R1-1, R2-3)", () => {
 		});
 		b.needsYou(second.id);
 		await publishNow(b.m.app);
+
 
 		const from = pushSends.length;
 		await b.m.call("/api/inbox/seen", { taskIds: [first.id] });
@@ -12094,7 +12308,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const fcm = "https://push.example/long";
 		await b.subscribe(fcm);
 
-		const t = await b.s.createTask("long ask");
+		const t = b.s.createTask("long ask");
 		await publishNow(b.m.app);
 
 		const asked = Array.from({ length: 6 }, (_, i) => ({
@@ -12107,7 +12321,7 @@ describe("web push (R1-1, R2-3)", () => {
 		} as Parameters<typeof b.s.updateTask>[1]);
 
 		await publishNow(b.m.app);
-		const key = taskEntryKey(await b.s.getTask(t.id)!);
+		const key = taskEntryKey(b.s.getTask(t.id)!);
 
 		expect(JSON.stringify(asked).length).toBeGreaterThan(2000);
 		const from = pushSends.length;
@@ -12134,15 +12348,15 @@ describe("web push (R1-1, R2-3)", () => {
 		const fcm = "https://push.example/cancel-card";
 		await b.subscribe(fcm);
 
-		const failed = await b.s.createTask("failed");
-		const done = await b.s.createTask("done");
+		const failed = b.s.createTask("failed");
+		const done = b.s.createTask("done");
 		await publishNow(b.m.app);
 		failTurn(b, failed.id, "boom", "queued");
-		await b.s.updateTask(done.id, { stage: "done", state: "idle" });
+		b.s.updateTask(done.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
 		const from = pushSends.length;
-		await b.s.updateTask(failed.id, { cancelledAt: Date.now() });
-		await b.s.updateTask(done.id, { cancelledAt: Date.now() });
+		b.s.updateTask(failed.id, { cancelledAt: Date.now() });
+		b.s.updateTask(done.id, { cancelledAt: Date.now() });
 		await publishNow(b.m.app);
 
 		expect(b.sentSince(from)).toEqual([
@@ -12161,9 +12375,10 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-race");
 		await b.subscribe("https://push.example/race");
 
-		const old = await b.s.createTask("old ask");
-		const fresh = await b.s.createTask("new ask");
-		const fin = await b.s.createTask("finish");
+		const old = b.s.createTask("old ask");
+		const fresh = b.s.createTask("new ask");
+		const fin = b.s.createTask("finish");
+
 		await publishNow(b.m.app);
 		b.needsYou(old.id);
 		await publishNow(b.m.app);
@@ -12171,7 +12386,8 @@ describe("web push (R1-1, R2-3)", () => {
 		// One frame: the old Request resolves while a new Request and a Complete arrive.
 		await b.s.updateTask(old.id, { state: "queued" });
 		b.needsYou(fresh.id);
-		await b.s.updateTask(fin.id, { stage: "done", state: "idle" });
+
+		b.s.updateTask(fin.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
 
 		const sent = b.sentSince(from).map((x) => x.payload);
@@ -12219,16 +12435,18 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-apple-race");
 		await b.subscribe("https://web.push.apple.com/race");
 
-		const old = await b.s.createTask("old ask");
-		const fresh = await b.s.createTask("new ask");
-		const fin = await b.s.createTask("finish");
+		const old = b.s.createTask("old ask");
+		const fresh = b.s.createTask("new ask");
+		const fin = b.s.createTask("finish");
+
 		await publishNow(b.m.app);
 		b.needsYou(old.id);
 		await publishNow(b.m.app); // request #1
 		await b.m.call("/api/inbox/seen", { taskIds: [old.id] }); // pending: request ≤ 1
 		const from = pushSends.length;
 		b.needsYou(fresh.id);
-		await b.s.updateTask(fin.id, { stage: "done", state: "idle" });
+
+		b.s.updateTask(fin.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
 
 		const sent = b.sentSince(from).map((x) => x.payload);
@@ -12248,7 +12466,8 @@ describe("web push (R1-1, R2-3)", () => {
 		const key = taskEntryKey((await b.s.getTask(t.id))!);
 		await b.m.call("/api/inbox/seen", { keys: [key] });
 
-		await b.s.updateTask(t.id, { state: "queued" });
+		b.s.updateTask(t.id, { state: "queued" });
+
 		await publishNow(b.m.app);
 		b.needsYou(t.id);
 
@@ -12263,12 +12482,12 @@ describe("web push (R1-1, R2-3)", () => {
 		const fcm = "https://push.example/restart";
 		await b.subscribe(fcm);
 
-		const acked = await b.s.createTask("ask before restart");
-		const resolved = await b.s.createTask("resolved while down");
+		const acked = b.s.createTask("ask before restart");
+		const resolved = b.s.createTask("resolved while down");
 		await publishNow(b.m.app);
 		b.needsYou(acked.id);
 		await publishNow(b.m.app);
-		await b.s.updateTask(resolved.id, { stage: "done", state: "idle" });
+		b.s.updateTask(resolved.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
 
 		// While the board is down the card leaves done.
@@ -12331,7 +12550,7 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(await inboxSeen()).toEqual([key, "notice:x"].sort());
 		// The card leaves needs_you: the publish prunes its task key; notice keys stay for the client.
 
-		await b.s.updateTask(t.id, { state: "queued", needsReason: null });
+		b.s.updateTask(t.id, { state: "queued", needsReason: null });
 		await publishNow(b.m.app);
 
 		expect(await inboxSeen()).toEqual(["notice:x"]);
@@ -12936,32 +13155,68 @@ describe("cancel and finish-kept routes", () => {
 	});
 });
 
-describe(
-	"orphan scan failures",
-	await (async () => {
-		let failScan = true;
-		const failing = await createTestApp({
-			gstore,
-			secretBox: testBox(gstore),
-			defaultDir: root,
-			projects,
-			...loopStubs(),
-			schedule: () => {},
-			serverVersion: "test",
-			port: 0,
-			publicHosts: [],
-			shared,
-			serverRef: { current: undefined },
-			listProcesses: () => {
-				if (failScan) throw new Error("no ps in container");
-				return [
-					{
-						pid: 4242,
-						cmd: "omp -p --mode json --session-dir d1",
-						// Past the 10-minute grace window, so the scan reports it.
-						started: Date.now() - 660_000,
-					},
-				];
+
+describe("orphan scan failures", () => {
+	let failScan = true;
+	const failing = createApp({
+		gstore,
+		secretBox: testBox(gstore),
+		defaultDir: root,
+		projects,
+		...loopStubs(),
+		schedule: () => {},
+		serverVersion: "test",
+		port: 0,
+		publicHosts: [],
+		shared,
+		serverRef: { current: undefined },
+		listProcesses: () => {
+			if (failScan) throw new Error("no ps in container");
+			return [
+				{
+					pid: 4242,
+					cmd: "omp -p --mode json --session-dir d1",
+					// Past the 10-minute grace window, so the scan reports it.
+					started: Date.now() - 660_000,
+				},
+			];
+		},
+	});
+	// The orphan cache is per app instance, so no module reset is needed across tests.
+	const failingServer = Bun.serve({ port: 0, ...failing.serveOptions });
+	failing.serverRef.current = failingServer;
+	mounted.push(failingServer);
+	// Same guard headers as the top-level get(): api() matches Host and Origin on deps.port (0).
+	const getFailing = async (path: string) =>
+		fetch(new URL(path, failingServer.url), {
+			headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+		});
+
+	test("a throwing scan surfaces the error", async () => {
+		const state = await (await getFailing("/api/state")).json();
+		expect(state.orphansError).toBe("no ps in container");
+		expect(state.orphans).toEqual([]);
+		const orphans = await (await getFailing("/api/orphans")).json();
+		expect(orphans.orphansError).toBe("no ps in container");
+	});
+
+	test("a later good scan clears it", async () => {
+		failScan = false;
+		// The seam flip above bypasses publishSoon; open the gate so the read rebuilds
+		// instead of serving the frame the throwing scan built (OTTR-866 state cache).
+		failing.publishSoon();
+		const state = await (await getFailing("/api/state")).json();
+		expect(state.orphansError).toBeNull();
+		// OTTR-463: the advisory carries the resolved facts, not just pid and start time.
+		expect(state.orphans).toEqual([
+			{
+				pid: 4242,
+				started: expect.any(Number),
+				cmd: "omp -p --mode json --session-dir d1",
+				project: null,
+				card: null,
+				kind: null,
+
 			},
 		});
 		// The orphan cache is per app instance, so no module reset is needed across tests.
@@ -18479,6 +18734,9 @@ describe("worker sign-in warnings", () => {
 			serverVersion: "test",
 			port: 0,
 			publicHosts: [],
+			// The local /tmp probe is host state: stubbed, so only the worker report's
+			// warning shows and exact warning assertions never read the machine (OTTR-754).
+			tmpSpace: () => null,
 			shared: {
 				maxTotalRuns: 3,
 				reviewCheck: true,
@@ -18611,6 +18869,9 @@ describe("worker /tmp full warnings (OTTR-754)", () => {
 			serverVersion: "test",
 			port: 0,
 			publicHosts: [],
+			// The local /tmp probe is host state: stubbed, so only the worker report's
+			// warning shows and exact warning assertions never read the machine (OTTR-754).
+			tmpSpace: () => null,
 			shared: {
 				maxTotalRuns: 3,
 				reviewCheck: true,

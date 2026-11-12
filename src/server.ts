@@ -999,7 +999,10 @@ let stateTick = 0;
 every(async () => {
 	if (app.socketCount() === 0) return;
 	if (++stateTick % 5 === 0) app.publish({ type: "ping" });
-	await app.publishState();
+
+	// OTTR-866: the build is async and single-flight; a failed build logs inside it.
+	void app.publishState();
+
 }, 1000);
 
 // Backups (docs/specs/db-backup.md): daily snapshot of tracker.db and each tasks.db, hourly
