@@ -402,6 +402,58 @@ test("a project db held by another writer is skipped with a warning, the rest re
 	expect(runningIn(freeName)!.created_at).toBeGreaterThan(1);
 });
 
+test("a failed demo project seed leaves no partial rows", () => {
+	const failedRoot = mkdtempSync(join(tmpdir(), "demo-seed-failure-"));
+	const projectDir = join(failedRoot, "lumen");
+	const dbPath = join(projectDir, ".tasks", "tasks.db");
+	const initialize = ProjectStore.init;
+	const init = spyOn(ProjectStore, "init").mockImplementation((dir) => {
+		const store = initialize(dir);
+		if (dir === projectDir) {
+			store.close();
+			const db = new Database(dbPath);
+			try {
+				// Abort only after earlier task, turn, and event writes succeed.
+				db.run(`CREATE TRIGGER fail_demo_seed BEFORE INSERT ON events
+					WHEN (SELECT COUNT(*) FROM tasks) > 1
+						AND EXISTS (SELECT 1 FROM turns)
+						AND EXISTS (SELECT 1 FROM events)
+					BEGIN
+						SELECT RAISE(ABORT, 'injected demo seed write failure');
+					END`);
+			} finally {
+				db.close();
+			}
+		}
+		return store;
+	});
+	let failure: unknown;
+	try {
+		seedDemo(failedRoot, false, join(failedRoot, "state"));
+	} catch (err) {
+		failure = err;
+	} finally {
+		init.mockRestore();
+	}
+	const db = new Database(dbPath);
+	try {
+		db.run("DROP TRIGGER fail_demo_seed");
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure).toHaveProperty(
+			"message",
+			"injected demo seed write failure",
+		);
+		expect(db.query("SELECT * FROM tasks").all()).toEqual([]);
+		expect(db.query("SELECT * FROM turns").all()).toEqual([]);
+		expect(db.query("SELECT * FROM events").all()).toEqual([]);
+		expect(
+			db.query("SELECT value FROM settings WHERE key = 'displayName'").get(),
+		).toBeNull();
+	} finally {
+		db.close();
+	}
+});
+
 // Two full seeds exceed bun's 5s default on slow machines; the cap is not the assertion.
 test("force reseed replaces the pool and drops stale projects", () => {
 	const refreshed = [...byId(board()).values()].find(

@@ -726,21 +726,26 @@ function seedProject(root: string, spec: ProjectSpec, now: number): void {
 
 	// Raw handle on purpose: pre-boot seeding, no ProjectStore lock held.
 	const db = new Database(join(dir, ".tasks", "tasks.db"));
-	db.run("INSERT INTO settings (key, value) VALUES ('displayName', ?)", [
-		JSON.stringify(spec.displayName),
-	]);
+	try {
+		db.transaction(() => {
+			db.run("INSERT INTO settings (key, value) VALUES ('displayName', ?)", [
+				JSON.stringify(spec.displayName),
+			]);
 
-	spec.tasks.forEach((t, i) => {
-		const seed = insertTaskRow(db, spec, t, i, now);
-		seedTaskEvents(db, seed);
-	});
-	// A task created on the demo board continues the key sequence instead of probing taken
-	// ids; the retro child consumes no number, so it stays out of the count.
-	db.run(
-		"INSERT INTO settings (key, value) VALUES ('next-task-num', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-		[JSON.stringify(spec.tasks.filter((t) => !t.retro).length + 1)],
-	);
-	db.close();
+			spec.tasks.forEach((t, i) => {
+				const seed = insertTaskRow(db, spec, t, i, now);
+				seedTaskEvents(db, seed);
+			});
+			// A task created on the demo board continues the key sequence instead of probing taken
+			// ids; the retro child consumes no number, so it stays out of the count.
+			db.run(
+				"INSERT INTO settings (key, value) VALUES ('next-task-num', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				[JSON.stringify(spec.tasks.filter((t) => !t.retro).length + 1)],
+			);
+		})();
+	} finally {
+		db.close();
+	}
 }
 
 const HOUR_STALE = 60 * 60 * 1000;
