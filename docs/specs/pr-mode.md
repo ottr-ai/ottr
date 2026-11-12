@@ -356,6 +356,16 @@ Non-goals of this section:
 - `ciPass` extends to PR-mode cards in Merging: the same
   `actions/runs?head_sha=<pr head>` poll, the same `CI_WAIT_MS` (2 h) and
   `GH_FAIL_LIMIT` (10) give-ups, the same `ciVerdict`.
+- Either give-up clears `pushSha` and leaves the PR card `merging`/`idle`.
+  The card log gets exactly one `supervisor: ... CI watch given up` line.
+  The board pill then reads `PR #N open · waiting for merge`, as after a
+  CI pass. That head has no CI watch until a later ship pins `pushSha`
+  again. The re-ship path from OTTR-799 (`ca543f3`) pins the new PR head.
+- The no-run wait expires when `now - (doneAt ?? updatedAt)` exceeds
+  `CI_WAIT_MS` (2 hours). PR cards have `doneAt` null, so they use the
+  movable `updatedAt` as the timer base. Any card write moves that base
+  and the no-run deadline. Merge-push cards use `doneAt`, so a later card
+  write does not move their deadline.
 - A failed run on the PR head does not file a separate card: the tracker
   replies on the same card with the failed-check list and the
   `gh run view --log-failed --repo <repo>` instruction (the
