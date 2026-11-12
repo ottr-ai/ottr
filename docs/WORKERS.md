@@ -233,14 +233,18 @@ omp. Two parts do the work:
 
    The server rolls last, only when no worker is stuck, and with no board-wide
    hold. The server step is idle-first too: it restarts only when no turn needs
-   it, so the server's own runner (`local`) must run no turn. The workers hold
-   per runner for the seconds of the restart window, and a busy worker keeps its
-   turn alive by detaching it, so worker turns survive the restart:
+   it, so the server's own runner (`local`) must run no turn. The step holds
+   `local` and the workers per runner for the seconds of the restart window,
+   and a busy worker keeps its turn alive by detaching it, so worker turns
+   survive the restart:
 
    - When the server's image changed or a fresh seed waits, the script first
-     checks whether `local` runs a turn. When it does, the script logs
-     `local runs turns: the restart waits for an idle run`, and the server step
-     waits for a later run. The workers keep starting and running turns.
+     holds `local` for the restart window (`POST /api/drain` with
+     `runner: local`), so a server turn cannot start in those seconds. It then
+     reads the runners fresh. When that read finds a local turn, the script
+     logs `local runs turns: the restart waits for an idle run`, releases every
+     hold, and the server step waits for a later run. The workers keep starting
+     and running turns.
    - After 6 hours of waiting, the hold-based drain returns, with the same
      `/etc/ottr/restart-waiting-since` threshold as the worker roll: the script
      holds `local` (`POST /api/drain` with `runner: local`). The server's own
@@ -254,9 +258,10 @@ omp. Two parts do the work:
      renewal, the script stops waiting the same way. The host command starts no
      second cycle while this cycle runs. The restart uses the image that this
      cycle built. A later cycle deploys newer commits.
-   - The script then holds every worker runner. The holds stop new dispatches
-     for the seconds of the restart window; the cards stay queued, and no
-     board-wide notice shows, because these are per-runner holds.
+   - The script then holds every worker runner (local skips: the step already
+     holds it). The holds stop new dispatches for the seconds of the restart
+     window; the cards stay queued, and no board-wide notice shows, because
+     these are per-runner holds.
    - Every busy worker detaches its running turn: the script runs, inside that
      worker's own container, a `bun -e` snippet that calls its token-gated
      `POST /detach`. The worker then releases the `/run` stream and keeps its

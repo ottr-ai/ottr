@@ -8,10 +8,10 @@
 // again: it holds one worker's new turns, recreates that worker with the new image,
 // waits until it is healthy and connected, releases it, and goes to the next worker.
 // The server rolls last without a board-wide hold: when no turn needs the server, it
-// holds the workers for the seconds of the restart window and recreates; in the hold
-// phase it also holds the server's own turns, waits them out, and tells each busy
-// worker to detach its running turn (the turn survives the restart, and the new server
-// re-binds it). A runner that keeps a turn past 1 h in the hold phase is released, and
+// holds local and the workers for the seconds of the restart window and recreates; in
+// the hold phase it also holds the server's own turns, waits them out, and tells each
+// busy worker to detach its running turn (the turn survives the restart, and the new
+// server re-binds it). A runner that keeps a turn past 1 h in the hold phase is released, and
 // the step waits for a later run. A board without the runner API holds the whole board
 // and restarts it at once. With ALATE_DATA or ALATE_DATA_REPO in the env file
 // it also seeds the board's agent layer (docs/WORKERS.md, "Seed the board config"). The omp
@@ -1400,17 +1400,19 @@ async function rollRunner(
 /**
  * The server's own roll, always last, with no board-wide hold. Idle-first: the
  * server restarts only when no turn needs it — local runs no turn (its turns
- * are children of the server process and cannot survive the restart), and a
- * fresh runner read feeds the restart window. In the hold phase (a pending
- * restart has waited past RESTART_WAIT_WARN_MS), local drains first with the
- * same 1 h limit as a worker. Then every worker runner holds (its queued cards
- * just wait out the restart window), and every busy worker detaches its running
- * turn through an exec in its own container, so the turn survives the server's
- * death and the new server's boot recovery re-binds it. A busy worker that
- * cannot detach (an old image answers 404) blocks the step: every hold
- * releases, and the step waits for a later run — killing that turn is not worth
- * the update. The recreate (a new image) or the restart (a seed only) clears
- * every in-memory drain, so the held runners release without an undrain call.
+ * are children of the server process and cannot survive the restart). The step
+ * holds local for the restart window before the fresh read, so no local turn
+ * can start in those seconds; a turn the read finds defers the step, and every
+ * hold releases. In the hold phase (a pending restart has waited past
+ * RESTART_WAIT_WARN_MS), local drains first with the same 1 h limit as a
+ * worker. Then every worker runner holds (its queued cards just wait out the
+ * restart window), and every busy worker detaches its running turn through an
+ * exec in its own container, so the turn survives the server's death and the
+ * new server's boot recovery re-binds it. A busy worker that cannot detach (an
+ * old image answers 404) blocks the step: every hold releases, and the step
+ * waits for a later run — killing that turn is not worth the update. The
+ * recreate (a new image) or the restart (a seed only) clears every in-memory
+ * drain, so the held runners release without an undrain call.
  */
 type ServerRoll =
 	| { kind: "early"; early: number }
@@ -1531,8 +1533,9 @@ async function pollLocalTurn(
 /**
  * Holds every worker runner: worker holds stop new dispatches for the seconds of
  * the restart window, the cards stay queued, and no board-wide notice shows.
- * Local skips: its hold is already on, and a second hold for it would name an
- * empty runner. Null when every hold is on; else the step's outcome.
+ * Local skips: the step held it before the fresh read (hold phase: drainLocal
+ * holds it), and a second hold for it would name an empty runner. Null when
+ * every hold is on; else the step's outcome.
  */
 async function holdWorkers(
 	exec: (code: string) => Promise<{ code: number; out: string }>,
@@ -1614,22 +1617,33 @@ async function rollServer(
 	} else {
 		// Idle-first: the server restarts only when no turn needs it, and the
 		// server's own turns are children of its process — local must run no
-		// turn. Read the runners fresh first: the check sees a turn that
-		// started after a worker rolled, and that read also feeds the restart
-		// window below. No hold, no wait: the step defers to a later run.
+		// turn. Hold local for the restart window first, so a turn that starts
+		// in the seconds of the fresh read cannot die with the restart; a turn
+		// that already runs shows in that read, and the step defers.
+		const held = await exec(holdRunner("local"));
+		if (held.code !== 0)
+			return {
+				kind: "early",
+				early: stop(`the board cannot hold local: ${lastLine(held.out)}`),
+			};
 		const fresh = await readRunners(exec);
-		if (fresh === null)
+		if (fresh === null) {
+			await releaseAll(exec, board);
 			return {
 				kind: "early",
 				early: stop(
 					"the board's runners cannot be read before the server step",
 				),
 			};
+		}
 		board.preparing = fresh.preparing;
 		board.runners = fresh.runners;
 		const local = board.runners.find((r) => r.id === "local");
 		if (local !== undefined && local.turns !== 0) {
-			d.log("local runs turns: the restart waits for an idle run");
+			await releaseAll(exec, board);
+			d.log(
+				"local runs turns: the restart waits for an idle run; the holds end, and the server step waits for a later run",
+			);
 			return { kind: "deferred" };
 		}
 	}

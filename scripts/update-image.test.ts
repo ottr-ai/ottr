@@ -1761,8 +1761,10 @@ describe("rolling restart", () => {
 			UP_SVC("worker-b"),
 			HEALTH,
 			...COMPARE_SVC("server"),
-			// The server step reads the runners fresh, holds both workers for the
-			// restart window, and recreates. Local never holds: nothing waits.
+			// The server step holds local for the restart window, reads the
+			// runners fresh, and holds both workers; the workers are idle, so no
+			// detach runs, and the recreate takes the new image.
+			HOLD,
 			GET,
 			HOLD,
 			HOLD,
@@ -1771,9 +1773,10 @@ describe("rolling restart", () => {
 			DEPLOYED(main),
 			PRUNE,
 		]);
-		// The only holds are the restart window's, one per worker; local skips.
+		// The only holds are the restart window's: local first, then the workers.
 		const posts = f.drains.filter((l) => l.includes("'POST'"));
 		expect(posts.map((_, i) => postBody(f, i))).toEqual([
+			{ runner: "local" },
 			{ runner: "worker-a" },
 			{ runner: "worker-b" },
 		]);
@@ -1849,6 +1852,7 @@ describe("rolling restart", () => {
 			UP_SVC("worker-b"),
 			HEALTH,
 			...COMPARE_SVC("server"),
+			HOLD,
 			GET,
 			HOLD,
 			HOLD,
@@ -2395,9 +2399,10 @@ describe("rolling restart", () => {
 			...COMPARE_SVC("worker-b"),
 			UP_SVC("worker-b"),
 			...COMPARE_SVC("server"),
-			// The server step reads the runners fresh and holds the idle worker-a
-			// for the restart window; no runner lists local, so local skips the
-			// hold, and no detach runs.
+			// The server step holds local for the restart window, reads the
+			// runners fresh, and holds the idle worker-a; no runner lists local,
+			// so the fresh read answers no local runner, and no detach runs.
+			HOLD,
 			GET,
 			HOLD,
 			UP_SVC("server"),
@@ -2464,9 +2469,10 @@ describe("rolling restart", () => {
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
-			// Seed only, so the server restarts instead of recreating. The server
-			// step reads the runners fresh and holds both workers for the restart
-			// window; the workers are idle, so no detach runs.
+			// Seed only, so the server restarts instead of recreating. The
+			// server step holds local for the restart window, reads the runners
+			// fresh, and holds both workers; they are idle, so no detach runs.
+			HOLD,
 			GET,
 			HOLD,
 			HOLD,
@@ -2476,7 +2482,7 @@ describe("rolling restart", () => {
 			DEPLOYED(main),
 			PRUNE,
 		]);
-		expect(postBody(f, 0)).toEqual({ runner: "worker-a" });
+		expect(postBody(f, 0)).toEqual({ runner: "local" });
 		expect(f.calls).not.toContain(COUNT);
 		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
 	}, 60_000);
@@ -2517,8 +2523,10 @@ describe("rolling restart", () => {
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
-			// The server step reads the runners fresh, holds both workers for the
-			// restart window, and detaches the busy worker-a before the restart.
+			// The server step holds local for the restart window, reads the
+			// runners fresh, holds both workers, and detaches the busy worker-a
+			// before the restart.
+			HOLD,
 			GET,
 			HOLD,
 			HOLD,
@@ -2535,14 +2543,17 @@ describe("rolling restart", () => {
 			.filter((l) => l.includes("'POST'"))
 			.map((_, i) => postBody(f, i)))
 			expect(body).toHaveProperty("runner");
-		// The holds are the restart window's worker holds; local never holds in
-		// the idle-first server step, and no detach exec ever targets the server
-		// container or the idle local runner.
+		// The holds are the restart window's: local first, then the workers. No
+		// detach exec ever targets the server container or the idle local runner.
 		expect(
 			f.drains
 				.filter((l) => l.includes("'POST'"))
 				.map((_, i) => postBody(f, i)),
-		).toEqual([{ runner: "worker-a" }, { runner: "worker-b" }]);
+		).toEqual([
+			{ runner: "local" },
+			{ runner: "worker-a" },
+			{ runner: "worker-b" },
+		]);
 		expect(f.calls.join("\n")).not.toMatch(
 			/exec -T (server|local) bun -e <detach>/,
 		);
@@ -2575,8 +2586,10 @@ describe("rolling restart", () => {
 			UP_SVC("worker-b"),
 			HEALTH,
 			...COMPARE_SVC("server"),
-			// The server step's fresh read sees worker-a busy; it detaches and
-			// the recreate takes the new image.
+			// The server step holds local for the restart window; its fresh read
+			// sees worker-a busy, so it holds both workers and detaches worker-a,
+			// and the recreate takes the new image.
+			HOLD,
 			GET,
 			HOLD,
 			HOLD,
@@ -3206,9 +3219,11 @@ describe("rolling restart", () => {
 			UP_SVC("vm-runner"),
 			HEALTH,
 			...COMPARE_SVC("server"),
-			// The server step's fresh read sees the vm-runner busy; holdWorkers
-			// holds it for the restart window (local skips), and the detach in
-			// its own container keeps the turn alive across the recreate.
+			// The server step holds local for the restart window; its fresh read
+			// sees the vm-runner busy, so holdWorkers holds it (local skips) and
+			// the detach in its own container keeps the turn alive across the
+			// recreate.
+			HOLD,
 			GET,
 			HOLD,
 			DETACH_SVC("vm-runner"),
@@ -3217,9 +3232,10 @@ describe("rolling restart", () => {
 			DEPLOYED(main),
 			PRUNE,
 		]);
-		// The only hold is the restart window's hold for the vm-runner; local skips.
-		expect(f.drains.filter((l) => l.includes("'POST'"))).toHaveLength(1);
-		expect(postBody(f, 0)).toEqual({ runner: "vm-runner" });
+		// The holds are the restart window's: local first, then the vm-runner.
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toHaveLength(2);
+		expect(postBody(f, 0)).toEqual({ runner: "local" });
+		expect(postBody(f, 1)).toEqual({ runner: "vm-runner" });
 	}, 60_000);
 
 	test("a vm-runner image that does not build stops the run before any hold or recreate", async () => {
@@ -3444,12 +3460,12 @@ describe("rolling restart", () => {
 		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
 	}, 60_000);
 
-	test("a busy local defers the idle-first server step before any hold", async () => {
+	test("a busy local defers the idle-first server step, and every hold releases", async () => {
 		const { main } = checkout();
 		const data = checkout();
-		// Idle-first: the workers roll holdless, and the server step's fresh read
-		// finds local busy — the step defers before any hold, and the run ends
-		// with the wait report.
+		// Idle-first: the workers roll holdless, and the server step holds local
+		// for the restart window; the fresh read under that hold finds local
+		// busy — the step releases every hold and defers to a later run.
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
@@ -3468,11 +3484,89 @@ describe("rolling restart", () => {
 		expect(f.calls).not.toContain(RESTART);
 		expect(f.calls).not.toContain(UP_SVC("server"));
 		expect(f.calls).not.toContain(UP);
+		// The local hold was the step's first act, before the fresh read.
+		expect(postBody(f, 0)).toEqual({ runner: "local" });
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toHaveLength(1);
 		expect(f.logs.join("\n")).toContain(
 			"local runs turns: the restart waits for an idle run",
 		);
-		// No hold anywhere: the deferral happened before the restart window.
-		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
+		// The deferral released the local hold and both worker holds, so the
+		// queued cards start again.
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
+	}, 60_000);
+
+	test("a local turn that appears after the hold defers the step and releases every hold", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// The check-then-act gap: the first read says local is idle, but a merge
+		// turn starts in the seconds before the server step. The step holds
+		// local first, so the turn cannot start under the hold — the fresh read
+		// under the hold sees it, and the step defers instead of killing it.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [stl(0, 0, 0), stl(0, 0, 1)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			`compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit`,
+			"compose -f c.yml ps -q alate",
+			"inspect -f {{.Config.Image}} alate123",
+			`compose -f c.yml run --rm --no-deps -v ${data.main}:/data:ro board-seed --data /data`,
+			RM_SEEDFAIL,
+			GET,
+			CAT_WAIT,
+			...COMPARE_SVC("worker-a"),
+			DETACHED_SVC("worker-a"),
+			UP_SVC("worker-a"),
+			HEALTH,
+			...COMPARE_SVC("worker-b"),
+			DETACHED_SVC("worker-b"),
+			UP_SVC("worker-b"),
+			HEALTH,
+			...COMPARE_SVC("server"),
+			// The local hold lands before the fresh read; the read finds the
+			// turn, and the deferral releases every hold (the three DELETEs).
+			// No prune: the deferred run ends with the wait report.
+			HOLD,
+			GET,
+			FREE,
+			FREE,
+			FREE,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			WAIT,
+			CAT_BUILD,
+			WAIT_RECORD_ANY,
+		]);
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(UP);
+		// The local hold was the step's first act, before the fresh read.
+		expect(postBody(f, 0)).toEqual({ runner: "local" });
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toHaveLength(1);
+		expect(f.logs.join("\n")).toContain(
+			"local runs turns: the restart waits for an idle run",
+		);
+		// Every hold released: local's own, and the workers the step never held.
+		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
+		expect(deletes.some((l) => l.includes("local"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
+		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
 		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
 	}, 60_000);
 
