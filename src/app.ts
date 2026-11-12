@@ -6640,6 +6640,9 @@ export async function createApp(deps: AppDeps) {
 	// path below must be a no-op before that (boot-time schedule() runs first).
 	let sockets = 0;
 	let lastStateJson = "";
+	/** OTTR-884: the bytes behind lastStateJson, so a quiet rebuild compares buffers
+	 * instead of re-stringifying the whole 30 MB frame on every publish. */
+	let lastStateBuf: Buffer | null = null;
 	/** The last "system" frame, replayed to a socket on open so the view renders before the next tick. */
 	let lastSystemJson: string | null = null;
 	let sampling = false; // one 30 s system sample in flight (worker fetches can take seconds)
@@ -6721,13 +6724,18 @@ export async function createApp(deps: AppDeps) {
 		// next call (OTTR-866).
 		builtVersion = entry.version;
 		const state = entry.state;
-
-		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
-		const inputs = await alertInputs(state.tasks, lastAlertInputs);
 		// The prune runs on every publish, consumers or not: a card that leaves needs_you and
 		// comes back with the same key must light the bell again, also on a board polled over
 		// /api/state with no socket and no push device (NODE_ENV=production disables /api/ws).
+		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
+		const inputs = await alertInputs(state.tasks, lastAlertInputs);
+		const seenBefore = state.inboxSeen;
 		await pruneSeen(state, inputs);
+		// The prune can be the frame's only change (a key stops mapping to an alert
+		// input). Everything else compares through the build's own bytes (OTTR-884):
+		// re-stringifying the wrapped 30 MB frame just to compare it measured
+		// 120-180 ms per quiet rebuild.
+		const pruned = seenBefore !== state.inboxSeen;
 		// Push works without a board tab (R1-1): skip the frame only when nothing can consume
 		// it — no open socket AND no push subscriber. The baseline still moves, so a device
 		// that subscribes later is never alerted for changes from before it existed.
@@ -6735,14 +6743,18 @@ export async function createApp(deps: AppDeps) {
 			lastAlertInputs = inputs;
 			return false;
 		}
+		if (
+			!pruned &&
+			lastStateBuf !== null &&
+			entry.stateBuf.equals(lastStateBuf)
+		) {
+			publishUpdate();
+			return false;
+		}
 		const text = JSON.stringify({
 			type: "state",
 			state,
 		} satisfies ServerMessage);
-		if (text === lastStateJson) {
-			publishUpdate();
-			return false;
-		}
 		// Diff the cards against the kept baseline and push out-of-band (closed phone app).
 		// Fire-and-forget: a push failure never breaks the publish.
 		try {
@@ -6766,6 +6778,11 @@ export async function createApp(deps: AppDeps) {
 		}
 		lastAlertInputs = inputs;
 		lastStateJson = text;
+		// The published bytes equal the wrapped build bytes unless the prune changed
+		// the frame; then the text is the truth (OTTR-884).
+		lastStateBuf = pruned
+			? Buffer.from(text, "utf8")
+			: Buffer.concat([STATE_WRAP_HEAD, entry.stateBuf, STATE_WRAP_TAIL]);
 		if (!closing && sockets > 0 && deps.serverRef.current !== undefined)
 			deps.serverRef.current.publish("board", text);
 		publishUpdate();
@@ -6809,7 +6826,11 @@ export async function createApp(deps: AppDeps) {
 		version: number;
 		builtAt: number;
 		state: StateResponse;
-		stateText: string;
+		/** The frame's exact bytes (OTTR-884): gzip and the buffer compare consume
+		 * these directly; big boards never hold the text form until asked. */
+		stateBuf: Buffer;
+		/** Derived from stateBuf on first text consumer; null while no consumer asked. */
+		stateText: string | null;
 		gz: Uint8Array<ArrayBuffer> | null;
 	};
 	let stateCache: StateCacheEntry | null = null;
@@ -6824,6 +6845,11 @@ export async function createApp(deps: AppDeps) {
 	// The tasks slot in the state text is spliced card by card; text this rare cannot
 	// collide with a real property value.
 	const STATE_TASKS_SENTINEL = "\u0000ottr-state-tasks\u0000";
+	// The wrapped "state" ServerMessage frame's fixed bytes around the state JSON:
+	// JSON.stringify({type:"state", state}) is exactly this prefix, the state's own
+	// JSON, and this suffix (OTTR-884).
+	const STATE_WRAP_HEAD = Buffer.from('{"type":"state","state":');
+	const STATE_WRAP_TAIL = Buffer.from("}");
 
 	/** Builds one state frame: the card loop yields between slices, the tasks text is
 	 * spliced card by card, and gzip runs async (never gzipSync on this path). Concurrent
@@ -6837,27 +6863,39 @@ export async function createApp(deps: AppDeps) {
 			// Byte-identity by construction: every property except tasks is one
 			// JSON.stringify; only the tasks array is spliced with the text the chunked
 			// card loop serialized — the same bytes JSON.stringify produces for plain
-			// objects, alone or inside an array.
-			const stateText = JSON.stringify({
+			// objects, alone or inside an array. Buffer assembly instead of
+			// String.replace keeps the build's one big copy a plain memcpy (the string
+			// surgery measured 60+ ms per build, OTTR-884), and gzip consumes the
+			// buffer without a second copy. Level 6 over 9: the rebuild's gzip wall
+			// dropped about 3x measured and the response grows about 2%; -9's marginal
+			// bytes were OTTR-662's one-time mermaid trade, not a per-rebuild one.
+			const frame = JSON.stringify({
 				...state,
 				tasks: [STATE_TASKS_SENTINEL],
-			}).replace(
-				JSON.stringify([STATE_TASKS_SENTINEL]),
-				() => `[${tasksText}]`,
-			);
+			});
+			const needle = JSON.stringify([STATE_TASKS_SENTINEL]);
+			const at = frame.indexOf(needle);
+			const stateBuf = Buffer.concat([
+				Buffer.from(frame.slice(0, at), "utf8"),
+				Buffer.from(`[${tasksText}]`, "utf8"),
+				Buffer.from(frame.slice(at + needle.length), "utf8"),
+			]);
 			const gz =
-				Buffer.byteLength(stateText, "utf8") >= 32 * 1024
+				stateBuf.length >= 32 * 1024
 					? // Copy out of zlib's possibly pooled Buffer: Response bodies need a
 						// plain ArrayBuffer view (same as the mermaid bodies above).
-						new Uint8Array(
-							await gzipAsync(Buffer.from(stateText, "utf8"), { level: 9 }),
-						)
+						new Uint8Array(await gzipAsync(stateBuf, { level: 6 }))
 					: null;
 			const entry: StateCacheEntry = {
 				version,
 				builtAt: Date.now(),
 				state,
-				stateText,
+				stateBuf,
+				// Big boards keep the 30 MB text out of memory until a consumer asks
+				// for it; the threshold matches the gz one, so a board with a cached
+				// gz frame always derives its text lazily instead.
+				stateText:
+					stateBuf.length < 32 * 1024 ? stateBuf.toString("utf8") : null,
 				gz,
 			};
 			stateCache = entry;
@@ -6901,7 +6939,14 @@ export async function createApp(deps: AppDeps) {
 				status: 200,
 				headers: { ...headers, "Content-Encoding": "gzip" },
 			});
-		return new Response(entry.stateText, { status: 200, headers });
+		// Big boards keep the text out of the cache until a consumer asks: the
+		// derivation is one 30 MB copy, memoized on the entry (OTTR-884).
+		let text = entry.stateText;
+		if (text === null) {
+			text = entry.stateBuf.toString("utf8");
+			entry.stateText = text;
+		}
+		return new Response(text, { status: 200, headers });
 	}
 
 	const logThrottle = keyedThrottle<{ project: string; id: string }>(250, (a) =>
@@ -13664,13 +13709,15 @@ export async function createApp(deps: AppDeps) {
 			stateText: string;
 		} | null => {
 			const c = stateCache;
+			if (c !== null && c.stateText === null)
+				c.stateText = c.stateBuf.toString("utf8");
 			return c === null
 				? null
 				: {
 						version: c.version,
 						builtAt: c.builtAt,
 						state: c.state,
-						stateText: c.stateText,
+						stateText: c.stateText as string,
 					};
 		},
 		notifyLog,
