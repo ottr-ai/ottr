@@ -15767,6 +15767,29 @@ describe("POST /api/settings/turn-github-token", () => {
 		expect(m.app.turnReadToken()).toEqual({ host: "github.com", token: TOKEN });
 	});
 
+	test("an scp-style ssh origin on the host is checked like an https one", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const m = mount({
+			projects: new Map([
+				["tt9", projectOn("tt9", "git@github.com:acme/api.git")],
+				// ssh:// form normalizes too.
+				["tt10", projectOn("tt10", "ssh://git@github.com/acme/ssh2.git")],
+			]),
+			turnTokenFetch: stubFetch(calls),
+		});
+		const res = await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: TOKEN,
+		});
+		expect(res.status).toBe(200);
+		// Both origins reach the checker as owner/repo on the host.
+		expect(calls).toHaveLength(2);
+		expect(calls.map((c) => c.url)).toEqual([
+			"https://api.github.com/repos/acme/api",
+			"https://api.github.com/repos/acme/ssh2",
+		]);
+	});
+
 	test("a write-capable token is stored but not served until confirmed", async () => {
 		const calls: { url: string; init?: RequestInit }[] = [];
 		// The classic `repo` scope is a write signal.
@@ -15813,10 +15836,7 @@ describe("POST /api/settings/turn-github-token", () => {
 			projects: new Map([
 				["tt4", projectOn("tt4", "https://github.com/acme/api.git")],
 			]),
-			turnTokenFetch: (async (
-				input: RequestInfo | URL,
-				init?: RequestInit,
-			) => {
+			turnTokenFetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
 				calls.push({
 					url: String(input instanceof Request ? input.url : input),
 					init,

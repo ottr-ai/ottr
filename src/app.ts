@@ -426,6 +426,7 @@ import {
 	githubUrl,
 	hasRules,
 	hostedGitAuth,
+	httpsRemote,
 	isGitRepoWithCommit,
 	originRemoteUrl,
 	remoteUrl,
@@ -5339,14 +5340,18 @@ export function createApp(deps: AppDeps) {
 		return { host: row.host, token: row.token };
 	}
 
-	/** Every project repo ("owner/repo") whose origin remote sits on the host; deduped, sorted. */
+	/** Every project repo ("owner/repo") whose origin remote sits on the host; deduped, sorted.
+	 * The origin may be https, ssh:// or scp-style ssh ("git@host:owner/repo.git"): the shared
+	 * remote parser normalizes all three before owner/repo extraction, so an scp-style origin
+	 * gets the same push-permission check as an https one. */
 	function reposOnHost(host: string): string[] {
 		const onHost = hostMatcher(host);
 		const out = new Set<string>();
 		for (const e of deps.projects.values()) {
 			const url = e.store.getSettings().originUrl;
 			if (url === null || !onHost.test(url)) continue;
-			const repo = ownerRepo(url);
+			const https = httpsRemote(url);
+			const repo = https === null ? null : ownerRepo(https);
 			if (repo !== null) out.add(repo);
 		}
 		return [...out].sort();

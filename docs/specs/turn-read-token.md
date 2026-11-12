@@ -54,7 +54,10 @@ interface TurnReadTokenRow {
 The board checks a saved token once with the GitHub API through `checkTurnToken`
 (below): the scopes header of each response (`X-OAuth-Scopes`, classic tokens) and
 `permissions.push` from `GET /repos/{owner}/{repo}` on each project repo hosted there.
-Either signal marks the token write-capable.
+Either signal marks the token write-capable. A project origin may be an https URL, an
+`ssh://` URL or an scp-style ssh remote (`git@host:owner/repo.git`); the board normalizes
+every form through the shared remote parser (`httpsRemote`) before it extracts
+owner/repo, so an scp-style origin gets the same push-permission check as an https one.
 
 - `ok`: every repo read succeeded with no push permission and no write-capable scope. The
   token is served to turns.
@@ -175,6 +178,8 @@ as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`.
   injected fetch, tests) and classifies scopes and `permissions.push` signals (tests).
 - A write-capable token is stored with `status: "write"`, is not served, and the confirm
   action enables serving; an `error` status is not served until a re-check passes (tests).
+- An scp-style ssh origin (`git@host:owner/repo.git`) on the configured host is checked
+  like an https origin: the checker receives its `owner/repo` (test).
 - `bun run check` and `bun test` exit 0.
 
 ## Non-goals
