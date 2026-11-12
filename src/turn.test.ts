@@ -12062,10 +12062,71 @@ describe("review findings check", () => {
 		expect(after.pendingPrompt).toContain("usage limit");
 	});
 
-	// The dispatched model's provider is out of quota: starts hold until the reset, deaths
-	// continue once, and the death's continue waits for the provider's reported reset. A
-	// queued continue without a reset is picked up at once by the loop's own schedule(), so
-	// these tests flush until the chain reaches a terminal state (a park or a success).
+	test("a review check at the limit with a silent report holds a probe wait", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const before = Date.now();
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			// 40% used: no exhausted window, so usageResetFor finds no reset (OTTR-880).
+			quota: async () => ({
+				limits: [
+					{
+						provider: "openai-codex",
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct: 40,
+						resetsAt: before + 3_600_000,
+					},
+				],
+				error: null,
+				at: Date.now(),
+			}),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				const result =
+					record.runs.length === 1
+						? runResult({
+								outcome: { status: "answered", summary: "review done" },
+								recorded: record.recorded,
+							})
+						: runResult({
+								exitCode: 1,
+								model: "openai-codex/gpt-5.5",
+								providerError:
+									"Codex error event: The usage limit has been reached (code=usage_limit_reached)",
+							});
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at the limit
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
+		expect(after.holdUntil).toBeLessThan(before + 31 * 60_000);
+		expect(after.holdProvider).toBe("openai-codex");
+		expect(after.holdWindow).toBeNull();
+		expect(after.holdAttempts).toBe(1);
+		expect(after.needsReason).toContain("tries again");
+		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
+			[],
+		);
+	});
+
+	// The dispatched model's provider is out of quota: the start gate holds until the
+	// reported reset, and every death's continue holds again — the reported reset, else
+	// the error's reset time when it names a zone, else a probe wait that grows
+	// (OTTR-880). A usage-limit death never parks.
 	describe("usage-limit start gate and auto-continue", () => {
 		const fakeQuota =
 			(provider: string, usedPct: number, resetsAt: number | null) =>
@@ -12106,18 +12167,6 @@ describe("review findings check", () => {
 				hasRules: true,
 				now,
 			}).map((t) => t.id);
-		/** Drains the loop's own background turns until the card leaves the given states. */
-		const untilSettled = async (
-			store: ProjectStore,
-			id: string,
-			inFlight: (state: string, stage: string) => boolean,
-		) => {
-			for (let i = 0; i < 100; i++) {
-				const t = store.getTask(id)!;
-				if (!inFlight(t.state, t.stage)) return;
-				await flushPromises();
-			}
-		};
 
 		test("a start at the provider's limit holds the card until the reset and starts nothing", async () => {
 			const resetsAt = Date.now() + 3_600_000;
@@ -12259,38 +12308,44 @@ describe("review findings check", () => {
 			expect(runnableIds(store, resetsAt + 1)).toContain(task.id);
 		});
 
-		test("a quota death without a known reset continues at once, and the next death parks", async () => {
+		test("a quota death with a silent report holds a probe wait, and the next death waits longer", async () => {
 			const record = baseRecord();
+			const before = Date.now();
 			const { store, loop } = setupWith(record, {
-				quota: fakeQuota("fake", 60, Date.now() + 3_600_000),
+				// 60% used: no exhausted window, so usageResetFor finds no reset (OTTR-880).
+				quota: fakeQuota("fake", 60, before + 3_600_000),
 				startRun: dyingRun(record),
 			});
 			const task = store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
-			// The first settle queued a continue with no hold: the loop's schedule() starts it
-			// right away, it dies the same way, and the streak rule parks for a human.
-			await untilSettled(
-				store,
-				task.id,
-				(state, stage) =>
-					state === "preparing" ||
-					state === "running" ||
-					(state === "queued" && stage === "in_progress"),
-			);
 
-			expect(record.runs).toHaveLength(2);
+			// The first death holds instead of continuing at once: the scheduler must not
+			// start the card before the probe wait ends, and no second run fires.
+			expect(record.runs).toHaveLength(1);
 			const after = store.getTask(task.id)!;
-			expect(after.state).toBe("needs_you");
-			expect(after.needsReason).toContain(
-				"The run stopped at the provider's usage limit again after the automatic continue",
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
+			expect(after.holdUntil).toBeLessThan(before + 31 * 60_000);
+			expect(after.holdProvider).toBe("fake");
+			expect(after.holdWindow).toBeNull();
+			expect(after.holdAttempts).toBe(1);
+			expect(after.needsReason).toStartWith(
+				"The run stopped at the provider's usage limit",
 			);
-			expect(after.needsReason).toContain("429 quota exhausted");
-			expect(after.pendingPrompt).toBeNull();
-			const rows = store.listTurns(task.id);
-			expect(rows).toHaveLength(2);
-			expect(rows[0]!.error).toBe(
-				"The run stopped at the provider's usage limit - continuing automatically. Cancel to stop it instead.",
-			);
+			expect(after.needsReason).toContain("tries again at");
+			expect(runnableIds(store)).not.toContain(task.id);
+
+			// The wait ends (the scheduler picks the card up then): the retry dies the same
+			// way and holds again with the doubled wait — never parks needs_you.
+			store.updateTask(task.id, { holdUntil: before - 1 });
+			await loop.runTurn(store.name, task.id);
+			expect(record.runs).toHaveLength(2);
+			const held = store.getTask(task.id)!;
+			expect(held.state).toBe("queued");
+			expect(held.holdUntil).toBeGreaterThanOrEqual(before + 60 * 60_000);
+			expect(held.holdUntil).toBeLessThan(before + 61 * 60_000);
+			expect(held.holdAttempts).toBe(2);
+			expect(runnableIds(store)).not.toContain(task.id);
 		});
 
 		test("the automatic continue runs the task and its success settles normally", async () => {
@@ -12323,14 +12378,10 @@ describe("review findings check", () => {
 			});
 			const task = store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
-			await untilSettled(
-				store,
-				task.id,
-				(state, stage) =>
-					state === "preparing" ||
-					state === "running" ||
-					(state === "queued" && stage === "in_progress"),
-			);
+			// The death held a probe wait; when it ends the scheduler starts the continue.
+			expect(store.getTask(task.id)!.holdAttempts).toBe(1);
+			store.updateTask(task.id, { holdUntil: Date.now() - 1 });
+			await loop.runTurn(store.name, task.id);
 
 			expect(record.runs).toHaveLength(2);
 			const after = store.getTask(task.id)!;
@@ -12339,7 +12390,79 @@ describe("review findings check", () => {
 			expect(after.state).toBe("idle");
 			expect(after.needsReason).toBeNull();
 			expect(after.pendingPrompt).toBeNull();
+			// The turn ran past the limit: the consecutive-hold count cleared.
+			expect(after.holdAttempts).toBe(0);
 			expect(store.listTurns(task.id)).toHaveLength(2);
+		});
+
+		test("an error-named reset without a zone holds the probe wait, not the named time", async () => {
+			const record = baseRecord();
+			const before = Date.now();
+			// The Z.AI 429's shape: a wall-clock reset with no zone (Beijing time at best).
+			const named = new Date(before + 86_400_000);
+			const p = (n: number) => String(n).padStart(2, "0");
+			const text = `429 Weekly/Monthly Limit Exhausted. Your limit will reset at ${named.getUTCFullYear()}-${p(named.getUTCMonth() + 1)}-${p(named.getUTCDate())} ${p(named.getUTCHours())}:${p(named.getUTCMinutes())}:${p(named.getUTCSeconds())} (type=1310)`;
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 60, before + 3_600_000),
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess");
+					return {
+						pid: 4242,
+						done: Promise.resolve(
+							runResult({
+								exitCode: 1,
+								model: "fake/glm",
+								providerError: text,
+							}),
+						),
+						kill: async () => {},
+					};
+				},
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			// The board never guesses the zone: the probe wait, not the named time.
+			expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
+			expect(after.holdUntil).toBeLessThan(before + 31 * 60_000);
+			expect(after.holdProvider).toBe("fake");
+			expect(after.holdAttempts).toBe(1);
+		});
+
+		test("an error-named reset with an explicit zone holds until it", async () => {
+			const record = baseRecord();
+			const before = Date.now();
+			const named = before + 86_400_000;
+			const at = new Date(named).toISOString().slice(0, 16).replace("T", " ");
+			const { store, loop } = setupWith(record, {
+				quota: fakeQuota("fake", 60, before + 3_600_000),
+				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					record.runs.push(o);
+					o.onSession?.("sess");
+					return {
+						pid: 4242,
+						done: Promise.resolve(
+							runResult({
+								exitCode: 1,
+								model: "fake/glm",
+								providerError: `429 quota exhausted. Your limit will reset at ${at} UTC`,
+							}),
+						),
+						kill: async () => {},
+					};
+				},
+			});
+			const task = store.createTask("work please");
+			await loop.runTurn(store.name, task.id);
+
+			const after = store.getTask(task.id)!;
+			expect(after.state).toBe("queued");
+			expect(after.holdUntil).toBe(Date.parse(`${at.replace(" ", "T")}Z`));
+			expect(after.holdProvider).toBe("fake");
+			expect(after.holdAttempts).toBe(1);
 		});
 	});
 
@@ -13516,17 +13639,22 @@ describe("work card check", () => {
 		expect(after.workCheckHead).toBe("sha1");
 	});
 
-	test("a check at the usage limit with no known reset parks needs_you after one attempt", async () => {
+	test("a check at the usage limit with no known reset holds a probe wait", async () => {
 		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
 			usageLimited,
 		]);
+		const before = Date.now();
 		const task = store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(2); // work run + one check attempt
 		const after = store.getTask(task.id)!;
-		expect(after.state).toBe("needs_you");
+		expect(after.state).toBe("queued");
+		expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
+		expect(after.holdUntil).toBeLessThan(before + 31 * 60_000);
+		expect(after.holdAttempts).toBe(1);
 		expect(after.needsReason).toContain("usage limit");
+		expect(after.needsReason).toContain("tries again");
 		expect(after.needsReason).not.toContain("failed twice");
 		expect(after.workCheckHead).toBeNull();
 	});

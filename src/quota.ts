@@ -77,7 +77,7 @@ function limitRow(
 }
 
 /** omp provider id of a model selector, e.g. "zai" for "zai/glm-5.3-flash"; null without a slash. */
-const providerOf = (model: string | null): string | null =>
+export const providerOf = (model: string | null): string | null =>
 	model?.includes("/") ? model.slice(0, model.indexOf("/")) : null;
 
 /** One sign-in provider's windows; a prefix matches families like google -> google-antigravity. */

@@ -4884,6 +4884,31 @@ describe("hold provider columns", () => {
 		expect(cleared?.holdWindow).toBeNull();
 		store.close();
 	});
+
+	test("open backfills hold_attempts on a pre-existing database and it round-trips", () => {
+		const dir = join(root, "legacy-hold-attempts");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		// Schema as it was before OTTR-880 added the consecutive-hold counter.
+		db.exec(
+			"CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, stage TEXT NOT NULL, state TEXT NOT NULL, needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT, session_id TEXT, summary TEXT, details TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, queued_at INTEGER, cancelled_at INTEGER, images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]', hold_until INTEGER)",
+		);
+		db.run(
+			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, hold_until) VALUES ('old1', 'held', 'p', 'todo', 'queued', 1, 1, 5000)",
+		);
+		db.close();
+		const store = open(dir);
+		// The old row converges: the counter exists and reads 0.
+		expect(store.getTask("old1")?.holdAttempts).toBe(0);
+		const task = store.createTask("probe held");
+		expect(task.holdAttempts).toBe(0);
+		store.updateTask(task.id, { holdAttempts: 3 });
+		expect(store.getTask(task.id)?.holdAttempts).toBe(3);
+		// A settle that runs past the limit writes the clear directly.
+		store.updateTask(task.id, { holdAttempts: 0 });
+		expect(store.getTask(task.id)?.holdAttempts).toBe(0);
+		store.close();
+	});
 });
 
 describe("turn log offset", () => {

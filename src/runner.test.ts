@@ -41,6 +41,7 @@ import {
 	renderEvent,
 	resumePlan,
 	startRun,
+	usageLimitResetMs,
 	vmEnv,
 	vmProviders,
 	vmRunnerFromEnv,
@@ -962,6 +963,44 @@ describe("hitUsageLimit", () => {
 		expect(hitUsageLimit(result({}))).toBe(false);
 	});
 
+	describe("usageLimitResetMs", () => {
+		const err = (providerError: string) =>
+			result({ exitCode: 1, providerError });
+
+		test("reads a zoned reset time and rejects a zoneless one", () => {
+			const at = Date.parse("2027-03-01T19:45:04Z");
+			expect(
+				usageLimitResetMs(
+					err(
+						"429 Weekly/Monthly Limit Exhausted. Your limit will reset at 2027-03-01 19:45:04 UTC (type=1310)",
+					),
+				),
+			).toBe(at);
+			expect(
+				usageLimitResetMs(
+					err("limit exhausted. Your limit will reset at 2027-03-01T19:45:04Z"),
+				),
+			).toBe(at);
+			expect(
+				usageLimitResetMs(
+					err("limit exhausted. will reset at 2027-03-01 20:45:04+01:00"),
+				),
+			).toBe(Date.parse("2027-03-01T20:45:04+01:00"));
+			// Z.AI writes Beijing time without a zone: the board never guesses one.
+			expect(
+				usageLimitResetMs(
+					err(
+						"429 Weekly/Monthly Limit Exhausted. Your limit will reset at 2027-03-01 19:45:04 (type=1310)",
+					),
+				),
+			).toBeNull();
+			expect(usageLimitResetMs(err("429 quota exhausted"))).toBeNull();
+			expect(
+				usageLimitResetMs(result({ exitCode: 1, stderrTail: "boom\n" })),
+			).toBeNull();
+		});
+	});
+
 	describe("rateLimitWaitMs", () => {
 		test("reads a 429's retry-after-ms in ms and a Retry-After value in seconds", () => {
 			expect(
@@ -1334,7 +1373,7 @@ describe("classify", () => {
 		});
 	});
 
-	test("2i. a usage-limit death continues once, then parks", () => {
+	test("2i. a usage-limit death keeps queueing with the continue prompt", () => {
 		// The z.ai gateway shape: the provider's structured error, no stderr line.
 		const gateway = run(
 			"work",
@@ -1362,7 +1401,8 @@ describe("classify", () => {
 			needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
 			pendingPrompt: ".",
 		});
-		// The continue fired once already and the provider still refuses: a human decides.
+		// The continue fired already and the provider still refuses: it queues again, and
+		// the settle's hold (reset, named reset, or probe wait) gates the retry (OTTR-880).
 		expect(
 			run(
 				"work",
@@ -1373,8 +1413,9 @@ describe("classify", () => {
 			),
 		).toEqual({
 			stage: "in_progress",
-			state: "needs_you",
-			needsReason: `${QUOTA_LIMIT} again after the automatic continue: 429 quota exhausted. Reply after the limit resets, or switch the card's model, then reply.`,
+			state: "queued",
+			needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
+			pendingPrompt: ".",
 		});
 		// A rate limit is not a quota: it clears in seconds, so the generic death park stays.
 		expect(

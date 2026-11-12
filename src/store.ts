@@ -358,6 +358,7 @@ interface TaskRow {
 	hold_until: number | null;
 	hold_provider: string | null;
 	hold_window: string | null;
+	hold_attempts: number;
 	proposal_summary: string | null;
 	findings_checked_at: number | null;
 	kind: string;
@@ -583,6 +584,7 @@ function toListedTask(
 		holdUntil: r.hold_until,
 		holdProvider: r.hold_provider,
 		holdWindow: r.hold_window,
+		holdAttempts: r.hold_attempts,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
 		findingsCheckedAt: r.findings_checked_at,
 	};
@@ -897,6 +899,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	holdUntil: "hold_until",
 	holdProvider: "hold_provider",
 	holdWindow: "hold_window",
+	holdAttempts: "hold_attempts",
 	proposalSummary: "proposal_summary",
 	findingsCheckedAt: "findings_checked_at",
 };
@@ -2107,6 +2110,16 @@ export class ProjectStore {
 			cols,
 			"hold_window",
 			"ALTER TABLE tasks ADD COLUMN hold_window TEXT",
+		);
+		// OTTR-880: how many consecutive usage-limit holds a card collected; the probe wait
+		// grows with it (30m → 6h) and a settle that runs past the limit clears it. NOT NULL
+		// DEFAULT 0, so plain ADD COLUMN converges; ALTER-only after every rebuild like the
+		// hold columns above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"hold_attempts",
+			"ALTER TABLE tasks ADD COLUMN hold_attempts INTEGER NOT NULL DEFAULT 0",
 		);
 		ProjectStore.addColumn(
 			db,

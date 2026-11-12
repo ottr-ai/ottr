@@ -19255,6 +19255,32 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		b.store.close();
 	});
 
+	test("frees a probe hold: the provider is named, the window stays null", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-probe")),
+			name: "a",
+		};
+		const probe = held(a.store, "probe hold", {
+			holdUntil: NOW + 30 * 60_000,
+			holdProvider: "zai",
+			holdWindow: null,
+		});
+		a.store.updateTask(probe.id, { holdAttempts: 2 });
+		expect(
+			releaseUsageHolds(
+				quota([window({ provider: "zai", usedPct: 40 })]),
+				[a],
+				NOW,
+			),
+		).toBe(1);
+		const free = a.store.getTask(probe.id)!;
+		expect(free.holdUntil).toBeNull();
+		expect(free.holdProvider).toBeNull();
+		// The release keeps the counter: only a run past the limit clears it.
+		expect(free.holdAttempts).toBe(2);
+		a.store.close();
+	});
+
 	test("no quota data keeps every hold until holdUntil", () => {
 		const a = {
 			store: ProjectStore.open(join(root, "quota-nodata")),

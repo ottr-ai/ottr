@@ -205,6 +205,7 @@ function task(p: Partial<Task> = {}): Task {
 		holdUntil: null,
 		holdProvider: null,
 		holdWindow: null,
+		holdAttempts: 0,
 		doneAt: null,
 		cancelledAt: null,
 		commits: null,

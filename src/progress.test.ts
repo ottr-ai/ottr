@@ -49,6 +49,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		holdUntil: null,
 		holdProvider: null,
 		holdWindow: null,
+		holdAttempts: 0,
 		doneAt: null,
 		cancelledAt: null,
 		commits,

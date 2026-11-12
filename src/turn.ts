@@ -79,7 +79,7 @@ import {
 } from "./prompts.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
-import { usageReset } from "./quota.ts";
+import { providerOf, usageReset } from "./quota.ts";
 import type { publishRelease, runReleaseCommand } from "./release.ts";
 import { hostedGh, ownerRepo } from "./release.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
@@ -94,6 +94,7 @@ import {
 	rateLimitWaitMs,
 	rejectedReport,
 	resumePlan,
+	usageLimitResetMs,
 	WORKER_BUSY,
 } from "./runner.ts";
 import type { DepProject, WorkCheckVerdict } from "./scheduler.ts";
@@ -1183,6 +1184,15 @@ function oneLine(text: string): string {
 		: line;
 }
 
+/** Probe waits for a usage limit with no known reset (OTTR-880): the first hold retries
+ * after 30 minutes, and every consecutive hold doubles the wait up to 6 hours. The card's
+ * holdAttempts counts the consecutive holds and indexes this table. */
+const USAGE_PROBE_WAITS_MS = [30, 60, 120, 240, 360].map((m) => m * 60_000);
+
+const usageProbeWaitMs = (attempts: number): number =>
+	USAGE_PROBE_WAITS_MS[Math.min(attempts, USAGE_PROBE_WAITS_MS.length - 1)] ??
+	0;
+
 /** The queued write that holds a check run until its provider's usage limit resets, or
  * until a rate limit's retry-after wait ends (OTTR-847). */
 interface UsageHold {
@@ -1794,20 +1804,53 @@ export function createTurnLoop(
 	function checkoutNotices(): string[] {
 		return guardNotices.map((n) => n.text);
 	}
-	/** The queued write for a check that hit a usage limit with a known reset, else null (the caller parks needs_you). */
-	async function usageHold(model: string | null): Promise<UsageHold | null> {
+	/** The queued write for a check that hit a usage limit: the reported reset, else the
+	 * error's own reset time when it names a zone, else a probe wait that grows with the
+	 * card's consecutive usage holds (OTTR-880) — a check never parks for a usage limit. */
+	async function usageHold(
+		result: RunResult,
+		model: string | null,
+		attempts: number,
+	): Promise<UsageHold> {
 		const hit = await usageResetFor(model);
-		if (hit === null) return null;
-		const at = new Date(hit.resetsAt)
+		if (hit !== null) {
+			const at = new Date(hit.resetsAt)
+				.toISOString()
+				.slice(0, 16)
+				.replace("T", " ");
+			return {
+				holdUntil: hit.resetsAt,
+				needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
+				pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+				provider: hit.provider,
+				window: hit.window,
+				rate: false,
+			};
+		}
+		const provider = providerOf(model);
+		const named = usageLimitResetMs(result);
+		if (named !== null && named > Date.now()) {
+			const at = new Date(named).toISOString().slice(0, 16).replace("T", " ");
+			return {
+				holdUntil: named,
+				needsReason: `The check hit the ${provider ?? "provider"} usage limit. The error names the reset at ${at} UTC. The board runs it again then. Send a message to run it now, or cancel the card.`,
+				pendingPrompt: `The board's check run stopped at the ${provider ?? "provider"} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+				provider,
+				window: null,
+				rate: false,
+			};
+		}
+		const wait = usageProbeWaitMs(attempts);
+		const at = new Date(Date.now() + wait)
 			.toISOString()
 			.slice(0, 16)
 			.replace("T", " ");
 		return {
-			holdUntil: hit.resetsAt,
-			needsReason: `The check hit the ${hit.provider} usage limit. The board runs it again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
-			pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
-			provider: hit.provider,
-			window: hit.window,
+			holdUntil: Date.now() + wait,
+			needsReason: `The check hit the ${provider ?? "provider"} usage limit. The quota report shows no exhausted window, and the error names no reset time. The board tries again at ${at} UTC. Send a message to run it now, or cancel the card.`,
+			pendingPrompt: `The board's check run stopped at the ${provider ?? "provider"} usage limit, and the wait has passed. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+			provider,
+			window: null,
 			rate: false,
 		};
 	}
@@ -1857,6 +1900,9 @@ export function createTurnLoop(
 			holdUntil: hold.holdUntil,
 			holdProvider: hold.provider,
 			holdWindow: hold.window,
+			// A usage hold counts the card's consecutive usage-limit holds (the probe wait
+			// grows with it); a rate hold keeps the count.
+			holdAttempts: hold.rate ? cur.holdAttempts : cur.holdAttempts + 1,
 			needsReason: hold.needsReason,
 			pendingPrompt:
 				cur.pendingPrompt === null
@@ -7120,10 +7166,11 @@ export function createTurnLoop(
 	}
 
 	/** A run the provider stopped at its usage limit continues automatically (classify's
-	 * queued continue): stamp the provider's reset as the hold, so the continue fires
-	 * after the reset instead of against the still-exhausted window. Without a known
-	 * reset the retry starts at once; classify's streak rule parks the next identical
-	 * death for a human. */
+	 * queued continue): stamp the hold so the continue fires later instead of against the
+	 * still-exhausted provider. The hold time is the provider's reported reset, else the
+	 * error's own reset time when it names a zone, else a probe wait that grows with the
+	 * card's consecutive usage holds up to 6 h (OTTR-880): the report may only lag, and a
+	 * retry that never waits would spin or park. */
 	async function stampUsageHold(st: TurnSettle, next: Next): Promise<Next> {
 		if (
 			!(
@@ -7133,20 +7180,48 @@ export function createTurnLoop(
 			)
 		)
 			return next;
-		const hit = await usageResetFor(
-			st.result.model ?? st.route.runModel ?? null,
-		);
-		if (hit === null) return next;
-		const at = new Date(hit.resetsAt)
+		const model = st.result.model ?? st.route.runModel ?? null;
+		const hit = await usageResetFor(model);
+		const attempts = st.task.holdAttempts + 1;
+		if (hit !== null) {
+			const at = new Date(hit.resetsAt)
+				.toISOString()
+				.slice(0, 16)
+				.replace("T", " ");
+			return {
+				...next,
+				holdUntil: hit.resetsAt,
+				holdProvider: hit.provider,
+				holdWindow: hit.window,
+				holdAttempts: attempts,
+				needsReason: `${QUOTA_LIMIT} - the board continues the task after the ${hit.provider} limit resets at ${at} UTC. Cancel to stop it instead.`,
+			};
+		}
+		const provider = providerOf(model);
+		const named = usageLimitResetMs(st.result);
+		if (named !== null && named > Date.now()) {
+			const at = new Date(named).toISOString().slice(0, 16).replace("T", " ");
+			return {
+				...next,
+				holdUntil: named,
+				holdProvider: provider,
+				holdWindow: null,
+				holdAttempts: attempts,
+				needsReason: `${QUOTA_LIMIT} - the error names the ${provider ?? "provider"} limit's reset at ${at} UTC. The board continues the task then. Cancel to stop it instead.`,
+			};
+		}
+		const wait = usageProbeWaitMs(st.task.holdAttempts);
+		const at = new Date(Date.now() + wait)
 			.toISOString()
 			.slice(0, 16)
 			.replace("T", " ");
 		return {
 			...next,
-			holdUntil: hit.resetsAt,
-			holdProvider: hit.provider,
-			holdWindow: hit.window,
-			needsReason: `${QUOTA_LIMIT} - the board continues the task after the ${hit.provider} limit resets at ${at} UTC. Cancel to stop it instead.`,
+			holdUntil: Date.now() + wait,
+			holdProvider: provider,
+			holdWindow: null,
+			holdAttempts: attempts,
+			needsReason: `${QUOTA_LIMIT} - the quota report shows no exhausted window, and the error names no reset time. The board tries again at ${at} UTC. Cancel to stop it instead.`,
 		};
 	}
 
@@ -8145,6 +8220,7 @@ export function createTurnLoop(
 				holdUntil?: number;
 				holdProvider?: string | null;
 				holdWindow?: string | null;
+				holdAttempts?: number;
 		  }
 		| Record<string, never> {
 		if (st.checkWillRun) return {};
@@ -8153,15 +8229,17 @@ export function createTurnLoop(
 			state: next.state,
 			needsReason: next.needsReason,
 			queuedAt: next.state === "queued" ? st.now : st.task.queuedAt,
-			// A usage-limit continue's reset hold; undefined keeps the column.
-			// The owner rides with it so the quota refresh can release early.
+			// A usage-limit continue's hold; undefined keeps the column. The owner rides
+			// with it so the quota refresh can release early, and the counter makes the
+			// next probe wait longer. A settle that ran past the limit clears the count.
 			...(next.holdUntil !== undefined
 				? {
 						holdUntil: next.holdUntil,
 						holdProvider: next.holdProvider ?? null,
 						holdWindow: next.holdWindow ?? null,
+						holdAttempts: next.holdAttempts,
 					}
-				: {}),
+				: { holdAttempts: 0 }),
 		};
 	}
 
@@ -8528,7 +8606,11 @@ export function createTurnLoop(
 			limitHit = out.limitHit;
 			st.log(`! review check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
-				hold = await usageHold(ran.result.model ?? built.selector ?? null);
+				hold = await usageHold(
+					ran.result,
+					ran.result.model ?? built.selector ?? null,
+					st.task.holdAttempts,
+				);
 				break;
 			}
 			// OTTR-847: same rule as the work check — a long retry-after holds
@@ -8676,6 +8758,8 @@ export function createTurnLoop(
 				stage: "in_progress",
 				state: "needs_you",
 				needsReason: `The review check failed${attempt.limitHit ? "" : " twice"}: ${attempt.checkFailed}. Reply to re-run the review, or cancel the card.`,
+				// The check ran past the limit: the probe count clears.
+				holdAttempts: 0,
 			});
 	}
 
@@ -8875,6 +8959,8 @@ export function createTurnLoop(
 		},
 	): void {
 		st.store.updateTask(st.id, {
+			// The review settled past any limit: the probe count clears.
+			holdAttempts: 0,
 			summary: `${cur.summary ?? "Review finished"}\nFindings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${args.checkOn ? ` (check ${(args.checkMs / 1000).toFixed(0)}s on ${args.checkModel ?? "default model"}${args.checkWarn === null ? "" : ` — ${args.checkWarn} as the review`})` : ""}.`,
 			details: `${cur.details ?? ""}\n\n## Findings\n${
 				filed.length > 0
@@ -8981,6 +9067,8 @@ export function createTurnLoop(
 				state: "needs_you",
 				needsReason: workCheckDivergeReason(runs),
 				asked: workCheckDivergeAsk(runs),
+				// The check ran past the limit: the probe count clears.
+				holdAttempts: 0,
 				workCheckLog: runs,
 				workCheckHead: head,
 				...reportStamp,
@@ -9008,6 +9096,8 @@ export function createTurnLoop(
 						" ",
 					)}. Reply to send it back anyway, run Merge anyway, or cancel the card.`,
 				asked: workCheckAsk(blockers),
+				// The check ran past the limit: the probe count clears.
+				holdAttempts: 0,
 				workCheckLog: runs,
 				workCheckHead: head,
 				...reportStamp,
@@ -9025,6 +9115,8 @@ export function createTurnLoop(
 			}),
 			pendingBy: "supervisor",
 			needsReason: null,
+			// The check ran past the limit: the probe count clears.
+			holdAttempts: 0,
 			workCheckLog: runs,
 			workCheckHead: head,
 			workCheckSendbacks: sendbacks + 1,
@@ -9102,7 +9194,11 @@ export function createTurnLoop(
 			limitHit = out.limitHit;
 			st.log(`! work check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
-				hold = await usageHold(ran.result.model ?? roles.selector ?? null);
+				hold = await usageHold(
+					ran.result,
+					ran.result.model ?? roles.selector ?? null,
+					st.task.holdAttempts,
+				);
 				break;
 			}
 			// OTTR-847: a rate limit with a long retry-after holds through the wait
@@ -9305,11 +9401,13 @@ export function createTurnLoop(
 		);
 		if (split.blockers.length === 0)
 			// Pass: the card stays in its current state; the deferred write
-			// below stores merging/queued with the check record stamped.
+			// below stores merging/queued with the check record stamped. The
+			// check ran past the limit, so the probe count clears.
 			st.store.updateTask(st.id, {
 				workCheckLog: allRuns,
 				workCheckHead: head,
 				workCheckSendbacks: cur.workCheckSendbacks,
+				holdAttempts: 0,
 				...(cur.workCheckReport === null
 					? { workCheckReport: readyReport }
 					: {}),
@@ -9343,6 +9441,8 @@ export function createTurnLoop(
 						stage: "in_progress" as const,
 						state: "needs_you" as const,
 						needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
+						// The check ran past the limit: the probe count clears.
+						holdAttempts: 0,
 					}
 				: patch),
 			workCheckLog: [

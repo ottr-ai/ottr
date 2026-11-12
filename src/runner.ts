@@ -492,6 +492,22 @@ export function rateLimitWaitMs(r: RunResult): number | null {
 	return seconds === null ? null : Number(seconds[1]) * 1000;
 }
 
+/** The reset instant a usage-limit error names ("will reset at 2026-11-16 19:45:04"),
+ * epoch ms; null when the text names none or names it without an explicit zone. A zoneless
+ * time stays unused (Z.AI writes Beijing time): the board never guesses a zone, it probes
+ * instead (OTTR-880). Accepted zones: UTC, GMT, Z, a numeric offset. Shared with the check
+ * runs' hold logic in turn.ts. */
+export function usageLimitResetMs(r: RunResult): number | null {
+	const text = `${r.stderrTail}\n${r.providerError ?? ""}`;
+	const m = /will reset at ([^\n()]+)/i.exec(text);
+	const raw = (m?.[1] ?? "").trim().replace(/[.,;]+$/, "");
+	if (raw === "") return null;
+	if (!/(?:\s(?:UTC|GMT)|[+-]\d{2}:\d{2}|Z)$/i.test(raw)) return null;
+	const norm = raw.replace(/\s+(?:UTC|GMT)$/i, "Z").replace(" ", "T");
+	const ms = Date.parse(norm);
+	return Number.isFinite(ms) ? ms : null;
+}
+
 /** The inputs classify reads. */
 interface ClassifyInput {
 	kind: TurnKind;
@@ -643,24 +659,18 @@ const modelRestoreRule: ClassifyRule = (o, stage) => {
 };
 
 /** The run died at the provider's usage or quota limit: a retry before the reset fails
- * the same way. One automatic continue per streak (worker-lost's rule): the settle in
- * turn.ts stamps the provider's reset as holdUntil on the queued card when the provider
- * reports one, so the continue fires after the reset; without a known reset the retry
- * starts at once, and this same rule's second death parks for a human. */
+ * the same way, so every death queues again (never parks) and the settle in turn.ts
+ * stamps the hold: the provider's reported reset, else the error's own reset time when
+ * it names a zone, else a probe wait that grows with the card's consecutive usage holds
+ * (OTTR-880). The scheduler starts the continue when the hold ends. */
 const usageLimitRule: ClassifyRule = (o, stage) => {
 	if (!hitUsageLimit(o.result)) return null;
-	const last = deathContext(o);
-	return o.previousError?.startsWith(QUOTA_LIMIT)
-		? needsAt(
-				stage,
-				`${QUOTA_LIMIT} again after the automatic continue${last ? `: ${last}` : ""}. Reply after the limit resets, or switch the card's model, then reply.`,
-			)
-		: {
-				stage,
-				state: "queued",
-				needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
-				pendingPrompt: ".",
-			};
+	return {
+		stage,
+		state: "queued",
+		needsReason: `${QUOTA_LIMIT} - continuing automatically. Cancel to stop it instead.`,
+		pendingPrompt: ".",
+	};
 };
 
 /** The worker container's memory limit killed the run (kernel OOM): the run ended with no

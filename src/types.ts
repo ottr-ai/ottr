@@ -532,6 +532,9 @@ export interface Task {
 	/** omp window id ("5h", "7d") of the blocking usage window when the reset named one; null when
 	 * the window is unnamed or the hold is not a usage hold. */
 	holdWindow: string | null;
+	/** Consecutive usage-limit holds this card collected (OTTR-880): the probe wait grows with
+	 * it (30m → 6h). A settle that runs past the limit clears it back to 0. */
+	holdAttempts: number;
 	/** Manual triage rank; null = unrated. Overview triage sorts P0 first, unrated last. */
 	priority: Priority | null;
 	/** Close-candidate nomination: the reason this card is a duplicate, superseded, or drifted; null = not nominated. */
@@ -731,9 +734,13 @@ export interface Next {
 	 * continue waiting for the provider's reset. Absent keeps the column. */
 	holdUntil?: number;
 	/** Which provider's usage limit holdUntil waits for, and its window id when the reset named
-	 * one; set whenever holdUntil is set. Absent keeps the columns. */
-	holdProvider?: string;
+	 * one; set whenever holdUntil is set. Null when the provider is unknown: the quota refresh
+	 * can then never release the hold early. Absent keeps the columns. */
+	holdProvider?: string | null;
 	holdWindow?: string | null;
+	/** The consecutive-hold count a usage-limit hold stamps (OTTR-880); it makes the next
+	 * probe wait longer. A settle without a hold clears the column to 0. */
+	holdAttempts?: number;
 	/** Who authored pendingPrompt; defaults to "supervisor" when the settle writes it. */
 	pendingBy?: "user" | "supervisor" | null;
 	/** Outstanding agent ask to store on the task (the "?" state); absent/undefined clears nothing by itself. */
