@@ -4036,13 +4036,6 @@ describe("NotificationsSection stale push recovery", () => {
 					on?.click();
 				});
 				await act(async () => {});
-				console.log("DBG posts", JSON.stringify(probe.posts));
-				console.log("DBG sub", JSON.stringify(probe.currentSubscription()));
-				console.log(
-					"DBG record",
-					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
-				);
-				console.log("DBG text", probe.containerText().slice(0, 400));
 				expect(probe.currentSubscription()).not.toBeNull();
 				expect(probe.containerText()).toContain("boom");
 				expect(probe.containerText()).toContain("Turn off");

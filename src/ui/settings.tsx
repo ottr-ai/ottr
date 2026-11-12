@@ -1421,7 +1421,6 @@ export function NotificationsSection({
 		}
 	};
 	const saveMute = async (name: string, v: boolean): Promise<void> => {
-		console.log("DBG saveMute called", name, v);
 		mutedRef.current = v
 			? [...mutedRef.current.filter((m) => m !== name), name]
 			: mutedRef.current.filter((m) => m !== name);
