@@ -3592,6 +3592,8 @@ describe("NotificationsSection stale push recovery", () => {
 			mutedProjects?: string[];
 			/** Holds every no-endpoint prefs GET until releaseMuteLoad runs. */
 			deferMuteLoad?: boolean;
+			/** The no-endpoint prefs GET answers 500 (a failed board-wide mute load). */
+			failMuteLoad?: boolean;
 		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
@@ -3720,6 +3722,8 @@ describe("NotificationsSection stale push recovery", () => {
 					"https://push.example",
 				).searchParams.get("endpoint");
 				if (endpoint === null) {
+					if (options.failMuteLoad)
+						return Response.json({ error: "boom" }, { status: 500 });
 					// The snapshot is the list the board served at request time; the
 					// deferral is transport delay, not a later server answer.
 					const snapshot = muted.slice();
@@ -3804,7 +3808,13 @@ describe("NotificationsSection stale push recovery", () => {
 					<NotificationsSection
 						projects={projects}
 						act={async (fn: () => Promise<unknown>) => {
-							await fn();
+							// The app act catches a failed save and reports false; the
+							// stub mirrors that contract so a refused write rolls back.
+							try {
+								await fn();
+							} catch {
+								return false;
+							}
 							return true;
 						}}
 					/>,
@@ -4080,11 +4090,12 @@ describe("NotificationsSection stale push recovery", () => {
 		await withPushBrowser(
 			async (probe) => {
 				// The board-wide mute read is still in flight when the kept Turn on
-				// moves the endpoint. The answer must land anyway (the mutes load
-				// never rides the endpoint effect), the boxes must show the real
-				// mutes, and the next mute save must carry the whole list: when the
-				// response died with the endpoint effect, mutedRef stayed empty and
-				// a save wiped the board-wide list the other devices hold.
+				// moves the endpoint. A change made while the list is unknown must
+				// write nothing, the answer must land anyway (the mutes load never
+				// rides the endpoint effect), and the next save must carry the
+				// whole list: when the response died with the endpoint effect,
+				// mutedRef stayed empty and a save wiped the board-wide list the
+				// other devices hold.
 				const on = [...probe.containerNode().querySelectorAll("button")].find(
 					(b) => b.textContent?.trim() === "Turn on",
 				);
@@ -4097,11 +4108,24 @@ describe("NotificationsSection stale push recovery", () => {
 				expect(
 					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
 				).not.toBeNull();
+				// Unknown list: a change now must write nothing. An empty mutedRef
+				// is a guess, and the server replaces the whole board-wide list
+				// with whatever a mute POST carries.
+				const held = switchOf(probe.containerNode(), "Mute beta");
+				expect(held?.disabled).toBe(true);
+				await act(async () => {
+					onChangeOf(held!)({ target: { checked: true } });
+				});
+				await act(async () => {});
+				expect(
+					probe.posts.filter((p) => p.url === "/api/notifications/prefs"),
+				).toEqual([]);
 				await act(async () => {
 					probe.releaseMuteLoad();
 				});
 				const node = probe.containerNode();
 				expect(switchOf(node, "Mute alpha")?.checked).toBe(true);
+				expect(switchOf(node, "Mute beta")?.checked).toBe(false);
 				const beta = switchOf(node, "Mute beta");
 				expect(beta).toBeDefined();
 				await act(async () => {
@@ -4129,6 +4153,31 @@ describe("NotificationsSection stale push recovery", () => {
 				initialEndpoint: "https://push.example.com/pending",
 				deferMuteLoad: true,
 			},
+		);
+	});
+
+	test("a failed mute load keeps the switches off and writes nothing", async () => {
+		await withPushBrowser(
+			async (probe) => {
+				// The board-wide mute load failed: the list stays unknown, the
+				// boxes stay disabled, and no change can replace the shared list
+				// with a partial guess. A reload is the retry.
+				const node = probe.containerNode();
+				const beta = switchOf(node, "Mute beta");
+				expect(beta?.disabled).toBe(true);
+				await act(async () => {
+					onChangeOf(beta!)({ target: { checked: true } });
+				});
+				for (let k = 0; k < 5; k++)
+					await act(async () => {
+						await new Promise((r) => setTimeout(r, 0));
+					});
+				expect(
+					probe.posts.filter((p) => p.url === "/api/notifications/prefs"),
+				).toEqual([]);
+				expect(probe.containerText()).toContain("could not be loaded");
+			},
+			{ failMuteLoad: true },
 		);
 	});
 });

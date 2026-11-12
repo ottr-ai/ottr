@@ -1110,6 +1110,12 @@ export function NotificationsSection({
 	const [endpoint, setEndpoint] = useState<string | null>(null);
 	const [classes, setClasses] = useState<ClassPrefs | null>(null);
 	const [muted, setMuted] = useState<string[]>([]);
+	// Board-wide mutes are writable only once a load answered: before that the
+	// ref is a guess, and a save would replace the shared list (ADR-0011). A
+	// device without Web Push never enables the boxes, so the guard starts open
+	// there; the load gate rules the supported path.
+	const [mutesKnown, setMutesKnown] = useState(!supported);
+	const [mutesError, setMutesError] = useState(false);
 	// "Test sent" is a short confirmation; the button reads "Send test" again after it.
 	const [sent, flashSent] = useFlash(2000);
 	const [error, setError] = useState<string | null>(null);
@@ -1276,10 +1282,14 @@ export function NotificationsSection({
 				mutedRef.current = p.mutedProjects;
 				savedMutedRef.current = p.mutedProjects;
 				setMuted(p.mutedProjects);
+				// Writes unlock here: mutedRef now holds the board's list.
+				setMutesKnown(true);
 			})
 			.catch(() => {
-				// A mute write before this load lands rolls back to savedMutedRef
-				// (empty); the user retries the change once the list is visible.
+				// Unknown stays unknown: the boxes stay disabled, so no save can
+				// replace the board-wide list with a partial guess (ADR-0011).
+				// The fieldset hint names the failure; a reload retries the load.
+				if (live) setMutesError(true);
 			});
 		return () => {
 			live = false;
@@ -1421,6 +1431,10 @@ export function NotificationsSection({
 		}
 	};
 	const saveMute = async (name: string, v: boolean): Promise<void> => {
+		// Board-wide mutes write only once a load answered (ADR-0011): an empty
+		// mutedRef is a guess, never the list, and a save would replace what
+		// every device holds. The throw rolls the row's optimistic change back.
+		if (!mutesKnown) throw new Error("the mute list has not loaded");
 		mutedRef.current = v
 			? [...mutedRef.current.filter((m) => m !== name), name]
 			: mutedRef.current.filter((m) => m !== name);
@@ -1512,13 +1526,19 @@ export function NotificationsSection({
 					aria-labelledby={`${uid}-muted`}
 				>
 					<h4 id={`${uid}-muted`}>Muted projects</h4>
+					{mutesError && (
+						<p className="notify-hint">
+							The project mute list could not be loaded, so the switches stay
+							off. Reload the page to try again.
+						</p>
+					)}
 					{byLabel(projects).map((p) => (
 						<CheckRow
 							key={p.name}
 							name={`Mute ${projectLabel(p)}`}
 							desc="No push from this project; the bell still shows it"
 							checked={muted.includes(p.name)}
-							disabled={!supported}
+							disabled={!supported || !mutesKnown}
 							save={(v) => saveMute(p.name, v)}
 							act={act}
 						/>
