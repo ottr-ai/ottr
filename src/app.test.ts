@@ -6,6 +6,7 @@ import {
 	beforeEach,
 	describe,
 	expect,
+	jest,
 	type Mock,
 	mock,
 	setSystemTime,
@@ -10225,6 +10226,14 @@ describe("costly-route limit (public boards)", () => {
 });
 
 describe("web push (R1-1, R2-3)", () => {
+	let timersControlled = false;
+	afterEach(() => {
+		if (!timersControlled) return;
+		jest.clearAllTimers();
+		jest.useRealTimers();
+		timersControlled = false;
+	});
+
 	const pushSub = {
 		endpoint: "https://push.example/abc",
 		keys: { p256dh: "k", auth: "a" },
@@ -10309,6 +10318,9 @@ describe("web push (R1-1, R2-3)", () => {
 	/** Isolated board for the alert flow (OTTR-494): own global store, one project named like
 	 * its folder, and a settable clock for the presence window. Sends land in pushSends. */
 	const alertBoard = (name: string) => {
+		// Explicit frames and flush own publishSoon, including after reboot; HTTP stays real.
+		jest.useFakeTimers();
+		timersControlled = true;
 		const dir = join(root, name);
 		mkdirSync(dir, { recursive: true });
 		const s = ProjectStore.open(dir);
@@ -10356,7 +10368,8 @@ describe("web push (R1-1, R2-3)", () => {
 			s.updateTask(id, { state: "needs_you", needsReason: "?" });
 		/** A second board process on the same global store and project: a server restart. */
 		const reboot = () => mount({ gstore: m.g, projects, now: () => clock.now });
-		return { s, m, clock, subscribe, sentSince, needsYou, reboot };
+		const flush = () => jest.runOnlyPendingTimers();
+		return { s, m, clock, subscribe, sentSince, needsYou, reboot, flush };
 	};
 
 	test("prefs: per-device classes survive a re-subscribe; mute list; 404 unknown endpoint, 400 bad shape", async () => {
@@ -10542,13 +10555,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 	test("a comment wave pushes one pr: request event; the drawer ack clears the stamp", async () => {
 		const b = alertBoard("alert-pr-comments");
-		// Saved directly, not through the subscribe route: that POST arms a publishSoon
-		// timer (guarded fires it after every mutation), and when the timer wins the race
-		// against this test it publishes the still empty board, moves the diff baseline
-		// off null, and the baseline frame then pushes the card's own needs_you entry —
-		// a second key in the payload asserted below. Direct saveSubs keeps every
-		// publishState call here explicit: prev is null at the baseline, always.
-		saveSubs(b.m.g, [{ ...pushSub, endpoint: "https://push.example/pr" }]);
+		await b.subscribe("https://push.example/pr");
 		const s = b.s;
 		const HEAD = "c".repeat(40);
 		s.savePrReview({
@@ -10602,9 +10609,16 @@ describe("web push (R1-1, R2-3)", () => {
 			comments: 6000,
 		});
 		// Opening the drawer acks: the wave clears, the cutoff stays, the key lands in seen.
+		const ackFrom = pushSends.length;
 		expect(
 			(await b.m.call("/api/inbox/seen", { taskIds: [t.id] })).status,
 		).toBe(200);
+		expect(b.sentSince(ackFrom)).toEqual([
+			{
+				endpoint: "https://push.example/pr",
+				payload: { type: "clear", tags: ["request"], upTo: { request: 1 } },
+			},
+		]);
 		const r = s.getPrReview(4242)!;
 		expect(r.commentsUnseen).toBe(false);
 		expect(r.commentsAt).toBe(6000);
@@ -10613,8 +10627,8 @@ describe("web push (R1-1, R2-3)", () => {
 		).keys;
 		expect(keys).toContain(`pr:${t.id}:6000`);
 		expect(keys).toContain(`task:${t.id}:needs-pr${run}`);
-		// The cleared stamp is over: the next publish prunes the acked key.
-		b.m.app.publishState();
+		// The queued publish prunes the acked key only after the immediate GET above.
+		b.flush();
 		keys = (
 			(await (await b.m.call("/api/inbox/seen")).json()) as { keys: string[] }
 		).keys;
@@ -10623,9 +10637,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 	test("a rewritten draft is a fresh needs_you occurrence keyed by the run id", async () => {
 		const b = alertBoard("alert-pr-draft");
-		// Direct saveSubs, same reason as the comment-wave test above: the subscribe
-		// route's publishSoon timer must not publish the empty board before the baseline.
-		saveSubs(b.m.g, [{ ...pushSub, endpoint: "https://push.example/draft" }]);
+		await b.subscribe("https://push.example/draft");
 		const s = b.s;
 		const HEAD = "d".repeat(40);
 		s.savePrReview({
@@ -10725,6 +10737,8 @@ describe("web push (R1-1, R2-3)", () => {
 		).toBe(200);
 		s.setPrComments(4244, 7_000, true);
 		expect(b.m.app.publishState()).toBe(true);
+		expect(b.sentSince(from)).toEqual([]);
+		b.flush();
 		expect(b.sentSince(from)).toEqual([]);
 		// No stamp in the frame: the bell and the event diff see no occurrence at all.
 		const quietFrame = (await (await b.m.call("/api/state")).json()) as {
