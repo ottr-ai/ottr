@@ -4558,59 +4558,57 @@ export function ProjectBoard({
 					onClose={() => setSetupOpen(false)}
 				/>
 			)}
-			{/* Mobile stage tabs: CSS shows this strip and hides the inactive columns only in
-			    the single-column tier (container ≤440px); the desktop grid never sees either.
-			    Done carries no number anywhere: its tab read the whole landed history, and the
-			    lane head repeated the tab's name and count. The other tabs keep theirs as bare
-			    digits, and the alarm shows as a mark only — the chip boxes pushed the strip
-			    past a 320px phone; bare digits fit common phone fonts, and where wider
-			    fallback fonts still overflow, .stage-tabs scrolls (never the page). */}
+			{/* Mobile stage tabs appear only in the single-column tier (container ≤440px).
+			    Equal-width tabs keep labels, counts and alarm marks whole. The outer strip
+			    scrolls, never the page. Done has no count because it shows landed history. */}
 			<div className="stage-tabs" role="tablist" aria-label="Board stages">
-				{COLUMNS.map((c) => {
-					const count = counts[c.key];
-					return (
-						<button
-							key={c.key}
-							type="button"
-							role="tab"
-							id={`stage-tab-${c.key}`}
-							data-tab={c.key}
-							aria-selected={stage === c.key}
-							aria-controls={`stage-${c.key}`}
-							tabIndex={stage === c.key ? 0 : -1}
-							onClick={() => setStage(c.key)}
-							onKeyDown={(e) => switchTab(e, STAGE_KEYS, setStage)}
-						>
-							{c.label}
-							{c.key !== "done" && (
-								<>
-									<span className="tabs-digits">
-										{q === ""
-											? fmtNum(count.shown)
-											: `${fmtNum(count.shown)}/${fmtNum(count.total)}`}
-									</span>
-									{count.alarm !== null && (
-										<span
-											role="img"
-											title={
-												count.alarm === "asked"
-													? "Question asked"
-													: "Needs action"
-											}
-											aria-label={
-												count.waiting === 1
-													? "1 task needs action"
-													: `${count.waiting} tasks need action`
-											}
-										>
-											<Mark kind={count.alarm} />
+				<div>
+					{COLUMNS.map((c) => {
+						const count = counts[c.key];
+						return (
+							<button
+								key={c.key}
+								type="button"
+								role="tab"
+								id={`stage-tab-${c.key}`}
+								data-tab={c.key}
+								aria-selected={stage === c.key}
+								aria-controls={`stage-${c.key}`}
+								tabIndex={stage === c.key ? 0 : -1}
+								onClick={() => setStage(c.key)}
+								onKeyDown={(e) => switchTab(e, STAGE_KEYS, setStage)}
+							>
+								{c.label}
+								{c.key !== "done" && (
+									<>
+										<span className="tabs-digits">
+											{q === ""
+												? fmtNum(count.shown)
+												: `${fmtNum(count.shown)}/${fmtNum(count.total)}`}
 										</span>
-									)}
-								</>
-							)}
-						</button>
-					);
-				})}
+										{count.alarm !== null && (
+											<span
+												role="img"
+												title={
+													count.alarm === "asked"
+														? "Question asked"
+														: "Needs action"
+												}
+												aria-label={
+													count.waiting === 1
+														? "1 task needs action"
+														: `${count.waiting} tasks need action`
+												}
+											>
+												<Mark kind={count.alarm} />
+											</span>
+										)}
+									</>
+								)}
+							</button>
+						);
+					})}
+				</div>
 			</div>
 			<div
 				className="flow"
@@ -16802,7 +16800,7 @@ export function App() {
 					/>
 				</div>
 				<AppRailToggle railCollapsed={railCollapsed} toggleRail={toggleRail} />
-				<a className="brand" href="/">
+				<a className="brand" href="/" aria-label="Ottr home">
 					<img src={logo} alt="" />
 					<span>Ottr</span>
 				</a>

@@ -3036,7 +3036,16 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 .stage-tabs {
 	display: none;
 	overflow-x: auto; /* wider fallback fonts can still push the strip past 320px: scroll, never wrap */
+	padding-bottom: 8px; /* Keep the scrollbar clear of the active tab underline. */
 	margin-bottom: 10px;
+}
+.stage-tabs > div {
+	/* Intrinsic grid tracks keep every tab as wide as the longest label, count and alarm. */
+	display: grid;
+	grid-auto-flow: column;
+	grid-auto-columns: 1fr;
+	width: max-content;
+	min-width: 100%;
 }
 @container (max-width: 440px) {
 	.flow {
@@ -3048,7 +3057,7 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 	}
 	/* The four lanes become tabs: the strip shows, only the active column stays in the grid. */
 	.stage-tabs {
-		display: flex;
+		display: block;
 	}
 	.stage:not([data-active="true"]) {
 		display: none;
@@ -4130,9 +4139,8 @@ a.pr-link:hover {
 		border-color 120ms cubic-bezier(0.2, 0.7, 0.3, 1);
 }
 .stage-tabs button {
-	/* Equal segments (shared rule above); min-width:auto keeps the label whole,
-	   so a strip too tight for all four scrolls instead of cutting a label. */
 	padding: 0 10px; /* phones: more of the four tabs fit before the strip scrolls */
+	margin-bottom: 0;
 	gap: 6px;
 	white-space: nowrap;
 }
