@@ -1265,7 +1265,13 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				body: JSON.stringify({
 					argv: body.argv,
 					cwd: body.cwd,
-					env: guestEnv(body.env ?? {}),
+					// The delivered read-only GitHub token merges after the strip
+					// (docs/specs/turn-read-token.md): it survives it and overrides
+					// any ambient name.
+					env: {
+						...guestEnv(body.env ?? {}),
+						...(body.githubReadEnv ?? {}),
+					},
 					stdin: body.stdin,
 					vm: {
 						gitUrl: `${spec.boardUrl.replace(/\/+$/, "")}/git/${spec.project}.git`,

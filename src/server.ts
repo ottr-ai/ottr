@@ -642,6 +642,9 @@ const loop = createTurnLoop(projects, {
 		rebaseTargetBranch(mainPath, branch, shared.commitIdentity),
 	// OTTR-693: the commit identity every turn falls back to when its home names none.
 	commitIdentity: () => shared.commitIdentity,
+	// OTTR-876: the read-only GitHub token a turn may hold (docs/specs/turn-read-token.md);
+	// late-bound like pushAuthKind above — app exists below the loop.
+	turnReadToken: () => app.turnReadToken(),
 	runMergeGates,
 	mergeHoldMismatch,
 	mergeHoldLanded,

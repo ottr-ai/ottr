@@ -6,6 +6,7 @@ import { join } from "node:path";
 import type { Server } from "bun";
 import { createApp } from "./app.ts";
 import { GlobalStore } from "./globalStore.ts";
+import { sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, loadSecretBox, type SecretBox } from "./secretBox.ts";
 
 // ADR-0011 app-level sealing: the config row's token/key fields are sealed at rest with the
@@ -41,6 +42,7 @@ const SESSION = "session-secret-plain-9f3a";
 const GH_TOKEN = `ghp_${"a".repeat(36)}`;
 const ALATE_KEY = "alate-key-plain-9f3a";
 const GIT_TOKEN = "git-token-plain-9f3a";
+const TURN_TOKEN = "turn-read-token-plain-9f3a";
 const ENV_VALUE = "env-value-plain-9f3a";
 const HS_TOKEN = "hindsight-plain-0000";
 
@@ -65,6 +67,15 @@ function plainRow(): Record<string, unknown> {
 		githubToken: GH_TOKEN,
 		githubHost: "github.com",
 		gitTokens: [{ host: "github.com", username: "u", token: GIT_TOKEN }],
+		turnReadTokens: [
+			{
+				host: "github.com",
+				token: TURN_TOKEN,
+				status: "ok",
+				detail: "Turns can use this token",
+				confirmed: false,
+			},
+		],
 		githubApp: null,
 		envValues: { HS_TOKEN: ENV_VALUE },
 		hindsightToken: HS_TOKEN,
@@ -82,6 +93,15 @@ function sealedRow(b: SecretBox): Record<string, unknown> {
 	r.alate = { url: "http://127.0.0.1:9", key: b.seal(ALATE_KEY) };
 	r.gitTokens = [
 		{ host: "github.com", username: "u", token: b.seal(GIT_TOKEN) },
+	];
+	r.turnReadTokens = [
+		{
+			host: "github.com",
+			token: b.seal(TURN_TOKEN),
+			status: "ok",
+			detail: "Turns can use this token",
+			confirmed: false,
+		},
 	];
 	r.envValues = { HS_TOKEN: b.seal(ENV_VALUE) };
 	return r;
@@ -200,6 +220,8 @@ describe("ADR-0011 config row sealing", () => {
 		expect(row.vapid).toBeNull();
 		for (const t of row.gitTokens as Record<string, string>[])
 			expect(isSealed(t.token)).toBe(true);
+		for (const t of row.turnReadTokens as Record<string, string>[])
+			expect(isSealed(t.token)).toBe(true);
 		for (const v of Object.values(row.envValues as Record<string, string>))
 			expect(isSealed(v)).toBe(true);
 		// The runtime opened the row: the stored values come back as plaintext.
@@ -210,6 +232,40 @@ describe("ADR-0011 config row sealing", () => {
 		expect(
 			box.open((row.gitTokens as Record<string, string>[])[0]!.token as string),
 		).toBe(GIT_TOKEN);
+		expect(
+			box.open(
+				(row.turnReadTokens as Record<string, string>[])[0]!.token as string,
+			),
+		).toBe(TURN_TOKEN);
+	});
+
+	test("the walker seals a turnReadTokens row's token and keeps an already-sealed one", () => {
+		const plain = sealStoredConfigRow(
+			{
+				turnReadTokens: [
+					{
+						host: "github.com",
+						token: TURN_TOKEN,
+						status: "ok",
+						detail: "d",
+						confirmed: false,
+					},
+				],
+			},
+			box,
+		);
+		expect(plain.changed).toBe(true);
+		const sealedToken = (
+			(plain.row as Record<string, unknown>).turnReadTokens as Record<
+				string,
+				unknown
+			>[]
+		)[0]!.token as string;
+		expect(isSealed(sealedToken)).toBe(true);
+		expect(box.open(sealedToken)).toBe(TURN_TOKEN);
+		// The other row fields pass through; a second walk is a no-op (idempotent).
+		const again = sealStoredConfigRow(plain.row, box);
+		expect(again.changed).toBe(false);
 	});
 
 	test("the stored apiKey is live at runtime after boot", async () => {
@@ -257,6 +313,11 @@ describe("ADR-0011 config row sealing", () => {
 		const hs = await app.call("/api/settings/hindsight");
 		expect(hs.json.tokenSet).toBe(true);
 		expect(hs.json.tokenReadable).toBe(false);
+
+		const turn = await app.call("/api/settings/turn-github-token");
+		const turnRow = (turn.json.tokens as Record<string, unknown>[])[0]!;
+		expect(turnRow.tokenSet).toBe(true);
+		expect(turnRow.tokenReadable).toBe(false);
 		// An env-only token with the stored blob kept: set but unreadable —
 		// entering the stored token restores persistence (ADR-0011).
 		process.env.HINDSIGHT_API_TOKEN = "env-only-token";
@@ -271,13 +332,22 @@ describe("ADR-0011 config row sealing", () => {
 			seeded.hindsightToken,
 			(seeded.alate as Record<string, string>).key,
 			(seeded.gitTokens as Record<string, string>[])[0]!.token,
+			(seeded.turnReadTokens as Record<string, string>[])[0]!.token,
 			(seeded.envValues as Record<string, string>).HS_TOKEN,
 		];
-		for (const body of [gh.text, hosts.text, env.text, alate.text, hs.text]) {
+		for (const body of [
+			gh.text,
+			hosts.text,
+			env.text,
+			alate.text,
+			hs.text,
+			turn.text,
+		]) {
 			for (const secret of [
 				GH_TOKEN,
 				ALATE_KEY,
 				GIT_TOKEN,
+				TURN_TOKEN,
 				ENV_VALUE,
 				HS_TOKEN,
 			])
@@ -299,6 +369,9 @@ describe("ADR-0011 config row sealing", () => {
 		);
 		expect((row.gitTokens as Record<string, string>[])[0]!.token).toBe(
 			(seeded.gitTokens as Record<string, string>[])[0]!.token,
+		);
+		expect((row.turnReadTokens as Record<string, string>[])[0]!.token).toBe(
+			(seeded.turnReadTokens as Record<string, string>[])[0]!.token,
 		);
 		expect((row.envValues as Record<string, string>).HS_TOKEN).toBe(
 			(seeded.envValues as Record<string, string>).HS_TOKEN,
@@ -473,7 +546,7 @@ describe("ADR-0011 config row sealing", () => {
 		const g = GlobalStore.open(join(root, "g-vapid"));
 		stores.push(g);
 		const seeded = sealedRow(box);
-		const OLD_PUBLIC = "old-public-key-B" + "0".repeat(56);
+		const OLD_PUBLIC = `old-public-key-B${"0".repeat(56)}`;
 		seeded.vapid = {
 			publicKey: OLD_PUBLIC,
 			privateKey: box.seal("vapid-private-plain-9f3a"),
@@ -544,7 +617,7 @@ describe("ADR-0011 config row sealing", () => {
 		const g = GlobalStore.open(join(root, "g-vapid-nokv"));
 		stores.push(g);
 		const seeded = sealedRow(box);
-		const OLD_PUBLIC = "old-public-key-C" + "1".repeat(56);
+		const OLD_PUBLIC = `old-public-key-C${"1".repeat(56)}`;
 		seeded.vapid = {
 			publicKey: OLD_PUBLIC,
 			// Sealed under key A: a wrong-key boot cannot read it, but the

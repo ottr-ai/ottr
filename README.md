@@ -419,6 +419,12 @@ Use a fine-grained personal access token:
 
 A classic token also works: the `repo` scope covers everything above, plus the `workflow` scope only if tasks change workflow files.
 
+### Read-only token for turns
+
+Agent turns get their own optional token under **Settings → GitHub → Read-only GitHub token for turns**. A turn uses it to read pull requests, Actions runs, CI logs and private repositories; it never pushes. A fine-grained personal access token with read-only Repository permissions is the supported shape. A classic token cannot be read-only for private repositories (its `repo` scope grants write), so the board checks each saved token against the project repositories, shows a warning for a write-capable token, and uses it only after you confirm.
+
+Every turn strips `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` from its environment. `GH_ENTERPRISE_TOKEN` in a `workers/<project>/env.txt` no longer reaches turns: this setting is the only supported delivery. On an Enterprise host the token reaches a turn as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`; on `github.com` as `GH_TOKEN`. Local server-side runs (merge turns) keep the board token and stay unchanged. Spec: [docs/specs/turn-read-token.md](docs/specs/turn-read-token.md).
+
 ### Enterprise orgs
 
 - A fine-grained token reaches only the repositories of its resource owner, so for an org repository the token must be owned by (or authorized for) the org. If the org does not allow org-owned fine-grained tokens for members, use a classic token.

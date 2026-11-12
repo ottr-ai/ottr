@@ -43,6 +43,9 @@ export interface WorkerRequest {
 	cwd: string;
 	stdin: string;
 	env: Record<string, string>;
+	/** The board's confirmed read-only GitHub token env (docs/specs/turn-read-token.md),
+	 * applied after the strips — the only GitHub token names a turn may hold. */
+	githubReadEnv?: Record<string, string>;
 	/** Set only for a vm-runner dispatch (docs/adr/0009-microvm-workers.md); classic workers
 	 * are never sent one and ignore it. */
 	vm?: VmSpec;
@@ -367,7 +370,7 @@ export function serveWorker(opts: {
 		notes: string,
 		pathDir: string,
 	): Promise<Response> => {
-		const env = runChildEnv(body.env, pathDir);
+		const env = runChildEnv(body.env, body.githubReadEnv, pathDir);
 		// The provision guard's untracked scan compares against the rules dir as it
 		// stood before omp started (docs/specs/turn-provision-guard.md).
 		const rulesAtStart = opts.rulesAtStart ? opts.rulesAtStart() : undefined;
@@ -522,6 +525,7 @@ async function provisionRun(
  * alate key; the tools link dir prepended to PATH. */
 function runChildEnv(
 	requestEnv: Record<string, string>,
+	githubReadEnv: Record<string, string> | undefined,
 	pathDir: string,
 ): Record<string, string | undefined> {
 	// The worker's own token drives every worker, and the container env can hold a git
@@ -543,6 +547,9 @@ function runChildEnv(
 	// Same strip as childEnv on the server: the container env can carry a
 	// corporate proxy URL with credentials; a turn keeps host and port only.
 	stripProxyCredentials(env);
+	// The delivered read-only GitHub token lands last (docs/specs/turn-read-token.md):
+	// it survives every strip above and overrides any ambient name.
+	Object.assign(env, githubReadEnv);
 	// The tools link dir is per tool set: project pins, then _all pins, then the container
 	// PATH. The daemon's own PATH never changes, and two projects never see each
 	// other's pins because the dir is keyed by the project's own tool set.

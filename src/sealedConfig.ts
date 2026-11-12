@@ -37,9 +37,9 @@ function sealKeySpot(
 /**
  * Seals every token/key spot of a stored config row (ADR-0011 scope list): apiKey,
  * sessionSecret, githubToken, hindsightToken, alate.key, githubApp.key, gitTokens[].token,
- * every envValues value, vapid.privateKey. admin.passHash, sessions and everything else pass
- * through untouched; already-sealed blobs stay sealed (idempotent). Shallow copy: the input
- * row is never mutated.
+ * turnReadTokens[].token, every envValues value, vapid.privateKey. admin.passHash, sessions
+ * and everything else pass through untouched; already-sealed blobs stay sealed (idempotent).
+ * Shallow copy: the input row is never mutated.
  */
 export function sealStoredConfigRow(
 	row: unknown,
@@ -81,6 +81,19 @@ export function sealStoredConfigRow(
 		});
 		if (touched) {
 			r.gitTokens = next;
+			changed = true;
+		}
+	}
+	if (Array.isArray(r.turnReadTokens)) {
+		let touched = false;
+		const next = (r.turnReadTokens as unknown[]).map((t) => {
+			const out = sealKeySpot(t, "token", box);
+			if (!out.changed) return t;
+			touched = true;
+			return out.v;
+		});
+		if (touched) {
+			r.turnReadTokens = next;
 			changed = true;
 		}
 	}

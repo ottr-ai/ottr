@@ -489,6 +489,8 @@ function mount(
 		trendingFetch?: typeof fetch;
 		/** Fetch seam for the re-run-failed-jobs GitHub call; passed through to createApp. */
 		rerunFetch?: typeof fetch;
+		/** Fetch seam for the turn read-token check; passed through to createApp. */
+		turnTokenFetch?: Parameters<typeof createApp>[0]["turnTokenFetch"];
 		/** Ceiling for the default token-expiry probe; passed through to createApp. */
 		githubTokenExpiryTimeoutMs?: Parameters<
 			typeof createApp
@@ -558,6 +560,7 @@ function mount(
 		prReviewSpawn: input.prReviewSpawn,
 		trendingFetch: input.trendingFetch,
 		rerunFetch: input.rerunFetch,
+		turnTokenFetch: input.turnTokenFetch,
 		githubTokenExpiryTimeoutMs: input.githubTokenExpiryTimeoutMs,
 		githubTokenExpirySleep: input.githubTokenExpirySleep,
 		slowApiMs: input.slowApiMs,
@@ -15684,6 +15687,294 @@ describe("POST /api/git-hosts/github-token", () => {
 			).json()) as HostsView;
 			expect(view.tokens).toEqual([]);
 		});
+	});
+});
+
+describe("POST /api/settings/turn-github-token", () => {
+	const savedHost = process.env.OTTR_GITHUB_HOST;
+	afterAll(() => {
+		if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = savedHost;
+		for (const s of opened) s.close();
+	});
+
+	const TOKEN = "tok-turn-read";
+	const opened: ProjectStore[] = [];
+
+	/** A project entry whose origin remote sits on `originUrl`. */
+	const projectOn = (name: string, originUrl: string | null): Entry => {
+		const dir = join(root, `turn-tok-${name}`);
+		const store = ProjectStore.open(dir);
+		opened.push(store);
+		store.setSettings({ originUrl });
+		return {
+			path: dir,
+			name,
+			store,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+	};
+
+	/** A stub checker fetch that records every call and answers one canned status. */
+	const stubFetch = (
+		calls: { url: string; init?: RequestInit }[],
+		status = 200,
+		extraHeaders: Record<string, string> = {},
+	) =>
+		(async (input: RequestInfo | URL, init?: RequestInit) => {
+			calls.push({
+				url: String(input instanceof Request ? input.url : input),
+				init,
+			});
+			return new Response(JSON.stringify({}), {
+				status,
+				headers: extraHeaders,
+			});
+		}) as unknown as typeof fetch;
+
+	test("a saved token is checked once per host repo and served when ok", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const m = mount({
+			projects: new Map([
+				["tt1", projectOn("tt1", "https://github.com/acme/api.git")],
+				// Off-host origin: its repo must not be checked.
+				["tt2", projectOn("tt2", "https://gitlab.com/acme/other.git")],
+			]),
+			turnTokenFetch: stubFetch(calls),
+		});
+		const res = await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: TOKEN,
+		});
+		expect(res.status).toBe(200);
+		// Exact probe shape: one GET on the on-host repo only.
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.init?.method ?? "GET").toBe("GET");
+		expect(calls[0]!.url).toBe("https://api.github.com/repos/acme/api");
+		const headers = new Headers(calls[0]!.init?.headers);
+		expect(headers.get("authorization")).toBe(`Bearer ${TOKEN}`);
+		// Serving is gated on the verdict: ok serves at once.
+		expect(m.app.turnReadToken()).toEqual({ host: "github.com", token: TOKEN });
+	});
+
+	test("a write-capable token is stored but not served until confirmed", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		// The classic `repo` scope is a write signal.
+		const m = mount({
+			projects: new Map([
+				["tt3", projectOn("tt3", "https://github.com/acme/api.git")],
+			]),
+			turnTokenFetch: stubFetch(calls, 200, { "x-oauth-scopes": "repo" }),
+		});
+		const res = await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: TOKEN,
+		});
+		expect(res.status).toBe(200);
+		const view = (await res.json()) as {
+			tokens: { status: string; confirmed: boolean }[];
+		};
+		expect(view.tokens[0]!.status).toBe("write");
+		expect(view.tokens[0]!.confirmed).toBe(false);
+		expect(m.app.turnReadToken()).toBeNull();
+		// The confirm action flips it on; the view never carries the token value.
+		const viewText = await (
+			await m.call("/api/settings/turn-github-token")
+		).text();
+		expect(viewText).not.toContain(TOKEN);
+		const yes = await m.call("/api/settings/turn-github-token/confirm", {
+			host: "github.com",
+		});
+		expect(yes.status).toBe(200);
+		expect(m.app.turnReadToken()).toEqual({ host: "github.com", token: TOKEN });
+		// Confirming a row that is not write-capable is a 400.
+		const no = await m.call("/api/settings/turn-github-token/confirm", {
+			host: "gitlab.com",
+		});
+		expect(no.status).toBe(400);
+	});
+
+	test("an error verdict is not served until a re-check passes", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		// The verdict flips mid-test: the route always consults the injected fetch,
+		// never the global one (m.call itself rides the global fetch).
+		let verdict = new Response(JSON.stringify({}), { status: 401 });
+		const m = mount({
+			projects: new Map([
+				["tt4", projectOn("tt4", "https://github.com/acme/api.git")],
+			]),
+			turnTokenFetch: (async (
+				input: RequestInfo | URL,
+				init?: RequestInit,
+			) => {
+				calls.push({
+					url: String(input instanceof Request ? input.url : input),
+					init,
+				});
+				return verdict;
+			}) as unknown as typeof fetch,
+		});
+		const res = await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: TOKEN,
+		});
+		expect(res.status).toBe(200);
+		const view = (await res.json()) as {
+			tokens: { status: string; tokenReadable: boolean }[];
+		};
+		expect(view.tokens[0]!.status).toBe("error");
+		expect(view.tokens[0]!.tokenReadable).toBe(true);
+		expect(m.app.turnReadToken()).toBeNull();
+		// The re-check runs on the stored token through the same injected fetch; a
+		// passing one serves the row.
+		calls.length = 0;
+		verdict = new Response(JSON.stringify({}), { status: 200 });
+		const again = await m.call("/api/settings/turn-github-token/recheck", {
+			host: "github.com",
+		});
+		expect(again.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(m.app.turnReadToken()).toEqual({ host: "github.com", token: TOKEN });
+		// A re-check names a host without a stored readable row: 400, and the check
+		// itself is refused for a host the board does not serve.
+		const absent = await m.call("/api/settings/turn-github-token/recheck", {
+			host: "gitlab.com",
+		});
+		expect(absent.status).toBe(400);
+	});
+
+	test("an empty token clears the row", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const m = mount({
+			projects: new Map([
+				["tt5", projectOn("tt5", "https://github.com/acme/api.git")],
+			]),
+			turnTokenFetch: stubFetch(calls),
+		});
+		await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: TOKEN,
+		});
+		expect(m.app.turnReadToken()).not.toBeNull();
+		const clear = await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: "",
+		});
+		expect(clear.status).toBe(200);
+		const view = (await clear.json()) as { tokens: unknown[] };
+		expect(view.tokens).toEqual([]);
+		expect(m.app.turnReadToken()).toBeNull();
+		const cfg = m.g.get<{ turnReadTokens?: unknown }>("config");
+		expect(cfg?.turnReadTokens).toEqual([]);
+	});
+
+	test("a foreign host is a 400 and stores nothing", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const m = mount({
+			projects: new Map([
+				["tt6", projectOn("tt6", "https://github.com/acme/api.git")],
+			]),
+			turnTokenFetch: stubFetch(calls),
+		});
+		const res = await m.call("/api/settings/turn-github-token", {
+			host: "evil.example.com",
+			token: TOKEN,
+		});
+		expect(res.status).toBe(400);
+		expect(calls).toHaveLength(0);
+		const cfg = m.g.get<{ turnReadTokens?: unknown }>("config");
+		expect(cfg?.turnReadTokens).toBeUndefined();
+		expect(m.app.turnReadToken()).toBeNull();
+	});
+
+	test("the GET view names flags and verdicts, never a token value", async () => {
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const m = mount({
+			projects: new Map([
+				["tt7", projectOn("tt7", "https://github.com/acme/api.git")],
+			]),
+			turnTokenFetch: stubFetch(calls),
+		});
+		await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: TOKEN,
+		});
+		const res = await m.call("/api/settings/turn-github-token");
+		expect(res.status).toBe(200);
+		const text = await res.text();
+		expect(text).not.toContain(TOKEN);
+		const view = JSON.parse(text) as {
+			host: string | null;
+			tokens: {
+				host: string;
+				tokenSet: boolean;
+				tokenReadable: boolean;
+				status: string;
+				detail: string;
+				confirmed: boolean;
+			}[];
+		};
+		expect(view.host).toBe("github.com");
+		expect(view.tokens).toEqual([
+			{
+				host: "github.com",
+				tokenSet: true,
+				tokenReadable: true,
+				status: "ok",
+				detail: expect.any(String),
+				confirmed: false,
+			},
+		]);
+	});
+
+	test("an enterprise host checks its own api base and serves under the configured host", async () => {
+		process.env.OTTR_GITHUB_HOST = "bmw.ghe.com";
+		const calls: { url: string; init?: RequestInit }[] = [];
+		const m = mount({
+			projects: new Map([
+				["tt8", projectOn("tt8", "https://bmw.ghe.com/acme/api.git")],
+			]),
+			turnTokenFetch: stubFetch(calls),
+		});
+		const res = await m.call("/api/settings/turn-github-token", {
+			host: "BMW.GHE.COM",
+			token: TOKEN,
+		});
+		expect(res.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		expect(calls[0]!.url).toBe("https://api.bmw.ghe.com/repos/acme/api");
+		expect(m.app.turnReadToken()).toEqual({
+			host: "bmw.ghe.com",
+			token: TOKEN,
+		});
+		// github.com stays a legal second row, but the configured host decides serving;
+		// with no github.com project its check needs no API call at all.
+		const gh = await m.call("/api/settings/turn-github-token", {
+			host: "github.com",
+			token: "tok-second",
+		});
+		expect(gh.status).toBe(200);
+		expect(calls).toHaveLength(1);
+		const view = (await gh.json()) as { tokens: { host: string }[] };
+		expect(view.tokens.map((t) => t.host).sort()).toEqual([
+			"bmw.ghe.com",
+			"github.com",
+		]);
+		expect(m.app.turnReadToken()).toEqual({
+			host: "bmw.ghe.com",
+			token: TOKEN,
+		});
+		delete process.env.OTTR_GITHUB_HOST;
 	});
 });
 

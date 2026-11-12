@@ -3037,6 +3037,233 @@ function GitHubConnectionBlock({
 	);
 }
 
+/** One stored turn-token row as GET /api/settings/turn-github-token serves it; a row
+ *  never carries the token value itself. */
+type TurnTokenRow = {
+	host: string;
+	tokenSet: boolean;
+	tokenReadable: boolean;
+	status: "ok" | "write" | "error";
+	detail: string;
+	confirmed: boolean;
+};
+
+/** GET /api/settings/turn-github-token's answer: the configured host and the stored rows. */
+type TurnTokenView = { host: string | null; tokens: TurnTokenRow[] };
+
+/** The "Read-only GitHub token for turns" block (docs/specs/turn-read-token.md): the row
+ *  for the configured GitHub host, plus github.com when it differs. A save posts
+ *  {host, token} — an empty token clears — and the server answers the checked row; a
+ *  write-capable token waits for "Use anyway", a failed check for "Check again". The
+ *  block never renders a token value, and hosted mode hides it with its card. */
+function TurnTokenBlock() {
+	const [view, setView] = useState<TurnTokenView | null>(null);
+	const [drafts, setDrafts] = useState<Record<string, string>>({});
+	const [error, setError] = useState<string | null>(null);
+	const [saved, flashSaved] = useFlash(1500);
+	const busy = useBusy();
+	useEffect(() => {
+		let live = true;
+		fetch("/api/settings/turn-github-token")
+			.then((res) => unwrap<TurnTokenView>(res))
+			.then((loaded) => {
+				if (live) setView(loaded);
+			})
+			.catch((err) => {
+				if (live) setError(err instanceof Error ? err.message : String(err));
+			});
+		return () => {
+			live = false;
+		};
+	}, []);
+	/** Replaces one row in the view after a save, a confirm or a re-check. */
+	const onRow = (row: TurnTokenRow): void =>
+		setView((v) =>
+			v === null
+				? v
+				: {
+						...v,
+						tokens: [
+							...v.tokens.filter(
+								(r) => r.host.toLowerCase() !== row.host.toLowerCase(),
+							),
+							row,
+						],
+					},
+		);
+	/** Posts to a turn-token route and applies the returned row; a failure shows on the
+	 *  block's own error line, like SecretTokenForm's saves. `onOk` runs the route's
+	 *  own side effect (clear the draft, flash Saved) only on a 200. */
+	const send = (path: string, body: unknown, onOk?: () => void): void =>
+		busy.start(async () => {
+			setError(null);
+			try {
+				onRow(await post<TurnTokenRow>(path, body));
+				onOk?.();
+				return true;
+			} catch (err) {
+				setError(err instanceof Error ? err.message : String(err));
+				return false;
+			}
+		});
+	const submitRow = (host: string): void =>
+		send(
+			"/api/settings/turn-github-token",
+			{ host, token: (drafts[host] ?? "").trim() },
+			() => {
+				setDrafts((d) => ({ ...d, [host]: "" }));
+				flashSaved();
+			},
+		);
+	// The configured host's row first; github.com joins when the host differs. A row is
+	// matched case-insensitively, the way the server compares hosts.
+	const configured = view?.host ?? null;
+	const hosts: string[] =
+		configured === null
+			? []
+			: configured.toLowerCase() === "github.com"
+				? [configured]
+				: [configured, "github.com"];
+	/** The check's outcome under the input: never a token value, only its verdict. */
+	const statusLine = (
+		row: TurnTokenRow | undefined,
+		host: string,
+	): ReactNode => {
+		if (row === undefined || !row.tokenSet) return null;
+		if (!row.tokenReadable)
+			return (
+				<p className="hint">
+					<span className="jira-conn-warn">
+						<Mark kind="warn" />
+						Unreadable — enter it again
+					</span>
+				</p>
+			);
+		if (row.status === "ok")
+			return <p className="hint">Turns can use this token</p>;
+		if (row.status === "write")
+			return (
+				<p className="hint">
+					<span className="jira-conn-warn">
+						<Mark kind="warn" />
+						{row.detail}
+						{row.confirmed ? " · in use" : ""}
+					</span>
+					{!row.confirmed && (
+						<button
+							type="button"
+							onClick={() =>
+								send("/api/settings/turn-github-token/confirm", { host })
+							}
+						>
+							Use anyway
+						</button>
+					)}
+				</p>
+			);
+		return (
+			<p className="hint">
+				<span className="jira-conn-warn">
+					<Mark kind="warn" />
+					{row.detail}
+				</span>
+				<button
+					type="button"
+					onClick={() =>
+						send("/api/settings/turn-github-token/recheck", { host })
+					}
+				>
+					Check again
+				</button>
+			</p>
+		);
+	};
+	return (
+		<div className="sec-block" id="turn-github-token-block" tabIndex={-1}>
+			<h4>Read-only GitHub token for turns</h4>
+			<p className="hint">
+				Agent turns use this token to read pull requests, Actions runs, CI logs
+				and private repositories. A fine-grained personal access token with
+				read-only Repository permissions is the supported shape. A classic token
+				with the repo scope cannot be read-only: the board checks each saved
+				token and warns before it uses a write-capable one.
+			</p>
+			{view === null && (
+				<p className="hint">
+					{error !== null
+						? "The saved tokens are unavailable"
+						: "Checking the saved tokens"}
+				</p>
+			)}
+			{view !== null && configured === null && (
+				<p className="hint">
+					No GitHub host is in effect: set the host under Connection first.
+				</p>
+			)}
+			{hosts.map((h) => {
+				const row = view?.tokens.find(
+					(r) => r.host.toLowerCase() === h.toLowerCase(),
+				);
+				return (
+					<form
+						key={h}
+						className="settings-form"
+						onSubmit={(e) => {
+							e.preventDefault();
+							submitRow(h);
+						}}
+					>
+						<div className="alate-def-rows">
+							<DefRow
+								name={h}
+								shape="secret · stored, never shown"
+								action={
+									<button
+										type="submit"
+										disabled={busy.busy}
+										className={busy.failed ? "failed" : undefined}
+									>
+										{busy.busy && (
+											<span className="spinner" aria-hidden="true" />
+										)}
+										<SaveLabel saved={saved} />
+									</button>
+								}
+							>
+								<label>
+									<input
+										type="password"
+										value={drafts[h] ?? ""}
+										onChange={(e) =>
+											setDrafts({ ...drafts, [h]: e.target.value })
+										}
+										placeholder={
+											row === undefined
+												? "Not set: turns read GitHub without a token"
+												: row.tokenSet
+													? "Set · paste a new token to replace it"
+													: "Not set: turns read GitHub without a token"
+										}
+										autoComplete="off"
+										spellCheck={false}
+										aria-label={`Read-only GitHub token for ${h}`}
+									/>
+								</label>
+							</DefRow>
+							{statusLine(row, h)}
+						</div>
+					</form>
+				);
+			})}
+			{error !== null && (
+				<p className="auth-error" role="alert">
+					{error}
+				</p>
+			)}
+		</div>
+	);
+}
+
 /** The "Global SSH key" block: the saved key's card or the empty hint, the pending key
  *  row, and the test and save prompts. */
 function GlobalKeyBlock({
@@ -3462,6 +3689,7 @@ export function GitHostsSection({
 			onSave={saveConnection}
 		/>
 	);
+	const turnB = <TurnTokenBlock />;
 	const appB = (h?: string | null) => (
 		<GitHubAppBlock
 			heading={h}
@@ -3711,6 +3939,7 @@ export function GitHostsSection({
 				status={githubChip(state)}
 			>
 				{connectionB}
+				{turnB}
 				{appB("App")}
 			</SettingsCard>
 			<SettingsCard
@@ -7324,6 +7553,7 @@ export const SETTINGS_TOC = [
 				blocks: [
 					{ id: "github-host-block", label: "GitHub host" },
 					{ id: "github-token-block", label: "GitHub token" },
+					{ id: "turn-github-token-block", label: "Turn GitHub token" },
 					{ id: "github-app-block", label: "GitHub App" },
 				],
 			},

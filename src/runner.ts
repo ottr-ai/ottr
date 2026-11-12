@@ -1629,6 +1629,9 @@ interface StartOptions {
 	secrets?: readonly string[];
 	/** Set: strip the board coordinates from the child env (a retro run). */
 	stripBoard?: boolean;
+	/** The confirmed read-only GitHub token env for worker and microVM turns
+	 * (docs/specs/turn-read-token.md); applied after every strip. A local run ignores it. */
+	githubReadEnv?: Record<string, string>;
 	/** Set: a local child runs without the board's GitHub token (GH_TOKEN, GITHUB_TOKEN), as a
 	 * worker child always does. A run that reads third-party text (the trending scout) sets it. */
 	stripGithubToken?: boolean;
@@ -1949,6 +1952,8 @@ function startVmRun(
 				token,
 				layerEnv,
 			}),
+			// Not merged into env here: the vm-runner merges it after its guestEnv strip.
+			githubReadEnv: o.githubReadEnv,
 			vm: spec,
 		},
 		vm.target,
@@ -2031,6 +2036,9 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 		...process.env,
 		...o.env,
 		GH_TOKEN: undefined,
+		GITHUB_TOKEN: undefined,
+		GH_ENTERPRISE_TOKEN: undefined,
+		GITHUB_ENTERPRISE_TOKEN: undefined,
 		PI_CODING_AGENT_DIR: undefined,
 		OTTR_BOARD_OMP_HOME: undefined,
 	});
@@ -2056,6 +2064,7 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env,
+			githubReadEnv: o.githubReadEnv,
 		},
 		worker,
 		sink,

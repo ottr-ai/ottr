@@ -19,7 +19,7 @@ import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { BRANCH_RULE_REJECTION, GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
-import { githubHost } from "./githubHost.ts";
+import { ghEnvFor, githubHost } from "./githubHost.ts";
 import type { CommitIdentity } from "./gitIdentity.ts";
 import {
 	DEFAULT_CREDIT_REASON,
@@ -987,6 +987,9 @@ export interface TurnOps {
 	startRun: typeof startRun;
 	/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
 	commitIdentity?: () => CommitIdentity | null;
+	/** OTTR-876: the read-only GitHub token served for turns, or null when none is
+	 * confirmed (docs/specs/turn-read-token.md); asked at every turn start. */
+	turnReadToken?: () => { host: string; token: string } | null;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
 	/**
@@ -5019,6 +5022,10 @@ export function createTurnLoop(
 		mx: TurnRunShared,
 		marks: Record<string, string>,
 	): Parameters<TurnOps["startRun"]>[0] {
+		// OTTR-876: the served read-only token joins the run's redaction secrets and, on
+		// worker/VM dispatch, rides githubReadEnv (applied after the strips on the target);
+		// a local run ignores it (docs/specs/turn-read-token.md).
+		const turnRead = ops.turnReadToken?.() ?? null;
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
@@ -5038,7 +5045,15 @@ export function createTurnLoop(
 			sessionName: idn.sessionName,
 			worker: route.vmTurn ? null : route.liveWorker,
 			vm: vmGrantFor(name, e, id, header, loc, route),
-			secrets: route.turnEnv.secrets,
+			secrets:
+				turnRead === null
+					? route.turnEnv.secrets
+					: [...(route.turnEnv.secrets ?? []), turnRead.token],
+			// Delivered env names for worker/VM turns: GH_TOKEN on github.com, GH_HOST plus
+			// GH_ENTERPRISE_TOKEN on an Enterprise host (ghEnvFor). Local runs never see it.
+			...(turnRead !== null && {
+				githubReadEnv: ghEnvFor(githubHost(), turnRead.token),
+			}),
 			// Retro flags: the retro.yml config sits next to the tracker extension, the
 			// skill is pinned, and the board env is stripped (the proposal files here).
 			// A review run gets OTTR_REVIEW=1: the extension then registers propose_task,

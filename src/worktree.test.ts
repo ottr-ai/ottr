@@ -76,6 +76,7 @@ import {
 	spawnPiped,
 	statusFiles,
 	statusRows,
+	stripGitAuthEnv,
 	targetCommits,
 	targetTracksRules,
 	trackedFiles,
@@ -4424,6 +4425,23 @@ describe("gitEnv", () => {
 			setNetworkGitAuth(() => ({}));
 		}
 	}, 60_000);
+
+	test("stripGitAuthEnv removes all four GitHub token names", () => {
+		const env: Record<string, string | undefined> = {
+			GH_TOKEN: "tok-classic",
+			GITHUB_TOKEN: "tok-classic-2",
+			GH_ENTERPRISE_TOKEN: "tok-ent",
+			GITHUB_ENTERPRISE_TOKEN: "tok-ent-2",
+			PATH: "/usr/bin",
+		};
+		stripGitAuthEnv(env);
+		expect(env).not.toHaveProperty("GH_TOKEN");
+		expect(env).not.toHaveProperty("GITHUB_TOKEN");
+		// The bug: the two ENTERPRISE names survived the strip before this fix.
+		expect(env).not.toHaveProperty("GH_ENTERPRISE_TOKEN");
+		expect(env).not.toHaveProperty("GITHUB_ENTERPRISE_TOKEN");
+		expect(env.PATH).toBe("/usr/bin");
+	});
 
 	test("the strip regex stays in lockstep with gitHosts' auth regex", () => {
 		expect(GIT_AUTH_ENV_NAME.source).toBe(GIT_AUTH_ENV_RE.source);

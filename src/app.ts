@@ -125,8 +125,10 @@ import {
 	configuredGithubHostname,
 	DEFAULT_GITHUB_HOST,
 	GITHUB_HOST_ENV,
+	type GithubHost,
 	gheNoticeHost,
 	githubHost,
+	hostMatcher,
 	parseGithubHost,
 } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
@@ -354,6 +356,7 @@ import {
 	type TurnProject,
 	UPDATE_HOLD_REASON,
 } from "./turn.ts";
+import { checkTurnToken } from "./turnGithubToken.ts";
 import {
 	APPROVE_REPLY,
 	type AppCheck,
@@ -696,6 +699,8 @@ interface AppDeps {
 	trendingFetch?: typeof fetch;
 	/** Fetch seam for the re-run-failed-jobs GitHub API call; defaults to fetch. Tests inject a stub. */
 	rerunFetch?: typeof fetch;
+	/** Fetch seam for the turn read-token check (checkTurnToken); defaults to fetch. Tests inject a stub. */
+	turnTokenFetch?: typeof fetch;
 	/** OTTR-532: the per-turn microVM tokens (git endpoint, /llm, /hindsight, card filing); absent = no VM turns. */
 	vmTokens?: VmTokens;
 	/** OTTR-532: the local auth-gateway the /llm proxy forwards to; null while it is not running. */
@@ -2459,6 +2464,23 @@ export function createApp(deps: AppDeps) {
 	type StoredGitToken = GitToken & { unreadable?: true };
 	let gitTokens: StoredGitToken[] = [];
 	/**
+	 * Read-only GitHub tokens for turns (docs/specs/turn-read-token.md), one row per GitHub
+	 * host; stored sealed like gitTokens (ADR-0011). The board checks a saved token with the
+	 * GitHub API once per save/re-check and stores the verdict; only a readable `ok` row, or
+	 * a `write` row the operator confirmed, is served to turns.
+	 */
+	type TurnReadTokenRow = {
+		/** "github.com" or the configured GitHub host, lowercased. */
+		host: string;
+		/** Runtime plaintext; null while the stored blob is absent or unreadable this boot. */
+		token: string | null;
+		status: "ok" | "write" | "error";
+		detail: string;
+		/** The operator accepted a write-capable token; every check resets it. */
+		confirmed: boolean;
+	};
+	let turnReadTokens: TurnReadTokenRow[] = [];
+	/**
 	 * GitHub App for PR review posts; stored sealed in the config file like githubToken
 	 * (ADR-0011), never served back after save. The key joins the git secret set.
 	 * `unreadable` marks a stored sealed key this boot cannot open: fingerprint null, no
@@ -3543,6 +3565,29 @@ export function createApp(deps: AppDeps) {
 								return !clearedSecrets.has(`git:${t.host}`);
 							});
 						})(),
+			turnReadTokens:
+				deps.secretBox !== undefined
+					? turnReadTokens.map((t) => ({
+							host: t.host,
+							status: t.status,
+							detail: t.detail,
+							confirmed: t.confirmed,
+							// A null runtime token (unreadable stored blob) writes the kept
+							// blob back, so an unrelated save never deletes a credential
+							// this boot cannot read.
+							token: sealForStore(`turnRead:${t.host}`, t.token),
+						}))
+					: // Runtime row additions are impossible (guarded routes): the stored
+						// rows pass through verbatim, minus the hosts cleared this boot.
+						(() => {
+							const storedRows = stored?.turnReadTokens;
+							if (!Array.isArray(storedRows)) return [];
+							return storedRows.filter((t) => {
+								if (typeof t !== "object" || t === null) return false;
+								if (!("host" in t) || typeof t.host !== "string") return false;
+								return !clearedSecrets.has(`turnRead:${t.host}`);
+							});
+						})(),
 			githubApp:
 				deps.secretBox === undefined
 					? clearedSecrets.has("githubAppKey")
@@ -3588,9 +3633,9 @@ export function createApp(deps: AppDeps) {
 		deps.gstore.set("config", out.row);
 	}
 	// ADR-0011 kept-unreadable bookkeeping: when this boot's box cannot open a stored sealed
-	// blob, the blob lands here keyed by field, and saveConfig puts it back so nothing is
+	// blob lands here keyed by field, and saveConfig puts it back so nothing is
 	// deleted. Keys: githubToken, apiKey, sessionSecret, hindsightToken, alateKey,
-	// githubAppKey, git:<host>, env:<name>.
+	// githubAppKey, git:<host>, turnRead:<host>, env:<name>.
 	const keptUnreadable = new Map<string, unknown>();
 	/** Runtime plaintext of a stored value, or null when absent or unreadable; an unreadable sealed blob is kept in keptUnreadable. Legacy plaintext passes through unsealed. */
 	function loadSecret(field: string, stored: unknown): string | null {
@@ -3656,6 +3701,7 @@ export function createApp(deps: AppDeps) {
 		githubToken?: unknown;
 		githubHost?: unknown;
 		gitTokens?: unknown;
+		turnReadTokens?: unknown;
 		githubApp?: unknown;
 		envValues?: unknown;
 		hindsightToken?: unknown;
@@ -3804,12 +3850,37 @@ export function createApp(deps: AppDeps) {
 		}
 		gitTokens = toks;
 	}
+	/** Restores the turn read-token rows; a malformed row is dropped, an unreadable stored blob stays as an unusable row (ADR-0011). */
+	function restoreTurnReadTokens(v: unknown): void {
+		if (!Array.isArray(v)) return;
+		const rows: TurnReadTokenRow[] = [];
+		for (const row of v) {
+			if (typeof row !== "object" || row === null) continue;
+			const r = row as Record<string, unknown>;
+			if (typeof r.host !== "string" || r.host === "") continue;
+			const status: TurnReadTokenRow["status"] =
+				r.status === "ok" || r.status === "write" || r.status === "error"
+					? r.status
+					: // An unknown stored verdict never serves: it reads as an error until
+						// the next check re-runs.
+						"error";
+			rows.push({
+				host: r.host,
+				token: loadSecret(`turnRead:${r.host}`, r.token),
+				status,
+				detail: typeof r.detail === "string" ? r.detail : "",
+				confirmed: r.confirmed === true,
+			});
+		}
+		turnReadTokens = rows;
+	}
 	/** Restores the GitHub token, host and the app pair. */
 	function restoreGithub(p: StoredConfig): void {
 		if (typeof p.githubToken === "string")
 			githubToken = loadSecret("githubToken", p.githubToken);
 		if (typeof p.githubHost === "string") savedGithubHost = p.githubHost;
 		restoreGitTokens(p.gitTokens);
+		restoreTurnReadTokens(p.turnReadTokens);
 		if (
 			typeof p.githubApp === "object" &&
 			p.githubApp !== null &&
@@ -5235,6 +5306,50 @@ export function createApp(deps: AppDeps) {
 						},
 			githubHost: githubHostView(),
 		};
+	}
+
+	/** The Settings read-only-turn-token view (docs/specs/turn-read-token.md): per-host flags and verdicts — never a token value. */
+	function turnReadTokenView() {
+		return {
+			host: githubHostView(),
+			tokens: turnReadTokens.map((r) => ({
+				host: r.host,
+				tokenSet: true,
+				// False when the stored sealed token is kept unreadable this boot (ADR-0011).
+				tokenReadable: r.token !== null,
+				status: r.status,
+				detail: r.detail,
+				confirmed: r.confirmed,
+			})),
+		};
+	}
+
+	/** The read-only GitHub token a turn may hold, or null: the configured host's row with a
+	 * readable token and the verdict `ok`, or `write` the operator confirmed. This is the
+	 * only function turns read (docs/specs/turn-read-token.md). */
+	function turnReadToken(): { host: string; token: string } | null {
+		const configured = githubHostView();
+		if (configured === null) return null;
+		const row = turnReadTokens.find(
+			(r) => r.host === configured && r.token !== null,
+		);
+		if (row === undefined || row.token === null) return null;
+		if (row.status !== "ok" && !(row.status === "write" && row.confirmed))
+			return null;
+		return { host: row.host, token: row.token };
+	}
+
+	/** Every project repo ("owner/repo") whose origin remote sits on the host; deduped, sorted. */
+	function reposOnHost(host: string): string[] {
+		const onHost = hostMatcher(host);
+		const out = new Set<string>();
+		for (const e of deps.projects.values()) {
+			const url = e.store.getSettings().originUrl;
+			if (url === null || !onHost.test(url)) continue;
+			const repo = ownerRepo(url);
+			if (repo !== null) out.add(repo);
+		}
+		return [...out].sort();
 	}
 
 	/** Probe a candidate git-host token live and, only then, save it as the host's entry. */
@@ -8512,6 +8627,107 @@ export function createApp(deps: AppDeps) {
 		return json({ tokenSet: true, expiresAt });
 	}
 
+	/** Parsed request host, or the 400 response; only github.com and the configured GitHub host are accepted. */
+	function turnTokenHost(
+		raw: unknown,
+	): { gh: GithubHost } | { error: Response } {
+		if (typeof raw !== "string")
+			return { error: json({ error: "host must be a string" }, 400) };
+		const parsed = parseGithubHost(raw);
+		if ("error" in parsed) return { error: json({ error: parsed.error }, 400) };
+		const configured = githubHostView();
+		if (parsed.host !== DEFAULT_GITHUB_HOST && parsed.host !== configured)
+			return {
+				error: json(
+					{ error: "host must be github.com or the configured GitHub host" },
+					400,
+				),
+			};
+		return { gh: parsed };
+	}
+
+	/** Runs the API check and lands the verdict on the row; every check resets confirmed. */
+	async function checkAndStoreTurnToken(
+		row: TurnReadTokenRow,
+		token: string,
+		apiBase: string,
+	): Promise<void> {
+		const check = await checkTurnToken({
+			apiBase,
+			token,
+			repos: reposOnHost(row.host),
+			fetch: deps.turnTokenFetch,
+		});
+		row.status = check.verdict;
+		row.detail = check.detail;
+		row.confirmed = false;
+	}
+
+	async function handlePOSTSettingsTurnToken(req: Request): Promise<Response> {
+		const noBox = sealGuard();
+		if (noBox !== null) return noBox;
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const h = turnTokenHost(r.body.host);
+		if ("error" in h) return h.error;
+		const host = h.gh.host;
+		const token = r.body.token;
+		if (typeof token !== "string")
+			return json({ error: "token must be a string" }, 400);
+		// An empty token clears: the stored blob drops with the row.
+		if (token === "") {
+			clearSecret(`turnRead:${host}`);
+			turnReadTokens = turnReadTokens.filter((x) => x.host !== host);
+			saveConfig();
+			return json(turnReadTokenView());
+		}
+		// One row per host: a re-save replaces the host's old entry, unconfirmed.
+		const row: TurnReadTokenRow = {
+			host,
+			token,
+			status: "error",
+			detail: "",
+			confirmed: false,
+		};
+		await checkAndStoreTurnToken(row, token, h.gh.apiBase);
+		turnReadTokens = [...turnReadTokens.filter((x) => x.host !== host), row];
+		saveConfig();
+		return json(turnReadTokenView());
+	}
+
+	async function handlePOSTSettingsTurnTokenConfirm(
+		req: Request,
+	): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const h = turnTokenHost(r.body.host);
+		if ("error" in h) return h.error;
+		const row = turnReadTokens.find((x) => x.host === h.gh.host);
+		if (row === undefined || row.status !== "write")
+			return json(
+				{ error: "only a write-capable token can be confirmed" },
+				400,
+			);
+		row.confirmed = true;
+		saveConfig();
+		return json(turnReadTokenView());
+	}
+
+	async function handlePOSTSettingsTurnTokenRecheck(
+		req: Request,
+	): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const h = turnTokenHost(r.body.host);
+		if ("error" in h) return h.error;
+		const row = turnReadTokens.find((x) => x.host === h.gh.host);
+		if (row === undefined || row.token === null)
+			return json({ error: "no stored readable token for this host" }, 400);
+		await checkAndStoreTurnToken(row, row.token, h.gh.apiBase);
+		saveConfig();
+		return json(turnReadTokenView());
+	}
+
 	async function handleDELETESettingsSessionsById(
 		req: BunRequest<"/api/settings/sessions/:id">,
 	): Promise<Response> {
@@ -11365,6 +11581,19 @@ export function createApp(deps: AppDeps) {
 		"/api/settings/github-host": {
 			POST: (req) => api(req, () => handlePOSTSettingsGithub(req)),
 		},
+		// Read-only GitHub tokens for turns (docs/specs/turn-read-token.md). No answer ever
+		// holds a token value; a save runs the API check and stores its verdict, and only a
+		// checked row (or a confirmed write-capable one) is served to turns.
+		"/api/settings/turn-github-token": {
+			GET: (req) => api(req, async () => json(turnReadTokenView())),
+			POST: (req) => api(req, () => handlePOSTSettingsTurnToken(req)),
+		},
+		"/api/settings/turn-github-token/confirm": {
+			POST: (req) => api(req, () => handlePOSTSettingsTurnTokenConfirm(req)),
+		},
+		"/api/settings/turn-github-token/recheck": {
+			POST: (req) => api(req, () => handlePOSTSettingsTurnTokenRecheck(req)),
+		},
 		// Secret env values, one per env.txt name. No answer ever holds a value; a re-save
 		// replaces it (parity with the GitHub token: no delete).
 		"/api/settings/env": {
@@ -12040,6 +12269,9 @@ export function createApp(deps: AppDeps) {
 		drainedRunner: (id: string) =>
 			Date.now() <
 			Math.max(runnerDrains.get(id) ?? 0, updateCycle.holdUntil(Date.now())),
+		// OTTR-876: the read-only GitHub token a turn may hold, or null — the served rule
+		// (docs/specs/turn-read-token.md); the turn loop asks it at every turn start.
+		turnReadToken,
 		// OTTR-754: the /tmp free-space warning phrase for this runner ("local" or a worker
 		// hostname), or null when space is fine or unknown; the turn start gate holds on it.
 		tmpFullLine: (runner: string): string | null => {

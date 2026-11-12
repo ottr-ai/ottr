@@ -183,11 +183,15 @@ export function hostedGitAuth(): HostedGitAuth | null {
 	return hostedAuth;
 }
 
-/** Deletes every git host credential name in place: GH_TOKEN, GITHUB_TOKEN and the
- * `GIT_AUTH_ENV_NAME` set. Local board git and every worker turn run without them. */
+/** Deletes every git host credential name in place: GH_TOKEN, GITHUB_TOKEN,
+ * GH_ENTERPRISE_TOKEN, GITHUB_ENTERPRISE_TOKEN and the `GIT_AUTH_ENV_NAME` set. Local
+ * board git and every worker turn run without them; a turn may hold only the delivered
+ * read-only token (docs/specs/turn-read-token.md). */
 export function stripGitAuthEnv(env: Record<string, string | undefined>): void {
 	delete env.GH_TOKEN;
 	delete env.GITHUB_TOKEN;
+	delete env.GH_ENTERPRISE_TOKEN;
+	delete env.GITHUB_ENTERPRISE_TOKEN;
 	for (const k of Object.keys(env)) {
 		if (GIT_AUTH_ENV_NAME.test(k)) delete env[k];
 	}

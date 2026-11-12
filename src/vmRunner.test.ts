@@ -440,6 +440,39 @@ describe("vm-runner /run", () => {
 		);
 	});
 
+	test("the delivered githubReadEnv reaches the guest env after the strip; ambient names do not", async () => {
+		const r = startRunner();
+		const res = await post(r.url, "/run", {
+			...request(),
+			// All four names ambient in the request env, plus the delivered read-only
+			// token on its dedicated field.
+			env: {
+				OTTR_PROJECT: "proj",
+				GH_TOKEN: "ghp_secret",
+				GITHUB_TOKEN: "ghp_secret2",
+				GH_ENTERPRISE_TOKEN: "ghp_ent",
+				GITHUB_ENTERPRISE_TOKEN: "ghp_ent2",
+				FOO: "bar",
+			},
+			githubReadEnv: {
+				GH_HOST: "acme.ghe.com",
+				GH_ENTERPRISE_TOKEN: "tok-ent",
+			},
+		});
+		await res.text();
+		const body = r.recs[0]!.runBody as {
+			env: Record<string, string>;
+		};
+		// The delivered read-only token lands after the strip...
+		expect(body.env).toHaveProperty("GH_HOST", "acme.ghe.com");
+		expect(body.env).toHaveProperty("GH_ENTERPRISE_TOKEN", "tok-ent");
+		// ...and every ambient GitHub token name is gone.
+		expect(body.env.GH_TOKEN).toBeUndefined();
+		expect(body.env.GITHUB_TOKEN).toBeUndefined();
+		expect(body.env.GITHUB_ENTERPRISE_TOKEN).toBeUndefined();
+		expect(body.env.FOO).toBe("bar");
+	});
+
 	test("answers 400 without a vm spec", async () => {
 		const r = startRunner();
 		const { vm: _vm, ...classic } = request();

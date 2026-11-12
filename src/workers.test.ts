@@ -449,6 +449,53 @@ describe("serveWorker", () => {
 		}
 	}, 30_000);
 
+	test("the delivered githubReadEnv reaches omp after the strips and overrides ambient names", async () => {
+		const planted: Record<string, string> = {
+			GH_ENTERPRISE_TOKEN: "ghp_container_ent",
+			GITHUB_ENTERPRISE_TOKEN: "ghp_container_ent2",
+		};
+		const saved = Object.fromEntries(
+			Object.keys(planted).map((k) => [k, process.env[k]]),
+		);
+		Object.assign(process.env, planted);
+		try {
+			const url = start({ ompPath: process.execPath });
+			const res = await fetch(`${url}/run`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id: "r-read-token",
+					argv: [envDumpPath],
+					cwd: dir,
+					stdin: "",
+					// Every ambient name, in the request env too: only the delivered
+					// read-only token may survive the strips.
+					env: {
+						GH_TOKEN: "ambient-classic",
+						GITHUB_TOKEN: "ambient-classic2",
+						GH_ENTERPRISE_TOKEN: "ambient-ent",
+						GITHUB_ENTERPRISE_TOKEN: "ambient-ent2",
+					},
+					githubReadEnv: { GH_TOKEN: "tok-read" },
+				}),
+			});
+			const env = JSON.parse((await readLines(res))[0] ?? "") as Record<
+				string,
+				string
+			>;
+			// The delivered token lands; no other GitHub token name survives anywhere.
+			expect(env).toHaveProperty("GH_TOKEN", "tok-read");
+			expect(env).not.toHaveProperty("GITHUB_TOKEN");
+			expect(env).not.toHaveProperty("GH_ENTERPRISE_TOKEN");
+			expect(env).not.toHaveProperty("GITHUB_ENTERPRISE_TOKEN");
+		} finally {
+			for (const [k, v] of Object.entries(saved)) {
+				if (v === undefined) delete process.env[k];
+				else process.env[k] = v;
+			}
+		}
+	}, 30_000);
+
 	test("omp never sees proxy credentials, from the container env or the request", async () => {
 		const planted: Record<string, string> = {
 			HTTP_PROXY: "http://user:pass@proxy:8080",

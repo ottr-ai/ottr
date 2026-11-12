@@ -22,6 +22,7 @@ import {
 	fmtPct,
 	GitHostsSection,
 	HindsightSection,
+	hostedHidden,
 	ModelRolesSection,
 	missingRequiredLine,
 	NotificationsSection,
@@ -32,8 +33,10 @@ import {
 	ProjectSetupSteps,
 	ProjectsOrderSection,
 	type ProvisionResult,
+	pageToc,
 	provisionChangeSummary,
 	runCeiling,
+	SETTINGS_TOC,
 	SessionSection,
 	SettingsPage,
 	shortProvisionLines,
@@ -251,6 +254,9 @@ describe("GitHostsSection GitHub App form", () => {
 			// The GitHub token block in the same section checks its state on mount.
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			// The turn-token block in the same section loads its rows on mount.
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			if (url.endsWith("/api/git-hosts/github-app")) {
 				postCalls += 1;
 				postBody = JSON.parse(String(init?.body));
@@ -363,6 +369,8 @@ describe("GitHostsSection GitHub host", () => {
 			}
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: view.githubHost, tokens: [] });
 			const hit = extra(url, init);
 			if (hit !== undefined) return hit;
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
@@ -402,6 +410,8 @@ describe("GitHostsSection GitHub host", () => {
 			}
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: fixture.githubHost, tokens: [] });
 			if (
 				url.endsWith("/api/settings/github-host") &&
 				init?.method === "POST"
@@ -1320,6 +1330,8 @@ describe("GitHostsSection global SSH key", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			if (url.endsWith("/api/git-hosts/ssh/pending"))
 				return ok({
 					id: "abc123",
@@ -2746,6 +2758,8 @@ describe("GitHostsSection board GitHub token reuse", () => {
 			}
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: fixture.githubHost, tokens: [] });
 			const hit = extra(url, init);
 			if (hit !== undefined) return hit;
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
@@ -6019,6 +6033,285 @@ describe("AlateSection provision result", () => {
 	});
 });
 
+// The "Read-only GitHub token for turns" block: the check's verdict drives the status
+// line, a write row waits for an explicit confirm, an error row for a re-check, and
+// hosted mode hides the block with its card (docs/specs/turn-read-token.md).
+describe("GitHostsSection turn GitHub token", () => {
+	const ok = (body: unknown): Response =>
+		new Response(JSON.stringify(body), {
+			status: 200,
+			headers: { "Content-Type": "application/json" },
+		});
+	const gitHostsView = {
+		tokens: [],
+		globalKey: null,
+		githubApp: null,
+		githubHost: "acme.ghe.com",
+	};
+	/** A stored row for the configured host; tests override the verdict fields. */
+	const row = (over: Record<string, unknown>): unknown => ({
+		host: "acme.ghe.com",
+		tokenSet: true,
+		tokenReadable: true,
+		status: "ok",
+		detail: "read-only on every project repository",
+		confirmed: false,
+		...over,
+	});
+	/** Mock for the section's loads; `turn` serves the GET, every POST body lands in
+	 *  `posts`, and `answer` returns the row a POST answers with. */
+	const baseMock = (
+		turn: unknown,
+		posts: { url: string; body: unknown }[],
+		answer?: () => unknown,
+	): typeof fetch =>
+		(async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		): Promise<Response> => {
+			const url = String(input);
+			if (url.endsWith("/api/git-hosts") && (init?.method ?? "GET") === "GET")
+				return ok(gitHostsView);
+			if (url.endsWith("/api/settings/github-token"))
+				return ok({ tokenSet: false, expiresAt: null });
+			if (url.includes("/api/settings/turn-github-token")) {
+				if ((init?.method ?? "GET") === "GET") return ok(turn);
+				posts.push({
+					url: url.replace(/^.*\/api/, "/api"),
+					body: JSON.parse(String(init?.body)),
+				});
+				return ok(answer?.() ?? {});
+			}
+			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
+		}) as typeof fetch;
+	/** Lets the turn block's requests land: one act per pending microtask lane. */
+	const settle = async (): Promise<void> => {
+		for (let k = 0; k < 5; k++)
+			await act(async () => {
+				await Bun.sleep(0);
+			});
+	};
+
+	test("an ok row says turns can use the token", async () => {
+		const { container, unmount } = await mountSection(
+			baseMock({ host: "acme.ghe.com", tokens: [row({})] }, []),
+		);
+		try {
+			const block = container.querySelector("#turn-github-token-block");
+			if (block === null) throw new Error("turn token block missing");
+			expect(block.textContent).toContain("Turns can use this token");
+			// The configured host and github.com render; no token value ever shows.
+			expect(block.querySelectorAll("input[type='password']").length).toBe(2);
+			expect(
+				block.querySelector(
+					"input[aria-label='Read-only GitHub token for acme.ghe.com']",
+				),
+			).not.toBeNull();
+			expect(
+				block.querySelector(
+					"input[aria-label='Read-only GitHub token for github.com']",
+				),
+			).not.toBeNull();
+			expect(block.textContent).not.toContain("Use anyway");
+			expect(block.textContent).not.toContain("Check again");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a write row warns and waits for Use anyway, which confirms it", async () => {
+		const posts: { url: string; body: unknown }[] = [];
+		const { container, unmount } = await mountSection(
+			baseMock(
+				{
+					host: "acme.ghe.com",
+					tokens: [
+						row({ status: "write", detail: "token can push to octo/repo" }),
+					],
+				},
+				posts,
+				() =>
+					row({
+						status: "write",
+						detail: "token can push to octo/repo",
+						confirmed: true,
+					}),
+			),
+		);
+		try {
+			const block = container.querySelector("#turn-github-token-block");
+			if (block === null) throw new Error("turn token block missing");
+			expect(block.textContent).toContain("token can push to octo/repo");
+			const useAnyway = [...block.querySelectorAll("button")].find(
+				(b) => b.textContent === "Use anyway",
+			);
+			if (useAnyway === undefined) throw new Error("Use anyway button missing");
+			await act(async () => {
+				useAnyway.click();
+			});
+			await settle();
+			expect(posts).toEqual([
+				{
+					url: "/api/settings/turn-github-token/confirm",
+					body: { host: "acme.ghe.com" },
+				},
+			]);
+			// Confirmed: the row reads as in use and the button goes.
+			expect(block.textContent).toContain("· in use");
+			expect(
+				[...block.querySelectorAll("button")].some(
+					(b) => b.textContent === "Use anyway",
+				),
+			).toBe(false);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an error row shows the detail and Check again, which re-checks", async () => {
+		const posts: { url: string; body: unknown }[] = [];
+		const { container, unmount } = await mountSection(
+			baseMock(
+				{
+					host: "acme.ghe.com",
+					tokens: [
+						row({ status: "error", detail: "GitHub rejected the token" }),
+					],
+				},
+				posts,
+				() => row({ detail: "" }),
+			),
+		);
+		try {
+			const block = container.querySelector("#turn-github-token-block");
+			if (block === null) throw new Error("turn token block missing");
+			expect(block.textContent).toContain("GitHub rejected the token");
+			const checkAgain = [...block.querySelectorAll("button")].find(
+				(b) => b.textContent === "Check again",
+			);
+			if (checkAgain === undefined)
+				throw new Error("Check again button missing");
+			await act(async () => {
+				checkAgain.click();
+			});
+			await settle();
+			expect(posts).toEqual([
+				{
+					url: "/api/settings/turn-github-token/recheck",
+					body: { host: "acme.ghe.com" },
+				},
+			]);
+			// The re-check passed: the row reads as usable and the old detail is gone.
+			expect(block.textContent).toContain("Turns can use this token");
+			expect(block.textContent).not.toContain("GitHub rejected the token");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("an unreadable row asks for the token again", async () => {
+		const { container, unmount } = await mountSection(
+			baseMock(
+				{ host: "acme.ghe.com", tokens: [row({ tokenReadable: false })] },
+				[],
+			),
+		);
+		try {
+			const block = container.querySelector("#turn-github-token-block");
+			if (block === null) throw new Error("turn token block missing");
+			expect(block.textContent).toContain("Unreadable — enter it again");
+			expect(block.textContent).not.toContain("Turns can use this token");
+			expect(block.textContent).not.toContain("Use anyway");
+			expect(block.textContent).not.toContain("Check again");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("Save posts host and token, shows the checked row and clears the input", async () => {
+		const posts: { url: string; body: unknown }[] = [];
+		const { container, unmount } = await mountSection(
+			baseMock({ host: "acme.ghe.com", tokens: [] }, posts, () => row({})),
+		);
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				"input[aria-label='Read-only GitHub token for acme.ghe.com']",
+			);
+			const form = input?.closest("form");
+			if (
+				input === null ||
+				input === undefined ||
+				form === null ||
+				form === undefined
+			)
+				throw new Error("turn token row did not render");
+			await act(async () => {
+				typeInto(input, "tok-read-1");
+				onChangeOf(input)({ target: input, currentTarget: input });
+			});
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			await settle();
+			expect(posts).toEqual([
+				{
+					url: "/api/settings/turn-github-token",
+					body: { host: "acme.ghe.com", token: "tok-read-1" },
+				},
+			]);
+			const block = container.querySelector("#turn-github-token-block");
+			if (block === null) throw new Error("turn token block missing");
+			expect(block.textContent).toContain("Turns can use this token");
+			// The pasted token never comes back and the input is clear.
+			expect(block.textContent).not.toContain("tok-read-1");
+			expect(input.value).toBe("");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a github.com host renders one row", async () => {
+		const { container, unmount } = await mountSection(
+			baseMock(
+				{ host: "github.com", tokens: [row({ host: "github.com" })] },
+				[],
+			),
+		);
+		try {
+			const block = container.querySelector("#turn-github-token-block");
+			if (block === null) throw new Error("turn token block missing");
+			// github.com is the configured host: no second row joins it.
+			expect(block.querySelectorAll("input[type='password']").length).toBe(1);
+			expect(
+				block.querySelector(
+					"input[aria-label='Read-only GitHub token for github.com']",
+				),
+			).not.toBeNull();
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("hosted mode hides the block with its card", () => {
+		expect(hostedHidden(false, "turn-github-token-block")).toBe(false);
+		expect(hostedHidden(true, "turn-github-token-block")).toBe(true);
+		// The block is on the general TOC under the GitHub card.
+		const blocks =
+			SETTINGS_TOC.find((g) => g.id === "git-group")?.sections.find(
+				(s) => s.id === "git-hosts-section",
+			)?.blocks ?? [];
+		expect(blocks.map((b) => b.label)).toContain("Turn GitHub token");
+		// The hosted TOC drops the whole GitHub card, so the block goes with it.
+		expect(
+			pageToc(true, true).some((g) =>
+				g.sections.some((s) =>
+					(s.blocks ?? []).some((b) => b.id === "turn-github-token-block"),
+				),
+			),
+		).toBe(false);
+	});
+});
+
 // OTTR-806: every stored-secret surface says "Token unreadable, enter it again"
 // when the server reports the stored value as unreadable, and stays quiet when
 // it is readable. The wording mirrors the Jira connections' warn chip.
@@ -6046,6 +6339,8 @@ describe("Unreadable stored secrets", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: true, tokenReadable: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountSection(fetchMock);
@@ -6072,6 +6367,8 @@ describe("Unreadable stored secrets", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: true, tokenReadable: true, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountSection(fetchMock);
@@ -6105,6 +6402,8 @@ describe("Unreadable stored secrets", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountSection(fetchMock);
@@ -6138,6 +6437,8 @@ describe("Unreadable stored secrets", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountSection(fetchMock);
@@ -6169,6 +6470,8 @@ describe("Unreadable stored secrets", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountSection(fetchMock);
@@ -6201,6 +6504,8 @@ describe("Unreadable stored secrets", () => {
 				});
 			if (url.endsWith("/api/settings/github-token"))
 				return ok({ tokenSet: false, expiresAt: null });
+			if (url.endsWith("/api/settings/turn-github-token"))
+				return ok({ host: "github.com", tokens: [] });
 			throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 		}) as typeof fetch;
 		const { container, unmount } = await mountSection(fetchMock);

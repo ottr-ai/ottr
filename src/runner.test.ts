@@ -3610,6 +3610,145 @@ describe("startRun worker dispatch", () => {
 		}
 	});
 
+	test("githubReadEnv rides the worker request after the ambient token names are gone", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-read-"));
+		let body: WorkerRequest | null = null;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				body = (await req.json()) as WorkerRequest;
+				return new Response("spawn failed: recorded", { status: 500 });
+			},
+		});
+		const names = [
+			"GH_TOKEN",
+			"GITHUB_TOKEN",
+			"GH_ENTERPRISE_TOKEN",
+			"GITHUB_ENTERPRISE_TOKEN",
+		];
+		const saved: Record<string, string | undefined> = {};
+		for (const n of names) {
+			saved[n] = process.env[n];
+			process.env[n] = "ambient";
+		}
+		try {
+			const handle = startRun({
+				...baseOpts(dir, join(dir, "run.log")),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				githubReadEnv: {
+					GH_HOST: "acme.ghe.com",
+					GH_ENTERPRISE_TOKEN: "tok-ent",
+				},
+			});
+			await handle.done;
+			expect(body).not.toBeNull();
+			// The delivered read-only token rides its dedicated field...
+			expect(body!.githubReadEnv).toEqual({
+				GH_HOST: "acme.ghe.com",
+				GH_ENTERPRISE_TOKEN: "tok-ent",
+			});
+			// ...and no ambient GitHub token name reaches the request env.
+			expect(body!.env).not.toHaveProperty("GH_TOKEN");
+			expect(body!.env).not.toHaveProperty("GITHUB_TOKEN");
+			expect(body!.env).not.toHaveProperty("GH_ENTERPRISE_TOKEN");
+			expect(body!.env).not.toHaveProperty("GITHUB_ENTERPRISE_TOKEN");
+		} finally {
+			for (const n of names) {
+				if (saved[n] === undefined) delete process.env[n];
+				else process.env[n] = saved[n];
+			}
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a worker dispatch without githubReadEnv carries none of the four ambient names", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-ambient-"));
+		let forwarded: Record<string, string> | null = null;
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				const body: unknown = await req.json();
+				if (
+					typeof body === "object" &&
+					body !== null &&
+					"env" in body &&
+					typeof body.env === "object" &&
+					body.env !== null
+				)
+					forwarded = body.env as Record<string, string>;
+				return new Response("spawn failed: recorded", { status: 500 });
+			},
+		});
+		const names = [
+			"GH_TOKEN",
+			"GITHUB_TOKEN",
+			"GH_ENTERPRISE_TOKEN",
+			"GITHUB_ENTERPRISE_TOKEN",
+		];
+		const saved: Record<string, string | undefined> = {};
+		for (const n of names) {
+			saved[n] = process.env[n];
+			process.env[n] = "ambient";
+		}
+		try {
+			const handle = startRun({
+				...baseOpts(dir, join(dir, "run.log")),
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+			});
+			await handle.done;
+			expect(forwarded).not.toBeNull();
+			for (const n of names) expect(forwarded).not.toHaveProperty(n);
+			expect(JSON.stringify(forwarded)).not.toContain("ambient");
+		} finally {
+			for (const n of names) {
+				if (saved[n] === undefined) delete process.env[n];
+				else process.env[n] = saved[n];
+			}
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("a local dispatch ignores githubReadEnv", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-local-read-"));
+		// The delivered names must be absent from the boot env too: a local run
+		// inherits it as-is, and only the delivered env must be provably ignored.
+		const saved = {
+			GH_HOST: process.env.GH_HOST,
+			GH_ENTERPRISE_TOKEN: process.env.GH_ENTERPRISE_TOKEN,
+		};
+		delete process.env.GH_HOST;
+		delete process.env.GH_ENTERPRISE_TOKEN;
+		try {
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const handle = startRun({
+				...baseOpts(dir, join(dir, "run.log")),
+				launcher: (_c, _a, options) => {
+					seen.push(options);
+					const fake = new FakeOmp();
+					queueMicrotask(() => fake.emit("close", 0));
+					return fake as unknown as ChildProcess;
+				},
+				githubReadEnv: {
+					GH_HOST: "acme.ghe.com",
+					GH_ENTERPRISE_TOKEN: "tok-ent",
+				},
+			});
+			await handle.done;
+			expect(seen).toHaveLength(1);
+			expect(seen[0]?.env).not.toHaveProperty("GH_HOST");
+			expect(seen[0]?.env).not.toHaveProperty("GH_ENTERPRISE_TOKEN");
+		} finally {
+			if (saved.GH_HOST === undefined) delete process.env.GH_HOST;
+			else process.env.GH_HOST = saved.GH_HOST;
+			if (saved.GH_ENTERPRISE_TOKEN === undefined)
+				delete process.env.GH_ENTERPRISE_TOKEN;
+			else process.env.GH_ENTERPRISE_TOKEN = saved.GH_ENTERPRISE_TOKEN;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("kill on a worker run settles killed immediately", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-"));
 		// A daemon that never answers keeps the run unsettled, which is the kill path.
