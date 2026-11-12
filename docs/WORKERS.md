@@ -193,47 +193,67 @@ omp. Two parts do the work:
    worker stuck never takes the image that its container runs.
 
    Workers roll first, one at a time, in `compose ps` order, and only a worker whose
-   image changed:
+   image changed. The roll is idle-first: when an image or a board seed is pending,
+   the script checks each runner's turn count at that moment (`GET /api/drain`, and
+   the worker's own `GET /detached` for detached runs the board cannot see). A
+   runner with no turn recreates at once, with no hold. A busy runner is skipped.
+   Queued cards keep starting; the update only waits:
 
-   - The script holds that one worker's new turns (`POST /api/drain` with
-     `runner`). The worker finishes its running turns while every other worker and
-     the server keep working, and no hold shows in the **Notices**.
-   - The script polls every 30 s until that worker runs no turn and nothing is
-     preparing. A hold lasts at most 1 hour. If the worker still runs a turn then,
-     the script ends its hold (`DELETE /api/drain?runner=`), the worker stays on
-     the old image, and a later run tries again. The roll goes on with the next
-     worker, and the run exits 0. The roll also waits for detached runs a
-     previous server restart left on that worker (the board cannot see them); a
-     worker that answers no `/detached` route reads as having none.
-   - When the worker is idle, the script recreates only its container
-     (`up -d --no-deps --wait <service>`). The worker's compose healthcheck probes
-     its own `GET /healthz`, so the `--wait` fails when the new container never
-     turns healthy. A failed recreate stops the roll at once (exit 1): the workers
-     that did not roll yet stay on the old image, and the server does not restart.
+   - An idle runner recreates at once (`up -d --no-deps --wait <service>`). The
+     worker's compose healthcheck probes its own `GET /healthz`, so the `--wait`
+     fails when the new container never turns healthy. A failed recreate stops
+     the roll at once (exit 1): the workers that did not roll yet stay on the
+     old image, and the server does not restart.
    - Healthy is not connected: the script then waits, from the server, until it
      reaches the worker's `/healthz` again (at most 5 minutes). A failure here
      stops the roll like a failed health check.
-   - Connected: the script releases the worker's hold, and the next worker rolls.
-     A worker hostname that no runner lists (not in `OTTR_WORKER_URLS`, so no turn
-     can reach it) recreates without a hold and without the turns wait.
+   - Connected: the next worker rolls. A worker hostname that no runner lists
+     (not in `OTTR_WORKER_URLS`, so no turn can reach it) recreates without a
+     hold and without the turns wait.
+   - A busy runner is skipped with no hold: the script logs
+     `<service> runs turns: the restart waits for an idle run`, the runner stays
+     on the old image, and a later hourly run rolls it. The detached-runs probe
+     counts in this check, because the board cannot see the detached runs; a
+     worker that answers no `/detached` route reads as having none.
+
+   The hold rule returns after a long wait. A deferred restart records its start
+   time in `/etc/ottr/restart-waiting-since` on the board-config volume (the same
+   field the deferred-restart report and the board bell notice read). When the
+   pending restart has waited longer than 6 hours, the run holds the busy
+   runner's new turns (`POST /api/drain` with `runner`) instead of skipping it:
+   the worker finishes its running turns while every other worker and the server
+   keep working, and no hold shows in the **Notices**. The script polls every
+   30 s and releases the hold (`DELETE /api/drain?runner=`) when the worker is
+   idle and connected again. The hold lasts at most 1 hour. If the worker still
+   runs a turn then, the script ends the hold, the worker stays on the old
+   image, and a later run tries again; the roll goes on with the next worker,
+   and the run exits 0. The 6 hour threshold is the same one that arms the
+   board's bell notice after 6 h of waiting (`RESTART_WAIT_WARN_MS` in the
+   script).
 
    The server rolls last, only when no worker is stuck, and with no board-wide
-   hold: the workers hold per runner for the seconds of the restart window, and
-   a busy worker keeps its turn alive by detaching it, so worker turns survive
-   the restart:
+   hold. The server step is idle-first too: it restarts only when no turn needs
+   it, so the server's own runner (`local`) must run no turn. The workers hold
+   per runner for the seconds of the restart window, and a busy worker keeps its
+   turn alive by detaching it, so worker turns survive the restart:
 
-   - When the server's image changed or a fresh seed waits, the script holds
-     `local` (`POST /api/drain` with `runner: local`). The server's own turns
-     (merge turns, retro, the board check, the release publish) are children of
-     the server process and cannot survive the restart, so they finish first,
-     while work turns on the workers keep starting and running. The script polls
-     every 30 s and renews the hold each time. The hold lasts at most 1 hour; if
-     a local turn still runs then, the script ends the holds (DELETE
-     `?runner=` for `local` and every worker), so the queued cards start, and a
-     later run tries the restart again. If the board refuses a renewal, the
-     script stops waiting the same way. The host command starts no second cycle
-     while this cycle runs. The restart uses the image that this cycle built.
-     A later cycle deploys newer commits.
+   - When the server's image changed or a fresh seed waits, the script first
+     checks whether `local` runs a turn. When it does, the script logs
+     `local runs turns: the restart waits for an idle run`, and the server step
+     waits for a later run. The workers keep starting and running turns.
+   - After 6 hours of waiting, the hold-based drain returns, with the same
+     `/etc/ottr/restart-waiting-since` threshold as the worker roll: the script
+     holds `local` (`POST /api/drain` with `runner: local`). The server's own
+     turns (merge turns, retro, the board check, the release publish) are
+     children of the server process and cannot survive the restart, so they
+     finish first, while work turns on the workers keep starting and running.
+     The script polls every 30 s and renews the hold each time. The hold lasts
+     at most 1 hour; if a local turn still runs then, the script ends the holds
+     (DELETE `?runner=` for `local` and every worker), so the queued cards
+     start, and a later run tries the restart again. If the board refuses a
+     renewal, the script stops waiting the same way. The host command starts no
+     second cycle while this cycle runs. The restart uses the image that this
+     cycle built. A later cycle deploys newer commits.
    - The script then holds every worker runner. The holds stop new dispatches
      for the seconds of the restart window; the cards stay queued, and no
      board-wide notice shows, because these are per-runner holds.
@@ -253,8 +273,9 @@ omp. Two parts do the work:
      requeued for the restart. The recreate or restart clears every in-memory
      hold, so no undrain is needed. When the server's image is unchanged and no
      seed waits, no server step runs.
-   - When the server step defers (a local turn that will not end, or a worker
-     that cannot detach), the run skips the final whole-stack up, leaves the
+   - When the server step defers (a local turn that runs at the idle check, a
+     local turn that does not end within the 1 hour hold, or a worker that
+     cannot detach), the run skips the final whole-stack up, leaves the
      seed record unwritten, and a later run seeds and records again. A deferred
      restart also surfaces on the board: after 6 h of waiting the bell shows a
      notice with both commits, the waiting cards, and the exact restart
@@ -285,11 +306,12 @@ omp. Two parts do the work:
    `/tmp of <runner> is full (<free>)` notice until the space is back.
 
    When the board is too old for the runner API (`GET /api/drain` answers
-   nothing), the script keeps the old whole-board rule: it holds new turns on the
-   whole board, waits for at most 1 hour, and restarts the stack at once with
-   `up -d --wait` when no turn runs. A board too old for the hold keeps the old
-   containers until a later run. When no board runs at all, it starts the stack
-   without counting turns.
+   nothing), the script keeps the old whole-board rule, with the old hold-first
+   behavior and no idle phase: it holds new turns on the whole board, waits for
+   at most 1 hour, and restarts the stack at once with `up -d --wait` when no
+   turn runs. A board too old for the hold keeps the old containers until a
+   later run. When no board runs at all, it starts the stack without counting
+   turns.
 
 3. A host-only override can build further services from their own local git checkouts
    (the compose files in this repo name none, so the script discovers them in

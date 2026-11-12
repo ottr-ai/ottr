@@ -1672,18 +1672,23 @@ describe("rolling restart", () => {
 	test("the roll drains, recreates, probes and releases one worker at a time, and the server rolls last", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
-		// worker-a runs one turn at probe time; it drains over one poll.
+		// worker-a runs one turn at probe time; it drains over one poll. The wait
+		// clock names a restart pending for 7 h, so the hold phase runs: the run
+		// holds new turns again, the rule from before the idle-first change.
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
 			gets: [st(1, 0), st(0, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
-		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
 			PS,
 			BUILD,
 			CFGJSON,
 			GET,
+			// The run reads the wait clock once, before the roll, to pick its phase.
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
 			GET,
@@ -1729,12 +1734,172 @@ describe("rolling restart", () => {
 		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
 	}, 60_000);
 
+	test("an idle board rolls every runner and the server in one run", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// No wait clock: the pending restart has waited nothing, so the run is
+		// idle-first — no hold waits any turns out; only the server step holds
+		// the workers for the seconds of the restart window.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			GET,
+			CAT_WAIT,
+			...COMPARE_SVC("worker-a"),
+			DETACHED_SVC("worker-a"),
+			UP_SVC("worker-a"),
+			HEALTH,
+			...COMPARE_SVC("worker-b"),
+			DETACHED_SVC("worker-b"),
+			UP_SVC("worker-b"),
+			HEALTH,
+			...COMPARE_SVC("server"),
+			// The server step reads the runners fresh, holds both workers for the
+			// restart window, and recreates. Local never holds: nothing waits.
+			GET,
+			HOLD,
+			HOLD,
+			UP_SVC("server"),
+			UP,
+			DEPLOYED(main),
+			PRUNE,
+		]);
+		// The only holds are the restart window's, one per worker; local skips.
+		const posts = f.drains.filter((l) => l.includes("'POST'"));
+		expect(posts.map((_, i) => postBody(f, i))).toEqual([
+			{ runner: "worker-a" },
+			{ runner: "worker-b" },
+		]);
+		// No hold ever released: nothing was held outside the window, and the
+		// recreate clears the window holds.
+		expect(f.drains.filter((l) => l.includes("'DELETE'"))).toEqual([]);
+		expect(f.logs.join("\n")).toContain("the stack runs main at");
+	}, 60_000);
+
+	test("a busy runner sets no hold, and the next run rolls it idle", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// worker-a runs a turn at the check; the run skips it and rolls worker-b.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0)],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		// No hold of any kind: the busy runner is never held, and the idle one
+		// rolls without one.
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
+		expect(f.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			GET,
+			CAT_WAIT,
+			...COMPARE_SVC("worker-a"),
+			// The busy check reads the board and skips before the worker's own
+			// detached-runs probe: no probe ran for worker-a.
+			...COMPARE_SVC("worker-b"),
+			DETACHED_SVC("worker-b"),
+			UP_SVC("worker-b"),
+			HEALTH,
+			// The run still prunes, then the skipped runner's turn streams through
+			// the server, so the server step waits for a later run, and the run
+			// ends with the wait report.
+			PRUNE,
+			CAT_WAIT,
+			WAIT_WRITE(Date.UTC(2026, 9, 16)),
+			WAIT,
+			CAT_BUILD,
+			WAIT_RECORD_ANY,
+		]);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.logs.join("\n")).toContain(
+			"worker-a runs turns: the restart waits for an idle run",
+		);
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
+		// The next run: worker-a is idle now, and the kept clock is younger than
+		// 6 h, so the run is idle-first again and rolls worker-a without a hold.
+		const f2 = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16)),
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f2.deps)).toBe(0);
+		expect(f2.calls).toEqual([
+			PS,
+			BUILD,
+			CFGJSON,
+			GET,
+			CAT_WAIT,
+			...COMPARE_SVC("worker-a"),
+			DETACHED_SVC("worker-a"),
+			UP_SVC("worker-a"),
+			HEALTH,
+			...COMPARE_SVC("worker-b"),
+			DETACHED_SVC("worker-b"),
+			UP_SVC("worker-b"),
+			HEALTH,
+			...COMPARE_SVC("server"),
+			GET,
+			HOLD,
+			HOLD,
+			UP_SVC("server"),
+			UP,
+			DEPLOYED(main),
+			PRUNE,
+		]);
+		expect(f2.logs.join("\n")).toContain("the stack runs main at");
+	}, 60_000);
+
+	test("the hold phase starts only after the wait passes 6 h", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// Exactly 6 h: the hold phase has not started, so the busy runner is
+		// skipped with no hold.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 6 * 60 * 60_000),
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
+		expect(f.logs.join("\n")).toContain(
+			"worker-a runs turns: the restart waits for an idle run",
+		);
+		// One millisecond past 6 h: the hold phase runs, and the run holds the
+		// busy runner's new turns.
+		const f2 = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(2, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 6 * 60 * 60_000 - 1),
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f2.deps)).toBe(0);
+		expect(
+			f2.drains.filter((l) => l.includes("'POST'")).length,
+		).toBeGreaterThan(0);
+		expect(f2.logs.join("\n")).toContain(
+			"worker-a still runs its turns: the roll follows when they finish",
+		);
+	}, 60_000);
+
 	test("a detached run the board cannot see holds the roll until the worker reports it finished", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
 		// worker-a's board count reaches 0 after one poll, but its /detached still
 		// lists a running entry: an earlier server step detached the run, and the
-		// new server re-binds its row, so the board cannot count it.
+		// new server re-binds its row, so the board cannot count it. The wait
+		// clock is 7 h old, so the hold phase runs and the hold waits the probe out.
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
@@ -1743,13 +1908,15 @@ describe("rolling restart", () => {
 				'[{"id":"r1","running":true}]',
 				'[{"id":"r1","running":false}]',
 			],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
-		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toEqual([
 			PS,
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
 			GET,
@@ -1789,6 +1956,30 @@ describe("rolling restart", () => {
 		).toHaveLength(1);
 	}, 60_000);
 
+	test("a detached run the board cannot see skips an idle-first runner", async () => {
+		const { main, ci } = checkout();
+		bump(ci, "1.1.0");
+		// The board counts no turn, but the worker's own /detached still runs one:
+		// the idle-first check asks the worker, and the runner is skipped like a
+		// busy one. No hold is ever set.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0)],
+			// worker-a's probe answers a running detached entry; the next answer
+			// (the last one repeats) leaves worker-b idle.
+			detachedList: ['[{"id":"r1","running":true}]', "[]"],
+		});
+		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
+		expect(f.calls).not.toContain(UP_SVC("worker-a"));
+		expect(f.calls).toContain(UP_SVC("worker-b"));
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.logs.join("\n")).toContain(
+			"worker-a runs turns: the restart waits for an idle run",
+		);
+	}, 60_000);
+
 	test("a detached run that outlasts the hold leaves the runner stuck, and nothing recreates", async () => {
 		const { main } = checkout();
 		const data = checkout();
@@ -1797,11 +1988,13 @@ describe("rolling restart", () => {
 			newImage: true,
 			running: RUNNING3,
 			gets: [st(0, 0)],
-			// The probe answers "running" at every poll, for both workers.
+			// The probe answers "running" at every poll, for both workers. The
+			// wait clock is 7 h old, so the hold phase runs and the holds wait.
 			detachedList: ['[{"id":"r1","running":true}]'],
 			seedRecord: unrecorded,
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -1814,10 +2007,10 @@ describe("rolling restart", () => {
 		expect(f.calls).not.toContain(UP_SVC("worker-b"));
 		expect(f.calls).not.toContain(UP_SVC("server"));
 		expect(f.calls).not.toContain(UP);
-		// The stuck roll ends with the wait report: both workers kept their hour.
-		expect(f.calls.slice(-5)).toEqual([
+		// The stuck roll ends with the wait report: both workers kept their hour,
+		// and the kept clock stays (the report read it, but wrote nothing).
+		expect(f.calls.slice(-4)).toEqual([
 			CAT_WAIT,
-			WAIT_WRITE(Date.UTC(2026, 9, 16) + 120 * 60_000),
 			WAIT,
 			CAT_BUILD,
 			WAIT_RECORD_ANY,
@@ -1831,9 +2024,8 @@ describe("rolling restart", () => {
 		expect(f.logs.join("\n")).toContain(
 			"the server restart waits for a later run",
 		);
-		expect(f.seedWrites).toEqual([
-			WAIT_WRITE(Date.UTC(2026, 9, 16) + 120 * 60_000),
-		]);
+		// The clock was already kept, so the report wrote nothing.
+		expect(f.seedWrites).toEqual([]);
 	}, 60_000);
 
 	test("a failed detached-list read stops the roll", async () => {
@@ -1846,14 +2038,15 @@ describe("rolling restart", () => {
 			detachedList: ["!fail"],
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
-		// Fail closed: the roll ends at once, and no container recreates.
+		// Fail closed: the idle-first check probes the worker before any hold,
+		// the read fails, and the roll ends at once with no container recreated.
 		expect(f.calls).toEqual([
 			PS,
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
-			HOLD,
 			DETACHED_SVC("worker-a"),
 		]);
 		expect(f.logs.join("\n")).toContain(
@@ -1906,6 +2099,9 @@ describe("rolling restart", () => {
 			seedRecord: unrecorded,
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			// The restart has waited 7 h, so the hold phase runs: the run holds
+			// the busy runner's new turns and waits them out for at most 1 h.
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -1920,10 +2116,9 @@ describe("rolling restart", () => {
 		// would recreate the stuck worker and the server, and that kills the stuck turn.
 		expect(f.calls).toContain(UP_SVC("worker-b"));
 		expect(f.calls).not.toContain(UP);
-		// The stuck roll ends with the wait report.
-		expect(f.calls.slice(-5)).toEqual([
+		// The stuck roll ends with the wait report; the kept clock stays.
+		expect(f.calls.slice(-4)).toEqual([
 			CAT_WAIT,
-			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
 			WAIT,
 			CAT_BUILD,
 			WAIT_RECORD_ANY,
@@ -1937,9 +2132,7 @@ describe("rolling restart", () => {
 		// The stuck runner is undrained, and the seed record waits for the restart.
 		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
 		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
-		expect(f.seedWrites).toEqual([
-			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
-		]);
+		expect(f.seedWrites).toEqual([]);
 	}, 60_000);
 
 	test("a refused renewal ends the wait: the runner is released and the roll stops", async () => {
@@ -1950,6 +2143,7 @@ describe("rolling restart", () => {
 			running: RUNNING3,
 			gets: [st(1, 0)], // worker-a keeps its turn at every read
 			hold: [0, 1], // the initial hold is accepted, the renewal is refused
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
 		// The refused renewal ends worker-a's wait at the first poll, not at the hour;
@@ -1968,22 +2162,21 @@ describe("rolling restart", () => {
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
-			gets: [st(2, 0)], // worker-a keeps its turn at every read
+			gets: [st(2, 0)], // worker-a is busy at the check, so the run skips it
 			deployedRecord: old,
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
-		expect(f.waits).toHaveLength(120);
-		// The deferral's last line names both commits: what the image holds and
-		// what the running server still has.
+		// The busy runner is skipped with no hold and no wait, and the deferral's
+		// last line names both commits: what the image holds and what the running
+		// server still has.
+		expect(f.waits).toHaveLength(0);
 		expect(f.logs.at(-1)).toBe(
 			`the image holds main at ${short} with omp 1.0.0; the server still runs ${old} until a later run restarts it`,
 		);
 		expect(f.logs.join("\n")).not.toContain("the stack runs main at");
 		expect(f.logs.join("\n")).toContain("the server restart has waited 0 min");
 		// The first deferral starts the wait clock next to the seed record.
-		expect(f.seedWrites).toEqual([
-			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
-		]);
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
 	}, 60_000);
 
 	test("a deferred server restart records the commit, the start time and the holding ids", async () => {
@@ -2007,11 +2200,12 @@ describe("rolling restart", () => {
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.restartWaits).toHaveLength(1);
 		// The record names what the image holds (the run's own head, read after
-		// the preflight fast-forward), when the wait began (the same
-		// epoch the wait clock got), how far the server lags, and the ids.
+		// the preflight fast-forward), when the wait began (the skipped runner
+		// deferred at once, so the clock got the run's own epoch), how far the
+		// server lags, and the ids.
 		expect(waitRecord(f)).toEqual({
 			commit: must(main, "log", "-1", "--format=%h"),
-			since: Date.UTC(2026, 9, 16) + 60 * 60_000,
+			since: Date.UTC(2026, 9, 16),
 			commits: 1,
 			turns: ["OTTR-9", "ALAT-87"],
 			// The exact recreate the server step runs, with the run's own compose
@@ -2019,9 +2213,7 @@ describe("rolling restart", () => {
 			command: "docker compose -f c.yml up -d --no-deps --wait server",
 		});
 		// The wait clock write still happened.
-		expect(f.seedWrites).toEqual([
-			WAIT_WRITE(Date.UTC(2026, 9, 16) + 60 * 60_000),
-		]);
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
 	}, 60_000);
 
 	test("a failed turns read still records the wait, with no turns", async () => {
@@ -2116,8 +2308,8 @@ describe("rolling restart", () => {
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
-			HOLD,
 			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 		]);
@@ -2195,19 +2387,17 @@ describe("rolling restart", () => {
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
-			HOLD,
 			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 			HEALTH,
-			FREE,
 			...COMPARE_SVC("worker-b"),
 			UP_SVC("worker-b"),
 			...COMPARE_SVC("server"),
-			// The step holds local, reads the runners fresh, then holds the idle
-			// worker-a; no runner lists local, so the wait ends at once, and no
-			// detach runs.
-			HOLD,
+			// The server step reads the runners fresh and holds the idle worker-a
+			// for the restart window; no runner lists local, so local skips the
+			// hold, and no detach runs.
 			GET,
 			HOLD,
 			UP_SVC("server"),
@@ -2230,6 +2420,7 @@ describe("rolling restart", () => {
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
@@ -2269,12 +2460,13 @@ describe("rolling restart", () => {
 			seedRun,
 			RM_SEEDFAIL,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
-			// Seed only, so the server restarts instead of recreating; the idle
-			// workers hold and skip their detach.
-			HOLD,
+			// Seed only, so the server restarts instead of recreating. The server
+			// step reads the runners fresh and holds both workers for the restart
+			// window; the workers are idle, so no detach runs.
 			GET,
 			HOLD,
 			HOLD,
@@ -2284,7 +2476,7 @@ describe("rolling restart", () => {
 			DEPLOYED(main),
 			PRUNE,
 		]);
-		expect(postBody(f, 0)).toEqual({ runner: "local" });
+		expect(postBody(f, 0)).toEqual({ runner: "worker-a" });
 		expect(f.calls).not.toContain(COUNT);
 		expect(f.seedWrites).toEqual([write, DEPLOYED(main)]);
 	}, 60_000);
@@ -2321,10 +2513,12 @@ describe("rolling restart", () => {
 			seedRun,
 			RM_SEEDFAIL,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
 			...COMPARE_SVC("worker-b"),
 			...COMPARE_SVC("server"),
-			HOLD,
+			// The server step reads the runners fresh, holds both workers for the
+			// restart window, and detaches the busy worker-a before the restart.
 			GET,
 			HOLD,
 			HOLD,
@@ -2341,17 +2535,14 @@ describe("rolling restart", () => {
 			.filter((l) => l.includes("'POST'"))
 			.map((_, i) => postBody(f, i)))
 			expect(body).toHaveProperty("runner");
-		// Local holds exactly once (the server step's hold), and no detach exec
-		// ever targets the server container or the idle local runner.
+		// The holds are the restart window's worker holds; local never holds in
+		// the idle-first server step, and no detach exec ever targets the server
+		// container or the idle local runner.
 		expect(
 			f.drains
 				.filter((l) => l.includes("'POST'"))
 				.map((_, i) => postBody(f, i)),
-		).toEqual([
-			{ runner: "local" },
-			{ runner: "worker-a" },
-			{ runner: "worker-b" },
-		]);
+		).toEqual([{ runner: "worker-a" }, { runner: "worker-b" }]);
 		expect(f.calls.join("\n")).not.toMatch(
 			/exec -T (server|local) bun -e <detach>/,
 		);
@@ -2374,20 +2565,18 @@ describe("rolling restart", () => {
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
-			HOLD,
 			DETACHED_SVC("worker-a"),
 			UP_SVC("worker-a"),
 			HEALTH,
-			FREE,
 			...COMPARE_SVC("worker-b"),
-			HOLD,
 			DETACHED_SVC("worker-b"),
 			UP_SVC("worker-b"),
 			HEALTH,
-			FREE,
 			...COMPARE_SVC("server"),
-			HOLD,
+			// The server step's fresh read sees worker-a busy; it detaches and
+			// the recreate takes the new image.
 			GET,
 			HOLD,
 			HOLD,
@@ -2436,11 +2625,13 @@ describe("rolling restart", () => {
 	test("a preparing turn holds every runner idle until it starts", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
-		// preparing is not attributable to one runner: the roll waits one poll for it.
+		// preparing is not attributable to one runner: the hold phase waits one
+		// poll for it (the wait clock is 7 h old, so holds run).
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
 			gets: [st(0, 0, 1), st(0, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.calls).toContain(GET);
@@ -2456,6 +2647,7 @@ describe("rolling restart", () => {
 			running: RUNNING3,
 			gets: [st(0, 0)],
 			hold: [0, 1], // worker-a's hold is accepted, worker-b's is refused
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(1);
 		expect(f.calls).toEqual([
@@ -2463,6 +2655,7 @@ describe("rolling restart", () => {
 			BUILD,
 			CFGJSON,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("worker-a"),
 			HOLD,
 			DETACHED_SVC("worker-a"),
@@ -2485,6 +2678,7 @@ describe("rolling restart", () => {
 			running: RUNNING3,
 			gets: [st(0, 0)],
 			free: [0, 1], // worker-a releases, worker-b's undrain fails
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.logs.join("\n")).toContain(
@@ -2497,7 +2691,12 @@ describe("rolling restart", () => {
 	test("a runner state that cannot be read mid-hold stops the roll", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
-		const f = fakes({ newImage: true, running: RUNNING3, gets: [st(1, 0)] });
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(1, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
+		});
 		let gets = 0;
 		const docker: Deps["docker"] = async (...a) => {
 			const line = a.join(" ");
@@ -2523,6 +2722,7 @@ describe("rolling restart", () => {
 			running: RUNNING3,
 			gets: [st(2, 0)],
 			free: 1,
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.logs.join("\n")).toContain(
@@ -2538,6 +2738,7 @@ describe("rolling restart", () => {
 			newImage: true,
 			running: RUNNING3,
 			gets: [st(1, 0), st(0, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		const scripts = new Set<string>();
 		const docker: Deps["docker"] = (...a) => {
@@ -2637,11 +2838,13 @@ describe("rolling restart", () => {
 	test("the first busy poll logs once, and each poll renews the hold", async () => {
 		const { main, ci } = checkout();
 		bump(ci, "1.1.0");
-		// worker-a runs its turn over three polls, then the roll proceeds.
+		// worker-a runs its turn over three polls, then the roll proceeds. The
+		// wait clock is 7 h old, so the hold phase runs.
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
 			gets: [st(1, 0), st(1, 0), st(1, 0), st(0, 0)],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		// The busy note names the runner once, and a clean roll never logs a hold
@@ -2850,6 +3053,7 @@ describe("rolling restart", () => {
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f c.yml"], f.deps, {
@@ -2878,6 +3082,7 @@ describe("rolling restart", () => {
 			newImage: true,
 			running: RUNNING3,
 			gets: [stl(0, 0, 1)], // the local hold never reaches zero turns
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f c.yml"], f.deps)).toBe(0);
 		// The local hold expired, so the server step and the whole-stack up wait for
@@ -2928,11 +3133,12 @@ describe("rolling restart", () => {
 		// The probe lists worker-a with a running turn (it holds); every later read
 		// drops worker-a entirely (the board restarted and lost its hold). The roll
 		// keeps polling instead of treating the vanished runner as idle, and waits
-		// for a later run.
+		// for a later run. The wait clock is 7 h old, so the hold phase runs.
 		const f = fakes({
 			newImage: true,
 			running: RUNNING3,
 			gets: [st(1, 0), onlyB(), onlyB()],
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(await updateImage(main, ["-f", "c.yml"], f.deps)).toBe(0);
 		expect(f.logs.join("\n")).toContain(
@@ -2992,14 +3198,17 @@ describe("rolling restart", () => {
 			// build the compare below reads its old image and it never rolls.
 			VM_BUILD,
 			GET,
+			CAT_WAIT,
 			...COMPARE_SVC("vm-runner"),
-			HOLD,
+			// Idle at the check, so the vm-runner rolls with no hold; a VM turn
+			// starts before the server step's fresh read and detaches instead.
 			DETACHED_SVC("vm-runner"),
 			UP_SVC("vm-runner"),
 			HEALTH,
-			FREE,
 			...COMPARE_SVC("server"),
-			HOLD,
+			// The server step's fresh read sees the vm-runner busy; holdWorkers
+			// holds it for the restart window (local skips), and the detach in
+			// its own container keeps the turn alive across the recreate.
 			GET,
 			HOLD,
 			DETACH_SVC("vm-runner"),
@@ -3008,8 +3217,9 @@ describe("rolling restart", () => {
 			DEPLOYED(main),
 			PRUNE,
 		]);
+		// The only hold is the restart window's hold for the vm-runner; local skips.
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toHaveLength(1);
 		expect(postBody(f, 0)).toEqual({ runner: "vm-runner" });
-		expect(postBody(f, 2)).toEqual({ runner: "vm-runner" });
 	}, 60_000);
 
 	test("a vm-runner image that does not build stops the run before any hold or recreate", async () => {
@@ -3095,10 +3305,13 @@ describe("rolling restart", () => {
 		const f = fakes({
 			running: RUNNING3,
 			gets: [st(0, 0)],
-			hold: [1], // the first hold of the server step is local's, and it is refused
+			// The hold phase's first hold is local's, and it is refused. The wait
+			// clock is 7 h old, so the hold phase runs.
+			hold: [1],
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -3121,10 +3334,11 @@ describe("rolling restart", () => {
 		const data = checkout();
 		const f = fakes({
 			running: RUNNING3,
-			gets: [st(0, 0), "!fail"], // the probe answers, the server step's read fails
+			gets: [st(0, 0), "!fail"], // the probe answers, the hold phase's fresh read fails
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -3146,13 +3360,15 @@ describe("rolling restart", () => {
 		const { main } = checkout();
 		const data = checkout();
 		// local stays busy across one renewal, then drains: the note prints once,
-		// and the renewal names local again.
+		// and the renewal names local again. The wait clock is 7 h old, so the
+		// hold phase runs and local drains under its hold.
 		const f = fakes({
 			running: RUNNING3,
 			gets: [st(0, 0), stl(0, 0, 1), stl(0, 0, 1), stl(0, 0, 0)],
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -3181,6 +3397,7 @@ describe("rolling restart", () => {
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
@@ -3207,9 +3424,10 @@ describe("rolling restart", () => {
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
-			await updateImage(main, ["-f", "c.yml"], f.deps, {
+			await updateImage(main, ["-f c.yml"], f.deps, {
 				ALATE_DATA: data.main,
 			}),
 		).toBe(0);
@@ -3218,11 +3436,44 @@ describe("rolling restart", () => {
 		);
 		expect(f.calls).not.toContain(RESTART);
 		expect(f.calls).not.toContain(UP);
-		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16) + 30_000)]);
+		// The kept clock stays: the deferral's report read it and wrote nothing.
+		expect(f.seedWrites).toEqual([]);
 		const deletes = f.drains.filter((l) => l.includes("'DELETE'"));
 		expect(deletes.some((l) => l.includes("local"))).toBe(true);
 		expect(deletes.some((l) => l.includes("worker-a"))).toBe(true);
 		expect(deletes.some((l) => l.includes("worker-b"))).toBe(true);
+	}, 60_000);
+
+	test("a busy local defers the idle-first server step before any hold", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		// Idle-first: the workers roll holdless, and the server step's fresh read
+		// finds local busy — the step defers before any hold, and the run ends
+		// with the wait report.
+		const f = fakes({
+			newImage: true,
+			running: RUNNING3,
+			gets: [st(0, 0), stl(0, 0, 1)],
+			seedRecord: "0".repeat(40),
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		expect(
+			await updateImage(main, ["-f c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		expect(f.calls).toContain(UP_SVC("worker-a"));
+		expect(f.calls).toContain(UP_SVC("worker-b"));
+		expect(f.calls).not.toContain(RESTART);
+		expect(f.calls).not.toContain(UP_SVC("server"));
+		expect(f.calls).not.toContain(UP);
+		expect(f.logs.join("\n")).toContain(
+			"local runs turns: the restart waits for an idle run",
+		);
+		// No hold anywhere: the deferral happened before the restart window.
+		expect(f.drains.filter((l) => l.includes("'POST'"))).toEqual([]);
+		expect(f.seedWrites).toEqual([WAIT_WRITE(Date.UTC(2026, 9, 16))]);
 	}, 60_000);
 
 	test("a refused worker hold in the server step stops the run", async () => {
@@ -3235,6 +3486,7 @@ describe("rolling restart", () => {
 			seedRecord: "0".repeat(40),
 			alatePs: "alate123",
 			alateInspect: "alate:current",
+			waitSince: String(Date.UTC(2026, 9, 16) - 7 * 60 * 60_000),
 		});
 		expect(
 			await updateImage(main, ["-f", "c.yml"], f.deps, {
