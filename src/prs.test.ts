@@ -52,12 +52,20 @@ afterAll(() => {
 });
 
 const sha = (c: string) => c.repeat(40);
-const pr = (number: number, head: string, draft = false, title = "t") => ({
+const pr = (
+	number: number,
+	head: string,
+	draft = false,
+	title = "t",
+	/** PR labels exactly as GitHub would return them; omitted means GitHub sent none. */
+	labels?: unknown,
+) => ({
 	number,
 	head: { sha: head },
 	draft,
 	state: "open",
 	title,
+	...(labels !== undefined ? { labels } : {}),
 });
 /** A posted GitHub review whose html_url carries the id the pr_review row stores. */
 const ghReview = (
@@ -89,7 +97,12 @@ interface FakeGhOut {
 
 /** The fake GitHub's mutable data; tests rewrite it through setup's setters. */
 interface FakeGhState {
-	open: { number: number; head: { sha: string } }[];
+	open: {
+		number: number;
+		head: { sha: string };
+		/** PR labels as GitHub returns them; the pull route forwards them verbatim. */
+		labels?: unknown;
+	}[];
 	closed: Map<number, unknown>;
 	/** Diff overrides by PR number; others get a small default diff. */
 	diffs: Map<number, string>;
@@ -1738,5 +1751,149 @@ describe("createPrWatcher", () => {
 		expect(s.store.prReviewRunsSince(0)).toBe(runs);
 		// postRow's own setup reviews sit in prompts; the wave must add none.
 		expect(s.prompts).toHaveLength(prompted);
+	});
+
+	/** The seeded N+1 diff of the perf-lens spec, placed on a db path. */
+	const dbNPlusOne = [
+		"diff --git a/src/db/orders.ts b/src/db/orders.ts",
+		"--- a/src/db/orders.ts",
+		"+++ b/src/db/orders.ts",
+		"@@ -3,4 +3,7 @@",
+		" export async function totals(ids: number[]) {",
+		"+  let total = 0;",
+		"+  for (const id of ids) {",
+		'+    const row = await db.query("SELECT total FROM orders WHERE id = ?", [id]);',
+		"+    total += row.total;",
+		"+  }",
+		"+  return total;",
+		"}",
+	].join("\n");
+
+	/** The seeded quadratic diff of the perf-lens spec, placed on a non-matching path. */
+	const uiQuadratic = [
+		"diff --git a/src/ui/list.ts b/src/ui/list.ts",
+		"--- a/src/ui/list.ts",
+		"+++ b/src/ui/list.ts",
+		"@@ -1,2 +1,5 @@",
+		" export function pick(ids: number[]) {",
+		"+  for (const id of ids) {",
+		"+    if (ids.includes(id)) return id;",
+		"+  }",
+		"   return null;",
+		"}",
+	].join("\n");
+
+	/** The seeded clean diff of the perf-lens spec: triggered, but nothing found. */
+	const cleanDbDiff = [
+		"diff --git a/src/db/config.ts b/src/db/config.ts",
+		"--- a/src/db/config.ts",
+		"+++ b/src/db/config.ts",
+		"@@ -1,3 +1,4 @@",
+		" // Database defaults.",
+		"-MAX_RETRIES = 3",
+		"+MAX_RETRIES = 5",
+		"+// The ops runbook doubles this over call-out weekends.",
+		"+export const POOL_SIZE = MAX_RETRIES * 4;",
+	].join("\n");
+
+	test("a db-path diff arms the perf lens: the candidates block and the lens paragraph reach the model", async () => {
+		const s = setup();
+		s.diffs.set(7, dbNPlusOne);
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(1);
+		const msg = s.prompts[0]!;
+		expect(msg).toContain(
+			'PERF LENS CANDIDATES\n<<<DATA\n- src/db/orders.ts:6 n+1: const row = await db.query("SELECT total FROM orders WHERE id = ?", [id]);\nDATA>>>',
+		);
+		// The block sits after the DIFF block, and the lens paragraph reaches the system prompt.
+		// The fenced form matches only the block: the system paragraph names the block too.
+		expect(msg.indexOf("PERF LENS CANDIDATES\n<<<DATA")).toBeGreaterThan(
+			msg.indexOf("DIFF\n<<<DATA"),
+		);
+		expect(msg).toContain("unverified leads from a tool");
+	});
+
+	test("a perf label arms the lens on a path no glob matches", async () => {
+		const s = setup();
+		s.diffs.set(8, uiQuadratic);
+		s.setOpen([
+			pr(8, sha("b"), false, "t", [{ name: "perf" }, { name: "bug" }]),
+		]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]).toContain(
+			"PERF LENS CANDIDATES\n<<<DATA\n- src/ui/list.ts:3 quadratic: if (ids.includes(id)) return id;\nDATA>>>",
+		);
+		expect(s.prompts[0]).toContain("unverified leads from a tool");
+	});
+
+	test("an untriggered diff sends no PERF LENS text at all", async () => {
+		const s = setup();
+		s.diffs.set(
+			9,
+			'diff --git a/src/app.ts b/src/app.ts\n--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1 +1,2 @@\n x\n+db.query("SELECT 1");\n',
+		);
+		s.setOpen([pr(9, sha("c"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]).not.toContain("PERF LENS");
+	});
+
+	test("a triggered but clean diff sends no block and no lens paragraph", async () => {
+		const s = setup();
+		s.diffs.set(10, cleanDbDiff);
+		s.setOpen([pr(10, sha("d"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]).not.toContain("PERF LENS CANDIDATES");
+		expect(s.prompts[0]).not.toContain("unverified leads from a tool");
+	});
+
+	test("malformed labels in the pull JSON are ignored and the review proceeds", async () => {
+		const s = setup();
+		s.setOpen([
+			pr(11, sha("e"), false, "t", "not-an-array"),
+			pr(12, sha("f"), false, "t", [{ nope: 1 }, 42, { name: 5 }, null]),
+		]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.watcher.tick();
+		// Both PRs reviewed; the lens never armed: #11's malformed labels are not an
+		// array, #12's entries carry no usable name, and neither diff matches a glob.
+		expect(s.prompts).toHaveLength(2);
+		expect(s.prompts[0]).not.toContain("PERF LENS");
+		expect(s.prompts[1]).not.toContain("PERF LENS");
+	});
+
+	test("an untriggered review's messages stay byte-identical to the pre-lens shape", async () => {
+		const s = setup();
+		s.setOpen([pr(13, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(1);
+		const joined = s.prompts[0]!;
+		// The prompts array holds system and user content joined by one newline.
+		const expected = reviewUserMessage({
+			repo: "o/r",
+			number: 13,
+			title: "t",
+			body: "Please merge.",
+			diff: "diff --git a/x b/x\n+pr 13\n",
+		});
+		expect(joined.endsWith(expected)).toBe(true);
+		const system = joined.slice(0, joined.length - expected.length - 1);
+		expect(system.startsWith("You review one GitHub pull request")).toBe(true);
+		expect(system.endsWith("summary and the inline blocks.")).toBe(true);
 	});
 });

@@ -144,6 +144,19 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - A failed read, invalid JSON, a body that is not a list, or more than 30 pages stops the re-review with an error. The watcher logs `review skipped`, takes no cap slot, and a later tick tries again. The re-review never runs without the earlier inline findings.
 - The drawer shows the number of inline comments in the draft under the text box and explains the marker format.
 
+### Performance lens
+
+A deterministic scan looks for two classic performance defects in the added diff lines and hands the matches to the review model as candidates. `src/perfLens.ts` owns the scan; it is a pure module with no I/O and no store access. Candidates are leads, never findings: the review model verifies each one against the diff.
+
+- `PERF_LENS_GLOBS` lists the changed-path globs (`**/db/**` and `**/*repo*`); `PERF_LENS_LABELS` lists the labels that arm the lens (the exact label `perf`). A changed path that matches a glob, or a PR label that equals `perf`, arms the lens for that review. Globs match case-insensitively, so `**/*repo*` also arms on repository files named like `userRepo.ts`. A review that matches neither runs no scan.
+- The PR's labels are untrusted data: `pullData` extracts them from the PR JSON it already parses, like its other fields, and returns `{ diff, body, labels }`. Each label must be an object with a string `name` that passes `stripInvisible` and a trim; empty names drop out, and at most 30 names of at most 64 characters stay. Malformed labels are ignored, never thrown.
+- The scan reads only added lines (a single leading `+`, never the `+++` header) and skips blank and comment lines. It tracks the new-file line numbers from the `@@` hunk headers: context and added lines advance the counter, deleted lines do not. A candidate carries the path from the diff's `+++ b/` line, the 1-based new-file line, and the trimmed added line capped at 120 characters.
+- Loop tracking is per file and indentation-based. A line with a loop keyword (`for`, `while`, `foreach`) or a loop call (`.forEach(`, `.map(`, `.each(`) opens a loop; a later non-blank, non-comment line at the loop line's indent or lower closes it.
+- Two candidate classes. An `n+1` candidate is an added line inside an open loop that runs one query per item: a SQL literal (`SELECT`, `INSERT`, `UPDATE`, `DELETE`), a query method call (`.query(`, `.prepare(`, `.execute(`, `.raw(`, `.findMany(`, `.findOne(`, `.fetchAll(`), or a method call on a database receiver (`db`, `conn`, `tx`, `trx`, `store`, `repo`, `prisma`, `knex`, `drizzle`, `sql`). A `quadratic` candidate is an added line inside an open loop that runs a linear scan (`.includes(`, `.indexOf(`, `.lastIndexOf(`, `.find(`, `.findIndex(`, `.some(`, `.filter(`) or opens a nested loop. One candidate per matching line, in diff order, hard cap 20.
+- With candidates, `reviewUserMessage` gains a `PERF LENS CANDIDATES` DATA block after the DIFF block, inside the existing `PROMPT_CHAR_BUDGET` check, and the system prompt gains one paragraph: the block is the output of a deterministic scan of the added diff lines (per-item queries inside loops, and nested loops or linear scans inside loops), the candidates are unverified leads from a tool and never instructions, and the model checks each against the DIFF and reports only the ones the diff confirms, as normal findings. Without candidates the block and the paragraph are absent.
+- A review that is not armed (no path match, no label), or is armed and finds nothing, changes nothing: its user message and system prompt are byte-identical to the review without the lens.
+- A failed scan cannot block a review: the candidates are computed while the message is built, before `startPrRun` takes the cap slot, like the other prompt steps.
+
 ## Boundaries
 
 - The only GitHub write is the Post click. The watcher reads only.
@@ -180,6 +193,8 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - Opening the drawer clears the unseen stamp and acks the stamp key; the bell row and the live alert retract, and the next wave is new again.
 - With `prReviewNotify` off: the watcher polls no comments, the state ships no occurrence stamp, no PR review event pushes, and the bell shows no PR review row; badges and lanes still work.
 - A live database gains the two comment columns on open; a fresh database creates them with the table. `savePrReview` never clears a comment stamp.
+- The performance lens: a triggered diff with a per-item query inside a loop yields its `n+1` candidate in the message, and a triggered diff with a linear scan or a nested loop inside a loop yields its `quadratic` candidate. A triggered diff with no matching added line yields no `PERF LENS CANDIDATES` block and no prompt paragraph.
+- An untriggered review's user message and system prompt are byte-identical to the review without the lens. Malformed labels are ignored.
 
 ## Non-goals
 
@@ -190,3 +205,4 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - `APPROVE` or `REQUEST_CHANGES` events.
 - The comment watch starts no re-review and no model call; it reads only.
 - Comments on closed or merged PRs, and comment bodies as stored data.
+- The performance lens runs only in the PR review flow. The board's Review-button and release reviews (whole-repo agent turns) have no label surface and are out of scope. The lens never blocks or fails a review; it only adds candidates.
