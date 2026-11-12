@@ -10590,6 +10590,7 @@ describe("web push (R1-1, R2-3)", () => {
 			head: HEAD,
 			draft: "draft",
 			prompt: "review",
+			blocking: true,
 		});
 		// The review is posted; the post baseline keeps its own comments silent.
 		s.savePrReview({ ...s.getPrReview(4242)!, postedHead: HEAD });
@@ -10672,6 +10673,7 @@ describe("web push (R1-1, R2-3)", () => {
 			head: HEAD,
 			draft: "d1",
 			prompt: "review",
+			blocking: true,
 		});
 		b.needsYou(t.id);
 		b.m.app.publishState(); // baseline: the first draft is already in the frame
@@ -10683,6 +10685,7 @@ describe("web push (R1-1, R2-3)", () => {
 			head: HEAD,
 			draft: "d2",
 			prompt: "review",
+			blocking: true,
 		});
 		b.needsYou(t.id);
 		expect(b.m.app.publishState()).toBe(true);
@@ -10723,6 +10726,7 @@ describe("web push (R1-1, R2-3)", () => {
 			head: HEAD,
 			draft: "draft",
 			prompt: "review",
+			blocking: true,
 		});
 		b.needsYou(t.id);
 		b.m.app.publishState(); // baseline
@@ -11623,6 +11627,7 @@ describe("read marks (/api/seen)", () => {
 			head: "cafe123",
 			draft: "the draft",
 			prompt: "review",
+			blocking: true,
 		});
 		// The watcher files the card with the draft as its details; it waits for a Post.
 		expect(pr.kind).toBe("pr_review");
@@ -13557,8 +13562,14 @@ describe("PR review routes", () => {
 		if (r === null) throw new Error(`no pr_review row ${n}`);
 		return r;
 	};
-	/** Saves a draft for PR `n` at `head` as the watcher does; `answered: false` leaves no draft. */
-	const reviewed = (n: number, head: string, answered = true): Task => {
+	/** Saves a draft for PR `n` at `head` as the watcher does; `answered: false` leaves no draft,
+	 *  `blocking: false` records a run with no blocking findings. */
+	const reviewed = (
+		n: number,
+		head: string,
+		answered = true,
+		blocking = true,
+	): Task => {
 		const prev = prStore.getPrReview(n);
 		prStore.savePrReview({
 			number: n,
@@ -13582,6 +13593,7 @@ describe("PR review routes", () => {
 			head,
 			draft: "draft",
 			prompt: "review",
+			blocking,
 		});
 		if (!answered) prStore.updateTask(t.id, { details: null });
 		return t;
@@ -13615,6 +13627,21 @@ describe("PR review routes", () => {
 		expect(await errorOf(bad)).toBe("prReviews must be a boolean");
 		await post("/api/projects/p1/settings", { prReviews: false });
 		expect(store.getSettings().prReviews).toBe(false);
+	});
+
+	test("project settings route accepts prReviewApprove and rejects non-boolean", async () => {
+		const ok = await post("/api/projects/p1/settings", {
+			prReviewApprove: true,
+		});
+		expect(ok.status).toBe(200);
+		expect(store.getSettings().prReviewApprove).toBe(true);
+		const bad = await post("/api/projects/p1/settings", {
+			prReviewApprove: "yes",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("prReviewApprove must be a boolean");
+		await post("/api/projects/p1/settings", { prReviewApprove: false });
+		expect(store.getSettings().prReviewApprove).toBe(false);
 	});
 
 	test("project settings route accepts prReviewNotify and rejects non-boolean", async () => {
@@ -14129,6 +14156,7 @@ describe("PR review routes", () => {
 				head,
 				draft: "draft",
 				prompt: "review",
+				blocking: true,
 			});
 		};
 		const reply = (id: string, body: Record<string, unknown>) =>
@@ -14323,6 +14351,39 @@ describe("PR review routes", () => {
 		expect(row(20).postedLogin).toBe("octocat");
 	});
 
+	test("an opted-in clean draft approves through the gh fallback", async () => {
+		await removeApp();
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(29, H1, true, false);
+		ghResult = {
+			code: 0,
+			stdout: JSON.stringify({
+				html_url: "https://github.com/acme/widget/pull/29#pullrequestreview-1",
+				user: { login: "octocat" },
+			}),
+			stderr: "",
+		};
+		const res = await postReview(t.id, { body: "Looks good." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "octocat",
+			via: "token",
+			inline: 0,
+		});
+		expect(ghCalls).toEqual([expectedArgv(29)]);
+		// ghPayloads reads the --input temp file inside the fake: the file is gone
+		// after the call, so this capture is the only way at the payload.
+		expect(ghPayloads).toEqual([
+			{
+				event: "APPROVE",
+				body: `Looks good.${REVIEW_FOOTER}`,
+				commit_id: H1,
+			},
+		]);
+		prStore.setSettings({ prReviewApprove: false });
+	});
+
 	test("an app without an installation falls back to gh with via token", async () => {
 		await saveApp();
 		// Default appFetchImpl answers 404 for the installation lookup.
@@ -14389,6 +14450,83 @@ describe("PR review routes", () => {
 		expect(view.prReview.postedUrl).toBe(
 			"https://github.com/acme/widget/pull/22#review-1",
 		);
+		await removeApp();
+	});
+
+	test("an opted-in clean draft posts one APPROVE review", async () => {
+		await saveApp();
+		appHappyPath({
+			html_url: "https://github.com/acme/widget/pull/26#review-1",
+			user: { login: "ottr[bot]" },
+		});
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(26, H1, true, false);
+		const res = await postReview(t.id, { body: "Ship it." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "ottr[bot]",
+			via: "app",
+			inline: 0,
+		});
+		expect(ghCalls).toEqual([]);
+		const postCall = appCalls.find((c) => c.url.endsWith("/reviews"))!;
+		expect(postCall.url).toBe(
+			"https://api.github.com/repos/acme/widget/pulls/26/reviews",
+		);
+		expect(postCall.init!.method).toBe("POST");
+		expect(JSON.parse(postCall.init!.body as string)).toEqual({
+			event: "APPROVE",
+			body: "Ship it.",
+			commit_id: H1,
+		});
+		prStore.setSettings({ prReviewApprove: false });
+		await removeApp();
+	});
+
+	test("a blocking draft posts a comment, not an approval", async () => {
+		await saveApp();
+		appHappyPath({
+			html_url: "https://github.com/acme/widget/pull/27#review-1",
+			user: { login: "ottr[bot]" },
+		});
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(27, H1);
+		const res = await postReview(t.id, { body: "Two nits." });
+		expect(res.status).toBe(200);
+		const postCall = appCalls.find((c) => c.url.endsWith("/reviews"))!;
+		expect(postCall.url).toBe(
+			"https://api.github.com/repos/acme/widget/pulls/27/reviews",
+		);
+		expect(postCall.init!.method).toBe("POST");
+		expect(JSON.parse(postCall.init!.body as string)).toEqual({
+			event: "COMMENT",
+			body: "Two nits.",
+			commit_id: H1,
+		});
+		prStore.setSettings({ prReviewApprove: false });
+		await removeApp();
+	});
+
+	test("the option off never approves", async () => {
+		await saveApp();
+		appHappyPath({
+			html_url: "https://github.com/acme/widget/pull/28#review-1",
+			user: { login: "ottr[bot]" },
+		});
+		const t = reviewed(28, H1, true, false);
+		const res = await postReview(t.id, { body: "Clean." });
+		expect(res.status).toBe(200);
+		const postCall = appCalls.find((c) => c.url.endsWith("/reviews"))!;
+		expect(postCall.url).toBe(
+			"https://api.github.com/repos/acme/widget/pulls/28/reviews",
+		);
+		expect(postCall.init!.method).toBe("POST");
+		expect(JSON.parse(postCall.init!.body as string)).toEqual({
+			event: "COMMENT",
+			body: "Clean.",
+			commit_id: H1,
+		});
 		await removeApp();
 	});
 

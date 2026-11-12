@@ -94,6 +94,32 @@ export function parseReviewDraft(text: string): ParsedReview {
 	return { body: normalizeBody(body), comments };
 }
 
+/** The model's machine-readable verdict for the review body (docs/specs/pr-reviews.md "Post").
+ *  A verdict line is a whole line whose trimmed text is exactly `<!-- blocking: yes -->` or
+ *  `<!-- blocking: no -->`; matching is strict lowercase after trim. Every verdict line comes
+ *  out of the text, and `blocking` follows the last one. A missing or malformed verdict counts
+ *  as blocking, so an unknown verdict never approves. */
+export function parseBlockingVerdict(text: string): {
+	text: string;
+	blocking: boolean;
+} {
+	const kept: string[] = [];
+	let blocking = true;
+	for (const line of text.split("\n")) {
+		const t = line.trim();
+		if (t === "<!-- blocking: yes -->") {
+			blocking = true;
+			continue;
+		}
+		if (t === "<!-- blocking: no -->") {
+			blocking = false;
+			continue;
+		}
+		kept.push(line);
+	}
+	return { text: kept.join("\n"), blocking };
+}
+
 function location(c: Pick<InlineComment, "path" | "line" | "startLine">) {
 	return c.startLine === null
 		? `${c.path}:${c.line}`

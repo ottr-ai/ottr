@@ -624,6 +624,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			prReviewNotify: true,
+			prReviewApprove: false,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -658,6 +659,7 @@ describe("settings", () => {
 			forkResearch: false,
 			prReviews: false,
 			prReviewNotify: true,
+			prReviewApprove: false,
 			prMode: false,
 			microVm: false,
 			trendingScout: false,
@@ -4107,6 +4109,18 @@ describe("pr review store methods", () => {
 		expect(open(join(root, "pr-mode")).getSettings().prMode).toBe(true);
 	});
 
+	test("prReviewApprove defaults to false and persists across reopen", () => {
+		expect(DEFAULT_SETTINGS.prReviewApprove).toBe(false);
+		const store = open(join(root, "pr-approve"));
+		expect(store.getSettings().prReviewApprove).toBe(false);
+		store.setSettings({ prReviewApprove: true });
+		expect(store.getSettings().prReviewApprove).toBe(true);
+		store.close();
+		expect(open(join(root, "pr-approve")).getSettings().prReviewApprove).toBe(
+			true,
+		);
+	});
+
 	test("savePrReview upserts by number and round-trips booleans and nulls", () => {
 		const store = open(join(root, "pr-row"));
 		expect(store.getPrReview(12)).toBeNull();
@@ -4172,6 +4186,7 @@ describe("pr review store methods", () => {
 			head: "abc",
 			draft: "d",
 			prompt: "p",
+			blocking: true,
 		});
 		expect(store.lastPrRunAt(12, "abc")).toBe(1000);
 		expect(store.lastPrRunAt(12, "xyz")).toBeNull();
@@ -4186,6 +4201,7 @@ describe("pr review store methods", () => {
 				head: "a",
 				draft: "d",
 				prompt: "p",
+				blocking: true,
 			}),
 		).toThrow();
 		store.savePrReview({ ...row, title: "Fix the thing", postError: "old" });
@@ -4198,6 +4214,7 @@ describe("pr review store methods", () => {
 			head: "abc",
 			draft: "## Summary\nok",
 			prompt: "review 1",
+			blocking: true,
 		});
 		expect(card.kind).toBe("pr_review");
 		expect(card.title).toBe("PR review: #12 Fix the thing");
@@ -4224,6 +4241,7 @@ describe("pr review store methods", () => {
 			head: "def",
 			draft: "second",
 			prompt: "review 2",
+			blocking: true,
 		});
 		expect(again.id).toBe(card.id);
 		expect(again.details).toBe("second");
@@ -4249,6 +4267,7 @@ describe("pr review store methods", () => {
 			head: "abc",
 			draft: "d",
 			prompt: "p",
+			blocking: true,
 		});
 		expect(card.state).toBe("needs_you");
 		// Posted head: done/idle, done_at stamped once.
@@ -4273,6 +4292,7 @@ describe("pr review store methods", () => {
 			head: "def",
 			draft: "d2",
 			prompt: "p",
+			blocking: true,
 		});
 		expect(again).toMatchObject({ stage: "in_progress", state: "needs_you" });
 		// Closed: done/idle.
@@ -4533,11 +4553,25 @@ describe("pr review store methods", () => {
 		store.savePrReview({ ...row, number: 7 });
 		const run = store.startPrRun(7, "abc", 2000);
 		expect(store.prHeadReviewed(7, "abc")).toBe(false);
-		store.savePrDraft({ run, number: 7, head: "abc", draft: "d", prompt: "p" });
+		store.savePrDraft({
+			run,
+			number: 7,
+			head: "abc",
+			draft: "d",
+			prompt: "p",
+			blocking: true,
+		});
 		expect(store.prHeadReviewed(7, "abc")).toBe(true);
 		store.close();
 		const shape = runShape(dir);
-		expect(shape.cols).toEqual(["id", "number", "started_at", "head", "done"]);
+		expect(shape.cols).toEqual([
+			"id",
+			"number",
+			"started_at",
+			"head",
+			"done",
+			"blocking",
+		]);
 		expect(shape.indexes).toContain("idx_pr_review_runs_at");
 	});
 
@@ -4569,7 +4603,89 @@ describe("pr review store methods", () => {
 		expect(store.prHeadReviewed(8, "xyz")).toBe(false);
 		store.close();
 		const shape = runShape(dir);
-		expect(shape.cols).toEqual(["id", "number", "started_at", "head", "done"]);
+		expect(shape.cols).toEqual([
+			"id",
+			"number",
+			"started_at",
+			"head",
+			"done",
+			"blocking",
+		]);
+	});
+
+	test("a pre-blocking pr_review_runs gains the column on open and old runs read as blocking", () => {
+		const dir = join(root, "pr-runs-no-blocking");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.exec(`CREATE TABLE pr_review_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  number INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  head TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0
+)`);
+		old.run(
+			"INSERT INTO pr_review_runs (number, started_at, head, done) VALUES (7, 1000, 'abc', 1)",
+		);
+		old.close();
+		const store = open(dir);
+		// The column lands additively with its default, so the unrecorded verdict reads as
+		// blocking and an approval needs a run that saved a clean one.
+		expect(store.lastPrRunBlocking(7)).toBe(true);
+		store.savePrReview({ ...row, number: 7 });
+		const run = store.startPrRun(7, "abc", 2000);
+		store.savePrDraft({
+			run,
+			number: 7,
+			head: "abc",
+			draft: "d",
+			prompt: "p",
+			blocking: false,
+		});
+		expect(store.lastPrRunBlocking(7)).toBe(false);
+		store.close();
+		const shape = runShape(dir);
+		expect(shape.cols).toEqual([
+			"id",
+			"number",
+			"started_at",
+			"head",
+			"done",
+			"blocking",
+		]);
+	});
+
+	test("lastPrRunBlocking reads the newest done run's verdict and defaults to blocking", () => {
+		const store = open(join(root, "pr-runs-verdict"));
+		// No runs at all.
+		expect(store.lastPrRunBlocking(12)).toBe(true);
+		store.startPrRun(12, "abc", 1000);
+		// An un-done run has no verdict yet.
+		expect(store.lastPrRunBlocking(12)).toBe(true);
+		store.savePrReview(row);
+		store.savePrDraft({
+			run: store.startPrRun(12, "abc", 1000),
+			number: 12,
+			head: "abc",
+			draft: "d",
+			prompt: "p",
+			blocking: false,
+		});
+		expect(store.lastPrRunBlocking(12)).toBe(false);
+		store.savePrDraft({
+			run: store.startPrRun(12, "abc", 2000),
+			number: 12,
+			head: "abc",
+			draft: "d2",
+			prompt: "p",
+			blocking: true,
+		});
+		// The newest done run wins.
+		expect(store.lastPrRunBlocking(12)).toBe(true);
+		store.close();
 	});
 });
 

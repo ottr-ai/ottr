@@ -79,7 +79,8 @@ the release and the `post_error` handling it has today. The GitHub call changes:
 
 - With an app configured and an installation found: direct fetch POST to
   `https://api.github.com/repos/{repo}/pulls/{number}/reviews`, JSON body
-  `{ event: "COMMENT", body: <body>, commit_id: <reviewedHead> }` (no footer),
+  `{ event: <"COMMENT", or "APPROVE" per pr-reviews.md "Post">, body: <body>,
+  commit_id: <reviewedHead> }` (no footer),
   `Authorization: Bearer <installation token>`. The board token and `gh` stay unused.
 - With no app configured, or an installation 404: today's `gh` call with the board token.
 - Another app-path failure (bad key, GitHub 5xx, network): 502 like a gh failure —

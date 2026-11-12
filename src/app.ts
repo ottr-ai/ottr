@@ -1667,6 +1667,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"trendingScout",
 	"prReviews",
 	"prReviewNotify",
+	"prReviewApprove",
 	"prMode",
 	"issueWatch",
 	"ompWatch",
@@ -8904,6 +8905,7 @@ export function createApp(deps: AppDeps) {
 		owner: string,
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
+		event: "COMMENT" | "APPROVE",
 	): Promise<{ via: "app"; stdout: string } | Response | null> {
 		if (githubApp === null || appTokens === null) return null;
 		const appSecrets = [...gitSecrets()];
@@ -8929,7 +8931,7 @@ export function createApp(deps: AppDeps) {
 						"user-agent": "Ottr",
 					},
 					body: JSON.stringify({
-						event: "COMMENT",
+						event,
 						// No footer: the review posts as the app, so GitHub's Bot badge
 						// already says who posted it.
 						body: draft.body,
@@ -8966,9 +8968,10 @@ export function createApp(deps: AppDeps) {
 		repo: string | null,
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
+		event: "COMMENT" | "APPROVE",
 	): Promise<{ stdout: string } | Response> {
 		const payload = {
-			event: "COMMENT",
+			event,
 			body: `${draft.body}${REVIEW_FOOTER}`,
 			commit_id: head,
 			...comments,
@@ -9143,6 +9146,13 @@ export function createApp(deps: AppDeps) {
 			draft.comments.length > 0
 				? { comments: reviewPayloadComments(draft.comments) }
 				: {};
+		// APPROVE only when the project opted in and this draft's own run found no blocking
+		// findings; an unknown verdict posts a plain comment.
+		const event =
+			e.store.getSettings().prReviewApprove === true &&
+			!e.store.lastPrRunBlocking(row.number)
+				? ("APPROVE" as const)
+				: ("COMMENT" as const);
 		const app = await postReviewViaApp(
 			e,
 			row,
@@ -9153,6 +9163,7 @@ export function createApp(deps: AppDeps) {
 			owner,
 			draft,
 			comments,
+			event,
 		);
 		if (app instanceof Response) return app;
 		let via: "app" | "token" = "token";
@@ -9169,6 +9180,7 @@ export function createApp(deps: AppDeps) {
 				repo,
 				draft,
 				comments,
+				event,
 			);
 			if (posted instanceof Response) return posted;
 			stdout = posted.stdout;

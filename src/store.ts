@@ -89,6 +89,7 @@ export const DEFAULT_SETTINGS: ProjectSettings = {
 	trendingScout: false,
 	prReviews: false,
 	prReviewNotify: true,
+	prReviewApprove: false,
 	prMode: false,
 	issueWatch: false,
 	issueWatchSince: null,
@@ -147,7 +148,8 @@ const PR_REVIEW_RUNS_DDL = `CREATE TABLE IF NOT EXISTS pr_review_runs (
   number INTEGER NOT NULL,
   started_at INTEGER NOT NULL,
   head TEXT NOT NULL,
-  done INTEGER NOT NULL DEFAULT 0
+  done INTEGER NOT NULL DEFAULT 0,
+  blocking INTEGER NOT NULL DEFAULT 1
 )`;
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1161,6 +1163,7 @@ const SETTINGS_SHAPES = {
 	trendingScout: "boolean",
 	prReviews: "boolean",
 	prReviewNotify: "boolean",
+	prReviewApprove: "boolean",
 	prMode: "boolean",
 	issueWatch: "boolean",
 	issueWatchSince: "number",
@@ -2243,6 +2246,18 @@ export class ProjectStore {
 			.all()
 			.map((c) => c.name);
 		ProjectStore.rebuildPrReviewRuns(db, runCols);
+		// The rebuild recreates from the current DDL (which has blocking); a live table that
+		// predates the column converges additively. Default 1 is fail-safe: an old run reads
+		// as blocking, so an approval needs a run that recorded a clean verdict.
+		ProjectStore.addColumn(
+			db,
+			db
+				.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
+				.all()
+				.map((c) => c.name),
+			"blocking",
+			"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
+		);
 		return new ProjectStore(root, db);
 	}
 
@@ -3017,6 +3032,17 @@ export class ProjectStore {
 		);
 	}
 
+	/** Whether the PR's newest done review run found blocking findings. True without a done
+	 * run or an unset column, so an unknown verdict never approves a PR. */
+	lastPrRunBlocking(number: number): boolean {
+		const row = this.db
+			.query<{ blocking: number | null }, [number]>(
+				"SELECT blocking FROM pr_review_runs WHERE number = ? AND done = 1 ORDER BY id DESC LIMIT 1",
+			)
+			.get(number);
+		return (row?.blocking ?? 1) !== 0;
+	}
+
 	/**
 	 * Claims the post of `head` in one statement before the GitHub call: only an open PR whose
 	 * reviewed head is `head` and not yet posted wins, so two concurrent Posts send one review.
@@ -3108,6 +3134,7 @@ export class ProjectStore {
 		head: string;
 		draft: string;
 		prompt: string;
+		blocking: boolean;
 	}): Task {
 		let cardId = "";
 		const tx = this.db.transaction(() => {
@@ -3134,7 +3161,10 @@ export class ProjectStore {
 				"UPDATE pr_review SET task_id = ?, reviewed_head = ?, post_error = NULL WHERE number = ?",
 				[card.id, o.head, o.number],
 			);
-			this.db.run("UPDATE pr_review_runs SET done = 1 WHERE id = ?", [o.run]);
+			this.db.run(
+				"UPDATE pr_review_runs SET done = 1, blocking = ? WHERE id = ?",
+				[o.blocking ? 1 : 0, o.run],
+			);
 			this.syncPrCard(o.number);
 		});
 		tx();

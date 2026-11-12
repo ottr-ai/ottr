@@ -217,6 +217,8 @@ export interface ProjectSettings {
 	prReviews: boolean;
 	/** Bell entry and Web Push for PR review drafts, draft updates and new comments after a posted review; off keeps the badges and lanes only. */
 	prReviewNotify: boolean;
+	/** Post also approves the PR when the run found no blocking findings; off by default. */
+	prReviewApprove: boolean;
 	/** Per-project PR mode: integration pushes the card branch and opens a GitHub pull request instead of merging into the target branch (off by default). */
 	prMode: boolean;
 	/** Run work turns in a Firecracker microVM via vm-runner instead of a worker container (off by default; docs/adr/0009-microvm-workers.md). */

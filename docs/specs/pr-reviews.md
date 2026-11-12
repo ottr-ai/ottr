@@ -10,8 +10,10 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 
 - `ProjectSettings.prReviews: boolean`. The default is `false`.
 - `POST /api/projects/:project/settings` accepts `prReviews`. A value that is not a boolean gets 400 `prReviews must be a boolean`.
+- `ProjectSettings.prReviewApprove: boolean`. The default is `false`.
+- `POST /api/projects/:project/settings` accepts `prReviewApprove`. A value that is not a boolean gets 400 `prReviewApprove must be a boolean`.
 - The watcher works only when `prReviews` is true and the project has a GitHub repo (`project.github !== null`). In other cases, the watcher makes no `gh` call for the project.
-- Project settings show a "PR reviews" checkbox next to "Fork research".
+- Project settings show a "PR reviews" checkbox next to "Fork research", a "PR review notifications" checkbox under it, and a "PR review approvals" checkbox under those. When `prReviewApprove` is on, the Post click sends the review with event `APPROVE` when the draft's run found no blocking findings (see "Post").
 
 ### Watcher (`src/prs.ts`)
 
@@ -38,7 +40,8 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
      4. `startPrRun` records the attempt. The attempt counts for the cap.
      5. Call the model with the fixed `reviewSystemPrompt()` and the user message.
      6. `parseDraft` strips invisible characters, trims the text, and caps it below 65536 characters. An empty answer stops the review.
-     7. `savePrDraft` saves the draft.
+     7. `parseBlockingVerdict` (in `src/prInline.ts`) extracts the verdict line — its own line, exactly `<!-- blocking: yes -->` or `<!-- blocking: no -->` after trimming — and strips it from the text. No verdict line, or a malformed one, counts as blocking, so an unknown verdict never approves.
+     8. `savePrDraft` saves the draft and writes the verdict on the run (`pr_review_runs.blocking`).
      - A failure after step 4 logs the error. The head stays open for a retry on a later tick, within the cap.
 
 ### Re-review and the reply flow
@@ -54,12 +57,13 @@ The earlier review gives a re-review its context: `fetchReReviewContext()` (in `
 Each project has its own store, so the PR number is the key inside it.
 
 - Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, posted_login TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
-- Table `pr_review_runs`: `id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0`. Each row is one attempt. `done = 1` marks a saved draft, so the done rows are the history of reviewed heads.
+- Table `pr_review_runs`: `id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, blocking INTEGER NOT NULL DEFAULT 1`. Each row is one attempt. `done = 1` marks a saved draft, so the done rows are the history of reviewed heads. `blocking` says whether the run found blocking findings; the default 1 is fail-safe, so a database from an older build never reads as clean.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
-- `savePrDraft({ run, number, head, draft, prompt })` runs in one transaction:
+- `savePrDraft({ run, number, head, draft, prompt, blocking })` runs in one transaction:
   - No card yet: create a card with kind `pr_review`, title `PR review: #N <title>`, topic `pr review`.
   - The card gets the draft as its `details` and a one-line summary. A card that exists gets the new prompt. `syncPrCard` then sets the card's stage and state (see "Card state").
-  - Set `task_id` and `reviewed_head`, clear `post_error`, and set `done = 1` on the run. Other columns stay, because the save runs after the model call.
+  - Set `task_id` and `reviewed_head`, clear `post_error`, and set `done = 1` and `blocking` on the run. Other columns stay, because the save runs after the model call.
+- `lastPrRunBlocking(number)` returns whether the PR's newest done run found blocking findings; true without a done run, so an unknown verdict never approves.
 - A `pr_review` card has no turns, no branch and no worktree. The scheduler never runs it, and the supervisor files no retro for it.
 
 ### Card state
@@ -86,9 +90,10 @@ A draft that nobody posted waits for the user, so the card must not hide in Done
   - The PR state must be `open`, else 409 with the state.
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
   - Before the GitHub call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
-  - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with event `COMMENT`, the review body without `REVIEW_FOOTER` (the app's Bot badge already says who posted it), `commit_id` set to the reviewed head, and `comments` when the draft has inline comments.
+  - The event is `COMMENT` by default. When the project setting `prReviewApprove` is on and the draft's own run found no blocking findings (`lastPrRunBlocking` false), the same post sends one review with event `APPROVE` and the comment as its body; the inline comments ride along. An unknown verdict never approves. Both send paths take the same event.
+  - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with that event, the review body without `REVIEW_FOOTER` (the app's Bot badge already says who posted it), `commit_id` set to the reviewed head, and `comments` when the draft has inline comments.
   - With no app configured, or when the app has no installation for the repo, Ottr falls back to today's `gh` call with the board token. The response reports which path ran: `{ ok, login, via }` with `via: "app" | "token"`.
-  - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST --input <file>`. The file is a JSON payload `{ event: "COMMENT", body: <review body + REVIEW_FOOTER>, commit_id: <reviewedHead>, comments? }` in a fresh directory below the OS temp dir. Ottr removes the directory after the call. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
+  - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST --input <file>`. The file is a JSON payload `{ event: <COMMENT or APPROVE per the rule above>, body: <review body + REVIEW_FOOTER>, commit_id: <reviewedHead>, comments? }` in a fresh directory below the OS temp dir. Ottr removes the directory after the call. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
   - On success Ottr parses the response body and stores its `html_url` in `posted_url`, and its `user.login` in `posted_login`; a body without an `https://github.com/` URL stores null for the URL. `setPrPostedUrl(number, url, login = null)` writes both columns in one statement. `PrReviewRow` and `PrReviewView` gain `postedLogin: string | null` (additive, the `posted_url` pattern).
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
   - On success the route calls `syncPrCard`, so the card moves to `done/idle`. The response gains `inline: <number of inline comments sent>`.
@@ -131,7 +136,7 @@ The board marks PR review activity NEW and notifies. The project setting `prRevi
 
 ### Inline comments
 
-The draft is one text. Inline comments are marked blocks in it, so the user edits them in the same text box. `src/prInline.ts` owns the format; the server and the UI share it.
+The draft is one text. Inline comments are marked blocks in it, so the user edits them in the same text box. `src/prInline.ts` owns the format; the server and the UI share it. The verdict line of the approve flow (`<!-- blocking: yes -->` or `<!-- blocking: no -->`) is the same kind of marked line; `parseBlockingVerdict` parses it and the watcher strips it before the save, so it never shows in the draft or on GitHub.
 
 - A block starts with a line `<!-- inline <path>:<line> -->` or `<!-- inline <path>:<start>-<end> -->` and ends with a line `<!-- /inline -->`. Marker lines match after trimming. The lines between are the comment body.
 - `<line>` and `<end>` are line numbers of the new file (the `RIGHT` side). `<start>` is less than `<end>`. The path holds no newline and at most 1000 characters.
@@ -161,7 +166,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 
 - The only GitHub write is the Post click. The watcher reads only.
 - No agent runs over PR code. The model gets the PR only as data and has no tools.
-- `event` is always `COMMENT`. Ottr never sends `APPROVE` or `REQUEST_CHANGES`.
+- The event is `COMMENT`, or `APPROVE` when `prReviewApprove` is on and the draft's run found no blocking findings. Ottr never sends `REQUEST_CHANGES`.
 - Only the PR review post uses the GitHub App. Merge pushes, releases and CI reads keep the board token.
 - Schema changes are additive only.
 
@@ -180,6 +185,9 @@ A deterministic scan looks for two classic performance defects in the added diff
 - The re-review paragraph instructs both triage outcomes: list only the still open or partly fixed findings with evidence, and one short line of thanks with no per-finding list when every earlier finding is fixed.
 - A reply on a `pr_review` card runs a new draft for the refreshed current head with the note outside the DATA blocks, counts one cap slot, and gets 429 once the daily cap is full, 409 on a closed PR, and 400 on empty or oversized text.
 - Post sends one `COMMENT` review with the edited body, the inline comments, and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
+- With `prReviewApprove` on and a clean run, the Post sends exactly POST `repos/{owner}/{repo}/pulls/N/reviews` with event `APPROVE`, the comment as its body, and the reviewed head as `commit_id`. A run with a blocking finding, or the option off, sends the same review with event `COMMENT` and approves nothing.
+- The verdict line never reaches the saved draft; a missing or malformed verdict counts as blocking.
+- A `prReviewApprove` value that is not a boolean gets 400 `prReviewApprove must be a boolean`.
 - An inline block on a diff line posts as an inline comment with `side: "RIGHT"`; a range block also sends `start_line`. A block outside the diff lands in the body of the saved draft. A suggestion fence reaches GitHub unchanged.
 - An open PR with an unposted draft puts the card in `in_progress/needs_you`. A Post, a close, or a merge moves it to `done/idle`. A new head on a posted card brings it back to `needs_you`. A card that an older build left in Done moves at the next tick.
 - A closed or merged PR disables Post and stops new reviews.
@@ -204,7 +212,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 - Running PR tests or CI.
 - GitHub webhooks.
 - A post without a click.
-- `APPROVE` or `REQUEST_CHANGES` events.
+- `REQUEST_CHANGES` events.
 - The comment watch starts no re-review and no model call; it reads only.
 - Comments on closed or merged PRs, and comment bodies as stored data.
 - The performance lens runs only in the PR review flow. The board's Review-button and release reviews (whole-repo agent turns) have no label surface and are out of scope. The lens never blocks or fails a review; it only adds candidates.

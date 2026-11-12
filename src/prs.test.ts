@@ -1152,6 +1152,39 @@ describe("createPrWatcher", () => {
 		);
 	});
 
+	test("a non-blocking verdict saves the draft without the verdict line and clears blocking", async () => {
+		const s = setup();
+		s.setAnswer("## Summary\nreview 1\n<!-- blocking: no -->");
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.cards()[0]!.details).toBe("## Summary\nreview 1");
+		expect(s.store.lastPrRunBlocking(7)).toBe(false);
+	});
+
+	test("a blocking verdict keeps the verdict line out of the draft and marks the run blocking", async () => {
+		const s = setup();
+		s.setAnswer("## Summary\nreview 1\n<!-- blocking: yes -->");
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.cards()[0]!.details).toBe("## Summary\nreview 1");
+		expect(s.store.lastPrRunBlocking(7)).toBe(true);
+	});
+
+	test("a review without a verdict line stays blocking", async () => {
+		const s = setup();
+		s.setAnswer("## Summary\nreview 1");
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		expect(s.cards()[0]!.details).toBe("## Summary\nreview 1");
+		expect(s.store.lastPrRunBlocking(7)).toBe(true);
+	});
+
 	test("a re-review keeps the posted review's inline comments in the earlier review, not in the comment list", async () => {
 		const s = setup();
 		s.setOpen([pr(22, sha("a"))]);

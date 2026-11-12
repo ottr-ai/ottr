@@ -3,6 +3,7 @@ import {
 	fitDraftToDiff,
 	formatInlineComment,
 	type InlineComment,
+	parseBlockingVerdict,
 	parseReviewDraft,
 	reviewPayloadComments,
 } from "./prInline.ts";
@@ -112,6 +113,62 @@ describe("parseReviewDraft", () => {
 		expect(parseReviewDraft(text)).toEqual({
 			body: "Top.\n\nMiddle.",
 			comments: [one("a.ts", 3, "Fix.\nMore.")],
+		});
+	});
+});
+
+describe("parseBlockingVerdict", () => {
+	test("no verdict line keeps the text and blocking true", () => {
+		const text = "Summary.\n\nA finding.";
+		expect(parseBlockingVerdict(text)).toEqual({ text, blocking: true });
+	});
+
+	test("a trailing no verdict line is removed and clears blocking", () => {
+		expect(parseBlockingVerdict("Summary.\n<!-- blocking: no -->")).toEqual({
+			text: "Summary.",
+			blocking: false,
+		});
+	});
+
+	test("a trailing yes verdict line is removed and keeps blocking true", () => {
+		expect(parseBlockingVerdict("Summary.\n<!-- blocking: yes -->")).toEqual({
+			text: "Summary.",
+			blocking: true,
+		});
+	});
+
+	test("the last verdict line wins", () => {
+		expect(
+			parseBlockingVerdict(
+				"<!-- blocking: no -->\nBody.\n<!-- blocking: yes -->",
+			),
+		).toEqual({ text: "Body.", blocking: true });
+	});
+
+	test("a verdict line matches after trimming", () => {
+		expect(parseBlockingVerdict("Body.\n\t<!-- blocking: no -->  ")).toEqual({
+			text: "Body.",
+			blocking: false,
+		});
+	});
+
+	test("an uppercase verdict line is not a verdict", () => {
+		const text = "Summary.\n<!-- blocking: NO -->";
+		expect(parseBlockingVerdict(text)).toEqual({ text, blocking: true });
+	});
+
+	test("the empty string stays blocking", () => {
+		expect(parseBlockingVerdict("")).toEqual({ text: "", blocking: true });
+	});
+
+	test("a verdict line inside an inline block body is still extracted", () => {
+		// Documented behavior: the watcher runs parseBlockingVerdict before parseReviewDraft,
+		// so a verdict line the model misplaced in a block body never reaches GitHub.
+		const text =
+			"<!-- inline a.ts:2 -->\nFix it.\n<!-- blocking: no -->\n<!-- /inline -->";
+		expect(parseBlockingVerdict(text)).toEqual({
+			text: "<!-- inline a.ts:2 -->\nFix it.\n<!-- /inline -->",
+			blocking: false,
 		});
 	});
 });
