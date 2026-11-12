@@ -40,6 +40,19 @@
 					}
 				}
 			}
+		},
+		{
+			"includes": ["scripts/gate-harness/**"],
+			"linter": {
+				"rules": {
+					"style": {
+						"noNonNullAssertion": "off"
+					},
+					"suspicious": {
+						"noTemplateCurlyInString": "off"
+					}
+				}
+			}
 		}
 	]
 }
