@@ -1845,6 +1845,88 @@ describe("createPrWatcher", () => {
 		expect(await s.store.prReviewRunsSince(0)).toBe(1);
 	});
 
+	test("the watcher never reviews a PR one of the project's cards opened", async () => {
+		const s = setup();
+		const card = s.store.createTask("parent");
+		s.store.updateTask(card.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 7,
+			prUrl: prUrl("o/r", 7),
+			prHeadSha: sha("a"),
+			pushSha: sha("a"),
+			branch: "ottr/7",
+			base: "main",
+		});
+		s.setOpen([
+			pr(7, sha("a"), false, "Board PR"),
+			pr(8, sha("b"), false, "Person PR"),
+		]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.watcher.tick();
+		expect(s.cards().length).toBe(1);
+		expect(s.cards()[0]!.title).toContain("#8");
+		expect(s.cards().some((c) => c.title.includes("PR review: #7"))).toBe(
+			false,
+		);
+		expect(s.prompts).toHaveLength(1);
+	});
+
+	test("a card's branch skips its PR by the open list's head ref", async () => {
+		const s = setup();
+		const card = s.store.createTask("branch card");
+		s.store.updateTask(card.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: null,
+			branch: "ottr/9",
+			base: "main",
+		});
+		const branchPr = {
+			number: 9,
+			head: { sha: sha("c"), ref: "ottr/9" },
+			draft: false,
+			state: "open",
+			title: "Branch PR",
+		};
+		s.setOpen([branchPr, pr(10, sha("d"), false, "Person PR")]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.watcher.tick();
+		expect(s.cards().length).toBe(1);
+		expect(s.cards()[0]!.title).toContain("#10");
+		expect(s.prompts).toHaveLength(1);
+	});
+
+	test("reviewNow skips the project's own PR", async () => {
+		const s = setup();
+		const card = s.store.createTask("parent");
+		s.store.updateTask(card.id, {
+			stage: "merging",
+			state: "idle",
+			prNumber: 7,
+			prUrl: prUrl("o/r", 7),
+			prHeadSha: sha("a"),
+			pushSha: sha("a"),
+			branch: "ottr/7",
+			base: "main",
+		});
+		s.setOpen([pr(7, sha("a"), false, "Board PR")]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.watcher.reviewNow({ project: "p", number: 7, note: "look" });
+		await s.watcher.reviewIdle();
+		expect(s.prompts).toHaveLength(0);
+		expect(s.cards().length).toBe(0);
+		expect(s.logs).toContain(
+			"prs: p: #7 is this project's own PR; not reviewed",
+		);
+	});
+
 	test("the daily cap holds the 6th start for 24h", async () => {
 		const s = await setup();
 		const pulls = [1, 2, 3, 4, 5, 6].map((n) => pr(n, sha("e")));

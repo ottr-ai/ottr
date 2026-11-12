@@ -476,6 +476,8 @@ export interface Task {
 	prNumber: number | null;
 	prUrl: string | null;
 	prHeadSha: string | null;
+	/** OTTR-877: the review feedback watch's cutoff (epoch ms); null = never swept, the first sweep initializes silently. */
+	prWatchAt: number | null;
 	/** OTTR-760: the pull request this card was filed from (a Dependabot PR); null for every other card. The ship step adopts it instead of opening a second PR. */
 	sourcePrNumber: number | null;
 	sourcePrUrl: string | null;

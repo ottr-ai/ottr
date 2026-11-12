@@ -19,6 +19,7 @@ import {
 	dependabotPrompt,
 	failedCheckNames,
 	prConflictReason,
+	prFeedbackReason,
 	type SupervisorEntry,
 	type SupervisorOps,
 	scratchShotsTend,
@@ -1124,11 +1125,22 @@ describe("kept-worktree hygiene", () => {
 
 		await tick(new Map([["proj", entry(store)]]), ops);
 
-		expect(await store.getTask(t.id)).toEqual(before);
+		// The feedback sweep's first window stamps prWatchAt; no verdict field moves.
+		expect(await store.getTask(t.id)).toEqual({
+			...before,
+			prWatchAt: expect.any(Number),
+			updatedAt: expect.any(Number),
+			revision: before.revision + 1,
+		});
 		expect(ops.calls.quarantine).toEqual([]);
 		expect(ops.calls.remove).toEqual([]);
 		expect(ops.calls.scheduled).toBe(0);
 		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+		const logPath = store.logPath(t.id);
+		// Nothing logged means no log file: absence is the same "silent" claim.
+		const log = existsSync(logPath) ? await Bun.file(logPath).text() : "";
+		expect(log).not.toContain("has merge conflicts");
+		expect(log).not.toContain("review feedback");
 		await store.close();
 	});
 
@@ -3202,10 +3214,19 @@ const openList = (ns: number[]) => ({
 });
 
 const PR7_CONFLICT = prConflictReason(7);
-const PR_LIST = ["api", "repos/acme/widget/pulls?state=open&per_page=100"];
+// Query strings stripped from the recorded urls: the list poll and the feedback reads
+// carry one, and the feedback `since` stamp varies per cutoff, so the exact lists
+// compare on the base paths only.
+const PR_LIST = ["api", "repos/acme/widget/pulls"];
 const PR7_READ = ["api", "repos/acme/widget/pulls/7"];
 const PR8_READ = ["api", "repos/acme/widget/pulls/8"];
 const PR9_READ = ["api", "repos/acme/widget/pulls/9"];
+/** The feedback sweep's three reads for PR #7, in sweep order. */
+const PR7_FEEDBACK = [
+	["api", "repos/acme/widget/issues/7/comments"],
+	["api", "repos/acme/widget/pulls/7/comments"],
+	["api", "repos/acme/widget/pulls/7/reviews"],
+];
 
 /** `gh api` stub: `pull` answers every per-PR read, every other call gets the open-PR list. */
 function prApi(pull: string, open: number[] = [7]) {
@@ -3215,9 +3236,43 @@ function prApi(pull: string, open: number[] = [7]) {
 			: openList(open);
 }
 
-/** The tick's `gh api` calls without the CI watch's runs poll (prCard pins pushSha). */
+/** The tick's `gh api` calls without the CI watch's runs poll (prCard pins pushSha),
+ * query strings stripped, so the exact lists carry PR_LIST and PR7_FEEDBACK. */
 function pullCalls(ops: FakeOps): string[][] {
-	return ops.apiCalls.filter((a) => !a[1]!.includes("/actions/runs?"));
+	return ops.apiCalls
+		.filter((a) => !a[1]!.includes("/actions/runs?"))
+		.map((a) => [a[0]!, a[1]!.split("?")[0]!]);
+}
+
+/** One JSON array body for the feedback sweep's list reads. */
+const jsonList = (xs: unknown[]) => ({
+	code: 0,
+	stdout: JSON.stringify(xs),
+	stderr: "",
+});
+
+/** OTTR-877: routes the feedback sweep's three list reads by URL suffix; `pull` answers
+ * the per-PR verdict read, everything else the open-PR list. */
+function feedbackApi(o: {
+	issue?: unknown[];
+	comments?: unknown[];
+	reviews?: unknown[];
+	pull?: string;
+}) {
+	return (url: string) => {
+		// The three list reads carry `?per_page=100&since=...`; route on the stripped base.
+		const base = url.split("?")[0]!;
+		if (base.endsWith("/issues/7/comments")) return jsonList(o.issue ?? []);
+		if (base.endsWith("/pulls/7/comments")) return jsonList(o.comments ?? []);
+		if (base.endsWith("/pulls/7/reviews")) return jsonList(o.reviews ?? []);
+		if (base.endsWith("/pulls/7"))
+			return {
+				code: 0,
+				stdout: o.pull ?? pullBody({ state: "open", mergeable: true }),
+				stderr: "",
+			};
+		return openList([7]);
+	};
 }
 
 describe("prPass", () => {
@@ -3636,7 +3691,13 @@ describe("prPass", () => {
 			apiResult: prApi(pullBody({ state: "open", mergeable: true })),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		expect((await store.getTask(t.id))!).toEqual(before);
+		// The sweep's first window stamps prWatchAt; no verdict field moves.
+		expect((await store.getTask(t.id))!).toEqual({
+			...before,
+			prWatchAt: expect.any(Number),
+			updatedAt: expect.any(Number),
+			revision: before.revision + 1,
+		});
 		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
 		expect(ops.calls.fetches).toEqual([]);
 		await store.close();
@@ -3683,7 +3744,14 @@ describe("prPass", () => {
 		ops.time += 6 * 60_000; // past the PR poll window
 		await tick(projects, ops);
 		expect((await store.getTask(t.id))!).toEqual(parked);
-		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ, PR_LIST, PR7_READ]);
+		// The conflict-parked card still gets the sweep's three reads, and they write nothing.
+		expect(pullCalls(ops)).toEqual([
+			PR_LIST,
+			PR7_READ,
+			PR_LIST,
+			PR7_READ,
+			...PR7_FEEDBACK,
+		]);
 		const log = await Bun.file(await store.logPath(t.id)).text();
 		expect(log.match(/has merge conflicts/g)).toHaveLength(1);
 		await store.close();
@@ -3739,7 +3807,15 @@ describe("prPass", () => {
 				(await store.getTask(idle.id))!,
 				(await store.getTask(parked.id))!,
 			];
-			expect(after).toEqual(before);
+			// Both cards get the sweep's init stamp; no verdict field moves.
+			expect(after).toEqual(
+				before.map((b) => ({
+					...b,
+					prWatchAt: expect.any(Number),
+					updatedAt: expect.any(Number),
+					revision: b.revision + 1,
+				})),
+			);
 			// listTasks is newest first, so PR #8 is read before PR #7.
 			expect(pullCalls(ops)).toEqual([PR_LIST, PR8_READ, PR7_READ]);
 			await store.close();
@@ -3823,7 +3899,13 @@ describe("prPass", () => {
 			apiResult: prApi(pullBody({ state: "closed", mergeable: false })),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		expect((await store.getTask(t.id))!).toEqual(before);
+		// The state check skips the verdict; the sweep still stamps its init cutoff.
+		expect((await store.getTask(t.id))!).toEqual({
+			...before,
+			prWatchAt: expect.any(Number),
+			updatedAt: expect.any(Number),
+			revision: before.revision + 1,
+		});
 		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
 		expect(ops.calls.fetches).toEqual([]);
 		await store.close();
@@ -3919,8 +4001,13 @@ describe("prPass", () => {
 		const verdict = fc.oneof(fc.boolean(), fc.constant(null), fc.jsonValue());
 		await fc.assert(
 			fc.asyncProperty(verdict, async (mergeable) => {
-				// One card for all runs: each run starts from the waiting state.
-				await store.updateTask(t.id, { state: "idle", needsReason: null });
+				// One card for all runs: each run starts from the waiting state, with the
+				// sweep cutoff armed so every window walks the three feedback reads.
+				await store.updateTask(t.id, {
+					state: "idle",
+					needsReason: null,
+					prWatchAt: 1_000_000_000,
+				});
 				const ops = fakeOps({
 					apiResult: prApi(pullBody({ state: "open", mergeable })),
 				});
@@ -3931,7 +4018,7 @@ describe("prPass", () => {
 				expect(after.stage).toBe("merging");
 				expect(after.state).toBe(parks ? "needs_you" : "idle");
 				expect(after.needsReason).toBe(parks ? PR7_CONFLICT : null);
-				expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
+				expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ, ...PR7_FEEDBACK]);
 			}),
 			// Gate: the shared fixed-seed helper; 100 runs here, below the 200 gate.
 			{ numRuns: 100 },
@@ -4700,6 +4787,154 @@ describe("prPass", () => {
 		const log = await Bun.file(await store.logPath(t.id)).text();
 		expect(log).toContain("supervisor: PR #7 merged; card done");
 		await store.close();
+	});
+
+	// ---- OTTR-877 review feedback watch ----
+
+	const COMMENT_ISO = "2026-11-01T12:00:00Z";
+	const COMMENT_TS = Date.parse(COMMENT_ISO);
+	const comment = (login = "alice", body = "Please fix the leak") => ({
+		user: { login },
+		created_at: COMMENT_ISO,
+		body,
+	});
+
+	test("new comment parks the idle card with a DATA block and advances the cutoff", async () => {
+		const store = prModeProject("pr-feedback-park");
+		const t = prCard(store);
+		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(prFeedbackReason(7));
+		expect(after.pendingPrompt).toContain(
+			`REVIEW COMMENT by alice at ${new Date(COMMENT_TS).toISOString()}`,
+		);
+		expect(after.pendingPrompt).toContain("<<<DATA");
+		expect(after.pendingPrompt).toContain("Please fix the leak");
+		expect(after.pendingPrompt).toContain("DATA>>>");
+		expect(after.pendingBy).toBe("supervisor");
+		expect(after.prWatchAt).toBe(COMMENT_TS);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 review feedback; card parked");
+		store.close();
+	});
+
+	test("the same feedback never parks twice: the cutoff advance dedupes", async () => {
+		const store = prModeProject("pr-feedback-dedupe");
+		const t = prCard(store);
+		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		const projects = new Map([["proj", entry(store)]]);
+		await tick(projects, ops);
+		const parked = store.getTask(t.id)!;
+		expect(parked.needsReason).toBe(prFeedbackReason(7));
+		ops.time += 6 * 60_000; // past the PR poll window
+		await tick(projects, ops);
+		const after = store.getTask(t.id)!;
+		expect(after.pendingPrompt).toBe(parked.pendingPrompt);
+		expect(after.prWatchAt).toBe(parked.prWatchAt);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log.match(/review feedback; card parked/g)).toHaveLength(1);
+		store.close();
+	});
+
+	test("the first sweep initializes the cutoff silently and never parks", async () => {
+		const store = prModeProject("pr-feedback-first");
+		const t = prCard(store); // prWatchAt left null
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.prWatchAt).toBeNumber();
+		const logPath = store.logPath(t.id);
+		// A silent sweep writes no log line, so the file may not exist at all.
+		const log = existsSync(logPath) ? await Bun.file(logPath).text() : "";
+		expect(log).not.toContain("review feedback");
+		store.close();
+	});
+
+	test("a changes-requested review parks the card with its DATA block", async () => {
+		const store = prModeProject("pr-feedback-changes");
+		const t = prCard(store);
+		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const ops = fakeOps({
+			apiResult: feedbackApi({
+				reviews: [
+					{
+						user: { login: "bob" },
+						state: "CHANGES_REQUESTED",
+						submitted_at: COMMENT_ISO,
+						body: "Rework the parser",
+					},
+				],
+			}),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(prFeedbackReason(7));
+		expect(after.pendingPrompt).toContain(
+			`CHANGES REQUESTED by bob at ${new Date(COMMENT_TS).toISOString()}`,
+		);
+		expect(after.pendingPrompt).toContain("Rework the parser");
+		expect(after.prWatchAt).toBe(COMMENT_TS);
+		store.close();
+	});
+
+	test("a conflict park keeps its reason and appends the new block", async () => {
+		const store = prModeProject("pr-feedback-conflict");
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: PR7_CONFLICT,
+			pendingPrompt: "resolve the conflict first",
+			pendingBy: "user",
+			prWatchAt: 1_000_000_000,
+		});
+		const ops = fakeOps({
+			apiResult: feedbackApi({
+				pull: pullBody({ state: "open", mergeable: false }),
+				issue: [comment("carol", "Also fix the docs link")],
+			}),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(PR7_CONFLICT);
+		expect(after.pendingPrompt).toContain("resolve the conflict first");
+		expect(after.pendingPrompt).toContain("REVIEW COMMENT by carol");
+		expect(after.pendingPrompt).toContain("Also fix the docs link");
+		store.close();
+	});
+
+	test("a live turn is skipped: the pass makes no comments or reviews reads", async () => {
+		const store = prModeProject("pr-feedback-running");
+		const t = prCard(store);
+		store.updateTask(t.id, { state: "running", prWatchAt: 1_000_000_000 });
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const read = (s: string) => ops.apiCalls.filter((a) => a[1]!.includes(s));
+		expect(read("/issues/7/comments")).toEqual([]);
+		expect(read("/pulls/7/comments")).toEqual([]);
+		expect(read("/pulls/7/reviews")).toEqual([]);
+		expect(read("/pulls/7")).toEqual([]); // the verdict read skips too
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("running");
+		expect(after.pendingPrompt).toBeNull();
+		store.close();
 	});
 });
 

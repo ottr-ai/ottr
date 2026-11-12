@@ -282,8 +282,55 @@ ff-only merge flow is untouched.
   an open PR that conflicts with its target branch: see "Open PR that cannot
   merge".
 - No ottr write touches the PR: no merge, close, comment, review event,
-  label or reviewer. Humans merge on GitHub under the repo's protection
-  rules.
+  label or reviewer (the review feedback watch below only reads). Humans
+  merge on GitHub under the repo's protection rules.
+
+### Review feedback watch (OTTR-877)
+
+While a PR-mode card's pull request is open, the card watches its PR's
+conversation and reviews. The watcher that files "PR review" cards for
+outside pull requests skips the project's own: a pull request whose number
+is any card's `prNumber`, or whose head branch is any card's `branch`, gets
+no review card and spends no daily-cap slot.
+
+The supervisor's PR pass (the same 5-minute window as the merge verdict)
+reads, for each tracked card whose PR is in the open list, the issue
+comments and the review comments since the card's cutoff (`?since=`), plus
+the PR's reviews kept only when the state is `CHANGES_REQUESTED` and
+`submitted_at` parses after the cutoff. The cutoff is the task's
+`pr_watch_at` column, added like the PR fields and migrated in
+`ProjectStore.open`. A null cutoff initializes to now and stays silent, so
+the first sweep after a deploy never parks. A card is read only while its
+stage is `merging`, its PR is in the open list, and its state is `idle`,
+`needs_you` with the conflict reason, or `needs_you` with the feedback
+reason below. A running, preparing, or queued card gets no read: its turn
+settles the card.
+
+New feedback parks the card `merging`/`needs_you` with this reason:
+
+```
+PR #N received new review comments or a changes-requested review. Reply to start a fix turn; the tracker pushes the branch and updates the pull request.
+```
+
+The comments and the requested-change reviews ride on the card as untrusted
+DATA blocks (`<<<DATA` ... `DATA>>>`, each body through `clean()`), one
+block per comment or review, with the author login and the ISO time in the
+block label (`REVIEW COMMENT by <login> at <iso>` / `CHANGES REQUESTED by
+<login> at <iso>`). A fixed trusted header above the blocks names them
+untrusted. A body is capped at 4000 characters with a cut marker; over a
+50000-character budget the oldest blocks drop with an omission line, the
+newest kept. The park is one task write that also advances the cutoff to
+the newest item, so the same comment never parks twice (one dedupe per
+review round, like the CI-failure reply). Feedback that arrives while the
+card is parked appends its blocks to the queued text; the conflict reason
+stays, so the mergeability un-park keeps working. The card log gets one
+line per park write.
+
+A reply on the parked card queues a work fix turn (stage `in_progress`);
+the merge turn after it re-ships the branch and updates the same pull
+request (OTTR-799). The watch makes no model call and takes no daily-cap
+slot; its cost is at most three paged `gh api` list reads per watched card
+per window.
 
 ## PR close without merge
 
@@ -463,9 +510,11 @@ Non-goals of this section:
 
 - No automatic rebase. The non-goal below stands.
 - No reaction to `mergeable_state` values such as `blocked`, `behind`,
-  `unstable` or `draft`. Pending reviews and checks are normal waits.
+  `unstable` or `draft`; the merge verdict reads `mergeable` only. Review
+  feedback is the watch section's concern, not this pass.
 - No write to the pull request.
-- No new task column, no UI change and no prompt change.
+- No new task column for the conflict state, no UI change and no prompt
+  change; the feedback watch below adds its own cutoff column.
 
 ## CI watch on the PR head
 
@@ -537,8 +586,10 @@ server remains the only writer of origin.
   differs.
 - Ottr does not rewrite any project's AGENTS.md; a project that enables PR
   mode updates its own merge-turn section (agent-data repo).
-- The `prReviews` watcher keeps its current behavior; PR-mode PRs are normal
-  PRs to it.
+- No automatic fix turn without the user's reply: the feedback watch parks
+  the card, and only a reply starts the fix turn.
+- No reply from the board to the pull request: the feedback watch reads the
+  conversation and never comments, reviews or writes to the PR.
 
 ## Acceptance checks
 
@@ -625,4 +676,16 @@ server remains the only writer of origin.
   runs.
 - Fresh and migrated databases converge on the new columns; no CHECK
   migration.
+- Review feedback watch (OTTR-877): a project with a PR-mode card whose
+  `prNumber` is 7 and an open PR #7 gets no review card from the watcher; a
+  person's open PR #8 in the same project still gets one. A PR whose head
+  branch is a card branch but whose number matches no card gets no review
+  card either. A new review comment on the card's PR parks the card
+  `merging`/`needs_you` with the feedback reason, the comment as a DATA
+  block, the author login, and the cutoff advanced; the same comment seen
+  in a later window parks nothing new. A `CHANGES_REQUESTED` review after
+  the cutoff parks the same way. The first sweep after the park initializes
+  nothing and a reply on the parked card queues a work fix turn whose merge
+  turn updates the same PR. Fresh and migrated databases converge on
+  `pr_watch_at`.
 - `bun run check` and `bun test` exit 0 from the worktree root.

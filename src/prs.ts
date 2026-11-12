@@ -1033,11 +1033,29 @@ async function closeGonePulls(
 	}
 }
 
+/** The PR numbers and branch names of the project's cards: pull requests the board opened
+ * itself. The watcher never files a review card for one. */
+function ownPulls(store: ForkProject["store"]): {
+	numbers: Set<number>;
+	branches: Set<string>;
+} {
+	const numbers = new Set<number>();
+	const branches = new Set<string>();
+	for (const c of await store.listTasks()) {
+		if (c.prNumber !== null) numbers.add(c.prNumber);
+		if (c.branch !== null) branches.add(c.branch);
+	}
+	return { numbers, branches };
+}
+
 /** Open, non-draft rows whose head the project has not reviewed yet and whose quiet period is over. */
 async function dueReviewRows(
 	store: ForkProject["store"],
 	t: number,
+	pulls: PullInfo[],
 ): Promise<PrReviewRow[]> {
+	const byNumber = new Map(pulls.map((p) => [p.number, p]));
+	const own = ownPulls(store);
 	const due: PrReviewRow[] = [];
 	for (const row of await store.listPrReviews()) {
 		if (
@@ -1050,6 +1068,12 @@ async function dueReviewRows(
 		const card = row.taskId ? await store.getTask(row.taskId) : null;
 		// A cancelled card is the user's "never review this PR".
 		if (card?.cancelledAt != null) continue;
+		const info = byNumber.get(row.number);
+		if (
+			own.numbers.has(row.number) ||
+			(info?.headRef != null && own.branches.has(info.headRef))
+		)
+			continue;
 		due.push(row);
 	}
 	return due;
@@ -1084,8 +1108,9 @@ async function runDueReviews(
 	repo: string,
 	store: ForkProject["store"],
 	t: number,
+	pulls: PullInfo[],
 ): Promise<void> {
-	for (const row of await dueReviewRows(store, t)) {
+	for (const row of await dueReviewRows(store, t, pulls)) {
 		if (
 			(await store.prReviewRunsSince(t - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
@@ -1131,7 +1156,7 @@ async function scanProject(
 	});
 	if ((await store.getSettings()).prReviewNotify === true)
 		await sweepNotifiedRows(ctx, project, repo);
-	await runDueReviews(ctx, project, repo, store, t);
+	await runDueReviews(ctx, project, repo, store, t, pulls);
 }
 
 /**
@@ -1459,9 +1484,10 @@ function prHeadInfo(stdout: string): {
 	head: string;
 	draft: boolean;
 	title: string;
+	ref: string | null;
 } {
 	const j = JSON.parse(stdout) as {
-		head?: { sha?: unknown };
+		head?: { sha?: unknown; ref?: unknown };
 		draft?: unknown;
 		title?: unknown;
 	} | null;
@@ -1474,6 +1500,10 @@ function prHeadInfo(stdout: string): {
 			typeof j.title === "string"
 				? stripInvisible(j.title).text.trim().slice(0, 120)
 				: "",
+		ref:
+			typeof j.head.ref === "string" && j.head.ref.length > 0
+				? j.head.ref
+				: null,
 	};
 }
 
@@ -1511,10 +1541,23 @@ async function requestReview(
 	let head: string;
 	let draft: boolean;
 	let title: string;
+	let ref: string | null;
 	try {
-		({ head, draft, title } = prHeadInfo(r.stdout));
+		({ head, draft, title, ref } = prHeadInfo(r.stdout));
 	} catch (e) {
 		ctx.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
+		return;
+	}
+	if (original === null) {
+		ctx.log(`prs: ${project.name}: #${o.number} is not watched`);
+		return;
+	}
+	// The project's own PR-mode work: a review here would answer the board itself.
+	const own = ownPulls(store);
+	if (own.numbers.has(o.number) || (ref !== null && own.branches.has(ref))) {
+		ctx.log(
+			`prs: ${project.name}: #${o.number} is this project's own PR; not reviewed`,
+		);
 		return;
 	}
 	const updated = await store.transaction(async () => {

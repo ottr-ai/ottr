@@ -323,6 +323,7 @@ import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, type SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
 import { type BoardTurnFacts, ProjectStore, type TaskPatch } from "./store.ts";
+import { prFeedbackReason } from "./supervisor.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
 	createSystemSampler,
@@ -10440,6 +10441,23 @@ export async function createApp(deps: AppDeps) {
 		}
 		return null;
 	}
+	/** A reply on a PR-mode card parked for review feedback (OTTR-877): queues a work fix turn
+	 * under the parked DATA blocks; the merge turn after it re-ships and updates the same PR. */
+	function prFeedbackFixReply(
+		e: Entry,
+		task: Task,
+		text: string,
+		images: string[],
+	): Response | null {
+		if (task.stage !== "merging" || task.prNumber === null) return null;
+		if (task.needsReason !== prFeedbackReason(task.prNumber)) return null;
+		e.store.updateTask(task.id, {
+			...replyPatch(task, text, images),
+			stage: "in_progress",
+		});
+		deps.schedule();
+		return taskResponse(e, task.id);
+	}
 	/** The gate park's Start anyway reply (docs/specs/prompt-gate.md): it approves the parked
 	 * prompt without a gate pass, so the next start skips the gate for this exact text. Any
 	 * other reply falls through to the queue and the gate re-runs on the next start. The
@@ -10756,6 +10774,8 @@ export async function createApp(deps: AppDeps) {
 		if (approval !== null) return approval;
 		const start = await gateStartReply(e, task, trimmed, images.length > 0);
 		if (start !== null) return start;
+		const fix = prFeedbackFixReply(e, task, trimmed || ".", names);
+		if (fix !== null) return fix;
 		await updateSnapshot(e, task, {
 			// "." keeps pendingPrompt non-null for a picture-only reply (see steer). A steer
 			// queued before the stop stays: the reply goes under it, and Resume (".") sends it alone.

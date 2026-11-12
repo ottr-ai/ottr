@@ -98,6 +98,7 @@ import {
 } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import { ProjectStore } from "./store.ts";
+import { prFeedbackReason } from "./supervisor.ts";
 import fc from "./test/properties.ts";
 import type { TmpDiskSpace } from "./tmpsweep.ts";
 import { formatBytes } from "./tmpsweep.ts";
@@ -2127,6 +2128,31 @@ describe("task routes", () => {
 		expect(askRow.stage).toBe("backlog");
 		expect(askRow.state).toBe("needs_you");
 		expect(askRow.asked).not.toBeNull();
+		expect(calls).toBe(before + 1);
+	});
+
+	test("a reply on a PR feedback park queues the fix turn under the blocks", async () => {
+		const blocks =
+			"REVIEW COMMENT by alice at 2026-11-01T12:00:00.000Z\n<<<DATA\nPlease fix the leak\nDATA>>>";
+		const t = store.createTask("parked for review feedback");
+		store.updateTask(t.id, {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: prFeedbackReason(7),
+			prNumber: 7,
+			pendingPrompt: blocks,
+			pendingBy: "supervisor",
+		});
+		const before = calls;
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "fix it",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.stage).toBe("in_progress");
+		expect(row.state).toBe("queued");
+		expect(row.needsReason).toBeNull();
+		expect(row.pendingPrompt).toBe(`${blocks}\n\nfix it`);
 		expect(calls).toBe(before + 1);
 	});
 

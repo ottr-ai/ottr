@@ -333,6 +333,7 @@ interface TaskRow {
 	pr_number: number | null;
 	pr_url: string | null;
 	pr_head_sha: string | null;
+	pr_watch_at: number | null;
 	source_pr_number: number | null;
 	source_pr_url: string | null;
 	source_pr_head_ref: string | null;
@@ -560,6 +561,7 @@ function toListedTask(
 		prNumber: r.pr_number,
 		prUrl: r.pr_url,
 		prHeadSha: r.pr_head_sha,
+		prWatchAt: r.pr_watch_at,
 		sourcePrNumber: r.source_pr_number,
 		sourcePrUrl: r.source_pr_url,
 		sourcePrHeadRef: r.source_pr_head_ref,
@@ -876,6 +878,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	prNumber: "pr_number",
 	prUrl: "pr_url",
 	prHeadSha: "pr_head_sha",
+	prWatchAt: "pr_watch_at",
 	sourcePrNumber: "source_pr_number",
 	sourcePrUrl: "source_pr_url",
 	sourcePrHeadRef: "source_pr_head_ref",
@@ -1955,6 +1958,25 @@ export class ProjectStore {
 					cols,
 					"follow_up_pr_url",
 					"ALTER TABLE tasks ADD COLUMN follow_up_pr_url TEXT",
+				);
+				// OTTR-877: the review feedback watch's cutoff. Null = never swept. ALTER-only
+				// after both CHECK rebuilds, same reason as pr_number above — a rebuild's
+				// explicit column list would drop them.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pr_watch_at",
+					"ALTER TABLE tasks ADD COLUMN pr_watch_at INTEGER",
+				);
+				// OTTR-877: marks a pending_prompt the feedback watch wrote, so passes settle
+				// through it (wentStale ignores it) and moving the card off the park clears it
+				// with the prompt. ALTER-only after both CHECK rebuilds, same reason as
+				// pr_watch_at above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pending_feedback",
+					"ALTER TABLE tasks ADD COLUMN pending_feedback INTEGER NOT NULL DEFAULT 0",
 				);
 				const turnCols = (
 					await db.query<{ name: string }, []>("PRAGMA table_info(turns)").all()
