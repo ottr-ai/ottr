@@ -648,6 +648,15 @@ async function mount(
 	return { g, app: created, server: srv, call };
 }
 
+/** OTTR-866: publishState() rebuilds the state only after a publishSoon() bumped the state
+ *  version. The publish tests drive the store directly (no route, no guarded publishSoon),
+ *  so every explicit publish goes through this: bump, then publish synchronously. The
+ *  queued sweep timer later finds the version consumed and skips the rebuild. */
+function publishNow(a: App): boolean {
+	a.publishSoon();
+	return a.publishState();
+}
+
 describe(
 	"card model validation at the filing routes",
 	await (async () => {
@@ -11234,6 +11243,32 @@ describe("web push (R1-1, R2-3)", () => {
 		classes: ALL_CLASSES_ON,
 	};
 
+	test("publishState rebuilds only after a publishSoon bumped the version (OTTR-866)", () => {
+		const g = GlobalStore.open(join(root, "g-gate"));
+		const m = mount({ gstore: g });
+		// One push consumer, so publishState takes the full path instead of the
+		// no-consumer early-out that skips the build for its own reason.
+		saveSubs(g, [pushSub]);
+		// First call: nothing built yet, so the gate starts open and the build runs.
+		expect(m.app.publishState()).toBe(true);
+		expect(m.app.stateBuilds()).toBe(1);
+		// The 1 s tick's call: no publishSoon between two publishState calls, so the
+		// frame is reused — no rebuild, no publish (the gate-skip path). Ungated, this
+		// call rebuilds the whole state a second time and the build count below fails.
+		expect(m.app.publishState()).toBe(false);
+		expect(m.app.stateBuilds()).toBe(1);
+		// A publishSoon opens the gate: exactly one rebuild, and the changed content
+		// (a notice key in inboxSeen) publishes. The timer it queued finds the version
+		// already consumed and skips.
+		g.set("inbox_seen", ["notice:x"]);
+		m.app.publishSoon();
+		expect(m.app.publishState()).toBe(true);
+		expect(m.app.stateBuilds()).toBe(2);
+		// The publishSoon above arms a timer that outlives this test; the shared afterAll
+		// closes the store (mountStores), like every other test that arms one.
+		mountStores.push(g);
+	});
+
 	test("push config heals a stored @localhost subject", async () => {
 		const g = await GlobalStore.open(join(root, "g-vapid"));
 		await g.set("config", {
@@ -11258,14 +11293,18 @@ describe("web push (R1-1, R2-3)", () => {
 	});
 
 	test("a needs-you transition pushes with zero open sockets", async () => {
-		await saveSubs(gstore, [pushSub]);
+
+		saveSubs(gstore, [pushSub]);
 		const t = await store.createTask("push me");
-		await app.publishState(); // baseline: prev = null is silent
+		await publishNow(app); // baseline: prev = null is silent
+
 		const sends = pushSends.length;
 		await store.updateTask(t.id, { state: "needs_you", needsReason: "?" });
 		// Old code returned before the diff when sockets === 0, so with the board closed —
 		// and always, in NODE_ENV=production — no push ever fired.
-		expect(await app.publishState()).toBe(true);
+
+		expect(await publishNow(app)).toBe(true);
+
 		expect(pushSends.length).toBe(sends + 1);
 		expect(pushSends[pushSends.length - 1]!.endpoint).toBe(pushSub.endpoint);
 	});
@@ -11277,10 +11316,12 @@ describe("web push (R1-1, R2-3)", () => {
 			null,
 			"retro",
 		);
-		await app.publishState(); // baseline
+
+		await publishNow(app); // baseline
 		const sends = pushSends.length;
 		await store.updateTask(retro.id, { state: "needs_you", needsReason: "?" });
-		expect(await app.publishState()).toBe(true);
+		expect(await publishNow(app)).toBe(true);
+
 		// Retro housekeeping is silent even on a real needs_you transition.
 		expect(pushSends.length).toBe(sends);
 		// A card absent from the previous frame alerts only in needs_you: retro proposals.
@@ -11289,7 +11330,9 @@ describe("web push (R1-1, R2-3)", () => {
 			state: "needs_you",
 			needsReason: "Proposed",
 		});
-		await app.publishState();
+
+		await publishNow(app);
+
 		expect(pushSends.length).toBe(sends + 1);
 	});
 
@@ -11494,11 +11537,13 @@ describe("web push (R1-1, R2-3)", () => {
 			endpoint: quiet,
 			classes: { request: true, error: true, complete: false },
 		});
+
 		const t = await b.s.createTask("finish me");
-		await b.m.app.publishState(); // baseline: the first frame alerts nothing
+		await publishNow(b.m.app); // baseline: the first frame alerts nothing
 		const from = pushSends.length;
 		await b.s.updateTask(t.id, { stage: "done", state: "idle" });
-		expect(await b.m.app.publishState()).toBe(true);
+		expect(await publishNow(b.m.app)).toBe(true);
+
 		const sent = b.sentSince(from);
 		expect(sent.map((x) => x.endpoint)).toEqual([loud]);
 		expect(sent[0]!.payload).toMatchObject({
@@ -11511,18 +11556,22 @@ describe("web push (R1-1, R2-3)", () => {
 	test("an error turn pushes an Error alert keyed by the turn", async () => {
 		const b = await alertBoard("alert-error");
 		await b.subscribe("https://push.example/err");
+
 		const t = await b.s.createTask("will fail");
 		await b.s.updateTask(t.id, { state: "running" });
-		const turn = await b.s.startTurn(t.id, "work", ".", null);
-		await b.m.app.publishState(); // baseline: the turn is still open
+		const turn = b.s.startTurn(t.id, "work", ".", null);
+		await publishNow(b.m.app); // baseline: the turn is still open
+
 		const from = pushSends.length;
 		await b.s.finishTurn(turn.id, {
 			endedAt: Date.now(),
 			exitCode: 1,
 			error: "boom",
 		});
+
 		await b.s.updateTask(t.id, { state: "queued" });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload).toMatchObject({
@@ -11538,11 +11587,13 @@ describe("web push (R1-1, R2-3)", () => {
 		await b.m.call("/api/notifications/prefs", {
 			mutedProjects: ["alert-muted"],
 		});
+
 		const t = await b.s.createTask("ask quietly");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
 		const from = pushSends.length;
-		await b.needsYou(t.id);
-		expect(await b.m.app.publishState()).toBe(true);
+		b.needsYou(t.id);
+		expect(await publishNow(b.m.app)).toBe(true);
+
 		expect(b.sentSince(from)).toEqual([]);
 		const state = (await (await b.m.call("/api/state")).json()) as {
 			tasks: Array<{ id: string; state: string }>;
@@ -11581,12 +11632,14 @@ describe("web push (R1-1, R2-3)", () => {
 			blocking: true,
 		});
 		// The review is posted; the post baseline keeps its own comments silent.
-		await s.savePrReview({ ...(await s.getPrReview(4242))!, postedHead: HEAD });
-		await s.setPrComments(4242, 5_000, false);
-		await b.m.app.publishState(); // baseline: the first frame alerts nothing
+
+		s.savePrReview({ ...s.getPrReview(4242)!, postedHead: HEAD });
+		s.setPrComments(4242, 5_000, false);
+		await publishNow(b.m.app); // baseline: the first frame alerts nothing
 		const from = pushSends.length;
-		await s.setPrComments(4242, 6_000, true);
-		expect(await b.m.app.publishState()).toBe(true);
+		s.setPrComments(4242, 6_000, true);
+		expect(await publishNow(b.m.app)).toBe(true);
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload).toMatchObject({
@@ -11625,8 +11678,10 @@ describe("web push (R1-1, R2-3)", () => {
 		).keys;
 		expect(keys).toContain(`pr:${t.id}:6000`);
 		expect(keys).toContain(`task:${t.id}:needs-pr${run}`);
-		// The queued publish prunes the acked key only after the immediate GET above.
-		await b.flush();
+
+		// The cleared stamp is over: the next publish prunes the acked key.
+		await publishNow(b.m.app);
+
 		keys = (
 			(await (await b.m.call("/api/inbox/seen")).json()) as { keys: string[] }
 		).keys;
@@ -11663,8 +11718,10 @@ describe("web push (R1-1, R2-3)", () => {
 			prompt: "review",
 			blocking: true,
 		});
-		await b.needsYou(t.id);
-		await b.m.app.publishState(); // baseline: the first draft is already in the frame
+
+		b.needsYou(t.id);
+		await publishNow(b.m.app); // baseline: the first draft is already in the frame
+
 		const from = pushSends.length;
 		const run2 = await s.startPrRun(4243, HEAD, 2);
 		await s.savePrDraft({
@@ -11675,8 +11732,10 @@ describe("web push (R1-1, R2-3)", () => {
 			prompt: "review",
 			blocking: true,
 		});
-		await b.needsYou(t.id);
-		expect(await b.m.app.publishState()).toBe(true);
+
+		b.needsYou(t.id);
+		expect(await publishNow(b.m.app)).toBe(true);
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload).toMatchObject({
@@ -11718,8 +11777,10 @@ describe("web push (R1-1, R2-3)", () => {
 			prompt: "review",
 			blocking: true,
 		});
-		await b.needsYou(t.id);
-		await b.m.app.publishState(); // baseline
+
+		b.needsYou(t.id);
+		await publishNow(b.m.app); // baseline
+
 		const occOf = (await (await b.m.call("/api/state")).json()) as {
 			tasks: Array<{
 				id: string;
@@ -11738,10 +11799,10 @@ describe("web push (R1-1, R2-3)", () => {
 				})
 			).status,
 		).toBe(200);
-		await s.setPrComments(4244, 7_000, true);
-		expect(await b.m.app.publishState()).toBe(true);
-		expect(b.sentSince(from)).toEqual([]);
-		await b.flush();
+
+		s.setPrComments(4244, 7_000, true);
+		expect(await publishNow(b.m.app)).toBe(true);
+
 		expect(b.sentSince(from)).toEqual([]);
 		// No stamp in the frame: the bell and the event diff see no occurrence at all.
 		const quietFrame = (await (await b.m.call("/api/state")).json()) as {
@@ -11758,22 +11819,26 @@ describe("web push (R1-1, R2-3)", () => {
 	test("a focused tab holds pushes for 60 s; held events are dropped, never sent later", async () => {
 		const b = await alertBoard("alert-presence");
 		await b.subscribe("https://push.example/presence");
+
 		const held = await b.s.createTask("held ask");
 		const later = await b.s.createTask("later ask");
 		const last = await b.s.createTask("last ask");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const beat = (focused: boolean, tab = "tab-1") =>
 			b.m.call("/api/presence", { tab, focused });
 		expect((await beat(true)).status).toBe(200);
 		const from = pushSends.length;
 		b.clock.now += 59_999;
-		await b.needsYou(held.id);
-		expect(await b.m.app.publishState()).toBe(true);
+
+		b.needsYou(held.id);
+		expect(await publishNow(b.m.app)).toBe(true);
 		expect(b.sentSince(from)).toEqual([]);
 		// The heartbeat is now exactly 60 s old: sends resume, for the new event only.
 		b.clock.now += 1;
-		await b.needsYou(later.id);
-		await b.m.app.publishState();
+		b.needsYou(later.id);
+		await publishNow(b.m.app);
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload.keys).toEqual([
@@ -11782,13 +11847,14 @@ describe("web push (R1-1, R2-3)", () => {
 		// focused:false ends the hold at once.
 		await beat(true);
 		await beat(false);
-		await b.needsYou(last.id);
-		await b.m.app.publishState();
+
+		b.needsYou(last.id);
+		await publishNow(b.m.app);
 		expect(b.sentSince(from).length).toBe(2);
 		// Nothing ever re-sends the held card's alert.
 		await b.s.createTask("unrelated");
-		await b.m.app.publishState();
-		const heldKey = taskEntryKey((await b.s.getTask(held.id))!);
+		await publishNow(b.m.app);
+
 		expect(
 			b
 				.sentSince(from)
@@ -11810,10 +11876,12 @@ describe("web push (R1-1, R2-3)", () => {
 		const apple = "https://web.push.apple.com/ack";
 		await b.subscribe(fcm);
 		await b.subscribe(apple);
+
 		const t = await b.s.createTask("ask me");
-		await b.m.app.publishState();
-		await b.needsYou(t.id);
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+		b.needsYou(t.id);
+		await publishNow(b.m.app);
+
 		const from = pushSends.length;
 		const res = await b.m.call("/api/inbox/seen", { taskIds: [t.id] });
 		expect(res.status).toBe(200);
@@ -11835,18 +11903,22 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-apple");
 		const apple = "https://web.push.apple.com/later";
 		await b.subscribe(apple);
+
 		const asked = await b.s.createTask("ask");
 		const done = await b.s.createTask("finish");
 		const third = await b.s.createTask("ask later");
-		await b.m.app.publishState();
-		await b.needsYou(asked.id);
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+		b.needsYou(asked.id);
+		await publishNow(b.m.app);
+
 		const from = pushSends.length;
 		await b.m.call("/api/inbox/seen", { taskIds: [asked.id] });
 		// No data-only push to Apple.
 		expect(b.sentSince(from)).toEqual([]);
+
 		await b.s.updateTask(done.id, { stage: "done", state: "idle" });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
 		expect(sent[0]!.payload).toMatchObject({
@@ -11855,8 +11927,10 @@ describe("web push (R1-1, R2-3)", () => {
 			clear: ["request"],
 		});
 		// Delivered once: the next alert carries no stale retraction.
-		await b.needsYou(third.id);
-		await b.m.app.publishState();
+
+		b.needsYou(third.id);
+		await publishNow(b.m.app);
+
 		expect(b.sentSince(from)[1]!.payload).toMatchObject({
 			tag: "request",
 			clear: [],
@@ -11880,11 +11954,13 @@ describe("web push (R1-1, R2-3)", () => {
 	test("a turn that starts and fails between two frames still pushes its Error", async () => {
 		const b = await alertBoard("alert-fast-fail");
 		await b.subscribe("https://push.example/fast");
+
 		const t = await b.s.createTask("fails fast");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
 		const from = pushSends.length;
-		const turn = await failTurn(b, t.id, "boom", "queued"); // same state and stage as before
-		await b.m.app.publishState();
+		const turn = failTurn(b, t.id, "boom", "queued"); // same state and stage as before
+		await publishNow(b.m.app);
+
 		expect(b.sentSince(from).map((x) => x.payload.keys)).toEqual([
 			[`error:${t.id}:${turn.id}`],
 		]);
@@ -11893,11 +11969,13 @@ describe("web push (R1-1, R2-3)", () => {
 	test("a cancelled turn is no failure: no Error push", async () => {
 		const b = await alertBoard("alert-cancel-turn");
 		await b.subscribe("https://push.example/cancel-turn");
+
 		const t = await b.s.createTask("stopped");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
 		const from = pushSends.length;
-		await failTurn(b, t.id, "cancelled", "queued");
-		await b.m.app.publishState();
+		failTurn(b, t.id, "cancelled", "queued");
+		await publishNow(b.m.app);
+
 		expect(b.sentSince(from)).toEqual([]);
 	});
 
@@ -11905,12 +11983,14 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-error-ack");
 		const fcm = "https://push.example/error-ack";
 		await b.subscribe(fcm);
+
 		const t = await b.s.createTask("fails then waits");
-		await b.m.app.publishState();
-		const turn = await failTurn(b, t.id, "boom", "queued");
-		await b.m.app.publishState(); // Error as error:<id>:<turn>
-		await b.needsYou(t.id);
-		await b.m.app.publishState(); // same failed turn: no Request
+		await publishNow(b.m.app);
+		const turn = failTurn(b, t.id, "boom", "queued");
+		await publishNow(b.m.app); // Error as error:<id>:<turn>
+		b.needsYou(t.id);
+		await publishNow(b.m.app); // same failed turn: no Request
+
 		const from = pushSends.length;
 		// "Mark all as read" acknowledges the bell's entry key, not the error key.
 		await b.m.call("/api/inbox/seen", {
@@ -11933,8 +12013,10 @@ describe("web push (R1-1, R2-3)", () => {
 	test("a reported needs_you hold is a Request, not an Error", async () => {
 		const b = await alertBoard("alert-hold");
 		await b.subscribe("https://push.example/hold");
+
 		const t = await b.s.createTask("holds for the user");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const from = pushSends.length;
 		await b.s.updateTask(t.id, { state: "running" });
 		const turn = await b.s.startTurn(t.id, "merge", ".", null);
@@ -11949,15 +12031,19 @@ describe("web push (R1-1, R2-3)", () => {
 			state: "needs_you",
 			needsReason: "Rebase onto origin/main first",
 		});
-		await b.m.app.publishState();
+
+		await publishNow(b.m.app);
+
 		expect(b.sentSince(from).map((x) => x.payload.tag)).toEqual(["request"]);
 	});
 
 	test("a needs_you report followed by a crash (bad exit) is an Error, as the runner classifies it", async () => {
 		const b = await alertBoard("alert-hold-crash");
 		await b.subscribe("https://push.example/hold-crash");
+
 		const t = await b.s.createTask("reports then dies");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const from = pushSends.length;
 		await b.s.updateTask(t.id, { state: "running" });
 		const turn = await b.s.startTurn(t.id, "work", ".", null);
@@ -11971,7 +12057,9 @@ describe("web push (R1-1, R2-3)", () => {
 			state: "needs_you",
 			needsReason: "omp exited with code 1 before finishing.",
 		});
-		await b.m.app.publishState();
+
+		await publishNow(b.m.app);
+
 		expect(b.sentSince(from).map((x) => x.payload.tag)).toEqual(["error"]);
 	});
 
@@ -11979,16 +12067,18 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-muted-tag");
 		const fcm = "https://push.example/muted-tag";
 		await b.subscribe(fcm);
+
 		const first = await b.s.createTask("delivered");
 		const second = await b.s.createTask("muted later");
-		await b.m.app.publishState();
-		await b.needsYou(first.id);
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+		b.needsYou(first.id);
+		await publishNow(b.m.app);
 		await b.m.call("/api/notifications/prefs", {
 			mutedProjects: ["alert-muted-tag"],
 		});
-		await b.needsYou(second.id);
-		await b.m.app.publishState();
+		b.needsYou(second.id);
+		await publishNow(b.m.app);
+
 		const from = pushSends.length;
 		await b.m.call("/api/inbox/seen", { taskIds: [first.id] });
 		expect(b.sentSince(from)).toEqual([
@@ -12003,8 +12093,10 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-long-ask");
 		const fcm = "https://push.example/long";
 		await b.subscribe(fcm);
+
 		const t = await b.s.createTask("long ask");
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const asked = Array.from({ length: 6 }, (_, i) => ({
 			question: `${"Which option fits the rollout plan best? ".repeat(8)}${i}`,
 			options: [{ label: "x".repeat(60) }, { label: "y".repeat(60) }],
@@ -12013,8 +12105,10 @@ describe("web push (R1-1, R2-3)", () => {
 			state: "needs_you",
 			asked,
 		} as Parameters<typeof b.s.updateTask>[1]);
-		await b.m.app.publishState();
-		const key = taskEntryKey((await b.s.getTask(t.id))!);
+
+		await publishNow(b.m.app);
+		const key = taskEntryKey(await b.s.getTask(t.id)!);
+
 		expect(JSON.stringify(asked).length).toBeGreaterThan(2000);
 		const from = pushSends.length;
 		expect((await b.m.call("/api/inbox/seen", { keys: [key] })).status).toBe(
@@ -12039,16 +12133,18 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-cancel-card");
 		const fcm = "https://push.example/cancel-card";
 		await b.subscribe(fcm);
+
 		const failed = await b.s.createTask("failed");
 		const done = await b.s.createTask("done");
-		await b.m.app.publishState();
-		await failTurn(b, failed.id, "boom", "queued");
+		await publishNow(b.m.app);
+		failTurn(b, failed.id, "boom", "queued");
 		await b.s.updateTask(done.id, { stage: "done", state: "idle" });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
 		const from = pushSends.length;
 		await b.s.updateTask(failed.id, { cancelledAt: Date.now() });
 		await b.s.updateTask(done.id, { cancelledAt: Date.now() });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		expect(b.sentSince(from)).toEqual([
 			{
 				endpoint: fcm,
@@ -12064,18 +12160,20 @@ describe("web push (R1-1, R2-3)", () => {
 	test("a frame's own alert classes never ride as clear tags on its other payloads", async () => {
 		const b = await alertBoard("alert-race");
 		await b.subscribe("https://push.example/race");
+
 		const old = await b.s.createTask("old ask");
 		const fresh = await b.s.createTask("new ask");
 		const fin = await b.s.createTask("finish");
-		await b.m.app.publishState();
-		await b.needsYou(old.id);
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+		b.needsYou(old.id);
+		await publishNow(b.m.app);
 		const from = pushSends.length;
 		// One frame: the old Request resolves while a new Request and a Complete arrive.
 		await b.s.updateTask(old.id, { state: "queued" });
-		await b.needsYou(fresh.id);
+		b.needsYou(fresh.id);
 		await b.s.updateTask(fin.id, { stage: "done", state: "idle" });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const sent = b.sentSince(from).map((x) => x.payload);
 		expect(sent.map((p) => p.tag).sort()).toEqual(["complete", "request"]);
 		for (const p of sent) expect(p.clear).toEqual([]);
@@ -12103,9 +12201,11 @@ describe("web push (R1-1, R2-3)", () => {
 				async (_, i) => (await b.s.createTask(`ask ${i}`)).id,
 			),
 		);
-		await b.m.app.publishState();
-		for (const id of ids) await b.needsYou(id);
-		await b.m.app.publishState();
+
+		await publishNow(b.m.app);
+		for (const id of ids) b.needsYou(id);
+		await publishNow(b.m.app);
+
 		expect((await liveOf(phone)).body.request).toEqual({ live: 21, seq: 1 });
 		// The device with Request off got nothing: nothing live there.
 		expect((await liveOf(quiet)).body.request).toEqual({ live: 0, seq: 0 });
@@ -12118,17 +12218,19 @@ describe("web push (R1-1, R2-3)", () => {
 	test("Apple: a pending retraction rides on the next alerts, bounded below the new alert's number", async () => {
 		const b = await alertBoard("alert-apple-race");
 		await b.subscribe("https://web.push.apple.com/race");
+
 		const old = await b.s.createTask("old ask");
 		const fresh = await b.s.createTask("new ask");
 		const fin = await b.s.createTask("finish");
-		await b.m.app.publishState();
-		await b.needsYou(old.id);
-		await b.m.app.publishState(); // request #1
+		await publishNow(b.m.app);
+		b.needsYou(old.id);
+		await publishNow(b.m.app); // request #1
 		await b.m.call("/api/inbox/seen", { taskIds: [old.id] }); // pending: request ≤ 1
 		const from = pushSends.length;
-		await b.needsYou(fresh.id);
+		b.needsYou(fresh.id);
 		await b.s.updateTask(fin.id, { stage: "done", state: "idle" });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		const sent = b.sentSince(from).map((x) => x.payload);
 		expect(sent.map((p) => [p.tag, p.seq])).toEqual([
 			["request", 2],
@@ -12145,9 +12247,11 @@ describe("web push (R1-1, R2-3)", () => {
 		await b.needsYou(t.id);
 		const key = taskEntryKey((await b.s.getTask(t.id))!);
 		await b.m.call("/api/inbox/seen", { keys: [key] });
+
 		await b.s.updateTask(t.id, { state: "queued" });
-		await b.m.app.publishState();
-		await b.needsYou(t.id);
+		await publishNow(b.m.app);
+		b.needsYou(t.id);
+
 		const state = (await (await b.m.call("/api/state")).json()) as {
 			inboxSeen: string[];
 		};
@@ -12158,18 +12262,22 @@ describe("web push (R1-1, R2-3)", () => {
 		const b = await alertBoard("alert-restart");
 		const fcm = "https://push.example/restart";
 		await b.subscribe(fcm);
+
 		const acked = await b.s.createTask("ask before restart");
 		const resolved = await b.s.createTask("resolved while down");
-		await b.m.app.publishState();
-		await b.needsYou(acked.id);
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+		b.needsYou(acked.id);
+		await publishNow(b.m.app);
 		await b.s.updateTask(resolved.id, { stage: "done", state: "idle" });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		// While the board is down the card leaves done.
 		await b.s.updateTask(resolved.id, { stage: "in_progress" });
 		const r = await b.reboot();
 		const from = pushSends.length;
-		await r.app.publishState(); // first frame after boot: retracts what resolved meanwhile
+
+		await publishNow(r.app); // first frame after boot: retracts what resolved meanwhile
+
 		expect(b.sentSince(from)).toEqual([
 			{
 				endpoint: fcm,
@@ -12215,13 +12323,17 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(
 			(await b.m.call(`/api/projects/alert-seen/tasks/${t.id}`)).status,
 		).toBe(200);
-		await b.m.app.publishState();
+
+		await publishNow(b.m.app);
+
 		expect(await inboxSeen()).toEqual([]);
 		await b.m.call("/api/inbox/seen", { keys: ["notice:x", key] });
 		expect(await inboxSeen()).toEqual([key, "notice:x"].sort());
 		// The card leaves needs_you: the publish prunes its task key; notice keys stay for the client.
+
 		await b.s.updateTask(t.id, { state: "queued", needsReason: null });
-		await b.m.app.publishState();
+		await publishNow(b.m.app);
+
 		expect(await inboxSeen()).toEqual(["notice:x"]);
 		await b.m.call("/api/inbox/seen", { drop: ["notice:x"] });
 		expect(await inboxSeen()).toEqual([]);
@@ -14105,7 +14217,9 @@ describe("update cycle control (OTTR-752)", () => {
 					)
 				).status,
 			).toBe(200);
-			await m.app.publishState();
+
+			await publishNow(m.app);
+
 			expect(
 				await until(
 					"the changed update",
@@ -14118,7 +14232,9 @@ describe("update cycle control (OTTR-752)", () => {
 				commits: ["New subject"],
 			});
 			setSystemTime(time + UPDATE_HOST_LEASE_MS + 1_000);
-			await m.app.publishState();
+
+			await publishNow(m.app);
+
 			expect(
 				await until(
 					"the expired update",

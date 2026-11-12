@@ -1787,6 +1787,9 @@ const settingParsers: FieldParser[] = [
 export type App = Awaited<ReturnType<typeof createApp>>;
 export type AppServeOptions = App["serveOptions"];
 
+/** The app object createApp returns; the name tests and callers import for its contract. */
+export type BoardApp = ReturnType<typeof createApp>;
+
 /** OTTR-488: card-view steps — the stored value, except legacy 'unknown' rows resolve against the stored report at read time (no row rewrite). 'unknown' in a view means quiet. */
 function viewSteps(t: Pick<Task, "steps" | "report">): Task["steps"] {
 	return t.steps !== "unknown"
@@ -1978,6 +1981,15 @@ export async function createApp(deps: AppDeps) {
 	 * the seenDoneSince baseline — a re-done card gets a new key, so its old one decays. Marks a
 	 * client sends for anything else are stale — a pre-server-sync tab imported marks for cards
 	 * it merely had open — so /api/seen drops them and the store decays instead of poisoning the board. */
+	/** OTTR-488 steps of a list row: the stored value, except research rows with legacy
+	 * 'unknown' steps resolve against the stored report. OTTR-866: list rows carry no
+	 * report, so only those rows read it back (one narrow query each). */
+	function listedSteps(e: Entry, t: ListedTask): Task["steps"] {
+		if (t.steps !== "unknown") return t.steps;
+		const report = t.research ? e.store.getTaskReport(t.id) : null;
+		return report !== null && recommendsSteps(report) ? "yes" : "unknown";
+	}
+
 	/** Whether a card's plain id is a read-mark key right now: pr_review, question-only answered,
 	 *  or done research whose report resolves to a steps value (see seenableIds). */
 	async function cardSeenable(t: ListedTask, e: Entry): Promise<boolean> {
@@ -2757,6 +2769,8 @@ export async function createApp(deps: AppDeps) {
 	async function memoryHealthTick(): Promise<void> {
 		try {
 			memoryHealth = await checkMemoryHealth(memoryBackendFromEnv(process.env));
+			// A changed reason lights the bell's warning: publish now, not on the sweep.
+			publishSoon();
 		} catch (err) {
 			// checkMemoryHealth reports reasons instead of throwing; a throw is a bug in the
 			// plumbing, and it must never take the board down.
@@ -2843,6 +2857,8 @@ export async function createApp(deps: AppDeps) {
 				),
 			),
 		);
+		// Fresh self-reports feed the bell's advisories: publish now, not on the sweep.
+		publishSoon();
 	}
 	function applyHindsight(): void {
 		if (hindsightUrl !== null) process.env.HINDSIGHT_API_URL = hindsightUrl;
@@ -2920,10 +2936,14 @@ export async function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		enabled: () => deps.shared.trendingScan,
 		load: loadTrendingState,
-		update: (modify) =>
+		update: (modify) => {
 			deps.gstore.update<TrendingState>("trending", (current) =>
 				modify(normalizeTrendingState(current)),
-			),
+			);
+			// The saved weekly slot and last outcome show on the board (trendingStatus):
+			// publish at the save edge, not on the sweep (OTTR-866).
+			publishSoon();
+		},
 		// No token and apiBase here: trending is a github.com feature, so the scan reads
 		// api.github.com and lends GH_TOKEN only on a github.com board (upstreamToken).
 		fetch: deps.trendingFetch,
@@ -3508,11 +3528,16 @@ export async function createApp(deps: AppDeps) {
 		// working on a busy board — when the provision gates below would defer the attempt.
 		const h = await alateHealth(alate);
 		if (h.ok) applyProvisionHealth(h);
+		// The health poll moves the bell's pending/error bookkeeping (applyProvisionHealth,
+		// and provisionGateBlocks' failed-probe record below): publish now, not on the sweep.
+		publishSoon();
 		if (await provisionGateBlocks(h)) return;
 		const r = await provisionNow();
 		if (!r.ok && r.running) return; // still running on alate; the outcome arrives via health
 		alateProvisionError = r.ok ? null : r.error;
 		if (!r.ok) alateBackoffUntil = Date.now() + 60 * 60_000;
+		// The attempt's outcome shows in alateView: publish now, not on the sweep.
+		publishSoon();
 	}
 
 	/** Files one architecture-review card; shared by the manual route and the idle auto-start
@@ -6613,7 +6638,17 @@ export async function createApp(deps: AppDeps) {
 			!(await loadInboxSeen()).some((k) => /^(task|done|error):/.test(k))
 		)
 			return false;
+		if (builtVersion === stateVersion) {
+			// OTTR-866: no publishSoon since the last build, so no store write can have
+			// landed (guarded() fires it after every mutation; the 5 s schedule sweep
+			// re-opens the gate for file-driven state). Skip the rebuild and behave like
+			// the unchanged-frame path below: refresh the small update frame, publish nothing.
+			publishUpdate();
+			return false;
+		}
 		const state = await stateResponse();
+		builtVersion = stateVersion;
+		builds++;
 		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
 		const inputs = await alertInputs(state.tasks, lastAlertInputs);
 		// The prune runs on every publish, consumers or not: a card that leaves needs_you and
@@ -6666,12 +6701,27 @@ export async function createApp(deps: AppDeps) {
 
 	// Coalesce publish requests within one event-loop turn: a mutating request touches the store
 	// several times before its response, and the board should ship one state frame, not five.
+	// OTTR-866: the 1 s server tick calls publishState() with open sockets even when nothing
+	// changed, and a full rebuild costs ~1 s at 10k tasks (OTTR-807). publishSoon() is the one
+	// change edge that opens the gate in publishState(): routes get it from guarded(), the
+	// ticks and scanners that write state-carrying fields call it directly, and the 5 s
+	// schedule sweep re-opens it so file-driven state never waits longer than one sweep.
+	let stateVersion = 0;
+	/** Version of the last built frame; -1 = nothing built yet, so the first build always runs. */
+	let builtVersion = -1;
+	/** Test seam: how often publishState() rebuilt the state (OTTR-866). */
+	let builds = 0;
 	let stateTimer: Timer | null = null;
 	function publishSoon(): void {
-		if (closing || stateTimer !== null) return;
+		if (closing) return;
+		// Bump before the queue check: a change arriving while a publish is queued must
+		// not be lost behind the already queued build.
+		stateVersion++;
+		if (stateTimer !== null) return;
 		stateTimer = setTimeout(() => {
 			stateTimer = null;
 			void publishState();
+>>>>>>> 880329a (perf: derive websocket publication from state changes)
 		}, 0);
 	}
 
@@ -6803,13 +6853,16 @@ export async function createApp(deps: AppDeps) {
 			checkingApp = true;
 			jobs.push(
 				refreshAppCheck()
-					.then(publishState)
+					// publishSoon, not publishState: the gate in publishState rebuilds only after
+					// a publishSoon bumped the version (OTTR-866).
+					.then(publishSoon)
 					.finally(() => {
 						checkingApp = false;
 					}),
 			);
 		}
-		// Five minutes, like omp's own per-account usage cache; the 1 s state diff ships the result.
+		// Five minutes, like omp's own per-account usage cache; publishSoon ships the fresh
+		// report in the next frame without waiting for the sweep (OTTR-866).
 		if (
 			(quota === null || Date.now() - quota.at > 300_000) &&
 			!refreshingQuota
@@ -6836,11 +6889,17 @@ export async function createApp(deps: AppDeps) {
 						} catch (err) {
 							console.log(`[quota] hold release failed: ${errmsg(err)}`);
 						}
-						await publishState();
-					})
-					.finally(() => {
-						refreshingQuota = false;
-					}),
+						// publishSoon ships the fresh report in the next frame without
+						// waiting for the sweep (OTTR-866); deps.schedule() above already
+						// published its own edge when a hold released.
+					} catch (err) {
+						console.log(`[quota] hold release failed: ${errmsg(err)}`);
+					}
+					publishSoon();
+				})
+				.finally(() => {
+					refreshingQuota = false;
+				}),
 			);
 		}
 		const pending = trackWork(
@@ -13396,6 +13455,9 @@ export async function createApp(deps: AppDeps) {
 					sockets++;
 					if (closing) return;
 					ws.subscribe("board");
+					// OTTR-866: the replayed frame must be the current state, so open the gate —
+					// a build may have run for a consumerless publish and left lastStateJson behind.
+					stateVersion++;
 					const published = await publishState();
 					if (closing) return;
 					if (!published) ws.send(lastStateJson);
@@ -13430,6 +13492,8 @@ export async function createApp(deps: AppDeps) {
 		publish,
 		publishState,
 		publishSoon,
+		/** Test seam (OTTR-866): how often publishState() rebuilt the state. */
+		stateBuilds: () => builds,
 		notifyLog,
 		drained: () =>
 			Date.now() < Math.max(drainUntil, updateCycle.holdUntil(Date.now())),
