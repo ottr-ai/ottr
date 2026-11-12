@@ -4375,8 +4375,6 @@ export async function createApp(deps: AppDeps) {
 	// Boot + interval (src/server.ts), never per turn (docs/specs/memory-backend.md).
 
 		void (await memoryHealthTick(true));
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	// OTTR-548: the workers' sign-in self-reports boot + interval (src/server.ts), advisory only.
 	void (await workerSignInTick());
 	const logins = providerLogin();
@@ -5286,8 +5284,6 @@ export async function createApp(deps: AppDeps) {
 	 * holds so both count the same cards. Chunked (OTTR-866): yields to the loop
 	 * between projects and every 100 cards, so no single block exceeds ~50 ms. */
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	async function boardCards(now: number): Promise<{
 		tasks: TaskCard[];
 		keptHeld: number;
@@ -5298,8 +5294,6 @@ export async function createApp(deps: AppDeps) {
 		 * tasks array in place of one giant stringify. */
 		tasksPieces: string[];
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 	}> {
 		const tasks: TaskCard[] = [];
 		let keptHeld = 0;
@@ -5316,8 +5310,6 @@ export async function createApp(deps: AppDeps) {
 
 			let built = 0;
 			for (const t of await e.store.listTasks()) {
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 					const kept = keptCounts(t, now, days);
 					keptHeld += kept.held;
 					keptStale += kept.stale;
@@ -5369,8 +5361,6 @@ export async function createApp(deps: AppDeps) {
 		const slots = slotUse(entry.state.tasks);
 		const queue = queueOrder(entry.state.tasks);
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		const first = queue[0];
 		return {
 			drainUntil: drainUntil > now ? drainUntil : null,
@@ -5398,8 +5388,6 @@ export async function createApp(deps: AppDeps) {
 			await boardCards(now);
 		const scan = await currentOrphanScan();
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
 		let list: SignIn[] = [];
 		try {
@@ -6701,8 +6689,6 @@ export async function createApp(deps: AppDeps) {
 
 	async function publishStateNow(): Promise<boolean> {
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		if (deps.serverRef.current === undefined) return false;
 		const consumers = sockets > 0 || (await loadSubs(deps.gstore)).length > 0;
 		// Without a consumer the frame exists only for the seen prune below; skip the state
@@ -6714,9 +6700,10 @@ export async function createApp(deps: AppDeps) {
 			return false;
 		if (builtVersion === stateVersion) {
 			// OTTR-866: no publishSoon since the last build, so no store write can have
-			// landed (guarded() fires it after every mutation; the 5 s schedule sweep
-			// re-opens the gate for file-driven state). Skip the rebuild and behave like
-			// the unchanged-frame path below: refresh the small update frame, publish nothing.
+			// landed (guarded() fires it after every mutation; the scheduler tick
+			// re-opens the gate on its flag and settle edges, OTTR-884). Skip the rebuild
+			// and behave like the unchanged-frame path below: refresh the small update
+			// frame, publish nothing.
 			publishUpdate();
 			return false;
 		}
@@ -6735,8 +6722,6 @@ export async function createApp(deps: AppDeps) {
 		builtVersion = entry.version;
 		const state = entry.state;
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
 		const inputs = await alertInputs(state.tasks, lastAlertInputs);
 		// The prune runs on every publish, consumers or not: a card that leaves needs_you and
@@ -6816,7 +6801,107 @@ export async function createApp(deps: AppDeps) {
 		}, 0);
 	}
 
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
+	// One shared /api/state build (OTTR-866): the GET route, publishState and the /system
+	// holds all consume the same cached frame instead of re-shaping whole history per
+	// request. `version` is the one the build observed at its start, so a mutation that
+	// lands mid-build keeps the next read honest: its bump mismatches and rebuilds.
+	type StateCacheEntry = {
+		version: number;
+		builtAt: number;
+		state: StateResponse;
+		stateText: string;
+		gz: Uint8Array<ArrayBuffer> | null;
+	};
+	let stateCache: StateCacheEntry | null = null;
+	let stateBuilding: Promise<StateCacheEntry> | null = null;
+	// While the version is unchanged the TTL only bounds staleness of file-driven
+	// changes for poll-only clients: every store write opens the gate via publishSoon(),
+	// and the scheduler tick publishes on its flag/settle edges (OTTR-884), so a store
+	// write is visible to the next frame at once. A quiet board never rebuilds from the
+	// tick; the worst case this TTL admits is file-driven state (a transcript written
+	// under a project) waiting one TTL window plus one build wall on the GET path.
+	const STATE_CACHE_TTL_MS = 10_000;
+	// The tasks slot in the state text is spliced card by card; text this rare cannot
+	// collide with a real property value.
+	const STATE_TASKS_SENTINEL = "\u0000ottr-state-tasks\u0000";
+
+	/** Builds one state frame: the card loop yields between slices, the tasks text is
+	 * spliced card by card, and gzip runs async (never gzipSync on this path). Concurrent
+	 * callers share the one in-flight build; a failure clears it and leaves the cache
+	 * untouched, so the next caller rebuilds. */
+	function stateBuild(): Promise<StateCacheEntry> {
+		if (stateBuilding !== null) return stateBuilding;
+		const built = (async (): Promise<StateCacheEntry> => {
+			const version = stateVersion;
+			const { state, tasksText } = await stateResponse();
+			// Byte-identity by construction: every property except tasks is one
+			// JSON.stringify; only the tasks array is spliced with the text the chunked
+			// card loop serialized — the same bytes JSON.stringify produces for plain
+			// objects, alone or inside an array.
+			const stateText = JSON.stringify({
+				...state,
+				tasks: [STATE_TASKS_SENTINEL],
+			}).replace(
+				JSON.stringify([STATE_TASKS_SENTINEL]),
+				() => `[${tasksText}]`,
+			);
+			const gz =
+				Buffer.byteLength(stateText, "utf8") >= 32 * 1024
+					? // Copy out of zlib's possibly pooled Buffer: Response bodies need a
+						// plain ArrayBuffer view (same as the mermaid bodies above).
+						new Uint8Array(
+							await gzipAsync(Buffer.from(stateText, "utf8"), { level: 9 }),
+						)
+					: null;
+			const entry: StateCacheEntry = {
+				version,
+				builtAt: Date.now(),
+				state,
+				stateText,
+				gz,
+			};
+			stateCache = entry;
+			// One increment per completed rebuild, GET-triggered or published (OTTR-866).
+			builds++;
+			return entry;
+		})();
+		stateBuilding = built;
+		const settled = (): void => {
+			if (stateBuilding === built) stateBuilding = null;
+		};
+		built.then(settled, settled);
+		return built;
+	}
+
+	/** The cached build while it matches the version and the TTL, else a fresh one. */
+	async function stateEntry(): Promise<StateCacheEntry> {
+		const c = stateCache;
+		if (
+			c !== null &&
+			c.version === stateVersion &&
+			Date.now() - c.builtAt < STATE_CACHE_TTL_MS
+		)
+			return c;
+		return stateBuild();
+	}
+
+	/** GET /api/state from the cached build, with json()'s exact headers: the Windows
+	 * Connection: close workaround must stay byte-identical on this route (OTTR-866). */
+	async function stateJsonResponse(): Promise<Response> {
+		const entry = await stateEntry();
+		const headers: Record<string, string> = {
+			"Content-Type": "application/json",
+			// Encodings differ per request even below the threshold, where the same URL
+			// can cross the size line later: caches must key on Accept-Encoding.
+			Vary: "Accept-Encoding",
+			Connection: "close",
+		};
+		if (entry.gz !== null && acceptsGzip(requestEnc.getStore()?.enc ?? null))
+			return new Response(entry.gz, {
+				status: 200,
+				headers: { ...headers, "Content-Encoding": "gzip" },
+			});
+		return new Response(entry.stateText, { status: 200, headers });
 	}
 
 	const logThrottle = keyedThrottle<{ project: string; id: string }>(250, (a) =>
@@ -6896,8 +6981,6 @@ export async function createApp(deps: AppDeps) {
 				}),
 		];
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		if (
 			updateCycle.available(Date.now()) === null &&
 			Date.now() - behindAt > 300_000 &&
@@ -12806,8 +12889,6 @@ export async function createApp(deps: AppDeps) {
 
 			GET: (req) => api(req, () => stateJsonResponse()),
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 		},
 		"/api/orphans": {
 			GET: async (req) => await api(req, async () => await handleGETOrphans()),
@@ -13542,8 +13623,6 @@ export async function createApp(deps: AppDeps) {
 					if (closing) return;
 					if (!published) ws.send(lastStateJson);
 
-
->>>>>>> dd3431b (perf: reuse the built state across /api/state requests)
 					ws.send(
 						JSON.stringify({
 							type: "update",
