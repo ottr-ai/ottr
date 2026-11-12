@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
 	analyzeRange,
 	buildUserMessage,
+	defaultSpawn,
 	parseAnalysis,
 	proposalPrompt,
 	redactSecrets,
@@ -516,5 +520,29 @@ describe("systemPrompt", () => {
 		expect(s).toContain('"propose"|"skip"|"unknown"');
 		expect(s).toContain("max 5");
 		expect(s).toContain("Never prescribe porting");
+	});
+});
+
+// OTTR-883: the fact lookup's real reader is this spawn — the production line
+// `cwd: o.cwd` is what puts the lookup in the project's main checkout, so a real
+// child process must land in the directory the caller passed, not the board's own.
+describe("defaultSpawn cwd", () => {
+	test("the spawned process runs in the given cwd", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-spawn-cwd-"));
+		const res = await defaultSpawn(
+			["bun", "-e", "process.stdout.write(process.cwd())"],
+			{ stdin: "", env: process.env, timeoutMs: 30_000, cwd: dir },
+		);
+		expect(res.code).toBe(0);
+		expect(resolve(res.stdout.trim())).toBe(resolve(dir));
+	});
+
+	test("no cwd leaves the child in the caller's working directory", async () => {
+		const res = await defaultSpawn(
+			["bun", "-e", "process.stdout.write(process.cwd())"],
+			{ stdin: "", env: process.env, timeoutMs: 30_000 },
+		);
+		expect(res.code).toBe(0);
+		expect(resolve(res.stdout.trim())).toBe(resolve(process.cwd()));
 	});
 });
