@@ -3571,6 +3571,8 @@ describe("NotificationsSection stale push recovery", () => {
 			containerText: () => string;
 			containerNode: () => HTMLDivElement;
 			currentSubscription: () => unknown;
+			/** Resolves every mute read a deferMuteLoad test holds back. */
+			releaseMuteLoad: () => void;
 		}) => Promise<void>,
 		options: {
 			unsubscribeRejects?: boolean;
@@ -3588,6 +3590,8 @@ describe("NotificationsSection stale push recovery", () => {
 			seedPending?: unknown;
 			/** The server's board-wide muted projects (default ["alpha"]). */
 			mutedProjects?: string[];
+			/** Holds every no-endpoint prefs GET until releaseMuteLoad runs. */
+			deferMuteLoad?: boolean;
 		} = {},
 	): Promise<void> {
 		const realFetch = globalThis.fetch;
@@ -3610,6 +3614,9 @@ describe("NotificationsSection stale push recovery", () => {
 		}> = [];
 		let subscribePosts = 0;
 		let permissionCalls = 0;
+		// Resolvers of mute reads a deferMuteLoad test holds back: the board
+		// answered at request time, the network delivers on release.
+		const heldMuteLoads: Array<() => void> = [];
 		const initialEndpoint =
 			options.initialEndpoint ?? "https://push.example.com/old";
 		// The server's board-wide muted projects. The no-endpoint and any
@@ -3713,8 +3720,16 @@ describe("NotificationsSection stale push recovery", () => {
 					"https://push.example",
 				).searchParams.get("endpoint");
 				if (endpoint === null) {
+					// The snapshot is the list the board served at request time; the
+					// deferral is transport delay, not a later server answer.
+					const snapshot = muted.slice();
+					if (options.deferMuteLoad) {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						heldMuteLoads.push(resolve);
+						await promise;
+					}
 					prefsReads.push({ endpoint: null, classes: null });
-					return Response.json({ classes: null, mutedProjects: muted });
+					return Response.json({ classes: null, mutedProjects: snapshot });
 				}
 				const row = rows.get(endpoint);
 				if (row === undefined) {
@@ -3806,6 +3821,9 @@ describe("NotificationsSection stale push recovery", () => {
 				containerText: () => container.textContent ?? "",
 				containerNode: () => container,
 				currentSubscription: () => currentSub,
+				releaseMuteLoad: () => {
+					for (const resolve of heldMuteLoads.splice(0)) resolve();
+				},
 			});
 		} finally {
 			globalThis.localStorage.removeItem(PENDING_KEY);
@@ -4054,6 +4072,62 @@ describe("NotificationsSection stale push recovery", () => {
 				noInitialSub: true,
 				failSubscribePosts: 1,
 				undoRejects: true,
+			},
+		);
+	});
+
+	test("a deferred mute load lands across the kept-enable endpoint change", async () => {
+		await withPushBrowser(
+			async (probe) => {
+				// The board-wide mute read is still in flight when the kept Turn on
+				// moves the endpoint. The answer must land anyway (the mutes load
+				// never rides the endpoint effect), the boxes must show the real
+				// mutes, and the next mute save must carry the whole list: when the
+				// response died with the endpoint effect, mutedRef stayed empty and
+				// a save wiped the board-wide list the other devices hold.
+				const on = [...probe.containerNode().querySelectorAll("button")].find(
+					(b) => b.textContent?.trim() === "Turn on",
+				);
+				expect(on).toBeDefined();
+				await act(async () => {
+					on?.click();
+				});
+				await act(async () => {});
+				// The kept path ran while the mute read was held back.
+				expect(
+					globalThis.localStorage.getItem("ottr.push.pendingSubscribe"),
+				).not.toBeNull();
+				await act(async () => {
+					probe.releaseMuteLoad();
+				});
+				const node = probe.containerNode();
+				expect(switchOf(node, "Mute alpha")?.checked).toBe(true);
+				const beta = switchOf(node, "Mute beta");
+				expect(beta).toBeDefined();
+				await act(async () => {
+					onChangeOf(beta!)({ target: { checked: true } });
+				});
+				for (let k = 0; k < 5; k++)
+					await act(async () => {
+						await new Promise((r) => setTimeout(r, 0));
+					});
+				const mutePost = probe.posts.find(
+					(p) =>
+						p.url === "/api/notifications/prefs" &&
+						(p.body as { mutedProjects?: string[] }).mutedProjects !==
+							undefined,
+				);
+				expect(mutePost).toBeDefined();
+				expect(
+					(mutePost!.body as { mutedProjects: string[] }).mutedProjects.sort(),
+				).toEqual(["alpha", "beta"]);
+			},
+			{
+				noInitialSub: true,
+				failSubscribePosts: 1,
+				undoRejects: true,
+				initialEndpoint: "https://push.example.com/pending",
+				deferMuteLoad: true,
 			},
 		);
 	});
