@@ -383,6 +383,10 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		branchUnpushed: async () => false,
 		// The default main checkout sits on main, so no off-default finding fires.
 		checkedOutBranch: async () => null,
+		// Mocked like the sibling git reads above: the real probe spawns git per refresh
+		// cycle, and a cycle that awaits a real child makes edge publishes depend on
+		// spawn latency instead of the microtask flush every schedule test relies on.
+		targetTracksRules: async () => false,
 		// The default cannot converge (a conflict), so a rejected push still queues the
 		// recovery steer exactly as before OTTR-510; tests on the converged path override both.
 		rebaseTargetBranch: async () => ({
@@ -2196,6 +2200,41 @@ describe("turn schedule", () => {
 		await flushPromises();
 		expect(record.runs).toHaveLength(0);
 		expect(record.publishSoon).toBeGreaterThan(0);
+	});
+
+	test("the first cycle publishes, a quiet tick publishes nothing (OTTR-884)", async () => {
+		const { record, loop } = setup({ maxTotalRuns: () => 0 });
+		loop.schedule();
+		await flushPromises();
+		// First cycle: the previous flag snapshot is undefined, so undefined -> value
+		// counts as a change and the board's first tick still publishes.
+		const first = record.publishSoon;
+		expect(first).toBeGreaterThan(0);
+		loop.schedule();
+		await flushPromises();
+		// Every flag holds the value the first cycle stored: the quiet tick must not
+		// bump the state version, or the sweep would rebuild the cache every 5 s.
+		expect(record.publishSoon).toBe(first);
+	});
+
+	test("a flag flip publishes exactly once, not per tick (OTTR-884)", async () => {
+		let clean = true;
+		const { record, loop } = setup({
+			maxTotalRuns: () => 0,
+			isClean: async () => clean,
+		});
+		loop.schedule();
+		await flushPromises();
+		const base = record.publishSoon;
+		expect(base).toBeGreaterThan(0);
+		clean = false; // the main checkout turns dirty: one flag edge
+		loop.schedule();
+		await flushPromises();
+		expect(record.publishSoon).toBe(base + 1);
+		// The dirty flag now equals what the cycle stored: the next tick is quiet again.
+		loop.schedule();
+		await flushPromises();
+		expect(record.publishSoon).toBe(base + 1);
 	});
 
 	test("a null global cap starts every queued card", async () => {
@@ -15950,6 +15989,27 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		expect(after.pendingPrompt).toBe(".");
 	});
 
+	test("a quiet sweep publishes nothing; settling a lost row publishes once (OTTR-884)", async () => {
+		const { store, record, loop } = sweepSetup();
+		loop.schedule();
+		await flushPromises();
+		// First cycle publishes (undefined -> value); the baseline includes it.
+		const base = record.publishSoon;
+		expect(base).toBeGreaterThan(0);
+		loop.schedule();
+		await flushPromises();
+		// Nothing lost, no flag changed: the sweep must leave the state cache alone.
+		expect(record.publishSoon).toBe(base);
+		const task = store.createTask("lost mid-run");
+		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		store.startTurn(task.id, "work", "prompt", 4344); // pid 4344 is dead in this fixture
+		loop.schedule();
+		await flushPromises();
+		// Exactly the settle edge: the row settled and requeued, and the sweep published.
+		expect(record.publishSoon).toBe(base + 1);
+		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
 	test("the lost sweep leaves a parked card's open row alone", async () => {
 		const { store, loop } = await sweepSetup();
 		const task = await store.createTask("parked with an open row");
@@ -23323,9 +23383,9 @@ describe("turn PR-mode merge settle", () => {
 								};
 							},
 						}),
+					},
 
 					startRun: async (o) => {
-
 						record.runs.push(o);
 						if (!fixed) {
 							writeFileSync(join(main, "fix.txt"), "fix");

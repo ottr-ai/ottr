@@ -306,7 +306,7 @@ const IMAGE_TTL = 15 * 60_000;
 const imageChips = new Map<string, { at: number; value: LatestImage | null }>();
 
 /** ghcr.io probe piggybacking on the release refresh: writes e.latestImage, one probe per TTL per repo. */
-function refreshImage(e: Entry): void {
+function refreshImage(e: Entry, publish?: () => void): void {
 	const repo = e.github === null ? null : ownerRepo(e.github);
 	if (repo === null) return;
 	const cached = imageChips.get(repo);
@@ -319,7 +319,14 @@ function refreshImage(e: Entry): void {
 	latestImage(repo)
 		.then((value) => {
 			imageChips.set(repo, { at: Date.now(), value });
+			// OTTR-884: this write lands outside the refresh cycle's awaited window, so the
+			// probe detects its own flag edge — a changed chip republishes, an unchanged
+			// one leaves the single-flight state cache alone.
+			const prev = e.latestImage;
 			e.latestImage = value;
+			// The view's field order is fixed by its builder, so a stringify compare
+			// is a faithful value compare here.
+			if (JSON.stringify(prev) !== JSON.stringify(value)) publish?.();
 		})
 		.catch(() => {}); // ghcr unreachable: keep the null seed until the next TTL
 }
@@ -327,7 +334,7 @@ function refreshImage(e: Entry): void {
 /** The chip's latest release: the repo's latest GitHub release when the project has a
  * GitHub remote and GitHub answers, else the highest vX.Y.Z tag merged into the target;
  * null when the target is unknown, like archReview. */
-async function refreshRelease(e: Entry): Promise<void> {
+async function refreshRelease(e: Entry, publish?: () => void): Promise<void> {
 	if (e.target === null) {
 		e.latestRelease = null;
 		e.latestReleaseUrl = null;
@@ -340,7 +347,7 @@ async function refreshRelease(e: Entry): Promise<void> {
 	});
 	e.latestRelease = chip.release;
 	e.latestReleaseUrl = chip.url;
-	refreshImage(e);
+	refreshImage(e, publish);
 }
 
 /** Commits since the last review on the target; null with no target or when git fails, like latestRelease. */
@@ -371,7 +378,7 @@ const PR_TTL = 10 * 60_000;
 const prChips = new Map<string, { at: number; value: OpenPrsView | null }>();
 
 /** Open-PR chips piggybacking on the release refresh: writes e.openPrs, one gh probe per TTL per repo. */
-function refreshOpenPrs(e: Entry): void {
+function refreshOpenPrs(e: Entry, publish?: () => void): void {
 	const repo = e.github === null ? null : ownerRepo(e.github);
 	if (repo === null) {
 		e.openPrs = null;
@@ -388,7 +395,14 @@ function refreshOpenPrs(e: Entry): void {
 		.then((pulls) => {
 			const value = openPrsView(pulls, repo);
 			prChips.set(repo, { at: Date.now(), value });
+			// OTTR-884: this write lands outside the refresh cycle's awaited window, so the
+			// probe detects its own flag edge — a changed chip republishes, an unchanged
+			// one leaves the single-flight state cache alone.
+			const prev = e.openPrs;
 			e.openPrs = value;
+			// The view's field order is fixed by its builder, so a stringify compare
+			// is a faithful value compare here.
+			if (JSON.stringify(prev) !== JSON.stringify(value)) publish?.();
 		})
 		.catch(() => {}); // gh unreachable: keep the null seed until the next TTL
 }
@@ -689,9 +703,11 @@ const loop = createTurnLoop(projects, {
 	drainedRunner: (id) => app.drainedRunner(id),
 	publishSoon: () => app.publishSoon(),
 	notifyLog: (project, id) => app.notifyLog(project, id),
-	refreshRelease,
+	// OTTR-884: the late probe writes inside refreshRelease/refreshOpenPrs publish their own
+	// flag edges through the same handle, so a quiet board still never rebuilds from the tick.
+	refreshRelease: (e) => refreshRelease(e, () => app.publishSoon()),
 	refreshArchReview,
-	refreshOpenPrs,
+	refreshOpenPrs: (e) => refreshOpenPrs(e, () => app.publishSoon()),
 	resolveTarget,
 	createWorktree,
 	removeWorktree,

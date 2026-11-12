@@ -2751,8 +2751,12 @@ export function createTurnLoop(
 		const lost: LostRun[] = [];
 		const lostChecks: LostCheckRun[] = [];
 		await collectLostRuns(lost, lostChecks);
+		const settledCount = lost.length + lostChecks.length;
 		await settleLostRows(lost);
 		await settleLostChecks(lostChecks);
+		// OTTR-884: publish on the settle edge only. A quiet sweep (nothing lost) must not
+		// bump the state version, or the single-flight cache rebuilds every tick for nothing.
+		if (settledCount > 0) ops.publishSoon();
 	}
 
 	/** One project's sync-commit hygiene findings; empty when none apply. */
@@ -2835,11 +2839,51 @@ export function createTurnLoop(
 			});
 	}
 
+	/** OTTR-884: one project's scheduler-refreshed flags as the cycle last saw them. The
+	 * previous snapshot starts undefined, so the first cycle after boot compares undefined
+	 * to value, counts that as a change, and the board's first tick still publishes. */
+	type FlagSnapshot = {
+		dirty: boolean;
+		mainUnpushed: boolean;
+		mainBranch: string | null;
+		targetRules?: boolean;
+		latestRelease: string | null;
+		latestReleaseUrl?: string | null;
+		latestImage: LatestImage | null;
+		openPrs?: OpenPrsView | null;
+		archReview: ArchReview | null;
+	};
+	const flagSnapshots = new WeakMap<TurnProject, FlagSnapshot>();
+	const FLAG_SNAPSHOT_KEYS = [
+		"dirty",
+		"mainUnpushed",
+		"mainBranch",
+		"targetRules",
+		"latestRelease",
+		"latestReleaseUrl",
+		"latestImage",
+		"openPrs",
+		"archReview",
+	] as const;
+	const flagSnapshotOf = (e: TurnProject): FlagSnapshot => ({
+		dirty: e.dirty,
+		mainUnpushed: e.mainUnpushed,
+		mainBranch: e.mainBranch,
+		targetRules: e.targetRules,
+		latestRelease: e.latestRelease,
+		latestReleaseUrl: e.latestReleaseUrl,
+		latestImage: e.latestImage,
+		openPrs: e.openPrs,
+		archReview: e.archReview,
+	});
+
 	/** Per-project flag refresh of the schedule tick: dirty, mainUnpushed (with the standing
 	 * pushSyncCommits approval above), mainBranch, release/arch-review/PR flags. Resolves when
 	 * the project's flag ops settle; every op keeps its own failure isolation (a failed op
-	 * keeps the last flag, the next tick retries), so the promise never rejects. */
-	async function refreshProjectFlags(e: TurnProject): Promise<void> {
+	 * keeps the last flag, the next tick retries), so the promise never rejects. True when any
+	 * flag changed against the project's last snapshot (OTTR-884): the cycle publishes only on
+	 * that edge, so a quiet board never rebuilds the state from the sweep. */
+	async function refreshProjectFlags(e: TurnProject): Promise<boolean> {
 		const settling: Promise<void>[] = [];
 		settling.push(
 			ops
@@ -2895,6 +2939,15 @@ export function createTurnLoop(
 		settling.push(ops.refreshArchReview(e).catch(() => {}));
 		void ops.refreshOpenPrs?.(e);
 		await Promise.all(settling);
+		// The fire-and-forget probes (open PRs, latest image) that land past this await
+		// detect their own edges in server.ts; everything the awaited ops wrote compares here.
+		const after = flagSnapshotOf(e);
+		const prev = flagSnapshots.get(e);
+		flagSnapshots.set(e, after);
+		const changed =
+			prev === undefined ||
+			FLAG_SNAPSHOT_KEYS.some((k) => prev[k] !== after[k]);
+		return changed;
 	}
 
 	// OTTR-866: the tick's refresh fan-out, coalesced. Every board write fires schedule(),
@@ -2910,12 +2963,14 @@ export function createTurnLoop(
 	async function refreshCycle(): Promise<void> {
 		const list = [...projects.values()];
 		let next = 0;
+		// OTTR-884: one publish per cycle, only when at least one project's flags moved.
+		let changed = false;
 		const worker = async (): Promise<void> => {
 			for (;;) {
 				const e = list[next++];
 				if (e === undefined) return;
 				try {
-					await refreshProjectFlags(e);
+					if (await refreshProjectFlags(e)) changed = true;
 				} catch (err) {
 					// One sick project must not stop the others' flags (dispatchProject's isolation).
 					logStoreError(e.store.name, err);
@@ -2928,6 +2983,7 @@ export function createTurnLoop(
 				() => worker(),
 			),
 		);
+		if (changed) ops.publishSoon();
 	}
 
 	/** The schedule tick's refresh kickoff: starts a cycle, or marks the queued follow-up
@@ -3074,7 +3130,11 @@ export function createTurnLoop(
 
 	async function schedule(): Promise<void> {
 		if (ops.stopping?.() === true) return;
-		ops.publishSoon(); // board diffs from dirty/release flags and new turns ship without polling
+		// OTTR-884: the entry publishes on edges only. The refresh cycle below publishes when a
+		// scheduler flag changed, sweepLostTurns when it settles a lost row, and dispatch/turn
+		// paths keep their own publishes. A quiet board (no flag change, no settled row) never
+		// bumps the state version from the sweep, so the single-flight state cache is not
+		// torn down every 5 s on a board with open sockets.
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
 		// Refresh every project first: a full cap must not skip the later projects' dirty and
 		// release flags (they gate the board and the merge queue). Coalesced (OTTR-866): a
