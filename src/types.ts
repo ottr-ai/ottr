@@ -66,6 +66,16 @@ export interface AskQuestion {
 	recommended: number | null;
 }
 
+/** One gate question the repo lookup answered from the code, with its file:line evidence (OTTR-883). */
+export interface GateFact {
+	/** The gate's fact question, verbatim. */
+	question: string;
+	/** The answer the lookup found in the repository. */
+	answer: string;
+	/** The evidence as `file:line`, or "" when the lookup answered nothing usable. */
+	evidence: string;
+}
+
 /** The comprehension gate's persisted state for one card (OTTR-823, JSON in the DB). */
 export interface PromptGateState {
 	/** sha256 hex of the compared effective text this gate passed (or the user started anyway); null = never passed. */
@@ -78,6 +88,8 @@ export interface PromptGateState {
 	sig: string | null;
 	/** True while the card sits in a gate park; the drawer shows Start anyway. */
 	parked: boolean;
+	/** Fact questions the lookup answered from the code (OTTR-883), shown in the drawer while parked; absent on a pass and after Start anyway. */
+	facts?: GateFact[];
 }
 
 /** Normalizes an ask tool call's `{ questions: [...] }` args; null when no usable question is inside. */

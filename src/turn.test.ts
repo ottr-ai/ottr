@@ -23647,7 +23647,9 @@ describe("prompt gate", () => {
 				covered: true,
 				reason: "covered",
 			})),
-			questions: [{ question, options: ["sqlite", "postgres"] }],
+			questions: [
+				{ question, kind: "decision", options: ["sqlite", "postgres"] },
+			],
 		};
 	}
 
@@ -23968,6 +23970,159 @@ describe("prompt gate", () => {
 		expect(calls).toBe(2);
 	});
 
+	test("a fact question gets one repo lookup, and the gate re-runs on the answers", async () => {
+		const factQ = "Where does the release currently run?";
+		const decisionQ = "If the app token mint fails, fail or fall back?";
+		const gateInputs: (string | null)[] = [];
+		let lookupInput: string[] | null | undefined;
+		let lookupCwd: string | null | undefined;
+		let calls = 0;
+		const checkWith = (questions: GateCheck["questions"]): GateCheck => ({
+			builds: "a release flow",
+			checks: "watch the release land",
+			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+			questions,
+		});
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				calls += 1;
+				gateInputs.push(o.userMessages);
+				return calls === 1
+					? checkWith([
+							{ question: factQ, kind: "fact", options: [] },
+							{ question: decisionQ, kind: "decision", options: ["fail"] },
+						])
+					: checkWith([
+							{ question: decisionQ, kind: "decision", options: ["fail"] },
+						]);
+			},
+			factLookup: async (o) => {
+				lookupInput = [...o.questions];
+				lookupCwd = o.cwd;
+				return [
+					{
+						question: factQ,
+						answer: "gh release create",
+						evidence: "src/release.ts:827",
+					},
+				];
+			},
+		});
+		const task = store.createTask("fact gate");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		// The lookup saw exactly the fact questions and ran in the project's main checkout.
+		expect(lookupInput).toEqual([factQ]);
+		expect(lookupCwd).toBe(store.path);
+		// The gate ran twice: the second time with the answers in view.
+		expect(calls).toBe(2);
+		expect(gateInputs[0] ?? null).toBeNull();
+		const seenText = gateInputs[1] ?? "";
+		expect(seenText).toContain("Answered from the code");
+		expect(seenText).toContain("gh release create (src/release.ts:827)");
+		// The park carries only the decision question; the fact went to the code.
+		expect(after.state).toBe("needs_you");
+		expect(after.asked).toHaveLength(1);
+		expect(after.asked?.[0]?.question).toBe(decisionQ);
+		// The seen text holds the answered fact, and the park persists it for the drawer.
+		expect(after.gate?.seen).toContain("Answered from the code");
+		expect(after.gate?.seen).toContain(
+			"gh release create (src/release.ts:827)",
+		);
+		expect(after.gate?.facts).toEqual([
+			{
+				question: factQ,
+				answer: "gh release create",
+				evidence: "src/release.ts:827",
+			},
+		]);
+		expect(after.gate?.parked).toBe(true);
+		// A parked gate spawns no omp session and no worktree.
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a lookup that answers unknown parks with both questions", async () => {
+		const factQ = "Where does the release currently run?";
+		const decisionQ = "If the app token mint fails, fail or fall back?";
+		let lookups = 0;
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return {
+					builds: "a release flow",
+					checks: "watch the release land",
+					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+					questions: [
+						{ question: factQ, kind: "fact", options: [] },
+						{ question: decisionQ, kind: "decision", options: ["fail"] },
+					],
+				};
+			},
+			factLookup: async () => {
+				lookups += 1;
+				// The real factLookup filters unusable answers out before returning.
+				return [];
+			},
+		});
+		const task = store.createTask("unknown fact gate");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(lookups).toBe(1);
+		// No usable answers: no re-gate, the first call's questions park as today.
+		expect(calls).toBe(1);
+		expect(after.state).toBe("needs_you");
+		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
+		expect(after.gate?.seen).toBeNull();
+		expect(after.gate?.facts).toBeUndefined();
+		expect(after.gate?.sig).toBe(`${factQ}\n${decisionQ}`);
+		expect(record.runs).toHaveLength(0);
+	});
+
+	test("a lookup that fails parks with both questions and logs the failure", async () => {
+		const factQ = "Where does the release currently run?";
+		const decisionQ = "If the app token mint fails, fail or fall back?";
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return {
+					builds: "a release flow",
+					checks: "watch the release land",
+					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+					questions: [
+						{ question: factQ, kind: "fact", options: [] },
+						{ question: decisionQ, kind: "decision", options: ["fail"] },
+					],
+				};
+			},
+			factLookup: async () => {
+				throw new Error("omp down");
+			},
+		});
+		const task = store.createTask("broken fact lookup");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(calls).toBe(1);
+		expect(after.state).toBe("needs_you");
+		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
+		expect(after.gate?.seen).toBeNull();
+		expect(after.gate?.facts).toBeUndefined();
+		expect(readFileSync(store.logPath(task.id), "utf8")).toContain(
+			"! prompt gate: fact lookup failed: omp down",
+		);
+		expect(record.runs).toHaveLength(0);
+	});
+
 	test("a hash match skips the gate seam entirely", async () => {
 		let calls = 0;
 		const { store, record, loop } = setup({
@@ -24077,6 +24232,7 @@ describe("prompt gate", () => {
 			})),
 			questions: ["a?", "b?", "c?", "d?", "e?"].map((question) => ({
 				question,
+				kind: "decision" as const,
 				options: ["yes", "no"],
 			})),
 		};

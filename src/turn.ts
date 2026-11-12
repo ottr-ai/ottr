@@ -40,6 +40,8 @@ import { joinLevel, splitLevel } from "./levels.ts";
 import { modelList, modelRoles } from "./models.ts";
 import type { GateCheck } from "./promptGate.ts";
 import {
+	factLookup,
+	factsBlock,
 	GATE_REASON,
 	gateAskQuestions,
 	gateCompareText,
@@ -144,6 +146,7 @@ import type {
 	ArchReview,
 	AskQuestion,
 	DiffFileStat,
+	GateFact,
 	GitFacts,
 	LatestImage,
 	ListedTask,
@@ -863,6 +866,8 @@ export interface TurnOps {
 	titleRetryDelayMs?: number;
 	/** OTTR-823 preparation gate: the comprehension check model call; overridable for tests so none spawns a gateway. */
 	gateCheck?: typeof promptGateCheck;
+	/** OTTR-883: the read-only repo lookup that answers the gate's fact questions; overridable for tests so none spawns omp. */
+	factLookup?: typeof factLookup;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
 	commitSubjects?: typeof commitSubjects;
 	/** OTTR-763: per-commit metadata (sha, subject, committer time, changed files) the
@@ -3842,12 +3847,47 @@ export function createTurnLoop(
 			);
 			return false;
 		}
-		const missing = !check.points[4]?.covered;
-		if (check.questions.length === 0 && !missing) {
+		// OTTR-883: answer the gate's fact questions from the code before anything
+		// parks. One read-only repo lookup in the project's main checkout; its
+		// answers enter the gate's seen text as an untrusted block and the gate
+		// runs once more on them. Any lookup (or second-call) failure falls back
+		// to today's park with the first call's questions.
+		let effCheck = check;
+		let effSeen = seen;
+		let answeredFacts: GateFact[] | null = null;
+		const factQs = check.questions.filter((q) => q.kind === "fact");
+		if (factQs.length > 0) {
+			try {
+				const facts = await (ops.factLookup ?? factLookup)({
+					questions: factQs.map((q) => q.question),
+					cwd: store.path,
+					sessionDir: store.sessionsDir,
+				});
+				if (facts.length > 0) {
+					for (const f of facts)
+						log(
+							`+ prompt gate: answered from the code: ${f.question} -> ${f.answer} (${f.evidence})`,
+						);
+					effSeen =
+						seen === null
+							? factsBlock(facts)
+							: `${seen}\n\n${factsBlock(facts)}`;
+					effCheck = await (ops.gateCheck ?? promptGateCheck)({
+						prompt: judged,
+						userMessages: gateUserText(pending, effSeen),
+					});
+					answeredFacts = facts;
+				}
+			} catch (e) {
+				log(`! prompt gate: fact lookup failed: ${(e as Error).message}`);
+			}
+		}
+		const missing = !effCheck.points[4]?.covered;
+		if (effCheck.questions.length === 0 && !missing) {
 			// Pass: restate what the gate understood, stamp the fingerprint, start.
-			log(`+ prompt gate: would build: ${check.builds}`);
-			log(`+ prompt gate: check: ${check.checks}`);
-			const missingPoints = check.points
+			log(`+ prompt gate: would build: ${effCheck.builds}`);
+			log(`+ prompt gate: check: ${effCheck.checks}`);
+			const missingPoints = effCheck.points
 				.map((p, i) => ({ p, i }))
 				.filter(({ p }) => !p.covered);
 			if (missingPoints.length === 0)
@@ -3856,8 +3896,8 @@ export function createTurnLoop(
 				log(`+ prompt gate: missing: ${DEEPEN_POINTS[i]} — ${p.reason}`);
 			store.updateTask(id, {
 				gate: {
-					hash: gateFingerprint(gateCompareText(judged, pending, seen)),
-					seen: gateUserText(pending, seen),
+					hash: gateFingerprint(gateCompareText(judged, pending, effSeen)),
+					seen: gateUserText(pending, effSeen),
 					fails: 0,
 					sig: null,
 					parked: false,
@@ -3866,8 +3906,8 @@ export function createTurnLoop(
 			return true;
 		}
 		// Park with the gate's questions (and a missing outside check, named).
-		const modelQs = gateAskQuestions(check);
-		const sig = check.questions.map((q) => q.question).join("\n");
+		const modelQs = gateAskQuestions(effCheck);
+		const sig = effCheck.questions.map((q) => q.question).join("\n");
 		const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
 		let asked = modelQs;
 		if (missing) asked = [...asked, missingCheckQuestion()];
@@ -3883,7 +3923,14 @@ export function createTurnLoop(
 			{
 				needsReason: `${GATE_REASON}${cause}`,
 				asked,
-				gate: { hash: null, seen, fails, sig, parked: true },
+				gate: {
+					hash: null,
+					seen: effSeen,
+					fails,
+					sig,
+					parked: true,
+					...(answeredFacts !== null ? { facts: answeredFacts } : {}),
+				},
 			},
 			log,
 		);

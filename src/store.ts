@@ -46,6 +46,7 @@ import type {
 	DiffFileStat,
 	ForkBranchState,
 	ForkHoldState,
+	GateFact,
 	ListedTask,
 	OutcomeStatus,
 	ProjectSettings,
@@ -662,13 +663,24 @@ function parseGate(raw: string | null): PromptGateState | null {
 		const value: unknown = JSON.parse(raw);
 		if (typeof value !== "object" || value === null) return null;
 		const g = value as Partial<PromptGateState>;
-		return {
+		const state: PromptGateState = {
 			hash: typeof g.hash === "string" ? g.hash : null,
 			seen: typeof g.seen === "string" ? g.seen : null,
 			fails: typeof g.fails === "number" ? g.fails : 0,
 			sig: typeof g.sig === "string" ? g.sig : null,
 			parked: g.parked === true,
 		};
+		// OTTR-883: the answered facts ride through when they parse as GateFacts.
+		if (Array.isArray(g.facts))
+			state.facts = g.facts.filter(
+				(f): f is GateFact =>
+					typeof f === "object" &&
+					f !== null &&
+					typeof f.question === "string" &&
+					typeof f.answer === "string" &&
+					typeof f.evidence === "string",
+			);
+		return state;
 	} catch {
 		return null;
 	}

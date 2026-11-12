@@ -236,14 +236,17 @@ export type SpawnFn = (
 		stdin: string;
 		env: Record<string, string | undefined>;
 		timeoutMs: number;
+		/** Working directory for the spawned process; undefined inherits the caller's (OTTR-883: the fact lookup runs in the project's main checkout). */
+		cwd?: string;
 	},
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
-const defaultSpawn: SpawnFn = async (argv, o) => {
+export const defaultSpawn: SpawnFn = async (argv, o) => {
 	const proc = Bun.spawn(argv, {
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
+		cwd: o.cwd,
 		env: o.env,
 		timeout: o.timeoutMs,
 		windowsHide: true,

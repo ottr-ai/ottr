@@ -4988,6 +4988,25 @@ dialog.diff-view {
 .gate-start .needs-reason {
 	margin: 0;
 }
+/* OTTR-883: the fact answers a repo lookup produced, above the Start anyway button. */
+.gate-facts {
+	align-self: stretch;
+}
+.gate-facts .gate-fact-list {
+	margin: 6px 0 0;
+	padding: 0 0 0 16px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	font-size: 12.5px;
+}
+.gate-fact-q {
+	color: var(--dim);
+}
+.gate-fact-e {
+	color: var(--dim);
+	font-size: 11.5px;
+}
 .diff-empty {
 	padding: 18px 14px;
 }
