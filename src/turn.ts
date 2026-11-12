@@ -88,6 +88,7 @@ import {
 	hitUsageLimit,
 	MODEL_RESTORE,
 	QUOTA_LIMIT,
+	rateLimitWaitMs,
 	rejectedReport,
 	resumePlan,
 	WORKER_BUSY,
@@ -1158,16 +1159,28 @@ function oneLine(text: string): string {
 		: line;
 }
 
-/** The queued write that holds a check run until its provider's usage limit resets. */
+/** The queued write that holds a check run until its provider's usage limit resets, or
+ * until a rate limit's retry-after wait ends (OTTR-847). */
 interface UsageHold {
 	holdUntil: number;
 	needsReason: string;
 	pendingPrompt: string;
 	/** The provider (and window id) the hold waits for, stored beside holdUntil so the
-	 * quota refresh can release the hold early (OTTR-688). */
-	provider: string;
+	 * quota refresh can release the hold early (OTTR-688). A rate-limit hold names none:
+	 * the quota state does not know the 429's wait, and an early release would only hit
+	 * the same 429 again. */
+	provider: string | null;
 	window: string | null;
+	/** True when the hold waits out a rate limit's retry-after; false for a usage hold. */
+	rate: boolean;
 }
+
+// OTTR-847: a rate-limit wait longer than this holds the check through the wait; a
+// shorter wait keeps today's immediate retry.
+const RATE_LIMIT_HOLD_MIN_MS = 60_000;
+// OTTR-847: the longest rate-limit wait a check holds for. Above it the card parks
+// needs_you as before, so a bad value cannot hide a card for days.
+const RATE_LIMIT_HOLD_MAX_MS = 24 * 3_600_000;
 
 const KEPT_PREFIX = "Kept the worktree: ";
 const demoBoard = () => process.env.OTTR_DEMO === "1";
@@ -1740,6 +1753,25 @@ export function createTurnLoop(
 			pendingPrompt: `The board's check run stopped at the ${hit.provider} usage limit, and the limit has reset. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
 			provider: hit.provider,
 			window: hit.window,
+			rate: false,
+		};
+	}
+	/** The hold for a check that hit a provider rate limit with a long retry-after wait
+	 * (OTTR-847): it waits out the wait instead of a retry that fails the same way. Names
+	 * no provider — see UsageHold. */
+	function rateLimitHold(wait: number): UsageHold {
+		const untilMs = Date.now() + wait;
+		const until = new Date(untilMs)
+			.toISOString()
+			.slice(0, 16)
+			.replace("T", " ");
+		return {
+			holdUntil: untilMs,
+			needsReason: `The check hit the provider's rate limit. The board runs it again after the wait ends at ${until} UTC. Send a message to run it now, or cancel the card.`,
+			pendingPrompt: `The board's check run stopped at the provider's rate limit, and the wait has passed. Report the same outcome again so the board runs the check again. A review records each finding again with propose_task first.`,
+			provider: null,
+			window: null,
+			rate: true,
 		};
 	}
 	/** The dispatched model's provider's exhausted-window reset from the board's quota state
@@ -8061,6 +8093,17 @@ export function createTurnLoop(
 				hold = await usageHold(ran.result.model ?? built.selector ?? null);
 				break;
 			}
+			// OTTR-847: same rule as the work check — a long retry-after holds
+			// through the wait; over the cap it parks as today.
+			const wait = rateLimitWaitMs(ran.result);
+			if (
+				wait !== null &&
+				wait > RATE_LIMIT_HOLD_MIN_MS &&
+				wait <= RATE_LIMIT_HOLD_MAX_MS
+			) {
+				hold = rateLimitHold(wait);
+				break;
+			}
 		}
 		return { kept, dropped, checkMs, checkFailed, hold, limitHit };
 	}
@@ -8202,7 +8245,7 @@ export function createTurnLoop(
 	 * is still this run's). */
 	function parkReviewCheckHold(st: TurnSettle, hold: UsageHold): void {
 		st.log(
-			`- review check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`,
+			`- review check held until ${new Date(hold.holdUntil).toISOString()}: ${hold.rate ? "rate limit" : "usage limit"}`,
 		);
 		const patch = holdPatch(st.store, st.id, hold);
 		if (patch !== null) st.store.updateTask(st.id, patch);
@@ -8519,6 +8562,18 @@ export function createTurnLoop(
 				hold = await usageHold(ran.result.model ?? roles.selector ?? null);
 				break;
 			}
+			// OTTR-847: a rate limit with a long retry-after holds through the wait
+			// instead of a retry that fails the same way; over the cap it parks as
+			// today, so the second attempt still runs.
+			const wait = rateLimitWaitMs(ran.result);
+			if (
+				wait !== null &&
+				wait > RATE_LIMIT_HOLD_MIN_MS &&
+				wait <= RATE_LIMIT_HOLD_MAX_MS
+			) {
+				hold = rateLimitHold(wait);
+				break;
+			}
 		}
 		if (checkFailed !== null)
 			parkFailedWorkCheck(
@@ -8735,7 +8790,7 @@ export function createTurnLoop(
 	): void {
 		st.log(
 			hold !== null
-				? `- work check held until ${new Date(hold.holdUntil).toISOString()}: usage limit`
+				? `- work check held until ${new Date(hold.holdUntil).toISOString()}: ${hold.rate ? "rate limit" : "usage limit"}`
 				: `- work check failed: ${checkFailed}`,
 		);
 		const patch = hold === null ? null : holdPatch(st.store, st.id, hold);

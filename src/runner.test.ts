@@ -35,6 +35,7 @@ import {
 	NO_DISCOVERY_CONFIG,
 	newEventState,
 	QUOTA_LIMIT,
+	rateLimitWaitMs,
 	rejectedReport,
 	renderEvent,
 	resumePlan,
@@ -958,6 +959,50 @@ describe("hitUsageLimit", () => {
 			),
 		).toBe(false);
 		expect(hitUsageLimit(result({}))).toBe(false);
+	});
+
+	describe("rateLimitWaitMs", () => {
+		test("reads a 429's retry-after-ms in ms and a Retry-After value in seconds", () => {
+			expect(
+				rateLimitWaitMs(
+					result({
+						exitCode: 1,
+						stderrTail:
+							'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}} retry-after-ms=9169000\n',
+					}),
+				),
+			).toBe(9_169_000);
+			expect(
+				rateLimitWaitMs(
+					result({
+						providerError: '429 rate_limit_error "retry-after-ms":2000',
+					}),
+				),
+			).toBe(2000);
+			expect(
+				rateLimitWaitMs(result({ stderrTail: "http 429 retry-after: 120\n" })),
+			).toBe(120_000);
+		});
+
+		test("returns null off the rate-limit signature or without a wait", () => {
+			expect(
+				rateLimitWaitMs(
+					result({
+						stderrTail:
+							'429 {"error":{"type":"rate_limit_error","message":"too many requests"}}\n',
+					}),
+				),
+			).toBeNull();
+			expect(
+				rateLimitWaitMs(
+					result({ stderrTail: "error: rate limit (429), retry in 2s\n" }),
+				),
+			).toBeNull();
+			expect(rateLimitWaitMs(result({ stderrTail: "boom\n" }))).toBeNull();
+			expect(
+				rateLimitWaitMs(result({ providerError: "retry-after-ms=5000" })),
+			).toBeNull();
+		});
 	});
 });
 

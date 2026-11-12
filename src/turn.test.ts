@@ -11686,6 +11686,49 @@ describe("review findings check", () => {
 		);
 	});
 
+	test("a review check 429 with a long retry-after holds the review instead of parking", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const wait = 9_169_000;
+		const before = Date.now();
+		const { store, loop } = setupWith(record, {
+			commitsAhead: async () => 0,
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				o.onSession?.("sess");
+				const result =
+					record.runs.length === 1
+						? runResult({
+								outcome: { status: "answered", summary: "review done" },
+								recorded: record.recorded,
+							})
+						: runResult({
+								exitCode: 1,
+								stderrTail: `429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}} retry-after-ms=${wait}\n`,
+							});
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at a long wait
+		const after = store.getTask(review.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.holdUntil).toBeGreaterThanOrEqual(before + wait);
+		expect(after.holdUntil).toBeLessThan(before + wait + 5_000);
+		expect(after.holdProvider).toBeNull();
+		expect(after.needsReason).toContain("rate limit");
+		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
+			[],
+		);
+	});
+
 	test("a cancel that keeps the worktree during the quota await is not resumed by the hold", async () => {
 		const kept = "Cancel kept the worktree: uncommitted changes";
 		const { store, review } = await limitedReview((s, id) =>
@@ -13174,6 +13217,99 @@ describe("work card check", () => {
 		expect(after.needsReason).toContain("usage limit");
 		expect(after.needsReason).not.toContain("failed twice");
 		expect(after.workCheckHead).toBeNull();
+	});
+
+	const rateLimited = (retryAfter: string) =>
+		runResult({
+			exitCode: 1,
+			stderrTail: `429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."}} retry-after-ms=${retryAfter}\n`,
+		});
+
+	test("a 429 with a long retry-after holds the card queued instead of parking", async () => {
+		const wait = 9_169_000;
+		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+			rateLimited(String(wait)),
+		]);
+		const before = Date.now();
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2); // work run + one check attempt: no retry at a long wait
+		const held = store.getTask(task.id)!;
+		expect(held.stage).toBe("in_progress");
+		expect(held.state).toBe("queued");
+		expect(held.holdUntil).toBeGreaterThanOrEqual(before + wait);
+		expect(held.holdUntil).toBeLessThan(before + wait + 5_000);
+		expect(held.holdProvider).toBeNull();
+		expect(held.needsReason).toContain("rate limit");
+		expect(held.needsReason).toContain("UTC");
+		expect(held.needsReason).not.toContain("failed twice");
+		expect(held.pendingPrompt).toContain("rate limit");
+		expect(held.workCheckHead).toBeNull();
+		expect(held.workCheckLog).toHaveLength(1);
+		expect(held.workCheckLog[0]!.outcome).toBe("error");
+		const ids = (now?: number) =>
+			pickRunnable(store.listTasks(), {
+				maxParallel: null,
+				hasRules: true,
+				now,
+			}).map((t) => t.id);
+		expect(ids()).not.toContain(task.id);
+		const heldUntil = held.holdUntil ?? 0;
+		expect(heldUntil).toBeGreaterThanOrEqual(before + wait);
+		expect(ids(heldUntil + 1)).toContain(task.id);
+	});
+
+	test("a 429 with no retry-after parks needs_you as today", async () => {
+		const noWait = runResult({
+			exitCode: 1,
+			stderrTail:
+				'429 {"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}\n',
+		});
+		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+			noWait,
+			noWait,
+		]);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(3); // work run + two check attempts
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("failed twice");
+		expect(after.holdUntil).toBeNull();
+	});
+
+	test("a short retry-after keeps today's retry and parks needs_you", async () => {
+		const short = rateLimited("2000");
+		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+			short,
+			short,
+		]);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(3); // work run + two check attempts
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("failed twice");
+		expect(after.holdUntil).toBeNull();
+	});
+
+	test("a retry-after above the hold cap parks needs_you as today", async () => {
+		const over = rateLimited(String(25 * 3_600_000));
+		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+			over,
+			over,
+		]);
+		const task = store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(3); // work run + two check attempts
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("failed twice");
+		expect(after.holdUntil).toBeNull();
 	});
 
 	test("the check holds a global cap slot while it runs", async () => {

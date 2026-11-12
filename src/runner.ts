@@ -465,12 +465,26 @@ export function deathLine(stderr: string): string | undefined {
  * reset fails the same way. Covers omp's usage_limit_reached, the human "usage limit"
  * wording, the gateways' "quota exhausted" / "quota exceeded" / "no quota" /
  * insufficient_quota forms, and ZAI's "Weekly/Monthly Limit Exhausted" (OTTR-670). Rate
- * limits stay out: they clear in seconds, so an immediate retry is right for them. Shared
+ * limits stay out: rateLimitWaitMs below reads their retry-after waits (OTTR-847). Shared
  * with the check runs' hold logic in turn.ts. */
 export function hitUsageLimit(r: RunResult): boolean {
 	return /usage_limit_reached|usage limit|limit exhausted|quota exhausted|quota exceeded|no quota|insufficient_quota/i.test(
 		`${r.stderrTail}\n${r.providerError ?? ""}`,
 	);
+}
+
+/** The wait a provider rate-limit rejection asks for, in ms: `retry-after-ms` counts
+ * milliseconds, a `Retry-After` value counts seconds (HTTP). Null when the failure is not
+ * a rate limit (a 429 or rate-limit wording) or names no wait. The check runs' hold logic
+ * in turn.ts holds through a long wait instead of a retry that fails the same way
+ * (OTTR-847). */
+export function rateLimitWaitMs(r: RunResult): number | null {
+	const text = `${r.stderrTail}\n${r.providerError ?? ""}`;
+	if (!/\b429\b|rate[-_ ]?limit/i.test(text)) return null;
+	const ms = /retry-after-ms["']?\s*[:=]\s*"?(\d+)/i.exec(text);
+	if (ms !== null) return Number(ms[1]);
+	const seconds = /retry-after(?!-ms)["']?\s*[:=]\s*"?(\d+)/i.exec(text);
+	return seconds === null ? null : Number(seconds[1]) * 1000;
 }
 
 /** The inputs classify reads. */
