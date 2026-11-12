@@ -2114,15 +2114,10 @@ describe("turn cost capture", () => {
 			usageLine(a.startedAt + 1000, { input: 10, output: 1, cost: 0.25 }),
 			usageLine(a.startedAt + 5000, { input: 99, output: 9, cost: 9 }),
 		]);
-<<<<<<< HEAD
+
 		await store.finishTurn(a.id, { endedAt: a.startedAt + 2000 });
 		await store.close();
-=======
-		store.finishTurn(a.id, { endedAt: a.startedAt + 2000 });
-		// The capture reads the transcript off the turn's critical path; await it here.
-		await store.captureSettled();
-		store.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const rows = raw
@@ -2183,14 +2178,10 @@ describe("turn cost capture", () => {
 			usageLine(T + 760_000, { input: 20, output: 2, cost: 0.5 }), // B only
 			usageLine(T + 1_400_000, { input: 99, output: 9, cost: 9 }), // after both
 		]);
-<<<<<<< HEAD
+
 		// The backfill runs on open and splits the transcript by window.
 		const reopened = await open(dir);
-=======
-		// The backfill runs on open, fire-and-forget; await it before the read.
-		const reopened = open(dir);
-		await reopened.backfill;
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		expect(
 			(await reopened.perfFacts()).turns.sort((x, y) => x.endedAt - y.endedAt),
 		).toEqual([
@@ -2224,18 +2215,13 @@ describe("turn cost capture", () => {
 			"p",
 			null,
 		);
-<<<<<<< HEAD
+
 		await store.finishTurn(orphan.id, { endedAt: orphan.startedAt + 1000 });
 		expect((await store.perfFacts()).turns.every((x) => x.cost === null)).toBe(
 			true,
 		);
 		await store.close();
-=======
-		store.finishTurn(orphan.id, { endedAt: orphan.startedAt + 1000 });
-		await store.captureSettled();
-		expect(store.perfFacts().turns.every((x) => x.cost === null)).toBe(true);
-		store.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 	});
 
 	test("an owned window without usage writes zeros, not NULL", async () => {
@@ -2253,14 +2239,10 @@ describe("turn cost capture", () => {
 				message: { role: "user", content: "go" },
 			}),
 		]);
-<<<<<<< HEAD
+
 		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
 		await store.close();
-=======
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		await store.captureSettled();
-		store.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const row = raw
 			.query<{ tokens_in: number; cost: number }, []>(
@@ -2279,16 +2261,10 @@ describe("turn cost capture", () => {
 		const t = await store.updateTask((await store.createTask("restarted")).id, {
 			sessionId: oldSid,
 		});
-<<<<<<< HEAD
+
 		const old = await store.startTurn(t.id, "work", "p", null);
 		await store.finishTurn(old.id, { endedAt: old.startedAt + 1000 }); // no file yet: NULL
-=======
-		const old = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(old.id, { endedAt: old.startedAt + 1000 }); // no file yet: NULL
-		// The capture is fire-and-forget: settle it while no transcript exists, so the
-		// files written below can never leak into the finished turn's capture.
-		await store.captureSettled();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		// The old session's own transcript bills cost 2 inside the old turn's window...
 		writeTranscript(store.sessionsDir, oldSid, [
 			usageLine(old.startedAt + 100, { input: 1, output: 1, cost: 2 }),
@@ -2299,14 +2275,10 @@ describe("turn cost capture", () => {
 		writeTranscript(store.sessionsDir, newSid, [
 			usageLine(T, { input: 5, output: 5, cost: 0.5 }),
 		]);
-<<<<<<< HEAD
+
 		await store.close();
 		const reopened = await open(dir);
-=======
-		store.close();
-		const reopened = open(dir);
-		await reopened.backfill;
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		// Not a confirmed zero: the current transcript cannot speak for that turn.
 		expect((await reopened.perfFacts()).turns[0]?.cost).toBeNull();
 		await reopened.close();
@@ -2325,7 +2297,7 @@ describe("turn cost capture", () => {
 			cost: 0.4,
 		});
 		writeTranscript(store.sessionsDir, sid, [good, "{broken"]);
-<<<<<<< HEAD
+
 		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
 		expect((await store.perfFacts()).turns[0]?.cost).toBeNull();
 		writeTranscript(store.sessionsDir, sid, [good]);
@@ -2333,27 +2305,13 @@ describe("turn cost capture", () => {
 		const reopened = await open(dir);
 		expect((await reopened.perfFacts()).turns[0]?.cost).toBe(0.4);
 		await reopened.close();
-=======
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		// Settle the fire-and-forget capture before the repair write below, so the
-		// capture provably read the garbled transcript, not the repaired one.
-		await store.captureSettled();
-		expect(store.perfFacts().turns[0]?.cost).toBeNull();
-		writeTranscript(store.sessionsDir, sid, [good]);
-		store.close();
-		const reopened = open(dir);
-		// The backfill is the fire-and-forget capture's reopen twin: async since the
-		// transcript reads went async, so perfFacts must read it only once it settled.
-		await reopened.backfill;
-		expect(reopened.perfFacts().turns[0]?.cost).toBe(0.4);
-		reopened.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 	});
 
 	test("a malformed transcript keeps cost NULL in the backfill until repaired", async () => {
 		const dir = join(root, "cost-malformed-backfill");
 		const sid3 = "eeee0000-0000-0000-0000-000000000401";
-<<<<<<< HEAD
+
 		const store = await open(dir);
 		const t = await store.updateTask(
 			(await store.createTask("garbled later")).id,
@@ -2363,23 +2321,14 @@ describe("turn cost capture", () => {
 		);
 		const turn = await store.startTurn(t.id, "work", "p", null);
 		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file: NULL
-=======
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("garbled later").id, {
-			sessionId: sid3,
-		});
-		const turn = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file: NULL
-		// Settle the fire-and-forget capture before the transcript write below.
-		await store.captureSettled();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		const good = usageLine(turn.startedAt + 100, {
 			input: 3,
 			output: 1,
 			cost: 0.6,
 		});
 		writeTranscript(store.sessionsDir, sid3, [good, "not json"]);
-<<<<<<< HEAD
+
 		await store.close();
 		const first = await open(dir);
 		expect((await first.perfFacts()).turns[0]?.cost).toBeNull();
@@ -2388,18 +2337,7 @@ describe("turn cost capture", () => {
 		const second = await open(dir);
 		expect((await second.perfFacts()).turns[0]?.cost).toBe(0.6);
 		await second.close();
-=======
-		store.close();
-		const first = open(dir);
-		await first.backfill;
-		expect(first.perfFacts().turns[0]?.cost).toBeNull();
-		writeTranscript(first.sessionsDir, sid3, [good]);
-		first.close();
-		const second = open(dir);
-		await second.backfill;
-		expect(second.perfFacts().turns[0]?.cost).toBe(0.6);
-		second.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 	});
 
 	// The subagent folder sits beside the session file (`<ts>_<sid>/`). Breakages are built
@@ -2437,23 +2375,14 @@ describe("turn cost capture", () => {
 				`2026-09-27T10-00-00-000Z_${sid4}`,
 			);
 			breakIt(subDir);
-<<<<<<< HEAD
+
 			await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
 			expect((await store.perfFacts()).turns[0]?.cost).toBeNull(); // turn end
 			await store.close();
 			const first = await open(dir);
 			expect((await first.perfFacts()).turns[0]?.cost).toBeNull(); // backfill
 			await first.close();
-=======
-			store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-			await store.captureSettled();
-			expect(store.perfFacts().turns[0]?.cost).toBeNull(); // turn end
-			store.close();
-			const first = open(dir);
-			await first.backfill;
-			expect(first.perfFacts().turns[0]?.cost).toBeNull(); // backfill
-			first.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 			// Repair: a readable folder with one subagent file that bills 2 more.
 			rmSync(subDir, { recursive: true, force: true });
 			mkdirSync(subDir, { recursive: true });
@@ -2461,16 +2390,11 @@ describe("turn cost capture", () => {
 				join(subDir, "0-sub.jsonl"),
 				usageLine(at + 10, { input: 1, output: 1, cost: 2 }),
 			);
-<<<<<<< HEAD
+
 			const second = await open(dir);
 			expect((await second.perfFacts()).turns[0]?.cost).toBe(3);
 			await second.close();
-=======
-			const second = open(dir);
-			await second.backfill;
-			expect(second.perfFacts().turns[0]?.cost).toBe(3);
-			second.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		});
 	}
 
@@ -2481,41 +2405,27 @@ describe("turn cost capture", () => {
 		const t = await store.updateTask((await store.createTask("old work")).id, {
 			sessionId: sid2,
 		});
-<<<<<<< HEAD
+
 		const turn = await store.startTurn(t.id, "work", "p", null);
 		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
 		expect((await store.perfFacts()).turns[0]?.cost).toBeNull(); // no transcript yet
-=======
-		const turn = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		// Settle the fire-and-forget capture while no transcript exists: NULL at turn end.
-		await store.captureSettled();
-		expect(store.perfFacts().turns[0]?.cost).toBeNull(); // no transcript yet
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		writeTranscript(store.sessionsDir, sid2, [
 			usageLine(turn.startedAt + 100, { input: 7, output: 3, cost: 0.75 }),
 		]);
 		await store.close();
 		// The backfill runs on open, before any caller touches the store.
-<<<<<<< HEAD
+
 		const reopened = await open(dir);
 		expect((await reopened.perfFacts()).turns).toEqual([
-=======
-		const reopened = open(dir);
-		await reopened.backfill;
-		expect(reopened.perfFacts().turns).toEqual([
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 			{ endedAt: turn.startedAt + 1000, failed: false, cost: 0.75 },
 		]);
 		await reopened.close();
 		// A second open is idempotent: filled turns are not re-read.
-<<<<<<< HEAD
+
 		expect((await (await open(dir)).perfFacts()).turns).toEqual([
-=======
-		const again = open(dir);
-		await again.backfill;
-		expect(again.perfFacts().turns).toEqual([
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 			{ endedAt: turn.startedAt + 1000, failed: false, cost: 0.75 },
 		]);
 		again.close();
@@ -2825,16 +2735,11 @@ describe("done task context capture", () => {
 			contextLine(turn.startedAt + 100, 10_000),
 			contextLine(turn.startedAt + 2000, 250_000),
 		]);
-<<<<<<< HEAD
+
 		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 3000 });
 		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBe(250_000);
 		await store.close();
-=======
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 3000 });
-		await store.captureSettled();
-		expect(store.perfFacts().tasks[0]?.contextTokens).toBe(250_000);
-		store.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		expect(storedContext(dir)).toBe(250_000);
 	});
 
@@ -2844,7 +2749,7 @@ describe("done task context capture", () => {
 		const t = await store.updateTask((await store.createTask("late file")).id, {
 			sessionId: sid,
 		});
-<<<<<<< HEAD
+
 		const a = await store.startTurn(t.id, "work", "p", null);
 		await store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
 		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBeNull();
@@ -2855,21 +2760,7 @@ describe("done task context capture", () => {
 		await store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
 		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBe(300_000);
 		await store.close();
-=======
-		const a = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
-		// Settle the fire-and-forget capture before the transcript write below.
-		await store.captureSettled();
-		expect(store.perfFacts().tasks[0]?.contextTokens).toBeNull();
-		writeTranscript(store.sessionsDir, sid, [
-			contextLine(a.startedAt + 2000, 300_000),
-		]);
-		const b = store.startTurn(t.id, "work", "p2", null);
-		store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
-		await store.captureSettled();
-		expect(store.perfFacts().tasks[0]?.contextTokens).toBe(300_000);
-		store.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 	});
 
 	test("reopen backfills a done task's reading once its transcript exists", async () => {
@@ -2889,7 +2780,7 @@ describe("done task context capture", () => {
 		writeTranscript(store.sessionsDir, sid, [
 			contextLine(turn.startedAt + 900, 128_000),
 		]);
-<<<<<<< HEAD
+
 		const reopened = await open(dir);
 		expect((await reopened.perfFacts()).tasks[0]?.contextTokens).toBe(128_000);
 		await reopened.close();
@@ -2897,17 +2788,7 @@ describe("done task context capture", () => {
 		expect((await (await open(dir)).perfFacts()).tasks[0]?.contextTokens).toBe(
 			128_000,
 		);
-=======
-		const reopened = open(dir);
-		await reopened.backfill;
-		expect(reopened.perfFacts().tasks[0]?.contextTokens).toBe(128_000);
-		reopened.close();
-		// A second open is idempotent: filled tasks are not re-read.
-		const again = open(dir);
-		await again.backfill;
-		expect(again.perfFacts().tasks[0]?.contextTokens).toBe(128_000);
-		again.close();
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 	});
 
 	test("only done tasks backfill; a missing transcript keeps NULL", async () => {
@@ -2927,13 +2808,9 @@ describe("done task context capture", () => {
 		await store.updateTask(done.id, { stage: "done" });
 		await store.close();
 		writeTranscript(store.sessionsDir, sid, [contextLine(1, 64_000)]);
-<<<<<<< HEAD
+
 		const facts = (await (await open(dir)).perfFacts()).tasks;
-=======
-		const skipStore = open(dir);
-		await skipStore.backfill;
-		const facts = skipStore.perfFacts().tasks;
->>>>>>> be77187 (perf: move transcript reads and git identity probes off the loop)
+
 		// The running card never backfills, even with a readable transcript.
 		expect(facts.find((f) => f.doneAt === null)?.contextTokens).toBeNull();
 		// The done card has no transcript to read.

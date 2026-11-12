@@ -11545,7 +11545,9 @@ describe("web push (R1-1, R2-3)", () => {
 
 	/** Isolated board for the alert flow (OTTR-494): own global store, one project named like
 	 * its folder, and a settable clock for the presence window. Sends land in pushSends. */
+
 	const alertBoard = async (name: string) => {
+
 		// Explicit frames and flush own publishSoon, including after reboot; HTTP stays real.
 		jest.useFakeTimers();
 		timersControlled = true;
@@ -11595,12 +11597,14 @@ describe("web push (R1-1, R2-3)", () => {
 		const needsYou = async (id: string) =>
 			await s.updateTask(id, { state: "needs_you", needsReason: "?" });
 		/** A second board process on the same global store and project: a server restart. */
+
 		const reboot = async () =>
 			await mount({ gstore: m.g, projects, now: () => clock.now });
 		const flush = async () => {
 			jest.runOnlyPendingTimers();
 			await m.app.publishState();
 		};
+
 		return { s, m, clock, subscribe, sentSince, needsYou, reboot, flush };
 	};
 
@@ -11797,7 +11801,9 @@ describe("web push (R1-1, R2-3)", () => {
 	});
 
 	test("a comment wave pushes one pr: request event; the drawer ack clears the stamp", async () => {
+
 		const b = await alertBoard("alert-pr-comments");
+
 		await b.subscribe("https://push.example/pr");
 		const s = b.s;
 		const HEAD = "c".repeat(40);
@@ -11866,7 +11872,9 @@ describe("web push (R1-1, R2-3)", () => {
 				payload: { type: "clear", tags: ["request"], upTo: { request: 1 } },
 			},
 		]);
+
 		const r = (await s.getPrReview(4242))!;
+
 		expect(r.commentsUnseen).toBe(false);
 		expect(r.commentsAt).toBe(6000);
 		// The ack POST armed its own publishSoon timer, and the prune on that publish
@@ -11877,8 +11885,10 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(keys).toContain(`pr:${t.id}:6000`);
 		expect(keys).toContain(`task:${t.id}:needs-pr${run}`);
 
+
 		// The cleared stamp is over: the next publish prunes the acked key.
 		await publishNow(b.m.app);
+
 
 
 		keys = (
@@ -11888,7 +11898,9 @@ describe("web push (R1-1, R2-3)", () => {
 	});
 
 	test("a rewritten draft is a fresh needs_you occurrence keyed by the run id", async () => {
+
 		const b = await alertBoard("alert-pr-draft");
+
 		await b.subscribe("https://push.example/draft");
 		const s = b.s;
 		const HEAD = "d".repeat(40);
@@ -12006,6 +12018,8 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(await publishNow(b.m.app)).toBe(true);
 
 
+		expect(b.sentSince(from)).toEqual([]);
+		b.flush();
 		expect(b.sentSince(from)).toEqual([]);
 		// No stamp in the frame: the bell and the event diff see no occurrence at all.
 		const quietFrame = (await (await b.m.call("/api/state")).json()) as {
