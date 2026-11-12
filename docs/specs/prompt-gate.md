@@ -309,8 +309,10 @@ repo lookup before it parks:
   not answer, and the missing outside check, exactly like today. The lookup or
   the second gate call failing logs one
   `! prompt gate: fact lookup failed: <reason>` line and falls back to today's
-  park with the first call's questions. The lookup never passes the gate by
-  itself.
+  park with the first call's questions and `seen` unchanged: the
+  answered-facts block enters the persisted state only when the second gate
+  call judged it, so a fallback park never holds answers the drawer does not
+  show. The lookup never passes the gate by itself.
 - `PromptGateState` gains optional `facts: GateFact[]` (`src/types.ts`) — the
   lookup's answers, persisted only on a park that followed an answered lookup
   (a pass needs no correction UI). Additive JSON inside the existing `gate`

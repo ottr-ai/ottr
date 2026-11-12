@@ -24123,6 +24123,59 @@ describe("prompt gate", () => {
 		expect(record.runs).toHaveLength(0);
 	});
 
+	test("a failed re-run after an answered lookup parks with seen unchanged", async () => {
+		const factQ = "Where does the release currently run?";
+		const decisionQ = "If the app token mint fails, fail or fall back?";
+		const gateInputs: (string | null)[] = [];
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				calls += 1;
+				gateInputs.push(o.userMessages);
+				if (calls === 1)
+					return {
+						builds: "a release flow",
+						checks: "watch the release land",
+						points: DEEPEN_POINTS.map(() => ({
+							covered: true,
+							reason: "fine",
+						})),
+						questions: [
+							{ question: factQ, kind: "fact", options: [] },
+							{ question: decisionQ, kind: "decision", options: ["fail"] },
+						],
+					};
+				throw new Error("re-gate down");
+			},
+			factLookup: async () => [
+				{
+					question: factQ,
+					answer: "gh release create",
+					evidence: "src/release.ts:827",
+				},
+			],
+		});
+		const task = store.createTask("failed re-gate");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		// Both gate calls ran; the second one failed after the lookup answered.
+		expect(calls).toBe(2);
+		// The second call saw the answers; the persisted park does not hold them.
+		expect(gateInputs[1] ?? "").toContain("Answered from the code");
+		// The fallback is today's park: the first call's questions, seen untouched.
+		expect(after.state).toBe("needs_you");
+		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
+		expect(after.gate?.seen).toBeNull();
+		expect(after.gate?.facts).toBeUndefined();
+		expect(readFileSync(store.logPath(task.id), "utf8")).toContain(
+			"! prompt gate: fact lookup failed: re-gate down",
+		);
+		expect(record.runs).toHaveLength(0);
+	});
+
 	test("a hash match skips the gate seam entirely", async () => {
 		let calls = 0;
 		const { store, record, loop } = setup({

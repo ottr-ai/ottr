@@ -3868,14 +3868,19 @@ export function createTurnLoop(
 						log(
 							`+ prompt gate: answered from the code: ${f.question} -> ${f.answer} (${f.evidence})`,
 						);
-					effSeen =
+					const seenWithFacts =
 						seen === null
 							? factsBlock(facts)
 							: `${seen}\n\n${factsBlock(facts)}`;
+					// The answers enter the persisted state only once the second call
+					// judged them: a failed re-run falls back to today's park with the
+					// seen text untouched, so the drawer never hides answers the state
+					// holds (and never holds answers it does not show).
 					effCheck = await (ops.gateCheck ?? promptGateCheck)({
 						prompt: judged,
-						userMessages: gateUserText(pending, effSeen),
+						userMessages: gateUserText(pending, seenWithFacts),
 					});
+					effSeen = seenWithFacts;
 					answeredFacts = facts;
 				}
 			} catch (e) {
