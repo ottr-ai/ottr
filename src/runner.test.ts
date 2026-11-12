@@ -1991,53 +1991,63 @@ describe("applyEvent", () => {
 
 	// OTTR-863: omp emits only the outer `eval` tool events for an eval-kernel call;
 	// a nested `tool.propose_task`/`tool.report_outcome` ride no tool_execution events.
-	// The extension refuses those nested calls, so the run's stream shows the refusals
-	// in the eval result the agent reads, and the parser records nothing. The parser
-	// must never grow an eval-output text parse either: the cell output is agent text,
-	// and a quoted marker line would forge findings.
-	test("an eval call the extension refused records no findings and no outcome", () => {
-		const refusal = (name: string) =>
-			`Error: ${name} was called through the eval kernel (tool.${name}). Call ${name} directly, not through eval: the board reads direct tool calls only, so this call recorded nothing.`;
-		const evalCode =
-			'const a = await tool.propose_task({ prompt: "F1", rank: 1 });\n' +
-			'const b = await tool.propose_task({ prompt: "F2", rank: 2 });\n' +
-			'const c = await tool.report_outcome({ status: "ready", summary: "s" });';
+	// The guard that refuses those calls lives in the extension (tracker.ts), whose
+	// tests separate before and after. This test pins the recorded ground truth the
+	// path decision rests on: feed the real recorded run (src/fixtures/eval-bridge-stream.jsonl,
+	// captured live from omp 18.15.0 with the guarded extension) and check the parser
+	// reads the direct retry's outcome but nothing from the eval window. It also pins
+	// the boundary the parser must never cross: the eval cell output is agent text,
+	// and a quoted marker line would forge findings, so no eval-output text parse.
+	test("the recorded eval-bridge run: the direct retry records, the eval window records nothing", async () => {
+		const fixture = await Bun.file(
+			join(import.meta.dir, "fixtures", "eval-bridge-stream.jsonl"),
+		).text();
+		const lines = fixture
+			.split("\n")
+			.map((l) => l.trim())
+			.filter((l) => l !== "");
+		// The recording's tool events: one eval pair and one DIRECT report_outcome pair.
+		// A nested propose_task/report_outcome event would mean omp changed the bridge;
+		// the refusal guard and this fixture must then be revisited together.
+		const toolNames = lines
+			.map((l) => {
+				const e = JSON.parse(l) as { type?: string; toolName?: string };
+				return e.type?.startsWith("tool_execution") ? e.toolName : null;
+			})
+			.filter((n) => n !== null);
+		expect([...new Set(toolNames)].sort()).toEqual(["eval", "report_outcome"]);
 		const s = newEventState();
-		const end = {
-			type: "tool_execution_end",
-			toolName: "eval",
-			toolCallId: "call_eval1",
-			isError: false,
-			result: {
-				content: [
-					{
-						type: "text",
-						text: JSON.stringify([
-							refusal("propose_task"),
-							refusal("propose_task"),
-							refusal("report_outcome"),
-						]),
-					},
-				],
-			},
-		};
-		feed(
-			s,
-			{
-				type: "tool_execution_start",
-				toolName: "eval",
-				toolCallId: "call_eval1",
-				args: { code: evalCode, language: "js" },
-			},
-			end,
-		);
+		for (const l of lines) feed(s, JSON.parse(l));
+		// Nothing from the eval window: the two nested propose_task calls and the
+		// nested report_outcome ride no events, refused or not.
 		expect(s.recorded).toHaveLength(0);
 		expect(s.proposed).toBeNull();
-		expect(s.outcome).toBeNull();
-		// The refusal reached the agent: the eval result text names the fix.
-		const resultText = (
-			end.result.content as { type: string; text: string }[]
-		)[0]!.text;
+		// The agent's DIRECT retry after the refusals is the call the board reads.
+		expect(s.outcome?.status).toBe("answered");
+		expect(s.outcome?.summary).toContain(
+			"Ran the requested eval routing probe",
+		);
+		// What the agent saw in the recording: the real bridge wraps each nested
+		// result as a {text, details} object, and the refusal texts ride in the
+		// eval result. Descriptive of the recording, not a guard check.
+		const evalEnd = lines
+			.map(
+				(l) =>
+					JSON.parse(l) as {
+						type?: string;
+						toolName?: string;
+						result?: unknown;
+					},
+			)
+			.find(
+				(e) => e.type === "tool_execution_end" && e.toolName === "eval",
+			) as {
+			result: { content: { type: string; text: string }[] };
+		};
+		const resultText = evalEnd.result.content
+			.filter((p) => p.type === "text")
+			.map((p) => p.text)
+			.join("");
 		expect(resultText).toContain(
 			"Call propose_task directly, not through eval",
 		);

@@ -3,6 +3,7 @@ import {
 	PROPOSE_TOOL_DESCRIPTION,
 	REVIEW_PROPOSE_TOOL_DESCRIPTION,
 } from "../src/prompts.ts";
+import { applyEvent, newEventState } from "../src/runner.ts";
 import createTracker from "./tracker.ts";
 
 // Hermeticity: every named omp session exports OTTR_SESSION_NAME into its child shells, and an
@@ -1292,6 +1293,50 @@ describe("board tools called through the eval kernel", () => {
 				}),
 			),
 		).toContain("delivered to the tracker user");
+	});
+
+	// The acceptance's event-stream half: the refusal text comes from the REAL execute
+	// (the code under test), wrapped in the bridge envelope omp actually returns — each
+	// nested result serialized as a {text, details} object, the eval cell output carrying
+	// that JSON (recorded live in src/fixtures/eval-bridge-stream.jsonl). Without the
+	// guard the execute returns its success text, the refusal assertion fails, and the
+	// stream would carry a false success the runner reads as nothing.
+	test("a refused eval call rides the bridge envelope into the event stream", async () => {
+		process.env.OTTR_REVIEW = "1";
+		const tools = await freshTools();
+		const runEval = async (name: string, params: Record<string, unknown>) => {
+			const result = await tools[name]!.execute(evalId(name), params);
+			const cell = JSON.stringify({ text: text(result), details: {} });
+			const s = newEventState();
+			applyEvent(s, {
+				type: "tool_execution_start",
+				toolName: "eval",
+				toolCallId: "call_probe",
+				args: { code: `await tool.${name}(...)`, language: "js" },
+			});
+			applyEvent(s, {
+				type: "tool_execution_end",
+				toolName: "eval",
+				toolCallId: "call_probe",
+				isError: false,
+				result: { content: [{ type: "text", text: cell }] },
+			});
+			return { s, cell };
+		};
+		const finding = await runEval("propose_task", { prompt: "F", rank: 1 });
+		expect(finding.s.recorded).toHaveLength(0);
+		expect(finding.s.outcome).toBeNull();
+		expect(finding.cell).toContain(
+			"Call propose_task directly, not through eval",
+		);
+		const outcome = await runEval("report_outcome", {
+			status: "ready",
+			summary: "s",
+		});
+		expect(outcome.s.outcome).toBeNull();
+		expect(outcome.cell).toContain(
+			"Call report_outcome directly, not through eval",
+		);
 	});
 
 	test("a retro eval proposal records nothing and the direct proposal still lands", async () => {
