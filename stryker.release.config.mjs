@@ -2,7 +2,7 @@
 // costs ~0.5-1 s on Windows), so only this file's mutants pay for it — the same isolation pattern
 // as stryker.worktree.config.mjs.
 import base from "./stryker.config.mjs";
-import { mutationConcurrency } from "./scripts/stryker-load.mjs";
+import { cappedConcurrency } from "./scripts/stryker-load.mjs";
 
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
@@ -17,8 +17,8 @@ export default {
   incrementalFile: "reports/stryker-incremental-release.json",
   // 8, not the base cap: this git-spawn-heavy suite inflated every run past any timeout
   // budget at higher concurrency (80/80 timed out at 16-way, 2026-09-30); 8 keeps runs within the
-  // budget below. The CPU-derived value and STRYKER_CONCURRENCY only lower it.
-  concurrency: Math.min(8, mutationConcurrency()),
+  // budget below. The CPU-derived value, the memory rule and STRYKER_CONCURRENCY only lower it.
+  concurrency: cappedConcurrency(8),
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time. The git-heavy suite inflates
   // under parallel runners, and a git spawn's cost on Windows swings ~3x with machine state
   // (74 s standalone in the morning, 160-260 s the same afternoon), so the budget is sized for

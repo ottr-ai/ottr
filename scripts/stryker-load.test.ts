@@ -13,27 +13,122 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	acquireMutationLock,
+	cappedConcurrency,
 	isStrykerRun,
 	mutationConcurrency,
 	sandboxTempDirName,
 } from "./stryker-load.mjs";
 
+// Cgroup v2 paths that do not exist, so the CPU rule decides alone (the pre-OTTR-886
+// behavior) no matter what the host's real cgroup says.
+const NO_CGROUP = {
+	max: "/ottr-886-absent/memory.max",
+	current: "/ottr-886-absent/memory.current",
+};
+const MIB = 1024 * 1024;
+const GIB = 1024 * MIB;
+
+function withCgroup(
+	max: string,
+	current: string,
+	run: (cgroup: { max: string; current: string }) => void,
+): void {
+	const dir = mkdtempSync(join(tmpdir(), "ottr-886-cgroup-"));
+	const cgroup = {
+		max: join(dir, "memory.max"),
+		current: join(dir, "memory.current"),
+	};
+	writeFileSync(cgroup.max, max);
+	writeFileSync(cgroup.current, current);
+	try {
+		run(cgroup);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 test("mutationConcurrency is half of the CPUs, at least 1", () => {
-	expect(mutationConcurrency({}, 24)).toBe(12);
-	expect(mutationConcurrency({}, 25)).toBe(12);
-	expect(mutationConcurrency({}, 2)).toBe(1);
-	expect(mutationConcurrency({}, 1)).toBe(1);
+	// NO_CGROUP keeps this the CPU rule in isolation; with a real cgroup the memory rule may
+	// lower the result.
+	expect(mutationConcurrency({}, 24, NO_CGROUP)).toBe(12);
+	expect(mutationConcurrency({}, 25, NO_CGROUP)).toBe(12);
+	expect(mutationConcurrency({}, 2, NO_CGROUP)).toBe(1);
+	expect(mutationConcurrency({}, 1, NO_CGROUP)).toBe(1);
 	for (let cpus = 1; cpus <= 64; cpus++) {
-		expect(mutationConcurrency({}, cpus)).toBe(
+		expect(mutationConcurrency({}, cpus, NO_CGROUP)).toBe(
 			Math.max(1, Math.floor(cpus / 2)),
 		);
 	}
 });
 
+test("the memory rule sizes slots from free cgroup memory", () => {
+	// The OTTR-886 acceptance case: 8 GiB limit, 4 GiB used, 24 CPUs. Free 3072 MiB after
+	// the 1 GiB reserve at 400 MiB per slot gives 7; the CPU rule alone (the behavior before
+	// this change) would return 12.
+	withCgroup(String(8 * GIB), String(4 * GIB), (cgroup) => {
+		expect(mutationConcurrency({}, 24, cgroup)).toBe(7);
+	});
+	// Slot boundaries: reserve + 400 MiB gives 1 slot, reserve + 800 MiB gives 2.
+	withCgroup(String(GIB + 400 * MIB), "0", (cgroup) => {
+		expect(mutationConcurrency({}, 24, cgroup)).toBe(1);
+	});
+	withCgroup(String(GIB + 800 * MIB), "0", (cgroup) => {
+		expect(mutationConcurrency({}, 24, cgroup)).toBe(2);
+	});
+});
+
+test("memory.max 'max' or missing cgroup files keep the CPU rule", () => {
+	withCgroup("max", String(4 * GIB), (cgroup) => {
+		expect(mutationConcurrency({}, 24, cgroup)).toBe(12);
+	});
+	expect(mutationConcurrency({}, 24, NO_CGROUP)).toBe(12);
+});
+
+test("very low free memory gives 1 slot, never 0", () => {
+	// Free memory inside the reserve: the floor would be 0 or negative, clamped to 1.
+	withCgroup(String(8 * GIB), String(8 * GIB - 512 * MIB), (cgroup) => {
+		expect(mutationConcurrency({}, 24, cgroup)).toBe(1);
+	});
+	// Used beyond the limit, on 1 CPU: still 1.
+	withCgroup(String(GIB), String(2 * GIB), (cgroup) => {
+		expect(mutationConcurrency({}, 1, cgroup)).toBe(1);
+	});
+});
+
+test("STRYKER_CONCURRENCY wins over the memory rule", () => {
+	withCgroup(String(8 * GIB), String(4 * GIB), (cgroup) => {
+		expect(mutationConcurrency({ STRYKER_CONCURRENCY: "5" }, 24, cgroup)).toBe(
+			5,
+		);
+		expect(mutationConcurrency({ STRYKER_CONCURRENCY: "20" }, 24, cgroup)).toBe(
+			20,
+		);
+	});
+});
+
+test("cappedConcurrency takes the lowest of cap and the rules", () => {
+	withCgroup(String(8 * GIB), String(4 * GIB), (cgroup) => {
+		// The memory rule (7) under the cap (8).
+		expect(cappedConcurrency(8, {}, 24, cgroup)).toBe(7);
+		// The cap (5) under the memory rule (7).
+		expect(cappedConcurrency(5, {}, 24, cgroup)).toBe(5);
+		// STRYKER_CONCURRENCY still lands under the cap.
+		expect(
+			cappedConcurrency(8, { STRYKER_CONCURRENCY: "20" }, 24, cgroup),
+		).toBe(8);
+	});
+});
+
 test("STRYKER_CONCURRENCY overrides the CPU value when set", () => {
-	expect(mutationConcurrency({ STRYKER_CONCURRENCY: "5" }, 24)).toBe(5);
-	expect(mutationConcurrency({ STRYKER_CONCURRENCY: "3" }, 2)).toBe(3);
-	expect(mutationConcurrency({ STRYKER_CONCURRENCY: "" }, 24)).toBe(12);
+	expect(mutationConcurrency({ STRYKER_CONCURRENCY: "5" }, 24, NO_CGROUP)).toBe(
+		5,
+	);
+	expect(mutationConcurrency({ STRYKER_CONCURRENCY: "3" }, 2, NO_CGROUP)).toBe(
+		3,
+	);
+	expect(mutationConcurrency({ STRYKER_CONCURRENCY: "" }, 24, NO_CGROUP)).toBe(
+		12,
+	);
 });
 
 test("STRYKER_CONCURRENCY rejects values below 1 and non-integers", () => {

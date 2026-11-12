@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	acquireMutationLock,
+	cappedConcurrency,
 	isStrykerRun,
-	mutationConcurrency,
 	sandboxTempDirName,
 } from "./scripts/stryker-load.mjs";
 
@@ -70,8 +70,13 @@ export default {
   // a source or test edit reruns exactly its own mutants stays open.
   incremental: true,
   incrementalFile: "reports/stryker-incremental-main.json",
-  // Half of the host CPUs (os.availableParallelism()), at least 1, so a run never asks for more
-  // CPU than the host has; STRYKER_CONCURRENCY wins when set. Capped at the measured 24: each
+  // Stryker worker count = cappedConcurrency(24): half of the host CPUs
+  // (os.availableParallelism()), at least 1, lowered at run start to what the worker's free
+  // cgroup v2 memory allows (400 MiB per slot, 1 GiB reserve), so a run cannot push a shared
+  // worker into an OOM kill; STRYKER_CONCURRENCY wins when set. 2026-11-12 measurement on
+  // the 8 GiB worker image (mutate src/app.ts:1800-2100, 274 mutants): 12 slots peaked at
+  // 4222 MiB and OOM-killed worker-b while it also ran other turns; 6 slots peaked at
+  // 2974 MiB with the same 156 kills, so one slot costs ~300 MiB. Capped at the measured 24: each
   // worker runs under the 2 GB cap, the 421-mutant uniform sample kept every verdict identical
   // at c8/c16/c24, while 48 slots produced 5 false timeouts from CPU saturation, so do not
   // raise the cap without re-measuring. The 2026-10-13 exit-137 run
@@ -79,7 +84,7 @@ export default {
   // was injected (fixed the same day). On a loaded machine inflated
   // run times can still mass-time-out past the budget (2026-09-30 review; a full clean base pass
   // once measured ~4 h at 8, 2026-10-13).
-  concurrency: Math.min(24, mutationConcurrency()),
+  concurrency: cappedConcurrency(24),
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time. The sandbox is a cold copy in
   // %TEMP%, so runs inflate past the standalone suite time; the 5 s / 1.5x default was too tight.
   timeoutMS: 10000,

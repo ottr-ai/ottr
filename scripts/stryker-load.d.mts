@@ -1,6 +1,14 @@
 export function mutationConcurrency(
 	env?: Record<string, string | undefined>,
 	parallelism?: number,
+	cgroup?: { max: string; current: string },
+): number;
+
+export function cappedConcurrency(
+	cap: number,
+	env?: Record<string, string | undefined>,
+	parallelism?: number,
+	cgroup?: { max: string; current: string },
 ): number;
 
 export function isStrykerRun(argv?: unknown[]): boolean;

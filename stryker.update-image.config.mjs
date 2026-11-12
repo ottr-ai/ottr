@@ -1,6 +1,7 @@
 // Mutation testing for scripts/update-image.ts, the fifth run of `bun run test:mutation`. Its test
 // drives real git fixtures, so only this file's mutants pay for them.
 import base from "./stryker.config.mjs";
+import { cappedConcurrency } from "./scripts/stryker-load.mjs";
 
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
@@ -15,8 +16,9 @@ export default {
   // inherited 24-way and the 10 s + 2x budget. Under host load (load average ~50, 2026-10-30)
   // that budget turned survivors into timeouts: of 17 timed-out mutants re-run at 6-way with a
   // 300 s budget, 11 survived and 6 were killed. Real hangs (the `i--` in the --env-file loop)
-  // still time out under any budget and count as detected.
-  concurrency: 8,
+  // still time out under any budget and count as detected. cappedConcurrency(8) also applies
+  // the memory rule, so the run never asks for more slots than the free cgroup memory allows.
+  concurrency: cappedConcurrency(8),
   timeoutMS: 120000,
   timeoutFactor: 3,
   // Own cache file: all five configs share the base module (stryker.config.mjs), which is

@@ -1,7 +1,7 @@
 // Mutation testing for src/worktree.ts, the second half of `bun run test:mutation`. Its tests drive real
 // git repos (~4 s a run alone, ~10 s with 23 in parallel), so only this file's mutants pay for them.
 import base from "./stryker.config.mjs";
-import { mutationConcurrency } from "./scripts/stryker-load.mjs";
+import { cappedConcurrency } from "./scripts/stryker-load.mjs";
 
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
@@ -20,8 +20,8 @@ export default {
   incrementalFile: "reports/stryker-incremental-worktree.json",
   // 8, not the base cap: this git-spawn-heavy suite timed out at 16-way on the loaded machine
   // (2026-09-30, 32/38 in the first minutes); 8 keeps runs inside the budget below. The
-  // CPU-derived value and STRYKER_CONCURRENCY only lower it.
-  concurrency: Math.min(8, mutationConcurrency()),
+  // CPU-derived value, the memory rule and STRYKER_CONCURRENCY only lower it.
+  concurrency: cappedConcurrency(8),
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time, sized for the slow machine
   // state: a git spawn's cost on Windows swings ~3x, and the git-heavy suite inflates with it.
   timeoutMS: 120000,

@@ -26,14 +26,47 @@ export function sandboxTempDirName(
 	return join(tmp, `ott-stryker-${hash}`);
 }
 
+// Cgroup v2 memory accounting, read at sizing time. The files are missing on Windows and on
+// hosts without cgroup v2, and memory.max says "max" when unlimited: then the CPU rule
+// decides alone.
+const CGROUP_MEMORY_FILES = {
+	max: "/sys/fs/cgroup/memory.max",
+	current: "/sys/fs/cgroup/memory.current",
+};
+// Measured on the 8 GiB worker image (2026-11-12, main 8e2a7ba, base config, mutate
+// src/app.ts:1800-2100): 12 slots peaked at 4222 MiB and OOM-killed worker-b while it also
+// ran other turns; 6 slots peaked at 2974 MiB with the same 156 kills. One slot costs about
+// 300 MiB, so a slot is priced at 400 MiB with a 1 GiB reserve for the run process itself.
+const SLOT_BYTES = 400 * 1024 * 1024;
+const RESERVE_BYTES = 1024 * 1024 * 1024;
+const MIB = 1024 * 1024;
+
 /**
- * Stryker worker count: half of the host CPUs, at least 1, so a mutation run never asks for more
- * CPU than the host has. STRYKER_CONCURRENCY is the calibration knob and wins when set.
+ * Free memory under the cgroup v2 limit in bytes, or null when no usable limit applies: the
+ * files are missing, unreadable, or memory.max says "max".
  */
-export function mutationConcurrency(
-	env = process.env,
-	parallelism = os.availableParallelism(),
-) {
+function cgroupFreeBytes(cgroup) {
+	let limit;
+	let used;
+	try {
+		limit = readFileSync(cgroup.max, "utf8").trim();
+		used = readFileSync(cgroup.current, "utf8").trim();
+	} catch {
+		return null;
+	}
+	const maxBytes = Number(limit);
+	const usedBytes = Number(used);
+	if (!Number.isFinite(maxBytes) || !Number.isFinite(usedBytes)) return null;
+	return maxBytes - usedBytes;
+}
+
+/**
+ * The slot decision behind mutationConcurrency and cappedConcurrency: the slot count and the
+ * rule that set it, so the run-start log can say why. STRYKER_CONCURRENCY wins; then the
+ * memory rule (400 MiB per slot, 1 GiB reserve, at least 1) lowers the CPU rule when the
+ * cgroup allows fewer slots than half the CPUs.
+ */
+function concurrencyDecision(env, parallelism, cgroup) {
 	const raw = env.STRYKER_CONCURRENCY;
 	if (raw) {
 		const value = Number(raw);
@@ -42,9 +75,68 @@ export function mutationConcurrency(
 				`STRYKER_CONCURRENCY must be a positive integer, got ${JSON.stringify(raw)}`,
 			);
 		}
-		return value;
+		return { slots: value, rule: `STRYKER_CONCURRENCY=${raw}` };
 	}
-	return Math.max(1, Math.floor(parallelism / 2));
+	const cpuSlots = Math.max(1, Math.floor(parallelism / 2));
+	const freeBytes = cgroupFreeBytes(cgroup);
+	if (freeBytes === null) {
+		return {
+			slots: cpuSlots,
+			rule: `cpu rule (${parallelism} CPUs, no cgroup memory limit)`,
+		};
+	}
+	const memorySlots = Math.max(
+		1,
+		Math.floor((freeBytes - RESERVE_BYTES) / SLOT_BYTES),
+	);
+	const freeMiB = Math.floor(freeBytes / MIB);
+	if (memorySlots < cpuSlots) {
+		return {
+			slots: memorySlots,
+			rule: `memory rule (${freeMiB} MiB free, 1024 MiB reserve, 400 MiB per slot) beat cpu rule ${cpuSlots}`,
+		};
+	}
+	return {
+		slots: cpuSlots,
+		rule: `cpu rule (${parallelism} CPUs; memory rule allowed ${memorySlots})`,
+	};
+}
+
+/**
+ * Stryker worker count: half of the host CPUs, at least 1, so a mutation run never asks for
+ * more CPU than the host has, lowered to what the worker's free cgroup memory allows
+ * (400 MiB per slot, 1 GiB reserve, at least 1) so a run cannot push a shared worker into an
+ * OOM kill. With no usable cgroup limit the CPU rule decides alone. STRYKER_CONCURRENCY is
+ * the calibration knob and wins when set.
+ */
+export function mutationConcurrency(
+	env = process.env,
+	parallelism = os.availableParallelism(),
+	cgroup = CGROUP_MEMORY_FILES,
+) {
+	return concurrencyDecision(env, parallelism, cgroup).slots;
+}
+
+/**
+ * A config's worker count: min(cap, mutationConcurrency()), so no config asks for more slots
+ * than its cap, the CPUs, or the free memory allow. On a Stryker run (isStrykerRun) it logs
+ * one line at run start with the chosen slots and the rule that decided; a plain import of a
+ * config stays silent.
+ */
+export function cappedConcurrency(
+	cap,
+	env = process.env,
+	parallelism = os.availableParallelism(),
+	cgroup = CGROUP_MEMORY_FILES,
+) {
+	const decision = concurrencyDecision(env, parallelism, cgroup);
+	const slots = Math.min(cap, decision.slots);
+	if (isStrykerRun()) {
+		const capNote =
+			slots < decision.slots ? ` (cap ${cap} below ${decision.slots})` : "";
+		console.log(`stryker-load: ${slots} slots; ${decision.rule}${capNote}`);
+	}
+	return slots;
 }
 
 /**
