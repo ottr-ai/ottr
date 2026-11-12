@@ -254,11 +254,83 @@ describe("handoffSteps", () => {
 		expect(handoffSteps("no headings at all")).toBeNull();
 	});
 
-	test("the section ends at the next heading of any level; its start offset is exact", () => {
+	test("the section ends at a same- or higher-level heading; its start offset is exact", () => {
 		const text = "intro\n\n## Recommended steps\n1. Do it.\n\n## Notes\nlater";
 		const s = handoffSteps(text);
 		expect(s?.text).toBe("## Recommended steps\n1. Do it.");
 		expect(text.slice(s!.start, s!.start + s!.text.length)).toBe(s!.text);
+	});
+
+	test("a child heading stays inside the section", () => {
+		const text = [
+			"intro",
+			"",
+			"## Recommended steps",
+			"1. Do it.",
+			"",
+			"### Measurements that could change the decision",
+			"",
+			"| state p95 below 250 ms |",
+			"",
+			"## Evidence appendix",
+			"later",
+		].join("\n");
+		const s = handoffSteps(text);
+		expect(s?.text).toBe(
+			[
+				"## Recommended steps",
+				"1. Do it.",
+				"",
+				"### Measurements that could change the decision",
+				"",
+				"| state p95 below 250 ms |",
+			].join("\n"),
+		);
+	});
+
+	test("a fenced line that starts with # is code, never a heading", () => {
+		// A fenced heading look-alike opens no section.
+		const fenced = [
+			"```sh",
+			"# Recommended steps would be a lie here",
+			"echo done",
+			"```",
+			"",
+			"## Summary",
+		].join("\n");
+		expect(handoffSteps(fenced)).toBeNull();
+
+		// A fenced comment inside the section does not end it: the command after
+		// the comment stays in the section.
+		const section = [
+			"## Recommended steps",
+			"1. Run the check:",
+			"",
+			"```sh",
+			"# the merge test must pass",
+			"bun test src/merge.test.ts",
+			"```",
+			"",
+			"## Evidence appendix",
+		].join("\n");
+		const s = handoffSteps(section);
+		expect(s?.text).toContain("# the merge test must pass");
+		expect(s?.text).toContain("bun test src/merge.test.ts");
+		expect(s?.text).not.toContain("Evidence appendix");
+	});
+
+	test("a fence of the other char inside an open fence stays code text", () => {
+		const section = [
+			"## Recommended steps",
+			"```text",
+			"~~~ not a fence end",
+			"# not a heading",
+			"```",
+			"## Notes",
+		].join("\n");
+		const s = handoffSteps(section);
+		expect(s?.text).toContain("# not a heading");
+		expect(s?.text).not.toContain("Notes");
 	});
 });
 

@@ -22695,6 +22695,13 @@ describe("prompt gate", () => {
 				"",
 				"Test: `bun test src/merge.test.ts` must pass.",
 				"",
+				"### Measurements that could change the decision",
+				"",
+				"| state p95 below 250 ms |",
+				"",
+				"## Evidence appendix",
+				"",
+				"later",
 			].join("\n");
 		writeFileSync(handoffPath, handoff);
 		store.updateTask(task.id, {
@@ -22716,6 +22723,13 @@ describe("prompt gate", () => {
 		);
 		expect(seen[0]).toContain("## Recommended steps");
 		expect(seen[0]).toContain("bun test src/merge.test.ts");
+		// The child sub-section with the section's own numbers rides along; the
+		// appendix after the same-level heading does not.
+		expect(seen[0]).toContain(
+			"### Measurements that could change the decision",
+		);
+		expect(seen[0]).toContain("state p95 below 250 ms");
+		expect(seen[0]).not.toContain("Evidence appendix");
 	});
 
 	test("a @-path outside the handoffs folder is never judged; the log names the reason", async () => {

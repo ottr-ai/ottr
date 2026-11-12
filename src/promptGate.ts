@@ -153,34 +153,53 @@ export function gateHandoff(o: {
 }
 
 /** The report's steps section: the heading line plus its body, up to the next
- * heading of any level (or the end of the text). Null when the text names none.
- * `start` is the offset of the heading line's first char, so callers can tell
- * whether the section survives a head slice of the text. */
+ * heading of the same or a higher level — a child heading (the "### Measurements"
+ * sub-section under "## Recommended steps") belongs to the section — or the end
+ * of the text. Lines inside a fenced code block are never headings, so a fenced
+ * "# comment" above a test command cannot end the section or open it. Null when
+ * the text names none. `start` is the offset of the heading line's first char,
+ * so callers can tell whether the section survives a head slice of the text. */
 export function handoffSteps(text: string): {
 	text: string;
 	start: number;
 } | null {
 	const lines = text.split("\n");
 	let lineStart = 0;
+	let level = 0;
+	let fence: string | null = null;
 	let found: { text: string; start: number } | null = null;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] ?? "";
-		if (found === null) {
-			if (STEPS_HEADING.test(line.trim()))
-				found = { text: line, start: lineStart };
+		const trimmed = line.trim();
+		const fenceMark = /^(`{3,}|~{3,})/.exec(trimmed);
+		const fenceChar = fenceMark?.[1]?.[0] ?? "";
+		const isFenceLine =
+			fenceMark !== null && (fence === null || fence === fenceChar);
+		let opened = false;
+		if (isFenceLine) {
+			fence = fence === null ? fenceChar : null;
+		} else if (fence !== null) {
+			// Inside a fenced block: code text, never a heading.
 		} else {
-			// A next heading of any level ends the section.
-			if (/^#{1,6}\s/.test(line.trim())) break;
-			found = {
-				text: `${found.text}\n${line}`,
-				start: found.start,
-			};
+			const heading = /^(#{1,6})(?:\s|$)/.exec(trimmed);
+			if (found === null) {
+				if (heading !== null && STEPS_HEADING.test(trimmed)) {
+					found = { text: line, start: lineStart };
+					level = heading[1]?.length ?? 0;
+					opened = true;
+				}
+			} else if (heading !== null && (heading[1]?.length ?? 0) <= level) {
+				// Only a heading of the same or a higher level ends the section.
+				break;
+			}
 		}
+		if (found !== null && !opened)
+			found = { text: `${found.text}\n${line}`, start: found.start };
 		lineStart += line.length + 1;
 	}
 	if (found === null) return null;
-	const trimmed = found.text.trim();
-	return trimmed === "" ? null : { text: trimmed, start: found.start };
+	const trimmedText = found.text.trim();
+	return trimmedText === "" ? null : { text: trimmedText, start: found.start };
 }
 
 /** The capped untrusted data block for a handoff text, in the gate prompt's label

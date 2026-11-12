@@ -248,10 +248,11 @@ otherwise miss. The gate judges the prompt plus that file:
   board's prompt limit) the block keeps the head slice — the header, the
   original task and the outcome that `handoffMarkdown` puts first — plus an
   elision marker, and carries the report's steps section (the "Recommended
-  steps" / "Next steps" / "Action items" heading, through the next heading)
-  past it under `STEPS_CAP`: the steps sit near the report's end, so head
-  truncation alone drops the checks the gate judges. The appendix is skipped
-  while the head slice already holds the whole section.
+  steps" / "Next steps" / "Action items" heading, through the next heading of
+  the same or a higher level — child headings and fenced code stay inside the
+  section) past it under `STEPS_CAP`: the steps sit near the report's end, so
+  head truncation alone drops the checks the gate judges. The appendix is
+  skipped while the head slice already holds the whole section.
 - The gate model call and both fingerprints (the turn pass stamp and the
   Start-anyway stamp in `gateStartReply`) cover the judged prompt, so a
   changed handoff runs the gate again.
