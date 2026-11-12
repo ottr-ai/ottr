@@ -253,6 +253,7 @@ import {
 	BOARD_CHECK_PROMPT,
 	followUpPrompt,
 	handoffMarkdown,
+	IMPLEMENT_RECOMMENDATIONS,
 	isProposalReason,
 	LOST_SESSION,
 	releasePrompt,
@@ -2964,7 +2965,10 @@ export function createApp(deps: AppDeps) {
 		for (const { e, recs } of groups) {
 			const prompt = updatePrompt(recs, propose);
 			const t = e.store.createTask(prompt);
-			e.store.updateTask(t.id, { updateIds: recs.map((r) => r.id) });
+			e.store.updateTask(t.id, {
+				promptAuthor: "board",
+				updateIds: recs.map((r) => r.id),
+			});
 			created.push({ project: e.name, id: t.id });
 		}
 		deps.schedule();
@@ -2998,7 +3002,7 @@ export function createApp(deps: AppDeps) {
 				error: `${id} is already covered by an open update card`,
 			};
 		const t = e.store.createTask(removePrompt([rec]));
-		e.store.updateTask(t.id, { updateIds: [id] });
+		e.store.updateTask(t.id, { promptAuthor: "board", updateIds: [id] });
 		deps.schedule();
 		return [{ project: e.name, id: t.id }];
 	}
@@ -3433,7 +3437,10 @@ export function createApp(deps: AppDeps) {
 			"review",
 		);
 		// Synchronous with createTask: the scheduler must never see a review card without its base.
-		const updated = e.store.updateTask(t.id, { base: resolved.sha });
+		const updated = e.store.updateTask(t.id, {
+			promptAuthor: "board",
+			base: resolved.sha,
+		});
 		deps.schedule();
 		return { ok: true, task: updated };
 	}
@@ -4366,6 +4373,17 @@ export function createApp(deps: AppDeps) {
 		return null;
 	}
 
+	/** OTTR-850: true when the request carries a live board or VM token, so the card it
+	 * files is agent-written (the extension's create_task), never the user's New task
+	 * form. The server reads the token itself; no client flag decides authorship. */
+	function agentCardRequest(req: Request): boolean {
+		const token = req.headers.get("x-board-token");
+		if (token === null) return false;
+		if (deps.board !== undefined && secretsEqual(token, deps.board.token))
+			return true;
+		return (deps.vmTokens?.check(token) ?? null) !== null;
+	}
+
 	/**
 	 * OTTR-532: microVM turns reach git, their provider gateway and memory with their per-turn
 	 * VM token, outside api() (no session, no host allowlist): each handler refuses any other
@@ -5275,6 +5293,7 @@ export function createApp(deps: AppDeps) {
 			null,
 			"interview",
 		);
+		e.store.updateTask(t.id, { promptAuthor: "board" });
 		return { interview: "queued", id: t.id };
 	}
 
@@ -7129,6 +7148,7 @@ export function createApp(deps: AppDeps) {
 			);
 		const child = e.store.createTask(task.prompt);
 		e.store.updateTask(child.id, {
+			promptAuthor: "board",
 			sourcePrNumber: task.sourcePrNumber,
 			sourcePrUrl: task.sourcePrUrl,
 			sourcePrHeadRef: task.sourcePrHeadRef,
@@ -7821,6 +7841,7 @@ export function createApp(deps: AppDeps) {
 			return taskResponse(e, last.id);
 		const t = e.store.createTask(BOARD_CHECK_PROMPT);
 		// Synchronous with createTask: the scheduler must never start the card unmarked.
+		e.store.updateTask(t.id, { promptAuthor: "board" });
 		e.store.setBoardCheckId(t.id);
 		deps.schedule();
 		return taskResponse(e, t.id);
@@ -9551,6 +9572,10 @@ export function createApp(deps: AppDeps) {
 					handoffPath,
 				}),
 				images: names,
+				// OTTR-850: the posted text is board-written only when it is the exact
+				// "Implement steps" template; any edit makes it user-authored, so the
+				// gate judges it. The server compares, never trusting a client flag.
+				promptAuthor: trimmed === IMPLEMENT_RECOMMENDATIONS ? "board" : "user",
 			});
 			return null;
 		} catch (err) {
@@ -10648,6 +10673,10 @@ export function createApp(deps: AppDeps) {
 		);
 		if ("error" in decoded) return json({ error: decoded.error }, 400);
 		const t = e.store.createTask(prep.prompt, prep.model);
+		// OTTR-850: an agent's create_task files board-written prompts (the token decides,
+		// never a client flag); the user's New task form stays user-authored.
+		if (agentCardRequest(req))
+			e.store.updateTask(t.id, { promptAuthor: "board" });
 		const saved = saveTaskImages(e, t, decoded);
 		if (saved instanceof Response) return saved;
 		applyTaskCreateExtras(e, t, prep, r.body.backlog);
@@ -10840,6 +10869,7 @@ export function createApp(deps: AppDeps) {
 		);
 		// Synchronous with createTask: the scheduler must never see a half-made release card.
 		const updated = e.store.updateTask(t.id, {
+			promptAuthor: "board",
 			base: plan.sha,
 			releaseVersion: version,
 			releaseNotes: notes,

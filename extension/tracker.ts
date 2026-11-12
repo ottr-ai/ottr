@@ -287,6 +287,39 @@ function rankValidationError(
 	return null;
 }
 
+// OTTR-850: true when the prompt carries an "Acceptance" section with at least one
+// non-empty line. A `#`-`######` heading or a bold `**Acceptance**` line opens the
+// section; the section ends at the next heading. Every filed card then names its
+// outside check, so it passes the prompt gate on its own.
+export function hasAcceptanceSection(prompt: string): boolean {
+	const lines = prompt.split("\n");
+	let open = false;
+	for (const line of lines) {
+		const bold = /^\*\*acceptance\*\*:?\s*(.*)$/i.exec(line.trim());
+		if (/^#{1,6}\s+acceptance\b/i.test(line) || bold !== null) {
+			if (bold !== null && (bold[1] ?? "").trim() !== "") return true;
+			open = true;
+			continue;
+		}
+		if (open) {
+			if (/^#{1,6}\s/.test(line)) {
+				open = false;
+				continue;
+			}
+			if (line.trim() !== "") return true;
+		}
+	}
+	return false;
+}
+
+// The refusal a create_task or propose_task call without the section gets, so the
+// agent fixes the prompt in the same turn.
+function acceptanceError(prompt: string, tool: string): string | null {
+	return hasAcceptanceSection(prompt)
+		? null
+		: `Error: the prompt needs an "Acceptance" section with at least one observable check (a command to run or a result to see). Add it and call ${tool} again.`;
+}
+
 // Shared validation of propose_task params; returns the error text or null.
 // The prompt/model messages keep the propose_task wording (not create_task's).
 function proposeValidationError(
@@ -296,6 +329,7 @@ function proposeValidationError(
 ): string | null {
 	return (
 		promptValidationError(params) ??
+		acceptanceError(trimmed(params.prompt), "propose_task") ??
 		modelValidationError(params) ??
 		projectValidationError(params, knownProjects) ??
 		summaryFieldsValidationError(params) ??
@@ -746,6 +780,8 @@ export default function (pi: Pi) {
 			"starts filed cards automatically, in parallel up to the project's max-parallel setting. Pass dependsOn with the ids of cards that must be done first to run cards in sequence (e.g. milestones); a dependent card stays queued until they are done. Every card " +
 			"runs in a FRESH session with its own worktree: its prompt must be fully self-contained (goal, " +
 			"target paths, constraints, acceptance criteria) — the new agent sees nothing of this session. " +
+			"The prompt must carry an 'Acceptance' section with at least one observable check (a command to run " +
+			"or a result to see); the tool refuses a prompt without one. " +
 			"A turn that must wait for its new card (e.g. a merge turn blocked on a fix) reports that id in report_outcome's dependsOn instead of stopping at needs_you. " +
 			"project: file the card in another project on the board; omit to file in this one.",
 		parameters: z.object({
@@ -783,6 +819,8 @@ export default function (pi: Pi) {
 			if (prompt === "" || prompt.length > 20000) {
 				return textResult("Error: prompt must be 1-20000 characters.");
 			}
+			const acceptance = acceptanceError(prompt, "create_task");
+			if (acceptance !== null) return textResult(acceptance);
 			const dependsOn = parseDependsOn(params);
 			const target = trimmed(params.project);
 			if (params.project !== undefined && target === "") {
@@ -826,8 +864,8 @@ export default function (pi: Pi) {
 			name: "propose_task",
 			label: "Propose task",
 			description: retroMode
-				? "Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified."
-				: 'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out.',
+				? "Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified."
+				: 'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out. End the prompt with a section headed \'Acceptance\' that holds at least one observable check; the tool refuses a prompt without one.',
 			parameters: z.object(
 				retroMode
 					? {

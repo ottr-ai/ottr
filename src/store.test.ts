@@ -5351,3 +5351,85 @@ describe("gate column", () => {
 		expect(cols).toContain("gate");
 	});
 });
+
+describe("prompt author column", () => {
+	// A database from before prompt authorship existed: the current tasks DDL
+	// minus the migrated prompt_author column.
+	const PRE_AUTHOR_TASKS_DDL = `CREATE TABLE tasks (
+		id TEXT PRIMARY KEY,
+		title TEXT,
+		prompt TEXT,
+		stage TEXT NOT NULL CHECK (stage IN ('todo','in_progress','merging','done','backlog')),
+		state TEXT NOT NULL CHECK (state IN ('queued','preparing','running','needs_you','idle')),
+		needs_reason TEXT,
+		pending_prompt TEXT,
+		branch TEXT,
+		base TEXT,
+		worktree TEXT,
+		session_id TEXT,
+		summary TEXT,
+		details TEXT,
+		report TEXT,
+		research INTEGER NOT NULL DEFAULT 0,
+		research_steps TEXT NOT NULL DEFAULT 'unknown',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		queued_at INTEGER,
+		cancelled_at INTEGER,
+		images TEXT NOT NULL DEFAULT '[]',
+		pending_images TEXT NOT NULL DEFAULT '[]',
+		shots TEXT NOT NULL DEFAULT '[]',
+		release_version TEXT,
+		release_notes TEXT,
+		session_title TEXT,
+		asked TEXT,
+		gate TEXT,
+		model TEXT,
+		kept_files TEXT NOT NULL DEFAULT '[]',
+		follow_up_of TEXT,
+		push_sha TEXT,
+		update_ids TEXT NOT NULL DEFAULT '[]',
+		update_merge_approved INTEGER NOT NULL DEFAULT 0,
+		revision INTEGER NOT NULL DEFAULT 1
+	)`;
+
+	test("an old-schema database backfills rows to 'user' on open and round-trips board authorship", () => {
+		const dir = join(root, "prompt-author-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(PRE_AUTHOR_TASKS_DDL);
+		db.exec(
+			"INSERT INTO tasks (id, title, stage, state, created_at, updated_at) VALUES ('seed1', 'seeded', 'in_progress', 'idle', 1, 1)",
+		);
+		db.close();
+
+		const store = open(dir);
+		// The seeded row survives and backfills to the user default.
+		expect(store.getTask("seed1")?.promptAuthor).toBe("user");
+		// New cards start as user-authored; a board write lands in the added column.
+		const card = store.createTask("board filed this");
+		expect(card.promptAuthor).toBe("user");
+		store.updateTask(card.id, { promptAuthor: "board" });
+		expect(store.getTask(card.id)?.promptAuthor).toBe("board");
+		store.close();
+		// The board value persists across a reopen.
+		const reopened = open(dir);
+		expect(reopened.getTask(card.id)?.promptAuthor).toBe("board");
+		// A user edit makes the prompt user-authored again.
+		reopened.editTask(card.id, "user rewrote this");
+		expect(reopened.getTask(card.id)?.promptAuthor).toBe("user");
+		reopened.close();
+	});
+
+	test("an old-schema database with no rows opens without error", () => {
+		const dir = join(root, "prompt-author-migration-empty");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		db.exec(PRE_AUTHOR_TASKS_DDL);
+		db.close();
+
+		const store = open(dir);
+		expect(store.listTasks()).toEqual([]);
+		store.close();
+	});
+});

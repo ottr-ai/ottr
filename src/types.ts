@@ -408,6 +408,10 @@ export interface Task {
 	/** Who authored pendingPrompt: "user" (steer/reply routes) or "supervisor" (tracker-parked:
 	 * holds, check send-backs, auto-resumes, tend replies). null behaves as "user". */
 	pendingBy: "user" | "supervisor" | null;
+	/** Who wrote the card's prompt (OTTR-850): "user" (New task form, steer, a user edit)
+	 * or "board" (a template, or a card an agent filed). The prompt gate skips its model
+	 * call for board prompts; every DB row carries the column, defaulted to "user". */
+	promptAuthor: "user" | "board";
 	/** Image file names (in the task's images folder) pasted with the original prompt; sent with every work turn that sends the original prompt. */
 	images: string[];
 	/** Image file names pasted with the pending reply; sent with the next turn only. */

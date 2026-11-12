@@ -134,6 +134,7 @@ const TASKS_DDL = `CREATE TABLE IF NOT EXISTS tasks (
   session_title TEXT,
   asked TEXT,
   gate TEXT,
+  prompt_author TEXT NOT NULL DEFAULT 'user',
   model TEXT,
   kept_files TEXT NOT NULL DEFAULT '[]',
   follow_up_of TEXT,
@@ -322,6 +323,7 @@ interface TaskRow {
 	release_notes: string | null;
 	asked: string | null;
 	gate: string | null;
+	prompt_author: string;
 	model: string | null;
 	kept_files: string;
 	follow_up_of: string | null;
@@ -546,6 +548,7 @@ function toListedTask(
 		releaseNotes: r.release_notes,
 		asked: parseAsked(r.asked),
 		gate: parseGate(r.gate),
+		promptAuthor: r.prompt_author === "board" ? "board" : "user",
 		model: r.model,
 		keptFiles: parseStringList(r.kept_files),
 		followUpOf: r.follow_up_of,
@@ -859,6 +862,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	releaseNotes: "release_notes",
 	asked: "asked",
 	gate: "gate",
+	promptAuthor: "prompt_author",
 	model: "model",
 	keptFiles: "kept_files",
 	followUpOf: "follow_up_of",
@@ -1705,6 +1709,15 @@ export class ProjectStore {
 			cols,
 			"gate",
 			"ALTER TABLE tasks ADD COLUMN gate TEXT",
+		);
+		// OTTR-850 prompt authorship: lives in TASKS_DDL, so its ALTER runs here, before
+		// the CHECK rebuilds (gate-column precedent). The DEFAULT backfills every existing
+		// row to 'user', so old cards keep today's gate behavior.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"prompt_author",
+			"ALTER TABLE tasks ADD COLUMN prompt_author TEXT NOT NULL DEFAULT 'user'",
 		);
 		// OTTR-795 optimistic-locking revision: lives in TASKS_DDL, so its ALTER runs here,
 		// before the CHECK rebuilds, like the shots column. The stale cols list fires the
@@ -2580,6 +2593,7 @@ export class ProjectStore {
 			cardId = card.id;
 			this.updateTask(card.id, {
 				title: o.title,
+				promptAuthor: "board",
 				research: true,
 				stage: "done",
 				state: "idle",
@@ -2590,6 +2604,7 @@ export class ProjectStore {
 				const child = this.createTask(p.prompt);
 				this.updateTask(child.id, {
 					followUpOf: card.id,
+					promptAuthor: "board",
 					state: "needs_you",
 					needsReason: forkProposedReason({ id: card.id }),
 					model: p.model,
@@ -2723,6 +2738,7 @@ export class ProjectStore {
 				const card = this.createTask(o.prompt, null);
 				const title = o.title?.trim();
 				this.updateTask(card.id, {
+					promptAuthor: "board",
 					stage: "backlog",
 					state: "idle",
 					queuedAt: null,
@@ -2865,6 +2881,7 @@ export class ProjectStore {
 			const card = this.createTask(o.prompt, null, "work");
 			this.updateTask(card.id, {
 				title: o.title,
+				promptAuthor: "board",
 				topic: "github issue",
 				stage: "backlog",
 				state: "idle",
@@ -2917,6 +2934,7 @@ export class ProjectStore {
 				const card = this.createTask(item.prompt, null, "work");
 				this.updateTask(card.id, {
 					title: item.title,
+					promptAuthor: "board",
 					topic: "jira",
 					...(o.stage === "backlog"
 						? { stage: "backlog", state: "idle", queuedAt: null }
@@ -3144,6 +3162,7 @@ export class ProjectStore {
 			const existing = row.taskId === null ? null : this.getTask(row.taskId);
 			const card = existing ?? this.createTask(o.prompt, null, "pr_review");
 			this.updateTask(card.id, {
+				promptAuthor: "board",
 				...(existing === null
 					? {
 							title: `PR review: #${o.number} ${row.title}`,
@@ -3282,6 +3301,9 @@ export class ProjectStore {
 			{
 				prompt,
 				title: deriveTitle(prompt),
+				// OTTR-850: a user edit makes the prompt user-authored again, so the gate
+				// judges it even when the card was filed as board-written.
+				promptAuthor: "user",
 				holdUntil: null,
 				holdProvider: null,
 				holdWindow: null,

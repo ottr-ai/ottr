@@ -478,6 +478,7 @@ export function createOmpWatcher(deps: {
 			);
 			store.updateTask(card.id, {
 				title: `omp ${r.version}: compatibility review failed`,
+				promptAuthor: "board",
 				topic: "omp",
 			});
 			state.verdicts[r.version] = {
@@ -531,6 +532,7 @@ export function createOmpWatcher(deps: {
 			);
 			store.updateTask(card.id, {
 				title: `Bump omp to ${target}`,
+				promptAuthor: "board",
 				topic: "omp",
 			});
 			state.bumpCard = { id: card.id, version: target };

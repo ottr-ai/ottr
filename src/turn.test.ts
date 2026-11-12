@@ -39,6 +39,7 @@ import {
 	DEEPEN_POINTS,
 	DEP_HELD_PROMPT,
 	followUpPrompt,
+	IMPLEMENT_RECOMMENDATIONS,
 	LOST_SESSION,
 	mergePrompt,
 	PROPOSED_REASON_PREFIX,
@@ -643,6 +644,8 @@ describe("turn loop", () => {
 		expect(kid.needsReason).toContain(task.id);
 		expect(kid.needsReason).not.toContain("the weekly retro");
 		expect(kid.model).toBe("zai/glm");
+		// The board wrote this prompt: the card's turn skips the gate model.
+		expect(kid.promptAuthor).toBe("board");
 		// The five decision fields ride to the child card for the drawer's panel.
 		expect(kid.proposalSummary).toEqual({
 			whatChanges: "Add a benchmark script for the merge path.",
@@ -751,6 +754,8 @@ describe("turn loop", () => {
 		// A proposal without a summary keeps the field null; the drawer falls back
 		// to the prompt's first paragraph.
 		expect(kid!.proposalSummary).toBeNull();
+		// The board wrote this prompt: the card's turn skips the gate model.
+		expect(kid!.promptAuthor).toBe("board");
 	});
 
 	test("retro proposal filing is capped at 3 open proposals", async () => {
@@ -858,6 +863,8 @@ describe("turn loop", () => {
 		expect(kid.followUpOfProject).toBe(store.name);
 		// The five decision fields ride along for the Decide panel.
 		expect(kid.proposalSummary).toEqual(record.proposal!.summary);
+		// The board wrote this prompt: the card's turn skips the gate model.
+		expect(kid.promptAuthor).toBe("board");
 		expect(kid.prompt).toContain("handoffs");
 		// The handoff file lives under the filing project's store.
 		const handoff = readFileSync(
@@ -11596,6 +11603,8 @@ describe("review findings check", () => {
 		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
 		// The scheduler may already have claimed the card; the queue stage is the contract.
 		expect(kids[0]!.stage).toBe("todo");
+		// The board wrote this prompt: the card's turn skips the gate model.
+		expect(kids[0]!.promptAuthor).toBe("board");
 		// Counts and the drop reason live on the review card.
 		expect(after.summary).toContain("2 recorded, 1 filed, 1 not filed");
 		expect(after.details).toContain("handled at src/x.ts:42");
@@ -14431,8 +14440,8 @@ describe("turn survivor round 5 — helpers", () => {
 		const g = gateway("Implement loading skeleton primitive");
 		const title = await generateTitle(
 			followUpPrompt({
-				// The fixed "Implement steps" text (IMPLEMENT_RECOMMENDATIONS, src/ui/app.tsx).
-				text: "Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.",
+				// The fixed "Implement steps" text (IMPLEMENT_RECOMMENDATIONS, src/prompts.ts).
+				text: IMPLEMENT_RECOMMENDATIONS,
 				title: "Loading-state UX advice for Ottr",
 				handoffPath: "/data/ottr/handoffs/OTTR-572.md",
 			}),
@@ -24056,6 +24065,8 @@ describe("stored review findings", () => {
 			expect(k.queuedAt).toBeNull();
 			expect(k.followUpOf).toBe(review.id);
 			expect(k.details).toContain("Unverified lead from review");
+			// The board wrote this prompt: the card's turn skips the gate model.
+			expect(k.promptAuthor).toBe("board");
 		}
 
 		// Below-cap confirmed findings stay logged, never filed.
@@ -25055,5 +25066,116 @@ describe("prompt gate", () => {
 		await loop.runTurn(store.name, retro.id);
 		expect(calls).toBe(0);
 		expect(store.getTask(retro.id)?.gate).toBeNull();
+	});
+
+	test("a board-authored card starts its work turn with no gate model call", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = store.createTask("build a thing");
+		// The board filed this prompt (a template, a finding or a proposal card).
+		store.updateTask(task.id, { promptAuthor: "board" });
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		// The skip rule ran instead of the model: the seam never fired.
+		expect(calls).toBe(0);
+		expect(logText(store, task.id)).toContain(
+			"board-written prompt runs without the model",
+		);
+		// The turn proceeded like a clear pass: one run, no park, no gate state.
+		expect(record.runs).toHaveLength(1);
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.gate).toBeNull();
+	});
+
+	test("a user prompt edit on a board-authored card runs the gate model again", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return clearCheck();
+			},
+		});
+		const task = store.createTask("build a thing");
+		store.updateTask(task.id, { promptAuthor: "board" });
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs).toHaveLength(1);
+
+		// The user edits the prompt: the text is user-authored again, so the gate
+		// judges it on the next work turn.
+		store.editTask(task.id, "a clearer brief");
+		store.updateTask(task.id, { stage: "in_progress", state: "queued" });
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(calls).toBe(1);
+		expect(record.runs).toHaveLength(2);
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.promptAuthor).toBe("user");
+		// The fingerprint stamps the edited text, not the board text.
+		expect(after.gate?.hash).toBe(gateFingerprint("a clearer brief"));
+		expect(after.gate?.parked).toBe(false);
+	});
+
+	test("a board-authored prompt with an Open questions section still parks with no model call", async () => {
+		let calls = 0;
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		const task = store.createTask("build a thing");
+		store.updateTask(task.id, {
+			promptAuthor: "board",
+			prompt: [
+				"migrate the store",
+				"",
+				"## Open questions",
+				"",
+				"Which database?",
+				"Which migration tool?",
+			].join("\n"),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		// The deterministic park ran first: needs_you with the section's lines,
+		// and the model never ran.
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the prompt still carries an Open questions section",
+		);
+		expect(after.asked).toEqual([
+			{
+				question: "Which database?",
+				options: [],
+				multi: false,
+				recommended: null,
+			},
+			{
+				question: "Which migration tool?",
+				options: [],
+				multi: false,
+				recommended: null,
+			},
+		]);
+		expect(after.gate?.parked).toBe(true);
+		expect(after.gate?.sig).toBe("Which database?\nWhich migration tool?");
+		expect(calls).toBe(0);
+		expect(record.runs).toHaveLength(0);
+		expect(record.createWorktree).toHaveLength(0);
 	});
 });

@@ -179,6 +179,7 @@ function task(p: Partial<Task> = {}): Task {
 		needsReason: null,
 		pendingPrompt: null,
 		pendingBy: null,
+		promptAuthor: "user",
 		images: [],
 		pendingImages: [],
 		shots: [],

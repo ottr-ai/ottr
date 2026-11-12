@@ -465,6 +465,7 @@ export function createTrendingScanner(deps: {
 		);
 		project.store.updateTask(task.id, {
 			title: `Trending scout: ${localDate(startedAt)}`,
+			promptAuthor: "board",
 			topic: "trending scout",
 		});
 		deps.log(

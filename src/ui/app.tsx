@@ -27,7 +27,11 @@ import { shortKey, taskEntryKey } from "../notifications.ts";
 import { derivedTaskPrefix } from "../prefix.ts";
 import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
-import { DEEPEN_POINTS, isProposalReason } from "../prompts.ts";
+import {
+	DEEPEN_POINTS,
+	IMPLEMENT_RECOMMENDATIONS,
+	isProposalReason,
+} from "../prompts.ts";
 import { forModel, tightest, tightestFor } from "../quota.ts";
 import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
@@ -8635,10 +8639,6 @@ function turnPage<T extends { list: string[]; index: number }>(
 ): T {
 	return { ...v, index: (v.index + delta + v.list.length) % v.list.length };
 }
-
-/** Follow-up text behind a research report's "Implement steps" button. */
-const IMPLEMENT_RECOMMENDATIONS =
-	"Implement the recommended steps (a `## Recommended steps` heading in the report; older reports call them next steps or action items) from the research report in the handoff. If the steps split into independent pieces of work, implement the first one in this task and file each other piece as its own card with the create_task tool. If the report recommends no steps, change nothing and report that.";
 
 /** First GitHub Actions run URL in the text, canonical form; null when the text links none. */
 export function ciRunUrl(text: string): string | null {

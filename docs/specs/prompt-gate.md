@@ -357,11 +357,20 @@ logs under it. Parked gate turns write no turn row (rows appear at startRun).
    lines (max 5) become the ask questions, options `[]` (custom answer only).
    Once user answers exist, the gate runs the model on prompt + answers; the
    model judges whether the section is settled.
-3. Model call: `runGateway` with `gateSystem` + `gatePrompt`, model selector
+3. Board-written skip (OTTR-850, spec `docs/specs/prompt-gate-board-prompts.md`):
+   when the row's `prompt_author` is `board` and no user text is queued or
+   accumulated, log one `+ prompt gate: board-written prompt runs without the
+   model` line and proceed. The board's templates and the agent-filed finding and
+   proposal cards carry their checks, so the model call is waste. The section
+   check above still ran first: it costs no call and catches a real gap. Queued
+   user text (a reply or steer) is judged as before: with pending or seen text
+   the model runs on prompt plus user text. Board prompts stamp no fingerprint,
+   so a later user edit (`editTask` writes `user`) runs the gate fresh.
+4. Model call: `runGateway` with `gateSystem` + `gatePrompt`, model selector
    **`@plan`** (the existing plan role; no new role), timeout 120 000 ms, via
    an injectable seam `ops.gateCheck ?? promptGateCheck` following the
    `ops.genTitle` pattern so tests never spawn a gateway.
-4. Parse strict JSON (`parseGateCheck` in `src/promptGate.ts`, same
+5. Parse strict JSON (`parseGateCheck` in `src/promptGate.ts`, same
    fence-tolerant validation style as `parseDeepenCheck`: `builds`/`checks`
    non-empty strings; `points` exactly 5 with boolean `covered` + string
    `reason`; `questions` array of `{question: string, kind: "fact" |

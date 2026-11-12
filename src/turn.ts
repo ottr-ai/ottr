@@ -3822,6 +3822,15 @@ export function createTurnLoop(
 			);
 			return false;
 		}
+		// OTTR-850: the board wrote this prompt (a template, or an agent's finding or
+		// proposal card), so its text is already complete — the model call is waste. The
+		// Open questions park above still ran: it costs no call and catches a real gap.
+		// Queued user text (a reply or steer) is judged as today, so a board prompt that
+		// carries pending or seen text still reaches the model below.
+		if (live.promptAuthor === "board" && pending === null && seen === null) {
+			log("+ prompt gate: board-written prompt runs without the model");
+			return true;
+		}
 		// Model evaluation; one immediate retry on any failure.
 		let check: GateCheck | null = null;
 		let err: Error | null = null;
@@ -8287,6 +8296,7 @@ export function createTurnLoop(
 		store.updateTask(child.id, {
 			prompt,
 			followUpOf: st.id,
+			promptAuthor: "board",
 			// A foreign filing stores the retro's project, so the lineage rail
 			// links the parent across the board (null keeps the own project).
 			followUpOfProject: store === st.store ? null : st.store.name,
@@ -8700,6 +8710,7 @@ export function createTurnLoop(
 				const child = st.store.createTask(k.finding.prompt);
 				st.store.updateTask(child.id, {
 					followUpOf: st.id,
+					promptAuthor: "board",
 					// A null model means the finding card runs on the default role.
 					model: k.finding.model,
 				});
@@ -8752,6 +8763,7 @@ export function createTurnLoop(
 						: "";
 				st.store.updateTask(child.id, {
 					followUpOf: st.id,
+					promptAuthor: "board",
 					model: lead.model,
 					stage: "backlog",
 					state: "idle",

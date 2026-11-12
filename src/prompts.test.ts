@@ -877,13 +877,13 @@ describe("retro prompts", () => {
 
 	test("PROPOSE_TOOL_DESCRIPTION verbatim", () => {
 		expect(PROPOSE_TOOL_DESCRIPTION).toBe(
-			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified.",
+			"Propose ONE improvement task from this retro. Ottr files it as a held card when the retro ends: it starts only after the user accepts it. prompt: the self-contained task text in this shape. Line 1: one plain sentence that says what changes and where, for example: Add 'summary is one line' to the ready and integrated prompts. No repo notes or meta text on line 1; this line becomes the card title. Then: Why: the evidence with card ids. Change: the exact edit; repo and path notes go here. Check: the acceptance test. Gain: the saving in concrete units. End the prompt with a section headed 'Acceptance' that holds at least one observable check (a command to run or a result to see); the tool refuses a prompt without one. model: optional model for the task. summary: five short strings the board shows next to the prompt, each the same fact as its prompt part: whatChanges: the file or setting and the edit, in one sentence; why: the cause and the evidence, with the card ids; gain: the saving in concrete units; risk: what can break, or \"none found\"; check: how the result is verified.",
 		);
 	});
 
 	test("REVIEW_PROPOSE_TOOL_DESCRIPTION verbatim", () => {
 		expect(REVIEW_PROPOSE_TOOL_DESCRIPTION).toBe(
-			'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out.',
+			'Record ONE finding of this review; call it once per finding, as many times as you need. After the review ends, Ottr ranks the findings, checks the best ones with a second model, and files the ones that pass as cards (at most 10, plus confirmed high or critical security findings). prompt: the self-contained finding text (what is wrong, the evidence, the effect, the fix). rank: the finding\'s importance, 1 = most important. security: "critical" or "high" for a confirmed security finding of that severity, else leave it out. End the prompt with a section headed \'Acceptance\' that holds at least one observable check; the tool refuses a prompt without one.',
 		);
 	});
 });
@@ -961,6 +961,7 @@ describe("handoffMarkdown research report", () => {
 		pushRetries: 0,
 		findingsCheckedAt: null,
 		revision: 1,
+		promptAuthor: "user" as const,
 		gate: null,
 	};
 

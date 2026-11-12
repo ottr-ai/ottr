@@ -15,6 +15,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		needsReason: null,
 		pendingPrompt: null,
 		pendingBy: null,
+		promptAuthor: "user",
 		pushRetries: 0,
 		prNumber: null,
 		prUrl: null,

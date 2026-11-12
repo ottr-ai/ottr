@@ -4,7 +4,7 @@ import {
 	REVIEW_PROPOSE_TOOL_DESCRIPTION,
 } from "../src/prompts.ts";
 import { applyEvent, newEventState } from "../src/runner.ts";
-import createTracker from "./tracker.ts";
+import createTracker, { hasAcceptanceSection } from "./tracker.ts";
 
 // Hermeticity: every named omp session exports OTTR_SESSION_NAME into its child shells, and an
 // ambient value would flip the refusal tests below into the pinned-name path. tracker.ts reads
@@ -130,6 +130,10 @@ async function freshTools(): Promise<Record<string, RegisteredTool>> {
 	const mod = await import(`./tracker.ts?refuse-${++freshModules}`);
 	return fakePi(mod.default as typeof createTracker);
 }
+
+// OTTR-850: create_task and propose_task refuse a prompt without an Acceptance
+// section, so every fixture prompt that reaches the tools carries this tail.
+const acceptance = "\n\n## Acceptance\n- bun test passes";
 
 describe("report_outcome tool", () => {
 	test("declares shots, so a reported screenshot survives the harness's schema", () => {
@@ -308,7 +312,7 @@ describe("create_task tool", () => {
 			return new Response(JSON.stringify({ id: "abc12345" }), { status: 200 });
 		}) as unknown as typeof fetch;
 		const out = await fakePi().create_task!.execute("t1", {
-			prompt: "  implement the thing  ",
+			prompt: `  implement the thing  ${acceptance}`,
 			model: " zai/glm ",
 		});
 		expect(seen!.url).toBe("http://127.0.0.1:4747/api/projects/ottr/tasks");
@@ -319,7 +323,7 @@ describe("create_task tool", () => {
 			"x-board-token": "boot-token",
 		});
 		expect(JSON.parse(String(seen!.init.body))).toEqual({
-			prompt: "implement the thing",
+			prompt: `implement the thing  ${acceptance}`,
 			followUpOf: "parent1",
 			model: "zai/glm",
 		});
@@ -337,8 +341,8 @@ describe("create_task tool", () => {
 			body = JSON.parse(String(init.body));
 			return new Response(JSON.stringify({ id: "x" }), { status: 200 });
 		}) as unknown as typeof fetch;
-		await fakePi().create_task!.execute("t1", { prompt: "p" });
-		expect(body).toEqual({ prompt: "p", followUpOf: "t" });
+		await fakePi().create_task!.execute("t1", { prompt: `p${acceptance}` });
+		expect(body).toEqual({ prompt: `p${acceptance}`, followUpOf: "t" });
 	});
 
 	test("refuses a model that is an agent type, not a model id, and fetches nothing", async () => {
@@ -353,7 +357,7 @@ describe("create_task tool", () => {
 			return new Response("{}", { status: 200 });
 		}) as unknown as typeof fetch;
 		const out = await fakePi().create_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			model: "sonic",
 		});
 		expect(text(out)).toBe(
@@ -377,7 +381,7 @@ describe("create_task tool", () => {
 				{ status: 400 },
 			)) as unknown as typeof fetch;
 		const out = await fakePi().create_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			model: "zai/retired",
 		});
 		expect(text(out)).toContain("HTTP 400");
@@ -396,14 +400,14 @@ describe("create_task tool", () => {
 			return new Response(JSON.stringify({ id: "abc12345" }), { status: 200 });
 		}) as unknown as typeof fetch;
 		const out = await fakePi().create_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			project: " agent-data ",
 		});
 		expect(seen!.url).toBe(
 			"http://127.0.0.1:4747/api/projects/agent-data/tasks",
 		);
 		expect(JSON.parse(String(seen!.init.body))).toEqual({
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			followUpOf: "t",
 		});
 		expect(text(out)).toContain("abc12345");
@@ -421,7 +425,9 @@ describe("create_task tool", () => {
 			seen = { url: String(url), init };
 			return new Response(JSON.stringify({ id: "abc12345" }), { status: 200 });
 		}) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(seen!.url).toBe("http://127.0.0.1:4747/api/projects/p/tasks");
 		expect(text(out)).toContain("abc12345");
 	});
@@ -438,7 +444,7 @@ describe("create_task tool", () => {
 			return new Response("{}", { status: 200 });
 		}) as unknown as typeof fetch;
 		const out = await fakePi().create_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			project: "   ",
 		});
 		expect(text(out)).toContain("non-empty");
@@ -484,7 +490,9 @@ describe("create_task tool", () => {
 			new Response(JSON.stringify({ error: "unknown followUpOf task" }), {
 				status: 404,
 			})) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toContain("HTTP 404");
 		expect(text(out)).toContain("unknown followUpOf task");
 	});
@@ -498,9 +506,38 @@ describe("create_task tool", () => {
 		globalThis.fetch = (async () => {
 			throw new Error("connection refused");
 		}) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toContain("unreachable");
 		expect(text(out)).toContain("connection refused");
+	});
+
+	test("refuses a prompt without an Acceptance section and files no card", async () => {
+		// The seeded URL is the listener's own host and port, so a wrongly sent
+		// request is observable on the wire and its count must stay zero.
+		let received = 0;
+		const listener = Bun.serve({
+			port: 0,
+			fetch: () => {
+				received++;
+				return new Response(JSON.stringify({ id: "x" }), { status: 200 });
+			},
+		});
+		setEnv({
+			OTTR_BOARD_URL: `http://localhost.:${listener.port}`,
+			OTTR_PROJECT: "p",
+			OTTR_TASK_ID: "t",
+		});
+		try {
+			const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+			expect(text(out)).toBe(
+				'Error: the prompt needs an "Acceptance" section with at least one observable check (a command to run or a result to see). Add it and call create_task again.',
+			);
+			expect(received).toBe(0);
+		} finally {
+			listener.stop(true);
+		}
 	});
 });
 
@@ -685,14 +722,14 @@ describe("propose_task tool", () => {
 			{},
 			{ prompt: "   " },
 			{ prompt: "x".repeat(20001) },
-			{ prompt: "p", model: "   " },
+			{ prompt: `p${acceptance}`, model: "   " },
 		];
 		for (const params of bad) {
 			const out = await tools.propose_task!.execute("t1", params);
 			expect(text(out)).toMatch(/^Error: /);
 		}
 		const blank = await tools.propose_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			project: "   ",
 		});
 		expect(text(blank)).toBe(
@@ -703,7 +740,7 @@ describe("propose_task tool", () => {
 	test("refuses a model that is an agent type, not a model id, and spends no proposal", async () => {
 		process.env.OTTR_RETRO = "1";
 		const out = await fakePi().propose_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			model: "sonic",
 		});
 		expect(text(out)).toBe(
@@ -716,14 +753,14 @@ describe("propose_task tool", () => {
 		process.env.OTTR_MODELS = "zai/glm-5.3-flash\nanthropic/claude-opus-5-5";
 		const tools = fakePi();
 		const unknown = await tools.propose_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			model: "zai/no-such-model",
 		});
 		expect(text(unknown)).toBe(
 			"Error: model zai/no-such-model: unknown model zai/no-such-model. Omit model to use the board default, or pick provider/model from the New task model list.",
 		);
 		const level = await tools.propose_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			model: "zai/glm-5.3-flash:turbo",
 		});
 		expect(text(level)).toContain(
@@ -735,12 +772,12 @@ describe("propose_task tool", () => {
 		process.env.OTTR_RETRO = "1";
 		const tools = fakePi();
 		const bad: Record<string, unknown>[] = [
-			{ prompt: "p", whatChanges: 7 },
-			{ prompt: "p", whatChanges: "   " },
-			{ prompt: "p", why: "x".repeat(401) },
-			{ prompt: "p", gain: "" },
-			{ prompt: "p", risk: {} },
-			{ prompt: "p", check: "x".repeat(401) },
+			{ prompt: `p${acceptance}`, whatChanges: 7 },
+			{ prompt: `p${acceptance}`, whatChanges: "   " },
+			{ prompt: `p${acceptance}`, why: "x".repeat(401) },
+			{ prompt: `p${acceptance}`, gain: "" },
+			{ prompt: `p${acceptance}`, risk: {} },
+			{ prompt: `p${acceptance}`, check: "x".repeat(401) },
 		];
 		for (const params of bad) {
 			const out = await tools.propose_task!.execute("t1", params);
@@ -761,14 +798,14 @@ describe("propose_task tool", () => {
 		// An unknown name fails the call with the board's list and spends no
 		// proposal lock: the retry with a listed name records below.
 		const unknown = await tools.propose_task!.execute("t1", {
-			prompt: "improve the thing",
+			prompt: `improve the thing${acceptance}`,
 			project: "no-such-project",
 		});
 		expect(text(unknown)).toBe(
 			'Error: unknown project "no-such-project". Known projects: alate, agent-data, ottr. Propose again with one of these projects, or without one.',
 		);
 		const out = await tools.propose_task!.execute("t1", {
-			prompt: "  improve the thing  ",
+			prompt: `  improve the thing  ${acceptance}`,
 			project: "agent-data",
 			whatChanges: "edit prompts.ts",
 			why: "OTTR-1 duplicated text",
@@ -783,6 +820,23 @@ describe("propose_task tool", () => {
 		const again = await tools.propose_task!.execute("t2", { prompt: "p" });
 		expect(text(again)).toContain("only one proposal is allowed");
 		delete process.env.OTTR_PROJECTS;
+	});
+
+	test("refuses a proposal without an Acceptance section and spends nothing", async () => {
+		process.env.OTTR_RETRO = "1";
+		// A virgin module copy: the refusal must leave the one-shot flag unspent,
+		// which the recording follow-up call proves.
+		const tools = await freshTools();
+		const refused = await tools.propose_task!.execute("t1", { prompt: "p" });
+		expect(text(refused)).toBe(
+			'Error: the prompt needs an "Acceptance" section with at least one observable check (a command to run or a result to see). Add it and call propose_task again.',
+		);
+		const ok = await tools.propose_task!.execute("t2", {
+			prompt: `p${acceptance}`,
+		});
+		expect(text(ok)).toBe(
+			"Recorded. Ottr files it as a held card when this retro ends.",
+		);
 	});
 });
 
@@ -802,7 +856,7 @@ describe("propose_task tool in review runs", () => {
 		process.env.OTTR_MODELS = "zai/glm-5.3-flash\nanthropic/claude-opus-5-5";
 		const tools = fakePi();
 		const levelled = await tools.propose_task!.execute("t1", {
-			prompt: "Bug in src/a.ts",
+			prompt: `Bug in src/a.ts${acceptance}`,
 			model: "zai/glm-5.3-flash:high",
 			rank: 1,
 		});
@@ -811,7 +865,7 @@ describe("propose_task tool in review runs", () => {
 		// shape rule, and turn start remains the backstop.
 		delete process.env.OTTR_MODELS;
 		const shaped = await tools.propose_task!.execute("t2", {
-			prompt: "Another",
+			prompt: `Another${acceptance}`,
 			model: "zai/no-such-model",
 			rank: 2,
 		});
@@ -832,7 +886,7 @@ describe("propose_task tool in review runs", () => {
 			"security",
 		]);
 		const first = await tools.propose_task!.execute("t1", {
-			prompt: "Bug in src/a.ts",
+			prompt: `Bug in src/a.ts${acceptance}`,
 			rank: 1,
 		});
 		expect(text(first)).toBe(
@@ -840,7 +894,7 @@ describe("propose_task tool in review runs", () => {
 		);
 		// One finding per call: a second call records instead of refusing.
 		const second = await tools.propose_task!.execute("t2", {
-			prompt: "Another",
+			prompt: `Another${acceptance}`,
 			rank: 2,
 			security: "high",
 		});
@@ -852,13 +906,50 @@ describe("propose_task tool in review runs", () => {
 		const tools = fakePi();
 		for (const params of [
 			{ prompt: "   " },
-			{ prompt: "p", rank: 0 },
-			{ prompt: "p", rank: 1.5 },
-			{ prompt: "p", rank: "1" },
+			{ prompt: `p${acceptance}`, rank: 0 },
+			{ prompt: `p${acceptance}`, rank: 1.5 },
+			{ prompt: `p${acceptance}`, rank: "1" },
 		]) {
 			const out = await tools.propose_task!.execute("t1", params);
 			expect(text(out)).toMatch(/^Error: /);
 		}
+	});
+
+	test("refuses a finding without an Acceptance section and records nothing", async () => {
+		process.env.OTTR_REVIEW = "1";
+		const tools = await freshTools();
+		const refused = await tools.propose_task!.execute("t1", { prompt: "p" });
+		expect(text(refused)).toBe(
+			'Error: the prompt needs an "Acceptance" section with at least one observable check (a command to run or a result to see). Add it and call propose_task again.',
+		);
+		const ok = await tools.propose_task!.execute("t2", {
+			prompt: `p${acceptance}`,
+			rank: 1,
+		});
+		expect(text(ok)).toBe(
+			"Recorded. Ottr checks the best findings with a second model when this review ends, and files the ones that pass as cards.",
+		);
+	});
+});
+
+describe("hasAcceptanceSection", () => {
+	test("a heading or bold line with a body opens the section", () => {
+		expect(
+			hasAcceptanceSection("Add the gate\n\n## Acceptance\n- bun test passes"),
+		).toBe(true);
+		expect(
+			hasAcceptanceSection("Add the gate\n\n### acceptance criteria\nbun test"),
+		).toBe(true);
+		expect(
+			hasAcceptanceSection("Add the gate\n\n**Acceptance**\nbun test"),
+		).toBe(true);
+		expect(hasAcceptanceSection("**Acceptance**: bun test passes")).toBe(true);
+	});
+
+	test("no section, an empty section, or a next heading is false", () => {
+		expect(hasAcceptanceSection("no acceptance here")).toBe(false);
+		expect(hasAcceptanceSection("## Acceptance\n## Follow-up")).toBe(false);
+		expect(hasAcceptanceSection("## Acceptance\n\n   \n")).toBe(false);
 	});
 });
 
@@ -1016,11 +1107,11 @@ describe("arch-review changed-line coverage", () => {
 			return new Response(JSON.stringify({ id: "x" }), { status: 200 });
 		}) as unknown as typeof fetch;
 		const out = await fakePi().create_task!.execute("t1", {
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			dependsOn: [" b ", "a", "", 42, null, "   "],
 		});
 		expect(body).toEqual({
-			prompt: "p",
+			prompt: `p${acceptance}`,
 			followUpOf: "t",
 			dependsOn: ["b", "a"],
 		});
@@ -1038,11 +1129,14 @@ describe("arch-review changed-line coverage", () => {
 			bodies.push(JSON.parse(String(init.body)));
 			return new Response(JSON.stringify({ id: "x" }), { status: 200 });
 		}) as unknown as typeof fetch;
-		await fakePi().create_task!.execute("t1", { prompt: "p", dependsOn: [] });
-		await fakePi().create_task!.execute("t1", { prompt: "p" });
+		await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+			dependsOn: [],
+		});
+		await fakePi().create_task!.execute("t1", { prompt: `p${acceptance}` });
 		expect(bodies).toEqual([
-			{ prompt: "p", followUpOf: "t" },
-			{ prompt: "p", followUpOf: "t" },
+			{ prompt: `p${acceptance}`, followUpOf: "t" },
+			{ prompt: `p${acceptance}`, followUpOf: "t" },
 		]);
 	});
 
@@ -1057,7 +1151,7 @@ describe("arch-review changed-line coverage", () => {
 			seen = { url: String(url), init };
 			return new Response(JSON.stringify({ id: "x" }), { status: 200 });
 		}) as unknown as typeof fetch;
-		await fakePi().create_task!.execute("t1", { prompt: "p" });
+		await fakePi().create_task!.execute("t1", { prompt: `p${acceptance}` });
 		expect(seen!.url).toBe(
 			"http://127.0.0.1:4747/api/projects/my%20proj%2Fx/tasks",
 		);
@@ -1076,7 +1170,9 @@ describe("arch-review changed-line coverage", () => {
 		globalThis.fetch = (async () => {
 			throw "boom";
 		}) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toBe(
 			"Error: the board at http://127.0.0.1:4747 is unreachable (boom). File no cards; report the blocker.",
 		);
@@ -1092,7 +1188,9 @@ describe("arch-review changed-line coverage", () => {
 			new Response("<html>not json</html>", {
 				status: 200,
 			})) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toBe(
 			"Error: card not filed (HTTP 200). Fix the cause or report the blocker.",
 		);
@@ -1108,7 +1206,9 @@ describe("arch-review changed-line coverage", () => {
 			new Response(JSON.stringify({ error: { code: 7 } }), {
 				status: 500,
 			})) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toBe(
 			"Error: card not filed (HTTP 500). Fix the cause or report the blocker.",
 		);
@@ -1124,7 +1224,9 @@ describe("arch-review changed-line coverage", () => {
 			new Response(JSON.stringify({ id: 99 }), {
 				status: 200,
 			})) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toContain("card not filed");
 	});
 
@@ -1138,7 +1240,9 @@ describe("arch-review changed-line coverage", () => {
 			new Response(JSON.stringify({ id: "card9" }), {
 				status: 200,
 			})) as unknown as typeof fetch;
-		const out = await fakePi().create_task!.execute("t1", { prompt: "p" });
+		const out = await fakePi().create_task!.execute("t1", {
+			prompt: `p${acceptance}`,
+		});
 		expect(text(out)).toBe(
 			"Card card9 filed and linked to this task. It starts when the scheduler picks it up. File more cards or continue; report_outcome as usual when done.",
 		);
