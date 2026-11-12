@@ -22671,6 +22671,53 @@ describe("prompt gate", () => {
 		);
 	});
 
+	test("a handoff whose steps lie past the cap still shows them to the gate", async () => {
+		const seen: string[] = [];
+		const { store, record, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async (o) => {
+				seen.push(o.prompt);
+				return clearCheck();
+			},
+		});
+		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
+		const task = store.createTask("seed");
+		const handoffPath = join(store.tasksDir, "handoffs", `${task.id}.md`);
+		// A long research handoff: the report fills the head cap and the steps
+		// section sits past it near the end (the measured shape of OTTR-841
+		// and OTTR-843).
+		const handoff =
+			`${"report body\n".repeat(2200)}` +
+			[
+				"## Recommended steps",
+				"",
+				"1. Add the benchmark.",
+				"",
+				"Test: `bun test src/merge.test.ts` must pass.",
+				"",
+			].join("\n");
+		writeFileSync(handoffPath, handoff);
+		store.updateTask(task.id, {
+			prompt: followUpPrompt({
+				text: "Implement the recommended steps from the research report in the handoff.",
+				title: "Research report",
+				handoffPath,
+			}),
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("idle");
+		expect(record.runs).toHaveLength(1);
+		// The gate model saw the steps section: the head cap alone would drop it.
+		expect(seen[0]).toContain(
+			"… (the handoff continues; the middle is truncated)",
+		);
+		expect(seen[0]).toContain("## Recommended steps");
+		expect(seen[0]).toContain("bun test src/merge.test.ts");
+	});
+
 	test("a @-path outside the handoffs folder is never judged; the log names the reason", async () => {
 		const seen: string[] = [];
 		const { store, record, loop } = setup({

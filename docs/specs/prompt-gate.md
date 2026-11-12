@@ -243,9 +243,15 @@ otherwise miss. The gate judges the prompt plus that file:
   a missing file, or an unreadable file adds nothing: the gate judges the
   prompt alone, and each rejected path logs one
   `! prompt gate: handoff not judged: <path>: <reason>` line.
-- `gateJudgedPrompt` appends the capped text (`HANDOFF_CAP`, 20 000 chars,
-  the board's prompt limit) after the prompt as one untrusted data block in
-  the `<handoff>` label style.
+- `gateJudgedPrompt` appends the block after the prompt as one untrusted data
+  block in the `<handoff>` label style. Over `HANDOFF_CAP` (20 000 chars, the
+  board's prompt limit) the block keeps the head slice — the header, the
+  original task and the outcome that `handoffMarkdown` puts first — plus an
+  elision marker, and carries the report's steps section (the "Recommended
+  steps" / "Next steps" / "Action items" heading, through the next heading)
+  past it under `STEPS_CAP`: the steps sit near the report's end, so head
+  truncation alone drops the checks the gate judges. The appendix is skipped
+  while the head slice already holds the whole section.
 - The gate model call and both fingerprints (the turn pass stamp and the
   Start-anyway stamp in `gateStartReply`) cover the judged prompt, so a
   changed handoff runs the gate again.

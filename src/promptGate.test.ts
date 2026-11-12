@@ -12,6 +12,7 @@ import {
 	gateUserText,
 	HANDOFF_CAP,
 	handoffBlock,
+	handoffSteps,
 	hasOpenQuestionsSection,
 	isStartAnywayReply,
 	missingCheckQuestion,
@@ -238,6 +239,29 @@ describe("promptHandoffPaths", () => {
 	});
 });
 
+describe("handoffSteps", () => {
+	test("the three heading variants match; other headings name no section", () => {
+		expect(handoffSteps("## Recommended steps\n1. Do it.")?.text).toBe(
+			"## Recommended steps\n1. Do it.",
+		);
+		expect(handoffSteps("### next steps\n1. Do it.")?.text).toBe(
+			"### next steps\n1. Do it.",
+		);
+		expect(handoffSteps("## Action items\n1. Do it.")?.text).toBe(
+			"## Action items\n1. Do it.",
+		);
+		expect(handoffSteps("## Summary\nnothing to do")).toBeNull();
+		expect(handoffSteps("no headings at all")).toBeNull();
+	});
+
+	test("the section ends at the next heading of any level; its start offset is exact", () => {
+		const text = "intro\n\n## Recommended steps\n1. Do it.\n\n## Notes\nlater";
+		const s = handoffSteps(text);
+		expect(s?.text).toBe("## Recommended steps\n1. Do it.");
+		expect(text.slice(s!.start, s!.start + s!.text.length)).toBe(s!.text);
+	});
+});
+
 describe("gateHandoff", () => {
 	const dir = mkdtempSync(join(tmpdir(), "gate-handoff-"));
 	const handoffs = join(dir, "handoffs");
@@ -330,8 +354,45 @@ describe("handoffBlock and gateJudgedPrompt", () => {
 		expect(handoffBlock("steps")).toBe(block("steps"));
 		const long = "x".repeat(HANDOFF_CAP + 5);
 		expect(handoffBlock(long)).toBe(
-			block(`${"x".repeat(HANDOFF_CAP)}\n… (truncated)`),
+			block(
+				`${"x".repeat(HANDOFF_CAP)}\n… (the handoff continues; the middle is truncated)`,
+			),
 		);
+	});
+
+	test("a long handoff keeps the head slice and carries the steps section past it", () => {
+		const steps =
+			"## Recommended steps\n\n1. Add the benchmark.\n\nTest: `bun test src/merge.test.ts`.";
+		const long = `${"x".repeat(HANDOFF_CAP + 100)}\n\n${steps}`;
+		const out = handoffBlock(long);
+		// The head slice runs into the elision marker...
+		expect(out).toContain(
+			`\n${"x".repeat(HANDOFF_CAP)}\n… (the handoff continues; the middle is truncated)`,
+		);
+		// ...the middle is not...
+		expect(out).not.toContain("x".repeat(HANDOFF_CAP + 1));
+		// ...and the end-of-report steps section rides past the cap.
+		expect(out).toContain(steps);
+	});
+
+	test("a section fully inside the head slice is not duplicated", () => {
+		const out = handoffBlock("## Recommended steps\n\n1. Do it.\n\nfiller");
+		expect(out.match(/## Recommended steps/g)).toHaveLength(1);
+	});
+
+	test("a section that only pokes past the head slice is carried whole", () => {
+		const steps = `## Recommended steps\n\n${"1. Do it.\n".repeat(20)}`;
+		const head = `${"h".repeat(HANDOFF_CAP - 10)}\n`;
+		const out = handoffBlock(`${head}${steps}`);
+		expect(out.match(/## Recommended steps/g)).toHaveLength(1);
+		expect(out.endsWith(`${steps.trim()}\n</handoff>`)).toBe(true);
+	});
+
+	test("a steps section over its own cap truncates", () => {
+		const list = `## Recommended steps\n${"step line\n".repeat(4000)}`;
+		const out = handoffBlock(list);
+		expect(out).toContain("## Recommended steps");
+		expect(out).toContain("… (truncated)");
 	});
 
 	test("the judged prompt appends the block; no handoff leaves the prompt alone", () => {
