@@ -5344,4 +5344,45 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		expect(existsSync(marker)).toBe(false);
 		rmSync(join(wt, ".."), { recursive: true, force: true });
 	}, 30_000);
+
+	test("never runs a planted filter.<d>.clean on an unborn HEAD either", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		// checkout --orphan (or a hand-written HEAD ref) leaves HEAD unborn while the
+		// index keeps every staged entry, so status still hashes dirty files there.
+		// Sealing cannot depend on HEAD resolving: the work turn controls that state.
+		const marker = join(wt, "..", "planted.clean");
+		const script = join(wt, "..", "clean.sh");
+		writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\ncat\n`);
+		chmodSync(script, 0o755);
+		const config = (...args: string[]): void => {
+			const run = Bun.spawnSync([gitExe(), ...args], {
+				cwd: wt,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (run.exitCode !== 0)
+				throw new Error(
+					`git ${args.join(" ")} failed: ${run.stderr.toString()}`,
+				);
+		};
+		config("checkout", "--orphan", "planted");
+		config("config", "filter.evil.clean", script);
+		writeFileSync(join(wt, ".git", "info", "attributes"), "* filter=evil\n");
+		// Same byte size as the staged text: only a content re-hash runs the filter.
+		writeFileSync(join(wt, "tracked.txt"), "no longer\n");
+		// Control: the plant is live under plain git on the unborn branch.
+		config("status", "--porcelain", "--untracked-files=no");
+		expect(existsSync(marker)).toBe(true);
+		rmSync(marker);
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		// The staged-dirty file still saves with its worktree content.
+		expect(r.copied).toEqual(["tracked.txt"]);
+		expect(readFileSync(join(saveDir, "tracked.txt"), "utf8")).toBe(
+			"no longer\n",
+		);
+		expect(existsSync(marker)).toBe(false);
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	}, 30_000);
 });

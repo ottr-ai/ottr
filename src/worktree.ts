@@ -354,8 +354,9 @@ const PROBED_CORE =
  * A work turn can write the shared gitdir (R5-1). Its config defines filter drivers
  * (`filter.<d>.clean`/`smudge`/`process`) under names that planted attributes pick, so no
  * `-c` can clear them, and git reads `$GIT_DIR/info/attributes` above every override. These
- * calls run against a board-written stub gitdir instead: HEAD as a sha, the worktree's own
- * index and objects, a copy of the main checkout's info/exclude, no repo config. Tracked
+ * calls run against a board-written stub gitdir instead: HEAD as a sha (symbolic when
+ * HEAD is unborn, so an unborn repo keeps the same seal), the worktree's own index and
+ * objects, a copy of the main checkout's info/exclude, no repo config. Tracked
  * .gitattributes still apply, but they can only name drivers of system, global or
  * command-line config (git-lfs). A partial clone's promisor remote (name, url, filter) is
  * copied, so a missing blob still fetches lazily; that fetch reads the stub too, never the
@@ -380,19 +381,36 @@ export async function sealedGit(
 		],
 		worktreePath,
 	);
-	if (info.code !== 0) return info;
 	const [gitDir = "", common = "", format = "", head = ""] =
 		info.stdout.split("\n");
 	// Both values land in the stub's files: a planted objectformat must not inject config lines.
-	if (
-		!/^(sha1|sha256)$/.test(format) ||
-		!/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(head)
-	)
+	if (!/^(sha1|sha256)$/.test(format)) {
+		// A broken repo keeps its real error; a planted format string fails closed.
+		if (info.code !== 0) return info;
 		return {
 			code: 128,
 			stdout: "",
 			stderr: `unexpected git rev-parse output: ${info.stdout.trim()}`,
 		};
+	}
+	// An unborn HEAD must not turn the seal off: a work turn can leave HEAD unborn
+	// while the index keeps every staged entry (`git checkout --orphan`, a
+	// hand-written HEAD ref), so plain status would still hash dirty files there.
+	// The stub keeps HEAD symbolic — the empty-tree base git itself uses for an
+	// unborn branch — so the sealed call answers as plain git would. Anything that
+	// is neither a sha nor a real symbolic ref fails closed.
+	let stubHead = `${head}\n`;
+	if (!/^([0-9a-f]{40}|[0-9a-f]{64})$/.test(head)) {
+		const unborn = await git(["symbolic-ref", "HEAD"], worktreePath);
+		const name = unborn.stdout.trim();
+		if (unborn.code !== 0 || !/^refs\/\S+$/.test(name))
+			return {
+				code: 128,
+				stdout: "",
+				stderr: `unexpected git rev-parse output: ${info.stdout.trim()}`,
+			};
+		stubHead = `ref: ${name}\n`;
+	}
 	const probed = await git(
 		["config", "-z", "--get-regexp", PROBED_CORE],
 		worktreePath,
@@ -405,7 +423,7 @@ export async function sealedGit(
 	try {
 		mkdirSync(path.join(stub, "refs"));
 		mkdirSync(path.join(stub, "info"));
-		writeFileSync(path.join(stub, "HEAD"), `${head}\n`);
+		writeFileSync(path.join(stub, "HEAD"), stubHead);
 		writeFileSync(
 			path.join(stub, "config"),
 			`[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = ${format}\n`,
@@ -2922,13 +2940,10 @@ export async function saveDoneFiles(
 
 	// Tracked files with content changes copy; they stay in the worktree until it goes away.
 	// sealedGit: a work turn can plant a filter.<d>.clean that plain git runs here (the
-	// regression test plants one). A repo with no commit yet has an empty index, so plain
-	// status has no tracked file to hash and no clean filter can run there; sealedGit
-	// needs a resolvable HEAD, so only such unborn repos skip the seal.
-	const canSeal =
-		(await git(["rev-parse", "-q", "--verify", "HEAD"], worktreePath)).code ===
-		0;
-	const s = await (canSeal ? sealedGit : git)(
+	// regression tests plant one, with HEAD resolving and on an unborn branch). Like the
+	// other sealed status callers, --ignore-submodules=dirty keeps git out of a submodule's
+	// planted gitdir; a dirty gitlink row still arrives and the read below skips it.
+	const s = await sealedGit(
 		[
 			"status",
 			"--porcelain",
