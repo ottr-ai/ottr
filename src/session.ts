@@ -9,6 +9,7 @@ import {
 	readFileSync,
 	readSync,
 } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import type { SessionContext } from "./types.ts";
@@ -97,16 +98,17 @@ function userText(content: unknown): string {
  * or unreadable — such a turn starts a fresh session whose start re-sends the card's
  * instructions, so the caller must not prepend them a second time.
  */
-export function sessionHoldsPrompt(
+export async function sessionHoldsPrompt(
 	dir: string,
 	sessionId: string | null,
 	prompt: string,
-): boolean {
+): Promise<boolean> {
 	const file = sessionFile(dir, sessionId);
 	if (file === null) return false;
 	let text: string;
 	try {
-		text = readFileSync(file, "utf8");
+		// Async: the resume path runs on the request path, and a transcript can be large.
+		text = await readFile(file, "utf8");
 	} catch {
 		return false;
 	}
@@ -237,18 +239,19 @@ export interface TranscriptTexts {
  * The omp transcript of one session: the `<ts>_<sessionId>.jsonl` file plus every
  * subagent file in its sibling `<ts>_<sessionId>/` folder. Reads never throw (R1): a
  * missing main file gives null, an absent subagent folder gives [], and any other
- * subagent read failure sets `complete` to false.
+ * subagent read failure sets `complete` to false. Async: whole transcripts are the
+ * largest reads on the board, so they must never block the request path.
  */
-export function readTranscript(
+export async function readTranscript(
 	dir: string,
 	sessionId: string | null,
-): TranscriptTexts {
+): Promise<TranscriptTexts> {
 	const file = sessionFile(dir, sessionId);
 	if (file === null)
 		return { sessionText: null, subagentTexts: [], complete: true };
 	let sessionText: string | null = null;
 	try {
-		sessionText = readFileSync(file, "utf8");
+		sessionText = await readFile(file, "utf8");
 	} catch {
 		return { sessionText: null, subagentTexts: [], complete: false };
 	}
@@ -256,7 +259,7 @@ export function readTranscript(
 	const subDir = file.slice(0, -".jsonl".length);
 	let names: string[];
 	try {
-		names = readdirSync(subDir);
+		names = await readdir(subDir);
 	} catch (err) {
 		// Only a folder that does not exist means "no subagents"; any other failure hides files.
 		const absent =
@@ -267,7 +270,7 @@ export function readTranscript(
 	for (const name of names) {
 		if (!name.endsWith(".jsonl")) continue;
 		try {
-			subagentTexts.push(readFileSync(join(subDir, name), "utf8"));
+			subagentTexts.push(await readFile(join(subDir, name), "utf8"));
 		} catch {
 			complete = false; // unreadable subagent transcript: its usage is unknown
 		}

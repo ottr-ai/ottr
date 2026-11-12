@@ -945,8 +945,8 @@ describe("hosted credit stop and release end to end", () => {
 				maxTotalRuns: 1,
 				// The real runner with pidless fakes: its kill only marks the run killed, and the
 				// fake then exits like a killed omp.
-				startRun: (run) => {
-					const handle = startRun({
+				startRun: async (run) => {
+					const handle = await startRun({
 						...run,
 						launcher: stopLauncher,
 						memoryConfigPath: null,

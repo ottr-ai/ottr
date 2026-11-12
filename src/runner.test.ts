@@ -22,7 +22,7 @@ import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
 import { pluginSkillsOverlayPath } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
-import type { EventState, RunLauncher } from "./runner.ts";
+import type { EventState, RunHandle, RunLauncher } from "./runner.ts";
 import {
 	APPROVAL_REFUSAL,
 	applyEvent,
@@ -2923,12 +2923,14 @@ class FakeOmp extends EventEmitter {
 function fakeStart(o: {
 	logPath: string;
 	pid?: number;
+
 	onSession?: (sessionId: string) => void | Promise<void>;
 	onRecorded?: (finding: RecordedFinding) => void | Promise<void>;
 }) {
+
 	const fake = new FakeOmp(o.pid);
 	const launcher: RunLauncher = () => fake as unknown as ChildProcess; // the fake stands in for Node's class
-	const handle = startRun({
+	return startRun({
 		cwd: "/unused",
 		prompt: "do the thing",
 		sessionDir: "/unused",
@@ -2939,8 +2941,7 @@ function fakeStart(o: {
 		onSession: o.onSession,
 		onRecorded: o.onRecorded,
 		launcher,
-	});
-	return { handle, fake };
+	}).then((handle) => ({ handle, fake }));
 }
 
 describe("startRun", () => {
@@ -3099,9 +3100,12 @@ describe("startRun", () => {
 				dataRoot: dir,
 				launcher,
 			};
-			const pinned = startRun({ ...base, sessionName: "Architecture review" });
-			const plain = startRun({ ...base });
-			const board = startRun({
+			const pinned = await startRun({
+				...base,
+				sessionName: "Architecture review",
+			});
+			const plain = await startRun({ ...base });
+			const board = await startRun({
 				...base,
 				board: {
 					url: "http://127.0.0.1:4747",
@@ -3152,7 +3156,7 @@ describe("startRun", () => {
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -3220,7 +3224,7 @@ describe("startRun", () => {
 				dataRoot: dir,
 				launcher,
 			};
-			const handle = startRun({ ...base, pluginSkillsHome: home });
+			const handle = await startRun({ ...base, pluginSkillsHome: home });
 			await handle.done;
 			// The overlay rides as the --config pair after NO_DISCOVERY_CONFIG.
 			const overlay = seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
@@ -3241,7 +3245,7 @@ describe("startRun", () => {
 			const empty = join(dir, "empty-home");
 			mkdirSync(empty, { recursive: true });
 			seen.length = 0;
-			await startRun({ ...base, pluginSkillsHome: empty }).done;
+			await (await startRun({ ...base, pluginSkillsHome: empty })).done;
 			const pinsOverlay = seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
 			expect(pinsOverlay).toBe(
 				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
@@ -3274,7 +3278,7 @@ describe("startRun", () => {
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -3305,7 +3309,7 @@ describe("startRun", () => {
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -3333,7 +3337,7 @@ describe("startRun", () => {
 				return fake as unknown as ChildProcess;
 			};
 			const overlay = join(dir, "omp-memory.yml");
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -3368,7 +3372,7 @@ describe("startRun", () => {
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -3401,7 +3405,7 @@ describe("startRun", () => {
 		try {
 			const logPath = join(dir, "logs", "run.log");
 			const sessions: string[] = [];
-			const { handle, fake } = fakeStart({
+			const { handle, fake } = await fakeStart({
 				logPath,
 				pid: 7,
 				onSession: (sid) => {
@@ -3447,7 +3451,7 @@ describe("startRun", () => {
 		setGitSecrets([stored]);
 		try {
 			const logPath = join(dir, "run.log");
-			const { handle, fake } = fakeStart({ logPath });
+			const { handle, fake } = await fakeStart({ logPath });
 			const hidden = "test-only-value";
 			const event = {
 				type: "message_end",
@@ -3497,7 +3501,7 @@ describe("startRun", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));
 		try {
 			const logPath = join(dir, "run.log");
-			const { handle, fake } = fakeStart({ logPath, pid: undefined });
+			const { handle, fake } = await fakeStart({ logPath, pid: undefined });
 			expect(handle.pid).toBeNull();
 
 			fake.emit("error", new Error("spawn omp ENOENT"));
@@ -3551,7 +3555,7 @@ describe("startRun worker dispatch", () => {
 		try {
 			const logPath = join(dir, "run.log");
 			let launched = 0;
-			const { pid, done } = startRun({
+			const { pid, done } = await startRun({
 				...baseOpts(dir, logPath),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 				launcher: (() => {
@@ -3581,7 +3585,7 @@ describe("startRun worker dispatch", () => {
 		try {
 			const logPath = join(dir, "run.log");
 			const overlay = join(dir, "omp-memory.yml");
-			const { done } = startRun({
+			const { done } = await startRun({
 				...baseOpts(dir, logPath),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 				launcher: (() => {
@@ -3616,11 +3620,13 @@ describe("startRun worker dispatch", () => {
 			const dead = Bun.serve({ port: 0, fetch: () => new Response("x") });
 			const deadUrl = `http://127.0.0.1:${dead.port}`;
 			dead.stop(true);
-			const r = await startRun({
-				...baseOpts(dir, logPath),
-				worker: { urls: [deadUrl] },
-				launcher,
-			}).done;
+			const r = await (
+				await startRun({
+					...baseOpts(dir, logPath),
+					worker: { urls: [deadUrl] },
+					launcher,
+				})
+			).done;
 			expect(spawned).toBe(0);
 			expect(r.exitCode).toBeNull();
 			expect(r.workerLost).toBe(true);
@@ -3679,8 +3685,9 @@ describe("startRun worker dispatch", () => {
 			// test never moves the process-wide HOME other suites read.
 			const opts = { env: { HOME: shared }, launcher };
 			// A board-side turn (merge, release review, release): no worker target.
-			await startRun({ ...baseOpts(dir, join(dir, "board.log")), ...opts })
-				.done;
+			await (
+				await startRun({ ...baseOpts(dir, join(dir, "board.log")), ...opts })
+			).done;
 			expect(seen.map((s) => s.env?.HOME)).toEqual([board]);
 			expect(reachable(seen[0]!.env)).toBe(0);
 			// The board's own config readers (model roles, sign-in store) follow its omp.
@@ -3701,10 +3708,12 @@ describe("startRun worker dispatch", () => {
 			fetch: () => new Response("spawn failed: no such image", { status: 500 }),
 		});
 		try {
-			const r = await startRun({
-				...baseOpts(dir, join(dir, "run.log")),
-				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-			}).done;
+			const r = await (
+				await startRun({
+					...baseOpts(dir, join(dir, "run.log")),
+					worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				})
+			).done;
 			expect(r.workerLost).toBe(true);
 			expect(r.dispatch).toContain(`worker http://127.0.0.1:${server.port}`);
 			expect(r.stderrTail).toContain(
@@ -3746,7 +3755,7 @@ describe("startRun worker dispatch", () => {
 		process.env.OTTR_SERVER_DATA_DIR = join(dir, "state");
 		process.env.OTTR_PROBE_KEPT = "kept"; // stands in for provider keys, which must travel
 		try {
-			const handle = startRun({
+			const handle = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 			});
@@ -3799,7 +3808,7 @@ describe("startRun worker dispatch", () => {
 			process.env[n] = keyPath;
 		}
 		try {
-			const handle = startRun({
+			const handle = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 			});
@@ -3840,7 +3849,7 @@ describe("startRun worker dispatch", () => {
 			process.env[n] = "ambient";
 		}
 		try {
-			const handle = startRun({
+			const handle = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 				githubReadEnv: {
@@ -3900,7 +3909,7 @@ describe("startRun worker dispatch", () => {
 			process.env[n] = "ambient";
 		}
 		try {
-			const handle = startRun({
+			const handle = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 			});
@@ -4029,7 +4038,7 @@ describe("startRun worker dispatch", () => {
 		delete process.env.GH_ENTERPRISE_TOKEN;
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
-			const handle = startRun({
+			const handle = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				launcher: (_c, _a, options) => {
 					seen.push(options);
@@ -4061,7 +4070,7 @@ describe("startRun worker dispatch", () => {
 		// A daemon that never answers keeps the run unsettled, which is the kill path.
 		const server = Bun.serve({ port: 0, fetch: () => new Promise(() => {}) });
 		try {
-			const handle = startRun({
+			const handle = await startRun({
 				...baseOpts(dir, join(dir, "run.log")),
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
 			});
@@ -4087,11 +4096,13 @@ describe("startRun worker dispatch", () => {
 		});
 		try {
 			const logPath = join(dir, "run.log");
-			const r = await startRun({
-				...baseOpts(dir, logPath),
-				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-				secrets: [lent],
-			}).done;
+			const r = await (
+				await startRun({
+					...baseOpts(dir, logPath),
+					worker: { urls: [`http://127.0.0.1:${server.port}`] },
+					secrets: [lent],
+				})
+			).done;
 			expect(r.exitCode).toBe(1);
 			expect(r.stderrTail).toBe("401 for [REDACTED]\n");
 			expect(readFileSync(logPath, "utf8")).not.toContain(lent);
@@ -4185,7 +4196,7 @@ describe("arch-review changed-line coverage", () => {
 		try {
 			const fake = new FakeOmp();
 			const seen: Parameters<RunLauncher>[2][] = [];
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "merge it",
 				sessionDir: join(dir, "sessions"),
@@ -4231,7 +4242,7 @@ describe("arch-review changed-line coverage", () => {
 		try {
 			const fake = new FakeOmp();
 			const logPath = join(dir, "run.log");
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "print env",
 				sessionDir: join(dir, "sessions"),
@@ -4501,7 +4512,7 @@ describe("startRun agent layer pinning", () => {
 				env: { LAYER_ENV_OUT: out, LAYER_RELEASE: rel },
 			});
 
-			const h1 = startRun(workerOpts(out1, rel1));
+			const h1 = await startRun(workerOpts(out1, rel1));
 			expect(h1.pid).toBeNull();
 			expect(h1.layerId).toBe("A");
 			await until(() => existsSync(out1));
@@ -4525,7 +4536,7 @@ describe("startRun agent layer pinning", () => {
 			// Switch current -> B while run 1 holds A open: run 1 stays on A, run 2 pins B.
 			const bDir = makeLayerDir(shared, "B");
 			switchCurrentTo(shared, "B");
-			const h2 = startRun(workerOpts(out2, rel2));
+			const h2 = await startRun(workerOpts(out2, rel2));
 			expect(h2.layerId).toBe("B");
 			await until(() => existsSync(out2));
 			const env2: Record<string, string> = JSON.parse(
@@ -4577,7 +4588,7 @@ describe("startRun agent layer pinning", () => {
 				return fake as unknown as ChildProcess;
 			};
 			const logPath = join(dir, "run.log");
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do it",
 				sessionDir: join(dir, "sessions"),
@@ -4617,18 +4628,20 @@ describe("startRun agent layer pinning", () => {
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
-			const run = (stripGithubToken: boolean) =>
-				startRun({
-					cwd: dir,
-					prompt: "do it",
-					sessionDir: join(dir, "sessions"),
-					extensionPath: null,
-					resumeId: null,
-					logPath: join(dir, `run-${stripGithubToken}.log`),
-					dataRoot: dir,
-					launcher,
-					stripGithubToken,
-				}).done;
+			const run = async (stripGithubToken: boolean) =>
+				(
+					await startRun({
+						cwd: dir,
+						prompt: "do it",
+						sessionDir: join(dir, "sessions"),
+						extensionPath: null,
+						resumeId: null,
+						logPath: join(dir, `run-${stripGithubToken}.log`),
+						dataRoot: dir,
+						launcher,
+						stripGithubToken,
+					})
+				).done;
 			await run(true);
 			await run(false);
 			expect(seen).toHaveLength(2);
@@ -4659,7 +4672,7 @@ describe("startRun agent layer pinning", () => {
 				return fake as unknown as ChildProcess;
 			};
 			const logPath = join(dir, "run.log");
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do it",
 				sessionDir: join(dir, "sessions"),
@@ -4700,7 +4713,7 @@ describe("startRun agent layer pinning", () => {
 				return fake as unknown as ChildProcess;
 			};
 			const logPath = join(dir, "run.log");
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do it",
 				sessionDir: join(dir, "sessions"),
@@ -4767,17 +4780,19 @@ describe("startRun agent layer pinning", () => {
 				queueMicrotask(() => fake.emit("close", 0));
 				return fake as unknown as ChildProcess;
 			};
-			const r = await startRun({
-				cwd: dir,
-				prompt: "p",
-				sessionDir: join(dir, "sessions"),
-				extensionPath: join(dir, "ext.ts"),
-				resumeId: null,
-				logPath: join(dir, "run.log"),
-				dataRoot: dir,
-				worker: { urls: [deadUrl] },
-				launcher,
-			}).done;
+			const r = await (
+				await startRun({
+					cwd: dir,
+					prompt: "p",
+					sessionDir: join(dir, "sessions"),
+					extensionPath: join(dir, "ext.ts"),
+					resumeId: null,
+					logPath: join(dir, "run.log"),
+					dataRoot: dir,
+					worker: { urls: [deadUrl] },
+					launcher,
+				})
+			).done;
 			expect(spawned).toBe(0); // fail closed: never run a worker turn locally
 			expect(r.workerLost).toBe(true);
 			// The failed dispatch released the layer: alate's clean-up sees no in-use entry.
@@ -5049,7 +5064,7 @@ describe("startRun microVM dispatch", () => {
 		const saved = process.env.ANTHROPIC_API_KEY;
 		process.env.ANTHROPIC_API_KEY = "sk-board-key";
 		try {
-			const run = startRun(vmOpts(dir, tokens, url));
+			const run = await startRun(vmOpts(dir, tokens, url));
 			expect(run.url).toBe(url);
 			const r = await run.done;
 			expect(await run.accepted).toBe(true);
@@ -5142,7 +5157,7 @@ describe("startRun microVM dispatch", () => {
 		const tokens = new VmTokens({ file: null });
 		const { server, seen, url } = fakeRunner(tokens, "busy");
 		try {
-			const run = startRun(vmOpts(dir, tokens, url));
+			const run = await startRun(vmOpts(dir, tokens, url));
 			expect(await run.accepted).toBe(false);
 			const r = await run.done;
 			expect(r.workerBusy).toBe(true);
@@ -5161,7 +5176,7 @@ describe("startRun microVM dispatch", () => {
 		const { server, seen, url } = fakeRunner(tokens, "run");
 		try {
 			const { memoryConfigPath: _omit, ...opts } = vmOpts(dir, tokens, url);
-			await startRun(opts).done;
+			await (await startRun(opts)).done;
 			const overlay = join(dir, "omp-memory.yml");
 			const { body } = seen[0]!;
 			expect(existsSync(overlay)).toBe(true);
@@ -5179,7 +5194,7 @@ describe("startRun microVM dispatch", () => {
 		const tokens = new VmTokens({ file: null });
 		const { server, url } = fakeRunner(tokens, "plain503");
 		try {
-			const r = await startRun(vmOpts(dir, tokens, url)).done;
+			const r = await (await startRun(vmOpts(dir, tokens, url))).done;
 			expect(r.workerLost).toBe(true);
 			expect(r.workerBusy).toBeUndefined();
 		} finally {
@@ -5196,16 +5211,18 @@ describe("startRun microVM dispatch", () => {
 		const { server, seen, url } = fakeRunner(tokens, "run");
 		try {
 			const { memoryConfigPath: _omit, ...opts } = vmOpts(dir, tokens, url);
-			await startRun(opts).done;
+			await (await startRun(opts)).done;
 			const env = seen[0]!.body.env ?? {};
 			expect(env.GIT_AUTHOR_NAME).toBeUndefined();
 			expect(env.GIT_COMMITTER_EMAIL).toBeUndefined();
 
 			seen.length = 0;
-			await startRun({
-				...opts,
-				commitIdentity: { name: "Acme", email: "ci@acme.dev" },
-			}).done;
+			await (
+				await startRun({
+					...opts,
+					commitIdentity: { name: "Acme", email: "ci@acme.dev" },
+				})
+			).done;
 			const custom = seen[0]!.body.env ?? {};
 			expect(custom.GIT_AUTHOR_NAME).toBe("Acme");
 			expect(custom.GIT_AUTHOR_EMAIL).toBe("ci@acme.dev");
@@ -5242,7 +5259,7 @@ describe("startRun commit identity env", () => {
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
 			const probes: IdentProbeEnv[] = [];
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -5251,7 +5268,7 @@ describe("startRun commit identity env", () => {
 				logPath: join(dir, "run.log"),
 				dataRoot: dir,
 				launcher: localLauncher(seen),
-				gitProbe: (o) => {
+				gitProbe: async (o) => {
 					probes.push(o);
 					return { name: false, email: false };
 				},
@@ -5281,7 +5298,7 @@ describe("startRun commit identity env", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-set-"));
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -5290,7 +5307,7 @@ describe("startRun commit identity env", () => {
 				logPath: join(dir, "run.log"),
 				dataRoot: dir,
 				launcher: localLauncher(seen),
-				gitProbe: () => ({ name: true, email: true }),
+				gitProbe: async () => ({ name: true, email: true }),
 			});
 			await handle.done;
 			for (const k of IDENT_VARS) expect(seen[0]!.env).not.toHaveProperty(k);
@@ -5303,7 +5320,7 @@ describe("startRun commit identity env", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-custom-"));
 		try {
 			const seen: Parameters<RunLauncher>[2][] = [];
-			const handle = startRun({
+			const handle = await startRun({
 				cwd: dir,
 				prompt: "do the thing",
 				sessionDir: join(dir, "sessions"),
@@ -5312,7 +5329,7 @@ describe("startRun commit identity env", () => {
 				logPath: join(dir, "run.log"),
 				dataRoot: dir,
 				launcher: localLauncher(seen),
-				gitProbe: () => ({ name: false, email: false }),
+				gitProbe: async () => ({ name: false, email: false }),
 				commitIdentity: { name: "Acme", email: "ci@acme.dev" },
 			});
 			await handle.done;
@@ -5321,6 +5338,54 @@ describe("startRun commit identity env", () => {
 				GIT_AUTHOR_EMAIL: "ci@acme.dev",
 				GIT_COMMITTER_NAME: "Acme",
 				GIT_COMMITTER_EMAIL: "ci@acme.dev",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("startRun awaits the git probe: a pending probe delays the spawn, not the caller", async () => {
+		// OTTR-807: the probe spawns git off the event loop, so an unresolved probe must
+		// leave startRun's caller free (nothing spawned yet), and the awaited answer must
+		// still shape the child's env once it lands.
+		const dir = mkdtempSync(join(tmpdir(), "ottr-ident-await-"));
+		try {
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const order: string[] = [];
+			const { resolve, promise } = Promise.withResolvers<{
+				name: boolean;
+				email: boolean;
+			}>();
+			// Deliberately not awaited yet: the point is that startRun's caller stays
+			// free while the probe is still pending.
+			const pending = startRun({
+				cwd: dir,
+				prompt: "do the thing",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher: localLauncher(seen),
+				gitProbe: async () => {
+					order.push("probe-called");
+					return promise;
+				},
+			});
+			// startRun called the probe and suspended before the first spawn: this code
+			// runs while the probe is still pending, and no child exists yet.
+			expect(order).toEqual(["probe-called"]);
+			expect(seen).toEqual([]);
+			resolve({ name: false, email: false });
+			const handle = await pending;
+			await handle.done;
+			expect(seen).toHaveLength(1);
+			// The awaited probe's answer shaped the env: the Ottr defaults ride the child.
+			expect(seen[0]!.env).toMatchObject({
+				GIT_AUTHOR_NAME: "Ottr",
+				GIT_AUTHOR_EMAIL: "ottr@localhost",
+				GIT_COMMITTER_NAME: "Ottr",
+				GIT_COMMITTER_EMAIL: "ottr@localhost",
 			});
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
@@ -5348,7 +5413,7 @@ describe("startRun commit identity env", () => {
 		try {
 			const probes: IdentProbeEnv[] = [];
 			const logPath = join(dir, "run.log");
-			const { done } = startRun({
+			const { done } = await startRun({
 				cwd: dir,
 				prompt: "do it",
 				sessionDir: join(dir, "sessions"),
@@ -5357,7 +5422,7 @@ describe("startRun commit identity env", () => {
 				logPath,
 				dataRoot: dir,
 				worker: { urls: [`http://127.0.0.1:${server.port}`] },
-				gitProbe: (o) => {
+				gitProbe: async (o) => {
 					probes.push(o);
 					return { name: false, email: false };
 				},

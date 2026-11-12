@@ -1487,7 +1487,7 @@ export function createSupervisor(
 		const memo = retroSkips.get(key);
 		if (memo !== undefined && memo.size > 0) return null;
 
-		const { sessionText, subagentTexts } = readTranscript(
+		const { sessionText, subagentTexts } = await readTranscript(
 			e.store.sessionsDir,
 			t.sessionId,
 		);

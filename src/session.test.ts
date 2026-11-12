@@ -111,7 +111,7 @@ describe("sessionModel", () => {
 
 describe("sessionHoldsPrompt", () => {
 	const sid = "11110000-0000-0000-0000-000000000002";
-	test("matches string and text-part user messages; ignores other roles and missing files", () => {
+	test("matches string and text-part user messages; ignores other roles and missing files", async () => {
 		const d = dir("holds");
 		const prompt = "line one\nline two";
 		const padded = `prefix\n${prompt}`;
@@ -121,10 +121,10 @@ describe("sessionHoldsPrompt", () => {
 				`{"type":"message","message":{"role":"user","content":${JSON.stringify(padded)}}}\n` +
 				`{"type":"message","message":{"role":"user","content":[${JSON.stringify({ type: "text", text: prompt })}]}}\n`,
 		);
-		expect(sessionHoldsPrompt(d, sid, prompt)).toBe(true);
-		expect(sessionHoldsPrompt(d, sid, "no such text")).toBe(false);
-		expect(sessionHoldsPrompt(root, sid, prompt)).toBe(false); // no file
-		expect(sessionHoldsPrompt(root, null, prompt)).toBe(false);
+		expect(await sessionHoldsPrompt(d, sid, prompt)).toBe(true);
+		expect(await sessionHoldsPrompt(d, sid, "no such text")).toBe(false);
+		expect(await sessionHoldsPrompt(root, sid, prompt)).toBe(false); // no file
+		expect(await sessionHoldsPrompt(root, null, prompt)).toBe(false);
 	});
 });
 

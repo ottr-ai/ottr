@@ -353,7 +353,6 @@ import {
 	type FinishKeptOutcome,
 	FORK_HOLD_REASON,
 	isKeptReason,
-	logStoreError,
 	MERGE_HOLD_MISMATCH_REASON,
 	queuedReply,
 	replyPatch,

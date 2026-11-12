@@ -4,7 +4,7 @@
 // "no author identity". The ident env vars beat every config scope, so the env is
 // set only for the fields the turn's git config leaves empty: a configured identity
 // (a user ~/.gitconfig, the board's pinned /etc/ottr/gitconfig) keeps winning.
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 /** The identity the entry script seeds the board's pinned git config with (docker/ottr-entry.sh). */
 export const DEFAULT_COMMIT_NAME = "Ottr";
@@ -111,12 +111,14 @@ export interface IdentProbeEnv {
  * What the turn's git resolves for the ident — the same cwd, the same global scope and
  * the same inherited env, so the ident env is set exactly when git would otherwise find
  * nothing. A spawn failure (git missing) counts as unset, so the default still applies.
+ * Async: the probe spawns git twice, and a git that answers slowly (a hung filesystem,
+ * a cold cache) must not hold the dispatching turn off the event loop.
  */
-export function probeGitIdent(o: IdentProbeEnv): {
+export async function probeGitIdent(o: IdentProbeEnv): Promise<{
 	name: boolean;
 	email: boolean;
-} {
-	const get = (key: string): boolean => {
+}> {
+	const get = async (key: string): Promise<boolean> => {
 		const env: Record<string, string> = {};
 		for (const [k, v] of Object.entries(o.baseEnv))
 			if (v !== undefined && !PROBE_STRIP.test(k)) env[k] = v;
@@ -126,13 +128,23 @@ export function probeGitIdent(o: IdentProbeEnv): {
 		if (o.gitConfigGlobal === null) delete env.GIT_CONFIG_GLOBAL;
 		else env.GIT_CONFIG_GLOBAL = o.gitConfigGlobal;
 		try {
-			const r = spawnSync("git", ["config", "--get", key], {
+			const { promise, resolve } = Promise.withResolvers<boolean>();
+			let out = "";
+			const child = spawn("git", ["config", "--get", key], {
 				cwd: o.cwd,
 				env,
 				stdio: ["ignore", "pipe", "ignore"],
 				windowsHide: true,
 			});
-			return r.status === 0 && r.stdout.toString("utf8").trim() !== "";
+			child.stdout?.on("data", (chunk: Buffer) => {
+				out += chunk.toString("utf8");
+			});
+			// A spawn failure (git missing) counts as unset, so the default still applies.
+			child.on("error", () => resolve(false));
+			child.on("close", (code) => {
+				resolve(code === 0 && out.trim() !== "");
+			});
+			return await promise;
 		} catch {
 			return false;
 		}
@@ -141,7 +153,7 @@ export function probeGitIdent(o: IdentProbeEnv): {
 		o.baseEnv[`GIT_AUTHOR_${suffix}`] !== undefined ||
 		o.baseEnv[`GIT_COMMITTER_${suffix}`] !== undefined;
 	return {
-		name: envNamed("NAME") || get("user.name"),
-		email: envNamed("EMAIL") || get("user.email"),
+		name: envNamed("NAME") || (await get("user.name")),
+		email: envNamed("EMAIL") || (await get("user.email")),
 	};
 }

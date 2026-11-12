@@ -1261,7 +1261,7 @@ function sameUsage(a: TokenUsage | null, b: TokenUsage): boolean {
 	);
 }
 
-interface RunHandle {
+export interface RunHandle {
 	pid: number | null;
 	/** OTTR-454: the dispatched worker's url; absent for a local run. The turn engine
 	 * buckets live runs by it for GET /api/drain. */
@@ -1704,7 +1704,7 @@ interface StartOptions {
 	/** OTTR-693: the Settings commit identity for this turn; null keeps the built-in Ottr default (src/gitIdentity.ts). */
 	commitIdentity?: CommitIdentity | null;
 	/** Test seam: replaces the git config probe (src/gitIdentity.ts IdentProbeEnv). */
-	gitProbe?: (o: IdentProbeEnv) => { name: boolean; email: boolean };
+	gitProbe?: (o: IdentProbeEnv) => Promise<{ name: boolean; email: boolean }>;
 	/** Pinned tool list / extension config / skill, passed to buildOmpArgs (a retro run). */
 	tools?: string | null;
 	config?: string | null;
@@ -1828,10 +1828,10 @@ function resolveLayerPin(
  * identity" failure this fixes. A VM guest owns its home and seeds the clone's own
  * config (src/vmGuest.ts; vmEnv drops the pointer too), so only an explicit Settings
  * identity rides the VM env, never the automatic default. */
-function resolveIdentityEnv(
+async function resolveIdentityEnv(
 	o: StartOptions,
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
-): Record<string, string> {
+): Promise<Record<string, string>> {
 	const identBaseEnv = withoutGitAuth({ ...process.env, ...o.env });
 	if (o.vm) {
 		return o.commitIdentity != null
@@ -1842,7 +1842,7 @@ function resolveIdentityEnv(
 		name: DEFAULT_COMMIT_NAME,
 		email: DEFAULT_COMMIT_EMAIL,
 	};
-	const probe = (o.gitProbe ?? probeGitIdent)({
+	const probe = await (o.gitProbe ?? probeGitIdent)({
 		cwd: o.cwd,
 		home: layerEnv?.HOME ?? process.env.HOME ?? null,
 		gitConfigGlobal:
@@ -2203,7 +2203,7 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 	};
 }
 
-export function startRun(o: StartOptions): RunHandle {
+export async function startRun(o: StartOptions): Promise<RunHandle> {
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
 	const vmToken = o.vm
@@ -2235,7 +2235,9 @@ export function startRun(o: StartOptions): RunHandle {
 		layerHome,
 	);
 	const args = buildOmpArgs({ ...o, memoryConfig, pluginSkillsConfig });
-	const identityEnv = resolveIdentityEnv(o, layerPin.layerEnv);
+	// Awaited here (after buildOmpArgs, before RunStart): the probe spawns git and must
+	// not block the caller's tick, but every dispatch path needs the ident env settled.
+	const identityEnv = await resolveIdentityEnv(o, layerPin.layerEnv);
 	const s: RunStart = {
 		o,
 		sink,

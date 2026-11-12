@@ -143,11 +143,11 @@ describe("probeGitIdent", () => {
 		return dir;
 	}
 
-	test("an empty home outside a repo resolves nothing", () => {
+	test("an empty home outside a repo resolves nothing", async () => {
 		const home = tempDir("ottr-probe-empty-");
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,
@@ -159,7 +159,7 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("a .gitconfig identity resolves both fields", () => {
+	test("a .gitconfig identity resolves both fields", async () => {
 		const home = tempDir("ottr-probe-full-");
 		writeFileSync(
 			join(home, ".gitconfig"),
@@ -167,7 +167,7 @@ describe("probeGitIdent", () => {
 		);
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,
@@ -179,12 +179,12 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("only user.name resolves the name alone", () => {
+	test("only user.name resolves the name alone", async () => {
 		const home = tempDir("ottr-probe-name-");
 		writeFileSync(join(home, ".gitconfig"), "[user]\n\tname = Tester\n");
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,
@@ -196,7 +196,7 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("a kept GIT_CONFIG_GLOBAL pointer wins over the home, like the turn's git", () => {
+	test("a kept GIT_CONFIG_GLOBAL pointer wins over the home, like the turn's git", async () => {
 		// The board container case: the pinned /etc/ottr/gitconfig replaces the global
 		// scope, so the shared home's ~/.gitconfig is never consulted by the turn.
 		const home = tempDir("ottr-probe-pin-");
@@ -209,7 +209,7 @@ describe("probeGitIdent", () => {
 		writeFileSync(cfg, "[user]\n\tname = Pinned\n\temail = pinned@ottr\n");
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: cfg,
@@ -220,7 +220,7 @@ describe("probeGitIdent", () => {
 			// pinned file without an identity and the planted home must still stay hidden.
 			writeFileSync(cfg, "[core]\n\tfsmonitor = false\n");
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: cfg,
@@ -233,7 +233,7 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("a stripped pointer (worker mode) reads the home's ~/.gitconfig", () => {
+	test("a stripped pointer (worker mode) reads the home's ~/.gitconfig", async () => {
 		const home = tempDir("ottr-probe-worker-");
 		writeFileSync(
 			join(home, ".gitconfig"),
@@ -241,7 +241,7 @@ describe("probeGitIdent", () => {
 		);
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,
@@ -253,7 +253,7 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("repo-local config counts when the probe cwd is the worktree", () => {
+	test("repo-local config counts when the probe cwd is the worktree", async () => {
 		const home = tempDir("ottr-probe-repo-home-");
 		const repo = tempRepo("ottr-probe-repo-");
 		writeFileSync(
@@ -262,7 +262,7 @@ describe("probeGitIdent", () => {
 		);
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: repo,
 					home,
 					gitConfigGlobal: null,
@@ -275,7 +275,7 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("an includeIf gitdir identity counts", () => {
+	test("an includeIf gitdir identity counts", async () => {
 		// The common corporate setup: one identity per checkout path via includeIf.
 		const home = tempDir("ottr-probe-if-home-");
 		const repo = tempRepo("ottr-probe-if-");
@@ -291,7 +291,7 @@ describe("probeGitIdent", () => {
 		);
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: repo,
 					home,
 					gitConfigGlobal: null,
@@ -305,13 +305,13 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("an inherited ident env counts as configured", () => {
+	test("an inherited ident env counts as configured", async () => {
 		// The env beats every config scope, so a base env that already carries an author
 		// name must suppress the fallback env for that field alone.
 		const home = tempDir("ottr-probe-inh-");
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,
@@ -326,13 +326,13 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("GIT_CONFIG_COUNT injection cannot steer the probe", () => {
+	test("GIT_CONFIG_COUNT injection cannot steer the probe", async () => {
 		// The turn env strips the count form (withoutGitAuth); the probe must not let a
 		// leftover one fake a configured identity.
 		const home = tempDir("ottr-probe-count-");
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,
@@ -349,7 +349,7 @@ describe("probeGitIdent", () => {
 		}
 	});
 
-	test("the XDG config also counts", () => {
+	test("the XDG config also counts", async () => {
 		const home = tempDir("ottr-probe-xdg-");
 		mkdirSync(join(home, ".config", "git"), { recursive: true });
 		writeFileSync(
@@ -358,7 +358,7 @@ describe("probeGitIdent", () => {
 		);
 		try {
 			expect(
-				probeGitIdent({
+				await probeGitIdent({
 					cwd: home,
 					home,
 					gitConfigGlobal: null,

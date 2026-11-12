@@ -735,7 +735,9 @@ describe("hosted metering at settle", () => {
 			hosted,
 			commitsAhead: async () => 0,
 			startRun: async (o: StartArgs) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 1,
 					done: Promise.resolve(answered({ model: null })),
@@ -976,7 +978,7 @@ describe("hosted interim metering", () => {
 		const { store, loop } = await setup({
 			hosted,
 			commitsAhead: async () => 0,
-			startRun: (o: StartArgs) => {
+			startRun: async (o: StartArgs) => {
 				onUsage = o.onUsage;
 				return { pid: 4242, done: done.promise, kill: async () => {} };
 			},
@@ -1419,7 +1421,7 @@ describe("hosted credit stop", () => {
 
 	test("a self-hosted loop ignores the credit hold: work run and check run as before", async () => {
 		const h = hangingChecks(readyRun);
-		const passCheck = (o: StartArgs) => {
+		const passCheck = async (o: StartArgs) => {
 			if (o.config?.endsWith("check.yml") !== true) return h.startRun(o);
 			h.runs.push(o);
 			return {

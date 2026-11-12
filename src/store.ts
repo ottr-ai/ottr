@@ -1232,6 +1232,29 @@ function parseSetting(
 	return value as ProjectSettings[keyof ProjectSettings];
 }
 
+
+/** Turns of one task still missing their captured cost, oldest first. */
+interface CostBackfillTurn {
+	id: number;
+	started_at: number;
+	ended_at: number;
+}
+
+/** Writes one turn's five cost columns from a usage sum. */
+function writeTurnCost(db: Database, turnId: number, sum: UsageSum): void {
+	db.run(
+		"UPDATE turns SET tokens_in = ?, tokens_out = ?, cache_read = ?, cache_write = ?, cost = ? WHERE id = ?",
+		[
+			sum.tokensIn,
+			sum.tokensOut,
+			sum.cacheRead,
+			sum.cacheWrite,
+			sum.cost,
+			turnId,
+		],
+	);
+}
+
 /** A trending verdict's repo: lowercase `owner/repo`. */
 const TRENDING_REPO_RE = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
 
@@ -1287,8 +1310,14 @@ export class ProjectStore {
 	readonly dataRoot: string;
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
+
 	private readonly db: SQLiteDatabase;
 	private readonly queue: StoreQueue;
+	/** Settles when open's fire-and-forget transcript backfills (cost columns, done
+	 * context) have landed; rejection-free. Reads that must see the filled columns await
+	 * it. Assigned after the migrations (OTTR-884 merge): the fills start on the
+	 * migrated database. */
+	readonly backfill: Promise<void> = Promise.resolve();
 
 	private constructor(projectPath: string, db: SQLiteDatabase) {
 		this.path = projectPath;
@@ -1299,6 +1328,7 @@ export class ProjectStore {
 		this.sessionsDir = join(this.tasksDir, "sessions");
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
+
 		this.queue = new StoreQueue({
 			begin: async () => {
 				await db.exec("BEGIN");
@@ -1895,6 +1925,7 @@ export class ProjectStore {
 					follow_up_of, push_sha, update_ids, update_merge_approved, fork_merge_approved,
 					commits, done_at, topic, depends_on, diff_files, diff_text, work_check_log,
 					work_check_sendbacks, work_check_head, work_check_report`,
+
 						"stage",
 					)) ?? cols;
 				// Triage columns: ALTER-only and placed after both CHECK rebuilds on
@@ -2346,12 +2377,31 @@ export class ProjectStore {
 					"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
 				);
 			});
+		// OTTR-866: the one-time cost and context backfills from the session
+		// transcripts start here, after the migrations, and ride the store's backfill
+		// promise so reads that need the columns can await them (OTTR-884 merge).
+		const costBackfill = backfillTurnCosts(
+			db,
+			join(tasksDir, "sessions"),
+		).catch(() => {
+			/* backfill is best-effort; the next open retries */
+		});
+		const doneContextBackfill = backfillDoneContext(
+			db,
+			join(tasksDir, "sessions"),
+		).catch(() => {
+			/* backfill is best-effort; the next open retries */
+		});
+		store.backfill = Promise.all([costBackfill, doneContextBackfill]).then(
+			() => {},
+		);
 			await store.backfillTranscriptData();
 			return store;
 		} catch (error) {
 			await store.close();
 			throw error;
 		}
+
 	}
 
 	async logPath(taskId: string): Promise<string> {
@@ -3901,6 +3951,7 @@ export class ProjectStore {
 					values.push(value as string | number | null);
 				}
 			}
+
 			if (sets.length > 0) {
 				values.push(turnId);
 				await this.db.run(
@@ -3962,7 +4013,9 @@ export class ProjectStore {
 		turnId: number,
 		startedAt: number,
 		endedAt: number,
+
 		expectedSessionId?: string | null,
+
 	): Promise<void> {
 		const sessionId =
 			expectedSessionId === undefined
@@ -3972,13 +4025,14 @@ export class ProjectStore {
 		let sum: UsageSum | null;
 		try {
 			sum = sumUsageIn(
-				readTranscript(this.sessionsDir, sessionId),
+				await readTranscript(this.sessionsDir, sessionId),
 				startedAt,
 				endedAt,
 			);
 		} catch {
 			return;
 		}
+
 		if (sum === null) return;
 		await this.transaction(async () => {
 			await this.db.run(
@@ -4070,6 +4124,7 @@ export class ProjectStore {
 				.all();
 		});
 		for (const task of done) await this.captureTaskContext(task.id, true);
+
 	}
 
 	async listTurns(taskId: string): Promise<Turn[]> {

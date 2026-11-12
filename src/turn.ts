@@ -146,6 +146,7 @@ import {
 } from "./session.ts";
 import {
 	DEFAULT_SETTINGS,
+	logStoreError,
 	type ProjectStore,
 	type TaskPatch,
 } from "./store.ts";
@@ -1475,15 +1476,6 @@ export function modelSwap(
 		: dispatched;
 }
 
-/** Logs a project store's failure at most once per 10 minutes per project: diagnosable, not spam. */
-const lastStoreErrorAt = new Map<string, number>();
-export function logStoreError(name: string, err: unknown): void {
-	const now = Date.now();
-	if (now - (lastStoreErrorAt.get(name) ?? 0) < 600_000) return;
-	lastStoreErrorAt.set(name, now);
-	console.error(`project ${name}:`, err);
-}
-
 /**
  * getSettings that cannot take the scheduler down: a store whose database hiccups
  * (locked file, recovering WAL, missing table) logs once per window with the project
@@ -1587,7 +1579,9 @@ type TurnRunShared = {
 	guardBefore: Map<string, { head: string | null; status: string }> | null;
 };
 
+
 /** The agent run one turn dispatches (ops.startRun's handle). */
+
 type TurnRunHandle = Awaited<ReturnType<TurnOps["startRun"]>>;
 
 /** The metering handle openMeter returns for one agent run (null on a self-hosted board). */
@@ -2102,18 +2096,20 @@ export function createTurnLoop(
 	 * seconds into a turn otherwise resumes the saved session with only the note, and the agent
 	 * never sees what the turn was asked to do. A missing session file needs no resend — that
 	 * turn starts a fresh session, whose start re-sends the card's instructions. */
-	function lostResumePrompt(
+	async function lostResumePrompt(
 		store: ProjectStore,
 		cur: ListedTask,
 		lost: Turn | null,
 		base: string,
-	): string {
-		return lost !== null &&
+	): Promise<string> {
+		if (
+			lost !== null &&
 			cur.sessionId !== null &&
 			sessionFile(store.sessionsDir, cur.sessionId) !== null &&
-			!sessionHoldsPrompt(store.sessionsDir, cur.sessionId, lost.prompt)
-			? `${lost.prompt}\n\n${base}`
-			: base;
+			!(await sessionHoldsPrompt(store.sessionsDir, cur.sessionId, lost.prompt))
+		)
+			return `${lost.prompt}\n\n${base}`;
+		return base;
 	}
 
 	/** Shared settle-and-requeue for the lost-run sweep and the boot restart sweep: end the open
@@ -2150,6 +2146,7 @@ export function createTurnLoop(
 		const lost =
 			turnId === null
 				? null
+
 				: ((await store.listTurns(t.id)).find((row) => row.id === turnId) ??
 					null);
 		const base = original?.pendingPrompt ?? resume;
@@ -2192,6 +2189,7 @@ export function createTurnLoop(
 				pendingBy:
 					current.pendingPrompt !== null ? current.pendingBy : "supervisor",
 			});
+
 		});
 		if (turnId !== null) await store.captureTurnData(turnId);
 	}
@@ -5719,6 +5717,7 @@ export function createTurnLoop(
 			idn.retroCard || idn.reviewCard || idn.scout
 				? await retroEnvMarks(idn)
 				: {};
+
 		const options = await turnRunStartOptions(
 			ops,
 			runMeter,
@@ -5734,6 +5733,7 @@ export function createTurnLoop(
 			kind,
 			mx,
 			marks,
+
 		);
 		const started = ops.startRun(options);
 		// A local fallback may fill its pid after the original dispatch snapshot.
@@ -9230,7 +9230,9 @@ export function createTurnLoop(
 		selector: string | undefined,
 		checkMeter: ReturnType<OpenRunMeter>,
 	): Promise<TurnRunHandle> {
+
 		return await ops.startRun({
+
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
 				auditProvisioned(homedir(), sinceMs, rulesAtStart),

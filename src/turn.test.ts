@@ -76,8 +76,10 @@ import {
 	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_DIVERGE,
 } from "./scheduler.ts";
+
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
+
 import fc from "./test/properties.ts";
 import { turnEnv } from "./tokens.ts";
 import type { TurnLoop, TurnOps, TurnProject } from "./turn.ts";
@@ -92,7 +94,6 @@ import {
 	getSettingsLogged,
 	isKeptReason,
 	keptReason,
-	logStoreError,
 	MERGE_HOLD_MISMATCH_REASON,
 	modelSwap,
 	parseDependabotHeadLine,
@@ -487,12 +488,16 @@ afterEach(async () => {
 
 describe("turn loop", () => {
 	test("a finished run records ranOn on the turn; a run without one leaves it null", async () => {
+
 		const { store, loop } = await setup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -1523,9 +1528,11 @@ describe("turn loop", () => {
 	});
 
 	test("a no-stderr death with dispatch context writes the same line to the turn log", async () => {
+
 		const { store, loop } = await setup({
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -1601,7 +1608,9 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 	setNetworkGitAuth(() => ({ GIT_SSH_COMMAND: "ssh -i /k" }));
 	try {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -2022,7 +2031,9 @@ describe("turn quarantine", () => {
 	});
 
 	test("crash turn: quarantine not called", async () => {
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -2042,7 +2053,9 @@ describe("turn quarantine", () => {
 	});
 
 	test("ask turn: quarantine not called", async () => {
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -2183,7 +2196,7 @@ describe("turn schedule", () => {
 		const { store, record, loop } = await setup({
 			maxTotalRuns: () => null,
 			// The runs hang, so the three starts this test expects stay the only ones.
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				return {
 					pid: 4242,
@@ -2205,7 +2218,7 @@ describe("turn schedule", () => {
 		const { store, record, loop } = await setup({
 			maxTotalRuns: () => null,
 			// The runs hang, so the starts this test expects stay the only ones.
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				return {
 					pid: 4242,
@@ -2246,7 +2259,7 @@ describe("turn schedule", () => {
 		const { store, record, loop } = await setup({
 			maxTotalRuns: () => null,
 			// The run hangs, so the one start this test expects stays the only one.
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				return {
 					pid: 4242,
@@ -2279,7 +2292,7 @@ describe("turn schedule", () => {
 		const { store, record, loop } = await setup({
 			drained: () => held,
 			// The run hangs, so the one start this test expects stays the only one.
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				return {
 					pid: 4242,
@@ -2303,7 +2316,7 @@ describe("turn schedule", () => {
 	test("an update's hold still starts the board check, and only it", async () => {
 		const { store, record, loop } = await setup({
 			drained: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				return {
 					pid: 4242,
@@ -2713,7 +2726,9 @@ describe("turn sessions, steering and images", () => {
 
 	test("work turn copies agent-reported shots, skipping missing paths", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -2755,8 +2770,10 @@ describe("turn sessions, steering and images", () => {
 
 	test("shots reported twice in one outcome are saved once", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -2794,8 +2811,10 @@ describe("turn sessions, steering and images", () => {
 
 	test("re-reporting the same shots on a later turn adds nothing", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.(`sess-${record.runs.length}`);
@@ -2888,8 +2907,10 @@ describe("turn sessions, steering and images", () => {
 
 	test("a re-captured screen with new bytes replaces the stored shot instead of doubling", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.(`sess-${record.runs.length}`);
@@ -2932,8 +2953,10 @@ describe("turn sessions, steering and images", () => {
 
 	test("a visually different new shot still appends", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.(`sess-${record.runs.length}`);
@@ -2966,8 +2989,10 @@ describe("turn sessions, steering and images", () => {
 
 	test("one outcome reporting the same screen in two encodings saves one", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -3002,7 +3027,9 @@ describe("turn sessions, steering and images", () => {
 
 	test("work turn adopts a shots/ directory when the outcome's shots were stripped", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -3436,7 +3463,7 @@ describe("turn sessions, steering and images", () => {
 			const { store, record, loop } = await setup({
 				holdFollowUps: true,
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
 					return {
 						pid: 4242,
@@ -3470,9 +3497,11 @@ describe("turn sessions, steering and images", () => {
 	);
 
 	test("the text-only retry failing too still lands in needs_you", async () => {
+
 		const { store, record, loop } = await setup({
 			holdFollowUps: true, // assert the settle instant; each turn runs via a direct runTurn
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 				record.runs.push(o);
 				return {
 					pid: 4242,
@@ -3510,8 +3539,10 @@ describe("turn sessions, steering and images", () => {
 		try {
 			const { store, record, loop } = await setup({
 				http400Dir: seedDir,
+
 				holdFollowUps: true, // assert the settle instant; the turn runs directly
 				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 					record.runs.push(o);
 					// omp writes the 400 entry while the turn runs, so it lands inside
 					// the turn's window by construction.
@@ -3555,7 +3586,9 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
+
 				holdFollowUps: true,
+
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -3601,6 +3634,7 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
+
 				holdFollowUps: true,
 				startRun: async (o: {
 					prompt: string;
@@ -3645,6 +3679,7 @@ describe("turn sessions, steering and images", () => {
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				holdFollowUps: true,
+
 				startRun: async (o: {
 					prompt: string;
 					model?: string | null;
@@ -3690,7 +3725,9 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
+
 				holdFollowUps: true,
+
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -3750,7 +3787,7 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
@@ -3897,7 +3934,9 @@ describe("turn classify wiring", () => {
 	test("background wait auto-continues once, then a repeat asks you", async () => {
 		const { store, record, loop } = await setup({
 			// Cap 0: keep the auto-queued card from being re-started by the finally's schedule.
+
 			holdFollowUps: true,
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -3942,7 +3981,9 @@ describe("turn classify wiring", () => {
 	});
 
 	test("killed run finishes the turn as cancelled and keeps the worktree", async () => {
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -3963,7 +4004,9 @@ describe("turn classify wiring", () => {
 	});
 
 	test("cancel landing while the run resolves finishes the turn as cancelled", async () => {
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -5072,7 +5115,9 @@ describe("turn survivor rounds", () => {
 
 	test("a merge turn's onSession does not touch the stage", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await setupWith(record, {
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -5122,7 +5167,9 @@ describe("turn survivor rounds", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
+
 				holdFollowUps: true,
+
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -5150,7 +5197,9 @@ describe("turn survivor rounds", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
+
 				holdFollowUps: true,
+
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -5264,12 +5313,16 @@ describe("turn ci watch pinning", () => {
 	});
 
 	test("an integrate report naming a version stamps it when a tag points at the pushed head", async () => {
+
 		const { store, loop, task } = await mergeDoneSetup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5298,7 +5351,9 @@ describe("turn ci watch pinning", () => {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5331,7 +5386,9 @@ describe("turn ci watch pinning", () => {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -6616,7 +6673,9 @@ describe("turn survivor rounds 3", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
+
 				holdFollowUps: true,
+
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -6732,7 +6791,7 @@ describe("turn survivor rounds 3", () => {
 		const commandLoop = holdFollowUps(
 			commandProjects,
 			fakeOps(withCommand, {
-				startRun: (o: { prompt: string }) => {
+				startRun: async (o: { prompt: string }) => {
 					withCommand.runs.push(o as never);
 					return {
 						pid: 1,
@@ -7959,7 +8018,7 @@ describe("package list", () => {
 			holdFollowUps: true, // each turn runs via a direct runTurn
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:medium" }),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				return {
 					pid: 4242,
@@ -8424,7 +8483,9 @@ describe("turn ownership, cap and settle regressions", () => {
 					record.runs.push(o);
 					await o.onSession?.("sess-1");
 					markStarted();
+
 					// A handle that learns its pid only after startTurn.
+
 					return {
 						get pid() {
 							return pid;
@@ -9289,7 +9350,9 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 	test("stop kills the run, keeps the session and parks the card at needs_you", async () => {
 		const { promise, resolve } = Promise.withResolvers<RunResult>();
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -10076,8 +10139,10 @@ describe("arch-review survivor kills", () => {
 			pidAlive: () => false,
 			// The sweep requeues the card; the cap keeps the resumed turn from claiming it
 			// mid-assertion.
+
 			holdFollowUps: true,
 			scheduledCap: 0,
+
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -11432,7 +11497,9 @@ describe("turn update-card merge hold (U7)", () => {
 		const { store, loop } = await setup({
 			targetSha: async () => "sha-1",
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -11901,9 +11968,11 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("a no-stderr death without images never quarantines images or retries text-only", async () => {
+
 		const { store, loop } = await setup({
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await o.onSession?.("sess-1");
+
 				return dieBeforeOutput();
 			},
 		});
@@ -11916,8 +11985,10 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("the provider note is logged exactly once per rejected turn", async () => {
+
 		const { store, record, loop } = await setup({
 			holdFollowUps: true, // the text-only retry runs via a direct runTurn below
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				if (record.runs.length === 1) return dieBeforeOutput();
@@ -11949,7 +12020,7 @@ describe("turn survivor round 4", () => {
 		const { store, record, loop } = await setup({
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				return dieBeforeOutput();
 			},
@@ -12024,7 +12095,9 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("a research crash turn keeps its crash reason, never a missing-report bounce", async () => {
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -12079,7 +12152,9 @@ describe("turn survivor round 4", () => {
 		const { store, loop } = await setup({
 			targetSha: async () => "sha-pushed",
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 				await o.onSession?.("sess-1");
+
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -12112,7 +12187,9 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("tracker error writes the bang line to the turn log", async () => {
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -15021,7 +15098,9 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	test("a ready outcome with dependsOn records the ids but keeps the normal next state", async () => {
 		let depId = "";
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -15592,7 +15671,7 @@ describe("turn survivor round 5 — helpers", () => {
 		const { store, record, loop } = await setup({
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				return {
 					pid: 4242,
@@ -16922,7 +17001,9 @@ describe("turn survivor round 5 — run setup", () => {
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const loop = loopFor(store, record, {
+
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				await o.onSession?.("s1");
@@ -16938,6 +17019,10 @@ describe("turn survivor round 5 — run setup", () => {
 		});
 		const running = loop.runTurn(store.name, task.id);
 		await started;
+		// startRun resolves after its body, so the dispatch continuation (entry
+		// registration) is still queued here; the flush lets it run, exactly where the
+		// synchronous startRun of old registered the entry before any assert.
+		await flushPromises();
 		const key = `${store.name}/${task.id}`;
 		await eventually(() => loop.running.has(key));
 		expect(logNotes).toEqual([[store.name, task.id]]);
@@ -16966,7 +17051,9 @@ describe("turn survivor round 5 — run setup", () => {
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const loop = loopFor(store, record, {
+
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				await o.onSession?.("s1");
@@ -16977,6 +17064,9 @@ describe("turn survivor round 5 — run setup", () => {
 		});
 		const running = loop.runTurn(store.name, task.id);
 		await started;
+		// The dispatch continuation registers the entry one microtask after the mock's
+		// body; the flush runs it before the first progress dispatch below.
+		await flushPromises();
 		const key = `${store.name}/${task.id}`;
 		await eventually(() => loop.running.has(key));
 		const stryker = (pct: number, elapsed: string, tested: number): string =>
@@ -17019,9 +17109,11 @@ describe("turn survivor round 5 — run setup", () => {
 		let seen: string | null | undefined;
 		const loop = loopFor(store, record, {
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 				await o.onSession?.("s1");
 				await o.onSession?.("s2");
 				seen = (await store.getTask(task.id))!.sessionId;
+
 				return answeredRun();
 			},
 		});
@@ -17036,9 +17128,11 @@ describe("turn survivor round 5 — run setup", () => {
 		let seen: { state: string; sessionId: string | null } | undefined;
 		const loop = loopFor(store, record, {
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 				await store.updateTask(task.id, { cancelledAt: Date.now() });
 				await o.onSession?.("s1");
 				const cur = (await store.getTask(task.id))!;
+
 				seen = { state: cur.state, sessionId: cur.sessionId };
 				return answeredRun();
 			},
@@ -17074,8 +17168,10 @@ describe("turn survivor round 5 — run setup", () => {
 		let seen: { stage: string; state: string } | undefined;
 		const loop = loopFor(store, record, {
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+
 				await o.onSession?.("s1");
 				const cur = (await store.getTask(task.id))!;
+
 				seen = { stage: cur.stage, state: cur.state };
 				return answeredRun();
 			},
@@ -17142,10 +17238,12 @@ describe("turn survivor round 5 — run setup", () => {
 			pendingImages: ["a", "b"],
 		});
 		const loop = loopFor(store, record, {
+
 			holdFollowUps: true,
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await o.onSession?.("s1");
 				await store.updateTask(task.id, {
+
 					pendingPrompt: "one\n\ntwo",
 					pendingImages: ["a", "c"],
 				});
@@ -17314,8 +17412,10 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	test("a killed run that no stop request owns leaves the card as the cancel wrote it", async () => {
 		const record = baseRecord();
 		const held = Promise.withResolvers<RunResult>();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -17342,8 +17442,10 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	test("a cancel that lands during a stop owns the card", async () => {
 		const record = baseRecord();
 		const held = Promise.withResolvers<RunResult>();
+
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -17799,11 +17901,13 @@ describe("turn survivor round 5 — run result and merge push", () => {
 describe("turn survivor round 5 — classify wiring", () => {
 	/** startRun override resolving every run with `p` (session announced unless p says otherwise). */
 	const runWith =
+
 		(
 			record: Recorded,
 			p: Partial<RunResult>,
 			during?: () => unknown | Promise<unknown>,
 		) =>
+
 		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
 			if (p.sessionId !== null) await o.onSession?.("sess-1");
@@ -18047,7 +18151,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "needs_you", summary: "hold", dependsOn: deps },
 				})(o),
@@ -18074,9 +18178,11 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await store.updateTask(taskId, { dependsOn: [depId, depId] });
 				return runWith(record, {
+
 					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
 				})(o);
 			},
@@ -18096,7 +18202,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			isIntegrated: async () => false,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "ready", summary: "done", dependsOn: [depId] },
 				})(o),
@@ -18121,7 +18227,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(
 					record,
 					{
@@ -18152,7 +18258,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
 					asked: [
@@ -18261,11 +18367,13 @@ describe("turn survivor round 5 — run finish", () => {
 	// A startRun fake that resolves `done` with `r`; `during` runs while the agent is live
 	// (a mid-run steer lands there, as POST /steer does).
 	const runReturning =
+
 		(
 			record: Recorded,
 			r: Partial<RunResult>,
 			during?: () => unknown | Promise<unknown>,
 		) =>
+
 		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
 			await o.onSession?.("sess-1");
@@ -18769,7 +18877,9 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		const checkRuns: StartOpts[] = [];
 		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
+
 			holdFollowUps: true,
+
 			startRun: async (o: StartOpts) => {
 				record.runs.push(o);
 				await o.onSession?.("sess");
@@ -19348,7 +19458,9 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 	test("a work card that ends needs_you gets no check", async () => {
 		const record = baseRecord();
+
 		const { store, loop } = await checkCase([verdict({})], {
+
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -19947,7 +20059,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		const { store, record, loop } = await setup({
 			holdFollowUps: true, // keep the finally's schedule() from starting the merge turn
 			// No onSession call: the card never left preparing while the run went on.
-			startRun: (o: StartArgs) => {
+			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
 				return {
 					pid: 4242,
@@ -20082,7 +20194,9 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 
 	test("a run whose done rejects frees its slot: the requeued card runs again", async () => {
 		let calls = 0;
+
 		const { store, record, loop } = await setup({
+
 			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -20521,7 +20635,7 @@ describe("per-runner drain gates (OTTR-454)", () => {
 		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				// A local run (merge, board check) carries no url: the entry counts local.
 				if (o.worker == null)
 					return {
@@ -20644,7 +20758,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => ({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => ({
 				pid: 4242,
 				// The dispatch record the settle reads the runner from; the reason text
 				// itself carries no dispatch token to parse.
@@ -20673,7 +20787,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => ({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => ({
 				pid: 4242,
 				url: o.worker?.urls[0],
 				done: Promise.resolve(runResult({ exitCode: 1 })),
@@ -25177,7 +25291,9 @@ describe("stored review findings", () => {
 		const checkRuns: StartOpts[] = [];
 		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
+
 			holdFollowUps: true,
+
 			startRun: async (o: StartOpts) => {
 				let done: Promise<RunResult>;
 				if (o.maxTime) {
