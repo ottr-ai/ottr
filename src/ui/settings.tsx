@@ -1536,7 +1536,7 @@ export function NotificationsSection({
 				>
 					<h4 id={`${uid}-muted`}>Muted projects</h4>
 					{mutesError && (
-						<p className="notify-hint">
+						<p className="notify-hint" role="status">
 							The project mute list could not be loaded, so the switches stay
 							off.{" "}
 							<button type="button" onClick={retryMutes}>

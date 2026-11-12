@@ -4175,7 +4175,10 @@ describe("NotificationsSection stale push recovery", () => {
 				expect(
 					probe.posts.filter((p) => p.url === "/api/notifications/prefs"),
 				).toEqual([]);
-				expect(probe.containerText()).toContain("could not be loaded");
+				// WCAG 4.1.3: the failure is error feedback, so the hint renders in
+				// a status region screen readers announce.
+				const hint = node.querySelector('p[role="status"]');
+				expect(hint?.textContent ?? "").toContain("could not be loaded");
 				const retry = [...node.querySelectorAll("button")].find(
 					(b) => b.textContent?.trim() === "Retry",
 				);
