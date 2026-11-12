@@ -13986,9 +13986,9 @@ export function AuthPage({
 							/>
 							<span className="hint" id={tokenHint}>
 								Serves the GitHub API features (PR reviews, CI watch,
-								Dependabot, releases, token expiry) and gh. Git on hosts other
-								than github.com needs its own token under Settings → Other git
-								hosts.
+								Dependabot, releases, token expiry) and gh, and git uses it on
+								the configured GitHub host when Settings → Other git hosts has
+								no token for that host.
 							</span>
 						</label>
 					)}

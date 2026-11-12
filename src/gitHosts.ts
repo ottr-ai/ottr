@@ -782,6 +782,9 @@ export function pushAuthKind(
 		key: boolean;
 		envToken: string | null;
 		githubHost: string;
+		/** Set only when the board token currently stands in for git on that host
+		 * (OTTR-875): the caller derives it from the same rule as the auth env. */
+		boardTokenHost?: string | null;
 	},
 ): string | null {
 	const remote = parseGitUrl(url);
@@ -795,6 +798,8 @@ export function pushAuthKind(
 			kinds.push(
 				`a board-stored token for ${t.host} (${gitTokenKind(t.token)})`,
 			);
+	if (o.boardTokenHost !== undefined && o.boardTokenHost === remote.hostKey)
+		kinds.push("the board GitHub token (no stored token for the host)");
 	if (o.ambientHelpers.length > 0)
 		kinds.push(
 			o.envToken !== null && remote.host === o.githubHost

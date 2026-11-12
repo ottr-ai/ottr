@@ -3261,11 +3261,13 @@ export function GitHostsSection({
 		);
 	};
 	// The proactive offer: the board token is set and the configured GitHub host is
-	// neither github.com nor carrying a git-host entry yet, so a first clone on that
-	// host would fail. On github.com the board token already serves git — the worker
-	// image pins its credential helper for https://github.com and gitAuthEnv adds the
-	// ambient helpers — so there is nothing to offer there. The offer names that one
-	// host only, and applying stays the user's explicit click.
+	// neither github.com nor carrying a git-host entry yet. Git on that host already
+	// falls back to the board token (OTTR-875), so the offer is a pin, not a fix: it
+	// stores the token for the host after a live test. On github.com the board token
+	// already serves git the same way — the image pins its credential helper for
+	// https://github.com and gitAuthEnv adds the ambient helpers — so there is nothing
+	// to offer there. The offer names that one host only, and applying stays the
+	// user's explicit click.
 	const boardTokenOffer =
 		state !== null &&
 		state.githubTokenSet === true &&
@@ -3480,17 +3482,24 @@ export function GitHostsSection({
 			{h !== null && <h4>{h ?? "Other host tokens"}</h4>}
 			<p className="hint">
 				HTTPS tokens for git hosts, one for each host. Ottr tests each token
-				with git ls-remote before it saves the token.
+				with git ls-remote before it saves the token.{" "}
+				{state?.githubHost != null &&
+					state.githubHost.toLowerCase() !== "github.com" && (
+						<>
+							Git on <code>{state.githubHost}</code> also uses the board GitHub
+							token when this list has no entry for that host; an entry here
+							wins.
+						</>
+					)}
 			</p>
 			{boardTokenOffer && state !== null && (
 				<div className="board-token-offer">
 					<p className="hint">
-						The board GitHub token serves the API and gh. Git on{" "}
-						<code>{state.githubHost}</code> needs its own entry here. Without
-						one, a first clone fails with a login prompt. Applying stores the
-						same token for git on <code>{state.githubHost}</code>. The token's
-						scopes must also grant repository read there. Ottr tests that with
-						git ls-remote before it saves.
+						The board GitHub token serves the API and gh, and git on{" "}
+						<code>{state.githubHost}</code> falls back to it while this list has
+						no entry for the host. Applying stores the token here and tests it
+						with git ls-remote first. The token's scopes must also grant
+						repository read there.
 					</p>
 					<form
 						className="settings-form"

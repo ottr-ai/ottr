@@ -3938,6 +3938,21 @@ export function createApp(deps: AppDeps) {
 				fetchImpl: githubAppFetch,
 			});
 	}
+	// OTTR-875: the board token also serves server-side git on the configured GitHub host
+	// when Settings → Other git hosts has no token for it, so a GitHub Enterprise board
+	// needs one token, not two. A stored token for the host wins, github.com keeps its
+	// GH_TOKEN helper path (the image pins that one), and no other host ever sees the
+	// token: gitAuthEnv scopes the helper to credential.https://<host>, so only a git
+	// call to that host reads it. Kept-unreadable stored rows are no credential, so the
+	// board token still covers the host when only those remain (ADR-0011).
+	function boardGitToken(): GitToken | null {
+		const h = githubHost();
+		if (h.isDefault || githubToken === null) return null;
+		if (gitTokens.some((t) => t.host === h.host && t.unreadable !== true))
+			return null;
+		const cand = parseGitToken({ host: h.host, token: githubToken });
+		return "error" in cand ? null : cand;
+	}
 	// D6: every network git call (clone/fetch/ls-remote/pull/push, merge turns included) picks
 	// up the auth of the project that owns cwd. Workers get none of these names: the runner
 	// strips them from the env it forwards (GIT_AUTH_ENV_RE in src/worktree.ts).
@@ -3952,10 +3967,14 @@ export function createApp(deps: AppDeps) {
 				break;
 			}
 		}
+		const board = boardGitToken();
 		return gitAuthEnv({
 			ambientHelpers,
 			// Kept-unreadable token rows stay out of the auth env (ADR-0011).
-			tokens: gitTokens.filter((t) => t.unreadable !== true),
+			tokens: [
+				...gitTokens.filter((t) => t.unreadable !== true),
+				...(board === null ? [] : [board]),
+			],
 			key,
 			knownHosts: paths.knownHosts,
 		});
@@ -5485,9 +5504,10 @@ export function createApp(deps: AppDeps) {
 		authEnv: Record<string, string>;
 		hostedSecrets: readonly string[];
 	}> {
+		const board = boardGitToken();
 		let authEnv = gitAuthEnv({
 			ambientHelpers,
-			tokens: gitTokens,
+			tokens: [...gitTokens, ...(board === null ? [] : [board])],
 			key,
 			knownHosts: paths.knownHosts,
 		});
@@ -11987,6 +12007,7 @@ export function createApp(deps: AppDeps) {
 					key: existsSync(sshPaths(sshDir).global),
 					envToken: process.env.GH_TOKEN ?? null,
 					githubHost: githubHost().host,
+					boardTokenHost: boardGitToken()?.host ?? null,
 				});
 			const remote = parseGitUrl(url);
 			if ("error" in remote) return null;

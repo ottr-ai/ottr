@@ -192,6 +192,8 @@ writeFileSync(
 		// No trailing slash on a prefix: git concatenates base + remainder verbatim, so the
 		// remainder must keep its leading "/" (the github entry above works the same way).
 		"\tinsteadOf = https://gitlab.com/g/sub",
+		`[url "file://${fixtureRepos}/ghe"]`,
+		"\tinsteadOf = https://bmw.ghe.com/o",
 		`[url "file://${fixtureRepos}/ex"]`,
 		"\tinsteadOf = https://git.example.com:8443/a/b/c",
 		`[url "file://${fixtureRepos}/scp"]`,
@@ -15221,6 +15223,101 @@ describe("git-host tokens", () => {
 			testUrl: "https://gitlab.com/g/sub/tokened",
 		});
 		expect(badToken.status).toBe(400);
+	});
+});
+
+describe("the board token serves git on the configured GitHub host", () => {
+	// gitAuthEnv carries its config as GIT_CONFIG_KEY_n/VALUE_n pairs; this reads one back.
+	const pairFor = (env: Record<string, string>, key: string): string | null => {
+		const n = Number(env.GIT_CONFIG_COUNT ?? "0");
+		for (let i = 0; i < n; i++)
+			if (env[`GIT_CONFIG_KEY_${i}`] === key)
+				return env[`GIT_CONFIG_VALUE_${i}`] ?? null;
+		return null;
+	};
+	const savedGH = process.env.GH_TOKEN;
+	const savedHost = process.env.OTTR_GITHUB_HOST;
+	afterAll(() => {
+		if (savedGH === undefined) delete process.env.GH_TOKEN;
+		else process.env.GH_TOKEN = savedGH;
+		if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = savedHost;
+	});
+	const BOARD = `ghp_${"w".repeat(36)}`;
+	const STORED = `ghp_${"s".repeat(36)}`;
+	// Live path: the token and host land through the real setup and settings routes,
+	// then the resolver that git() runs with answers through networkGitAuth. The host
+	// saves before the token exists, so the save probes no expiry endpoint.
+	const setup = async (m: {
+		call: (path: string, body?: unknown) => Promise<Response>;
+	}): Promise<void> => {
+		delete process.env.OTTR_GITHUB_HOST;
+		await m.call("/api/settings/github-host", { host: "bmw.ghe.com" });
+		await m.call("/api/setup", {
+			name: "ada",
+			password: "correct horse",
+			githubToken: BOARD,
+		});
+	};
+
+	test("git on the configured ghe host uses the board token when no stored token covers it", async () => {
+		const m = mount({ sshDir: join(root, "ssh-board-git") });
+		await setup(m);
+		const env = networkGitAuth(join(root, "board-git", ".worktrees", "w"));
+		// The helper answers only the configured host's URLs and its credential is the
+		// board token, under the x-access-token name GitHub hosts use.
+		const helper = pairFor(env, "credential.https://bmw.ghe.com.helper");
+		expect(helper).toContain('"$OTTR_GIT_TOKEN_0"');
+		expect(env.OTTR_GIT_TOKEN_0).toBe(BOARD);
+		expect(env.OTTR_GIT_USER_0).toBe("x-access-token");
+	});
+
+	test("a stored token for the host wins over the board token", async () => {
+		makeFixture("ghe/stored");
+		const m = mount({ sshDir: join(root, "ssh-board-wins") });
+		await setup(m);
+		// Saved through the real route, so it passed the live ls-remote on its host.
+		const save = await m.call("/api/git-hosts/tokens", {
+			host: "bmw.ghe.com",
+			token: STORED,
+			testUrl: "https://bmw.ghe.com/o/stored",
+		});
+		expect(save.status).toBe(200);
+		const env = networkGitAuth(join(root, "board-wins", ".worktrees", "w"));
+		const helper = pairFor(env, "credential.https://bmw.ghe.com.helper");
+		expect(helper).toContain('"$OTTR_GIT_TOKEN_0"');
+		expect(env.OTTR_GIT_TOKEN_0).toBe(STORED);
+		for (const [k, v] of Object.entries(env))
+			if (k.startsWith("OTTR_GIT_TOKEN_")) expect(v).not.toBe(BOARD);
+	});
+
+	test("git to another host carries no board token", async () => {
+		const m = mount({ sshDir: join(root, "ssh-board-other") });
+		await setup(m);
+		const env = networkGitAuth(join(root, "board-other", ".worktrees", "w"));
+		// No Ottr helper for a host that is neither the configured GitHub host nor the
+		// image's pinned github.com: gitlab.com never sees the board token.
+		expect(pairFor(env, "credential.https://gitlab.com.helper")).toBeNull();
+		expect(
+			pairFor(env, "credential.https://bmw.ghe.com.helper"),
+		).not.toBeNull();
+		// The board token appears exactly once, as that helper's credential.
+		const carrying = Object.entries(env).filter(
+			([k, v]) => k.startsWith("OTTR_GIT_TOKEN_") && v === BOARD,
+		);
+		expect(carrying).toEqual([["OTTR_GIT_TOKEN_0", BOARD]]);
+	});
+
+	test("an unset host keeps the GH_TOKEN helper path and stores no board-token helper", async () => {
+		delete process.env.OTTR_GITHUB_HOST;
+		const m = mount({ sshDir: join(root, "ssh-board-default") });
+		await m.call("/api/setup", {
+			name: "ada",
+			password: "correct horse",
+			githubToken: BOARD,
+		});
+		const env = networkGitAuth(join(root, "board-default", ".worktrees", "w"));
+		expect(env.OTTR_GIT_TOKEN_0).toBeUndefined();
 	});
 });
 

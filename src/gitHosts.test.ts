@@ -719,6 +719,48 @@ describe("pushAuthKind", () => {
 		expect(pushAuthKind("/tmp/origin.git", base)).toBeNull();
 		expect(pushAuthKind("/tmp/origin.git", { ...base, key: true })).toBeNull();
 	});
+
+	test("the board-token fallback names the host it covers, only there", () => {
+		// OTTR-875: git on the configured host carries the board token when no stored
+		// token does; the caller derives the host with the same rule as the auth env.
+		expect(
+			pushAuthKind("https://acme.ghe.com/o/r.git", {
+				...base,
+				envToken: "ghp_aaaa0000aaaa0000",
+				boardTokenHost: "acme.ghe.com",
+			}),
+		).toBe("the board GitHub token (no stored token for the host)");
+		// Another host never claims it.
+		expect(
+			pushAuthKind("https://gitlab.com/o/r.git", {
+				...base,
+				envToken: "ghp_aaaa0000aaaa0000",
+				boardTokenHost: "acme.ghe.com",
+			}),
+		).toBe("no credential the board knows of");
+		// A stored token for the host outranks it, so the caller passes no fallback host.
+		expect(
+			pushAuthKind("https://acme.ghe.com/o/r.git", {
+				...base,
+				tokens: [
+					{
+						host: "acme.ghe.com",
+						username: "x-access-token",
+						token: "ghp_bbbb0000bbbb0000",
+					},
+				],
+				boardTokenHost: null,
+			}),
+		).toBe("a board-stored token for acme.ghe.com (personal access token)");
+		// An ssh remote names the key alone, never the board token.
+		expect(
+			pushAuthKind("git@acme.ghe.com:o/r.git", {
+				...base,
+				key: true,
+				boardTokenHost: "acme.ghe.com",
+			}),
+		).toBe("the server's ssh key");
+	});
 });
 
 describe("defaultSshDir", () => {
