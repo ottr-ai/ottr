@@ -1229,3 +1229,91 @@ describe("git host secrets in tool results", () => {
 		}
 	});
 });
+
+// OTTR-863: omp's eval kernel mints nested `tool.<name>` call ids `js-<name>-<uuid>`.
+// The runner reads board tools only from direct tool_execution events, so an eval call's
+// success text would be a false success the board never sees. Each event-riding board tool
+// refuses the nested call; tools with real side effects (create_task, rename, the trending
+// POSTs) keep working through eval.
+describe("board tools called through the eval kernel", () => {
+	const evalId = (name: string) => `js-${name}-${crypto.randomUUID()}`;
+
+	test("two eval propose_task calls and one eval report_outcome refuse; direct calls still record", async () => {
+		process.env.OTTR_REVIEW = "1";
+		const tools = await freshTools();
+		for (const prompt of ["First finding", "Second finding"])
+			expect(
+				text(
+					await tools.propose_task!.execute(evalId("propose_task"), {
+						prompt,
+						rank: 1,
+					}),
+				),
+			).toContain("Call propose_task directly, not through eval");
+		expect(
+			text(
+				await tools.report_outcome!.execute(evalId("report_outcome"), {
+					status: "ready",
+					summary: "s",
+				}),
+			),
+		).toContain("Call report_outcome directly, not through eval");
+		// Nothing was consumed by the refusals: the direct calls after them still record.
+		expect(
+			text(
+				await tools.propose_task!.execute("t1", { prompt: "Direct", rank: 2 }),
+			),
+		).toContain("Recorded");
+		currentSessionName = "Named before the direct report";
+		expect(
+			text(
+				await tools.report_outcome!.execute("t2", {
+					status: "ready",
+					summary: "s",
+				}),
+			),
+		).toBe("Outcome recorded: ready");
+	});
+
+	test("an eval ask refuses and spends no ask budget", async () => {
+		const tools = await freshTools();
+		expect(
+			text(
+				await tools.ask!.execute(evalId("ask"), {
+					questions: [{ question: "Q?", options: [{ label: "a" }] }],
+				}),
+			),
+		).toContain("Call ask directly, not through eval");
+		// The one-ask-per-turn budget is untouched: the direct ask still delivers.
+		expect(
+			text(
+				await tools.ask!.execute("t1", {
+					questions: [{ question: "Q?", options: [{ label: "a" }] }],
+				}),
+			),
+		).toContain("delivered to the tracker user");
+	});
+
+	test("a retro eval proposal records nothing and the direct proposal still lands", async () => {
+		process.env.OTTR_RETRO = "1";
+		const tools = await freshTools();
+		expect(
+			text(
+				await tools.propose_task!.execute(evalId("propose_task"), {
+					prompt: "Eval proposal",
+				}),
+			),
+		).toContain("Call propose_task directly, not through eval");
+		// The refusal spent no proposal: the direct call records, a second direct one hits the cap.
+		expect(
+			text(
+				await tools.propose_task!.execute("t1", { prompt: "Direct proposal" }),
+			),
+		).toContain("Recorded");
+		expect(
+			text(
+				await tools.propose_task!.execute("t2", { prompt: "Second direct" }),
+			),
+		).toContain("only one proposal is allowed");
+	});
+});

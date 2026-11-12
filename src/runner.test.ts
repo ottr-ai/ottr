@@ -1989,6 +1989,63 @@ describe("applyEvent", () => {
 		expect(t.recorded).toHaveLength(0);
 	});
 
+	// OTTR-863: omp emits only the outer `eval` tool events for an eval-kernel call;
+	// a nested `tool.propose_task`/`tool.report_outcome` ride no tool_execution events.
+	// The extension refuses those nested calls, so the run's stream shows the refusals
+	// in the eval result the agent reads, and the parser records nothing. The parser
+	// must never grow an eval-output text parse either: the cell output is agent text,
+	// and a quoted marker line would forge findings.
+	test("an eval call the extension refused records no findings and no outcome", () => {
+		const refusal = (name: string) =>
+			`Error: ${name} was called through the eval kernel (tool.${name}). Call ${name} directly, not through eval: the board reads direct tool calls only, so this call recorded nothing.`;
+		const evalCode =
+			'const a = await tool.propose_task({ prompt: "F1", rank: 1 });\n' +
+			'const b = await tool.propose_task({ prompt: "F2", rank: 2 });\n' +
+			'const c = await tool.report_outcome({ status: "ready", summary: "s" });';
+		const s = newEventState();
+		const end = {
+			type: "tool_execution_end",
+			toolName: "eval",
+			toolCallId: "call_eval1",
+			isError: false,
+			result: {
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify([
+							refusal("propose_task"),
+							refusal("propose_task"),
+							refusal("report_outcome"),
+						]),
+					},
+				],
+			},
+		};
+		feed(
+			s,
+			{
+				type: "tool_execution_start",
+				toolName: "eval",
+				toolCallId: "call_eval1",
+				args: { code: evalCode, language: "js" },
+			},
+			end,
+		);
+		expect(s.recorded).toHaveLength(0);
+		expect(s.proposed).toBeNull();
+		expect(s.outcome).toBeNull();
+		// The refusal reached the agent: the eval result text names the fix.
+		const resultText = (
+			end.result.content as { type: string; text: string }[]
+		)[0]!.text;
+		expect(resultText).toContain(
+			"Call propose_task directly, not through eval",
+		);
+		expect(resultText).toContain(
+			"Call report_outcome directly, not through eval",
+		);
+	});
+
 	test("a blank-project refusal drops the call; the retry without a project files on the own project", () => {
 		const s = newEventState();
 		feed(

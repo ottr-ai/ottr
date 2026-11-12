@@ -75,6 +75,20 @@ function textResult(text: string) {
 	return { content: [{ type: "text", text }], details: {} };
 }
 
+// omp's eval kernel mints a nested `tool.<name>` call its own id, `js-<name>-<uuid>`;
+// a direct tool call carries the provider's id (call_..., toolu_...). The runner reads
+// board tools only from direct tool_execution events: an eval call emits none, so its
+// success text would be a false success the board never sees (OTTR-836 recorded 119
+// review findings this way and the board stored none). Refuse the nested call instead.
+// The `js-` prefix is omp's own id format; scripts/eval-bridge-contract.ts fails
+// `bun run check` when the pinned omp stops minting it, so this guard cannot rot
+// silently at an omp bump.
+function evalBridgeRefusal(toolCallId: string, name: string): string | null {
+	return toolCallId.startsWith("js-")
+		? `Error: ${name} was called through the eval kernel (tool.${name}). Call ${name} directly, not through eval: the board reads direct tool calls only, so this call recorded nothing.`
+		: null;
+}
+
 // Trimmed, non-empty dependsOn ids; non-string or blank entries are dropped.
 function parseDependsOn(params: CreateTaskParams): string[] {
 	return Array.isArray(params.dependsOn)
@@ -581,7 +595,9 @@ export default function (pi: Pi) {
 		}),
 		loadMode: "essential",
 		approval: "read",
-		async execute(_toolCallId: string, params: ReportParams) {
+		async execute(toolCallId: string, params: ReportParams) {
+			const bridge = evalBridgeRefusal(toolCallId, "report_outcome");
+			if (bridge !== null) return textResult(bridge);
 			await ensureNamedSession(pi);
 			reported = true;
 			return {
@@ -631,7 +647,9 @@ export default function (pi: Pi) {
 		}),
 		loadMode: "essential",
 		approval: "read",
-		async execute(_toolCallId: string, params: AskParams) {
+		async execute(toolCallId: string, params: AskParams) {
+			const bridge = evalBridgeRefusal(toolCallId, "ask");
+			if (bridge !== null) return textResult(bridge);
 			if (asked) {
 				return {
 					content: [
@@ -881,7 +899,9 @@ export default function (pi: Pi) {
 			),
 			loadMode: "essential",
 			approval: "read",
-			async execute(_toolCallId: string, params: CreateTaskParams) {
+			async execute(toolCallId: string, params: CreateTaskParams) {
+				const bridge = evalBridgeRefusal(toolCallId, "propose_task");
+				if (bridge !== null) return textResult(bridge);
 				if (retroMode && proposed) {
 					return textResult(
 						"Error: propose_task was already called in this retro; only one proposal is allowed.",
