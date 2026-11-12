@@ -20,6 +20,7 @@ function done(id: string, project: string, commits: number | null): Task {
 		prNumber: null,
 		prUrl: null,
 		prHeadSha: null,
+		prWatchAt: null,
 		sourcePrNumber: null,
 		sourcePrUrl: null,
 		sourcePrHeadRef: null,

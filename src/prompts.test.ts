@@ -978,6 +978,7 @@ describe("handoffMarkdown research report", () => {
 		prNumber: null,
 		prUrl: null,
 		prHeadSha: null,
+		prWatchAt: null,
 		sourcePrNumber: null,
 		sourcePrUrl: null,
 		sourcePrHeadRef: null,

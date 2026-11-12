@@ -89,6 +89,7 @@ function retroTask(p: Partial<Task> = {}): Task {
 		prNumber: null,
 		prUrl: null,
 		prHeadSha: null,
+		prWatchAt: null,
 		sourcePrNumber: null,
 		sourcePrUrl: null,
 		sourcePrHeadRef: null,
