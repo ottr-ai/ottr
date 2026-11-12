@@ -118,9 +118,10 @@ written.
 
 ### Stranded merge safeguard (OTTR-860)
 
-The designed PR ship stores `merging`/`idle` and `prNumber` in one atomic
-write. A non-cancelled PR-mode card must not wait in `merging`/`idle`
-without a PR number. This state has no PR for the supervisor to watch.
+The PR ship records its PR number before normal settlement writes
+`merging`/`idle`. A non-cancelled PR-mode card must not wait in
+`merging`/`idle` without a PR number. This state has no PR for the
+supervisor to watch.
 
 - When kept-worktree hygiene reaches a non-cancelled `merging` card without
   `prNumber`, it parks the card at `needs_you` with a clear recovery reason.
@@ -138,6 +139,24 @@ Acceptance: restart and hygiene regression tests fail without the safeguards.
 After the fix, each affected card reads `merging`/`needs_you` with a recovery
 reason and retains its branch, worktree, and PR fields. Tests also prove that
 cancelled cards, non-PR projects, and valid idle PR cards keep their behavior.
+
+### Cancel during the PR ship (OTTR-842)
+
+The ship reads the current card from `ProjectStore` before each next outbound
+ship action and before each PR metadata write. It continues only when
+`cancelledAt` is null and the current state is `running` or `preparing`.
+The captured task does not grant permission to continue after an await.
+
+Cancel owns the card after either the cancelled/`idle` result or the
+cancel-kept `needs_you` result. The latter can clear `cancelledAt`, so that
+field alone does not prove that the turn still owns the card. The ship must
+not start a later push, PR request, source PR adoption, or PR-state write
+after cancel takes ownership. This also protects the kept reason and files.
+
+An already-started push or GitHub request can still finish. A later state
+read cannot undo that external action. The remote card-branch delete rules
+below stay unchanged, including the target-branch and source-PR-head
+exclusions and the cancel-kept exception.
 
 ### The second merge turn (OTTR-799)
 
@@ -439,6 +458,8 @@ server remains the only writer of origin.
   the PR, the card sits `merging`/`idle` with the PR link, is not pickable,
   and occupies no merge slot; a second card of the same project can merge in
   parallel.
+- A successful PR ship or source PR adoption ends its turn without a
+  cancellation error.
 - PR merged: card `done`, worktree removed, `pushSha` = the merge commit, a
   failed target CI after that files a follow-up card as today.
 - PR closed unmerged: card `in_progress`/`needs_you` with the reason, branch
@@ -451,6 +472,21 @@ server remains the only writer of origin.
   never picked; a source-PR card's second ship never opens a second PR.
 - A failed push or gh call parks `needs_you` with the output; a reply
   retries without opening a second PR.
+- Cancel during the PR ship: use `createTurnLoop().runTurn` and `.cancel`
+  with the real `ProjectStore` for these checks:
+  - Complete cancel while the integrated proof awaits, then release the
+    proof. No branch push or PR request starts, and no PR metadata changes.
+  - Complete cancel while the branch push awaits, then release the push.
+    No PR request starts, and no PR metadata changes, whether the push
+    succeeds or fails. The test does not claim to undo the push.
+  - Complete cancel while the PR request awaits, then release its success
+    or failure. The ship preserves the cancelled/`idle` card and its PR
+    metadata. The test does not claim to undo the GitHub request.
+  - Complete cancel while a source PR read, tree comparison, or source-head
+    push awaits. After that action returns, no later ship request or source
+    PR adoption occurs, and no PR metadata changes.
+  - Repeat with cancel-kept `needs_you`, where `cancelledAt` is null.
+    The ship preserves the state, kept reason, kept files, and PR metadata.
 - Open PR with `mergeable: false`: the card is `merging`/`needs_you` with
   the conflict reason. The PR fields, `pushSha`, the branch and the worktree
   stay unchanged, and the card log gets one line. A later window with the

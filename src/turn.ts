@@ -5978,6 +5978,16 @@ export function createTurnLoop(
 					}));
 	}
 
+	/** A cancel owns the card after an await, even when its kept path clears cancelledAt. */
+	function canShipPr(st: TurnSettle): boolean {
+		const task = st.store.getTask(st.id);
+		return (
+			task !== null &&
+			task.cancelledAt === null &&
+			(task.state === "running" || task.state === "preparing")
+		);
+	}
+
 	/** PR mode ships the card branch itself: the server pushes the branch and opens the
 	 * pull request, so nothing local is ever pushed to the target — the merge-hold
 	 * machinery and serverMergePush of the target must not run for these cards.
@@ -5990,6 +6000,7 @@ export function createTurnLoop(
 	 * opens a fresh one after a close, and the stored PR fields and pushSha pin
 	 * the new head. */
 	async function shipPrCard(st: TurnSettle): Promise<void> {
+		if (!canShipPr(st)) return;
 		const outcome = st.result.outcome;
 		if (outcome?.status !== "integrated") {
 			if (outcome === null)
@@ -6012,6 +6023,7 @@ export function createTurnLoop(
 		// its PR in the prompt's first line; adopt that PR instead of opening a
 		// duplicate one at ship time.
 		const legacy = await resolveLegacyDependabotPr(st);
+		if (!canShipPr(st)) return;
 		if (legacy.kind === "parked") return;
 		if (legacy.kind === "match") {
 			await shipSourcePrCard(st, legacy.n, legacy.src);
@@ -6044,6 +6056,7 @@ export function createTurnLoop(
 		n: number,
 		src: SourcePrRef,
 	): Promise<void> {
+		if (!canShipPr(st)) return;
 		const prBranch = st.task.branch ?? "";
 		const head = src.headSha;
 		if (head === null) {
@@ -6058,6 +6071,7 @@ export function createTurnLoop(
 		const tip = await ops
 			.targetSha(st.e.path, `refs/heads/${prBranch}`)
 			.catch(() => null);
+		if (!canShipPr(st)) return;
 		if (tip === null || prBranch === "") {
 			st.prNext = {
 				stage: "merging",
@@ -6068,6 +6082,7 @@ export function createTurnLoop(
 		}
 		const sameTree =
 			tip === head || ((await ops.treesEqual?.(st.e.path, head, tip)) ?? false);
+		if (!canShipPr(st)) return;
 		if (sameTree) {
 			adoptSourcePr(st, n, head, src.url);
 			return;
@@ -6077,6 +6092,7 @@ export function createTurnLoop(
 		const onHead = await ops
 			.targetContains(st.e.path, head, tip)
 			.catch(() => false);
+		if (!canShipPr(st)) return;
 		const pushable =
 			onHead && src.crossRepo !== true && src.dependabot !== true;
 		if (pushable) {
@@ -6097,6 +6113,7 @@ export function createTurnLoop(
 		| { kind: "parked" }
 		| { kind: "match"; n: number; src: SourcePrRef }
 	> {
+		if (!canShipPr(st)) return { kind: "parked" };
 		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
 		if (repo === null) return { kind: "none" };
 		const n = parseDependabotHeadLine(
@@ -6115,6 +6132,7 @@ export function createTurnLoop(
 		const fetchErr = await ops
 			.fetchPrHead(st.e.path, n, `${githubHost().webBase}/${repo}.git`)
 			.catch((err: unknown) => errmsg(err));
+		if (!canShipPr(st)) return { kind: "parked" };
 		if (fetchErr !== null) {
 			st.prNext = {
 				stage: "merging",
@@ -6126,6 +6144,7 @@ export function createTurnLoop(
 		const sha = await ops
 			.targetSha(st.e.path, `refs/ottr/pr/${n}`)
 			.catch(() => null);
+		if (!canShipPr(st)) return { kind: "parked" };
 		if (sha === null) {
 			st.prNext = {
 				stage: "merging",
@@ -6159,10 +6178,8 @@ export function createTurnLoop(
 		prHeadSha: string,
 		url: string | null,
 	): void {
+		if (!canShipPr(st)) return;
 		st.store.updateTask(st.id, {
-			stage: "merging",
-			state: "idle",
-			needsReason: null,
 			prNumber: n,
 			prUrl: url,
 			prHeadSha,
@@ -6184,6 +6201,7 @@ export function createTurnLoop(
 		prBranch: string,
 		tip: string,
 	): Promise<void> {
+		if (!canShipPr(st)) return;
 		const dst = src.headRef;
 		const pushBranch = ops.pushBranch;
 		if (pushBranch === undefined || dst === null) {
@@ -6203,6 +6221,7 @@ export function createTurnLoop(
 				error: errmsg(err),
 			}),
 		);
+		if (!canShipPr(st)) return;
 		if (pr.status !== "pushed") {
 			logPrPushFailure(st, dst, pr);
 			return;
@@ -6221,6 +6240,7 @@ export function createTurnLoop(
 		src: SourcePrRef,
 	): Promise<void> {
 		await commentSourcePr(st, n, src.dependabot);
+		if (!canShipPr(st)) return;
 		const dependabot = src.dependabot;
 		st.prNext = {
 			stage: "merging",
@@ -6241,19 +6261,23 @@ export function createTurnLoop(
 		const comment = ops.prComment;
 		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
 		if (comment === undefined || repo === null) return;
+		const gh =
+			ops.hosted !== undefined
+				? await hostedGh(st.e.path, st.header.settings.originUrl)
+				: undefined;
+		if (!canShipPr(st)) return;
 		const res = await comment({
 			repo,
 			number: n,
 			body: dependabot
 				? "@dependabot rebase"
 				: `The board's card for this pull request finished with fixes on branch \`${st.task.branch ?? "(gone)"}\`; they are not on this PR. Please carry them over by hand.`,
-			...(ops.hosted !== undefined && {
-				gh: await hostedGh(st.e.path, st.header.settings.originUrl),
-			}),
+			...(gh !== undefined && { gh }),
 		}).catch((err: unknown) => ({
 			ok: false as const,
 			error: errmsg(err),
 		}));
+		if (!canShipPr(st)) return;
 		if (!res.ok) st.log(`! commenting on source PR #${n} failed: ${res.error}`);
 	}
 
@@ -6268,6 +6292,7 @@ export function createTurnLoop(
 		const proof = await ops
 			.prIntegrated?.(st.e.path, st.loc.wt, st.header.target)
 			.catch(() => false);
+		if (!canShipPr(st)) return;
 		const prBranch = st.task.branch ?? "";
 		const tip =
 			proof === true
@@ -6275,6 +6300,7 @@ export function createTurnLoop(
 						.targetSha(st.e.path, `refs/heads/${prBranch}`)
 						.catch(() => null)
 				: null;
+		if (!canShipPr(st)) return;
 		if (proof !== true) {
 			// No ship: classify parks the integrated report as not-on-target.
 			return;
@@ -6310,12 +6336,14 @@ export function createTurnLoop(
 		// openPullRequest parked on a null origin before this call, so the pinned URL is set.
 		const originUrl = st.header.settings.originUrl;
 		if (originUrl === null) return;
+		if (!canShipPr(st)) return;
 		const pr = await pushBranch(st.e.path, prBranch, originUrl).catch(
 			(err: unknown) => ({
 				status: "failed" as const,
 				error: errmsg(err),
 			}),
 		);
+		if (!canShipPr(st)) return;
 		if (pr.status === "pushed") {
 			st.log(`- pushed ${prBranch} from the server`);
 		} else {
@@ -6370,6 +6398,11 @@ export function createTurnLoop(
 			return;
 		}
 		const slash = repo.indexOf("/");
+		const gh =
+			ops.hosted !== undefined
+				? await hostedGh(st.e.path, st.header.settings.originUrl)
+				: undefined;
+		if (!canShipPr(st)) return;
 		const opened = await openPr({
 			repo,
 			owner: repo.slice(0, slash),
@@ -6378,13 +6411,12 @@ export function createTurnLoop(
 			title: st.task.title,
 			body: prBody(st.task, st.result.outcome),
 			// Hosted: gh takes the project's minted token, never GH_TOKEN.
-			...(ops.hosted !== undefined && {
-				gh: await hostedGh(st.e.path, st.header.settings.originUrl),
-			}),
+			...(gh !== undefined && { gh }),
 		}).catch((err: unknown) => ({
 			ok: false as const,
 			error: errmsg(err),
 		}));
+		if (!canShipPr(st)) return;
 		if (!opened.ok) {
 			st.log(`! opening the pull request failed: ${opened.error}`);
 			st.prNext = {
@@ -6395,9 +6427,6 @@ export function createTurnLoop(
 			return;
 		}
 		st.store.updateTask(st.id, {
-			stage: "merging",
-			state: "idle",
-			needsReason: null,
 			prNumber: opened.pr.number,
 			prUrl: opened.pr.url,
 			prHeadSha: tip,

@@ -20416,6 +20416,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/12");
 		expect(after.prHeadSha).toBe("sha-tip");
 		expect(after.pushSha).toBe("sha-tip");
+		expect(store.listTurns(task.id)[0]!.error).toBeNull();
 		// The done write never ran: the worktree stays.
 		expect(record.removeWorktree).toHaveLength(0);
 		expect(logText(store, task.id)).toContain("- PR #12 opened (base main)");
@@ -20437,6 +20438,197 @@ describe("turn PR-mode merge settle", () => {
 			sourcePrDependabot: true,
 			...over,
 		};
+	}
+
+	for (const phase of [
+		"integration proof",
+		"branch-tip read",
+		"branch push",
+		"PR open",
+		"source branch-tip read",
+		"source tree read",
+		"source ancestor read",
+		"source branch push",
+		"legacy source head fetch",
+		"legacy source head read",
+	] as const) {
+		for (const result of ["success", "failure"] as const) {
+			const cancelModes =
+				phase === "integration proof" ||
+				phase === "branch push" ||
+				phase === "PR open" ||
+				phase === "source branch-tip read" ||
+				phase === "source branch push"
+					? (["removed", "kept"] as const)
+					: (["removed"] as const);
+			for (const cancelMode of cancelModes) {
+				test(`OTTR-842 ${cancelMode} cancel during ${phase} preserves state after ${result}`, async () => {
+					const gate = Promise.withResolvers<void>();
+					const reached = Promise.withResolvers<void>();
+					const effects: string[] = [];
+					const kept = cancelMode === "kept";
+					const failed = result === "failure";
+					const source = phase.startsWith("source ");
+					const legacy = phase.startsWith("legacy ");
+					const unsaved = "uncommitted changes to cancel.txt";
+					let cancelled = false;
+					let blocked = false;
+					const waitAt = async (at: typeof phase) => {
+						if (phase !== at || blocked) return;
+						blocked = true;
+						reached.resolve();
+						await gate.promise;
+					};
+					const { store, loop, task, e, record } = prMergeSetup({
+						prIntegrated: async () => {
+							await waitAt("integration proof");
+							return !(phase === "integration proof" && failed);
+						},
+						targetSha: async (_m, ref) => {
+							if (ref === "refs/ottr/pr/30") {
+								await waitAt("legacy source head read");
+								return phase === "legacy source head read" && failed
+									? null
+									: "pr-head";
+							}
+							if (ref !== "refs/heads/ott/m") return "sha-old";
+							await waitAt("branch-tip read");
+							await waitAt("source branch-tip read");
+							if (
+								failed &&
+								(phase === "branch-tip read" ||
+									phase === "source branch-tip read")
+							)
+								return null;
+							if (phase === "source branch-tip read" || legacy)
+								return "pr-head";
+							return source ? "sha-fixed" : "sha-tip";
+						},
+						treesEqual: async () => {
+							await waitAt("source tree read");
+							return phase === "source tree read" && !failed;
+						},
+						targetContains: async (_m, sha, tip) => {
+							if (sha !== "pr-head" || tip !== "sha-fixed") return false;
+							await waitAt("source ancestor read");
+							return !(phase === "source ancestor read" && failed);
+						},
+						pushBranch: async () => {
+							effects.push("push");
+							await waitAt("branch push");
+							await waitAt("source branch push");
+							return failed &&
+								(phase === "branch push" || phase === "source branch push")
+								? { status: "failed" as const, error: "push failed" }
+								: { status: "pushed" as const, output: "" };
+						},
+						openPr: async () => {
+							effects.push("open");
+							await waitAt("PR open");
+							return phase === "PR open" && failed
+								? { ok: false as const, error: "PR open failed" }
+								: {
+										ok: true as const,
+										pr: {
+											number: 12,
+											url: "https://github.com/acme/repo/pull/12",
+										},
+									};
+						},
+						fetchPrHead: async () => {
+							effects.push("fetch");
+							await waitAt("legacy source head fetch");
+							return phase === "legacy source head fetch" && failed
+								? "head fetch failed"
+								: null;
+						},
+						prComment: async () => {
+							effects.push("comment");
+							return { ok: true as const };
+						},
+						unsavedWork: async () => (cancelled && kept ? unsaved : null),
+						statusFiles: async () => (cancelled && kept ? ["cancel.txt"] : []),
+					});
+					e.target = "origin/main";
+					if (source)
+						store.updateTask(
+							task.id,
+							sourcePr({
+								sourcePrDependabot: false,
+								sourcePrHeadRef: "contrib/fix-branch",
+							}),
+						);
+					if (legacy)
+						store.updateTask(task.id, {
+							prompt: `${dependabotHead(30, "acme/repo")}: Bump vite`,
+						});
+					const before = store.getTask(task.id)!;
+					const expectedEffects = legacy
+						? ["fetch"]
+						: phase === "PR open"
+							? ["push", "open"]
+							: phase === "branch push" || phase === "source branch push"
+								? ["push"]
+								: [];
+					const turn = loop.runTurn(store.name, task.id);
+					try {
+						await Promise.race([
+							reached.promise,
+							turn.then(() => {
+								throw new Error(`Turn ended before ${phase}`);
+							}),
+						]);
+						expect(effects).toEqual(expectedEffects);
+						cancelled = true;
+						expect(await loop.cancel(e, task.id, false)).toEqual(
+							kept ? { kept: unsaved } : { removed: true },
+						);
+						const cancelState = store.getTask(task.id)!;
+						expect(cancelState.state).toBe(kept ? "needs_you" : "idle");
+						expect(cancelState.needsReason).toBe(
+							kept ? cancelKeptReason(unsaved) : null,
+						);
+						if (kept) {
+							expect(cancelState.cancelledAt).toBeNull();
+							expect(cancelState.keptFiles).toEqual(["cancel.txt"]);
+							expect(record.removeWorktree).toHaveLength(0);
+						} else {
+							expect(cancelState.cancelledAt).not.toBeNull();
+							expect(record.removeWorktree).toHaveLength(1);
+						}
+						gate.resolve();
+						await turn;
+						// The request at the gate may finish, but no later effect may start.
+						expect(effects).toEqual(expectedEffects);
+						const after = store.getTask(task.id)!;
+						expect(after).toMatchObject({
+							stage: cancelState.stage,
+							state: cancelState.state,
+							needsReason: cancelState.needsReason,
+							cancelledAt: cancelState.cancelledAt,
+							keptFiles: cancelState.keptFiles,
+							worktree: cancelState.worktree,
+							branch: cancelState.branch,
+							prNumber: before.prNumber,
+							prUrl: before.prUrl,
+							prHeadSha: before.prHeadSha,
+							pushSha: before.pushSha,
+							sourcePrNumber: before.sourcePrNumber,
+							sourcePrUrl: before.sourcePrUrl,
+							sourcePrHeadSha: before.sourcePrHeadSha,
+						});
+						const turns = store.listTurns(task.id);
+						expect(turns).toHaveLength(1);
+						expect(turns[0]!.endedAt).not.toBeNull();
+						expect(turns[0]!.error).toBe("cancelled");
+					} finally {
+						reached.resolve();
+						gate.resolve();
+						await turn;
+					}
+				});
+			}
+		}
 	}
 
 	test("a clean Dependabot bump adopts its PR: no second PR opens (OTTR-760)", async () => {
@@ -20464,6 +20656,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prHeadSha).toBe("pr-head");
 		// The PR's CI runs on a head its author can rebase; the board watches the PR.
 		expect(after.pushSha).toBe(null);
+		expect(store.listTurns(task.id)[0]!.error).toBeNull();
 		expect(logText(store, task.id)).toContain(
 			"- source PR #20 stays the card's PR",
 		);
