@@ -4261,7 +4261,7 @@ describe("Drawer approve button", () => {
 		expect(html).toContain('type="submit" class="primary"');
 	});
 
-	test("a done PR-review card keeps Post review primary; Follow up drops to grey", () => {
+	test("a done PR-review card keeps Post review the one primary beside the Follow up row", () => {
 		const task = cardFixture({
 			...drawerFields,
 			kind: "pr_review",
@@ -4283,21 +4283,27 @@ describe("Drawer approve button", () => {
 		expect(html).toContain("Post review");
 		expect(html).toContain("Follow up");
 		expect(visiblePrimaries(html)).toHaveLength(1);
-		expect(html).toContain('<div class="followup-cta"><button type="button">');
+		expect(html).toContain(
+			'<div class="followup-cta"><button type="button" class="followup-row">',
+		);
 	});
 
-	test("a done research card keeps Follow up as the one primary", () => {
+	test("a done card offers Follow up as the next-step row with its hint, no filled button", () => {
 		const task = cardFixture({
 			...drawerFields,
 			stage: "done",
 			state: "idle",
 		});
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
-		expect(html).toContain("Follow up");
-		expect(visiblePrimaries(html)).toHaveLength(1);
-		expect(html).toContain(
-			'<div class="followup-cta"><button type="button" class="primary">',
+		const cta = html.slice(html.indexOf('class="followup-cta"'));
+		expect(cta).toMatch(
+			/^class="followup-cta"><button type="button" class="followup-row">/,
 		);
+		expect(cta).toContain("<b>Follow up</b>");
+		expect(cta).toContain(
+			"<small>Creates a new task that continues this one with a full handoff.</small>",
+		);
+		expect(visiblePrimaries(html)).toHaveLength(0);
 	});
 
 	test("a needs-you card without a parked hold renders none", () => {
@@ -5373,7 +5379,6 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		);
 		expect(html).toContain('id="pr-review-text"');
 		expect(html).not.toContain('id="drawer-reply"');
-		expect(html).not.toContain("Go to reply");
 		expect(html).not.toContain("New session");
 		// The Post button is the one primary; closed compose dialogs do not count.
 		const visible = html.replace(
@@ -7316,6 +7321,8 @@ describe("Drawer proposal decision panel", () => {
 			<Drawer {...base} task={task} tasks={[source]} />,
 		);
 		expect(html).toContain('id="drawer-decide"');
+		// Always open, no section head: nothing can fold the decision away.
+		expect(html).not.toContain('aria-controls="drawer-decide"');
 		expect(html).toContain("<dt>What changes</dt>");
 		expect(html).toContain("<dt>Why</dt>");
 		expect(html).toContain("<dt>Gain</dt>");
@@ -7367,7 +7374,16 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain('title="Edit the task text"');
 		expect(html).not.toContain("Decline this proposal");
 		// The full prompt sits collapsed under a visible summary.
-		expect(html).toContain("<summary>Full prompt</summary>");
+		expect(html).toMatch(
+			/<summary><svg class="chev"[\s\S]*?<\/svg>Full prompt<\/summary>/,
+		);
+		// One decision card: the body (reason, summary, full prompt) first, then the footer
+		// with Accept and Edit, so the buttons close the decision instead of splitting it.
+		const card = html.slice(html.indexOf('class="decide-card"'));
+		expect(card.indexOf('class="decide-body"')).toBeGreaterThan(-1);
+		expect(card.indexOf('class="decide-actions"')).toBeGreaterThan(
+			card.indexOf("Full prompt</summary>"),
+		);
 		// The panel replaces the standalone prompt section and the needs-reason box.
 		expect(html).not.toContain('id="drawer-prompt"');
 		expect(html).not.toContain('class="needs-reason"');
@@ -7375,6 +7391,14 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).toContain(">Accept</button>");
 		expect(html).toContain(">Edit</button>");
 		expect(html).toContain(">Cancel task</button>");
+		// All three decisions share the card's footer: Cancel task renders once, inside it,
+		// and the drawer's action row no longer carries it.
+		expect(html.split(">Cancel task</button>").length - 1).toBe(1);
+		const foot = html.slice(html.indexOf('class="decide-actions"'));
+		expect(foot.indexOf(">Cancel task</button>")).toBeLessThan(
+			foot.indexOf(">Accept</button>"),
+		);
+		expect(html).not.toContain("Go to reply");
 		// The two panel buttons carry no tabindex: keyboard order follows document order.
 		// The drawer dialog itself sets tabindex="-1" as its focus target, so scope to the
 		// buttons' own tags.
@@ -7399,6 +7423,25 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).not.toContain(">Decide</button>");
 		expect(html).toContain('class="needs-reason"');
 		expect(html).toContain('id="drawer-prompt"');
+		// A blocker keeps the head's amber "action required" with its triangle.
+		expect(html).toContain('class="st st-needs_you"');
+		expect(html).toContain("action required");
+	});
+
+	test("a proposal drawer reads as not started: grey head word, the lineage arrow, no alarm", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: reason,
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('<span class="st">not started</span>');
+		expect(html).not.toContain("st-needs_you");
+		expect(html).not.toContain("action required");
+		expect(html).not.toContain("mark-needs");
+		expect(html).not.toContain('class="needs-reason"');
+		expect(html).toMatch(/<div class="decide-reason"><svg class="icon-svg"/);
 	});
 
 	test("a proposal card in needs_you renders exactly one Accept button", () => {
@@ -7417,6 +7460,22 @@ describe("Drawer proposal decision panel", () => {
 		expect(html.match(/>Accept<\/button>/g) ?? []).toHaveLength(1);
 		// The composer itself stays: Reply keeps rendering under it.
 		expect(html).toContain('id="drawer-reply"');
+	});
+
+	test("the reply band starts folded: a reply field and a Reply head, the form not open", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "todo",
+			state: "needs_you",
+			needsReason: "hit a blocker",
+		});
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		const form = html.slice(html.indexOf('id="drawer-reply"'));
+		// Phones show only the field until a tap; the CSS keys off data-open.
+		expect(form).toMatch(/^id="drawer-reply" class="reply-form reply-fold">/);
+		expect(form).toContain('aria-label="Write a reply"');
+		expect(form).toContain("Reply to the agent…");
+		expect(form).toContain('class="reply-head" aria-expanded="false"');
 	});
 
 	test("a cancelled proposal hides the panel and keeps the composer's Accept", () => {
@@ -7450,7 +7509,7 @@ describe("Drawer proposal decision panel", () => {
 		expect(html).not.toContain('id="drawer-decide"');
 	});
 
-	test("a proposal card on the board shows the Decide chip; an ordinary needs_you card does not", () => {
+	test("a proposal card reads as a draft with a Decide chip; an ordinary needs_you card keeps the alarm", () => {
 		const laneBase = {
 			projectTasks: [] as TaskCard[],
 			groups: null,
@@ -7485,10 +7544,23 @@ describe("Drawer proposal decision panel", () => {
 		expect(withProposal).toContain(
 			'title="Accept, edit or cancel this proposal"',
 		);
+		// A suggestion, not a fault: the draft face, no amber error line, no needs triangle.
+		expect(withProposal).toContain("data-proposal");
+		expect(withProposal).toContain(
+			'<span class="proposal-chip">Proposal</span>',
+		);
+		expect(withProposal).toContain("· not started");
+		expect(withProposal).toContain('class="mark mark-queued"');
+		expect(withProposal).not.toContain("card-error");
+		expect(withProposal).not.toContain("mark-needs");
+		expect(withProposal).not.toContain("action required");
 		const withPlain = renderToStaticMarkup(
 			<LaneCol {...laneBase} stage="todo" tasks={[plain]} />,
 		);
 		expect(withPlain).not.toContain("decide-link");
+		expect(withPlain).not.toContain("data-proposal");
+		expect(withPlain).toContain('class="card-error"');
+		expect(withPlain).toContain("mark-needs");
 	});
 });
 

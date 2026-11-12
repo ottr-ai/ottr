@@ -247,7 +247,10 @@ button:active:not(
 	.menu-row,
 	.area-add,
 	.project-menu > button,
-	.model-trigger
+	.model-trigger,
+	.followup-row,
+	.reply-peek,
+	.reply-head
 ) {
 	transform: scale(0.97);
 }
@@ -3607,6 +3610,29 @@ a.pr-link:hover {
 .card[data-state="needs_you"][data-asked] .card-meta {
 	color: var(--accent);
 }
+/* A retro proposal is a suggestion, not a fault: it reads as a draft not started yet - a
+   dashed grey edge on the lane background, the grey ring, a PROPOSAL chip in the meta line.
+   The steel Decide chip is its only colour (One-Edge Rule). */
+.card[data-state="needs_you"][data-proposal] {
+	border-style: dashed;
+	border-color: var(--line-hover);
+	background: transparent;
+}
+.card[data-state="needs_you"][data-proposal] .card-meta {
+	color: var(--dim);
+}
+.card .proposal-chip {
+	flex-shrink: 0;
+	padding: 0 6px;
+	font-family: var(--mono);
+	font-size: 11.5px;
+	line-height: 18px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--text);
+	border: 1px solid var(--line);
+	border-radius: 3px;
+}
 /* Unseen answers reuse the ask accent: the answer waits for the operator. */
 .card[data-unread] {
 	border-color: var(--accent);
@@ -4131,9 +4157,6 @@ a.pr-link:hover {
 	flex: none;
 	padding: 2px 7px;
 	font-size: 12px;
-}
-.followup-cta > button {
-	flex: none; /* the label must not wrap at narrow drawer widths */
 }
 .perf-range button + button {
 	border-left: 1px solid var(--line-soft);
@@ -5986,8 +6009,7 @@ dialog.confirm-dialog {
 	min-width: 0;
 }
 .reply-form label,
-.prompt-field > label,
-.meta-block > summary {
+.prompt-field > label {
 	font-size: 12px;
 	font-weight: 600;
 	letter-spacing: 0.06em;
@@ -6295,9 +6317,6 @@ dialog.confirm-dialog {
 .wt-files .hint {
 	color: var(--dim);
 	font-size: 12px;
-}
-.followup-cta .hint {
-	margin: 0;
 }
 .role-notes .hint {
 	display: flex;
@@ -7117,7 +7136,6 @@ a.lineage-row:hover .lineage-title {
 button.diff-link,
 button.notif-link,
 button.diff-path,
-button.jump-link,
 a.notif-link {
 	padding: 0;
 	border: 0;
@@ -7128,9 +7146,6 @@ a.notif-link {
 	text-decoration: underline;
 	cursor: pointer;
 	overflow-wrap: anywhere;
-}
-.jump-reply {
-	margin: 0 0 8px;
 }
 button.diff-path {
 	font-family: var(--mono);
@@ -7171,8 +7186,7 @@ button.diff-path {
 .kept-actions {
 	margin-top: 10px;
 }
-.needs-reason,
-.decide-reason {
+.needs-reason {
 	display: flex;
 	gap: 8px;
 	margin: 8px 0;
@@ -7185,8 +7199,7 @@ button.diff-path {
 	/* Git errors carry the GitHub-API hint on a following line ("GitHub: …"); keep it under. */
 	white-space: pre-line;
 }
-.needs-reason::before,
-.decide-reason::before {
+.needs-reason::before {
 	content: "";
 	flex: none;
 	width: 13px;
@@ -7195,10 +7208,33 @@ button.diff-path {
 	background: var(--alarm);
 	clip-path: polygon(50% 0, 100% 100%, 0 100%);
 }
-/* The proposal card's decision panel: .decide-reason shares the amber box above; the five
-   summary rows sit in a compact two-column grid (labels dim, values bright, per the
-   values-read-first rule), stacking to one column under 720px so the panel fits without
-   scrolling at phone widths. */
+/* The proposal's decision is one recessed card: a dim byline (the reason, led by the
+   lineage arrow, never the amber triangle), the summary and the full prompt, then a
+   footer bar with Accept and Edit at the right, like a dialog's actions. */
+.decide-card {
+	margin: 8px 0 0;
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+}
+.decide-body {
+	padding: 4px 14px 12px;
+}
+.decide-reason {
+	display: flex;
+	gap: 8px;
+	margin: 8px 0 0;
+	font-size: 12.5px;
+	color: var(--dim);
+	overflow-wrap: anywhere;
+}
+.decide-reason > .icon-svg {
+	flex: none;
+	margin-top: 2px;
+}
+/* The proposal card's decision panel: the five summary rows sit in a compact two-column
+   grid (labels dim, values bright, per the values-read-first rule), stacking to one column
+   under 720px so the panel fits without scrolling at phone widths. */
 .decide-facts {
 	display: grid;
 	grid-template-columns: max-content minmax(0, 1fr);
@@ -7225,17 +7261,52 @@ button.diff-path {
 }
 .decide-actions {
 	display: flex;
+	justify-content: flex-end;
 	gap: 8px;
-	margin: 10px 0 0;
+	padding: 10px 14px;
+	border-top: 1px solid var(--line);
+}
+.decide-actions .primary {
+	min-width: 96px;
+}
+/* The decline sits apart at the left; Accept and Edit stay together at the right. */
+.decide-actions .danger {
+	margin-right: auto;
 }
 .decide-prompt {
 	margin: 10px 0 0;
 }
-.decide-prompt summary {
+/* Full prompt and Meta are native <details>; their summary takes the drawer section head's
+   look (.fu-head button): 12px semibold sentence case, the same chevron, 32px tall. */
+.decide-prompt > summary,
+.meta-block > summary {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-height: 32px;
+	font-size: 12px;
+	font-weight: 600;
 	color: var(--dim);
+	list-style: none;
 	cursor: pointer;
 }
-.decide-prompt summary:hover {
+:is(.decide-prompt, .meta-block) > summary::-webkit-details-marker {
+	display: none;
+}
+:is(.decide-prompt, .meta-block) > summary .chev {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.5;
+	flex-shrink: 0;
+	transition: transform 160ms var(--ease);
+}
+:is(.decide-prompt, .meta-block):not([open]) > summary .chev {
+	transform: rotate(-90deg);
+}
+.decide-prompt > summary:hover,
+.meta-block > summary:hover {
 	color: var(--text-strong);
 }
 .prompt-text {
@@ -7666,11 +7737,100 @@ button.log-mode[aria-pressed="true"] {
 	order: 3;
 	position: sticky;
 	bottom: 0;
+	/* Meta and the actions row come later in the DOM; without a stack level they paint
+	   over the docked band while they scroll under it. */
+	z-index: 1;
 	/* A short drawer pushes the band to the bottom edge (auto top margin); the 10px
 	   step above it comes from the meta and actions blocks' bottom margins. */
 	margin: auto -22px -26px;
 	padding: 12px 22px 18px;
 	background: var(--panel);
+}
+/* Reply fold: the docked band folds under a Reply head in the drawer section heads' look,
+   at every width. Folded, it is one reply field; a click opens the full composer. Phones
+   start folded so the report keeps the screen, desktop starts open (ReplyComposer). */
+.reply-peek,
+.reply-head {
+	display: none;
+}
+.drawer-body > .reply-fold:not([data-open]) {
+	gap: 0;
+	padding-top: 10px;
+	padding-bottom: 12px;
+}
+.drawer-body > .reply-fold:not([data-open]) > :not(.reply-peek) {
+	display: none;
+}
+.reply-fold:not([data-open]) > .reply-peek {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	width: 100%;
+	min-height: 40px;
+	padding: 0 14px 0 12px;
+	font: inherit;
+	color: var(--dim);
+	text-align: left;
+	background: var(--well);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	cursor: text;
+}
+.reply-peek > span {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+}
+.reply-peek > .icon-svg {
+	flex: none;
+	color: var(--accent);
+}
+.reply-fold[data-open] > .reply-head {
+	display: flex;
+	align-items: center;
+	justify-content: flex-start;
+	gap: 6px;
+	width: 100%;
+	min-height: 32px;
+	padding: 0;
+	font: inherit;
+	font-size: 12px;
+	font-weight: 600;
+	color: var(--dim);
+	background: none;
+	border: 0;
+	cursor: pointer;
+}
+.reply-head:hover {
+	color: var(--text-strong);
+}
+.reply-head .chev {
+	width: 12px;
+	height: 12px;
+	fill: none;
+	stroke: var(--dim);
+	stroke-width: 1.5;
+}
+/* The head names the field; the REPLY caption stays for screen readers only. */
+.reply-fold[data-open] .prompt-field > label {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+}
+/* Touch sizes: 44px field (16px type stops iOS zoom), 40px head. */
+@media (max-width: 720px) {
+	.reply-fold:not([data-open]) > .reply-peek {
+		min-height: 44px;
+		font-size: 16px;
+	}
+	.reply-fold[data-open] > .reply-head {
+		min-height: 40px;
+	}
 }
 /* Prompt card (Claude style), shared by the steer composer and the compose dialogs (New task,
    Add draft, Follow up): the field and one tool row share a recessed box, with + at the left and
@@ -7890,11 +8050,58 @@ button.log-mode[aria-pressed="true"] {
 	background: var(--card-hover);
 	border-color: var(--line-hover);
 }
+/* Follow up: one full-width row that reads as the next step - steel send icon and title,
+   the handoff hint under it, a chevron. No filled button, so it never competes with a
+   decision section's primary (One primary per surface). */
 .followup-cta {
+	margin-top: 22px;
+}
+.followup-cta > .followup-row {
 	display: flex;
 	align-items: center;
-	gap: 10px;
-	margin-top: 20px;
+	justify-content: flex-start;
+	gap: 12px;
+	width: 100%;
+	min-height: 56px;
+	padding: 10px 14px;
+	font: inherit;
+	text-align: left;
+	color: var(--text);
+	background: var(--card);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	cursor: pointer;
+}
+.followup-row:hover {
+	background: var(--card-hover);
+	border-color: var(--line-hover);
+}
+.followup-row > .icon-svg {
+	flex: none;
+	color: var(--accent);
+}
+.followup-row > .icon-svg:last-child {
+	color: var(--dim);
+}
+.followup-row > span {
+	display: grid;
+	gap: 1px;
+	flex: 1;
+	min-width: 0;
+}
+.followup-row b {
+	font-weight: 600;
+	color: var(--accent);
+}
+.followup-row small {
+	font-size: 12.5px;
+	color: var(--dim);
+}
+.followup-extra {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 8px;
 }
 .reply-actions {
 	display: flex;
@@ -7955,12 +8162,6 @@ button.log-mode[aria-pressed="true"] {
 .meta-block {
 	order: 1;
 	margin: 14px 0 10px;
-}
-.meta-block > summary {
-	cursor: pointer;
-}
-.meta-block > summary:hover {
-	color: var(--text-strong);
 }
 .meta-block[open] > summary {
 	margin-bottom: 8px;
@@ -8130,7 +8331,8 @@ button.log-mode[aria-pressed="true"] {
 	.ov td {
 		padding: 9px 10px;
 	}
-	button {
+	button,
+	:is(.decide-prompt, .meta-block) > summary {
 		min-height: 40px;
 	}
 	/* Inline value links stay text-sized inside KPI tiles and table cells. */

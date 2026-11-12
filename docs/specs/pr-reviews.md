@@ -72,7 +72,7 @@ A draft that nobody posted waits for the user, so the card must not hide in Done
   - A cancelled card or a row with no card stays as it is.
 - Callers: `savePrDraft` (in its transaction), a successful Post, the watcher after it writes `closed` or `merged`, and every watcher tick for every row of an enabled project. The tick call converges cards that an older build left in Done.
 - A failed Post keeps the card at `needs_you`.
-- The `needs_you` state raises the usual request alert. The drawer shows the PR section, not the generic reply form, the "Go to reply" link, or the restart-session button. The card does not show `needsReason` as an error.
+- The `needs_you` state raises the usual request alert. The drawer shows the PR section, not the generic reply form or the restart-session button. The card does not show `needsReason` as an error.
 
 ### Post
 

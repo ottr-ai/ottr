@@ -687,11 +687,24 @@ function cardDerived(task: TaskCard): {
 	return { sp, spLeft, silent, commits, held };
 }
 
-/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. */
+/** A retro proposal waiting for the operator's decision: not started, never an error. */
+function isProposalCard(
+	task: Pick<TaskCard, "state" | "cancelledAt" | "needsReason">,
+): boolean {
+	return (
+		task.state === "needs_you" &&
+		task.cancelledAt === null &&
+		isProposalReason(task.needsReason)
+	);
+}
+
+/** The card's top line: mark, id, unread/research/cancelled flags, main-loop model. A
+ *  proposal takes the grey queued ring: it waits like a card not started yet. */
 function cardHead(
 	task: TaskCard,
 	unread: boolean,
 	catalog: ModelCatalog | null,
+	proposal: boolean,
 ): ReactNode {
 	return (
 		<span className="card-head">
@@ -700,7 +713,7 @@ function cardHead(
 				// icon button toggles it, the card carries only the state.
 				<Mark kind="star" />
 			) : (
-				<Mark kind={cardMark(task)} />
+				<Mark kind={proposal ? "queued" : cardMark(task)} />
 			)}
 			<span className="card-key" title={`Task ${task.id}`}>
 				{task.id}
@@ -996,15 +1009,9 @@ function cardTags(
 }
 
 /** A proposal card's Decide chip beside the card tags: it opens the drawer, where the
- *  decision panel sits on top. Same click rules as the hold-link chips. */
+ *  decision panel sits on top. Same click rules as the hold-link chips. The caller renders
+ *  it only for a proposal card (isProposalCard). */
 function cardDecide(task: TaskCard, onOpen: (id: string) => void): ReactNode {
-	if (
-		task.state !== "needs_you" ||
-		task.cancelledAt !== null ||
-		!isProposalReason(task.needsReason)
-	) {
-		return null;
-	}
 	return (
 		<span className="card-tags">
 			<button
@@ -1073,6 +1080,7 @@ const Card = memo(function Card({
 	const catalog = useModels();
 	const release = releaseOf(task);
 	const { sp, spLeft, silent, commits, held } = cardDerived(task);
+	const proposal = isProposalCard(task);
 	return (
 		// A stretched link opens the card; the release link sits beside it, never nested in it.
 		// biome-ignore lint/a11y/noStaticElementInteractions: HTML5 drag-and-drop on the card shell; keyboard users act through the stretched link inside
@@ -1082,6 +1090,7 @@ const Card = memo(function Card({
 			data-task-id={task.id}
 			data-stage={task.stage}
 			data-cancelled={task.cancelledAt !== null ? "" : undefined}
+			data-proposal={proposal ? "" : undefined}
 			data-asked={
 				task.state === "needs_you" && task.asked !== null ? "" : undefined
 			}
@@ -1103,20 +1112,25 @@ const Card = memo(function Card({
 				}
 				onClick={(e) => navClick(e, () => onOpen(task.id))}
 			>
-				{cardHead(task, unread, catalog)}
+				{cardHead(task, unread, catalog, proposal)}
 				<span className="card-title">{task.sessionTitle ?? task.title}</span>
-				{cardErrorLine(task, silent)}
+				{/* A proposal is a suggestion, not a fault: its reason stays in the tooltip and the
+				    drawer's decision panel, never as the amber error line. */}
+				{!proposal && cardErrorLine(task, silent)}
 				{/* The two-way follow-up link names its parent on the card itself, like the
 				    drawer's "Follow-up of" chip; a bare glyph made the name hover-only. */}
 				{fuOf != null && (
 					<span className="card-fu" title={`Follow-up of ${fuOf}`}>
 						<Icon name="corner-up-left" size={12} />
-						<span className="card-fu-title">{fuOf}</span>
+						<span className="card-fu-title">
+							{proposal ? `From ${fuOf}` : fuOf}
+						</span>
 					</span>
 				)}
 				<span className="card-meta" title={cardMetaTitle(task)}>
+					{proposal && <span className="proposal-chip">Proposal</span>}
 					{cardMetaAge(task, sp, status)}{" "}
-					{cardMetaStatus(task, status, sp, held)}
+					{proposal ? "· not started" : cardMetaStatus(task, status, sp, held)}
 					{cardCommits(commits, delta)}
 				</span>
 				{cardHold(reRelease)}
@@ -1125,7 +1139,7 @@ const Card = memo(function Card({
 			{cardTags(task, github, release, holdRelease, onOpenTask, onRerelease)}
 			{/* A proposal card gets a Decide chip beside the card tags: it opens the drawer,
 			    where the decision panel sits on top. Same click rules as the hold-link chips. */}
-			{cardDecide(task, onOpen)}
+			{proposal && cardDecide(task, onOpen)}
 		</div>
 	);
 });
@@ -8442,6 +8456,13 @@ function KeptFilesPanel({
 	);
 }
 
+/** The drawer section heads' chevron: points down when open, right when collapsed (CSS). */
+const SEC_CHEV = (
+	<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+		<path d="M2 3l2 2 2-2" />
+	</svg>
+);
+
 /** Collapsible drawer section: the caps head is the toggle, the chevron mirrors the
  * Follow-ups head. `head` rides right of the label (Edit button, meters, downloads).
  * The body stays mounted and only `hidden` toggles, so its scroll and inputs survive. */
@@ -8469,9 +8490,7 @@ function DrawerSec({
 				aria-controls={id}
 				onClick={() => setOpen(!open)}
 			>
-				<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-					<path d="M2 3l2 2 2-2" />
-				</svg>
+				{SEC_CHEV}
 				{label}
 			</button>
 		</h3>
@@ -9312,6 +9331,7 @@ function ProposalPanel({
 	editSave,
 	onSaveEdit,
 	editConflict,
+	onCancel,
 }: {
 	task: TaskView;
 	selfProject: string;
@@ -9328,95 +9348,123 @@ function ProposalPanel({
 	editSave: BusyState;
 	onSaveEdit: () => void;
 	editConflict: TaskView | null;
+	/** Declines the proposal (the drawer's Cancel task, with its confirm). */
+	onCancel: () => Promise<boolean>;
 }) {
 	// Older proposals and partial fixtures carry no summary: undefined reads as the fallback.
 	const s = task.proposalSummary ?? null;
-	return (
-		<>
-			<div className="decide-reason">
-				<ProposalReasonLink
-					reason={task.needsReason ?? ""}
-					selfProject={selfProject}
-					tasks={tasks}
-					onOpenTask={onOpenTask}
-				/>
-			</div>
-			{s !== null ? (
-				<dl className="decide-facts">
-					<div>
-						<dt>What changes</dt>
-						<dd>{s.whatChanges}</dd>
-					</div>
-					<div>
-						<dt>Why</dt>
-						<dd>
-							<CardIdLinks
-								text={s.why}
-								selfProject={selfProject}
-								tasks={tasks}
-								onOpenTask={onOpenTask}
-							/>
-						</dd>
-					</div>
-					<div>
-						<dt>Gain</dt>
-						<dd>{s.gain}</dd>
-					</div>
-					<div>
-						<dt>Risk</dt>
-						<dd>{s.risk}</dd>
-					</div>
-					<div>
-						<dt>Check</dt>
-						<dd>{s.check}</dd>
-					</div>
-				</dl>
-			) : (
-				// First paragraph of the prompt, one line per row: the prompt's single-newline
-				// sections (Why:, Change:, …) keep their run-in labels readable.
-				<div className="decide-fallback">
-					{(task.prompt.split(/\n{2}/)[0] ?? "").split("\n").map((line) => (
-						<div key={line}>{line}</div>
-					))}
+	// A proposal is a suggestion, not a fault: a dim byline led by the lineage arrow,
+	// never the amber needs-reason box.
+	const reason = (
+		<div className="decide-reason">
+			<Icon name="corner-up-left" size={13} />
+			<ProposalReasonLink
+				reason={task.needsReason ?? ""}
+				selfProject={selfProject}
+				tasks={tasks}
+				onOpenTask={onOpenTask}
+			/>
+		</div>
+	);
+	const facts =
+		s !== null ? (
+			<dl className="decide-facts">
+				<div>
+					<dt>What changes</dt>
+					<dd>{s.whatChanges}</dd>
 				</div>
-			)}
-			<div className="decide-actions">
-				<BusyButton
-					className="primary"
-					title={editOpen ? editGuardTitle : "Start the proposed task"}
-					disabled={editOpen}
-					run={onAccept}
-				>
-					Accept
-				</BusyButton>
-				<button
-					type="button"
-					title={editOpen ? editGuardTitle : "Edit the task text"}
-					disabled={editOpen}
-					onClick={onEdit}
-				>
-					Edit
-				</button>
+				<div>
+					<dt>Why</dt>
+					<dd>
+						<CardIdLinks
+							text={s.why}
+							selfProject={selfProject}
+							tasks={tasks}
+							onOpenTask={onOpenTask}
+						/>
+					</dd>
+				</div>
+				<div>
+					<dt>Gain</dt>
+					<dd>{s.gain}</dd>
+				</div>
+				<div>
+					<dt>Risk</dt>
+					<dd>{s.risk}</dd>
+				</div>
+				<div>
+					<dt>Check</dt>
+					<dd>{s.check}</dd>
+				</div>
+			</dl>
+		) : (
+			// First paragraph of the prompt, one line per row: the prompt's single-newline
+			// sections (Why:, Change:, …) keep their run-in labels readable.
+			<div className="decide-fallback">
+				{(task.prompt.split(/\n{2}/)[0] ?? "").split("\n").map((line) => (
+					<div key={line}>{line}</div>
+				))}
 			</div>
-			{edit !== null ? (
-				<PromptEditForm
-					edit={edit}
-					onEdit={onEditChange}
-					editValid={editValid}
-					saveArmed={editSaveArmed}
-					editSave={editSave}
-					onSave={onSaveEdit}
-					conflict={editConflict}
-				/>
-			) : (
-				<details className="decide-prompt">
-					<summary>Full prompt</summary>
-					<div className="prompt-text">
-						<Markdown text={task.prompt} />
-					</div>
-				</details>
-			)}
-		</>
+		);
+	// The footer holds all three decisions: the decline (danger) apart at the left, the
+	// constructive pair at the right, the same grammar as the drawer's action row.
+	const actions = (
+		<div className="decide-actions">
+			<BusyButton className="danger" run={onCancel}>
+				<Icon name="x" />
+				Cancel task
+			</BusyButton>
+			<BusyButton
+				className="primary"
+				title={editOpen ? editGuardTitle : "Start the proposed task"}
+				disabled={editOpen}
+				run={onAccept}
+			>
+				Accept
+			</BusyButton>
+			<button
+				type="button"
+				title={editOpen ? editGuardTitle : "Edit the task text"}
+				disabled={editOpen}
+				onClick={onEdit}
+			>
+				Edit
+			</button>
+		</div>
+	);
+	const prompt =
+		edit !== null ? (
+			<PromptEditForm
+				edit={edit}
+				onEdit={onEditChange}
+				editValid={editValid}
+				saveArmed={editSaveArmed}
+				editSave={editSave}
+				onSave={onSaveEdit}
+				conflict={editConflict}
+			/>
+		) : (
+			<details className="decide-prompt">
+				<summary>
+					{SEC_CHEV}
+					Full prompt
+				</summary>
+				<div className="prompt-text">
+					<Markdown text={task.prompt} />
+				</div>
+			</details>
+		);
+	// One recessed card holds the whole decision: reason, summary and full prompt, then
+	// a footer bar with Accept and Edit at the right, like a dialog's actions.
+	return (
+		<div className="decide-card">
+			<div className="decide-body">
+				{reason}
+				{facts}
+				{prompt}
+			</div>
+			{actions}
+		</div>
 	);
 }
 
@@ -9589,22 +9637,29 @@ function DrawerHead(p: {
 						landed {stamp(task.doneAt)}
 					</span>
 				)}
-				{/* The stage label already says done; the status word only earns its place when it adds state. */}
-				{task.state !== "idle" && (
-					<span className={`st st-${task.state}${askedNow ? " st-asked" : ""}`}>
-						{/* Alarm coding rides in markup, not ::before: the drawer-sub
+				{/* The stage label already says done; the status word only earns its place when it adds state.
+				    A proposal is a suggestion, not a fault: it reads "not started" in grey, like its card. */}
+				{isProposalCard(task) ? (
+					<span className="st">not started</span>
+				) : (
+					task.state !== "idle" && (
+						<span
+							className={`st st-${task.state}${askedNow ? " st-asked" : ""}`}
+						>
+							{/* Alarm coding rides in markup, not ::before: the drawer-sub
 						    separator owns that pseudo-element. */}
-						{task.state === "needs_you" && <Mark kind={cardMark(task)} />}
-						{statusLine(
-							task,
-							project.hasRules,
-							// The list below names the cards; the meta line only counts them.
-							waiting.length > 0
-								? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
-								: holdFor(task, tasks),
-							draining,
-						)}
-					</span>
+							{task.state === "needs_you" && <Mark kind={cardMark(task)} />}
+							{statusLine(
+								task,
+								project.hasRules,
+								// The list below names the cards; the meta line only counts them.
+								waiting.length > 0
+									? `waiting for ${waiting.length === 1 ? "1 task" : `${waiting.length} tasks`}`
+									: holdFor(task, tasks),
+								draining,
+							)}
+						</span>
+					)
 				)}
 			</p>
 		</header>
@@ -9855,8 +9910,6 @@ function DrawerWaiting(p: {
 	askedNow: boolean;
 	proposal: boolean;
 	row: TaskCard;
-	followUp: boolean;
-	prReviewOpen: boolean;
 	project: ProjectView;
 	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
@@ -9872,8 +9925,6 @@ function DrawerWaiting(p: {
 		askedNow,
 		proposal,
 		row,
-		followUp,
-		prReviewOpen,
 	} = p;
 	return (
 		<>
@@ -9908,26 +9959,6 @@ function DrawerWaiting(p: {
 			{/* A parked merge hold approves by reply; the hold-actions bar at the end of the
 					    body pins the message's actions while the report scrolls. The server still
 					    gates the approval. */}
-			{/* A stopped card only interacts through the composer at the very bottom;
-					    the jump link skips the report so no manual scrolling is needed. */}
-			{task.state === "needs_you" &&
-				!askedNow &&
-				!followUp &&
-				!prReviewOpen && (
-					<p className="jump-reply">
-						<button
-							type="button"
-							className="jump-link"
-							onClick={() =>
-								document
-									.getElementById("drawer-reply")
-									?.scrollIntoView({ block: "start" })
-							}
-						>
-							Go to reply ↓
-						</button>
-					</p>
-				)}
 		</>
 	);
 }
@@ -11517,30 +11548,35 @@ function DrawerHoldBar(p: {
 	);
 }
 
-/** Drawer Composer section: extracted verbatim from the drawer body. */
-/** The follow-up call to action: Follow up, optional Implement steps, and the hint. */
+/** The follow-up call to action: one full-width row that reads as the next step (send
+ *  icon and title in steel, the handoff hint under it, a chevron), plus a research
+ *  report's Implement steps and No further steps under it. No filled button: the row
+ *  never competes with a decision section's primary. */
 function FollowUpCta(p: {
-	prReviewOpen: boolean;
 	task: TaskView;
 	setFollowOpen: (v: boolean) => void;
 	setStepsOpen: (v: boolean) => void;
 	onMarkSeen: () => void;
 }) {
-	const { prReviewOpen, task, setFollowOpen, setStepsOpen, onMarkSeen } = p;
+	const { task, setFollowOpen, setStepsOpen, onMarkSeen } = p;
 	return (
 		<div className="followup-cta">
-			{/* One primary per surface: the PR section's Post review outranks
-							    the generic Follow up, which renders stock grey beside it. */}
 			<button
 				type="button"
-				className={prReviewOpen ? undefined : "primary"}
+				className="followup-row"
 				onClick={() => setFollowOpen(true)}
 			>
 				<Icon name="send" />
-				Follow up
+				<span>
+					<b>Follow up</b>
+					<small>
+						Creates a new task that continues this one with a full handoff.
+					</small>
+				</span>
+				<Icon name="chevron-right" size={14} />
 			</button>
 			{task.research && researchSteps(task) === "yes" && (
-				<>
+				<div className="followup-extra">
 					<button
 						type="button"
 						title="Picks a model, then creates a follow-up task that implements the report's recommended steps"
@@ -11559,11 +11595,8 @@ function FollowUpCta(p: {
 						<Icon name="eye-off" />
 						No further steps
 					</BusyButton>
-				</>
+				</div>
 			)}
-			<p className="hint">
-				Creates a new task that continues this one with a full handoff.
-			</p>
 		</div>
 	);
 }
@@ -11619,21 +11652,68 @@ function ReplyComposer(p: {
 		act,
 		setViewing,
 	} = p;
+	// The docked band folds under a Reply head at every width. Phones start folded to one
+	// reply field, so the report keeps the screen; desktop starts open.
+	const [replyOpen, setReplyOpen] = useState(
+		() =>
+			typeof window !== "undefined" &&
+			!window.matchMedia("(max-width: 720px)").matches,
+	);
+	const formRef = useRef<HTMLFormElement | null>(null);
+	const openReply = (): void => {
+		setReplyOpen(true);
+		requestAnimationFrame(() =>
+			formRef.current?.querySelector("textarea")?.focus(),
+		);
+	};
+	// A sent reply folds the band again; a failed send keeps it open with the text.
+	const send = (): void =>
+		replySend.start(async () => {
+			const ok = await sendReply(reply, true);
+			if (ok) setReplyOpen(false);
+			return ok;
+		});
 	return (
 		<form
 			id="drawer-reply"
-			className="reply-form"
+			ref={formRef}
+			className="reply-form reply-fold"
+			data-open={replyOpen || undefined}
 			onSubmit={(e) => {
 				e.preventDefault();
-				replySend.start(() => sendReply(reply, true));
+				send();
 			}}
 		>
+			<button
+				type="button"
+				className="reply-peek"
+				aria-label="Write a reply"
+				onClick={openReply}
+			>
+				<span>{reply.trim() !== "" ? reply : "Reply to the agent…"}</span>
+				<Icon name="send" size={15} />
+			</button>
+			<button
+				type="button"
+				className="reply-head"
+				aria-expanded={replyOpen}
+				onClick={() => {
+					setReplyOpen(false);
+					// Focus lands on the field that reopens it, not on the page body.
+					requestAnimationFrame(() =>
+						formRef.current?.querySelector<HTMLElement>(".reply-peek")?.focus(),
+					);
+				}}
+			>
+				{SEC_CHEV}
+				Reply
+			</button>
 			<PromptInput
 				label="Reply"
 				value={reply}
 				placeholder="Yes, but keep the old route"
 				onChange={setReply}
-				onEnter={() => replySend.start(() => sendReply(reply, true))}
+				onEnter={send}
 				images={replyImages}
 				onView={(i) => {
 					const list = replyImages.images.map((im) => im.url);
@@ -11926,7 +12006,6 @@ function DrawerComposer(p: {
 			{" "}
 			{followUp ? (
 				<FollowUpCta
-					prReviewOpen={prReviewOpen}
 					task={task}
 					setFollowOpen={setFollowOpen}
 					setStepsOpen={setStepsOpen}
@@ -12005,6 +12084,8 @@ function DrawerActions(p: {
 	refileError: string | null;
 	rerunDone: boolean;
 	runCancel: () => Promise<boolean>;
+	/** A proposal's decision card carries Cancel task in its footer; the row drops it. */
+	cancelInPanel: boolean;
 }) {
 	const {
 		task,
@@ -12027,6 +12108,7 @@ function DrawerActions(p: {
 		refileError,
 		rerunDone,
 		runCancel,
+		cancelInPanel,
 	} = p;
 	return (
 		<>
@@ -12119,7 +12201,7 @@ function DrawerActions(p: {
 				)}
 				{/* A cancelled card is final: its drawer is read-only, so the delete
 						    action goes too (an uncancel does not exist). */}
-				{!cancelled && (
+				{!cancelled && !cancelInPanel && (
 					<BusyButton className="danger" run={runCancel}>
 						<Icon name={task.stage === "done" ? "trash" : "x"} />
 						{task.stage === "done" ? "Delete task" : "Cancel task"}
@@ -12189,7 +12271,10 @@ function DrawerMeta(p: {
 			{" "}
 			{/* The meta section is the drawer's last element: it sits below everything else. */}
 			<details className="meta-block">
-				<summary>Meta</summary>
+				<summary>
+					{SEC_CHEV}
+					Meta
+				</summary>
 				<dl className="meta">
 					{task.research && (
 						<div>
@@ -13522,10 +13607,11 @@ export function Drawer({
 						setIdCopyError={setIdCopyError}
 						setWfOpen={setWfOpen}
 					/>
-					{/* The decision panel leads the drawer body on a proposal card; the needs-reason
-					    box and the Prompt section below stay hidden because the panel carries both. */}
+					{/* The decision card leads the drawer body on a proposal card, always open and
+					    without a section head: it is the reason the drawer is open. The needs-reason
+					    box and the Prompt section below stay hidden because the card carries both. */}
 					{proposal && task.state === "needs_you" && !cancelled && (
-						<DrawerSec id="drawer-decide" label="Decide">
+						<section id="drawer-decide" className="dsec" aria-label="Decide">
 							<ProposalPanel
 								task={task}
 								selfProject={row.project}
@@ -13542,8 +13628,9 @@ export function Drawer({
 								editSave={editSave}
 								onSaveEdit={editSubmit}
 								editConflict={editConflict}
+								onCancel={runCancel}
 							/>
-						</DrawerSec>
+						</section>
 					)}
 					<DrawerMut mut={mut} />
 					<DrawerLineage
@@ -13569,8 +13656,6 @@ export function Drawer({
 						askedNow={askedNow}
 						proposal={proposal}
 						row={row}
-						followUp={followUp}
-						prReviewOpen={prReviewOpen}
 						project={project}
 						tasks={tasks}
 						onOpenTask={onOpenTask}
@@ -13732,6 +13817,7 @@ export function Drawer({
 						refileError={refileError}
 						rerunDone={rerunDone}
 						runCancel={runCancel}
+						cancelInPanel={proposal && task.state === "needs_you"}
 					/>
 					<DrawerMeta
 						task={task}
