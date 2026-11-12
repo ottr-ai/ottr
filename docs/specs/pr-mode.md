@@ -157,6 +157,24 @@ An already-started push or GitHub request can still finish. A later state
 read cannot undo that external action. The remote card-branch delete rules
 below stay unchanged, including the target-branch and source-PR-head
 exclusions and the cancel-kept exception.
+### Turn ownership during PR ship (OTTR-861)
+
+The initial ship, a re-ship and source-PR adoption keep turn ownership
+through `finishTurnRow`. The PR helpers store PR metadata without changing
+the card's stage, state or `needsReason`. Normal settle uses `st.prNext`
+and `writeSettledCard` to write `merging`/`idle`. The latest turn has
+`error: null` and `outcome: integrated`. The rest of settle stores the
+report summary and details.
+
+A real cancellation during asynchronous ship owns the card instead.
+This includes the cancel-kept path, which resets `cancelledAt` to null
+and sets state `needs_you`. That state must survive the ship result.
+The latest turn has `error: cancelled` and `outcome: null`.
+The success report must not overwrite the cancellation result.
+
+A failed push or PR-open call still parks the card at
+`merging`/`needs_you` with its error. These rules add no feature, schema,
+prompt, dependency or UI scope.
 
 ### The second merge turn (OTTR-799)
 
@@ -458,8 +476,16 @@ server remains the only writer of origin.
   the PR, the card sits `merging`/`idle` with the PR link, is not pickable,
   and occupies no merge slot; a second card of the same project can merge in
   parallel.
-- A successful PR ship or source PR adoption ends its turn without a
-  cancellation error.
+- Turn-settle tests cover successful initial ship, re-ship and source-PR
+  adoption. Each keeps ownership through `finishTurnRow`, then reaches
+  `merging`/`idle` through normal settle. The latest turn has `error: null`
+  and `outcome: integrated`. The card stores the report summary and details.
+- Cancellation tests cover a real cancel during asynchronous ship.
+  The latest turn has `error: cancelled` and `outcome: null`.
+  The success report does not overwrite the cancellation result.
+- The cancel-kept test covers `cancelledAt: null` and state `needs_you`
+  after cancellation. Both survive the ship result without a success
+  report overwrite.
 - PR merged: card `done`, worktree removed, `pushSha` = the merge commit, a
   failed target CI after that files a follow-up card as today.
 - PR closed unmerged: card `in_progress`/`needs_you` with the reason, branch
@@ -477,8 +503,8 @@ server remains the only writer of origin.
   A cleared watch after a give-up also resumes after the next successful
   ship pins a new tip. These checks use the turn loop, the supervisor and
   the same store.
-- A failed push or gh call parks `needs_you` with the output; a reply
-  retries without opening a second PR.
+- A failed push or PR-open call parks `merging`/`needs_you` with its error
+  output. A reply retries without opening a second PR.
 - Cancel during the PR ship: use `createTurnLoop().runTurn` and `.cancel`
   with the real `ProjectStore` for these checks:
   - Complete cancel while the integrated proof awaits, then release the

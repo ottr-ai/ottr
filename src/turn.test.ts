@@ -20370,6 +20370,8 @@ describe("turn PR-mode merge settle", () => {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
+			summary: "stale summary",
+			details: "stale details",
 		});
 		return { ...setup, e, task };
 	}
@@ -20421,13 +20423,67 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/12");
 		expect(after.prHeadSha).toBe("sha-tip");
 		expect(after.pushSha).toBe("sha-tip");
-		expect(store.listTurns(task.id)[0]!.error).toBeNull();
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: null,
+			outcome: "integrated",
+			summary: "rebased",
+			details: "gates green",
+		});
+		expect(after.summary).toBe("rebased");
+		expect(after.details).toBe("gates green");
 		// The done write never ran: the worktree stays.
 		expect(record.removeWorktree).toHaveLength(0);
 		expect(logText(store, task.id)).toContain("- PR #12 opened (base main)");
-		// The merge prompt used the PR variant.
-		expect(record.runs[0]!.prompt).toContain("opens the pull request");
-		expect(record.runs[0]!.prompt).not.toContain("git merge --ff-only");
+	});
+
+	test("a user cancel during asynchronous PR open keeps its state and report", async () => {
+		const gate = Promise.withResolvers<void>();
+		const reached = Promise.withResolvers<void>();
+		const { store, record, loop, e, task } = prMergeSetup({
+			unsavedWork: async () => "M src/kept.ts",
+			statusFiles: async () => ["src/kept.ts", "notes.txt"],
+			openPr: async () => {
+				reached.resolve();
+				await gate.promise;
+				return {
+					ok: true as const,
+					pr: { number: 12, url: "https://github.com/acme/repo/pull/12" },
+				};
+			},
+		});
+		const turn = loop.runTurn(store.name, task.id);
+		await reached.promise;
+		try {
+			expect(store.getTask(task.id)!.state).toBe("running");
+			await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
+				kept: "M src/kept.ts",
+			});
+			const cancelled = store.getTask(task.id)!;
+			expect(cancelled.cancelledAt).toBe(null);
+			expect(cancelled.state).toBe("needs_you");
+			expect(cancelled.needsReason).toBe(
+				"Cancel kept the worktree: M src/kept.ts",
+			);
+			expect(cancelled.keptFiles).toEqual(["src/kept.ts", "notes.txt"]);
+		} finally {
+			gate.resolve();
+			await turn;
+		}
+		const after = store.getTask(task.id)!;
+		expect(after.cancelledAt).toBe(null);
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe("Cancel kept the worktree: M src/kept.ts");
+		expect(after.keptFiles).toEqual(["src/kept.ts", "notes.txt"]);
+		expect(after.summary).toBe("stale summary");
+		expect(after.details).toBe("stale details");
+		expect(after.worktree).toBe("wt-m");
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: "cancelled",
+			outcome: null,
+		});
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(record.deletes).toHaveLength(0);
 	});
 
 	/** OTTR-760 source fields for a Dependabot PR #20; spread overrides per case. */
@@ -20661,7 +20717,14 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prHeadSha).toBe("pr-head");
 		// The PR's CI runs on a head its author can rebase; the board watches the PR.
 		expect(after.pushSha).toBe(null);
-		expect(store.listTurns(task.id)[0]!.error).toBeNull();
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: null,
+			outcome: "integrated",
+			summary: "rebased",
+			details: "gates green",
+		});
+		expect(after.summary).toBe("rebased");
+		expect(after.details).toBe("gates green");
 		expect(logText(store, task.id)).toContain(
 			"- source PR #20 stays the card's PR",
 		);
@@ -20888,6 +20951,14 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.state).toBe("idle");
 		expect(after.prNumber).toBe(20);
 		expect(after.prHeadSha).toBe("sha-fixed");
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: null,
+			outcome: "integrated",
+			summary: "rebased",
+			details: "gates green",
+		});
+		expect(after.summary).toBe("rebased");
+		expect(after.details).toBe("gates green");
 	});
 
 	test("a failed branch push parks merging/needs_you and never opens the PR", async () => {
@@ -20911,6 +20982,10 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prNumber).toBe(null);
 		expect(opened).toBe(false);
 		expect(logText(store, task.id)).toContain("git's full push output");
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: "Server push to origin failed: fatal: [REDACTED] denied",
+			outcome: "integrated",
+		});
 	});
 
 	test("a failed gh call parks merging/needs_you with the gh error", async () => {
@@ -20926,6 +21001,10 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("HTTP 422: Validation Failed");
 		expect(after.prNumber).toBe(null);
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: "Opening the pull request failed: HTTP 422: Validation Failed",
+			outcome: "integrated",
+		});
 	});
 
 	test("an unproven integration ships nothing and parks not-on-target", async () => {
@@ -20977,6 +21056,14 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prNumber).toBe(12);
 		expect(after.prHeadSha).toBe("sha-tip");
 		expect(after.pushSha).toBe("sha-tip");
+		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+			error: null,
+			outcome: "integrated",
+			summary: "rebased",
+			details: "gates green",
+		});
+		expect(after.summary).toBe("rebased");
+		expect(after.details).toBe("gates green");
 	});
 
 	test("OTTR-799: after a closed PR the second ship opens a fresh PR and stores the new number", async () => {
