@@ -57,11 +57,13 @@ import {
 	workCheckSendBack,
 } from "./prompts.ts";
 import { openPullRequest } from "./prs.ts";
+
 import {
 	hitUsageLimit,
 	startRun as realStartRun,
 	WORKER_LOST,
 } from "./runner.ts";
+
 import {
 	FINDINGS_HOLD,
 	isRetro,
@@ -77,8 +79,10 @@ import {
 	WORK_CHECK_ASK_DIVERGE,
 } from "./scheduler.ts";
 
+
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
+
 
 import fc from "./test/properties.ts";
 import { turnEnv } from "./tokens.ts";
@@ -126,7 +130,9 @@ import {
 	checkoutState as realCheckoutState,
 	cleanMergeTree as realCleanMergeTree,
 	fetchOriginBranch as realFetchOriginBranch,
+
 	fetchPrHead as realFetchPrHead,
+
 	prIntegrated as realPrIntegrated,
 	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
@@ -23289,9 +23295,11 @@ describe("turn PR-mode merge settle", () => {
 				const oldHead = run(main, "rev-parse", "HEAD");
 				const adoptCalls: string[][] = [];
 				let fixed = false;
+
 				const { store, record, loop, task, e, projects } = await prMergeSetup({
 					// Keep dispatch explicit: settle must not start the next turn.
 					holdFollowUps: true,
+
 					pushBranch: pushBranchReal,
 					prIntegrated: realPrIntegrated,
 					targetSha: async (path, ref) => run(path, "rev-parse", ref),
@@ -23315,7 +23323,9 @@ describe("turn PR-mode merge settle", () => {
 								};
 							},
 						}),
+
 					startRun: async (o) => {
+
 						record.runs.push(o);
 						if (!fixed) {
 							writeFileSync(join(main, "fix.txt"), "fix");
@@ -23323,14 +23333,18 @@ describe("turn PR-mode merge settle", () => {
 							run(main, ...id, "commit", "-qm", "CI fix");
 							fixed = true;
 						}
+
 						await o.onSession?.("sess-1");
+
 						return {
 							pid: 4242,
 							done: Promise.resolve(
 								runResult({
 									outcome: {
 										status:
+
 											(await store.getTask(task.id))!.stage === "in_progress"
+
 												? "ready"
 												: "integrated",
 										summary: "CI fix",
@@ -23342,9 +23356,11 @@ describe("turn PR-mode merge settle", () => {
 					},
 				});
 				e.path = main;
+
 				await store.setSettings({ originUrl: bare });
 				// Only the first ship is seeded. The next pin must come from settle.
 				await store.updateTask(task.id, {
+
 					state: "idle",
 					worktree: main,
 					prNumber: 12,
@@ -23384,7 +23400,9 @@ describe("turn PR-mode merge settle", () => {
 					worktreeHusk: async () => false,
 					worktreeLinked: async () => true,
 					branchMergedOrGone: async () => false,
+
 					quarantineUntracked: async () => ({ moved: [], refused: [] }),
+
 					targetSha: async (path, ref) => run(path, "rev-parse", ref),
 					fetchOriginBranch: async () => null,
 					fetchPrHead: async () => null,
@@ -23422,7 +23440,9 @@ describe("turn PR-mode merge settle", () => {
 					},
 				});
 				await supervisor.tick();
+
 				const cleared = (await store.getTask(task.id))!;
+
 				expect(cleared.pushSha).toBeNull();
 				expect(cleared.prNumber).toBe(12);
 				expect(cleared.prHeadSha).toBe(oldHead);
@@ -23450,6 +23470,7 @@ describe("turn PR-mode merge settle", () => {
 						: [["run", "view", "101", "--log-failed", "--repo", "acme/repo"]]),
 				]);
 				await supervisor.tick();
+
 				expect(await store.getTask(task.id)).toEqual(cleared);
 				expect(ciCalls).toEqual(firstCalls);
 				if (giveUp)
@@ -23460,6 +23481,7 @@ describe("turn PR-mode merge settle", () => {
 				else {
 					await loop.runTurn(store.name, task.id);
 					expect(await store.getTask(task.id)).toMatchObject({
+
 						stage: "merging",
 						state: "queued",
 						pushSha: null,
@@ -23474,7 +23496,9 @@ describe("turn PR-mode merge settle", () => {
 				expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
 					`${tip}\trefs/heads/ott/m`,
 				);
+
 				expect(await store.getTask(task.id)).toMatchObject({
+
 					stage: "merging",
 					state: "idle",
 					needsReason: null,
@@ -23497,7 +23521,9 @@ describe("turn PR-mode merge settle", () => {
 					html_url: "https://github.com/acme/repo/actions/runs/202",
 				};
 				await supervisor.tick();
+
 				const requeued = (await store.getTask(task.id))!;
+
 				expect(scheduled).toBe(initial === "failure" ? 2 : 1);
 				expect(requeued).toMatchObject({
 					stage: "in_progress",
@@ -23522,10 +23548,12 @@ describe("turn PR-mode merge settle", () => {
 				const replies = scheduled;
 				await supervisor.tick();
 				await supervisor.tick();
+
 				expect(await store.getTask(task.id)).toEqual(requeued);
 				expect(ciCalls).toEqual(callsAfterFailure);
 				expect(scheduled).toBe(replies);
 				expect((await store.listTasks()).map((t) => t.id)).toEqual([task.id]);
+
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}
@@ -25401,10 +25429,12 @@ describe("stored review findings", () => {
 			await store.updateTask(k.id, { stage: "done", state: "idle" });
 		projects.get(store.name)!.target = "origin/main";
 		await loop.schedule();
+
 		await eventually(
 			async () => (await store.getTask(review.id))?.stage === "done",
 		);
 		after = (await store.getTask(review.id))!;
+
 		expect(record.runs).toHaveLength(1); // the tick runs no agent
 		expect(checkRuns).toHaveLength(1);
 		expect(after.stage).toBe("done");
@@ -25418,7 +25448,9 @@ describe("stored review findings", () => {
 			state: "idle",
 			needsReason: FINDINGS_HOLD,
 		});
+
 		await store.appendReviewFinding(review.id, mkFinding("Bug C", 3));
+
 		await loop.schedule();
 		await flushPromises();
 		after = (await store.getTask(review.id))!;
@@ -25773,6 +25805,7 @@ describe("stored review findings", () => {
 		for (const k of deployKids)
 			expect(k.details).not.toContain("Waits for a validation sandbox");
 
+
 		// Exactly ONE question card for the two deployment-fact leads: one question
 		// per lead, each naming its lead card, with the two fixed answers.
 		const qKids = kids.filter((k) =>
@@ -25799,6 +25832,7 @@ describe("stored review findings", () => {
 			(a) => deployKids.find((k) => a.question.endsWith(`(card #${k.id})`))?.id,
 		);
 		expect(new Set(namedIds)).toEqual(new Set(deployKids.map((k) => k.id)));
+
 	});
 
 	test("a review whose leads all wait on a sandbox files no question card", async () => {
@@ -25889,11 +25923,13 @@ describe("stored review findings", () => {
 
 		// Findings implemented: the tick publishes and lands Done.
 		for (const k of kids)
+
 			await store.updateTask(k.id, { stage: "done", state: "idle" });
 		await loop.schedule();
 		await eventually(
 			async () => (await store.getTask(review.id))?.stage === "done",
 		);
+
 		expect(record.publishRelease).toHaveLength(1);
 		const done = (await store.getTask(review.id))!;
 		expect(done.stage).toBe("done");
