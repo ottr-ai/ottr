@@ -294,6 +294,9 @@ import {
 	findingsSettledAt,
 	isRetro,
 	isReview,
+	LEAD_APPLIES_OPTION,
+	LEAD_NOT_APPLY_OPTION,
+	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
 	liveCardOf,
 	mergeAnywayPatch,
@@ -362,6 +365,7 @@ import {
 	APPROVE_REPLY,
 	type AppCheck,
 	answeredCard,
+	askAnswerLine,
 	doneReadKey,
 	type ListedTask,
 	type OrphanProcess,
@@ -10032,6 +10036,80 @@ export function createApp(deps: AppDeps) {
 		deps.schedule();
 		return taskResponse(e, task.id);
 	}
+	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
+	 * `For "<question>": <answer>` line per question and each answer applies to that
+	 * question's lead card — "Yes, the risk applies" queues the lead with the answer in
+	 * its prompt, "No, it does not apply" cancels it with the answer as its reason, and
+	 * free text appends to its details so the lead stays in backlog. The question card
+	 * lands Done either way, so a second reply is refused. Null is a plain reply. */
+	function reviewLeadAskReply(
+		e: Entry,
+		task: Task,
+		text: string,
+	): Response | null {
+		if (
+			task.asked === null ||
+			!task.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)
+		)
+			return null;
+		const tasks = e.store.listTasks();
+		for (const q of task.asked) {
+			const marker = askAnswerLine(q.question, "");
+			const at = text.indexOf(marker);
+			// No answer line (or an empty answer) for this question: its lead stays as it is.
+			if (at === -1) continue;
+			const rest = text.slice(at + marker.length);
+			const stop = rest.indexOf('\nFor "');
+			const answer = (stop === -1 ? rest : rest.slice(0, stop)).trim();
+			if (answer === "") continue;
+			// The question text carries its lead card: `... (card #<lead id>)`.
+			const leadId = /\(card #([^)]+)\)$/.exec(q.question)?.[1];
+			const lead =
+				leadId === undefined
+					? undefined
+					: tasks.find(
+							(t) => t.id === leadId && t.followUpOf === task.followUpOf,
+						);
+			// A stale question (its lead was cancelled or done) applies nothing.
+			if (
+				lead === undefined ||
+				lead.cancelledAt !== null ||
+				lead.stage === "done"
+			)
+				continue;
+			if (answer === LEAD_APPLIES_OPTION) {
+				const cur = e.store.getTask(lead.id);
+				if (cur === null) continue;
+				e.store.updateTask(lead.id, {
+					stage: "todo",
+					state: "queued",
+					queuedAt: Date.now(),
+					prompt: `${cur.prompt}\n\nThe user answered the review's question: ${answer}`,
+				});
+			} else if (answer === LEAD_NOT_APPLY_OPTION) {
+				e.store.updateTask(lead.id, {
+					cancelledAt: Date.now(),
+					state: "idle",
+					needsReason: `Cancelled by the user's answer to the review's question: ${answer}`,
+				});
+			} else {
+				// Free text from the drawer's Other field: the lead stays in backlog.
+				const cur = e.store.getTask(lead.id);
+				if (cur === null) continue;
+				e.store.updateTask(lead.id, {
+					details: `${cur.details ?? ""}\n\nThe user answered the review's question: ${answer}`,
+				});
+			}
+		}
+		e.store.updateTask(task.id, {
+			stage: "done",
+			state: "idle",
+			asked: null,
+			needsReason: null,
+		});
+		deps.schedule();
+		return taskResponse(e, task.id);
+	}
 	/** The reply payload refusals: not needs-you, bad images, or text over the cap. */
 	function replyRefusal(
 		e: Entry,
@@ -10094,6 +10172,10 @@ export function createApp(deps: AppDeps) {
 			images.length > 0,
 		);
 		if (ask !== null) return ask;
+		// A review's lead-question card (OTTR-869): the reply carries one answer per
+		// question, each applied to its lead card, and the card lands Done here.
+		const leadAsk = reviewLeadAskReply(e, task, trimmed);
+		if (leadAsk !== null) return leadAsk;
 		const names =
 			images.length > 0
 				? saveImages(e.store.dataRoot, e.store.imagesDir(task.id), images)

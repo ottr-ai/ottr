@@ -63,26 +63,65 @@ which does the full Done bookkeeping — commits, mergeHead, uncommitted files,
 worktree removal. The post-check write keeps the planned stage and state and
 recomputes only the parked reason from the live cards.
 
-### 4. "Needs validation" findings file as backlog cards marked unverified
+### 4. "Needs validation" findings file as backlog cards sorted by their blocker
 
-The review prompt already tells the reviewer to start such findings' prompts with
-the tag `Needs validation`, rank them below confirmed findings, and leave
-security out. No prompt wording changes (hard stop 3 not triggered).
+A lead waits on one of two things: a deployment fact only the user knows, or a run
+of the target code in an OS-enforced sandbox this board does not have. The review
+prompt tells the reviewer to start lead prompts with the tag `Needs validation`,
+rank them below confirmed findings, leave security out, and end each lead prompt
+with exactly one blocker line:
 
-Code partitions the stored set by that prompt prefix:
+- `Blocker: deployment fact: <question>` — a fact only the user knows decides the
+  risk; the question asks for that fact.
+- `Blocker: sandbox run: <missing control>` — the proof waits on controls this
+  runner lacks; the text names the missing control.
+
+(The prompt wording is new in this change; its exact text ships in the ready report
+for the user's approval — hard stop 3.)
+
+Code partitions the stored set by the `Needs validation` prefix, then sorts leads
+with one strict pattern, `/^[^\S\n]*Blocker: (deployment fact|sandbox run): (.+)$/`
+per line, first match wins. A lead without a matching line counts as a sandbox-run
+lead.
 
 - Confirmed findings: `selectFindings` picks the cap-10 selection plus confirmed
   high/critical security findings, as today; the second model checks them; kept
   ones file as queued cards; below-cap ones stay logged, not filed.
-- Lead findings (prompt starts with `Needs validation`): they never enter the
-  selection or the cap. Each files immediately as a backlog card:
-  `createTask(prompt)`, then `updateTask` with `followUpOf` (the review),
-  `model`, `stage: "backlog"`, `state: "idle"`, `queuedAt: null` (the existing
-  backlog creators' shape), and a details note that marks the card unverified:
-  the second-model check did not run on it. The review card's Findings trail
-  lists them as filed backlog cards.
-- Leads do not hold the review's Done: `findingsHold` ignores linked children in
-  `backlog` stage (a lead is optional work, not a commitment).
+- Sandbox-run leads file as today: backlog card, `createTask(prompt)`, then
+  `updateTask` with `followUpOf` (the review), `model`, `stage: "backlog"`,
+  `state: "idle"`, `queuedAt: null` (the existing backlog creators' shape), and the
+  unverified details note plus ` Waits for a validation sandbox.`
+- Deployment-fact leads file the same backlog card, without the sandbox note. When
+  the pass filed at least one and the review has no open question card yet, the
+  review also files ONE question card: `createTask` with a prompt that starts with
+  the fixed prefix `Needs-validation lead questions from review #`, then
+  `updateTask` with `followUpOf` (the review), `stage: "backlog"`,
+  `state: "needs_you"`, `queuedAt: null`, and `asked` holding one question per
+  deployment-fact lead of this pass: question text `<question> (card #<lead id>)`,
+  options `Yes, the risk applies` and `No, it does not apply` (free text rides the
+  drawer's Other field), `multi: false`, `recommended: null`.
+- The question card holds nothing: `findingsOpen` ignores `backlog`-stage children,
+  so the review's Done never waits for the answer. A review whose leads are all
+  sandbox-run leads files no question card.
+
+The reply route applies the answers (`src/app.ts`). A reply to a card whose prompt
+starts with the question-card prefix and whose `asked` is set parses one answer per
+question from the drawer's wire line `For "<question>": <answer>` (shared helper
+`askAnswerLine`), applies it to the question's lead card, and lands the question
+card Done (`stage: "done"`, `state: "idle"`, `asked: null`, `doneAt` set):
+
+- `Yes, the risk applies`: the lead card moves to `stage: "todo"`, `state: "queued"`,
+  `queuedAt` set, and the answer appends to its prompt.
+- `No, it does not apply`: the lead card cancels (`cancelledAt` set,
+  `state: "idle"`) with the answer as its `needsReason`.
+- Any other text, an empty answer, or no answer line: the lead card stays in
+  backlog; non-empty free text appends to its details.
+- Answers only touch lead cards of the same review (`followUpOf` match) that are
+  still open (not cancelled, not done). The question card lands Done inside the
+  same reply, so a second reply is refused (409, not needs_you).
+
+No schema change: the question card reuses the existing `asked` column and its
+`AskQuestion` normalization.
 
 #### Lead fingerprint dedupe
 
@@ -204,12 +243,27 @@ before the run resolves.
    no new card, and that card's details gain `Seen again in review <id> on
    <date>.`; a cancelled match files nothing; a done match files a new card
    whose details name the old card; a lead without the line files as today.
+7. turn: a review with two deployment-fact leads and one sandbox-run lead files
+   three backlog cards and one question card with two questions; the sandbox
+   card's details say it waits for a validation sandbox; each question text ends
+   with its lead card's id.
+8. reply route: the answers "applies" and "does not apply" queue the first lead
+   card with the answer in its prompt and cancel the second with the answer as
+   its reason; the question card goes Done. Free text leaves the lead card in
+   backlog with the answer in its details.
+9. turn: a review with only sandbox-run leads (one without the blocker line)
+   files no question card.
 
 ## Non-goals
 
-- No UI changes (no `src/ui/**` edits; the Findings trail text update is card
-  data, not UI code).
-- No prompt wording changes (`src/prompts.ts` untouched).
+- No UI changes (no `src/ui/**` edits beyond the AskPanel's move onto the shared
+  `askAnswerLine` wire-format helper, which keeps its output byte-identical; the
+  Findings trail text update is card data, not UI code).
+- The review prompt gains the blocker-line sentence; its wording ships in the
+  ready report for approval (hard stop 3).
+- No validation sandbox; sandbox-run leads keep waiting for one.
+- No change to leads that already exist, and no fingerprint duplicate rule (a
+  separate card owns dedupe of open lead cards).
 - No recovery of findings lost before this change; no parsing of omp session
   files.
 - No unverified marker column or UI badge; the mark is the card's details text.

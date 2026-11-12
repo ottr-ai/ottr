@@ -47,6 +47,7 @@ import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
 	type AskQuestion,
+	askAnswerLine,
 	doneReadKey,
 	type GhStatus,
 	type KeptChoice,
@@ -8558,9 +8559,10 @@ function AskPanel({
 	const count = Object.keys(answers).length;
 	const send = () => {
 		const text = asked
-			.map((q, qi) =>
-				answers[qi] !== undefined ? `For "${q.question}": ${answers[qi]}` : "",
-			)
+			.map((q, qi) => {
+				const a = answers[qi];
+				return a !== undefined ? askAnswerLine(q.question, a) : "";
+			})
 			.filter(Boolean)
 			.join("\n");
 		if (text !== "") {

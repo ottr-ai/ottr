@@ -23,9 +23,13 @@ import {
 	findingsSettledAt,
 	isRetro,
 	isReview,
+	LEAD_APPLIES_OPTION,
+	LEAD_NOT_APPLY_OPTION,
+	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastFullReview,
 	lastFullReviewBase,
 	lastReviewBase,
+	leadBlocker,
 	liveCard,
 	liveCardOf,
 	mergeAnywayPatch,
@@ -2084,5 +2088,62 @@ describe("backlog grill slot", () => {
 		const running = task({ stage: "backlog", state: "running" });
 		const kicked = task({ stage: "backlog" });
 		expect(pickRunnable([running, kicked], opts)).toEqual([]);
+	});
+});
+
+describe("leadBlocker", () => {
+	test("reads both fixed blocker lines with their payload", () => {
+		expect(
+			leadBlocker(
+				"Needs validation: rate limiter bug\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For?",
+			),
+		).toEqual({
+			kind: "deployment",
+			question: "Does a trusted proxy set X-Forwarded-For?",
+		});
+		expect(leadBlocker("x\nBlocker: sandbox run: no network deny")).toEqual({
+			kind: "sandbox",
+			control: "no network deny",
+		});
+	});
+
+	test("the first blocker line wins and leading spaces are allowed", () => {
+		expect(
+			leadBlocker("Blocker: sandbox run: a\n  Blocker: deployment fact: q"),
+		).toEqual({ kind: "sandbox", control: "a" });
+		expect(
+			leadBlocker("Blocker: deployment fact:  spaced question  \nrest"),
+		).toEqual({ kind: "deployment", question: "spaced question" });
+	});
+
+	test("a missing or malformed line counts as a sandbox run", () => {
+		expect(leadBlocker("Needs validation: flaky retry")).toEqual({
+			kind: "sandbox",
+			control: null,
+		});
+		expect(leadBlocker("Blocker: deployment-fact: q")).toEqual({
+			kind: "sandbox",
+			control: null,
+		});
+		expect(leadBlocker("Blocker: deployment fact without a colon")).toEqual({
+			kind: "sandbox",
+			control: null,
+		});
+		expect(leadBlocker("Blocker: deployment fact:")).toEqual({
+			kind: "sandbox",
+			control: null,
+		});
+		expect(leadBlocker("Inline Blocker: deployment fact: not a line")).toEqual({
+			kind: "sandbox",
+			control: null,
+		});
+	});
+
+	test("the fixed option labels and question-card prefix hold their wording", () => {
+		expect(LEAD_APPLIES_OPTION).toBe("Yes, the risk applies");
+		expect(LEAD_NOT_APPLY_OPTION).toBe("No, it does not apply");
+		expect(LEAD_QUESTIONS_PROMPT_PREFIX).toBe(
+			"Needs-validation lead questions from review #",
+		);
 	});
 });

@@ -64,6 +64,9 @@ import {
 	FINDINGS_HOLD,
 	isRetro,
 	isReview,
+	LEAD_APPLIES_OPTION,
+	LEAD_NOT_APPLY_OPTION,
+	LEAD_QUESTIONS_PROMPT_PREFIX,
 	liveCard,
 	PROMPT_EDIT_HELD,
 	pickRunnable,
@@ -24371,7 +24374,7 @@ describe("stored review findings", () => {
 		expect(kids).toHaveLength(1);
 		expect(kids[0]!.prompt).toBe(lead.prompt);
 		expect(kids[0]!.details).toBe(
-			`Unverified lead from review ${review.id}: the second-model check did not run on this finding (needs validation).`,
+			`Unverified lead from review ${review.id}: the second-model check did not run on this finding (needs validation). Waits for a validation sandbox.`,
 		);
 		expect(store.getTask(other.id)!.details ?? "").not.toContain("Seen again");
 	});
@@ -24408,12 +24411,139 @@ describe("stored review findings", () => {
 		const filed = kids[0]!;
 		expect(filed.details).not.toContain("came back");
 		expect(filed.details).toMatch(
-			new RegExp(
-				`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.$`,
-			),
+			new RegExp(`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.`),
 		);
 		const reviewAfter = store.getTask(review.id)!;
 		expect(reviewAfter.details).toContain(`already open: #${filed.id}`);
+	});
+
+	test("deployment-fact leads file one question card; sandbox leads note the sandbox", async () => {
+		const record = baseRecord();
+		const confirmed = Array.from({ length: 12 }, (_, i) =>
+			mkFinding(`Bug ${i + 1}`, i + 1),
+		);
+		const leads = [
+			mkFinding(
+				"Needs validation: rate limiter keys on X-Forwarded-For\nBlocker: deployment fact: Does a trusted proxy set X-Forwarded-For on setup-secret requests?",
+			),
+			mkFinding(
+				"Needs validation: auth bypass behind reverse proxy\nBlocker: deployment fact: Does the deployment terminate TLS at a trusted proxy?",
+			),
+			mkFinding(
+				"Needs validation: sandbox-only parser crash\nBlocker: sandbox run: no OS-enforced network deny",
+			),
+		];
+		const { store, loop } = storedReviewSetup(
+			record,
+			[...confirmed, ...leads],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			// The check sees only the cap-10 confirmed selection and drops every one.
+			[
+				verdicts(
+					...Array.from(
+						{ length: 10 },
+						(_, i) => [i + 1, false, "not real"] as [number, boolean, string],
+					),
+				),
+			],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		// All three leads file as unverified backlog cards linked to the review.
+		const kids = kidsOf(store, review.id);
+		const leadKids = kids.filter((k) =>
+			k.prompt.startsWith("Needs validation:"),
+		);
+		expect(leadKids).toHaveLength(3);
+		for (const k of leadKids) {
+			expect(k.stage).toBe("backlog");
+			expect(k.state).toBe("idle");
+			expect(k.queuedAt).toBeNull();
+			expect(k.followUpOf).toBe(review.id);
+			expect(k.details).toContain("Unverified lead from review");
+		}
+		const sandboxKid = leadKids.find((k) =>
+			k.prompt.startsWith("Needs validation: sandbox-only parser crash"),
+		)!;
+		expect(sandboxKid.details).toContain("Waits for a validation sandbox");
+		const deployKids = leadKids.filter((k) => k.id !== sandboxKid.id);
+		for (const k of deployKids)
+			expect(k.details).not.toContain("Waits for a validation sandbox");
+
+		// Exactly ONE question card for the two deployment-fact leads: one question
+		// per lead, each naming its lead card, with the two fixed answers.
+		const qKids = kids.filter((k) =>
+			k.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX),
+		);
+		expect(qKids).toHaveLength(1);
+		const q = qKids[0]!;
+		expect(q.stage).toBe("backlog");
+		expect(q.state).toBe("needs_you");
+		expect(q.queuedAt).toBeNull();
+		expect(q.followUpOf).toBe(review.id);
+		expect(q.needsReason).toContain("Wants your answer");
+		expect(q.asked).toHaveLength(2);
+		for (const a of q.asked ?? []) {
+			expect(a.multi).toBe(false);
+			expect(a.recommended).toBeNull();
+			expect(a.options).toEqual([
+				{ label: LEAD_APPLIES_OPTION },
+				{ label: LEAD_NOT_APPLY_OPTION },
+			]);
+		}
+		// Every question names one of the two deployment lead cards, both covered.
+		const namedIds = (q.asked ?? []).map(
+			(a) => deployKids.find((k) => a.question.endsWith(`(card #${k.id})`))?.id,
+		);
+		expect(new Set(namedIds)).toEqual(new Set(deployKids.map((k) => k.id)));
+	});
+
+	test("a review whose leads all wait on a sandbox files no question card", async () => {
+		const record = baseRecord();
+		const confirmed = Array.from({ length: 12 }, (_, i) =>
+			mkFinding(`Bug ${i + 1}`, i + 1),
+		);
+		const leads = [
+			mkFinding("Needs validation: flaky retry on push"),
+			mkFinding(
+				"Needs validation: sandbox-only crash\nBlocker: sandbox run: no sandbox",
+			),
+		];
+		const { store, loop } = storedReviewSetup(
+			record,
+			[...confirmed, ...leads],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			// The check sees only the cap-10 confirmed selection and drops every one.
+			[
+				verdicts(
+					...Array.from(
+						{ length: 10 },
+						(_, i) => [i + 1, false, "not real"] as [number, boolean, string],
+					),
+				),
+			],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		// Exactly the two lead cards, both marked as waiting for a validation
+		// sandbox (a lead without a blocker line counts as a sandbox-run lead),
+		// and no question card.
+		const kids = kidsOf(store, review.id);
+		expect(kids).toHaveLength(2);
+		for (const k of kids) {
+			expect(k.stage).toBe("backlog");
+			expect(k.state).toBe("idle");
+			expect(k.details).toContain("Waits for a validation sandbox");
+			expect(k.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)).toBe(false);
+		}
 	});
 
 	test("a release review refuses to publish while its stored findings are unchecked", async () => {

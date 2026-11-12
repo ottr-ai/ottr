@@ -1133,6 +1133,37 @@ export const WORK_CHECK_ASK_DIVERGE = "The work-check loop is diverging";
 export const WORK_CHECK_ASK_NEW_APPROACH = "Send back with a new approach";
 export const WORK_CHECK_ASK_CANCEL = "Cancel";
 
+/** The two fixed answers a review question card offers per deployment-fact lead; free
+ * text rides the drawer's Other field. */
+export const LEAD_APPLIES_OPTION = "Yes, the risk applies";
+export const LEAD_NOT_APPLY_OPTION = "No, it does not apply";
+
+/** The question card a review files for its deployment-fact leads; the reply route
+ * recognizes it by this prompt prefix plus a non-null `asked`. */
+export const LEAD_QUESTIONS_PROMPT_PREFIX =
+	"Needs-validation lead questions from review #";
+
+/** How a lead prompt names its blocker: one strict line, first match wins. A lead
+ * without a matching line waits for a validation sandbox (docs/specs/
+ * review-findings-persistence.md §4). Pure. */
+const LEAD_BLOCKER_PATTERN =
+	/^[^\S\n]*Blocker: (deployment fact|sandbox run): (.+)$/m;
+
+export type LeadBlocker =
+	| { kind: "deployment"; question: string }
+	| { kind: "sandbox"; control: string | null };
+
+/** Sorts a lead by its blocker line: the exact question a deployment-fact lead asks
+ * the user, or the sandbox kind with the named missing control (null when the line
+ * is absent or malformed). Pure. */
+export function leadBlocker(prompt: string): LeadBlocker {
+	const m = LEAD_BLOCKER_PATTERN.exec(prompt);
+	if (m === null) return { kind: "sandbox", control: null };
+	return m[1] === "deployment fact"
+		? { kind: "deployment", question: (m[2] ?? "").trim() }
+		: { kind: "sandbox", control: (m[2] ?? "").trim() };
+}
+
 /** The needs_you reason for a diverging loop: the blocker counts per round, then the rule(s)
  * that fired — the did-not-drop claim only when the counts rule fired, plus each repeated
  * bug class with its blockers. Pure. */

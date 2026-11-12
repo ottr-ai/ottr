@@ -111,7 +111,11 @@ import {
 	findingsHold,
 	isRetro,
 	isReview,
+	LEAD_APPLIES_OPTION,
+	LEAD_NOT_APPLY_OPTION,
+	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
+	leadBlocker,
 	mergeHold,
 	openWorkBlockers,
 	parseCheckVerdicts,
@@ -8719,7 +8723,9 @@ export function createTurnLoop(
 		// Leads file with or without a check verdict: they are unverified by definition
 		// (the second-model check never ran on them), so they hold no cap slot. A lead
 		// that carries the audit fingerprint (docs/specs/review-findings-persistence.md
-		// §4) dedupes against the cards holding the same value instead of filing again.
+		// §4) dedupes against the cards holding the same value instead of filing again,
+		// and the blocker line sorts each filer: a deployment fact asks the user, a
+		// sandbox run waits for a validation sandbox.
 		if (live !== null && live.cancelledAt === null) {
 			const byFingerprint = new Map<string, ListedTask[]>();
 			for (const t of st.store.listTasks()) {
@@ -8729,6 +8735,7 @@ export function createTurnLoop(
 				if (list === undefined) byFingerprint.set(fp, [t]);
 				else list.push(t);
 			}
+			const questions: string[] = [];
 			for (const lead of args.leads) {
 				const fp = leadFingerprint(lead.prompt);
 				const match =
@@ -8756,6 +8763,7 @@ export function createTurnLoop(
 					}
 					continue;
 				}
+				const blocker = leadBlocker(lead.prompt);
 				const child = st.store.createTask(lead.prompt);
 				const cameBack =
 					match !== null
@@ -8768,9 +8776,13 @@ export function createTurnLoop(
 					stage: "backlog",
 					state: "idle",
 					queuedAt: null,
-					details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}`,
+					details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}${
+						blocker.kind === "sandbox" ? " Waits for a validation sandbox." : ""
+					}`,
 				});
 				filed.push(child.id);
+				if (blocker.kind === "deployment")
+					questions.push(`${blocker.question} (card #${child.id})`);
 				// A card filed in this pass joins the index: two leads with one
 				// fingerprint file once, also when no card held the value before.
 				if (fp !== null) {
@@ -8782,7 +8794,49 @@ export function createTurnLoop(
 					}
 				}
 				st.log(
-					`- filed lead as backlog card #${child.id} (unverified): ${findingHead(lead)}`,
+					`- filed lead as backlog card #${child.id} (${
+						blocker.kind === "sandbox"
+							? "unverified, waits for a validation sandbox"
+							: "unverified, asked the user"
+					}): ${findingHead(lead)}`,
+				);
+			}
+			// ONE question card per review for the deployment-fact leads: the user's
+			// answers sort those leads, and the reply route applies each answer to its
+			// card. The card holds nothing, so Done never waits for the answers.
+			const n = questions.length;
+			const hasOpenQuestionCard = st.store
+				.listTasks()
+				.some(
+					(t) =>
+						t.followUpOf === st.id &&
+						t.cancelledAt === null &&
+						t.stage !== "done" &&
+						t.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX),
+				);
+			if (n > 0 && !hasOpenQuestionCard) {
+				const q = st.store.createTask(
+					`${LEAD_QUESTIONS_PROMPT_PREFIX}${st.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+				);
+				st.store.updateTask(q.id, {
+					followUpOf: st.id,
+					promptAuthor: "board",
+					stage: "backlog",
+					state: "needs_you",
+					queuedAt: null,
+					asked: questions.map((question) => ({
+						question,
+						options: [
+							{ label: LEAD_APPLIES_OPTION },
+							{ label: LEAD_NOT_APPLY_OPTION },
+						],
+						multi: false,
+						recommended: null,
+					})),
+					needsReason: `Wants your answer: ${n} question${n === 1 ? "" : "s"} about the review's needs-validation leads`,
+				});
+				st.log(
+					`- filed the leads question card #${q.id} (${n} deployment-fact lead${n === 1 ? "" : "s"})`,
 				);
 			}
 		}

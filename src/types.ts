@@ -106,6 +106,12 @@ export function askQuestions(args: unknown): AskQuestion[] | null {
 	return out.length > 0 ? out : null;
 }
 
+/** The drawer's ask-answer wire line: AskPanel sends one per answered question, and the
+ * board-side parsers (the review question card's reply route) read the same format back. */
+export function askAnswerLine(question: string, answer: string): string {
+	return `For "${question}": ${answer}`;
+}
+
 /** One normalized ask question, or null when its question/options are unusable. */
 function askQuestionOf(item: unknown): AskQuestion | null {
 	if (

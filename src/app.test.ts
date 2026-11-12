@@ -81,6 +81,9 @@ import { PR_GATES } from "./prs.ts";
 import { createRunSink } from "./runner.ts";
 import {
 	archReviewDue,
+	LEAD_APPLIES_OPTION,
+	LEAD_NOT_APPLY_OPTION,
+	LEAD_QUESTIONS_PROMPT_PREFIX,
 	PROMPT_EDIT_HELD,
 	pickRunnable,
 	type ReviewTask,
@@ -106,6 +109,7 @@ import {
 import type { QuotaLimit, QuotaState, TaskCard } from "./types.ts";
 import {
 	type AddProjectResponse,
+	askAnswerLine,
 	doneReadKey,
 	type ListedTask,
 	type PrReviewRow,
@@ -1661,6 +1665,146 @@ describe("task routes", () => {
 		});
 		await post(`/api/projects/p1/tasks/${r.id}/reply`, { text: "." });
 		expect(store.getTask(r.id)?.pendingPrompt).toBe("use the fixed config");
+	});
+
+	/** Seeds a review, two backlog lead cards of it, and its question card with one
+	 * question per lead, as the review check files them (no review run needed). */
+	const seedLeadAsk = () => {
+		const review = store.createTask("review", null, "review");
+		const leads = [
+			store.createTask("Needs validation: confirm the proxy allowlist"),
+			store.createTask("Needs validation: confirm the cron job env"),
+		];
+		for (const lead of leads)
+			store.updateTask(lead.id, {
+				followUpOf: review.id,
+				stage: "backlog",
+				state: "idle",
+				queuedAt: null,
+			});
+		const ask = store.createTask(
+			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+		);
+		store.updateTask(ask.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "needs_you",
+			queuedAt: null,
+			needsReason:
+				"Wants your answer: 2 questions about the review's needs-validation leads",
+			asked: leads.map((lead, i) => ({
+				question: `Q ${i === 0 ? "one" : "two"}? (card #${lead.id})`,
+				options: [
+					{ label: LEAD_APPLIES_OPTION },
+					{ label: LEAD_NOT_APPLY_OPTION },
+				],
+				multi: false,
+				recommended: null,
+			})),
+		});
+		return { review, lead1: leads[0]!, lead2: leads[1]!, ask };
+	};
+
+	test("a lead-question reply queues the applies lead, cancels the other, and lands the card Done", async () => {
+		const { lead1, lead2, ask } = seedLeadAsk();
+		const before = calls;
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: `${askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION)}\n${askAnswerLine(`Q two? (card #${lead2.id})`, LEAD_NOT_APPLY_OPTION)}`,
+		});
+		expect(res.status).toBe(200);
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		expect(one.queuedAt).not.toBeNull();
+		expect(
+			one.prompt.endsWith(
+				`The user answered the review's question: ${LEAD_APPLIES_OPTION}`,
+			),
+		).toBe(true);
+		const two = store.getTask(lead2.id)!;
+		expect(two.cancelledAt).not.toBeNull();
+		expect(two.needsReason).toBe(
+			`Cancelled by the user's answer to the review's question: ${LEAD_NOT_APPLY_OPTION}`,
+		);
+		const done = store.getTask(ask.id)!;
+		expect(done.stage).toBe("done");
+		expect(done.state).toBe("idle");
+		expect(done.asked).toBeNull();
+		expect(done.doneAt).not.toBeNull();
+		expect(calls).toBe(before + 1);
+		// The card landed Done inside the reply: a second reply is refused, not needs_you.
+		const again = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "again",
+		});
+		expect(again.status).toBe(409);
+		expect(await errorOf(again)).toBe("task is not waiting for you");
+	});
+
+	test("a lead-question free-text answer appends to the lead's details and keeps both leads in backlog", async () => {
+		const { lead1, lead2, ask } = seedLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(
+				`Q one? (card #${lead1.id})`,
+				"only behind our staging proxy",
+			),
+		});
+		expect(res.status).toBe(200);
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("backlog");
+		expect(one.state).toBe("idle");
+		expect(one.cancelledAt).toBeNull();
+		expect(one.details).toBe(
+			"\n\nThe user answered the review's question: only behind our staging proxy",
+		);
+		// The question without an answer line touches nothing.
+		const two = store.getTask(lead2.id)!;
+		expect(two.stage).toBe("backlog");
+		expect(two.state).toBe("idle");
+		expect(two.cancelledAt).toBeNull();
+		expect(two.details).toBeNull();
+		const done = store.getTask(ask.id)!;
+		expect(done.stage).toBe("done");
+		expect(done.state).toBe("idle");
+		expect(done.asked).toBeNull();
+	});
+
+	test("a plain card with an ask is not intercepted: its reply queues normally", async () => {
+		const { lead1, ask } = seedLeadAsk();
+		const plain = store.createTask("a plain card");
+		store.updateTask(plain.id, {
+			state: "needs_you",
+			needsReason: "the agent asked",
+			asked: [
+				{
+					question: `Q one? (card #${lead1.id})`,
+					options: [
+						{ label: LEAD_APPLIES_OPTION },
+						{ label: LEAD_NOT_APPLY_OPTION },
+					],
+					multi: false,
+					recommended: null,
+				},
+			],
+		});
+		const before = calls;
+		const res = await post(`/api/projects/p1/tasks/${plain.id}/reply`, {
+			text: "the env var is set in staging",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(plain.id)!;
+		expect(row.state).toBe("queued");
+		expect(row.pendingPrompt).toBe("the env var is set in staging");
+		// Without the question-card prompt prefix nothing applies to the lead cards,
+		// and the question card itself keeps waiting.
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("backlog");
+		expect(one.state).toBe("idle");
+		expect(one.cancelledAt).toBeNull();
+		const askRow = store.getTask(ask.id)!;
+		expect(askRow.stage).toBe("backlog");
+		expect(askRow.state).toBe("needs_you");
+		expect(askRow.asked).not.toBeNull();
+		expect(calls).toBe(before + 1);
 	});
 
 	test("star toggles the flag and rejects a non-boolean body", async () => {
