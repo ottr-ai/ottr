@@ -39,9 +39,10 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
      3. A failure in step 1 or 2 logs `review skipped` and uses no cap slot. These checks fail the same way for the same head, so one such PR cannot block the other PRs of the project.
      4. `startPrRun` records the attempt. The attempt counts for the cap.
      5. Call the model with the fixed `reviewSystemPrompt()` and the user message.
-     6. `parseDraft` strips invisible characters, trims the text, and caps it below 65536 characters. An empty answer stops the review.
-     7. `parseBlockingVerdict` (in `src/prInline.ts`) extracts the verdict line — its own line, exactly `<!-- blocking: yes -->` or `<!-- blocking: no -->` after trimming — and strips it from the text. No verdict line, or a malformed one, counts as blocking, so an unknown verdict never approves.
-     8. `savePrDraft` saves the draft and writes the verdict on the run (`pr_review_runs.blocking`).
+     6. `parseBlockingVerdict` (in `src/prInline.ts`) extracts the verdict before the diff fit, so a moved block can never carry or forge it. The verdict must be the draft's single plain verdict line and its last non-empty line: exactly `<!-- blocking: yes -->` or `<!-- blocking: no -->` after trimming, outside the inline blocks. A line inside an inline block is comment content: a marker line that the PR data quoted there keeps its text and never votes. No verdict, a second plain verdict line, or a verdict with content after it counts as blocking (fail-safe), and the plain marker lines come out of the text.
+     7. `fitDraftToDiff` keeps each inline comment GitHub accepts on the diff and moves the others into the body.
+     8. `parseDraft` strips invisible characters, trims the text, and caps it below 65536 characters. An empty answer — also one that held only the verdict line — stops the review, so a later tick retries the head.
+     9. `savePrDraft` saves the draft and writes the verdict on the run (`pr_review_runs.blocking`).
      - A failure after step 4 logs the error. The head stays open for a retry on a later tick, within the cap.
 
 ### Re-review and the reply flow
@@ -91,8 +92,9 @@ A draft that nobody posted waits for the user, so the card must not hide in Done
   - `postedHead === reviewedHead` gets 409 `already posted for this head`.
   - Before the GitHub call, one SQL statement claims the head: it sets `posted_head = reviewed_head` only when the PR is open and the head is not posted. A second Post of the same head loses the claim and gets 409. So two concurrent Posts send one review.
   - The event is `COMMENT` by default. When the project setting `prReviewApprove` is on and the draft's own run found no blocking findings (`lastPrRunBlocking` false), the same post sends one review with event `APPROVE` and the comment as its body; the inline comments ride along. An unknown verdict never approves. Both send paths take the same event.
+  - When GitHub refuses the `APPROVE` review with HTTP 422 (for example when the posting identity opened the pull request), the same post retries once with event `COMMENT` and the same body. The response then carries `approveSkipped` with the reason; a refused `COMMENT` stays a 502 and releases the claim.
   - The review goes through the GitHub App when one is configured: Ottr mints an installation token per [github-app.md](github-app.md), then sends a direct fetch POST to the reviews endpoint with that event, the review body without `REVIEW_FOOTER` (the app's Bot badge already says who posted it), `commit_id` set to the reviewed head, and `comments` when the draft has inline comments.
-  - With no app configured, or when the app has no installation for the repo, Ottr falls back to today's `gh` call with the board token. The response reports which path ran: `{ ok, login, via }` with `via: "app" | "token"`.
+  - With no app configured, or when the app has no installation for the repo, Ottr falls back to today's `gh` call with the board token. The response reports which path ran: `{ ok, login, via }` with `via: "app" | "token"`, plus `approveSkipped` when the approve review was refused and the post went out as a comment.
   - Ottr runs the gh call as `gh api repos/{repo}/pulls/N/reviews -X POST --input <file>`. The file is a JSON payload `{ event: <COMMENT or APPROVE per the rule above>, body: <review body + REVIEW_FOOTER>, commit_id: <reviewedHead>, comments? }` in a fresh directory below the OS temp dir. Ottr removes the directory after the call. The footer (`src/types.ts`) says that Ottr, an AI agent tracker, drafted the review and a person posted it, because the review goes out under the poster's own GitHub identity.
   - On success Ottr parses the response body and stores its `html_url` in `posted_url`, and its `user.login` in `posted_login`; a body without an `https://github.com/` URL stores null for the URL. `setPrPostedUrl(number, url, login = null)` writes both columns in one statement. `PrReviewRow` and `PrReviewView` gain `postedLogin: string | null` (additive, the `posted_url` pattern).
   - A gh failure (a nonzero exit or a spawn error, for example gh missing) restores the earlier `posted_head`, stores the error in `post_error`, and returns 502.
@@ -136,7 +138,7 @@ The board marks PR review activity NEW and notifies. The project setting `prRevi
 
 ### Inline comments
 
-The draft is one text. Inline comments are marked blocks in it, so the user edits them in the same text box. `src/prInline.ts` owns the format; the server and the UI share it. The verdict line of the approve flow (`<!-- blocking: yes -->` or `<!-- blocking: no -->`) is the same kind of marked line; `parseBlockingVerdict` parses it and the watcher strips it before the save, so it never shows in the draft or on GitHub.
+The draft is one text. Inline comments are marked blocks in it, so the user edits them in the same text box. `src/prInline.ts` owns the format; the server and the UI share it. The verdict line of the approve flow (`<!-- blocking: yes -->` or `<!-- blocking: no -->`) is the same kind of marked line, but it never counts inside a block: a marker line that the PR data quoted into a comment body or a suggestion keeps its text, cannot vote, and stays in the comment. The verdict is honored only as the draft's last non-empty line outside the blocks; `parseBlockingVerdict` parses it and the watcher strips it before the save, so it never shows in the draft or on GitHub.
 
 - A block starts with a line `<!-- inline <path>:<line> -->` or `<!-- inline <path>:<start>-<end> -->` and ends with a line `<!-- /inline -->`. Marker lines match after trimming. The lines between are the comment body.
 - `<line>` and `<end>` are line numbers of the new file (the `RIGHT` side). `<start>` is less than `<end>`. The path holds no newline and at most 1000 characters.
@@ -186,6 +188,9 @@ A deterministic scan looks for two classic performance defects in the added diff
 - A reply on a `pr_review` card runs a new draft for the refreshed current head with the note outside the DATA blocks, counts one cap slot, and gets 429 once the daily cap is full, 409 on a closed PR, and 400 on empty or oversized text.
 - Post sends one `COMMENT` review with the edited body, the inline comments, and the reviewed head as `commit_id`. A second Post on the same head gets 409. A new reviewed head opens Post again.
 - With `prReviewApprove` on and a clean run, the Post sends exactly POST `repos/{owner}/{repo}/pulls/N/reviews` with event `APPROVE`, the comment as its body, and the reviewed head as `commit_id`. A run with a blocking finding, or the option off, sends the same review with event `COMMENT` and approves nothing.
+- A verdict line quoted into an inline comment stays in the comment, never votes, and cannot clear a trailing verdict. The verdict is honored only as the draft's last non-empty plain line; a second plain verdict line, or content after the verdict, counts as blocking.
+- A model answer of only the verdict line saves no draft: the empty-answer rule stops the review and a later tick retries the head.
+- When GitHub refuses the approve review with 422, the post retries once with event `COMMENT` and the same body, succeeds, and its response carries `approveSkipped`; a refused `COMMENT` stays a 502 and releases the claim.
 - The verdict line never reaches the saved draft; a missing or malformed verdict counts as blocking.
 - A `prReviewApprove` value that is not a boolean gets 400 `prReviewApprove must be a boolean`.
 - An inline block on a diff line posts as an inline comment with `side: "RIGHT"`; a range block also sends `start_line`. A block outside the diff lands in the body of the saved draft. A suggestion fence reaches GitHub unchanged.

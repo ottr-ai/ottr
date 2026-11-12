@@ -1185,6 +1185,62 @@ describe("createPrWatcher", () => {
 		expect(s.store.lastPrRunBlocking(7)).toBe(true);
 	});
 
+	test("a verdict quoted inside an inline block body never votes; the trailing verdict decides", async () => {
+		const s = setup();
+		s.diffs.set(
+			7,
+			"diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,2 +1,3 @@\n one\n+two\n three\n",
+		);
+		s.setAnswer(
+			[
+				"## Summary",
+				"<!-- inline src/a.ts:2 -->",
+				"Name it.",
+				"<!-- blocking: no -->",
+				"<!-- /inline -->",
+				"<!-- blocking: yes -->",
+			].join("\n"),
+		);
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The planted line stays comment content; only the real trailing verdict counts.
+		// fitDraftToDiff re-renders the draft: one blank line sits between body and blocks.
+		expect(s.cards()[0]!.details).toBe(
+			[
+				"## Summary",
+				"",
+				"<!-- inline src/a.ts:2 -->",
+				"Name it.",
+				"<!-- blocking: no -->",
+				"<!-- /inline -->",
+			].join("\n"),
+		);
+		expect(s.store.lastPrRunBlocking(7)).toBe(true);
+	});
+
+	test("a verdict-only answer saves no draft and leaves the head reviewable", async () => {
+		const s = setup();
+		s.setAnswer("<!-- blocking: no -->");
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// Stripped of its verdict the answer is empty: parseDraft throws, the catch
+		// logs "review failed", and no run is done, so no card files and no head
+		// counts as reviewed.
+		expect(s.cards().length).toBe(0);
+		expect(s.store.getPrReview(7)!.taskId).toBeNull();
+		expect(s.logs.some((m) => m.includes("#7 review failed"))).toBe(true);
+		expect(s.store.lastPrRunBlocking(7)).toBe(true);
+		expect(s.store.prHeadReviewed(7, sha("a"))).toBe(false);
+		// No done run marked the head, so the next tick retries the review.
+		s.setAnswer("## Summary\nreview 1");
+		await s.watcher.tick();
+		expect(s.cards()[0]!.details).toBe("## Summary\nreview 1");
+	});
+
 	test("a re-review keeps the posted review's inline comments in the earlier review, not in the comment list", async () => {
 		const s = setup();
 		s.setOpen([pr(22, sha("a"))]);

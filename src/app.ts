@@ -8906,7 +8906,9 @@ export function createApp(deps: AppDeps) {
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
 		event: "COMMENT" | "APPROVE",
-	): Promise<{ via: "app"; stdout: string } | Response | null> {
+	): Promise<
+		{ via: "app"; stdout: string; approveSkipped?: string } | Response | null
+	> {
 		if (githubApp === null || appTokens === null) return null;
 		const appSecrets = [...gitSecrets()];
 		let tok: string | null = null;
@@ -8919,28 +8921,43 @@ export function createApp(deps: AppDeps) {
 		}
 		if (tok === null) return null;
 		// Direct fetch, no gh: the review posts as the app, not the board token.
+		const url = `${githubHost().apiBase}/repos/${repo}/pulls/${row.number}/reviews`;
+		const headers = {
+			authorization: `Bearer ${tok}`,
+			accept: "application/vnd.github+json",
+			"content-type": "application/json",
+			"user-agent": "Ottr",
+		};
+		const postOnce = (ev: "COMMENT" | "APPROVE") =>
+			githubAppFetch(url, {
+				method: "POST",
+				headers,
+				body: JSON.stringify({
+					event: ev,
+					// No footer: the review posts as the app, so GitHub's Bot badge
+					// already says who posted it.
+					body: draft.body,
+					commit_id: head,
+					...comments,
+				}),
+			});
 		try {
-			const res = await githubAppFetch(
-				`${githubHost().apiBase}/repos/${repo}/pulls/${row.number}/reviews`,
-				{
-					method: "POST",
-					headers: {
-						authorization: `Bearer ${tok}`,
-						accept: "application/vnd.github+json",
-						"content-type": "application/json",
-						"user-agent": "Ottr",
-					},
-					body: JSON.stringify({
-						event,
-						// No footer: the review posts as the app, so GitHub's Bot badge
-						// already says who posted it.
-						body: draft.body,
-						commit_id: head,
-						...comments,
-					}),
-				},
-			);
-			const text = await res.text();
+			let res = await postOnce(event);
+			let text = await res.text();
+			if (!res.ok && event === "APPROVE") {
+				// GitHub refuses an APPROVE review when the posting identity opened
+				// the PR (HTTP 422), so the same draft goes out as a comment and the
+				// response notes the skip.
+				const refused = res.status;
+				res = await postOnce("COMMENT");
+				text = await res.text();
+				if (res.ok)
+					return {
+						via: "app",
+						stdout: text,
+						approveSkipped: `GitHub refused the approve review (HTTP ${refused}); posted it as a comment instead`,
+					};
+			}
 			if (!res.ok) {
 				const error =
 					redact(text.trim().slice(0, 300), appSecrets) ||
@@ -8969,7 +8986,7 @@ export function createApp(deps: AppDeps) {
 		draft: ParsedReview,
 		comments: Record<string, unknown>,
 		event: "COMMENT" | "APPROVE",
-	): Promise<{ stdout: string } | Response> {
+	): Promise<{ stdout: string; approveSkipped?: string } | Response> {
 		const payload = {
 			event,
 			body: `${draft.body}${REVIEW_FOOTER}`,
@@ -8980,16 +8997,35 @@ export function createApp(deps: AppDeps) {
 		let dir: string | null = null;
 		try {
 			dir = await mkdtemp(join(tmpdir(), "ottr-review-"));
-			const file = join(dir, "review.json");
-			await writeFile(file, JSON.stringify(payload), { mode: 0o600 });
-			res = await gh([
-				"api",
-				`repos/${repo}/pulls/${row.number}/reviews`,
-				"-X",
-				"POST",
-				"--input",
-				file,
-			]);
+			// A fresh payload per attempt: the retry must send COMMENT, not the
+			// refused APPROVE.
+			const callGh = async (ev: "COMMENT" | "APPROVE", at: string) => {
+				const file = join(at, "review.json");
+				await writeFile(file, JSON.stringify({ ...payload, event: ev }), {
+					mode: 0o600,
+				});
+				return gh([
+					"api",
+					`repos/${repo}/pulls/${row.number}/reviews`,
+					"-X",
+					"POST",
+					"--input",
+					file,
+				]);
+			};
+			res = await callGh(event, dir);
+			if (res.code !== 0 && event === "APPROVE") {
+				// GitHub refuses an APPROVE review when the posting identity opened
+				// the PR, so the same draft goes out as a comment and the response
+				// notes the skip.
+				const refused = res.code;
+				res = await callGh("COMMENT", dir);
+				if (res.code === 0)
+					return {
+						stdout: res.stdout,
+						approveSkipped: `GitHub refused the approve review (gh exit ${refused}); posted it as a comment instead`,
+					};
+			}
 		} catch (err) {
 			// A spawn or temp file failure (e.g. gh missing) sent nothing: free the claim, or the head reads as posted.
 			res = { code: -1, stdout: "", stderr: errmsg(err) };
@@ -9168,9 +9204,11 @@ export function createApp(deps: AppDeps) {
 		if (app instanceof Response) return app;
 		let via: "app" | "token" = "token";
 		let stdout: string;
+		let approveSkipped: string | undefined;
 		if (app !== null) {
 			stdout = app.stdout;
 			via = "app";
+			approveSkipped = app.approveSkipped;
 		} else {
 			const posted = await postReviewViaGh(
 				e,
@@ -9184,6 +9222,7 @@ export function createApp(deps: AppDeps) {
 			);
 			if (posted instanceof Response) return posted;
 			stdout = posted.stdout;
+			approveSkipped = posted.approveSkipped;
 		}
 		// GitHub's response body is untrusted: only an https URL on the configured
 		// host becomes the drawer link, and only a plausible login names the
@@ -9194,7 +9233,13 @@ export function createApp(deps: AppDeps) {
 		e.store.setPrComments(row.number, Date.now(), false);
 		// The head is posted: the card leaves needs_you for done/idle.
 		e.store.syncPrCard(row.number);
-		return json({ ok: true, login, via, inline: draft.comments.length });
+		return json({
+			ok: true,
+			login,
+			via,
+			inline: draft.comments.length,
+			...(approveSkipped !== undefined ? { approveSkipped } : {}),
+		});
 	}
 
 	/** The latest finished grill report's details, or null when none finished. */

@@ -95,29 +95,54 @@ export function parseReviewDraft(text: string): ParsedReview {
 }
 
 /** The model's machine-readable verdict for the review body (docs/specs/pr-reviews.md "Post").
- *  A verdict line is a whole line whose trimmed text is exactly `<!-- blocking: yes -->` or
- *  `<!-- blocking: no -->`; matching is strict lowercase after trim. Every verdict line comes
- *  out of the text, and `blocking` follows the last one. A missing or malformed verdict counts
- *  as blocking, so an unknown verdict never approves. */
+ *  A verdict line is a whole plain line — outside every inline block — whose trimmed text is
+ *  exactly `<!-- blocking: yes -->` or `<!-- blocking: no -->`; matching is strict lowercase
+ *  after trim, and a line inside a marked block is comment content that never votes. The
+ *  verdict is honored only when exactly one plain verdict line exists and it is the review's
+ *  last non-empty line. Anything else (none, a second candidate, or content after it) is a
+ *  contradiction and fails safe to blocking. Every plain verdict line comes out of the text;
+ *  block bodies and all other lines stay byte-identical. */
 export function parseBlockingVerdict(text: string): {
 	text: string;
 	blocking: boolean;
 } {
-	const kept: string[] = [];
-	let blocking = true;
-	for (const line of text.split("\n")) {
+	const lines = text.split(/\r\n|\r|\n/);
+	// A line inside a marked block is comment content: a PR line quoted there keeps
+	// its text and never votes.
+	let open = false;
+	const votes: number[] = [];
+	let lastPlain = -1;
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		if (!open && openMarker(line) !== null) {
+			open = true;
+			continue;
+		}
+		if (open) {
+			if (line.trim() === CLOSE) open = false;
+			continue;
+		}
 		const t = line.trim();
-		if (t === "<!-- blocking: yes -->") {
-			blocking = true;
-			continue;
+		if (t === "<!-- blocking: yes -->" || t === "<!-- blocking: no -->") {
+			votes.push(i);
+			lastPlain = i;
+		} else if (t !== "") {
+			lastPlain = i;
 		}
-		if (t === "<!-- blocking: no -->") {
-			blocking = false;
-			continue;
-		}
-		kept.push(line);
 	}
-	return { text: kept.join("\n"), blocking };
+	const strip = () => {
+		for (let i = votes.length - 1; i >= 0; i--) lines.splice(votes[i]!, 1);
+	};
+	// Zero verdicts, a second candidate (the PR data can quote a marker line into the
+	// summary), or a verdict with content after it: fail safe, and strip the plain
+	// marker lines so the draft stays clean.
+	if (votes.length !== 1 || votes[0] !== lastPlain) {
+		strip();
+		return { text: lines.join("\n"), blocking: true };
+	}
+	const blocking = lines[votes[0]!]!.trim() !== "<!-- blocking: no -->";
+	strip();
+	return { text: lines.join("\n"), blocking };
 }
 
 function location(c: Pick<InlineComment, "path" | "line" | "startLine">) {

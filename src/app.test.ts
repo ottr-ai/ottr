@@ -14384,6 +14384,69 @@ describe("PR review routes", () => {
 		prStore.setSettings({ prReviewApprove: false });
 	});
 
+	test("a refused approve downsizes to a comment on the gh fallback", async () => {
+		await removeApp();
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(31, H1, true, false);
+		// The fake gh inspects each attempt's payload: the APPROVE gets refused
+		// with GitHub's self-approval 422 body on stderr, the retried COMMENT
+		// gets the success envelope.
+		ghHook = async () => {
+			const last: unknown = ghPayloads[ghPayloads.length - 1];
+			ghResult =
+				typeof last === "object" &&
+				last !== null &&
+				"event" in last &&
+				last.event === "APPROVE"
+					? {
+							code: 1,
+							stdout: "",
+							stderr:
+								'(HTTP 422) {"message":"Can not approve your own pull request"}',
+						}
+					: {
+							code: 0,
+							stdout: JSON.stringify({
+								html_url:
+									"https://github.com/acme/widget/pull/31#pullrequestreview-1",
+								user: { login: "octocat" },
+							}),
+							stderr: "",
+						};
+		};
+		const res = await postReview(t.id, { body: "Looks good." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "octocat",
+			via: "token",
+			inline: 0,
+			approveSkipped: expect.stringContaining("posted it as a comment"),
+		});
+		expect(ghCalls).toEqual([expectedArgv(31), expectedArgv(31)]);
+		// ghPayloads reads the --input temp file inside the fake: the file is gone
+		// after the call, so this capture is the only way at the payload. Both
+		// attempts carry the same body and head; only the event changes.
+		expect(ghPayloads).toEqual([
+			{
+				event: "APPROVE",
+				body: `Looks good.${REVIEW_FOOTER}`,
+				commit_id: H1,
+			},
+			{
+				event: "COMMENT",
+				body: `Looks good.${REVIEW_FOOTER}`,
+				commit_id: H1,
+			},
+		]);
+		// The retry posted: the head and link are stored, not a post error.
+		expect(row(31).postedHead).toBe(H1);
+		expect(row(31).postedUrl).toBe(
+			"https://github.com/acme/widget/pull/31#pullrequestreview-1",
+		);
+		prStore.setSettings({ prReviewApprove: false });
+	});
+
 	test("an app without an installation falls back to gh with via token", async () => {
 		await saveApp();
 		// Default appFetchImpl answers 404 for the installation lookup.
@@ -14477,6 +14540,65 @@ describe("PR review routes", () => {
 		expect(postCall.init!.method).toBe("POST");
 		expect(JSON.parse(postCall.init!.body as string)).toEqual({
 			event: "APPROVE",
+			body: "Ship it.",
+			commit_id: H1,
+		});
+		prStore.setSettings({ prReviewApprove: false });
+		await removeApp();
+	});
+
+	test("a refused approve downsizes to a comment on the app path", async () => {
+		await saveApp();
+		// The reviews endpoint refuses the APPROVE with GitHub's self-approval
+		// 422, then answers the retried COMMENT with the success envelope.
+		appFetchImpl = async (url, init) => {
+			if (url.endsWith("/installation")) return Response.json({ id: 77 });
+			if (url.includes("/access_tokens"))
+				return Response.json({
+					token: "INSTA",
+					expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+				});
+			if (url.endsWith("/reviews")) {
+				const body: unknown = JSON.parse(String(init?.body));
+				const event =
+					typeof body === "object" &&
+					body !== null &&
+					"event" in body &&
+					typeof body.event === "string"
+						? body.event
+						: "";
+				if (event === "APPROVE")
+					return new Response("Can not approve your own pull request", {
+						status: 422,
+					});
+				return Response.json({
+					html_url: "https://github.com/acme/widget/pull/45#review-1",
+					user: { login: "ottr[bot]" },
+				});
+			}
+			return Response.json({ message: "no route" }, { status: 404 });
+		};
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(45, H1, true, false);
+		const res = await postReview(t.id, { body: "Ship it." });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({
+			ok: true,
+			login: "ottr[bot]",
+			via: "app",
+			inline: 0,
+			approveSkipped: expect.stringContaining("posted it as a comment"),
+		});
+		expect(ghCalls).toEqual([]);
+		const reviewCalls = appCalls.filter((c) => c.url.endsWith("/reviews"));
+		expect(reviewCalls.length).toBe(2);
+		expect(JSON.parse(reviewCalls[0]!.init!.body as string)).toEqual({
+			event: "APPROVE",
+			body: "Ship it.",
+			commit_id: H1,
+		});
+		expect(JSON.parse(reviewCalls[1]!.init!.body as string)).toEqual({
+			event: "COMMENT",
 			body: "Ship it.",
 			commit_id: H1,
 		});

@@ -82,6 +82,8 @@ the release and the `post_error` handling it has today. The GitHub call changes:
   `{ event: <"COMMENT", or "APPROVE" per pr-reviews.md "Post">, body: <body>,
   commit_id: <reviewedHead> }` (no footer),
   `Authorization: Bearer <installation token>`. The board token and `gh` stay unused.
+- A refused `APPROVE` review (HTTP 422) retries once with event `COMMENT` and the
+  same body; the response then carries `approveSkipped` (pr-reviews.md "Post").
 - With no app configured, or an installation 404: today's `gh` call with the board token.
 - Another app-path failure (bad key, GitHub 5xx, network): 502 like a gh failure —
   the claim is released, `post_error` stores the redacted error, no fallback post.

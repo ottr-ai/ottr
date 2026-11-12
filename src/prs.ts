@@ -1276,24 +1276,21 @@ async function reviewOnce(
 	// marks the head reviewed, so a failed attempt retries on a later tick.
 	const run = store.startPrRun(row.number, row.head, t);
 	try {
+		// The verdict comes out before the fit, so a block the fit moves can never carry
+		// or forge it, and before parseDraft: a verdict-only answer is empty and throws.
+		const stripped = stripInvisible(
+			await ctx.review([
+				{
+					role: "system",
+					content: reviewSystemPrompt(earlier !== null, candidates.length > 0),
+				},
+				{ role: "user", content: user },
+			]),
+		).text;
+		const verdict = parseBlockingVerdict(stripped);
 		// Fit before the cap: a block GitHub would reject on this diff moves into the body.
-		const fitted = fitDraftToDiff(
-			stripInvisible(
-				await ctx.review([
-					{
-						role: "system",
-						content: reviewSystemPrompt(
-							earlier !== null,
-							candidates.length > 0,
-						),
-					},
-					{ role: "user", content: user },
-				]),
-			).text,
-			diff,
-		);
+		const fitted = fitDraftToDiff(verdict.text, diff);
 		const draft = parseDraft(fitted.text);
-		const verdict = parseBlockingVerdict(draft);
 		if (fitted.moved > 0)
 			ctx.log(
 				`prs: ${project.name}: #${row.number}: ${fitted.moved} inline comment(s) outside the diff moved into the body`,
@@ -1302,7 +1299,7 @@ async function reviewOnce(
 			run,
 			number: row.number,
 			head: row.head,
-			draft: verdict.text,
+			draft,
 			blocking: verdict.blocking,
 			prompt: `Review of pull request #${row.number} of ${repo} at head ${row.head.slice(0, 7)}: ${row.title}\n${prUrl(repo, row.number)}`,
 		});
