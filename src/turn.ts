@@ -1702,6 +1702,37 @@ function findingHead(f: RecordedFinding): string {
 	return f.prompt.split("\n")[0]?.slice(0, 120) ?? "";
 }
 
+/** A lead's audit fingerprint, read from its fixed line `Fingerprint: <value>`
+ * (docs/specs/review-findings-persistence.md §4; the value is the record's
+ * fingerprint from the security-audit-harness audit output). Strict: the exact
+ * prefix at line start, no case or spacing variants. Null: the lead carries no
+ * line and files as today. */
+function leadFingerprint(prompt: string): string | null {
+	const m = /^Fingerprint: (.+)$/m.exec(prompt);
+	if (m === null) return null;
+	const value = m[1]?.trim() ?? "";
+	return value === "" ? null : value;
+}
+
+/** Picks the card a lead dedupes against: an open card first (the lead is
+ * already tracked), then a cancelled one (the user declined it), then a done
+ * one (the lead came back). Ties break on the lowest id. */
+function pickLeadMatch(
+	matches: ListedTask[],
+): { card: ListedTask; kind: "open" | "cancelled" | "done" } | null {
+	const byId = [...matches].sort((a, b) =>
+		a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+	);
+	for (const t of byId)
+		if (t.cancelledAt === null && t.stage !== "done")
+			return { card: t, kind: "open" };
+	for (const t of byId)
+		if (t.cancelledAt !== null) return { card: t, kind: "cancelled" };
+	for (const t of byId)
+		if (t.stage === "done") return { card: t, kind: "done" };
+	return null;
+}
+
 export function createTurnLoop(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -8282,6 +8313,7 @@ export function createTurnLoop(
 		},
 	): void {
 		const filed: string[] = [];
+		const leadNotFiled: string[] = [];
 		const live = st.store.getTask(st.id);
 		if (args.checkFailed === null && live !== null && live.cancelledAt === null)
 			for (const k of args.kept) {
@@ -8294,26 +8326,74 @@ export function createTurnLoop(
 				filed.push(child.id);
 			}
 		// Leads file with or without a check verdict: they are unverified by definition
-		// (the second-model check never ran on them), so they hold no cap slot.
-		if (live !== null && live.cancelledAt === null)
+		// (the second-model check never ran on them), so they hold no cap slot. A lead
+		// that carries the audit fingerprint (docs/specs/review-findings-persistence.md
+		// §4) dedupes against the cards holding the same value instead of filing again.
+		if (live !== null && live.cancelledAt === null) {
+			const byFingerprint = new Map<string, ListedTask[]>();
+			for (const t of st.store.listTasks()) {
+				const fp = leadFingerprint(t.prompt);
+				if (fp === null) continue;
+				const list = byFingerprint.get(fp);
+				if (list === undefined) byFingerprint.set(fp, [t]);
+				else list.push(t);
+			}
 			for (const lead of args.leads) {
+				const fp = leadFingerprint(lead.prompt);
+				const match =
+					fp === null ? null : pickLeadMatch(byFingerprint.get(fp) ?? []);
+				if (match !== null && match.kind !== "done") {
+					if (match.kind === "open") {
+						st.store.updateTask(match.card.id, {
+							details: `${match.card.details ?? ""}\nSeen again in review ${st.id} on ${new Date()
+								.toISOString()
+								.slice(0, 10)}.`,
+						});
+						leadNotFiled.push(
+							`- already open: #${match.card.id} (${findingHead(lead)})`,
+						);
+						st.log(
+							`- lead already open as card ${match.card.id}, not filed again: ${findingHead(lead)}`,
+						);
+					} else {
+						leadNotFiled.push(
+							`- not filed: the user cancelled the same lead before, card #${match.card.id} (${findingHead(lead)})`,
+						);
+						st.log(
+							`- lead matches cancelled card ${match.card.id}, not filed: ${findingHead(lead)}`,
+						);
+					}
+					continue;
+				}
 				const child = st.store.createTask(lead.prompt);
+				const cameBack =
+					match !== null
+						? ` The same fingerprint was already on done card #${match.card.id}; the lead came back.`
+						: "";
 				st.store.updateTask(child.id, {
 					followUpOf: st.id,
 					model: lead.model,
 					stage: "backlog",
 					state: "idle",
 					queuedAt: null,
-					details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).`,
+					details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}`,
 				});
 				filed.push(child.id);
+				// A card filed in this pass joins the index: two leads with one
+				// fingerprint file once.
+				if (fp !== null) {
+					const fresh = st.store.getTask(child.id);
+					const list = byFingerprint.get(fp);
+					if (fresh !== null && list !== undefined) list.push(fresh);
+				}
 				st.log(
 					`- filed lead as backlog card #${child.id} (unverified): ${findingHead(lead)}`,
 				);
 			}
+		}
 		st.log(
 			`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${
-				args.belowCap.length + args.dropped.length
+				args.belowCap.length + args.dropped.length + leadNotFiled.length
 			} not filed${args.checkOn ? `, check ${(args.checkMs / 1000).toFixed(0)}s` : ", check off"}`,
 		);
 		// The counts and every unfiled finding with its reason live on the review card: the
@@ -8326,6 +8406,7 @@ export function createTurnLoop(
 			...args.dropped.map(
 				(d) => `- dropped: ${findingHead(d.finding)} — ${d.reason}`,
 			),
+			...leadNotFiled,
 		];
 		writeReviewFindingsCard(st, cur, filed, notFiled, args);
 	}

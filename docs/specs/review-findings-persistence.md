@@ -84,6 +84,40 @@ Code partitions the stored set by that prompt prefix:
 - Leads do not hold the review's Done: `findingsHold` ignores linked children in
   `backlog` stage (a lead is optional work, not a commitment).
 
+#### Lead fingerprint dedupe
+
+Each audit run carries its open leads into the next audit (docs/specs/security-audit-harness.md
+"Review behavior": every `needs_validation` record has a fingerprint, and a proposal
+preserves it). Until OTTR-870 every lead filed a new backlog card, so each release
+review of a project refiled the same leads (run-7 carried 51 of 59 leads over
+unchanged).
+
+- The lead prompt carries the record's fingerprint on one fixed line:
+  `Fingerprint: <value>`. The board reads it with one strict pattern: a line that
+  starts with the exact prefix `Fingerprint: `, value = the trimmed rest of that
+  line. A lead without the line files as today (no fallback patterns).
+- Before the board files a lead, it looks in the same project's cards for one
+  whose prompt carries the same fingerprint value. Among several matches the
+  lowest card id decides, with priority: open (not done, not cancelled), then
+  cancelled, then done.
+  - Open card: no new card. The board appends one line to that card's details:
+    `Seen again in review <review id> on <YYYY-MM-DD>.` The review card's
+    Findings trail counts the lead as `- already open: #<card id> (<prompt
+    head>)` and the log says so too; the lead counts as not filed.
+  - Cancelled card: no new card, because the user declined the lead. The Findings
+    trail notes it (`- not filed: the user cancelled the same lead before,
+    card #<card id>`); the lead counts as not filed.
+  - Done card: the lead files as today, and the new card's details name the old
+    card (`The same fingerprint was already on done card #<card id>; the lead
+    came back.`).
+- A card filed for a lead joins the fingerprint index for the rest of the same
+  pass, so two leads with one fingerprint file once.
+
+The review prompt does not yet tell the reviewer to write the fixed line
+(`src/prompts.ts` wording changes need the user's approval). Until the wording
+lands, most leads carry no line and file as today; the dedupe activates lead by
+lead as prompts start carrying it.
+
 ### 5. research-report.md survives the worktree
 
 The report harvest (`readReportFile` -> `archiveReport` -> `task.report`) runs
@@ -166,6 +200,10 @@ before the run resolves.
 5. turn: lead findings file as backlog cards marked unverified, never enter the
    check input or the cap; below-cap confirmed findings stay logged; leads do
    not hold Done.
+6. turn (OTTR-870): a lead whose `Fingerprint:` line matches an open card files
+   no new card, and that card's details gain `Seen again in review <id> on
+   <date>.`; a cancelled match files nothing; a done match files a new card
+   whose details name the old card; a lead without the line files as today.
 
 ## Non-goals
 
@@ -177,3 +215,6 @@ before the run resolves.
 - No unverified marker column or UI badge; the mark is the card's details text.
 - No structured per-finding check verdict storage beyond the stamp; the card
   summary/details trail stays the check's record.
+- No dedupe of confirmed findings and no repair of the duplicate lead cards
+  filed before OTTR-870; the fixed line dedupes leads only, from its first
+  appearance in a lead prompt onward.

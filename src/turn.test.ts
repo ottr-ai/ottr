@@ -22781,6 +22781,171 @@ describe("stored review findings", () => {
 		expect(leadKids.every((k) => k.stage === "backlog")).toBe(true);
 	});
 
+	test("a lead whose fingerprint is on an open card is not filed again; the card learns it was seen again", async () => {
+		const record = baseRecord();
+		const lead = mkFinding(
+			"Needs validation: maybe a race in the scheduler\nOpen fact: the retry path can double-commit.\nFingerprint: fp-race",
+		);
+		const { store, loop, checkRuns } = storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		const old = store.createTask(
+			"Needs validation: maybe a race in the scheduler\nFingerprint: fp-race",
+		);
+		store.updateTask(old.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+
+		await loop.runTurn(store.name, review.id);
+
+		// No new card for the lead: the open card holds the same fingerprint.
+		const holders = store
+			.listTasks()
+			.filter((t) => t.prompt.includes("Fingerprint: fp-race"))
+			.map((t) => t.id);
+		expect(holders).toEqual([old.id]);
+		expect(kidsOf(store, review.id)).toHaveLength(0);
+
+		// The old card gained the "Seen again" line and stays an open backlog card.
+		const after = store.getTask(old.id)!;
+		expect(after.stage).toBe("backlog");
+		expect(after.cancelledAt).toBeNull();
+		expect(after.details).toMatch(
+			new RegExp(
+				`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.$`,
+			),
+		);
+
+		// The review's trail counts the lead as already open, not filed; the
+		// confirmed finding still went through the check and was dropped.
+		const reviewAfter = store.getTask(review.id)!;
+		expect(reviewAfter.details).toContain(`already open: #${old.id}`);
+		expect(reviewAfter.details).not.toContain("filed as card #");
+		expect(checkRuns).toHaveLength(1);
+	});
+
+	test("a lead whose fingerprint is on a cancelled card files nothing", async () => {
+		const record = baseRecord();
+		const lead = mkFinding(
+			"Needs validation: config load may double-read\nFingerprint: fp-config",
+		);
+		const { store, loop } = storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		const old = store.createTask(
+			"Needs validation: config load may double-read\nFingerprint: fp-config",
+		);
+		store.updateTask(old.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			cancelledAt: Date.now(),
+		});
+
+		await loop.runTurn(store.name, review.id);
+
+		// The user declined this lead: no new card, and the old card is untouched.
+		const holders = store
+			.listTasks()
+			.filter((t) => t.prompt.includes("Fingerprint: fp-config"))
+			.map((t) => t.id);
+		expect(holders).toEqual([old.id]);
+		expect(kidsOf(store, review.id)).toHaveLength(0);
+		const reviewAfter = store.getTask(review.id)!;
+		expect(reviewAfter.details).toContain(
+			`the user cancelled the same lead before, card #${old.id}`,
+		);
+	});
+
+	test("a lead whose fingerprint is on a done card files a new card that names the old one", async () => {
+		const record = baseRecord();
+		const lead = mkFinding(
+			"Needs validation: flaky retry on push\nFingerprint: fp-retry",
+		);
+		const { store, loop } = storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		const old = store.createTask(
+			"Needs validation: flaky retry on push\nFingerprint: fp-retry",
+		);
+		store.updateTask(old.id, { stage: "done", state: "idle" });
+
+		await loop.runTurn(store.name, review.id);
+
+		// The lead came back: it files as today, and its details name the old card.
+		const kids = kidsOf(store, review.id);
+		expect(kids).toHaveLength(1);
+		const refiled = kids[0]!;
+		expect(refiled.prompt).toBe(lead.prompt);
+		expect(refiled.stage).toBe("backlog");
+		expect(refiled.followUpOf).toBe(review.id);
+		expect(refiled.details).toContain("Unverified lead from review");
+		expect(refiled.details).toContain(
+			`The same fingerprint was already on done card #${old.id}; the lead came back.`,
+		);
+		const reviewAfter = store.getTask(review.id)!;
+		expect(reviewAfter.details).toContain(`filed as card #${refiled.id}`);
+		expect(reviewAfter.details).not.toContain("already open");
+	});
+
+	test("a lead without a fingerprint line files as today", async () => {
+		const record = baseRecord();
+		const lead = mkFinding("Needs validation: flaky retry on push");
+		const { store, loop } = storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = reviewCard(store);
+		// An unrelated open card holds a fingerprint; it must not catch the
+		// lineless lead, and it gains no "Seen again" line.
+		const other = store.createTask(
+			"Needs validation: another suspicion\nFingerprint: fp-other",
+		);
+		store.updateTask(other.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+
+		await loop.runTurn(store.name, review.id);
+
+		const kids = kidsOf(store, review.id);
+		expect(kids).toHaveLength(1);
+		expect(kids[0]!.prompt).toBe(lead.prompt);
+		expect(kids[0]!.details).toBe(
+			`Unverified lead from review ${review.id}: the second-model check did not run on this finding (needs validation).`,
+		);
+		expect(store.getTask(other.id)!.details ?? "").not.toContain("Seen again");
+	});
+
 	test("a release review refuses to publish while its stored findings are unchecked", async () => {
 		const record = baseRecord();
 		// Stored findings from an earlier (lost) turn; this turn records nothing.
