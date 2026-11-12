@@ -511,6 +511,55 @@ describe("reviewPrompt", () => {
 		expect(release).toContain("ui-ux-check skill");
 	});
 
+	test("normal, idle and release reviews include the bounded state-machine lens with or without a prior base", () => {
+		// Normal and idle reviews share reviewPrompt through fileArchReview.
+		for (const from of ["def5678", null]) {
+			for (const prompt of [
+				reviewPrompt({
+					target: "main",
+					sha: "abc1234",
+					from,
+					commits: 3,
+					alerts: "test alert summary",
+				}),
+				releasePrompt({
+					version: "v1.2.3",
+					from: from === null ? null : "v1.2.2",
+					sha: "abc1234",
+					commits: 3,
+					notes: "- fix",
+					alerts: "test alert summary",
+				}),
+			]) {
+				expect(prompt).toContain("Review the state machines too");
+				expect(prompt).toContain("fields that hold a lifecycle");
+				expect(prompt).toContain(
+					"a status or stage column, a flag, a nullable timestamp, an in-memory claim set",
+				);
+				expect(prompt).toContain(
+					"Start from the fields that the commits under review write",
+				);
+				expect(prompt).toContain("take the two fields with the most writers");
+				expect(prompt).toContain(
+					"For each field, list every writer and the from-state that it checks",
+				);
+				expect(prompt).toContain(
+					"Record as a finding each transition that no guard prevents and no document names",
+				);
+				expect(prompt).toContain("a write after a cancel");
+				expect(prompt).toContain("two writers with no compare-and-set");
+				expect(prompt).toContain("a state with no exit");
+				expect(prompt).toContain("a field pair that no code path may produce");
+				expect(prompt).toContain(
+					"with the call path that reaches it and a test or command that shows it",
+				);
+				expect(prompt).toContain(
+					"When the project has a lifecycle document, compare the writers with it and record each difference",
+				);
+			}
+		}
+	});
+
 	test("the review records ranked findings instead of filing cards", () => {
 		const prompt = reviewPrompt({
 			target: "main",

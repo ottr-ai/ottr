@@ -76,6 +76,49 @@ Text for `mergePrompt`, after the verification sentence:
 
 > Before you integrate, run the diff-security-review skill on the branch diff against the target (docs-only diffs skip it); a confirmed high or medium finding blocks the merge: fix it on the branch and re-run the gates, or call report_outcome with needs_you.
 
+## Implicit state-machine lens
+
+The user approved the exact OTTR-842 option A draft on 2026-11-12.
+The source is `/data/ottr/handoffs/OTTR-842.md:94-96`.
+This adds one inline paragraph to `reviewBody`, not a skill.
+Normal reviews, idle reviews and release reviews use the same paragraph.
+The lens uses the existing review range and proof policy.
+The earlier cleanup and security decisions stay unchanged.
+
+Approved text:
+
+> Review the state machines too: find the fields that hold a lifecycle (a status or stage column, a flag, a nullable timestamp, an in-memory claim set). Start from the fields that the commits under review write, then take the two fields with the most writers. For each field, list every writer and the from-state that it checks. Record as a finding each transition that no guard prevents and no document names (a write after a cancel, two writers with no compare-and-set, a state with no exit, a field pair that no code path may produce), with the call path that reaches it and a test or command that shows it. When the project has a lifecycle document, compare the writers with it and record each difference.
+
+### Scope and proof
+
+- Start with lifecycle fields that the commits under review write.
+- Select the two fields with the most writers.
+- If fewer than two fields qualify, review those fields only.
+- For each selected field, list every writer and its from-state guard, not only writers in the reviewed commits.
+- Record each transition that no guard prevents and no document names.
+- Check writes after cancel, writers without compare-and-set, states without exits, and invalid field pairs.
+- Include the call path and a test or command that shows each finding.
+- Record the proof command and its output.
+- If the project has a lifecycle document, compare every selected field's writers with it and record each difference.
+- Keep the review read-only. Do not change project code or live data to prove a finding.
+- If safe proof is absent, state the proof limit instead of a confirmed finding.
+- Do not claim full lifecycle coverage from this two-field check.
+
+### Acceptance checks
+
+- Normal, idle and release review prompts contain the exact approved paragraph.
+- Prompt tests check the field selection, writer guards, finding criteria, call path, proof and document comparison.
+- `docs/ARCH-REVIEWS.md` describes the same scope and read-only proof rules.
+- The README names this check and links to the review process.
+- Existing review gates and the architecture skill list stay unchanged.
+
+### Non-goals
+
+- No new skill or `requiredSkills` entry.
+- No lifecycle model, guard or behavior change.
+- No new task lifecycle document.
+- No two-review trial.
+
 ## Boundaries
 
 - The review stays read-only. The cleanup sweep records findings. It fixes nothing.

@@ -68,6 +68,11 @@ The **System** page (`/system`, in the sidebar under Overview) shows where the m
 
 The project's **Start review** button starts a read-only review card: full verification, mutation tests, a security audit, and a UI/UX check (the ui-ux-check skill) over the UI that the reviewed commits change. It ranks its findings, files the confirmed ones as task cards, files the ones tagged "Needs validation" as Backlog cards marked unverified (the second-model check never ran on them, and they never hold the review's Done) unless a card in the project already holds the lead's audit fingerprint, and it is done only when its confirmed findings are all done. The findings live on the review card from the moment the reviewer records them, and Done waits until a check pass has covered them. Review conventions live in the project's AGENTS.md. Every review turn reads AGENTS.md in its worktree. The retired `learnings` table in tasks.db stays unused.
 
+Normal, idle and release reviews also check implicit state machines.
+The read-only check selects the two lifecycle fields with the most writers among fields that the reviewed commits write.
+It checks writer guards and requires a call path plus test or command proof for each finding.
+See the [review process](docs/ARCH-REVIEWS.md#what-the-review-does) for its scope and proof rules.
+
 Ottr's security phase uses `skill://security-audit-harness`, even when the generic prompt names `security-audit`. Normal reviews use all six phases with the `quick` profile and disclose partial coverage, including for generic full-audit requests. Only an explicit scheduled deep security review uses `deep`. The skill writes structured findings and a coverage ledger, and both must pass its validators before proposals or cards. Only `confirmed` records receive security severity. Reports retain blocked or unproven `needs_validation` records without severity.
 
 The skill requires the Alate import and provision steps on each host and worker before use. If the skill is absent, the review reports this prerequisite instead of another skill. [The security audit spec](docs/specs/security-audit-harness.md) defines verdicts, evidence, and sandbox rules. Other review gates stay unchanged.

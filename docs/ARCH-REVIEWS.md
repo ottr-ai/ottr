@@ -54,6 +54,23 @@ The review runs read-only at a frozen commit and changes no code:
 5. A full security audit with the `security-audit` skill and the
    `codeguard-*` rules that match the files, then an architecture pass over
    module seams, coupling and over-engineering.
+6. A bounded implicit state-machine check for normal, idle and release reviews.
+   The user approved the exact [OTTR-842 option A draft](specs/review-cleanup-hardening.md#implicit-state-machine-lens) on 2026-11-12.
+   It is an inline lens in `reviewBody`, not a new skill.
+   - Start with lifecycle fields that the reviewed commits write, such as status, stage, flags, nullable timestamps or in-memory claim sets.
+   - Select the two fields with the most writers, or all qualifying fields if fewer than two exist.
+   - For each field, list every writer and its from-state guard, not only writers in the reviewed commits.
+   - Record each transition that no guard prevents and no document names.
+   - Check writes after cancel, writers without compare-and-set, states without exits, and invalid field pairs.
+   - Include the call path and a test or command that shows each finding.
+   - Record the proof command and its output.
+   - If the project has a lifecycle document, compare every selected field's writers with it and record each difference.
+   - Keep proof read-only. Do not change project code or live data to prove a finding.
+   - If safe proof is absent, state the proof limit instead of a confirmed finding.
+   - Do not claim full lifecycle coverage from this two-field check.
+
+The lens adds no `requiredSkills` entry and changes no lifecycle model or guard.
+It adds no task lifecycle document or two-review trial.
 
 Each merge turn also runs the `diff-security-review` skill on the branch diff
 before it integrates. A confirmed high or medium finding blocks the merge.
