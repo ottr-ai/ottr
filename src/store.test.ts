@@ -1458,7 +1458,7 @@ describe("diff capture columns", () => {
 		await reopened.close();
 	});
 
-	test("listTasks leaves out the raw diff and matches getTask on every other field", async () => {
+	test("listTasks leaves out diffText, details, report and diffFiles and matches getTask on every other field", async () => {
 		const store = await open(join(root, "diff-list"));
 		const task = await store.createTask("listed");
 		await store.updateTask(task.id, {
@@ -1468,10 +1468,23 @@ describe("diff capture columns", () => {
 			report: "the report",
 		});
 		const [listed] = await store.listTasks();
-		const { diffText, ...rest } = (await store.getTask(task.id))!;
+		const { diffText, details, report, diffFiles, ...rest } = (
+			await store.getTask(task.id)
+		)!;
 		expect(diffText).toBe("diff --git a/a.ts b/a.ts\n");
-		expect(listed).not.toHaveProperty("diffText");
-		// Strict: a column missing from the list read would show as undefined, not null.
+		expect(details).toBe("the details");
+		expect(report).toBe("the report");
+		expect(diffFiles).toEqual([{ file: "a.ts", plus: 1, minus: 0 }]);
+		// Wide text stays off the list rows (OTTR-866): in-checks, so a column lost
+		// from the SELECT shows as absent, not merely undefined.
+		expect("diffText" in listed).toBe(false);
+		expect("details" in listed).toBe(false);
+		expect("report" in listed).toBe(false);
+		expect("diffFiles" in listed).toBe(false);
+		// The narrow per-row read the list callers fall back to (OTTR-866).
+		expect(store.getTaskReport(task.id)).toBe("the report");
+		expect(store.getTaskReport("nope")).toBeNull();
+		// Strict: every remaining field still matches the full row exactly.
 		expect(listed).toStrictEqual(rest);
 		await store.close();
 	});

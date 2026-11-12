@@ -1328,7 +1328,10 @@ describe("createPrWatcher", () => {
 		// Open and unposted: the card waits for the user, not in Done.
 		expect(card.stage).toBe("in_progress");
 		expect(card.state).toBe("needs_you");
-		expect(card.details).toBe("## Summary\nreview 1");
+		// List rows carry no details (OTTR-866); read the row fresh.
+		expect((await s.store.getTask(card.id))!.details).toBe(
+			"## Summary\nreview 1",
+		);
 		expect((await s.store.getPrReview(7))!.reviewedHead).toBe(sha("a"));
 		expect((await s.store.getPrReviewByTask(card.id))!.number).toBe(7);
 		// One model call; the PR fields reach it only as DATA blocks after the fixed system prompt.
@@ -1429,7 +1432,9 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		// The system prompt names the marker format.
 		expect(s.prompts[0]).toContain("<!-- inline <path>:<line> -->");
-		const draft = parseReviewDraft((await s.cards())[0]!.details!);
+		const draft = parseReviewDraft(
+			(await s.store.getTask((await s.cards())[0]!.id))!.details!,
+		);
 		expect(draft.comments).toEqual([
 			{
 				path: "src/a.ts",
@@ -1750,7 +1755,9 @@ describe("createPrWatcher", () => {
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		expect(models).toEqual(["@plan"]);
-		expect((await s.cards())[0]!.details).toBe("## Summary");
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary",
+		);
 	});
 
 	test("a draft files nothing until it is ready", async () => {
@@ -2162,7 +2169,9 @@ describe("createPrWatcher", () => {
 		});
 		await s.watcher.reviewIdle();
 		expect((await s.store.getPrReview(24))!.reviewedHead).toBe(sha("c"));
-		expect((await s.cards())[0]!.details).toBe("## Summary\nreview 2");
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary\nreview 2",
+		);
 		const msg = s.prompts.at(-1)!;
 		expect(msg).toContain("focus on the error panel");
 		// The note is the maintainer's trusted text: outside every DATA block.

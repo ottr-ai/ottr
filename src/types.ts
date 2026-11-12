@@ -551,9 +551,14 @@ export interface Task {
 	findingsCheckedAt: number | null;
 }
 
-/** A task from a list read (ProjectStore.listTasks): every field but the raw diff, which only
- * getTask loads. Code that reads list rows takes this type, so a diffText read needs getTask. */
-export type ListedTask = Omit<Task, "diffText">;
+/** A task from a list read (ProjectStore.listTasks): every field but diffText, details,
+ * report and diffFiles, which only getTask loads (wide text the list callers never read).
+ * Code that reads list rows takes this type, so a read of any of those four needs getTask;
+ * the drawer fetches them per task. */
+export type ListedTask = Omit<
+	Task,
+	"diffText" | "details" | "report" | "diffFiles"
+>;
 
 export const PRIORITIES = ["P0", "P1", "P2", "P3"] as const;
 export type Priority = (typeof PRIORITIES)[number];

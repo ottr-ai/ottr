@@ -511,7 +511,7 @@ interface TurnRow {
 
 function toListedTask(
 	project: string,
-	r: Omit<TaskRow, "diff_text">,
+	r: Omit<TaskRow, "diff_text" | "details" | "report" | "diff_files">,
 ): ListedTask {
 	return {
 		id: r.id,
@@ -529,8 +529,6 @@ function toListedTask(
 		worktree: r.worktree,
 		sessionId: r.session_id,
 		summary: r.summary,
-		details: r.details,
-		report: r.report,
 		research: r.research === 1,
 		steps:
 			r.research_steps === "yes"
@@ -579,7 +577,6 @@ function toListedTask(
 		updateMergeHead: r.update_merge_head,
 		forkMergeHead: r.fork_merge_head,
 		holdHead: r.hold_head,
-		diffFiles: parseDiffFiles(r.diff_files),
 		uncommittedFiles: parseStringList(r.uncommitted_files),
 		workCheckLog: parseWorkCheckLog(r.work_check_log),
 		workCheckSendbacks: r.work_check_sendbacks,
@@ -599,7 +596,13 @@ function toListedTask(
 }
 
 function toTask(project: string, r: TaskRow): Task {
-	return { ...toListedTask(project, r), diffText: r.diff_text };
+	return {
+		...toListedTask(project, r),
+		details: r.details,
+		report: r.report,
+		diffFiles: parseDiffFiles(r.diff_files),
+		diffText: r.diff_text,
+	};
 }
 
 /** One parsed diffstat entry, or null when the entry is wrong-shaped. */
@@ -919,9 +922,17 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	findingsCheckedAt: "findings_checked_at",
 };
 
-// listTasks reads every column but the raw diff (up to 200 KB per card): the board, the
-// scheduler pass and every other list caller never read it. Derived from TASK_COLUMNS, so a
-// new Task field (a compile error there until mapped) joins the list read automatically.
+// Wide text columns the list read never selects (OTTR-866): diff_text alone is up to
+// 200 KB per card, and no list caller reads any of them; getTask loads them per task.
+const LIST_WIDE_COLUMNS: Record<string, true> = {
+	diff_text: true,
+	details: true,
+	report: true,
+	diff_files: true,
+};
+
+// Derived from TASK_COLUMNS, so a new Task field (a compile error there until mapped)
+// joins the list read automatically.
 const TASK_LIST_COLUMNS = [
 	"id",
 	"created_at",
@@ -931,7 +942,7 @@ const TASK_LIST_COLUMNS = [
 	// revision is not in TASK_COLUMNS (never caller-settable), so the board still gets it
 	// on list rows and can send it back with guarded edits.
 	"revision",
-	...Object.values(TASK_COLUMNS).filter((c) => c !== "diff_text"),
+	...Object.values(TASK_COLUMNS).filter((c) => !(c in LIST_WIDE_COLUMNS)),
 ].join(", ");
 
 const TURN_COLUMNS: Record<keyof TurnPatch, string> = {
@@ -3633,11 +3644,26 @@ export class ProjectStore {
 		});
 	}
 
+	/** The stored research report alone, without the wide row (OTTR-866: list rows no
+	 * longer carry it): legacy 'unknown'-steps rows resolve their steps against it
+	 * (OTTR-488) one narrow query at a time. */
+	getTaskReport(id: string): string | null {
+		const row = this.db
+			.query<{ report: string | null }, [string]>(
+				"SELECT report FROM tasks WHERE id = ?",
+			)
+			.get(id);
+		return row?.report ?? null;
+	}
+
 	async listTasks(): Promise<ListedTask[]> {
 		return this.queue.run(async () => {
 			return (
 				await this.db
-					.query<Omit<TaskRow, "diff_text">, []>(
+					.query<
+						Omit<TaskRow, "diff_text" | "details" | "report" | "diff_files">,
+						[]
+					>(
 						`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, rowid DESC`,
 					)
 					.all()

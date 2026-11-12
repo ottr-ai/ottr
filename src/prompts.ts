@@ -1,4 +1,4 @@
-import type { ListedTask, Stage, Turn, TurnKind } from "./types.ts";
+import type { Stage, Task, Turn, TurnKind } from "./types.ts";
 
 const STAGE_LABEL: Record<Stage, string> = {
 	todo: "todo",
@@ -536,9 +536,11 @@ ${NO_DESTRUCTION}
 Ask the user with the ask tool. When the check is done, call report_outcome answered: the summary is one line, and details hold the report from the skill.
 ${ONE_SHOT}`;
 
-/** Markdown handed to a follow-up task so a fresh omp session can continue a completed one. */
+/** Markdown handed to a follow-up task so a fresh omp session can continue a completed one.
+ * Takes the full Task: the handoff carries details and the research report, which list rows
+ * no longer hold (OTTR-866). */
 export function handoffMarkdown(o: {
-	task: ListedTask;
+	task: Task;
 	turns: Turn[];
 	sessionsDir: string;
 	savedDir?: string | null;

@@ -1900,7 +1900,8 @@ describe("hold acceptance checks", () => {
 		await f.waitOut();
 		// B is not covered by D or any other open PR: it is released and analyzed.
 		expect(await f.tick({ pulls: [{ n: 5, head: d }] })).toBe(1);
-		const card = (await forkCards(f.store))[0]!;
+		// List rows carry no report (OTTR-866); the result card reads fresh.
+		const card = await f.store.getTask((await forkCards(f.store))[0]!.id)!;
 		expect(card.report).toContain("held feature b");
 		// B's consumed row is deleted after the successful run; D's row survives.
 		expect(await holds(f.store)).toEqual([
@@ -1924,7 +1925,8 @@ describe("hold acceptance checks", () => {
 				states: { 5: { merged: false, head: b } },
 			}),
 		).toBe(1);
-		const card = (await forkCards(f.store))[0]!;
+		// List rows carry no report (OTTR-866); the result card reads fresh.
+		const card = await f.store.getTask((await forkCards(f.store))[0]!.id)!;
 		expect(card.report).toContain("held feature b");
 		expect(await holds(f.store)).toEqual([]);
 		expect((await featRow(f.store)).analyzedHead).toBe(c);

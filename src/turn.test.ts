@@ -25498,7 +25498,9 @@ describe("stored review findings", () => {
 			expect(k.state).toBe("idle");
 			expect(k.queuedAt).toBeNull();
 			expect(k.followUpOf).toBe(review.id);
-			expect(k.details).toContain("Unverified lead from review");
+			expect(store.getTask(k.id)!.details).toContain(
+				"Unverified lead from review",
+			);
 		}
 		const sandboxKid = leadKids.find((k) =>
 			k.prompt.startsWith("Needs validation: sandbox-only parser crash"),

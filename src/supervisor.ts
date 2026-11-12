@@ -1508,7 +1508,13 @@ export function createSupervisor(
 			log,
 			sessionText,
 			subagentTexts,
-			tasks,
+			// List rows carry no details (OTTR-866); only the retro lessons section
+			// reads them, so retro rows read fresh and other rows carry null.
+			tasks: tasks.map((x) => ({
+				...x,
+				details:
+					x.kind === "retro" ? (e.store.getTask(x.id)?.details ?? null) : null,
+			})),
 		});
 		if (settings.retroFilter && !frictionFilter(facts)) {
 			retroSkips.set(key, new Set(["friction-filter"]));
@@ -1534,9 +1540,13 @@ export function createSupervisor(
 		// tick would both pass the guard above and file two retros. One live retro per project
 		// holds against the list as it stands at filing time.
 		if (liveCard(await e.store.listTasks(), "retro")) return;
+		// t is a tick snapshot list row without details/report (OTTR-866); the handoff
+		// carries both, so it reads the row fresh. A vanished card skips this tick.
+		const full = await e.store.getTask(t.id);
+		if (full === null) return;
 		const turns = await e.store.listTurns(t.id);
 		const handoff = `${handoffMarkdown({
-			task: t,
+			task: full,
 			turns,
 			sessionsDir: e.store.sessionsDir,
 		})}\n\n${factsMarkdown(facts)}`;
@@ -1910,8 +1920,14 @@ export function createSupervisor(
 		let prompt = text;
 		try {
 			const handoffPath = join(e.store.tasksDir, "handoffs", `${child.id}.md`);
+			// t is a list row without details/report (OTTR-866); the handoff carries
+			// both, so it reads the row fresh. A vanished card falls into the catch
+			// below: best-effort, the plain prompt is self-contained.
+			const full = await e.store.getTask(t.id);
+			if (full === null)
+				throw new Error("source card vanished; handoff from the plain prompt");
 			let handoff = handoffMarkdown({
-				task: t,
+				task: full,
 				turns: await e.store.listTurns(t.id),
 				sessionsDir: e.store.sessionsDir,
 				savedDir: existsSync(join(e.store.tasksDir, "quarantine", t.id))
