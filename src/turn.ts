@@ -1364,6 +1364,9 @@ export function replyPatch(
 				: text === "."
 					? (task.pendingBy ?? by)
 					: "user",
+		// A queued user text owns the turn again: full wentStale protection is back
+		// (OTTR-877), including the hosted resume paths that reuse this patch.
+		pendingFeedback: false,
 		pendingImages: [...task.pendingImages, ...images],
 		state: "queued",
 		holdUntil: null,

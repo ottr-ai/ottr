@@ -165,7 +165,10 @@ async function wentStale(store: ProjectStore, t: ListedTask): Promise<boolean> {
 		fresh.state !== t.state ||
 		fresh.needsReason !== t.needsReason ||
 		fresh.cancelledAt !== t.cancelledAt ||
-		fresh.pendingPrompt !== null
+		// A supervisor feedback park carries a prompt with no queued turn behind it:
+		// passes settle through it (OTTR-877). A reply clears the flag, so real user
+		// text keeps the protection.
+		(fresh.pendingPrompt !== null && fresh.pendingFeedback !== true)
 	);
 }
 
@@ -398,7 +401,13 @@ export function prFeedbackPrompt(items: readonly PrFeedbackItem[]): string {
 	const block = (item: PrFeedbackItem): string => {
 		const label =
 			item.kind === "comment" ? "REVIEW COMMENT" : "CHANGES REQUESTED";
-		let shown = clean(item.body).trim();
+		let shown: string;
+		try {
+			shown = clean(item.body).trim();
+		} catch {
+			// clean refuses credential-shaped bodies; the park still names the author.
+			shown = "redacted: possible credential";
+		}
 		if (shown === "") shown = "(no text)";
 		else if (shown.length > 4000) {
 			shown = `${shown.slice(0, 4000)}\n(cut at 4000 characters)`;
@@ -1643,6 +1652,7 @@ export function createSupervisor(
 				queuedAt: ops.now(),
 				pendingPrompt: text,
 				pendingBy: "supervisor",
+				pendingFeedback: false,
 				pushSha: null,
 			}))
 		)
@@ -2074,6 +2084,9 @@ export function createSupervisor(
 				stage: "done",
 				state: "idle",
 				needsReason: null,
+				// The card is done: a feedback park's prompt (and flag) is void.
+				pendingPrompt: null,
+				pendingFeedback: false,
 				pushSha: onOrigin ? mergeCommit : null,
 				uncommittedFiles: uncommitted,
 			});
@@ -2293,7 +2306,12 @@ export function createSupervisor(
 				e,
 				t,
 				parked
-					? { state: "idle", needsReason: null }
+					? {
+							state: "idle",
+							needsReason: null,
+							pendingPrompt: null,
+							pendingFeedback: false,
+						}
 					: { state: "needs_you", needsReason: reason },
 			))
 		)
@@ -2676,6 +2694,9 @@ export function createSupervisor(
 			...(fresh.state === "idle" ? { needsReason: reason } : {}),
 			pendingPrompt: queuedReply(fresh.pendingPrompt, blocks),
 			pendingBy: fresh.pendingPrompt === null ? "supervisor" : fresh.pendingBy,
+			// Marks this prompt as supervisor feedback: wentStale passes it and any reply
+			// (turn dispatch included) clears it with the prompt.
+			pendingFeedback: true,
 		});
 		ops.appendLog(
 			e.store,

@@ -4818,6 +4818,7 @@ describe("prPass", () => {
 		expect(after.pendingPrompt).toContain("Please fix the leak");
 		expect(after.pendingPrompt).toContain("DATA>>>");
 		expect(after.pendingBy).toBe("supervisor");
+		expect(after.pendingFeedback).toBe(true);
 		expect(after.prWatchAt).toBe(COMMENT_TS);
 		const log = await Bun.file(store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 review feedback; card parked");
@@ -4915,6 +4916,121 @@ describe("prPass", () => {
 		expect(after.pendingPrompt).toContain("resolve the conflict first");
 		expect(after.pendingPrompt).toContain("REVIEW COMMENT by carol");
 		expect(after.pendingPrompt).toContain("Also fix the docs link");
+		// The appended blocks are supervisor data: flagged, so the verdict un-park can
+		// still reach this card (and a reply clears the flag with the prompt).
+		expect(after.pendingFeedback).toBe(true);
+		store.close();
+	});
+
+	test("a merged PR finishes a feedback-parked card done", async () => {
+		const store = prModeProject("pr-feedback-merged");
+		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		mkdirSync(join(root, "pr-feedback-merged", ".wt"), { recursive: true });
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			worktree: join(root, "pr-feedback-merged", ".wt"),
+			prWatchAt: 1_000_000_000,
+		});
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+			targetShas: { "refs/remotes/origin/main": MERGE_SHA },
+		});
+		const projects = new Map([
+			["proj", entry(store, { target: "origin/main" })],
+		]);
+		await tick(projects, ops);
+		const parked = store.getTask(t.id)!;
+		expect(parked.state).toBe("needs_you");
+		expect(parked.needsReason).toBe(prFeedbackReason(7));
+		expect(parked.pendingFeedback).toBe(true);
+		ops.time += 6 * 60_000; // past the PR poll window
+		// The PR merged since the park: gone from the open list, and the per-PR
+		// read answers the merge. The flagged prompt must not block the settle.
+		ops.apiResult = (url) =>
+			url.endsWith("/pulls/7")
+				? {
+						code: 0,
+						stdout: pullBody({
+							mergedAt: "2026-11-06T00:00:00Z",
+							mergeSha: MERGE_SHA,
+						}),
+						stderr: "",
+					}
+				: openList([]);
+		await tick(projects, ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBe(MERGE_SHA);
+		// The done write clears the park's prompt and flag with it.
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.pendingFeedback).toBe(false);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain("PR #7 merged; card done");
+		store.close();
+	});
+
+	test("a resolved conflict un-parks an appended feedback card", async () => {
+		const store = prModeProject("pr-feedback-unpark");
+		const t = prCard(store);
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: PR7_CONFLICT,
+			pendingPrompt: "resolve the conflict first",
+			pendingBy: "user",
+			prWatchAt: 1_000_000_000,
+		});
+		const ops = fakeOps({
+			apiResult: feedbackApi({
+				pull: pullBody({ state: "open", mergeable: false }),
+				issue: [comment("carol", "Also fix the docs link")],
+			}),
+		});
+		const projects = new Map([["proj", entry(store)]]);
+		await tick(projects, ops);
+		const parked = store.getTask(t.id)!;
+		expect(parked.state).toBe("needs_you");
+		expect(parked.needsReason).toBe(PR7_CONFLICT);
+		expect(parked.pendingPrompt).toContain("resolve the conflict first");
+		expect(parked.pendingPrompt).toContain("REVIEW COMMENT by carol");
+		expect(parked.pendingFeedback).toBe(true);
+		ops.time += 6 * 60_000; // past the PR poll window
+		// GitHub can merge again and no new feedback arrived: the verdict un-park
+		// drops the appended blocks and their flag together.
+		ops.apiResult = feedbackApi({
+			pull: pullBody({ state: "open", mergeable: true }),
+		});
+		await tick(projects, ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.pendingFeedback).toBe(false);
+		store.close();
+	});
+
+	test("a credential-shaped comment parks redacted", async () => {
+		const store = prModeProject("pr-feedback-credential");
+		const t = prCard(store);
+		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const ops = fakeOps({
+			apiResult: feedbackApi({
+				issue: [
+					comment("alice", 'api_key: "0123456789abcdef0123456789abcdef"'),
+				],
+			}),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(prFeedbackReason(7));
+		// The park still names the author, but the refused body never reaches it.
+		expect(after.pendingPrompt).toContain("REVIEW COMMENT by alice");
+		expect(after.pendingPrompt).toContain("redacted: possible credential");
+		expect(after.pendingPrompt).not.toContain("0123456789abcdef");
+		expect(after.pendingFeedback).toBe(true);
+		expect(after.prWatchAt).toBe(COMMENT_TS);
 		store.close();
 	});
 

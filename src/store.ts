@@ -334,6 +334,7 @@ interface TaskRow {
 	pr_url: string | null;
 	pr_head_sha: string | null;
 	pr_watch_at: number | null;
+	pending_feedback: number;
 	source_pr_number: number | null;
 	source_pr_url: string | null;
 	source_pr_head_ref: string | null;
@@ -562,6 +563,7 @@ function toListedTask(
 		prUrl: r.pr_url,
 		prHeadSha: r.pr_head_sha,
 		prWatchAt: r.pr_watch_at,
+		pendingFeedback: r.pending_feedback === 1,
 		sourcePrNumber: r.source_pr_number,
 		sourcePrUrl: r.source_pr_url,
 		sourcePrHeadRef: r.source_pr_head_ref,
@@ -879,6 +881,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	prUrl: "pr_url",
 	prHeadSha: "pr_head_sha",
 	prWatchAt: "pr_watch_at",
+	pendingFeedback: "pending_feedback",
 	sourcePrNumber: "source_pr_number",
 	sourcePrUrl: "source_pr_url",
 	sourcePrHeadRef: "source_pr_head_ref",

@@ -317,7 +317,9 @@ DATA blocks (`<<<DATA` ... `DATA>>>`, each body through `clean()`), one
 block per comment or review, with the author login and the ISO time in the
 block label (`REVIEW COMMENT by <login> at <iso>` / `CHANGES REQUESTED by
 <login> at <iso>`). A fixed trusted header above the blocks names them
-untrusted. A body is capped at 4000 characters with a cut marker; over a
+untrusted. A body that `clean()` refuses (a credential-shaped text) parks as the marker
+`redacted: possible credential` in its block, with the author label kept. A
+body is capped at 4000 characters with a cut marker; over a
 50000-character budget the oldest blocks drop with an omission line, the
 newest kept. The park is one task write that also advances the cutoff to
 the newest item, so the same comment never parks twice (one dedupe per
@@ -325,6 +327,14 @@ review round, like the CI-failure reply). Feedback that arrives while the
 card is parked appends its blocks to the queued text; the conflict reason
 stays, so the mergeability un-park keeps working. The card log gets one
 line per park write.
+
+The park writes the `pending_feedback` flag with the prompt: it marks the
+queued text as supervisor-written reviewer data, not a user reply.
+`wentStale` ignores a flagged prompt, so the merge verdict, the merged done
+write and the closed park settle through it; a reply or steer clears the
+flag and keeps today's protection. Moving the card off the park clears the
+prompt and the flag together: the un-park to idle, the merged done write,
+and a CI-failure requeue.
 
 A reply on the parked card queues a work fix turn (stage `in_progress`);
 the merge turn after it re-ships the branch and updates the same pull
@@ -686,6 +696,10 @@ server remains the only writer of origin.
   in a later window parks nothing new. A `CHANGES_REQUESTED` review after
   the cutoff parks the same way. The first sweep after the park initializes
   nothing and a reply on the parked card queues a work fix turn whose merge
-  turn updates the same PR. Fresh and migrated databases converge on
-  `pr_watch_at`.
+  turn updates the same PR. A merged pull request finishes a feedback-parked
+  card done; a conflict resolved on GitHub un-parks an appended card and
+  clears the blocks with the flag; a credential-shaped comment parks with
+  the author label and the `redacted: possible credential` marker only.
+  Fresh and migrated databases converge on `pr_watch_at` and
+  `pending_feedback`.
 - `bun run check` and `bun test` exit 0 from the worktree root.

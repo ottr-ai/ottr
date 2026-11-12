@@ -160,6 +160,7 @@ describe("mergeAnywayPatch", () => {
 			queuedAt: patch.queuedAt,
 			pendingPrompt: null,
 			pendingBy: null,
+			pendingFeedback: false,
 			needsReason: null,
 			asked: null,
 		});
@@ -221,6 +222,7 @@ function task(p: Partial<Task> = {}): Task {
 		prUrl: null,
 		prHeadSha: null,
 		prWatchAt: null,
+		pendingFeedback: false,
 		sourcePrNumber: null,
 		sourcePrUrl: null,
 		sourcePrHeadRef: null,

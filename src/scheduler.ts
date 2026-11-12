@@ -1263,6 +1263,9 @@ export function mergeAnywayPatch(
 		queuedAt: Date.now(),
 		pendingPrompt: null,
 		pendingBy: null,
+		// OTTR-877: the prompt goes with its flag — a feedback park's appended blocks are
+		// void once the user merges anyway.
+		pendingFeedback: false,
 		needsReason: null,
 		asked: null,
 	};
