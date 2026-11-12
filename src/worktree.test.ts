@@ -5304,4 +5304,44 @@ describe("saveDoneFiles (OTTR-826 P2)", () => {
 		expect(existsSync(join(saveDir, "gone.txt"))).toBe(false);
 		rmSync(join(wt, ".."), { recursive: true, force: true });
 	});
+
+	test("never runs a planted filter.<d>.clean while reading tracked changes", async () => {
+		const { wt, saveDir, dataRoot } = saveFixture();
+		// A work turn can write the shared gitdir (R5-1): repo-local config defines the
+		// driver and $GIT_DIR/info/attributes picks it, so plain git status runs the
+		// planted command in the board server while it hashes a dirty file. The marker
+		// and script live outside the worktree, so saveDoneFiles cannot move them.
+		const marker = join(wt, "..", "planted.clean");
+		const script = join(wt, "..", "clean.sh");
+		writeFileSync(script, `#!/bin/sh\ntouch '${marker}'\ncat\n`);
+		chmodSync(script, 0o755);
+		const config = (...args: string[]): void => {
+			const run = Bun.spawnSync([gitExe(), ...args], {
+				cwd: wt,
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (run.exitCode !== 0)
+				throw new Error(
+					`git ${args.join(" ")} failed: ${run.stderr.toString()}`,
+				);
+		};
+		config("config", "filter.evil.clean", script);
+		writeFileSync(join(wt, ".git", "info", "attributes"), "* filter=evil\n");
+		// The dirty tracked file forces status to run the clean filter over its content.
+		// The edit keeps the committed byte size: a size change alone decides "modified"
+		// without a content re-hash, so the planted clean would never run.
+		writeFileSync(join(wt, "tracked.txt"), "no longer\n");
+		// Control: the plant is live under plain git.
+		config("status", "--porcelain", "--untracked-files=no");
+		expect(existsSync(marker)).toBe(true);
+		rmSync(marker);
+
+		const r = await saveDoneFiles(wt, saveDir, dataRoot, 1024 * 1024);
+
+		// The save still read the dirty file, but the planted clean never ran.
+		expect(r.copied).toEqual(["tracked.txt"]);
+		expect(existsSync(marker)).toBe(false);
+		rmSync(join(wt, ".."), { recursive: true, force: true });
+	}, 30_000);
 });

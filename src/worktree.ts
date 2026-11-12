@@ -2921,8 +2921,21 @@ export async function saveDoneFiles(
 	}
 
 	// Tracked files with content changes copy; they stay in the worktree until it goes away.
-	const s = await git(
-		["status", "--porcelain", "-z", "--untracked-files=no"],
+	// sealedGit: a work turn can plant a filter.<d>.clean that plain git runs here (the
+	// regression test plants one). A repo with no commit yet has an empty index, so plain
+	// status has no tracked file to hash and no clean filter can run there; sealedGit
+	// needs a resolvable HEAD, so only such unborn repos skip the seal.
+	const canSeal =
+		(await git(["rev-parse", "-q", "--verify", "HEAD"], worktreePath)).code ===
+		0;
+	const s = await (canSeal ? sealedGit : git)(
+		[
+			"status",
+			"--porcelain",
+			"-z",
+			"--untracked-files=no",
+			"--ignore-submodules=dirty",
+		],
 		worktreePath,
 	);
 	if (s.code !== 0) throw new Error(s.stderr || "git status failed");
