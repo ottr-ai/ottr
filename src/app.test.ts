@@ -19336,6 +19336,33 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		a.store.close();
 	});
 
+	test("keeps the hold when the sighting row has no future reset", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-stale-full")),
+			name: "a",
+		};
+		const probe = held(a.store, "probe hold", {
+			holdUntil: NOW + 30 * 60_000,
+			holdProvider: "zai",
+			holdSetAt: NOW - 60_000,
+		});
+		// A credit row stuck at 100% with no named reset: it reads as free in the
+		// current report too, so it is not recovery evidence (OTTR-880).
+		const staleFull = quota([
+			window({ provider: "zai", usedPct: 100, resetsAt: null }),
+		]);
+		expect(releaseUsageHolds(staleFull, [a], NOW, staleFull)).toBe(0);
+		// A past reset is equally stale: not a sighting.
+		const pastReset = quota([
+			window({ provider: "zai", usedPct: 100, resetsAt: NOW - 1 }),
+		]);
+		expect(releaseUsageHolds(pastReset, [a], NOW, pastReset)).toBe(0);
+		const after = a.store.getTask(probe.id)!;
+		expect(after.holdUntil).toBe(NOW + 30 * 60_000);
+		expect(after.holdProvider).toBe("zai");
+		a.store.close();
+	});
+
 	test("no quota data keeps every hold until holdUntil", () => {
 		const a = {
 			store: ProjectStore.open(join(root, "quota-nodata")),

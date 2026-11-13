@@ -554,10 +554,12 @@ export function releaseUsageHolds(
 		// No data for the provider (a failed usage check included): holdUntil stays the bound.
 		if (rows.length === 0 || providerBlocked(rows, provider, now) !== null)
 			continue;
-		// Recovery evidence: an earlier refresh saw a window of this provider at 100%.
+		// Recovery evidence: an earlier refresh saw a blocking window of this provider
+		// (100% used with a future reset at that time). The same test both halves use:
+		// a stale row at 100% whose reset passed or is unnamed is not evidence — it
+		// reads as free here too, and treating it as the sighting would loop.
 		const seen =
-			prev !== null &&
-			forProvider(prev.limits, provider).some((l) => l.usedPct >= 100);
+			prev !== null && providerBlocked(prev.limits, provider, prev.at) !== null;
 		if (!seen) continue;
 		let freed = 0;
 		for (const c of cards) {

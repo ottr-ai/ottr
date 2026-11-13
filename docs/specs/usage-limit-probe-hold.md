@@ -32,8 +32,12 @@ A usage-limit death never parks needs_you.
 ## Early release (the quota refresh)
 
 `releaseUsageHolds` releases a hold early only with recovery evidence: an
-earlier refresh — after the hold was set (`holdSetAt`) — saw a window of the
-hold's provider at 100%, and the current refresh shows no blocking window.
+earlier refresh — after the hold was set (`holdSetAt`) — saw a blocking
+window of the hold's provider (100% used with a future reset at that time),
+and the current refresh shows no blocking window. Both halves use the same
+`providerBlocked` test, each at its own refresh time: a stale row at 100%
+whose reset passed or is unnamed is not evidence, because it reads as free
+in the current report too.
 app.ts keeps the previous report in memory and passes it to the refresh.
 
 A hold stamped from a silent report (a probe hold, an error-named reset) has
