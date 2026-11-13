@@ -21378,6 +21378,71 @@ describe("turn PR-mode merge settle", () => {
 		);
 	});
 
+	// OTTR-914: a merge turn that pauses on the ask tool must park the card with the
+	// agent's question and options, not with the lost-receipt text, and a reply must
+	// resume the merge turn.
+	test("a PR-mode merge turn that ends on an ask parks needs_you with the question and resumes on a reply", async () => {
+		const question =
+			"The Sonar gate fails because of main: fix main first, push anyway, or fix here?";
+		const { store, record, loop, task } = await prMergeSetup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				record.runs.push(o as never);
+				await o.onSession?.("sess-1");
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						runResult({
+							asked: [
+								{
+									question,
+									options: [
+										{ label: "fix main first" },
+										{ label: "push anyway" },
+									],
+									multi: false,
+									recommended: null,
+								},
+							],
+						}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(`Wants your answer: ${question}`);
+		expect(after.needsReason).not.toContain("without calling report_outcome");
+		expect(after.asked).toEqual([
+			{
+				question,
+				options: [{ label: "fix main first" }, { label: "push anyway" }],
+				multi: false,
+				recommended: null,
+			},
+		]);
+
+		// A reply to the card resumes the merge turn with the answer.
+		await store.updateTask(task.id, {
+			sessionId: "sess-1",
+			pendingPrompt: "push anyway",
+			state: "queued",
+			queuedAt: Date.now(),
+		});
+		saveSession(store, "sess-1");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2);
+		expect(record.runs[1]!.prompt).toContain("push anyway");
+	});
+
 	test("a user cancel during asynchronous PR open keeps its state and report", async () => {
 		const gate = Promise.withResolvers<void>();
 		const reached = Promise.withResolvers<void>();

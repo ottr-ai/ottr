@@ -6507,9 +6507,11 @@ export function createTurnLoop(
 		if (!(await canShipPr(st))) return;
 		const outcome = st.result.outcome;
 		if (outcome?.status !== "integrated") {
-			if (outcome === null)
+			if (outcome === null && st.result.asked === null)
 				// A lost receipt must not land via classify's git-integrated done
-				// path: nothing was merged, so ask for a human instead.
+				// path: nothing was merged, so ask for a human instead. An ask-pause
+				// keeps prNext null: classify parks the card on the agent's question
+				// (askedRule, the work-turn flow) and a reply resumes this merge turn.
 				st.prNext = {
 					stage: "merging",
 					state: "needs_you",
