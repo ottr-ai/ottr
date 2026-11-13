@@ -44,3 +44,11 @@ _Avoid_: generated title, auto title
 The card title that replaces the draft title one time. It is the run agent's
 first valid rename. After it lands, later renames change nothing.
 _Avoid_: agent title, rename title
+
+**Release age gate**:
+The rule that a release must be at least 7 days old before a gate may take it.
+_Avoid_: cooldown, minimum age check
+
+**Release line**:
+All releases of one package that share the same major and minor version.
+_Avoid_: version series, minor stream

@@ -65,8 +65,14 @@ function fakeNet() {
 				[PIN]: new Date(NOW - 60 * DAY).toISOString(),
 				"18.0.0-beta.1": new Date(NOW - 50 * DAY).toISOString(),
 			};
-			for (const [v, r] of releases)
+			const versions: Record<string, Record<string, unknown>> = {
+				[PIN]: {},
+				"18.0.0-beta.1": {},
+			};
+			for (const [v, r] of releases) {
 				time[v] = new Date(r.publishedAt).toISOString();
+				versions[v] = {};
+			}
 			return Response.json({
 				name: "@oh-my-pi/pi-coding-agent",
 				repository: {
@@ -74,6 +80,7 @@ function fakeNet() {
 					url: "git+https://github.com/can1357/oh-my-pi.git",
 				},
 				time,
+				versions,
 			});
 		}
 		const m = url.match(
@@ -264,6 +271,13 @@ describe("parsePackument", () => {
 					"18.11.0-rc.1": "2026-01-04T00:00:00Z",
 					"18.12.0": "not a date",
 					"18.8.0": "2026-01-01T00:00:00Z",
+					// 18.13.0 has a time entry but no versions entry: the registry removed it.
+					"18.13.0": "2026-01-05T00:00:00Z",
+				},
+				versions: {
+					"18.9.0": { deprecated: "superseded by 18.10.0" },
+					"18.9.1": {},
+					"18.10.0": {},
 				},
 			},
 			"18.8.0",
@@ -274,6 +288,8 @@ describe("parsePackument", () => {
 			"18.9.1",
 			"18.10.0",
 		]);
+		// deprecated is true when the versions entry names a string.
+		expect(p.releases.map((r) => r.deprecated)).toEqual([true, false, false]);
 	});
 
 	test("a packument without a time map throws", () => {
@@ -378,6 +394,19 @@ describe("bumpTarget", () => {
 		).toBe("1.0.2");
 	});
 
+	test("an unreviewed young release unsettles the line: no target", () => {
+		// The walk stops at the unreviewed 1.0.3, but it still unsettles the line.
+		const releases = [rel("1.0.1", 12), rel("1.0.2", 9), rel("1.0.3", 2)];
+		expect(
+			bumpTarget(releases, { "1.0.1": pass, "1.0.2": pass }, () => true, NOW),
+		).toBeNull();
+		// Past the cap the wait lifts anyway: the aged 1.0.2 is today's pick.
+		const old = [rel("1.0.1", 20), rel("1.0.2", 9), rel("1.0.3", 2)];
+		expect(
+			bumpTarget(old, { "1.0.1": pass, "1.0.2": pass }, () => true, NOW),
+		).toBe("1.0.2");
+	});
+
 	test("an open fail card stops the walk; a cleared one lets it pass", () => {
 		const releases = [rel("1.0.1", 20), rel("1.0.2", 9), rel("1.0.3", 8)];
 		const verdicts = { "1.0.1": pass, "1.0.2": fail("T-1"), "1.0.3": pass };
@@ -400,6 +429,24 @@ describe("bumpTarget", () => {
 		expect(
 			bumpTarget([rel("1.0.1", age)], { "1.0.1": pass }, () => true, NOW),
 		).toBe("1.0.1");
+	});
+
+	test("an unsettled line holds the pin though the aged release passed", () => {
+		const releases = [rel("1.2.0", 8), rel("1.2.5", 2)];
+		const verdicts = { "1.2.0": pass, "1.2.5": pass };
+		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBeNull();
+	});
+
+	test("a line past the cap falls back to the aged release", () => {
+		const releases = [rel("1.2.0", 15), rel("1.2.5", 2)];
+		const verdicts = { "1.2.0": pass, "1.2.5": pass };
+		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.2.0");
+	});
+
+	test("an older settled line is the target while the newest line waits", () => {
+		const releases = [rel("1.1.9", 30), rel("1.2.0", 8), rel("1.2.5", 2)];
+		const verdicts = { "1.1.9": pass, "1.2.0": pass, "1.2.5": pass };
+		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.1.9");
 	});
 });
 

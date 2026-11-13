@@ -15,6 +15,7 @@ import {
 	ompBumpCardPrompt,
 	ompFailCardPrompt,
 } from "./prompts.ts";
+import { compareVersions, settledLineTarget } from "./releaseLine.ts";
 import { singleFlightTick } from "./singleFlight.ts";
 
 export const OMP_WATCH_GATES = {
@@ -22,6 +23,8 @@ export const OMP_WATCH_GATES = {
 	reviewsPerTick: 5,
 	/** npm release age a bump target needs. */
 	ageDays: 7,
+	/** The oldest a release line waits for a young release; past this the cap lifts the wait. */
+	capDays: 14,
 	/** A release without GitHub notes is retried for this long after its npm publish. */
 	notesGraceMs: 86_400_000,
 	/** Release notes are cut to this many characters for the model. */
@@ -74,16 +77,8 @@ export function parsePin(dockerfile: string): string | null {
 	return PIN_RE.exec(dockerfile)?.[1] ?? null;
 }
 
-/** Numeric x.y.z order; both sides must match VERSION_RE. */
-export function compareVersions(a: string, b: string): number {
-	const pa = a.split(".").map(Number);
-	const pb = b.split(".").map(Number);
-	for (let i = 0; i < 3; i++) {
-		const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-		if (d !== 0) return d;
-	}
-	return 0;
-}
+// Numeric x.y.z order lives in ./releaseLine.ts now; the export stays for existing imports.
+export { compareVersions };
 
 /** One verdict entry; null when it fails the shape checks. */
 function parseVerdictEntry(v: unknown): OmpVerdict | null {
@@ -188,11 +183,17 @@ export function parseRepo(repository: unknown): string | null {
 	return repo !== null && REPO_RE.test(repo) ? repo : null;
 }
 
-export type OmpRelease = { version: string; publishedAt: number };
+export type OmpRelease = {
+	version: string;
+	publishedAt: number;
+	deprecated?: boolean;
+};
 
 /**
- * The npm packument's x.y.z versions newer than the pin, ascending, with their publish times,
- * and the GitHub repo that holds the release notes (null when the packument names none).
+ * The npm packument's x.y.z versions newer than the pin, ascending, with their publish times
+ * (a time entry without a versions entry is a removed version and drops out), the packument's
+ * deprecated flag on each release, and the GitHub repo that holds the release notes (null
+ * when the packument names none).
  */
 export function parsePackument(
 	body: unknown,
@@ -200,13 +201,20 @@ export function parsePackument(
 ): { releases: OmpRelease[]; repo: string | null } {
 	if (!isObj(body) || !isObj(body.time))
 		throw new Error("npm packument has no time map");
+	const versions = isObj(body.versions) ? body.versions : {};
 	const releases: OmpRelease[] = [];
 	for (const [version, t] of Object.entries(body.time)) {
 		if (!VERSION_RE.test(version) || typeof t !== "string") continue;
 		const publishedAt = Date.parse(t);
 		if (!Number.isFinite(publishedAt)) continue;
 		if (compareVersions(version, pin) <= 0) continue;
-		releases.push({ version, publishedAt });
+		if (!(version in versions)) continue;
+		const v = versions[version];
+		releases.push({
+			version,
+			publishedAt,
+			deprecated: isObj(v) && typeof v.deprecated === "string",
+		});
 	}
 	releases.sort((a, b) => compareVersions(a.version, b.version));
 	return { releases, repo: parseRepo(body.repository) };
@@ -215,7 +223,10 @@ export function parsePackument(
 /**
  * The highest version the pin may move to (spec "Bump target"): walk the releases above the
  * pin in ascending order, stop at the first one without a verdict or with a fail whose card
- * is not cleared; a passed (or cleared) release at least ageDays old is a candidate.
+ * is not cleared; the release line gate (docs/specs/release-line-gate.md) then picks from
+ * the full release list (settle state is registry state, so an unreviewed young release
+ * still blocks its line), and the target is the highest walked release that is aged and at
+ * or below the pick.
  */
 export function bumpTarget(
 	releases: OmpRelease[],
@@ -223,13 +234,26 @@ export function bumpTarget(
 	cleared: (cardId: string) => boolean,
 	now: number,
 ): string | null {
-	let target: string | null = null;
+	const walked: OmpRelease[] = [];
 	for (const r of releases) {
 		const v = verdicts[r.version];
 		if (v === undefined) break;
 		if (v.verdict === "fail" && (v.cardId === null || !cleared(v.cardId)))
 			break;
-		if (now - r.publishedAt >= OMP_WATCH_GATES.ageDays * DAY_MS)
+		walked.push(r);
+	}
+	const pick = settledLineTarget(
+		releases,
+		now,
+		OMP_WATCH_GATES.ageDays * DAY_MS,
+		OMP_WATCH_GATES.capDays * DAY_MS,
+	);
+	if (pick === null) return null;
+	let target: string | null = null;
+	for (const r of walked) {
+		if (now - r.publishedAt < OMP_WATCH_GATES.ageDays * DAY_MS) continue;
+		if (compareVersions(r.version, pick) > 0) continue;
+		if (target === null || compareVersions(r.version, target) > 0)
 			target = r.version;
 	}
 	return target;

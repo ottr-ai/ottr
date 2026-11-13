@@ -82,8 +82,9 @@ flight: a tick that starts while one runs joins it. For each project with `ompWa
 Walk the reviewed versions above the pin in ascending order:
 
 - Stop at the first version that has no verdict, or that failed and whose card is not cleared.
-- A version is a candidate when it passed (or failed with a cleared card) and its npm publish
-  time is 7 or more days old.
+- A version is a candidate when it passed (or failed with a cleared card) and it also
+  satisfies the settled-line rule of docs/specs/release-line-gate.md; that rule holds the
+  7-day age gate and its 14-day cap.
 - The target is the highest candidate before the stop.
 
 File the bump card when a target exists, no earlier bump card is still open (stage not `done`),
