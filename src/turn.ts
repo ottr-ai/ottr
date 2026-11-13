@@ -4087,8 +4087,15 @@ export function createTurnLoop(
 	): Promise<boolean> {
 		if (!gateApplies(kind, idn, task)) return true;
 		const live = (await store.getTask(id)) ?? task;
+		// OTTR-904 send-back: queued text with pendingBy "supervisor" (work-check
+		// send-backs, the screenshot resume, other board resumes) never runs the
+		// gate and never changes the fingerprint — the gate reads it as null. The
+		// omp session still receives the text; only the gate ignores it. User text
+		// (an edit, a reply, or a steer) keeps the gate.
 		const pending =
-			live.pendingPrompt !== null && live.pendingPrompt !== "."
+			live.pendingPrompt !== null &&
+			live.pendingPrompt !== "." &&
+			live.pendingBy !== "supervisor"
 				? live.pendingPrompt
 				: null;
 		const seen = live.gate?.seen ?? null;

@@ -25837,6 +25837,44 @@ describe("prompt gate", () => {
 		expect(after.gate?.parked).toBe(false);
 	});
 
+	test("a supervisor send-back never runs the gate; a user reply does", async () => {
+		let calls = 0;
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return clearCheck();
+			},
+		});
+		const task = store.createTask("clear work");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.gate?.hash).not.toBeNull();
+		expect(calls).toBe(1);
+		// The work check's send-back requeues the card with supervisor text: the next
+		// start must skip by hash, run no gate model call, and still deliver the text.
+		store.updateTask(task.id, {
+			state: "queued",
+			queuedAt: Date.now(),
+			pendingPrompt:
+				"The board's check run stopped at a blocker. Fix it and report ready again.",
+			pendingBy: "supervisor",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(1);
+		const after = store.getTask(task.id)!;
+		expect(after.state).toBe("idle");
+		expect(after.gate?.parked).toBe(false);
+		// A user reply keeps the gate: the model judges prompt plus reply.
+		store.updateTask(task.id, {
+			state: "queued",
+			queuedAt: Date.now(),
+			pendingPrompt: "use Postgres",
+			pendingBy: "user",
+		});
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(2);
+	});
+
 	test("a pass folds the queued answer into seen and keeps earlier answers", async () => {
 		let calls = 0;
 		let userMessages: string | null | undefined;

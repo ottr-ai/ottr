@@ -240,6 +240,13 @@ export interface GateAssumption {
   values of `seen` and `pending` (a pending of `"."` counts as null) joined
   with `"\n\n"`; null when both are null. Earlier answers are never dropped:
   a pass or Start anyway folds the newest queued text into `seen`.
+- Queued text whose `pendingBy` is `"supervisor"` — work-check send-backs,
+  the screenshot resume, other board resumes — never runs the gate and never
+  changes the fingerprint: the gate's pending input reads null for it, so it
+  never reaches the model, never folds into `seen`, and never breaks a
+  stored hash. Only the prompt before the first work turn and user text (an
+  edit, a reply, or a steer) run the gate. The omp session still receives
+  the supervisor text; only the gate ignores it.
 - `gateCompareText(prompt, pending, seen)` — `gateEffectiveText(prompt,
   gateUserText(pending, seen))`; consumed replies compare through `seen`.
 - `gateFingerprint(text)` — sha256 hex.
@@ -368,7 +375,7 @@ logs under it. Parked gate turns write no turn row (rows appear at startRun).
 
 ### Evaluation
 
-1. Skip check (fingerprint) — match logs one `+ prompt gate: passed earlier for this text` line and proceeds.
+1. Skip check (fingerprint) — match logs one `+ prompt gate: passed earlier for this text` line and proceeds. The pending input excludes queued text with `pendingBy: "supervisor"` (board resumes, work-check send-backs), so a supervisor send-back on a passed card skips by hash and runs no model call; a user reply or steer keeps the gate.
 2. Unresolved-section check: when the compared text carries an `Open questions`
    section (a markdown heading `#`–`######` "Open questions", or a bold
    `**Open questions**` line) **and** no user text is queued (`pending === null`
