@@ -65,34 +65,3 @@ export function assignTopics(
 	}
 	return out;
 }
-
-/** Topic sections for the board: top 10 by member count desc then label asc; the rest plus unclassified rows ride in a final "Everything else" section. */
-export function groupTopics<T extends { topic: string | null }>(
-	tasks: T[],
-): { key: string; label: string; tasks: T[] }[] {
-	const byKey = new Map<string, { key: string; label: string; tasks: T[] }>();
-	for (const t of tasks) {
-		const label = t.topic?.trim() ?? "";
-		const key = label.toLowerCase();
-		if (key === "") continue;
-		let section = byKey.get(key);
-		if (section === undefined) {
-			section = { key, label, tasks: [] };
-			byKey.set(key, section);
-		}
-		section.tasks.push(t);
-	}
-	const sorted = [...byKey.values()].sort(
-		(a, b) => b.tasks.length - a.tasks.length || (a.label < b.label ? -1 : 1),
-	);
-	const sections = sorted.slice(0, 10);
-	const other = [
-		...sorted.slice(10).flatMap((s) => s.tasks),
-		...tasks.filter((t) => (t.topic?.trim().toLowerCase() ?? "") === ""),
-	];
-	// Key "": every topic key is non-empty (blank topics skip above), so a topic named
-	// "other" never shares Everything else's collapse or page state.
-	if (other.length > 0)
-		sections.push({ key: "", label: "Everything else", tasks: other });
-	return sections;
-}

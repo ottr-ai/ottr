@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { assignTopics, groupTopics } from "./topics.ts";
+import { assignTopics } from "./topics.ts";
 
 const row = (
 	id: string,
@@ -11,8 +11,6 @@ const row = (
 	title,
 	sessionTitle,
 });
-
-const t = (id: string, topic: string | null) => ({ id, topic });
 
 describe("assignTopics", () => {
 	test("a candidate needs df >= 3; plurals normalize into the same term", () => {
@@ -93,69 +91,5 @@ describe("assignTopics", () => {
 				["d", null],
 			]),
 		);
-	});
-});
-
-describe("groupTopics", () => {
-	test("keys are case-insensitive; the label keeps first-seen casing", () => {
-		const sections = groupTopics([
-			t("a", "Auth"),
-			t("b", "auth"),
-			t("c", "AUTH"),
-		]);
-		expect(sections).toEqual([
-			{
-				key: "auth",
-				label: "Auth",
-				tasks: [t("a", "Auth"), t("b", "auth"), t("c", "AUTH")],
-			},
-		]);
-	});
-
-	test("busiest first, ties alphabetical, cap of 10 named sections", () => {
-		const tasks = [
-			...Array.from({ length: 5 }, (_, i) => t(`big${i}`, "big")),
-			...Array.from({ length: 12 }, (_, i) =>
-				t(`s${i}`, `topic${String(i).padStart(2, "0")}`),
-			),
-		];
-		const sections = groupTopics(tasks);
-		expect(sections).toHaveLength(11); // 10 named + Everything else
-		expect(sections[0]?.key).toBe("big");
-		expect(sections[1]?.key).toBe("topic00");
-		expect(sections[9]?.key).toBe("topic08");
-		const other = sections[10]!;
-		expect(other.key).toBe("");
-		expect(other.label).toBe("Everything else");
-		expect(other.tasks.map((x) => x.id)).toEqual(["s9", "s10", "s11"]);
-	});
-
-	test("null topics land in a final Everything else section", () => {
-		const sections = groupTopics([
-			t("a", "one"),
-			t("b", "one"),
-			t("c", null),
-			t("d", null),
-		]);
-		expect(sections).toEqual([
-			{ key: "one", label: "one", tasks: [t("a", "one"), t("b", "one")] },
-			{
-				key: "",
-				label: "Everything else",
-				tasks: [t("c", null), t("d", null)],
-			},
-		]);
-	});
-
-	test("a topic named other keeps a key apart from Everything else", () => {
-		const keys = groupTopics([t("a", "other"), t("b", null)]).map((s) => s.key);
-		expect(new Set(keys).size).toBe(keys.length);
-	});
-
-	test("no Everything else when it would hold zero tasks", () => {
-		expect(groupTopics([t("a", "one")])).toEqual([
-			{ key: "one", label: "one", tasks: [t("a", "one")] },
-		]);
-		expect(groupTopics([])).toEqual([]);
 	});
 });

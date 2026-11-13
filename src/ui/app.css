@@ -3063,15 +3063,8 @@ mark as text — hue only repeats what the word says (WCAG 2.1 AA, use of color 
 		display: none;
 	}
 	/* The active tab right above already names the lane and carries its count: the head
-	   would repeat both. Mobile keeps only what the tab cannot show — the done lane's
-	   grouping tools — and drops the head entirely when it would be empty. */
-	.stage-name {
-		display: none;
-	}
-	.stage-head > .count {
-		display: none;
-	}
-	.stage-head:not(:has(.lane-tools)) {
+	   would repeat both, so mobile drops the head entirely. */
+	.stage-head {
 		display: none;
 	}
 }
@@ -3753,29 +3746,6 @@ a.pr-link:hover {
 	background: var(--panel);
 }
 
-/* ---- Done lane topic sections ---- */
-
-.topic-head {
-	position: sticky;
-	top: -9px;
-	z-index: 2;
-	display: flex;
-	align-items: center;
-	gap: 7px;
-	width: 100%;
-	padding: 5px 2px 5px 0;
-	/* Reuse the done column's recessed background so cards scroll under the head. */
-	background: color-mix(in srgb, var(--field) 60%, var(--panel));
-	/* No rule: the head's own fill already separates it from the cards below. */
-	border: 0;
-	cursor: pointer;
-	text-align: left;
-	font: inherit;
-}
-.topic-head:focus-visible {
-	outline: 2px solid var(--accent);
-	outline-offset: 2px;
-}
 .chev {
 	width: 12px;
 	height: 12px;
@@ -3794,9 +3764,6 @@ a.pr-link:hover {
 	flex-shrink: 0;
 	transition: transform 160ms var(--ease);
 }
-.topic[data-collapsed] .chev {
-	transform: rotate(-90deg);
-}
 .topic-count {
 	margin-left: auto;
 	padding-right: 2px;
@@ -3805,79 +3772,9 @@ a.pr-link:hover {
 	color: var(--dim);
 	font-variant-numeric: tabular-nums;
 }
-.topic-body {
-	display: grid;
-	grid-template-rows: 1fr;
-	transition: grid-template-rows 160ms var(--ease);
-}
-.topic[data-collapsed] .topic-body {
-	grid-template-rows: 0fr;
-}
-.topic-cards {
-	overflow: hidden;
-	min-height: 0;
-	display: flex;
-	flex-direction: column;
-	gap: var(--card-gap);
-	padding: 6px 0 2px;
-	/* No padding transition: animating padding thrashes layout, and the 6px snap
-	   is invisible inside the 160ms grid-template-rows collapse above. */
-}
-.topic[data-collapsed] .topic-cards {
-	padding-block: 0;
-}
-/* Quiet collapse/expand-all controls in the done stage head. */
-.lane-tools {
-	display: flex;
-	gap: 2px;
-	/* Hug the count badge at the right edge; space-between alone would center the tools. */
-	margin-left: auto;
-}
-.lane-tools button {
-	/* Square icon control, sized to the count badge so the done head keeps the common height. */
-	display: grid;
-	place-items: center;
-	width: 18px;
-	/* The global button min-height (32px) is what inflated the done head past its peers. */
-	min-height: 0;
-	height: 18px;
-	padding: 0;
-	color: var(--dim);
-	background: none;
-	border: 1px solid transparent;
-	border-radius: 3px;
-	cursor: pointer;
-}
-/* The text segments keep their label width; only the icon controls are squares. */
-.lane-tools .view-toggle {
-	width: auto;
-	padding: 0 7px;
-	white-space: nowrap;
-	font: 600 12px / 1.4 var(--font);
-}
-/* The pressed segment names the view the lane shows, like the card log's pair. */
-.lane-tools .view-toggle[aria-pressed="true"] {
-	color: var(--text-strong);
-	background: var(--card);
-	border-color: var(--line);
-}
-.lane-tools button:hover {
-	color: var(--text-strong);
-	border-color: var(--line-soft);
-}
-.lane-tools button:focus-visible {
-	outline: 2px solid var(--accent);
-	outline-offset: 1px;
-}
-/* The fresh badge rides with the count even with the tools' auto margin present. */
-.stage[data-stage="done"] .stage-head .count.fresh {
-	margin-left: 0;
-}
 
 @media (prefers-reduced-motion: reduce) {
-	.chev,
-	.topic-body,
-	.topic-cards {
+	.chev {
 		transition: none;
 	}
 }
@@ -4145,8 +4042,8 @@ a.pr-link:hover {
 	white-space: nowrap;
 }
 /* Collapsible Follow-ups head: the h3 keeps the drawer label's caps look (margins, size and
-   color come from `.drawer h3`), the button inside is the click target. The chevron reuses the
-   done-lane topic head's arrow: points down when open, right when collapsed. */
+   color come from `.drawer h3`), the button inside is the click target. The chevron points
+   down when open, right when collapsed. */
 .fu-head button {
 	display: flex;
 	align-items: center;
@@ -8851,22 +8748,9 @@ button.log-mode[aria-pressed="true"] {
 	.meters,
 	.lane-add,
 	.help-badge,
-	.lane-tools button,
 	.notif-line button.icon {
 		min-height: 44px;
 		min-width: 44px;
-	}
-	/* Done tools use layout space, with another row when the lane is too narrow. */
-	.stage[data-stage="done"] .stage-head,
-	.lane-tools {
-		flex-wrap: wrap;
-	}
-	.lane-tools {
-		max-width: 100%;
-	}
-	.lane-tools button {
-		flex-shrink: 0;
-		height: 44px;
 	}
 	/* The bar is 48px: the lit bell keeps its 44px hit area but paints a 32px plate,
 	   the same height as the other bar chrome, so it never touches the bar edges. */

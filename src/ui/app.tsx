@@ -42,7 +42,6 @@ import {
 	queueOrder,
 	waitingOn,
 } from "../scheduler.ts";
-import { groupTopics } from "../topics.ts";
 import {
 	type AddProjectResponse,
 	APPROVE_REPLY,
@@ -3778,62 +3777,11 @@ const newestLanded = (a: TaskCard, b: TaskCard): number =>
 	(b.cancelledAt ?? b.doneAt ?? b.updatedAt) -
 	(a.cancelledAt ?? a.doneAt ?? a.updatedAt);
 
-/** The done lane's topic view: every topic, each cut to its newest page. `limits` holds the
- * page size of each topic its "Show more" grew; other topics show DONE_PAGE cards. */
-export function doneTopicPages(
-	tasks: TaskCard[],
-	limits: ReadonlyMap<string, number>,
-): { key: string; label: string; tasks: TaskCard[]; hidden: number }[] {
-	return groupTopics(tasks).map((g) => {
-		// groupTopics can append unclassified cards after overflow topics, so each topic
-		// re-sorts by landing time before its newest page is cut.
-		const page = donePage(
-			[...g.tasks].sort(newestLanded),
-			() => false,
-			limits.get(g.key) ?? DONE_PAGE,
-		);
-		return { ...g, tasks: page.shown, hidden: page.hidden };
-	});
-}
-
-/** Section key of the done lane's cancelled section (topic view). No real topic key starts
- * with "__" (keys are lowercased topic text), so a topic can never share this section's
- * collapse or page state. */
-export const CANCELLED_KEY = "__cancelled";
-
-/** The done lane's cancelled section (topic view): every cancelled card, newest cancel
- * first, paged like a topic under its own "Show more". Cancelled cards stay out of the
- * topic groups, so no topic count includes them. Empty while nothing is cancelled. */
-export function cancelledTopic(
-	tasks: TaskCard[],
-	limits: ReadonlyMap<string, number>,
-): { key: string; label: string; tasks: TaskCard[]; hidden: number }[] {
-	const cancelled = tasks
-		.filter((t) => t.cancelledAt !== null)
-		.sort(newestLanded);
-	if (cancelled.length === 0) return [];
-	const page = donePage(
-		cancelled,
-		() => false,
-		limits.get(CANCELLED_KEY) ?? DONE_PAGE,
-	);
-	return [
-		{
-			key: CANCELLED_KEY,
-			label: "Cancelled",
-			tasks: page.shown,
-			hidden: page.hidden,
-		},
-	];
-}
-
-/** Per-column card list plus the done lane's grouping and paging state, computed once per column. */
+/** Per-column card list plus the done lane's paging state, computed once per column. */
 function laneColumnData(
 	key: Stage,
 	shown: readonly TaskCard[],
 	q: string,
-	grouped: boolean,
-	topicLimits: ReadonlyMap<string, number>,
 	doneLimit: number,
 	seenAnswers: ReadonlySet<string>,
 	since: number,
@@ -3850,23 +3798,7 @@ function laneColumnData(
 	// ponytail: the state payload still carries every card; paginate /api/state
 	// instead if boards grow into the thousands of done cards.
 	let doneHidden = 0;
-	// Empty search only: the done lane groups into topic sections under sticky heads,
-	// every topic loaded and each one paged by its own "Show more". Cancelled cards
-	// stay out of every topic (no topic count includes one) and ride in their own
-	// trailing "Cancelled" section, paged like a topic.
-	const doneGroups =
-		key === "done" && q === "" && grouped
-			? [
-					...doneTopicPages(
-						col.filter(
-							(t) => t.cancelledAt === null && !unread(t) && !t.starred,
-						),
-						topicLimits,
-					),
-					...cancelledTopic(col, topicLimits),
-				]
-			: null;
-	if (key === "done" && q === "" && !grouped) {
+	if (key === "done" && q === "") {
 		const page = donePage(
 			col,
 			(t) => unread(t) || (t.starred && t.cancelledAt === null),
@@ -3875,65 +3807,7 @@ function laneColumnData(
 		col = page.shown;
 		doneHidden = page.hidden;
 	}
-	return { col, doneGroups, doneHidden };
-}
-
-/** The done lane's head tools: the two view toggles and, while grouped, the collapse-all pair. */
-function DoneLaneTools(p: {
-	grouped: boolean;
-	doneGroups:
-		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
-		| null;
-	setGrouped: (v: boolean) => void;
-	setCollapsed: (v: Record<string, boolean>) => void;
-}) {
-	const groups = p.doneGroups;
-	return (
-		<span className="lane-tools">
-			<button
-				type="button"
-				className="view-toggle"
-				aria-pressed={p.grouped}
-				title="Group done cards by topic"
-				onClick={() => p.setGrouped(true)}
-			>
-				By topic
-			</button>
-			<button
-				type="button"
-				className="view-toggle"
-				aria-pressed={!p.grouped}
-				title="Show one flat list, newest done first"
-				onClick={() => p.setGrouped(false)}
-			>
-				By time
-			</button>
-			{groups !== null && (
-				<>
-					<button
-						type="button"
-						title="Collapse all"
-						aria-label="Collapse all"
-						onClick={() =>
-							p.setCollapsed(
-								Object.fromEntries(groups.map((g) => [g.key, true])),
-							)
-						}
-					>
-						<Icon name="chevrons-up" size={13} />
-					</button>
-					<button
-						type="button"
-						title="Expand all"
-						aria-label="Expand all"
-						onClick={() => p.setCollapsed({})}
-					>
-						<Icon name="chevrons-down" size={13} />
-					</button>
-				</>
-			)}
-		</span>
-	);
+	return { col, doneHidden };
 }
 
 /** The project head's overflow menu: review, release, diagrams and settings, plus the popover trigger. */
@@ -4379,17 +4253,8 @@ export function ProjectBoard({
 		);
 		setStage(STAGE_KEYS[next] ?? stage);
 	};
-	// Collapsed topic sections in the done lane, by group key; unknown keys default expanded.
-	const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-	// Done lane layout: flat newest-done-first list (default) or topic sections.
-	const [grouped, setGrouped] = useState(false);
 	// Done lane lazy load: how many read cards render before "Show more" appends a page.
-	// The topic view pages each topic on its own, keyed by topic.
 	const [doneLimit, setDoneLimit] = useState(DONE_PAGE);
-	// A Map, not a plain object: a topic named "constructor" must not read Object.prototype.
-	const [topicLimits, setTopicLimits] = useState<ReadonlyMap<string, number>>(
-		() => new Map(),
-	);
 	// The setup wizard, opened from the checklist's Open setup button.
 	const [setupOpen, setSetupOpen] = useState(false);
 	/** One settings patch from the checklist row buttons; the board's project state refreshes. */
@@ -4638,12 +4503,10 @@ export function ProjectBoard({
 				}}
 			>
 				{COLUMNS.map((c) => {
-					const { col, doneGroups, doneHidden } = laneColumnData(
+					const { col, doneHidden } = laneColumnData(
 						c.key,
 						shown,
 						q,
-						grouped,
-						topicLimits,
 						doneLimit,
 						seenAnswers,
 						seenDoneSince,
@@ -4673,14 +4536,6 @@ export function ProjectBoard({
 						>
 							<h2 id={`stage-${c.key}`} className="stage-head">
 								<span className="stage-name">{c.label}</span>
-								{c.key === "done" && q === "" && (
-									<DoneLaneTools
-										grouped={grouped}
-										doneGroups={doneGroups}
-										setGrouped={setGrouped}
-										setCollapsed={setCollapsed}
-									/>
-								)}
 								{count.fresh > 0 && (
 									<span
 										className="count fresh"
@@ -4713,19 +4568,6 @@ export function ProjectBoard({
 								onAddDraft={c.key === "todo" ? composeDraft : undefined}
 								projectTasks={tasks}
 								foreignDeps={foreignDeps}
-								groups={doneGroups}
-								collapsed={collapsed}
-								onToggle={(key) =>
-									setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }))
-								}
-								onTopicMore={(key) =>
-									setTopicLimits((prev) =>
-										new Map(prev).set(
-											key,
-											(prev.get(key) ?? DONE_PAGE) + DONE_PAGE,
-										),
-									)
-								}
 								onRerelease={rerelease}
 								hasRules={project.hasRules}
 								github={project.github}
@@ -5893,38 +5735,7 @@ function queueTarget(
 	return { id, idx };
 }
 
-/** One collapsible topic section in a lane: sticky head with chevron and count, then the cards. */
-function TopicSection(p: {
-	id: string;
-	label: string;
-	collapsed: boolean;
-	onToggle: () => void;
-	count: React.ReactNode;
-	children: React.ReactNode;
-}) {
-	return (
-		<section className="topic" data-collapsed={p.collapsed || undefined}>
-			<button
-				type="button"
-				className="topic-head"
-				aria-expanded={!p.collapsed}
-				aria-controls={p.id}
-				onClick={p.onToggle}
-			>
-				<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
-					<path d="M2 3l2 2 2-2" />
-				</svg>
-				<span className="lane-label">{p.label}</span>
-				<span className="topic-count">{p.count}</span>
-			</button>
-			<div className="topic-body" id={p.id}>
-				<div className="topic-cards">{p.children}</div>
-			</div>
-		</section>
-	);
-}
-
-/** A lane's card content: the empty state, the done lane's pinned/starred/topic sections or the flat list, then the "Show more" button. */
+/** A lane's card content: the empty state, the pinned Inbox and Starred groups, the flat list, then the "Show more" button. */
 function LaneCards(p: {
 	stage: Stage;
 	filtering: boolean;
@@ -5933,16 +5744,9 @@ function LaneCards(p: {
 	unread: (t: TaskCard) => boolean;
 	fresh: TaskCard[];
 	starred: TaskCard[];
-	groups:
-		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
-		| null;
 	view: TaskCard[];
 	more: number;
 	onMore: (() => void) | undefined;
-	collapsed: Record<string, boolean>;
-	uid: string;
-	onToggle: (key: string) => void;
-	onTopicMore: ((key: string) => void) | undefined;
 	showMore: (e: ReactMouseEvent<HTMLButtonElement>, go: () => void) => void;
 	card: (t: TaskCard) => ReactNode;
 }) {
@@ -5950,18 +5754,10 @@ function LaneCards(p: {
 		stage,
 		filtering,
 		hasTasks,
-		total,
 		unread,
-		fresh,
-		starred,
-		groups,
 		view,
 		more,
 		onMore,
-		collapsed,
-		uid,
-		onToggle,
-		onTopicMore,
 		showMore,
 		card,
 	} = p;
@@ -5977,58 +5773,22 @@ function LaneCards(p: {
 			{p.fresh.length > 0 && p.fresh.length + p.starred.length < p.total && (
 				<hr className="lane-divider" />
 			)}
-			{p.starred.length > 0 && (
-				<TopicSection
-					id={`${p.uid}-topic-starred`}
-					label="Starred"
-					collapsed={p.collapsed.starred === true}
-					onToggle={() => p.onToggle("starred")}
-					count={p.starred.length}
-				>
-					{p.starred.map(p.card)}
-				</TopicSection>
+			{p.starred.length > 0 && <p className="lane-label">Starred</p>}
+			{p.starred.map(p.card)}
+			{p.starred.length > 0 && p.fresh.length + p.starred.length < p.total && (
+				<hr className="lane-divider" />
 			)}
-			{/* A collapsed section is just its head, whose own border-bottom already
-			    draws the single divider; the extra rule would double it. */}
-			{starred.length > 0 &&
-				collapsed.starred !== true &&
-				fresh.length + starred.length < total && (
-					<hr className="lane-divider" />
-				)}
-			{groups !== null
-				? groups.map((g) => (
-						<TopicSection
-							key={g.key}
-							id={`${uid}-topic-${g.key}`}
-							label={g.label}
-							collapsed={collapsed[g.key] === true}
-							onToggle={() => onToggle(g.key)}
-							count={`${g.tasks.length}/${g.tasks.length + g.hidden}`}
-						>
-							{g.tasks.map(card)}
-							{g.hidden > 0 && onTopicMore && (
-								<button
-									type="button"
-									className="lane-more"
-									onClick={(e) => showMore(e, () => onTopicMore(g.key))}
-									title={`Show older ${g.label} cards`}
-									aria-label={`Show more, ${g.hidden} older ${g.label} cards`}
-								>
-									Show more
-									<span className="topic-count">{g.hidden}</span>
-								</button>
-							)}
-						</TopicSection>
-					))
-				: // Only the done lane pins unread and starred cards above; other lanes show every card.
-					view
-						.filter(
-							(t) =>
-								stage !== "done" ||
-								t.cancelledAt !== null ||
-								(!unread(t) && !t.starred),
-						)
-						.map(card)}
+			{
+				// Only the done lane pins unread and starred cards above; other lanes show every card.
+				view
+					.filter(
+						(t) =>
+							stage !== "done" ||
+							t.cancelledAt !== null ||
+							(!unread(t) && !t.starred),
+					)
+					.map(card)
+			}
 			{more > 0 && onMore && (
 				<button
 					type="button"
@@ -6133,9 +5893,6 @@ export function LaneCol({
 	tasks,
 	projectTasks,
 	foreignDeps,
-	groups,
-	collapsed,
-	onToggle,
 	hasRules,
 	github,
 	deltas,
@@ -6149,7 +5906,6 @@ export function LaneCol({
 	onAddDraft,
 	more = 0,
 	onMore,
-	onTopicMore,
 	onRerelease,
 	tick,
 }: {
@@ -6169,17 +5925,9 @@ export function LaneCol({
 	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
 	 * foreign card; absent before the first state frame or for an unknown project. */
 	foreignDeps?: DepIndex;
-	/** Done lane only: topic sections to render instead of the flat landing order;
-	 * `hidden` counts the topic's cards behind its own "Show more" button. */
-	groups:
-		| { key: string; label: string; tasks: TaskCard[]; hidden: number }[]
-		| null;
-	onTopicMore?: (key: string) => void;
 	/** Cancels the stalled release card this id names and opens Create release; set only for
 	 * the release flow. */
 	onRerelease?: (id: string) => void;
-	collapsed: Record<string, boolean>;
-	onToggle: (key: string) => void;
 	hasRules: boolean;
 	github: string | null;
 	deltas: Map<string, number>;
@@ -6193,7 +5941,6 @@ export function LaneCol({
 	tick?: number;
 }) {
 	const boxRef = useRef<HTMLDivElement | null>(null);
-	const uid = useId();
 	// Optimistic overlay: the queued-id order the client adopted on a reorder tap, before the
 	// server frame confirms it. null = render the server order; a failed POST clears it and
 	// the FLIP effect slides the cards back.
@@ -6424,9 +6171,8 @@ export function LaneCol({
 		stage === "done"
 			? tasks.filter((t) => t.cancelledAt === null && unread(t))
 			: [];
-	// Done lane: starred research cards get their own collapsible section; unread wins over
-	// starred. A cancelled card never lands here: it pages in the main list (flat view) or
-	// the trailing "Cancelled" section (topic view).
+	// Done lane: starred research cards pin above the main list; unread wins over starred.
+	// A cancelled card never lands here: it pages in the main list.
 	const starred =
 		stage === "done"
 			? tasks.filter((t) => t.cancelledAt === null && t.starred && !unread(t))
@@ -6455,14 +6201,9 @@ export function LaneCol({
 				unread={unread}
 				fresh={fresh}
 				starred={starred}
-				groups={groups}
 				view={view}
 				more={more}
 				onMore={onMore}
-				collapsed={collapsed}
-				uid={uid}
-				onToggle={onToggle}
-				onTopicMore={onTopicMore}
 				showMore={showMore}
 				card={card}
 			/>

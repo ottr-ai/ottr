@@ -27,6 +27,8 @@ import {
 } from "../types.ts";
 // Static: models.ts touches no browser global at load, so hoisting is safe.
 import { resetCatalogCache } from "./models.ts";
+// Static: queue.ts is pure lane math over types.ts and scheduler.ts, no browser global.
+import { donePage } from "./queue.ts";
 
 // app.tsx reads sessionStorage at module load; bun test has no browser storage.
 globalThis.sessionStorage = {
@@ -48,8 +50,6 @@ const {
 	RestartWaitLine,
 	UpdateCycleControl,
 	AppBehindNotice,
-	doneTopicPages,
-	cancelledTopic,
 	Overview,
 	KpiStrip,
 	PerfTable,
@@ -482,9 +482,6 @@ const cardFixture = (
 describe("LaneCol backlog divider", () => {
 	const base = {
 		projectTasks: [] as TaskCard[],
-		groups: null,
-		collapsed: {},
-		onToggle: () => {},
 		hasRules: true,
 		github: null,
 		deltas: new Map<string, number>(),
@@ -661,80 +658,6 @@ describe("LaneCol backlog divider", () => {
 			<LaneCol {...base} stage="done" tasks={done} />,
 		);
 		expect(defaultOff).not.toContain("lane-more");
-	});
-
-	test("the topic view puts a Show more button in each topic that hides cards", () => {
-		const t1 = cardFixture({ id: "t1", stage: "done", state: "idle" });
-		const t2 = cardFixture({ id: "t2", stage: "done", state: "idle" });
-		const html = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="done"
-				tasks={[t1, t2]}
-				more={0}
-				groups={[
-					{ key: "a", label: "Alpha", tasks: [t1], hidden: 7 },
-					{ key: "b", label: "Beta", tasks: [t2], hidden: 0 },
-				]}
-				onTopicMore={() => {}}
-			/>,
-		);
-		expect(html.match(/lane-more/g)?.length).toBe(1);
-		// Every topic head reads loaded/total, a fully loaded topic too.
-		expect(html).toContain(">1/8</span>");
-		expect(html).toContain(">1/1</span>");
-		expect(html).toContain(">7</span>");
-	});
-
-	test("each topic pages its newest cards, Everything else by landing time too", () => {
-		// 11 named topics: the smallest overflows into Everything else ahead of the
-		// unclassified cards, though the unclassified cards landed later.
-		const tasks: TaskCard[] = [];
-		for (let i = 0; i < 10; i++)
-			for (let j = 0; j < 3; j++)
-				tasks.push(
-					cardFixture({ id: `n${i}-${j}`, topic: `topic${i}`, doneAt: 1000 }),
-				);
-		for (let j = 0; j < 2; j++)
-			tasks.push(cardFixture({ id: `old${j}`, topic: "overflow", doneAt: j }));
-		for (let j = 0; j < 25; j++)
-			tasks.push(cardFixture({ id: `new${j}`, topic: null, doneAt: 500 - j }));
-		const other = doneTopicPages(tasks, new Map()).at(-1)!;
-		expect(other.key).toBe("");
-		expect(other.tasks.map((t) => t.id)).toEqual(
-			Array.from({ length: 20 }, (_, j) => `new${j}`),
-		);
-		expect(other.hidden).toBe(7);
-		const grown = doneTopicPages(tasks, new Map([["", 40]])).at(-1)!;
-		expect(grown.tasks.at(-1)!.id).toBe("old0");
-		expect(grown.hidden).toBe(0);
-	});
-
-	test("Show more on Everything else leaves a topic named other alone", () => {
-		const tasks = [
-			...Array.from({ length: 25 }, (_, j) =>
-				cardFixture({ id: `o${j}`, topic: "other", doneAt: j }),
-			),
-			...Array.from({ length: 25 }, (_, j) =>
-				cardFixture({ id: `u${j}`, topic: null, doneAt: j }),
-			),
-		];
-		const before = doneTopicPages(tasks, new Map());
-		const rest = before.find((g) => g.label === "Everything else")!;
-		const pages = doneTopicPages(tasks, new Map([[rest.key, 40]]));
-		expect(pages.find((g) => g.label === "other")!.tasks).toHaveLength(20);
-		expect(
-			pages.find((g) => g.label === "Everything else")!.tasks,
-		).toHaveLength(25);
-	});
-
-	test("a topic named constructor still pages", () => {
-		const tasks = Array.from({ length: 25 }, (_, j) =>
-			cardFixture({ id: `c${j}`, topic: "constructor", doneAt: j }),
-		);
-		const [g] = doneTopicPages(tasks, new Map());
-		expect(g!.tasks).toHaveLength(20);
-		expect(g!.hidden).toBe(5);
 	});
 
 	test("a running card's mutation line shows the percent and the time left only", () => {
@@ -947,9 +870,6 @@ describe("LaneCol backlog divider", () => {
 describe("done lane star section", () => {
 	const base = {
 		projectTasks: [] as TaskCard[],
-		groups: null,
-		collapsed: {},
-		onToggle: () => {},
 		hasRules: true,
 		github: null,
 		deltas: new Map<string, number>(),
@@ -1008,7 +928,7 @@ describe("done lane star section", () => {
 			/>,
 		);
 		const inboxAt = html.indexOf(">Inbox</p>");
-		const starredAt = html.indexOf(">Starred</span>");
+		const starredAt = html.indexOf(">Starred</p>");
 		const normalAt = html.indexOf('data-task-id="n1"');
 		expect(inboxAt).toBeGreaterThanOrEqual(0);
 		expect(starredAt).toBeGreaterThan(inboxAt);
@@ -1067,74 +987,7 @@ describe("done lane star section", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="done" tasks={[normal]} />,
 		);
-		expect(html).not.toContain(">Starred</span>");
-	});
-
-	test("the Starred head toggles collapsed state", () => {
-		const starredCard = cardFixture({
-			id: "s1",
-			stage: "done",
-			state: "idle",
-			research: true,
-			starred: true,
-		});
-		const open = renderToStaticMarkup(
-			<LaneCol {...base} stage="done" tasks={[starredCard]} />,
-		);
-		expect(open).toContain('aria-expanded="true"');
-		expect(open).not.toContain("data-collapsed");
-		const shut = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="done"
-				tasks={[starredCard]}
-				collapsed={{ starred: true }}
-			/>,
-		);
-		expect(shut).toContain('aria-expanded="false"');
-		expect(shut).toContain('data-collapsed="true"');
-	});
-
-	test("a collapsed Starred section leaves one divider, an open one two", () => {
-		const freshCard = cardFixture({
-			id: "u1",
-			stage: "done",
-			state: "idle",
-			answered: true,
-		});
-		const starredCard = cardFixture({
-			id: "s1",
-			stage: "done",
-			state: "idle",
-			research: true,
-			starred: true,
-		});
-		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
-		const tasks = [starredCard, normal, freshCard];
-		const open = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="done"
-				tasks={tasks}
-				unread={(t) => t.id === "u1"}
-			/>,
-		);
-		// One rule between Inbox and Starred, one between Starred and the rest.
-		expect(open.match(/lane-divider/g)?.length).toBe(2);
-		const shut = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="done"
-				tasks={tasks}
-				unread={(t) => t.id === "u1"}
-				collapsed={{ starred: true }}
-			/>,
-		);
-		// The head's own border-bottom replaces the vanished trailing rule.
-		expect(shut.match(/lane-divider/g)?.length).toBe(1);
-		expect(shut.indexOf("lane-divider")).toBeLessThan(
-			shut.indexOf(">Starred</span>"),
-		);
+		expect(html).not.toContain(">Starred</p>");
 	});
 });
 
@@ -4564,9 +4417,6 @@ describe("Drawer approve button", () => {
 describe("cancelled cards on the board", () => {
 	const base = {
 		projectTasks: [] as TaskCard[],
-		groups: null,
-		collapsed: {},
-		onToggle: () => {},
 		hasRules: true,
 		github: null,
 		deltas: new Map<string, number>(),
@@ -4624,59 +4474,6 @@ describe("cancelled cards on the board", () => {
 		// The star never replaces the cancelled x, not even on a starred card.
 		expect(html).toContain("mark-cancelled");
 		expect(html).not.toContain("mark-star");
-	});
-
-	test("the topic view lists cancelled cards in a Cancelled section, outside every topic", () => {
-		const done = cardFixture({
-			id: "t1",
-			stage: "done",
-			state: "idle",
-			topic: "Cut",
-		});
-		const dead = cardFixture({
-			id: "d1",
-			stage: "done",
-			state: "idle",
-			cancelledAt: 1000,
-		});
-		const groups = [
-			...doneTopicPages([done], new Map()),
-			...cancelledTopic([done, dead], new Map()),
-		];
-		const html = renderToStaticMarkup(
-			<LaneCol
-				{...base}
-				stage="done"
-				tasks={[done, dead]}
-				groups={groups}
-				onTopicMore={() => {}}
-			/>,
-		);
-		expect(html).toContain("Cut");
-		// The cancelled card's null topic must not open an Everything else section.
-		expect(html).not.toContain("Everything else");
-		expect(html).toContain('data-task-id="d1"');
-		// Both sections count their own card only.
-		expect(html.match(/>1\/1<\/span>/g)?.length).toBe(2);
-	});
-
-	test("cancelledTopic pages its section and stays empty without cancelled cards", () => {
-		const dead = cardFixture({
-			id: "d1",
-			stage: "done",
-			state: "idle",
-			cancelledAt: 1000,
-		});
-		const fresh = cardFixture({ id: "t1", stage: "done", state: "idle" });
-		expect(cancelledTopic([fresh], new Map())).toEqual([]);
-		const page = cancelledTopic([dead], new Map());
-		expect(page).toHaveLength(1);
-		expect(page[0]!.key).toBe("__cancelled");
-		expect(page[0]!.label).toBe("Cancelled");
-		expect(page[0]!.tasks.map((t) => t.id)).toEqual(["d1"]);
-		// A grown limit stops the paging: no hidden cards, no Show more.
-		const grown = cancelledTopic([dead], new Map([["__cancelled", 40]]));
-		expect(grown[0]!.hidden).toBe(0);
 	});
 
 	test("a cancelled update card covers nothing, so its rows stay actionable", () => {
@@ -5432,9 +5229,6 @@ describe("Drawer of a cancelled card opens read-only", () => {
 
 describe("LaneCol release hold", () => {
 	const base = {
-		groups: null,
-		collapsed: {},
-		onToggle: () => {},
 		hasRules: true,
 		github: null,
 		deltas: new Map<string, number>(),
@@ -5899,9 +5693,6 @@ describe("path URL card links", () => {
 				stage="todo"
 				tasks={[cardFixture({ id: "X" })]}
 				projectTasks={[]}
-				groups={null}
-				collapsed={{}}
-				onToggle={() => {}}
 				hasRules={true}
 				github={null}
 				deltas={new Map()}
@@ -6230,6 +6021,123 @@ describe("ProjectBoard search delay", () => {
 			).toBe(false);
 		} finally {
 			await unmount();
+		}
+	});
+});
+
+describe("ProjectBoard done lane time view", () => {
+	// React rendering needs browser globals; the same happy-dom swap as the search
+	// delay tests above.
+	const window = new Window({ url: "http://localhost/projects/proj" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		requestAnimationFrame: window.requestAnimationFrame,
+		cancelAnimationFrame: window.cancelAnimationFrame,
+	};
+	const originals = new Map<string, unknown>();
+
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+
+	test("the done lane stays on the time view: no toggle, one paged flat list", async () => {
+		// 25 landed cards, none answered or starred: no pinned card may bend the cut.
+		const doneCards = Array.from({ length: 25 }, (_, j) =>
+			cardFixture({
+				id: `d${j}`,
+				stage: "done",
+				state: "idle",
+				doneAt: j + 1,
+			}),
+		);
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={doneCards}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			// The switch is gone for good: no view-toggle element anywhere, and the
+			// words "By topic" / "By time" appear nowhere on the board.
+			expect(container.querySelector(".view-toggle")).toBeNull();
+			expect(container.textContent).not.toContain("By topic");
+			expect(container.textContent).not.toContain("By time");
+			expect(container.innerHTML).not.toContain("By topic");
+			expect(container.innerHTML).not.toContain("By time");
+			// The done stage head renders no tools at all: not even one button.
+			const head = container.querySelector("#stage-done");
+			expect(head?.querySelectorAll("button")).toHaveLength(0);
+			// The flat list pages by time: donePage's cut decides the first page.
+			// The lane sorts newest landed first, then donePage cuts at the page size
+			// (app.tsx's unexported DONE_PAGE is 20), so no number here is guessed.
+			const { shown, hidden } = donePage(
+				[...doneCards].sort((a, b) => (b.doneAt ?? 0) - (a.doneAt ?? 0)),
+				() => false,
+				20,
+			);
+			expect(hidden).toBeGreaterThan(0);
+			const lane = container.querySelector('[data-stage="done"]');
+			expect(lane).not.toBeNull();
+			const visibleIds = [...lane!.querySelectorAll("[data-task-id]")].map(
+				(el) => el.getAttribute("data-task-id"),
+			);
+			expect(visibleIds).toEqual(shown.map((t) => t.id));
+			// One lane-wide "Show more" carries the hidden count in its label.
+			const more = lane!.querySelector("button.lane-more");
+			expect(more?.textContent).toContain("Show more");
+			expect(more?.getAttribute("aria-label")).toBe(
+				`Show more, ${hidden} older cards`,
+			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
 		}
 	});
 });
@@ -7579,9 +7487,6 @@ describe("Drawer proposal decision panel", () => {
 	test("a proposal card reads as a draft with a Decide chip; an ordinary needs_you card keeps the alarm", () => {
 		const laneBase = {
 			projectTasks: [] as TaskCard[],
-			groups: null,
-			collapsed: {},
-			onToggle: () => {},
 			hasRules: true,
 			github: null,
 			deltas: new Map<string, number>(),
@@ -9342,9 +9247,6 @@ describe("Optimistic taps (client)", () => {
 
 	const laneBase = {
 		projectTasks: [] as TaskCard[],
-		groups: null,
-		collapsed: {},
-		onToggle: () => {},
 		hasRules: true,
 		github: null,
 		deltas: new Map<string, number>(),
@@ -10824,7 +10726,6 @@ describe("memoized Card renders", () => {
 	// The callbacks the production board also keeps stable (App's openTask is a
 	// useCallback): fresh closures per render would break the memo in the test itself.
 	const stable = {
-		onToggle: (): void => {},
 		open: (): void => {},
 		unread: (): boolean => false,
 		onReorder: async (): Promise<boolean> => true,
@@ -10833,9 +10734,6 @@ describe("memoized Card renders", () => {
 		stage: "todo" as const,
 		tasks,
 		projectTasks,
-		groups: null,
-		collapsed: {},
-		onToggle: stable.onToggle,
 		hasRules: true,
 		github: null,
 		deltas: new Map<string, number>(),
