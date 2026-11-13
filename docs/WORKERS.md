@@ -184,7 +184,8 @@ omp. Two parts do the work:
 2. Each source-based host runs `scripts/update-host.ts` from a clean `main` checkout.
    This persistent command runs the current `scripts/update-image.ts` once per cycle.
    A deployment that runs a published release image (`OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>`,
-   README quick start) updates by moving its image tag. Neither host script runs there.
+   [README, Docker Compose, latest release](../README.md#docker-compose-latest-release))
+   updates by moving its image tag. Neither host script runs there.
    The one-shot updater fast-forwards `main` and builds the image, then it
    rolls the stack one runner at a time. A runner is a worker (its hostname, the
    compose service name) or the server itself (`local`). It stops when the

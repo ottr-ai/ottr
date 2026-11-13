@@ -32,7 +32,7 @@ Every full variant — Windows PowerShell, the Alate provisioning block, the age
 
 ### Docker Compose, latest release
 
-The compose file and the image come from the same GitHub release tag; the image is public, so the pull needs no login.
+The compose file and the image come from the same GitHub release tag; the image is public, so the pull needs no login. Run the seed line before `up`: on a first install the snapshot does not exist, and `up` then makes Docker create a directory for the missing bind source, which the entry script refuses.
 
 ```sh
 mkdir -p ottr && cd ottr
@@ -43,13 +43,15 @@ export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
 mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
+# Seed it once with a consistent copy of the host db. Never mount the live file.
+[ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose pull
 docker compose up -d --no-build
 ```
 
 ### From source
 
-Builds the image on your machine; the seed and Alate steps are in [docs/install.md](docs/install.md#from-source-main-branch).
+Builds the image on your machine. Run the seed line before `up`, for the same first-install reason as above; the Alate steps are in [docs/install.md](docs/install.md#from-source-main-branch).
 
 ```sh
 git clone git@github.com:ottr-ai/ottr.git ottr
@@ -58,6 +60,8 @@ export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
 mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
+# Seed it once with a consistent copy of the host db. Never mount the live file.
+[ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose build
 docker compose up -d
 ```
