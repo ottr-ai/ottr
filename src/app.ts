@@ -8944,10 +8944,11 @@ export function createApp(deps: AppDeps) {
 		try {
 			let res = await postOnce(event);
 			let text = await res.text();
-			if (!res.ok && event === "APPROVE") {
+			if (!res.ok && event === "APPROVE" && res.status === 422) {
 				// GitHub refuses an APPROVE review when the posting identity opened
 				// the PR (HTTP 422), so the same draft goes out as a comment and the
-				// response notes the skip.
+				// response notes the skip. Any other failure stays a 502: a 5xx or a
+				// rate limit must never trade the approval of this head away.
 				const refused = res.status;
 				res = await postOnce("COMMENT");
 				text = await res.text();
@@ -9014,10 +9015,15 @@ export function createApp(deps: AppDeps) {
 				]);
 			};
 			res = await callGh(event, dir);
-			if (res.code !== 0 && event === "APPROVE") {
+			if (
+				res.code !== 0 &&
+				event === "APPROVE" &&
+				/\b422\b|Can not approve your own pull request/i.test(res.stderr)
+			) {
 				// GitHub refuses an APPROVE review when the posting identity opened
-				// the PR, so the same draft goes out as a comment and the response
-				// notes the skip.
+				// the PR; gh prints the refusal body to stderr. Only that signature
+				// downsizes to a comment — any other exit stays a 502, so a 5xx or a
+				// rate limit never trades the approval of this head away.
 				const refused = res.code;
 				res = await callGh("COMMENT", dir);
 				if (res.code === 0)

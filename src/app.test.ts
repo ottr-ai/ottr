@@ -14606,6 +14606,90 @@ describe("PR review routes", () => {
 		await removeApp();
 	});
 
+	test("a non-422 approve failure stays a 502 on the app path", async () => {
+		await saveApp();
+		// A 5xx is not a refusal: no downsize, one attempt, claim released.
+		appFetchImpl = async (url, init) => {
+			if (url.endsWith("/installation")) return Response.json({ id: 77 });
+			if (url.includes("/access_tokens"))
+				return Response.json({
+					token: "INSTA",
+					expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+				});
+			if (url.endsWith("/reviews")) {
+				const body: unknown = JSON.parse(String(init?.body));
+				const event =
+					typeof body === "object" &&
+					body !== null &&
+					"event" in body &&
+					typeof body.event === "string"
+						? body.event
+						: "";
+				if (event === "APPROVE")
+					return new Response("Server Error", { status: 500 });
+				throw new Error("the route must not retry a non-422 refusal");
+			}
+			return Response.json({ message: "no route" }, { status: 404 });
+		};
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(46, H1, true, false);
+		const res = await postReview(t.id, { body: "Ship it." });
+		expect(res.status).toBe(502);
+		expect(await errorOf(res)).toContain("Server Error");
+		const reviewCalls = appCalls.filter((c) => c.url.endsWith("/reviews"));
+		expect(reviewCalls).toHaveLength(1);
+		expect(ghCalls).toEqual([]);
+		// The claim is released: the head reads as not posted, so a retry stays possible.
+		const view = (await (
+			await m.call(`/api/projects/pg/tasks/${t.id}`)
+		).json()) as {
+			prReview: { postedHead: string | null; postError: string | null };
+		};
+		expect(view.prReview.postedHead).toBeNull();
+		expect(view.prReview.postError).not.toBeNull();
+		prStore.setSettings({ prReviewApprove: false });
+		await removeApp();
+	});
+
+	test("a non-422 approve failure stays a 502 on the gh fallback", async () => {
+		await removeApp();
+		prStore.setSettings({ prReviewApprove: true });
+		const t = reviewed(32, H1, true, false);
+		// A 5xx body on stderr is not the 422 refusal signature: no downsize.
+		ghHook = async () => {
+			const last: unknown = ghPayloads[ghPayloads.length - 1];
+			ghResult =
+				typeof last === "object" &&
+				last !== null &&
+				"event" in last &&
+				last.event === "APPROVE"
+					? {
+							code: 1,
+							stdout: "",
+							stderr: '(HTTP 500) {"message":"Server Error"}',
+						}
+					: { code: 0, stdout: "{}", stderr: "" };
+		};
+		const res = await postReview(t.id, { body: "Looks good." });
+		expect(res.status).toBe(502);
+		expect(ghCalls).toEqual([expectedArgv(32)]);
+		expect(ghPayloads).toEqual([
+			{
+				event: "APPROVE",
+				body: `Looks good.${REVIEW_FOOTER}`,
+				commit_id: H1,
+			},
+		]);
+		const view = (await (
+			await m.call(`/api/projects/pg/tasks/${t.id}`)
+		).json()) as {
+			prReview: { postedHead: string | null; postError: string | null };
+		};
+		expect(view.prReview.postedHead).toBeNull();
+		expect(view.prReview.postError).not.toBeNull();
+		prStore.setSettings({ prReviewApprove: false });
+	});
+
 	test("a blocking draft posts a comment, not an approval", async () => {
 		await saveApp();
 		appHappyPath({

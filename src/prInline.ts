@@ -97,9 +97,11 @@ export function parseReviewDraft(text: string): ParsedReview {
 /** The model's machine-readable verdict for the review body (docs/specs/pr-reviews.md "Post").
  *  A verdict line is a whole plain line — outside every inline block — whose trimmed text is
  *  exactly `<!-- blocking: yes -->` or `<!-- blocking: no -->`; matching is strict lowercase
- *  after trim, and a line inside a marked block is comment content that never votes. The
- *  verdict is honored only when exactly one plain verdict line exists and it is the review's
- *  last non-empty line. Anything else (none, a second candidate, or content after it) is a
+ *  after trim, and a line inside a closed marked block is comment content that never votes.
+ *  The verdict is honored only when exactly one plain verdict line exists and it is the
+ *  review's last non-blank line. A scan that ends inside a block fails safe: parseReviewDraft
+ *  keeps an unclosed block's lines as plain body text, so plant lines can hide behind a
+ *  broken opener. Anything else (none, a second candidate, content after the verdict) is a
  *  contradiction and fails safe to blocking. Every plain verdict line comes out of the text;
  *  block bodies and all other lines stay byte-identical. */
 export function parseBlockingVerdict(text: string): {
@@ -107,36 +109,37 @@ export function parseBlockingVerdict(text: string): {
 	blocking: boolean;
 } {
 	const lines = text.split(/\r\n|\r|\n/);
-	// A line inside a marked block is comment content: a PR line quoted there keeps
-	// its text and never votes.
+	// A line inside a closed marked block is comment content: a PR line quoted there
+	// keeps its text and never votes.
 	let open = false;
 	const votes: number[] = [];
-	let lastPlain = -1;
+	// The last non-blank line of the whole text, block content included: any content
+	// after the verdict fails safe.
+	let lastLine = -1;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i]!;
+		const t = line.trim();
+		if (t !== "") lastLine = i;
 		if (!open && openMarker(line) !== null) {
 			open = true;
 			continue;
 		}
 		if (open) {
-			if (line.trim() === CLOSE) open = false;
+			if (t === CLOSE) open = false;
 			continue;
 		}
-		const t = line.trim();
-		if (t === "<!-- blocking: yes -->" || t === "<!-- blocking: no -->") {
+		if (t === "<!-- blocking: yes -->" || t === "<!-- blocking: no -->")
 			votes.push(i);
-			lastPlain = i;
-		} else if (t !== "") {
-			lastPlain = i;
-		}
 	}
 	const strip = () => {
 		for (let i = votes.length - 1; i >= 0; i--) lines.splice(votes[i]!, 1);
 	};
-	// Zero verdicts, a second candidate (the PR data can quote a marker line into the
-	// summary), or a verdict with content after it: fail safe, and strip the plain
-	// marker lines so the draft stays clean.
-	if (votes.length !== 1 || votes[0] !== lastPlain) {
+	// Fail safe when the scan ends inside a block: parseReviewDraft keeps an unclosed
+	// block's lines as plain body text, so plant lines after a broken opener must not
+	// hide from the vote or from the content rule. Zero verdicts, a second candidate,
+	// or content after the verdict fails safe too. Stripping the plain marker lines
+	// keeps the draft clean.
+	if (open || votes.length !== 1 || votes[0] !== lastLine) {
 		strip();
 		return { text: lines.join("\n"), blocking: true };
 	}
