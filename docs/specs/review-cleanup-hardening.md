@@ -101,8 +101,6 @@ Approved text:
 - Record the proof command and its output.
 - If the project has a lifecycle document, compare every selected field's writers with it and record each difference.
 - Keep the review read-only. Do not change project code or live data to prove a finding.
-- If safe proof is absent, state the proof limit instead of a confirmed finding.
-- Do not claim full lifecycle coverage from this two-field check.
 
 ### Acceptance checks
 
