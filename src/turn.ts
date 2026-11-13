@@ -142,6 +142,7 @@ import {
 	sessionFile,
 	sessionHoldsPrompt,
 	sessionModel,
+	titleProblem,
 } from "./session.ts";
 import {
 	DEFAULT_SETTINGS,
@@ -266,43 +267,6 @@ const TITLE_TIMEOUT_MS = 30_000;
 /** Slack on the gateway spawn's kill cap, so the deadline above decides the logged cause. */
 const TITLE_TIMEOUT_SLACK_MS = 5_000;
 
-/** Reply heads that mark a model refusal instead of a title (OTTR-538): the titler answered
- * the prompt's content — usually a link — rather than naming the request. Curly apostrophes
- * normalize to straight ones before matching. */
-const TITLE_REFUSAL_HEADS = [
-	"i can't",
-	"i cannot",
-	"i can not",
-	"i couldn't",
-	"i could not",
-	"i don't",
-	"i do not",
-	"i'm unable",
-	"i am unable",
-	"i'm sorry",
-	"i am sorry",
-	"sorry",
-];
-
-/** Reply heads that name the handoff-reading step instead of the work (OTTR-516, OTTR-570). */
-const TITLE_HANDOFF_HEADS = ["read the handoff", "read handoff"];
-
-/** Why a cleaned titler reply is not a title, or null when it is one: at most 8 words, and
- * not a first-person refusal, a file path, or a handoff-reading step. A rejected reply counts
- * as a failure, so the scheduled retry and the run's rename stay the fallback instead of the
- * store freezing a sentence into session_title (nameTask keeps only the first write). */
-function titleProblem(title: string): string | null {
-	const lower = title.toLowerCase().replace(/[\u2019\u2018]/g, "'");
-	if (TITLE_REFUSAL_HEADS.some((head) => lower.startsWith(head)))
-		return "refusal reply";
-	// OTTR-516: a title that carries a file path names the instruction, not the work.
-	if (lower.includes("@/") || lower.includes("/data/") || lower.includes(".md"))
-		return "names a file path";
-	if (TITLE_HANDOFF_HEADS.some((head) => lower.startsWith(head)))
-		return "names the handoff step";
-	return title.split(/\s+/).filter(Boolean).length > 8 ? "over 8 words" : null;
-}
-
 /** The follow-up tail `followUpPrompt` (src/prompts.ts) appends to a continued task's prompt:
  * the parent title and the handoff path behind the order to read the file. The titler must
  * not see the instruction or the path (OTTR-516): it named cards "Read @/data/…/OTTR-516.md
@@ -354,7 +318,7 @@ export async function generateTitle(
 			{
 				role: "system",
 				content:
-					'You name tasks. Reply with only a 3-8 word title naming the request, no quotes, no trailing period. You never open links and never need their content: name the request as written, e.g. "Check TikTok link for advice". Name the work itself, never the steps of reading a file or a handoff.',
+					'You name tasks. Reply with only a 3-8 word title naming the request, no quotes, no trailing period. You never open links and never need their content: name the action and the source of the content you cannot see (a video, a page, an issue), never the content itself, e.g. "Evaluate check idea from TikTok video". A question in the prompt does not make the title a question. Name the work itself, never the steps of reading a file or a handoff.',
 			},
 			// ponytail: the first 1000 chars name almost every task; feed more only when titles come back wrong.
 			// The parent title rides above the task text, outside its 1000-char budget.
@@ -4365,7 +4329,11 @@ export function createTurnLoop(
 		// Review sessions get one fixed name, applied by the extension before the agent runs,
 		// so the board never depends on the agent inventing a title.
 		const sessionName = fixedSessionName(flags);
-		if (sessionName !== null) return { ...flags, sessionName };
+		if (sessionName !== null) {
+			// Fixed names must not yield to the rename scan; the IS NULL guard keeps an existing stored title.
+			await store.nameTask(id, sessionName, "work");
+			return { ...flags, sessionName };
+		}
 		const named = await resolveSessionTitle(store, id, task, key, log);
 		if (named.stopped) return null;
 		return { ...flags, sessionName: named.name };

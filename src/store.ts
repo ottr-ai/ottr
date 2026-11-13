@@ -36,6 +36,7 @@ import { queueOrder } from "./scheduler.ts";
 import {
 	cleanTitle,
 	firstSessionTitle,
+	firstWorkTitle,
 	readTranscript,
 	sessionContext,
 } from "./session.ts";
@@ -1397,6 +1398,39 @@ export class ProjectStore {
 		});
 	}
 
+	/** Consumes each open card's first valid agent rename into a work title (OTTR-912);
+	 * idempotent (only rows still marked draft). Done and cancelled cards keep their titles.
+	 * Runs inside open's queue.run, so no transaction of its own. */
+	private static async backfillWorkTitles(
+		db: SQLiteDatabase,
+		sessionsDir: string,
+	): Promise<void> {
+		const drafts = await db
+			.query<
+				{
+					id: string;
+					session_id: string | null;
+					session_title: string | null;
+				},
+				[]
+			>(
+				"SELECT id, session_id, session_title FROM tasks WHERE stage != 'done' AND cancelled_at IS NULL AND session_title IS NOT NULL AND title_source = 'draft'",
+			)
+			.all();
+		for (const row of drafts) {
+			const work = firstWorkTitle(
+				sessionsDir,
+				row.session_id,
+				cleanTitle(row.session_title ?? ""),
+			);
+			if (work === null) continue;
+			await db.run(
+				"UPDATE tasks SET session_title = ?, title_source = 'work' WHERE id = ? AND title_source = 'draft'",
+				[work, row.id],
+			);
+		}
+	}
+
 	/** The converged needs_reason for one legacy proposal row, or null when nothing rewrites it. */
 	private static async convergedReason(
 		db: SQLiteDatabase,
@@ -1981,6 +2015,24 @@ export class ProjectStore {
 					"pending_feedback",
 					"ALTER TABLE tasks ADD COLUMN pending_feedback INTEGER NOT NULL DEFAULT 0",
 				);
+				// OTTR-912 card titles: which source named the card ('draft' | 'work'). ALTER-only
+				// after both CHECK rebuilds like the columns above — a rebuild's explicit column
+				// list would drop it. The stamp is idempotent on NULL; the backfill then consumes
+				// each open card's first valid agent rename once. Both run only when the table
+				// already carries session_title and cancelled_at (a pre-title shape stores no
+				// titles, so there is nothing to stamp), which keeps minimal old fixtures opening.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"title_source",
+					"ALTER TABLE tasks ADD COLUMN title_source TEXT",
+				);
+				if (cols.includes("session_title") && cols.includes("cancelled_at")) {
+					await db.exec(
+						"UPDATE tasks SET title_source = 'draft' WHERE session_title IS NOT NULL AND title_source IS NULL",
+					);
+					await ProjectStore.backfillWorkTitles(db, store.sessionsDir);
+				}
 				const turnCols = (
 					await db.query<{ name: string }, []>("PRAGMA table_info(turns)").all()
 				).map((c) => c.name);
@@ -2337,17 +2389,71 @@ export class ProjectStore {
 		});
 	}
 
+	/** The task's title-source state, or null when the row is gone. */
+	private async titleState(id: string): Promise<{
+		source: string | null;
+		stage: string;
+		cancelledAt: number | null;
+	} | null> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<
+					{
+						title_source: string | null;
+						stage: string;
+						cancelled_at: number | null;
+					},
+					[string]
+				>("SELECT title_source, stage, cancelled_at FROM tasks WHERE id = ?")
+				.get(id);
+			if (row === null) return null;
+			return {
+				source: row.title_source,
+				stage: row.stage,
+				cancelledAt: row.cancelled_at,
+			};
+		});
+	}
+
+	/** One guarded write of the work title: it wins only while the stored title is still a
+	 * draft, so two racing resolves cannot store different renames. */
+	private async writeWorkTitle(id: string, title: string): Promise<boolean> {
+		return this.queue.run(async () => {
+			const res = await this.db.run(
+				"UPDATE tasks SET session_title = ?, title_source = 'work' WHERE id = ? AND title_source = 'draft'",
+				[title, id],
+			);
+			return res.changes > 0;
+		});
+	}
+
 	/** One title ladder for every caller: the stored title first, then the first title in
 	 * the session transcript, persisted once when `persist`; null when neither exists yet.
 	 * Markdown from the titler and omp's card prefix are stripped on read, so rows written
 	 * before the cleaning also display clean. A pending generation retry holds the
-	 * transcript title back. */
+	 * transcript title back. A stored draft title (OTTR-912) yields once to the run agent's
+	 * first valid rename, written with source `work`; a stored work title (a fixed turn name
+	 * or a consumed rename) is final. Done and cancelled cards never yield. */
 	private async resolveTitle(
 		task: ListedTask,
 		storedTitle: string | null,
 		persist: boolean,
 	): Promise<string | null> {
-		if (storedTitle) return cleanTitle(storedTitle);
+		if (storedTitle) {
+			const cleaned = cleanTitle(storedTitle);
+			const state = await this.titleState(task.id);
+			if (
+				state !== null &&
+				state.source === "draft" &&
+				state.stage !== "done" &&
+				state.cancelledAt === null
+			) {
+				const work = firstWorkTitle(this.sessionsDir, task.sessionId, cleaned);
+				if (work !== null && (await this.writeWorkTitle(task.id, work)))
+					return cleanTitle(work);
+			}
+			return cleaned;
+		}
 		if (await this.titleHold(task.id)) return null;
 		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
 		if (fromSession === null) return null;
@@ -2376,22 +2482,30 @@ export class ProjectStore {
 		);
 	}
 
-	/** Persists a title once: `IS NULL` keeps the first name authoritative even if two writes race. */
-	async nameTask(id: string, title: string): Promise<void> {
+	/** Persists a title once with its source: `IS NULL` keeps the first name authoritative
+	 * even if two writes race. `draft` names a prepare-phase generation or a transcript title;
+	 * `work` names a fixed turn name or the run agent's first valid rename (OTTR-912), final. */
+	async nameTask(
+		id: string,
+		title: string,
+		source: "draft" | "work" = "draft",
+	): Promise<void> {
 		return this.queue.run(async () => {
 			await this.db.run(
-				"UPDATE tasks SET session_title = ? WHERE id = ? AND session_title IS NULL",
-				[title, id],
+				"UPDATE tasks SET session_title = ?, title_source = ? WHERE id = ? AND session_title IS NULL",
+				[title, source, id],
 			);
 		});
 	}
 
 	/**
-	 * Card title: the first title of the task's own session, stored once and never overwritten, so
-	 * later re-titles (merge turn, resume, New session) can't rename the card. A follow-up is a new
-	 * task with a fresh session, so it gets that session's title. Until a title exists (omp, the
-	 * run's rename, or the tracker's prepare-phase generation), the card shows a short cut of the
-	 * prompt line — recomputed each call, never persisted.
+	 * Card title: a draft name (the tracker's prepare-phase generation or the first transcript
+	 * title) stored once, then the run agent's first valid rename (OTTR-912) replaces it with
+	 * source `work` — after that the title never changes, so later re-titles (merge turn,
+	 * resume, New session) can't rename the card. A follow-up is a new task with a fresh
+	 * session, so it gets that session's title. Until a title exists (omp, the run's rename,
+	 * or the tracker's prepare-phase generation), the card shows a short cut of the prompt
+	 * line — recomputed each call, never persisted.
 	 */
 	async frozenTitle(task: ListedTask): Promise<string> {
 		return await this.frozenTitleFrom(task, await this.storedTitle(task.id));

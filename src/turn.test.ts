@@ -4005,6 +4005,37 @@ describe("turn release cards", () => {
 		expect(record.runs[0]!.sessionName).toBe("Release review");
 	});
 
+	test("a release card's pinned name is stored with source work and a rename cannot take it", async () => {
+		const { store, record, loop } = await setup();
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs[0]!.sessionName).toBe("Release review");
+		await store.close();
+		const raw = new Database(join(store.path, ".tasks", "tasks.db"));
+		try {
+			const row = raw
+				.query<
+					{ session_title: string | null; title_source: string | null },
+					[string]
+				>("SELECT session_title, title_source FROM tasks WHERE id = ?")
+				.get(task.id);
+			expect(row?.session_title).toBe("Release review");
+			expect(row?.title_source).toBe("work");
+		} finally {
+			raw.close();
+		}
+		const reopened = await ProjectStore.open(store.path);
+		stores.push(reopened);
+		const after = (await reopened.getTask(task.id))!;
+		expect(after.sessionId).toBe("sess-1");
+		mkdirSync(reopened.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(reopened.sessionsDir, "1_sess-1.jsonl"),
+			'{"type":"session"}\n{"type":"title_change","title":"Something else entirely"}\n',
+		);
+		expect(await reopened.frozenTitle(after)).toBe("Release review");
+	});
+
 	test("a release review that would merge is bounced: reviews must not commit", async () => {
 		const { store, record, loop } = await setup({
 			isIntegrated: async () => false,
@@ -15271,6 +15302,21 @@ describe("turn survivor round 5 — helpers", () => {
 		// The 8-word cap boundary holds: eight words pass.
 		const eight = "Fix the flaky login redirect test in CI";
 		expect(await generateTitle("name me", gateway(eight).spawn)).toBe(eight);
+	});
+
+	test("generateTitle: the system text names the action and the unseen content source, never the content (OTTR-912)", async () => {
+		const g = gateway("Evaluate check idea from TikTok video");
+		const title = await generateTitle(
+			"Should we add a check like that https://vm.tiktok.com/ZGdXHRJBg/ ?",
+			g.spawn,
+		);
+		// The canned reply passes titleProblem, so the route still returns a title.
+		expect(title).toBe("Evaluate check idea from TikTok video");
+		const system = g.requests[0]!.body.messages[0]!.content;
+		expect(system).toContain("never the content itself");
+		expect(system).toContain("does not make the title a question");
+		expect(system).toContain("Evaluate check idea from TikTok video");
+		expect(system).not.toContain("name the request as written");
 	});
 
 	test("generateTitle: an OTTR-516 follow-up titles the work with the parent as context, never the handoff path", async () => {

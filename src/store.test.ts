@@ -707,7 +707,7 @@ describe("asked", () => {
 });
 
 describe("frozenTitle", () => {
-	test("persists the session's first title once; a later rewrite cannot rename the card", async () => {
+	test("persists the session's first title; the first rename takes over once, later rewrites cannot rename", async () => {
 		const store = await open(join(root, "frozen-title"));
 		const sid = "bbbb0000-0000-0000-0000-000000000101";
 		const task = await store.updateTask(
@@ -727,7 +727,14 @@ describe("frozenTitle", () => {
 			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
 			'{"type":"title","v":1,"title":"Renamed"}\n{"type":"session"}\n{"type":"title_change","title":"Renamed"}\n',
 		);
-		expect(await store.frozenTitle(task)).toBe("Persisted"); // the first write stays authoritative
+		// The stored transcript title is a draft: the run agent's differing rename becomes the
+		// card's work title once (OTTR-912).
+		expect(await store.frozenTitle(task)).toBe("Renamed");
+		writeFileSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			'{"type":"title","v":1,"title":"Renamed again"}\n{"type":"session"}\n{"type":"title_change","title":"Renamed again"}\n',
+		);
+		expect(await store.frozenTitle(task)).toBe("Renamed"); // the work title is final
 		await store.close();
 	});
 
@@ -826,6 +833,166 @@ describe("frozenTitle", () => {
 		expect(await logPath).toBe(join(store.tasksDir, "logs", `${task.id}.log`));
 		expect(await imagesDir).toBe(join(store.tasksDir, "images", task.id));
 		await expect(store.getTask(task.id)).rejects.toThrow("Store is closed");
+	});
+});
+
+describe("work title", () => {
+	/** Writes the session transcript with one top-level title_change record per title. */
+	function writeSessionTitles(
+		store: ProjectStore,
+		sid: string,
+		titles: string[],
+	): void {
+		mkdirSync(store.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
+			'{"type":"session"}\n' +
+				titles
+					.map((t) => `{"type":"title_change","title":${JSON.stringify(t)}}\n`)
+					.join(""),
+		);
+	}
+
+	/** Reads `tasks.title_source` straight off the closed store's db file. */
+	function rawTitleSource(dir: string, id: string): string | null {
+		const db = new Database(join(dir, ".tasks", "tasks.db"));
+		try {
+			return (
+				db
+					.query<{ title_source: string | null }, [string]>(
+						"SELECT title_source FROM tasks WHERE id = ?",
+					)
+					.get(id)?.title_source ?? null
+			);
+		} finally {
+			db.close();
+		}
+	}
+
+	test("the first valid agent rename becomes the card's work title once", async () => {
+		const dir = join(root, "work-title-first-rename");
+		let store = await open(dir);
+		const sid = "bbbb0000-0000-0000-0000-000000001101";
+		const task = await store.updateTask(
+			(await store.createTask("still untitled")).id,
+			{ sessionId: sid },
+		);
+		await store.nameTask(task.id, "Add TikTok link check?");
+		writeSessionTitles(store, sid, [
+			"Add TikTok link check?",
+			"Evaluate check idea from TikTok video",
+		]);
+		expect(await store.frozenTitle(task)).toBe(
+			"Evaluate check idea from TikTok video",
+		);
+		await store.close();
+		expect(rawTitleSource(dir, task.id)).toBe("work");
+
+		// A later rewrite cannot rename the card again: the first work title stays.
+		store = await open(dir);
+		writeSessionTitles(store, sid, [
+			"Add TikTok link check?",
+			"Evaluate check idea from TikTok video",
+			"Second rename here",
+		]);
+		expect(await store.frozenTitle((await store.getTask(task.id))!)).toBe(
+			"Evaluate check idea from TikTok video",
+		);
+	});
+
+	test("an invalid rename is skipped and a later valid one wins", async () => {
+		const dir = join(root, "work-title-invalid-skip");
+		let store = await open(dir);
+		const sid = "bbbb0000-0000-0000-0000-000000001201";
+		const task = await store.updateTask(
+			(await store.createTask("still untitled")).id,
+			{ sessionId: sid },
+		);
+		await store.nameTask(task.id, "Draft stays");
+		writeSessionTitles(store, sid, [
+			"Draft stays",
+			"This rename has far too many words for a title",
+		]);
+		expect(await store.frozenTitle(task)).toBe("Draft stays");
+		await store.close();
+		store = await open(dir);
+		writeSessionTitles(store, sid, [
+			"Draft stays",
+			"This rename has far too many words for a title",
+			"Valid rename lands",
+		]);
+		expect(await store.frozenTitle((await store.getTask(task.id))!)).toBe(
+			"Valid rename lands",
+		);
+	});
+
+	test("no rename leaves the draft title and its draft source in place", async () => {
+		const dir = join(root, "work-title-no-rename");
+		const store = await open(dir);
+		const sid = "bbbb0000-0000-0000-0000-000000001301";
+		const task = await store.updateTask(
+			(await store.createTask("still untitled")).id,
+			{ sessionId: sid },
+		);
+		await store.nameTask(task.id, "Draft stays");
+		writeSessionTitles(store, sid, ["Draft stays"]);
+		expect(await store.frozenTitle(task)).toBe("Draft stays");
+		await store.close();
+		expect(rawTitleSource(dir, task.id)).toBe("draft");
+	});
+
+	test("the open-time backfill rewrites an open card's draft from its session; a done card keeps its draft", async () => {
+		const dir = join(root, "work-title-backfill");
+		let store = await open(dir);
+		const openSid = "bbbb0000-0000-0000-0000-000000001401";
+		const doneSid = "bbbb0000-0000-0000-0000-000000001402";
+		const openTask = await store.updateTask(
+			(await store.createTask("open card draft")).id,
+			{ sessionId: openSid },
+		);
+		const doneTask = await store.updateTask(
+			(await store.createTask("done card draft")).id,
+			{ sessionId: doneSid, stage: "done" },
+		);
+		await store.nameTask(openTask.id, "Open card draft");
+		await store.nameTask(doneTask.id, "Done card draft");
+		writeSessionTitles(store, openSid, [
+			"Open card draft",
+			"Backfilled work title",
+		]);
+		writeSessionTitles(store, doneSid, [
+			"Done card draft",
+			"Done rename never lands",
+		]);
+		await store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		raw.run("UPDATE tasks SET title_source = NULL");
+		raw.close();
+
+		// The reopen stamps the null sources and backfills the open card once.
+		store = await open(dir);
+		expect(await store.frozenTitle((await store.getTask(openTask.id))!)).toBe(
+			"Backfilled work title",
+		);
+		await store.close();
+		expect(rawTitleSource(dir, openTask.id)).toBe("work");
+
+		// The done card keeps its draft: neither the backfill nor a resolve consumes its rename.
+		store = await open(dir);
+		expect(await store.frozenTitle((await store.getTask(doneTask.id))!)).toBe(
+			"Done card draft",
+		);
+		await store.close();
+		expect(rawTitleSource(dir, doneTask.id)).toBe("draft");
+
+		// A further open is idempotent: no title changes again.
+		store = await open(dir);
+		expect(await store.frozenTitle((await store.getTask(openTask.id))!)).toBe(
+			"Backfilled work title",
+		);
+		expect(await store.frozenTitle((await store.getTask(doneTask.id))!)).toBe(
+			"Done card draft",
+		);
 	});
 });
 

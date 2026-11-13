@@ -302,6 +302,44 @@ export function cleanTitle(raw: string): string {
 		.trim();
 }
 
+/** Reply heads that mark a model refusal instead of a title (OTTR-538): the titler answered
+ * the prompt's content — usually a link — rather than naming the request. Curly apostrophes
+ * normalize to straight ones before matching. */
+const TITLE_REFUSAL_HEADS = [
+	"i can't",
+	"i cannot",
+	"i can not",
+	"i couldn't",
+	"i could not",
+	"i don't",
+	"i do not",
+	"i'm unable",
+	"i am unable",
+	"i'm sorry",
+	"i am sorry",
+	"sorry",
+];
+
+/** Reply heads that name the handoff-reading step instead of the work (OTTR-516, OTTR-570). */
+const TITLE_HANDOFF_HEADS = ["read the handoff", "read handoff"];
+
+/** Why a cleaned titler reply is not a title, or null when it is one: at most 8 words, and
+ * not a first-person refusal, a file path, or a handoff-reading step. A rejected reply counts
+ * as a failure, so the scheduled retry and the run's rename stay the fallback instead of the
+ * store freezing a sentence into session_title (nameTask keeps only the first write). The
+ * same filter gates a rename's rise to work title (OTTR-912). */
+export function titleProblem(title: string): string | null {
+	const lower = title.toLowerCase().replace(/[\u2019\u2018]/g, "'");
+	if (TITLE_REFUSAL_HEADS.some((head) => lower.startsWith(head)))
+		return "refusal reply";
+	// OTTR-516: a title that carries a file path names the instruction, not the work.
+	if (lower.includes("@/") || lower.includes("/data/") || lower.includes(".md"))
+		return "names a file path";
+	if (TITLE_HANDOFF_HEADS.some((head) => lower.startsWith(head)))
+		return "names the handoff step";
+	return title.split(/\s+/).filter(Boolean).length > 8 ? "over 8 words" : null;
+}
+
 /** omp's per-file pieces of firstSessionTitle: the latest title from line 1, and the first title_change record. */
 function latestTitle(file: string): string | null {
 	try {
@@ -341,17 +379,19 @@ export function firstSessionTitle(
 	const file = sessionFile(dir, sessionId);
 	if (file === null) return null;
 	const latest = latestTitle(file);
-	return latest === null ? null : (firstTitleChange(file) ?? latest);
+	// First top-level `title_change`, else the line-1 latest; null when the file has neither.
+	return latest === null ? null : (topTitleChanges(file)[0] ?? latest);
 }
 
-/** First top-level `title_change` record in the file; null when it has none or cannot be read. */
-function firstTitleChange(file: string): string | null {
+/** The file's top-level `title_change` titles, in order; empty when it has none or cannot be read. */
+function topTitleChanges(file: string): string[] {
 	let text: string;
 	try {
 		text = readFileSync(file, "utf8");
 	} catch {
-		return null;
+		return [];
 	}
+	const titles: string[] = [];
 	const needle = '"type":"title_change"';
 	for (
 		let at = text.indexOf(needle);
@@ -369,10 +409,33 @@ function firstTitleChange(file: string): string | null {
 				typeof rec.title === "string" &&
 				rec.title.trim() !== ""
 			)
-				return rec.title;
+				titles.push(rec.title);
 		} catch {
 			// not a whole record line; keep looking
 		}
+	}
+	return titles;
+}
+
+/**
+ * The run agent's first valid rename (OTTR-912): the first top-level `title_change` whose
+ * cleaned title differs from the card's current title and passes the same filter the draft
+ * title passes (`titleProblem`). Failing records are skipped, not blocking. The comparison
+ * runs on `cleanTitle` output of both sides, so a transcript echo of the stored title never
+ * counts as a rename. Null when the session is missing or has no such record.
+ */
+export function firstWorkTitle(
+	dir: string,
+	sessionId: string | null,
+	current: string,
+): string | null {
+	const file = sessionFile(dir, sessionId);
+	if (file === null) return null;
+	for (const raw of topTitleChanges(file)) {
+		const title = cleanTitle(raw);
+		if (title === "" || title === current) continue;
+		if (titleProblem(title) !== null) continue;
+		return title;
 	}
 	return null;
 }
