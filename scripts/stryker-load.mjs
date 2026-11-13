@@ -75,10 +75,12 @@ function concurrencyDecision(env, parallelism, cgroup) {
 				`STRYKER_CONCURRENCY must be a positive integer, got ${JSON.stringify(raw)}`,
 			);
 		}
-		return {
-			slots: value,
-			rule: `STRYKER_CONCURRENCY=${raw}, free memory unknown`,
-		};
+		const freeBytes = cgroupFreeBytes(cgroup);
+		const memory =
+			freeBytes === null
+				? "free memory unknown"
+				: `free memory ${Math.floor(freeBytes / MIB)} MiB`;
+		return { slots: value, rule: `STRYKER_CONCURRENCY=${raw}, ${memory}` };
 	}
 	const cpuSlots = Math.max(1, Math.floor(parallelism / 2));
 	const freeBytes = cgroupFreeBytes(cgroup);
@@ -120,6 +122,11 @@ export function mutationConcurrency(
 	return concurrencyDecision(env, parallelism, cgroup).slots;
 }
 
+/** The cap's note in the log line, when the cap cut the decision's slot count. */
+function capNote(cap, decision) {
+	return decision.slots > cap ? ` (cap ${cap} below ${decision.slots})` : "";
+}
+
 /**
  * A config's worker count: min(cap, mutationConcurrency()), so no config asks for more slots
  * than its cap, the CPUs, or the free memory allow. On a Stryker run (isStrykerRun) it logs
@@ -135,11 +142,27 @@ export function cappedConcurrency(
 	const decision = concurrencyDecision(env, parallelism, cgroup);
 	const slots = Math.min(cap, decision.slots);
 	if (isStrykerRun()) {
-		const capNote =
-			slots < decision.slots ? ` (cap ${cap} below ${decision.slots})` : "";
-		console.log(`stryker-load: ${slots} slots; ${decision.rule}${capNote}`);
+		console.log(
+			`stryker-load: ${slots} slots; ${decision.rule}${capNote(cap, decision)}`,
+		);
 	}
 	return slots;
+}
+
+/**
+ * The run-start log line for a cap: the chosen slots, the free memory and the rule that
+ * decided. Exported so the log-contract tests can pin each line shape with fake cgroup
+ * files; cappedConcurrency prints this same line under a Stryker run.
+ */
+export function concurrencyLogLine(
+	cap,
+	env = process.env,
+	parallelism = os.availableParallelism(),
+	cgroup = CGROUP_MEMORY_FILES,
+) {
+	const decision = concurrencyDecision(env, parallelism, cgroup);
+	const slots = Math.min(cap, decision.slots);
+	return `stryker-load: ${slots} slots; ${decision.rule}${capNote(cap, decision)}`;
 }
 
 /**

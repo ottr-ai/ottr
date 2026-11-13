@@ -14,6 +14,7 @@ import { join } from "node:path";
 import {
 	acquireMutationLock,
 	cappedConcurrency,
+	concurrencyLogLine,
 	isStrykerRun,
 	mutationConcurrency,
 	sandboxTempDirName,
@@ -390,10 +391,11 @@ test("a plain import of the real config leaves a sandbox parent alone", () => {
 	});
 });
 
-// OTTR-886 send-back: a run logs exactly one concurrency line, with the slots the run uses
-// and the free memory (or "free memory unknown" where no reading applies). The children drive
-// the REAL configs with a Stryker-shaped argv, so the line prints; the sandbox TMPDIR keeps
-// the lock and wipe away from the real host state.
+// OTTR-886 send-back: a run logs exactly one concurrency line. The children drive the REAL
+// configs with a Stryker-shaped argv, so the line prints; the sandbox TMPDIR keeps the lock
+// and wipe away from the real host state. These two pin only the wiring (one line per run,
+// through the real configs); the line SHAPES are pinned by the concurrencyLogLine tests
+// below with fake cgroup files, so they must fail on a regression.
 const strykerBin = join(
 	new URL("..", import.meta.url).pathname,
 	"node_modules",
@@ -450,23 +452,48 @@ test("a wrapper config logs one line with its own cap", () => {
 	});
 });
 
-test("STRYKER_CONCURRENCY logs free memory unknown", () => {
-	withSandbox((sandbox) => {
-		const out = runChild(
-			`process.env.TMPDIR = process.env.SANDBOX_ROOT;
-			process.env.STRYKER_CONCURRENCY = "5";
-			process.argv[1] = process.env.FAKE_BIN;
-			await import(${configUrl});
-			console.log("DONE");`,
-			{
-				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
-				FAKE_BIN: strykerBin,
-			},
+// The line SHAPES, pinned with fake cgroup files so each assertion must fail on a
+// regression. concurrencyLogLine is the exact builder cappedConcurrency prints.
+test("the cpu-rule line names the free reading", () => {
+	// Free memory far above the cpu rule: the memory rule cannot bind, and the line still
+	// carries the MiB figure (the earlier blocker-4 gap).
+	withCgroup(String(100 * GIB), String(4 * GIB), (cgroup) => {
+		expect(concurrencyLogLine(24, {}, 24, cgroup)).toBe(
+			"stryker-load: 12 slots; cpu rule (24 CPUs, 98304 MiB free; memory rule allowed 243)",
 		);
-		const lines = concurrencyLines(out);
-		expect(lines).toHaveLength(1);
-		expect(lines[0]).toContain("STRYKER_CONCURRENCY=5");
-		expect(lines[0]).toContain("free memory unknown");
-		expect(out).toContain("DONE");
 	});
+	expect(concurrencyLogLine(24, {}, 24, NO_CGROUP)).toBe(
+		"stryker-load: 12 slots; cpu rule (24 CPUs, free memory unknown, no cgroup limit)",
+	);
+});
+
+test("the line names the cap when the cap decides", () => {
+	// Wrapper case: cap 8 under the cpu rule 12, memory plentiful.
+	withCgroup(String(100 * GIB), String(4 * GIB), (cgroup) => {
+		expect(concurrencyLogLine(8, {}, 24, cgroup)).toBe(
+			"stryker-load: 8 slots; cpu rule (24 CPUs, 98304 MiB free; memory rule allowed 243) (cap 8 below 12)",
+		);
+	});
+});
+
+test("the memory-rule line shows its readings", () => {
+	// The OTTR-886 acceptance case: 8 GiB limit, 4 GiB used, 24 CPUs -> 7 slots.
+	withCgroup(String(8 * GIB), String(4 * GIB), (cgroup) => {
+		expect(concurrencyLogLine(24, {}, 24, cgroup)).toBe(
+			"stryker-load: 7 slots; memory rule (4096 MiB free, 1024 MiB reserve, 400 MiB per slot) beat cpu rule 12",
+		);
+	});
+});
+
+test("STRYKER_CONCURRENCY logs the free reading when one exists", () => {
+	withCgroup(String(8 * GIB), String(4 * GIB), (cgroup) => {
+		expect(
+			concurrencyLogLine(24, { STRYKER_CONCURRENCY: "5" }, 24, cgroup),
+		).toBe(
+			"stryker-load: 5 slots; STRYKER_CONCURRENCY=5, free memory 4096 MiB",
+		);
+	});
+	expect(
+		concurrencyLogLine(24, { STRYKER_CONCURRENCY: "5" }, 24, NO_CGROUP),
+	).toBe("stryker-load: 5 slots; STRYKER_CONCURRENCY=5, free memory unknown");
 });

@@ -52,20 +52,23 @@ function writeInnerScript(dir: string): void {
 		join(dir, "inner.sh"),
 		`# OTTR-886 acceptance measurement inside the bounded container.
 set -eu
+target=4294967296  # 4 GiB, the ballast buffer size
 echo "ballast: holding a 4 GiB buffer and touching every page"
 bun -e 'const b = Buffer.alloc(4 * 2 ** 30, 1); let s = 0; for (let i = 0; i < b.length; i += 4096) s += b[i]; console.log("ballast resident, checksum", s); setTimeout(() => {}, 7200000);' &
+resident=0
 for i in $(seq 1 120); do
-	if [ "$(cat /sys/fs/cgroup/memory.current)" -ge 4500000000 ]; then
+	if [ "$(cat /sys/fs/cgroup/memory.current)" -ge "$target" ]; then
+		resident=1
 		break
 	fi
 	sleep 1
 done
 cur=$(cat /sys/fs/cgroup/memory.current)
-if [ "$cur" -lt 4500000000 ]; then
-	echo "WARNING: the ballast did not reach 4.5 GiB in 120 s (memory.current=$cur)"
-else
-	echo "ballast-resident memory.current=$cur"
+if [ "$resident" -ne 1 ]; then
+	echo "ERROR: the ballast did not reach 4 GiB in 120 s (memory.current=$cur); refusing to measure without it"
+	exit 1
 fi
+echo "ballast-resident memory.current=$cur"
 start=$(date +%s)
 rc=0
 ./node_modules/.bin/stryker run /measure/measure.config.mjs || rc=$?
