@@ -6,6 +6,8 @@ Date: 2026-11-05
 
 accepted
 
+Note: [ADR 0013](0013-postgresql-backend-and-async-stores.md) extends this design to PostgreSQL and async stores. This ADR stays accepted for SQLite.
+
 ## Context
 
 Each project's state is one SQLite file, `.tasks/tasks.db` (bun:sqlite). Schema changes land in `ProjectStore.open` (`src/store.ts`): plain additions use `ALTER TABLE ADD COLUMN` plus a backfill for existing rows (e.g. `done_at`, `topic`, `fork_merge_approved`, and the transcript cost backfills in `backfillTurnCosts`/`backfillDoneContext`). Constraint changes have no additive form, so the table is rebuilt in one transaction: create `tasks_migrating` from the new DDL, `INSERT ... SELECT` by explicit column names, verify the row count, then swap — a failure leaves the old table untouched ("preparing migration" in `src/store.test.ts` is the reference fixture). `CREATE TABLE IF NOT EXISTS` never updates a live table, and `bun test` runs against fresh databases, so a missing migration is invisible to the gates and crashes the live board at runtime (AGENTS.md, hard stop 2). Tracker data is never dropped or destructively altered; that is a hard stop asking the user first (AGENTS.md, hard stop 2; docs/specs/review-conventions.md). When the learnings feature was removed (commit ee9f330), the retired `learnings` table stayed in the `CREATE TABLE` text so fresh and existing databases converge. The original decision date is not recorded in the repo.
