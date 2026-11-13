@@ -2135,8 +2135,8 @@ describe("task routes", () => {
 	test("a reply on a PR feedback park queues the fix turn under the blocks", async () => {
 		const blocks =
 			"REVIEW COMMENT by alice at 2026-11-01T12:00:00.000Z\n<<<DATA\nPlease fix the leak\nDATA>>>";
-		const t = store.createTask("parked for review feedback");
-		store.updateTask(t.id, {
+		const t = await store.createTask("parked for review feedback");
+		await store.updateTask(t.id, {
 			stage: "merging",
 			state: "needs_you",
 			needsReason: prFeedbackReason(7),
@@ -2149,7 +2149,7 @@ describe("task routes", () => {
 			text: "fix it",
 		});
 		expect(res.status).toBe(200);
-		const row = store.getTask(t.id)!;
+		const row = (await store.getTask(t.id))!;
 		expect(row.stage).toBe("in_progress");
 		expect(row.state).toBe("queued");
 		expect(row.needsReason).toBeNull();
@@ -6774,8 +6774,8 @@ describe("steer cancel route", () => {
 	});
 
 	test("a steer clears a feedback park's flag", async () => {
-		const t = store.createTask("parked with feedback");
-		store.updateTask(t.id, {
+		const t = await store.createTask("parked with feedback");
+		await store.updateTask(t.id, {
 			state: "queued",
 			pendingPrompt: "blocks",
 			pendingBy: "supervisor",
@@ -6785,7 +6785,7 @@ describe("steer cancel route", () => {
 			text: "focus on the parser",
 		});
 		expect(res.status).toBe(200);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.pendingPrompt?.endsWith("focus on the parser")).toBe(true);
 		// The queue now carries user steering, not an unaddressed supervisor park.
 		expect(after.pendingFeedback).toBe(false);
@@ -6995,8 +6995,8 @@ describe("steer edit route", () => {
 	});
 
 	test("rewriting a feedback park clears the flag", async () => {
-		const t = store.createTask("parked with feedback");
-		store.updateTask(t.id, {
+		const t = await store.createTask("parked with feedback");
+		await store.updateTask(t.id, {
 			state: "running",
 			pendingPrompt: "blocks",
 			pendingBy: "supervisor",
@@ -7006,7 +7006,7 @@ describe("steer edit route", () => {
 			text: "focus on the parser",
 		});
 		expect(res.status).toBe(200);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		// A human rewrote the text, so it is no longer the supervisor's park.
 		expect(after.pendingPrompt).toBe("focus on the parser");
 		expect(after.pendingBy).toBe("user");
@@ -7060,8 +7060,8 @@ describe("steer edit route", () => {
 
 describe("restart session route", () => {
 	test("a restart on a feedback park queues a fix turn with the blocks", async () => {
-		const t = store.createTask("parked with feedback");
-		store.updateTask(t.id, {
+		const t = await store.createTask("parked with feedback");
+		await store.updateTask(t.id, {
 			stage: "merging",
 			state: "needs_you",
 			needsReason: prFeedbackReason(7),
@@ -7076,7 +7076,7 @@ describe("restart session route", () => {
 			{},
 		);
 		expect(res.status).toBe(200);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		// The blocks ride under the lost-session text: the sweep's cutoff is already
 		// past them. The work stage keeps the restart from re-shipping as a merge turn.
 		expect(after.pendingPrompt?.startsWith(LOST_SESSION)).toBe(true);
@@ -7090,8 +7090,8 @@ describe("restart session route", () => {
 	});
 
 	test("a restart without feedback queues the lost-session ask alone", async () => {
-		const t = store.createTask("parked plain");
-		store.updateTask(t.id, {
+		const t = await store.createTask("parked plain");
+		await store.updateTask(t.id, {
 			state: "needs_you",
 			sessionId: "sess-1",
 			pendingFeedback: false,
@@ -7101,7 +7101,7 @@ describe("restart session route", () => {
 			{},
 		);
 		expect(res.status).toBe(200);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.pendingPrompt).toBe(LOST_SESSION);
 		expect(after.pendingFeedback).toBe(false);
 		expect(after.stage).not.toBe("in_progress");

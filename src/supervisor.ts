@@ -2641,7 +2641,7 @@ export function createSupervisor(
 		if (!watched) return;
 		const cutoff = t.prWatchAt;
 		if (cutoff === null) {
-			e.store.updateTask(t.id, { prWatchAt: ops.now() });
+			await e.store.updateTask(t.id, { prWatchAt: ops.now() });
 			return;
 		}
 		const n = t.prNumber;
@@ -2702,7 +2702,7 @@ export function createSupervisor(
 		const blocks = prFeedbackPrompt(items);
 		// The reads were awaited, so the card may have settled meanwhile: branch on the
 		// fresh row, not the snapshot the pass started from.
-		const fresh = e.store.getTask(t.id);
+		const fresh = await e.store.getTask(t.id);
 		if (fresh === null || fresh.cancelledAt !== null || fresh.prNumber !== n)
 			return;
 		const freshFeedback = fresh.needsReason === reason;
@@ -2711,7 +2711,7 @@ export function createSupervisor(
 		const append =
 			fresh.state === "needs_you" && (freshFeedback || freshConflict);
 		if (!fullPark && !append) return;
-		e.store.updateTask(fresh.id, {
+		await e.store.updateTask(fresh.id, {
 			prWatchAt: newest,
 			state: "needs_you",
 			...(fresh.state === "idle" ? { needsReason: reason } : {}),
@@ -2721,7 +2721,7 @@ export function createSupervisor(
 			// (turn dispatch included) clears it with the prompt.
 			pendingFeedback: true,
 		});
-		ops.appendLog(
+		await ops.appendLog(
 			e.store,
 			fresh.id,
 			`supervisor: PR #${fresh.prNumber} review feedback; card parked`,

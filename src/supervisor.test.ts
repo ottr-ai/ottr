@@ -1136,7 +1136,7 @@ describe("kept-worktree hygiene", () => {
 		expect(ops.calls.remove).toEqual([]);
 		expect(ops.calls.scheduled).toBe(0);
 		expect(pullCalls(ops)).toEqual([PR_LIST, PR7_READ]);
-		const logPath = store.logPath(t.id);
+		const logPath = await store.logPath(t.id);
 		// Nothing logged means no log file: absence is the same "silent" claim.
 		const log = existsSync(logPath) ? await Bun.file(logPath).text() : "";
 		expect(log).not.toContain("has merge conflicts");
@@ -4800,14 +4800,14 @@ describe("prPass", () => {
 	});
 
 	test("new comment parks the idle card with a DATA block and advances the cutoff", async () => {
-		const store = prModeProject("pr-feedback-park");
-		const t = prCard(store);
-		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const store = await prModeProject("pr-feedback-park");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
 		const ops = fakeOps({
 			apiResult: feedbackApi({ issue: [comment()] }),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(prFeedbackReason(7));
@@ -4820,55 +4820,55 @@ describe("prPass", () => {
 		expect(after.pendingBy).toBe("supervisor");
 		expect(after.pendingFeedback).toBe(true);
 		expect(after.prWatchAt).toBe(COMMENT_TS);
-		const log = await Bun.file(store.logPath(t.id)).text();
+		const log = await Bun.file(await store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 review feedback; card parked");
-		store.close();
+		await store.close();
 	});
 
 	test("the same feedback never parks twice: the cutoff advance dedupes", async () => {
-		const store = prModeProject("pr-feedback-dedupe");
-		const t = prCard(store);
-		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const store = await prModeProject("pr-feedback-dedupe");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
 		const ops = fakeOps({
 			apiResult: feedbackApi({ issue: [comment()] }),
 		});
 		const projects = new Map([["proj", entry(store)]]);
 		await tick(projects, ops);
-		const parked = store.getTask(t.id)!;
+		const parked = (await store.getTask(t.id))!;
 		expect(parked.needsReason).toBe(prFeedbackReason(7));
 		ops.time += 6 * 60_000; // past the PR poll window
 		await tick(projects, ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.pendingPrompt).toBe(parked.pendingPrompt);
 		expect(after.prWatchAt).toBe(parked.prWatchAt);
-		const log = await Bun.file(store.logPath(t.id)).text();
+		const log = await Bun.file(await store.logPath(t.id)).text();
 		expect(log.match(/review feedback; card parked/g)).toHaveLength(1);
-		store.close();
+		await store.close();
 	});
 
 	test("the first sweep initializes the cutoff silently and never parks", async () => {
-		const store = prModeProject("pr-feedback-first");
-		const t = prCard(store); // prWatchAt left null
+		const store = await prModeProject("pr-feedback-first");
+		const t = await prCard(store); // prWatchAt left null
 		const ops = fakeOps({
 			apiResult: feedbackApi({ issue: [comment()] }),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
 		expect(after.pendingPrompt).toBeNull();
 		expect(after.prWatchAt).toBeNumber();
-		const logPath = store.logPath(t.id);
+		const logPath = await store.logPath(t.id);
 		// A silent sweep writes no log line, so the file may not exist at all.
 		const log = existsSync(logPath) ? await Bun.file(logPath).text() : "";
 		expect(log).not.toContain("review feedback");
-		store.close();
+		await store.close();
 	});
 
 	test("a changes-requested review parks the card with its DATA block", async () => {
-		const store = prModeProject("pr-feedback-changes");
-		const t = prCard(store);
-		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const store = await prModeProject("pr-feedback-changes");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
 		const ops = fakeOps({
 			apiResult: feedbackApi({
 				reviews: [
@@ -4882,7 +4882,7 @@ describe("prPass", () => {
 			}),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(prFeedbackReason(7));
 		expect(after.pendingPrompt).toContain(
@@ -4890,13 +4890,13 @@ describe("prPass", () => {
 		);
 		expect(after.pendingPrompt).toContain("Rework the parser");
 		expect(after.prWatchAt).toBe(COMMENT_TS);
-		store.close();
+		await store.close();
 	});
 
 	test("a conflict park keeps its reason and appends the new block", async () => {
-		const store = prModeProject("pr-feedback-conflict");
-		const t = prCard(store);
-		store.updateTask(t.id, {
+		const store = await prModeProject("pr-feedback-conflict");
+		const t = await prCard(store);
+		await store.updateTask(t.id, {
 			state: "needs_you",
 			needsReason: PR7_CONFLICT,
 			pendingPrompt: "resolve the conflict first",
@@ -4910,7 +4910,7 @@ describe("prPass", () => {
 			}),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(PR7_CONFLICT);
 		expect(after.pendingPrompt).toContain("resolve the conflict first");
@@ -4919,15 +4919,17 @@ describe("prPass", () => {
 		// The appended blocks are supervisor data: flagged, so the verdict un-park can
 		// still reach this card (and a reply clears the flag with the prompt).
 		expect(after.pendingFeedback).toBe(true);
-		store.close();
+		await store.close();
 	});
 
 	test("a merged PR finishes a feedback-parked card done", async () => {
-		const store = prModeProject("pr-feedback-merged");
-		store.setSettings({ originUrl: "https://github.com/acme/widget.git" });
+		const store = await prModeProject("pr-feedback-merged");
+		await store.setSettings({
+			originUrl: "https://github.com/acme/widget.git",
+		});
 		mkdirSync(join(root, "pr-feedback-merged", ".wt"), { recursive: true });
-		const t = prCard(store);
-		store.updateTask(t.id, {
+		const t = await prCard(store);
+		await store.updateTask(t.id, {
 			worktree: join(root, "pr-feedback-merged", ".wt"),
 			prWatchAt: 1_000_000_000,
 		});
@@ -4939,7 +4941,7 @@ describe("prPass", () => {
 			["proj", entry(store, { target: "origin/main" })],
 		]);
 		await tick(projects, ops);
-		const parked = store.getTask(t.id)!;
+		const parked = (await store.getTask(t.id))!;
 		expect(parked.state).toBe("needs_you");
 		expect(parked.needsReason).toBe(prFeedbackReason(7));
 		expect(parked.pendingFeedback).toBe(true);
@@ -4958,7 +4960,7 @@ describe("prPass", () => {
 					}
 				: openList([]);
 		await tick(projects, ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -4966,15 +4968,15 @@ describe("prPass", () => {
 		// The done write clears the park's prompt and flag with it.
 		expect(after.pendingPrompt).toBeNull();
 		expect(after.pendingFeedback).toBe(false);
-		const log = await Bun.file(store.logPath(t.id)).text();
+		const log = await Bun.file(await store.logPath(t.id)).text();
 		expect(log).toContain("PR #7 merged; card done");
-		store.close();
+		await store.close();
 	});
 
 	test("a resolved conflict keeps an appended card parked as feedback", async () => {
-		const store = prModeProject("pr-feedback-unpark");
-		const t = prCard(store);
-		store.updateTask(t.id, {
+		const store = await prModeProject("pr-feedback-unpark");
+		const t = await prCard(store);
+		await store.updateTask(t.id, {
 			state: "needs_you",
 			needsReason: PR7_CONFLICT,
 			pendingPrompt: "resolve the conflict first",
@@ -4989,7 +4991,7 @@ describe("prPass", () => {
 		});
 		const projects = new Map([["proj", entry(store)]]);
 		await tick(projects, ops);
-		const parked = store.getTask(t.id)!;
+		const parked = (await store.getTask(t.id))!;
 		expect(parked.state).toBe("needs_you");
 		expect(parked.needsReason).toBe(PR7_CONFLICT);
 		expect(parked.pendingPrompt).toContain("resolve the conflict first");
@@ -5003,22 +5005,22 @@ describe("prPass", () => {
 			pull: pullBody({ state: "open", mergeable: true }),
 		});
 		await tick(projects, ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(prFeedbackReason(7));
 		expect(after.pendingPrompt).toBe(parked.pendingPrompt);
 		expect(after.pendingFeedback).toBe(true);
-		const log = await Bun.file(store.logPath(t.id)).text();
+		const log = await Bun.file(await store.logPath(t.id)).text();
 		expect(log).toContain(
 			"PR #7 can merge again; reviewer feedback kept on the card",
 		);
-		store.close();
+		await store.close();
 	});
 
 	test("a credential-shaped comment parks redacted", async () => {
-		const store = prModeProject("pr-feedback-credential");
-		const t = prCard(store);
-		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const store = await prModeProject("pr-feedback-credential");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
 		const ops = fakeOps({
 			apiResult: feedbackApi({
 				issue: [
@@ -5027,7 +5029,7 @@ describe("prPass", () => {
 			}),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(prFeedbackReason(7));
 		// The park still names the author, but the refused body never reaches it.
@@ -5036,13 +5038,16 @@ describe("prPass", () => {
 		expect(after.pendingPrompt).not.toContain("0123456789abcdef");
 		expect(after.pendingFeedback).toBe(true);
 		expect(after.prWatchAt).toBe(COMMENT_TS);
-		store.close();
+		await store.close();
 	});
 
 	test("a live turn is skipped: the pass makes no comments or reviews reads", async () => {
-		const store = prModeProject("pr-feedback-running");
-		const t = prCard(store);
-		store.updateTask(t.id, { state: "running", prWatchAt: 1_000_000_000 });
+		const store = await prModeProject("pr-feedback-running");
+		const t = await prCard(store);
+		await store.updateTask(t.id, {
+			state: "running",
+			prWatchAt: 1_000_000_000,
+		});
 		const ops = fakeOps({
 			apiResult: feedbackApi({ issue: [comment()] }),
 		});
@@ -5052,10 +5057,10 @@ describe("prPass", () => {
 		expect(read("/pulls/7/comments")).toEqual([]);
 		expect(read("/pulls/7/reviews")).toEqual([]);
 		expect(read("/pulls/7")).toEqual([]); // the verdict read skips too
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("running");
 		expect(after.pendingPrompt).toBeNull();
-		store.close();
+		await store.close();
 	});
 });
 
@@ -5146,9 +5151,9 @@ describe("CI on the PR head", () => {
 	});
 
 	test("a CI failure requeues a feedback park with both texts", async () => {
-		const store = prModeProject("ci-pr-head-feedback");
-		const t = prCard(store);
-		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const store = await prModeProject("ci-pr-head-feedback");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
 		// The PR still merges, so the conflict verdict stays out of it: tick 1 parks
 		// through the feedback watch alone.
 		const ops = fakeOps({
@@ -5163,7 +5168,7 @@ describe("CI on the PR head", () => {
 			}),
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const parked = store.getTask(t.id)!;
+		const parked = (await store.getTask(t.id))!;
 		expect(parked.state).toBe("needs_you");
 		expect(parked.needsReason).toBe(prFeedbackReason(7));
 		expect(parked.pendingFeedback).toBe(true);
@@ -5186,7 +5191,7 @@ describe("CI on the PR head", () => {
 				? { code: 0, stdout: failed, stderr: "" }
 				: open(url);
 		await tick(new Map([["proj", entry(store)]]), ops);
-		const after = store.getTask(t.id)!;
+		const after = (await store.getTask(t.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.pendingBy).toBe("supervisor");
@@ -5197,7 +5202,7 @@ describe("CI on the PR head", () => {
 		expect(after.pendingPrompt).toContain("DATA>>>");
 		expect(after.pendingPrompt?.endsWith(blocks)).toBe(true);
 		expect(after.pendingFeedback).toBe(true);
-		store.close();
+		await store.close();
 	});
 });
 

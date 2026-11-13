@@ -1035,10 +1035,10 @@ async function closeGonePulls(
 
 /** The PR numbers and branch names of the project's cards: pull requests the board opened
  * itself. The watcher never files a review card for one. */
-function ownPulls(store: ForkProject["store"]): {
+async function ownPulls(store: ForkProject["store"]): Promise<{
 	numbers: Set<number>;
 	branches: Set<string>;
-} {
+}> {
 	const numbers = new Set<number>();
 	const branches = new Set<string>();
 	for (const c of await store.listTasks()) {
@@ -1055,7 +1055,7 @@ async function dueReviewRows(
 	pulls: PullInfo[],
 ): Promise<PrReviewRow[]> {
 	const byNumber = new Map(pulls.map((p) => [p.number, p]));
-	const own = ownPulls(store);
+	const own = await ownPulls(store);
 	const due: PrReviewRow[] = [];
 	for (const row of await store.listPrReviews()) {
 		if (
@@ -1553,7 +1553,7 @@ async function requestReview(
 		return;
 	}
 	// The project's own PR-mode work: a review here would answer the board itself.
-	const own = ownPulls(store);
+	const own = await ownPulls(store);
 	if (own.numbers.has(o.number) || (ref !== null && own.branches.has(ref))) {
 		ctx.log(
 			`prs: ${project.name}: #${o.number} is this project's own PR; not reviewed`,

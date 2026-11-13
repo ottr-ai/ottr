@@ -1846,9 +1846,9 @@ describe("createPrWatcher", () => {
 	});
 
 	test("the watcher never reviews a PR one of the project's cards opened", async () => {
-		const s = setup();
-		const card = s.store.createTask("parent");
-		s.store.updateTask(card.id, {
+		const s = await setup();
+		const card = await s.store.createTask("parent");
+		await s.store.updateTask(card.id, {
 			stage: "merging",
 			state: "idle",
 			prNumber: 7,
@@ -1866,18 +1866,18 @@ describe("createPrWatcher", () => {
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(1);
-		expect(s.cards()[0]!.title).toContain("#8");
-		expect(s.cards().some((c) => c.title.includes("PR review: #7"))).toBe(
-			false,
-		);
+		expect((await s.cards()).length).toBe(1);
+		expect((await s.cards())[0]!.title).toContain("#8");
+		expect(
+			(await s.cards()).some((c) => c.title.includes("PR review: #7")),
+		).toBe(false);
 		expect(s.prompts).toHaveLength(1);
 	});
 
 	test("a card's branch skips its PR by the open list's head ref", async () => {
-		const s = setup();
-		const card = s.store.createTask("branch card");
-		s.store.updateTask(card.id, {
+		const s = await setup();
+		const card = await s.store.createTask("branch card");
+		await s.store.updateTask(card.id, {
 			stage: "merging",
 			state: "idle",
 			prNumber: null,
@@ -1896,15 +1896,15 @@ describe("createPrWatcher", () => {
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(1);
-		expect(s.cards()[0]!.title).toContain("#10");
+		expect((await s.cards()).length).toBe(1);
+		expect((await s.cards())[0]!.title).toContain("#10");
 		expect(s.prompts).toHaveLength(1);
 	});
 
 	test("reviewNow skips the project's own PR", async () => {
-		const s = setup();
-		const card = s.store.createTask("parent");
-		s.store.updateTask(card.id, {
+		const s = await setup();
+		const card = await s.store.createTask("parent");
+		await s.store.updateTask(card.id, {
 			stage: "merging",
 			state: "idle",
 			prNumber: 7,
@@ -1921,7 +1921,7 @@ describe("createPrWatcher", () => {
 		await s.watcher.reviewNow({ project: "p", number: 7, note: "look" });
 		await s.watcher.reviewIdle();
 		expect(s.prompts).toHaveLength(0);
-		expect(s.cards().length).toBe(0);
+		expect((await s.cards()).length).toBe(0);
 		expect(s.logs).toContain(
 			"prs: p: #7 is this project's own PR; not reviewed",
 		);
