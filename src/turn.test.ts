@@ -7,6 +7,7 @@ import {
 	setSystemTime,
 	test,
 } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, execSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import {
@@ -110,6 +111,7 @@ import type {
 	ProposalSummary,
 	RecordedFinding,
 	RunResult,
+	Task,
 	WorkCheckRun,
 } from "./types.ts";
 import { vmState } from "./vmState.ts";
@@ -213,7 +215,67 @@ function runResult(p: Partial<RunResult> = {}): RunResult {
 	};
 }
 
-function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
+type FixtureOps = Partial<TurnOps> & {
+	holdFollowUps?: boolean;
+	scheduledCap?: number | null;
+};
+
+// Only an explicit turn owns a temporary cap. Its callbacks and finally close that cap before automatic dispatch.
+function holdFollowUps(
+	projects: Map<string, TurnProject>,
+	options: TurnOps & { holdFollowUps?: boolean; scheduledCap?: number | null },
+): TurnLoop {
+	const { holdFollowUps: hold = false, scheduledCap, ...ops } = options;
+	if (!hold) return createTurnLoop(projects, ops);
+	const admission = new AsyncLocalStorage<{ allowed: boolean }>();
+	const close = () => {
+		const state = admission.getStore();
+		if (state) state.allowed = false;
+	};
+	const controlled: TurnOps = {
+		...ops,
+		maxTotalRuns: () => {
+			const state = admission.getStore();
+			if (!state)
+				return scheduledCap === undefined ? ops.maxTotalRuns() : scheduledCap;
+			return state.allowed ? ops.maxTotalRuns() : 0;
+		},
+		publishSoon: () => {
+			close();
+			ops.publishSoon();
+		},
+		startRun: (options) => {
+			close();
+			return ops.startRun(options);
+		},
+	};
+	if (ops.hosted !== undefined) {
+		const hosted = ops.hosted;
+		controlled.hosted = {
+			...hosted,
+			hooks: {
+				...hosted.hooks,
+				creditOk: () => {
+					close();
+					return hosted.hooks.creditOk();
+				},
+			},
+		};
+	}
+	const loop = createTurnLoop(projects, controlled);
+	const runTurn = loop.runTurn;
+	loop.runTurn = (name, id) =>
+		admission.run({ allowed: true }, async () => {
+			try {
+				await runTurn(name, id);
+			} finally {
+				close();
+			}
+		});
+	return loop;
+}
+
+function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 	return {
 		extensionPath: "ext.ts",
 		board: { url: "http://127.0.0.1:4747", token: "boot-token" },
@@ -333,7 +395,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 		mergeHoldLanded: async () => false,
 		resetBranchTo: async () => true,
 		pidAlive: () => true,
-		startRun: (o: {
+		startRun: async (o: {
 			cwd: string;
 			prompt: string;
 			env?: Record<string, string>;
@@ -351,7 +413,7 @@ function fakeOps(record: Recorded, overrides: Partial<TurnOps> = {}): TurnOps {
 			onSession?: (sid: string) => void;
 		}) => {
 			record.runs.push(o);
-			o.onSession?.("sess-1");
+			await o.onSession?.("sess-1");
 			return {
 				pid: 4242,
 				done: Promise.resolve(
@@ -409,24 +471,27 @@ function fakeProject(store: ProjectStore): TurnProject {
 const dirs: string[] = [];
 const stores: ProjectStore[] = [];
 
-function freshStore(): ProjectStore {
+async function freshStore(): Promise<ProjectStore> {
 	const dir = mkdtempSync(join(tmpdir(), "turn-test-"));
 	dirs.push(dir);
-	const store = ProjectStore.open(dir);
+	const store = await ProjectStore.open(dir);
 	stores.push(store);
 	return store;
 }
 
-afterEach(() => {
-	for (const s of stores.splice(0)) s.close();
+afterEach(async () => {
+	for (const s of stores.splice(0)) await s.close();
 	for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
 describe("turn loop", () => {
 	test("a finished run records ranOn on the turn; a run without one leaves it null", async () => {
-		const { store, loop } = setup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
-				o.onSession?.("sess-1");
+		const { store, loop } = await setup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -439,21 +504,21 @@ describe("turn loop", () => {
 				};
 			},
 		});
-		const task = store.createTask("worker run");
+		const task = await store.createTask("worker run");
 		await loop.runTurn(store.name, task.id);
-		const turns = store.listTurns(task.id);
+		const turns = await store.listTurns(task.id);
 		expect(turns).toHaveLength(1);
 		expect(turns[0]!.ranOn).toBe("worker-a (abc)");
 		expect(turns[0]!.outcome).toBe("answered");
 
-		const { store: plainStore, loop: plainLoop } = setup();
-		const plain = plainStore.createTask("plain run");
+		const { store: plainStore, loop: plainLoop } = await setup();
+		const plain = await plainStore.createTask("plain run");
 		await plainLoop.runTurn(plainStore.name, plain.id);
-		expect(plainStore.listTurns(plain.id)[0]!.ranOn).toBeNull();
+		expect((await plainStore.listTurns(plain.id))[0]!.ranOn).toBeNull();
 	});
 
 	test("queued work turn lands done: branch, session, commits, worktree removed", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -470,15 +535,15 @@ describe("turn loop", () => {
 			recorded: [],
 		};
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, { commitsAhead: async () => 0 }),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// outcome answered + commitsAhead 0 classifies to done/idle.
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
@@ -486,22 +551,22 @@ describe("turn loop", () => {
 		expect(after.branch).toBe(`ott/${task.id.toLowerCase()}-work-please`);
 		expect(after.sessionId).toBe("sess-1");
 		// Stage went todo -> in_progress (in onSession) before landing done.
-		const events = store.events().filter((e) => e.kind === "stage");
+		const events = (await store.events()).filter((e) => e.kind === "stage");
 		expect(events.map((e) => e.to)).toContain("in_progress");
 		// Worktree created then removed exactly once with the created branch.
 		expect(record.createWorktree).toHaveLength(1);
 		expect(record.removeWorktree).toHaveLength(1);
 		expect(record.removeWorktree[0]).toMatchObject({ branch: after.branch });
 		// One turn recorded with the outcome and the model.
-		const turns = store.listTurns(task.id);
+		const turns = await store.listTurns(task.id);
 		expect(turns).toHaveLength(1);
 		expect(turns[0]!.outcome).toBe("answered");
 		expect(turns[0]!.pid).toBe(4242);
 		expect(turns[0]!.model).toBe("m");
 		// The task's selector level lands on the recorded model (transcripts carry the bare model only).
-		const picked = store.createTask("work with a level", "m:max");
+		const picked = await store.createTask("work with a level", "m:max");
 		await loop.runTurn(store.name, picked.id);
-		expect(store.listTurns(picked.id)[0]!.model).toBe("m:max");
+		expect((await store.listTurns(picked.id))[0]!.model).toBe("m:max");
 		// The turn's prompt reached the fake process in the created worktree.
 		expect(record.runs[0]!.cwd).toContain(task.id);
 		expect(record.runs[0]!.prompt).toContain("work please");
@@ -517,66 +582,71 @@ describe("turn loop", () => {
 	});
 
 	test("review turns pin a fixed session name; a plain work turn pins none", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
 
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER} review origin/main`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs[0]!.sessionName).toBe("Review");
 
-		const work = store.createTask("work please");
+		const work = await store.createTask("work please");
 		await loop.runTurn(store.name, work.id);
 		expect(record.runs[1]!.sessionName).toBeNull();
 	});
 
 	test("prepare generates the card title once and pins it on the run", async () => {
 		const prompts: string[] = [];
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			genTitle: async (prompt: string) => {
 				prompts.push(prompt);
 				return "Fix the login gate";
 			},
 		});
 
-		const task = store.createTask(
+		const task = await store.createTask(
 			"fix the login redirect for expired sessions",
 		);
 		await loop.runTurn(store.name, task.id);
 		expect(prompts).toEqual([task.prompt]);
 		expect(record.runs[0]!.sessionName).toBe("Fix the login gate");
 		// Persisted in prepare: the card shows the generated name before the run even starts.
-		expect(store.sessionTitle(store.getTask(task.id)!)).toBe(
+		expect(await store.sessionTitle((await store.getTask(task.id))!)).toBe(
 			"Fix the login gate",
 		);
 
 		// A stored title is reused, never regenerated: a later prepare re-pins the same name.
-		const carried = store.createTask("second task with a stored title");
-		store.nameTask(carried.id, "Carried over");
+		const carried = await store.createTask("second task with a stored title");
+		await store.nameTask(carried.id, "Carried over");
 		await loop.runTurn(store.name, carried.id);
 		expect(prompts).toHaveLength(1);
 		expect(record.runs[1]!.sessionName).toBe("Carried over");
 	});
 
 	test("a failed title generation starts the turn unnamed on the prompt cut", async () => {
-		const { store, record, loop } = setup({ genTitle: async () => null });
+		const { store, record, loop } = await setup({ genTitle: async () => null });
 
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.sessionName).toBeNull();
-		expect(store.frozenTitle(store.getTask(task.id)!)).toBe(task.title);
+		expect(await store.frozenTitle((await store.getTask(task.id))!)).toBe(
+			task.title,
+		);
 	});
 
 	test("a board check runs in the server with the board env; the same text unmarked goes to a worker", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 		});
-		const check = store.createTask(BOARD_CHECK_PROMPT);
-		store.setBoardCheckId(check.id);
+		const check = await store.createTask(BOARD_CHECK_PROMPT);
+		await store.setBoardCheckId(check.id);
 		await loop.runTurn(store.name, check.id);
 		const run = record.runs[0]!;
 		// Only loopback in the server's own container reaches the whole board API.
@@ -591,14 +661,14 @@ describe("turn loop", () => {
 		});
 
 		// An agent can file the same text, but only the route's mark keeps a card off the workers.
-		const copy = store.createTask(BOARD_CHECK_PROMPT);
+		const copy = await store.createTask(BOARD_CHECK_PROMPT);
 		await loop.runTurn(store.name, copy.id);
 		expect(record.runs[1]!.worker).toEqual({ urls: ["http://worker-a:8787"] });
 		expect(record.runs[1]!.sessionName).toBeNull();
 	});
 
 	test("retro card runs raw prompt with the retro flags and no board, and files its proposal as a held card", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			modelList: async () => [
 				{
@@ -621,7 +691,7 @@ describe("turn loop", () => {
 			},
 			project: null,
 		};
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RETRO_MARKER}the weekly retro`,
 			null,
 			"retro",
@@ -645,7 +715,9 @@ describe("turn loop", () => {
 		expect(run.skills).toBe("retro");
 
 		// The proposal is a held child card.
-		const kids = store.listTasks().filter((t) => t.followUpOf === task.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === task.id,
+		);
 		expect(kids).toHaveLength(1);
 		const kid = kids[0]!;
 		expect(kid.state).toBe("needs_you");
@@ -672,16 +744,16 @@ describe("turn loop", () => {
 			"utf8",
 		);
 		expect(handoff).toContain("the weekly retro");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`filed proposal ${kid.id} (held for approval)`,
 		);
 		// The retro card itself settles done like a work card.
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a trending scout runs on a worker, read-only in the main checkout with only its tools, and settles done", async () => {
 		const unsaved: string[] = [];
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// The scout reads third-party text: with a worker pool it never runs on the server (D6).
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			// commitsAhead keeps its default 1: the main checkout's own commits are never the scout's.
@@ -690,7 +762,7 @@ describe("turn loop", () => {
 				return null;
 			},
 		});
-		const task = store.createTask(
+		const task = await store.createTask(
 			"Trending scout for demo\nread the bundle",
 			null,
 			"trending",
@@ -723,23 +795,25 @@ describe("turn loop", () => {
 		expect(record.removeWorktree).toHaveLength(0);
 		expect(record.quarantine).toHaveLength(0);
 		expect(unsaved).toEqual([]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.branch).toBeNull();
 	});
 
 	test("a retro proposal names its source card once by id and title", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const source = store.createTask(
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const source = await store.createTask(
 			"Rebase and retry when the server push after a merge fails",
 		);
-		const retro = store.createTask(
+		const retro = await store.createTask(
 			`${RETRO_MARKER}${source.title}`,
 			null,
 			"retro",
 		);
-		store.updateTask(retro.id, { followUpOf: source.id });
+		await store.updateTask(retro.id, { followUpOf: source.id });
 		record.proposal = {
 			prompt: "Add a benchmark for the merge path",
 			model: null,
@@ -749,7 +823,9 @@ describe("turn loop", () => {
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kid = store.listTasks().find((t) => t.followUpOf === retro.id);
+		const kid = (await store.listTasks()).find(
+			(t) => t.followUpOf === retro.id,
+		);
 		expect(kid).toBeDefined();
 		const reason = kid!.needsReason ?? "";
 		expect(reason.startsWith(PROPOSED_REASON_PREFIX)).toBe(true);
@@ -769,13 +845,19 @@ describe("turn loop", () => {
 	});
 
 	test("retro proposal filing is capped at 3 open proposals", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 		// Three already-open, untouched proposals fill the cap. The first keeps the
 		// pre-2026-11 wording: stored cards still count against the cap.
 		for (let i = 0; i < 3; i++) {
-			const p = store.createTask(`proposal ${i}`);
-			store.updateTask(p.id, {
+			const p = await store.createTask(`proposal ${i}`);
+			await store.updateTask(p.id, {
 				state: "needs_you",
 				needsReason:
 					i === 0
@@ -793,19 +875,25 @@ describe("turn loop", () => {
 		await loop.runTurn(store.name, retro.id);
 
 		expect(
-			store.listTasks().filter((t) => t.followUpOf === retro.id),
+			(await store.listTasks()).filter((t) => t.followUpOf === retro.id),
 		).toHaveLength(0);
-		expect(logText(store, retro.id)).toContain(
+		expect(await logText(store, retro.id)).toContain(
 			"retro: proposal dropped: cap of 3 open proposals reached",
 		);
 	});
 
 	test("a cancelled proposal does not count against the cap", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 		for (let i = 0; i < 3; i++) {
-			const p = store.createTask(`proposal ${i}`);
-			store.updateTask(p.id, {
+			const p = await store.createTask(`proposal ${i}`);
+			await store.updateTask(p.id, {
 				state: "needs_you",
 				needsReason: `${PROPOSED_REASON_PREFIX}an older retro.`,
 				...(i === 0 ? { cancelledAt: Date.now() } : {}),
@@ -820,25 +908,27 @@ describe("turn loop", () => {
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kid = store.listTasks().find((t) => t.followUpOf === retro.id);
+		const kid = (await store.listTasks()).find(
+			(t) => t.followUpOf === retro.id,
+		);
 		expect(kid).toBeDefined();
 		expect(kid!.prompt).toContain("fits under the cap");
 	});
 
 	test("a retro proposal with a project files the card on that project's store", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		// A second board project named by the proposal, like agent-data for a
 		// rules, skills or AGENTS.md change.
 		const root = mkdtempSync(join(tmpdir(), "turn-test-"));
 		dirs.push(root);
-		const agent = ProjectStore.open(join(root, "agent-data"));
+		const agent = await ProjectStore.open(join(root, "agent-data"));
 		stores.push(agent);
 		const projects = new Map([
 			[store.name, fakeProject(store)],
 			[agent.name, fakeProject(agent)],
 		]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, { commitsAhead: async () => 0 }),
 		);
@@ -854,7 +944,7 @@ describe("turn loop", () => {
 			},
 			project: agent.name,
 		};
-		const retro = store.createTask(
+		const retro = await store.createTask(
 			`${RETRO_MARKER}the weekly retro`,
 			null,
 			"retro",
@@ -863,7 +953,9 @@ describe("turn loop", () => {
 		await loop.runTurn(store.name, retro.id);
 
 		// The card lands on the named project, held and linked to the retro.
-		const kids = agent.listTasks().filter((t) => t.followUpOf === retro.id);
+		const kids = (await agent.listTasks()).filter(
+			(t) => t.followUpOf === retro.id,
+		);
 		expect(kids).toHaveLength(1);
 		const kid = kids[0]!;
 		expect(kid.state).toBe("needs_you");
@@ -884,9 +976,9 @@ describe("turn loop", () => {
 		expect(handoff).toContain("the weekly retro");
 		// The retro's own store holds no proposal card.
 		expect(
-			store.listTasks().filter((t) => t.followUpOf === retro.id),
+			(await store.listTasks()).filter((t) => t.followUpOf === retro.id),
 		).toHaveLength(0);
-		expect(logText(store, retro.id)).toContain(
+		expect(await logText(store, retro.id)).toContain(
 			`filed proposal ${kid.id} in project ${agent.name} (held for approval)`,
 		);
 	});
@@ -895,31 +987,43 @@ describe("turn loop", () => {
 		// The extension rejects an unknown name at the call when the run carries
 		// the board's list; this settle check guards a list that is missing or
 		// went stale (a project removed while the retro ran).
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
 		record.proposal = {
 			prompt: "an idea for a project that does not exist",
 			model: null,
 			summary: null,
 			project: "no-such-project",
 		};
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 
 		await loop.runTurn(store.name, retro.id);
 
 		expect(
-			store.listTasks().filter((t) => t.followUpOf === retro.id),
+			(await store.listTasks()).filter((t) => t.followUpOf === retro.id),
 		).toHaveLength(0);
-		expect(logText(store, retro.id)).toContain(
+		expect(await logText(store, retro.id)).toContain(
 			`retro: proposal dropped: unknown project "no-such-project" (known projects: ${store.name})`,
 		);
 		// The retro itself still settles done.
-		expect(store.getTask(retro.id)!.stage).toBe("done");
+		expect((await store.getTask(retro.id))!.stage).toBe("done");
 	});
 
 	test("retro reply resumes with retroReplyPrompt, not the work reply", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
-		store.updateTask(retro.id, {
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
+		await store.updateTask(retro.id, {
 			sessionId: "sess-1",
 			pendingPrompt: "also check the CI logs",
 		});
@@ -935,7 +1039,7 @@ describe("turn loop", () => {
 	});
 
 	test("interview card runs in the main checkout, raw prompt, settles done without worktree ops", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -952,11 +1056,11 @@ describe("turn loop", () => {
 			recorded: [],
 		};
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, { commitsAhead: async () => 0 }),
 		);
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}demo`,
 			null,
 			"interview",
@@ -964,7 +1068,7 @@ describe("turn loop", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.branch).toBeNull();
 		// The run happened in the project checkout, never in a created worktree.
@@ -975,12 +1079,12 @@ describe("turn loop", () => {
 		// unsavedWork never gated the main checkout.
 		expect(after.keptFiles).toEqual([]);
 		// A ready outcome is normalized to answered and still settles done.
-		const turns = store.listTurns(task.id);
+		const turns = await store.listTurns(task.id);
 		expect(turns[0]!.outcome).toBe("answered");
 	});
 
 	test("interview card ignores the commits-ahead gate (its AGENTS.md commit is on main)", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -999,11 +1103,11 @@ describe("turn loop", () => {
 		const projects = new Map([[store.name, fakeProject(store)]]);
 		// A work task reporting answered with a commit ahead is bounced; the interview committed
 		// AGENTS.md on the main checkout (no base branch), so the gate must not count it.
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, { commitsAhead: async () => 1 }),
 		);
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}demo`,
 			null,
 			"interview",
@@ -1011,12 +1115,12 @@ describe("turn loop", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 	});
 
 	test("interview card with a ready outcome settles done", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -1034,13 +1138,13 @@ describe("turn loop", () => {
 		};
 
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -1058,7 +1162,7 @@ describe("turn loop", () => {
 				},
 			}),
 		);
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}demo`,
 			null,
 			"interview",
@@ -1066,12 +1170,12 @@ describe("turn loop", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(store.listTurns(task.id)[0]!.outcome).toBe("answered");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect((await store.listTurns(task.id))[0]!.outcome).toBe("answered");
 	});
 
 	test("the turn row records the agent layer the run pinned", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -1089,13 +1193,13 @@ describe("turn loop", () => {
 		};
 
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						layerId: "A",
@@ -1114,7 +1218,7 @@ describe("turn loop", () => {
 				},
 			}),
 		);
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}demo`,
 			null,
 			"interview",
@@ -1124,23 +1228,23 @@ describe("turn loop", () => {
 
 		// The audit record (docs/specs/agent-layer-switch.md "Record"): the run's
 		// pinned layer id lands on the turn row; a flat-home run records null.
-		expect(store.listTurns(task.id)[0]!.layer).toBe("A");
+		expect((await store.listTurns(task.id))[0]!.layer).toBe("A");
 	});
 
 	test("backlog card runs a grill turn: no worktree, ready parks it idle in backlog", async () => {
 		const record = baseRecord();
-		const store = freshStore();
+		const store = await freshStore();
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
-				startRun: (o: {
+				startRun: async (o: {
 					cwd: string;
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -1157,12 +1261,12 @@ describe("turn loop", () => {
 				},
 			}),
 		);
-		const task = store.createTask("an idea");
-		store.updateTask(task.id, { stage: "backlog" });
+		const task = await store.createTask("an idea");
+		await store.updateTask(task.id, { stage: "backlog" });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("backlog");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -1181,17 +1285,17 @@ describe("turn loop", () => {
 
 	test("a grill turn that ends on an ask parks needs_you with the question", async () => {
 		const record = baseRecord();
-		const store = freshStore();
+		const store = await freshStore();
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -1211,12 +1315,12 @@ describe("turn loop", () => {
 				},
 			}),
 		);
-		const task = store.createTask("an idea");
-		store.updateTask(task.id, { stage: "backlog" });
+		const task = await store.createTask("an idea");
+		await store.updateTask(task.id, { stage: "backlog" });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("backlog");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("Wants your answer: Which scope?");
@@ -1232,14 +1336,14 @@ describe("turn loop", () => {
 
 	test("a reply to a grilled card resumes in the main checkout and stays backlog", async () => {
 		const record = baseRecord();
-		const store = freshStore();
+		const store = await freshStore();
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(projects, fakeOps(record));
-		const task = store.createTask("an idea");
-		store.updateTask(task.id, { stage: "backlog" });
+		const loop = holdFollowUps(projects, fakeOps(record));
+		const task = await store.createTask("an idea");
+		await store.updateTask(task.id, { stage: "backlog" });
 		await loop.runTurn(store.name, task.id);
 		// A reply queues like the answer route does: pending text on a queued card.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			sessionId: "sess-1",
 			pendingPrompt: "use option B",
 			state: "queued",
@@ -1249,7 +1353,7 @@ describe("turn loop", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("backlog");
 		expect(after.state).toBe("idle");
 		expect(record.createWorktree).toHaveLength(0);
@@ -1260,7 +1364,7 @@ describe("turn loop", () => {
 	});
 
 	test("merge turn done: pushSha pinned when origin tip equals local target tip", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -1277,7 +1381,7 @@ describe("turn loop", () => {
 			recorded: [],
 		};
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				// The Done path also reads the branch tip (OTTR-326 gate) and the mergeHead
@@ -1286,9 +1390,9 @@ describe("turn loop", () => {
 					ref === "origin/main" || ref === "refs/remotes/origin/main"
 						? "abc123"
 						: "branch-tip",
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -1306,17 +1410,17 @@ describe("turn loop", () => {
 				},
 			}),
 		);
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, { stage: "merging" });
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, { stage: "merging" });
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)?.stage).toBe("done");
-		expect(store.getTask(task.id)?.pushSha).toBe("abc123");
+		expect((await store.getTask(task.id))?.stage).toBe("done");
+		expect((await store.getTask(task.id))?.pushSha).toBe("abc123");
 	});
 
 	test("merge turn done: pushSha stays null when origin tip differs from local target tip", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -1333,7 +1437,7 @@ describe("turn loop", () => {
 			recorded: [],
 		};
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				// The local target tip and the origin tip differ, so the CI pin stays unset.
@@ -1343,9 +1447,9 @@ describe("turn loop", () => {
 						: ref === "refs/remotes/origin/main"
 							? "def456"
 							: "branch-tip",
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -1363,17 +1467,17 @@ describe("turn loop", () => {
 				},
 			}),
 		);
-		const task = store.createTask("merge please 2");
-		store.updateTask(task.id, { stage: "merging" });
+		const task = await store.createTask("merge please 2");
+		await store.updateTask(task.id, { stage: "merging" });
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)?.stage).toBe("done");
-		expect(store.getTask(task.id)?.pushSha).toBeNull();
+		expect((await store.getTask(task.id))?.stage).toBe("done");
+		expect((await store.getTask(task.id))?.pushSha).toBeNull();
 	});
 
 	test("omp exits non-zero: task waits for you with the classify reason", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -1390,9 +1494,9 @@ describe("turn loop", () => {
 			recorded: [],
 		};
 		const ops = fakeOps(record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(runResult({ exitCode: 1 })),
@@ -1403,24 +1507,24 @@ describe("turn loop", () => {
 			},
 		});
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(projects, ops);
-		const task = store.createTask("work please");
+		const loop = holdFollowUps(projects, ops);
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("omp exited with code 1 before finishing.");
 		// The worktree is kept: nothing landed, nothing gets deleted.
 		expect(record.removeWorktree).toHaveLength(0);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe(after.needsReason);
 	});
 
 	test("a no-stderr death with dispatch context writes the same line to the turn log", async () => {
-		const { store, loop } = setup({
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("sess-1");
+		const { store, loop } = await setup({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -1433,17 +1537,17 @@ describe("turn loop", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		const line =
 			"omp exited with code 1 before finishing (dispatch local, argv 12, cwd wt, pid 4242, 41s, no stderr).";
-		expect(store.getTask(task.id)!.needsReason).toBe(line);
-		expect(logText(store, task.id)).toContain(`${line}\n`);
+		expect((await store.getTask(task.id))!.needsReason).toBe(line);
+		expect(await logText(store, task.id)).toContain(`${line}\n`);
 	});
 
 	test("tracker error: task waits for you with 'Tracker error: <msg>'", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -1460,9 +1564,9 @@ describe("turn loop", () => {
 			recorded: [],
 		};
 		const ops = fakeOps(record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.reject(new Error("boom")),
@@ -1473,16 +1577,16 @@ describe("turn loop", () => {
 			},
 		});
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(projects, ops);
-		const task = store.createTask("work please");
+		const loop = holdFollowUps(projects, ops);
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("Tracker error: boom");
 		expect(record.removeWorktree).toHaveLength(0);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe("boom");
 	});
 });
@@ -1496,10 +1600,10 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 	setNetworkGitAuth(() => ({ GIT_SSH_COMMAND: "ssh -i /k" }));
 	try {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -1514,13 +1618,13 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 				};
 			},
 		});
-		const merge = store.createTask("merge please");
-		store.updateTask(merge.id, { stage: "merging" });
+		const merge = await store.createTask("merge please");
+		await store.updateTask(merge.id, { stage: "merging" });
 		await loop.runTurn(store.name, merge.id);
 		// env is always an object now; the assertion is that it carries no git auth.
 		expect(record.runs[0]!.env).toEqual({});
 
-		const work = store.createTask("work please");
+		const work = await store.createTask("work please");
 		await loop.runTurn(store.name, work.id);
 		expect(record.runs[1]!.env).toEqual({});
 	} finally {
@@ -1535,7 +1639,7 @@ test("a merge turn on an origin without the target branch parks naming Push to o
 	const run = (cwd: string, ...args: string[]): void => {
 		execSync(`git ${args.join(" ")}`, { cwd, stdio: "ignore" });
 	};
-	const { store, loop } = setup({ resolveTarget: realResolveTarget });
+	const { store, loop } = await setup({ resolveTarget: realResolveTarget });
 	// The main checkout holds a commit; origin is an empty bare repo.
 	const dir = store.path;
 	const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
@@ -1546,13 +1650,13 @@ test("a merge turn on an origin without the target branch parks naming Push to o
 	run(dir, "config", "user.name", "t");
 	run(dir, "commit", "-q", "--allow-empty", "-m", "seed");
 	run(dir, "remote", "add", "origin", origin);
-	store.setSettings({ originUrl: origin });
-	const task = store.createTask("merge please");
-	store.updateTask(task.id, { stage: "merging" });
+	await store.setSettings({ originUrl: origin });
+	const task = await store.createTask("merge please");
+	await store.updateTask(task.id, { stage: "merging" });
 
 	await loop.runTurn(store.name, task.id);
 
-	const parked = store.getTask(task.id)!;
+	const parked = (await store.getTask(task.id))!;
 	expect(parked.state).toBe("needs_you");
 	expect(parked.needsReason).toContain(
 		'origin has no main branch yet, so origin/main cannot resolve. Push the local main with the board\'s "Push to origin" button',
@@ -1577,24 +1681,24 @@ function baseRecord(): Recorded {
 	};
 }
 
-function setup(overrides: Partial<TurnOps> = {}) {
-	const store = freshStore();
+async function setup(overrides: FixtureOps = {}) {
+	const store = await freshStore();
 	const record = baseRecord();
 	const projects = new Map([[store.name, fakeProject(store)]]);
-	const loop = createTurnLoop(projects, fakeOps(record, overrides));
+	const loop = holdFollowUps(projects, fakeOps(record, overrides));
 	return { store, record, projects, loop };
 }
 
 /** Like setup, for overrides that need the record itself (e.g. integratedRun(record)). */
-function setupWith(record: Recorded, overrides: Partial<TurnOps> = {}) {
-	const store = freshStore();
+async function setupWith(record: Recorded, overrides: FixtureOps = {}) {
+	const store = await freshStore();
 	const projects = new Map([[store.name, fakeProject(store)]]);
-	const loop = createTurnLoop(projects, fakeOps(record, overrides));
+	const loop = holdFollowUps(projects, fakeOps(record, overrides));
 	return { store, record, projects, loop };
 }
 
-function logText(store: ProjectStore, id: string): string {
-	return readFileSync(store.logPath(id), "utf8");
+async function logText(store: ProjectStore, id: string): Promise<string> {
+	return readFileSync(await store.logPath(id), "utf8");
 }
 
 function saveSession(store: ProjectStore, sid: string): void {
@@ -1603,9 +1707,9 @@ function saveSession(store: ProjectStore, sid: string): void {
 }
 
 /** A card waiting for a reply turn on a saved session. */
-function replyCard(store: ProjectStore, prompt: string, kind?: "retro") {
-	const task = store.createTask(prompt, null, kind);
-	store.updateTask(task.id, {
+async function replyCard(store: ProjectStore, prompt: string, kind?: "retro") {
+	const task = await store.createTask(prompt, null, kind);
+	await store.updateTask(task.id, {
 		stage: "in_progress",
 		sessionId: "s1",
 		pendingPrompt: "just finish it",
@@ -1614,9 +1718,14 @@ function replyCard(store: ProjectStore, prompt: string, kind?: "retro") {
 	return task;
 }
 
-function setImage(store: ProjectStore, id: string, name: string, body: string) {
-	mkdirSync(store.imagesDir(id), { recursive: true });
-	writeFileSync(join(store.imagesDir(id), name), body);
+async function setImage(
+	store: ProjectStore,
+	id: string,
+	name: string,
+	body: string,
+) {
+	mkdirSync(await store.imagesDir(id), { recursive: true });
+	writeFileSync(join(await store.imagesDir(id), name), body);
 }
 
 // settleReviews is voided inside schedule(); no completion promise exists, so drain the
@@ -1631,9 +1740,12 @@ async function flushPromises() {
 /** Polls until the predicate holds, bounded. The concurrent-turn tests drain real
  * async settle chains whose round count varies (real git reads), so a fixed flush
  * count would race; this awaits the real condition instead of a guessed duration. */
-async function eventually(cond: () => boolean, ms = 10_000): Promise<void> {
+async function eventually(
+	cond: () => boolean | Promise<boolean>,
+	ms = 10_000,
+): Promise<void> {
 	const end = Date.now() + ms;
-	while (!cond()) {
+	while (!(await cond())) {
 		if (Date.now() > end) throw new Error("eventually: condition never held");
 		await Bun.sleep(2);
 	}
@@ -1644,19 +1756,19 @@ async function settled(
 	store: ProjectStore,
 	id: string,
 ): Promise<{ stage: string; state: string; needsReason: string | null }> {
-	await eventually(() => {
-		const t = store.getTask(id)!;
+	await eventually(async () => {
+		const t = (await store.getTask(id))!;
 		return t.stage === "done" || t.state === "needs_you";
 	});
-	const t = store.getTask(id)!;
+	const t = (await store.getTask(id))!;
 	return { stage: t.stage, state: t.state, needsReason: t.needsReason };
 }
 
 /** startRun override whose run reports integrated: the release-approve path. */
 function integratedRun(record: Recorded) {
-	return (o: { prompt: string; onSession?: (sid: string) => void }) => {
+	return async (o: { prompt: string; onSession?: (sid: string) => void }) => {
 		record.runs.push(o as never);
-		o.onSession?.("sess-1");
+		await o.onSession?.("sess-1");
 		return {
 			pid: 4242,
 			done: Promise.resolve(
@@ -1803,24 +1915,24 @@ describe("turn helpers", () => {
 		expect(seen).toEqual(["Error: a1", "Error: b1"]);
 	});
 
-	test("getSettingsLogged: store settings pass through", () => {
-		const { store } = setup();
+	test("getSettingsLogged: store settings pass through", async () => {
+		const { store } = await setup();
 		const e = fakeProject(store);
-		expect(getSettingsLogged(e)).toEqual(store.getSettings());
+		expect(await getSettingsLogged(e)).toEqual(await store.getSettings());
 	});
 
-	test("getSettingsLogged: sick store gets defaults with a private copyExtra", () => {
+	test("getSettingsLogged: sick store gets defaults with a private copyExtra", async () => {
 		const seen: string[] = [];
 		const orig = console.error;
 		console.error = (_: string, err: unknown) => seen.push(String(err));
 		try {
 			const sick = {
 				name: `sick-${Math.random()}`,
-				getSettings() {
+				async getSettings() {
 					throw new Error("database is locked");
 				},
 			} as unknown as ProjectStore;
-			const s = getSettingsLogged({ store: sick } as TurnProject);
+			const s = await getSettingsLogged({ store: sick } as TurnProject);
 			expect(s).toEqual(DEFAULT_SETTINGS);
 			s.copyExtra.push("extra");
 			expect(DEFAULT_SETTINGS.copyExtra).toEqual([]);
@@ -1829,26 +1941,28 @@ describe("turn helpers", () => {
 		}
 	});
 
-	test("appendLog writes the line and fires the notify hook", () => {
-		const { store, record } = setup();
-		const task = store.createTask("log me");
-		appendLog(store, task.id, "hello");
-		expect(readFileSync(store.logPath(task.id), "utf8")).toBe("hello\n");
+	test("appendLog writes the line and fires the notify hook", async () => {
+		const { store, record } = await setup();
+		const task = await store.createTask("log me");
+		await appendLog(store, task.id, "hello");
+		expect(readFileSync(await store.logPath(task.id), "utf8")).toBe("hello\n");
 		expect(record.notifyLog).toContainEqual([store.name, task.id]);
 	});
 
 	test.skipIf(process.platform !== "linux")(
 		"appendLog refuses a log file planted as a symlink and leaves its target unchanged",
-		() => {
-			const { store } = setup();
-			const task = store.createTask("log me");
+		async () => {
+			const { store } = await setup();
+			const task = await store.createTask("log me");
 			const outside = mkdtempSync(join(tmpdir(), "ottr-outside-"));
 			try {
 				const target = join(outside, "victim.txt");
 				writeFileSync(target, "original\n");
-				mkdirSync(dirname(store.logPath(task.id)), { recursive: true });
-				symlinkSync(target, store.logPath(task.id));
-				expect(() => appendLog(store, task.id, "planted")).toThrow(/refusing/);
+				mkdirSync(dirname(await store.logPath(task.id)), { recursive: true });
+				symlinkSync(target, await store.logPath(task.id));
+				await expect(appendLog(store, task.id, "planted")).rejects.toThrow(
+					/refusing/,
+				);
 				expect(readFileSync(target, "utf8")).toBe("original\n");
 			} finally {
 				rmSync(outside, { recursive: true, force: true });
@@ -1859,17 +1973,17 @@ describe("turn helpers", () => {
 
 describe("turn quarantine", () => {
 	test("clean work turn with scratch: quarantined, card settles, log names the files", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// The queued merging card would otherwise auto-chain a merge turn in runTurn's
 			// finally; the cap keeps the card at the settle instant these tests assert.
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			quarantineUntracked: async (worktreePath, quarantineDir) => {
 				record.quarantine.push({ worktreePath, quarantineDir });
 				return [".smoke-1.png", ".smoke-2.png"];
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.quarantine).toHaveLength(1);
@@ -1877,10 +1991,10 @@ describe("turn quarantine", () => {
 			join(store.tasksDir, "quarantine", task.id),
 		);
 		// isClean (default true) read after quarantine classifies as before.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"quarantined 2 untracked file(s) to .tasks/quarantine/" +
 				task.id +
 				": .smoke-1.png, .smoke-2.png",
@@ -1888,27 +2002,32 @@ describe("turn quarantine", () => {
 	});
 
 	test("quarantine failure: facts still classify, failure logged, no crash", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0, // hold the chained merge turn; assert the settle instant
+		const { store, loop } = await setup({
+			holdFollowUps: true, // hold the chained merge turn; assert the settle instant
 			commitsAhead: async () => 1,
 			quarantineUntracked: async () => {
 				throw new Error("git boom");
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
-		expect(logText(store, task.id)).toContain("quarantine failed: git boom");
+		expect(await logText(store, task.id)).toContain(
+			"quarantine failed: git boom",
+		);
 	});
 
 	test("crash turn: quarantine not called", async () => {
-		const { store, record, loop } = setup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(runResult({ exitCode: 1, outcome: null })),
@@ -1916,16 +2035,19 @@ describe("turn quarantine", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.quarantine).toHaveLength(0);
 	});
 
 	test("ask turn: quarantine not called", async () => {
-		const { store, record, loop } = setup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -1945,16 +2067,16 @@ describe("turn quarantine", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.quarantine).toHaveLength(0);
 	});
 
 	test("merge turn in the main checkout: quarantine not called", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("merge please");
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("merge please");
 		// A merge turn is a merging-stage task; a todo task would run as work and quarantine.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
@@ -1965,15 +2087,15 @@ describe("turn quarantine", () => {
 	});
 
 	test("interview and research cards: quarantine not called", async () => {
-		const { store, record, loop } = setup();
-		const interview = store.createTask(
+		const { store, record, loop } = await setup();
+		const interview = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}demo`,
 			null,
 			"interview",
 		);
 		await loop.runTurn(store.name, interview.id);
-		const research = store.createTask("research something");
-		store.updateTask(research.id, { research: true });
+		const research = await store.createTask("research something");
+		await store.updateTask(research.id, { research: true });
 		await loop.runTurn(store.name, research.id);
 		expect(record.quarantine).toHaveLength(0);
 	});
@@ -1981,42 +2103,42 @@ describe("turn quarantine", () => {
 
 describe("merge-turn diff capture", () => {
 	test("a merge turn captures the branch's stat and diff before integrating", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			diffStat: async () => [{ file: "src/a.ts", plus: 2, minus: 1 }],
 			diffText: async () => "diff --git a/src/a.ts b/src/a.ts\n",
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
 			worktree: "wt-x",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id);
+		const after = await store.getTask(task.id);
 		expect(after?.diffFiles).toEqual([{ file: "src/a.ts", plus: 2, minus: 1 }]);
 		expect(after?.diffText).toBe("diff --git a/src/a.ts b/src/a.ts\n");
 	});
 
 	test("a work turn captures nothing", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			diffStat: async () => [{ file: "src/a.ts", plus: 2, minus: 1 }],
 			diffText: async () => "diff --git a/src/a.ts b/src/a.ts\n",
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)?.diffFiles).toBeNull();
-		expect(store.getTask(task.id)?.diffText).toBeNull();
+		expect((await store.getTask(task.id))?.diffFiles).toBeNull();
+		expect((await store.getTask(task.id))?.diffText).toBeNull();
 	});
 
 	test("an already-integrated branch keeps the earlier capture", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			// A retried merge turn: the first attempt landed the branch, so nothing is ahead.
 			commitsAhead: async () => 0,
 			diffStat: async () => [{ file: "src/a.ts", plus: 2, minus: 1 }],
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
@@ -2025,7 +2147,7 @@ describe("merge-turn diff capture", () => {
 			diffText: "first",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)?.diffFiles).toEqual([
+		expect((await store.getTask(task.id))?.diffFiles).toEqual([
 			{ file: "first.txt", plus: 1, minus: 0 },
 		]);
 	});
@@ -2033,16 +2155,16 @@ describe("merge-turn diff capture", () => {
 
 describe("turn schedule", () => {
 	test("global cap 0 starts nothing but still publishes", async () => {
-		const { store, record, loop } = setup({ maxTotalRuns: () => 0 });
-		store.createTask("queued");
-		loop.schedule();
+		const { store, record, loop } = await setup({ maxTotalRuns: () => 0 });
+		await store.createTask("queued");
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(0);
 		expect(record.publishSoon).toBeGreaterThan(0);
 	});
 
 	test("a null global cap starts every queued card", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			maxTotalRuns: () => null,
 			// The runs hang, so the three starts this test expects stay the only ones.
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
@@ -2054,17 +2176,17 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		store.setSettings({ maxParallel: null });
-		store.createTask("queued one");
-		store.createTask("queued two");
-		store.createTask("queued three");
-		loop.schedule();
-		await flushPromises();
+		await store.setSettings({ maxParallel: null });
+		await store.createTask("queued one");
+		await store.createTask("queued two");
+		await store.createTask("queued three");
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 3);
 		expect(record.runs).toHaveLength(3);
 	});
 
 	test("a trending scout takes only a slot the normal picks left, one scout at a time", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			maxTotalRuns: () => null,
 			// The runs hang, so the starts this test expects stay the only ones.
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
@@ -2076,36 +2198,36 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		store.setSettings({ maxParallel: 2 });
-		const first = store.createTask("scout one", null, "trending");
-		const second = store.createTask("scout two", null, "trending");
-		store.updateTask(first.id, { queuedAt: 1 });
-		store.updateTask(second.id, { queuedAt: 2 });
-		store.createTask("work one");
-		store.createTask("work two");
-		loop.schedule();
-		await flushPromises();
+		await store.setSettings({ maxParallel: 2 });
+		const first = await store.createTask("scout one", null, "trending");
+		const second = await store.createTask("scout two", null, "trending");
+		await store.updateTask(first.id, { queuedAt: 1 });
+		await store.updateTask(second.id, { queuedAt: 2 });
+		await store.createTask("work one");
+		await store.createTask("work two");
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 2);
 		// Both slots went to the normal cards, although the scouts queued first.
 		expect(record.runs).toHaveLength(2);
-		expect(store.getTask(first.id)!.state).toBe("queued");
-		expect(store.getTask(second.id)!.state).toBe("queued");
+		expect((await store.getTask(first.id))!.state).toBe("queued");
+		expect((await store.getTask(second.id))!.state).toBe("queued");
 
 		// Free slots: the oldest scout starts; the other waits while one scout runs.
-		store.setSettings({ maxParallel: 4 });
-		loop.schedule();
-		await flushPromises();
+		await store.setSettings({ maxParallel: 4 });
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 3);
 		expect(record.runs).toHaveLength(3);
 		expect(record.runs[2]!.prompt).toBe("scout one");
 		expect(record.runs[2]!.cwd).toBe(store.path);
-		expect(store.getTask(second.id)!.state).toBe("queued");
-		loop.schedule();
-		await flushPromises();
+		expect((await store.getTask(second.id))!.state).toBe("queued");
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 3);
 		expect(record.runs).toHaveLength(3);
-		expect(store.getTask(second.id)!.state).toBe("queued");
+		expect((await store.getTask(second.id))!.state).toBe("queued");
 	});
 
 	test("a prompt-edit hold starts no turn until it clears", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			maxTotalRuns: () => null,
 			// The run hangs, so the one start this test expects stays the only one.
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
@@ -2117,28 +2239,28 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		store.setSettings({ maxParallel: null });
-		const task = store.createTask("queued work");
+		await store.setSettings({ maxParallel: null });
+		const task = await store.createTask("queued work");
 		// The drawer's open editor claims the hold (edit/start): a scheduler tick must
 		// defer the card, or the agent runs the saved prompt over the unsaved draft.
 		// The claim is PROMPT_EDIT_HELD exactly because nothing renews it — a hidden
 		// tab's throttled timers must not lapse the hold mid-edit.
-		store.updateTask(task.id, { holdUntil: PROMPT_EDIT_HELD });
-		loop.schedule();
+		await store.updateTask(task.id, { holdUntil: PROMPT_EDIT_HELD });
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)?.state).toBe("queued");
+		expect((await store.getTask(task.id))?.state).toBe("queued");
 		// Saving (editTask) or closing the editor (edit/stop) clears the hold; the
 		// next tick starts the card.
-		store.updateTask(task.id, { holdUntil: null });
-		loop.schedule();
-		await flushPromises();
+		await store.updateTask(task.id, { holdUntil: null });
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 1);
 		expect(record.runs).toHaveLength(1);
 	});
 
 	test("an update's hold starts no new turn until it lapses", async () => {
 		let held = true;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			drained: () => held,
 			// The run hangs, so the one start this test expects stays the only one.
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
@@ -2150,20 +2272,20 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		const task = store.createTask("queued work");
-		loop.schedule();
+		const task = await store.createTask("queued work");
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)?.state).toBe("queued");
+		expect((await store.getTask(task.id))?.state).toBe("queued");
 		held = false;
-		loop.schedule();
-		await flushPromises();
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 1);
 		expect(record.runs).toHaveLength(1);
 		expect(record.runs[0]?.prompt).toContain("queued work");
 	});
 
 	test("an update's hold still starts the board check, and only it", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			drained: () => true,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
@@ -2174,24 +2296,24 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		store.setSettings({ maxParallel: 1 });
+		await store.setSettings({ maxParallel: 1 });
 		// Queued first: without the hold, this card would take the one slot.
-		const work = store.createTask("queued work");
-		const check = store.createTask(BOARD_CHECK_PROMPT);
-		store.setBoardCheckId(check.id);
-		loop.schedule();
-		await flushPromises();
+		const work = await store.createTask("queued work");
+		const check = await store.createTask(BOARD_CHECK_PROMPT);
+		await store.setBoardCheckId(check.id);
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 1);
 		expect(record.runs.map((r) => r.prompt)).toEqual([BOARD_CHECK_PROMPT]);
-		expect(store.getTask(work.id)?.state).toBe("queued");
+		expect((await store.getTask(work.id))?.state).toBe("queued");
 	});
 
 	test("a dependent card starts only after its dependency is done", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// The dependency's run hangs: the default fake run resolves answered, which would
 			// land the card done and start the dependent within this same flush.
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.withResolvers<RunResult>().promise,
@@ -2199,16 +2321,16 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		const m1 = store.createTask("first");
-		const m2 = store.createTask("second");
-		store.updateTask(m2.id, { dependsOn: [m1.id] });
-		loop.schedule();
-		await flushPromises();
+		const m1 = await store.createTask("first");
+		const m2 = await store.createTask("second");
+		await store.updateTask(m2.id, { dependsOn: [m1.id] });
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 1);
 		expect(record.runs).toHaveLength(1);
 		expect(record.runs[0]!.prompt).toContain("first");
-		store.updateTask(m1.id, { stage: "done", state: "idle" });
-		loop.schedule();
-		await flushPromises();
+		await store.updateTask(m1.id, { stage: "done", state: "idle" });
+		await loop.schedule();
+		await eventually(() => record.runs.length >= 2);
 		expect(record.runs).toHaveLength(2);
 		expect(record.runs[1]!.prompt).toContain("second");
 	});
@@ -2217,7 +2339,7 @@ describe("turn schedule", () => {
 		let released = 0;
 		let reviewed = 0;
 		let prs = 0;
-		const { loop } = setup({
+		const { loop } = await setup({
 			refreshRelease: async () => {
 				released += 1;
 			},
@@ -2228,7 +2350,7 @@ describe("turn schedule", () => {
 				prs += 1;
 			},
 		});
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(released).toBe(1);
 		expect(reviewed).toBe(1);
@@ -2236,15 +2358,17 @@ describe("turn schedule", () => {
 	});
 
 	test("isClean result lands in dirty; a git failure keeps the old flag", async () => {
-		const { store, projects, loop } = setup({ isClean: async () => true });
+		const { store, projects, loop } = await setup({
+			isClean: async () => true,
+		});
 		const e = projects.get(store.name)!;
 		e.dirty = true;
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(e.dirty).toBe(false);
 
 		e.dirty = true;
-		const failing = createTurnLoop(
+		const failing = holdFollowUps(
 			projects,
 			fakeOps(baseRecord(), {
 				isClean: async () => {
@@ -2252,13 +2376,13 @@ describe("turn schedule", () => {
 				},
 			}),
 		);
-		failing.schedule();
+		await failing.schedule();
 		await flushPromises();
 		expect(e.dirty).toBe(true);
 	});
 
 	test("runTurn on an unknown project is a no-op", async () => {
-		const { record, loop } = setup();
+		const { record, loop } = await setup();
 		await loop.runTurn("no-such-project", "no-such-task");
 		expect(record.publishSoon).toBe(0);
 		expect(record.runs).toHaveLength(0);
@@ -2267,9 +2391,9 @@ describe("turn schedule", () => {
 
 describe("turn runTurn guards", () => {
 	test("cancelled task never starts", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { cancelledAt: Date.now() });
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { cancelledAt: Date.now() });
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
@@ -2277,74 +2401,99 @@ describe("turn runTurn guards", () => {
 	});
 
 	test("non-queued task never starts", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { state: "needs_you" });
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { state: "needs_you" });
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
 	});
 
 	test("a second runTurn while one is live does not double-start", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // the settled card must not auto-chain a merge turn into the count
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			createWorktree: async (o: { worktreePath: string }) => {
+				record.createWorktree.push(o);
+				entered.resolve();
+				await release.promise;
+				mkdirSync(o.worktreePath, { recursive: true });
+			},
 		});
-		const task = store.createTask("work please");
-		const { resolve: releaseDone } = Promise.withResolvers<RunResult>();
-		const p1 = loop.runTurn(store.name, task.id);
-		// First call is synchronous up to the first await; the claim is in place now.
-		const p2 = loop.runTurn(store.name, task.id);
-		releaseDone(runResult({}));
-		await Promise.all([p1, p2]);
+		const task = await store.createTask("work please");
+		const first = loop.runTurn(store.name, task.id);
+		const second = loop.runTurn(store.name, task.id);
+		await entered.promise;
+		try {
+			expect((await store.getTask(task.id))!.state).toBe("preparing");
+			const unrelated = await store.createTask("independent database work");
+			expect((await store.getTask(unrelated.id))!.state).toBe("queued");
+			expect(record.createWorktree).toHaveLength(1);
+			expect(record.runs).toHaveLength(0);
+		} finally {
+			release.resolve();
+			await Promise.all([first, second]);
+		}
 		expect(record.runs).toHaveLength(1);
+		expect(await store.listTurns(task.id)).toHaveLength(1);
+		expect(
+			(await store.events()).filter(
+				(event) =>
+					event.taskId === task.id &&
+					event.kind === "state" &&
+					event.to === "preparing",
+			),
+		).toMatchObject([{ from: "queued", to: "preparing" }]);
 	});
 
 	test("cancel during worktree creation removes the fresh worktree and never starts omp", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			createWorktree: async (o: { worktreePath: string }) => {
 				record.createWorktree.push(o);
-				store.updateTask(store.listTasks()[0]!.id, {
+				await store.updateTask((await store.listTasks())[0]!.id, {
 					cancelledAt: Date.now(),
 				});
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.removeWorktree).toHaveLength(1);
 		expect(record.runs).toHaveLength(0);
 	});
 
 	test("resolveTarget warning is logged", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			resolveTarget: async () => ({
 				target: "origin/main",
 				sha: "sha0",
 				warning: "head moved",
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain("! head moved");
+		expect(await logText(store, task.id)).toContain("! head moved");
 	});
 
 	test("release card worktrees start from the frozen base", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("release v1.0.0");
-		store.updateTask(task.id, { releaseVersion: "v1.0.0", base: "shaR" });
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("release v1.0.0");
+		await store.updateTask(task.id, { releaseVersion: "v1.0.0", base: "shaR" });
 		await loop.runTurn(store.name, task.id);
 		expect(record.createWorktree[0]).toMatchObject({ base: "shaR" });
-		expect(logText(store, task.id)).toContain("(frozen release base)");
+		expect(await logText(store, task.id)).toContain("(frozen release base)");
 	});
 });
 
 describe("turn sessions, steering and images", () => {
 	test("saved session resumes and consumes the pending prompt and images", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // no chained merge turn: its fresh-session note would pollute the log
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // no chained merge turn: its fresh-session note would pollute the log
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		saveSession(store, "s9");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			sessionId: "s9",
 			pendingPrompt: "continue\n\nplease",
 			pendingImages: ["p.png"],
@@ -2355,33 +2504,45 @@ describe("turn sessions, steering and images", () => {
 		expect(
 			(record.runs[0]!.images?.[0] as string | undefined)?.endsWith("p.png"),
 		).toBe(true);
-		expect(logText(store, task.id)).not.toContain("omp never saved session");
-		const after = store.getTask(task.id)!;
+		expect(await logText(store, task.id)).not.toContain(
+			"omp never saved session",
+		);
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toBe(null);
 		expect(after.pendingImages).toEqual([]);
 		// The delivered user text rides the turn for the timeline.
-		expect(store.listTurns(task.id).at(-1)!.input).toBe("continue\n\nplease");
+		expect((await store.listTurns(task.id)).at(-1)!.input).toBe(
+			"continue\n\nplease",
+		);
 	});
 
 	test("lost session starts fresh with the pending text as a note", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { sessionId: "s9", pendingPrompt: "continue" });
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
+			sessionId: "s9",
+			pendingPrompt: "continue",
+		});
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.resumeId).toBe(null);
-		expect(logText(store, task.id)).toContain("! omp never saved session s9");
+		expect(await logText(store, task.id)).toContain(
+			"! omp never saved session s9",
+		);
 		expect(record.runs[0]!.prompt).toContain("work please");
 		expect(record.runs[0]!.prompt).toContain("continue");
 	});
 
 	test("work turns send the task images plus pending ones, with byte sizes logged", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
-		setImage(store, task.id, "a.png", "abc");
-		store.updateTask(task.id, { images: ["a.png"], pendingImages: ["b.png"] });
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "a.png", "abc");
+		await store.updateTask(task.id, {
+			images: ["a.png"],
+			pendingImages: ["b.png"],
+		});
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.images).toHaveLength(2);
-		const log = logText(store, task.id);
+		const log = await logText(store, task.id);
 		expect(log).toContain("attached image");
 		expect(log).toContain("(3 bytes)");
 		expect(log).toContain("(missing)");
@@ -2389,10 +2550,10 @@ describe("turn sessions, steering and images", () => {
 
 	test("work turn copies agent-reported shots, skipping missing paths", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2408,7 +2569,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		// Minimal PNG header: passes the magic-byte sniff.
@@ -2417,13 +2578,13 @@ describe("turn sessions, steering and images", () => {
 			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toHaveLength(1);
 		expect(after.shots[0]).toMatch(/^\d+\.png$/);
-		expect(existsSync(join(store.imagesDir(task.id), after.shots[0]!))).toBe(
-			true,
-		);
-		expect(logText(store, task.id)).toContain("! shot nope.png");
+		expect(
+			existsSync(join(await store.imagesDir(task.id), after.shots[0]!)),
+		).toBe(true);
+		expect(await logText(store, task.id)).toContain("! shot nope.png");
 		// Copy, never move: the source stays in the worktree (tracked shots must keep
 		// the tree clean for the ready gate; untracked ones are the quarantine's job).
 		expect(existsSync(join(wt, "ui.png"))).toBe(true);
@@ -2431,11 +2592,11 @@ describe("turn sessions, steering and images", () => {
 
 	test("shots reported twice in one outcome are saved once", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2451,7 +2612,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		const png = Uint8Array.from([
@@ -2460,21 +2621,21 @@ describe("turn sessions, steering and images", () => {
 		writeFileSync(join(wt, "ui.png"), png);
 		writeFileSync(join(wt, "same.png"), png); // byte-identical repeat
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toHaveLength(1);
-		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(1);
-		expect(logText(store, task.id)).toContain(
+		expect(readdirSync(await store.imagesDir(task.id))).toHaveLength(1);
+		expect(await logText(store, task.id)).toContain(
 			"! shot same.png: duplicate of an existing screenshot",
 		);
 	});
 
 	test("re-reporting the same shots on a later turn adds nothing", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2490,7 +2651,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		writeFileSync(
@@ -2498,12 +2659,12 @@ describe("turn sessions, steering and images", () => {
 			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		);
 		await loop.runTurn(store.name, task.id);
-		const first = store.getTask(task.id)!;
+		const first = (await store.getTask(task.id))!;
 		expect(first.shots).toHaveLength(1);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toEqual(first.shots);
-		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(1);
+		expect(readdirSync(await store.imagesDir(task.id))).toHaveLength(1);
 	});
 
 	// A real decodable 16×24 8-bit gray PNG; `sub` picks Sub row filtering, so two
@@ -2564,11 +2725,11 @@ describe("turn sessions, steering and images", () => {
 
 	test("a re-captured screen with new bytes replaces the stored shot instead of doubling", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2584,7 +2745,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		writeFileSync(join(wt, "ui.png"), grayPng(screenPixels, false));
@@ -2592,27 +2753,27 @@ describe("turn sessions, steering and images", () => {
 		// Same screen captured again on a later turn: re-encoded bytes, identical pixels.
 		writeFileSync(join(wt, "ui2.png"), grayPng(screenPixels, true));
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toEqual(["1.png"]);
-		expect(readdirSync(store.imagesDir(task.id))).toEqual(["1.png"]);
+		expect(readdirSync(await store.imagesDir(task.id))).toEqual(["1.png"]);
 		// The stored shot now carries the newer capture's bytes.
 		expect(
-			readFileSync(join(store.imagesDir(task.id), "1.png")).equals(
+			readFileSync(join(await store.imagesDir(task.id), "1.png")).equals(
 				Buffer.from(grayPng(screenPixels, true)),
 			),
 		).toBe(true);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"! shot ui2.png: visually identical to 1.png — replaced it",
 		);
 	});
 
 	test("a visually different new shot still appends", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2628,25 +2789,25 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		writeFileSync(join(wt, "ui.png"), grayPng(screenPixels, false));
 		await loop.runTurn(store.name, task.id);
 		writeFileSync(join(wt, "ui2.png"), grayPng(otherPixels, false));
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toHaveLength(2);
-		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(2);
+		expect(readdirSync(await store.imagesDir(task.id))).toHaveLength(2);
 	});
 
 	test("one outcome reporting the same screen in two encodings saves one", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2662,26 +2823,26 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		writeFileSync(join(wt, "ui.png"), grayPng(screenPixels, false));
 		writeFileSync(join(wt, "ui2.png"), grayPng(screenPixels, true));
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toHaveLength(1);
-		expect(readdirSync(store.imagesDir(task.id))).toHaveLength(1);
-		expect(logText(store, task.id)).toContain(
+		expect(readdirSync(await store.imagesDir(task.id))).toHaveLength(1);
+		expect(await logText(store, task.id)).toContain(
 			"! shot ui2.png: visually identical to a shot saved this turn",
 		);
 	});
 
 	test("work turn adopts a shots/ directory when the outcome's shots were stripped", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2694,7 +2855,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(join(wt, "shots"), { recursive: true });
 		writeFileSync(
@@ -2702,11 +2863,11 @@ describe("turn sessions, steering and images", () => {
 			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toHaveLength(1);
-		expect(existsSync(join(store.imagesDir(task.id), after.shots[0]!))).toBe(
-			true,
-		);
+		expect(
+			existsSync(join(await store.imagesDir(task.id), after.shots[0]!)),
+		).toBe(true);
 		// The source stays (copy, never move); the quarantine may sweep it later,
 		// after this copy landed.
 		expect(existsSync(join(wt, "shots", "ui.png"))).toBe(true);
@@ -2716,11 +2877,11 @@ describe("turn sessions, steering and images", () => {
 		// The 2026-10-14 incident: a committed smoke shot rode every fresh worktree, and a
 		// work turn with no reported shots adopted it as if the agent had captured it.
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			trackedFiles: (p: string, rel: string) => realTrackedFiles(p, rel),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2732,7 +2893,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(join(wt, "shots"), { recursive: true });
 		const png = Uint8Array.from([
@@ -2745,9 +2906,11 @@ describe("turn sessions, steering and images", () => {
 		execSync("git add shots/committed.png", { cwd: wt });
 		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.shots).toEqual(["1.png"]); // the tracked shot never arrives
-		expect(existsSync(join(store.imagesDir(task.id), "1.png"))).toBe(true);
+		expect(existsSync(join(await store.imagesDir(task.id), "1.png"))).toBe(
+			true,
+		);
 	});
 
 	test("ready with committed shots and a clean tree queues the merge, keeping the files", async () => {
@@ -2756,13 +2919,13 @@ describe("turn sessions, steering and images", () => {
 		// tree dirty, and the turn bounced with "uncommitted changes". Reproduced with a
 		// real git worktree so isClean sees what the agent left.
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0, // hold the chained merge turn; assert the settle instant
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true, // hold the chained merge turn; assert the settle instant
 			commitsAhead: async () => 1,
 			isClean: (p: string) => gitIsClean(p), // real cleanliness, not the fake
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2781,7 +2944,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(join(wt, "shots"), { recursive: true });
 		const png = Uint8Array.from([
@@ -2798,59 +2961,61 @@ describe("turn sessions, steering and images", () => {
 		execSync("git -c user.name=t -c user.email=t@t commit -qm c", { cwd: wt });
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(null);
 		expect(after.summary).toBe("did it");
-		expect(store.listTurns(task.id)).toMatchObject([
+		expect(await store.listTurns(task.id)).toMatchObject([
 			{ outcome: "ready", summary: "did it" },
 		]);
 		expect(after.shots).toHaveLength(2);
 		for (const name of after.shots)
-			expect(existsSync(join(store.imagesDir(task.id), name!))).toBe(true);
+			expect(existsSync(join(await store.imagesDir(task.id), name!))).toBe(
+				true,
+			);
 		// The worktree keeps its files: the tree the classifier read stays clean.
 		expect(existsSync(join(wt, "shots", "board-advisories.png"))).toBe(true);
 		expect(existsSync(join(wt, "shots", "settings-kept-days.png"))).toBe(true);
 	});
 
 	test("work turn changing ui files without shots logs a warning", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			changedFiles: async () => ["src/ui/app.tsx", "src/store.ts"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).toContain(UI_SHOT_WARNING);
 	});
 
 	test("work turn changing ui files without shots re-prompts to capture one", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0, // no chained turn: the re-prompt stays pending for its assertions
+		const { store, loop } = await setup({
+			holdFollowUps: true, // no chained turn: the re-prompt stays pending for its assertions
 			changedFiles: async () => ["src/ui/app.tsx"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The merge queue is replaced by an automatic resume that asks for the shot.
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toContain("screenshot");
 		expect(after.pendingPrompt).toContain("shots field");
-		expect(logText(store, task.id)).toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).toContain(UI_SHOT_WARNING);
 	});
 
 	test("a second ui-shot miss parks the card at needs_you instead of settling on", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			changedFiles: async () => ["src/ui/app.tsx"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		// The marker from an earlier miss: the auto re-prompt already ran, so this miss
 		// must not sail on to merging — done without a screenshot is not an outcome.
-		appendLog(store, task.id, `${UI_SHOT_WARNING}: src/ui/app.tsx`);
+		await appendLog(store, task.id, `${UI_SHOT_WARNING}: src/ui/app.tsx`);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("screenshot");
@@ -2858,34 +3023,36 @@ describe("turn sessions, steering and images", () => {
 	});
 
 	test("ui-shot warning alone when the turn does not settle clean", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			changedFiles: async () => ["src/ui/app.tsx"],
 			isClean: async () => false,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.pendingPrompt).toBeNull();
-		expect(logText(store, task.id)).toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).toContain(UI_SHOT_WARNING);
 	});
 
 	test("ui-shot re-prompt does not overwrite mid-run steering", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
-		const loop = createTurnLoop(
+		const task = await store.createTask("work please");
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
 				changedFiles: async () => ["src/ui/app.tsx"],
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
-					store.updateTask(task.id, { pendingPrompt: "also fix the button" });
+					await o.onSession?.("sess-1");
+					await store.updateTask(task.id, {
+						pendingPrompt: "also fix the button",
+					});
 					return {
 						pid: 4242,
 						done: Promise.resolve(runResult()),
@@ -2895,21 +3062,21 @@ describe("turn sessions, steering and images", () => {
 			}),
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.stage).toBe("in_progress");
 		expect(after.pendingPrompt).toBe("also fix the button");
-		expect(logText(store, task.id)).toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).toContain(UI_SHOT_WARNING);
 	});
 
 	test("work turn changing ui files with a copied shot logs no warning", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			changedFiles: async () => ["src/ui/app.tsx"],
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -2925,7 +3092,7 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = join(store.worktreesDir, task.id);
 		mkdirSync(wt, { recursive: true });
 		// Minimal PNG header: passes the magic-byte sniff.
@@ -2934,34 +3101,38 @@ describe("turn sessions, steering and images", () => {
 			Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 		);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.shots).toHaveLength(1);
-		expect(logText(store, task.id)).not.toContain("no screenshot was attached");
+		expect((await store.getTask(task.id))!.shots).toHaveLength(1);
+		expect(await logText(store, task.id)).not.toContain(
+			"no screenshot was attached",
+		);
 	});
 
 	test("work turn changing no ui files logs no warning", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			changedFiles: async () => ["src/store.ts"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).not.toContain("no screenshot was attached");
+		expect(await logText(store, task.id)).not.toContain(
+			"no screenshot was attached",
+		);
 	});
 
 	test("a stylesheet outside src/ui fires the guard: every project gets it", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			changedFiles: async () => ["src/components/discover.css"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		// The re-prompt names what changed and where the shot goes, not ottr's own dev board.
 		expect(after.pendingPrompt).toContain("src/components/discover.css");
 		expect(after.pendingPrompt).toContain("shots/");
 		expect(after.pendingPrompt).not.toContain("src/dev.ts");
-		expect(logText(store, task.id)).toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).toContain(UI_SHOT_WARNING);
 	});
 
 	test("uiFiles: styles, markup, components and ui/ code count; tests and docs do not", () => {
@@ -2991,25 +3162,27 @@ describe("turn sessions, steering and images", () => {
 	});
 
 	test("merge turns never run the ui-shot diff", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			changedFiles: async () => {
 				throw new Error("merge turns must not diff");
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-x",
 			branch: "ott/x",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).not.toContain("no screenshot was attached");
+		expect(await logText(store, task.id)).not.toContain(
+			"no screenshot was attached",
+		);
 	});
 
 	test("merge turns send no images even with pending ones", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-x",
 			branch: "ott/x",
@@ -3022,10 +3195,10 @@ describe("turn sessions, steering and images", () => {
 	});
 
 	test("provider rejects the attached images: quarantine, note, one text-only retry", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // assert the settle instant; the retry runs via a direct runTurn
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // assert the settle instant; the retry runs via a direct runTurn
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				// The rejection kills omp before its first event: no session announcement.
 				if (record.runs.length === 1)
@@ -3043,7 +3216,7 @@ describe("turn sessions, steering and images", () => {
 							record.killed = true;
 						},
 					};
-				o.onSession?.("sess-2");
+				await o.onSession?.("sess-2");
 				return {
 					pid: 4243,
 					done: Promise.resolve(
@@ -3060,19 +3233,23 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
-		setImage(store, task.id, "1.png", "rejected-bytes");
-		store.updateTask(task.id, { images: ["1.png"] });
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "1.png", "rejected-bytes");
+		await store.updateTask(task.id, { images: ["1.png"] });
 
 		await loop.runTurn(store.name, task.id);
 
-		const afterFirst = store.getTask(task.id)!;
+		const afterFirst = (await store.getTask(task.id))!;
 		// Requeued for the text-only retry, not needs_you.
 		expect(afterFirst.state).toBe("queued");
 		expect(afterFirst.needsReason).toContain("retrying text-only");
 		// The failed turn keeps the note, and the file moved rather than vanished.
-		expect(store.listTurns(task.id)[0]!.error).toContain("retrying text-only");
-		expect(existsSync(join(store.imagesDir(task.id), "1.png"))).toBe(false);
+		expect((await store.listTurns(task.id))[0]!.error).toContain(
+			"retrying text-only",
+		);
+		expect(existsSync(join(await store.imagesDir(task.id), "1.png"))).toBe(
+			false,
+		);
 		expect(
 			existsSync(join(store.tasksDir, "quarantine", task.id, "1.png")),
 		).toBe(true);
@@ -3083,7 +3260,7 @@ describe("turn sessions, steering and images", () => {
 		expect(record.runs).toHaveLength(2);
 		expect(record.runs[1]!.images).toEqual([]);
 		expect(record.runs[1]!.prompt).toContain("work please");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
 	});
@@ -3093,8 +3270,8 @@ describe("turn sessions, steering and images", () => {
 		async () => {
 			const outside = mkdtempSync(join(tmpdir(), "turn-quarantine-out-"));
 			dirs.push(outside);
-			const { store, record, loop } = setup({
-				maxTotalRuns: () => 0,
+			const { store, record, loop } = await setup({
+				holdFollowUps: true,
 				commitsAhead: async () => 0,
 				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
@@ -3114,15 +3291,15 @@ describe("turn sessions, steering and images", () => {
 					};
 				},
 			});
-			const task = store.createTask("work please");
-			setImage(store, task.id, "1.png", "rejected-bytes");
-			store.updateTask(task.id, { images: ["1.png"] });
+			const task = await store.createTask("work please");
+			await setImage(store, task.id, "1.png", "rejected-bytes");
+			await store.updateTask(task.id, { images: ["1.png"] });
 			symlinkSync(outside, join(store.tasksDir, "quarantine"));
 
 			await loop.runTurn(store.name, task.id);
 
 			expect(readdirSync(outside)).toEqual([]);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("needs_you");
 			expect(after.needsReason).toContain("Image quarantine failed");
 			expect(after.needsReason).toContain("refusing");
@@ -3130,8 +3307,8 @@ describe("turn sessions, steering and images", () => {
 	);
 
 	test("the text-only retry failing too still lands in needs_you", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // assert the settle instant; each turn runs via a direct runTurn
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // assert the settle instant; each turn runs via a direct runTurn
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				return {
@@ -3150,14 +3327,14 @@ describe("turn sessions, steering and images", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
-		setImage(store, task.id, "1.png", "rejected-bytes");
-		store.updateTask(task.id, { images: ["1.png"] });
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "1.png", "rejected-bytes");
+		await store.updateTask(task.id, { images: ["1.png"] });
 
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.state).toBe("queued"); // first failure: quarantine + retry
+		expect((await store.getTask(task.id))!.state).toBe("queued"); // first failure: quarantine + retry
 		await loop.runTurn(store.name, task.id); // the retry is text-only and dies too
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("omp exited with code 1 before finishing.");
 		expect(record.runs[1]!.images).toEqual([]);
@@ -3168,9 +3345,9 @@ describe("turn sessions, steering and images", () => {
 	test("a text turn dying pre-event with a logged HTTP 400 names the evidence file", async () => {
 		const seedDir = mkdtempSync(join(tmpdir(), "http400-turn-"));
 		try {
-			const { store, record, loop } = setup({
+			const { store, record, loop } = await setup({
 				http400Dir: seedDir,
-				maxTotalRuns: () => 0, // assert the settle instant; the turn runs directly
+				holdFollowUps: true, // assert the settle instant; the turn runs directly
 				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
 					// omp writes the 400 entry while the turn runs, so it lands inside
@@ -3192,10 +3369,10 @@ describe("turn sessions, steering and images", () => {
 					};
 				},
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 
 			await loop.runTurn(store.name, task.id);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("needs_you");
 			expect(after.needsReason).toContain(
 				"The provider rejects this prompt's content - reword the task (evidence: ~/.omp/logs/http-400-requests/",
@@ -3207,23 +3384,23 @@ describe("turn sessions, steering and images", () => {
 	});
 
 	test("steering landing mid-run is queued as the next turn, not consumed", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		let unsavedCalls = 0;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		// Cap 0: the finally's schedule() must not start the queued follow-up mid-assertion.
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
-				startRun: (o: {
+				holdFollowUps: true,
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					if (record.runs.length === 1) {
-						store.updateTask(task.id, { pendingPrompt: "steer mid-run" });
+						await store.updateTask(task.id, { pendingPrompt: "steer mid-run" });
 					}
 					return {
 						pid: 4242,
@@ -3238,36 +3415,36 @@ describe("turn sessions, steering and images", () => {
 			}),
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.stage).toBe("in_progress");
 		expect(after.pendingPrompt).toBe("steer mid-run");
 		// The queued steer rides the next turn; this one delivered no user text.
-		expect(store.listTurns(task.id).at(-1)!.input).toBe(null);
+		expect((await store.listTurns(task.id)).at(-1)!.input).toBe(null);
 		// Steering at turn end short-circuits before the done path.
 		expect(unsavedCalls).toBe(0);
 	});
 
 	test("a model switch mid-run lands with the next turn", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		let unsavedCalls = 0;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		// Cap 0: the finally's schedule() must not start the queued follow-up mid-assertion.
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
-				startRun: (o: {
+				holdFollowUps: true,
+				startRun: async (o: {
 					prompt: string;
 					model?: string | null;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					if (record.runs.length === 1) {
 						// Like a mid-run steer, the row write is what queues the switch.
-						store.updateTask(task.id, {
+						await store.updateTask(task.id, {
 							model: "switched-model",
 							pendingPrompt: "steer mid-run",
 						});
@@ -3286,7 +3463,7 @@ describe("turn sessions, steering and images", () => {
 		);
 		await loop.runTurn(store.name, task.id);
 		// The steer queued the follow-up turn; the model switch rode along instead of settling.
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 		await loop.runTurn(store.name, task.id);
 		const second = record.runs[1] as { prompt?: string; model?: string | null };
 		expect(second.model).toBe("switched-model");
@@ -3295,22 +3472,22 @@ describe("turn sessions, steering and images", () => {
 	});
 
 	test("grown pending prompt consumes only the sent prefix", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		saveSession(store, "s9");
-		store.updateTask(task.id, { sessionId: "s9", pendingPrompt: "one" });
-		const loop = createTurnLoop(
+		await store.updateTask(task.id, { sessionId: "s9", pendingPrompt: "one" });
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
-				startRun: (o: {
+				holdFollowUps: true,
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("s9");
-					store.updateTask(task.id, {
+					await o.onSession?.("s9");
+					await store.updateTask(task.id, {
 						pendingPrompt: "one\n\ntwo",
 						pendingImages: ["a", "b"],
 					});
@@ -3323,42 +3500,44 @@ describe("turn sessions, steering and images", () => {
 			}),
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toBe("two");
 		expect(after.pendingImages).toEqual(["a", "b"]);
 	});
 
 	test("a new steer that only starts with the sent text stays whole", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		saveSession(store, "s9");
-		store.updateTask(task.id, { sessionId: "s9", pendingPrompt: "one" });
-		const loop = createTurnLoop(
+		await store.updateTask(task.id, { sessionId: "s9", pendingPrompt: "one" });
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
 				// During the prepare window the user cancels the steer "one" and sends a new one.
 				ensurePackages: async () => {
-					store.updateTask(task.id, { pendingPrompt: "one more thing" });
+					await store.updateTask(task.id, { pendingPrompt: "one more thing" });
 					return [];
 				},
 			}),
 		);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.pendingPrompt).toBe("one more thing");
+		expect((await store.getTask(task.id))!.pendingPrompt).toBe(
+			"one more thing",
+		);
 	});
 
 	test("onSession upgrades preparing to running once, then ignores repeats", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		let onSession: ((sid: string) => void) | undefined;
 		const { promise: gate, resolve: releaseDone } =
 			Promise.withResolvers<RunResult>();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				startRun: (o: {
@@ -3380,25 +3559,25 @@ describe("turn sessions, steering and images", () => {
 		// runTurn suspends at its first await; wait until it reached startRun.
 		await started;
 		// First report: preparing -> running (and todo -> in_progress for work turns).
-		onSession?.("s1");
-		expect(store.getTask(task.id)!.sessionId).toBe("s1");
-		expect(store.getTask(task.id)!.state).toBe("running");
+		await onSession?.("s1");
+		expect((await store.getTask(task.id))!.sessionId).toBe("s1");
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		// A repeat once the task left preparing is ignored, cancelled or not.
-		store.updateTask(task.id, { cancelledAt: Date.now() });
-		onSession?.("s2");
-		expect(store.getTask(task.id)!.sessionId).toBe("s1");
+		await store.updateTask(task.id, { cancelledAt: Date.now() });
+		await onSession?.("s2");
+		expect((await store.getTask(task.id))!.sessionId).toBe("s1");
 		releaseDone(runResult({}));
 		await running;
-		const stageEvents = store
-			.events()
-			.filter((e) => e.kind === "stage" && e.to === "in_progress");
+		const stageEvents = (await store.events()).filter(
+			(e) => e.kind === "stage" && e.to === "in_progress",
+		);
 		expect(stageEvents).toHaveLength(1);
 	});
 });
 
 describe("turn classify wiring", () => {
 	test("git fact rejections fall back to their defaults", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => {
 				throw new Error("no repo");
 			},
@@ -3409,39 +3588,39 @@ describe("turn classify wiring", () => {
 				throw new Error("no repo");
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		// commitsAhead rejection reads as 0, so an answered turn still lands done.
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a work turn's integrated outcome is rejected without a git look", async () => {
 		const record = baseRecord();
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				isIntegrated: async () => false,
 				startRun: integratedRun(record),
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("Work turns do not merge; report ready.");
 	});
 
 	test("a worktree that lost its git link settles done from the branch proof", async () => {
 		const record = baseRecord();
-		const store = freshStore();
+		const store = await freshStore();
 		// Deregistered worktree shape: checkout files kept, the .git link gone entirely.
 		const wt = mkdtempSync(join(tmpdir(), "turn-lost-link-"));
 		dirs.push(wt);
 		writeFileSync(join(wt, "kept.txt"), "checkout");
 		let integratedCalls = 0;
 		let mergedCalls = 0;
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				isIntegrated: async () => {
@@ -3457,14 +3636,14 @@ describe("turn classify wiring", () => {
 				startRun: integratedRun(record),
 			}),
 		);
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/lost-link",
 			worktree: wt,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(integratedCalls).toBe(0);
 		expect(mergedCalls).toBe(1);
@@ -3472,12 +3651,12 @@ describe("turn classify wiring", () => {
 
 	test("a worktree that lost its git link names the real cause when the branch diverged", async () => {
 		const record = baseRecord();
-		const store = freshStore();
+		const store = await freshStore();
 		const wt = mkdtempSync(join(tmpdir(), "turn-lost-link-"));
 		dirs.push(wt);
 		writeFileSync(join(wt, "kept.txt"), "checkout");
 		let integratedCalls = 0;
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				isIntegrated: async () => {
@@ -3490,14 +3669,14 @@ describe("turn classify wiring", () => {
 				startRun: integratedRun(record),
 			}),
 		);
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/lost-link",
 			worktree: wt,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"worktree link lost and branch has unreached commits",
@@ -3506,12 +3685,15 @@ describe("turn classify wiring", () => {
 	});
 
 	test("background wait auto-continues once, then a repeat asks you", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// Cap 0: keep the auto-queued card from being re-started by the finally's schedule.
-			maxTotalRuns: () => 0,
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			holdFollowUps: true,
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -3521,9 +3703,9 @@ describe("turn classify wiring", () => {
 				};
 			},
 		});
-		const first = store.createTask("work please");
+		const first = await store.createTask("work please");
 		await loop.runTurn(store.name, first.id);
-		const afterFirst = store.getTask(first.id)!;
+		const afterFirst = (await store.getTask(first.id))!;
 		expect(afterFirst.state).toBe("queued");
 		expect(afterFirst.pendingPrompt).toBe(
 			"Your previous turn ended while a background job ran; the run exits and kills the job. Continue the task and run slow gates in the foreground.",
@@ -3532,25 +3714,31 @@ describe("turn classify wiring", () => {
 
 		// Second streak on a fresh card: the previous turn's error is already a
 		// background wait, so classify demands a human.
-		const second = store.createTask("work again");
-		const t1 = store.startTurn(second.id, "work", "p", 1);
-		store.finishTurn(t1.id, {
+		const second = await store.createTask("work again");
+		const t1 = await store.startTurn(second.id, "work", "p", 1);
+		await store.finishTurn(t1.id, {
 			endedAt: Date.now(),
 			error: "earlier failure",
 		});
-		const t2 = store.startTurn(second.id, "work", "p", 2);
-		store.finishTurn(t2.id, { endedAt: Date.now(), error: BACKGROUND_WAIT });
+		const t2 = await store.startTurn(second.id, "work", "p", 2);
+		await store.finishTurn(t2.id, {
+			endedAt: Date.now(),
+			error: BACKGROUND_WAIT,
+		});
 		await loop.runTurn(store.name, second.id);
-		const afterSecond = store.getTask(second.id)!;
+		const afterSecond = (await store.getTask(second.id))!;
 		expect(afterSecond.state).toBe("needs_you");
 		expect(afterSecond.needsReason).toContain(`${BACKGROUND_WAIT} again`);
 	});
 
 	test("killed run finishes the turn as cancelled and keeps the worktree", async () => {
-		const { store, record, loop } = setup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(runResult({ killed: true })),
@@ -3558,18 +3746,21 @@ describe("turn classify wiring", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.listTurns(task.id)[0]!.error).toBe("cancelled");
+		expect((await store.listTurns(task.id))[0]!.error).toBe("cancelled");
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
 	test("cancel landing while the run resolves finishes the turn as cancelled", async () => {
-		const { store, record, loop } = setup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
-				store.updateTask(store.listTasks()[0]!.id, {
+				await o.onSession?.("sess-1");
+				await store.updateTask((await store.listTasks())[0]!.id, {
 					cancelledAt: Date.now(),
 				});
 				return {
@@ -3579,21 +3770,21 @@ describe("turn classify wiring", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.listTurns(task.id)[0]!.error).toBe("cancelled");
+		expect((await store.listTurns(task.id))[0]!.error).toBe("cancelled");
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
 	test("unsaved work on a done work turn keeps the worktree and records the files", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			unsavedWork: async () => "M f.ts",
 			statusFiles: async () => ["f.ts"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(keptReason("M f.ts"));
 		expect(after.keptFiles).toEqual(["f.ts"]);
@@ -3602,16 +3793,16 @@ describe("turn classify wiring", () => {
 
 	test("turn details fall back to the final text; outcome questions surface", async () => {
 		const record = baseRecord();
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -3632,28 +3823,28 @@ describe("turn classify wiring", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		// outcome.details is undefined, so the final text is recorded as details.
 		expect(turn.details).toBe("the text");
 		expect(turn.question).toBe("why?");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe("Wants your answer: why?");
 	});
 
 	test("a tool ask without a report still marks the turn's question", async () => {
 		const record = baseRecord();
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -3668,9 +3859,9 @@ describe("turn classify wiring", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		// The drawer styles the echoed reason by this marker, report or no report.
 		expect(turn.question).toBe("why?");
 		expect(turn.error).toBe("Wants your answer: why?");
@@ -3678,16 +3869,16 @@ describe("turn classify wiring", () => {
 
 	test("a needs_you report without an ask is a hold, not a question", async () => {
 		const record = baseRecord();
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -3704,9 +3895,9 @@ describe("turn classify wiring", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		// No ask tool call ran, so the timeline must keep the alert styling: question
 		// stays null even though the report carries prose in its question field.
 		expect(turn.question).toBeNull();
@@ -3716,23 +3907,23 @@ describe("turn classify wiring", () => {
 	});
 
 	test("removeWorktree failure on done is logged, not thrown", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			removeWorktree: async () => {
 				throw new Error("busy");
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain("! removeWorktree: busy");
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect(await logText(store, task.id)).toContain("! removeWorktree: busy");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 });
 
 describe("turn release cards", () => {
-	function releaseTask(store: ProjectStore) {
-		const task = store.createTask("release v1.0.0");
-		store.updateTask(task.id, {
+	async function releaseTask(store: ProjectStore) {
+		const task = await store.createTask("release v1.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			releaseVersion: "v1.0.0",
@@ -3745,17 +3936,19 @@ describe("turn release cards", () => {
 	}
 
 	test("a release card's turn pins its session name", async () => {
-		const { store, record, loop } = setup();
-		const task = releaseTask(store);
+		const { store, record, loop } = await setup();
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.sessionName).toBe("Release review");
 	});
 
 	test("a release review that would merge is bounced: reviews must not commit", async () => {
-		const { store, record, loop } = setup({ isIntegrated: async () => false });
-		const task = releaseTask(store);
+		const { store, record, loop } = await setup({
+			isIntegrated: async () => false,
+		});
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe(
 			"A release review must not commit. Cancel this release, or reply to continue.",
 		);
@@ -3764,13 +3957,15 @@ describe("turn release cards", () => {
 	});
 
 	test("a Review-button review that would merge is bounced like a release review", async () => {
-		const { store, record, loop } = setup({ isIntegrated: async () => false });
-		const review = store.createTask(
+		const { store, record, loop } = await setup({
+			isIntegrated: async () => false,
+		});
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			stage: "merging",
 			state: "queued",
 			base: "shaR",
@@ -3778,7 +3973,7 @@ describe("turn release cards", () => {
 			branch: "ott/review",
 		});
 		await loop.runTurn(store.name, review.id);
-		expect(store.getTask(review.id)?.needsReason).toBe(
+		expect((await store.getTask(review.id))?.needsReason).toBe(
 			"A review must not commit. Cancel this review, or reply to continue.",
 		);
 		expect(record.publishRelease).toHaveLength(0);
@@ -3786,20 +3981,22 @@ describe("turn release cards", () => {
 
 	test("an approved Review-button review waits in merging while its findings are open", async () => {
 		// A review commits nothing: no commits ahead of the target.
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const review = store.createTask(
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
-		const finding = store.createTask("review finding");
-		store.updateTask(finding.id, {
+		await store.updateTask(review.id, { base: "shaR" });
+		const finding = await store.createTask("review finding");
+		await store.updateTask(finding.id, {
 			stage: "in_progress",
 			followUpOf: review.id,
 		});
 		await loop.runTurn(store.name, review.id);
-		const after = store.getTask(review.id);
+		const after = await store.getTask(review.id);
 		expect(after?.stage).toBe("merging");
 		expect(after?.state).toBe("idle");
 		expect(after?.needsReason).toBe(
@@ -3811,34 +4008,37 @@ describe("turn release cards", () => {
 
 	test("a Review-button review's leftover files never keep its worktree", async () => {
 		// Mutation runs leave report files, and a review must not commit: its worktree is disposable.
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			unsavedWork: async () => "uncommitted changes",
 		});
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
-		expect(store.getTask(review.id)?.stage).toBe("done");
+		expect((await store.getTask(review.id))?.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("an approved release waits while its review findings are open", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = releaseTask(store);
+		const task = await releaseTask(store);
 		// create_task links each finding to the review that filed it.
-		const finding = store.createTask("review finding");
-		store.updateTask(finding.id, { stage: "in_progress", followUpOf: task.id });
+		const finding = await store.createTask("review finding");
+		await store.updateTask(finding.id, {
+			stage: "in_progress",
+			followUpOf: task.id,
+		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(
@@ -3850,16 +4050,16 @@ describe("turn release cards", () => {
 
 	test("an approved release publishes with the commits since the last review", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			archReviewDelta: async () => ({ delta: 12, reviewed: true, anchor: "a" }),
 			startRun: integratedRun(record),
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = releaseTask(store);
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v1.0.0");
 		expect(after.commits).toBe(3);
@@ -3877,18 +4077,18 @@ describe("turn release cards", () => {
 
 	test("release notes edited through the app route reach the publisher", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = releaseTask(store);
-		store.updateTask(task.id, { state: "needs_you" });
+		const task = await releaseTask(store);
+		await store.updateTask(task.id, { state: "needs_you" });
 		const dir = mkdtempSync(join(tmpdir(), "turn-test-"));
 		dirs.push(dir);
-		const gstore = GlobalStore.open(join(dir, "g"));
-		const app = createApp({
+		const gstore = await GlobalStore.open(join(dir, "g"));
+		const app = await createApp({
 			gstore,
 			defaultDir: dir,
 			projects,
@@ -3937,20 +4137,21 @@ describe("turn release cards", () => {
 			expect(res.status).toBe(200);
 		} finally {
 			server.stop(true);
-			gstore.close();
+			await app.close();
+			await gstore.close();
 		}
-		store.updateTask(task.id, { state: "queued" });
+		await store.updateTask(task.id, { state: "queued" });
 		await loop.runTurn(store.name, task.id);
 		expect(record.publishRelease[0]).toMatchObject({
 			version: "v1.0.0",
 			notes: "edited release notes",
 		});
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a failed publish parks the card with the release failure", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			publishRelease: async () => {
@@ -3958,9 +4159,9 @@ describe("turn release cards", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = releaseTask(store);
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Release failed: push denied. Fix it, then reply to retry.",
@@ -3969,21 +4170,21 @@ describe("turn release cards", () => {
 
 	test("cancel landing during the publish owns the card", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			publishRelease: async () => {
-				store.updateTask(store.listTasks()[0]!.id, {
+				await store.updateTask((await store.listTasks())[0]!.id, {
 					cancelledAt: Date.now(),
 				});
 				return "tagged";
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = releaseTask(store);
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.listTurns(task.id).at(-1)!.error).toBe("cancelled");
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.listTurns(task.id)).at(-1)!.error).toBe("cancelled");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
@@ -3991,7 +4192,7 @@ describe("turn release cards", () => {
 		const record = baseRecord();
 		const gate = Promise.withResolvers<void>();
 		const reached = Promise.withResolvers<void>();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			publishRelease: async (o: unknown) => {
@@ -4003,18 +4204,18 @@ describe("turn release cards", () => {
 		});
 		const e = projects.get(store.name)!;
 		e.target = "origin/main";
-		const task = releaseTask(store);
+		const task = await releaseTask(store);
 		const turn = loop.runTurn(store.name, task.id);
 		await reached.promise;
 		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
 			error: "release already publishing",
 			status: 409,
 		});
-		expect(store.getTask(task.id)!.cancelledAt).toBe(null);
+		expect((await store.getTask(task.id))!.cancelledAt).toBe(null);
 		expect(record.removeWorktree).toHaveLength(0);
 		gate.resolve();
 		await turn;
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v1.0.0");
 		expect(record.publishRelease).toHaveLength(1);
@@ -4022,7 +4223,7 @@ describe("turn release cards", () => {
 
 	test("a release command gets a notes file and its output logged", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			runReleaseCommand: async (o: unknown) => {
@@ -4031,10 +4232,10 @@ describe("turn release cards", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		store.setSettings({ releaseCommand: "bin release" });
-		const task = releaseTask(store);
+		await store.setSettings({ releaseCommand: "bin release" });
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v1.0.0");
 		expect(record.runReleaseCommand[0]).toMatchObject({
@@ -4042,7 +4243,7 @@ describe("turn release cards", () => {
 			cwd: "wt-x",
 			version: "v1.0.0",
 		});
-		const log = logText(store, task.id);
+		const log = await logText(store, task.id);
 		expect(log).toContain("$ bin release");
 		expect(log).toContain("published v1.0.0");
 		expect(
@@ -4054,7 +4255,7 @@ describe("turn release cards", () => {
 		"a release notes file planted as a symlink is refused and its target stays unchanged",
 		async () => {
 			const record = baseRecord();
-			const { store, projects, loop } = setupWith(record, {
+			const { store, projects, loop } = await setupWith(record, {
 				isIntegrated: async () => true,
 				startRun: integratedRun(record),
 				runReleaseCommand: async (o: unknown) => {
@@ -4067,11 +4268,13 @@ describe("turn release cards", () => {
 				const target = join(outside, "victim.txt");
 				writeFileSync(target, "original\n");
 				projects.get(store.name)!.target = "origin/main";
-				store.setSettings({ releaseCommand: "bin release" });
-				const task = releaseTask(store);
+				await store.setSettings({ releaseCommand: "bin release" });
+				const task = await releaseTask(store);
 				symlinkSync(target, join(store.tasksDir, `release-${task.id}.md`));
 				await loop.runTurn(store.name, task.id);
-				expect(store.getTask(task.id)!.needsReason).toContain("refusing");
+				expect((await store.getTask(task.id))!.needsReason).toContain(
+					"refusing",
+				);
 				expect(record.runReleaseCommand).toHaveLength(0);
 				expect(readFileSync(target, "utf8")).toBe("original\n");
 			} finally {
@@ -4082,7 +4285,7 @@ describe("turn release cards", () => {
 
 	test("a release command frees its scheduler slot when it settles", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			runReleaseCommand: async (
@@ -4099,17 +4302,17 @@ describe("turn release cards", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		store.setSettings({ releaseCommand: "bin release" });
-		const task = releaseTask(store);
+		await store.setSettings({ releaseCommand: "bin release" });
+		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 		// The leak: onSpawn's entry stayed in `running` and consumed a global-cap slot.
 		expect(loop.running.size).toBe(0);
 	});
 
 	test("a release command gets the commits since the last review", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			archReviewDelta: async () => ({ delta: 12, reviewed: true, anchor: "a" }),
@@ -4119,8 +4322,8 @@ describe("turn release cards", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		store.setSettings({ releaseCommand: "bin release" });
-		await loop.runTurn(store.name, releaseTask(store).id);
+		await store.setSettings({ releaseCommand: "bin release" });
+		await loop.runTurn(store.name, (await releaseTask(store)).id);
 		expect(record.runReleaseCommand[0]).toMatchObject({
 			archReview: { delta: 12 },
 		});
@@ -4128,9 +4331,9 @@ describe("turn release cards", () => {
 });
 
 describe("turn settleReviews", () => {
-	function parkedCard(store: ProjectStore) {
-		const task = store.createTask("release v2.0.0");
-		store.updateTask(task.id, {
+	async function parkedCard(store: ProjectStore) {
+		const task = await store.createTask("release v2.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: "waiting for the review's findings to be implemented",
@@ -4143,14 +4346,14 @@ describe("turn settleReviews", () => {
 
 	test("a parked release publishes once its findings are done", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		loop.schedule();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await flushPromises();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v2.0.0");
 		expect(after.needsReason).toBe(null);
@@ -4161,7 +4364,7 @@ describe("turn settleReviews", () => {
 		const record = baseRecord();
 		const gate = Promise.withResolvers<void>();
 		const reached = Promise.withResolvers<void>();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			archReviewDelta: async () => {
 				reached.resolve();
 				await gate.promise;
@@ -4171,18 +4374,18 @@ describe("turn settleReviews", () => {
 		});
 		const e = projects.get(store.name)!;
 		e.target = "origin/main";
-		const task = parkedCard(store);
-		loop.schedule();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await reached.promise;
 		await loop.cancel(e, task.id, false);
 		gate.resolve();
 		await flushPromises();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(record.publishRelease).toHaveLength(0);
 		expect(after.cancelledAt).not.toBe(null);
 		expect(after.stage).not.toBe("done");
 		expect(after.summary).not.toBe("Released v2.0.0");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"release skipped: the card was cancelled",
 		);
 	});
@@ -4191,7 +4394,7 @@ describe("turn settleReviews", () => {
 		const record = baseRecord();
 		const gate = Promise.withResolvers<void>();
 		const reached = Promise.withResolvers<void>();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: async (o: unknown) => {
 				record.publishRelease.push(o);
 				reached.resolve();
@@ -4201,18 +4404,18 @@ describe("turn settleReviews", () => {
 		});
 		const e = projects.get(store.name)!;
 		e.target = "origin/main";
-		const task = parkedCard(store);
-		loop.schedule();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await reached.promise;
 		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
 			error: "release already publishing",
 			status: 409,
 		});
-		expect(store.getTask(task.id)!.cancelledAt).toBe(null);
+		expect((await store.getTask(task.id))!.cancelledAt).toBe(null);
 		expect(record.removeWorktree).toHaveLength(0);
 		gate.resolve();
 		await flushPromises();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v2.0.0");
 		expect(record.publishRelease).toHaveLength(1);
@@ -4221,54 +4424,54 @@ describe("turn settleReviews", () => {
 	test("an update's hold keeps a parked release from its publish until the hold lapses", async () => {
 		const record = baseRecord();
 		let held = true;
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			drained: () => held,
 		});
 		for (const p of projects.values()) p.target = "origin/main";
-		const task = parkedCard(store);
-		loop.schedule();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await flushPromises();
 		expect(record.publishRelease).toHaveLength(0);
 		held = false;
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.getTask(task.id)?.stage).toBe("done");
+		expect((await store.getTask(task.id))?.stage).toBe("done");
 		expect(record.publishRelease).toHaveLength(1);
 	});
 
 	test("a parked Review-button review is done, without a publish, once its findings are done", async () => {
-		const { store, record, projects, loop } = setup({
+		const { store, record, projects, loop } = await setup({
 			statusFiles: async () => ["stryker-report.md"],
 		});
 		for (const p of projects.values()) p.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
 		const wt = join(store.worktreesDir, review.id);
 		mkdirSync(wt, { recursive: true });
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: "waiting for the review's findings to be implemented",
 			base: "b",
 			worktree: wt,
 		});
-		const finding = store.createTask("review finding");
-		store.updateTask(finding.id, {
+		const finding = await store.createTask("review finding");
+		await store.updateTask(finding.id, {
 			stage: "in_progress",
 			state: "needs_you",
 			followUpOf: review.id,
 		});
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.getTask(review.id)?.stage).toBe("merging");
-		store.updateTask(finding.id, { stage: "done", state: "idle" });
-		loop.schedule();
+		expect((await store.getTask(review.id))?.stage).toBe("merging");
+		await store.updateTask(finding.id, { stage: "done", state: "idle" });
+		await loop.schedule();
 		await flushPromises();
-		const after = store.getTask(review.id);
+		const after = await store.getTask(review.id);
 		expect(after?.stage).toBe("done");
 		expect(after?.needsReason).toBeNull();
 		expect(after?.commits).toBe(3);
@@ -4279,16 +4482,16 @@ describe("turn settleReviews", () => {
 	});
 
 	test("a failing settle parks the card as needs_you", async () => {
-		const { store, projects, loop } = setup({
+		const { store, projects, loop } = await setup({
 			publishRelease: async () => {
 				throw new Error("no tag");
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		loop.schedule();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await flushPromises();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
@@ -4297,51 +4500,51 @@ describe("turn settleReviews", () => {
 	});
 
 	test("settle waits for other merging turns to finish", async () => {
-		const { store, record, projects, loop } = setup();
+		const { store, record, projects, loop } = await setup();
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		const merger = store.createTask("merging now");
-		store.updateTask(merger.id, { stage: "merging", state: "running" });
-		loop.schedule();
+		const task = await parkedCard(store);
+		const merger = await store.createTask("merging now");
+		await store.updateTask(merger.id, { stage: "merging", state: "running" });
+		await loop.schedule();
 		await flushPromises();
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 		expect(record.publishRelease).toHaveLength(0);
 	});
 
 	test("a parked release publishes while a merge it holds waits in the queue", async () => {
 		// The held merge waits for the publish, so settle waiting for that merge would deadlock both.
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		const late = store.createTask("added during the review");
-		store.updateTask(late.id, {
+		const task = await parkedCard(store);
+		const late = await store.createTask("added during the review");
+		await store.updateTask(late.id, {
 			stage: "merging",
 			state: "queued",
 			branch: "ott/late",
 		});
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.getTask(task.id)?.stage).toBe("done");
+		expect((await store.getTask(task.id))?.stage).toBe("done");
 		expect(record.publishRelease).toHaveLength(1);
 	});
 
 	test("no target: settle does nothing", async () => {
-		const { store, record, loop } = setup();
-		const task = parkedCard(store);
-		loop.schedule();
+		const { store, record, loop } = await setup();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await flushPromises();
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 		expect(record.publishRelease).toHaveLength(0);
 	});
 
 	test("cards without the parked shape are ignored", async () => {
-		const { store, record, projects, loop } = setup();
+		const { store, record, projects, loop } = await setup();
 		projects.get(store.name)!.target = "origin/main";
-		const task = store.createTask("release v3.0.0");
-		store.updateTask(task.id, {
+		const task = await store.createTask("release v3.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "idle",
 			// needsReason stays null: not a parked card
@@ -4349,17 +4552,17 @@ describe("turn settleReviews", () => {
 			base: "b",
 			worktree: "wt",
 		});
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 		expect(record.publishRelease).toHaveLength(0);
 	});
 
 	test("parked releases in two projects share the global cap within one tick (R3-5)", async () => {
 		const record = baseRecord();
-		const a = freshStore();
-		const b = freshStore();
-		const loop = createTurnLoop(
+		const a = await freshStore();
+		const b = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[a.name, { ...fakeProject(a), target: "origin/main" }],
 				[b.name, { ...fakeProject(b), target: "origin/main" }],
@@ -4379,11 +4582,11 @@ describe("turn settleReviews", () => {
 				},
 			}),
 		);
-		a.setSettings({ releaseCommand: "bin release" });
-		b.setSettings({ releaseCommand: "bin release" });
-		parkedCard(a);
-		parkedCard(b);
-		loop.schedule();
+		await a.setSettings({ releaseCommand: "bin release" });
+		await b.setSettings({ releaseCommand: "bin release" });
+		await parkedCard(a);
+		await parkedCard(b);
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runReleaseCommand).toHaveLength(1);
 	});
@@ -4391,13 +4594,16 @@ describe("turn settleReviews", () => {
 
 describe("turn merge outcomes", () => {
 	test("an integrated merge turn stamps the release version", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			isIntegrated: async () => true,
 			// A real tag of the released name points at the pushed head.
 			targetSha: async () => "sha-pushed",
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4412,28 +4618,28 @@ describe("turn merge outcomes", () => {
 				};
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.releaseVersion).toBe("v7.7.7");
 	});
 
 	test("an answered merge turn asks you about the unexpected outcome", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const { store, loop } = await setup();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			'Unexpected outcome "answered" in a merge turn.',
@@ -4454,12 +4660,12 @@ describe("turn survivor rounds", () => {
 		];
 		for (const patch of shapes) {
 			const record = baseRecord();
-			const { store, projects, loop } = setupWith(record, {
+			const { store, projects, loop } = await setupWith(record, {
 				publishRelease: publishingRelease(record),
 			});
 			projects.get(store.name)!.target = "origin/main";
-			const task = store.createTask("release v9.0.0");
-			store.updateTask(task.id, {
+			const task = await store.createTask("release v9.0.0");
+			await store.updateTask(task.id, {
 				stage: "merging",
 				state: "idle",
 				needsReason: "waiting for the review's findings to be implemented",
@@ -4468,32 +4674,32 @@ describe("turn survivor rounds", () => {
 				worktree: "wt",
 				...patch,
 			});
-			loop.schedule();
+			await loop.schedule();
 			await flushPromises();
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.stage).not.toBe("done");
 			expect(record.publishRelease).toHaveLength(0);
-			store.close();
+			await store.close();
 		}
 	});
 
 	test("settleReviews ignores idle and needs_you merging rows as blockers", async () => {
 		for (const blockerState of ["idle", "needs_you"] as const) {
 			const record = baseRecord();
-			const { store, projects, loop } = setupWith(record, {
+			const { store, projects, loop } = await setupWith(record, {
 				publishRelease: publishingRelease(record),
 			});
 			projects.get(store.name)!.target = "origin/main";
 			// The blocker row predates the card and is cancelled: not a finding for
 			// findingsHold, and its idle/needs_you state does not block settling.
-			const other = store.createTask("other merge");
-			store.updateTask(other.id, {
+			const other = await store.createTask("other merge");
+			await store.updateTask(other.id, {
 				stage: "merging",
 				state: blockerState,
 				cancelledAt: Date.now(),
 			});
-			const task = store.createTask("release v9.1.0");
-			store.updateTask(task.id, {
+			const task = await store.createTask("release v9.1.0");
+			await store.updateTask(task.id, {
 				stage: "merging",
 				state: "idle",
 				needsReason: "waiting for the review's findings to be implemented",
@@ -4501,11 +4707,11 @@ describe("turn survivor rounds", () => {
 				base: "b",
 				worktree: "wt",
 			});
-			loop.schedule();
+			await loop.schedule();
 			await flushPromises();
-			expect(store.getTask(task.id)!.stage).toBe("done");
+			expect((await store.getTask(task.id))!.stage).toBe("done");
 			expect(record.publishRelease).toHaveLength(1);
-			store.close();
+			await store.close();
 		}
 	});
 
@@ -4516,9 +4722,9 @@ describe("turn survivor rounds", () => {
 	});
 
 	test("a pending prompt without a session rides along with the work images", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			images: ["a.png"],
 			pendingImages: ["b.png"],
 			pendingPrompt: "also this",
@@ -4531,10 +4737,13 @@ describe("turn survivor rounds", () => {
 
 	test("a merge turn's onSession does not touch the stage", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+		const { store, loop } = await setupWith(record, {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4550,42 +4759,42 @@ describe("turn survivor rounds", () => {
 			},
 			isIntegrated: async () => true,
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
-		const events = store
-			.events()
-			.filter((e) => e.kind === "stage" && e.to === "in_progress");
+		const events = (await store.events()).filter(
+			(e) => e.kind === "stage" && e.to === "in_progress",
+		);
 		expect(events).toHaveLength(0);
 		// Integrated summary without a version stamps nothing.
-		expect(store.getTask(task.id)!.releaseVersion).toBe(null);
+		expect((await store.getTask(task.id))!.releaseVersion).toBe(null);
 	});
 
 	test("out-of-order pending images are not treated as the sent prefix", async () => {
 		const record = baseRecord();
-		const store = freshStore();
-		const task = store.createTask("work please");
+		const store = await freshStore();
+		const task = await store.createTask("work please");
 		saveSession(store, "s9");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			sessionId: "s9",
 			pendingPrompt: "one",
 			pendingImages: ["a"],
 		});
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
-				startRun: (o: {
+				holdFollowUps: true,
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("s9");
-					store.updateTask(task.id, { pendingImages: ["b", "a"] });
+					await o.onSession?.("s9");
+					await store.updateTask(task.id, { pendingImages: ["b", "a"] });
 					return {
 						pid: 4242,
 						done: Promise.resolve(runResult({})),
@@ -4596,24 +4805,24 @@ describe("turn survivor rounds", () => {
 		);
 		await loop.runTurn(store.name, task.id);
 		// ["b","a"] does not start with the sent ["a"], so nothing is sliced off.
-		expect(store.getTask(task.id)!.pendingImages).toEqual(["b", "a"]);
+		expect((await store.getTask(task.id))!.pendingImages).toEqual(["b", "a"]);
 	});
 
 	test("a re-queued turn stamps queuedAt and leaves commits alone", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
-		const loop = createTurnLoop(
+		const task = await store.createTask("work please");
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
-				startRun: (o: {
+				holdFollowUps: true,
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("sess-1");
-					store.updateTask(task.id, { pendingPrompt: "steer" });
+					await o.onSession?.("sess-1");
+					await store.updateTask(task.id, { pendingPrompt: "steer" });
 					return {
 						pid: 4242,
 						done: Promise.resolve(runResult({})),
@@ -4623,7 +4832,7 @@ describe("turn survivor rounds", () => {
 			}),
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.queuedAt).toBeGreaterThan(0);
 		expect(after.commits).toBe(null);
@@ -4631,11 +4840,14 @@ describe("turn survivor rounds", () => {
 
 	test("a done work turn never stamps a release version", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4651,22 +4863,26 @@ describe("turn survivor rounds", () => {
 			},
 			isIntegrated: async () => true,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		// Only merge turns stamp versions from integrate reports.
-		expect(store.getTask(task.id)!.releaseVersion).toBe(null);
+		expect((await store.getTask(task.id))!.releaseVersion).toBe(null);
 	});
 });
 
 describe("turn ci watch pinning", () => {
-	function mergeDoneSetup(overrides: Partial<TurnOps>) {
+	async function mergeDoneSetup(overrides: FixtureOps) {
 		const record = baseRecord();
-		const setup = setupWith(record, {
+		const setup = await setupWith(record, {
+			holdFollowUps: true,
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4682,8 +4898,8 @@ describe("turn ci watch pinning", () => {
 			},
 			...overrides,
 		});
-		const task = setup.store.createTask("merge please");
-		setup.store.updateTask(task.id, {
+		const task = await setup.store.createTask("merge please");
+		await setup.store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -4693,7 +4909,7 @@ describe("turn ci watch pinning", () => {
 
 	test("matching local and pushed tips pin the push sha", async () => {
 		const shaCalls: [string, string][] = [];
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			targetSha: async (mainPath: string, ref: string) => {
 				shaCalls.push([mainPath, ref]);
 				return "sha-pushed";
@@ -4708,14 +4924,17 @@ describe("turn ci watch pinning", () => {
 			[store.path, "origin/main"],
 			[store.path, "refs/remotes/origin/main"],
 		]);
-		expect(store.getTask(task.id)!.pushSha).toBe("sha-pushed");
+		expect((await store.getTask(task.id))!.pushSha).toBe("sha-pushed");
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("an integrate report naming a version stamps it when a tag points at the pushed head", async () => {
-		const { store, loop, task } = mergeDoneSetup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
-				o.onSession?.("sess-1");
+		const { store, loop, task } = await mergeDoneSetup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4732,16 +4951,19 @@ describe("turn ci watch pinning", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		// The default fake targetSha resolves every ref, the tag included, to "sha-pushed".
-		expect(store.getTask(task.id)!.releaseVersion).toBe("v1.2.3");
-		expect(store.getTask(task.id)!.pushSha).toBe("sha-pushed");
+		expect((await store.getTask(task.id))!.releaseVersion).toBe("v1.2.3");
+		expect((await store.getTask(task.id))!.pushSha).toBe("sha-pushed");
 	});
 
 	test("a version in the report prose without a tag does not stamp", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("refs/tags/") ? null : "sha-pushed",
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
-				o.onSession?.("sess-1");
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4758,20 +4980,23 @@ describe("turn ci watch pinning", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.releaseVersion).toBe(null);
+		expect((await store.getTask(task.id))!.releaseVersion).toBe(null);
 		// The CI-watch pin is independent of the stamp.
-		expect(store.getTask(task.id)!.pushSha).toBe("sha-pushed");
-		expect(logText(store, task.id)).toContain(
+		expect((await store.getTask(task.id))!.pushSha).toBe("sha-pushed");
+		expect(await logText(store, task.id)).toContain(
 			"- no release stamp for v1.2.3: no tag on the pushed head",
 		);
 	});
 
 	test("a tag pointing at another commit does not stamp", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("refs/tags/") ? "tagged-elsewhere" : "sha-pushed",
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
-				o.onSession?.("sess-1");
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -4787,31 +5012,31 @@ describe("turn ci watch pinning", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.releaseVersion).toBe(null);
+		expect((await store.getTask(task.id))!.releaseVersion).toBe(null);
 	});
 
 	test("a pushed tip that differs from the local target skips the pin", async () => {
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("origin/") ? "local-tip" : "older-origin-tip",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.pushSha).toBe(null);
-		expect(logText(store, task.id)).toContain(
+		expect((await store.getTask(task.id))!.pushSha).toBe(null);
+		expect(await logText(store, task.id)).toContain(
 			"- CI watch skipped: merge push not on origin",
 		);
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("unresolvable tips skip the pin", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async () => {
 				throw new Error("no such ref");
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.pushSha).toBe(null);
-		expect(logText(store, task.id)).toContain(
+		expect((await store.getTask(task.id))!.pushSha).toBe(null);
+		expect(await logText(store, task.id)).toContain(
 			"- CI watch skipped: merge push not on origin",
 		);
 	});
@@ -4819,7 +5044,7 @@ describe("turn ci watch pinning", () => {
 	test("the server push runs before the integration check, so a local-only merge lands", async () => {
 		let pushed = false;
 		const calls: [string, string, string, string][] = [];
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			// Origin holds the merge only after the server push: the check must come after it.
 			isIntegrated: async () => pushed,
 			serverMergePush: async (
@@ -4835,16 +5060,16 @@ describe("turn ci watch pinning", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toEqual([[store.path, "wt-m", "origin/main", "ott/m"]]);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"- pushed origin/main from the server",
 		);
 	});
 
 	test("a held merge with patches beyond the approved head parks instead of pushing", async () => {
 		const pushes: string[] = [];
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("origin/") ? "sha-pushed" : "sha-local-main",
 			serverMergePush: async (_m: string, _w: string, target: string) => {
@@ -4857,12 +5082,12 @@ describe("turn ci watch pinning", () => {
 				auditedTip: null,
 			}),
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(pushes).toEqual([]);
 		expect(t.stage).toBe("in_progress");
 		expect(t.state).toBe("needs_you");
@@ -4874,7 +5099,7 @@ describe("turn ci watch pinning", () => {
 
 	test("a held fork merge with patches beyond the approved head parks too", async () => {
 		const pushes: string[] = [];
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async () => "sha-local-main",
 			serverMergePush: async () => {
 				pushes.push("origin/main");
@@ -4886,9 +5111,9 @@ describe("turn ci watch pinning", () => {
 				auditedTip: null,
 			}),
 		});
-		store.updateTask(task.id, { forkMergeHead: "sha-approved" });
+		await store.updateTask(task.id, { forkMergeHead: "sha-approved" });
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(pushes).toEqual([]);
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
@@ -4897,7 +5122,7 @@ describe("turn ci watch pinning", () => {
 
 	test("an approved head already on origin settles a stale local main without a park", async () => {
 		const pushes: string[] = [];
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			// VELV-89: the agent's own push moved only origin, so the local branch sits behind
 			// it and the ordinary worktree proof cannot see the landing.
 			isIntegrated: async () => false,
@@ -4912,12 +5137,12 @@ describe("turn ci watch pinning", () => {
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		// The remote target already holds the work: no push, no park, the card lands.
 		expect(pushes).toEqual([]);
 		expect(t.stage).toBe("done");
@@ -4925,13 +5150,13 @@ describe("turn ci watch pinning", () => {
 		expect(t.needsReason).toBeNull();
 		expect(t.holdHead).toBeNull();
 		expect(record.removeWorktree).toHaveLength(1);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"- approved head already on origin/main: the merge landed without the local branch moving",
 		);
 	});
 
 	test("a hold probe that cannot fetch still parks on the gate's failure", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref === "refs/heads/main" ? "sha-stale-local" : "sha-origin",
 			// The probe fetch failed; the gate re-fetches and fails closed too.
@@ -4945,19 +5170,19 @@ describe("turn ci watch pinning", () => {
 				throw new Error("a parked hold must not push");
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 		expect(t.holdHead).toBe("sha-stale-local");
 	});
 
 	test("extra patches on the remote beyond the approved head still park a stale local main", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref === "refs/heads/main" ? "sha-stale-local" : "sha-origin",
 			// Containment held but the remote carries patches beyond the approval.
@@ -4972,12 +5197,12 @@ describe("turn ci watch pinning", () => {
 				throw new Error("a parked hold must not push");
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 		expect(t.diffText).toBe("diff --git a/evil.txt b/evil.txt");
@@ -4988,7 +5213,7 @@ describe("turn ci watch pinning", () => {
 		let branchTip = "sha-A-patches";
 		const resets: [string, string][] = [];
 		const pushes: string[] = [];
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("origin/")
 					? "sha-origin"
@@ -5010,12 +5235,12 @@ describe("turn ci watch pinning", () => {
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const a = store.getTask(task.id)!;
+		const a = (await store.getTask(task.id))!;
 		expect(a.stage).toBe("in_progress");
 		expect(a.state).toBe("needs_you");
 		expect(a.holdHead).toBe("sha-A-patches");
@@ -5024,20 +5249,20 @@ describe("turn ci watch pinning", () => {
 		expect(a.diffText).toBe("diff --git a/evil.txt b/evil.txt");
 
 		// Card B merges with no approved heads: its push carries only its own work.
-		const b = store.createTask("merge b please");
-		store.updateTask(b.id, {
+		const b = await store.createTask("merge b please");
+		await store.updateTask(b.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/b",
 		});
 		await loop.runTurn(store.name, b.id);
 		expect(pushes).toEqual(["origin/main@sha-origin"]);
-		expect(store.getTask(b.id)!.stage).toBe("done");
+		expect((await store.getTask(b.id))!.stage).toBe("done");
 	});
 
 	test("a park that cannot reset the branch pins later pushes of the held tip", async () => {
 		const pushes: string[] = [];
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("origin/")
 					? "sha-origin"
@@ -5058,31 +5283,31 @@ describe("turn ci watch pinning", () => {
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const a = store.getTask(task.id)!;
+		const a = (await store.getTask(task.id))!;
 		expect(a.state).toBe("needs_you");
 		expect(a.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 
-		const b = store.createTask("merge b please");
-		store.updateTask(b.id, {
+		const b = await store.createTask("merge b please");
+		await store.updateTask(b.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/b",
 		});
 		await loop.runTurn(store.name, b.id);
 		expect(pushes).toEqual([]);
-		const bt = store.getTask(b.id)!;
+		const bt = (await store.getTask(b.id))!;
 		expect(bt.stage).toBe("merging");
 		expect(bt.state).toBe("needs_you");
 		expect(bt.needsReason).toContain(`card #${task.id} parks a held merge`);
 	});
 
 	test("a merge whose head is exactly the approved push head pushes without the patch compare", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			targetSha: async (_mainPath: string, ref: string) =>
 				ref.startsWith("origin/") ? "sha-pushed" : "sha-approved",
 			serverMergePush: async () => ({ status: "pushed" as const, output: "" }),
@@ -5090,27 +5315,27 @@ describe("turn ci watch pinning", () => {
 				throw new Error("must not compare when the head is the approved one");
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a merge without a hold approval is not gated", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			mergeHoldMismatch: async () => {
 				throw new Error("no hold columns set: nothing to compare");
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a held merge that passes the gate pins the push to the audited tip", async () => {
 		const calls: unknown[][] = [];
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async (...args: unknown[]) => {
 				calls.push(args);
 				return { status: "pushed" as const, output: "" };
@@ -5121,12 +5346,12 @@ describe("turn ci watch pinning", () => {
 				auditedTip: "sha-audited",
 			}),
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 		expect(calls.at(-1)![4]).toBe("sha-audited");
 	});
 
@@ -5135,12 +5360,15 @@ describe("turn ci watch pinning", () => {
 		// The worktree is alive when the turn dispatches; the merge agent removes it during
 		// its run, so the husk only shows at the settle (OTTR-341 never dispatches into one).
 		let removed = false;
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			worktreeHusk: async () => removed,
 			branchMergedOrGone: async () => true,
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				removed = true;
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5166,15 +5394,15 @@ describe("turn ci watch pinning", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toEqual(["ott/m"]);
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(logText(store, task.id)).toContain(
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect(await logText(store, task.id)).toContain(
 			"- pushed origin/main from the server",
 		);
 	});
 
 	test("a needs_you report on a push authentication failure resolves to integrated once the server pushed", async () => {
 		let pushed = false;
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			isIntegrated: async () => pushed,
 			serverMergePush: async () => {
 				pushed = true;
@@ -5184,9 +5412,12 @@ describe("turn ci watch pinning", () => {
 						"To git.example.com:a/r.git\n   1111111..2222222  main -> main",
 				};
 			},
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5205,20 +5436,23 @@ describe("turn ci watch pinning", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
-		const turn = store.listTurns(task.id).at(-1)!;
+		const turn = (await store.listTurns(task.id)).at(-1)!;
 		expect(turn.outcome).toBe("integrated");
 		expect(turn.details).toContain("main -> main");
 	});
 
 	test("a needs_you report for another reason stays needs_you after a server push", async () => {
-		const { store, loop, task, record } = mergeDoneSetup({
+		const { store, loop, task, record } = await mergeDoneSetup({
 			serverMergePush: async () => ({ status: "pushed" as const, output: "" }),
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5235,30 +5469,30 @@ describe("turn ci watch pinning", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.state).toBe("needs_you");
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 	});
 
 	test("a failed server push keeps the card at merging with git's reason and the worktree", async () => {
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error: "fatal: [REDACTED] rejected",
 			}),
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(
 			"Server push to origin failed: fatal: [REDACTED] rejected",
 		);
 		// OTTR-465: without a pinned URL no re-check can run, so the retry stays off and says so.
-		expect(logText(store, task.id)).toContain("no pinned origin URL");
+		expect(await logText(store, task.id)).toContain("no pinned origin URL");
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
 	test("a server push refused by a GitHub branch rule parks with the PR-mode hint", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error:
@@ -5266,7 +5500,7 @@ describe("turn ci watch pinning", () => {
 			}),
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toContain("PR mode");
@@ -5276,40 +5510,40 @@ describe("turn ci watch pinning", () => {
 	});
 
 	test("a plain server push failure parks without the PR-mode hint", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error: "remote: HTTP Basic: Access denied",
 			}),
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).not.toContain("PR mode");
 	});
 
 	test("OTTR-743: a cannot-lock-ref push the remote already held lands as done with the recovery reason", async () => {
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "pushed" as const,
 				output: `${PUSH_LANDED_BEFORE_ATTEMPT}: the remote ref moved while the push ran ("cannot lock ref"), and the fetched main already contains the pushed head`,
 			}),
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		// Same state as a successful push: the card lands, no needs_you, the worktree goes.
 		expect(t.stage).toBe("done");
 		expect(t.needsReason).toBeNull();
 		expect(record.removeWorktree).toHaveLength(1);
 		// One log line names the reason.
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"- push landed on origin before this attempt",
 		);
 	});
 
 	test("OTTR-743: a cannot-lock-ref push whose head origin lacks parks as today", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error:
@@ -5317,7 +5551,7 @@ describe("turn ci watch pinning", () => {
 			}),
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(
@@ -5328,7 +5562,7 @@ describe("turn ci watch pinning", () => {
 	test("a rejected server push fetches origin and queues a rebase merge turn, not needs_you", async () => {
 		const fetches: string[] = [];
 		let pushes = 0;
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return pushes === 1
@@ -5347,14 +5581,14 @@ describe("turn ci watch pinning", () => {
 				return null;
 			},
 		});
-		// maxParallel 0 keeps the scheduler's post-settle schedule() from auto-starting the
+		// The fixture closes its global cap after dispatch to prevent an automatic start of the
 		// queued rebase turn mid-assertion; phase 2 below starts it like the merge slot would.
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The card lands queued with the rebase prompt, not parked at needs_you.
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
@@ -5370,18 +5604,18 @@ describe("turn ci watch pinning", () => {
 		);
 		expect(after.pendingPrompt).toContain("automatic rebase retry 1 of 2");
 		expect(after.pendingBy).toBe("supervisor");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"server push rejected: origin moved, merge turn queued to rebase (retry 1 of 2)",
 		);
 		expect(record.removeWorktree).toHaveLength(0);
 		// The queued turn runs with the rebase prompt, the push runs again, and the card lands.
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 		expect(pushes).toBe(2);
 		expect(record.runs[1]!.prompt).toContain(
 			"rebase the local target branch onto origin/main",
 		);
-		expect(store.listTurns(task.id)[1]!.inputBy).toBe("supervisor");
+		expect((await store.listTurns(task.id))[1]!.inputBy).toBe("supervisor");
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
@@ -5389,7 +5623,7 @@ describe("turn ci watch pinning", () => {
 		let pushes = 0;
 		const rebases: string[] = [];
 		const gates: string[] = [];
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return pushes === 1
@@ -5409,12 +5643,12 @@ describe("turn ci watch pinning", () => {
 				return { ok: true, output: "" };
 			},
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The retry push landed: the card is done, no recovery steer, no budget spent.
 		expect(after.stage).toBe("done");
 		expect(after.pendingPrompt).toBeNull();
@@ -5422,13 +5656,13 @@ describe("turn ci watch pinning", () => {
 		expect(pushes).toBe(2);
 		expect(rebases).toEqual([`${store.path}:main`]);
 		expect(gates).toEqual([store.path]);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"merge gates passed on the rebased main",
 		);
-		expect(logText(store, task.id)).not.toContain(
+		expect(await logText(store, task.id)).not.toContain(
 			"automatic rebase retry 1 of 2",
 		);
-		expect(logText(store, task.id)).not.toContain(
+		expect(await logText(store, task.id)).not.toContain(
 			"merge turn queued to rebase",
 		);
 		expect(record.removeWorktree).toHaveLength(1);
@@ -5437,7 +5671,7 @@ describe("turn ci watch pinning", () => {
 	test("a conflicting automatic rebase still queues the steer and runs no gates", async () => {
 		let pushes = 0;
 		let gateRuns = 0;
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return {
@@ -5456,19 +5690,19 @@ describe("turn ci watch pinning", () => {
 				return { ok: true, output: "" };
 			},
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.pushRetries).toBe(1);
 		expect(after.pendingPrompt).toContain("automatic rebase retry 1 of 2");
 		expect(gateRuns).toBe(0);
 		expect(pushes).toBe(1);
-		const log = logText(store, task.id);
+		const log = await logText(store, task.id);
 		expect(log).toContain("the automatic rebase of main hit a conflict");
 		expect(log).toContain(
 			"server push rejected: origin moved, merge turn queued to rebase (retry 1 of 2)",
@@ -5478,7 +5712,7 @@ describe("turn ci watch pinning", () => {
 
 	test("failed merge gates on the rebased target queue the steer before any second push", async () => {
 		let pushes = 0;
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return {
@@ -5493,17 +5727,17 @@ describe("turn ci watch pinning", () => {
 				output: "bun run check exited 1\nerror: check failed",
 			}),
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.pushRetries).toBe(1);
 		expect(pushes).toBe(1);
-		const log = logText(store, task.id);
+		const log = await logText(store, task.id);
 		expect(log).toContain("merge gates failed on the rebased main");
 		expect(log).toContain("merge gates output");
 	});
@@ -5511,7 +5745,7 @@ describe("turn ci watch pinning", () => {
 	test("a still-rejected retry push queues the steer on a fresh fetch", async () => {
 		const fetches: string[] = [];
 		let pushes = 0;
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return {
@@ -5530,24 +5764,24 @@ describe("turn ci watch pinning", () => {
 			rebaseTargetBranch: async () => ({ ok: true as const }),
 			runMergeGates: async () => ({ ok: true, output: "" }),
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.pushRetries).toBe(1);
 		expect(pushes).toBe(2);
 		expect(fetches).toHaveLength(2);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"the retry push of origin/main rejected after the automatic rebase",
 		);
 	});
 
 	test("a failed push under a bare 403 appends the GitHub SAML hint to the park reason", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error:
@@ -5557,12 +5791,12 @@ describe("turn ci watch pinning", () => {
 			githubAuthHint: async () =>
 				"\nGitHub: Resource protected by organization SAML enforcement. You must grant your Personal Access token access to an organization that has SAML SSO enabled.",
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "https://acme.ghe.com/o/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toContain("Server push to origin failed:");
 		expect(t.needsReason).toContain(
@@ -5571,7 +5805,7 @@ describe("turn ci watch pinning", () => {
 	});
 
 	test("a failed push where the probe cannot answer parks the bare git error only", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error:
@@ -5580,12 +5814,12 @@ describe("turn ci watch pinning", () => {
 			}),
 			githubAuthHint: async () => null,
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "https://acme.ghe.com/o/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toContain("Server push to origin failed:");
 		expect(t.needsReason).toContain("returned error: 403");
@@ -5594,7 +5828,7 @@ describe("turn ci watch pinning", () => {
 
 	test("a failed (non-conflict) automatic rebase parks needs_you", async () => {
 		let pushes = 0;
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return {
@@ -5610,12 +5844,12 @@ describe("turn ci watch pinning", () => {
 			}),
 			runMergeGates: async () => ({ ok: true, output: "" }),
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toContain("Server push to origin failed:");
@@ -5635,7 +5869,7 @@ describe("turn ci watch pinning", () => {
 			loop,
 			projects,
 			task: a,
-		} = mergeDoneSetup({
+		} = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return pushes === 1
@@ -5650,43 +5884,52 @@ describe("turn ci watch pinning", () => {
 			// between the rejected push and the repairing one, pushed after it.
 			branchUnpushed: async () => pushes === 1,
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
+		await store.updateTask(a.id, { queuedAt: 1 });
 		// Card b queued before a's rejection: queue order alone would start b first and
 		// pile its merge onto the unpushed main (the 2026-11-04 incident). The hold must
 		// invert the order: the rejected card's rebase retry repairs main first.
-		const b = store.createTask("merge b please");
-		store.updateTask(b.id, {
+		const b = await store.createTask("merge b please");
+		await store.updateTask(b.id, {
 			stage: "merging",
+			queuedAt: 2,
 			worktree: "wt-m",
 			branch: "ott/b",
 		});
+		expect(
+			pickRunnable(await store.listTasks(), {
+				maxParallel: 1,
+				hasRules: true,
+				mainUnpushed: false,
+			}).map((task) => task.id),
+		).toEqual([a.id]);
 		await loop.runTurn(store.name, a.id);
-		const after = store.getTask(a.id)!;
+		const after = (await store.getTask(a.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pushRetries).toBe(1);
 		// The rejection holds the project's merges at once, before any tick's refresh.
 		expect(projects.get(store.name)!.mainUnpushed).toBe(true);
 		// Exactly the gate schedule() runs: only the retry card may start; once main
 		// reached origin, b is the runnable merge again.
-		const gate = (unpushed: boolean) =>
-			pickRunnable(store.listTasks(), {
+		const gate = async (unpushed: boolean) =>
+			pickRunnable(await store.listTasks(), {
 				maxParallel: null,
 				hasRules: true,
 				mainUnpushed: unpushed,
 			}).map((t) => t.id);
-		expect(gate(true)).toEqual([a.id]);
-		expect(gate(false)).toEqual([b.id]);
+		expect(await gate(true)).toEqual([a.id]);
+		expect(await gate(false)).toEqual([b.id]);
 		// The retry turn rebases, the server push lands, and the hold lifts.
 		await loop.runTurn(store.name, a.id);
-		expect(store.getTask(a.id)!.stage).toBe("done");
+		expect((await store.getTask(a.id))!.stage).toBe("done");
 		expect(projects.get(store.name)!.mainUnpushed).toBe(false);
 		expect(pushes).toBe(2);
 		// The second card merges after the repaired main, and its push succeeds.
 		await loop.runTurn(store.name, b.id);
-		expect(store.getTask(b.id)!.stage).toBe("done");
+		expect((await store.getTask(b.id))!.stage).toBe("done");
 		expect(pushes).toBe(3);
 		expect(record.removeWorktree).toHaveLength(2);
 	});
@@ -5703,7 +5946,7 @@ describe("turn ci watch pinning", () => {
 			loop,
 			projects,
 			task: a,
-		} = mergeDoneSetup({
+		} = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return pushes === 1
@@ -5719,58 +5962,58 @@ describe("turn ci watch pinning", () => {
 			branchUnpushed: async () => pushes === 1,
 		});
 		// No pinned origin URL: the in-turn re-check cannot run, so the card parks.
-		store.setSettings({ originUrl: null, maxParallel: 0 });
+		await store.setSettings({ originUrl: null, maxParallel: 1 });
 		await loop.runTurn(store.name, a.id);
-		const parked = store.getTask(a.id)!;
+		const parked = (await store.getTask(a.id))!;
 		expect(parked.state).toBe("needs_you");
 		expect(parked.pushRetries).toBe(0);
 		// The failure left main unpushed: the hold engages for every queued merge.
 		expect(projects.get(store.name)!.mainUnpushed).toBe(true);
-		const b = store.createTask("merge b please");
-		store.updateTask(b.id, {
+		const b = await store.createTask("merge b please");
+		await store.updateTask(b.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/b",
 		});
-		const gate = () =>
-			pickRunnable(store.listTasks(), {
+		const gate = async () =>
+			pickRunnable(await store.listTasks(), {
 				maxParallel: null,
 				hasRules: true,
 				mainUnpushed: true,
 			}).map((t) => t.id);
 		// A supervisor queue of the parked card stays held: no user directed it, and the
 		// normal queued merge b is held too — only a user reply (or a rebase retry) runs.
-		store.updateTask(a.id, {
+		await store.updateTask(a.id, {
 			state: "queued",
 			needsReason: null,
 			pendingPrompt: "retry",
 			pendingBy: "supervisor",
 			queuedAt: Date.now(),
 		});
-		expect(gate()).toEqual([]);
-		store.updateTask(a.id, { state: "needs_you", pendingPrompt: null });
+		expect(await gate()).toEqual([]);
+		await store.updateTask(a.id, { state: "needs_you", pendingPrompt: null });
 		// The user replies: the reply route queues the card with pendingBy "user".
-		store.updateTask(a.id, {
+		await store.updateTask(a.id, {
 			state: "queued",
 			needsReason: null,
 			pendingPrompt: "retry the push",
 			pendingBy: "user",
 			queuedAt: Date.now(),
 		});
-		expect(gate()).toEqual([a.id]);
+		expect(await gate()).toEqual([a.id]);
 		// The recovered turn pushes and lands, and the hold lifts for the other card.
 		await loop.runTurn(store.name, a.id);
-		expect(store.getTask(a.id)!.stage).toBe("done");
+		expect((await store.getTask(a.id))!.stage).toBe("done");
 		expect(projects.get(store.name)!.mainUnpushed).toBe(false);
 		expect(pushes).toBe(2);
 		await loop.runTurn(store.name, b.id);
-		expect(store.getTask(b.id)!.stage).toBe("done");
+		expect((await store.getTask(b.id))!.stage).toBe("done");
 		expect(pushes).toBe(3);
 		expect(record.removeWorktree).toHaveLength(2);
 	});
 
 	test("the third rejected push parks the card at needs_you with git's reason", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "rejected" as const,
 				error: "! [rejected] main -> main (non-fast-forward)",
@@ -5779,9 +6022,9 @@ describe("turn ci watch pinning", () => {
 				throw new Error("must not fetch beyond the retry budget");
 			},
 		});
-		store.updateTask(task.id, { pushRetries: 2 });
+		await store.updateTask(task.id, { pushRetries: 2 });
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(
@@ -5792,7 +6035,7 @@ describe("turn ci watch pinning", () => {
 	});
 
 	test("a hold-approved merge origin rejects keeps needs_you: the lease covers one exact head", async () => {
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => ({
 				status: "rejected" as const,
 				error: "! [rejected] main -> main (stale info)",
@@ -5806,12 +6049,12 @@ describe("turn ci watch pinning", () => {
 				throw new Error("must not fetch a held push");
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			updateIds: ["x@1"],
 			updateMergeHead: "sha-approved",
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(
@@ -5825,7 +6068,7 @@ describe("turn ci watch pinning", () => {
 		const fetches: string[] = [];
 		const error =
 			"remote: Permission to Skare69/agent-data.git denied to ottr-board\nfatal: unable to access 'https://github.com/Skare69/agent-data.git/': The requested URL returned error: 403\nerror: failed to push some refs to 'https://github.com/Skare69/agent-data.git'";
-		const { store, record, loop, task } = mergeDoneSetup({
+		const { store, record, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return pushes === 1
@@ -5851,19 +6094,19 @@ describe("turn ci watch pinning", () => {
 			targetContains: async () => true,
 			pushRetryDelayMs: 0,
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "https://github.com/Skare69/agent-data.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("done");
 		expect(t.needsReason).toBeNull();
 		// The rebase-retry budget stays untouched: this retry never queued a turn.
 		expect(t.pushRetries).toBe(0);
 		expect(pushes).toBe(2);
 		expect(fetches).toEqual(["main@https://github.com/Skare69/agent-data.git"]);
-		const text = logText(store, task.id);
+		const text = await logText(store, task.id);
 		expect(text).toContain(
 			"remote: Permission to Skare69/agent-data.git denied to ottr-board",
 		);
@@ -5876,7 +6119,7 @@ describe("turn ci watch pinning", () => {
 		let pushes = 0;
 		const error =
 			"remote: Permission to Skare69/agent-data.git denied to ottr-board\nerror: failed to push some refs to 'https://github.com/Skare69/agent-data.git'";
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return {
@@ -5895,17 +6138,17 @@ describe("turn ci watch pinning", () => {
 					? "a board-stored token for github.com (personal access token)"
 					: null,
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "https://github.com/Skare69/agent-data.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.stage).toBe("merging");
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(`Server push to origin failed: ${error}`);
 		expect(pushes).toBe(2);
-		const text = logText(store, task.id);
+		const text = await logText(store, task.id);
 		expect(text).toContain(
 			"remote: Permission to Skare69/agent-data.git denied to ottr-board",
 		);
@@ -5917,7 +6160,7 @@ describe("turn ci watch pinning", () => {
 
 	test("a failed origin re-check parks with its own reason and no retry", async () => {
 		let pushes = 0;
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return { status: "failed" as const, error: "fatal: denied" };
@@ -5927,12 +6170,12 @@ describe("turn ci watch pinning", () => {
 			},
 			pushRetryDelayMs: 0,
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe(
 			"Server push to origin failed: fatal: denied\norigin re-check failed: ssh: token refresh failed",
@@ -5942,7 +6185,7 @@ describe("turn ci watch pinning", () => {
 
 	test("origin moved: the failed push does not retry", async () => {
 		let pushes = 0;
-		const { store, loop, task } = mergeDoneSetup({
+		const { store, loop, task } = await mergeDoneSetup({
 			serverMergePush: async () => {
 				pushes += 1;
 				return { status: "failed" as const, error: "fatal: denied" };
@@ -5953,31 +6196,31 @@ describe("turn ci watch pinning", () => {
 			targetContains: async () => false,
 			pushRetryDelayMs: 0,
 		});
-		store.setSettings({
+		await store.setSettings({
 			originUrl: "ssh://git.example.com/a/r.git",
-			maxParallel: 0,
+			maxParallel: 1,
 		});
 		await loop.runTurn(store.name, task.id);
-		const t = store.getTask(task.id)!;
+		const t = (await store.getTask(task.id))!;
 		expect(t.state).toBe("needs_you");
 		expect(t.needsReason).toBe("Server push to origin failed: fatal: denied");
 		expect(pushes).toBe(1);
-		expect(logText(store, task.id)).toContain("not retrying the push");
+		expect(await logText(store, task.id)).toContain("not retrying the push");
 	});
 });
 
 describe("turn survivor rounds 3", () => {
 	test("an interview card runs the raw prompt in the main checkout and settles ready as done", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
-			startRun: (o: {
+			startRun: async (o: {
 				cwd: string;
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5992,13 +6235,13 @@ describe("turn survivor rounds 3", () => {
 				};
 			},
 		});
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}${store.name}`,
 			null,
 			"interview",
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// ready is rewritten to answered, and answered with no commits settles done.
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
@@ -6010,14 +6253,14 @@ describe("turn survivor rounds 3", () => {
 	});
 
 	test("the sibling list skips cancelled and done tasks", async () => {
-		const { store, record, loop } = setup();
-		const dead = store.createTask("dead sibling");
-		store.updateTask(dead.id, { cancelledAt: Date.now() });
-		const finished = store.createTask("done sibling");
-		store.updateTask(finished.id, { stage: "done" });
-		const live = store.createTask("live sibling");
-		store.updateTask(live.id, { stage: "in_progress" });
-		const task = store.createTask("work please");
+		const { store, record, loop } = await setup();
+		const dead = await store.createTask("dead sibling");
+		await store.updateTask(dead.id, { cancelledAt: Date.now() });
+		const finished = await store.createTask("done sibling");
+		await store.updateTask(finished.id, { stage: "done" });
+		const live = await store.createTask("live sibling");
+		await store.updateTask(live.id, { stage: "in_progress" });
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		const prompt = record.runs[0]!.prompt;
 		expect(prompt).toContain("live sibling");
@@ -6027,25 +6270,25 @@ describe("turn survivor rounds 3", () => {
 
 	test("a shrunken pending image list keeps the remainder untouched", async () => {
 		const record = baseRecord();
-		const store = freshStore();
-		const task = store.createTask("work please");
+		const store = await freshStore();
+		const task = await store.createTask("work please");
 		saveSession(store, "s9");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			sessionId: "s9",
 			pendingPrompt: "one",
 			pendingImages: ["a", "b"],
 		});
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
-				startRun: (o: {
+				holdFollowUps: true,
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					record.runs.push(o as never);
-					o.onSession?.("s9");
-					store.updateTask(task.id, { pendingImages: ["a"] });
+					await o.onSession?.("s9");
+					await store.updateTask(task.id, { pendingImages: ["a"] });
 					return {
 						pid: 4242,
 						done: Promise.resolve(runResult({})),
@@ -6056,18 +6299,21 @@ describe("turn survivor rounds 3", () => {
 		);
 		await loop.runTurn(store.name, task.id);
 		// ["a"] is shorter than the sent ["a","b"], so no prefix is sliced off.
-		expect(store.getTask(task.id)!.pendingImages).toEqual(["a"]);
+		expect((await store.getTask(task.id))!.pendingImages).toEqual(["a"]);
 	});
 
 	test("unsaved work on a done merge turn holds the card at merging", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			unsavedWork: async () => "M x.ts",
 			statusFiles: async () => ["x.ts"],
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -6082,14 +6328,14 @@ describe("turn survivor rounds 3", () => {
 				};
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(keptReason("M x.ts"));
@@ -6099,13 +6345,16 @@ describe("turn survivor rounds 3", () => {
 
 	test("an integrated merge turn stamps a version found in the details", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			// A real tag of the released name points at the pushed head.
 			targetSha: async () => "sha-pushed",
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -6121,28 +6370,31 @@ describe("turn survivor rounds 3", () => {
 				};
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.releaseVersion).toBe("v8.8.8");
+		expect((await store.getTask(task.id))!.releaseVersion).toBe("v8.8.8");
 	});
 
 	test("a release command holds queued merges; without one the merge runs", async () => {
 		const withCommand = baseRecord();
-		const commandStore = freshStore();
+		const commandStore = await freshStore();
 		const commandProjects = new Map([
 			[commandStore.name, fakeProject(commandStore)],
 		]);
-		commandStore.setSettings({ releaseCommand: "bin release" });
-		const merge = commandStore.createTask("merge please");
-		commandStore.updateTask(merge.id, { stage: "merging", state: "queued" });
-		const release = commandStore.createTask("release v1.0.0");
-		commandStore.updateTask(release.id, { releaseVersion: "v1.0.0" });
-		const commandLoop = createTurnLoop(
+		await commandStore.setSettings({ releaseCommand: "bin release" });
+		const merge = await commandStore.createTask("merge please");
+		await commandStore.updateTask(merge.id, {
+			stage: "merging",
+			state: "queued",
+		});
+		const release = await commandStore.createTask("release v1.0.0");
+		await commandStore.updateTask(release.id, { releaseVersion: "v1.0.0" });
+		const commandLoop = holdFollowUps(
 			commandProjects,
 			fakeOps(withCommand, {
 				startRun: (o: { prompt: string }) => {
@@ -6155,34 +6407,34 @@ describe("turn survivor rounds 3", () => {
 				},
 			}),
 		);
-		commandLoop.schedule();
+		await commandLoop.schedule();
 		await flushPromises();
 		// The queued release card starts its review; the merge stays queued while it does.
 		expect(withCommand.runs).toHaveLength(1);
 		expect(["preparing", "running"]).toContain(
-			commandStore.getTask(release.id)!.state,
+			(await commandStore.getTask(release.id))!.state,
 		);
-		expect(commandStore.getTask(merge.id)!.state).toBe("queued");
+		expect((await commandStore.getTask(merge.id))!.state).toBe("queued");
 
 		const without = baseRecord();
-		const plainStore = freshStore();
+		const plainStore = await freshStore();
 		const plainProjects = new Map([[plainStore.name, fakeProject(plainStore)]]);
-		const plainMerge = plainStore.createTask("merge please");
-		plainStore.updateTask(plainMerge.id, {
+		const plainMerge = await plainStore.createTask("merge please");
+		await plainStore.updateTask(plainMerge.id, {
 			stage: "merging",
 			state: "queued",
 		});
-		const plainRelease = plainStore.createTask("release v1.0.0");
-		plainStore.updateTask(plainRelease.id, { releaseVersion: "v1.0.0" });
-		const plainLoop = createTurnLoop(
+		const plainRelease = await plainStore.createTask("release v1.0.0");
+		await plainStore.updateTask(plainRelease.id, { releaseVersion: "v1.0.0" });
+		const plainLoop = holdFollowUps(
 			plainProjects,
 			fakeOps(without, {
-				startRun: (o: {
+				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
 				}) => {
 					without.runs.push(o as never);
-					o.onSession?.("s1");
+					await o.onSession?.("s1");
 					return {
 						pid: 2,
 						done: Promise.resolve(runResult({})),
@@ -6191,17 +6443,17 @@ describe("turn survivor rounds 3", () => {
 				},
 			}),
 		);
-		plainLoop.schedule();
+		await plainLoop.schedule();
 		await flushPromises();
 		// Without a release command nothing holds the merge slot back: the card started.
-		expect(plainStore.getTask(plainMerge.id)!.state).not.toBe("queued");
+		expect((await plainStore.getTask(plainMerge.id))!.state).not.toBe("queued");
 		expect(without.runs).not.toHaveLength(0);
 	});
 });
 
 describe("turn research cards", () => {
-	function researchStore() {
-		const store = freshStore();
+	async function researchStore() {
+		const store = await freshStore();
 		const record: Recorded = {
 			createWorktree: [],
 			removeWorktree: [],
@@ -6221,15 +6473,15 @@ describe("turn research cards", () => {
 		return { store, record, projects };
 	}
 
-	function researchTask(store: ProjectStore) {
-		const task = store.createTask("research something");
-		store.updateTask(task.id, { research: true });
+	async function researchTask(store: ProjectStore) {
+		const task = await store.createTask("research something");
+		await store.updateTask(task.id, { research: true });
 		return task;
 	}
 
 	test("research work turn done: report harvested, worktree removed", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6240,11 +6492,11 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.report).toBe("# findings");
@@ -6255,7 +6507,7 @@ describe("turn research cards", () => {
 	});
 
 	test("direct answered report_outcome preserves summary and details through the turn, task, and handoff", async () => {
-		const { store, record, projects } = researchStore();
+		const { store, record, projects } = await researchStore();
 		const summary =
 			"Research confirms that answered outcomes retain their exact summary — including punctuation.";
 		const details =
@@ -6263,7 +6515,7 @@ describe("turn research cards", () => {
 		const finalText = "Final assistant text differs from the report.";
 		const report =
 			"# Findings\n\nAnswered outcomes must keep their summary and details distinct.\n";
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6331,12 +6583,12 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
-		const turns = store.listTurns(task.id);
+		const after = (await store.getTask(task.id))!;
+		const turns = await store.listTurns(task.id);
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.report).toBe(report);
@@ -6363,10 +6615,10 @@ describe("turn research cards", () => {
 	});
 
 	test("done settle saves untracked files and logs the saved list (fake op)", async () => {
-		const { store, record, projects } = researchStore();
+		const { store, record, projects } = await researchStore();
 		const saved: Array<{ wt: string; dir: string; root: string; max: number }> =
 			[];
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6386,11 +6638,11 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The save ran against the card's quarantine folder before the removal.
 		expect(saved).toHaveLength(1);
 		expect(saved[0]!.dir).toBe(join(store.tasksDir, "quarantine", after.id));
@@ -6398,7 +6650,7 @@ describe("turn research cards", () => {
 		// A save failure must never block the removal: removeWorktree still ran.
 		expect(record.removeWorktree).toHaveLength(1);
 		expect(after.stage).toBe("done");
-		const log = logText(store, after.id);
+		const log = await logText(store, after.id);
 		expect(log).toContain(
 			`saved 1 file(s) to .tasks/quarantine/${after.id}: mockup.html`,
 		);
@@ -6407,9 +6659,9 @@ describe("turn research cards", () => {
 	});
 
 	test("done settle runs the real saveDoneFiles: untracked files land in quarantine", async () => {
-		const { store, record, projects } = researchStore();
+		const { store, record, projects } = await researchStore();
 		let wtPath = "";
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6435,11 +6687,11 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
 		expect(existsSync(wtPath)).toBe(false);
@@ -6458,15 +6710,15 @@ describe("turn research cards", () => {
 				"utf8",
 			),
 		).toBe("# findings\n\nthe body");
-		const log = logText(store, after.id);
+		const log = await logText(store, after.id);
 		expect(log).toContain(`saved 3 file(s) to .tasks/quarantine/${after.id}: `);
 		for (const name of [RESEARCH_REPORT, "mockup.html", "mockup.md"])
 			expect(log).toContain(name);
 	});
 
 	test("a harvested report with a Recommended steps heading stores steps yes", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6480,14 +6732,14 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.steps).toBe("yes");
+		expect((await store.getTask(task.id))!.steps).toBe("yes");
 	});
 
 	test("a harvested report without the heading stores steps no", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6498,14 +6750,14 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.steps).toBe("no");
+		expect((await store.getTask(task.id))!.steps).toBe("no");
 	});
 
 	test("a loose Recommended-steps heading variant stores steps yes", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6519,20 +6771,20 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.steps).toBe("yes");
+		expect((await store.getTask(task.id))!.steps).toBe("yes");
 	});
 
 	test("a plain work card with no report file keeps steps unknown", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, { commitsAhead: async () => 0 }),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.steps).toBe("unknown");
+		expect((await store.getTask(task.id))!.steps).toBe("unknown");
 	});
 
 	// OTTR-233: a refused report holds every work card — a plain card too — before the
@@ -6542,12 +6794,12 @@ describe("turn research cards", () => {
 			test.skipIf(shape === "symlink" && process.platform !== "linux")(
 				`a ${shape} report on a ${research ? "research" : "plain"} card holds the card`,
 				async () => {
-					const { store, record, projects } = researchStore();
+					const { store, record, projects } = await researchStore();
 					const outside = mkdtempSync(join(tmpdir(), "turn-report-secret-"));
 					dirs.push(outside);
 					const secret = join(outside, "secret");
 					writeFileSync(secret, "top secret");
-					const loop = createTurnLoop(
+					const loop = holdFollowUps(
 						projects,
 						fakeOps(record, {
 							commitsAhead: async () => 0,
@@ -6561,12 +6813,12 @@ describe("turn research cards", () => {
 						}),
 					);
 					const task = research
-						? researchTask(store)
-						: store.createTask("work please");
+						? await researchTask(store)
+						: await store.createTask("work please");
 
 					await loop.runTurn(store.name, task.id);
 
-					const after = store.getTask(task.id)!;
+					const after = (await store.getTask(task.id))!;
 					expect(after.report ?? "").not.toContain("top secret");
 					expect(after.stage).toBe("in_progress");
 					expect(after.state).toBe("needs_you");
@@ -6580,8 +6832,8 @@ describe("turn research cards", () => {
 			);
 
 	test("research turn saves agent-reported shots before the worktree goes", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6595,9 +6847,9 @@ describe("turn research cards", () => {
 						Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
 					);
 				},
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -6614,30 +6866,30 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.shots).toHaveLength(1);
 		expect(after.shots[0]).toMatch(/^\d+\.png$/);
 		// The shot outlives the worktree the research answer was produced in.
-		expect(existsSync(join(store.imagesDir(task.id), after.shots[0]!))).toBe(
-			true,
-		);
+		expect(
+			existsSync(join(await store.imagesDir(task.id), after.shots[0]!)),
+		).toBe(true);
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("research work turn with no outcome settles done from the report file", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						// Exit 0 but the agent never called report_outcome.
@@ -6654,11 +6906,11 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.report).toBe("rep");
@@ -6666,16 +6918,16 @@ describe("turn research cards", () => {
 	});
 
 	test("research work turn answered without a report file asks you", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, { commitsAhead: async () => 0 }),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("research-report.md");
@@ -6683,14 +6935,14 @@ describe("turn research cards", () => {
 	});
 
 	test("research work turn reporting ready is coerced to answered and settles done", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -6713,25 +6965,25 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(store.listTurns(task.id)[0]!.outcome).toBe("answered");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect((await store.listTurns(task.id))[0]!.outcome).toBe("answered");
 	});
 
 	test("unmarking a coerced card: its next ready report settles merging, not done", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				// Hold the chained merge turn; assert the settle instant.
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
 				commitsAhead: async () => 1,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -6750,29 +7002,29 @@ describe("turn research cards", () => {
 				// No research-report.md: the agent did not self-declare again.
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 		// The unmark route's write: the flag clears before the next turn starts.
-		store.updateTask(task.id, { research: false });
+		await store.updateTask(task.id, { research: false });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
-		expect(store.listTurns(task.id)[0]!.outcome).toBe("ready");
+		expect((await store.listTurns(task.id))[0]!.outcome).toBe("ready");
 		expect(after.report).toBeNull();
 	});
 
 	test("a research card's reply turn with landable commits and no report demotes it to work", async () => {
-		const { store, record, projects } = researchStore();
+		const { store, record, projects } = await researchStore();
 		let runs = 0;
 		let commits = 0;
 		let wtPath = "";
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				// Hold the chained merge turn; assert the settle instant.
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
 				commitsAhead: async () => commits,
 				createWorktree: async (o: { worktreePath: string }) => {
 					record.createWorktree.push(o);
@@ -6782,9 +7034,9 @@ describe("turn research cards", () => {
 					if (runs === 0)
 						writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "# findings");
 				},
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					runs += 1;
 					return {
 						pid: 4242,
@@ -6805,16 +7057,17 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = store.createTask("research something");
+		const task = await store.createTask("research something");
 
 		// Turn 1: writing the report file marks the card research; it settles done.
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.research).toBe(true);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.research).toBe(true);
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 
 		// The reply turn commits real work and removes the report file.
 		rmSync(join(wtPath, RESEARCH_REPORT));
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
+			stage: "in_progress",
 			pendingPrompt: "make it a real fix",
 			state: "queued",
 			queuedAt: Date.now(),
@@ -6823,16 +7076,16 @@ describe("turn research cards", () => {
 		commits = 1;
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.research).toBe(false);
-		expect(store.listTurns(task.id)[1]!.outcome).toBe("ready");
+		expect((await store.listTurns(task.id))[1]!.outcome).toBe("ready");
 	});
 
 	test("research work turn with an extra uncommitted file still settles done", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -6848,11 +7101,11 @@ describe("turn research cards", () => {
 				statusFiles: async () => ["research-report.md", "scratch.txt"],
 			}),
 		);
-		const task = researchTask(store);
+		const task = await researchTask(store);
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.uncommittedFiles).toEqual([
@@ -6863,14 +7116,14 @@ describe("turn research cards", () => {
 	});
 
 	test("a plain work task writing the report self-declares research and settles done", async () => {
-		const { store, record, projects } = researchStore();
-		const loop = createTurnLoop(
+		const { store, record, projects } = await researchStore();
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -6893,16 +7146,16 @@ describe("turn research cards", () => {
 				},
 			}),
 		);
-		const task = store.createTask("ordinary work");
+		const task = await store.createTask("ordinary work");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.research).toBe(true);
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.report).toBe("# answer");
-		expect(store.listTurns(task.id)[0]!.outcome).toBe("answered");
+		expect((await store.listTurns(task.id))[0]!.outcome).toBe("answered");
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 });
@@ -6910,9 +7163,9 @@ describe("turn research cards", () => {
 describe("lost-process sweep", () => {
 	/** startRun override whose first run hangs forever on pid 4242: the vanished-process fixture. */
 	function hungRun(record: Recorded, markStarted: () => void) {
-		return (o: Parameters<TurnOps["startRun"]>[0]) => {
+		return async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
-			o.onSession?.("sess-1");
+			await o.onSession?.("sess-1");
 			markStarted();
 			if (record.runs.length > 1)
 				return {
@@ -6938,11 +7191,11 @@ describe("lost-process sweep", () => {
 	}
 
 	test("a swept review settles, requeues, and its held merge lands", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				maxTotalRuns: () => 1,
@@ -6954,9 +7207,9 @@ describe("lost-process sweep", () => {
 				// Run 1 hangs on a dead pid. Run 2 is the review's resume: a review is
 				// read-only, it reports answered. Run 3 is the held merge turn: it lands
 				// and reports integrated (only a merge turn may).
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					if (record.runs.length === 1) {
 						markStarted();
 						return {
@@ -6981,22 +7234,25 @@ describe("lost-process sweep", () => {
 		);
 		// The clipshelf shape: a review hangs on a dead pid while it holds every queued merge
 		// ("waiting for the review to finish").
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER} review origin/main`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "abc123def456" });
-		const merge = store.createTask("merge plz");
-		store.updateTask(merge.id, { stage: "merging", branch: "ott/merge-plz" });
+		await store.updateTask(review.id, { base: "abc123def456" });
+		const merge = await store.createTask("merge plz");
+		await store.updateTask(merge.id, {
+			stage: "merging",
+			branch: "ott/merge-plz",
+		});
 		void loop.runTurn(store.name, review.id);
 		await started; // the turn row exists and the run hangs on pid 4242
 
 		// Tick 1: settle the lost run and requeue the review.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"The agent process (pid 4242) disappeared during this turn - resuming automatically. Cancel to stop it instead.",
@@ -7005,46 +7261,46 @@ describe("lost-process sweep", () => {
 		expect(after.pendingPrompt).toBe(
 			restartResumePrompt({ sha: "abc123def456", clean: true }),
 		);
-		const turn = store.listTurns(review.id)[0]!;
+		const turn = (await store.listTurns(review.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.exitCode).toBeNull();
 		expect(turn.error).toBe("lost agent process (pid 4242)");
 		expect(loop.running.size).toBe(0); // the dead entry no longer holds the cap slot
 
 		// Tick 2: the review runs again and finishes; with it done, the held merge lands.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.getTask(review.id)!.stage).toBe("done");
-		expect(store.getTask(merge.id)!.stage).toBe("done");
+		expect((await store.getTask(review.id))!.stage).toBe("done");
+		expect((await store.getTask(merge.id))!.stage).toBe("done");
 	});
 
 	test("a live pid is left alone", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, { startRun: hungRun(record, markStarted) }),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		void loop.runTurn(store.name, task.id);
 		await started;
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		expect(loop.running.size).toBe(1);
 		expect(record.runs).toHaveLength(1);
 	});
 
 	test("board start sweeps stale turn rows with dead pids", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				// Cap 0: the first tick sweeps (it runs before the cap check) but starts nothing.
@@ -7053,28 +7309,30 @@ describe("lost-process sweep", () => {
 			}),
 		);
 		// A row a crashed predecessor left open: no entry in this loop's `running` map.
-		const task = store.createTask("crashed elsewhere");
-		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		const task = await store.createTask("crashed elsewhere");
+		await store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("lost agent process (pid 4344)");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe("."); // no worktree: the plain continue marker
-		expect(logText(store, task.id)).toContain("lost agent process (pid 4344)");
+		expect(await logText(store, task.id)).toContain(
+			"lost agent process (pid 4344)",
+		);
 		// Cap 0 stopped the same-tick resume: it starts on a later tick.
 		expect(record.runs).toHaveLength(0);
 	});
 
 	test("board start sweeps stale pid-null rows with no live worker entry", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				// Cap 0: the first tick sweeps (it runs before the cap check) but starts nothing.
@@ -7083,23 +7341,23 @@ describe("lost-process sweep", () => {
 			}),
 		);
 		// A worker run a crashed predecessor left open: pid null, no entry in this loop's `running` map.
-		const task = store.createTask("crashed worker");
-		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
-		store.startTurn(task.id, "work", "old prompt", null);
+		const task = await store.createTask("crashed worker");
+		await store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		await store.startTurn(task.id, "work", "old prompt", null);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("lost agent process (worker run)");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"The worker running this turn disappeared - resuming automatically. Cancel to stop it instead.",
 		);
 		expect(after.pendingPrompt).toBe("."); // no worktree: the plain continue marker
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"lost agent process (worker run)",
 		);
 		// Cap 0 stopped the same-tick resume: it starts on a later tick.
@@ -7107,17 +7365,17 @@ describe("lost-process sweep", () => {
 	});
 
 	test("a live worker entry (pid null) is left alone", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				pidAlive: () => true, // nothing for the pid path to catch
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					markStarted();
 					return {
 						pid: null, // worker client: the stream is the liveness proof
@@ -7129,64 +7387,65 @@ describe("lost-process sweep", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		void loop.runTurn(store.name, task.id);
 		await started;
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		expect(loop.running.size).toBe(1);
 		expect(record.runs).toHaveLength(1);
 	});
 
 	test("a cancelled card is settled but not requeued", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				pidAlive: (pid: number) => pid !== 4242,
 				startRun: hungRun(record, markStarted),
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		void loop.runTurn(store.name, task.id);
 		await started;
 		// cancelTask marks the card, then waits out the run before finishing its state move.
-		store.updateTask(task.id, { cancelledAt: Date.now() });
+		await store.updateTask(task.id, { cancelledAt: Date.now() });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("lost agent process (pid 4242)");
 		// Cancel owns the card: settled, but not requeued (cancelTask finishes the state move).
-		expect(store.getTask(task.id)!.state).toBe("running");
-		expect(store.getTask(task.id)!.pendingPrompt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
+		expect((await store.getTask(task.id))!.pendingPrompt).toBeNull();
 		expect(record.runs).toHaveLength(1);
 	});
 
 	test("a late done after the sweep leaves the settled turn alone", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const { promise: gate, resolve: releaseDone } =
 			Promise.withResolvers<RunResult>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0, // keep the finally's schedule() from restarting the card
+				holdFollowUps: true, // keep the finally's schedule() from restarting the card
+				scheduledCap: 0,
 				pidAlive: (pid: number) => pid !== 4242,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					markStarted();
 					return {
 						pid: 4242,
@@ -7198,12 +7457,15 @@ describe("lost-process sweep", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const run = loop.runTurn(store.name, task.id);
 		await started;
-		loop.schedule();
-		await flushPromises();
-		const endedAt = store.listTurns(task.id)[0]!.endedAt;
+		await loop.schedule();
+		await eventually(
+			async () =>
+				((await store.listTurns(task.id))[0]?.endedAt ?? null) !== null,
+		);
+		const endedAt = (await store.listTurns(task.id))[0]!.endedAt;
 		expect(endedAt).not.toBeNull();
 
 		// The hung pipes finally close, after the sweep already settled the row.
@@ -7214,24 +7476,25 @@ describe("lost-process sweep", () => {
 		);
 		await run;
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBe(endedAt); // untouched by the late resolution
 		expect(turn.outcome).toBeNull();
 		expect(turn.error).toBe("lost agent process (pid 4242)");
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 		expect(record.runs).toHaveLength(1);
 		expect(loop.running.size).toBe(0);
 	});
 
 	test("a run that ended is not lost while its settle awaits git", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		let tick = (): void => {};
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				commitsAhead: async () => 0, // answered, no commits: done/idle
-				maxTotalRuns: () => 0, // keep the finally's schedule() from starting anything
+				holdFollowUps: true, // keep the finally's schedule() from starting anything
+				scheduledCap: 0,
 				pidAlive: (pid: number) => pid !== 4242, // omp already exited
 				// Any other card's event can tick the scheduler while the settle awaits git.
 				worktreeHusk: async () => {
@@ -7240,13 +7503,13 @@ describe("lost-process sweep", () => {
 				},
 			}),
 		);
-		tick = () => loop.schedule();
-		const task = store.createTask("work please");
+		tick = async () => await loop.schedule();
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		await flushPromises();
 
-		expect(logText(store, task.id)).not.toContain("lost agent process");
-		const after = store.getTask(task.id);
+		expect(await logText(store, task.id)).not.toContain("lost agent process");
+		const after = await store.getTask(task.id);
 		expect([after?.stage, after?.state]).toEqual(["done", "idle"]);
 		// No resume prompt is left behind to replace the next turn's own prompt (a merge turn got
 		// "Tracker restarted..." instead of its merge prompt and re-reported ready).
@@ -7257,16 +7520,16 @@ describe("lost-process sweep", () => {
 describe("package list", () => {
 	test("a local turn installs the project's packages before omp starts and logs the result", async () => {
 		const order: string[] = [];
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // hold the chained merge turn: one install, one omp
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // hold the chained merge turn: one install, one omp
 			ensurePackages: async (project: string) => {
 				order.push(`install ${project}`);
 				return ["apt: installed libnss3"];
 			},
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				order.push("omp");
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -7276,35 +7539,35 @@ describe("package list", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(order).toEqual([`install ${store.name}`, "omp"]);
-		expect(logText(store, task.id)).toContain("apt: installed libnss3");
+		expect(await logText(store, task.id)).toContain("apt: installed libnss3");
 	});
 
 	test("a work turn sent to a worker leaves the install to that worker; its merge turn installs here", async () => {
 		const asked: string[] = [];
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // each turn runs via a direct runTurn
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // each turn runs via a direct runTurn
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			ensurePackages: async (project: string) => {
 				asked.push(project);
 				return [];
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(asked).toEqual([]);
 		// D6: merge turns stay server-side, so the server needs the packages too.
-		store.updateTask(task.id, { stage: "merging", state: "queued" });
+		await store.updateTask(task.id, { stage: "merging", state: "queued" });
 		await loop.runTurn(store.name, task.id);
 		expect(asked).toEqual([store.name]);
 		expect(record.runs).toHaveLength(2);
 	});
 
 	test("a merge turn whose session model cannot load reruns with the board's default role", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // each turn runs via a direct runTurn
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // each turn runs via a direct runTurn
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:medium" }),
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
@@ -7327,16 +7590,16 @@ describe("package list", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		saveSession(store, "sess-1");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			sessionId: "sess-1",
 			pendingPrompt: "please merge",
 		});
 		await loop.runTurn(store.name, task.id);
-		const mid = store.getTask(task.id)!;
+		const mid = (await store.getTask(task.id))!;
 		expect(mid.state).toBe("queued");
 		expect(mid.pendingPrompt).toBe("please merge"); // the reply never reached the session
 		await loop.runTurn(store.name, task.id);
@@ -7345,24 +7608,24 @@ describe("package list", () => {
 			"anthropic/claude-opus-5-5:medium",
 		]);
 		expect(record.runs[1]!.resumeId).toBe("sess-1");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.stage).toBe("done");
 		expect(after.model).toBeNull(); // the card keeps the default role
 	});
 
 	test("a failed install stops the turn before omp starts and names apt's error", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			ensurePackages: async () => {
 				throw new Error(
 					"apt: apt-get install failed (exit 100): E: Unable to locate package nope",
 				);
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("Unable to locate package nope");
 	});
@@ -7370,20 +7633,20 @@ describe("package list", () => {
 
 describe("prepareTurn", () => {
 	test("a turn logs one env line naming listed-but-valueless names", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			turnEnv: async () => ({ env: {}, missing: ["FOO", "BAR"] }),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"env: no value for FOO, BAR (set it under Settings, Env)",
 		);
 	});
 
 	test("a worker turn whose credential cannot be lent does not start, and the card shows the cause", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			turnEnv: async () => ({
 				env: {},
@@ -7392,10 +7655,13 @@ describe("prepareTurn", () => {
 					"omp did not refresh the board's anthropic sign-in: invalid_grant",
 			}),
 		});
-		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		const task = await store.createTask(
+			"work please",
+			"anthropic/claude-opus-5-5",
+		);
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Sign-in: omp did not refresh the board's anthropic sign-in: invalid_grant. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.",
@@ -7403,12 +7669,12 @@ describe("prepareTurn", () => {
 	});
 
 	test("a local turn passes the env values and a PATH prefixed with the link dir", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			turnEnv: async () => ({ env: { FOO: "v" }, missing: [] }),
 			prepareTurn: async () => ({ lines: [], pathDir: "/tmp/x" }),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		const env = record.runs[0]!.env;
 		expect(env?.FOO).toBe("v");
@@ -7417,8 +7683,8 @@ describe("prepareTurn", () => {
 
 	test("a worker-dispatched turn still gets the env values and the missing line, but no tools prep", async () => {
 		let prepared = false;
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			turnEnv: async () => ({
 				env: { FOO: "v" },
@@ -7430,10 +7696,10 @@ describe("prepareTurn", () => {
 				return { lines: [], pathDir: null };
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(prepared).toBe(false);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"env: no value for BAR (set it under Settings, Env)",
 		);
 		expect(record.runs[0]!.env?.FOO).toBe("v");
@@ -7469,9 +7735,9 @@ describe("prepareTurn", () => {
 	}
 
 	/** A worker loop whose turnEnv is the server's wiring against `dbPath`. */
-	function lendingSetup(dbPath: string, overrides: Partial<TurnOps> = {}) {
-		return setup({
-			maxTotalRuns: () => 0,
+	async function lendingSetup(dbPath: string, overrides: FixtureOps = {}) {
+		return await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			turnEnv: (project, model) =>
 				turnEnv(project, model, {}, { dbPath, home: dirname(dbPath) }),
@@ -7481,25 +7747,25 @@ describe("prepareTurn", () => {
 
 	test("a worker turn runs the card's model as --model and lends its token; a local turn lends none", async () => {
 		const seen: Array<string | null> = [];
-		const worker = setup({
-			maxTotalRuns: () => 0,
+		const worker = await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			turnEnv: async (_project, model) => {
 				seen.push(model);
 				return { env: {}, missing: [] };
 			},
 		});
-		const w = worker.store.createTask("work please", "zai/glm-5.3-flash");
+		const w = await worker.store.createTask("work please", "zai/glm-5.3-flash");
 		await worker.loop.runTurn(worker.store.name, w.id);
 		expect(worker.record.runs[0]!.model).toBe("zai/glm-5.3-flash");
-		const local = setup({
-			maxTotalRuns: () => 0,
+		const local = await setup({
+			holdFollowUps: true,
 			turnEnv: async (_project, model) => {
 				seen.push(model);
 				return { env: {}, missing: [] };
 			},
 		});
-		const l = local.store.createTask("work please", "zai/glm-5.3-flash");
+		const l = await local.store.createTask("work please", "zai/glm-5.3-flash");
 		await local.loop.runTurn(local.store.name, l.id);
 		// A local run uses the board store itself: no model to lend for.
 		expect(seen).toEqual(["zai/glm-5.3-flash", null]);
@@ -7513,13 +7779,13 @@ describe("prepareTurn", () => {
 			anthropic: "access-board",
 			zai: "zai-board",
 		});
-		const { store, record, loop } = lendingSetup(dbPath, {
+		const { store, record, loop } = await lendingSetup(dbPath, {
 			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:high" }),
 		});
 		// No card model, and an empty one: both resolve to the board's default role.
-		const none = store.createTask("work please");
+		const none = await store.createTask("work please");
 		await loop.runTurn(store.name, none.id);
-		const empty = store.createTask("work please", "  ");
+		const empty = await store.createTask("work please", "  ");
 		await loop.runTurn(store.name, empty.id);
 		expect(record.runs.map((r) => [r.model, r.env])).toEqual([
 			[
@@ -7538,27 +7804,30 @@ describe("prepareTurn", () => {
 			anthropic: "access-board",
 			zai: "zai-board",
 		});
-		const { store, record, loop } = lendingSetup(dbPath, {
+		const { store, record, loop } = await lendingSetup(dbPath, {
 			modelRoles: () => ({ default: "anthropic/claude-opus-5-5" }),
 		});
 		/** A card whose saved session ran zai, with a pending reply. */
-		const resumable = (sid: string) => {
-			const task = store.createTask("work please", "zai/glm-5.3-flash");
+		const resumable = async (sid: string) => {
+			const task = await store.createTask("work please", "zai/glm-5.3-flash");
 			mkdirSync(store.sessionsDir, { recursive: true });
 			writeFileSync(
 				join(store.sessionsDir, `1_${sid}.jsonl`),
 				`${JSON.stringify({ type: "model_change", model: "zai/glm-5.3-flash" })}\n`,
 			);
-			store.updateTask(task.id, { sessionId: sid, pendingPrompt: "go on" });
+			await store.updateTask(task.id, {
+				sessionId: sid,
+				pendingPrompt: "go on",
+			});
 			return task;
 		};
 		// The card's model is cleared: the session's model wins over the default role.
-		const cleared = resumable("s-cleared");
-		store.updateTask(cleared.id, { model: null });
+		const cleared = await resumable("s-cleared");
+		await store.updateTask(cleared.id, { model: null });
 		await loop.runTurn(store.name, cleared.id);
 		// The card switched to another model: the card wins, and omp switches with --model.
-		const switched = resumable("s-switched");
-		store.updateTask(switched.id, { model: "anthropic/claude-opus-5-5" });
+		const switched = await resumable("s-switched");
+		await store.updateTask(switched.id, { model: "anthropic/claude-opus-5-5" });
 		await loop.runTurn(store.name, switched.id);
 		expect(record.runs.map((r) => [r.resumeId, r.model, r.env])).toEqual([
 			["s-cleared", "zai/glm-5.3-flash", { ZAI_API_KEY: "zai-board" }],
@@ -7571,13 +7840,13 @@ describe("prepareTurn", () => {
 	});
 
 	test("a worker turn with no model anywhere does not start, and the card shows the cause", async () => {
-		const { store, record, loop } = lendingSetup(boardStore({}), {
+		const { store, record, loop } = await lendingSetup(boardStore({}), {
 			modelRoles: () => ({ smol: "zai/glm-5.3-flash" }),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
@@ -7585,11 +7854,14 @@ describe("prepareTurn", () => {
 	});
 
 	test("a worker turn whose provider has no board sign-in does not start, and the card shows the cause", async () => {
-		const { store, record, loop } = lendingSetup(boardStore({}));
-		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		const { store, record, loop } = await lendingSetup(boardStore({}));
+		const task = await store.createTask(
+			"work please",
+			"anthropic/claude-opus-5-5",
+		);
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Sign-in: the board has no anthropic sign-in. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.",
@@ -7597,11 +7869,11 @@ describe("prepareTurn", () => {
 	});
 
 	test("a stored model that names no provider parks naming the model and the switch", async () => {
-		const { store, record, loop } = lendingSetup(boardStore({}));
-		const task = store.createTask("work please", "sonic");
+		const { store, record, loop } = await lendingSetup(boardStore({}));
+		const task = await store.createTask("work please", "sonic");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Model: sonic names no provider (expected provider/model). The turn did not start. Switch the model on the card (provider/model), then reply to retry.",
@@ -7609,22 +7881,25 @@ describe("prepareTurn", () => {
 	});
 
 	test("an empty credential error still stops the worker turn", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			turnEnv: async () => ({ env: {}, missing: [], credentialError: "" }),
 		});
-		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		const task = await store.createTask(
+			"work please",
+			"anthropic/claude-opus-5-5",
+		);
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)!.needsReason).toBe(
+		expect((await store.getTask(task.id))!.needsReason).toBe(
 			"Sign-in: the board cannot lend a credential. The turn did not start. Sign in again under Settings, Provider sign-in, then reply to retry.",
 		);
 	});
 
 	test("a busy board store stops the turn with a retry reason, not a sign-in prompt", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			turnEnv: async () => ({
 				env: {},
@@ -7634,39 +7909,42 @@ describe("prepareTurn", () => {
 				busy: true,
 			}),
 		});
-		const task = store.createTask("work please", "anthropic/claude-opus-5-5");
+		const task = await store.createTask(
+			"work please",
+			"anthropic/claude-opus-5-5",
+		);
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)!.needsReason).toBe(
+		expect((await store.getTask(task.id))!.needsReason).toBe(
 			"Sign-in: the board store /agent/agent.db is busy (a write did not end within 5 s). The turn did not start. Reply to retry; do not sign in again.",
 		);
 	});
 
 	test("a worker-dispatched turn never calls prepareTurn", async () => {
 		let called = false;
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			prepareTurn: async () => {
 				called = true;
 				return { lines: [], pathDir: null };
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(called).toBe(false);
 	});
 
 	test("a prepareTurn rejection stops the turn before omp starts", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			prepareTurn: async () => {
 				throw new Error("tools: download failed");
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("tools: download failed");
 	});
@@ -7688,14 +7966,15 @@ describe("turn ownership, cap and settle regressions", () => {
 	}
 
 	test("sweep leaves a turn its runTurn still owns (slow post-run git)", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const huskReached = Promise.withResolvers<void>();
 		let releaseHusk: (() => void) | null = null;
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
+				scheduledCap: 0,
 				commitsAhead: async () => 0,
 				pidAlive: () => false, // omp already exited; only runTurn's settle remains
 				worktreeHusk: async () => {
@@ -7706,50 +7985,47 @@ describe("turn ownership, cap and settle regressions", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const run = loop.runTurn(store.name, task.id);
 		await huskReached.promise; // past running.delete, still before the settle writes
 
 		// The tick fires while runTurn is between `running.delete` and its settle writes.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		// The preparing claim owns the row: no lost-settle, no requeue under the live run.
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(logText(store, task.id)).not.toContain("lost agent process");
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect(await logText(store, task.id)).not.toContain("lost agent process");
+		expect((await store.getTask(task.id))!.state).toBe("running");
 
 		releaseHusk!();
 		await run;
 
 		// runTurn settles exactly once, with no phantom requeue from a sweep write.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.pendingPrompt).toBeNull();
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBeNull();
 	});
 
 	test("sweep leaves a worker turn whose pid getter filled in after startTurn", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		let pid: number | null = null;
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				pidAlive: () => true,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					markStarted();
 					// A handle that learns its pid only after startTurn.
-					queueMicrotask(() => {
-						pid = 4242;
-					});
 					return {
 						get pid() {
 							return pid;
@@ -7760,29 +8036,31 @@ describe("turn ownership, cap and settle regressions", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		void loop.runTurn(store.name, task.id);
 		await started;
+		await eventually(async () => (await store.listTurns(task.id)).length === 1);
+		pid = 4242;
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		// The row's pid is null but the live entry owns the turn: no lost-settle.
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.listTurns(task.id)[0]!.pid).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
-		expect(logText(store, task.id)).not.toContain("lost agent process");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.pid).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
+		expect(await logText(store, task.id)).not.toContain("lost agent process");
 	});
 
 	test("cancel during prepare keeps the card: no run starts", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				// cancelTask's kept path answers during the prepare awaits and owns the card.
 				ensurePackages: async () => {
-					store.updateTask(task.id, {
+					await store.updateTask(task.id, {
 						cancelledAt: null,
 						state: "needs_you",
 						needsReason: keptReason("M f.ts"),
@@ -7791,24 +8069,24 @@ describe("turn ownership, cap and settle regressions", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		// An existing worktree: the prepare window is resolveTarget + ensurePackages.
-		store.updateTask(task.id, { worktree: "wt-x", branch: "ott/x" });
+		await store.updateTask(task.id, { worktree: "wt-x", branch: "ott/x" });
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(keptReason("M f.ts"));
-		expect(store.listTurns(task.id)).toHaveLength(0);
+		expect(await store.listTurns(task.id)).toHaveLength(0);
 	});
 
 	test("cancel during settle cannot write over the kept card", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const gate = Promise.withResolvers<void>();
 		const reached = Promise.withResolvers<void>();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				commitsAhead: async () => 0,
@@ -7819,11 +8097,11 @@ describe("turn ownership, cap and settle regressions", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { worktree: "wt-x", branch: "ott/x" });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { worktree: "wt-x", branch: "ott/x" });
 		const run = loop.runTurn(store.name, task.id);
 		await reached.promise; // settle-phase git in flight
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			cancelledAt: null,
 			state: "needs_you",
 			needsReason: keptReason("M f.ts"),
@@ -7831,18 +8109,18 @@ describe("turn ownership, cap and settle regressions", () => {
 		gate.resolve();
 		await run;
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(keptReason("M f.ts"));
-		expect(store.listTurns(task.id)[0]!.error).toBe("cancelled");
+		expect((await store.listTurns(task.id))[0]!.error).toBe("cancelled");
 	});
 
 	test("the global cap counts each live run once and holds within the tick", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			maxTotalRuns: () => 2,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.withResolvers<RunResult>().promise,
@@ -7850,20 +8128,20 @@ describe("turn ownership, cap and settle regressions", () => {
 				};
 			},
 		});
-		store.setSettings({ maxParallel: 4 });
-		for (let i = 0; i < 4; i++) store.createTask(`task ${i}`);
-		loop.schedule();
+		await store.setSettings({ maxParallel: 4 });
+		for (let i = 0; i < 4; i++) await store.createTask(`task ${i}`);
+		await loop.schedule();
 		await flushPromises();
 		// A live run used to sit in both `running` and `preparing` and the tick started all 4.
 		expect(record.runs).toHaveLength(2);
 	});
 
 	test("a cap with headroom starts a new run on the same tick", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			maxTotalRuns: () => 3,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.withResolvers<RunResult>().promise,
@@ -7871,35 +8149,35 @@ describe("turn ownership, cap and settle regressions", () => {
 				};
 			},
 		});
-		store.setSettings({ maxParallel: 4 });
-		const t1 = store.createTask("one");
-		const t2 = store.createTask("two");
-		const t3 = store.createTask("three");
+		await store.setSettings({ maxParallel: 4 });
+		const t1 = await store.createTask("one");
+		const t2 = await store.createTask("two");
+		const t3 = await store.createTask("three");
 		void loop.runTurn(store.name, t1.id);
 		void loop.runTurn(store.name, t2.id);
 		await flushPromises(); // both runs reach `running` (4 counted by the old sum)
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(3);
 		expect(record.runs[2]!.prompt).toContain("three");
-		expect(store.getTask(t3.id)!.state).not.toBe("queued");
+		expect((await store.getTask(t3.id))!.state).not.toBe("queued");
 	});
 
 	test("a full cap still refreshes every project flag", async () => {
-		const { store, record, projects, loop } = setup({
+		const { store, record, projects, loop } = await setup({
 			maxTotalRuns: () => 0,
 			isClean: async () => false,
 		});
 		const e = projects.get(store.name)!;
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(e.dirty).toBe(true);
 		expect(record.runs).toHaveLength(0);
 	});
 
 	test("a store whose listTasks throws does not stop the other projects' schedule", async () => {
-		const good = freshStore();
-		const sick = freshStore();
+		const good = await freshStore();
+		const sick = await freshStore();
 		const record = baseRecord();
 		const seen: string[] = [];
 		const origError = console.error;
@@ -7907,7 +8185,7 @@ describe("turn ownership, cap and settle regressions", () => {
 			seen.push(`${String(first)} ${String(second)}`);
 		};
 		try {
-			const loop = createTurnLoop(
+			const loop = holdFollowUps(
 				new Map([
 					[sick.name, { ...fakeProject(sick), store: sickStore(sick) }],
 					[good.name, fakeProject(good)],
@@ -7916,9 +8194,9 @@ describe("turn ownership, cap and settle regressions", () => {
 					// Held launch: a resolved run requeues the card (merging) and the loop's
 					// end-of-turn schedule() would legitimately start its merge turn, so the
 					// run count would depend on how far the microtasks drain.
-					startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+					startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 						record.runs.push(o);
-						o.onSession?.("sess-1");
+						await o.onSession?.("sess-1");
 						return {
 							pid: 4242,
 							done: new Promise<RunResult>(() => {}),
@@ -7927,8 +8205,8 @@ describe("turn ownership, cap and settle regressions", () => {
 					},
 				}),
 			);
-			good.createTask("work please");
-			expect(() => loop.schedule()).not.toThrow();
+			await good.createTask("work please");
+			await expect(loop.schedule()).resolves.toBeUndefined();
 			await flushPromises();
 			expect(record.runs).toHaveLength(1);
 			expect(record.runs[0]!.board!.project).toBe(good.name);
@@ -7940,28 +8218,28 @@ describe("turn ownership, cap and settle regressions", () => {
 	});
 
 	test("the ui-shot guard counts the card's earlier screenshots", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			changedFiles: async () => ["src/ui/app.tsx"],
 			// Assert the settle instant: the requeued merge turn is real but must not
 			// start inside this await and flip the card to preparing.
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		// An earlier turn on this card attached a shot; changedFiles is the cumulative diff.
-		store.updateTask(task.id, { shots: ["a.png"] });
+		await store.updateTask(task.id, { shots: ["a.png"] });
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBeNull();
-		expect(logText(store, task.id)).not.toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).not.toContain(UI_SHOT_WARNING);
 	});
 
 	test("a pending reply reaches a fresh release session and its turn input", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("release v1.0.0");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("release v1.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			releaseVersion: "v1.0.0",
@@ -7977,13 +8255,13 @@ describe("turn ownership, cap and settle regressions", () => {
 		// The raw release prompt must carry the lost-session note and the reply.
 		expect(record.runs[0]!.prompt).toContain(LOST_SESSION);
 		expect(record.runs[0]!.prompt).toContain("skip X");
-		expect(store.listTurns(task.id)[0]!.input).toBe("skip X");
+		expect((await store.listTurns(task.id))[0]!.input).toBe("skip X");
 	});
 
 	test("a pending reply reaches a fresh merge session and its turn input", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
@@ -7994,13 +8272,15 @@ describe("turn ownership, cap and settle regressions", () => {
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs[0]!.prompt).toContain("also bump the chart");
-		expect(store.listTurns(task.id)[0]!.input).toBe("also bump the chart");
+		expect((await store.listTurns(task.id))[0]!.input).toBe(
+			"also bump the chart",
+		);
 	});
 
 	test("the delivered input keeps the park's authorship: supervisor parks vs user steers", async () => {
-		const { store, loop } = setup();
-		const held = store.createTask("merge please");
-		store.updateTask(held.id, {
+		const { store, loop } = await setup();
+		const held = await store.createTask("merge please");
+		await store.updateTask(held.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
@@ -8010,10 +8290,10 @@ describe("turn ownership, cap and settle regressions", () => {
 			pendingBy: "supervisor",
 		});
 		await loop.runTurn(store.name, held.id);
-		expect(store.listTurns(held.id)[0]!.inputBy).toBe("supervisor");
+		expect((await store.listTurns(held.id))[0]!.inputBy).toBe("supervisor");
 
-		const steered = store.createTask("merge please two");
-		store.updateTask(steered.id, {
+		const steered = await store.createTask("merge please two");
+		await store.updateTask(steered.id, {
 			stage: "merging",
 			branch: "ott/y",
 			base: "sha0",
@@ -8023,24 +8303,24 @@ describe("turn ownership, cap and settle regressions", () => {
 			pendingBy: "user",
 		});
 		await loop.runTurn(store.name, steered.id);
-		expect(store.listTurns(steered.id)[0]!.inputBy).toBe("user");
+		expect((await store.listTurns(steered.id))[0]!.inputBy).toBe("user");
 	});
 
 	test("a pending reply reaches a fresh interview session", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask(
+		const { store, record, loop } = await setup();
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}demo`,
 			null,
 			"interview",
 		);
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			sessionId: "s1",
 			pendingPrompt: "answer part two",
 		});
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs[0]!.prompt).toContain("answer part two");
-		expect(store.listTurns(task.id)[0]!.input).toBe("answer part two");
+		expect((await store.listTurns(task.id))[0]!.input).toBe("answer part two");
 	});
 
 	test("kept reasons recognize both the delete keep and the cancel keep", () => {
@@ -8052,9 +8332,9 @@ describe("turn ownership, cap and settle regressions", () => {
 	});
 
 	test("recoverRestarted settles open rows and requeues through the restart route", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				maxTotalRuns: () => 0,
@@ -8064,20 +8344,20 @@ describe("turn ownership, cap and settle regressions", () => {
 					ref === "HEAD" ? "abc123def" : null,
 			}),
 		);
-		const task = store.createTask("interrupted");
-		store.updateTask(task.id, {
+		const task = await store.createTask("interrupted");
+		await store.updateTask(task.id, {
 			state: "running",
 			sessionId: "sess-9",
 			worktree: "wt-x",
 			branch: "ott/x",
 		});
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 		await loop.recoverRestarted();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
@@ -8090,9 +8370,9 @@ describe("turn ownership, cap and settle regressions", () => {
 
 	test("recoverRestarted leaves a card whose agent pid survived the restart running", async () => {
 		let shaCalls = 0;
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				// pid 4344 is the predecessor's agent and it outlived the tracker restart.
@@ -8103,28 +8383,28 @@ describe("turn ownership, cap and settle regressions", () => {
 				},
 			}),
 		);
-		const task = store.createTask("agent outlived the tracker");
-		store.updateTask(task.id, {
+		const task = await store.createTask("agent outlived the tracker");
+		await store.updateTask(task.id, {
 			state: "running",
 			sessionId: "sess-9",
 			worktree: "wt-x",
 			branch: "ott/x",
 		});
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 		await loop.recoverRestarted();
 
 		// The live pid owns the worktree: no settle, no requeue, no second startRun.
 		// sweepLostTurns settles and requeues the card once the pid dies.
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBeNull();
 		expect(turn.error).toBeNull();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("running");
 		expect(after.needsReason).toBeNull();
 		expect(after.pendingPrompt).toBeNull();
 		expect(record.runs).toHaveLength(0);
 		expect(shaCalls).toBe(0);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"agent pid 4344 survived the tracker restart; leaving the card running",
 		);
 	});
@@ -8134,19 +8414,19 @@ describe("turn ownership, cap and settle regressions", () => {
 			const ship = jest.fn(async () => {
 				throw new Error("restart recovery must not ship or rebase");
 			});
-			const { store, projects, record, loop } = setup({
+			const { store, projects, record, loop } = await setup({
 				pushBranch: ship,
 				openPr: ship,
 				serverMergePush: ship,
 				rebaseTargetBranch: ship,
 			});
-			store.setSettings({
+			await store.setSettings({
 				prMode: true,
 				originUrl: "https://github.com/acme/repo.git",
 			});
 			projects.get(store.name)!.github = "https://github.com/acme/repo.git";
-			const task = store.createTask("stranded PR-mode merge");
-			store.updateTask(task.id, {
+			const task = await store.createTask("stranded PR-mode merge");
+			await store.updateTask(task.id, {
 				stage: "merging",
 				state: "idle",
 				branch: metadata === "saved" ? "ott/stranded" : null,
@@ -8161,7 +8441,7 @@ describe("turn ownership, cap and settle regressions", () => {
 				keptFiles: metadata === "saved" ? ["notes.txt", "src/fix.ts"] : [],
 				needsReason: metadata === "saved" ? keptReason("M notes.txt") : null,
 			});
-			const before = store.getTask(task.id)!;
+			const before = (await store.getTask(task.id))!;
 			if (before.worktree) {
 				mkdirSync(before.worktree, { recursive: true });
 				writeFileSync(join(before.worktree, "notes.txt"), "retained work");
@@ -8169,7 +8449,7 @@ describe("turn ownership, cap and settle regressions", () => {
 
 			await loop.recoverRestarted();
 
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("needs_you");
 			expect(after.needsReason).toMatch(/no (?:PR|pull request).*recorded/i);
 			expect(after.needsReason).toMatch(/reply.*retry.*merge/i);
@@ -8187,8 +8467,8 @@ describe("turn ownership, cap and settle regressions", () => {
 
 			await loop.recoverRestarted();
 
-			expect(store.getTask(task.id)).toEqual(after);
-			expect(store.listTurns(task.id)).toHaveLength(0);
+			expect(await store.getTask(task.id)).toEqual(after);
+			expect(await store.listTurns(task.id)).toHaveLength(0);
 			expect(record.runs).toHaveLength(0);
 			expect(record.createWorktree).toHaveLength(0);
 			expect(record.removeWorktree).toHaveLength(0);
@@ -8251,19 +8531,19 @@ describe("turn ownership, cap and settle regressions", () => {
 			const ship = jest.fn(async () => {
 				throw new Error("restart recovery must not ship or rebase");
 			});
-			const { store, projects, record, loop } = setup({
+			const { store, projects, record, loop } = await setup({
 				pushBranch: ship,
 				openPr: ship,
 				serverMergePush: ship,
 				rebaseTargetBranch: ship,
 			});
-			store.setSettings({
+			await store.setSettings({
 				prMode: boundary.prMode,
 				originUrl: "https://github.com/acme/repo.git",
 			});
 			projects.get(store.name)!.github = "https://github.com/acme/repo.git";
-			const task = store.createTask(boundary.name);
-			store.updateTask(task.id, {
+			const task = await store.createTask(boundary.name);
+			await store.updateTask(task.id, {
 				stage: boundary.stage,
 				state: boundary.state,
 				cancelledAt: boundary.cancelledAt,
@@ -8281,15 +8561,15 @@ describe("turn ownership, cap and settle regressions", () => {
 				needsReason: "preserve this reason",
 			});
 			if (boundary.state === "running" || boundary.state === "preparing")
-				store.startTurn(task.id, "merge", "live merge prompt", 4344);
-			const before = store.getTask(task.id)!;
-			const turns = store.listTurns(task.id);
+				await store.startTurn(task.id, "merge", "live merge prompt", 4344);
+			const before = (await store.getTask(task.id))!;
+			const turns = await store.listTurns(task.id);
 
 			await loop.recoverRestarted();
 			await loop.recoverRestarted();
 
-			expect(store.getTask(task.id)).toEqual(before);
-			expect(store.listTurns(task.id)).toEqual(turns);
+			expect(await store.getTask(task.id)).toEqual(before);
+			expect(await store.listTurns(task.id)).toEqual(turns);
 			expect(record.runs).toHaveLength(0);
 			expect(record.createWorktree).toHaveLength(0);
 			expect(record.removeWorktree).toHaveLength(0);
@@ -8300,36 +8580,36 @@ describe("turn ownership, cap and settle regressions", () => {
 	}
 
 	test("recoverRestarted ends a cancelled card idle and never requeues it", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, { maxTotalRuns: () => 0 }),
 		);
-		const task = store.createTask("cancelling");
-		store.updateTask(task.id, {
+		const task = await store.createTask("cancelling");
+		await store.updateTask(task.id, {
 			state: "running",
 			sessionId: "sess-9",
 			cancelledAt: Date.now(),
 			pendingPrompt: "manual note",
 		});
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 		await loop.recoverRestarted();
 
 		// The row is settled, the dead cancel is finished: idle (hidden, no longer counted as
 		// active by project remove), no requeue, no pendingPrompt write.
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		expect(after.pendingPrompt).toBe("manual note");
 	});
 
 	test("recoverRestarted keeps a pending reply over the restart resume prompt", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				maxTotalRuns: () => 0,
@@ -8339,18 +8619,18 @@ describe("turn ownership, cap and settle regressions", () => {
 					ref === "HEAD" ? "abc123def" : null,
 			}),
 		);
-		const task = store.createTask("interrupted with a reply");
-		store.updateTask(task.id, {
+		const task = await store.createTask("interrupted with a reply");
+		await store.updateTask(task.id, {
 			state: "running",
 			sessionId: "sess-9",
 			worktree: "wt-x",
 			branch: "ott/x",
 			pendingPrompt: "typed reply",
 		});
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
@@ -8359,7 +8639,7 @@ describe("turn ownership, cap and settle regressions", () => {
 	});
 
 	test("a restart re-sends a merge turn's prompt its session never saved", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// The crashed predecessor's agent pid died with it.
 			pidAlive: (pid: number) => pid !== 4344,
 			targetSha: async (_p: string, ref: string) =>
@@ -8367,8 +8647,8 @@ describe("turn ownership, cap and settle regressions", () => {
 		});
 		// The session file exists (the first turn saved it) but the merge prompt never reached it.
 		saveSession(store, "sess-9");
-		const task = store.createTask("merge work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge work");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "merging",
 			branch: "ott/x",
@@ -8376,7 +8656,7 @@ describe("turn ownership, cap and settle regressions", () => {
 			worktree: "wt-x",
 			sessionId: "sess-9",
 		});
-		store.startTurn(
+		await store.startTurn(
 			task.id,
 			"merge",
 			mergePrompt({ branch: "ott/x", target: "main" }),
@@ -8384,7 +8664,7 @@ describe("turn ownership, cap and settle regressions", () => {
 		);
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toContain("Your turn to integrate");
 		expect(after.pendingPrompt).toContain(
 			restartResumePrompt({ sha: "abc123def", clean: true }),
@@ -8396,22 +8676,22 @@ describe("turn ownership, cap and settle regressions", () => {
 	});
 
 	test("a restart re-sends an interrupted reply turn's text its session never saved", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// The crashed predecessor's agent pid died with it.
 			pidAlive: (pid: number) => pid !== 4344,
 			targetSha: async (_p: string, ref: string) =>
 				ref === "HEAD" ? "abc123def" : null,
 		});
 		saveSession(store, "sess-9");
-		const task = store.createTask("work then reply");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work then reply");
+		await store.updateTask(task.id, {
 			state: "running",
 			branch: "ott/x",
 			base: "sha0",
 			worktree: "wt-x",
 			sessionId: "sess-9",
 		});
-		store.startTurn(
+		await store.startTurn(
 			task.id,
 			"work",
 			replyPrompt({ text: "please also bump the chart", kind: "work" }),
@@ -8419,7 +8699,7 @@ describe("turn ownership, cap and settle regressions", () => {
 		);
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toContain("please also bump the chart");
 		expect(after.pendingPrompt).toContain("Tracker restarted.");
 
@@ -8428,14 +8708,14 @@ describe("turn ownership, cap and settle regressions", () => {
 	});
 
 	test("a restart keeps the note alone when the session already holds the interrupted prompt", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			// The crashed predecessor's agent pid died with it.
 			pidAlive: (pid: number) => pid !== 4344,
 			targetSha: async (_p: string, ref: string) =>
 				ref === "HEAD" ? "abc123def" : null,
 		});
-		const task = store.createTask("merge work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge work");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "merging",
 			branch: "ott/x",
@@ -8444,7 +8724,7 @@ describe("turn ownership, cap and settle regressions", () => {
 			sessionId: "sess-9",
 		});
 		const merge = mergePrompt({ branch: "ott/x", target: "main" });
-		store.startTurn(task.id, "merge", merge, 4344);
+		await store.startTurn(task.id, "merge", merge, 4344);
 		mkdirSync(store.sessionsDir, { recursive: true });
 		writeFileSync(
 			join(store.sessionsDir, `1_sess-9.jsonl`),
@@ -8452,57 +8732,57 @@ describe("turn ownership, cap and settle regressions", () => {
 		);
 		await loop.recoverRestarted();
 
-		expect(store.getTask(task.id)!.pendingPrompt).toBe(
+		expect((await store.getTask(task.id))!.pendingPrompt).toBe(
 			restartResumePrompt({ sha: "abc123def", clean: true }),
 		);
 	});
 
 	test("recoverRestarted requeues a preparing card with no turn row", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, { maxTotalRuns: () => 0 }),
 		);
-		const task = store.createTask("crashed in preparation");
-		store.updateTask(task.id, { state: "preparing" });
+		const task = await store.createTask("crashed in preparation");
+		await store.updateTask(task.id, { state: "preparing" });
 		await loop.recoverRestarted();
 
 		// No row existed, so nothing was finished; the card is requeued with the restart reason.
-		expect(store.listTurns(task.id)).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		expect(await store.listTurns(task.id)).toHaveLength(0);
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
 		);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"tracker restarted; requeueing the card",
 		);
 
 		// Cancellation invariant: a cancel that died with the tracker ends idle, never requeued.
-		const cancelled = store.createTask("cancelled in preparation");
-		store.updateTask(cancelled.id, {
+		const cancelled = await store.createTask("cancelled in preparation");
+		await store.updateTask(cancelled.id, {
 			state: "preparing",
 			cancelledAt: Date.now(),
 			pendingPrompt: "manual note",
 		});
 		await loop.recoverRestarted();
-		const cAfter = store.getTask(cancelled.id)!;
+		const cAfter = (await store.getTask(cancelled.id))!;
 		expect(cAfter.state).toBe("idle");
 		expect(cAfter.pendingPrompt).toBe("manual note");
 	});
 
 	test("recoverRestarted requeues a later preparation whose last row is already ended", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, { maxTotalRuns: () => 0 }),
 		);
-		const task = store.createTask("crashed after a finished turn");
-		store.updateTask(task.id, { state: "preparing" });
-		store.startTurn(task.id, "work", "old prompt", 4344);
-		store.finishTurn(store.listTurns(task.id)[0]!.id, {
+		const task = await store.createTask("crashed after a finished turn");
+		await store.updateTask(task.id, { state: "preparing" });
+		await store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.finishTurn((await store.listTurns(task.id))[0]!.id, {
 			endedAt: 12345,
 			exitCode: 0,
 			error: null,
@@ -8510,10 +8790,10 @@ describe("turn ownership, cap and settle regressions", () => {
 		await loop.recoverRestarted();
 
 		// The ended row is not settled twice: its original end stays untouched.
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBe(12345);
 		expect(turn.error).toBeNull();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
@@ -8521,33 +8801,33 @@ describe("turn ownership, cap and settle regressions", () => {
 		expect(after.pendingPrompt).toBe(".");
 
 		// Cancellation invariant: a cancelled card with an ended row ends idle, its row untouched.
-		const cancelled = store.createTask("cancelled after a finished turn");
-		store.updateTask(cancelled.id, {
+		const cancelled = await store.createTask("cancelled after a finished turn");
+		await store.updateTask(cancelled.id, {
 			state: "preparing",
 			cancelledAt: Date.now(),
 			pendingPrompt: "manual note",
 		});
-		store.startTurn(cancelled.id, "work", "old prompt", 4345);
-		store.finishTurn(store.listTurns(cancelled.id)[0]!.id, {
+		await store.startTurn(cancelled.id, "work", "old prompt", 4345);
+		await store.finishTurn((await store.listTurns(cancelled.id))[0]!.id, {
 			endedAt: 12346,
 			exitCode: 0,
 			error: null,
 		});
 		await loop.recoverRestarted();
-		const cAfter = store.getTask(cancelled.id)!;
+		const cAfter = (await store.getTask(cancelled.id))!;
 		expect(cAfter.state).toBe("idle");
 		expect(cAfter.pendingPrompt).toBe("manual note");
-		expect(store.listTurns(cancelled.id)).toHaveLength(1);
+		expect(await store.listTurns(cancelled.id)).toHaveLength(1);
 	});
 });
 describe("turn cancel, finish-kept and restart recovery", () => {
 	/** Seeds a card with a live-looking worktree and returns it. */
-	function seed(
+	async function seed(
 		store: ProjectStore,
 		patch: Record<string, unknown> = {},
-	): ReturnType<ProjectStore["createTask"]> {
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+	): Promise<Task> {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "in_progress",
 			worktree: join(store.worktreesDir, task.id),
@@ -8560,18 +8840,18 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	}
 
 	test("cancel keeps a dirty worktree as needs_you with the kept reason", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			unsavedWork: async () => "uncommitted changes to foo.txt",
 			statusFiles: async () => ["foo.txt"],
 		});
-		const task = seed(store);
+		const task = await seed(store);
 		const e = fakeProject(store);
 
 		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
 			kept: "uncommitted changes to foo.txt",
 		});
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason?.startsWith("Cancel kept the worktree: ")).toBe(
 			true,
@@ -8579,12 +8859,14 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(after.keptFiles).toEqual(["foo.txt"]);
 		expect(after.cancelledAt).toBeNull();
 		expect(record.removeWorktree).toHaveLength(0);
-		expect(logText(store, task.id)).toContain("! cancel kept the worktree:");
+		expect(await logText(store, task.id)).toContain(
+			"! cancel kept the worktree:",
+		);
 	});
 
 	test("cancel kills the run and removes a clean worktree", async () => {
-		const { store, record, loop } = setup();
-		const task = seed(store);
+		const { store, record, loop } = await setup();
+		const task = await seed(store);
 		loop.running.set(`${store.name}/${task.id}`, {
 			pid: 4242,
 			done: Promise.resolve(),
@@ -8601,17 +8883,20 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 		expect(record.killed).toBe(true);
 		expect(record.removeWorktree).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		expect(after.cancelledAt).not.toBeNull();
 	});
 
 	test("stop kills the run, keeps the session and parks the card at needs_you", async () => {
 		const { promise, resolve } = Promise.withResolvers<RunResult>();
-		const { store, record, loop } = setup({
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: promise,
@@ -8622,7 +8907,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const run = loop.runTurn(store.name, task.id);
 		for (
 			let i = 0;
@@ -8639,9 +8924,9 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 		expect(record.killed).toBe(true);
 		expect(record.removeWorktree).toHaveLength(0);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe("stopped");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("Turn stopped.");
 		expect(after.cancelledAt).toBeNull();
@@ -8650,8 +8935,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	});
 
 	test("stop without a live run is a 409, unknown task a 404", async () => {
-		const { store, loop } = setup();
-		const task = seed(store);
+		const { store, loop } = await setup();
+		const task = await seed(store);
 		await expect(loop.stopTurn(fakeProject(store), task.id)).resolves.toEqual({
 			error: "no turn is running",
 			status: 409,
@@ -8662,8 +8947,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	});
 
 	test("stop on a cancelled task is a 409", async () => {
-		const { store, loop } = setup();
-		const task = seed(store, { cancelledAt: Date.now() });
+		const { store, loop } = await setup();
+		const task = await seed(store, { cancelledAt: Date.now() });
 		loop.running.set(`${store.name}/${task.id}`, {
 			pid: 4242,
 			done: Promise.resolve(),
@@ -8677,13 +8962,13 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 	test("a forced cancel deletes a dirty worktree anyway", async () => {
 		let unsavedCalls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			unsavedWork: async () => {
 				unsavedCalls += 1;
 				return "uncommitted changes";
 			},
 		});
-		const task = seed(store);
+		const task = await seed(store);
 
 		await expect(
 			loop.cancel(fakeProject(store), task.id, true),
@@ -8692,19 +8977,19 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		});
 
 		expect(unsavedCalls).toBe(0);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 	});
 
 	test("a husk worktree has nothing to keep", async () => {
 		let unsavedCalls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			unsavedWork: async () => {
 				unsavedCalls += 1;
 				return "uncommitted changes";
 			},
 		});
-		const task = seed(store);
+		const task = await seed(store);
 
 		await expect(
 			loop.cancel(fakeProject(store), task.id, false),
@@ -8721,11 +9006,11 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	});
 
 	test("a husk cancel keeps the branch whose commits never reached the target", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			branchMergedOrGone: async () => false,
 		});
-		const task = seed(store);
+		const task = await seed(store);
 		const e = fakeProject(store);
 
 		await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
@@ -8735,15 +9020,15 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		// The husk holds no checkout, but the branch holds the work: the cancel keeps it.
 		expect(record.removeWorktree).toHaveLength(1);
 		expect(record.removeWorktree[0]).toMatchObject({ branch: null });
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`! cancel kept the branch ott/${task.id}: it holds commits that never reached abc`,
 		);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 	});
 
 	test("finish-kept applies move/ignore/delete choices", async () => {
-		const { store, record, loop } = setup();
-		const task = seed(store, {
+		const { store, record, loop } = await setup();
+		const task = await seed(store, {
 			state: "needs_you",
 			needsReason: keptReason("uncommitted changes"),
 			keptFiles: ["a.txt", "b.txt", "c.txt"],
@@ -8764,19 +9049,19 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 			{ mainPath: store.path, rel: "b.txt" },
 		]);
 		expect(record.removeWorktree).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.keptFiles).toEqual([]);
 		expect(after.commits).toBe(3);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"finished kept worktree: 1 moved, 1 ignored, 1 deleted",
 		);
 	});
 
 	test("finish-kept refuses while a turn is running", async () => {
-		const { store, record, loop } = setup();
-		const task = seed(store, {
+		const { store, record, loop } = await setup();
+		const task = await seed(store, {
 			state: "needs_you",
 			needsReason: keptReason("uncommitted changes"),
 			keptFiles: ["a.txt"],
@@ -8794,17 +9079,17 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	});
 
 	test("a restart-interrupted cancel asks the kept-worktree question", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			unsavedWork: async () => "uncommitted changes to bar.txt",
 			statusFiles: async () => ["bar.txt"],
 		});
-		const task = seed(store);
-		store.updateTask(task.id, { cancelledAt: Date.now() });
-		store.startTurn(task.id, "work", "carry on", null);
+		const task = await seed(store);
+		await store.updateTask(task.id, { cancelledAt: Date.now() });
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason?.startsWith("Cancel kept the worktree: ")).toBe(
 			true,
@@ -8812,34 +9097,34 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(after.keptFiles).toEqual(["bar.txt"]);
 		expect(after.cancelledAt).toBeNull();
 		expect(record.removeWorktree).toHaveLength(0);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
 	});
 
 	test("a restart-interrupted cancel removes a clean worktree", async () => {
-		const { store, record, loop } = setup();
-		const task = seed(store);
-		store.updateTask(task.id, { cancelledAt: Date.now() });
-		store.startTurn(task.id, "work", "carry on", null);
+		const { store, record, loop } = await setup();
+		const task = await seed(store);
+		await store.updateTask(task.id, { cancelledAt: Date.now() });
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("recoverRestarted requeues a plain running task", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			targetSha: async () => "abc123def456",
 			isClean: async () => true,
 		});
-		const task = seed(store);
-		store.startTurn(task.id, "work", "carry on", null);
+		const task = await seed(store);
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
@@ -8847,7 +9132,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(after.pendingPrompt).toBe(
 			restartResumePrompt({ sha: "abc123def456", clean: true }),
 		);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
 	});
@@ -8855,7 +9140,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	/** The merge-turn crash-window fixture: real bare origin, a real main checkout
 	 * whose target holds the merge, the card's real worktree, and a merging card with
 	 * branch and worktree stored. Returns the paths the window assertions read. */
-	function mergeCrashFixture() {
+	async function mergeCrashFixture() {
 		const run = (cwd: string, ...args: string[]): string => {
 			const r = Bun.spawnSync(["git", ...args], {
 				cwd,
@@ -8866,7 +9151,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
 			return r.stdout.toString().trim();
 		};
-		const store = freshStore();
+		const store = await freshStore();
 		const dir = store.path;
 		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
 		dirs.push(origin);
@@ -8879,8 +9164,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		// origin/main sits at the seed; the tracking ref the push later moves is exact.
 		run(dir, "push", "-q", "origin", "main:main");
 		const seedTip = run(dir, "rev-parse", "refs/remotes/origin/main");
-		const task = store.createTask("merge please");
-		store.setSettings({ originUrl: origin });
+		const task = await store.createTask("merge please");
+		await store.setSettings({ originUrl: origin });
 		// The card's worktree holds the card branch one commit past the seed.
 		const wt = join(dir, "wt-card");
 		run(dir, "branch", "ott/m");
@@ -8889,7 +9174,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		// The merge the merge agent performed in the main checkout before the push.
 		run(dir, "checkout", "-q", "main");
 		run(dir, "merge", "-q", "--ff-only", "ott/m");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: wt,
 			branch: "ott/m",
@@ -8910,7 +9195,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		const reached = Promise.withResolvers<void>();
 		let pushed = false;
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				serverMergePush: async (
@@ -8936,9 +9221,9 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 	/** The boot-side loop: the reopened store swept with the real git readers (target
 	 * resolution, ref reads, containment, commit count, worktree removal). */
-	function recoveryLoop(store: ProjectStore, overrides: Partial<TurnOps> = {}) {
+	function recoveryLoop(store: ProjectStore, overrides: FixtureOps = {}) {
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, { ...fakeProject(store), target: "origin/main" }]]),
 			fakeOps(record, {
 				pidAlive: () => false,
@@ -8970,28 +9255,28 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		// suspends the first post-push tree read; no process is signalled). The boot
 		// sweep on a reopened store must finish the card integrated with the settle's
 		// writes, not requeue a merge the pushed target already holds.
-		const { run, store, dir, origin, task, wt } = mergeCrashFixture();
+		const { run, store, dir, origin, task, wt } = await mergeCrashFixture();
 		await suspendAfterPush(store, task);
 
 		// The window: the merge is on origin, the settle write never ran.
 		const pushedTip = run(dir, "rev-parse", "refs/remotes/origin/main");
 		expect(pushedTip).toBe(run(dir, "rev-parse", "refs/heads/main"));
-		const mid = store.getTask(task.id)!;
+		const mid = (await store.getTask(task.id))!;
 		expect(mid.stage).toBe("merging");
 		expect(mid.state).toBe("running");
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.listTurns(task.id)[0]!.outcome).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.outcome).toBeNull();
 
 		// The boot path: the dead tracker's process is gone, so its store handle and
 		// its in-memory settle state are lost with it. Close the suspended store (the
 		// flow never resumes, so nothing writes again) and reopen as the new boot does.
-		store.close();
-		const reopened = ProjectStore.open(store.path);
+		await store.close();
+		const reopened = await ProjectStore.open(store.path);
 		stores.push(reopened);
 		const { loop: loop2, record: record2 } = recoveryLoop(reopened);
 		await loop2.recoverRestarted();
 
-		const after = reopened.getTask(task.id)!;
+		const after = (await reopened.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -9001,7 +9286,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(after.commits).toBe(2);
 		expect(after.mergeHead).toBe(pushedTip);
 		expect(after.pendingPrompt ?? null).toBeNull();
-		const turn = reopened.listTurns(task.id)[0]!;
+		const turn = (await reopened.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.outcome).toBe("integrated");
 		// The done write removed the worktree, like the settle's own done write.
@@ -9009,18 +9294,18 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		expect(record2.removeWorktree).toHaveLength(1);
 		// No second push: origin still holds exactly the tip the first push carried.
 		expect(run(origin, "rev-parse", "main")).toBe(pushedTip);
-		expect(logText(reopened, task.id)).toContain(
+		expect(await logText(reopened, task.id)).toContain(
 			"the merge push landed before the restart",
 		);
 
 		// A second boot recovery run on the same store changes nothing.
-		const taskSnap = JSON.stringify(reopened.getTask(task.id));
-		const turnsSnap = JSON.stringify(reopened.listTurns(task.id));
-		const logSnap = logText(reopened, task.id);
+		const taskSnap = JSON.stringify(await reopened.getTask(task.id));
+		const turnsSnap = JSON.stringify(await reopened.listTurns(task.id));
+		const logSnap = await logText(reopened, task.id);
 		await loop2.recoverRestarted();
-		expect(JSON.stringify(reopened.getTask(task.id))).toBe(taskSnap);
-		expect(JSON.stringify(reopened.listTurns(task.id))).toBe(turnsSnap);
-		expect(logText(reopened, task.id)).toBe(logSnap);
+		expect(JSON.stringify(await reopened.getTask(task.id))).toBe(taskSnap);
+		expect(JSON.stringify(await reopened.listTurns(task.id))).toBe(turnsSnap);
+		expect(await logText(reopened, task.id)).toBe(logSnap);
 	});
 
 	test("recoverRestarted finishes the card when the crash cut before the tracking-ref write", async () => {
@@ -9028,7 +9313,8 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		// tracker died inside the push helper before recordLandedPush wrote the
 		// remote-tracking ref. The cached ref lags the remote, so the proof must fetch
 		// the pinned origin before it judges containment.
-		const { run, store, dir, origin, task, wt, seedTip } = mergeCrashFixture();
+		const { run, store, dir, origin, task, wt, seedTip } =
+			await mergeCrashFixture();
 		await suspendAfterPush(store, task, () => {
 			run(dir, "update-ref", "refs/remotes/origin/main", seedTip);
 		});
@@ -9037,11 +9323,11 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		const pushedTip = run(origin, "rev-parse", "main");
 		expect(pushedTip).toBe(run(dir, "rev-parse", "refs/heads/main"));
 		expect(run(dir, "rev-parse", "refs/remotes/origin/main")).toBe(seedTip);
-		expect(store.getTask(task.id)!.state).toBe("running");
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 
-		store.close();
-		const reopened = ProjectStore.open(store.path);
+		await store.close();
+		const reopened = await ProjectStore.open(store.path);
 		stores.push(reopened);
 		const fetches: [string, string, string][] = [];
 		const { loop: loop2 } = recoveryLoop(reopened, {
@@ -9056,7 +9342,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		});
 		await loop2.recoverRestarted();
 
-		const after = reopened.getTask(task.id)!;
+		const after = (await reopened.getTask(task.id))!;
 		// The proof fetched the pinned origin before it judged containment, and the
 		// fetch refreshed the tracking ref to the pushed tip.
 		expect(fetches).toEqual([[dir, "main", origin]]);
@@ -9072,7 +9358,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 	});
 
 	test("the demo switch keeps seeded cards through both sweeps and starts no queued card", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			pidAlive: () => false,
 			isClean: async () => true,
 			targetSha: async () => "abc123def456",
@@ -9080,22 +9366,22 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		});
 		process.env.OTTR_DEMO = "1";
 		try {
-			const a = seed(store);
-			store.startTurn(a.id, "work", "carry on", null);
-			const b = seed(store, { state: "preparing" });
-			store.startTurn(b.id, "work", "carry on", null);
-			store.setSettings({ maxParallel: null }); // only the demo switch may hold it
-			const queued = store.createTask("queued demo card");
+			const a = await seed(store);
+			await store.startTurn(a.id, "work", "carry on", null);
+			const b = await seed(store, { state: "preparing" });
+			await store.startTurn(b.id, "work", "carry on", null);
+			await store.setSettings({ maxParallel: null }); // only the demo switch may hold it
+			const queued = await store.createTask("queued demo card");
 
 			await loop.recoverRestarted();
-			loop.schedule();
+			await loop.schedule();
 			await flushPromises();
 
-			expect(store.getTask(a.id)!.state).toBe("running");
-			expect(store.getTask(b.id)!.state).toBe("preparing");
-			expect(store.listTurns(a.id).at(-1)!.endedAt).toBeNull();
-			expect(store.listTurns(b.id).at(-1)!.endedAt).toBeNull();
-			expect(store.getTask(queued.id)!.state).toBe("queued");
+			expect((await store.getTask(a.id))!.state).toBe("running");
+			expect((await store.getTask(b.id))!.state).toBe("preparing");
+			expect((await store.listTurns(a.id)).at(-1)!.endedAt).toBeNull();
+			expect((await store.listTurns(b.id)).at(-1)!.endedAt).toBeNull();
+			expect((await store.getTask(queued.id))!.state).toBe("queued");
 			expect(record.runs).toHaveLength(0);
 		} finally {
 			delete process.env.OTTR_DEMO;
@@ -9118,13 +9404,13 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 		}).trim();
 
 		const record = baseRecord();
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			unsavedWork: realUnsavedWork,
 			statusFiles: realStatusFiles,
 			worktreeHusk: realWorktreeHusk,
 		});
-		const task = seed(store, { base });
-		const wt = store.getTask(task.id)!.worktree!;
+		const task = await seed(store, { base });
+		const wt = (await store.getTask(task.id))!.worktree!;
 		run(`git -C ${repoDir} worktree add -q "${wt}" -b ${task.branch}`);
 		writeFileSync(join(wt, "scratch.txt"), "unsaved");
 
@@ -9132,7 +9418,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 			loop.cancel(fakeProject(store), task.id, false),
 		).resolves.toEqual({ kept: expect.any(String) });
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		// Old code reused keptReason(), whose "Kept the worktree: " prefix is what the
 		// supervisor's auto-tend matches: it replied to a card the user had just cancelled.
@@ -9176,9 +9462,9 @@ describe("arch-review survivor kills", () => {
 	}
 	let spyErrorsRestore: (() => void) | null = null;
 
-	function openTurn(store: ProjectStore, id: string, pid: number | null) {
-		store.updateTask(id, { state: "running" });
-		store.startTurn(id, "work", "carry on", pid);
+	async function openTurn(store: ProjectStore, id: string, pid: number | null) {
+		await store.updateTask(id, { state: "running" });
+		await store.startTurn(id, "work", "carry on", pid);
 	}
 
 	async function withErrors(fn: () => Promise<void> | void): Promise<string[]> {
@@ -9192,9 +9478,9 @@ describe("arch-review survivor kills", () => {
 		return seen;
 	}
 
-	function parkedCard(store: ProjectStore) {
-		const task = store.createTask("release v9.0.0");
-		store.updateTask(task.id, {
+	async function parkedCard(store: ProjectStore) {
+		const task = await store.createTask("release v9.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: "waiting for the review's findings to be implemented",
@@ -9206,9 +9492,12 @@ describe("arch-review survivor kills", () => {
 		return task;
 	}
 
-	function keptTask(store: ProjectStore, patch: Record<string, unknown> = {}) {
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+	async function keptTask(
+		store: ProjectStore,
+		patch: Record<string, unknown> = {},
+	) {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "needs_you",
 			stage: "in_progress",
 			needsReason: keptReason("M a.txt"),
@@ -9225,116 +9514,116 @@ describe("arch-review survivor kills", () => {
 	// ---- settleLostTurn / recoverRestarted -------------------------------------
 
 	test("recoverRestarted logs 'settling the turn' for an open row and 'requeueing the card' without one", async () => {
-		const a = freshStore();
-		const b = freshStore();
-		const loop = createTurnLoop(
+		const a = await freshStore();
+		const b = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[a.name, fakeProject(a)],
 				[b.name, fakeProject(b)],
 			]),
 			fakeOps(baseRecord()),
 		);
-		const ta = a.createTask("open row");
-		openTurn(a, ta.id, null);
-		const tb = b.createTask("no row");
-		b.updateTask(tb.id, { state: "running" });
+		const ta = await a.createTask("open row");
+		await openTurn(a, ta.id, null);
+		const tb = await b.createTask("no row");
+		await b.updateTask(tb.id, { state: "running" });
 
 		await loop.recoverRestarted();
 
-		expect(logText(a, ta.id)).toContain(
+		expect(await logText(a, ta.id)).toContain(
 			"! tracker restarted; settling the turn",
 		);
-		expect(logText(b, tb.id)).toContain(
+		expect(await logText(b, tb.id)).toContain(
 			"! tracker restarted; requeueing the card",
 		);
 	});
 
 	test("recoverRestarted with no worktree requeues with '.' and never reads the target sha", async () => {
 		let shaCalls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			targetSha: async () => {
 				shaCalls += 1;
 				return "abc";
 			},
 		});
-		const task = store.createTask("bare card");
-		store.updateTask(task.id, { state: "running", worktree: null });
-		store.startTurn(task.id, "work", "carry on", null);
+		const task = await store.createTask("bare card");
+		await store.updateTask(task.id, { state: "running", worktree: null });
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
 		expect(shaCalls).toBe(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe(".");
 	});
 
 	test("recoverRestarted falls back to '.' when the worktree sha read fails", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			targetSha: async () => {
 				throw new Error("git gone");
 			},
 		});
-		const task = store.createTask("card");
-		store.updateTask(task.id, {
+		const task = await store.createTask("card");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 		});
 		mkdirSync(join(store.worktreesDir, task.id), { recursive: true });
-		store.startTurn(task.id, "work", "carry on", null);
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe(".");
 	});
 
 	test("recoverRestarted requeues with the unchanged-tree hint only for a clean tree", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			targetSha: async () => "abc123def456789",
 			isClean: async () => {
 				throw new Error("git gone");
 			},
 		});
-		const task = store.createTask("card");
-		store.updateTask(task.id, {
+		const task = await store.createTask("card");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 		});
 		mkdirSync(join(store.worktreesDir, task.id), { recursive: true });
-		store.startTurn(task.id, "work", "carry on", null);
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
 		// A dirty (unreadable = not proven clean) tree collapses to ".".
-		expect(store.getTask(task.id)!.pendingPrompt).toBe(".");
+		expect((await store.getTask(task.id))!.pendingPrompt).toBe(".");
 	});
 
 	test("recoverRestarted leaves non-running cards alone", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("idle card");
-		store.updateTask(task.id, { state: "idle" });
-		store.startTurn(task.id, "work", "carry on", null);
+		const { store, loop } = await setup();
+		const task = await store.createTask("idle card");
+		await store.updateTask(task.id, { state: "idle" });
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		await loop.recoverRestarted();
 
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 		// The open row was not settled behind the card's back.
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 	});
 
 	test("a sick store does not stop recoverRestarted for the other projects", async () => {
-		const sick = freshStore();
-		const healthy = freshStore();
-		const loop = createTurnLoop(
+		const sick = await freshStore();
+		const healthy = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				// A fresh sick view per call: the prototype override throws every time.
 				[
 					sick.name,
 					fakeProject(
 						proxyStore(sick, {
-							listTasks() {
+							async listTasks() {
 								throw new Error("database is locked");
 							},
 						}),
@@ -9344,25 +9633,25 @@ describe("arch-review survivor kills", () => {
 			]),
 			fakeOps(baseRecord()),
 		);
-		const task = healthy.createTask("fine here");
-		healthy.updateTask(task.id, { state: "running" });
-		healthy.startTurn(task.id, "work", "carry on", null);
+		const task = await healthy.createTask("fine here");
+		await healthy.updateTask(task.id, { state: "running" });
+		await healthy.startTurn(task.id, "work", "carry on", null);
 
 		const seen = await withErrors(() => loop.recoverRestarted());
 
 		expect(seen.join("\n")).toContain("database is locked");
-		expect(healthy.getTask(task.id)!.state).toBe("queued");
+		expect((await healthy.getTask(task.id))!.state).toBe("queued");
 	});
 
 	test("recoverRestarted turns a failing settle row into a logged error", async () => {
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[
 					store.name,
 					fakeProject(
 						proxyStore(store, {
-							finishTurn() {
+							async finishTurnState() {
 								throw new Error("write failed");
 							},
 						}),
@@ -9371,9 +9660,9 @@ describe("arch-review survivor kills", () => {
 			]),
 			fakeOps(baseRecord()),
 		);
-		const task = store.createTask("card");
-		store.updateTask(task.id, { state: "running" });
-		store.startTurn(task.id, "work", "carry on", null);
+		const task = await store.createTask("card");
+		await store.updateTask(task.id, { state: "running" });
+		await store.startTurn(task.id, "work", "carry on", null);
 
 		const seen = await withErrors(() => loop.recoverRestarted());
 
@@ -9384,14 +9673,18 @@ describe("arch-review survivor kills", () => {
 
 	test("the lost sweep settles a claimed run whose agent pid died", async () => {
 		const doneGate = deferred<RunResult>();
-		const { store, record, loop } = setupWith(baseRecord(), {
+		const { store, record, loop } = await setupWith(baseRecord(), {
 			pidAlive: () => false,
 			// The sweep requeues the card; the cap keeps the resumed turn from claiming it
 			// mid-assertion.
-			maxTotalRuns: () => 0,
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			holdFollowUps: true,
+			scheduledCap: 0,
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: doneGate.promise,
@@ -9399,16 +9692,19 @@ describe("arch-review survivor kills", () => {
 				};
 			},
 		});
-		const task = store.createTask("hangs forever");
+		const task = await store.createTask("hangs forever");
 		const run = loop.runTurn(store.name, task.id);
-		await flushPromises();
+		await eventually(() => loop.running.has(`${store.name}/${task.id}`));
 
-		loop.schedule();
-		await flushPromises();
+		await loop.schedule();
+		await eventually(
+			async () =>
+				((await store.listTurns(task.id))[0]?.endedAt ?? null) !== null,
+		);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("lost agent process (pid 4242)");
 
@@ -9417,14 +9713,14 @@ describe("arch-review survivor kills", () => {
 	});
 
 	test("the lost sweep logs a store that cannot be listed", async () => {
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[
 					store.name,
 					fakeProject(
 						proxyStore(store, {
-							listTasks() {
+							async listTasks() {
 								throw new Error("table missing");
 							},
 						}),
@@ -9434,8 +9730,8 @@ describe("arch-review survivor kills", () => {
 			fakeOps(baseRecord()),
 		);
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
@@ -9443,8 +9739,8 @@ describe("arch-review survivor kills", () => {
 	});
 
 	test("the lost sweep skips a card whose row vanished before the settle", async () => {
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[
 					store.name,
@@ -9457,29 +9753,29 @@ describe("arch-review survivor kills", () => {
 			]),
 			fakeOps(baseRecord()),
 		);
-		const task = store.createTask("vanishing card");
-		store.updateTask(task.id, { state: "running" });
-		store.startTurn(task.id, "work", "carry on", null);
+		const task = await store.createTask("vanishing card");
+		await store.updateTask(task.id, { state: "running" });
+		await store.startTurn(task.id, "work", "carry on", null);
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
 		// The settle is skipped quietly: no task writes, no error log.
 		expect(seen).toEqual([]);
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 	});
 
 	test("the lost sweep turns a failing settle into a logged error", async () => {
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[
 					store.name,
 					fakeProject(
 						proxyStore(store, {
-							finishTurn() {
+							async finishTurnState() {
 								throw new Error("row write failed");
 							},
 						}),
@@ -9488,12 +9784,12 @@ describe("arch-review survivor kills", () => {
 			]),
 			fakeOps(baseRecord()),
 		);
-		const task = store.createTask("card");
-		store.updateTask(task.id, { state: "running" });
-		store.startTurn(task.id, "work", "carry on", null);
+		const task = await store.createTask("card");
+		await store.updateTask(task.id, { state: "running" });
+		await store.startTurn(task.id, "work", "carry on", null);
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
@@ -9503,15 +9799,15 @@ describe("arch-review survivor kills", () => {
 	// ---- schedule ----------------------------------------------------------------
 
 	test("a store that cannot be listed rejects into the log, not the scheduler", async () => {
-		const sick = freshStore();
-		const healthy = freshStore();
-		const loop = createTurnLoop(
+		const sick = await freshStore();
+		const healthy = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[
 					sick.name,
 					fakeProject(
 						proxyStore(sick, {
-							listTasks() {
+							async listTasks() {
 								throw new Error("locked again");
 							},
 						}),
@@ -9521,108 +9817,113 @@ describe("arch-review survivor kills", () => {
 			]),
 			fakeOps(baseRecord()),
 		);
-		const task = healthy.createTask("start me");
-		healthy.updateTask(task.id, { state: "queued" });
+		const task = await healthy.createTask("start me");
+		await healthy.updateTask(task.id, { state: "queued" });
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
 		expect(seen.join("\n")).toContain("locked again");
 		// The healthy project still ran its runnable card.
-		expect(healthy.getTask(task.id)!.state).not.toBe("queued");
+		expect((await healthy.getTask(task.id))!.state).not.toBe("queued");
 	});
 
 	// ---- settleReleases ------------------------------------------------------------
 
 	test("a busy merging card parks settleReleases", async () => {
-		const { store, record, projects, loop } = setup();
+		const { store, record, projects, loop } = await setup();
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		const merger = store.createTask("merging now");
-		store.updateTask(merger.id, { stage: "merging", state: "running" });
+		const task = await parkedCard(store);
+		const merger = await store.createTask("merging now");
+		await store.updateTask(merger.id, { stage: "merging", state: "running" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	test("a non-merging busy card does not block settleReleases", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
+		const task = await parkedCard(store);
 		// The review's turn is settled long ago: a card created later is not a finding.
-		const first = store.startTurn(task.id, "work", "review", 1);
-		store.finishTurn(first.id, { endedAt: 1 });
-		const worker = store.createTask("working now");
-		store.updateTask(worker.id, { stage: "in_progress", state: "running" });
+		const first = await store.startTurn(task.id, "work", "review", 1);
+		await store.finishTurn(first.id, { endedAt: 1 });
+		const worker = await store.createTask("working now");
+		await store.updateTask(worker.id, {
+			stage: "in_progress",
+			state: "running",
+		});
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(1);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a needs_you parked shape never publishes", async () => {
 		// The recording fake: the default publishRelease records nothing, so a publish would
 		// pass unnoticed.
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		store.updateTask(task.id, { state: "needs_you" });
+		const task = await parkedCard(store);
+		await store.updateTask(task.id, { state: "needs_you" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	test("overlapping ticks settle the same release card once", async () => {
 		const gate = deferred<string>();
 		const published: unknown[] = [];
-		const { store, projects, loop } = setupWith(baseRecord(), {
+		const { store, projects, loop } = await setupWith(baseRecord(), {
 			publishRelease: async () => {
 				published.push(1);
 				return gate.promise;
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		parkedCard(store);
+		await parkedCard(store);
 
-		loop.schedule();
-		loop.schedule();
+		await loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(published).toHaveLength(1);
 		gate.resolve("tagged");
 		await flushPromises();
-		expect(store.getTask(store.listTasks()[0]!.id)!.stage).toBe("done");
+		expect((await store.getTask((await store.listTasks())[0]!.id))!.stage).toBe(
+			"done",
+		);
 	});
 
 	test("a settled release holds for findings created before its last turn ended", async () => {
-		const { store, record, projects, loop } = setup();
+		const { store, record, projects, loop } = await setup();
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		store.startTurn(task.id, "work", "review", 1);
+		const task = await parkedCard(store);
+		await store.startTurn(task.id, "work", "review", 1);
 		// endedAt in the future: the finding (created now) lands before `end` -> hold.
-		store.finishTurn(store.listTurns(task.id)[0]!.id, {
+		await store.finishTurn((await store.listTurns(task.id))[0]!.id, {
 			endedAt: Date.now() + 60_000,
 		});
-		const finding = store.createTask("late finding");
-		store.updateTask(finding.id, { stage: "in_progress" });
+		const finding = await store.createTask("late finding");
+		await store.updateTask(finding.id, { stage: "in_progress" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
@@ -9630,34 +9931,34 @@ describe("arch-review survivor kills", () => {
 
 	test("a release hold uses the last turn row, not the first", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
+		const task = await parkedCard(store);
 		// Two settled rows: the FIRST ends in the future, the LAST long ago. Only reading the
 		// last row (end = 1) puts the later-created finding outside the window and publishes.
-		const first = store.startTurn(task.id, "work", "review", 1);
-		store.finishTurn(first.id, { endedAt: Date.now() + 60_000 });
-		const second = store.startTurn(task.id, "work", "review", 2);
-		store.finishTurn(second.id, { endedAt: 1 });
-		const finding = store.createTask("late finding");
-		store.updateTask(finding.id, { stage: "in_progress" });
+		const first = await store.startTurn(task.id, "work", "review", 1);
+		await store.finishTurn(first.id, { endedAt: Date.now() + 60_000 });
+		const second = await store.startTurn(task.id, "work", "review", 2);
+		await store.finishTurn(second.id, { endedAt: 1 });
+		const finding = await store.createTask("late finding");
+		await store.updateTask(finding.id, { stage: "in_progress" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(1);
 	});
 
 	test("a card with no turn rows holds against later findings", async () => {
-		const { store, record, projects, loop } = setup();
+		const { store, record, projects, loop } = await setup();
 		projects.get(store.name)!.target = "origin/main";
-		parkedCard(store);
-		const finding = store.createTask("late finding");
-		store.updateTask(finding.id, { stage: "in_progress" });
+		await parkedCard(store);
+		const finding = await store.createTask("late finding");
+		await store.updateTask(finding.id, { stage: "in_progress" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
@@ -9665,19 +9966,19 @@ describe("arch-review survivor kills", () => {
 
 	test("a finished settle frees its cap slot for the next tick", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			maxTotalRuns: () => 1,
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		parkedCard(store);
-		loop.schedule();
+		await parkedCard(store);
+		await loop.schedule();
 		await flushPromises();
 		expect(record.publishRelease).toHaveLength(1);
 
-		const task = store.createTask("start me next tick");
-		store.updateTask(task.id, { state: "queued" });
-		loop.schedule();
+		const task = await store.createTask("start me next tick");
+		await store.updateTask(task.id, { state: "queued" });
+		await loop.schedule();
 		await flushPromises();
 
 		// The freed cap slot lets the queued card start. The loop may legitimately chain its
@@ -9687,35 +9988,35 @@ describe("arch-review survivor kills", () => {
 
 	test("a settled release card can be re-parked and publishes again", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedCard(store);
-		loop.schedule();
+		const task = await parkedCard(store);
+		await loop.schedule();
 		await flushPromises();
 		expect(record.publishRelease).toHaveLength(1);
 
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: "waiting for the review's findings to be implemented",
 		});
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(2);
 	});
 
 	test("a settle that cannot list tasks rejects into the log", async () => {
-		const store = freshStore();
-		const loop = createTurnLoop(
+		const store = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[
 					store.name,
 					fakeProject(
 						proxyStore(store, {
-							listTasks() {
+							async listTasks() {
 								throw new Error("settle boom");
 							},
 						}),
@@ -9725,8 +10026,8 @@ describe("arch-review survivor kills", () => {
 			fakeOps(baseRecord()),
 		);
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
@@ -9736,16 +10037,16 @@ describe("arch-review survivor kills", () => {
 	// ---- runTurn: pre-run ownership and turn input ---------------------------------
 
 	test("a cancel landing during ensurePackages stops the run before the spawn", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			ensurePackages: async () => {
-				store.updateTask(store.listTasks()[0]!.id, {
+				await store.updateTask((await store.listTasks())[0]!.id, {
 					cancelledAt: Date.now(),
 				});
 				return [];
 			},
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			state: "queued",
 			worktree: "wt-p",
 			branch: "ott/p",
@@ -9756,22 +10057,22 @@ describe("arch-review survivor kills", () => {
 
 		expect(record.runs).toHaveLength(0);
 		// The card still stands where the cancel left it; no settle clobbered it.
-		expect(store.getTask(task.id)!.state).toBe("preparing");
-		expect(store.getTask(task.id)!.cancelledAt).not.toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("preparing");
+		expect((await store.getTask(task.id))!.cancelledAt).not.toBeNull();
 	});
 
 	test("a task deleted mid-prepare stops quietly instead of erroring", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		let armed = false;
 		const real = store.getTask.bind(store);
 		const view = proxyStore(store, {
-			getTask(id: string) {
-				const t = real(id);
+			async getTask(id: string) {
+				const t = await real(id);
 				return armed && t ? null : t;
 			},
 		});
 		const record = baseRecord();
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(view)]]),
 			fakeOps(record, {
 				ensurePackages: async () => {
@@ -9780,8 +10081,8 @@ describe("arch-review survivor kills", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			state: "queued",
 			worktree: "wt-p",
 			branch: "ott/p",
@@ -9792,13 +10093,13 @@ describe("arch-review survivor kills", () => {
 
 		// Quiet stop: no run, the card stands where the claim left it.
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)!.state).toBe("preparing");
+		expect((await store.getTask(task.id))!.state).toBe("preparing");
 	});
 
 	test("a reply to a saved session is recorded as the turn's input", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const { store, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			sessionId: "sess-1",
 			pendingPrompt: "add tests",
 		});
@@ -9806,70 +10107,78 @@ describe("arch-review survivor kills", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.listTurns(task.id)[0]!.input).toBe("add tests");
+		expect((await store.listTurns(task.id))[0]!.input).toBe("add tests");
 	});
 
 	test("a '.' continue on a fresh session is not recorded as user text", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { sessionId: "sess-1", pendingPrompt: "." });
+		const { store, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
+			sessionId: "sess-1",
+			pendingPrompt: ".",
+		});
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.listTurns(task.id)[0]!.input).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.input).toBeNull();
 	});
 
 	test("a '.' continue on a saved session is recorded as user text", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { sessionId: "sess-1", pendingPrompt: "." });
+		const { store, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
+			sessionId: "sess-1",
+			pendingPrompt: ".",
+		});
 		saveSession(store, "sess-1");
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.listTurns(task.id)[0]!.input).toBe(".");
+		expect((await store.listTurns(task.id))[0]!.input).toBe(".");
 	});
 
 	test("a real reply folded into a fresh session is recorded as user text", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const { store, loop } = await setup();
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			sessionId: "sess-1",
 			pendingPrompt: "do stuff",
 		});
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.listTurns(task.id)[0]!.input).toBe("do stuff");
+		expect((await store.listTurns(task.id))[0]!.input).toBe("do stuff");
 	});
 
 	// ---- keptFiles at settle ---------------------------------------------------------
 
 	test("a done work turn clears stale keptFiles", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			statusFiles: async () => ["leftover.txt"],
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { keptFiles: ["stale.txt"] });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { keptFiles: ["stale.txt"] });
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(store.getTask(task.id)!.keptFiles).toEqual([]);
-		expect(store.getTask(task.id)!.uncommittedFiles).toEqual(["leftover.txt"]);
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.keptFiles).toEqual([]);
+		expect((await store.getTask(task.id))!.uncommittedFiles).toEqual([
+			"leftover.txt",
+		]);
 	});
 
 	test("a done release card leaves keptFiles untouched", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			startRun: integratedRun(record),
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = store.createTask("release v1.0.0");
-		store.updateTask(task.id, {
+		const task = await store.createTask("release v1.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			releaseVersion: "v1.0.0",
@@ -9881,15 +10190,15 @@ describe("arch-review survivor kills", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(store.getTask(task.id)!.keptFiles).toEqual(["history.txt"]);
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.keptFiles).toEqual(["history.txt"]);
 	});
 
 	test("finishing a kept worktree keeps the run's uncommitted files on the done card", async () => {
-		const { store, loop, record } = setup();
-		const task = store.createTask("kept work");
+		const { store, loop, record } = await setup();
+		const task = await store.createTask("kept work");
 		const wt = join(store.worktreesDir, task.id);
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			state: "needs_you",
 			stage: "in_progress",
 			needsReason: keptReason("M a.txt"),
@@ -9904,7 +10213,7 @@ describe("arch-review survivor kills", () => {
 
 		await loop.finishKept(e, task.id, {});
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		// The kept list is this run's uncommitted files: the done drawer keeps the
 		// names now that the worktree they lived in is gone.
@@ -9916,9 +10225,9 @@ describe("arch-review survivor kills", () => {
 	// ---- cancel ----------------------------------------------------------------------
 
 	test("cancel removes the worktree with its exact coordinates", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: `ott/${task.id}`,
@@ -9940,13 +10249,13 @@ describe("arch-review survivor kills", () => {
 	// ---- OTTR-800: the cancel's remote branch delete --------------------------------
 
 	test("a prMode cancel with an open PR deletes the remote branch and names the PR", async () => {
-		const { store, record, loop } = setup();
-		store.setSettings({
+		const { store, record, loop } = await setup();
+		await store.setSettings({
 			prMode: true,
 			originUrl: "https://github.com/acme/widget.git",
 		});
-		const task = store.createTask("pr work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("pr work");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "idle",
 			prNumber: 7,
@@ -9969,21 +10278,21 @@ describe("arch-review survivor kills", () => {
 				keep: ["main"],
 			},
 		]);
-		const log = await Bun.file(store.logPath(task.id)).text();
+		const log = await Bun.file(await store.logPath(task.id)).text();
 		expect(log).toContain(
 			"cancel: removed remote branch ott/card; PR #7 closed with it",
 		);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 	});
 
 	test("a prMode cancel without an open PR deletes the remote branch", async () => {
-		const { store, record, loop } = setup();
-		store.setSettings({
+		const { store, record, loop } = await setup();
+		await store.setSettings({
 			prMode: true,
 			originUrl: "https://github.com/acme/widget.git",
 		});
-		const task = store.createTask("pr work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("pr work");
+		await store.updateTask(task.id, {
 			stage: "in_progress",
 			state: "needs_you",
 			prNumber: null,
@@ -10004,20 +10313,20 @@ describe("arch-review survivor kills", () => {
 				keep: ["main"],
 			},
 		]);
-		const log = await Bun.file(store.logPath(task.id)).text();
+		const log = await Bun.file(await store.logPath(task.id)).text();
 		expect(log).toContain("cancel: removed remote branch ott/card");
 		expect(log).not.toContain("closed with it");
 	});
 
 	test("the cancel log claims no PR close without an open PR on the branch", async () => {
-		const { store, loop } = setup();
-		store.setSettings({
+		const { store, loop } = await setup();
+		await store.setSettings({
 			prMode: true,
 			originUrl: "https://github.com/acme/widget.git",
 		});
 		// A PR closed unmerged earlier keeps its prNumber after the park (in_progress).
-		const closed = store.createTask("closed pr");
-		store.updateTask(closed.id, {
+		const closed = await store.createTask("closed pr");
+		await store.updateTask(closed.id, {
 			stage: "in_progress",
 			state: "needs_you",
 			prNumber: 7,
@@ -10027,8 +10336,8 @@ describe("arch-review survivor kills", () => {
 		});
 		// An adopted source PR keeps the source PR's number; the card branch was never
 		// pushed, and deleting it does not close the source PR.
-		const adopted = store.createTask("adopted pr");
-		store.updateTask(adopted.id, {
+		const adopted = await store.createTask("adopted pr");
+		await store.updateTask(adopted.id, {
 			stage: "merging",
 			state: "idle",
 			prNumber: 20,
@@ -10038,8 +10347,8 @@ describe("arch-review survivor kills", () => {
 			base: "abc",
 		});
 		// A done card keeps the merged PR's number.
-		const done = store.createTask("merged pr");
-		store.updateTask(done.id, {
+		const done = await store.createTask("merged pr");
+		await store.updateTask(done.id, {
 			stage: "done",
 			state: "idle",
 			prNumber: 7,
@@ -10052,8 +10361,8 @@ describe("arch-review survivor kills", () => {
 		await loop.cancel(fakeProject(store), adopted.id, false);
 		await loop.cancel(fakeProject(store), done.id, false);
 
-		const log = (id: string) => Bun.file(store.logPath(id)).text();
-		expect(await Bun.file(store.logPath(closed.id)).text()).toContain(
+		const log = async (id: string) => Bun.file(await store.logPath(id)).text();
+		expect(await Bun.file(await store.logPath(closed.id)).text()).toContain(
 			"cancel: removed remote branch ott/closed",
 		);
 		expect(await log(closed.id)).not.toContain("closed with it");
@@ -10062,15 +10371,15 @@ describe("arch-review survivor kills", () => {
 	});
 
 	test("a kept-worktree cancel runs no remote branch delete", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			unsavedWork: async () => "M a.txt",
 		});
-		store.setSettings({
+		await store.setSettings({
 			prMode: true,
 			originUrl: "https://github.com/acme/widget.git",
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: "ott/card",
@@ -10080,13 +10389,13 @@ describe("arch-review survivor kills", () => {
 		await loop.cancel(fakeProject(store), task.id, false);
 
 		expect(record.deletes).toEqual([]);
-		expect(store.getTask(task.id)!.state).toBe("needs_you");
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 	});
 
 	test("with prMode off a cancel runs no remote branch delete", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("plain work");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("plain work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: "ott/card",
@@ -10096,19 +10405,19 @@ describe("arch-review survivor kills", () => {
 		await loop.cancel(fakeProject(store), task.id, false);
 
 		expect(record.deletes).toEqual([]);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 	});
 
 	test("a failing cancel delete is logged and never blocks the cancel", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			deleteRemoteBranch: async () => "git boom",
 		});
-		store.setSettings({
+		await store.setSettings({
 			prMode: true,
 			originUrl: "https://github.com/acme/widget.git",
 		});
-		const task = store.createTask("pr work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("pr work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: "ott/card",
@@ -10117,19 +10426,19 @@ describe("arch-review survivor kills", () => {
 
 		await loop.cancel(fakeProject(store), task.id, false);
 
-		const log = await Bun.file(store.logPath(task.id)).text();
+		const log = await Bun.file(await store.logPath(task.id)).text();
 		expect(log).toContain("! cancel remote branch delete failed: git boom");
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 	});
 
 	test("a failing cancel removal is logged, not thrown", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			removeWorktree: async () => {
 				throw new Error("busy worktree");
 			},
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: `ott/${task.id}`,
@@ -10139,17 +10448,17 @@ describe("arch-review survivor kills", () => {
 		await expect(
 			loop.cancel(fakeProject(store), task.id, false),
 		).resolves.toEqual({ removed: true });
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"! cancel removeWorktree: busy worktree",
 		);
 	});
 
 	test("a cancel with no known base names that in the kept reason", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			unsavedWork: async () => "uncommitted changes to foo.txt",
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: `ott/${task.id}`,
@@ -10161,21 +10470,21 @@ describe("arch-review survivor kills", () => {
 			loop.cancel({ ...fakeProject(store), target: null }, task.id, false),
 		).resolves.toEqual({ kept: "its base commit is unknown" });
 
-		expect(store.getTask(task.id)!.needsReason).toBe(
+		expect((await store.getTask(task.id))!.needsReason).toBe(
 			"Cancel kept the worktree: its base commit is unknown",
 		);
 	});
 
 	test("a done card's worktree is cancelled like a forced one", async () => {
 		let unsavedCalls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			unsavedWork: async () => {
 				unsavedCalls += 1;
 				return "uncommitted changes";
 			},
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "done",
 			worktree: join(store.worktreesDir, task.id),
@@ -10192,14 +10501,14 @@ describe("arch-review survivor kills", () => {
 
 	test("a release card's worktree is cancelled like a forced one", async () => {
 		let unsavedCalls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			unsavedWork: async () => {
 				unsavedCalls += 1;
 				return "uncommitted changes";
 			},
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			releaseVersion: "v1.0.0",
 			base: "shaR",
@@ -10217,14 +10526,14 @@ describe("arch-review survivor kills", () => {
 
 	test("a forced cancel deletes a dirty worktree anyway", async () => {
 		let unsavedCalls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			unsavedWork: async () => {
 				unsavedCalls += 1;
 				return "uncommitted changes";
 			},
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: `ott/${task.id}`,
@@ -10238,21 +10547,21 @@ describe("arch-review survivor kills", () => {
 	});
 
 	test("a task deleted under a live run makes cancel report the unknown task", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		let armed = false;
 		const real = store.getTask.bind(store);
 		const view = proxyStore(store, {
-			getTask(id: string) {
-				const t = real(id);
+			async getTask(id: string) {
+				const t = await real(id);
 				return armed && t ? null : t;
 			},
 		});
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(view)]]),
 			fakeOps(baseRecord()),
 		);
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			state: "running",
 			worktree: join(store.worktreesDir, task.id),
 			branch: `ott/${task.id}`,
@@ -10274,11 +10583,11 @@ describe("arch-review survivor kills", () => {
 
 	async function finishKeptCase(
 		patch: Record<string, unknown> = {},
-		overrides: Partial<TurnOps> = {},
+		overrides: FixtureOps = {},
 	) {
-		const { store, record, projects, loop } = setup(overrides);
+		const { store, record, projects, loop } = await setup(overrides);
 		projects.get(store.name)!.target = "origin/main";
-		const task = keptTask(store, patch);
+		const task = await keptTask(store, patch);
 		return {
 			store,
 			record,
@@ -10368,7 +10677,7 @@ describe("arch-review survivor kills", () => {
 			{
 				mainPath: store.path,
 				worktreePath: join(store.worktreesDir, task.id),
-				branch: store.getTask(task.id)!.branch,
+				branch: (await store.getTask(task.id))!.branch,
 				log: expect.any(Function),
 			},
 		]);
@@ -10436,7 +10745,7 @@ describe("arch-review survivor kills", () => {
 		);
 
 		await expect(loop.finishKept(e, task.id, {})).resolves.toEqual({
-			error: `branch ${e.store.getTask(task.id)!.branch} has commits that never reached origin/main`,
+			error: `branch ${(await e.store.getTask(task.id))!.branch} has commits that never reached origin/main`,
 			status: 409,
 		});
 	});
@@ -10632,18 +10941,20 @@ describe("arch-review survivor kills", () => {
 		await expect(loop.finishKept(e, task.id, {})).resolves.toEqual({
 			ok: true,
 		});
-		expect(logText(store, task.id)).toContain("! removeWorktree: remove boom");
+		expect(await logText(store, task.id)).toContain(
+			"! removeWorktree: remove boom",
+		);
 	});
 });
 
 describe("turn update-card merge hold (U7)", () => {
 	test("a hold-update-merges project parks a done update card for a reply", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"] });
-		store.setSettings({ holdUpdateMerges: true });
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"] });
+		await store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
@@ -10653,76 +10964,76 @@ describe("turn update-card merge hold (U7)", () => {
 
 	test("no hold when the setting is off", async () => {
 		// commitsAhead 0: a ready work settle integrates straight to done.
-		const { store, loop } = setup({ commitsAhead: async () => 0 });
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"] });
+		const { store, loop } = await setup({ commitsAhead: async () => 0 });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"] });
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("no hold without updateIds", async () => {
-		const { store, loop } = setup({ commitsAhead: async () => 0 });
-		const task = store.createTask("plain work");
-		store.setSettings({ holdUpdateMerges: true });
+		const { store, loop } = await setup({ commitsAhead: async () => 0 });
+		const task = await store.createTask("plain work");
+		await store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("an approval binds to the parked head: a later commit parks the card again", async () => {
 		let head: string | null = "sha-1";
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			targetSha: async (_p: string, ref: string) =>
 				ref === "HEAD" ? head : null,
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"] });
-		store.setSettings({ holdUpdateMerges: true });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"] });
+		await store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		expect((await store.getTask(task.id))!.holdHead).toBe("sha-1");
 		// What POST /reply does (U7): queue the card and approve the parked head.
-		const approve = () =>
-			store.updateTask(task.id, {
+		const approve = async () =>
+			await store.updateTask(task.id, {
 				pendingPrompt: "approved",
 				state: "queued",
 				queuedAt: Date.now(),
 				needsReason: null,
-				updateMergeHead: store.getTask(task.id)!.holdHead,
+				updateMergeHead: (await store.getTask(task.id))!.holdHead,
 				holdHead: null,
 			});
-		approve();
+		await approve();
 		head = "sha-2"; // the agent commits after the approval
 		await loop.runTurn(store.name, task.id);
-		let after = store.getTask(task.id)!;
+		let after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
 		expect(after.holdHead).toBe("sha-2");
 		expect(record.removeWorktree).toHaveLength(0);
 		// HEAD unreadable: an approval never matches, the hold fails closed.
-		approve();
+		await approve();
 		head = null;
 		await loop.runTurn(store.name, task.id);
-		after = store.getTask(task.id)!;
+		after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
 		expect(after.holdHead).toBeNull();
 		expect(after.updateMergeHead).toBeNull(); // the park spent the sha-2 approval
 		// A reply with no parked head approves nothing; the next settle parks at sha-2 again.
 		head = "sha-2";
-		approve();
+		await approve();
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.holdHead).toBe("sha-2");
+		expect((await store.getTask(task.id))!.holdHead).toBe("sha-2");
 		// Approved at the head the next settle sees: it integrates.
-		approve();
+		await approve();
 		await loop.runTurn(store.name, task.id);
-		after = store.getTask(task.id)!;
+		after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("an agent's own needs_you with the hold text leaves no head to approve", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			targetSha: async () => "sha-1",
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("sess-1");
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -10738,11 +11049,11 @@ describe("turn update-card merge hold (U7)", () => {
 				};
 			},
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"], holdHead: "stale" });
-		store.setSettings({ holdUpdateMerges: true });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"], holdHead: "stale" });
+		await store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe(UPDATE_HOLD_REASON);
 		expect(after.holdHead).toBeNull();
 	});
@@ -10752,19 +11063,19 @@ describe("turn update-card merge hold (U7)", () => {
 	// queues a merge turn with no prompt text; a change-request reply still rides alone.
 	test("a change-request reply's work-turn prompt carries no rejected-hold line", async () => {
 		const head = "sha-1";
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			targetSha: async (_p: string, ref: string) =>
 				ref === "HEAD" ? head : null,
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"] });
-		store.setSettings({ holdUpdateMerges: true });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"] });
+		await store.setSettings({ holdUpdateMerges: true });
 		saveSession(store, "sess-1");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		expect((await store.getTask(task.id))!.holdHead).toBe("sha-1");
 		// A non-approval reply queues a work turn with the text; the hold stays parked.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			pendingPrompt: "Update approved",
 			pendingBy: "user",
 			state: "queued",
@@ -10779,8 +11090,10 @@ describe("turn update-card merge hold (U7)", () => {
 			"The tracker rejected your last report_outcome",
 		);
 		// The hold was not spent: the settle parks the card again for an approval.
-		expect(store.getTask(task.id)!.stage).toBe("in_progress");
-		expect(store.getTask(task.id)!.needsReason).toBe(UPDATE_HOLD_REASON);
+		expect((await store.getTask(task.id))!.stage).toBe("in_progress");
+		expect((await store.getTask(task.id))!.needsReason).toBe(
+			UPDATE_HOLD_REASON,
+		);
 	});
 
 	test("an approved card whose worktree is gone and whose head is on the target settles done", async () => {
@@ -10791,7 +11104,7 @@ describe("turn update-card merge hold (U7)", () => {
 		// read fails there and the target proves the approved head landed, so the card
 		// settles done instead of parking.
 		let merged = false;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			targetSha: async (_p: string, ref: string) =>
 				ref === "HEAD" ? head : null,
@@ -10800,7 +11113,7 @@ describe("turn update-card merge hold (U7)", () => {
 			branchMergedOrGone: async () => merged,
 			isIntegrated: async () => merged,
 			targetContains: async () => merged,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				// The merge lands and the worktree disappears mid-run, only on the
 				// approving run: the first run still parks the hold normally.
@@ -10808,7 +11121,7 @@ describe("turn update-card merge hold (U7)", () => {
 					merged = true;
 					head = null; // the worktree is gone: the HEAD read fails
 				}
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -10825,23 +11138,23 @@ describe("turn update-card merge hold (U7)", () => {
 				};
 			},
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"] });
-		store.setSettings({ holdUpdateMerges: true });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"] });
+		await store.setSettings({ holdUpdateMerges: true });
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.holdHead).toBe("sha-1");
+		expect((await store.getTask(task.id))!.holdHead).toBe("sha-1");
 		// What POST /reply does now: the approval spends the parked head and queues the
 		// merge turn; no work turn runs for it.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			queuedAt: Date.now(),
 			needsReason: null,
-			updateMergeHead: store.getTask(task.id)!.holdHead,
+			updateMergeHead: (await store.getTask(task.id))!.holdHead,
 			holdHead: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The approved head is contained in the target: done, never parked again.
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
@@ -10855,21 +11168,21 @@ describe("turn update-card merge hold (U7)", () => {
 	// the dead cwd (AGEN-24: every worker refused the turn with a 400, and the card stayed
 	// needs_you forever on a lost-worker reason).
 	test("an approved update card with no worktree and its head on the target settles done with no dispatch", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			// The worktree was removed after the agent merged by itself (AGEN-24); the target
 			// proves the approved head landed.
 			worktreeHusk: async () => true,
 			targetContains: async () => true,
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, {
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, {
 			updateIds: ["a@1"],
 			worktree: "/nonexistent/ottr-341-worktree",
 			branch: "ott/update-pins",
 		});
 		// The approval state (the parked head spent, holdHead cleared); the pre-dispatch
 		// guard ignores stage and consumes any queued reply text.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			pendingPrompt: "Approved.",
 			pendingBy: "user",
 			state: "queued",
@@ -10879,7 +11192,7 @@ describe("turn update-card merge hold (U7)", () => {
 			holdHead: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -10889,16 +11202,16 @@ describe("turn update-card merge hold (U7)", () => {
 	});
 
 	test("a fork-born card approved with its worktree gone and its head on the target settles done", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			targetContains: async () => true,
 		});
-		const task = store.createTask("fork follow-up");
-		store.updateTask(task.id, {
+		const task = await store.createTask("fork follow-up");
+		await store.updateTask(task.id, {
 			worktree: "/nonexistent/ottr-341-worktree",
 			branch: "ott/fork-follow-up",
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			pendingPrompt: "Approved.",
 			pendingBy: "user",
 			state: "queued",
@@ -10908,7 +11221,7 @@ describe("turn update-card merge hold (U7)", () => {
 			holdHead: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -10916,18 +11229,18 @@ describe("turn update-card merge hold (U7)", () => {
 	});
 
 	test("an approved card with no worktree and its head not on the target parks with the worktree-gone reason", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			// Fails closed like the real git read: containment must be proven, never assumed.
 			targetContains: async () => false,
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, {
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, {
 			updateIds: ["a@1"],
 			worktree: "/nonexistent/ottr-341-worktree",
 			branch: "ott/update-pins",
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			pendingPrompt: "Approved.",
 			pendingBy: "user",
 			state: "queued",
@@ -10937,7 +11250,7 @@ describe("turn update-card merge hold (U7)", () => {
 			holdHead: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"The card's worktree is gone; its work is not on origin/main. Cancel the card or recreate the work.",
@@ -10949,7 +11262,7 @@ describe("turn update-card merge hold (U7)", () => {
 	// and retro cards never commit, and base is always an ancestor of the target. The guard
 	// must not settle such a card done on that vacuous proof; it rebuilds the worktree instead.
 	test("a husk worktree whose branch has no commits past base recreates the worktree and dispatches", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			// The zero-commit branch tip sits at base (sha0), which is always an ancestor of the
 			// target: containment holds vacuously and must not settle the card done unheard.
@@ -10957,8 +11270,8 @@ describe("turn update-card merge hold (U7)", () => {
 				ref === "refs/heads/ott/do-a-thing" ? "sha0" : null,
 			targetContains: async () => true,
 		});
-		const task = store.createTask("do a thing");
-		store.updateTask(task.id, {
+		const task = await store.createTask("do a thing");
+		await store.updateTask(task.id, {
 			worktree: join(tmpdir(), "ottr-349-worktree"),
 			branch: "ott/do-a-thing",
 		});
@@ -10971,20 +11284,20 @@ describe("turn update-card merge hold (U7)", () => {
 		});
 		// The turn ran in the rebuilt worktree; no done settle consumed it unheard.
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.needsReason).toBeNull();
+		expect((await store.getTask(task.id))!.needsReason).toBeNull();
 	});
 
 	// OTTR-347: a husk whose branch survives holds the work; the tracker rebuilds the
 	// worktree from the branch and dispatches instead of parking.
 	test("a queued card whose husk worktree can be rebuilt from its branch recreates and dispatches", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			// The branch exists with a head the target does not contain.
 			targetSha: async (_p: string, ref: string) =>
 				ref === "refs/heads/ott/rebuild-me" ? "branch-sha" : null,
 		});
-		const task = store.createTask("rebuild me");
-		store.updateTask(task.id, {
+		const task = await store.createTask("rebuild me");
+		await store.updateTask(task.id, {
 			// A path whose missing parents sit under a writable root: the fake createWorktree
 			// mkdirs the path, and "/nonexistent/..." throws EACCES for a non-root runner,
 			// which parked the turn as "Tracker error" and left record.runs empty on CI.
@@ -11000,19 +11313,19 @@ describe("turn update-card merge hold (U7)", () => {
 			base: "branch-sha",
 		});
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.needsReason).toBeNull();
+		expect((await store.getTask(task.id))!.needsReason).toBeNull();
 	});
 
 	test("a review card's husk worktree on its frozen base recreates and runs instead of settling done", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			// The review card's branch sits at its frozen base: containment is vacuous.
 			targetSha: async (_p, ref) =>
 				ref === "refs/heads/ott/review-the-board" ? "sha0" : null,
 			targetContains: async () => true,
 		});
-		const task = store.createTask("review the board", null, "review");
-		store.updateTask(task.id, {
+		const task = await store.createTask("review the board", null, "review");
+		await store.updateTask(task.id, {
 			base: "sha0",
 			worktree: join(tmpdir(), "ottr-349-review-worktree"),
 			branch: "ott/review-the-board",
@@ -11021,17 +11334,17 @@ describe("turn update-card merge hold (U7)", () => {
 		expect(record.createWorktree).toHaveLength(1);
 		// The review ran; the buggy guard settled the card done with zero runs here.
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.needsReason).toBeNull();
+		expect((await store.getTask(task.id))!.needsReason).toBeNull();
 	});
 
 	test("a husk worktree whose branch is gone recreates the worktree from base", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			// The branch ref is gone: no proof either way, and a husk holds nothing recoverable.
 			targetSha: async () => null,
 		});
-		const task = store.createTask("do a thing");
-		store.updateTask(task.id, {
+		const task = await store.createTask("do a thing");
+		await store.updateTask(task.id, {
 			worktree: join(tmpdir(), "ottr-349-gone-branch-worktree"),
 			branch: "ott/do-a-thing",
 		});
@@ -11045,21 +11358,21 @@ describe("turn update-card merge hold (U7)", () => {
 	});
 
 	test("a husk worktree whose branch is gone and whose approved head is not on the target parks", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			worktreeHusk: async () => true,
 			// The branch ref is gone and the approved head never reached the target: nothing
 			// to rebuild from, so the card parks for the user.
 			targetSha: async () => null,
 			targetContains: async () => false,
 		});
-		const task = store.createTask("do a thing");
-		store.updateTask(task.id, {
+		const task = await store.createTask("do a thing");
+		await store.updateTask(task.id, {
 			worktree: join(tmpdir(), "ottr-347-park-worktree"),
 			branch: "ott/do-a-thing",
 			updateMergeHead: "sha9",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"The card's worktree is gone; its work is not on origin/main. Cancel the card or recreate the work.",
@@ -11069,17 +11382,17 @@ describe("turn update-card merge hold (U7)", () => {
 	});
 
 	test("a queued card whose worktree still exists dispatches as before", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 		});
-		const task = store.createTask("do a thing");
-		store.updateTask(task.id, {
+		const task = await store.createTask("do a thing");
+		await store.updateTask(task.id, {
 			worktree: "/fake/ottr-341-worktree",
 			branch: "ott/do-a-thing",
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.needsReason).toBeNull();
+		expect((await store.getTask(task.id))!.needsReason).toBeNull();
 	});
 });
 
@@ -11102,30 +11415,30 @@ describe("turn survivor round 4", () => {
 
 	test("quarantine note over 20 files: exactly 20 names and the ellipsis", async () => {
 		const files = Array.from({ length: 21 }, (_, i) => `f${i + 1}.tmp`);
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			quarantineUntracked: async () => files,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		const names = files.slice(0, 20).join(", ");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`quarantined 21 untracked file(s) to .tasks/quarantine/${task.id}: ${names} …\n`,
 		);
 	});
 
 	test("quarantine note at 2 files: the line ends after the last name", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			quarantineUntracked: async () => [".smoke-1.png", ".smoke-2.png"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`quarantined 2 untracked file(s) to .tasks/quarantine/${task.id}: ` +
 				".smoke-1.png, .smoke-2.png\n",
 		);
@@ -11136,8 +11449,8 @@ describe("turn survivor round 4", () => {
 		// The worktree dies during the run: the first husk read is OTTR-341's dispatch
 		// guard (alive), the settle's later reads see the husk and read the main repo.
 		let huskReads = 0;
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0, // hold the chained merge turn; each settle runs via a direct runTurn
+		const { store, loop } = await setup({
+			holdFollowUps: true, // hold the chained merge turn; each settle runs via a direct runTurn
 			worktreeHusk: async () => huskReads++ > 0,
 			branchMergedOrGone: async (...args: unknown[]) => {
 				bmgCalls.push(args);
@@ -11147,8 +11460,8 @@ describe("turn survivor round 4", () => {
 				throw new Error("a husk turn must not read the worktree tree");
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
@@ -11158,8 +11471,8 @@ describe("turn survivor round 4", () => {
 		// fromMain passes the branch itself — never a placeholder or a dropped argument.
 		expect(bmgCalls).toEqual([[store.path, "ott/x", "origin/main"]]);
 
-		const branchless = store.createTask("merge without branch");
-		store.updateTask(branchless.id, {
+		const branchless = await store.createTask("merge without branch");
+		await store.updateTask(branchless.id, {
 			stage: "merging",
 			base: "sha0",
 			worktree: "wt-y",
@@ -11169,27 +11482,27 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("a no-stderr death without images never quarantines images or retries text-only", async () => {
-		const { store, loop } = setup({
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("sess-1");
+		const { store, loop } = await setup({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("sess-1");
 				return dieBeforeOutput();
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason ?? "").not.toContain("retrying text-only");
-		expect(logText(store, task.id)).not.toContain("provider rejected");
+		expect(await logText(store, task.id)).not.toContain("provider rejected");
 	});
 
 	test("the provider note is logged exactly once per rejected turn", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // the text-only retry runs via a direct runTurn below
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // the text-only retry runs via a direct runTurn below
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				if (record.runs.length === 1) return dieBeforeOutput();
-				o.onSession?.("sess-2");
+				await o.onSession?.("sess-2");
 				return {
 					pid: 4243,
 					done: Promise.resolve(
@@ -11201,40 +11514,41 @@ describe("turn survivor round 4", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
-		setImage(store, task.id, "1.png", "rejected-bytes");
-		store.updateTask(task.id, { images: ["1.png"] });
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "1.png", "rejected-bytes");
+		await store.updateTask(task.id, { images: ["1.png"] });
 
 		await loop.runTurn(store.name, task.id);
 
 		// The classification note (appendLog) and the quarantine note must not double-log.
-		const hits = logText(store, task.id).match(/provider rejected/g) ?? [];
+		const hits =
+			(await logText(store, task.id)).match(/provider rejected/g) ?? [];
 		expect(hits).toHaveLength(1);
 	});
 
 	test("an image quarantine failure parks the card at needs_you with the exact stage", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				return dieBeforeOutput();
 			},
 		});
-		const task = store.createTask("work please");
-		setImage(store, task.id, "1.png", "rejected-bytes");
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "1.png", "rejected-bytes");
 		// A file where the quarantine dir must be: every rename/mkdir inside fails.
 		mkdirSync(join(store.tasksDir, "quarantine"), { recursive: true });
 		writeFileSync(join(store.tasksDir, "quarantine", task.id), "blocked");
-		store.updateTask(task.id, { images: ["1.png"] });
+		await store.updateTask(task.id, { images: ["1.png"] });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.stage).toBe("in_progress");
 		expect(after.needsReason).toMatch(/^Image quarantine failed: .+\.$/);
-		expect(store.listTurns(task.id)[0]!.error ?? "").toContain(
+		expect((await store.listTurns(task.id))[0]!.error ?? "").toContain(
 			"Image quarantine failed",
 		);
 	});
@@ -11242,18 +11556,18 @@ describe("turn survivor round 4", () => {
 	test("a plain review that lands done never publishes a release", async () => {
 		// A review commits nothing: no commits ahead of the target. No finding cards exist,
 		// so findingsHold returns null and the done settle must not touch release plumbing.
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 		});
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
 
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(record.publishRelease).toHaveLength(0);
@@ -11261,59 +11575,59 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("ui-shot re-prompt reason is exact", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			changedFiles: async () => ["src/ui/app.tsx"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe(
 			"no screenshot attached - resuming automatically to capture one. Cancel to stop it instead.",
 		);
 	});
 
 	test("a changedFiles crash under the ui-shot guard is swallowed", async () => {
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			changedFiles: async () => {
 				throw new Error("git diff boom");
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 	});
 
 	test("a research crash turn keeps its crash reason, never a missing-report bounce", async () => {
-		const { store, record, loop } = setup({
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return dieBeforeOutput();
 			},
 		});
-		const task = store.createTask("research something");
-		store.updateTask(task.id, { research: true });
+		const task = await store.createTask("research something");
+		await store.updateTask(task.id, { research: true });
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason ?? "").toContain("omp exited with code");
 		expect(after.needsReason ?? "").not.toContain(RESEARCH_REPORT);
 	});
 
 	test("work done without an outcome keeps summary, details, topic and queuedAt exact", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -11326,15 +11640,15 @@ describe("turn survivor round 4", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			summary: "before",
 			details: "old details",
 			queuedAt: 12345,
 		});
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.summary).toBe("before");
 		expect(after.details).toBe("shipped the thing\ntopic: widgets");
 		expect(after.topic).toBe("widgets");
@@ -11343,10 +11657,10 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("an integrated merge without a version stamps nothing and never logs a null-version skip", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			targetSha: async () => "sha-pushed",
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("sess-1");
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -11361,26 +11675,28 @@ describe("turn survivor round 4", () => {
 				};
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// No version in the report: no stamp, and the skip log names the version, never "null".
 		expect(after.releaseVersion).toBe(null);
 		expect(after.pushSha).toBe("sha-pushed");
-		expect(logText(store, task.id)).not.toContain("no release stamp for null");
+		expect(await logText(store, task.id)).not.toContain(
+			"no release stamp for null",
+		);
 	});
 
 	test("tracker error writes the bang line to the turn log", async () => {
-		const { store, record, loop } = setup({
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.reject(new Error("boom")),
@@ -11388,32 +11704,32 @@ describe("turn survivor round 4", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		expect(logText(store, task.id)).toContain("! boom\n");
+		expect(await logText(store, task.id)).toContain("! boom\n");
 	});
 });
 
 describe("turn fork-born merge hold", () => {
-	function forkCase(overrides: Partial<TurnOps> = {}) {
-		const s = setup({ commitsAhead: async () => 0, ...overrides });
-		const parent = s.store.createTask("fork research: weekly digest");
-		s.store.updateTask(parent.id, {
+	async function forkCase(overrides: FixtureOps = {}) {
+		const s = await setup({ commitsAhead: async () => 0, ...overrides });
+		const parent = await s.store.createTask("fork research: weekly digest");
+		await s.store.updateTask(parent.id, {
 			topic: "fork research",
 			research: true,
 			stage: "done",
 			state: "idle",
 		});
-		const task = s.store.createTask("adopt fork idea");
-		s.store.updateTask(task.id, { followUpOf: parent.id });
+		const task = await s.store.createTask("adopt fork idea");
+		await s.store.updateTask(task.id, { followUpOf: parent.id });
 		return { ...s, task };
 	}
 
 	test("a fork-born done card parks for merge approval, even with holdUpdateMerges off", async () => {
-		const { store, record, loop, task } = forkCase();
+		const { store, record, loop, task } = await forkCase();
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(FORK_HOLD_REASON);
@@ -11421,19 +11737,19 @@ describe("turn fork-born merge hold", () => {
 	});
 
 	test("with forkMergeHold off a fork-born card settles done like any work card", async () => {
-		const { store, record, loop, task } = forkCase();
-		store.setSettings({ forkMergeHold: false });
+		const { store, record, loop, task } = await forkCase();
+		await store.setSettings({ forkMergeHold: false });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("turning forkMergeHold off does not release a card parked on a fork hold", async () => {
-		const { store, record, loop, task } = forkCase();
+		const { store, record, loop, task } = await forkCase();
 		// Parked as today: the settle left a head to approve and spent no fork approval.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			state: "queued",
 			pendingPrompt: "keep going",
 			pendingBy: "user",
@@ -11441,59 +11757,63 @@ describe("turn fork-born merge hold", () => {
 			holdHead: "sha-1",
 			forkMergeHead: null,
 		});
-		store.setSettings({ forkMergeHold: false });
+		await store.setSettings({ forkMergeHold: false });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(FORK_HOLD_REASON);
 		expect(record.removeWorktree).toHaveLength(0);
 	});
 
 	test("an approved fork-born card integrates only at the approved head", async () => {
-		const { store, record, loop, task } = forkCase();
-		store.updateTask(task.id, { forkMergeHead: "sha-1" });
+		const { store, record, loop, task } = await forkCase();
+		await store.updateTask(task.id, { forkMergeHead: "sha-1" });
 		// The fake HEAD is unreadable (null): the approval does not match.
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.needsReason).toBe(FORK_HOLD_REASON);
+		expect((await store.getTask(task.id))!.needsReason).toBe(FORK_HOLD_REASON);
 		expect(record.removeWorktree).toHaveLength(0);
-		const ok = forkCase({ targetSha: async () => "sha-1" });
-		ok.store.updateTask(ok.task.id, { forkMergeHead: "sha-1" });
+		const ok = await forkCase({ targetSha: async () => "sha-1" });
+		await ok.store.updateTask(ok.task.id, { forkMergeHead: "sha-1" });
 		await ok.loop.runTurn(ok.store.name, ok.task.id);
-		expect(ok.store.getTask(ok.task.id)!.stage).toBe("done");
+		expect((await ok.store.getTask(ok.task.id))!.stage).toBe("done");
 		expect(ok.record.removeWorktree).toHaveLength(1);
 	});
 
 	test("a card filed from a fork-born card inherits the hold", async () => {
-		const { store, loop, task } = forkCase();
-		const child = store.createTask("split-off fork work");
-		store.updateTask(child.id, { followUpOf: task.id });
+		const { store, loop, task } = await forkCase();
+		const child = await store.createTask("split-off fork work");
+		await store.updateTask(child.id, { followUpOf: task.id });
 		await loop.runTurn(store.name, child.id);
-		expect(store.getTask(child.id)!.needsReason).toBe(FORK_HOLD_REASON);
+		expect((await store.getTask(child.id))!.needsReason).toBe(FORK_HOLD_REASON);
 	});
 
 	test("a retro filed below fork-born work settles done and files its proposal", async () => {
-		const { store, record, loop, task } = forkCase();
+		const { store, record, loop, task } = await forkCase();
 		record.proposal = {
 			prompt: "Add a benchmark",
 			model: null,
 			summary: null,
 			project: null,
 		};
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
-		store.updateTask(retro.id, { followUpOf: task.id });
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
+		await store.updateTask(retro.id, { followUpOf: task.id });
 		await loop.runTurn(store.name, retro.id);
-		expect(store.getTask(retro.id)!.stage).toBe("done");
+		expect((await store.getTask(retro.id))!.stage).toBe("done");
 		expect(
-			store.listTasks().filter((t) => t.followUpOf === retro.id),
+			(await store.listTasks()).filter((t) => t.followUpOf === retro.id),
 		).toHaveLength(1);
 	});
 
 	test("a follow-up of a non-fork parent settles done", async () => {
-		const { store, loop, task } = forkCase();
-		const retro = store.createTask("weekly retro");
-		store.updateTask(task.id, { followUpOf: retro.id });
+		const { store, loop, task } = await forkCase();
+		const retro = await store.createTask("weekly retro");
+		await store.updateTask(task.id, { followUpOf: retro.id });
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 });
 
@@ -11501,16 +11821,16 @@ describe("fork-born work check before the hold", () => {
 	// A fork-born card whose ready report carries commits classifies merging/queued; the
 	// fork hold would park it, and the second-model check must judge the head first
 	// (OTTR-766: the park must not preempt the check).
-	function forkCheckCase(
+	async function forkCheckCase(
 		head: { sha: string },
 		checks: RunResult[],
-		overrides: Partial<TurnOps> = {},
+		overrides: FixtureOps = {},
 		works: RunResult[] = [],
 	) {
 		const record = baseRecord();
-		const s = setupWith(record, {
+		const s = await setupWith(record, {
 			// Holds the chained send-back turn so each test asserts the settle instant.
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			startRun: checkedRun(record, checks, works),
@@ -11518,40 +11838,42 @@ describe("fork-born work check before the hold", () => {
 			diffText: async () => "const x = 1;\n",
 			...overrides,
 		});
-		const parent = s.store.createTask("fork research: weekly digest");
-		s.store.updateTask(parent.id, {
+		const parent = await s.store.createTask("fork research: weekly digest");
+		await s.store.updateTask(parent.id, {
 			topic: "fork research",
 			research: true,
 			stage: "done",
 			state: "idle",
 		});
-		const task = s.store.createTask("adopt fork idea");
-		s.store.updateTask(task.id, { followUpOf: parent.id });
+		const task = await s.store.createTask("adopt fork idea");
+		await s.store.updateTask(task.id, { followUpOf: parent.id });
 		return { ...s, task };
 	}
 
 	test("a fork-born ready report starts a work check before the hold parks", async () => {
-		const { store, record, loop, task } = forkCheckCase({ sha: "sha-1" }, [
-			pass(["small nit"]),
-		]);
+		const { store, record, loop, task } = await forkCheckCase(
+			{ sha: "sha-1" },
+			[pass(["small nit"])],
+		);
 		await loop.runTurn(store.name, task.id);
 
 		// The work run and the check ran; the park never preempted the check.
 		expect(record.runs).toHaveLength(2);
 		expect(record.runs[1]!.prompt).toContain("You are the second model");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");
 		expect(after.workCheckHead).toBe("sha-1");
 	});
 
 	test("a passed fork-born check parks the hold at the checked head", async () => {
-		const { store, record, loop, task } = forkCheckCase({ sha: "sha-1" }, [
-			pass(),
-		]);
+		const { store, record, loop, task } = await forkCheckCase(
+			{ sha: "sha-1" },
+			[pass()],
+		);
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(FORK_HOLD_REASON);
@@ -11566,13 +11888,14 @@ describe("fork-born work check before the hold", () => {
 	});
 
 	test("a blocking fork-born check sends the work back instead of parking", async () => {
-		const { store, record, loop, task } = forkCheckCase({ sha: "sha-1" }, [
-			block("tests were weakened", "const x = 1;"),
-		]);
+		const { store, record, loop, task } = await forkCheckCase(
+			{ sha: "sha-1" },
+			[block("tests were weakened", "const x = 1;")],
+		);
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(2); // work run + check run; no park, no merge turn
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBeNull();
@@ -11583,7 +11906,7 @@ describe("fork-born work check before the hold", () => {
 	});
 
 	test("an approval routes the checked fork-born card through the merge queue", async () => {
-		const { store, loop, task } = forkCheckCase(
+		const { store, loop, task } = await forkCheckCase(
 			{ sha: "sha-1" },
 			[pass()],
 			{ maxTotalRuns: () => 10 },
@@ -11598,13 +11921,15 @@ describe("fork-born work check before the hold", () => {
 			],
 		);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.needsReason).toBe(FORK_HOLD_REASON);
+		expect((await store.getTask(task.id))!.needsReason).toBe(FORK_HOLD_REASON);
 		// The head the approval will cover is the head the check passed.
-		expect(store.getTask(task.id)!.workCheckLog[0]!.outcome).toBe("pass");
+		expect((await store.getTask(task.id))!.workCheckLog[0]!.outcome).toBe(
+			"pass",
+		);
 
 		// The drawer's approval reply spends the parked head and queues the merge turn
 		// (the exact write holdApprovalReply makes on APPROVE_REPLY).
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			needsReason: null,
@@ -11614,19 +11939,19 @@ describe("fork-born work check before the hold", () => {
 		await loop.runTurn(store.name, task.id);
 
 		// The merge turn integrated; the work turn never merged by itself.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
 	});
 });
 
 describe("trusted kind, not prompt text", () => {
-	test("a work card with a privileged marker prompt gets no privileged kind", () => {
-		const { store } = setup();
-		store.createTask(`${RETRO_MARKER}retro text`);
-		store.createTask(`${ARCH_REVIEW_MARKER}review text`);
-		store.createTask(`${RULES_INTERVIEW_MARKER}interview text`);
-		const tasks = store.listTasks();
+	test("a work card with a privileged marker prompt gets no privileged kind", async () => {
+		const { store } = await setup();
+		await store.createTask(`${RETRO_MARKER}retro text`);
+		await store.createTask(`${ARCH_REVIEW_MARKER}review text`);
+		await store.createTask(`${RULES_INTERVIEW_MARKER}interview text`);
+		const tasks = await store.listTasks();
 		const retro = tasks.find((t) => t.prompt === `${RETRO_MARKER}retro text`)!;
 		const review = tasks.find(
 			(t) => t.prompt === `${ARCH_REVIEW_MARKER}review text`,
@@ -11646,9 +11971,9 @@ describe("trusted kind, not prompt text", () => {
 			),
 		).toBeUndefined();
 		// A real interview card keeps its exemption.
-		const real = store.createTask("real interview", null, "interview");
+		const real = await store.createTask("real interview", null, "interview");
 		expect(
-			pickRunnable(store.listTasks(), {
+			pickRunnable(await store.listTasks(), {
 				maxParallel: null,
 				hasRules: false,
 			}).find((t) => t.id === real.id),
@@ -11657,13 +11982,13 @@ describe("trusted kind, not prompt text", () => {
 });
 
 describe("review findings check", () => {
-	const reviewCard = (store: ProjectStore) => {
-		const review = store.createTask(
+	const reviewCard = async (store: ProjectStore) => {
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		return review;
 	};
 	const finding = (
@@ -11675,13 +12000,13 @@ describe("review findings check", () => {
 	test("recorded findings park the review, run one check, and file the kept ones", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1), finding("Bug B", 2)];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
 			commitSubjects: async () => ["a1 fix it upstream"],
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -11701,9 +12026,9 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		// Parked while the (kept) finding is open, exactly like create_task findings.
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
@@ -11721,7 +12046,9 @@ describe("review findings check", () => {
 		expect(check.prompt).toContain("Bug A");
 		expect(check.prompt).toContain("a1 fix it upstream");
 		// Only the kept finding becomes a card, linked to the review like create_task linked it.
-		const kids = store.listTasks().filter((t) => t.followUpOf === review.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === review.id,
+		);
 		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
 		// The scheduler may already have claimed the card; the queue stage is the contract.
 		expect(kids[0]!.stage).toBe("todo");
@@ -11739,13 +12066,13 @@ describe("review findings check", () => {
 		// provider prefix); a critic that also points at Claude warns on the card.
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			modelRoles: () => ({ critic: "anthropic/claude-opus-5-5:medium" }),
 			commitSubjects: async () => ["a1 fix it upstream"],
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -11763,11 +12090,11 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		expect(record.runs[1]!.model).toBe("anthropic/claude-opus-5-5:medium");
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.summary).toContain(
 			"check 0s on anthropic/claude-opus-5-5:medium — same vendor as the review",
 		);
@@ -11776,13 +12103,13 @@ describe("review findings check", () => {
 	test("a release's recorded blockers file as findings and park it at merging, unapproved", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Blocker: the notes drop the late commits", 1)];
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
 			commitSubjects: async () => ["a1 fix it upstream"],
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -11806,20 +12133,22 @@ describe("review findings check", () => {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const release = store.createTask("release v2.0.0");
-		store.updateTask(release.id, {
+		const release = await store.createTask("release v2.0.0");
+		await store.updateTask(release.id, {
 			base: "shaR",
 			releaseVersion: "v2.0.0",
 			releaseNotes: "notes body",
 		});
 		await loop.runTurn(store.name, release.id);
-		const after = store.getTask(release.id)!;
+		const after = (await store.getTask(release.id))!;
 		// The answered report parks the release at merging while the finding is open, not needs_you.
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
 		// The check filed the blocker as a finding card that holds the release.
-		const kids = store.listTasks().filter((t) => t.followUpOf === release.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === release.id,
+		);
 		expect(kids.map((k) => k.prompt)).toEqual([
 			"Blocker: the notes drop the late commits",
 		]);
@@ -11834,21 +12163,21 @@ describe("review findings check", () => {
 			...Array.from({ length: 12 }, (_, i) => finding(`Bug ${i + 1}`, i + 1)),
 			finding("Sec leak", 13, "high"),
 		];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			reviewCheck: () => false,
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(1); // the review only: no check session
-		const kids = store
-			.listTasks()
+		const kids = (await store.listTasks())
 			.filter((t) => t.followUpOf === review.id)
 			.map((t) => t.prompt);
 		expect(kids).toHaveLength(11); // cap 10 + the confirmed high security finding
 		expect(kids).toContain("Sec leak");
 		expect(kids).not.toContain("Bug 11");
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.details).toContain("below the cap of 10: Bug 11");
 		expect(after.summary).toContain("13 recorded, 11 filed, 2 not filed");
 	});
@@ -11856,11 +12185,11 @@ describe("review findings check", () => {
 	test("a failed check run retries once and then files", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -11880,22 +12209,24 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(3); // review + failed check + retry
-		const kids = store.listTasks().filter((t) => t.followUpOf === review.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === review.id,
+		);
 		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
-		expect(store.getTask(review.id)!.state).toBe("idle");
+		expect((await store.getTask(review.id))!.state).toBe("idle");
 	});
 
 	test("a check that fails twice leaves the review needs_you with the error and files nothing", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -11913,33 +12244,36 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(3); // review + two check attempts
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("failed twice");
-		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
-			[],
-		);
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
+		).toEqual([]);
 	});
 
 	/** A review whose check hits the openai-codex usage limit; `duringQuota` runs while the
 	 * board awaits the quota for the check's hold (the second fetch — the start gate's own
 	 * fetch comes first), where a cancel or a steer can land. */
 	async function limitedReview(
-		duringQuota: (store: ProjectStore, id: string) => void = () => {},
+		duringQuota: (
+			store: ProjectStore,
+			id: string,
+		) => unknown | Promise<unknown> = () => {},
 	) {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
 		const resetsAt = Date.now() + 3_600_000;
 		const ref: { id: string; store?: ProjectStore } = { id: "" };
 		let quotaCalls = 0;
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			quota: async () => {
 				quotaCalls++;
-				if (quotaCalls === 2) duringQuota(ref.store!, ref.id);
+				if (quotaCalls === 2) await duringQuota(ref.store!, ref.id);
 				return {
 					limits: [
 						{
@@ -11955,9 +12289,9 @@ describe("review findings check", () => {
 					at: Date.now(),
 				};
 			},
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -11977,7 +12311,7 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		ref.store = store;
 		ref.id = review.id;
 		await loop.runTurn(store.name, review.id);
@@ -11987,15 +12321,15 @@ describe("review findings check", () => {
 	test("a check at the usage limit holds the review until the reset and files nothing", async () => {
 		const { record, store, review, resetsAt } = await limitedReview();
 		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at the limit
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.holdUntil).toBe(resetsAt);
 		expect(after.needsReason).toContain("openai-codex usage limit");
 		expect(after.pendingPrompt).toContain("usage limit");
-		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
-			[],
-		);
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
+		).toEqual([]);
 	});
 
 	test("a review check 429 with a long retry-after holds the review instead of parking", async () => {
@@ -12003,11 +12337,11 @@ describe("review findings check", () => {
 		record.recorded = [finding("Bug A", 1)];
 		const wait = 9_169_000;
 		const before = Date.now();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -12025,38 +12359,40 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at a long wait
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.holdUntil).toBeGreaterThanOrEqual(before + wait);
 		expect(after.holdUntil).toBeLessThan(before + wait + 5_000);
 		expect(after.holdProvider).toBeNull();
 		expect(after.needsReason).toContain("rate limit");
-		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
-			[],
-		);
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
+		).toEqual([]);
 	});
 
 	test("a cancel that keeps the worktree during the quota await is not resumed by the hold", async () => {
 		const kept = "Cancel kept the worktree: uncommitted changes";
-		const { store, review } = await limitedReview((s, id) =>
-			s.updateTask(id, { state: "needs_you", needsReason: kept }),
+		const { store, review } = await limitedReview(
+			async (s, id) =>
+				await s.updateTask(id, { state: "needs_you", needsReason: kept }),
 		);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(kept);
 		expect(after.holdUntil).toBeNull();
 	});
 
 	test("a message steered during the quota await survives the hold", async () => {
-		const { store, review } = await limitedReview((s, id) =>
-			s.updateTask(id, { pendingPrompt: "also check the docs" }),
+		const { store, review } = await limitedReview(
+			async (s, id) =>
+				await s.updateTask(id, { pendingPrompt: "also check the docs" }),
 		);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toStartWith("also check the docs\n\n");
 		expect(after.pendingPrompt).toContain("usage limit");
@@ -12066,7 +12402,7 @@ describe("review findings check", () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
 		const before = Date.now();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			// 40% used: no exhausted window, so usageResetFor finds no reset (OTTR-880).
 			quota: async () => ({
@@ -12083,9 +12419,9 @@ describe("review findings check", () => {
 				error: null,
 				at: Date.now(),
 			}),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				const result =
 					record.runs.length === 1
 						? runResult({
@@ -12105,11 +12441,11 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		expect(record.runs).toHaveLength(2); // review + one check attempt: no retry at the limit
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
@@ -12120,9 +12456,9 @@ describe("review findings check", () => {
 		// The stamp lets the quota refresh gate its early release on this hold.
 		expect(after.holdSetAt).toBeGreaterThan(0);
 		expect(after.needsReason).toContain("tries again");
-		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
-			[],
-		);
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
+		).toEqual([]);
 	});
 
 	// The dispatched model's provider is out of quota: the start gate holds until the
@@ -12148,9 +12484,9 @@ describe("review findings check", () => {
 			});
 		const dyingRun =
 			(record: Recorded, model = "fake/glm") =>
-			(o: Parameters<TurnOps["startRun"]>[0]) => {
+			async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -12163,8 +12499,8 @@ describe("review findings check", () => {
 					kill: async () => {},
 				};
 			};
-		const runnableIds = (store: ProjectStore, now?: number) =>
-			pickRunnable(store.listTasks(), {
+		const runnableIds = async (store: ProjectStore, now?: number) =>
+			pickRunnable(await store.listTasks(), {
 				maxParallel: null,
 				hasRules: true,
 				now,
@@ -12173,37 +12509,37 @@ describe("review findings check", () => {
 		test("a start at the provider's limit holds the card until the reset and starts nothing", async () => {
 			const resetsAt = Date.now() + 3_600_000;
 			const record = baseRecord();
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				quota: fakeQuota("fake", 100, resetsAt),
 				startRun: dyingRun(record),
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
 
 			expect(record.runs).toHaveLength(0);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBe(resetsAt);
 			expect(after.needsReason).toContain("The fake usage limit is reached");
 			expect(after.needsReason).toContain("starts the task again");
-			expect(runnableIds(store)).not.toContain(task.id);
-			expect(runnableIds(store, resetsAt + 1)).toContain(task.id);
+			expect(await runnableIds(store)).not.toContain(task.id);
+			expect(await runnableIds(store, resetsAt + 1)).toContain(task.id);
 		});
 
 		test("a queued user message overrides the start gate and runs now", async () => {
 			const resetsAt = Date.now() + 3_600_000;
 			const record = baseRecord();
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				quota: fakeQuota("fake", 100, resetsAt),
 				startRun: dyingRun(record),
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
-			expect(store.getTask(task.id)!.holdUntil).toBe(resetsAt);
+			expect((await store.getTask(task.id))!.holdUntil).toBe(resetsAt);
 
 			// The steer route's write: a message on a held card clears the hold and runs it now,
 			// even though the quota state still reports the provider as exhausted.
-			store.updateTask(task.id, {
+			await store.updateTask(task.id, {
 				pendingPrompt: "run it now",
 				pendingBy: "user",
 				holdUntil: null,
@@ -12214,7 +12550,7 @@ describe("review findings check", () => {
 			expect(record.runs[0]!.prompt).toContain("run it now");
 			// The user text is consumed; the run dies at the limit anyway and the death's
 			// continue takes over, holding until the same reset.
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBe(resetsAt);
 			expect(after.pendingPrompt).toBe(".");
@@ -12226,13 +12562,13 @@ describe("review findings check", () => {
 		test("a user message combined under the resume marker overrides the gate too", async () => {
 			const resetsAt = Date.now() + 3_600_000;
 			const record = baseRecord();
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				quota: fakeQuota("fake", 100, resetsAt),
 				startRun: dyingRun(record),
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			// The death-continue's park: the tracker's "." resume, held until the reset.
-			store.updateTask(task.id, {
+			await store.updateTask(task.id, {
 				state: "queued",
 				pendingPrompt: ".",
 				pendingBy: "supervisor",
@@ -12240,7 +12576,7 @@ describe("review findings check", () => {
 			});
 			// The steer route's write on that held card: the message combines under the
 			// marker, the hold clears, and authorship records the user (the run-now signal).
-			store.updateTask(task.id, {
+			await store.updateTask(task.id, {
 				pendingPrompt: ".\n\nrun it now",
 				pendingBy: "user",
 				holdUntil: null,
@@ -12249,7 +12585,7 @@ describe("review findings check", () => {
 
 			expect(record.runs).toHaveLength(1);
 			expect(record.runs[0]!.prompt).toContain("run it now");
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBe(resetsAt);
 			expect(after.pendingPrompt).toBe(".");
@@ -12258,12 +12594,12 @@ describe("review findings check", () => {
 		test("supervisor-parked pending text does not override the start gate", async () => {
 			const resetsAt = Date.now() + 3_600_000;
 			const record = baseRecord();
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				quota: fakeQuota("fake", 100, resetsAt),
 				startRun: dyingRun(record),
 			});
-			const task = store.createTask("work please");
-			store.updateTask(task.id, {
+			const task = await store.createTask("work please");
+			await store.updateTask(task.id, {
 				pendingPrompt: "Report the same outcome again after the reset.",
 				pendingBy: "supervisor",
 			});
@@ -12271,7 +12607,7 @@ describe("review findings check", () => {
 
 			// The park's own instruction waits like the card it parked: no run until the reset.
 			expect(record.runs).toHaveLength(0);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBe(resetsAt);
 			expect(after.pendingPrompt).toBe(
@@ -12284,16 +12620,16 @@ describe("review findings check", () => {
 			const record = baseRecord();
 			// No default role: the start gate cannot bind a provider, so the run goes out;
 			// the served model's provider is the one the death's continue waits for.
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				modelRoles: () => ({}),
 				quota: fakeQuota("fake", 100, resetsAt),
 				startRun: dyingRun(record),
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
 
 			expect(record.runs).toHaveLength(1);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBe(resetsAt);
 			expect(after.pendingPrompt).toBe(".");
@@ -12302,29 +12638,29 @@ describe("review findings check", () => {
 			);
 			expect(after.needsReason).toContain("fake limit resets at");
 			// The turn row carries the reason, so the next classify sees the streak.
-			expect(store.listTurns(task.id).at(-1)!.error).toStartWith(
+			expect((await store.listTurns(task.id)).at(-1)!.error).toStartWith(
 				"The run stopped at the provider's usage limit",
 			);
 			// Held past the reset: the scheduler starts the continue then, not now.
-			expect(runnableIds(store)).not.toContain(task.id);
-			expect(runnableIds(store, resetsAt + 1)).toContain(task.id);
+			expect(await runnableIds(store)).not.toContain(task.id);
+			expect(await runnableIds(store, resetsAt + 1)).toContain(task.id);
 		});
 
 		test("a quota death with a silent report holds a probe wait, and the next death waits longer", async () => {
 			const record = baseRecord();
 			const before = Date.now();
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				// 60% used: no exhausted window, so usageResetFor finds no reset (OTTR-880).
 				quota: fakeQuota("fake", 60, before + 3_600_000),
 				startRun: dyingRun(record),
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
 
 			// The first death holds instead of continuing at once: the scheduler must not
 			// start the card before the probe wait ends, and no second run fires.
 			expect(record.runs).toHaveLength(1);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
 			expect(after.holdUntil).toBeLessThan(before + 31 * 60_000);
@@ -12337,29 +12673,29 @@ describe("review findings check", () => {
 				"The run stopped at the provider's usage limit",
 			);
 			expect(after.needsReason).toContain("tries again at");
-			expect(runnableIds(store)).not.toContain(task.id);
+			expect(await runnableIds(store)).not.toContain(task.id);
 
 			// The wait ends (the scheduler picks the card up then): the retry dies the same
 			// way and holds again with the doubled wait — never parks needs_you.
-			store.updateTask(task.id, { holdUntil: before - 1 });
+			await store.updateTask(task.id, { holdUntil: before - 1 });
 			await loop.runTurn(store.name, task.id);
 			expect(record.runs).toHaveLength(2);
-			const held = store.getTask(task.id)!;
+			const held = (await store.getTask(task.id))!;
 			expect(held.state).toBe("queued");
 			expect(held.holdUntil).toBeGreaterThanOrEqual(before + 60 * 60_000);
 			expect(held.holdUntil).toBeLessThan(before + 61 * 60_000);
 			expect(held.holdAttempts).toBe(2);
-			expect(runnableIds(store)).not.toContain(task.id);
+			expect(await runnableIds(store)).not.toContain(task.id);
 		});
 
 		test("the automatic continue runs the task and its success settles normally", async () => {
 			const record = baseRecord();
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				commitsAhead: async () => 0,
 				quota: fakeQuota("fake", 60, Date.now() + 3_600_000),
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess");
+					await o.onSession?.("sess");
 					// The continue succeeds with an answered outcome and no commits: the card
 					// settles done/idle, which the merge queue does not pick up, so the
 					// background chain ends here.
@@ -12380,15 +12716,15 @@ describe("review findings check", () => {
 					};
 				},
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
 			// The death held a probe wait; when it ends the scheduler starts the continue.
-			expect(store.getTask(task.id)!.holdAttempts).toBe(1);
-			store.updateTask(task.id, { holdUntil: Date.now() - 1 });
+			expect((await store.getTask(task.id))!.holdAttempts).toBe(1);
+			await store.updateTask(task.id, { holdUntil: Date.now() - 1 });
 			await loop.runTurn(store.name, task.id);
 
 			expect(record.runs).toHaveLength(2);
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			// The continue's successful run settled the card like any answered work turn.
 			expect(after.stage).toBe("done");
 			expect(after.state).toBe("idle");
@@ -12396,7 +12732,7 @@ describe("review findings check", () => {
 			expect(after.pendingPrompt).toBeNull();
 			// The turn ran past the limit: the consecutive-hold count cleared.
 			expect(after.holdAttempts).toBe(0);
-			expect(store.listTurns(task.id)).toHaveLength(2);
+			expect(await store.listTurns(task.id)).toHaveLength(2);
 		});
 
 		test("an error-named reset without a zone holds the probe wait, not the named time", async () => {
@@ -12406,11 +12742,11 @@ describe("review findings check", () => {
 			const named = new Date(before + 86_400_000);
 			const p = (n: number) => String(n).padStart(2, "0");
 			const text = `429 Weekly/Monthly Limit Exhausted. Your limit will reset at ${named.getUTCFullYear()}-${p(named.getUTCMonth() + 1)}-${p(named.getUTCDate())} ${p(named.getUTCHours())}:${p(named.getUTCMinutes())}:${p(named.getUTCSeconds())} (type=1310)`;
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				quota: fakeQuota("fake", 60, before + 3_600_000),
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess");
+					await o.onSession?.("sess");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -12424,10 +12760,10 @@ describe("review findings check", () => {
 					};
 				},
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
 
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			// The board never guesses the zone: the probe wait, not the named time.
 			expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
@@ -12441,11 +12777,11 @@ describe("review findings check", () => {
 			const before = Date.now();
 			const named = before + 86_400_000;
 			const at = new Date(named).toISOString().slice(0, 16).replace("T", " ");
-			const { store, loop } = setupWith(record, {
+			const { store, loop } = await setupWith(record, {
 				quota: fakeQuota("fake", 60, before + 3_600_000),
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess");
+					await o.onSession?.("sess");
 					return {
 						pid: 4242,
 						done: Promise.resolve(
@@ -12459,10 +12795,10 @@ describe("review findings check", () => {
 					};
 				},
 			});
-			const task = store.createTask("work please");
+			const task = await store.createTask("work please");
 			await loop.runTurn(store.name, task.id);
 
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.state).toBe("queued");
 			expect(after.holdUntil).toBe(Date.parse(`${at.replace(" ", "T")}Z`));
 			expect(after.holdProvider).toBe("fake");
@@ -12477,11 +12813,11 @@ describe("review findings check", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -12497,7 +12833,7 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		const turn = loop.runTurn(store.name, review.id);
 		await flushPromises();
 		expect(record.runs).toHaveLength(2);
@@ -12511,7 +12847,9 @@ describe("review findings check", () => {
 		expect([...loop.running.keys()]).not.toContain(
 			`${store.name}/${review.id}:check`,
 		);
-		const kids = store.listTasks().filter((t) => t.followUpOf === review.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === review.id,
+		);
 		expect(kids).toHaveLength(1);
 	});
 
@@ -12522,14 +12860,14 @@ describe("review findings check", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			// Cap 1: after the sweep, a queued card must start again (both cap units gone).
 			maxTotalRuns: () => 1,
 			commitsAhead: async () => 0,
 			pidAlive: () => false, // the check's omp died; a grandchild keeps `done` hanging
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -12554,18 +12892,18 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		const run = loop.runTurn(store.name, review.id);
 		await flushPromises();
 		expect([...loop.running.keys()]).toContain(
 			`${store.name}/${review.id}:check`,
 		);
-		expect(store.getTask(review.id)!.state).toBe("running");
+		expect((await store.getTask(review.id))!.state).toBe("running");
 
-		loop.schedule(); // the tick: the check pid is dead
+		await loop.schedule(); // the tick: the check pid is dead
 		await flushPromises();
 
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("lost check agent process (pid 4242)");
 		expect([...loop.running.keys()]).not.toContain(
@@ -12576,14 +12914,14 @@ describe("review findings check", () => {
 			runResult({ finalText: '[{"id":1,"keep":true,"reason":""}]' }),
 		);
 		await run;
-		expect(store.getTask(review.id)!.state).toBe("needs_you");
-		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
-			[],
-		);
+		expect((await store.getTask(review.id))!.state).toBe("needs_you");
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
+		).toEqual([]);
 
 		// Both cap units are free: a queued card starts under the cap of 1.
-		store.createTask("other card");
-		loop.schedule();
+		await store.createTask("other card");
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(3); // review + check + the other card's run
 	});
@@ -12595,13 +12933,14 @@ describe("review findings check", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0, // keep any follow-up turn from claiming mid-assertion
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true, // keep any follow-up turn from claiming mid-assertion
+			scheduledCap: 0,
 			commitsAhead: async () => 0,
 			pidAlive: () => true, // the check's own pid is alive
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -12617,15 +12956,17 @@ describe("review findings check", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		const run = loop.runTurn(store.name, review.id);
-		await flushPromises();
-		expect(store.getTask(review.id)!.state).toBe("running");
+		await eventually(() =>
+			loop.running.has(`${store.name}/${review.id}:check`),
+		);
+		expect((await store.getTask(review.id))!.state).toBe("running");
 
-		loop.schedule(); // the tick: the check is alive, so nothing settles
+		await loop.schedule(); // the tick: the check is alive, so nothing settles
 		await flushPromises();
 
-		expect(store.getTask(review.id)!.state).toBe("running");
+		expect((await store.getTask(review.id))!.state).toBe("running");
 		expect([...loop.running.keys()]).toContain(
 			`${store.name}/${review.id}:check`,
 		);
@@ -12635,7 +12976,7 @@ describe("review findings check", () => {
 		);
 		await run;
 		expect(
-			store.listTasks().filter((t) => t.followUpOf === review.id),
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
 		).toHaveLength(1);
 	});
 
@@ -12728,9 +13069,9 @@ const checkedRun = (
 ) => {
 	let checkIndex = 0;
 	let workIndex = 0;
-	return (o: Parameters<TurnOps["startRun"]>[0]) => {
+	return async (o: Parameters<TurnOps["startRun"]>[0]) => {
 		record.runs.push(o);
-		o.onSession?.(`sess-${record.runs.length}`);
+		await o.onSession?.(`sess-${record.runs.length}`);
 		const isCheck = o.prompt.startsWith("You are the second model");
 		return {
 			pid: 4242,
@@ -12770,15 +13111,15 @@ describe("work card check", () => {
 	// A ready work turn classifies merging/queued (commitsAhead 1, clean), which is the
 	// check block's gate. maxTotalRuns 0 holds the chained merge turn so each test asserts
 	// the settle instant; head.sha is mutable so later turns can push "new commits".
-	function workCheckCase(
+	async function workCheckCase(
 		head: { sha: string },
 		checks: RunResult[],
-		overrides: Partial<TurnOps> = {},
+		overrides: FixtureOps = {},
 		works: RunResult[] = [],
 	) {
 		const record = baseRecord();
-		return setupWith(record, {
-			maxTotalRuns: () => 0,
+		return await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			startRun: checkedRun(record, checks, works),
@@ -12789,10 +13130,14 @@ describe("work card check", () => {
 
 	test("a ready card with commits ahead runs the check once, and a pass keeps it merging/queued", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(head, [pass(["small nit"])], {
-			modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
-		});
-		const task = store.createTask("work please");
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[pass(["small nit"])],
+			{
+				modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
+			},
+		);
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(2); // the work run + one check run
@@ -12803,8 +13148,8 @@ describe("work card check", () => {
 		expect(check.tools).toBe("read,grep,glob");
 		expect(check.config).toBe(join(dirname("ext.ts"), "check.yml"));
 		expect(check.model).toBe("zai/glm-5.3-flash:medium");
-		expect(check.cwd).toBe(store.getTask(task.id)!.worktree!);
-		const after = store.getTask(task.id)!;
+		expect(check.cwd).toBe((await store.getTask(task.id))!.worktree!);
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckHead).toBe("sha1");
@@ -12820,28 +13165,28 @@ describe("work card check", () => {
 		const head = { sha: "sha1" };
 		// No adversary role in the harness default ({ default: "fake/default-model" }):
 		// the card must name the model the check actually fell back to.
-		const { store, loop } = workCheckCase(head, [pass(["small nit"])]);
-		const task = store.createTask("work please");
+		const { store, loop } = await workCheckCase(head, [pass(["small nit"])]);
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		// The launch still passes the raw selector (omp resolves its default); the card
 		// record names the model that fallback resolves to.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
 		expect(after.workCheckLog[0]!.warn).toBeUndefined();
 	});
 
 	test("a blocker whose quote is in the diff sends the card back to the work agent", async () => {
-		const { store, loop } = workCheckCase(
+		const { store, loop } = await workCheckCase(
 			{ sha: "sha1" },
 			[block("tests were weakened", "const x = 1;")],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckSendbacks).toBe(1);
@@ -12853,7 +13198,7 @@ describe("work card check", () => {
 	});
 
 	test("a nit or pre-existing severity never blocks, even with a good quote", async () => {
-		const { store, loop } = workCheckCase(
+		const { store, loop } = await workCheckCase(
 			{ sha: "sha1" },
 			[
 				runResult({
@@ -12877,10 +13222,10 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckSendbacks).toBe(0);
@@ -12893,7 +13238,7 @@ describe("work card check", () => {
 	});
 
 	test("an important blocker keeps its class and sends back tagged with it", async () => {
-		const { store, loop } = workCheckCase(
+		const { store, loop } = await workCheckCase(
 			{ sha: "sha1" },
 			[
 				runResult({
@@ -12913,10 +13258,10 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckSendbacks).toBe(1);
 		expect(after.pendingPrompt).toContain("[off-by-one] off by one");
 		// The stored roundtrip keeps the class the send-back showed.
@@ -12931,7 +13276,7 @@ describe("work card check", () => {
 	test("a re-check at a new head prompts with only the commits since the previous check", async () => {
 		const head = { sha: "sha1" };
 		const diffs: string[] = [];
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[block("tests were weakened", "const x = 1;"), pass()],
 			{
@@ -12943,9 +13288,9 @@ describe("work card check", () => {
 				},
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 		expect(record.runs[1]!.prompt).toContain("Diff of the branch");
 
 		head.sha = "sha2"; // the agent pushed fixes
@@ -12964,14 +13309,14 @@ describe("work card check", () => {
 		// The re-check judges the update against the original result.
 		expect(recheckPrompt).toContain("Original ready report");
 		expect(recheckPrompt).toContain("New ready report");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckHead).toBe("sha2");
 	});
 
 	test("a later pass at a new head that names the blocker fixed resolves it and keeps the sendback count", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				block("tests were weakened", "const x = 1;"),
@@ -12985,14 +13330,14 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		head.sha = "sha2"; // the agent pushed fixes
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(record.runs).toHaveLength(4); // two work runs, two checks
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
@@ -13009,7 +13354,7 @@ describe("work card check", () => {
 
 	test("a fifth blocking check parks the card on needs_you with the findings", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				// Counts 2,1,2,1,2 with fresh bug classes each round keep the loop off the
@@ -13070,28 +13415,28 @@ describe("work card check", () => {
 				diffText: async () => "const x = 1;\nalso touched README\n",
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		head.sha = "sha2";
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(2);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(2);
 
 		head.sha = "sha3";
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(3);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(3);
 
 		head.sha = "sha4";
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(
 			WORK_CHECK_MAX_SENDBACKS,
 		);
 
 		head.sha = "sha5";
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(record.runs).toHaveLength(10); // five work runs, five checks
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
@@ -13112,7 +13457,7 @@ describe("work card check", () => {
 
 	test("an OTTR-809-shaped loop parks after the third check, not the fifth", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				block("parses diff text", "const a = 1;", "diff-parse"),
@@ -13159,18 +13504,18 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const a = 1;\nalso touched README\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		head.sha = "sha2";
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(2);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(2);
 
 		head.sha = "sha3";
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(record.runs).toHaveLength(6); // three work runs, three checks; 4 and 5 never run
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
@@ -13194,14 +13539,14 @@ describe("work card check", () => {
 
 	test("with the switch off no check run starts and the card stays merging/queued", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(head, [], {
+		const { store, record, loop } = await workCheckCase(head, [], {
 			workCheck: () => false,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(1); // the work run only
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckHead).toBeNull();
@@ -13211,7 +13556,7 @@ describe("work card check", () => {
 	test("a re-ready at an unchanged head after a send-back reruns the check, and a flat loop parks after the third check", async () => {
 		const head = { sha: "sha1" };
 		const diffs: string[] = [];
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				block("tests were weakened", "const x = 1;"),
@@ -13227,9 +13572,9 @@ describe("work card check", () => {
 				},
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		// Ready again with no new commits and no new report text: still a fresh check run —
 		// the update may be new evidence or a corrected claim — never a word-for-word resend.
@@ -13246,7 +13591,7 @@ describe("work card check", () => {
 			"Diff of only the new commits since the previous check",
 		);
 		expect(recheck.prompt).not.toContain("Diff of the branch");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckSendbacks).toBe(2);
 		expect(after.pendingPrompt).toContain("tests were weakened");
 		expect(after.stage).toBe("in_progress");
@@ -13259,7 +13604,7 @@ describe("work card check", () => {
 		// A third identical check diverges: park now, not at the cap.
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(6); // three work runs, three checks; 4 and 5 never run
-		const parked = store.getTask(task.id)!;
+		const parked = (await store.getTask(task.id))!;
 		expect(parked.state).toBe("needs_you");
 		expect(parked.stage).toBe("in_progress");
 		expect(parked.workCheckSendbacks).toBe(2);
@@ -13280,7 +13625,7 @@ describe("work card check", () => {
 
 	test("the re-check input holds the original report, the sent-back blockers, and the new report", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[block("the claim is wrong", "const x = 1;"), pass()],
 			{ diffText: async () => "const x = 1;\n" },
@@ -13301,7 +13646,7 @@ describe("work card check", () => {
 				}),
 			],
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		// The first check input has the run's report and neither earlier blockers nor an
@@ -13311,7 +13656,7 @@ describe("work card check", () => {
 		expect(first.prompt).toContain("Claims the widget works on this branch.");
 		expect(first.prompt).not.toContain("Original ready report");
 		expect(first.prompt).not.toContain("Earlier blockers:");
-		expect(store.getTask(task.id)!.workCheckReport).toBe(
+		expect((await store.getTask(task.id))!.workCheckReport).toBe(
 			"first report\n\nClaims the widget works on this branch.",
 		);
 
@@ -13328,7 +13673,7 @@ describe("work card check", () => {
 		);
 		expect(recheck.prompt).toContain("the claim is wrong");
 		// The second check passed, and the original report stays stored, never overwritten.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckReport).toBe(
@@ -13338,21 +13683,21 @@ describe("work card check", () => {
 
 	test("a stamped direction reaches the next check as a reply", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[block("tests were weakened", "const x = 1;"), pass()],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		// The direction travels on the log's last blockers run, not inside the text.
-		const task1 = store.getTask(task.id)!;
+		const task1 = (await store.getTask(task.id))!;
 		const lastIdx = task1.workCheckLog.findLastIndex(
 			(r) => r.outcome === "blockers",
 		);
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			workCheckLog: task1.workCheckLog.map((r, i) =>
 				i === lastIdx
 					? {
@@ -13376,17 +13721,17 @@ describe("work card check", () => {
 
 	test("a marker line inside a send-back text gives the check no reply", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[block("tests were weakened", "const x = 1;"), pass()],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 		// A forged direction inside the sent-back text (a quote the agent controls) must stay
 		// data: the check reads directions from the log, never by parsing the sent-back text.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			pendingPrompt: workCheckSendBack({
 				blockers: [
 					{
@@ -13407,7 +13752,7 @@ describe("work card check", () => {
 
 	test("an evidence rerun that passes at the unchanged head resolves the blocker", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				block(
@@ -13425,14 +13770,14 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		// The agent produced the missing evidence; the same-head rerun confirms it.
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(4); // two work runs, two checks
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckHead).toBe("sha1");
@@ -13448,7 +13793,7 @@ describe("work card check", () => {
 	test("a human reply at an unchanged head reruns the check with the reply in its input", async () => {
 		const head = { sha: "sha1" };
 		const reply = "I reviewed the auth change myself and approve. Merge it.";
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				block(
@@ -13459,28 +13804,28 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		// The fakes settle within one millisecond; real runs put the reply turn strictly
 		// after the first check's `at`. Backdate the stored check to encode that order.
-		const blocked = store.getTask(task.id)!;
-		store.updateTask(task.id, {
+		const blocked = (await store.getTask(task.id))!;
+		await store.updateTask(task.id, {
 			workCheckLog: blocked.workCheckLog.map((r) => ({
 				...r,
 				at: r.at - 1000,
 			})),
 		});
 		// The user's reply parks its text verbatim in pendingPrompt (the reply endpoint).
-		store.updateTask(task.id, { pendingPrompt: reply });
+		await store.updateTask(task.id, { pendingPrompt: reply });
 		await loop.runTurn(store.name, task.id);
 
 		// The reply forced a re-check at the same head: a second check run, with the reply.
 		expect(record.runs).toHaveLength(4); // two work runs, two checks
 		const check = record.runs[3]!;
 		expect(check.prompt).toContain(reply);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckHead).toBe("sha1");
@@ -13493,7 +13838,7 @@ describe("work card check", () => {
 	test("a human reply does not clear a code blocker the re-check cites again", async () => {
 		const head = { sha: "sha1" };
 		const reply = "I looked at it, ship it.";
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[
 				block("tests were weakened", "const x = 1;"),
@@ -13501,24 +13846,24 @@ describe("work card check", () => {
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckSendbacks).toBe(1);
+		expect((await store.getTask(task.id))!.workCheckSendbacks).toBe(1);
 
 		// Same backdate as above: keep the reply turn strictly after the first check's `at`.
-		const blocked = store.getTask(task.id)!;
-		store.updateTask(task.id, {
+		const blocked = (await store.getTask(task.id))!;
+		await store.updateTask(task.id, {
 			workCheckLog: blocked.workCheckLog.map((r) => ({
 				...r,
 				at: r.at - 1000,
 			})),
 		});
-		store.updateTask(task.id, { pendingPrompt: reply });
+		await store.updateTask(task.id, { pendingPrompt: reply });
 		await loop.runTurn(store.name, task.id);
 
 		// The re-check ran and still blocks: the reply did not clear the code problem.
 		expect(record.runs).toHaveLength(4);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckSendbacks).toBe(2);
@@ -13530,17 +13875,17 @@ describe("work card check", () => {
 
 	test("a re-ready at an unchanged head with no open blockers starts no check", async () => {
 		const head = { sha: "sha1" };
-		const { store, record, loop } = workCheckCase(head, [pass()]);
-		const task = store.createTask("work please");
+		const { store, record, loop } = await workCheckCase(head, [pass()]);
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.workCheckHead).toBe("sha1");
+		expect((await store.getTask(task.id))!.workCheckHead).toBe("sha1");
 
 		// Simulate a fresh ready at the same head (the merge queue has not taken the card).
-		store.updateTask(task.id, { stage: "in_progress", state: "queued" });
+		await store.updateTask(task.id, { stage: "in_progress", state: "queued" });
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(3); // no second check run
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckLog).toHaveLength(1);
@@ -13553,12 +13898,15 @@ describe("work card check", () => {
 			exitCode: 1,
 			stderrTail: "error: the provider dropped the connection\n",
 		});
-		const { store, record, loop } = workCheckCase(head, [transient, transient]);
-		const task = store.createTask("work please");
+		const { store, record, loop } = await workCheckCase(head, [
+			transient,
+			transient,
+		]);
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(3); // work run + two check attempts
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("failed twice");
@@ -13582,7 +13930,7 @@ describe("work card check", () => {
 	test("a check at the usage limit holds the card until the reset, then runs again", async () => {
 		const head = { sha: "sha1" };
 		const resetsAt = Date.now() + 3_600_000;
-		const { store, record, loop } = workCheckCase(
+		const { store, record, loop } = await workCheckCase(
 			head,
 			[usageLimited, pass()],
 			{
@@ -13603,11 +13951,11 @@ describe("work card check", () => {
 				}),
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(2); // work run + one check attempt: no retry at the limit
-		const held = store.getTask(task.id)!;
+		const held = (await store.getTask(task.id))!;
 		expect(held.stage).toBe("in_progress");
 		expect(held.state).toBe("queued");
 		expect(held.holdUntil).toBe(resetsAt);
@@ -13619,40 +13967,45 @@ describe("work card check", () => {
 		expect(held.pendingPrompt).toContain("Report the same outcome again");
 		expect(held.workCheckHead).toBeNull();
 		expect(held.workCheckLog[0]!.outcome).toBe("error");
-		const ids = (now?: number) =>
-			pickRunnable(store.listTasks(), {
+		const ids = async (now?: number) =>
+			pickRunnable(await store.listTasks(), {
 				maxParallel: null,
 				hasRules: true,
 				now,
 			}).map((t) => t.id);
-		expect(ids()).not.toContain(task.id);
-		expect(ids(resetsAt + 1)).toContain(task.id);
+		expect(await ids()).not.toContain(task.id);
+		expect(await ids(resetsAt + 1)).toContain(task.id);
 		// A queue reorder rewrites queuedAt; the hold must survive it.
-		const other = store.createTask("another");
-		expect(store.reorderQueue([task.id, other.id])).toBe(true);
-		expect(store.getTask(task.id)!.holdUntil).toBe(resetsAt);
-		expect(ids()).not.toContain(task.id);
-		store.updateTask(other.id, { state: "idle" });
+		const other = await store.createTask("another");
+		expect(await store.reorderQueue([task.id, other.id])).toBe(true);
+		expect((await store.getTask(task.id))!.holdUntil).toBe(resetsAt);
+		expect(await ids()).not.toContain(task.id);
+		await store.updateTask(other.id, { state: "idle" });
 
 		// After the reset the scheduler starts the turn: the agent re-reports ready, the check re-runs.
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs).toHaveLength(4);
-		const after = store.getTask(task.id)!;
-		expect(after.stage).toBe("merging");
-		expect(after.state).toBe("queued");
-		expect(after.workCheckHead).toBe("sha1");
+		setSystemTime(new Date(resetsAt + 1));
+		try {
+			await loop.runTurn(store.name, task.id);
+			expect(record.runs).toHaveLength(4);
+			const after = (await store.getTask(task.id))!;
+			expect(after.stage).toBe("merging");
+			expect(after.state).toBe("queued");
+			expect(after.workCheckHead).toBe("sha1");
+		} finally {
+			setSystemTime();
+		}
 	});
 
 	test("a check at the usage limit with no known reset holds a probe wait", async () => {
-		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+		const { store, record, loop } = await workCheckCase({ sha: "sha1" }, [
 			usageLimited,
 		]);
 		const before = Date.now();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(2); // work run + one check attempt
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
 		expect(after.holdUntil).toBeLessThan(before + 31 * 60_000);
@@ -13671,15 +14024,15 @@ describe("work card check", () => {
 
 	test("a 429 with a long retry-after holds the card queued instead of parking", async () => {
 		const wait = 9_169_000;
-		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+		const { store, record, loop } = await workCheckCase({ sha: "sha1" }, [
 			rateLimited(String(wait)),
 		]);
 		const before = Date.now();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(2); // work run + one check attempt: no retry at a long wait
-		const held = store.getTask(task.id)!;
+		const held = (await store.getTask(task.id))!;
 		expect(held.stage).toBe("in_progress");
 		expect(held.state).toBe("queued");
 		expect(held.holdUntil).toBeGreaterThanOrEqual(before + wait);
@@ -13692,16 +14045,16 @@ describe("work card check", () => {
 		expect(held.workCheckHead).toBeNull();
 		expect(held.workCheckLog).toHaveLength(1);
 		expect(held.workCheckLog[0]!.outcome).toBe("error");
-		const ids = (now?: number) =>
-			pickRunnable(store.listTasks(), {
+		const ids = async (now?: number) =>
+			pickRunnable(await store.listTasks(), {
 				maxParallel: null,
 				hasRules: true,
 				now,
 			}).map((t) => t.id);
-		expect(ids()).not.toContain(task.id);
+		expect(await ids()).not.toContain(task.id);
 		const heldUntil = held.holdUntil ?? 0;
 		expect(heldUntil).toBeGreaterThanOrEqual(before + wait);
-		expect(ids(heldUntil + 1)).toContain(task.id);
+		expect(await ids(heldUntil + 1)).toContain(task.id);
 	});
 
 	test("a 429 with no retry-after parks needs_you as today", async () => {
@@ -13710,15 +14063,15 @@ describe("work card check", () => {
 			stderrTail:
 				'429 {"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}\n',
 		});
-		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+		const { store, record, loop } = await workCheckCase({ sha: "sha1" }, [
 			noWait,
 			noWait,
 		]);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(3); // work run + two check attempts
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("failed twice");
 		expect(after.holdUntil).toBeNull();
@@ -13726,15 +14079,15 @@ describe("work card check", () => {
 
 	test("a short retry-after keeps today's retry and parks needs_you", async () => {
 		const short = rateLimited("2000");
-		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+		const { store, record, loop } = await workCheckCase({ sha: "sha1" }, [
 			short,
 			short,
 		]);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(3); // work run + two check attempts
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("failed twice");
 		expect(after.holdUntil).toBeNull();
@@ -13742,15 +14095,15 @@ describe("work card check", () => {
 
 	test("a retry-after above the hold cap parks needs_you as today", async () => {
 		const over = rateLimited(String(25 * 3_600_000));
-		const { store, record, loop } = workCheckCase({ sha: "sha1" }, [
+		const { store, record, loop } = await workCheckCase({ sha: "sha1" }, [
 			over,
 			over,
 		]);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(3); // work run + two check attempts
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("failed twice");
 		expect(after.holdUntil).toBeNull();
@@ -13763,14 +14116,14 @@ describe("work card check", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -13788,7 +14141,7 @@ describe("work card check", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const turn = loop.runTurn(store.name, task.id);
 		await flushPromises();
 		expect(record.runs).toHaveLength(2);
@@ -13800,7 +14153,7 @@ describe("work card check", () => {
 		expect([...loop.running.keys()]).not.toContain(
 			`${store.name}/${task.id}:workcheck`,
 		);
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	test("the lost sweep settles a work check whose agent pid died and records the run", async () => {
@@ -13810,15 +14163,16 @@ describe("work card check", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0, // hold any chained turn; the assertion is the parked state
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true, // hold any chained turn; the assertion is the parked state
+			scheduledCap: 0,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			workCheck: () => true,
 			pidAlive: () => false, // the check's omp died; a grandchild keeps `done` hanging
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -13836,18 +14190,23 @@ describe("work card check", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const run = loop.runTurn(store.name, task.id);
-		await flushPromises();
+		await eventually(() =>
+			loop.running.has(`${store.name}/${task.id}:workcheck`),
+		);
 		expect([...loop.running.keys()]).toContain(
 			`${store.name}/${task.id}:workcheck`,
 		);
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.getTask(task.id))!.state).toBe("running");
 
-		loop.schedule(); // the tick: the check pid is dead
-		await flushPromises();
+		await loop.schedule(); // the tick: the check pid is dead
+		await eventually(
+			async () =>
+				(await store.getTask(task.id))?.workCheckLog[0]?.outcome === "error",
+		);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("The work check was lost");
 		expect(after.needsReason).toContain("lost check agent process (pid 4242)");
@@ -13861,12 +14220,12 @@ describe("work card check", () => {
 		releaseCheck(pass());
 		await run;
 		// The late `done` must not touch the card the sweep parked.
-		expect(store.getTask(task.id)!.state).toBe("needs_you");
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 	});
 
 	test("a blocker whose quote matches nothing demotes to a note beside a real note", async () => {
 		const head = { sha: "sha1" };
-		const { store, loop } = workCheckCase(head, [
+		const { store, loop } = await workCheckCase(head, [
 			runResult({
 				finalText: JSON.stringify({
 					blockers: [{ finding: "naming is off", quote: "NO SUCH QUOTE" }],
@@ -13875,10 +14234,10 @@ describe("work card check", () => {
 				}),
 			}),
 		]);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		const run = after.workCheckLog[0]!;
@@ -13892,15 +14251,15 @@ describe("work card check", () => {
 	test("an anthropic work run checks with the critic role's selector", async () => {
 		const head = { sha: "sha1" };
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			modelRoles: () => ({ critic: "openai-codex/gpt-6.1-sol:max" }),
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -13918,7 +14277,7 @@ describe("work card check", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs[1]!.model).toBe("openai-codex/gpt-6.1-sol:max");
@@ -13927,15 +14286,15 @@ describe("work card check", () => {
 	test("a check that runs on the work model itself warns on the card", async () => {
 		const head = { sha: "sha1" };
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			modelRoles: () => ({ adversary: "zai/glm-5.3-flash:medium" }),
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -13954,10 +14313,10 @@ describe("work card check", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const run = store.getTask(task.id)!.workCheckLog[0]!;
+		const run = (await store.getTask(task.id))!.workCheckLog[0]!;
 		expect(run.outcome).toBe("pass");
 		expect(run.model).toBe("zai/glm-5.3-flash:medium");
 		expect(run.warn).toBe(
@@ -13968,15 +14327,15 @@ describe("work card check", () => {
 	test("a check on the work model's vendor, another model, warns with the vendor reason", async () => {
 		const head = { sha: "sha1" };
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => head.sha,
 			modelRoles: () => ({ adversary: "zai/glm-5:medium" }),
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -13994,10 +14353,10 @@ describe("work card check", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.workCheckLog[0]!.warn).toBe(
+		expect((await store.getTask(task.id))!.workCheckLog[0]!.warn).toBe(
 			"The check model zai/glm-5:medium is from the same vendor as the run it checks — no second-vendor opinion.",
 		);
 	});
@@ -14014,9 +14373,9 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 	): Partial<TurnOps> {
 		return {
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -14037,11 +14396,11 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 	}
 
 	/** Like setup, but the holdingRun override reads dep ids lazily. */
-	function depCase(depIds: () => string[]) {
-		const store = freshStore();
+	async function depCase(depIds: () => string[]) {
+		const store = await freshStore();
 		const record = baseRecord();
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, holdingRun(record, depIds)),
 		);
@@ -14050,14 +14409,14 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	test("a needs_you outcome with dependsOn requeues the work card and stores the ids", async () => {
 		let depId = "";
-		const { store, loop } = depCase(() => [depId]);
-		const dep = store.createTask("the blocker");
+		const { store, loop } = await depCase(() => [depId]);
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.stage).toBe("in_progress");
 		expect(after.dependsOn).toContain(dep.id);
@@ -14067,15 +14426,15 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	test("a merge-kind card requeues at merging the same way", async () => {
 		let depId = "";
-		const { store, loop } = depCase(() => [depId]);
-		const dep = store.createTask("the blocker");
+		const { store, loop } = await depCase(() => [depId]);
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, { stage: "merging" });
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, { stage: "merging" });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.stage).toBe("merging");
 		expect(after.needsReason).toBe(`waiting for #${dep.id} the blocker`);
@@ -14083,12 +14442,12 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 	});
 
 	test("a dependsOn id that is not a card parks needs_you naming it, ids unchanged", async () => {
-		const { store, loop } = depCase(() => ["nope"]);
-		const task = store.createTask("work please");
+		const { store, loop } = await depCase(() => ["nope"]);
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("nope");
 		expect(after.dependsOn).toEqual([]);
@@ -14096,13 +14455,13 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	test("a dependsOn naming the card itself parks needs_you naming it", async () => {
 		let taskId = "";
-		const { store, loop } = depCase(() => [taskId]);
-		const task = store.createTask("work please");
+		const { store, loop } = await depCase(() => [taskId]);
+		const task = await store.createTask("work please");
 		taskId = task.id;
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(`#${task.id}`);
 		expect(after.dependsOn).toEqual([]);
@@ -14114,17 +14473,17 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 		depId: string;
 		store: ProjectStore;
 	}> {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 		});
-		const dep = store.createTask("the blocker");
-		store.updateTask(dep.id, {
+		const dep = await store.createTask("the blocker");
+		await store.updateTask(dep.id, {
 			stage: done ? "done" : "in_progress",
 			state: "idle",
 			...(done ? {} : { cancelledAt: Date.now() }),
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			sessionId: "sess-1",
 			state: "queued",
 			queuedAt: Date.now(),
@@ -14144,9 +14503,9 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 		expect(prompt).toContain("call report_outcome");
 		// The reply is consumed: a leftover pendingPrompt would read as mid-run steering
 		// at settle and requeue the card forever.
-		const after = store.getTask(
-			store.listTasks().find((t) => t.prompt === "work please")!.id,
-		)!;
+		const after = (await store.getTask(
+			(await store.listTasks()).find((t) => t.prompt === "work please")!.id,
+		))!;
 		expect(after.pendingPrompt).toBeNull();
 		expect(after.state).toBe("idle");
 	});
@@ -14158,12 +14517,12 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 	});
 
 	test("a dependsOn id naming no project parks needs_you naming it, ids unchanged", async () => {
-		const { store, loop } = depCase(() => ["NOPE-5"]);
-		const task = store.createTask("work please");
+		const { store, loop } = await depCase(() => ["NOPE-5"]);
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("NOPE-5");
 		expect(after.needsReason).toContain("no project NOPE");
@@ -14172,17 +14531,17 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	/** Two projects on one loop: `store` (own) and `foreign` with the AD id handle, so
 	 * report_outcome may hold on the foreign project's cards. */
-	function twoProjectCase(depIds: () => string[]) {
-		const store = freshStore();
-		const foreign = freshStore();
-		foreign.setSettings({ taskIdPrefix: "AD" });
-		const foreignDep = foreign.createTask("the foreign blocker");
+	async function twoProjectCase(depIds: () => string[]) {
+		const store = await freshStore();
+		const foreign = await freshStore();
+		await foreign.setSettings({ taskIdPrefix: "AD" });
+		const foreignDep = await foreign.createTask("the foreign blocker");
 		const record = baseRecord();
 		const projects = new Map([
 			[store.name, fakeProject(store)],
 			[foreign.name, fakeProject(foreign)],
 		]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, holdingRun(record, depIds)),
 		);
@@ -14190,12 +14549,14 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 	}
 
 	test("a cross-project dependsOn id is recorded and holds like a local one", async () => {
-		const { store, foreignDep, loop } = twoProjectCase(() => [foreignDep.id]);
-		const task = store.createTask("work please");
+		const { store, foreignDep, loop } = await twoProjectCase(() => [
+			foreignDep.id,
+		]);
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.stage).toBe("in_progress");
 		expect(after.dependsOn).toEqual([foreignDep.id]);
@@ -14206,22 +14567,22 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 	});
 
 	test("a dep-held card restarts naming its foreign dependency done", async () => {
-		const store = freshStore();
-		const foreign = freshStore();
-		foreign.setSettings({ taskIdPrefix: "AD" });
-		const foreignDep = foreign.createTask("the foreign blocker");
+		const store = await freshStore();
+		const foreign = await freshStore();
+		await foreign.setSettings({ taskIdPrefix: "AD" });
+		const foreignDep = await foreign.createTask("the foreign blocker");
 		const record = baseRecord();
 		const projects = new Map([
 			[store.name, fakeProject(store)],
 			[foreign.name, fakeProject(foreign)],
 		]);
-		const loop = createTurnLoop(projects, fakeOps(record));
-		const task = replyCard(store, "work please");
-		store.updateTask(task.id, {
+		const loop = holdFollowUps(projects, fakeOps(record));
+		const task = await replyCard(store, "work please");
+		await store.updateTask(task.id, {
 			pendingPrompt: DEP_HELD_PROMPT,
 			dependsOn: [foreignDep.id],
 		});
-		foreign.updateTask(foreignDep.id, { stage: "done", state: "idle" });
+		await foreign.updateTask(foreignDep.id, { stage: "done", state: "idle" });
 
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.prompt).toContain(
@@ -14235,10 +14596,10 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	test("a ready outcome with dependsOn records the ids but keeps the normal next state", async () => {
 		let depId = "";
-		const { store, record, loop } = setup({
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -14256,13 +14617,13 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 				};
 			},
 		});
-		const dep = store.createTask("the blocker");
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.dependsOn).toContain(dep.id);
@@ -14290,13 +14651,13 @@ describe("card state while a second-model check runs", () => {
 			releaseCheck = resolve;
 		});
 		const mergeDone = new Promise<RunResult>(() => {}); // the merge turn starts and hangs
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 1,
 			targetSha: async () => "sha1",
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done:
@@ -14316,24 +14677,24 @@ describe("card state while a second-model check runs", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const turn = loop.runTurn(store.name, task.id);
 		await until(() => record.runs.length === 2);
 		// The check is in flight: the card must not read as mergeable yet.
 		expect(record.runs).toHaveLength(2);
-		const during = store.getTask(task.id)!;
+		const during = (await store.getTask(task.id))!;
 		expect(during.stage).toBe("in_progress");
 		expect(during.state).toBe("running");
 		// The tick sees a running work card: nothing to pick, no merge turn starts.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(2);
-		expect(store.getTask(task.id)!.stage).toBe("in_progress");
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.getTask(task.id))!.stage).toBe("in_progress");
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		releaseCheck(passVerdict());
 		await turn;
 		await until(() => record.runs.length === 3);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");
 		expect(after.workCheckHead).toBe("sha1");
 		expect(after.stage).toBe("merging");
@@ -14348,14 +14709,14 @@ describe("card state while a second-model check runs", () => {
 			releaseCheck = resolve;
 		});
 		const mergeDone = new Promise<RunResult>(() => {}); // the merge turn starts and hangs
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 1,
 			targetSha: async () => "sha1",
 			diffText: async () => "const x = 1;\n",
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done:
@@ -14375,13 +14736,13 @@ describe("card state while a second-model check runs", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const turn = loop.runTurn(store.name, task.id);
 		await until(() => record.runs.length === 2);
 		expect(record.runs).toHaveLength(2);
-		expect(store.getTask(task.id)!.stage).toBe("in_progress");
-		expect(store.getTask(task.id)!.state).toBe("running");
-		loop.schedule();
+		expect((await store.getTask(task.id))!.stage).toBe("in_progress");
+		expect((await store.getTask(task.id))!.state).toBe("running");
+		await loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(2); // a running card is not mergeable
 		releaseCheck(
@@ -14398,7 +14759,7 @@ describe("card state while a second-model check runs", () => {
 		// The send-back requeued the card and the loop immediately resumed the work agent:
 		// in_progress/running again, never merging, and the third run is the resumed work
 		// turn — no merge turn starts for this head.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("running");
 		expect(after.workCheckSendbacks).toBe(1);
@@ -14418,12 +14779,12 @@ describe("card state while a second-model check runs", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done:
@@ -14440,12 +14801,12 @@ describe("card state while a second-model check runs", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}release v1.0.0`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			stage: "in_progress",
 			state: "queued",
 			releaseVersion: "v1.0.0",
@@ -14457,14 +14818,14 @@ describe("card state while a second-model check runs", () => {
 		const turn = loop.runTurn(store.name, review.id);
 		await until(() => record.runs.length === 2);
 		expect(record.runs).toHaveLength(2);
-		const during = store.getTask(review.id)!;
+		const during = (await store.getTask(review.id))!;
 		expect(during.stage).toBe("in_progress");
 		expect(during.state).toBe("running");
 		// The tick must not settle a review whose check has not even finished.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(record.publishRelease).toHaveLength(0);
-		const ticking = store.getTask(review.id)!;
+		const ticking = (await store.getTask(review.id))!;
 		expect(ticking.stage).toBe("in_progress");
 		expect(ticking.state).toBe("running");
 		releaseCheck(
@@ -14472,18 +14833,20 @@ describe("card state while a second-model check runs", () => {
 		);
 		await turn;
 		await flushPromises();
-		const kids = store.listTasks().filter((t) => t.followUpOf === review.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === review.id,
+		);
 		expect(kids).toHaveLength(1);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
 		expect(record.publishRelease).toHaveLength(0);
-		store.updateTask(kids[0]!.id, { stage: "done", state: "idle" });
-		loop.schedule();
+		await store.updateTask(kids[0]!.id, { stage: "done", state: "idle" });
+		await loop.schedule();
 		await flushPromises();
 		expect(record.publishRelease).toHaveLength(1);
-		const done = store.getTask(review.id)!;
+		const done = (await store.getTask(review.id))!;
 		expect(done.stage).toBe("done");
 		expect(done.summary).toBe("Released v1.0.0");
 	});
@@ -14497,12 +14860,12 @@ describe("card state while a second-model check runs", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done:
@@ -14519,21 +14882,21 @@ describe("card state while a second-model check runs", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		const turn = loop.runTurn(store.name, review.id);
 		await until(() => record.runs.length === 2);
 		expect(record.runs).toHaveLength(2);
-		const during = store.getTask(review.id)!;
+		const during = (await store.getTask(review.id))!;
 		expect(during.stage).toBe("in_progress");
 		expect(during.state).toBe("running");
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		const ticking = store.getTask(review.id)!;
+		const ticking = (await store.getTask(review.id))!;
 		expect(ticking.stage).not.toBe("done");
 		expect(ticking.stage).toBe("in_progress");
 		expect(ticking.state).toBe("running");
@@ -14543,9 +14906,11 @@ describe("card state while a second-model check runs", () => {
 		);
 		await turn;
 		await flushPromises();
-		const kids = store.listTasks().filter((t) => t.followUpOf === review.id);
+		const kids = (await store.listTasks()).filter(
+			(t) => t.followUpOf === review.id,
+		);
 		expect(kids).toHaveLength(1);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
@@ -14753,26 +15118,26 @@ describe("turn survivor round 5 — helpers", () => {
 
 	test("ui-shot re-prompt lists five files, then an ellipsis", async () => {
 		const six = ["a", "b", "c", "d", "e", "f"].map((n) => `${n}.css`);
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			changedFiles: async () => six,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const prompt = store.getTask(task.id)!.pendingPrompt ?? "";
+		const prompt = (await store.getTask(task.id))!.pendingPrompt ?? "";
 		expect(prompt).toContain("(a.css, b.css, c.css, d.css, e.css, …)");
 		expect(prompt).not.toContain("f.css");
 	});
 
 	test("ui-shot re-prompt with exactly five files has no ellipsis", async () => {
 		const five = ["a", "b", "c", "d", "e"].map((n) => `${n}.css`);
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			changedFiles: async () => five,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const prompt = store.getTask(task.id)!.pendingPrompt ?? "";
+		const prompt = (await store.getTask(task.id))!.pendingPrompt ?? "";
 		expect(prompt).toContain("(a.css, b.css, c.css, d.css, e.css)");
 		expect(prompt).not.toContain("…");
 	});
@@ -14784,8 +15149,8 @@ describe("turn survivor round 5 — helpers", () => {
 	});
 
 	test("image quarantine moves only the files that exist and counts them", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, record, loop } = await setup({
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
@@ -14803,19 +15168,19 @@ describe("turn survivor round 5 — helpers", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
-		setImage(store, task.id, "1.png", "rejected-bytes");
-		store.updateTask(task.id, { images: ["1.png", "gone.png"] });
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "1.png", "rejected-bytes");
+		await store.updateTask(task.id, { images: ["1.png", "gone.png"] });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.images).toEqual(["gone.png"]);
 		expect(
 			existsSync(join(store.tasksDir, "quarantine", task.id, "1.png")),
 		).toBe(true);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`quarantined 1 image(s) to .tasks/quarantine/${task.id}: 1.png `,
 		);
 	});
@@ -14867,18 +15232,18 @@ describe("turn survivor round 5 — helpers", () => {
 		expect(seen).toEqual(["Error: first", "Error: again"]);
 	});
 
-	test("getSettingsLogged: a sick store logs its error", () => {
+	test("getSettingsLogged: a sick store logs its error", async () => {
 		const seen: string[] = [];
 		const orig = console.error;
 		console.error = (_: string, err: unknown) => seen.push(String(err));
 		try {
 			const sick = {
 				name: `sick-${Math.random()}`,
-				getSettings() {
+				async getSettings() {
 					throw new Error("database is locked");
 				},
 			} as unknown as ProjectStore;
-			getSettingsLogged({ store: sick } as TurnProject);
+			await getSettingsLogged({ store: sick } as TurnProject);
 		} finally {
 			console.error = orig;
 		}
@@ -14886,25 +15251,27 @@ describe("turn survivor round 5 — helpers", () => {
 	});
 
 	test("held update and fork-born cards tell the user to approve the merge", async () => {
-		const u = setup();
-		const update = u.store.createTask("update pins");
-		u.store.updateTask(update.id, { updateIds: ["a@1"] });
-		u.store.setSettings({ holdUpdateMerges: true });
+		const u = await setup();
+		const update = await u.store.createTask("update pins");
+		await u.store.updateTask(update.id, { updateIds: ["a@1"] });
+		await u.store.setSettings({ holdUpdateMerges: true });
 		await u.loop.runTurn(u.store.name, update.id);
-		expect(u.store.getTask(update.id)!.needsReason).toContain("approve");
+		expect((await u.store.getTask(update.id))!.needsReason).toContain(
+			"approve",
+		);
 
-		const f = setup({ commitsAhead: async () => 0 });
-		const parent = f.store.createTask("fork research: weekly digest");
-		f.store.updateTask(parent.id, {
+		const f = await setup({ commitsAhead: async () => 0 });
+		const parent = await f.store.createTask("fork research: weekly digest");
+		await f.store.updateTask(parent.id, {
 			topic: "fork research",
 			research: true,
 			stage: "done",
 			state: "idle",
 		});
-		const fork = f.store.createTask("adopt fork idea");
-		f.store.updateTask(fork.id, { followUpOf: parent.id });
+		const fork = await f.store.createTask("adopt fork idea");
+		await f.store.updateTask(fork.id, { followUpOf: parent.id });
 		await f.loop.runTurn(f.store.name, fork.id);
-		const held = f.store.getTask(fork.id)!;
+		const held = (await f.store.getTask(fork.id))!;
 		expect(held.state).toBe("needs_you");
 		expect(held.needsReason).toContain("approve");
 	});
@@ -14937,32 +15304,32 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 	}
 
 	/** The stale-row fixture: pid 4344 is dead, cap 0 keeps the requeued card from restarting. */
-	function sweepSetup() {
-		return setup({
+	async function sweepSetup() {
+		return await setup({
 			maxTotalRuns: () => 0,
 			pidAlive: (pid: number) => pid !== 4344,
 		});
 	}
 
 	/** A review run whose findings check hangs on `checkPid` (the review run itself ends). */
-	function checkCase(
+	async function checkCase(
 		checkPid: number | null,
-		overrides: Partial<TurnOps> = {},
+		overrides: FixtureOps = {},
 		wrap: (s: ProjectStore) => ProjectStore = (s) => s,
 	) {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		record.recorded = [
 			{ prompt: "Bug A", model: null, rank: 1, security: null },
 		];
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(wrap(store))]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
 				commitsAhead: async () => 0,
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess");
+					await o.onSession?.("sess");
 					const isReview = record.runs.length === 1;
 					return {
 						pid: isReview ? 4242 : checkPid,
@@ -14980,19 +15347,19 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 				...overrides,
 			}),
 		);
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		const checkKey = `${store.name}/${review.id}:check`;
 		return { store, record, loop, review, checkKey };
 	}
 
-	function parkedRelease(store: ProjectStore, version = "v4.0.0") {
-		const task = store.createTask(`release ${version}`);
-		store.updateTask(task.id, {
+	async function parkedRelease(store: ProjectStore, version = "v4.0.0") {
+		const task = await store.createTask(`release ${version}`);
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: FINDINGS_HOLD,
@@ -15006,29 +15373,31 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 	// ---- settleLostTurn ---------------------------------------------------------
 
 	test("a lost row re-sends its own prompt, not an earlier row's", async () => {
-		const { store, loop } = sweepSetup();
-		const task = store.createTask("two turns");
-		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		const { store, loop } = await sweepSetup();
+		const task = await store.createTask("two turns");
+		await store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
 		saveSession(store, "sess-9"); // saved, but it never recorded the prompt
-		const first = store.startTurn(task.id, "work", "first prompt", 4343);
-		store.finishTurn(first.id, { endedAt: 1 });
-		store.startTurn(task.id, "work", "second prompt", 4344);
+		const first = await store.startTurn(task.id, "work", "first prompt", 4343);
+		await store.finishTurn(first.id, { endedAt: 1 });
+		await store.startTurn(task.id, "work", "second prompt", 4344);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.getTask(task.id)!.pendingPrompt).toBe("second prompt\n\n.");
+		expect((await store.getTask(task.id))!.pendingPrompt).toBe(
+			"second prompt\n\n.",
+		);
 	});
 
 	test("a restart with a saved session and no open row requeues with the plain continue", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("restart me");
-		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
+		const { store, loop } = await setup();
+		const task = await store.createTask("restart me");
+		await store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
 		saveSession(store, "sess-9");
 
 		await loop.recoverRestarted();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe(".");
 	});
@@ -15036,63 +15405,66 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 	// ---- sweepLostTurns -----------------------------------------------------------
 
 	test("the lost sweep settles a preparing card's dead row without re-sending an unsaved prompt", async () => {
-		const { store, loop } = sweepSetup();
-		const task = store.createTask("left preparing");
+		const { store, loop } = await sweepSetup();
+		const task = await store.createTask("left preparing");
 		// The session id is known, but omp never wrote its file.
-		store.updateTask(task.id, { state: "preparing", sessionId: "sess-9" });
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.updateTask(task.id, {
+			state: "preparing",
+			sessionId: "sess-9",
+		});
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("lost agent process (pid 4344)");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe(".");
 	});
 
 	test("the lost sweep leaves a parked card's open row alone", async () => {
-		const { store, loop } = sweepSetup();
-		const task = store.createTask("parked with an open row");
-		store.updateTask(task.id, {
+		const { store, loop } = await sweepSetup();
+		const task = await store.createTask("parked with an open row");
+		await store.updateTask(task.id, {
 			state: "needs_you",
 			needsReason: "which colour?",
 		});
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		const after = store.getTask(task.id)!;
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("which colour?");
 		expect(after.pendingPrompt).toBeNull();
 	});
 
 	test("a running card whose last row already ended is not settled again", async () => {
-		const { store, loop } = sweepSetup();
-		const task = store.createTask("between run and check");
-		store.updateTask(task.id, { state: "running" });
-		const row = store.startTurn(task.id, "work", "old prompt", 4344);
-		store.finishTurn(row.id, { endedAt: 1, exitCode: 0 });
+		const { store, loop } = await sweepSetup();
+		const task = await store.createTask("between run and check");
+		await store.updateTask(task.id, { state: "running" });
+		const row = await store.startTurn(task.id, "work", "old prompt", 4344);
+		await store.finishTurn(row.id, { endedAt: 1, exitCode: 0 });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBe(1);
 		expect(turn.error).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.getTask(task.id))!.state).toBe("running");
 	});
 
 	test("a pid-less open row whose worker stream is live is left alone", async () => {
-		const { store, loop } = sweepSetup();
-		const task = store.createTask("worker run");
-		store.updateTask(task.id, { state: "running" });
-		store.startTurn(task.id, "work", "old prompt", null);
+		const { store, loop } = await sweepSetup();
+		const task = await store.createTask("worker run");
+		await store.updateTask(task.id, { state: "running" });
+		await store.startTurn(task.id, "work", "old prompt", null);
 		const entry = {
 			pid: null,
 			done: new Promise<void>(() => {}),
@@ -15100,19 +15472,19 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		};
 		loop.running.set(`${store.name}/${task.id}`, entry);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		expect(loop.running.get(`${store.name}/${task.id}`)).toBe(entry);
 	});
 
 	test("the sweep keeps a live entry whose pid is not the dead row's pid", async () => {
-		const { store, loop } = sweepSetup();
-		const task = store.createTask("dead row, other live process");
-		store.updateTask(task.id, { state: "running" });
-		store.startTurn(task.id, "work", "old prompt", 4344);
+		const { store, loop } = await sweepSetup();
+		const task = await store.createTask("dead row, other live process");
+		await store.updateTask(task.id, { state: "running" });
+		await store.startTurn(task.id, "work", "old prompt", 4344);
 		const key = `${store.name}/${task.id}`;
 		const entry = {
 			pid: 777,
@@ -15121,29 +15493,29 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		};
 		loop.running.set(key, entry);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		// The dead row settles, but only the entry holding pid 4344 could be abandoned.
-		expect(store.listTurns(task.id)[0]!.error).toBe(
+		expect((await store.listTurns(task.id))[0]!.error).toBe(
 			"lost agent process (pid 4344)",
 		);
 		expect(loop.running.get(key)).toBe(entry);
 	});
 
 	test("a store whose first listing fails is logged by the sweep", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		let calls = 0;
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([
 				[
 					store.name,
 					fakeProject(
 						proxyStore(store, {
-							listTasks() {
+							async listTasks() {
 								calls += 1;
 								if (calls === 1) throw new Error("sweep listing failed");
-								return store.listTasks();
+								return await store.listTasks();
 							},
 						}),
 					),
@@ -15152,8 +15524,8 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 			fakeOps(baseRecord()),
 		);
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
@@ -15164,43 +15536,45 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 	// ---- sweepLostTurns: lost second-model checks ---------------------------------
 
 	test("a lost pid-less review check parks the card with the review reason", async () => {
-		const { store, loop, review, checkKey } = checkCase(null, {
+		const { store, loop, review, checkKey } = await checkCase(null, {
 			pidAlive: () => true,
 		});
 		void loop.runTurn(store.name, review.id);
 		await flushPromises();
 		expect([...loop.running.keys()]).toContain(checkKey);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"The review check was lost: lost check agent process. Reply to re-run the review, or cancel the card.",
 		);
 		expect(after.workCheckLog).toEqual([]); // a review check is not a work-check run
-		expect(logText(store, review.id)).toContain("lost check agent process");
+		expect(await logText(store, review.id)).toContain(
+			"lost check agent process",
+		);
 		expect([...loop.running.keys()]).not.toContain(checkKey);
 	});
 
 	test("a lost check on a cancelled card leaves the card to the cancel", async () => {
-		const { store, loop, review, checkKey } = checkCase(4242, {
+		const { store, loop, review, checkKey } = await checkCase(4242, {
 			pidAlive: () => false,
 		});
 		void loop.runTurn(store.name, review.id);
 		await flushPromises();
 		expect([...loop.running.keys()]).toContain(checkKey);
-		store.updateTask(review.id, { cancelledAt: Date.now() });
+		await store.updateTask(review.id, { cancelledAt: Date.now() });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("running");
 		expect(after.needsReason).toBeNull();
-		expect(logText(store, review.id)).toContain(
+		expect(await logText(store, review.id)).toContain(
 			"lost check agent process (pid 4242)",
 		);
 		expect([...loop.running.keys()]).not.toContain(checkKey);
@@ -15208,12 +15582,12 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 
 	test("a check whose card vanished before the settle is skipped quietly", async () => {
 		let gone = false;
-		const { store, loop, review, checkKey } = checkCase(
+		const { store, loop, review, checkKey } = await checkCase(
 			4242,
 			{ pidAlive: () => false },
 			(s) =>
 				proxyStore(s, {
-					getTask: (id: string) => (gone ? null : s.getTask(id)),
+					getTask: async (id: string) => (gone ? null : await s.getTask(id)),
 				}),
 		);
 		void loop.runTurn(store.name, review.id);
@@ -15221,29 +15595,29 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		expect([...loop.running.keys()]).toContain(checkKey);
 		gone = true;
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
 		expect(seen).toEqual([]);
 		expect([...loop.running.keys()]).not.toContain(checkKey);
-		expect(store.getTask(review.id)!.state).toBe("running");
+		expect((await store.getTask(review.id))!.state).toBe("running");
 	});
 
 	test("a lost-check settle that cannot write is logged", async () => {
 		let fail = false;
-		const { store, loop, review, checkKey } = checkCase(
+		const { store, loop, review, checkKey } = await checkCase(
 			4242,
 			{ pidAlive: () => false },
 			(s) =>
 				proxyStore(s, {
-					updateTask: (
+					updateTask: async (
 						id: string,
 						patch: Parameters<ProjectStore["updateTask"]>[1],
 					) => {
 						if (fail) throw new Error("check park failed");
-						return s.updateTask(id, patch);
+						return await s.updateTask(id, patch);
 					},
 				}),
 		);
@@ -15252,26 +15626,26 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		expect([...loop.running.keys()]).toContain(checkKey);
 		fail = true;
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
 		expect(seen.join("\n")).toContain("check park failed");
-		expect(store.getTask(review.id)!.state).toBe("running");
+		expect((await store.getTask(review.id))!.state).toBe("running");
 	});
 
 	test("a lost work check records an error run with no blockers and no notes", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => "sha1",
 			workCheck: () => true,
 			pidAlive: () => false,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -15289,17 +15663,17 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		void loop.runTurn(store.name, task.id);
 		await flushPromises();
 		expect([...loop.running.keys()]).toContain(
 			`${store.name}/${task.id}:workcheck`,
 		);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const entry = store.getTask(task.id)!.workCheckLog[0]!;
+		const entry = (await store.getTask(task.id))!.workCheckLog[0]!;
 		expect(entry.outcome).toBe("error");
 		expect(entry.blockers).toEqual([]);
 		expect(entry.notes).toEqual([]);
@@ -15310,15 +15684,15 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 	// ---- schedule -------------------------------------------------------------------
 
 	test("a schedule step that throws for a project is logged", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			hasRules: () => {
 				throw new Error("rules unreadable");
 			},
 		});
-		store.createTask("start me");
+		await store.createTask("start me");
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
@@ -15327,18 +15701,18 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 
 	test("an unlimited cap still settles a parked release", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			maxTotalRuns: () => null,
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
+		const task = await parkedRelease(store);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(1);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	// ---- publishReleaseCard -----------------------------------------------------------
@@ -15346,7 +15720,7 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 	test("a parked release tags the freshly fetched head with empty notes when none were written", async () => {
 		const record = baseRecord();
 		const resolves: unknown[][] = [];
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			resolveTarget: async (mainPath: string, fetch?: boolean) => {
 				resolves.push([mainPath, fetch]);
@@ -15354,35 +15728,35 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
+		const task = await parkedRelease(store);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(resolves).toEqual([[store.path, true]]);
 		expect(record.publishRelease[0]).toMatchObject({ sha: "sha0", notes: "" });
 		// No target warning: the card log carries no stray line for it.
-		expect(logText(store, task.id).split("\n")).not.toContain("null");
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await logText(store, task.id)).split("\n")).not.toContain("null");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a parked release passes the finding merges as the publish anchors", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
+		const task = await parkedRelease(store);
 		// A finding card the review filed, done and stamped with its merge head.
-		const finding = store.createTask("fix the found bug");
-		store.updateTask(finding.id, {
+		const finding = await store.createTask("fix the found bug");
+		await store.updateTask(finding.id, {
 			followUpOf: task.id,
 			stage: "done",
 			state: "idle",
 			mergeHead: "shaF",
 		});
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(1);
@@ -15391,7 +15765,7 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 
 	test("a target warning at publish reaches the release card's log", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			resolveTarget: async () => ({
 				target: "origin/trunk",
@@ -15400,34 +15774,34 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 			}),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
+		const task = await parkedRelease(store);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"origin/main is gone; tagging origin/trunk",
 		);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a failed review-delta read publishes without the review range", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			archReviewDelta: async () => {
 				throw new Error("git log failed");
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
+		const task = await parkedRelease(store);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(1);
 		expect(record.publishRelease[0]).toMatchObject({ archReview: null });
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("Released v4.0.0");
 	});
@@ -15441,7 +15815,7 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		};
 		let key = "";
 		let liveEntry: unknown = "unset";
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			runReleaseCommand: async (
 				o: Parameters<TurnOps["runReleaseCommand"]>[0],
 			) => {
@@ -15454,115 +15828,115 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		store.setSettings({ releaseCommand: "bin release" });
-		const task = parkedRelease(store);
+		await store.setSettings({ releaseCommand: "bin release" });
+		const task = await parkedRelease(store);
 		key = `${store.name}/${task.id}`;
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.runReleaseCommand).toHaveLength(1);
 		expect(liveEntry).toBe(handle);
-		expect(logText(store, task.id)).toContain("| building assets");
+		expect(await logText(store, task.id)).toContain("| building assets");
 		expect(
 			readFileSync(join(store.tasksDir, `release-${task.id}.md`), "utf8"),
 		).toBe("");
 		expect(loop.running.size).toBe(0);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	// ---- settleReviews ------------------------------------------------------------------
 
 	test("a cancelled merge card still marked running does not hold the publish", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
-		const merger = store.createTask("cancelled mid-merge");
-		store.updateTask(merger.id, {
+		const task = await parkedRelease(store);
+		const merger = await store.createTask("cancelled mid-merge");
+		await store.updateTask(merger.id, {
 			stage: "merging",
 			state: "running",
 			cancelledAt: Date.now(),
 		});
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(1);
-		expect(store.getTask(task.id)!.stage).toBe("done");
+		expect((await store.getTask(task.id))!.stage).toBe("done");
 	});
 
 	test("a merge in preparing holds the publish", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
-		const merger = store.createTask("merge starting");
-		store.updateTask(merger.id, { stage: "merging", state: "preparing" });
+		const task = await parkedRelease(store);
+		const merger = await store.createTask("merge starting");
+		await store.updateTask(merger.id, { stage: "merging", state: "preparing" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	test("a parked shape in needs_you never publishes", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const task = parkedRelease(store);
-		store.updateTask(task.id, { state: "needs_you" });
+		const task = await parkedRelease(store);
+		await store.updateTask(task.id, { state: "needs_you" });
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 	});
 
 	test("parked releases in two projects both publish in one tick", async () => {
 		const record = baseRecord();
-		const a = freshStore();
-		const b = freshStore();
-		const loop = createTurnLoop(
+		const a = await freshStore();
+		const b = await freshStore();
+		const loop = holdFollowUps(
 			new Map([
 				[a.name, { ...fakeProject(a), target: "origin/main" }],
 				[b.name, { ...fakeProject(b), target: "origin/main" }],
 			]),
 			fakeOps(record, { publishRelease: publishingRelease(record) }),
 		);
-		const ta = parkedRelease(a, "v5.0.0");
-		const tb = parkedRelease(b, "v6.0.0");
+		const ta = await parkedRelease(a, "v5.0.0");
+		const tb = await parkedRelease(b, "v6.0.0");
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(2);
-		expect(a.getTask(ta.id)!.stage).toBe("done");
-		expect(b.getTask(tb.id)!.stage).toBe("done");
+		expect((await a.getTask(ta.id))!.stage).toBe("done");
+		expect((await b.getTask(tb.id))!.stage).toBe("done");
 	});
 
 	test("a Review-button card with a worktree finishes without a publish", async () => {
 		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: FINDINGS_HOLD,
@@ -15570,42 +15944,42 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 			worktree: "wt",
 		});
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(record.publishRelease).toHaveLength(0);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBeNull(); // no "Released …" summary
 		expect(after.commits).toBe(3);
 	});
 
 	test("a Review-button settle whose commit count fails is logged and stays parked", async () => {
-		const { store, projects, loop } = setup({
+		const { store, projects, loop } = await setup({
 			targetCommits: async () => {
 				throw new Error("rev-list failed");
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: FINDINGS_HOLD,
 			base: "b",
 		});
 
-		const seen = await withErrors(() => {
-			loop.schedule();
+		const seen = await withErrors(async () => {
+			await loop.schedule();
 			return flushPromises();
 		});
 
 		expect(seen.join("\n")).toContain("rev-list failed");
-		expect(store.getTask(review.id)!.stage).toBe("merging");
+		expect((await store.getTask(review.id))!.stage).toBe("merging");
 	});
 });
 
@@ -15623,17 +15997,17 @@ describe("turn survivor round 5 — run setup", () => {
 	function loopFor(
 		store: ProjectStore,
 		record: Recorded,
-		overrides: Partial<TurnOps>,
+		overrides: FixtureOps,
 	) {
-		return createTurnLoop(
+		return holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, overrides),
 		);
 	}
 
-	function mergeCard(store: ProjectStore) {
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+	async function mergeCard(store: ProjectStore) {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			base: "sha0",
@@ -15642,34 +16016,36 @@ describe("turn survivor round 5 — run setup", () => {
 		return task;
 	}
 
-	const noTrackerError = (store: ProjectStore, id: string) =>
-		expect(store.getTask(id)!.needsReason ?? "").not.toContain("Tracker error");
+	const noTrackerError = async (store: ProjectStore, id: string) =>
+		expect((await store.getTask(id))!.needsReason ?? "").not.toContain(
+			"Tracker error",
+		);
 
 	test("resolveTarget fetches fresh only when the card lacks its worktree or branch", async () => {
 		const calls: [string, boolean | undefined][] = [];
-		const { store, loop } = setup({
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setup({
+			holdFollowUps: true,
 			resolveTarget: async (path: string, fresh?: boolean) => {
 				calls.push([path, fresh]);
 				return { target: "origin/main", sha: "sha0", warning: null };
 			},
 		});
-		const fresh = store.createTask("fresh card");
-		const kept = store.createTask("kept card");
-		store.updateTask(kept.id, {
+		const fresh = await store.createTask("fresh card");
+		const kept = await store.createTask("kept card");
+		await store.updateTask(kept.id, {
 			stage: "in_progress",
 			worktree: "wt-k",
 			branch: "ott/k",
 			base: "sha0",
 		});
-		const noBranch = store.createTask("worktree without branch");
-		store.updateTask(noBranch.id, {
+		const noBranch = await store.createTask("worktree without branch");
+		await store.updateTask(noBranch.id, {
 			stage: "in_progress",
 			worktree: "wt-n",
 			base: "sha0",
 		});
-		const noWorktree = store.createTask("branch without worktree");
-		store.updateTask(noWorktree.id, {
+		const noWorktree = await store.createTask("branch without worktree");
+		await store.updateTask(noWorktree.id, {
 			stage: "in_progress",
 			branch: "ott/w",
 			base: "sha0",
@@ -15685,11 +16061,11 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a fresh work card's prepare log: turn header, worktree line, no empty warning", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const branch = store.getTask(task.id)!.branch!;
-		const log = logText(store, task.id);
+		const branch = (await store.getTask(task.id))!.branch!;
+		const log = await logText(store, task.id);
 		expect(log).toContain("== work turn ");
 		expect(log).toContain(`+ worktree ${branch} from origin/main at sha0\n`);
 		// resolveTarget's null warning must not leave a "! null" line on the card.
@@ -15701,11 +16077,11 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("the settled turn records its logOffset at the turn header", async () => {
-		const { store, loop } = setup();
-		const task = store.createTask("work please");
+		const { store, loop } = await setup();
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const turn = store.listTurns(task.id).at(-1)!;
-		const log = logText(store, task.id);
+		const turn = (await store.listTurns(task.id)).at(-1)!;
+		const log = await logText(store, task.id);
 		// The offset points at the turn's own header line in the card log.
 		expect(turn.logOffset).not.toBeNull();
 		expect(log.slice(turn.logOffset!)).toMatch(/^== (work|merge) turn /);
@@ -15717,41 +16093,45 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a resolveTarget warning reaches the card log", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			resolveTarget: async () => ({
 				target: "origin/main",
 				sha: "sha0",
 				warning: "fetch failed: offline",
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain("! fetch failed: offline\n");
+		expect(await logText(store, task.id)).toContain(
+			"! fetch failed: offline\n",
+		);
 	});
 
 	test("a merge turn's log names the merge kind", async () => {
-		const { store, loop } = setup({ commitsAhead: async () => 0 });
-		const task = mergeCard(store);
+		const { store, loop } = await setup({ commitsAhead: async () => 0 });
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain("== merge turn ");
+		expect(await logText(store, task.id)).toContain("== merge turn ");
 	});
 
 	test("prepare names an unnamed card from the generated title and logs it", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			genTitle: async () => "Fix the header",
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.sessionName).toBe("Fix the header");
-		expect(logText(store, task.id)).toContain("+ title: Fix the header\n");
+		expect(await logText(store, task.id)).toContain(
+			"+ title: Fix the header\n",
+		);
 	});
 
 	test("a failed title generation logs the fallback and names nothing", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("work please");
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.sessionName).toBeNull();
-		const log = logText(store, task.id);
+		const log = await logText(store, task.id);
 		expect(log).toContain("title generation failed");
 		expect(log).not.toContain("+ title:");
 	});
@@ -15764,7 +16144,7 @@ describe("turn survivor round 5 — run setup", () => {
 		// The run stalls, so no later turn's prepare can claim the retry before the timer does.
 		const { promise: finishRun, resolve: finish } =
 			Promise.withResolvers<RunResult>();
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			genTitle: async (_prompt, _spawn, onFail) => {
 				calls += 1;
 				if (calls === 1) {
@@ -15774,23 +16154,24 @@ describe("turn survivor round 5 — run setup", () => {
 				sawRetry();
 				return "Named on retry";
 			},
-			startRun: (o) => {
+			startRun: async (o) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return { pid: 4242, done: finishRun, kill: async () => {} };
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const run = loop.runTurn(store.name, task.id);
 		const key = `${store.name}/${task.id}`;
-		for (let i = 0; i < 100 && !loop.running.has(key); i++)
-			await flushPromises();
+		await eventually(() => loop.running.has(key));
 		await retried; // the scheduled retry ran while the stalled run holds the card
-		await Promise.resolve(); // let the retry's nameTask land
+		await eventually(async () => !(await store.titleHold(task.id)));
 		expect(calls).toBe(2);
-		expect(store.titleHold(task.id)).toBe(false);
-		expect(store.frozenTitle(store.getTask(task.id)!)).toBe("Named on retry");
-		expect(logText(store, task.id)).toContain(
+		expect(await store.titleHold(task.id)).toBe(false);
+		expect(await store.frozenTitle((await store.getTask(task.id))!)).toBe(
+			"Named on retry",
+		);
+		expect(await logText(store, task.id)).toContain(
 			"+ title: Named on retry (retry after a failed first attempt)",
 		);
 		// A later turn never generates again: the one retry is spent.
@@ -15802,7 +16183,7 @@ describe("turn survivor round 5 — run setup", () => {
 
 	test("a failed generation retries at the next turn start, once", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			genTitle: async (_prompt, _spawn, onFail) => {
 				calls += 1;
 				if (calls === 1) {
@@ -15814,7 +16195,7 @@ describe("turn survivor round 5 — run setup", () => {
 			// Only a turn start may claim the retry in this test; the timer must not fire first.
 			titleRetryDelayMs: 3_600_000,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.sessionName).toBeNull();
 		// The work turn's write schedules its merge turn on the loop; wait for that prepare:
@@ -15822,14 +16203,16 @@ describe("turn survivor round 5 — run setup", () => {
 		// not the timer, claimed the retry.
 		for (
 			let i = 0;
-			i < 100 && !logText(store, task.id).includes("Named on turn two");
+			i < 100 && !(await logText(store, task.id)).includes("Named on turn two");
 			i++
 		)
 			await flushPromises();
-		expect(logText(store, task.id)).toContain("+ title: Named on turn two\n");
+		expect(await logText(store, task.id)).toContain(
+			"+ title: Named on turn two\n",
+		);
 		expect(calls).toBe(2);
-		expect(store.titleHold(task.id)).toBe(false);
-		expect(store.frozenTitle(store.getTask(task.id)!)).toBe(
+		expect(await store.titleHold(task.id)).toBe(false);
+		expect(await store.frozenTitle((await store.getTask(task.id))!)).toBe(
 			"Named on turn two",
 		);
 		// A later turn never generates again: the one retry is spent.
@@ -15839,14 +16222,14 @@ describe("turn survivor round 5 — run setup", () => {
 
 	test("a release card keeps its fixed session name and never generates a title", async () => {
 		let generated = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			genTitle: async () => {
 				generated += 1;
 				return "Generated";
 			},
 		});
-		const task = store.createTask("release v1.0.0");
-		store.updateTask(task.id, {
+		const task = await store.createTask("release v1.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			releaseVersion: "v1.0.0",
 			base: "shaR",
@@ -15860,17 +16243,17 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a release version without a frozen base is no release review: it gets a generated title", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			genTitle: async () => "Generated",
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { releaseVersion: "v2.0.0" });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { releaseVersion: "v2.0.0" });
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.sessionName).toBe("Generated");
 	});
 
 	test("a Review-button review run gets OTTR_REVIEW=1", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			modelList: async () => [
 				{
@@ -15881,12 +16264,12 @@ describe("turn survivor round 5 — run setup", () => {
 				},
 			],
 		});
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs[0]!.env).toEqual({
 			OTTR_REVIEW: "1",
@@ -15895,11 +16278,15 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("an unreadable catalog sends no OTTR_MODELS: the record-time check stays shape-only", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			modelList: async () => [],
 		});
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 		await loop.runTurn(store.name, retro.id);
 		expect(record.runs[0]!.env).toEqual({
 			OTTR_RETRO: "1",
@@ -15908,17 +16295,17 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a cancel during worktree creation removes exactly that worktree and starts nothing", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const loop = loopFor(store, record, {
 			createWorktree: async (o: { worktreePath: string }) => {
 				record.createWorktree.push(o);
-				store.updateTask(task.id, { cancelledAt: Date.now() });
+				await store.updateTask(task.id, { cancelledAt: Date.now() });
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const branch = store.getTask(task.id)!.branch;
+		const branch = (await store.getTask(task.id))!.branch;
 		expect(record.removeWorktree).toEqual([
 			{
 				mainPath: store.path,
@@ -15931,87 +16318,91 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a failed cleanup of a cancelled fresh worktree is logged with its error", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const loop = loopFor(store, record, {
 			createWorktree: async (o: { worktreePath: string }) => {
 				record.createWorktree.push(o);
-				store.updateTask(task.id, { cancelledAt: Date.now() });
+				await store.updateTask(task.id, { cancelledAt: Date.now() });
 			},
 			removeWorktree: async () => {
 				throw new Error("worktree busy");
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"! removeWorktree: worktree busy\n",
 		);
 		expect(record.runs).toHaveLength(0);
 	});
 
 	test("a failed diff stat skips the capture and the merge turn still runs", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			diffStat: async () => {
 				throw new Error("git gone");
 			},
 			diffText: async () => "diff text",
 		});
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.diffFiles).toBeNull();
-		noTrackerError(store, task.id);
+		expect((await store.getTask(task.id))!.diffFiles).toBeNull();
+		await noTrackerError(store, task.id);
 	});
 
 	test("a failed raw diff keeps the stat, stores no text, and logs the file count", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			diffStat: async () => [{ file: "src/a.ts", plus: 2, minus: 1 }],
 			diffText: async () => {
 				throw new Error("git gone");
 			},
 		});
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.diffFiles).toEqual([{ file: "src/a.ts", plus: 2, minus: 1 }]);
 		expect(after.diffText).toBeNull();
-		expect(logText(store, task.id)).toContain("- captured diff: 1 file(s)\n");
+		expect(await logText(store, task.id)).toContain(
+			"- captured diff: 1 file(s)\n",
+		);
 		expect(record.runs).toHaveLength(1);
-		noTrackerError(store, task.id);
+		await noTrackerError(store, task.id);
 	});
 
 	test("a raw diff over 200 KB is cut at 200 KB with the truncation note", async () => {
 		const text = `${"a".repeat(200_000)}b`;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			diffStat: async () => [{ file: "big.txt", plus: 1, minus: 0 }],
 			diffText: async () => text,
 		});
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.diffText).toBe(
+		expect((await store.getTask(task.id))!.diffText).toBe(
 			`${"a".repeat(200_000)}\n… diff truncated at 200 KB`,
 		);
 	});
 
 	test("a raw diff of exactly 200 KB is stored whole", async () => {
 		const text = "a".repeat(200_000);
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			diffStat: async () => [{ file: "big.txt", plus: 1, minus: 0 }],
 			diffText: async () => text,
 		});
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.diffText).toBe(text);
+		expect((await store.getTask(task.id))!.diffText).toBe(text);
 	});
 
 	test("a steer that lands during prepare rides this turn's prompt", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const loop = loopFor(store, record, {
 			resolveTarget: async () => {
-				store.updateTask(task.id, { pendingPrompt: "use the blue theme" });
+				await store.updateTask(task.id, {
+					pendingPrompt: "use the blue theme",
+				});
 				return { target: "origin/main", sha: "sha0", warning: null };
 			},
 		});
@@ -16022,22 +16413,22 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a dep-held card whose dependency left the project names it as done", async () => {
-		const { store, record, loop } = setup();
-		const task = replyCard(store, "work please");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await replyCard(store, "work please");
+		await store.updateTask(task.id, {
 			pendingPrompt: DEP_HELD_PROMPT,
 			dependsOn: ["OTTR-404"],
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.prompt).toContain("- #OTTR-404 OTTR-404: done");
-		noTrackerError(store, task.id);
+		await noTrackerError(store, task.id);
 	});
 
 	test("a reply after the only, rejected turn carries the rejection", async () => {
-		const { store, record, loop } = setup();
-		const task = replyCard(store, "work please");
-		const prior = store.startTurn(task.id, "work", "p", null);
-		store.finishTurn(prior.id, {
+		const { store, record, loop } = await setup();
+		const task = await replyCard(store, "work please");
+		const prior = await store.startTurn(task.id, "work", "p", null);
+		await store.finishTurn(prior.id, {
 			endedAt: Date.now(),
 			outcome: "ready",
 			error: "no commits on the branch",
@@ -16049,10 +16440,12 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a retro reply after the only, rejected turn carries the rejection", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = replyCard(store, `${RETRO_MARKER}the retro`, "retro");
-		const prior = store.startTurn(retro.id, "work", "p", null);
-		store.finishTurn(prior.id, {
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const retro = await replyCard(store, `${RETRO_MARKER}the retro`, "retro");
+		const prior = await store.startTurn(retro.id, "work", "p", null);
+		await store.finishTurn(prior.id, {
 			endedAt: Date.now(),
 			outcome: "answered",
 			error: "the retro report is empty",
@@ -16066,22 +16459,22 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a reply turn sends only the reply's images, not the original prompt's", async () => {
-		const { store, record, loop } = setup();
-		const task = replyCard(store, "work please");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await replyCard(store, "work please");
+		await store.updateTask(task.id, {
 			images: ["a.png"],
 			pendingImages: ["b.png"],
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.images).toEqual([
-			join(store.imagesDir(task.id), "b.png"),
+			join(await store.imagesDir(task.id), "b.png"),
 		]);
 	});
 
 	test("run log and progress events: progress shows only once the run is registered", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		let progress: ((text: string | null) => void) | undefined;
 		let logNotes: [string, string][] = [];
 		const { promise: gate, resolve: releaseDone } =
@@ -16089,10 +16482,10 @@ describe("turn survivor round 5 — run setup", () => {
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const loop = loopFor(store, record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
-				o.onSession?.("s1");
+				await o.onSession?.("s1");
 				progress = o.onProgress;
 				markStarted();
 				// Before startRun returns there is no running entry: the event shows nothing.
@@ -16106,6 +16499,7 @@ describe("turn survivor round 5 — run setup", () => {
 		const running = loop.runTurn(store.name, task.id);
 		await started;
 		const key = `${store.name}/${task.id}`;
+		await eventually(() => loop.running.has(key));
 		expect(logNotes).toEqual([[store.name, task.id]]);
 		expect(loop.running.get(key)?.progress).toBeUndefined();
 		const published = record.publishSoon;
@@ -16119,23 +16513,23 @@ describe("turn survivor round 5 — run setup", () => {
 			runResult({ outcome: { status: "answered", summary: "did it" } }),
 		);
 		await running;
-		noTrackerError(store, task.id);
+		await noTrackerError(store, task.id);
 	});
 
 	test("progressAt moves only when the progress numbers move (OTTR-469)", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		let progress: ((text: string | null) => void) | undefined;
 		const { promise: gate, resolve: releaseDone } =
 			Promise.withResolvers<RunResult>();
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const loop = loopFor(store, record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
-				o.onSession?.("s1");
+				await o.onSession?.("s1");
 				progress = o.onProgress;
 				markStarted();
 				return { pid: 4242, done: gate, kill: async () => {} };
@@ -16144,6 +16538,7 @@ describe("turn survivor round 5 — run setup", () => {
 		const running = loop.runTurn(store.name, task.id);
 		await started;
 		const key = `${store.name}/${task.id}`;
+		await eventually(() => loop.running.has(key));
 		const stryker = (pct: number, elapsed: string, tested: number): string =>
 			`Mutation testing ${pct}% (elapsed: ${elapsed}, remaining: ~1h 23m) ${tested}/6523 tested (38 survived)`;
 		// Fake clock: onProgress stamps Date.now(), so the tests pin exact stamps.
@@ -16174,19 +16569,19 @@ describe("turn survivor round 5 — run setup", () => {
 			runResult({ outcome: { status: "answered", summary: "did it" } }),
 		);
 		await running;
-		noTrackerError(store, task.id);
+		await noTrackerError(store, task.id);
 	});
 
 	test("a repeated session report while running keeps the first session id", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		let seen: string | null | undefined;
 		const loop = loopFor(store, record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("s1");
-				o.onSession?.("s2");
-				seen = store.getTask(task.id)!.sessionId;
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("s1");
+				await o.onSession?.("s2");
+				seen = (await store.getTask(task.id))!.sessionId;
 				return answeredRun();
 			},
 		});
@@ -16195,15 +16590,15 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a session report after a cancel in the spawn window leaves the card untouched", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		let seen: { state: string; sessionId: string | null } | undefined;
 		const loop = loopFor(store, record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				store.updateTask(task.id, { cancelledAt: Date.now() });
-				o.onSession?.("s1");
-				const cur = store.getTask(task.id)!;
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await store.updateTask(task.id, { cancelledAt: Date.now() });
+				await o.onSession?.("s1");
+				const cur = (await store.getTask(task.id))!;
 				seen = { state: cur.state, sessionId: cur.sessionId };
 				return answeredRun();
 			},
@@ -16213,17 +16608,17 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a merge turn's session report never moves the card to in progress", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		let stage: string | undefined;
 		const loop = loopFor(store, record, {
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				// The card sits at todo when the merge session starts.
-				store.updateTask(task.id, { stage: "todo" });
-				o.onSession?.("s1");
-				stage = store.getTask(task.id)!.stage;
+				await store.updateTask(task.id, { stage: "todo" });
+				await o.onSession?.("s1");
+				stage = (await store.getTask(task.id))!.stage;
 				return answeredRun();
 			},
 		});
@@ -16232,15 +16627,15 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a grill turn's session report keeps the card in the backlog", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("grill me");
-		store.updateTask(task.id, { stage: "backlog" });
+		const task = await store.createTask("grill me");
+		await store.updateTask(task.id, { stage: "backlog" });
 		let seen: { stage: string; state: string } | undefined;
 		const loop = loopFor(store, record, {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("s1");
-				const cur = store.getTask(task.id)!;
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("s1");
+				const cur = (await store.getTask(task.id))!;
 				seen = { stage: cur.stage, state: cur.state };
 				return answeredRun();
 			},
@@ -16250,62 +16645,67 @@ describe("turn survivor round 5 — run setup", () => {
 	});
 
 	test("a steer landing during package install on a card without pending text stays queued", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const loop = loopFor(store, record, {
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 			ensurePackages: async () => {
 				// The steer text starts with "null": no stale prefix may be stripped from it.
-				store.updateTask(task.id, { pendingPrompt: "null check the parser" });
+				await store.updateTask(task.id, {
+					pendingPrompt: "null check the parser",
+				});
 				return [];
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toBe("null check the parser");
-		const turns = store.listTurns(task.id);
+		const turns = await store.listTurns(task.id);
 		expect(turns).toHaveLength(1);
 		expect(turns[0]!.prompt).not.toContain("null check the parser");
-		noTrackerError(store, task.id);
+		await noTrackerError(store, task.id);
 	});
 
 	test("a steer cancelled during package install: the turn still starts and records the reply", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = replyCard(store, "work please");
-		store.updateTask(task.id, {
+		const task = await replyCard(store, "work please");
+		await store.updateTask(task.id, {
 			pendingPrompt: "one",
 			pendingImages: ["a.png"],
 		});
 		const loop = loopFor(store, record, {
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 			ensurePackages: async () => {
-				store.updateTask(task.id, { pendingPrompt: null, pendingImages: [] });
+				await store.updateTask(task.id, {
+					pendingPrompt: null,
+					pendingImages: [],
+				});
 				return [];
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const turns = store.listTurns(task.id);
+		const turns = await store.listTurns(task.id);
 		expect(turns).toHaveLength(1);
 		expect(turns[0]!.input).toBe("one");
-		expect(store.getTask(task.id)!.pendingPrompt).toBeNull();
-		noTrackerError(store, task.id);
+		expect((await store.getTask(task.id))!.pendingPrompt).toBeNull();
+		await noTrackerError(store, task.id);
 	});
 
 	test("pending images that no longer start with the sent ones stay queued", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
-		const task = replyCard(store, "work please");
-		store.updateTask(task.id, {
+		const task = await replyCard(store, "work please");
+		await store.updateTask(task.id, {
 			pendingPrompt: "one",
 			pendingImages: ["a", "b"],
 		});
 		const loop = loopFor(store, record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				o.onSession?.("s1");
-				store.updateTask(task.id, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await o.onSession?.("s1");
+				await store.updateTask(task.id, {
 					pendingPrompt: "one\n\ntwo",
 					pendingImages: ["a", "c"],
 				});
@@ -16313,7 +16713,7 @@ describe("turn survivor round 5 — run setup", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toBe("two");
 		expect(after.pendingImages).toEqual(["a", "c"]);
 	});
@@ -16324,9 +16724,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 
 	/** startRun override whose run resolves with runResult(p). */
 	function finishing(record: Recorded, p: Partial<RunResult>) {
-		return (o: Parameters<TurnOps["startRun"]>[0]) => {
+		return async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
-			o.onSession?.("sess-1");
+			await o.onSession?.("sess-1");
 			return {
 				pid: 4242,
 				done: Promise.resolve(runResult(p)),
@@ -16338,18 +16738,18 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	}
 
 	/** setupWith plus a run that resolves with runResult(p); chained turns are held. */
-	function withRun(p: Partial<RunResult>, overrides: Partial<TurnOps> = {}) {
+	async function withRun(p: Partial<RunResult>, overrides: FixtureOps = {}) {
 		const record = baseRecord();
-		return setupWith(record, {
-			maxTotalRuns: () => 0,
+		return await setupWith(record, {
+			holdFollowUps: true,
 			startRun: finishing(record, p),
 			...overrides,
 		});
 	}
 
-	function mergeCard(store: ProjectStore, worktree = "wt-m") {
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+	async function mergeCard(store: ProjectStore, worktree = "wt-m") {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree,
 			branch: "ott/m",
@@ -16357,9 +16757,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		return task;
 	}
 
-	function researchCard(store: ProjectStore) {
-		const task = store.createTask("research something");
-		store.updateTask(task.id, { research: true });
+	async function researchCard(store: ProjectStore) {
+		const task = await store.createTask("research something");
+		await store.updateTask(task.id, { research: true });
 		return task;
 	}
 
@@ -16378,33 +16778,33 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		return wt;
 	}
 
-	function lastTurn(store: ProjectStore, id: string) {
-		return store.listTurns(id).at(-1)!;
+	async function lastTurn(store: ProjectStore, id: string) {
+		return (await store.listTurns(id)).at(-1)!;
 	}
 
 	test("a merge turn never reads a research report left in its worktree", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "integrated", summary: "landed" },
 		});
 		const wt = join(store.worktreesDir, "merge-wt");
 		mkdirSync(wt, { recursive: true });
 		writeFileSync(join(wt, RESEARCH_REPORT), "# stray notes");
-		const task = mergeCard(store, wt);
+		const task = await mergeCard(store, wt);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.research).toBe(false);
 		expect(after.report).toBeNull();
 	});
 
 	test("a release card with a report file is never flagged research", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "answered", summary: "reviewed" },
 		});
-		const task = store.createTask("release v1.0.0");
+		const task = await store.createTask("release v1.0.0");
 		const wt = workTree(store, task.id);
 		writeFileSync(join(wt, RESEARCH_REPORT), "# review notes");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "in_progress",
 			releaseVersion: "v1.0.0",
 			base: "shaR",
@@ -16412,16 +16812,16 @@ describe("turn survivor round 5 — run result and merge push", () => {
 			branch: "ott/rel",
 		});
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.research).toBe(false);
+		expect((await store.getTask(task.id))!.research).toBe(false);
 	});
 
 	test("a plain work card without a report stays a work card: ready goes to merging", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "ready", summary: "did it" },
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.research).toBe(false);
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
@@ -16429,16 +16829,16 @@ describe("turn survivor round 5 — run result and merge push", () => {
 
 	test("a research card whose report is still there keeps its mark on a ready report with commits", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			createWorktree: withReport(record),
 			startRun: finishing(record, {
 				outcome: { status: "ready", summary: "researched" },
 			}),
 		});
-		const task = researchCard(store);
+		const task = await researchCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.research).toBe(true);
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
@@ -16446,12 +16846,12 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a research card without its report keeps its mark on an answered report with commits", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "answered", summary: "researched" },
 		});
-		const task = researchCard(store);
+		const task = await researchCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.research).toBe(true);
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
@@ -16459,13 +16859,13 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a research card's ready report without commits stays research and asks for the report", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "ready", summary: "researched" } },
 			{ commitsAhead: async () => 0 },
 		);
-		const task = researchCard(store);
+		const task = await researchCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.research).toBe(true);
 		expect(after.stage).toBe("in_progress");
 		expect(after.needsReason).toContain(RESEARCH_REPORT);
@@ -16474,15 +16874,15 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	test("a killed run that no stop request owns leaves the card as the cancel wrote it", async () => {
 		const record = baseRecord();
 		const held = Promise.withResolvers<RunResult>();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return { pid: 4242, done: held.promise, kill: async () => {} };
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const key = `${store.name}/${task.id}`;
 		const run = loop.runTurn(store.name, task.id);
 		for (let i = 0; i < 100 && !loop.running.has(key); i++)
@@ -16490,11 +16890,11 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		expect(loop.running.has(key)).toBe(true);
 		// A cancel whose kill wait timed out kept the worktree and handed the card back.
 		const kept = cancelKeptReason("uncommitted changes to a.txt");
-		store.updateTask(task.id, { state: "needs_you", needsReason: kept });
+		await store.updateTask(task.id, { state: "needs_you", needsReason: kept });
 		held.resolve(runResult({ killed: true, sawTerminalEnd: false }));
 		await run;
-		expect(lastTurn(store, task.id).error).toBe("cancelled");
-		const after = store.getTask(task.id)!;
+		expect((await lastTurn(store, task.id)).error).toBe("cancelled");
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBe(kept);
 		expect(after.cancelledAt).toBeNull();
 	});
@@ -16502,11 +16902,11 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	test("a cancel that lands during a stop owns the card", async () => {
 		const record = baseRecord();
 		const held = Promise.withResolvers<RunResult>();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: held.promise,
@@ -16516,7 +16916,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const key = `${store.name}/${task.id}`;
 		const e = fakeProject(store);
 		const run = loop.runTurn(store.name, task.id);
@@ -16531,15 +16931,15 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		await run;
 		await expect(stop).resolves.toEqual({ ok: true });
 		await expect(cancel).resolves.toEqual({ removed: true });
-		expect(lastTurn(store, task.id).error).toBe("stopped");
-		const after = store.getTask(task.id)!;
+		expect((await lastTurn(store, task.id)).error).toBe("stopped");
+		const after = (await store.getTask(task.id))!;
 		expect(after.cancelledAt).not.toBeNull();
 		expect(after.state).toBe("idle");
 		expect(after.needsReason ?? "").not.toContain("Turn stopped");
 	});
 
 	test("an interview turn's integrated report is rejected like a work turn's", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "integrated", summary: "rules set" } },
 			{
 				worktreeHusk: async () => true,
@@ -16548,13 +16948,13 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				branchMergedOrGone: async () => true,
 			},
 		);
-		const task = store.createTask(
+		const task = await store.createTask(
 			`${RULES_INTERVIEW_MARKER}${store.name}`,
 			null,
 			"interview",
 		);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// Interviews are question cards: even with the branch proof at hand, an
 		// integrated report from a work-kind turn never lands the card.
 		expect(after.state).toBe("needs_you");
@@ -16562,7 +16962,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a husk check that fails counts as no husk: the worktree decides integration", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "integrated", summary: "landed" } },
 			{
 				worktreeHusk: async () => {
@@ -16572,9 +16972,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				branchMergedOrGone: async () => true,
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.needsReason).toBe(
 			"Reported integrated, but HEAD is not on origin/main.",
@@ -16582,7 +16982,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a link check that fails counts as unlinked: the main repo proves integration", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "integrated", summary: "landed" } },
 			{
 				worktreeLinked: async () => {
@@ -16592,17 +16992,17 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				branchMergedOrGone: async () => true,
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 	});
 
 	test("a needs_you turn leaves untracked files alone", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: finishing(record, {
 				outcome: { status: "needs_you", summary: "stuck", question: "Which?" },
 			}),
@@ -16614,70 +17014,70 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				return ["junk.txt"];
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.quarantine).toHaveLength(0);
-		expect(logText(store, task.id)).not.toContain("junk.txt");
-		expect(store.getTask(task.id)!.state).toBe("needs_you");
+		expect(await logText(store, task.id)).not.toContain("junk.txt");
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 	});
 
 	test("an outcome without shots and no shots/ dir adopts nothing and warns about no shot", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "ready", summary: "did it" },
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.shots).toEqual([]);
-		expect(logText(store, task.id)).not.toContain("! shot");
+		expect((await store.getTask(task.id))!.shots).toEqual([]);
+		expect(await logText(store, task.id)).not.toContain("! shot");
 	});
 
 	test("a non-image under shots/ is skipped and named by its shots/ path", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "ready", summary: "did it" },
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = workTree(store, task.id);
 		mkdirSync(join(wt, "shots"), { recursive: true });
 		writeFileSync(join(wt, "shots", "notes.txt"), "not a picture");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.shots).toEqual([]);
-		expect(existsSync(store.imagesDir(task.id))).toBe(false);
-		expect(logText(store, task.id)).toContain(
+		expect((await store.getTask(task.id))!.shots).toEqual([]);
+		expect(existsSync(await store.imagesDir(task.id))).toBe(false);
+		expect(await logText(store, task.id)).toContain(
 			"! shot shots/notes.txt: not a recognized image",
 		);
 	});
 
 	test("a reported shot outside the worktree is refused", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: {
 				status: "ready",
 				summary: "did it",
 				shots: ["../escape.png"],
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const wt = workTree(store, task.id);
 		writeFileSync(join(dirname(wt), "escape.png"), PNG);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.shots).toEqual([]);
-		expect(logText(store, task.id)).toContain(
+		expect((await store.getTask(task.id))!.shots).toEqual([]);
+		expect(await logText(store, task.id)).toContain(
 			"! shot ../escape.png: path escapes the worktree — keep the path inside the worktree, for example shots/<name>.png (shots/ is gitignored)",
 		);
 	});
 
 	test("the card keeps the newest 8 shots", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: { status: "ready", summary: "did it", shots: ["ui.png"] },
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const old = ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"].map(
 			(n) => `${n}.png`,
 		);
-		store.updateTask(task.id, { shots: old });
+		await store.updateTask(task.id, { shots: old });
 		const wt = workTree(store, task.id);
 		writeFileSync(join(wt, "ui.png"), PNG);
 		await loop.runTurn(store.name, task.id);
-		const shots = store.getTask(task.id)!.shots;
+		const shots = (await store.getTask(task.id))!.shots;
 		expect(shots).toHaveLength(8);
 		expect(shots.slice(0, 7)).toEqual(old.slice(1));
 		expect(shots[7]).toMatch(/^\d+\.png$/);
@@ -16685,16 +17085,16 @@ describe("turn survivor round 5 — run result and merge push", () => {
 
 	test("a clean turn with nothing untracked writes no quarantine line", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: finishing(record, {
 				outcome: { status: "ready", summary: "did it" },
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		expect(record.quarantine).toHaveLength(1);
-		expect(logText(store, task.id)).not.toContain("quarantined");
+		expect(await logText(store, task.id)).not.toContain("quarantined");
 	});
 
 	test("exactly 20 quarantined files are all listed without a truncation mark", async () => {
@@ -16703,16 +17103,16 @@ describe("turn survivor round 5 — run result and merge push", () => {
 			(_, i) => `f${String(i + 1).padStart(2, "0")}`,
 		);
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: finishing(record, {
 				outcome: { status: "ready", summary: "did it" },
 			}),
 			quarantineUntracked: async () => names,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const line = logText(store, task.id)
+		const line = (await logText(store, task.id))
 			.split("\n")
 			.find((l) => l.includes("quarantined 20 untracked file(s)"));
 		expect(line).toBeDefined();
@@ -16721,7 +17121,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 
 	test("a work turn never takes the server merge push", async () => {
 		const pushes: string[] = [];
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "ready", summary: "did it" } },
 			{
 				serverMergePush: async (_m: string, _w: string, target: string) => {
@@ -16730,9 +17130,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBeNull();
@@ -16740,7 +17140,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a server push that throws keeps the merge card with git's reason", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "integrated", summary: "landed" } },
 			{
 				serverMergePush: async () => {
@@ -16748,39 +17148,39 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Server push to origin failed: ssh: connect refused",
 		);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"server push of origin/main failed: ssh: connect refused",
 		);
 	});
 
 	test("a skipped server push neither logs a push nor resolves an auth failure", async () => {
-		const { store, loop } = withRun({
+		const { store, loop } = await withRun({
 			outcome: {
 				status: "needs_you",
 				summary: "push blocked",
 				details: "fatal: Authentication failed for 'https://h/r.git/'",
 			},
 		});
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
-		expect(lastTurn(store, task.id).outcome).toBe("needs_you");
-		expect(logText(store, task.id)).not.toContain("from the server");
+		expect((await lastTurn(store, task.id)).outcome).toBe("needs_you");
+		expect(await logText(store, task.id)).not.toContain("from the server");
 	});
 
 	test("an auth failure named only in the summary resolves once the server pushed", async () => {
 		let pushed = false;
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{
 				outcome: {
 					status: "needs_you",
@@ -16795,23 +17195,23 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		const turn = lastTurn(store, task.id);
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		const turn = await lastTurn(store, task.id);
 		expect(turn.outcome).toBe("integrated");
 		expect(
 			turn.details!.startsWith("fatal: Authentication failed for origin"),
 		).toBe(true);
 		expect(turn.details).toContain("Server push of origin/main:\n(no output)");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"needs_you on a push authentication failure resolved",
 		);
 	});
 
 	test("an auth failure named only in the question resolves and keeps the agent's details", async () => {
 		let pushed = false;
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{
 				outcome: {
 					status: "needs_you",
@@ -16828,17 +17228,17 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		const turn = lastTurn(store, task.id);
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		const turn = await lastTurn(store, task.id);
 		expect(turn.outcome).toBe("integrated");
 		expect(turn.details!.startsWith("the remote said no")).toBe(true);
 		expect(turn.details).toContain("main -> main");
 	});
 
 	test("a merge turn without an outcome still takes the server push and lands from git", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: null },
 			{
 				serverMergePush: async () => ({
@@ -16847,18 +17247,18 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				}),
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"pushed origin/main from the server",
 		);
 	});
 
 	test("an answered merge report naming an auth failure is not rewritten by the push", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{
 				outcome: {
 					status: "answered",
@@ -16872,33 +17272,33 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				}),
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.needsReason).toBe(
 			'Unexpected outcome "answered" in a merge turn.',
 		);
-		expect(lastTurn(store, task.id).outcome).toBe("answered");
+		expect((await lastTurn(store, task.id)).outcome).toBe("answered");
 	});
 
 	test("a husk work card's ready report names no uncommitted changes", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "ready", summary: "did it" } },
 			{
 				worktreeHusk: async () => true,
 				branchMergedOrGone: async () => false,
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.needsReason).toBe(
+		expect((await store.getTask(task.id))!.needsReason).toBe(
 			"Reported ready, but git shows 0 commit(s) ahead of the base.",
 		);
 	});
 
 	test("a tree whose clean check fails counts as dirty", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "ready", summary: "did it" } },
 			{
 				isClean: async () => {
@@ -16906,9 +17306,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.needsReason).toBe(
 			"Reported ready, but git shows 1 commit(s) ahead of the base and uncommitted changes.",
@@ -16919,7 +17319,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		// The worktree dies during the run: the first husk read is OTTR-341's dispatch
 		// guard (alive), the settle's later reads see the husk and read the main repo.
 		let huskReads = 0;
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "integrated", summary: "landed" } },
 			{
 				worktreeHusk: async () => huskReads++ > 0,
@@ -16928,9 +17328,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.needsReason).toBe(
 			"worktree link lost and branch has unreached commits",
@@ -16938,7 +17338,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	});
 
 	test("a merge whose integration check fails is not integrated", async () => {
-		const { store, loop } = withRun(
+		const { store, loop } = await withRun(
 			{ outcome: { status: "integrated", summary: "landed" } },
 			{
 				isIntegrated: async () => {
@@ -16946,9 +17346,9 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				},
 			},
 		);
-		const task = mergeCard(store);
+		const task = await mergeCard(store);
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.needsReason).toBe(
 			"Reported integrated, but HEAD is not on origin/main.",
@@ -16959,11 +17359,15 @@ describe("turn survivor round 5 — run result and merge push", () => {
 describe("turn survivor round 5 — classify wiring", () => {
 	/** startRun override resolving every run with `p` (session announced unless p says otherwise). */
 	const runWith =
-		(record: Recorded, p: Partial<RunResult>, during?: () => void) =>
-		(o: Parameters<TurnOps["startRun"]>[0]) => {
+		(
+			record: Recorded,
+			p: Partial<RunResult>,
+			during?: () => unknown | Promise<unknown>,
+		) =>
+		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
-			if (p.sessionId !== null) o.onSession?.("sess-1");
-			during?.();
+			if (p.sessionId !== null) await o.onSession?.("sess-1");
+			await during?.();
 			return {
 				pid: 4242,
 				done: Promise.resolve(runResult(p)),
@@ -16981,15 +17385,15 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("a research card without its report file and no receipt asks for the receipt", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: runWith(record, {}),
 		});
-		const task = store.createTask("research please");
-		store.updateTask(task.id, { research: true });
+		const task = await store.createTask("research please");
+		await store.updateTask(task.id, { research: true });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// No report file: classify must not take the report-present done rule.
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(NO_REPORT);
@@ -17000,18 +17404,21 @@ describe("turn survivor round 5 — classify wiring", () => {
 		// The worktree dies during the run: alive at dispatch (OTTR-341 never dispatches
 		// into a husk), a husk by the settle, so classify reads its facts from the main repo.
 		let husked = false;
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			worktreeHusk: async () => husked,
 			branchMergedOrGone: async () => false,
 			startRun: runWith(record, {}, () => {
 				husked = true;
 			}),
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { branch: "ott/husk", worktree: "wt-husk" });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
+			branch: "ott/husk",
+			worktree: "wt-husk",
+		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(NO_REPORT);
 	});
@@ -17020,8 +17427,8 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const record = baseRecord();
 		// Same mid-run removal: alive at dispatch, a husk at the settle.
 		let husked = false;
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			worktreeHusk: async () => husked,
 			branchMergedOrGone: async () => false,
 			startRun: runWith(
@@ -17032,10 +17439,13 @@ describe("turn survivor round 5 — classify wiring", () => {
 				},
 			),
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { branch: "ott/husk", worktree: "wt-husk" });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
+			branch: "ott/husk",
+			worktree: "wt-husk",
+		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// answered with 0 commits ahead (the husk reads 0) is done; the null reason must not crash.
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
@@ -17044,47 +17454,47 @@ describe("turn survivor round 5 — classify wiring", () => {
 	test("a needs_you reason that mentions a dispatch is not copied into the run log", async () => {
 		const reason = "Blocked on infra (dispatch q7) for now";
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: runWith(record, {
 				outcome: { status: "needs_you", summary: "s", question: reason },
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.needsReason).toBe(reason);
-		expect(logText(store, task.id)).not.toContain(reason);
+		expect((await store.getTask(task.id))!.needsReason).toBe(reason);
+		expect(await logText(store, task.id)).not.toContain(reason);
 	});
 
 	test("an exit without dispatch context is not copied into the run log", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: runWith(record, { exitCode: 1 }),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		const reason = "omp exited with code 1 before finishing.";
-		expect(store.getTask(task.id)!.needsReason).toBe(reason);
-		expect(logText(store, task.id)).not.toContain(reason);
+		expect((await store.getTask(task.id))!.needsReason).toBe(reason);
+		expect(await logText(store, task.id)).not.toContain(reason);
 	});
 
 	test("image quarantine keeps the card's images it did not move", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: runWith(record, diedBeforeOutput),
 		});
-		const task = store.createTask("work please");
-		setImage(store, task.id, "a.png", "bytes-a");
-		setImage(store, task.id, "b.png", "bytes-b");
+		const task = await store.createTask("work please");
+		await setImage(store, task.id, "a.png", "bytes-a");
+		await setImage(store, task.id, "b.png", "bytes-b");
 		// gone.png has no file: nothing moves for it, so it stays on the card.
-		store.updateTask(task.id, { images: ["a.png", "gone.png", "b.png"] });
+		await store.updateTask(task.id, { images: ["a.png", "gone.png", "b.png"] });
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.images).toEqual(["gone.png"]);
-		const line = logText(store, task.id)
+		const line = (await logText(store, task.id))
 			.split("\n")
 			.find((l) => l.includes("provider rejected the attached images"));
 		expect(line).toContain(
@@ -17094,19 +17504,19 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("the image quarantine note lists at most 20 names", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: runWith(record, diedBeforeOutput),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const names = Array.from(
 			{ length: 21 },
 			(_, i) => `img${String(i + 1).padStart(2, "0")}.png`,
 		);
-		for (const n of names) setImage(store, task.id, n, n);
-		store.updateTask(task.id, { images: names });
+		for (const n of names) await setImage(store, task.id, n, n);
+		await store.updateTask(task.id, { images: names });
 		await loop.runTurn(store.name, task.id);
-		const line = logText(store, task.id)
+		const line = (await logText(store, task.id))
 			.split("\n")
 			.find((l) => l.includes("provider rejected the attached images"));
 		expect(line).toContain(
@@ -17117,17 +17527,17 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("a merge reply whose image quarantine fails parks at merging", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: runWith(record, diedBeforeOutput),
 		});
-		const task = store.createTask("merge please");
+		const task = await store.createTask("merge please");
 		saveSession(store, "s9");
-		setImage(store, task.id, "1.png", "rejected-bytes");
+		await setImage(store, task.id, "1.png", "rejected-bytes");
 		// A file where the quarantine dir must be: the move fails.
 		mkdirSync(join(store.tasksDir, "quarantine"), { recursive: true });
 		writeFileSync(join(store.tasksDir, "quarantine", task.id), "blocked");
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			worktree: "wt-x",
@@ -17137,7 +17547,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs[0]!.images).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toMatch(/^Image quarantine failed: /);
@@ -17146,23 +17556,24 @@ describe("turn survivor round 5 — classify wiring", () => {
 	test("steering on a merge turn requeues it at merging", async () => {
 		const record = baseRecord();
 		let id = "";
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			startRun: runWith(
 				record,
 				{ outcome: { status: "integrated", summary: "merged" } },
-				() => store.updateTask(id, { pendingPrompt: "steer mid-run" }),
+				async () =>
+					await store.updateTask(id, { pendingPrompt: "steer mid-run" }),
 			),
 		});
-		const task = store.createTask("merge please");
+		const task = await store.createTask("merge please");
 		id = task.id;
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			worktree: "wt-x",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe("steer mid-run");
@@ -17170,8 +17581,8 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("an empty reported dependsOn is no hold: needs_you stays needs_you", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: runWith(record, {
 				outcome: {
@@ -17182,9 +17593,9 @@ describe("turn survivor round 5 — classify wiring", () => {
 				},
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("which db?");
 		expect(after.pendingPrompt).toBeNull();
@@ -17193,53 +17604,56 @@ describe("turn survivor round 5 — classify wiring", () => {
 	test("a bad dependsOn id gets the reason for its own kind of mistake", async () => {
 		let deps: string[] = [];
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "needs_you", summary: "hold", dependsOn: deps },
 				})(o),
 		});
-		const self = store.createTask("self hold");
+		const self = await store.createTask("self hold");
 		deps = [self.id];
 		await loop.runTurn(store.name, self.id);
-		expect(store.getTask(self.id)!.needsReason).toBe(
+		expect((await store.getTask(self.id))!.needsReason).toBe(
 			`report_outcome's dependsOn names #${self.id}, which is this card itself. Reply to continue, or cancel the card.`,
 		);
 
-		const other = store.createTask("unknown hold");
+		const other = await store.createTask("unknown hold");
 		deps = ["nope"];
 		await loop.runTurn(store.name, other.id);
-		expect(store.getTask(other.id)!.needsReason).toBe(
+		expect((await store.getTask(other.id))!.needsReason).toBe(
 			"report_outcome's dependsOn names #nope, which is not a card in this project. Reply to continue, or cancel the card.",
 		);
 	});
 
 	test("a reported hold rewrites a stored dependsOn that holds a duplicate", async () => {
 		let depId = "";
+		let taskId = "";
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
-				runWith(record, {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				await store.updateTask(taskId, { dependsOn: [depId, depId] });
+				return runWith(record, {
 					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
-				})(o),
+				})(o);
+			},
 		});
-		const dep = store.createTask("the blocker");
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { dependsOn: [dep.id, dep.id] });
+		const task = await store.createTask("work please");
+		taskId = task.id;
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.dependsOn).toEqual([dep.id]);
+		expect((await store.getTask(task.id))!.dependsOn).toEqual([dep.id]);
 	});
 
 	test("a reported hold on a non-needs_you outcome records the ids but never requeues", async () => {
 		let depId = "";
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			isIntegrated: async () => false,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
@@ -17247,11 +17661,11 @@ describe("turn survivor round 5 — classify wiring", () => {
 					outcome: { status: "ready", summary: "done", dependsOn: [depId] },
 				})(o),
 		});
-		const dep = store.createTask("the blocker");
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.dependsOn).toEqual([dep.id]);
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
@@ -17264,8 +17678,8 @@ describe("turn survivor round 5 — classify wiring", () => {
 		let depId = "";
 		let id = "";
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(
@@ -17277,15 +17691,16 @@ describe("turn survivor round 5 — classify wiring", () => {
 							dependsOn: [depId],
 						},
 					},
-					() => store.updateTask(id, { pendingPrompt: "steer mid-run" }),
+					async () =>
+						await store.updateTask(id, { pendingPrompt: "steer mid-run" }),
 				)(o),
 		});
-		const dep = store.createTask("the blocker");
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		id = task.id;
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe("steer mid-run");
 		expect(after.needsReason).toBeNull();
@@ -17294,8 +17709,8 @@ describe("turn survivor round 5 — classify wiring", () => {
 	test("a reported hold with an open ask keeps the question", async () => {
 		let depId = "";
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
@@ -17305,11 +17720,11 @@ describe("turn survivor round 5 — classify wiring", () => {
 					] as never,
 				})(o),
 		});
-		const dep = store.createTask("the blocker");
+		const dep = await store.createTask("the blocker");
 		depId = dep.id;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("Wants your answer: pick one?");
 		expect(after.dependsOn).toEqual([dep.id]);
@@ -17320,13 +17735,13 @@ describe("turn survivor round 5 — classify wiring", () => {
 		record.recorded = [
 			{ prompt: "Bug A", model: null, rank: 1, security: null },
 		];
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
 	});
@@ -17336,8 +17751,8 @@ describe("turn survivor round 5 — classify wiring", () => {
 		record.recorded = [
 			{ prompt: "Bug A", model: null, rank: 1, security: null },
 		];
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			// Check off: the parked card's assertions stay about the park, not the check.
 			reviewCheck: () => false,
@@ -17346,14 +17761,14 @@ describe("turn survivor round 5 — classify wiring", () => {
 				recorded: record.recorded,
 			}),
 		});
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("scope?");
@@ -17361,19 +17776,19 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("a plain review landing done never calls the release publish", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			publishRelease: publishingRelease(record),
 		});
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
 		expect(record.publishRelease).toHaveLength(0);
@@ -17381,22 +17796,22 @@ describe("turn survivor round 5 — classify wiring", () => {
 
 	test("a merge turn with UI files in its diff never asks for a screenshot", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			changedFiles: async () => ["src/ui/app.tsx"],
 			startRun: integratedRun(record),
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			branch: "ott/x",
 			worktree: "wt-x",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.pendingPrompt).toBeNull();
-		expect(logText(store, task.id)).not.toContain(UI_SHOT_WARNING);
+		expect(await logText(store, task.id)).not.toContain(UI_SHOT_WARNING);
 	});
 });
 
@@ -17406,11 +17821,15 @@ describe("turn survivor round 5 — run finish", () => {
 	// A startRun fake that resolves `done` with `r`; `during` runs while the agent is live
 	// (a mid-run steer lands there, as POST /steer does).
 	const runReturning =
-		(record: Recorded, r: Partial<RunResult>, during?: () => void) =>
-		(o: Parameters<TurnOps["startRun"]>[0]) => {
+		(
+			record: Recorded,
+			r: Partial<RunResult>,
+			during?: () => unknown | Promise<unknown>,
+		) =>
+		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
-			o.onSession?.("sess-1");
-			during?.();
+			await o.onSession?.("sess-1");
+			await during?.();
 			return {
 				pid: 4242,
 				done: Promise.resolve(runResult(r)),
@@ -17420,58 +17839,66 @@ describe("turn survivor round 5 — run finish", () => {
 	const askOutcome = (question: string): Partial<RunResult> => ({
 		outcome: { status: "needs_you", summary: "blocked", question },
 	});
-	const forkChild = (store: ProjectStore, prompt: string) => {
-		const parent = store.createTask("fork research: weekly digest");
-		store.updateTask(parent.id, {
+	const forkChild = async (store: ProjectStore, prompt: string) => {
+		const parent = await store.createTask("fork research: weekly digest");
+		await store.updateTask(parent.id, {
 			topic: "fork research",
 			research: true,
 			stage: "done",
 			state: "idle",
 		});
-		const task = store.createTask(prompt);
-		store.updateTask(task.id, { followUpOf: parent.id });
+		const task = await store.createTask(prompt);
+		await store.updateTask(task.id, { followUpOf: parent.id });
 		return task;
 	};
-	const kidsOf = (store: ProjectStore, id: string) =>
-		store.listTasks().filter((t) => t.followUpOf === id);
+	const kidsOf = async (store: ProjectStore, id: string) =>
+		(await store.listTasks()).filter((t) => t.followUpOf === id);
 
 	test("a steered research turn keeps the archived report until the turn settles", async () => {
 		const record = baseRecord();
 		let taskId = "";
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			createWorktree: async (o: { worktreePath: string }) => {
 				record.createWorktree.push(o);
 				mkdirSync(o.worktreePath, { recursive: true });
 				writeFileSync(join(o.worktreePath, RESEARCH_REPORT), "# half-written");
 			},
-			startRun: runReturning(record, {}, () =>
-				store.updateTask(taskId, { pendingPrompt: "also cover pricing" }),
+			startRun: runReturning(
+				record,
+				{},
+				async () =>
+					await store.updateTask(taskId, {
+						pendingPrompt: "also cover pricing",
+					}),
 			),
 		});
-		const task = store.createTask("research something");
+		const task = await store.createTask("research something");
 		taskId = task.id;
-		store.updateTask(task.id, { research: true, report: "# first answer" });
+		await store.updateTask(task.id, {
+			research: true,
+			report: "# first answer",
+		});
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.report).toBe("# first answer");
 	});
 
 	test("unsaved work on a finished work card keeps it in progress, not merging", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			unsavedWork: async () => "uncommitted changes",
 			statusFiles: async () => ["src/a.ts"],
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(keptReason("uncommitted changes"));
@@ -17481,16 +17908,16 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("the update-merge hold never stalls a merge turn that integrated", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			startRun: integratedRun(record),
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { stage: "merging", updateIds: ["a@1"] });
-		store.setSettings({ holdUpdateMerges: true });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { stage: "merging", updateIds: ["a@1"] });
+		await store.setSettings({ holdUpdateMerges: true });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
 		expect(record.removeWorktree).toHaveLength(1);
@@ -17498,31 +17925,31 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("the update-merge hold keeps an update card's own question", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			startRun: runReturning(record, askOutcome("pin a@2 or a@3?")),
 		});
-		const task = store.createTask("update pins");
-		store.updateTask(task.id, { updateIds: ["a@1"] });
-		store.setSettings({ holdUpdateMerges: true });
+		const task = await store.createTask("update pins");
+		await store.updateTask(task.id, { updateIds: ["a@1"] });
+		await store.setSettings({ holdUpdateMerges: true });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("pin a@2 or a@3?");
 	});
 
 	test("the fork hold never stalls a fork-born card's merge turn that integrated", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			startRun: integratedRun(record),
 		});
-		const task = forkChild(store, "adopt fork idea");
-		store.updateTask(task.id, { stage: "merging" });
+		const task = await forkChild(store, "adopt fork idea");
+		await store.updateTask(task.id, { stage: "merging" });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
 		expect(record.removeWorktree).toHaveLength(1);
@@ -17530,32 +17957,32 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("the fork hold keeps a fork-born card's own question", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			startRun: runReturning(record, askOutcome("which digest day?")),
 		});
-		const task = forkChild(store, "adopt fork idea");
+		const task = await forkChild(store, "adopt fork idea");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.needsReason).toBe("which digest day?");
 	});
 
 	test("a fork-born card with commits to merge parks for approval instead of merging", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			startRun: runReturning(record, {
 				outcome: { status: "ready", summary: "did it" },
 			}),
 		});
-		const task = forkChild(store, "adopt fork idea");
+		const task = await forkChild(store, "adopt fork idea");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(FORK_HOLD_REASON);
@@ -17564,40 +17991,40 @@ describe("turn survivor round 5 — run finish", () => {
 
 	test("an empty ask list records no question and the card settles normally", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			startRun: runReturning(record, {
 				asked: [],
 				outcome: { status: "answered", summary: "did it" },
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.needsReason).toBeNull();
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.question).toBeNull();
 		expect(turn.error).toBeNull();
 	});
 
 	test("a merge card parked at merging never gets the work check", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			workCheck: () => true,
 			startRun: runReturning(record, askOutcome("force-push the tag?")),
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, { stage: "merging" });
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, { stage: "merging" });
 
 		await loop.runTurn(store.name, task.id);
 
 		// Only the merge run itself: no second-model check run started.
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("force-push the tag?");
@@ -17607,39 +18034,44 @@ describe("turn survivor round 5 — run finish", () => {
 	test("a steered turn re-enters the queue with a fresh queuedAt", async () => {
 		const record = baseRecord();
 		let taskId = "";
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
-			startRun: runReturning(record, {}, () =>
-				store.updateTask(taskId, { pendingPrompt: "also fix the docs" }),
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			startRun: runReturning(
+				record,
+				{},
+				async () =>
+					await store.updateTask(taskId, {
+						pendingPrompt: "also fix the docs",
+					}),
 			),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		taskId = task.id;
-		store.updateTask(task.id, { queuedAt: 5 });
+		await store.updateTask(task.id, { queuedAt: 5 });
 		const t0 = Date.now();
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.queuedAt).toBeGreaterThanOrEqual(t0);
 	});
 
 	test("a done work card shows the run's own summary", async () => {
-		const { store, loop } = setup({ commitsAhead: async () => 0 });
-		const task = store.createTask("work please");
+		const { store, loop } = await setup({ commitsAhead: async () => 0 });
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.summary).toBe("did it");
 	});
 
 	test("a release card bounced to needs_you keeps the run summary, not Released", async () => {
-		const { store, loop } = setup({ isIntegrated: async () => false });
-		const task = store.createTask("release v1.0.0");
-		store.updateTask(task.id, {
+		const { store, loop } = await setup({ isIntegrated: async () => false });
+		const task = await store.createTask("release v1.0.0");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			releaseVersion: "v1.0.0",
@@ -17651,43 +18083,49 @@ describe("turn survivor round 5 — run finish", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.summary).toBe("did it");
 	});
 
 	test("a plain work card's proposal is never filed as a card", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
 		record.proposal = {
 			prompt: "not a retro idea",
 			model: null,
 			summary: null,
 			project: null,
 		};
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.stage).toBe("done");
-		expect(store.listTasks()).toHaveLength(1);
+		expect((await store.getTask(task.id))!.stage).toBe("done");
+		expect(await store.listTasks()).toHaveLength(1);
 	});
 
 	test("a done retro without a proposal settles done and files nothing", async () => {
-		const { store, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const { store, loop } = await setup({ commitsAhead: async () => 0 });
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 
 		await loop.runTurn(store.name, retro.id);
 
-		const after = store.getTask(retro.id)!;
+		const after = (await store.getTask(retro.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
-		expect(store.listTasks()).toHaveLength(1);
+		expect(await store.listTasks()).toHaveLength(1);
 	});
 
 	test("a retro that ends on a question files no proposal", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			startRun: runReturning(record, {
 				...askOutcome("which week?"),
@@ -17699,22 +18137,32 @@ describe("turn survivor round 5 — run finish", () => {
 				},
 			}),
 		});
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 
 		await loop.runTurn(store.name, retro.id);
 
-		const after = store.getTask(retro.id)!;
+		const after = (await store.getTask(retro.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("which week?");
-		expect(kidsOf(store, retro.id)).toHaveLength(0);
+		expect(await kidsOf(store, retro.id)).toHaveLength(0);
 	});
 
 	test("proposals that are no longer held do not count against the cap", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 		for (let i = 0; i < 3; i++) {
-			const p = store.createTask(`proposal ${i}`);
-			store.updateTask(p.id, {
+			const p = await store.createTask(`proposal ${i}`);
+			await store.updateTask(p.id, {
 				state: "idle",
 				needsReason: `${PROPOSED_REASON_PREFIX}an older retro.`,
 			});
@@ -17728,22 +18176,28 @@ describe("turn survivor round 5 — run finish", () => {
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kids = kidsOf(store, retro.id);
+		const kids = await kidsOf(store, retro.id);
 		expect(kids).toHaveLength(1);
 		expect(kids[0]!.prompt).toContain("fits under the cap");
 	});
 
 	test("held proposals that already ran a turn do not count against the cap", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 		for (let i = 0; i < 3; i++) {
-			const p = store.createTask(`proposal ${i}`);
-			store.updateTask(p.id, {
+			const p = await store.createTask(`proposal ${i}`);
+			await store.updateTask(p.id, {
 				state: "needs_you",
 				needsReason: `${PROPOSED_REASON_PREFIX}an older retro.`,
 			});
-			const t = store.startTurn(p.id, "work", "p", null);
-			store.finishTurn(t.id, { endedAt: Date.now() });
+			const t = await store.startTurn(p.id, "work", "p", null);
+			await store.finishTurn(t.id, { endedAt: Date.now() });
 		}
 		record.proposal = {
 			prompt: "fits under the cap",
@@ -17754,13 +18208,15 @@ describe("turn survivor round 5 — run finish", () => {
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kids = kidsOf(store, retro.id);
+		const kids = await kidsOf(store, retro.id);
 		expect(kids).toHaveLength(1);
 		expect(kids[0]!.prompt).toContain("fits under the cap");
 	});
 
 	test("a proposal filed when the handoffs folder already exists still gets its handoff", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
 		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
 		record.proposal = {
 			prompt: "second idea",
@@ -17768,29 +18224,39 @@ describe("turn survivor round 5 — run finish", () => {
 			summary: null,
 			project: null,
 		};
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kid = kidsOf(store, retro.id)[0]!;
+		const kid = (await kidsOf(store, retro.id))[0]!;
 		const handoffPath = join(store.tasksDir, "handoffs", `${kid.id}.md`);
 		expect(kid.prompt).toContain(`@${handoffPath}`);
 		expect(existsSync(handoffPath)).toBe(true);
 	});
 
 	test("the proposal handoff describes the settled retro: its summary and session", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
 		record.proposal = {
 			prompt: "an idea",
 			model: null,
 			summary: null,
 			project: null,
 		};
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kid = kidsOf(store, retro.id)[0]!;
+		const kid = (await kidsOf(store, retro.id))[0]!;
 		const handoff = readFileSync(
 			join(store.tasksDir, "handoffs", `${kid.id}.md`),
 			"utf8",
@@ -17800,7 +18266,9 @@ describe("turn survivor round 5 — run finish", () => {
 	});
 
 	test("a failed handoff write files the proposal with its bare prompt and logs why", async () => {
-		const { store, record, loop } = setup({ commitsAhead: async () => 0 });
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+		});
 		mkdirSync(store.tasksDir, { recursive: true });
 		// A plain file where the handoffs folder belongs: mkdir fails.
 		writeFileSync(join(store.tasksDir, "handoffs"), "not a folder");
@@ -17810,32 +18278,38 @@ describe("turn survivor round 5 — run finish", () => {
 			summary: null,
 			project: null,
 		};
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
 
 		await loop.runTurn(store.name, retro.id);
 
-		const kid = kidsOf(store, retro.id)[0]!;
+		const kid = (await kidsOf(store, retro.id))[0]!;
 		expect(kid.prompt).toBe("bare idea");
 		expect(kid.state).toBe("needs_you");
-		expect(logText(store, retro.id)).toContain("handoff write failed");
+		expect(await logText(store, retro.id)).toContain("handoff write failed");
 	});
 });
 
 describe("turn survivor round 5 — post-finish branch", () => {
 	type StartOpts = Parameters<TurnOps["startRun"]>[0];
-	type CheckStep = RunResult | ((o: StartOpts) => RunResult);
+	type CheckStep =
+		| RunResult
+		| ((o: StartOpts) => RunResult | Promise<RunResult>);
 	const finding = (
 		prompt: string,
 		rank: number | null = null,
 		security: "critical" | "high" | null = null,
 	): RecordedFinding => ({ prompt, model: null, rank, security });
-	const reviewCard = (store: ProjectStore) => {
-		const review = store.createTask(
+	const reviewCard = async (store: ProjectStore) => {
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		return review;
 	};
 	const verdicts = (...v: [number, boolean, string][]) =>
@@ -17846,19 +18320,19 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		});
 	/** The first run is the review (its result patched by `review`); every later run is a check
 	 * served from `checks` in order. Cap 0: filed cards never start mid-assertion. */
-	function reviewSetup(
+	async function reviewSetup(
 		record: Recorded,
 		review: Partial<RunResult>,
 		checks: CheckStep[],
-		overrides: Partial<TurnOps> = {},
+		overrides: FixtureOps = {},
 	) {
 		const checkRuns: StartOpts[] = [];
-		const s = setupWith(record, {
+		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
-			maxTotalRuns: () => 0,
-			startRun: (o: StartOpts) => {
+			holdFollowUps: true,
+			startRun: async (o: StartOpts) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				let result: RunResult;
 				if (record.runs.length === 1)
 					result = runResult({
@@ -17869,7 +18343,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 				else {
 					checkRuns.push(o);
 					const step = checks.shift() ?? runResult({ finalText: "[]" });
-					result = typeof step === "function" ? step(o) : step;
+					result = typeof step === "function" ? await step(o) : step;
 				}
 				return {
 					pid: 4242,
@@ -17881,8 +18355,8 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		});
 		return { ...s, checkRuns };
 	}
-	const kidsOf = (store: ProjectStore, id: string) =>
-		store.listTasks().filter((t) => t.followUpOf === id);
+	const kidsOf = async (store: ProjectStore, id: string) =>
+		(await store.listTasks()).filter((t) => t.followUpOf === id);
 	/** Freezes Date.now so a check run can advance it by a known amount. */
 	async function withClock(
 		fn: (advance: (ms: number) => void) => Promise<void>,
@@ -17902,7 +18376,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 	test("a review that reports needs_you with one recorded finding files one card and stays needs_you", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop, checkRuns } = reviewSetup(
+		const { store, loop, checkRuns } = await reviewSetup(
 			record,
 			{
 				outcome: {
@@ -17913,13 +18387,13 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			},
 			[verdicts([1, true, ""])],
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(2); // review + the findings check
 		expect(checkRuns).toHaveLength(1);
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("which branch?");
 		expect(after.summary).toContain("need input");
@@ -17938,27 +18412,27 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		// The harness serves the review result only on the first run, so the second
 		// turn's review run arrives through the checks queue. Its own check must never
 		// run: the already-linked finding is skipped, so the queue ends there.
-		const { store, loop } = reviewSetup(record, park, [
+		const { store, loop } = await reviewSetup(record, park, [
 			verdicts([1, true, ""]),
 			runResult({ ...park, recorded: [finding("Bug A", 1)] }),
 		]);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
-		store.updateTask(review.id, { state: "queued" });
+		await store.updateTask(review.id, { state: "queued" });
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(3); // review + check + second review, no second check
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
-		expect(store.getTask(review.id)!.state).toBe("needs_you");
+		expect((await store.getTask(review.id))!.state).toBe("needs_you");
 	});
 
 	test("a review that records no findings runs no check and settles done", async () => {
 		const record = baseRecord();
-		const { store, loop } = reviewSetup(record, {}, []);
-		const review = reviewCard(store);
+		const { store, loop } = await reviewSetup(record, {}, []);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.summary).toBe("review done");
@@ -17968,7 +18442,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1, "high"), finding("Bug B", 2)];
 		let logPings: [string, string][] = [];
-		const { store, loop, checkRuns } = reviewSetup(record, {}, [
+		const { store, loop, checkRuns } = await reviewSetup(record, {}, [
 			(o) => {
 				const before = record.notifyLog.length;
 				o.onLog?.();
@@ -17976,19 +18450,21 @@ describe("turn survivor round 5 — post-finish branch", () => {
 				return verdicts([1, true, ""], [2, true, ""]);
 			},
 		]);
-		const review = reviewCard(store);
-		const open = store.createTask("Open sibling card");
-		const cancelled = store.createTask("Cancelled sibling card");
-		store.updateTask(cancelled.id, { cancelledAt: Date.now() });
-		const finished = store.createTask("Finished sibling card");
-		store.updateTask(finished.id, { stage: "done" });
+		const review = await reviewCard(store);
+		const open = await store.createTask("Open sibling card");
+		const cancelled = await store.createTask("Cancelled sibling card");
+		await store.updateTask(cancelled.id, { cancelledAt: Date.now() });
+		const finished = await store.createTask("Finished sibling card");
+		await store.updateTask(finished.id, { stage: "done" });
 		await loop.runTurn(store.name, review.id);
 		expect(checkRuns).toHaveLength(1);
 		const check = checkRuns[0]!;
 		const cards = check.prompt
 			.split("Open cards of the project:\n")[1]!
 			.split("\n\nCommits on main")[0]!;
-		expect(cards).toBe(`- #${open.id} ${store.getTask(open.id)!.title}`);
+		expect(cards).toBe(
+			`- #${open.id} ${(await store.getTask(open.id))!.title}`,
+		);
 		const findings = JSON.parse(
 			check.prompt
 				.split("Findings:\n")[1]!
@@ -18002,9 +18478,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		// The check's transcript lines notify the review card's log viewers.
 		expect(logPings).toEqual([[store.name, review.id]]);
 		expect(
-			kidsOf(store, review.id)
-				.map((k) => k.prompt)
-				.sort(),
+			(await kidsOf(store, review.id)).map((k) => k.prompt).sort(),
 		).toEqual(["Bug A", "Bug B"]);
 	});
 
@@ -18016,7 +18490,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			finding("Bug 11", 11),
 			finding(long, 12),
 		];
-		const { store, loop } = reviewSetup(
+		const { store, loop } = await reviewSetup(
 			record,
 			{
 				outcome: {
@@ -18028,10 +18502,10 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			[],
 			{ reviewCheck: () => false },
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		const cut = "L".repeat(120);
 		expect(after.summary).toBe(
 			"review done\nFindings: 12 recorded, 10 filed, 2 not filed.",
@@ -18044,7 +18518,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			`- below the cap of 10: Bug 11\n- below the cap of 10: ${cut}`,
 		);
 		expect(after.details).not.toContain("L".repeat(121));
-		const log = logText(store, review.id);
+		const log = await logText(store, review.id);
 		expect(log).toContain("below the cap of 10, not filed: Bug 11");
 		expect(log).toContain(`below the cap of 10, not filed: ${cut}\n`);
 		expect(log).toContain(
@@ -18056,7 +18530,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1), finding("Bug B", 2)];
 		await withClock(async (advance) => {
-			const { store, loop } = reviewSetup(record, {}, [
+			const { store, loop } = await reviewSetup(record, {}, [
 				() => {
 					advance(4000);
 					return verdicts(
@@ -18065,17 +18539,17 @@ describe("turn survivor round 5 — post-finish branch", () => {
 					);
 				},
 			]);
-			const review = reviewCard(store);
+			const review = await reviewCard(store);
 			await loop.runTurn(store.name, review.id);
-			expect(kidsOf(store, review.id)).toEqual([]);
-			const after = store.getTask(review.id)!;
+			expect(await kidsOf(store, review.id)).toEqual([]);
+			const after = (await store.getTask(review.id))!;
 			expect(after.summary).toBe(
 				"review done\nFindings: 2 recorded, 0 filed, 2 not filed (check 4s on fake/default-model).",
 			);
 			expect(after.details).toContain(
 				"## Findings\n- none filed\n- dropped: Bug A — dup of #7\n- dropped: Bug B — handled at src/x.ts:42",
 			);
-			const log = logText(store, review.id);
+			const log = await logText(store, review.id);
 			expect(log).toContain("dropped finding 1: dup of #7");
 			expect(log).toContain("dropped finding 2: handled at src/x.ts:42");
 			expect(log).toContain(
@@ -18087,7 +18561,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 	test("a failed check run is retried even when its final text holds verdicts", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = reviewSetup(record, {}, [
+		const { store, loop } = await reviewSetup(record, {}, [
 			runResult({
 				exitCode: 1,
 				stderrTail: "boom\n",
@@ -18095,12 +18569,14 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			}),
 			verdicts([1, false, "stale finding"]),
 		]);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(3);
-		expect(kidsOf(store, review.id)).toEqual([]);
-		expect(store.getTask(review.id)!.details).toContain("stale finding");
-		expect(logText(store, review.id)).toContain(
+		expect(await kidsOf(store, review.id)).toEqual([]);
+		expect((await store.getTask(review.id))!.details).toContain(
+			"stale finding",
+		);
+		expect(await logText(store, review.id)).toContain(
 			"attempt 1 failed: the check run exited with code 1: boom",
 		);
 	});
@@ -18108,22 +18584,22 @@ describe("turn survivor round 5 — post-finish branch", () => {
 	test("a check without a JSON verdict twice parks the review with that reason and writes no findings report", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = reviewSetup(record, {}, [
+		const { store, loop } = await reviewSetup(record, {}, [
 			runResult({ finalText: "no verdict here" }),
 			runResult({ finalText: "still no verdict" }),
 		]);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(3);
-		expect(kidsOf(store, review.id)).toEqual([]);
-		const after = store.getTask(review.id)!;
+		expect(await kidsOf(store, review.id)).toEqual([]);
+		const after = (await store.getTask(review.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(
 			"failed twice: the check verdict was not valid JSON",
 		);
 		expect(after.summary).toBe("review done");
 		expect(after.details ?? "").not.toContain("## Findings");
-		const log = logText(store, review.id);
+		const log = await logText(store, review.id);
 		expect(log).toContain(
 			"attempt 1 failed: the check verdict was not valid JSON",
 		);
@@ -18139,18 +18615,18 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
 		let reviewId = "";
-		const { store, loop } = reviewSetup(record, {}, [
+		const { store, loop } = await reviewSetup(record, {}, [
 			runResult({ finalText: "no verdict here" }),
-			() => {
-				store.updateTask(reviewId, { cancelledAt: Date.now() });
+			async () => {
+				await store.updateTask(reviewId, { cancelledAt: Date.now() });
 				return runResult({ finalText: "still no verdict" });
 			},
 		]);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		reviewId = review.id;
 		await loop.runTurn(store.name, review.id);
 		expect(record.runs).toHaveLength(3);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.needsReason ?? "").not.toContain("failed twice");
 		expect(after.state).not.toBe("needs_you");
 	});
@@ -18159,17 +18635,17 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
 		let reviewId = "";
-		const { store, loop } = reviewSetup(record, {}, [
-			() => {
-				store.updateTask(reviewId, { cancelledAt: Date.now() });
+		const { store, loop } = await reviewSetup(record, {}, [
+			async () => {
+				await store.updateTask(reviewId, { cancelledAt: Date.now() });
 				return verdicts([1, true, ""]);
 			},
 		]);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		reviewId = review.id;
 		await loop.runTurn(store.name, review.id);
-		expect(kidsOf(store, review.id)).toEqual([]);
-		const after = store.getTask(review.id)!;
+		expect(await kidsOf(store, review.id)).toEqual([]);
+		const after = (await store.getTask(review.id))!;
 		expect(after.summary ?? "").not.toContain("Findings:");
 		expect(after.details ?? "").not.toContain("## Findings");
 	});
@@ -18177,17 +18653,17 @@ describe("turn survivor round 5 — post-finish branch", () => {
 	test("a review settled from the merge stage without a report: the summary falls back, details start empty", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
-		const { store, loop } = reviewSetup(
+		const { store, loop } = await reviewSetup(
 			record,
 			{ outcome: null, finalText: "" },
 			[verdicts([1, true, ""])],
 		);
-		const review = reviewCard(store);
-		store.updateTask(review.id, { stage: "merging", state: "queued" });
+		const review = await reviewCard(store);
+		await store.updateTask(review.id, { stage: "merging", state: "queued" });
 		await loop.runTurn(store.name, review.id);
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids.map((k) => k.prompt)).toEqual(["Bug A"]);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(
 			after.summary!.startsWith(
 				"Review finished\nFindings: 1 recorded, 1 filed",
@@ -18210,7 +18686,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 			releasePrepare = resolve;
 		});
 		let targets = 0;
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			maxTotalRuns: () => 1,
 			commitsAhead: async () => 0,
 			pidAlive: () => false,
@@ -18220,9 +18696,9 @@ describe("turn survivor round 5 — post-finish branch", () => {
 				if (targets === 2) await prepareHeld;
 				return { target: "origin/main", sha: "sha0", warning: null };
 			},
-			startRun: (o: StartOpts) => {
+			startRun: async (o: StartOpts) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done:
@@ -18244,17 +18720,17 @@ describe("turn survivor round 5 — post-finish branch", () => {
 				};
 			},
 		});
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		const first = loop.runTurn(store.name, review.id);
 		await flushPromises();
-		loop.schedule(); // the check pid is dead: the sweep takes the check over
+		await loop.schedule(); // the check pid is dead: the sweep takes the check over
 		await flushPromises();
-		expect(store.getTask(review.id)!.state).toBe("needs_you");
+		expect((await store.getTask(review.id))!.state).toBe("needs_you");
 		// A reply re-queues the review: its replacement turn claims the card's one cap unit.
-		store.updateTask(review.id, { state: "queued" });
+		await store.updateTask(review.id, { state: "queued" });
 		const replacement = loop.runTurn(store.name, review.id);
 		await flushPromises();
-		const other = store.createTask("other card waits for the cap");
+		const other = await store.createTask("other card waits for the cap");
 		// The old check's late end must not free the replacement's claim.
 		releaseCheck(
 			runResult({ finalText: '[{"id":1,"keep":true,"reason":""}]' }),
@@ -18264,7 +18740,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		expect(record.runs.some((r) => r.prompt.includes(other.prompt!))).toBe(
 			false,
 		);
-		expect(store.getTask(other.id)!.state).toBe("queued");
+		expect((await store.getTask(other.id))!.state).toBe("queued");
 		releasePrepare();
 		await replacement;
 	});
@@ -18308,14 +18784,16 @@ describe("turn survivor round 5 — work card to merging", () => {
 	function checkRuns(
 		record: Recorded,
 		checks: RunResult[],
-		onCheck: (o: Parameters<TurnOps["startRun"]>[0]) => void = () => {},
+		onCheck: (
+			o: Parameters<TurnOps["startRun"]>[0],
+		) => unknown | Promise<unknown> = () => {},
 	) {
 		let next = 0;
-		return (o: Parameters<TurnOps["startRun"]>[0]) => {
+		return async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
-			o.onSession?.(`sess-${record.runs.length}`);
+			await o.onSession?.(`sess-${record.runs.length}`);
 			const isCheck = o.prompt.startsWith(CHECK_OPENING);
-			if (isCheck) onCheck(o);
+			if (isCheck) await onCheck(o);
 			return {
 				pid: 4242,
 				done: Promise.resolve(
@@ -18326,10 +18804,10 @@ describe("turn survivor round 5 — work card to merging", () => {
 		};
 	}
 	/** A ready work card with one commit ahead at head sha1; maxTotalRuns 0 holds the merge turn. */
-	function checkCase(checks: RunResult[], overrides: Partial<TurnOps> = {}) {
+	async function checkCase(checks: RunResult[], overrides: FixtureOps = {}) {
 		const record = baseRecord();
-		return setupWith(record, {
-			maxTotalRuns: () => 0,
+		return await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => "sha1",
 			diffText: async () => "const x = 1;\n",
@@ -18341,9 +18819,13 @@ describe("turn survivor round 5 — work card to merging", () => {
 	const checkPrompts = (record: Recorded) =>
 		record.runs.filter((r) => r.prompt.startsWith(CHECK_OPENING));
 	/** A finished turn row that delivered a human message; returns its start time. */
-	function humanTurn(store: ProjectStore, id: string, text: string): number {
-		const t = store.startTurn(id, "work", "p", null, text);
-		store.finishTurn(t.id, { endedAt: t.startedAt, exitCode: 0 });
+	async function humanTurn(
+		store: ProjectStore,
+		id: string,
+		text: string,
+	): Promise<number> {
+		const t = await store.startTurn(id, "work", "p", null, text);
+		await store.finishTurn(t.id, { endedAt: t.startedAt, exitCode: 0 });
 		return t.startedAt;
 	}
 
@@ -18351,8 +18833,8 @@ describe("turn survivor round 5 — work card to merging", () => {
 		const record = baseRecord();
 		const diffs: [string, string][] = [];
 		let checkNotified: [string, string][] = [];
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			workCheck: () => true,
 			modelRoles: () => ({ adversary: "zai/check-model" }),
@@ -18371,7 +18853,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 				checkNotified = record.notifyLog.slice(before);
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		setSystemTime(new Date(Date.now()));
 		try {
 			await loop.runTurn(store.name, task.id);
@@ -18386,39 +18868,39 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(diffs).toEqual([["origin/main", "HEAD"]]);
 		// The check's log output notifies the board like the work run's.
 		expect(checkNotified).toEqual([[store.name, task.id]]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckHead).toBe("sha1");
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.model).toBe("zai/check-model");
 		expect(after.workCheckLog[0]!.durationMs).toBe(5000);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"work check: 0 blocker(s), 1 note(s), 5s",
 		);
 	});
 
 	test("an unknown head with no stored head still runs the check", async () => {
-		const { store, record, loop } = checkCase([verdict({})], {
+		const { store, record, loop } = await checkCase([verdict({})], {
 			targetSha: async () => null,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(checkPrompts(record)).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckHead).toBeNull();
 	});
 
 	test("an absent work-check switch counts as on", async () => {
-		const { store, record, loop } = checkCase([verdict({})], {
+		const { store, record, loop } = await checkCase([verdict({})], {
 			workCheck: undefined,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(checkPrompts(record)).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");
 		expect(after.workCheckHead).toBe("sha1");
@@ -18426,10 +18908,10 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 	test("a work card that ends needs_you gets no check", async () => {
 		const record = baseRecord();
-		const { store, loop } = checkCase([verdict({})], {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+		const { store, loop } = await checkCase([verdict({})], {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -18444,11 +18926,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.workCheckLog).toEqual([]);
 		expect(after.workCheckHead).toBeNull();
@@ -18459,13 +18941,13 @@ describe("turn survivor round 5 — work card to merging", () => {
 		record.recorded = [
 			{ prompt: "Bug A", model: null, rank: 1, security: null },
 		];
-		const { store, projects, loop } = setupWith(record, {
+		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
 			commitsAhead: async () => 0,
 			workCheck: () => true,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -18481,23 +18963,23 @@ describe("turn survivor round 5 — work card to merging", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		await loop.runTurn(store.name, review.id);
 
 		expect(record.runs).toHaveLength(2); // the review and its findings check only
 		expect(checkPrompts(record)).toHaveLength(0);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog).toEqual([]);
 	});
 
 	test("a card the store no longer returns after the head read gets no check and no tracker error", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		let gone = false;
 		const vanishing = new Proxy(store, {
@@ -18507,10 +18989,10 @@ describe("turn survivor round 5 — work card to merging", () => {
 				return typeof value === "function" ? value.bind(target) : value;
 			},
 		});
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(vanishing)]]),
 			fakeOps(record, {
-				maxTotalRuns: () => 0,
+				holdFollowUps: true,
 				commitsAhead: async () => 1,
 				workCheck: () => true,
 				targetSha: async () => {
@@ -18520,40 +19002,41 @@ describe("turn survivor round 5 — work card to merging", () => {
 				startRun: checkRuns(record, [verdict({})]),
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		gone = false;
 
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.needsReason).toBeNull();
 		expect(after.workCheckLog).toEqual([]);
 	});
 
 	test("a card cancelled during the head read gets no check", async () => {
 		let cancel = () => {};
-		const { store, record, loop } = checkCase([verdict({})], {
+		const { store, record, loop } = await checkCase([verdict({})], {
 			targetSha: async () => {
 				cancel();
 				return "sha1";
 			},
 		});
-		const task = store.createTask("work please");
-		cancel = () => store.updateTask(task.id, { cancelledAt: Date.now() });
+		const task = await store.createTask("work please");
+		cancel = async () =>
+			await store.updateTask(task.id, { cancelledAt: Date.now() });
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.workCheckLog).toEqual([]);
+		expect((await store.getTask(task.id))!.workCheckLog).toEqual([]);
 	});
 
 	test("an unreadable head checks the full diff against HEAD and clears the stored head", async () => {
-		const { store, record, loop } = checkCase([verdict({})], {
+		const { store, record, loop } = await checkCase([verdict({})], {
 			targetSha: async () => {
 				throw new Error("not a git repository");
 			},
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			workCheckLog: [storedRun(1)],
 			workCheckHead: "old",
 		});
@@ -18562,21 +19045,21 @@ describe("turn survivor round 5 — work card to merging", () => {
 		const check = checkPrompts(record)[0]!;
 		expect(check.prompt).toContain(", branch origin/main..HEAD:");
 		expect(check.prompt).toContain("Diff of the branch");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog).toHaveLength(2);
 		expect(after.workCheckHead).toBeNull();
 	});
 
 	test("a stored head without any check run still re-checks from the stored head", async () => {
 		const froms: string[] = [];
-		const { store, record, loop } = checkCase([verdict({})], {
+		const { store, record, loop } = await checkCase([verdict({})], {
 			diffText: async (_wt: string, from: string) => {
 				froms.push(from);
 				return "const x = 1;\n";
 			},
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { workCheckHead: "old" });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { workCheckHead: "old" });
 		await loop.runTurn(store.name, task.id);
 
 		// The stored head counts as a completed check: the re-check diff starts there, and
@@ -18586,12 +19069,12 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(prompt).toContain(
 			"Diff of only the new commits since the previous check",
 		);
-		expect(store.getTask(task.id)!.workCheckHead).toBe("sha1");
+		expect((await store.getTask(task.id))!.workCheckHead).toBe("sha1");
 	});
 
 	test("after an errored check, a new check sees the full diff and resolves only the open blockers", async () => {
-		const { store, record, loop } = checkCase([verdict({})]);
-		const task = store.createTask("work please");
+		const { store, record, loop } = await checkCase([verdict({})]);
+		const task = await store.createTask("work please");
 		const settled = {
 			finding: "old naming",
 			quote: "let y",
@@ -18599,7 +19082,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 			statusReason: "earlier fix",
 		};
 		const open = { finding: "weak tests", quote: "const x = 1;" };
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			workCheckLog: [
 				storedRun(1, [settled, open]),
 				{
@@ -18620,7 +19103,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 		const prompt = checkPrompts(record)[0]!.prompt;
 		expect(prompt).toContain("Diff of the branch");
 		expect(prompt).toContain("\n1. weak tests\n   quote: const x = 1;");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog).toHaveLength(3);
 		expect(after.workCheckLog[0]!.blockers).toEqual([
@@ -18635,10 +19118,10 @@ describe("turn survivor round 5 — work card to merging", () => {
 	});
 
 	test("a human message from the last check's start instant is not reply data, and the re-check runs anyway", async () => {
-		const { store, record, loop } = checkCase([verdict({})]);
-		const task = store.createTask("work please");
-		const said = humanTurn(store, task.id, "looks fine to me");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await checkCase([verdict({})]);
+		const task = await store.createTask("work please");
+		const said = await humanTurn(store, task.id, "looks fine to me");
+		await store.updateTask(task.id, {
 			workCheckLog: [
 				storedRun(said, [{ finding: "weak tests", quote: "const x = 1;" }]),
 			],
@@ -18652,31 +19135,31 @@ describe("turn survivor round 5 — work card to merging", () => {
 		const prompt = checkPrompts(record)[0]!.prompt;
 		expect(prompt).not.toContain("looks fine to me");
 		expect(prompt).not.toContain("Human messages to the work agent");
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	test("a human reply after a passed check at the same head starts no check", async () => {
-		const { store, record, loop } = checkCase([verdict({})]);
-		const task = store.createTask("work please");
-		const said = humanTurn(store, task.id, "also add a changelog line");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await checkCase([verdict({})]);
+		const task = await store.createTask("work please");
+		const said = await humanTurn(store, task.id, "also add a changelog line");
+		await store.updateTask(task.id, {
 			workCheckLog: [storedRun(said - 1)],
 			workCheckHead: "sha1",
 		});
 		await loop.runTurn(store.name, task.id);
 
 		expect(checkPrompts(record)).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.workCheckLog).toHaveLength(1);
 	});
 
 	test("a reply-driven re-check at an unchanged head sees the reply and the since-head diff", async () => {
-		const { store, record, loop } = checkCase([verdict({})]);
-		const task = store.createTask("work please");
-		const said = humanTurn(store, task.id, "I approve the auth change");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await checkCase([verdict({})]);
+		const task = await store.createTask("work please");
+		const said = await humanTurn(store, task.id, "I approve the auth change");
+		await store.updateTask(task.id, {
 			workCheckLog: [
 				storedRun(said - 1, [
 					{ finding: "auth touched", quote: "const x = 1;" },
@@ -18694,11 +19177,11 @@ describe("turn survivor round 5 — work card to merging", () => {
 			"Diff of only the new commits since the previous check",
 		);
 		expect(prompt).not.toContain("Diff of the branch");
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	test("a re-check at a new head reads the new-commits diff up to HEAD", async () => {
-		const { store, record, loop } = checkCase([verdict({})], {
+		const { store, record, loop } = await checkCase([verdict({})], {
 			targetSha: async () => "sha2",
 			diffText: async (_wt: string, from: string, to: string) =>
 				to !== "HEAD"
@@ -18707,8 +19190,8 @@ describe("turn survivor round 5 — work card to merging", () => {
 						? "const y = 2;\n"
 						: "const x = 1;\nconst y = 2;\n",
 		});
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			workCheckLog: [
 				storedRun(1, [{ finding: "weak", quote: "const x = 1;" }]),
 			],
@@ -18724,24 +19207,24 @@ describe("turn survivor round 5 — work card to merging", () => {
 	});
 
 	test("a blocker sent back names attempt 1 of the cap in the prompt and the log", async () => {
-		const { store, loop } = checkCase([
+		const { store, loop } = await checkCase([
 			verdict({ blockers: [{ finding: "weak tests", quote: "const x = 1;" }] }),
 		]);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckSendbacks).toBe(1);
 		expect(after.pendingPrompt).toContain(
 			`Send-back 1 of ${WORK_CHECK_MAX_SENDBACKS}: while fewer than ${WORK_CHECK_MAX_SENDBACKS} send-backs have run, a failing next check sends the card back again`,
 		);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`sent back to the work agent (1 of ${WORK_CHECK_MAX_SENDBACKS})`,
 		);
 	});
 
 	test("the fifth block numbers every finding in the needs_you reason", async () => {
-		const { store, loop } = checkCase(
+		const { store, loop } = await checkCase(
 			[
 				verdict({
 					blockers: [
@@ -18752,17 +19235,19 @@ describe("turn survivor round 5 — work card to merging", () => {
 			],
 			{ diffText: async () => "const x = 1;\nconst y = 2;\n" },
 		);
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { workCheckSendbacks: WORK_CHECK_MAX_SENDBACKS });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
+			workCheckSendbacks: WORK_CHECK_MAX_SENDBACKS,
+		});
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("1. first finding 2. second finding.");
 	});
 
 	test("a transcript quote blocks: the check gets the session file and reads it", async () => {
-		const { store, record, loop } = checkCase([
+		const { store, record, loop } = await checkCase([
 			verdict({
 				blockers: [{ finding: "claims tests ran", quote: "bun test: 12 pass" }],
 			}),
@@ -18770,24 +19255,24 @@ describe("turn survivor round 5 — work card to merging", () => {
 		mkdirSync(store.sessionsDir, { recursive: true });
 		const transcript = join(store.sessionsDir, "1_sess-1.jsonl");
 		writeFileSync(transcript, '{"text":"bun test: 12 pass"}\n');
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		expect(checkPrompts(record)[0]!.prompt.endsWith(`): ${transcript}`)).toBe(
 			true,
 		);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.workCheckLog[0]!.outcome).toBe("blockers");
 		expect(after.workCheckLog[0]!.blockers[0]!.quote).toBe("bun test: 12 pass");
 		expect(after.workCheckSendbacks).toBe(1);
 	});
 
 	test("with no diff and no transcript every quote demotes and the prompt holds neither", async () => {
-		const { store, record, loop } = checkCase(
+		const { store, record, loop } = await checkCase(
 			[verdict({ blockers: [{ finding: "looks wrong", quote: "here" }] })],
 			{ diffText: async () => null },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		const prompt = checkPrompts(record)[0]!.prompt;
@@ -18795,25 +19280,25 @@ describe("turn survivor round 5 — work card to merging", () => {
 			"read files in the worktree for the rest):\n\n\n\n",
 		);
 		expect(prompt.endsWith("read it in ranges): ")).toBe(true);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog[0]!.outcome).toBe("pass");
 		expect(after.workCheckLog[0]!.notes[0]).toContain("looks wrong");
 	});
 
 	test("a check that answers no JSON twice parks the card with an error run", async () => {
-		const { store, loop } = checkCase(
+		const { store, loop } = await checkCase(
 			[
 				runResult({ finalText: "no verdict" }),
 				runResult({ finalText: "still none" }),
 			],
 			{ modelRoles: () => ({ adversary: "zai/check-model" }) },
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
 		const reason = "the work check verdict was not valid JSON";
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(`failed twice: ${reason}.`);
@@ -18823,7 +19308,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 		expect(run.blockers).toEqual([]);
 		expect(run.notes).toEqual([]);
 		expect(run.error).toBe(reason);
-		const text = logText(store, task.id);
+		const text = await logText(store, task.id);
 		expect(text).toContain(`work check attempt 1 failed: ${reason}`);
 		expect(text).toContain(`work check attempt 2 failed: ${reason}`);
 		expect(text).toContain(`work check failed: ${reason}`);
@@ -18835,15 +19320,15 @@ describe("turn survivor round 5 — work card to merging", () => {
 		const checkDone = new Promise<RunResult>((resolve) => {
 			releaseCheck = resolve;
 		});
-		const { store, loop } = setupWith(record, {
-			maxTotalRuns: () => 0,
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
 			commitsAhead: async () => 1,
 			targetSha: async () => "sha1",
 			workCheck: () => true,
 			pidAlive: () => false,
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess");
+				await o.onSession?.("sess");
 				return {
 					pid: 4242,
 					done: record.runs.length === 1 ? Promise.resolve(ready()) : checkDone,
@@ -18851,16 +19336,23 @@ describe("turn survivor round 5 — work card to merging", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const run = loop.runTurn(store.name, task.id);
-		await flushPromises();
-		loop.schedule(); // the check pid is dead: the sweep parks the card
-		await flushPromises();
-		expect(store.getTask(task.id)!.workCheckLog[0]!.outcome).toBe("error");
+		await eventually(() =>
+			loop.running.has(`${store.name}/${task.id}:workcheck`),
+		);
+		await loop.schedule(); // the check pid is dead: the sweep parks the card
+		await eventually(
+			async () =>
+				(await store.getTask(task.id))?.workCheckLog[0]?.outcome === "error",
+		);
+		expect((await store.getTask(task.id))!.workCheckLog[0]!.outcome).toBe(
+			"error",
+		);
 
 		releaseCheck(verdict({}));
 		await run;
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.workCheckLog).toHaveLength(1);
 		expect(after.workCheckLog[0]!.outcome).toBe("error");
@@ -18874,7 +19366,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 			releaseCheck = resolve;
 		});
 		let installs = 0;
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			maxTotalRuns: () => 1,
 			commitsAhead: async () => 1,
 			targetSha: async () => "sha1",
@@ -18885,9 +19377,9 @@ describe("turn survivor round 5 — work card to merging", () => {
 				installs++;
 				return installs === 2 ? new Promise<string[]>(() => {}) : [];
 			},
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.(`sess-${record.runs.length}`);
+				await o.onSession?.(`sess-${record.runs.length}`);
 				return {
 					pid: 4242,
 					done:
@@ -18900,25 +19392,28 @@ describe("turn survivor round 5 — work card to merging", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const first = loop.runTurn(store.name, task.id);
 		await flushPromises();
-		loop.schedule(); // the check pid is dead: the sweep parks the card
+		await loop.schedule(); // the check pid is dead: the sweep parks the card
 		await flushPromises();
-		expect(store.getTask(task.id)!.state).toBe("needs_you");
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 
 		// The user replies: a replacement turn claims the card's slot and hangs in its prepare.
-		store.updateTask(task.id, { state: "queued", pendingPrompt: "re-run it" });
+		await store.updateTask(task.id, {
+			state: "queued",
+			pendingPrompt: "re-run it",
+		});
 		void loop.runTurn(store.name, task.id);
 		await flushPromises();
 		expect(installs).toBe(2);
-		const other = store.createTask("another card");
+		const other = await store.createTask("another card");
 
 		releaseCheck(verdict({}));
 		await first;
 		await flushPromises();
 		// The cap of 1 is still held by the replacement: the other card waits.
-		expect(store.getTask(other.id)!.state).toBe("queued");
+		expect((await store.getTask(other.id))!.state).toBe("queued");
 		expect(installs).toBe(2);
 		expect(record.runs).toHaveLength(2);
 	});
@@ -18934,18 +19429,18 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		for (let i = 0; i < n; i++) await Promise.resolve();
 	}
 
-	async function waitFor(cond: () => boolean) {
-		for (let i = 0; i < 100 && !cond(); i++) await flushPromises();
-		expect(cond()).toBe(true);
+	async function waitFor(cond: () => boolean | Promise<boolean>) {
+		for (let i = 0; i < 100 && !(await cond()); i++) await flushPromises();
+		expect(await cond()).toBe(true);
 	}
 
-	function reviewWith(store: ProjectStore) {
-		const review = store.createTask(
+	async function reviewWith(store: ProjectStore) {
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		return review;
 	}
 
@@ -18960,16 +19455,16 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		const removeGate = Promise.withResolvers<void>();
 		let cancelling: Promise<unknown> = Promise.resolve();
 		let duringCheck: () => Promise<unknown> = async () => undefined;
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			removeWorktree: async (o: unknown) => {
 				record.removeWorktree.push(o);
 				removing.resolve();
 				await removeGate.promise;
 			},
-			startRun: (o: StartArgs) => {
+			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				const first = record.runs.length === 1;
 				const result = first
 					? runResult({
@@ -18986,31 +19481,31 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 				};
 			},
 		});
-		const review = reviewWith(store);
+		const review = await reviewWith(store);
 		duringCheck = async () => {
 			cancelling = loop.cancel(fakeProject(store), review.id, false);
 			await removing.promise;
-			expect(store.getTask(review.id)!.state).toBe("running");
+			expect((await store.getTask(review.id))!.state).toBe("running");
 		};
 		await loop.runTurn(store.name, review.id);
 		removeGate.resolve();
 		await expect(cancelling).resolves.toEqual({ removed: true });
 
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(record.runs).toHaveLength(2); // the check did run
 		expect(after.cancelledAt).not.toBeNull();
 		// The findings park (merging/idle/FINDINGS_HOLD) never lands on the cancelled card.
 		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
-		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
-			[],
-		);
+		expect(
+			(await store.listTasks()).filter((t) => t.followUpOf === review.id),
+		).toEqual([]);
 	});
 
 	test("a run whose session was never announced still settles to merging/queued", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // keep the finally's schedule() from starting the merge turn
+		const { store, record, loop } = await setup({
+			holdFollowUps: true, // keep the finally's schedule() from starting the merge turn
 			// No onSession call: the card never left preparing while the run went on.
 			startRun: (o: StartArgs) => {
 				record.runs.push(o);
@@ -19021,20 +19516,20 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect([after.stage, after.state]).toEqual(["merging", "queued"]);
 	});
 
 	test("a work card settling to merging/queued gets a fresh queue time", async () => {
 		// Cap 0 keeps the finally's schedule() from starting the merge turn.
-		const { store, loop } = setup({ maxTotalRuns: () => 0 });
-		const task = store.createTask("work please");
-		store.updateTask(task.id, { queuedAt: 1 });
+		const { store, loop } = await setup({ holdFollowUps: true });
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, { queuedAt: 1 });
 		const before = Date.now();
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect([after.stage, after.state]).toEqual(["merging", "queued"]);
 		expect(after.queuedAt).toBeGreaterThanOrEqual(before);
 	});
@@ -19044,14 +19539,14 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		record.recorded = [
 			{ prompt: "Bug A", model: null, rank: 1, security: null },
 		];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			commitsAhead: async () => 0,
 			reviewCheck: () => false,
 		});
-		const review = reviewWith(store);
-		store.updateTask(review.id, { queuedAt: 1 });
+		const review = await reviewWith(store);
+		await store.updateTask(review.id, { queuedAt: 1 });
 		await loop.runTurn(store.name, review.id);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect([after.stage, after.state, after.needsReason]).toEqual([
 			"merging",
 			"idle",
@@ -19062,12 +19557,12 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 
 	test("a merge proved by git without a receipt stamps no version from its prose", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
-			startRun: (o: StartArgs) => {
+			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					// No report_outcome: git proves the merge; the final text names a version.
@@ -19078,31 +19573,31 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 				};
 			},
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.releaseVersion).toBeNull();
 		expect(after.pushSha).toBe("sha-pushed");
 		expect(record.removeWorktree).toHaveLength(1);
-		expect(logText(store, task.id)).toContain("worktree removed");
+		expect(await logText(store, task.id)).toContain("worktree removed");
 	});
 
 	test("a rejected work integrated report pins no CI push sha", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			startRun: integratedRun(record),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The report is rejected (AGEN-33): the park names the out-of-turn merge, and no
 		// settle runs and no CI watch starts — the card never records a push sha it did
 		// not earn through a merge turn.
@@ -19112,13 +19607,13 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 			"Out-of-turn merge: the branch head is already on origin/main. A work turn never merges; report ready.",
 		);
 		expect(after.pushSha).toBeNull();
-		expect(logText(store, task.id)).not.toContain("CI watch skipped");
+		expect(await logText(store, task.id)).not.toContain("CI watch skipped");
 	});
 
 	test("a target with origin/ inside its name reads its own remote-tracking ref", async () => {
 		const record = baseRecord();
 		const refs: string[] = [];
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			resolveTarget: async () => ({
 				target: "mirror-origin/main",
 				sha: "sha0",
@@ -19134,23 +19629,23 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 			},
 			startRun: integratedRun(record),
 		});
-		const task = store.createTask("merge please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("merge please");
+		await store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(refs).toContain("refs/remotes/origin/mirror-origin/main");
-		expect(store.getTask(task.id)!.pushSha).toBe("sha-pushed");
+		expect((await store.getTask(task.id))!.pushSha).toBe("sha-pushed");
 	});
 
 	test("a run whose done rejects frees its slot: the requeued card runs again", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
-			startRun: (o: StartArgs) => {
+		const { store, record, loop } = await setup({
+			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				calls += 1;
 				return {
 					pid: 4242,
@@ -19162,37 +19657,37 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		const failed = store.getTask(task.id)!;
+		const failed = (await store.getTask(task.id))!;
 		expect(failed.state).toBe("needs_you");
 		expect(failed.needsReason).toBe("Tracker error: stream broke");
-		expect(store.listTurns(task.id)[0]!.error).toBe("stream broke");
+		expect((await store.listTurns(task.id))[0]!.error).toBe("stream broke");
 		await expect(loop.stopTurn(fakeProject(store), task.id)).resolves.toEqual({
 			error: "no turn is running",
 			status: 409,
 		});
 
-		store.updateTask(task.id, { state: "queued" });
+		await store.updateTask(task.id, { state: "queued" });
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(2);
-		expect(store.getTask(task.id)!.stage).toBe("merging");
+		expect((await store.getTask(task.id))!.stage).toBe("merging");
 	});
 
 	/** First run hangs on dead pid 4242 until `release1`; later runs use pid 5050. */
-	function abandonFixture(overrides: Partial<TurnOps> = {}) {
+	async function abandonFixture(overrides: FixtureOps = {}) {
 		const gate1 = Promise.withResolvers<RunResult>();
 		const gate2 = Promise.withResolvers<RunResult>();
 		const record = baseRecord();
-		const store = freshStore();
+		const store = await freshStore();
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				pidAlive: (pid: number) => pid !== 4242,
-				startRun: (o: StartArgs) => {
+				startRun: async (o: StartArgs) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					if (record.runs.length === 1)
 						return { pid: 4242, done: gate1.promise, kill: async () => {} };
 					return {
@@ -19207,18 +19702,18 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 				...overrides,
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const key = `${store.name}/${task.id}`;
 		return { record, store, projects, loop, task, key, gate1 };
 	}
 
 	test("a late done of an abandoned run leaves the resumed run's slot alone", async () => {
-		const { record, store, loop, task, key, gate1 } = abandonFixture();
+		const { record, store, loop, task, key, gate1 } = await abandonFixture();
 		const run1 = loop.runTurn(store.name, task.id);
 		await waitFor(() => loop.running.has(key));
 		// The sweep abandons the dead pid; a later tick starts the resumed run (pid 5050).
 		for (let i = 0; i < 10 && record.runs.length < 2; i++) {
-			loop.schedule();
+			await loop.schedule();
 			await flushPromises();
 		}
 		expect(record.runs).toHaveLength(2);
@@ -19237,33 +19732,34 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 	test("a late done of an abandoned run keeps the resumed run's cap claim", async () => {
 		let targets = 0;
 		const hold = Promise.withResolvers<void>();
-		const other = freshStore();
-		const { record, store, projects, loop, task, key, gate1 } = abandonFixture({
-			maxTotalRuns: () => 1,
-			resolveTarget: async () => {
-				targets += 1;
-				// The resumed run (second resolve) sits in its prepare phase.
-				if (targets === 2) await hold.promise;
-				return { target: "origin/main", sha: "sha0", warning: null };
-			},
-		});
+		const other = await freshStore();
+		const { record, store, projects, loop, task, key, gate1 } =
+			await abandonFixture({
+				maxTotalRuns: () => 1,
+				resolveTarget: async () => {
+					targets += 1;
+					// The resumed run (second resolve) sits in its prepare phase.
+					if (targets === 2) await hold.promise;
+					return { target: "origin/main", sha: "sha0", warning: null };
+				},
+			});
 		projects.set(other.name, fakeProject(other));
 		const run1 = loop.runTurn(store.name, task.id);
 		await waitFor(() => loop.running.has(key));
 		for (let i = 0; i < 10 && targets < 2; i++) {
-			loop.schedule();
+			await loop.schedule();
 			await flushPromises();
 		}
 		expect(targets).toBe(2);
-		expect(store.getTask(task.id)!.state).toBe("preparing");
+		expect((await store.getTask(task.id))!.state).toBe("preparing");
 		// A card in another project waits for the one global slot.
-		const waiting = other.createTask("next in line");
+		const waiting = await other.createTask("next in line");
 
 		gate1.resolve(answered());
 		await run1;
 		await flushPromises();
 
-		expect(other.getTask(waiting.id)!.state).toBe("queued");
+		expect((await other.getTask(waiting.id))!.state).toBe("queued");
 		expect(record.runs).toHaveLength(1);
 		hold.resolve();
 	});
@@ -19271,11 +19767,11 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 	test("a stop that raced a natural finish does not turn a later cancel into a stop", async () => {
 		const gate1 = Promise.withResolvers<RunResult>();
 		const gate2 = Promise.withResolvers<RunResult>();
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
-			startRun: (o: StartArgs) => {
+			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				if (record.runs.length === 1)
 					// The kill lands too late: the run finishes on its own.
 					return { pid: 4242, done: gate1.promise, kill: async () => {} };
@@ -19288,7 +19784,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 				};
 			},
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		const key = `${store.name}/${task.id}`;
 		const run1 = loop.runTurn(store.name, task.id);
 		await waitFor(() => loop.running.has(key));
@@ -19296,9 +19792,9 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		gate1.resolve(answered());
 		await expect(stop).resolves.toEqual({ ok: true });
 		await run1;
-		expect(store.listTurns(task.id)[0]!.error).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.error).toBeNull();
 
-		store.updateTask(task.id, { stage: "in_progress", state: "queued" });
+		await store.updateTask(task.id, { stage: "in_progress", state: "queued" });
 		const run2 = loop.runTurn(store.name, task.id);
 		await waitFor(() => loop.running.has(key));
 		await expect(
@@ -19306,16 +19802,16 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		).resolves.toEqual({ removed: true });
 		await run2;
 
-		const second = store.listTurns(task.id).at(-1)!;
+		const second = (await store.listTurns(task.id)).at(-1)!;
 		expect(second.error).toBe("cancelled");
-		expect(store.getTask(task.id)!.needsReason ?? "").not.toContain(
+		expect((await store.getTask(task.id))!.needsReason ?? "").not.toContain(
 			"Turn stopped",
 		);
 	});
 
 	test("stop returns after 15 s when the killed run never ends", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("hung");
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("hung");
 		loop.running.set(`${store.name}/${task.id}`, {
 			pid: 4242,
 			done: new Promise<unknown>(() => {}),
@@ -19326,15 +19822,15 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		jest.useFakeTimers();
 		try {
 			let out: unknown = null;
-			void loop.stopTurn(fakeProject(store), task.id).then((r) => {
+			const stopping = loop.stopTurn(fakeProject(store), task.id).then((r) => {
 				out = r;
 			});
-			await drainMicrotasks();
+			while (jest.getTimerCount() === 0) await Promise.resolve();
 			jest.advanceTimersByTime(14_999);
 			await drainMicrotasks();
 			expect(out).toBeNull();
 			jest.advanceTimersByTime(1);
-			await drainMicrotasks();
+			await stopping;
 			expect(out).toEqual({ ok: true });
 			expect(record.killed).toBe(true);
 		} finally {
@@ -19343,9 +19839,9 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 	});
 
 	test("cancel removes the worktree after 15 s when the killed run never ends", async () => {
-		const { store, record, loop } = setup();
-		const task = store.createTask("hung");
-		store.updateTask(task.id, {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("hung");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "in_progress",
 			worktree: join(store.worktreesDir, task.id),
@@ -19362,15 +19858,17 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		jest.useFakeTimers();
 		try {
 			let out: unknown = null;
-			void loop.cancel(fakeProject(store), task.id, false).then((r) => {
-				out = r;
-			});
-			await drainMicrotasks();
+			const cancellation = loop
+				.cancel(fakeProject(store), task.id, false)
+				.then((r) => {
+					out = r;
+				});
+			while (jest.getTimerCount() === 0) await Promise.resolve();
 			jest.advanceTimersByTime(15_000);
-			await drainMicrotasks();
+			await cancellation;
 			expect(out).toEqual({ removed: true });
 			expect(record.removeWorktree).toHaveLength(1);
-			expect(store.getTask(task.id)!.state).toBe("idle");
+			expect((await store.getTask(task.id))!.state).toBe("idle");
 		} finally {
 			jest.useRealTimers();
 		}
@@ -19378,15 +19876,15 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 
 	test("finish-kept without a worktree refuses a branch with unreached commits", async () => {
 		let huskCalls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			branchMergedOrGone: async () => false,
 			worktreeHusk: async () => {
 				huskCalls += 1;
 				return false;
 			},
 		});
-		const task = store.createTask("kept work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("kept work");
+		await store.updateTask(task.id, {
 			stage: "in_progress",
 			state: "needs_you",
 			needsReason: keptReason("uncommitted changes"),
@@ -19402,7 +19900,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 		});
 		expect(huskCalls).toBe(0);
 		expect(record.removeWorktree).toHaveLength(0);
-		expect(store.getTask(task.id)!.state).toBe("needs_you");
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 	});
 });
 
@@ -19484,14 +19982,14 @@ describe("generateTitle failure causes", () => {
 
 describe("per-runner drain gates (OTTR-454)", () => {
 	test("a drained worker gets no dispatch while the other still does", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: {
 				urls: ["http://worker-a:8787", "http://worker-b:8787"],
 			},
 			drainedRunner: (id) => id === "worker-a",
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(1);
 		expect((record.runs[0]!.worker as { urls: string[] }).urls).toEqual([
@@ -19500,27 +19998,27 @@ describe("per-runner drain gates (OTTR-454)", () => {
 	});
 
 	test("every worker drained leaves the card queued and starts no run", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			// Selective: "local" stays undrained, so the deferral must come from the
 			// workers' check, not from the local branch that merge turns take.
 			drainedRunner: (id) => id !== "local",
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)?.state).toBe("queued");
+		expect((await store.getTask(task.id))?.state).toBe("queued");
 	});
 
 	test("a board check starts while every worker is drained", async () => {
 		// The check runs on the server's local runner: a workers-only hold must not
 		// defer it, and the gate must take the workers' branch for nothing else.
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			drainedRunner: (id) => id !== "local",
 		});
-		const check = store.createTask(BOARD_CHECK_PROMPT);
-		store.setBoardCheckId(check.id);
+		const check = await store.createTask(BOARD_CHECK_PROMPT);
+		await store.setBoardCheckId(check.id);
 		await loop.runTurn(store.name, check.id);
 		expect(record.runs).toHaveLength(1);
 	});
@@ -19529,7 +20027,7 @@ describe("per-runner drain gates (OTTR-454)", () => {
 		// Race path: the hold covers every worker only after the claim. Dispatching
 		// would be fail-open, so the prepared turn parks for a human instead.
 		let drained = false;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			drainedRunner: (id) => drained && id === "worker-a",
@@ -19538,49 +20036,49 @@ describe("per-runner drain gates (OTTR-454)", () => {
 				return { target: "origin/main", sha: "sha0", warning: null };
 			},
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const card = store.getTask(task.id);
+		const card = await store.getTask(task.id);
 		expect(card?.state).toBe("needs_you");
 		expect(card?.needsReason).toContain("Every worker is unavailable");
 	});
 
 	test("a local drain defers a merge turn but a worker turn still starts", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			drainedRunner: (id) => id === "local",
 		});
-		const merge = store.createTask("merge please");
-		store.updateTask(merge.id, {
+		const merge = await store.createTask("merge please");
+		await store.updateTask(merge.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
 		await loop.runTurn(store.name, merge.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(merge.id)?.state).toBe("queued");
+		expect((await store.getTask(merge.id))?.state).toBe("queued");
 
-		const work = store.createTask("queued work");
+		const work = await store.createTask("queued work");
 		await loop.runTurn(store.name, work.id);
 		expect(record.runs).toHaveLength(1);
 	});
 
 	test("a local drain defers the board check too", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			drainedRunner: () => true,
 		});
-		const check = store.createTask(BOARD_CHECK_PROMPT);
-		store.setBoardCheckId(check.id);
+		const check = await store.createTask(BOARD_CHECK_PROMPT);
+		await store.setBoardCheckId(check.id);
 		await loop.runTurn(store.name, check.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(check.id)?.state).toBe("queued");
+		expect((await store.getTask(check.id))?.state).toBe("queued");
 	});
 
 	test("runnerTurns buckets live runs by worker hostname and counts preparing", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
@@ -19600,12 +20098,12 @@ describe("per-runner drain gates (OTTR-454)", () => {
 				};
 			},
 		});
-		const check = store.createTask(BOARD_CHECK_PROMPT);
-		store.setBoardCheckId(check.id);
+		const check = await store.createTask(BOARD_CHECK_PROMPT);
+		await store.setBoardCheckId(check.id);
 		void loop.runTurn(store.name, check.id);
-		const first = store.createTask("queued work");
+		const first = await store.createTask("queued work");
 		void loop.runTurn(store.name, first.id);
-		const second = store.createTask("more work");
+		const second = await store.createTask("more work");
 		void loop.runTurn(store.name, second.id);
 		await flushPromises();
 		// Two live runs share worker-a's hostname, and the local check counts apart.
@@ -19625,56 +20123,56 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 	});
 
 	test("a tmp-full worker gets no dispatch while the other still does", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: {
 				urls: ["http://worker-a:8787", "http://worker-b:8787"],
 			},
 			...tmpHolds("worker-a"),
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(1);
 		expect(record.runs[0]!.worker?.urls).toEqual(["http://worker-b:8787"]);
 	});
 
 	test("every worker tmp-full leaves the card queued and starts no run", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			...tmpHolds("worker-a"),
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)?.state).toBe("queued");
+		expect((await store.getTask(task.id))?.state).toBe("queued");
 		// OTTR-754: the queued card carries the hold reason with the runner's free space.
-		expect(store.getTask(task.id)?.needsReason).toBe(
+		expect((await store.getTask(task.id))?.needsReason).toBe(
 			"/tmp of worker-a is full (512 MiB)",
 		);
 	});
 
 	test("a drain-only hold writes no /tmp reason on the queued card", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			drainedRunner: (id) => id === "worker-a",
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(task.id)?.state).toBe("queued");
-		expect(store.getTask(task.id)?.needsReason).toBeNull();
+		expect((await store.getTask(task.id))?.state).toBe("queued");
+		expect((await store.getTask(task.id))?.needsReason).toBeNull();
 	});
 
 	test("a tmp-full local runner defers the board check", async () => {
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			...tmpHolds("local"),
 		});
-		const check = store.createTask(BOARD_CHECK_PROMPT);
-		store.setBoardCheckId(check.id);
+		const check = await store.createTask(BOARD_CHECK_PROMPT);
+		await store.setBoardCheckId(check.id);
 		await loop.runTurn(store.name, check.id);
 		expect(record.runs).toHaveLength(0);
-		expect(store.getTask(check.id)?.state).toBe("queued");
-		expect(store.getTask(check.id)?.needsReason).toBe(
+		expect((await store.getTask(check.id))?.state).toBe("queued");
+		expect((await store.getTask(check.id))?.needsReason).toBe(
 			"/tmp of local is full (512 MiB)",
 		);
 	});
@@ -19683,7 +20181,7 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 		// Race path, mirror of the drain test: the hold covers the only worker after
 		// the claim, so the prepared turn parks and the reason names the runner's space.
 		let full = false;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpFullLine: (r) =>
@@ -19693,16 +20191,16 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				return { target: "origin/main", sha: "sha0", warning: null };
 			},
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(0);
-		const card = store.getTask(task.id);
+		const card = await store.getTask(task.id);
 		expect(card?.state).toBe("needs_you");
 		expect(card?.needsReason).toContain("/tmp of worker-a is full (512 MiB)");
 	});
 
 	test("an apt disk-failure reason names the free /tmp of the runner it ran on", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
@@ -19721,17 +20219,17 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				kill: async () => {},
 			}),
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(
 			after.needsReason?.endsWith("/tmp of worker-a has 512 MiB free"),
 		).toBe(true);
 	});
 
 	test("a failed run without the apt signature stays unenriched", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"] },
 			tmpSpaceLine: (r) => `/tmp of ${r} has 512 MiB free`,
@@ -19742,10 +20240,10 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 				kill: async () => {},
 			}),
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.needsReason).toBe(
+		expect((await store.getTask(task.id))!.needsReason).toBe(
 			"omp exited with code 1 before finishing.",
 		);
 	});
@@ -19796,25 +20294,25 @@ describe("detached re-bind after the restart", () => {
 		"The update restarted the board and the turn finished on the worker - resuming automatically. Cancel to stop it instead.";
 
 	/** A running card with an open pid-null worker row whose worktree matches the worker answer. */
-	function seededWorkerRow(store: ProjectStore) {
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+	async function seededWorkerRow(store: ProjectStore) {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "in_progress",
 			sessionId: "sess-9",
 			worktree: WT,
 			branch: "ott/x",
 		});
-		store.startTurn(task.id, "work", "old prompt", null);
+		await store.startTurn(task.id, "work", "old prompt", null);
 		return task;
 	}
 
 	/** setup whose worker answers `runs` per probe; killDetached records into `killed`. */
-	function rebindSetup(
+	async function rebindSetup(
 		runs: () => DetachedRun[],
 		killed: { id: string; token: string | undefined }[] = [],
 	) {
-		return setup({
+		return await setup({
 			// Cap 0: the sweep ticks settle but start no resumed run.
 			maxTotalRuns: () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
@@ -19830,25 +20328,25 @@ describe("detached re-bind after the restart", () => {
 
 	test("recoverRestarted re-binds a running detached run and leaves the card running", async () => {
 		const running = true;
-		const { store, record, loop } = rebindSetup(() => [
+		const { store, record, loop } = await rebindSetup(() => [
 			{ id: "run-1", cwd: WT, pid: null, running, startedAt: 1 },
 		]);
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 
 		await loop.recoverRestarted();
 
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		expect(record.runs).toHaveLength(0);
 		// The sweep keeps polling the watcher: a still-running run leaves the row open.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
 	});
 
 	test("a finished detached run settles at recovery through the resume route", async () => {
-		const { store, loop } = rebindSetup(() => [
+		const { store, loop } = await rebindSetup(() => [
 			{
 				id: "run-1",
 				cwd: WT,
@@ -19858,14 +20356,14 @@ describe("detached re-bind after the restart", () => {
 				result: { exitCode: 0, stderrTail: "" },
 			},
 		]);
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 
 		await loop.recoverRestarted();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe(RESTART_ERROR);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		// A detached completion is not a worker failure: the reason names the restart, and
 		// no lost-worker parking is involved.
@@ -19876,7 +20374,7 @@ describe("detached re-bind after the restart", () => {
 	});
 
 	test("an unmatched row keeps the lost settle", async () => {
-		const { store, loop } = rebindSetup(() => [
+		const { store, loop } = await rebindSetup(() => [
 			{
 				id: "run-1",
 				cwd: "/srv/other",
@@ -19885,14 +20383,14 @@ describe("detached re-bind after the restart", () => {
 				startedAt: 1,
 			},
 		]);
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 
 		await loop.recoverRestarted();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(
 			"Tracker restarted during this turn - resuming automatically. Cancel to stop it instead.",
@@ -19900,87 +20398,87 @@ describe("detached re-bind after the restart", () => {
 	});
 
 	test("an unreachable worker keeps the lost settle", async () => {
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			maxTotalRuns: () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
 			detachedRuns: async () => {
 				throw new Error("connection refused");
 			},
 		});
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 
 		await loop.recoverRestarted();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("tracker restarted");
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 	});
 
 	test("the sweep settles a re-bound row once the worker reports it finished", async () => {
 		let running = true;
-		const { store, loop } = rebindSetup(() => [
+		const { store, loop } = await rebindSetup(() => [
 			{ id: "run-1", cwd: WT, pid: null, running, startedAt: 1 },
 		]);
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 		await loop.recoverRestarted();
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 
 		running = false;
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe(RESTART_ERROR);
-		expect(store.getTask(task.id)!.state).toBe("queued");
-		expect(store.getTask(task.id)!.needsReason).toBe(RESTART_REASON);
+		expect((await store.getTask(task.id))!.state).toBe("queued");
+		expect((await store.getTask(task.id))!.needsReason).toBe(RESTART_REASON);
 
 		// The watcher is dropped: a further sweep settles nothing again.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.listTurns(task.id)).toHaveLength(1);
+		expect(await store.listTurns(task.id)).toHaveLength(1);
 	});
 
 	test("cancel of a re-bound row kills the detached run and drops the watcher", async () => {
 		const killed: { id: string; token: string | undefined }[] = [];
-		const { store, projects, loop } = rebindSetup(
+		const { store, projects, loop } = await rebindSetup(
 			() => [{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 }],
 			killed,
 		);
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
 		await loop.cancel(e, task.id, true);
 
 		expect(killed).toEqual([{ id: "run-1", token: "tok" }]);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 		// The watcher is gone: a further sweep probes and kills nothing again.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(killed).toEqual([{ id: "run-1", token: "tok" }]);
 	});
 
 	test("stop of a re-bound row kills the detached run and parks the card stopped", async () => {
 		const killed: { id: string; token: string | undefined }[] = [];
-		const { store, projects, loop } = rebindSetup(
+		const { store, projects, loop } = await rebindSetup(
 			() => [{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 }],
 			killed,
 		);
-		const task = seededWorkerRow(store);
+		const task = await seededWorkerRow(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
 		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
 
 		expect(killed).toEqual([{ id: "run-1", token: "tok" }]);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).not.toBeNull();
 		expect(turn.error).toBe("stopped");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.",
@@ -20015,7 +20513,7 @@ describe("detached re-bind survivor pins", () => {
 	});
 
 	/** A running card, worktree WT, with an open worker row (pid null unless opts.pid). */
-	function row(
+	async function row(
 		store: ProjectStore,
 		opts: {
 			pid?: number | null;
@@ -20024,8 +20522,8 @@ describe("detached re-bind survivor pins", () => {
 			noRow?: boolean;
 		} = {},
 	) {
-		const task = store.createTask("work please");
-		store.updateTask(task.id, {
+		const task = await store.createTask("work please");
+		await store.updateTask(task.id, {
 			state: "running",
 			stage: "in_progress",
 			sessionId: "sess-9",
@@ -20034,12 +20532,12 @@ describe("detached re-bind survivor pins", () => {
 			...(opts.cancelled ? { cancelledAt: Date.now() } : {}),
 		});
 		if (!opts.noRow)
-			store.startTurn(task.id, "work", "old prompt", opts.pid ?? null);
+			await store.startTurn(task.id, "work", "old prompt", opts.pid ?? null);
 		return task;
 	}
 
-	function endRow(store: ProjectStore, id: string, error: string) {
-		store.finishTurn(store.listTurns(id)[0]!.id, {
+	async function endRow(store: ProjectStore, id: string, error: string) {
+		await store.finishTurn((await store.listTurns(id))[0]!.id, {
 			endedAt: Date.now(),
 			exitCode: null,
 			error,
@@ -20047,7 +20545,7 @@ describe("detached re-bind survivor pins", () => {
 	}
 
 	/** setup with probe/kill recording; `answer(nth, url)` scripts each probe result. */
-	function watchSetup(
+	async function watchSetup(
 		answer: (nth: number, url: string) => DetachedRun[],
 		opts: {
 			urls?: string[];
@@ -20060,13 +20558,13 @@ describe("detached re-bind survivor pins", () => {
 		const probes: { url: string; token: string }[] = [];
 		const killed: { url: string; token: string | undefined; id: string }[] = [];
 		let nth = 0;
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		// A target so a redone non-forced cancel (clean tree) removes the worktree.
 		const projects = new Map([
 			[store.name, { ...fakeProject(store), target: "origin/main" }],
 		]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				maxTotalRuns: () => 0,
@@ -20098,16 +20596,16 @@ describe("detached re-bind survivor pins", () => {
 	}
 
 	test("a live agent pid owns the card and is never probed for detached runs", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store, { pid: 4344 });
+		const { store, loop, probes } = await watchSetup(() => [run1(true)]);
+		const task = await row(store, { pid: 4344 });
 
 		await loop.recoverRestarted();
 
 		expect(probes).toEqual([]);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
-		const log = logText(store, task.id);
+		expect((await store.getTask(task.id))!.state).toBe("running");
+		const log = await logText(store, task.id);
 		expect(log).toContain(
 			"agent pid 4344 survived the tracker restart; leaving the card running",
 		);
@@ -20115,74 +20613,80 @@ describe("detached re-bind survivor pins", () => {
 	});
 
 	test("a cancelled card is never re-bound; its interrupted cancel finishes", async () => {
-		const { store, record, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store, { cancelled: true });
+		const { store, record, loop, probes } = await watchSetup(() => [
+			run1(true),
+		]);
+		const task = await row(store, { cancelled: true });
 
 		await loop.recoverRestarted();
 
 		expect(probes).toEqual([]);
-		expect(store.listTurns(task.id)[0]!.error).toBe("tracker restarted");
-		const after = store.getTask(task.id)!;
+		expect((await store.listTurns(task.id))[0]!.error).toBe(
+			"tracker restarted",
+		);
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		// The dead cancel was redone: the worktree is gone and the card is idle.
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
 	test("a running card with no turn row requeues without probing", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store, { noRow: true });
+		const { store, loop, probes } = await watchSetup(() => [run1(true)]);
+		const task = await row(store, { noRow: true });
 
 		await loop.recoverRestarted();
 
 		expect(probes).toEqual([]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(TRACKER_REASON);
 		expect(after.pendingPrompt).toBe(RESTART_RESUME);
 	});
 
 	test("an ended pid-null row requeues without probing", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store);
-		endRow(store, task.id, "earlier");
+		const { store, loop, probes } = await watchSetup(() => [run1(true)]);
+		const task = await row(store);
+		await endRow(store, task.id, "earlier");
 
 		await loop.recoverRestarted();
 
 		expect(probes).toEqual([]);
-		expect(store.listTurns(task.id)[0]!.error).toBe("earlier");
-		const after = store.getTask(task.id)!;
+		expect((await store.listTurns(task.id))[0]!.error).toBe("earlier");
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe(RESTART_RESUME);
 	});
 
 	test("an ended row with a live pid requeues too", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store, { pid: 4344 });
-		endRow(store, task.id, "earlier");
+		const { store, loop, probes } = await watchSetup(() => [run1(true)]);
+		const task = await row(store, { pid: 4344 });
+		await endRow(store, task.id, "earlier");
 
 		await loop.recoverRestarted();
 
 		expect(probes).toEqual([]);
-		expect(store.listTurns(task.id)[0]!.error).toBe("earlier");
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.listTurns(task.id))[0]!.error).toBe("earlier");
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 	});
 
 	test("a null-worktree row is never probed; it keeps the lost settle", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store, { worktree: null });
+		const { store, loop, probes } = await watchSetup(() => [run1(true)]);
+		const task = await row(store, { worktree: null });
 
 		await loop.recoverRestarted();
 
 		expect(probes).toEqual([]);
-		expect(store.listTurns(task.id)[0]!.error).toBe("tracker restarted");
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.listTurns(task.id))[0]!.error).toBe(
+			"tracker restarted",
+		);
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 	});
 
 	test("a missing worker target keeps the lost settle without probing", async () => {
-		const store = freshStore();
+		const store = await freshStore();
 		const record = baseRecord();
 		const projects = new Map([[store.name, fakeProject(store)]]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				maxTotalRuns: () => 0,
@@ -20190,20 +20694,22 @@ describe("detached re-bind survivor pins", () => {
 				// No workerTarget: the re-bind has nowhere to ask.
 			}),
 		);
-		const task = row(store);
+		const task = await row(store);
 
 		await loop.recoverRestarted();
 
-		expect(store.listTurns(task.id)[0]!.error).toBe("tracker restarted");
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.listTurns(task.id))[0]!.error).toBe(
+			"tracker restarted",
+		);
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 	});
 
 	test("matchDetached asks workers in order and re-binds the first cwd match", async () => {
-		const { store, loop, probes } = watchSetup(
+		const { store, loop, probes } = await watchSetup(
 			(_nth, url) => (url === URL_A ? [] : [run1(true)]),
 			{ urls: [URL_A, URL_B] },
 		);
-		const task = row(store);
+		const task = await row(store);
 
 		await loop.recoverRestarted();
 
@@ -20211,22 +20717,22 @@ describe("detached re-bind survivor pins", () => {
 			{ url: URL_A, token: "tok" },
 			{ url: URL_B, token: "tok" },
 		]);
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
-		expect(logText(store, task.id)).toContain(
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
+		expect(await logText(store, task.id)).toContain(
 			"- re-bound detached run run-1 on worker-b:8787; the card stays running",
 		);
 	});
 
 	test("a failing worker probe falls through to the next worker at recovery", async () => {
-		const { store, loop, probes } = watchSetup(
+		const { store, loop, probes } = await watchSetup(
 			(_nth, url) => {
 				if (url === URL_A) throw new Error("connection refused");
 				return [finished1()];
 			},
 			{ urls: [URL_A, URL_B] },
 		);
-		const task = row(store);
+		const task = await row(store);
 
 		await loop.recoverRestarted();
 
@@ -20234,231 +20740,238 @@ describe("detached re-bind survivor pins", () => {
 			{ url: URL_A, token: "tok" },
 			{ url: URL_B, token: "tok" },
 		]);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe(RESTART_ERROR);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(RESTART_REASON);
 		expect(after.pendingPrompt).toBe(RESTART_RESUME);
 	});
 
 	test("an absent worker token probes with the empty token", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)], {
+		const { store, loop, probes } = await watchSetup(() => [run1(true)], {
 			token: null,
 		});
-		const task = row(store);
+		const task = await row(store);
 
 		await loop.recoverRestarted();
 		expect(probes).toEqual([{ url: URL_A, token: "" }]);
 
 		// The sweep's watcher poll probes with the same empty token.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(probes).toEqual([
 			{ url: URL_A, token: "" },
 			{ url: URL_A, token: "" },
 		]);
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 	});
 
 	test("the lost scan leaves a re-bound row to its watcher", async () => {
-		const { store, loop, probes } = watchSetup(() => [run1(true)]);
-		const task = row(store);
+		const { store, loop, probes } = await watchSetup(() => [run1(true)]);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		expect(probes).toHaveLength(1);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBeNull();
 		expect(turn.error).toBeNull();
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("running");
 		expect(after.needsReason).toBeNull();
 		expect(probes).toHaveLength(2);
-		expect(logText(store, task.id)).not.toContain("lost agent process");
+		expect(await logText(store, task.id)).not.toContain("lost agent process");
 	});
 
 	test("a vanished run settles through the restart route and drops the watcher", async () => {
-		const { store, loop, probes } = watchSetup((nth) =>
+		const { store, loop, probes } = await watchSetup((nth) =>
 			nth === 0 ? [run1(true)] : [],
 		);
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe(RESTART_ERROR);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(RESTART_REASON);
 		expect(probes).toHaveLength(2);
 
 		// The watcher is gone: no further probes, no second settle.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(probes).toHaveLength(2);
-		expect(store.listTurns(task.id)).toHaveLength(1);
+		expect(await store.listTurns(task.id)).toHaveLength(1);
 	});
 
 	test("a probe failure keeps its watcher while other rows settle", async () => {
-		const { store, loop, probes } = watchSetup((nth) => {
+		const { store, loop, probes } = await watchSetup((nth) => {
 			if (nth < 2) return [run1(true)];
 			if (nth === 2) throw new Error("worker down mid-watch");
 			return [finished1()];
 		});
-		const task1 = row(store);
-		const task2 = row(store);
+		const task1 = await row(store);
+		const task2 = await row(store);
 		await loop.recoverRestarted();
 		expect(probes).toHaveLength(2);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		// The failed probe leaves its own row to its watcher; the other row settles.
 		// (Watcher order follows the store's task order, so don't pin which is which.)
 		const openId =
-			store.listTurns(task1.id)[0]!.endedAt === null ? task1.id : task2.id;
+			(await store.listTurns(task1.id))[0]!.endedAt === null
+				? task1.id
+				: task2.id;
 		const settledId = openId === task1.id ? task2.id : task1.id;
-		expect(store.listTurns(openId)[0]!.endedAt).toBeNull();
-		expect(store.getTask(openId)!.state).toBe("running");
-		expect(store.listTurns(settledId)[0]!.error).toBe(RESTART_ERROR);
-		expect(store.getTask(settledId)!.state).toBe("queued");
+		expect((await store.listTurns(openId))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(openId))!.state).toBe("running");
+		expect((await store.listTurns(settledId))[0]!.error).toBe(RESTART_ERROR);
+		expect((await store.getTask(settledId))!.state).toBe("queued");
 		expect(probes).toHaveLength(4);
 
 		// The kept watcher settles its row on the next tick.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
-		expect(store.listTurns(openId)[0]!.error).toBe(RESTART_ERROR);
-		expect(store.getTask(openId)!.state).toBe("queued");
+		expect((await store.listTurns(openId))[0]!.error).toBe(RESTART_ERROR);
+		expect((await store.getTask(openId))!.state).toBe("queued");
 		expect(probes).toHaveLength(5);
 	});
 
 	test("a stale watcher on an ended row drops itself without a second settle", async () => {
-		const { store, loop, probes } = watchSetup((nth) =>
+		const { store, loop, probes } = await watchSetup((nth) =>
 			nth === 0 ? [run1(true)] : [finished1()],
 		);
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
-		endRow(store, task.id, "manual");
+		await endRow(store, task.id, "manual");
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
-		expect(store.listTurns(task.id)[0]!.error).toBe("manual");
+		expect((await store.listTurns(task.id))[0]!.error).toBe("manual");
 		expect(probes).toHaveLength(2);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(probes).toHaveLength(2);
 	});
 
 	test("a watcher whose project vanished drops itself without settling", async () => {
-		const { store, projects, loop, probes } = watchSetup((nth) =>
+		const { store, projects, loop, probes } = await watchSetup((nth) =>
 			nth === 0 ? [run1(true)] : [finished1()],
 		);
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		projects.delete(store.name);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		// The row is untouched: no project object exists to settle through.
-		expect(store.listTurns(task.id)[0]!.endedAt).toBeNull();
-		expect(store.getTask(task.id)!.state).toBe("running");
+		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		expect((await store.getTask(task.id))!.state).toBe("running");
 		expect(probes).toHaveLength(2);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(probes).toHaveLength(2);
 	});
 
 	test("stop of a re-bound row works without a killDetached op", async () => {
-		const { store, projects, loop } = watchSetup(() => [run1(true)], {
+		const { store, projects, loop } = await watchSetup(() => [run1(true)], {
 			kill: false,
 		});
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
 		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
 
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe("stopped");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(STOP_REASON);
-		expect(logText(store, task.id)).not.toContain("! stop killDetached");
+		expect(await logText(store, task.id)).not.toContain("! stop killDetached");
 	});
 
 	test("a failed stop kill logs the failure and still parks the card", async () => {
-		const { store, projects, loop, killed } = watchSetup(() => [run1(true)], {
-			killError: "boom",
-		});
-		const task = row(store);
+		const { store, projects, loop, killed } = await watchSetup(
+			() => [run1(true)],
+			{
+				killError: "boom",
+			},
+		);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
 		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
 
 		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
-		const turn = store.listTurns(task.id)[0]!;
+		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.error).toBe("stopped");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(STOP_REASON);
-		expect(logText(store, task.id)).toContain("! stop killDetached: boom");
+		expect(await logText(store, task.id)).toContain(
+			"! stop killDetached: boom",
+		);
 	});
 
 	test("stop of an already-ended watched row keeps that row's error", async () => {
-		const { store, projects, loop, probes, killed } = watchSetup(() => [
+		const { store, projects, loop, probes, killed } = await watchSetup(() => [
 			run1(true),
 		]);
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
-		endRow(store, task.id, "manual");
+		await endRow(store, task.id, "manual");
 		const e = projects.get(store.name)!;
 
 		await expect(loop.stopTurn(e, task.id)).resolves.toEqual({ ok: true });
 
-		expect(store.listTurns(task.id)[0]!.error).toBe("manual");
-		const after = store.getTask(task.id)!;
+		expect((await store.listTurns(task.id))[0]!.error).toBe("manual");
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
 		// The watcher is dropped with the stop: no further probes.
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(probes).toHaveLength(1);
 	});
 
 	test("cancel drops the watcher before any further probe", async () => {
-		const { store, projects, loop, probes, killed } = watchSetup(() => [
+		const { store, projects, loop, probes, killed } = await watchSetup(() => [
 			run1(true),
 		]);
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
 		await loop.cancel(e, task.id, true);
 
 		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 		expect(probes).toHaveLength(1);
 
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 		expect(probes).toHaveLength(1);
 		expect(killed).toEqual([{ url: URL_A, token: "tok", id: "run-1" }]);
 	});
 
 	test("a failed cancel kill logs the failure and the cancel proceeds", async () => {
-		const { store, projects, loop } = watchSetup(() => [run1(true)], {
+		const { store, projects, loop } = await watchSetup(() => [run1(true)], {
 			killError: "boom",
 		});
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
@@ -20466,15 +20979,17 @@ describe("detached re-bind survivor pins", () => {
 			removed: true,
 		});
 
-		expect(store.getTask(task.id)!.state).toBe("idle");
-		expect(logText(store, task.id)).toContain("! cancel killDetached: boom");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
+		expect(await logText(store, task.id)).toContain(
+			"! cancel killDetached: boom",
+		);
 	});
 
 	test("cancel works without a killDetached op", async () => {
-		const { store, projects, loop } = watchSetup(() => [run1(true)], {
+		const { store, projects, loop } = await watchSetup(() => [run1(true)], {
 			kill: false,
 		});
-		const task = row(store);
+		const task = await row(store);
 		await loop.recoverRestarted();
 		const e = projects.get(store.name)!;
 
@@ -20482,13 +20997,17 @@ describe("detached re-bind survivor pins", () => {
 			removed: true,
 		});
 
-		expect(store.getTask(task.id)!.state).toBe("idle");
-		expect(logText(store, task.id)).not.toContain("! cancel killDetached");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
+		expect(await logText(store, task.id)).not.toContain(
+			"! cancel killDetached",
+		);
 	});
 
 	test("a plain cancel of a live local run never touches the detach path", async () => {
-		const { store, projects, loop, killed } = watchSetup(() => [run1(true)]);
-		const task = store.createTask("local work");
+		const { store, projects, loop, killed } = await watchSetup(() => [
+			run1(true),
+		]);
+		const task = await store.createTask("local work");
 		let kills = 0;
 		loop.running.set(`${store.name}/${task.id}`, {
 			pid: 4242,
@@ -20503,64 +21022,66 @@ describe("detached re-bind survivor pins", () => {
 
 		expect(kills).toBe(1);
 		expect(killed).toEqual([]);
-		expect(store.getTask(task.id)!.state).toBe("idle");
+		expect((await store.getTask(task.id))!.state).toBe("idle");
 		// No detach-path error was logged: the task's log file was never even created.
-		expect(existsSync(store.logPath(task.id))).toBe(false);
+		expect(existsSync(await store.logPath(task.id))).toBe(false);
 	});
 });
 
 describe("sync-commit hygiene (OTTR-531)", () => {
 	/** A settled work turn with target origin/main on the project entry. */
-	function targetedSetup(overrides: Partial<TurnOps> = {}) {
-		const s = setup(overrides);
+	async function targetedSetup(overrides: FixtureOps = {}) {
+		const s = await setup(overrides);
 		s.projects.get(s.store.name)!.target = "origin/main";
 		return s;
 	}
 
 	test("a settled outcome names a main checkout left on a foreign branch", async () => {
-		const { store, loop } = targetedSetup({
+		const { store, loop } = await targetedSetup({
 			checkedOutBranch: async () => "ott/ottr-516-mean",
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.details).toContain(
+		expect((await store.getTask(task.id))!.details).toContain(
 			`Board: ${store.name}'s main checkout is on branch ott/ottr-516-mean, not main.`,
 		);
 	});
 
 	test("a settled outcome names a local main that origin lacks", async () => {
-		const { store, loop } = targetedSetup({
+		const { store, loop } = await targetedSetup({
 			branchUnpushed: async () => true,
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.details).toContain(
+		expect((await store.getTask(task.id))!.details).toContain(
 			`Board: ${store.name}'s local main has commits origin lacks.`,
 		);
 	});
 
 	test("a clean main checkout adds no Board: line", async () => {
-		const { store, loop } = targetedSetup();
-		const task = store.createTask("work please");
+		const { store, loop } = await targetedSetup();
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		expect(store.getTask(task.id)!.details ?? "").not.toContain("Board:");
+		expect((await store.getTask(task.id))!.details ?? "").not.toContain(
+			"Board:",
+		);
 	});
 
 	test("pushSyncCommits on: the tick pushes once on the unpushed edge and lifts the hold", async () => {
 		const calls: unknown[][] = [];
-		const { store, projects, loop } = targetedSetup({
+		const { store, projects, loop } = await targetedSetup({
 			branchUnpushed: async () => true,
 			serverMergePush: async (...args: unknown[]) => {
 				calls.push(args);
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		store.setSettings({ pushSyncCommits: true });
+		await store.setSettings({ pushSyncCommits: true });
 		const e = projects.get(store.name)!;
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(calls).toHaveLength(1);
@@ -20570,21 +21091,21 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 			"origin/main",
 			"",
 			null,
-			store.getSettings().originUrl,
+			(await store.getSettings()).originUrl,
 		]);
 		expect(e.mainUnpushed).toBe(false);
 	});
 
 	test("pushSyncCommits off: the tick never pushes", async () => {
 		const calls: unknown[][] = [];
-		const { loop } = setup({
+		const { loop } = await setup({
 			branchUnpushed: async () => true,
 			serverMergePush: async (...args: unknown[]) => {
 				calls.push(args);
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		loop.schedule();
+		await loop.schedule();
 		await flushPromises();
 
 		expect(calls).toHaveLength(0);
@@ -20592,9 +21113,9 @@ describe("sync-commit hygiene (OTTR-531)", () => {
 });
 
 describe("turn PR-mode merge settle", () => {
-	function prMergeSetup(overrides: Partial<TurnOps> = {}) {
+	async function prMergeSetup(overrides: FixtureOps = {}) {
 		const record = baseRecord();
-		const setup = setupWith(record, {
+		const setup = await setupWith(record, {
 			prIntegrated: async () => true,
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-tip" : "sha-old",
@@ -20609,9 +21130,12 @@ describe("turn PR-mode merge settle", () => {
 			runMergeGates: async () => {
 				throw new Error("merge gates must not run in PR mode");
 			},
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -20630,12 +21154,12 @@ describe("turn PR-mode merge settle", () => {
 		});
 		const e = setup.projects.get(setup.store.name)!;
 		e.github = "https://github.com/acme/repo.git";
-		setup.store.setSettings({
+		await setup.store.setSettings({
 			prMode: true,
 			originUrl: "https://github.com/acme/repo.git",
 		});
-		const task = setup.store.createTask("merge please");
-		setup.store.updateTask(task.id, {
+		const task = await setup.store.createTask("merge please");
+		await setup.store.updateTask(task.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -20655,7 +21179,7 @@ describe("turn PR-mode merge settle", () => {
 			title: string;
 			body: string;
 		}[] = [];
-		const { store, record, loop, task } = prMergeSetup({
+		const { store, record, loop, task } = await prMergeSetup({
 			pushBranch: async (...args: unknown[]) => {
 				pushes.push(args);
 				return { status: "pushed" as const, output: "" };
@@ -20684,7 +21208,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(opens[0]!.body).toContain("gates green");
 		expect(opens[0]!.body).toContain(task.id);
 		expect(opens[0]!.body).toContain("Ottr");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(null);
@@ -20692,7 +21216,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/12");
 		expect(after.prHeadSha).toBe("sha-tip");
 		expect(after.pushSha).toBe("sha-tip");
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: null,
 			outcome: "integrated",
 			summary: "rebased",
@@ -20702,13 +21226,15 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.details).toBe("gates green");
 		// The done write never ran: the worktree stays.
 		expect(record.removeWorktree).toHaveLength(0);
-		expect(logText(store, task.id)).toContain("- PR #12 opened (base main)");
+		expect(await logText(store, task.id)).toContain(
+			"- PR #12 opened (base main)",
+		);
 	});
 
 	test("a user cancel during asynchronous PR open keeps its state and report", async () => {
 		const gate = Promise.withResolvers<void>();
 		const reached = Promise.withResolvers<void>();
-		const { store, record, loop, e, task } = prMergeSetup({
+		const { store, record, loop, e, task } = await prMergeSetup({
 			unsavedWork: async () => "M src/kept.ts",
 			statusFiles: async () => ["src/kept.ts", "notes.txt"],
 			openPr: async () => {
@@ -20723,11 +21249,11 @@ describe("turn PR-mode merge settle", () => {
 		const turn = loop.runTurn(store.name, task.id);
 		await reached.promise;
 		try {
-			expect(store.getTask(task.id)!.state).toBe("running");
+			expect((await store.getTask(task.id))!.state).toBe("running");
 			await expect(loop.cancel(e, task.id, false)).resolves.toEqual({
 				kept: "M src/kept.ts",
 			});
-			const cancelled = store.getTask(task.id)!;
+			const cancelled = (await store.getTask(task.id))!;
 			expect(cancelled.cancelledAt).toBe(null);
 			expect(cancelled.state).toBe("needs_you");
 			expect(cancelled.needsReason).toBe(
@@ -20738,7 +21264,7 @@ describe("turn PR-mode merge settle", () => {
 			gate.resolve();
 			await turn;
 		}
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.cancelledAt).toBe(null);
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
@@ -20747,7 +21273,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.summary).toBe("stale summary");
 		expect(after.details).toBe("stale details");
 		expect(after.worktree).toBe("wt-m");
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: "cancelled",
 			outcome: null,
 		});
@@ -20809,7 +21335,7 @@ describe("turn PR-mode merge settle", () => {
 						reached.resolve();
 						await gate.promise;
 					};
-					const { store, loop, task, e, record } = prMergeSetup({
+					const { store, loop, task, e, record } = await prMergeSetup({
 						prIntegrated: async () => {
 							await waitAt("integration proof");
 							return !(phase === "integration proof" && failed);
@@ -20884,7 +21410,7 @@ describe("turn PR-mode merge settle", () => {
 					});
 					e.target = "origin/main";
 					if (source)
-						store.updateTask(
+						await store.updateTask(
 							task.id,
 							sourcePr({
 								sourcePrDependabot: false,
@@ -20892,10 +21418,10 @@ describe("turn PR-mode merge settle", () => {
 							}),
 						);
 					if (legacy)
-						store.updateTask(task.id, {
+						await store.updateTask(task.id, {
 							prompt: `${dependabotHead(30, "acme/repo")}: Bump vite`,
 						});
-					const before = store.getTask(task.id)!;
+					const before = (await store.getTask(task.id))!;
 					// Source-PR cards re-read the PR head before the ship judges the
 					// branch (OTTR-809's stale-head fix), so a fetch effect precedes
 					// everything; a legacy card fetches twice (the resolve, then the
@@ -20923,7 +21449,7 @@ describe("turn PR-mode merge settle", () => {
 						expect(await loop.cancel(e, task.id, false)).toEqual(
 							kept ? { kept: unsaved } : { removed: true },
 						);
-						const cancelState = store.getTask(task.id)!;
+						const cancelState = (await store.getTask(task.id))!;
 						expect(cancelState.state).toBe(kept ? "needs_you" : "idle");
 						expect(cancelState.needsReason).toBe(
 							kept ? cancelKeptReason(unsaved) : null,
@@ -20940,7 +21466,7 @@ describe("turn PR-mode merge settle", () => {
 						await turn;
 						// The request at the gate may finish, but no later effect may start.
 						expect(effects).toEqual(expectedEffects);
-						const after = store.getTask(task.id)!;
+						const after = (await store.getTask(task.id))!;
 						expect(after).toMatchObject({
 							stage: cancelState.stage,
 							state: cancelState.state,
@@ -20957,7 +21483,7 @@ describe("turn PR-mode merge settle", () => {
 							sourcePrUrl: before.sourcePrUrl,
 							sourcePrHeadSha: before.sourcePrHeadSha,
 						});
-						const turns = store.listTurns(task.id);
+						const turns = await store.listTurns(task.id);
 						expect(turns).toHaveLength(1);
 						expect(turns[0]!.endedAt).not.toBeNull();
 						expect(turns[0]!.error).toBe("cancelled");
@@ -20973,7 +21499,7 @@ describe("turn PR-mode merge settle", () => {
 
 	test("a clean Dependabot bump adopts its PR: no second PR opens (OTTR-760)", async () => {
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "pr-head" : "sha-old",
 			pushBranch: async () => {
@@ -20984,10 +21510,10 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(null);
@@ -20998,7 +21524,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.pushSha).toBe(null);
 		// A card without fixes opens no follow-up PR.
 		expect(after.followUpPrNumber).toBe(null);
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: null,
 			outcome: "integrated",
 			summary: "rebased",
@@ -21006,14 +21532,14 @@ describe("turn PR-mode merge settle", () => {
 		});
 		expect(after.summary).toBe("rebased");
 		expect(after.details).toBe("gates green");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"- source PR #20 stays the card's PR",
 		);
 	});
 
 	test("a cherry-picked clean bump with the same tree adopts its PR too (OTTR-760)", async () => {
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-cherry" : "sha-old",
 			treesEqual: async (_m: string, a: string, b: string) =>
@@ -21023,10 +21549,10 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.prNumber).toBe(20);
 		expect(after.prHeadSha).toBe("pr-head");
 		expect(after.stage).toBe("merging");
@@ -21036,7 +21562,7 @@ describe("turn PR-mode merge settle", () => {
 	test("a legacy Dependabot card adopts its PR instead of opening a second one (OTTR-781)", async () => {
 		const fetches: unknown[][] = [];
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			// OTTR-781: the ship step fetches the legacy card's source PR head itself.
 			fetchPrHead: async (...args: unknown[]) => {
 				fetches.push(args);
@@ -21055,7 +21581,7 @@ describe("turn PR-mode merge settle", () => {
 			},
 		});
 		// A pre-OTTR-760 card: no source PR fields, only the prompt's first line.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
 		});
 		await loop.runTurn(store.name, task.id);
@@ -21066,13 +21592,13 @@ describe("turn PR-mode merge settle", () => {
 			[store.path, 30, "https://github.com/acme/repo.git"],
 			[store.path, 30, "https://github.com/acme/repo.git"],
 		]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.prNumber).toBe(30);
 		expect(after.prUrl).toBe("https://github.com/acme/repo/pull/30");
 		expect(after.prHeadSha).toBe("head30");
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"- source PR #30 stays the card's PR",
 		);
 	});
@@ -21080,7 +21606,7 @@ describe("turn PR-mode merge settle", () => {
 	test("a Dependabot head line for another repo does not adopt (OTTR-781)", async () => {
 		const fetches: unknown[][] = [];
 		const opens: unknown[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			fetchPrHead: async (...args: unknown[]) => {
 				fetches.push(args);
 				return "unreachable";
@@ -21093,31 +21619,31 @@ describe("turn PR-mode merge settle", () => {
 				};
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: `${dependabotHead(30, "other/repo")}: Bump x`,
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(fetches).toEqual([]);
 		expect(opens).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.prNumber).toBe(99);
 	});
 
 	test("a failed source-PR head fetch parks instead of opening a PR (OTTR-781)", async () => {
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			fetchPrHead: async () => "network down",
 			openPr: async () => {
 				opened = true;
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("Source PR #30 head fetch failed");
@@ -21127,7 +21653,7 @@ describe("turn PR-mode merge settle", () => {
 	test("fixes on a cross-repo source PR park with the PR named and never open a PR (OTTR-760)", async () => {
 		const comments: { repo: string; number: number; body: string }[] = [];
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			targetContains: async (_m: string, sha: string, tip: string) =>
@@ -21145,13 +21671,13 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const };
 			},
 		});
-		store.updateTask(
+		await store.updateTask(
 			task.id,
 			sourcePr({ sourcePrCrossRepo: true, sourcePrDependabot: false }),
 		);
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("source PR #20");
@@ -21175,7 +21701,7 @@ describe("turn PR-mode merge settle", () => {
 			base: string;
 		}[] = [];
 		const pushes: unknown[][] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			// Diverged: the branch cherry-picked the bump onto an advanced target, so
@@ -21198,9 +21724,9 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const };
 			},
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		// The follow-up bases on the target: the PR carries the rebased work, and
@@ -21230,7 +21756,7 @@ describe("turn PR-mode merge settle", () => {
 		const pushes: unknown[][] = [];
 		const opens: unknown[] = [];
 		const comments: unknown[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			targetContains: async (_m: string, sha: string, tip: string) =>
@@ -21252,7 +21778,7 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const };
 			},
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
 		expect(opens).toHaveLength(1);
 		expect(opens[0]).toMatchObject({
@@ -21272,7 +21798,7 @@ describe("turn PR-mode merge settle", () => {
 				body: expect.stringContaining("#33"),
 			},
 		]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(null);
@@ -21281,7 +21807,7 @@ describe("turn PR-mode merge settle", () => {
 		expect(after.prHeadSha).toBe("sha-fixed");
 		expect(after.followUpPrNumber).toBe(33);
 		expect(after.followUpPrUrl).toBe("https://github.com/acme/repo/pull/33");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"follow-up PR #33 opened (base dependabot/npm_and_yarn/vite-7.1.2)",
 		);
 	});
@@ -21289,7 +21815,7 @@ describe("turn PR-mode merge settle", () => {
 	test("a diverged legacy Dependabot card opens the follow-up on the target (OTTR-809)", async () => {
 		const comments: { repo: string; number: number; body: string }[] = [];
 		const opens: { repo: string; branch: string; base: string }[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			fetchPrHead: async () => null,
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/ottr/pr/30" ? "head30" : "sha-fixed",
@@ -21310,11 +21836,11 @@ describe("turn PR-mode merge settle", () => {
 			},
 		});
 		// A pre-OTTR-760 card: no source PR fields, only the prompt's first line.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		// The legacy path holds no head branch name, so the follow-up bases on the
@@ -21342,7 +21868,7 @@ describe("turn PR-mode merge settle", () => {
 
 	test("a legacy re-ship after a rebase refreshes the head and adopts the PR (OTTR-809)", async () => {
 		const fetches: unknown[][] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			fetchPrHead: async (...args: unknown[]) => {
 				fetches.push(args);
 				return null;
@@ -21366,7 +21892,7 @@ describe("turn PR-mode merge settle", () => {
 		});
 		// The card parked once (parkOnSourcePr stamped the row) and Dependabot rebased
 		// its branch since; a re-ship must judge the fresh head, not the stamped one.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
 			sourcePrNumber: 30,
 			sourcePrUrl: "https://github.com/acme/repo/pull/30",
@@ -21381,14 +21907,14 @@ describe("turn PR-mode merge settle", () => {
 		expect(fetches).toEqual([
 			[store.path, 30, "https://github.com/acme/repo.git"],
 		]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.prNumber).toBe(30);
 		expect(after.prHeadSha).toBe("fresh-head");
 		// The refreshed head replaces the dead one on the row for the next ship.
 		expect(after.sourcePrHeadSha).toBe("fresh-head");
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"- source PR #30 head refreshed to fresh-h",
 		);
 	});
@@ -21400,7 +21926,7 @@ describe("turn PR-mode merge settle", () => {
 		let fetchFails = false;
 		let branchTip = "sha-fixed";
 		const opens: unknown[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			fetchPrHead: async (...args: unknown[]) => {
 				fetches.push(args);
 				return fetchFails ? "network down" : null;
@@ -21425,7 +21951,7 @@ describe("turn PR-mode merge settle", () => {
 			},
 			prComment: async () => ({ ok: true as const }),
 		});
-		store.updateTask(
+		await store.updateTask(
 			task.id,
 			sourcePr({
 				sourcePrCrossRepo: true,
@@ -21434,9 +21960,9 @@ describe("turn PR-mode merge settle", () => {
 				sourcePrNumber: 20,
 			}),
 		);
-		store.updateTask(task.id, { sourcePrHeadSha: "stale-head" });
+		await store.updateTask(task.id, { sourcePrHeadSha: "stale-head" });
 		await loop.runTurn(store.name, task.id);
-		const parked = store.getTask(task.id)!;
+		const parked = (await store.getTask(task.id))!;
 		expect(parked.state).toBe("needs_you");
 		expect(parked.needsReason).toContain("Carry them onto the PR by hand.");
 		// The park keeps the refreshed sha; it does not restore the stale one.
@@ -21449,13 +21975,13 @@ describe("turn PR-mode merge settle", () => {
 		// head, and the ship adopts the PR instead of parking again.
 		fetchFails = true;
 		branchTip = "fresh-head";
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			state: "queued",
 			queuedAt: 2,
 			needsReason: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(fetches).toHaveLength(2);
 		expect(opens).toEqual([]);
 		expect(after.stage).toBe("merging");
@@ -21578,7 +22104,7 @@ describe("turn PR-mode merge settle", () => {
 				const opens: { repo: string; branch: string; base: string }[] = [];
 				const comments: { repo: string; number: number; body: string }[] = [];
 				const pushes: unknown[][] = [];
-				const { store, loop, task } = prMergeSetup({
+				const { store, loop, task } = await prMergeSetup({
 					targetSha: async (_m: string, ref: string) => {
 						const r = Bun.spawnSync(
 							["git", "rev-parse", "--verify", "--quiet", ref],
@@ -21612,8 +22138,8 @@ describe("turn PR-mode merge settle", () => {
 						return { ok: true as const };
 					},
 				});
-				store.setSettings({ prMode: true, originUrl: bare });
-				store.updateTask(task.id, {
+				await store.setSettings({ prMode: true, originUrl: bare });
+				await store.updateTask(task.id, {
 					// The card checkout the reads run in.
 					worktree: wt,
 					sourcePrNumber: 30,
@@ -21624,7 +22150,7 @@ describe("turn PR-mode merge settle", () => {
 					sourcePrDependabot: true,
 				});
 				await loop.runTurn(store.name, task.id);
-				const after = store.getTask(task.id)!;
+				const after = (await store.getTask(task.id))!;
 				expect(after.stage).toBe("merging");
 				expect(after.prNumber).toBe(30);
 				if (apply === "none" || apply.startsWith("cherry")) {
@@ -21637,7 +22163,7 @@ describe("turn PR-mode merge settle", () => {
 					expect(opens).toEqual([]);
 					expect(pushes).toEqual([]);
 					expect(comments).toEqual([]);
-					expect(logText(store, task.id)).toContain(
+					expect(await logText(store, task.id)).toContain(
 						"- source PR #30 stays the card's PR",
 					);
 				} else {
@@ -21659,7 +22185,7 @@ describe("turn PR-mode merge settle", () => {
 							body: expect.stringContaining("#33"),
 						},
 					]);
-					expect(logText(store, task.id)).toContain(
+					expect(await logText(store, task.id)).toContain(
 						"- follow-up PR #33 opened (base main)",
 					);
 				}
@@ -21675,7 +22201,7 @@ describe("turn PR-mode merge settle", () => {
 		// onto the target tip reproduces the card tree exactly: no fixes, no second
 		// PR. The card adopts and waits.
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/ottr/pr/20"
 					? "pr-head"
@@ -21703,10 +22229,10 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.prNumber).toBe(20);
@@ -21719,7 +22245,7 @@ describe("turn PR-mode merge settle", () => {
 		// bump onto the target produces a different tree (the fix changed it): the
 		// follow-up PR delivers the fix, based on the target.
 		const opens: { repo: string; branch: string; base: string }[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/ottr/pr/20"
 					? "pr-head"
@@ -21742,9 +22268,9 @@ describe("turn PR-mode merge settle", () => {
 			},
 			prComment: async () => ({ ok: true as const }),
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(opens).toHaveLength(1);
@@ -21760,7 +22286,7 @@ describe("turn PR-mode merge settle", () => {
 	test("fixes on a same-repo source PR push to its head branch, no new PR (OTTR-760)", async () => {
 		const pushes: unknown[][] = [];
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			targetContains: async (_m: string, sha: string, tip: string) =>
@@ -21775,7 +22301,7 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
 		});
-		store.updateTask(
+		await store.updateTask(
 			task.id,
 			sourcePr({
 				sourcePrDependabot: false,
@@ -21792,12 +22318,12 @@ describe("turn PR-mode merge settle", () => {
 				"contrib/fix-branch",
 			],
 		]);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.prNumber).toBe(20);
 		expect(after.prHeadSha).toBe("sha-fixed");
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: null,
 			outcome: "integrated",
 			summary: "rebased",
@@ -21809,7 +22335,7 @@ describe("turn PR-mode merge settle", () => {
 
 	test("a legacy Dependabot card with fixes bases the follow-up PR on the target", async () => {
 		const opens: { base: string }[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			// A pre-OTTR-760 card has no stored head branch name; the ship fetches the head.
 			fetchPrHead: async () => null,
 			targetSha: async (_m: string, ref: string) =>
@@ -21831,20 +22357,20 @@ describe("turn PR-mode merge settle", () => {
 			},
 			prComment: async () => ({ ok: true as const }),
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: `${dependabotHead(30, "acme/repo")}: Bump vite from 5 to 7`,
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(opens).toHaveLength(1);
 		expect(opens[0]!.base).toBe("main");
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.prNumber).toBe(30);
 		expect(after.followUpPrNumber).toBe(34);
 	});
 
 	test("a failed follow-up push parks and never opens the PR", async () => {
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			targetContains: async (_m: string, sha: string, tip: string) =>
@@ -21860,17 +22386,17 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const, pr: { number: 99, url: null } };
 			},
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("denied");
 		expect(after.followUpPrNumber).toBe(null);
 	});
 
 	test("a failed follow-up open parks with the gh error", async () => {
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			targetContains: async (_m: string, sha: string, tip: string) =>
@@ -21882,9 +22408,9 @@ describe("turn PR-mode merge settle", () => {
 				error: "HTTP 422: Validation Failed",
 			}),
 		});
-		store.updateTask(task.id, sourcePr());
+		await store.updateTask(task.id, sourcePr());
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(
 			"Opening the follow-up pull request failed",
@@ -21895,7 +22421,7 @@ describe("turn PR-mode merge settle", () => {
 	test("a cross-repo Dependabot PR still opens the follow-up PR", async () => {
 		const opens: unknown[] = [];
 		const comments: unknown[] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "sha-fixed" : "sha-old",
 			targetContains: async (_m: string, sha: string, tip: string) =>
@@ -21914,7 +22440,7 @@ describe("turn PR-mode merge settle", () => {
 				return { ok: true as const };
 			},
 		});
-		store.updateTask(task.id, sourcePr({ sourcePrCrossRepo: true }));
+		await store.updateTask(task.id, sourcePr({ sourcePrCrossRepo: true }));
 		await loop.runTurn(store.name, task.id);
 		expect(opens).toHaveLength(1);
 		expect(opens[0]).toMatchObject({
@@ -21922,14 +22448,14 @@ describe("turn PR-mode merge settle", () => {
 			base: "dependabot/npm_and_yarn/vite-7.1.2",
 		});
 		expect(comments).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		expect(after.followUpPrNumber).toBe(35);
 	});
 
 	test("a failed branch push parks merging/needs_you and never opens the PR", async () => {
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			pushBranch: async () => ({
 				status: "failed" as const,
 				error: "fatal: [REDACTED] denied",
@@ -21941,44 +22467,44 @@ describe("turn PR-mode merge settle", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("fatal: [REDACTED] denied");
 		expect(after.prNumber).toBe(null);
 		expect(opened).toBe(false);
-		expect(logText(store, task.id)).toContain("git's full push output");
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect(await logText(store, task.id)).toContain("git's full push output");
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: "Server push to origin failed: fatal: [REDACTED] denied",
 			outcome: "integrated",
 		});
 	});
 
 	test("a failed gh call parks merging/needs_you with the gh error", async () => {
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			openPr: async () => ({
 				ok: false as const,
 				error: "HTTP 422: Validation Failed",
 			}),
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("HTTP 422: Validation Failed");
 		expect(after.prNumber).toBe(null);
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: "Opening the pull request failed: HTTP 422: Validation Failed",
 			outcome: "integrated",
 		});
 	});
 
 	test("an unproven integration ships nothing and parks not-on-target", async () => {
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			prIntegrated: async () => false,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("not on origin/main");
@@ -21988,7 +22514,7 @@ describe("turn PR-mode merge settle", () => {
 	test("OTTR-799: a CI fix re-ships — the push updates the same PR, no second PR opens", async () => {
 		const pushes: unknown[][] = [];
 		let openPrCalls = 0;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			pushBranch: async (...args: unknown[]) => {
 				pushes.push(args);
 				return { status: "pushed" as const, output: "" };
@@ -22003,7 +22529,7 @@ describe("turn PR-mode merge settle", () => {
 		});
 		// The card as ciPrHeadReply requeued it: the open PR kept, the old head
 		// unpinned, a fix commit landed and reported integrated.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prNumber: 12,
 			prUrl: "https://github.com/acme/repo/pull/12",
 			prHeadSha: "sha-old",
@@ -22015,14 +22541,14 @@ describe("turn PR-mode merge settle", () => {
 		]);
 		// One adopt-or-create call: the same PR is adopted, never a second one.
 		expect(openPrCalls).toBe(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(null);
 		expect(after.prNumber).toBe(12);
 		expect(after.prHeadSha).toBe("sha-tip");
 		expect(after.pushSha).toBe("sha-tip");
-		expect(store.listTurns(task.id).at(-1)).toMatchObject({
+		expect((await store.listTurns(task.id)).at(-1)).toMatchObject({
 			error: null,
 			outcome: "integrated",
 			summary: "rebased",
@@ -22033,7 +22559,7 @@ describe("turn PR-mode merge settle", () => {
 	});
 
 	test("OTTR-799: after a closed PR the second ship opens a fresh PR and stores the new number", async () => {
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			openPr: async () => ({
 				ok: true as const,
 				pr: { number: 9, url: "https://github.com/acme/repo/pull/9" },
@@ -22041,14 +22567,14 @@ describe("turn PR-mode merge settle", () => {
 		});
 		// The card as settlePrCard parked it, then a reply ran the work and merge
 		// turns: the old PR #7 is closed, the card still carries its number.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prNumber: 7,
 			prUrl: "https://github.com/acme/repo/pull/7",
 			prHeadSha: "sha-old",
 			pushSha: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.prNumber).toBe(9);
@@ -22061,13 +22587,13 @@ describe("turn PR-mode merge settle", () => {
 		// The conflict park itself lands with OTTR-789's card; this proves the
 		// reply path (state queued, stage merging kept) re-ships.
 		const pushes: unknown[][] = [];
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			pushBranch: async (...args: unknown[]) => {
 				pushes.push(args);
 				return { status: "pushed" as const, output: "" };
 			},
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prNumber: 12,
 			prUrl: "https://github.com/acme/repo/pull/12",
 			prHeadSha: "sha-old",
@@ -22077,7 +22603,7 @@ describe("turn PR-mode merge settle", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(pushes).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(null);
@@ -22086,7 +22612,7 @@ describe("turn PR-mode merge settle", () => {
 
 	test("OTTR-799: a source-PR card's second ship never opens a second PR", async () => {
 		let opened = false;
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			openPr: async () => {
 				opened = true;
 				return { ok: true as const, pr: { number: 21, url: null } };
@@ -22094,7 +22620,7 @@ describe("turn PR-mode merge settle", () => {
 			targetSha: async (_m: string, ref: string) =>
 				ref === "refs/heads/ott/m" ? "pr-head" : "sha-old",
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			// A same-repo, non-Dependabot source PR already adopted as the card's PR.
 			...sourcePr({
 				sourcePrDependabot: false,
@@ -22106,7 +22632,7 @@ describe("turn PR-mode merge settle", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(opened).toBe(false);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.prNumber).toBe(20);
@@ -22144,9 +22670,9 @@ describe("turn PR-mode merge settle", () => {
 				const oldHead = run(main, "rev-parse", "HEAD");
 				const adoptCalls: string[][] = [];
 				let fixed = false;
-				const { store, record, loop, task, e, projects } = prMergeSetup({
+				const { store, record, loop, task, e, projects } = await prMergeSetup({
 					// Keep dispatch explicit: settle must not start the next turn.
-					maxTotalRuns: () => 0,
+					holdFollowUps: true,
 					pushBranch: pushBranchReal,
 					prIntegrated: realPrIntegrated,
 					targetSha: async (path, ref) => run(path, "rev-parse", ref),
@@ -22170,7 +22696,7 @@ describe("turn PR-mode merge settle", () => {
 								};
 							},
 						}),
-					startRun: (o) => {
+					startRun: async (o) => {
 						record.runs.push(o);
 						if (!fixed) {
 							writeFileSync(join(main, "fix.txt"), "fix");
@@ -22178,14 +22704,14 @@ describe("turn PR-mode merge settle", () => {
 							run(main, ...id, "commit", "-qm", "CI fix");
 							fixed = true;
 						}
-						o.onSession?.("sess-1");
+						await o.onSession?.("sess-1");
 						return {
 							pid: 4242,
 							done: Promise.resolve(
 								runResult({
 									outcome: {
 										status:
-											store.getTask(task.id)!.stage === "in_progress"
+											(await store.getTask(task.id))!.stage === "in_progress"
 												? "ready"
 												: "integrated",
 										summary: "CI fix",
@@ -22197,9 +22723,9 @@ describe("turn PR-mode merge settle", () => {
 					},
 				});
 				e.path = main;
-				store.setSettings({ originUrl: bare });
+				await store.setSettings({ originUrl: bare });
 				// Only the first ship is seeded. The next pin must come from settle.
-				store.updateTask(task.id, {
+				await store.updateTask(task.id, {
 					state: "idle",
 					worktree: main,
 					prNumber: 12,
@@ -22277,7 +22803,7 @@ describe("turn PR-mode merge settle", () => {
 					},
 				});
 				await supervisor.tick();
-				const cleared = store.getTask(task.id)!;
+				const cleared = (await store.getTask(task.id))!;
 				expect(cleared.pushSha).toBeNull();
 				expect(cleared.prNumber).toBe(12);
 				expect(cleared.prHeadSha).toBe(oldHead);
@@ -22305,13 +22831,16 @@ describe("turn PR-mode merge settle", () => {
 						: [["run", "view", "101", "--log-failed", "--repo", "acme/repo"]]),
 				]);
 				await supervisor.tick();
-				expect(store.getTask(task.id)).toEqual(cleared);
+				expect(await store.getTask(task.id)).toEqual(cleared);
 				expect(ciCalls).toEqual(firstCalls);
 				if (giveUp)
-					store.updateTask(task.id, replyPatch(cleared, "Ship the next fix"));
+					await store.updateTask(
+						task.id,
+						replyPatch(cleared, "Ship the next fix"),
+					);
 				else {
 					await loop.runTurn(store.name, task.id);
-					expect(store.getTask(task.id)).toMatchObject({
+					expect(await store.getTask(task.id)).toMatchObject({
 						stage: "merging",
 						state: "queued",
 						pushSha: null,
@@ -22326,7 +22855,7 @@ describe("turn PR-mode merge settle", () => {
 				expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
 					`${tip}\trefs/heads/ott/m`,
 				);
-				expect(store.getTask(task.id)).toMatchObject({
+				expect(await store.getTask(task.id)).toMatchObject({
 					stage: "merging",
 					state: "idle",
 					needsReason: null,
@@ -22349,7 +22878,7 @@ describe("turn PR-mode merge settle", () => {
 					html_url: "https://github.com/acme/repo/actions/runs/202",
 				};
 				await supervisor.tick();
-				const requeued = store.getTask(task.id)!;
+				const requeued = (await store.getTask(task.id))!;
 				expect(scheduled).toBe(initial === "failure" ? 2 : 1);
 				expect(requeued).toMatchObject({
 					stage: "in_progress",
@@ -22374,10 +22903,10 @@ describe("turn PR-mode merge settle", () => {
 				const replies = scheduled;
 				await supervisor.tick();
 				await supervisor.tick();
-				expect(store.getTask(task.id)).toEqual(requeued);
+				expect(await store.getTask(task.id)).toEqual(requeued);
 				expect(ciCalls).toEqual(callsAfterFailure);
 				expect(scheduled).toBe(replies);
-				expect(store.listTasks().map((t) => t.id)).toEqual([task.id]);
+				expect((await store.listTasks()).map((t) => t.id)).toEqual([task.id]);
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}
@@ -22385,20 +22914,20 @@ describe("turn PR-mode merge settle", () => {
 	);
 
 	test("OTTR-799: a PR merged mid-turn fails the ship closed into needs_you", async () => {
-		const { store, loop, task } = prMergeSetup({
+		const { store, loop, task } = await prMergeSetup({
 			openPr: async () => ({
 				ok: false as const,
 				// What GitHub answers when the merged PR left nothing to compare.
 				error: "HTTP 422: No commits between main and ott/m",
 			}),
 		});
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prNumber: 12,
 			prHeadSha: "sha-old",
 			pushSha: null,
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("HTTP 422");
@@ -22408,7 +22937,7 @@ describe("turn PR-mode merge settle", () => {
 
 	test("a needs_you report never ships even with a clean rebased tree", async () => {
 		const pushes: unknown[][] = [];
-		const { store, record, loop, task } = prMergeSetup({
+		const { store, record, loop, task } = await prMergeSetup({
 			pushBranch: async (...args: unknown[]) => {
 				pushes.push(args);
 				return { status: "pushed" as const, output: "" };
@@ -22416,9 +22945,12 @@ describe("turn PR-mode merge settle", () => {
 			openPr: async () => {
 				throw new Error("openPr must not run for a needs_you report");
 			},
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -22437,7 +22969,7 @@ describe("turn PR-mode merge settle", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(pushes).toHaveLength(0);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// classify parks the card with the agent's question; the ship step and
 		// its prNext override never ran.
 		expect(after.stage).toBe("merging");
@@ -22447,16 +22979,19 @@ describe("turn PR-mode merge settle", () => {
 	});
 
 	test("a merge turn without a receipt parks instead of landing or shipping", async () => {
-		const { store, record, loop, task } = prMergeSetup({
+		const { store, record, loop, task } = await prMergeSetup({
 			pushBranch: async () => {
 				throw new Error("pushBranch must not run without a receipt");
 			},
 			openPr: async () => {
 				throw new Error("openPr must not run without a receipt");
 			},
-			startRun: (o: { prompt: string; onSession?: (sid: string) => void }) => {
+			startRun: async (o: {
+				prompt: string;
+				onSession?: (sid: string) => void;
+			}) => {
 				record.runs.push(o as never);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				return {
 					pid: 4242,
 					done: Promise.resolve(runResult({})),
@@ -22465,7 +23000,7 @@ describe("turn PR-mode merge settle", () => {
 			},
 		});
 		await loop.runTurn(store.name, task.id);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("without calling report_outcome");
@@ -22474,7 +23009,7 @@ describe("turn PR-mode merge settle", () => {
 
 	test("a PR-mode project schedules its queued merge even with main unpushed", async () => {
 		const record = baseRecord();
-		const s = setupWith(record, {
+		const s = await setupWith(record, {
 			prIntegrated: async () => true,
 			pushBranch: async () => ({ status: "pushed" as const, output: "" }),
 			openPr: async () => ({
@@ -22485,15 +23020,15 @@ describe("turn PR-mode merge settle", () => {
 		const e = s.projects.get(s.store.name)!;
 		e.github = "https://github.com/acme/repo.git";
 		e.mainUnpushed = true;
-		s.store.setSettings({ prMode: true });
-		const task = s.store.createTask("merge please");
-		s.store.updateTask(task.id, {
+		await s.store.setSettings({ prMode: true });
+		const task = await s.store.createTask("merge please");
+		await s.store.updateTask(task.id, {
 			stage: "merging",
 			state: "queued",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
-		s.loop.schedule();
+		await s.loop.schedule();
 		await flushPromises();
 		expect(record.runs).toHaveLength(1);
 		expect(record.runs[0]!.prompt).toContain("opens the pull request");
@@ -22514,9 +23049,9 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 	 * worker dispatch's (the settle log reads its hostname). */
 	const oomRun =
 		(record: Recorded, result: RunResult) =>
-		(o: Parameters<TurnOps["startRun"]>[0]) => {
+		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
-			o.onSession?.("sess");
+			await o.onSession?.("sess");
 			return {
 				pid: null,
 				...(o.worker ? { url: o.worker.urls[0]! } : {}),
@@ -22531,7 +23066,7 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 		inFlight: (state: string, stage: string) => boolean,
 	) => {
 		for (let i = 0; i < 100; i++) {
-			const t = store.getTask(id)!;
+			const t = (await store.getTask(id))!;
 			if (!inFlight(t.state, t.stage)) return;
 			await flushPromises();
 		}
@@ -22539,16 +23074,16 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 
 	test("a worker OOM death queues the card once and logs the cause with the worker name", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			// Cap 0: the settle's own schedule() starts no follow-up turn behind the test.
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 			workerTarget: { urls: ["http://worker-b:8787"] },
 			startRun: oomRun(record, oomResult()),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(card.state).toBe("queued");
 		expect(card.pendingPrompt).toBe(".");
 		expect(card.needsReason).toStartWith(
@@ -22556,18 +23091,18 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 		);
 		expect(card.needsReason).toContain("continuing automatically");
 		// The card log names the cause and the worker, not just "omp exited with code unknown".
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`${card.needsReason} (worker worker-b)`,
 		);
 	});
 
 	test("a second OOM death parks the card for a human", async () => {
 		const record = baseRecord();
-		const { store, loop } = setupWith(record, {
+		const { store, loop } = await setupWith(record, {
 			workerTarget: { urls: ["http://worker-b:8787"] },
 			startRun: oomRun(record, oomResult()),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		// The first settle queued a continue: the loop's schedule() starts it, it dies the
 		// same way, and the streak rule parks for a human.
@@ -22581,7 +23116,7 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 		);
 
 		expect(record.runs).toHaveLength(2);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toStartWith(
 			"The worker ran out of memory (OOM kill, limit 8 GiB)",
@@ -22589,13 +23124,13 @@ describe("worker OOM kill: one automatic continue, then a park", () => {
 		expect(after.needsReason).toContain("again after the automatic continue");
 		expect(after.pendingPrompt).toBeNull();
 		// The turn row carries the reason, so the next classify sees the streak.
-		const rows = store.listTurns(task.id);
+		const rows = await store.listTurns(task.id);
 		expect(rows).toHaveLength(2);
 		expect(rows[0]!.error).toBe(
 			"The worker ran out of memory (OOM kill, limit 8 GiB) - continuing automatically. Cancel to stop it instead.",
 		);
 		// Both settles logged the cause with the worker name.
-		expect(logText(store, task.id)).toContain("worker worker-b");
+		expect(await logText(store, task.id)).toContain("worker worker-b");
 	});
 });
 
@@ -22611,7 +23146,7 @@ describe("microVM dispatch (OTTR-532)", () => {
 	type RunOpts = Parameters<TurnOps["startRun"]>[0];
 
 	/** A microVM project whose fake vm-runner answers with `answer` (mutable per test). */
-	function vmSetup(overrides: Partial<TurnOps> = {}, microVm = true) {
+	async function vmSetup(overrides: FixtureOps = {}, microVm = true) {
 		vmState.health = { configured: true, ok: true, reason: null };
 		const calls: RunOpts[] = [];
 		const envModels: (string | null)[] = [];
@@ -22623,9 +23158,9 @@ describe("microVM dispatch (OTTR-532)", () => {
 				outcome: { status: "answered", summary: "done" },
 			}),
 		};
-		const s = setup({
+		const s = await setup({
 			// Cap 0: the settle's own schedule() starts no follow-up turn behind the test.
-			maxTotalRuns: () => 0,
+			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			workerTarget: { urls: ["http://worker-a:8787"], token: "tok" },
 			vmTarget: { urls: [VM_URL], token: "tok" },
@@ -22637,9 +23172,9 @@ describe("microVM dispatch (OTTR-532)", () => {
 				envModels.push(model);
 				return { env: {}, missing: [] };
 			},
-			startRun: (o: RunOpts) => {
+			startRun: async (o: RunOpts) => {
 				calls.push(o);
-				if (answer.accepted) o.onSession?.("sess-1");
+				if (answer.accepted) await o.onSession?.("sess-1");
 				const target = o.vm?.target ?? o.worker ?? null;
 				return {
 					pid: target === null ? 4242 : null,
@@ -22651,18 +23186,18 @@ describe("microVM dispatch (OTTR-532)", () => {
 			},
 			...overrides,
 		});
-		s.store.setSettings({ microVm });
+		await s.store.setSettings({ microVm });
 		return { ...s, calls, envModels, synced, tokens, answer };
 	}
 
 	test("an eligible work turn goes to vm-runner only, lent nothing", async () => {
-		const { store, loop, calls, envModels } = vmSetup();
-		const task = store.createTask("queued work");
+		const { store, loop, calls, envModels } = await vmSetup();
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]!.vm?.target.urls).toEqual([VM_URL]);
 		expect(calls[0]!.worker ?? null).toBeNull();
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(calls[0]!.vm?.grant).toEqual({
 			project: store.name,
 			taskId: task.id,
@@ -22676,8 +23211,8 @@ describe("microVM dispatch (OTTR-532)", () => {
 	});
 
 	test("microVM mode off keeps the classic worker pool", async () => {
-		const { store, loop, calls, envModels } = vmSetup({}, false);
-		const task = store.createTask("queued work");
+		const { store, loop, calls, envModels } = await vmSetup({}, false);
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]!.vm ?? null).toBeNull();
@@ -22686,12 +23221,12 @@ describe("microVM dispatch (OTTR-532)", () => {
 	});
 
 	test("a merge turn of a microVM project stays on the server", async () => {
-		const { store, loop, calls } = vmSetup({
+		const { store, loop, calls } = await vmSetup({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 		});
-		const merge = store.createTask("merge please");
-		store.updateTask(merge.id, {
+		const merge = await store.createTask("merge please");
+		await store.updateTask(merge.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -22703,9 +23238,9 @@ describe("microVM dispatch (OTTR-532)", () => {
 	});
 
 	test("a grill turn (main checkout) of a microVM project keeps the classic pool", async () => {
-		const { store, loop, calls } = vmSetup();
-		const idea = store.createTask("an idea");
-		store.updateTask(idea.id, { stage: "backlog" });
+		const { store, loop, calls } = await vmSetup();
+		const idea = await store.createTask("an idea");
+		await store.updateTask(idea.id, { stage: "backlog" });
 		await loop.runTurn(store.name, idea.id);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]!.vm ?? null).toBeNull();
@@ -22714,35 +23249,35 @@ describe("microVM dispatch (OTTR-532)", () => {
 	});
 
 	test("a runner that is down leaves the card queued and unclaimed, with no fallback", async () => {
-		const { store, loop, calls } = vmSetup();
+		const { store, loop, calls } = await vmSetup();
 		vmState.health = {
 			configured: true,
 			ok: false,
 			reason: "connection refused",
 		};
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toHaveLength(0);
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(card.state).toBe("queued");
 		expect(card.worktree).toBeNull();
-		expect(store.listTurns(task.id)).toHaveLength(0);
+		expect(await store.listTurns(task.id)).toHaveLength(0);
 	});
 
 	test("a drained vm-runner defers the turn while the classic pool stays untouched", async () => {
-		const { store, loop, calls } = vmSetup({
+		const { store, loop, calls } = await vmSetup({
 			drainedRunner: (id) => id === "vm-runner",
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toHaveLength(0);
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 	});
 
 	test("busy requeues the card as it was, outside the lost streak; the next dispatch clears the mark", async () => {
-		const { store, loop, calls, answer } = vmSetup();
-		const task = store.createTask("queued work");
-		store.updateTask(task.id, {
+		const { store, loop, calls, answer } = await vmSetup();
+		const task = await store.createTask("queued work");
+		await store.updateTask(task.id, {
 			pendingPrompt: "also fix the docs",
 			pendingBy: "user",
 		});
@@ -22755,19 +23290,19 @@ describe("microVM dispatch (OTTR-532)", () => {
 		const key = `${store.name}/${task.id}`;
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toHaveLength(1);
-		let card = store.getTask(task.id)!;
+		let card = (await store.getTask(task.id))!;
 		expect(card.state).toBe("queued");
 		expect(card.needsReason).toBeNull();
 		expect(card.pendingPrompt).toBe("also fix the docs");
 		expect(card.pendingBy).toBe("user");
 		// Nothing ran: no turn row, so no lost-worker streak can count it.
-		expect(store.listTurns(task.id)).toHaveLength(0);
+		expect(await store.listTurns(task.id)).toHaveLength(0);
 		expect(vmState.busy.has(key)).toBe(true);
 
 		// Inside the backoff the card is not even claimed.
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toHaveLength(1);
-		expect(store.getTask(task.id)!.state).toBe("queued");
+		expect((await store.getTask(task.id))!.state).toBe("queued");
 
 		setSystemTime(new Date(Date.now() + VM_BUSY_RETRY_MS + 1));
 		answer.accepted = true;
@@ -22778,13 +23313,15 @@ describe("microVM dispatch (OTTR-532)", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls[1]!.vm?.target.urls).toEqual([VM_URL]);
 		expect(vmState.busy.has(key)).toBe(false);
-		card = store.getTask(task.id)!;
-		expect(store.listTurns(task.id)).toHaveLength(1);
-		expect(store.listTurns(task.id)[0]!.input).toBe("also fix the docs");
+		card = (await store.getTask(task.id))!;
+		expect(await store.listTurns(task.id)).toHaveLength(1);
+		expect((await store.listTurns(task.id))[0]!.input).toBe(
+			"also fix the docs",
+		);
 	});
 
 	test("a dirty VM tree refuses ready and names its files, whatever the server worktree says", async () => {
-		const { store, loop, answer, synced } = vmSetup({
+		const { store, loop, answer, synced } = await vmSetup({
 			commitsAhead: async () => 1,
 			// The server worktree looks clean; only the VM's report may decide.
 			isClean: async () => true,
@@ -22803,9 +23340,9 @@ describe("microVM dispatch (OTTR-532)", () => {
 				dirty: [" M src/a.ts", "?? notes.txt"],
 			},
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(card.state).toBe("needs_you");
 		expect(card.needsReason).toContain("M src/a.ts");
 		expect(card.needsReason).toContain("?? notes.txt");
@@ -22813,7 +23350,7 @@ describe("microVM dispatch (OTTR-532)", () => {
 	});
 
 	test("a clean VM outcome syncs the worktree to the branch tip and goes to merging", async () => {
-		const { store, loop, answer, synced } = vmSetup({
+		const { store, loop, answer, synced } = await vmSetup({
 			commitsAhead: async () => 1,
 			// A stale server tree must not block a VM whose own tree was clean.
 			isClean: async () => false,
@@ -22828,16 +23365,16 @@ describe("microVM dispatch (OTTR-532)", () => {
 			outcome: { status: "ready", summary: "done" },
 			vm: { head: "c".repeat(40), pushError: null, dirty: [] },
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(synced).toEqual([[card.worktree!, "c".repeat(40)]]);
 		expect(card.stage).toBe("merging");
 		expect(card.state).toBe("queued");
 	});
 
 	test("a VM that never pushed leaves a worktree already at the branch tip alone", async () => {
-		const { store, loop, answer, synced } = vmSetup({
+		const { store, loop, answer, synced } = await vmSetup({
 			targetSha: async (_path: string, ref: string) =>
 				ref.startsWith("refs/heads/") || ref === "HEAD" ? "a".repeat(40) : null,
 		});
@@ -22845,10 +23382,10 @@ describe("microVM dispatch (OTTR-532)", () => {
 			outcome: { status: "answered", summary: "done" },
 			vm: { head: null, pushError: "auth failed", dirty: [] },
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(synced).toEqual([]);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"microVM push failed: auth failed",
 		);
 	});
@@ -22856,7 +23393,7 @@ describe("microVM dispatch (OTTR-532)", () => {
 	test("a VM claiming a foreign head syncs to the real branch tip and logs the mismatch", async () => {
 		const tip = "d".repeat(40);
 		const foreign = "e".repeat(40);
-		const { store, loop, answer, synced } = vmSetup({
+		const { store, loop, answer, synced } = await vmSetup({
 			targetSha: async (path: string, ref: string) =>
 				path === store.path && ref.startsWith("refs/heads/")
 					? tip
@@ -22868,39 +23405,39 @@ describe("microVM dispatch (OTTR-532)", () => {
 			outcome: { status: "answered", summary: "done" },
 			vm: { head: foreign, pushError: null, dirty: [] },
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(synced).toEqual([[card.worktree!, tip]]);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			`! microVM: reported head ${foreign} is not the branch tip ${tip}`,
 		);
 	});
 
 	test("a VM whose branch does not resolve leaves the worktree unsynced and says so", async () => {
-		const { store, loop, answer, synced } = vmSetup();
+		const { store, loop, answer, synced } = await vmSetup();
 		answer.result = runResult({
 			outcome: { status: "answered", summary: "done" },
 			vm: { head: "f".repeat(40), pushError: null, dirty: [] },
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
 		expect(synced).toEqual([]);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"does not resolve; the worktree is not synced",
 		);
 	});
 
 	test("a lost VM settles as a lost worker", async () => {
-		const { store, loop, answer } = vmSetup();
+		const { store, loop, answer } = await vmSetup();
 		answer.result = runResult({
 			exitCode: null,
 			workerLost: true,
 			stderrTail: "worker connection lost",
 		});
-		const task = store.createTask("queued work");
+		const task = await store.createTask("queued work");
 		await loop.runTurn(store.name, task.id);
-		const card = store.getTask(task.id)!;
+		const card = (await store.getTask(task.id))!;
 		expect(card.state).toBe("queued");
 		expect(card.needsReason).toContain(WORKER_LOST);
 		expect(card.pendingPrompt).toBe(".");
@@ -22908,16 +23445,16 @@ describe("microVM dispatch (OTTR-532)", () => {
 
 	describe("token revoke at the restart settle", () => {
 		const WT = "/srv/wt-vm";
-		function seeded(store: ProjectStore) {
-			const task = store.createTask("work please");
-			store.updateTask(task.id, {
+		async function seeded(store: ProjectStore) {
+			const task = await store.createTask("work please");
+			await store.updateTask(task.id, {
 				state: "running",
 				stage: "in_progress",
 				sessionId: "sess-9",
 				worktree: WT,
 				branch: "ott/x",
 			});
-			store.startTurn(task.id, "work", "old prompt", null);
+			await store.startTurn(task.id, "work", "old prompt", null);
 			return task;
 		}
 		const grantFor = (store: ProjectStore, id: string) => ({
@@ -22929,17 +23466,17 @@ describe("microVM dispatch (OTTR-532)", () => {
 		});
 
 		test("a still-running detached VM turn keeps its token across the restart", async () => {
-			const { store, loop, tokens } = vmSetup({
+			const { store, loop, tokens } = await vmSetup({
 				workerTarget: null,
 				detachedRuns: async (url) =>
 					url === VM_URL
 						? [{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 }]
 						: [],
 			});
-			const task = seeded(store);
+			const task = await seeded(store);
 			const raw = tokens.issue(grantFor(store, task.id));
 			await loop.recoverRestarted();
-			expect(store.getTask(task.id)!.state).toBe("running");
+			expect((await store.getTask(task.id))!.state).toBe("running");
 			expect(tokens.check(raw)).not.toBeNull();
 		});
 
@@ -22954,22 +23491,22 @@ describe("microVM dispatch (OTTR-532)", () => {
 					result: { exitCode: 0, stderrTail: "" },
 				},
 			];
-			const { store, loop, tokens } = vmSetup({
+			const { store, loop, tokens } = await vmSetup({
 				workerTarget: null,
 				targetSha: async () => "abc123def",
 				detachedRuns: async (url) => (url === VM_URL ? runs : []),
 			});
-			const task = seeded(store);
+			const task = await seeded(store);
 			const raw = tokens.issue(grantFor(store, task.id));
 			await loop.recoverRestarted();
-			expect(store.getTask(task.id)!.state).toBe("queued");
+			expect((await store.getTask(task.id))!.state).toBe("queued");
 			expect(tokens.check(raw)).toBeNull();
 		});
 	});
 });
 
 describe("writeVmFiles", () => {
-	test("writes the report and shots/ into the worktree; refuses every other path", () => {
+	test("writes the report and shots/ into the worktree; refuses every other path", async () => {
 		const wt = mkdtempSync(join(tmpdir(), "ottr-vmfiles-"));
 		const outside = mkdtempSync(join(tmpdir(), "ottr-vmfiles-out-"));
 		mkdirSync(join(wt, "src"));
@@ -22977,7 +23514,7 @@ describe("writeVmFiles", () => {
 		symlinkSync(outside, join(wt, "shots", "link"));
 		const b64 = (s: string) => Buffer.from(s).toString("base64");
 		const logs: string[] = [];
-		writeVmFiles(
+		await writeVmFiles(
 			wt,
 			[
 				{ path: "research-report.md", b64: b64("# Report\n") },
@@ -22988,7 +23525,9 @@ describe("writeVmFiles", () => {
 				{ path: "shots/../src/y.ts", b64: b64("x") },
 				{ path: "shots/link/evil.png", b64: b64("x") },
 			],
-			(l) => logs.push(l),
+			(l) => {
+				logs.push(l);
+			},
 		);
 		expect(readFileSync(join(wt, "research-report.md"), "utf8")).toBe(
 			"# Report\n",
@@ -23013,20 +23552,20 @@ describe("turn checkout guard (other projects)", () => {
 	type Snap = { head: string | null; status: string };
 
 	/** Two-project loop whose checkoutState fake reads a mutable per-path state map. */
-	function twoProjectCase(
-		overrides: Partial<TurnOps> = {},
+	async function twoProjectCase(
+		overrides: FixtureOps = {},
 		extra: TurnProject[] = [],
 	) {
 		const record = baseRecord();
-		const store = freshStore();
-		const other = freshStore();
+		const store = await freshStore();
+		const other = await freshStore();
 		const states = new Map<string, Snap>();
 		const projects = new Map<string, TurnProject>([
 			[store.name, fakeProject(store)],
 			[other.name, fakeProject(other)],
 			...extra.map((p) => [p.name, p] as const),
 		]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				checkoutState: async (path: string) =>
@@ -23040,10 +23579,10 @@ describe("turn checkout guard (other projects)", () => {
 	/** startRun override that changes the other checkout mid-run, then answers. */
 	function changingRun(record: Recorded, change: () => void): Partial<TurnOps> {
 		return {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				change();
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				const isFirstRun = record.runs.length === 1;
 				return {
 					pid: 4242,
@@ -23075,7 +23614,7 @@ describe("turn checkout guard (other projects)", () => {
 
 	test("a work turn whose other project gains a commit and a dirty file parks needs_you", async () => {
 		const record = baseRecord();
-		const { store, other, states, loop } = twoProjectCase({
+		const { store, other, states, loop } = await twoProjectCase({
 			commitMeta: async () => [
 				{
 					sha: "abc1234",
@@ -23091,11 +23630,11 @@ describe("turn checkout guard (other projects)", () => {
 				});
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(other.name);
 		expect(after.needsReason).toContain("abc1234 add widget");
@@ -23107,14 +23646,14 @@ describe("turn checkout guard (other projects)", () => {
 		// Filing a card in the other project goes through the board API: no git change,
 		// so the snapshots read identical and the guard stays silent.
 		const record = baseRecord();
-		const { store, loop } = twoProjectCase(changingRun(record, () => {}));
-		const task = store.createTask("work please");
+		const { store, loop } = await twoProjectCase(changingRun(record, () => {}));
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 		// The chained merge turn settles asynchronously; drain it before reading the row.
 		await flushPromises();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The settled end state (not merely "no needs_you"): the work turn settles to
 		// merging/queued, the chained merge turn lands it, done/idle.
 		expect(after.stage).toBe("done");
@@ -23138,16 +23677,16 @@ describe("turn checkout guard (other projects)", () => {
 			),
 			kill: async () => {},
 		});
-		const { store, other, record, states, loop } = twoProjectCase({
+		const { store, other, record, states, loop } = await twoProjectCase({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			serverMergePush: async () => ({
 				status: "pushed" as const,
 				output: "",
 			}),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				if (!workRun) return integrated();
 				states.set(other.path, { head: "merged9", status: "" });
 				return {
@@ -23169,8 +23708,8 @@ describe("turn checkout guard (other projects)", () => {
 		// The other project's merge turn lands first: its settle push records the head the
 		// board itself moved the main checkout to.
 		states.set(other.path, { head: "merged9", status: "" });
-		const mergeTask = other.createTask("merge please");
-		other.updateTask(mergeTask.id, {
+		const mergeTask = await other.createTask("merge please");
+		await other.updateTask(mergeTask.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -23182,10 +23721,10 @@ describe("turn checkout guard (other projects)", () => {
 		// again. The recorded board push discounts the advance.
 		states.delete(other.path);
 		workRun = true;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
@@ -23207,16 +23746,16 @@ describe("turn checkout guard (other projects)", () => {
 			),
 			kill: async () => {},
 		});
-		const { store, other, record, states, loop } = twoProjectCase({
+		const { store, other, record, states, loop } = await twoProjectCase({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			serverMergePush: async () => ({
 				status: "failed" as const,
 				error: "auth failed",
 			}),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				if (!workRun) return integrated();
 				states.set(other.path, { head: "failed9", status: "" });
 				return {
@@ -23236,8 +23775,8 @@ describe("turn checkout guard (other projects)", () => {
 			},
 		});
 		states.set(other.path, { head: "failed9", status: "" });
-		const mergeTask = other.createTask("merge please");
-		other.updateTask(mergeTask.id, {
+		const mergeTask = await other.createTask("merge please");
+		await other.updateTask(mergeTask.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -23249,10 +23788,10 @@ describe("turn checkout guard (other projects)", () => {
 		// failed push's recording still discounts it.
 		states.delete(other.path);
 		workRun = true;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
@@ -23261,23 +23800,23 @@ describe("turn checkout guard (other projects)", () => {
 		// While the other project's own merge turn runs, its agent fast-forwards its main
 		// checkout legitimately; the guard skips the project until that turn is over.
 		const record = baseRecord();
-		const { store, other, states, loop } = twoProjectCase({
+		const { store, other, states, loop } = await twoProjectCase({
 			...changingRun(record, () => {
 				states.set(other.path, { head: "midmerge", status: "" });
 			}),
 		});
-		const mergeTask = other.createTask("merge please");
-		other.updateTask(mergeTask.id, {
+		const mergeTask = await other.createTask("merge please");
+		await other.updateTask(mergeTask.id, {
 			stage: "merging",
 			state: "running",
 			worktree: "wt-m",
 			branch: "ott/m",
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 		await flushPromises();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
@@ -23300,16 +23839,16 @@ describe("turn checkout guard (other projects)", () => {
 			),
 			kill: async () => {},
 		});
-		const { store, other, record, states, loop } = twoProjectCase({
+		const { store, other, record, states, loop } = await twoProjectCase({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			serverMergePush: async () => ({
 				status: "pushed" as const,
 				output: "",
 			}),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				if (!workRun) return integrated();
 				states.set(other.path, { head: "refused9", status: "" });
 				return {
@@ -23331,14 +23870,14 @@ describe("turn checkout guard (other projects)", () => {
 		// The merge agent's fast-forward result, plus a parked held merge whose holdHead
 		// pins the branch tip the settle reads.
 		states.set(other.path, { head: "refused9", status: "" });
-		const parked = other.createTask("held please");
-		other.updateTask(parked.id, {
+		const parked = await other.createTask("held please");
+		await other.updateTask(parked.id, {
 			state: "needs_you",
 			holdHead: "sha-pushed",
 			needsReason: MERGE_HOLD_MISMATCH_REASON,
 		});
-		const mergeTask = other.createTask("merge please");
-		other.updateTask(mergeTask.id, {
+		const mergeTask = await other.createTask("merge please");
+		await other.updateTask(mergeTask.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -23346,15 +23885,15 @@ describe("turn checkout guard (other projects)", () => {
 		await loop.runTurn(other.name, mergeTask.id);
 		await flushPromises();
 		// The refusal path ran: the merge card parked on the held merge, not on a push.
-		const mergeAfter = other.getTask(mergeTask.id)!;
+		const mergeAfter = (await other.getTask(mergeTask.id))!;
 		expect(mergeAfter.needsReason).toContain("parks a held merge");
 
 		states.delete(other.path);
 		workRun = true;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
@@ -23377,7 +23916,7 @@ describe("turn checkout guard (other projects)", () => {
 			),
 			kill: async () => {},
 		});
-		const { store, other, record, states, loop } = twoProjectCase({
+		const { store, other, record, states, loop } = await twoProjectCase({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			mergeHoldMismatch: async () => ({
@@ -23391,9 +23930,9 @@ describe("turn checkout guard (other projects)", () => {
 				states.set(other.path, { head: "audited9", status: "" });
 				return true;
 			},
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				if (!workRun) return integrated();
 				states.set(other.path, { head: "audited9", status: "" });
 				return {
@@ -23415,8 +23954,8 @@ describe("turn checkout guard (other projects)", () => {
 		// The merge agent's fast-forward left the main checkout at its own head before
 		// the settle judged it against the approved head.
 		states.set(other.path, { head: "mismatch9", status: "" });
-		const mergeTask = other.createTask("merge please");
-		other.updateTask(mergeTask.id, {
+		const mergeTask = await other.createTask("merge please");
+		await other.updateTask(mergeTask.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -23425,16 +23964,16 @@ describe("turn checkout guard (other projects)", () => {
 		await loop.runTurn(other.name, mergeTask.id);
 		await flushPromises();
 		// The mismatch park ran and the reset moved the head to the audited tip.
-		const mergeAfter = other.getTask(mergeTask.id)!;
+		const mergeAfter = (await other.getTask(mergeTask.id))!;
 		expect(mergeAfter.needsReason).toBe(MERGE_HOLD_MISMATCH_REASON);
 		expect(mergeAfter.holdHead).toBe("sha-pushed");
 
 		states.delete(other.path);
 		workRun = true;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
@@ -23456,15 +23995,15 @@ describe("turn checkout guard (other projects)", () => {
 			),
 			kill: async () => {},
 		});
-		const { store, other, record, states, loop } = twoProjectCase({
+		const { store, other, record, states, loop } = await twoProjectCase({
 			isIntegrated: async () => true,
 			targetSha: async () => "sha-pushed",
 			serverMergePush: async () => {
 				throw new Error("remote hung up");
 			},
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				if (!workRun) return integrated();
 				states.set(other.path, { head: "threw9", status: "" });
 				return {
@@ -23484,8 +24023,8 @@ describe("turn checkout guard (other projects)", () => {
 			},
 		});
 		states.set(other.path, { head: "threw9", status: "" });
-		const mergeTask = other.createTask("merge please");
-		other.updateTask(mergeTask.id, {
+		const mergeTask = await other.createTask("merge please");
+		await other.updateTask(mergeTask.id, {
 			stage: "merging",
 			worktree: "wt-m",
 			branch: "ott/m",
@@ -23495,35 +24034,35 @@ describe("turn checkout guard (other projects)", () => {
 
 		states.delete(other.path);
 		workRun = true;
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
 
 	test("an unrecorded HEAD advance with a clean tree parks needs_you", async () => {
 		const record = baseRecord();
-		const { store, other, states, loop } = twoProjectCase(
+		const { store, other, states, loop } = await twoProjectCase(
 			changingRun(record, () => {
 				states.set(other.path, { head: "stealth9", status: "" });
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(other.name);
 		expect(after.needsReason).toContain("moved to stealth");
 	});
 
 	test("own-project changes and gitless projects are skipped", async () => {
-		const gitlessStore = freshStore();
+		const gitlessStore = await freshStore();
 		const record = baseRecord();
-		const { store, states, loop } = twoProjectCase(
+		const { store, states, loop } = await twoProjectCase(
 			changingRun(record, () => {
 				// The card's own project and the gitless project both change mid-run;
 				// the guard must stay silent for both.
@@ -23535,11 +24074,11 @@ describe("turn checkout guard (other projects)", () => {
 			}),
 			[{ ...fakeProject(gitlessStore), gitless: true }],
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).not.toBe("needs_you");
 		expect(after.needsReason).toBeNull();
 	});
@@ -23555,20 +24094,20 @@ describe("turn checkout guard (other projects)", () => {
 	 * changes the watched checkout), and `shared` (the watched checkout both guards
 	 * read, like agent-data on the real board). Pass `record` when the overrides need
 	 * the same Recorded the loop's fakes write to. */
-	function threeProjectCase(
-		overrides: Partial<TurnOps> = {},
+	async function threeProjectCase(
+		overrides: FixtureOps = {},
 		record: Recorded = baseRecord(),
 	) {
-		const store = freshStore();
-		const guilty = freshStore();
-		const shared = freshStore();
+		const store = await freshStore();
+		const guilty = await freshStore();
+		const shared = await freshStore();
 		const states = new Map<string, Snap>();
 		const projects = new Map<string, TurnProject>([
 			[store.name, fakeProject(store)],
 			[guilty.name, fakeProject(guilty)],
 			[shared.name, fakeProject(shared)],
 		]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				checkoutState: async (path: string) =>
@@ -23591,9 +24130,9 @@ describe("turn checkout guard (other projects)", () => {
 		const bothIn = Promise.withResolvers<void>();
 		const changed = Promise.withResolvers<void>();
 		return {
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
-				o.onSession?.("sess-1");
+				await o.onSession?.("sess-1");
 				const key = o.board?.project ?? o.cwd;
 				if (seen.has(key)) {
 					return {
@@ -23655,7 +24194,7 @@ describe("turn checkout guard (other projects)", () => {
 		// the change.
 		const changeTime = { t: 0 };
 		const record = baseRecord();
-		const { store, guilty, shared, states, loop } = threeProjectCase(
+		const { store, guilty, shared, states, loop } = await threeProjectCase(
 			{
 				commitMeta: async () => [
 					{
@@ -23675,8 +24214,8 @@ describe("turn checkout guard (other projects)", () => {
 			},
 			record,
 		);
-		const a = store.createTask("work please");
-		const b = guilty.createTask("work please");
+		const a = await store.createTask("work please");
+		const b = await guilty.createTask("work please");
 
 		await Promise.all([
 			loop.runTurn(store.name, a.id),
@@ -23703,7 +24242,7 @@ describe("turn checkout guard (other projects)", () => {
 		// so the settling turn is the change's only blameable turn and parks as today.
 		const changeTime = { t: 0 };
 		const record = baseRecord();
-		const { store, shared, states, loop } = threeProjectCase({
+		const { store, shared, states, loop } = await threeProjectCase({
 			commitMeta: async () => [
 				{
 					sha: "abc1234",
@@ -23720,12 +24259,12 @@ describe("turn checkout guard (other projects)", () => {
 				});
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 		await flushPromises();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(shared.name);
 		expect(after.needsReason).toContain("abc1234 sneak edit");
@@ -23740,7 +24279,7 @@ describe("turn checkout guard (other projects)", () => {
 		// guard parked the card for exactly that commit.
 		const changeTime = { t: 0 };
 		const record = baseRecord();
-		const { store, shared, states, loop } = threeProjectCase({
+		const { store, shared, states, loop } = await threeProjectCase({
 			commitMeta: async () => [
 				{
 					sha: "def5678",
@@ -23754,12 +24293,12 @@ describe("turn checkout guard (other projects)", () => {
 				states.set(shared.path, { head: "def5678", status: "" });
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 		await flushPromises();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("done");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -23771,7 +24310,7 @@ describe("turn checkout guard (other projects)", () => {
 		// the change back under the guard, and the lone turn is its only blameable turn.
 		const changeTime = { t: 0 };
 		const record = baseRecord();
-		const { store, shared, states, loop } = threeProjectCase({
+		const { store, shared, states, loop } = await threeProjectCase({
 			commitMeta: async () => [
 				{
 					sha: "def5678",
@@ -23788,12 +24327,12 @@ describe("turn checkout guard (other projects)", () => {
 				});
 			}),
 		});
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 		await flushPromises();
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain("README.md");
 		expect(loop.checkoutNotices()).toHaveLength(0);
@@ -23803,7 +24342,7 @@ describe("turn checkout guard (other projects)", () => {
 		// No commit meta: the change carries no timestamp, so the guard falls back to
 		// the turn windows themselves. Fails before OTTR-763: the innocent card parked.
 		const record = baseRecord();
-		const { store, guilty, shared, states, loop } = threeProjectCase(
+		const { store, guilty, shared, states, loop } = await threeProjectCase(
 			{
 				...overlappingRuns(record, () => {
 					states.set(shared.path, {
@@ -23814,8 +24353,8 @@ describe("turn checkout guard (other projects)", () => {
 			},
 			record,
 		);
-		const a = store.createTask("work please");
-		const b = guilty.createTask("work please");
+		const a = await store.createTask("work please");
+		const b = await guilty.createTask("work please");
 
 		await Promise.all([
 			loop.runTurn(store.name, a.id),
@@ -23843,19 +24382,19 @@ describe("turn checkout guard (other projects)", () => {
 	 * of them fires `change` while every work run is still live, and every work run
 	 * finishes only after `change` completed, so each turn window holds the change.
 	 * Later runs are a card's chained merge run and report integrated. */
-	function realSharedRepoCase(
+	async function realSharedRepoCase(
 		record: Recorded,
 		change: () => void | Promise<void>,
 		workRuns = 1,
-	): {
+	): Promise<{
 		store: ProjectStore;
 		guilty: ProjectStore;
 		repo: string;
 		loop: TurnLoop;
-	} {
-		const store = freshStore();
-		const guilty = freshStore();
-		const other = freshStore();
+	}> {
+		const store = await freshStore();
+		const guilty = await freshStore();
+		const other = await freshStore();
 		const repo = mkdtempSync(join(tmpdir(), "ottr-guard-repo-"));
 		dirs.push(repo);
 		const seenWorkRuns = new Set<string>();
@@ -23881,13 +24420,13 @@ describe("turn checkout guard (other projects)", () => {
 			// The watched checkout is the real repository; every read is live.
 			[other.name, { ...fakeProject(other), path: repo }],
 		]);
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				checkoutState: (path: string) => realCheckoutState(path),
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					const key = o.board?.project ?? o.cwd;
 					const workRun = !seenWorkRuns.has(key);
 					seenWorkRuns.add(key);
@@ -23927,7 +24466,7 @@ describe("turn checkout guard (other projects)", () => {
 		// the innocent card parked needs_you.
 		let sha = "";
 		const record = baseRecord();
-		const { store, guilty, repo, loop } = realSharedRepoCase(
+		const { store, guilty, repo, loop } = await realSharedRepoCase(
 			record,
 			async () => {
 				const git = (args: string[], env?: Record<string, string>): string => {
@@ -23967,8 +24506,8 @@ describe("turn checkout guard (other projects)", () => {
 				sha = git(["rev-parse", "--short", "HEAD"]);
 			},
 		);
-		const a = store.createTask("work please");
-		const b = guilty.createTask("work please");
+		const a = await store.createTask("work please");
+		const b = await guilty.createTask("work please");
 
 		await Promise.all([
 			loop.runTurn(store.name, a.id),
@@ -23992,8 +24531,8 @@ describe("turn checkout guard (other projects)", () => {
 		// the exemption fires. Fails whenever the reader goes stub-shaped (no files),
 		// which parked the syncing card before the send-back fix.
 		const record = baseRecord();
-		const store = freshStore();
-		const other = freshStore();
+		const store = await freshStore();
+		const other = await freshStore();
 		const repo = mkdtempSync(join(tmpdir(), "ottr-guard-sync-"));
 		dirs.push(repo);
 		const git = (cwd: string, ...args: string[]): string => {
@@ -24024,13 +24563,13 @@ describe("turn checkout guard (other projects)", () => {
 			[other.name, { ...fakeProject(other), path: repo }],
 		]);
 		let committed = false;
-		const loop = createTurnLoop(
+		const loop = holdFollowUps(
 			projects,
 			fakeOps(record, {
 				checkoutState: (path: string) => realCheckoutState(path),
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
-					o.onSession?.("sess-1");
+					await o.onSession?.("sess-1");
 					// First run: the work run commits the sync; later runs are the card's
 					// chained merge run and report integrated, like the other fakes.
 					const workRun = !committed;
@@ -24078,7 +24617,7 @@ describe("turn checkout guard (other projects)", () => {
 				},
 			}),
 		);
-		const task = store.createTask("work please");
+		const task = await store.createTask("work please");
 
 		await loop.runTurn(store.name, task.id);
 		const after = await settled(store, task.id);
@@ -24096,17 +24635,17 @@ describe("stored review findings", () => {
 		rank: number | null = null,
 		security: "critical" | "high" | null = null,
 	): RecordedFinding => ({ prompt, model: null, rank, security });
-	const reviewCard = (store: ProjectStore) => {
-		const review = store.createTask(
+	const reviewCard = async (store: ProjectStore) => {
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}main (3 commits)`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, { base: "shaR" });
+		await store.updateTask(review.id, { base: "shaR" });
 		return review;
 	};
-	const kidsOf = (store: ProjectStore, id: string) =>
-		store.listTasks().filter((t) => t.followUpOf === id);
+	const kidsOf = async (store: ProjectStore, id: string) =>
+		(await store.listTasks()).filter((t) => t.followUpOf === id);
 	const verdicts = (...v: [number, boolean, string][]) =>
 		runResult({
 			finalText: JSON.stringify(
@@ -24123,18 +24662,18 @@ describe("stored review findings", () => {
 	/** A review run that delivers findings through the spec's onRecorded callback as they
 	 * arrive, then serves `result` (or rejects when `fail` is set). Later runs are checks
 	 * served from `checks` in order and captured in `checkRuns`. */
-	function storedReviewSetup(
+	async function storedReviewSetup(
 		record: Recorded,
 		findings: RecordedFinding[],
 		result: RunResult | { fail: Error },
 		checks: RunResult[],
-		overrides: Partial<TurnOps> = {},
+		overrides: FixtureOps = {},
 	) {
 		const checkRuns: StartOpts[] = [];
-		const s = setupWith(record, {
+		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
-			maxTotalRuns: () => 0,
-			startRun: (o: StartOpts) => {
+			holdFollowUps: true,
+			startRun: async (o: StartOpts) => {
 				let done: Promise<RunResult>;
 				if (o.maxTime) {
 					// The second-model check over the stored set: a fresh capped session.
@@ -24144,9 +24683,9 @@ describe("stored review findings", () => {
 					);
 				} else {
 					record.runs.push(o);
-					o.onSession?.("sess");
+					await o.onSession?.("sess");
 					// The run "parses" each propose_task as it arrives, before settling.
-					for (const f of findings) o.onRecorded?.(f);
+					for (const f of findings) await o.onRecorded?.(f);
 					done =
 						record.runs.length === 1
 							? "fail" in result
@@ -24167,7 +24706,7 @@ describe("stored review findings", () => {
 
 	test("findings persist through a never-settling run and a later answered turn checks and files them", async () => {
 		const record = baseRecord();
-		const { store, loop, checkRuns } = storedReviewSetup(
+		const { store, loop, checkRuns } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug A", 1), mkFinding("Bug B", 2)],
 			{ fail: new Error("worker dispatch failed") },
@@ -24175,17 +24714,16 @@ describe("stored review findings", () => {
 			// run reported nothing recorded.
 			[verdicts([1, true, ""], [2, true, ""])],
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		// Turn 1 never settled, yet both findings are on the card in arrival order.
-		expect(store.listReviewFindings(review.id).map((f) => f.prompt)).toEqual([
-			"Bug A",
-			"Bug B",
-		]);
+		expect(
+			(await store.listReviewFindings(review.id)).map((f) => f.prompt),
+		).toEqual(["Bug A", "Bug B"]);
 
 		// Turn 2: a reply on the same card; its run records nothing and answers.
-		store.updateTask(review.id, { state: "queued" });
+		await store.updateTask(review.id, { state: "queued" });
 		await loop.runTurn(store.name, review.id);
 
 		// The check ran as a fresh session over the stored set and filed both findings.
@@ -24195,11 +24733,11 @@ describe("stored review findings", () => {
 			"Bug A",
 			"Bug B",
 		]);
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids.map((k) => k.prompt).sort()).toEqual(["Bug A", "Bug B"]);
 		expect(kids.every((k) => k.stage === "todo")).toBe(true);
 		// The card waits at merging for its findings, not done.
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
@@ -24207,7 +24745,7 @@ describe("stored review findings", () => {
 
 	test("done is refused while stored findings are unchecked; the stamp lets a done settle through", async () => {
 		const record = baseRecord();
-		const { store, loop, projects, checkRuns } = storedReviewSetup(
+		const { store, loop, projects, checkRuns } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug A", 1), mkFinding("Bug B", 2)],
 			runResult({
@@ -24220,30 +24758,32 @@ describe("stored review findings", () => {
 			// makes every tick return the cap bit before the settle).
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
-		store.appendReviewFinding(review.id, mkFinding("Bug A", 1));
-		store.appendReviewFinding(review.id, mkFinding("Bug B", 2));
+		const review = await reviewCard(store);
+		await store.appendReviewFinding(review.id, mkFinding("Bug A", 1));
+		await store.appendReviewFinding(review.id, mkFinding("Bug B", 2));
 		await loop.runTurn(store.name, review.id);
 
 		// The done-classified settle parked instead: the stored set was unchecked,
 		// so the check ran in the same settle and its kept cards hold the review.
-		let after = store.getTask(review.id)!;
+		let after = (await store.getTask(review.id))!;
 		expect(after.stage).not.toBe("done");
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
 		expect(checkRuns).toHaveLength(1);
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids).toHaveLength(2);
 
 		// Second half: the scheduled settle finishes the held review once the stamp
 		// is in and the filed cards are done; no agent run, no re-check.
 		for (const k of kids)
-			store.updateTask(k.id, { stage: "done", state: "idle" });
+			await store.updateTask(k.id, { stage: "done", state: "idle" });
 		projects.get(store.name)!.target = "origin/main";
 		await loop.schedule();
-		await flushPromises();
-		after = store.getTask(review.id)!;
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
+		after = (await store.getTask(review.id))!;
 		expect(record.runs).toHaveLength(1); // the tick runs no agent
 		expect(checkRuns).toHaveLength(1);
 		expect(after.stage).toBe("done");
@@ -24252,15 +24792,15 @@ describe("stored review findings", () => {
 		// A finding that arrives after the check re-opens the refusal: park the card
 		// back in the held shape (the needsReason is the tick's held marker), append,
 		// and the tick refuses done until stamped.
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			stage: "merging",
 			state: "idle",
 			needsReason: FINDINGS_HOLD,
 		});
-		store.appendReviewFinding(review.id, mkFinding("Bug C", 3));
+		await store.appendReviewFinding(review.id, mkFinding("Bug C", 3));
 		await loop.schedule();
 		await flushPromises();
-		after = store.getTask(review.id)!;
+		after = (await store.getTask(review.id))!;
 		expect(after.stage).not.toBe("done");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(UNCHECKED_FINDINGS_HOLD);
@@ -24277,7 +24817,7 @@ describe("stored review findings", () => {
 			mkFinding("Needs validation: config load may double-read"),
 			mkFinding("Needs validation: flaky retry on push"),
 		];
-		const { store, loop, projects, checkRuns } = storedReviewSetup(
+		const { store, loop, projects, checkRuns } = await storedReviewSetup(
 			record,
 			[...confirmed, ...leads],
 			runResult({
@@ -24296,7 +24836,7 @@ describe("stored review findings", () => {
 			// makes every tick return the cap bit before the settle).
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		// The check input holds exactly the cap-10 confirmed selection: no leads,
@@ -24308,7 +24848,7 @@ describe("stored review findings", () => {
 		);
 
 		// Each lead filed as a backlog card marked unverified, linked to the review.
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		const leadKids = kids.filter((k) =>
 			k.prompt.startsWith("Needs validation:"),
 		);
@@ -24327,7 +24867,7 @@ describe("stored review findings", () => {
 		const filed = kids.map((k) => k.prompt);
 		expect(filed).not.toContain("Bug 11");
 		expect(filed).not.toContain("Bug 12");
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.details).toContain("below the cap of 10: Bug 11");
 		expect(after.details).toContain("below the cap of 10: Bug 12");
 
@@ -24339,8 +24879,10 @@ describe("stored review findings", () => {
 		expect(after.state).toBe("idle");
 		projects.get(store.name)!.target = "origin/main";
 		await loop.schedule();
-		await flushPromises();
-		const doneAfter = store.getTask(review.id)!;
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
+		const doneAfter = (await store.getTask(review.id))!;
 		expect(doneAfter.stage).toBe("done");
 		expect(doneAfter.needsReason).toBeNull();
 		expect(leadKids.every((k) => k.stage === "backlog")).toBe(true);
@@ -24351,7 +24893,7 @@ describe("stored review findings", () => {
 		const lead = mkFinding(
 			"Needs validation: maybe a race in the scheduler\nOpen fact: the retry path can double-commit.\nFingerprint: fp-race",
 		);
-		const { store, loop, checkRuns } = storedReviewSetup(
+		const { store, loop, checkRuns } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug 1", 1), lead],
 			runResult({
@@ -24360,11 +24902,11 @@ describe("stored review findings", () => {
 			[verdicts([1, false, "not real"])],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
-		const old = store.createTask(
+		const review = await reviewCard(store);
+		const old = await store.createTask(
 			"Needs validation: maybe a race in the scheduler\nFingerprint: fp-race",
 		);
-		store.updateTask(old.id, {
+		await store.updateTask(old.id, {
 			stage: "backlog",
 			state: "idle",
 			queuedAt: null,
@@ -24373,15 +24915,14 @@ describe("stored review findings", () => {
 		await loop.runTurn(store.name, review.id);
 
 		// No new card for the lead: the open card holds the same fingerprint.
-		const holders = store
-			.listTasks()
+		const holders = (await store.listTasks())
 			.filter((t) => t.prompt.includes("Fingerprint: fp-race"))
 			.map((t) => t.id);
 		expect(holders).toEqual([old.id]);
-		expect(kidsOf(store, review.id)).toHaveLength(0);
+		expect(await kidsOf(store, review.id)).toHaveLength(0);
 
 		// The old card gained the "Seen again" line and stays an open backlog card.
-		const after = store.getTask(old.id)!;
+		const after = (await store.getTask(old.id))!;
 		expect(after.stage).toBe("backlog");
 		expect(after.cancelledAt).toBeNull();
 		expect(after.details).toMatch(
@@ -24392,7 +24933,7 @@ describe("stored review findings", () => {
 
 		// The review's trail counts the lead as already open, not filed; the
 		// confirmed finding still went through the check and was dropped.
-		const reviewAfter = store.getTask(review.id)!;
+		const reviewAfter = (await store.getTask(review.id))!;
 		expect(reviewAfter.details).toContain(`already open: #${old.id}`);
 		expect(reviewAfter.details).not.toContain("filed as card #");
 		expect(checkRuns).toHaveLength(1);
@@ -24403,7 +24944,7 @@ describe("stored review findings", () => {
 		const lead = mkFinding(
 			"Needs validation: config load may double-read\nFingerprint: fp-config",
 		);
-		const { store, loop } = storedReviewSetup(
+		const { store, loop } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug 1", 1), lead],
 			runResult({
@@ -24412,11 +24953,11 @@ describe("stored review findings", () => {
 			[verdicts([1, false, "not real"])],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
-		const old = store.createTask(
+		const review = await reviewCard(store);
+		const old = await store.createTask(
 			"Needs validation: config load may double-read\nFingerprint: fp-config",
 		);
-		store.updateTask(old.id, {
+		await store.updateTask(old.id, {
 			stage: "backlog",
 			state: "idle",
 			queuedAt: null,
@@ -24426,13 +24967,12 @@ describe("stored review findings", () => {
 		await loop.runTurn(store.name, review.id);
 
 		// The user declined this lead: no new card, and the old card is untouched.
-		const holders = store
-			.listTasks()
+		const holders = (await store.listTasks())
 			.filter((t) => t.prompt.includes("Fingerprint: fp-config"))
 			.map((t) => t.id);
 		expect(holders).toEqual([old.id]);
-		expect(kidsOf(store, review.id)).toHaveLength(0);
-		const reviewAfter = store.getTask(review.id)!;
+		expect(await kidsOf(store, review.id)).toHaveLength(0);
+		const reviewAfter = (await store.getTask(review.id))!;
 		expect(reviewAfter.details).toContain(
 			`the user cancelled the same lead before, card #${old.id}`,
 		);
@@ -24443,7 +24983,7 @@ describe("stored review findings", () => {
 		const lead = mkFinding(
 			"Needs validation: flaky retry on push\nFingerprint: fp-retry",
 		);
-		const { store, loop } = storedReviewSetup(
+		const { store, loop } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug 1", 1), lead],
 			runResult({
@@ -24452,16 +24992,16 @@ describe("stored review findings", () => {
 			[verdicts([1, false, "not real"])],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
-		const old = store.createTask(
+		const review = await reviewCard(store);
+		const old = await store.createTask(
 			"Needs validation: flaky retry on push\nFingerprint: fp-retry",
 		);
-		store.updateTask(old.id, { stage: "done", state: "idle" });
+		await store.updateTask(old.id, { stage: "done", state: "idle" });
 
 		await loop.runTurn(store.name, review.id);
 
 		// The lead came back: it files as today, and its details name the old card.
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids).toHaveLength(1);
 		const refiled = kids[0]!;
 		expect(refiled.prompt).toBe(lead.prompt);
@@ -24471,7 +25011,7 @@ describe("stored review findings", () => {
 		expect(refiled.details).toContain(
 			`The same fingerprint was already on done card #${old.id}; the lead came back.`,
 		);
-		const reviewAfter = store.getTask(review.id)!;
+		const reviewAfter = (await store.getTask(review.id))!;
 		expect(reviewAfter.details).toContain(`filed as card #${refiled.id}`);
 		expect(reviewAfter.details).not.toContain("already open");
 	});
@@ -24479,7 +25019,7 @@ describe("stored review findings", () => {
 	test("a lead without a fingerprint line files as today", async () => {
 		const record = baseRecord();
 		const lead = mkFinding("Needs validation: flaky retry on push");
-		const { store, loop } = storedReviewSetup(
+		const { store, loop } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug 1", 1), lead],
 			runResult({
@@ -24488,13 +25028,13 @@ describe("stored review findings", () => {
 			[verdicts([1, false, "not real"])],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		// An unrelated open card holds a fingerprint; it must not catch the
 		// lineless lead, and it gains no "Seen again" line.
-		const other = store.createTask(
+		const other = await store.createTask(
 			"Needs validation: another suspicion\nFingerprint: fp-other",
 		);
-		store.updateTask(other.id, {
+		await store.updateTask(other.id, {
 			stage: "backlog",
 			state: "idle",
 			queuedAt: null,
@@ -24502,13 +25042,15 @@ describe("stored review findings", () => {
 
 		await loop.runTurn(store.name, review.id);
 
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids).toHaveLength(1);
 		expect(kids[0]!.prompt).toBe(lead.prompt);
 		expect(kids[0]!.details).toBe(
 			`Unverified lead from review ${review.id}: the second-model check did not run on this finding (needs validation). Waits for a validation sandbox.`,
 		);
-		expect(store.getTask(other.id)!.details ?? "").not.toContain("Seen again");
+		expect((await store.getTask(other.id))!.details ?? "").not.toContain(
+			"Seen again",
+		);
 	});
 
 	test("two leads with one new fingerprint file once; the second marks the first seen again", async () => {
@@ -24519,7 +25061,7 @@ describe("stored review findings", () => {
 		const second = mkFinding(
 			"Needs validation: the same race, phrased differently\nFingerprint: fp-new",
 		);
-		const { store, loop } = storedReviewSetup(
+		const { store, loop } = await storedReviewSetup(
 			record,
 			[mkFinding("Bug 1", 1), first, second],
 			runResult({
@@ -24528,17 +25070,17 @@ describe("stored review findings", () => {
 			[verdicts([1, false, "not real"])],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 
 		await loop.runTurn(store.name, review.id);
 
 		// The first lead files a card; no card held the fingerprint before, yet the
 		// second lead matches the card the first lead just filed.
-		const holders = store
-			.listTasks()
-			.filter((t) => t.prompt.includes("Fingerprint: fp-new"));
+		const holders = (await store.listTasks()).filter((t) =>
+			t.prompt.includes("Fingerprint: fp-new"),
+		);
 		expect(holders).toHaveLength(1);
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids.map((k) => k.prompt)).toEqual([first.prompt]);
 		const filed = kids[0]!;
 		expect(filed.details).not.toContain("came back");
@@ -24547,7 +25089,7 @@ describe("stored review findings", () => {
 				`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.`,
 			),
 		);
-		const reviewAfter = store.getTask(review.id)!;
+		const reviewAfter = (await store.getTask(review.id))!;
 		expect(reviewAfter.details).toContain(`already open: #${filed.id}`);
 	});
 
@@ -24567,7 +25109,7 @@ describe("stored review findings", () => {
 				"Needs validation: sandbox-only parser crash\nBlocker: sandbox run: no OS-enforced network deny",
 			),
 		];
-		const { store, loop } = storedReviewSetup(
+		const { store, loop } = await storedReviewSetup(
 			record,
 			[...confirmed, ...leads],
 			runResult({
@@ -24584,11 +25126,11 @@ describe("stored review findings", () => {
 			],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		// All three leads file as unverified backlog cards linked to the review.
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		const leadKids = kids.filter((k) =>
 			k.prompt.startsWith("Needs validation:"),
 		);
@@ -24647,7 +25189,7 @@ describe("stored review findings", () => {
 				"Needs validation: sandbox-only crash\nBlocker: sandbox run: no sandbox",
 			),
 		];
-		const { store, loop } = storedReviewSetup(
+		const { store, loop } = await storedReviewSetup(
 			record,
 			[...confirmed, ...leads],
 			runResult({
@@ -24664,13 +25206,13 @@ describe("stored review findings", () => {
 			],
 			{ maxTotalRuns: () => null },
 		);
-		const review = reviewCard(store);
+		const review = await reviewCard(store);
 		await loop.runTurn(store.name, review.id);
 
 		// Exactly the two lead cards, both marked as waiting for a validation
 		// sandbox (a lead without a blocker line counts as a sandbox-run lead),
 		// and no question card.
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids).toHaveLength(2);
 		for (const k of kids) {
 			expect(k.stage).toBe("backlog");
@@ -24683,7 +25225,7 @@ describe("stored review findings", () => {
 	test("a release review refuses to publish while its stored findings are unchecked", async () => {
 		const record = baseRecord();
 		// Stored findings from an earlier (lost) turn; this turn records nothing.
-		const { store, projects, loop, checkRuns } = storedReviewSetup(
+		const { store, projects, loop, checkRuns } = await storedReviewSetup(
 			record,
 			[],
 			runResult({
@@ -24694,20 +25236,20 @@ describe("stored review findings", () => {
 			{ publishRelease: publishingRelease(record), maxTotalRuns: () => null },
 		);
 		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask(
+		const review = await store.createTask(
 			`${ARCH_REVIEW_MARKER}release v1.0.0`,
 			null,
 			"review",
 		);
-		store.updateTask(review.id, {
+		await store.updateTask(review.id, {
 			releaseVersion: "v1.0.0",
 			base: "shaR",
 			worktree: "wt-rel",
 			branch: "ott/rel",
 			releaseNotes: "notes body",
 		});
-		store.appendReviewFinding(review.id, mkFinding("Bug A", 1));
-		store.appendReviewFinding(review.id, mkFinding("Bug B", 2));
+		await store.appendReviewFinding(review.id, mkFinding("Bug A", 1));
+		await store.appendReviewFinding(review.id, mkFinding("Bug B", 2));
 
 		await loop.runTurn(store.name, review.id);
 
@@ -24715,20 +25257,22 @@ describe("stored review findings", () => {
 		// stored set in the same settle and filed both findings.
 		expect(record.publishRelease).toHaveLength(0);
 		expect(checkRuns).toHaveLength(1);
-		const kids = kidsOf(store, review.id);
+		const kids = await kidsOf(store, review.id);
 		expect(kids.map((k) => k.prompt).sort()).toEqual(["Bug A", "Bug B"]);
-		const after = store.getTask(review.id)!;
+		const after = (await store.getTask(review.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBe(FINDINGS_HOLD);
 
 		// Findings implemented: the tick publishes and lands Done.
 		for (const k of kids)
-			store.updateTask(k.id, { stage: "done", state: "idle" });
+			await store.updateTask(k.id, { stage: "done", state: "idle" });
 		await loop.schedule();
-		await flushPromises();
+		await eventually(
+			async () => (await store.getTask(review.id))?.stage === "done",
+		);
 		expect(record.publishRelease).toHaveLength(1);
-		const done = store.getTask(review.id)!;
+		const done = (await store.getTask(review.id))!;
 		expect(done.stage).toBe("done");
 		expect(done.summary).toBe("Released v1.0.0");
 	});
@@ -24765,18 +25309,18 @@ describe("prompt gate", () => {
 
 	test("a vague card parks needs_you with the model's questions, no omp session and no worktree", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return questionCheck();
 			},
 		});
-		const task = store.createTask("build a thing");
+		const task = await store.createTask("build a thing");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(
 			"Prompt gate: the gate still has open questions",
@@ -24798,23 +25342,23 @@ describe("prompt gate", () => {
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
 		expect(after.worktree).toBeNull();
-		expect(store.listTurns(task.id)).toHaveLength(0);
+		expect(await store.listTurns(task.id)).toHaveLength(0);
 	});
 
 	test("a clear card with an outside check starts its turn", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return clearCheck();
 			},
 		});
-		const task = store.createTask("clear work");
+		const task = await store.createTask("clear work");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(calls).toBe(1);
 		expect(record.runs).toHaveLength(1);
 		expect(after.state).toBe("idle");
@@ -24826,7 +25370,7 @@ describe("prompt gate", () => {
 
 	test("a follow-up prompt's named handoff rides with the prompt through the gate", async () => {
 		const seen: string[] = [];
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				seen.push(o.prompt);
@@ -24834,7 +25378,7 @@ describe("prompt gate", () => {
 			},
 		});
 		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
-		const task = store.createTask("seed");
+		const task = await store.createTask("seed");
 		const handoffPath = join(store.tasksDir, "handoffs", `${task.id}.md`);
 		writeFileSync(
 			handoffPath,
@@ -24854,11 +25398,11 @@ describe("prompt gate", () => {
 			title: "Research report",
 			handoffPath,
 		});
-		store.updateTask(task.id, { prompt });
+		await store.updateTask(task.id, { prompt });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// A clear gate pass starts the turn.
 		expect(after.state).toBe("idle");
 		expect(after.needsReason).toBeNull();
@@ -24880,7 +25424,7 @@ describe("prompt gate", () => {
 
 	test("a handoff whose steps lie past the cap still shows them to the gate", async () => {
 		const seen: string[] = [];
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				seen.push(o.prompt);
@@ -24888,7 +25432,7 @@ describe("prompt gate", () => {
 			},
 		});
 		mkdirSync(join(store.tasksDir, "handoffs"), { recursive: true });
-		const task = store.createTask("seed");
+		const task = await store.createTask("seed");
 		const handoffPath = join(store.tasksDir, "handoffs", `${task.id}.md`);
 		// A long research handoff: the report fills the head cap and the steps
 		// section sits past it near the end (the measured shape of OTTR-841
@@ -24911,7 +25455,7 @@ describe("prompt gate", () => {
 				"later",
 			].join("\n");
 		writeFileSync(handoffPath, handoff);
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			prompt: followUpPrompt({
 				text: "Implement the recommended steps from the research report in the handoff.",
 				title: "Research report",
@@ -24921,7 +25465,7 @@ describe("prompt gate", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		expect(record.runs).toHaveLength(1);
 		// The gate model saw the steps section: the head cap alone would drop it.
@@ -24941,14 +25485,14 @@ describe("prompt gate", () => {
 
 	test("a @-path outside the handoffs folder is never judged; the log names the reason", async () => {
 		const seen: string[] = [];
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				seen.push(o.prompt);
 				return clearCheck();
 			},
 		});
-		const passwd = store.createTask(
+		const passwd = await store.createTask(
 			followUpPrompt({
 				text: "Implement the recommended steps from the research report in the handoff.",
 				title: "Research report",
@@ -24962,13 +25506,13 @@ describe("prompt gate", () => {
 		// The passwd content never reached the gate model.
 		expect(seen[0]).not.toContain("root:x:0:0");
 		expect(seen[0]).not.toContain("<handoff>");
-		expect(readFileSync(store.logPath(passwd.id), "utf8")).toContain(
+		expect(readFileSync(await store.logPath(passwd.id), "utf8")).toContain(
 			"/etc/passwd: outside the handoffs folder",
 		);
 
 		// A .. path that escapes the folder is refused the same way.
 		const escapePath = join(store.tasksDir, "handoffs", "..", "secrets.md");
-		const escapeTask = store.createTask(
+		const escapeTask = await store.createTask(
 			followUpPrompt({
 				text: "Implement the recommended steps from the research report in the handoff.",
 				title: "Research report",
@@ -24976,14 +25520,14 @@ describe("prompt gate", () => {
 			}),
 		);
 		await loop.runTurn(store.name, escapeTask.id);
-		expect(readFileSync(store.logPath(escapeTask.id), "utf8")).toContain(
+		expect(readFileSync(await store.logPath(escapeTask.id), "utf8")).toContain(
 			"outside the handoffs folder",
 		);
 	});
 
 	test("a missing handoff file falls back to the prompt alone and logs the reason", async () => {
 		const seen: string[] = [];
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				seen.push(o.prompt);
@@ -24991,7 +25535,7 @@ describe("prompt gate", () => {
 			},
 		});
 		const missing = join(store.tasksDir, "handoffs", "absent.md");
-		const task = store.createTask(
+		const task = await store.createTask(
 			followUpPrompt({
 				text: "Implement the recommended steps from the research report in the handoff.",
 				title: "Research report",
@@ -25002,31 +25546,31 @@ describe("prompt gate", () => {
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("idle");
 		// The gate judged the prompt alone: no handoff block, bare-prompt fingerprint.
 		expect(seen[0]).toBe(after.prompt);
 		expect(after.gate?.hash).toBe(
 			gateFingerprint(gateCompareText(after.prompt, null, null)),
 		);
-		expect(readFileSync(store.logPath(task.id), "utf8")).toContain(
+		expect(readFileSync(await store.logPath(task.id), "utf8")).toContain(
 			`${missing}: the handoff file is missing`,
 		);
 	});
 
 	test("a gate check that fails twice parks with the error and makes no third call", async () => {
 		let calls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			gateCheck: async () => {
 				calls += 1;
 				throw new Error("gateway down");
 			},
 		});
-		const task = store.createTask("flaky gate");
+		const task = await store.createTask("flaky gate");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(calls).toBe(2);
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe("Prompt gate: gateway down");
@@ -25038,24 +25582,24 @@ describe("prompt gate", () => {
 
 	test("two identical question parks carry the Start-anyway question on the second", async () => {
 		let calls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return questionCheck("Which database?");
 			},
 		});
-		const task = store.createTask("loopy gate");
+		const task = await store.createTask("loopy gate");
 
 		await loop.runTurn(store.name, task.id);
-		const first = store.getTask(task.id)!;
+		const first = (await store.getTask(task.id))!;
 		expect(first.gate?.fails).toBe(1);
 
 		// Requeue: the same questions come back, so the second park gains Start anyway.
-		store.updateTask(task.id, { state: "queued" });
+		await store.updateTask(task.id, { state: "queued" });
 		await loop.runTurn(store.name, task.id);
 
-		const second = store.getTask(task.id)!;
+		const second = (await store.getTask(task.id))!;
 		expect(second.state).toBe("needs_you");
 		expect(second.gate?.fails).toBe(2);
 		expect(second.gate?.sig).toBe("Which database?");
@@ -25080,7 +25624,7 @@ describe("prompt gate", () => {
 			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
 			questions,
 		});
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				calls += 1;
@@ -25106,11 +25650,11 @@ describe("prompt gate", () => {
 				];
 			},
 		});
-		const task = store.createTask("fact gate");
+		const task = await store.createTask("fact gate");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The lookup saw exactly the fact questions and ran in the project's main checkout.
 		expect(lookupInput).toEqual([factQ]);
 		expect(lookupCwd).toBe(store.path);
@@ -25146,7 +25690,7 @@ describe("prompt gate", () => {
 		const decisionQ = "If the app token mint fails, fail or fall back?";
 		let lookups = 0;
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
@@ -25166,11 +25710,11 @@ describe("prompt gate", () => {
 				return [];
 			},
 		});
-		const task = store.createTask("unknown fact gate");
+		const task = await store.createTask("unknown fact gate");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(lookups).toBe(1);
 		// No usable answers: no re-gate, the first call's questions park as today.
 		expect(calls).toBe(1);
@@ -25186,7 +25730,7 @@ describe("prompt gate", () => {
 		const factQ = "Where does the release currently run?";
 		const decisionQ = "If the app token mint fails, fail or fall back?";
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
@@ -25204,17 +25748,17 @@ describe("prompt gate", () => {
 				throw new Error("omp down");
 			},
 		});
-		const task = store.createTask("broken fact lookup");
+		const task = await store.createTask("broken fact lookup");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(calls).toBe(1);
 		expect(after.state).toBe("needs_you");
 		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
 		expect(after.gate?.seen).toBeNull();
 		expect(after.gate?.facts).toBeUndefined();
-		expect(readFileSync(store.logPath(task.id), "utf8")).toContain(
+		expect(readFileSync(await store.logPath(task.id), "utf8")).toContain(
 			"! prompt gate: fact lookup failed: omp down",
 		);
 		expect(record.runs).toHaveLength(0);
@@ -25225,7 +25769,7 @@ describe("prompt gate", () => {
 		const decisionQ = "If the app token mint fails, fail or fall back?";
 		const gateInputs: (string | null)[] = [];
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				calls += 1;
@@ -25253,11 +25797,11 @@ describe("prompt gate", () => {
 				},
 			],
 		});
-		const task = store.createTask("failed re-gate");
+		const task = await store.createTask("failed re-gate");
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// Both gate calls ran; the second one failed after the lookup answered.
 		expect(calls).toBe(2);
 		// The second call saw the answers; the persisted park does not hold them.
@@ -25267,7 +25811,7 @@ describe("prompt gate", () => {
 		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
 		expect(after.gate?.seen).toBeNull();
 		expect(after.gate?.facts).toBeUndefined();
-		expect(readFileSync(store.logPath(task.id), "utf8")).toContain(
+		expect(readFileSync(await store.logPath(task.id), "utf8")).toContain(
 			"! prompt gate: fact lookup failed: re-gate down",
 		);
 		expect(record.runs).toHaveLength(0);
@@ -25275,15 +25819,15 @@ describe("prompt gate", () => {
 
 	test("a hash match skips the gate seam entirely", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				throw new Error("the seam must not run");
 			},
 		});
-		const task = store.createTask("already passed");
-		store.updateTask(task.id, {
+		const task = await store.createTask("already passed");
+		await store.updateTask(task.id, {
 			gate: {
 				hash: gateFingerprint("already passed"),
 				seen: null,
@@ -25297,14 +25841,14 @@ describe("prompt gate", () => {
 
 		expect(calls).toBe(0);
 		expect(record.runs).toHaveLength(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.gate?.parked).toBe(false);
 	});
 
 	test("a pass folds the queued answer into seen and keeps earlier answers", async () => {
 		let calls = 0;
 		let userMessages: string | null | undefined;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async (o) => {
 				calls += 1;
@@ -25312,8 +25856,8 @@ describe("prompt gate", () => {
 				return clearCheck();
 			},
 		});
-		const task = store.createTask("clear work");
-		store.updateTask(task.id, {
+		const task = await store.createTask("clear work");
+		await store.updateTask(task.id, {
 			pendingPrompt: "new answers",
 			gate: {
 				hash: null,
@@ -25326,7 +25870,7 @@ describe("prompt gate", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(calls).toBe(1);
 		expect(record.runs).toHaveLength(1);
 		// The gate model sees the answers from earlier rounds too.
@@ -25339,17 +25883,17 @@ describe("prompt gate", () => {
 
 	test("a Start-anyway approval still matches after the run consumes the queued answer", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				throw new Error("the seam must not run");
 			},
 		});
-		const task = store.createTask("approved with answer");
+		const task = await store.createTask("approved with answer");
 		// Simulate a Start anyway given while "use Postgres" was queued: the hash covers
 		// prompt + pending and the answer sat in seen.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			pendingPrompt: "use Postgres",
 			gate: {
 				hash: gateFingerprint(
@@ -25362,13 +25906,13 @@ describe("prompt gate", () => {
 			},
 		});
 		// The run consumes the queued answer.
-		store.updateTask(task.id, { pendingPrompt: null });
+		await store.updateTask(task.id, { pendingPrompt: null });
 
 		await loop.runTurn(store.name, task.id);
 
 		expect(calls).toBe(0);
 		expect(record.runs).toHaveLength(1);
-		expect(store.getTask(task.id)!.gate?.parked).toBe(false);
+		expect((await store.getTask(task.id))!.gate?.parked).toBe(false);
 	});
 
 	test("the third identical park carries only the Start-anyway question", async () => {
@@ -25386,20 +25930,20 @@ describe("prompt gate", () => {
 				options: ["yes", "no"],
 			})),
 		};
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return check;
 			},
 		});
-		const task = store.createTask("stubborn gate");
+		const task = await store.createTask("stubborn gate");
 
 		await loop.runTurn(store.name, task.id);
-		store.updateTask(task.id, { state: "queued" });
+		await store.updateTask(task.id, { state: "queued" });
 		await loop.runTurn(store.name, task.id);
 
-		const second = store.getTask(task.id)!;
+		const second = (await store.getTask(task.id))!;
 		expect(second.gate?.fails).toBe(2);
 		expect(second.asked).toHaveLength(5);
 		expect(second.asked!.slice(0, 4).map((q) => q.question)).toEqual([
@@ -25410,10 +25954,10 @@ describe("prompt gate", () => {
 		]);
 		expect(second.asked!.at(-1)).toEqual(startAnywayQuestion());
 
-		store.updateTask(task.id, { state: "queued" });
+		await store.updateTask(task.id, { state: "queued" });
 		await loop.runTurn(store.name, task.id);
 
-		const third = store.getTask(task.id)!;
+		const third = (await store.getTask(task.id))!;
 		expect(third.state).toBe("needs_you");
 		expect(third.gate?.fails).toBe(3);
 		expect(third.asked).toEqual([startAnywayQuestion()]);
@@ -25422,7 +25966,7 @@ describe("prompt gate", () => {
 
 	test("merge-kind and retro turns skip the gate", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
@@ -25430,16 +25974,20 @@ describe("prompt gate", () => {
 			},
 		});
 		// Merge kind: stage merging.
-		const merge = store.createTask("merge me");
-		store.updateTask(merge.id, { stage: "merging" });
+		const merge = await store.createTask("merge me");
+		await store.updateTask(merge.id, { stage: "merging" });
 		await loop.runTurn(store.name, merge.id);
 		expect(calls).toBe(0);
-		expect(store.getTask(merge.id)?.gate).toBeNull();
+		expect((await store.getTask(merge.id))?.gate).toBeNull();
 
 		// Retro flag.
-		const source = store.createTask("the source card");
-		const retro = store.createTask(`${RETRO_MARKER}the retro`, null, "retro");
-		store.updateTask(retro.id, { followUpOf: source.id });
+		const source = await store.createTask("the source card");
+		const retro = await store.createTask(
+			`${RETRO_MARKER}the retro`,
+			null,
+			"retro",
+		);
+		await store.updateTask(retro.id, { followUpOf: source.id });
 		record.proposal = {
 			prompt: "file this",
 			model: null,
@@ -25448,28 +25996,28 @@ describe("prompt gate", () => {
 		};
 		await loop.runTurn(store.name, retro.id);
 		expect(calls).toBe(0);
-		expect(store.getTask(retro.id)?.gate).toBeNull();
+		expect((await store.getTask(retro.id))?.gate).toBeNull();
 	});
 
 	test("a board-authored card starts its work turn with no gate model call", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				throw new Error("the seam must not run");
 			},
 		});
-		const task = store.createTask("build a thing");
+		const task = await store.createTask("build a thing");
 		// The board filed this prompt (a template, a finding or a proposal card).
-		store.updateTask(task.id, { promptAuthor: "board" });
+		await store.updateTask(task.id, { promptAuthor: "board" });
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The skip rule ran instead of the model: the seam never fired.
 		expect(calls).toBe(0);
-		expect(logText(store, task.id)).toContain(
+		expect(await logText(store, task.id)).toContain(
 			"board-written prompt runs without the model",
 		);
 		// The turn proceeded like a clear pass: one run, no park, no gate state.
@@ -25481,25 +26029,25 @@ describe("prompt gate", () => {
 
 	test("a user prompt edit on a board-authored card runs the gate model again", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return clearCheck();
 			},
 		});
-		const task = store.createTask("build a thing");
-		store.updateTask(task.id, { promptAuthor: "board" });
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, { promptAuthor: "board" });
 		await loop.runTurn(store.name, task.id);
 		expect(record.runs).toHaveLength(1);
 
 		// The user edits the prompt: the text is user-authored again, so the gate
 		// judges it on the next work turn.
-		store.editTask(task.id, "a clearer brief");
-		store.updateTask(task.id, { stage: "in_progress", state: "queued" });
+		await store.editTask(task.id, "a clearer brief");
+		await store.updateTask(task.id, { stage: "in_progress", state: "queued" });
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(calls).toBe(1);
 		expect(record.runs).toHaveLength(2);
 		expect(after.state).toBe("idle");
@@ -25512,15 +26060,15 @@ describe("prompt gate", () => {
 
 	test("a board-authored prompt with an Open questions section still parks with no model call", async () => {
 		let calls = 0;
-		const { store, record, loop } = setup({
+		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				throw new Error("the seam must not run");
 			},
 		});
-		const task = store.createTask("build a thing");
-		store.updateTask(task.id, {
+		const task = await store.createTask("build a thing");
+		await store.updateTask(task.id, {
 			promptAuthor: "board",
 			prompt: [
 				"migrate the store",
@@ -25534,7 +26082,7 @@ describe("prompt gate", () => {
 
 		await loop.runTurn(store.name, task.id);
 
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		// The deterministic park ran first: needs_you with the section's lines,
 		// and the model never ran.
 		expect(after.state).toBe("needs_you");
@@ -25560,5 +26108,350 @@ describe("prompt gate", () => {
 		expect(calls).toBe(0);
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
+	});
+});
+
+describe("async turn state boundaries", () => {
+	test.each(["cancelled", "parked"] as const)(
+		"queued claims observe the final %s gate after a yielded transaction",
+		async (gate) => {
+			const { store, record, loop } = await setup();
+			const task = await store.createTask("wait for the authoritative gate");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const write = store.transaction(async () => {
+				entered.resolve();
+				await release.promise;
+				await store.updateTask(
+					task.id,
+					gate === "cancelled"
+						? { cancelledAt: 1234 }
+						: { state: "needs_you", needsReason: "owner decision" },
+				);
+			});
+			await entered.promise;
+			const first = loop.runTurn(store.name, task.id);
+			const second = loop.runTurn(store.name, task.id);
+			release.resolve();
+			await Promise.all([write, first, second]);
+			expect(record.runs).toHaveLength(0);
+			expect(record.createWorktree).toHaveLength(0);
+			expect(await store.listTurns(task.id)).toEqual([]);
+			expect(
+				(await store.events()).filter(
+					(event) =>
+						event.taskId === task.id &&
+						event.kind === "state" &&
+						event.to === "preparing",
+				),
+			).toEqual([]);
+			expect(await store.getTask(task.id)).toMatchObject(
+				gate === "cancelled"
+					? { state: "queued", cancelledAt: 1234 }
+					: { state: "needs_you", needsReason: "owner decision" },
+			);
+		},
+	);
+
+	test.each(["global cap", "project removal"] as const)(
+		"queued claims observe the final %s gate",
+		async (gate) => {
+			let cap = 10;
+			let held = false;
+			let blocked: Promise<void> | undefined;
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const { store, record, projects, loop } = await setup({
+				maxTotalRuns: () => cap,
+				hasRules: () => {
+					if (!held) {
+						held = true;
+						blocked = store.transaction(async () => {
+							entered.resolve();
+							await release.promise;
+						});
+					}
+					return true;
+				},
+			});
+			const task = await store.createTask("wait for the final board gate");
+			const attempted = loop.runTurn(store.name, task.id);
+			await entered.promise;
+			if (gate === "global cap") cap = 0;
+			else projects.delete(store.name);
+			release.resolve();
+			await Promise.all([blocked, attempted]);
+
+			expect(record.runs).toHaveLength(0);
+			expect(record.createWorktree).toHaveLength(0);
+			expect(await store.getTask(task.id)).toMatchObject({ state: "queued" });
+			expect(await store.listTurns(task.id)).toEqual([]);
+			expect(
+				(await store.events()).filter(
+					(event) => event.taskId === task.id && event.to === "preparing",
+				),
+			).toEqual([]);
+		},
+	);
+
+	test("concurrent lost recoveries settle one row and emit one queue transition", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<string>();
+		let reads = 0;
+		const { store, loop } = await setup({
+			maxTotalRuns: () => 0,
+			pidAlive: () => false,
+			targetSha: async () => {
+				reads += 1;
+				if (reads === 2) entered.resolve();
+				return release.promise;
+			},
+		});
+		const task = await store.createTask("recover once");
+		await store.updateTask(task.id, {
+			stage: "in_progress",
+			state: "running",
+			worktree: join(store.worktreesDir, task.id),
+		});
+		const turn = await store.startTurn(
+			task.id,
+			"work",
+			"interrupted prompt",
+			4344,
+		);
+		const first = loop.recoverRestarted();
+		const second = loop.recoverRestarted();
+		await entered.promise;
+		try {
+			expect((await store.getTask(task.id))!.state).toBe("running");
+			expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
+		} finally {
+			release.resolve("lost-head");
+			await Promise.all([first, second]);
+		}
+		expect(await store.getTask(task.id)).toMatchObject({
+			state: "queued",
+			pendingPrompt: restartResumePrompt({ sha: "lost-head", clean: true }),
+			pendingBy: "supervisor",
+		});
+		const turns = await store.listTurns(task.id);
+		expect(turns).toHaveLength(1);
+		expect(turns[0]!.id).toBe(turn.id);
+		expect(turns[0]!.endedAt).not.toBeNull();
+		expect(turns[0]!.error).toContain("restarted");
+		const events = (await store.events()).filter(
+			(event) => event.taskId === task.id,
+		);
+		expect(events.filter((event) => event.kind === "error")).toHaveLength(1);
+		expect(
+			events.filter(
+				(event) =>
+					event.kind === "state" &&
+					event.from === "running" &&
+					event.to === "queued",
+			),
+		).toMatchObject([{ from: "running", to: "queued" }]);
+	});
+
+	test("lost settlement preserves a task revised during its external resume read", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<string>();
+		const { store, loop } = await setup({
+			maxTotalRuns: () => 0,
+			pidAlive: () => false,
+			targetSha: async () => {
+				entered.resolve();
+				return release.promise;
+			},
+		});
+		const task = await store.createTask("recover the lost turn");
+		await store.updateTask(task.id, {
+			stage: "in_progress",
+			state: "running",
+			worktree: join(store.worktreesDir, task.id),
+			sessionId: "old-session",
+			base: "old-base",
+		});
+		const turn = await store.startTurn(
+			task.id,
+			"work",
+			"interrupted prompt",
+			4344,
+		);
+		const recovery = loop.recoverRestarted();
+		await entered.promise;
+		let revised: Task | null = null;
+		let events = await store.events();
+		try {
+			await store.updateTask(task.id, {
+				state: "needs_you",
+				sessionId: "new-session",
+				base: "new-base",
+				pendingPrompt: "owner reply",
+				pendingBy: "user",
+				needsReason: "owner decision",
+			});
+			revised = await store.getTask(task.id);
+			events = await store.events();
+		} finally {
+			release.resolve("recovered-head");
+			await recovery;
+		}
+		expect(await store.getTask(task.id)).toEqual(revised);
+		expect(
+			(await store.events()).filter((event) => event.kind !== "error"),
+		).toEqual(events.filter((event) => event.kind !== "error"));
+		const settledTurn = (await store.listTurns(task.id)).find(
+			(row) => row.id === turn.id,
+		)!;
+		expect(settledTurn.endedAt).not.toBeNull();
+		expect(settledTurn.error).toContain("restarted");
+	});
+
+	test("review child creation and final findings state remain atomic across a yield", async () => {
+		const record = baseRecord();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			commitsAhead: async () => 0,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.(`session-${record.runs.length}`);
+				return {
+					pid: 4242,
+					done: Promise.resolve(
+						record.runs.length === 1
+							? runResult({
+									outcome: { status: "answered", summary: "review complete" },
+									recorded: [
+										{
+											prompt: "A real finding",
+											model: null,
+											rank: 1,
+											security: null,
+										},
+									],
+								})
+							: runResult({
+									finalText: '[{"id":1,"keep":true,"reason":""}]',
+								}),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = await store.createTask(
+			`${ARCH_REVIEW_MARKER}main (3 commits)`,
+			null,
+			"review",
+		);
+		await store.updateTask(review.id, { base: "review-base" });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const createTask = store.createTask.bind(store);
+		store.createTask = async (
+			...args: Parameters<ProjectStore["createTask"]>
+		) => {
+			const child = await createTask(...args);
+			entered.resolve();
+			await release.promise;
+			return child;
+		};
+		const run = loop.runTurn(store.name, review.id);
+		await entered.promise;
+		let observed = false;
+		const snapshot = store.transaction(async () => {
+			observed = true;
+			return {
+				tasks: await store.listTasks(),
+				events: await store.events(),
+			};
+		});
+		try {
+			await flushPromises();
+			expect(observed).toBe(false);
+		} finally {
+			release.resolve();
+			await run;
+		}
+		const after = await snapshot;
+		const parent = after.tasks.find((task) => task.id === review.id)!;
+		expect(parent).toMatchObject({
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+		});
+		expect(parent.findingsCheckedAt).not.toBeNull();
+		const children = after.tasks.filter(
+			(task) => task.followUpOf === review.id,
+		);
+		expect(children).toHaveLength(1);
+		expect(children[0]).toMatchObject({
+			prompt: "A real finding",
+			stage: "todo",
+			state: "queued",
+			promptAuthor: "board",
+		});
+		expect(
+			after.events.filter(
+				(event) => event.kind === "create" && event.taskId === children[0]!.id,
+			),
+		).toHaveLength(1);
+		expect(
+			after.events.filter(
+				(event) =>
+					event.taskId === review.id &&
+					event.kind === "state" &&
+					event.to === "idle",
+			),
+		).toHaveLength(1);
+	});
+
+	test("cancel persists its early mark before kill and preserves a later task revision", async () => {
+		const { store, record, loop } = await setup();
+		const task = await store.createTask("cancel the live turn");
+		await store.updateTask(task.id, {
+			stage: "in_progress",
+			state: "running",
+			sessionId: "old-session",
+			base: "old-base",
+			worktree: join(store.worktreesDir, task.id),
+			branch: "ott/cancel-boundary",
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const done = Promise.withResolvers<void>();
+		loop.running.set(`${store.name}/${task.id}`, {
+			pid: 4242,
+			done: done.promise,
+			kill: async () => {
+				entered.resolve();
+				await release.promise;
+				done.resolve();
+			},
+		});
+		const cancellation = loop.cancel(fakeProject(store), task.id, false);
+		await entered.promise;
+		let revised: Task | null = null;
+		let events = await store.events();
+		try {
+			const claimed = (await store.getTask(task.id))!;
+			expect(claimed.cancelledAt).not.toBeNull();
+			expect(claimed.state).toBe("running");
+			expect(record.removeWorktree).toHaveLength(0);
+			await store.updateTask(task.id, {
+				state: "needs_you",
+				sessionId: "new-session",
+				base: "new-base",
+				pendingPrompt: "new owner reply",
+				needsReason: "new owner decision",
+			});
+			revised = await store.getTask(task.id);
+			events = await store.events();
+		} finally {
+			release.resolve();
+			await cancellation;
+		}
+		expect(await store.getTask(task.id)).toEqual(revised);
+		expect(await store.events()).toEqual(events);
 	});
 });

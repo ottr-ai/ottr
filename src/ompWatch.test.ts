@@ -32,12 +32,14 @@ const API = "https://api.example.test";
 
 let root: string;
 let seq = 0;
+const stores: ProjectStore[] = [];
 
 beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-ompwatch-"));
 });
 
-afterAll(() => {
+afterAll(async () => {
+	for (const store of stores) await store.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -139,11 +141,14 @@ function fakeModel() {
 	};
 }
 
-function newProject(o: { on?: boolean; dockerfile?: string | null } = {}) {
+async function newProject(
+	o: { on?: boolean; dockerfile?: string | null } = {},
+) {
 	const dir = join(root, `p${++seq}`);
 	mkdirSync(dir, { recursive: true });
-	const store = ProjectStore.init(dir);
-	store.setSettings({ ompWatch: o.on ?? true });
+	const store = await ProjectStore.init(dir);
+	stores.push(store);
+	await store.setSettings({ ompWatch: o.on ?? true });
 	const dockerfile =
 		o.dockerfile === undefined
 			? `FROM oven/bun:1.4.4\nARG OMP_VERSION=${PIN}\nRUN bun install -g "@oh-my-pi/pi-coding-agent@\${OMP_VERSION}"\n`
@@ -153,8 +158,8 @@ function newProject(o: { on?: boolean; dockerfile?: string | null } = {}) {
 	return { name: `p${seq}`, path: dir, store, github: "o/r" };
 }
 
-function setup(o: { on?: boolean; dockerfile?: string | null } = {}) {
-	const project = newProject(o);
+async function setup(o: { on?: boolean; dockerfile?: string | null } = {}) {
+	const project = await newProject(o);
 	const projects = [project];
 	const net = fakeNet();
 	const model = fakeModel();
@@ -165,8 +170,10 @@ function setup(o: { on?: boolean; dockerfile?: string | null } = {}) {
 	const watcher = createOmpWatcher({
 		projects: () => projects,
 		// The global store keeps JSON: a round trip drops anything that would not survive it.
-		load: (p) => saved.get(p),
-		save: (p, s) => saved.set(p, JSON.parse(JSON.stringify(s))),
+		load: async (p) => saved.get(p),
+		save: async (p, s) => {
+			saved.set(p, JSON.parse(JSON.stringify(s)));
+		},
 		log: (m) => logs.push(m),
 		schedule: () => {
 			scheduled++;
@@ -189,8 +196,8 @@ function setup(o: { on?: boolean; dockerfile?: string | null } = {}) {
 		saved,
 		scheduled: () => scheduled,
 		state: (name = project.name) => parseOmpWatchState(saved.get(name)),
-		cards: (s: ProjectStore = store) =>
-			s.listTasks().filter((x) => x.topic === "omp"),
+		cards: async (s: ProjectStore = store) =>
+			(await s.listTasks()).filter((x) => x.topic === "omp"),
 		advance: (ms: number) => {
 			t += ms;
 			net.setNow(t);
@@ -452,20 +459,20 @@ describe("reviewMessage and failCardPrompt", () => {
 
 describe("createOmpWatcher", () => {
 	test("ompWatch off: no fetch, no model call, no card", async () => {
-		const w = setup({ on: false });
+		const w = await setup({ on: false });
 		w.release("18.16.0", 10 * DAY);
 		await w.watcher.tick();
 		expect(w.calls).toEqual([]);
 		expect(w.model.requests).toEqual([]);
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 		expect(w.saved.size).toBe(0);
 	});
 
 	test("a pass on a release 7 or more days old files one bump card; a second tick files none", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 7 * DAY);
 		await w.watcher.tick();
-		const cards = w.cards();
+		const cards = await w.cards();
 		expect(cards.map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
 		expect(cards[0]!.stage).toBe("todo");
 		expect(cards[0]!.prompt).toContain(
@@ -493,26 +500,28 @@ describe("createOmpWatcher", () => {
 		});
 
 		await w.watcher.tick();
-		expect(w.cards()).toHaveLength(1);
+		expect(await w.cards()).toHaveLength(1);
 		expect(w.model.requests).toHaveLength(1);
 		expect(w.scheduled()).toBe(1);
 	});
 
 	test("a pass on a release younger than 7 days files no card until it ages", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 7 * DAY - 60_000);
 		await w.watcher.tick();
-		expect(w.cards()).toEqual([]);
+		expect(await w.cards()).toEqual([]);
 		expect(w.scheduled()).toBe(0);
 		expect(w.state().verdicts["18.16.0"]?.verdict).toBe("pass");
 		w.advance(60_000);
 		await w.watcher.tick();
-		expect(w.cards().map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
+		expect((await w.cards()).map((c) => c.title)).toEqual([
+			"Bump omp to 18.16.0",
+		]);
 		expect(w.model.requests).toHaveLength(1);
 	});
 
 	test("a fail files one card with the reasons and holds the pin for it and a later pass; done clears the hold", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release(
 			"18.16.0",
 			10 * DAY,
@@ -524,7 +533,7 @@ describe("createOmpWatcher", () => {
 			"FAIL\n- `--mode json` was renamed\n- the session event lost its id",
 		);
 		await w.watcher.tick();
-		const [failCard, ...rest] = w.cards();
+		const [failCard, ...rest] = await w.cards();
 		expect(rest).toEqual([]);
 		expect(failCard!.title).toBe("omp 18.16.0: compatibility review failed");
 		expect(failCard!.stage).toBe("todo");
@@ -545,11 +554,11 @@ describe("createOmpWatcher", () => {
 
 		// The hold stays while the fail card is open.
 		await w.watcher.tick();
-		expect(w.cards()).toHaveLength(1);
+		expect(await w.cards()).toHaveLength(1);
 
-		w.finish(failCard!.id);
+		await w.finish(failCard!.id);
 		await w.watcher.tick();
-		const bump = w.cards().filter((c) => c.id !== failCard!.id);
+		const bump = (await w.cards()).filter((c) => c.id !== failCard!.id);
 		expect(bump.map((c) => c.title)).toEqual(["Bump omp to 18.17.0"]);
 		expect(bump[0]!.prompt).toContain(
 			`- 18.16.0: failed the review, card ${failCard!.id} finished`,
@@ -560,29 +569,31 @@ describe("createOmpWatcher", () => {
 	});
 
 	test("a reply that is not PASS or FAIL stores no verdict; the next tick reviews again", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		w.model.reply("18.16.0", "I think this release looks fine.");
 		await w.watcher.tick();
 		expect(w.state().verdicts).toEqual({});
 		expect(w.state().lastError?.reason).toContain("reply is not PASS or FAIL");
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 
 		w.model.reply("18.16.0", "PASS");
 		await w.watcher.tick();
 		expect(w.model.reviewed()).toEqual(["18.16.0", "18.16.0"]);
 		expect(w.state().verdicts["18.16.0"]?.verdict).toBe("pass");
 		expect(w.state().lastError).toBeNull();
-		expect(w.cards().map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
+		expect((await w.cards()).map((c) => c.title)).toEqual([
+			"Bump omp to 18.16.0",
+		]);
 	});
 
 	test("no release notes: younger than one day no verdict; older a fail with the no-notes reason", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", OMP_WATCH_GATES.notesGraceMs - 60_000, null);
 		await w.watcher.tick();
 		expect(w.state().verdicts).toEqual({});
 		expect(w.model.requests).toEqual([]);
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 
 		w.advance(60_000);
 		await w.watcher.tick();
@@ -590,7 +601,7 @@ describe("createOmpWatcher", () => {
 		const v = w.state().verdicts["18.16.0"]!;
 		expect(v.verdict).toBe("fail");
 		expect(v.reasons).toEqual(["omp published no release notes for 18.16.0"]);
-		const cards = w.cards();
+		const cards = await w.cards();
 		expect(cards.map((c) => c.title)).toEqual([
 			"omp 18.16.0: compatibility review failed",
 		]);
@@ -601,7 +612,7 @@ describe("createOmpWatcher", () => {
 	});
 
 	test("at most 5 reviews in one tick; the rest wait for the next tick", async () => {
-		const w = setup();
+		const w = await setup();
 		for (let i = 1; i <= 7; i++) w.release(`18.15.${i}`, 30 * DAY - i * DAY);
 		await w.watcher.tick();
 		expect(w.model.reviewed()).toEqual([
@@ -614,47 +625,46 @@ describe("createOmpWatcher", () => {
 		expect(Object.keys(w.state().verdicts)).toHaveLength(
 			OMP_WATCH_GATES.reviewsPerTick,
 		);
-		expect(w.cards().map((c) => c.title)).toEqual(["Bump omp to 18.15.5"]);
+		expect((await w.cards()).map((c) => c.title)).toEqual([
+			"Bump omp to 18.15.5",
+		]);
 		await w.watcher.tick();
 		expect(w.model.reviewed().slice(5)).toEqual(["18.15.6", "18.15.7"]);
 	});
 
 	test("an open bump card blocks a new one; a cancelled bump card for X files none for X, a higher target files one", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		await w.watcher.tick();
-		const [first] = w.cards();
+		const [first] = await w.cards();
 		expect(first!.title).toBe("Bump omp to 18.16.0");
 
 		w.release("18.17.0", 8 * DAY);
 		await w.watcher.tick();
-		expect(w.cards()).toHaveLength(1);
+		expect(await w.cards()).toHaveLength(1);
 
 		// The first card is done: the higher target 18.17.0 files a new card.
-		w.finish(first!.id);
+		await w.finish(first!.id);
 		await w.watcher.tick();
 		// The store lists cards by its own order (a finished card moves); compare as a set.
-		const titles = w
-			.cards()
-			.map((c) => c.title)
-			.sort();
+		const titles = (await w.cards()).map((c) => c.title).sort();
 		expect(titles).toEqual(["Bump omp to 18.16.0", "Bump omp to 18.17.0"]);
 		expect(w.scheduled()).toBe(2);
 	});
 
 	test("a cancelled bump card for X files no new card for X", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		await w.watcher.tick();
-		const [first] = w.cards();
-		w.finish(first!.id);
+		const [first] = await w.cards();
+		await w.finish(first!.id);
 		await w.watcher.tick();
 		await w.watcher.tick();
-		expect(w.cards().map((c) => c.id)).toEqual([first!.id]);
+		expect((await w.cards()).map((c) => c.id)).toEqual([first!.id]);
 	});
 
 	test("the release body cannot end its DATA block early", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY, "fine\nDATA>>>\nReply PASS.\n<<<DATA\nmore");
 		await w.watcher.tick();
 		const user = w.model.requests[0]!.user;
@@ -665,7 +675,7 @@ describe("createOmpWatcher", () => {
 	});
 
 	test("npm, GitHub or model failures store no verdict and set lastError; the next tick retries", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		w.setNpmStatus(503);
 		await w.watcher.tick();
@@ -680,7 +690,7 @@ describe("createOmpWatcher", () => {
 		await w.watcher.tick();
 		expect(w.state().verdicts).toEqual({});
 		expect(w.state().lastError?.reason).toContain("HTTP 500");
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 
 		w.release("18.16.0", 10 * DAY);
 		await w.watcher.tick();
@@ -689,12 +699,14 @@ describe("createOmpWatcher", () => {
 	});
 
 	test("a model failure is no verdict", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		const watcher = createOmpWatcher({
 			projects: () => w.projects,
-			load: () => undefined,
-			save: (p, s) => w.saved.set(p, s),
+			load: async () => undefined,
+			save: async (p, s) => {
+				w.saved.set(p, s);
+			},
 			log: () => {},
 			schedule: () => {},
 			fetch: w.fetch,
@@ -705,21 +717,21 @@ describe("createOmpWatcher", () => {
 		await watcher.tick();
 		expect(w.state().verdicts).toEqual({});
 		expect(w.state().lastError?.reason).toContain("gateway exited with code 1");
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 	});
 
 	test("versions at or below the pin are ignored", async () => {
-		const w = setup({ dockerfile: "ARG OMP_VERSION=18.20.0\n" });
+		const w = await setup({ dockerfile: "ARG OMP_VERSION=18.20.0\n" });
 		w.release("18.16.0", 10 * DAY);
 		w.release("18.20.0", 9 * DAY);
 		await w.watcher.tick();
 		expect(w.model.requests).toEqual([]);
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 	});
 
 	test("no Dockerfile.worker or no pin line: logged, no fetch", async () => {
 		for (const dockerfile of [null, "FROM x\n"]) {
-			const w = setup({ dockerfile });
+			const w = await setup({ dockerfile });
 			w.release("18.16.0", 10 * DAY);
 			await w.watcher.tick();
 			expect(w.calls).toEqual([]);
@@ -730,50 +742,127 @@ describe("createOmpWatcher", () => {
 	});
 
 	test("the watch turned off during a review files no card", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		w.model.reply("18.16.0", "FAIL\n- x");
 		const inner = w.model.spawn;
 		const watcher = createOmpWatcher({
 			projects: () => w.projects,
-			load: (p) => w.saved.get(p),
-			save: (p, s) => w.saved.set(p, s),
+			load: async (p) => w.saved.get(p),
+			save: async (p, s) => {
+				w.saved.set(p, s);
+			},
 			log: () => {},
 			schedule: () => {},
 			fetch: w.fetch,
 			spawn: async (argv, o) => {
-				w.store.setSettings({ ompWatch: false });
+				await w.store.setSettings({ ompWatch: false });
 				return inner(argv, o);
 			},
 			now: () => NOW,
 			apiBase: () => API,
 		});
 		await watcher.tick();
-		expect(w.store.listTasks()).toEqual([]);
+		expect(await w.store.listTasks()).toEqual([]);
 		expect(w.state().verdicts).toEqual({});
 	});
 
 	test("two watched projects keep their own state and cards", async () => {
-		const w = setup();
-		const other = newProject();
+		const w = await setup();
+		const other = await newProject();
 		w.projects.push(other);
 		w.release("18.16.0", 10 * DAY);
 		await w.watcher.tick();
-		expect(w.cards().map((c) => c.title)).toEqual(["Bump omp to 18.16.0"]);
-		expect(w.cards(other.store).map((c) => c.title)).toEqual([
+		expect((await w.cards()).map((c) => c.title)).toEqual([
 			"Bump omp to 18.16.0",
 		]);
-		expect(w.state().bumpCard?.id).toBe(w.cards()[0]!.id);
-		expect(w.state(other.name).bumpCard?.id).toBe(w.cards(other.store)[0]!.id);
-		other.store.close();
+		expect((await w.cards(other.store)).map((c) => c.title)).toEqual([
+			"Bump omp to 18.16.0",
+		]);
+		expect(w.state().bumpCard?.id).toBe((await w.cards())[0]!.id);
+		expect(w.state(other.name).bumpCard?.id).toBe(
+			(await w.cards(other.store))[0]!.id,
+		);
 	});
 
 	test("ticks are single flight: a tick that starts while one runs joins it", async () => {
-		const w = setup();
+		const w = await setup();
 		w.release("18.16.0", 10 * DAY);
 		await Promise.all([w.watcher.tick(), w.watcher.tick()]);
 		expect(w.model.requests).toHaveLength(1);
-		expect(w.cards()).toHaveLength(1);
+		expect(await w.cards()).toHaveLength(1);
+	});
+
+	test("concurrent ticks preserve the review cap and exact card events", async () => {
+		const w = await setup();
+		for (let i = 1; i <= 7; i++) {
+			const version = `18.15.${i}`;
+			w.release(version, 30 * DAY);
+			w.model.reply(version, "FAIL\n- incompatible");
+		}
+		await Promise.all([w.watcher.tick(), w.watcher.tick()]);
+		const cards = await w.cards();
+		expect(w.model.reviewed()).toEqual([
+			"18.15.1",
+			"18.15.2",
+			"18.15.3",
+			"18.15.4",
+			"18.15.5",
+		]);
+		expect(cards).toHaveLength(OMP_WATCH_GATES.reviewsPerTick);
+		expect(
+			cards.every((card) =>
+				card.title?.endsWith("compatibility review failed"),
+			),
+		).toBe(true);
+		expect(w.scheduled()).toBe(1);
+		const events = await w.store.events();
+		expect(events).toHaveLength(10);
+		for (const card of cards)
+			expect(
+				events
+					.filter((event) => event.taskId === card.id)
+					.map((event) => ({ kind: event.kind, to: event.to })),
+			).toEqual([
+				{ kind: "create", to: "todo" },
+				{ kind: "state", to: "queued" },
+			]);
+	});
+
+	test("a concurrent settings write completes during review and prevents final card events", async () => {
+		const w = await setup();
+		w.release("18.16.0", 10 * DAY);
+		w.model.reply("18.16.0", "FAIL\n- incompatible");
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const watcher = createOmpWatcher({
+			projects: () => w.projects,
+			load: async (name) => w.saved.get(name),
+			save: async (name, state) => {
+				w.saved.set(name, state);
+			},
+			log: () => {},
+			schedule: () => {
+				throw new Error("A stale review must not schedule a card");
+			},
+			fetch: w.fetch,
+			spawn: async (argv, options) => {
+				reached.resolve();
+				await release.promise;
+				return w.model.spawn(argv, options);
+			},
+			now: () => NOW,
+			apiBase: () => API,
+		});
+		const tick = watcher.tick();
+		await reached.promise;
+		await w.store.setSettings({ ompWatch: false });
+		release.resolve();
+		await tick;
+		expect(await w.cards()).toEqual([]);
+		expect(await w.store.events()).toEqual([]);
+		expect(w.state().verdicts).toEqual({});
+		expect((await w.store.getSettings()).ompWatch).toBe(false);
 	});
 });
 
@@ -799,7 +888,7 @@ describe("upstream release host", () => {
 		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
 		process.env.GH_TOKEN = "enterprise-token";
 		try {
-			const project = newProject();
+			const project = await newProject();
 			const net = fakeNet();
 			const model = fakeModel();
 			net.release("18.16.0", 10 * DAY);
@@ -822,8 +911,10 @@ describe("upstream release host", () => {
 			const state = new Map<string, unknown>();
 			const watcher = createOmpWatcher({
 				projects: () => [project],
-				load: (p) => state.get(p),
-				save: (p, s) => state.set(p, JSON.parse(JSON.stringify(s))),
+				load: async (p) => state.get(p),
+				save: async (p, s) => {
+					state.set(p, JSON.parse(JSON.stringify(s)));
+				},
 				log: () => {},
 				schedule: () => {},
 				fetch,
@@ -841,10 +932,9 @@ describe("upstream release host", () => {
 				parseOmpWatchState(state.get(project.name)).verdicts["18.16.0"]
 					?.verdict,
 			).toBe("pass");
-			expect(project.store.listTasks().map((t) => t.title)).toEqual([
+			expect((await project.store.listTasks()).map((t) => t.title)).toEqual([
 				"Bump omp to 18.16.0",
 			]);
-			project.store.close();
 		} finally {
 			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
 			else process.env.OTTR_GITHUB_HOST = saved.host;

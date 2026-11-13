@@ -10,7 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AppServeOptions, createApp, type Entry } from "./app.ts";
+import {
+	type App,
+	type AppServeOptions,
+	createApp,
+	type Entry,
+} from "./app.ts";
 import { signIdentity } from "./auth.ts";
 import { createHostedGitAuth, HOSTED_TOKEN_MARGIN_MS } from "./gitHosts.ts";
 import { GlobalStore } from "./globalStore.ts";
@@ -23,14 +28,16 @@ import { git, setHostedGitAuth, setNetworkGitAuth } from "./worktree.ts";
 // Hosted mode's per-project git credential (docs/specs/hosted-mode.md section 6).
 
 const root = mkdtempSync(join(tmpdir(), "hosted-git-"));
-const stores: { close(): void }[] = [];
+const apps: App[] = [];
+const stores: { close(): Promise<void> }[] = [];
 afterEach(() => {
 	// createApp and the tests install module-wide resolvers: no test leaks one into the next.
 	setHostedGitAuth(null);
 	setNetworkGitAuth(() => ({}));
 });
-afterAll(() => {
-	for (const s of stores) s.close();
+afterAll(async () => {
+	for (const app of apps) await app.close();
+	for (const s of stores) await s.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -241,13 +248,16 @@ describe("hosted network git credential (createHostedGitAuth)", () => {
 	test("concurrent misses for one project and remote share one hook call", async () => {
 		clock = 0;
 		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
 		const t = unitAuth("flight", async (project, n) => {
+			entered.resolve();
 			await gate.promise;
 			return { token: `minted-${project}-${n}`, expiresAt: clock + HOUR };
 		});
 		const all = Promise.all(
 			[1, 2, 3].map(() => t.auth.network(t.a, pushArgs(URL_A))),
 		);
+		await entered.promise;
 		expect(t.calls).toHaveLength(1);
 		gate.resolve();
 		const envs = await all;
@@ -408,17 +418,17 @@ const shared = () => ({
 });
 
 /** A board with project `p` (a git repo whose origin is an ssh fake host) pinned to URL_A. */
-function board(
+async function board(
 	name: string,
 	hosted: Hosted | undefined,
 	fetchImpl?: typeof globalThis.fetch,
 ) {
 	const base = join(root, name);
 	mkdirSync(base, { recursive: true });
-	const g = GlobalStore.open(join(base, "g"));
+	const g = await GlobalStore.open(join(base, "g"));
 	stores.push(g);
 	// A board-global token for github.com: flag off it rides every https call there.
-	g.set("config", {
+	await g.set("config", {
 		gitTokens: [
 			{ host: "github.com", username: "x-access-token", token: GLOBAL },
 		],
@@ -432,9 +442,9 @@ function board(
 		const r = Bun.spawnSync(["git", ...args], { cwd: dir });
 		expect(r.exitCode).toBe(0);
 	}
-	const store = ProjectStore.open(dir);
+	const store = await ProjectStore.open(dir);
 	stores.push(store);
-	store.setSettings({ originUrl: URL_A });
+	await store.setSettings({ originUrl: URL_A });
 	const projects = new Map<string, Entry>();
 	projects.set("p", {
 		path: dir,
@@ -452,7 +462,7 @@ function board(
 		latestImage: null,
 		archReview: null,
 	});
-	const app = createApp({
+	const app = await createApp({
 		gstore: g,
 		defaultDir: base,
 		projects,
@@ -472,6 +482,7 @@ function board(
 		hosted,
 		githubAuthProbe: fetchImpl ? { fetchImpl } : undefined,
 	});
+	apps.push(app);
 	// git runs GIT_SSH_COMMAND for the ssh origin, so the script records the exact env of the
 	// network git child. (git drops GIT_CONFIG_COUNT for its ssh child, so the credential
 	// lookup itself is proven by the unit tests above.)
@@ -493,7 +504,7 @@ describe("createApp network git credential", () => {
 			token: `minted-${project}-${n}`,
 			expiresAt: Date.now() + HOUR,
 		}));
-		const b = board("app-hosted", {
+		const b = await board("app-hosted", {
 			config: {
 				tenant: "acme",
 				secret: "hosted-secret-".repeat(4),
@@ -533,7 +544,7 @@ describe("createApp network git credential", () => {
 		if (process.platform === "win32") return; // the fake ssh is a sh script
 		// The hosted resolver stays unset: a self-hosted app clears it.
 		setHostedGitAuth(unitAuth("app-self-stale").auth);
-		const b = board("app-self", undefined);
+		const b = await board("app-self", undefined);
 		await b.fetch();
 		const env = b.childEnv();
 		expect(env).toMatch(new RegExp(`^OTTR_GIT_TOKEN_0=${GLOBAL}$`, "m"));
@@ -567,31 +578,31 @@ function probe() {
 
 describe("hosted push credential line and auth hint", () => {
 	test("hosted pushAuthKind names the control-plane token, never the global kinds", async () => {
-		const b = board("kind-hosted", hostedCfg(fakeHooks().hooks));
+		const b = await board("kind-hosted", hostedCfg(fakeHooks().hooks));
 		await withEnv("GH_TOKEN", GLOBAL, async () => {
-			const line = b.app.pushAuthKind(URL_A);
+			const line = await b.app.pushAuthKind(URL_A);
 			expect(line).toBe(
 				"the control-plane token for the project, when it has one",
 			);
 			expect(line).not.toContain("board-stored");
 			expect(line).not.toContain("GH_TOKEN");
 			expect(line).not.toContain("credential helper");
-			expect(b.app.pushAuthKind("git@github.com:acme/a.git")).toBe(
+			expect(await b.app.pushAuthKind("git@github.com:acme/a.git")).toBe(
 				"no credential the board knows of",
 			);
 		});
 	});
 
-	test("flag off: pushAuthKind still names the board-stored token", () => {
-		const b = board("kind-self", undefined);
-		expect(b.app.pushAuthKind(URL_A)).toContain(
+	test("flag off: pushAuthKind still names the board-stored token", async () => {
+		const b = await board("kind-self", undefined);
+		expect(await b.app.pushAuthKind(URL_A)).toContain(
 			"a board-stored token for github.com (personal access token)",
 		);
 	});
 
 	test("hosted githubAuthHint makes no request with the global token", async () => {
 		const p = probe();
-		const b = board("hint-hosted", hostedCfg(fakeHooks().hooks), p.impl);
+		const b = await board("hint-hosted", hostedCfg(fakeHooks().hooks), p.impl);
 		await withEnv("GH_TOKEN", GLOBAL, async () => {
 			expect(await b.app.githubAuthHint(URL_A)).toBeNull();
 		});
@@ -600,7 +611,7 @@ describe("hosted push credential line and auth hint", () => {
 
 	test("flag off: githubAuthHint still probes with the board-global token", async () => {
 		const p = probe();
-		const b = board("hint-self", undefined, p.impl);
+		const b = await board("hint-self", undefined, p.impl);
 		await b.app.githubAuthHint(URL_A);
 		expect(p.auths.some((a) => a.includes(GLOBAL))).toBe(true);
 	});
@@ -674,7 +685,7 @@ describe("hosted Add-project clone", () => {
 			token: `minted-${project}-${n}`,
 			expiresAt: Date.now() + HOUR,
 		}));
-		const b = board("clone-hosted", hostedCfg(hooks));
+		const b = await board("clone-hosted", hostedCfg(hooks));
 		auths.length = 0;
 		await withEnv("GIT_SSL_NO_VERIFY", "1", () =>
 			withEnv("GH_TOKEN", GLOBAL, async () => {
@@ -702,7 +713,7 @@ describe("hosted Add-project clone", () => {
 	test("a null token (hook 404) runs the hosted clone credential-less", async () => {
 		if (process.platform === "win32") return; // the credential helper is a sh function
 		const { hooks, calls } = fakeHooks(() => null);
-		const b = board("clone-hosted-null", hostedCfg(hooks));
+		const b = await board("clone-hosted-null", hostedCfg(hooks));
 		auths.length = 0;
 		await withEnv("GIT_SSL_NO_VERIFY", "1", () =>
 			withEnv("GH_TOKEN", GLOBAL, async () => {
@@ -726,7 +737,7 @@ describe("hosted Add-project clone", () => {
 			token: "leaked-token-1",
 			expiresAt: Date.now() + HOUR,
 		}));
-		const b = board("clone-hosted-leak", hostedCfg(hooks));
+		const b = await board("clone-hosted-leak", hostedCfg(hooks));
 		auths.length = 0;
 		// The url echoes the minted token (as a git error does for an authed remote), so
 		// the redaction list of the clone must hold the token pending() minted.
@@ -751,7 +762,7 @@ describe("hosted Add-project clone", () => {
 			probes.push(`${url} ${new Headers(init?.headers).get("authorization")}`);
 			return new Response("{}", { status: 404 });
 		}) as typeof globalThis.fetch;
-		const b = board("clone-hosted-hint", hostedCfg(hooks), probe);
+		const b = await board("clone-hosted-hint", hostedCfg(hooks), probe);
 		// The remote counts as the configured GitHub host and GH_TOKEN is set, so the
 		// self-host diagnostic would probe the REST API with the global token.
 		await withEnv("GIT_SSL_NO_VERIFY", "1", () =>

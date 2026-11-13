@@ -478,29 +478,36 @@ export function findDep(
 }
 
 /** The resolver's view of one project store: name, id handle, task lookup. */
-export function depProjectOf(store: {
+export async function depProjectOf(store: {
 	name: string;
-	taskPrefix(): string;
-	getTask(id: string): DepCard | null;
-}): DepProject {
-	return {
-		name: store.name,
-		prefix: store.taskPrefix(),
-		getTask: (id) => store.getTask(id),
-	};
+	taskPrefix(): Promise<string>;
+	listTasks(): Promise<DepCard[]>;
+	transaction<T>(work: () => T | Promise<T>): Promise<T>;
+}): Promise<DepProject> {
+	return store.transaction(async () => {
+		const prefix = await store.taskPrefix();
+		const tasks = await store.listTasks();
+		const byId = new Map(tasks.map((task) => [task.id, task]));
+		return {
+			name: store.name,
+			prefix,
+			getTask: (id: string) => byId.get(id) ?? null,
+		};
+	});
 }
 
 /** The resolver's view of the board's projects; entries only need a store. */
-export function depProjectsOf(
+export async function depProjectsOf(
 	projects: Iterable<{
 		store: {
 			name: string;
-			taskPrefix(): string;
-			getTask(id: string): DepCard | null;
+			taskPrefix(): Promise<string>;
+			listTasks(): Promise<DepCard[]>;
+			transaction<T>(work: () => T | Promise<T>): Promise<T>;
 		};
 	}>,
-): DepProject[] {
-	return [...projects].map((e) => depProjectOf(e.store));
+): Promise<DepProject[]> {
+	return Promise.all([...projects].map((e) => depProjectOf(e.store)));
 }
 
 /** The needs_you reason a settle block shows for a report_outcome dependsOn id that

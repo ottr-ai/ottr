@@ -5,7 +5,12 @@
 import { constants, homedir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
-import { createApp, ompSessionStores, storedProjectPaths } from "./app.ts";
+import {
+	type App,
+	createApp,
+	ompSessionStores,
+	storedProjectPaths,
+} from "./app.ts";
 import { ensureProjectPackages } from "./apt.ts";
 import { newSecret } from "./auth.ts";
 import { backupSources, backupTick, resolveBackup } from "./backup.ts";
@@ -155,7 +160,7 @@ const ROOTS = process.env.OMP_TRACKER_ROOTS
 // Scratch tests and dev boards set OTTR_STATE_DIR so the global kv store never
 // opens (and locks) the checkout's own tracker.db.
 const STATE_DIR = process.env.OTTR_STATE_DIR ?? resolve(import.meta.dir, "..");
-const gstore = GlobalStore.open(STATE_DIR);
+const gstore = await GlobalStore.open(STATE_DIR);
 /** Jira token sealing (docs/specs/jira-import.md section 1): the key file sits next to tracker.db.
  * A malformed key never stops the boot: the Jira routes answer 503 until it is fixed. */
 let secretBox: SecretBox | undefined;
@@ -201,25 +206,85 @@ const shared: {
 	commitIdentity: null,
 	envValues: {},
 	envPlain: {},
-	...storedProjectPaths(gstore),
+	...(await storedProjectPaths(gstore)),
 };
 
 const projects = new Map<string, Entry>();
+let shuttingDown = false;
+const timers: Timer[] = [];
+const activeWork = new Set<Promise<unknown>>();
+const serverRef: { current: Server<undefined> | undefined } = {
+	current: undefined,
+};
+let statsServer: Server<undefined> | undefined;
+let backupWork: Promise<void> | undefined;
+
+function runWork(work: () => void | Promise<unknown>): void {
+	if (shuttingDown) return;
+	const pending = Promise.resolve().then(() => {
+		if (!shuttingDown) return work();
+	});
+	activeWork.add(pending);
+	void pending
+		.catch((err) => logError("background work failed", err))
+		.finally(() => {
+			activeWork.delete(pending);
+		});
+}
+
+function every(work: () => void | Promise<unknown>, ms: number): void {
+	timers.push(setInterval(() => runWork(work), ms));
+}
 /** Set once createTurnLoop returns; a signal during boot finds no live turns and skips the kill sweep. */
 let loopRef: TurnLoop | undefined;
-/** Normal-exit path: best-effort cancel of live turns, then release every instance lock. */
-function shutdown(exitCode: number): never {
-	for (const h of loopRef?.running.values() ?? [])
-		if (h.pid !== null) platform.killTree(h.pid);
-	for (const e of projects.values()) {
+let appRef: App | undefined;
+/** Stop new work, settle active callbacks, and release all locks before exit. */
+async function shutdown(exitCode: number): Promise<void> {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	for (const timer of timers) clearInterval(timer);
+	let failed = false;
+	for (const h of loopRef?.running.values() ?? []) {
+		if (h.pid === null) continue;
 		try {
-			e.store.close();
-		} catch {
-			// a project that will not close must not block the others' release
+			platform.killTree(h.pid);
+		} catch (err) {
+			failed = true;
+			logError("shutdown: could not stop a turn", err);
 		}
 	}
-	gstore.close();
-	process.exit(exitCode);
+	const stopped = await Promise.allSettled([
+		serverRef.current?.stop(true),
+		statsServer?.stop(true),
+		...activeWork,
+		backupWork,
+	]);
+	for (const result of stopped) {
+		if (result.status !== "rejected") continue;
+		failed = true;
+		logError("shutdown: active work failed", result.reason);
+	}
+	try {
+		await appRef?.close();
+	} catch (err) {
+		failed = true;
+		logError("shutdown: could not close the app", err);
+	}
+	for (const e of projects.values()) {
+		try {
+			await e.store.close();
+		} catch (err) {
+			failed = true;
+			logError(`shutdown: could not close ${e.name}`, err);
+		}
+	}
+	try {
+		await gstore.close();
+	} catch (err) {
+		failed = true;
+		logError("shutdown: could not close the global store", err);
+	}
+	process.exit(exitCode === 0 && failed ? 1 : exitCode);
 }
 // omp must not outlive the tracker: when the server goes down, the turns it
 // was running go with it (and store closes drop the databases' exclusive lock).
@@ -228,7 +293,7 @@ process.on("exit", () => {
 		if (h.pid !== null) platform.killTree(h.pid);
 });
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-	process.on(signal, () => shutdown(128 + constants.signals[signal]));
+	process.on(signal, () => void shutdown(128 + constants.signals[signal]));
 }
 // A bug in a timer tick or a fire-and-forget must log and keep the board up, not kill the server:
 // every loop here re-runs on its own schedule, so the failing tick heals itself on the next pass.
@@ -286,15 +351,17 @@ async function refreshArchReview(e: Entry): Promise<void> {
 	// One anchor for the count and the view: the delta counts from the newest done full
 	// review's base (a release card must not reset it, docs/specs/mutation-delta.md §6), and
 	// archReviewView reads the same base, so Settings cannot disagree with the count.
-	const last = lastFullReview(e.store.listTasks());
+	const last = lastFullReview(await e.store.listTasks());
 	const a = await archReviewDelta(
 		e.path,
 		e.target,
 		last === null ? null : last.base,
 	).catch(() => null);
-	const cap = getSettingsLogged(e).archReviewCap;
-	// Running: a review is queued or running, or its findings are still landing.
-	const running = reviewBlocked(e.store.listTasks()) !== null;
+	const { cap, running } = await e.store.transaction(async () => ({
+		cap: (await getSettingsLogged(e)).archReviewCap,
+		// Running: a review is queued or running, or its findings are still landing.
+		running: reviewBlocked(await e.store.listTasks()) !== null,
+	}));
 	e.archReview = a === null ? null : archReviewView(last, a, cap, running);
 }
 
@@ -355,7 +422,7 @@ if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 		// Same as the open loop below: a live board holding an old DB must stop this boot.
 		if (err instanceof StoreLockedError) {
 			logError("refusing to start", err);
-			process.exit(1);
+			await shutdown(1);
 		}
 		throw err;
 	}
@@ -395,26 +462,28 @@ for (const p of discoverProjects(
 )) {
 	let store: ProjectStore;
 	try {
-		store = ProjectStore.open(p);
+		store = await ProjectStore.open(p);
 	} catch (err) {
 		if (err instanceof StoreLockedError) {
-			// A second server must die naming the holder, not limp along project-less
-			// (three servers sharing one db was the 2026-10-06 incident). Exit directly:
-			// trapCrashes' net would swallow a throw here and keep a project-less board up.
+			// A second server must refuse startup and release all stores it opened.
 			logError("refusing to start", err);
-			process.exit(1);
+			await shutdown(1);
 		}
 		// One unreadable project database must not keep the whole board from booting.
 		console.error(`skipping project ${p}:`, err);
 		unopenedProjects.push({ name: basename(p), error: errmsg(err) });
 		continue;
 	}
+	if (shuttingDown) {
+		await store.close();
+		break;
+	}
 	const e: Entry = {
 		store,
 		name: store.name,
 		path: p,
 		target: null,
-		gitless: !(await isGitRepoWithCommit(p)),
+		gitless: true,
 		github: null,
 		protectedTarget: false,
 		remote: null,
@@ -427,16 +496,20 @@ for (const p of discoverProjects(
 		openPrs: null,
 	};
 	projects.set(store.name, e);
+	e.gitless = !(await isGitRepoWithCommit(p));
 
 	// R5-1 (docs/specs/pinned-origin-url.md): pin the origin URL before the loop starts and
 	// any turn can run — awaited, so a merge cannot dispatch against an unpinned origin.
 	if (!e.gitless) {
 		const pin = await originRemoteUrl(p).catch(() => null);
-		if (pin !== null && store.getSettings().originUrl === null)
-			store.setSettings({ originUrl: pin });
+		if (pin !== null)
+			await store.transaction(async () => {
+				if ((await store.getSettings()).originUrl === null)
+					await store.setSettings({ originUrl: pin });
+			});
 	}
 
-	resolveTarget(p, false, null, store.getSettings().targetBranch)
+	await resolveTarget(p, false, null, (await store.getSettings()).targetBranch)
 		.then((r) => {
 			e.target = r.target;
 			// OTTR-605: a repo whose origin has no branch for the local branch yet (awaiting
@@ -445,12 +518,12 @@ for (const p of discoverProjects(
 			if (r.unpushed === true) e.mainUnpushed = true;
 		})
 		.catch(() => {});
-	githubUrl(p)
+	await githubUrl(p)
 		.then((u) => {
 			e.github = u;
 		})
 		.catch(() => {});
-	remoteUrl(p)
+	await remoteUrl(p)
 		.then((u) => {
 			e.remote = u;
 		})
@@ -459,14 +532,18 @@ for (const p of discoverProjects(
 	// boot); the same pass re-checks stamped non-release cards, because only a real tag
 	// anchors a release pill — prose that merely names a version must not keep one. A version
 	// a release card already owns is claimed twice: the prose stamp loses.
-	const releaseOwned = new Set<string>();
-	for (const t of store.listTasks())
-		if (t.base !== null && t.releaseVersion !== null)
-			releaseOwned.add(t.releaseVersion);
-	for (const t of store.listTasks()) {
+	const { tasks, releaseOwned } = await store.transaction(async () => {
+		const tasks = await store.listTasks();
+		const releaseOwned = new Set<string>();
+		for (const t of tasks)
+			if (t.base !== null && t.releaseVersion !== null)
+				releaseOwned.add(t.releaseVersion);
+		return { tasks, releaseOwned };
+	});
+	for (const t of tasks) {
 		if (t.stage !== "done" || t.base !== null || t.cancelledAt !== null)
 			continue;
-		const last = store.listTurns(t.id).at(-1);
+		const last = (await store.listTurns(t.id)).at(-1);
 		const version =
 			t.releaseVersion ??
 			(last?.kind === "merge" && last.outcome === "integrated"
@@ -479,14 +556,26 @@ for (const p of discoverProjects(
 		).catch(() => null);
 		if (probe === null) continue; // git spawn failed: change nothing
 		const anchored = probe.code === 0 && probe.stdout.trim() !== "";
-		if (anchored && !releaseOwned.has(version)) {
-			if (t.releaseVersion === null)
-				store.updateTask(t.id, { releaseVersion: version });
-		} else if (t.releaseVersion !== null) {
-			// ponytail: an old merge-cut stamp whose tag exists but predates release cards cannot
-			// be told apart from a kept release — it stays anchored and keeps its pill.
-			store.updateTask(t.id, { releaseVersion: null });
-		}
+		await store.transaction(async () => {
+			const current = await store.getTask(t.id);
+			if (
+				current === null ||
+				current.revision !== t.revision ||
+				current.stage !== t.stage ||
+				current.base !== t.base ||
+				current.cancelledAt !== t.cancelledAt ||
+				current.releaseVersion !== t.releaseVersion
+			)
+				return;
+			if (anchored && !releaseOwned.has(version)) {
+				if (t.releaseVersion === null)
+					await store.updateTask(t.id, { releaseVersion: version });
+			} else if (t.releaseVersion !== null) {
+				// ponytail: an old merge-cut stamp whose tag exists but predates release cards cannot
+				// be told apart from a kept release — it stays anchored and keeps its pill.
+				await store.updateTask(t.id, { releaseVersion: null });
+			}
+		});
 	}
 }
 
@@ -574,15 +663,15 @@ async function probeVmRunner(): Promise<void> {
 	}
 }
 // Boot probe without blocking boot: until it answers, microVM cards wait unclaimed.
-void probeVmRunner();
-setInterval(() => void probeVmRunner(), 30_000);
+runWork(() => probeVmRunner());
+every(() => probeVmRunner(), 30_000);
 // Demo board (src/dev.ts): the seeded gate card's meter needs a fabricated progress line,
 // because no agent runs and loop.running stays empty. Real boards never set OTTR_DEMO and
 // take loop.running only. The import is dynamic: the image ships src/ only, never scripts/,
 // so a static import crashes every real board at boot.
 const demoProgress =
 	process.env.OTTR_DEMO === "1"
-		? (await import("../scripts/demo-data.ts")).demoProgressMap(projects)
+		? await (await import("../scripts/demo-data.ts")).demoProgressMap(projects)
 		: null;
 
 // The loop owns the engine; the request layer calls back into it through deps.schedule, and
@@ -594,7 +683,8 @@ const loop = createTurnLoop(projects, {
 	reviewCheck: () => shared.reviewCheck,
 	workCheck: () => shared.workCheck,
 	quota: () => fetchQuota(boardOmpEnv()),
-	drained: () => app.drained(),
+	drained: () => shuttingDown || app.drained(),
+	stopping: () => shuttingDown,
 	drainedRunner: (id) => app.drainedRunner(id),
 	publishSoon: () => app.publishSoon(),
 	notifyLog: (project, id) => app.notifyLog(project, id),
@@ -751,17 +841,14 @@ const supervisor = createSupervisor(
 );
 
 /** Every pid a live turn claim or a store's runningPids() row holds; orphan checks subtract these. */
-function claimedPids(): Set<number> {
+async function claimedPids(): Promise<Set<number>> {
 	const claimed = new Set<number>();
 	for (const handle of loop.running.values())
 		if (handle.pid !== null) claimed.add(handle.pid);
 	for (const e of projects.values())
-		for (const pid of e.store.runningPids()) claimed.add(pid);
+		for (const pid of await e.store.runningPids()) claimed.add(pid);
 	return claimed;
 }
-const serverRef: { current: Server<undefined> | undefined } = {
-	current: undefined,
-};
 // Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md):
 // omp's own `omp stats` web UI, started on demand and served behind the board's walls on a
 // second port. Its transcript mirror reads the same stores as the omp usage card.
@@ -782,8 +869,8 @@ const ompStatsDashboard = createOmpStatsDashboard({
 // The child must not outlive the board. SIGINT/SIGTERM/SIGHUP end in shutdown() ->
 // process.exit, which runs this handler too.
 process.on("exit", () => ompStatsDashboard.stop());
-setInterval(() => void ompStatsDashboard.tick(), 60_000);
-const app = createApp({
+every(() => ompStatsDashboard.tick(), 60_000);
+const app = await createApp({
 	gstore,
 	defaultDir: resolve(ROOTS[0] ?? resolve(import.meta.dir, "..", "..")),
 	// Server-only ssh keys and known_hosts: a data dir outside every
@@ -857,43 +944,44 @@ const app = createApp({
 	secretBox,
 	ompStats: { info: ompStatsInfo, dashboard: ompStatsDashboard },
 });
+appRef = app;
 
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing
 // turns through one code path, so a cancelled card can never be requeued twice.
 await loop.recoverRestarted();
-loop.schedule();
-setInterval(loop.schedule, 5000);
+await loop.schedule();
+every(loop.schedule, 5000);
 
-setInterval(() => void supervisor.tick(), 60_000);
+every(() => supervisor.tick(), 60_000);
 
 // U9: when the alate server holds an unprovisioned import and no turn runs, run the same
 // provision path as Settings → Alate → Provision; a failed attempt waits an hour.
-setInterval(() => void app.alateProvisionTick(), 5 * 60_000);
+every(() => app.alateProvisionTick(), 5 * 60_000);
 
 // Idle auto-start (docs/specs/mutation-delta.md §7): with the setting on, a board quiet for
 // two hours files the first due project's architecture-review card by itself.
-setInterval(() => void app.idleReviewTick(), 5 * 60_000);
+every(() => app.idleReviewTick(), 5 * 60_000);
 
 // Weekly GitHub trending scan (Monday 06:00 server time): the boot call lets a board that
 // was down at the slot catch up; the 5-min tick finds the slot.
-void app.trendingTick();
-setInterval(() => void app.trendingTick(), 5 * 60_000);
+runWork(() => app.trendingTick());
+every(() => app.trendingTick(), 5 * 60_000);
 
 // Memory health: boot + interval, never per turn (docs/specs/memory-backend.md).
-setInterval(() => void app.memoryHealthTick(), 60_000);
+every(() => app.memoryHealthTick(), 60_000);
 
 // OTTR-548: worker sign-in self-reports, 60 s tick (the boot call is createApp's, like memory
 // health); the state warnings read only the tick's cache — advisory, fail-soft.
-setInterval(() => void app.workerSignInTick(), 60_000);
+every(() => app.workerSignInTick(), 60_000);
 
 // 1 s diff tick: catches file-driven changes no code path writes (omp session titles, AGENTS.md
 // appearing, main-checkout dirtiness). ponytail: replace with fs watchers if the state build ever
 // shows in profiles. Every 5th tick a bare liveness ping.
 let stateTick = 0;
-setInterval(() => {
+every(async () => {
 	if (app.socketCount() === 0) return;
 	if (++stateTick % 5 === 0) app.publish({ type: "ping" });
-	app.publishState();
+	await app.publishState();
 }, 1000);
 
 // Backups (docs/specs/db-backup.md): daily snapshot of tracker.db and each tasks.db, hourly
@@ -901,8 +989,10 @@ setInterval(() => {
 const backup = resolveBackup(process.env, STATE_DIR, workerRoots);
 for (const text of backup.errors) console.error(`backup: ${text}`);
 if (backup.keep !== 0) {
-	const backupNow = () =>
-		backupTick({
+	const backupNow = async (): Promise<void> => {
+		if (shuttingDown) return;
+		if (backupWork !== undefined) return backupWork;
+		backupWork = backupTick({
 			dir: backup.dir,
 			keep: backup.keep,
 			now: new Date(),
@@ -915,38 +1005,44 @@ if (backup.keep !== 0) {
 				),
 			log: (line) => console.log(line),
 		});
-	backupNow();
-	setInterval(backupNow, 3_600_000);
+		try {
+			await backupWork;
+		} finally {
+			backupWork = undefined;
+		}
+	};
+	await backupNow();
+	every(backupNow, 3_600_000);
 }
 
 // System sampler, one for all tabs (and for /api/system in polling mode): container and VM
 // readings, self-update checks and the usage quota live behind sampleStats() in the request layer.
-void app.sampleStats();
-setInterval(() => void app.sampleStats(), 30_000);
+runWork(() => app.sampleStats());
+every(() => app.sampleStats(), 30_000);
 
 // Upstream updates: one pull at boot, then hourly.
-void app.refreshUpdates();
-setInterval(() => void app.refreshUpdates(), 3_600_000);
+runWork(() => app.refreshUpdates());
+every(() => app.refreshUpdates(), 3_600_000);
 
 // Fork research: hourly poll; change-triggered analysis inside the watcher.
-void app.forkResearchTick();
-setInterval(() => void app.forkResearchTick(), 3_600_000);
+runWork(() => app.forkResearchTick());
+every(() => app.forkResearchTick(), 3_600_000);
 
 // PR reviews: hourly poll; the watcher gates which open PRs start a review turn.
-void app.prReviewTick();
-setInterval(() => void app.prReviewTick(), 3_600_000);
+runWork(() => app.prReviewTick());
+every(() => app.prReviewTick(), 3_600_000);
 
 // Issue watch: hourly poll; files new open GitHub issues as backlog cards, capped per day.
-void app.issueWatchTick();
-setInterval(() => void app.issueWatchTick(), 3_600_000);
+runWork(() => app.issueWatchTick());
+every(() => app.issueWatchTick(), 3_600_000);
 
 // omp watch: hourly npm poll; a model reviews each new omp release, files fail and bump cards.
-void app.ompWatchTick();
-setInterval(() => void app.ompWatchTick(), 3_600_000);
+runWork(() => app.ompWatchTick());
+every(() => app.ompWatchTick(), 3_600_000);
 
 // Token expiry: probe at boot and once a day; advisory warnings and reminder pushes inside.
-void app.tokenReminderTick();
-setInterval(() => void app.tokenReminderTick(), 86_400_000);
+runWork(() => app.tokenReminderTick());
+every(() => app.tokenReminderTick(), 86_400_000);
 
 // No bind retry: nothing in the repo restarts this process on the same port, so a
 // bind failure surfaces as the thrown error from Bun.serve.
@@ -963,7 +1059,7 @@ serverRef.current = Bun.serve({
 // carries the error instead of the port.
 if (ompStatsInfo.port !== null) {
 	try {
-		Bun.serve({
+		statsServer = Bun.serve({
 			hostname: HOST,
 			port: ompStatsInfo.port,
 			idleTimeout: 120,
@@ -982,7 +1078,7 @@ if (ompStatsInfo.port !== null) {
 // Advisory boot report: agent-launcher processes no running turn claims. The tracker never
 // kills them; the operator decides (also on demand via GET /api/orphans and /api/state).
 try {
-	const claimed = claimedPids();
+	const claimed = await claimedPids();
 	const orphans = orphanPids(
 		platform.listProcesses(),
 		claimed,

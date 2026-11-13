@@ -28,11 +28,21 @@ const PROJECTS_DIR = "projects";
 const PROJECT_DB = "tasks.db";
 const STAMP = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
 
-export type BackupSource = { file: string; backupTo: (dest: string) => void };
+export type BackupSource = {
+	file: string;
+	backupTo: (dest: string) => Promise<void>;
+};
 
 type Failure = { file: string; error: string };
 
 export type Manifest = { copied: string[]; failed: Failure[] };
+
+export type BackupResult = {
+	stamp: string | null;
+	copied: string[];
+	failed: Failure[];
+	pruned: string[];
+};
 
 const errorText = (err: unknown): string =>
 	err instanceof Error ? err.message : String(err);
@@ -123,8 +133,8 @@ const projectFile = (name: string): string =>
  * that fails, so the snapshot records the failure and retention keeps the last good copy.
  */
 export function backupSources(
-	tracker: { backupTo(dest: string): void },
-	projects: Iterable<{ name: string; backupTo(dest: string): void }>,
+	tracker: { backupTo(dest: string): Promise<void> },
+	projects: Iterable<{ name: string; backupTo(dest: string): Promise<void> }>,
 	unopened: Iterable<{ name: string; error: string }> = [],
 ): BackupSource[] {
 	const sources: BackupSource[] = [
@@ -139,7 +149,7 @@ export function backupSources(
 	for (const project of unopened) {
 		sources.push({
 			file: projectFile(project.name),
-			backupTo: () => {
+			backupTo: async () => {
 				throw new Error(
 					`the board did not open this database: ${project.error}`,
 				);
@@ -209,7 +219,10 @@ export function readManifest(dir: string, stamp: string): Manifest | null {
 	return isRealFile(path) ? parseManifest(readFileSync(path, "utf8")) : null;
 }
 
-function copySource(partial: string, source: BackupSource): void {
+async function copySource(
+	partial: string,
+	source: BackupSource,
+): Promise<void> {
 	if (!isSafeRelative(source.file))
 		throw new Error(`not a relative path inside the snapshot: ${source.file}`);
 	const dest = join(partial, source.file);
@@ -218,7 +231,7 @@ function copySource(partial: string, source: BackupSource): void {
 		throw new Error(`a second source for the snapshot file ${source.file}`);
 	mkdirSync(dirname(dest), { recursive: true });
 	try {
-		source.backupTo(dest);
+		await source.backupTo(dest);
 	} catch (err) {
 		// A copy that failed its checks must not stay in the snapshot: restore would use it.
 		rmSync(dest, { force: true });
@@ -237,17 +250,12 @@ function prune(dir: string, keep: number): string[] {
  * Writes one snapshot `<dir>/<stamp>/` through `<stamp>.partial/`, then applies retention when
  * all sources passed. Throws when a snapshot with the same stamp exists already.
  */
-export function runBackup(o: {
+export async function runBackup(o: {
 	dir: string;
 	keep: number;
 	now: Date;
 	sources: BackupSource[];
-}): {
-	stamp: string | null;
-	copied: string[];
-	failed: Failure[];
-	pruned: string[];
-} {
+}): Promise<BackupResult> {
 	mkdirSync(o.dir, { recursive: true });
 	removeStalePartials(o.dir);
 	const stamp = formatStamp(o.now);
@@ -260,7 +268,7 @@ export function runBackup(o: {
 	const failed: Failure[] = [];
 	for (const source of o.sources) {
 		try {
-			copySource(partial, source);
+			await copySource(partial, source);
 			copied.push(source.file);
 		} catch (err) {
 			failed.push({ file: source.file, error: errorText(err) });
@@ -282,17 +290,17 @@ export function runBackup(o: {
 }
 
 /** One scheduler tick. Never throws: the result and each failure go to `log`. */
-export function backupTick(o: {
+export async function backupTick(o: {
 	dir: string;
 	keep: number;
 	now: Date;
 	sources: () => BackupSource[];
 	log: (line: string) => void;
-}): void {
+}): Promise<void> {
 	if (o.keep <= 0) return;
 	try {
 		if (!backupDue(o.dir, o.now)) return;
-		const result = runBackup({
+		const result = await runBackup({
 			dir: o.dir,
 			keep: o.keep,
 			now: o.now,

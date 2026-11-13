@@ -1176,11 +1176,11 @@ async function addWorktree(o: {
 	worktreePath: string;
 	branch: string;
 	base: string;
-	log: (line: string) => void;
+	log: (line: string) => void | Promise<void>;
 }): Promise<boolean> {
 	const onDisk = existsSync(o.worktreePath);
 	if (onDisk && (await worktreeLinked(o.worktreePath))) {
-		o.log(`reusing worktree ${o.worktreePath} on ${o.branch}`);
+		await o.log(`reusing worktree ${o.worktreePath} on ${o.branch}`);
 		return false;
 	}
 	if (onDisk)
@@ -1225,17 +1225,21 @@ async function checkoutFresh(worktreePath: string): Promise<void> {
 /** Logs the skip of a candidate the base already tracks, naming the rules conflict when
  * the local AGENTS.md differs from the base's (the target ships its own rules now). */
 async function logSkippedTracked(
-	o: { mainPath: string; base: string; log: (line: string) => void },
+	o: {
+		mainPath: string;
+		base: string;
+		log: (line: string) => void | Promise<void>;
+	},
 	relFwd: string,
 ): Promise<void> {
-	o.log(`skipped ${relFwd}: ${o.base} tracks it`);
+	await o.log(`skipped ${relFwd}: ${o.base} tracks it`);
 	if (relFwd !== "AGENTS.md") return;
 	const local = readRegular(path.join(o.mainPath, relFwd)).toString("utf8");
 	const atBase = await git(["show", `${o.base}:AGENTS.md`], o.mainPath);
 	if (atBase.code !== 0)
 		throw new Error(`git show failed: ${atBase.stderr.trim()}`);
 	if (local.replaceAll("\r\n", "\n") !== atBase.stdout.replaceAll("\r\n", "\n"))
-		o.log(
+		await o.log(
 			"! the target now tracks AGENTS.md; move your local rules to .omp/AGENTS.md",
 		);
 }
@@ -1246,7 +1250,7 @@ async function copyUntracked(o: {
 	worktreePath: string;
 	base: string;
 	copyExtra: string[];
-	log: (line: string) => void;
+	log: (line: string) => void | Promise<void>;
 }): Promise<string[]> {
 	const candidates = ["AGENTS.md", ".omp", ...o.copyExtra].filter((p) =>
 		existsSync(path.join(o.mainPath, p)),
@@ -1294,7 +1298,7 @@ async function copyUntracked(o: {
 			o.mainPath,
 		);
 		copied.push(rel);
-		o.log(`copied ${rel}`);
+		await o.log(`copied ${rel}`);
 	}
 	return copied;
 }
@@ -1304,7 +1308,7 @@ async function excludeAndVerify(
 	o: {
 		mainPath: string;
 		worktreePath: string;
-		log: (line: string) => void;
+		log: (line: string) => void | Promise<void>;
 	},
 	copied: string[],
 ): Promise<void> {
@@ -1324,7 +1328,7 @@ async function excludeAndVerify(
 			if (!excludeLines.has(`/${relFwd}`)) {
 				appendLineBelow(exclude.anchor, exclude.file, `/${relFwd}`);
 				excludeLines.add(`/${relFwd}`);
-				o.log(`added /${relFwd} to .git/info/exclude`);
+				await o.log(`added /${relFwd} to .git/info/exclude`);
 			}
 		} else if (ci.code > 1) {
 			throw new Error(
@@ -1353,7 +1357,7 @@ export async function createWorktree(o: {
 	branch: string;
 	base: string;
 	copyExtra: string[];
-	log: (line: string) => void;
+	log: (line: string) => void | Promise<void>;
 }): Promise<void> {
 	for (const p of o.copyExtra) {
 		const reason = validateCopyPath(p);
@@ -1366,7 +1370,7 @@ export async function createWorktree(o: {
 	// worktree behind; both names derive from the task id, so a retry reuses them instead of
 	// failing with "branch already exists".
 	const fresh = await addWorktree(o);
-	o.log(`worktree ${o.worktreePath} on ${o.branch}`);
+	await o.log(`worktree ${o.worktreePath} on ${o.branch}`);
 
 	try {
 		if (fresh) await checkoutFresh(o.worktreePath);
@@ -1382,7 +1386,7 @@ export async function createWorktree(o: {
 				log: o.log,
 			});
 		} catch (rmErr) {
-			o.log(
+			await o.log(
 				`cleanup after failed createWorktree failed: ${rmErr instanceof Error ? rmErr.message : String(rmErr)}`,
 			);
 		}
@@ -1402,9 +1406,12 @@ export async function createWorktree(o: {
  * editors). Every kill lands in the task log with pid, command and reason. No-op on platforms
  * whose discovery has no data (Windows, non-Linux).
  */
-function reapHolders(root: string, log?: (line: string) => void): void {
+async function reapHolders(
+	root: string,
+	log?: (line: string) => void | Promise<void>,
+): Promise<void> {
 	for (const holder of platform.processesWithCwdUnder(root)) {
-		log?.(
+		await log?.(
 			`reap: killing ${holder.pid} (${holder.cmd}): its working directory sits inside the worktree being removed`,
 		);
 		platform.killTree(holder.pid);
@@ -1416,11 +1423,11 @@ export async function removeWorktree(o: {
 	worktreePath: string;
 	branch: string | null;
 	/** Task-log hook: reap kills land here; callers pass their card log. */
-	log?: (line: string) => void;
+	log?: (line: string) => void | Promise<void>;
 }): Promise<void> {
 	await guardAdminEntries(o.mainPath, null);
 	// Reap before the first attempt (see reapHolders): never as a reaction to an errno.
-	if (existsSync(o.worktreePath)) reapHolders(o.worktreePath, o.log);
+	if (existsSync(o.worktreePath)) await reapHolders(o.worktreePath, o.log);
 	await git(["worktree", "remove", "--force", o.worktreePath], o.mainPath); // best effort
 	if (existsSync(o.worktreePath)) {
 		const anchor = worktreeAnchor(o.mainPath, o.worktreePath);

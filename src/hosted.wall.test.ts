@@ -1,10 +1,10 @@
 import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
-import { createApp, type Entry } from "./app.ts";
+import { type App, createApp, type Entry } from "./app.ts";
 import {
 	type IdentityRole,
 	SESSION_COOKIE,
@@ -28,10 +28,12 @@ const TENANT = "acme";
 const PUBLIC = "acme.ottr.cloud";
 const BOOT = "boot-token-hosted";
 const servers: Server<undefined>[] = [];
-const stores: { close(): void }[] = [];
-afterAll(() => {
+const apps: App[] = [];
+const stores: { close(): Promise<void> }[] = [];
+afterAll(async () => {
 	for (const s of servers) s.stop(true);
-	for (const s of stores) s.close();
+	for (const app of apps) await app.close();
+	for (const s of stores) await s.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -49,8 +51,24 @@ const shared = () => ({
 	projectOrder: [] as string[],
 });
 
+interface WallCallOptions {
+	method?: string;
+	headers?: Record<string, string>;
+	body?: unknown;
+}
+
+interface WallBoard {
+	call(path: string, opts?: WallCallOptions): Promise<Response>;
+	g: GlobalStore;
+	store: ProjectStore;
+	stops: number[];
+	releases: number[];
+	app: App;
+	projects: Map<string, Entry>;
+}
+
 /** One board on a random port; hosted undefined mounts a self-hosted board. */
-function mount(
+async function mount(
 	name: string,
 	hosted: Hosted | undefined,
 	extra: Partial<Parameters<typeof createApp>[0]> = {},
@@ -62,15 +80,15 @@ function mount(
 		ciWatchTick?: (opts?: { manual?: string }) => Promise<void>;
 		projects?: { name: string; github: string }[];
 	} = {},
-) {
-	const g = GlobalStore.open(join(root, `g-${name}`));
+): Promise<WallBoard> {
+	const g = await GlobalStore.open(join(root, `g-${name}`));
 	stores.push(g);
 	// Every self-host credential is set, so a pass would show it still counts in hosted mode.
 	// No admin: a self-hosted board would be in onboarding.
-	g.set("config", { apiKey: "wall-key", sessionSecret: "wall-secret" });
+	await g.set("config", { apiKey: "wall-key", sessionSecret: "wall-secret" });
 	const projectDir = join(root, `p-${name}`);
 	mkdirSync(projectDir, { recursive: true });
-	const store = ProjectStore.open(projectDir);
+	const store = await ProjectStore.open(projectDir);
 	stores.push(store);
 	const projects = new Map<string, Entry>();
 	projects.set("p1", {
@@ -92,7 +110,7 @@ function mount(
 	for (const p of opts.projects ?? []) {
 		const dir = join(root, `p-${p.name}`);
 		mkdirSync(dir, { recursive: true });
-		const store = ProjectStore.open(dir);
+		const store = await ProjectStore.open(dir);
 		stores.push(store);
 		projects.set(p.name, {
 			path: dir,
@@ -113,7 +131,7 @@ function mount(
 	}
 	const stops: number[] = [];
 	const releases: number[] = [];
-	const app = createApp({
+	const app = await createApp({
 		gstore: g,
 		secretBox: (() => {
 			const dir = join(root, `boxes-${name}`);
@@ -147,17 +165,11 @@ function mount(
 		},
 		...extra,
 	});
+	apps.push(app);
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
 	app.serverRef.current = srv;
 	servers.push(srv);
-	const call = (
-		path: string,
-		opts: {
-			method?: string;
-			headers?: Record<string, string>;
-			body?: unknown;
-		} = {},
-	) =>
+	const call = (path: string, opts: WallCallOptions = {}) =>
 		fetch(new URL(path, srv.url), {
 			method: opts.method ?? (opts.body === undefined ? "GET" : "POST"),
 			headers: { "content-type": "application/json", ...opts.headers },
@@ -197,7 +209,10 @@ const signed = (
 const loopback = { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" };
 
 describe("hosted mode request wall", () => {
-	const board = mount("hosted", hosted);
+	let board: WallBoard;
+	beforeAll(async () => {
+		board = await mount("hosted", hosted);
+	});
 
 	test("a signed owner header passes on a host and origin no allowlist covers", async () => {
 		const res = await board.call("/api/state", { headers: signed("owner") });
@@ -209,6 +224,39 @@ describe("hosted mode request wall", () => {
 			body: { prompt: "owner card" },
 		});
 		expect(post.status).toBe(200);
+	});
+
+	test("concurrent owner requests retain each card and its lifecycle events", async () => {
+		const concurrent = await mount("concurrent-owner", hosted);
+		const prompts = ["concurrent owner A", "concurrent owner B"];
+		const responses = await Promise.all(
+			prompts.map((prompt) =>
+				concurrent.call("/api/projects/p1/tasks", {
+					headers: signed("owner"),
+					body: { prompt, backlog: true },
+				}),
+			),
+		);
+		expect(responses.map((response) => response.status)).toEqual([200, 200]);
+		const tasks = await concurrent.store.listTasks();
+		expect(tasks).toHaveLength(2);
+		expect(new Set(tasks.map((task) => task.id)).size).toBe(2);
+		expect(tasks.map((task) => task.prompt).sort()).toEqual(prompts);
+		const events = await concurrent.store.events();
+		expect(events).toHaveLength(8);
+		for (const task of tasks) {
+			expect(task).toMatchObject({ stage: "backlog", state: "idle" });
+			expect(
+				events
+					.filter((event) => event.taskId === task.id)
+					.map(({ kind, from, to }) => ({ kind, from, to })),
+			).toEqual([
+				{ kind: "create", from: null, to: "todo" },
+				{ kind: "state", from: null, to: "queued" },
+				{ kind: "stage", from: "todo", to: "backlog" },
+				{ kind: "state", from: "queued", to: "idle" },
+			]);
+		}
 	});
 
 	test("no header is 401, also from direct loopback", async () => {
@@ -223,9 +271,9 @@ describe("hosted mode request wall", () => {
 			body: { prompt: "anonymous" },
 		});
 		expect(filed.status).toBe(401);
-		expect(board.store.listTasks().some((t) => t.prompt === "anonymous")).toBe(
-			false,
-		);
+		expect(
+			(await board.store.listTasks()).some((t) => t.prompt === "anonymous"),
+		).toBe(false);
 	});
 
 	test("a forged, other-tenant, expired or replayed header is 401", async () => {
@@ -382,7 +430,7 @@ describe("hosted mode request wall", () => {
 		// Neither the API key nor the session secret rotated, and no admin was created.
 		// The row holds sealed values: under the mount's box (same key dir) they open
 		// to the seeded credentials.
-		const row = board.g.get<Record<string, unknown>>("config");
+		const row = await board.g.get<Record<string, unknown>>("config");
 		const wallBox = loadSecretBox({
 			dir: join(root, "boxes-hosted"),
 			env: {},
@@ -409,7 +457,7 @@ describe("hosted mode request wall", () => {
 			body: { prompt: "filed over loopback" },
 		});
 		expect(viaLoopback.status).toBe(200);
-		const prompts = board.store.listTasks().map((t) => t.prompt);
+		const prompts = (await board.store.listTasks()).map((t) => t.prompt);
 		expect(prompts).toContain("filed by a turn");
 		expect(prompts).toContain("filed over loopback");
 		const guessed = await board.call("/api/projects/p1/tasks", {
@@ -428,7 +476,7 @@ describe("hosted mode request wall", () => {
 test("hosted mode serves no omp stats dashboard proxy, also from direct loopback", async () => {
 	let ensured = 0;
 	const PROXY = 3848;
-	const board = mount("hosted-omp-stats", hosted, {
+	const board = await mount("hosted-omp-stats", hosted, {
 		ompStats: {
 			info: { port: PROXY, error: null },
 			dashboard: {
@@ -461,25 +509,28 @@ test("hosted mode serves no omp stats dashboard proxy, also from direct loopback
 describe("POST /api/hosted/github-event", () => {
 	const ghCalls: string[][] = [];
 	const kicks: (string | undefined)[] = [];
-	const board = mount(
-		"events",
-		hosted,
-		{
-			gh: async (args) => {
-				ghCalls.push(args);
-				return { code: 0, stdout: "[]", stderr: "" };
+	let board: WallBoard;
+	beforeAll(async () => {
+		board = await mount(
+			"events",
+			hosted,
+			{
+				gh: async (args) => {
+					ghCalls.push(args);
+					return { code: 0, stdout: "[]", stderr: "" };
+				},
+				ciWatchTick: async (opts) => {
+					kicks.push(opts?.manual);
+				},
 			},
-			ciWatchTick: async (opts) => {
-				kicks.push(opts?.manual);
+			{
+				projects: [
+					{ name: "w1", github: "https://github.com/acme/widget" },
+					{ name: "w2", github: "https://github.com/acme/other" },
+				],
 			},
-		},
-		{
-			projects: [
-				{ name: "w1", github: "https://github.com/acme/widget" },
-				{ name: "w2", github: "https://github.com/acme/other" },
-			],
-		},
-	);
+		);
+	});
 
 	/** One webhook POST as the control plane forwards it. */
 	const event = (
@@ -592,7 +643,7 @@ describe("POST /api/hosted/github-event", () => {
 		// The scan gates on the setting (src/prs.ts scan): enable it for both projects,
 		// then only the repo the event names may reach the gh fake.
 		for (const name of ["w1", "w2"])
-			board.projects.get(name)!.store.setSettings({ prReviews: true });
+			await board.projects.get(name)!.store.setSettings({ prReviews: true });
 		const callsBefore = ghCalls.length;
 		const res = await event("d4", "pull_request", {
 			repository: { full_name: "acme/widget" },
@@ -609,7 +660,7 @@ describe("POST /api/hosted/github-event", () => {
 		// The issue scan gates on the setting and reads issueWatchSince as its mark
 		// (src/issues.ts scanProject): set both, one shared mark per project is enough.
 		for (const name of ["w1", "w2"])
-			board.projects
+			await board.projects
 				.get(name)!
 				.store.setSettings({ issueWatch: true, issueWatchSince: 1 });
 		const callsBefore = ghCalls.length;
@@ -653,7 +704,10 @@ describe("POST /api/hosted/github-event", () => {
 });
 
 describe("self-hosted board (hosted mode off)", () => {
-	const board = mount("self", undefined);
+	let board: WallBoard;
+	beforeAll(async () => {
+		board = await mount("self", undefined);
+	});
 
 	test("/api/setup stays open and /api/hosted/stop and /release do not exist", async () => {
 		const setup = await board.call("/api/setup", {

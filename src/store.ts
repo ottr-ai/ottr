@@ -40,6 +40,7 @@ import {
 	readTranscript,
 	sessionContext,
 } from "./session.ts";
+import { StoreQueue } from "./storeQueue.ts";
 import { assignTopics } from "./topics.ts";
 import type {
 	AskQuestion,
@@ -1209,81 +1210,6 @@ function parseSetting(
 	return value as ProjectSettings[keyof ProjectSettings];
 }
 
-/** Turns of one task still missing their captured cost, oldest first. */
-interface CostBackfillTurn {
-	id: number;
-	started_at: number;
-	ended_at: number;
-}
-
-/** Writes one turn's five cost columns from a usage sum. */
-function writeTurnCost(db: Database, turnId: number, sum: UsageSum): void {
-	db.run(
-		"UPDATE turns SET tokens_in = ?, tokens_out = ?, cache_read = ?, cache_write = ?, cost = ? WHERE id = ?",
-		[
-			sum.tokensIn,
-			sum.tokensOut,
-			sum.cacheRead,
-			sum.cacheWrite,
-			sum.cost,
-			turnId,
-		],
-	);
-}
-
-/**
- * Backfills the cost columns of finished turns that have none (runs once per open, after the
- * migrations): groups the pending turns by task so each task's transcript is read once, then
- * fills each turn from its `[started_at, ended_at]` window. A turn the transcript cannot prove
- * (no transcript, a malformed record, or a turn of an earlier session) keeps NULL so a later
- * open can retry; an owned window without usage writes zeros. Best-effort by contract — the
- * caller wraps this so a failure never blocks the open.
- */
-function backfillTurnCosts(db: Database, sessionsDir: string): void {
-	const tasks = db
-		.query<{ id: string; session_id: string | null }, []>(
-			`SELECT DISTINCT tasks.id, tasks.session_id FROM tasks
-			 JOIN turns ON turns.task_id = tasks.id
-			 WHERE turns.ended_at IS NOT NULL AND turns.cost IS NULL`,
-		)
-		.all();
-	for (const task of tasks) {
-		if (task.session_id === null) continue;
-		const texts = readTranscript(sessionsDir, task.session_id);
-		const turns = db
-			.query<CostBackfillTurn, [string]>(
-				"SELECT id, started_at, ended_at FROM turns WHERE task_id = ? AND ended_at IS NOT NULL AND cost IS NULL ORDER BY id",
-			)
-			.all(task.id);
-		for (const turn of turns) {
-			const sum = sumUsageIn(texts, turn.started_at, turn.ended_at);
-			if (sum !== null) writeTurnCost(db, turn.id, sum);
-		}
-	}
-}
-
-/**
- * Backfills done tasks' final context tokens (runs once per open): reads each task's
- * session transcript tail once and stores its last contextSnapshot's promptTokens.
- * Best-effort like the cost backfill: no transcript or an unreadable one leaves the
- * column NULL and the next open tries again.
- */
-function backfillDoneContext(db: Database, sessionsDir: string): void {
-	const tasks = db
-		.query<{ id: string; session_id: string | null }, []>(
-			"SELECT id, session_id FROM tasks WHERE stage = 'done' AND context_tokens IS NULL",
-		)
-		.all();
-	for (const task of tasks) {
-		const ctx = sessionContext(sessionsDir, task.session_id);
-		if (ctx !== null)
-			db.run("UPDATE tasks SET context_tokens = ? WHERE id = ?", [
-				ctx.promptTokens,
-				task.id,
-			]);
-	}
-}
-
 /** A trending verdict's repo: lowercase `owner/repo`. */
 const TRENDING_REPO_RE = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/;
 
@@ -1340,8 +1266,7 @@ export class ProjectStore {
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
 	private readonly db: Database;
-	/** Set by close(): a second close must not run the lock release on a dead handle. */
-	private closed = false;
+	private readonly queue: StoreQueue;
 
 	private constructor(projectPath: string, db: Database) {
 		this.path = projectPath;
@@ -1352,9 +1277,24 @@ export class ProjectStore {
 		this.sessionsDir = join(this.tasksDir, "sessions");
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
+		this.queue = new StoreQueue({
+			begin: async () => {
+				await db.exec("BEGIN");
+			},
+			commit: async () => {
+				await db.exec("COMMIT");
+			},
+			rollback: async () => {
+				await db.exec("ROLLBACK");
+			},
+		});
 	}
 
-	static init(projectPath: string): ProjectStore {
+	async transaction<T>(work: () => T | Promise<T>): Promise<T> {
+		return this.queue.transaction(work);
+	}
+
+	static async init(projectPath: string): Promise<ProjectStore> {
 		const root = resolve(projectPath);
 		const tasksDir = tasksDirFor(root);
 		const dataRoot = dataRootFor(root);
@@ -1362,94 +1302,106 @@ export class ProjectStore {
 		mkdirBelow(dataRoot, join(tasksDir, "sessions"));
 		writeIgnoreAll(dataRoot, join(tasksDir, ".gitignore"));
 		writeIgnoreAll(root, join(root, ".worktrees", ".gitignore"));
-		return ProjectStore.open(root);
+		return await ProjectStore.open(root);
 	}
 
 	/** Additive column convergence: adds one column when the (possibly stale) column list lacks it. */
-	private static addColumn(
+	private static async addColumn(
 		db: Database,
 		cols: readonly string[],
 		col: string,
 		ddl: string,
-	): void {
+	): Promise<void> {
 		if (cols.includes(col)) return;
-		db.exec(ddl);
+		await db.exec(ddl);
 	}
 
 	/** Rebuilds the tasks table in one transaction when its stored DDL still carries the
 	 * `detect` CHECK list: recreates from TASKS_DDL, adds `addCols`, copies the named
 	 * columns explicitly, verifies the count, then swaps — a failure leaves the old
-	 * table untouched. */
-	private static rebuildTasksOnCheck(
+	 * table untouched. Returns the live columns so later convergence cannot use the old shape. */
+	private static async rebuildTasksOnCheck(
 		db: Database,
 		tasksSql: string,
 		detect: string,
 		addCols: readonly string[],
 		names: string,
 		label: string,
-	): void {
-		if (!tasksSql.includes(detect)) return;
-		const count = (table: string): number =>
-			db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
-				?.n ?? 0;
-		const before = count("tasks");
-		db.exec("BEGIN");
+	): Promise<string[] | null> {
+		if (!tasksSql.includes(detect)) return null;
+		const count = async (table: string): Promise<number> =>
+			(
+				await db
+					.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`)
+					.get()
+			)?.n ?? 0;
+		const before = await count("tasks");
+		await db.exec("BEGIN");
 		try {
-			db.exec(
+			await db.exec(
 				TASKS_DDL.replace(
 					"CREATE TABLE IF NOT EXISTS tasks",
 					"CREATE TABLE tasks_migrating",
 				),
 			);
-			for (const ddl of addCols) db.exec(ddl);
-			db.exec(
+			for (const ddl of addCols) await db.exec(ddl);
+			await db.exec(
 				`INSERT INTO tasks_migrating (${names}) SELECT ${names} FROM tasks`,
 			);
-			const after = count("tasks_migrating");
+			const after = await count("tasks_migrating");
 			if (after !== before)
 				throw Error(
 					`${label} migration would lose rows: ${before} -> ${after}`,
 				);
-			db.exec("DROP TABLE tasks");
-			db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
-			db.exec("COMMIT");
+			await db.exec("DROP TABLE tasks");
+			await db.exec("ALTER TABLE tasks_migrating RENAME TO tasks");
+			const columns = (
+				await db.query<{ name: string }, []>("PRAGMA table_info(tasks)").all()
+			).map((column) => column.name);
+			await db.exec("COMMIT");
+			return columns;
 		} catch (err) {
-			db.exec("ROLLBACK");
+			await db.exec("ROLLBACK");
 			throw err;
 		}
 	}
 
 	/** Backfills topics for done cards missing one; idempotent (only null rows). */
-	private static backfillTopics(db: Database): void {
-		const untopic = db
-			.query<
-				{ id: string; title: string | null; session_title: string | null },
-				[]
-			>(
-				"SELECT id, title, session_title FROM tasks WHERE stage = 'done' AND topic IS NULL",
-			)
-			.all();
-		if (untopic.length === 0) return;
-		const topics = assignTopics(
-			untopic.map((r) => ({
-				id: r.id,
-				title: r.title ?? "",
-				sessionTitle: r.session_title,
-			})),
-		);
-		for (const [id, topic] of topics)
-			db.run("UPDATE tasks SET topic = ? WHERE id = ?", [topic, id]);
+	private static async backfillTopics(
+		db: Database,
+		queue: StoreQueue,
+	): Promise<void> {
+		await queue.transaction(async () => {
+			const untopic = await db
+				.query<
+					{ id: string; title: string | null; session_title: string | null },
+					[]
+				>(
+					"SELECT id, title, session_title FROM tasks WHERE stage = 'done' AND topic IS NULL",
+				)
+				.all();
+			if (untopic.length === 0) return;
+			const topics = assignTopics(
+				untopic.map((r) => ({
+					id: r.id,
+					title: r.title ?? "",
+					sessionTitle: r.session_title,
+				})),
+			);
+			for (const [id, topic] of topics)
+				await db.run("UPDATE tasks SET topic = ? WHERE id = ?", [topic, id]);
+		});
 	}
 
 	/** The converged needs_reason for one legacy proposal row, or null when nothing rewrites it. */
-	private static convergedReason(
+	private static async convergedReason(
 		db: Database,
 		row: { needs_reason: string; follow_up_of: string | null },
-	): string | null {
+	): Promise<string | null> {
 		const reason = row.needs_reason;
 		if (reason.startsWith(LEGACY_PROPOSED_REASON_PREFIX)) {
 			const parent = row.follow_up_of
-				? db
+				? await db
 						.query<{ follow_up_of: string | null }, [string]>(
 							"SELECT follow_up_of FROM tasks WHERE id = ?",
 						)
@@ -1476,72 +1428,80 @@ export class ProjectStore {
 	/** Rewrites legacy proposal needs_reason text to the current wording. Display text
 	 * only: it never touches titles, prompts or turn rows. A converged row no longer
 	 * matches, so the pass stays idempotent on every open. */
-	private static convergeProposalReasons(db: Database): void {
-		// Proposal reasons written before the 2026-11 wording fix double the kind label
-		// ("the retro of Retro of …", "the fork research Fork research: …") and describe
-		// the actions without naming the drawer buttons. replace() with the exact
-		// generated substrings converges held proposals; a converged row no longer
-		// matches, so the pass stays idempotent on every open. Display text only: it
-		// never touches titles, prompts or turn rows.
-		db.run(
-			`UPDATE tasks SET needs_reason = replace(needs_reason, ? || ?, ?)
+	private static async convergeProposalReasons(
+		db: Database,
+		queue: StoreQueue,
+	): Promise<void> {
+		await queue.transaction(async () => {
+			// Proposal reasons written before the 2026-11 wording fix double the kind label
+			// ("the retro of Retro of …", "the fork research Fork research: …") and describe
+			// the actions without naming the drawer buttons. replace() with the exact
+			// generated substrings converges held proposals; a converged row no longer
+			// matches, so the pass stays idempotent on every open. Display text only: it
+			// never touches titles, prompts or turn rows.
+			await db.run(
+				`UPDATE tasks SET needs_reason = replace(needs_reason, ? || ?, ?)
 			 WHERE needs_reason LIKE ? || ? || '%'`,
-			[
-				LEGACY_PROPOSED_REASON_PREFIX,
-				RETRO_MARKER,
-				LEGACY_PROPOSED_REASON_PREFIX,
-				LEGACY_PROPOSED_REASON_PREFIX,
-				RETRO_MARKER,
-			],
-		);
-		db.run(
-			`UPDATE tasks SET needs_reason = replace(needs_reason, ? || 'Fork research: ', ?)
+				[
+					LEGACY_PROPOSED_REASON_PREFIX,
+					RETRO_MARKER,
+					LEGACY_PROPOSED_REASON_PREFIX,
+					LEGACY_PROPOSED_REASON_PREFIX,
+					RETRO_MARKER,
+				],
+			);
+			await db.run(
+				`UPDATE tasks SET needs_reason = replace(needs_reason, ? || 'Fork research: ', ?)
 			 WHERE needs_reason LIKE ? || 'Fork research: %'`,
-			[
-				LEGACY_FORK_PROPOSED_REASON_PREFIX,
-				LEGACY_FORK_PROPOSED_REASON_PREFIX,
-				LEGACY_FORK_PROPOSED_REASON_PREFIX,
-			],
-		);
-		db.run(
-			`UPDATE tasks SET needs_reason = replace(needs_reason, '. Accept to start it, edit the prompt first, or cancel to decline.', '. Accept starts it. Edit task changes the prompt first. Cancel task declines it.') WHERE needs_reason LIKE '%Accept to start it, edit the prompt first, or cancel to decline.'`,
-		);
-		// Proposal reasons that quote the source title converge to the id-only text the
-		// drawer can link. Legacy prefixes recover the source id through the follow-up
-		// chain (a retro proposal names the parent retro's own follow-up, else that retro
-		// itself; a fork proposal names the result card); a row whose chain is gone keeps
-		// its legacy text — no id, no rewrite. Rows of the 2026-11 wording already carry
-		// the id and only drop the quoted title.
-		for (const row of db
-			.query<
-				{ id: string; needs_reason: string; follow_up_of: string | null },
-				[string, string, string, string]
-			>(
-				`SELECT id, needs_reason, follow_up_of FROM tasks
+				[
+					LEGACY_FORK_PROPOSED_REASON_PREFIX,
+					LEGACY_FORK_PROPOSED_REASON_PREFIX,
+					LEGACY_FORK_PROPOSED_REASON_PREFIX,
+				],
+			);
+			await db.run(
+				`UPDATE tasks SET needs_reason = replace(needs_reason, '. Accept to start it, edit the prompt first, or cancel to decline.', '. Accept starts it. Edit task changes the prompt first. Cancel task declines it.') WHERE needs_reason LIKE '%Accept to start it, edit the prompt first, or cancel to decline.'`,
+			);
+			// Proposal reasons that quote the source title converge to the id-only text the
+			// drawer can link. Legacy prefixes recover the source id through the follow-up
+			// chain (a retro proposal names the parent retro's own follow-up, else that retro
+			// itself; a fork proposal names the result card); a row whose chain is gone keeps
+			// its legacy text — no id, no rewrite. Rows of the 2026-11 wording already carry
+			// the id and only drop the quoted title.
+			for (const row of await db
+				.query<
+					{ id: string; needs_reason: string; follow_up_of: string | null },
+					[string, string, string, string]
+				>(
+					`SELECT id, needs_reason, follow_up_of FROM tasks
 				 WHERE needs_reason LIKE ? || '%'
 				    OR needs_reason LIKE ? || '%'
 				    OR (needs_reason LIKE ? || '%' AND needs_reason LIKE '% ("%')
 				    OR (needs_reason LIKE ? || '%' AND needs_reason LIKE '% ("%')`,
-			)
-			.all(
-				LEGACY_PROPOSED_REASON_PREFIX,
-				LEGACY_FORK_PROPOSED_REASON_PREFIX,
-				PROPOSED_REASON_PREFIX,
-				FORK_PROPOSED_REASON_PREFIX,
-			)) {
-			const next = ProjectStore.convergedReason(db, row);
-			if (next !== null)
-				db.run("UPDATE tasks SET needs_reason = ? WHERE id = ?", [
-					next,
-					row.id,
-				]);
-		}
+				)
+				.all(
+					LEGACY_PROPOSED_REASON_PREFIX,
+					LEGACY_FORK_PROPOSED_REASON_PREFIX,
+					PROPOSED_REASON_PREFIX,
+					FORK_PROPOSED_REASON_PREFIX,
+				)) {
+				const next = await ProjectStore.convergedReason(db, row);
+				if (next !== null)
+					await db.run("UPDATE tasks SET needs_reason = ? WHERE id = ?", [
+						next,
+						row.id,
+					]);
+			}
+		});
 	}
 
 	/** Rebuilds pr_review_runs when its stored shape predates the current columns: copies
 	 * rows explicitly, verifies the count, swaps — one transaction, so a failure leaves
 	 * the old table untouched. */
-	private static rebuildPrReviewRuns(db: Database, runCols: string[]): void {
+	private static async rebuildPrReviewRuns(
+		db: Database,
+		runCols: string[],
+	): Promise<void> {
 		if (
 			runCols.length === 0 ||
 			["id", "number", "started_at", "head", "done"].every((c) =>
@@ -1549,13 +1509,16 @@ export class ProjectStore {
 			)
 		)
 			return;
-		const count = (table: string): number =>
-			db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()
-				?.n ?? 0;
-		const before = count("pr_review_runs");
-		db.exec("BEGIN");
+		const count = async (table: string): Promise<number> =>
+			(
+				await db
+					.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`)
+					.get()
+			)?.n ?? 0;
+		const before = await count("pr_review_runs");
+		await db.exec("BEGIN");
 		try {
-			db.exec(
+			await db.exec(
 				PR_REVIEW_RUNS_DDL.replace(
 					"CREATE TABLE IF NOT EXISTS pr_review_runs",
 					"CREATE TABLE pr_review_runs_migrating",
@@ -1564,10 +1527,10 @@ export class ProjectStore {
 			if (runCols.includes("head")) {
 				// The head-era build wrote each row after its review finished, so done = 1
 				// keeps the one-review-per-head gate for heads already reviewed there.
-				db.exec(
+				await db.exec(
 					"INSERT INTO pr_review_runs_migrating (number, started_at, head, done) SELECT number, started_at, head, 1 FROM pr_review_runs",
 				);
-				const after = count("pr_review_runs_migrating");
+				const after = await count("pr_review_runs_migrating");
 				if (after !== before)
 					throw Error(
 						`pr_review_runs migration would lose rows: ${before} -> ${after}`,
@@ -1575,19 +1538,21 @@ export class ProjectStore {
 				// The first shape holds no head, so its rows cannot satisfy head NOT NULL
 				// and drop: they only carry the daily rate-limit window, never review content.
 			}
-			db.exec("DROP TABLE pr_review_runs");
-			db.exec("ALTER TABLE pr_review_runs_migrating RENAME TO pr_review_runs");
-			db.exec(
+			await db.exec("DROP TABLE pr_review_runs");
+			await db.exec(
+				"ALTER TABLE pr_review_runs_migrating RENAME TO pr_review_runs",
+			);
+			await db.exec(
 				"CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at)",
 			);
-			db.exec("COMMIT");
+			await db.exec("COMMIT");
 		} catch (err) {
-			db.exec("ROLLBACK");
+			await db.exec("ROLLBACK");
 			throw err;
 		}
 	}
 
-	static open(projectPath: string): ProjectStore {
+	static async open(projectPath: string): Promise<ProjectStore> {
 		const root = resolve(projectPath);
 		const tasksDir = tasksDirFor(root);
 		mkdirBelow(dataRootFor(root), tasksDir);
@@ -1597,713 +1562,713 @@ export class ProjectStore {
 		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
 		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
 		const db = openLocked(dbPath);
-		db.exec(SCHEMA);
-		const cols = db
-			.query<{ name: string }, []>("PRAGMA table_info(tasks)")
-			.all()
-			.map((c) => c.name);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"images",
-			"ALTER TABLE tasks ADD COLUMN images TEXT NOT NULL DEFAULT '[]'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"pending_images",
-			"ALTER TABLE tasks ADD COLUMN pending_images TEXT NOT NULL DEFAULT '[]'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"shots",
-			"ALTER TABLE tasks ADD COLUMN shots TEXT NOT NULL DEFAULT '[]'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"session_title",
-			"ALTER TABLE tasks ADD COLUMN session_title TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"commits",
-			"ALTER TABLE tasks ADD COLUMN commits INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"release_version",
-			"ALTER TABLE tasks ADD COLUMN release_version TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"release_notes",
-			"ALTER TABLE tasks ADD COLUMN release_notes TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"asked",
-			"ALTER TABLE tasks ADD COLUMN asked TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"model",
-			"ALTER TABLE tasks ADD COLUMN model TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"kept_files",
-			"ALTER TABLE tasks ADD COLUMN kept_files TEXT NOT NULL DEFAULT '[]'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"follow_up_of",
-			"ALTER TABLE tasks ADD COLUMN follow_up_of TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"done_at",
-			"ALTER TABLE tasks ADD COLUMN done_at INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"push_sha",
-			"ALTER TABLE tasks ADD COLUMN push_sha TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"report",
-			"ALTER TABLE tasks ADD COLUMN report TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"research",
-			"ALTER TABLE tasks ADD COLUMN research INTEGER NOT NULL DEFAULT 0",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"research_steps",
-			"ALTER TABLE tasks ADD COLUMN research_steps TEXT NOT NULL DEFAULT 'unknown'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"update_ids",
-			"ALTER TABLE tasks ADD COLUMN update_ids TEXT NOT NULL DEFAULT '[]'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"update_merge_approved",
-			"ALTER TABLE tasks ADD COLUMN update_merge_approved INTEGER NOT NULL DEFAULT 0",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"gate",
-			"ALTER TABLE tasks ADD COLUMN gate TEXT",
-		);
-		// OTTR-850 prompt authorship: lives in TASKS_DDL, so its ALTER runs here, before
-		// the CHECK rebuilds (gate-column precedent). The DEFAULT backfills every existing
-		// row to 'user', so old cards keep today's gate behavior.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"prompt_author",
-			"ALTER TABLE tasks ADD COLUMN prompt_author TEXT NOT NULL DEFAULT 'user'",
-		);
-		// OTTR-795 optimistic-locking revision: lives in TASKS_DDL, so its ALTER runs here,
-		// before the CHECK rebuilds, like the shots column. The stale cols list fires the
-		// ALTER once on an old database; a rebuild afterwards recreates the table from
-		// TASKS_DDL, which already carries the column, so no open re-queues the ALTER
-		// (a column living in DDL but migrated after the rebuilds would dupe here instead).
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"revision",
-			"ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
-		);
-		// Backfill runs on every open and is idempotent (only null rows): a process stop
-		// between the ALTER above and the UPDATE converges here on the next open instead
-		// of leaving done cards unstamped forever (includedTasks drops them from releases).
-		db.exec(
-			"UPDATE tasks SET done_at = (SELECT ended_at FROM turns WHERE turns.task_id = tasks.id ORDER BY turns.id DESC LIMIT 1) WHERE stage = 'done' AND done_at IS NULL",
-		);
-		// OTTR-799: the conflict park's reason text grew the reply recovery, and
-		// prConflictVerdict un-parks only on the exact current text. Rewrite stored
-		// pre-update parks (the old text ends at "…pull request."), so cards parked
-		// before the update take the automatic recovery again. Idempotent: the
-		// migrated text no longer ends with the matched literal. Only the supervisor's
-		// own park shape matches (the LIKE pins the full literal around the number).
-		db.exec(
-			"UPDATE tasks SET needs_reason = REPLACE(needs_reason, 'Resolve the conflict on the pull request.', 'Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.') WHERE needs_reason LIKE 'PR #% cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.'",
-		);
-		// A CHECK constraint can only change by rebuilding the table: databases created before
-		// `preparing` carry the old state list, and the scheduler writes 'preparing' on every
-		// claim. Runs after the column backfills so old and new shapes have the same named
-		// columns; copies rows explicitly (legacy column ORDER can differ), verifies the count,
-		// then swaps — all in one transaction, so a failure leaves the old table untouched.
-		const tasksSql =
-			db
-				.query<{ sql: string }, []>(
-					"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
-				)
-				.get()?.sql ?? "";
-		ProjectStore.rebuildTasksOnCheck(
-			db,
-			tasksSql,
-			"state IN ('queued','running','needs_you','idle')",
-			[
-				"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
-				"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
-			],
-			`id, title, prompt, stage, state, needs_reason, pending_prompt,
+		const store = new ProjectStore(root, db);
+		try {
+			await store.queue.run(async () => {
+				await db.exec(SCHEMA);
+				let cols = (
+					await db.query<{ name: string }, []>("PRAGMA table_info(tasks)").all()
+				).map((c) => c.name);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"images",
+					"ALTER TABLE tasks ADD COLUMN images TEXT NOT NULL DEFAULT '[]'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pending_images",
+					"ALTER TABLE tasks ADD COLUMN pending_images TEXT NOT NULL DEFAULT '[]'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"shots",
+					"ALTER TABLE tasks ADD COLUMN shots TEXT NOT NULL DEFAULT '[]'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"session_title",
+					"ALTER TABLE tasks ADD COLUMN session_title TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"commits",
+					"ALTER TABLE tasks ADD COLUMN commits INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"release_version",
+					"ALTER TABLE tasks ADD COLUMN release_version TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"release_notes",
+					"ALTER TABLE tasks ADD COLUMN release_notes TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"asked",
+					"ALTER TABLE tasks ADD COLUMN asked TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"model",
+					"ALTER TABLE tasks ADD COLUMN model TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"kept_files",
+					"ALTER TABLE tasks ADD COLUMN kept_files TEXT NOT NULL DEFAULT '[]'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"follow_up_of",
+					"ALTER TABLE tasks ADD COLUMN follow_up_of TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"done_at",
+					"ALTER TABLE tasks ADD COLUMN done_at INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"push_sha",
+					"ALTER TABLE tasks ADD COLUMN push_sha TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"report",
+					"ALTER TABLE tasks ADD COLUMN report TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"research",
+					"ALTER TABLE tasks ADD COLUMN research INTEGER NOT NULL DEFAULT 0",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"research_steps",
+					"ALTER TABLE tasks ADD COLUMN research_steps TEXT NOT NULL DEFAULT 'unknown'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"update_ids",
+					"ALTER TABLE tasks ADD COLUMN update_ids TEXT NOT NULL DEFAULT '[]'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"update_merge_approved",
+					"ALTER TABLE tasks ADD COLUMN update_merge_approved INTEGER NOT NULL DEFAULT 0",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"gate",
+					"ALTER TABLE tasks ADD COLUMN gate TEXT",
+				);
+				// OTTR-850 prompt authorship: lives in TASKS_DDL, so its ALTER runs here, before
+				// the CHECK rebuilds (gate-column precedent). The DEFAULT backfills every existing
+				// row to 'user', so old cards keep today's gate behavior.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"prompt_author",
+					"ALTER TABLE tasks ADD COLUMN prompt_author TEXT NOT NULL DEFAULT 'user'",
+				);
+				// OTTR-795 optimistic-locking revision: lives in TASKS_DDL, so its ALTER runs here,
+				// before the CHECK rebuilds, like the shots column. The stale cols list fires the
+				// ALTER once on an old database; a rebuild afterwards recreates the table from
+				// TASKS_DDL, which already carries the column, so no open re-queues the ALTER
+				// (a column living in DDL but migrated after the rebuilds would dupe here instead).
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"revision",
+					"ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+				);
+				// Backfill runs on every open and is idempotent (only null rows): a process stop
+				// between the ALTER above and the UPDATE converges here on the next open instead
+				// of leaving done cards unstamped forever (includedTasks drops them from releases).
+				await db.exec(
+					"UPDATE tasks SET done_at = (SELECT ended_at FROM turns WHERE turns.task_id = tasks.id ORDER BY turns.id DESC LIMIT 1) WHERE stage = 'done' AND done_at IS NULL",
+				);
+				// OTTR-799: the conflict park's reason text grew the reply recovery, and
+				// prConflictVerdict un-parks only on the exact current text. Rewrite stored
+				// pre-update parks (the old text ends at "…pull request."), so cards parked
+				// before the update take the automatic recovery again. Idempotent: the
+				// migrated text no longer ends with the matched literal. Only the supervisor's
+				// own park shape matches (the LIKE pins the full literal around the number).
+				await db.exec(
+					"UPDATE tasks SET needs_reason = REPLACE(needs_reason, 'Resolve the conflict on the pull request.', 'Resolve the conflict on the pull request, or reply to rebase the branch onto the target; the tracker pushes and updates the pull request.') WHERE needs_reason LIKE 'PR #% cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.'",
+				);
+				// A CHECK constraint can only change by rebuilding the table: databases created before
+				// `preparing` carry the old state list, and the scheduler writes 'preparing' on every
+				// claim. Runs after the column backfills so old and new shapes have the same named
+				// columns; copies rows explicitly (legacy column ORDER can differ), verifies the count,
+				// then swaps — all in one transaction, so a failure leaves the old table untouched.
+				const tasksSql =
+					(
+						await db
+							.query<{ sql: string }, []>(
+								"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+							)
+							.get()
+					)?.sql ?? "";
+				cols =
+					(await ProjectStore.rebuildTasksOnCheck(
+						db,
+						tasksSql,
+						"state IN ('queued','running','needs_you','idle')",
+						[
+							"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
+							"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
+						],
+						`id, title, prompt, stage, state, needs_reason, pending_prompt,
 					branch, base, worktree, session_id, summary, details, created_at, updated_at,
 					queued_at, cancelled_at, images, pending_images, release_version, release_notes,
 					session_title, asked, model, kept_files, follow_up_of, commits, done_at`,
-			"state",
-		);
-		// topic lands after the state-CHECK rebuild above on purpose: that migration copies
-		// named columns only, so a column added before it would be dropped together with the
-		// freshly backfilled labels. Same idempotent pattern as done_at: only null rows.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"topic",
-			"ALTER TABLE tasks ADD COLUMN topic TEXT",
-		);
-		ProjectStore.backfillTopics(db);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"depends_on",
-			"ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
-		);
-		// Diff capture columns: null on every pre-existing row (never captured), so plain ADD COLUMN
-		// converges; placed after the state-CHECK rebuild like topic, whose named-column copy would
-		// drop them otherwise.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"diff_files",
-			"ALTER TABLE tasks ADD COLUMN diff_files TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"diff_text",
-			"ALTER TABLE tasks ADD COLUMN diff_text TEXT",
-		);
-		// Work-check columns: absent from TASKS_DDL on purpose — the state-CHECK
-		// rebuild recreates the table from that DDL, so a column living in both would dupe
-		// here on the stale column list (same reason topic and the diff columns live here).
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"work_check_log",
-			"ALTER TABLE tasks ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"work_check_sendbacks",
-			"ALTER TABLE tasks ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"work_check_head",
-			"ALTER TABLE tasks ADD COLUMN work_check_head TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"work_check_report",
-			"ALTER TABLE tasks ADD COLUMN work_check_report TEXT",
-		);
-		// fork_merge_approved lives after the state-CHECK rebuild on purpose (like topic and the
-		// diff columns): it is ALTER-only, so a rebuild before its backfill would drop the
-		// column and the stale `cols` list would never re-add it.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"fork_merge_approved",
-			"ALTER TABLE tasks ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
-		);
-		// A CHECK constraint can only change by rebuilding the table: databases created before
-		// `backlog` carry the old stage list, and a parked card writes 'backlog'. Same pattern as
-		// the state-CHECK rebuild above: runs after every column backfill (named-column copy),
-		// copies rows explicitly, verifies the count, swaps in one transaction.
-		ProjectStore.rebuildTasksOnCheck(
-			db,
-			tasksSql,
-			"stage IN ('todo','in_progress','merging','done')",
-			[
-				"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
-				"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
-				"ALTER TABLE tasks_migrating ADD COLUMN topic TEXT",
-				"ALTER TABLE tasks_migrating ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
-				"ALTER TABLE tasks_migrating ADD COLUMN diff_files TEXT",
-				"ALTER TABLE tasks_migrating ADD COLUMN diff_text TEXT",
-				"ALTER TABLE tasks_migrating ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
-				"ALTER TABLE tasks_migrating ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
-				"ALTER TABLE tasks_migrating ADD COLUMN work_check_head TEXT",
-				"ALTER TABLE tasks_migrating ADD COLUMN work_check_report TEXT",
-				"ALTER TABLE tasks_migrating ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
-			],
-			`id, title, prompt, stage, state, needs_reason, pending_prompt,
+						"state",
+					)) ?? cols;
+				// topic lands after the state-CHECK rebuild above on purpose: that migration copies
+				// named columns only, so a column added before it would be dropped together with the
+				// freshly backfilled labels. Same idempotent pattern as done_at: only null rows.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"topic",
+					"ALTER TABLE tasks ADD COLUMN topic TEXT",
+				);
+				await ProjectStore.backfillTopics(db, store.queue);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"depends_on",
+					"ALTER TABLE tasks ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
+				);
+				// Diff capture columns: null on every pre-existing row (never captured), so plain ADD COLUMN
+				// converges; placed after the state-CHECK rebuild like topic, whose named-column copy would
+				// drop them otherwise.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"diff_files",
+					"ALTER TABLE tasks ADD COLUMN diff_files TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"diff_text",
+					"ALTER TABLE tasks ADD COLUMN diff_text TEXT",
+				);
+				// Work-check columns: absent from TASKS_DDL on purpose — the state-CHECK
+				// rebuild recreates the table from that DDL, so a column living in both would dupe
+				// here on the stale column list (same reason topic and the diff columns live here).
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"work_check_log",
+					"ALTER TABLE tasks ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"work_check_sendbacks",
+					"ALTER TABLE tasks ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"work_check_head",
+					"ALTER TABLE tasks ADD COLUMN work_check_head TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"work_check_report",
+					"ALTER TABLE tasks ADD COLUMN work_check_report TEXT",
+				);
+				// fork_merge_approved lives after the state-CHECK rebuild on purpose (like topic and the
+				// diff columns): it is ALTER-only, so a rebuild before its backfill would drop the
+				// column and the stale `cols` list would never re-add it.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"fork_merge_approved",
+					"ALTER TABLE tasks ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
+				);
+				// A CHECK constraint can only change by rebuilding the table: databases created before
+				// `backlog` carry the old stage list, and a parked card writes 'backlog'. Same pattern as
+				// the state-CHECK rebuild above: runs after every column backfill (named-column copy),
+				// copies rows explicitly, verifies the count, swaps in one transaction.
+				cols =
+					(await ProjectStore.rebuildTasksOnCheck(
+						db,
+						tasksSql,
+						"stage IN ('todo','in_progress','merging','done')",
+						[
+							"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
+							"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
+							"ALTER TABLE tasks_migrating ADD COLUMN topic TEXT",
+							"ALTER TABLE tasks_migrating ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'",
+							"ALTER TABLE tasks_migrating ADD COLUMN diff_files TEXT",
+							"ALTER TABLE tasks_migrating ADD COLUMN diff_text TEXT",
+							"ALTER TABLE tasks_migrating ADD COLUMN work_check_log TEXT NOT NULL DEFAULT '[]'",
+							"ALTER TABLE tasks_migrating ADD COLUMN work_check_sendbacks INTEGER NOT NULL DEFAULT 0",
+							"ALTER TABLE tasks_migrating ADD COLUMN work_check_head TEXT",
+							"ALTER TABLE tasks_migrating ADD COLUMN work_check_report TEXT",
+							"ALTER TABLE tasks_migrating ADD COLUMN fork_merge_approved INTEGER NOT NULL DEFAULT 0",
+						],
+						`id, title, prompt, stage, state, needs_reason, pending_prompt,
 					branch, base, worktree, session_id, summary, details, report, research, research_steps,
 					created_at, updated_at, queued_at, cancelled_at, images, pending_images,
 					release_version, release_notes, session_title, asked, model, kept_files,
 					follow_up_of, push_sha, update_ids, update_merge_approved, fork_merge_approved,
 					commits, done_at, topic, depends_on, diff_files, diff_text, work_check_log,
 					work_check_sendbacks, work_check_head, work_check_report`,
-			"stage",
-		);
-		// Triage columns: ALTER-only and placed after both CHECK rebuilds on
-		// purpose — the rebuilds copy named columns, so a column living in TASKS_DDL too
-		// would dupe here on the stale column list (same reason topic and the diff columns).
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"priority",
-			"ALTER TABLE tasks ADD COLUMN priority TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"close_candidate",
-			"ALTER TABLE tasks ADD COLUMN close_candidate TEXT",
-		);
-		// Merge-hold heads (replace the retired update/fork_merge_approved flags, which stay
-		// unused in old rows): ALTER-only after the rebuilds, same reason as priority above.
-		for (const col of ["update_merge_head", "fork_merge_head", "hold_head"])
-			ProjectStore.addColumn(
-				db,
-				cols,
-				col,
-				`ALTER TABLE tasks ADD COLUMN ${col} TEXT`,
-			);
-		// Who authored pending_prompt ("user" | "supervisor"): ALTER-only after the
-		// rebuilds, same reason as priority above; null behaves as "user" on old rows.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"pending_by",
-			"ALTER TABLE tasks ADD COLUMN pending_by TEXT",
-		);
-		// OTTR-394: how many automatic rebase retries a rejected server push has spent
-		// (budget 2 per card). ALTER-only after the rebuilds, like pending_by above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"push_retries",
-			"ALTER TABLE tasks ADD COLUMN push_retries INTEGER NOT NULL DEFAULT 0",
-		);
-		// OTTR-552 PR-mode PR fields: ALTER-only after both CHECK rebuilds, same reason as
-		// push_retries above — a rebuild's explicit column list would drop them.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"pr_number",
-			"ALTER TABLE tasks ADD COLUMN pr_number INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"pr_url",
-			"ALTER TABLE tasks ADD COLUMN pr_url TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"pr_head_sha",
-			"ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT",
-		);
-		// OTTR-760: the pull request a card was filed from (a Dependabot PR). The ship step
-		// adopts it instead of opening a second PR. ALTER-only after both CHECK rebuilds,
-		// same reason as pr_number above — a rebuild's explicit column list would drop them.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"source_pr_number",
-			"ALTER TABLE tasks ADD COLUMN source_pr_number INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"source_pr_url",
-			"ALTER TABLE tasks ADD COLUMN source_pr_url TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"source_pr_head_ref",
-			"ALTER TABLE tasks ADD COLUMN source_pr_head_ref TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"source_pr_head_sha",
-			"ALTER TABLE tasks ADD COLUMN source_pr_head_sha TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"source_pr_cross_repo",
-			"ALTER TABLE tasks ADD COLUMN source_pr_cross_repo INTEGER NOT NULL DEFAULT 0",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"source_pr_dependabot",
-			"ALTER TABLE tasks ADD COLUMN source_pr_dependabot INTEGER NOT NULL DEFAULT 0",
-		);
-		// OTTR-809: the follow-up PR the ship step opened for a Dependabot card's fixes
-		// beyond the source PR's head. ALTER-only after both CHECK rebuilds, same reason
-		// as pr_number above — a rebuild's explicit column list would drop them.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"follow_up_pr_number",
-			"ALTER TABLE tasks ADD COLUMN follow_up_pr_number INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"follow_up_pr_url",
-			"ALTER TABLE tasks ADD COLUMN follow_up_pr_url TEXT",
-		);
-		const turnCols = db
-			.query<{ name: string }, []>("PRAGMA table_info(turns)")
-			.all()
-			.map((c) => c.name);
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"model",
-			"ALTER TABLE turns ADD COLUMN model TEXT",
-		);
-		// The --model selector a swapped run was dispatched with; null when none served a
-		// different model than dispatched. Nullable, so plain ADD COLUMN converges.
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"dispatched_model",
-			"ALTER TABLE turns ADD COLUMN dispatched_model TEXT",
-		);
-		// Where the turn's run executed; null for turns recorded before OTTR-503.
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"ran_on",
-			"ALTER TABLE turns ADD COLUMN ran_on TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"input",
-			"ALTER TABLE turns ADD COLUMN input TEXT",
-		);
-		// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"input_by",
-			"ALTER TABLE turns ADD COLUMN input_by TEXT",
-		);
-		// Byte offset in the card log where the turn's own section starts; null for pre-field rows.
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"log_offset",
-			"ALTER TABLE turns ADD COLUMN log_offset INTEGER",
-		);
-		// Cost capture columns: nullable, so plain ADD COLUMN converges like the
-		// tasks columns above; the backfill below fills what the transcripts still allow.
-		for (const col of [
-			"tokens_in",
-			"tokens_out",
-			"cache_read",
-			"cache_write",
-		]) {
-			ProjectStore.addColumn(
-				db,
-				turnCols,
-				col,
-				`ALTER TABLE turns ADD COLUMN ${col} INTEGER`,
-			);
-		}
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"cost",
-			"ALTER TABLE turns ADD COLUMN cost REAL",
-		);
-		ProjectStore.addColumn(
-			db,
-			turnCols,
-			"layer",
-			"ALTER TABLE turns ADD COLUMN layer TEXT",
-		);
-		// One-time-per-open cost backfill: finished turns without captured cost read their
-		// task's transcript once per task and fill each turn by its timestamp window. Never
-		// throws (spec): a failure or a missing transcript leaves the columns NULL and the
-		// next open tries again.
-		try {
-			backfillTurnCosts(db, join(tasksDir, "sessions"));
-		} catch {
-			/* backfill is best-effort; the next open retries */
-		}
-		// kind: trusted, server-set card kind. ALTER-only and placed after both
-		// table-rebuild blocks on purpose (like topic/fork_merge_approved): those copy rows by
-		// an explicit name list and would reset kind to 'work'. The one-time backfill maps
-		// pre-existing privileged cards to their kind: they were all created by the trusted
-		// routes whose prompt builders emit these prefixes, so a LIKE on the marker constants
-		// is exact here. After this backfill no code derives kind from prompt text again.
-		if (!cols.includes("kind")) {
-			ProjectStore.addColumn(
-				db,
-				cols,
-				"kind",
-				"ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'",
-			);
-			db.run("UPDATE tasks SET kind = 'retro' WHERE prompt LIKE ? || '%'", [
-				RETRO_MARKER,
-			]);
-			db.run("UPDATE tasks SET kind = 'interview' WHERE prompt LIKE ? || '%'", [
-				RULES_INTERVIEW_MARKER,
-			]);
-			db.run(
-				"UPDATE tasks SET kind = 'review' WHERE release_version IS NULL AND prompt LIKE ? || '%'",
-				[ARCH_REVIEW_MARKER],
-			);
-		}
-		// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"hold_until",
-			"ALTER TABLE tasks ADD COLUMN hold_until INTEGER",
-		);
-		// OTTR-688: which provider (and window) a usage-limit hold waits for; null on non-usage
-		// holds. Nullable TEXT, so plain ADD COLUMN converges; ALTER-only after every rebuild
-		// like hold_until above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"hold_provider",
-			"ALTER TABLE tasks ADD COLUMN hold_provider TEXT",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"hold_window",
-			"ALTER TABLE tasks ADD COLUMN hold_window TEXT",
-		);
-		// OTTR-880: how many consecutive usage-limit holds a card collected; the probe wait
-		// grows with it (30m → 6h) and a settle that runs past the limit clears it. NOT NULL
-		// DEFAULT 0, so plain ADD COLUMN converges; ALTER-only after every rebuild like the
-		// hold columns above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"hold_attempts",
-			"ALTER TABLE tasks ADD COLUMN hold_attempts INTEGER NOT NULL DEFAULT 0",
-		);
-		// OTTR-880: when the current hold was stamped. The quota refresh counts only
-		// blocked-window sightings after it as early-release evidence. Nullable, so plain
-		// ADD COLUMN converges; ALTER-only after every rebuild like the hold columns above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"hold_set_at",
-			"ALTER TABLE tasks ADD COLUMN hold_set_at INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"starred",
-			"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
-		);
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"merge_head",
-			"ALTER TABLE tasks ADD COLUMN merge_head TEXT",
-		);
-		// The parent's project when follow_up_of names a card on another project's board
-		// (create_task's project parameter); null keeps the link on this board. ALTER-only
-		// after every rebuild, like the columns above: a rebuild's explicit column list
-		// would drop it, and a column living in TASKS_DDL too would dupe here on the
-		// stale cols list.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"follow_up_of_project",
-			"ALTER TABLE tasks ADD COLUMN follow_up_of_project TEXT",
-		);
-		// context_tokens: the task's final context-window size in prompt tokens, captured
-		// at turn finish and backfilled for done tasks from their transcripts. ALTER-only
-		// after every rebuild, like the columns above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"context_tokens",
-			"ALTER TABLE tasks ADD COLUMN context_tokens INTEGER",
-		);
-		try {
-			backfillDoneContext(db, join(tasksDir, "sessions"));
-		} catch {
-			/* backfill is best-effort; the next open retries */
-		}
-		// uncommitted_files: the worktree's uncommitted files captured when a card settles
-		// done, so the done drawer still names them after removeWorktree deletes the tree.
-		// ALTER-only after every rebuild, like the columns above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"uncommitted_files",
-			"ALTER TABLE tasks ADD COLUMN uncommitted_files TEXT NOT NULL DEFAULT '[]'",
-		);
-		// OTTR-528: the decision panel's five fields, nullable JSON, ALTER-only after the
-		// rebuilds like the columns above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"proposal_summary",
-			"ALTER TABLE tasks ADD COLUMN proposal_summary TEXT",
-		);
-		// OTTR-769: the review-check stamp over the card's stored findings. ALTER-only after
-		// every rebuild, like the columns above.
-		ProjectStore.addColumn(
-			db,
-			cols,
-			"findings_checked_at",
-			"ALTER TABLE tasks ADD COLUMN findings_checked_at INTEGER",
-		);
-		ProjectStore.convergeProposalReasons(db);
-		// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
-		// updates a live table, so converge additively like the tasks columns above.
-		const prCols = db
-			.query<{ name: string }, []>("PRAGMA table_info(pr_review)")
-			.all()
-			.map((c) => c.name);
-		ProjectStore.addColumn(
-			db,
-			prCols,
-			"posted_url",
-			"ALTER TABLE pr_review ADD COLUMN posted_url TEXT",
-		);
-		// The open-PR hold columns landed after the first fork_branch release: same additive
-		// convergence; null reads as "no hold", the state of every older row.
-		const forkCols = db
-			.query<{ name: string }, []>("PRAGMA table_info(fork_branch)")
-			.all()
-			.map((c) => c.name);
-		for (const col of ["hold_prs", "hold_base"])
-			ProjectStore.addColumn(
-				db,
-				forkCols,
-				col,
-				`ALTER TABLE fork_branch ADD COLUMN ${col} TEXT`,
-			);
-		// The retired cursor hold (hold_prs/hold_base, superseded by the per-commit
-		// fork_hold rows) converts in two steps, so a live board keeps every held
-		// commit: each legacy entry held its PR's head, so the head sha seeds the
-		// fork_hold row here; the watcher then expands the PR's other held commits
-		// (they live between hold_base and the head, a window only git knows) and
-		// clears hold_base. One transaction for this step; a later open is a no-op.
-		db.transaction(() => {
-			const legacy = db
-				.query<
-					{ fork_id: number; branch_hash: string; hold_prs: string | null },
-					[]
-				>(
-					"SELECT fork_id, branch_hash, hold_prs FROM fork_branch WHERE hold_prs IS NOT NULL",
-				)
-				.all();
-			for (const row of legacy) {
-				const prs = parseHoldPrs(row.hold_prs);
-				if (prs !== null) {
-					for (const e of prs)
-						db.run(
-							"INSERT OR IGNORE INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, 0)",
-							[row.fork_id, row.branch_hash, e.head, e.n, e.head],
-						);
-				}
-				db.run(
-					"UPDATE fork_branch SET hold_prs = NULL WHERE fork_id = ? AND branch_hash = ?",
-					[row.fork_id, row.branch_hash],
+						"stage",
+					)) ?? cols;
+				// Triage columns: ALTER-only and placed after both CHECK rebuilds on
+				// purpose — the rebuilds copy named columns, so a column living in TASKS_DDL too
+				// would dupe here on the stale column list (same reason topic and the diff columns).
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"priority",
+					"ALTER TABLE tasks ADD COLUMN priority TEXT",
 				);
-			}
-		})();
-		// posted_login landed with the GitHub App posts: same additive convergence, so an
-		// older database still reads and posts without a rebuild.
-		ProjectStore.addColumn(
-			db,
-			prCols,
-			"posted_login",
-			"ALTER TABLE pr_review ADD COLUMN posted_login TEXT",
-		);
-		// The comment watch landed with the PR review notifications: same additive
-		// convergence, so an older database still sweeps and alerts without a rebuild.
-		ProjectStore.addColumn(
-			db,
-			prCols,
-			"comments_at",
-			"ALTER TABLE pr_review ADD COLUMN comments_at INTEGER",
-		);
-		ProjectStore.addColumn(
-			db,
-			prCols,
-			"comments_unseen",
-			"ALTER TABLE pr_review ADD COLUMN comments_unseen INTEGER NOT NULL DEFAULT 0",
-		);
-		// pr_review_runs changed shape twice inside the first pr_review releases (head, then
-		// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
-		// prHeadReviewed and the done update then throw "no such column" and the watcher
-		// only logs it. NOT NULL and the new primary key have no additive form: rebuild,
-		// same pattern as the stage rebuilds above — copy rows explicitly, verify the count,
-		// swap, one transaction, so a failure leaves the old table untouched.
-		const runCols = db
-			.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
-			.all()
-			.map((c) => c.name);
-		ProjectStore.rebuildPrReviewRuns(db, runCols);
-		// The rebuild recreates from the current DDL (which has blocking); a live table that
-		// predates the column converges additively. Default 1 is fail-safe: an old run reads
-		// as blocking, so an approval needs a run that recorded a clean verdict.
-		ProjectStore.addColumn(
-			db,
-			db
-				.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
-				.all()
-				.map((c) => c.name),
-			"blocking",
-			"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
-		);
-		return new ProjectStore(root, db);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"close_candidate",
+					"ALTER TABLE tasks ADD COLUMN close_candidate TEXT",
+				);
+				// Merge-hold heads (replace the retired update/fork_merge_approved flags, which stay
+				// unused in old rows): ALTER-only after the rebuilds, same reason as priority above.
+				for (const col of ["update_merge_head", "fork_merge_head", "hold_head"])
+					await ProjectStore.addColumn(
+						db,
+						cols,
+						col,
+						`ALTER TABLE tasks ADD COLUMN ${col} TEXT`,
+					);
+				// Who authored pending_prompt ("user" | "supervisor"): ALTER-only after the
+				// rebuilds, same reason as priority above; null behaves as "user" on old rows.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pending_by",
+					"ALTER TABLE tasks ADD COLUMN pending_by TEXT",
+				);
+				// OTTR-394: how many automatic rebase retries a rejected server push has spent
+				// (budget 2 per card). ALTER-only after the rebuilds, like pending_by above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"push_retries",
+					"ALTER TABLE tasks ADD COLUMN push_retries INTEGER NOT NULL DEFAULT 0",
+				);
+				// OTTR-552 PR-mode PR fields: ALTER-only after both CHECK rebuilds, same reason as
+				// push_retries above — a rebuild's explicit column list would drop them.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pr_number",
+					"ALTER TABLE tasks ADD COLUMN pr_number INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pr_url",
+					"ALTER TABLE tasks ADD COLUMN pr_url TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"pr_head_sha",
+					"ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT",
+				);
+				// OTTR-760: the pull request a card was filed from (a Dependabot PR). The ship step
+				// adopts it instead of opening a second PR. ALTER-only after both CHECK rebuilds,
+				// same reason as pr_number above — a rebuild's explicit column list would drop them.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_number",
+					"ALTER TABLE tasks ADD COLUMN source_pr_number INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_url",
+					"ALTER TABLE tasks ADD COLUMN source_pr_url TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_head_ref",
+					"ALTER TABLE tasks ADD COLUMN source_pr_head_ref TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_head_sha",
+					"ALTER TABLE tasks ADD COLUMN source_pr_head_sha TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_cross_repo",
+					"ALTER TABLE tasks ADD COLUMN source_pr_cross_repo INTEGER NOT NULL DEFAULT 0",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"source_pr_dependabot",
+					"ALTER TABLE tasks ADD COLUMN source_pr_dependabot INTEGER NOT NULL DEFAULT 0",
+				);
+				// OTTR-809: the follow-up PR the ship step opened for a Dependabot card's fixes
+				// beyond the source PR's head. ALTER-only after both CHECK rebuilds, same reason
+				// as pr_number above — a rebuild's explicit column list would drop them.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"follow_up_pr_number",
+					"ALTER TABLE tasks ADD COLUMN follow_up_pr_number INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"follow_up_pr_url",
+					"ALTER TABLE tasks ADD COLUMN follow_up_pr_url TEXT",
+				);
+				const turnCols = (
+					await db.query<{ name: string }, []>("PRAGMA table_info(turns)").all()
+				).map((c) => c.name);
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"model",
+					"ALTER TABLE turns ADD COLUMN model TEXT",
+				);
+				// The --model selector a swapped run was dispatched with; null when none served a
+				// different model than dispatched. Nullable, so plain ADD COLUMN converges.
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"dispatched_model",
+					"ALTER TABLE turns ADD COLUMN dispatched_model TEXT",
+				);
+				// Where the turn's run executed; null for turns recorded before OTTR-503.
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"ran_on",
+					"ALTER TABLE turns ADD COLUMN ran_on TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"input",
+					"ALTER TABLE turns ADD COLUMN input TEXT",
+				);
+				// Who authored the delivered input ("user" | "supervisor"); null behaves as "user".
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"input_by",
+					"ALTER TABLE turns ADD COLUMN input_by TEXT",
+				);
+				// Byte offset in the card log where the turn's own section starts; null for pre-field rows.
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"log_offset",
+					"ALTER TABLE turns ADD COLUMN log_offset INTEGER",
+				);
+				// Cost capture columns: nullable, so plain ADD COLUMN converges like the
+				// tasks columns above; the backfill below fills what the transcripts still allow.
+				for (const col of [
+					"tokens_in",
+					"tokens_out",
+					"cache_read",
+					"cache_write",
+				]) {
+					await ProjectStore.addColumn(
+						db,
+						turnCols,
+						col,
+						`ALTER TABLE turns ADD COLUMN ${col} INTEGER`,
+					);
+				}
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"cost",
+					"ALTER TABLE turns ADD COLUMN cost REAL",
+				);
+				await ProjectStore.addColumn(
+					db,
+					turnCols,
+					"layer",
+					"ALTER TABLE turns ADD COLUMN layer TEXT",
+				);
+				// kind: trusted, server-set card kind. ALTER-only and placed after both
+				// table-rebuild blocks on purpose (like topic/fork_merge_approved): those copy rows by
+				// an explicit name list and would reset kind to 'work'. The one-time backfill maps
+				// pre-existing privileged cards to their kind: they were all created by the trusted
+				// routes whose prompt builders emit these prefixes, so a LIKE on the marker constants
+				// is exact here. After this backfill no code derives kind from prompt text again.
+				if (!cols.includes("kind")) {
+					await store.transaction(async () => {
+						await ProjectStore.addColumn(
+							db,
+							cols,
+							"kind",
+							"ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'",
+						);
+						await db.run(
+							"UPDATE tasks SET kind = 'retro' WHERE prompt LIKE ? || '%'",
+							[RETRO_MARKER],
+						);
+						await db.run(
+							"UPDATE tasks SET kind = 'interview' WHERE prompt LIKE ? || '%'",
+							[RULES_INTERVIEW_MARKER],
+						);
+						await db.run(
+							"UPDATE tasks SET kind = 'review' WHERE release_version IS NULL AND prompt LIKE ? || '%'",
+							[ARCH_REVIEW_MARKER],
+						);
+					});
+				}
+				// ALTER-only after every rebuild, like kind: a rebuild's explicit column list would drop it.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"hold_until",
+					"ALTER TABLE tasks ADD COLUMN hold_until INTEGER",
+				);
+				// OTTR-688: which provider (and window) a usage-limit hold waits for; null on non-usage
+				// holds. Nullable TEXT, so plain ADD COLUMN converges; ALTER-only after every rebuild
+				// like hold_until above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"hold_provider",
+					"ALTER TABLE tasks ADD COLUMN hold_provider TEXT",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"hold_window",
+					"ALTER TABLE tasks ADD COLUMN hold_window TEXT",
+				);
+				// OTTR-880: increase the probe wait after each consecutive usage-limit hold.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"hold_attempts",
+					"ALTER TABLE tasks ADD COLUMN hold_attempts INTEGER NOT NULL DEFAULT 0",
+				);
+				// Only blocked-window sightings after this stamp can release the hold early.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"hold_set_at",
+					"ALTER TABLE tasks ADD COLUMN hold_set_at INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"starred",
+					"ALTER TABLE tasks ADD COLUMN starred INTEGER NOT NULL DEFAULT 0",
+				);
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"merge_head",
+					"ALTER TABLE tasks ADD COLUMN merge_head TEXT",
+				);
+				// The parent's project when follow_up_of names a card on another project's board
+				// (create_task's project parameter); null keeps the link on this board. ALTER-only
+				// after every rebuild, like the columns above: a rebuild's explicit column list
+				// would drop it, and a column living in TASKS_DDL too would dupe here on the
+				// stale cols list.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"follow_up_of_project",
+					"ALTER TABLE tasks ADD COLUMN follow_up_of_project TEXT",
+				);
+				// context_tokens: the task's final context-window size in prompt tokens, captured
+				// at turn finish and backfilled for done tasks from their transcripts. ALTER-only
+				// after every rebuild, like the columns above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"context_tokens",
+					"ALTER TABLE tasks ADD COLUMN context_tokens INTEGER",
+				);
+				// uncommitted_files: the worktree's uncommitted files captured when a card settles
+				// done, so the done drawer still names them after removeWorktree deletes the tree.
+				// ALTER-only after every rebuild, like the columns above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"uncommitted_files",
+					"ALTER TABLE tasks ADD COLUMN uncommitted_files TEXT NOT NULL DEFAULT '[]'",
+				);
+				// OTTR-528: the decision panel's five fields, nullable JSON, ALTER-only after the
+				// rebuilds like the columns above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"proposal_summary",
+					"ALTER TABLE tasks ADD COLUMN proposal_summary TEXT",
+				);
+				// OTTR-769: the review-check stamp over the card's stored findings. ALTER-only after
+				// every rebuild, like the columns above.
+				await ProjectStore.addColumn(
+					db,
+					cols,
+					"findings_checked_at",
+					"ALTER TABLE tasks ADD COLUMN findings_checked_at INTEGER",
+				);
+				await ProjectStore.convergeProposalReasons(db, store.queue);
+				// posted_url landed after the first pr_review release: CREATE TABLE IF NOT EXISTS never
+				// updates a live table, so converge additively like the tasks columns above.
+				const prCols = (
+					await db
+						.query<{ name: string }, []>("PRAGMA table_info(pr_review)")
+						.all()
+				).map((c) => c.name);
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"posted_url",
+					"ALTER TABLE pr_review ADD COLUMN posted_url TEXT",
+				);
+				// The open-PR hold columns landed after the first fork_branch release: same additive
+				// convergence; null reads as "no hold", the state of every older row.
+				const forkCols = (
+					await db
+						.query<{ name: string }, []>("PRAGMA table_info(fork_branch)")
+						.all()
+				).map((c) => c.name);
+				for (const col of ["hold_prs", "hold_base"])
+					await ProjectStore.addColumn(
+						db,
+						forkCols,
+						col,
+						`ALTER TABLE fork_branch ADD COLUMN ${col} TEXT`,
+					);
+				// The retired cursor hold (hold_prs/hold_base, superseded by the per-commit
+				// fork_hold rows) converts in two steps, so a live board keeps every held
+				// commit: each legacy entry held its PR's head, so the head sha seeds the
+				// fork_hold row here; the watcher then expands the PR's other held commits
+				// (they live between hold_base and the head, a window only git knows) and
+				// clears hold_base. One transaction for this step; a later open is a no-op.
+				await store.transaction(async () => {
+					const legacy = await db
+						.query<
+							{ fork_id: number; branch_hash: string; hold_prs: string | null },
+							[]
+						>(
+							"SELECT fork_id, branch_hash, hold_prs FROM fork_branch WHERE hold_prs IS NOT NULL",
+						)
+						.all();
+					for (const row of legacy) {
+						const prs = parseHoldPrs(row.hold_prs);
+						if (prs !== null) {
+							for (const e of prs)
+								await db.run(
+									"INSERT OR IGNORE INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, 0)",
+									[row.fork_id, row.branch_hash, e.head, e.n, e.head],
+								);
+						}
+						await db.run(
+							"UPDATE fork_branch SET hold_prs = NULL WHERE fork_id = ? AND branch_hash = ?",
+							[row.fork_id, row.branch_hash],
+						);
+					}
+				});
+				// posted_login landed with the GitHub App posts: same additive convergence, so an
+				// older database still reads and posts without a rebuild.
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"posted_login",
+					"ALTER TABLE pr_review ADD COLUMN posted_login TEXT",
+				);
+				// The comment watch landed with the PR review notifications: same additive
+				// convergence, so an older database still sweeps and alerts without a rebuild.
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"comments_at",
+					"ALTER TABLE pr_review ADD COLUMN comments_at INTEGER",
+				);
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"comments_unseen",
+					"ALTER TABLE pr_review ADD COLUMN comments_unseen INTEGER NOT NULL DEFAULT 0",
+				);
+				// pr_review_runs changed shape twice inside the first pr_review releases (head, then
+				// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
+				// prHeadReviewed and the done update then throw "no such column" and the watcher
+				// only logs it. NOT NULL and the new primary key have no additive form: rebuild,
+				// same pattern as the stage rebuilds above — copy rows explicitly, verify the count,
+				// swap, one transaction, so a failure leaves the old table untouched.
+				const runCols = (
+					await db
+						.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
+						.all()
+				).map((c) => c.name);
+				await ProjectStore.rebuildPrReviewRuns(db, runCols);
+				// The rebuild recreates from the current DDL (which has blocking); a live table that
+				// predates the column converges additively. Default 1 is fail-safe: an old run reads
+				// as blocking, so an approval needs a run that recorded a clean verdict.
+				await ProjectStore.addColumn(
+					db,
+					(
+						await db
+							.query<{ name: string }, []>("PRAGMA table_info(pr_review_runs)")
+							.all()
+					).map((c) => c.name),
+					"blocking",
+					"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
+				);
+			});
+			await store.backfillTranscriptData();
+			return store;
+		} catch (error) {
+			await store.close();
+			throw error;
+		}
 	}
 
-	logPath(taskId: string): string {
+	async logPath(taskId: string): Promise<string> {
 		return join(this.tasksDir, "logs", `${taskId}.log`);
 	}
 
-	imagesDir(taskId: string): string {
+	async imagesDir(taskId: string): Promise<string> {
 		return join(this.tasksDir, "images", taskId);
 	}
 
@@ -2315,13 +2280,13 @@ export class ProjectStore {
 	private titleHolds = new Map<string, () => void>();
 
 	/** Holds the task's transcript title back until a pending generation retry settles. */
-	holdTitle(id: string, cancelRetry: () => void): void {
+	async holdTitle(id: string, cancelRetry: () => void): Promise<void> {
 		this.titleHolds.get(id)?.();
 		this.titleHolds.set(id, cancelRetry);
 	}
 
 	/** Ends the hold and cancels the scheduled retry; true when a hold was live. */
-	releaseTitleHold(id: string): boolean {
+	async releaseTitleHold(id: string): Promise<boolean> {
 		const cancel = this.titleHolds.get(id);
 		if (cancel === undefined) return false;
 		this.titleHolds.delete(id);
@@ -2330,19 +2295,23 @@ export class ProjectStore {
 	}
 
 	/** True while a title-generation retry is pending for the task. */
-	titleHold(id: string): boolean {
+	async titleHold(id: string): Promise<boolean> {
 		return this.titleHolds.has(id);
 	}
 
 	/** The task's raw stored session title, or null; one indexed read. */
-	private storedTitle(id: string): string | null {
-		return (
-			this.db
-				.query<{ session_title: string | null }, [string]>(
-					"SELECT session_title FROM tasks WHERE id = ?",
-				)
-				.get(id)?.session_title ?? null
-		);
+	private async storedTitle(id: string): Promise<string | null> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ session_title: string | null }, [string]>(
+							"SELECT session_title FROM tasks WHERE id = ?",
+						)
+						.get(id)
+				)?.session_title ?? null
+			);
+		});
 	}
 
 	/** One title ladder for every caller: the stored title first, then the first title in
@@ -2350,32 +2319,48 @@ export class ProjectStore {
 	 * Markdown from the titler and omp's card prefix are stripped on read, so rows written
 	 * before the cleaning also display clean. A pending generation retry holds the
 	 * transcript title back. */
-	private resolveTitle(
+	private async resolveTitle(
 		task: ListedTask,
 		storedTitle: string | null,
 		persist: boolean,
-	): string | null {
+	): Promise<string | null> {
 		if (storedTitle) return cleanTitle(storedTitle);
-		if (this.titleHolds.has(task.id)) return null; // a pending generation retry outraces it
+		if (await this.titleHold(task.id)) return null;
 		const fromSession = firstSessionTitle(this.sessionsDir, task.sessionId);
 		if (fromSession === null) return null;
 		const title = cleanTitle(fromSession);
-		if (persist) this.nameTask(task.id, title);
-		return title;
+		return this.transaction(async () => {
+			const current = await this.getTask(task.id);
+			if (current === null) return null;
+			const saved = await this.storedTitle(task.id);
+			if (saved) return cleanTitle(saved);
+			if (current.sessionId !== task.sessionId || this.titleHolds.has(task.id))
+				return null;
+			if (!persist) return title;
+			await this.nameTask(task.id, title);
+			const winner = await this.storedTitle(task.id);
+			return winner === null ? null : cleanTitle(winner);
+		});
 	}
 
 	/** The task's own session title: the stored one, or the first title in the session
 	 * transcript; null when neither exists yet. */
-	sessionTitle(task: ListedTask): string | null {
-		return this.resolveTitle(task, this.storedTitle(task.id), false);
+	async sessionTitle(task: ListedTask): Promise<string | null> {
+		return await this.resolveTitle(
+			task,
+			await this.storedTitle(task.id),
+			false,
+		);
 	}
 
 	/** Persists a title once: `IS NULL` keeps the first name authoritative even if two writes race. */
-	nameTask(id: string, title: string): void {
-		this.db.run(
-			"UPDATE tasks SET session_title = ? WHERE id = ? AND session_title IS NULL",
-			[title, id],
-		);
+	async nameTask(id: string, title: string): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE tasks SET session_title = ? WHERE id = ? AND session_title IS NULL",
+				[title, id],
+			);
+		});
 	}
 
 	/**
@@ -2385,133 +2370,161 @@ export class ProjectStore {
 	 * run's rename, or the tracker's prepare-phase generation), the card shows a short cut of the
 	 * prompt line — recomputed each call, never persisted.
 	 */
-	frozenTitle(task: ListedTask): string {
-		return this.frozenTitleFrom(task, this.storedTitle(task.id));
+	async frozenTitle(task: ListedTask): Promise<string> {
+		return await this.frozenTitleFrom(task, await this.storedTitle(task.id));
 	}
 
 	/** frozenTitle for a batched caller (the board card build): the stored title arrives
 	 * from boardCardFacts instead of a per-task SELECT, and the once-only persist runs
 	 * only when the title came from the transcript — a stored title needs no write.
 	 * Same output as frozenTitle. */
-	frozenTitleFrom(task: ListedTask, storedTitle: string | null): string {
-		return this.resolveTitle(task, storedTitle, true) ?? shortTitle(task.title);
+	async frozenTitleFrom(
+		task: ListedTask,
+		storedTitle: string | null,
+	): Promise<string> {
+		return (
+			(await this.resolveTitle(task, storedTitle, true)) ??
+			shortTitle(task.title)
+		);
 	}
 
-	getSettings(): ProjectSettings {
-		// A deep copy: callers own the arrays (copyExtra, tendChurnGlobs), never the defaults'.
-		const out = structuredClone(DEFAULT_SETTINGS);
-		for (const row of this.db
-			.query<{ key: string; value: string }, []>(
-				"SELECT key, value FROM settings",
-			)
-			.all()) {
-			try {
-				const value = parseSetting(row.key, JSON.parse(row.value) as unknown);
-				if (value !== undefined)
-					(out as Record<keyof ProjectSettings, unknown>)[
-						row.key as keyof ProjectSettings
-					] = value;
-			} catch {
-				// corrupt settings row: keep default
+	async getSettings(): Promise<ProjectSettings> {
+		return this.queue.run(async () => {
+			// A deep copy: callers own the arrays (copyExtra, tendChurnGlobs), never the defaults'.
+			const out = structuredClone(DEFAULT_SETTINGS);
+			for (const row of await this.db
+				.query<{ key: string; value: string }, []>(
+					"SELECT key, value FROM settings",
+				)
+				.all()) {
+				try {
+					const value = parseSetting(row.key, JSON.parse(row.value) as unknown);
+					if (value !== undefined)
+						(out as Record<keyof ProjectSettings, unknown>)[
+							row.key as keyof ProjectSettings
+						] = value;
+				} catch {
+					// corrupt settings row: keep default
+				}
 			}
-		}
-		return out;
+			return out;
+		});
 	}
 
-	setSettings(patch: Partial<ProjectSettings>): ProjectSettings {
-		for (const [key, value] of Object.entries(patch)) {
-			// Unknown keys can only arrive from a hand-built JSON body; ignore them.
-			if (value === undefined || !(key in DEFAULT_SETTINGS)) continue;
-			// A reset stores JSON null instead of deleting the row: tracker data is never deleted.
-			this.db.run(
-				"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-				[key, JSON.stringify(value)],
-			);
-		}
-		return this.getSettings();
+	async setSettings(patch: Partial<ProjectSettings>): Promise<ProjectSettings> {
+		return this.queue.transaction(async () => {
+			for (const [key, value] of Object.entries(patch)) {
+				// Unknown keys can only arrive from a hand-built JSON body; ignore them.
+				if (value === undefined || !(key in DEFAULT_SETTINGS)) continue;
+				// A reset stores JSON null instead of deleting the row: tracker data is never deleted.
+				await this.db.run(
+					"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+					[key, JSON.stringify(value)],
+				);
+			}
+			return await this.getSettings();
+		});
 	}
 
 	/** The card the Check the board button filed last (POST /api/projects/:project/board-check).
 	 * Only that route writes the mark, so no prompt an agent writes can make a card a board
 	 * check, which runs in the server's own container. Stored next to next-task-num, outside
 	 * the project settings that the Settings route edits. */
-	boardCheckId(): string | null {
-		const row = this.db
-			.query<{ value: string }, []>(
-				"SELECT value FROM settings WHERE key = 'board-check'",
-			)
-			.get();
-		return row === null ? null : (JSON.parse(row.value) as string);
+	async boardCheckId(): Promise<string | null> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<{ value: string }, []>(
+					"SELECT value FROM settings WHERE key = 'board-check'",
+				)
+				.get();
+			return row === null ? null : (JSON.parse(row.value) as string);
+		});
 	}
 
-	setBoardCheckId(id: string): void {
-		this.db.run(
-			"INSERT INTO settings (key, value) VALUES ('board-check', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-			[JSON.stringify(id)],
-		);
+	async setBoardCheckId(id: string): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"INSERT INTO settings (key, value) VALUES ('board-check', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				[JSON.stringify(id)],
+			);
+		});
 	}
 
 	/** Pids of turns that never ended: the orphan scan must not kill live processes. */
-	runningPids(): number[] {
-		return this.db
-			.query<{ pid: number }, []>(
-				"SELECT DISTINCT pid FROM turns WHERE pid IS NOT NULL AND ended_at IS NULL",
-			)
-			.all()
-			.map((r) => r.pid);
+	async runningPids(): Promise<number[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<{ pid: number }, []>(
+						"SELECT DISTINCT pid FROM turns WHERE pid IS NOT NULL AND ended_at IS NULL",
+					)
+					.all()
+			).map((r) => r.pid);
+		});
 	}
 
 	// ---- Fork research watch state ----
 
 	/** Branch watch rows of one fork, branch name ascending. */
-	listForkBranches(forkId: number): ForkBranchState[] {
-		return this.db
-			.query<ForkBranchRow, [number]>(
-				"SELECT * FROM fork_branch WHERE fork_id = ? ORDER BY branch",
-			)
-			.all(forkId)
-			.map(toForkBranch);
+	async listForkBranches(forkId: number): Promise<ForkBranchState[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<ForkBranchRow, [number]>(
+						"SELECT * FROM fork_branch WHERE fork_id = ? ORDER BY branch",
+					)
+					.all(forkId)
+			).map(toForkBranch);
+		});
 	}
 
 	/** Every branch watch row (the gates scan the whole watch). */
-	listAllForkBranches(): ForkBranchState[] {
-		return this.db
-			.query<ForkBranchRow, []>("SELECT * FROM fork_branch")
-			.all()
-			.map(toForkBranch);
+	async listAllForkBranches(): Promise<ForkBranchState[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<ForkBranchRow, []>("SELECT * FROM fork_branch")
+					.all()
+			).map(toForkBranch);
+		});
 	}
 
 	/** Per-commit holds of one fork, any order (the watcher merges them per branch). */
-	listForkHolds(forkId: number): ForkHoldState[] {
-		return this.db
-			.query<ForkHoldRow, [number]>("SELECT * FROM fork_hold WHERE fork_id = ?")
-			.all(forkId)
-			.map(toForkHold);
+	async listForkHolds(forkId: number): Promise<ForkHoldState[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<ForkHoldRow, [number]>(
+						"SELECT * FROM fork_hold WHERE fork_id = ?",
+					)
+					.all(forkId)
+			).map(toForkHold);
+		});
 	}
 
 	/** Replaces ALL per-commit hold rows of one branch in one transaction. */
-	setForkHolds(
+	async setForkHolds(
 		forkId: number,
 		branchHash: string,
 		rows: Array<{ sha: string; pr: number; prHead: string; released: boolean }>,
-	): void {
-		for (const r of rows) {
-			if (!/^[0-9a-f]{40}$/.test(r.prHead)) {
-				throw new Error(`fork_hold: pr_head must be 40-hex, got ${r.prHead}`);
+	): Promise<void> {
+		return this.queue.transaction(async () => {
+			for (const r of rows) {
+				if (!/^[0-9a-f]{40}$/.test(r.prHead)) {
+					throw new Error(`fork_hold: pr_head must be 40-hex, got ${r.prHead}`);
+				}
 			}
-		}
-		this.db.transaction(() => {
-			this.db.run(
+			await this.db.run(
 				"DELETE FROM fork_hold WHERE fork_id = ? AND branch_hash = ?",
 				[forkId, branchHash],
 			);
 			for (const r of rows) {
-				this.db.run(
+				await this.db.run(
 					"INSERT INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, ?)",
 					[forkId, branchHash, r.sha, r.pr, r.prHead, r.released ? 1 : 0],
 				);
 			}
-		})();
+		});
 	}
 
 	/**
@@ -2519,82 +2532,110 @@ export class ProjectStore {
 	 * it to expand a migrated PR-level hold into per-commit rows, then clears it; a
 	 * failed expansion leaves it in place, so the next tick retries the conversion.
 	 */
-	legacyForkHoldBase(forkId: number, branchHash: string): string | null {
-		return (
-			this.db
-				.query<{ hold_base: string | null }, [number, string]>(
-					"SELECT hold_base FROM fork_branch WHERE fork_id = ? AND branch_hash = ?",
-				)
-				.get(forkId, branchHash)?.hold_base ?? null
-		);
+	async legacyForkHoldBase(
+		forkId: number,
+		branchHash: string,
+	): Promise<string | null> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ hold_base: string | null }, [number, string]>(
+							"SELECT hold_base FROM fork_branch WHERE fork_id = ? AND branch_hash = ?",
+						)
+						.get(forkId, branchHash)
+				)?.hold_base ?? null
+			);
+		});
 	}
 
 	/** Clears the retired cursor-hold base after a successful legacy conversion. */
-	clearLegacyForkHoldBase(forkId: number, branchHash: string): void {
-		this.db.run(
-			"UPDATE fork_branch SET hold_base = NULL WHERE fork_id = ? AND branch_hash = ?",
-			[forkId, branchHash],
-		);
+	async clearLegacyForkHoldBase(
+		forkId: number,
+		branchHash: string,
+	): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE fork_branch SET hold_base = NULL WHERE fork_id = ? AND branch_hash = ?",
+				[forkId, branchHash],
+			);
+		});
 	}
 
 	/** Upserts one branch watch row. */
-	saveForkBranch(s: ForkBranchState): void {
-		this.db.run(
-			`INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, first_pending_at, last_run_at, last_error, retries)
+	async saveForkBranch(s: ForkBranchState): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				`INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, first_pending_at, last_run_at, last_error, retries)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(fork_id, branch_hash) DO UPDATE SET
 			   branch = excluded.branch, head = excluded.head, analyzed_head = excluded.analyzed_head,
 			   first_pending_at = excluded.first_pending_at, last_run_at = excluded.last_run_at,
 			   last_error = excluded.last_error, retries = excluded.retries`,
-			[
-				s.forkId,
-				s.branchHash,
-				s.branch,
-				s.head,
-				s.analyzedHead,
-				s.firstPendingAt,
-				s.lastRunAt,
-				s.lastError,
-				s.retries,
-			],
-		);
+				[
+					s.forkId,
+					s.branchHash,
+					s.branch,
+					s.head,
+					s.analyzedHead,
+					s.firstPendingAt,
+					s.lastRunAt,
+					s.lastError,
+					s.retries,
+				],
+			);
+		});
 	}
 
 	/** Analysis attempts started since `since` (project daily-rate gate). */
-	forkRunsSince(since: number): number {
-		return (
-			this.db
-				.query<{ n: number }, [number]>(
-					"SELECT COUNT(*) AS n FROM fork_runs WHERE started_at >= ?",
-				)
-				.get(since)?.n ?? 0
-		);
+	async forkRunsSince(since: number): Promise<number> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ n: number }, [number]>(
+							"SELECT COUNT(*) AS n FROM fork_runs WHERE started_at >= ?",
+						)
+						.get(since)
+				)?.n ?? 0
+			);
+		});
 	}
 
-	recordForkRun(forkId: number, at: number): void {
-		this.db.run("INSERT INTO fork_runs (started_at, fork_id) VALUES (?, ?)", [
-			at,
-			forkId,
-		]);
+	async recordForkRun(forkId: number, at: number): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"INSERT INTO fork_runs (started_at, fork_id) VALUES (?, ?)",
+				[at, forkId],
+			);
+		});
 	}
 
 	/** Drops watch rows of forks absent from the latest scan; an empty list clears the watch. */
-	deleteForkBranchesNotIn(ids: number[]): void {
-		if (ids.length === 0) {
-			this.db.run("DELETE FROM fork_branch");
-			this.db.run("DELETE FROM fork_hold");
-			return;
-		}
-		const ph = ids.map(() => "?").join(", ");
-		this.db.run(`DELETE FROM fork_branch WHERE fork_id NOT IN (${ph})`, ids);
-		this.db.run(`DELETE FROM fork_hold WHERE fork_id NOT IN (${ph})`, ids);
+	async deleteForkBranchesNotIn(ids: number[]): Promise<void> {
+		return this.queue.transaction(async () => {
+			if (ids.length === 0) {
+				await this.db.run("DELETE FROM fork_branch");
+				await this.db.run("DELETE FROM fork_hold");
+				return;
+			}
+			const ph = ids.map(() => "?").join(", ");
+			await this.db.run(
+				`DELETE FROM fork_branch WHERE fork_id NOT IN (${ph})`,
+				ids,
+			);
+			await this.db.run(
+				`DELETE FROM fork_hold WHERE fork_id NOT IN (${ph})`,
+				ids,
+			);
+		});
 	}
 
 	/**
 	 * Creates a server-generated fork research result card with its held proposals and marks the
 	 * analyzed branches — one transaction, so a restart cannot file the same result twice.
 	 */
-	createForkResult(o: {
+	async createForkResult(o: {
 		prompt: string;
 		title: string;
 		report: string;
@@ -2611,48 +2652,49 @@ export class ProjectStore {
 			/** Per-commit hold shas this run consumed; the rows die with the cursor advance. */
 			consumed?: string[];
 		}>;
-	}): Task {
-		let cardId = "";
-		const tx = this.db.transaction(() => {
-			const card = this.createTask(o.prompt);
-			cardId = card.id;
-			this.updateTask(card.id, {
-				title: o.title,
-				promptAuthor: "board",
-				research: true,
-				stage: "done",
-				state: "idle",
-				report: o.report,
-				topic: o.topic,
-			});
-			for (const p of o.proposals) {
-				const child = this.createTask(p.prompt);
-				this.updateTask(child.id, {
-					followUpOf: card.id,
+	}): Promise<Task> {
+		return this.queue.transaction(async () => {
+			let cardId = "";
+			{
+				const card = await this.createTask(o.prompt);
+				cardId = card.id;
+				await this.updateTask(card.id, {
+					title: o.title,
 					promptAuthor: "board",
-					state: "needs_you",
-					needsReason: forkProposedReason({ id: card.id }),
-					model: p.model,
+					research: true,
+					stage: "done",
+					state: "idle",
+					report: o.report,
+					topic: o.topic,
 				});
-			}
-			for (const a of o.analyzed) {
-				this.db.run(
-					"UPDATE fork_branch SET analyzed_head = ?, first_pending_at = NULL, last_run_at = ?, last_error = NULL, retries = 0 WHERE fork_id = ? AND branch_hash = ?",
-					[a.head, a.at, a.forkId, a.branchHash],
-				);
-				if (a.consumed && a.consumed.length > 0) {
-					const ph = a.consumed.map(() => "?").join(", ");
-					this.db.run(
-						`DELETE FROM fork_hold WHERE fork_id = ? AND branch_hash = ? AND sha IN (${ph})`,
-						[a.forkId, a.branchHash, ...a.consumed],
+				for (const p of o.proposals) {
+					const child = await this.createTask(p.prompt);
+					await this.updateTask(child.id, {
+						followUpOf: card.id,
+						promptAuthor: "board",
+						state: "needs_you",
+						needsReason: forkProposedReason({ id: card.id }),
+						model: p.model,
+					});
+				}
+				for (const a of o.analyzed) {
+					await this.db.run(
+						"UPDATE fork_branch SET analyzed_head = ?, first_pending_at = NULL, last_run_at = ?, last_error = NULL, retries = 0 WHERE fork_id = ? AND branch_hash = ?",
+						[a.head, a.at, a.forkId, a.branchHash],
 					);
+					if (a.consumed && a.consumed.length > 0) {
+						const ph = a.consumed.map(() => "?").join(", ");
+						await this.db.run(
+							`DELETE FROM fork_hold WHERE fork_id = ? AND branch_hash = ? AND sha IN (${ph})`,
+							[a.forkId, a.branchHash, ...a.consumed],
+						);
+					}
 				}
 			}
+			const card = await this.getTask(cardId);
+			if (!card) throw new Error(`fork result card vanished: ${cardId}`);
+			return card;
 		});
-		tx();
-		const card = this.getTask(cardId);
-		if (!card) throw new Error(`fork result card vanished: ${cardId}`);
-		return card;
 	}
 
 	// ---- Trending scout verdicts ----
@@ -2660,154 +2702,176 @@ export class ProjectStore {
 	// `deferred` is offered to the scout again next scan. The table is created by SCHEMA
 	// at open, so existing databases gain it without a migration step.
 
-	listTrendingVerdicts(): TrendingVerdict[] {
-		return this.db
-			.query<TrendingVerdictRow, []>(
-				"SELECT * FROM trending_verdict ORDER BY judged_at DESC, repo",
-			)
-			.all()
-			.map(rowToTrendingVerdict);
+	async listTrendingVerdicts(): Promise<TrendingVerdict[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<TrendingVerdictRow, []>(
+						"SELECT * FROM trending_verdict ORDER BY judged_at DESC, repo",
+					)
+					.all()
+			).map(rowToTrendingVerdict);
+		});
 	}
 
-	getTrendingVerdict(repo: string): TrendingVerdict | null {
-		const row = this.db
-			.query<TrendingVerdictRow, [string]>(
-				"SELECT * FROM trending_verdict WHERE repo = ?",
-			)
-			.get(repo.trim().toLowerCase());
-		return row ? rowToTrendingVerdict(row) : null;
+	async getTrendingVerdict(repo: string): Promise<TrendingVerdict | null> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<TrendingVerdictRow, [string]>(
+					"SELECT * FROM trending_verdict WHERE repo = ?",
+				)
+				.get(repo.trim().toLowerCase());
+			return row ? rowToTrendingVerdict(row) : null;
+		});
 	}
 
 	/** Upserts by lowercase repo; an existing row keeps its firstSeenAt. */
-	saveTrendingVerdict(v: TrendingVerdict): void {
-		this.db.run(
-			`INSERT INTO trending_verdict (repo, verdict, reason, rejected_by_user, first_seen_at, judged_at, scout_card_id, proposal_card_id)
+	async saveTrendingVerdict(v: TrendingVerdict): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				`INSERT INTO trending_verdict (repo, verdict, reason, rejected_by_user, first_seen_at, judged_at, scout_card_id, proposal_card_id)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(repo) DO UPDATE SET verdict = excluded.verdict, reason = excluded.reason,
 			   rejected_by_user = excluded.rejected_by_user, judged_at = excluded.judged_at,
 			   scout_card_id = excluded.scout_card_id, proposal_card_id = excluded.proposal_card_id`,
-			[
-				v.repo.trim().toLowerCase(),
-				v.verdict,
-				v.reason,
-				v.rejectedByUser ? 1 : 0,
-				v.firstSeenAt,
-				v.judgedAt,
-				v.scoutCardId,
-				v.proposalCardId,
-			],
-		);
+				[
+					v.repo.trim().toLowerCase(),
+					v.verdict,
+					v.reason,
+					v.rejectedByUser ? 1 : 0,
+					v.firstSeenAt,
+					v.judgedAt,
+					v.scoutCardId,
+					v.proposalCardId,
+				],
+			);
+		});
 	}
 
-	trendingVerdictByProposal(cardId: string): TrendingVerdict | null {
-		const row = this.db
-			.query<TrendingVerdictRow, [string]>(
-				"SELECT * FROM trending_verdict WHERE proposal_card_id = ?",
-			)
-			.get(cardId);
-		return row ? rowToTrendingVerdict(row) : null;
+	async trendingVerdictByProposal(
+		cardId: string,
+	): Promise<TrendingVerdict | null> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<TrendingVerdictRow, [string]>(
+					"SELECT * FROM trending_verdict WHERE proposal_card_id = ?",
+				)
+				.get(cardId);
+			return row ? rowToTrendingVerdict(row) : null;
+		});
 	}
 
 	/** Shared scout + repo checks of the agent's verdict tools; returns the error or the normalized repo. */
-	private checkTrendingJudgement(
+	private async checkTrendingJudgement(
 		scoutId: string,
 		repo: string,
-	): { ok: true; repo: string } | { ok: false; error: string } {
-		const scout = this.getTask(scoutId);
-		if (
-			scout?.kind !== "trending" ||
-			scout.cancelledAt !== null ||
-			scout.stage === "done"
-		)
-			return { ok: false, error: "not an open trending scout card" };
-		const norm = repo.trim().toLowerCase();
-		if (!TRENDING_REPO_RE.test(norm))
-			return {
-				ok: false,
-				error: `invalid repo: ${repo} (expected owner/repo)`,
-			};
-		const prev = this.getTrendingVerdict(norm);
-		if (prev && prev.verdict !== "deferred")
-			return {
-				ok: false,
-				error: `${norm} already has a final verdict (${prev.verdict})`,
-			};
-		return { ok: true, repo: norm };
+	): Promise<{ ok: true; repo: string } | { ok: false; error: string }> {
+		return this.queue.run<
+			{ ok: true; repo: string } | { ok: false; error: string }
+		>(async () => {
+			const scout = await this.getTask(scoutId);
+			if (
+				scout?.kind !== "trending" ||
+				scout.cancelledAt !== null ||
+				scout.stage === "done"
+			)
+				return { ok: false, error: "not an open trending scout card" };
+			const norm = repo.trim().toLowerCase();
+			if (!TRENDING_REPO_RE.test(norm))
+				return {
+					ok: false,
+					error: `invalid repo: ${repo} (expected owner/repo)`,
+				};
+			const prev = await this.getTrendingVerdict(norm);
+			if (prev && prev.verdict !== "deferred")
+				return {
+					ok: false,
+					error: `${norm} already has a final verdict (${prev.verdict})`,
+				};
+			return { ok: true, repo: norm };
+		});
 	}
 
 	/** Files a backlog proposal card for `repo` under the scout card, at most `cap` per scout card. */
-	fileTrendingProposal(o: {
+	async fileTrendingProposal(o: {
 		scoutId: string;
 		repo: string;
 		prompt: string;
 		title?: string;
 		cap: number;
 		now?: number;
-	}): { ok: true; task: Task } | { ok: false; error: string } {
-		const now = o.now ?? Date.now();
-		const tx = this.db.transaction(
-			(): { ok: true; id: string } | { ok: false; error: string } => {
-				const check = this.checkTrendingJudgement(o.scoutId, o.repo);
-				if (!check.ok) return check;
-				const filed =
-					this.db
-						.query<{ n: number }, [string]>(
-							"SELECT COUNT(*) AS n FROM trending_verdict WHERE scout_card_id = ? AND proposal_card_id IS NOT NULL",
-						)
-						.get(o.scoutId)?.n ?? 0;
-				if (filed >= o.cap)
-					return {
-						ok: false,
-						error: `cap of ${o.cap} proposals per scan reached: record ${check.repo} as deferred instead`,
-					};
-				const card = this.createTask(o.prompt, null);
-				const title = o.title?.trim();
-				this.updateTask(card.id, {
-					promptAuthor: "board",
-					stage: "backlog",
-					state: "idle",
-					queuedAt: null,
-					followUpOf: o.scoutId,
-					...(title ? { title } : {}),
-				});
-				const prev = this.getTrendingVerdict(check.repo);
-				this.saveTrendingVerdict({
-					repo: check.repo,
-					verdict: "filed",
-					reason: "Filed as a proposal",
-					rejectedByUser: false,
-					firstSeenAt: prev?.firstSeenAt ?? now,
-					judgedAt: now,
-					scoutCardId: o.scoutId,
-					proposalCardId: card.id,
-				});
-				return { ok: true, id: card.id };
-			},
-		);
-		const res = tx();
-		if (!res.ok) return res;
-		const task = this.getTask(res.id);
-		if (!task) throw new Error(`trending proposal vanished: ${res.id}`);
-		return { ok: true, task };
+	}): Promise<{ ok: true; task: Task } | { ok: false; error: string }> {
+		return this.queue.transaction<
+			{ ok: true; task: Task } | { ok: false; error: string }
+		>(async () => {
+			const now = o.now ?? Date.now();
+			const res = await this.transaction(
+				async (): Promise<
+					{ ok: true; id: string } | { ok: false; error: string }
+				> => {
+					const check = await this.checkTrendingJudgement(o.scoutId, o.repo);
+					if (!check.ok) return check;
+					const filed =
+						(
+							await this.db
+								.query<{ n: number }, [string]>(
+									"SELECT COUNT(*) AS n FROM trending_verdict WHERE scout_card_id = ? AND proposal_card_id IS NOT NULL",
+								)
+								.get(o.scoutId)
+						)?.n ?? 0;
+					if (filed >= o.cap)
+						return {
+							ok: false,
+							error: `cap of ${o.cap} proposals per scan reached: record ${check.repo} as deferred instead`,
+						};
+					const card = await this.createTask(o.prompt, null);
+					const title = o.title?.trim();
+					await this.updateTask(card.id, {
+						promptAuthor: "board",
+						stage: "backlog",
+						state: "idle",
+						queuedAt: null,
+						followUpOf: o.scoutId,
+						...(title ? { title } : {}),
+					});
+					const prev = await this.getTrendingVerdict(check.repo);
+					await this.saveTrendingVerdict({
+						repo: check.repo,
+						verdict: "filed",
+						reason: "Filed as a proposal",
+						rejectedByUser: false,
+						firstSeenAt: prev?.firstSeenAt ?? now,
+						judgedAt: now,
+						scoutCardId: o.scoutId,
+						proposalCardId: card.id,
+					});
+					return { ok: true, id: card.id };
+				},
+			);
+			if (!res.ok) return res;
+			const task = await this.getTask(res.id);
+			if (!task) throw new Error(`trending proposal vanished: ${res.id}`);
+			return { ok: true, task };
+		});
 	}
 
 	/** Records `no_fit` (final) or `deferred` (offered again next scan) for a repo the scout judged. */
-	judgeTrendingRepo(o: {
+	async judgeTrendingRepo(o: {
 		scoutId: string;
 		repo: string;
 		verdict: "no_fit" | "deferred";
 		reason: string;
 		now?: number;
-	}): { ok: true } | { ok: false; error: string } {
-		const now = o.now ?? Date.now();
-		const reason = o.reason.trim().slice(0, 500);
-		const tx = this.db.transaction(
-			(): { ok: true } | { ok: false; error: string } => {
-				const check = this.checkTrendingJudgement(o.scoutId, o.repo);
+	}): Promise<{ ok: true } | { ok: false; error: string }> {
+		return this.queue.transaction<{ ok: true } | { ok: false; error: string }>(
+			async () => {
+				const now = o.now ?? Date.now();
+				const reason = o.reason.trim().slice(0, 500);
+				const check = await this.checkTrendingJudgement(o.scoutId, o.repo);
 				if (!check.ok) return check;
 				if (reason === "") return { ok: false, error: "reason is required" };
-				const prev = this.getTrendingVerdict(check.repo);
-				this.saveTrendingVerdict({
+				const prev = await this.getTrendingVerdict(check.repo);
+				await this.saveTrendingVerdict({
 					repo: check.repo,
 					verdict: o.verdict,
 					reason,
@@ -2820,91 +2884,103 @@ export class ProjectStore {
 				return { ok: true };
 			},
 		);
-		return tx();
 	}
 
 	/** A cancelled proposal card turns its repo into a user-rejected `no_fit`; false when the card is no filed proposal. */
-	rejectTrendingProposal(
+	async rejectTrendingProposal(
 		cardId: string,
 		reason: string | null,
 		now: number = Date.now(),
-	): boolean {
-		const note = reason?.trim() || "Rejected by the user (no reason given)";
-		const res = this.db.run(
-			`UPDATE trending_verdict SET verdict = 'no_fit', rejected_by_user = 1, reason = ?, judged_at = ?
+	): Promise<boolean> {
+		return this.queue.run(async () => {
+			const note = reason?.trim() || "Rejected by the user (no reason given)";
+			const res = await this.db.run(
+				`UPDATE trending_verdict SET verdict = 'no_fit', rejected_by_user = 1, reason = ?, judged_at = ?
 			 WHERE proposal_card_id = ? AND verdict = 'filed'`,
-			[note, now, cardId],
-		);
-		return res.changes > 0;
+				[note, now, cardId],
+			);
+			return res.changes > 0;
+		});
 	}
 
 	// ---- PR review watch state ----
 
-	listPrReviews(): PrReviewRow[] {
-		return this.db
-			.query<PrReviewDbRow, []>("SELECT * FROM pr_review ORDER BY number")
-			.all()
-			.map(toPrReview);
+	async listPrReviews(): Promise<PrReviewRow[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<PrReviewDbRow, []>("SELECT * FROM pr_review ORDER BY number")
+					.all()
+			).map(toPrReview);
+		});
 	}
 
-	getPrReview(number: number): PrReviewRow | null {
-		const r = this.db
-			.query<PrReviewDbRow, [number]>(
-				"SELECT * FROM pr_review WHERE number = ?",
-			)
-			.get(number);
-		return r ? toPrReview(r) : null;
+	async getPrReview(number: number): Promise<PrReviewRow | null> {
+		return this.queue.run(async () => {
+			const r = await this.db
+				.query<PrReviewDbRow, [number]>(
+					"SELECT * FROM pr_review WHERE number = ?",
+				)
+				.get(number);
+			return r ? toPrReview(r) : null;
+		});
 	}
 
 	/** One issue_watch row by GitHub issue number, or null. */
-	getIssueWatch(number: number): {
+	async getIssueWatch(number: number): Promise<{
 		number: number;
 		taskId: string | null;
 		labelled: boolean;
 		filedAt: number;
-	} | null {
-		const r = this.db
-			.query<
-				{
-					number: number;
-					task_id: string | null;
-					labelled: number;
-					filed_at: number;
-				},
-				[number]
-			>("SELECT * FROM issue_watch WHERE number = ?")
-			.get(number);
-		return r
-			? {
-					number: r.number,
-					taskId: r.task_id,
-					labelled: r.labelled !== 0,
-					filedAt: r.filed_at,
-				}
-			: null;
+	} | null> {
+		return this.queue.run(async () => {
+			const r = await this.db
+				.query<
+					{
+						number: number;
+						task_id: string | null;
+						labelled: number;
+						filed_at: number;
+					},
+					[number]
+				>("SELECT * FROM issue_watch WHERE number = ?")
+				.get(number);
+			return r
+				? {
+						number: r.number,
+						taskId: r.task_id,
+						labelled: r.labelled !== 0,
+						filedAt: r.filed_at,
+					}
+				: null;
+		});
 	}
 
 	/** Count of issue cards filed at or after `since`. */
-	issueCardsFiledSince(since: number): number {
-		return (
-			this.db
-				.query<{ n: number }, [number]>(
-					"SELECT COUNT(*) AS n FROM issue_watch WHERE filed_at >= ?",
-				)
-				.get(since)?.n ?? 0
-		);
+	async issueCardsFiledSince(since: number): Promise<number> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ n: number }, [number]>(
+							"SELECT COUNT(*) AS n FROM issue_watch WHERE filed_at >= ?",
+						)
+						.get(since)
+				)?.n ?? 0
+			);
+		});
 	}
 
 	/** Files a backlog card for an issue and records its watch row in one transaction; throws if the issue was already filed. */
-	fileIssueCard(o: {
+	async fileIssueCard(o: {
 		number: number;
 		title: string;
 		prompt: string;
 		now: number;
-	}): Task {
-		const tx = this.db.transaction((): string => {
-			const card = this.createTask(o.prompt, null, "work");
-			this.updateTask(card.id, {
+	}): Promise<Task> {
+		return this.queue.transaction(async () => {
+			const card = await this.createTask(o.prompt, null, "work");
+			await this.updateTask(card.id, {
 				title: o.title,
 				// The prompt embeds the issue's title and body, which a person wrote, so
 				// the card stays user-authored and the prompt gate judges it (OTTR-850).
@@ -2913,40 +2989,44 @@ export class ProjectStore {
 				state: "idle",
 				queuedAt: null,
 			});
-			this.db.run(
+			await this.db.run(
 				"INSERT INTO issue_watch (number, task_id, labelled, filed_at) VALUES (?, ?, 0, ?)",
 				[o.number, card.id, o.now],
 			);
-			return card.id;
+			const id = card.id;
+			const task = await this.getTask(id);
+			if (task === null) throw new Error(`unknown task: ${id}`);
+			return task;
 		});
-		const id = tx();
-		const task = this.getTask(id);
-		if (task === null) throw new Error(`unknown task: ${id}`);
-		return task;
 	}
 
 	/** key -> task id for keys already imported from site whose task row still exists (any stage, cancelled too). Rows for missing tasks are ignored. */
-	jiraImported(site: string, keys: string[]): Map<string, string> {
-		const out = new Map<string, string>();
-		const q = this.db.query<{ task_id: string }, [string, string]>(
-			"SELECT j.task_id FROM jira_imports j JOIN tasks t ON t.id = j.task_id WHERE j.site = ? AND j.issue_key = ?",
-		);
-		for (const key of keys) {
-			const r = q.get(site, key);
-			if (r) out.set(key, r.task_id);
-		}
-		return out;
+	async jiraImported(
+		site: string,
+		keys: string[],
+	): Promise<Map<string, string>> {
+		return this.queue.run(async () => {
+			const out = new Map<string, string>();
+			const q = this.db.query<{ task_id: string }, [string, string]>(
+				"SELECT j.task_id FROM jira_imports j JOIN tasks t ON t.id = j.task_id WHERE j.site = ? AND j.issue_key = ?",
+			);
+			for (const key of keys) {
+				const r = await q.get(site, key);
+				if (r) out.set(key, r.task_id);
+			}
+			return out;
+		});
 	}
 
 	/** Files one card for each Jira issue not yet imported from site, in one transaction; backlog cards wait idle like fileIssueCard, todo cards queue like createTask. */
-	fileJiraCards(o: {
+	async fileJiraCards(o: {
 		site: string;
 		stage: "backlog" | "todo";
 		items: { key: string; title: string; prompt: string }[];
 		now: number;
-	}): { filed: Task[]; skipped: string[] } {
-		const tx = this.db.transaction(() => {
-			const done = this.jiraImported(
+	}): Promise<{ filed: Task[]; skipped: string[] }> {
+		return this.queue.transaction(async () => {
+			const done = await this.jiraImported(
 				o.site,
 				o.items.map((i) => i.key),
 			);
@@ -2957,8 +3037,8 @@ export class ProjectStore {
 					skipped.push(item.key);
 					continue;
 				}
-				const card = this.createTask(item.prompt, null, "work");
-				this.updateTask(card.id, {
+				const card = await this.createTask(item.prompt, null, "work");
+				await this.updateTask(card.id, {
 					title: item.title,
 					// The prompt embeds the ticket's summary, description and comments,
 					// which people wrote, so the card stays user-authored and the prompt
@@ -2968,125 +3048,151 @@ export class ProjectStore {
 						? { stage: "backlog", state: "idle", queuedAt: null }
 						: {}),
 				});
-				this.db.run(
+				await this.db.run(
 					"INSERT OR REPLACE INTO jira_imports (site, issue_key, task_id, filed_at) VALUES (?, ?, ?, ?)",
 					[o.site, item.key, card.id, o.now],
 				);
 				done.set(item.key, card.id);
 				ids.push(card.id);
 			}
-			return { ids, skipped };
+			const filed = await Promise.all(
+				ids.map(async (id) => {
+					const task = await this.getTask(id);
+					if (task === null) throw new Error(`unknown task: ${id}`);
+					return task;
+				}),
+			);
+			return { filed, skipped };
 		});
-		const { ids, skipped } = tx();
-		const filed = ids.map((id) => {
-			const task = this.getTask(id);
-			if (task === null) throw new Error(`unknown task: ${id}`);
-			return task;
-		});
-		return { filed, skipped };
 	}
 
 	/** Issue numbers filed but not yet labelled on GitHub, ascending. */
-	unlabelledIssues(): number[] {
-		return this.db
-			.query<{ number: number }, []>(
-				"SELECT number FROM issue_watch WHERE labelled = 0 ORDER BY number",
-			)
-			.all()
-			.map((r) => r.number);
+	async unlabelledIssues(): Promise<number[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<{ number: number }, []>(
+						"SELECT number FROM issue_watch WHERE labelled = 0 ORDER BY number",
+					)
+					.all()
+			).map((r) => r.number);
+		});
 	}
 
 	/** Marks an issue's tracking label as applied. */
-	markIssueLabelled(number: number): void {
-		this.db.run("UPDATE issue_watch SET labelled = 1 WHERE number = ?", [
-			number,
-		]);
+	async markIssueLabelled(number: number): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE issue_watch SET labelled = 1 WHERE number = ?",
+				[number],
+			);
+		});
 	}
 
-	getPrReviewByTask(taskId: string): PrReviewRow | null {
-		const r = this.db
-			.query<PrReviewDbRow, [string]>(
-				"SELECT * FROM pr_review WHERE task_id = ?",
-			)
-			.get(taskId);
-		return r ? toPrReview(r) : null;
+	async getPrReviewByTask(taskId: string): Promise<PrReviewRow | null> {
+		return this.queue.run(async () => {
+			const r = await this.db
+				.query<PrReviewDbRow, [string]>(
+					"SELECT * FROM pr_review WHERE task_id = ?",
+				)
+				.get(taskId);
+			return r ? toPrReview(r) : null;
+		});
 	}
 
 	/** Upserts one PR watch row by PR number. */
-	savePrReview(row: PrReviewRow): void {
-		this.db.run(
-			`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, posted_url, posted_login, state, draft, title, post_error)
+	async savePrReview(row: PrReviewRow): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				`INSERT INTO pr_review (number, task_id, head, first_seen_at, reviewed_head, posted_head, posted_url, posted_login, state, draft, title, post_error)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(number) DO UPDATE SET
 			   task_id = excluded.task_id, head = excluded.head, first_seen_at = excluded.first_seen_at,
 			   reviewed_head = excluded.reviewed_head, posted_head = excluded.posted_head, posted_url = excluded.posted_url,
 			   posted_login = excluded.posted_login,
 			   state = excluded.state, draft = excluded.draft, title = excluded.title, post_error = excluded.post_error`,
-			[
-				row.number,
-				row.taskId,
-				row.head,
-				row.firstSeenAt,
-				row.reviewedHead,
-				row.postedHead,
-				row.postedUrl,
-				row.postedLogin,
-				row.state,
-				row.draft ? 1 : 0,
-				row.title,
-				row.postError,
-			],
-		);
+				[
+					row.number,
+					row.taskId,
+					row.head,
+					row.firstSeenAt,
+					row.reviewedHead,
+					row.postedHead,
+					row.postedUrl,
+					row.postedLogin,
+					row.state,
+					row.draft ? 1 : 0,
+					row.title,
+					row.postError,
+				],
+			);
+		});
 	}
 
 	/** Sets only the PR state, so a write after an await never reverts post fields. */
-	setPrState(number: number, state: PrReviewRow["state"]): void {
-		this.db.run("UPDATE pr_review SET state = ? WHERE number = ?", [
-			state,
-			number,
-		]);
+	async setPrState(number: number, state: PrReviewRow["state"]): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run("UPDATE pr_review SET state = ? WHERE number = ?", [
+				state,
+				number,
+			]);
+		});
 	}
 
 	/** Stores the posted review's html_url and posting login after a successful Post; null clears both. */
-	setPrPostedUrl(
+	async setPrPostedUrl(
 		number: number,
 		url: string | null,
 		login: string | null = null,
-	): void {
-		this.db.run(
-			"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
-			[url, login, number],
-		);
+	): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE pr_review SET posted_url = ?, posted_login = ? WHERE number = ?",
+				[url, login, number],
+			);
+		});
 	}
 
 	/** Writes the two comment columns only: the sweep's cutoff and the unseen flag. */
-	setPrComments(number: number, at: number, unseen: boolean): void {
-		this.db.run(
-			"UPDATE pr_review SET comments_at = ?, comments_unseen = ? WHERE number = ?",
-			[at, unseen ? 1 : 0, number],
-		);
+	async setPrComments(
+		number: number,
+		at: number,
+		unseen: boolean,
+	): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE pr_review SET comments_at = ?, comments_unseen = ? WHERE number = ?",
+				[at, unseen ? 1 : 0, number],
+			);
+		});
 	}
 
 	/** The PR's newest done review run id: the draft occurrence stamp. Null without a done run. */
-	lastPrRun(number: number): number | null {
-		return (
-			this.db
-				.query<{ id: number }, [number]>(
-					"SELECT id FROM pr_review_runs WHERE number = ? AND done = 1 ORDER BY id DESC LIMIT 1",
-				)
-				.get(number)?.id ?? null
-		);
+	async lastPrRun(number: number): Promise<number | null> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ id: number }, [number]>(
+							"SELECT id FROM pr_review_runs WHERE number = ? AND done = 1 ORDER BY id DESC LIMIT 1",
+						)
+						.get(number)
+				)?.id ?? null
+			);
+		});
 	}
 
 	/** Whether the PR's newest done review run found blocking findings. True without a done
 	 * run or an unset column, so an unknown verdict never approves a PR. */
-	lastPrRunBlocking(number: number): boolean {
-		const row = this.db
-			.query<{ blocking: number | null }, [number]>(
-				"SELECT blocking FROM pr_review_runs WHERE number = ? AND done = 1 ORDER BY id DESC LIMIT 1",
-			)
-			.get(number);
-		return (row?.blocking ?? 1) !== 0;
+	async lastPrRunBlocking(number: number): Promise<boolean> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<{ blocking: number | null }, [number]>(
+					"SELECT blocking FROM pr_review_runs WHERE number = ? AND done = 1 ORDER BY id DESC LIMIT 1",
+				)
+				.get(number);
+			return (row?.blocking ?? 1) !== 0;
+		});
 	}
 
 	/**
@@ -3094,10 +3200,13 @@ export class ProjectStore {
 	 * reviewed head is `head` and not yet posted wins, so two concurrent Posts send one review.
 	 * Returns the earlier posted head for releasePrPost, or undefined when the claim lost.
 	 */
-	claimPrPost(number: number, head: string): string | null | undefined {
-		const tx = this.db.transaction(() => {
-			const prev = this.getPrReview(number);
-			const res = this.db.run(
+	async claimPrPost(
+		number: number,
+		head: string,
+	): Promise<string | null | undefined> {
+		return this.queue.transaction(async () => {
+			const prev = await this.getPrReview(number);
+			const res = await this.db.run(
 				`UPDATE pr_review SET posted_head = ?, post_error = NULL
 				 WHERE number = ? AND state = 'open' AND reviewed_head = ?
 				   AND (posted_head IS NULL OR posted_head != ?)`,
@@ -3105,67 +3214,87 @@ export class ProjectStore {
 			);
 			return res.changes === 1 ? (prev?.postedHead ?? null) : undefined;
 		});
-		return tx();
 	}
 
 	/** Undoes a failed claim: restores the earlier posted head and stores the error; other fields stay. */
-	releasePrPost(
+	async releasePrPost(
 		number: number,
 		head: string,
 		prev: string | null,
 		error: string,
-	): void {
-		this.db.run(
-			"UPDATE pr_review SET posted_head = ?, post_error = ? WHERE number = ? AND posted_head = ?",
-			[prev, error, number, head],
-		);
+	): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"UPDATE pr_review SET posted_head = ?, post_error = ? WHERE number = ? AND posted_head = ?",
+				[prev, error, number, head],
+			);
+		});
 	}
 
 	/** Review starts since `since` (project daily-rate gate). */
-	prReviewRunsSince(since: number): number {
-		return (
-			this.db
-				.query<{ n: number }, [number]>(
-					"SELECT COUNT(*) AS n FROM pr_review_runs WHERE started_at >= ?",
-				)
-				.get(since)?.n ?? 0
-		);
+	async prReviewRunsSince(since: number): Promise<number> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ n: number }, [number]>(
+							"SELECT COUNT(*) AS n FROM pr_review_runs WHERE started_at >= ?",
+						)
+						.get(since)
+				)?.n ?? 0
+			);
+		});
 	}
 
 	/** One review per PR per head SHA: true once a draft of this PR's `head` was saved. */
-	prHeadReviewed(number: number, head: string): boolean {
-		return (
-			this.db
-				.query<{ n: number }, [number, string]>(
-					"SELECT COUNT(*) AS n FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1",
-				)
-				.get(number, head)?.n !== 0
-		);
+	async prHeadReviewed(number: number, head: string): Promise<boolean> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ n: number }, [number, string]>(
+							"SELECT COUNT(*) AS n FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1",
+						)
+						.get(number, head)
+				)?.n !== 0
+			);
+		});
 	}
 
 	/**
 	 * The latest done run's start for this number+head: a never-posted draft's re-review cutoff.
 	 * null when none (a null head was never reviewed); undone runs count as no review yet.
 	 */
-	lastPrRunAt(number: number, head: string | null): number | null {
-		if (head === null) return null;
-		return (
-			this.db
-				.query<{ started_at: number }, [number, string]>(
-					"SELECT started_at FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1 ORDER BY started_at DESC LIMIT 1",
-				)
-				.get(number, head)?.started_at ?? null
-		);
+	async lastPrRunAt(
+		number: number,
+		head: string | null,
+	): Promise<number | null> {
+		return this.queue.run(async () => {
+			if (head === null) return null;
+			return (
+				(
+					await this.db
+						.query<{ started_at: number }, [number, string]>(
+							"SELECT started_at FROM pr_review_runs WHERE number = ? AND head = ? AND done = 1 ORDER BY started_at DESC LIMIT 1",
+						)
+						.get(number, head)
+				)?.started_at ?? null
+			);
+		});
 	}
 
 	/** Counts one review attempt (the daily cap) before the model call; returns its run id. */
-	startPrRun(number: number, head: string, at: number): number {
-		return Number(
-			this.db.run(
-				"INSERT INTO pr_review_runs (number, started_at, head) VALUES (?, ?, ?)",
-				[number, at, head],
-			).lastInsertRowid,
-		);
+	async startPrRun(number: number, head: string, at: number): Promise<number> {
+		return this.queue.transaction(async () => {
+			return Number(
+				(
+					await this.db.run(
+						"INSERT INTO pr_review_runs (number, started_at, head) VALUES (?, ?, ?)",
+						[number, at, head],
+					)
+				).lastInsertRowid,
+			);
+		});
 	}
 
 	/**
@@ -3174,50 +3303,53 @@ export class ProjectStore {
 	 * lets syncPrCard place the card. It runs after the model call, so it writes only its
 	 * own columns of the live row.
 	 */
-	savePrDraft(o: {
+	async savePrDraft(o: {
 		run: number;
 		number: number;
 		head: string;
 		draft: string;
 		prompt: string;
 		blocking: boolean;
-	}): Task {
-		let cardId = "";
-		const tx = this.db.transaction(() => {
-			const row = this.getPrReview(o.number);
-			if (!row) throw new Error(`unknown pr_review: #${o.number}`);
-			const summary = `Review draft for head ${o.head.slice(0, 7)}.`;
-			const existing = row.taskId === null ? null : this.getTask(row.taskId);
-			const card = existing ?? this.createTask(o.prompt, null, "pr_review");
-			this.updateTask(card.id, {
-				promptAuthor: "board",
-				...(existing === null
-					? {
-							title: `PR review: #${o.number} ${row.title}`,
-							topic: "pr review",
-						}
-					: { prompt: o.prompt }),
-				// A new card leaves the queue here; syncPrCard sets its final place below.
-				...(existing === null ? { stage: "in_progress", state: "idle" } : {}),
-				queuedAt: null,
-				summary,
-				details: o.draft,
-			});
-			cardId = card.id;
-			this.db.run(
-				"UPDATE pr_review SET task_id = ?, reviewed_head = ?, post_error = NULL WHERE number = ?",
-				[card.id, o.head, o.number],
-			);
-			this.db.run(
-				"UPDATE pr_review_runs SET done = 1, blocking = ? WHERE id = ?",
-				[o.blocking ? 1 : 0, o.run],
-			);
-			this.syncPrCard(o.number);
+	}): Promise<Task> {
+		return this.queue.transaction(async () => {
+			let cardId = "";
+			{
+				const row = await this.getPrReview(o.number);
+				if (!row) throw new Error(`unknown pr_review: #${o.number}`);
+				const summary = `Review draft for head ${o.head.slice(0, 7)}.`;
+				const existing =
+					row.taskId === null ? null : await this.getTask(row.taskId);
+				const card =
+					existing ?? (await this.createTask(o.prompt, null, "pr_review"));
+				await this.updateTask(card.id, {
+					promptAuthor: "board",
+					...(existing === null
+						? {
+								title: `PR review: #${o.number} ${row.title}`,
+								topic: "pr review",
+							}
+						: { prompt: o.prompt }),
+					// A new card leaves the queue here; syncPrCard sets its final place below.
+					...(existing === null ? { stage: "in_progress", state: "idle" } : {}),
+					queuedAt: null,
+					summary,
+					details: o.draft,
+				});
+				cardId = card.id;
+				await this.db.run(
+					"UPDATE pr_review SET task_id = ?, reviewed_head = ?, post_error = NULL WHERE number = ?",
+					[card.id, o.head, o.number],
+				);
+				await this.db.run(
+					"UPDATE pr_review_runs SET done = 1, blocking = ? WHERE id = ?",
+					[o.blocking ? 1 : 0, o.run],
+				);
+				await this.syncPrCard(o.number);
+			}
+			const card = await this.getTask(cardId);
+			if (!card) throw new Error(`pr review card vanished: ${cardId}`);
+			return card;
 		});
-		tx();
-		const card = this.getTask(cardId);
-		if (!card) throw new Error(`pr review card vanished: ${cardId}`);
-		return card;
 	}
 
 	/**
@@ -3225,29 +3357,31 @@ export class ProjectStore {
 	 * needs_you; posted, closed or merged goes to done/idle. A cancelled card or a row without
 	 * a card stays. Writes only on a difference, so done_at is not stamped again.
 	 */
-	syncPrCard(number: number): void {
-		const row = this.getPrReview(number);
-		if (!row || row.taskId === null) return;
-		const card = this.getTask(row.taskId);
-		if (!card || card.cancelledAt !== null) return;
-		const waiting =
-			row.state === "open" &&
-			card.details !== null &&
-			row.postedHead !== row.reviewedHead;
-		const want = waiting
-			? ({
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: PR_REVIEW_WAITING,
-				} as const)
-			: ({ stage: "done", state: "idle", needsReason: null } as const);
-		if (
-			card.stage === want.stage &&
-			card.state === want.state &&
-			card.needsReason === want.needsReason
-		)
-			return;
-		this.updateTask(card.id, want);
+	async syncPrCard(number: number): Promise<void> {
+		return this.queue.transaction(async () => {
+			const row = await this.getPrReview(number);
+			if (!row || row.taskId === null) return;
+			const card = await this.getTask(row.taskId);
+			if (!card || card.cancelledAt !== null) return;
+			const waiting =
+				row.state === "open" &&
+				card.details !== null &&
+				row.postedHead !== row.reviewedHead;
+			const want = waiting
+				? ({
+						stage: "in_progress",
+						state: "needs_you",
+						needsReason: PR_REVIEW_WAITING,
+					} as const)
+				: ({ stage: "done", state: "idle", needsReason: null } as const);
+			if (
+				card.stage === want.stage &&
+				card.state === want.state &&
+				card.needsReason === want.needsReason
+			)
+				return;
+			await this.updateTask(card.id, want);
+		});
 	}
 
 	/**
@@ -3255,122 +3389,178 @@ export class ProjectStore {
 	 * Defensive normalization covers values stored by direct setSettings callers that bypass
 	 * the API's validation. Public for the cross-project dependsOn resolver (OTTR-708).
 	 */
-	taskPrefix(): string {
-		const p = this.getSettings().taskIdPrefix;
-		if (p !== null) {
-			const s = p.replaceAll(/[^A-Za-z0-9]/g, "").toUpperCase();
-			if (s !== "") return s;
-		}
-		return derivedTaskPrefix(this.name);
+	async taskPrefix(): Promise<string> {
+		return this.queue.run(async () => {
+			const p = (await this.getSettings()).taskIdPrefix;
+			if (p !== null) {
+				const s = p.replaceAll(/[^A-Za-z0-9]/g, "").toUpperCase();
+				if (s !== "") return s;
+			}
+			return derivedTaskPrefix(this.name);
+		});
 	}
 
 	/** Next `PREFIX-n` id; the per-store counter only ever increments (no reuse). */
-	private nextTaskId(): string {
-		const row = this.db
-			.query<{ value: string }, []>(
-				"SELECT value FROM settings WHERE key = 'next-task-num'",
-			)
-			.get();
-		const n = row ? parseInt(row.value, 10) : NaN;
-		const current = Number.isInteger(n) && n >= 1 ? n : 1;
-		this.db.run(
-			"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-			["next-task-num", JSON.stringify(current + 1)],
-		);
-		return `${this.taskPrefix()}-${current}`;
+	private async nextTaskId(): Promise<string> {
+		return this.queue.transaction(async () => {
+			const row = await this.db
+				.query<{ value: string }, []>(
+					"SELECT value FROM settings WHERE key = 'next-task-num'",
+				)
+				.get();
+			const n = row ? parseInt(row.value, 10) : NaN;
+			const current = Number.isInteger(n) && n >= 1 ? n : 1;
+			await this.db.run(
+				"INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				["next-task-num", JSON.stringify(current + 1)],
+			);
+			return `${await this.taskPrefix()}-${current}`;
+		});
 	}
 
-	createTask(
+	async createTask(
 		prompt: string,
 		model: string | null = null,
 		kind: TaskKind = "work",
 		id?: string,
-	): Task {
-		const now = Date.now();
-		const title = deriveTitle(prompt);
-		// An explicit id (a retro child `<source id>-retro`) skips the counter: no number is
-		// consumed, so visible cards keep gap-free ids. A taken id gets -2, -3, ...: no id
-		// is ever reused and the loop ends because the store holds finitely many ids.
-		let usedId: string;
-		if (id === undefined) {
-			usedId = this.nextTaskId();
-			while (this.getTask(usedId) !== null) {
-				// Each retry consumes the next counter value: no reuse, guaranteed termination.
-				usedId = this.nextTaskId();
+	): Promise<Task> {
+		return this.queue.transaction(async () => {
+			const now = Date.now();
+			const title = deriveTitle(prompt);
+			// An explicit id (a retro child `<source id>-retro`) skips the counter: no number is
+			// consumed, so visible cards keep gap-free ids. A taken id gets -2, -3, ...: no id
+			// is ever reused and the loop ends because the store holds finitely many ids.
+			let usedId: string;
+			if (id === undefined) {
+				usedId = await this.nextTaskId();
+				while ((await this.getTask(usedId)) !== null) {
+					// Each retry consumes the next counter value: no reuse, guaranteed termination.
+					usedId = await this.nextTaskId();
+				}
+			} else {
+				if (id === "") throw new Error("createTask: an explicit id is empty");
+				usedId = id;
+				for (let n = 2; (await this.getTask(usedId)) !== null; n++)
+					usedId = `${id}-${n}`;
 			}
-		} else {
-			if (id === "") throw new Error("createTask: an explicit id is empty");
-			usedId = id;
-			for (let n = 2; this.getTask(usedId) !== null; n++) usedId = `${id}-${n}`;
-		}
-		this.db.run(
-			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)",
-			[usedId, title, prompt, now, now, now, model, kind],
-		);
-		this.recordEvent("create", usedId, null, "todo", null);
-		this.recordEvent("state", usedId, null, "queued", null);
-		// Read the row back instead of hand-building the literal (R4-9): defaults and the
-		// toTask normalizer stay in one place, so the returned Task can't drift from the DB.
-		const task = this.getTask(usedId);
-		if (!task) throw new Error(`unknown task: ${usedId}`);
-		return task;
+			await this.db.run(
+				"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, queued_at, model, kind) VALUES (?, ?, ?, 'todo', 'queued', ?, ?, ?, ?, ?)",
+				[usedId, title, prompt, now, now, now, model, kind],
+			);
+			await this.recordEvent("create", usedId, null, "todo", null);
+			await this.recordEvent("state", usedId, null, "queued", null);
+			// Read the row back instead of hand-building the literal (R4-9): defaults and the
+			// toTask normalizer stay in one place, so the returned Task can't drift from the DB.
+			const task = await this.getTask(usedId);
+			if (!task) throw new Error(`unknown task: ${usedId}`);
+			return task;
+		});
 	}
 
 	/** Rewrites an unstarted task's prompt; the title re-derives like on create. Clears the
 	 * prompt-edit hold in the same write: the edit finished, so the card may start. With
 	 * expectedRevision the write only lands when the row's revision still matches. */
-	editTask(
+	async editTask(
 		id: string,
 		prompt: string,
 		expectedRevision?: number,
-	): RevisionResult {
-		return this.runTaskUpdate(
-			id,
-			{
-				prompt,
-				title: deriveTitle(prompt),
-				// OTTR-850: a user edit makes the prompt user-authored again, so the gate
-				// judges it even when the card was filed as board-written.
-				promptAuthor: "user",
-				holdUntil: null,
-				holdProvider: null,
-				holdWindow: null,
-			},
-			expectedRevision,
-		);
+	): Promise<RevisionResult> {
+		return this.queue.run(async () => {
+			return await this.runTaskUpdate(
+				id,
+				{
+					prompt,
+					title: deriveTitle(prompt),
+					// OTTR-850: a user edit makes the prompt user-authored again, so the gate
+					// judges it even when the card was filed as board-written.
+					promptAuthor: "user",
+					holdUntil: null,
+					holdProvider: null,
+					holdWindow: null,
+				},
+				expectedRevision,
+			);
+		});
 	}
 
-	getTask(id: string): Task | null {
-		const row = this.db
-			.query<TaskRow, [string]>("SELECT * FROM tasks WHERE id = ?")
-			.get(id);
-		return row ? toTask(this.name, row) : null;
+	async getTask(id: string): Promise<Task | null> {
+		return this.queue.run(async () => {
+			const row = await this.db
+				.query<TaskRow, [string]>("SELECT * FROM tasks WHERE id = ?")
+				.get(id);
+			return row ? toTask(this.name, row) : null;
+		});
 	}
 
-	listTasks(): ListedTask[] {
-		return this.db
-			.query<Omit<TaskRow, "diff_text">, []>(
-				`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, rowid DESC`,
-			)
-			.all()
-			.map((row) => toListedTask(this.name, row));
+	async listTasks(): Promise<ListedTask[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<Omit<TaskRow, "diff_text">, []>(
+						`SELECT ${TASK_LIST_COLUMNS} FROM tasks ORDER BY created_at DESC, rowid DESC`,
+					)
+					.all()
+			).map((row) => toListedTask(this.name, row));
+		});
 	}
 
-	updateTask(id: string, patch: TaskPatch): Task {
-		// Unguarded: internal writers (scheduler, turn loop, quota sweep) never fail on a
-		// revision; the write itself still bumps it.
-		return this.runTaskUpdate(id, patch).task;
+	async claimTurn(
+		id: string,
+		gate: (
+			task: Task,
+			settings: ProjectSettings,
+			tasks: ListedTask[],
+			boardCheckId: string | null,
+		) =>
+			| { allow: boolean; needsReason?: string }
+			| Promise<{ allow: boolean; needsReason?: string }>,
+	): Promise<Task | null> {
+		return this.transaction(async () => {
+			const task = await this.getTask(id);
+			if (task === null || task.state !== "queued" || task.cancelledAt !== null)
+				return null;
+			const decision = await gate(
+				task,
+				await this.getSettings(),
+				await this.listTasks(),
+				await this.boardCheckId(),
+			);
+			if (!decision.allow) {
+				if (
+					decision.needsReason !== undefined &&
+					decision.needsReason !== task.needsReason
+				)
+					await this.updateTask(id, { needsReason: decision.needsReason });
+				return null;
+			}
+			await this.updateTask(id, {
+				state: "preparing",
+				needsReason: null,
+				asked: null,
+			});
+			return task;
+		});
+	}
+
+	async updateTask(id: string, patch: TaskPatch): Promise<Task> {
+		return this.queue.run(async () => {
+			// Unguarded: internal writers (scheduler, turn loop, quota sweep) never fail on a
+			// revision; the write itself still bumps it.
+			return (await this.runTaskUpdate(id, patch)).task;
+		});
 	}
 
 	/** Optimistic write for user edits from routes: lands only while the row's revision
 	 * still equals expectedRevision. On a conflict nothing is written and the current
 	 * row comes back for the 409 body. */
-	updateTaskIfCurrent(
+	async updateTaskIfCurrent(
 		id: string,
 		patch: TaskPatch,
 		expectedRevision: number,
-	): RevisionResult {
-		return this.runTaskUpdate(id, patch, expectedRevision);
+	): Promise<RevisionResult> {
+		return this.queue.run(async () => {
+			return await this.runTaskUpdate(id, patch, expectedRevision);
+		});
 	}
 
 	/** The prompt-edit hold: contentless bookkeeping, so it never moves the revision —
@@ -3379,27 +3569,31 @@ export class ProjectStore {
 	 * content edit that landed between the editor's load and the claim refuses the
 	 * claim (and the stale draft never arms); null claims unconditionally for
 	 * body-less compatibility callers. */
-	claimPromptHold(
+	async claimPromptHold(
 		id: string,
 		holdUntil: number,
 		expectedRevision: number | null,
-	): RevisionResult {
-		return this.runTaskUpdate(
-			id,
-			{ holdUntil, holdProvider: null, holdWindow: null },
-			expectedRevision ?? undefined,
-			false,
-		);
+	): Promise<RevisionResult> {
+		return this.queue.run(async () => {
+			return await this.runTaskUpdate(
+				id,
+				{ holdUntil, holdProvider: null, holdWindow: null },
+				expectedRevision ?? undefined,
+				false,
+			);
+		});
 	}
 
 	/** Clears the prompt-edit hold; contentless like the claim, so no revision bump. */
-	releasePromptHold(id: string): void {
-		this.runTaskUpdate(
-			id,
-			{ holdUntil: null, holdProvider: null, holdWindow: null },
-			undefined,
-			false,
-		);
+	async releasePromptHold(id: string): Promise<void> {
+		return this.queue.run(async () => {
+			await this.runTaskUpdate(
+				id,
+				{ holdUntil: null, holdProvider: null, holdWindow: null },
+				undefined,
+				false,
+			);
+		});
 	}
 
 	/** The one task UPDATE builder: unconditional for internal writers, and with an
@@ -3408,70 +3602,79 @@ export class ProjectStore {
 	 * the same UPDATE) makes this one's changes count 0 and nothing is written.
 	 * `bumpRevision: false` is for the prompt-edit hold claim/release only: contentless
 	 * bookkeeping must not move the revision the editor's guarded save arms from. */
-	private runTaskUpdate(
+	private async runTaskUpdate(
 		id: string,
 		patch: TaskPatch,
 		expectedRevision?: number,
 		bumpRevision = true,
-	): RevisionResult {
-		const before = this.getTask(id);
-		if (before === null) throw new Error(`unknown task: ${id}`);
-		const sets: string[] = ["updated_at = ?"];
-		if (bumpRevision) sets.push("revision = revision + 1");
-		const values: (string | number | null)[] = [Date.now()];
-		// Entering Done stamps done_at; it overwrites, so a release card that bounced to needs_you re-lands with a fresh time.
-		if (patch.stage === "done") {
-			sets.push("done_at = ?");
-			values.push(Date.now());
-		}
-		for (const key of Object.keys(TASK_COLUMNS) as (keyof TaskPatch)[]) {
-			const value = patch[key];
-			if (value !== undefined) {
-				sets.push(`${TASK_COLUMNS[key]} = ?`);
-				values.push(bindTaskValue(value));
+	): Promise<RevisionResult> {
+		return this.queue.transaction<RevisionResult>(async () => {
+			const before = await this.getTask(id);
+			if (before === null) throw new Error(`unknown task: ${id}`);
+			const sets: string[] = ["updated_at = ?"];
+			if (bumpRevision) sets.push("revision = revision + 1");
+			const values: (string | number | null)[] = [Date.now()];
+			// Entering Done stamps done_at; it overwrites, so a release card that bounced to needs_you re-lands with a fresh time.
+			if (patch.stage === "done") {
+				sets.push("done_at = ?");
+				values.push(Date.now());
 			}
-		}
-		values.push(id);
-		const { changes } =
-			expectedRevision === undefined
-				? this.db.run(
-						`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`,
-						values,
-					)
-				: this.db.run(
-						`UPDATE tasks SET ${sets.join(", ")} WHERE id = ? AND revision = ?`,
-						[...values, expectedRevision],
-					);
-		// Guarded and stale: changes 0 means another writer moved the revision first.
-		if (expectedRevision !== undefined && changes === 0)
-			return { ok: false, task: this.getTask(id) as Task };
-		const task = this.getTask(id) as Task;
-		// Every stage/state write funnels through here, so this is the one place transitions get recorded — on success only.
-		if (patch.stage !== undefined && patch.stage !== before.stage)
-			this.recordEvent("stage", id, before.stage, patch.stage, null);
-		if (patch.state !== undefined && patch.state !== before.state)
-			this.recordEvent("state", id, before.state, patch.state, null);
-		return { ok: true, task };
+			for (const key of Object.keys(TASK_COLUMNS) as (keyof TaskPatch)[]) {
+				const value = patch[key];
+				if (value !== undefined) {
+					sets.push(`${TASK_COLUMNS[key]} = ?`);
+					values.push(bindTaskValue(value));
+				}
+			}
+			values.push(id);
+			const { changes } =
+				expectedRevision === undefined
+					? await this.db.run(
+							`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`,
+							values,
+						)
+					: await this.db.run(
+							`UPDATE tasks SET ${sets.join(", ")} WHERE id = ? AND revision = ?`,
+							[...values, expectedRevision],
+						);
+			// Guarded and stale: changes 0 means another writer moved the revision first.
+			if (expectedRevision !== undefined && changes === 0)
+				return { ok: false, task: (await this.getTask(id)) as Task };
+			const task = (await this.getTask(id)) as Task;
+			// Every stage/state write funnels through here, so this is the one place transitions get recorded — on success only.
+			if (patch.stage !== undefined && patch.stage !== before.stage)
+				await this.recordEvent("stage", id, before.stage, patch.stage, null);
+			if (patch.state !== undefined && patch.state !== before.state)
+				await this.recordEvent("state", id, before.state, patch.state, null);
+			return { ok: true, task };
+		});
 	}
 
-	queueIds(): string[] {
-		return queueOrder(this.listTasks()).map((t) => t.id);
+	async queueIds(): Promise<string[]> {
+		return this.queue.run(async () => {
+			return queueOrder(await this.listTasks()).map((t) => t.id);
+		});
 	}
 
 	/** True iff `order` is an exact permutation of the current queue; then moves each task by writing future queuedAt. */
-	reorderQueue(order: string[]): boolean {
-		const current = this.queueIds();
-		if (order.length !== current.length || new Set(order).size !== order.length)
-			return false;
-		const currentSet = new Set(current);
-		if (order.some((id) => !currentSet.has(id))) return false;
-		const now = Date.now();
-		for (const [i, id] of order.entries())
-			this.updateTask(id, { queuedAt: now + i });
-		return true;
+	async reorderQueue(order: string[]): Promise<boolean> {
+		return this.queue.transaction(async () => {
+			const current = await this.queueIds();
+			if (
+				order.length !== current.length ||
+				new Set(order).size !== order.length
+			)
+				return false;
+			const currentSet = new Set(current);
+			if (order.some((id) => !currentSet.has(id))) return false;
+			const now = Date.now();
+			for (const [i, id] of order.entries())
+				await this.updateTask(id, { queuedAt: now + i });
+			return true;
+		});
 	}
 
-	startTurn(
+	async startTurn(
 		taskId: string,
 		kind: TurnKind,
 		prompt: string,
@@ -3486,83 +3689,117 @@ export class ProjectStore {
 		// that landed during startRun — the checkout guard's attribution would then
 		// exclude the very turn that made the change (OTTR-772).
 		startedAt: number = Date.now(),
-	): Turn {
-		const { lastInsertRowid } = this.db.run(
-			"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model, layer, log_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			[
-				taskId,
-				kind,
-				prompt,
-				input,
-				inputBy,
-				startedAt,
-				pid,
-				model,
-				layer,
-				logOffset,
-			],
-		);
-		// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
-		const row = this.db
-			.query<TurnRow, [number]>("SELECT * FROM turns WHERE id = ?")
-			.get(Number(lastInsertRowid));
-		if (!row) throw new Error(`unknown turn: ${lastInsertRowid}`);
-		return toTurn(row);
+	): Promise<Turn> {
+		return this.queue.transaction(async () => {
+			const { lastInsertRowid } = await this.db.run(
+				"INSERT INTO turns (task_id, kind, prompt, input, input_by, started_at, pid, model, layer, log_offset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				[
+					taskId,
+					kind,
+					prompt,
+					input,
+					inputBy,
+					startedAt,
+					pid,
+					model,
+					layer,
+					logOffset,
+				],
+			);
+			// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
+			const row = await this.db
+				.query<TurnRow, [number]>("SELECT * FROM turns WHERE id = ?")
+				.get(Number(lastInsertRowid));
+			if (!row) throw new Error(`unknown turn: ${lastInsertRowid}`);
+			return toTurn(row);
+		});
 	}
 
-	finishTurn(turnId: number, patch: TurnPatch): Turn {
-		const sets: string[] = [];
-		const values: (string | number | null)[] = [];
-		for (const key of Object.keys(TURN_COLUMNS) as (keyof TurnPatch)[]) {
-			const value = patch[key];
-			if (value !== undefined) {
-				sets.push(`${TURN_COLUMNS[key]} = ?`);
-				values.push(value as string | number | null);
+	async finishTurn(turnId: number, patch: TurnPatch): Promise<Turn> {
+		const turn = await this.finishTurnState(turnId, patch);
+		if (patch.endedAt !== undefined && turn.endedAt !== null)
+			await this.captureTurnData(turnId);
+		return turn;
+	}
+
+	async finishTurnState(turnId: number, patch: TurnPatch): Promise<Turn> {
+		return this.transaction(async () => {
+			const sets: string[] = [];
+			const values: (string | number | null)[] = [];
+			for (const key of Object.keys(TURN_COLUMNS) as (keyof TurnPatch)[]) {
+				const value = patch[key];
+				if (value !== undefined) {
+					sets.push(`${TURN_COLUMNS[key]} = ?`);
+					values.push(value as string | number | null);
+				}
 			}
-		}
-		if (sets.length > 0) {
-			values.push(turnId);
-			this.db.run(`UPDATE turns SET ${sets.join(", ")} WHERE id = ?`, values);
-		}
-		const row = this.db
-			.query<TurnRow, [number]>("SELECT * FROM turns WHERE id = ?")
-			.get(turnId);
-		if (!row) throw new Error(`unknown turn: ${turnId}`);
-		// Cost capture: a finished turn owns its transcript window's usage; a
-		// missing or unreadable transcript leaves the columns NULL and never fails the turn.
-		if (patch.endedAt !== undefined && row.ended_at !== null) {
-			this.captureTurnCost(row.task_id, turnId, row.started_at, row.ended_at);
-			// Context capture: the transcript tail holds the run's latest context-window
-			// snapshot, so the column tracks the session's context as turns finish.
-			this.captureTaskContext(row.task_id);
-		}
-		// A failed turn is an error event; a deliberate Cancel is not. `task_id` is NOT NULL in turns.
-		if (
-			patch.error !== undefined &&
-			patch.error !== null &&
-			patch.error !== "cancelled"
-		)
-			this.recordEvent("error", row.task_id, null, null, patch.error);
-		return toTurn(row);
+			if (sets.length > 0) {
+				values.push(turnId);
+				await this.db.run(
+					`UPDATE turns SET ${sets.join(", ")} WHERE id = ?`,
+					values,
+				);
+			}
+			const row = await this.db
+				.query<TurnRow, [number]>("SELECT * FROM turns WHERE id = ?")
+				.get(turnId);
+			if (!row) throw new Error(`unknown turn: ${turnId}`);
+			// A failed turn is an error event; a deliberate Cancel is not. `task_id` is NOT NULL in turns.
+			if (
+				patch.error !== undefined &&
+				patch.error !== null &&
+				patch.error !== "cancelled"
+			)
+				await this.recordEvent("error", row.task_id, null, null, patch.error);
+			return toTurn(row);
+		});
 	}
 
-	/**
-	 * Fills one finished turn's token/cost columns from the task's transcript: only the
-	 * transcript read and parse sit inside the guards (spec), so a store error still
-	 * surfaces. No transcript on disk leaves the columns NULL.
-	 */
-	private captureTurnCost(
+	/** Reads transcript data outside the turn completion transaction. */
+	async captureTurnData(turnId: number): Promise<void> {
+		const { turn, task, contextTokens } = await this.queue.run(async () => {
+			const turn = await this.db
+				.query<TurnRow, [number]>("SELECT * FROM turns WHERE id = ?")
+				.get(turnId);
+			if (turn === null) throw new Error(`unknown turn: ${turnId}`);
+			const context = await this.db
+				.query<{ context_tokens: number | null }, [string]>(
+					"SELECT context_tokens FROM tasks WHERE id = ?",
+				)
+				.get(turn.task_id);
+			return {
+				turn,
+				task: await this.getTask(turn.task_id),
+				contextTokens: context?.context_tokens ?? null,
+			};
+		});
+		if (turn.ended_at === null || task === null) return;
+		await this.captureTurnCost(
+			turn.task_id,
+			turnId,
+			turn.started_at,
+			turn.ended_at,
+			task.sessionId,
+		);
+		await this.captureTaskContext(
+			turn.task_id,
+			false,
+			task.sessionId,
+			contextTokens,
+		);
+	}
+
+	private async captureTurnCost(
 		taskId: string,
 		turnId: number,
 		startedAt: number,
 		endedAt: number,
-	): void {
+		expectedSessionId?: string | null,
+	): Promise<void> {
 		const sessionId =
-			this.db
-				.query<{ session_id: string | null }, [string]>(
-					"SELECT session_id FROM tasks WHERE id = ?",
-				)
-				.get(taskId)?.session_id ?? null;
+			expectedSessionId === undefined
+				? ((await this.getTask(taskId))?.sessionId ?? null)
+				: expectedSessionId;
 		if (sessionId === null) return;
 		let sum: UsageSum | null;
 		try {
@@ -3572,240 +3809,337 @@ export class ProjectStore {
 				endedAt,
 			);
 		} catch {
-			return; // unreadable transcript: the columns stay NULL
+			return;
 		}
-		// Null: no transcript, a malformed record, or not this session's turn. Stays NULL.
-		if (sum !== null) writeTurnCost(this.db, turnId, sum);
+		if (sum === null) return;
+		await this.transaction(async () => {
+			await this.db.run(
+				`UPDATE turns SET tokens_in = ?, tokens_out = ?, cache_read = ?, cache_write = ?, cost = ?
+				 WHERE id = ? AND task_id = ? AND started_at = ? AND ended_at = ? AND cost IS NULL
+				   AND EXISTS (SELECT 1 FROM tasks WHERE id = ? AND session_id = ?)`,
+				[
+					sum.tokensIn,
+					sum.tokensOut,
+					sum.cacheRead,
+					sum.cacheWrite,
+					sum.cost,
+					turnId,
+					taskId,
+					startedAt,
+					endedAt,
+					taskId,
+					sessionId,
+				],
+			);
+		});
 	}
 
-	/**
-	 * Refreshes the task's final context-window reading (tasks.context_tokens) from the
-	 * current session transcript's last contextSnapshot. Best-effort: no session, an
-	 * unreadable transcript, or no usable snapshot leaves the column as-is.
-	 */
-	private captureTaskContext(taskId: string): void {
-		const sessionId =
-			this.db
-				.query<{ session_id: string | null }, [string]>(
-					"SELECT session_id FROM tasks WHERE id = ?",
+	private async captureTaskContext(
+		taskId: string,
+		doneOnly = false,
+		expectedSessionId?: string | null,
+		expectedContextTokens?: number | null,
+	): Promise<void> {
+		const task = await this.queue.run(async () => {
+			return await this.db
+				.query<
+					{
+						session_id: string | null;
+						context_tokens: number | null;
+						stage: string;
+					},
+					[string]
+				>("SELECT session_id, context_tokens, stage FROM tasks WHERE id = ?")
+				.get(taskId);
+		});
+		if (
+			task === null ||
+			(doneOnly && (task.stage !== "done" || task.context_tokens !== null))
+		)
+			return;
+		if (
+			expectedSessionId !== undefined &&
+			task.session_id !== expectedSessionId
+		)
+			return;
+		const ctx = sessionContext(this.sessionsDir, task.session_id);
+		if (ctx === null) return;
+		const previousContext =
+			expectedContextTokens === undefined
+				? task.context_tokens
+				: expectedContextTokens;
+		await this.transaction(async () => {
+			await this.db.run(
+				`UPDATE tasks SET context_tokens = ? WHERE id = ? AND session_id IS ?
+				 AND context_tokens IS ?${doneOnly ? " AND stage = 'done' AND context_tokens IS NULL" : ""}`,
+				[ctx.promptTokens, taskId, task.session_id, previousContext],
+			);
+		});
+	}
+
+	private async backfillTranscriptData(): Promise<void> {
+		const pending = await this.queue.run(async () => {
+			return await this.db
+				.query<TurnRow, []>(
+					"SELECT * FROM turns WHERE ended_at IS NOT NULL AND cost IS NULL ORDER BY id",
 				)
-				.get(taskId)?.session_id ?? null;
-		const ctx = sessionContext(this.sessionsDir, sessionId);
-		if (ctx !== null)
-			this.db.run("UPDATE tasks SET context_tokens = ? WHERE id = ?", [
-				ctx.promptTokens,
-				taskId,
-			]);
+				.all();
+		});
+		for (const turn of pending) {
+			if (turn.ended_at !== null)
+				await this.captureTurnCost(
+					turn.task_id,
+					turn.id,
+					turn.started_at,
+					turn.ended_at,
+				);
+		}
+		const done = await this.queue.run(async () => {
+			return await this.db
+				.query<{ id: string }, []>(
+					"SELECT id FROM tasks WHERE stage = 'done' AND context_tokens IS NULL",
+				)
+				.all();
+		});
+		for (const task of done) await this.captureTaskContext(task.id, true);
 	}
 
-	listTurns(taskId: string): Turn[] {
-		return this.db
-			.query<TurnRow, [string]>(
-				"SELECT * FROM turns WHERE task_id = ? ORDER BY id",
-			)
-			.all(taskId)
-			.map(toTurn);
+	async listTurns(taskId: string): Promise<Turn[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<TurnRow, [string]>(
+						"SELECT * FROM turns WHERE task_id = ? ORDER BY id",
+					)
+					.all(taskId)
+			).map(toTurn);
+		});
 	}
 
 	/** Every turn whose window [startedAt, endedAt or open] can overlap `since` or later:
 	 * the cross-project checkout guard's attribution candidates (OTTR-763). */
-	openOrRecentTurns(since: number): Turn[] {
-		return this.db
-			.query<TurnRow, [number]>(
-				"SELECT * FROM turns WHERE ended_at IS NULL OR ended_at >= ? ORDER BY id",
-			)
-			.all(since)
-			.map(toTurn);
+	async openOrRecentTurns(since: number): Promise<Turn[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<TurnRow, [number]>(
+						"SELECT * FROM turns WHERE ended_at IS NULL OR ended_at >= ? ORDER BY id",
+					)
+					.all(since)
+			).map(toTurn);
+		});
 	}
 
 	/** Layers of turns that never ended (boot reconcile source for in-use.json); distinct, null-free. */
-	listOpenTurnLayers(): string[] {
-		return this.db
-			.query<{ layer: string }, []>(
-				"SELECT DISTINCT layer FROM turns WHERE ended_at IS NULL AND layer IS NOT NULL",
-			)
-			.all()
-			.map((r) => r.layer);
+	async listOpenTurnLayers(): Promise<string[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<{ layer: string }, []>(
+						"SELECT DISTINCT layer FROM turns WHERE ended_at IS NULL AND layer IS NOT NULL",
+					)
+					.all()
+			).map((r) => r.layer);
+		});
 	}
 
 	/** Model of the task's newest turn that saw one (a run's snapshot); null when no turn recorded a model. */
-	lastTurnModel(taskId: string): string | null {
-		return (
-			this.db
-				.query<{ model: string | null }, [string]>(
-					"SELECT model FROM turns WHERE task_id = ? AND model IS NOT NULL ORDER BY id DESC LIMIT 1",
-				)
-				.get(taskId)?.model ?? null
-		);
+	async lastTurnModel(taskId: string): Promise<string | null> {
+		return this.queue.run(async () => {
+			return (
+				(
+					await this.db
+						.query<{ model: string | null }, [string]>(
+							"SELECT model FROM turns WHERE task_id = ? AND model IS NOT NULL ORDER BY id DESC LIMIT 1",
+						)
+						.get(taskId)
+				)?.model ?? null
+			);
+		});
 	}
 
 	/** Batched facts for the board card build, two queries per project: per-task turn
 	 * facts (first open turn, newest model, last work outcome) and each task's raw stored
 	 * session title. Replaces the two listTurns calls, the lastTurnModel query, the
 	 * sessionTitle SELECT, and the no-op nameTask UPDATE the build ran per card. */
-	boardCardFacts(): {
+	async boardCardFacts(): Promise<{
 		turns: Map<string, BoardTurnFacts>;
 		/** Raw stored session_title per task id; frozenTitleFrom applies the cleaning. */
 		titles: Map<string, string | null>;
 		/** Per pr_review card: the draft run stamp and the unseen comment stamp. */
 		pr: Map<string, { draft: number | null; comments: number | null }>;
-	} {
-		const turns = this.boardTurnFacts();
-		const titles = this.boardTitleFacts(turns);
-		const pr = this.boardPrFacts();
-		return { turns, titles, pr };
+	}> {
+		return this.queue.run(async () => {
+			const turns = await this.boardTurnFacts();
+			const titles = await this.boardTitleFacts(turns);
+			const pr = await this.boardPrFacts();
+			return { turns, titles, pr };
+		});
 	}
 
 	/** Turn facts per task: first open turn, newest model, last work outcome. */
-	private boardTurnFacts(): Map<string, BoardTurnFacts> {
-		const turns = new Map<string, BoardTurnFacts>();
-		const factsFor = (taskId: string): BoardTurnFacts => {
-			let f = turns.get(taskId);
-			if (f === undefined) {
-				f = { openTurn: null, lastModel: null, lastWorkOutcome: null };
-				turns.set(taskId, f);
+	private async boardTurnFacts(): Promise<Map<string, BoardTurnFacts>> {
+		return this.queue.run(async () => {
+			const turns = new Map<string, BoardTurnFacts>();
+			const factsFor = (taskId: string): BoardTurnFacts => {
+				let f = turns.get(taskId);
+				if (f === undefined) {
+					f = { openTurn: null, lastModel: null, lastWorkOutcome: null };
+					turns.set(taskId, f);
+				}
+				return f;
+			};
+			for (const r of await this.db
+				.query<
+					{
+						task_id: string;
+						started_at: number;
+						ended_at: number | null;
+						kind: string;
+						model: string | null;
+						outcome: string | null;
+					},
+					[]
+				>(
+					"SELECT task_id, started_at, ended_at, kind, model, outcome FROM turns ORDER BY id",
+				)
+				.all()) {
+				const f = factsFor(r.task_id);
+				// The first open turn in id order is the one listTurns().find() reported.
+				if (r.ended_at === null && f.openTurn === null)
+					f.openTurn = {
+						startedAt: r.started_at,
+						kind: r.kind as TurnKind,
+						model: r.model,
+					};
+				// Ascending id: the last non-null write is the newest, like lastTurnModel.
+				if (r.model !== null) f.lastModel = r.model;
+				if (r.kind === "work")
+					f.lastWorkOutcome = r.outcome as OutcomeStatus | null;
 			}
-			return f;
-		};
-		for (const r of this.db
-			.query<
-				{
-					task_id: string;
-					started_at: number;
-					ended_at: number | null;
-					kind: string;
-					model: string | null;
-					outcome: string | null;
-				},
-				[]
-			>(
-				"SELECT task_id, started_at, ended_at, kind, model, outcome FROM turns ORDER BY id",
-			)
-			.all()) {
-			const f = factsFor(r.task_id);
-			// The first open turn in id order is the one listTurns().find() reported.
-			if (r.ended_at === null && f.openTurn === null)
-				f.openTurn = {
-					startedAt: r.started_at,
-					kind: r.kind as TurnKind,
-					model: r.model,
-				};
-			// Ascending id: the last non-null write is the newest, like lastTurnModel.
-			if (r.model !== null) f.lastModel = r.model;
-			if (r.kind === "work")
-				f.lastWorkOutcome = r.outcome as OutcomeStatus | null;
-		}
-		return turns;
+			return turns;
+		});
 	}
 
 	/** Raw stored session_title per task; also seeds an all-null fact row per task,
 	 * so a turn-less task reads as all-null, not missing. */
-	private boardTitleFacts(
+	private async boardTitleFacts(
 		turns: Map<string, BoardTurnFacts>,
-	): Map<string, string | null> {
-		const titles = new Map<string, string | null>();
-		for (const r of this.db
-			.query<{ id: string; session_title: string | null }, []>(
-				"SELECT id, session_title FROM tasks",
-			)
-			.all()) {
-			titles.set(r.id, r.session_title);
-			// Total over the task rows: a turn-less task reads as all-null, not missing.
-			if (!turns.has(r.id))
-				turns.set(r.id, {
-					openTurn: null,
-					lastModel: null,
-					lastWorkOutcome: null,
-				});
-		}
-		return titles;
+	): Promise<Map<string, string | null>> {
+		return this.queue.run(async () => {
+			const titles = new Map<string, string | null>();
+			for (const r of await this.db
+				.query<{ id: string; session_title: string | null }, []>(
+					"SELECT id, session_title FROM tasks",
+				)
+				.all()) {
+				titles.set(r.id, r.session_title);
+				// Total over the task rows: a turn-less task reads as all-null, not missing.
+				if (!turns.has(r.id))
+					turns.set(r.id, {
+						openTurn: null,
+						lastModel: null,
+						lastWorkOutcome: null,
+					});
+			}
+			return titles;
+		});
 	}
 
 	/** One grouped query and one row scan per project: the occurrence stamps the board
 	 * build and the alert diff read for pr_review cards. */
-	private boardPrFacts(): Map<
-		string,
-		{ draft: number | null; comments: number | null }
+	private async boardPrFacts(): Promise<
+		Map<string, { draft: number | null; comments: number | null }>
 	> {
-		const pr = new Map<
-			string,
-			{ draft: number | null; comments: number | null }
-		>();
-		const runs = new Map<number, number>();
-		for (const r of this.db
-			.query<{ number: number; id: number }, []>(
-				"SELECT number, MAX(id) AS id FROM pr_review_runs WHERE done = 1 GROUP BY number",
-			)
-			.all())
-			runs.set(r.number, r.id);
-		for (const row of this.listPrReviews()) {
-			if (row.taskId === null) continue;
-			pr.set(row.taskId, {
-				draft: runs.get(row.number) ?? null,
-				comments:
-					row.commentsUnseen && row.commentsAt !== null ? row.commentsAt : null,
-			});
-		}
-		return pr;
+		return this.queue.run(async () => {
+			const pr = new Map<
+				string,
+				{ draft: number | null; comments: number | null }
+			>();
+			const runs = new Map<number, number>();
+			for (const r of await this.db
+				.query<{ number: number; id: number }, []>(
+					"SELECT number, MAX(id) AS id FROM pr_review_runs WHERE done = 1 GROUP BY number",
+				)
+				.all())
+				runs.set(r.number, r.id);
+			for (const row of await this.listPrReviews()) {
+				if (row.taskId === null) continue;
+				pr.set(row.taskId, {
+					draft: runs.get(row.number) ?? null,
+					comments:
+						row.commentsUnseen && row.commentsAt !== null
+							? row.commentsAt
+							: null,
+				});
+			}
+			return pr;
+		});
 	}
 
 	/** The task's newest settled turn (id, error, reported outcome, exit code), or null; one
 	 * indexed row for the alert diff. */
-	lastSettledTurn(taskId: string): {
+	async lastSettledTurn(taskId: string): Promise<{
 		id: number;
 		error: string | null;
 		outcome: string | null;
 		exitCode: number | null;
-	} | null {
-		return (
-			this.db
-				.query<
-					{
-						id: number;
-						error: string | null;
-						outcome: string | null;
-						exitCode: number | null;
-					},
-					[string]
-				>(
-					"SELECT id, error, outcome, exit_code AS exitCode FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
-				)
-				.get(taskId) ?? null
-		);
+	} | null> {
+		return this.queue.run(async () => {
+			return (
+				(await this.db
+					.query<
+						{
+							id: number;
+							error: string | null;
+							outcome: string | null;
+							exitCode: number | null;
+						},
+						[string]
+					>(
+						"SELECT id, error, outcome, exit_code AS exitCode FROM turns WHERE task_id = ? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+					)
+					.get(taskId)) ?? null
+			);
+		});
 	}
 
 	/** Appends one lifecycle event; every stat derives from this log plus the tasks and turns tables. */
-	private recordEvent(
+	private async recordEvent(
 		kind: StatEvent["kind"],
 		taskId: string | null,
 		from: string | null,
 		to: string | null,
 		detail: string | null,
-	): void {
-		this.db.run(
-			"INSERT INTO events (at, task_id, kind, from_value, to_value, detail) VALUES (?, ?, ?, ?, ?, ?)",
-			[Date.now(), taskId, kind, from, to, detail],
-		);
+	): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"INSERT INTO events (at, task_id, kind, from_value, to_value, detail) VALUES (?, ?, ?, ?, ?, ?)",
+				[Date.now(), taskId, kind, from, to, detail],
+			);
+		});
 	}
 
 	/** All lifecycle events, oldest first: the raw feed a stats dashboard reads. */
-	events(): StatEvent[] {
-		return this.db
-			.query<
-				{
-					at: number;
-					task_id: string | null;
-					kind: StatEvent["kind"];
-					from_value: string | null;
-					to_value: string | null;
-					detail: string | null;
-				},
-				[]
-			>(
-				"SELECT at, task_id, kind, from_value, to_value, detail FROM events ORDER BY id",
-			)
-			.all()
-			.map((r) => ({
+	async events(): Promise<StatEvent[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<
+						{
+							at: number;
+							task_id: string | null;
+							kind: StatEvent["kind"];
+							from_value: string | null;
+							to_value: string | null;
+							detail: string | null;
+						},
+						[]
+					>(
+						"SELECT at, task_id, kind, from_value, to_value, detail FROM events ORDER BY id",
+					)
+					.all()
+			).map((r) => ({
 				at: r.at,
 				taskId: r.task_id,
 				kind: r.kind,
@@ -3813,6 +4147,7 @@ export class ProjectStore {
 				to: r.to_value,
 				detail: r.detail,
 			}));
+		});
 	}
 
 	/**
@@ -3820,12 +4155,16 @@ export class ProjectStore {
 	 * the median and the history threshold live in perf.ts (turnMedians).
 	 * `ended_at >= started_at` filters stamp glitches.
 	 */
-	turnDurations(): Array<{ kind: TurnKind; model: string | null; ms: number }> {
-		return this.db
-			.query<{ kind: TurnKind; model: string | null; ms: number }, []>(
-				"SELECT kind, model, ended_at - started_at AS ms FROM turns WHERE ended_at IS NOT NULL AND ended_at >= started_at",
-			)
-			.all();
+	async turnDurations(): Promise<
+		Array<{ kind: TurnKind; model: string | null; ms: number }>
+	> {
+		return this.queue.run(async () => {
+			return await this.db
+				.query<{ kind: TurnKind; model: string | null; ms: number }, []>(
+					"SELECT kind, model, ended_at - started_at AS ms FROM turns WHERE ended_at IS NOT NULL AND ended_at >= started_at",
+				)
+				.all();
+		});
 	}
 
 	/**
@@ -3835,83 +4174,91 @@ export class ProjectStore {
 	 * event, and a turn fails on a real error or a non-zero exit (SQL semantics: a NULL
 	 * exit_code is not `<> 0`).
 	 */
-	perfFacts(): PerfFacts {
-		const tasks = this.db
-			.query<
-				{
-					id: string;
-					created_at: number;
-					cancelled_at: number | null;
-					context_tokens: number | null;
-				},
-				[]
-			>("SELECT id, created_at, cancelled_at, context_tokens FROM tasks")
-			.all();
-		const doneAt = new Map(
-			this.db
-				.query<{ task_id: string; at: number }, []>(
-					"SELECT task_id, MAX(at) AS at FROM events WHERE kind = 'stage' AND to_value = 'done' GROUP BY task_id",
+	async perfFacts(): Promise<PerfFacts> {
+		return this.queue.run(async () => {
+			const tasks = await this.db
+				.query<
+					{
+						id: string;
+						created_at: number;
+						cancelled_at: number | null;
+						context_tokens: number | null;
+					},
+					[]
+				>("SELECT id, created_at, cancelled_at, context_tokens FROM tasks")
+				.all();
+			const doneAt = new Map(
+				(
+					await this.db
+						.query<{ task_id: string; at: number }, []>(
+							"SELECT task_id, MAX(at) AS at FROM events WHERE kind = 'stage' AND to_value = 'done' GROUP BY task_id",
+						)
+						.all()
+				).map((r): [string, number] => [r.task_id, r.at]),
+			);
+			const needsYou = new Set(
+				(
+					await this.db
+						.query<{ task_id: string }, []>(
+							"SELECT DISTINCT task_id FROM events WHERE kind = 'state' AND to_value = 'needs_you' AND task_id IS NOT NULL",
+						)
+						.all()
+				).map((r) => r.task_id),
+			);
+			const workTurns = new Map(
+				(
+					await this.db
+						.query<{ task_id: string; n: number }, []>(
+							"SELECT task_id, COUNT(*) AS n FROM turns WHERE kind = 'work' GROUP BY task_id",
+						)
+						.all()
+				).map((r): [string, number] => [r.task_id, r.n]),
+			);
+			const turns = await this.db
+				.query<
+					{
+						ended_at: number;
+						error: string | null;
+						exit_code: number | null;
+						cost: number | null;
+					},
+					[]
+				>(
+					"SELECT ended_at, error, exit_code, cost FROM turns WHERE ended_at IS NOT NULL",
 				)
-				.all()
-				.map((r): [string, number] => [r.task_id, r.at]),
-		);
-		const needsYou = new Set(
-			this.db
-				.query<{ task_id: string }, []>(
-					"SELECT DISTINCT task_id FROM events WHERE kind = 'state' AND to_value = 'needs_you' AND task_id IS NOT NULL",
-				)
-				.all()
-				.map((r) => r.task_id),
-		);
-		const workTurns = new Map(
-			this.db
-				.query<{ task_id: string; n: number }, []>(
-					"SELECT task_id, COUNT(*) AS n FROM turns WHERE kind = 'work' GROUP BY task_id",
-				)
-				.all()
-				.map((r): [string, number] => [r.task_id, r.n]),
-		);
-		const turns = this.db
-			.query<
-				{
-					ended_at: number;
-					error: string | null;
-					exit_code: number | null;
-					cost: number | null;
-				},
-				[]
-			>(
-				"SELECT ended_at, error, exit_code, cost FROM turns WHERE ended_at IS NOT NULL",
-			)
-			.all();
-		return {
-			tasks: tasks.map((t) => ({
-				id: t.id,
-				project: this.name,
-				createdAt: t.created_at,
-				doneAt: doneAt.get(t.id) ?? null,
-				cancelled: t.cancelled_at !== null,
-				workTurns: workTurns.get(t.id) ?? 0,
-				hadNeedsYou: needsYou.has(t.id),
-				contextTokens: t.context_tokens,
-			})),
-			turns: turns.map((t) => ({
-				endedAt: t.ended_at,
-				failed:
-					(t.error !== null && t.error !== "cancelled") ||
-					(t.exit_code !== null && t.exit_code !== 0),
-				cost: t.cost,
-			})),
-		};
+				.all();
+			return {
+				tasks: tasks.map((t) => ({
+					id: t.id,
+					project: this.name,
+					createdAt: t.created_at,
+					doneAt: doneAt.get(t.id) ?? null,
+					cancelled: t.cancelled_at !== null,
+					workTurns: workTurns.get(t.id) ?? 0,
+					hadNeedsYou: needsYou.has(t.id),
+					contextTokens: t.context_tokens,
+				})),
+				turns: turns.map((t) => ({
+					endedAt: t.ended_at,
+					failed:
+						(t.error !== null && t.error !== "cancelled") ||
+						(t.exit_code !== null && t.exit_code !== 0),
+					cost: t.cost,
+				})),
+			};
+		});
 	}
 
 	/** Stores one arrived review finding; returns true when it was new (not a duplicate of a
 	 * stored prompt). A new finding clears the card's findingsCheckedAt in the same
 	 * transaction, so the next landing re-runs the review check. */
-	appendReviewFinding(cardId: string, finding: RecordedFinding): boolean {
-		const inserted = this.db.transaction(() => {
-			const result = this.db.run(
-				"INSERT OR IGNORE INTO review_findings (card_id, prompt, model, rank, security, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+	async appendReviewFinding(
+		cardId: string,
+		finding: RecordedFinding,
+	): Promise<boolean> {
+		return this.queue.transaction(async () => {
+			const result = await this.db.run(
+				"INSERT INTO review_findings (card_id, prompt, model, rank, security, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(card_id, prompt) DO NOTHING",
 				[
 					cardId,
 					finding.prompt,
@@ -3922,45 +4269,50 @@ export class ProjectStore {
 				],
 			);
 			if (result.changes === 0) return false;
-			this.db.run(
+			await this.db.run(
 				"UPDATE tasks SET findings_checked_at = NULL WHERE id = ? AND findings_checked_at IS NOT NULL",
 				[cardId],
 			);
 			return true;
 		});
-		return inserted();
 	}
 
 	/** The card's stored review findings in arrival order. */
-	listReviewFindings(cardId: string): RecordedFinding[] {
-		return this.db
-			.query<
-				{
-					prompt: string;
-					model: string | null;
-					rank: number | null;
-					security: string | null;
-				},
-				[string]
-			>(
-				"SELECT prompt, model, rank, security FROM review_findings WHERE card_id = ? ORDER BY id",
-			)
-			.all(cardId)
-			.map((r) => ({
+	async listReviewFindings(cardId: string): Promise<RecordedFinding[]> {
+		return this.queue.run(async () => {
+			return (
+				await this.db
+					.query<
+						{
+							prompt: string;
+							model: string | null;
+							rank: number | null;
+							security: string | null;
+						},
+						[string]
+					>(
+						"SELECT prompt, model, rank, security FROM review_findings WHERE card_id = ? ORDER BY id",
+					)
+					.all(cardId)
+			).map((r) => ({
 				prompt: r.prompt,
 				model: r.model,
 				rank: r.rank,
 				security: (r.security as RecordedFinding["security"]) ?? null,
 			}));
+		});
 	}
 
 	/** Snapshot copy of tasks.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
-	backupTo(dest: string): void {
-		vacuumInto(this.db, dest, ["tasks", "turns"]);
+	async backupTo(dest: string): Promise<void> {
+		return this.queue.run(async () => {
+			await vacuumInto(this.db, dest, ["tasks", "turns"]);
+		});
 	}
 
-	close(): void {
-		if (!this.closed) closeLocked(this.db);
-		this.closed = true;
+	async close(): Promise<void> {
+		await this.queue.close(async () => {
+			await closeLocked(this.db);
+		});
 	}
 }

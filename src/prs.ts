@@ -932,7 +932,7 @@ interface PrWatcherCtx {
 	/** The deterministic lens over one PR diff; defaults to perfFindings. */
 	perfScan: (diff: string, labels: string[]) => PerfFinding[];
 	/** Called with the card id when a re-review rewrites a draft the user may have read. */
-	forgetSeen?: (taskId: string) => void;
+	forgetSeen?: (taskId: string) => void | Promise<void>;
 }
 
 /** The repo id of a project's GitHub remote; throws on a malformed id. */
@@ -943,17 +943,25 @@ function repoForProject(github: string): string {
 }
 
 /** Fresh rows for the pulls seen this tick; returns the set of seen numbers. */
-function syncSeenPulls(
+async function syncSeenPulls(
 	store: ForkProject["store"],
 	pulls: PullInfo[],
 	t: number,
-): Set<number> {
+	source: Map<number, PrReviewRow>,
+): Promise<Set<number>> {
 	const seen = new Set<number>();
 	for (const p of pulls) {
 		seen.add(p.number);
-		const row = store.getPrReview(p.number);
+		const row = await store.getPrReview(p.number);
+		const original = source.get(p.number);
+		if (
+			row?.head !== original?.head ||
+			row?.firstSeenAt !== original?.firstSeenAt ||
+			row?.state !== original?.state
+		)
+			continue;
 		if (!row) {
-			store.savePrReview({
+			await store.savePrReview({
 				number: p.number,
 				taskId: null,
 				head: p.head,
@@ -972,7 +980,7 @@ function syncSeenPulls(
 			continue;
 		}
 		const moved = row.head !== p.head;
-		store.savePrReview({
+		await store.savePrReview({
 			...row,
 			head: p.head,
 			firstSeenAt: moved ? t : row.firstSeenAt,
@@ -990,9 +998,10 @@ async function closeGonePulls(
 	project: ForkProject,
 	repo: string,
 	seen: Set<number>,
+	source: Map<number, PrReviewRow>,
 ): Promise<void> {
 	const store = project.store;
-	for (const row of store.listPrReviews()) {
+	for (const row of source.values()) {
 		if (row.state !== "open" || seen.has(row.number)) continue;
 		const r = await ctx.gh(["api", `repos/${repo}/pulls/${row.number}`]);
 		if (r.code !== 0) {
@@ -1009,24 +1018,36 @@ async function closeGonePulls(
 			ctx.log(`prs: ${project.name}: #${row.number}: bad JSON`);
 			continue;
 		}
-		// Only the state: a Post may have written the row during the await.
-		store.setPrState(row.number, merged ? "merged" : "closed");
-		store.syncPrCard(row.number);
+		await store.transaction(async () => {
+			const current = await store.getPrReview(row.number);
+			if (
+				(await store.getSettings()).prReviews !== true ||
+				current?.head !== row.head ||
+				current.firstSeenAt !== row.firstSeenAt ||
+				current.state !== row.state
+			)
+				return;
+			await store.setPrState(row.number, merged ? "merged" : "closed");
+			await store.syncPrCard(row.number);
+		});
 	}
 }
 
 /** Open, non-draft rows whose head the project has not reviewed yet and whose quiet period is over. */
-function dueReviewRows(store: ForkProject["store"], t: number): PrReviewRow[] {
+async function dueReviewRows(
+	store: ForkProject["store"],
+	t: number,
+): Promise<PrReviewRow[]> {
 	const due: PrReviewRow[] = [];
-	for (const row of store.listPrReviews()) {
+	for (const row of await store.listPrReviews()) {
 		if (
 			row.state !== "open" ||
 			row.draft ||
-			store.prHeadReviewed(row.number, row.head) ||
+			(await store.prHeadReviewed(row.number, row.head)) ||
 			row.firstSeenAt > t - PR_GATES.QUIET_MS
 		)
 			continue;
-		const card = row.taskId ? store.getTask(row.taskId) : null;
+		const card = row.taskId ? await store.getTask(row.taskId) : null;
 		// A cancelled card is the user's "never review this PR".
 		if (card?.cancelledAt != null) continue;
 		due.push(row);
@@ -1041,11 +1062,11 @@ async function sweepNotifiedRows(
 	repo: string,
 ): Promise<void> {
 	const store = project.store;
-	for (const row of store.listPrReviews()) {
+	for (const row of await store.listPrReviews()) {
 		if (row.state !== "open" || row.taskId === null || row.postedHead === null)
 			continue;
 		// A cancelled card is the user's "never review this PR".
-		if (store.getTask(row.taskId)?.cancelledAt != null) continue;
+		if ((await store.getTask(row.taskId))?.cancelledAt != null) continue;
 		try {
 			await sweepComments(ctx, project, repo, row);
 		} catch (e) {
@@ -1064,9 +1085,9 @@ async function runDueReviews(
 	store: ForkProject["store"],
 	t: number,
 ): Promise<void> {
-	for (const row of dueReviewRows(store, t)) {
+	for (const row of await dueReviewRows(store, t)) {
 		if (
-			store.prReviewRunsSince(t - PR_GATES.DAY_MS) >=
+			(await store.prReviewRunsSince(t - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
 		) {
 			ctx.log(
@@ -1085,6 +1106,9 @@ async function scanProject(
 ): Promise<void> {
 	const store = project.store;
 	const repo = repoForProject(github);
+	const source = new Map(
+		(await store.listPrReviews()).map((row) => [row.number, row]),
+	);
 	let pulls: PullInfo[];
 	try {
 		pulls = await listPulls(repo, ctx.gh);
@@ -1093,11 +1117,19 @@ async function scanProject(
 		return;
 	}
 	const t = ctx.now();
-	const seen = syncSeenPulls(store, pulls, t);
-	await closeGonePulls(ctx, project, repo, seen);
+	const seen = await store.transaction(async () => {
+		if ((await store.getSettings()).prReviews !== true) return null;
+		return syncSeenPulls(store, pulls, t, source);
+	});
+	if (seen === null) return;
+	await closeGonePulls(ctx, project, repo, seen, source);
 	// Converges every card to its row: a reopened PR, or a card an older build left in Done.
-	for (const row of store.listPrReviews()) store.syncPrCard(row.number);
-	if (store.getSettings().prReviewNotify === true)
+	await store.transaction(async () => {
+		if ((await store.getSettings()).prReviews !== true) return;
+		for (const row of await store.listPrReviews())
+			await store.syncPrCard(row.number);
+	});
+	if ((await store.getSettings()).prReviewNotify === true)
 		await sweepNotifiedRows(ctx, project, repo);
 	await runDueReviews(ctx, project, repo, store, t);
 }
@@ -1116,8 +1148,28 @@ async function sweepComments(
 	row: PrReviewRow,
 ): Promise<void> {
 	const store = project.store;
+	const apply = (at: number, unseen: boolean) =>
+		store.transaction(async () => {
+			const settings = await store.getSettings();
+			const current = await store.getPrReview(row.number);
+			const card = row.taskId === null ? null : await store.getTask(row.taskId);
+			if (
+				settings.prReviews !== true ||
+				settings.prReviewNotify !== true ||
+				card?.cancelledAt != null ||
+				current?.head !== row.head ||
+				current.state !== row.state ||
+				current.taskId !== row.taskId ||
+				current.postedHead !== row.postedHead ||
+				current.postedLogin !== row.postedLogin ||
+				current.commentsAt !== row.commentsAt
+			)
+				return false;
+			await store.setPrComments(row.number, at, unseen);
+			return true;
+		});
 	if (row.commentsAt === null) {
-		store.setPrComments(row.number, ctx.now(), false);
+		await apply(ctx.now(), false);
 		return;
 	}
 	const since = new Date(row.commentsAt).toISOString();
@@ -1137,9 +1189,9 @@ async function sweepComments(
 	];
 	const { newest, count } = countNewComments(entries, row);
 	if (count === 0 || newest === null) return;
-	store.setPrComments(row.number, newest, true);
+	if (!(await apply(newest, true))) return;
 	// The card may already be read: drop the mark so it wears the unread badge again.
-	if (row.taskId !== null) ctx.forgetSeen?.(row.taskId);
+	if (row.taskId !== null) await ctx.forgetSeen?.(row.taskId);
 	ctx.log(`prs: ${project.name}: #${row.number}: ${count} new comment(s)`);
 }
 
@@ -1213,9 +1265,29 @@ async function reviewOnce(
 	repo: string,
 	row: PrReviewRow,
 	note: string | undefined,
+	reviewsEnabled = true,
 ): Promise<void> {
 	const store = project.store;
-	const t = ctx.now();
+	const source = await store.transaction(async () => {
+		const current = await store.getPrReview(row.number);
+		const card = row.taskId === null ? null : await store.getTask(row.taskId);
+		if (
+			(await store.getSettings()).prReviews !== reviewsEnabled ||
+			current?.head !== row.head ||
+			current.firstSeenAt !== row.firstSeenAt ||
+			current.state !== "open" ||
+			current.taskId !== row.taskId ||
+			current.reviewedHead !== row.reviewedHead ||
+			current.postedHead !== row.postedHead ||
+			card?.cancelledAt != null
+		)
+			return null;
+		return {
+			card,
+			draftAt: await store.lastPrRunAt(row.number, row.reviewedHead),
+		};
+	});
+	if (source === null) return;
 	// Diff fetch, prompt budget and redaction pause fail the same way for the same head on
 	// every tick: run them before the attempt takes a cap slot, so one such PR cannot
 	// starve the others of the project.
@@ -1250,11 +1322,8 @@ async function reviewOnce(
 			postedLogin: row.postedLogin,
 			reviewedHead: row.reviewedHead,
 			head: row.head,
-			draftBody:
-				row.taskId !== null
-					? (store.getTask(row.taskId)?.details ?? null)
-					: null,
-			draftAt: store.lastPrRunAt(row.number, row.reviewedHead),
+			draftBody: source.card?.details ?? null,
+			draftAt: source.draftAt,
 		});
 		user = reviewUserMessage({
 			repo,
@@ -1274,7 +1343,40 @@ async function reviewOnce(
 	}
 	// The model attempt counts against the cap before the slow call; only a saved draft
 	// marks the head reviewed, so a failed attempt retries on a later tick.
-	const run = store.startPrRun(row.number, row.head, t);
+	const claim = await store.transaction(async () => {
+		const t = ctx.now();
+		const current = await store.getPrReview(row.number);
+		const card = row.taskId === null ? null : await store.getTask(row.taskId);
+		if (
+			(await store.getSettings()).prReviews !== reviewsEnabled ||
+			current?.head !== row.head ||
+			current.firstSeenAt !== row.firstSeenAt ||
+			current.state !== "open" ||
+			current.taskId !== row.taskId ||
+			current.reviewedHead !== row.reviewedHead ||
+			current.postedHead !== row.postedHead ||
+			card?.revision !== source.card?.revision ||
+			card?.cancelledAt != null ||
+			(note === undefined &&
+				(current.draft || (await store.prHeadReviewed(row.number, row.head))))
+		)
+			return null;
+		if (
+			(await store.prReviewRunsSince(t - PR_GATES.DAY_MS)) >=
+			PR_GATES.PROJECT_DAILY_RUNS
+		) {
+			ctx.log(
+				`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
+			);
+			return null;
+		}
+		return {
+			run: await store.startPrRun(row.number, row.head, t),
+			revision: card?.revision,
+		};
+	});
+	if (claim === null) return;
+	const { run } = claim;
 	try {
 		// The verdict comes out before the fit, so a block the fit moves can never carry
 		// or forge it, and before parseDraft: a verdict-only answer is empty and throws.
@@ -1295,18 +1397,34 @@ async function reviewOnce(
 			ctx.log(
 				`prs: ${project.name}: #${row.number}: ${fitted.moved} inline comment(s) outside the diff moved into the body`,
 			);
-		store.savePrDraft({
-			run,
-			number: row.number,
-			head: row.head,
-			draft,
-			blocking: verdict.blocking,
-			prompt: `Review of pull request #${row.number} of ${repo} at head ${row.head.slice(0, 7)}: ${row.title}\n${prUrl(repo, row.number)}`,
+		const saved = await store.transaction(async () => {
+			const current = await store.getPrReview(row.number);
+			const card = row.taskId === null ? null : await store.getTask(row.taskId);
+			if (
+				(await store.getSettings()).prReviews !== reviewsEnabled ||
+				current?.head !== row.head ||
+				current.firstSeenAt !== row.firstSeenAt ||
+				current.state !== "open" ||
+				current.taskId !== row.taskId ||
+				current.reviewedHead !== row.reviewedHead ||
+				current.postedHead !== row.postedHead ||
+				card?.cancelledAt != null ||
+				card?.revision !== claim.revision
+			)
+				return false;
+			await store.savePrDraft({
+				run,
+				number: row.number,
+				head: row.head,
+				draft,
+				blocking: verdict.blocking,
+				prompt: `Review of pull request #${row.number} of ${repo} at head ${row.head.slice(0, 7)}: ${row.title}\n${prUrl(repo, row.number)}`,
+			});
+			return true;
 		});
-		// A re-review rewrites the draft the user may already have read: drop the
-		// read mark so the card wears the unread badge again. `row` predates the
-		// awaits, and only this single-flight watcher writes task_id.
-		if (row.taskId !== null) ctx.forgetSeen?.(row.taskId);
+		if (!saved) return;
+		// Notify only after the guarded draft transaction succeeds.
+		if (row.taskId !== null) await ctx.forgetSeen?.(row.taskId);
 	} catch (e) {
 		ctx.log(
 			`prs: ${project.name}: #${row.number} review failed: ${(e as Error).message}`,
@@ -1323,7 +1441,10 @@ async function scanTick(
 	for (const project of ctx.projects()) {
 		if (opts?.manual !== undefined && project.name !== opts.manual) continue;
 		const github = project.github;
-		if (project.store.getSettings().prReviews !== true || github === null)
+		if (
+			(await project.store.getSettings()).prReviews !== true ||
+			github === null
+		)
 			continue;
 		try {
 			await scanProject(ctx, project, github);
@@ -1375,6 +1496,11 @@ async function requestReview(
 		return;
 	}
 	const store = project.store;
+	// Explicit replies work even when the background watcher is disabled.
+	const { original, reviewsEnabled } = await store.transaction(async () => ({
+		original: await store.getPrReview(o.number),
+		reviewsEnabled: (await store.getSettings()).prReviews,
+	}));
 	const r = await ctx.gh(["api", `repos/${repo}/pulls/${o.number}`]);
 	if (r.code !== 0) {
 		ctx.log(
@@ -1391,38 +1517,34 @@ async function requestReview(
 		ctx.log(`prs: ${project.name}: #${o.number}: ${(e as Error).message}`);
 		return;
 	}
-	const row = store.getPrReview(o.number);
-	if (!row) {
-		ctx.log(`prs: ${project.name}: #${o.number} is not watched`);
-		return;
-	}
-	// Refresh the head first, like the scanner's move branch: the review names this head.
-	const moved = row.head !== head;
-	const updated: PrReviewRow = {
-		...row,
-		head,
-		firstSeenAt: moved ? ctx.now() : row.firstSeenAt,
-		draft,
-		title,
-		state: "open",
-	};
-	store.savePrReview(updated);
-	const card = updated.taskId ? store.getTask(updated.taskId) : null;
-	// A cancelled card is the user's "never review this PR", even on an explicit request.
-	if (card?.cancelledAt != null) {
-		ctx.log(`prs: ${project.name}: #${o.number} card is cancelled`);
-		return;
-	}
-	const t = ctx.now();
-	if (
-		store.prReviewRunsSince(t - PR_GATES.DAY_MS) >= PR_GATES.PROJECT_DAILY_RUNS
-	) {
-		ctx.log(
-			`prs: ${project.name}: daily cap of ${PR_GATES.PROJECT_DAILY_RUNS} reviews reached`,
-		);
-		return;
-	}
-	await reviewOnce(ctx, project, repo, updated, o.note);
+	const updated = await store.transaction(async () => {
+		const row = await store.getPrReview(o.number);
+		if (
+			!row ||
+			(await store.getSettings()).prReviews !== reviewsEnabled ||
+			row.head !== original?.head ||
+			row.firstSeenAt !== original?.firstSeenAt ||
+			row.state !== original?.state
+		)
+			return null;
+		const card = row.taskId === null ? null : await store.getTask(row.taskId);
+		if (card?.cancelledAt != null) {
+			ctx.log(`prs: ${project.name}: #${o.number} card is cancelled`);
+			return null;
+		}
+		const next: PrReviewRow = {
+			...row,
+			head,
+			firstSeenAt: row.head !== head ? ctx.now() : row.firstSeenAt,
+			draft,
+			title,
+			state: "open",
+		};
+		await store.savePrReview(next);
+		return next;
+	});
+	if (updated === null) return;
+	await reviewOnce(ctx, project, repo, updated, o.note, reviewsEnabled);
 }
 
 export function createPrWatcher(deps: {
@@ -1430,7 +1552,7 @@ export function createPrWatcher(deps: {
 	log: (m: string) => void;
 	gh?: GhFn;
 	/** Called with the card id when a re-review rewrites a draft the user may have read; the board drops the read mark so the card wears the unread badge again. */
-	forgetSeen?: (taskId: string) => void;
+	forgetSeen?: (taskId: string) => void | Promise<void>;
 	now?: () => number;
 	/** The tool-free model call; defaults to the board's `omp auth-gateway` on the `plan` role. */
 	review?: ReviewFn;

@@ -19,14 +19,14 @@ import { discoverProjects, ProjectStore } from "./store.ts";
 // The restore tool of docs/specs/db-backup.md, with real stores as the sources and the holders.
 
 const root = mkdtempSync(join(tmpdir(), "ottr-restore-"));
-const opened: { close(): void }[] = [];
+const opened: { close(): Promise<void> }[] = [];
 /** Teardown closes each store also when an assertion fails before the close in the test. */
-const track = <S extends { close(): void }>(store: S): S => {
+const track = <S extends { close(): Promise<void> }>(store: S): S => {
 	opened.push(store);
 	return store;
 };
-afterAll(() => {
-	for (const store of opened) store.close(); // a second close does nothing
+afterAll(async () => {
+	for (const store of opened) await store.close(); // a second close does nothing
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -43,14 +43,17 @@ const T1 = new Date("2026-11-11T03:15:00Z");
 const S1 = "20261111T031500Z";
 
 /** Runs `fn` with `vars` in process.env, where the stores read their dirs, then puts the old values back. */
-const withEnv = <T>(vars: Record<string, string>, fn: () => T): T => {
+const withEnv = async <T>(
+	vars: Record<string, string>,
+	fn: () => T | Promise<T>,
+): Promise<T> => {
 	const saved = Object.keys(vars).map((key) => ({
 		key,
 		value: process.env[key],
 	}));
 	Object.assign(process.env, vars);
 	try {
-		return fn();
+		return await fn();
 	} finally {
 		for (const { key, value } of saved) {
 			if (value === undefined) delete process.env[key];
@@ -63,29 +66,29 @@ const withEnv = <T>(vars: Record<string, string>, fn: () => T): T => {
  * Makes the snapshot of `now` in `dir` from a real GlobalStore that holds the key `k`.
  * Each name in `projects` gets a project file that is a copy of the same database.
  */
-const snapshot = (
+const snapshot = async (
 	dir: string,
 	now: Date,
 	value: string,
 	projects: string[] = [],
-): void => {
-	const gstore = track(GlobalStore.open(tmp("source-state")));
-	gstore.set("k", value);
+): Promise<void> => {
+	const gstore = track(await GlobalStore.open(tmp("source-state")));
+	await gstore.set("k", value);
 	const stores = projects.map((name) => ({
 		name,
-		backupTo: (dest: string) => gstore.backupTo(dest),
+		backupTo: async (dest: string) => await gstore.backupTo(dest),
 	}));
 	const sources = backupSources(gstore, stores);
-	const result = runBackup({ dir, keep: 7, now, sources });
-	gstore.close();
+	const result = await runBackup({ dir, keep: 7, now, sources });
+	await gstore.close();
 	expect(result.failed).toEqual([]);
 };
 
 /** The key `k` of the tracker.db in `stateDir`, read through a real GlobalStore. */
-const kIn = (stateDir: string): string | null => {
-	const gstore = track(GlobalStore.open(stateDir));
-	const value = gstore.get<string>("k");
-	gstore.close();
+const kIn = async (stateDir: string): Promise<string | null> => {
+	const gstore = track(await GlobalStore.open(stateDir));
+	const value = await gstore.get<string>("k");
+	await gstore.close();
 	return value;
 };
 
@@ -100,7 +103,7 @@ const dirs = (label: string) => {
 };
 
 describe("runRestore", () => {
-	test("a snapshot of the live stores restores into an empty state dir and server data dir", () => {
+	test("a snapshot of the live stores restores into an empty state dir and server data dir", async () => {
 		const base = tmp("round-trip");
 		const data = join(base, "data");
 		const backups = join(base, "backup");
@@ -113,25 +116,25 @@ describe("runRestore", () => {
 			OTTR_DATA_DIR: data,
 			OTTR_SERVER_DATA_DIR: join(base, "server"),
 		};
-		const before = withEnv(oldDirs, () => {
-			const gstore = track(GlobalStore.open(join(base, "state")));
-			const store = track(ProjectStore.open(proj));
-			gstore.set("config", config);
-			gstore.set("seen-answers", [3, 5, 8]);
-			store.setSettings({
+		const before = await withEnv(oldDirs, async () => {
+			const gstore = track(await GlobalStore.open(join(base, "state")));
+			const store = track(await ProjectStore.open(proj));
+			await gstore.set("config", config);
+			await gstore.set("seen-answers", [3, 5, 8]);
+			await store.setSettings({
 				releaseCommand: "bun run release",
 				displayName: "Demo",
 			});
-			const first = store.createTask("First card\n\nwith a body");
-			store.createTask("Second card");
-			const work = store.startTurn(first.id, "work", "First card", null);
-			store.finishTurn(work.id, {
+			const first = await store.createTask("First card\n\nwith a body");
+			await store.createTask("Second card");
+			const work = await store.startTurn(first.id, "work", "First card", null);
+			await store.finishTurn(work.id, {
 				endedAt: 1_800_000_000_000,
 				model: "zai/glm-5.3-flash",
 			});
-			const second = store.startTurn(first.id, "work", "Go on", null);
-			store.finishTurn(second.id, { endedAt: 1_800_000_060_000 });
-			const result = runBackup({
+			const second = await store.startTurn(first.id, "work", "Go on", null);
+			await store.finishTurn(second.id, { endedAt: 1_800_000_060_000 });
+			const result = await runBackup({
 				dir: backups,
 				keep: 7,
 				now: T0,
@@ -144,13 +147,13 @@ describe("runRestore", () => {
 				pruned: [],
 			});
 			const values = {
-				settings: store.getSettings(),
-				tasks: store.listTasks(),
-				turns: store.listTurns(first.id),
+				settings: await store.getSettings(),
+				tasks: await store.listTasks(),
+				turns: await store.listTurns(first.id),
 				firstId: first.id,
 			};
-			store.close();
-			gstore.close();
+			await store.close();
+			await gstore.close();
 			return values;
 		});
 		expect(before.settings.releaseCommand).toBe("bun run release");
@@ -163,7 +166,7 @@ describe("runRestore", () => {
 		mkdirSync(state);
 		mkdirSync(server);
 		const newDirs = { OTTR_DATA_DIR: data, OTTR_SERVER_DATA_DIR: server };
-		withEnv(newDirs, () => {
+		await withEnv(newDirs, () => {
 			expect(discoverProjects([parent])).toEqual([]);
 		});
 
@@ -182,21 +185,21 @@ describe("runRestore", () => {
 		});
 		expect(existsSync(join(server, ".adopted"))).toBe(true);
 
-		withEnv(newDirs, () => {
+		await withEnv(newDirs, async () => {
 			expect(discoverProjects([parent])).toEqual([proj]);
-			const gstore = track(GlobalStore.open(state));
-			const store = track(ProjectStore.open(proj));
-			expect(gstore.get("config")).toEqual(config);
-			expect(gstore.get("seen-answers")).toEqual([3, 5, 8]);
-			expect(store.getSettings()).toEqual(before.settings);
-			expect(store.listTasks()).toEqual(before.tasks);
-			expect(store.listTurns(before.firstId)).toEqual(before.turns);
-			store.close();
-			gstore.close();
+			const gstore = track(await GlobalStore.open(state));
+			const store = track(await ProjectStore.open(proj));
+			expect(await gstore.get("config")).toEqual(config);
+			expect(await gstore.get("seen-answers")).toEqual([3, 5, 8]);
+			expect(await store.getSettings()).toEqual(before.settings);
+			expect(await store.listTasks()).toEqual(before.tasks);
+			expect(await store.listTurns(before.firstId)).toEqual(before.turns);
+			await store.close();
+			await gstore.close();
 		});
 	});
 
-	test("no argument lists the snapshots with the size of each file and changes nothing", () => {
+	test("no argument lists the snapshots with the size of each file and changes nothing", async () => {
 		const d = dirs("list");
 		expect(runRestore([], d.env)).toEqual({
 			code: 0,
@@ -205,8 +208,8 @@ describe("runRestore", () => {
 		});
 		expect(readdirSync(d.base)).toEqual([]);
 
-		snapshot(d.dir, T0, "one");
-		snapshot(d.dir, T1, "two", ["demo", "alpha"]);
+		await snapshot(d.dir, T0, "one");
+		await snapshot(d.dir, T1, "two", ["demo", "alpha"]);
 		const size = (...parts: string[]): number =>
 			statSync(join(d.dir, ...parts)).size;
 		const tracker = size(S1, "tracker.db");
@@ -225,9 +228,9 @@ describe("runRestore", () => {
 		expect(readdirSync(d.dir).sort()).toEqual([S0, S1]);
 	});
 
-	test("a stamp that is not a snapshot gives code 1 and changes nothing", () => {
+	test("a stamp that is not a snapshot gives code 1 and changes nothing", async () => {
 		const d = dirs("missing");
-		snapshot(d.dir, T0, "one");
+		await snapshot(d.dir, T0, "one");
 		expect(runRestore(["20260101T000000Z"], d.env)).toEqual({
 			code: 1,
 			out: [],
@@ -243,9 +246,9 @@ describe("runRestore", () => {
 		expect(readdirSync(d.base)).toEqual(["backup"]);
 	});
 
-	test("more than one argument or an option gives code 1 and a usage line", () => {
+	test("more than one argument or an option gives code 1 and a usage line", async () => {
 		const d = dirs("usage");
-		snapshot(d.dir, T0, "one");
+		await snapshot(d.dir, T0, "one");
 		for (const args of [["latest", "extra"], ["--help"], ["-f", S0], ["-"]]) {
 			const run = runRestore(args, d.env);
 			expect(run.code).toBe(1);
@@ -256,10 +259,10 @@ describe("runRestore", () => {
 		expect(readdirSync(d.base)).toEqual(["backup"]);
 	});
 
-	test("with no data dir set, a project database gets a line to copy it by hand", () => {
+	test("with no data dir set, a project database gets a line to copy it by hand", async () => {
 		const d = dirs("manual");
-		snapshot(d.dir, T0, "old one");
-		snapshot(d.dir, T1, "new one", ["demo"]);
+		await snapshot(d.dir, T0, "old one");
+		await snapshot(d.dir, T1, "new one", ["demo"]);
 
 		// A stamp argument restores that snapshot, not the newest one.
 		expect(runRestore([S0], d.env)).toEqual({
@@ -267,7 +270,7 @@ describe("runRestore", () => {
 			out: [`restored tracker.db -> ${d.trackerDb}`],
 			err: [],
 		});
-		expect(kIn(d.state)).toBe("old one");
+		expect(await kIn(d.state)).toBe("old one");
 
 		const run = runRestore(["latest"], d.env);
 		const from = join(d.dir, S1, "projects", "demo", "tasks.db");
@@ -280,7 +283,7 @@ describe("runRestore", () => {
 		expect(run.out[2]).toBe(
 			`copy by hand: ${from} -> <checkout>/.tasks/tasks.db`,
 		);
-		expect(kIn(d.state)).toBe("new one");
+		expect(await kIn(d.state)).toBe("new one");
 
 		// The tool renamed the old file: its content still opens at the printed path.
 		const old = new Database(run.out[1]!.slice(kept.length));
@@ -294,10 +297,10 @@ describe("runRestore", () => {
 		}
 	});
 
-	test("with only OTTR_DATA_DIR set, a project database goes there and no marker is written", () => {
+	test("with only OTTR_DATA_DIR set, a project database goes there and no marker is written", async () => {
 		const d = dirs("data-dir");
 		const data = join(d.base, "data");
-		snapshot(d.dir, T0, "one", ["demo"]);
+		await snapshot(d.dir, T0, "one", ["demo"]);
 		const run = runRestore(["latest"], { ...d.env, OTTR_DATA_DIR: data });
 		expect(run).toEqual({
 			code: 0,
@@ -311,45 +314,91 @@ describe("runRestore", () => {
 		expect(readdirSync(join(data, "demo"))).toEqual(["tasks.db"]);
 	});
 
-	test("a live store on a target stops the tool with code 1 and no change", () => {
+	test("a live store on a target stops the tool with code 1 and no change", async () => {
 		const d = dirs("held");
-		snapshot(d.dir, T0, "from the snapshot");
-		const live = track(GlobalStore.open(d.state));
-		live.set("k", "live");
+		await snapshot(d.dir, T0, "from the snapshot");
+		const live = track(await GlobalStore.open(d.state));
+		await live.set("k", "live");
 		const run = runRestore(["latest"], d.env);
 		expect(run.code).toBe(1);
 		expect(run.out).toEqual([]);
 		expect(run.err.length).toBe(1);
 		expect(run.err[0]).toContain("stop the board first");
 		expect(run.err[0]).toContain(d.trackerDb);
-		expect(live.get<string>("k")).toBe("live");
+		expect(await live.get<string>("k")).toBe("live");
 		const touched = readdirSync(join(d.state, ".tasks")).filter((name) =>
 			name.includes("restor"),
 		);
 		expect(touched).toEqual([]);
-		live.close();
-		expect(kIn(d.state)).toBe("live");
+		await live.close();
+		expect(await kIn(d.state)).toBe("live");
 	});
 
-	test("a snapshot in which a database copy failed gives code 1 and names the newest snapshot with a copy", () => {
+	test("close drains a delayed transaction and snapshot before restore acquires the lock", async () => {
+		const d = dirs("close-drain");
+		await snapshot(d.dir, T0, "snapshot");
+		const live = track(await GlobalStore.open(d.state));
+		await live.set("k", "live");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const work = live.transaction(async () => {
+			entered.resolve();
+			await release.promise;
+			await live.set("k", "settled");
+		});
+		await entered.promise;
+		const copyPath = join(d.base, "drained.db");
+		const copy = live.backupTo(copyPath);
+		let closed = false;
+		const closing = live.close().then(() => {
+			closed = true;
+		});
+		try {
+			expect(closed).toBe(false);
+			const held = runRestore(["latest"], d.env);
+			expect(held.code).toBe(1);
+			expect(held.err[0]).toContain("stop the board first");
+			expect(existsSync(copyPath)).toBe(false);
+		} finally {
+			release.resolve();
+			await Promise.all([work, copy, closing]);
+		}
+		expect(closed).toBe(true);
+		const drained = new Database(copyPath);
+		try {
+			expect(
+				drained
+					.query<{ value: string }, []>("SELECT value FROM kv WHERE key = 'k'")
+					.get()?.value,
+			).toBe('"settled"');
+		} finally {
+			drained.close();
+		}
+		const restored = runRestore(["latest"], d.env);
+		expect(restored.code).toBe(0);
+		expect(restored.err).toEqual([]);
+		expect(await kIn(d.state)).toBe("snapshot");
+	});
+
+	test("a snapshot in which a database copy failed gives code 1 and names the newest snapshot with a copy", async () => {
 		const d = dirs("incomplete");
 		const server = join(d.base, "server");
-		snapshot(d.dir, T0, "complete", ["demo"]);
-		const gstore = track(GlobalStore.open(tmp("source-state")));
-		gstore.set("k", "newest");
+		await snapshot(d.dir, T0, "complete", ["demo"]);
+		const gstore = track(await GlobalStore.open(tmp("source-state")));
+		await gstore.set("k", "newest");
 		const failing = {
 			name: "demo",
-			backupTo: () => {
+			backupTo: async () => {
 				throw new Error("disk full");
 			},
 		};
-		const made = runBackup({
+		const made = await runBackup({
 			dir: d.dir,
 			keep: 7,
 			now: T1,
 			sources: backupSources(gstore, [failing]),
 		});
-		gstore.close();
+		await gstore.close();
 		expect(made.failed).toEqual([
 			{ file: "projects/demo/tasks.db", error: "disk full" },
 		]);
@@ -363,7 +412,7 @@ describe("runRestore", () => {
 				`projects/demo/tasks.db failed: not in the snapshot ${S1}: the copy failed at backup time (disk full). The newest snapshot with a copy is ${S0}: ${older}`,
 			],
 		});
-		expect(kIn(d.state)).toBe("newest");
+		expect(await kIn(d.state)).toBe("newest");
 		expect(existsSync(join(server, "demo", "tasks.db"))).toBe(false);
 
 		const list = runRestore([], env);
@@ -374,10 +423,10 @@ describe("runRestore", () => {
 		expect(list.out[1]).not.toContain("incomplete");
 	});
 
-	test("a snapshot file that fails the check gives code 1, and the other files still restore", () => {
+	test("a snapshot file that fails the check gives code 1, and the other files still restore", async () => {
 		const d = dirs("bad-file");
 		const server = join(d.base, "server");
-		snapshot(d.dir, T0, "one", ["demo"]);
+		await snapshot(d.dir, T0, "one", ["demo"]);
 		writeFileSync(
 			join(d.dir, S0, "projects", "demo", "tasks.db"),
 			"not a sqlite file at all",
@@ -391,6 +440,6 @@ describe("runRestore", () => {
 		expect(run.err.length).toBe(1);
 		expect(run.err[0]).toStartWith("projects/demo/tasks.db failed: ");
 		expect(readdirSync(join(server, "demo"))).toEqual([]);
-		expect(kIn(d.state)).toBe("one");
+		expect(await kIn(d.state)).toBe("one");
 	});
 });

@@ -909,7 +909,9 @@ async function consumeRun(
 	let lost: string | undefined;
 	try {
 		for (;;) {
+			if (settled()) return;
 			const { done: ended, value } = await reader.read();
+			if (settled()) return;
 			if (ended) break;
 			partial += dec.decode(value, { stream: true });
 			let idx = partial.indexOf("\n");
@@ -972,13 +974,13 @@ export function runWorker(
 		resolveAccepted(false); // no-op once the 200 resolved it true
 		if (settled) return;
 		settled = true;
-		resolveDone(r);
+		void sink.drain().then(() => resolveDone(r), rejectDone);
 	};
 	const fail = (e: unknown): void => {
 		resolveAccepted(false);
 		if (settled) return;
 		settled = true;
-		rejectDone(e);
+		void sink.drain().then(() => rejectDone(e), rejectDone);
 	};
 
 	(async () => {

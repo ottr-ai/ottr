@@ -48,8 +48,8 @@ function parseSub(s: unknown): PushSub | null {
 	return out;
 }
 
-export function loadSubs(store: GlobalStore): PushSub[] {
-	const parsed: unknown = store.get<unknown[]>("push_subs");
+export async function loadSubs(store: GlobalStore): Promise<PushSub[]> {
+	const parsed: unknown = await store.get<unknown[]>("push_subs");
 	if (!Array.isArray(parsed)) return [];
 	const subs: PushSub[] = [];
 	for (const s of parsed) {
@@ -73,7 +73,10 @@ function parseClasses(raw: unknown): ClassPrefs {
 }
 
 /** One subscription per endpoint: a re-subscribe replaces the older entry. */
-export function saveSubs(store: GlobalStore, subs: PushSub[]): void {
+export async function saveSubs(
+	store: GlobalStore,
+	subs: PushSub[],
+): Promise<void> {
 	const seen = new Set<string>();
 	const deduped: PushSub[] = [];
 	for (const s of subs) {
@@ -81,7 +84,17 @@ export function saveSubs(store: GlobalStore, subs: PushSub[]): void {
 		seen.add(s.endpoint);
 		deduped.push(s);
 	}
-	store.set("push_subs", deduped);
+	await store.set("push_subs", deduped);
+}
+
+/** Apply a subscription change against the current list in one transaction. */
+export async function updateSubs(
+	store: GlobalStore,
+	modify: (current: PushSub[]) => PushSub[],
+): Promise<void> {
+	await store.transaction(async () => {
+		await saveSubs(store, modify(await loadSubs(store)));
+	});
 }
 
 /**
@@ -181,11 +194,29 @@ export async function sendAll(
 	return report;
 }
 
-/** Drops gone endpoints against a fresh read, so subscriptions added or removed during the sends survive. */
-export function pruneSubs(store: GlobalStore, gone: Set<string>): void {
+/** Drop only failed subscription snapshots. Preserve concurrent replacements and new subscriptions. */
+export async function pruneSubs(
+	store: GlobalStore,
+	gone: Set<string>,
+	attempted: PushSub[],
+): Promise<void> {
 	if (gone.size === 0) return;
-	saveSubs(
-		store,
-		loadSubs(store).filter((s) => !gone.has(s.endpoint)),
+	const expired = new Map(
+		attempted
+			.filter((sub) => gone.has(sub.endpoint))
+			.map((sub) => [sub.endpoint, sub]),
+	);
+	await updateSubs(store, (current) =>
+		current.filter((sub) => {
+			const sent = expired.get(sub.endpoint);
+			return (
+				sent === undefined ||
+				sub.keys.p256dh !== sent.keys.p256dh ||
+				sub.keys.auth !== sent.keys.auth ||
+				sub.addedAt !== sent.addedAt ||
+				sub.vapidPublicKey !== sent.vapidPublicKey ||
+				ALERT_CLASSES.some((name) => sub.classes[name] !== sent.classes[name])
+			);
+		}),
 	);
 }

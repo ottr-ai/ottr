@@ -294,8 +294,8 @@ export function upstreamToken(
 
 export function createOmpWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
-	load: (project: string) => unknown;
-	save: (project: string, state: OmpWatchState) => void;
+	load: (project: string) => Promise<unknown>;
+	save: (project: string, state: OmpWatchState) => Promise<void>;
 	log: (m: string) => void;
 	schedule: () => void;
 	fetch?: typeof fetch;
@@ -348,7 +348,7 @@ export function createOmpWatcher(deps: {
 
 	async function watchProject(project: ForkProject): Promise<void> {
 		const store = project.store;
-		const watching = () => store.getSettings().ompWatch === true;
+		const watching = async () => (await store.getSettings()).ompWatch === true;
 		const tag = project.name;
 		let pin: string | null = null;
 		try {
@@ -362,16 +362,12 @@ export function createOmpWatcher(deps: {
 			deps.log(`${tag}: no ARG OMP_VERSION=x.y.z line in Dockerfile.worker`);
 			return;
 		}
-		const state = parseOmpWatchState(deps.load(project.name));
+		const state = parseOmpWatchState(await deps.load(project.name));
 		// The tick's last failure becomes lastError; a tick without one clears it.
 		const failures: string[] = [];
 		const fail = (reason: string) => {
 			failures.push(reason);
 			deps.log(`${tag}: ${reason}`);
-		};
-		const cleared = (id: string): boolean => {
-			const t = store.getTask(id);
-			return t === null || t.stage === "done";
 		};
 
 		let pack: { releases: OmpRelease[]; repo: string | null };
@@ -381,7 +377,7 @@ export function createOmpWatcher(deps: {
 			const reason = `npm: ${errText(e)}`;
 			fail(reason);
 			state.lastError = { reason, at: now() };
-			deps.save(project.name, state);
+			await deps.save(project.name, state);
 			return;
 		}
 		const { releases, repo } = pack;
@@ -401,19 +397,11 @@ export function createOmpWatcher(deps: {
 			fail,
 			watching,
 		);
-		filed += await fileBumpCard(
-			project,
-			state,
-			releases,
-			pin,
-			fail,
-			watching,
-			cleared,
-		);
+		filed += await fileBumpCard(project, state, releases, pin, fail, watching);
 
 		const reason = failures.at(-1);
 		state.lastError = reason === undefined ? null : { reason, at: now() };
-		deps.save(project.name, state);
+		await deps.save(project.name, state);
 		if (filed > 0) deps.schedule();
 	}
 
@@ -425,16 +413,16 @@ export function createOmpWatcher(deps: {
 		repo: string | null,
 		pin: string,
 		fail: (reason: string) => void,
-		watching: () => boolean,
+		watching: () => Promise<boolean>,
 	): Promise<number> {
 		const store = project.store;
 		const tag = project.name;
 		let filed = 0;
 		for (const r of unreviewed.slice(0, OMP_WATCH_GATES.reviewsPerTick)) {
-			if (repo === null || !watching()) break;
+			if (repo === null || !(await watching())) break;
 			const v = await review(r, repo, pin, fail);
 			if (v === null) continue;
-			if (!watching()) {
+			if (!(await watching())) {
 				deps.log(`${tag}: watch turned off during the review of ${r.version}`);
 				break;
 			}
@@ -466,21 +454,23 @@ export function createOmpWatcher(deps: {
 		fail: (reason: string) => void,
 	): Promise<number> {
 		try {
-			const card = store.createTask(
-				failCardPrompt({
-					version: r.version,
-					pin,
-					reasons: v.reasons,
-					notes: v.notes,
-				}),
-				null,
-				"work",
-			);
-			store.updateTask(card.id, {
-				title: `omp ${r.version}: compatibility review failed`,
-				promptAuthor: "board",
-				topic: "omp",
+			const prompt = failCardPrompt({
+				version: r.version,
+				pin,
+				reasons: v.reasons,
+				notes: v.notes,
 			});
+			const card = await store.transaction(async () => {
+				if ((await store.getSettings()).ompWatch !== true) return null;
+				const created = await store.createTask(prompt, null, "work");
+				await store.updateTask(created.id, {
+					title: `omp ${r.version}: compatibility review failed`,
+					promptAuthor: "board",
+					topic: "omp",
+				});
+				return created;
+			});
+			if (card === null) return 0;
 			state.verdicts[r.version] = {
 				verdict: "fail",
 				reasons: v.reasons,
@@ -502,44 +492,64 @@ export function createOmpWatcher(deps: {
 		releases: OmpRelease[],
 		pin: string,
 		fail: (reason: string) => void,
-		watching: () => boolean,
-		cleared: (cardId: string) => boolean,
+		watching: () => Promise<boolean>,
 	): Promise<number> {
 		const store = project.store;
-		const target = bumpTarget(releases, state.verdicts, cleared, now());
-		const open = state.bumpCard !== null && !cleared(state.bumpCard.id);
-		if (
-			target === null ||
-			open ||
-			(state.bumpCard !== null &&
-				compareVersions(target, state.bumpCard.version) <= 0) ||
-			!watching()
-		)
-			return 0;
-		// bumpTarget stops at the first release without a verdict, so every covered
-		// release has one here.
-		const covers = releases.flatMap((r) => {
-			if (compareVersions(r.version, target) > 0) return [];
-			const v = state.verdicts[r.version];
-			if (v === undefined) return [];
-			return [{ version: r.version, verdict: v.verdict, cardId: v.cardId }];
-		});
+		let attemptedTarget: string | null = null;
 		try {
-			const card = store.createTask(
-				ompBumpCardPrompt({ version: target, pin, covers }),
-				null,
-				"work",
-			);
-			store.updateTask(card.id, {
-				title: `Bump omp to ${target}`,
-				promptAuthor: "board",
-				topic: "omp",
+			const result = await store.transaction(async () => {
+				if (!(await watching())) return null;
+				const cleared = new Set<string>();
+				const ids = new Set(
+					Object.values(state.verdicts).flatMap((v) =>
+						v.cardId === null ? [] : [v.cardId],
+					),
+				);
+				if (state.bumpCard !== null) ids.add(state.bumpCard.id);
+				for (const id of ids) {
+					const task = await store.getTask(id);
+					if (task === null || task.stage === "done") cleared.add(id);
+				}
+				const target = bumpTarget(
+					releases,
+					state.verdicts,
+					(id) => cleared.has(id),
+					now(),
+				);
+				if (
+					target === null ||
+					(state.bumpCard !== null &&
+						(!cleared.has(state.bumpCard.id) ||
+							compareVersions(target, state.bumpCard.version) <= 0))
+				)
+					return null;
+				attemptedTarget = target;
+				// Every release through the target has a verdict.
+				const covers = releases.flatMap((r) => {
+					if (compareVersions(r.version, target) > 0) return [];
+					const v = state.verdicts[r.version];
+					if (v === undefined) return [];
+					return [{ version: r.version, verdict: v.verdict, cardId: v.cardId }];
+				});
+				const card = await store.createTask(
+					ompBumpCardPrompt({ version: target, pin, covers }),
+					null,
+					"work",
+				);
+				await store.updateTask(card.id, {
+					title: `Bump omp to ${target}`,
+					promptAuthor: "board",
+					topic: "omp",
+				});
+				return { card, target };
 			});
+			if (result === null) return 0;
+			const { card, target } = result;
 			state.bumpCard = { id: card.id, version: target };
 			deps.log(`${project.name}: filed bump card ${card.id} for omp ${target}`);
 			return 1;
 		} catch (e) {
-			fail(`bump card for ${target} not filed: ${errText(e)}`);
+			fail(`bump card for ${attemptedTarget} not filed: ${errText(e)}`);
 			return 0;
 		}
 	}
@@ -614,7 +624,7 @@ export function createOmpWatcher(deps: {
 	async function scan(): Promise<void> {
 		// Fresh iteration per tick: a one-shot iterator would be empty after the first tick.
 		for (const project of deps.projects()) {
-			if (project.store.getSettings().ompWatch !== true) continue;
+			if ((await project.store.getSettings()).ompWatch !== true) continue;
 			try {
 				await watchProject(project);
 			} catch (e) {

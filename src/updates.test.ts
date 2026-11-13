@@ -160,16 +160,67 @@ describe("mapRepo", () => {
 });
 
 describe("skips", () => {
-	test("stores ids once in the global store and survives a reopen", () => {
-		const a = GlobalStore.open(join(tmp, "skips"));
-		expect(loadSkips(a)).toEqual([]);
-		addSkip(a, "rtk@v1.2.3");
-		addSkip(a, "rtk@v1.2.3");
-		addSkip(a, "skills@abc");
-		a.close();
-		const b = GlobalStore.open(join(tmp, "skips"));
-		expect(loadSkips(b)).toEqual(["rtk@v1.2.3", "skills@abc"]);
-		b.close();
+	test("stores ids once in the global store and survives a reopen", async () => {
+		const a = await GlobalStore.open(join(tmp, "skips"));
+		expect(await loadSkips(a)).toEqual([]);
+		await addSkip(a, "rtk@v1.2.3");
+		await addSkip(a, "rtk@v1.2.3");
+		await addSkip(a, "skills@abc");
+		await a.close();
+		const b = await GlobalStore.open(join(tmp, "skips"));
+		expect(await loadSkips(b)).toEqual(["rtk@v1.2.3", "skills@abc"]);
+		await b.close();
+	});
+
+	test("concurrent skip additions preserve every distinct id", async () => {
+		const store = await GlobalStore.open(join(tmp, "concurrent-skips"));
+		try {
+			await store.set("updateSkips", ["legacy@1", 42, "legacy@1"]);
+			const results = await Promise.all([
+				addSkip(store, "first@1"),
+				addSkip(store, "second@1"),
+				addSkip(store, "first@1"),
+			]);
+			expect(results).toEqual([
+				["legacy@1", "first@1"],
+				["legacy@1", "first@1", "second@1"],
+				["legacy@1", "first@1", "second@1"],
+			]);
+			expect(await loadSkips(store)).toEqual([
+				"legacy@1",
+				"first@1",
+				"second@1",
+			]);
+		} finally {
+			await store.close();
+		}
+	});
+
+	test("property: skip additions keep strings once and drop non-string values", async () => {
+		const store = await GlobalStore.open(join(tmp, "skip-properties"));
+		try {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.array(fc.jsonValue()),
+					fc.string(),
+					async (values, id) => {
+						await store.set("updateSkips", values);
+						const saved = await addSkip(store, id);
+						expect(saved.every((value) => typeof value === "string")).toBe(
+							true,
+						);
+						expect(new Set(saved).size).toBe(saved.length);
+						expect(saved).toContain(id);
+						for (const value of values) {
+							if (typeof value === "string") expect(saved).toContain(value);
+						}
+						expect(await loadSkips(store)).toEqual(saved);
+					},
+				),
+			);
+		} finally {
+			await store.close();
+		}
 	});
 });
 
@@ -184,22 +235,58 @@ describe("update decisions", () => {
 		expect(v!.updates).toEqual([]);
 	});
 
-	test("migratePendingToSkips moves queued skips into updateSkips and empties the queue", () => {
-		const a = GlobalStore.open(join(tmp, "migrate"));
-		addSkip(a, "legacy@1");
-		a.set("updateDecisionsPending", [
+	test("migratePendingToSkips moves queued skips into updateSkips and empties the queue", async () => {
+		const a = await GlobalStore.open(join(tmp, "migrate"));
+		await addSkip(a, "legacy@1");
+		await a.set("updateDecisionsPending", [
 			{ id: "rtk@v1.2.3", decision: "skipped" },
 			{ id: "skills@abc", decision: "skipped", propose: true },
 			{ id: "approved@1", decision: "approved" },
 			"junk",
 		]);
-		migratePendingToSkips(a);
-		expect(loadSkips(a)).toEqual(["legacy@1", "rtk@v1.2.3", "skills@abc"]);
-		expect(a.get<unknown[]>("updateDecisionsPending")).toEqual([]);
+		await migratePendingToSkips(a);
+		expect(await loadSkips(a)).toEqual([
+			"legacy@1",
+			"rtk@v1.2.3",
+			"skills@abc",
+		]);
+		expect(await a.get<unknown[]>("updateDecisionsPending")).toEqual([]);
 		// Idempotent: a second run changes nothing.
-		migratePendingToSkips(a);
-		expect(loadSkips(a)).toEqual(["legacy@1", "rtk@v1.2.3", "skills@abc"]);
-		a.close();
+		await migratePendingToSkips(a);
+		expect(await loadSkips(a)).toEqual([
+			"legacy@1",
+			"rtk@v1.2.3",
+			"skills@abc",
+		]);
+		await a.close();
+	});
+
+	test("concurrent migration and skip additions preserve both lists", async () => {
+		const store = await GlobalStore.open(join(tmp, "concurrent-migration"));
+		try {
+			await addSkip(store, "legacy@1");
+			await store.set("updateDecisionsPending", [
+				{ id: "queued@1", decision: "skipped" },
+				{ id: "approved@1", decision: "approved" },
+			]);
+			await Promise.all([
+				migratePendingToSkips(store),
+				addSkip(store, "live@1"),
+				store.set("updateDecisionsPending", [
+					{ id: "newer@1", decision: "skipped" },
+				]),
+				migratePendingToSkips(store),
+			]);
+			expect(await loadSkips(store)).toEqual([
+				"legacy@1",
+				"queued@1",
+				"live@1",
+				"newer@1",
+			]);
+			expect(await store.get("updateDecisionsPending")).toEqual([]);
+		} finally {
+			await store.close();
+		}
 	});
 });
 

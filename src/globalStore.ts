@@ -6,14 +6,26 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { closeLocked, openLocked, vacuumInto } from "./dblock.ts";
+import { StoreQueue } from "./storeQueue.ts";
 
 export class GlobalStore {
-	/** Set by close(): a second close must not run the lock release on a dead handle. */
-	private closed = false;
+	private readonly queue: StoreQueue;
 
-	private constructor(private db: Database) {}
+	private constructor(private db: Database) {
+		this.queue = new StoreQueue({
+			begin: () => {
+				this.db.exec("BEGIN IMMEDIATE");
+			},
+			commit: () => {
+				this.db.exec("COMMIT");
+			},
+			rollback: () => {
+				this.db.exec("ROLLBACK");
+			},
+		});
+	}
 
-	static open(root: string): GlobalStore {
+	static async open(root: string): Promise<GlobalStore> {
 		const dir = resolve(root);
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		// Keep a fresh checkout's boot from leaving an untracked .tasks dir (mirrors ProjectStore.init).
@@ -31,36 +43,52 @@ export class GlobalStore {
 		return store;
 	}
 
-	get<T>(key: string): T | null {
-		try {
+	async transaction<T>(work: () => T | Promise<T>): Promise<T> {
+		return this.queue.transaction(work);
+	}
+
+	async get<T>(key: string): Promise<T | null> {
+		return this.queue.run(() => {
 			const row = this.db
 				.query<{ value: string }, [string]>(
 					"SELECT value FROM kv WHERE key = ?",
 				)
 				.get(key);
 			if (row === null) return null;
-			return JSON.parse(row.value) as T;
-		} catch {
-			return null; // missing key or corrupt JSON row: degrade to null
-		}
+			try {
+				return JSON.parse(row.value) as T;
+			} catch {
+				return null; // Only corrupt JSON degrades to null; database errors propagate.
+			}
+		});
 	}
 
-	set(key: string, value: unknown): void {
-		this.db
-			.query(
-				"INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-			)
-			.run(key, JSON.stringify(value));
+	async set(key: string, value: unknown): Promise<void> {
+		return this.queue.run(() => {
+			this.db
+				.query(
+					"INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				)
+				.run(key, JSON.stringify(value));
+		});
+	}
+
+	async update<T>(key: string, modify: (current: T | null) => T): Promise<T> {
+		return this.transaction(async () => {
+			const next = modify(await this.get<T>(key));
+			await this.set(key, next);
+			return next;
+		});
 	}
 
 	/** Snapshot copy of tracker.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
-	backupTo(dest: string): void {
-		vacuumInto(this.db, dest, ["kv"]);
+	async backupTo(dest: string): Promise<void> {
+		return this.queue.run(() => {
+			vacuumInto(this.db, dest, ["kv"]);
+		});
 	}
 
-	close(): void {
-		if (this.closed) return; // a closed handle must never be used twice
-		this.closed = true;
-		closeLocked(this.db);
+	async close(): Promise<void> {
+		return this.queue.close(() => closeLocked(this.db));
 	}
 }

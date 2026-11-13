@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	BACKUP_INTERVAL_MS,
+	type BackupResult,
 	type BackupSource,
 	backupDue,
 	backupSources,
@@ -55,11 +56,11 @@ const after = (ms: number): Date => new Date(T0.getTime() + ms);
 
 const good = (file: string, body = "copy"): BackupSource => ({
 	file,
-	backupTo: (dest) => writeFileSync(dest, body),
+	backupTo: async (dest) => writeFileSync(dest, body),
 });
 const bad = (file: string, error: string): BackupSource => ({
 	file,
-	backupTo: () => {
+	backupTo: async () => {
 		throw new Error(error);
 	},
 });
@@ -303,11 +304,13 @@ describe("resolveBackup", () => {
 });
 
 describe("backupSources", () => {
-	test("gives the snapshot layout and copies through each store", () => {
+	test("gives the snapshot layout and copies through each store", async () => {
 		const calls: string[] = [];
 		const store = (name: string) => ({
 			name,
-			backupTo: (dest: string) => calls.push(`${name} -> ${dest}`),
+			backupTo: async (dest: string) => {
+				calls.push(`${name} -> ${dest}`);
+			},
 		});
 		const projects = new Set([store("alpha"), store("beta")]);
 		const sources = backupSources(store("tracker"), projects);
@@ -316,7 +319,7 @@ describe("backupSources", () => {
 			"projects/alpha/tasks.db",
 			"projects/beta/tasks.db",
 		]);
-		for (const source of sources) source.backupTo(`/x/${source.file}`);
+		for (const source of sources) await source.backupTo(`/x/${source.file}`);
 		expect(calls).toEqual([
 			"tracker -> /x/tracker.db",
 			"alpha -> /x/projects/alpha/tasks.db",
@@ -324,30 +327,30 @@ describe("backupSources", () => {
 		]);
 	});
 
-	test("a project that the board did not open is a source that fails with the open error", () => {
-		const never = { backupTo: () => expect.unreachable() };
+	test("a project that the board did not open is a source that fails with the open error", async () => {
+		const never = { backupTo: async () => expect.unreachable() };
 		const sources = backupSources(never, [], [{ name: "demo", error: "boom" }]);
 		expect(sources.map((source) => source.file)).toEqual([
 			"tracker.db",
 			"projects/demo/tasks.db",
 		]);
-		expect(() => sources[1]?.backupTo("/x/never")).toThrow(
+		await expect(sources[1]!.backupTo("/x/never")).rejects.toThrow(
 			"the board did not open this database: boom",
 		);
 	});
 
-	test("a corrupt project database counts as failed, and retention keeps its last good copy", () => {
+	test("a corrupt project database counts as failed, and retention keeps its last good copy", async () => {
 		const base = tmp("unopened");
 		const dir = join(base, "backups");
 		const projectPath = join(base, "roots", "demo");
 		mkdirSync(projectPath, { recursive: true });
-		const gstore = GlobalStore.open(join(base, "state"));
+		const gstore = await GlobalStore.open(join(base, "state"));
 		try {
-			const store = ProjectStore.open(projectPath);
+			const store = await ProjectStore.open(projectPath);
 			const dbFile = join(store.serverDir, "tasks.db");
 			try {
-				store.createTask("the card of the last good copy");
-				const first = runBackup({
+				await store.createTask("the card of the last good copy");
+				const first = await runBackup({
 					dir,
 					keep: 1,
 					now: T0,
@@ -355,20 +358,20 @@ describe("backupSources", () => {
 				});
 				expect(first.failed).toEqual([]);
 			} finally {
-				store.close();
+				await store.close();
 			}
 
 			// The board's boot path: the open throws, and the project stays off the board.
 			writeFileSync(dbFile, "not a sqlite file at all");
 			let openError = "";
 			try {
-				ProjectStore.open(projectPath).close();
+				await (await ProjectStore.open(projectPath)).close();
 			} catch (err) {
 				openError = (err as Error).message;
 			}
 			expect(openError).not.toBe("");
 
-			const result = runBackup({
+			const result = await runBackup({
 				dir,
 				keep: 1,
 				now: after(DAY),
@@ -400,7 +403,7 @@ describe("backupSources", () => {
 				copy.close();
 			}
 		} finally {
-			gstore.close();
+			await gstore.close();
 		}
 	});
 });
@@ -412,8 +415,8 @@ describe("backupDue and backupTick", () => {
 	) => {
 		const lines: string[] = [];
 		let asked = 0;
-		const tick = (now: Date, keep = 7): void =>
-			backupTick({
+		const tick = async (now: Date, keep = 7): Promise<void> =>
+			await backupTick({
 				dir,
 				keep,
 				now,
@@ -426,12 +429,12 @@ describe("backupDue and backupTick", () => {
 		return { lines, tick, asked: () => asked };
 	};
 
-	test("the first tick makes a snapshot, the next one is due at exactly 24 hours", () => {
+	test("the first tick makes a snapshot, the next one is due at exactly 24 hours", async () => {
 		const dir = join(tmp("tick"), "backups");
 		const t = ticker(dir);
 		expect(BACKUP_INTERVAL_MS).toBe(DAY);
 		expect(backupDue(dir, T0)).toBe(true);
-		t.tick(T0);
+		await t.tick(T0);
 		expect(listSnapshots(dir)).toEqual([S0]);
 		expect(readdirSync(join(dir, S0)).sort()).toEqual([
 			"snapshot.json",
@@ -443,15 +446,15 @@ describe("backupDue and backupTick", () => {
 
 		const early = after(DAY - 1000);
 		expect(backupDue(dir, early)).toBe(false);
-		t.tick(after(HOUR));
-		t.tick(early);
-		t.tick(after(DAY - 1));
+		await t.tick(after(HOUR));
+		await t.tick(early);
+		await t.tick(after(DAY - 1));
 		expect(listSnapshots(dir)).toEqual([S0]);
 		expect(t.asked()).toBe(1);
 		expect(t.lines.length).toBe(1);
 
 		expect(backupDue(dir, after(DAY))).toBe(true);
-		t.tick(after(DAY));
+		await t.tick(after(DAY));
 		expect(listSnapshots(dir)).toEqual([S1, S0]);
 		expect(t.asked()).toBe(2);
 	});
@@ -462,51 +465,51 @@ describe("backupDue and backupTick", () => {
 		expect(backupDue(dir, after(HOUR))).toBe(true);
 	});
 
-	test("keep 0 makes no snapshot and asks for no sources", () => {
+	test("keep 0 makes no snapshot and asks for no sources", async () => {
 		const dir = join(tmp("tick-off"), "backups");
 		const t = ticker(dir);
-		t.tick(T0, 0);
-		t.tick(T0, -1);
+		await t.tick(T0, 0);
+		await t.tick(T0, -1);
 		expect(existsSync(dir)).toBe(false);
 		expect(t.asked()).toBe(0);
 		expect(t.lines).toEqual([]);
 	});
 
-	test("the tick reports the number of removed snapshots", () => {
+	test("the tick reports the number of removed snapshots", async () => {
 		const dir = tmp("tick-prune");
 		const t = ticker(dir);
-		t.tick(T0, 1);
-		t.tick(after(DAY), 1);
+		await t.tick(T0, 1);
+		await t.tick(after(DAY), 1);
 		expect(listSnapshots(dir)).toEqual([S1]);
 		expect(t.lines[1]).toBe(
 			`backup: snapshot ${S1}: 1 databases, removed 1 old snapshots`,
 		);
 	});
 
-	test("a throwing sources() is logged and does not throw", () => {
+	test("a throwing sources() is logged and does not throw", async () => {
 		const dir = tmp("tick-throw");
 		const t = ticker(dir, () => {
 			throw new Error("boom");
 		});
-		t.tick(T0);
+		await t.tick(T0);
 		expect(t.lines).toEqual(["backup: failed: boom"]);
 		expect(readdirSync(dir)).toEqual([]);
 	});
 
-	test("each failed database gets a log line with its file and error", () => {
+	test("each failed database gets a log line with its file and error", async () => {
 		const dir = tmp("tick-fail");
 		const t = ticker(dir, () => [
 			good("tracker.db"),
 			bad("projects/p/tasks.db", "disk full"),
 		]);
-		t.tick(T0);
+		await t.tick(T0);
 		expect(t.lines).toEqual([
 			`backup: snapshot ${S0}: 1 databases, removed 0 old snapshots`,
 			"backup: projects/p/tasks.db failed: disk full",
 		]);
 	});
 
-	test("a tick in which all databases fail keeps no snapshot, and the next tick tries again", () => {
+	test("a tick in which all databases fail keeps no snapshot, and the next tick tries again", async () => {
 		const dir = tmp("tick-all-fail");
 		let broken = true;
 		const t = ticker(dir, () =>
@@ -514,7 +517,7 @@ describe("backupDue and backupTick", () => {
 				? [bad("tracker.db", "locked"), bad("projects/p/tasks.db", "gone")]
 				: [good("tracker.db")],
 		);
-		t.tick(T0);
+		await t.tick(T0);
 		expect(t.lines).toEqual([
 			"backup: no snapshot: all 2 databases failed",
 			"backup: tracker.db failed: locked",
@@ -522,36 +525,143 @@ describe("backupDue and backupTick", () => {
 		]);
 		expect(readdirSync(dir)).toEqual([]);
 		broken = false;
-		t.tick(after(HOUR));
+		await t.tick(after(HOUR));
 		expect(listSnapshots(dir)).toEqual(["20261110T041500Z"]);
 	});
 
-	test("a backup dir that cannot be made is logged, and the tick does not throw", () => {
+	test("a backup dir that cannot be made is logged, and the tick does not throw", async () => {
 		const file = join(tmp("tick-nodir"), "a-file");
 		writeFileSync(file, "in the way");
 		const t = ticker(join(file, "backups"));
-		t.tick(T0);
+		await t.tick(T0);
 		expect(t.lines.length).toBe(1);
 		expect(t.lines[0]).toStartWith("backup: failed: ");
 	});
 });
 
 describe("runBackup", () => {
-	const run = (
+	const run = async (
 		dir: string,
 		now: Date,
 		keep: number,
 		sources: BackupSource[] = [good("tracker.db")],
-	) => runBackup({ dir, keep, now, sources });
+	) => await runBackup({ dir, keep, now, sources });
 
-	test("keep 2: the third good snapshot removes the oldest, foreign entries stay", () => {
+	test("a delayed real snapshot precedes manifest, rename, retention, and log output", async () => {
+		const dir = tmp("delayed-copy");
+		const store = await GlobalStore.open(tmp("delayed-state"));
+		const copied = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const lines: string[] = [];
+		let pending: Promise<void> | undefined;
+		try {
+			await store.set("value", "old");
+			await run(dir, T0, 1, backupSources(store, []));
+			await store.set("value", "new");
+			pending = backupTick({
+				dir,
+				keep: 1,
+				now: after(DAY),
+				sources: () => [
+					{
+						file: "tracker.db",
+						backupTo: async (dest) => {
+							await store.backupTo(dest);
+							copied.resolve();
+							await release.promise;
+						},
+					},
+				],
+				log: (line) => lines.push(line),
+			});
+			await copied.promise;
+			expect(listSnapshots(dir)).toEqual([S0]);
+			expect(existsSync(join(dir, `${S1}.partial`, "tracker.db"))).toBe(true);
+			expect(existsSync(join(dir, `${S1}.partial`, "snapshot.json"))).toBe(
+				false,
+			);
+			expect(existsSync(join(dir, S1))).toBe(false);
+			expect(lines).toEqual([]);
+			release.resolve();
+			await pending;
+			expect(listSnapshots(dir)).toEqual([S1]);
+			expect(readManifest(dir, S1)).toEqual({
+				copied: ["tracker.db"],
+				failed: [],
+			});
+			expect(lines).toEqual([
+				`backup: snapshot ${S1}: 1 databases, removed 1 old snapshots`,
+			]);
+			const copy = new Database(join(dir, S1, "tracker.db"));
+			try {
+				expect(
+					copy
+						.query<{ value: string }, []>(
+							"SELECT value FROM kv WHERE key = 'value'",
+						)
+						.get()?.value,
+				).toBe('"new"');
+			} finally {
+				copy.close();
+			}
+		} finally {
+			release.resolve();
+			await pending;
+			await store.close();
+		}
+	});
+
+	test("a delayed copy failure removes its real copy before the manifest and keeps retention", async () => {
+		const dir = tmp("delayed-failure");
+		const store = await GlobalStore.open(tmp("delayed-failure-state"));
+		const copied = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let pending: Promise<BackupResult> | undefined;
+		try {
+			await store.set("value", "saved");
+			await run(dir, T0, 1, backupSources(store, []));
+			pending = run(dir, after(DAY), 1, [
+				{
+					file: "tracker.db",
+					backupTo: async (dest) => {
+						await store.backupTo(dest);
+						copied.resolve();
+						await release.promise;
+						throw new Error("delayed integrity failure");
+					},
+				},
+				good("projects/demo/tasks.db"),
+			]);
+			await copied.promise;
+			expect(readManifest(dir, S1)).toBeNull();
+			expect(listSnapshots(dir)).toEqual([S0]);
+			release.resolve();
+			const result = await pending;
+			expect(result.failed).toEqual([
+				{ file: "tracker.db", error: "delayed integrity failure" },
+			]);
+			expect(result.pruned).toEqual([]);
+			expect(listSnapshots(dir)).toEqual([S1, S0]);
+			expect(existsSync(join(dir, S1, "tracker.db"))).toBe(false);
+			expect(readManifest(dir, S1)).toEqual({
+				copied: ["projects/demo/tasks.db"],
+				failed: [{ file: "tracker.db", error: "delayed integrity failure" }],
+			});
+		} finally {
+			release.resolve();
+			await pending;
+			await store.close();
+		}
+	});
+
+	test("keep 2: the third good snapshot removes the oldest, foreign entries stay", async () => {
 		const dir = tmp("keep");
 		writeFileSync(join(dir, "notes.txt"), "mine");
 		mkdirSync(join(dir, "manual-copy"));
 		writeFileSync(join(dir, "manual-copy", "tracker.db"), "by hand");
-		expect(run(dir, T0, 2).pruned).toEqual([]);
-		expect(run(dir, after(DAY), 2).pruned).toEqual([]);
-		expect(run(dir, after(2 * DAY), 2)).toEqual({
+		expect((await run(dir, T0, 2)).pruned).toEqual([]);
+		expect((await run(dir, after(DAY), 2)).pruned).toEqual([]);
+		expect(await run(dir, after(2 * DAY), 2)).toEqual({
 			stamp: S2,
 			copied: ["tracker.db"],
 			failed: [],
@@ -570,37 +680,37 @@ describe("runBackup", () => {
 		expect(readFileSync(join(dir, S2, "tracker.db"), "utf8")).toBe("copy");
 	});
 
-	test("retention removes only real directories with a canonical stamp name", () => {
+	test("retention removes only real directories with a canonical stamp name", async () => {
 		const dir = tmp("keep-foreign");
 		const foreignDirs = ["20261340T000000Z", "20200101T000000Z.bak", "old"];
 		for (const name of foreignDirs) mkdirSync(join(dir, name));
 		writeFileSync(join(dir, "20200101T000000Z"), "a file with a stamp name");
 		mkdirSync(join(dir, "20200102T000000Z"));
-		const result = run(dir, T0, 1);
+		const result = await run(dir, T0, 1);
 		expect(result.pruned).toEqual(["20200102T000000Z"]);
 		expect(readdirSync(dir).sort()).toEqual(
 			[...foreignDirs, "20200101T000000Z", S0].sort(),
 		);
 	});
 
-	test("keep below 1 never removes the snapshot of the run itself", () => {
+	test("keep below 1 never removes the snapshot of the run itself", async () => {
 		const dir = tmp("keep-zero");
-		run(dir, T0, 1);
-		expect(run(dir, after(DAY), 0).pruned).toEqual([S0]);
+		await run(dir, T0, 1);
+		expect((await run(dir, after(DAY), 0)).pruned).toEqual([S0]);
 		expect(listSnapshots(dir)).toEqual([S1]);
 	});
 
-	test("a failed source removes nothing, and the snapshot holds the copies that passed", () => {
+	test("a failed source removes nothing, and the snapshot holds the copies that passed", async () => {
 		const dir = tmp("one-fails");
-		run(dir, T0, 1);
+		await run(dir, T0, 1);
 		const halfWritten: BackupSource = {
 			file: "projects/half/tasks.db",
-			backupTo: (dest) => {
+			backupTo: async (dest) => {
 				writeFileSync(dest, "half a copy");
 				throw new Error("tasks count mismatch: 3 vs 2 in copy");
 			},
 		};
-		const result = run(dir, after(DAY), 1, [
+		const result = await run(dir, after(DAY), 1, [
 			good("tracker.db", "tracker"),
 			bad("projects/down/tasks.db", "disk full"),
 			halfWritten,
@@ -626,18 +736,18 @@ describe("runBackup", () => {
 		expect(existsSync(join(snap, "projects/half/tasks.db"))).toBe(false);
 
 		// The next run in which all sources pass applies retention again.
-		expect(run(dir, after(2 * DAY), 1).pruned).toEqual([S1, S0]);
+		expect((await run(dir, after(2 * DAY), 1)).pruned).toEqual([S1, S0]);
 		expect(listSnapshots(dir)).toEqual([S2]);
 	});
 
-	test("a snapshot holds a manifest of the copies that passed and the copies that failed", () => {
+	test("a snapshot holds a manifest of the copies that passed and the copies that failed", async () => {
 		const dir = tmp("manifest");
-		run(dir, T0, 7);
+		await run(dir, T0, 7);
 		expect(readManifest(dir, S0)).toEqual({
 			copied: ["tracker.db"],
 			failed: [],
 		});
-		run(dir, after(DAY), 7, [
+		await run(dir, after(DAY), 7, [
 			good("tracker.db"),
 			bad("projects/down/tasks.db", "disk full"),
 		]);
@@ -647,10 +757,10 @@ describe("runBackup", () => {
 		});
 	});
 
-	test("a run in which all sources fail leaves no new dir", () => {
+	test("a run in which all sources fail leaves no new dir", async () => {
 		const dir = tmp("all-fail");
-		run(dir, T0, 1);
-		const result = run(dir, after(DAY), 1, [
+		await run(dir, T0, 1);
+		const result = await run(dir, after(DAY), 1, [
 			bad("tracker.db", "locked"),
 			bad("projects/p/tasks.db", "gone"),
 		]);
@@ -666,23 +776,23 @@ describe("runBackup", () => {
 		expect(readdirSync(dir)).toEqual([S0]);
 	});
 
-	test("a run removes a leftover partial snapshot and no other entry", () => {
+	test("a run removes a leftover partial snapshot and no other entry", async () => {
 		const dir = tmp("partial");
 		const stale = `${S0}.partial`;
 		const foreign = ["x.partial", "20261340T000000Z.partial", "partial"];
 		mkdirSync(join(dir, stale, "projects", "p"), { recursive: true });
 		writeFileSync(join(dir, stale, "tracker.db"), "half a snapshot");
 		for (const name of foreign) mkdirSync(join(dir, name));
-		expect(run(dir, after(DAY), 7).stamp).toBe(S1);
+		expect((await run(dir, after(DAY), 7)).stamp).toBe(S1);
 		expect(readdirSync(dir).sort()).toEqual([...foreign, S1].sort());
 	});
 
-	test("a source file that is not a relative path inside the snapshot fails", () => {
+	test("a source file that is not a relative path inside the snapshot fails", async () => {
 		const dir = join(tmp("unsafe"), "backups");
 		const called: string[] = [];
 		const source = (file: string): BackupSource => ({
 			file,
-			backupTo: (dest) => {
+			backupTo: async (dest) => {
 				called.push(file);
 				writeFileSync(dest, "copy");
 			},
@@ -694,7 +804,7 @@ describe("runBackup", () => {
 			join(dirname(dir), "absolute.db"),
 			"",
 		];
-		const result = run(dir, T0, 7, [
+		const result = await run(dir, T0, 7, [
 			...unsafe.map(source),
 			source("tracker.db"),
 		]);
@@ -709,9 +819,9 @@ describe("runBackup", () => {
 		]);
 	});
 
-	test("a second source for one file fails and keeps the first copy", () => {
+	test("a second source for one file fails and keeps the first copy", async () => {
 		const dir = tmp("twice");
-		const result = run(dir, T0, 7, [
+		const result = await run(dir, T0, 7, [
 			good("tracker.db", "first"),
 			good("tracker.db", "second"),
 		]);
@@ -722,17 +832,17 @@ describe("runBackup", () => {
 		expect(readFileSync(join(dir, S0, "tracker.db"), "utf8")).toBe("first");
 	});
 
-	test("a second run with the same time throws, and the first snapshot still opens", () => {
+	test("a second run with the same time throws, and the first snapshot still opens", async () => {
 		const dir = tmp("same-second");
-		const gstore = GlobalStore.open(tmp("same-second-state"));
+		const gstore = await GlobalStore.open(tmp("same-second-state"));
 		try {
-			gstore.set("k", "first");
+			await gstore.set("k", "first");
 			const sources = () => backupSources(gstore, []);
-			expect(run(dir, T0, 7, sources()).stamp).toBe(S0);
-			gstore.set("k", "second");
-			expect(() => run(dir, T0, 7, sources())).toThrow(S0);
+			expect((await run(dir, T0, 7, sources())).stamp).toBe(S0);
+			await gstore.set("k", "second");
+			await expect(run(dir, T0, 7, sources())).rejects.toThrow(S0);
 		} finally {
-			gstore.close();
+			await gstore.close();
 		}
 		expect(readdirSync(dir)).toEqual([S0]);
 		const copy = new Database(join(dir, S0, "tracker.db"));
@@ -746,7 +856,7 @@ describe("runBackup", () => {
 		}
 	});
 
-	test("property: retention keeps each foreign entry and exactly the newest snapshots", () => {
+	test("property: retention keeps each foreign entry and exactly the newest snapshots", async () => {
 		const base = tmp("retention-property");
 		const now = new Date("2040-01-01T00:00:00Z");
 		const stampArb = fc
@@ -771,15 +881,15 @@ describe("runBackup", () => {
 			),
 		);
 		let runs = 0;
-		fc.assert(
-			fc.property(
+		await fc.assert(
+			fc.asyncProperty(
 				fc.uniqueArray(stampArb, { maxLength: 8 }),
 				fc.uniqueArray(fc.tuple(foreignArb, fc.boolean()), {
 					maxLength: 5,
 					selector: ([name]) => name,
 				}),
 				fc.integer({ min: 1, max: 5 }),
-				(stamps, foreign, keep) => {
+				async (stamps, foreign, keep) => {
 					const dir = join(base, String(runs++));
 					mkdirSync(dir);
 					for (const stamp of stamps) mkdirSync(join(dir, stamp));
@@ -787,7 +897,7 @@ describe("runBackup", () => {
 						if (asDir) mkdirSync(join(dir, name));
 						else writeFileSync(join(dir, name), "foreign");
 					}
-					const result = run(dir, now, keep);
+					const result = await run(dir, now, keep);
 					const all = [...stamps, formatStamp(now)].sort().reverse();
 					expect(listSnapshots(dir)).toEqual(all.slice(0, keep));
 					expect(result.pruned).toEqual(all.slice(keep));

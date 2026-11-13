@@ -635,7 +635,10 @@ export function createHostedGitAuth(o: {
 	/** The project that owns cwd and its pinned origin; null when no project does. */
 	projectFor: (
 		cwd: string,
-	) => { name: string; originUrl: string | null } | null;
+	) =>
+		| { name: string; originUrl: string | null }
+		| null
+		| Promise<{ name: string; originUrl: string | null } | null>;
 	knownHosts: string;
 	log: (scope: string, err: unknown) => void;
 	now?: () => number;
@@ -738,7 +741,7 @@ export function createHostedGitAuth(o: {
 	};
 	return {
 		async network(cwd, args) {
-			const p = o.projectFor(cwd);
+			const p = await o.projectFor(cwd);
 			return p === null
 				? envAndSecrets([], null)
 				: mintedAuth(p.name, hostedRemote(args, p.originUrl));
@@ -749,7 +752,7 @@ export function createHostedGitAuth(o: {
 			return mintedAuth(name, remote);
 		},
 		async ghToken(cwd, remote) {
-			const p = o.projectFor(cwd);
+			const p = await o.projectFor(cwd);
 			return p === null || httpsHost(remote) === null
 				? null
 				: token(p.name, remote);

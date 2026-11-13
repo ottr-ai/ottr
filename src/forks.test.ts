@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
 	existsSync,
@@ -26,15 +27,24 @@ import {
 	rangeCommits,
 } from "./forks.ts";
 import { ProjectStore } from "./store.ts";
+import type { ForkAnalysisResult } from "./types.ts";
 import { git, gitExe, spawnPiped } from "./worktree.ts";
 
 let root: string;
+const stores: ProjectStore[] = [];
+
+async function initStore(path: string): Promise<ProjectStore> {
+	const store = await ProjectStore.init(path);
+	stores.push(store);
+	return store;
+}
 
 beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-forks-"));
 });
 
-afterAll(() => {
+afterAll(async () => {
+	for (const store of stores) await store.close();
 	rmSync(root, { recursive: true, force: true });
 });
 
@@ -409,8 +419,8 @@ describe("watcher", () => {
 		analyzeImpl: (r: unknown) => Promise<unknown>,
 	) {
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const gh: GhFn = async () => ({
 			code: 0,
 			stdout: JSON.stringify([forkPageEntry(1)]),
@@ -468,28 +478,31 @@ describe("watcher", () => {
 		await makeFork("watch-ok-fork", main);
 		await watcher.tick();
 		expect(calls()).toBe(1);
-		const card = store
-			.listTasks()
-			.find((t) => t.topic === "fork research" && t.followUpOf === null);
+		const card = (await store.listTasks()).find(
+			(t) => t.topic === "fork research" && t.followUpOf === null,
+		);
 		expect(card).toBeDefined();
 		expect(card!.research).toBe(true);
 		expect(card!.stage).toBe("done");
 		expect(card!.title).toContain("Fork research: o/r");
-		const proposal = store.listTasks().find((t) => t.followUpOf === card!.id);
+		const proposal = (await store.listTasks()).find(
+			(t) => t.followUpOf === card!.id,
+		);
 		expect(proposal).toBeDefined();
 		expect(proposal!.state).toBe("needs_you");
 		// The reason names the fork research card once by id; the drawer links that id.
 		expect(proposal!.needsReason).toBe(
 			`Fork proposal from ${card!.id}. Accept starts it. Edit task changes the prompt first. Cancel task declines it.`,
 		);
-		const row = store.listAllForkBranches()[0]!;
+		const row = (await store.listAllForkBranches())[0]!;
 		expect(row.analyzedHead).toBe(row.head);
 		expect(row.firstPendingAt).toBeNull();
 		// Second tick: cursor advanced, nothing pending, no duplicate card.
 		await watcher.tick();
 		expect(calls()).toBe(1);
 		expect(
-			store.listTasks().filter((t) => t.topic === "fork research").length,
+			(await store.listTasks()).filter((t) => t.topic === "fork research")
+				.length,
 		).toBe(1);
 	});
 
@@ -505,8 +518,8 @@ describe("watcher", () => {
 		try {
 			const name = "watch-serverdir";
 			const main = await initUpstream(name);
-			const store = ProjectStore.init(main);
-			store.setSettings({ forkResearch: true });
+			const store = await initStore(main);
+			await store.setSettings({ forkResearch: true });
 			await makeFork(`${name}-fork`, main);
 			const calls: { args: string[]; cwd: string }[] = [];
 			const inner = localFileGit(join(root, `${name}-fork`));
@@ -569,11 +582,11 @@ describe("watcher", () => {
 		await makeFork("watch-fail-fork", main);
 		await watcher.tick();
 		expect(calls()).toBe(1);
-		const row = store.listAllForkBranches()[0]!;
+		const row = (await store.listAllForkBranches())[0]!;
 		expect(row.retries).toBe(1);
 		expect(row.lastError).toContain("model offline");
 		expect(row.analyzedHead).toBeNull();
-		expect(store.listTasks().length).toBe(0);
+		expect((await store.listTasks()).length).toBe(0);
 	});
 
 	/** Publishes `branch` of `forkDir` as the upstream pull ref of PR `n`, as GitHub does. */
@@ -616,6 +629,11 @@ describe("watcher", () => {
 		store: ProjectStore,
 		forks: Array<{ id: number; owner: string; dir: string }>,
 		pulls: unknown[],
+		hooks: {
+			beforeGit?: (args: string[]) => Promise<void>;
+			beforeAnalyze?: () => Promise<void>;
+			proposals?: ForkAnalysisResult["proposals"];
+		} = {},
 	) {
 		const state = {
 			pulls,
@@ -652,7 +670,8 @@ describe("watcher", () => {
 							}));
 				return { code: 0, stdout: JSON.stringify(body), stderr: "" };
 			},
-			git: (args, cwd, timeoutMs) => {
+			git: async (args, cwd, timeoutMs) => {
+				await hooks.beforeGit?.(args);
 				const at = args.indexOf("fetch");
 				const mapped = args.map((a) => urls.get(a) ?? a);
 				return git(
@@ -671,9 +690,10 @@ describe("watcher", () => {
 			analyze: async (range) => {
 				state.subjects.push(range.commits.map((c) => c.subject));
 				state.merges.push(range.merges.length);
+				await hooks.beforeAnalyze?.();
 				return {
 					features: [],
-					proposals: [],
+					proposals: hooks.proposals ?? [],
 					coverage: "",
 					commits: range.commits.map((c) => c.sha),
 					deferred: [],
@@ -694,8 +714,8 @@ describe("watcher", () => {
 	test("commits of an open PR branch stay out of the range, also on a child branch", async () => {
 		const name = "watch-pr-child";
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkDir = await makeFork(`${name}-fork`, main);
 		await run(["checkout", "-q", "-b", "independent", forkDir], forkDir);
 		await commitFile(forkDir, "own.txt", "own work");
@@ -710,21 +730,23 @@ describe("watcher", () => {
 		await watcher.tick();
 		expect(state.ghCalls.filter((u) => u.includes("/pulls")).length).toBe(1);
 		expect(state.subjects).toEqual([["own work"]]);
-		const feat = store.listAllForkBranches().find((r) => r.branch === "feat")!;
+		const feat = (await store.listAllForkBranches()).find(
+			(r) => r.branch === "feat",
+		)!;
 		// The per-commit model advances the cursor through held work: the PR commits
 		// are held rows, so they stay out of the analysis while the PR is open.
 		expect(feat.analyzedHead).toBe(feat.head);
 		expect(feat.retries).toBe(0);
-		expect(store.listForkHolds(1).some((h) => h.sha === pr.head.sha)).toBe(
-			true,
-		);
+		expect(
+			(await store.listForkHolds(1)).some((h) => h.sha === pr.head.sha),
+		).toBe(true);
 	});
 
 	test("commits of an open PR from one fork stay out of another fork's range", async () => {
 		const name = "watch-pr-cross";
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkA = mkRepo(`${name}-a`);
 		await run(["clone", "-q", main, forkA], root);
 		await run(["checkout", "-q", "-b", "feat", forkA], forkA);
@@ -753,8 +775,8 @@ describe("watcher", () => {
 	test("a range emptied by an open PR files nothing and does not pause the fork", async () => {
 		const name = "watch-pr";
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkDir = await makeFork(`${name}-fork`, main);
 		const pr = await openPr(main, forkDir, "feat", 2);
 		const { watcher, state } = prWatcher(
@@ -767,9 +789,9 @@ describe("watcher", () => {
 		await watcher.tick();
 		// The fork's unchanged main is pending too, but it carries no new commit.
 		expect(state.subjects).toEqual([]);
-		expect(store.listTasks().length).toBe(0);
-		expect(store.forkRunsSince(0)).toBe(0);
-		for (const r of store.listAllForkBranches()) {
+		expect((await store.listTasks()).length).toBe(0);
+		expect(await store.forkRunsSince(0)).toBe(0);
+		for (const r of await store.listAllForkBranches()) {
 			expect(r.lastRunAt).toBeNull();
 			expect(r.retries).toBe(0);
 		}
@@ -786,8 +808,8 @@ describe("watcher", () => {
 		const name = "watch-merge-only";
 		const main = await initUpstream(name);
 		await commitFile(main, "up.txt", "upstream work");
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkDir = mkRepo(`${name}-fork`);
 		await run(["clone", "-q", main, forkDir], root);
 		await run(["checkout", "-q", "-b", "feat", "HEAD~1", forkDir], forkDir);
@@ -812,8 +834,8 @@ describe("watcher", () => {
 	test("work held by a PR of the project's own branch comes back when the PR closes unmerged", async () => {
 		const name = "watch-hold-empty";
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkDir = await makeFork(`${name}-fork`, main);
 		// Head repo 99 is the project itself: the fork branch only copies the PR's commit.
 		const pr = await openPr(main, forkDir, "feat", 2, 99);
@@ -826,9 +848,9 @@ describe("watcher", () => {
 		);
 		await watcher.tick();
 		expect(state.subjects).toEqual([]);
-		const feat = () =>
-			store.listAllForkBranches().find((r) => r.branch === "feat")!;
-		expect(feat().analyzedHead).toBe(feat().head);
+		const feat = async () =>
+			(await store.listAllForkBranches()).find((r) => r.branch === "feat")!;
+		expect((await feat()).analyzedHead).toBe((await feat()).head);
 		state.pulls = [];
 		state.closed.set(2, { merged_at: null, head: pr.head.sha });
 		state.clock += 2 * DAY;
@@ -839,8 +861,8 @@ describe("watcher", () => {
 	test("work held next to analyzed work comes back when the PR closes unmerged", async () => {
 		const name = "watch-hold-mixed";
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkDir = mkRepo(`${name}-fork`);
 		await run(["clone", "-q", main, forkDir], root);
 		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
@@ -884,17 +906,17 @@ describe("watcher", () => {
 			state.clock += 2 * DAY;
 			await watcher.tick();
 			expect(state.subjects.length).toBe(before);
-			const feat = store
-				.listAllForkBranches()
-				.find((r) => r.branch === "feat")!;
+			const feat = (await store.listAllForkBranches()).find(
+				(r) => r.branch === "feat",
+			)!;
 			expect(feat.analyzedHead).toBe(feat.head);
 		});
 
 	/** A fork whose `feat` holds "PR work" (and optionally "Other work" on top) behind PR 2. */
 	async function heldPrFork(name: string, other: boolean) {
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const forkDir = mkRepo(`${name}-fork`);
 		await run(["clone", "-q", main, forkDir], root);
 		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
@@ -962,8 +984,8 @@ describe("watcher", () => {
 	test("a failed open-PR listing ports nothing", async () => {
 		const name = "watch-pr-fail";
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		await makeFork(`${name}-fork`, main);
 		let analyzeCalls = 0;
 		const logs: string[] = [];
@@ -988,7 +1010,7 @@ describe("watcher", () => {
 		await watcher.tick();
 		expect(analyzeCalls).toBe(0);
 		expect(logs.some((m) => m.includes("HTTP 502"))).toBe(true);
-		expect(store.listTasks().length).toBe(0);
+		expect((await store.listTasks()).length).toBe(0);
 	});
 
 	test("daily cap blocks the fourth run in 24h", async () => {
@@ -1001,15 +1023,445 @@ describe("watcher", () => {
 		await makeFork("watch-cap-fork", main);
 		const now = Date.now();
 		for (let i = 0; i < FORK_GATES.PROJECT_DAILY_RUNS; i++)
-			store.recordForkRun(1, now - i * 1000);
+			await store.recordForkRun(1, now - i * 1000);
 		await watcher.tick();
 		expect(calls()).toBe(0);
 	});
 
+	for (const cap of ["daily", "proposals"] as const) {
+		test(`concurrent fork analyses respect the ${cap} cap and retain serial events`, async () => {
+			const name = `watch-concurrent-${cap}`;
+			const main = await initUpstream(name);
+			const store = await initStore(main);
+			await store.setSettings({ forkResearch: true });
+			const forks = [
+				{ id: 1, owner: "a", dir: await makeFork(`${name}-a`, main) },
+				{ id: 2, owner: "b", dir: await makeFork(`${name}-b`, main) },
+			];
+			for (const fork of forks) {
+				await commitFile(fork.dir, "feature.txt", "fork feature");
+				await ensureCache(
+					store.serverDir,
+					{
+						id: fork.id,
+						owner: fork.owner,
+						name: "r",
+						defaultBranch: "feat",
+						pushedAt: null,
+						sizeKb: 1,
+					},
+					git,
+				);
+			}
+			if (cap === "daily") {
+				for (let i = 0; i < FORK_GATES.PROJECT_DAILY_RUNS - 1; i++)
+					await store.recordForkRun(99, Date.now() - i * 1000);
+			}
+			const gate = Promise.withResolvers<void>();
+			let arrivals = 0;
+			const hooks = {
+				beforeGit: async (args: string[]) => {
+					if (args[0] !== "ls-tree") return;
+					arrivals++;
+					if (arrivals === 2) gate.resolve();
+					await gate.promise;
+				},
+				proposals: Array.from({ length: 3 }, (_, i) => ({
+					title: `proposal ${i}`,
+					goal: "goal",
+					comparison: "comparison",
+					change: "change",
+					checks: "checks",
+					risk: "risk",
+					effort: "S" as const,
+					commits: [],
+				})),
+			};
+			const a = prWatcher(name, main, store, forks, [], hooks);
+			const b = prWatcher(name, main, store, [...forks].reverse(), [], hooks);
+			await Promise.all([a.watcher.tick(), b.watcher.tick()]);
+			const cards = await store.listTasks();
+			const results = cards.filter((task) => task.topic === "fork research");
+			const proposals = cards.filter((task) => task.followUpOf !== null);
+			expect(results.length).toBe(cap === "daily" ? 1 : 2);
+			expect(proposals.length).toBe(3);
+			expect(await store.forkRunsSince(0)).toBe(cap === "daily" ? 3 : 2);
+			expect(
+				(await store.events()).filter((event) => event.kind === "create")
+					.length,
+			).toBe(cards.length);
+			for (const result of results) {
+				expect(result.stage).toBe("done");
+				expect(result.report).toContain("fork feature");
+			}
+			const advanced = (await store.listAllForkBranches()).filter(
+				(row) => row.branch === "feat" && row.analyzedHead === row.head,
+			);
+			expect(advanced.length).toBe(results.length);
+		});
+	}
+
+	for (const changed of ["branch", "holds", "settings"] as const) {
+		test(`a model result does not overwrite a newer ${changed} state`, async () => {
+			const name = `watch-final-${changed}`;
+			const main = await initUpstream(name);
+			const store = await initStore(main);
+			await store.setSettings({ forkResearch: true });
+			const dir = await makeFork(`${name}-fork`, main);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const { watcher } = prWatcher(
+				name,
+				main,
+				store,
+				[{ id: 1, owner: "o", dir }],
+				[],
+				{
+					beforeAnalyze: async () => {
+						entered.resolve();
+						await release.promise;
+					},
+				},
+			);
+			const tick = watcher.tick();
+			await entered.promise;
+			const row = (await store.listForkBranches(1)).find(
+				(r) => r.branch === "feat",
+			)!;
+			const replacement = "f".repeat(40);
+			if (changed === "branch")
+				await store.saveForkBranch({ ...row, head: replacement });
+			if (changed === "holds")
+				await store.setForkHolds(1, row.branchHash, [
+					{ sha: replacement, pr: 8, prHead: replacement, released: true },
+				]);
+			if (changed === "settings")
+				await store.setSettings({ forkResearch: false });
+			release.resolve();
+			await tick;
+			expect(await store.listTasks()).toEqual([]);
+			expect(await store.events()).toEqual([]);
+			expect(await store.forkRunsSince(0)).toBe(1);
+			const final = (await store.listForkBranches(1)).find(
+				(r) => r.branch === "feat",
+			)!;
+			expect(final.analyzedHead).toBeNull();
+			expect(final.retries).toBe(0);
+			expect(final.head).toBe(changed === "branch" ? replacement : row.head);
+			if (changed === "holds")
+				expect(await store.listForkHolds(1)).toEqual([
+					{
+						forkId: 1,
+						branchHash: row.branchHash,
+						sha: replacement,
+						pr: 8,
+						prHead: replacement,
+						released: 1,
+					},
+				]);
+		});
+	}
+
+	for (const changed of [
+		"none",
+		"branch",
+		"base",
+		"holds",
+		"settings",
+		"failure",
+	] as const) {
+		test(`legacy expansion preserves its checkpoint across ${changed} interleaving`, async () => {
+			const name = `watch-checkpoint-${changed}`;
+			const main = await initUpstream(name);
+			const base = await shaOf(main);
+			const dir = await makeFork(`${name}-fork`, main);
+			await commitFile(dir, "first.txt", "first held change");
+			const first = await shaOf(dir);
+			await commitFile(dir, "last.txt", "last held change");
+			const head = await shaOf(dir);
+			const pr = await openPr(main, dir, "feat", 5);
+			const initial = await initStore(main);
+			await initial.setSettings({ forkResearch: true });
+			const bh = branchHash("feat");
+			await initial.saveForkBranch({
+				forkId: 1,
+				branchHash: bh,
+				branch: "feat",
+				head,
+				analyzedHead: head,
+				firstPendingAt: null,
+				lastRunAt: null,
+				lastError: null,
+				retries: 0,
+			});
+			await initial.setForkHolds(1, bh, [
+				{ sha: head, pr: 5, prHead: head, released: false },
+			]);
+			await initial.close();
+			const raw = new Database(join(initial.serverDir, "tasks.db"));
+			try {
+				raw.run(
+					"UPDATE fork_branch SET hold_base = ? WHERE fork_id = ? AND branch_hash = ?",
+					[base, 1, bh],
+				);
+				if (changed === "failure")
+					raw.exec(`
+					CREATE TRIGGER reject_expanded_hold BEFORE INSERT ON fork_hold
+					WHEN NEW.sha <> (SELECT head FROM fork_branch WHERE fork_id = NEW.fork_id AND branch_hash = NEW.branch_hash)
+					BEGIN SELECT RAISE(ABORT, 'hold replacement rejected'); END
+				`);
+			} finally {
+				raw.close();
+			}
+			const store = await initStore(main);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const { watcher, state } = prWatcher(
+				name,
+				main,
+				store,
+				[{ id: 1, owner: "o", dir }],
+				[pr],
+				{
+					beforeGit: async (args) => {
+						if (args[0] === "rev-list" && args[1] === `${base}..${head}`) {
+							entered.resolve();
+							await release.promise;
+						}
+					},
+				},
+			);
+			const tick = watcher.tick();
+			await entered.promise;
+			expect(await store.legacyForkHoldBase(1, bh)).toBe(base);
+			const before = await store.listForkHolds(1);
+			expect(before.map((hold) => hold.sha)).toEqual([head]);
+			const branch = (await store.listForkBranches(1)).find(
+				(row) => row.branchHash === bh,
+			)!;
+			const replacement = "e".repeat(40);
+			if (changed === "branch")
+				await store.saveForkBranch({ ...branch, head: replacement });
+			if (changed === "base") await store.clearLegacyForkHoldBase(1, bh);
+			if (changed === "holds")
+				await store.setForkHolds(1, bh, [
+					{ sha: replacement, pr: 9, prHead: replacement, released: true },
+				]);
+			if (changed === "settings")
+				await store.setSettings({ forkResearch: false });
+			release.resolve();
+			await tick;
+			const holds = await store.listForkHolds(1);
+			if (changed === "none") {
+				expect(holds.map((hold) => hold.sha)).toContain(first);
+				expect(holds.map((hold) => hold.sha)).toContain(head);
+				expect(await store.legacyForkHoldBase(1, bh)).toBeNull();
+			} else {
+				expect(holds).toEqual(
+					changed === "holds"
+						? [
+								{
+									forkId: 1,
+									branchHash: bh,
+									sha: replacement,
+									pr: 9,
+									prHead: replacement,
+									released: 1,
+								},
+							]
+						: before,
+				);
+				expect(await store.legacyForkHoldBase(1, bh)).toBe(
+					changed === "base" ? null : base,
+				);
+			}
+			if (changed === "failure")
+				expect(
+					state.logs.some((log) => log.includes("hold replacement rejected")),
+				).toBe(true);
+			expect(await store.listTasks()).toEqual([]);
+			expect(await store.events()).toEqual([]);
+			expect(await store.forkRunsSince(0)).toBe(0);
+			expect(
+				(await store.listForkBranches(1)).find((row) => row.branchHash === bh)!
+					.head,
+			).toBe(changed === "branch" ? replacement : head);
+		});
+	}
+
+	test("an empty-range apply cannot replace a newer hold or advance its cursor", async () => {
+		const name = "watch-empty-final-hold";
+		const main = await initUpstream(name);
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
+		const dir = await makeFork(`${name}-fork`, main);
+		await commitFile(dir, "held.txt", "held change");
+		const pr = await openPr(main, dir, "feat", 5);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const { watcher } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir }],
+			[pr],
+			{
+				beforeGit: async (args) => {
+					if (args[0] === "ls-tree") {
+						entered.resolve();
+						await release.promise;
+					}
+				},
+			},
+		);
+		const tick = watcher.tick();
+		await entered.promise;
+		const bh = branchHash("feat");
+		const replacement = "d".repeat(40);
+		await store.setForkHolds(1, bh, [
+			{ sha: replacement, pr: 9, prHead: replacement, released: true },
+		]);
+		release.resolve();
+		await tick;
+		expect(await store.listForkHolds(1)).toEqual([
+			{
+				forkId: 1,
+				branchHash: bh,
+				sha: replacement,
+				pr: 9,
+				prHead: replacement,
+				released: 1,
+			},
+		]);
+		expect(
+			(await store.listForkBranches(1)).find((row) => row.branchHash === bh)!
+				.analyzedHead,
+		).toBeNull();
+		expect(await store.listTasks()).toEqual([]);
+		expect(await store.events()).toEqual([]);
+		expect(await store.forkRunsSince(0)).toBe(0);
+	});
+
+	test("a failed result insert rolls back hold consumption, cursors, cards, and events", async () => {
+		const name = "watch-result-rollback";
+		const main = await initUpstream(name);
+		const base = await shaOf(main);
+		const dir = await makeFork(`${name}-fork`, main);
+		await commitFile(dir, "released.txt", "released change");
+		const head = await shaOf(dir);
+		await openPr(main, dir, "feat", 5);
+		const initial = await initStore(main);
+		await initial.setSettings({ forkResearch: true });
+		const bh = branchHash("feat");
+		await initial.saveForkBranch({
+			forkId: 1,
+			branchHash: bh,
+			branch: "feat",
+			head,
+			analyzedHead: base,
+			firstPendingAt: null,
+			lastRunAt: null,
+			lastError: null,
+			retries: 0,
+		});
+		await initial.setForkHolds(1, bh, [
+			{ sha: head, pr: 5, prHead: head, released: true },
+		]);
+		await initial.close();
+		const raw = new Database(join(initial.serverDir, "tasks.db"));
+		try {
+			raw.exec(`CREATE TRIGGER reject_result BEFORE INSERT ON tasks
+				BEGIN SELECT RAISE(ABORT, 'result insert rejected'); END`);
+		} finally {
+			raw.close();
+		}
+		const store = await initStore(main);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir }],
+			[],
+		);
+		await watcher.tick();
+		expect(state.subjects).toHaveLength(1);
+		expect(
+			state.logs.some((log) => log.includes("result insert rejected")),
+		).toBe(true);
+		expect(await store.listTasks()).toEqual([]);
+		expect(await store.events()).toEqual([]);
+		expect(await store.listForkHolds(1)).toEqual([
+			{
+				forkId: 1,
+				branchHash: bh,
+				sha: head,
+				pr: 5,
+				prHead: head,
+				released: 1,
+			},
+		]);
+		const final = (await store.listForkBranches(1)).find(
+			(row) => row.branchHash === bh,
+		)!;
+		expect(final.analyzedHead).toBe(base);
+		expect(final.retries).toBe(1);
+		expect(await store.forkRunsSince(0)).toBe(1);
+	});
+
+	for (const changed of ["none", "branch", "holds", "new"] as const) {
+		test(`a vanished-fork prune preserves concurrent ${changed} state`, async () => {
+			const name = `watch-prune-${changed}`;
+			const main = mkRepo(name);
+			const store = await initStore(main);
+			await store.setSettings({ forkResearch: true });
+			const row = {
+				forkId: 9,
+				branchHash: branchHash("feat"),
+				branch: "feat",
+				head: "a".repeat(40),
+				analyzedHead: null,
+				firstPendingAt: null,
+				lastRunAt: null,
+				lastError: null,
+				retries: 0,
+			};
+			if (changed !== "new") await store.saveForkBranch(row);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const watcher = createForkWatcher({
+				projects: () => [{ name, path: main, store, github: "o/main" }],
+				log: () => {},
+				gh: async () => {
+					entered.resolve();
+					await release.promise;
+					return { code: 0, stdout: "[]", stderr: "" };
+				},
+			});
+			const tick = watcher.tick();
+			await entered.promise;
+			if (changed === "new") await store.saveForkBranch(row);
+			if (changed === "branch")
+				await store.saveForkBranch({ ...row, head: "b".repeat(40) });
+			if (changed === "holds")
+				await store.setForkHolds(9, row.branchHash, [
+					{ sha: row.head, pr: 8, prHead: row.head, released: false },
+				]);
+			release.resolve();
+			await tick;
+			expect((await store.listForkBranches(9)).length).toBe(
+				changed === "none" ? 0 : 1,
+			);
+			expect((await store.listForkHolds(9)).length).toBe(
+				changed === "holds" ? 1 : 0,
+			);
+			expect(await store.events()).toEqual([]);
+		});
+	}
+
 	test("empty fork list never calls analyze", async () => {
 		const main = mkRepo("watch-empty");
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		let analyzeCalls = 0;
 		const watcher = createForkWatcher({
 			projects: () => [{ name: "p", path: main, store, github: "o/main" }],
@@ -1028,8 +1480,8 @@ describe("watcher", () => {
 
 	test("a one-shot projects iterator is re-iterable across ticks", async () => {
 		const main = mkRepo("watch-oneshot");
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		let ghCalls = 0;
 		// The exact shape app.ts passes: a live Map's values() is a one-shot iterator.
 		const projects = new Map([
@@ -1061,10 +1513,10 @@ describe("watcher", () => {
 	test("a manual check for one project during another project's scan still scans it", async () => {
 		const a = mkRepo("watch-overlap-a");
 		const b = mkRepo("watch-overlap-b");
-		const storeA = ProjectStore.init(a);
-		storeA.setSettings({ forkResearch: true });
-		const storeB = ProjectStore.init(b);
-		storeB.setSettings({ forkResearch: true });
+		const storeA = await initStore(a);
+		await storeA.setSettings({ forkResearch: true });
+		const storeB = await initStore(b);
+		await storeB.setSettings({ forkResearch: true });
 		const calls: string[] = [];
 		const { promise: gate, resolve: release } = Promise.withResolvers<void>();
 		const watcher = createForkWatcher({
@@ -1141,9 +1593,8 @@ describe("hold acceptance checks", () => {
 	const bySha = (x: { sha: string }, y: { sha: string }) =>
 		x.sha < y.sha ? -1 : 1;
 
-	function holds(store: ProjectStore) {
-		return store
-			.listForkHolds(1)
+	async function holds(store: ProjectStore) {
+		return (await store.listForkHolds(1))
 			.map((h) => ({
 				sha: h.sha,
 				pr: h.pr,
@@ -1153,22 +1604,22 @@ describe("hold acceptance checks", () => {
 			.sort(bySha);
 	}
 
-	function forkCards(store: ProjectStore) {
-		return store.listTasks().filter((t) => t.topic === "fork research");
+	async function forkCards(store: ProjectStore) {
+		return (await store.listTasks()).filter((t) => t.topic === "fork research");
 	}
 
 	/** Fork fixture with a feat branch, pull refs in the upstream fixture, and a clock-driven tick. */
 	async function holdFixture(name: string) {
 		const main = await initUpstream(name);
-		const store = ProjectStore.init(main);
-		store.setSettings({ forkResearch: true });
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
 		const fork = mkRepo(`${name}-fork`);
 		await run(["clone", "-q", main, fork], root);
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
 		let fileNo = 0;
 		const commit = async (msg: string): Promise<string> => {
 			fileNo++;
-			Bun.write(join(fork, `f${fileNo}.txt`), `data ${fileNo}\n`);
+			await Bun.write(join(fork, `f${fileNo}.txt`), `data ${fileNo}\n`);
 			await run(["add", `f${fileNo}.txt`, fork], fork);
 			await run(["commit", "-q", "-m", msg, fork], fork);
 			return shaOf(fork);
@@ -1264,10 +1715,12 @@ describe("hold acceptance checks", () => {
 			return analyzeCalls - before;
 		};
 		// Marks the branch's pending wait as spent, so the next tick's run passes the quiet gate.
-		const waitOut = () => {
-			const row = store.listAllForkBranches().find((r) => r.branch === "feat");
+		const waitOut = async () => {
+			const row = (await store.listAllForkBranches()).find(
+				(r) => r.branch === "feat",
+			);
 			if (row)
-				store.saveForkBranch({
+				await store.saveForkBranch({
 					...row,
 					firstPendingAt: clock - (FORK_GATES.QUIET_MS + HOUR),
 				});
@@ -1284,8 +1737,8 @@ describe("hold acceptance checks", () => {
 		};
 	}
 
-	const featRow = (store: ProjectStore) =>
-		store.listAllForkBranches().find((r) => r.branch === "feat")!;
+	const featRow = async (store: ProjectStore) =>
+		(await store.listAllForkBranches()).find((r) => r.branch === "feat")!;
 
 	test("a direct PR branch held; a squash merge at the same head files nothing", async () => {
 		const f = await holdFixture("hold-squash");
@@ -1293,9 +1746,11 @@ describe("hold acceptance checks", () => {
 		await f.setPullRefAt(5, a);
 		// Tick 1: the open PR covers the branch head; it is held, the cursor advances, no run.
 		expect(await f.tick({ pulls: [{ n: 5, head: a }] })).toBe(0);
-		expect(forkCards(f.store).length).toBe(0);
-		expect(holds(f.store)).toEqual([{ sha: a, pr: 5, prHead: a, released: 0 }]);
-		const row = featRow(f.store);
+		expect((await forkCards(f.store)).length).toBe(0);
+		expect(await holds(f.store)).toEqual([
+			{ sha: a, pr: 5, prHead: a, released: 0 },
+		]);
+		const row = await featRow(f.store);
 		expect(row.analyzedHead).toBe(a);
 		expect(row.firstPendingAt).toBeNull();
 		// Upstream gains only an unrelated squash commit with a different sha.
@@ -1306,8 +1761,8 @@ describe("hold acceptance checks", () => {
 		expect(
 			await f.tick({ pulls: [], states: { 5: { merged: true, head: a } } }),
 		).toBe(0);
-		expect(holds(f.store)).toEqual([]);
-		expect(forkCards(f.store).length).toBe(0);
+		expect(await holds(f.store)).toEqual([]);
+		expect((await forkCards(f.store)).length).toBe(0);
 	});
 
 	test("a merged PR not pulled locally drops its holds without a run", async () => {
@@ -1315,14 +1770,14 @@ describe("hold acceptance checks", () => {
 		const a = await f.commit("fork feature one");
 		await f.setPullRefAt(5, a);
 		expect(await f.tick({ pulls: [{ n: 5, head: a }] })).toBe(0);
-		expect(holds(f.store).length).toBe(1);
+		expect((await holds(f.store)).length).toBe(1);
 		// The local main fixture never receives the merge; pullState still proves it.
 		expect(
 			await f.tick({ pulls: [], states: { 5: { merged: true, head: a } } }),
 		).toBe(0);
-		expect(holds(f.store)).toEqual([]);
+		expect(await holds(f.store)).toEqual([]);
 		expect(f.calls()).toBe(0);
-		expect(forkCards(f.store).length).toBe(0);
+		expect((await forkCards(f.store)).length).toBe(0);
 	});
 
 	test("a PR append never resends already analyzed work", async () => {
@@ -1333,22 +1788,24 @@ describe("hold acceptance checks", () => {
 		expect(f.calls()).toBe(1);
 		const b = await f.commit("feature b");
 		await f.setPullRefAt(5, b);
-		f.waitOut();
+		await f.waitOut();
 		// The PR opens with head A+B: B is held, the cursor advances to B, no resend.
 		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
 		expect(f.calls()).toBe(1);
-		expect(forkCards(f.store).length).toBe(1);
-		expect(featRow(f.store).analyzedHead).toBe(b);
-		expect(holds(f.store)).toEqual([{ sha: b, pr: 5, prHead: b, released: 0 }]);
+		expect((await forkCards(f.store)).length).toBe(1);
+		expect((await featRow(f.store)).analyzedHead).toBe(b);
+		expect(await holds(f.store)).toEqual([
+			{ sha: b, pr: 5, prHead: b, released: 0 },
+		]);
 		const c = await f.commit("feature c");
 		await f.setPullRefAt(5, c);
-		f.waitOut();
+		await f.waitOut();
 		// The append to C re-judges B (covered by C), holds C, and still never re-runs.
 		expect(await f.tick({ pulls: [{ n: 5, head: c }] })).toBe(0);
 		expect(f.calls()).toBe(1);
-		expect(forkCards(f.store).length).toBe(1);
-		expect(featRow(f.store).analyzedHead).toBe(c);
-		expect(holds(f.store)).toEqual(
+		expect((await forkCards(f.store)).length).toBe(1);
+		expect((await featRow(f.store)).analyzedHead).toBe(c);
+		expect(await holds(f.store)).toEqual(
 			[
 				{ sha: b, pr: 5, prHead: c, released: 0 },
 				{ sha: c, pr: 5, prHead: c, released: 0 },
@@ -1361,7 +1818,9 @@ describe("hold acceptance checks", () => {
 		const b = await f.commit("held feature b");
 		await f.setPullRefAt(5, b);
 		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
-		expect(holds(f.store)).toEqual([{ sha: b, pr: 5, prHead: b, released: 0 }]);
+		expect(await holds(f.store)).toEqual([
+			{ sha: b, pr: 5, prHead: b, released: 0 },
+		]);
 		// The PR force-pushes a rebased head D that lacks B (and shares no patch with it).
 		await run(["checkout", "-q", "--detach", "origin/main", f.fork], f.fork);
 		touch(join(f.fork, "side.txt"), 1);
@@ -1371,14 +1830,16 @@ describe("hold acceptance checks", () => {
 		await run(["branch", "-q", "-f", "feat", f.fork], f.fork);
 		await run(["checkout", "-q", "feat", f.fork], f.fork);
 		await f.setPullRefAt(5, d);
-		f.waitOut();
+		await f.waitOut();
 		// B is not covered by D or any other open PR: it is released and analyzed.
 		expect(await f.tick({ pulls: [{ n: 5, head: d }] })).toBe(1);
-		const card = forkCards(f.store)[0]!;
+		const card = (await forkCards(f.store))[0]!;
 		expect(card.report).toContain("held feature b");
 		// B's consumed row is deleted after the successful run; D's row survives.
-		expect(holds(f.store)).toEqual([{ sha: d, pr: 5, prHead: d, released: 0 }]);
-		expect(featRow(f.store).analyzedHead).toBe(d);
+		expect(await holds(f.store)).toEqual([
+			{ sha: d, pr: 5, prHead: d, released: 0 },
+		]);
+		expect((await featRow(f.store)).analyzedHead).toBe(d);
 	});
 
 	test("a closed unmerged PR gets its held commits analyzed", async () => {
@@ -1388,7 +1849,7 @@ describe("hold acceptance checks", () => {
 		expect(await f.tick({ pulls: [{ n: 5, head: b }] })).toBe(0);
 		expect(f.calls()).toBe(0);
 		const c = await f.commit("feature c");
-		f.waitOut();
+		await f.waitOut();
 		// pullState reports closed unmerged: B is released and rides the run.
 		expect(
 			await f.tick({
@@ -1396,10 +1857,10 @@ describe("hold acceptance checks", () => {
 				states: { 5: { merged: false, head: b } },
 			}),
 		).toBe(1);
-		const card = forkCards(f.store)[0]!;
+		const card = (await forkCards(f.store))[0]!;
 		expect(card.report).toContain("held feature b");
-		expect(holds(f.store)).toEqual([]);
-		expect(featRow(f.store).analyzedHead).toBe(c);
+		expect(await holds(f.store)).toEqual([]);
+		expect((await featRow(f.store)).analyzedHead).toBe(c);
 	});
 
 	test("a held commit covered by another open PR re-points and stays held", async () => {
@@ -1425,7 +1886,7 @@ describe("hold acceptance checks", () => {
 		await run(["branch", "-q", "-f", "feat", f.fork], f.fork);
 		await run(["checkout", "-q", "feat", f.fork], f.fork);
 		await f.setPullRefAt(5, d);
-		f.waitOut();
+		await f.waitOut();
 		// B re-points to PR 6 and stays held; D is held too, so nothing runs.
 		expect(
 			await f.tick({
@@ -1435,13 +1896,13 @@ describe("hold acceptance checks", () => {
 				],
 			}),
 		).toBe(0);
-		expect(holds(f.store)).toEqual(
+		expect(await holds(f.store)).toEqual(
 			[
 				{ sha: b, pr: 6, prHead: e, released: 0 },
 				{ sha: d, pr: 5, prHead: d, released: 0 },
 			].sort(bySha),
 		);
-		expect(featRow(f.store).analyzedHead).toBe(d);
-		expect(forkCards(f.store).length).toBe(0);
+		expect((await featRow(f.store)).analyzedHead).toBe(d);
+		expect((await forkCards(f.store)).length).toBe(0);
 	});
 });

@@ -228,15 +228,23 @@ export function mapRepo(
 }
 
 /** Skips are record ids (`<name>@<target>`): one version only, the id never returns (U5). */
-export function loadSkips(store: GlobalStore): string[] {
-	const v = store.get<string[]>("updateSkips");
+export async function loadSkips(store: GlobalStore): Promise<string[]> {
+	const v = await store.get<string[]>("updateSkips");
 	return Array.isArray(v) ? v.filter((s) => typeof s === "string") : [];
 }
 
-export function addSkip(store: GlobalStore, id: string): string[] {
-	const skips = [...new Set([...loadSkips(store), id])];
-	store.set("updateSkips", skips);
-	return skips;
+export async function addSkip(
+	store: GlobalStore,
+	id: string,
+): Promise<string[]> {
+	return store.update<string[]>("updateSkips", (current) => [
+		...new Set([
+			...(Array.isArray(current)
+				? current.filter((s) => typeof s === "string")
+				: []),
+			id,
+		]),
+	]);
 }
 
 /**
@@ -245,19 +253,23 @@ export function addSkip(store: GlobalStore, id: string): string[] {
  * `updateSkips` (the plain local skip store) so no user Skip is lost; queued approvals had no
  * local effect (Allow files the card immediately) and are dropped. Idempotent.
  */
-export function migratePendingToSkips(store: GlobalStore): void {
-	const v = store.get<unknown>("updateDecisionsPending");
-	if (!Array.isArray(v)) return;
-	const pending: string[] = [];
-	for (const raw of v) {
-		if (typeof raw !== "object" || raw === null) continue;
-		const d = raw as Record<string, unknown>;
-		if (typeof d.id === "string" && d.decision === "skipped")
-			pending.push(d.id);
-	}
-	if (pending.length > 0)
-		store.set("updateSkips", [...new Set([...loadSkips(store), ...pending])]);
-	store.set("updateDecisionsPending", []);
+export async function migratePendingToSkips(store: GlobalStore): Promise<void> {
+	await store.transaction(async () => {
+		const v = await store.get<unknown>("updateDecisionsPending");
+		if (!Array.isArray(v)) return;
+		const pending: string[] = [];
+		for (const raw of v) {
+			if (typeof raw !== "object" || raw === null) continue;
+			const d = raw as Record<string, unknown>;
+			if (typeof d.id === "string" && d.decision === "skipped")
+				pending.push(d.id);
+		}
+		if (pending.length > 0)
+			await store.set("updateSkips", [
+				...new Set([...(await loadSkips(store)), ...pending]),
+			]);
+		await store.set("updateDecisionsPending", []);
+	});
 }
 
 /**

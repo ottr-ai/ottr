@@ -32,12 +32,14 @@ describe("issueUrl", () => {
 
 let root: string;
 let seq = 0;
+const stores: ProjectStore[] = [];
 
 beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-issues-"));
 });
 
-afterAll(() => {
+afterAll(async () => {
+	for (const store of stores) await store.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
@@ -136,18 +138,19 @@ function fakeGh() {
 	};
 }
 
-function newStore(on: boolean, since: number | null = SINCE) {
+async function newStore(on: boolean, since: number | null = SINCE) {
 	const dir = join(root, `p${++seq}`);
 	mkdirSync(dir, { recursive: true });
-	const store = ProjectStore.init(dir);
-	store.setSettings({ issueWatch: on, issueWatchSince: since });
+	const store = await ProjectStore.init(dir);
+	stores.push(store);
+	await store.setSettings({ issueWatch: on, issueWatchSince: since });
 	return { dir, store };
 }
 
-function setup(
+async function setup(
 	opts: { on?: boolean; github?: string | null; since?: number | null } = {},
 ) {
-	const { dir, store } = newStore(opts.on ?? true, opts.since);
+	const { dir, store } = await newStore(opts.on ?? true, opts.since);
 	const fake = fakeGh();
 	const logs: string[] = [];
 	let t = SINCE + 10 * ISSUE_GATES.DAY_MS;
@@ -173,7 +176,8 @@ function setup(
 		advance: (ms: number) => {
 			t += ms;
 		},
-		cards: () => store.listTasks().filter((x) => x.topic === "github issue"),
+		cards: async () =>
+			(await store.listTasks()).filter((x) => x.topic === "github issue"),
 	};
 }
 
@@ -303,29 +307,99 @@ describe("issueCardPrompt", () => {
 });
 
 describe("createIssueWatcher", () => {
+	test("concurrent scans share one cap and one issue claim", async () => {
+		const { dir, store } = await newStore(true);
+		const fake = fakeGh();
+		fake.setOpen("o/r", [
+			issue(1),
+			...Array.from({ length: 15 }, (_, i) => issue(i + 1)),
+		]);
+		const arrived = Promise.withResolvers<void>();
+		let scans = 0;
+		const gh: GhFn = async (args) => {
+			if (args.some((arg) => arg.includes("/issues?"))) {
+				if (++scans === 2) arrived.resolve();
+				await arrived.promise;
+			}
+			return fake.gh(args);
+		};
+		const projects = () => [{ name: "p", path: dir, store, github: "o/r" }];
+		const make = () =>
+			createIssueWatcher({
+				projects,
+				gh,
+				log: () => {},
+				now: () => SINCE + 10 * ISSUE_GATES.DAY_MS,
+			});
+		await Promise.all([make().tick(), make().tick()]);
+		const cards = await store.listTasks();
+		expect(cards).toHaveLength(ISSUE_GATES.DAILY_CARDS);
+		expect(new Set(cards.map((card) => card.id)).size).toBe(cards.length);
+		for (let number = 1; number <= 15; number++) {
+			const claim = await store.getIssueWatch(number);
+			if (number <= ISSUE_GATES.DAILY_CARDS) expect(claim).not.toBeNull();
+			else expect(claim).toBeNull();
+		}
+		const events = await store.events();
+		expect(events).toHaveLength(40);
+		for (const card of cards) {
+			expect(
+				events
+					.filter((event) => event.taskId === card.id)
+					.map(({ kind, from, to }) => ({ kind, from, to })),
+			).toEqual([
+				{ kind: "create", from: null, to: "todo" },
+				{ kind: "state", from: null, to: "queued" },
+				{ kind: "stage", from: "todo", to: "backlog" },
+				{ kind: "state", from: "queued", to: "idle" },
+			]);
+		}
+		expect(await store.issueCardsFiledSince(SINCE)).toBe(10);
+	});
+
+	test("a label response does not mark a claim after the watch changes", async () => {
+		const { dir, store } = await newStore(true);
+		const fake = fakeGh();
+		fake.setOpen("o/r", [issue(1)]);
+		const gh: GhFn = async (args) => {
+			if (args.some((arg) => arg.endsWith("/issues/1/labels")))
+				await store.setSettings({ issueWatch: false });
+			return fake.gh(args);
+		};
+		const watcher = createIssueWatcher({
+			projects: () => [{ name: "p", path: dir, store, github: "o/r" }],
+			log: () => {},
+			gh,
+			now: () => SINCE + ISSUE_GATES.DAY_MS,
+		});
+		await watcher.tick();
+		expect(await store.getIssueWatch(1)).not.toBeNull();
+		expect(await store.unlabelledIssues()).toEqual([1]);
+	});
+
 	test("toggle off or no github makes no gh call", async () => {
-		const a = setup({ on: false });
+		const a = await setup({ on: false });
 		a.open([issue(1)]);
 		await a.watcher.tick();
-		const b = setup({ github: null });
+		const b = await setup({ github: null });
 		b.open([issue(1)]);
 		await b.watcher.tick();
 		expect(a.calls.length + b.calls.length).toBe(0);
-		expect(a.cards().length + b.cards().length).toBe(0);
+		expect((await a.cards()).length + (await b.cards()).length).toBe(0);
 	});
 
 	test("no start mark files nothing", async () => {
-		const s = setup({ since: null });
+		const s = await setup({ since: null });
 		s.open([issue(1)]);
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(0);
+		expect((await s.cards()).length).toBe(0);
 	});
 
 	test("a new issue files exactly one backlog work card and gets the label", async () => {
-		const s = setup();
+		const s = await setup();
 		s.open([issue(7, { title: "Add export", body: "Please add CSV." })]);
 		await s.watcher.tick();
-		const cards = s.cards();
+		const cards = await s.cards();
 		expect(cards.length).toBe(1);
 		const c = cards[0]!;
 		expect(c.title).toBe("Issue #7: Add export");
@@ -336,7 +410,7 @@ describe("createIssueWatcher", () => {
 		expect(c.prompt).toContain("untrusted text from the issue author");
 		expect(c.prompt).toContain("TITLE\n<<<DATA\nAdd export\nDATA>>>");
 		expect(c.prompt).toContain("BODY\n<<<DATA\nPlease add CSV.\nDATA>>>");
-		expect(s.store.getIssueWatch(7)).toMatchObject({
+		expect(await s.store.getIssueWatch(7)).toMatchObject({
 			number: 7,
 			taskId: c.id,
 			labelled: true,
@@ -353,12 +427,12 @@ describe("createIssueWatcher", () => {
 		]);
 		// Second tick: the row blocks a duplicate, and nothing is left to label.
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(1);
+		expect((await s.cards()).length).toBe(1);
 		expect(s.labelled).toEqual([7]);
 	});
 
 	test("a missing label is created before labelling", async () => {
-		const s = setup();
+		const s = await setup();
 		s.setLabelExists(false);
 		s.open([issue(3)]);
 		await s.watcher.tick();
@@ -377,11 +451,11 @@ describe("createIssueWatcher", () => {
 			],
 		]);
 		expect(s.labelled).toEqual([3]);
-		expect(s.store.unlabelledIssues()).toEqual([]);
+		expect(await s.store.unlabelledIssues()).toEqual([]);
 	});
 
 	test("pull requests, issues before the mark and already-tracked issues never file", async () => {
-		const s = setup();
+		const s = await setup();
 		s.open([
 			issue(1, { pull: true }),
 			issue(2, { at: -1 }),
@@ -390,60 +464,64 @@ describe("createIssueWatcher", () => {
 			issue(5, { at: 0 }),
 		]);
 		await s.watcher.tick();
-		expect(s.cards().map((c) => c.title)).toEqual(["Issue #5: t5"]);
-		for (const n of [1, 2, 3, 4]) expect(s.store.getIssueWatch(n)).toBeNull();
+		expect((await s.cards()).map((c) => c.title)).toEqual(["Issue #5: t5"]);
+		for (const n of [1, 2, 3, 4])
+			expect(await s.store.getIssueWatch(n)).toBeNull();
 	});
 
 	test("a cancelled card never re-files its issue", async () => {
-		const s = setup();
+		const s = await setup();
 		s.open([issue(4)]);
 		await s.watcher.tick();
-		const id = s.cards()[0]!.id;
-		s.store.updateTask(id, { cancelledAt: 1 });
+		const id = (await s.cards())[0]!.id;
+		await s.store.updateTask(id, { cancelledAt: 1 });
 		// The label was removed on GitHub meanwhile: the row still blocks a re-file.
 		await s.watcher.tick();
 		s.advance(2 * ISSUE_GATES.DAY_MS);
 		await s.watcher.tick();
-		expect(s.cards().map((c) => c.id)).toEqual([id]);
+		expect((await s.cards()).map((c) => c.id)).toEqual([id]);
 	});
 
 	test("the daily cap files the oldest issues first, the rest after a day", async () => {
-		const s = setup();
+		const s = await setup();
 		// Numbers run against creation time: #15 is the oldest.
 		s.open(Array.from({ length: 15 }, (_, i) => issue(i + 1, { at: 100 - i })));
 		await s.watcher.tick();
-		const filed = () =>
-			Array.from({ length: 15 }, (_, i) => i + 1).filter(
-				(n) => s.store.getIssueWatch(n) !== null,
-			);
-		expect(s.cards().length).toBe(ISSUE_GATES.DAILY_CARDS);
-		expect(filed()).toEqual([6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+		const filed = async () => {
+			const numbers: number[] = [];
+			for (let n = 1; n <= 15; n++) {
+				if ((await s.store.getIssueWatch(n)) !== null) numbers.push(n);
+			}
+			return numbers;
+		};
+		expect((await s.cards()).length).toBe(ISSUE_GATES.DAILY_CARDS);
+		expect(await filed()).toEqual([6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
 		expect(s.logs.some((m) => m.includes("daily cap"))).toBe(true);
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(10);
+		expect((await s.cards()).length).toBe(10);
 		s.advance(ISSUE_GATES.DAY_MS + 1);
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(15);
-		expect(filed().length).toBe(15);
+		expect((await s.cards()).length).toBe(15);
+		expect((await filed()).length).toBe(15);
 	});
 
 	test("a failed label call keeps the card and retries next tick without a new card", async () => {
-		const s = setup();
+		const s = await setup();
 		s.setLabelPostFail(true);
 		s.open([issue(8)]);
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(1);
-		expect(s.store.unlabelledIssues()).toEqual([8]);
+		expect((await s.cards()).length).toBe(1);
+		expect(await s.store.unlabelledIssues()).toEqual([8]);
 		expect(s.logs.some((m) => m.includes("#8 label failed"))).toBe(true);
 		s.setLabelPostFail(false);
 		await s.watcher.tick();
-		expect(s.cards().length).toBe(1);
+		expect((await s.cards()).length).toBe(1);
 		expect(s.labelled).toEqual([8]);
-		expect(s.store.unlabelledIssues()).toEqual([]);
+		expect(await s.store.unlabelledIssues()).toEqual([]);
 	});
 
 	test("invisible characters and secrets in the issue stay out of the card", async () => {
-		const s = setup();
+		const s = await setup();
 		s.open([
 			issue(9, {
 				title: `crash\u200b with ${TOKEN}`,
@@ -451,22 +529,22 @@ describe("createIssueWatcher", () => {
 			}),
 		]);
 		await s.watcher.tick();
-		const c = s.cards()[0]!;
+		const c = (await s.cards())[0]!;
 		expect(c.prompt).not.toContain("\u200b");
 		expect(c.prompt).not.toContain(TOKEN);
 		expect(c.title).not.toContain(TOKEN);
 	});
 
 	test("a 50k-char body still files a card within the prompt limit", async () => {
-		const s = setup();
+		const s = await setup();
 		s.open([issue(2, { body: "z".repeat(50_000) })]);
 		await s.watcher.tick();
-		expect(s.cards()[0]!.prompt.length).toBeLessThanOrEqual(20_000);
+		expect((await s.cards())[0]!.prompt.length).toBeLessThanOrEqual(20_000);
 	});
 
 	test("one project's gh failure does not stop another in the same tick", async () => {
-		const a = newStore(true);
-		const b = newStore(true);
+		const a = await newStore(true);
+		const b = await newStore(true);
 		const fake = fakeGh();
 		fake.failListing("o/a");
 		fake.setOpen("o/b", [issue(1)]);
@@ -482,8 +560,8 @@ describe("createIssueWatcher", () => {
 		});
 		await watcher.tick();
 		expect(logs.some((m) => m.startsWith("issues: a: "))).toBe(true);
-		expect(a.store.issueCardsFiledSince(0)).toBe(0);
-		expect(b.store.getIssueWatch(1)?.labelled).toBe(true);
+		expect(await a.store.issueCardsFiledSince(0)).toBe(0);
+		expect((await b.store.getIssueWatch(1))?.labelled).toBe(true);
 		// A manual tick scans only the named project.
 		fake.calls.length = 0;
 		await watcher.tick({ manual: "b" });
@@ -493,31 +571,31 @@ describe("createIssueWatcher", () => {
 	});
 
 	test("a quoted credential ending past the 120-char cut is withheld, not cut open", async () => {
-		const s = setup();
+		const s = await setup();
 		const value = "Zq8vN3pL7wR2tY6kM4";
 		// 121 chars: the closing quote sits at index 120, just past the card title's cut.
 		const title = `${"a".repeat(91)} password="${value}"`;
 		expect(title.length).toBe(121);
 		s.open([issue(11, { title })]);
 		await s.watcher.tick();
-		const c = s.cards()[0]!;
+		const c = (await s.cards())[0]!;
 		expect(c.title).toBe("Issue #11");
 		expect(c.title).not.toContain(value);
 		expect(c.prompt).not.toContain(value);
 	});
 
 	test("a token straddling the 120-char cut is redacted whole, no prefix leaks", async () => {
-		const s = setup();
+		const s = await setup();
 		s.open([issue(12, { title: `${"x".repeat(100)} ${TOKEN}` })]);
 		await s.watcher.tick();
-		const c = s.cards()[0]!;
+		const c = (await s.cards())[0]!;
 		expect(c.title).toBe(`Issue #12: ${"x".repeat(100)} [REDACTED]`);
 		expect(c.title).not.toContain("ghp_");
 		expect(c.prompt).not.toContain("ghp_");
 	});
 
 	test("an off/on cycle during the listing call files and labels nothing from the old mark", async () => {
-		const { dir, store } = newStore(true);
+		const { dir, store } = await newStore(true);
 		const fake = fakeGh();
 		// Opened 5 minutes after the first mark, before the re-enable mark.
 		fake.setOpen("o/r", [issue(5, { at: 5 })]);
@@ -538,21 +616,24 @@ describe("createIssueWatcher", () => {
 		});
 		const tick = watcher.tick();
 		await reached.promise;
-		store.setSettings({ issueWatch: false });
-		store.setSettings({ issueWatch: true, issueWatchSince: SINCE + 10 * MIN });
+		await store.setSettings({ issueWatch: false });
+		await store.setSettings({
+			issueWatch: true,
+			issueWatchSince: SINCE + 10 * MIN,
+		});
 		gate.resolve();
 		await tick;
-		expect(store.getIssueWatch(5)).toBeNull();
+		expect(await store.getIssueWatch(5)).toBeNull();
 		expect(fake.labelled).toEqual([]);
 		// The next tick reads the new mark: the issue opened while off stays unfiled.
 		await watcher.tick();
-		expect(store.getIssueWatch(5)).toBeNull();
-		expect(store.issueCardsFiledSince(0)).toBe(0);
+		expect(await store.getIssueWatch(5)).toBeNull();
+		expect(await store.issueCardsFiledSince(0)).toBe(0);
 	});
 
 	for (const exists of [true, false])
 		test(`turning the watch off during the label check stops label writes (label ${exists ? "exists" : "missing: no create"})`, async () => {
-			const { dir, store } = newStore(true);
+			const { dir, store } = await newStore(true);
 			const fake = fakeGh();
 			fake.setLabelExists(exists);
 			fake.setOpen("o/r", [issue(6)]);
@@ -572,17 +653,17 @@ describe("createIssueWatcher", () => {
 			});
 			const tick = watcher.tick();
 			await reached.promise;
-			expect(store.getIssueWatch(6)).not.toBeNull();
-			store.setSettings({ issueWatch: false });
+			expect(await store.getIssueWatch(6)).not.toBeNull();
+			await store.setSettings({ issueWatch: false });
 			gate.resolve();
 			await tick;
 			expect(fake.created).toEqual([]);
 			expect(fake.labelled).toEqual([]);
-			expect(store.unlabelledIssues()).toEqual([6]);
+			expect(await store.unlabelledIssues()).toEqual([6]);
 		});
 
 	test("pages run newest first: 10,000 older open issues cannot hide a new one", async () => {
-		const { dir, store } = newStore(true);
+		const { dir, store } = await newStore(true);
 		const fake = fakeGh();
 		const old = Array.from({ length: 10_000 }, (_, i) =>
 			issue(i + 1, { at: -1 - i }),
@@ -603,7 +684,7 @@ describe("createIssueWatcher", () => {
 			});
 		// Newest first, as direction=desc returns them.
 		await serve([issue(10_001, { at: 5 }), ...old]).tick();
-		expect(store.getIssueWatch(10_001)).not.toBeNull();
+		expect(await store.getIssueWatch(10_001)).not.toBeNull();
 		expect(pages.length).toBe(1);
 		expect(pages[0]).toContain("direction=desc");
 		// 150 new issues fill page 1 and half of page 2: both pages are read, the scan stops
@@ -614,10 +695,11 @@ describe("createIssueWatcher", () => {
 		pages.length = 0;
 		await serve([...fresh, ...old]).tick();
 		expect(pages.length).toBe(2);
-		const filed = fresh
-			.map((x) => x.number)
-			.filter((n) => store.getIssueWatch(n) !== null)
-			.sort((a, b) => a - b);
+		const filed: number[] = [];
+		for (const { number } of fresh) {
+			if ((await store.getIssueWatch(number)) !== null) filed.push(number);
+		}
+		filed.sort((a, b) => a - b);
 		// One slot went to #10001 above: 9 more, the 9 oldest of the fresh ones.
 		expect(filed).toEqual(Array.from({ length: 9 }, (_, i) => 20_141 + i));
 	});

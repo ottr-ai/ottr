@@ -2051,6 +2051,79 @@ describe("against real repos", () => {
 		await must(main, "worktree", "remove", "--force", wt);
 	}, 60_000);
 
+	test("createWorktree awaits copy logs before the next copy and completion", async () => {
+		const checkout = repo();
+		await must(checkout, "init", "-q", "-b", "main");
+		await must(checkout, "commit", "-q", "--allow-empty", "-m", "init");
+		writeFileSync(join(checkout, "AGENTS.md"), "rules\n");
+		mkdirSync(join(checkout, ".omp"));
+		writeFileSync(join(checkout, ".omp", "AGENTS.md"), "more rules\n");
+		const wt = join(repo(), "wt");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const lines: string[] = [];
+		const creating = createWorktree({
+			mainPath: checkout,
+			worktreePath: wt,
+			branch: "ott/async-copy-log",
+			base: "main",
+			copyExtra: [],
+			log: async (line) => {
+				if (line === "copied .omp/AGENTS.md") {
+					entered.resolve();
+					await release.promise;
+				}
+				lines.push(line);
+			},
+		});
+		try {
+			await entered.promise;
+			expect(readFileSync(join(wt, ".omp", "AGENTS.md"), "utf8")).toBe(
+				"more rules\n",
+			);
+			expect(existsSync(join(wt, "AGENTS.md"))).toBe(false);
+			expect(lines.some((line) => line.startsWith("added /"))).toBe(false);
+		} finally {
+			release.resolve();
+			await creating;
+		}
+		expect(readFileSync(join(wt, "AGENTS.md"), "utf8")).toBe("rules\n");
+		expect(lines.indexOf("copied .omp/AGENTS.md")).toBeLessThan(
+			lines.indexOf("copied AGENTS.md"),
+		);
+		expect(await must(wt, "status", "--porcelain")).toBe("");
+	}, 60_000);
+
+	test.each(["worktree ", "copied AGENTS.md", "added /AGENTS.md"])(
+		"createWorktree propagates an async log rejection at %s",
+		async (prefix) => {
+			const checkout = repo();
+			await must(checkout, "init", "-q", "-b", "main");
+			await must(checkout, "commit", "-q", "--allow-empty", "-m", "init");
+			writeFileSync(join(checkout, "AGENTS.md"), "rules\n");
+			const wt = join(repo(), "wt");
+			const failure = new Error("log persistence failed");
+			await expect(
+				createWorktree({
+					mainPath: checkout,
+					worktreePath: wt,
+					branch: "ott/rejected-log",
+					base: "main",
+					copyExtra: [],
+					log: async (line) => {
+						if (line.startsWith(prefix)) throw failure;
+					},
+				}),
+			).rejects.toBe(failure);
+			if (prefix === "worktree ") {
+				expect(existsSync(join(wt, "AGENTS.md"))).toBe(false);
+			} else {
+				expect(existsSync(wt)).toBe(false);
+			}
+		},
+		60_000,
+	);
+
 	test("createWorktree copies local-only rules whatever hides them from git", async () => {
 		const checkout = repo();
 		await must(checkout, "init", "-q", "-b", "main");
@@ -2123,7 +2196,9 @@ describe("against real repos", () => {
 			branch: "ott/skip",
 			base,
 			copyExtra: [],
-			log: (line) => lines.push(line),
+			log: (line) => {
+				lines.push(line);
+			},
 		});
 		// The base's tracked file survives; the local copy never lands.
 		expect(readFileSync(join(wt, "AGENTS.md"), "utf8")).toBe("tracked rules\n");
@@ -2173,7 +2248,9 @@ describe("against real repos", () => {
 				branch: `ott/${id}`,
 				base,
 				copyExtra: [],
-				log: (line) => lines.push(line),
+				log: (line) => {
+					lines.push(line);
+				},
 			});
 			expect(readFileSync(join(wt, "AGENTS.md"), "utf8")).toBe("same rules\n");
 			expect(
@@ -5040,13 +5117,42 @@ describe("removeWorktree reap (OTTR-697)", () => {
 			});
 			const holders = await holdersIn(wt);
 			expect(holders).not.toBeNull();
+			const failure = new Error("reap log persistence failed");
+			await expect(
+				removeWorktree({
+					mainPath: main,
+					worktreePath: wt,
+					branch: null,
+					log: async () => {
+						throw failure;
+					},
+				}),
+			).rejects.toBe(failure);
+			expect(existsSync(wt)).toBe(true);
+			for (const holder of holders!) expect(isGone(holder.pid)).toBe(false);
+
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
 			const log: string[] = [];
-			await removeWorktree({
+			const removing = removeWorktree({
 				mainPath: main,
 				worktreePath: wt,
 				branch: null,
-				log: (line) => log.push(line),
+				log: async (line) => {
+					entered.resolve();
+					await release.promise;
+					log.push(line);
+				},
 			});
+			try {
+				await entered.promise;
+				expect(readFileSync(join(wt, "file.txt"), "utf8")).toBe("x");
+				for (const holder of holders!) expect(isGone(holder.pid)).toBe(false);
+				expect(log).toEqual([]);
+			} finally {
+				release.resolve();
+				await removing;
+			}
 			expect(existsSync(wt)).toBe(false);
 			for (const holder of holders!) {
 				expect(isGone(holder.pid)).toBe(true);
@@ -5085,7 +5191,9 @@ describe("removeWorktree reap (OTTR-697)", () => {
 				mainPath: main,
 				worktreePath: wt,
 				branch: null,
-				log: (line) => log.push(line),
+				log: (line) => {
+					log.push(line);
+				},
 			});
 			expect(existsSync(wt)).toBe(false);
 			expect(log.some((l) => l.startsWith("reap:"))).toBe(false);

@@ -7,8 +7,9 @@ import { isSealed, type SecretBox } from "./secretBox.ts";
 
 /** The store surface the migration needs (GlobalStore satisfies it). */
 export interface SealedConfigStore {
-	get<T>(key: string): T | null;
-	set(key: string, value: unknown): void;
+	get<T>(key: string): Promise<T | null>;
+	set(key: string, value: unknown): Promise<void>;
+	transaction<T>(work: () => T | Promise<T>): Promise<T>;
 }
 
 /** Seal one scalar spot: empty and already-sealed values pass through unchanged. */
@@ -136,11 +137,13 @@ export function sealStoredConfigRow(
  * box (legacy degraded mode) stays as it is, and a second boot with everything already
  * sealed writes nothing.
  */
-export function migrateSealedConfig(
+export async function migrateSealedConfig(
 	gstore: SealedConfigStore,
 	box: SecretBox | undefined,
-): void {
+): Promise<void> {
 	if (box === undefined) return;
-	const out = sealStoredConfigRow(gstore.get<unknown>("config"), box);
-	if (out.changed) gstore.set("config", out.row);
+	await gstore.transaction(async () => {
+		const out = sealStoredConfigRow(await gstore.get<unknown>("config"), box);
+		if (out.changed) await gstore.set("config", out.row);
+	});
 }

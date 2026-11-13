@@ -46,7 +46,7 @@ export async function bootstrap(): Promise<void> {
 	// Full demo pool for design work: five projects with backdated tasks, turns and events.
 	// A pinned OTTR_DEV_ROOT seeds once; `bun scripts/demo-data.ts <root> --force` rebuilds it.
 	// An unpinned root is fresh every spawn, so every board seeds its own pool.
-	seedDemo(root);
+	await seedDemo(root);
 	process.env.OMP_TRACKER_ROOTS = root;
 	process.env.OTTR_STATE_DIR ??= resolve(root, "state");
 	// The Settings Env section reads <home>/.ottr/workers/<project>/env.txt; the dev board

@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
-import { createApp, type Entry } from "./app.ts";
+import { type App, createApp, type Entry } from "./app.ts";
 import { GlobalStore } from "./globalStore.ts";
 import type { JiraNet } from "./jira.ts";
+import { createJiraRoutes } from "./jiraRoutes.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import { ProjectStore } from "./store.ts";
 import type {
@@ -23,7 +24,8 @@ type Answer = JiraConnectionView &
 
 const root = mkdtempSync(join(tmpdir(), "ottr-jira-routes-"));
 const servers: Server<undefined>[] = [];
-const gstore = GlobalStore.open(join(root, "g"));
+const apps: App[] = [];
+const gstore = await GlobalStore.open(join(root, "g"));
 const box = loadSecretBox({ dir: join(root, "g", ".tasks"), env: {} });
 const otherBox = loadSecretBox({
 	dir: root,
@@ -155,7 +157,7 @@ const stores: ProjectStore[] = [];
 for (const name of ["p1", "p2"]) {
 	const path = join(root, name);
 	mkdirSync(path, { recursive: true });
-	const store = ProjectStore.open(path);
+	const store = await ProjectStore.open(path);
 	stores.push(store);
 	projects.set(name, {
 		path,
@@ -194,8 +196,8 @@ function firstSeen(): Seen {
 
 let scheduled = 0;
 
-function boot(o: { secretBox?: SecretBox; jiraNet?: Partial<JiraNet> }) {
-	const app = createApp({
+async function boot(o: { secretBox?: SecretBox; jiraNet?: Partial<JiraNet> }) {
+	const app = await createApp({
 		gstore,
 		defaultDir: root,
 		projects,
@@ -226,6 +228,7 @@ function boot(o: { secretBox?: SecretBox; jiraNet?: Partial<JiraNet> }) {
 		secretBox: o.secretBox,
 		jiraNet: o.jiraNet,
 	});
+	apps.push(app);
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
 	app.serverRef.current = srv;
 	servers.push(srv);
@@ -249,14 +252,15 @@ function boot(o: { secretBox?: SecretBox; jiraNet?: Partial<JiraNet> }) {
 	};
 }
 
-afterAll(() => {
+afterAll(async () => {
 	for (const s of servers) s.stop(true);
-	for (const s of stores) s.close();
-	gstore.close();
+	for (const app of apps) await app.close();
+	for (const s of stores) await s.close();
+	await gstore.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
-const call = boot({ secretBox: box, jiraNet: { fetch: stubFetch } });
+const call = await boot({ secretBox: box, jiraNet: { fetch: stubFetch } });
 
 const cloud = {
 	name: "work",
@@ -300,7 +304,7 @@ describe("Jira connections", () => {
 			expect(r.text).not.toContain(CLOUD_TOKEN);
 			expect(r.text).not.toContain(DC_TOKEN);
 		}
-		const stored = JSON.stringify(gstore.get("jira-connections"));
+		const stored = JSON.stringify(await gstore.get("jira-connections"));
 		expect(stored).not.toContain(CLOUD_TOKEN);
 		expect(stored).not.toContain(DC_TOKEN);
 		expect(stored).toContain(`v1:${box.keyId}:`);
@@ -347,7 +351,7 @@ describe("Jira connections", () => {
 	});
 
 	test("hosted mode refuses a site that resolves to a private address at save", async () => {
-		const hosted = boot({
+		const hosted = await boot({
 			secretBox: box,
 			jiraNet: {
 				fetch: stubFetch,
@@ -361,12 +365,14 @@ describe("Jira connections", () => {
 		});
 		expect(r.status).toBe(400);
 		expect(
-			gstore.get<{ name: string }[]>("jira-connections")?.map((c) => c.name),
+			(await gstore.get<{ name: string }[]>("jira-connections"))?.map(
+				(c) => c.name,
+			),
 		).not.toContain("inner");
 	});
 
 	test("no secret box: every Jira route answers 503", async () => {
-		const off = boot({});
+		const off = await boot({});
 		const r = await off("/api/jira/connections");
 		expect(r.status).toBe(503);
 		expect(r.json.error).toBe("OTTR_SECRET_KEY is invalid");
@@ -380,7 +386,7 @@ describe("project settings and delete", () => {
 		});
 		expect(r.status).toBe(400);
 		expect(r.json.error).toBe("unknown Jira connection");
-		expect(p1.getSettings().jiraConnection).toBeNull();
+		expect((await p1.getSettings()).jiraConnection).toBeNull();
 	});
 
 	test("settings take a known name; deleting it is refused and names the project", async () => {
@@ -388,7 +394,7 @@ describe("project settings and delete", () => {
 			jiraConnection: "work",
 		});
 		expect(set.status).toBe(200);
-		expect(p1.getSettings().jiraConnection).toBe("work");
+		expect((await p1.getSettings()).jiraConnection).toBe("work");
 		const view = (
 			await call<JiraConnectionView[]>("/api/jira/connections")
 		).json.find((c) => c.name === "work");
@@ -441,7 +447,7 @@ describe("search and import", () => {
 			importedCard: null,
 		});
 		expect(r.json.rows[4]?.priority).toBe("");
-		expect(p1.getSettings().jiraLastJql).toBe("project = PROJ");
+		expect((await p1.getSettings()).jiraLastJql).toBe("project = PROJ");
 	});
 
 	test("a Jira 400 answers 400 with Jira's message and keeps the last JQL", async () => {
@@ -449,7 +455,7 @@ describe("search and import", () => {
 		expect(r.status).toBe(400);
 		expect(r.json.error).toContain("Error in the JQL Query: bad");
 		expect(r.text).not.toContain(CLOUD_TOKEN);
-		expect(p1.getSettings().jiraLastJql).toBe("project = PROJ");
+		expect((await p1.getSettings()).jiraLastJql).toBe("project = PROJ");
 	});
 
 	test("search refuses an empty or too long JQL and a project without a connection", async () => {
@@ -496,7 +502,7 @@ describe("search and import", () => {
 			"GET /jira/rest/api/2/issue/PROJ-1?fields=issuelinks",
 		);
 		// The wiki body went through the converter: the author and date line is in the prompt.
-		expect(p2.getTask(r.json.filed[0] ?? "")?.prompt).toContain(
+		expect((await p2.getTask(r.json.filed[0] ?? ""))?.prompt).toContain(
 			"COMMENTS\n<<<DATA\nDan (2026-10-06T08:00:00.000+0000):\n",
 		);
 		commentsByKey.clear();
@@ -526,7 +532,7 @@ describe("search and import", () => {
 		expect(r.json.filed).toHaveLength(3);
 		expect(firstSeen().body.jql).toBe("key in (PROJ-1,PROJ-2,PROJ-3)");
 		expect(firstSeen().body.fields).toContain("description");
-		const tasks = r.json.filed.map((id) => p1.getTask(id));
+		const tasks = await Promise.all(r.json.filed.map((id) => p1.getTask(id)));
 		expect(tasks.map((t) => t?.title)).toEqual([
 			"PROJ-1: Summary 1",
 			"PROJ-2: Summary 2",
@@ -613,7 +619,7 @@ describe("search and import", () => {
 			auth: expect.any(String),
 			body: {},
 		});
-		const single = p1.getTask(r.json.filed[0] ?? "");
+		const single = await p1.getTask(r.json.filed[0] ?? "");
 		expect(single?.prompt).toContain(
 			"COMMENTS\n<<<DATA\nAda (2026-10-07T09:00:00.000+0000):\nRoot cause found in the spike\nDATA>>>",
 		);
@@ -621,7 +627,7 @@ describe("search and import", () => {
 			"LINKS\n<<<DATA\nblocks: CMIS-8343: the follow-up (Done)\nDATA>>>",
 		);
 		// BULK-9002 keeps every one of its 130 comments, oldest first.
-		const paged = p1.getTask(r.json.filed[1] ?? "");
+		const paged = await p1.getTask(r.json.filed[1] ?? "");
 		expect(paged?.prompt).toContain(
 			"Author 0 (2026-10-01T10:00:00.000+0000):\nbody 0",
 		);
@@ -651,7 +657,7 @@ describe("search and import", () => {
 		const before = scheduled;
 		const r = await importKeys(["PROJ-4"], "todo");
 		expect(r.json.filed).toHaveLength(1);
-		expect(p1.getTask(r.json.filed[0] ?? "")?.stage).toBe("todo");
+		expect((await p1.getTask(r.json.filed[0] ?? ""))?.stage).toBe("todo");
 		expect(scheduled).toBeGreaterThan(before);
 	});
 
@@ -683,8 +689,8 @@ describe("board-wide search and import", () => {
 
 	test("board search hits Jira live and writes no project settings", async () => {
 		await call("/api/projects/p2/settings", { jiraConnection: "work" });
-		const p1Jql = p1.getSettings().jiraLastJql;
-		const p2Jql = p2.getSettings().jiraLastJql;
+		const p1Jql = (await p1.getSettings()).jiraLastJql;
+		const p2Jql = (await p2.getSettings()).jiraLastJql;
 		seen.length = 0;
 		const r = await boardSearch("project = PROJ");
 		expect(r.status).toBe(200);
@@ -694,12 +700,14 @@ describe("board-wide search and import", () => {
 		expect(req.auth).toBe(
 			`Basic ${Buffer.from(`me@example.com:${CLOUD_TOKEN}`).toString("base64")}`,
 		);
-		const card = p1.jiraImported("https://jira.test", ["PROJ-1"]).get("PROJ-1");
+		const card = (await p1.jiraImported("https://jira.test", ["PROJ-1"])).get(
+			"PROJ-1",
+		);
 		expect(r.json.rows[0]?.importedIn).toEqual(
 			card === undefined ? [] : [{ project: "p1", task: card }],
 		);
-		expect(p1.getSettings().jiraLastJql).toBe(p1Jql);
-		expect(p2.getSettings().jiraLastJql).toBe(p2Jql);
+		expect((await p1.getSettings()).jiraLastJql).toBe(p1Jql);
+		expect((await p2.getSettings()).jiraLastJql).toBe(p2Jql);
 	});
 
 	test("one key can be imported into two projects on purpose; a repeat skips", async () => {
@@ -711,7 +719,7 @@ describe("board-wide search and import", () => {
 		]);
 		expect(first.json.skipped).toEqual([]);
 		expect(first.json.unavailable).toEqual([]);
-		const task = p1.getTask(filed[0]?.task ?? "");
+		const task = await p1.getTask(filed[0]?.task ?? "");
 		expect(task?.title).toBe("BULK-2001: Summary BULK-2001");
 		expect(task?.stage).toBe("backlog");
 
@@ -723,7 +731,9 @@ describe("board-wide search and import", () => {
 		const second = await boardImport([{ key: "BULK-2001", project: "p2" }]);
 		expect(second.json.filed).toHaveLength(1);
 		const p2Card = second.json.filed[0]?.task ?? "";
-		expect(p2.getTask(p2Card)?.title).toBe("BULK-2001: Summary BULK-2001");
+		expect((await p2.getTask(p2Card))?.title).toBe(
+			"BULK-2001: Summary BULK-2001",
+		);
 
 		const s2 = await boardSearch("key in (BULK-2001)");
 		expect(s2.json.rows[0]?.importedIn).toEqual([
@@ -776,7 +786,7 @@ describe("board-wide search and import", () => {
 		expect(calls).toContain(
 			"GET /rest/api/3/issue/BULK-3001?fields=issuelinks",
 		);
-		const task = p1.getTask(r.json.filed[0]?.task ?? "");
+		const task = await p1.getTask(r.json.filed[0]?.task ?? "");
 		expect(task?.prompt).toContain(
 			"COMMENTS\n<<<DATA\nAda (2026-10-07T09:00:00.000+0000):\nRoot cause found in the spike\nDATA>>>",
 		);
@@ -795,8 +805,12 @@ describe("board-wide search and import", () => {
 		expect(r.status).toBe(200);
 		expect(r.json.filed).toHaveLength(2);
 		expect(r.json.skipped).toEqual([]);
-		expect(p1.jiraImported("https://jira.test", ["BULK-2002"]).size).toBe(1);
-		expect(p2.jiraImported("https://jira.test", ["BULK-2002"]).size).toBe(1);
+		expect(
+			(await p1.jiraImported("https://jira.test", ["BULK-2002"])).size,
+		).toBe(1);
+		expect(
+			(await p2.jiraImported("https://jira.test", ["BULK-2002"])).size,
+		).toBe(1);
 	});
 
 	test("a project without its own connection imports from the board connection", async () => {
@@ -855,9 +869,9 @@ describe("board-wide search and import", () => {
 		expect(unknownProject.status).toBe(400);
 		expect(unknownProject.json.error).toBe("unknown project: nope");
 		for (const store of [p1, p2])
-			expect(store.jiraImported("https://jira.test", ["BULK-2010"]).size).toBe(
-				0,
-			);
+			expect(
+				(await store.jiraImported("https://jira.test", ["BULK-2010"])).size,
+			).toBe(0);
 		const ok = await boardImport([{ key: "BULK-2011", project: "p1" }]);
 		expect(ok.status).toBe(200);
 		expect(ok.json.filed).toHaveLength(1);
@@ -874,7 +888,10 @@ describe("board-wide search and import", () => {
 
 describe("a changed key", () => {
 	test("the connection shows token unreadable and search answers 409", async () => {
-		const other = boot({ secretBox: otherBox, jiraNet: { fetch: stubFetch } });
+		const other = await boot({
+			secretBox: otherBox,
+			jiraNet: { fetch: stubFetch },
+		});
 		const view = (
 			await other<JiraConnectionView[]>("/api/jira/connections")
 		).json.find((c) => c.name === "work");
@@ -886,6 +903,139 @@ describe("a changed key", () => {
 		expect(r.status).toBe(409);
 		expect(r.json.error).toBe("token unreadable, enter it again");
 		expect(seen).toHaveLength(0);
-		expect(p1.getSettings().jiraLastJql).toBe("project = PROJ");
+		expect((await p1.getSettings()).jiraLastJql).toBe("project = PROJ");
+	});
+});
+
+describe("async Jira route guards", () => {
+	test("concurrent connection saves preserve both names after host checks", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let checks = 0;
+		const routes = createJiraRoutes({
+			gstore,
+			projects,
+			box,
+			now: Date.now,
+			schedule: () => {},
+			json: (value, status = 200) => Response.json(value, { status }),
+			net: {
+				hosted: true,
+				lookup: async () => {
+					if (++checks === 2) entered.resolve();
+					await release.promise;
+					return ["93.184.216.34"];
+				},
+			},
+		});
+		const saves = ["race-a", "race-b"].map((name) =>
+			routes.save({ ...cloud, name }),
+		);
+		await entered.promise;
+		release.resolve();
+		const responses = await Promise.all(saves);
+		expect(responses.map((response) => response.status)).toEqual([200, 200]);
+		const connections =
+			await gstore.get<{ name: string; token: string }[]>("jira-connections");
+		for (const name of ["race-a", "race-b"]) {
+			const connection = connections?.find((item) => item.name === name);
+			expect(connection).toBeDefined();
+			expect(box.open(connection!.token)).toBe(CLOUD_TOKEN);
+		}
+	});
+
+	test("a project connection change during Jira fetch refuses the import", async () => {
+		const original = (await p2.getSettings()).jiraConnection;
+		await p2.setSettings({ jiraConnection: "work" });
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const guarded = await boot({
+			secretBox: box,
+			jiraNet: {
+				fetch: (async (input, init) => {
+					if (String(input).includes("/search/")) {
+						entered.resolve();
+						await release.promise;
+					}
+					return stubFetch(input, init);
+				}) as typeof fetch,
+			},
+		});
+		try {
+			const pending = guarded("/api/projects/p2/jira/import", {
+				keys: ["BULK-9901"],
+				stage: "todo",
+			});
+			await entered.promise;
+			await p2.setSettings({ jiraConnection: null });
+			release.resolve();
+			const response = await pending;
+			expect(response.status).toBe(409);
+			expect(
+				(await p2.jiraImported("https://jira.test", ["BULK-9901"])).size,
+			).toBe(0);
+		} finally {
+			release.resolve();
+			await p2.setSettings({ jiraConnection: original });
+		}
+	});
+
+	test("concurrent board imports create one card and one event pair", async () => {
+		const body = {
+			connection: "work",
+			stage: "todo",
+			assignments: [{ key: "BULK-9902", project: "p2" }],
+		};
+		const [a, b] = await Promise.all([
+			call<JiraBoardImportResult>("/api/jira/import", body),
+			call<JiraBoardImportResult>("/api/jira/import", body),
+		]);
+		expect([a.status, b.status]).toEqual([200, 200]);
+		expect(a.json.filed.length + b.json.filed.length).toBe(1);
+		expect(a.json.skipped.length + b.json.skipped.length).toBe(1);
+		const imported = await p2.jiraImported("https://jira.test", ["BULK-9902"]);
+		const id = imported.get("BULK-9902");
+		expect(id).toBeDefined();
+		expect(
+			(await p2.events()).filter((event) => event.taskId === id),
+		).toHaveLength(2);
+	});
+
+	test("a removed board target receives no cards after Jira returns", async () => {
+		const targets = new Map(projects);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const routes = createJiraRoutes({
+			gstore,
+			projects: targets,
+			box,
+			now: Date.now,
+			schedule: () => {},
+			json: (value, status = 200) => Response.json(value, { status }),
+			net: {
+				hosted: false,
+				fetch: (async (input, init) => {
+					if (String(input).includes("/search/")) {
+						entered.resolve();
+						await release.promise;
+					}
+					return stubFetch(input, init);
+				}) as typeof fetch,
+			},
+		});
+		const before = await p2.events();
+		const pending = routes.boardImport({
+			connection: "work",
+			stage: "todo",
+			assignments: [{ key: "BULK-9903", project: "p2" }],
+		});
+		await entered.promise;
+		targets.delete("p2");
+		release.resolve();
+		expect((await pending).status).toBe(409);
+		expect(
+			(await p2.jiraImported("https://jira.test", ["BULK-9903"])).size,
+		).toBe(0);
+		expect(await p2.events()).toEqual(before);
 	});
 });

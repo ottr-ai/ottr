@@ -74,7 +74,7 @@ type GlobalConfig = {
 
 const root = mkdtempSync(join(tmpdir(), "demo-data-"));
 const stateDir = join(root, "state");
-seedDemo(root, false, stateDir);
+await seedDemo(root, false, stateDir);
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 function projectNames(): string[] {
@@ -321,13 +321,13 @@ test("the seeded retro files a proposal that waits for a decision", () => {
 
 // The dev board shows the mutation meter only when progress parses as a Stryker line, so
 // the fabricated line must parse, and only the gate card may carry it.
-test("demo progress fabricates a parseable Stryker line for the gate card alone", () => {
+test("demo progress fabricates a parseable Stryker line for the gate card alone", async () => {
 	const gate = allTasks(firstBoard).find((t) =>
 		/mutation gate/i.test(t.title),
 	)!;
-	const store = ProjectStore.open(join(root, "hollowpine"));
-	const lines = demoProgressMap([["hollowpine", { store }]]);
-	store.close();
+	const store = await ProjectStore.open(join(root, "hollowpine"));
+	const lines = await demoProgressMap([["hollowpine", { store }]]);
+	await store.close();
 	const line = lines.get(`hollowpine/${gate.id}`);
 	expect(line).toBeDefined();
 	const parsed = strykerProgress(line!);
@@ -338,10 +338,10 @@ test("demo progress fabricates a parseable Stryker line for the gate card alone"
 	expect(lines.size).toBe(1);
 });
 
-test("admin is bootstrapped without a plain password", () => {
-	const store = GlobalStore.open(stateDir);
-	const config = store.get<GlobalConfig>("config");
-	store.close();
+test("admin is bootstrapped without a plain password", async () => {
+	const store = await GlobalStore.open(stateDir);
+	const config = await store.get<GlobalConfig>("config");
+	await store.close();
 	if (config === null) throw new Error("config missing after seed");
 	expect(typeof config.admin.name).toBe("string");
 	expect(typeof config.admin.passHash).toBe("string");
@@ -351,24 +351,26 @@ test("admin is bootstrapped without a plain password", () => {
 	adminPassHash = config.admin.passHash;
 });
 
-test("second seed refreshes live clocks and keeps the rest", () => {
+test("second seed refreshes live clocks and keeps the rest", async () => {
 	const before = byId(board());
 	const running = [...before.values()].find((t) => t.state === "running")!;
 	const done = [...before.values()].find(
 		(t) => t.stage === "done" && t.state === "idle",
 	)!;
-	seedDemo(root, false, stateDir);
+	await seedDemo(root, false, stateDir);
 	const after = byId(board());
 	expect(after.get(running.id)!.created_at).toBeGreaterThanOrEqual(
 		running.created_at,
 	);
 	expect(after.get(done.id)!.created_at).toBe(done.created_at);
-	const store = GlobalStore.open(stateDir);
-	expect(store.get<GlobalConfig>("config")?.admin.passHash).toBe(adminPassHash);
-	store.close();
+	const store = await GlobalStore.open(stateDir);
+	expect((await store.get<GlobalConfig>("config"))?.admin.passHash).toBe(
+		adminPassHash,
+	);
+	await store.close();
 });
 
-test("a project db held by another writer is skipped with a warning, the rest refresh", () => {
+test("a project db held by another writer is skipped with a warning, the rest refresh", async () => {
 	const names = projectNames();
 	const runningIn = (name: string) =>
 		readDb(join(root, name)).tasks.find((t) => t.state === "running");
@@ -388,7 +390,7 @@ test("a project db held by another writer is skipped with a warning, the rest re
 	const warn = spyOn(console, "warn").mockImplementation(() => {});
 	try {
 		expect(heldDb(root)).toBe(lockedPath);
-		seedDemo(root, false, stateDir);
+		await seedDemo(root, false, stateDir);
 		const warned = warn.mock.calls.flat().join("\n");
 		expect(warned).toContain(lockedPath);
 		expect(warned).not.toContain(freeName);
@@ -402,15 +404,15 @@ test("a project db held by another writer is skipped with a warning, the rest re
 	expect(runningIn(freeName)!.created_at).toBeGreaterThan(1);
 });
 
-test("a failed demo project seed leaves no partial rows", () => {
+test("a failed demo project seed leaves no partial rows", async () => {
 	const failedRoot = mkdtempSync(join(tmpdir(), "demo-seed-failure-"));
 	const projectDir = join(failedRoot, "lumen");
 	const dbPath = join(projectDir, ".tasks", "tasks.db");
 	const initialize = ProjectStore.init;
-	const init = spyOn(ProjectStore, "init").mockImplementation((dir) => {
-		const store = initialize(dir);
+	const init = spyOn(ProjectStore, "init").mockImplementation(async (dir) => {
+		const store = await initialize(dir);
 		if (dir === projectDir) {
-			store.close();
+			await store.close();
 			const db = new Database(dbPath);
 			try {
 				// Abort only after earlier task, turn, and event writes succeed.
@@ -429,7 +431,7 @@ test("a failed demo project seed leaves no partial rows", () => {
 	});
 	let failure: unknown;
 	try {
-		seedDemo(failedRoot, false, join(failedRoot, "state"));
+		await seedDemo(failedRoot, false, join(failedRoot, "state"));
 	} catch (err) {
 		failure = err;
 	} finally {
@@ -455,30 +457,32 @@ test("a failed demo project seed leaves no partial rows", () => {
 });
 
 // Two full seeds exceed bun's 5s default on slow machines; the cap is not the assertion.
-test("force reseed replaces the pool and drops stale projects", () => {
+test("force reseed replaces the pool and drops stale projects", async () => {
 	const refreshed = [...byId(board()).values()].find(
 		(t) => t.state === "running",
 	)!;
 	const junk = join(root, "junkbox");
 	mkdirSync(join(junk, ".tasks"), { recursive: true });
 	new Database(join(junk, ".tasks", "tasks.db")).close();
-	seedDemo(root, true, stateDir);
+	await seedDemo(root, true, stateDir);
 	expect(existsSync(junk)).toBe(false);
 	const reseeded = byId(board()).get(refreshed.id)!;
 	// every boot leaves a running card freshly restarted, a force reseed included
 	expect(reseeded.created_at).toBeGreaterThanOrEqual(Date.now() - 10 * 60_000);
-	const store = GlobalStore.open(stateDir);
-	expect(store.get<GlobalConfig>("config")?.admin.passHash).toBe(adminPassHash);
-	store.close();
+	const store = await GlobalStore.open(stateDir);
+	expect((await store.get<GlobalConfig>("config"))?.admin.passHash).toBe(
+		adminPassHash,
+	);
+	await store.close();
 }, 20_000);
 
 // plantCards regression (OTTR-776): a fixture spec with an empty tasks array routes
 // through seedTaskId's index counting, which cannot see the rows the pool seed wrote
 // and derives the same first id for every plant. A plant passes explicit ids instead.
-test("insertTaskRow honors an explicit id for fixture plants", () => {
+test("insertTaskRow honors an explicit id for fixture plants", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "demo-plant-"));
 	try {
-		ProjectStore.init(dir).close();
+		await (await ProjectStore.init(dir)).close();
 		const db = new Database(join(dir, ".tasks", "tasks.db"));
 		try {
 			const lumen: ProjectSpec = {

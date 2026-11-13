@@ -422,6 +422,7 @@ import {
 	pruneSubs,
 	saveSubs,
 	sendAll,
+	updateSubs,
 } from "./webpush.ts";
 import type { WorkerTarget } from "./workers.ts";
 import {
@@ -524,61 +525,49 @@ export type Entry = TurnProject;
  * blocked and a later one sees it free. `prev` is the report the previous refresh processed
  * (null on the first refresh after a start: no evidence yet, nothing releases). Returns the
  * released card count. */
-export function releaseUsageHolds(
+export async function releaseUsageHolds(
 	q: QuotaState,
 	projects: Iterable<{ store: ProjectStore }>,
 	now: number,
 	prev: QuotaState | null = null,
-): number {
-	const held = new Map<
-		string,
-		{ store: ProjectStore; id: string; holdSetAt: number }[]
-	>();
-	for (const p of projects)
-		for (const t of p.store.listTasks()) {
-			if (
-				t.cancelledAt !== null ||
-				t.holdUntil === null ||
-				t.holdUntil <= now ||
-				t.holdProvider === null
-			)
-				continue;
-			const list = held.get(t.holdProvider) ?? [];
-			// A legacy row (pre hold_set_at) reads 0: every post-start sighting counts for it.
-			list.push({ store: p.store, id: t.id, holdSetAt: t.holdSetAt ?? 0 });
-			held.set(t.holdProvider, list);
-		}
+): Promise<number> {
+	const counts = new Map<string, number>();
 	let released = 0;
-	for (const [provider, cards] of held) {
-		const rows = forProvider(q.limits, provider);
-		// No data for the provider (a failed usage check included): holdUntil stays the bound.
-		if (rows.length === 0 || providerBlocked(rows, provider, now) !== null)
-			continue;
-		// Recovery evidence: an earlier refresh saw a blocking window of this provider
-		// (100% used with a future reset at that time). The same test both halves use:
-		// a stale row at 100% whose reset passed or is unnamed is not evidence — it
-		// reads as free here too, and treating it as the sighting would loop.
-		const seen =
-			prev !== null && providerBlocked(prev.limits, provider, prev.at) !== null;
-		if (!seen) continue;
-		let freed = 0;
-		for (const c of cards) {
-			// Only sightings after the hold was set say anything about this hold.
-			if (prev.at < c.holdSetAt) continue;
-			c.store.updateTask(c.id, {
-				holdUntil: null,
-				holdProvider: null,
-				holdWindow: null,
-				holdSetAt: null,
-			});
-			freed++;
-		}
-		released += freed;
-		if (freed > 0)
-			console.log(
-				`[quota] released ${freed} cards held for ${provider}: the limit reports free again`,
-			);
-	}
+	for (const p of projects)
+		await p.store.transaction(async () => {
+			for (const t of await p.store.listTasks()) {
+				if (
+					t.cancelledAt !== null ||
+					t.holdUntil === null ||
+					t.holdUntil <= now ||
+					t.holdProvider === null
+				)
+					continue;
+				const provider = t.holdProvider;
+				const rows = forProvider(q.limits, provider);
+				if (rows.length === 0 || providerBlocked(rows, provider, now) !== null)
+					continue;
+				// Only a blocked sighting after this hold can prove recovery.
+				if (
+					prev === null ||
+					prev.at < (t.holdSetAt ?? 0) ||
+					providerBlocked(prev.limits, provider, prev.at) === null
+				)
+					continue;
+				await p.store.updateTask(t.id, {
+					holdUntil: null,
+					holdProvider: null,
+					holdWindow: null,
+					holdSetAt: null,
+				});
+				counts.set(provider, (counts.get(provider) ?? 0) + 1);
+				released++;
+			}
+		});
+	for (const [provider, count] of counts)
+		console.log(
+			`[quota] released ${count} cards held for ${provider}: the limit reports free again`,
+		);
 	return released;
 }
 
@@ -607,14 +596,14 @@ interface AppDeps {
 		id: string,
 		choices: unknown,
 	): Promise<FinishKeptOutcome>;
-	claimedPids(): Set<number>;
+	claimedPids(): Set<number> | Promise<Set<number>>;
 	/** Live progress of the task's running turn (TaskCard.progress) and when its moving part
 	 * last changed (silentSince's activity, absent until the first numbered status); absent in tests. */
 	progressOf?(
 		project: string,
 		id: string,
 	): { text: string; at?: number } | null;
-	schedule: () => void;
+	schedule: () => void | Promise<void>;
 	/** Node env style clock for the idle-review logic only; tests inject a fixed clock.
 	 * Defaults to Date.now. */
 	now?: () => number;
@@ -801,12 +790,12 @@ export async function behindMain(
 
 /** The persisted removed/added project paths and display order; boot discovery needs them
  * before createApp runs. */
-export function storedProjectPaths(gstore: GlobalStore): {
+export async function storedProjectPaths(gstore: GlobalStore): Promise<{
 	removedPaths: string[];
 	projectPaths: string[];
 	projectOrder: string[];
-} {
-	const c = gstore.get<{
+}> {
+	const c = await gstore.get<{
 		removed?: unknown;
 		projects?: unknown;
 		projectOrder?: unknown;
@@ -1794,7 +1783,8 @@ const settingParsers: FieldParser[] = [
 ];
 
 /** The serve options createApp hands to Bun.serve; the shape tests spread into their own servers. */
-export type AppServeOptions = ReturnType<typeof createApp>["serveOptions"];
+export type App = Awaited<ReturnType<typeof createApp>>;
+export type AppServeOptions = App["serveOptions"];
 
 /** OTTR-488: card-view steps — the stored value, except legacy 'unknown' rows resolve against the stored report at read time (no row rewrite). 'unknown' in a view means quiet. */
 function viewSteps(t: Pick<Task, "steps" | "report">): Task["steps"] {
@@ -1806,28 +1796,21 @@ function viewSteps(t: Pick<Task, "steps" | "report">): Task["steps"] {
 }
 
 /** OTTR-566: epoch ms before which every done card counts as read (module-level helper; see createApp). A missing/corrupt row restamps and persists the fresh stamp. */
-function initialSeenDoneSince(deps: AppDeps): number {
-	const storedDoneSince: unknown = deps.gstore.get<unknown>("seen_done_since");
-	const seenDoneSince =
-		typeof storedDoneSince === "number" && Number.isFinite(storedDoneSince)
-			? storedDoneSince
-			: Date.now();
-	if (seenDoneSince !== storedDoneSince)
-		deps.gstore.set("seen_done_since", seenDoneSince);
-	return seenDoneSince;
+async function initialSeenDoneSince(deps: AppDeps): Promise<number> {
+	return deps.gstore.update<number>("seen_done_since", (current) =>
+		typeof current === "number" && Number.isFinite(current)
+			? current
+			: Date.now(),
+	);
 }
 
 /** Sorted task ids marked as read; missing/corrupt row = empty. */
-function loadSeenFrom(deps: AppDeps): string[] {
-	const parsed: unknown = deps.gstore.get<unknown>("seen_answers");
+async function loadSeenFrom(deps: AppDeps): Promise<string[]> {
+	const parsed: unknown = await deps.gstore.get<unknown>("seen_answers");
 	if (!Array.isArray(parsed)) return [];
 	return [
 		...new Set(parsed.filter((s): s is string => typeof s === "string")),
 	].sort();
-}
-
-function saveSeenTo(deps: AppDeps, ids: string[]): void {
-	deps.gstore.set("seen_answers", [...new Set(ids)].sort());
 }
 
 /** Dependency seams used by createApp, with their production defaults; one object so the
@@ -1886,10 +1869,16 @@ function createAppPathDefaults(deps: AppDeps): {
  * (turn rows without ended_at) decide which layer folders stay registered as in use,
  * so alate's clean-up never deletes a layer a crashed-but-live turn reads. Fail-soft:
  * a broken store or registry only degrades clean-up, it never breaks the boot. */
-function bootReconcileLayers(deps: AppDeps): void {
+async function bootReconcileLayers(deps: AppDeps): Promise<void> {
 	try {
 		reconcileLayerUse(
-			[...deps.projects.values()].flatMap((e) => e.store.listOpenTurnLayers()),
+			(
+				await Promise.all(
+					[...deps.projects.values()].map(
+						async (e) => await e.store.listOpenTurnLayers(),
+					),
+				)
+			).flat(),
 		);
 	} catch (err) {
 		console.warn(`layers: in-use reconcile failed: ${errmsg(err)}`);
@@ -1911,10 +1900,53 @@ export function dependabotHeadPrefix(line: string): string | null {
 	return `Dependabot PR #${n} (${m[2]})`;
 }
 
-export function createApp(deps: AppDeps) {
+async function someAsync<T>(
+	items: Iterable<T>,
+	test: (item: T) => Promise<boolean>,
+): Promise<boolean> {
+	for (const item of items) if (await test(item)) return true;
+	return false;
+}
+
+class TaskConflict extends Error {
+	entry: Entry;
+	task: Task;
+	constructor(entry: Entry, task: Task) {
+		super("card changed since it was loaded");
+		this.entry = entry;
+		this.task = task;
+	}
+}
+
+export async function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
 		createAppNetworkDefaults(deps);
 	const { now, slowApiMs } = createAppClockDefaults(deps);
+	let closing = false;
+	let closePromise: Promise<void> | null = null;
+	const internalWork = new Set<Promise<unknown>>();
+
+	function trackWork<T>(label: string, work: Promise<T>): Promise<T> {
+		internalWork.add(work);
+		void work.then(
+			() => {
+				internalWork.delete(work);
+			},
+			(err) => {
+				internalWork.delete(work);
+				logError(label, err);
+			},
+		);
+		return work;
+	}
+
+	function backgroundTick(
+		label: string,
+		work: () => Promise<void>,
+	): Promise<void> {
+		if (closing) return Promise.resolve();
+		return trackWork(label, Promise.resolve().then(work));
+	}
 	let lastInputAt = now();
 	const prod = deps.prod === true;
 	const { sshDir, workersHome, keyscan } = createAppPathDefaults(deps);
@@ -1923,13 +1955,20 @@ export function createApp(deps: AppDeps) {
 	// (turn rows without ended_at) decide which layer folders stay registered as in use,
 	// so alate's clean-up never deletes a layer a crashed-but-live turn reads. Fail-soft:
 	// a broken store or registry only degrades clean-up, it never breaks the boot.
-	bootReconcileLayers(deps);
+	await bootReconcileLayers(deps);
 	// Sorted task ids marked as read; missing/corrupt row = empty. The bodies live at
-	// module level (loadSeenFrom/saveSeenTo): the store is the only state they touch.
-	const loadSeen = (): string[] => loadSeenFrom(deps);
-	const saveSeen = (ids: string[]): void => saveSeenTo(deps, ids);
+	// module level (loadSeenFrom). Atomic updates preserve concurrent read marks.
+	const loadSeen = async (): Promise<string[]> => await loadSeenFrom(deps);
 
-	const seenDoneSince = initialSeenDoneSince(deps);
+	const updateSeen = (modify: (ids: string[]) => string[]) =>
+		deps.gstore.update<unknown>("seen_answers", (raw) => {
+			const ids = Array.isArray(raw)
+				? raw.filter((id): id is string => typeof id === "string")
+				: [];
+			return [...new Set(modify(ids))].sort();
+		});
+
+	const seenDoneSince = await initialSeenDoneSince(deps);
 
 	/** Read-mark keys a mark can stick to right now, by the same rule the state frame
 	 * ships (stateResponse): plain ids of question-only answered cards, pr_review cards and
@@ -1940,13 +1979,13 @@ export function createApp(deps: AppDeps) {
 	 * it merely had open — so /api/seen drops them and the store decays instead of poisoning the board. */
 	/** Whether a card's plain id is a read-mark key right now: pr_review, question-only answered,
 	 *  or done research whose report resolves to a steps value (see seenableIds). */
-	function cardSeenable(t: ListedTask, e: Entry): boolean {
+	async function cardSeenable(t: ListedTask, e: Entry): Promise<boolean> {
 		return (
 			t.cancelledAt === null &&
 			(t.kind === "pr_review" ||
 				(t.stage === "done" &&
 					!isRetro(t) &&
-					answeredCard(e.store.listTurns(t.id))) ||
+					answeredCard(await e.store.listTurns(t.id))) ||
 				(t.research &&
 					t.stage === "done" &&
 					t.report !== null &&
@@ -1970,19 +2009,19 @@ export function createApp(deps: AppDeps) {
 
 	/** Adds one store's read-mark keys (see seenableIds); throws so the caller's fail-soft
 	 *  catch can skip a sick store. */
-	function addStoreSeenable(ids: Set<string>, e: Entry): void {
-		for (const t of e.store.listTasks()) {
-			if (cardSeenable(t, e)) ids.add(t.id);
+	async function addStoreSeenable(ids: Set<string>, e: Entry): Promise<void> {
+		for (const t of await e.store.listTasks()) {
+			if (await cardSeenable(t, e)) ids.add(t.id);
 			const k = doneKeyOf(t);
 			if (k !== null) ids.add(k);
 		}
 	}
 
-	function seenableIds(): Set<string> {
+	async function seenableIds(): Promise<Set<string>> {
 		const ids = new Set<string>();
 		for (const e of deps.projects.values()) {
 			try {
-				addStoreSeenable(ids, e);
+				await addStoreSeenable(ids, e);
 			} catch (err) {
 				// A sick store contributes nothing, like in stateResponse.
 				logStoreError(e.store.name, err);
@@ -1992,53 +2031,59 @@ export function createApp(deps: AppDeps) {
 	}
 	/** Existing VAPID keys, generating and persisting them on the first push path (never at boot). */
 	let vapidApplied = false;
-	function ensureVapid(): {
+	async function ensureVapid(): Promise<{
 		publicKey: string;
 		privateKey: string;
 		subject: string;
-	} {
-		if (vapid === null) {
-			const keys = generateVAPIDKeys();
-			vapid = { ...keys, subject: PUSH_SUBJECT };
-			// ADR-0011 recovery: rebind, never delete. After a pair change every
-			// pre-existing subscription binds to the outgoing key — bound subs by
-			// their stamp, legacy subs because they could only have been created
-			// while the previous pair was current. Rebinding keeps the per-sub
-			// stale rule covering both and never deletes the evidence a
-			// recovering device needs.
-			const previous =
-				deps.gstore.get<string | null>("push_vapid_key") ??
-				previousVapidPublicKey;
-			const subs = loadSubs(deps.gstore);
+	}> {
+		const pair = await deps.gstore.transaction(async () => {
+			if (vapid === null) {
+				const keys = generateVAPIDKeys();
+				vapid = { ...keys, subject: PUSH_SUBJECT };
+				// ADR-0011 recovery: rebind, never delete. After a pair change every
+				// pre-existing subscription binds to the outgoing key — bound subs by
+				// their stamp, legacy subs because they could only have been created
+				// while the previous pair was current. Rebinding keeps the per-sub
+				// stale rule covering both and never deletes the evidence a
+				// recovering device needs.
+				const previous =
+					(await deps.gstore.get<string | null>("push_vapid_key")) ??
+					previousVapidPublicKey;
+				const subs = await loadSubs(deps.gstore);
+				if (
+					previous !== null &&
+					previous !== vapid.publicKey &&
+					subs.some((s) => s.vapidPublicKey === undefined)
+				)
+					await saveSubs(
+						deps.gstore,
+						subs.map((s) =>
+							s.vapidPublicKey === undefined
+								? { ...s, vapidPublicKey: previous }
+								: s,
+						),
+					);
+				await saveConfig();
+			}
+			// Recording the load path too: an upgraded board's first ensure records the
+			// stored pair's key, so a later recovery can rebind subs created before
+			// the upgrade.
 			if (
-				previous !== null &&
-				previous !== vapid.publicKey &&
-				subs.some((s) => s.vapidPublicKey === undefined)
+				(await deps.gstore.get<string | null>("push_vapid_key")) !==
+				vapid.publicKey
 			)
-				saveSubs(
-					deps.gstore,
-					subs.map((s) =>
-						s.vapidPublicKey === undefined
-							? { ...s, vapidPublicKey: previous }
-							: s,
-					),
-				);
-			saveConfig();
-		}
-		// Recording the load path too: an upgraded board's first ensure records the
-		// stored pair's key, so a later recovery can rebind subs created before
-		// the upgrade.
-		if (deps.gstore.get<string | null>("push_vapid_key") !== vapid.publicKey)
-			deps.gstore.set("push_vapid_key", vapid.publicKey);
-		// Keys loaded from config at boot skip the branch above, but web-push's module state
+				await deps.gstore.set("push_vapid_key", vapid.publicKey);
+			return vapid;
+		});
+		// Keys loaded from config skip the branch above. web-push's module state
 		// is per-process: without this, sends go out unsigned and FCM answers 401. The
 		// constant subject, not the stored one, heals configs saved before R2-3 (Apple
 		// answers 403 BadJwtToken for mailto:...@localhost); the subject is not bound to subs.
 		if (!vapidApplied) {
-			setVapidDetails(PUSH_SUBJECT, vapid.publicKey, vapid.privateKey);
+			setVapidDetails(PUSH_SUBJECT, pair.publicKey, pair.privateKey);
 			vapidApplied = true;
 		}
-		return vapid;
+		return pair;
 	}
 	// --- Alert push (OTTR-494): the server decides every OS-level event, Web Push delivers it ---
 	/** Card facts of the last published frame: the event diff's baseline. Null until the first
@@ -2068,7 +2113,7 @@ export function createApp(deps: AppDeps) {
 			if (isClass(c) && typeof n === "number") out[c] = n;
 		return out;
 	};
-	loadAlertState();
+	await loadAlertState();
 	/** The stored push endpoints of one live alert; a malformed row contributes nothing. */
 	function endpointList(v: unknown): string[] {
 		return Array.isArray(v)
@@ -2127,23 +2172,27 @@ export function createApp(deps: AppDeps) {
 		restoreSeqs(r.seqs);
 	}
 	/** Restores the live-alert registry, the pending Apple clears and the sequence numbers from the stored row; malformed rows contribute nothing. */
-	function loadAlertState(): void {
-		restoreAlertRow(deps.gstore.get<unknown>(ALERT_STATE_KEY));
+	async function loadAlertState(): Promise<void> {
+		restoreAlertRow(await deps.gstore.get<unknown>(ALERT_STATE_KEY));
 	}
 	/** Writes the registry, the pending Apple clears and the sequence numbers; drops entries of
 	 * gone devices. */
-	function saveAlertState(): void {
-		const endpoints = new Set(loadSubs(deps.gstore).map((s) => s.endpoint));
-		appleClear = new Map(
-			[...appleClear].filter(
-				([e, b]) => endpoints.has(e) && Object.keys(b).length > 0,
-			),
-		);
-		alertSeqs = new Map([...alertSeqs].filter(([e]) => endpoints.has(e)));
-		deps.gstore.set(ALERT_STATE_KEY, {
-			alerts: liveAlerts,
-			appleClear: Object.fromEntries(appleClear),
-			seqs: Object.fromEntries(alertSeqs),
+	async function saveAlertState(): Promise<void> {
+		return deps.gstore.transaction(async () => {
+			const endpoints = new Set(
+				(await loadSubs(deps.gstore)).map((s) => s.endpoint),
+			);
+			appleClear = new Map(
+				[...appleClear].filter(
+					([e, b]) => endpoints.has(e) && Object.keys(b).length > 0,
+				),
+			);
+			alertSeqs = new Map([...alertSeqs].filter(([e]) => endpoints.has(e)));
+			await deps.gstore.set(ALERT_STATE_KEY, {
+				alerts: liveAlerts,
+				appleClear: Object.fromEntries(appleClear),
+				seqs: Object.fromEntries(alertSeqs),
+			});
 		});
 	}
 	/** Board tab id → epoch ms of its last focus heartbeat (POST /api/presence). Map order is
@@ -2152,13 +2201,15 @@ export function createApp(deps: AppDeps) {
 	const PRESENCE_TABS_MAX = 200;
 
 	/** Acknowledged inbox keys: shared by every browser, read by the service worker. */
-	function loadInboxSeen(): string[] {
-		return normalizeSeen(deps.gstore.get<unknown>("inbox_seen"));
+	async function loadInboxSeen(): Promise<string[]> {
+		return normalizeSeen(await deps.gstore.get<unknown>("inbox_seen"));
 	}
 
 	/** Projects whose alerts never push (the bell still lights); missing/corrupt row = none. */
-	function loadMuted(): string[] {
-		const raw: unknown = deps.gstore.get<unknown>("notify_muted_projects");
+	async function loadMuted(): Promise<string[]> {
+		const raw: unknown = await deps.gstore.get<unknown>(
+			"notify_muted_projects",
+		);
 		if (!Array.isArray(raw)) return [];
 		return [...new Set(raw.filter((s): s is string => typeof s === "string"))];
 	}
@@ -2170,16 +2221,16 @@ export function createApp(deps: AppDeps) {
 	 * failed. A clean reported hold stores its reason in turns.error too (turn.ts finishTurn);
 	 * that is a Request, not an Error. A deliberate cancel (error "cancelled", see
 	 * ProjectStore.finishTurn) is no failure either. A sick store keeps `fallback`. */
-	function latestTurnError(
+	async function latestTurnError(
 		project: string,
 		id: string,
 		fallback: Pick<AlertCardInput, "errorTurn" | "errorText"> | undefined,
-	): Pick<AlertCardInput, "errorTurn" | "errorText"> {
+	): Promise<Pick<AlertCardInput, "errorTurn" | "errorText">> {
 		const none = { errorTurn: null, errorText: null };
 		const e = deps.projects.get(project);
 		if (e === undefined) return none;
 		try {
-			const turn = e.store.lastSettledTurn(id);
+			const turn = await e.store.lastSettledTurn(id);
 			const failed =
 				turn !== null &&
 				turn.error !== null &&
@@ -2196,32 +2247,34 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** The event diff's view of the frame's cards. */
-	function alertInputs(
+	async function alertInputs(
 		tasks: readonly TaskCard[],
 		prev: readonly AlertCardInput[] | null,
-	): AlertCardInput[] {
+	): Promise<AlertCardInput[]> {
 		const before = new Map((prev ?? []).map((p) => [p.id, p]));
-		return tasks.map((t) => {
-			const err = latestTurnError(t.project, t.id, before.get(t.id));
-			return {
-				id: t.id,
-				project: t.project,
-				title: t.title,
-				sessionTitle: t.sessionTitle,
-				state: t.state,
-				stage: t.stage,
-				kind: t.kind,
-				asked: t.asked,
-				answered: t.answered,
-				needsReason: t.needsReason,
-				summary: t.summary,
-				errorTurn: err.errorTurn,
-				errorText: err.errorText,
-				prDraft: t.prOccurrence?.draft ?? null,
-				prComments: t.prOccurrence?.comments ?? null,
-				cancelled: t.cancelledAt !== null,
-			};
-		});
+		return await Promise.all(
+			tasks.map(async (t) => {
+				const err = await latestTurnError(t.project, t.id, before.get(t.id));
+				return {
+					id: t.id,
+					project: t.project,
+					title: t.title,
+					sessionTitle: t.sessionTitle,
+					state: t.state,
+					stage: t.stage,
+					kind: t.kind,
+					asked: t.asked,
+					answered: t.answered,
+					needsReason: t.needsReason,
+					summary: t.summary,
+					errorTurn: err.errorTurn,
+					errorText: err.errorText,
+					prDraft: t.prOccurrence?.draft ?? null,
+					prComments: t.prOccurrence?.comments ?? null,
+					cancelled: t.cancelledAt !== null,
+				};
+			}),
+		);
 	}
 
 	/** Drops task-derived seen keys whose occurrence is over: a `task:` key no card's current
@@ -2325,103 +2378,113 @@ export function createApp(deps: AppDeps) {
 		return out;
 	}
 
-	/** Fire-and-forget: every payload to its device; prunes 404/410 endpoints. Never throws into the caller's path. */
-	function sendPushes(
+	/** Delivery continues as tracked work. App shutdown drains it before store closure. */
+	async function sendPushes(
 		batches: ReadonlyArray<{
 			sub: PushSub;
 			payloads: ReadonlyArray<AlertPayload | ClearPayload>;
 		}>,
-	): void {
+	): Promise<void> {
 		if (batches.every((b) => b.payloads.length === 0)) return;
-		ensureVapid();
-		void Promise.all(
-			batches.flatMap(({ sub, payloads }) =>
-				payloads.map((p) =>
-					sendAll([sub], JSON.stringify(p), (s, body) =>
-						sendNotification(s, body),
+		await ensureVapid();
+		void trackWork(
+			"push failed",
+			Promise.all(
+				batches.flatMap(({ sub, payloads }) =>
+					payloads.map((p) =>
+						sendAll([sub], JSON.stringify(p), (s, body) =>
+							sendNotification(s, body),
+						),
 					),
 				),
-			),
-		)
-			.then((reports) => {
+			).then(async (reports) => {
 				// Prune gone endpoints against a fresh read (R2-7): the pre-send snapshot is
 				// stale by the time the network answers, and writing it back would drop or
 				// resurrect subscriptions that changed during the sends.
 				const gone = new Set<string>();
 				for (const r of reports) for (const g of r.gone) gone.add(g);
-				pruneSubs(deps.gstore, gone);
-			})
-			.catch((err) => logError("push failed", err));
+				await pruneSubs(
+					deps.gstore,
+					gone,
+					batches.map((b) => b.sub),
+				);
+			}),
+		);
 	}
 
 	/** One frame's push pass: retract alerts whose cause cleared or that were acked, then deliver
 	 * the frame's new events per device (class switches, project mute). A focused board tab holds
 	 * the new events — dropped, never sent later; they still sit in the inbox — but never the retraction. */
-	function pushAlerts(
+	async function pushAlerts(
 		inputs: readonly AlertCardInput[],
 		events: readonly AlertEvent[],
 		seen: ReadonlySet<string>,
-	): void {
-		const rekeyed = rekeyAlerts(inputs);
-		const removed = retire(clearedAlerts(liveAlerts, inputs, seen));
-		const fresh = presenceHolds(focusAt, now())
-			? []
-			: events.filter((e) => !seen.has(e.key));
-		if (fresh.length === 0 && removed.length === 0) {
-			if (rekeyed) saveAlertState();
-			return;
-		}
-		const subs = loadSubs(deps.gstore);
-		const muted = new Set(loadMuted());
-		const toOf = new Map(
-			fresh.map((e) => [
-				e.key,
-				subs
-					.filter((s) => deliverable(s.classes, muted, e))
-					.map((s) => s.endpoint),
-			]),
-		);
-		// An alert no device got needs no retraction, so it never enters the registry.
-		const sent = fresh.filter((e) => (toOf.get(e.key)?.length ?? 0) > 0);
-		if (sent.length > 0) {
-			const keys = new Set(sent.map((e) => e.key));
-			liveAlerts = [
-				...liveAlerts.filter((a) => !keys.has(a.key)),
-				...sent.map((e) => ({
-					key: e.key,
-					sent: e.key,
-					class: e.class,
-					taskId: e.taskId,
-					project: e.project,
-					to: toOf.get(e.key) ?? [],
-				})),
-			];
-		}
-		const batches = subs.map((sub) => {
-			const mine = liveAlerts.filter((a) => a.to.includes(sub.endpoint));
-			// The class notification stands for every alert of the class this device still
-			// shows, so its keys (and a grouped count) cover all of them, not just this frame.
-			const liveKeys: Record<AlertClass, string[]> = {
-				request: [],
-				error: [],
-				complete: [],
-			};
-			for (const a of mine) liveKeys[a.class].push(a.key);
-			const clear = tagsToClear(removed, mine, sub.endpoint);
-			return {
-				sub,
-				payloads: batchFor(
+	): Promise<void> {
+		const batches = await deps.gstore.transaction(async () => {
+			const acknowledged = new Set([...seen, ...(await loadInboxSeen())]);
+			lastAlertInputs = [...inputs];
+			const rekeyed = rekeyAlerts(inputs);
+			const removed = retire(clearedAlerts(liveAlerts, inputs, acknowledged));
+			const fresh = presenceHolds(focusAt, now())
+				? []
+				: events.filter((e) => !acknowledged.has(e.key));
+			if (fresh.length === 0 && removed.length === 0) {
+				if (rekeyed) await saveAlertState();
+				return;
+			}
+			const subs = await loadSubs(deps.gstore);
+			const muted = new Set(await loadMuted());
+			const toOf = new Map(
+				fresh.map((e) => [
+					e.key,
+					subs
+						.filter((s) => deliverable(s.classes, muted, e))
+						.map((s) => s.endpoint),
+				]),
+			);
+			// An alert no device got needs no retraction, so it never enters the registry.
+			const sent = fresh.filter((e) => (toOf.get(e.key)?.length ?? 0) > 0);
+			if (sent.length > 0) {
+				const keys = new Set(sent.map((e) => e.key));
+				liveAlerts = [
+					...liveAlerts.filter((a) => !keys.has(a.key)),
+					...sent.map((e) => ({
+						key: e.key,
+						sent: e.key,
+						class: e.class,
+						taskId: e.taskId,
+						project: e.project,
+						to: toOf.get(e.key) ?? [],
+					})),
+				];
+			}
+			const batches = subs.map((sub) => {
+				const mine = liveAlerts.filter((a) => a.to.includes(sub.endpoint));
+				// The class notification stands for every alert of the class this device still
+				// shows, so its keys (and a grouped count) cover all of them, not just this frame.
+				const liveKeys: Record<AlertClass, string[]> = {
+					request: [],
+					error: [],
+					complete: [],
+				};
+				for (const a of mine) liveKeys[a.class].push(a.key);
+				const clear = tagsToClear(removed, mine, sub.endpoint);
+				return {
 					sub,
-					payloadsFor(
-						sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
-						liveKeys,
+					payloads: batchFor(
+						sub,
+						payloadsFor(
+							sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
+							liveKeys,
+						),
+						clear,
 					),
-					clear,
-				),
-			};
+				};
+			});
+			await saveAlertState();
+			return batches;
 		});
-		saveAlertState();
-		sendPushes(batches);
+		if (batches !== undefined) await sendPushes(batches);
 	}
 
 	/** Applies rekeyErrorAlerts to the registry; true when a key changed. */
@@ -2434,26 +2497,33 @@ export function createApp(deps: AppDeps) {
 
 	/** Retraction right after an ack (POST /api/inbox/seen), so the devices close the acked alerts
 	 * at once instead of at the next card change. */
-	function retractAcked(): void {
-		if (lastAlertInputs === null || liveAlerts.length === 0) return;
-		const rekeyed = rekeyAlerts(lastAlertInputs);
-		const removed = retire(
-			clearedAlerts(liveAlerts, lastAlertInputs, new Set(loadInboxSeen())),
-		);
-		if (removed.length === 0) {
-			if (rekeyed) saveAlertState();
-			return;
-		}
-		const batches = loadSubs(deps.gstore).map((sub) => ({
-			sub,
-			payloads: batchFor(
+	async function retractAcked(): Promise<void> {
+		const batches = await deps.gstore.transaction(async () => {
+			if (lastAlertInputs === null || liveAlerts.length === 0) return;
+			const rekeyed = rekeyAlerts(lastAlertInputs);
+			const removed = retire(
+				clearedAlerts(
+					liveAlerts,
+					lastAlertInputs,
+					new Set(await loadInboxSeen()),
+				),
+			);
+			if (removed.length === 0) {
+				if (rekeyed) await saveAlertState();
+				return;
+			}
+			const batches = (await loadSubs(deps.gstore)).map((sub) => ({
 				sub,
-				[],
-				tagsToClear(removed, liveAlerts, sub.endpoint),
-			),
-		}));
-		saveAlertState();
-		sendPushes(batches);
+				payloads: batchFor(
+					sub,
+					[],
+					tagsToClear(removed, liveAlerts, sub.endpoint),
+				),
+			}));
+			await saveAlertState();
+			return batches;
+		});
+		if (batches !== undefined) await sendPushes(batches);
 	}
 
 	/** Single admin (set by /api/setup): null means the board is in onboarding. Loopback never checks it. */
@@ -2626,9 +2696,11 @@ export function createApp(deps: AppDeps) {
 		if (body === null || !(days === 30 || (days >= 0 && days <= 14))) return;
 		if (presenceHolds(focusAt, now())) return;
 		try {
-			const subs = loadSubs(deps.gstore).filter((s) => s.classes.request);
+			const subs = (await loadSubs(deps.gstore)).filter(
+				(s) => s.classes.request,
+			);
 			if (subs.length > 0) {
-				ensureVapid();
+				await ensureVapid();
 				await sendAll(
 					subs,
 					JSON.stringify({
@@ -2764,8 +2836,10 @@ export function createApp(deps: AppDeps) {
 		const target = deps.workerTarget;
 		if (!target || target.urls.length === 0) return;
 		await Promise.all(
-			target.urls.map(async (url) =>
-				storeWorkerReport(url, await probeWorkerSignIns(url, target.token)),
+			await Promise.all(
+				target.urls.map(async (url) =>
+					storeWorkerReport(url, await probeWorkerSignIns(url, target.token)),
+				),
 			),
 		);
 	}
@@ -2802,8 +2876,8 @@ export function createApp(deps: AppDeps) {
 	let updates: {
 		checkedAt: string;
 		updates: UpdateRecord[];
-	} | null = (() => {
-		const v = deps.gstore.get<unknown>("updates");
+	} | null = await (async () => {
+		const v = await deps.gstore.get<unknown>("updates");
 		if (typeof v !== "object" || v === null) return null;
 		const r = v as Record<string, unknown>;
 		return typeof r.checkedAt === "string" && Array.isArray(r.updates)
@@ -2815,12 +2889,12 @@ export function createApp(deps: AppDeps) {
 	})();
 	let updatesInFlight: Promise<void> | null = null;
 	// Pending decisions from the dropped forward design become local skips.
-	migratePendingToSkips(deps.gstore);
+	await migratePendingToSkips(deps.gstore);
 
 	/** State-frame view: repo→project mapping and decision/skip filtering run against live projects. */
-	function updatesView(): UpdatesView | null {
+	async function updatesView(): Promise<UpdatesView | null> {
 		if (updates === null) return null;
-		const hidden = new Set(loadSkips(deps.gstore));
+		const hidden = new Set(await loadSkips(deps.gstore));
 		return {
 			checkedAt: updates.checkedAt,
 			rows: updates.updates
@@ -2845,7 +2919,10 @@ export function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		enabled: () => deps.shared.trendingScan,
 		load: loadTrendingState,
-		save: (s: TrendingState) => deps.gstore.set("trending", s),
+		update: (modify) =>
+			deps.gstore.update<TrendingState>("trending", (current) =>
+				modify(normalizeTrendingState(current)),
+			),
 		token: () => process.env.GH_TOKEN,
 		apiBase: () => githubHost().apiBase,
 		fetch: deps.trendingFetch,
@@ -2856,16 +2933,22 @@ export function createApp(deps: AppDeps) {
 
 	/** The stored TrendingState; missing or malformed = EMPTY_TRENDING_STATE (a malformed
 	 * field alone falls back to its empty value). */
-	function loadTrendingState(): TrendingState {
-		const s = deps.gstore.get<Record<string, unknown>>("trending");
+	async function loadTrendingState(): Promise<TrendingState> {
+		return normalizeTrendingState(
+			await deps.gstore.get<Record<string, unknown>>("trending"),
+		);
+	}
+
+	function normalizeTrendingState(s: unknown): TrendingState {
 		if (typeof s !== "object" || s === null || Array.isArray(s))
 			return { ...EMPTY_TRENDING_STATE };
 		const num = (v: unknown): number | null =>
 			typeof v === "number" && Number.isFinite(v) ? v : null;
-		const err = s.lastError as { reason?: unknown; at?: unknown } | null;
+		const value = s as Record<string, unknown>;
+		const err = value.lastError as { reason?: unknown; at?: unknown } | null;
 		return {
-			lastWeek: typeof s.lastWeek === "string" ? s.lastWeek : null,
-			lastRunAt: num(s.lastRunAt),
+			lastWeek: typeof value.lastWeek === "string" ? value.lastWeek : null,
+			lastRunAt: num(value.lastRunAt),
 			lastError:
 				typeof err === "object" &&
 				err !== null &&
@@ -2873,7 +2956,7 @@ export function createApp(deps: AppDeps) {
 				num(err.at) !== null
 					? { reason: err.reason, at: err.at as number }
 					: null,
-			firstFailAt: num(s.firstFailAt),
+			firstFailAt: num(value.firstFailAt),
 		};
 	}
 
@@ -2887,12 +2970,11 @@ export function createApp(deps: AppDeps) {
 		// or the updated card never wears the unread badge again. OTTR-827: the
 		// completion key goes with the plain id, or a done card's rail mark would
 		// outlive the badge the new comments earn.
-		forgetSeen: (taskId) =>
-			saveSeen(
-				loadSeen().filter(
-					(id) => id !== taskId && !id.startsWith(`${taskId}@`),
-				),
-			),
+		forgetSeen: async (taskId) => {
+			await updateSeen((ids) =>
+				ids.filter((id) => id !== taskId && !id.startsWith(`${taskId}@`)),
+			);
+		},
 	});
 
 	// Issue watcher: same live project Map; files new open GitHub issues as backlog cards.
@@ -2905,8 +2987,8 @@ export function createApp(deps: AppDeps) {
 	// omp watch: reviews new omp releases per opted-in project; state lives in gstore.
 	const ompWatcher = createOmpWatcher({
 		projects: () => deps.projects.values(),
-		load: (p) => deps.gstore.get(`ompWatch:${p}`),
-		save: (p, s) => deps.gstore.set(`ompWatch:${p}`, s),
+		load: async (p) => await deps.gstore.get(`ompWatch:${p}`),
+		save: async (p, s) => await deps.gstore.set(`ompWatch:${p}`, s),
 		log: (m) => console.log(`[omp-watch] ${m}`),
 		schedule: deps.schedule,
 	});
@@ -2936,17 +3018,15 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** Whether an open (not done, not cancelled) card already covers the update id. */
-	function updateCardExists(id: string): boolean {
+	async function updateCardExists(id: string): Promise<boolean> {
 		for (const pe of deps.projects.values())
 			if (
-				pe.store
-					.listTasks()
-					.some(
-						(t) =>
-							t.cancelledAt === null &&
-							t.stage !== "done" &&
-							t.updateIds.includes(id),
-					)
+				(await pe.store.listTasks()).some(
+					(t) =>
+						t.cancelledAt === null &&
+						t.stage !== "done" &&
+						t.updateIds.includes(id),
+				)
 			)
 				return true;
 		return false;
@@ -2954,10 +3034,10 @@ export function createApp(deps: AppDeps) {
 
 	/** The rows that may file now (U6): each id's filable row, target-checked, not already
 	 *  covered by an open card. Throws the route's `{status, error}` json responses. */
-	function pickedUpdates(
+	async function pickedUpdates(
 		ids: string[],
 		propose: boolean,
-	): Array<{ rec: UpdateRecord; e: Entry }> {
+	): Promise<Array<{ rec: UpdateRecord; e: Entry }>> {
 		const fail = (status: number, error: string): never => {
 			throw { status, error };
 		};
@@ -2969,7 +3049,7 @@ export function createApp(deps: AppDeps) {
 				return fail(400, `${id} already has a target`);
 			if (!propose && rec.target === null)
 				return fail(400, `${id} has no qualified target yet`);
-			if (updateCardExists(id))
+			if (await updateCardExists(id))
 				return fail(409, `${id} is already covered by an open update card`);
 			picked.push({ rec, e });
 		}
@@ -2978,10 +3058,10 @@ export function createApp(deps: AppDeps) {
 
 	/** Creates one card per project group, same pattern as followUpOf in
 	 *  POST /api/projects/:project/tasks, then schedules the board. */
-	function createUpdateCards(
+	async function createUpdateCards(
 		picked: ReadonlyArray<{ rec: UpdateRecord; e: Entry }>,
 		propose: boolean,
-	): Array<{ project: string; id: string }> {
+	): Promise<Array<{ project: string; id: string }>> {
 		const groups: Array<{ e: Entry; recs: UpdateRecord[] }> = [];
 		for (const { rec, e } of picked) {
 			const g = groups.find((g) => g.e.name === e.name);
@@ -2991,14 +3071,35 @@ export function createApp(deps: AppDeps) {
 		const created: Array<{ project: string; id: string }> = [];
 		for (const { e, recs } of groups) {
 			const prompt = updatePrompt(recs, propose);
-			const t = e.store.createTask(prompt);
-			e.store.updateTask(t.id, {
-				promptAuthor: "board",
-				updateIds: recs.map((r) => r.id),
+			await e.store.transaction(async () => {
+				const all = await e.store.listTasks();
+				for (const rec of recs) {
+					const current = fileableUpdate(rec.id, false);
+					if (current.e !== e || current.rec !== rec)
+						throw { status: 409, error: "update target changed" };
+				}
+				for (const rec of recs)
+					if (
+						all.some(
+							(task) =>
+								task.cancelledAt === null &&
+								task.stage !== "done" &&
+								task.updateIds.includes(rec.id),
+						)
+					)
+						throw {
+							status: 409,
+							error: `${rec.id} is already covered by an open update card`,
+						};
+				const t = await e.store.createTask(prompt);
+				await e.store.updateTask(t.id, {
+					promptAuthor: "board",
+					updateIds: recs.map((r) => r.id),
+				});
+				created.push({ project: e.name, id: t.id });
 			});
-			created.push({ project: e.name, id: t.id });
 		}
-		deps.schedule();
+		await deps.schedule();
 		return created;
 	}
 
@@ -3014,7 +3115,7 @@ export function createApp(deps: AppDeps) {
 			throw { status, error };
 		};
 		if (updates === null) return fail(409, "no updates loaded");
-		return createUpdateCards(pickedUpdates(ids, propose), propose);
+		return await createUpdateCards(await pickedUpdates(ids, propose), propose);
 	}
 
 	/** Files one card that removes an upstream-deleted row (U5): the mapped project's agent
@@ -3023,14 +3124,35 @@ export function createApp(deps: AppDeps) {
 		id: string,
 	): Promise<Array<{ project: string; id: string }>> {
 		const { rec, e } = fileableUpdate(id, true);
-		if (updateCardExists(id))
+		if (await updateCardExists(id))
 			throw {
 				status: 409,
 				error: `${id} is already covered by an open update card`,
 			};
-		const t = e.store.createTask(removePrompt([rec]));
-		e.store.updateTask(t.id, { promptAuthor: "board", updateIds: [id] });
-		deps.schedule();
+		const t = await e.store.transaction(async () => {
+			const current = fileableUpdate(id, true);
+			if (current.e !== e || current.rec !== rec)
+				throw { status: 409, error: "update target changed" };
+			if (
+				(await e.store.listTasks()).some(
+					(task) =>
+						task.cancelledAt === null &&
+						task.stage !== "done" &&
+						task.updateIds.includes(id),
+				)
+			)
+				throw {
+					status: 409,
+					error: `${id} is already covered by an open update card`,
+				};
+			const t = await e.store.createTask(removePrompt([rec]));
+			await e.store.updateTask(t.id, {
+				promptAuthor: "board",
+				updateIds: [id],
+			});
+			return t;
+		});
+		await deps.schedule();
 		return [{ project: e.name, id: t.id }];
 	}
 
@@ -3043,7 +3165,7 @@ export function createApp(deps: AppDeps) {
 			logError("updates pull", new Error(refused));
 			return Promise.resolve();
 		}
-		updatesInFlight = (async () => {
+		const pending = (async () => {
 			try {
 				let res: Response;
 				try {
@@ -3092,7 +3214,7 @@ export function createApp(deps: AppDeps) {
 						(r) => r.current !== r.latest && r.current !== r.target,
 					),
 				};
-				deps.gstore.set("updates", updates);
+				await deps.gstore.set("updates", updates);
 				if (good.dropped > 0)
 					console.log(
 						`updates: dropped ${good.dropped} invalid record(s) from alate`,
@@ -3102,7 +3224,8 @@ export function createApp(deps: AppDeps) {
 				updatesInFlight = null;
 			}
 		})();
-		return updatesInFlight;
+		updatesInFlight = pending;
+		return pending;
 	}
 	function alateView() {
 		return {
@@ -3317,11 +3440,11 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 	/** Same idle gate scripts/update-image.ts deploys behind: a preparing or running turn anywhere. */
-	function anyTurnActive(): boolean {
-		return [...deps.projects.values()].some((e) =>
-			e.store
-				.listTasks()
-				.some((t) => t.state === "preparing" || t.state === "running"),
+	async function anyTurnActive(): Promise<boolean> {
+		return await someAsync([...deps.projects.values()], async (e) =>
+			(await e.store.listTasks()).some(
+				(t) => t.state === "preparing" || t.state === "running",
+			),
 		);
 	}
 	/**
@@ -3346,7 +3469,7 @@ export function createApp(deps: AppDeps) {
 	}
 	/** Whether the U9 tick must skip its provision attempt, recording alate's failure state
 	 *  when the health probe failed. Caller just returns (docs/specs/agent-layer-switch.md). */
-	function provisionGateBlocks(
+	async function provisionGateBlocks(
 		h:
 			| {
 					ok: true;
@@ -3357,7 +3480,7 @@ export function createApp(deps: AppDeps) {
 					status: number;
 					error: string;
 			  },
-	): boolean {
+	): Promise<boolean> {
 		if (alate.key === null) return true;
 		if (Date.now() < alateBackoffUntil) return true;
 		// With agent-layer support (alate health layers:true) a provision installs a new
@@ -3365,7 +3488,7 @@ export function createApp(deps: AppDeps) {
 		// so the provision never waits for an idle board. Without the flag — or when the
 		// health probe failed and says nothing — alate may write the flat home under
 		// running turns, so the old idle gate stays for that attempt.
-		if ((h.ok ? h.body.layers : undefined) !== true && anyTurnActive())
+		if ((h.ok ? h.body.layers : undefined) !== true && (await anyTurnActive()))
 			return true;
 		if (!h.ok) {
 			alateProvisionError = h.error;
@@ -3384,7 +3507,7 @@ export function createApp(deps: AppDeps) {
 		// working on a busy board — when the provision gates below would defer the attempt.
 		const h = await alateHealth(alate);
 		if (h.ok) applyProvisionHealth(h);
-		if (provisionGateBlocks(h)) return;
+		if (await provisionGateBlocks(h)) return;
 		const r = await provisionNow();
 		if (!r.ok && r.running) return; // still running on alate; the outcome arrives via health
 		alateProvisionError = r.ok ? null : r.error;
@@ -3394,7 +3517,7 @@ export function createApp(deps: AppDeps) {
 	/** Files one architecture-review card; shared by the manual route and the idle auto-start
 	 * tick (docs/specs/mutation-delta.md §7). Keeps the R1-8 ordering: resolveTarget and
 	 * archReviewDelta run BEFORE the reviewBlocked guard, so the guard and createTask sit in
-	 * one synchronous block and two overlapping calls cannot both pass it. With
+	 * one transaction, so concurrent calls cannot both pass it. With
 	 * opts.requireDue (the tick only) the review must also be due right now:
 	 * archReviewDue(delta, cap, reviewed). Returns the filed card or the route's json error. */
 	async function fileArchReview(
@@ -3412,64 +3535,78 @@ export function createApp(deps: AppDeps) {
 				status: 409,
 				error: "project has no integration target",
 			};
+		const settings = await e.store.getSettings();
 		// The review freezes the target's current head, like a release card.
 		let resolved: { target: string; sha: string };
 		try {
 			resolved = await resolveTarget(
 				e.path,
 				true,
-				e.store.getSettings().originUrl,
-				e.store.getSettings().targetBranch,
+				(await e.store.getSettings()).originUrl,
+				(await e.store.getSettings()).targetBranch,
 			);
 		} catch (err) {
 			return { ok: false, status: 409, error: errmsg(err) };
 		}
+		const reviewBase = lastReviewBase(await e.store.listTasks());
 		const delta = await archReviewDelta(
 			e.path,
 			resolved.target,
-			lastReviewBase(e.store.listTasks()),
+			reviewBase,
 		).catch(() => null);
-		// Network before the guard, like the git spawns, so the guard and createTask below
-		// stay one synchronous block (R1-8). Never throws: a failed fetch lands in the
+		// Network precedes the database transaction. A failed fetch appears in the
 		// prompt as a per-type unavailable line or "alerts unavailable: <reason>".
 		const alerts = await githubAlertSummary({ repo: e.github, gh });
-		// The git spawns run BEFORE the guard, so the guard and createTask below sit in one
-		// synchronous block: two overlapping requests cannot both pass it (R1-8).
-		const blocked = reviewBlocked(e.store.listTasks());
-		if (blocked !== null) return { ok: false, status: 409, error: blocked };
-		if (delta === null)
-			return {
-				ok: false,
-				status: 409,
-				error: "could not read the git history",
-			};
-		if (
-			opts.requireDue &&
-			!archReviewDue(
-				delta.delta,
-				e.store.getSettings().archReviewCap,
-				delta.reviewed,
-			)
-		)
-			return { ok: false, status: 409, error: "review is not due" };
-		const t = e.store.createTask(
-			reviewPrompt({
-				target: resolved.target,
-				sha: resolved.sha,
-				from: delta.reviewed ? delta.anchor : null,
-				commits: delta.delta,
-				alerts,
-			}),
-			model,
-			"review",
+		// The final transaction checks the source settings and the review base.
+		const result = await e.store.transaction(
+			async (): Promise<
+				{ ok: true; task: Task } | { ok: false; status: number; error: string }
+			> => {
+				const current = await e.store.getSettings();
+				if (
+					current.originUrl !== settings.originUrl ||
+					current.targetBranch !== settings.targetBranch ||
+					lastReviewBase(await e.store.listTasks()) !== reviewBase
+				)
+					return { ok: false, status: 409, error: "review target changed" };
+				const blocked = reviewBlocked(await e.store.listTasks());
+				if (blocked !== null) return { ok: false, status: 409, error: blocked };
+				if (delta === null)
+					return {
+						ok: false,
+						status: 409,
+						error: "could not read the git history",
+					};
+				if (
+					opts.requireDue &&
+					!archReviewDue(
+						delta.delta,
+						(await e.store.getSettings()).archReviewCap,
+						delta.reviewed,
+					)
+				)
+					return { ok: false, status: 409, error: "review is not due" };
+				const t = await e.store.createTask(
+					reviewPrompt({
+						target: resolved.target,
+						sha: resolved.sha,
+						from: delta.reviewed ? delta.anchor : null,
+						commits: delta.delta,
+						alerts,
+					}),
+					model,
+					"review",
+				);
+				// The creation transaction also saves the review base.
+				const updated = await e.store.updateTask(t.id, {
+					promptAuthor: "board",
+					base: resolved.sha,
+				});
+				return { ok: true, task: updated };
+			},
 		);
-		// Synchronous with createTask: the scheduler must never see a review card without its base.
-		const updated = e.store.updateTask(t.id, {
-			promptAuthor: "board",
-			base: resolved.sha,
-		});
-		deps.schedule();
-		return { ok: true, task: updated };
+		if (result.ok) await deps.schedule();
+		return result;
 	}
 
 	/** Card id the idle auto-start filed last (in-memory only): while that card exists and is
@@ -3481,9 +3618,9 @@ export function createApp(deps: AppDeps) {
 	 * anywhere, file the first due project's architecture-review card, in project map
 	 * order. Silent when nothing qualifies (docs/specs/mutation-delta.md §7). */
 	/** Whether the tick's remembered idle-review card is still open somewhere on the board. */
-	function idleCardStillLive(id: string): boolean {
-		return [...deps.projects.values()].some((pe) => {
-			const t = pe.store.getTask(id);
+	async function idleCardStillLive(id: string): Promise<boolean> {
+		return await someAsync([...deps.projects.values()], async (pe) => {
+			const t = await pe.store.getTask(id);
 			return t !== null && t.cancelledAt === null && t.stage !== "done";
 		});
 	}
@@ -3504,174 +3641,186 @@ export function createApp(deps: AppDeps) {
 	async function idleReviewTick(): Promise<void> {
 		if (!deps.shared.idleReviews) return;
 		if (now() - lastInputAt < 2 * 60 * 60_000) return;
-		if (anyTurnActive()) return;
+		if (await anyTurnActive()) return;
 		// The remembered card finished or its project left the board: filing may start again.
-		if (idleReviewCardId !== null && idleCardStillLive(idleReviewCardId))
+		if (
+			idleReviewCardId !== null &&
+			(await idleCardStillLive(idleReviewCardId))
+		)
 			return;
 		idleReviewCardId = null;
 		const filedId = await fileFirstDueArchReview();
 		if (filedId !== null) idleReviewCardId = filedId;
 	}
-	function saveConfig(): void {
-		// ADR-0011: runtime plaintext goes into the row as-is; sealForStore swaps a null
-		// runtime value back to the kept blob when this boot cannot open the stored one, so
-		// an unrelated save never deletes a credential it cannot read. The walker below is
-		// the only place that produces sealed strings; with no box every secret spot comes
-		// from the stored row instead (writes of plaintext are refused at the routes), so an
-		// allowed save can neither write plaintext over a sealed blob nor drop one.
-		const stored = deps.gstore.get<Record<string, unknown> | null>("config");
-		const storedSpot = (field: string, plain: string | null): string | null => {
-			if (deps.secretBox !== undefined) return sealForStore(field, plain);
-			if (clearedSecrets.has(field)) return null;
-			return (
-				(keptUnreadable.get(field) as string | undefined) ??
-				(stored?.[field] as string | undefined) ??
-				null
+	async function saveConfig(): Promise<void> {
+		return deps.gstore.transaction(async () => {
+			// ADR-0011: runtime plaintext goes into the row as-is; sealForStore swaps a null
+			// runtime value back to the kept blob when this boot cannot open the stored one, so
+			// an unrelated save never deletes a credential it cannot read. The walker below is
+			// the only place that produces sealed strings; with no box every secret spot comes
+			// from the stored row instead (writes of plaintext are refused at the routes), so an
+			// allowed save can neither write plaintext over a sealed blob nor drop one.
+			const stored = await deps.gstore.get<Record<string, unknown> | null>(
+				"config",
 			);
-		};
-		const row: Record<string, unknown> = {
-			maxTotal: deps.shared.maxTotalRuns,
-			reviewCheck: deps.shared.reviewCheck,
-			workCheck: deps.shared.workCheck,
-			idleReviews: deps.shared.idleReviews,
-			trendingScan: deps.shared.trendingScan,
-			commitIdentity: deps.shared.commitIdentity,
-			removed: deps.shared.removedPaths,
-			projects: deps.shared.projectPaths,
-			projectOrder: deps.shared.projectOrder,
-			admin,
-			apiKey: storedSpot("apiKey", apiKey),
-			sessionSecret: storedSpot("sessionSecret", sessionSecret),
-			sessions,
-			vapid:
-				deps.secretBox === undefined
-					? // ADR-0011: no box keeps the stored spot verbatim. A generated pair
-						// stays in memory only (pushes still work this boot; the next good
-						// boot seals it), and a legacy plaintext row writes its own value
-						// back byte-identical — no plaintext private key is ever created.
-						(stored?.vapid ?? null)
-					: // ADR-0011 recovery: a null runtime pair with an unreadable stored
-						// row keeps the stored object (sealed private key + plaintext public
-						// key) so a save does not erase the outgoing key before ensureVapid()
-						// regenerates; a regenerated pair writes the fresh sealed pair.
-						vapid === null
-						? (keptUnreadable.get("vapidKey") ?? null)
-						: {
-								...vapid,
-								privateKey: sealForStore("vapidKey", vapid.privateKey),
-							},
-			alate:
-				deps.secretBox !== undefined
-					? { url: alate.url, key: sealForStore("alateKey", alate.key) }
-					: (() => {
-							const storedAlate = stored?.alate;
-							const storedKey =
-								typeof storedAlate === "object" &&
-								storedAlate !== null &&
-								"key" in storedAlate &&
-								typeof storedAlate.key === "string"
-									? storedAlate.key
-									: null;
-							return {
-								url: alate.url,
-								key: clearedSecrets.has("alateKey")
-									? null
-									: ((keptUnreadable.get("alateKey") as string | undefined) ??
-										storedKey),
-							};
-						})(),
-			githubToken: storedSpot("githubToken", githubToken),
-			githubHost: savedGithubHost,
-			gitTokens:
-				deps.secretBox !== undefined
-					? gitTokens.map((t) =>
-							t.unreadable === true
-								? {
-										host: t.host,
-										username: t.username,
-										token: keptUnreadable.get(`git:${t.host}`) ?? t.token,
-									}
-								: { ...t, token: sealForStore(`git:${t.host}`, t.token) },
-						)
-					: // Runtime token additions are impossible (guarded routes): the stored
-						// rows pass through verbatim, minus the hosts cleared this boot.
-						(() => {
-							const storedTokens = stored?.gitTokens;
-							if (!Array.isArray(storedTokens)) return [];
-							return storedTokens.filter((t) => {
-								if (typeof t !== "object" || t === null) return false;
-								if (!("host" in t) || typeof t.host !== "string") return false;
-								return !clearedSecrets.has(`git:${t.host}`);
-							});
-						})(),
-			turnReadTokens:
-				deps.secretBox !== undefined
-					? turnReadTokens.map((t) => ({
-							host: t.host,
-							status: t.status,
-							detail: t.detail,
-							confirmed: t.confirmed,
-							// A null runtime token (unreadable stored blob) writes the kept
-							// blob back, so an unrelated save never deletes a credential
-							// this boot cannot read.
-							token: sealForStore(`turnRead:${t.host}`, t.token),
-						}))
-					: // Runtime row additions are impossible (guarded routes): the stored
-						// rows pass through verbatim, minus the hosts cleared this boot.
-						(() => {
-							const storedRows = stored?.turnReadTokens;
-							if (!Array.isArray(storedRows)) return [];
-							return storedRows.filter((t) => {
-								if (typeof t !== "object" || t === null) return false;
-								if (!("host" in t) || typeof t.host !== "string") return false;
-								return !clearedSecrets.has(`turnRead:${t.host}`);
-							});
-						})(),
-			githubApp:
-				deps.secretBox === undefined
-					? clearedSecrets.has("githubAppKey")
-						? null
-						: (stored?.githubApp ?? null)
-					: githubApp === null
-						? null
-						: githubApp.unreadable === true
-							? { id: githubApp.id, key: keptUnreadable.get("githubAppKey") }
+			const storedSpot = (
+				field: string,
+				plain: string | null,
+			): string | null => {
+				if (deps.secretBox !== undefined) return sealForStore(field, plain);
+				if (clearedSecrets.has(field)) return null;
+				return (
+					(keptUnreadable.get(field) as string | undefined) ??
+					(stored?.[field] as string | undefined) ??
+					null
+				);
+			};
+			const row: Record<string, unknown> = {
+				maxTotal: deps.shared.maxTotalRuns,
+				reviewCheck: deps.shared.reviewCheck,
+				workCheck: deps.shared.workCheck,
+				idleReviews: deps.shared.idleReviews,
+				trendingScan: deps.shared.trendingScan,
+				commitIdentity: deps.shared.commitIdentity,
+				removed: deps.shared.removedPaths,
+				projects: deps.shared.projectPaths,
+				projectOrder: deps.shared.projectOrder,
+				admin,
+				apiKey: storedSpot("apiKey", apiKey),
+				sessionSecret: storedSpot("sessionSecret", sessionSecret),
+				sessions,
+				vapid:
+					deps.secretBox === undefined
+						? // ADR-0011: no box keeps the stored spot verbatim. A generated pair
+							// stays in memory only (pushes still work this boot; the next good
+							// boot seals it), and a legacy plaintext row writes its own value
+							// back byte-identical — no plaintext private key is ever created.
+							(stored?.vapid ?? null)
+						: // ADR-0011 recovery: a null runtime pair with an unreadable stored
+							// row keeps the stored object (sealed private key + plaintext public
+							// key) so a save does not erase the outgoing key before ensureVapid()
+							// regenerates; a regenerated pair writes the fresh sealed pair.
+							vapid === null
+							? (keptUnreadable.get("vapidKey") ?? null)
 							: {
-									id: githubApp.id,
-									key: sealForStore("githubAppKey", githubApp.key),
+									...vapid,
+									privateKey: sealForStore("vapidKey", vapid.privateKey),
 								},
-			envValues: (() => {
-				if (deps.secretBox === undefined) {
-					// Kept-unreadable env blobs go back first; with no box the stored values
-					// pass through verbatim, minus names cleared this boot.
-					const storedEnv = stored?.envValues;
+				alate:
+					deps.secretBox !== undefined
+						? { url: alate.url, key: sealForStore("alateKey", alate.key) }
+						: (() => {
+								const storedAlate = stored?.alate;
+								const storedKey =
+									typeof storedAlate === "object" &&
+									storedAlate !== null &&
+									"key" in storedAlate &&
+									typeof storedAlate.key === "string"
+										? storedAlate.key
+										: null;
+								return {
+									url: alate.url,
+									key: clearedSecrets.has("alateKey")
+										? null
+										: ((keptUnreadable.get("alateKey") as string | undefined) ??
+											storedKey),
+								};
+							})(),
+				githubToken: storedSpot("githubToken", githubToken),
+				githubHost: savedGithubHost,
+				gitTokens:
+					deps.secretBox !== undefined
+						? gitTokens.map((t) =>
+								t.unreadable === true
+									? {
+											host: t.host,
+											username: t.username,
+											token: keptUnreadable.get(`git:${t.host}`) ?? t.token,
+										}
+									: { ...t, token: sealForStore(`git:${t.host}`, t.token) },
+							)
+						: // Runtime token additions are impossible (guarded routes): the stored
+							// rows pass through verbatim, minus the hosts cleared this boot.
+							(() => {
+								const storedTokens = stored?.gitTokens;
+								if (!Array.isArray(storedTokens)) return [];
+								return storedTokens.filter((t) => {
+									if (typeof t !== "object" || t === null) return false;
+									if (!("host" in t) || typeof t.host !== "string")
+										return false;
+									return !clearedSecrets.has(`git:${t.host}`);
+								});
+							})(),
+				turnReadTokens:
+					deps.secretBox !== undefined
+						? turnReadTokens.map((t) => ({
+								host: t.host,
+								status: t.status,
+								detail: t.detail,
+								confirmed: t.confirmed,
+								// A null runtime token (unreadable stored blob) writes the kept
+								// blob back, so an unrelated save never deletes a credential
+								// this boot cannot read.
+								token: sealForStore(`turnRead:${t.host}`, t.token),
+							}))
+						: // Runtime row additions are impossible (guarded routes): the stored
+							// rows pass through verbatim, minus the hosts cleared this boot.
+							(() => {
+								const storedRows = stored?.turnReadTokens;
+								if (!Array.isArray(storedRows)) return [];
+								return storedRows.filter((t) => {
+									if (typeof t !== "object" || t === null) return false;
+									if (!("host" in t) || typeof t.host !== "string")
+										return false;
+									return !clearedSecrets.has(`turnRead:${t.host}`);
+								});
+							})(),
+				githubApp:
+					deps.secretBox === undefined
+						? clearedSecrets.has("githubAppKey")
+							? null
+							: (stored?.githubApp ?? null)
+						: githubApp === null
+							? null
+							: githubApp.unreadable === true
+								? { id: githubApp.id, key: keptUnreadable.get("githubAppKey") }
+								: {
+										id: githubApp.id,
+										key: sealForStore("githubAppKey", githubApp.key),
+									},
+				envValues: (() => {
+					if (deps.secretBox === undefined) {
+						// Kept-unreadable env blobs go back first; with no box the stored values
+						// pass through verbatim, minus names cleared this boot.
+						const storedEnv = stored?.envValues;
+						const vals: Record<string, unknown> = {};
+						for (const [key, blob] of keptUnreadable)
+							if (key.startsWith("env:")) vals[key.slice(4)] = blob;
+						if (typeof storedEnv === "object" && storedEnv !== null)
+							for (const [name, value] of Object.entries(storedEnv))
+								if (!clearedSecrets.has(`env:${name}`)) vals[name] = value;
+						return vals;
+					}
+					// Kept-unreadable env blobs go back first: an unrelated save must not delete
+					// a value this boot cannot read. A re-entered value then overwrites its blob.
 					const vals: Record<string, unknown> = {};
 					for (const [key, blob] of keptUnreadable)
 						if (key.startsWith("env:")) vals[key.slice(4)] = blob;
-					if (typeof storedEnv === "object" && storedEnv !== null)
-						for (const [name, value] of Object.entries(storedEnv))
-							if (!clearedSecrets.has(`env:${name}`)) vals[name] = value;
+					for (const [name, value] of Object.entries(deps.shared.envValues))
+						vals[name] = sealForStore(`env:${name}`, value);
 					return vals;
-				}
-				// Kept-unreadable env blobs go back first: an unrelated save must not delete
-				// a value this boot cannot read. A re-entered value then overwrites its blob.
-				const vals: Record<string, unknown> = {};
-				for (const [key, blob] of keptUnreadable)
-					if (key.startsWith("env:")) vals[key.slice(4)] = blob;
-				for (const [name, value] of Object.entries(deps.shared.envValues))
-					vals[name] = sealForStore(`env:${name}`, value);
-				return vals;
-			})(),
-			// Plain values are not secrets: stored as plain text, never sealed.
-			envPlain: deps.shared.envPlain,
-			hindsightToken: storedSpot("hindsightToken", hindsightToken),
-			hindsightUrl,
-		};
-		const out =
-			deps.secretBox === undefined
-				? { row: row as unknown, changed: false }
-				: sealStoredConfigRow(row, deps.secretBox);
-		deps.gstore.set("config", out.row);
+				})(),
+				// Plain values are not secrets: stored as plain text, never sealed.
+				envPlain: deps.shared.envPlain,
+				hindsightToken: storedSpot("hindsightToken", hindsightToken),
+				hindsightUrl,
+			};
+			const out =
+				deps.secretBox === undefined
+					? { row: row as unknown, changed: false }
+					: sealStoredConfigRow(row, deps.secretBox);
+			await deps.gstore.set("config", out.row);
+		});
 	}
 	// ADR-0011 kept-unreadable bookkeeping: when this boot's box cannot open a stored sealed
 	// blob lands here keyed by field, and saveConfig puts it back so nothing is
@@ -3714,8 +3863,8 @@ export function createApp(deps: AppDeps) {
 	}
 	// ADR-0011 boot migration: seal every plaintext spot of the stored row before the
 	// restore below reads it. Converge, never destructive; a no-box boot skips it.
-	migrateSealedConfig(deps.gstore, deps.secretBox);
-	loadStoredConfig();
+	await migrateSealedConfig(deps.gstore, deps.secretBox);
+	await loadStoredConfig();
 	// Board-generated secrets this boot could not read are regenerated once: the kept blob
 	// proved a real board wrote them, so a fresh board (no kept blob) keeps onboarding's
 	// "generate on first save" behavior unchanged.
@@ -3812,7 +3961,7 @@ export function createApp(deps: AppDeps) {
 		);
 	}
 	/** Restores the admin pair, the api key, the session secret, the VAPID keys and the Alate pair. */
-	function restoreSecrets(p: StoredConfig): void {
+	async function restoreSecrets(p: StoredConfig): Promise<void> {
 		if (
 			typeof p.admin === "object" &&
 			p.admin !== null &&
@@ -3852,8 +4001,11 @@ export function createApp(deps: AppDeps) {
 				// must exist before any config save can drop the row.
 				keptUnreadable.set("vapidKey", p.vapid);
 				previousVapidPublicKey = p.vapid.publicKey;
-				if (deps.gstore.get<string | null>("push_vapid_key") == null)
-					deps.gstore.set("push_vapid_key", previousVapidPublicKey);
+				const publicKey = p.vapid.publicKey;
+				await deps.gstore.update<string | null>(
+					"push_vapid_key",
+					(current) => current ?? publicKey,
+				);
 			}
 		}
 		if (typeof p.alate === "object" && p.alate !== null) {
@@ -3993,13 +4145,13 @@ export function createApp(deps: AppDeps) {
 		if (typeof p.hindsightUrl === "string") hindsightUrl = p.hindsightUrl;
 	}
 	/** Boot config load: reads the stored "config" row, validates every field (a wrong type keeps the default), seeds the Alate URL/key from the compose env, and re-applies the GitHub token/host. */
-	function loadStoredConfig(): void {
-		const parsed = deps.gstore.get<StoredConfig>("config");
+	async function loadStoredConfig(): Promise<void> {
+		const parsed = await deps.gstore.get<StoredConfig>("config");
 		if (parsed !== null) {
 			restoreRunConfig(parsed);
 			restoreCommitIdentity(parsed.commitIdentity);
 			restoreSessions(parsed.sessions);
-			restoreSecrets(parsed);
+			await restoreSecrets(parsed);
 			restoreGithub(parsed);
 			restoreEnvValues(parsed);
 			restoreHindsight(parsed);
@@ -4118,12 +4270,12 @@ export function createApp(deps: AppDeps) {
 			? null
 			: createHostedGitAuth({
 					gitToken: deps.hosted.hooks.gitToken.bind(deps.hosted.hooks),
-					projectFor: (cwd) => {
+					projectFor: async (cwd) => {
 						for (const e of deps.projects.values())
 							if (cwd === e.path || cwd.startsWith(e.path + sep))
 								return {
 									name: e.name,
-									originUrl: e.store.getSettings().originUrl,
+									originUrl: (await e.store.getSettings()).originUrl,
 								};
 						return null;
 					},
@@ -4138,9 +4290,9 @@ export function createApp(deps: AppDeps) {
 		logError("hindsight env seed", err);
 	}
 	// Boot + interval (src/server.ts), never per turn (docs/specs/memory-backend.md).
-	void memoryHealthTick();
+	void (await memoryHealthTick());
 	// OTTR-548: the workers' sign-in self-reports boot + interval (src/server.ts), advisory only.
-	void workerSignInTick();
+	void (await workerSignInTick());
 	const logins = providerLogin();
 
 	// NODE_ENV=development keeps Bun's HTML dev server (HMR, /_bun/… paths); every other
@@ -4329,9 +4481,8 @@ export function createApp(deps: AppDeps) {
 				}),
 		);
 	}
-	// Compression runs once per process (memoized at module scope); kick it off at boot so the
-	// first Diagrams open never waits for brotli.
-	void mermaidCompressed();
+	// This process-wide cache does not use stores. App shutdown does not own its drain.
+	void mermaidCompressed().catch((err) => logError("mermaid compression", err));
 
 	/**
 	 * The board's address for turns when no allowlist covers it (compose: ottr:<port>); null on
@@ -4434,7 +4585,10 @@ export function createApp(deps: AppDeps) {
 
 	/** The non-hosted walls for one /api request: the agent-host token wall, the host
 	 *  allowlist, and the auth wall (session or API key). Null lets the request pass. */
-	function wallRefusal(req: Request, host: string | null): Response | null {
+	async function wallRefusal(
+		req: Request,
+		host: string | null,
+	): Promise<Response | null> {
 		if (viaAgentHost(req)) return agentRefusal(req);
 		const refusal = hostRefusal(host, deps.port, deps.publicHosts);
 		if (refusal !== null) return json({ error: refusal }, 403);
@@ -4448,7 +4602,7 @@ export function createApp(deps: AppDeps) {
 				path === "/api/setup" ||
 				path === "/api/login" ||
 				path === "/api/logout";
-			if (!open && !authorized(req))
+			if (!open && !(await authorized(req)))
 				return json({ error: "unauthorized" }, 401);
 		}
 		return null;
@@ -4456,6 +4610,15 @@ export function createApp(deps: AppDeps) {
 
 	/** Guards every /api request (host allowlist + auth wall); wraps handlers so unexpected errors become 500. */
 	function api(
+		req: Request,
+		fn: () => Promise<Response>,
+		opts: { costly?: boolean } = {},
+	): Promise<Response> {
+		if (closing) return Promise.resolve(json({ error: "app is closed" }, 503));
+		return trackWork("api request", serveApi(req, fn, opts));
+	}
+
+	async function serveApi(
 		req: Request,
 		fn: () => Promise<Response>,
 		opts: { costly?: boolean } = {},
@@ -4485,7 +4648,7 @@ export function createApp(deps: AppDeps) {
 			const originRefused = originWall(req);
 			if (originRefused !== null) return Promise.resolve(originRefused);
 		}
-		const wall = wallRefusal(req, req.headers.get("host"));
+		const wall = await wallRefusal(req, req.headers.get("host"));
 		if (wall !== null) return Promise.resolve(wall);
 		// The costly-route cap runs after every wall: unauthorized or wrong-origin traffic
 		// burns nothing, and a blocked request never reaches the handler.
@@ -4525,7 +4688,12 @@ export function createApp(deps: AppDeps) {
 		if (req.method !== "GET") lastInputAt = now();
 		return requestEnc.run({ enc: req.headers.get("accept-encoding") }, () =>
 			fn()
-				.catch((err) => {
+				.catch(async (err) => {
+					if (err instanceof TaskConflict)
+						return json(
+							{ error: err.message, task: await taskView(err.entry, err.task) },
+							409,
+						);
 					logError(`api ${req.method} ${new URL(req.url).pathname}`, err);
 					return json({ error: "internal error" }, 500);
 				})
@@ -4586,7 +4754,7 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** Valid session cookie or matching X-API-Key; checked only behind the auth wall (see api()). */
-	function authorized(req: Request): boolean {
+	async function authorized(req: Request): Promise<boolean> {
 		const key = req.headers.get("x-api-key");
 		if (key !== null && apiKey !== null && secretsEqual(key, apiKey))
 			return true;
@@ -4603,7 +4771,7 @@ export function createApp(deps: AppDeps) {
 		const now = Date.now();
 		if (now - entry.lastSeen >= 60_000) {
 			entry.lastSeen = now;
-			saveConfig();
+			await saveConfig();
 		}
 		return true;
 	}
@@ -4748,15 +4916,15 @@ export function createApp(deps: AppDeps) {
 	): Promise<{ body: Record<string, unknown> } | { error: Response }> {
 		if (!(req.headers.get("content-type") ?? "").startsWith("application/json"))
 			return { body: {} };
-		return readJson(req, MAX_BODY_BYTES, true);
+		return await readJson(req, MAX_BODY_BYTES, true);
 	}
 
-	function projectView(e: Entry): ProjectView {
+	async function projectView(e: Entry): Promise<ProjectView> {
 		const file = iconFile(e.store.tasksDir);
 		const icon = file
 			? statSync(file, { throwIfNoEntry: false })?.mtimeMs
 			: undefined;
-		const settings = e.store.getSettings();
+		const settings = await e.store.getSettings();
 		return {
 			name: e.store.name,
 			icon: icon ?? null,
@@ -4792,15 +4960,19 @@ export function createApp(deps: AppDeps) {
 		`Latest GitHub release "${name}" is not vX.Y.Z; Ottr cannot create the next release for this repo.`;
 
 	/** Agent processes no live turn claims, cached for a few minutes; advisory only, never killed. */
-	function currentOrphanScan(): {
+	async function currentOrphanScan(): Promise<{
 		orphans: OrphanProcess[];
 		error: string | null;
-	} {
+	}> {
+		const claimedPids = await deps.claimedPids();
+		const cards = new Map<string, Set<string>>();
+		for (const [name, e] of deps.projects)
+			cards.set(name, new Set((await e.store.listTasks()).map((t) => t.id)));
 		const scan = orphanSnapshot(
 			() => (deps.listProcesses ?? (() => platform.listProcesses()))(),
 			() => {
 				const claimed = new Set<number>();
-				for (const pid of deps.claimedPids()) claimed.add(pid);
+				for (const pid of claimedPids) claimed.add(pid);
 				return claimed;
 			},
 			Date.now(),
@@ -4818,10 +4990,8 @@ export function createApp(deps: AppDeps) {
 					projects,
 					platform.samePath,
 					// A worktree card id counts only when that store still has the card.
-					(project, card) => {
-						const e = project === null ? undefined : deps.projects.get(project);
-						return e !== undefined && e.store.getTask(card) !== null;
-					},
+					(project, card) =>
+						project !== null && cards.get(project)?.has(card) === true,
 				),
 			),
 			error: scan.error,
@@ -4838,44 +5008,52 @@ export function createApp(deps: AppDeps) {
 	const updateCycle = new UpdateCycleController();
 
 	/** A failed reader is not proof that the board is idle. */
-	function updateCycleIdle(): boolean {
+	function runnerCountsIdle(): boolean {
 		try {
 			const turns = deps.runnerTurns?.();
 			if (turns === undefined) return false;
-			const counts = [
+			return [
 				turns.local,
 				turns.preparing,
 				...Object.values(turns.workers),
-			];
-			if (!counts.every((count) => Number.isSafeInteger(count) && count === 0))
-				return false;
-			for (const e of deps.projects.values())
+			].every((count) => Number.isSafeInteger(count) && count === 0);
+		} catch {
+			return false;
+		}
+	}
+
+	async function idleProjectStores(): Promise<boolean> {
+		try {
+			for (const e of deps.projects.values()) {
 				if (
-					e.store
-						.listTasks()
-						.some(
-							(task) => task.state === "running" || task.state === "preparing",
-						)
+					(await e.store.listTasks()).some(
+						(task) => task.state === "running" || task.state === "preparing",
+					)
 				)
 					return false;
+			}
 			return true;
 		} catch {
 			return false;
 		}
 	}
 
-	function updateCycleView(now: number): UpdateCycleView | null {
+	async function updateCycleIdle(): Promise<boolean> {
+		return (await idleProjectStores()) && runnerCountsIdle();
+	}
+
+	async function updateCycleView(now: number): Promise<UpdateCycleView | null> {
 		if (deps.hosted !== undefined) return null;
 		const cycle = updateCycle.view(now, false);
-		if (cycle?.phase === "idle") cycle.canStart = updateCycleIdle();
+		if (cycle?.phase === "idle") cycle.canStart = await updateCycleIdle();
 		return cycle;
 	}
 
 	/** The trending scout's open proposals: proposal card id → repo (one map per project, not
 	 *  a lookup per card). */
-	function trendingReposOf(e: Entry): Map<string, string> {
+	async function trendingReposOf(e: Entry): Promise<Map<string, string>> {
 		const repos = new Map<string, string>();
-		for (const v of e.store.listTrendingVerdicts())
+		for (const v of await e.store.listTrendingVerdicts())
 			if (v.verdict === "filed" && v.proposalCardId !== null)
 				repos.set(v.proposalCardId, v.repo);
 		return repos;
@@ -4916,7 +5094,7 @@ export function createApp(deps: AppDeps) {
 	/** One card's TaskCard: per-task turn facts and stored titles batched by the caller
 	 * (two queries per project instead of three statements and a no-op UPDATE per card,
 	 * OTTR-721). */
-	function taskCardOf(
+	async function taskCardOf(
 		e: Entry,
 		t: ListedTask,
 		ctx: {
@@ -4930,7 +5108,7 @@ export function createApp(deps: AppDeps) {
 			settings: ProjectSettings;
 		},
 		now: number,
-	): TaskCard {
+	): Promise<TaskCard> {
 		const {
 			details: _details,
 			report: _report,
@@ -4940,7 +5118,7 @@ export function createApp(deps: AppDeps) {
 		const progress = deps.progressOf?.(e.store.name, t.id);
 		const silent = silentSince(
 			t,
-			e.store.logPath(t.id),
+			await e.store.logPath(t.id),
 			now,
 			// Live progress movement counts as activity like a log write: a Stryker
 			// run whose meter moves keeps a silent log from warning (OTTR-448).
@@ -4950,7 +5128,7 @@ export function createApp(deps: AppDeps) {
 		return {
 			...card,
 			steps: viewSteps(t),
-			sessionTitle: e.store.frozenTitleFrom(
+			sessionTitle: await e.store.frozenTitleFrom(
 				t,
 				ctx.facts.titles.get(t.id) ?? null,
 			),
@@ -4985,8 +5163,11 @@ export function createApp(deps: AppDeps) {
 	/** OTTR-506: stamp the queued merges the push hold parks (local main has commits
 	 * origin lacks), so the board names the hold — the browser gets no git. PR mode
 	 * never writes the local target branch (OTTR-552), so the hold names nothing there. */
-	function stampPushHolds(e: Entry, cards: TaskCard[]): void {
-		if (e.mainUnpushed !== true || e.store.getSettings().prMode === true)
+	async function stampPushHolds(e: Entry, cards: TaskCard[]): Promise<void> {
+		if (
+			e.mainUnpushed !== true ||
+			(await e.store.getSettings()).prMode === true
+		)
 			return;
 		for (const card of cards) {
 			if (card.cancelledAt === null && pushHold(true, card) !== null)
@@ -4995,8 +5176,8 @@ export function createApp(deps: AppDeps) {
 	}
 	/** A microVM-mode project's queued cards wait on vm-runner (unreachable or busy); stamp
 	 * the reason so the board names the hold instead of a silent queue. */
-	function stampVmHolds(e: Entry, cards: TaskCard[]): void {
-		const microVm = e.store.getSettings().microVm;
+	async function stampVmHolds(e: Entry, cards: TaskCard[]): Promise<void> {
+		const microVm = (await e.store.getSettings()).microVm;
 		for (const card of cards) {
 			if (card.state !== "queued" || card.cancelledAt !== null) continue;
 			const held = vmHoldFor(microVm, e.store.name, card.id);
@@ -5006,25 +5187,25 @@ export function createApp(deps: AppDeps) {
 
 	/** Every project's cards, newest first, plus the kept-worktree counts: the card slice of
 	 * stateResponse, shared with the /system holds so both count the same cards. */
-	function boardCards(now: number): {
+	async function boardCards(now: number): Promise<{
 		tasks: TaskCard[];
 		keptHeld: number;
 		keptStale: number;
 		keptCards: string[];
-	} {
+	}> {
 		const tasks: TaskCard[] = [];
 		let keptHeld = 0;
 		let keptStale = 0;
 		const keptCards: string[] = [];
 		for (const e of deps.projects.values()) {
 			try {
-				const settings = e.store.getSettings();
+				const settings = await e.store.getSettings();
 				const days = settings.keptWorktreeDays;
-				const facts = e.store.boardCardFacts();
-				const medians = turnMedians(e.store.turnDurations());
-				const trendingRepos = trendingReposOf(e);
+				const facts = await e.store.boardCardFacts();
+				const medians = turnMedians(await e.store.turnDurations());
+				const trendingRepos = await trendingReposOf(e);
 				const cards: TaskCard[] = [];
-				for (const t of e.store.listTasks()) {
+				for (const t of await e.store.listTasks()) {
 					const kept = keptCounts(t, now, days);
 					keptHeld += kept.held;
 					keptStale += kept.stale;
@@ -5034,12 +5215,17 @@ export function createApp(deps: AppDeps) {
 					// "Cancelled" chip. Every counter (slots, alarms, holds, coverage) either
 					// filters cancelledAt or reads state/stage facts a cancelled card no longer has.
 					cards.push(
-						taskCardOf(e, t, { facts, medians, trendingRepos, settings }, now),
+						await taskCardOf(
+							e,
+							t,
+							{ facts, medians, trendingRepos, settings },
+							now,
+						),
 					);
 				}
 				stampReleaseHolds(cards);
-				stampPushHolds(e, cards);
-				stampVmHolds(e, cards);
+				await stampPushHolds(e, cards);
+				await stampVmHolds(e, cards);
 				tasks.push(...cards);
 			} catch (err) {
 				// A sick store skips its own cards; the rest of the board still renders.
@@ -5051,8 +5237,8 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** The /system holds, from the same drain values and cards the state frame ships. */
-	function systemHolds(now: number): SystemHolds {
-		const { tasks } = boardCards(now);
+	async function systemHolds(now: number): Promise<SystemHolds> {
+		const { tasks } = await boardCards(now);
 		const slots = slotUse(tasks);
 		const queue = queueOrder(tasks);
 		const first = queue[0];
@@ -5067,11 +5253,11 @@ export function createApp(deps: AppDeps) {
 		};
 	}
 
-	function stateResponse(): StateResponse {
+	async function stateResponse(): Promise<StateResponse> {
 		const now = Date.now();
-		const cycle = updateCycleView(now);
-		const { tasks, keptHeld, keptStale, keptCards } = boardCards(now);
-		const scan = currentOrphanScan();
+		const cycle = await updateCycleView(now);
+		const { tasks, keptHeld, keptStale, keptCards } = await boardCards(now);
+		const scan = await currentOrphanScan();
 		// Advisory only: a sick credential store yields no sign-in advisories, not a failed state.
 		let list: SignIn[] = [];
 		try {
@@ -5081,15 +5267,19 @@ export function createApp(deps: AppDeps) {
 		}
 		const roles = modelRoles();
 		const dead = deadSignIns(list, roles);
-		const projects = [...deps.projects.values()]
-			.flatMap((e) => {
-				try {
-					return [projectView(e)];
-				} catch (err) {
-					logStoreError(e.store.name, err);
-					return [];
-				}
-			})
+		const projects = (
+			await Promise.all(
+				[...deps.projects.values()].map(async (e) => {
+					try {
+						return [await projectView(e)];
+					} catch (err) {
+						logStoreError(e.store.name, err);
+						return [];
+					}
+				}),
+			)
+		)
+			.flat()
 			.sort(
 				(a, b) =>
 					rankInOrder(a.name, deps.shared.projectOrder) -
@@ -5104,7 +5294,7 @@ export function createApp(deps: AppDeps) {
 			idleReviews: deps.shared.idleReviews,
 			trendingScan: deps.shared.trendingScan,
 			commitIdentity: deps.shared.commitIdentity,
-			trendingStatus: trendingScanner.status(),
+			trendingStatus: await trendingScanner.status(),
 			serverVersion: deps.serverVersion,
 			quota,
 			// Absent on self-hosted boards, so their payload stays as before.
@@ -5112,9 +5302,9 @@ export function createApp(deps: AppDeps) {
 			// Hosted mode has no admin login: the proxy authenticates, so setup never opens.
 			onboarding: deps.hosted === undefined && admin === null,
 			user: admin?.name ?? null,
-			seenAnswers: loadSeen(),
+			seenAnswers: await loadSeen(),
 			seenDoneSince,
-			inboxSeen: loadInboxSeen(),
+			inboxSeen: await loadInboxSeen(),
 			orphans: scan.orphans,
 			orphansError: scan.error,
 			keptWorktrees: { held: keptHeld, stale: keptStale, cards: keptCards },
@@ -5137,7 +5327,7 @@ export function createApp(deps: AppDeps) {
 					? [`omp runs with no memory: ${memoryHealth.reason}`]
 					: []),
 			],
-			updates: updatesView(),
+			updates: await updatesView(),
 			alatePendingSince,
 			alateProvisionError,
 			deadSignIns: dead,
@@ -5148,52 +5338,89 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** Applies a user card edit guarded by the revision the client loaded. */
-	function applyUserEdit(
+	async function applyUserEdit(
 		e: Entry,
 		task: Task,
 		patch: TaskPatch,
 		body: Record<string, unknown>,
-	): Response | Task {
+	): Promise<Response | Task> {
 		const revision = body.revision;
-		// Absent keeps today's behavior: extension and API-key clients do not send it.
-		if (revision === undefined) return e.store.updateTask(task.id, patch);
 		if (
-			typeof revision !== "number" ||
-			!Number.isInteger(revision) ||
-			revision < 1
+			revision !== undefined &&
+			(typeof revision !== "number" ||
+				!Number.isInteger(revision) ||
+				revision < 1)
 		)
 			return json({ error: "revision must be a positive integer" }, 400);
-		const res = e.store.updateTaskIfCurrent(task.id, patch, revision);
+		const res = await withTask(e, task, async () =>
+			revision === undefined
+				? { ok: true as const, task: await e.store.updateTask(task.id, patch) }
+				: e.store.updateTaskIfCurrent(task.id, patch, revision),
+		);
 		if (!res.ok)
 			return json(
 				{
 					error: "card changed since it was loaded",
-					task: taskView(e, res.task),
+					task: await taskView(e, res.task),
 				},
 				409,
 			);
 		return res.task;
 	}
 
+	async function withTask<T>(
+		e: Entry,
+		task: Task,
+		work: () => T | Promise<T>,
+	): Promise<T> {
+		return e.store.transaction(async () => {
+			const current = await e.store.getTask(task.id);
+			if (current === null) throw new Error(`unknown task: ${task.id}`);
+			if (
+				current.revision !== task.revision ||
+				current.state !== task.state ||
+				current.stage !== task.stage ||
+				current.cancelledAt !== task.cancelledAt ||
+				current.sessionId !== task.sessionId ||
+				current.base !== task.base ||
+				current.worktree !== task.worktree ||
+				current.holdUntil !== task.holdUntil ||
+				current.pendingPrompt !== task.pendingPrompt ||
+				current.holdHead !== task.holdHead
+			)
+				throw new TaskConflict(e, current);
+			return work();
+		});
+	}
+
+	async function updateSnapshot(
+		e: Entry,
+		task: Task,
+		patch: TaskPatch,
+	): Promise<Task> {
+		return await withTask(e, task, () => e.store.updateTask(task.id, patch));
+	}
+
 	/** The stale-edit precheck for routes whose state preconditions must not shadow a
 	 * stale revision: answers 400 for a malformed revision and 409 with the current
 	 * card when the revision is stale, so the drawer's conflict flow keeps the draft
 	 * even when the newer state would refuse the edit on its own. Null when the
-	 * revision is absent or current: the task was read synchronously and is written
-	 * synchronously below, so the preconditions after this check run on the row the
-	 * revision was checked against. */
-	function staleEditResponse(
+	 * revision is absent or current. The final transaction checks the snapshot again. */
+	async function staleEditResponse(
 		e: Entry,
 		task: Task,
 		body: Record<string, unknown>,
-	): Response | null {
+	): Promise<Response | null> {
 		const rev = body.revision;
 		if (rev === undefined) return null;
 		if (typeof rev !== "number" || !Number.isInteger(rev) || rev < 1)
 			return json({ error: "revision must be a positive integer" }, 400);
 		if (rev !== task.revision)
 			return json(
-				{ error: "card changed since it was loaded", task: taskView(e, task) },
+				{
+					error: "card changed since it was loaded",
+					task: await taskView(e, task),
+				},
 				409,
 			);
 		return null;
@@ -5201,29 +5428,28 @@ export function createApp(deps: AppDeps) {
 
 	/** One task with its turns for the drawer; turns ship without the prompt text and the raw
 	 * diff ships only from its own endpoint, so opening a drawer never carries the cap-sized text. */
-	function taskView(e: Entry, t: Task): TaskView {
+	async function taskView(e: Entry, t: Task): Promise<TaskView> {
 		const { diffText: _diffText, ...task } = t;
-		const pr = t.kind === "pr_review" ? e.store.getPrReviewByTask(t.id) : null;
+		const pr =
+			t.kind === "pr_review" ? await e.store.getPrReviewByTask(t.id) : null;
 		// listTasks orders newest first, so find takes the newest retro of this card.
 		const retro =
 			t.kind === "retro"
 				? undefined
-				: e.store
-						.listTasks()
-						.find(
-							(c) =>
-								c.kind === "retro" &&
-								c.followUpOf === t.id &&
-								c.followUpOfProject === null,
-						);
-		const proposal = e.store.trendingVerdictByProposal(t.id);
+				: (await e.store.listTasks()).find(
+						(c) =>
+							c.kind === "retro" &&
+							c.followUpOf === t.id &&
+							c.followUpOfProject === null,
+					);
+		const proposal = await e.store.trendingVerdictByProposal(t.id);
 		return {
 			...task,
 			steps: viewSteps(t),
-			turns: e.store
-				.listTurns(t.id)
-				.map(({ prompt: _prompt, ...turn }) => turn),
-			sessionTitle: e.store.frozenTitle(t),
+			turns: (await e.store.listTurns(t.id)).map(
+				({ prompt: _prompt, ...turn }) => turn,
+			),
+			sessionTitle: await e.store.frozenTitle(t),
 			...(proposal?.verdict === "filed" ? { trendingRepo: proposal.repo } : {}),
 			...(pr !== null && e.github !== null
 				? {
@@ -5251,27 +5477,29 @@ export function createApp(deps: AppDeps) {
 							cancelledAt: retro.cancelledAt,
 							needsReason: retro.needsReason,
 							asked: retro.asked,
-							turns: e.store
-								.listTurns(retro.id)
-								.map(({ prompt: _prompt, ...turn }) => turn),
+							turns: (await e.store.listTurns(retro.id)).map(
+								({ prompt: _prompt, ...turn }) => turn,
+							),
 						},
 					}
 				: {}),
 			...(isReview(t)
 				? {
-						findings: reviewFindings(e.store.listTasks(), t)
-							.sort((a, b) => a.createdAt - b.createdAt)
-							.map((f) => ({
-								id: f.id,
-								title: f.title,
-								state: f.state,
-								stage: f.stage,
-								cancelledAt: f.cancelledAt,
-								createdAt: f.createdAt,
-								turns: e.store
-									.listTurns(f.id)
-									.map(({ prompt: _prompt, ...turn }) => turn),
-							})),
+						findings: await Promise.all(
+							reviewFindings(await e.store.listTasks(), t)
+								.sort((a, b) => a.createdAt - b.createdAt)
+								.map(async (f) => ({
+									id: f.id,
+									title: f.title,
+									state: f.state,
+									stage: f.stage,
+									cancelledAt: f.cancelledAt,
+									createdAt: f.createdAt,
+									turns: (await e.store.listTurns(f.id)).map(
+										({ prompt: _prompt, ...turn }) => turn,
+									),
+								})),
+						),
 					}
 				: {}),
 		};
@@ -5282,46 +5510,48 @@ export function createApp(deps: AppDeps) {
 	 * `Task | null` type: createTask/updateTask throw on a missing id and tasks are never
 	 * deleted, so a route that wrote through this store always finds the row (R1-11h).
 	 */
-	function taskResponse(e: Entry, id: string): Response {
-		const t = e.store.getTask(id);
+	async function taskResponse(e: Entry, id: string): Promise<Response> {
+		const t = await e.store.getTask(id);
 		return t === null
 			? json({ error: "unknown task" }, 404)
-			: json(taskView(e, t));
+			: json(await taskView(e, t));
 	}
 
 	/** Route params: registered project (404), task id — legacy 8-hex or new `PREFIX-n` key (400) that exists (404). */
-	function resolveTask(
+	async function resolveTask(
 		project: string,
 		id: string,
-	): { e: Entry; task: Task } | Response {
+	): Promise<{ e: Entry; task: Task } | Response> {
 		const e = deps.projects.get(project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
 		if (!TASK_ID_RE.test(id)) return json({ error: "bad task id" }, 400);
-		const task = e.store.getTask(id);
+		const task = await e.store.getTask(id);
 		if (!task) return json({ error: "unknown task" }, 404);
 		return { e, task };
 	}
 
 	/** Queues the rules interview as a card; idempotent while one is live. "not-needed" when rules exist, unless fix asks for an alignment pass over them. The id names the card the answer talks about: the new one when queued, the live one when running, so the UI can open it. */
-	function startInterview(
+	async function startInterview(
 		e: Entry,
 		fix = false,
-	): {
+	): Promise<{
 		interview: string;
 		id: string | null;
-	} {
+	}> {
 		const has = hasRules(e.path, e.targetRules === true);
 		if (has && !fix) return { interview: "not-needed", id: null };
-		const live = liveCardOf(e.store.listTasks(), "interview");
-		if (live !== null) return { interview: "running", id: live.id };
-		const t = e.store.createTask(
-			rulesInterviewPrompt({ projectName: e.store.name, existing: has }),
-			null,
-			"interview",
-		);
-		e.store.updateTask(t.id, { promptAuthor: "board" });
-		return { interview: "queued", id: t.id };
+		return e.store.transaction(async () => {
+			const live = liveCardOf(await e.store.listTasks(), "interview");
+			if (live !== null) return { interview: "running", id: live.id };
+			const t = await e.store.createTask(
+				rulesInterviewPrompt({ projectName: e.store.name, existing: has }),
+				null,
+				"interview",
+			);
+			await e.store.updateTask(t.id, { promptAuthor: "board" });
+			return { interview: "queued", id: t.id };
+		});
 	}
 
 	/** Project ssh key file; "" when the board name cannot name one (a separator or a leading dot). */
@@ -5407,11 +5637,11 @@ export function createApp(deps: AppDeps) {
 	 * The origin may be https, ssh:// or scp-style ssh ("git@host:owner/repo.git"): the shared
 	 * remote parser normalizes all three before owner/repo extraction, so an scp-style origin
 	 * gets the same push-permission check as an https one. */
-	function reposOnHost(host: string): string[] {
+	async function reposOnHost(host: string): Promise<string[]> {
 		const onHost = hostMatcher(host);
 		const out = new Set<string>();
 		for (const e of deps.projects.values()) {
-			const url = e.store.getSettings().originUrl;
+			const url = (await e.store.getSettings()).originUrl;
 			if (url === null || !onHost.test(url)) continue;
 			const https = httpsRemote(url);
 			const repo = https === null ? null : ownerRepo(https);
@@ -5465,7 +5695,7 @@ export function createApp(deps: AppDeps) {
 		}
 		// One token per host: a re-save replaces the host's old entry.
 		gitTokens = [...gitTokens.filter((x) => x.host !== cand.host), cand];
-		saveConfig();
+		await saveConfig();
 		applyGitSecrets();
 		return json(await gitHostsView());
 	}
@@ -5605,7 +5835,7 @@ export function createApp(deps: AppDeps) {
 			stderr: errmsg(err),
 		}));
 		if (r.code !== 0)
-			return cloneFailure(url, r, remote, authEnv, hostedSecrets);
+			return await cloneFailure(url, r, remote, authEnv, hostedSecrets);
 		// A pending key that cloned cleanly becomes the project key.
 		if (pending !== null) promoteKey(pending, paths.project(name));
 		return { p: dest };
@@ -5923,7 +6153,7 @@ export function createApp(deps: AppDeps) {
 		const gitless = !(await isGitRepoWithCommit(p));
 		const key = basename(p);
 
-		const store = ProjectStore.init(p);
+		const store = await ProjectStore.init(p);
 		const e: Entry = {
 			store,
 			name: key,
@@ -5944,14 +6174,14 @@ export function createApp(deps: AppDeps) {
 		// Explicitly added paths persist so boot finds them again even outside the scan roots.
 		if (!deps.shared.projectPaths.includes(p)) {
 			deps.shared.projectPaths = [...deps.shared.projectPaths, p];
-			saveConfig();
+			await saveConfig();
 		}
 		if (deps.shared.removedPaths.includes(p)) {
 			// Re-adding lifts the removal: the board shows the project's stored tasks again.
 			deps.shared.removedPaths = deps.shared.removedPaths.filter(
 				(x) => x !== p,
 			);
-			saveConfig();
+			await saveConfig();
 		}
 		await refreshRemote(e);
 
@@ -5960,21 +6190,27 @@ export function createApp(deps: AppDeps) {
 		// remote name the worker-writable .git/config resolves. Never refreshed while the
 		// board runs; a re-add or the settings API re-pins.
 		const pin = await originRemoteUrl(p);
-		if (pin !== null && e.store.getSettings().originUrl === null)
-			e.store.setSettings({ originUrl: pin });
+		await e.store.transaction(async () => {
+			if (pin !== null && (await e.store.getSettings()).originUrl === null)
+				await e.store.setSettings({ originUrl: pin });
 
-		// The wizard/checklist opens for every newly added project; a set prefix must land
-		// before the interview so its first tasks already use it.
-		e.store.setSettings({
-			setupChecklist: true,
-			taskIdPrefix: prefix === "" ? null : prefix,
+			// The wizard/checklist opens for every newly added project; a set prefix must land
+			// before the interview so its first tasks already use it.
+			await e.store.setSettings({
+				setupChecklist: true,
+				taskIdPrefix: prefix === "" ? null : prefix,
+			});
 		});
 		// A gitless project has no HEAD to create a worktree from; the turn machinery would
 		// crash, so the rules interview waits for POST /init.
 		if (e.gitless)
-			return json({ project: projectView(e), interview: "gitless", id: null });
-		const interview = startInterview(e);
-		return json({ project: projectView(e), ...interview });
+			return json({
+				project: await projectView(e),
+				interview: "gitless",
+				id: null,
+			});
+		const interview = await startInterview(e);
+		return json({ project: await projectView(e), ...interview });
 	}
 
 	async function addProject(body: Record<string, unknown>): Promise<Response> {
@@ -6006,20 +6242,18 @@ export function createApp(deps: AppDeps) {
 			return json({ error: "provide a git URL or a project name" }, 400);
 		}
 		if (!("p" in added)) return added;
-		return registerProject(added.p, prefix);
+		return await registerProject(added.p, prefix);
 	}
 
 	/** 409 while any task is queued/preparing/running — removing or re-homing the project's
 	 * store would strand them; null when the project is quiet. */
-	function activeRefusal(e: Entry): Response | null {
-		const active = e.store
-			.listTasks()
-			.filter(
-				(t) =>
-					t.state === "queued" ||
-					t.state === "preparing" ||
-					t.state === "running",
-			);
+	async function activeRefusal(e: Entry): Promise<Response | null> {
+		const active = (await e.store.listTasks()).filter(
+			(t) =>
+				t.state === "queued" ||
+				t.state === "preparing" ||
+				t.state === "running",
+		);
 		if (active.length === 0) return null;
 		const titles = active.map((t) => `"${t.title}"`).join(", ");
 		return json(
@@ -6037,7 +6271,7 @@ export function createApp(deps: AppDeps) {
 				e.path,
 				false,
 				null,
-				e.store.getSettings().targetBranch,
+				(await e.store.getSettings()).targetBranch,
 			);
 			e.target = r.target;
 			// OTTR-605: an origin that has no branch for the local branch yet (a repo awaiting
@@ -6089,7 +6323,7 @@ export function createApp(deps: AppDeps) {
 	 * the field false, so nothing shows. */
 	async function refreshBranchRules(e: Entry): Promise<void> {
 		e.protectedTarget = false;
-		if (e.store.getSettings().prMode === true) return;
+		if ((await e.store.getSettings()).prMode === true) return;
 		const t = branchRulesTarget(e);
 		if (t === null) return;
 		const { repo, slash, branch, remote } = t;
@@ -6114,19 +6348,19 @@ export function createApp(deps: AppDeps) {
 	 * so boot discovery cannot re-find it. Refuses while a turn process is running; a killed-store
 	 * writer would corrupt state.
 	 */
-	function removeProject(name: string): Response {
+	async function removeProject(name: string): Promise<Response> {
 		const e = deps.projects.get(name);
 		if (e === undefined) return json({ error: "unknown project" }, 404);
-		const refused = activeRefusal(e);
+		const refused = await e.store.transaction(() => activeRefusal(e));
 		if (refused !== null) return refused;
 		deps.projects.delete(name);
-		e.store.close();
+		await e.store.close();
 		deps.shared.removedPaths = [...deps.shared.removedPaths, e.path];
 		deps.shared.projectPaths = deps.shared.projectPaths.filter(
 			(x) => x !== e.path,
 		);
-		saveConfig();
-		deps.schedule();
+		await saveConfig();
+		await deps.schedule();
 		return json({ ok: true });
 	}
 
@@ -6177,10 +6411,11 @@ export function createApp(deps: AppDeps) {
 			ompStatsCache = { at: report.at, report };
 			return report;
 		})();
-		ompStatsRead = build.finally(() => {
+		const pendingReport = build.finally(() => {
 			ompStatsRead = null;
 		});
-		return ompStatsRead;
+		ompStatsRead = pendingReport;
+		return pendingReport;
 	}
 
 	// Settings -> omp usage -> Launch omp stats dashboard (docs/specs/omp-stats-dashboard.md).
@@ -6233,7 +6468,8 @@ export function createApp(deps: AppDeps) {
 		const refusal = hostRefusal(req.headers.get("host"), port, []);
 		if (refusal !== null) return json({ error: refusal }, 403);
 		const url = new URL(req.url);
-		if (walled(req, server) && !authorized(req)) return ompSignInPage(req);
+		if (walled(req, server) && !(await authorized(req)))
+			return ompSignInPage(req);
 		const origin = ompOriginRefusal(req, port);
 		if (origin !== null) return origin;
 		const st = dashboard.ensure();
@@ -6280,40 +6516,58 @@ export function createApp(deps: AppDeps) {
 	let refreshingBehind = false;
 
 	function publish(msg: ServerMessage): void {
-		if (deps.serverRef.current === undefined || sockets === 0) return;
+		if (closing || deps.serverRef.current === undefined || sockets === 0)
+			return;
 		deps.serverRef.current.publish("board", JSON.stringify(msg));
 	}
 
 	/** Prunes acknowledged inbox keys that no longer map to an alert input; persists the pruned list. */
-	function pruneSeen(state: StateResponse, inputs: AlertCardInput[]): void {
+	async function pruneSeen(
+		state: StateResponse,
+		inputs: AlertCardInput[],
+	): Promise<void> {
 		try {
-			const pruned = pruneInboxSeen(state.inboxSeen, inputs);
-			if (pruned.length !== state.inboxSeen.length) {
-				deps.gstore.set("inbox_seen", pruned);
-				state.inboxSeen = pruned;
-			}
+			state.inboxSeen = await deps.gstore.update<string[]>(
+				"inbox_seen",
+				(current) => pruneInboxSeen(normalizeSeen(current), inputs),
+			);
 		} catch (err) {
 			logError("inbox seen prune", err);
 		}
 	}
 
-	function publishState(): boolean {
+	let publishTail: Promise<void> = Promise.resolve();
+	function publishState(): Promise<boolean> {
+		if (closing) return Promise.resolve(false);
+		const result = trackWork(
+			"state publish",
+			publishTail.then(publishStateNow),
+		);
+		// Keep the queue active after trackWork records a failure.
+		publishTail = result.then(
+			() => {},
+			() => {},
+		);
+		return result;
+	}
+
+	async function publishStateNow(): Promise<boolean> {
 		if (deps.serverRef.current === undefined) return false;
-		const consumers = sockets > 0 || loadSubs(deps.gstore).length > 0;
+		const consumers = sockets > 0 || (await loadSubs(deps.gstore)).length > 0;
 		// Without a consumer the frame exists only for the seen prune below; skip the state
 		// build (this runs every second) when no task-derived key is acknowledged.
 		if (
 			!consumers &&
-			!loadInboxSeen().some((k) => /^(task|done|error):/.test(k))
+			!(await loadInboxSeen()).some((k) => /^(task|done|error):/.test(k))
 		)
 			return false;
-		const state = stateResponse();
+		const state = await stateResponse();
 		// The inputs come first: the seen prune reads them, and this frame must carry the pruned list.
-		const inputs = alertInputs(state.tasks, lastAlertInputs);
+		const inputs = await alertInputs(state.tasks, lastAlertInputs);
 		// The prune runs on every publish, consumers or not: a card that leaves needs_you and
 		// comes back with the same key must light the bell again, also on a board polled over
 		// /api/state with no socket and no push device (NODE_ENV=production disables /api/ws).
-		pruneSeen(state, inputs);
+		await pruneSeen(state, inputs);
 		// Push works without a board tab (R1-1): skip the frame only when nothing can consume
 		// it — no open socket AND no push subscriber. The baseline still moves, so a device
 		// that subscribes later is never alerted for changes from before it existed.
@@ -6334,17 +6588,15 @@ export function createApp(deps: AppDeps) {
 		try {
 			// A project with prReviewNotify off alerts nothing: strip its pr events before the
 			// push (also the first needs_you request event) — the diff never sees the quiet set.
-			const quiet = new Set(
-				inputs
-					.filter(
-						(t) =>
-							t.kind === "pr_review" &&
-							deps.projects.get(t.project)?.store.getSettings()
-								.prReviewNotify !== true,
-					)
-					.map((t) => t.id),
-			);
-			pushAlerts(
+			const quiet = new Set<string>();
+			for (const task of inputs) {
+				if (task.kind !== "pr_review") continue;
+				const settings = await deps.projects
+					.get(task.project)
+					?.store.getSettings();
+				if (settings?.prReviewNotify !== true) quiet.add(task.id);
+			}
+			await pushAlerts(
 				inputs,
 				diffEvents(lastAlertInputs, inputs).filter((e) => !quiet.has(e.taskId)),
 				new Set(state.inboxSeen),
@@ -6354,7 +6606,7 @@ export function createApp(deps: AppDeps) {
 		}
 		lastAlertInputs = inputs;
 		lastStateJson = text;
-		if (sockets > 0 && deps.serverRef.current !== undefined)
+		if (!closing && sockets > 0 && deps.serverRef.current !== undefined)
 			deps.serverRef.current.publish("board", text);
 		publishUpdate();
 		return true;
@@ -6362,20 +6614,42 @@ export function createApp(deps: AppDeps) {
 
 	// Coalesce publish requests within one event-loop turn: a mutating request touches the store
 	// several times before its response, and the board should ship one state frame, not five.
-	let stateQueued = false;
+	let stateTimer: Timer | null = null;
 	function publishSoon(): void {
-		if (stateQueued) return;
-		stateQueued = true;
-		setTimeout(() => {
-			stateQueued = false;
-			publishState();
+		if (closing || stateTimer !== null) return;
+		stateTimer = setTimeout(() => {
+			stateTimer = null;
+			void publishState();
 		}, 0);
+	}
+
+	/** Stop admission, then drain accepted work before the stores close. */
+	function close(): Promise<void> {
+		if (closePromise !== null) return closePromise;
+		closing = true;
+		if (stateTimer !== null) {
+			clearTimeout(stateTimer);
+			stateTimer = null;
+		}
+		closePromise = (async () => {
+			const errors: unknown[] = [];
+			while (internalWork.size > 0) {
+				const results = await Promise.allSettled([...internalWork]);
+				for (const result of results)
+					if (result.status === "rejected") errors.push(result.reason);
+			}
+			await publishTail;
+			if (errors.length > 0)
+				throw new AggregateError(errors, "app background work failed");
+		})();
+		return closePromise;
 	}
 
 	const logThrottle = keyedThrottle<{ project: string; id: string }>(250, (a) =>
 		publish({ type: "log", ...a }),
 	);
 	function notifyLog(project: string, id: string): void {
+		if (closing) return;
 		logThrottle(`${project}/${id}`, { project, id });
 	}
 
@@ -6419,33 +6693,33 @@ export function createApp(deps: AppDeps) {
 		if (githubApp === app) appCheck = check;
 	}
 
-	function sampleStats(): void {
-		if (sampling) return;
+	let sampleInFlight: Promise<void> | null = null;
+	function sampleStats(): Promise<void> {
+		if (closing) return Promise.resolve();
+		if (sampling) return sampleInFlight ?? Promise.resolve();
 		sampling = true;
-		void measureSystem()
-			.then(() => {
-				const now = Date.now();
-				const snap = system.snapshot(
-					deps.liveRuns?.() ?? [],
-					systemHolds(now),
-					now,
-				);
-				const msg = { type: "system", system: snap } satisfies ServerMessage;
-				lastSystemJson = JSON.stringify(msg);
-				// Publish every sample: publish() no-ops with 0 sockets, and /api/system in
-				// polling mode builds a fresh snapshot.
-				publish(msg);
-				// Last, so a failed snapshot/publish counts as a failed tick (OTTR-793).
-				sampleLog.success();
-			})
-			.catch((err) => {
-				// OTTR-793: a failed sample logs one rate-limited stderr line instead of
-				// dropping silently; it still skips one tick.
-				sampleLog.failure(err);
-			})
-			.finally(() => {
-				sampling = false;
-			});
+		const jobs: Promise<unknown>[] = [
+			measureSystem()
+				.then(async () => {
+					const now = Date.now();
+					const snap = system.snapshot(
+						deps.liveRuns?.() ?? [],
+						await systemHolds(now),
+						now,
+					);
+					const msg = { type: "system", system: snap } satisfies ServerMessage;
+					lastSystemJson = JSON.stringify(msg);
+					publish(msg);
+					sampleLog.success();
+				})
+				.catch((err) => {
+					// Keep the sampler's rate-limited failure and recovery messages.
+					sampleLog.failure(err);
+				})
+				.finally(() => {
+					sampling = false;
+				}),
+		];
 		if (
 			updateCycle.available(Date.now()) === null &&
 			Date.now() - behindAt > 300_000 &&
@@ -6453,16 +6727,18 @@ export function createApp(deps: AppDeps) {
 		) {
 			refreshingBehind = true;
 			const previous = JSON.stringify(effectiveUpdate());
-			void refreshBehind()
-				.then(() => {
-					if (JSON.stringify(effectiveUpdate()) !== previous) publishUpdate();
-				})
-				.catch(() => {
-					// Failed refresh: keep the last value; the next 5 min window retries.
-				})
-				.finally(() => {
-					refreshingBehind = false;
-				});
+			jobs.push(
+				refreshBehind()
+					.then(() => {
+						if (JSON.stringify(effectiveUpdate()) !== previous) publishUpdate();
+					})
+					.catch((err) => {
+						logError("update refresh", err);
+					})
+					.finally(() => {
+						refreshingBehind = false;
+					}),
+			);
 		}
 		// Ten minutes, or at once when the board repos changed: 1 + one call per repo each time.
 		if (
@@ -6473,11 +6749,13 @@ export function createApp(deps: AppDeps) {
 				appCheck.repos.join() !== boardRepos().join())
 		) {
 			checkingApp = true;
-			void refreshAppCheck()
-				.then(publishState)
-				.finally(() => {
-					checkingApp = false;
-				});
+			jobs.push(
+				refreshAppCheck()
+					.then(publishState)
+					.finally(() => {
+						checkingApp = false;
+					}),
+			);
 		}
 		// Five minutes, like omp's own per-account usage cache; the 1 s state diff ships the result.
 		if (
@@ -6485,30 +6763,50 @@ export function createApp(deps: AppDeps) {
 			!refreshingQuota
 		) {
 			refreshingQuota = true;
-			void fetchQuota(boardOmpEnv())
-				.then((q) => {
-					// The report the previous refresh processed: early release needs it as
-					// the blocked-then-free sighting pair (OTTR-880).
-					const prev = quota;
-					quota = q;
-					// OTTR-688: holds of providers the fresh report shows free start now,
-					// not at their stored reset; nothing scheduled when nothing released.
-					try {
-						if (
-							releaseUsageHolds(q, deps.projects.values(), Date.now(), prev) > 0
-						) {
-							deps.schedule();
-							publishSoon();
+			jobs.push(
+				fetchQuota(boardOmpEnv())
+					.then(async (q) => {
+						// Early release needs a previous blocked sighting after the hold began.
+						const prev = quota;
+						quota = q;
+						try {
+							if (
+								(await releaseUsageHolds(
+									q,
+									deps.projects.values(),
+									Date.now(),
+									prev,
+								)) > 0
+							) {
+								await deps.schedule();
+								publishSoon();
+							}
+						} catch (err) {
+							console.log(`[quota] hold release failed: ${errmsg(err)}`);
 						}
-					} catch (err) {
-						console.log(`[quota] hold release failed: ${errmsg(err)}`);
-					}
-					publishState();
-				})
-				.finally(() => {
-					refreshingQuota = false;
-				});
+						await publishState();
+					})
+					.finally(() => {
+						refreshingQuota = false;
+					}),
+			);
 		}
+		const pending = trackWork(
+			"system sample",
+			Promise.allSettled(jobs).then((results) => {
+				const errors: unknown[] = [];
+				for (const result of results)
+					if (result.status === "rejected") errors.push(result.reason);
+				if (errors.length > 0)
+					throw new AggregateError(errors, "system sample jobs failed");
+			}),
+		);
+		sampleInFlight = pending;
+		const clear = () => {
+			if (sampleInFlight === pending) sampleInFlight = null;
+		};
+		void pending.then(clear, clear);
+		return pending;
 	}
 
 	// U6: file update cards now instead of waiting for the daily push window.
@@ -6577,7 +6875,7 @@ export function createApp(deps: AppDeps) {
 			lastSeen: now,
 			exp: now + SESSION_MS,
 		});
-		saveConfig();
+		await saveConfig();
 		applyGithubToken();
 		const secure = viaPublicHost(req);
 		return withCookie(
@@ -6636,7 +6934,7 @@ export function createApp(deps: AppDeps) {
 			lastSeen: now,
 			exp: now + SESSION_MS,
 		});
-		saveConfig();
+		await saveConfig();
 		return withCookie(
 			json({ ok: true }),
 			sessionCookie(
@@ -6653,7 +6951,7 @@ export function createApp(deps: AppDeps) {
 			const v = verifySession(sessionSecret, token);
 			if (v !== null && v.id !== null && sessions.some((s) => s.id === v.id)) {
 				sessions = dropSession(sessions, v.id);
-				saveConfig();
+				await saveConfig();
 			}
 		}
 		return withCookie(
@@ -6817,7 +7115,7 @@ export function createApp(deps: AppDeps) {
 		if (typeof status !== "number") return status;
 		if (picked.raw !== "") hindsightUrl = picked.url;
 		if (provided) hindsightToken = token;
-		saveConfig();
+		await saveConfig();
 		// applyHindsight only seeds the env now, so it cannot throw by a flip;
 		// the fresh check makes the returned view report the new backend at once.
 		applyHindsight();
@@ -6826,13 +7124,17 @@ export function createApp(deps: AppDeps) {
 	}
 
 	async function notificationPrefs(req: Request): Promise<Response> {
-		const endpoint = new URL(req.url).searchParams.get("endpoint");
-		const mutedProjects = loadMuted();
-		if (endpoint === null) return json({ classes: null, mutedProjects });
-		const sub = loadSubs(deps.gstore).find((s) => s.endpoint === endpoint);
-		return sub === undefined
-			? json({ error: "unknown endpoint" }, 404)
-			: json({ classes: sub.classes, mutedProjects });
+		return deps.gstore.transaction(async () => {
+			const endpoint = new URL(req.url).searchParams.get("endpoint");
+			const mutedProjects = await loadMuted();
+			if (endpoint === null) return json({ classes: null, mutedProjects });
+			const sub = (await loadSubs(deps.gstore)).find(
+				(s) => s.endpoint === endpoint,
+			);
+			return sub === undefined
+				? json({ error: "unknown endpoint" }, 404)
+				: json({ classes: sub.classes, mutedProjects });
+		});
 	}
 
 	async function saveNotificationPrefs(req: Request): Promise<Response> {
@@ -6849,24 +7151,28 @@ export function createApp(deps: AppDeps) {
 				ALERT_CLASSES.some((c) => typeof raw[c] !== "boolean")
 			)
 				return json({ error: "invalid prefs" }, 400);
-			const subs = loadSubs(deps.gstore);
-			const sub = subs.find((s) => s.endpoint === b.endpoint);
-			if (sub === undefined) return json({ error: "unknown endpoint" }, 404);
-			// A fresh object of the three switches: extra posted keys never reach the store.
-			const classes: ClassPrefs = {
-				request: raw.request === true,
-				error: raw.error === true,
-				complete: raw.complete === true,
-			};
-			saveSubs(
-				deps.gstore,
-				subs.map((s) => (s === sub ? { ...s, classes } : s)),
-			);
-			return json({ ok: true });
+			return deps.gstore.transaction(async () => {
+				const subs = await loadSubs(deps.gstore);
+				const sub = subs.find((s) => s.endpoint === b.endpoint);
+				if (sub === undefined) return json({ error: "unknown endpoint" }, 404);
+				// A fresh object of the three switches: extra posted keys never reach the store.
+				const classes: ClassPrefs = {
+					request: raw.request === true,
+					error: raw.error === true,
+					complete: raw.complete === true,
+				};
+				await saveSubs(
+					deps.gstore,
+					subs.map((s) => (s === sub ? { ...s, classes } : s)),
+				);
+				return json({ ok: true });
+			});
 		}
 		if (!isStringList(b.mutedProjects, 500))
 			return json({ error: "invalid prefs" }, 400);
-		deps.gstore.set("notify_muted_projects", [...new Set(b.mutedProjects)]);
+		await deps.gstore.set("notify_muted_projects", [
+			...new Set(b.mutedProjects),
+		]);
 		return json({ ok: true });
 	}
 
@@ -6896,47 +7202,61 @@ export function createApp(deps: AppDeps) {
 	/** Acks one PR review card: clears an unseen comment wave and acks its stamp key, so the
 	 * bell row and the live alert retract like a read. The next wave is new again. Returns
 	 * whether the wave was cleared, so the caller publishes the cleared stamp. */
-	function ackPrReview(e: Entry, t: Task, added: string[]): boolean {
-		const row = e.store.getPrReviewByTask(t.id);
-		let cleared = false;
-		if (row !== null) {
-			if (row.commentsUnseen) {
-				e.store.setPrComments(row.number, row.commentsAt ?? Date.now(), false);
-				cleared = true;
+	async function ackPrReview(
+		e: Entry,
+		t: Task,
+		added: string[],
+	): Promise<boolean> {
+		return e.store.transaction(async () => {
+			const row = await e.store.getPrReviewByTask(t.id);
+			let cleared = false;
+			if (row !== null) {
+				if (row.commentsUnseen) {
+					await e.store.setPrComments(
+						row.number,
+						row.commentsAt ?? Date.now(),
+						false,
+					);
+					cleared = true;
+				}
+				if (row.commentsAt !== null) added.push(`pr:${t.id}:${row.commentsAt}`);
 			}
-			if (row.commentsAt !== null) added.push(`pr:${t.id}:${row.commentsAt}`);
-		}
-		added.push(
-			taskEntryKey({
-				id: t.id,
-				asked: t.asked,
-				kind: t.kind,
-				prOccurrence: {
-					draft: row !== null ? e.store.lastPrRun(row.number) : null,
-				},
-			}),
-		);
-		return cleared;
+			added.push(
+				taskEntryKey({
+					id: t.id,
+					asked: t.asked,
+					kind: t.kind,
+					prOccurrence: {
+						draft: row !== null ? await e.store.lastPrRun(row.number) : null,
+					},
+				}),
+			);
+			return cleared;
+		});
 	}
 	/** One acked task's keys: a PR review card's stamp keys, or its needs_you entry. Returns
 	 * whether an unseen PR comment wave was cleared. */
-	function ackTaskKeys(e: Entry, t: Task, added: string[]): boolean {
-		if (t.kind === "pr_review") return ackPrReview(e, t, added);
+	async function ackTaskKeys(
+		e: Entry,
+		t: Task,
+		added: string[],
+	): Promise<boolean> {
+		if (t.kind === "pr_review") return await ackPrReview(e, t, added);
 		if (t.state === "needs_you") added.push(taskEntryKey(t));
 		return false;
 	}
 	/** One project's acked ids' keys. Returns whether an unseen PR comment wave was cleared. */
-	function ackProjectKeys(
+	async function ackProjectKeys(
 		e: Entry,
 		ids: Set<string>,
 		added: string[],
-	): boolean {
+	): Promise<boolean> {
 		let cleared = false;
 		for (const id of ids) {
 			try {
-				const t = e.store.getTask(id);
+				const t = await e.store.getTask(id);
 				if (t === null) continue;
-				if (ackTaskKeys(e, t, added)) cleared = true;
+				if (await ackTaskKeys(e, t, added)) cleared = true;
 			} catch (err) {
 				logStoreError(e.store.name, err);
 			}
@@ -6946,14 +7266,14 @@ export function createApp(deps: AppDeps) {
 	/** The keys a card ack adds: its needs_you entry plus every alert it has live on the devices.
 	 * prFlagCleared says an unseen PR comment wave was read, so the frame must publish even when
 	 * the seen list did not change. */
-	function cardAckAdded(ids: Set<string>): {
+	async function cardAckAdded(ids: Set<string>): Promise<{
 		added: string[];
 		prFlagCleared: boolean;
-	} {
+	}> {
 		const added = liveAlerts.filter((a) => ids.has(a.taskId)).map((a) => a.key);
 		let prFlagCleared = false;
 		for (const e of deps.projects.values()) {
-			if (ackProjectKeys(e, ids, added)) prFlagCleared = true;
+			if (await ackProjectKeys(e, ids, added)) prFlagCleared = true;
 		}
 		return { added, prFlagCleared };
 	}
@@ -6981,14 +7301,21 @@ export function createApp(deps: AppDeps) {
 		return { list, field };
 	}
 	/** Stores the new seen list and retracts pushed alerts when it changed. */
-	function persistInboxSeen(before: string[], after: string[]): void {
-		if (
-			after.length !== before.length ||
-			after.some((k, i) => k !== before[i])
-		) {
-			deps.gstore.set("inbox_seen", after);
+	async function persistInboxSeen(
+		modify: (current: string[]) => string[],
+	): Promise<void> {
+		let changed = false;
+		await deps.gstore.update<string[]>("inbox_seen", (raw) => {
+			const before = normalizeSeen(raw);
+			const after = normalizeSeen(modify(before));
+			changed =
+				after.length !== before.length ||
+				after.some((key, i) => key !== before[i]);
+			return after;
+		});
+		if (changed) {
 			try {
-				retractAcked();
+				await retractAcked();
 			} catch (err) {
 				logError("push retraction", err);
 			}
@@ -6996,29 +7323,23 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 	async function inboxSeen(req: Request): Promise<Response> {
-		// Task keys embed the ask JSON, so a "Mark all as read" list outgrows the default cap.
 		const r = await readJson(req, 4 * 1024 * 1024);
 		if ("error" in r) return r.error;
 		const picked = seenList(r.body);
 		if (picked === null) return json({ error: "invalid seen list" }, 400);
 		const { list } = picked;
-		const before = loadInboxSeen();
-		let next: string[];
-		if (picked.field === "keys")
-			next = [...before, ...ackKeys(list, liveAlerts)];
-		else if (picked.field === "drop") {
+		if (picked.field === "drop") {
 			const gone = new Set(list);
-			next = before.filter((k) => !gone.has(k));
+			await persistInboxSeen((current) =>
+				current.filter((key) => !gone.has(key)),
+			);
 		} else {
-			// A card ack: its current needs_you entry plus every alert it has live on the devices.
-			const ids = new Set(list);
-			const ack = cardAckAdded(ids);
-			next = [...before, ...ackKeys(ack.added, liveAlerts)];
-			// The cleared comment stamp must reach the frame even when the seen list
-			// did not change: the bell row and the live alert read the occurrence.
-			if (ack.prFlagCleared) publishSoon();
+			const ack =
+				picked.field === "taskIds" ? await cardAckAdded(new Set(list)) : null;
+			const added = ackKeys(ack?.added ?? list, liveAlerts);
+			await persistInboxSeen((current) => [...current, ...added]);
+			if (ack?.prFlagCleared) publishSoon();
 		}
-		persistInboxSeen(before, normalizeSeen(next));
 		return json({ ok: true });
 	}
 
@@ -7055,27 +7376,27 @@ export function createApp(deps: AppDeps) {
 			(e) => e.github !== null && ownerRepo(e.github) === repo,
 		);
 		if (matches.length === 0) return json({ ok: true });
-		return tickGithubWatchers(matches, kind);
+		return await tickGithubWatchers(matches, kind);
 	}
 
 	/** Returns the socket-wall response for a non-hosted request, or null to continue. */
-	function wsWall(req: Request): Response | null {
+	async function wsWall(req: Request): Promise<Response | null> {
 		const refusal = upgradeRefusal(
 			req.headers.get("host"),
 			req.headers.get("origin"),
 			deps.port,
 			deps.publicHosts,
-			!walled(req) || authorized(req),
+			!walled(req) || (await authorized(req)),
 		);
 		if (refusal)
 			return json({ error: refusal }, refusal === "unauthorized" ? 401 : 403);
 		return null;
 	}
 
-	function wsUpgrade(
+	async function wsUpgrade(
 		req: Request,
 		srv: { upgrade(req: Request): boolean },
-	): Response | undefined {
+	): Promise<Response | undefined> {
 		if (prod)
 			return json(
 				{ error: "live updates are disabled in production mode" },
@@ -7090,7 +7411,7 @@ export function createApp(deps: AppDeps) {
 		}
 		// Same wall rule as api(): walled hosts need a live session or the API key (browsers
 		// send cookies on the handshake); direct loopback with a loopback Host stays open.
-		const wall = wsWall(req);
+		const wall = await wsWall(req);
 		if (wall !== null) return wall;
 		if (srv.upgrade(req)) return;
 		return json({ error: "websocket upgrade required" }, 400);
@@ -7134,7 +7455,7 @@ export function createApp(deps: AppDeps) {
 		const reason = rawReason?.trim() || null;
 		if (reason !== null && reason.length > 1000)
 			return json({ error: "reason must be at most 1000 characters" }, 400);
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const out = await deps.cancel(
 			found.e,
@@ -7145,50 +7466,45 @@ export function createApp(deps: AppDeps) {
 		if ("kept" in out) return json({ ok: false, kept: out.kept });
 		// A cancelled trending proposal turns its repo into a user-rejected no_fit;
 		// any other card is a no-op here.
-		found.e.store.rejectTrendingProposal(found.task.id, reason);
+		await found.e.store.rejectTrendingProposal(found.task.id, reason);
 		return json({ ok: true });
 	}
 
 	async function handlePOSTProjectsTasksRefileByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/refile">,
 	): Promise<Response> {
-		// No body: this route takes no options (api()'s Origin wall still covers the POST).
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
-		if (task.cancelledAt === null)
-			return json({ error: "only a cancelled card can be refiled" }, 409);
-		// OTTR-781: a cancelled Dependabot card blocks its PR in the supervisor's dedupe;
-		// refile files a fresh card with the same prompt and source-PR fields so the ship
-		// step adopts the PR instead of opening a duplicate.
-		const prefix = dependabotHeadPrefix(task.prompt.split("\n", 1)[0] ?? "");
-		if (prefix === null) return json({ error: "not a Dependabot card" }, 400);
-		// Any non-cancelled card covering the same PR blocks the refile: the refiled card
-		// while it runs, and a done card too (the update already landed). The cancelled
-		// source card never blocks (it is cancelled).
-		const blocker = e.store
-			.listTasks()
-			.find(
+		const child = await withTask(e, task, async () => {
+			if (task.cancelledAt === null)
+				return json({ error: "only a cancelled card can be refiled" }, 409);
+			const prefix = dependabotHeadPrefix(task.prompt.split("\n", 1)[0] ?? "");
+			if (prefix === null) return json({ error: "not a Dependabot card" }, 400);
+			const blocker = (await e.store.listTasks()).find(
 				(t) =>
 					(t.prompt.split("\n", 1)[0] ?? "").startsWith(prefix) &&
 					t.cancelledAt === null,
 			);
-		if (blocker !== undefined)
-			return json(
-				{ error: `${blocker.id} already covers this Dependabot PR` },
-				409,
-			);
-		const child = e.store.createTask(task.prompt);
-		e.store.updateTask(child.id, {
-			promptAuthor: "board",
-			sourcePrNumber: task.sourcePrNumber,
-			sourcePrUrl: task.sourcePrUrl,
-			sourcePrHeadRef: task.sourcePrHeadRef,
-			sourcePrHeadSha: task.sourcePrHeadSha,
-			sourcePrCrossRepo: task.sourcePrCrossRepo,
-			sourcePrDependabot: task.sourcePrDependabot,
+			if (blocker !== undefined)
+				return json(
+					{ error: `${blocker.id} already covers this Dependabot PR` },
+					409,
+				);
+			const child = await e.store.createTask(task.prompt);
+			await e.store.updateTask(child.id, {
+				promptAuthor: "board",
+				sourcePrNumber: task.sourcePrNumber,
+				sourcePrUrl: task.sourcePrUrl,
+				sourcePrHeadRef: task.sourcePrHeadRef,
+				sourcePrHeadSha: task.sourcePrHeadSha,
+				sourcePrCrossRepo: task.sourcePrCrossRepo,
+				sourcePrDependabot: task.sourcePrDependabot,
+			});
+			return child;
 		});
-		deps.schedule();
+		if (child instanceof Response) return child;
+		await deps.schedule();
 		return json({ ok: true, id: child.id });
 	}
 
@@ -7197,14 +7513,14 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
 			return json({ error: "task is cancelled" }, 404);
 		// The revision guard outranks the state refusal below: a stale pick answers
 		// 409 with the current card instead of a bare precondition error.
-		const stale = staleEditResponse(e, task, r.body);
+		const stale = await staleEditResponse(e, task, r.body);
 		if (stale !== null) return stale;
 		if (
 			task.state !== "running" &&
@@ -7226,9 +7542,9 @@ export function createApp(deps: AppDeps) {
 		// card has no live run: the pick pre-stages the model its reply turn spawns with.
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
-		const res = applyUserEdit(e, task, { model }, r.body);
+		const res = await applyUserEdit(e, task, { model }, r.body);
 		if (res instanceof Response) return res;
-		return json(taskView(e, res));
+		return json(await taskView(e, res));
 	}
 
 	async function handlePOSTProjectsTasksSteerEditByProjectAndId(
@@ -7236,7 +7552,7 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
@@ -7244,7 +7560,7 @@ export function createApp(deps: AppDeps) {
 		// The revision guard outranks the state preconditions below: a stale edit
 		// answers 409 with the current card, so the drawer's conflict flow keeps the
 		// draft even when the newer state would refuse the edit on its own.
-		const stale = staleEditResponse(e, task, r.body);
+		const stale = await staleEditResponse(e, task, r.body);
 		if (stale !== null) return stale;
 		if (task.pendingPrompt === null)
 			return json({ error: "no steering is queued" }, 409);
@@ -7258,11 +7574,10 @@ export function createApp(deps: AppDeps) {
 		const text = r.body.text;
 		if (typeof text !== "string" || text.trim().length === 0)
 			return json({ error: "text must be a non-empty string" }, 400);
-		// Check and write are sync, so the scheduler (same event loop) cannot start a
-		// turn in between: the queued text never changes after the pre-edit read.
+		// The final transaction refuses a changed task snapshot.
 		// Queued images stay; this edits the words. A human rewrote the text, so it is
 		// no longer the supervisor's park even when the queue carried one.
-		const res = applyUserEdit(
+		const res = await applyUserEdit(
 			e,
 			task,
 			{
@@ -7272,7 +7587,7 @@ export function createApp(deps: AppDeps) {
 			r.body,
 		);
 		if (res instanceof Response) return res;
-		return json(taskView(e, res));
+		return json(await taskView(e, res));
 	}
 
 	async function handlePOSTProjectsTasksSteerCancelByProjectAndId(
@@ -7284,7 +7599,7 @@ export function createApp(deps: AppDeps) {
 		// block, like every other user-edit route.
 		const body = await readOptionalJson(req);
 		if ("error" in body) return body.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
@@ -7292,7 +7607,7 @@ export function createApp(deps: AppDeps) {
 		// The revision guard outranks the state preconditions below: a stale discard
 		// answers 409 with the current card, so the drawer's conflict flow keeps the
 		// draft even when the newer state would refuse the cancel on its own.
-		const stale = staleEditResponse(e, task, body.body);
+		const stale = await staleEditResponse(e, task, body.body);
 		if (stale !== null) return stale;
 		if (task.pendingPrompt === null)
 			return json({ error: "no steering is queued" }, 409);
@@ -7308,7 +7623,7 @@ export function createApp(deps: AppDeps) {
 		// card, or runTurn would re-send the whole task prompt as a fresh turn.
 		const queuedOnlyForTheSteer =
 			task.state === "queued" && task.stage !== "todo";
-		const res = applyUserEdit(
+		const res = await applyUserEdit(
 			e,
 			task,
 			{
@@ -7326,19 +7641,19 @@ export function createApp(deps: AppDeps) {
 			body.body,
 		);
 		if (res instanceof Response) return res;
-		return json(taskView(e, res));
+		return json(await taskView(e, res));
 	}
 
 	async function handleGETProjectsTasksLogByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/log">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const rawFrom = new URL(req.url).searchParams.get("from");
 		if (rawFrom !== null && !/^\d+$/.test(rawFrom))
 			return json({ error: "from must be a non-negative integer" }, 400);
 		const from = rawFrom === null ? 0 : Number(rawFrom);
-		const file = found.e.store.logPath(found.task.id);
+		const file = await found.e.store.logPath(found.task.id);
 		let fd: number;
 		try {
 			fd = openRegular(file);
@@ -7371,7 +7686,7 @@ export function createApp(deps: AppDeps) {
 	async function handleGETProjectsTasksDiffByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/diff">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		// Same source rule as the drawer's diffFiles: captured text for finished cards,
@@ -7404,7 +7719,7 @@ export function createApp(deps: AppDeps) {
 	async function handleGETProjectsTasksFilesByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/files">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { task } = found;
 		const rel = new URL(req.url).searchParams.get("path") ?? "";
@@ -7431,7 +7746,7 @@ export function createApp(deps: AppDeps) {
 	async function handleGETProjectsTasksSavedFilesByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/saved-files">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const rel = new URL(req.url).searchParams.get("path") ?? "";
@@ -7480,9 +7795,9 @@ export function createApp(deps: AppDeps) {
 		if (!Array.isArray(order) || !order.every((id) => typeof id === "string")) {
 			return json({ error: "order must be an array of task ids" }, 400);
 		}
-		if (!e.store.reorderQueue(order))
+		if (!(await e.store.reorderQueue(order)))
 			return json({ error: "order does not match the current queue" }, 409);
-		deps.schedule();
+		await deps.schedule();
 		return json({ ok: true });
 	}
 
@@ -7502,8 +7817,8 @@ export function createApp(deps: AppDeps) {
 			resolved = await resolveTarget(
 				e.path,
 				true,
-				e.store.getSettings().originUrl,
-				e.store.getSettings().targetBranch,
+				(await e.store.getSettings()).originUrl,
+				(await e.store.getSettings()).targetBranch,
 			);
 		} catch (err) {
 			return json({ error: errmsg(err) }, 409);
@@ -7512,7 +7827,7 @@ export function createApp(deps: AppDeps) {
 			mainPath: e.path,
 			target: resolved.target,
 			sha,
-			originUrl: e.store.getSettings().originUrl,
+			originUrl: (await e.store.getSettings()).originUrl,
 		}).catch((err) => json({ error: errmsg(err) }, 409));
 		if (plan instanceof Response) return plan;
 		// Before the first release there is nothing to consolidate: the dialog
@@ -7526,23 +7841,24 @@ export function createApp(deps: AppDeps) {
 					await git(["log", "-1", "--format=%ct", plan.from], e.path)
 				).stdout.trim(),
 			) * 1000;
-		const all = e.store.listTasks();
+		const all = await e.store.listTasks();
 		const tasks = includedTasks(all, since);
-		const cards = tasks.map((t) => {
-			// The release notes are the card's own ready report: the latest settled
-			// turn with outcome ready. Task.details is the wrong source — every
-			// settled turn overwrites it (turn.ts), so it holds the merge turn's
-			// integration output, not the notes.
-			const ready = e.store
-				.listTurns(t.id)
-				.filter((turn) => turn.outcome === "ready")
-				.at(-1);
-			return {
-				id: t.id,
-				title: t.title,
-				details: ready?.details ?? null,
-			};
-		});
+		const cards = await Promise.all(
+			tasks.map(async (t) => {
+				// The release notes are the card's own ready report: the latest settled
+				// turn with outcome ready. Task.details is the wrong source — every
+				// settled turn overwrites it (turn.ts), so it holds the merge turn's
+				// integration output, not the notes.
+				const ready = (await e.store.listTurns(t.id))
+					.filter((turn) => turn.outcome === "ready")
+					.at(-1);
+				return {
+					id: t.id,
+					title: t.title,
+					details: ready?.details ?? null,
+				};
+			}),
+		);
 		const result = await summarizeRelease({
 			notes: plan.notes,
 			cards,
@@ -7616,15 +7932,15 @@ export function createApp(deps: AppDeps) {
 		deps.shared.projectOrder = mergeProjectOrder(order, [
 			...deps.projects.keys(),
 		]);
-		saveConfig();
-		deps.schedule();
+		await saveConfig();
+		await deps.schedule();
 		return json({ ok: true });
 	}
 
 	async function handlePOSTProjectsTasksUnmarkByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/unmark-research">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		// The in-flight turn holds its own task snapshot, so clearing mid-run
@@ -7636,7 +7952,9 @@ export function createApp(deps: AppDeps) {
 			);
 		// Clears only the flag: turns, commits and the harvested report stay;
 		// the next settle classifies from the branch like any other card.
-		return json(taskView(e, e.store.updateTask(task.id, { research: false })));
+		return json(
+			await taskView(e, await updateSnapshot(e, task, { research: false })),
+		);
 	}
 
 	async function handleGETProjectsGithubByProject(
@@ -7685,7 +8003,7 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const out = await deps.finishKept(found.e, found.task.id, r.body.choices);
 		return "error" in out
@@ -7696,7 +8014,7 @@ export function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsTasksStopByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/stop">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const out = await deps.stopTurn(found.e, found.task.id);
 		return "error" in out
@@ -7707,7 +8025,7 @@ export function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsTasksRestartByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/restart-session">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.state !== "needs_you")
@@ -7717,7 +8035,7 @@ export function createApp(deps: AppDeps) {
 			);
 		if (task.sessionId === null)
 			return json({ error: "task has no session to restart" }, 409);
-		e.store.updateTask(task.id, {
+		await updateSnapshot(e, task, {
 			sessionId: null,
 			pendingImages: [],
 			asked: null, // a fresh session knows nothing of the old ask
@@ -7728,7 +8046,7 @@ export function createApp(deps: AppDeps) {
 			queuedAt: Date.now(),
 			needsReason: null,
 		});
-		deps.schedule();
+		await deps.schedule();
 		return json({ ok: true });
 	}
 
@@ -7737,20 +8055,23 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (typeof r.body.starred !== "boolean")
 			return json({ error: "starred must be a boolean" }, 400);
 		return json(
-			taskView(e, e.store.updateTask(task.id, { starred: r.body.starred })),
+			await taskView(
+				e,
+				await updateSnapshot(e, task, { starred: r.body.starred }),
+			),
 		);
 	}
 
 	async function handleGETProjectsTasksContextByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/context">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		return json({
 			context: sessionContext(found.e.store.sessionsDir, found.task.sessionId),
@@ -7760,13 +8081,13 @@ export function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsTasksEditStopByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/edit/stop">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		// Idempotent, and guard-free on purpose: the drawer posts it on every editor
 		// close (a save already cleared the hold), and clearing can only let a card
 		// start sooner — it never stalls one. Contentless: it never moves the revision.
-		e.store.releasePromptHold(task.id);
+		await e.store.releasePromptHold(task.id);
 		return json({ ok: true });
 	}
 
@@ -7777,52 +8098,57 @@ export function createApp(deps: AppDeps) {
 		// not hide the card's state behind an older snapshot.
 		const body = await readOptionalJson(req);
 		if ("error" in body) return body.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		// The revision guard outranks the state refusal below: a stale claim answers
 		// 409 with the current card, so the editor can show the current version
 		// through the conflict flow instead of a bare precondition error.
-		const stale = staleEditResponse(e, task, body.body);
+		const stale = await staleEditResponse(e, task, body.body);
 		if (stale !== null) return stale;
 		// Same rule as /edit: only a queued todo card, a parked backlog card, or a held
 		// proposal parked needs_you has a prompt worth guarding — and a hold on a started
 		// card could stall a later reply turn.
-		if (
-			!(
-				(task.stage === "todo" && task.state === "queued") ||
-				(task.stage === "backlog" && task.state === "idle") ||
-				(task.stage === "todo" &&
-					task.state === "needs_you" &&
-					isProposalReason(task.needsReason))
-			) ||
-			task.cancelledAt !== null ||
-			e.store.listTurns(task.id).length > 0
-		)
-			return json(
-				{
-					error:
-						"only a queued todo task or a parked backlog task can be edited",
-				},
-				409,
+		const result = await withTask(e, task, async () => {
+			if (
+				!(
+					(task.stage === "todo" && task.state === "queued") ||
+					(task.stage === "backlog" && task.state === "idle") ||
+					(task.stage === "todo" &&
+						task.state === "needs_you" &&
+						isProposalReason(task.needsReason))
+				) ||
+				task.cancelledAt !== null ||
+				(await e.store.listTurns(task.id)).length > 0
+			)
+				return json(
+					{
+						error:
+							"only a queued todo task or a parked backlog task can be edited",
+					},
+					409,
+				);
+			// The hold is contentless bookkeeping (it never moves the revision), and with a
+			// revision the claim itself is guarded: a content edit that landed between the
+			// editor's load and this claim refuses the claim, so the editor never arms a
+			// stale draft with a fresh revision. Body-less callers keep the unconditional
+			// claim, like every guarded route's no-revision path. staleEditResponse has
+			// already validated the revision, so only absence reaches the null path.
+			const rev = body.body.revision;
+			const res = await e.store.claimPromptHold(
+				task.id,
+				PROMPT_EDIT_HELD,
+				typeof rev === "number" ? rev : null,
 			);
-		// The hold is contentless bookkeeping (it never moves the revision), and with a
-		// revision the claim itself is guarded: a content edit that landed between the
-		// editor's load and this claim refuses the claim, so the editor never arms a
-		// stale draft with a fresh revision. Body-less callers keep the unconditional
-		// claim, like every guarded route's no-revision path. staleEditResponse has
-		// already validated the revision, so only absence reaches the null path.
-		const rev = body.body.revision;
-		const res = e.store.claimPromptHold(
-			task.id,
-			PROMPT_EDIT_HELD,
-			typeof rev === "number" ? rev : null,
-		);
+			return res;
+		});
+		if (result instanceof Response) return result;
+		const res = result;
 		if (!res.ok)
 			return json(
 				{
 					error: "card changed since it was loaded",
-					task: taskView(e, res.task),
+					task: await taskView(e, res.task),
 				},
 				409,
 			);
@@ -7832,7 +8158,7 @@ export function createApp(deps: AppDeps) {
 	async function handleGETProjectsTasksImagesByProjectAndIdAndName(
 		req: BunRequest<"/api/projects/:project/tasks/:id/images/:name">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const name = req.params.name;
@@ -7847,7 +8173,7 @@ export function createApp(deps: AppDeps) {
 		) {
 			return json({ error: "unknown image" }, 404);
 		}
-		const file = join(e.store.imagesDir(task.id), name);
+		const file = join(await e.store.imagesDir(task.id), name);
 		const st = statSync(file, { throwIfNoEntry: false });
 		if (!st?.isFile()) return json({ error: "unknown image" }, 404);
 		const f = Bun.file(file);
@@ -7866,17 +8192,18 @@ export function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		// One live check: a second click opens it instead of starting a parallel check.
-		const lastId = e.store.boardCheckId();
-		const last = lastId === null ? null : e.store.getTask(lastId);
-		if (last && last.cancelledAt === null && last.stage !== "done")
-			return taskResponse(e, last.id);
-		const t = e.store.createTask(BOARD_CHECK_PROMPT);
-		// Synchronous with createTask: the scheduler must never start the card unmarked.
-		e.store.updateTask(t.id, { promptAuthor: "board" });
-		e.store.setBoardCheckId(t.id);
-		deps.schedule();
-		return taskResponse(e, t.id);
+		const id = await e.store.transaction(async () => {
+			const lastId = await e.store.boardCheckId();
+			const last = lastId === null ? null : await e.store.getTask(lastId);
+			if (last && last.cancelledAt === null && last.stage !== "done")
+				return last.id;
+			const t = await e.store.createTask(BOARD_CHECK_PROMPT);
+			await e.store.updateTask(t.id, { promptAuthor: "board" });
+			await e.store.setBoardCheckId(t.id);
+			return t.id;
+		});
+		await deps.schedule();
+		return taskResponse(e, id);
 	}
 
 	async function handlePOSTProjectsArchByProject(
@@ -7891,7 +8218,7 @@ export function createApp(deps: AppDeps) {
 		const badModel = await cardModelResponse(model);
 		if (badModel !== null) return badModel;
 		// The helper keeps the R1-8 ordering (git spawns before the guard; guard
-		// and createTask in one synchronous block); the manual route files
+		// and createTask in one transaction). The manual route files
 		// without a due check, as today.
 		const filed = await fileArchReview(e, model, { requireDue: false });
 		if (!filed.ok) return json({ error: filed.error }, filed.status);
@@ -7930,7 +8257,7 @@ export function createApp(deps: AppDeps) {
 			e.target,
 			"",
 			null,
-			e.store.getSettings().originUrl,
+			(await e.store.getSettings()).originUrl,
 		).catch((err) => ({ status: "failed" as const, error: errmsg(err) }));
 		if (result.status === "pushed") {
 			e.mainUnpushed = false;
@@ -7948,7 +8275,7 @@ export function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		removeIcons(e.store.dataRoot, e.store.tasksDir);
-		return json(projectView(e));
+		return json(await projectView(e));
 	}
 
 	async function handlePOSTProjectsIconByProject(
@@ -7967,7 +8294,7 @@ export function createApp(deps: AppDeps) {
 			join(e.store.tasksDir, `icon.${ext}`),
 			r.bytes,
 		);
-		return json(projectView(e));
+		return json(await projectView(e));
 	}
 
 	async function handleGETProjectsIconByProject(
@@ -8006,8 +8333,9 @@ export function createApp(deps: AppDeps) {
 				{ error: "The update request must be an empty object." },
 				400,
 			);
-		// No await can let a turn claim a runner between this check and the hold.
-		const idle = updateCycleIdle();
+		// The final runner snapshot precedes the hold.
+		const storesIdle = await idleProjectStores();
+		const idle = storesIdle && runnerCountsIdle();
 		const result = updateCycle.request(Date.now(), idle);
 		return json(result, "error" in result ? 409 : 202);
 	}
@@ -8141,14 +8469,14 @@ export function createApp(deps: AppDeps) {
 			return json({ error: "id must be a string" }, 400);
 		if (!updates?.updates.some((rec) => rec.id === id))
 			return json({ error: "unknown update id" }, 400);
-		addSkip(deps.gstore, id);
+		await addSkip(deps.gstore, id);
 		publishSoon();
-		return json(updatesView());
+		return json(await updatesView());
 	}
 
 	async function handlePOSTUpdatesRefresh(): Promise<Response> {
 		await refreshUpdates();
-		return json(updatesView());
+		return json(await updatesView());
 	}
 
 	async function handlePOSTAlateProvision(): Promise<Response> {
@@ -8221,7 +8549,7 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		return removeProject(req.params.project);
+		return await removeProject(req.params.project);
 	}
 
 	async function handlePOSTProjectsInterviewByProject(
@@ -8234,7 +8562,7 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		// parsed JSON boundary: shape is only trusted after the === true check
 		const b = r.body as { fix?: unknown };
-		return json(startInterview(e, b.fix === true));
+		return json(await startInterview(e, b.fix === true));
 	}
 
 	async function handlePOSTProjectsInitByProject(
@@ -8247,14 +8575,14 @@ export function createApp(deps: AppDeps) {
 		if (err !== null) return json({ error: err }, 400);
 		e.gitless = false;
 		await refreshRemote(e);
-		const interview = startInterview(e);
-		return json({ project: projectView(e), ...interview });
+		const interview = await startInterview(e);
+		return json({ project: await projectView(e), ...interview });
 	}
 
 	async function handlePOSTProjects(req: Request): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		return addProject(r.body);
+		return await addProject(r.body);
 	}
 
 	async function handleGETGh(req: Request): Promise<Response> {
@@ -8309,7 +8637,9 @@ export function createApp(deps: AppDeps) {
 		const stores = [...deps.projects.values()];
 		// Fleet first: its facts union fixes the series start so every
 		// project's series aligns.
-		const facts = stores.map((e) => e.store.perfFacts());
+		const facts = await Promise.all(
+			stores.map(async (e) => await e.store.perfFacts()),
+		);
 		const fleet = perfMetrics(
 			{
 				tasks: facts.flatMap((f) => f.tasks),
@@ -8339,12 +8669,12 @@ export function createApp(deps: AppDeps) {
 	async function handleGETSystem(): Promise<Response> {
 		const now = Date.now();
 		return json(
-			system.snapshot(deps.liveRuns?.() ?? [], systemHolds(now), now),
+			system.snapshot(deps.liveRuns?.() ?? [], await systemHolds(now), now),
 		);
 	}
 
 	async function handleGETOrphans(): Promise<Response> {
-		const scan = currentOrphanScan();
+		const scan = await currentOrphanScan();
 		return json({ orphans: scan.orphans, orphansError: scan.error });
 	}
 
@@ -8363,38 +8693,42 @@ export function createApp(deps: AppDeps) {
 		// set too when they are stale, so the store decays here as on the read path.
 		if (b.unread === true) {
 			// ponytail: ids here hold one id; includes beats a Set at this size.
-			saveSeen(loadSeen().filter((id) => !ids.includes(id)));
+			await updateSeen((current) => current.filter((id) => !ids.includes(id)));
 			return json({ ok: true });
 		}
 		// seen ⇒ a card that can carry the mark right now: drop anything else
 		// (stale clients, dead ids).
-		const live = seenableIds();
-		saveSeen([...loadSeen(), ...ids].filter((id) => live.has(id)));
+		const live = await seenableIds();
+		await updateSeen((current) =>
+			[...current, ...ids].filter((id) => live.has(id)),
+		);
 		return json({ ok: true });
 	}
 
 	async function handleGETNotificationsLive(req: Request): Promise<Response> {
-		const endpoint = new URL(req.url).searchParams.get("endpoint");
-		if (
-			endpoint === null ||
-			!loadSubs(deps.gstore).some((s) => s.endpoint === endpoint)
-		)
-			return json({ error: "unknown endpoint" }, 404);
-		const seqs = alertSeqs.get(endpoint);
-		const live: Record<AlertClass, { live: number; seq: number }> = {
-			request: { live: 0, seq: seqs?.request ?? 0 },
-			error: { live: 0, seq: seqs?.error ?? 0 },
-			complete: { live: 0, seq: seqs?.complete ?? 0 },
-		};
-		for (const a of liveAlerts)
-			if (a.to.includes(endpoint)) live[a.class].live++;
-		return json(live);
+		return deps.gstore.transaction(async () => {
+			const endpoint = new URL(req.url).searchParams.get("endpoint");
+			if (
+				endpoint === null ||
+				!(await loadSubs(deps.gstore)).some((s) => s.endpoint === endpoint)
+			)
+				return json({ error: "unknown endpoint" }, 404);
+			const seqs = alertSeqs.get(endpoint);
+			const live: Record<AlertClass, { live: number; seq: number }> = {
+				request: { live: 0, seq: seqs?.request ?? 0 },
+				error: { live: 0, seq: seqs?.error ?? 0 },
+				complete: { live: 0, seq: seqs?.complete ?? 0 },
+			};
+			for (const a of liveAlerts)
+				if (a.to.includes(endpoint)) live[a.class].live++;
+			return json(live);
+		});
 	}
 
 	async function handlePOSTPushTest(): Promise<Response> {
-		const subs = loadSubs(deps.gstore);
+		const subs = await loadSubs(deps.gstore);
 		if (subs.length === 0) return json({ error: "no subscribed device" }, 400);
-		ensureVapid();
+		await ensureVapid();
 		const report = await sendAll(
 			subs,
 			JSON.stringify({
@@ -8405,7 +8739,7 @@ export function createApp(deps: AppDeps) {
 			}),
 			(sub, payload) => sendNotification(sub, payload),
 		);
-		pruneSubs(deps.gstore, report.gone);
+		await pruneSubs(deps.gstore, report.gone, subs);
 		// A 403 (rejected VAPID subject) is not a send: Settings must see it failed
 		// (R2-3), not a green `{ ok: true, sent }` that counted the failures.
 		return report.failed > 0
@@ -8426,9 +8760,8 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		if (typeof r.body.endpoint !== "string")
 			return json({ error: "endpoint required" }, 400);
-		saveSubs(
-			deps.gstore,
-			loadSubs(deps.gstore).filter((s) => s.endpoint !== r.body.endpoint),
+		await updateSubs(deps.gstore, (current) =>
+			current.filter((s) => s.endpoint !== r.body.endpoint),
 		);
 		return json({ ok: true });
 	}
@@ -8463,38 +8796,38 @@ export function createApp(deps: AppDeps) {
 			}
 			carriedClasses = c as ClassPrefs;
 		}
-		const subs = loadSubs(deps.gstore);
-		// A re-subscribe (key rotation, permission re-grant) keeps the device's class
-		// switches; a new device starts with every class on. Carried classes win:
-		// the recovery read the old row and must override the endpoint-match default.
-		const classes =
-			carriedClasses ??
-			subs.find((s) => s.endpoint === b.endpoint)?.classes ??
-			ALL_CLASSES_ON;
-		saveSubs(deps.gstore, [
-			...subs.filter((s) => s.endpoint !== b.endpoint),
-			{
-				endpoint: b.endpoint,
-				keys: { p256dh: b.keys.p256dh, auth: b.keys.auth },
-				addedAt: Date.now(),
-				classes: { ...classes },
-				// ADR-0011: the sub only receives under the key it was created with.
-				vapidPublicKey: ensureVapid().publicKey,
-			},
-		]);
+		const endpoint = b.endpoint;
+		const keys = { p256dh: b.keys.p256dh, auth: b.keys.auth };
+		const vapidPublicKey = (await ensureVapid()).publicKey;
+		await updateSubs(deps.gstore, (current) => {
+			const classes =
+				carriedClasses ??
+				current.find((sub) => sub.endpoint === endpoint)?.classes ??
+				ALL_CLASSES_ON;
+			return [
+				...current.filter((sub) => sub.endpoint !== endpoint),
+				{
+					endpoint,
+					keys,
+					addedAt: Date.now(),
+					classes: { ...classes },
+					vapidPublicKey,
+				},
+			];
+		});
 		return json({ ok: true });
 	}
 
 	async function handleGETPushConfig(req: Request): Promise<Response> {
 		// Lazy: the first push path pays the VAPID keygen, boot stays silent.
-		const v = ensureVapid();
+		const v = await ensureVapid();
 		// An endpoint whose stored sub carries a bound key differing from the current one
 		// is stale: Settings recovers it by re-subscribing (ADR-0011 recovery).
 		const endpoint = new URL(req.url).searchParams.get("endpoint");
 		const sub =
 			endpoint === null
 				? undefined
-				: loadSubs(deps.gstore).find((s) => s.endpoint === endpoint);
+				: (await loadSubs(deps.gstore)).find((s) => s.endpoint === endpoint);
 		const stale =
 			sub !== undefined &&
 			sub.vapidPublicKey !== undefined &&
@@ -8522,7 +8855,7 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		const f = projectKeyPath(e.name);
 		if (f === "") return json({ error: "no such key" }, 400);
-		return saveKeyFlow(r.body, f);
+		return await saveKeyFlow(r.body, f);
 	}
 
 	async function handleGETProjectsSshByProject(
@@ -8539,7 +8872,7 @@ export function createApp(deps: AppDeps) {
 		githubApp = null;
 		appTokens = null;
 		appCheck = null;
-		saveConfig();
+		await saveConfig();
 		applyGitSecrets();
 		return json(await gitHostsView());
 	}
@@ -8558,7 +8891,7 @@ export function createApp(deps: AppDeps) {
 				400,
 			);
 		githubApp = v;
-		saveConfig();
+		await saveConfig();
 		// A fresh pair invalidates any cached installation token for the old one.
 		appTokens = new AppTokenSource({
 			appId: v.id,
@@ -8579,7 +8912,7 @@ export function createApp(deps: AppDeps) {
 	async function handlePUTGitSshGlobal(req: Request): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		return saveKeyFlow(r.body, sshPaths(sshDir).global);
+		return await saveKeyFlow(r.body, sshPaths(sshDir).global);
 	}
 
 	async function handlePOSTGitSshPending(req: Request): Promise<Response> {
@@ -8604,7 +8937,7 @@ export function createApp(deps: AppDeps) {
 		// Same normalized form the rows and the kept map use, so the kept blob drops too.
 		clearSecret(`git:${req.params.host}`);
 		gitTokens = gitTokens.filter((x) => x.host !== req.params.host);
-		saveConfig();
+		await saveConfig();
 		applyGitSecrets();
 		return json(await gitHostsView());
 	}
@@ -8626,7 +8959,7 @@ export function createApp(deps: AppDeps) {
 		// x-access-token for a GitHub host.
 		const cand = parseGitToken({ host, token: githubToken });
 		if ("error" in cand) return json({ error: cand.error }, 400);
-		return saveGitToken(cand, r.body.testUrl);
+		return await saveGitToken(cand, r.body.testUrl);
 	}
 
 	async function handlePOSTGitTokens(req: Request): Promise<Response> {
@@ -8636,7 +8969,7 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		const cand = parseGitToken(r.body);
 		if ("error" in cand) return json({ error: cand.error }, 400);
-		return saveGitToken(cand, r.body.testUrl);
+		return await saveGitToken(cand, r.body.testUrl);
 	}
 
 	async function handlePOSTSettingsEnv(req: Request): Promise<Response> {
@@ -8662,13 +8995,13 @@ export function createApp(deps: AppDeps) {
 		// A plain value is not a secret: no secret box, no redaction (env-plain-values.md).
 		if (row.plain) {
 			deps.shared.envPlain[name] = value;
-			saveConfig();
+			await saveConfig();
 			return json({ ok: true });
 		}
 		const noBox = sealGuard();
 		if (noBox !== null) return noBox;
 		deps.shared.envValues[name] = value;
-		saveConfig();
+		await saveConfig();
 		applyGitSecrets();
 		return json({ ok: true });
 	}
@@ -8687,7 +9020,7 @@ export function createApp(deps: AppDeps) {
 			if ("error" in parsed) return json({ error: parsed.error }, 400);
 			savedGithubHost = parsed.host;
 		}
-		saveConfig();
+		await saveConfig();
 		applyGithubHost();
 		const expiresAt = await refreshBoardExpiry();
 		return json({ host: githubHostView(), expiresAt });
@@ -8701,7 +9034,7 @@ export function createApp(deps: AppDeps) {
 		const token = githubTokenParam(r.body.token);
 		if (token === null) return json({ error: GITHUB_TOKEN_ERROR }, 400);
 		githubToken = token;
-		saveConfig();
+		await saveConfig();
 		applyGithubToken();
 		// Immediate probe: a pasted token shows its real date at once.
 		const expiresAt = await refreshBoardExpiry();
@@ -8736,7 +9069,7 @@ export function createApp(deps: AppDeps) {
 		const check = await checkTurnToken({
 			apiBase,
 			token,
-			repos: reposOnHost(row.host),
+			repos: await reposOnHost(row.host),
 			fetch: deps.turnTokenFetch,
 		});
 		row.status = check.verdict;
@@ -8759,7 +9092,7 @@ export function createApp(deps: AppDeps) {
 		if (token === "") {
 			clearSecret(`turnRead:${host}`);
 			turnReadTokens = turnReadTokens.filter((x) => x.host !== host);
-			saveConfig();
+			await saveConfig();
 			return json(turnReadTokenView());
 		}
 		// One row per host: a re-save replaces the host's old entry, unconfirmed.
@@ -8772,7 +9105,7 @@ export function createApp(deps: AppDeps) {
 		};
 		await checkAndStoreTurnToken(row, token, h.gh.apiBase);
 		turnReadTokens = [...turnReadTokens.filter((x) => x.host !== host), row];
-		saveConfig();
+		await saveConfig();
 		return json(turnReadTokenView());
 	}
 
@@ -8790,7 +9123,7 @@ export function createApp(deps: AppDeps) {
 				400,
 			);
 		row.confirmed = true;
-		saveConfig();
+		await saveConfig();
 		return json(turnReadTokenView());
 	}
 
@@ -8805,7 +9138,7 @@ export function createApp(deps: AppDeps) {
 		if (row === undefined || row.token === null)
 			return json({ error: "no stored readable token for this host" }, 400);
 		await checkAndStoreTurnToken(row, row.token, h.gh.apiBase);
-		saveConfig();
+		await saveConfig();
 		return json(turnReadTokenView());
 	}
 
@@ -8815,7 +9148,7 @@ export function createApp(deps: AppDeps) {
 		if (!sessions.some((s) => s.id === req.params.id))
 			return json({ error: "no such session" }, 404);
 		sessions = dropSession(sessions, req.params.id);
-		saveConfig();
+		await saveConfig();
 		return json({ ok: true });
 	}
 
@@ -8825,7 +9158,7 @@ export function createApp(deps: AppDeps) {
 		// Lazy pruning: persist only when serving the list actually dropped entries.
 		if (live.length !== sessions.length) {
 			sessions = live;
-			saveConfig();
+			await saveConfig();
 		}
 		const token = parseCookies(req.headers.get("cookie"))[SESSION_COOKIE];
 		const currentId =
@@ -8853,7 +9186,7 @@ export function createApp(deps: AppDeps) {
 		sessionSecret = newSecret();
 		// The registry dies with the secret: no ghost rows survive the rotation.
 		sessions = [];
-		saveConfig();
+		await saveConfig();
 		return json({ ok: true });
 	}
 
@@ -8869,7 +9202,7 @@ export function createApp(deps: AppDeps) {
 		const prev = alate;
 		try {
 			alate = { url: alate.url, key: r.body.key };
-			saveConfig();
+			await saveConfig();
 		} catch (err) {
 			// The assignment mutated the closure before saveConfig read it, so a failed
 			// save must restore the old value: store and live config stay equal. The
@@ -8891,7 +9224,7 @@ export function createApp(deps: AppDeps) {
 		if (noBox !== null) return noBox;
 		if (apiKey === null) return json({ error: "no admin configured" }, 400);
 		apiKey = newSecret();
-		saveConfig();
+		await saveConfig();
 		return json({ apiKey });
 	}
 
@@ -8928,12 +9261,12 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		// The revision guard outranks the refusal below: a stale notes edit answers
 		// 409 with the current card instead of a bare precondition error.
-		const stale = staleEditResponse(e, task, r.body);
+		const stale = await staleEditResponse(e, task, r.body);
 		if (stale !== null) return stale;
 		const refusal = releaseNotesRefusal(task);
 		if (refusal !== null) return refusal;
@@ -8942,9 +9275,14 @@ export function createApp(deps: AppDeps) {
 		const trimmed = r.body.notes.trim();
 		if (!trimmed || trimmed.length > 20000)
 			return json({ error: "notes must be 1-20000 characters" }, 400);
-		const res = applyUserEdit(e, task, { releaseNotes: r.body.notes }, r.body);
+		const res = await applyUserEdit(
+			e,
+			task,
+			{ releaseNotes: r.body.notes },
+			r.body,
+		);
 		if (res instanceof Response) return res;
-		return json(taskView(e, res));
+		return json(await taskView(e, res));
 	}
 
 	/** Posts the review as the GitHub App through an installation token; null when no app or no installation, so the board token path runs. */
@@ -8969,7 +9307,7 @@ export function createApp(deps: AppDeps) {
 			tok = await appTokens.tokenFor(owner, repoName);
 		} catch (err) {
 			const error = redact(errmsg(err), appSecrets).trim().slice(0, 300);
-			e.store.releasePrPost(row.number, head, prev, error);
+			await e.store.releasePrPost(row.number, head, prev, error);
 			return json({ error }, 502);
 		}
 		if (tok === null) return null;
@@ -9020,13 +9358,13 @@ export function createApp(deps: AppDeps) {
 						res.status,
 						"check the app's or token's permissions, then post the review again",
 					);
-				e.store.releasePrPost(row.number, head, prev, error);
+				await e.store.releasePrPost(row.number, head, prev, error);
 				return json({ error }, 502);
 			}
 			return { via: "app", stdout: text };
 		} catch (err) {
 			const error = redact(errmsg(err), appSecrets).trim().slice(0, 300);
-			e.store.releasePrPost(row.number, head, prev, error);
+			await e.store.releasePrPost(row.number, head, prev, error);
 			return json({ error }, 502);
 		}
 	}
@@ -9093,7 +9431,7 @@ export function createApp(deps: AppDeps) {
 		}
 		if (res.code !== 0) {
 			const error = res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
-			e.store.releasePrPost(row.number, head, prev, error);
+			await e.store.releasePrPost(row.number, head, prev, error);
 			return json({ error }, 502);
 		}
 		return { stdout: res.stdout };
@@ -9171,27 +9509,44 @@ export function createApp(deps: AppDeps) {
 		if (row.state !== "open") return json({ error: `PR is ${row.state}` }, 409);
 		return null;
 	}
-	function claimPrPostCard(
+	async function claimPrPostCard(
 		e: Entry,
 		task: Task,
 		rawHead: unknown,
-	): Response | { row: PrReviewRow; head: string; prev: string | null } {
-		const row =
-			task.kind === "pr_review" ? e.store.getPrReviewByTask(task.id) : null;
-		const storedGithub = e.github;
-		if (row === null || storedGithub === null)
-			return json({ error: "not a PR review card" }, 409);
-		const stateRefused = prPostStateRefusal(task, row);
-		if (stateRefused !== null) return stateRefused;
-		const headRefused = prHeadRefusal(row, rawHead);
-		if (headRefused !== null) return json({ error: headRefused }, 409);
-		if (typeof rawHead !== "string")
-			return json({ error: "the draft changed" }, 409);
-		// Claim before the await: a concurrent Post of the same head loses here.
-		const prev = e.store.claimPrPost(row.number, rawHead);
-		if (prev === undefined)
-			return json({ error: "already posted for this head" }, 409);
-		return { row, head: rawHead, prev };
+	): Promise<
+		| Response
+		| {
+				row: PrReviewRow;
+				head: string;
+				prev: string | null;
+				event: "APPROVE" | "COMMENT";
+		  }
+	> {
+		return withTask(e, task, async () => {
+			const row =
+				task.kind === "pr_review"
+					? await e.store.getPrReviewByTask(task.id)
+					: null;
+			const storedGithub = e.github;
+			if (row === null || storedGithub === null)
+				return json({ error: "not a PR review card" }, 409);
+			const stateRefused = prPostStateRefusal(task, row);
+			if (stateRefused !== null) return stateRefused;
+			const headRefused = prHeadRefusal(row, rawHead);
+			if (headRefused !== null) return json({ error: headRefused }, 409);
+			if (typeof rawHead !== "string")
+				return json({ error: "the draft changed" }, 409);
+			// Claim before the await: a concurrent Post of the same head loses here.
+			const prev = await e.store.claimPrPost(row.number, rawHead);
+			if (prev === undefined)
+				return json({ error: "already posted for this head" }, 409);
+			const event =
+				(await e.store.getSettings()).prReviewApprove === true &&
+				!(await e.store.lastPrRunBlocking(row.number))
+					? ("APPROVE" as const)
+					: ("COMMENT" as const);
+			return { row, head: rawHead, prev, event };
+		});
 	}
 	async function preparePrPost(
 		req: BunRequest<"/api/projects/:project/tasks/:id/pr-review/post">,
@@ -9203,16 +9558,17 @@ export function createApp(deps: AppDeps) {
 				row: PrReviewRow;
 				head: string;
 				prev: string | null;
+				event: "APPROVE" | "COMMENT";
 				draft: ParsedReview;
 				github: string;
 		  }
 	> {
 		const picked = await readPrPostDraft(req);
 		if (picked instanceof Response) return picked;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
-		const claimed = claimPrPostCard(e, task, picked.rawHead);
+		const claimed = await claimPrPostCard(e, task, picked.rawHead);
 		if (claimed instanceof Response) return claimed;
 		const storedGithub = e.github;
 		if (storedGithub === null)
@@ -9223,6 +9579,7 @@ export function createApp(deps: AppDeps) {
 			row: claimed.row,
 			head: claimed.head,
 			prev: claimed.prev,
+			event: claimed.event,
 			draft: picked.draft,
 			github: storedGithub,
 		};
@@ -9243,11 +9600,7 @@ export function createApp(deps: AppDeps) {
 				: {};
 		// APPROVE only when the project opted in and this draft's own run found no blocking
 		// findings; an unknown verdict posts a plain comment.
-		const event =
-			e.store.getSettings().prReviewApprove === true &&
-			!e.store.lastPrRunBlocking(row.number)
-				? ("APPROVE" as const)
-				: ("COMMENT" as const);
+		const event = prep.event;
 		const app = await postReviewViaApp(
 			e,
 			row,
@@ -9287,11 +9640,26 @@ export function createApp(deps: AppDeps) {
 		// host becomes the drawer link, and only a plausible login names the
 		// posting identity.
 		const { url, login } = parsePrPostResult(stdout);
-		e.store.setPrPostedUrl(row.number, url, login);
-		// The posted review's own comments must never alert: the baseline is the post time.
-		e.store.setPrComments(row.number, Date.now(), false);
-		// The head is posted: the card leaves needs_you for done/idle.
-		e.store.syncPrCard(row.number);
+		const applied = await withTask(e, prep.task, async () => {
+			const current = await e.store.getPrReviewByTask(prep.task.id);
+			if (
+				current === null ||
+				current.number !== row.number ||
+				current.firstSeenAt !== row.firstSeenAt ||
+				current.head !== row.head ||
+				current.reviewedHead !== head ||
+				current.postedHead !== head
+			)
+				return json({ error: "the draft changed" }, 409);
+			// A watcher can close or merge this PR during the post. Preserve that state.
+			await e.store.setPrPostedUrl(row.number, url, login);
+			// The posted review's own comments must never alert: the baseline is the post time.
+			await e.store.setPrComments(row.number, Date.now(), false);
+			// The head is posted: the card leaves needs_you for done/idle.
+			await e.store.syncPrCard(row.number);
+			return null;
+		});
+		if (applied !== null) return applied;
 		return json({
 			ok: true,
 			login,
@@ -9302,8 +9670,11 @@ export function createApp(deps: AppDeps) {
 	}
 
 	/** The latest finished grill report's details, or null when none finished. */
-	function latestGrillDetails(e: Entry, taskId: string): string | null {
-		const turns = e.store.listTurns(taskId);
+	async function latestGrillDetails(
+		e: Entry,
+		taskId: string,
+	): Promise<string | null> {
+		const turns = await e.store.listTurns(taskId);
 		for (let i = turns.length - 1; i >= 0; i--) {
 			const turn = turns[i];
 			const out = turn?.outcome;
@@ -9317,11 +9688,11 @@ export function createApp(deps: AppDeps) {
 		return null;
 	}
 	/** Moves a backlog task to todo: validates the grill state, folds the latest grilled definition of ready into the prompt, queues it. */
-	function backlogToTodo(
+	async function backlogToTodo(
 		e: Entry,
 		task: Task,
 		body: Record<string, unknown>,
-	): Response {
+	): Promise<Response> {
 		if (task.stage !== "backlog")
 			return json({ error: "only a backlog task can move to todo" }, 409);
 		if (task.state !== "idle")
@@ -9337,26 +9708,28 @@ export function createApp(deps: AppDeps) {
 		const model = modelParam(body);
 		if (model instanceof Response) return model;
 		// The latest finished grill report carries the refinement; fold it into the prompt.
-		const details = latestGrillDetails(e, task.id);
-		const refined =
-			details !== null
-				? `${task.prompt}\n\n## Definition of ready (grilled)\n\n${details}`
-				: null;
-		e.store.updateTask(task.id, {
-			...(refined !== null ? { prompt: refined } : {}),
-			...(model !== null ? { model } : {}),
-			stage: "todo",
-			state: "queued",
-			holdUntil: null,
-			queuedAt: Date.now(),
-			needsReason: null,
-			asked: null,
+		await withTask(e, task, async () => {
+			const details = await latestGrillDetails(e, task.id);
+			const refined =
+				details !== null
+					? `${task.prompt}\n\n## Definition of ready (grilled)\n\n${details}`
+					: null;
+			await updateSnapshot(e, task, {
+				...(refined !== null ? { prompt: refined } : {}),
+				...(model !== null ? { model } : {}),
+				stage: "todo",
+				state: "queued",
+				holdUntil: null,
+				queuedAt: Date.now(),
+				needsReason: null,
+				asked: null,
+			});
 		});
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 	/** Parks a todo task back into the backlog. */
-	function backlogToPark(e: Entry, task: Task): Response {
+	async function backlogToPark(e: Entry, task: Task): Promise<Response> {
 		if (task.stage !== "todo")
 			return json({ error: "only a todo task can be parked" }, 409);
 		if (task.state !== "queued")
@@ -9368,22 +9741,22 @@ export function createApp(deps: AppDeps) {
 			);
 		if (task.pendingPrompt !== null)
 			return json({ error: "a reply or steer is still queued" }, 409);
-		e.store.updateTask(task.id, {
+		await updateSnapshot(e, task, {
 			stage: "backlog",
 			state: "idle",
 			queuedAt: null,
 			needsReason: null,
 			holdUntil: null,
 		});
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 	async function handlePOSTProjectsTasksBacklogByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/backlog">,
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
@@ -9391,8 +9764,8 @@ export function createApp(deps: AppDeps) {
 		const to = r.body.to;
 		if (to !== "todo" && to !== "backlog")
 			return json({ error: `to must be "todo" or "backlog"` }, 400);
-		if (to === "todo") return backlogToTodo(e, task, r.body);
-		return backlogToPark(e, task);
+		if (to === "todo") return await backlogToTodo(e, task, r.body);
+		return await backlogToPark(e, task);
 	}
 
 	/** Refusals that gate starting a grill; null lets it start. */
@@ -9408,7 +9781,7 @@ export function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsTasksGrillByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/grill">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
@@ -9419,7 +9792,7 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
-		e.store.updateTask(task.id, {
+		await updateSnapshot(e, task, {
 			state: "queued",
 			holdUntil: null,
 			...(model !== null ? { model } : {}),
@@ -9427,8 +9800,8 @@ export function createApp(deps: AppDeps) {
 			needsReason: null,
 			asked: null,
 		});
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 
 	/** The steering refusal for a card not in flight; null lets the steer queue. */
@@ -9447,25 +9820,29 @@ export function createApp(deps: AppDeps) {
 		return null;
 	}
 	/** Saves decoded steer images into the card's image dir; a Response is the 500. */
-	function steerImages(
+	async function steerImages(
 		e: Entry,
 		taskId: string,
 		images: DecodedImage[],
-	): string[] | Response {
+	): Promise<string[] | Response> {
 		try {
-			return saveImages(e.store.dataRoot, e.store.imagesDir(taskId), images);
+			return saveImages(
+				e.store.dataRoot,
+				await e.store.imagesDir(taskId),
+				images,
+			);
 		} catch (err) {
 			return json({ error: `could not save images: ${errmsg(err)}` }, 500);
 		}
 	}
 	/** Queues the steering text and images; runTurn delivers them with the next turn. */
-	function applySteer(
+	async function applySteer(
 		e: Entry,
 		task: Task,
 		prompt: string,
 		names: string[],
-	): void {
-		e.store.updateTask(task.id, {
+	): Promise<void> {
+		await updateSnapshot(e, task, {
 			pendingPrompt:
 				task.pendingPrompt === null
 					? prompt
@@ -9483,7 +9860,7 @@ export function createApp(deps: AppDeps) {
 			pendingImages: [...task.pendingImages, ...names],
 			holdUntil: null,
 		});
-		deps.schedule();
+		await deps.schedule();
 	}
 	/** The steer text; a Response is the 400 for a non-string. */
 	function steerText(v: unknown): string | Response {
@@ -9492,19 +9869,22 @@ export function createApp(deps: AppDeps) {
 			: json({ error: "text must be a non-empty string" }, 400);
 	}
 	/** The decoded steer images under the project's cap; a Response is the 400. */
-	function steerDecoded(e: Entry, v: unknown): DecodedImage[] | Response {
-		const decoded = decodeImages(v, e.store.getSettings().maxImages);
+	async function steerDecoded(
+		e: Entry,
+		v: unknown,
+	): Promise<DecodedImage[] | Response> {
+		const decoded = decodeImages(v, (await e.store.getSettings()).maxImages);
 		if ("error" in decoded) return json({ error: decoded.error }, 400);
 		return decoded.images;
 	}
 	/** The steer prompt and images; a Response is the 400. */
-	function steerPayload(
+	async function steerPayload(
 		e: Entry,
 		body: Record<string, unknown>,
-	): { prompt: string; images: DecodedImage[] } | Response {
+	): Promise<{ prompt: string; images: DecodedImage[] } | Response> {
 		const text = steerText(body.text);
 		if (text instanceof Response) return text;
-		const images = steerDecoded(e, body.images);
+		const images = await steerDecoded(e, body.images);
 		if (images instanceof Response) return images;
 		// Picture-only steer: "." keeps pendingPrompt non-null so runTurn queues a turn that carries the images.
 		if (text.trim().length === 0 && images.length === 0)
@@ -9516,19 +9896,19 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req, IMAGE_BODY_BYTES);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		if (task.cancelledAt !== null)
 			return json({ error: "task is cancelled" }, 404);
 		const gated = steerStateRefusal(task);
 		if (gated !== null) return gated;
-		const payload = steerPayload(e, r.body);
+		const payload = await steerPayload(e, r.body);
 		if (payload instanceof Response) return payload;
-		const names = steerImages(e, task.id, payload.images);
+		const names = await steerImages(e, task.id, payload.images);
 		if (names instanceof Response) return names;
-		applySteer(e, task, payload.prompt, names);
-		return taskResponse(e, task.id);
+		await applySteer(e, task, payload.prompt, names);
+		return await taskResponse(e, task.id);
 	}
 
 	/** The board a follow-up card lands in; the same project keeps the source board. */
@@ -9547,20 +9927,20 @@ export function createApp(deps: AppDeps) {
 		return { target: te, followUpOfProject: reqProject };
 	}
 	/** Saves the follow-up's images; on failure the fresh card is cancelled and a 500 returns. */
-	function followUpImages(
+	async function followUpImages(
 		target: Entry,
-		taskId: string,
+		task: Task,
 		images: DecodedImage[],
-	): string[] | Response {
+	): Promise<string[] | Response> {
 		if (images.length === 0) return [];
 		try {
 			return saveImages(
 				target.store.dataRoot,
-				target.store.imagesDir(taskId),
+				await target.store.imagesDir(task.id),
 				images,
 			);
 		} catch (err) {
-			target.store.updateTask(taskId, {
+			await updateSnapshot(target, task, {
 				cancelledAt: Date.now(),
 				state: "idle",
 			});
@@ -9568,50 +9948,38 @@ export function createApp(deps: AppDeps) {
 		}
 	}
 	/** Writes the handoff and stamps the follow-up links; on failure the fresh card is cancelled and a 500 returns. */
-	function followUpHandoff(
+	async function followUpHandoff(
 		target: Entry,
 		source: Entry,
 		sourceTask: Task,
-		newTaskId: string,
+		newTask: Task,
 		trimmed: string,
 		followUpOfProject: string | null,
 		names: string[],
-	): Response | null {
+	): Promise<Response | null> {
+		const turns = await withTask(source, sourceTask, () =>
+			source.store.listTurns(sourceTask.id),
+		);
+		const title = await source.store.frozenTitle(sourceTask);
+		const handoffPath = join(
+			target.store.tasksDir,
+			"handoffs",
+			`${newTask.id}.md`,
+		);
+		const savedDir = join(source.store.tasksDir, "quarantine", sourceTask.id);
 		try {
-			const handoffPath = join(
-				target.store.tasksDir,
-				"handoffs",
-				`${newTaskId}.md`,
-			);
-			// The kept-files folder, when the finished card has one (done cards only).
-			const savedDir = join(source.store.tasksDir, "quarantine", sourceTask.id);
 			writeBelow(
 				target.store.dataRoot,
 				handoffPath,
 				handoffMarkdown({
 					task: sourceTask,
-					turns: source.store.listTurns(sourceTask.id),
+					turns,
 					sessionsDir: source.store.sessionsDir,
 					savedDir: existsSync(savedDir) ? savedDir : null,
 				}),
 			);
-			target.store.updateTask(newTaskId, {
-				followUpOf: sourceTask.id,
-				followUpOfProject,
-				prompt: followUpPrompt({
-					text: trimmed,
-					title: source.store.frozenTitle(sourceTask),
-					handoffPath,
-				}),
-				images: names,
-				// OTTR-850: the posted text is board-written only when it is the exact
-				// "Implement steps" template; any edit makes it user-authored, so the
-				// gate judges it. The server compares, never trusting a client flag.
-				promptAuthor: trimmed === IMPLEMENT_RECOMMENDATIONS ? "board" : "user",
-			});
-			return null;
 		} catch (err) {
-			target.store.updateTask(newTaskId, {
+			await updateSnapshot(target, newTask, {
 				cancelledAt: Date.now(),
 				state: "idle",
 			});
@@ -9620,6 +9988,32 @@ export function createApp(deps: AppDeps) {
 				500,
 			);
 		}
+		const patch: TaskPatch = {
+			followUpOf: sourceTask.id,
+			followUpOfProject,
+			prompt: followUpPrompt({ text: trimmed, title, handoffPath }),
+			images: names,
+			promptAuthor: trimmed === IMPLEMENT_RECOMMENDATIONS ? "board" : "user",
+			holdUntil: null,
+		};
+		try {
+			if (target.store === source.store)
+				await withTask(source, sourceTask, () =>
+					updateSnapshot(target, newTask, patch),
+				);
+			else {
+				await withTask(source, sourceTask, () => {});
+				await updateSnapshot(target, newTask, patch);
+			}
+		} catch (err) {
+			if (err instanceof TaskConflict)
+				await updateSnapshot(target, newTask, {
+					cancelledAt: Date.now(),
+					state: "idle",
+				});
+			throw err;
+		}
+		return null;
 	}
 	/** The follow-up text; a Response is the 400. */
 	function followUpText(v: unknown): string | Response {
@@ -9652,45 +10046,66 @@ export function createApp(deps: AppDeps) {
 		return { trimmed, model };
 	}
 	/** Creates the follow-up card and saves its images; a Response cancels the fresh card. */
-	function createFollowUp(
+	async function createFollowUp(
 		target: Entry,
 		trimmed: string,
 		model: string | null,
 		images: DecodedImage[],
-	): { id: string; names: string[] } | Response {
-		// Sync from createTask through updateTask: the 5 s schedule timer must never see the task
-		// without its final prompt (no await in between, so no timer can interleave).
-		const t = target.store.createTask(trimmed, model);
-		const names = followUpImages(target, t.id, images);
+	): Promise<{ id: string; names: string[]; task: Task } | Response> {
+		// The creation hold keeps the task idle until its images and handoff are ready.
+		const t = await target.store.transaction(async () => {
+			const task = await target.store.createTask(trimmed, model);
+			return target.store.updateTask(task.id, { holdUntil: PROMPT_EDIT_HELD });
+		});
+		const names = await followUpImages(target, t, images);
 		if (names instanceof Response) return names;
-		return { id: t.id, names };
+		return { id: t.id, names, task: t };
 	}
 	/** Lands the follow-up card on its target board; a Response is a refusal or failure. */
-	function landFollowUp(
+	async function landFollowUp(
 		e: Entry,
 		task: Task,
 		reqProject: string,
 		body: Record<string, unknown>,
 		trimmed: string,
 		model: string | null,
-	): Response | { target: Entry; id: string } {
+	): Promise<Response | { target: Entry; id: string }> {
 		// Optional target board: the card lands there, linked back across the border.
 		const picked = followUpTarget(e, body.project, reqProject);
 		if (picked instanceof Response) return picked;
 		const target = picked.target;
-		const images = steerDecoded(target, body.images);
+		const images = await steerDecoded(target, body.images);
 		if (images instanceof Response) return images;
-		const made = createFollowUp(target, trimmed, model, images);
+		await withTask(e, task, () => {});
+		const made = await createFollowUp(target, trimmed, model, images);
 		if (made instanceof Response) return made;
-		const failed = followUpHandoff(
-			target,
-			e,
-			task,
-			made.id,
-			trimmed,
-			picked.followUpOfProject,
-			made.names,
-		);
+		let failed: Response | null;
+		try {
+			failed = await followUpHandoff(
+				target,
+				e,
+				task,
+				made.task,
+				trimmed,
+				picked.followUpOfProject,
+				made.names,
+			);
+		} catch (err) {
+			if (err instanceof TaskConflict)
+				await target.store.transaction(async () => {
+					const current = await target.store.getTask(made.id);
+					if (
+						current !== null &&
+						current.cancelledAt === null &&
+						current.holdUntil === PROMPT_EDIT_HELD
+					)
+						await target.store.updateTask(made.id, {
+							cancelledAt: Date.now(),
+							state: "idle",
+						});
+				});
+			throw err;
+		}
 		if (failed !== null) return failed;
 		return { target, id: made.id };
 	}
@@ -9699,14 +10114,14 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req, IMAGE_BODY_BYTES);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const facts = followUpFacts(task, r.body);
 		if (facts instanceof Response) return facts;
 		const badModel = await cardModelResponse(facts.model);
 		if (badModel !== null) return badModel;
-		const landed = landFollowUp(
+		const landed = await landFollowUp(
 			e,
 			task,
 			req.params.project,
@@ -9715,8 +10130,8 @@ export function createApp(deps: AppDeps) {
 			facts.model,
 		);
 		if (landed instanceof Response) return landed;
-		deps.schedule();
-		return taskResponse(landed.target, landed.id);
+		await deps.schedule();
+		return await taskResponse(landed.target, landed.id);
 	}
 
 	/** Asks GitHub to re-run the failed jobs of one run; a Response is the 502 or the API error. */
@@ -9765,7 +10180,7 @@ export function createApp(deps: AppDeps) {
 	async function handlePOSTProjectsTasksRerunByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id/rerun-failed-jobs">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { task } = found;
 		const token = process.env.GH_TOKEN;
@@ -9818,24 +10233,24 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req, MAX_BODY_BYTES);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const allowed = mergeAnywayRefusal(task, r.body.reason);
 		if (allowed instanceof Response) return allowed;
-		e.store.updateTask(task.id, mergeAnywayPatch(task, allowed.trimmed));
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await updateSnapshot(e, task, mergeAnywayPatch(task, allowed.trimmed));
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 
 	/** A reply on a PR review card: a note for the reviewer that runs a new draft for the current head. */
-	function prReviewReply(
+	async function prReviewReply(
 		e: Entry,
 		task: Task,
 		text: string,
 		body: Record<string, unknown>,
-	): Response {
-		const row = e.store.getPrReviewByTask(task.id);
+	): Promise<Response> {
+		const row = await e.store.getPrReviewByTask(task.id);
 		if (row === null || e.github === null)
 			return json({ error: "not a PR review card" }, 409);
 		if (row.state !== "open") return json({ error: `PR is ${row.state}` }, 409);
@@ -9845,7 +10260,7 @@ export function createApp(deps: AppDeps) {
 		if (Array.isArray(body.images) && body.images.length > 0)
 			return json({ error: "PR review notes are text-only" }, 400);
 		if (
-			e.store.prReviewRunsSince(Date.now() - PR_GATES.DAY_MS) >=
+			(await e.store.prReviewRunsSince(Date.now() - PR_GATES.DAY_MS)) >=
 			PR_GATES.PROJECT_DAILY_RUNS
 		)
 			return json(
@@ -9854,11 +10269,12 @@ export function createApp(deps: AppDeps) {
 				},
 				429,
 			);
-		// reviewNow never rejects; the catch only guards against a stray throw.
-		void prWatcher
-			.reviewNow({ project: e.name, number: row.number, note })
-			.catch(() => {});
-		return taskResponse(e, task.id);
+		// Track the detached review so app shutdown waits for its final writes.
+		void trackWork(
+			"PR review reply",
+			prWatcher.reviewNow({ project: e.name, number: row.number, note }),
+		);
+		return await taskResponse(e, task.id);
 	}
 	/** Queues the work-check send-back under any pending steer. A null direction
 	 * is a plain send-back; on a diverging park, any other text is the user's new
@@ -9866,12 +10282,12 @@ export function createApp(deps: AppDeps) {
 	 * attaches the board's rethink direction, so the send-back always pushes the
 	 * rethink. The direction goes out with the send-back for the agent and into
 	 * the log for the next check. */
-	function applyWorkCheckSendBack(
+	async function applyWorkCheckSendBack(
 		e: Entry,
 		task: Task,
 		open: ReturnType<typeof openWorkBlockers>,
 		direction: string | null = null,
-	): Response {
+	): Promise<Response> {
 		const n = task.workCheckSendbacks + 1;
 		const repeated = repeatedBugClasses(task.workCheckLog);
 		const divergePark =
@@ -9907,7 +10323,7 @@ export function createApp(deps: AppDeps) {
 			max: WORK_CHECK_MAX_SENDBACKS,
 			repeatedClasses: repeated,
 		});
-		e.store.updateTask(task.id, {
+		await updateSnapshot(e, task, {
 			// A steer queued before the stop stays: the send-back goes under it.
 			pendingPrompt: queuedReply(
 				task.pendingPrompt,
@@ -9922,8 +10338,8 @@ export function createApp(deps: AppDeps) {
 			needsReason: null,
 			asked: null,
 		});
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 	/** A click on the cap-exceeded work-check block's ask: the send-back or the merge. On a
 	 * diverging park, a click does the chosen action; any other text is the user's new
@@ -9946,25 +10362,26 @@ export function createApp(deps: AppDeps) {
 		)
 			return null;
 		if (trimmed === WORK_CHECK_ASK_MERGE) {
-			e.store.updateTask(
-				task.id,
+			await updateSnapshot(
+				e,
+				task,
 				mergeAnywayPatch(task, "Merge anyway, chosen in the work-check ask"),
 			);
-			deps.schedule();
-			return taskResponse(e, task.id);
+			await deps.schedule();
+			return await taskResponse(e, task.id);
 		}
 		if (capPark && trimmed === WORK_CHECK_ASK_SEND_BACK)
-			return applyWorkCheckSendBack(e, task, open);
+			return await applyWorkCheckSendBack(e, task, open);
 		if (divergePark) {
 			if (trimmed === WORK_CHECK_ASK_CANCEL) {
 				const out = await deps.cancel(e, task.id, false);
 				if ("error" in out) return json({ error: out.error }, out.status);
 				if ("kept" in out) return json({ ok: false, kept: out.kept });
-				return taskResponse(e, task.id);
+				return await taskResponse(e, task.id);
 			}
 			const direction =
 				trimmed === WORK_CHECK_ASK_NEW_APPROACH ? null : trimmed;
-			return applyWorkCheckSendBack(e, task, open, direction);
+			return await applyWorkCheckSendBack(e, task, open, direction);
 		}
 		return null;
 	}
@@ -9987,12 +10404,12 @@ export function createApp(deps: AppDeps) {
 					(mismatchHold && task.updateIds.length === 0)),
 		};
 	}
-	function holdApprovalReply(
+	async function holdApprovalReply(
 		e: Entry,
 		task: Task,
 		trimmed: string,
 		hasImages: boolean,
-	): Response | null {
+	): Promise<Response | null> {
 		// U7: the approval reply on a parked update card approves its merge hold for the
 		// head the settle parked (undefined keeps the column) and queues the normal merge
 		// turn, so the server push happens. Same for a fork-born card parked by the fork
@@ -10008,7 +10425,7 @@ export function createApp(deps: AppDeps) {
 			trimmed === APPROVE_REPLY &&
 			hasImages === false
 		) {
-			e.store.updateTask(task.id, {
+			await updateSnapshot(e, task, {
 				stage: "merging",
 				state: "queued",
 				holdUntil: null,
@@ -10019,8 +10436,8 @@ export function createApp(deps: AppDeps) {
 				forkMergeHead: approveForkHold ? parked : undefined,
 				holdHead: null,
 			});
-			deps.schedule();
-			return taskResponse(e, task.id);
+			await deps.schedule();
+			return await taskResponse(e, task.id);
 		}
 		return null;
 	}
@@ -10029,12 +10446,12 @@ export function createApp(deps: AppDeps) {
 	 * other reply falls through to the queue and the gate re-runs on the next start. The
 	 * fingerprint covers the judged prompt (the handoff the prompt names included,
 	 * OTTR-844) plus any pending steer, so a queued user text still gates. */
-	function gateStartReply(
+	async function gateStartReply(
 		e: Entry,
 		task: Task,
 		trimmed: string,
 		hasImages: boolean,
-	): Response | null {
+	): Promise<Response | null> {
 		const gate = task.gate;
 		if (gate?.parked !== true || !isStartAnywayReply(trimmed) || hasImages)
 			return null;
@@ -10042,7 +10459,7 @@ export function createApp(deps: AppDeps) {
 			prompt: task.prompt,
 			handoffsDir: join(e.store.tasksDir, "handoffs"),
 		});
-		e.store.updateTask(task.id, {
+		await updateSnapshot(e, task, {
 			state: "queued",
 			queuedAt: Date.now(),
 			needsReason: null,
@@ -10061,8 +10478,8 @@ export function createApp(deps: AppDeps) {
 				parked: false,
 			},
 		});
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 	/** One parsed answer per asked question: the drawer's wire line, or — on a
 	 * single-question card, whose drawer sends the raw answer text instead of the
@@ -10130,9 +10547,10 @@ export function createApp(deps: AppDeps) {
 			!task.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)
 		)
 			return null;
-		const tasks = e.store.listTasks();
-		const leadOf = (question: string): ListedTask | undefined => {
-			// The question text carries its lead card: `... (card #<lead id>)`.
+		const leadOf = (
+			question: string,
+			tasks: ListedTask[],
+		): ListedTask | undefined => {
 			const leadId = /\(card #([^)]+)\)$/.exec(question)?.[1];
 			return leadId === undefined
 				? undefined
@@ -10140,99 +10558,118 @@ export function createApp(deps: AppDeps) {
 						(t) => t.id === leadId && t.followUpOf === task.followUpOf,
 					);
 		};
-		const open = (lead: ListedTask): boolean =>
-			lead.cancelledAt === null && lead.stage !== "done";
-		const appendDetails = (id: string, note: string): void => {
-			const cur = e.store.getTask(id);
+		const appendDetails = async (id: string, note: string): Promise<void> => {
+			const cur = await e.store.getTask(id);
 			if (cur === null) return;
-			e.store.updateTask(id, {
+			await e.store.updateTask(id, {
 				details: `${cur.details ?? ""}\n\nThe user answered the review's question: ${note}`,
 			});
 		};
 		const matches = leadAskMatches(task.asked, text);
 		const answered = new Set<string>();
-		for (const m of matches) {
-			const lead = leadOf(m.question);
-			// A stale question (its lead was cancelled or done) applies nothing.
-			if (lead === undefined || !open(lead)) continue;
-			const live = e.store.getTask(lead.id);
-			if (live === null) continue;
-			if (m.answer === LEAD_APPLIES_OPTION) {
-				if (live.stage === "backlog" && live.state === "idle") {
-					e.store.updateTask(lead.id, {
-						stage: "todo",
-						state: "queued",
-						queuedAt: Date.now(),
-						prompt: `${live.prompt}\n\nThe user answered the review's question: ${m.answer}`,
-					});
-					answered.add(lead.id);
-					continue;
-				}
-				// The user started the lead by hand: record the answer, touch no run state.
-				appendDetails(lead.id, m.answer);
-				answered.add(lead.id);
-				continue;
-			}
-			if (m.answer === LEAD_NOT_APPLY_OPTION) {
-				const reason = `Cancelled by the user's answer to the review's question: ${m.answer}`;
-				if (live.stage === "backlog" && live.state === "idle") {
-					e.store.updateTask(lead.id, {
-						cancelledAt: Date.now(),
-						state: "idle",
-						needsReason: reason,
-					});
-					answered.add(lead.id);
-					continue;
-				}
-				// A started lead cancels through the sanctioned cancel: the bare patch
-				// would leave a live agent and an orphan worktree behind a cancelled card.
-				const out = await deps.cancel(e, lead.id, false);
-				if ("removed" in out)
-					e.store.updateTask(lead.id, { needsReason: reason });
-				else
-					appendDetails(
-						lead.id,
-						`${m.answer} (the cancel kept work: ${"kept" in out ? out.kept : "unknown"})`,
-					);
-				answered.add(lead.id);
-				continue;
-			}
-			// Free text from the drawer's Other field: the lead keeps its state.
-			appendDetails(lead.id, m.answer);
-			answered.add(lead.id);
-		}
-		// Free text no question consumed (a plain reply on the card): the record for
-		// every open lead that got no per-question answer.
 		let free = text;
 		for (const m of [...matches].sort((a, b) => b.start - a.start))
 			free = free.slice(0, m.start) + free.slice(m.end);
 		free = free.trim();
-		if (free !== "")
-			for (const q of task.asked) {
-				const lead = leadOf(q.question);
-				if (lead === undefined || !open(lead)) continue;
-				if (answered.has(lead.id)) continue;
-				appendDetails(lead.id, free);
-			}
-		e.store.updateTask(task.id, {
-			stage: "done",
-			state: "idle",
-			asked: null,
-			needsReason: null,
-		});
-		deps.schedule();
+		let cursor = 0;
+		let cancelled: {
+			id: string;
+			reason: string;
+			answer: string;
+			outcome: CancelOutcome;
+		} | null = null;
+		// Preserve each database-only section around a started lead's external cancel.
+		while (true) {
+			const nextCancel = await withTask(e, task, async () => {
+				if (cancelled !== null) {
+					const { id, reason, answer, outcome } = cancelled;
+					if ("removed" in outcome)
+						await e.store.updateTask(id, { needsReason: reason });
+					else
+						await appendDetails(
+							id,
+							`${answer} (the cancel kept work: ${"kept" in outcome ? outcome.kept : "unknown"})`,
+						);
+					cancelled = null;
+				}
+				const tasks = await e.store.listTasks();
+				while (cursor < matches.length) {
+					const m = matches[cursor++]!;
+					const lead = leadOf(m.question, tasks);
+					if (
+						lead === undefined ||
+						lead.cancelledAt !== null ||
+						lead.stage === "done"
+					)
+						continue;
+					const live = await e.store.getTask(lead.id);
+					if (live === null) continue;
+					if (m.answer === LEAD_APPLIES_OPTION) {
+						if (live.stage === "backlog" && live.state === "idle")
+							await e.store.updateTask(lead.id, {
+								stage: "todo",
+								state: "queued",
+								queuedAt: Date.now(),
+								prompt: `${live.prompt}\n\nThe user answered the review's question: ${m.answer}`,
+							});
+						else await appendDetails(lead.id, m.answer);
+						answered.add(lead.id);
+						continue;
+					}
+					if (m.answer === LEAD_NOT_APPLY_OPTION) {
+						const reason = `Cancelled by the user's answer to the review's question: ${m.answer}`;
+						answered.add(lead.id);
+						if (live.stage !== "backlog" || live.state !== "idle")
+							return { id: lead.id, reason, answer: m.answer };
+						await e.store.updateTask(lead.id, {
+							cancelledAt: Date.now(),
+							state: "idle",
+							needsReason: reason,
+						});
+						continue;
+					}
+					await appendDetails(lead.id, m.answer);
+					answered.add(lead.id);
+				}
+				if (free !== "")
+					for (const q of task.asked!) {
+						const lead = leadOf(q.question, tasks);
+						if (
+							lead === undefined ||
+							lead.cancelledAt !== null ||
+							lead.stage === "done"
+						)
+							continue;
+						if (answered.has(lead.id)) continue;
+						await appendDetails(lead.id, free);
+					}
+				await e.store.updateTask(task.id, {
+					stage: "done",
+					state: "idle",
+					asked: null,
+					needsReason: null,
+				});
+				return null;
+			});
+			if (nextCancel === null) break;
+			cancelled = {
+				...nextCancel,
+				outcome: await deps.cancel(e, nextCancel.id, false),
+			};
+		}
+		await deps.schedule();
 		return taskResponse(e, task.id);
 	}
 	/** The reply payload refusals: not needs-you, bad images, or text over the cap. */
-	function replyRefusal(
+	async function replyRefusal(
 		e: Entry,
 		task: Task,
 		text: string,
 		rawImages: unknown,
-	): { trimmed: string; images: DecodedImage[] } | Response {
+	): Promise<{ trimmed: string; images: DecodedImage[] } | Response> {
 		if (task.state !== "needs_you")
 			return json({ error: "task is not waiting for you" }, 409);
-		const images = steerDecoded(e, rawImages);
+		const images = await steerDecoded(e, rawImages);
 		if (images instanceof Response) return images;
 		// Same rule as steer/follow-up (R1-9): an empty reply would re-send the whole
 		// task prompt as the next turn, and an unbounded one can blow the session.
@@ -10250,7 +10687,7 @@ export function createApp(deps: AppDeps) {
 	> {
 		const r = await readJson(req, IMAGE_BODY_BYTES);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const text = r.body.text;
 		if (typeof text !== "string")
@@ -10261,7 +10698,8 @@ export function createApp(deps: AppDeps) {
 		// A pr_review card never replays its prompt as a turn: the reply is a note for
 		// the reviewer, which runs a new draft for the current head and counts against
 		// the daily cap like a watcher run.
-		if (task.kind === "pr_review") return prReviewReply(e, task, text, r.body);
+		if (task.kind === "pr_review")
+			return await prReviewReply(e, task, text, r.body);
 		return { e, task, text, body: r.body };
 	}
 	async function handlePOSTProjectsTasksReplyByProjectAndId(
@@ -10270,7 +10708,7 @@ export function createApp(deps: AppDeps) {
 		const picked = await replyTarget(req);
 		if (picked instanceof Response) return picked;
 		const { e, task, text, body } = picked;
-		const payload = replyRefusal(e, task, text, body.images);
+		const payload = await replyRefusal(e, task, text, body.images);
 		if (payload instanceof Response) return payload;
 		const { trimmed, images } = payload;
 		// A click on the cap-exceeded work-check block's ask, or on a diverging
@@ -10291,21 +10729,26 @@ export function createApp(deps: AppDeps) {
 		if (leadAsk !== null) return leadAsk;
 		const names =
 			images.length > 0
-				? saveImages(e.store.dataRoot, e.store.imagesDir(task.id), images)
+				? saveImages(e.store.dataRoot, await e.store.imagesDir(task.id), images)
 				: [];
-		const approval = holdApprovalReply(e, task, trimmed, images.length > 0);
+		const approval = await holdApprovalReply(
+			e,
+			task,
+			trimmed,
+			images.length > 0,
+		);
 		if (approval !== null) return approval;
-		const start = gateStartReply(e, task, trimmed, images.length > 0);
+		const start = await gateStartReply(e, task, trimmed, images.length > 0);
 		if (start !== null) return start;
-		e.store.updateTask(task.id, {
+		await updateSnapshot(e, task, {
 			// "." keeps pendingPrompt non-null for a picture-only reply (see steer). A steer
 			// queued before the stop stays: the reply goes under it, and Resume (".") sends it alone.
 			...replyPatch(task, trimmed || ".", names),
 			// A non-approval reply never spends the parked head: the hold stays, and the
 			// settle re-parks the card after the work turn.
 		});
-		deps.schedule();
-		return taskResponse(e, task.id);
+		await deps.schedule();
+		return await taskResponse(e, task.id);
 	}
 
 	/** The validated triage priority; a Response is the 400. */
@@ -10364,21 +10807,21 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const made = triagePatch(r.body);
 		if (made instanceof Response) return made;
-		const updated = e.store.updateTask(task.id, made.patch);
-		return json(taskView(e, updated));
+		const updated = await updateSnapshot(e, task, made.patch);
+		return json(await taskView(e, updated));
 	}
 
 	/** The prompt-edit gate: only an unclaimed queued/parked card with no turns may edit. */
-	function editPromptRefusal(
+	async function editPromptRefusal(
 		e: Entry,
 		task: Task,
 		prompt: unknown,
-	): Response | { trimmed: string } {
+	): Promise<Response | { trimmed: string }> {
 		if (typeof prompt !== "string")
 			return json({ error: "prompt must be a string" }, 400);
 		const trimmed = prompt.trim();
@@ -10389,8 +10832,7 @@ export function createApp(deps: AppDeps) {
 		// edits the prompt before the user accepts). A preparing claim has already
 		// consumed the prompt (its turn row only appears at startRun, after the git and
 		// worktree preparation), so a rewrite there would never reach the run. The check
-		// and the write are sync, so the scheduler (same event loop) cannot start a turn
-		// in between.
+		// and the write share a transaction that checks the task snapshot.
 		if (
 			!(
 				(task.stage === "todo" && task.state === "queued") ||
@@ -10400,7 +10842,7 @@ export function createApp(deps: AppDeps) {
 					isProposalReason(task.needsReason))
 			) ||
 			task.cancelledAt !== null ||
-			e.store.listTurns(task.id).length > 0
+			(await e.store.listTurns(task.id)).length > 0
 		)
 			return json(
 				{
@@ -10416,34 +10858,39 @@ export function createApp(deps: AppDeps) {
 	): Promise<Response> {
 		const r = await readJson(req);
 		if ("error" in r) return r.error;
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		// The revision guard outranks the refusal below: a stale prompt edit answers
 		// 409 with the current card instead of a bare precondition error.
-		const stale = staleEditResponse(e, task, r.body);
+		const stale = await staleEditResponse(e, task, r.body);
 		if (stale !== null) return stale;
-		const edit = editPromptRefusal(e, task, r.body.prompt);
-		if (edit instanceof Response) return edit;
-		// Same shape rule as applyUserEdit: an absent revision keeps today's behavior.
-		const revision = r.body.revision;
-		if (
-			revision !== undefined &&
-			(typeof revision !== "number" ||
-				!Number.isInteger(revision) ||
-				revision < 1)
-		)
-			return json({ error: "revision must be a positive integer" }, 400);
-		const t = e.store.editTask(task.id, edit.trimmed, revision);
+		const result = await withTask(e, task, async () => {
+			const edit = await editPromptRefusal(e, task, r.body.prompt);
+			if (edit instanceof Response) return edit;
+			// Same shape rule as applyUserEdit: an absent revision keeps today's behavior.
+			const revision = r.body.revision;
+			if (
+				revision !== undefined &&
+				(typeof revision !== "number" ||
+					!Number.isInteger(revision) ||
+					revision < 1)
+			)
+				return json({ error: "revision must be a positive integer" }, 400);
+			const t = await e.store.editTask(task.id, edit.trimmed, revision);
+			return t;
+		});
+		if (result instanceof Response) return result;
+		const t = result;
 		if (!t.ok)
 			return json(
 				{
 					error: "card changed since it was loaded",
-					task: taskView(e, t.task),
+					task: await taskView(e, t.task),
 				},
 				409,
 			);
-		return json(taskView(e, t.task));
+		return json(await taskView(e, t.task));
 	}
 
 	/** Fills the release card's late-commit list: the commits the publish ships past the reviewed commit, with the review's finding merges marked. */
@@ -10458,7 +10905,7 @@ export function createApp(deps: AppDeps) {
 			return;
 		// The commits the publish will ship past the reviewed commit, with the review's finding
 		// merges marked: the anchors are the mergeHeads the finding cards stamped at Done.
-		const findings = reviewFindings(e.store.listTasks(), task)
+		const findings = reviewFindings(await e.store.listTasks(), task)
 			.filter((f) => f.cancelledAt === null)
 			.sort((a, b) => (a.doneAt ?? 0) - (b.doneAt ?? 0))
 			.flatMap((f) => (f.mergeHead === null ? [] : [f.mergeHead]));
@@ -10466,7 +10913,7 @@ export function createApp(deps: AppDeps) {
 			e.path,
 			false,
 			null,
-			e.store.getSettings().targetBranch,
+			(await e.store.getSettings()).targetBranch,
 		)
 			.then((r) => r.sha)
 			.catch(() => null);
@@ -10520,10 +10967,10 @@ export function createApp(deps: AppDeps) {
 	async function handleGETProjectsTasksByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id">,
 	): Promise<Response> {
-		const found = resolveTask(req.params.project, req.params.id);
+		const found = await resolveTask(req.params.project, req.params.id);
 		if (found instanceof Response) return found;
 		const { e, task } = found;
-		const view = taskView(e, task);
+		const view = await taskView(e, task);
 		// Done cards serve the list captured at settle (the worktree is gone, so the
 		// live read would always be []); open cards read the worktree live.
 		view.worktreeFiles =
@@ -10598,7 +11045,7 @@ export function createApp(deps: AppDeps) {
 		return { prompt: text, ...(name !== "" ? { title: name } : {}) };
 	}
 
-	function judgeTrending(
+	async function judgeTrending(
 		e: Entry,
 		v: {
 			scoutId: string;
@@ -10606,11 +11053,11 @@ export function createApp(deps: AppDeps) {
 			verdict: "filed" | "no_fit" | "deferred";
 			reason: string;
 		},
-	): Response {
+	): Promise<Response> {
 		const { scoutId, repo, reason } = v;
 		const verdict = v.verdict === "filed" ? null : v.verdict;
 		if (!verdict) return json({ error: "not a judgment verdict" }, 400);
-		const out = e.store.judgeTrendingRepo({
+		const out = await e.store.judgeTrendingRepo({
 			scoutId,
 			repo,
 			verdict,
@@ -10619,12 +11066,12 @@ export function createApp(deps: AppDeps) {
 		return out.ok ? json({ ok: true }) : json({ error: out.error }, 409);
 	}
 
-	function fileTrending(
+	async function fileTrending(
 		e: Entry,
 		v: { scoutId: string; repo: string },
 		p: { prompt: string; title?: string },
-	): Response {
-		const out = e.store.fileTrendingProposal({
+	): Promise<Response> {
+		const out = await e.store.fileTrendingProposal({
 			scoutId: v.scoutId,
 			repo: v.repo,
 			prompt: p.prompt,
@@ -10645,27 +11092,28 @@ export function createApp(deps: AppDeps) {
 		if (!e) return json({ error: "unknown project" }, 404);
 		const v = validateTrendingVerdict(r.body);
 		if (v instanceof Response) return v;
-		if (v.verdict !== "filed") return judgeTrending(e, v);
+		if (v.verdict !== "filed") return await judgeTrending(e, v);
 		const p = validateTrendingPrompt(r.body);
 		if (p instanceof Response) return p;
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		return fileTrending(e, v, p);
+		return await fileTrending(e, v, p);
 	}
 
-	function resolveFollowUpOf(
+	async function resolveFollowUpOf(
 		project: string,
 		value: unknown,
-	):
+	): Promise<
 		| {
 				followUpOf: string;
 				followUpOfProject: string | null;
 				updateIds: string[];
 		  }
-		| Response {
+		| Response
+	> {
 		if (typeof value !== "string")
 			return json({ error: "followUpOf must be a task id" }, 400);
 		const parentId: string = value;
-		const parent = resolveTask(project, parentId);
+		const parent = await resolveTask(project, parentId);
 		if (!(parent instanceof Response)) {
 			// A child of an update card inherits its merge hold: split-off update work needs the same approval.
 			return {
@@ -10681,12 +11129,16 @@ export function createApp(deps: AppDeps) {
 		// first). Ids are unique per project, not across projects: exactly
 		// one foreign match links and stores the parent's project, several
 		// are ambiguous, and the merge hold never crosses a project border.
-		const hits = [...deps.projects.values()]
-			.filter((p) => p.name !== project)
-			.flatMap((p) => {
-				const task = p.store.getTask(parentId);
-				return task === null ? [] : [{ project: p.name, task }];
-			});
+		const hits = (
+			await Promise.all(
+				[...deps.projects.values()]
+					.filter((p) => p.name !== project)
+					.map(async (p) => {
+						const task = await p.store.getTask(parentId);
+						return task === null ? [] : [{ project: p.name, task }];
+					}),
+			)
+		).flat();
 		const hit = hits[0];
 		if (hit === undefined)
 			return json({ error: "unknown followUpOf task" }, 404);
@@ -10722,7 +11174,10 @@ export function createApp(deps: AppDeps) {
 		return json({ error: `unknown dependsOn task: ${id}` }, 404);
 	}
 
-	function validateDependsOn(e: Entry, value: unknown): string[] | Response {
+	async function validateDependsOn(
+		e: Entry,
+		value: unknown,
+	): Promise<string[] | Response> {
 		if (
 			!Array.isArray(value) ||
 			value.some((x) => typeof x !== "string" || x.trim() === "")
@@ -10731,8 +11186,8 @@ export function createApp(deps: AppDeps) {
 		const ids = [...new Set(value as string[])];
 		// OTTR-708: a card of this project, or by its PREFIX-n handle a card of any
 		// registered project. An unknown handle names the project in the error.
-		const depProjects = depProjectsOf(deps.projects.values());
-		const ownDep = depProjectOf(e.store);
+		const depProjects = await depProjectsOf(deps.projects.values());
+		const ownDep = await depProjectOf(e.store);
 		for (const id of ids) {
 			if (ownDep.getTask(id) !== null) continue;
 			const bad = depResolveError(id, resolveDep(id, depProjects, ownDep));
@@ -10753,29 +11208,24 @@ export function createApp(deps: AppDeps) {
 		return trimmed;
 	}
 
-	function saveTaskImages(
+	async function saveTaskImages(
 		e: Entry,
-		t: { id: string },
+		t: Task,
 		decoded: { images: DecodedImage[] },
-	): Response | null {
+	): Promise<Task | Response> {
+		if (decoded.images.length === 0) return t;
+		let names: string[];
 		try {
-			if (decoded.images.length > 0) {
-				const names = saveImages(
-					e.store.dataRoot,
-					e.store.imagesDir(t.id),
-					decoded.images,
-				);
-				// Synchronous with createTask so the 5 s schedule timer never sees the task without its images.
-				e.store.updateTask(t.id, { images: names });
-			}
+			names = saveImages(
+				e.store.dataRoot,
+				await e.store.imagesDir(t.id),
+				decoded.images,
+			);
 		} catch (err) {
-			e.store.updateTask(t.id, {
-				cancelledAt: Date.now(),
-				state: "idle",
-			});
+			await updateSnapshot(e, t, { cancelledAt: Date.now(), state: "idle" });
 			return json({ error: `could not save images: ${errmsg(err)}` }, 500);
 		}
-		return null;
+		return await updateSnapshot(e, t, { images: names });
 	}
 
 	async function validateTaskCreate(
@@ -10799,7 +11249,7 @@ export function createApp(deps: AppDeps) {
 		let followUpOfProject: string | null = null;
 		let updateIds: string[] = [];
 		if (body.followUpOf != null) {
-			const linked = resolveFollowUpOf(e.store.name, body.followUpOf);
+			const linked = await resolveFollowUpOf(e.store.name, body.followUpOf);
 			if (linked instanceof Response) return linked;
 			followUpOf = linked.followUpOf;
 			followUpOfProject = linked.followUpOfProject;
@@ -10807,7 +11257,7 @@ export function createApp(deps: AppDeps) {
 		}
 		let dependsOn: string[] = [];
 		if (body.dependsOn != null) {
-			const depIds = validateDependsOn(e, body.dependsOn);
+			const depIds = await validateDependsOn(e, body.dependsOn);
 			if (depIds instanceof Response) return depIds;
 			dependsOn = depIds;
 		}
@@ -10825,7 +11275,7 @@ export function createApp(deps: AppDeps) {
 		};
 	}
 
-	function applyTaskCreateExtras(
+	async function applyTaskCreateExtras(
 		e: Entry,
 		t: { id: string },
 		prep: {
@@ -10835,17 +11285,17 @@ export function createApp(deps: AppDeps) {
 			dependsOn: string[];
 		},
 		backlog: unknown,
-	): void {
+	): Promise<void> {
 		if (prep.followUpOf !== null)
-			e.store.updateTask(t.id, {
+			await e.store.updateTask(t.id, {
 				followUpOf: prep.followUpOf,
 				followUpOfProject: prep.followUpOfProject,
 				updateIds: prep.updateIds,
 			});
 		if (prep.dependsOn.length > 0)
-			e.store.updateTask(t.id, { dependsOn: prep.dependsOn });
+			await e.store.updateTask(t.id, { dependsOn: prep.dependsOn });
 		if (backlog === true)
-			e.store.updateTask(t.id, {
+			await e.store.updateTask(t.id, {
 				stage: "backlog",
 				state: "idle",
 				queuedAt: null,
@@ -10862,22 +11312,32 @@ export function createApp(deps: AppDeps) {
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
 		const prep = await validateTaskCreate(e, r.body);
 		if (prep instanceof Response) return prep;
-		const decoded = decodeImages(
-			r.body.images,
-			e.store.getSettings().maxImages,
-		);
-		if ("error" in decoded) return json({ error: decoded.error }, 400);
-		const t = e.store.createTask(prep.prompt, prep.model);
-		// OTTR-850: an agent's create_task files board-written prompts (the token decides,
-		// never a client flag); the user's New task form stays user-authored.
-		if (agentCardRequest(req))
-			e.store.updateTask(t.id, { promptAuthor: "board" });
-		const saved = saveTaskImages(e, t, decoded);
+		const made = await e.store.transaction(async () => {
+			const result = decodeImages(
+				r.body.images,
+				(await e.store.getSettings()).maxImages,
+			);
+			if ("error" in result) return json({ error: result.error }, 400);
+
+			const t = await e.store.createTask(prep.prompt, prep.model);
+			if (agentCardRequest(req))
+				await e.store.updateTask(t.id, { promptAuthor: "board" });
+			return {
+				task: await e.store.updateTask(t.id, { holdUntil: PROMPT_EDIT_HELD }),
+				decoded: result,
+			};
+		});
+		if (made instanceof Response) return made;
+		const { task: t, decoded } = made;
+		const saved = await saveTaskImages(e, t, decoded);
 		if (saved instanceof Response) return saved;
-		applyTaskCreateExtras(e, t, prep, r.body.backlog);
+		await withTask(e, saved, async () => {
+			await applyTaskCreateExtras(e, saved, prep, r.body.backlog);
+			await e.store.updateTask(saved.id, { holdUntil: null });
+		});
 		// schedule() may start a turn that mutates the row: re-read, don't trust the create return.
-		deps.schedule();
-		return taskResponse(e, t.id);
+		await deps.schedule();
+		return await taskResponse(e, t.id);
 	}
 
 	async function handlePOSTProjectsDeepenByProject(
@@ -10997,12 +11457,11 @@ export function createApp(deps: AppDeps) {
 		const version = versionRes ?? plan.version;
 		const tagClash = await releaseTagClash(e, version, plan.version);
 		if (tagClash instanceof Response) return tagClash;
-		// No await between the guard and createTask below: two overlapping requests cannot
-		// both pass the check and create two release cards (R1-8).
+		// The creation transaction repeats this guard after the external checks.
 		const blocked =
 			releaseBlocked(
-				e.store.listTasks(),
-				e.store.getSettings().releaseCommand,
+				await e.store.listTasks(),
+				(await e.store.getSettings()).releaseCommand,
 			) ?? plan.blocked;
 		if (blocked !== null) return json({ error: blocked }, 409);
 		// Optional user edit of the planned notes (the dialog's textarea).
@@ -11023,54 +11482,71 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		const sha = validateReleaseSha(r.body);
 		if (sha instanceof Response) return sha;
+		const settings = await e.store.getSettings();
 		const planned = await planFromRepo(e, sha);
 		if (planned instanceof Response) return planned;
 		const semverGate = await checkReleaseSemver(e);
 		if (semverGate instanceof Response) return semverGate;
-		// Network before the guard: resolveReleaseOverrides keeps the R1-8 ordering with no
-		// await between the guard and createTask. Never throws: a failed fetch lands in the
+		// Network precedes the creation transaction. A failed fetch appears in the
 		// prompt as a per-type unavailable line or "alerts unavailable: <reason>".
 		const alerts = await githubAlertSummary({ repo: e.github, gh });
 		const overrides = await resolveReleaseOverrides(e, planned.plan, r.body);
 		if (overrides instanceof Response) return overrides;
-		return createReleaseCard(
+		return await createReleaseCard(
 			e,
 			planned.plan,
 			overrides.version,
 			overrides.notes,
 			overrides.model,
 			alerts,
+			settings,
 		);
 	}
 
-	function createReleaseCard(
+	async function createReleaseCard(
 		e: Entry,
 		plan: Omit<ReleasePlan, "tasks">,
 		version: string,
 		notes: string,
 		model: string | null,
 		alerts: string,
+		settings: ProjectSettings,
 	) {
-		const t = e.store.createTask(
-			releasePrompt({
-				version,
-				from: plan.from,
-				sha: plan.sha,
-				commits: plan.commits,
-				notes,
-				alerts,
-			}),
-			model,
-		);
-		// Synchronous with createTask: the scheduler must never see a half-made release card.
-		const updated = e.store.updateTask(t.id, {
-			promptAuthor: "board",
-			base: plan.sha,
-			releaseVersion: version,
-			releaseNotes: notes,
+		const result = await e.store.transaction(async () => {
+			const current = await e.store.getSettings();
+			if (
+				current.originUrl !== settings.originUrl ||
+				current.targetBranch !== settings.targetBranch ||
+				current.releaseCommand !== settings.releaseCommand
+			)
+				return json({ error: "release settings changed" }, 409);
+			const blocked =
+				releaseBlocked(await e.store.listTasks(), current.releaseCommand) ??
+				plan.blocked;
+			if (blocked !== null) return json({ error: blocked }, 409);
+			const t = await e.store.createTask(
+				releasePrompt({
+					version,
+					from: plan.from,
+					sha: plan.sha,
+					commits: plan.commits,
+					notes,
+					alerts,
+				}),
+				model,
+			);
+			// The creation transaction also saves the release metadata.
+			const updated = await e.store.updateTask(t.id, {
+				promptAuthor: "board",
+				base: plan.sha,
+				releaseVersion: version,
+				releaseNotes: notes,
+			});
+			return updated;
 		});
-		deps.schedule();
-		return json({ ...updated, turns: [] });
+		if (result instanceof Response) return result;
+		await deps.schedule();
+		return json({ ...result, turns: [] });
 	}
 
 	async function releaseWindowStart(
@@ -11096,8 +11572,8 @@ export function createApp(deps: AppDeps) {
 			resolved = await resolveTarget(
 				e.path,
 				true,
-				e.store.getSettings().originUrl,
-				e.store.getSettings().targetBranch,
+				(await e.store.getSettings()).originUrl,
+				(await e.store.getSettings()).targetBranch,
 			);
 		} catch (err) {
 			return json({ error: errmsg(err) }, 409);
@@ -11106,7 +11582,7 @@ export function createApp(deps: AppDeps) {
 			mainPath: e.path,
 			target: resolved.target,
 			sha: sha ?? resolved.sha,
-			originUrl: e.store.getSettings().originUrl,
+			originUrl: (await e.store.getSettings()).originUrl,
 		}).catch((err) => json({ error: errmsg(err) }, 409));
 		if (plan instanceof Response) return plan;
 		return { target: resolved.target, sha: resolved.sha, plan };
@@ -11140,9 +11616,12 @@ export function createApp(deps: AppDeps) {
 		// Window start: the last release tag's commit time; merges are serialized, so a
 		// task is in from..sha exactly when it finished after that commit landed.
 		const since = await releaseWindowStart(e, plan.from);
-		const all = e.store.listTasks();
+		const all = await e.store.listTasks();
 		const tasks = includedTasks(all, since);
-		const blocked = releaseBlocked(all, e.store.getSettings().releaseCommand);
+		const blocked = releaseBlocked(
+			all,
+			(await e.store.getSettings()).releaseCommand,
+		);
 		return json(
 			blocked === null ? { ...plan, tasks } : { ...plan, tasks, blocked },
 		);
@@ -11173,14 +11652,14 @@ export function createApp(deps: AppDeps) {
 
 	// retro -> retroSince: on keeps the existing mark (a re-save must not move
 	// it), off clears it. Validated as a boolean by parseSettingsPatch.
-	function applyRetroSince(
+	async function applyRetroSince(
 		e: Entry,
 		patch: Record<string, unknown>,
 		retro: unknown,
-	): void {
+	): Promise<void> {
 		if (typeof retro !== "boolean") return;
 		patch.retroSince = retro
-			? (e.store.getSettings().retroSince ?? Date.now())
+			? ((await e.store.getSettings()).retroSince ?? Date.now())
 			: null;
 	}
 
@@ -11209,8 +11688,14 @@ export function createApp(deps: AppDeps) {
 	// (re-)enable file cards. Saving true while on keeps the mark; off leaves it. Set
 	// after every await above, from the live setting, so the mark is the moment the
 	// watch actually turns on.
-	function stampIssueWatch(e: Entry, patch: Record<string, unknown>): void {
-		if (patch.issueWatch === true && e.store.getSettings().issueWatch !== true)
+	async function stampIssueWatch(
+		e: Entry,
+		patch: Record<string, unknown>,
+	): Promise<void> {
+		if (
+			patch.issueWatch === true &&
+			(await e.store.getSettings()).issueWatch !== true
+		)
 			patch.issueWatchSince = Date.now();
 	}
 
@@ -11247,16 +11732,29 @@ export function createApp(deps: AppDeps) {
 		const patch = parseSettingsPatch(r.body);
 		if (patch instanceof Response) return patch;
 		const guard =
-			jira.settingsRefusal(patch.jiraConnection) ??
+			(await jira.settingsRefusal(patch.jiraConnection)) ??
 			checkSettingsGuards(e, patch);
 		if (guard instanceof Response) return guard;
-		applyRetroSince(e, patch, r.body.retro);
+		const before = await e.store.getSettings();
+		await applyRetroSince(e, patch, r.body.retro);
 		const resolved = await resolveSettingsTarget(e, patch);
 		if (resolved instanceof Response) return resolved;
-		stampIssueWatch(e, patch);
-		e.store.setSettings(patch);
+		const applied = await e.store.transaction(async () => {
+			const current = await e.store.getSettings();
+			if (
+				(patch.targetBranch !== undefined &&
+					current.targetBranch !== before.targetBranch) ||
+				(typeof r.body.retro === "boolean" &&
+					current.retroSince !== before.retroSince)
+			)
+				return json({ error: "settings changed" }, 409);
+			await stampIssueWatch(e, patch);
+			await e.store.setSettings(patch);
+			return null;
+		});
+		if (applied !== null) return applied;
 		if (patch.targetBranch !== undefined) await refreshRemote(e);
-		return json(projectView(e));
+		return json(await projectView(e));
 	}
 
 	function validateAlateUrl(trimmed: string): string | Response {
@@ -11307,7 +11805,7 @@ export function createApp(deps: AppDeps) {
 		// kept-unreadable blob (ADR-0011).
 		if (next.key === null && body.key !== undefined) clearSecret("alateKey");
 		alate = next;
-		saveConfig();
+		await saveConfig();
 		return json(alateView());
 	}
 
@@ -11441,8 +11939,8 @@ export function createApp(deps: AppDeps) {
 		const identity = commitIdentitySetting(body);
 		if (identity instanceof Response) return identity;
 		if (identity !== undefined) deps.shared.commitIdentity = identity;
-		saveConfig();
-		deps.schedule();
+		await saveConfig();
+		await deps.schedule();
 		return json({
 			maxTotal: deps.shared.maxTotalRuns,
 			reviewCheck: deps.shared.reviewCheck,
@@ -11469,14 +11967,14 @@ export function createApp(deps: AppDeps) {
 	// Advisory stays advisory: kill only what the last scan reported, and only
 	// when the live process table still names the same command. Any drift
 	// (pid reuse, restart, a now-claimed turn) refuses, so the operator decides.
-	function checkOrphansStop(
+	async function checkOrphansStop(
 		pid: number,
 		started: number,
 		cmd: string,
-	): Response | null {
+	): Promise<Response | null> {
 		if (pid === process.pid)
 			return json({ error: "refusing to stop the tracker itself" }, 409);
-		const claimed = deps.claimedPids();
+		const claimed = await deps.claimedPids();
 		if (claimed.has(pid))
 			return json({ error: "a live turn claims this pid" }, 409);
 		const fresh = (deps.listProcesses ?? (() => platform.listProcesses()))();
@@ -11496,7 +11994,11 @@ export function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		const parsed = validateOrphansStopBody(r.body);
 		if (parsed instanceof Response) return parsed;
-		const refused = checkOrphansStop(parsed.pid, parsed.started, parsed.cmd);
+		const refused = await checkOrphansStop(
+			parsed.pid,
+			parsed.started,
+			parsed.cmd,
+		);
 		if (refused instanceof Response) return refused;
 		(deps.killTree ?? ((p) => platform.killTree(p)))(parsed.pid);
 		return json({ ok: true });
@@ -11739,12 +12241,14 @@ export function createApp(deps: AppDeps) {
 		// Dev: Bun's HTML dev server (import route, HMR). Prod: the boot-built bundle
 		// from memory (docs/specs/compressed-serving.md). The fixed-path views serve the
 		// same board HTML; the client routes on location.pathname.
-		"/": devUi ? board : (req) => boardHtml(req),
-		"/projects/:project": devUi ? board : (req) => boardHtml(req),
-		"/projects/:project/tasks/:id": devUi ? board : (req) => boardHtml(req),
-		"/settings": devUi ? board : (req) => boardHtml(req),
-		"/system": devUi ? board : (req) => boardHtml(req),
-		"/settings/:project": devUi ? board : (req) => boardHtml(req),
+		"/": devUi ? board : async (req) => await boardHtml(req),
+		"/projects/:project": devUi ? board : async (req) => await boardHtml(req),
+		"/projects/:project/tasks/:id": devUi
+			? board
+			: async (req) => await boardHtml(req),
+		"/settings": devUi ? board : async (req) => await boardHtml(req),
+		"/system": devUi ? board : async (req) => await boardHtml(req),
+		"/settings/:project": devUi ? board : async (req) => await boardHtml(req),
 		// --- Web Push (begin): service worker for notifications; the sibling PWA branch adds its static routes here too ---
 		"/sw.js": () =>
 			new Response(Bun.file(resolve(import.meta.dir, "ui", "sw.js")), {
@@ -11805,12 +12309,12 @@ export function createApp(deps: AppDeps) {
 					},
 				}),
 		},
-		"/api/ws": (req, srv) => wsUpgrade(req, srv),
+		"/api/ws": async (req, srv) => await wsUpgrade(req, srv),
 		"/api/boot": {
 			// Through api() like every other route (R2-11): the Host allowlist must cover it, so
 			// a DNS-rebinding page cannot read the version or whether onboarding is open.
-			GET: (req) =>
-				api(req, async () =>
+			GET: async (req) =>
+				await api(req, async () =>
 					json({
 						onboarding: deps.hosted === undefined && admin === null,
 						version: deps.serverVersion,
@@ -11822,19 +12326,19 @@ export function createApp(deps: AppDeps) {
 		// Hosted credit stop (docs/specs/hosted-mode.md section 5): the control plane's call when the
 		// tenant runs out of credit. hostedRefusal lets only a signed control identity reach it.
 		"/api/hosted/stop": {
-			POST: (req) => {
+			POST: async (req) => {
 				if (deps.hosted === undefined)
 					return Promise.resolve(json({ error: "not found" }, 404));
-				return api(req, () => handlePOSTHostedStop());
+				return await api(req, async () => await handlePOSTHostedStop());
 			},
 		},
 		// Hosted credit release (docs/specs/hosted-mode.md section 5): the control plane's call after
 		// a top-up. Same wall rule as stop: only a signed control identity reaches it.
 		"/api/hosted/release": {
-			POST: (req) => {
+			POST: async (req) => {
 				if (deps.hosted === undefined)
 					return Promise.resolve(json({ error: "not found" }, 404));
-				return api(req, () => handlePOSTHostedRelease());
+				return await api(req, async () => await handlePOSTHostedRelease());
 			},
 		},
 		// Hosted forwarded GitHub events (docs/specs/hosted-mode.md section 8): the control plane
@@ -11842,78 +12346,96 @@ export function createApp(deps: AppDeps) {
 		// GitHub on a self-hosted board kick only for the repo the event names. Same wall rule as
 		// stop: hostedRefusal lets only a signed control identity reach it.
 		"/api/hosted/github-event": {
-			POST: (req) => {
+			POST: async (req) => {
 				if (deps.hosted === undefined)
 					return Promise.resolve(json({ error: "not found" }, 404));
-				return api(req, () => hostedGithubEvent(req));
+				return await api(req, async () => await hostedGithubEvent(req));
 			},
 		},
 		"/api/setup": {
-			POST: (req) => api(req, () => setup(req)),
+			POST: async (req) => await api(req, async () => await setup(req)),
 		},
 		"/api/login": {
-			POST: (req, server) => api(req, () => login(req, server)),
+			POST: async (req, server) =>
+				await api(req, async () => await login(req, server)),
 		},
 		"/api/logout": {
 			// Open route: without a valid cookie it only clears the cookie, as before.
-			POST: (req) => api(req, () => logout(req)),
+			POST: async (req) => await api(req, async () => await logout(req)),
 		},
 		"/api/settings/api-key": {
-			GET: (req) => api(req, async () => json({ apiKey })),
-			POST: (req) => api(req, () => handlePOSTSettingsApi()),
+			GET: async (req) => await api(req, async () => json({ apiKey })),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsApi()),
 		},
 		// Alate key reveal/rotate: GET hands back the stored key, POST asks alate to rotate
 		// it (alate kills the old key immediately, so a failed save must hand the new key back).
 		"/api/settings/alate-key": {
-			GET: (req) => api(req, async () => secretJson({ apiKey: alate.key })),
-			POST: (req) => api(req, () => handlePOSTSettingsAlate()),
+			GET: async (req) =>
+				await api(req, async () => secretJson({ apiKey: alate.key })),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsAlate()),
 		},
 		// Rotation invalidates every signed session at once: the lost-device kill switch
 		// (the plain logout below clears only the calling browser's cookie).
 		"/api/settings/session-secret": {
-			POST: (req) => api(req, () => handlePOSTSettingsSession()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsSession()),
 		},
 		"/api/settings/sessions": {
-			GET: (req) => api(req, () => handleGETSettingsSessions(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETSettingsSessions(req)),
 		},
 		"/api/settings/sessions/:id": {
-			DELETE: (req) => api(req, () => handleDELETESettingsSessionsById(req)),
+			DELETE: async (req) =>
+				await api(req, async () => await handleDELETESettingsSessionsById(req)),
 		},
 		"/api/settings/github-token": {
-			GET: (req) =>
-				api(req, async () =>
+			GET: async (req) =>
+				await api(req, async () =>
 					json({
 						tokenSet: githubToken !== null || keptUnreadable.has("githubToken"),
 						tokenReadable: githubToken !== null,
 						expiresAt: loadReminders().board.expiresAt,
 					}),
 				),
-			POST: (req) => api(req, () => handlePOSTSettingsGithub2(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsGithub2(req)),
 		},
 		// Settings → GitHub → GitHub host. An empty host is the reset: the boot env value
 		// comes back, or github.com when the env had none. A save re-probes the token so the
 		// expiry notice follows the new host at once.
 		"/api/settings/github-host": {
-			POST: (req) => api(req, () => handlePOSTSettingsGithub(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsGithub(req)),
 		},
 		// Read-only GitHub tokens for turns (docs/specs/turn-read-token.md). No answer ever
 		// holds a token value; a save runs the API check and stores its verdict, and only a
 		// checked row (or a confirmed write-capable one) is served to turns.
 		"/api/settings/turn-github-token": {
-			GET: (req) => api(req, async () => json(turnReadTokenView())),
-			POST: (req) => api(req, () => handlePOSTSettingsTurnToken(req)),
+			GET: async (req) => await api(req, async () => json(turnReadTokenView())),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsTurnToken(req)),
 		},
 		"/api/settings/turn-github-token/confirm": {
-			POST: (req) => api(req, () => handlePOSTSettingsTurnTokenConfirm(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTSettingsTurnTokenConfirm(req),
+				),
 		},
 		"/api/settings/turn-github-token/recheck": {
-			POST: (req) => api(req, () => handlePOSTSettingsTurnTokenRecheck(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTSettingsTurnTokenRecheck(req),
+				),
 		},
 		// Env values, one per env.txt name. A secret answer never holds its value; a plain
 		// name (env.txt `plain`) answers with it. A re-save replaces it (no delete).
 		"/api/settings/env": {
-			GET: (req) =>
-				api(req, async () =>
+			GET: async (req) =>
+				await api(req, async () =>
 					json({
 						names: listedEnvNames(workersHome).map((row) =>
 							row.plain
@@ -11933,66 +12455,84 @@ export function createApp(deps: AppDeps) {
 						),
 					}),
 				),
-			POST: (req) => api(req, () => handlePOSTSettingsEnv(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettingsEnv(req)),
 		},
 		// Per-host git tokens (any host, GitHub included). No answer ever holds a token
 		// or a private key; every saved credential passed a live test first.
 		"/api/git-hosts": {
-			GET: (req) => api(req, async () => json(await gitHostsView())),
+			GET: async (req) =>
+				await api(req, async () => json(await gitHostsView())),
 		},
 		"/api/git-hosts/tokens": {
-			POST: (req) => api(req, () => handlePOSTGitTokens(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTGitTokens(req)),
 		},
 		// The board GitHub token only becomes a git-host entry through this explicit
 		// endpoint — never reused for git without the click.
 		"/api/git-hosts/github-token": {
-			POST: (req) => api(req, () => handlePOSTGitGithub2(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTGitGithub2(req)),
 		},
 		"/api/git-hosts/tokens/:host": {
-			DELETE: (req) => api(req, () => handleDELETEGitTokensByHost(req)),
+			DELETE: async (req) =>
+				await api(req, async () => await handleDELETEGitTokensByHost(req)),
 		},
 		"/api/git-hosts/ssh/pending": {
-			POST: (req) => api(req, () => handlePOSTGitSshPending(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTGitSshPending(req)),
 		},
 		"/api/git-hosts/ssh/test": {
-			POST: (req) => api(req, () => testSshKey(req)),
+			POST: async (req) => await api(req, async () => await testSshKey(req)),
 		},
 		"/api/git-hosts/ssh/global": {
-			PUT: (req) => api(req, () => handlePUTGitSshGlobal(req)),
-			DELETE: (req) => api(req, () => handleDELETEGitSshGlobal()),
+			PUT: async (req) =>
+				await api(req, async () => await handlePUTGitSshGlobal(req)),
+			DELETE: async (req) =>
+				await api(req, async () => await handleDELETEGitSshGlobal()),
 		},
 		// The GitHub App that posts PR reviews as ottr[bot]. No answer holds the key.
 		"/api/git-hosts/github-app": {
-			POST: (req) => api(req, () => handlePOSTGitGithub(req)),
-			DELETE: (req) => api(req, () => handleDELETEGitGithub()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTGitGithub(req)),
+			DELETE: async (req) =>
+				await api(req, async () => await handleDELETEGitGithub()),
 		},
 		"/api/projects/:project/ssh-key": {
-			GET: (req) => api(req, () => handleGETProjectsSshByProject(req)),
-			PUT: (req) => api(req, () => handlePUTProjectsSshByProject(req)),
-			DELETE: (req) => api(req, () => handleDELETEProjectsSshByProject(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETProjectsSshByProject(req)),
+			PUT: async (req) =>
+				await api(req, async () => await handlePUTProjectsSshByProject(req)),
+			DELETE: async (req) =>
+				await api(req, async () => await handleDELETEProjectsSshByProject(req)),
 		},
 		"/api/settings/omp-stats": {
-			GET: (req) => api(req, async () => json(await ompStatsReportNow())),
+			GET: async (req) =>
+				await api(req, async () => json(await ompStatsReportNow())),
 		},
 		"/api/settings/omp-stats/dashboard": {
-			GET: (req) => api(req, async () => json(ompStatsListener)),
+			GET: async (req) => await api(req, async () => json(ompStatsListener)),
 		},
 		"/api/settings/hindsight": {
-			GET: (req) => api(req, async () => json(hindsightView())),
-			POST: (req) => api(req, () => saveHindsight(req)),
+			GET: async (req) => await api(req, async () => json(hindsightView())),
+			POST: async (req) => await api(req, async () => await saveHindsight(req)),
 		},
 		// --- Web Push (begin) ---
 		"/api/push/config": {
-			GET: (req) => api(req, () => handleGETPushConfig(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETPushConfig(req)),
 		},
 		"/api/push/subscribe": {
-			POST: (req) => api(req, () => handlePOSTPushSubscribe(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTPushSubscribe(req)),
 		},
 		"/api/push/unsubscribe": {
-			POST: (req) => api(req, () => handlePOSTPushUnsubscribe(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTPushUnsubscribe(req)),
 		},
 		"/api/push/test": {
-			POST: (req) => api(req, () => handlePOSTPushTest()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTPushTest()),
 		},
 		// --- Web Push (end) ---
 		// The service worker's authority before it shows or keeps a notification: per class,
@@ -12000,82 +12540,106 @@ export function createApp(deps: AppDeps) {
 		// sequence number of the last alert sent to it. A delayed, resolved or superseded
 		// payload reads as stale here, however the pushes were ordered.
 		"/api/notifications/live": {
-			GET: (req) => api(req, () => handleGETNotificationsLive(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETNotificationsLive(req)),
 		},
 		"/api/notifications/prefs": {
-			GET: (req) => api(req, () => notificationPrefs(req)),
-			POST: (req) => api(req, () => saveNotificationPrefs(req)),
+			GET: async (req) =>
+				await api(req, async () => await notificationPrefs(req)),
+			POST: async (req) =>
+				await api(req, async () => await saveNotificationPrefs(req)),
 		},
 		"/api/presence": {
-			POST: (req) => api(req, () => presence(req)),
+			POST: async (req) => await api(req, async () => await presence(req)),
 		},
 		"/api/inbox/seen": {
-			GET: (req) => api(req, async () => json({ keys: loadInboxSeen() })),
-			POST: (req) => api(req, () => inboxSeen(req)),
+			GET: async (req) =>
+				await api(req, async () => json({ keys: await loadInboxSeen() })),
+			POST: async (req) => await api(req, async () => await inboxSeen(req)),
 		},
 		"/api/seen": {
-			POST: (req) => api(req, () => handlePOSTSeen(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSeen(req)),
 		},
 		"/api/models": {
-			GET: (req) =>
-				api(req, async () =>
+			GET: async (req) =>
+				await api(req, async () =>
 					json({ models: await modelList(), roles: modelRoles() }),
 				),
 		},
 		"/api/state": {
-			GET: (req) => api(req, async () => json(stateResponse())),
+			GET: async (req) =>
+				await api(req, async () => json(await stateResponse())),
 		},
 		"/api/orphans": {
-			GET: (req) => api(req, () => handleGETOrphans()),
+			GET: async (req) => await api(req, async () => await handleGETOrphans()),
 		},
 		"/api/orphans/stop": {
-			POST: (req) => api(req, () => handlePOSTOrphansStop(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTOrphansStop(req)),
 		},
 		"/api/system": {
-			GET: (req) => api(req, () => handleGETSystem()),
+			GET: async (req) => await api(req, async () => await handleGETSystem()),
 		},
 		"/api/performance": {
-			GET: (req) => api(req, () => handleGETPerformance(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETPerformance(req)),
 		},
 		"/api/gh-status": {
-			GET: (req) => api(req, () => handleGETGh(req)),
+			GET: async (req) => await api(req, async () => await handleGETGh(req)),
 		},
 		"/api/projects/order": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsOrder(req), { costly: true }),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProjectsOrder(req), {
+					costly: true,
+				}),
 		},
 		"/api/projects": {
 			// OTTR-715: a clone-on-add request runs a real `git clone` that can stay quiet
 			// past the 120 s idle cut (see vmRoute): lift it for this request before readJson.
-			POST: (req, server) => {
+			POST: async (req, server) => {
 				server.timeout(req, 0);
-				return api(req, () => handlePOSTProjects(req), { costly: true });
+				return await api(req, async () => await handlePOSTProjects(req), {
+					costly: true,
+				});
 			},
 		},
 		"/api/projects/:project/init": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsInitByProject(req), {
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProjectsInitByProject(req), {
 					costly: true,
 				}),
 		},
 		"/api/projects/:project/interview": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsInterviewByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsInterviewByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/remove": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsRemoveByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsRemoveByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/settings": {
-			POST: (req) => api(req, () => handlePOSTSettings(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTSettings(req)),
 		},
 		// Settings → "Scan trending now": the weekly trending scan, run at once. Body optional.
 		"/api/trending/scan": {
-			POST: (req) => api(req, () => handlePOSTTrendingScan(), { costly: true }),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTTrendingScan(), {
+					costly: true,
+				}),
 		},
 		// The update script holds new turns here while a new image waits, so the running turns
 		// finish and the restart finds the board idle (docs/WORKERS.md, "Updates").
@@ -12083,143 +12647,188 @@ export function createApp(deps: AppDeps) {
 		// time and the others keep working. A per-runner hold never touches the board-wide
 		// state or the notice bar.
 		"/api/drain": {
-			GET: (req) => api(req, () => handleGETDrain()),
-			POST: (req) => api(req, () => handlePOSTDrain(req)),
-			DELETE: (req) => api(req, () => handleDELETEDrain(req)),
+			GET: async (req) => await api(req, async () => await handleGETDrain()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTDrain(req)),
+			DELETE: async (req) =>
+				await api(req, async () => await handleDELETEDrain(req)),
 		},
 		"/api/alate": {
-			GET: (req) => api(req, async () => json(alateView())),
-			POST: (req) => api(req, () => handlePOSTAlate(req)),
+			GET: async (req) => await api(req, async () => json(alateView())),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTAlate(req)),
 		},
 		"/api/alate/health": {
-			GET: (req) => api(req, () => handleGETAlateHealth()),
+			GET: async (req) =>
+				await api(req, async () => await handleGETAlateHealth()),
 		},
 		"/api/alate/provision": {
-			POST: (req) => api(req, () => handlePOSTAlateProvision()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTAlateProvision()),
 		},
 		// Read-only view of the alate integration and the workers' provisioned lists.
 		"/api/provisioning": {
-			GET: (req) => api(req, () => handleGETProvisioning()),
+			GET: async (req) =>
+				await api(req, async () => await handleGETProvisioning()),
 		},
 		"/api/model-roles": {
-			GET: (req) =>
-				api(req, () =>
-					layout422(async () => {
-						const f = await loadConfigYml(alate, false);
-						if (!f.ok) return json({ error: f.error }, f.status);
-						return json({
-							base: f.body.base,
-							hash: f.body.hash,
-							roles: readRoles(f.body.content),
-							fallbacks: readFallbacks(f.body.content),
-							// The data source: repo for Alate's GitHub source, path for a
-							// local folder.
-							repo: f.body.repo,
-							path: f.body.path,
-							// A folder the board saw refuse a save locks the editor on
-							// load, before any edit; null until such a save.
-							ro: folderSaveVerdict(f.body.path),
-							// One sign-in, on the board (docs/specs/provider-credentials.md): the
-							// board store's active providers; null when it cannot be read.
-							signIns: (() => {
-								try {
-									return signIns()
-										.filter((a) => a.active)
-										.map((a) => a.provider);
-								} catch {
-									return null;
-								}
-							})(),
-							seed: seedView(),
-						});
-					}),
+			GET: async (req) =>
+				await api(
+					req,
+					async () =>
+						await layout422(async () => {
+							const f = await loadConfigYml(alate, false);
+							if (!f.ok) return json({ error: f.error }, f.status);
+							return json({
+								base: f.body.base,
+								hash: f.body.hash,
+								roles: readRoles(f.body.content),
+								fallbacks: readFallbacks(f.body.content),
+								// The data source: repo for Alate's GitHub source, path for a
+								// local folder.
+								repo: f.body.repo,
+								path: f.body.path,
+								// A folder the board saw refuse a save locks the editor on
+								// load, before any edit; null until such a save.
+								ro: folderSaveVerdict(f.body.path),
+								// One sign-in, on the board (docs/specs/provider-credentials.md): the
+								// board store's active providers; null when it cannot be read.
+								signIns: (() => {
+									try {
+										return signIns()
+											.filter((a) => a.active)
+											.map((a) => a.provider);
+									} catch {
+										return null;
+									}
+								})(),
+								seed: seedView(),
+							});
+						}),
 				),
-			POST: (req) =>
-				api(req, () =>
-					layout422(async () => {
-						const r = await readJson(req);
-						if ("error" in r) return r.error;
-						const prep = await prepareRolesSave(r.body);
-						if (prep instanceof Response) return prep;
-						if (prep.source.repo === null || prep.source.base === null)
-							return saveRolesFolder(prep.source, prep.content, prep.message);
-						return saveRolesRepo(prep.source, prep.content, prep.message);
-					}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () =>
+						await layout422(async () => {
+							const r = await readJson(req);
+							if ("error" in r) return r.error;
+							const prep = await prepareRolesSave(r.body);
+							if (prep instanceof Response) return prep;
+							if (prep.source.repo === null || prep.source.base === null)
+								return await saveRolesFolder(
+									prep.source,
+									prep.content,
+									prep.message,
+								);
+							return await saveRolesRepo(
+								prep.source,
+								prep.content,
+								prep.message,
+							);
+						}),
 				),
 		},
 		"/api/updates/refresh": {
-			POST: (req) => api(req, () => handlePOSTUpdatesRefresh()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTUpdatesRefresh()),
 		},
 		"/api/updates/skip": {
-			POST: (req) => api(req, () => handlePOSTUpdatesSkip(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTUpdatesSkip(req)),
 		},
 		"/api/updates/allow": {
-			POST: (req) => api(req, () => allowUpdates(req)),
+			POST: async (req) => await api(req, async () => await allowUpdates(req)),
 		},
 		"/api/updates/remove": {
-			POST: (req) => api(req, () => handlePOSTUpdatesRemove(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTUpdatesRemove(req)),
 		},
 		"/api/provider-login": {
-			GET: (req) => api(req, () => handleGETProvider()),
-			POST: (req) => api(req, () => handlePOSTProvider(req)),
+			GET: async (req) => await api(req, async () => await handleGETProvider()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProvider(req)),
 		},
 		"/api/provider-login/answer": {
-			POST: (req) => api(req, () => handlePOSTProviderAnswer(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProviderAnswer(req)),
 		},
 		"/api/provider-login/cancel": {
-			POST: (req) => api(req, () => handlePOSTProviderCancel(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProviderCancel(req)),
 		},
 		"/api/provider-login/logout": {
-			POST: (req) => api(req, () => handlePOSTProviderLogout(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProviderLogout(req)),
 		},
 		"/api/update": {
-			GET: (req) => api(req, () => handleGETUpdate()),
-			POST: (req) => api(req, () => handlePOSTUpdate(req)),
+			GET: async (req) => await api(req, async () => await handleGETUpdate()),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTUpdate(req)),
 		},
 		"/api/update/host": {
-			POST: (req) => api(req, () => handlePOSTUpdateHost(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTUpdateHost(req)),
 		},
 		"/api/projects/:project/icon": {
-			GET: (req) => api(req, () => handleGETProjectsIconByProject(req)),
-			POST: (req) => api(req, () => handlePOSTProjectsIconByProject(req)),
-			DELETE: (req) => api(req, () => handleDELETEProjectsIconByProject(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETProjectsIconByProject(req)),
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProjectsIconByProject(req)),
+			DELETE: async (req) =>
+				await api(
+					req,
+					async () => await handleDELETEProjectsIconByProject(req),
+				),
 		},
 		"/api/projects/:project/settings": {
-			POST: (req) => api(req, () => handlePOSTProjectsSettingsByProject(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsSettingsByProject(req),
+				),
 		},
 		"/api/jira/connections": {
-			GET: (req) => api(req, () => jira.list()),
-			POST: (req) => api(req, () => jiraPost(req, jira.save)),
+			GET: async (req) => await api(req, () => jira.list()),
+			POST: async (req) =>
+				await api(req, async () => await jiraPost(req, jira.save)),
 		},
 		"/api/jira/connections/:name": {
-			DELETE: (req) => api(req, () => jira.remove(req.params.name)),
+			DELETE: async (req) => await api(req, () => jira.remove(req.params.name)),
 		},
 		"/api/jira/connections/:name/test": {
-			POST: (req) => api(req, () => jira.test(req.params.name)),
+			POST: async (req) => await api(req, () => jira.test(req.params.name)),
 		},
 		"/api/jira/detect": {
-			POST: (req) => api(req, () => jiraPost(req, jira.detect)),
+			POST: async (req) =>
+				await api(req, async () => await jiraPost(req, jira.detect)),
 		},
 		"/api/jira/search": {
-			POST: (req) => api(req, () => jiraPost(req, jira.boardSearch)),
+			POST: async (req) =>
+				await api(req, async () => await jiraPost(req, jira.boardSearch)),
 		},
 		"/api/jira/import": {
-			POST: (req) =>
-				api(req, () => jiraPost(req, jira.boardImport), {
+			POST: async (req) =>
+				await api(req, async () => await jiraPost(req, jira.boardImport), {
 					costly: true,
 				}),
 		},
 		"/api/projects/:project/jira/search": {
-			POST: (req) =>
-				api(req, () =>
-					jiraPost(req, (b) => jira.search(req.params.project, b)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () =>
+						await jiraPost(req, (b) => jira.search(req.params.project, b)),
 				),
 		},
 		"/api/projects/:project/jira/import": {
-			POST: (req) =>
-				api(
+			POST: async (req) =>
+				await api(
 					req,
-					() => jiraPost(req, (b) => jira.importIssues(req.params.project, b)),
+					async () =>
+						await jiraPost(req, (b) =>
+							jira.importIssues(req.params.project, b),
+						),
 					{ costly: true },
 				),
 		},
@@ -12227,92 +12836,145 @@ export function createApp(deps: AppDeps) {
 		// authenticated path the merge flow uses. Moves refs/heads/<target> on origin only;
 		// never depends on the checked-out branch, never forces.
 		"/api/projects/:project/push-main": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsPushByProject(req), {
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProjectsPushByProject(req), {
 					costly: true,
 				}),
 		},
 		// The board's Diagrams button: docs/how-it-works.md as committed on the target branch.
 		"/api/projects/:project/how-it-works": {
-			GET: (req) => api(req, () => handleGETProjectsHowByProject(req)),
+			GET: async (req) =>
+				await api(req, async () => await handleGETProjectsHowByProject(req)),
 		},
 		"/api/projects/:project/release": {
-			GET: (req) => api(req, () => handleGETProjectsReleaseByProject(req)),
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsReleaseByProject(req), {
-					costly: true,
-				}),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsReleaseByProject(req),
+				),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsReleaseByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/release-summary": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsReleaseSummaryByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsReleaseSummaryByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/arch-review": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsArchByProject(req), {
+			POST: async (req) =>
+				await api(req, async () => await handlePOSTProjectsArchByProject(req), {
 					costly: true,
 				}),
 		},
 		// The dev-only Check the board button: files the card that runs the check-ottr-board
 		// skill in the server's own container (turn.ts keeps it off the workers).
 		"/api/projects/:project/board-check": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsBoardByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsBoardByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/queue": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsQueueByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsQueueByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		// The composer's opt-in Deepen: a model rewrites the draft; the user accepts before anything runs.
 		"/api/projects/:project/deepen": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsDeepenByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsDeepenByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		// The trending scout's two tools (extension/tracker.ts): "filed" files a backlog proposal
 		// card (at most TRENDING_CAP per scan, the store enforces it), no_fit and deferred record
 		// the verdict. The turns' host reaches it with the board token like card filing (agentRefusal).
 		"/api/projects/:project/trending/verdicts": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTrendingVerdictsByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTrendingVerdictsByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id": {
-			GET: (req) => api(req, () => handleGETProjectsTasksByProjectAndId(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/files": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsTasksFilesByProjectAndId(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksFilesByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/saved-files": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsTasksSavedFilesByProjectAndId(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksSavedFilesByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/diff": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsTasksDiffByProjectAndId(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksDiffByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/images/:name": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsTasksImagesByProjectAndIdAndName(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () =>
+						await handleGETProjectsTasksImagesByProjectAndIdAndName(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/edit": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksEditByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksEditByProjectAndId(req),
+				),
 		},
 		// The prompt-edit hold: while a drawer has the editor open, the card must not start —
 		// a scheduler tick would run the saved prompt and strand the unsaved draft (a started
@@ -12321,147 +12983,247 @@ export function createApp(deps: AppDeps) {
 		// store's editTask, and every queue write below clears it, so a user action never
 		// stalls behind a hold whose editor died silently.
 		"/api/projects/:project/tasks/:id/edit/start": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksEditStartByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksEditStartByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/edit/stop": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksEditStopByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksEditStopByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/triage": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksTriageByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksTriageByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/log": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsTasksLogByProjectAndId(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksLogByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/context": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsTasksContextByProjectAndId(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksContextByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/reply": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksReplyByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksReplyByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/merge-anyway": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksMergeByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksMergeByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/rerun-failed-jobs": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksRerunByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksRerunByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/follow-up": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksFollowByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksFollowByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/steer": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksSteerByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksSteerByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/steer/cancel": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksSteerCancelByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () =>
+						await handlePOSTProjectsTasksSteerCancelByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/steer/edit": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksSteerEditByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksSteerEditByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/model": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksModelByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksModelByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/star": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksStarByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksStarByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/restart-session": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksRestartByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksRestartByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		// Parked backlog cards: a grill session refines the prompt, promote moves it to todo.
 		"/api/projects/:project/tasks/:id/grill": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksGrillByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksGrillByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/backlog": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksBacklogByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksBacklogByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/cancel": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksCancelByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksCancelByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/refile": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksRefileByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksRefileByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/stop": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksStopByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksStopByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/finish-kept": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksFinishByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksFinishByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/forks/check": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsForksCheckByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsForksCheckByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/prs/check": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsPrsCheckByProject(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsPrsCheckByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/tasks/:id/pr-review/post": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksPrPostByProjectAndId(req), {
-					costly: true,
-				}),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksPrPostByProjectAndId(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/github": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsGithubByProject(req), {
-					costly: true,
-				}),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsGithubByProject(req),
+					{
+						costly: true,
+					},
+				),
 		},
 		"/api/projects/:project/github/visibility": {
-			GET: (req) =>
-				api(req, () => handleGETProjectsGithubVisibilityByProject(req)),
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsGithubVisibilityByProject(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/unmark-research": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksUnmarkByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksUnmarkByProjectAndId(req),
+				),
 		},
 		"/api/projects/:project/tasks/:id/release-notes": {
-			POST: (req) =>
-				api(req, () => handlePOSTProjectsTasksReleaseByProjectAndId(req)),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksReleaseByProjectAndId(req),
+				),
 		},
 	});
 
@@ -12507,6 +13269,7 @@ export function createApp(deps: AppDeps) {
 	}
 
 	return {
+		close,
 		serveOptions: {
 			routes,
 			// Bun closes an idle connection after 10 s — in-flight requests included — so a
@@ -12516,16 +13279,26 @@ export function createApp(deps: AppDeps) {
 			idleTimeout: 120,
 			// A provider's sign-in redirect to localhost:<port> lands here when compose publishes that
 			// port to the board; anything else stays a 404.
-			fetch: async (req: Request) =>
-				(await logins.callback(req)) ??
-				(await boardAsset(req)) ??
-				json({ error: "not found" }, 404),
+			fetch: (req: Request): Promise<Response> => {
+				if (closing)
+					return Promise.resolve(json({ error: "app is closed" }, 503));
+				return trackWork(
+					"asset request",
+					(async () =>
+						(await logins.callback(req)) ??
+						(await boardAsset(req)) ??
+						json({ error: "not found" }, 404))(),
+				);
+			},
 			websocket: {
-				open(ws: ServerWebSocket<undefined>) {
+				async open(ws: ServerWebSocket<undefined>) {
 					// Increment BEFORE publishState so this socket is either in the publish or sent the frame.
 					sockets++;
+					if (closing) return;
 					ws.subscribe("board");
-					if (!publishState()) ws.send(lastStateJson);
+					const published = await publishState();
+					if (closing) return;
+					if (!published) ws.send(lastStateJson);
 					ws.send(
 						JSON.stringify({
 							type: "update",
@@ -12542,7 +13315,14 @@ export function createApp(deps: AppDeps) {
 			},
 		},
 		serverRef: deps.serverRef,
-		ompStatsFetch,
+		ompStatsFetch: (
+			req: Request,
+			server: Server<undefined>,
+		): Promise<Response> => {
+			if (closing)
+				return Promise.resolve(json({ error: "app is closed" }, 503));
+			return trackWork("stats request", ompStatsFetch(req, server));
+		},
 		/** The proxy listener's bind result; a failed bind passes { port: null, error }. */
 		setOmpStatsListener: (info: OmpStatsDashboardInfo): void => {
 			ompStatsListener = info;
@@ -12620,17 +13400,24 @@ export function createApp(deps: AppDeps) {
 		},
 		socketCount: () => sockets,
 		sampleStats,
-		alateProvisionTick,
-		idleReviewTick,
-		trendingTick: () => trendingScanner.tick(),
-		memoryHealthTick,
-		workerSignInTick,
-		refreshUpdates,
-		tokenReminderTick,
-		forkResearchTick: (opts?: { manual?: string }) => forkWatcher.tick(opts),
-		prReviewTick: (opts?: { manual?: string }) => prWatcher.tick(opts),
-		prReviewIdle: () => prWatcher.reviewIdle(),
-		issueWatchTick: (opts?: { manual?: string }) => issueWatcher.tick(opts),
-		ompWatchTick: () => ompWatcher.tick(),
+		alateProvisionTick: () =>
+			backgroundTick("alate provision", alateProvisionTick),
+		idleReviewTick: () => backgroundTick("idle review", idleReviewTick),
+		trendingTick: () =>
+			backgroundTick("trending scan", () => trendingScanner.tick()),
+		memoryHealthTick: () => backgroundTick("memory health", memoryHealthTick),
+		workerSignInTick: () => backgroundTick("worker sign-ins", workerSignInTick),
+		refreshUpdates: () => backgroundTick("updates refresh", refreshUpdates),
+		tokenReminderTick: () =>
+			backgroundTick("token reminder", tokenReminderTick),
+		forkResearchTick: (opts?: { manual?: string }) =>
+			backgroundTick("fork research", () => forkWatcher.tick(opts)),
+		prReviewTick: (opts?: { manual?: string }) =>
+			backgroundTick("PR review", () => prWatcher.tick(opts)),
+		prReviewIdle: () =>
+			backgroundTick("PR review drain", () => prWatcher.reviewIdle()),
+		issueWatchTick: (opts?: { manual?: string }) =>
+			backgroundTick("issue watch", () => issueWatcher.tick(opts)),
+		ompWatchTick: () => backgroundTick("omp watch", () => ompWatcher.tick()),
 	};
 }

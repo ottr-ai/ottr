@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { GlobalStore } from "./globalStore.ts";
 import { ProjectStore } from "./store.ts";
 import {
 	createTrendingScanner,
@@ -35,25 +36,29 @@ beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-trending-"));
 });
 
-afterAll(() => {
-	for (const s of stores) s.close();
+afterAll(async () => {
+	for (const s of stores) await s.close();
 	rmSync(root, { recursive: true, force: true });
 });
 
 let seq = 0;
-function project(settings = { trendingScout: true }): TrendingProject {
+async function project(
+	settings = { trendingScout: true },
+): Promise<TrendingProject> {
 	const name = `p${++seq}`;
 	const path = mkdtempSync(join(root, `${name}-`));
-	const store = ProjectStore.init(path);
+	const store = await ProjectStore.init(path);
 	stores.push(store);
-	store.setSettings(settings);
+	await store.setSettings(settings);
 	return { name: store.name, path, store, github: `o/${store.name}` };
 }
 
 type Fake = {
 	pages: Record<string, string>;
 	/** Per-URL override: return a Response to replace the default answer. */
-	respond?: (url: string) => Response | undefined;
+	respond?: (
+		url: string,
+	) => Response | undefined | Promise<Response | undefined>;
 	calls: { url: string; headers: Record<string, string> }[];
 };
 
@@ -64,7 +69,7 @@ function fakeFetch(fake: Fake): typeof fetch {
 			url,
 			headers: Object.fromEntries(new Headers(init?.headers).entries()),
 		});
-		const over = fake.respond?.(url);
+		const over = await fake.respond?.(url);
 		if (over) return over;
 		const page = fake.pages[url];
 		if (page !== undefined) return new Response(page, { status: 200 });
@@ -111,6 +116,7 @@ function harness(o: {
 	state?: { value: TrendingState };
 	enabled?: () => boolean;
 	token?: string;
+	globalStore?: GlobalStore;
 }) {
 	const fake: Fake = { pages: goodPages(), calls: [], ...o.fake };
 	const state = o.state ?? { value: { ...EMPTY_TRENDING_STATE } };
@@ -119,9 +125,15 @@ function harness(o: {
 	const scanner = createTrendingScanner({
 		projects: () => o.projects,
 		enabled: o.enabled ?? (() => true),
-		load: () => state.value,
-		save: (s) => {
-			state.value = s;
+		load: async () =>
+			(await o.globalStore?.get<TrendingState>("trending")) ?? state.value,
+		update: async (modify) => {
+			if (o.globalStore)
+				return o.globalStore.update<TrendingState>("trending", (current) =>
+					modify(current ?? { ...EMPTY_TRENDING_STATE }),
+				);
+			state.value = modify(state.value);
+			return state.value;
 		},
 		token: () => o.token,
 		apiBase: () => API,
@@ -135,8 +147,8 @@ function harness(o: {
 	return { scanner, fake, state, logs, scheduled: () => scheduled };
 }
 
-const scouts = (p: TrendingProject) =>
-	p.store.listTasks().filter((t) => t.kind === "trending");
+const scouts = async (p: TrendingProject) =>
+	(await p.store.listTasks()).filter((t) => t.kind === "trending");
 
 /** The one bundle the scanner wrote for `p`. */
 function bundle(p: TrendingProject): {
@@ -177,10 +189,10 @@ function verdict(
 }
 
 /** Closes every scout card of `p` so the next scan may file a new one. */
-function closeScouts(p: TrendingProject): void {
-	for (const t of scouts(p))
+async function closeScouts(p: TrendingProject): Promise<void> {
+	for (const t of await scouts(p))
 		if (t.cancelledAt === null)
-			p.store.updateTask(t.id, { cancelledAt: Date.now() });
+			await p.store.updateTask(t.id, { cancelledAt: Date.now() });
 }
 
 describe("parseTrending", () => {
@@ -203,17 +215,17 @@ describe("parseTrending", () => {
 
 describe("scanNow", () => {
 	test("files one scout card per opted-in project with the deduped union as candidates", async () => {
-		const a = project();
-		const off = project({ trendingScout: false });
+		const a = await project();
+		const off = await project({ trendingScout: false });
 		const h = harness({ projects: [a, off], token: "tok" });
 		const r = await h.scanner.scanNow();
 		expect(r.ok).toBe(true);
-		const cards = scouts(a);
+		const cards = await scouts(a);
 		expect(cards).toHaveLength(1);
 		expect(r).toEqual({ ok: true, filed: [cards[0]?.id as string] });
 		expect(cards[0]?.title).toMatch(/^Trending scout: \d{4}-\d{2}-\d{2}$/);
 		expect(cards[0]?.topic).toBe("trending scout");
-		expect(scouts(off)).toHaveLength(0);
+		expect(await scouts(off)).toHaveLength(0);
 		expect(h.scheduled()).toBe(1);
 		const b = bundle(a);
 		expect(b.project).toBe(a.name);
@@ -226,14 +238,14 @@ describe("scanNow", () => {
 		expect(apiCall?.headers["user-agent"]).toBe("ottr");
 		const pageCall = h.fake.calls.find((c) => c.url === ALL_URL);
 		expect(pageCall?.headers.authorization).toBeUndefined();
-		expect(h.scanner.status()).toMatchObject({
+		expect(await h.scanner.status()).toMatchObject({
 			lastError: null,
 			running: true,
 		});
 	});
 
 	test("no token sends no authorization header", async () => {
-		const a = project();
+		const a = await project();
 		const h = harness({ projects: [a] });
 		expect((await h.scanner.scanNow()).ok).toBe(true);
 		expect(
@@ -242,7 +254,7 @@ describe("scanNow", () => {
 	});
 
 	test("truncates the readme, skips archived and vanished repos", async () => {
-		const a = project();
+		const a = await project();
 		const h = harness({
 			projects: [a],
 			fake: {
@@ -274,7 +286,7 @@ describe("scanNow", () => {
 		["an empty page", "empty"],
 	] as const)
 		test(`${name} fails the scan with 502 and files no card`, async () => {
-			const a = project();
+			const a = await project();
 			const h = harness({
 				projects: [a],
 				fake: { pages: { ...goodPages(), [TS_URL]: fixture(page) } },
@@ -285,13 +297,15 @@ describe("scanNow", () => {
 				status: 502,
 				error: `trending page ${TS_URL} listed no repos (markup changed?)`,
 			});
-			expect(h.scanner.status().lastError?.reason).toContain("markup changed");
-			expect(scouts(a)).toHaveLength(0);
+			expect((await h.scanner.status()).lastError?.reason).toContain(
+				"markup changed",
+			);
+			expect(await scouts(a)).toHaveLength(0);
 			expect(h.scheduled()).toBe(0);
 		});
 
 	test("a rate-limited API call fails the scan", async () => {
-		const a = project();
+		const a = await project();
 		const h = harness({
 			projects: [a],
 			fake: {
@@ -307,7 +321,7 @@ describe("scanNow", () => {
 			expect(r.status).toBe(502);
 			expect(r.error).toContain("HTTP 403");
 		}
-		expect(scouts(a)).toHaveLength(0);
+		expect(await scouts(a)).toHaveLength(0);
 	});
 
 	// The headers arrived, then the body timed out: no optional-field fallback may hide it.
@@ -317,7 +331,7 @@ describe("scanNow", () => {
 		["tree", (u: string) => u.includes("/git/trees/")],
 	] as const)
 		test(`a ${part} body that times out fails the scan`, async () => {
-			const a = project();
+			const a = await project();
 			const h = harness({
 				projects: [a],
 				fake: {
@@ -342,14 +356,14 @@ describe("scanNow", () => {
 				expect(r.status).toBe(502);
 				expect(r.error).toContain("reading the body failed: timed out");
 			}
-			expect(h.scanner.status().lastError?.reason).toContain(
+			expect((await h.scanner.status()).lastError?.reason).toContain(
 				"reading the body failed: timed out",
 			);
-			expect(scouts(a)).toHaveLength(0);
+			expect(await scouts(a)).toHaveLength(0);
 		});
 
 	test("an open scout card or a scan in flight answers 409", async () => {
-		const a = project();
+		const a = await project();
 		const h = harness({ projects: [a] });
 		const first = h.scanner.scanNow();
 		expect(await h.scanner.scanNow()).toEqual({
@@ -359,38 +373,160 @@ describe("scanNow", () => {
 		});
 		const r = await first;
 		expect(r.ok).toBe(true);
-		const id = scouts(a)[0]?.id as string;
+		const id = (await scouts(a))[0]?.id as string;
 		expect(await h.scanner.scanNow()).toEqual({
 			ok: false,
 			status: 409,
 			error: `a trending scout card is still open: ${id}`,
 		});
-		closeScouts(a);
-		expect(h.scanner.status().running).toBe(false);
+		await closeScouts(a);
+		expect((await h.scanner.status()).running).toBe(false);
 	});
 
 	test("no opted-in project answers 409", async () => {
-		const h = harness({ projects: [project({ trendingScout: false })] });
+		const h = harness({ projects: [await project({ trendingScout: false })] });
 		const r = await h.scanner.scanNow();
 		expect(r.ok).toBe(false);
 		if (!r.ok) expect(r.status).toBe(409);
+	});
+
+	test("concurrent scanners file one complete scout and one event pair", async () => {
+		const a = await project();
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let arrivals = 0;
+		const respond = async (url: string) => {
+			if (url === ALL_URL) {
+				if (++arrivals === 2) reached.resolve();
+				await release.promise;
+			}
+			return undefined;
+		};
+		const first = harness({ projects: [a], fake: { respond } });
+		const second = harness({ projects: [a], fake: { respond } });
+		const scans = [first.scanner.scanNow(), second.scanner.scanNow()];
+		await reached.promise;
+		release.resolve();
+		const results = await Promise.all(scans);
+		const cards = await scouts(a);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]?.title).toMatch(/^Trending scout: /);
+		expect(cards[0]?.topic).toBe("trending scout");
+		expect(results.filter((r) => r.ok).length).toBe(2);
+		expect(results.flatMap((r) => (r.ok ? r.filed : []))).toEqual([
+			cards[0]!.id,
+		]);
+		expect(first.scheduled() + second.scheduled()).toBe(1);
+		expect(
+			(await a.store.events()).map((e) => ({
+				taskId: e.taskId,
+				kind: e.kind,
+				to: e.to,
+			})),
+		).toEqual([
+			{ taskId: cards[0]!.id, kind: "create", to: "todo" },
+			{ taskId: cards[0]!.id, kind: "state", to: "queued" },
+		]);
+	});
+
+	for (const change of ["settings", "verdicts"] as const)
+		test(`a concurrent ${change} change prevents a stale scout`, async () => {
+			const a = await project();
+			const reached = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const h = harness({
+				projects: [a],
+				fake: {
+					respond: async (url) => {
+						if (url === `${API}/repos/${UNION[0]}`) {
+							reached.resolve();
+							await release.promise;
+						}
+						return undefined;
+					},
+				},
+			});
+			const scan = h.scanner.scanNow();
+			await reached.promise;
+			if (change === "settings")
+				await a.store.setSettings({ trendingScout: false });
+			else
+				for (const repo of UNION)
+					await a.store.saveTrendingVerdict(verdict(repo, "no_fit", "no"));
+			release.resolve();
+			expect(await scan).toEqual({ ok: true, filed: [] });
+			expect(await scouts(a)).toEqual([]);
+			expect(await a.store.events()).toEqual([]);
+			expect(h.scheduled()).toBe(0);
+		});
+
+	test("final global persistence preserves a concurrent weekly state update", async () => {
+		const a = await project();
+		const globalStore = await GlobalStore.open(
+			mkdtempSync(join(root, "global-")),
+		);
+		try {
+			const reached = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const at = 42;
+			const h = harness({
+				projects: [a],
+				globalStore,
+				now: () => at,
+				fake: {
+					respond: async (url) => {
+						if (url === ALL_URL) {
+							reached.resolve();
+							await release.promise;
+						}
+						return undefined;
+					},
+				},
+			});
+			const scan = h.scanner.scanNow();
+			await reached.promise;
+			await globalStore.update<TrendingState>("trending", () => ({
+				...EMPTY_TRENDING_STATE,
+				lastWeek: "2026-W46",
+				firstFailAt: 7,
+			}));
+			release.resolve();
+			const result = await scan;
+			expect(result.ok).toBe(true);
+			expect(await globalStore.get<TrendingState>("trending")).toEqual({
+				lastWeek: "2026-W46",
+				firstFailAt: 7,
+				lastRunAt: at,
+				lastError: null,
+			});
+			const cards = await scouts(a);
+			expect(cards).toHaveLength(1);
+			expect((await a.store.events()).map((event) => event.kind)).toEqual([
+				"create",
+				"state",
+			]);
+		} finally {
+			await globalStore.close();
+		}
 	});
 });
 
 describe("verdict memory", () => {
 	test("final verdicts never return, deferred ones do, per project", async () => {
-		const a = project();
-		const b = project();
-		a.store.saveTrendingVerdict(
+		const a = await project();
+		const b = await project();
+		await a.store.saveTrendingVerdict(
 			verdict("thedotmack/claude-mem", "filed", "good fit"),
 		);
-		a.store.saveTrendingVerdict(
+		await a.store.saveTrendingVerdict(
 			verdict("pingdotgg/t3code", "no_fit", "too big", true),
 		);
-		a.store.saveTrendingVerdict(
+		await a.store.saveTrendingVerdict(
 			verdict("garrytan/gstack", "deferred", "revisit"),
 		);
-		a.store.saveTrendingVerdict(verdict("old/repo", "deferred", "not yet"));
+		await a.store.saveTrendingVerdict(
+			verdict("old/repo", "deferred", "not yet"),
+		);
 		const h = harness({ projects: [a, b] });
 		expect((await h.scanner.scanNow()).ok).toBe(true);
 
@@ -421,12 +557,12 @@ describe("verdict memory", () => {
 	});
 
 	test("a project whose every repo is judged gets no card", async () => {
-		const a = project();
+		const a = await project();
 		for (const r of UNION)
-			a.store.saveTrendingVerdict(verdict(r, "no_fit", "no"));
+			await a.store.saveTrendingVerdict(verdict(r, "no_fit", "no"));
 		const h = harness({ projects: [a] });
 		expect(await h.scanner.scanNow()).toEqual({ ok: true, filed: [] });
-		expect(scouts(a)).toHaveLength(0);
+		expect(await scouts(a)).toHaveLength(0);
 		expect(h.scheduled()).toBe(0);
 	});
 });
@@ -445,39 +581,39 @@ describe("weekly schedule", () => {
 	});
 
 	test("fires on the first tick at or after Monday 06:00, once per week", async () => {
-		const a = project();
+		const a = await project();
 		let t = monday - 60_000;
 		const state = { value: { ...EMPTY_TRENDING_STATE } };
 		const h = harness({ projects: [a], now: () => t, state });
 		await h.scanner.tick();
-		expect(scouts(a)).toHaveLength(0);
+		expect(await scouts(a)).toHaveLength(0);
 		expect(h.fake.calls).toHaveLength(0);
 		t = monday;
 		await h.scanner.tick();
-		expect(scouts(a)).toHaveLength(1);
+		expect(await scouts(a)).toHaveLength(1);
 		expect(state.value.lastWeek).toBe("2026-W46");
 		expect(state.value.lastRunAt).toBe(monday);
-		closeScouts(a);
+		await closeScouts(a);
 		t = monday + 5 * 60_000;
 		await h.scanner.tick();
 		// A restart reads the persisted state: still no second run this week.
 		const again = harness({ projects: [a], now: () => wednesday, state });
 		await again.scanner.tick();
-		expect(scouts(a)).toHaveLength(1);
+		expect(await scouts(a)).toHaveLength(1);
 		expect(again.fake.calls).toHaveLength(0);
 	});
 
 	test("a board down at the slot catches up later the same week", async () => {
-		const a = project();
+		const a = await project();
 		const state = { value: { ...EMPTY_TRENDING_STATE } };
 		const h = harness({ projects: [a], now: () => wednesday, state });
 		await h.scanner.tick();
-		expect(scouts(a)).toHaveLength(1);
+		expect(await scouts(a)).toHaveLength(1);
 		expect(state.value.lastWeek).toBe("2026-W46");
 	});
 
 	test("disabled or no opted-in project is a no-op", async () => {
-		const a = project();
+		const a = await project();
 		const off = harness({
 			projects: [a],
 			now: () => monday,
@@ -485,7 +621,7 @@ describe("weekly schedule", () => {
 		});
 		await off.scanner.tick();
 		const none = harness({
-			projects: [project({ trendingScout: false })],
+			projects: [await project({ trendingScout: false })],
 			now: () => monday,
 		});
 		await none.scanner.tick();
@@ -495,22 +631,22 @@ describe("weekly schedule", () => {
 	});
 
 	test("a manual scan does not consume the week's slot", async () => {
-		const a = project();
+		const a = await project();
 		let t = sundayBefore;
 		const state = { value: { ...EMPTY_TRENDING_STATE } };
 		const h = harness({ projects: [a], now: () => t, state });
 		expect((await h.scanner.scanNow()).ok).toBe(true);
 		expect(state.value.lastWeek).toBeNull();
 		expect(state.value.lastRunAt).toBe(sundayBefore);
-		closeScouts(a);
+		await closeScouts(a);
 		t = monday;
 		await h.scanner.tick();
-		expect(scouts(a)).toHaveLength(2);
+		expect(await scouts(a)).toHaveLength(2);
 		expect(state.value.lastWeek).toBe("2026-W46");
 	});
 
 	test("a failure retries for 24h, then waits for next week", async () => {
-		const a = project();
+		const a = await project();
 		let t = monday;
 		let broken = true;
 		const state = { value: { ...EMPTY_TRENDING_STATE } };
@@ -544,10 +680,10 @@ describe("weekly schedule", () => {
 		t = wednesday;
 		await h.scanner.tick();
 		expect(pageCalls()).toBe(2);
-		expect(scouts(a)).toHaveLength(0);
+		expect(await scouts(a)).toHaveLength(0);
 		t = nextMonday;
 		await h.scanner.tick();
-		expect(scouts(a)).toHaveLength(1);
+		expect(await scouts(a)).toHaveLength(1);
 		expect(state.value).toMatchObject({
 			lastWeek: "2026-W47",
 			lastRunAt: nextMonday,
@@ -557,7 +693,7 @@ describe("weekly schedule", () => {
 	});
 
 	test("a failure streak from last week does not stop this week's run", async () => {
-		const a = project();
+		const a = await project();
 		const state = {
 			value: {
 				...EMPTY_TRENDING_STATE,
@@ -567,7 +703,7 @@ describe("weekly schedule", () => {
 		};
 		const h = harness({ projects: [a], now: () => wednesday, state });
 		await h.scanner.tick();
-		expect(scouts(a)).toHaveLength(1);
+		expect(await scouts(a)).toHaveLength(1);
 		expect(state.value.lastError).toBeNull();
 	});
 });

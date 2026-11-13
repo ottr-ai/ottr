@@ -3,7 +3,7 @@ import { writeBelow } from "./confine.ts";
 import { withGithubRetry } from "./githubRetry.ts";
 import { trendingScoutPrompt } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
-import type { ListedTask, TrendingStatus } from "./types.ts";
+import type { ListedTask, TrendingStatus, TrendingVerdict } from "./types.ts";
 
 // Weekly GitHub trending pages the scan reads; their union is the week's candidate pool.
 export const TRENDING_PAGES: readonly string[] = [
@@ -145,14 +145,12 @@ function errText(e: unknown): string {
 }
 
 /** A live scout card blocks another scan for its project: not cancelled and not done. */
-function liveScout(store: ProjectStore): ListedTask | null {
+async function liveScout(store: ProjectStore): Promise<ListedTask | null> {
 	return (
-		store
-			.listTasks()
-			.find(
-				(t) =>
-					t.kind === "trending" && t.cancelledAt === null && t.stage !== "done",
-			) ?? null
+		(await store.listTasks()).find(
+			(t) =>
+				t.kind === "trending" && t.cancelledAt === null && t.stage !== "done",
+		) ?? null
 	);
 }
 
@@ -187,8 +185,10 @@ const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 export function createTrendingScanner(deps: {
 	projects: () => Iterable<TrendingProject>;
 	enabled: () => boolean;
-	load: () => TrendingState;
-	save: (s: TrendingState) => void;
+	load: () => Promise<TrendingState>;
+	update: (
+		modify: (current: TrendingState) => TrendingState,
+	) => Promise<TrendingState>;
 	token: () => string | undefined;
 	apiBase?: () => string;
 	fetch?: typeof fetch;
@@ -201,7 +201,7 @@ export function createTrendingScanner(deps: {
 		| { ok: true; filed: string[] }
 		| { ok: false; status: 409 | 502; error: string }
 	>;
-	status(): TrendingStatus;
+	status(): Promise<TrendingStatus>;
 } {
 	const doFetch = withGithubRetry(deps.fetch ?? fetch);
 	const now = deps.now ?? Date.now;
@@ -209,10 +209,13 @@ export function createTrendingScanner(deps: {
 	let inFlight = false;
 
 	// Fresh iteration per call: a one-shot iterator would be empty on the next tick.
-	const optedIn = (): TrendingProject[] =>
-		[...deps.projects()].filter(
-			(p) => p.store.getSettings().trendingScout === true,
-		);
+	const optedIn = async (): Promise<TrendingProject[]> => {
+		const projects: TrendingProject[] = [];
+		for (const project of deps.projects())
+			if ((await project.store.getSettings()).trendingScout === true)
+				projects.push(project);
+		return projects;
+	};
 
 	async function fetchPage(url: string): Promise<string[]> {
 		let res: Response;
@@ -372,11 +375,11 @@ export function createTrendingScanner(deps: {
 	}
 
 	/** One project's picks and hints from the trending repos and its past verdicts. */
-	function planFor(
+	async function planFor(
 		p: TrendingProject,
 		trending: string[],
 		seen: Set<string>,
-	): {
+	): Promise<{
 		project: TrendingProject;
 		picks: {
 			repo: string;
@@ -384,8 +387,9 @@ export function createTrendingScanner(deps: {
 			earlierReason: string | null;
 		}[];
 		hints: { repo: string; reason: string }[];
-	} {
-		const verdicts = p.store.listTrendingVerdicts();
+		verdicts: TrendingVerdict[];
+	}> {
+		const verdicts = await p.store.listTrendingVerdicts();
 		const byRepo = new Map(verdicts.map((v) => [v.repo.toLowerCase(), v]));
 		const picks: {
 			repo: string;
@@ -410,11 +414,11 @@ export function createTrendingScanner(deps: {
 		const hints = verdicts
 			.filter((v) => v.verdict === "no_fit" && v.rejectedByUser)
 			.map((v) => ({ repo: v.repo, reason: v.reason }));
-		return { project: p, picks, hints };
+		return { project: p, picks, hints, verdicts };
 	}
 
 	/** Writes the bundle and files the scout card; null when the project has no candidates. */
-	function fileScoutCard(
+	async function fileScoutCard(
 		project: TrendingProject,
 		candidates: (RepoLookup & {
 			trendingNow: boolean;
@@ -422,7 +426,8 @@ export function createTrendingScanner(deps: {
 		})[],
 		hints: { repo: string; reason: string }[],
 		startedAt: number,
-	): string | null {
+		verdicts: TrendingVerdict[],
+	): Promise<string | null> {
 		if (candidates.length === 0) {
 			deps.log(`trending: ${project.name}: no new candidates, no card`);
 			return null;
@@ -450,24 +455,36 @@ export function createTrendingScanner(deps: {
 				2,
 			),
 		);
-		const task = project.store.createTask(
-			trendingScoutPrompt({
-				project: project.name,
-				repo: project.github,
-				bundlePath,
-				candidates: candidates.length,
-				cap: TRENDING_CAP,
-				maxDeep: DEEP_REPOS,
-				maxFiles: DEEP_FILES,
-			}),
-			null,
-			"trending",
-		);
-		project.store.updateTask(task.id, {
-			title: `Trending scout: ${localDate(startedAt)}`,
-			promptAuthor: "board",
-			topic: "trending scout",
+		const store = project.store;
+		const task = await store.transaction(async () => {
+			if (
+				(await store.getSettings()).trendingScout !== true ||
+				(await liveScout(store)) !== null ||
+				JSON.stringify(await store.listTrendingVerdicts()) !==
+					JSON.stringify(verdicts)
+			)
+				return null;
+			const created = await store.createTask(
+				trendingScoutPrompt({
+					project: project.name,
+					repo: project.github,
+					bundlePath,
+					candidates: candidates.length,
+					cap: TRENDING_CAP,
+					maxDeep: DEEP_REPOS,
+					maxFiles: DEEP_FILES,
+				}),
+				null,
+				"trending",
+			);
+			await store.updateTask(created.id, {
+				title: `Trending scout: ${localDate(startedAt)}`,
+				promptAuthor: "board",
+				topic: "trending scout",
+			});
+			return created;
 		});
+		if (task === null) return null;
 		deps.log(
 			`trending: ${project.name}: filed scout card ${task.id} with ${candidates.length} candidate(s)`,
 		);
@@ -489,15 +506,19 @@ export function createTrendingScanner(deps: {
 	}
 
 	/** Projects with no open scout card; open ones are logged. */
-	function eligibleProjects(projects: TrendingProject[]): TrendingProject[] {
-		return projects.filter((p) => {
-			const live = liveScout(p.store);
+	async function eligibleProjects(
+		projects: TrendingProject[],
+	): Promise<TrendingProject[]> {
+		const eligible: TrendingProject[] = [];
+		for (const p of projects) {
+			const live = await liveScout(p.store);
 			if (live)
 				deps.log(
 					`trending: ${p.name}: skipped, scout card ${live.id} is still open`,
 				);
-			return live === null;
-		});
+			else eligible.push(p);
+		}
+		return eligible;
 	}
 
 	/** A pick's lookup, with its trending flags; skipped or failed lookups drop out. */
@@ -544,26 +565,30 @@ export function createTrendingScanner(deps: {
 	 */
 	async function scan(projects: TrendingProject[]): Promise<string[]> {
 		const startedAt = now();
-		const eligible = eligibleProjects(projects);
+		const eligible = await eligibleProjects(projects);
 		if (eligible.length === 0) return [];
 
 		const pages = await Promise.all(TRENDING_PAGES.map(fetchPage));
 		const { trending, seen } = mergeTrending(pages);
 
 		// Per project: trending repos without a final verdict, then every deferred repo.
-		const plans = eligible.map((p) => planFor(p, trending, seen));
+		const plans = await Promise.all(
+			eligible.map((p) => planFor(p, trending, seen)),
+		);
 
 		const facts = await lookupFacts([
 			...new Set(plans.flatMap((pl) => pl.picks.map((x) => x.repo))),
 		]);
 
 		const filed: string[] = [];
-		for (const { project, picks, hints } of plans) {
-			const id = fileScoutCard(
+		for (const { project } of plans) {
+			const { picks, hints, verdicts } = await planFor(project, trending, seen);
+			const id = await fileScoutCard(
 				project,
 				candidatesFor(picks, facts),
 				hints,
 				startedAt,
+				verdicts,
 			);
 			if (id !== null) filed.push(id);
 		}
@@ -576,54 +601,65 @@ export function createTrendingScanner(deps: {
 		projects: TrendingProject[],
 		week: ((s: TrendingState, ok: boolean, at: number) => TrendingState) | null,
 	): Promise<{ ok: true; filed: string[] } | { ok: false; error: string }> {
-		inFlight = true;
+		// The caller holds the instance guard across every awaited read and effect.
 		try {
 			const filed = await scan(projects);
 			const at = now();
-			const s: TrendingState = {
-				...deps.load(),
-				lastRunAt: at,
-				lastError: null,
-			};
-			deps.save(week ? week(s, true, at) : s);
+			await deps.update((current) => {
+				const s: TrendingState = {
+					...current,
+					lastRunAt: at,
+					lastError: null,
+				};
+				return week ? week(s, true, at) : s;
+			});
 			return { ok: true, filed };
 		} catch (e) {
 			const reason = errText(e).slice(0, 500);
 			const at = now();
 			deps.log(`trending: scan failed: ${reason}`);
-			const s: TrendingState = { ...deps.load(), lastError: { reason, at } };
-			deps.save(week ? week(s, false, at) : s);
+			await deps.update((current) => {
+				const s: TrendingState = { ...current, lastError: { reason, at } };
+				return week ? week(s, false, at) : s;
+			});
 			return { ok: false, error: reason };
-		} finally {
-			inFlight = false;
 		}
 	}
 
 	async function tick(): Promise<void> {
 		if (inFlight || !deps.enabled()) return;
-		const projects = optedIn();
-		if (projects.length === 0) return;
-		const t = now();
-		const thisWeek = isoWeekKey(t);
-		const state = deps.load();
-		if (state.lastWeek === thisWeek || t < weeklySlot(t)) return;
-		// A failure streak from an earlier week does not count against this one.
-		const firstFailAt =
-			state.firstFailAt !== null && isoWeekKey(state.firstFailAt) === thisWeek
-				? state.firstFailAt
-				: null;
-		if (firstFailAt !== null && t >= firstFailAt + DAY_MS) {
-			deps.log(
-				`trending: giving up on ${thisWeek} after 24h of failures, next try next week`,
+		inFlight = true;
+		try {
+			const projects = await optedIn();
+			if (projects.length === 0) return;
+			const t = now();
+			const thisWeek = isoWeekKey(t);
+			const state = await deps.load();
+			if (state.lastWeek === thisWeek || t < weeklySlot(t)) return;
+			// A failure streak from an earlier week does not count against this one.
+			const firstFailAt =
+				state.firstFailAt !== null && isoWeekKey(state.firstFailAt) === thisWeek
+					? state.firstFailAt
+					: null;
+			if (firstFailAt !== null && t >= firstFailAt + DAY_MS) {
+				deps.log(
+					`trending: giving up on ${thisWeek} after 24h of failures, next try next week`,
+				);
+				await deps.update((current) => ({
+					...current,
+					lastWeek: thisWeek,
+					firstFailAt: null,
+				}));
+				return;
+			}
+			await attempt(projects, (s, ok, at) =>
+				ok
+					? { ...s, lastWeek: thisWeek, firstFailAt: null }
+					: { ...s, firstFailAt: firstFailAt ?? at },
 			);
-			deps.save({ ...state, lastWeek: thisWeek, firstFailAt: null });
-			return;
+		} finally {
+			inFlight = false;
 		}
-		await attempt(projects, (s, ok, at) =>
-			ok
-				? { ...s, lastWeek: thisWeek, firstFailAt: null }
-				: { ...s, firstFailAt: firstFailAt ?? at },
-		);
 	}
 
 	async function scanNow(): Promise<
@@ -636,32 +672,37 @@ export function createTrendingScanner(deps: {
 				status: 409,
 				error: "a trending scan is already running",
 			};
-		const projects = optedIn();
-		if (projects.length === 0)
-			return {
-				ok: false,
-				status: 409,
-				error: "no project has the trending scout on",
-			};
-		for (const p of deps.projects()) {
-			const live = liveScout(p.store);
-			if (live)
+		inFlight = true;
+		try {
+			const projects = await optedIn();
+			if (projects.length === 0)
 				return {
 					ok: false,
 					status: 409,
-					error: `a trending scout card is still open: ${live.id}`,
+					error: "no project has the trending scout on",
 				};
+			for (const p of deps.projects()) {
+				const live = await liveScout(p.store);
+				if (live)
+					return {
+						ok: false,
+						status: 409,
+						error: `a trending scout card is still open: ${live.id}`,
+					};
+			}
+			const r = await attempt(projects, null);
+			return r.ok ? r : { ok: false, status: 502, error: r.error };
+		} finally {
+			inFlight = false;
 		}
-		const r = await attempt(projects, null);
-		return r.ok ? r : { ok: false, status: 502, error: r.error };
 	}
 
-	function status(): TrendingStatus {
-		const s = deps.load();
+	async function status(): Promise<TrendingStatus> {
+		const s = await deps.load();
 		let running = inFlight;
 		if (!running)
 			for (const p of deps.projects())
-				if (liveScout(p.store)) {
+				if (await liveScout(p.store)) {
 					running = true;
 					break;
 				}

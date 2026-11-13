@@ -19,7 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Server } from "bun";
-import { createApp, type Entry } from "./app.ts";
+import { type App, createApp, type Entry } from "./app.ts";
 import { NonceCache, signIdentity, verifyIdentity } from "./auth.ts";
 import { GlobalStore } from "./globalStore.ts";
 import {
@@ -102,7 +102,8 @@ const CHECK_USAGE: TokenUsage = {
 
 const root = mkdtempSync(join(tmpdir(), "hosted-e2e-"));
 const servers: Server<undefined>[] = [];
-const stores: { close(): void }[] = [];
+const apps: App[] = [];
+const stores: { close(): Promise<void> }[] = [];
 
 /** Ordered trace across the control plane and the fake omp: proves credit came before any run. */
 const trace: string[] = [];
@@ -124,7 +125,7 @@ interface ControlPlane {
 /** How a fake control plane answers: the credit check and a hook on each metering record. */
 interface ControlPolicy {
 	/** The credit answer for the `calls`-th check (1-based). */
-	credit(calls: number): boolean;
+	credit(calls: number): boolean | Promise<boolean>;
 	onMetering?(record: MeteringRecord): void;
 }
 
@@ -179,7 +180,7 @@ function startControlPlane(
 			if (req.method === "GET" && path === `${base}/credit`) {
 				cp.creditCalls += 1;
 				trace.push(`credit#${cp.creditCalls}`);
-				const ok = policy.credit(cp.creditCalls);
+				const ok = await policy.credit(cp.creditCalls);
 				queueMicrotask(wake);
 				return Response.json({ ok });
 			}
@@ -495,20 +496,20 @@ function makeRepo(dir: string): void {
 
 /** createTurnLoop + createApp with the hosted deps, after src/server.ts's wiring. `name` is the
  * project folder; `startRun` replaces the real runner with the plain fake launcher. */
-function mountBoard(
+async function mountBoard(
 	hosted: Hosted,
 	o: {
 		name?: string;
 		maxTotalRuns?: number;
 		startRun?: TurnOps["startRun"];
 	} = {},
-): Board {
+): Promise<Board> {
 	const name = o.name ?? "app";
-	const g = GlobalStore.open(join(root, `global-${name}`));
+	const g = await GlobalStore.open(join(root, `global-${name}`));
 	stores.push(g);
 	const projectDir = join(root, name);
 	makeRepo(projectDir);
-	const store = ProjectStore.open(projectDir);
+	const store = await ProjectStore.open(projectDir);
 	stores.push(store);
 	const projects = new Map<string, Entry>();
 	projects.set(store.name, {
@@ -628,7 +629,7 @@ function mountBoard(
 	const serverRef: { current: Server<undefined> | undefined } = {
 		current: undefined,
 	};
-	const app = createApp({
+	const app = await createApp({
 		gstore: g,
 		defaultDir: root,
 		projects,
@@ -648,6 +649,7 @@ function mountBoard(
 		vmTokens,
 		hosted,
 	});
+	apps.push(app);
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
 	serverRef.current = srv;
 	servers.push(srv);
@@ -685,7 +687,7 @@ function proxyFetch(
 	});
 }
 
-beforeAll(() => {
+beforeAll(async () => {
 	cp = startControlPlane();
 	const config = readHostedConfig({
 		OTTR_HOSTED: "1",
@@ -695,16 +697,17 @@ beforeAll(() => {
 	});
 	if (config === null) throw new Error("hosted config did not parse");
 	const hookLogs: string[] = [];
-	board = mountBoard({
+	board = await mountBoard({
 		config,
 		hooks: controlPlaneHooks(config, { log: (m) => hookLogs.push(m) }),
 	});
 	board.logs = hookLogs;
 });
 
-afterAll(() => {
+afterAll(async () => {
 	for (const s of servers) s.stop(true);
-	for (const s of stores) s.close();
+	for (const app of apps) await app.close();
+	for (const s of stores) await s.close();
 	// createApp installs the hosted git credential resolver process-wide: leave none behind.
 	setHostedGitAuth(null);
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
@@ -713,11 +716,11 @@ afterAll(() => {
 /** Bounded wait for a store fact that no event exposes (the turn loop has no settle signal). */
 async function eventually(
 	what: string,
-	done: () => boolean,
+	done: () => boolean | Promise<boolean>,
 	ms = 10_000,
 ): Promise<void> {
 	const deadline = Date.now() + ms;
-	while (!done()) {
+	while (!(await done())) {
 		if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
 		await Bun.sleep(10);
 	}
@@ -744,10 +747,12 @@ describe("hosted mode end to end", () => {
 			{ body: { prompt: WORK_PROMPT, backlog: true } },
 		);
 		expect(created.status).toBe(200);
-		const task = board.store.listTasks().find((t) => t.prompt === WORK_PROMPT);
+		const task = (await board.store.listTasks()).find(
+			(t) => t.prompt === WORK_PROMPT,
+		);
 		expect(task).toBeDefined();
 		const id = task!.id;
-		expect(board.store.getTask(id)!.stage).toBe("backlog");
+		expect((await board.store.getTask(id))!.stage).toBe("backlog");
 		expect(cp.creditCalls).toBe(0);
 
 		// Start it the way the board's "move to todo" does; the route ticks the scheduler.
@@ -763,17 +768,17 @@ describe("hosted mode end to end", () => {
 		await cp.creditCount(2);
 		await eventually(
 			"the merge turn to park at the credit gate",
-			() => board.store.getTask(id)!.state === "needs_you",
+			async () => (await board.store.getTask(id))!.state === "needs_you",
 		);
 
-		const card = board.store.getTask(id)!;
+		const card = (await board.store.getTask(id))!;
 		expect(card.stage).toBe("merging");
 		expect(card.needsReason).toBe(DEFAULT_CREDIT_REASON);
 		expect(card.workCheckLog.map((r) => r.outcome)).toEqual(["pass"]);
 		expect(card.workCheckLog[0]!.model).toBe(CHECK_MODEL);
 
 		// Exactly one turn ran (the merge turn never got past the gate), with two agent runs.
-		const turns = board.store.listTurns(id);
+		const turns = await board.store.listTurns(id);
 		expect(turns).toHaveLength(1);
 		expect(launches).toHaveLength(2);
 		expect(launches[0]!.prompt).toContain(WORK_PROMPT);
@@ -877,9 +882,9 @@ describe("hosted mode end to end", () => {
 			identity: once,
 		});
 		expect(filed.status).toBe(401);
-		expect(board.store.listTasks().some((t) => t.prompt === prompt)).toBe(
-			false,
-		);
+		expect(
+			(await board.store.listTasks()).some((t) => t.prompt === prompt),
+		).toBe(false);
 	});
 });
 
@@ -902,12 +907,12 @@ describe("hosted credit stop and release end to end", () => {
 	const mergeClaimed = (t: { state: string; stage: string }) =>
 		t.state === "preparing" && t.stage === "merging";
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		cp2 = startControlPlane({
 			// The harness wires no merge gates, so a merge turn never gets credit: a finished work
 			// turn parks in the merge column, as in the first scenario.
-			credit: () =>
-				balance() > 0 && !board2.store.listTasks().some(mergeClaimed),
+			credit: async () =>
+				balance() > 0 && !(await board2.store.listTasks()).some(mergeClaimed),
 			onMetering: (r) => {
 				const key = JSON.stringify(runKey(r));
 				spent.set(key, Math.max(spent.get(key) ?? 0, r.usage.cost));
@@ -929,7 +934,7 @@ describe("hosted credit stop and release end to end", () => {
 		});
 		if (config === null) throw new Error("hosted config did not parse");
 		const hookLogs: string[] = [];
-		board2 = mountBoard(
+		board2 = await mountBoard(
 			{
 				config,
 				hooks: controlPlaneHooks(config, { log: (m) => hookLogs.push(m) }),
@@ -969,7 +974,7 @@ describe("hosted credit stop and release end to end", () => {
 				to: board2,
 			});
 			expect(res.status).toBe(200);
-			return store.listTasks().find((t) => t.prompt === prompt)!.id;
+			return (await store.listTasks()).find((t) => t.prompt === prompt)!.id;
 		};
 
 		// Card A runs. Its first interim record empties the balance, and the control plane
@@ -985,15 +990,15 @@ describe("hosted credit stop and release end to end", () => {
 
 		await eventually(
 			"card A to park",
-			() => store.getTask(a)!.state === "needs_you",
+			async () => (await store.getTask(a))!.state === "needs_you",
 		);
-		const parked = store.getTask(a)!;
+		const parked = (await store.getTask(a))!;
 		expect(parked.needsReason).toBe(DEFAULT_CREDIT_REASON);
 		expect(parked.sessionId).toBe(STOP_SESSION);
 		const wt = parked.worktree!;
 		expect(wt).toBe(stopLaunches[0]!.cwd);
 		expect(gitSync(wt, "status", "--porcelain")).toContain("?? wip.txt");
-		expect(store.listTurns(a).map((t) => t.error)).toEqual(["stopped"]);
+		expect((await store.listTurns(a)).map((t) => t.error)).toEqual(["stopped"]);
 
 		// The interim record that emptied the balance and the stopped run's final record name
 		// the same run.
@@ -1009,17 +1014,17 @@ describe("hosted credit stop and release end to end", () => {
 		expect(stopRecords[0]).toMatchObject({
 			role: "default",
 			run: 0,
-			turnId: store.listTurns(a)[0]!.id,
+			turnId: (await store.listTurns(a))[0]!.id,
 		});
 
 		// Card B: the gate finds no credit, and the card parks before any run.
 		const b = await file("Card B: add a second file");
 		await eventually(
 			"card B to park at the gate",
-			() => store.getTask(b)!.state === "needs_you",
+			async () => (await store.getTask(b))!.state === "needs_you",
 		);
-		expect(store.getTask(b)!.needsReason).toBe(DEFAULT_CREDIT_REASON);
-		expect(store.getTask(b)!.worktree).toBeNull();
+		expect((await store.getTask(b))!.needsReason).toBe(DEFAULT_CREDIT_REASON);
+		expect((await store.getTask(b))!.worktree).toBeNull();
 		expect(stopLaunches).toHaveLength(1);
 
 		// Top-up, then the control plane releases the board.
@@ -1035,11 +1040,10 @@ describe("hosted credit stop and release end to end", () => {
 		// Both cards finish their work turn, and each parks at its merge turn's gate.
 		await eventually(
 			"both work turns to finish",
-			() =>
-				[a, b].every((id) => {
-					const t = store.getTask(id)!;
-					return t.stage === "merging" && t.state === "needs_you";
-				}),
+			async () =>
+				(await Promise.all([a, b].map((id) => store.getTask(id)))).every(
+					(t) => t!.stage === "merging" && t!.state === "needs_you",
+				),
 			30_000,
 		);
 
@@ -1052,7 +1056,7 @@ describe("hosted credit stop and release end to end", () => {
 			wipAtStart: true,
 			isCheck: false,
 		});
-		const doneA = store.getTask(a)!;
+		const doneA = (await store.getTask(a))!;
 		expect(doneA.sessionId).toBe(STOP_SESSION);
 		expect(doneA.worktree).toBe(wt);
 		expect(doneA.needsReason).toBe(DEFAULT_CREDIT_REASON);
@@ -1060,10 +1064,10 @@ describe("hosted credit stop and release end to end", () => {
 		expect(
 			gitSync(wt, "show", "--name-only", "--format=", "HEAD").split("\n"),
 		).toContain("wip.txt");
-		expect(store.listTurns(a).map((t) => t.error)[0]).toBe("stopped");
+		expect((await store.listTurns(a)).map((t) => t.error)[0]).toBe("stopped");
 
 		// B, released from the gate, ran its first work turn from a fresh session.
-		const doneB = store.getTask(b)!;
+		const doneB = (await store.getTask(b))!;
 		expect(doneB.workCheckLog.map((r) => r.outcome)).toEqual(["pass"]);
 		expect(
 			stopLaunches.filter((l) => l.cwd === doneB.worktree && !l.isCheck),

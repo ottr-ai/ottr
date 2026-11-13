@@ -15,6 +15,7 @@ import { singleFlightTick } from "./singleFlight.ts";
 import type { ProjectStore } from "./store.ts";
 import type {
 	ForkAnalysisResult,
+	ForkBranchState,
 	ForkCommit,
 	ForkHoldState,
 	ForkInfo,
@@ -641,11 +642,11 @@ export interface ForkProject {
 const capStrings = (a: string[]) => a.slice(0, 50).map((s) => s.slice(0, 200));
 
 /** Prior fork-research titles and declines the model should not repeat. */
-function buildPrior(store: ProjectStore): {
+async function buildPrior(store: ProjectStore): Promise<{
 	titles: string[];
 	declines: string[];
-} {
-	const tasks = store.listTasks();
+}> {
+	const tasks = await store.listTasks();
 	const byId = new Map(tasks.map((t) => [t.id, t]));
 	const titles: string[] = [];
 	const declines: string[] = [];
@@ -661,16 +662,71 @@ function buildPrior(store: ProjectStore): {
 }
 
 /** Open held proposals from retros and fork research; the board caps these at 3. */
-function openProposals(store: ProjectStore): number {
-	return store
-		.listTasks()
-		.filter(
-			(x) =>
-				!x.cancelledAt &&
-				x.state === "needs_you" &&
-				isProposalReason(x.needsReason) &&
-				store.listTurns(x.id).length === 0,
-		).length;
+async function openProposals(store: ProjectStore): Promise<number> {
+	let count = 0;
+	for (const task of await store.listTasks()) {
+		if (
+			!task.cancelledAt &&
+			task.state === "needs_you" &&
+			isProposalReason(task.needsReason) &&
+			(await store.listTurns(task.id)).length === 0
+		)
+			count++;
+	}
+	return count;
+}
+
+function holdKey(holds: ForkHoldState[]): string {
+	return JSON.stringify(
+		holds
+			.map((h) =>
+				JSON.stringify([h.branchHash, h.sha, h.pr, h.prHead, h.released]),
+			)
+			.sort(),
+	);
+}
+
+type ForkSnapshot = {
+	rows: ForkBranchState[];
+	holds: ForkHoldState[];
+	bases: Map<string, string | null>;
+};
+
+async function readFork(
+	store: ProjectStore,
+	forkId: number,
+): Promise<ForkSnapshot> {
+	return store.transaction(async () => {
+		const rows = await store.listForkBranches(forkId);
+		const holds = await store.listForkHolds(forkId);
+		const bases = new Map<string, string | null>();
+		for (const row of rows) {
+			bases.set(
+				row.branchHash,
+				await store.legacyForkHoldBase(forkId, row.branchHash),
+			);
+		}
+		return { rows, holds, bases };
+	});
+}
+
+/** Call only inside a database transaction. External facts belong to this snapshot. */
+async function unchangedFork(
+	store: ProjectStore,
+	forkId: number,
+	snapshot: ForkSnapshot,
+): Promise<boolean> {
+	if (!(await store.getSettings()).forkResearch) return false;
+	const current = await readFork(store, forkId);
+	return (
+		JSON.stringify(current.rows) === JSON.stringify(snapshot.rows) &&
+		holdKey(current.holds) === holdKey(snapshot.holds) &&
+		snapshot.rows.every(
+			(row) =>
+				current.bases.get(row.branchHash) ===
+				snapshot.bases.get(row.branchHash),
+		)
+	);
 }
 
 export function createForkWatcher(deps: {
@@ -699,10 +755,21 @@ export function createForkWatcher(deps: {
 		for (const project of deps.projects()) {
 			if (manual !== undefined && project.name !== manual) continue;
 			const store = project.store;
-			if (store.getSettings().forkResearch !== true || project.github === null)
+			if (
+				(await store.getSettings()).forkResearch !== true ||
+				project.github === null
+			)
 				continue;
 			const repo =
 				ownerRepo(`https://github.com/${project.github}.git`) ?? project.github;
+			const beforeScan = await store.transaction(async () => {
+				const snapshots = new Map<number, ForkSnapshot>();
+				for (const row of await store.listAllForkBranches()) {
+					if (!snapshots.has(row.forkId))
+						snapshots.set(row.forkId, await readFork(store, row.forkId));
+				}
+				return snapshots;
+			});
 			let forks: ForkInfo[];
 			try {
 				forks = await listForks(repo, gh);
@@ -712,6 +779,7 @@ export function createForkWatcher(deps: {
 			}
 			const forkIds = forks.map((f) => f.id);
 			for (const fork of forks) {
+				const observed = await readFork(store, fork.id);
 				// Neutral cwd (server-only state dir, OTTR_SERVER_DATA_DIR): ls-remote carries GH_TOKEN
 				// via gitEnv, so it must not read a worker-writable repo config (planted credential.helper).
 				const { heads, skipped } = await listBranchHeads(
@@ -723,44 +791,58 @@ export function createForkWatcher(deps: {
 					deps.log(
 						`forks: ${fork.owner}/${fork.name}: skipped ${skipped} branch name(s) git rejects`,
 					);
-				const rows = store
-					.listAllForkBranches()
-					.filter((r) => r.forkId === fork.id);
-				const byHash = new Map(rows.map((r) => [r.branchHash, r]));
-				for (const [branch, sha] of heads) {
-					const bh = branchHash(branch);
-					const row = byHash.get(bh);
-					if (!row) {
-						store.saveForkBranch({
-							forkId: fork.id,
-							branchHash: bh,
-							branch,
+				await store.transaction(async () => {
+					if (!(await unchangedFork(store, fork.id, observed))) return;
+					const byHash = new Map(observed.rows.map((r) => [r.branchHash, r]));
+					for (const [branch, sha] of heads) {
+						const bh = branchHash(branch);
+						const row = byHash.get(bh);
+						if (!row) {
+							await store.saveForkBranch({
+								forkId: fork.id,
+								branchHash: bh,
+								branch,
+								head: sha,
+								analyzedHead: null,
+								firstPendingAt: null,
+								lastRunAt: null,
+								lastError: null,
+								retries: 0,
+							});
+							continue;
+						}
+						if (row.head === sha) continue;
+						const firstPendingAt =
+							sha !== row.analyzedHead && row.firstPendingAt === null
+								? now()
+								: row.firstPendingAt;
+						await store.saveForkBranch({
+							...row,
 							head: sha,
-							analyzedHead: null,
-							firstPendingAt: null,
-							lastRunAt: null,
-							lastError: null,
-							retries: 0,
+							firstPendingAt: sha === row.analyzedHead ? null : firstPendingAt,
 						});
-						continue;
 					}
-					if (row.head === sha) continue;
-					const firstPendingAt =
-						sha !== row.analyzedHead && row.firstPendingAt === null
-							? now()
-							: row.firstPendingAt;
-					if (sha === row.analyzedHead) {
-						store.saveForkBranch({ ...row, head: sha, firstPendingAt: null });
-					} else {
-						store.saveForkBranch({ ...row, head: sha, firstPendingAt });
-					}
-				}
+				});
 			}
 			// Prune only after the project's whole scan succeeded; the fork_branch rows live in
 			// this project's own store, so absent ids are this project's vanished forks.
-			store.deleteForkBranchesNotIn(forkIds);
-
-			const fresh = store.listAllForkBranches();
+			await store.transaction(async () => {
+				if (!(await store.getSettings()).forkResearch) return;
+				const keep = new Set(forkIds);
+				const currentIds = new Set(
+					(await store.listAllForkBranches()).map((row) => row.forkId),
+				);
+				for (const forkId of currentIds) {
+					if (keep.has(forkId)) continue;
+					const original = beforeScan.get(forkId);
+					if (
+						original === undefined ||
+						!(await unchangedFork(store, forkId, original))
+					)
+						keep.add(forkId);
+				}
+				await store.deleteForkBranchesNotIn([...keep]);
+			});
 			const isManual = manual !== undefined;
 			// One open-pull list per project per tick; a failure stops the project's fork loop
 			// before any fork acts on a partial list.
@@ -772,11 +854,12 @@ export function createForkWatcher(deps: {
 					);
 					continue;
 				}
-				const rows = fresh.filter((r) => r.forkId === fork.id);
+				let snapshot = await readFork(store, fork.id);
+				let { rows } = snapshot;
 				// Step 1: nothing held and nothing pending — listPulls stays uncalled.
 				// (The run's pending recomputes after the re-judge; this check only
 				// decides whether PR facts are needed at all.)
-				const holdRows = store.listForkHolds(fork.id);
+				const holdRows = snapshot.holds;
 				const heldOrPending =
 					holdRows.length > 0 ||
 					rows.some((r) => r.head !== null && r.head !== r.analyzedHead);
@@ -880,8 +963,9 @@ export function createForkWatcher(deps: {
 						// later release carries the whole held range. A failed expansion
 						// keeps the base, and the next tick retries.
 						const branchRow = rows.find((r) => r.branchHash === bh);
-						const legacyBase = store.legacyForkHoldBase(fork.id, bh);
+						const legacyBase = snapshot.bases.get(bh) ?? null;
 						let expanded = false;
+						let expansionFailed = false;
 						if (
 							branchRow !== undefined &&
 							branchRow.analyzedHead !== null &&
@@ -895,6 +979,7 @@ export function createForkWatcher(deps: {
 								60_000,
 							);
 							if (lr.code === 0) {
+								expanded = true;
 								for (const sha of lr.stdout.split("\n").filter(Boolean)) {
 									if (branchHolds.some((h) => h.sha === sha)) continue;
 									let owner = seeded[0];
@@ -904,7 +989,10 @@ export function createForkWatcher(deps: {
 											break;
 										}
 									}
-									if (owner === undefined) break;
+									if (owner === undefined) {
+										expansionFailed = true;
+										break;
+									}
 									branchHolds.push({
 										forkId: fork.id,
 										branchHash: bh,
@@ -913,15 +1001,16 @@ export function createForkWatcher(deps: {
 										prHead: owner.prHead,
 										released: 0,
 									});
-									expanded = true;
 								}
 								changed = changed || expanded;
 							} else {
+								expansionFailed = true;
 								deps.log(
 									`forks: ${fork.owner}/${fork.name}: legacy hold expansion skipped, missing objects (${lr.stderr.slice(0, 120)})`,
 								);
 							}
 						}
+						if (expansionFailed) continue;
 						for (const row of branchHolds) {
 							if (row.released === 1) {
 								next.push(toRow(row));
@@ -1002,14 +1091,25 @@ export function createForkWatcher(deps: {
 							}
 						}
 						if (changed) {
-							store.setForkHolds(fork.id, bh, next);
-							if (expanded) store.clearLegacyForkHoldBase(fork.id, bh);
+							const applied = await store.transaction(async () => {
+								if (!(await unchangedFork(store, fork.id, snapshot)))
+									return false;
+								await store.setForkHolds(fork.id, bh, next);
+								if (expanded) await store.clearLegacyForkHoldBase(fork.id, bh);
+								snapshot = await readFork(store, fork.id);
+								return true;
+							});
+							if (!applied) break;
 						}
 					}
+					// An incomplete legacy expansion must not advance its checkpoint.
+					if ([...snapshot.bases.values()].some((base) => base !== null))
+						continue;
 					// Step 5: pending = a moved head OR released hold rows; released commits
 					// are pending analysis work and reach the gated run without a new push.
 					// Recomputed after the re-judge: its releases make branches pending.
-					const curHolds = store.listForkHolds(fork.id);
+					rows = snapshot.rows;
+					const curHolds = snapshot.holds;
 					const pending = rows.filter(
 						(r) =>
 							(r.head !== null && r.head !== r.analyzedHead) ||
@@ -1034,8 +1134,9 @@ export function createForkWatcher(deps: {
 					)
 						continue;
 					if (
-						store.forkRunsSince(now() - FORK_GATES.FORK_RUN_SPACING_MS) >=
-						FORK_GATES.PROJECT_DAILY_RUNS
+						(await store.forkRunsSince(
+							now() - FORK_GATES.FORK_RUN_SPACING_MS,
+						)) >= FORK_GATES.PROJECT_DAILY_RUNS
 					) {
 						deps.log(
 							`forks: ${project.name}: daily cap of ${FORK_GATES.PROJECT_DAILY_RUNS} runs reached, stopping analysis`,
@@ -1119,25 +1220,49 @@ export function createForkWatcher(deps: {
 					// Step 8: every pending branch's filtered range is empty — hold the
 					// covered commits, advance the cursors, and skip the run entirely.
 					if (range.commits.length === 0 && range.merges.length === 0) {
-						for (const r of pending) {
-							store.setForkHolds(
-								fork.id,
-								r.branchHash,
-								mergeRows(r.branchHash, () => false),
-							);
-							store.saveForkBranch({
-								...r,
-								analyzedHead: r.head,
-								firstPendingAt: null,
-								lastError: null,
-								retries: 0,
-							});
-						}
+						await store.transaction(async () => {
+							if (!(await unchangedFork(store, fork.id, snapshot))) return;
+							for (const r of pending) {
+								await store.setForkHolds(
+									fork.id,
+									r.branchHash,
+									mergeRows(r.branchHash, () => false),
+								);
+								await store.saveForkBranch({
+									...r,
+									analyzedHead: r.head,
+									firstPendingAt: null,
+									lastError: null,
+									retries: 0,
+								});
+							}
+						});
 						continue;
 					}
 					// Step 9.
-					store.recordForkRun(fork.id, now());
-					const result = await analyze(range, buildPrior(store));
+					const claim = await store.transaction(async () => {
+						if (!(await unchangedFork(store, fork.id, snapshot))) return false;
+						const at = now();
+						if (
+							(await store.forkRunsSince(
+								at - FORK_GATES.FORK_RUN_SPACING_MS,
+							)) >= FORK_GATES.PROJECT_DAILY_RUNS
+						)
+							return false;
+						if (
+							Math.max(0, ...snapshot.rows.map((r) => r.lastRunAt ?? 0)) +
+								FORK_GATES.FORK_RUN_SPACING_MS >
+							at
+						)
+							return false;
+						await store.recordForkRun(fork.id, at);
+						for (const row of pending)
+							await store.saveForkBranch({ ...row, lastRunAt: at });
+						snapshot = await readFork(store, fork.id);
+						return true;
+					});
+					if (!claim) continue;
+					const result = await analyze(range, await buildPrior(store));
 					// Step 10: cursors and the consumed released rows.
 					const covered = new Set(result.commits);
 					const analyzed: Array<{
@@ -1174,11 +1299,7 @@ export function createForkWatcher(deps: {
 						const consumed = (releasedByBranch.get(h.branchHash) ?? []).filter(
 							(s) => covered.has(s),
 						);
-						store.setForkHolds(
-							fork.id,
-							h.branchHash,
-							mergeRows(h.branchHash, (rel) => covered.has(rel.sha)),
-						);
+						// The final transaction installs these holds with the result.
 						analyzed.push({
 							forkId: fork.id,
 							branchHash: h.branchHash,
@@ -1198,39 +1319,47 @@ export function createForkWatcher(deps: {
 
 						model: null,
 					}));
-					const open = openProposals(store);
-					const kept =
-						open >= 3
-							? (deps.log(
-									`forks: ${fork.owner}/${fork.name}: proposal(s) dropped: cap of 3 open proposals reached`,
-								),
-								[])
-							: proposals;
-					store.createForkResult({
-						prompt,
-						title,
-						report: renderReport(range, result),
-						topic: "fork research",
-						proposals: kept,
-						analyzed,
+					const report = renderReport(range, result);
+					const dropped = await store.transaction(async () => {
+						if (!(await unchangedFork(store, fork.id, snapshot))) return false;
+						for (const branch of analyzed) {
+							await store.setForkHolds(
+								fork.id,
+								branch.branchHash,
+								mergeRows(branch.branchHash, (rel) => covered.has(rel.sha)),
+							);
+						}
+						const open = await openProposals(store);
+						const kept = proposals.slice(0, Math.max(0, 3 - open));
+						await store.createForkResult({
+							prompt,
+							title,
+							report,
+							topic: "fork research",
+							proposals: kept,
+							analyzed,
+						});
+						return kept.length < proposals.length;
 					});
+					if (dropped)
+						deps.log(
+							`forks: ${fork.owner}/${fork.name}: proposal(s) dropped: cap of 3 open proposals reached`,
+						);
 				} catch (e) {
 					const msg = ((e as Error).message ?? String(e)).slice(0, 300);
-					for (const r of store
-						.listAllForkBranches()
-						.filter(
-							(x) =>
-								x.forkId === fork.id &&
-								x.head !== null &&
-								x.head !== x.analyzedHead,
+					await store.transaction(async () => {
+						if (!(await unchangedFork(store, fork.id, snapshot))) return;
+						for (const r of snapshot.rows.filter(
+							(x) => x.head !== null && x.head !== x.analyzedHead,
 						)) {
-						store.saveForkBranch({
-							...r,
-							retries: r.retries + 1,
-							lastError: msg,
-							lastRunAt: now(),
-						});
-					}
+							await store.saveForkBranch({
+								...r,
+								retries: r.retries + 1,
+								lastError: msg,
+								lastRunAt: now(),
+							});
+						}
+					});
 					deps.log(`forks: ${fork.owner}/${fork.name}: ${msg}`);
 				}
 			}

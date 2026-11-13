@@ -209,7 +209,7 @@ const port = await freePort();
 // no board boots on it.
 const root = mkdtempSync(join(tmpdir(), "ottr-card-shot-"));
 const stateDir = join(root, "state");
-seedDemo(root, false, stateDir);
+await seedDemo(root, false, stateDir);
 const planted: Planted | null = pr !== null ? plantCards(root, pr) : null;
 if (planted !== null) {
 	console.log(

@@ -205,7 +205,7 @@ export function createIssueWatcher(deps: {
 	async function ensureLabel(
 		project: ForkProject,
 		repo: string,
-		watching: () => boolean,
+		watching: () => Promise<boolean>,
 	) {
 		const r = await gh(["api", `repos/${repo}/labels/${TRACKED_LABEL}`]);
 		if (r.code === 0) return true;
@@ -215,7 +215,7 @@ export function createIssueWatcher(deps: {
 			);
 			return false;
 		}
-		if (!watching()) return false;
+		if (!(await watching())) return false;
 		const c = await gh([
 			"api",
 			"-X",
@@ -242,15 +242,15 @@ export function createIssueWatcher(deps: {
 			ownerRepo(`${githubHost().webBase}/${project.github}.git`) ??
 			project.github;
 		if (!REPO_RE.test(repo)) throw new Error(`invalid repo id: ${repo}`);
-		const since = store.getSettings().issueWatchSince;
+		const since = (await store.getSettings()).issueWatchSince;
 		if (since === null) {
 			deps.log(`issues: ${project.name}: no watch start mark; nothing filed`);
 			return;
 		}
 		// The watch may turn off, or off and on (a new mark), while a gh call is in flight:
 		// every card or label write rechecks the live settings against the mark read here.
-		const watching = (): boolean => {
-			const s = store.getSettings();
+		const watching = async (): Promise<boolean> => {
+			const s = await store.getSettings();
 			return s.issueWatch === true && s.issueWatchSince === since;
 		};
 		let issues: IssueInfo[];
@@ -260,61 +260,55 @@ export function createIssueWatcher(deps: {
 			deps.log(`issues: ${project.name}: ${(e as Error).message}`);
 			return;
 		}
-		if (!watching()) {
+		if (!(await watching())) {
 			deps.log(
 				`issues: ${project.name}: watch changed during the scan; next tick`,
 			);
 			return;
 		}
-		const t = now();
 		const candidates = issues
 			.filter(
 				(i) =>
 					!i.isPull &&
 					i.createdAt >= since &&
-					!i.labels.includes(TRACKED_LABEL) &&
-					store.getIssueWatch(i.number) === null,
+					!i.labels.includes(TRACKED_LABEL),
 			)
 			.sort((a, b) => a.createdAt - b.createdAt || a.number - b.number);
-		const slots = Math.max(
-			0,
-			ISSUE_GATES.DAILY_CARDS -
-				store.issueCardsFiledSince(t - ISSUE_GATES.DAY_MS),
-		);
-		if (candidates.length > slots)
-			deps.log(
-				`issues: ${project.name}: daily cap of ${ISSUE_GATES.DAILY_CARDS} cards reached; ${candidates.length - slots} issue(s) wait`,
+		await store.transaction(async () => {
+			if (!(await watching())) return;
+			const t = now();
+			const unfiled: IssueInfo[] = [];
+			const numbers = new Set<number>();
+			for (const candidate of candidates) {
+				if (numbers.has(candidate.number)) continue;
+				numbers.add(candidate.number);
+				if ((await store.getIssueWatch(candidate.number)) === null)
+					unfiled.push(candidate);
+			}
+			const slots = Math.max(
+				0,
+				ISSUE_GATES.DAILY_CARDS -
+					(await store.issueCardsFiledSince(t - ISSUE_GATES.DAY_MS)),
 			);
-		fileCandidateCards(project, repo, candidates.slice(0, slots), t);
-		await labelWatchedIssues(project, repo, watching);
-	}
-
-	/** Files the chosen candidates as cards; a failure is logged, never thrown. */
-	function fileCandidateCards(
-		project: ForkProject,
-		repo: string,
-		chosen: IssueInfo[],
-		t: number,
-	): void {
-		for (const i of chosen) {
-			try {
-				project.store.fileIssueCard({
-					number: i.number,
-					title: cardTitle(i.number, i.title),
+			if (unfiled.length > slots)
+				deps.log(
+					`issues: ${project.name}: daily cap of ${ISSUE_GATES.DAILY_CARDS} cards reached; ${unfiled.length - slots} issue(s) wait`,
+				);
+			for (const issue of unfiled.slice(0, slots)) {
+				await store.fileIssueCard({
+					number: issue.number,
+					title: cardTitle(issue.number, issue.title),
 					prompt: issueCardPrompt({
 						repo,
-						number: i.number,
-						title: i.title,
-						body: i.body,
+						number: issue.number,
+						title: issue.title,
+						body: issue.body,
 					}),
 					now: t,
 				});
-			} catch (e) {
-				deps.log(
-					`issues: ${project.name}: #${i.number} not filed: ${(e as Error).message}`,
-				);
 			}
-		}
+		});
+		await labelWatchedIssues(project, repo, watching);
 	}
 
 	// Labels go on after filing, from the table: a failed label call retries next tick
@@ -322,14 +316,14 @@ export function createIssueWatcher(deps: {
 	async function labelWatchedIssues(
 		project: ForkProject,
 		repo: string,
-		watching: () => boolean,
+		watching: () => Promise<boolean>,
 	): Promise<void> {
 		const store = project.store;
-		const unlabelled = store.unlabelledIssues();
+		const unlabelled = await store.unlabelledIssues();
 		if (unlabelled.length === 0) return;
 		if (!(await ensureLabel(project, repo, watching))) return;
 		for (const n of unlabelled) {
-			if (!watching()) return;
+			if (!(await watching())) return;
 			const r = await gh([
 				"api",
 				"-X",
@@ -338,7 +332,11 @@ export function createIssueWatcher(deps: {
 				"-f",
 				`labels[]=${TRACKED_LABEL}`,
 			]);
-			if (r.code === 0) store.markIssueLabelled(n);
+			if (r.code === 0)
+				await store.transaction(async () => {
+					if ((await watching()) && (await store.getIssueWatch(n)) !== null)
+						await store.markIssueLabelled(n);
+				});
 			else
 				deps.log(
 					`issues: ${project.name}: #${n} label failed (${r.code}): ${r.stderr.slice(0, 300)}`,
@@ -351,7 +349,7 @@ export function createIssueWatcher(deps: {
 		for (const project of deps.projects()) {
 			if (opts?.manual !== undefined && project.name !== opts.manual) continue;
 			if (
-				project.store.getSettings().issueWatch !== true ||
+				(await project.store.getSettings()).issueWatch !== true ||
 				project.github === null
 			)
 				continue;

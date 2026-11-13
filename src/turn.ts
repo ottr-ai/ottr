@@ -106,7 +106,6 @@ import {
 	demoteUnquoted,
 	depHold,
 	depProjectOf,
-	depProjectsOf,
 	FINDINGS_HOLD,
 	findDep,
 	findingsHold,
@@ -411,21 +410,21 @@ const TITLE_RETRY_MS = 20_000;
  * card. A later turn that generates again claims the retry through releaseTitleHold, which
  * also cancels this timer, so at most one retry runs.
  */
-function scheduleTitleRetry(
+async function scheduleTitleRetry(
 	store: ProjectStore,
 	id: string,
 	prompt: string,
-	log: (line: string) => void,
+	log: (line: string) => void | Promise<void>,
 	ops: TurnOps,
-	creditBlocked: () => boolean = () => false,
-): void {
+	creditBlocked: () => boolean | Promise<boolean> = () => false,
+): Promise<void> {
 	const timer = setTimeout(() => {
 		void (async () => {
 			try {
-				const task = store.getTask(id);
+				const task = await store.getTask(id);
 				if (task === null || task.cancelledAt !== null) return;
-				if (creditBlocked()) {
-					log("- title retry skipped: the board is out of credit");
+				if (await creditBlocked()) {
+					await log("- title retry skipped: the board is out of credit");
 					return;
 				}
 				let cause = "unknown failure";
@@ -437,10 +436,10 @@ function scheduleTitleRetry(
 					},
 				);
 				if (gen !== null) {
-					store.nameTask(id, gen);
-					log(`+ title: ${gen} (retry after a failed first attempt)`);
+					await store.nameTask(id, gen);
+					await log(`+ title: ${gen} (retry after a failed first attempt)`);
 				} else {
-					log(
+					await log(
 						`! title retry failed (${cause}); the transcript title, once the run writes one, names the card`,
 					);
 				}
@@ -449,12 +448,12 @@ function scheduleTitleRetry(
 				// removed mid-flight (tests, card deletion), and there is nothing to name.
 				return;
 			} finally {
-				store.releaseTitleHold(id);
+				await store.releaseTitleHold(id);
 			}
 		})();
 	}, ops.titleRetryDelayMs ?? TITLE_RETRY_MS);
 	timer.unref();
-	store.holdTitle(id, () => clearTimeout(timer));
+	await store.holdTitle(id, () => clearTimeout(timer));
 }
 
 /** OTTR-326: refusal text while another live card parks a merge-hold mismatch whose held head is
@@ -471,16 +470,14 @@ async function heldMergeOnBranchTip(
 		.targetSha(mainPath, `refs/heads/${branch}`)
 		.catch(() => null);
 	if (tip === null) return null;
-	const parked = store
-		.listTasks()
-		.find(
-			(t) =>
-				t.id !== self &&
-				t.cancelledAt === null &&
-				t.holdHead !== null &&
-				t.needsReason === MERGE_HOLD_MISMATCH_REASON &&
-				t.holdHead === tip,
-		);
+	const parked = (await store.listTasks()).find(
+		(t) =>
+			t.id !== self &&
+			t.cancelledAt === null &&
+			t.holdHead !== null &&
+			t.needsReason === MERGE_HOLD_MISMATCH_REASON &&
+			t.holdHead === tip,
+	);
 	return parked === undefined
 		? null
 		: `card #${parked.id} parks a held merge that is still the local tip of refs/heads/${branch} (its park could not reset the branch); resolve that card and reset the branch to origin first`;
@@ -640,11 +637,11 @@ async function checkoutGuardChangeParts(
  * is the commit times when the change carries commits, the settling turn's whole guard
  * window otherwise (a file-only change carries no timestamp). A turn whose window ended
  * before the guard window start is never a candidate. */
-function blameCandidates(
+async function blameCandidates(
 	projects: Map<string, TurnProject>,
 	st: TurnSettle,
 	change: GuardChange,
-): string[] {
+): Promise<string[]> {
 	const windowStart = st.dispatch.runStartedAt;
 	const windowEnd = st.now;
 	const times = change.commits.map((c) => c.time);
@@ -652,7 +649,7 @@ function blameCandidates(
 	const evEnd = times.length > 0 ? Math.max(...times) : windowEnd;
 	const others: string[] = [];
 	for (const p of projects.values()) {
-		for (const t of p.store.openOrRecentTurns(windowStart)) {
+		for (const t of await p.store.openOrRecentTurns(windowStart)) {
 			if (p.name === st.name && t.id === st.dispatch.turn.id) continue;
 			const end = t.endedAt ?? Number.POSITIVE_INFINITY;
 			if (t.startedAt <= evEnd && end >= evStart)
@@ -682,9 +679,9 @@ async function checkoutGuardProjectVerdict(
 	// The other project's own merge turn is mid-flight: its agent fast-forwards its
 	// main checkout legitimately, and the settle records the head it advanced. Skip
 	// the project until that turn is over.
-	const mergingInFlight = other.store
-		.listTasks()
-		.some((t) => t.stage === "merging" && t.state === "running");
+	const mergingInFlight = (await other.store.listTasks()).some(
+		(t) => t.stage === "merging" && t.state === "running",
+	);
 	if (mergingInFlight) return { kind: "none" };
 	const before = st.mx.guardBefore;
 	const was = before?.get(other.name);
@@ -717,7 +714,7 @@ async function checkoutGuardProjectVerdict(
 		);
 		return { kind: "none" };
 	}
-	const others = blameCandidates(projects, st, change);
+	const others = await blameCandidates(projects, st, change);
 	if (others.length === 0)
 		return {
 			kind: "park",
@@ -856,9 +853,9 @@ export interface TurnOps {
 	board: { url: string; token: string };
 	maxTotalRuns(): number | null;
 	/** The board's review-check switch (POST /api/settings); absent counts as on, so test fakes need nothing. */
-	reviewCheck?: () => boolean;
+	reviewCheck?: () => boolean | Promise<boolean>;
 	/** The board's work-check switch (POST /api/settings); absent counts as on, so test fakes need nothing. */
-	workCheck?: () => boolean;
+	workCheck?: () => boolean | Promise<boolean>;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
 	modelRoles?: typeof modelRoles;
 	/** The chat catalog a retro or review run's propose_task checks a model against; overridable for tests. */
@@ -885,6 +882,7 @@ export interface TurnOps {
 	commitMeta?: typeof commitMeta;
 	/** True while an update holds new turns (POST /api/drain): running turns finish, nothing new starts. */
 	drained(): boolean;
+	stopping?: () => boolean;
 	/** OTTR-454: true while a per-runner hold covers this runner id (a worker hostname or "local"). */
 	drainedRunner(id: string): boolean;
 	/** OTTR-754: the /tmp free-space warning phrase for this runner (a worker hostname or
@@ -1005,12 +1003,17 @@ export interface TurnOps {
 		token: string | undefined,
 		id: string,
 	) => Promise<void>;
-	startRun: typeof startRun;
+	startRun: (
+		...args: Parameters<typeof startRun>
+	) => ReturnType<typeof startRun> | Promise<ReturnType<typeof startRun>>;
 	/** OTTR-693: the commit identity Settings names; null keeps the built-in Ottr default. */
-	commitIdentity?: () => CommitIdentity | null;
+	commitIdentity?: () => CommitIdentity | null | Promise<CommitIdentity | null>;
 	/** OTTR-876: the read-only GitHub token served for turns, or null when none is
 	 * confirmed (docs/specs/turn-read-token.md); asked at every turn start. */
-	turnReadToken?: () => { host: string; token: string } | null;
+	turnReadToken?: () =>
+		| { host: string; token: string }
+		| null
+		| Promise<{ host: string; token: string } | null>;
 	/** Installs the project's package list (apt.txt from the data repo) on this machine; returns log lines. */
 	ensurePackages: typeof ensureProjectPackages;
 	/**
@@ -1082,11 +1085,11 @@ let notifyHook: (project: string, id: string) => void = () => {};
  * written through writeBelow, which refuses a symlink at the file or any parent. Anything else
  * is skipped and logged.
  */
-export function writeVmFiles(
+export async function writeVmFiles(
 	worktree: string,
 	files: readonly { path: string; b64: string }[],
-	log: (line: string) => void,
-): void {
+	log: (line: string) => void | Promise<void>,
+): Promise<void> {
 	for (const f of files) {
 		const segs = f.path.split("/");
 		const allowed =
@@ -1094,7 +1097,9 @@ export function writeVmFiles(
 			!segs.some((s) => s === ".." || s === "." || s === "") &&
 			(f.path === RESEARCH_REPORT || (segs[0] === "shots" && segs.length > 1));
 		if (!allowed) {
-			log(`! microVM: refusing handed-back file ${JSON.stringify(f.path)}`);
+			await log(
+				`! microVM: refusing handed-back file ${JSON.stringify(f.path)}`,
+			);
 			continue;
 		}
 		try {
@@ -1104,13 +1109,17 @@ export function writeVmFiles(
 				Buffer.from(f.b64, "base64"),
 			);
 		} catch (err) {
-			log(`! microVM: writing ${f.path} failed: ${errmsg(err)}`);
+			await log(`! microVM: writing ${f.path} failed: ${errmsg(err)}`);
 		}
 	}
 }
 
-export function appendLog(store: ProjectStore, id: string, line: string): void {
-	writeBelow(store.dataRoot, store.logPath(id), `${line}\n`, "append");
+export async function appendLog(
+	store: ProjectStore,
+	id: string,
+	line: string,
+): Promise<void> {
+	writeBelow(store.dataRoot, await store.logPath(id), `${line}\n`, "append");
 	notifyHook(store.name, id);
 }
 
@@ -1490,9 +1499,11 @@ export function logStoreError(name: string, err: unknown): void {
  * (locked file, recovering WAL, missing table) logs once per window with the project
  * name and returns defaults, so one sick project never blocks the others.
  */
-export function getSettingsLogged(e: TurnProject): ProjectSettings {
+export async function getSettingsLogged(
+	e: TurnProject,
+): Promise<ProjectSettings> {
 	try {
-		return e.store.getSettings();
+		return await e.store.getSettings();
 	} catch (err) {
 		logStoreError(e.store.name, err);
 		return structuredClone(DEFAULT_SETTINGS);
@@ -1510,7 +1521,7 @@ export type FinishKeptOutcome =
 
 /** The engine handle the server binds: scheduler ticks, live-run kills, boot recovery. */
 export interface TurnLoop {
-	schedule(): void;
+	schedule(): Promise<void>;
 	runTurn(name: string, id: string): Promise<void>;
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
@@ -1587,7 +1598,7 @@ type TurnRunShared = {
 };
 
 /** The agent run one turn dispatches (ops.startRun's handle). */
-type TurnRunHandle = ReturnType<TurnOps["startRun"]>;
+type TurnRunHandle = Awaited<ReturnType<TurnOps["startRun"]>>;
 
 /** The metering handle openMeter returns for one agent run (null on a self-hosted board). */
 type OpenRunMeter = (
@@ -1663,8 +1674,8 @@ type TurnSettle = {
 	dispatch: TurnDispatch;
 	mx: TurnRunShared;
 	openMeter: OpenRunMeter;
-	creditBlocked: () => boolean;
-	log: (line: string) => void;
+	creditBlocked: () => boolean | Promise<boolean>;
+	log: (line: string) => void | Promise<void>;
 	// run facts
 	result: RunResult;
 	vmOut: VmOutcome | null;
@@ -1708,6 +1719,7 @@ type TurnSettle = {
 	workCard: boolean;
 	reviewFindings: RecordedFinding[];
 	checkWillRun: boolean;
+	plannedNext?: Next;
 };
 
 /** The source PR facts a ship needs (OTTR-760 stored on the row; OTTR-781 resolved for a
@@ -1885,8 +1897,8 @@ export function createTurnLoop(
 	/** The write that holds card `id`, or null when the card is no longer this run's: a cancel or
 	 * kept-worktree cancel may land during the quota await and owns the state then. Text the user
 	 * queued meanwhile stays ahead of the hold's own prompt. */
-	function holdPatch(store: ProjectStore, id: string, hold: UsageHold) {
-		const cur = store.getTask(id);
+	async function holdPatch(store: ProjectStore, id: string, hold: UsageHold) {
+		const cur = await store.getTask(id);
 		if (
 			cur === null ||
 			cur.cancelledAt !== null ||
@@ -1916,8 +1928,7 @@ export function createTurnLoop(
 		};
 	}
 	/** Hosted credit gate (docs/specs/hosted-mode.md section 5). runTurn calls it right after its
-	 * synchronous claim and before anything spends a model token (title, run, check): an await
-	 * before the claim would let one schedule tick pass every queued card through the caps. True:
+	 * atomic claim and before anything spends a model token (title, run, check). True:
 	 * the turn starts. False: the card parked with the credit reason, or went back to the queue
 	 * held for CREDIT_RETRY_MS when the control plane gave no answer, or unheld when a
 	 * creditRelease ran during a call that answered no credit. A cancel that landed during
@@ -1926,7 +1937,7 @@ export function createTurnLoop(
 		hosted: Hosted,
 		store: ProjectStore,
 		claimed: Task,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
 		let ok: boolean;
 		// A gate call that started before a creditStop must not clear that stop's hold.
@@ -1945,42 +1956,58 @@ export function createTurnLoop(
 			if (stopsBefore === creditStops) creditHold = false;
 			return true;
 		}
-		const cur = store.getTask(claimed.id);
-		if (cur === null || cur.cancelledAt !== null || cur.state !== "preparing")
-			return false;
-		if (failure !== null) {
-			log(`! credit check failed: ${failure}`);
-			// Back to the queue as before the claim, held so the scheduler asks again in a minute.
-			// Not a usage hold: holdProvider stays null so the quota refresh never releases it.
-			store.updateTask(claimed.id, {
-				state: "queued",
-				holdUntil: Date.now() + CREDIT_RETRY_MS,
-				holdProvider: null,
-				holdWindow: null,
-				needsReason: CREDIT_CHECK_FAILED,
-				asked: claimed.asked,
+		const lines: string[] = [];
+		const deferredLog = (line: string) => {
+			lines.push(line);
+		};
+		try {
+			return await store.transaction(async () => {
+				const cur = await store.getTask(claimed.id);
+				if (
+					cur === null ||
+					cur.cancelledAt !== null ||
+					cur.state !== "preparing"
+				)
+					return false;
+				if (failure !== null) {
+					await deferredLog(`! credit check failed: ${failure}`);
+					// Back to the queue as before the claim, held so the scheduler asks again in a minute.
+					// Not a usage hold: holdProvider stays null so the quota refresh never releases it.
+					await store.updateTask(claimed.id, {
+						state: "queued",
+						holdUntil: Date.now() + CREDIT_RETRY_MS,
+						holdProvider: null,
+						holdWindow: null,
+						needsReason: CREDIT_CHECK_FAILED,
+						asked: claimed.asked,
+					});
+				} else if (releasesBefore !== creditReleases) {
+					await deferredLog(
+						"- credit released during the credit check: the card checks again",
+					);
+					// Back to the queue unheld, so the next schedule tick asks the gate again.
+					await store.updateTask(claimed.id, {
+						state: "queued",
+						holdUntil: null,
+						holdProvider: null,
+						holdWindow: null,
+						asked: claimed.asked,
+					});
+				} else {
+					await deferredLog("- turn not started: the board is out of credit");
+					await store.updateTask(claimed.id, {
+						state: "needs_you",
+						needsReason: hosted.config.wording.creditReason,
+					});
+				}
+				return false;
 			});
-		} else if (releasesBefore !== creditReleases) {
-			log("- credit released during the credit check: the card checks again");
-			// Back to the queue unheld, so the next schedule tick asks the gate again.
-			store.updateTask(claimed.id, {
-				state: "queued",
-				holdUntil: null,
-				holdProvider: null,
-				holdWindow: null,
-				asked: claimed.asked,
-			});
-		} else {
-			log("- turn not started: the board is out of credit");
-			store.updateTask(claimed.id, {
-				state: "needs_you",
-				needsReason: hosted.config.wording.creditReason,
-			});
+		} finally {
+			for (const line of lines) await log(line);
 		}
-		return false;
 	}
 
-	/** Claimed runs, from the synchronous claim to the settle writes: the key overlaps `running`
+	/** Claimed runs, from the atomic claim to the settle writes: the key overlaps `running`
 	 * once startRun returns, so the cap counts distinct keys, never the two sets' summed sizes.
 	 * The claim also covers a run whose `done` resolved while its settle awaits git (row open,
 	 * `running` entry gone, pid dead): sweepLostTurns leaves it to runTurn. */
@@ -2113,37 +2140,70 @@ export function createTurnLoop(
 		needsReason: string,
 	): Promise<void> {
 		const store = e.store;
-		appendLog(
+		await appendLog(
 			store,
 			t.id,
 			`! ${error}; ${turnId === null ? "requeueing the card" : "settling the turn"}`,
 		);
-		if (turnId !== null)
-			store.finishTurn(turnId, {
-				endedAt: Date.now(),
-				exitCode: null,
-				error,
-			});
-		// The settle ends the card's microVM turn (lost, or a re-bound detached run that
-		// finished): its VM must not push or reach /llm any more. Before the requeue below, so
-		// the next turn's fresh token is never caught by this sweep.
 		ops.vmTokens?.revokeTask(e.name, t.id);
-		// A cancel that landed while the run hung already owns the card's state.
-		const cur = store.getTask(t.id);
-		if (!cur || cur.cancelledAt !== null) return;
-		const resume = await lostResumeReply(cur);
+		const original = await store.getTask(t.id);
+		const sourceMatches =
+			original !== null &&
+			original.state === t.state &&
+			original.stage === t.stage &&
+			original.sessionId === t.sessionId &&
+			original.base === t.base;
+		const resume =
+			!sourceMatches || original === null
+				? "."
+				: await lostResumeReply(original);
 		const lost =
 			turnId === null
 				? null
-				: (store.listTurns(t.id).find((row) => row.id === turnId) ?? null);
-		const base = cur.pendingPrompt ?? resume;
-		store.updateTask(t.id, {
-			state: "queued",
-			needsReason,
-			pendingPrompt: lostResumePrompt(store, cur, lost, base),
-			// Queued user text keeps its authorship; the board's own resume text is supervisor.
-			pendingBy: cur.pendingPrompt !== null ? cur.pendingBy : "supervisor",
+				: ((await store.listTurns(t.id)).find((row) => row.id === turnId) ??
+					null);
+		const base = original?.pendingPrompt ?? resume;
+		const pending =
+			original === null ? null : lostResumePrompt(store, original, lost, base);
+		const resend = lost !== null && pending !== null && pending !== base;
+		await store.transaction(async () => {
+			if (turnId !== null) {
+				const currentTurn = (await store.listTurns(t.id)).find(
+					(row) => row.id === turnId,
+				);
+				if (currentTurn === undefined || currentTurn.endedAt !== null) return;
+				await store.finishTurnState(turnId, {
+					endedAt: Date.now(),
+					exitCode: null,
+					error,
+				});
+			}
+			const current = await store.getTask(t.id);
+			if (
+				!sourceMatches ||
+				original === null ||
+				current === null ||
+				current.cancelledAt !== null ||
+				current.state !== original.state ||
+				current.stage !== original.stage ||
+				current.sessionId !== original.sessionId ||
+				current.base !== original.base ||
+				(current.state !== "running" && current.state !== "preparing")
+			)
+				return;
+			const currentBase = current.pendingPrompt ?? resume;
+			await store.updateTask(t.id, {
+				state: "queued",
+				needsReason,
+				pendingPrompt:
+					resend && lost !== null
+						? `${lost.prompt}\n\n${currentBase}`
+						: currentBase,
+				pendingBy:
+					current.pendingPrompt !== null ? current.pendingBy : "supervisor",
+			});
 		});
+		if (turnId !== null) await store.captureTurnData(turnId);
 	}
 
 	/** Settles a card whose second-model check run was lost (sweepLostTurns): the check's
@@ -2156,34 +2216,45 @@ export function createTurnLoop(
 		error: string,
 	): Promise<void> {
 		const store = e.store;
-		appendLog(store, t.id, `! ${error}; parking the card`);
-		// A cancel that landed while the check hung already owns the card's state.
-		const cur = store.getTask(t.id);
-		if (!cur || cur.cancelledAt !== null) return;
-		if (checkKey.endsWith(":workcheck"))
-			store.updateTask(t.id, {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: `The work check was lost: ${error}. Reply to re-run it, or cancel the card.`,
-				workCheckLog: [
-					...cur.workCheckLog,
-					{
-						at: Date.now(),
-						model: null,
-						outcome: "error",
-						blockers: [],
-						notes: [],
-						durationMs: 0,
-						error,
-					},
-				],
-			});
-		else
-			store.updateTask(t.id, {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: `The review check was lost: ${error}. Reply to re-run the review, or cancel the card.`,
-			});
+		await appendLog(store, t.id, `! ${error}; parking the card`);
+		await store.transaction(async () => {
+			// A cancel that landed while the check hung already owns the card's state.
+			const cur = await store.getTask(t.id);
+			if (
+				!cur ||
+				cur.cancelledAt !== null ||
+				(cur.state !== "running" && cur.state !== "preparing") ||
+				cur.state !== t.state ||
+				cur.stage !== t.stage ||
+				cur.sessionId !== t.sessionId ||
+				cur.base !== t.base
+			)
+				return;
+			if (checkKey.endsWith(":workcheck"))
+				await store.updateTask(t.id, {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: `The work check was lost: ${error}. Reply to re-run it, or cancel the card.`,
+					workCheckLog: [
+						...cur.workCheckLog,
+						{
+							at: Date.now(),
+							model: null,
+							outcome: "error",
+							blockers: [],
+							notes: [],
+							durationMs: 0,
+							error,
+						},
+					],
+				});
+			else
+				await store.updateTask(t.id, {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: `The review check was lost: ${error}. Reply to re-run the review, or cancel the card.`,
+				});
+		});
 	}
 
 	/** OTTR-454, boot side: a pid-null row is a worker run the update detached instead of losing.
@@ -2211,7 +2282,7 @@ export function createTurnLoop(
 						url: match.url,
 						runId: match.run.id,
 					});
-					appendLog(
+					await appendLog(
 						e.store,
 						t.id,
 						`- re-bound detached run ${match.run.id} on ${new URL(match.url).host}; the card stays running`,
@@ -2248,7 +2319,7 @@ export function createTurnLoop(
 		// A worker run's push state is not provable from the main checkout's refs.
 		if (!t.branch || !t.worktree || turn === undefined || turn.pid === null)
 			return false;
-		const settings = e.store.getSettings();
+		const settings = await e.store.getSettings();
 		const resolved = await ops
 			.resolveTarget(e.path, false, settings.originUrl, settings.targetBranch)
 			.catch(() => null);
@@ -2279,48 +2350,63 @@ export function createTurnLoop(
 		)
 			return false;
 		const store = e.store;
-		appendLog(
+		await appendLog(
 			store,
 			t.id,
 			`- ${target} already holds ${t.branch} on origin: the merge push landed before the restart; finishing the card integrated`,
 		);
-		if (turn.endedAt === null)
-			store.finishTurn(turn.id, {
-				endedAt: Date.now(),
-				exitCode: null,
-				outcome: "integrated",
-				error: null,
-			});
 		const localTargetTip = await ops
 			.targetSha(e.path, `refs/heads/${short}`)
 			.catch(() => null);
-		store.updateTask(t.id, {
-			stage: "done",
-			state: "idle",
-			needsReason: null,
-			// The Done metadata measureSettleGit stamps: the target commit count and the
-			// target head anchor the release's late-commit attribution to this merge.
-			commits: await ops.targetCommits(e.path, target),
-			mergeHead: await ops.targetSha(e.path, target).catch(() => null),
-			...(localTargetTip !== null && localTargetTip === pushedTip
-				? { pushSha: pushedTip }
-				: {}),
+		const commits = await ops.targetCommits(e.path, target);
+		const mergeHead = await ops.targetSha(e.path, target).catch(() => null);
+		const uncommittedFiles = await ops.statusFiles(t.worktree).catch(() => []);
+		const applied = await store.transaction(async () => {
+			const current = await store.getTask(t.id);
+			const currentSettings = await store.getSettings();
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.revision !== t.revision ||
+				currentSettings.originUrl !== settings.originUrl ||
+				currentSettings.targetBranch !== settings.targetBranch
+			)
+				return false;
+			const currentTurn = (await store.listTurns(t.id)).find(
+				(row) => row.id === turn.id,
+			);
+			if (currentTurn?.endedAt === null)
+				await store.finishTurnState(turn.id, {
+					endedAt: Date.now(),
+					exitCode: null,
+					outcome: "integrated",
+					error: null,
+				});
+			await store.updateTask(t.id, {
+				stage: "done",
+				state: "idle",
+				needsReason: null,
+				commits,
+				mergeHead,
+				uncommittedFiles,
+				...(localTargetTip !== null && localTargetTip === pushedTip
+					? { pushSha: pushedTip }
+					: {}),
+			});
+			return true;
 		});
-		// Same done cleanup as the settle's stampDoneCard: capture what the run left
-		// uncommitted, then remove the worktree and its branch (best effort there too).
-		store.updateTask(t.id, {
-			uncommittedFiles: await ops.statusFiles(t.worktree).catch(() => []),
-		});
+		if (!applied) return false;
+		await store.captureTurnData(turn.id);
 		try {
 			await ops.removeWorktree({
 				mainPath: e.path,
 				worktreePath: t.worktree,
 				branch: t.branch,
-				log: (line) => appendLog(store, t.id, line),
+				log: async (line) => await appendLog(store, t.id, line),
 			});
-			appendLog(store, t.id, "- worktree removed");
+			await appendLog(store, t.id, "- worktree removed");
 		} catch (err) {
-			appendLog(store, t.id, `! removeWorktree: ${errmsg(err)}`);
+			await appendLog(store, t.id, `! removeWorktree: ${errmsg(err)}`);
 		}
 		return true;
 	}
@@ -2336,16 +2422,28 @@ export function createTurnLoop(
 			t.stage === "merging" &&
 			t.state === "idle" &&
 			t.prNumber === null &&
-			e.store.getSettings().prMode === true
+			(await e.store.getSettings()).prMode === true
 		) {
 			const needsReason =
 				"PR-mode merge is stranded: no pull request is recorded. Reply to retry the merge turn.";
-			e.store.updateTask(t.id, { state: "needs_you", needsReason });
-			appendLog(e.store, t.id, `! ${needsReason}`);
+			await e.store.transaction(async () => {
+				const current = await e.store.getTask(t.id);
+				const settings = await e.store.getSettings();
+				if (
+					current?.revision === t.revision &&
+					current.cancelledAt === null &&
+					current.stage === "merging" &&
+					current.state === "idle" &&
+					current.prNumber === null &&
+					settings.prMode === true
+				)
+					await e.store.updateTask(t.id, { state: "needs_you", needsReason });
+			});
+			await appendLog(e.store, t.id, `! ${needsReason}`);
 			return;
 		}
 		if (t.state !== "running" && t.state !== "preparing") return;
-		const turn = e.store.listTurns(t.id).at(-1);
+		const turn = (await e.store.listTurns(t.id)).at(-1);
 		// An agent process is a child and can outlive the tracker restart: a still-alive
 		// recorded pid owns the worktree, so requeueing here would start a second agent
 		// on it. Leave the card to sweepLostTurns, which settles and requeues through
@@ -2359,7 +2457,7 @@ export function createTurnLoop(
 			ops.pidAlive(turn.pid) &&
 			t.cancelledAt === null
 		) {
-			appendLog(
+			await appendLog(
 				e.store,
 				t.id,
 				`agent pid ${turn.pid} survived the tracker restart; leaving the card running`,
@@ -2406,7 +2504,7 @@ export function createTurnLoop(
 		for (const e of projects.values()) {
 			let tasks: ListedTask[];
 			try {
-				tasks = e.store.listTasks();
+				tasks = await e.store.listTasks();
 			} catch (err) {
 				logStoreError(e.store.name, err);
 				continue;
@@ -2448,8 +2546,8 @@ export function createTurnLoop(
 		if (runs.find((r) => r.id === watch.runId)?.running) return;
 		const sep = key.indexOf("/");
 		const e = projects.get(key.slice(0, sep));
-		const t = e?.store.getTask(key.slice(sep + 1));
-		const turn = t && e ? e.store.listTurns(t.id).at(-1) : null;
+		const t = await e?.store.getTask(key.slice(sep + 1));
+		const turn = t && e ? (await e.store.listTurns(t.id)).at(-1) : null;
 		// ponytail: the t && e lookup above turns a missing project or task into a null
 		// turn, so !e and !t are backstopped by !turn.
 		if (!e || !t || !turn || turn.endedAt !== null) {
@@ -2535,13 +2633,13 @@ export function createTurnLoop(
 
 	/** One card's open turn row: classify it lost (worker run with no live proof, or a dead
 	 * pid) and record the settle arguments. */
-	function collectLostRow(
+	async function collectLostRow(
 		e: TurnProject,
 		t: ListedTask,
 		key: string,
 		lost: LostRun[],
-	): void {
-		const turn = e.store.listTurns(t.id).at(-1);
+	): Promise<void> {
+		const turn = (await e.store.listTurns(t.id)).at(-1);
 		if (!turn || turn.endedAt !== null) return;
 		// A live runTurn owns its row from the claim until its settle writes: the omp pid can
 		// be dead while slow post-run git work is still in flight (running.delete happened,
@@ -2558,7 +2656,7 @@ export function createTurnLoop(
 		if (turn.pid === null) {
 			// Worker run: the live stream in `running` is the liveness proof. A local spawn failure
 			// stores pid null too but settles its row in runTurn's catch; and running.set precedes
-			// store.startTurn synchronously, so a sweep can never see an open pid-null row for a
+			// store.startTurn, so a sweep cannot see an open pid-null row for a
 			// live local run. A pid-null lost row therefore has no live entry to abandon by
 			// construction — the abandonment block below is pid-path only.
 			if (lostWorkerRow(key))
@@ -2571,32 +2669,41 @@ export function createTurnLoop(
 	}
 
 	/** One card of the lost-run scan. */
-	function collectLostRun(
+	async function collectLostRun(
 		e: TurnProject,
 		t: ListedTask,
 		lost: LostRun[],
 		lostChecks: LostCheckRun[],
-	): void {
+	): Promise<void> {
 		// Only in-flight cards can hold an open turn row (same filter as the boot restart sweep).
 		if (t.state !== "running" && t.state !== "preparing") return;
 		const key = `${e.name}/${t.id}`;
 		if (collectLostCheck(e, t, key, lostChecks)) return;
-		collectLostRow(e, t, key, lost);
+		await collectLostRow(e, t, key, lost);
 	}
 
 	/** The scan half of the sweep: every project's in-flight cards, one sick store isolated. */
-	function collectLostRuns(lost: LostRun[], lostChecks: LostCheckRun[]): void {
+	async function collectLostRuns(
+		lost: LostRun[],
+		lostChecks: LostCheckRun[],
+	): Promise<void> {
 		for (const e of projects.values()) {
 			let tasks: ListedTask[];
 			try {
-				tasks = e.store.listTasks();
+				tasks = await e.store.listTasks();
 			} catch (err) {
 				// One sick store must not stop the sweep for the other projects (same isolation as
 				// getSettingsLogged).
 				logStoreError(e.store.name, err);
 				continue;
 			}
-			for (const t of tasks) collectLostRun(e, t, lost, lostChecks);
+			for (const t of tasks) {
+				try {
+					await collectLostRun(e, t, lost, lostChecks);
+				} catch (err) {
+					logStoreError(e.store.name, err);
+				}
+			}
 		}
 	}
 
@@ -2611,7 +2718,7 @@ export function createTurnLoop(
 					? "The worker running this turn disappeared - resuming automatically. Cancel to stop it instead."
 					: `The agent process (pid ${pid}) disappeared during this turn - resuming automatically. Cancel to stop it instead.`;
 			try {
-				const t = e.store.getTask(id);
+				const t = await e.store.getTask(id);
 				if (t) await settleLostTurn(e, t, turnId, error, needsReason);
 			} catch (err) {
 				// `void`ed by schedule(): a locked store must reject into the log, not unhandled.
@@ -2632,7 +2739,7 @@ export function createTurnLoop(
 				// without touching the store.
 				running.delete(checkKey);
 				preparing.delete(`${e.name}/${id}`);
-				const t = e.store.getTask(id);
+				const t = await e.store.getTask(id);
 				if (t) await settleLostCheck(e, t, checkKey, error);
 			} catch (err) {
 				// Same isolation as the lost-row settle: a locked store rejects into the log.
@@ -2652,11 +2759,10 @@ export function createTurnLoop(
 		// Same fabricated data: the lost-turn sweep runs on every schedule tick.
 		if (demoBoard()) return;
 		await pollDetachedWatchers();
-		// Synchronous scan: claimed entries leave `running` before the first await, so a re-entrant
-		// schedule() cannot double-settle a row.
+		// Each final transaction rechecks its row and task before it settles them.
 		const lost: LostRun[] = [];
 		const lostChecks: LostCheckRun[] = [];
-		collectLostRuns(lost, lostChecks);
+		await collectLostRuns(lost, lostChecks);
 		await settleLostRows(lost);
 		await settleLostChecks(lostChecks);
 	}
@@ -2690,15 +2796,16 @@ export function createTurnLoop(
 	/** OTTR-531: on the false→true edge of an unpushed main, a standing pushSyncCommits
 	 * approval pushes the local target ref once — no edge (a failed push leaves the flag true)
 	 * means no retry storm. */
-	function syncUnpushedMain(
+	async function syncUnpushedMain(
 		e: TurnProject,
 		branch: string,
 		unpushed: boolean,
-	): void {
+	): Promise<void> {
 		const edge = !e.mainUnpushed && unpushed;
 		e.mainUnpushed = unpushed;
-		if (!edge || !e.store.getSettings().pushSyncCommits) return;
-		const settings = e.store.getSettings();
+		if (!edge) return;
+		const settings = await e.store.getSettings();
+		if (!settings.pushSyncCommits) return;
 		void ops
 			.serverMergePush(
 				e.path,
@@ -2760,7 +2867,7 @@ export function createTurnLoop(
 		if (branch !== null)
 			void ops
 				.branchUnpushed(e.path, branch)
-				.then((unpushed) => syncUnpushedMain(e, branch, unpushed))
+				.then(async (unpushed) => await syncUnpushedMain(e, branch, unpushed))
 				.catch(() => {
 					// git failed: keep the last mainUnpushed flag; the next tick retries.
 				});
@@ -2788,27 +2895,50 @@ export function createTurnLoop(
 		void ops.refreshOpenPrs?.(e);
 	}
 
+	/** Keep unrelated projects available, but fail any dependency lookup that needs unavailable data. */
+	async function turnDepProjects(): Promise<DepProject[]> {
+		const snapshots: DepProject[] = [];
+		for (const project of projects.values()) {
+			try {
+				snapshots.push(await depProjectOf(project.store));
+			} catch (err) {
+				logStoreError(project.name, err);
+				snapshots.push({
+					name: project.name,
+					get prefix(): string {
+						throw err;
+					},
+					getTask: () => {
+						throw err;
+					},
+				});
+			}
+		}
+		return snapshots;
+	}
+
 	/** One project's dispatch: pick runnable cards and start a turn for each. True when the
 	 * tick must stop (the global cap bit). */
-	function dispatchRunnable(
+	async function dispatchRunnable(
 		e: TurnProject,
 		drained: boolean,
 		cap: number | null,
 		active: () => number,
 		depProjects: DepProject[],
-	): boolean {
-		const settings = getSettingsLogged(e);
-		const runnable = pickRunnable(e.store.listTasks(), {
+	): Promise<boolean> {
+		const settings = await getSettingsLogged(e);
+		const ownDeps = await depProjectOf(e.store);
+		const runnable = pickRunnable(await e.store.listTasks(), {
 			maxParallel: settings.maxParallel,
 			hasRules: ops.hasRules(e.path, e.targetRules === true),
-			only: drained ? e.store.boardCheckId() : undefined,
+			only: drained ? await e.store.boardCheckId() : undefined,
 			mainUnpushed: e.mainUnpushed === true,
 			prMode: settings.prMode === true,
-			crossDeps: (did) => findDep(did, depProjects, depProjectOf(e.store)),
+			crossDeps: (did) => findDep(did, depProjects, ownDeps),
 		});
 		for (const t of runnable) {
 			if (cap !== null && active() >= cap) return true;
-			void runTurn(e.store.name, t.id);
+			await dispatchTurn(e.store.name, t.id);
 		}
 		// The release command's process takes a cap slot too: do not overbook the tick.
 		return cap !== null && active() >= cap;
@@ -2816,15 +2946,16 @@ export function createTurnLoop(
 
 	/** One project of the dispatch loop: start its runnable turns, then settle review cards
 	 * unless an update drain holds the board. True when the tick must stop (the cap bit). */
-	function dispatchProject(
+	async function dispatchProject(
 		e: TurnProject,
 		drained: boolean,
 		cap: number | null,
 		active: () => number,
 		depProjects: DepProject[],
-	): boolean {
+	): Promise<boolean> {
 		try {
-			if (dispatchRunnable(e, drained, cap, active, depProjects)) return true;
+			if (await dispatchRunnable(e, drained, cap, active, depProjects))
+				return true;
 			if (!drained) void settleReviews(e.store.name);
 			return false;
 		} catch (err) {
@@ -2836,14 +2967,14 @@ export function createTurnLoop(
 	}
 
 	/** One project's low-priority pick. A trending scout already running stops the whole tick. */
-	function pickProjectScout(
+	async function pickProjectScout(
 		e: TurnProject,
 		drained: boolean,
 		scout: { name: string; id: string } | null,
 		depProjects: DepProject[],
-	): { name: string; id: string } | { stop: true } | null {
+	): Promise<{ name: string; id: string } | { stop: true } | null> {
 		try {
-			const tasks = e.store.listTasks();
+			const tasks = await e.store.listTasks();
 			if (
 				tasks.some(
 					(t) =>
@@ -2854,12 +2985,13 @@ export function createTurnLoop(
 			)
 				return { stop: true };
 			if (scout !== null) return null;
+			const ownDeps = await depProjectOf(e.store);
 			const t = pickLowPriority(tasks, {
-				maxParallel: getSettingsLogged(e).maxParallel,
+				maxParallel: (await getSettingsLogged(e)).maxParallel,
 				hasRules: ops.hasRules(e.path, e.targetRules === true),
-				only: drained ? e.store.boardCheckId() : undefined,
+				only: drained ? await e.store.boardCheckId() : undefined,
 				mainUnpushed: e.mainUnpushed === true,
-				crossDeps: (did) => findDep(did, depProjects, depProjectOf(e.store)),
+				crossDeps: (did) => findDep(did, depProjects, ownDeps),
 			});
 			return t === null ? null : { name: e.store.name, id: t.id };
 		} catch (err) {
@@ -2871,16 +3003,16 @@ export function createTurnLoop(
 	/** The low-priority slot: a trending scout starts only after every project's picks above
 	 * left a free slot, in project order, at most one per call and one running board-wide.
 	 * Returns the scout to start, or a stop mark when one already runs (the tick ends). */
-	function pickScout(
+	async function pickScout(
 		drained: boolean,
 		cap: number | null,
 		active: () => number,
 		depProjects: DepProject[],
-	): { name: string; id: string } | { stop: true } | null {
+	): Promise<{ name: string; id: string } | { stop: true } | null> {
 		if (cap !== null && active() >= cap) return { stop: true };
 		let scout: { name: string; id: string } | null = null;
 		for (const e of projects.values()) {
-			const found = pickProjectScout(e, drained, scout, depProjects);
+			const found = await pickProjectScout(e, drained, scout, depProjects);
 			if (found !== null) {
 				if ("stop" in found) return found;
 				scout = found;
@@ -2889,7 +3021,8 @@ export function createTurnLoop(
 		return scout;
 	}
 
-	function schedule(): void {
+	async function schedule(): Promise<void> {
+		if (ops.stopping?.() === true) return;
 		ops.publishSoon(); // board diffs from dirty/release flags and new turns ship without polling
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
 		// Refresh every project first: a full cap must not skip the later projects' dirty and
@@ -2902,28 +3035,33 @@ export function createTurnLoop(
 		const drained = ops.drained();
 		// Global cap across projects: per-project maxParallel alone let one boot start 10 agents.
 		// Counted in distinct keys: a live run sat in both `running` and `preparing`, so the old
-		// sum counted every run twice and the cap bit at half its number. runTurn claims
-		// synchronously, so the count is exact before each start.
+		// sum counted every run twice and the cap bit at half its number.
+		// The authoritative claim rechecks this count after each async selection.
 		// The dev board's fabricated cards must never start a real agent, whatever the cap says.
-		const cap = demoBoard() ? 0 : ops.maxTotalRuns();
+		const cap = demoBoard() ? 0 : await ops.maxTotalRuns();
 		const active = () => new Set([...running.keys(), ...preparing]).size;
 		// OTTR-708: the pickers resolve foreign dependsOn ids across the board's projects.
-		const depProjects = depProjectsOf(projects.values());
+		const depProjects = await turnDepProjects();
 		for (const e of projects.values()) {
-			if (dispatchProject(e, drained, cap, active, depProjects)) return;
+			if (await dispatchProject(e, drained, cap, active, depProjects)) return;
 		}
-		const scouted = pickScout(drained, cap, active, depProjects);
-		if (scouted !== null && !("stop" in scouted))
-			void runTurn(scouted.name, scouted.id);
+		const scouted = await pickScout(drained, cap, active, depProjects);
+		if (scouted !== null && !("stop" in scouted)) {
+			try {
+				await dispatchTurn(scouted.name, scouted.id);
+			} catch (err) {
+				logStoreError(scouted.name, err);
+			}
+		}
 	}
 
 	/** The finding cards' mergeHeads, in done order: the anchors that mark which late
 	 * commits are review fixes in the published notes. */
-	function releaseFindingHeads(
+	async function releaseFindingHeads(
 		store: ProjectStore,
 		task: ListedTask,
-	): string[] {
-		return reviewFindings(store.listTasks(), task)
+	): Promise<string[]> {
+		return reviewFindings(await store.listTasks(), task)
 			.filter(
 				(f): f is ListedTask & { mergeHead: string } =>
 					f.cancelledAt === null && f.mergeHead !== null,
@@ -2943,8 +3081,8 @@ export function createTurnLoop(
 		settings: ProjectSettings,
 		archReview: { delta: number } | null,
 		findings: string[],
-		claimPublish: () => boolean,
-		log: (line: string) => void,
+		claimPublish: () => boolean | Promise<boolean>,
+		log: (line: string) => void | Promise<void>,
 	): Promise<string | null> {
 		const head = await ops.resolveTarget(
 			e.path,
@@ -2952,8 +3090,8 @@ export function createTurnLoop(
 			settings.originUrl,
 			settings.targetBranch,
 		);
-		if (head.warning !== null) log(head.warning);
-		if (!claimPublish()) return null;
+		if (head.warning !== null) await log(head.warning);
+		if (!(await claimPublish())) return null;
 		return ops.publishRelease({
 			mainPath: e.path,
 			reviewed: base,
@@ -2983,15 +3121,15 @@ export function createTurnLoop(
 		releaseCommand: string,
 		originUrl: string | null,
 		archReview: { delta: number } | null,
-		claimPublish: () => boolean,
-		log: (line: string) => void,
+		claimPublish: () => boolean | Promise<boolean>,
+		log: (line: string) => void | Promise<void>,
 	): Promise<string | null> {
 		const store = e.store;
 		// Outside the worktree: the command may refuse a dirty tree.
 		const notesFile = join(store.tasksDir, `release-${task.id}.md`);
 		writeBelow(store.dataRoot, notesFile, task.releaseNotes ?? "");
-		log(`$ ${releaseCommand}`);
-		if (!claimPublish()) return null;
+		await log(`$ ${releaseCommand}`);
+		if (!(await claimPublish())) return null;
 		const key = `${store.name}/${task.id}`;
 		let releaseEntry: RunEntry | null = null;
 		try {
@@ -3005,7 +3143,7 @@ export function createTurnLoop(
 				version: releaseVersion,
 				notesFile,
 				archReview,
-				log: (l) => log(`| ${l}`),
+				log: async (l) => await log(`| ${l}`),
 				onSpawn: (h) => {
 					releaseEntry = h;
 					running.set(key, h);
@@ -3035,26 +3173,32 @@ export function createTurnLoop(
 		target: string,
 	): Promise<string | null> {
 		const store = e.store;
-		const log = (line: string) => appendLog(store, task.id, line);
+		const log = async (line: string) => await appendLog(store, task.id, line);
 		// Synchronous with the publish call after it: a cancel either lands first (and the publish
 		// skips) or finds the claim (and refuses).
-		const claimPublish = (): boolean => {
-			if (store.getTask(task.id)?.cancelledAt !== null) {
-				log("release skipped: the card was cancelled");
-				return false;
-			}
-			publishing.add(`${store.name}/${task.id}`);
-			return true;
+		const claimPublish = async (): Promise<boolean> => {
+			const claimed = await store.transaction(async () => {
+				const current = await store.getTask(task.id);
+				if (current === null || current.cancelledAt !== null) return false;
+				publishing.add(`${store.name}/${task.id}`);
+				return true;
+			});
+			if (!claimed) await log("release skipped: the card was cancelled");
+			return claimed;
 		};
 		try {
 			// Read fresh: the settings may have changed during a long review.
-			const settings = store.getSettings();
+			const settings = await store.getSettings();
 			// The tag message and OTTR_ARCH_REVIEW carry the commits since the previous review.
 			const archDelta = await ops
-				.archReviewDelta(e.path, target, lastReviewBase(store.listTasks()))
+				.archReviewDelta(
+					e.path,
+					target,
+					lastReviewBase(await store.listTasks()),
+				)
 				.catch(() => null);
 			const archReview = archDelta !== null ? { delta: archDelta.delta } : null;
-			const findings = releaseFindingHeads(store, task);
+			const findings = await releaseFindingHeads(store, task);
 			const line =
 				settings.releaseCommand === null
 					? await publishTaggedRelease(
@@ -3082,7 +3226,7 @@ export function createTurnLoop(
 							log,
 						);
 			if (line === null) return null;
-			log(line);
+			await log(line);
 			return null;
 		} catch (err) {
 			return `Release failed: ${errmsg(err)}. Fix it, then reply to retry.`;
@@ -3112,6 +3256,41 @@ export function createTurnLoop(
 		);
 	}
 
+	/** Recheck a held review and apply its next database state without a stale read gap. */
+	async function applyHeldReview(
+		e: TurnProject,
+		task: ListedTask,
+		patch?: TaskPatch,
+	): Promise<Task | null> {
+		return await e.store.transaction(async () => {
+			const current = await e.store.getTask(task.id);
+			if (
+				current === null ||
+				!heldReviewCard(current) ||
+				current.base !== task.base ||
+				current.sessionId !== task.sessionId ||
+				current.revision !== task.revision
+			)
+				return null;
+			if (findingsHold(await e.store.listTasks(), current) !== null)
+				return null;
+			if (
+				(await e.store.listReviewFindings(task.id)).length > 0 &&
+				current.findingsCheckedAt === null
+			) {
+				await e.store.updateTask(task.id, {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: UNCHECKED_FINDINGS_HOLD,
+				});
+				return null;
+			}
+			return patch === undefined
+				? current
+				: await e.store.updateTask(task.id, patch);
+		});
+	}
+
 	/** A release card whose findings are done: publish, park on a failure, or land done with
 	 * the release summary. */
 	async function settleReleaseCard(
@@ -3120,22 +3299,9 @@ export function createTurnLoop(
 		releaseVersion: string,
 		base: string,
 		target: string,
-		cancelled: () => boolean,
+		cancelled: () => boolean | Promise<boolean>,
 	): Promise<void> {
-		// Stored findings the review check never covered refuse the done write.
-		const cur = e.store.getTask(t.id);
-		if (
-			cur !== null &&
-			e.store.listReviewFindings(t.id).length > 0 &&
-			cur.findingsCheckedAt === null
-		) {
-			e.store.updateTask(t.id, {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: UNCHECKED_FINDINGS_HOLD,
-			});
-			return;
-		}
+		if ((await applyHeldReview(e, t)) === null) return;
 		// A release publishes from its worktree.
 		if (t.worktree === null) return;
 		const err = await publishReleaseCard(
@@ -3146,9 +3312,9 @@ export function createTurnLoop(
 			t.worktree,
 			target,
 		);
-		if (cancelled()) return;
+		if (await cancelled()) return;
 		if (err !== null) {
-			e.store.updateTask(t.id, {
+			await applyHeldReview(e, t, {
 				stage: "in_progress",
 				state: "needs_you",
 				needsReason: err,
@@ -3162,8 +3328,8 @@ export function createTurnLoop(
 			t.worktree !== null && existsSync(t.worktree)
 				? await ops.statusFiles(t.worktree)
 				: [];
-		if (cancelled()) return;
-		e.store.updateTask(t.id, {
+		if (await cancelled()) return;
+		await applyHeldReview(e, t, {
 			stage: "done",
 			state: "idle",
 			needsReason: null,
@@ -3181,24 +3347,9 @@ export function createTurnLoop(
 		t: ListedTask,
 		base: string,
 		target: string,
-		cancelled: () => boolean,
+		cancelled: () => boolean | Promise<boolean>,
 	): Promise<void> {
-		if (findingsHold(e.store.listTasks(), t) !== null) return;
-		// Stored findings the review check never covered refuse the done write: park for
-		// a human; a reply resumes the review and the next settle runs the check.
-		const cur = e.store.getTask(t.id);
-		if (
-			cur !== null &&
-			e.store.listReviewFindings(t.id).length > 0 &&
-			cur.findingsCheckedAt === null
-		) {
-			e.store.updateTask(t.id, {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: UNCHECKED_FINDINGS_HOLD,
-			});
-			return;
-		}
+		if ((await applyHeldReview(e, t)) === null) return;
 		if (t.releaseVersion === null) {
 			// The Review button's card has nothing to publish.
 			const commits = await ops.targetCommits(e.path, target);
@@ -3209,8 +3360,8 @@ export function createTurnLoop(
 				t.worktree !== null && existsSync(t.worktree)
 					? await ops.statusFiles(t.worktree)
 					: [];
-			if (cancelled()) return;
-			e.store.updateTask(t.id, {
+			if (await cancelled()) return;
+			await applyHeldReview(e, t, {
 				stage: "done",
 				state: "idle",
 				needsReason: null,
@@ -3237,7 +3388,8 @@ export function createTurnLoop(
 		preparing.add(key);
 		// `tasks` is this tick's snapshot and every await below may let a cancel in: re-read
 		// before each write, and leave a cancelled card to cancel.
-		const cancelled = () => e.store.getTask(t.id)?.cancelledAt !== null;
+		const cancelled = async () =>
+			(await e.store.getTask(t.id))?.cancelledAt !== null;
 		try {
 			await settleReviewCard(e, t, t.base, target, cancelled);
 		} finally {
@@ -3258,7 +3410,7 @@ export function createTurnLoop(
 		if (!e || e.target === null) return;
 		try {
 			const target = e.target;
-			const tasks = e.store.listTasks();
+			const tasks = await e.store.listTasks();
 			const live = tasks.filter((t) => t.cancelledAt === null);
 			// Wait out a merge that may push: one that runs, or a queued one no review holds. A merge
 			// this release holds waits for the publish itself, so waiting for it would deadlock.
@@ -3274,10 +3426,27 @@ export function createTurnLoop(
 	}
 
 	async function runTurn(name: string, id: string): Promise<void> {
-		const claim = claimTurn(name, id);
+		const claim = await claimTurn(name, id);
 		if (claim === null) return;
+		await runClaimedTurn(name, id, claim);
+	}
+
+	/** A scheduler tick waits for its claim, not for the external turn work. */
+	async function dispatchTurn(name: string, id: string): Promise<void> {
+		const claim = await claimTurn(name, id);
+		if (claim === null) return;
+		void runClaimedTurn(name, id, claim).catch((err: unknown) =>
+			logStoreError(name, err),
+		);
+	}
+
+	async function runClaimedTurn(
+		name: string,
+		id: string,
+		claim: NonNullable<Awaited<ReturnType<typeof claimTurn>>>,
+	): Promise<void> {
 		const { e, store, task, key, kind } = claim;
-		const log = (line: string) => appendLog(store, id, line);
+		const log = async (line: string) => await appendLog(store, id, line);
 		/** Mutable run state the catch and finally read after a phase helper wrote it. */
 		const mx: TurnRunShared = {
 			entry: null,
@@ -3332,11 +3501,12 @@ export function createTurnLoop(
 		/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
 		 * hold or this turn's creditStop mark forbids the next model run. The card then parks
 		 * needs_you with the credit reason, unless a cancel or another park already owns it. */
-		const creditBlocked = () => creditBlockedRun(store, id, key, log);
+		const creditBlocked = async () =>
+			await creditBlockedRun(store, id, key, log);
 		try {
 			const header = await prepareTurnHeader(e, store, id, task, kind, log);
 			if (header === null) return;
-			const flags = turnIdentityFlags(store, id, task);
+			const flags = await turnIdentityFlags(store, id, task);
 			const idn = await resolveTurnIdentity(store, id, task, key, flags, log);
 			if (idn === null) return;
 			if (!(await promptGateTurnStart(store, id, task, kind, idn, log))) return;
@@ -3353,7 +3523,7 @@ export function createTurnLoop(
 			const wt = loc.wt;
 
 			await captureMergeDiff(store, id, kind, wt, header, idn.interview, log);
-			const input = buildTurnInput(
+			const input = await buildTurnInput(
 				store,
 				id,
 				task,
@@ -3419,35 +3589,58 @@ export function createTurnLoop(
 				creditBlocked,
 			);
 		} catch (err) {
-			settleTurnError(name, store, id, mx, log, err);
+			await settleTurnError(name, store, id, mx, log, err);
 		} finally {
-			releaseRunClaim(name, e, id, task, key, kind, mx, interims, metered);
+			await releaseRunClaim(
+				name,
+				e,
+				id,
+				task,
+				key,
+				kind,
+				mx,
+				interims,
+				metered,
+			);
 		}
 	}
 
 	/** The turn died in the tracker: log the error, close the row when it exists, park the
 	 * card, and revoke any VM token of this card (startRun revokes its own token when its run
 	 * settles; this covers a throw in between). */
-	function settleTurnError(
+	async function settleTurnError(
 		name: string,
 		store: ProjectStore,
 		id: string,
 		mx: TurnRunShared,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 		err: unknown,
-	): void {
+	): Promise<void> {
 		const msg = errmsg(err);
 		try {
-			log(`! ${msg}`);
+			await log(`! ${msg}`);
 		} catch {
 			// logging must not mask the error path
 		}
-		if (mx.turn)
-			store.finishTurn(mx.turn.id, { endedAt: Date.now(), error: msg });
-		store.updateTask(id, {
-			state: "needs_you",
-			needsReason: `Tracker error: ${msg}`,
+		await store.transaction(async () => {
+			if (mx.turn)
+				await store.finishTurnState(mx.turn.id, {
+					endedAt: Date.now(),
+					error: msg,
+				});
+			const current = await store.getTask(id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				(current.state !== "preparing" && current.state !== "running")
+			)
+				return;
+			await store.updateTask(id, {
+				state: "needs_you",
+				needsReason: `Tracker error: ${msg}`,
+			});
 		});
+		if (mx.turn) await store.captureTurnData(mx.turn.id);
 		ops.vmTokens?.revokeTask(name, id);
 	}
 
@@ -3484,7 +3677,7 @@ export function createTurnLoop(
 
 	/** The final metering record of each metered run of one finished run: the outcome and
 	 * the title ride the main run's record only. */
-	function reportRunMetering(
+	async function reportRunMetering(
 		hosted: Hosted,
 		turn: Turn,
 		name: string,
@@ -3493,9 +3686,9 @@ export function createTurnLoop(
 		task: Task,
 		e: TurnProject,
 		metered: MeteredRun[],
-	): void {
-		const settledTask = e.store.getTask(id);
-		const row = e.store.listTurns(id).at(-1)?.outcome ?? null;
+	): Promise<void> {
+		const settledTask = await e.store.getTask(id);
+		const row = (await e.store.listTurns(id)).at(-1)?.outcome ?? null;
 		const outcome = settledOutcome(row, settledTask);
 		const title = meteringTitle(task);
 		for (const entry of metered) {
@@ -3513,7 +3706,7 @@ export function createTurnLoop(
 		}
 	}
 
-	function releaseRunClaim(
+	async function releaseRunClaim(
 		name: string,
 		e: TurnProject,
 		id: string,
@@ -3523,7 +3716,7 @@ export function createTurnLoop(
 		mx: TurnRunShared,
 		interims: Set<InterimMeter>,
 		metered: MeteredRun[],
-	): void {
+	): Promise<void> {
 		// The sweep may have replaced this entry: only drop the map slot this run still owns.
 		if (mx.entry && running.get(key) === mx.entry) running.delete(key);
 		// A stop that raced a natural finish leaves no mark behind.
@@ -3537,9 +3730,18 @@ export function createTurnLoop(
 		if (ops.hosted !== undefined && mx.turn !== null) {
 			// M10: the outcome is the state the board shows after this settle; see
 			// settledOutcome for the parked and requeued cases.
-			reportRunMetering(ops.hosted, mx.turn, name, id, kind, task, e, metered);
+			await reportRunMetering(
+				ops.hosted,
+				mx.turn,
+				name,
+				id,
+				kind,
+				task,
+				e,
+				metered,
+			);
 		}
-		schedule();
+		await schedule();
 	}
 
 	/** True when the comprehension gate runs on this turn (OTTR-823 scope): plain work turns only —
@@ -3566,60 +3768,121 @@ export function createTurnLoop(
 		return true;
 	}
 
-	/** The synchronous claim of one queued turn: re-entrancy and drain gates, the preparing
-	 * write, and the run identity. Null: the card is not startable this tick. Runs before the
-	 * first await so a re-entrant schedule() cannot double-start. */
-	function claimTurn(
+	/** Serialize board-wide claims, then let the store claim the current task atomically. */
+	let claimQueue: Promise<void> = Promise.resolve();
+	async function claimTurn(
 		name: string,
 		id: string,
-	): {
+	): Promise<{
 		e: TurnProject;
 		store: ProjectStore;
 		task: Task;
 		key: string;
 		kind: TurnKind;
-	} | null {
-		const e = projects.get(name);
-		if (!e) return null;
-		const store = e.store;
-		const task = store.getTask(id);
-		const key = `${name}/${id}`;
-		if (
-			task?.state !== "queued" ||
-			task.cancelledAt !== null ||
-			running.has(key)
-		)
-			return null;
-		const kind: TurnKind = task.stage === "merging" ? "merge" : "work";
-		const preRetro = isRetro(task);
-		const preBoardCheck = store.boardCheckId() === id;
-		if (startGatesHold(e, task, key, kind, preRetro, preBoardCheck)) {
-			// OTTR-754: a /tmp hold names the runner and its free space on the queued card,
-			// so the card shows why it waits. A drain-only hold keeps its silent surface
-			// (the board's drain view carries that cause). One write per text change: the
-			// phrase is stable across schedule ticks while the space stays below the limit.
-			const tmpReason = startGateTmpReason(
+	} | null> {
+		const previous = claimQueue;
+		const { promise, resolve: release } = Promise.withResolvers<void>();
+		claimQueue = promise;
+		await previous;
+		try {
+			const e = projects.get(name);
+			if (e === undefined || ops.stopping?.() === true) return null;
+			const store = e.store;
+			const key = `${name}/${id}`;
+			const depProjects = await turnDepProjects();
+			const ownDeps = depProjects.find((p) => p.name === name);
+			if (ownDeps === undefined) return null;
+			let otherScout = false;
+			for (const other of projects.values()) {
+				if (other === e) continue;
+				try {
+					if (
+						(await other.store.listTasks()).some(
+							(t) =>
+								t.kind === "trending" &&
+								t.cancelledAt === null &&
+								(t.state === "preparing" || t.state === "running"),
+						)
+					)
+						otherScout = true;
+				} catch (err) {
+					logStoreError(other.name, err);
+					otherScout = true;
+				}
+			}
+			const hasRules = ops.hasRules(e.path, e.targetRules === true);
+			let reserved = false;
+			let task: Task | null;
+			try {
+				task = await store.claimTurn(
+					id,
+					(current, settings, tasks, boardCheckId) => {
+						const cap = demoBoard() ? 0 : ops.maxTotalRuns();
+						const active = new Set([...running.keys(), ...preparing]).size;
+						if (
+							projects.get(name) !== e ||
+							ops.stopping?.() === true ||
+							running.has(key) ||
+							preparing.has(key) ||
+							(cap !== null && active >= cap)
+						)
+							return { allow: false };
+						const options = {
+							maxParallel: settings.maxParallel,
+							hasRules,
+							only: ops.drained() ? boardCheckId : undefined,
+							mainUnpushed: e.mainUnpushed === true,
+							prMode: settings.prMode === true,
+							crossDeps: (did: string) => findDep(did, depProjects, ownDeps),
+						};
+						const candidate =
+							current.kind === "trending"
+								? !otherScout && pickLowPriority(tasks, options)?.id === id
+								: pickRunnable(tasks, options).some((t) => t.id === id);
+						if (!candidate) return { allow: false };
+						const kind: TurnKind =
+							current.stage === "merging" ? "merge" : "work";
+						const retro = isRetro(current);
+						const boardCheck = boardCheckId === id;
+						if (
+							startGatesHold(settings, current, key, kind, retro, boardCheck)
+						) {
+							const reason = startGateTmpReason(
+								settings,
+								current,
+								kind,
+								retro,
+								boardCheck,
+							);
+							return {
+								allow: false,
+								...(reason === null ? {} : { needsReason: reason }),
+							};
+						}
+						preparing.add(key);
+						creditStopped.delete(key);
+						reserved = true;
+						return { allow: true };
+					},
+				);
+			} catch (err) {
+				if (reserved) preparing.delete(key);
+				throw err;
+			}
+			if (task === null) {
+				if (reserved) preparing.delete(key);
+				return null;
+			}
+			return {
 				e,
+				store,
 				task,
-				kind,
-				preRetro,
-				preBoardCheck,
-			);
-			if (tmpReason !== null && task.needsReason !== tmpReason)
-				store.updateTask(id, { needsReason: tmpReason });
-			return null;
+				key,
+				kind: task.stage === "merging" ? "merge" : "work",
+			};
+		} finally {
+			release();
 		}
-		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
-		store.updateTask(id, {
-			state: "preparing",
-			needsReason: null,
-			asked: null,
-		});
-		preparing.add(key);
-		// A credit-stop mark belongs to a run claimed before the stop; this claim starts clean
-		// (a stop from now on marks it again, and the hold covers the gap until the gate).
-		creditStopped.delete(key);
-		return { e, store, task, key, kind };
 	}
 
 	/** OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
@@ -3632,7 +3895,7 @@ export function createTurnLoop(
 	 * busy moments ago, leaves the card queued and unclaimed (the board shows vmHoldFor);
 	 * it never falls back to the classic pool or the server. */
 	function startGatesHold(
-		e: TurnProject,
+		settings: ProjectSettings,
 		task: Task,
 		key: string,
 		kind: TurnKind,
@@ -3641,7 +3904,7 @@ export function createTurnLoop(
 	): boolean {
 		if (
 			microVmTurn({
-				microVm: getSettingsLogged(e).microVm === true,
+				microVm: settings.microVm === true,
 				kind,
 				retro: preRetro,
 				boardCheck: preBoardCheck,
@@ -3696,7 +3959,7 @@ export function createTurnLoop(
 	 * the vmHoldFor surface. Each line is the tmpFullLine phrase, so the card reason
 	 * names the runner and its free space exactly like the bell notice. */
 	function startGateTmpReason(
-		e: TurnProject,
+		settings: ProjectSettings,
 		task: Task,
 		kind: TurnKind,
 		preRetro: boolean,
@@ -3704,7 +3967,7 @@ export function createTurnLoop(
 	): string | null {
 		if (
 			microVmTurn({
-				microVm: getSettingsLogged(e).microVm === true,
+				microVm: settings.microVm === true,
 				kind,
 				retro: preRetro,
 				boardCheck: preBoardCheck,
@@ -3726,25 +3989,28 @@ export function createTurnLoop(
 	/** Hosted credit stop (docs/specs/hosted-mode.md section 5): true when the loop's credit
 	 * hold or this turn's creditStop mark forbids the next model run. The card then parks
 	 * needs_you with the credit reason, unless a cancel or another park already owns it. */
-	function creditBlockedRun(
+	async function creditBlockedRun(
 		store: ProjectStore,
 		id: string,
 		key: string,
-		log: (line: string) => void,
-	): boolean {
-		if (ops.hosted === undefined) return false;
+		log: (line: string) => void | Promise<void>,
+	): Promise<boolean> {
+		const hosted = ops.hosted;
+		if (hosted === undefined) return false;
 		if (!creditHold && !creditStopped.has(key)) return false;
-		log("- model run not started: the board is out of credit");
-		const cur = store.getTask(id);
-		if (
-			cur !== null &&
-			cur.cancelledAt === null &&
-			(cur.state === "preparing" || cur.state === "running")
-		)
-			store.updateTask(id, {
-				state: "needs_you",
-				needsReason: ops.hosted.config.wording.creditReason,
-			});
+		await log("- model run not started: the board is out of credit");
+		await store.transaction(async () => {
+			const cur = await store.getTask(id);
+			if (
+				cur !== null &&
+				cur.cancelledAt === null &&
+				(cur.state === "preparing" || cur.state === "running")
+			)
+				await store.updateTask(id, {
+					state: "needs_you",
+					needsReason: hosted.config.wording.creditReason,
+				});
+		});
 		return true;
 	}
 
@@ -3757,19 +4023,19 @@ export function createTurnLoop(
 		id: string,
 		task: Task,
 		kind: TurnKind,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<TurnHeader | null> {
 		if (
 			ops.hosted !== undefined &&
 			!(await creditGate(ops.hosted, store, task, log))
 		)
 			return null;
-		const settings = store.getSettings();
+		const settings = await store.getSettings();
 		// Capture must stay adjacent to the header write: the offset is the header's byte
 		// position in the card log. A missing file is a fresh card, so the header starts at 0.
 		const turnLogOffset =
-			statSync(store.logPath(id), { throwIfNoEntry: false })?.size ?? 0;
-		log(`== ${kind} turn ${new Date().toISOString()}`);
+			statSync(await store.logPath(id), { throwIfNoEntry: false })?.size ?? 0;
+		await log(`== ${kind} turn ${new Date().toISOString()}`);
 		// A new worktree starts from a freshly fetched target; an existing one keeps its base.
 		const { target, sha, warning } = await ops.resolveTarget(
 			e.path,
@@ -3777,7 +4043,7 @@ export function createTurnLoop(
 			settings.originUrl,
 			settings.targetBranch,
 		);
-		if (warning) log(`! ${warning}`);
+		if (warning) await log(`! ${warning}`);
 		e.target = target;
 		// A review card reviews the frozen sha it was created with, not the current target head.
 		// A review card's base is always its frozen sha, so `?? sha` only fires for normal tasks.
@@ -3785,18 +4051,18 @@ export function createTurnLoop(
 	}
 
 	/** The per-card kind flags: read once from the task row and reused by every phase. */
-	function turnIdentityFlags(
+	async function turnIdentityFlags(
 		store: ProjectStore,
 		id: string,
 		task: Task,
-	): TurnIdentityFlags {
+	): Promise<TurnIdentityFlags> {
 		return {
 			releaseCard: task.releaseVersion !== null && task.base !== null,
 			// The Review button's card runs the same read-only review at its frozen base, minus the publish.
 			reviewCard: isReview(task) && task.base !== null,
 			retroCard: isRetro(task),
 			// The Check the board button's card: only its route sets the mark, never the prompt text.
-			boardCheck: store.boardCheckId() === id,
+			boardCheck: (await store.boardCheckId()) === id,
 			interview: task.kind === "interview",
 			// A backlog card only ever runs grill turns: worktree-less, in the main checkout.
 			grill: task.stage === "backlog",
@@ -3816,10 +4082,10 @@ export function createTurnLoop(
 		task: Task,
 		kind: TurnKind,
 		idn: TurnIdentity,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
 		if (!gateApplies(kind, idn, task)) return true;
-		const live = store.getTask(id) ?? task;
+		const live = (await store.getTask(id)) ?? task;
 		const pending =
 			live.pendingPrompt !== null && live.pendingPrompt !== "."
 				? live.pendingPrompt
@@ -3836,14 +4102,14 @@ export function createTurnLoop(
 			handoffsDir: join(store.tasksDir, "handoffs"),
 		});
 		for (const reason of handoff.reasons)
-			log(`! prompt gate: handoff not judged: ${reason}`);
+			await log(`! prompt gate: handoff not judged: ${reason}`);
 		const judged = gateJudgedPrompt(live.prompt, handoff);
 		// Skip rule: the gate passed for exactly this compared text.
 		if (
 			live.gate?.hash ===
 			gateFingerprint(gateCompareText(judged, pending, seen))
 		) {
-			log("+ prompt gate: passed earlier for this text");
+			await log("+ prompt gate: passed earlier for this text");
 			return true;
 		}
 		// Deterministic park: the Deepen rewrite left an Open questions section and no user
@@ -3862,7 +4128,7 @@ export function createTurnLoop(
 			}));
 			const sig = lines.join("\n");
 			const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
-			parkGate(
+			await parkGate(
 				store,
 				id,
 				{
@@ -3880,7 +4146,7 @@ export function createTurnLoop(
 		// Queued user text (a reply or steer) is judged as today, so a board prompt that
 		// carries pending or seen text still reaches the model below.
 		if (live.promptAuthor === "board" && pending === null && seen === null) {
-			log("+ prompt gate: board-written prompt runs without the model");
+			await log("+ prompt gate: board-written prompt runs without the model");
 			return true;
 		}
 		// Model evaluation; one immediate retry on any failure.
@@ -3900,8 +4166,8 @@ export function createTurnLoop(
 		}
 		if (err !== null || check === null) {
 			const cause = err?.message ?? "unknown failure";
-			log(`! prompt gate: ${cause}`);
-			parkGate(
+			await log(`! prompt gate: ${cause}`);
+			await parkGate(
 				store,
 				id,
 				{
@@ -3937,7 +4203,7 @@ export function createTurnLoop(
 				});
 				if (facts.length > 0) {
 					for (const f of facts)
-						log(
+						await log(
 							`+ prompt gate: answered from the code: ${f.question} -> ${f.answer} (${f.evidence})`,
 						);
 					const seenWithFacts =
@@ -3956,31 +4222,40 @@ export function createTurnLoop(
 					answeredFacts = facts;
 				}
 			} catch (e) {
-				log(`! prompt gate: fact lookup failed: ${(e as Error).message}`);
+				await log(`! prompt gate: fact lookup failed: ${(e as Error).message}`);
 			}
 		}
 		const missing = !effCheck.points[4]?.covered;
 		if (effCheck.questions.length === 0 && !missing) {
 			// Pass: restate what the gate understood, stamp the fingerprint, start.
-			log(`+ prompt gate: would build: ${effCheck.builds}`);
-			log(`+ prompt gate: check: ${effCheck.checks}`);
+			await log(`+ prompt gate: would build: ${effCheck.builds}`);
+			await log(`+ prompt gate: check: ${effCheck.checks}`);
 			const missingPoints = effCheck.points
 				.map((p, i) => ({ p, i }))
 				.filter(({ p }) => !p.covered);
 			if (missingPoints.length === 0)
-				log("+ prompt gate: all five points covered");
+				await log("+ prompt gate: all five points covered");
 			for (const { p, i } of missingPoints)
-				log(`+ prompt gate: missing: ${DEEPEN_POINTS[i]} — ${p.reason}`);
-			store.updateTask(id, {
-				gate: {
-					hash: gateFingerprint(gateCompareText(judged, pending, effSeen)),
-					seen: gateUserText(pending, effSeen),
-					fails: 0,
-					sig: null,
-					parked: false,
-				},
+				await log(`+ prompt gate: missing: ${DEEPEN_POINTS[i]} — ${p.reason}`);
+			return await store.transaction(async () => {
+				const current = await store.getTask(id);
+				if (
+					current === null ||
+					current.cancelledAt !== null ||
+					current.state !== "preparing"
+				)
+					return false;
+				await store.updateTask(id, {
+					gate: {
+						hash: gateFingerprint(gateCompareText(judged, pending, effSeen)),
+						seen: gateUserText(pending, effSeen),
+						fails: 0,
+						sig: null,
+						parked: false,
+					},
+				});
+				return true;
 			});
-			return true;
 		}
 		// Park with the gate's questions (and a missing outside check, named).
 		const modelQs = gateAskQuestions(effCheck);
@@ -3994,7 +4269,7 @@ export function createTurnLoop(
 			missing && modelQs.length === 0
 				? "the prompt names no outside check"
 				: "the gate still has open questions";
-		parkGate(
+		await parkGate(
 			store,
 			id,
 			{
@@ -4015,7 +4290,7 @@ export function createTurnLoop(
 	}
 
 	/** The one gate park write: needs_you with the reason, the ask questions and the gate state. */
-	function parkGate(
+	async function parkGate(
 		store: ProjectStore,
 		id: string,
 		write: {
@@ -4023,14 +4298,23 @@ export function createTurnLoop(
 			asked: AskQuestion[] | null;
 			gate: PromptGateState;
 		},
-		log: (line: string) => void,
-	): void {
-		log(`! ${write.needsReason}`);
-		store.updateTask(id, {
-			state: "needs_you",
-			needsReason: write.needsReason,
-			asked: write.asked,
-			gate: write.gate,
+		log: (line: string) => void | Promise<void>,
+	): Promise<void> {
+		await log(`! ${write.needsReason}`);
+		await store.transaction(async () => {
+			const current = await store.getTask(id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.state !== "preparing"
+			)
+				return;
+			await store.updateTask(id, {
+				state: "needs_you",
+				needsReason: write.needsReason,
+				asked: write.asked,
+				gate: write.gate,
+			});
 		});
 	}
 
@@ -4044,7 +4328,7 @@ export function createTurnLoop(
 		task: Task,
 		key: string,
 		flags: TurnIdentityFlags,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<TurnIdentity | null> {
 		// Review sessions get one fixed name, applied by the extension before the agent runs,
 		// so the board never depends on the agent inventing a title.
@@ -4074,12 +4358,12 @@ export function createTurnLoop(
 		id: string,
 		task: Task,
 		key: string,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<{ name: string | null; stopped: boolean }> {
-		const named = store.sessionTitle(task);
+		const named = await store.sessionTitle(task);
 		if (named !== null) return { name: named, stopped: false };
 		// The title is a model call: a credit stop in the prepare above ends the turn.
-		if (creditBlockedRun(store, id, key, log))
+		if (await creditBlockedRun(store, id, key, log))
 			return { name: null, stopped: true };
 		return {
 			name: await generateSessionTitle(store, id, task, key, log),
@@ -4095,7 +4379,7 @@ export function createTurnLoop(
 		id: string,
 		task: Task,
 		key: string,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<string | null> {
 		let cause = "unknown failure";
 		const gen = await (ops.genTitle ?? generateTitle)(
@@ -4106,22 +4390,22 @@ export function createTurnLoop(
 			},
 		);
 		if (gen !== null) {
-			store.nameTask(id, gen);
+			await store.nameTask(id, gen);
 			// Any pending retry is spent either way; clear it before the transcript
 			// title can win the race the hold was holding back.
-			store.releaseTitleHold(id);
-			log(`+ title: ${gen}`);
+			await store.releaseTitleHold(id);
+			await log(`+ title: ${gen}`);
 			return gen;
 		}
-		log(
+		await log(
 			`! title generation failed (${cause}); the card shows the prompt cut until the run names itself`,
 		);
-		if (store.titleHold(id)) {
+		if (await store.titleHold(id)) {
 			// This failed attempt was the one retry an earlier turn scheduled:
 			// give up, so the run's own transcript title can name the card.
-			store.releaseTitleHold(id);
+			await store.releaseTitleHold(id);
 		} else {
-			scheduleTitleRetry(
+			await scheduleTitleRetry(
 				store,
 				id,
 				task.prompt,
@@ -4145,7 +4429,7 @@ export function createTurnLoop(
 		task: Task,
 		header: TurnHeader,
 		flags: TurnIdentity,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<RunLocation | null> {
 		const special = flags.interview || flags.grill || flags.scout;
 		// A card run always holds a branch name here: task.branch, or the one the
@@ -4197,11 +4481,11 @@ export function createTurnLoop(
 		task: Task,
 		header: TurnHeader,
 		releaseCard: boolean,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<{ wt: string; branch: string } | null> {
 		const branch = `ott/${id.toLowerCase()}-${slugify(task.title)}`;
 		const wt = join(store.worktreesDir, id);
-		log(
+		await log(
 			`+ worktree ${branch} from ${header.target} at ${header.base}${releaseCard ? " (frozen release base)" : ""}`,
 		);
 		await ops.createWorktree({
@@ -4212,8 +4496,11 @@ export function createTurnLoop(
 			copyExtra: header.settings.copyExtra,
 			log,
 		});
-		store.updateTask(id, { branch, base: header.base, worktree: wt });
-		if (store.getTask(id)?.cancelledAt) {
+		const cancelled = await store.transaction(async () => {
+			await store.updateTask(id, { branch, base: header.base, worktree: wt });
+			return (await store.getTask(id))?.cancelledAt !== null;
+		});
+		if (cancelled) {
 			// fresh worktree: the agent never ran, so there is nothing to lose
 			await ops
 				.removeWorktree({
@@ -4222,7 +4509,7 @@ export function createTurnLoop(
 					branch,
 					log,
 				})
-				.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+				.catch(async (err) => await log(`! removeWorktree: ${errmsg(err)}`));
 			return null;
 		}
 		return { wt, branch };
@@ -4250,7 +4537,7 @@ export function createTurnLoop(
 		branch: string,
 		header: TurnHeader,
 		special: boolean,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
 		if (
 			special ||
@@ -4270,9 +4557,16 @@ export function createTurnLoop(
 		// A cancel that landed while the git reads ran owns the card; never write over it.
 		if (facts === null) return true;
 		if (facts.landed)
-			return settleLandedHusk(e, store, id, header.target, facts.head, log);
+			return await settleLandedHusk(
+				e,
+				store,
+				id,
+				header.target,
+				facts.head,
+				log,
+			);
 		if (facts.branchHead !== null && facts.branchHead !== header.base)
-			return rebuildHuskAtBranch(
+			return await rebuildHuskAtBranch(
 				e,
 				store,
 				id,
@@ -4283,10 +4577,10 @@ export function createTurnLoop(
 				log,
 			);
 		if (facts.head !== null && facts.head !== header.base) {
-			parkHuskWorktree(store, id, header.target, log);
+			await parkHuskWorktree(store, id, header.target, log);
 			return true;
 		}
-		return rebuildHuskAtBase(e, store, id, wt, branch, header, log);
+		return await rebuildHuskAtBase(e, store, id, wt, branch, header, log);
 	}
 
 	/** The husk's git facts: the head the approved hold or the branch names and whether the
@@ -4314,7 +4608,7 @@ export function createTurnLoop(
 			head !== null &&
 			head !== base &&
 			(await ops.targetContains(e.path, head, target).catch(() => false));
-		const cur = store.getTask(id);
+		const cur = await store.getTask(id);
 		if (cur === null || cur.cancelledAt !== null) return null;
 		return { head, landed, branchHead };
 	}
@@ -4327,22 +4621,32 @@ export function createTurnLoop(
 		id: string,
 		target: string,
 		head: string | null,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
-		log(
+		await log(
 			`- worktree is gone; head ${head} is already on ${target}: the card settles done`,
 		);
-		// Same end state as the hold settle for a landed approval.
-		store.updateTask(id, {
-			stage: "done",
-			state: "idle",
-			needsReason: null,
-			asked: null,
-			pendingPrompt: null,
-			pendingImages: [],
-			holdHead: null,
-			commits: await ops.targetCommits(e.path, target).catch(() => 0),
-			mergeHead: await ops.targetSha(e.path, target).catch(() => null),
+		const commits = await ops.targetCommits(e.path, target).catch(() => 0);
+		const mergeHead = await ops.targetSha(e.path, target).catch(() => null);
+		await store.transaction(async () => {
+			const current = await store.getTask(id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.state !== "preparing"
+			)
+				return;
+			await store.updateTask(id, {
+				stage: "done",
+				state: "idle",
+				needsReason: null,
+				asked: null,
+				pendingPrompt: null,
+				pendingImages: [],
+				holdHead: null,
+				commits,
+				mergeHead,
+			});
 		});
 		return true;
 	}
@@ -4357,9 +4661,11 @@ export function createTurnLoop(
 		branch: string,
 		branchHead: string,
 		header: TurnHeader,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
-		log(`+ worktree is gone; recreating ${branch} at its head ${branchHead}`);
+		await log(
+			`+ worktree is gone; recreating ${branch} at its head ${branchHead}`,
+		);
 		await ops.createWorktree({
 			mainPath: e.path,
 			worktreePath: wt,
@@ -4370,7 +4676,7 @@ export function createTurnLoop(
 		});
 		// A cancel that landed while the worktree was rebuilt owns the card; the
 		// branch holds the work, so nothing is deleted here.
-		if (store.getTask(id)?.cancelledAt) return true;
+		if ((await store.getTask(id))?.cancelledAt) return true;
 		return false;
 	}
 
@@ -4384,9 +4690,9 @@ export function createTurnLoop(
 		wt: string,
 		branch: string,
 		header: TurnHeader,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
-		log(
+		await log(
 			`- worktree is gone; ${branch} has no commits past ${header.base}: recreating the worktree`,
 		);
 		await ops.createWorktree({
@@ -4397,8 +4703,11 @@ export function createTurnLoop(
 			copyExtra: header.settings.copyExtra,
 			log,
 		});
-		store.updateTask(id, { branch, base: header.base, worktree: wt });
-		if (store.getTask(id)?.cancelledAt) {
+		const cancelled = await store.transaction(async () => {
+			await store.updateTask(id, { branch, base: header.base, worktree: wt });
+			return (await store.getTask(id))?.cancelledAt !== null;
+		});
+		if (cancelled) {
 			// fresh worktree: the agent never ran, so there is nothing to lose
 			await ops
 				.removeWorktree({
@@ -4407,23 +4716,32 @@ export function createTurnLoop(
 					branch,
 					log,
 				})
-				.catch((err) => log(`! removeWorktree: ${errmsg(err)}`));
+				.catch(async (err) => await log(`! removeWorktree: ${errmsg(err)}`));
 			return true;
 		}
 		return false;
 	}
 
 	/** The husk's work is not on the target: park the card for the user. */
-	function parkHuskWorktree(
+	async function parkHuskWorktree(
 		store: ProjectStore,
 		id: string,
 		target: string,
-		log: (line: string) => void,
-	): void {
-		log(`! worktree is gone; its work is not on ${target}`);
-		store.updateTask(id, {
-			state: "needs_you",
-			needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
+		log: (line: string) => void | Promise<void>,
+	): Promise<void> {
+		await log(`! worktree is gone; its work is not on ${target}`);
+		await store.transaction(async () => {
+			const current = await store.getTask(id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.state !== "preparing"
+			)
+				return;
+			await store.updateTask(id, {
+				state: "needs_you",
+				needsReason: `The card's worktree is gone; its work is not on ${target}. Cancel the card or recreate the work.`,
+			});
 		});
 	}
 
@@ -4437,7 +4755,7 @@ export function createTurnLoop(
 		wt: string,
 		header: TurnHeader,
 		interview: boolean,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<void> {
 		if (
 			kind === "merge" &&
@@ -4451,17 +4769,26 @@ export function createTurnLoop(
 				.diffText(wt, header.base, header.target)
 				.catch(() => null);
 			if (files !== null) {
-				store.updateTask(id, {
-					diffFiles: files,
-					// ponytail: 200 KB cap — bigger diffs keep their numstat, the raw view truncates; raise the cap when a card needs more.
-					diffText:
-						text === null
-							? null
-							: text.length > 200_000
-								? `${text.slice(0, 200_000)}\n… diff truncated at 200 KB`
-								: text,
+				await store.transaction(async () => {
+					const current = await store.getTask(id);
+					if (
+						current === null ||
+						current.cancelledAt !== null ||
+						(current.state !== "preparing" && current.state !== "running")
+					)
+						return;
+					await store.updateTask(id, {
+						diffFiles: files,
+						// ponytail: 200 KB cap — bigger diffs keep their numstat, the raw view truncates; raise the cap when a card needs more.
+						diffText:
+							text === null
+								? null
+								: text.length > 200_000
+									? `${text.slice(0, 200_000)}\n… diff truncated at 200 KB`
+									: text,
+					});
 				});
-				log(`- captured diff: ${files.length} file(s)`);
+				await log(`- captured diff: ${files.length} file(s)`);
 			}
 		}
 	}
@@ -4469,7 +4796,7 @@ export function createTurnLoop(
 	/** Builds the run's prompt, reply state, and image list: the fresh pending read (steering
 	 * can land between the pick and the omp spawn), the resume plan, the reply/raw prompt with
 	 * hosted wording appended, and the images the run carries. */
-	function buildTurnInput(
+	async function buildTurnInput(
 		store: ProjectStore,
 		id: string,
 		task: Task,
@@ -4477,33 +4804,32 @@ export function createTurnLoop(
 		header: TurnHeader,
 		idn: TurnIdentity,
 		loc: RunLocation,
-		log: (line: string) => void,
-	): TurnInput {
-		const siblings = store
-			.listTasks()
+		log: (line: string) => void | Promise<void>,
+	): Promise<TurnInput> {
+		const siblings = (await store.listTasks())
 			.filter(
 				(t) => t.id !== id && t.cancelledAt === null && t.stage !== "done",
 			)
 			.map((t) => ({ title: t.title, stage: t.stage, branch: t.branch }));
 		// Fresh read: steering can land between the pick and the omp spawn, so pendingPrompt is read as
 		// late as possible and only the consumed prefix is cleared after startRun.
-		const live = store.getTask(id) ?? task;
+		const live = (await store.getTask(id)) ?? task;
 		const raw = live.pendingPrompt;
-		const pending = resumePendingPrompt(store, live, raw);
+		const pending = await resumePendingPrompt(store, live, raw);
 		const plan = resumePlan(
 			live.sessionId,
 			sessionFile(store.sessionsDir, live.sessionId) !== null,
 			pending,
 		);
 		if (plan.resumeId !== live.sessionId)
-			log(
+			await log(
 				`! omp never saved session ${live.sessionId}; starting a fresh session`,
 			);
 		// startTurn runs after startRun, so the last turn here is the one this reply answers.
 		// A parked merge hold names its hold text as the turn error, so rejectedReport reads it
 		// as a rejected report (AGEN-24): agents read "reply to approve the merge" as an order
 		// and merged by themselves. A hold reason is never a rejection; the reply rides alone.
-		const rejected = rejectedReport(store.listTurns(id).at(-1));
+		const rejected = rejectedReport((await store.listTurns(id)).at(-1));
 		const holdRejected =
 			rejected === UPDATE_HOLD_REASON ||
 			rejected === FORK_HOLD_REASON ||
@@ -4525,25 +4851,26 @@ export function createTurnLoop(
 		const suffix = hostedWordingSuffix(pending, plan, kind);
 		const prompt = suffix === "" ? ownPrompt : `${ownPrompt}\n\n${suffix}`;
 		const turnImages = turnRunImages(kind, live, pending, plan);
-		const imagePaths = turnImages.map((n) => join(store.imagesDir(id), n));
-		logTurnImages(imagePaths, log);
+		const imagesDir = await store.imagesDir(id);
+		const imagePaths = turnImages.map((n) => join(imagesDir, n));
+		await logTurnImages(imagePaths, log);
 		return { live, raw, pending, plan, prompt, turnImages, imagePaths };
 	}
 
 	/** A dep-held card parks the marker; the real reply names each dependency and its end
 	 * state, known only at restart (the scheduler starts the card only once they are done
 	 * or cancelled — a dependency missing from the project counts as done). */
-	function resumePendingPrompt(
+	async function resumePendingPrompt(
 		store: ProjectStore,
 		live: Task,
 		raw: string | null,
-	): string | null {
+	): Promise<string | null> {
 		if (raw !== DEP_HELD_PROMPT) return raw;
-		const all = store.listTasks();
+		const all = await store.listTasks();
 		// OTTR-708: a foreign dependency's title comes from its project's
 		// store; this runs once, on the dep-held restart only.
-		const depProjects = depProjectsOf(projects.values());
-		const ownDep = depProjectOf(store);
+		const depProjects = await turnDepProjects();
+		const ownDep = await depProjectOf(store);
 		return depResumePrompt({
 			deps: live.dependsOn.map((did) => {
 				const d =
@@ -4667,13 +4994,13 @@ export function createTurnLoop(
 	}
 
 	/** Logs every image the run carries, with its size; a missing file says so. */
-	function logTurnImages(
+	async function logTurnImages(
 		imagePaths: string[],
-		log: (line: string) => void,
-	): void {
+		log: (line: string) => void | Promise<void>,
+	): Promise<void> {
 		for (const p of imagePaths) {
 			const st = statSync(p, { throwIfNoEntry: false });
-			log(
+			await log(
 				st
 					? `attached image ${p} (${st.size} bytes)`
 					: `attached image ${p} (missing)`,
@@ -4696,8 +5023,8 @@ export function createTurnLoop(
 		idn: TurnIdentity,
 		loc: RunLocation,
 		input: TurnInput,
-		creditBlocked: () => boolean,
-		log: (line: string) => void,
+		creditBlocked: () => boolean | Promise<boolean>,
+		log: (line: string) => void | Promise<void>,
 	): Promise<TurnRoute | null> {
 		// D6: merge turns mutate shared state (main checkout, push) and stay server-side;
 		// work turns go to the worker pool when one is configured.
@@ -4739,10 +5066,10 @@ export function createTurnLoop(
 		// A cancel landing inside the prepare awaits (resolveTarget, an apt install — minutes on
 		// a merge turn) already owns the card: its kept path wrote the final state. Starting the
 		// run now would drive omp behind a "kept the worktree" card.
-		const preRun = store.getTask(id);
+		const preRun = await store.getTask(id);
 		if (!preRun || preRun.cancelledAt !== null || preRun.state !== "preparing")
 			return null;
-		const { restoreFailed, runModel } = resolveRunModel(
+		const { restoreFailed, runModel } = await resolveRunModel(
 			store,
 			id,
 			input.live,
@@ -4812,11 +5139,12 @@ export function createTurnLoop(
 	async function prepareTurnPackages(
 		name: string,
 		local: boolean,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<TurnPrep | null> {
-		if (local) for (const line of await ops.ensurePackages(name)) log(line);
+		if (local)
+			for (const line of await ops.ensurePackages(name)) await log(line);
 		const prep = local && ops.prepareTurn ? await ops.prepareTurn(name) : null;
-		for (const l of prep?.lines ?? []) log(l);
+		for (const l of prep?.lines ?? []) await log(l);
 		return prep;
 	}
 
@@ -4843,16 +5171,18 @@ export function createTurnLoop(
 
 	/** Parks the card with the cause instead of starting omp; a cancel that landed in the
 	 * prepare awaits already owns the card (same rule as the preRun check below). */
-	function parkBeforeRun(
+	async function parkBeforeRun(
 		store: ProjectStore,
 		id: string,
 		reason: string,
-		log: (line: string) => void,
-	): void {
-		log(`! ${reason}`);
-		const cur = store.getTask(id);
-		if (!cur || cur.cancelledAt !== null || cur.state !== "preparing") return;
-		store.updateTask(id, { state: "needs_you", needsReason: reason });
+		log: (line: string) => void | Promise<void>,
+	): Promise<void> {
+		await log(`! ${reason}`);
+		await store.transaction(async () => {
+			const cur = await store.getTask(id);
+			if (!cur || cur.cancelledAt !== null || cur.state !== "preparing") return;
+			await store.updateTask(id, { state: "needs_you", needsReason: reason });
+		});
 	}
 
 	/** OTTR-754: one cause line per unavailable worker url; the tmpFullLine phrase already
@@ -4884,16 +5214,16 @@ export function createTurnLoop(
 	 * server. A hold that lands after this point cannot strand the turn: the update script
 	 * counts every live run on the runner (the entry's url) before it recreates.
 	 * True when the card parked. */
-	function parkUnavailableWorkers(
+	async function parkUnavailableWorkers(
 		store: ProjectStore,
 		id: string,
 		vmTurn: boolean,
 		worker: WorkerTarget | null,
-		log: (line: string) => void,
-	): boolean {
+		log: (line: string) => void | Promise<void>,
+	): Promise<boolean> {
 		if (worker === null || worker.urls.some(workerUrlUsable)) return false;
 		if (vmTurn) {
-			parkBeforeRun(
+			await parkBeforeRun(
 				store,
 				id,
 				"The microVM runner is drained for an image update, so the turn did not start. The update undrains it when its roll ends; reply to retry.",
@@ -4906,7 +5236,7 @@ export function createTurnLoop(
 		const causes = unavailableWorkerCauses(worker);
 		const why =
 			causes.length > 0 ? causes.join("; ") : "no runner is available";
-		parkBeforeRun(
+		await parkBeforeRun(
 			store,
 			id,
 			`Every worker is unavailable, so the turn did not start: ${why}. The update undrains a drained worker when its roll ends, and the /tmp warning clears when space returns; reply to retry.`,
@@ -4925,11 +5255,11 @@ export function createTurnLoop(
 		vmTurn: boolean,
 		worker: WorkerTarget | null,
 		execModel: string | null,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<{ liveWorker: TurnLiveWorker | null } | null> {
 		if (vmTurn && (worker === null || ops.vmTokens === undefined)) {
 			// Fail closed: never the classic pool or the server for a microVM turn.
-			parkBeforeRun(
+			await parkBeforeRun(
 				store,
 				id,
 				"MicroVM mode is on for this project, but the board has no microVM runner (OTTR_VM_RUNNER_URL). Set it, or turn microVM mode off, then reply to retry.",
@@ -4937,7 +5267,8 @@ export function createTurnLoop(
 			);
 			return null;
 		}
-		if (parkUnavailableWorkers(store, id, vmTurn, worker, log)) return null;
+		if (await parkUnavailableWorkers(store, id, vmTurn, worker, log))
+			return null;
 		const liveWorker =
 			worker === null
 				? null
@@ -4946,7 +5277,7 @@ export function createTurnLoop(
 						token: worker.token,
 					};
 		if (worker !== null && execModel === null) {
-			parkBeforeRun(
+			await parkBeforeRun(
 				store,
 				id,
 				"Sign-in: no model for this worker turn. The card sets none, the saved session names none, and the board's config.yml has no default role. Pick a model on the card, or set modelRoles.default, then reply to retry.",
@@ -4968,21 +5299,21 @@ export function createTurnLoop(
 		id: string,
 		vmTurn: boolean,
 		execModel: string | null,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<TurnEnvValues | null> {
 		const turnEnv = (await ops.turnEnv?.(name, vmTurn ? null : execModel)) ?? {
 			env: {},
 			missing: [],
 		};
 		if (turnEnv.missing.length > 0)
-			log(
+			await log(
 				`env: no value for ${turnEnv.missing.join(", ")} (set it under Settings, Env)`,
 			);
 		if (
 			turnEnv.credentialError !== undefined &&
 			turnEnv.credentialError !== null
 		) {
-			parkBeforeRun(
+			await parkBeforeRun(
 				store,
 				id,
 				signInNeedsReason(
@@ -5002,20 +5333,21 @@ export function createTurnLoop(
 	 * board turn on the default role reruns with the board's default role. The card's model
 	 * stays. The model that runs (and that the turn row records): a worker turn's execution
 	 * model, else the restore fallback or the card's model of a local run. */
-	function resolveRunModel(
+	async function resolveRunModel(
 		store: ProjectStore,
 		id: string,
 		live: Task,
 		plan: TurnPlan,
 		worker: WorkerTarget | null,
 		execModel: string | null,
-		log: (line: string) => void,
-	): { restoreFailed: boolean; runModel: string | null } {
+		log: (line: string) => void | Promise<void>,
+	): Promise<{ restoreFailed: boolean; runModel: string | null }> {
 		const restoreFailed =
 			live.model === null &&
 			worker === null &&
 			plan.resumeId !== null &&
-			store.listTurns(id).at(-1)?.error?.startsWith(MODEL_RESTORE) === true;
+			(await store.listTurns(id)).at(-1)?.error?.startsWith(MODEL_RESTORE) ===
+				true;
 		const runModel =
 			worker !== null
 				? execModel
@@ -5023,7 +5355,7 @@ export function createTurnLoop(
 					? ((ops.modelRoles ?? modelRoles)().default ?? null)
 					: live.model;
 		if (restoreFailed)
-			log(
+			await log(
 				runModel === null
 					? "! the board has no default model role to replace the session's model"
 					: `- model ${runModel}: the board's default role replaces the session's model`,
@@ -5049,8 +5381,8 @@ export function createTurnLoop(
 		kind: TurnKind,
 		live: Task,
 		runModel: string | null,
-		creditBlocked: () => boolean,
-		log: (line: string) => void,
+		creditBlocked: () => boolean | Promise<boolean>,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
 		const userOverride =
 			live.pendingPrompt !== null && live.pendingBy !== "supervisor";
@@ -5059,28 +5391,32 @@ export function createTurnLoop(
 			: await usageResetFor(
 					runModel ?? (ops.modelRoles ?? modelRoles)().default ?? null,
 				);
-		if (creditBlocked()) return true;
+		if (await creditBlocked()) return true;
 		if (userOverride)
-			log("- user message queued: the usage-limit start gate does not hold");
+			await log(
+				"- user message queued: the usage-limit start gate does not hold",
+			);
 		if (startHold !== null) {
 			const at = new Date(startHold.resetsAt)
 				.toISOString()
 				.slice(0, 16)
 				.replace("T", " ");
-			log(
+			await log(
 				`- ${kind} turn held until ${at} UTC: ${startHold.provider} usage limit`,
 			);
-			const cur = store.getTask(id);
-			if (cur && cur.cancelledAt === null && cur.state === "preparing")
-				store.updateTask(id, {
-					state: "queued",
-					queuedAt: Date.now(),
-					holdUntil: startHold.resetsAt,
-					holdProvider: startHold.provider,
-					holdWindow: startHold.window,
-					holdSetAt: Date.now(),
-					needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
-				});
+			await store.transaction(async () => {
+				const cur = await store.getTask(id);
+				if (cur && cur.cancelledAt === null && cur.state === "preparing")
+					await store.updateTask(id, {
+						state: "queued",
+						queuedAt: Date.now(),
+						holdUntil: startHold.resetsAt,
+						holdProvider: startHold.provider,
+						holdWindow: startHold.window,
+						holdSetAt: Date.now(),
+						needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
+					});
+			});
 			ops.publishSoon();
 			return true;
 		}
@@ -5131,7 +5467,7 @@ export function createTurnLoop(
 
 	/** The options object one turn's agent run starts with: identity, location, prompt and
 	 * images, routing, metering, and the live progress/session entries. */
-	function turnRunStartOptions(
+	async function turnRunStartOptions(
 		ops: TurnOps,
 		runMeter: ReturnType<OpenRunMeter>,
 		name: string,
@@ -5146,11 +5482,11 @@ export function createTurnLoop(
 		kind: TurnKind,
 		mx: TurnRunShared,
 		marks: Record<string, string>,
-	): Parameters<TurnOps["startRun"]>[0] {
+	): Promise<Parameters<TurnOps["startRun"]>[0]> {
 		// OTTR-876: the served read-only token joins the run's redaction secrets and, on
 		// worker/VM dispatch, rides githubReadEnv (applied after the strips on the target);
 		// a local run ignores it (docs/specs/turn-read-token.md).
-		const turnRead = ops.turnReadToken?.() ?? null;
+		const turnRead = (await ops.turnReadToken?.()) ?? null;
 		return {
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
@@ -5161,7 +5497,7 @@ export function createTurnLoop(
 			prompt: input.prompt,
 			images: input.imagePaths,
 			// OTTR-693: the identity this turn's git commits with when its home config names none.
-			commitIdentity: ops.commitIdentity?.() ?? null,
+			commitIdentity: (await ops.commitIdentity?.()) ?? null,
 			sessionDir: store.sessionsDir,
 			extensionPath: ops.extensionPath,
 			board: idn.retroCard ? null : { ...ops.board, project: name, taskId: id },
@@ -5197,15 +5533,16 @@ export function createTurnLoop(
 			stripGithubToken: idn.scout,
 			...turnRunTools(idn),
 			dataRoot: store.dataRoot,
-			logPath: store.logPath(id),
+			logPath: await store.logPath(id),
 			onLog: () => ops.notifyLog(name, id),
 			onProgress: (text) => dispatchProgressEntry(mx, ops, text),
-			onSession: (sid) => dispatchSessionEntry(store, id, kind, sid),
+			onSession: async (sid) =>
+				await dispatchSessionEntry(store, id, kind, sid),
 			// A review run stores each finding the moment the runner parses it (the
 			// spec's arrival persistence); other cards store nothing.
 			...(idn.reviewCard && {
-				onRecorded: (finding: RecordedFinding) => {
-					store.appendReviewFinding(id, finding);
+				onRecorded: async (finding: RecordedFinding) => {
+					await store.appendReviewFinding(id, finding);
 				},
 			}),
 		};
@@ -5246,20 +5583,22 @@ export function createTurnLoop(
 
 	/** The run's session entry: a session id only lands while the card still reads preparing
 	 * and uncancelled; the first work run of a todo card moves the stage. */
-	function dispatchSessionEntry(
+	async function dispatchSessionEntry(
 		store: ProjectStore,
 		id: string,
 		kind: TurnKind,
 		sid: string,
-	): void {
-		const cur = store.getTask(id);
-		if (cur?.state !== "preparing" || cur.cancelledAt !== null) return;
-		store.updateTask(id, {
-			sessionId: sid,
-			state: "running",
-			...(kind === "work" && cur.stage === "todo"
-				? { stage: "in_progress" }
-				: {}),
+	): Promise<void> {
+		return await store.transaction(async () => {
+			const cur = await store.getTask(id);
+			if (cur?.state !== "preparing" || cur.cancelledAt !== null) return;
+			await store.updateTask(id, {
+				sessionId: sid,
+				state: "running",
+				...(kind === "work" && cur.stage === "todo"
+					? { stage: "in_progress" }
+					: {}),
+			});
 		});
 	}
 
@@ -5281,7 +5620,7 @@ export function createTurnLoop(
 		route: TurnRoute,
 		mx: TurnRunShared,
 		openMeter: OpenRunMeter,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<TurnDispatch | null> {
 		// The HTTP-400 correlation window: from just before the omp spawn to the run's end.
 		const runStartedAt = Date.now();
@@ -5298,50 +5637,53 @@ export function createTurnLoop(
 		const runMeter = openMeter("default", true);
 		// A retro, review or scout run carries its env marks (a retro or review adds
 		// OTTR_MODELS: its proposal files past the card-filing routes' catalog check,
-		// so propose_task must check at record time). Awaited only for these rare
-		// turns; a work turn's spawn path stays synchronous.
+		// so propose_task must check at record time).
 		const marks =
 			idn.retroCard || idn.reviewCard || idn.scout
 				? await retroEnvMarks(idn)
 				: {};
-		const handle = ops.startRun(
-			turnRunStartOptions(
-				ops,
-				runMeter,
-				name,
-				e,
-				id,
-				header,
-				loc,
-				input,
-				route,
-				idn,
-				store,
-				kind,
-				mx,
-				marks,
-			),
+		const options = await turnRunStartOptions(
+			ops,
+			runMeter,
+			name,
+			e,
+			id,
+			header,
+			loc,
+			input,
+			route,
+			idn,
+			store,
+			kind,
+			mx,
+			marks,
 		);
+		const started = ops.startRun(options);
+		// A local fallback may fill its pid after the original dispatch snapshot.
+		const pidAtStart = started instanceof Promise ? undefined : started.pid;
+		const handle = await started;
 		mx.entry = handle;
 		running.set(key, mx.entry);
-		// Awaited only where the original awaited (a microVM dispatch): the sync path must
-		// not yield, so a pid that fills in a later microtask is still null at startTurn.
+		// A microVM refusal must precede the input consume and the turn row.
 		if (route.vmTurn && handle.accepted !== undefined) {
 			const ok = await vmAcceptance(store, id, task, key, handle, log);
 			if (!ok) return null;
 		}
-		consumeTurnPending(store, id, input);
-		const turn = recordTurnRow(
-			store,
-			id,
-			kind,
-			input,
-			route,
-			mx,
-			handle,
-			header,
-			runStartedAt,
-		);
+		const turn = await store.transaction(async () => {
+			await consumeTurnPending(store, id, input);
+			return await recordTurnRow(
+				store,
+				id,
+				kind,
+				input,
+				route,
+				mx,
+				handle,
+				header,
+				runStartedAt,
+				route.vmTurn || pidAtStart === undefined ? handle.pid : pidAtStart,
+			);
+		});
 		return { handle, runMeter, runStartedAt, turn };
 	}
 
@@ -5355,7 +5697,7 @@ export function createTurnLoop(
 		task: Task,
 		key: string,
 		handle: TurnRunHandle,
-		log: (line: string) => void,
+		log: (line: string) => void | Promise<void>,
 	): Promise<boolean> {
 		if (handle.accepted === undefined) return true;
 		const started = await handle.accepted;
@@ -5368,15 +5710,19 @@ export function createTurnLoop(
 		running.delete(key);
 		vmState.busy.add(key);
 		vmBusyAt.set(key, Date.now());
-		log(`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`);
-		const cur = store.getTask(id);
-		// A cancel or stop that landed meanwhile owns the card.
-		if (cur && cur.cancelledAt === null && cur.state === "preparing")
-			store.updateTask(id, {
-				state: "queued",
-				needsReason: task.needsReason,
-				asked: task.asked,
-			});
+		await log(
+			`- ${WORKER_BUSY}; the card waits in the queue for a free microVM`,
+		);
+		await store.transaction(async () => {
+			const cur = await store.getTask(id);
+			// A cancel or stop that landed meanwhile owns the card.
+			if (cur && cur.cancelledAt === null && cur.state === "preparing")
+				await store.updateTask(id, {
+					state: "queued",
+					needsReason: task.needsReason,
+					asked: task.asked,
+				});
+		});
 		ops.publishSoon();
 		return false;
 	}
@@ -5388,24 +5734,26 @@ export function createTurnLoop(
 	 * that separator is this turn's text: a cancelled steer replaced by one that merely starts
 	 * with raw stays whole. Same prefix rule for images: a steer landing since the build
 	 * appends, so drop only what this turn sends. */
-	function consumeTurnPending(
+	async function consumeTurnPending(
 		store: ProjectStore,
 		id: string,
 		input: TurnInput,
-	): void {
-		const fresh = store.getTask(id);
-		let rest = fresh?.pendingPrompt ?? null;
-		if (input.raw !== null && input.pending !== null && rest !== null) {
-			if (rest === input.raw) rest = null;
-			else if (rest.startsWith(`${input.raw}\n\n`))
-				rest = rest.slice(input.raw.length + 2) || null;
-		}
-		const restImages = stripConsumedImages(fresh, input);
-		store.updateTask(id, {
-			pendingPrompt: rest,
-			pendingImages: restImages,
-			// rest holds only steering that landed mid-run (user); a full consume clears.
-			pendingBy: rest === null ? null : "user",
+	): Promise<void> {
+		return await store.transaction(async () => {
+			const fresh = await store.getTask(id);
+			let rest = fresh?.pendingPrompt ?? null;
+			if (input.raw !== null && input.pending !== null && rest !== null) {
+				if (rest === input.raw) rest = null;
+				else if (rest.startsWith(`${input.raw}\n\n`))
+					rest = rest.slice(input.raw.length + 2) || null;
+			}
+			const restImages = stripConsumedImages(fresh, input);
+			await store.updateTask(id, {
+				pendingPrompt: rest,
+				pendingImages: restImages,
+				// rest holds only steering that landed mid-run (user); a full consume clears.
+				pendingBy: rest === null ? null : "user",
+			});
 		});
 	}
 
@@ -5426,7 +5774,7 @@ export function createTurnLoop(
 	 * here too; the "." continue marker is not user text), the dispatch snapshot of the
 	 * --model, the pending text's authorship, the layer this run pinned at start, and the
 	 * card-log byte offset captured with the header write. */
-	function recordTurnRow(
+	async function recordTurnRow(
 		store: ProjectStore,
 		id: string,
 		kind: TurnKind,
@@ -5436,18 +5784,19 @@ export function createTurnLoop(
 		handle: TurnRunHandle,
 		header: TurnHeader,
 		runStartedAt: number,
-	): Turn {
+		pid: number | null = handle.pid,
+	): Promise<Turn> {
 		const turnInput =
 			input.pending &&
 			(input.plan.resumeId !== null ||
 				(input.plan.note !== null && input.pending !== "."))
 				? input.pending
 				: null;
-		const turn = store.startTurn(
+		const turn = await store.startTurn(
 			id,
 			kind,
 			input.prompt,
-			handle.pid,
+			pid,
 			// The user text this turn delivered (steer or reply) — the timeline shows it on the turn.
 			// A fresh session that folded the reply into its prompt records it here too; the "."
 			// continue marker is not user text.
@@ -5542,7 +5891,7 @@ export function createTurnLoop(
 		dispatch: TurnDispatch,
 		mx: TurnRunShared,
 		openMeter: OpenRunMeter,
-		creditBlocked: () => boolean,
+		creditBlocked: () => boolean | Promise<boolean>,
 	): Promise<boolean> {
 		// RunEntry.done is Promise<unknown> for test fakes; the real handle resolves a RunResult.
 		const result0 = (await dispatch.handle.done) as RunResult;
@@ -5563,7 +5912,7 @@ export function createTurnLoop(
 			mx,
 			openMeter,
 			creditBlocked,
-			log: (line) => appendLog(e.store, id, line),
+			log: async (line) => await appendLog(e.store, id, line),
 			result: result0,
 			vmOut: null,
 			runEndedAt: 0,
@@ -5602,7 +5951,7 @@ export function createTurnLoop(
 			checkWillRun: false,
 		};
 		if (await readTurnOutcome(st, result0)) return true;
-		readRunReport(st, result0);
+		await readRunReport(st, result0);
 		running.delete(key);
 		if (await settleKilledRun(st)) return true;
 		await analyzeTurnTree(st);
@@ -5615,13 +5964,24 @@ export function createTurnLoop(
 		const guarded = await guardUiShot(st, stabilized);
 		const planned = await planSettleWrite(st, guarded);
 		await recordSyncFindings(st);
-		if (await finishTurnRow(st, planned)) return true;
-		planTurnChecks(st, planned);
-		writeSettledCard(st, planned);
+		const swap = modelSwap(st.result.model, st.route.runModel);
+		if (swap !== null)
+			await st.log(
+				`! model swap: dispatched ${swap} but the run served ${turnModel(st.result.model, st.route.runModel)}${st.result.providerError ? ` (${st.result.providerError})` : ""} — the card keeps ${swap} for its next turn`,
+			);
+		const cancelled = await st.store.transaction(async () => {
+			if (await finishTurnRow(st, planned)) return true;
+			await planTurnChecks(st, planned);
+			await writeSettledCard(st, planned);
+			return false;
+		});
+		await st.store.captureTurnData(st.dispatch.turn.id);
+		if (cancelled) return true;
+		st.plannedNext = planned;
 		await fileRetroProposal(st, planned);
 		if (await runReviewCheck(st)) return true;
 		if (await runWorkCheck(st, planned)) return true;
-		writePostCheckState(st, planned);
+		await writePostCheckState(st, planned);
 		await stampDoneCard(st, planned);
 		return false;
 	}
@@ -5656,13 +6016,13 @@ export function createTurnLoop(
 		st.vmOut = vmOut;
 		if (vmOut === null) return;
 		if (vmOut.pushError !== null)
-			st.log(`! microVM push failed: ${vmOut.pushError}`);
+			await st.log(`! microVM push failed: ${vmOut.pushError}`);
 		// The card run always holds a branch name here: vmTurn requires a non-special card.
 		const branch = st.loc.special ? (st.task.branch ?? "") : st.loc.branch;
 		await syncVmTip(st, branch, vmOut);
 		// Uncommitted files the turn leaves for the board (the research report, shots)
 		// never ride a push: the sentinel carries them, before the report read below.
-		if (vmOut.files) writeVmFiles(st.loc.wt, vmOut.files, st.log);
+		if (vmOut.files) await writeVmFiles(st.loc.wt, vmOut.files, st.log);
 	}
 
 	/** The branch-tip read a microVM settle syncs against: log a reported head that is not the
@@ -5679,38 +6039,43 @@ export function createTurnLoop(
 						.targetSha(st.e.path, `refs/heads/${branch}`)
 						.catch(() => null);
 		if (vmOut.head !== null && tip !== null && vmOut.head !== tip)
-			st.log(
+			await st.log(
 				`! microVM: reported head ${vmOut.head} is not the branch tip ${tip}`,
 			);
 		if (tip === null)
-			st.log(
+			await st.log(
 				`! microVM: branch ${branch ?? "(none)"} does not resolve; the worktree is not synced`,
 			);
 		else if (ops.syncWorktreeTo) {
 			const syncTo = ops.syncWorktreeTo;
 			const current = await ops.targetSha(st.loc.wt, "HEAD").catch(() => null);
 			if (current !== tip)
-				await syncTo(st.loc.wt, tip).catch((err: unknown) =>
-					st.log(
-						`! microVM: syncing the worktree to ${tip} failed: ${errmsg(err)}`,
-					),
+				await syncTo(st.loc.wt, tip).catch(
+					async (err: unknown) =>
+						await st.log(
+							`! microVM: syncing the worktree to ${tip} failed: ${errmsg(err)}`,
+						),
 				);
 		}
 	}
 
 	/** The agent self-declares research by writing the report file; its presence at settle flips
-	 * the card. Sync read: settle must stay within one microtask flush (tests await runTurn or
-	 * flush microtasks only). No symlink is followed: a worker could point the file at a
-	 * server-only secret (OTTR-233). */
-	function readRunReport(st: TurnSettle, result0: RunResult): void {
-		const report = readReportFile(st);
-		// First capture wins: persist the report the moment it is read, so any settle that
-		// can read the file keeps its text even when the turn parks before the card write.
-		if (report.text !== null && st.task.report === null)
-			st.store.updateTask(st.id, { report: report.text });
+	 * the card. The file read stays outside the database transaction.
+	 * No symlink is followed: a worker could otherwise read a server-only secret (OTTR-233). */
+	async function readRunReport(
+		st: TurnSettle,
+		result0: RunResult,
+	): Promise<void> {
+		const report = await readReportFile(st);
 		const autoResearch =
 			!st.idn.releaseCard && !st.task.research && report.text !== null;
-		if (autoResearch) st.store.updateTask(st.id, { research: true });
+		await st.store.transaction(async () => {
+			const current = await st.store.getTask(st.id);
+			if (current === null || current.cancelledAt !== null) return;
+			if (report.text !== null && current.report === null)
+				await st.store.updateTask(st.id, { report: report.text });
+			if (autoResearch) await st.store.updateTask(st.id, { research: true });
+		});
 		const wasResearch = st.task.research || autoResearch;
 		// A research card's later turn can do real work: a ready outcome, landable clean
 		// commits, and no report file (it cleared the file it once self-declared with). The
@@ -5742,10 +6107,10 @@ export function createTurnLoop(
 
 	/** Reads the research report file out of the worktree (work cards only). A refused report
 	 * (symlink, not a file, too big) holds the card: no quarantine, no removal. */
-	function readReportFile(st: TurnSettle): {
+	async function readReportFile(st: TurnSettle): Promise<{
 		text: string | null;
 		error: string | null;
-	} {
+	}> {
 		if (
 			!(
 				st.kind === "work" &&
@@ -5767,7 +6132,7 @@ export function createTurnLoop(
 			};
 		} catch (err) {
 			const error = errmsg(err);
-			st.log(`! ${RESEARCH_REPORT}: ${error}`);
+			await st.log(`! ${RESEARCH_REPORT}: ${error}`);
 			return { text: null, error };
 		}
 	}
@@ -5775,24 +6140,28 @@ export function createTurnLoop(
 	/** A stop-turn request owns this kill: end the row as stopped and park the card like Esc —
 	 * worktree, branch and session stay, the user replies. True: the turn stops. */
 	async function settleKilledRun(st: TurnSettle): Promise<boolean> {
-		if (!st.result.killed && !st.store.getTask(st.id)?.cancelledAt)
-			return false;
-		const stopReason = stopping.get(st.key);
-		stopping.delete(st.key);
-		st.store.finishTurn(st.dispatch.turn.id, {
-			endedAt: Date.now(),
-			exitCode: st.result.exitCode,
-			error: stopReason !== undefined ? "stopped" : "cancelled",
-		});
-		// A cancel that landed meanwhile owns the card: cancelTask writes its kept
-		// or idle state after the kill, so only mark the card when no cancel ran.
-		const cur = st.store.getTask(st.id);
-		if (stopReason !== undefined && cur && cur.cancelledAt === null)
-			st.store.updateTask(st.id, {
-				state: "needs_you",
-				needsReason: stopReason,
+		const settled = await st.store.transaction(async () => {
+			if (!st.result.killed && !(await st.store.getTask(st.id))?.cancelledAt)
+				return false;
+			const stopReason = stopping.get(st.key);
+			stopping.delete(st.key);
+			await st.store.finishTurnState(st.dispatch.turn.id, {
+				endedAt: Date.now(),
+				exitCode: st.result.exitCode,
+				error: stopReason !== undefined ? "stopped" : "cancelled",
 			});
-		return true;
+			// A cancel that landed meanwhile owns the card: cancelTask writes its kept
+			// or idle state after the kill, so only mark the card when no cancel ran.
+			const cur = await st.store.getTask(st.id);
+			if (stopReason !== undefined && cur && cur.cancelledAt === null)
+				await st.store.updateTask(st.id, {
+					state: "needs_you",
+					needsReason: stopReason,
+				});
+			return true;
+		});
+		if (settled) await st.store.captureTurnData(st.dispatch.turn.id);
+		return settled;
 	}
 
 	/** ponytail: after an agent removes its worktree, an empty folder can stay (omp's cwd holds
@@ -5846,7 +6215,7 @@ export function createTurnLoop(
 		if (!st.result.outcome) return;
 		const seen = new Set<string>();
 		const stored: { name: string; gray: Uint8Array }[] = [];
-		seedStoredShots(st, seen, stored);
+		await seedStoredShots(st, seen, stored);
 		const reported = st.result.outcome.shots ?? [];
 		const copied: DecodedImage[] = [];
 		// Grays of this run's new copies: a second capture of the same new screen
@@ -5856,13 +6225,15 @@ export function createTurnLoop(
 			try {
 				await adoptShot(st, seen, stored, batch, copied, shot, p);
 			} catch (err) {
-				st.log(`! shot ${shot}: ${err instanceof Error ? err.message : err}`);
+				await st.log(
+					`! shot ${shot}: ${err instanceof Error ? err.message : err}`,
+				);
 			}
 		}
 		if (copied.length > 0) {
 			const names = saveImages(
 				st.store.dataRoot,
-				st.store.imagesDir(st.id),
+				await st.store.imagesDir(st.id),
 				copied,
 			);
 			st.shots = [...st.task.shots, ...names].slice(-8); // cap 8, keep newest
@@ -5871,14 +6242,14 @@ export function createTurnLoop(
 
 	/** Seeds the dedup state with what the card already stores; pruned or absent shots
 	 * contribute nothing. */
-	function seedStoredShots(
+	async function seedStoredShots(
 		st: TurnSettle,
 		seen: Set<string>,
 		stored: { name: string; gray: Uint8Array }[],
-	): void {
+	): Promise<void> {
 		for (const name of st.task.shots) {
 			try {
-				const bytes = readRegular(join(st.store.imagesDir(st.id), name));
+				const bytes = readRegular(join(await st.store.imagesDir(st.id), name));
 				seen.add(createHash("sha256").update(bytes).digest("hex"));
 				const gray = pngGray16(bytes);
 				if (gray !== null) stored.push({ name, gray });
@@ -5926,7 +6297,7 @@ export function createTurnLoop(
 		p: string,
 	): Promise<void> {
 		if (!p.startsWith(resolve(st.loc.wt) + sep)) {
-			st.log(
+			await st.log(
 				`! shot ${shot}: path escapes the worktree — keep the path inside the worktree, for example shots/<name>.png (shots/ is gitignored)`,
 			);
 			return;
@@ -5939,12 +6310,12 @@ export function createTurnLoop(
 		if (bytes === null) throw new Error("no such file");
 		const ext = sniffImage(bytes);
 		if (ext === null) {
-			st.log(`! shot ${shot}: not a recognized image`);
+			await st.log(`! shot ${shot}: not a recognized image`);
 			return;
 		}
 		const hash = createHash("sha256").update(bytes).digest("hex");
 		if (seen.has(hash)) {
-			st.log(`! shot ${shot}: duplicate of an existing screenshot`);
+			await st.log(`! shot ${shot}: duplicate of an existing screenshot`);
 			return;
 		}
 		const gray = pngGray16(bytes);
@@ -5954,7 +6325,7 @@ export function createTurnLoop(
 			copied.push({ bytes, ext });
 			return;
 		}
-		if (adoptVisualTwin(st, stored, batch, gray, bytes, shot)) return;
+		if (await adoptVisualTwin(st, stored, batch, gray, bytes, shot)) return;
 		seen.add(hash);
 		copied.push({ bytes, ext });
 		batch.push(gray);
@@ -5963,14 +6334,14 @@ export function createTurnLoop(
 	/** A re-capture of an unchanged screen (new bytes, same pixels) matches an existing shot
 	 * visually and replaces it, so a check send-back round does not double every screenshot on
 	 * the card. True: the shot was a twin (stored, or saved this turn) — nothing to copy. */
-	function adoptVisualTwin(
+	async function adoptVisualTwin(
 		st: TurnSettle,
 		stored: { name: string; gray: Uint8Array }[],
 		batch: Uint8Array[],
 		gray: Uint8Array,
 		bytes: Uint8Array,
 		shot: string,
-	): boolean {
+	): Promise<boolean> {
 		const twin = stored.findIndex((s) => visuallyIdentical(s.gray, gray));
 		const twinShot = stored[twin];
 		const batchTwin =
@@ -5982,18 +6353,20 @@ export function createTurnLoop(
 			// instead of appending a second copy of it.
 			writeBelow(
 				st.store.dataRoot,
-				join(st.store.imagesDir(st.id), twinShot.name),
+				join(await st.store.imagesDir(st.id), twinShot.name),
 				bytes,
 				"truncate",
 			);
 			stored[twin] = { name: twinShot.name, gray };
-			st.log(
+			await st.log(
 				`! shot ${shot}: visually identical to ${twinShot.name} — replaced it`,
 			);
 			return true;
 		}
 		if (batchTwin !== -1) {
-			st.log(`! shot ${shot}: visually identical to a shot saved this turn`);
+			await st.log(
+				`! shot ${shot}: visually identical to a shot saved this turn`,
+			);
 			return true;
 		}
 		return false;
@@ -6022,13 +6395,13 @@ export function createTurnLoop(
 				st.store.dataRoot,
 			);
 			if (moved.length > 0)
-				appendLog(
+				await appendLog(
 					st.store,
 					st.id,
 					`quarantined ${moved.length} untracked file(s) to .tasks/quarantine/${st.id}: ${moved.slice(0, 20).join(", ")}${moved.length > 20 ? " …" : ""}`,
 				);
 		} catch (err) {
-			appendLog(st.store, st.id, `quarantine failed: ${errmsg(err)}`);
+			await appendLog(st.store, st.id, `quarantine failed: ${errmsg(err)}`);
 		}
 	}
 
@@ -6104,8 +6477,8 @@ export function createTurnLoop(
 	}
 
 	/** A cancel owns the card after an await, even when its kept path clears cancelledAt. */
-	function canShipPr(st: TurnSettle): boolean {
-		const task = st.store.getTask(st.id);
+	async function canShipPr(st: TurnSettle): Promise<boolean> {
+		const task = await st.store.getTask(st.id);
 		return (
 			task !== null &&
 			task.cancelledAt === null &&
@@ -6125,7 +6498,7 @@ export function createTurnLoop(
 	 * opens a fresh one after a close, and the stored PR fields and pushSha pin
 	 * the new head. */
 	async function shipPrCard(st: TurnSettle): Promise<void> {
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const outcome = st.result.outcome;
 		if (outcome?.status !== "integrated") {
 			if (outcome === null)
@@ -6148,7 +6521,7 @@ export function createTurnLoop(
 		// its PR in the prompt's first line; adopt that PR instead of opening a
 		// duplicate one at ship time.
 		const legacy = await resolveLegacyDependabotPr(st);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (legacy.kind === "parked") return;
 		if (legacy.kind === "match") {
 			await shipSourcePrCard(st, legacy.n, legacy.src);
@@ -6183,7 +6556,7 @@ export function createTurnLoop(
 		n: number,
 		src: SourcePrRef,
 	): Promise<void> {
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const prBranch = st.task.branch ?? "";
 		const head = await refreshedSourceHead(st, n, src);
 		if (head === null) {
@@ -6198,7 +6571,7 @@ export function createTurnLoop(
 		const tip = await ops
 			.targetSha(st.e.path, `refs/heads/${prBranch}`)
 			.catch(() => null);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (tip === null || prBranch === "") {
 			st.prNext = {
 				stage: "merging",
@@ -6209,9 +6582,9 @@ export function createTurnLoop(
 		}
 		const sameTree =
 			tip === head || ((await ops.treesEqual?.(st.e.path, head, tip)) ?? false);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (sameTree) {
-			adoptSourcePr(st, n, head, src.url);
+			await adoptSourcePr(st, n, head, src.url);
 			return;
 		}
 		// The card's fixes are the commits after the source PR's head: an empty
@@ -6225,13 +6598,13 @@ export function createTurnLoop(
 		// empty.
 		const beyond = await commitsBeyondHead(st, head, tip);
 		if (beyond === 0) {
-			adoptSourcePr(st, n, head, src.url);
+			await adoptSourcePr(st, n, head, src.url);
 			return;
 		}
 		if (beyond !== null) {
 			const reproduced = await bumpReproducesCard(st, head, tip);
 			if (reproduced) {
-				adoptSourcePr(st, n, head, src.url);
+				await adoptSourcePr(st, n, head, src.url);
 				return;
 			}
 		}
@@ -6240,7 +6613,7 @@ export function createTurnLoop(
 		const onHead = await ops
 			.targetContains(st.e.path, head, tip)
 			.catch(() => false);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const pushable =
 			onHead && src.crossRepo !== true && src.dependabot !== true;
 		if (pushable) {
@@ -6324,18 +6697,21 @@ export function createTurnLoop(
 			`${githubHost().webBase}/${repo}.git`,
 		).catch((e: unknown) => errmsg(e));
 		if (err !== null) {
-			st.log(`! refreshing the source PR #${n} head failed: ${err}`);
+			await st.log(`! refreshing the source PR #${n} head failed: ${err}`);
 			return src.headSha;
 		}
 		const sha = await ops
 			.targetSha(st.e.path, `refs/ottr/pr/${n}`)
 			.catch(() => null);
 		if (sha === null || sha === src.headSha) return src.headSha;
-		st.store.updateTask(st.id, { sourcePrHeadSha: sha });
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, { sourcePrHeadSha: sha });
+		});
 		// Keep the fresh sha in the ref too: the park's stamp below must not
 		// overwrite it with the stale one the ship started from.
 		src.headSha = sha;
-		st.log(`- source PR #${n} head refreshed to ${sha.slice(0, 7)}`);
+		await st.log(`- source PR #${n} head refreshed to ${sha.slice(0, 7)}`);
 		return sha;
 	}
 
@@ -6350,7 +6726,7 @@ export function createTurnLoop(
 		| { kind: "parked" }
 		| { kind: "match"; n: number; src: SourcePrRef }
 	> {
-		if (!canShipPr(st)) return { kind: "parked" };
+		if (!(await canShipPr(st))) return { kind: "parked" };
 		const repo = st.e.github === null ? null : ownerRepo(st.e.github);
 		if (repo === null) return { kind: "none" };
 		const n = parseDependabotHeadLine(
@@ -6369,7 +6745,7 @@ export function createTurnLoop(
 		const fetchErr = await ops
 			.fetchPrHead(st.e.path, n, `${githubHost().webBase}/${repo}.git`)
 			.catch((err: unknown) => errmsg(err));
-		if (!canShipPr(st)) return { kind: "parked" };
+		if (!(await canShipPr(st))) return { kind: "parked" };
 		if (fetchErr !== null) {
 			st.prNext = {
 				stage: "merging",
@@ -6381,7 +6757,7 @@ export function createTurnLoop(
 		const sha = await ops
 			.targetSha(st.e.path, `refs/ottr/pr/${n}`)
 			.catch(() => null);
-		if (!canShipPr(st)) return { kind: "parked" };
+		if (!(await canShipPr(st))) return { kind: "parked" };
 		if (sha === null) {
 			st.prNext = {
 				stage: "merging",
@@ -6409,22 +6785,25 @@ export function createTurnLoop(
 	 * finishes the card when GitHub merges it, and the drawer's PR badge links the original
 	 * PR. pushSha stays null — the PR's CI runs on a head the author can rebase any time,
 	 * so the board watches the PR, never a pinned sha. */
-	function adoptSourcePr(
+	async function adoptSourcePr(
 		st: TurnSettle,
 		n: number,
 		prHeadSha: string,
 		url: string | null,
-	): void {
-		if (!canShipPr(st)) return;
-		st.store.updateTask(st.id, {
-			prNumber: n,
-			prUrl: url,
-			prHeadSha,
-			// A clean bump leaves no follow-up PR; a stale stamp from an earlier ship must go.
-			followUpPrNumber: null,
-			followUpPrUrl: null,
+	): Promise<void> {
+		if (!(await canShipPr(st))) return;
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, {
+				prNumber: n,
+				prUrl: url,
+				prHeadSha,
+				// A clean bump leaves no follow-up PR; a stale stamp from an earlier ship must go.
+				followUpPrNumber: null,
+				followUpPrUrl: null,
+			});
 		});
-		appendLog(
+		await appendLog(
 			st.store,
 			st.id,
 			`- source PR #${n} stays the card's PR; the tracker waits for GitHub to merge it`,
@@ -6441,7 +6820,7 @@ export function createTurnLoop(
 		prBranch: string,
 		tip: string,
 	): Promise<void> {
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const dst = src.headRef;
 		const pushBranch = ops.pushBranch;
 		if (pushBranch === undefined || dst === null) {
@@ -6461,13 +6840,13 @@ export function createTurnLoop(
 				error: errmsg(err),
 			}),
 		);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (pr.status !== "pushed") {
-			logPrPushFailure(st, dst, pr);
+			await logPrPushFailure(st, dst, pr);
 			return;
 		}
-		st.log(`- pushed the card's fixes to ${dst} (source PR #${n})`);
-		adoptSourcePr(st, n, tip, src.url);
+		await st.log(`- pushed the card's fixes to ${dst} (source PR #${n})`);
+		await adoptSourcePr(st, n, tip, src.url);
 	}
 
 	/** Ships a Dependabot card's fixes as a follow-up PR: the bot owns the source PR's
@@ -6513,10 +6892,10 @@ export function createTurnLoop(
 			}),
 		);
 		if (pr.status !== "pushed") {
-			logPrPushFailure(st, prBranch, pr);
+			await logPrPushFailure(st, prBranch, pr);
 			return;
 		}
-		st.log(`- pushed ${prBranch} (the fixes beyond source PR #${n})`);
+		await st.log(`- pushed ${prBranch} (the fixes beyond source PR #${n})`);
 		// On top of the PR head the fixes land with the bump; a diverged branch or a
 		// legacy card without the head name bases on the target, where they land after
 		// the bump merges.
@@ -6554,7 +6933,7 @@ export function createTurnLoop(
 			}));
 		if (opened === undefined || !opened.ok) {
 			const error = opened === undefined ? "openPr is not wired" : opened.error;
-			st.log(`! opening the follow-up pull request failed: ${error}`);
+			await st.log(`! opening the follow-up pull request failed: ${error}`);
 			st.prNext = {
 				stage: "merging",
 				state: "needs_you",
@@ -6578,21 +6957,24 @@ export function createTurnLoop(
 				error: errmsg(err),
 			}));
 		if (res !== undefined && !res.ok)
-			st.log(`! commenting on source PR #${n} failed: ${res.error}`);
+			await st.log(`! commenting on source PR #${n} failed: ${res.error}`);
 		// pushSha stays null: the bot may rebase its branch, so the board watches the
 		// PRs, never a pinned sha.
-		st.store.updateTask(st.id, {
-			stage: "merging",
-			state: "idle",
-			needsReason: null,
-			prNumber: n,
-			prUrl: src.url,
-			prHeadSha: tip,
-			pushSha: null,
-			followUpPrNumber: opened.pr.number,
-			followUpPrUrl: opened.pr.url,
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, {
+				stage: "merging",
+				state: "idle",
+				needsReason: null,
+				prNumber: n,
+				prUrl: src.url,
+				prHeadSha: tip,
+				pushSha: null,
+				followUpPrNumber: opened.pr.number,
+				followUpPrUrl: opened.pr.url,
+			});
 		});
-		appendLog(
+		await appendLog(
 			st.store,
 			st.id,
 			`- follow-up PR #${opened.pr.number} opened (base ${base}); the card waits on PR #${n} and PR #${opened.pr.number}`,
@@ -6614,18 +6996,21 @@ export function createTurnLoop(
 		src: SourcePrRef,
 	): Promise<void> {
 		await commentSourcePr(st, n, src.dependabot);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const dependabot = src.dependabot;
 		// Stamp the source fields before the park (a legacy card carries none until
 		// now): the watch reads Dependabot's rebase answer off the row, and a re-ship
 		// re-judges the branch against the same source PR instead of re-resolving it.
-		st.store.updateTask(st.id, {
-			sourcePrNumber: n,
-			sourcePrUrl: src.url,
-			sourcePrHeadRef: src.headRef,
-			sourcePrHeadSha: src.headSha,
-			sourcePrCrossRepo: src.crossRepo,
-			sourcePrDependabot: src.dependabot,
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, {
+				sourcePrNumber: n,
+				sourcePrUrl: src.url,
+				sourcePrHeadRef: src.headRef,
+				sourcePrHeadSha: src.headSha,
+				sourcePrCrossRepo: src.crossRepo,
+				sourcePrDependabot: src.dependabot,
+			});
 		});
 		st.prNext = {
 			stage: "merging",
@@ -6650,7 +7035,7 @@ export function createTurnLoop(
 			ops.hosted !== undefined
 				? await hostedGh(st.e.path, st.header.settings.originUrl)
 				: undefined;
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const res = await comment({
 			repo,
 			number: n,
@@ -6662,8 +7047,9 @@ export function createTurnLoop(
 			ok: false as const,
 			error: errmsg(err),
 		}));
-		if (!canShipPr(st)) return;
-		if (!res.ok) st.log(`! commenting on source PR #${n} failed: ${res.error}`);
+		if (!(await canShipPr(st))) return;
+		if (!res.ok)
+			await st.log(`! commenting on source PR #${n} failed: ${res.error}`);
 	}
 
 	/** Ships a proven integration: the same proof classify reads (clean tree, origin/<target>
@@ -6677,7 +7063,7 @@ export function createTurnLoop(
 		const proof = await ops
 			.prIntegrated?.(st.e.path, st.loc.wt, st.header.target)
 			.catch(() => false);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const prBranch = st.task.branch ?? "";
 		const tip =
 			proof === true
@@ -6685,7 +7071,7 @@ export function createTurnLoop(
 						.targetSha(st.e.path, `refs/heads/${prBranch}`)
 						.catch(() => null)
 				: null;
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (proof !== true) {
 			// No ship: classify parks the integrated report as not-on-target.
 			return;
@@ -6721,18 +7107,18 @@ export function createTurnLoop(
 		// openPullRequest parked on a null origin before this call, so the pinned URL is set.
 		const originUrl = st.header.settings.originUrl;
 		if (originUrl === null) return;
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const pr = await pushBranch(st.e.path, prBranch, originUrl).catch(
 			(err: unknown) => ({
 				status: "failed" as const,
 				error: errmsg(err),
 			}),
 		);
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (pr.status === "pushed") {
-			st.log(`- pushed ${prBranch} from the server`);
+			await st.log(`- pushed ${prBranch} from the server`);
 		} else {
-			logPrPushFailure(st, prBranch, pr);
+			await logPrPushFailure(st, prBranch, pr);
 		}
 		if (pr.status === "pushed") {
 			// The PR needs a GitHub remote: PR mode without one is not a state
@@ -6743,21 +7129,21 @@ export function createTurnLoop(
 
 	/** Logs a failed server branch push with git's full output and the credential kinds the
 	 * push could use, and parks the card with the reason. */
-	function logPrPushFailure(
+	async function logPrPushFailure(
 		st: TurnSettle,
 		prBranch: string,
 		pr: { status: "failed" | "rejected"; error: string; output?: string },
-	): void {
-		st.log(
+	): Promise<void> {
+		await st.log(
 			`! server push of ${prBranch} ${pr.status === "rejected" ? "rejected" : "failed"}: ${pr.error}`,
 		);
 		const pushOut = "output" in pr ? (pr.output ?? null) : null;
-		if (pushOut !== null) st.log(`git's full push output:\n${pushOut}`);
+		if (pushOut !== null) await st.log(`git's full push output:\n${pushOut}`);
 		const kindAuth =
 			st.header.settings.originUrl === null
 				? null
 				: (ops.pushAuthKind?.(st.header.settings.originUrl) ?? null);
-		if (kindAuth !== null) st.log(`- push auth: ${kindAuth}`);
+		if (kindAuth !== null) await st.log(`- push auth: ${kindAuth}`);
 		st.prNext = {
 			stage: "merging",
 			state: "needs_you",
@@ -6787,7 +7173,7 @@ export function createTurnLoop(
 			ops.hosted !== undefined
 				? await hostedGh(st.e.path, st.header.settings.originUrl)
 				: undefined;
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		const opened = await openPr({
 			repo,
 			owner: repo.slice(0, slash),
@@ -6801,9 +7187,9 @@ export function createTurnLoop(
 			ok: false as const,
 			error: errmsg(err),
 		}));
-		if (!canShipPr(st)) return;
+		if (!(await canShipPr(st))) return;
 		if (!opened.ok) {
-			st.log(`! opening the pull request failed: ${opened.error}`);
+			await st.log(`! opening the pull request failed: ${opened.error}`);
 			st.prNext = {
 				stage: "merging",
 				state: "needs_you",
@@ -6811,13 +7197,16 @@ export function createTurnLoop(
 			};
 			return;
 		}
-		st.store.updateTask(st.id, {
-			prNumber: opened.pr.number,
-			prUrl: opened.pr.url,
-			prHeadSha: tip,
-			pushSha: tip,
+		await st.store.transaction(async () => {
+			if (!(await canShipPr(st))) return;
+			await st.store.updateTask(st.id, {
+				prNumber: opened.pr.number,
+				prUrl: opened.pr.url,
+				prHeadSha: tip,
+				pushSha: tip,
+			});
 		});
-		appendLog(
+		await appendLog(
 			st.store,
 			st.id,
 			`- PR #${opened.pr.number} opened (base ${st.header.target.replace(/^origin\//, "")})`,
@@ -6893,7 +7282,7 @@ export function createTurnLoop(
 			.catch(() => false);
 		if (landed) {
 			st.remoteLanded = true;
-			st.log(
+			await st.log(
 				`- approved head already on ${st.header.target}: the merge landed without the local branch moving`,
 			);
 			return;
@@ -6947,14 +7336,14 @@ export function createTurnLoop(
 				: await ops
 						.diffStat(st.e.path, st.header.target, `refs/heads/${branch}`)
 						.catch(() => null);
-		st.log("! held merge carries patches beyond the approved head");
+		await st.log("! held merge carries patches beyond the approved head");
 		const reset =
 			auditedTip !== null &&
 			(await ops
 				.resetBranchTo(st.e.path, branch, auditedTip)
 				.catch(() => false));
 		if (!reset)
-			st.log(
+			await st.log(
 				"! merge-hold park kept the held patches on the local target branch; resolve it by hand before any merge",
 			);
 	}
@@ -6974,13 +7363,13 @@ export function createTurnLoop(
 		for (let attempt = 1; ; attempt++) {
 			if (p.status === "skipped") break;
 			if (p.status === "pushed") {
-				markPushedRun(st, p);
+				await markPushedRun(st, p);
 				break;
 			}
 			await logPushFailure(st, p);
 			if (!authLogged) {
 				authLogged = true;
-				logPushAuthKind(st);
+				await logPushAuthKind(st);
 			}
 			if (!(await retryFailedPush(st, branch, attempt))) break;
 			p = await serverPush(st);
@@ -6993,19 +7382,19 @@ export function createTurnLoop(
 	 * The agent's own push has no credentials (D6). A merge agent that stopped at needs_you on
 	 * that authentication failure did integrate: the server push landed it, so the report
 	 * becomes integrated with the push output in details. */
-	function markPushedRun(
+	async function markPushedRun(
 		st: TurnSettle,
 		p: { status: "pushed"; output: string },
-	): void {
+	): Promise<void> {
 		st.pushError = null;
 		st.pushOutput = null;
 		st.pushRejected = false;
 		st.e.mainUnpushed = false;
-		st.log(`- pushed ${st.header.target} from the server`);
+		await st.log(`- pushed ${st.header.target} from the server`);
 		// OTTR-743: a "cannot lock ref" failure whose head the remote already
 		// holds lands as pushed; name the recovery in the card log.
 		if (p.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
-			st.log(`- ${p.output}`);
+			await st.log(`- ${p.output}`);
 		const o = st.result.outcome;
 		const text = `${o?.summary ?? ""}\n${o?.details ?? ""}\n${o?.question ?? ""}`;
 		if (o?.status === "needs_you" && GIT_AUTH_FAILURE.test(text)) {
@@ -7019,7 +7408,7 @@ export function createTurnLoop(
 					details: `${o.details ?? o.summary}\n\nServer push of ${st.header.target}:\n${p.output || "(no output)"}`,
 				},
 			};
-			st.log(
+			await st.log(
 				"- needs_you on a push authentication failure resolved: the server pushed",
 			);
 		}
@@ -7034,20 +7423,20 @@ export function createTurnLoop(
 		st.pushRejected = p.status === "rejected";
 		st.pushError = p.error;
 		st.pushOutput = p.output ?? null;
-		st.log(
+		await st.log(
 			`! server push of ${st.header.target} ${st.pushRejected ? "rejected" : "failed"}: ${p.error}`,
 		);
 		if (st.pushOutput !== null)
-			st.log(`git's full push output:\n${st.pushOutput}`);
+			await st.log(`git's full push output:\n${st.pushOutput}`);
 	}
 
 	/** One line naming the credential kinds the push could use (OTTR-465). */
-	function logPushAuthKind(st: TurnSettle): void {
+	async function logPushAuthKind(st: TurnSettle): Promise<void> {
 		const kind =
 			st.header.settings.originUrl === null
 				? null
 				: (ops.pushAuthKind?.(st.header.settings.originUrl) ?? null);
-		if (kind !== null) st.log(`- push auth: ${kind}`);
+		if (kind !== null) await st.log(`- push auth: ${kind}`);
 	}
 
 	/** The OTTR-465 retry decision after a failed server push. True: the fetch proved the
@@ -7065,7 +7454,7 @@ export function createTurnLoop(
 		)
 			return false;
 		if (st.header.settings.originUrl === null) {
-			st.log(
+			await st.log(
 				"! no pinned origin URL; cannot re-check origin's tip before a push retry",
 			);
 			return false;
@@ -7074,20 +7463,26 @@ export function createTurnLoop(
 		const fetchError = await ops
 			.fetchOriginBranch(st.e.path, branch, originUrl)
 			.then(() => null)
-			.catch((err: unknown) => withAuthHint(originUrl, errmsg(err)));
+			.catch(
+				async (err: unknown) => await withAuthHint(originUrl, errmsg(err)),
+			);
 		if (fetchError !== null) {
 			// The re-check's own reason (a network error, a token-refresh failure)
 			// rides the park reason; the retry stays off without a proven origin tip.
 			st.recheckError = fetchError;
-			st.log(`! origin re-check before a push retry failed: ${fetchError}`);
+			await st.log(
+				`! origin re-check before a push retry failed: ${fetchError}`,
+			);
 			return false;
 		}
 		if (!(await originStillFastForward(st, branch))) {
-			st.log("! origin moved or its tip is unreadable; not retrying the push");
+			await st.log(
+				"! origin moved or its tip is unreadable; not retrying the push",
+			);
 			return false;
 		}
 		const waitMs = ops.pushRetryDelayMs ?? MERGE_PUSH_RETRY_WAIT_MS;
-		st.log(
+		await st.log(
 			`- origin did not move; retrying the server push once in ${Math.round(waitMs / 1000)} s`,
 		);
 		await new Promise<void>((r) => setTimeout(r, waitMs));
@@ -7141,7 +7536,12 @@ export function createTurnLoop(
 		// research mark. Clear the flag and classify like any other work turn — the ready
 		// outcome was held unrewritten, so classify's ready branch sends it to merging.
 		const demoted = st.demoteCandidate && facts.commitsAhead > 0 && facts.clean;
-		if (demoted) st.store.updateTask(st.id, { research: false });
+		const previousError = await st.store.transaction(async () => {
+			const current = await st.store.getTask(st.id);
+			if (demoted && current !== null && current.cancelledAt === null)
+				await st.store.updateTask(st.id, { research: false });
+			return (await st.store.listTurns(st.id)).at(-2)?.error ?? null;
+		});
 		st.research = st.wasResearch && !demoted;
 		// listTurns ends with this turn; the one before it tells classify whether this exit repeats.
 		let next = classify({
@@ -7152,7 +7552,7 @@ export function createTurnLoop(
 			hasReport: st.reportText !== null,
 			grill: st.idn.grill,
 			target: st.header.target,
-			previousError: st.store.listTurns(st.id).at(-2)?.error ?? null,
+			previousError,
 			...(st.vmOut !== null ? { vmDirty: st.vmOut.dirty } : {}),
 			images: st.input.imagePaths.length,
 			http400: () =>
@@ -7299,7 +7699,7 @@ export function createTurnLoop(
 		const branch = st.header.target.startsWith("origin/")
 			? st.header.target.slice("origin/".length)
 			: null;
-		const retries = st.store.getTask(st.id)?.pushRetries ?? 0;
+		const retries = (await st.store.getTask(st.id))?.pushRetries ?? 0;
 		const ruleHint = BRANCH_RULE_REJECTION.test(st.pushError)
 			? "\nThis push was refused by a GitHub branch rule: the target branch requires pull requests. Project PR mode ships cards as pull requests instead; turn it on under the project's settings."
 			: "";
@@ -7309,7 +7709,7 @@ export function createTurnLoop(
 			branch !== null &&
 			retries < MERGE_PUSH_RETRIES
 		)
-			return rebaseRecoveredPush(st, branch, retries, ruleHint, next);
+			return await rebaseRecoveredPush(st, branch, retries, ruleHint, next);
 		return parkFailedPush(st, ruleHint);
 	}
 
@@ -7338,8 +7738,12 @@ export function createTurnLoop(
 				: await ops
 						.fetchOriginBranch(st.e.path, branch, st.header.settings.originUrl)
 						.then(() => null)
-						.catch((err: unknown) =>
-							withAuthHint(st.header.settings.originUrl ?? "", errmsg(err)),
+						.catch(
+							async (err: unknown) =>
+								await withAuthHint(
+									st.header.settings.originUrl ?? "",
+									errmsg(err),
+								),
 						);
 		if (fetchError !== null)
 			return {
@@ -7347,7 +7751,7 @@ export function createTurnLoop(
 				state: "needs_you",
 				needsReason: `Server push to origin failed: ${st.pushError}${ruleHint}`,
 			};
-		st.log(
+		await st.log(
 			`- push rejected and origin moved: trying the automatic rebase of ${branch} onto the fetched tip first`,
 		);
 		const rb = await ops
@@ -7358,24 +7762,24 @@ export function createTurnLoop(
 				error: errmsg(err),
 			}));
 		if (!rb.ok && rb.conflict) {
-			st.log(
+			await st.log(
 				`! the automatic rebase of ${branch} hit a conflict (the branch stays on its rejected head); queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
 			);
-			return queueRebaseTurn(st, branch, retries, ruleHint);
+			return await queueRebaseTurn(st, branch, retries, ruleHint);
 		}
 		if (!rb.ok) {
 			// Fail closed: no turn queued, no retry budget spent.
-			st.log(`! the automatic rebase of ${branch} failed: ${rb.error}`);
+			await st.log(`! the automatic rebase of ${branch} failed: ${rb.error}`);
 			return {
 				stage: "merging",
 				state: "needs_you",
 				needsReason: `Server push to origin failed: ${st.pushError}\nthe automatic rebase failed: ${rb.error}${ruleHint}`,
 			};
 		}
-		st.log(
+		await st.log(
 			`- automatic rebase of ${branch} onto the fetched origin tip converged; running the merge gates (bun run check, bun test)`,
 		);
-		return runRebaseGates(st, branch, retries, ruleHint, next);
+		return await runRebaseGates(st, branch, retries, ruleHint, next);
 	}
 
 	/** Queues the rebase recovery merge turn (OTTR-510). The gates can run minutes: re-fetch
@@ -7394,11 +7798,15 @@ export function createTurnLoop(
 				: await ops
 						.fetchOriginBranch(st.e.path, branch, st.header.settings.originUrl)
 						.then(() => null)
-						.catch((err: unknown) =>
-							withAuthHint(st.header.settings.originUrl ?? "", errmsg(err)),
+						.catch(
+							async (err: unknown) =>
+								await withAuthHint(
+									st.header.settings.originUrl ?? "",
+									errmsg(err),
+								),
 						);
 		if (refetchError !== null) {
-			st.log(
+			await st.log(
 				`! origin re-fetch before the recovery turn failed: ${refetchError}`,
 			);
 			// Fail closed: no turn queued, no retry budget spent.
@@ -7413,23 +7821,35 @@ export function createTurnLoop(
 			attempt: retries + 1,
 			max: MERGE_PUSH_RETRIES,
 		});
-		// Steering that landed mid-run rides the rebase turn, its authorship
-		// leading — the same rule a hold park follows under queued user text.
-		const steer = st.store.getTask(st.id)?.pendingPrompt ?? null;
-		st.store.updateTask(st.id, { pushRetries: retries + 1 });
-		appendLog(
+		const result = await st.store.transaction(async () => {
+			const current = await st.store.getTask(st.id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				(current.state !== "running" && current.state !== "preparing")
+			)
+				return null;
+			const steer = current.pendingPrompt;
+			await st.store.updateTask(st.id, {
+				pushRetries: retries + 1,
+				pendingPrompt: steer === null ? prompt : `${prompt}\n\n${steer}`,
+				pendingBy:
+					steer === null ? "supervisor" : (current.pendingBy ?? "user"),
+			});
+			return {
+				stage: "merging" as const,
+				state: "queued" as const,
+				needsReason: null,
+			};
+		});
+		if (result === null)
+			return { stage: "merging", state: "needs_you", needsReason: null };
+		await appendLog(
 			st.store,
 			st.id,
 			`server push rejected: origin moved, merge turn queued to rebase (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
 		);
-		return {
-			stage: "merging",
-			state: "queued",
-			needsReason: null,
-			pendingPrompt: steer === null ? prompt : `${prompt}\n\n${steer}`,
-			pendingBy:
-				steer === null ? "supervisor" : (st.input.live.pendingBy ?? "user"),
-		};
+		return result;
 	}
 
 	/** The merge gates on the rebased branch: pass pushes the target again, fail queues the
@@ -7445,13 +7865,14 @@ export function createTurnLoop(
 			.runMergeGates(st.e.path)
 			.catch((err: unknown) => ({ ok: false, output: errmsg(err) }));
 		if (!gates.ok) {
-			st.log(
+			await st.log(
 				`! merge gates failed on the rebased ${branch}; queuing the rebase turn (retry ${retries + 1} of ${MERGE_PUSH_RETRIES})`,
 			);
-			if (gates.output !== "") st.log(`! merge gates output:\n${gates.output}`);
-			return queueRebaseTurn(st, branch, retries, ruleHint);
+			if (gates.output !== "")
+				await st.log(`! merge gates output:\n${gates.output}`);
+			return await queueRebaseTurn(st, branch, retries, ruleHint);
 		}
-		st.log(
+		await st.log(
 			`- merge gates passed on the rebased ${branch}; retrying the server push`,
 		);
 		const p2 = await serverPush(st);
@@ -7459,24 +7880,24 @@ export function createTurnLoop(
 			st.pushError = null;
 			st.pushOutput = null;
 			st.pushRejected = false;
-			st.log(
+			await st.log(
 				`- pushed ${st.header.target} from the server after the automatic rebase`,
 			);
 			// OTTR-743: the same recovery reason line rides a retry push.
 			if (p2.output.startsWith(PUSH_LANDED_BEFORE_ATTEMPT))
-				st.log(`- ${p2.output}`);
+				await st.log(`- ${p2.output}`);
 		} else if (p2.status === "skipped") {
 			st.pushError = null;
 			st.pushOutput = null;
 			st.pushRejected = false;
-			st.log(
+			await st.log(
 				"- server push skipped after the automatic rebase (nothing to push)",
 			);
 		} else {
-			st.log(
+			await st.log(
 				`! the retry push of ${st.header.target} ${p2.status} after the automatic rebase: ${p2.error}`,
 			);
-			return queueRebaseTurn(st, branch, retries, ruleHint);
+			return await queueRebaseTurn(st, branch, retries, ruleHint);
 		}
 		return next;
 	}
@@ -7537,13 +7958,13 @@ export function createTurnLoop(
 			settled.needsReason?.startsWith("omp exited with code ") &&
 			settled.needsReason.includes(" (dispatch ")
 		)
-			appendLog(st.store, st.id, settled.needsReason);
+			await appendLog(st.store, st.id, settled.needsReason);
 		// A worker OOM death names its cause in the reason; the card log gets the same line
 		// with the worker's name (the dispatch URL hostname), so an operator tailing the log
 		// sees which worker hit its memory wall. An OOM reason never starts with
 		// "omp exited with code ", so the two branches never double-log.
 		if (settled.needsReason?.startsWith(OOM_KILL))
-			appendLog(
+			await appendLog(
 				st.store,
 				st.id,
 				st.dispatch?.handle?.url
@@ -7581,14 +8002,18 @@ export function createTurnLoop(
 		try {
 			const moved = quarantineImageFiles(
 				st.store.dataRoot,
-				st.store.imagesDir(st.id),
+				await st.store.imagesDir(st.id),
 				join(st.store.tasksDir, "quarantine", st.id),
 				st.input.turnImages,
 			);
-			st.store.updateTask(st.id, {
-				images: st.input.live.images.filter((n) => !moved.includes(n)),
+			await st.store.transaction(async () => {
+				const current = await st.store.getTask(st.id);
+				if (current === null || current.cancelledAt !== null) return;
+				await st.store.updateTask(st.id, {
+					images: current.images.filter((n) => !moved.includes(n)),
+				});
 			});
-			appendLog(
+			await appendLog(
 				st.store,
 				st.id,
 				`provider rejected the attached images (died before any output); quarantined ${moved.length} image(s) to .tasks/quarantine/${st.id}: ${moved.slice(0, 20).join(", ")} — retrying text-only`,
@@ -7620,7 +8045,7 @@ export function createTurnLoop(
 			return next;
 		const sent = [
 			st.input.raw,
-			st.store.getTask(st.id)?.pendingPrompt ?? null,
+			(await st.store.getTask(st.id))?.pendingPrompt ?? null,
 		].filter((p): p is string => p !== null && p !== ".");
 		return {
 			...next,
@@ -7637,7 +8062,8 @@ export function createTurnLoop(
 		next: Next,
 		restoreRetry: boolean,
 	): Promise<Next> {
-		const steered = (st.store.getTask(st.id)?.pendingPrompt ?? null) !== null;
+		const steered =
+			((await st.store.getTask(st.id))?.pendingPrompt ?? null) !== null;
 		st.steered = steered;
 		if (!steered || restoreRetry) return next;
 		return {
@@ -7657,17 +8083,26 @@ export function createTurnLoop(
 		const reportedDeps = outcome !== null ? outcome.dependsOn : undefined;
 		if (reportedDeps === undefined || reportedDeps.length === 0) return next;
 		// OTTR-708: ids resolve across the board's projects, this store's own cards first.
-		const depProjects = depProjectsOf(projects.values());
-		const ownDep = depProjectOf(st.store);
+		const depProjects = await turnDepProjects();
+		const ownDep = await depProjectOf(st.store);
 		const bad = badDep(reportedDeps, depProjects, ownDep, st.id);
 		if (bad !== null) return parkBadDep(next, bad.reason);
-		const merged = [...new Set([...st.task.dependsOn, ...reportedDeps])];
-		if (
-			merged.length !== st.task.dependsOn.length ||
-			reportedDeps.some((d, i) => st.task.dependsOn[i] !== d)
-		)
-			st.store.updateTask(st.id, { dependsOn: merged });
-		return queueDepHold(st, next, outcome, merged, depProjects, ownDep);
+		return await st.store.transaction(async () => {
+			const current = await st.store.getTask(st.id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				(current.state !== "running" && current.state !== "preparing")
+			)
+				return next;
+			const merged = [...new Set([...current.dependsOn, ...reportedDeps])];
+			if (
+				merged.length !== current.dependsOn.length ||
+				reportedDeps.some((d, i) => current.dependsOn[i] !== d)
+			)
+				await st.store.updateTask(st.id, { dependsOn: merged });
+			return await queueDepHold(st, next, outcome, merged, depProjects, ownDep);
+		});
 	}
 
 	/** A bad id parks needs_you naming it; the ids are not recorded. */
@@ -7682,14 +8117,14 @@ export function createTurnLoop(
 
 	/** A needs_you outcome holding on valid ids: requeue in the current stage until every id
 	 * is done or cancelled (the scheduler restarts the turn then). */
-	function queueDepHold(
+	async function queueDepHold(
 		st: TurnSettle,
 		next: Next,
 		outcome: Outcome | null,
 		merged: string[],
 		depProjects: DepProject[],
 		ownDep: DepProject,
-	): Next {
+	): Promise<Next> {
 		if (
 			!(
 				outcome?.status === "needs_you" &&
@@ -7702,7 +8137,7 @@ export function createTurnLoop(
 			stage: next.stage,
 			state: "queued",
 			needsReason: depHold(
-				st.store.listTasks(),
+				await st.store.listTasks(),
 				{
 					...st.task,
 					dependsOn: merged,
@@ -7734,7 +8169,7 @@ export function createTurnLoop(
 				needsReason: "A trending scout must not commit.",
 			};
 		if (st.idn.reviewCard && next.stage === "done")
-			return parkReviewDone(st, next);
+			return await parkReviewDone(st, next);
 		return next;
 	}
 
@@ -7747,20 +8182,19 @@ export function createTurnLoop(
 		// Stored findings that have no card yet will be checked this settle (planTurnChecks
 		// selects them); if that check never completes, the parked hold keeps them visible.
 		// Release reviews hold too: the publish below only runs once the hold is clear.
-		const stored = st.store.listReviewFindings(st.id);
+		const stored = await st.store.listReviewFindings(st.id);
+		const tasks = await st.store.listTasks();
 		const hold =
 			st.task.findingsCheckedAt === null &&
 			stored.length > 0 &&
 			stored.some(
 				(f) =>
-					!st.store
-						.listTasks()
-						.some((x) => x.followUpOf === st.id && x.prompt === f.prompt),
+					!tasks.some((x) => x.followUpOf === st.id && x.prompt === f.prompt),
 			)
 				? UNCHECKED_FINDINGS_HOLD
 				: st.result.recorded.length > 0
 					? FINDINGS_HOLD
-					: findingsHold(st.store.listTasks(), st.task);
+					: findingsHold(await st.store.listTasks(), st.task);
 		if (hold !== null)
 			return { stage: "merging", state: "idle", needsReason: hold };
 		if (st.idn.releaseCard && st.task.releaseVersion !== null) {
@@ -7811,10 +8245,10 @@ export function createTurnLoop(
 			.catch(() => [] as string[]);
 		const ui = uiFiles(changed);
 		if (ui.length === 0) return next;
-		const priorLog = existsSync(st.store.logPath(st.id))
-			? readRegular(st.store.logPath(st.id)).toString("utf8")
+		const priorLog = existsSync(await st.store.logPath(st.id))
+			? readRegular(await st.store.logPath(st.id)).toString("utf8")
 			: "";
-		appendLog(st.store, st.id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
+		await appendLog(st.store, st.id, `${UI_SHOT_WARNING}: ${listed(ui)}`);
 		if (next.needsReason !== null || st.steered) return next;
 		if (!priorLog.includes(UI_SHOT_WARNING))
 			return {
@@ -7904,7 +8338,7 @@ export function createTurnLoop(
 				};
 		}
 		await measureSettleGit(st, planned);
-		return planMergeHolds(st, planned);
+		return await planMergeHolds(st, planned);
 	}
 
 	/** A research card's deliverable is the report file: archive it before the worktree goes,
@@ -7960,13 +8394,13 @@ export function createTurnLoop(
 	 * feature ran, so this is independent of the forkResearch toggle. The hold covers every
 	 * descendant: a card an agent files from a fork-born card (create_task) must not merge
 	 * without approval either. */
-	function isForkBorn(st: TurnSettle): boolean {
+	async function isForkBorn(st: TurnSettle): Promise<boolean> {
 		const seen = new Set<string>([st.task.id]);
 		let up = st.task.followUpOf;
 		let forkBorn = false;
 		while (up !== null && !seen.has(up) && !forkBorn) {
 			seen.add(up);
-			const anc = st.store.getTask(up);
+			const anc = await st.store.getTask(up);
 			forkBorn = anc?.topic === "fork research";
 			up = anc?.followUpOf ?? null;
 		}
@@ -7986,15 +8420,14 @@ export function createTurnLoop(
 	async function planMergeHolds(st: TurnSettle, next: Next): Promise<Next> {
 		const readyWork =
 			st.kind === "work" && (next.stage === "done" || next.stage === "merging");
+		const settings = await st.store.getSettings();
 		const updateHold =
-			readyWork &&
-			st.task.updateIds.length > 0 &&
-			st.store.getSettings().holdUpdateMerges;
+			readyWork && st.task.updateIds.length > 0 && settings.holdUpdateMerges;
 		const forkHold =
 			readyWork &&
-			isForkBorn(st) &&
+			(await isForkBorn(st)) &&
 			!st.idn.retroCard &&
-			(st.store.getSettings().forkMergeHold ||
+			(settings.forkMergeHold ||
 				(st.task.holdHead !== null && st.task.forkMergeHead === null));
 		const { head, holdLanded } = await resolveHoldHead(
 			st,
@@ -8112,14 +8545,17 @@ export function createTurnLoop(
 	/** A cancel that landed inside the slow settle git reads owns the card (its kept path
 	 * already wrote the final state): finish only the turn row and leave the card alone.
 	 * True: the turn stops. */
-	function settleCancelled(st: TurnSettle, now: number): boolean {
-		const settled = st.store.getTask(st.id);
+	async function settleCancelled(
+		st: TurnSettle,
+		now: number,
+	): Promise<boolean> {
+		const settled = await st.store.getTask(st.id);
 		if (
 			!settled ||
 			settled.cancelledAt !== null ||
 			(settled.state !== "running" && settled.state !== "preparing")
 		) {
-			st.store.finishTurn(st.dispatch.turn.id, {
+			await st.store.finishTurnState(st.dispatch.turn.id, {
 				endedAt: now,
 				exitCode: st.result.exitCode,
 				error: "cancelled",
@@ -8135,17 +8571,13 @@ export function createTurnLoop(
 	 * needs_you report's free-text question field is often a hold instruction ("re-run after
 	 * X"), not a question, so the timeline keeps its alert styling unless the ask tool actually
 	 * ran). True: the turn stopped (a cancel owned the card). */
-	function finishTurnRow(st: TurnSettle, next: Next): boolean {
-		if (settleCancelled(st, st.now)) return true;
+	async function finishTurnRow(st: TurnSettle, next: Next): Promise<boolean> {
+		if (await settleCancelled(st, st.now)) return true;
 		// The model the stream served, with the dispatch's thinking level re-attached when the
 		// bases match; and the dispatched selector when the run fell back to another model.
 		const served = turnModel(st.result.model, st.route.runModel);
 		const swap = modelSwap(st.result.model, st.route.runModel);
-		if (swap !== null)
-			st.log(
-				`! model swap: dispatched ${swap} but the run served ${served}${st.result.providerError ? ` (${st.result.providerError})` : ""} — the card keeps ${swap} for its next turn`,
-			);
-		st.store.finishTurn(st.dispatch.turn.id, {
+		await st.store.finishTurnState(st.dispatch.turn.id, {
 			endedAt: st.now,
 			exitCode: st.result.exitCode,
 			// live is the turn's own snapshot: the selector this run started with (switches land in-between turns).
@@ -8178,33 +8610,31 @@ export function createTurnLoop(
 	 * the card is still in_progress/running: the final stage/state only lands once the check's
 	 * verdict — or a skipped check — is in, so the schedule tick can neither pick the card for
 	 * a merge turn nor settle a parked review early. */
-	function planTurnChecks(st: TurnSettle, next: Next): void {
+	async function planTurnChecks(st: TurnSettle, next: Next): Promise<void> {
 		st.workCard = isWorkCard(st);
-		st.reviewFindings =
+		st.reviewFindings = [];
+		if (
 			st.idn.reviewCard &&
 			st.task.findingsCheckedAt === null &&
 			(next.stage === "merging" || next.state === "needs_you")
-				? // The union of the card's stored findings (arrival persistence) and this
-					// run's recorded ones, deduped by prompt with the stored entries first;
-					// the stored set alone is the source in production, the union keeps
-					// run-result delivery working.
-					(() => {
-						const stored = st.store.listReviewFindings(st.id);
-						const seen = new Set(stored.map((f) => f.prompt));
-						const all = [...stored];
-						for (const f of st.result.recorded)
-							if (!seen.has(f.prompt)) {
-								seen.add(f.prompt);
-								all.push(f);
-							}
-						return all.filter((f) => {
-							const linked = st.store
-								.listTasks()
-								.some((x) => x.followUpOf === st.id && x.prompt === f.prompt);
-							return !linked;
-						});
-					})()
-				: [];
+		) {
+			const stored = await st.store.listReviewFindings(st.id);
+			const tasks = await st.store.listTasks();
+			const seen = new Set(stored.map((f) => f.prompt));
+			const all = [...stored];
+			for (const finding of st.result.recorded) {
+				if (seen.has(finding.prompt)) continue;
+				seen.add(finding.prompt);
+				all.push(finding);
+			}
+			st.reviewFindings = all.filter(
+				(finding) =>
+					!tasks.some(
+						(task) =>
+							task.followUpOf === st.id && task.prompt === finding.prompt,
+					),
+			);
+		}
 		st.checkWillRun =
 			st.reviewFindings.length > 0 || (st.workCard && next.stage === "merging");
 	}
@@ -8272,8 +8702,8 @@ export function createTurnLoop(
 
 	/** Stores the settle on the card row: the (deferred) stage/state, shots, the pending
 	 * prompt, the ask, text, the git facts, the report, and the hold columns. */
-	function writeSettledCard(st: TurnSettle, next: Next): void {
-		st.store.updateTask(st.id, {
+	async function writeSettledCard(st: TurnSettle, next: Next): Promise<void> {
+		await st.store.updateTask(st.id, {
 			...settledCardState(st, next),
 			shots: st.shots,
 			pendingPrompt: next.pendingPrompt, // undefined keeps the column: only classify's automatic continue sets it
@@ -8335,71 +8765,75 @@ export function createTurnLoop(
 		if (targetName !== null && targetName !== st.store.name) {
 			const tp = projects.get(targetName);
 			if (tp === undefined) {
-				st.log(
+				await st.log(
 					`retro: proposal dropped: unknown project "${targetName}" (known projects: ${[...projects.keys()].join(", ")})`,
 				);
 				return;
 			}
 			store = tp.store;
 		}
-		const openProposals = store
-			.listTasks()
-			.filter(
-				(x) =>
-					!x.cancelledAt &&
-					x.state === "needs_you" &&
-					isRetroProposalReason(x.needsReason) &&
-					store.listTurns(x.id).length === 0,
-			).length;
-		if (openProposals >= 3) {
-			st.log("retro: proposal dropped: cap of 3 open proposals reached");
+		const proposed = st.result.proposed;
+		const sourceTask = (await st.store.getTask(st.id)) ?? st.task;
+		const turns = await st.store.listTurns(st.id);
+		const parent =
+			st.task.followUpOf === null
+				? null
+				: await st.store.getTask(st.task.followUpOf);
+		const child = await store.transaction(async () => {
+			let openProposals = 0;
+			for (const task of await store.listTasks()) {
+				if (
+					task.cancelledAt === null &&
+					task.state === "needs_you" &&
+					isRetroProposalReason(task.needsReason) &&
+					(await store.listTurns(task.id)).length === 0
+				)
+					openProposals++;
+			}
+			if (openProposals >= 3) return null;
+			const created = await store.createTask(proposed.prompt);
+			const handoffPath = join(store.tasksDir, "handoffs", `${created.id}.md`);
+			return await store.updateTask(created.id, {
+				prompt: followUpPrompt({
+					text: proposed.prompt,
+					title: st.task.title,
+					handoffPath,
+				}),
+				followUpOf: st.id,
+				promptAuthor: "board",
+				followUpOfProject: store === st.store ? null : st.store.name,
+				model: proposed.model,
+				state: "needs_you",
+				needsReason: proposedReason(parent ?? { id: st.task.id }),
+				proposalSummary: proposed.summary,
+			});
+		});
+		if (child === null) {
+			await st.log("retro: proposal dropped: cap of 3 open proposals reached");
 			return;
 		}
-		const child = store.createTask(st.result.proposed.prompt);
 		const handoffPath = join(store.tasksDir, "handoffs", `${child.id}.md`);
-		let prompt = followUpPrompt({
-			text: st.result.proposed.prompt,
-			title: st.task.title,
-			handoffPath,
-		});
 		try {
 			const savedDir = join(st.store.tasksDir, "quarantine", st.id);
 			writeBelow(
 				store.dataRoot,
 				handoffPath,
 				handoffMarkdown({
-					task: st.store.getTask(st.id) ?? st.task,
-					turns: st.store.listTurns(st.id),
+					task: sourceTask,
+					turns,
 					sessionsDir: st.store.sessionsDir,
 					savedDir: existsSync(savedDir) ? savedDir : null,
 				}),
 			);
 		} catch (err) {
-			// The card is still held; it just starts without the handoff pointer.
-			prompt = st.result.proposed.prompt;
-			st.log(`! handoff write failed: ${errmsg(err)}`);
+			await store.transaction(async () => {
+				const current = await store.getTask(child.id);
+				if (current?.revision === child.revision)
+					await store.updateTask(child.id, { prompt: proposed.prompt });
+			});
+			await st.log(`! handoff write failed: ${errmsg(err)}`);
 		}
-		store.updateTask(child.id, {
-			prompt,
-			followUpOf: st.id,
-			promptAuthor: "board",
-			// A foreign filing stores the retro's project, so the lineage rail
-			// links the parent across the board (null keeps the own project).
-			followUpOfProject: store === st.store ? null : st.store.name,
-			// A null model means the proposal card runs on the default role.
-			model: st.result.proposed.model,
-			state: "needs_you",
-			// The reason names the retro's source card once; a missing link falls
-			// back to naming the retro itself.
-			needsReason: proposedReason(
-				(st.task.followUpOf !== null
-					? st.store.getTask(st.task.followUpOf)
-					: null) ?? { id: st.task.id },
-			),
-			// The drawer's decision panel reads it; older proposals keep null.
-			proposalSummary: st.result.proposed.summary,
-		});
-		st.log(
+		await st.log(
 			store === st.store
 				? `- filed proposal ${child.id} (held for approval)`
 				: `- filed proposal ${child.id} in project ${store.name} (held for approval)`,
@@ -8415,7 +8849,7 @@ export function createTurnLoop(
 	 * True: the turn stopped (a credit stop or a taken-over check). */
 	async function runReviewCheck(st: TurnSettle): Promise<boolean> {
 		if (st.reviewFindings.length === 0) return false;
-		const checkOn = ops.reviewCheck?.() ?? true;
+		const checkOn = (await ops.reviewCheck?.()) ?? true;
 		// Leads (the prompt's "Needs validation" tag) never enter the selection or the cap:
 		// they file as unverified backlog cards without a second-model opinion.
 		const confirmed = st.reviewFindings.filter(
@@ -8453,9 +8887,11 @@ export function createTurnLoop(
 			await settleReviewCheckFailure(st, attempt);
 		} else {
 			for (const f of belowCap)
-				st.log(`- finding below the cap of 10, not filed: ${findingHead(f)}`);
+				await st.log(
+					`- finding below the cap of 10, not filed: ${findingHead(f)}`,
+				);
 		}
-		fileKeptFindings(st, {
+		await fileKeptFindings(st, {
 			kept,
 			dropped,
 			belowCap,
@@ -8466,10 +8902,7 @@ export function createTurnLoop(
 			checkModel,
 			checkWarn,
 		});
-		// Only a completed pass (check on or off, trail written) stamps the set: a failed
-		// or stopped attempt leaves the findings unchecked for the next landing.
-		if (checkFailed === null)
-			st.store.updateTask(st.id, { findingsCheckedAt: Date.now() });
+
 		return false;
 	}
 
@@ -8521,8 +8954,7 @@ export function createTurnLoop(
 	}> {
 		const [openCards, commitsSince] = await Promise.all([
 			Promise.resolve(
-				st.store
-					.listTasks()
+				(await st.store.listTasks())
 					.filter(
 						(x) =>
 							x.id !== st.id && x.cancelledAt === null && x.stage !== "done",
@@ -8608,7 +9040,7 @@ export function createTurnLoop(
 			}
 			checkFailed = out.failed;
 			limitHit = out.limitHit;
-			st.log(`! review check attempt ${attempt} failed: ${checkFailed}`);
+			await st.log(`! review check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
 				hold = await usageHold(
 					ran.result,
@@ -8674,16 +9106,16 @@ export function createTurnLoop(
 		checkKey: string,
 	): Promise<{ result: RunResult; checkMs: number } | null> {
 		// Hosted: no check attempt starts under a credit stop, the retry included.
-		if (st.creditBlocked()) return null;
+		if (await st.creditBlocked()) return null;
 		const startedAt = Date.now();
 		const checkMeter = st.openMeter(
 			selector === undefined ? "default" : checkRole,
 		);
-		const handle = startCheckRun(st, input, selector, checkMeter);
+		const handle = await startCheckRun(st, input, selector, checkMeter);
 		const result = await awaitCheckRun(st, checkKey, handle, checkMeter);
 		if (result === null) return null;
 		// A creditStop killed this check: park with the credit reason, no retry.
-		if (st.creditBlocked()) return null;
+		if (await st.creditBlocked()) return null;
 		return { result, checkMs: Date.now() - startedAt };
 	}
 
@@ -8691,13 +9123,13 @@ export function createTurnLoop(
 	 * --resume, never the checked run's own — memory off), read/grep/glob only, the
 	 * check.yml config, capped at 30 minutes. The check's transcript lands in the card's
 	 * log, next to the run it checks. */
-	function startCheckRun(
+	async function startCheckRun(
 		st: TurnSettle,
 		input: string,
 		selector: string | undefined,
 		checkMeter: ReturnType<OpenRunMeter>,
-	): TurnRunHandle {
-		return ops.startRun({
+	): Promise<TurnRunHandle> {
+		return await ops.startRun({
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
 				auditProvisioned(homedir(), sinceMs, rulesAtStart),
@@ -8714,7 +9146,7 @@ export function createTurnLoop(
 			maxTime: "1800",
 			dataRoot: st.store.dataRoot,
 			// The check's transcript lands in the card's log, next to the run it checks.
-			logPath: st.store.logPath(st.id),
+			logPath: await st.store.logPath(st.id),
 			onLog: () => ops.notifyLog(st.name, st.id),
 		});
 	}
@@ -8746,41 +9178,74 @@ export function createTurnLoop(
 		st: TurnSettle,
 		attempt: NonNullable<Awaited<ReturnType<typeof reviewCheckAttempts>>>,
 	): Promise<void> {
-		if (attempt.checkFailed === null) {
-			for (const d of attempt.dropped)
-				st.log(`- dropped finding ${d.id}: ${d.reason}`);
-			return;
-		}
-		if (attempt.hold !== null) {
-			parkReviewCheckHold(st, attempt.hold);
-			return;
-		}
-		st.log(`- review check gave up after a retry: ${attempt.checkFailed}`);
-		const cur = st.store.getTask(st.id);
-		if (cur !== null && cur.cancelledAt === null)
-			st.store.updateTask(st.id, {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: `The review check failed${attempt.limitHit ? "" : " twice"}: ${attempt.checkFailed}. Reply to re-run the review, or cancel the card.`,
-				// The check ran past the limit: the probe count clears.
-				holdAttempts: 0,
+		const originalLog = st.log;
+		const lines: string[] = [];
+		st = {
+			...st,
+			log: (line) => {
+				lines.push(line);
+			},
+		};
+		try {
+			return await st.store.transaction(async () => {
+				if (attempt.checkFailed === null) {
+					for (const d of attempt.dropped)
+						await st.log(`- dropped finding ${d.id}: ${d.reason}`);
+					return;
+				}
+				if (attempt.hold !== null) {
+					await parkReviewCheckHold(st, attempt.hold);
+					return;
+				}
+				await st.log(
+					`- review check gave up after a retry: ${attempt.checkFailed}`,
+				);
+				const cur = await st.store.getTask(st.id);
+				if (cur !== null && cur.cancelledAt === null)
+					await st.store.updateTask(st.id, {
+						stage: "in_progress",
+						state: "needs_you",
+						needsReason: `The review check failed${attempt.limitHit ? "" : " twice"}: ${attempt.checkFailed}. Reply to re-run the review, or cancel the card.`,
+						// The check ran past the limit: the probe count clears.
+						holdAttempts: 0,
+					});
 			});
+		} finally {
+			for (const line of lines) await originalLog(line);
+		}
 	}
 
 	/** Holds the review card on the provider's usage reset (the write only lands when the card
 	 * is still this run's). */
-	function parkReviewCheckHold(st: TurnSettle, hold: UsageHold): void {
-		st.log(
-			`- review check held until ${new Date(hold.holdUntil).toISOString()}: ${hold.rate ? "rate limit" : "usage limit"}`,
-		);
-		const patch = holdPatch(st.store, st.id, hold);
-		if (patch !== null) st.store.updateTask(st.id, patch);
+	async function parkReviewCheckHold(
+		st: TurnSettle,
+		hold: UsageHold,
+	): Promise<void> {
+		const originalLog = st.log;
+		const lines: string[] = [];
+		st = {
+			...st,
+			log: (line) => {
+				lines.push(line);
+			},
+		};
+		try {
+			return await st.store.transaction(async () => {
+				await st.log(
+					`- review check held until ${new Date(hold.holdUntil).toISOString()}: ${hold.rate ? "rate limit" : "usage limit"}`,
+				);
+				const patch = await holdPatch(st.store, st.id, hold);
+				if (patch !== null) await st.store.updateTask(st.id, patch);
+			});
+		} finally {
+			for (const line of lines) await originalLog(line);
+		}
 	}
 
 	/** Files the kept findings as queued cards linked to the review (the flow create_task's
 	 * per-finding calls did inline before), logs the counts, and writes every unfiled finding
 	 * with its reason onto the review card so the user can file any of them by hand. */
-	function fileKeptFindings(
+	async function fileKeptFindings(
 		st: TurnSettle,
 		args: {
 			kept: { id: number; finding: RecordedFinding }[];
@@ -8793,164 +9258,189 @@ export function createTurnLoop(
 			checkModel: string | null;
 			checkWarn: "same model" | "same vendor" | null;
 		},
-	): void {
-		const filed: string[] = [];
-		const leadNotFiled: string[] = [];
-		const live = st.store.getTask(st.id);
-		if (args.checkFailed === null && live !== null && live.cancelledAt === null)
-			for (const k of args.kept) {
-				const child = st.store.createTask(k.finding.prompt);
-				st.store.updateTask(child.id, {
-					followUpOf: st.id,
-					promptAuthor: "board",
-					// A null model means the finding card runs on the default role.
-					model: k.finding.model,
-				});
-				filed.push(child.id);
-			}
-		// Leads file with or without a check verdict: they are unverified by definition
-		// (the second-model check never ran on them), so they hold no cap slot. A lead
-		// that carries the audit fingerprint (docs/specs/review-findings-persistence.md
-		// §4) dedupes against the cards holding the same value instead of filing again,
-		// and the blocker line sorts each filer: a deployment fact asks the user, a
-		// sandbox run waits for a validation sandbox.
-		if (live !== null && live.cancelledAt === null) {
-			const byFingerprint = new Map<string, ListedTask[]>();
-			for (const t of st.store.listTasks()) {
-				const fp = leadFingerprint(t.prompt);
-				if (fp === null) continue;
-				const list = byFingerprint.get(fp);
-				if (list === undefined) byFingerprint.set(fp, [t]);
-				else list.push(t);
-			}
-			const questions: string[] = [];
-			for (const lead of args.leads) {
-				const fp = leadFingerprint(lead.prompt);
-				const match =
-					fp === null ? null : pickLeadMatch(byFingerprint.get(fp) ?? []);
-				if (match !== null && match.kind !== "done") {
-					if (match.kind === "open") {
-						st.store.updateTask(match.card.id, {
-							details: `${match.card.details ?? ""}\nSeen again in review ${st.id} on ${new Date()
-								.toISOString()
-								.slice(0, 10)}.`,
+	): Promise<void> {
+		const originalLog = st.log;
+		const lines: string[] = [];
+		st = {
+			...st,
+			log: (line) => {
+				lines.push(line);
+			},
+		};
+		try {
+			return await st.store.transaction(async () => {
+				const filed: string[] = [];
+				const leadNotFiled: string[] = [];
+				const live = await st.store.getTask(st.id);
+				if (
+					args.checkFailed === null &&
+					live !== null &&
+					live.cancelledAt === null
+				)
+					for (const k of args.kept) {
+						const child = await st.store.createTask(k.finding.prompt);
+						await st.store.updateTask(child.id, {
+							followUpOf: st.id,
+							promptAuthor: "board",
+							// A null model means the finding card runs on the default role.
+							model: k.finding.model,
 						});
-						leadNotFiled.push(
-							`- already open: #${match.card.id} (${findingHead(lead)})`,
-						);
-						st.log(
-							`- lead already open as card ${match.card.id}, not filed again: ${findingHead(lead)}`,
-						);
-					} else {
-						leadNotFiled.push(
-							`- not filed: the user cancelled the same lead before, card #${match.card.id} (${findingHead(lead)})`,
-						);
-						st.log(
-							`- lead matches cancelled card ${match.card.id}, not filed: ${findingHead(lead)}`,
-						);
+						filed.push(child.id);
 					}
-					continue;
-				}
-				const blocker = leadBlocker(lead.prompt);
-				const child = st.store.createTask(lead.prompt);
-				const cameBack =
-					match !== null
-						? ` The same fingerprint was already on done card #${match.card.id}; the lead came back.`
-						: "";
-				st.store.updateTask(child.id, {
-					followUpOf: st.id,
-					promptAuthor: "board",
-					model: lead.model,
-					stage: "backlog",
-					state: "idle",
-					queuedAt: null,
-					details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}${
-						blocker.kind === "sandbox" ? " Waits for a validation sandbox." : ""
-					}`,
-				});
-				filed.push(child.id);
-				if (blocker.kind === "deployment")
-					questions.push(`${blocker.question} (card #${child.id})`);
-				// A card filed in this pass joins the index: two leads with one
-				// fingerprint file once, also when no card held the value before.
-				if (fp !== null) {
-					const fresh = st.store.getTask(child.id);
-					if (fresh !== null) {
+				// Leads file with or without a check verdict: they are unverified by definition
+				// (the second-model check never ran on them), so they hold no cap slot. A lead
+				// that carries the audit fingerprint (docs/specs/review-findings-persistence.md
+				// §4) dedupes against the cards holding the same value instead of filing again,
+				// and the blocker line sorts each filer: a deployment fact asks the user, a
+				// sandbox run waits for a validation sandbox.
+				if (live !== null && live.cancelledAt === null) {
+					const byFingerprint = new Map<string, ListedTask[]>();
+					for (const t of await st.store.listTasks()) {
+						const fp = leadFingerprint(t.prompt);
+						if (fp === null) continue;
 						const list = byFingerprint.get(fp);
-						if (list === undefined) byFingerprint.set(fp, [fresh]);
-						else list.push(fresh);
+						if (list === undefined) byFingerprint.set(fp, [t]);
+						else list.push(t);
+					}
+					const questions: string[] = [];
+					for (const lead of args.leads) {
+						const fp = leadFingerprint(lead.prompt);
+						const match =
+							fp === null ? null : pickLeadMatch(byFingerprint.get(fp) ?? []);
+						if (match !== null && match.kind !== "done") {
+							if (match.kind === "open") {
+								await st.store.updateTask(match.card.id, {
+									details: `${match.card.details ?? ""}\nSeen again in review ${st.id} on ${new Date()
+										.toISOString()
+										.slice(0, 10)}.`,
+								});
+								leadNotFiled.push(
+									`- already open: #${match.card.id} (${findingHead(lead)})`,
+								);
+								await st.log(
+									`- lead already open as card ${match.card.id}, not filed again: ${findingHead(lead)}`,
+								);
+							} else {
+								leadNotFiled.push(
+									`- not filed: the user cancelled the same lead before, card #${match.card.id} (${findingHead(lead)})`,
+								);
+								await st.log(
+									`- lead matches cancelled card ${match.card.id}, not filed: ${findingHead(lead)}`,
+								);
+							}
+							continue;
+						}
+						const blocker = leadBlocker(lead.prompt);
+						const child = await st.store.createTask(lead.prompt);
+						const cameBack =
+							match !== null
+								? ` The same fingerprint was already on done card #${match.card.id}; the lead came back.`
+								: "";
+						await st.store.updateTask(child.id, {
+							followUpOf: st.id,
+							promptAuthor: "board",
+							model: lead.model,
+							stage: "backlog",
+							state: "idle",
+							queuedAt: null,
+							details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}${
+								blocker.kind === "sandbox" ? " Waits for a validation sandbox." : ""
+							}`,
+						});
+						filed.push(child.id);
+						if (blocker.kind === "deployment")
+							questions.push(`${blocker.question} (card #${child.id})`);
+						// A card filed in this pass joins the index: two leads with one
+						// fingerprint file once, also when no card held the value before.
+						if (fp !== null) {
+							const fresh = await st.store.getTask(child.id);
+							if (fresh !== null) {
+								const list = byFingerprint.get(fp);
+								if (list === undefined) byFingerprint.set(fp, [fresh]);
+								else list.push(fresh);
+							}
+						}
+						await st.log(
+							`- filed lead as backlog card #${child.id} (${
+								blocker.kind === "sandbox"
+									? "unverified, waits for a validation sandbox"
+									: "unverified, asked the user"
+							}): ${findingHead(lead)}`,
+						);
+					}
+					// ONE question card per review for the deployment-fact leads: the user's
+					// answers sort those leads, and the reply route applies each answer to its
+					// card. The card holds nothing, so Done never waits for the answers.
+					const n = questions.length;
+					const hasOpenQuestionCard = (await st.store.listTasks()).some(
+						(t) =>
+							t.followUpOf === st.id &&
+							t.cancelledAt === null &&
+							t.stage !== "done" &&
+							t.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX),
+					);
+					if (n > 0 && !hasOpenQuestionCard) {
+						const q = await st.store.createTask(
+							`${LEAD_QUESTIONS_PROMPT_PREFIX}${st.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+						);
+						await st.store.updateTask(q.id, {
+							followUpOf: st.id,
+							promptAuthor: "board",
+							stage: "backlog",
+							state: "needs_you",
+							queuedAt: null,
+							asked: questions.map((question) => ({
+								question,
+								options: [
+									{ label: LEAD_APPLIES_OPTION },
+									{ label: LEAD_NOT_APPLY_OPTION },
+								],
+								multi: false,
+								recommended: null,
+							})),
+							needsReason: `Wants your answer: ${n} question${n === 1 ? "" : "s"} about the review's needs-validation leads`,
+						});
+						await st.log(
+							`- filed the leads question card #${q.id} (${n} deployment-fact lead${n === 1 ? "" : "s"})`,
+						);
 					}
 				}
-				st.log(
-					`- filed lead as backlog card #${child.id} (${
-						blocker.kind === "sandbox"
-							? "unverified, waits for a validation sandbox"
-							: "unverified, asked the user"
-					}): ${findingHead(lead)}`,
+				await st.log(
+					`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${
+						args.belowCap.length + args.dropped.length + leadNotFiled.length
+					} not filed${args.checkOn ? `, check ${(args.checkMs / 1000).toFixed(0)}s` : ", check off"}`,
 				);
-			}
-			// ONE question card per review for the deployment-fact leads: the user's
-			// answers sort those leads, and the reply route applies each answer to its
-			// card. The card holds nothing, so Done never waits for the answers.
-			const n = questions.length;
-			const hasOpenQuestionCard = st.store
-				.listTasks()
-				.some(
-					(t) =>
-						t.followUpOf === st.id &&
-						t.cancelledAt === null &&
-						t.stage !== "done" &&
-						t.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX),
-				);
-			if (n > 0 && !hasOpenQuestionCard) {
-				const q = st.store.createTask(
-					`${LEAD_QUESTIONS_PROMPT_PREFIX}${st.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
-				);
-				st.store.updateTask(q.id, {
-					followUpOf: st.id,
-					promptAuthor: "board",
-					stage: "backlog",
-					state: "needs_you",
-					queuedAt: null,
-					asked: questions.map((question) => ({
-						question,
-						options: [
-							{ label: LEAD_APPLIES_OPTION },
-							{ label: LEAD_NOT_APPLY_OPTION },
-						],
-						multi: false,
-						recommended: null,
-					})),
-					needsReason: `Wants your answer: ${n} question${n === 1 ? "" : "s"} about the review's needs-validation leads`,
-				});
-				st.log(
-					`- filed the leads question card #${q.id} (${n} deployment-fact lead${n === 1 ? "" : "s"})`,
-				);
-			}
+				// The counts and every unfiled finding with its reason live on the review card: the
+				// user can file any of them by hand.
+				const cur = await st.store.getTask(st.id);
+				if (
+					args.checkFailed !== null ||
+					cur === null ||
+					cur.cancelledAt !== null
+				)
+					return;
+				const notFiled = [
+					...args.belowCap.map(
+						(f) => `- below the cap of 10: ${findingHead(f)}`,
+					),
+					...args.dropped.map(
+						(d) => `- dropped: ${findingHead(d.finding)} — ${d.reason}`,
+					),
+					...leadNotFiled,
+				];
+				await writeReviewFindingsCard(st, cur, filed, notFiled, args);
+				await st.store.updateTask(st.id, { findingsCheckedAt: Date.now() });
+				if (st.plannedNext !== undefined)
+					await writePostCheckState(st, st.plannedNext);
+			});
+		} finally {
+			for (const line of lines) await originalLog(line);
 		}
-		st.log(
-			`- review findings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${
-				args.belowCap.length + args.dropped.length + leadNotFiled.length
-			} not filed${args.checkOn ? `, check ${(args.checkMs / 1000).toFixed(0)}s` : ", check off"}`,
-		);
-		// The counts and every unfiled finding with its reason live on the review card: the
-		// user can file any of them by hand.
-		const cur = st.store.getTask(st.id);
-		if (args.checkFailed !== null || cur === null || cur.cancelledAt !== null)
-			return;
-		const notFiled = [
-			...args.belowCap.map((f) => `- below the cap of 10: ${findingHead(f)}`),
-			...args.dropped.map(
-				(d) => `- dropped: ${findingHead(d.finding)} — ${d.reason}`,
-			),
-			...leadNotFiled,
-		];
-		writeReviewFindingsCard(st, cur, filed, notFiled, args);
 	}
 
 	/** Writes the finding counts and every unfiled finding with its reason onto the review
 	 * card, so the user can file any of them by hand. */
-	function writeReviewFindingsCard(
+	async function writeReviewFindingsCard(
 		st: TurnSettle,
 		cur: Task,
 		filed: string[],
@@ -8961,8 +9451,8 @@ export function createTurnLoop(
 			checkModel: string | null;
 			checkWarn: "same model" | "same vendor" | null;
 		},
-	): void {
-		st.store.updateTask(st.id, {
+	): Promise<void> {
+		await st.store.updateTask(st.id, {
 			// The review settled past any limit: the probe count clears.
 			holdAttempts: 0,
 			summary: `${cur.summary ?? "Review finished"}\nFindings: ${st.reviewFindings.length} recorded, ${filed.length} filed, ${notFiled.length} not filed${args.checkOn ? ` (check ${(args.checkMs / 1000).toFixed(0)}s on ${args.checkModel ?? "default model"}${args.checkWarn === null ? "" : ` — ${args.checkWarn} as the review`})` : ""}.`,
@@ -8978,17 +9468,17 @@ export function createTurnLoop(
 	 * turn stopped. */
 	async function runWorkCheck(st: TurnSettle, next: Next): Promise<boolean> {
 		if (!(st.workCard && next.stage === "merging")) return false;
-		return prepareWorkCheck(st);
+		return await prepareWorkCheck(st);
 	}
 
 	/** The work-check gate: off by switch, on a cancelled card, or on a card that stopped
 	 * running skips the check entirely (the deferred write below stores the classify state). */
 	async function prepareWorkCheck(st: TurnSettle): Promise<boolean> {
-		const checkOn = ops.workCheck?.() ?? true;
+		const checkOn = (await ops.workCheck?.()) ?? true;
 		const head = await ops.targetSha(st.loc.wt, "HEAD").catch(() => null);
-		const cur = st.store.getTask(st.id);
+		const cur = await st.store.getTask(st.id);
 		if (!(checkOn && cur !== null && cur.cancelledAt === null)) return false;
-		return routeWorkCheck(st, cur, head);
+		return await routeWorkCheck(st, cur, head);
 	}
 
 	/** Routes a work card due for its check: every ready report after a send-back gets a
@@ -9010,8 +9500,7 @@ export function createTurnLoop(
 		// extra check run, not a wrong verdict.
 		const lastRun = priorLog[priorLog.length - 1];
 		const lastCheckAt = lastRun === undefined ? 0 : lastRun.at;
-		const replies = st.store
-			.listTurns(st.id)
+		const replies = (await st.store.listTurns(st.id))
 			.filter(
 				(t) =>
 					t.input !== null &&
@@ -9035,7 +9524,7 @@ export function createTurnLoop(
 		// session judges it. A re-ready after a passing check at an unchanged head
 		// starts nothing: the last check passed and nothing changed.
 		if (!seen || open.length > 0)
-			return attemptWorkCheck(st, cur, head, priorLog, open, replies);
+			return await attemptWorkCheck(st, cur, head, priorLog, open, replies);
 		// seen with no open blockers: this head already passed a check; the deferred
 		// write below stores merging/queued.
 		return false;
@@ -9046,13 +9535,13 @@ export function createTurnLoop(
 	 * WORK_CHECK_MAX_SENDBACKS cap. A block after the cap asks the user: the reply
 	 * route turns a click into the send-back or the merge (no board check skill needed to
 	 * unstick it). */
-	function sendWorkCheckBack(
+	async function sendWorkCheckBack(
 		st: TurnSettle,
 		cur: Task,
 		head: string | null,
 		blockers: WorkCheckBlocker[],
 		runs: WorkCheckRun[],
-	): void {
+	): Promise<void> {
 		const sendbacks = cur.workCheckSendbacks;
 		// The ready report of the run being checked: the outcome's summary and
 		// details, else the run's final message. The first completed check stamps
@@ -9066,7 +9555,7 @@ export function createTurnLoop(
 		// new direction, a merge, or a cancel. The cap stays the outer bound for
 		// loops that still improve.
 		if (workCheckDiverged(runs)) {
-			st.store.updateTask(st.id, {
+			await st.store.updateTask(st.id, {
 				stage: "in_progress",
 				state: "needs_you",
 				needsReason: workCheckDivergeReason(runs),
@@ -9087,11 +9576,11 @@ export function createTurnLoop(
 					? `repeated bug class${repeated.length > 1 ? "es" : ""} ${repeated.map((c) => `"${c}"`).join(", ")}`
 					: null,
 			].filter((part) => part !== null);
-			st.log(`- work check: diverging loop parked (${why.join("; ")})`);
+			await st.log(`- work check: diverging loop parked (${why.join("; ")})`);
 			return;
 		}
 		if (sendbacks >= WORK_CHECK_MAX_SENDBACKS) {
-			st.store.updateTask(st.id, {
+			await st.store.updateTask(st.id, {
 				stage: "in_progress",
 				state: "needs_you",
 				needsReason: `${WORK_CHECK_ASK_BLOCK}: ${blockers
@@ -9108,7 +9597,7 @@ export function createTurnLoop(
 			});
 			return;
 		}
-		st.store.updateTask(st.id, {
+		await st.store.updateTask(st.id, {
 			stage: "in_progress",
 			state: "queued",
 			queuedAt: Date.now(),
@@ -9126,7 +9615,7 @@ export function createTurnLoop(
 			workCheckSendbacks: sendbacks + 1,
 			...reportStamp,
 		});
-		st.log(
+		await st.log(
 			`- work check: sent back to the work agent (${sendbacks + 1} of ${WORK_CHECK_MAX_SENDBACKS})`,
 		);
 	}
@@ -9147,7 +9636,7 @@ export function createTurnLoop(
 	): Promise<boolean> {
 		const built = await workCheckInput(st, cur, head, open, replies);
 		const roles = workCheckRoles(st);
-		return workCheckAttempts(st, cur, head, open, priorLog, roles, built);
+		return await workCheckAttempts(st, cur, head, open, priorLog, roles, built);
 	}
 
 	/** The work check attempts (two, then the user decides: an unchecked card never merges;
@@ -9178,7 +9667,7 @@ export function createTurnLoop(
 			checkMs += ran.checkMs;
 			const out = workAttemptOutcome(ran.result);
 			if (out.verdict !== null) {
-				applyWorkCheckVerdict(
+				await applyWorkCheckVerdict(
 					st,
 					cur,
 					head,
@@ -9196,7 +9685,7 @@ export function createTurnLoop(
 			}
 			checkFailed = out.failed;
 			limitHit = out.limitHit;
-			st.log(`! work check attempt ${attempt} failed: ${checkFailed}`);
+			await st.log(`! work check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
 				hold = await usageHold(
 					ran.result,
@@ -9219,7 +9708,7 @@ export function createTurnLoop(
 			}
 		}
 		if (checkFailed !== null)
-			parkFailedWorkCheck(
+			await parkFailedWorkCheck(
 				st,
 				priorLog,
 				roles.warn,
@@ -9328,7 +9817,7 @@ export function createTurnLoop(
 		selector: string | undefined,
 		checkRole: string,
 	): Promise<{ result: RunResult; checkMs: number } | null> {
-		return awaitCheckAttempt(
+		return await awaitCheckAttempt(
 			st,
 			input,
 			selector,
@@ -9342,7 +9831,7 @@ export function createTurnLoop(
 	 * blockers re-cite stays open; anything else counts as fixed because the re-check dropped
 	 * it. Copies, never in place. A pass stamps the card (the deferred write below stores
 	 * merging/queued with the check record); blockers go back to the work agent. */
-	function applyWorkCheckVerdict(
+	async function applyWorkCheckVerdict(
 		st: TurnSettle,
 		cur: Task,
 		head: string | null,
@@ -9355,74 +9844,108 @@ export function createTurnLoop(
 		verdict: WorkCheckVerdict,
 		diff: string,
 		transcriptText: string,
-	): void {
-		const readyReport = readyReportText(st.result.outcome, st.result.finalText);
-		const split = demoteUnquoted(verdict, diff, readyReport, transcriptText);
-		// Earlier blockers resolve three ways: the verdict's fixed list
-		// (by the prompt's 1-based id) wins; a blocker whose exact quote
-		// the new blockers re-cite stays open; anything else counts as
-		// fixed because the re-check dropped it. Copies, never in place.
-		const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
-		const requoted = new Set(split.blockers.map((b) => b.quote));
-		const runs = [...priorLog];
-		const lastIdx = runs.findLastIndex((r) => r.outcome === "blockers");
-		const prev = lastIdx === -1 ? undefined : runs[lastIdx];
-		if (prev !== undefined)
-			runs[lastIdx] = {
-				...prev,
-				blockers: prev.blockers.map((b) => {
-					const oi = open.indexOf(b);
-					if (oi === -1) return b;
-					const reason = fixedById.get(oi + 1);
-					if (reason !== undefined)
-						return {
-							...b,
-							status: "fixed" as const,
-							statusReason: reason,
-						};
-					if (requoted.has(b.quote)) return b;
-					return {
-						...b,
-						status: "fixed" as const,
-						statusReason: "not re-cited by the re-check",
-					};
-				}),
-			};
-		const run: WorkCheckRun = {
-			at: checkStart,
-			// The resolved model, not just the role selector: with the role
-			// missing, the card must name the default role it fell back to.
-			model: checkModel,
-			outcome: split.blockers.length === 0 ? "pass" : "blockers",
-			blockers: split.blockers,
-			notes: split.notes,
-			durationMs: checkMs,
-			...warn,
+	): Promise<void> {
+		const originalLog = st.log;
+		const lines: string[] = [];
+		st = {
+			...st,
+			log: (line) => {
+				lines.push(line);
+			},
 		};
-		const allRuns = [...runs, run].slice(-20);
-		st.log(
-			`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
-		);
-		if (split.blockers.length === 0)
-			// Pass: the card stays in its current state; the deferred write
-			// below stores merging/queued with the check record stamped. The
-			// check ran past the limit, so the probe count clears.
-			st.store.updateTask(st.id, {
-				workCheckLog: allRuns,
-				workCheckHead: head,
-				workCheckSendbacks: cur.workCheckSendbacks,
-				holdAttempts: 0,
-				...(cur.workCheckReport === null
-					? { workCheckReport: readyReport }
-					: {}),
+		try {
+			return await st.store.transaction(async () => {
+				const current = await st.store.getTask(st.id);
+				if (
+					current === null ||
+					current.cancelledAt !== null ||
+					(current.state !== "running" && current.state !== "preparing") ||
+					current.sessionId !== cur.sessionId ||
+					current.base !== cur.base
+				)
+					return;
+				cur = current;
+				const readyReport = readyReportText(
+					st.result.outcome,
+					st.result.finalText,
+				);
+				const split = demoteUnquoted(
+					verdict,
+					diff,
+					readyReport,
+					transcriptText,
+				);
+				// Earlier blockers resolve three ways: the verdict's fixed list
+				// (by the prompt's 1-based id) wins; a blocker whose exact quote
+				// the new blockers re-cite stays open; anything else counts as
+				// fixed because the re-check dropped it. Copies, never in place.
+				const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
+				const requoted = new Set(split.blockers.map((b) => b.quote));
+				const runs = [...priorLog];
+				const lastIdx = runs.findLastIndex((r) => r.outcome === "blockers");
+				const prev = lastIdx === -1 ? undefined : runs[lastIdx];
+				if (prev !== undefined)
+					runs[lastIdx] = {
+						...prev,
+						blockers: prev.blockers.map((b) => {
+							const oi = open.indexOf(b);
+							if (oi === -1) return b;
+							const reason = fixedById.get(oi + 1);
+							if (reason !== undefined)
+								return {
+									...b,
+									status: "fixed" as const,
+									statusReason: reason,
+								};
+							if (requoted.has(b.quote)) return b;
+							return {
+								...b,
+								status: "fixed" as const,
+								statusReason: "not re-cited by the re-check",
+							};
+						}),
+					};
+				const run: WorkCheckRun = {
+					at: checkStart,
+					// The resolved model, not just the role selector: with the role
+					// missing, the card must name the default role it fell back to.
+					model: checkModel,
+					outcome: split.blockers.length === 0 ? "pass" : "blockers",
+					blockers: split.blockers,
+					notes: split.notes,
+					durationMs: checkMs,
+					...warn,
+				};
+				const allRuns = [...runs, run].slice(-20);
+				await st.log(
+					`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
+				);
+				if (split.blockers.length === 0)
+					// Pass: the card stays in its current state; the deferred write
+					// below stores merging/queued with the check record stamped. The
+					// check ran past the limit, so the probe count clears.
+					await st.store.updateTask(st.id, {
+						workCheckLog: allRuns,
+						workCheckHead: head,
+						workCheckSendbacks: cur.workCheckSendbacks,
+						holdAttempts: 0,
+						...(cur.workCheckReport === null
+							? { workCheckReport: readyReport }
+							: {}),
+					});
+				else await sendWorkCheckBack(st, cur, head, split.blockers, allRuns);
+				if (st.plannedNext !== undefined)
+					await writePostCheckState(st, st.plannedNext);
 			});
-		else sendWorkCheckBack(st, cur, head, split.blockers, allRuns);
+		} finally {
+			for (const line of lines) await originalLog(line);
+		}
 	}
 
 	/** A work check that failed twice (or hit a usage limit): park needs_you for a re-run, or
 	 * hold the card until the provider's reset. No head stamp: the next ready at this head
 	 * must run the check again. */
-	function parkFailedWorkCheck(
+	async function parkFailedWorkCheck(
 		st: TurnSettle,
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
@@ -9432,37 +9955,59 @@ export function createTurnLoop(
 		checkFailed: string,
 		limitHit: boolean,
 		hold: UsageHold | null,
-	): void {
-		st.log(
-			hold !== null
-				? `- work check held until ${new Date(hold.holdUntil).toISOString()}: ${hold.rate ? "rate limit" : "usage limit"}`
-				: `- work check failed: ${checkFailed}`,
-		);
-		const patch = hold === null ? null : holdPatch(st.store, st.id, hold);
-		st.store.updateTask(st.id, {
-			...(hold === null
-				? {
-						stage: "in_progress" as const,
-						state: "needs_you" as const,
-						needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
-						// The check ran past the limit: the probe count clears.
-						holdAttempts: 0,
-					}
-				: patch),
-			workCheckLog: [
-				...priorLog,
-				{
-					at: checkStart,
-					model: checkModel,
-					outcome: "error",
-					blockers: [],
-					notes: [],
-					durationMs: checkMs,
-					...warn,
-					error: checkFailed,
-				},
-			],
-		});
+	): Promise<void> {
+		const originalLog = st.log;
+		const lines: string[] = [];
+		st = {
+			...st,
+			log: (line) => {
+				lines.push(line);
+			},
+		};
+		try {
+			return await st.store.transaction(async () => {
+				const current = await st.store.getTask(st.id);
+				if (
+					current === null ||
+					current.cancelledAt !== null ||
+					(current.state !== "running" && current.state !== "preparing")
+				)
+					return;
+				await st.log(
+					hold !== null
+						? `- work check held until ${new Date(hold.holdUntil).toISOString()}: ${hold.rate ? "rate limit" : "usage limit"}`
+						: `- work check failed: ${checkFailed}`,
+				);
+				const patch =
+					hold === null ? null : await holdPatch(st.store, st.id, hold);
+				await st.store.updateTask(st.id, {
+					...(hold === null
+						? {
+								stage: "in_progress" as const,
+								state: "needs_you" as const,
+								needsReason: `The work check failed${limitHit ? "" : " twice"}: ${checkFailed}. Reply to re-run it, or cancel the card.`,
+								// The check ran past the limit: the probe count clears.
+								holdAttempts: 0,
+							}
+						: patch),
+					workCheckLog: [
+						...priorLog,
+						{
+							at: checkStart,
+							model: checkModel,
+							outcome: "error",
+							blockers: [],
+							notes: [],
+							durationMs: checkMs,
+							...warn,
+							error: checkFailed,
+						},
+					],
+				});
+			});
+		} finally {
+			for (const line of lines) await originalLog(line);
+		}
 	}
 
 	/** The hold columns a settle that parked a hold writes: the parked hold's head to
@@ -9487,34 +10032,40 @@ export function createTurnLoop(
 	 * settleReviewCard on the next tick, which does the full Done bookkeeping — commits,
 	 * mergeHead, uncommitted files, worktree removal. Only the reason is recomputed: the
 	 * check filed (or logged) the findings above, so the reason comes from the live cards. */
-	function writePostCheckState(st: TurnSettle, next: Next): void {
-		if (!st.checkWillRun) return;
-		// A merge hold deferred for the check (OTTR-766) parks here, after a passed check
-		// stamped its head. A send-back or a failed check left the card not running, so
-		// the guard below skips the park and their own write stands.
-		const final = st.holdPark ?? next;
-		const afterCheck = st.store.getTask(st.id);
-		const live =
-			afterCheck !== null &&
-			afterCheck.cancelledAt === null &&
-			(afterCheck.state === "running" || afterCheck.state === "preparing");
-		if (live)
-			st.store.updateTask(st.id, {
-				stage: final.stage,
-				state: final.state,
-				// The check filed (or logged) the findings above: a parked review's reason
-				// comes from the live cards — open kept cards hold with FINDINGS_HOLD, and
-				// with nothing open the held marker stays so the next tick (a plain review
-				// lands done, a release publishes) finishes the card with the full Done
-				// bookkeeping. A deferred merge hold keeps its own reason.
-				needsReason:
-					!st.holdPark && st.idn.reviewCard && final.stage === "merging"
-						? (findingsHold(st.store.listTasks(), st.task) ?? FINDINGS_HOLD)
-						: final.needsReason,
-				queuedAt: final.state === "queued" ? Date.now() : undefined,
-				// On a plain check settle these ride as the no-op they always were.
-				...holdParkColumns(st),
-			});
+	async function writePostCheckState(
+		st: TurnSettle,
+		next: Next,
+	): Promise<void> {
+		return await st.store.transaction(async () => {
+			if (!st.checkWillRun) return;
+			// A merge hold deferred for the check (OTTR-766) parks here, after a passed check
+			// stamped its head. A send-back or a failed check left the card not running, so
+			// the guard below skips the park and their own write stands.
+			const final = st.holdPark ?? next;
+			const afterCheck = await st.store.getTask(st.id);
+			const live =
+				afterCheck !== null &&
+				afterCheck.cancelledAt === null &&
+				(afterCheck.state === "running" || afterCheck.state === "preparing");
+			if (live)
+				await st.store.updateTask(st.id, {
+					stage: final.stage,
+					state: final.state,
+					// The check filed (or logged) the findings above: a parked review's reason
+					// comes from the live cards — open kept cards hold with FINDINGS_HOLD, and
+					// with nothing open the held marker stays so the next tick (a plain review
+					// lands done, a release publishes) finishes the card with the full Done
+					// bookkeeping. A deferred merge hold keeps its own reason.
+					needsReason:
+						!st.holdPark && st.idn.reviewCard && final.stage === "merging"
+							? (findingsHold(await st.store.listTasks(), st.task) ??
+								FINDINGS_HOLD)
+							: final.needsReason,
+					queuedAt: final.state === "queued" ? Date.now() : undefined,
+					// On a plain check settle these ride as the no-op they always were.
+					...holdParkColumns(st),
+				});
+		});
 	}
 
 	/** One work-check attempt's outcome: the parsed verdict on a valid one (null on an
@@ -9540,6 +10091,13 @@ export function createTurnLoop(
 	/** The done card: stamp the released version and remove the worktree. */
 	async function stampDoneCard(st: TurnSettle, next: Next): Promise<void> {
 		if (next.stage !== "done") return;
+		const current = await st.store.getTask(st.id);
+		if (
+			current === null ||
+			current.cancelledAt !== null ||
+			current.stage !== "done"
+		)
+			return;
 		if (!st.idn.releaseCard && st.kind === "merge")
 			await stampReleaseVersion(st);
 		await removeDoneWorktree(
@@ -9556,7 +10114,7 @@ export function createTurnLoop(
 	 * this card. ponytail: two merges landing between push and capture pin the newer run to
 	 * both cards. */
 	async function stampReleaseVersion(st: TurnSettle): Promise<void> {
-		const version = readReleasedVersion(st);
+		const version = await readReleasedVersion(st);
 		const short = st.header.target.replace(/^origin\//, "");
 		const [local, pushed] = await Promise.all([
 			ops.targetSha(st.e.path, st.header.target).catch(() => null),
@@ -9571,20 +10129,29 @@ export function createTurnLoop(
 						.targetSha(st.e.path, `refs/tags/${version}`)
 						.catch(() => null)
 				: null;
-		if (version !== null) {
-			if (onOrigin && tagged === pushed)
-				st.store.updateTask(st.id, { releaseVersion: version });
-			else
-				st.log(`- no release stamp for ${version}: no tag on the pushed head`);
-		}
-		if (onOrigin) st.store.updateTask(st.id, { pushSha: pushed });
-		else st.log("- CI watch skipped: merge push not on origin");
+		if (version !== null && !(onOrigin && tagged === pushed))
+			await st.log(
+				`- no release stamp for ${version}: no tag on the pushed head`,
+			);
+		if (!onOrigin) await st.log("- CI watch skipped: merge push not on origin");
+		await st.store.transaction(async () => {
+			const current = await st.store.getTask(st.id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.stage !== "done"
+			)
+				return;
+			if (version !== null && onOrigin && tagged === pushed)
+				await st.store.updateTask(st.id, { releaseVersion: version });
+			if (onOrigin) await st.store.updateTask(st.id, { pushSha: pushed });
+		});
 	}
 
 	/** The version this merge turn released, parsed from the settled row's report prose
 	 * (null unless the run reported an integrated outcome). */
-	function readReleasedVersion(st: TurnSettle): string | null {
-		const last = st.store.listTurns(st.id).at(-1);
+	async function readReleasedVersion(st: TurnSettle): Promise<string | null> {
+		const last = (await st.store.listTurns(st.id)).at(-1);
 		return last?.outcome === "integrated"
 			? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
 			: null;
@@ -9600,9 +10167,20 @@ export function createTurnLoop(
 		// The done drawer keeps naming what the run left uncommitted after the
 		// worktree is gone: capture the list before removeWorktree deletes it.
 		// statusFiles never rejects (an unreadable tree reads as []).
-		st.store.updateTask(st.id, {
-			uncommittedFiles: await ops.statusFiles(st.loc.wt),
+		const uncommittedFiles = await ops.statusFiles(st.loc.wt);
+		const applied = await st.store.transaction(async () => {
+			const current = await st.store.getTask(st.id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.stage !== "done" ||
+				current.worktree !== st.loc.wt
+			)
+				return false;
+			await st.store.updateTask(st.id, { uncommittedFiles });
+			return true;
 		});
+		if (!applied) return;
 		await saveDoneArtifacts(st);
 		try {
 			await ops.removeWorktree({
@@ -9611,9 +10189,9 @@ export function createTurnLoop(
 				branch,
 				log: st.log,
 			});
-			st.log("- worktree removed");
+			await st.log("- worktree removed");
 		} catch (err) {
-			st.log(`! removeWorktree: ${errmsg(err)}`);
+			await st.log(`! removeWorktree: ${errmsg(err)}`);
 		}
 	}
 
@@ -9630,17 +10208,21 @@ export function createTurnLoop(
 			);
 			const names = [...r.moved, ...r.copied];
 			if (names.length > 0)
-				appendLog(
+				await appendLog(
 					st.store,
 					st.id,
 					`saved ${names.length} file(s) to .tasks/quarantine/${st.id}: ${names.slice(0, 20).join(", ")}${names.length > 20 ? " …" : ""}`,
 				);
 			for (const f of r.tooLarge)
-				appendLog(st.store, st.id, `${f}: too large, not kept`);
+				await appendLog(st.store, st.id, `${f}: too large, not kept`);
 			for (const f of r.failed)
-				appendLog(st.store, st.id, `${f.path}: not kept (${f.reason})`);
+				await appendLog(st.store, st.id, `${f.path}: not kept (${f.reason})`);
 		} catch (err) {
-			appendLog(st.store, st.id, `saving done files failed: ${errmsg(err)}`);
+			await appendLog(
+				st.store,
+				st.id,
+				`saving done files failed: ${errmsg(err)}`,
+			);
 		}
 	}
 
@@ -9658,19 +10240,28 @@ export function createTurnLoop(
 			// so the optional chain on the token cannot see null here.
 			await ops.killDetached?.(watch.url, runnerToken(watch.url), watch.runId);
 		} catch (err) {
-			appendLog(store, id, `! stop killDetached: ${errmsg(err)}`);
+			await appendLog(store, id, `! stop killDetached: ${errmsg(err)}`);
 		}
-		const turn = store.listTurns(id).at(-1);
-		if (turn && turn.endedAt === null)
-			store.finishTurn(turn.id, {
-				endedAt: Date.now(),
-				exitCode: null,
-				error: "stopped",
-			});
-		store.updateTask(id, {
-			state: "needs_you",
-			needsReason: reason,
+		let turnId: number | null = null;
+		await store.transaction(async () => {
+			const turn = (await store.listTurns(id)).at(-1);
+			if (turn?.endedAt === null) {
+				turnId = turn.id;
+				await store.finishTurnState(turn.id, {
+					endedAt: Date.now(),
+					exitCode: null,
+					error: "stopped",
+				});
+			}
+			const current = await store.getTask(id);
+			if (
+				current !== null &&
+				current.cancelledAt === null &&
+				(current.state === "running" || current.state === "preparing")
+			)
+				await store.updateTask(id, { state: "needs_you", needsReason: reason });
 		});
+		if (turnId !== null) await store.captureTurnData(turnId);
 		return { ok: true };
 	}
 
@@ -9683,7 +10274,7 @@ export function createTurnLoop(
 		reason: string = TURN_STOPPED_REASON,
 	): Promise<StopOutcome> {
 		const store = e.store;
-		const task = store.getTask(id);
+		const task = await store.getTask(id);
 		if (task === null) return { error: "unknown task", status: 404 };
 		if (task.cancelledAt !== null)
 			return { error: "task is cancelled", status: 409 };
@@ -9692,7 +10283,8 @@ export function createTurnLoop(
 		// and settles the row here — the same stopped park a live kill gets from runTurn.
 		const watch = detached.get(`${store.name}/${id}`);
 		if (!handle && !watch) return { error: "no turn is running", status: 409 };
-		if (watch !== undefined) return stopDetachedRun(store, id, reason, watch);
+		if (watch !== undefined)
+			return await stopDetachedRun(store, id, reason, watch);
 		// A watcher row returned above, so handle is set here; the guard keeps TS exact.
 		if (!handle) return { error: "no turn is running", status: 409 };
 		stopping.set(`${store.name}/${id}`, reason);
@@ -9717,7 +10309,7 @@ export function createTurnLoop(
 		const stops: Promise<boolean>[] = [];
 		for (const e of projects.values()) {
 			try {
-				for (const t of e.store.listTasks()) {
+				for (const t of await e.store.listTasks()) {
 					const stop = creditStopTurn(e, t.id, reason);
 					if (stop !== null) stops.push(stop);
 				}
@@ -9770,21 +10362,26 @@ export function createTurnLoop(
 	 * worktree. Each queued turn still passes the credit gate. Resolves to the number queued; a
 	 * second call finds no parked card. One sick store must not keep the other projects' cards
 	 * parked. */
-	function releaseParkedCards(reason: string): number {
+	async function releaseParkedCards(reason: string): Promise<number> {
 		let released = 0;
 		for (const e of projects.values()) {
 			try {
-				for (const t of e.store.listTasks()) {
-					if (
-						t.state !== "needs_you" ||
-						t.cancelledAt !== null ||
-						t.needsReason !== reason
-					)
-						continue;
-					// Nobody typed the release's ".": a queued steer keeps its own author.
-					e.store.updateTask(t.id, replyPatch(t, ".", [], "supervisor"));
-					released += 1;
-				}
+				await e.store.transaction(async () => {
+					for (const t of await e.store.listTasks()) {
+						if (
+							t.state !== "needs_you" ||
+							t.cancelledAt !== null ||
+							t.needsReason !== reason
+						)
+							continue;
+						// Nobody typed the release's ".": a queued steer keeps its own author.
+						await e.store.updateTask(
+							t.id,
+							replyPatch(t, ".", [], "supervisor"),
+						);
+						released += 1;
+					}
+				});
 			} catch (err) {
 				logStoreError(e.store.name, err);
 			}
@@ -9803,9 +10400,9 @@ export function createTurnLoop(
 		const reason = ops.hosted.config.wording.creditReason;
 		creditHold = false;
 		creditReleases += 1;
-		const released = releaseParkedCards(reason);
+		const released = await releaseParkedCards(reason);
 		if (released > 0) ops.publishSoon();
-		schedule();
+		await schedule();
 		return released;
 	}
 
@@ -9820,7 +10417,7 @@ export function createTurnLoop(
 			// so the optional chain on the token cannot see null here.
 			await ops.killDetached?.(watch.url, runnerToken(watch.url), watch.runId);
 		} catch (err) {
-			appendLog(e.store, id, `! cancel killDetached: ${errmsg(err)}`);
+			await appendLog(e.store, id, `! cancel killDetached: ${errmsg(err)}`);
 		}
 	}
 
@@ -9870,15 +10467,25 @@ export function createTurnLoop(
 			force,
 		);
 		if (unsaved !== null) {
-			appendLog(store, id, `! cancel kept the worktree: ${unsaved}`);
-			store.updateTask(id, {
-				cancelledAt: null,
-				state: "needs_you",
-				// Its own prefix (R5-2): the supervisor's auto-tend matches "Kept the
-				// worktree: " and must not answer a card the user just cancelled; the
-				// kept counts and finish-kept still cover it via isKeptReason.
-				needsReason: cancelKeptReason(unsaved),
-				keptFiles: await ops.statusFiles(wt),
+			await appendLog(store, id, `! cancel kept the worktree: ${unsaved}`);
+			const keptFiles = await ops.statusFiles(wt);
+			await store.transaction(async () => {
+				const current = await store.getTask(id);
+				if (
+					current?.cancelledAt !== task.cancelledAt ||
+					current?.worktree !== task.worktree ||
+					current?.base !== task.base
+				)
+					return;
+				await store.updateTask(id, {
+					cancelledAt: null,
+					state: "needs_you",
+					// Its own prefix (R5-2): the supervisor's auto-tend matches "Kept the
+					// worktree: " and must not answer a card the user just cancelled; the
+					// kept counts and finish-kept still cover it via isKeptReason.
+					needsReason: cancelKeptReason(unsaved),
+					keptFiles,
+				});
 			});
 			return { kept: unsaved };
 		}
@@ -9887,13 +10494,13 @@ export function createTurnLoop(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: keepBranch ? null : task.branch,
-				log: (line) => appendLog(store, id, line),
+				log: async (line) => await appendLog(store, id, line),
 			});
 		} catch (err) {
-			appendLog(store, id, `! cancel removeWorktree: ${errmsg(err)}`);
+			await appendLog(store, id, `! cancel removeWorktree: ${errmsg(err)}`);
 		}
 		if (keepBranch && task.branch)
-			appendLog(
+			await appendLog(
 				store,
 				id,
 				`! cancel kept the branch ${task.branch}: it holds commits that never reached ${e.target ?? task.base}`,
@@ -9913,7 +10520,7 @@ export function createTurnLoop(
 		task: ListedTask | null | undefined,
 	): Promise<void> {
 		const branch = task?.branch ?? null;
-		const settings = e.store.getSettings();
+		const settings = await e.store.getSettings();
 		const originUrl = settings.originUrl;
 		if (
 			task === null ||
@@ -9934,7 +10541,11 @@ export function createTurnLoop(
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)
 			.catch((err: unknown) => errmsg(err));
 		if (err !== null) {
-			appendLog(e.store, id, `! cancel remote branch delete failed: ${err}`);
+			await appendLog(
+				e.store,
+				id,
+				`! cancel remote branch delete failed: ${err}`,
+			);
 			return;
 		}
 		// prNumber alone does not name an open PR on this branch: an adopted source PR keeps
@@ -9945,7 +10556,7 @@ export function createTurnLoop(
 			task.stage === "merging" &&
 			task.prNumber !== null &&
 			task.sourcePrNumber === null;
-		appendLog(
+		await appendLog(
 			e.store,
 			id,
 			prOpen
@@ -9965,9 +10576,12 @@ export function createTurnLoop(
 	): Promise<CancelOutcome> {
 		const store = e.store;
 		// The tag and push cannot be taken back: a cancel must not claim a card it cannot stop.
-		if (publishing.has(`${store.name}/${id}`))
-			return { error: "release already publishing", status: 409 };
-		store.updateTask(id, { cancelledAt: Date.now() });
+		const cancelledAt = Date.now();
+		const claimed = await store.transaction(async () => {
+			if (publishing.has(`${store.name}/${id}`)) return null;
+			return await store.updateTask(id, { cancelledAt });
+		});
+		if (!claimed) return { error: "release already publishing", status: 409 };
 		await killDetachedWatch(e, id);
 		const handle = running.get(`${store.name}/${id}`);
 		if (handle) {
@@ -9977,8 +10591,19 @@ export function createTurnLoop(
 				new Promise<void>((r) => setTimeout(r, 15_000)),
 			]);
 		}
-		const task = store.getTask(id);
-		if (task?.worktree) {
+		const task = await store.getTask(id);
+		if (task === null) throw new Error(`unknown task: ${id}`);
+		if (
+			task.cancelledAt !== cancelledAt ||
+			task.state !== claimed.state ||
+			task.stage !== claimed.stage ||
+			task.sessionId !== claimed.sessionId ||
+			task.base !== claimed.base ||
+			task.pendingPrompt !== claimed.pendingPrompt ||
+			task.worktree !== claimed.worktree
+		)
+			return { removed: true };
+		if (task.worktree) {
 			const kept = await disposeCancelledWorktree(
 				e,
 				id,
@@ -9989,7 +10614,20 @@ export function createTurnLoop(
 			if (kept !== null) return kept;
 		}
 		await deleteCancelledRemoteBranch(e, id, task);
-		store.updateTask(id, { state: "idle" });
+		await store.transaction(async () => {
+			const current = await store.getTask(id);
+			if (
+				current !== null &&
+				current.cancelledAt === cancelledAt &&
+				current.state === claimed.state &&
+				current.stage === claimed.stage &&
+				current.sessionId === claimed.sessionId &&
+				current.base === claimed.base &&
+				current.pendingPrompt === claimed.pendingPrompt &&
+				current.worktree === claimed.worktree
+			)
+				await store.updateTask(id, { state: "idle" });
+		});
 		return { removed: true };
 	}
 
@@ -10092,14 +10730,14 @@ export function createTurnLoop(
 		choices: unknown,
 	): Promise<FinishKeptOutcome> {
 		const store = e.store;
-		const task = store.getTask(id);
+		const task = await store.getTask(id);
 		if (task === null) return { error: "unknown task", status: 404 };
 		const plan = await planKeptFinishRun(e, id, task, choices);
 		if ("error" in plan) return plan;
 		const failed = moveKeptFiles(e, task.worktree, plan.planned);
 		if (failed !== null) return failed;
 		for (const rel of plan.planned.ignores) await ops.ignoreInMain(e.path, rel);
-		appendLog(
+		await appendLog(
 			store,
 			id,
 			`- finished kept worktree: ${plan.planned.moves.length} moved, ${plan.planned.ignores.length} ignored, ${plan.planned.deletes.length} deleted`,
@@ -10110,23 +10748,40 @@ export function createTurnLoop(
 					mainPath: e.path,
 					worktreePath: task.worktree,
 					branch: task.branch,
-					log: (line) => appendLog(store, id, line),
+					log: async (line) => await appendLog(store, id, line),
 				});
 		} catch (err) {
-			appendLog(store, id, `! removeWorktree: ${errmsg(err)}`);
+			await appendLog(store, id, `! removeWorktree: ${errmsg(err)}`);
 		}
-		store.updateTask(id, {
-			stage: "done",
-			state: "idle",
-			needsReason: null,
-			// The kept list is this run's uncommitted files: the done drawer keeps
-			// naming them now that the worktree they lived in is gone.
-			uncommittedFiles: task.keptFiles,
-			keptFiles: [],
-			commits: await ops.targetCommits(e.path, plan.target),
-			mergeHead: await ops.targetSha(e.path, plan.target).catch(() => null),
+		const commits = await ops.targetCommits(e.path, plan.target);
+		const mergeHead = await ops
+			.targetSha(e.path, plan.target)
+			.catch(() => null);
+		return await store.transaction<FinishKeptOutcome>(async () => {
+			const current = await store.getTask(id);
+			if (
+				current === null ||
+				current.revision !== task.revision ||
+				current.cancelledAt !== null ||
+				current.sessionId !== task.sessionId ||
+				current.base !== task.base ||
+				current.worktree !== task.worktree
+			)
+				return {
+					error: "task changed while the kept worktree was finished",
+					status: 409,
+				};
+			await store.updateTask(id, {
+				stage: "done",
+				state: "idle",
+				needsReason: null,
+				uncommittedFiles: task.keptFiles,
+				keptFiles: [],
+				commits,
+				mergeHead,
+			});
+			return { ok: true };
 		});
-		return { ok: true };
 	}
 
 	/** OTTR-454: live runs per runner for GET /api/drain. A worker turn's entry carries the

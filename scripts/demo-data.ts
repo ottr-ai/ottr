@@ -696,7 +696,11 @@ export function seedTaskEvents(db: Database, seed: TaskSeed): void {
 	if (isDone || t.stage === "merging") seedMergeEvents(db, id, t, wEnd, isDone);
 }
 
-function seedProject(root: string, spec: ProjectSpec, now: number): void {
+async function seedProject(
+	root: string,
+	spec: ProjectSpec,
+	now: number,
+): Promise<void> {
 	const dir = join(root, spec.name);
 	rmSync(dir, { recursive: true, force: true });
 	mkdirSync(dir, { recursive: true });
@@ -710,7 +714,7 @@ function seedProject(root: string, spec: ProjectSpec, now: number): void {
 		appendFileSync(join(dir, ".git", "info", "exclude"), "AGENTS.md\n");
 	}
 	// init() creates the schema and the self-ignoring .tasks/.worktrees gitignores.
-	ProjectStore.init(dir).close();
+	await (await ProjectStore.init(dir)).close();
 	git(
 		dir,
 		"-c",
@@ -859,61 +863,66 @@ const MUTATION_TURN_PROMPT = /mutation (?:gate|testing)/i;
 
 /** Store slice the map builder reads; ProjectStore satisfies it structurally. */
 interface DemoStore {
-	listTasks(): Array<{ id: string; state: string }>;
-	listTurns(taskId: string): Array<{
-		kind: string;
-		endedAt: number | null;
-		prompt: string;
-	}>;
+	transaction<T>(work: () => T | Promise<T>): Promise<T>;
+	listTasks(): Promise<Array<{ id: string; state: string }>>;
+	listTurns(taskId: string): Promise<
+		Array<{
+			kind: string;
+			endedAt: number | null;
+			prompt: string;
+		}>
+	>;
 }
 
 /** Progress lines per `project/task`: one entry per preparing/running card whose open
  * work turn runs the mutation gate. Deterministic text, like the rest of the pool. */
-export function demoProgressMap(
+export async function demoProgressMap(
 	projects: Iterable<[string, { store: DemoStore }]>,
-): Map<string, string> {
+): Promise<Map<string, string>> {
 	const lines = new Map<string, string>();
 	for (const [name, { store }] of projects) {
-		for (const t of store.listTasks()) {
-			if (t.state !== "running" && t.state !== "preparing") continue;
-			const gate = store
-				.listTurns(t.id)
-				.find(
+		await store.transaction(async () => {
+			for (const t of await store.listTasks()) {
+				if (t.state !== "running" && t.state !== "preparing") continue;
+				const gate = (await store.listTurns(t.id)).find(
 					(tn) =>
 						tn.kind === "work" &&
 						tn.endedAt === null &&
 						MUTATION_TURN_PROMPT.test(tn.prompt),
 				);
-			if (gate !== undefined)
-				lines.set(`${name}/${t.id}`, DEMO_MUTATION_PROGRESS);
-		}
+				if (gate !== undefined)
+					lines.set(`${name}/${t.id}`, DEMO_MUTATION_PROGRESS);
+			}
+		});
 	}
 	return lines;
 }
 
 /** Make sure the board has an admin login; an existing one always wins. The plain password
  * exists only long enough to be hashed and is never printed or stored. */
-function ensureAdmin(stateDir: string): void {
-	const store = GlobalStore.open(stateDir);
+async function ensureAdmin(stateDir: string): Promise<void> {
+	const store = await GlobalStore.open(stateDir);
 	try {
-		const config = store.get<Record<string, unknown>>("config");
-		const admin = config?.admin as
-			| { name?: unknown; passHash?: unknown }
-			| undefined;
-		if (
-			admin &&
-			typeof admin.name === "string" &&
-			typeof admin.passHash === "string"
-		)
-			return;
-		store.set("config", {
-			...config,
-			admin: { name: "dev", passHash: hashPassword(newSecret()) },
-			sessionSecret: newSecret(),
-			apiKey: newSecret(),
+		await store.transaction(async () => {
+			const config = await store.get<Record<string, unknown>>("config");
+			const admin = config?.admin as
+				| { name?: unknown; passHash?: unknown }
+				| undefined;
+			if (
+				admin &&
+				typeof admin.name === "string" &&
+				typeof admin.passHash === "string"
+			)
+				return;
+			await store.set("config", {
+				...config,
+				admin: { name: "dev", passHash: hashPassword(newSecret()) },
+				sessionSecret: newSecret(),
+				apiKey: newSecret(),
+			});
 		});
 	} finally {
-		store.close();
+		await store.close();
 	}
 }
 
@@ -932,18 +941,18 @@ function readMarker(root: string): SeedMarker | null {
 	}
 }
 
-export function seedDemo(
+export async function seedDemo(
 	root: string,
 	force = false,
 	stateDir: string = process.env.OTTR_STATE_DIR ?? join(root, "state"),
-): void {
+): Promise<void> {
 	mkdirSync(root, { recursive: true });
 	const marker = readMarker(root);
 	const reseed = force || marker?.version !== POOL_VERSION;
 	if (reseed) {
 		removeStaleProjects(root);
 		const now = Date.now();
-		for (const spec of POOL) seedProject(root, spec, now);
+		for (const spec of POOL) await seedProject(root, spec, now);
 		writeFileSync(
 			join(root, "seeded.json"),
 			JSON.stringify({
@@ -958,7 +967,7 @@ export function seedDemo(
 		root,
 		reseed ? POOL.map((p) => p.name) : (marker?.projects ?? []),
 	);
-	ensureAdmin(stateDir);
+	await ensureAdmin(stateDir);
 }
 
 /** The data repo's omp config.yml on the demo board: the roles the Model roles editor shows,
@@ -1066,7 +1075,7 @@ if (import.meta.main) {
 	const positional = process.argv.slice(2).find((a) => !a.startsWith("--"));
 	const root = resolveRoot(positional);
 	const force = process.argv.includes("--force");
-	seedDemo(root, force);
+	await seedDemo(root, force);
 	console.log(
 		`demo data ${force ? "reseeded" : "seeded or refreshed"} in ${root}`,
 	);

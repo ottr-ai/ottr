@@ -170,6 +170,11 @@ An ordinary operation must not execute inside another operation's open transacti
 
 The queue continues after a definite rolled-back application error. Connection loss follows the retry and ownership rules below. Shutdown stops new work, settles permitted queued work, closes stores, and releases the lifetime lock before process exit.
 
+Card A adds `App.close(): Promise<void>` for the same shutdown boundary.
+It stops new background work and publication timers, then awaits accepted work and queued publications.
+Server shutdown and test fixtures await this method before they close stores.
+An accepted background error remains visible. Store closure must not cause a detached database read.
+
 ### Current store-internal read/write inventory
 
 This inventory records synchronous groups that can interleave after an async conversion. It also records existing transactions and grouped writes that require a preserved boundary.
@@ -215,6 +220,71 @@ For transcript capture, preserve the distinction between an unavailable transcri
 `legacyForkHoldBase` and `clearLegacyForkHoldBase` are separate methods (`src/store.ts:2404-2418`). Their caller performs Git work before hold replacement (`src/forks.ts:882-1006`). Preserve the base until replacement succeeds. Guard the final database apply against the original branch/base state. Never hold a database transaction across the Git work.
 
 Caller quota examples also cross external work: fork runs (`src/forks.ts:1037-1139`), PR runs (`src/prs.ts:896-900,1000-1092`), and issue batches (`src/issues.ts:281-305`). Extract atomic quota claims or guarded final decisions. Do not claim a database transaction covers the external scan or review preparation.
+
+### Card A assumptions and refreshed store inventory
+
+Card A uses revision `e2cfc28`. It keeps `bun:sqlite`, existing schemas, lifetime locks, migrations, paths, and event values. Card D alone adds the insertion ordinal.
+
+Integration also covers revision `4c809e1`: usage-hold stamps and attempt counts, quota recovery evidence, and lead-question replies. Lead replies keep each database-only section atomic around an external cancellation.
+
+All store methods return promises. Properties and exported free filesystem helpers remain plain. Each store serializes database operations through one queue.
+
+The current `src/store.ts` groups are:
+
+| Current source | Group and boundary |
+| --- | --- |
+| `1214-1279` | Cost writes and transcript backfills. Read files outside transactions. Guard session, turn window, state, and missing values on apply. |
+| `1351-2275` | Init and ordered open convergence. Preserve named-column copy, row counts, rollback, kind markers, topics, reasons, and legacy hold checkpoints. |
+| `2277-2373` | Path and title helpers. Preserve title holds and the first saved title. Guard transcript title applies against the same session. |
+| `2375-2407` | Settings patch and result. Use one transaction. |
+| `2468-2490,2557-2631` | Fork holds, obsolete branches, result cards, children, cursors, and consumed holds. Use one transaction for each operation. |
+| `2687-2799` | Trending judgments, caps, task creation, and verdicts. Preserve one transaction. |
+| `2874-2962` | Issue and Jira imports. Preserve task, watch, and duplicate-key boundaries. |
+| `3072-3084,3137-3226` | PR claims, generated run IDs, drafts, and synchronized cards. Preserve transactional results. |
+| `3243-3430` | Task counters, creation, revision guards, and events. Use one transaction for each operation. |
+| `3432-3522` | Queue reorder and turn writes. Keep error events with turn writes. Separate transcript capture. |
+| `3529-3574` | Cost and context capture. Guard final applies after file reads. |
+| `3621-3725,3813-3881` | Board and performance facts. Serialize each grouped read. |
+| `3886-3907` | Finding insertion and stamp reset. Preserve duplicate-only no-op behavior. |
+| `3933-3940` | Serialize snapshots without `BEGIN`. Stop admission before close, drain accepted work, and release the lifetime lock. |
+| `src/globalStore.ts:16-65` | Global open, key reads and upserts, snapshots, and close. Serialize access. Add atomic `update` for caller get/modify/set groups. Keep JSON errors separate from database errors. |
+
+`claimTurn` reads the current task, settings, tasks, and board-check marker in one transaction. Its caller supplies database-only or memory-only gates. It returns the original task after a successful preparing claim. It applies a blocked reason only when that reason changes.
+The caller reads the current global cap and project membership inside the claim callback. The cap getter reads memory without I/O.
+
+`finishTurnState` exposes database-only turn completion for caller settlement transactions. `captureTurnData` reads files after those transactions commit. `finishTurn` composes both methods for independent callers.
+
+Caller groups include routes, turn dispatch and settlement, supervisors, watchers, startup, backup, restore, scripts, and real SQLite tests. Each caller must await results before effects. No cross-store transaction or external effect belongs inside a store transaction.
+
+The ProjectStore inventory precedes source edits. Ripwire reports 26 direct importers and 85 affected test files. Its ambiguous and unresolved edges prevent a complete caller proof.
+
+#### Refreshed caller inventory
+
+This inventory uses the same card A baseline. The listed modules own these database groups.
+Each module keeps external effects separate from its final guarded transaction.
+
+| Module | Groups and retained boundaries |
+| --- | --- |
+| `src/turn.ts`, `src/scheduler.ts` | Advisory selection, authoritative claims, credit results, lost turns, boot recovery, preparation, reports, research, outcomes, rebase replies, checks, findings, cancellation, and finish-kept. |
+| `src/supervisor.ts` | Stale guards, reclassification, hygiene, auto-tend, retro children, CI replies and children, Dependabot deduplication, and PR settlement. |
+| `src/app.ts` | Resolution, edits, refile, reorder, restart, steering, replies, approval, promotion, parking, release creation, settings, project removal, and global lists. |
+| `src/jiraRoutes.ts` | Connection updates after host checks, removal validation, query stamps, and one import transaction for each project. |
+| `src/issues.ts` | Watch settings, batch caps, duplicate claims, and label stamps after GitHub effects. |
+| `src/forks.ts` | Branch snapshots, hold replacement, legacy expansion checkpoints, quota claims, result cards, cursors, failure applies, and remaining proposal capacity. |
+| `src/prs.ts` | Fetched rows, closure, quota claims, drafts, comments, cutoffs, and source identity guards. |
+| `src/ompWatch.ts`, `src/trending.ts` | Settings and verdict guards, duplicate scouts, card creation and titles, and separate final global state. Bundle files remain external. |
+| `src/webpush.ts`, `src/updates.ts` | Atomic subscription and update lists. Push cleanup compares the attempted subscription before removal. |
+| `src/sealedConfig.ts` | Atomic config migration. The sealing walker and key policy remain unchanged. |
+| `src/server.ts` | Awaited open, origin pins, guarded release stamps, recovery, timer admission, active callbacks, snapshots, and close before exit. |
+| `src/backup.ts`, `src/restore.ts` | Awaited snapshots before manifests, rename, retention, and reports. Raw SQLite restore and integrity readers retain their current file boundaries. |
+| `src/runner.ts`, `src/workers.ts` | Ordered session and finding callbacks. Run completion awaits callback drain and reports persistence failures. |
+| `src/worktree.ts`, `src/release.ts` | Awaited task log callbacks before dependent effects or completion. |
+| `scripts/demo-data.ts`, `src/dev.ts`, `scripts/card-shot.ts` | Awaited store initialization, demo state, progress snapshots, and close. Raw demo and screenshot SQL remains SQLite-specific. |
+| Store, route, watcher, lifecycle, backup, and hosted tests | Awaited fixtures, old-schema opens, subprocess readiness, snapshots, and close before reuse. Concurrency assertions check state and required events. |
+
+`src/dblock.ts`, the independent `agent.db`, Mnemopi, and the update-host lock retain their SQLite interfaces.
+The pure dependency resolvers retain synchronous snapshot lookups for UI consumers. Card A adds no UI change.
+
 
 ### SQL dialect inventory and target behavior
 

@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import fc from "fast-check";
+import { GlobalStore } from "./globalStore.ts";
 import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, loadSecretBox } from "./secretBox.ts";
 
@@ -106,28 +110,54 @@ describe("sealStoredConfigRow", () => {
 		});
 	});
 
-	test("migrateSealedConfig seals in place and writes only on change", () => {
+	test("migrateSealedConfig seals in place and writes only on change", async () => {
 		let stored: unknown = fullRow();
 		let writes = 0;
 		const gstore = {
-			get<T>(): T | null {
+			async get<T>(): Promise<T | null> {
 				return stored as T;
 			},
-			set(_key: string, value: unknown): void {
+			async set(_key: string, value: unknown): Promise<void> {
 				stored = value;
 				writes++;
 			},
+			async transaction<T>(work: () => T | Promise<T>): Promise<T> {
+				return work();
+			},
 		};
-		migrateSealedConfig(gstore, box);
+		await migrateSealedConfig(gstore, box);
 		expect(writes).toBe(1);
 		expect(isSealed((stored as Record<string, unknown>).apiKey as string)).toBe(
 			true,
 		);
-		migrateSealedConfig(gstore, box);
+		await migrateSealedConfig(gstore, box);
 		expect(writes).toBe(1);
 		// Without the box the migration is a no-op.
-		migrateSealedConfig(gstore, undefined);
+		await migrateSealedConfig(gstore, undefined);
 		expect(writes).toBe(1);
+	});
+
+	test("migration preserves a concurrent config update in a real store", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-seal-concurrent-"));
+		const store = await GlobalStore.open(root);
+		try {
+			await store.set("config", fullRow());
+			await Promise.all([
+				migrateSealedConfig(store, box),
+				store.update<Record<string, unknown>>("config", (current) => ({
+					...current,
+					concurrentField: "kept",
+				})),
+			]);
+			const row = await store.get<Record<string, unknown>>("config");
+			expect(row?.concurrentField).toBe("kept");
+			expect(typeof row?.apiKey).toBe("string");
+			expect(isSealed(row?.apiKey as string)).toBe(true);
+			expect(box.open(row?.apiKey as string)).toBe("api-plain");
+		} finally {
+			await store.close();
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	test("property: re-sealing an already sealed row is a no-op and seals open back", () => {

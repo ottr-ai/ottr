@@ -19,7 +19,7 @@ import {
 import { classify } from "./runner.ts";
 import { isRetro, isReview, liveCard } from "./scheduler.ts";
 import { readTranscript } from "./session.ts";
-import type { ProjectStore } from "./store.ts";
+import type { ProjectStore, TaskPatch } from "./store.ts";
 import { dependabotHead, isKeptReason, parseReleaseVersion } from "./turn.ts";
 import type {
 	GitFacts,
@@ -53,16 +53,20 @@ export interface SupervisorEntry {
 	target: string | null; // integration target branch, null = unknown
 }
 export interface SupervisorOps {
-	appendLog(store: ProjectStore, id: string, line: string): void;
+	appendLog(
+		store: ProjectStore,
+		id: string,
+		line: string,
+	): void | Promise<void>;
 	sweepWorker(url: string, token: string | undefined): Promise<SweptProcess[]>;
-	schedule(): void;
+	schedule(): void | Promise<void>;
 	now(): number;
 	removeWorktree(o: {
 		mainPath: string;
 		worktreePath: string;
 		branch: string | null;
 		/** Card-log hook: reap kills land here; the supervisor passes appendLog. */
-		log?: (line: string) => void;
+		log?: (line: string) => void | Promise<void>;
 	}): Promise<void>;
 	unsavedWork(worktreePath: string, target: string): Promise<string | null>;
 	statusRows(worktreePath: string): Promise<string[]>;
@@ -144,15 +148,30 @@ export function ciVerdict(
  * skip the write when anything the pass guards on moved, or a queued prompt is waiting (the
  * pending turn must start on the card as the user left it).
  */
-function wentStale(store: ProjectStore, t: ListedTask): boolean {
-	const fresh = store.getTask(t.id);
+async function wentStale(store: ProjectStore, t: ListedTask): Promise<boolean> {
+	const fresh = await store.getTask(t.id);
 	return (
 		fresh === null ||
+		fresh.revision !== t.revision ||
 		fresh.state !== t.state ||
 		fresh.needsReason !== t.needsReason ||
 		fresh.cancelledAt !== t.cancelledAt ||
 		fresh.pendingPrompt !== null
 	);
+}
+
+async function applyTask(
+	e: SupervisorEntry,
+	t: ListedTask,
+	patch: TaskPatch,
+	guard?: () => Promise<boolean>,
+): Promise<boolean> {
+	return e.store.transaction(async () => {
+		if (await wentStale(e.store, t)) return false;
+		if (guard !== undefined && !(await guard())) return false;
+		await e.store.updateTask(t.id, patch);
+		return true;
+	});
 }
 /** Failing check names a CI follow-up prompt lists (lines `- Name: conclusion - URL`); [] when the prompt is not a CI follow-up. Pure. */
 export function failedCheckNames(prompt: string): string[] {
@@ -485,18 +504,18 @@ export function createSupervisor(
 
 	// One failure bookkeeping path for both retry points: the count and spacing live in
 	// `cleanup`, and the card's log names the reason once, at the give-up try.
-	function noteCleanupFailure(
+	async function noteCleanupFailure(
 		e: SupervisorEntry,
 		t: ListedTask,
 		key: string,
 		state: CleanupState,
 		reason: string,
-	): void {
+	): Promise<void> {
 		state.attempts += 1;
 		state.lastAt = ops.now();
 		if (state.attempts >= CLEANUP_TRIES && !state.logged) {
 			state.logged = true;
-			ops.appendLog(e.store, t.id, `supervisor: ${reason}`);
+			await ops.appendLog(e.store, t.id, `supervisor: ${reason}`);
 		}
 		cleanup.set(key, state);
 	}
@@ -536,7 +555,7 @@ export function createSupervisor(
 		const target = e.target ?? t.base ?? "HEAD";
 		const unsaved = await cleanupUnsaved(wt, target);
 		if (unsaved !== null) {
-			noteCleanupFailure(
+			await noteCleanupFailure(
 				e,
 				t,
 				key,
@@ -547,22 +566,22 @@ export function createSupervisor(
 		}
 		// A reply, steer, restart or cancel may have landed during the unsaved-work await;
 		// the removal below must not run under a card the user just picked back up.
-		if (wentStale(e.store, t)) return;
+		if (await wentStale(e.store, t)) return;
 		try {
 			await ops.removeWorktree({
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: t.branch,
-				log: (line) => ops.appendLog(e.store, t.id, line),
+				log: async (line) => await ops.appendLog(e.store, t.id, line),
 			});
 			cleanup.delete(key);
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				t.id,
 				"supervisor: worktree removed (earlier attempt hit a lock)",
 			);
 		} catch (err) {
-			noteCleanupFailure(
+			await noteCleanupFailure(
 				e,
 				t,
 				key,
@@ -629,13 +648,13 @@ export function createSupervisor(
 			);
 			// Same line as turn.ts's quarantine: the card's log names every moved file.
 			if (moved.length > 0)
-				ops.appendLog(
+				await ops.appendLog(
 					e.store,
 					t.id,
 					`supervisor: quarantined ${moved.length} untracked file(s) to .tasks/quarantine/${t.id}: ${moved.slice(0, 20).join(", ")}${moved.length > 20 ? " …" : ""}`,
 				);
 		} catch (err) {
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				t.id,
 				`supervisor: quarantine failed: ${errmsg(err)}`,
@@ -680,7 +699,7 @@ export function createSupervisor(
 			const key = `${e.name}/${t.id}`;
 			if (!reclassifyLogged.has(key)) {
 				reclassifyLogged.add(key);
-				ops.appendLog(
+				await ops.appendLog(
 					e.store,
 					t.id,
 					"supervisor: reclassify skipped — git rev-list failed; card left parked",
@@ -701,25 +720,43 @@ export function createSupervisor(
 		t: ListedTask,
 		target: string,
 		next: Next,
+		last: Turn,
 	): Promise<void> {
+		const currentTurn = async () => {
+			if (e.target !== target) return false;
+			const current = (await e.store.listTurns(t.id)).at(-1);
+			return (
+				current?.id === last.id &&
+				current.endedAt === last.endedAt &&
+				current.outcome === last.outcome
+			);
+		};
 		if (next.state === "queued") {
 			// Only a work report re-classifies to queued (merging). The turn settle runs the work
 			// check and the update/fork merge holds on that path; promoting here would skip them,
 			// so resume the work turn ("." = the resume marker) and let its settle decide.
-			e.store.updateTask(t.id, {
-				stage: "in_progress",
-				state: "queued",
-				needsReason: null,
-				queuedAt: ops.now(),
-				pendingPrompt: ".",
-				pendingBy: "supervisor",
-			});
-			ops.appendLog(
+			if (
+				!(await applyTask(
+					e,
+					t,
+					{
+						stage: "in_progress",
+						state: "queued",
+						needsReason: null,
+						queuedAt: ops.now(),
+						pendingPrompt: ".",
+						pendingBy: "supervisor",
+					},
+					currentTurn,
+				))
+			)
+				return;
+			await ops.appendLog(
 				e.store,
 				t.id,
 				"supervisor: stale needs_you cleared — git now proves the work report; resumed the work turn so its settle runs the work check and merge holds",
 			);
-			ops.schedule();
+			await ops.schedule();
 		} else if (next.stage === "done") {
 			const commits = await ops.targetCommits(e.path, target);
 			// The tracked changes that kept this card parked stay in the worktree (only
@@ -731,17 +768,25 @@ export function createSupervisor(
 					: [];
 			// Re-checked past the git awaits: a reply landing there must not lose
 			// its queued prompt to this write.
-			if (wentStale(e.store, t)) return;
+			if (await wentStale(e.store, t)) return;
 			// ponytail: a tick-done card skips the finish path's kept-files UI; quarantine already
 			// cleared scratch, and cleanupPass keeps the worktree (logged) if tracked changes remain.
-			e.store.updateTask(t.id, {
-				stage: "done",
-				state: "idle",
-				needsReason: null,
-				commits,
-				uncommittedFiles: uncommitted,
-			});
-			ops.appendLog(
+			if (
+				!(await applyTask(
+					e,
+					t,
+					{
+						stage: "done",
+						state: "idle",
+						needsReason: null,
+						commits,
+						uncommittedFiles: uncommitted,
+					},
+					currentTurn,
+				))
+			)
+				return;
+			await ops.appendLog(
 				e.store,
 				t.id,
 				"supervisor: stale needs_you cleared — git now proves the work integrated; card resolved",
@@ -751,15 +796,15 @@ export function createSupervisor(
 
 	/** The card's last ended turn when the card is a stale git-proof park with a matching
 	 * outcome; null leaves the card untouched. */
-	function reclassifyTurn(
+	async function reclassifyTurn(
 		e: SupervisorEntry,
 		t: ListedTask,
-	): { cand: ReclassifyCard; last: Turn } | null {
+	): Promise<{ cand: ReclassifyCard; last: Turn } | null> {
 		const cand = reclassifyCandidate(e, t);
 		if (cand === null) return null;
 		const expected = GIT_PROOF_REASONS.find(([p]) => cand.reason.startsWith(p));
 		if (!expected) return null;
-		const last = e.store.listTurns(t.id).at(-1);
+		const last = (await e.store.listTurns(t.id)).at(-1);
 		if (last === undefined || last.endedAt === null) return null;
 		if (last.outcome !== expected[1]) return null;
 		return { cand, last };
@@ -774,7 +819,7 @@ export function createSupervisor(
 		e: SupervisorEntry,
 		t: ListedTask,
 	): Promise<void> {
-		const stale = reclassifyTurn(e, t);
+		const stale = await reclassifyTurn(e, t);
 		if (stale === null) return;
 
 		if (!(await reclassifyQuarantine(e, t, stale.last.kind === "work"))) return;
@@ -797,8 +842,8 @@ export function createSupervisor(
 		if (next.state === "needs_you") return; // still stuck the same way; leave it
 		// A reply, steer or cancel may have landed during the git awaits above; the writes
 		// below must not overwrite it.
-		if (wentStale(e.store, t)) return;
-		await applyReclassify(e, t, stale.cand.target, next);
+		if (await wentStale(e.store, t)) return;
+		await applyReclassify(e, t, stale.cand.target, next, stale.last);
 	}
 
 	/**
@@ -835,10 +880,15 @@ export function createSupervisor(
 
 	/** Kept-worktree park with a worktree on disk, past its keep days: returns what the
 	 * removal needs. Null = the pass skips the card. */
-	function hygieneCandidate(
+	async function hygieneCandidate(
 		e: SupervisorEntry,
 		t: ListedTask,
-	): { wt: string; days: number; target: string } | null {
+	): Promise<{
+		wt: string;
+		days: number;
+		target: string;
+		prMode: boolean;
+	} | null> {
 		if (
 			t.state !== "needs_you" ||
 			!isKeptReason(t.needsReason) ||
@@ -846,21 +896,27 @@ export function createSupervisor(
 			!existsSync(t.worktree)
 		)
 			return null;
-		const days = e.store.getSettings().keptWorktreeDays;
+		const settings = await e.store.getSettings();
+		const days = settings.keptWorktreeDays;
 		if (ops.now() - t.updatedAt <= days * 86_400_000) return null;
-		return { wt: t.worktree, days, target: e.target ?? t.base ?? "HEAD" };
+		return {
+			wt: t.worktree,
+			days,
+			target: e.target ?? t.base ?? "HEAD",
+			prMode: settings.prMode,
+		};
 	}
 
 	/** One skip line per card: a persistent skip names itself once, not every tick. */
-	function hygieneNote(
+	async function hygieneNote(
 		e: SupervisorEntry,
 		t: ListedTask,
 		key: string,
 		line: string,
-	): void {
+	): Promise<void> {
 		if (!hygieneLogged.has(key)) {
 			hygieneLogged.add(key);
-			ops.appendLog(e.store, t.id, line);
+			await ops.appendLog(e.store, t.id, line);
 		}
 	}
 
@@ -879,7 +935,12 @@ export function createSupervisor(
 				e.store.dataRoot,
 			);
 		} catch (err) {
-			hygieneNote(e, t, key, `hygiene: quarantine failed: ${errmsg(err)}`);
+			await hygieneNote(
+				e,
+				t,
+				key,
+				`hygiene: quarantine failed: ${errmsg(err)}`,
+			);
 			return null;
 		}
 	}
@@ -895,10 +956,10 @@ export function createSupervisor(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: t.branch,
-				log: (line) => ops.appendLog(e.store, t.id, line),
+				log: async (line) => await ops.appendLog(e.store, t.id, line),
 			});
 		} catch (err) {
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				t.id,
 				`hygiene: worktree removal failed: ${errmsg(err)}`,
@@ -909,21 +970,37 @@ export function createSupervisor(
 	}
 
 	async function hygienePass(e: SupervisorEntry, t: ListedTask): Promise<void> {
-		const cand = hygieneCandidate(e, t);
+		const cand = await hygieneCandidate(e, t);
 		if (cand === null) return;
+		const sameSettings = async () => {
+			const current = await e.store.getSettings();
+			return (
+				current.keptWorktreeDays === cand.days &&
+				current.prMode === cand.prMode &&
+				(e.target ?? t.base ?? "HEAD") === cand.target
+			);
+		};
 		if (
-			e.store.getSettings().prMode &&
+			cand.prMode &&
 			t.cancelledAt === null &&
 			t.stage === "merging" &&
 			t.prNumber === null
 		) {
-			if (wentStale(e.store, t)) return;
-			e.store.updateTask(t.id, {
-				state: "needs_you",
-				needsReason:
-					"PR-mode merge is stranded: no pull request is recorded. Reply to retry the merge turn.",
-			});
-			ops.appendLog(
+			if (await wentStale(e.store, t)) return;
+			if (
+				!(await applyTask(
+					e,
+					t,
+					{
+						state: "needs_you",
+						needsReason:
+							"PR-mode merge is stranded: no pull request is recorded. Reply to retry the merge turn.",
+					},
+					sameSettings,
+				))
+			)
+				return;
+			await ops.appendLog(
 				e.store,
 				t.id,
 				"hygiene: PR-mode merge is stranded without a recorded pull request; preserved the worktree for a retry.",
@@ -933,25 +1010,39 @@ export function createSupervisor(
 		const key = `${e.name}/${t.id}`;
 		const keep = await hygieneKeepReason(cand.wt, cand.target);
 		if (keep !== null) {
-			hygieneNote(e, t, key, `hygiene: kept worktree left in place (${keep})`);
+			await hygieneNote(
+				e,
+				t,
+				key,
+				`hygiene: kept worktree left in place (${keep})`,
+			);
 			return;
 		}
 		// A reply landing since the snapshot must stop the removal: the pending turn has to
 		// start on the worktree as the user left it.
-		if (wentStale(e.store, t)) return;
+		if ((await wentStale(e.store, t)) || !(await sameSettings())) return;
 		const moved = await hygieneQuarantine(e, t, cand.wt, key);
 		if (moved === null) return;
+		if ((await wentStale(e.store, t)) || !(await sameSettings())) return;
 		if (!(await hygieneRemove(e, t, cand.wt))) return;
 		// Re-checked past the quarantine and removal awaits: a reply landing there must not
 		// lose its queued prompt to this write.
-		if (wentStale(e.store, t)) return;
-		e.store.updateTask(t.id, {
-			worktree: null,
-			keptFiles: [],
-			needsReason: null,
-			state: "idle",
-		});
-		ops.appendLog(
+		if (await wentStale(e.store, t)) return;
+		if (
+			!(await applyTask(
+				e,
+				t,
+				{
+					worktree: null,
+					keptFiles: [],
+					needsReason: null,
+					state: "idle",
+				},
+				sameSettings,
+			))
+		)
+			return;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			`hygiene: kept worktree quarantined after ${cand.days} day(s): ${moved.length} untracked file(s) in .tasks/quarantine/${t.id}${moved.length > 0 ? `: ${moved.join(", ")}` : ""}`,
@@ -968,6 +1059,7 @@ export function createSupervisor(
 
 	interface TendCandidate {
 		id: string;
+		task: ListedTask;
 		family: TendPlan["rule"];
 		plan: TendPlan;
 		entered: boolean;
@@ -1065,7 +1157,7 @@ export function createSupervisor(
 		// kept-files panel); the durable per-card budget in tendSend already blocks any
 		// further reply.
 		if (ep.entered && ep.arrivals > TEND_BUDGET) {
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				t.id,
 				`supervisor: auto-tend gave up after ${ep.arrivals} parks on the same reason`,
@@ -1079,6 +1171,7 @@ export function createSupervisor(
 		if (plan === null) return null;
 		return {
 			id: t.id,
+			task: t,
 			family: ep.family,
 			plan,
 			entered: ep.entered,
@@ -1089,11 +1182,11 @@ export function createSupervisor(
 	/** Rule 5 — storm guard: many cards parking with one reason inside the window is one
 	 * incident, not N cards: tend none of them, log one summary line. The bucket was
 	 * filled for the whole board during the scan and is per project. True = tend none. */
-	function tendStormed(
+	async function tendStormed(
 		e: SupervisorEntry,
 		family: TendPlan["rule"],
 		now: number,
-	): boolean {
+	): Promise<boolean> {
 		const stormKey = `${e.name}/${family}`;
 		const bucket = tendBucket.get(stormKey) ?? new Map();
 		if (bucket.size < STORM_CARDS) return false;
@@ -1101,7 +1194,7 @@ export function createSupervisor(
 			stormLoggedAt.set(stormKey, now);
 			const first = [...bucket.keys()].sort()[0];
 			if (first !== undefined)
-				ops.appendLog(
+				await ops.appendLog(
 					e.store,
 					first.slice(e.name.length + 1),
 					`supervisor: storm guard: ${bucket.size} cards parked with the same reason within 10 minutes; tending none`,
@@ -1129,38 +1222,46 @@ export function createSupervisor(
 		const now = ops.now();
 
 		// Rule 5 — the storm guard (tendStormed) tends none when one reason floods the window.
-		if (tendStormed(e, c.family, now)) return;
+		if (await tendStormed(e, c.family, now)) return;
 
 		// Per-card budget, durable via turn rows (tend replies carry the "[supervisor] " input),
 		// so the two-reply cap survives restarts. ponytail: a human typing "[supervisor] " by
 		// hand also spends the card's budget — cheaper than a tend ledger table.
-		const durable = e.store
-			.listTurns(c.id)
-			.filter((x) => x.input?.startsWith(TEND_PREFIX)).length;
-		if (Math.max(durable, c.arrivals - 1) >= TEND_BUDGET) return;
-
-		// Per-project hourly cap (settings.autoTendLimit is "per project per hour").
 		const times = tendFreshTimes(e, now);
-		if (times.length >= settings.autoTendLimit) return;
-
-		// The reply path a human uses (mirrors POST /tasks/:id/reply), attributed [supervisor].
-		e.store.updateTask(c.id, {
-			pendingPrompt: c.plan.reply,
-			pendingBy: "supervisor",
-			pendingImages: [],
-			state: "queued",
-			queuedAt: now,
-			needsReason: null,
-			asked: null,
+		const applied = await e.store.transaction(async () => {
+			if (await wentStale(e.store, c.task)) return false;
+			const current = await e.store.getSettings();
+			if (
+				!current.autoTend ||
+				JSON.stringify(current.tendChurnGlobs) !==
+					JSON.stringify(settings.tendChurnGlobs) ||
+				times.length >= current.autoTendLimit
+			)
+				return false;
+			const durable = (await e.store.listTurns(c.id)).filter((x) =>
+				x.input?.startsWith(TEND_PREFIX),
+			).length;
+			if (Math.max(durable, c.arrivals - 1) >= TEND_BUDGET) return false;
+			await e.store.updateTask(c.id, {
+				pendingPrompt: c.plan.reply,
+				pendingBy: "supervisor",
+				pendingImages: [],
+				state: "queued",
+				queuedAt: now,
+				needsReason: null,
+				asked: null,
+			});
+			return true;
 		});
+		if (!applied) return;
 		times.push(now);
 		tendTimes.set(e.name, times);
-		ops.appendLog(
+		await ops.appendLog(
 			e.store,
 			c.id,
 			`supervisor: auto-tend (${c.plan.rule}): ${c.plan.note}`,
 		);
-		ops.schedule();
+		await ops.schedule();
 	}
 
 	/** One tend pass per project: scan every card, then send oldest-first so the longest-parked
@@ -1180,18 +1281,18 @@ export function createSupervisor(
 
 	/** Done-card timing gates: the card is done (not cancelled), inside the retro window,
 	 * past the two-minute grace, and not freshly pushed (the CI watch still owns the card). */
-	function retroDue(
+	async function retroDue(
 		e: SupervisorEntry,
 		t: ListedTask,
 		settings: ProjectSettings,
-	): boolean {
+	): Promise<boolean> {
 		if (settings.retroSince === null) return false;
 		if (t.doneAt === null || t.doneAt < settings.retroSince) return false;
 		if (t.stage !== "done" || t.cancelledAt !== null) return false;
 		if (ops.now() - t.doneAt < 2 * 60 * 1000) return false;
 		// Fresh read: the grace window covers the await between the Done write and the pushSha
 		// write of a merge turn; past CI_WAIT_MS the CI verdict is simply unknown.
-		const fresh = e.store.getTask(t.id);
+		const fresh = await e.store.getTask(t.id);
 		return !(
 			fresh !== null &&
 			fresh.pushSha !== null &&
@@ -1221,13 +1322,13 @@ export function createSupervisor(
 
 	/** Retro facts for a Done card, with the per-process skip memo (no transcript, or the
 	 * friction filter found nothing worth a retro). Null = skip. */
-	function retroFacts(
+	async function retroFacts(
 		e: SupervisorEntry,
 		t: ListedTask,
 		settings: ProjectSettings,
 		tasks: readonly ListedTask[],
 		key: string,
-	): RetroFacts | null {
+	): Promise<RetroFacts | null> {
 		const memo = retroSkips.get(key);
 		if (memo !== undefined && memo.size > 0) return null;
 
@@ -1243,12 +1344,12 @@ export function createSupervisor(
 		}
 		let log: string | null = null;
 		try {
-			log = readFileSync(e.store.logPath(t.id), "utf8");
+			log = readFileSync(await e.store.logPath(t.id), "utf8");
 		} catch {
 			/* no log: facts show CI unknown */
 		}
 		const facts = collectRetroFacts({
-			turns: e.store.listTurns(t.id),
+			turns: await e.store.listTurns(t.id),
 			log,
 			sessionText,
 			subagentTexts,
@@ -1268,35 +1369,49 @@ export function createSupervisor(
 		settings: ProjectSettings,
 		tasks: readonly ListedTask[],
 	): Promise<void> {
-		if (!retroDue(e, t, settings)) return;
+		if (!(await retroDue(e, t, settings))) return;
 		if (retroBlocked(t, tasks)) return;
 
 		const key = `${e.name}/${t.id}`;
-		const facts = retroFacts(e, t, settings, tasks, key);
+		const facts = await retroFacts(e, t, settings, tasks, key);
 		if (facts === null) return;
 		// Fresh read: `tasks` is the tick's start snapshot, so two eligible Done cards in one
 		// tick would both pass the guard above and file two retros. One live retro per project
 		// holds against the list as it stands at filing time.
-		if (liveCard(e.store.listTasks(), "retro")) return;
+		if (liveCard(await e.store.listTasks(), "retro")) return;
+		const turns = await e.store.listTurns(t.id);
 		const handoff = `${handoffMarkdown({
 			task: t,
-			turns: e.store.listTurns(t.id),
+			turns,
 			sessionsDir: e.store.sessionsDir,
 		})}\n\n${factsMarkdown(facts)}`;
-		const child = e.store.createTask(
-			retroPrompt({ title: t.title, model: t.model, handoff }),
-			null,
-			"retro",
-			// The retro takes the source card's id, not the counter's next number (no gaps
-			// in the visible cards' ids); a second retro for the card gets -retro-2, -3, ...
-			`${t.id}-retro`,
-		);
-		e.store.updateTask(child.id, {
-			followUpOf: t.id,
-			promptAuthor: "board",
+		const child = await e.store.transaction(async () => {
+			if (await wentStale(e.store, t)) return null;
+			if ((await e.store.listTurns(t.id)).at(-1)?.id !== turns.at(-1)?.id)
+				return null;
+			const current = await e.store.getSettings();
+			if (
+				current.retroSince !== settings.retroSince ||
+				current.retroFilter !== settings.retroFilter ||
+				!(await retroDue(e, t, current)) ||
+				retroBlocked(t, await e.store.listTasks())
+			)
+				return null;
+			const child = await e.store.createTask(
+				retroPrompt({ title: t.title, model: t.model, handoff }),
+				null,
+				"retro",
+				`${t.id}-retro`,
+			);
+			await e.store.updateTask(child.id, {
+				followUpOf: t.id,
+				promptAuthor: "board",
+			});
+			return child;
 		});
-		ops.schedule();
-		ops.appendLog(e.store, t.id, `supervisor: filed retro ${child.id}`);
+		if (child === null) return;
+		await ops.schedule();
+		await ops.appendLog(e.store, t.id, `supervisor: filed retro ${child.id}`);
 	}
 
 	/** Failed-step logs for a CI follow-up handoff: one `gh run view --log-failed` per failed
@@ -1311,7 +1426,7 @@ export function createSupervisor(
 		const sections: string[] = [];
 		for (const r of failed) {
 			if (typeof r.id !== "number") {
-				ops.appendLog(
+				await ops.appendLog(
 					e.store,
 					t.id,
 					`supervisor: ci log fetch skipped for ${r.name} (no run id)`,
@@ -1333,7 +1448,7 @@ export function createSupervisor(
 			}
 			const out = res.stdout.trim();
 			if (res.code !== 0 || !out) {
-				ops.appendLog(
+				await ops.appendLog(
 					e.store,
 					t.id,
 					`supervisor: ci log fetch failed for ${r.name} (${(res.stderr || "no output").slice(0, 200)})`,
@@ -1350,15 +1465,15 @@ export function createSupervisor(
 
 	/** Count one gh api failure; after GH_FAIL_LIMIT consecutive failures the watch gives
 	 * up (stop clears pushSha and logs). Null always, so the caller returns. */
-	function ciFetchFailed(
+	async function ciFetchFailed(
 		key: string,
-		stop: (line?: string) => void,
+		stop: (line?: string) => Promise<void>,
 		cause: string,
-	): null {
+	): Promise<null> {
 		const fails = (ghFails.get(key) ?? 0) + 1;
 		if (fails >= GH_FAIL_LIMIT) {
 			ghFails.delete(key);
-			stop(`gh api kept failing (${cause}); CI watch given up`);
+			await stop(`gh api kept failing (${cause}); CI watch given up`);
 			return null;
 		}
 		ghFails.set(key, fails);
@@ -1371,7 +1486,7 @@ export function createSupervisor(
 		repo: string,
 		pushSha: string,
 		key: string,
-		stop: (line?: string) => void,
+		stop: (line?: string) => Promise<void>,
 	): Promise<WorkflowRun[] | null> {
 		let res: { code: number; stdout: string; stderr: string };
 		try {
@@ -1383,7 +1498,7 @@ export function createSupervisor(
 			res = { code: 1, stdout: "", stderr: errmsg(err) };
 		}
 		if (res.code !== 0)
-			return ciFetchFailed(
+			return await ciFetchFailed(
 				key,
 				stop,
 				(res.stderr || "unknown error").slice(0, 200),
@@ -1393,7 +1508,7 @@ export function createSupervisor(
 			ghFails.delete(key);
 			return runs;
 		} catch (err) {
-			return ciFetchFailed(key, stop, errmsg(err).slice(0, 200));
+			return await ciFetchFailed(key, stop, errmsg(err).slice(0, 200));
 		}
 	}
 
@@ -1423,80 +1538,79 @@ export function createSupervisor(
 		]
 			.filter((x) => x !== "")
 			.join("\n\n");
-		if (wentStale(e.store, t)) return true;
-		e.store.updateTask(t.id, {
-			stage: "in_progress",
-			state: "queued",
-			needsReason: null,
-			queuedAt: ops.now(),
-			pendingPrompt: text,
-			pendingBy: "supervisor",
-			pushSha: null,
-		});
-		ops.appendLog(
+		if (await wentStale(e.store, t)) return true;
+		if (
+			!(await applyTask(e, t, {
+				stage: "in_progress",
+				state: "queued",
+				needsReason: null,
+				queuedAt: ops.now(),
+				pendingPrompt: text,
+				pendingBy: "supervisor",
+				pushSha: null,
+			}))
+		)
+			return true;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			`supervisor: CI failed on the PR head ${short}; replied for a fix`,
 		);
-		ops.schedule();
+		await ops.schedule();
 		return true;
 	}
 
 	// One fix per failing push: a restarted supervisor (crash between createTask and stop)
 	// or two cards pinned to the same merge push (capture race in turn.ts) must not file twice.
-	function ciFollowUpFiled(
+	async function ciFollowUpFiled(
 		e: SupervisorEntry,
 		t: ListedTask,
 		first: string | undefined,
-	): boolean {
-		return e.store
-			.listTasks()
-			.some(
-				(x) =>
-					x.id !== t.id &&
-					x.stage !== "done" &&
-					x.cancelledAt === null &&
-					x.prompt.split("\n", 1)[0] === first,
-			);
+	): Promise<boolean> {
+		return (await e.store.listTasks()).some(
+			(x) =>
+				x.id !== t.id &&
+				x.stage !== "done" &&
+				x.cancelledAt === null &&
+				x.prompt.split("\n", 1)[0] === first,
+		);
 	}
 
 	// Same failing check on a different push: N cards race on one root cause, one merges the
 	// fix, the rest would stick. The open follow-up that already names this check wins.
-	function ciNamedSibling(
+	async function ciNamedSibling(
 		e: SupervisorEntry,
 		t: ListedTask,
 		names: readonly string[],
-	): ListedTask | undefined {
-		return e.store
-			.listTasks()
-			.find(
-				(x) =>
-					x.id !== t.id &&
-					x.stage !== "done" &&
-					x.cancelledAt === null &&
-					failedCheckNames(x.prompt).some((n) => names.includes(n)),
-			);
+	): Promise<ListedTask | undefined> {
+		return (await e.store.listTasks()).find(
+			(x) =>
+				x.id !== t.id &&
+				x.stage !== "done" &&
+				x.cancelledAt === null &&
+				failedCheckNames(x.prompt).some((n) => names.includes(n)),
+		);
 	}
 
 	/** The stop line when an open follow-up already covers this failing push or the same
 	 * failing checks; null = file a new card. */
-	function ciDedupeLine(
+	async function ciDedupeLine(
 		e: SupervisorEntry,
 		t: ListedTask,
 		pushSha: string,
 		head: string,
-	): string | null {
+	): Promise<string | null> {
 		// One fix per failing push: a restarted supervisor (crash between createTask and stop)
 		// or two cards pinned to the same merge push (capture race in turn.ts) must not file twice.
 		const first = head.split("\n", 1)[0];
-		if (ciFollowUpFiled(e, t, first))
+		if (await ciFollowUpFiled(e, t, first))
 			return `CI failed for ${pushSha.slice(0, 7)}; follow-up already filed`;
 		const names = failedCheckNames(head);
 		// ponytail: intersection, not equality — two distinct checks failing on one push still
 		// file one card per new check only if no open card shares a name; rarer than the race it
 		// prevents.
 		if (names.length === 0) return null;
-		const sibling = ciNamedSibling(e, t, names);
+		const sibling = await ciNamedSibling(e, t, names);
 		if (sibling === undefined) return null;
 		return `CI failed for ${pushSha.slice(0, 7)}; follow-up already filed for the same failing check (${sibling.id})`;
 	}
@@ -1510,10 +1624,10 @@ export function createSupervisor(
 		repo: string,
 		head: string,
 		refetch: string,
-		stop: (line?: string) => void,
+		stop: (line?: string) => Promise<void>,
 	): Promise<void> {
-		const stopLine = ciDedupeLine(e, t, pushSha, head);
-		if (stopLine !== null) return stop(stopLine);
+		const stopLine = await ciDedupeLine(e, t, pushSha, head);
+		if (stopLine !== null) return await stop(stopLine);
 		// The log fetch comes after the dedupe: a push that files no card never calls gh again.
 		const logs = await ciLogSection(e, t, failed, repo);
 		const fetchCause = `Find the cause (e.g. ${refetch}), fix it, and land the fix through a normal merge.`;
@@ -1527,13 +1641,26 @@ export function createSupervisor(
 				: fetchCause,
 			ciCheck,
 		].join("\n");
-		const child = e.store.createTask(text);
+		const filing = await e.store.transaction(async () => {
+			if (await wentStale(e.store, t)) return null;
+			const stopLine = await ciDedupeLine(e, t, pushSha, head);
+			if (stopLine !== null) return { stopLine, child: null };
+			const child = await e.store.createTask(text);
+			const linked = await e.store.updateTask(child.id, {
+				followUpOf: t.id,
+				promptAuthor: "board",
+			});
+			return { stopLine: null, child: linked };
+		});
+		if (filing === null) return;
+		if (filing.child === null) return await stop(filing.stopLine ?? undefined);
+		const child = filing.child;
 		let prompt = text;
 		try {
 			const handoffPath = join(e.store.tasksDir, "handoffs", `${child.id}.md`);
 			let handoff = handoffMarkdown({
 				task: t,
-				turns: e.store.listTurns(t.id),
+				turns: await e.store.listTurns(t.id),
 				sessionsDir: e.store.sessionsDir,
 				savedDir: existsSync(join(e.store.tasksDir, "quarantine", t.id))
 					? join(e.store.tasksDir, "quarantine", t.id)
@@ -1543,7 +1670,7 @@ export function createSupervisor(
 			writeBelow(e.store.dataRoot, handoffPath, handoff);
 			prompt = followUpPrompt({
 				text,
-				title: e.store.frozenTitle(t),
+				title: await e.store.frozenTitle(t),
 				handoffPath,
 			});
 		} catch {
@@ -1551,42 +1678,40 @@ export function createSupervisor(
 			// Without the file the prompt must not claim an attached log.
 			if (logs) prompt = `${head}\n${fetchCause}\n${ciCheck}`;
 		}
-		e.store.updateTask(child.id, {
-			prompt,
-			followUpOf: t.id,
-			promptAuthor: "board",
-		});
-		ops.schedule();
-		stop(`CI failed for ${pushSha.slice(0, 7)}; filed follow-up ${child.id}`);
+		if (!(await applyTask(e, child, { prompt }))) return;
+		await ops.schedule();
+		await stop(
+			`CI failed for ${pushSha.slice(0, 7)}; filed follow-up ${child.id}`,
+		);
 	}
 
 	/** The owner/repo slug of the entry's GitHub remote; null (with a stop log) when there
 	 * is no usable remote. */
-	function ciRepo(
+	async function ciRepo(
 		e: SupervisorEntry,
-		stop: (line?: string) => void,
-	): string | null {
+		stop: (line?: string) => Promise<void>,
+	): Promise<string | null> {
 		if (e.github === null) {
-			stop("no GitHub remote; CI watch skipped");
+			await stop("no GitHub remote; CI watch skipped");
 			return null;
 		}
 		const repo = ownerRepo(e.github);
 		if (repo === null)
-			stop(`cannot read owner/name from GitHub remote ${e.github}`);
+			await stop(`cannot read owner/name from GitHub remote ${e.github}`);
 		return repo;
 	}
 
 	/** The failed runs when the push's CI failed; null = nothing to do (no runs and timed
 	 * out via stop, still pending, passed via stop, or gave up via stop). */
-	function ciFailedRuns(
+	async function ciFailedRuns(
 		t: ListedTask,
 		pushSha: string,
 		runs: WorkflowRun[],
-		stop: (line?: string) => void,
-	): WorkflowRun[] | null {
+		stop: (line?: string) => Promise<void>,
+	): Promise<WorkflowRun[] | null> {
 		if (runs.length === 0) {
 			if (ops.now() - (t.doneAt ?? t.updatedAt) > CI_WAIT_MS)
-				stop(
+				await stop(
 					`no CI run appeared for ${pushSha.slice(0, 7)}; CI watch given up`,
 				);
 			return null;
@@ -1594,7 +1719,7 @@ export function createSupervisor(
 		const verdict = ciVerdict(runs);
 		if (verdict === "pending") return null;
 		if (verdict === "passed") {
-			stop(`CI passed for ${pushSha.slice(0, 7)}`);
+			await stop(`CI passed for ${pushSha.slice(0, 7)}`);
 			return null;
 		}
 		return runs.filter((r) => ciVerdict([r]) === "failed");
@@ -1612,20 +1737,20 @@ export function createSupervisor(
 			return;
 		const key = `${e.name}/${t.id}`;
 		const pushSha = t.pushSha;
-		const stop = (line?: string): void => {
+		const stop = async (line?: string): Promise<void> => {
 			// A reply, steer or cancel may have landed during the gh awaits; skip the write
 			// and re-decide on fresh facts next tick.
-			if (wentStale(e.store, t)) return;
-			e.store.updateTask(t.id, { pushSha: null });
-			if (line) ops.appendLog(e.store, t.id, `supervisor: ${line}`);
+			if (await wentStale(e.store, t)) return;
+			if (!(await applyTask(e, t, { pushSha: null }))) return;
+			if (line) await ops.appendLog(e.store, t.id, `supervisor: ${line}`);
 		};
 
-		const repo = ciRepo(e, stop);
+		const repo = await ciRepo(e, stop);
 		if (repo === null) return;
 
 		const runs = await ciFetchRuns(repo, pushSha, key, stop);
 		if (runs === null) return;
-		const failed = ciFailedRuns(t, pushSha, runs, stop);
+		const failed = await ciFailedRuns(t, pushSha, runs, stop);
 		if (failed === null) return;
 		const refetch = `gh run view <run-id> --log-failed --repo ${repo}`;
 		if (await ciPrHeadReply(e, t, pushSha, failed, repo, refetch)) return;
@@ -1650,7 +1775,7 @@ export function createSupervisor(
 		// A stored card blocks only when it is at least as new as the PR: a repo can restart
 		// its PR numbers, so an older card with the same number must not skip the new PR.
 		// Done and cancelled cards still block (a cancel skips that update) while not older.
-		const cards = e.store.listTasks().map((x) => ({
+		const cards = (await e.store.listTasks()).map((x) => ({
 			head: x.prompt.split("\n", 1)[0] ?? "",
 			createdAt: x.createdAt,
 		}));
@@ -1680,21 +1805,34 @@ export function createSupervisor(
 				);
 				continue;
 			}
-			cards.push({ head, createdAt });
-			const child = e.store.createTask(dependabotPrompt(n, repo, title));
-			// OTTR-760: the card carries its source PR, so the ship step adopts that PR
-			// instead of opening a second one.
-			e.store.updateTask(child.id, {
-				promptAuthor: "board",
-				sourcePrNumber: n,
-				sourcePrUrl: `${githubHost().webBase}/${repo}/pull/${n}`,
-				sourcePrHeadRef: headRefName,
-				sourcePrHeadSha: sha,
-				sourcePrCrossRepo: crossRepo,
-				sourcePrDependabot: true,
+			const child = await e.store.transaction(async () => {
+				const current = await e.store.listTasks();
+				if (
+					current.some(
+						(c) =>
+							c.prompt.split("\n", 1)[0]?.startsWith(head) &&
+							c.createdAt >= createdAt,
+					)
+				)
+					return null;
+				const child = await e.store.createTask(
+					dependabotPrompt(n, repo, title),
+				);
+				await e.store.updateTask(child.id, {
+					promptAuthor: "board",
+					sourcePrNumber: n,
+					sourcePrUrl: `${githubHost().webBase}/${repo}/pull/${n}`,
+					sourcePrHeadRef: headRefName,
+					sourcePrHeadSha: sha,
+					sourcePrCrossRepo: crossRepo,
+					sourcePrDependabot: true,
+				});
+				return child;
 			});
-			ops.schedule();
-			ops.appendLog(
+			if (child === null) continue;
+			cards.push({ head, createdAt });
+			await ops.schedule();
+			await ops.appendLog(
 				e.store,
 				child.id,
 				`supervisor: filed for Dependabot PR #${n}`,
@@ -1749,8 +1887,8 @@ export function createSupervisor(
 		t: ListedTask,
 		mergeCommit: string,
 		onOrigin: boolean,
-	): Promise<void> {
-		const last = e.store.listTurns(t.id).at(-1);
+	): Promise<ListedTask | null> {
+		const last = (await e.store.listTurns(t.id)).at(-1);
 		const version =
 			last?.outcome === "integrated"
 				? parseReleaseVersion(`${last.summary ?? ""}\n${last.details ?? ""}`)
@@ -1759,9 +1897,16 @@ export function createSupervisor(
 			const tagged = await ops
 				.targetSha(e.path, `refs/tags/${version}`)
 				.catch(() => null);
-			if (tagged === mergeCommit)
-				e.store.updateTask(t.id, { releaseVersion: version });
+			if (tagged === mergeCommit) {
+				return e.store.transaction(async () => {
+					if (await wentStale(e.store, t)) return null;
+					if ((await e.store.listTurns(t.id)).at(-1)?.id !== last?.id)
+						return null;
+					return e.store.updateTask(t.id, { releaseVersion: version });
+				});
+			}
 		}
+		return (await wentStale(e.store, t)) ? null : t;
 	}
 
 	/** Remove a finished card's worktree; a removal failure logs and leaves the folder. */
@@ -1775,11 +1920,11 @@ export function createSupervisor(
 				mainPath: e.path,
 				worktreePath: wt,
 				branch: t.branch,
-				log: (line) => ops.appendLog(e.store, t.id, line),
+				log: async (line) => await ops.appendLog(e.store, t.id, line),
 			});
-			ops.appendLog(e.store, t.id, "supervisor: worktree removed");
+			await ops.appendLog(e.store, t.id, "supervisor: worktree removed");
 		} catch (err) {
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				t.id,
 				`supervisor: worktree removal failed: ${errmsg(err)}`,
@@ -1804,29 +1949,39 @@ export function createSupervisor(
 	}
 
 	/** The done write after a PR merge: capture the worktree's status rows for the done
-	 * drawer, then pin pushSha when the merge commit is the fetched origin tip. False = a
-	 * reply landed during the awaits and the pass stops. */
+	 * drawer, then pin pushSha when the merge commit is the fetched origin tip. A stale
+	 * card returns null and stops the pass. */
 	async function prPinDone(
 		e: SupervisorEntry,
 		t: ListedTask,
 		mergeCommit: string,
 		onOrigin: boolean,
-	): Promise<boolean> {
-		if (wentStale(e.store, t)) return false;
+		settings: ProjectSettings,
+		target: string,
+	): Promise<ListedTask | null> {
+		if (await wentStale(e.store, t)) return null;
 		const wt = t.worktree;
 		const uncommitted =
 			wt !== null && existsSync(wt) ? await ops.statusFiles(wt) : [];
 		// Re-checked past the statusFiles await: a reply landing there must not lose its
 		// queued prompt to this write.
-		if (wentStale(e.store, t)) return false;
-		e.store.updateTask(t.id, {
-			stage: "done",
-			state: "idle",
-			needsReason: null,
-			pushSha: onOrigin ? mergeCommit : null,
-			uncommittedFiles: uncommitted,
+		return e.store.transaction(async () => {
+			if (await wentStale(e.store, t)) return null;
+			const current = await e.store.getSettings();
+			if (
+				current.prMode !== settings.prMode ||
+				current.originUrl !== settings.originUrl ||
+				(e.target ?? t.base) !== target
+			)
+				return null;
+			return e.store.updateTask(t.id, {
+				stage: "done",
+				state: "idle",
+				needsReason: null,
+				pushSha: onOrigin ? mergeCommit : null,
+				uncommittedFiles: uncommitted,
+			});
 		});
-		return true;
 	}
 
 	/** PR merged: deletes the remote card branch the ship step pushed (OTTR-800). The done
@@ -1852,14 +2007,18 @@ export function createSupervisor(
 			.deleteRemoteBranch(e.path, branch, originUrl, keep)
 			.catch((err: unknown) => errmsg(err));
 		if (err !== null) {
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				t.id,
 				`supervisor: remote branch delete failed: ${err}`,
 			);
 			return;
 		}
-		ops.appendLog(e.store, t.id, `supervisor: removed remote branch ${branch}`);
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: removed remote branch ${branch}`,
+		);
 	}
 
 	/** PR merged on GitHub: finish the card like a merge turn's done write — fetch the target,
@@ -1883,12 +2042,17 @@ export function createSupervisor(
 		// Exact tip match only: a later merge moving origin past this one leaves the pin and
 		// stamp off rather than pinning a sha CI never watched.
 		const onOrigin = originTip !== null && originTip === mergeCommit;
-		if (!(await prPinDone(e, t, mergeCommit, onOrigin))) return;
-		const wt = t.worktree;
-		await finishPrMergeStamp(e, t, mergeCommit, onOrigin);
-		if (wt !== null && existsSync(wt)) await finishPrMergeRemove(e, t, wt);
-		await finishPrDeleteRemote(e, settings, t);
-		ops.appendLog(
+		const done = await prPinDone(e, t, mergeCommit, onOrigin, settings, target);
+		if (done === null) return;
+		const stamped = await finishPrMergeStamp(e, done, mergeCommit, onOrigin);
+		if (stamped === null) return;
+		const wt = stamped.worktree;
+		if (await wentStale(e.store, stamped)) return;
+		if (wt !== null && existsSync(wt))
+			await finishPrMergeRemove(e, stamped, wt);
+		if (await wentStale(e.store, stamped)) return;
+		await finishPrDeleteRemote(e, settings, stamped);
+		await ops.appendLog(
 			e.store,
 			t.id,
 			t.followUpPrNumber !== null
@@ -1980,7 +2144,7 @@ export function createSupervisor(
 		const pr = await prState(e, repo, t.prNumber!);
 		if (pr === null) return;
 		if (pr.state === "open") {
-			prConflictVerdict(e, t, pr.mergeable, reason);
+			await prConflictVerdict(e, t, pr.mergeable, reason);
 			return;
 		}
 		if (pr.merged && pr.mergeCommit !== null) {
@@ -1994,44 +2158,51 @@ export function createSupervisor(
 			);
 			return;
 		}
-		if (wentStale(e.store, t)) return;
-		e.store.updateTask(t.id, {
-			stage: "in_progress",
-			state: "needs_you",
-			needsReason: `PR #${t.prNumber} closed without merging`,
-			pushSha: null,
-		});
-		ops.appendLog(
+		if (await wentStale(e.store, t)) return;
+		if (
+			!(await applyTask(e, t, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: `PR #${t.prNumber} closed without merging`,
+				pushSha: null,
+			}))
+		)
+			return;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			`supervisor: PR #${t.prNumber} closed without merging; card parked`,
 		);
-		ops.schedule();
+		await ops.schedule();
 	}
 
 	/** GitHub's merge verdict for the open PR of one tracked Merging card (OTTR-789): false
 	 * parks the idle card needs_you with the conflict reason, true returns a card parked with
 	 * exactly that reason to idle. Null (GitHub still computes it) and a card in any other
 	 * state write nothing. The stage, the PR fields, pushSha, the branch and the worktree stay. */
-	function prConflictVerdict(
+	async function prConflictVerdict(
 		e: SupervisorEntry,
 		t: ListedTask,
 		mergeable: boolean | null,
 		reason: string,
-	): void {
+	): Promise<void> {
 		const parked = t.state === "needs_you" && t.needsReason === reason;
 		if (t.state !== "idle" && !parked) return;
 		// A write needs a verdict that contradicts the card: false (conflict) while it waits
 		// idle, true (can merge) while it is parked. Null equals neither flag.
 		if (mergeable !== parked) return;
-		if (wentStale(e.store, t)) return;
-		e.store.updateTask(
-			t.id,
-			parked
-				? { state: "idle", needsReason: null }
-				: { state: "needs_you", needsReason: reason },
-		);
-		ops.appendLog(
+		if (await wentStale(e.store, t)) return;
+		if (
+			!(await applyTask(
+				e,
+				t,
+				parked
+					? { state: "idle", needsReason: null }
+					: { state: "needs_you", needsReason: reason },
+			))
+		)
+			return;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			parked
@@ -2055,7 +2226,7 @@ export function createSupervisor(
 		if (t.state !== "idle" && !parked) return;
 		const pr = await prState(e, repo, number);
 		if (pr === null || pr.state !== "open") return;
-		prConflictVerdict(e, t, pr.mergeable, reason);
+		await prConflictVerdict(e, t, pr.mergeable, reason);
 	}
 
 	/** OTTR-809: a parked Dependabot carry card reads its source PR's comments once per
@@ -2078,16 +2249,19 @@ export function createSupervisor(
 		}).catch(() => null);
 		if (comments === null) return;
 		if (!dependabotCannotRebase(comments)) return;
-		if (wentStale(e.store, t)) return;
-		e.store.updateTask(t.id, {
-			needsReason: `Source PR #${n} cannot be rebased: Dependabot answered it can't rebase this PR (orphaned or edited). Close the pull request; Dependabot reopens it from the current config.`,
-		});
-		ops.appendLog(
+		if (await wentStale(e.store, t)) return;
+		if (
+			!(await applyTask(e, t, {
+				needsReason: `Source PR #${n} cannot be rebased: Dependabot answered it can't rebase this PR (orphaned or edited). Close the pull request; Dependabot reopens it from the current config.`,
+			}))
+		)
+			return;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			`supervisor: Dependabot cannot rebase PR #${n}; the card asks to close it so Dependabot reopens it from the current config`,
 		);
-		ops.schedule();
+		await ops.schedule();
 	}
 
 	/** One tracked Merging follow-up card whose follow-up PR is not in the open list. The
@@ -2107,33 +2281,36 @@ export function createSupervisor(
 		if (pr === null) return;
 		if (pr.state === "open") {
 			// Left the list since, or a re-list edge: take the merge verdict like a listed one.
-			prConflictVerdict(e, t, pr.mergeable, prConflictReason(F));
+			await prConflictVerdict(e, t, pr.mergeable, prConflictReason(F));
 			return;
 		}
 		if (pr.merged && pr.mergeCommit !== null) {
 			// A state flip, so it writes once: afterwards followUpPrNumber is null and the
 			// single-PR path owns the card.
-			const clearFollowUp = () => {
-				if (wentStale(e.store, t)) return;
-				e.store.updateTask(t.id, {
-					followUpPrNumber: null,
-					followUpPrUrl: null,
-				});
-				ops.appendLog(
+			const clearFollowUp = async () => {
+				if (await wentStale(e.store, t)) return;
+				if (
+					!(await applyTask(e, t, {
+						followUpPrNumber: null,
+						followUpPrUrl: null,
+					}))
+				)
+					return;
+				await ops.appendLog(
 					e.store,
 					t.id,
 					`supervisor: follow-up PR #${F} merged; the card waits on PR #${S}`,
 				);
-				ops.schedule();
+				await ops.schedule();
 			};
 			if (sOpen) {
-				clearFollowUp();
+				await clearFollowUp();
 				return;
 			}
 			const s = await prState(e, repo, S);
 			if (s === null) return;
 			if (s.state === "open") {
-				clearFollowUp();
+				await clearFollowUp();
 				return;
 			}
 			if (s.merged && s.mergeCommit !== null) {
@@ -2176,63 +2353,72 @@ export function createSupervisor(
 				// it: the same reason, the same write, one log line, once.
 				const unresolved = `Follow-up PR #${F} merged without proof its fixes reached the target (it still bases on the bump branch, or merged after PR #${S}). Carry them onto a new pull request.`;
 				if (t.state === "needs_you" && t.needsReason === unresolved) return;
-				if (wentStale(e.store, t)) return;
+				if (await wentStale(e.store, t)) return;
 				// stage in_progress: the card leaves the merging watch, so no later
 				// window re-reads the PRs or re-writes the park until a reply
 				// re-queues it. The guard stays as defense in depth.
-				e.store.updateTask(t.id, {
-					stage: "in_progress",
-					state: "needs_you",
-					needsReason: unresolved,
-					pushSha: null,
-				});
-				ops.appendLog(
+				if (
+					!(await applyTask(e, t, {
+						stage: "in_progress",
+						state: "needs_you",
+						needsReason: unresolved,
+						pushSha: null,
+					}))
+				)
+					return;
+				await ops.appendLog(
 					e.store,
 					t.id,
 					`supervisor: follow-up PR #${F} has no proof of delivery; the fixes may sit on the bump branch; card parked`,
 				);
-				ops.schedule();
+				await ops.schedule();
 				return;
 			}
-			if (wentStale(e.store, t)) return;
+			if (await wentStale(e.store, t)) return;
 			// stage in_progress: the card leaves the merging watch, so no later
 			// window re-reads the PRs or re-writes the park until a reply
 			// re-queues it. The exact-reason guard stays as defense in depth.
 			const reason = `PR #${S} closed without merging`;
 			if (t.state === "needs_you" && t.needsReason === reason) return;
-			e.store.updateTask(t.id, {
-				stage: "in_progress",
-				state: "needs_you",
-				needsReason: reason,
-				pushSha: null,
-			});
-			ops.appendLog(
+			if (
+				!(await applyTask(e, t, {
+					stage: "in_progress",
+					state: "needs_you",
+					needsReason: reason,
+					pushSha: null,
+				}))
+			)
+				return;
+			await ops.appendLog(
 				e.store,
 				t.id,
 				`supervisor: PR #${S} closed without merging; card parked`,
 			);
-			ops.schedule();
+			await ops.schedule();
 			return;
 		}
 		// The follow-up closed unmerged: an idempotent park, so a second pass with the
 		// same answer rewrites nothing.
 		const reason = `follow-up PR #${F} closed without merging`;
 		if (t.state === "needs_you" && t.needsReason === reason) return;
-		if (wentStale(e.store, t)) return;
+		if (await wentStale(e.store, t)) return;
 		// stage in_progress: the card leaves the merging watch, so no later window
 		// re-reads the PRs or re-writes the park until a reply re-queues it.
-		e.store.updateTask(t.id, {
-			stage: "in_progress",
-			state: "needs_you",
-			needsReason: reason,
-			pushSha: null,
-		});
-		ops.appendLog(
+		if (
+			!(await applyTask(e, t, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: reason,
+				pushSha: null,
+			}))
+		)
+			return;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			`supervisor: follow-up PR #${F} closed without merging; card parked`,
 		);
-		ops.schedule();
+		await ops.schedule();
 	}
 
 	/** One tracked Merging follow-up card whose follow-up PR is open but whose source PR
@@ -2252,21 +2438,24 @@ export function createSupervisor(
 		// The park repeats in every window unless the guard stops it: the same
 		// reason, the same write, one log line, once.
 		if (t.state === "needs_you" && t.needsReason === reason) return;
-		if (wentStale(e.store, t)) return;
+		if (await wentStale(e.store, t)) return;
 		// stage in_progress: the card leaves the merging watch, so no later window
 		// re-reads the PRs or re-writes the park until a reply re-queues it.
-		e.store.updateTask(t.id, {
-			stage: "in_progress",
-			state: "needs_you",
-			needsReason: reason,
-			pushSha: null,
-		});
-		ops.appendLog(
+		if (
+			!(await applyTask(e, t, {
+				stage: "in_progress",
+				state: "needs_you",
+				needsReason: reason,
+				pushSha: null,
+			}))
+		)
+			return;
+		await ops.appendLog(
 			e.store,
 			t.id,
 			`supervisor: PR #${S} closed without merging; card parked`,
 		);
-		ops.schedule();
+		await ops.schedule();
 	}
 
 	/** OTTR-809: a follow-up card watches both its PRs. The conflict verdict runs on each
@@ -2289,7 +2478,7 @@ export function createSupervisor(
 		else if (!sOpen) await settleOpenFollowUpsSource(e, t, repo, S);
 		// Conflict watch on each open PR for idle cards (or cards parked with that PR's
 		// own conflict reason) — only while the card still tracks the follow-up.
-		const row = e.store.getTask(t.id);
+		const row = await e.store.getTask(t.id);
 		if (row === null || row.followUpPrNumber === null) return;
 		if (fOpen) await prConflictCard(e, t, repo, F, prConflictReason(F));
 		if (sOpen) await prConflictCard(e, t, repo, S, prConflictReason(S));
@@ -2304,7 +2493,7 @@ export function createSupervisor(
 		repo: string,
 		open: Set<number>,
 	): Promise<void> {
-		for (const t of e.store.listTasks()) {
+		for (const t of await e.store.listTasks()) {
 			if (t.stage !== "merging" || t.cancelledAt !== null) continue;
 			// OTTR-799: a live merge turn settles its own card; a mid-turn settle would
 			// fight the ship step. wentStale cannot catch this: the snapshot and the row
@@ -2364,11 +2553,11 @@ export function createSupervisor(
 
 	// The worker pool is shared across projects, so the sweep runs once per tick, not per
 	// project; workers only answer for their own container's /proc.
-	function logSweptProcesses(swept: SweptProcess[]): void {
+	async function logSweptProcesses(swept: SweptProcess[]): Promise<void> {
 		for (const p of swept) {
 			const e = projects.get(p.project);
 			if (e === undefined) continue;
-			const task = e.store.listTasks().find((t) => t.id === p.cardId);
+			const task = (await e.store.listTasks()).find((t) => t.id === p.cardId);
 			if (task === undefined) continue;
 			// /proc argv is worker-supplied and untrusted: control characters and line
 			// separators become spaces and the command is capped, so one appendLog call
@@ -2377,7 +2566,7 @@ export function createSupervisor(
 				.replace(/[\p{Cc}\p{Zl}\p{Zp}]/gu, " ")
 				.trim()
 				.slice(0, 200);
-			ops.appendLog(
+			await ops.appendLog(
 				e.store,
 				task.id,
 				`hygiene: stopped leftover process ${p.pid} (${command})`,
@@ -2390,7 +2579,7 @@ export function createSupervisor(
 		for (const url of workers.urls) {
 			try {
 				const swept = await ops.sweepWorker(url, workers.token);
-				logSweptProcesses(swept);
+				await logSweptProcesses(swept);
 			} catch (err) {
 				console.error(
 					`supervisor: worker sweep failed (${url}): ${errmsg(err)}`,
@@ -2406,8 +2595,10 @@ export function createSupervisor(
 		manual: string | undefined,
 	): Promise<void> {
 		if (manual !== undefined && e.name !== manual) return;
-		const settings = e.store.getSettings();
-		const tasks = e.store.listTasks();
+		const { settings, tasks } = await e.store.transaction(async () => ({
+			settings: await e.store.getSettings(),
+			tasks: await e.store.listTasks(),
+		}));
 		for (const t of tasks) {
 			await cleanupPass(e, t);
 			await reclassifyPass(e, t);

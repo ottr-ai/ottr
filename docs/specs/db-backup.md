@@ -122,8 +122,8 @@ the operator what to do for each.
 `VACUUM INTO dest`, then the row-count compare for `tables` and `PRAGMA integrity_check`
 on the copy. It throws on a difference. `dest` must not exist.
 
-`ProjectStore.backupTo(dest: string): void` and `GlobalStore.backupTo(dest: string): void`
-call it on the store's own connection.
+`ProjectStore.backupTo(dest: string): Promise<void>` and `GlobalStore.backupTo(dest: string): Promise<void>`
+call it on the store's own connection. Each caller awaits the snapshot before it writes the manifest.
 
 `src/backup.ts` (no import of `src/store.ts`: the caller passes the sources):
 
@@ -132,9 +132,9 @@ call it on the store's own connection.
     listSnapshots(dir: string): string[]         // finished snapshots, newest first
     resolveBackup(env, stateDir: string, workerRoots: readonly string[]):
       { dir: string; keep: number; errors: string[] }
-    type BackupSource = { file: string; backupTo: (dest: string) => void }
-    backupSources(tracker: { backupTo(dest: string): void },
-      projects: Iterable<{ name: string; backupTo(dest: string): void }>,
+    type BackupSource = { file: string; backupTo: (dest: string) => Promise<void> }
+    backupSources(tracker: { backupTo(dest: string): Promise<void> },
+      projects: Iterable<{ name: string; backupTo(dest: string): Promise<void> }>,
       unopened?: Iterable<{ name: string; error: string }>): BackupSource[]
       // files `tracker.db` and `projects/<name>/tasks.db`: the layout that restore reads.
       // Each `unopened` project is a source that throws with its open error.
@@ -145,10 +145,10 @@ call it on the store's own connection.
       // path inside the snapshot makes the whole manifest not valid)
     backupDue(dir: string, now: Date): boolean
     runBackup(o: { dir: string; keep: number; now: Date; sources: BackupSource[] }):
-      { stamp: string | null; copied: string[];
-        failed: { file: string; error: string }[]; pruned: string[] }
+      Promise<{ stamp: string | null; copied: string[];
+        failed: { file: string; error: string }[]; pruned: string[] }>
     backupTick(o: { dir: string; keep: number; now: Date;
-      sources: () => BackupSource[]; log: (line: string) => void }): void
+      sources: () => BackupSource[]; log: (line: string) => void }): Promise<void>
     restoreSnapshot(o: { dir: string; stamp: string; now: Date; trackerDb: string;
       projectDbFor: (name: string) => string | null; adoptedMarker: string | null }):
       { restored: { file: string; to: string }[]; manual: { file: string; from: string }[];

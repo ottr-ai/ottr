@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Server } from "bun";
-import { createApp } from "./app.ts";
+import { type App, createApp } from "./app.ts";
 import { GlobalStore } from "./globalStore.ts";
 import { sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, loadSecretBox, type SecretBox } from "./secretBox.ts";
@@ -107,14 +107,15 @@ function sealedRow(b: SecretBox): Record<string, unknown> {
 	return r;
 }
 
-function storedRow(g: GlobalStore): Record<string, unknown> {
-	const row = g.get<Record<string, unknown>>("config");
+async function storedRow(g: GlobalStore): Promise<Record<string, unknown>> {
+	const row = await g.get<Record<string, unknown>>("config");
 	if (typeof row !== "object" || row === null)
 		throw new Error("no config row stored");
 	return row;
 }
 
 const servers: Server<undefined>[] = [];
+const apps: App[] = [];
 const stores: GlobalStore[] = [];
 const databases: Database[] = [];
 
@@ -130,8 +131,8 @@ interface Boot {
 	}>;
 }
 
-function boot(gstore: GlobalStore, secretBox?: SecretBox): Boot {
-	const app = createApp({
+async function boot(gstore: GlobalStore, secretBox?: SecretBox): Promise<Boot> {
+	const app = await createApp({
 		gstore,
 		defaultDir: root,
 		// Server-only ssh state and env.txt lists: root subdirs, never the real home.
@@ -163,6 +164,7 @@ function boot(gstore: GlobalStore, secretBox?: SecretBox): Boot {
 		secretBox,
 		githubTokenExpiry: async () => null,
 	});
+	apps.push(app);
 	const srv = Bun.serve({ port: 0, ...app.serveOptions });
 	app.serverRef.current = srv;
 	servers.push(srv);
@@ -193,10 +195,11 @@ function tokenRow(json: Record<string, unknown>): Record<string, unknown> {
 	return tokens[0]!;
 }
 
-afterAll(() => {
+afterAll(async () => {
 	for (const s of servers) s.stop(true);
+	for (const app of apps) await app.close();
 	for (const d of databases) d.close();
-	for (const g of stores) g.close();
+	for (const g of stores) await g.close();
 	delete process.env.OTTR_BOARD_OMP_HOME;
 	delete process.env.PI_CODING_AGENT_DIR;
 	delete process.env.GH_TOKEN;
@@ -207,12 +210,12 @@ afterAll(() => {
 });
 
 describe("ADR-0011 config row sealing", () => {
-	test("a plaintext row is sealed in the store after a boxed boot", () => {
-		const g = GlobalStore.open(join(root, "g-plain"));
+	test("a plaintext row is sealed in the store after a boxed boot", async () => {
+		const g = await GlobalStore.open(join(root, "g-plain"));
 		stores.push(g);
-		g.set("config", plainRow());
-		boot(g, box);
-		const row = storedRow(g);
+		await g.set("config", plainRow());
+		await boot(g, box);
+		const row = await storedRow(g);
 		expect(isSealed(row.apiKey as string)).toBe(true);
 		expect(isSealed(row.sessionSecret as string)).toBe(true);
 		expect(isSealed(row.githubToken as string)).toBe(true);
@@ -270,21 +273,21 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("the stored apiKey is live at runtime after boot", async () => {
-		const g = GlobalStore.open(join(root, "g-apikey"));
+		const g = await GlobalStore.open(join(root, "g-apikey"));
 		stores.push(g);
-		g.set("config", plainRow());
-		const app = boot(g, box);
+		await g.set("config", plainRow());
+		const app = await boot(g, box);
 		const res = await app.call("/api/settings/api-key");
 		expect(res.status).toBe(200);
 		expect(res.json.apiKey).toBe(API_KEY);
 	});
 
 	test("a wrong-key boot reports set+unreadable and regenerates apiKey", async () => {
-		const g = GlobalStore.open(join(root, "g-wrong"));
+		const g = await GlobalStore.open(join(root, "g-wrong"));
 		stores.push(g);
 		const seeded = sealedRow(box);
-		g.set("config", seeded);
-		const app = boot(g, wrongBox);
+		await g.set("config", seeded);
+		const app = await boot(g, wrongBox);
 
 		// The board still starts: an open GET answers 200.
 		expect((await app.call("/api/boot")).status).toBe(200);
@@ -363,7 +366,7 @@ describe("ADR-0011 config row sealing", () => {
 		expect(rotation.status).toBe(200);
 		const general = await app.call("/api/settings", {});
 		expect(general.status).toBe(200);
-		const row = storedRow(g);
+		const row = await storedRow(g);
 		expect(row.githubToken).toBe(seeded.githubToken);
 		expect((row.alate as Record<string, string>).key).toBe(
 			(seeded.alate as Record<string, string>).key,
@@ -387,28 +390,28 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("re-entering the GitHub token replaces an unreadable one", async () => {
-		const g = GlobalStore.open(join(root, "g-reenter"));
+		const g = await GlobalStore.open(join(root, "g-reenter"));
 		stores.push(g);
-		g.set("config", sealedRow(box));
-		const app = boot(g, wrongBox);
+		await g.set("config", sealedRow(box));
+		const app = await boot(g, wrongBox);
 		const NEW = `ghp_${"b".repeat(36)}`;
 		const save = await app.call("/api/settings/github-token", { token: NEW });
 		expect(save.status).toBe(200);
 		const gh = await app.call("/api/settings/github-token");
 		expect(gh.json.tokenSet).toBe(true);
 		expect(gh.json.tokenReadable).toBe(true);
-		const blob = storedRow(g).githubToken as string;
+		const blob = (await storedRow(g)).githubToken as string;
 		expect(isSealed(blob)).toBe(true);
 		expect(wrongBox.open(blob)).toBe(NEW);
 	});
 
-	test("backupTo keeps the snapshot sealed", () => {
-		const g = GlobalStore.open(join(root, "g-backup"));
+	test("backupTo keeps the snapshot sealed", async () => {
+		const g = await GlobalStore.open(join(root, "g-backup"));
 		stores.push(g);
-		g.set("config", sealedRow(box));
-		boot(g, box);
+		await g.set("config", sealedRow(box));
+		await boot(g, box);
 		const snapshot = join(root, "snapshot.db");
-		g.backupTo(snapshot);
+		await g.backupTo(snapshot);
 		const db = new Database(snapshot);
 		databases.push(db);
 		const value = db
@@ -421,17 +424,17 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("a no-box boot leaves sealed blobs and plaintext spots alone; a boxed boot seals", async () => {
-		const g = GlobalStore.open(join(root, "g-nobox"));
+		const g = await GlobalStore.open(join(root, "g-nobox"));
 		stores.push(g);
 		const seeded = plainRow();
 		// Mixed row: githubToken, alate key and the env value sealed; the rest plaintext.
 		seeded.githubToken = box.seal(GH_TOKEN);
 		seeded.alate = { url: "http://127.0.0.1:9", key: box.seal(ALATE_KEY) };
 		seeded.envValues = { HS_TOKEN: box.seal(ENV_VALUE) };
-		g.set("config", { ...seeded });
+		await g.set("config", { ...seeded });
 
 		// Legacy degraded boot: no box anywhere.
-		const app = boot(g, undefined);
+		const app = await boot(g, undefined);
 		// Guarded credential writes answer 503; the general settings save is the
 		// unrelated non-secret save.
 		const rotation = await app.call("/api/settings/session-secret", {}, "POST");
@@ -439,7 +442,7 @@ describe("ADR-0011 config row sealing", () => {
 		expect(rotation.json.error).toBe("OTTR_SECRET_KEY is invalid");
 		const general = await app.call("/api/settings", {});
 		expect(general.status).toBe(200);
-		let row = storedRow(g);
+		let row = await storedRow(g);
 		expect(row.githubToken).toBe(seeded.githubToken);
 		expect((row.alate as Record<string, string>).key).toBe(
 			(seeded.alate as Record<string, string>).key,
@@ -453,8 +456,8 @@ describe("ADR-0011 config row sealing", () => {
 		expect(row.sessionSecret).toBe(SESSION);
 
 		// The next good boot converges the row to sealed.
-		boot(g, box);
-		row = storedRow(g);
+		await boot(g, box);
+		row = await storedRow(g);
 		expect(isSealed(row.apiKey as string)).toBe(true);
 		expect(isSealed(row.sessionSecret as string)).toBe(true);
 		expect(box.open(row.apiKey as string)).toBe(API_KEY);
@@ -462,11 +465,11 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("a no-box boot refuses credential writes with 503 and keeps every blob", async () => {
-		const g = GlobalStore.open(join(root, "g-nobox-guard"));
+		const g = await GlobalStore.open(join(root, "g-nobox-guard"));
 		stores.push(g);
 		const seeded = sealedRow(box);
-		g.set("config", seeded);
-		const app = boot(g, undefined);
+		await g.set("config", seeded);
+		const app = await boot(g, undefined);
 
 		const guarded: [string, unknown, string?][] = [
 			["/api/setup", { name: "op", password: "longenough1" }],
@@ -484,7 +487,7 @@ describe("ADR-0011 config row sealing", () => {
 			expect(res.json.error).toBe("OTTR_SECRET_KEY is invalid");
 		}
 		// The stored row kept every blob byte-identical.
-		const row = storedRow(g);
+		const row = await storedRow(g);
 		expect(row.githubToken).toBe(seeded.githubToken);
 		expect(row.apiKey).toBe(seeded.apiKey);
 		expect(row.sessionSecret).toBe(seeded.sessionSecret);
@@ -501,23 +504,23 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("a no-box boot regenerates apiKey in memory but never persists it; an explicit alate clear lands", async () => {
-		const g = GlobalStore.open(join(root, "g-nobox-regen"));
+		const g = await GlobalStore.open(join(root, "g-nobox-regen"));
 		stores.push(g);
 		const seeded = sealedRow(box);
-		g.set("config", seeded);
-		const app = boot(g, undefined);
+		await g.set("config", seeded);
+		const app = await boot(g, undefined);
 		// Board-generated secrets regenerate in memory; the general save keeps the
 		// stored blobs byte-identical (blocker 1B), the regen is not persisted.
 		const general = await app.call("/api/settings", {});
 		expect(general.status).toBe(200);
-		let row = storedRow(g);
+		let row = await storedRow(g);
 		expect(row.apiKey).toBe(seeded.apiKey);
 		expect(row.sessionSecret).toBe(seeded.sessionSecret);
 		// The explicit alate key clear is allowed and drops the kept blob (blocker 2).
 		const clear = await app.call("/api/alate", { key: null });
 		expect(clear.status).toBe(200);
 		expect(clear.json.keySet).toBe(false);
-		row = storedRow(g);
+		row = await storedRow(g);
 		expect((row.alate as Record<string, unknown>).key).toBeNull();
 		// The GitHub App delete clears the stored app too.
 		const del = await app.call(
@@ -526,25 +529,27 @@ describe("ADR-0011 config row sealing", () => {
 			"DELETE",
 		);
 		expect(del.status).toBe(200);
-		expect(storedRow(g).githubApp).toBeNull();
+		expect((await storedRow(g)).githubApp).toBeNull();
 	});
 
 	test("a wrong-key boot lets an explicit alate clear win over the kept blob", async () => {
-		const g = GlobalStore.open(join(root, "g-wrong-clear"));
+		const g = await GlobalStore.open(join(root, "g-wrong-clear"));
 		stores.push(g);
-		g.set("config", sealedRow(box));
-		const app = boot(g, wrongBox);
+		await g.set("config", sealedRow(box));
+		const app = await boot(g, wrongBox);
 		const view = await app.call("/api/alate");
 		expect(view.json.keySet).toBe(true);
 		expect(view.json.keyReadable).toBe(false);
 		const clear = await app.call("/api/alate", { key: null });
 		expect(clear.status).toBe(200);
 		expect(clear.json.keySet).toBe(false);
-		expect((storedRow(g).alate as Record<string, unknown>).key).toBeNull();
+		expect(
+			((await storedRow(g)).alate as Record<string, unknown>).key,
+		).toBeNull();
 	});
 
 	test("VAPID regeneration rebinds subs to the outgoing key and reports stale", async () => {
-		const g = GlobalStore.open(join(root, "g-vapid"));
+		const g = await GlobalStore.open(join(root, "g-vapid"));
 		stores.push(g);
 		const seeded = sealedRow(box);
 		const OLD_PUBLIC = `old-public-key-B${"0".repeat(56)}`;
@@ -555,9 +560,9 @@ describe("ADR-0011 config row sealing", () => {
 		};
 		const boundEndpoint = "https://push.example.com/bound";
 		const legacyEndpoint = "https://push.example.com/legacy";
-		g.set("config", seeded);
-		g.set("push_vapid_key", OLD_PUBLIC);
-		g.set("push_subs", [
+		await g.set("config", seeded);
+		await g.set("push_vapid_key", OLD_PUBLIC);
+		await g.set("push_subs", [
 			{
 				endpoint: boundEndpoint,
 				keys: { p256dh: "p", auth: "a" },
@@ -574,12 +579,12 @@ describe("ADR-0011 config row sealing", () => {
 				classes: { request: true, error: true, complete: true },
 			},
 		]);
-		const app = boot(g, wrongBox);
+		const app = await boot(g, wrongBox);
 		// The first push path regenerates the pair and rebinds, never deletes:
 		// both rows remain in the store.
 		const config = await app.call("/api/push/config");
 		expect(config.status).toBe(200);
-		const subs = g.get<Record<string, unknown>[]>("push_subs") ?? [];
+		const subs = (await g.get<Record<string, unknown>[]>("push_subs")) ?? [];
 		expect([...subs].map((s) => s.endpoint).sort()).toEqual(
 			[boundEndpoint, legacyEndpoint].sort(),
 		);
@@ -607,7 +612,7 @@ describe("ADR-0011 config row sealing", () => {
 			keys: { p256dh: "p", auth: "a" },
 		});
 		expect(sub.status).toBe(200);
-		const stored = g.get<Record<string, unknown>[]>("push_subs") ?? [];
+		const stored = (await g.get<Record<string, unknown>[]>("push_subs")) ?? [];
 		const fresh = stored.find(
 			(s) => s.endpoint === "https://push.example.com/new",
 		);
@@ -615,7 +620,7 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("a restored board without the kv marker rebinds legacy subs to the stored public key", async () => {
-		const g = GlobalStore.open(join(root, "g-vapid-nokv"));
+		const g = await GlobalStore.open(join(root, "g-vapid-nokv"));
 		stores.push(g);
 		const seeded = sealedRow(box);
 		const OLD_PUBLIC = `old-public-key-C${"1".repeat(56)}`;
@@ -627,8 +632,8 @@ describe("ADR-0011 config row sealing", () => {
 			subject: "https://github.com/ottr-ai/ottr",
 		};
 		const legacyEndpoint = "https://push.example.com/legacy-nokv";
-		g.set("config", seeded);
-		g.set("push_subs", [
+		await g.set("config", seeded);
+		await g.set("push_subs", [
 			{
 				endpoint: legacyEndpoint,
 				keys: { p256dh: "p", auth: "a" },
@@ -636,10 +641,10 @@ describe("ADR-0011 config row sealing", () => {
 				classes: { request: true, error: true, complete: true },
 			},
 		]);
-		const app = boot(g, wrongBox);
+		const app = await boot(g, wrongBox);
 		const config = await app.call("/api/push/config");
 		expect(config.status).toBe(200);
-		const subs = g.get<Record<string, unknown>[]>("push_subs") ?? [];
+		const subs = (await g.get<Record<string, unknown>[]>("push_subs")) ?? [];
 		const legacy = subs.find((s) => s.endpoint === legacyEndpoint)!;
 		expect(legacy.vapidPublicKey).toBe(OLD_PUBLIC);
 		const stale = await app.call(
@@ -649,7 +654,7 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("a wrong-key boot keeps the stored vapid row through a config save and rebinds after a restart", async () => {
-		const g = GlobalStore.open(join(root, "g-vapid-save"));
+		const g = await GlobalStore.open(join(root, "g-vapid-save"));
 		stores.push(g);
 		const seeded = sealedRow(box);
 		const OLD_PUBLIC = "old-pub";
@@ -661,9 +666,9 @@ describe("ADR-0011 config row sealing", () => {
 			subject: "https://github.com/ottr-ai/ottr",
 		};
 		const legacyEndpoint = "https://push.example.com/legacy-save";
-		g.set("config", seeded);
+		await g.set("config", seeded);
 		// NO push_vapid_key kv: recovery must capture the outgoing key itself.
-		g.set("push_subs", [
+		await g.set("push_subs", [
 			{
 				endpoint: legacyEndpoint,
 				keys: { p256dh: "p", auth: "a" },
@@ -671,21 +676,21 @@ describe("ADR-0011 config row sealing", () => {
 				classes: { request: true, error: true, complete: true },
 			},
 		]);
-		const app = boot(g, wrongBox);
+		const app = await boot(g, wrongBox);
 		// Any config save must not erase the unreadable stored row: the outgoing
 		// key is plaintext inside it and a later boot needs it to rebind subs.
 		const saved = await app.call("/api/settings", {});
 		expect(saved.status).toBe(200);
-		const row = storedRow(g);
+		const row = await storedRow(g);
 		expect(row.vapid).toEqual({
 			publicKey: OLD_PUBLIC,
 			privateKey: SEALED_PRIVATE,
 			subject: "https://github.com/ottr-ai/ottr",
 		});
 		// The marker was persisted at capture, before the save could drop the row.
-		expect(g.get<string | null>("push_vapid_key")).toBe(OLD_PUBLIC);
+		expect(await g.get<string | null>("push_vapid_key")).toBe(OLD_PUBLIC);
 		// A restart on the same store (wrong key again) still rebinds: stale.
-		const app2 = boot(g, wrongBox);
+		const app2 = await boot(g, wrongBox);
 		const stale = await app2.call(
 			`/api/push/config?endpoint=${encodeURIComponent(legacyEndpoint)}`,
 		);
@@ -693,16 +698,16 @@ describe("ADR-0011 config row sealing", () => {
 	});
 
 	test("a no-box fresh board answers push config and never persists the generated pair", async () => {
-		const g = GlobalStore.open(join(root, "g-nobox-vapid"));
+		const g = await GlobalStore.open(join(root, "g-nobox-vapid"));
 		stores.push(g);
-		g.set("config", plainRow());
-		const app = boot(g, undefined);
+		await g.set("config", plainRow());
+		const app = await boot(g, undefined);
 		const config = await app.call("/api/push/config");
 		expect(config.status).toBe(200);
 		expect(typeof config.json.publicKey).toBe("string");
 		// The generated pair stays in memory only: no plaintext private key at
 		// rest (the next good boot seals it).
-		expect(storedRow(g).vapid).toBeNull();
+		expect((await storedRow(g)).vapid).toBeNull();
 	});
 
 	test("an empty-string alate key normalizes to a real clear", async () => {
@@ -710,16 +715,18 @@ describe("ADR-0011 config row sealing", () => {
 			["wrong-key", wrongBox],
 			["no-box", undefined],
 		] as const) {
-			const g = GlobalStore.open(join(root, `g-alate-empty-${name}`));
+			const g = await GlobalStore.open(join(root, `g-alate-empty-${name}`));
 			stores.push(g);
-			g.set("config", sealedRow(box));
-			const app = boot(g, appBox);
+			await g.set("config", sealedRow(box));
+			const app = await boot(g, appBox);
 			const view = await app.call("/api/alate");
 			expect(view.json.keySet).toBe(true);
 			const clear = await app.call("/api/alate", { key: "" });
 			expect(clear.status).toBe(200);
 			expect(clear.json.keySet).toBe(false);
-			expect((storedRow(g).alate as Record<string, unknown>).key).toBeNull();
+			expect(
+				((await storedRow(g)).alate as Record<string, unknown>).key,
+			).toBeNull();
 		}
 	});
 });

@@ -1111,6 +1111,137 @@ describe("run OOM detection", () => {
 });
 
 describe("runWorker", () => {
+	test.each(["sentinel", "lost", "killed"] as const)(
+		"%s completion waits for ordered session and finding persistence",
+		async (ending) => {
+			const gate = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const persisted: string[] = [];
+			const payload =
+				[
+					{ type: "session", id: "worker-session" },
+					{
+						type: "tool_execution_start",
+						toolName: "propose_task",
+						toolCallId: "finding",
+						args: { prompt: "worker finding" },
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "propose_task",
+						toolCallId: "finding",
+						isError: false,
+					},
+					...(ending === "sentinel"
+						? [{ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }]
+						: []),
+				]
+					.map((event) => JSON.stringify(event))
+					.join("\n") + "\n";
+			const server = Bun.serve({
+				port: 0,
+				fetch: () =>
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								const bytes = new TextEncoder().encode(payload);
+								controller.enqueue(bytes.slice(0, 13));
+								controller.enqueue(bytes.slice(13));
+								if (ending !== "killed") controller.close();
+							},
+						}),
+					),
+			});
+			servers.push(server);
+			const sink = createRunSink({
+				logPath: join(dir, `ordered-${ending}.log`),
+				dataRoot: dir,
+				onSession: async (id) => {
+					started.resolve();
+					await gate.promise;
+					persisted.push(id);
+				},
+				onRecorded: (finding) => {
+					persisted.push(finding.prompt);
+				},
+			});
+			const handle = runWorker(
+				{ id: `ordered-${ending}`, argv: [], cwd: dir, stdin: "", env: {} },
+				{ urls: [server.url.origin] },
+				sink,
+			);
+			let completed = false;
+			const done = handle.done.then((result) => {
+				completed = true;
+				return result;
+			});
+			try {
+				await started.promise;
+				if (ending === "killed") handle.kill();
+				await Promise.resolve();
+				expect(persisted).toEqual([]);
+				expect(completed).toBe(false);
+				gate.resolve();
+				const result = await done;
+				expect(persisted).toEqual(["worker-session", "worker finding"]);
+				expect(result.sessionId).toBe("worker-session");
+				expect(result.killed).toBe(ending === "killed");
+				expect(result.workerLost === true).toBe(ending === "lost");
+			} finally {
+				gate.resolve();
+			}
+		},
+	);
+
+	test("a rejected finding callback rejects worker completion without a lost-worker fallback", async () => {
+		const gate = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const failure = new Error("finding persistence failed");
+		const payload =
+			[
+				{
+					type: "tool_execution_start",
+					toolName: "propose_task",
+					toolCallId: "rejected",
+					args: { prompt: "rejected finding" },
+				},
+				{
+					type: "tool_execution_end",
+					toolName: "propose_task",
+					toolCallId: "rejected",
+					isError: false,
+				},
+				{ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } },
+			]
+				.map((event) => JSON.stringify(event))
+				.join("\n") + "\n";
+		const server = Bun.serve({
+			port: 0,
+			fetch: () => new Response(payload),
+		});
+		servers.push(server);
+		const sink = createRunSink({
+			logPath: join(dir, "rejected-finding.log"),
+			dataRoot: dir,
+			onRecorded: () => {
+				started.resolve();
+				return gate.promise;
+			},
+		});
+		const { done } = runWorker(
+			{ id: "rejected-finding", argv: [], cwd: dir, stdin: "", env: {} },
+			{ urls: [server.url.origin] },
+			sink,
+		);
+		const outcome = done.then(
+			() => null,
+			(error: unknown) => error,
+		);
+		await started.promise;
+		gate.reject(failure);
+		expect(await outcome).toBe(failure);
+	});
+
 	test("non-sentinel lines go to the sink; sentinel settles the result and logs the stderr tail", async () => {
 		const errPath = join(dir, "err2-omp.js");
 		writeFileSync(
@@ -1414,12 +1545,11 @@ describe("runWorker", () => {
 					process.execPath,
 					"-e",
 					`import { runWorker } from "./src/workers.ts";
-const sink = {
-	line() {}, stdout() {}, stderr() {}, stderrLine() {}, childError() {}, logMark() {}, flush() {},
-	state: { sessionId: null, model: null, outcome: null, asked: null, approvalRefused: false, sawTerminalEnd: false, finalText: "", remembered: new Map() },
-	tail: () => "",
-	result: (r) => ({ sessionId: null, model: null, outcome: null, asked: null, approvalRefused: false, sawTerminalEnd: false, finalText: "", recorded: [], ...r }),
-};
+import { createRunSink } from "./src/runner.ts";
+const sink = createRunSink({
+	logPath: ${JSON.stringify(join(dir, "idle-client.log"))},
+	dataRoot: ${JSON.stringify(dir)},
+});
 runWorker({ id: "idle", argv: [], cwd: ${JSON.stringify(dir)}, stdin: "", env: {} }, { urls: ["http://127.0.0.1:${silent.port}"] }, sink)
 	.done.then(
 		(r) => console.log(JSON.stringify(r)),

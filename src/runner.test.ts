@@ -2396,7 +2396,9 @@ describe("applyEvent", () => {
 			const sink = createRunSink({
 				logPath: join(dir, "run.log"),
 				dataRoot: dir,
-				onRecorded: (finding) => recorded.push(finding),
+				onRecorded: (finding) => {
+					recorded.push(finding);
+				},
 			});
 			sink.line(
 				JSON.stringify({
@@ -2889,7 +2891,8 @@ class FakeOmp extends EventEmitter {
 function fakeStart(o: {
 	logPath: string;
 	pid?: number;
-	onSession?: (sessionId: string) => void;
+	onSession?: (sessionId: string) => void | Promise<void>;
+	onRecorded?: (finding: RecordedFinding) => void | Promise<void>;
 }) {
 	const fake = new FakeOmp(o.pid);
 	const launcher: RunLauncher = () => fake as unknown as ChildProcess; // the fake stands in for Node's class
@@ -2902,12 +2905,142 @@ function fakeStart(o: {
 		logPath: o.logPath,
 		dataRoot: dirname(o.logPath),
 		onSession: o.onSession,
+		onRecorded: o.onRecorded,
 		launcher,
 	});
 	return { handle, fake };
 }
 
 describe("startRun", () => {
+	test("session and findings persist in arrival order before local completion", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));
+		const sessionGate = Promise.withResolvers<void>();
+		const findingGate = Promise.withResolvers<void>();
+		const findingStarted = Promise.withResolvers<void>();
+		try {
+			const persisted: string[] = [];
+			const started: string[] = [];
+			const { handle, fake } = fakeStart({
+				logPath: join(dir, "run.log"),
+				onSession: async (id) => {
+					started.push(id);
+					await sessionGate.promise;
+					persisted.push(id);
+				},
+				onRecorded: async (finding) => {
+					started.push(finding.prompt);
+					if (finding.prompt === "First") {
+						findingStarted.resolve();
+						await findingGate.promise;
+					}
+					persisted.push(finding.prompt);
+				},
+			});
+			let completed = false;
+			const done = handle.done.then((result) => {
+				completed = true;
+				return result;
+			});
+			const events = [{ type: "session", id: "session-ordered" }];
+			const stream = [
+				...events,
+				...["First", "Second"].flatMap((prompt, i) => [
+					{
+						type: "tool_execution_start",
+						toolName: "propose_task",
+						toolCallId: `p${i}`,
+						args: { prompt },
+					},
+					{
+						type: "tool_execution_end",
+						toolName: "propose_task",
+						toolCallId: `p${i}`,
+						isError: false,
+						result: { content: [{ type: "text", text: "Recorded." }] },
+					},
+				]),
+				{ type: "agent_end", isTerminal: true },
+			]
+				.map((event) => JSON.stringify(event))
+				.join("\n");
+			fake.stdout.emit("data", Buffer.from(stream.slice(0, 17)));
+			fake.stdout.emit("data", Buffer.from(stream.slice(17, 83)));
+			fake.stdout.emit("data", Buffer.from(stream.slice(83)));
+			fake.emit("close", 0);
+			expect(started).toEqual(["session-ordered"]);
+			expect(persisted).toEqual([]);
+			expect(completed).toBe(false);
+			sessionGate.resolve();
+			await findingStarted.promise;
+			expect(started).toEqual(["session-ordered", "First"]);
+			expect(persisted).toEqual(["session-ordered"]);
+			expect(completed).toBe(false);
+			findingGate.resolve();
+			const result = await done;
+			expect(persisted).toEqual(["session-ordered", "First", "Second"]);
+			expect(result.sessionId).toBe("session-ordered");
+			expect(result.sawTerminalEnd).toBe(true);
+		} finally {
+			sessionGate.resolve();
+			findingGate.resolve();
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("local completion rejects persistence errors instead of treating them as bad JSON", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));
+		const gate = Promise.withResolvers<void>();
+		try {
+			const failure = new Error("session persistence failed");
+			const persisted: string[] = [];
+			const { handle, fake } = fakeStart({
+				logPath: join(dir, "run.log"),
+				onSession: async (id) => {
+					if (id === "first") await gate.promise;
+					persisted.push(id);
+				},
+				onRecorded: (finding) => {
+					persisted.push(finding.prompt);
+				},
+			});
+			const outcome = handle.done.then(
+				() => null,
+				(error: unknown) => error,
+			);
+			fake.stdout.emit(
+				"data",
+				Buffer.from(
+					[
+						{ type: "session", id: "first" },
+						{
+							type: "tool_execution_start",
+							toolName: "propose_task",
+							toolCallId: "after-failure",
+							args: { prompt: "after failure" },
+						},
+						{
+							type: "tool_execution_end",
+							toolName: "propose_task",
+							toolCallId: "after-failure",
+							isError: false,
+						},
+					]
+						.map((event) => JSON.stringify(event))
+						.join("\n"),
+				),
+			);
+			fake.emit("close", 0);
+			gate.reject(failure);
+			expect(await outcome).toBe(failure);
+			expect(persisted).toEqual(["after failure"]);
+			expect(readFileSync(join(dir, "run.log"), "utf8")).toContain(
+				"[omp session first]",
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a pinned sessionName reaches the child env; unpinned launches inherit untouched", async () => {
 		// A task session inherits OTTR_BOARD_URL from its own board, and the operator value
 		// wins over the injected coordinates: on a non-default board port the assertion
@@ -3239,7 +3372,9 @@ describe("startRun", () => {
 			const { handle, fake } = fakeStart({
 				logPath,
 				pid: 7,
-				onSession: (sid) => sessions.push(sid),
+				onSession: (sid) => {
+					sessions.push(sid);
+				},
 			});
 			expect(handle.pid).toBe(7);
 

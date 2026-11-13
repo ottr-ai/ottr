@@ -49,7 +49,7 @@ export interface JiraRouteDeps {
 	/** Undefined when the key failed to load at boot: every Jira route answers 503. */
 	box: SecretBox | undefined;
 	net: JiraNet;
-	schedule: () => void;
+	schedule: () => void | Promise<void>;
 	now: () => number;
 	json: (v: unknown, status?: number) => Response;
 }
@@ -154,19 +154,23 @@ function parseSearch(
 export function createJiraRoutes(d: JiraRouteDeps) {
 	const { json } = d;
 
-	function load(): StoredConnection[] {
-		const raw = d.gstore.get<unknown>(JIRA_CONNECTIONS_KEY);
+	async function load(): Promise<StoredConnection[]> {
+		const raw = await d.gstore.get<unknown>(JIRA_CONNECTIONS_KEY);
 		return Array.isArray(raw) ? raw.filter(isStored) : [];
 	}
 
-	function usedBy(name: string): string[] {
+	async function usedBy(name: string): Promise<string[]> {
 		const out: string[] = [];
 		for (const [project, e] of d.projects)
-			if (e.store.getSettings().jiraConnection === name) out.push(project);
+			if ((await e.store.getSettings()).jiraConnection === name)
+				out.push(project);
 		return out.sort();
 	}
 
-	function view(c: StoredConnection, box: SecretBox): JiraConnectionView {
+	async function view(
+		c: StoredConnection,
+		box: SecretBox,
+	): Promise<JiraConnectionView> {
 		return {
 			name: c.name,
 			site: c.site,
@@ -175,7 +179,7 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 			customFields: c.customFields,
 			tokenSet: c.token !== null,
 			tokenReadable: c.token !== null && box.open(c.token) !== null,
-			usedBy: usedBy(c.name),
+			usedBy: await usedBy(c.name),
 		};
 	}
 
@@ -184,8 +188,11 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 	}
 
 	/** The connection with its token opened, or the refusal (404 unknown, 409 unreadable). */
-	function openConnection(name: string, box: SecretBox): JiraConn | Response {
-		const c = load().find((x) => x.name === name);
+	async function openConnection(
+		name: string,
+		box: SecretBox,
+	): Promise<JiraConn | Response> {
+		const c = (await load()).find((x) => x.name === name);
 		if (c === undefined)
 			return json({ error: `unknown Jira connection: ${name}` }, 404);
 		const token = c.token === null ? null : box.open(c.token);
@@ -210,21 +217,21 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 	}
 
 	/** The project's connection for search and import, or the refusal. */
-	function projectConnection(
+	async function projectConnection(
 		project: string,
 		box: SecretBox,
-	): { store: ProjectStore; conn: JiraConn } | Response {
+	): Promise<{ store: ProjectStore; conn: JiraConn; name: string } | Response> {
 		const e = d.projects.get(project);
 		if (e === undefined) return json({ error: "unknown project" }, 404);
-		const name = e.store.getSettings().jiraConnection;
+		const name = (await e.store.getSettings()).jiraConnection;
 		if (name === null)
 			return json({ error: "no Jira connection for this project" }, 409);
-		const conn = openConnection(name, box);
+		const conn = await openConnection(name, box);
 		if (conn instanceof Response)
 			return conn.status === 404
 				? json({ error: `Jira connection "${name}" no longer exists` }, 409)
 				: conn;
-		return { store: e.store, conn };
+		return { store: e.store, conn, name };
 	}
 
 	/** The site check hosted mode runs at save; null = allowed. */
@@ -241,7 +248,9 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 	async function list(): Promise<Response> {
 		const box = d.box;
 		if (box === undefined) return noBox();
-		return json(load().map((c) => view(c, box)));
+		return json(
+			await Promise.all((await load()).map(async (c) => await view(c, box))),
+		);
 	}
 
 	/** Upsert by name (renames are a new connection); an empty token keeps the stored one. */
@@ -252,38 +261,41 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		if (typeof f === "string") return json({ error: f }, 400);
 		const refused = await hostRefusal(f.site);
 		if (refused !== null) return refused;
-		// Load after the await: a save that raced this one must not be lost.
-		const all = load();
-		const old = all.find((c) => c.name === f.name);
-		const token = f.token !== "" ? box.seal(f.token) : (old?.token ?? null);
-		if (token === null)
-			return json({ error: "a new connection needs a token" }, 400);
-		const next: StoredConnection = { ...f, token };
-		d.gstore.set(
-			JIRA_CONNECTIONS_KEY,
-			old === undefined
+		let next: StoredConnection | undefined;
+		await d.gstore.update<unknown>(JIRA_CONNECTIONS_KEY, (raw) => {
+			const all = Array.isArray(raw) ? raw.filter(isStored) : [];
+			const old = all.find((c) => c.name === f.name);
+			const token = f.token !== "" ? box.seal(f.token) : (old?.token ?? null);
+			if (token === null) return all;
+			next = { ...f, token };
+			return old === undefined
 				? [...all, next]
-				: all.map((c) => (c === old ? next : c)),
-		);
-		return json(view(next, box));
+				: all.map((c) => (c === old ? next! : c));
+		});
+		if (next === undefined)
+			return json({ error: "a new connection needs a token" }, 400);
+		return json(await view(next, box));
 	}
 
 	async function remove(name: string): Promise<Response> {
 		if (d.box === undefined) return noBox();
-		const all = load();
-		if (!all.some((c) => c.name === name))
+		if (!(await load()).some((connection) => connection.name === name))
 			return json({ error: `unknown Jira connection: ${name}` }, 404);
-		const users = usedBy(name);
+		const users = await usedBy(name);
 		if (users.length > 0)
 			return json(
 				{ error: `in use by: ${users.join(", ")}`, projects: users },
 				409,
 			);
-		d.gstore.set(
-			JIRA_CONNECTIONS_KEY,
-			all.filter((c) => c.name !== name),
-		);
-		return json({ ok: true });
+		let found = false;
+		await d.gstore.update<unknown>(JIRA_CONNECTIONS_KEY, (raw) => {
+			const all = Array.isArray(raw) ? raw.filter(isStored) : [];
+			found = all.some((c) => c.name === name);
+			return all.filter((c) => c.name !== name);
+		});
+		return found
+			? json({ ok: true })
+			: json({ error: `unknown Jira connection: ${name}` }, 404);
 	}
 
 	async function detect(body: Record<string, unknown>): Promise<Response> {
@@ -298,7 +310,7 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 	async function test(name: string): Promise<Response> {
 		const box = d.box;
 		if (box === undefined) return noBox();
-		const conn = openConnection(name, box);
+		const conn = await openConnection(name, box);
 		if (conn instanceof Response) return conn;
 		try {
 			return json(await testConnection(conn, d.net));
@@ -316,16 +328,28 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		const q = parseSearch(body);
 		if (typeof q === "string") return json({ error: q }, 400);
 		const { jql, cursor } = q;
-		const p = projectConnection(project, box);
+		const p = await projectConnection(project, box);
 		if (p instanceof Response) return p;
 		const page = await searchIssues(p.conn, jql, cursor, d.net).catch((err) =>
 			jiraFailure(project, err),
 		);
 		if (page instanceof Response) return page;
-		const imported = p.store.jiraImported(
-			p.conn.site,
-			page.issues.map((i) => i.key),
-		);
+		if (d.projects.get(project)?.store !== p.store)
+			return json({ error: "Jira connection changed" }, 409);
+		const imported = await p.store.transaction(async () => {
+			if (
+				d.projects.get(project)?.store !== p.store ||
+				(await p.store.getSettings()).jiraConnection !== p.name
+			)
+				return json({ error: "Jira connection changed" }, 409);
+			const imported = await p.store.jiraImported(
+				p.conn.site,
+				page.issues.map((i) => i.key),
+			);
+			await p.store.setSettings({ jiraLastJql: jql });
+			return imported;
+		});
+		if (imported instanceof Response) return imported;
 		const rows: JiraRow[] = page.issues.map((i) => ({
 			key: i.key,
 			url: `${p.conn.site}/browse/${i.key}`,
@@ -335,7 +359,6 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 			priority: i.priority,
 			importedCard: imported.get(i.key) ?? null,
 		}));
-		p.store.setSettings({ jiraLastJql: jql });
 		return json({
 			rows,
 			next: page.next,
@@ -399,7 +422,7 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		const stage = body.stage;
 		if (stage !== "backlog" && stage !== "todo")
 			return json({ error: 'stage must be "backlog" or "todo"' }, 400);
-		const p = projectConnection(project, box);
+		const p = await projectConnection(project, box);
 		if (p instanceof Response) return p;
 		const keys = [...new Set(raw as string[])];
 		const issues = await fetchIssues(p.conn, keys).catch((err) =>
@@ -430,13 +453,23 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 					];
 		});
 		// The store re-checks inside its transaction: a parallel import of one key files one card.
-		const filed = p.store.fileJiraCards({
-			site: p.conn.site,
-			stage,
-			items,
-			now: d.now(),
+		if (d.projects.get(project)?.store !== p.store)
+			return json({ error: "Jira connection changed" }, 409);
+		const filed = await p.store.transaction(async () => {
+			if (
+				d.projects.get(project)?.store !== p.store ||
+				(await p.store.getSettings()).jiraConnection !== p.name
+			)
+				return json({ error: "Jira connection changed" }, 409);
+			return p.store.fileJiraCards({
+				site: p.conn.site,
+				stage,
+				items,
+				now: d.now(),
+			});
 		});
-		if (stage === "todo" && filed.filed.length > 0) d.schedule();
+		if (filed instanceof Response) return filed;
+		if (stage === "todo" && filed.filed.length > 0) await d.schedule();
 		return json({
 			filed: filed.filed.map((t) => t.id),
 			skipped: filed.skipped,
@@ -445,13 +478,13 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 	}
 
 	/** Per key, every project holding a card for it at the connection's site (spec section 6). */
-	function aggregateImported(
+	async function aggregateImported(
 		site: string,
 		keys: string[],
-	): Map<string, JiraBoardImported[]> {
+	): Promise<Map<string, JiraBoardImported[]>> {
 		const aggregated = new Map<string, JiraBoardImported[]>();
 		for (const [project, e] of d.projects)
-			for (const [key, task] of e.store.jiraImported(site, keys)) {
+			for (const [key, task] of await e.store.jiraImported(site, keys)) {
 				const list = aggregated.get(key) ?? [];
 				list.push({ project, task });
 				aggregated.set(key, list);
@@ -473,13 +506,13 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 		const q = parseSearch(body);
 		if (typeof q === "string") return json({ error: q }, 400);
 		const { jql, cursor } = q;
-		const conn = openConnection(name, box);
+		const conn = await openConnection(name, box);
 		if (conn instanceof Response) return conn;
 		const page = await searchIssues(conn, jql, cursor, d.net).catch((err) =>
 			jiraFailure(name, err),
 		);
 		if (page instanceof Response) return page;
-		const aggregated = aggregateImported(
+		const aggregated = await aggregateImported(
 			conn.site,
 			page.issues.map((i) => i.key),
 		);
@@ -531,10 +564,14 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 				400,
 			);
 		const assignments = raw as JiraBoardAssignment[];
-		for (const a of assignments)
-			if (!d.projects.has(a.project))
+		const targets = new Map<string, { store: ProjectStore }>();
+		for (const a of assignments) {
+			const target = d.projects.get(a.project);
+			if (target === undefined)
 				return json({ error: `unknown project: ${a.project}` }, 400);
-		const conn = openConnection(name, box);
+			targets.set(a.project, target);
+		}
+		const conn = await openConnection(name, box);
 		if (conn instanceof Response) return conn;
 		// First-seen key order, deduped per (key, project).
 		const order: string[] = [];
@@ -583,13 +620,20 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 							},
 						];
 			});
-			const e = d.projects.get(project)!;
-			const result = e.store.fileJiraCards({
-				site: conn.site,
-				stage,
-				items,
-				now: d.now(),
+			const e = targets.get(project)!;
+			if (d.projects.get(project) !== e)
+				return json({ error: `project changed: ${project}` }, 409);
+			const result = await e.store.transaction(async () => {
+				if (d.projects.get(project) !== e)
+					return json({ error: `project changed: ${project}` }, 409);
+				return e.store.fileJiraCards({
+					site: conn.site,
+					stage,
+					items,
+					now: d.now(),
+				});
 			});
+			if (result instanceof Response) return result;
 			// Both lists follow items' order: skipped names the passed-over key, filed the created task.
 			let si = 0;
 			let fi = 0;
@@ -606,7 +650,7 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 				}
 			}
 		}
-		if (stage === "todo" && anyFiled) d.schedule();
+		if (stage === "todo" && anyFiled) await d.schedule();
 		return json({
 			filed,
 			skipped,
@@ -615,9 +659,11 @@ export function createJiraRoutes(d: JiraRouteDeps) {
 	}
 
 	/** Settings POST: a jiraConnection string must name a stored connection. */
-	function settingsRefusal(name: string | null | undefined): Response | null {
+	async function settingsRefusal(
+		name: string | null | undefined,
+	): Promise<Response | null> {
 		if (typeof name !== "string") return null;
-		return load().some((c) => c.name === name)
+		return (await load()).some((c) => c.name === name)
 			? null
 			: json({ error: "unknown Jira connection" }, 400);
 	}

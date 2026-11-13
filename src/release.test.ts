@@ -1027,7 +1027,7 @@ describe("runReleaseCommand against real repos", () => {
 		extra: {
 			mainPath?: string;
 			target?: string;
-			log?: (l: string) => void;
+			log?: (l: string) => void | Promise<void>;
 			archReview?: { delta: number } | null;
 		} = {},
 	) =>
@@ -1048,7 +1048,9 @@ describe("runReleaseCommand against real repos", () => {
 		const { sha, wt } = reviewed();
 		const lines: string[] = [];
 		const out = await run("ok", sha, wt, "v1.0.0", {
-			log: (l) => lines.push(l),
+			log: (l) => {
+				lines.push(l);
+			},
 		});
 		const tagged = must(main, "rev-parse", "refs/tags/v1.0.0^{commit}");
 		expect(out).toBe(
@@ -1075,6 +1077,21 @@ describe("runReleaseCommand against real repos", () => {
 		await expect(run("fail", sha, wt, "v1.0.1")).rejects.toThrow(
 			"release command exited with code 3: boom",
 		);
+	}, 60_000);
+
+	test("awaits an async log and reports its failure before command settlement", async () => {
+		const { sha, wt } = reviewed();
+		const lines: string[] = [];
+		await expect(
+			run("fail", sha, wt, "v1.0.91", {
+				log: async (line) => {
+					await Promise.resolve();
+					lines.push(line);
+					throw new Error("release log failed");
+				},
+			}),
+		).rejects.toThrow("release log failed");
+		expect(lines).toEqual(["boom"]);
 	}, 60_000);
 
 	test("a command that is not on PATH fails with a readable reason", async () => {

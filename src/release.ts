@@ -952,18 +952,18 @@ function spawnRelease(
 /** Streams one pipe of the command into `emit`, newline-split; the unterminated tail flushes at EOF. */
 async function pumpLines(
 	stream: ReadableStream<Uint8Array>,
-	emit: (raw: string) => void,
+	emit: (raw: string) => void | Promise<void>,
 ): Promise<void> {
 	const decoder = new TextDecoder();
 	let buf = "";
 	for await (const chunk of stream) {
 		buf += decoder.decode(chunk, { stream: true });
 		for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
-			emit(buf.slice(0, nl));
+			await emit(buf.slice(0, nl));
 			buf = buf.slice(nl + 1);
 		}
 	}
-	emit(buf + decoder.decode());
+	await emit(buf + decoder.decode());
 }
 
 /** The commit the command's tag points at: from the pinned origin when the repo has one
@@ -1029,7 +1029,7 @@ export async function runReleaseCommand(o: {
 	/** Commits since the previous review, exposed as OTTR_ARCH_REVIEW for the command's tag message.
 	 * Informational: the board counts its review watermark from review cards, not from tags. */
 	archReview?: { delta: number } | null;
-	log: (line: string) => void;
+	log: (line: string) => void | Promise<void>;
 	/** Lets Cancel and shutdown stop the command's process tree. */
 	onSpawn?: (h: {
 		pid: number;
@@ -1046,10 +1046,10 @@ export async function runReleaseCommand(o: {
 		kill: async () => platform.killTree(pid),
 	});
 	let last = "";
-	const emit = (raw: string): void => {
+	const emit = async (raw: string): Promise<void> => {
 		const line = raw.replace(/\r$/, "");
 		if (line.trim() === "") return;
-		o.log(line);
+		await o.log(line);
 		last = line.trim();
 	};
 	const [code] = await Promise.all([

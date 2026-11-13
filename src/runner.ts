@@ -1290,6 +1290,8 @@ export interface RunSink {
 	logMark(text: string): void;
 	/** Flush the buffered partial stdout line (end of stream). */
 	flush(): void;
+	/** Wait for all session, finding, and usage callbacks, then surface persistence errors. */
+	drain(): Promise<void>;
 	/** EventState advanced by the lines seen so far. */
 	state: EventState;
 	/** Current stderr tail (last 4000 chars, CRLF normalized). */
@@ -1306,7 +1308,7 @@ export interface RunSink {
 function handleEventLine(
 	raw: string,
 	o: {
-		onSession?: (sessionId: string) => void;
+		onSession?: (sessionId: string) => void | Promise<void>;
 		/** A progress event (stryker.ts): never logged; null text clears the card's progress. */
 		onProgress?: (text: string | null) => void;
 		/** Hosted metering on: sum assistant usage into state.usage; off leaves it null. */
@@ -1314,10 +1316,11 @@ function handleEventLine(
 		/** Hosted mode only (needs `meter`): interim usage of the active run. */
 		onUsage?: (usage: TokenUsage, model: string | null) => void;
 		/** Fired once per newly parsed propose_task finding, in arrival order. */
-		onRecorded?: (finding: RecordedFinding) => void;
+		onRecorded?: (finding: RecordedFinding) => void | Promise<void>;
 	},
 	es: EventState,
 	log: { write(text: string): void },
+	notify: (callback: () => void | Promise<void>) => void,
 ): void {
 	const line = raw.replace(/\r$/, "");
 	if (!line.trim()) return;
@@ -1337,11 +1340,17 @@ function handleEventLine(
 	const before = es.usage;
 	const recordedBefore = es.recorded.length;
 	const { sessionStarted } = applyEvent(es, ev, o.meter === true);
-	if (sessionStarted !== undefined) o.onSession?.(sessionStarted);
-	for (let i = recordedBefore; i < es.recorded.length; i++)
-		o.onRecorded?.(es.recorded[i]!);
-	if (es.usage !== null && !sameUsage(before, es.usage))
-		o.onUsage?.({ ...es.usage }, es.model);
+	if (sessionStarted !== undefined && o.onSession)
+		notify(() => o.onSession!(sessionStarted));
+	for (let i = recordedBefore; i < es.recorded.length; i++) {
+		const finding = es.recorded[i]!;
+		if (o.onRecorded) notify(() => o.onRecorded!(finding));
+	}
+	if (es.usage !== null && !sameUsage(before, es.usage) && o.onUsage) {
+		const usage = { ...es.usage };
+		const model = es.model;
+		notify(() => o.onUsage!(usage, model));
+	}
 }
 
 export function createRunSink(o: {
@@ -1349,7 +1358,7 @@ export function createRunSink(o: {
 	/** Anchor for the log write (src/confine.ts). */
 	dataRoot: string;
 	onLog?: () => void;
-	onSession?: (sessionId: string) => void;
+	onSession?: (sessionId: string) => void | Promise<void>;
 	/** A progress event (stryker.ts): never logged; null text clears the card's progress. */
 	onProgress?: (text: string | null) => void;
 	/** Extra values redacted like the git secrets: the run's lent provider token. */
@@ -1360,7 +1369,7 @@ export function createRunSink(o: {
 	 * message_end that changed the usage; turn.ts sends the interim metering records from it. */
 	onUsage?: (usage: TokenUsage, model: string | null) => void;
 	/** Fired once per newly parsed propose_task finding, in arrival order, before the run resolves. */
-	onRecorded?: (finding: RecordedFinding) => void;
+	onRecorded?: (finding: RecordedFinding) => void | Promise<void>;
 }): RunSink {
 	const es = newEventState();
 	let stderrTail = "";
@@ -1407,12 +1416,47 @@ export function createRunSink(o: {
 	const liveSecrets = () => [...runSecrets, ...gitSecrets()];
 	const log = redactingWriter(appendLog, liveSecrets);
 
-	const handleLine = (raw: string): void => handleEventLine(raw, o, es, log);
+	let pending: Promise<void> | null = null;
+	let failed = false;
+	let failure: unknown;
+	const recordFailure = (error: unknown): void => {
+		if (!failed) {
+			failed = true;
+			failure = error;
+		}
+	};
+	const notify = (callback: () => void | Promise<void>): void => {
+		const invoke = (): void | Promise<void> => {
+			try {
+				return callback();
+			} catch (error) {
+				recordFailure(error);
+			}
+		};
+		if (pending !== null) {
+			pending = pending.then(invoke).catch(recordFailure);
+		} else {
+			const result = invoke();
+			if (result !== undefined && typeof result.then === "function")
+				pending = result.catch(recordFailure);
+		}
+	};
+	const drain = async (): Promise<void> => {
+		let current: Promise<void> | null;
+		do {
+			current = pending;
+			await current;
+		} while (current !== pending);
+		if (failed) throw failure;
+	};
+	const handleLine = (raw: string): void =>
+		handleEventLine(raw, o, es, log, notify);
 
 	let partial = "";
 	let stderrPartial = "";
 	return {
 		state: es,
+		drain,
 		line: handleLine,
 		stdout: (text) => {
 			partial += text;
@@ -1610,7 +1654,7 @@ interface StartOptions {
 	dataRoot: string;
 	/** Called after every append to the log file; the server turns it into a throttled `log` push. */
 	onLog?: () => void;
-	onSession?: (sessionId: string) => void;
+	onSession?: (sessionId: string) => void | Promise<void>;
 	/** Live Stryker progress of the run (stryker.ts); null once the run ends. */
 	onProgress?: (text: string | null) => void;
 	/** Defaults to the real `spawn`; tests inject a fake child. */
@@ -1678,7 +1722,7 @@ interface StartOptions {
 	onUsage?: (usage: TokenUsage, model: string | null) => void;
 	/** Fired once per newly parsed propose_task finding (createRunSink); a review card's
 	 * main run stores each finding at parse time. */
-	onRecorded?: (finding: RecordedFinding) => void;
+	onRecorded?: (finding: RecordedFinding) => void | Promise<void>;
 }
 
 /** Shared state the local, worker and microVM dispatch paths read. */
@@ -1855,25 +1899,35 @@ function startLocalRun(s: RunStart): RunHandle {
 	child.stdin?.end();
 
 	let settled = false;
-	const { promise: done, resolve: resolveDone } =
-		Promise.withResolvers<RunResult>();
+	const {
+		promise: done,
+		resolve: resolveDone,
+		reject: rejectDone,
+	} = Promise.withResolvers<RunResult>();
 	const settle = (code: number | null): void => {
 		if (settled) return;
 		settled = true;
-		unregisterLayer();
-		// The provision guard fires after the run's writes are final; drift fails the
-		// run through classify (docs/specs/turn-provision-guard.md).
-		const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
-		resolveDone(
-			sink.result({
-				exitCode: code,
-				killed,
-				stderrTail: sink.tail(),
-				ranOn: `board (${hostname()})`,
-				dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
-				...(drift.length ? { provisionDrift: [...drift] } : {}),
-			}),
-		);
+		void (async () => {
+			try {
+				await sink.drain();
+				// Audit only after the run's output and persistence callbacks finish.
+				const drift = o.auditProvisioned?.(startedAt, rulesAtStart) ?? [];
+				resolveDone(
+					sink.result({
+						exitCode: code,
+						killed,
+						stderrTail: sink.tail(),
+						ranOn: `board (${hostname()})`,
+						dispatch: `local, argv ${args.length}, cwd ${basename(o.cwd)}${child.pid !== undefined ? `, pid ${child.pid}` : ""}, ${Math.round((Date.now() - startedAt) / 1000)}s`,
+						...(drift.length ? { provisionDrift: [...drift] } : {}),
+					}),
+				);
+			} catch (error) {
+				rejectDone(error);
+			} finally {
+				unregisterLayer();
+			}
+		})();
 	};
 
 	child.on("error", (err: Error) => {
