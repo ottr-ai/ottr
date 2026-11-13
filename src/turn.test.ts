@@ -2207,13 +2207,13 @@ describe("turn schedule", () => {
 
 	test("the first cycle publishes, a quiet tick publishes nothing (OTTR-884)", async () => {
 		const { record, loop } = setup({ maxTotalRuns: () => 0 });
-		loop.schedule();
+		loop.schedule(); // the write-driven entry publishes; the first cycle publishes too
 		await flushPromises();
 		// First cycle: the previous flag snapshot is undefined, so undefined -> value
 		// counts as a change and the board's first tick still publishes.
 		const first = record.publishSoon;
 		expect(first).toBeGreaterThan(0);
-		loop.schedule();
+		loop.scheduleTick(); // the 5 s tick: no writes landed, no flag changed
 		await flushPromises();
 		// Every flag holds the value the first cycle stored: the quiet tick must not
 		// bump the state version, or the sweep would rebuild the cache every 5 s.
@@ -2238,13 +2238,12 @@ describe("turn schedule", () => {
 				};
 			},
 		});
-		loop.schedule();
+		loop.schedule(); // the write-driven entry publishes; the first cycle publishes too
 		await flushPromises();
 		const first = record.publishSoon;
 		expect(first).toBeGreaterThan(0);
-		loop.schedule();
+		loop.scheduleTick(); // the second cycle stores a NEW object, SAME contents: quiet
 		await flushPromises();
-		// The second cycle stored a NEW object with the SAME contents: a quiet tick.
 		expect(record.publishSoon).toBe(first);
 	});
 
@@ -2254,16 +2253,16 @@ describe("turn schedule", () => {
 			maxTotalRuns: () => 0,
 			isClean: async () => clean,
 		});
-		loop.schedule();
+		loop.schedule(); // the write-driven entry publishes; the first cycle publishes too
 		await flushPromises();
 		const base = record.publishSoon;
 		expect(base).toBeGreaterThan(0);
 		clean = false; // the main checkout turns dirty: one flag edge
-		loop.schedule();
+		loop.scheduleTick(); // the tick's cycle sees the flip: exactly one publish
 		await flushPromises();
 		expect(record.publishSoon).toBe(base + 1);
 		// The dirty flag now equals what the cycle stored: the next tick is quiet again.
-		loop.schedule();
+		loop.scheduleTick();
 		await flushPromises();
 		expect(record.publishSoon).toBe(base + 1);
 	});
@@ -15978,6 +15977,9 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 
 		await loop.schedule();
 		await flushPromises();
+		// The settle chain crosses several mocked-async hops; one drain can starve
+		// it under parallel-suite load, so drain once more before asserting.
+		await flushPromises();
 
 		expect((await store.getTask(task.id))!.pendingPrompt).toBe(
 			"second prompt\n\n.",
@@ -16022,23 +16024,148 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 
 	test("a quiet sweep publishes nothing; settling a lost row publishes once (OTTR-884)", async () => {
 		const { store, record, loop } = sweepSetup();
-		loop.schedule();
+		loop.scheduleTick();
 		await flushPromises();
 		// First cycle publishes (undefined -> value); the baseline includes it.
 		const base = record.publishSoon;
 		expect(base).toBeGreaterThan(0);
-		loop.schedule();
+		loop.scheduleTick();
 		await flushPromises();
 		// Nothing lost, no flag changed: the sweep must leave the state cache alone.
 		expect(record.publishSoon).toBe(base);
 		const task = store.createTask("lost mid-run");
 		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
 		store.startTurn(task.id, "work", "prompt", 4344); // pid 4344 is dead in this fixture
-		loop.schedule();
+		loop.scheduleTick();
 		await flushPromises();
-		// Exactly the settle edge: the row settled and requeued, and the sweep published.
-		expect(record.publishSoon).toBe(base + 1);
+		// Same settle chain as the re-send test: drain twice so the parallel-suite
+		// load cannot starve it before the count.
+		await flushPromises();
+		// Two edges in one tick: the fixture's own writes (a running card, a turn
+		// row) ship through the write check, and the sweep settles the lost row.
+		expect(record.publishSoon).toBe(base + 2);
 		expect(store.getTask(task.id)!.state).toBe("queued");
+	});
+
+	test("writes between the claim and the settle ship on the next tick (OTTR-884)", async () => {
+		// Cap 0: the fixture's queued card never claims or settles, so the count
+		// moves only on the write check.
+		const { store, record, loop } = setup({ maxTotalRuns: () => 0 });
+		loop.schedule(); // write-driven entry: publishes; first cycle publishes too
+		await flushPromises();
+		loop.scheduleTick();
+		await flushPromises();
+		const base = record.publishSoon;
+		// Mid-run writes have no publish edge of their own: the session entry, the
+		// branch/base/worktree write, the turn row, a recorded review finding. The
+		// base shipped them with the tick publish this card removed; the tick's
+		// write check must ship them too.
+		const task = store.createTask("mid-run writes");
+		store.updateTask(task.id, {
+			branch: "ott/x",
+			base: "main",
+			worktree: "wt",
+		});
+		await store.startTurn(task.id, "work", "p", 4242);
+		loop.scheduleTick();
+		await flushPromises();
+		const shipped = record.publishSoon;
+		expect(shipped).toBeGreaterThan(base);
+		// A tick with no writes on top stays quiet.
+		loop.scheduleTick();
+		await flushPromises();
+		expect(record.publishSoon).toBe(shipped);
+	});
+
+	test("a held review settle ships on the next tick (OTTR-884)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = store.createTask("review the work", null, "review");
+		store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			base: "b",
+			worktree: "wt",
+		});
+		const finding = store.createTask("fix one finding");
+		store.updateTask(finding.id, {
+			followUpOf: review.id,
+			stage: "in_progress",
+			state: "idle",
+		});
+		loop.schedule(); // the visit finds the findings open: no write, no publish from it
+		await flushPromises();
+		loop.scheduleTick();
+		await flushPromises();
+		const base = record.publishSoon;
+		// The finding lands: the settle writes the card done, and the write ships
+		// on the next tick's check.
+		store.updateTask(finding.id, { stage: "done", state: "idle" });
+		loop.scheduleTick();
+		await flushPromises();
+		expect(record.publishSoon).toBeGreaterThan(base);
+		expect(store.getTask(review.id)!.stage).toBe("done");
+	});
+
+	test("a held review whose findings stay open publishes nothing per tick (OTTR-884)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = store.createTask("review the work", null, "review");
+		store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			base: "b",
+			worktree: "wt",
+		});
+		const finding = store.createTask("fix one finding");
+		store.updateTask(finding.id, {
+			followUpOf: review.id,
+			stage: "in_progress",
+			state: "idle",
+		});
+		loop.schedule(); // the visit finds the findings open: no write
+		await flushPromises();
+		const first = record.publishSoon;
+		expect(first).toBeGreaterThan(0);
+		// The findings stay open: settleReviewCard returns with no write, so the
+		// visits must not publish — the tick stays quiet however long the wait runs.
+		loop.scheduleTick();
+		await flushPromises();
+		loop.scheduleTick();
+		await flushPromises();
+		expect(record.publishSoon).toBe(first);
+		expect(store.getTask(review.id)!.state).toBe("idle");
+	});
+
+	test("the /tmp hold's reason write publishes its own edge (OTTR-884)", async () => {
+		const { store, record, loop } = setup({
+			tmpFullLine: () => "/tmp of local is full (0 MiB free)",
+		});
+		const task = store.createTask("queued work");
+		loop.schedule(); // entry + first cycle + the hold write's edge
+		await flushPromises();
+		const first = record.publishSoon;
+		expect(first).toBeGreaterThan(0);
+		expect(store.getTask(task.id)!.needsReason).toContain(
+			"/tmp of local is full",
+		);
+		loop.scheduleTick(); // the hold persists (the reason text matches): quiet
+		await flushPromises();
+		expect(record.publishSoon).toBe(first);
+		const base = record.publishSoon;
+		store.updateTask(task.id, { needsReason: null }); // a user clear; the next claim rewrites
+		loop.schedule(); // entry publish + the hold rewrite's edge
+		await flushPromises();
+		expect(record.publishSoon).toBe(base + 2);
+		expect(store.getTask(task.id)!.needsReason).toContain("/tmp of local");
 	});
 
 	test("the lost sweep leaves a parked card's open row alone", async () => {
@@ -20994,6 +21121,34 @@ describe("detached re-bind after the restart", () => {
 		await flushPromises();
 		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 		expect((await store.getTask(task.id))!.state).toBe("running");
+	});
+
+	test("a detached watcher settle publishes through the sweep's edge (OTTR-884)", async () => {
+		let runs: DetachedRun[] = [
+			{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 },
+		];
+		const { store, record, loop } = rebindSetup(() => runs);
+		const task = seededWorkerRow(store);
+		await loop.recoverRestarted(); // re-binds the still-running run; the watcher stays
+		loop.schedule(); // the write-driven entry publishes; the run is still out there
+		await flushPromises();
+		loop.scheduleTick(); // first tick: first cycle publishes; the watcher keeps waiting
+		await flushPromises();
+		const base = record.publishSoon;
+		runs = [
+			{
+				id: "run-1",
+				cwd: WT,
+				pid: null,
+				running: false,
+				startedAt: 1,
+				result: { exitCode: 0, stderrTail: "" },
+			},
+		];
+		loop.scheduleTick(); // the sweep settles the detached run: its own publish edge
+		await flushPromises();
+		expect(record.publishSoon).toBe(base + 1);
+		expect(store.getTask(task.id)!.state).toBe("queued");
 	});
 
 	test("a finished detached run settles at recovery through the resume route", async () => {

@@ -1503,7 +1503,10 @@ export type FinishKeptOutcome =
 
 /** The engine handle the server binds: scheduler ticks, live-run kills, boot recovery. */
 export interface TurnLoop {
+/** Write-driven entry: dispatch plus the write entry publish. */
 	schedule(): Promise<void>;
+	/** The 5 s tick: dispatch plus the landed-writes check (OTTR-884). */
+	scheduleTick(): Promise<void>;
 	runTurn(name: string, id: string): Promise<void>;
 	cancel(e: TurnProject, id: string, force: boolean): Promise<CancelOutcome>;
 	/** Stops the running turn without cancelling the task (the board's Esc). */
@@ -3077,12 +3080,7 @@ export function createTurnLoop(
 		try {
 			if (await dispatchRunnable(e, drained, cap, active, depProjects))
 				return true;
-			if (!drained)
-				void settleReviews(e.store.name).then((settled) => {
-					// A settled review card is a frame change (OTTR-884): the settle
-					// publishes its own edge, like the turn settle tail does.
-					if (settled > 0) ops.publishSoon();
-				});
+			if (!drained) void settleReviews(e.store.name);
 			return false;
 		} catch (err) {
 			// One sick store (locked file, missing table) must not stop the other projects'
@@ -3149,11 +3147,48 @@ export function createTurnLoop(
 
 	async function schedule(): Promise<void> {
 		if (ops.stopping?.() === true) return;
-		// OTTR-884: the entry publishes on edges only. The refresh cycle below publishes when a
-		// scheduler flag changed, sweepLostTurns when it settles a lost row, and dispatch/turn
-		// paths keep their own publishes. A quiet board (no flag change, no settled row) never
-		// bumps the state version from the sweep, so the single-flight state cache is not
-		// torn down every 5 s on a board with open sockets.
+		// Write-driven entry (OTTR-884): every board write path lands here through
+		// deps.schedule (routes, the supervisor, the omp watch), the settle tail,
+		// or the release/credit flows, and its writes ship at once. The 5 s tick
+		// enters through scheduleTick(), which publishes only on landed writes.
+		ops.publishSoon();
+		await scheduleDispatch();
+	}
+
+	/** The 5 s tick: quiet unless a store write landed since the last tick. The
+	 * write check is the SQLite WAL fingerprint of every project's database —
+	 * complete by construction (every write touches the WAL), so no write path
+	 * can miss its publish: mid-run writes (session entry, branch writes, turn
+	 * rows, review findings) and later writers (supervisor, watch) ship within
+	 * one tick, the same bound the removed unconditional publish gave. */
+	async function scheduleTick(): Promise<void> {
+		if (ops.stopping?.() === true) return;
+		if (boardWritesLanded()) ops.publishSoon();
+		await scheduleDispatch();
+	}
+
+	// WAL fingerprint per project store path: size and mtime of tasks.db-wal.
+	const walSeen = new Map<string, string>();
+	function boardWritesLanded(): boolean {
+		let moved = false;
+		for (const e of projects.values()) {
+			const wal = join(e.store.path, ".tasks", "tasks.db-wal");
+			let mark: string;
+			try {
+				const st = statSync(wal, { throwIfNoEntry: false });
+				mark = st === undefined ? "absent" : `${st.size}:${st.mtimeMs}`;
+			} catch {
+				mark = "absent";
+			}
+			const seen = walSeen.get(wal);
+			if (seen !== undefined && seen !== mark) moved = true;
+			walSeen.set(wal, mark);
+		}
+		return moved;
+	}
+
+	async function scheduleDispatch(): Promise<void> {
+>>>>>>> 4327d9d (fix: split the scheduler tick from the write entry and publish landed writes)
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
 		// Refresh every project first: a full cap must not skip the later projects' dirty and
 		// release flags (they gate the board and the merge queue). Coalesced (OTTR-866): a
@@ -3563,27 +3598,24 @@ export function createTurnLoop(
 	 * merge turns that may push: the release command's push must not race one (the same reason
 	 * pickRunnable holds merges while a release runs). */
 	const settling = new Set<string>();
-	async function settleReviews(name: string): Promise<number> {
+	async function settleReviews(name: string): Promise<void> {
 		const e = projects.get(name);
-		if (!e || e.target === null) return 0;
-		let settled = 0;
+		if (!e || e.target === null) return;
 		try {
 			const target = e.target;
 			const tasks = await e.store.listTasks();
 			const live = tasks.filter((t) => t.cancelledAt === null);
 			// Wait out a merge that may push: one that runs, or a queued one no review holds. A merge
 			// this release holds waits for the publish itself, so waiting for it would deadlock.
-			if (mergePushInFlight(live)) return 0;
+			if (mergePushInFlight(live)) return;
 			for (const t of tasks) {
 				if (!heldReviewCard(t)) continue;
 				await settleHeldReview(e, t, target);
-				settled++;
 			}
 		} catch (err) {
 			// Voided by schedule(): a locked store must reject into the log, not unhandled.
 			logStoreError(name, err);
 		}
-		return settled;
 	}
 
 	async function runTurn(name: string, id: string): Promise<void> {
@@ -3907,10 +3939,8 @@ export function createTurnLoop(
 				metered,
 			);
 		}
-		// The settle's store writes (card state, requeue, findings) are a frame
-		// change (OTTR-884): the tick's unconditional publish is gone, so the
-		// settle tail publishes its own edge before the dispatch reschedule.
-		ops.publishSoon();
+		// The settle's store writes ship through the write-driven schedule() entry
+		// below, which publishes on entry (OTTR-884).
 		schedule();
 	}
 
@@ -4047,41 +4077,12 @@ export function createTurnLoop(
 				e,
 				store,
 				task,
-<<<<<<< HEAD
 				key,
 				kind: task.stage === "merging" ? "merge" : "work",
 			};
 		} finally {
 			release();
 		}
-=======
-				kind,
-				preRetro,
-				preBoardCheck,
-			);
-			if (tmpReason !== null && task.needsReason !== tmpReason) {
-				store.updateTask(id, { needsReason: tmpReason });
-				// The hold's reason line is a frame change (OTTR-884): the tick's
-				// unconditional publish is gone, so the write publishes its own edge.
-				ops.publishSoon();
-			}
-			return null;
-		}
-		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
-		store.updateTask(id, {
-			state: "preparing",
-			needsReason: null,
-			asked: null,
-		});
-		// The claim is a frame change (queued -> preparing, OTTR-884): the tick's
-		// unconditional publish is gone, so the claim publishes its own edge.
-		ops.publishSoon();
-		preparing.add(key);
-		// A credit-stop mark belongs to a run claimed before the stop; this claim starts clean
-		// (a stop from now on marks it again, and the hold covers the gap until the gate).
-		creditStopped.delete(key);
-		return { e, store, task, key, kind };
->>>>>>> 9946ae7 (fix: value-compare object flags and publish the turn edges)
 	}
 
 	/** OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
@@ -11044,6 +11045,9 @@ export function createTurnLoop(
 
 	return {
 		schedule,
+		/** The 5 s tick's entry: dispatch and sweeps without the write-driven
+		 * entry publish; publishes only when a store write landed (OTTR-884). */
+		scheduleTick,
 		runTurn,
 		cancel,
 		stopTurn,

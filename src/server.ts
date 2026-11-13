@@ -983,8 +983,13 @@ appRef = app;
 // Boot recovery is the loop's job now: a restart resurfaces running/preparing
 // turns through one code path, so a cancelled card can never be requeued twice.
 await loop.recoverRestarted();
+<<<<<<< HEAD
 await loop.schedule();
 every(loop.schedule, 5000);
+=======
+loop.schedule();
+setInterval(() => loop.scheduleTick(), 5000);
+>>>>>>> 4327d9d (fix: split the scheduler tick from the write entry and publish landed writes)
 
 every(() => supervisor.tick(), 60_000);
 
