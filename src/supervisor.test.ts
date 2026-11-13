@@ -5322,6 +5322,7 @@ describe("CI reopen after the merge", () => {
 		await store.updateTask(t.id, {
 			stage: "done",
 			state: "idle",
+			base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			worktree: join(root, "ci-reopen", ".wt-gone"),
 			branch: "ott/ci-reopen",
 			sessionId: "sess-123",
@@ -5354,6 +5355,7 @@ describe("CI reopen after the merge", () => {
 		expect(after.pushSha).toBeNull();
 		expect(after.worktree).toBeNull();
 		expect(after.branch).toBeNull();
+		expect(after.base).toBeNull();
 		expect(after.sessionId).toBe("sess-123");
 		expect(
 			after.pendingPrompt?.startsWith(
@@ -5474,6 +5476,137 @@ describe("CI reopen after the merge", () => {
 			),
 		);
 		expect(logs.join("\n")).toContain("follow-up already filed");
+		await store.close();
+	});
+	test("a reopened card holds the same-check dedupe against later done cards", async () => {
+		const dir = join(root, "ci-reopen-sibling");
+		const store = await ProjectStore.open(dir);
+		const first = await store.createTask("first");
+		await store.updateTask(first.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "aaaa1111aaaa1111",
+			base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			worktree: join(dir, ".wt-gone"),
+			branch: "ott/one",
+		});
+		const second = await store.createTask("second");
+		await store.updateTask(second.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "cccc2222cccc2222",
+			base: "dddddddddddddddddddddddddddddddddddddddd",
+			worktree: join(dir, ".wt-gone-2"),
+			branch: "ott/two",
+		});
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 414,
+					},
+				]),
+				stderr: "",
+			},
+			runViewResult: {
+				code: 0,
+				stdout: "error: Process completed with exit code 1.",
+				stderr: "",
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		// One card reopens (the pass visits newest first); the other holds the same
+		// failing check on another push: it stops and waits for the fix already under
+		// way instead of reopening a second one.
+		const after = await store.listTasks();
+		const reopened = after.find((x) => x.stage === "in_progress");
+		expect(reopened).toBeDefined();
+		expect(reopened?.state).toBe("queued");
+		expect(reopened?.pendingPrompt).toContain("## Failed-step logs");
+		const held = after.find(
+			(x) =>
+				x.id !== reopened?.id &&
+				(x.prompt === "first" || x.prompt === "second"),
+		);
+		expect(held?.stage).toBe("done");
+		expect(held?.state).toBe("idle");
+		expect(held?.pushSha).toBeNull();
+		expect(held?.pendingPrompt).toBeNull();
+		// No follow-up card was filed for either push.
+		expect(
+			after.filter((x) => x.prompt.startsWith("CI failed on the merge push")),
+		).toHaveLength(0);
+		// The dedupe runs before the log fetch: only the reopen fetched one.
+		expect(ops.runViewCalls).toBe(1);
+		const log = await Bun.file(await store.logPath(held!.id)).text();
+		expect(log).toContain(
+			`follow-up already filed for the same failing check (${reopened!.id})`,
+		);
+		await store.close();
+	});
+
+	test("an open same-check follow-up from another push stops both cards of one pushSha", async () => {
+		const dir = join(root, "ci-reopen-two-sibling");
+		const store = await ProjectStore.open(dir);
+		const sibling = await store.createTask(
+			"CI failed on the merge push of this card's parent task (def5678 on main).\n- build: failure - https://run/0\nFind the cause.",
+		);
+		const first = await store.createTask("first");
+		await store.updateTask(first.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "aaaa1111aaaa1111",
+			base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			worktree: join(dir, ".wt-gone"),
+			branch: "ott/one",
+		});
+		const second = await store.createTask("second");
+		await store.updateTask(second.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "aaaa1111aaaa1111",
+			base: "dddddddddddddddddddddddddddddddddddddddd",
+			worktree: join(dir, ".wt-gone-2"),
+			branch: "ott/two",
+		});
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 415,
+					},
+				]),
+				stderr: "",
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		// Neither card reopens: the per-check dedupe stops both into the fallback.
+		for (const id of [first.id, second.id]) {
+			const p = await store.getTask(id);
+			expect(p?.stage).toBe("done");
+			expect(p?.state).toBe("idle");
+			expect(p?.pushSha).toBeNull();
+			expect(p?.pendingPrompt).toBeNull();
+		}
+		// No new card was filed and the sibling is untouched.
+		expect(await store.listTasks()).toHaveLength(3);
+		expect(await store.getTask(sibling.id)).toBeDefined();
+		const log = await Bun.file(await store.logPath(second.id)).text();
+		expect(log).toContain(
+			`follow-up already filed for the same failing check (${sibling.id})`,
+		);
+		// Both stops happened in the dedupe, before any log fetch.
+		expect(ops.runViewCalls).toBe(0);
 		await store.close();
 	});
 });

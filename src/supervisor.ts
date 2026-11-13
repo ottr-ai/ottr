@@ -1740,9 +1740,14 @@ export function createSupervisor(
 			(x) =>
 				x.stage === "done" && x.cancelledAt === null && x.pushSha === pushSha,
 		);
+		// The follow-up flow's full dedupe stands here too: a same-head follow-up or an
+		// open same-check fix (a follow-up prompt or another card's queued CI reply)
+		// sends this failure to the fallback path, which stops with the line it always
+		// logged. Without it, every later card failing the same check would reopen and
+		// race the one fix already under way.
 		if (
 			matches.length !== 1 ||
-			(await ciFollowUpFiled(e, t, head.split("\n", 1)[0]))
+			(await ciDedupeLine(e, t, pushSha, head)) !== null
 		)
 			return false;
 		const short = pushSha.slice(0, 7);
@@ -1768,6 +1773,11 @@ export function createSupervisor(
 				pushSha: null,
 				worktree: null,
 				branch: null,
+				// A done card keeps the base its first dispatch stamped; left set, the next
+				// header would build the worktree from that old commit instead of the
+				// current target tip. Null takes prepareTurnHeader's `task.base ?? sha`
+				// fallback — the same fresh-card path this reopen promised.
+				base: null,
 			}))
 		)
 			return true;
@@ -1798,6 +1808,8 @@ export function createSupervisor(
 
 	// Same failing check on a different push: N cards race on one root cause, one merges the
 	// fix, the rest would stick. The open follow-up that already names this check wins.
+	// OTTR-915: a reopened card carries its failed-check list in the queued reply, not in
+	// the prompt, so an in-flight reopen counts like an open follow-up here.
 	async function ciNamedSibling(
 		e: SupervisorEntry,
 		t: ListedTask,
@@ -1808,7 +1820,10 @@ export function createSupervisor(
 				x.id !== t.id &&
 				x.stage !== "done" &&
 				x.cancelledAt === null &&
-				failedCheckNames(x.prompt).some((n) => names.includes(n)),
+				(failedCheckNames(x.prompt).some((n) => names.includes(n)) ||
+					failedCheckNames(x.pendingPrompt ?? "").some((n) =>
+						names.includes(n),
+					)),
 		);
 	}
 

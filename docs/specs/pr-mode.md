@@ -574,24 +574,34 @@ session, decisions or check findings. The board now answers on the card
 that owns the work:
 
 - The failed run's head sha matches exactly one non-cancelled done card by
-  `pushSha`, and no open follow-up card names this failing head: the board
-  reopens that card. The write sets `in_progress`/`queued` with
+  `pushSha`, and the follow-up flow's dedupe does not stop the failure: the
+  board reopens that card. The write sets `in_progress`/`queued` with
   `needsReason` null, queues the failed-check list plus the failed steps'
-  log as the pending prompt, and clears `pushSha`, `worktree` and
-  `branch`. `doneAt` stays: nothing reads it while the stage is not
+  log as the pending prompt, and clears `pushSha`, `worktree`, `branch`
+  and `base`. `doneAt` stays: nothing reads it while the stage is not
   `done`, and the next done write stamps it fresh.
-- The next turn dispatch reads the cleared row fields and takes the
-  create-worktree path: a fresh worktree and branch from the current
-  target tip, while the card's `sessionId` carries over untouched, so the
-  agent resumes its own session. The fix ships through the normal merge
-  flow; a PR-mode card re-ships and opens a new PR (OTTR-799).
-- The same one-fix-per-head dedupe as the PR-head reply: the cleared
-  `pushSha` stops a second reply for the same head, and the next ship pins
-  a new head for the next verdict.
+- The next turn dispatch reads the cleared row fields and takes the same
+  create path as a fresh card: `resolveTarget` fetches the target fresh,
+  and `prepareTurnHeader`'s `task.base ?? sha` fallback stamps the current
+  target tip as the base of the new worktree and branch, while the card's
+  `sessionId` carries over untouched, so the agent resumes its own
+  session. The fix ships through the normal merge flow; a PR-mode card
+  re-ships and opens a new PR (OTTR-799).
+- The same dedupe as the follow-up flow: the cleared `pushSha` is the
+  one-fix-per-head rule (a cleared head never replies twice, and the next
+  ship pins a new head for the next verdict), and the per-check rule runs
+  through `ciDedupeLine` before the reopen — an open follow-up naming the
+  same failing check, or another card whose queued CI-fix reply names it,
+  sends the failure to the fallback path instead. A reopened card carries
+  its check names in the queued reply (`pendingPrompt`), which
+  `ciNamedSibling` reads beside the prompt; the stop line names the
+  reopened card. One limit is accepted: once the fix turn consumes the
+  reply, the marker is gone, and a sibling failure discovered only then
+  can start its own fix.
 - Fallback — the follow-up card files exactly as before this reopen
   existed: zero or several done cards match the `pushSha` (several cards
-  in one push), the single match is a cancelled card, or an open follow-up
-  already covers this head. The follow-up links to the card in its lineage
+  in one push), the single match is a cancelled card, or the dedupe above
+  stops the head. The follow-up links to the card in its lineage
   (`followUpOf`) as today, and the per-push and per-check dedupe rules
   stand.
 
@@ -599,11 +609,12 @@ Non-goals of this section:
 
 - No new state or schema: the reopen reuses `in_progress`/`queued` and
   clears existing columns; no CHECK-constraint change.
-- No worktree or branch cleanup on reopen: both are already gone on every
-  done path (`removeWorktree` deletes the local branch; the PR ship's
-  remote delete covers origin). A branch that a failed delete left behind
-  is reused at its tip by `createWorktree`, which is safe: the turn then
-  works from the merged tip and the merge turn rebases.
+- No worktree, branch or base cleanup beyond the reopen write: the
+  worktree and the branches are already gone on every done path
+  (`removeWorktree` deletes the local branch; the PR ship's remote delete
+  covers origin). A branch that a failed delete left behind is reused at
+  its tip by `createWorktree`, which is safe: the turn then works from the
+  merged tip and the merge turn rebases.
 - The reopen makes no GitHub call beyond the log fetch.
 
 ## Store
@@ -690,11 +701,16 @@ server remains the only writer of origin.
   plain refetch instruction.
 - CI failure after the merge (OTTR-915): a failed run whose head sha
   matches exactly one done card reopens that card — `in_progress`/`queued`
-  with the failed-step log in the pending prompt, `pushSha`, `worktree`
-  and `branch` cleared, no follow-up card filed, and the next tick replies
-  nothing. A run matching two done cards files one follow-up card as
-  today and reopens nothing. A failed log fetch keeps the refetch
-  instruction in the reopen prompt.
+  with the failed-step log in the pending prompt, `pushSha`, `worktree`,
+  `branch` and `base` cleared, no follow-up card filed, and the next tick
+  replies nothing. A run matching two done cards files one follow-up card
+  as today and reopens nothing. A failed log fetch keeps the refetch
+  instruction in the reopen prompt. The per-check dedupe holds the reopen:
+  a second done card failing the same check on another push stops while a
+  fix reply is queued on the reopened card, and an open follow-up naming
+  the same check stops both cards of one pushSha; both stops log the
+  existing "already filed for the same failing check" line and fetch no
+  log.
 - OTTR-799: a queued `merging` card with a `prNumber` is pickable and
   re-ships — the push updates the same PR (or opens a fresh one after a
   close), and `prHeadSha`/`pushSha` pin the new tip; an idle PR card is
