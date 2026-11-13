@@ -577,9 +577,11 @@ that owns the work:
   `pushSha`, and the follow-up flow's dedupe does not stop the failure: the
   board reopens that card. The write sets `in_progress`/`queued` with
   `needsReason` null, queues the failed-check list plus the failed steps'
-  log as the pending prompt, and clears `pushSha`, `worktree`, `branch`
-  and `base`. `doneAt` stays: nothing reads it while the stage is not
-  `done`, and the next done write stamps it fresh.
+  log as the pending prompt, and clears `pushSha`, `worktree`, `branch`,
+  `base` and the first life's work-check state (`workCheckHead`,
+  `workCheckReport`, `workCheckSendbacks`, `workCheckLog`). `doneAt`
+  stays: nothing reads it while the stage is not `done`, and the next done
+  write stamps it fresh.
 - The next turn dispatch reads the cleared row fields and takes the same
   create path as a fresh card: `resolveTarget` fetches the target fresh,
   and `prepareTurnHeader`'s `task.base ?? sha` fallback stamps the current
@@ -591,13 +593,13 @@ that owns the work:
   one-fix-per-head rule (a cleared head never replies twice, and the next
   ship pins a new head for the next verdict), and the per-check rule runs
   through `ciDedupeLine` before the reopen — an open follow-up naming the
-  same failing check, or another card whose queued CI-fix reply names it,
-  sends the failure to the fallback path instead. A reopened card carries
-  its check names in the queued reply (`pendingPrompt`), which
-  `ciNamedSibling` reads beside the prompt; the stop line names the
-  reopened card. One limit is accepted: once the fix turn consumes the
-  reply, the marker is gone, and a sibling failure discovered only then
-  can start its own fix.
+  same failing check, or another card whose queued or dispatched CI-fix
+  reply names it, sends the failure to the fallback path instead. A
+  reopened card carries its check names in the CI reply: while queued, in
+  `pendingPrompt`; once the fix turn starts, on the turn row (what
+  `recordTurnRow` stores as the delivered reply), so the stop holds for
+  the fix's whole run — until the card is done or cancelled, the same
+  lifetime as a follow-up prompt. The stop line names the reopened card.
 - Fallback — the follow-up card files exactly as before this reopen
   existed: zero or several done cards match the `pushSha` (several cards
   in one push), the single match is a cancelled card, or the dedupe above
@@ -702,15 +704,16 @@ server remains the only writer of origin.
 - CI failure after the merge (OTTR-915): a failed run whose head sha
   matches exactly one done card reopens that card — `in_progress`/`queued`
   with the failed-step log in the pending prompt, `pushSha`, `worktree`,
-  `branch` and `base` cleared, no follow-up card filed, and the next tick
-  replies nothing. A run matching two done cards files one follow-up card
-  as today and reopens nothing. A failed log fetch keeps the refetch
-  instruction in the reopen prompt. The per-check dedupe holds the reopen:
-  a second done card failing the same check on another push stops while a
-  fix reply is queued on the reopened card, and an open follow-up naming
-  the same check stops both cards of one pushSha; both stops log the
-  existing "already filed for the same failing check" line and fetch no
-  log.
+  `branch`, `base` and the first life's work-check state cleared, no
+  follow-up card filed, and the next tick replies nothing. A run matching
+  two done cards files one follow-up card as today and reopens nothing. A
+  failed log fetch keeps the refetch instruction in the reopen prompt.
+  The per-check dedupe holds the reopen for the fix's whole run: a second
+  done card failing the same check on another push stops while the fix
+  reply is queued, and still stops after the fix turn consumed the reply
+  (the turn row carries it); an open follow-up naming the same check stops
+  both cards of one pushSha. All stops log the existing "already filed for
+  the same failing check" line and fetch no log.
 - OTTR-799: a queued `merging` card with a `prNumber` is pickable and
   re-ships — the push updates the same PR (or opens a fresh one after a
   close), and `prHeadSha`/`pushSha` pin the new tip; an idle PR card is

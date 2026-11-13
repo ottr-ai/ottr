@@ -57,11 +57,16 @@ interface FakeOps extends SupervisorOps {
 	};
 	// prPass: every `gh api ...` call's args, in order
 	apiCalls: string[][];
-	// prPass: per-call override keyed by the api URL; null result falls through to the default
+	// prPass: per-call override keyed by the api URL; a null or undefined result falls
+	// through to the default (ghApi reads both)
 	apiResult:
 		| ((
 				url: string,
-		  ) => { code: number; stdout: string; stderr: string } | Error)
+		  ) =>
+				| { code: number; stdout: string; stderr: string }
+				| Error
+				| null
+				| undefined)
 		| null;
 	// prPass: ref -> sha; missing refs read null (git failure / absent ref)
 	targetShas: Record<string, string | null>;
@@ -5607,6 +5612,159 @@ describe("CI reopen after the merge", () => {
 		);
 		// Both stops happened in the dedupe, before any log fetch.
 		expect(ops.runViewCalls).toBe(0);
+		await store.close();
+	});
+
+	test("the stop holds after the fix turn starts: the reply lives on the turn row", async () => {
+		const dir = join(root, "ci-reopen-turngap");
+		const store = await ProjectStore.open(dir);
+		const first = await store.createTask("first");
+		await store.updateTask(first.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "aaaa1111aaaa1111",
+			base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			worktree: join(dir, ".wt-gone"),
+			branch: "ott/one",
+		});
+		const second = await store.createTask("second");
+		await store.updateTask(second.id, {
+			stage: "done",
+			state: "idle",
+			pushSha: "cccc2222cccc2222",
+			base: "dddddddddddddddddddddddddddddddddddddddd",
+			worktree: join(dir, ".wt-gone-2"),
+			branch: "ott/two",
+		});
+		// The verdicts land in different ticks: the second push fails first, the first
+		// push's run is still pending until after the fix turn has started.
+		const failed = runsJson([
+			{
+				status: "completed",
+				conclusion: "failure",
+				name: "build",
+				html_url: "https://run/1",
+				id: 416,
+			},
+		]);
+		let firstVerdict: "pending" | "failed" = "pending";
+		const ops = fakeOps({
+			apiResult: (url) => {
+				if (!url.includes("/actions/runs?")) return undefined;
+				if (url.includes("cccc2222"))
+					return { code: 0, stdout: failed, stderr: "" };
+				if (url.includes("aaaa1111"))
+					return firstVerdict === "failed"
+						? { code: 0, stdout: failed, stderr: "" }
+						: {
+								code: 0,
+								stdout: runsJson([{ status: "queued", conclusion: null }]),
+								stderr: "",
+							};
+				return undefined;
+			},
+			runViewResult: {
+				code: 0,
+				stdout: "error: Process completed with exit code 1.",
+				stderr: "",
+			},
+		});
+		// Tick 1: the newest card's verdict lands first and reopens it; the older
+		// card's run is pending, so it keeps its pushSha.
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const reopened = await store.getTask(second.id);
+		expect(reopened?.pendingPrompt).toContain("## Failed-step logs");
+		expect((await store.getTask(first.id))?.pushSha).toBe("aaaa1111aaaa1111");
+		// The fix turn starts: the reply is consumed from the row and recorded on the
+		// turn row, the way recordTurnRow writes a resumed session's delivered reply.
+		const reply = reopened?.pendingPrompt ?? "";
+		await store.updateTask(second.id, {
+			pendingPrompt: null,
+			pendingBy: null,
+			state: "running",
+		});
+		await store.startTurn(
+			second.id,
+			"work",
+			`work turn scaffold\n\n${reply}`,
+			null,
+			reply,
+			null,
+			"supervisor",
+		);
+		// Tick 2, minutes later: the older card's verdict lands on its own push. The
+		// queued-reply marker is gone; the turn row must carry the stop.
+		firstVerdict = "failed";
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const held = await store.getTask(first.id);
+		expect(held?.stage).toBe("done");
+		expect(held?.state).toBe("idle");
+		expect(held?.pushSha).toBeNull();
+		expect(held?.pendingPrompt).toBeNull();
+		expect(
+			(await store.listTasks()).filter((x) =>
+				x.prompt.startsWith("CI failed on the merge push"),
+			),
+		).toHaveLength(0);
+		expect(ops.runViewCalls).toBe(1);
+		const log = await Bun.file(await store.logPath(first.id)).text();
+		expect(log).toContain(
+			`follow-up already filed for the same failing check (${second.id})`,
+		);
+		await store.close();
+	});
+
+	test("the reopen resets the first life's work-check state", async () => {
+		const { store, t } = await ciProject("ci-reopen-workcheck");
+		await store.updateTask(t.id, {
+			stage: "done",
+			state: "idle",
+			base: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			worktree: join(root, "ci-reopen-workcheck", ".wt-gone"),
+			branch: "ott/wc",
+			workCheckHead: "eeee0000eeee0000eeee0000eeee0000eeee0000",
+			workCheckReport: "first life report",
+			workCheckSendbacks: 2,
+			workCheckLog: [
+				{
+					at: 1,
+					model: null,
+					outcome: "pass",
+					blockers: [],
+					notes: [],
+					durationMs: 5,
+				},
+			],
+		});
+		const ops = fakeOps({
+			ghResult: {
+				code: 0,
+				stdout: runsJson([
+					{
+						status: "completed",
+						conclusion: "failure",
+						name: "build",
+						html_url: "https://run/1",
+						id: 417,
+					},
+				]),
+				stderr: "",
+			},
+			runViewResult: {
+				code: 0,
+				stdout: "error: Process completed with exit code 1.",
+				stderr: "",
+			},
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		expect(after.stage).toBe("in_progress");
+		// The second life checks like a fresh card: a kept workCheckHead would diff the
+		// pre-merge branch head against HEAD and judge other cards' target commits.
+		expect(after.workCheckHead).toBeNull();
+		expect(after.workCheckReport).toBeNull();
+		expect(after.workCheckSendbacks).toBe(0);
+		expect(after.workCheckLog).toEqual([]);
 		await store.close();
 	});
 });

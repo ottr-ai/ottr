@@ -1778,6 +1778,14 @@ export function createSupervisor(
 				// current target tip. Null takes prepareTurnHeader's `task.base ?? sha`
 				// fallback — the same fresh-card path this reopen promised.
 				base: null,
+				// The second life checks like a fresh card: a kept workCheckHead would
+				// diff the pre-merge branch head against HEAD (other cards' target
+				// commits ride in, a cut diff can hide the fix), and the first life's
+				// report and sendback count would leak into the re-check.
+				workCheckHead: null,
+				workCheckReport: null,
+				workCheckSendbacks: 0,
+				workCheckLog: [],
 			}))
 		)
 			return true;
@@ -1808,23 +1816,32 @@ export function createSupervisor(
 
 	// Same failing check on a different push: N cards race on one root cause, one merges the
 	// fix, the rest would stick. The open follow-up that already names this check wins.
-	// OTTR-915: a reopened card carries its failed-check list in the queued reply, not in
-	// the prompt, so an in-flight reopen counts like an open follow-up here.
+	// OTTR-915: a reopened card carries its failed-check list in the CI reply. While the
+	// reply is queued it sits in pendingPrompt; once the fix turn starts, recordTurnRow
+	// keeps it on the turn row (inputBy supervisor), so the stop holds for the fix's
+	// whole run — until the card is done or cancelled, like a follow-up prompt.
 	async function ciNamedSibling(
 		e: SupervisorEntry,
 		t: ListedTask,
 		names: readonly string[],
 	): Promise<ListedTask | undefined> {
-		return (await e.store.listTasks()).find(
-			(x) =>
-				x.id !== t.id &&
-				x.stage !== "done" &&
-				x.cancelledAt === null &&
-				(failedCheckNames(x.prompt).some((n) => names.includes(n)) ||
-					failedCheckNames(x.pendingPrompt ?? "").some((n) =>
-						names.includes(n),
-					)),
-		);
+		for (const x of await e.store.listTasks()) {
+			if (x.id === t.id || x.stage === "done" || x.cancelledAt !== null)
+				continue;
+			if (
+				failedCheckNames(x.prompt).some((n) => names.includes(n)) ||
+				failedCheckNames(x.pendingPrompt ?? "").some((n) => names.includes(n))
+			)
+				return x;
+			for (const turn of await e.store.listTurns(x.id)) {
+				if (
+					turn.inputBy === "supervisor" &&
+					failedCheckNames(turn.input ?? "").some((n) => names.includes(n))
+				)
+					return x;
+			}
+		}
+		return undefined;
 	}
 
 	/** The stop line when an open follow-up already covers this failing push or the same
