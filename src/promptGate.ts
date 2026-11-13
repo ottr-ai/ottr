@@ -472,17 +472,22 @@ export function gateAssumptionsBlock(gate: PromptGateState | null): string {
 export async function replayGateParks(
 	projects: Iterable<{ name: string; store: ProjectStore }>,
 	o: {
+		/** The board kv (GlobalStore) answers through a promise; a test kv may
+		 * answer directly. Await both: an unawaited promise is never null, which
+		 * took this branch on every boot (OTTR-920). */
 		kvGet(key: string): unknown;
-		kvSet(key: string, value: unknown): void;
+		kvSet(key: string, value: unknown): void | Promise<void>;
 		log(line: string): void;
 	},
 ): Promise<number> {
-	if (o.kvGet("promptGateReplay") !== null) {
+	if ((await o.kvGet("promptGateReplay")) !== null) {
 		o.log("already replayed");
 		return 0;
 	}
+	const perProject: string[] = [];
 	let count = 0;
-	for (const { store } of projects) {
+	for (const { name, store } of projects) {
+		let queued = 0;
 		for (const task of await store.listTasks()) {
 			if (
 				task.state !== "needs_you" ||
@@ -504,10 +509,17 @@ export async function replayGateParks(
 					parked: false,
 				},
 			});
-			count += 1;
+			queued += 1;
 		}
+		perProject.push(`${name}: ${queued}`);
+		count += queued;
 	}
-	o.kvSet("promptGateReplay", new Date().toISOString());
-	o.log(`re-queued ${count}`);
+	await o.kvSet("promptGateReplay", new Date().toISOString());
+	const detail = perProject.join(", ");
+	o.log(
+		perProject.length === 0
+			? `re-queued ${count}`
+			: `re-queued ${count} (${detail})`,
+	);
 	return count;
 }

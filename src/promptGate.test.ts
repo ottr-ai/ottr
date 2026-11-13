@@ -713,6 +713,64 @@ describe("replayGateParks", () => {
 		await b.close();
 	});
 
+	test("an async kv read of a missing stamp still runs the replay (OTTR-920)", async () => {
+		// GlobalStore.get answers through a promise; the pre-fix check compared
+		// the promise itself to null, so every boot took the already-replayed
+		// branch and no parked card was ever re-queued.
+		const store = await open();
+		const id = await parkedCard(store);
+		const kv = new Map<string, unknown>();
+		const lines: string[] = [];
+
+		const count = await replayGateParks([{ name: store.name, store }], {
+			kvGet: async (key: string) => kv.get(key) ?? null,
+			kvSet: async (key: string, value: unknown) => {
+				kv.set(key, value);
+			},
+			log: (line: string) => lines.push(line),
+		});
+
+		expect(count).toBe(1);
+		expect((await store.getTask(id))!.state).toBe("queued");
+		expect(lines.join("\n")).not.toContain("already replayed");
+		expect(typeof kv.get("promptGateReplay")).toBe("string");
+		await store.close();
+	});
+
+	test("the stamp lands only after both projects' updates are done (OTTR-920)", async () => {
+		const a = await open();
+		const idA = await parkedCard(a);
+		const b = await open();
+		const idB = await parkedCard(b);
+		const kv = new Map<string, unknown>();
+		const atStamp: string[] = [];
+
+		const count = await replayGateParks(
+			[
+				{ name: a.name, store: a },
+				{ name: b.name, store: b },
+			],
+			{
+				kvGet: async (key: string) => kv.get(key) ?? null,
+				kvSet: async (key: string, value: unknown) => {
+					for (const [store, id] of [
+						[a, idA],
+						[b, idB],
+					] as const)
+						atStamp.push(`${store.name}:${(await store.getTask(id))!.state}`);
+					kv.set(key, value);
+				},
+				log: () => {},
+			},
+		);
+
+		expect(count).toBe(2);
+		expect(atStamp).toEqual([`${a.name}:queued`, `${b.name}:queued`]);
+		expect(typeof kv.get("promptGateReplay")).toBe("string");
+		await a.close();
+		await b.close();
+	});
+
 	test("a parked card with a queued answer stays parked", async () => {
 		const store = await open();
 		const id = await parkedCard(store, { pending: "use Postgres" });

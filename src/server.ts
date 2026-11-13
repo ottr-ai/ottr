@@ -847,7 +847,8 @@ const supervisor = createSupervisor(
 // through the app, so calling it during module init reads `app` before its
 // initialization and crashes the boot (OTTR-904 screenshot run). The
 // loop.schedule() after loop.recoverRestarted() below starts the re-queued
-// cards.
+// cards. The boot loop above opened every project store, so the pass scans
+// each project's parked cards (OTTR-920).
 await replayGateParks(projects.values(), {
 	kvGet: (key) => gstore.get(key),
 	kvSet: (key, value) => gstore.set(key, value),
