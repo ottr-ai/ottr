@@ -540,6 +540,7 @@ Card views have a one-command path too: `bun scripts/card-shot.ts --view card --
 ## Docs
 
 - [docs/how-it-works.md](docs/how-it-works.md): how Ottr works — architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
+- [docs/specs/task-lifecycle.md](docs/specs/task-lifecycle.md): current task stages, states, cancellation latch, transitions, and writer guards.
 - [docs/notifications.md](docs/notifications.md): the notification model — alert classes, per-device settings, project mutes, presence and retraction.
 - [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack — topology, updates, env settings, fleet memory.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md): run one host — what "board up" means, the board-down runbook, restore, and the incident template.
