@@ -1,11 +1,28 @@
 ---
 name: llm-to-code
-description: "Use to save tokens: analyze a workflow that an agent runs (a session, a card log, a skill, a scheduled prompt), find its intent, and move every step that does not need a model into a script. Use it when the user asks to cut LLM cost, to automate a recurring agent task, to find where an LLM is not needed, or asks if a workflow could run without an agent. Examples: scrape a page for keywords, get the text of a video, triage logs, fill a report."
+description: "Use to save tokens: analyze a workflow that an agent runs (a session, a card log, a skill, a scheduled prompt), find its intent, and move every step that does not need a model into a script. Use it when the user asks to cut LLM cost, to automate a recurring agent task, to find where an LLM is not needed, or to find which recurring workflows to move, or asks if a workflow could run without an agent. Examples: scrape a page for keywords, get the text of a video, triage logs, fill a report."
 ---
 
 # Move agent workflows into code
 
 An agent pays tokens for each step, also for steps that a script does for free and the same way each time. This skill reads a workflow, finds what it is for, and moves each step that does not need a model into code. Only real interpretation stays with a model. The result is a script that the user runs without an agent, plus a short list of the model steps that remain and the reason for each.
+
+## 0. Find the workflows
+
+Skip this step when the user's prompt names a workflow: a session, a card, a log, a skill, a prompt, or a scheduled task. Then go to step 1.
+
+Else list the workflows that run again and again.
+
+|Source|Where|
+|---|---|
+|omp sessions|`~/.omp/agent/sessions/`, prompts that recur|
+|The Ottr board|cards with the same kind or the same prompt start, with their logs|
+|Skills and scheduled prompts that run often|scheduled tasks, cron|
+|Project scripts|scripts that call a model|
+
+Rank each candidate by runs per week x cost per run. Get the cost from the profiler on one or two sample sessions, or estimate it and name the method.
+
+Show the top 3 to 5 to the user in a table: workflow, source, runs per week, cost per run, likely classes from step 2. Ask the user which one to take. Continue at step 1 with that workflow.
 
 ## 1. Get the workflow
 
@@ -24,7 +41,7 @@ For a session file, run the profiler. It shows the cost per tool and the step li
 bun <skill-dir>/scripts/profile-session.ts <session.jsonl> --steps
 ```
 
-Ask the user for the workflow only when no source exists. Two or three runs of the same workflow show which steps are fixed and which steps change.
+Ask the user for the workflow only when no source exists. Step 0 finds the candidate workflows. Two or three runs of the same workflow show which steps are fixed and which steps change.
 
 ## 2. Split the workflow into steps
 

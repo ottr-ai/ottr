@@ -114,7 +114,7 @@ omp loads `.agents/skills/` from the repo for runs in this checkout. Install a s
 
 **Optional shipped skills** — no board prompt needs them; install one into another home with the skills CLI when you want it:
 
-- `llm-to-code` ships in this repo: `.agents/skills/llm-to-code` — moves the fixed steps of an agent workflow into a script and keeps the model only where real interpretation stays, with `scripts/profile-session.ts` as a session cost profiler.
+- `llm-to-code` ships in this repo: `.agents/skills/llm-to-code` — finds the recurring agent workflows worth moving, moves the fixed steps of an agent workflow into a script and keeps the model only where real interpretation stays, with `scripts/profile-session.ts` as a session cost profiler.
 - `web-perf-audit` ships in this repo: `.agents/skills/web-perf-audit` — verifies generic performance tips against the code with file:line evidence and real size and header measurements, then writes a verdict report.
 
 ## Requirements
