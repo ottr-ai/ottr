@@ -11347,6 +11347,9 @@ export async function createApp(deps: AppDeps) {
 			task.state !== "needs_you"
 		)
 			return json({ error: "task has no open question" }, 409);
+		// A delayed save from a panel of an earlier ask round must not replace the current draft.
+		if (draft.fp !== task.asked.map((q) => q.question).join("\n"))
+			return json({ error: "draft is for an earlier question round" }, 409);
 		return json({ draft: await e.store.saveAskDraft(task.id, draft) });
 	}
 

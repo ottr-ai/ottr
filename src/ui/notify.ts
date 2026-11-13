@@ -28,9 +28,10 @@ export function loadAskDrafts(): Record<string, AskDraft> {
 		const drafts = JSON.parse(
 			localStorage.getItem(ASK_DRAFTS_KEY) ?? "{}",
 		) as Record<string, AskDraft>;
-		// Older builds wrote no `at`: such a draft loses to any stamped one.
+		// Older builds wrote no `at`: such a draft loses to any stamped one, but still beats an
+		// absent server draft (0), so the panel uploads it. 1 is the API's smallest `at`.
 		for (const d of Object.values(drafts)) {
-			if (typeof d.at !== "number") d.at = 0;
+			if (typeof d.at !== "number") d.at = 1;
 		}
 		return drafts;
 	} catch {

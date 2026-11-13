@@ -8441,7 +8441,11 @@ function AskPanel({
 		const draft = {
 			fp,
 			answers: next,
-			at: Math.max(Date.now(), shownAt.current + 1),
+			// Capped at the API's largest accepted `at`; an equal `at` still saves.
+			at: Math.min(
+				Number.MAX_SAFE_INTEGER,
+				Math.max(Date.now(), shownAt.current + 1),
+			),
 		};
 		shownAt.current = draft.at;
 		setAnswers(next);

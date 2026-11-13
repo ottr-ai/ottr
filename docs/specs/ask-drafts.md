@@ -14,10 +14,11 @@ An ask with two or more questions collects answers before one reply sends them a
 ## API
 
 - `GET /api/projects/:project/tasks/:id/ask-draft` returns `200 { draft: { fp, answers, at } | null }`.
-- `POST /api/projects/:project/tasks/:id/ask-draft` with body `{ fp: string, answers: { [index]: string }, at: number }` upserts the draft and returns `200 { draft }` with the stored row. A body with an `at` older than the stored `at` changes nothing; the response then carries the stored (newer) draft.
+- `POST /api/projects/:project/tasks/:id/ask-draft` with body `{ fp: string, answers: { [index]: string }, at: number }` upserts the draft and returns `200 { draft }` with the stored row. When the stored row has the same `fp` and a larger `at`, the request changes nothing. The response then carries the stored (newer) draft. A stored row with a different `fp` comes from an earlier ask round, and the request always replaces it.
 - Errors:
   - unknown project or task: 404, bad task id: 400 (same as the other task routes, `resolveTask`).
   - the task has no outstanding ask (`asked === null` or state is not `needs_you`), or the task is cancelled: 409.
+  - the body `fp` is not the fingerprint of the task's current ask (a delayed save from an earlier round): 409.
   - bad body: 400. `fp` is a string of at most 20000 characters. `answers` is an object of at most 50 entries. Each key is a non-negative integer index in decimal form. Each value is a string of at most 20000 characters. `at` is a positive safe integer.
 - `POST /api/projects/:project/tasks/:id/reply` deletes the draft row after a 2xx response.
 
@@ -34,7 +35,9 @@ CREATE TABLE IF NOT EXISTS ask_drafts (
 );
 ```
 
-`answers` holds the JSON object. The upsert keeps the row with the larger `at`.
+`answers` holds the JSON object. Within one `fp`, the upsert keeps the row with the larger `at`.
+
+The client caps a new `at` at `Number.MAX_SAFE_INTEGER`. A local draft from an older build has no `at`, and the client reads it as `at: 1`. It then wins over an absent server draft and gets uploaded.
 
 ## Acceptance checks
 

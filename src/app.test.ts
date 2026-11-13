@@ -1815,6 +1815,28 @@ describe("task routes", () => {
 		expect(await draftOf(stale)).toEqual(draft);
 	});
 
+	test("ask-draft POST refuses an earlier round's fingerprint, and a new round replaces a future-stamped old row", async () => {
+		const t = await askedTask("draft rounds");
+		const url = `/api/projects/p1/tasks/${t.id}/ask-draft`;
+		const current = { fp: "A?\nB?", answers: { "0": "yes" }, at: 10 };
+		expect((await post(url, current)).status).toBe(200);
+		// A delayed save from an old panel: rejected, the current draft stays.
+		const old = await post(url, { fp: "Old?", answers: { "0": "x" }, at: 11 });
+		expect(old.status).toBe(409);
+		expect(await store.getAskDraft(t.id)).toEqual(current);
+		// A stale row from an earlier round, stamped in the future (fast clock).
+		await store.saveAskDraft(t.id, {
+			fp: "Old?",
+			answers: { "0": "x" },
+			at: Date.now() + 86_400_000,
+		});
+		const fresh = { fp: "A?\nB?", answers: { "1": "no" }, at: Date.now() };
+		const res = await post(url, fresh);
+		expect(res.status).toBe(200);
+		expect(await draftOf(res)).toEqual(fresh);
+		expect(await store.getAskDraft(t.id)).toEqual(fresh);
+	});
+
 	test("ask-draft POST is 409 without an outstanding ask", async () => {
 		const plain = await store.createTask("no ask");
 		await store.updateTask(plain.id, { state: "needs_you", needsReason: "?" });

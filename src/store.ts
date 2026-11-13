@@ -2918,7 +2918,7 @@ export class ProjectStore {
 			await this.db.run(
 				`INSERT INTO ask_drafts (task_id, fp, answers, at) VALUES (?, ?, ?, ?)
 			 ON CONFLICT(task_id) DO UPDATE SET fp = excluded.fp, answers = excluded.answers, at = excluded.at
-			 WHERE excluded.at >= ask_drafts.at`,
+			 WHERE excluded.at >= ask_drafts.at OR excluded.fp <> ask_drafts.fp`,
 				[taskId, draft.fp, JSON.stringify(draft.answers), draft.at],
 			);
 			const stored = await this.readAskDraft(taskId);

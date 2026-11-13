@@ -7338,6 +7338,47 @@ describe("Drawer ask drafts on the server", () => {
 			m.restore();
 		}
 	});
+
+	test("a local draft from an older build syncs when the server has none", async () => {
+		window.localStorage.clear();
+		window.localStorage.setItem(
+			"ottr.ask.drafts",
+			JSON.stringify({ t1: { fp, answers: { 1: "EU" } } }),
+		);
+		const m = await mount(null);
+		try {
+			expect(m.chosen()).toEqual(["EU"]);
+			expect(m.draftPosts().map((c) => JSON.parse(c.body))).toEqual([
+				{ fp, answers: { 1: "EU" }, at: 1 },
+			]);
+		} finally {
+			await m.unmount();
+			m.restore();
+		}
+	});
+
+	test("a pick after a draft at the largest safe `at` stays within the API's range", async () => {
+		window.localStorage.clear();
+		const m = await mount({
+			fp,
+			answers: { 0: "SQLite" },
+			at: Number.MAX_SAFE_INTEGER,
+		});
+		try {
+			const eu = m.input("EU");
+			await act(async () => {
+				propOf(eu, "onChange")({ target: eu, currentTarget: eu });
+			});
+			await settle(600);
+			const posts = m.draftPosts().map((c) => JSON.parse(c.body));
+			expect(posts).toEqual([
+				{ fp, answers: { 0: "SQLite", 1: "EU" }, at: Number.MAX_SAFE_INTEGER },
+			]);
+		} finally {
+			await m.unmount();
+			m.restore();
+		}
+	});
 });
 
 describe("OrphanNotice", () => {

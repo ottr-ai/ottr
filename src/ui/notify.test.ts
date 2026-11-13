@@ -45,12 +45,12 @@ test("ask drafts round-trip per task and drop on mismatching fingerprint", () =>
 	expect(loadAskDrafts().t1?.fp === "a\nb").toBe(false);
 });
 
-test("an ask draft from an older build without `at` reads as at 0", () => {
+test("an ask draft from an older build without `at` reads as at 1", () => {
 	localStorage.setItem(
 		ASK_DRAFTS_KEY,
 		JSON.stringify({ old: { fp: "q", answers: { 0: "a" } } }),
 	);
-	expect(loadAskDrafts().old).toEqual({ fp: "q", answers: { 0: "a" }, at: 0 });
+	expect(loadAskDrafts().old).toEqual({ fp: "q", answers: { 0: "a" }, at: 1 });
 });
 
 describe("newerAskDraft", () => {
