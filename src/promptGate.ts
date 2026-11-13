@@ -475,7 +475,6 @@ export function replayGateParks(
 		kvGet(key: string): unknown;
 		kvSet(key: string, value: unknown): void;
 		log(line: string): void;
-		schedule(): void;
 	},
 ): number {
 	if (o.kvGet("promptGateReplay") !== null) {
@@ -510,6 +509,5 @@ export function replayGateParks(
 	}
 	o.kvSet("promptGateReplay", new Date().toISOString());
 	o.log(`re-queued ${count}`);
-	if (count > 0) o.schedule();
 	return count;
 }

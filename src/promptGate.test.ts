@@ -658,7 +658,6 @@ describe("replayGateParks", () => {
 		return t.id;
 	};
 	const harness = () => {
-		let scheduled = 0;
 		const lines: string[] = [];
 		const kv = new Map<string, unknown>();
 		return {
@@ -668,13 +667,9 @@ describe("replayGateParks", () => {
 					kv.set(key, value);
 				},
 				log: (line: string) => lines.push(line),
-				schedule: () => {
-					scheduled += 1;
-				},
 			},
 			kv,
 			lines,
-			scheduled: () => scheduled,
 		};
 	};
 	const open = (): ProjectStore =>
@@ -713,7 +708,6 @@ describe("replayGateParks", () => {
 			});
 		}
 		expect(typeof h.kv.get("promptGateReplay")).toBe("string");
-		expect(h.scheduled()).toBe(1);
 		expect(h.lines.join("\n")).toContain("re-queued 2");
 		a.close();
 		b.close();
@@ -731,7 +725,6 @@ describe("replayGateParks", () => {
 		expect(after.state).toBe("needs_you");
 		expect(after.pendingPrompt).toBe("use Postgres");
 		expect(after.gate?.parked).toBe(true);
-		expect(h.scheduled()).toBe(0);
 		// The stamp lands even on an empty pass: the replay runs once, ever.
 		expect(typeof h.kv.get("promptGateReplay")).toBe("string");
 		store.close();
@@ -789,7 +782,6 @@ describe("replayGateParks", () => {
 		const after = store.getTask(id)!;
 		expect(after.state).toBe("needs_you");
 		expect(after.gate?.parked).toBe(true);
-		expect(h.scheduled()).toBe(1);
 		store.close();
 	});
 });

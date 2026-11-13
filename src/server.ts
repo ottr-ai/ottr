@@ -843,12 +843,15 @@ const supervisor = createSupervisor(
 
 // OTTR-904: the old gate parks replay once per boot stamp, so the cards the
 // old rule parked get the new park rule (defaults ride, only null defaults
-// block) on their next turn start.
+// block) on their next turn start. No schedule here: loop.schedule publishes
+// through the app, so calling it during module init reads `app` before its
+// initialization and crashes the boot (OTTR-904 screenshot run). The
+// loop.schedule() after loop.recoverRestarted() below starts the re-queued
+// cards.
 replayGateParks(projects.values(), {
 	kvGet: (key) => gstore.get(key),
 	kvSet: (key, value) => gstore.set(key, value),
 	log: (line) => console.log(`prompt gate replay: ${line}`),
-	schedule: loop.schedule,
 });
 
 /** Every pid a live turn claim or a store's runningPids() row holds; orphan checks subtract these. */
