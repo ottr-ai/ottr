@@ -41,7 +41,8 @@ beforeAll(() => {
 afterAll(async () => {
 	for (const store of stores) await store.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-});
+	// The accumulated stores can take over the 5 s default hook timeout to close.
+}, 30000);
 
 /** The npm and GitHub side: releases by version, each with its publish time and its notes (null = 404). */
 function fakeNet() {

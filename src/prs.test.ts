@@ -64,7 +64,9 @@ afterEach(async () => {
 
 afterAll(() => {
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-});
+	// Sixty-plus stores close at about 100 ms each, so the 5 s default kills this
+	// hook; measured 6-7 s on this project's suite.
+}, 30000);
 
 const sha = (c: string) => c.repeat(40);
 const pr = (

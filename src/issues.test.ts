@@ -41,7 +41,8 @@ beforeAll(() => {
 afterAll(async () => {
 	for (const store of stores) await store.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-});
+	// The accumulated stores can take over the 5 s default hook timeout to close.
+}, 30000);
 
 /** The watch start mark every setup uses; issues are dated relative to it. */
 const SINCE = Date.parse("2026-01-01T00:00:00Z");

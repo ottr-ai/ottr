@@ -46,7 +46,8 @@ beforeAll(() => {
 afterAll(async () => {
 	for (const store of stores) await store.close();
 	rmSync(root, { recursive: true, force: true });
-});
+	// The accumulated stores take over the 5 s default hook timeout to close.
+}, 30000);
 
 function run(allArgs: string[], cwd: string, env?: Record<string, string>) {
 	// Fixtures pass the repo dir as the last arg and as cwd; git only needs one.
