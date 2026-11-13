@@ -10194,6 +10194,12 @@ function DrawerWorkCheck(p: {
 											? "Blocked"
 											: "Error"}
 									{" · "}
+									{run.role !== undefined && (
+										<>
+											{run.role}
+											{" · "}
+										</>
+									)}
 									{run.model === null
 										? "default model"
 										: displayModel(catalog?.models ?? [], run.model)}

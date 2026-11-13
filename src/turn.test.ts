@@ -13446,6 +13446,7 @@ describe("work card check", () => {
 		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
+		expect(after.workCheckLog[0]!.role).toBe("adversary");
 		expect(after.workCheckLog[0]!.warn).toBeUndefined();
 	});
 
@@ -14187,6 +14188,7 @@ describe("work card check", () => {
 		expect(after.workCheckLog[0]!.outcome).toBe("error");
 		// No adversary role: the record names the default role the check fell back to.
 		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
+		expect(after.workCheckLog[0]!.role).toBe("adversary");
 		expect(after.workCheckLog[0]!.error).toContain(
 			"the provider dropped the connection",
 		);
@@ -14553,6 +14555,10 @@ describe("work card check", () => {
 		await loop.runTurn(store.name, task.id);
 
 		expect(record.runs[1]!.model).toBe("openai-codex/gpt-6.1-sol:max");
+		// The stamped record names the role the pick logic chose (critic for an
+		// anthropic work run), not only the selector it launched with.
+		const after = (await store.getTask(task.id))!;
+		expect(after.workCheckLog[0]!.role).toBe("critic");
 	});
 
 	test("a check that runs on the work model itself warns on the card", async () => {

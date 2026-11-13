@@ -9704,6 +9704,7 @@ export function createTurnLoop(
 					cur,
 					head,
 					roles.checkModel,
+					roles.checkRole,
 					open,
 					priorLog,
 					roles.warn,
@@ -9745,6 +9746,7 @@ export function createTurnLoop(
 				priorLog,
 				roles.warn,
 				roles.checkModel,
+				roles.checkRole,
 				checkStart,
 				checkMs,
 				checkFailed,
@@ -9820,7 +9822,7 @@ export function createTurnLoop(
 	 * warning. */
 	function workCheckRoles(st: TurnSettle): {
 		selector: string | undefined;
-		checkRole: string;
+		checkRole: "critic" | "adversary";
 		checkModel: string | null;
 		warn: { warn?: string };
 	} {
@@ -9868,6 +9870,7 @@ export function createTurnLoop(
 		cur: Task,
 		head: string | null,
 		checkModel: string | null,
+		checkRole: "critic" | "adversary",
 		open: WorkCheckBlocker[],
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
@@ -9942,6 +9945,7 @@ export function createTurnLoop(
 					// The resolved model, not just the role selector: with the role
 					// missing, the card must name the default role it fell back to.
 					model: checkModel,
+					role: checkRole,
 					outcome: split.blockers.length === 0 ? "pass" : "blockers",
 					blockers: split.blockers,
 					notes: split.notes,
@@ -9982,6 +9986,7 @@ export function createTurnLoop(
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
 		checkModel: string | null,
+		checkRole: "critic" | "adversary",
 		checkStart: number,
 		checkMs: number,
 		checkFailed: string,
@@ -10027,6 +10032,7 @@ export function createTurnLoop(
 						{
 							at: checkStart,
 							model: checkModel,
+							role: checkRole,
 							outcome: "error",
 							blockers: [],
 							notes: [],

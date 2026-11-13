@@ -4349,6 +4349,36 @@ describe("ModelRolesSection missing check roles", () => {
 			await unmount();
 		}
 	});
+
+	test("the missing-role warning shows only while a check role is unset", async () => {
+		// Both check roles set: no warning.
+		resetCatalogCache();
+		const full = await mountRoles(
+			rolesFetch({
+				critic: "anthropic/claude-opus-5-5",
+				adversary: "zai/glm-5.3-flash",
+			}),
+		);
+		try {
+			await act(async () => {});
+			expect(full.container.querySelector(".role-warn")).toBeNull();
+		} finally {
+			await full.unmount();
+		}
+		// critic unset while adversary is set: the warning names only critic.
+		resetCatalogCache();
+		const half = await mountRoles(
+			rolesFetch({ adversary: "zai/glm-5.3-flash" }),
+		);
+		try {
+			await act(async () => {});
+			expect(half.container.querySelector(".role-warn b")?.textContent).toBe(
+				"No critic role",
+			);
+		} finally {
+			await half.unmount();
+		}
+	});
 });
 
 describe("ModelRolesSection model picker", () => {

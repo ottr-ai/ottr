@@ -1903,6 +1903,7 @@ describe("work check log", () => {
 				{
 					at: 1000,
 					model: "zai/glm-5.3-flash:medium",
+					role: "critic",
 					outcome: "pass",
 					blockers: [],
 					notes: [],
@@ -1912,6 +1913,8 @@ describe("work check log", () => {
 				{
 					at: 2000,
 					model: "anthropic/claude-opus-5-5",
+					// A value the union never names: the parse whitelist drops it.
+					role: "plan" as unknown as "critic" | "adversary",
 					outcome: "blockers",
 					blockers: [{ finding: "off by one", quote: "i <= n" }],
 					notes: ["a note"],
@@ -1927,6 +1930,10 @@ describe("work check log", () => {
 			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
 		);
 		expect(log[1]?.warn).toBeUndefined();
+		// The role rides the same whitelist: a picked role survives, a bogus
+		// value lands as undefined.
+		expect(log[0]?.role).toBe("critic");
+		expect(log[1]?.role).toBeUndefined();
 		await reopened.close();
 	});
 });

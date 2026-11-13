@@ -763,6 +763,7 @@ function parseWorkCheckRun(r: unknown): WorkCheckRun | null {
 	return {
 		at: e.at,
 		model: typeof e.model === "string" ? e.model : null,
+		role: e.role === "critic" || e.role === "adversary" ? e.role : undefined,
 		outcome: e.outcome,
 		blockers,
 		notes: e.notes.filter((n): n is string => typeof n === "string"),

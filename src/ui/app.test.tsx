@@ -4807,6 +4807,68 @@ describe("Drawer research report button", () => {
 		await unmount();
 	});
 
+	test("the work check rows name the role each check ran with", async () => {
+		// OTTR-916: the row shows the picked check role before the model; a record
+		// written before the field existed renders the row without a role.
+		const at = 1_700_000_000_000;
+		detailBody.workCheckLog = [
+			{
+				at,
+				model: "openai/gpt-6",
+				role: "adversary",
+				outcome: "pass",
+				blockers: [],
+				notes: [],
+				durationMs: 41_000,
+			},
+			{
+				at,
+				model: null,
+				role: "critic",
+				outcome: "error",
+				blockers: [],
+				notes: [],
+				durationMs: 0,
+				error: "lost",
+			},
+			{
+				at,
+				model: "zai/glm-5.3-flash",
+				outcome: "pass",
+				blockers: [],
+				notes: [],
+				durationMs: 9_000,
+			},
+		] as unknown as typeof detailBody.workCheckLog;
+		const row = cardFixture({
+			id: "R-1",
+			kind: "work",
+			research: true,
+			stage: "done",
+			state: "idle",
+			...rowFields,
+		});
+		const { container, unmount } = await mountDrawer(row);
+		try {
+			const rows = container.querySelectorAll(".wc-run");
+			expect(rows.length).toBe(3);
+			const texts = Array.from(rows, (p) => p.textContent ?? "");
+			const [adversary, critic, legacy] = texts;
+			expect(adversary).toContain("adversary");
+			expect(adversary).toContain("gpt-6");
+			expect(critic).toContain("critic");
+			expect(critic).toContain("default model");
+			expect(legacy).toContain("glm-5.3-flash");
+			expect(legacy).not.toContain("critic");
+			expect(legacy).not.toContain("adversary");
+		} finally {
+			await act(async () => {
+				detailBody.workCheckLog = [];
+			});
+			await unmount();
+		}
+	});
+
 	test("Work steps opens on a live ticket and starts collapsed on a done one", async () => {
 		const live = cardFixture({
 			id: "R-1",
