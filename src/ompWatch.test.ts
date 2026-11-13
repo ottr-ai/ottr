@@ -443,6 +443,16 @@ describe("bumpTarget", () => {
 		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.2.0");
 	});
 
+	test("a deprecated walked release is never the target", () => {
+		const releases = [
+			rel("1.2.0", 10),
+			{ ...rel("1.2.1", 9), deprecated: true },
+			rel("1.2.2", 8),
+		];
+		const verdicts = { "1.2.0": pass, "1.2.1": pass };
+		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.2.0");
+	});
+
 	test("an older settled line is the target while the newest line waits", () => {
 		const releases = [rel("1.1.9", 30), rel("1.2.0", 8), rel("1.2.5", 2)];
 		const verdicts = { "1.1.9": pass, "1.2.0": pass, "1.2.5": pass };

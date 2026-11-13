@@ -90,14 +90,21 @@ function git(...args: string[]): {
 	};
 }
 
-/** name -> installed version for the registry packages of one lock text;
- * non-registry entries (workspace:, link:, git:, file:, tarballs) never match. */
-function registryEntries(lockText: string): Map<string, string> {
-	const entries = new Map<string, string>();
+type LockEntry = { key: string; name: string; version: string };
+
+/** The registry entries of one lock text, keyed by their packages map key,
+ * never by the resolved name: a nested key like d3-dsv/commander resolves a
+ * package named commander beside the top-level commander, and the two must
+ * not collapse into one slot. Non-registry entries (workspace:, link:,
+ * git:, file:, tarballs) never match. */
+function registryEntries(lockText: string): LockEntry[] {
+	const entries: LockEntry[] = [];
 	const parsed = parseJsonc(lockText) as { packages?: unknown } | null;
 	const packages = parsed?.packages;
 	if (packages === null || typeof packages !== "object") return entries;
-	for (const tuple of Object.values(packages as Record<string, unknown>)) {
+	for (const [key, tuple] of Object.entries(
+		packages as Record<string, unknown>,
+	)) {
 		if (!Array.isArray(tuple)) continue;
 		const entry: unknown = tuple[0];
 		if (typeof entry !== "string") continue;
@@ -106,7 +113,7 @@ function registryEntries(lockText: string): Map<string, string> {
 		const name = match[1];
 		const version = match[2];
 		if (name === undefined || version === undefined) continue;
-		entries.set(name, version);
+		entries.push({ key, name, version });
 	}
 	return entries;
 }
@@ -133,21 +140,46 @@ function directNames(): Set<string> {
 
 type Changed = { name: string; version: string; direct: boolean };
 
-/** Changed registry packages, ascending by name: added or version-differing
- * against origin/main; installed prereleases are skipped. */
+/** Ascending by name, then version, so identical pairs sit adjacent. */
+function ascending(a: Changed, b: Changed): number {
+	if (a.name !== b.name) return a.name < b.name ? -1 : 1;
+	if (a.version !== b.version) return a.version < b.version ? -1 : 1;
+	return 0;
+}
+
+/** Changed registry packages, ascending by name: a lock key that is added,
+ * or whose resolved name or version differs, against origin/main. Installed
+ * prereleases are skipped; identical changed (name, version) pairs scan
+ * once. */
 function changedPackages(): Changed[] {
-	const base = registryEntries(baseLockText());
+	const base = new Map(
+		registryEntries(baseLockText()).map((entry) => [entry.key, entry]),
+	);
 	const direct = directNames();
 	const changed: Changed[] = [];
-	for (const [name, version] of registryEntries(
-		readFileSync("bun.lock", "utf8"),
-	)) {
-		if (base.get(name) === version) continue;
-		if (!STABLE.test(version)) continue;
-		changed.push({ name, version, direct: direct.has(name) });
+	for (const entry of registryEntries(readFileSync("bun.lock", "utf8"))) {
+		const before = base.get(entry.key);
+		if (
+			before !== undefined &&
+			before.name === entry.name &&
+			before.version === entry.version
+		)
+			continue;
+		if (!STABLE.test(entry.version)) continue;
+		changed.push({
+			name: entry.name,
+			version: entry.version,
+			direct: direct.has(entry.name),
+		});
 	}
-	changed.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-	return changed;
+	changed.sort(ascending);
+	const scanned = new Set<string>();
+	return changed.filter((pkg) => {
+		const pair = `${pkg.name}@${pkg.version}`;
+		if (scanned.has(pair)) return false;
+		scanned.add(pair);
+		return true;
+	});
 }
 
 type Packument = {

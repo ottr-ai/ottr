@@ -40,8 +40,22 @@ const PACKAGE_JSON = `${JSON.stringify(
 )}\n`;
 
 /** Real bun.lock tuple shapes with the version edited per case: mermaid is
- * a direct dependency, @babel/code-frame is transitive only. */
-function lockfile(mermaidVersion: string, babelVersion: string): string {
+ * a direct dependency, @babel/code-frame is transitive only, and the three
+ * commander entries copy the real lock in real order (a nested lock key like
+ * d3-dsv/commander resolves package "commander" beside the top-level one). */
+type FixtureLock = {
+	mermaid: string;
+	babel: string;
+	commander?: { top: string; nested: string; katex: string };
+};
+
+const COMMANDER_DEFAULT = { top: "14.0.3", nested: "7.2.0", katex: "15.0.0" };
+
+function lockfile(
+	mermaidVersion: string,
+	babelVersion: string,
+	commander: { top: string; nested: string; katex: string } = COMMANDER_DEFAULT,
+): string {
 	return JSON.stringify({
 		lockfileVersion: 1,
 		workspaces: {
@@ -61,6 +75,24 @@ function lockfile(mermaidVersion: string, babelVersion: string): string {
 					},
 				},
 				"sha512-uMHhvmDmwFiLuiozaoRYTZHqMFuu3fem/X9JY78lohAuLoh8LSGGC8JqUzo2cVuBsBxkjMZNk56CE7ock8Xxkw==",
+			],
+			commander: [
+				`commander@${commander.top}`,
+				"",
+				{},
+				"sha512-H+y0Jo/T1RZ9qPP4Eh1pkcQcLRglraJaSLoyOtHxu6AapkjWVCy2Sit1QQ4x3Dng8qDlSsZEet7g5Pq06MvTgw==",
+			],
+			"d3-dsv/commander": [
+				`commander@${commander.nested}`,
+				"",
+				{},
+				"sha512-QrWXB+ZQSVPmIWIhtEO9H+gwHaMGYiF5ChvoJ+K9ZGHG/sVsa6yiesAD1GC/x46sET00Xlwo1u49RVVVzvcSkw==",
+			],
+			"katex/commander": [
+				`commander@${commander.katex}`,
+				"",
+				{},
+				"sha512-z67u4ZhzCL/Tydu1lJARtEZYWbWaN7oYLHbsuzocr6y4N6WZAagG3RQ4FW61V1/0+jImpj293XfrcYnd1qxtPg==",
 			],
 			mermaid: [
 				`mermaid@${mermaidVersion}`,
@@ -86,15 +118,15 @@ let fixtures = 0;
 
 /** Scratch git repo: base lock committed and pushed to origin/main, then the
  * worktree lock rewritten (uncommitted) so the diff is non-empty. */
-function fixture(
-	base: { mermaid: string; babel: string },
-	work: { mermaid: string; babel: string },
-): string {
+function fixture(base: FixtureLock, work: FixtureLock): string {
 	const dir = join(root, `case-${fixtures++}`);
 	const repo = join(dir, "repo");
 	mkdirSync(repo, { recursive: true });
 	writeFileSync(join(repo, "package.json"), PACKAGE_JSON);
-	writeFileSync(join(repo, "bun.lock"), lockfile(base.mermaid, base.babel));
+	writeFileSync(
+		join(repo, "bun.lock"),
+		lockfile(base.mermaid, base.babel, base.commander ?? COMMANDER_DEFAULT),
+	);
 	must(repo, "init", "-b", "main");
 	must(repo, "add", ".");
 	must(
@@ -110,7 +142,10 @@ function fixture(
 	must(repo, "init", "--bare", join(dir, "origin.git"));
 	must(repo, "remote", "add", "origin", join(dir, "origin.git"));
 	must(repo, "push", "origin", "main");
-	writeFileSync(join(repo, "bun.lock"), lockfile(work.mermaid, work.babel));
+	writeFileSync(
+		join(repo, "bun.lock"),
+		lockfile(work.mermaid, work.babel, work.commander ?? COMMANDER_DEFAULT),
+	);
 	return repo;
 }
 
@@ -247,6 +282,45 @@ describe("check-release-lines (live spawns)", () => {
 					line.startsWith("release line check failed: mermaid: "),
 				),
 			).toBe(true);
+		} finally {
+			reg.stop();
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	test("changed nested lock key scans beside an unchanged plain name", async () => {
+		// Spec check 17: the real lock holds commander@14.0.3 top-level,
+		// commander@7.2.0 under d3-dsv/commander and commander@15.0.0 under
+		// katex/commander. Only the nested entry changes here, so keying by
+		// resolved name (last wins: katex's unchanged 15.0.0) must not hide it.
+		const repo = fixture(
+			{
+				mermaid: "12.2.0",
+				babel: "8.0.6",
+				commander: { top: "14.0.3", nested: "7.2.0", katex: "15.0.0" },
+			},
+			{
+				mermaid: "12.2.0",
+				babel: "8.0.6",
+				commander: { top: "14.0.3", nested: "7.2.1", katex: "15.0.0" },
+			},
+		);
+		const reg = listener({
+			commander: packument([
+				["7.2.1", 2],
+				["7.2.2", 2],
+			]),
+		});
+		try {
+			const { stderr, code } = await runScript(repo, reg.base);
+			expect(code).toBe(0);
+			const lines = stderr.split("\n").filter((line) => line !== "");
+			expect(lines).toContain(
+				"warning: release line not settled: commander 7.2.1, 7.2.2 is 2 days old (transitive)",
+			);
+			expect(reg.requests).toEqual([
+				{ method: "GET", url: `${reg.base}/commander` },
+			]);
 		} finally {
 			reg.stop();
 			rmSync(repo, { recursive: true, force: true });

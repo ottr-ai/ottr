@@ -251,6 +251,8 @@ export function bumpTarget(
 	if (pick === null) return null;
 	let target: string | null = null;
 	for (const r of walked) {
+		// A deprecated release never counts, so it is never the target (check 16).
+		if (r.deprecated === true) continue;
 		if (now - r.publishedAt < OMP_WATCH_GATES.ageDays * DAY_MS) continue;
 		if (compareVersions(r.version, pick) > 0) continue;
 		if (target === null || compareVersions(r.version, target) > 0)

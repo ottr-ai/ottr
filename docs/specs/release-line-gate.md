@@ -110,7 +110,8 @@ existing imports keep working.
 - `bumpTarget` keeps its verdict walk unchanged (stop at the first version without a
   verdict or with a fail whose card is not cleared). It calls `settledLineTarget` once
   with the full release list and `maxVersion` unset; the target is the highest walked
-  release that is aged and `<= pick`. No pick, no target.
+  release that is aged, not deprecated, and `<= pick` (a deprecated release never
+  counts, so it is never the target). No pick, no target.
 - `parsePackument` keeps `time` entries only for versions the packument still lists in its
   `versions` map (removed versions drop out) and carries `deprecated: typeof
   versions[v]?.deprecated === "string"` on each release. The `OmpRelease` type gains
@@ -133,7 +134,11 @@ Scan:
   `git show origin/main:bun.lock` (a base without the file means an empty base map).
   An entry is a registry package when its first tuple element matches
   `^(.+)@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$`; everything else (`workspace:`, `link:`,
-  `git:`, `file:`, tarballs) is skipped. Changed = added, or the version string differs.
+  `git:`, `file:`, tarballs) is skipped. Entries are keyed by their `packages` map key,
+  never by the resolved package name: a nested lock key like `d3-dsv/commander` can
+  resolve a package named `commander` beside the top-level `commander`, and the two
+  must not collapse into one slot. Changed = a key that is added, or whose resolved
+  name or version differs; identical changed `(name, version)` pairs scan once.
 - Direct dependency = the name is a key of `dependencies`, `devDependencies` or
   `optionalDependencies` in `./package.json`. Everything else is transitive.
 - Skip changed packages whose installed version is not stable.
@@ -205,6 +210,13 @@ local registry listener, fixture lock derived from the real `bun.lock`):
 14. No lock change: exit 0 and the listener request count stays 0 (registry base seeded to
     `http://localhost.:<port>`).
 15. The request test asserts method `GET` and the exact encoded path, not a substring.
+16. A deprecated walked release is never the target: v1.2.0 aged 10 days passed, v1.2.1
+    aged 9 days passed and deprecated, v1.2.2 aged 8 days unreviewed: the target is
+    v1.2.0.
+17. A changed nested lock key scans even when a top-level key of the same package name
+    is unchanged: the fixture derives the real bun.lock's `d3-dsv/commander` nested
+    entry beside a top-level `commander`; changing only the nested entry's version
+    produces the registry call and the report for that nested version.
 
 Gates: `bun run check` and `bun test` exit 0.
 
