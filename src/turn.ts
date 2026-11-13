@@ -6387,7 +6387,7 @@ export function createTurnLoop(
 		)
 			return;
 		try {
-			const moved = await ops.quarantineUntracked(
+			const { moved, refused } = await ops.quarantineUntracked(
 				st.loc.wt,
 				join(st.store.tasksDir, "quarantine", st.id),
 				st.store.dataRoot,
@@ -6397,6 +6397,14 @@ export function createTurnLoop(
 					st.store,
 					st.id,
 					`quarantined ${moved.length} untracked file(s) to .tasks/quarantine/${st.id}: ${moved.slice(0, 20).join(", ")}${moved.length > 20 ? " …" : ""}`,
+				);
+			// OTTR-890: an entry whose name the confine walk refuses stays in the worktree;
+			// name it so the agent can remove it (once per settle, never per tick).
+			if (refused.length > 0)
+				await appendLog(
+					st.store,
+					st.id,
+					`quarantine kept ${refused.length} untracked file(s) git refuses to move: ${refused.join(", ")} — remove them from the worktree`,
 				);
 		} catch (err) {
 			await appendLog(st.store, st.id, `quarantine failed: ${errmsg(err)}`);

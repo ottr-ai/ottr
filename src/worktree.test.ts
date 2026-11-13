@@ -3127,7 +3127,7 @@ describe("quarantineUntracked", () => {
 		mkdirSync(join(main, "sub", "dir"), { recursive: true });
 		writeFileSync(join(main, "sub", "dir", "x.txt"), "x");
 
-		const moved = await quarantineUntracked(main, q, main);
+		const { moved } = await quarantineUntracked(main, q, main);
 		expect(moved.sort()).toEqual([
 			".smoke-22.png",
 			"file0",
@@ -3144,6 +3144,28 @@ describe("quarantineUntracked", () => {
 		expect(await statusFiles(main)).toEqual([]);
 	}, 60_000);
 
+	test.skipIf(process.platform !== "linux")(
+		"OTTR-890: keeps an entry whose name holds a backslash and moves the rest",
+		async () => {
+			const main = await seeded();
+			const q = join(main, ".tasks", "quarantine", "t9");
+			writeFileSync(join(main, "scratch.log"), "scratch");
+			const bad =
+				"C:\\Users\\domin\\AppData\\Local\\Temp\\alate-152-win32-sim.mjs";
+			writeFileSync(join(main, bad), "windows path");
+			const { moved, refused } = await quarantineUntracked(main, q, main);
+			expect(moved).toEqual(["scratch.log"]);
+			// Verbatim: the name must match the file on disk, so it can be removed.
+			expect(refused).toEqual([
+				"C:\\Users\\domin\\AppData\\Local\\Temp\\alate-152-win32-sim.mjs",
+			]);
+			expect(readFileSync(join(q, "scratch.log"), "utf8")).toBe("scratch");
+			expect(existsSync(join(main, bad))).toBe(true);
+			expect(existsSync(join(q, bad))).toBe(false);
+		},
+		60_000,
+	);
+
 	test("leaves gitignored files in place", async () => {
 		const main = await seeded();
 		writeFileSync(join(main, ".gitignore"), "ignored.log\n");
@@ -3151,7 +3173,10 @@ describe("quarantineUntracked", () => {
 		await must(main, "add", ".gitignore");
 		await must(main, "commit", "-q", "-m", "gitignore");
 		const q = join(main, ".tasks", "quarantine", "t2");
-		expect(await quarantineUntracked(main, q, main)).toEqual([]);
+		expect(await quarantineUntracked(main, q, main)).toEqual({
+			moved: [],
+			refused: [],
+		});
 		expect(existsSync(join(main, "ignored.log"))).toBe(true);
 		expect(existsSync(q)).toBe(false);
 	}, 60_000);
@@ -3160,7 +3185,10 @@ describe("quarantineUntracked", () => {
 		const main = await seeded();
 		writeFileSync(join(main, "tracked.txt"), "dirty");
 		const q = join(main, ".tasks", "quarantine", "t3");
-		expect(await quarantineUntracked(main, q, main)).toEqual([]);
+		expect(await quarantineUntracked(main, q, main)).toEqual({
+			moved: [],
+			refused: [],
+		});
 		expect(readFileSync(join(main, "tracked.txt"), "utf8")).toBe("dirty");
 		expect(await statusFiles(main)).toEqual(["tracked.txt"]);
 	}, 60_000);
@@ -3168,7 +3196,10 @@ describe("quarantineUntracked", () => {
 	test("clean worktree: [] and no quarantine dir created", async () => {
 		const main = await seeded();
 		const q = join(main, ".tasks", "quarantine", "t4");
-		expect(await quarantineUntracked(main, q, main)).toEqual([]);
+		expect(await quarantineUntracked(main, q, main)).toEqual({
+			moved: [],
+			refused: [],
+		});
 		expect(existsSync(q)).toBe(false);
 	}, 60_000);
 
@@ -3212,7 +3243,10 @@ describe("quarantineUntracked", () => {
 			writeFileSync(outside, "keep");
 			symlinkSync(outside, join(main, "link"));
 			const q = join(main, ".tasks", "quarantine", "t7");
-			expect(await quarantineUntracked(main, q, main)).toEqual(["link"]);
+			expect(await quarantineUntracked(main, q, main)).toEqual({
+				moved: ["link"],
+				refused: [],
+			});
 			expect(lstatSync(join(q, "link")).isSymbolicLink()).toBe(true);
 			expect(readlinkSync(join(q, "link"))).toBe(outside);
 			expect(readFileSync(outside, "utf8")).toBe("keep");
@@ -3234,7 +3268,7 @@ describe("quarantineUntracked", () => {
 				mkdirSync(join(main, "sub"));
 				writeFileSync(join(main, "sub", "b.txt"), "b");
 				const q = join(root, "quarantine", "t8");
-				const moved = await quarantineUntracked(main, q, root);
+				const { moved } = await quarantineUntracked(main, q, root);
 				expect(moved.sort()).toEqual(["a.txt", "sub/b.txt"]);
 				expect(readFileSync(join(q, "a.txt"), "utf8")).toBe("a");
 				expect(readFileSync(join(q, "sub", "b.txt"), "utf8")).toBe("b");

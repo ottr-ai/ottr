@@ -731,22 +731,23 @@ export function createSupervisor(
 	}
 
 	/** Fresh scratch would fail the clean gate again; move it out first. Merge turns may run
-	 * in the main checkout — never quarantine there. False = the pass stops: the quarantine
-	 * failed and the card's log says so. */
+	 * in the main checkout — never quarantine there. Returns the names the quarantine kept
+	 * (OTTR-890: an entry whose name the confine walk refuses; one line per refused name and
+	 * card, not one per tick); null = the quarantine failed and the card's log says so. */
 	async function reclassifyQuarantine(
 		e: SupervisorEntry,
 		t: ListedTask,
 		isWorkTurn: boolean,
-	): Promise<boolean> {
+	): Promise<string[] | null> {
 		if (
 			!isWorkTurn ||
 			t.worktree === null ||
 			!existsSync(t.worktree) ||
 			(await ops.worktreeHusk(t.worktree).catch(() => true))
 		)
-			return true;
+			return [];
 		try {
-			const moved = await ops.quarantineUntracked(
+			const { moved, refused } = await ops.quarantineUntracked(
 				t.worktree,
 				join(e.store.tasksDir, "quarantine", t.id),
 				e.store.dataRoot,
@@ -758,15 +759,44 @@ export function createSupervisor(
 					t.id,
 					`supervisor: quarantined ${moved.length} untracked file(s) to .tasks/quarantine/${t.id}: ${moved.slice(0, 20).join(", ")}${moved.length > 20 ? " …" : ""}`,
 				);
+			// OTTR-890: the refused entry stays and would park the card every tick; log one
+			// line per refused name and card, not one failure line per tick.
+			for (const name of refused) {
+				const key = `${e.name}/${t.id}/refused/${name}`;
+				if (reclassifyLogged.has(key)) continue;
+				reclassifyLogged.add(key);
+				await ops.appendLog(
+					e.store,
+					t.id,
+					`supervisor: quarantine kept an entry git refuses to move: ${name} — remove it from the worktree`,
+				);
+			}
+			return refused;
 		} catch (err) {
 			await ops.appendLog(
 				e.store,
 				t.id,
 				`supervisor: quarantine failed: ${errmsg(err)}`,
 			);
-			return false;
+			return null;
 		}
-		return true;
+	}
+
+	/** OTTR-890: a refused entry keeps the worktree dirty, so the park reason must name it —
+	 * the agent or user removes the file and the next tick still re-judges, because the
+	 * git-proof prefix stays. Writes nothing once the reason names every refused entry (no
+	 * per-tick churn). */
+	async function nameRefusedEntries(
+		e: SupervisorEntry,
+		t: ListedTask,
+		reason: string,
+		refused: readonly string[],
+	): Promise<void> {
+		const missing = refused.filter((n) => !(t.needsReason ?? "").includes(n));
+		if (missing.length === 0) return;
+		await applyTask(e, t, {
+			needsReason: `${reason} Quarantine kept an untracked file git refuses to move: ${missing.join(", ")} — remove it from the worktree.`,
+		});
 	}
 
 	/** Fresh git facts for a stale park. Mirrors src/turn.ts's husk handling: a husk or
@@ -927,7 +957,12 @@ export function createSupervisor(
 		const stale = await reclassifyTurn(e, t);
 		if (stale === null) return;
 
-		if (!(await reclassifyQuarantine(e, t, stale.last.kind === "work"))) return;
+		const refused = await reclassifyQuarantine(
+			e,
+			t,
+			stale.last.kind === "work",
+		);
+		if (refused === null) return;
 		const facts = await reclassifyFacts(
 			e,
 			t,
@@ -944,7 +979,13 @@ export function createSupervisor(
 			target: stale.cand.target,
 			previousError: stale.last.error,
 		});
-		if (next.state === "needs_you") return; // still stuck the same way; leave it
+		if (next.state === "needs_you") {
+			// Still stuck the same way; leave it — but name the kept entries in the park
+			// reason, so the agent or user can remove what the quarantine could not move.
+			if (refused.length > 0)
+				await nameRefusedEntries(e, t, stale.cand.reason, refused);
+			return;
+		}
 		// A reply, steer or cancel may have landed during the git awaits above; the writes
 		// below must not overwrite it.
 		if (await wentStale(e.store, t)) return;
@@ -1025,8 +1066,9 @@ export function createSupervisor(
 		}
 	}
 
-	/** Quarantine the worktree's untracked scratch; null = it failed and the card's log
-	 * names the reason (once). */
+	/** Quarantine the worktree's untracked scratch; null = it failed or kept a refused
+	 * entry (OTTR-890: the entry stays, so the removal must not run), and the card's log
+	 * names the reason (once per refused name). */
 	async function hygieneQuarantine(
 		e: SupervisorEntry,
 		t: ListedTask,
@@ -1034,11 +1076,19 @@ export function createSupervisor(
 		key: string,
 	): Promise<string[] | null> {
 		try {
-			return await ops.quarantineUntracked(
+			const { moved, refused } = await ops.quarantineUntracked(
 				wt,
 				join(e.store.tasksDir, "quarantine", t.id),
 				e.store.dataRoot,
 			);
+			for (const name of refused)
+				await hygieneNote(
+					e,
+					t,
+					`${key}/refused/${name}`,
+					`hygiene: quarantine kept an entry git refuses to move: ${name} — remove it from the worktree`,
+				);
+			return refused.length > 0 ? null : moved;
 		} catch (err) {
 			await hygieneNote(
 				e,

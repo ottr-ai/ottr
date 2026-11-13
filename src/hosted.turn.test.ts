@@ -164,7 +164,7 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		isIntegrated: async () => true,
 		unsavedWork: async () => null,
 		statusFiles: async () => [],
-		quarantineUntracked: async () => [],
+		quarantineUntracked: async () => ({ moved: [], refused: [] }),
 		saveDoneFiles: async () => ({
 			moved: [],
 			copied: [],

@@ -221,7 +221,7 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 			ops.calls.quarantine.push({ worktreePath, quarantineDir });
 			if (ops.quarantineErr) throw ops.quarantineErr;
 			ops.cleanNow = true; // simulates the move: scratch gone, worktree reads clean
-			return [];
+			return { moved: [], refused: [] };
 		},
 		targetCommits: async () => 3,
 		targetSha: async (_mainPath, ref) =>
@@ -766,7 +766,7 @@ describe("stale needs_you re-classification", () => {
 		const ops = fakeOps({ cleanNow: false, integratedNow: true });
 		ops.quarantineUntracked = async () => {
 			ops.cleanNow = true;
-			return ["scratch.log", "notes/draft.md"];
+			return { moved: ["scratch.log", "notes/draft.md"], refused: [] };
 		};
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const log = await Bun.file(await store.logPath(t.id)).text();
@@ -960,7 +960,7 @@ describe("kept-worktree hygiene", () => {
 			time: Date.now() + 8 * 86_400_000,
 			quarantineUntracked: async (worktreePath, quarantineDir) => {
 				ops.calls.quarantine.push({ worktreePath, quarantineDir });
-				return ["notes.md", "shots/pic.png"];
+				return { moved: ["notes.md", "shots/pic.png"], refused: [] };
 			},
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
@@ -989,6 +989,28 @@ describe("kept-worktree hygiene", () => {
 		expect(log).toContain(`.tasks/quarantine/${t.id}: notes.md, shots/pic.png`);
 		await store.close();
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"OTTR-890: a refused entry name keeps the worktree and logs once over two ticks",
+		async () => {
+			const { store, t } = await keptCard("hyg-refused");
+			const ops = fakeOps({ time: Date.now() + 8 * 86_400_000 });
+			ops.quarantineUntracked = async (worktreePath, quarantineDir) => {
+				ops.calls.quarantine.push({ worktreePath, quarantineDir });
+				return { moved: ["notes.md"], refused: ["C:\\Temp\\alate-sim.mjs"] };
+			};
+			await tick(new Map([["proj", entry(store)]]), ops);
+			await tick(new Map([["proj", entry(store)]]), ops);
+			// The refused entry still holds the worktree, so the removal never runs.
+			expect(ops.calls.remove).toEqual([]);
+			const log = await Bun.file(await store.logPath(t.id)).text();
+			expect(
+				log.split("\n").filter((l) => l.includes("refuses to move")).length,
+			).toBe(1);
+			expect(log).toContain("refuses to move: C:\\Temp\\alate-sim.mjs");
+			await store.close();
+		},
+	);
 
 	test("stale PR-mode merging card without a PR stays parked for reply recovery", async () => {
 		const { store, t, wt } = await keptCard("hyg-pr-missing");
@@ -1422,7 +1444,7 @@ describe("fresh read before pass writes", () => {
 		ops.quarantineUntracked = async (worktreePath, quarantineDir) => {
 			ops.calls.quarantine.push({ worktreePath, quarantineDir });
 			await replyLands(store, t.id);
-			return [];
+			return { moved: [], refused: [] };
 		};
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = (await store.getTask(t.id))!;
@@ -1843,7 +1865,7 @@ describe("arch-review changed-line coverage", () => {
 		const ops = fakeOps({ cleanNow: false, integratedNow: true });
 		ops.quarantineUntracked = async () => {
 			ops.cleanNow = true;
-			return moved;
+			return { moved, refused: [] };
 		};
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const log = await Bun.file(await store.logPath(t.id)).text();
@@ -1871,6 +1893,46 @@ describe("arch-review changed-line coverage", () => {
 		expect(log).not.toContain("quarantined ");
 		await store.close();
 	});
+
+	test.skipIf(process.platform !== "linux")(
+		"OTTR-890: a refused entry name logs once over two ticks and the reason names it",
+		async () => {
+			const { store, t } = await staleProofCard("ar-qrefused", {
+				needsReason:
+					"Reported ready, but git shows 0 commit(s) ahead of the base and uncommitted changes.",
+				outcome: "ready",
+			});
+			const bad =
+				"C:\\Users\\domin\\AppData\\Local\\Temp\\alate-152-win32-sim.mjs";
+			let calls = 0;
+			const ops = fakeOps({ cleanNow: false, integratedNow: false });
+			ops.quarantineUntracked = async () => {
+				calls += 1;
+				// Tick 1 moves the normal scratch; the backslash-named entry stays on both.
+				return calls === 1
+					? { moved: ["scratch.log"], refused: [bad] }
+					: { moved: [], refused: [bad] };
+			};
+			await tick(new Map([["proj", entry(store)]]), ops);
+			await tick(new Map([["proj", entry(store)]]), ops);
+			const log = await Bun.file(await store.logPath(t.id)).text();
+			expect(log).toContain(
+				`supervisor: quarantined 1 untracked file(s) to .tasks/quarantine/${t.id}: scratch.log`,
+			);
+			expect(
+				log.split("\n").filter((l) => l.includes("refuses to move")).length,
+			).toBe(1);
+			// The park reason names the refused file but keeps the git-proof prefix, so the
+			// next tick still re-judges on fresh facts once the file is gone.
+			const after = (await store.getTask(t.id))!;
+			expect(after.state).toBe("needs_you");
+			expect(
+				after.needsReason?.startsWith("Reported ready, but git shows"),
+			).toBe(true);
+			expect(after.needsReason).toContain(bad);
+			await store.close();
+		},
+	);
 
 	// -- regions 419-476: hygiene gates, gate order, exact keep reasons --------
 
@@ -2037,7 +2099,7 @@ describe("arch-review changed-line coverage", () => {
 		ops.quarantineUntracked = async (worktreePath, quarantineDir) => {
 			ops.calls.quarantine.push({ worktreePath, quarantineDir });
 			ops.cleanNow = true;
-			return ["notes.md", "shots/pic.png"];
+			return { moved: ["notes.md", "shots/pic.png"], refused: [] };
 		};
 		await tick(new Map([["proj", entry(store)]]), ops);
 		expect(ops.calls.quarantine).toEqual([

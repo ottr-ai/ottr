@@ -349,7 +349,7 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 			quarantineDir: string,
 		) => {
 			record.quarantine.push({ worktreePath, quarantineDir });
-			return [];
+			return { moved: [], refused: [] };
 		},
 		saveDoneFiles: async () => ({
 			moved: [],
@@ -1981,7 +1981,7 @@ describe("turn quarantine", () => {
 			commitsAhead: async () => 1,
 			quarantineUntracked: async (worktreePath, quarantineDir) => {
 				record.quarantine.push({ worktreePath, quarantineDir });
-				return [".smoke-1.png", ".smoke-2.png"];
+				return { moved: [".smoke-1.png", ".smoke-2.png"], refused: [] };
 			},
 		});
 		const task = await store.createTask("work please");
@@ -11545,7 +11545,7 @@ describe("turn survivor round 4", () => {
 		const { store, loop } = await setup({
 			holdFollowUps: true,
 			commitsAhead: async () => 1,
-			quarantineUntracked: async () => files,
+			quarantineUntracked: async () => ({ moved: files, refused: [] }),
 		});
 		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -11560,7 +11560,10 @@ describe("turn survivor round 4", () => {
 		const { store, loop } = await setup({
 			holdFollowUps: true,
 			commitsAhead: async () => 1,
-			quarantineUntracked: async () => [".smoke-1.png", ".smoke-2.png"],
+			quarantineUntracked: async () => ({
+				moved: [".smoke-1.png", ".smoke-2.png"],
+				refused: [],
+			}),
 		});
 		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -11568,6 +11571,23 @@ describe("turn survivor round 4", () => {
 		expect(await logText(store, task.id)).toContain(
 			`quarantined 2 untracked file(s) to .tasks/quarantine/${task.id}: ` +
 				".smoke-1.png, .smoke-2.png\n",
+		);
+	});
+
+	test("OTTR-890: a refused entry name stays and the settle log names it", async () => {
+		const { store, loop } = await setup({
+			holdFollowUps: true,
+			commitsAhead: async () => 1,
+			quarantineUntracked: async () => ({
+				moved: [".smoke-1.png"],
+				refused: ["C:\\Temp\\alate-152-win32-sim.mjs"],
+			}),
+		});
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		expect(await logText(store, task.id)).toContain(
+			"quarantine kept 1 untracked file(s) git refuses to move: " +
+				"C:\\Temp\\alate-152-win32-sim.mjs",
 		);
 	});
 
@@ -17138,7 +17158,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 				quarantineDir: string,
 			) => {
 				record.quarantine.push({ worktreePath, quarantineDir });
-				return ["junk.txt"];
+				return { moved: ["junk.txt"], refused: [] };
 			},
 		});
 		const task = await store.createTask("work please");
@@ -17235,7 +17255,7 @@ describe("turn survivor round 5 — run result and merge push", () => {
 			startRun: finishing(record, {
 				outcome: { status: "ready", summary: "did it" },
 			}),
-			quarantineUntracked: async () => names,
+			quarantineUntracked: async () => ({ moved: names, refused: [] }),
 		});
 		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
@@ -22892,7 +22912,7 @@ describe("turn PR-mode merge settle", () => {
 					worktreeHusk: async () => false,
 					worktreeLinked: async () => true,
 					branchMergedOrGone: async () => false,
-					quarantineUntracked: async () => [],
+					quarantineUntracked: async () => ({ moved: [], refused: [] }),
 					targetSha: async (path, ref) => run(path, "rev-parse", ref),
 					fetchOriginBranch: async () => null,
 					fetchPrHead: async () => null,

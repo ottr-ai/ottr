@@ -2872,34 +2872,52 @@ export async function checkoutState(
 
 /**
  * Moves every non-ignored untracked file in the worktree into `quarantineDir`, preserving repo-relative
- * paths; returns the moved paths (repo-relative, forward slashes). Ignored files and tracked files stay
- * untouched. [] when there is nothing to move. Throws when git fails. No symlink below the worktree or
- * below `dataRoot` is followed: an untracked symlink moves as a link, and a symlinked parent on either
- * side throws ("refusing ...").
+ * paths; returns the moved paths (repo-relative, forward slashes) and the refused names verbatim, as
+ * the entries sit on disk. Ignored files and tracked files stay
+ * untouched. An entry whose name the confine walk refuses (a backslash in the
+ * name, like a Windows path an agent wrote on Linux; OTTR-890) is skipped, kept in the worktree, and
+ * reported in `refused` — one bad name must not fail the whole batch. Empty `moved` when there is
+ * nothing to move. Throws when git fails. No symlink below the worktree or below `dataRoot` is
+ * followed: an untracked symlink moves as a link, and a symlinked parent on either side throws
+ * ("refusing ...").
  */
 export async function quarantineUntracked(
 	worktreePath: string,
 	quarantineDir: string,
 	dataRoot: string,
-): Promise<string[]> {
+): Promise<{ moved: string[]; refused: string[] }> {
 	const r = await git(
 		["ls-files", "-z", "--others", "--exclude-standard"],
 		worktreePath,
 	);
 	if (r.code !== 0) throw new Error(r.stderr || "git ls-files failed");
 	const moved: string[] = [];
+	const refused: string[] = [];
 	for (const rel of r.stdout.split("\0")) {
 		if (rel === "") continue;
-		moveBelow(
-			{
-				anchor: trustedAnchor(worktreePath),
-				file: path.join(worktreePath, rel),
-			},
-			{ anchor: dataRoot, file: path.join(quarantineDir, rel) },
-		);
+		try {
+			moveBelow(
+				{
+					anchor: trustedAnchor(worktreePath),
+					file: path.join(worktreePath, rel),
+				},
+				{ anchor: dataRoot, file: path.join(quarantineDir, rel) },
+			);
+		} catch (err) {
+			// OTTR-890: entryName refuses the name; skip the entry, keep the rest moving.
+			if (
+				!(err instanceof Error) ||
+				!err.message.startsWith("invalid entry name")
+			)
+				throw err;
+			// Verbatim: the caller's log must name the file as it sits on disk, so the
+			// agent or user can remove exactly that name.
+			refused.push(rel);
+			continue;
+		}
 		moved.push(rel.replaceAll("\\", "/"));
 	}
-	return moved;
+	return { moved, refused };
 }
 
 /**
