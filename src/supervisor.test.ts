@@ -4378,10 +4378,13 @@ describe("prPass", () => {
 		});
 		await tick(new Map([["proj", entry(store)]]), ops);
 		const after = store.getTask(t.id)!;
+		// The park leaves the merging watch: stage in_progress, follow-up kept.
+		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toContain(
 			"follow-up PR #9 closed without merging",
 		);
+		expect(after.followUpPrNumber).toBe(9);
 		const listReads = () =>
 			ops.apiCalls.filter((a) => a[1]!.includes("pulls?state=open")).length;
 		const log = await Bun.file(store.logPath(t.id)).text();
