@@ -4,12 +4,14 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readFileSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
+	boardOmpEnv,
 	deadSignIns,
 	type LoginStores,
 	loginProviders,
@@ -51,7 +53,13 @@ writeFileSync(
 import { appendFileSync, mkdirSync } from "node:fs";
 const provider = process.argv.at(-1);
 const agentDir = process.env.PI_CODING_AGENT_DIR;
-appendFileSync(${JSON.stringify(RUNS)}, JSON.stringify({ agentDir, home: process.env.HOME }) + "\\n");
+appendFileSync(${JSON.stringify(RUNS)}, JSON.stringify({
+	agentDir,
+	home: process.env.HOME,
+	hasProductionDatabaseUrl: Object.hasOwn(process.env, "OTTR_DATABASE_URL"),
+	hasTestPgUrl: Object.hasOwn(process.env, "OTTR_TEST_PG_URL"),
+	requirePgTests: process.env.OTTR_REQUIRE_PG_TESTS,
+}) + "\\n");
 if (provider === "unknown") {
 	console.error("Login failed: Unknown OAuth provider 'unknown'.");
 	process.exit(1);
@@ -114,6 +122,48 @@ const browserTo = (url: string) =>
 // 4 s), so each test carries a 30 s budget: the 5 s default bounds the machine, not the
 // assertions, and the two-stores describe below already proved 30 s enough at load 20.
 describe("providerLogin", () => {
+	test("excludes the production database URL from board environments and login children", async () => {
+		const names = [
+			"OTTR_DATABASE_URL",
+			"OTTR_TEST_PG_URL",
+			"OTTR_REQUIRE_PG_TESTS",
+		] as const;
+		const saved = names.map((name) => [name, process.env[name]] as const);
+		const productionUrl = `postgresql://127.0.0.1/production-${crypto.randomUUID()}`;
+		const testUrl = `postgresql://127.0.0.1/test-${crypto.randomUUID()}`;
+		try {
+			process.env.OTTR_DATABASE_URL = productionUrl;
+			process.env.OTTR_TEST_PG_URL = testUrl;
+			process.env.OTTR_REQUIRE_PG_TESTS = "1";
+			const base = {
+				OTTR_DATABASE_URL: productionUrl,
+				OTTR_TEST_PG_URL: testUrl,
+				OTTR_REQUIRE_PG_TESTS: "1",
+				PATH: process.env.PATH,
+			};
+			for (const env of [boardOmpEnv(), boardOmpEnv(base)]) {
+				expect(Object.hasOwn(env, "OTTR_DATABASE_URL")).toBe(false);
+				expect(env.OTTR_TEST_PG_URL === testUrl).toBe(true);
+				expect(env.OTTR_REQUIRE_PG_TESTS).toBe("1");
+				expect(env.PATH === base.PATH).toBe(true);
+			}
+			expect(base.OTTR_DATABASE_URL === productionUrl).toBe(true);
+			expect(process.env.OTTR_DATABASE_URL === productionUrl).toBe(true);
+			await logins().start("unknown", BOARD);
+			const last = readFileSync(RUNS, "utf8").trim().split("\n").at(-1);
+			expect(typeof last).toBe("string");
+			const observed = JSON.parse(last ?? "");
+			expect(observed.hasProductionDatabaseUrl).toBe(false);
+			expect(observed.hasTestPgUrl).toBe(true);
+			expect(observed.requirePgTests).toBe("1");
+		} finally {
+			for (const [name, value] of saved) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
+	}, 30_000);
+
 	test("start shows the sign-in URL and the prompt, without terminal escapes", async () => {
 		const l = logins();
 		const v = await l.start("anthropic", BOARD);

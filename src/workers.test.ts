@@ -449,6 +449,62 @@ describe("serveWorker", () => {
 		}
 	}, 30_000);
 
+	test("worker children retain test variables but reject production URLs from every source", async () => {
+		const inherited = {
+			OTTR_DATABASE_URL: crypto.randomUUID(),
+			OTTR_TEST_PG_URL: `postgres://localhost/${crypto.randomUUID()}`,
+			OTTR_REQUIRE_PG_TESTS: "1",
+		};
+		const saved = Object.fromEntries(
+			Object.keys(inherited).map((key) => [key, process.env[key]]),
+		);
+		Object.assign(process.env, inherited);
+		try {
+			const url = start({ ompPath: process.execPath });
+			for (const source of ["daemon", "request", "githubReadEnv"]) {
+				const requestEnv =
+					source === "request"
+						? {
+								OTTR_DATABASE_URL: crypto.randomUUID(),
+								OTTR_TEST_PG_URL: `postgres://localhost/${crypto.randomUUID()}`,
+								OTTR_REQUIRE_PG_TESTS: "0",
+							}
+						: {};
+				const res = await fetch(`${url}/run`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						id: `r-database-${source}`,
+						argv: [envDumpPath],
+						cwd: dir,
+						stdin: "",
+						env: requestEnv,
+						...(source === "githubReadEnv"
+							? { githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() } }
+							: {}),
+					}),
+				});
+				expect(res.status).toBe(200);
+				const env = JSON.parse((await readLines(res))[0] ?? "") as Record<
+					string,
+					string
+				>;
+				expect(env).not.toHaveProperty("OTTR_DATABASE_URL");
+				expect(env.OTTR_TEST_PG_URL).toBe(
+					requestEnv.OTTR_TEST_PG_URL ?? inherited.OTTR_TEST_PG_URL,
+				);
+				expect(env.OTTR_REQUIRE_PG_TESTS).toBe(
+					requestEnv.OTTR_REQUIRE_PG_TESTS ?? inherited.OTTR_REQUIRE_PG_TESTS,
+				);
+			}
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}, 30_000);
+
 	test("the delivered githubReadEnv reaches omp after the strips and overrides ambient names", async () => {
 		const planted: Record<string, string> = {
 			GH_ENTERPRISE_TOKEN: "ghp_container_ent",

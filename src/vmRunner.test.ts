@@ -481,6 +481,40 @@ describe("vm-runner /run", () => {
 		expect(body.env.FOO).toBe("bar");
 	});
 
+	test.each(["request", "githubReadEnv", "both"])(
+		"excludes OTTR_DATABASE_URL from the guest env when supplied through %s",
+		async (source) => {
+			const r = startRunner();
+			const body = request();
+			const res = await post(r.url, "/run", {
+				...body,
+				env: {
+					...body.env,
+					...(source !== "githubReadEnv"
+						? { OTTR_DATABASE_URL: "request-database-marker" }
+						: {}),
+				},
+				githubReadEnv: {
+					GH_HOST: "acme.ghe.com",
+					...(source !== "request"
+						? { OTTR_DATABASE_URL: "overlay-database-marker" }
+						: {}),
+				},
+			});
+			expect(res.status).toBe(200);
+			await res.text();
+			const guest = r.recs[0]!.runBody as {
+				env: Record<string, string>;
+			};
+			expect(guest.env).not.toHaveProperty("OTTR_DATABASE_URL");
+			expect(guest.env).toEqual({
+				OTTR_PROJECT: "proj",
+				FOO: "bar",
+				GH_HOST: "acme.ghe.com",
+			});
+		},
+	);
+
 	test("answers 400 without a vm spec", async () => {
 		const r = startRunner();
 		const { vm: _vm, ...classic } = request();

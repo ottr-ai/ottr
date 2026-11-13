@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import {
 	existsSync,
 	mkdirSync,
@@ -38,8 +38,10 @@ const open = async (dbPath: string) => {
 	opened.push(store);
 	return store;
 };
-afterAll(async () => {
-	for (const store of opened) await store.close(); // double close is a no-op
+afterEach(async () => {
+	for (const store of opened.splice(0)) await store.close(); // double close is a no-op
+});
+afterAll(() => {
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 

@@ -1,4 +1,11 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	describe,
+	expect,
+	test,
+} from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,8 +58,11 @@ beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-prs-"));
 });
 
-afterAll(async () => {
-	for (const store of stores) await store.close();
+afterEach(async () => {
+	for (const store of stores.splice(0)) await store.close();
+});
+
+afterAll(() => {
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 

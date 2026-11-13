@@ -1297,6 +1297,14 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			// copy-out may replace.
 			const copiedIn = new Set<string>();
 			await putFiles(vm, token, copyInRoots(copiedIn), signal);
+			// The delivered read-only GitHub token merges after the strip
+			// (docs/specs/turn-read-token.md) and overrides ambient names.
+			const env = {
+				...guestEnv(body.env ?? {}),
+				...(body.githubReadEnv ?? {}),
+			};
+			// Neither input may pass the production database URL to the guest.
+			delete env.OTTR_DATABASE_URL;
 			const r = await guestFetch(`${vm.guestUrl}/run`, {
 				method: "POST",
 				headers: {
@@ -1306,13 +1314,7 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				body: JSON.stringify({
 					argv: body.argv,
 					cwd: body.cwd,
-					// The delivered read-only GitHub token merges after the strip
-					// (docs/specs/turn-read-token.md): it survives it and overrides
-					// any ambient name.
-					env: {
-						...guestEnv(body.env ?? {}),
-						...(body.githubReadEnv ?? {}),
-					},
+					env,
 					stdin: body.stdin,
 					vm: {
 						gitUrl: `${spec.boardUrl.replace(/\/+$/, "")}/git/${spec.project}.git`,

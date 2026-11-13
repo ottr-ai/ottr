@@ -13,6 +13,24 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    services:
+      postgres-test:
+        image: docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+        env:
+          # Isolated runner service only; never use trust for production.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: postgres
+        ports:
+          - 5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+          --tmpfs /var/lib/postgresql
+    env:
+      OTTR_TEST_PG_URL: postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres
+      OTTR_REQUIRE_PG_TESTS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

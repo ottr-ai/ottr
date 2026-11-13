@@ -67,3 +67,98 @@ The README board screenshot has its own one-command path: `bun run readme-screen
 
 Card views have a one-command path too: `bun scripts/card-shot.ts --view card --pr 53`. The script plants a parked PR-mode card (`stage` merging, PR #53 open, never "done") and a normal done card into a fresh demo pool. It boots its own board on a free port and writes the requested views to `shots/`. The views are `card` (the PR card's drawer), `done` (the contrast card), and `board` (the Lumen project face); `--view` can repeat. The script writes its fixture rows with direct sqlite before the board boots, so no write touches a live board's database. It bounds every wait with a watchdog, verifies each PNG signature, and stops only the children it started. It calls `process.exit` once the artifacts verify, so it cannot hang after success. Use it instead of a throwaway shot script. Spec: `docs/specs/card-shot.md`.
 
+## PostgreSQL test infrastructure
+
+Card C adds PostgreSQL test infrastructure only.
+Ottr still uses SQLite for product state.
+This service does not add a PostgreSQL product backend or a supported local backend setup.
+See the [backend specification](specs/postgres-backend.md) and [ADR 0013](adr/0013-postgresql-backend-and-async-stores.md).
+The README remains accurate for SQLite.
+
+The specification selects PostgreSQL 18 as the minimum and test target major.
+Compose and the CI `check` job use this exact image:
+
+```text
+docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+```
+
+The digest comes from the [official Docker Hub tag API for `library/postgres:18.4`](https://hub.docker.com/v2/repositories/library/postgres/tags/18.4).
+The tag API records its last push as 2026-08-06.
+Card F must reuse this exact digest for its optional production service.
+The production service does not exist on card C.
+
+### Isolated service and operator action
+
+The compose service `postgres-test` uses profile `pgtest` and the default compose network.
+The server and workers reach it by its service name.
+It publishes no host port.
+PostgreSQL 18 stores its data under `/var/lib/postgresql`, which this service mounts as tmpfs.
+Data does not survive a service recreation.
+
+Trust authentication without a password is an explicit exception for this isolated, disposable test service.
+Any container on the default network can access its test data.
+Never put production data or credentials in this service.
+Never use this configuration as a production example.
+The checked-in test URL contains no password or secret.
+Keep `OTTR_DATABASE_URL` out of workers and settings.
+The two test variables are separate from production backend selection.
+
+After merge, the operator must add `pgtest` to the existing `COMPOSE_PROFILES` list in the compose environment file.
+Keep any profiles that the stack already needs.
+Set both test variables in that file:
+
+```dotenv
+OTTR_TEST_PG_URL=postgres://postgres@postgres-test:5432/postgres
+OTTR_REQUIRE_PG_TESTS=1
+```
+
+Recreate the stack so the server and workers receive both variables:
+
+```sh
+docker compose up -d --force-recreate
+```
+
+Do not use `127.0.0.1` for the test URL inside the compose stack.
+Loopback refers to each container itself.
+The CI job runs directly on `ubuntu-latest`, so it uses `127.0.0.1` and the ephemeral host port from `job.services.postgres-test.ports[5432]`.
+The job environment passes both variables to its existing test commands and their child processes.
+CI uses the same trust exception and tmpfs data.
+
+### Per-file database fixture
+
+Import `readPostgresTestConfig` and `createPostgresFixture` from `src/test/postgres.ts`.
+Read the configuration once per test file.
+Create one fixture in that file's `beforeAll` hook.
+Await `fixture.close()` in its `afterAll` hook.
+If the configuration is absent, use `test.skip` for that file's PostgreSQL tests.
+Do not share one fixture across test files.
+
+The helper creates a random database through the isolated service's `postgres` database.
+It refuses a test URL whose normalized host, port, and database match the production URL.
+It treats an omitted default port as port 5432.
+The returned `sql` connection supports real queries against the file's database.
+The returned `url` identifies only that database.
+
+Register additional connections or store owners with `fixture.register(owner)`.
+The owner must expose an async `close()` method.
+The fixture closes these owners before it drops only its own database.
+Pass `fixture.subprocessEnv()` as the environment for a real subprocess fixture.
+It sets the normal `OTTR_DATABASE_URL` to the file's database URL.
+This test-only subprocess use does not permit production URL propagation to workers.
+Do not print either URL, credentials, or nested driver errors.
+
+### Proof boundary
+
+The fixture follows these rules:
+
+- If `OTTR_TEST_PG_URL` is absent and `OTTR_REQUIRE_PG_TESTS=1`, the test fails.
+- If both variables are absent, PostgreSQL tests skip with an explicit notice.
+- If a test URL is present, the test must connect and execute a real query.
+- If a URL is invalid or unreachable, the test fails with a safe error.
+
+Card C's work-turn proof covers required-without-URL failure and optional-without-URL skip.
+The live service is unavailable until merge and stack recreation.
+Do not claim a live PostgreSQL pass from the work turn.
+The compose and CI shape tests check configuration only.
+Post-merge CI must prove the real connection and query test.
+Card D must prove that same live test as its first action, before backend work.

@@ -96,6 +96,8 @@ export function childEnv(o: {
 	delete env.OTTR_DATA_DIR;
 	delete env.OTTR_SERVER_DATA_DIR;
 	delete env.OTTR_BACKUP_DIR;
+	// Database access stays on the server; the isolated test variables still pass.
+	delete env.OTTR_DATABASE_URL;
 	delete env.OTTR_WORKER_URLS;
 	delete env.OTTR_WORKER_TOKEN;
 	// The alate bearer key drives provisioning of the agent layer every turn executes;
@@ -124,6 +126,16 @@ export function childEnv(o: {
 	}
 	for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
 	return env;
+}
+
+/** Keep the server database URL out of the secondary worker environment too. */
+function withoutDatabaseUrl(
+	env: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+	if (!env || !Object.hasOwn(env, "OTTR_DATABASE_URL")) return env;
+	const clean = { ...env };
+	delete clean.OTTR_DATABASE_URL;
+	return clean;
 }
 
 /**
@@ -2040,7 +2052,7 @@ function startVmRun(
 				layerEnv,
 			}),
 			// Not merged into env here: the vm-runner merges it after its guestEnv strip.
-			githubReadEnv: o.githubReadEnv,
+			githubReadEnv: withoutDatabaseUrl(o.githubReadEnv),
 			vm: spec,
 		},
 		vm.target,
@@ -2151,7 +2163,7 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 			cwd: o.cwd,
 			stdin: o.prompt,
 			env,
-			githubReadEnv: o.githubReadEnv,
+			githubReadEnv: withoutDatabaseUrl(o.githubReadEnv),
 		},
 		worker,
 		sink,

@@ -49,6 +49,7 @@ import {
 	WORKER_LOST,
 	workerFromEnv,
 } from "./runner.ts";
+import fc from "./test/properties.ts";
 import type {
 	GitFacts,
 	Next,
@@ -210,6 +211,29 @@ describe("childEnv", () => {
 
 	test("without board or pinned name the env is the inherited base", () => {
 		expect(childEnv({ base: { PATH: "/bin" } })).toEqual({ PATH: "/bin" });
+	});
+	test("keeps test database variables but never the production URL", () => {
+		fc.assert(
+			fc.property(
+				fc.string(),
+				fc.string(),
+				fc.string(),
+				(production, testUrl, required) => {
+					expect(
+						childEnv({
+							base: {
+								OTTR_DATABASE_URL: production,
+								OTTR_TEST_PG_URL: testUrl,
+								OTTR_REQUIRE_PG_TESTS: required,
+							},
+						}),
+					).toEqual({
+						OTTR_TEST_PG_URL: testUrl,
+						OTTR_REQUIRE_PG_TESTS: required,
+					});
+				},
+			),
+		);
 	});
 	test("drops the board's data dir; a local turn keeps GH_TOKEN for its merge push", () => {
 		expect(
@@ -3894,6 +3918,105 @@ describe("startRun worker dispatch", () => {
 		}
 	});
 
+	test("worker requests exclude production URLs from all environment sources", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-database-"));
+		const bodies: WorkerRequest[] = [];
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				bodies.push((await req.json()) as WorkerRequest);
+				return new Response("spawn failed: recorded", { status: 500 });
+			},
+		});
+		const inherited = {
+			OTTR_DATABASE_URL: crypto.randomUUID(),
+			OTTR_TEST_PG_URL: `postgres://localhost/${crypto.randomUUID()}`,
+			OTTR_REQUIRE_PG_TESTS: "1",
+		};
+		const saved = Object.fromEntries(
+			Object.keys(inherited).map((key) => [key, process.env[key]]),
+		);
+		Object.assign(process.env, inherited);
+		try {
+			for (const supplied of [false, true]) {
+				const testEnv = supplied
+					? {
+							OTTR_DATABASE_URL: crypto.randomUUID(),
+							OTTR_TEST_PG_URL: `postgres://localhost/${crypto.randomUUID()}`,
+							OTTR_REQUIRE_PG_TESTS: "0",
+						}
+					: inherited;
+				await startRun({
+					...baseOpts(dir, join(dir, "run.log")),
+					worker: { urls: [`http://127.0.0.1:${server.port}`] },
+					env: supplied ? testEnv : {},
+					githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() },
+				}).done;
+				const body = bodies.at(-1)!;
+				expect(body.env).not.toHaveProperty("OTTR_DATABASE_URL");
+				expect(body.githubReadEnv).not.toHaveProperty("OTTR_DATABASE_URL");
+				expect(body.env.OTTR_TEST_PG_URL).toBe(testEnv.OTTR_TEST_PG_URL);
+				expect(body.env.OTTR_REQUIRE_PG_TESTS).toBe(
+					testEnv.OTTR_REQUIRE_PG_TESTS,
+				);
+			}
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("local children exclude inherited and supplied production URLs but retain test variables", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-local-database-"));
+		const inherited = {
+			OTTR_DATABASE_URL: crypto.randomUUID(),
+			OTTR_TEST_PG_URL: `postgres://localhost/${crypto.randomUUID()}`,
+			OTTR_REQUIRE_PG_TESTS: "1",
+		};
+		const saved = Object.fromEntries(
+			Object.keys(inherited).map((key) => [key, process.env[key]]),
+		);
+		Object.assign(process.env, inherited);
+		try {
+			for (const supplied of [false, true]) {
+				let seen: Parameters<RunLauncher>[2] | undefined;
+				const testEnv = supplied
+					? {
+							OTTR_DATABASE_URL: crypto.randomUUID(),
+							OTTR_TEST_PG_URL: `postgres://localhost/${crypto.randomUUID()}`,
+							OTTR_REQUIRE_PG_TESTS: "0",
+						}
+					: inherited;
+				await startRun({
+					...baseOpts(dir, join(dir, "run.log")),
+					env: supplied ? testEnv : {},
+					launcher: (_command, _args, options) => {
+						seen = options;
+						const fake = new FakeOmp();
+						queueMicrotask(() => fake.emit("close", 0));
+						return fake as unknown as ChildProcess;
+					},
+				}).done;
+				expect(seen).toBeDefined();
+				expect(seen!.env).not.toHaveProperty("OTTR_DATABASE_URL");
+				expect(seen!.env?.OTTR_TEST_PG_URL).toBe(testEnv.OTTR_TEST_PG_URL);
+				expect(seen!.env?.OTTR_REQUIRE_PG_TESTS).toBe(
+					testEnv.OTTR_REQUIRE_PG_TESTS,
+				);
+			}
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a local dispatch ignores githubReadEnv", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-local-read-"));
 		// The delivered names must be absent from the boot env too: a local run
@@ -4980,6 +5103,35 @@ describe("startRun microVM dispatch", () => {
 		} finally {
 			if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
 			else process.env.ANTHROPIC_API_KEY = saved;
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("VM requests exclude inherited, project and secondary production URLs", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-vm-database-"));
+		const tokens = new VmTokens({ file: null });
+		const { server, seen, url } = fakeRunner(tokens, "run");
+		const saved = process.env.OTTR_DATABASE_URL;
+		process.env.OTTR_DATABASE_URL = crypto.randomUUID();
+		try {
+			for (const supplied of [false, true]) {
+				const opts = vmOpts(dir, tokens, url);
+				await startRun({
+					...opts,
+					env: {
+						...opts.env,
+						...(supplied ? { OTTR_DATABASE_URL: crypto.randomUUID() } : {}),
+					},
+					githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() },
+				}).done;
+				const body = seen.at(-1)!.body;
+				expect(body.env).not.toHaveProperty("OTTR_DATABASE_URL");
+				expect(body.githubReadEnv).not.toHaveProperty("OTTR_DATABASE_URL");
+			}
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_DATABASE_URL;
+			else process.env.OTTR_DATABASE_URL = saved;
 			server.stop(true);
 			rmSync(dir, { recursive: true, force: true });
 		}

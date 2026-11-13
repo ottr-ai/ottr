@@ -116,15 +116,16 @@ export async function startLlmGateway(
 	const delay = o.restartDelayMs ?? 5_000;
 	const deadline = Date.now() + (o.readyTimeoutMs ?? 60_000);
 
-	// The board's env minus git host credentials: the children need provider env keys and the
-	// proxy settings, never GH_TOKEN. An inherited broker URL would make the broker's own
-	// store remote, so both children get only the ones set here.
+	// The children need provider keys and proxy settings, but not git host credentials or the
+	// production database URL. An inherited broker URL would make the broker's own store
+	// remote, so both children get only the broker settings set here.
 	const env: Record<string, string | undefined> = {
 		...process.env,
 		HOME: o.home,
 		PI_CODING_AGENT_DIR: o.agentDir,
 	};
 	stripGitAuthEnv(env);
+	delete env.OTTR_DATABASE_URL;
 	delete env.OMP_AUTH_BROKER_URL;
 	delete env.OMP_AUTH_BROKER_TOKEN;
 

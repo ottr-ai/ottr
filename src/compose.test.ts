@@ -1,6 +1,5 @@
-// Pins the BuildKit sidecar compose shape (OTTR-785, docs/specs/turn-image-builds.md):
-// profile gating, no privileged/docker.sock/ports, network isolation, cert separation,
-// mTLS daemon flags, digest pin, limits, and the client-side buildctl + docs pins.
+// Pins compose and CI infrastructure shape: BuildKit isolation and disposable
+// PostgreSQL tests. These checks do not prove container or database behavior.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
@@ -17,6 +16,13 @@ const xWorker = compose["x-worker"] as Service;
 const buildkit = svc("buildkit");
 const buildkitCerts = svc("buildkit-certs");
 const server = svc("server");
+const postgresTest = svc("postgres-test");
+const postgresTestImage =
+	"docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636";
+const ci = Bun.YAML.parse(
+	readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"),
+) as { jobs: { check: Service } };
+const ciCheck = ci.jobs.check;
 
 /** A compose service that must exist: a missing sidecar service fails the pin loudly. */
 function svc(name: string): Service {
@@ -163,6 +169,82 @@ describe("the buildkit sidecar compose shape", () => {
 			"podman inside the Firecracker VM",
 		]) {
 			expect(workersDoc).toContain(text);
+		}
+	});
+});
+
+describe("the PostgreSQL test infrastructure shape", () => {
+	test("compose gates disposable data behind pgtest without a host port", () => {
+		expect(postgresTest.profiles).toEqual(["pgtest"]);
+		expect(postgresTest.tmpfs).toEqual(["/var/lib/postgresql"]);
+		expect(postgresTest.volumes).toBeUndefined();
+		expect(postgresTest.ports).toBeUndefined();
+		expect(postgresTest.network_mode).toBeUndefined();
+		expect(postgresTest.networks).toEqual(["default"]);
+		expect(Object.keys(server.networks)).toContain("default");
+		for (const name of ["worker-a", "worker-b"]) {
+			expect(svc(name).networks).toContain("default");
+		}
+	});
+
+	test("compose uses trust only for the isolated test database", () => {
+		expect(postgresTest.environment).toEqual({
+			POSTGRES_HOST_AUTH_METHOD: "trust",
+			POSTGRES_DB: "postgres",
+		});
+		expect(postgresTest.healthcheck).toEqual({
+			test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"],
+			interval: "5s",
+			timeout: "5s",
+			retries: 12,
+			start_period: "10s",
+		});
+	});
+
+	test("server and worker environments pass both optional test variables", () => {
+		for (const service of [server, xWorker, svc("worker-a"), svc("worker-b")]) {
+			expect(service.environment.OTTR_TEST_PG_URL).toBe(
+				"${OTTR_TEST_PG_URL:-}",
+			);
+			expect(service.environment.OTTR_REQUIRE_PG_TESTS).toBe(
+				"${OTTR_REQUIRE_PG_TESTS:-}",
+			);
+		}
+		for (const service of [xWorker, svc("worker-a"), svc("worker-b")]) {
+			expect(service.environment.OTTR_DATABASE_URL).toBeUndefined();
+		}
+	});
+
+	test("compose and CI use the exact same PostgreSQL 18 image digest", () => {
+		expect(postgresTest.image).toBe(postgresTestImage);
+		expect(ciCheck.services["postgres-test"].image).toBe(postgresTestImage);
+	});
+
+	test("the host CI job uses a reachable ephemeral service port", () => {
+		const service = ciCheck.services["postgres-test"] as Service;
+		expect(ciCheck["runs-on"]).toBe("ubuntu-latest");
+		expect(ciCheck.container).toBeUndefined();
+		expect(service.ports).toEqual([5432]);
+		expect(service.env).toEqual({
+			POSTGRES_HOST_AUTH_METHOD: "trust",
+			POSTGRES_DB: "postgres",
+		});
+		for (const option of [
+			'--health-cmd "pg_isready -U postgres -d postgres"',
+			"--health-interval 5s",
+			"--health-timeout 5s",
+			"--health-retries 12",
+			"--tmpfs /var/lib/postgresql",
+		]) {
+			expect(service.options).toContain(option);
+		}
+		expect(ciCheck.env.OTTR_TEST_PG_URL).toBe(
+			"postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres",
+		);
+		expect(ciCheck.env.OTTR_REQUIRE_PG_TESTS).toBe("1");
+		for (const step of ciCheck.steps as Service[]) {
+			expect(step.env?.OTTR_TEST_PG_URL).toBeUndefined();
+			expect(step.env?.OTTR_REQUIRE_PG_TESTS).toBeUndefined();
 		}
 	});
 });

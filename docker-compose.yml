@@ -82,6 +82,9 @@ x-worker: &worker
     # container).
     HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
     HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
+    # Isolated PostgreSQL tests only. Never pass the production OTTR_DATABASE_URL.
+    OTTR_TEST_PG_URL: ${OTTR_TEST_PG_URL:-}
+    OTTR_REQUIRE_PG_TESTS: ${OTTR_REQUIRE_PG_TESTS:-}
     # No GitHub token here: workers run turns only, and push credentials stay on the
     # server (D6). The worker daemon strips GH_TOKEN and every git host credential from
     # each turn's env, so a token set here would never reach a turn.
@@ -182,6 +185,9 @@ services:
       OTTR_SSH_DIR: /app/.tasks/ssh
       OTTR_BACKUP_DIR: /backup
       OTTR_BACKUP_KEEP: ${OTTR_BACKUP_KEEP:-7} # snapshots to keep; 0 turns the backups off
+      # Test infrastructure only; no product PostgreSQL backend on this card.
+      OTTR_TEST_PG_URL: ${OTTR_TEST_PG_URL:-}
+      OTTR_REQUIRE_PG_TESTS: ${OTTR_REQUIRE_PG_TESTS:-}
       OTTR_WORKER_URLS: http://worker-a:8787,http://worker-b:8787
       # The microVM runner (the `vm` profile below): empty keeps every turn on the classic
       # workers, and the board holds the work turns of a project with microVMs on (the
@@ -272,6 +278,26 @@ services:
     # Copy-paste this block for worker-c..h and add each to OTTR_WORKER_URLS.
     # Do NOT use `compose --scale`: round-robin DNS breaks cancel routing —
     # per-run addressability requires stable per-worker names.
+
+  # Disposable PostgreSQL 18 tests only (docs/development.md). Trust is an explicit
+  # isolated-test exception: no credentials, production data, or host port.
+  postgres-test:
+    image: docker.io/library/postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636
+    profiles: [pgtest]
+    logging: *logging
+    networks:
+      - default
+    tmpfs:
+      - /var/lib/postgresql
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   # Rootless BuildKit sidecar (OTTR-785, spec docs/specs/turn-image-builds.md): lets a
   # work turn build container images (Dockerfile.worker, project Dockerfiles) with no
