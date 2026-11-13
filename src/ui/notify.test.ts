@@ -100,21 +100,42 @@ test("inboxView: clear bell", () => {
 	});
 });
 
-test("inboxView: all acknowledged shows standing at the most urgent listed level", () => {
+test("inboxView: an acknowledged needs entry keeps the bell lit at its level", () => {
 	const entries = [entry("a", "needs"), entry("b", "info")];
 	const v = inboxView(entries, new Set(["a", "b"]));
-	expect(v.lit).toBe(false);
+	expect(v.lit).toBe(true);
 	expect(v.total).toBe(2);
 	expect(v.fresh).toEqual([]);
 	expect(v.level).toBe("needs");
 });
 
-test("inboxView: a new info entry lights beside an acknowledged needs entry", () => {
+test("inboxView: only read notices leave the bell grey with no level", () => {
+	const entries = [entry("notice:a", "info"), entry("notice:b", "info")];
+	const v = inboxView(entries, new Set(["notice:a", "notice:b"]));
+	expect(v.lit).toBe(false);
+	expect(v.level).toBe(null);
+	expect(v.total).toBe(2);
+	expect(v.fresh).toEqual([]);
+});
+
+test("inboxView: 18 asked entries stay lit after acknowledgement", () => {
+	const entries = Array.from({ length: 18 }, (_, n) =>
+		entry(`task:a${n}:ask`, "asked"),
+	);
+	const seen = new Set(entries.map((e) => e.key));
+	const v = inboxView(entries, seen);
+	expect(v.lit).toBe(true);
+	expect(v.level).toBe("asked");
+	expect(v.total).toBe(18);
+	expect(v.fresh).toEqual([]);
+});
+
+test("inboxView: a new info entry lights beside an acknowledged needs entry, at the needs level", () => {
 	const entries = [entry("task:1:needs", "needs"), entry("notice:x", "info")];
 	const seen = new Set(["task:1:needs"]);
 	const v = inboxView(entries, seen);
 	expect(v.lit).toBe(true);
-	expect(v.level).toBe("info");
+	expect(v.level).toBe("needs");
 	expect(v.fresh).toEqual([entry("notice:x", "info")]);
 });
 

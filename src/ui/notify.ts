@@ -137,8 +137,9 @@ export function alatePendingEntry(
 // One place owns the urgency order; inboxView picks the most urgent level from it.
 const LEVELS: readonly InboxLevel[] = ["crit", "needs", "asked", "info"];
 
-/** What the bar bell shows. `fresh` = unacknowledged entries; lit while any is fresh; `level` is the
- *  most urgent fresh entry's level when lit, else the most urgent of all; null when there are none. */
+/** What the bar bell shows. `fresh` = unacknowledged entries; lit while an action-required
+ *  entry (any level but info) stands — acknowledged or not — or while any entry is fresh;
+ *  `level` is the most urgent level of that standing pool; null when there is none. */
 export function inboxView(
 	entries: readonly InboxEntry[],
 	seen: ReadonlySet<string>,
@@ -149,12 +150,16 @@ export function inboxView(
 	level: InboxLevel | null;
 } {
 	const fresh = entries.filter((e) => !seen.has(e.key));
-	const pool = fresh.length > 0 ? fresh : entries;
+	// The bell stays lit while work blocks on the user (crit, needs-you, asked) — read
+	// or not — and for anything new; read notices alone leave it grey.
+	const standing = entries.filter(
+		(e) => e.level !== "info" || !seen.has(e.key),
+	);
 	return {
 		total: entries.length,
 		fresh,
-		lit: fresh.length > 0,
-		level: LEVELS.find((l) => pool.some((e) => e.level === l)) ?? null,
+		lit: standing.length > 0,
+		level: LEVELS.find((l) => standing.some((e) => e.level === l)) ?? null,
 	};
 }
 

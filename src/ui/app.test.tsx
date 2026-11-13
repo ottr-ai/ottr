@@ -10965,14 +10965,80 @@ describe("AppInboxBell badge", () => {
 		expect(html).toContain("24 new notifications");
 	});
 
-	test("with nothing unread the badge shows the total and the bell stays grey", () => {
-		const meta = metaWithAcks(29);
+	test("18 asked entries stay lit and counted after acknowledgement", () => {
+		const ask = Array.from({ length: 18 }, (_, n) =>
+			cardFixture({ id: `ask${n}` }),
+		);
+		const probe = appInboxMeta(
+			null,
+			new Set<string>(),
+			null,
+			null,
+			[],
+			ask,
+			[],
+			[],
+			[],
+			0,
+			"",
+		);
+		const ackLocal = new Set(probe.entries.map((e) => e.key));
+		const meta = appInboxMeta(
+			null,
+			ackLocal,
+			null,
+			null,
+			[],
+			ask,
+			[],
+			[],
+			[],
+			0,
+			"",
+		);
+		expect(meta.inbox.total).toBe(18);
 		expect(meta.inbox.fresh.length).toBe(0);
+		expect(meta.inbox.lit).toBe(true);
+		const html = bell(meta);
+		expect(html).toContain('class="icon inbox lit"');
+		expect(html).toContain('data-level="asked"');
+		expect(html).toContain('<span class="inbox-n">18</span>');
+		expect(html).toContain('aria-label="Notifications, 0 new of 18"');
+	});
+
+	test("only read notices leave the bell grey; the badge keeps the count", () => {
+		const info = Array.from({ length: 6 }, (_, n) => `notice:n${n}`);
+		const probe = appInboxMeta(
+			null,
+			new Set<string>(),
+			null,
+			null,
+			[],
+			[],
+			[],
+			info,
+			[],
+			0,
+			"",
+		);
+		const ackLocal = new Set(probe.entries.map((e) => e.key));
+		const meta = appInboxMeta(
+			null,
+			ackLocal,
+			null,
+			null,
+			[],
+			[],
+			[],
+			info,
+			[],
+			0,
+			"",
+		);
 		expect(meta.inbox.lit).toBe(false);
 		const html = bell(meta);
 		expect(html).toContain('class="icon inbox"');
 		expect(html).not.toContain("icon inbox lit");
-		expect(html).toContain('<span class="inbox-n">29</span>');
-		expect(html).toContain('aria-label="Notifications, 29"');
+		expect(html).toContain('<span class="inbox-n">6</span>');
 	});
 });
