@@ -92,7 +92,9 @@ afterAll(async () => {
 	for (const [i, store] of stores.splice(0).entries())
 		await closeNamed(store, i);
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-});
+	// Closing every sqlite store and removing the tree can take past bun's 5 s
+	// hook default on a busy host, which fails the file without any test failing.
+}, 20_000);
 
 const sha = (c: string) => c.repeat(40);
 const pr = (

@@ -4310,14 +4310,11 @@ describe("seed-only", () => {
 		);
 	}, 60_000);
 
-	test("a run that another run holds the lock for exits 0 without a docker call", async () => {
+	test("a seed-only run that another run holds the lock for exits 0 without a docker call", async () => {
 		const { main } = checkout();
 		const data = checkout();
 		const lock = updateLockPath(main);
 		writeFileSync(lock, JSON.stringify({ pid: process.pid }));
-		const other = checkout();
-		const fullLock = updateLockPath(other.main);
-		writeFileSync(fullLock, JSON.stringify({ pid: process.pid }));
 		try {
 			const f = fakes({ seedRecord: unrecorded });
 			expect(
@@ -4333,17 +4330,167 @@ describe("seed-only", () => {
 				pid: process.pid,
 			});
 			expect(f.logs.join("\n")).toContain("holds the lock");
-
-			// The full run behaves the same against its own pre-created lock.
-			const g = fakes();
-			expect(await updateImage(other.main, ["-f", "c.yml"], g.deps, {})).toBe(
-				0,
-			);
-			expect(g.calls).toEqual([]);
-			expect(g.logs.join("\n")).toContain("holds the lock");
 		} finally {
 			rmSync(lock, { force: true });
-			rmSync(fullLock, { force: true });
+		}
+	}, 60_000);
+
+	test("the full run waits for the lock, takes it once the holder dies, and runs", async () => {
+		const { main } = checkout();
+		const lock = updateLockPath(main);
+		const dead = Bun.spawnSync(["bun", "-e", ""], { stdout: "ignore" });
+		// The holder pid is this test process (always live); after the first poll
+		// it "dies", and the waiting run takes the dead holder's lock over.
+		writeFileSync(lock, JSON.stringify({ pid: process.pid }));
+		try {
+			const f = fakes({
+				onWait: () => writeFileSync(lock, JSON.stringify({ pid: dead.pid })),
+			});
+			expect(await updateImage(main, ["-f", "c.yml"], f.deps, {})).toBe(0);
+			expect(f.waits).toEqual([5000]);
+			expect(f.logs.join("\n")).toContain("this run waits up to 10 min");
+			// The run went past the lock: its first docker call happened.
+			expect(f.calls[0]).toBe(PS);
+			// The taken-over lock is ours again, so the release removes it.
+			expect(existsSync(lock)).toBe(false);
+		} finally {
+			rmSync(lock, { force: true });
+		}
+	}, 60_000);
+
+	test("the full run that waits 10 min in vain stops with an error and leaves the lock", async () => {
+		const { main } = checkout();
+		const lock = updateLockPath(main);
+		// This test process stays alive, so the holder stays live for every poll.
+		writeFileSync(lock, JSON.stringify({ pid: process.pid }));
+		try {
+			const f = fakes();
+			expect(await updateImage(main, ["-f", "c.yml"], f.deps, {})).toBe(1);
+			// 10 min at a 5 s poll: 120 waits, then the deadline give-up.
+			expect(f.waits).toHaveLength(120);
+			expect(f.waits.every((ms) => ms === 5000)).toBe(true);
+			expect(f.logs.join("\n")).toContain(
+				"another update-image run still holds the lock after 10 min; this run stops",
+			);
+			expect(f.calls).toEqual([]);
+			// The run never owned the lock, so the release spares the holder's file.
+			expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual({
+				pid: process.pid,
+			});
+		} finally {
+			rmSync(lock, { force: true });
+		}
+	}, 60_000);
+
+	test("a dead holder's lock is taken over and released again", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const lock = updateLockPath(main);
+		const dead = Bun.spawnSync(["bun", "-e", ""], { stdout: "ignore" });
+		writeFileSync(lock, JSON.stringify({ pid: dead.pid }));
+		try {
+			const f = fakes({ seedRecord: head });
+			expect(
+				await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			// The run went past the dead holder's lock and did the compare.
+			expect(f.calls).toEqual([DATA_READ]);
+			// The takeover made the lock ours, so the release removed it.
+			expect(existsSync(lock)).toBe(false);
+		} finally {
+			rmSync(lock, { force: true });
+		}
+	}, 60_000);
+
+	test("an unparseable lock file counts as dead and is taken over", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const lock = updateLockPath(main);
+		writeFileSync(lock, "not json at all");
+		try {
+			const f = fakes({ seedRecord: head });
+			expect(
+				await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			expect(f.calls).toEqual([DATA_READ]);
+			expect(existsSync(lock)).toBe(false);
+		} finally {
+			rmSync(lock, { force: true });
+		}
+	}, 60_000);
+
+	test("a holder this run cannot signal (EPERM) keeps the lock", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const lock = updateLockPath(main);
+		const foreignLive = 15728640; // above every Linux pid_max: live only through the mock
+		writeFileSync(lock, JSON.stringify({ pid: foreignLive }));
+		const realKill = process.kill;
+		process.kill = ((pid: number, signal?: number | string) => {
+			if (pid === foreignLive) {
+				const e = new Error("Operation not permitted") as NodeJS.ErrnoException;
+				e.code = "EPERM";
+				throw e;
+			}
+			return realKill(pid, signal as never);
+		}) as typeof process.kill;
+		try {
+			const f = fakes({ seedRecord: unrecorded });
+			expect(
+				await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			expect(f.calls).toEqual([]);
+			expect(f.logs.join("\n")).toContain("holds the lock");
+			// The live holder's lock survives untouched.
+			expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual({
+				pid: foreignLive,
+			});
+		} finally {
+			process.kill = realKill;
+			rmSync(lock, { force: true });
+		}
+	}, 60_000);
+
+	test("the release spares a lock it no longer owns", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const lock = updateLockPath(main);
+		const dead = Bun.spawnSync(["bun", "-e", ""], { stdout: "ignore" });
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		// After the first docker call (the record read), a takeover rewrites the
+		// lock to a foreign pid: this run's release must leave that file alone.
+		const inner = f.deps.docker;
+		f.deps.docker = async (...args) => {
+			const r = await inner(...args);
+			writeFileSync(lock, JSON.stringify({ pid: dead.pid }));
+			return r;
+		};
+		try {
+			expect(
+				await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			expect(f.seedRuns).toHaveLength(1);
+			// The foreign lock survives the release...
+			expect(existsSync(lock)).toBe(true);
+			expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual({
+				pid: dead.pid,
+			});
+		} finally {
+			rmSync(lock, { force: true });
 		}
 	}, 60_000);
 

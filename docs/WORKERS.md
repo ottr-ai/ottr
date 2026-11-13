@@ -463,15 +463,18 @@ they differ, and records the commit. No build, no git fetch, no restart. A faile
 exits 1 and the board shows the seed-failed notice as before.
 
 The full run and the seed-only run share one lock per checkout, so the two never run at
-the same time. A run that finds the lock held exits 0 and logs one line. A host cycle
-that a seed run blocks deploys at the next cycle.
+the same time. A seed-only run that finds the lock held exits 0 and logs one line; its
+next start is 5 minutes later. The full run waits up to 10 minutes for the seed to
+finish, then stops with an error, and the host controller reports the failed cycle in
+the bell. Start the seed task at :02 of its slot, so it never starts on the full hour,
+where an hourly full-run task starts.
 
 Windows Task Scheduler (run once in the checkout, in cmd or PowerShell; replace each
 path placeholder; a path that holds spaces cannot appear in this line, keep tool and
 checkout paths without spaces or use the persistent host command above):
 
 ```sh
-schtasks /Create /TN "Ottr board seed" /TR "cmd /c cd /d <checkout> && bun scripts\update-image.ts --seed-only -f docker-compose.yml --env-file <env> >> %LOCALAPPDATA%\ottr-board-seed.log 2>&1" /SC MINUTE /MO 5 /ST 00:00 /F
+schtasks /Create /TN "Ottr board seed" /TR "cmd /c cd /d <checkout> && bun scripts\update-image.ts --seed-only -f docker-compose.yml --env-file <env> >> %LOCALAPPDATA%\ottr-board-seed.log 2>&1" /SC MINUTE /MO 5 /ST 00:02 /F
 ```
 
 Read the log at `%LOCALAPPDATA%\ottr-board-seed.log`.

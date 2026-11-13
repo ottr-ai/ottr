@@ -20,8 +20,8 @@ import { createHash } from "node:crypto";
 // (.github/workflows/omp-bump.yml), so a host needs read access and never pushes.
 // Its arguments go to every `docker compose` call, e.g. -f docker-compose.yml -f <override>.
 // `--seed-only` seeds the board's agent layer only when the data source moved — no
-// build, no pull, no restart. Both modes share one lock, so a run that another run
-// holds the lock for exits 0 with one log line.
+// build, no pull, no restart. Both modes share one lock: the seed-only run skips with
+// exit 0 when the lock is held, and the full run waits up to 10 minutes, then exits 1.
 import {
 	closeSync,
 	existsSync,
@@ -2105,13 +2105,26 @@ export function updateLockPath(repo: string): string {
 	);
 }
 
+/** How often the waiting full run re-reads the lock. */
+const LOCK_POLL_MS = 5_000;
+/** How long the full run waits for a seed-only run's lock before it stops with an error. */
+const LOCK_WAIT_MS = 10 * 60_000;
+
 /**
- * Takes the run lock, or reports the live holder and takes nothing — there is no
- * waiting. A lock whose pid is gone (a hard-killed run's leftover) is dead, and this
- * run steals it: the file is removed and the create is retried.
+ * Takes the run lock. A live holder skips the seed-only run at once (its next start is
+ * 5 minutes later) and makes the full run poll up to LOCK_WAIT_MS (10 min) before it
+ * gives up — a full run never skips as a success, because the host controller reads
+ * exit 0 as a finished cycle. A lock whose pid is gone (a hard-killed run's leftover)
+ * is dead, and this run steals it: the file is removed and the create is retried.
  */
-function acquireLock(repo: string, d: Deps, seedOnly: boolean): boolean {
+async function acquireLock(
+	repo: string,
+	d: Deps,
+	seedOnly: boolean,
+): Promise<boolean> {
 	const path = updateLockPath(repo);
+	const deadline = d.now() + LOCK_WAIT_MS;
+	let told = false;
 	for (;;) {
 		try {
 			const fd = openSync(path, "wx");
@@ -2124,32 +2137,41 @@ function acquireLock(repo: string, d: Deps, seedOnly: boolean): boolean {
 		} catch (e) {
 			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
 		}
-		let live = false;
-		try {
-			const holder = JSON.parse(readFileSync(path, "utf8")) as {
-				pid?: unknown;
-			};
-			// An unreadable or unparseable file counts as a dead holder, and a
-			// kill that does not throw means the holder still runs.
-			if (typeof holder.pid === "number") {
-				process.kill(holder.pid, 0);
-				live = true;
-			}
-		} catch (e) {
-			// A process of another user cannot be signalled but still runs (the
-			// same read scripts/stryker-load.mjs makes); anything else is a dead
-			// holder, and this run steals the lock below.
-			if ((e as NodeJS.ErrnoException).code === "EPERM") live = true;
+		if (!holderLive(path)) {
+			rmSync(path, { force: true });
+			continue;
 		}
-		if (live) {
+		if (seedOnly || d.now() >= deadline) {
 			d.log(
 				seedOnly
 					? "another update-image run holds the lock; the seed-only run skips"
-					: "another update-image run holds the lock; this run skips",
+					: `another update-image run still holds the lock after ${LOCK_WAIT_MS / 60_000} min; this run stops`,
 			);
 			return false;
 		}
-		rmSync(path, { force: true });
+		if (!told) {
+			d.log(
+				`another update-image run holds the lock; this run waits up to ${LOCK_WAIT_MS / 60_000} min`,
+			);
+			told = true;
+		}
+		await d.wait(LOCK_POLL_MS);
+	}
+}
+
+/** Whether the lock's recorded pid still runs. An unreadable or unparseable file counts
+ * as a dead holder, a kill that does not throw as a live one, and a process of another
+ * user (EPERM) as a live one — the same read scripts/stryker-load.mjs makes. */
+function holderLive(path: string): boolean {
+	try {
+		const holder = JSON.parse(readFileSync(path, "utf8")) as {
+			pid?: unknown;
+		};
+		if (typeof holder.pid !== "number") return false;
+		process.kill(holder.pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code === "EPERM";
 	}
 }
 
@@ -2248,7 +2270,8 @@ async function deployMain(
 
 /**
  * Deploys main under the shared run lock. When another run holds the lock, this run
- * logs one line and exits 0; the exit code is 1 when the deploy stopped early or failed.
+ * waits up to 10 minutes and then stops with exit 1 — never a silent skip; the exit
+ * code is 1 when the deploy stopped early or failed.
  */
 export async function updateImage(
 	repo: string,
@@ -2256,7 +2279,7 @@ export async function updateImage(
 	d: Deps,
 	env: Record<string, string | undefined> = process.env,
 ): Promise<number> {
-	if (!acquireLock(repo, d, false)) return 0;
+	if (!(await acquireLock(repo, d, false))) return 1;
 	try {
 		return await deployMain(repo, compose, d, env);
 	} finally {
@@ -2267,7 +2290,7 @@ export async function updateImage(
 /**
  * Seeds the board's agent layer only when the data source moved: no build, no pull, no
  * restart — the seed is the whole job. Shares the run lock with the full deploy, so a
- * blocked run logs one line and exits 0.
+ * blocked seed-only run logs one line and exits 0; its next start is 5 minutes later.
  */
 export async function seedOnlyUpdate(
 	repo: string,
@@ -2275,7 +2298,7 @@ export async function seedOnlyUpdate(
 	d: Deps,
 	env: Record<string, string | undefined> = process.env,
 ): Promise<number> {
-	if (!acquireLock(repo, d, true)) return 0;
+	if (!(await acquireLock(repo, d, true))) return 0;
 	try {
 		const seed = await seedSource(d, env, repo);
 		if (seed === null) return 0; // seedSource already logged the skip.
