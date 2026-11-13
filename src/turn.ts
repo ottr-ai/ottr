@@ -1354,11 +1354,15 @@ export function replyPatch(
 ): TaskPatch {
 	return {
 		pendingPrompt: queuedReply(task.pendingPrompt, text),
+		// The flag titles the whole queue: any user text in it makes it "user",
+		// so the gate runs on a reply that lands on queued supervisor text
+		// (OTTR-904 send-back). The "." marker appends nothing, so it changes
+		// no authorship.
 		pendingBy:
 			task.pendingPrompt === null
 				? by
-				: task.pendingBy === "supervisor"
-					? "supervisor"
+				: text === "."
+					? (task.pendingBy ?? by)
 					: "user",
 		pendingImages: [...task.pendingImages, ...images],
 		state: "queued",

@@ -247,6 +247,12 @@ export interface GateAssumption {
   stored hash. Only the prompt before the first work turn and user text (an
   edit, a reply, or a steer) run the gate. The omp session still receives
   the supervisor text; only the gate ignores it.
+- One flag titles the whole queue, so the writers keep the title honest:
+  a user reply or steer that lands on queued supervisor text flips
+  `pendingBy` to `"user"` — the queue now holds user text, and the gate
+  runs on it. A send-back that lands under a queued user steer keeps
+  `"user"`. Only a queue with no user text in it stays `"supervisor"`;
+  the resume marker `"."` changes no authorship.
 - `gateCompareText(prompt, pending, seen)` — `gateEffectiveText(prompt,
   gateUserText(pending, seen))`; consumed replies compare through `seen`.
 - `gateFingerprint(text)` — sha256 hex.

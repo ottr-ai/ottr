@@ -9847,16 +9847,11 @@ export async function createApp(deps: AppDeps) {
 				task.pendingPrompt === null
 					? prompt
 					: `${task.pendingPrompt}\n\n${prompt}`,
-			// A message on a card held for a usage limit runs it now: user authorship
-			// plus the cleared holdUntil is the run-now signal the turn loop's start
-			// gate reads. A combined park is only titled as supervisor when no hold
-			// was involved (the tracker's own "." resume under it stays tracker text).
-			pendingBy:
-				task.holdUntil !== null
-					? "user"
-					: task.pendingBy === "supervisor"
-						? "supervisor"
-						: "user",
+			// A steer is user text: the queue now holds user text, so the gate
+			// runs on it even when the queue carried supervisor text before
+			// (OTTR-904 send-back). The run-now signal below is unchanged: a
+			// user message on a held card clears the hold and runs it now.
+			pendingBy: "user",
 			pendingImages: [...task.pendingImages, ...names],
 			holdUntil: null,
 		});
@@ -10330,7 +10325,11 @@ export async function createApp(deps: AppDeps) {
 				directionSection === null ? text : `${text}\n${directionSection}`,
 			),
 			...(stampedLog === null ? {} : { workCheckLog: stampedLog }),
-			pendingBy: "supervisor",
+			// A send-back under a queued user steer keeps "user": the queue
+			// holds user text, so the gate runs on it (OTTR-904 send-back).
+			// Only a fresh queue (no pending text) is supervisor-authored.
+			pendingBy:
+				task.pendingPrompt === null ? "supervisor" : (task.pendingBy ?? "user"),
 			workCheckSendbacks: n,
 			state: "queued",
 			holdUntil: null,

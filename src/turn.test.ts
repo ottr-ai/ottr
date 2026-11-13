@@ -25875,6 +25875,36 @@ describe("prompt gate", () => {
 		expect(calls).toBe(2);
 	});
 
+	test("a user reply on a queued send-back runs the gate", async () => {
+		let calls = 0;
+		const { store, loop } = setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return clearCheck();
+			},
+		});
+		const task = store.createTask("clear work");
+		await loop.runTurn(store.name, task.id);
+		expect(store.getTask(task.id)!.gate?.hash).not.toBeNull();
+		expect(calls).toBe(1);
+		// The send-back queues supervisor text, and the user answers it: the reply
+		// route queues through replyPatch, so the queue now holds user text and
+		// the gate must judge prompt plus queue.
+		store.updateTask(task.id, {
+			state: "queued",
+			queuedAt: Date.now(),
+			pendingPrompt:
+				"The board's check run stopped at a blocker. Fix it and report ready again.",
+			pendingBy: "supervisor",
+		});
+		const live = store.getTask(task.id)!;
+		store.updateTask(task.id, replyPatch(live, "fix the README first"));
+		expect(store.getTask(task.id)!.pendingBy).toBe("user");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(2);
+	});
+
 	test("a pass folds the queued answer into seen and keeps earlier answers", async () => {
 		let calls = 0;
 		let userMessages: string | null | undefined;
@@ -26534,3 +26564,43 @@ describe("async completion stop boundaries", () => {
 		},
 	);
 });
+
+describe("queue authorship (OTTR-904 send-back)", () => {
+	const queued = (
+		pendingPrompt: string | null,
+		pendingBy: "user" | "supervisor" | null,
+	) =>
+		({
+			pendingPrompt,
+			pendingBy,
+			pendingImages: [],
+		}) as Parameters<typeof replyPatch>[0];
+
+	test("a user reply on queued supervisor text titles the queue user", () => {
+		const patch = replyPatch(
+			queued("Send-back 1 of 4: fix and report ready again.", "supervisor"),
+			"fix the README first",
+		);
+		expect(patch.pendingBy).toBe("user");
+	});
+
+	test("the resume marker changes no authorship", () => {
+		const patch = replyPatch(
+			queued("Send-back 1 of 4: fix and report ready again.", "supervisor"),
+			".",
+		);
+		expect(patch.pendingBy).toBe("supervisor");
+		expect(patch.pendingPrompt).toBe(
+			"Send-back 1 of 4: fix and report ready again.",
+		);
+	});
+
+	test("a user reply on user text stays user", () => {
+		const patch = replyPatch(
+			queued("use Postgres", "user"),
+			"and pin the version",
+		);
+		expect(patch.pendingBy).toBe("user");
+	});
+});
+>>>>>>> 4584248 (fix: user text in the queue always reaches the prompt gate)

@@ -6729,7 +6729,7 @@ describe("steer cancel route", () => {
 		expect(after.pendingBy).toBe("user");
 	});
 
-	test("a steer under a supervisor park without a hold keeps supervisor authorship", async () => {
+	test("a steer under a supervisor park titles the queue user", async () => {
 		const t = await store.createTask("running with a park");
 		await store.updateTask(t.id, {
 			state: "running",
@@ -6741,7 +6741,9 @@ describe("steer cancel route", () => {
 		expect(after.pendingPrompt).toBe(
 			"the merge is held: resolve the conflict\n\ntake theirs",
 		);
-		expect(after.pendingBy).toBe("supervisor");
+		// A steer is user text: the queue now holds user text, so the gate
+		// runs on it even though the queue carried supervisor text before.
+		expect(after.pendingBy).toBe("user");
 	});
 
 	test("nothing queued, or an automatic resume, is 409", async () => {
@@ -9221,6 +9223,25 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.pendingPrompt).not.toContain("goes to needs_you");
 		expect(row.pendingPrompt).toContain("still open");
 		expect(row.pendingPrompt).not.toContain("already fixed");
+	});
+
+	test("a send-back under a queued user steer keeps the user title", async () => {
+		const t = parked();
+		// A user steer is already queued when the check's send-back lands under it:
+		// the queue holds user text, so the gate must keep judging it (OTTR-904).
+		store.updateTask(t.id, {
+			pendingPrompt: "also tighten the docs",
+			pendingBy: "user",
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "Send it back",
+		});
+		expect(res.status).toBe(200);
+		const row = store.getTask(t.id)!;
+		expect(row.pendingBy).toBe("user");
+		// The send-back lands under the queued steer, so the steer text leads.
+		expect(row.pendingPrompt).toStartWith("also tighten the docs\n\n");
+		expect(row.pendingPrompt).toContain(WORK_CHECK_SENDBACK_OPENING);
 	});
 
 	test("any other answer is a plain reply to the agent", async () => {
