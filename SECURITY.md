@@ -14,4 +14,4 @@ Only the newest release and the newest commit on `main` get security fixes.
 
 ## Scope
 
-Ottr runs coding agents with full shell access in your projects, and it stores credentials in its tracker database (see [Requirements](README.md#requirements)). This is by design. A vulnerability is a way to get more access than the owner of the board gave, for example to use the board or its API without a login, or to read a stored credential.
+Ottr runs coding agents with full shell access in your projects, and it stores credentials in its tracker database (see [Requirements](docs/install.md#requirements)). This is by design. A vulnerability is a way to get more access than the owner of the board gave, for example to use the board or its API without a login, or to read a stored credential.

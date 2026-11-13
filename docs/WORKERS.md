@@ -110,7 +110,7 @@ od -An -tx1 -N8 shots/board.png
 agent-browser --session "$session" close
 ```
 
-Use the demo board and fresh port from the [screenshot proof policy](../README.md#screenshot-proofs-for-ui-cards).
+Use the demo board and fresh port from the [screenshot proof policy](development.md#screenshot-proofs-for-ui-cards).
 Use the board URL, not the omp stats URL, from the dev log.
 Write the screenshot directly to its final PNG path.
 Never pass image bytes through agent text.
@@ -597,7 +597,7 @@ installs only. The image carries no JDK and no Maven; it carries `python3` and
 
 A work turn builds container images when the compose `build` profile runs: the
 rootless BuildKit sidecar (the `buildkit` service, specified in
-[docs/specs/turn-image-builds.md](docs/specs/turn-image-builds.md)). No worker
+[docs/specs/turn-image-builds.md](specs/turn-image-builds.md)). No worker
 ever talks to the host Docker daemon. No host socket enters the stack, and the
 sidecar runs without privileged mode. The sidecar holds no credentials and
 publishes no port; it sits on its own compose network together with the workers.
@@ -712,7 +712,8 @@ real podman.
   in Settings → GitHub → GitHub host; a saved value wins over the env
   until cleared. Compose reads the
   value from the host shell or the compose env file and passes it to the
-  server only; workers never use it. Refer to the README row "GitHub host".
+  server only; workers never use it. Refer to the "GitHub host" row in
+  [docs/configuration.md](configuration.md).
 - Unset `OTTR_WORKER_URLS` = local spawn on the server host (the default;
   `runner.startRun` stays the reference implementation). When the variable is
   set, a work turn never runs on the server: if a worker is down or answers
@@ -1278,7 +1279,7 @@ change also needs them: an existing stack starts with an empty `board-config` vo
    scans for secrets first. The `create-data-repo` skill already runs this capture; run
    the command again after you change your omp setup, then provision again. Run this
    before the first provision, so the first install already carries your layer
-   ([README, After the first start](../README.md#after-the-first-start)).
+   ([After the first start](install.md#after-the-first-start)).
 2. Run the seed. For a private data repo, export `GH_TOKEN` first:
    `docker compose run --rm board-seed --repo <owner/name>`.
    To use a local checkout of the data repo, run

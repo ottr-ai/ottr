@@ -4,6 +4,10 @@
 
 <h1 align="center">Ottr – The Task Tracker for Oh My Pi</h1>
 
+<p align="center">A local kanban board that runs omp coding agents on your git projects.</p>
+
+<p align="center"><a href="#install">Install</a>&ensp;·&ensp;<a href="#quick-start">Quick start</a>&ensp;·&ensp;<a href="docs/how-it-works.md">Documentation</a>&ensp;·&ensp;<a href="https://github.com/ottr-ai/ottr/releases">Releases</a></p>
+
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"/></a>
   <a href="https://bun.sh"><img alt="Runtime: Bun" src="https://img.shields.io/badge/runtime-Bun-000000?logo=bun&logoColor=white"/></a>
@@ -12,7 +16,7 @@
   <a href="https://github.com/ottr-ai/ottr"><img alt="Repo" src="https://img.shields.io/badge/repo-ottr--ai%2Fottr-181717?logo=github"/></a>
 </p>
 
-Ottr (**O**hMyPi **T**ask **Tr**acker) is a local kanban board that runs omp coding agents on your git projects. You type a task in plain language. Ottr gives it a git worktree, runs the agent in it, checks the result, and merges through a per-project queue. It enforces the process; your project's `AGENTS.md` enforces quality. Everything runs on your machine; the board binds `127.0.0.1` by default.
+You type a task in plain language. Ottr gives it a git worktree, runs the agent in it, checks the result, and merges through a per-project queue. It enforces the process; your project's `AGENTS.md` enforces quality. Everything runs on your machine; the board binds `127.0.0.1` by default.
 
 Ottr is mainly built with Ottr itself.
 
@@ -20,122 +24,15 @@ Ottr is mainly built with Ottr itself.
   <img alt="The Ottr board: tasks move from Todo through In progress and Merging to Done" src=".github/assets/screenshot.png" width="100%"/>
 </p>
 
-## How a task moves
+## Install
 
-<p align="center">
-  <img alt="The task workflow: a card runs from Todo through In progress and Merging to Done." src="src/ui/workflow-task.svg" width="100%"/>
-</p>
+Requirements: Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`; see [Requirements](docs/install.md#requirements).
 
-| Column | What happens |
-|---|---|
-| Todo | Waits for a free slot: 2 agents per project, 3 in total. Cards can declare dependencies and split into sub-task cards. |
-| In progress | Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it. The agent finishes with the `report_outcome` tool. |
-| Merging | A second turn rebases, re-runs the project's checks, and integrates the work the way `AGENTS.md` says. When the server push races a moved origin, the server first retries the rebase, checks and push itself, and only turns to a recovery merge turn when that cannot converge. One merge turn per project at a time. While main holds commits origin lacks, the project's other merges wait — `waiting for main to reach origin/main` — until a repairing merge pushes: the automatic server-side retry, or the parked card itself after you reply to it. |
-| Done | The report passed the git checks. Worktree and branch are gone. The lane shows the newest 20 cards and every unread card (an answer or a PR review not opened yet). **Show more** loads 20 more. A star on a done research card pins its report in a collapsible **Starred** section above the normal done cards. A cancelled card also shows here, with a **Cancelled** chip that names the cancel time; its drawer opens read-only, with no action buttons. A project with a task that finished and whose drawer you have not opened yet shows a steel-blue dot in the left project list, ranked below needs action, asked and running; opening that task's drawer, by a click or a pasted link, clears it, and a task that lands in Done again shows the dot again. The read mark is kept on the server, so it holds across reloads and devices; tasks done before this dot shipped count as read. |
-| Backlog | Parks ideas that are not ready to run. The list sits under Todo below a divider. A grill session refines an idea; a grilled card moves to Todo. While the grill session runs, the card leaves the backlog row and shows as a normal card in the Todo lane. |
+Every full variant — Windows PowerShell, the Alate provisioning block, the agent-db seed, and the Podman notes — is in [docs/install.md](docs/install.md).
 
-On phones, stage tabs keep equal widths and complete labels.
-Scroll the tab strip to reach more stages.
-The strip keeps the active stage label in view after a tap, swipe, or keyboard change.
-The Ottr logo links to the home page and keeps its accessible name when the wordmark is hidden.
+### Docker Compose, latest release
 
-Ottr checks every report against git: `ready` needs commits ahead of the base and a clean worktree; `answered` needs no commits; `integrated` needs the branch head on the upstream branch.
-
-For an `answered` report, Ottr keeps the exact `summary` in the card and the turn record. A follow-up handoff includes the card summary under **Final outcome**. Call `report_outcome` directly, not through `eval`.
-
-Before a card enters the merge queue, a second memory-less model checks it (optional, **Settings**): it reads the card, the diff and the transcript, and hunts for test tampering, fabricated actions, unmet acceptance items, logic errors and security flaws. A blocker must quote the diff or transcript; at most four send-backs. After the fifth block, the card asks you with two buttons: **Send it back** or **Merge anyway**. The board also asks at once when the loop diverges — the blocker count did not drop over two send-backs, or one bug class repeats in two checks — then with **Send back with a new approach**, **Merge anyway** or **Cancel**.
-
-A **research** task answers a question instead of changing code: the agent writes a report that Ottr archives on the card. Research cards end `answered` and never merge. A starred done research card shows a star in place of the done check, and the star icon in its drawer pins the report in the done lane's **Starred** section, so you can find it again. The **Implement steps** button on a research report that recommends steps starts a follow-up task that implements the recommended steps of the report. That task files a separate card for each independent piece of work. A done card keeps every file its run left uncommitted: the board saves them into the project's `.tasks/quarantine/<task id>` folder before it removes the worktree, and the drawer lists them under **Saved files**; the research report also stays on the card as before.
-
-A **backlog** card holds a feature idea that is not thought through yet. Park a draft with **Add draft** in the backlog row of the todo lane, or press **B**; a draft runs no agent and picks no model. Open the card and pick **Plan with agent** — or **Move to todo** — and you pick the model at that moment, or leave it empty to use the project's role model: the agent asks rounds of questions, you answer with a click, and the refined task text lands in the report. Before the agent reports, a fresh subagent that sees only the refined text says what it would build and lists its open questions. A mismatch gives one more round, and the check runs at most two times. Until a parked card starts, **Edit task** rewrites its text; the title follows the new text. When the item is ready, pick **Move to todo**; Ottr appends the grilled definition to the prompt and the card enters the normal queue.
-
-For a project with a GitHub remote, Ottr watches CI after each merge push and files a follow-up card with the failed steps' log when a run fails. When a card's text links a run (`https://github.com/<owner>/<repo>/actions/runs/<run_id>`), its drawer offers **Re-run failed jobs**: the board calls the rerun-failed-jobs API with its stored token, so a one-off flake never leaves the board. On a 403 or 404 the drawer shows an error naming the missing `actions:write` scope. Once an hour it turns each open Dependabot pull request into a card that runs like any task. A cancelled card keeps blocking its PR; the drawer's **Refile** action on the cancelled card files a fresh one with the source PR's fields, and a card that still covers the PR — open or done — refuses the refile.
-
-A card with **!** needs you. Reply in its drawer and the agent continues in the same session. A todo card whose text is too vague to build without guessing (say, "add a password-forgotten feature") parks here before the agent changes any file: it asks you rounds of questions with clickable options, like a backlog grill, and builds once your answers settle the intent. The composer's **Deepen** rewrite never guesses those choices for you: it lists them under **Open questions**, and the agent asks them first. A model gate checks every work prompt a person wrote before the agent runs: open questions or a missing outside check park the card with clickable questions and a **Start anyway** override, cards the board filed itself skip the model call, and the Deepen review shows which of the five points the rewrite improved next to its diff. You can also steer a running task, edit a queued steer before the agent gets it, stop its current turn, cancel any card, paste images, and start follow-ups from Done cards; the follow-up dialog's **Project** picker files the follow-up into another project's board, linked back to the done card. The bell in the header collects everything that needs you; optional push notifications (**Settings → Notifications**) reach desktops and phones. See [docs/notifications.md](docs/notifications.md). Cards can carry a **triage rank** (P0-P3, set in the drawer): the Overview triage ranks them ahead of wait time, and a close-candidate badge marks cards you plan to cancel.
-
-A proposal card (a retro or fork proposal parked with **!**) opens on a **Decide** panel at the top of its drawer: what changes, why, the gain, the risk and the check, each on one line, with **Accept**, **Edit** and **Cancel** beside them and the full prompt under a collapsed section. The board card carries a **Decide** button that opens the drawer. Accept starts the card, Edit rewrites its prompt first, Cancel declines it. Older proposals without the stored summary show the prompt's first paragraph instead of the five lines.
-
-When a running turn writes nothing to its task log for 2 hours, its card shows a warning: the agent may wait on a hung command. Ottr does not stop the run. Steer, stop, or cancel the card. The warning goes away when the log grows again. A log that reached its 2 MiB limit keeps no new text, but new output still clears the warning.
-
-If a turn fails without stderr, its card shows the provider's error when the event stream has one. The task log records it too. Ottr removes stored secrets, labeled secrets, URL credentials, and common API tokens from this error. A check run that dies because its model's provider has no usable sign-in names the provider on the card, with the fix: sign in again under Settings. When a run serves another model than the card dispatched — the provider errored and omp's retry chain fell back — the task log names both models and the card keeps the pick for its next turn; the turn's row in **Work steps** reads "dispatched … , ran …". The bell lists an advisory for every configured model role whose provider's stored sign-in omp has disabled, with omp's disabled cause and the role names.
-
-On screens ≤720px wide, **Overview → Projects** and **Performance** show labelled rows with native table semantics. Project links, **New task**, performance range controls, and **Context (max)** task links remain available. Desktop tables stay unchanged.
-
-The **System** page (`/system`, in the sidebar under Overview) shows where the machine runs out. Each container (the server, then each worker in `OTTR_WORKER_URLS`) gets one row. A row shows its CPU against its share, memory used against its limit (cgroup `memory.current`, page cache included, as the kernel counts it against the limit), memory limit hits, OOM kills, the turns running on it, and its mutation lock holder and waiters, with one-hour sparklines. The numbers come from the container's own cgroup v2 files; workers report theirs on `GET /stats`. On a worker, each turn also shows its own share: memory now and its peak, CPU now, and the CPU time since the turn started. The worker reads these numbers from the turn's process tree in `/proc` (the `omp` process and all its child processes). Memory is the sum of Pss, so a shared page counts once across all turns. The turn with the most memory comes first. The peak comes from the 30 s samples, and it starts over when the board restarts. Server turns show no numbers. A row turns amber, with the reason as text, at 90 % of its memory limit, after an OOM kill in the last hour, or at 90 % of its CPU share for 5 minutes. The header then shows a warning mark that links to the page. A worker that does not answer reads "not reachable since HH:MM". The page also shows the Docker VM (CPU, load, available memory) and the board-wide holds: the update hold with its commits, running agents against the cap, and the queue with its oldest wait. Samples come every 30 s; the hour of history lives in memory and starts over when the board restarts.
-
-## Workflows: review and release
-
-<p align="center">
-  <img alt="The review workflow: a read-only review card runs the full verification and files its findings as task cards." src="src/ui/workflow-review.svg" width="100%"/>
-</p>
-
-<p align="center">
-  <img alt="The release workflow: the release preview turns into the same review, then Ottr tags the reviewed commit and publishes." src="src/ui/workflow-release.svg" width="100%"/>
-</p>
-
-The project's **Start review** button starts a read-only review card: full verification, mutation tests, a security audit, and a UI/UX check (the ui-ux-check skill) over the UI that the reviewed commits change. It ranks its findings, files the confirmed ones as task cards, files the ones tagged "Needs validation" as Backlog cards marked unverified (the second-model check never ran on them, and they never hold the review's Done) unless a card in the project already holds the lead's audit fingerprint, and it is done only when its confirmed findings are all done. Each lead names its blocker on one line. Leads that wait on a fact only you know (for example a proxy setting) file one question card per review; your answer queues the lead card, cancels it, or leaves it in the Backlog with your answer. Leads that wait on a validation sandbox stay in the Backlog with a note. The findings live on the review card from the moment the reviewer records them, and Done waits until a check pass has covered them. Review conventions live in the project's AGENTS.md. Every review turn reads AGENTS.md in its worktree. The retired `learnings` table in tasks.db stays unused.
-
-Normal, idle and release reviews also check implicit state machines.
-The read-only check selects the two lifecycle fields with the most writers among fields that the reviewed commits write.
-It checks writer guards and requires a call path plus test or command proof for each finding.
-See the [review process](docs/ARCH-REVIEWS.md#what-the-review-does) for its scope and proof rules.
-
-Ottr's security phase uses `skill://security-audit-harness`, even when the generic prompt names `security-audit`. Normal reviews use all six phases with the `quick` profile and disclose partial coverage, including for generic full-audit requests. Only an explicit scheduled deep security review uses `deep`. The skill writes structured findings and a coverage ledger, and both must pass its validators before proposals or cards. Only `confirmed` records receive security severity. Reports retain blocked or unproven `needs_validation` records without severity.
-
-The skill requires the Alate import and provision steps on each host and worker before use. If the skill is absent, the review reports this prerequisite instead of another skill. [The security audit spec](docs/specs/security-audit-harness.md) defines verdicts, evidence, and sandbox rules. Other review gates stay unchanged.
-
-**Create release** runs the same review since the last tag, then tags the reviewed commit and creates the GitHub release. Versions follow Conventional Commits; a model consolidates the commit list into short notes with Highlights, and the full one-bullet-per-commit list stays one click away. Both are editable before you start the release, and a failed model call falls back to the deterministic list. A commit body line `Supersedes: <sha>` or `Reverts: <sha>` (also git's `This reverts commit <sha>.`) removes the bullet of that commit when it is in the release. A revert of that line's commit cancels the removal. When all `Reverts:` and `Fixes: <sha>` lines of a commit name commits in the release, the commit gets no bullet of its own. A breaking commit always keeps its bullet. You can edit the notes on the release card while it is idle or waits for you. While the release card waits for your approval, its drawer lists the commits that landed after the reviewed one — each merge of a finding card marked "review fix", every other commit marked "not reviewed". Those commits join the published notes under **New features**, **Bug fixes** or **Other changes** by their commit type, the not-reviewed ones with a "(not reviewed)" suffix, and a late `Supersedes:`/`Reverts:` line drops the named commit's bullet there too. A project can set a **release command** instead, which runs at the reviewed commit with `OTTR_RELEASE_VERSION`, `OTTR_RELEASE_COMMIT`, `OTTR_RELEASE_NOTES_FILE` and `OTTR_ARCH_REVIEW` in its environment.
-
-The project header's release chip shows the repo's latest GitHub release — its name when the release's tag is not `vX.Y.Z` — and falls back to the highest `vX.Y.Z` tag merged into the target when the project has no GitHub remote or GitHub does not answer. When the latest GitHub release is not `vX.Y.Z`, Create release stays blocked with an explanation instead of offering a computed next version: Ottr's release flow only tags `vX.Y.Z`. When the project has a GitHub remote, the header also shows its open pull requests: up to three `#number` links (the title on hover, drafts marked), and more than three collapse into one count link to the repo's pulls page. The list re-probes GitHub about every ten minutes and hides itself when GitHub does not answer.
-
-While a review is open, only its finding cards merge — a release ships reviewed work and its fixes, nothing else. Also, the **Create release** and **Start review** buttons stay disabled until the open review or release and its findings are done.
-
-A release card that waits for you with every finding done shows the held merges on the card and offers **Release again**: it cancels the release and opens Create release, so a new review covers the fixes. A card that waits for such a release shows the hold and links to the release card. The board warnings name a release that holds merges for more than an hour after its last finding landed.
-
-**Show diagrams** opens `docs/how-it-works.md` as committed on the target branch, with each Mermaid block drawn as a diagram. **Create/update diagrams** at the top of that window asks for confirmation, then creates a normal task card. Its agent loads the `explain-project` skill and commits `docs/how-it-works.md` with Mermaid diagrams of the project; if the file already exists, the task updates it to match the code. See [Required skills](#required-skills) for where each skill lives.
-
-## Required skills
-
-The board's prompts name skills and rules. A prompt stops with a `needs_you` report when its runner lacks one. The board compares the workers' installed skills with this list and shows the missing ones in **Settings → Alate** and on the affected buttons.
-
-| Skill or rules | Source | Used by |
-| --- | --- | --- |
-| `check-ottr-board` | ships in this repo: `.agents/skills/check-ottr-board` | the **Check the board** button |
-| `diff-security-review` | ships in this repo: `.agents/skills/diff-security-review`; ported from [anthropics/claude-code-security-review](https://github.com/anthropics/claude-code-security-review) (MIT) | every merge turn |
-| `explain-project` | ships in this repo: `.agents/skills/explain-project` | the **Create/update diagrams** button |
-| `ui-ux-check` | ships in this repo: `.agents/skills/ui-ux-check` | reviews of projects with a UI |
-| `security-audit` | [cloudflare/security-audit-skill](https://github.com/cloudflare/security-audit-skill); Ottr substitutes its own `security-audit-harness` when present | every review |
-| codeguard rules | [cosai-oasis/project-codeguard](https://github.com/cosai-oasis/project-codeguard) | every review |
-| `codebase-design` | [mattpocock/skills](https://github.com/mattpocock/skills) | review architecture lens |
-| `ponytail-audit` | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) | review architecture lens |
-| `retro` | ships in this repo: `.agents/skills/retro` | the end-of-task retro |
-
-omp loads `.agents/skills/` from the repo for runs in this checkout. Install a shipped skill into another home with the skills CLI (`npx skills add`). The third-party skills come from their repos with the skills CLI or a data repo.
-
-**Optional shipped skills** — no board prompt needs them; install one into another home with the skills CLI when you want it:
-
-- `llm-to-code` ships in this repo: `.agents/skills/llm-to-code` — finds the recurring agent workflows worth moving, moves the fixed steps of an agent workflow into a script and keeps the model only where real interpretation stays, with `scripts/profile-session.ts` as a session cost profiler.
-- `web-perf-audit` ships in this repo: `.agents/skills/web-perf-audit` — verifies generic performance tips against the code with file:line evidence and real size and header measurements, then writes a verdict report.
-
-## Requirements
-
-- Windows 10/11 or Linux, with [Bun](https://bun.sh) ≥ 1.4.2, git, and `omp` on `PATH`. (macOS is not supported yet.)
-- `gh` ([GitHub CLI](https://cli.github.com)) only for releases, when **Settings** holds no GitHub token.
-- omp must run its tools without approval prompts; a one-shot `omp -p` run cannot answer them.
-- Ottr seals the token and key fields of `.tasks/tracker.db` at rest with the SecretBox key (`OTTR_SECRET_KEY` env wins, `.tasks/secret.key` next to `tracker.db` is the fallback). The sealed fields are: GitHub token, API key, session secret, per-host git tokens, GitHub App key, Alate key, Hindsight API key, the secret env values, and the Web Push private key. The database snapshots hold the sealed values. Treat that file as a credential store, together with its key, and protect the backup dir the same way. [ADR-0011](docs/adr/0011-sealed-token-fields-encrypted-volumes.md) also records: run the state volume, the backup dir, and the SSH key dir on an encrypted volume.
-
-## Quick start
-
-Docker Compose is the preferred way to run Ottr: the board and its worker containers share one image, so every turn gets the same pinned toolchain, and a restart of the host machine brings the whole stack back. The stack is one file, [`docker-compose.yml`](docker-compose.yml).
-
-Every turn and the board's own git calls commit with a default identity (`Ottr <ottr@localhost>`) when the project or the home's git config names none. Change it under **Settings → Git and integrations → Git identity → Commit identity**; a configured `~/.gitconfig` identity wins over the default, and the Settings identity wins over the home's git config when the board git-inits a project.
-For a new project, the board ignores an identity that Git infers from the OS or hostname.
-
-### Latest release (no clone, no build)
-
-Each GitHub release publishes the image as `ghcr.io/ottr-ai/ottr` (amd64), with the tags `<version>`, `v<version>` and `latest`. The image is public, so the pull needs no login. These lines fetch the compose file of the latest release and run that release's image.
-
-Linux and macOS (bash, zsh):
+The compose file and the image come from the same GitHub release tag; the image is public, so the pull needs no login.
 
 ```sh
 mkdir -p ottr && cd ottr
@@ -146,52 +43,13 @@ export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
 mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
-# Turn Alate on (skip this when an Alate server already runs). The three settings
-# go into .env once, so updates and new shells keep the same key.
-[ -f .env ] || cat > .env <<EOF
-COMPOSE_PROFILES=alate
-ALATE_URL=http://alate:4570
-ALATE_API_KEY=$(openssl rand -hex 32)
-# OTTR_GITHUB_HOST=acme.ghe.com   # set before onboarding when GitHub lives on *.ghe.com
-EOF
-# Seed it once with a consistent copy of the host db. Never mount the live file.
-[ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose pull
 docker compose up -d --no-build
 ```
 
-Windows (PowerShell 5.1 or 7):
+### From source
 
-```powershell
-New-Item -ItemType Directory -Force ottr | Out-Null; Set-Location ottr
-$TAG = (Invoke-RestMethod https://api.github.com/repos/ottr-ai/ottr/releases/latest).tag_name
-Invoke-WebRequest -UseBasicParsing -OutFile docker-compose.yml "https://raw.githubusercontent.com/ottr-ai/ottr/$TAG/docker-compose.yml"
-$env:OTTR_IMAGE = "ghcr.io/ottr-ai/ottr:$TAG"       # the image of the same release
-$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
-$env:OTTR_WORKER_TOKEN = -join ($b | ForEach-Object { $_.ToString('x2') })   # server-to-worker auth
-$env:OTTR_OAUTH_DIR = "$HOME\.omp\oauth"            # provider sign-ins, read-only
-New-Item -ItemType Directory -Force $env:OTTR_OAUTH_DIR | Out-Null   # Podman refuses a missing mount source
-$env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth db
-# Turn Alate on (skip this when an Alate server already runs). The three settings
-# go into .env once, so updates and new shells keep the same key.
-if (-not (Test-Path .env)) {
-  $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
-  $key = 'ALATE_API_KEY=' + (($b | ForEach-Object { $_.ToString('x2') }) -join '')
-  @('COMPOSE_PROFILES=alate', 'ALATE_URL=http://alate:4570', $key, '# OTTR_GITHUB_HOST=acme.ghe.com') | Set-Content .env
-}
-# Seed it once with a consistent copy of the host db. Never mount the live file.
-if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
-docker compose pull
-docker compose up -d --no-build
-```
-
-The compose file and the image come from the same tag, so they always match. To update to a newer release, run the same lines again from the folder above `ottr`. The `[ -e … ]`, `Test-Path`, and `[ -f .env ]` guards keep the existing `agent.db` snapshot and the same Alate key, and the named volumes keep the board data. Set `OTTR_GITHUB_HOST` before onboarding: uncomment the `# OTTR_GITHUB_HOST=acme.ghe.com` line in `.env` and replace the example host with yours (compose ignores the line while it stays commented); otherwise a `*.ghe.com` token is checked against `github.com`, so the expiry probe and the GitHub API calls would aim at the wrong host.
-
-The `export` and `$env:` values live only in the current shell. Compose also reads a `.env` file in the same folder by itself, so put the values there (one `NAME=value` per line, for example `OTTR_WORKER_TOKEN=...`) and a new shell needs no exports. Windows: compose gives the shell environment priority over `.env`, so a stale `OTTR_*` value keeps the old release or the old paths. Remove the old values first. Run `Remove-Item env:OTTR_*` for the current session. A user-level value (set with `setx` or `[Environment]::SetEnvironmentVariable`) survives new shells; remove it the same way, for example `[Environment]::SetEnvironmentVariable('OTTR_IMAGE', $null, 'User')`. The entry script logs the pinned image tag and the two host paths at start, before its refusal checks, so `docker compose logs server` shows the values even when the stack refuses to start. The Alate lines in the quick start already write the three Alate settings there; keep the `ALATE_API_KEY` line, because the board and alate must share one key.
-
-### From source (main branch)
-
-Linux and macOS (bash, zsh):
+Builds the image on your machine; the seed and Alate steps are in [docs/install.md](docs/install.md#from-source-main-branch).
 
 ```sh
 git clone git@github.com:ottr-ai/ottr.git ottr
@@ -200,158 +58,17 @@ export OTTR_WORKER_TOKEN=$(openssl rand -hex 32)   # server-to-worker auth
 export OTTR_OAUTH_DIR=~/.omp/oauth                 # provider sign-ins, read-only
 mkdir -p "$OTTR_OAUTH_DIR"                         # Podman refuses a missing mount source
 export OTTR_AGENT_DB=~/.omp/ottr-agent.db          # the stack's own omp auth db
-# Turn Alate on (skip this when an Alate server already runs). The three settings
-# go into .env once, so updates and new shells keep the same key.
-[ -f .env ] || cat > .env <<EOF
-COMPOSE_PROFILES=alate
-ALATE_URL=http://alate:4570
-ALATE_API_KEY=$(openssl rand -hex 32)
-# OTTR_GITHUB_HOST=acme.ghe.com   # set before onboarding when GitHub lives on *.ghe.com
-EOF
-# Seed it once with a consistent copy of the host db. Never mount the live file.
-[ -e "$OTTR_AGENT_DB" ] || bun -e 'new (require("bun:sqlite").Database)(process.argv[1], { readonly: true }).run("VACUUM INTO ?", [process.argv[2]])' ~/.omp/agent/agent.db "$OTTR_AGENT_DB"
 docker compose build
 docker compose up -d
 ```
-
-Windows (PowerShell 5.1 or 7):
-
-```powershell
-git clone git@github.com:ottr-ai/ottr.git ottr
-Set-Location ottr
-$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
-$env:OTTR_WORKER_TOKEN = -join ($b | ForEach-Object { $_.ToString('x2') })   # server-to-worker auth
-$env:OTTR_OAUTH_DIR = "$HOME\.omp\oauth"            # provider sign-ins, read-only
-New-Item -ItemType Directory -Force $env:OTTR_OAUTH_DIR | Out-Null   # Podman refuses a missing mount source
-$env:OTTR_AGENT_DB = "$HOME\.omp\ottr-agent.db"     # the stack's own omp auth db
-# Turn Alate on (skip this when an Alate server already runs). The three settings
-# go into .env once, so updates and new shells keep the same key.
-if (-not (Test-Path .env)) {
-  $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
-  $key = 'ALATE_API_KEY=' + (($b | ForEach-Object { $_.ToString('x2') }) -join '')
-  @('COMPOSE_PROFILES=alate', 'ALATE_URL=http://alate:4570', $key, '# OTTR_GITHUB_HOST=acme.ghe.com') | Set-Content .env
-}
-# Seed it once with a consistent copy of the host db. Never mount the live file.
-if (-not (Test-Path $env:OTTR_AGENT_DB)) { bun -e 'new (require(''bun:sqlite'').Database)(process.argv[1], { readonly: true }).run(''VACUUM INTO ?'', [process.argv[2]])' "$HOME\.omp\agent\agent.db" $env:OTTR_AGENT_DB }
-docker compose build
-docker compose up -d
-```
-
-PowerShell 5.1 drops double quotes inside the arguments of native programs, so the PowerShell `bun -e` line uses only single quotes in its JavaScript.
 
 ### Podman
 
-Podman runs the stack too. The Windows + podman-compose notes below are as reported by a
-user on Windows 11 (Podman 6.1.4, rootful, WSL machine; podman-compose 1.6.0) — the
-project has no Windows machine to verify them.
-
-- `podman compose` needs a compose provider. Use Docker Compose v2 (`winget install Docker.DockerCompose`, then `$env:PODMAN_COMPOSE_PROVIDER = "docker-compose"`), or `pip install podman-compose`.
-- Podman has no `local` log driver. Set `OTTR_LOG_DRIVER=k8s-file` (env or `.env`).
-- Windows + podman-compose cannot take the host paths as written: `C:\...` does not parse in a short volume mount, and a POSIX path like `/mnt/c/Users/<you>/.omp/oauth` goes through Python `abspath`, becomes `C:\mnt\c\...`, and podman mounts `/mnt/c/mnt/c/Users/...`. Rootful podman creates the missing source as an empty folder, so the stack starts with an empty oauth folder and `agent.db` as a folder — provider sign-in then fails. The entry script refuses to start on the `agent.db` folder and warns on the empty oauth folder. Use Docker Compose v2 as the provider, or:
-  - use paths relative to the compose folder, which podman-compose resolves there and the podman client translates into machine paths. From `C:\Users\<you>\ottr`: `OTTR_OAUTH_DIR=../../../../Users/<you>/.omp/oauth` and `OTTR_AGENT_DB=../../../../Users/<you>/.omp/ottr-agent.db`;
-  - or switch the two mounts in your compose copy to the long bind syntax (`type: bind`, `source:` the Windows path, `target:` the container path), which podman-compose takes as-is.
-- An empty oauth folder does not block the start: the entry script warns, then starts, because the host omp can keep every provider sign-in in `agent.db` (seen: GitHub Copilot only). If a sign-in should be there, the host path is wrong — fix it and sign in again. An empty `.keep` file in the folder stops the warning.
-- Check the mounts after `up` (podman-compose names the container `ottr_server_1`; Docker Compose v2 `ottr-server-1`):
-
-  ```sh
-  podman inspect ottr_server_1 --format "{{range .Mounts}}{{.Source}}{{println}}{{end}}"
-  ```
-
-  A source under `/mnt/c/mnt/c/` means the path was mangled.
-- Repair a `home` volume that kept an empty `agent.db` folder from a bad mount — the next recreate then fails with `crun: mount ... agent.db: Not a directory`. `rmdir` removes only empty directories, so a populated db survives (the volume is `ottr_home`: compose project `ottr`, volume `home`):
-
-  ```sh
-  podman run --rm -v ottr_home:/h busybox rmdir /h/.omp/agent/agent.db
-  ```
-
-- From source, build with podman, not compose — `podman compose build` passes the Windows context path to the remote podman and fails — then start without building. Check first that no turn runs, because a restart stops a running turn. podman-compose 1.6 does not recreate a container when only its image changed, so the `--force-recreate` flag is required. After the start, `podman ps --format "{{.ImageID}}"` must list the new image ID for the server and every worker, which share `ottr-worker:local`. Compare the IDs with `podman images ottr-worker:local`:
-
-  ```sh
-  podman build -f Dockerfile.worker -t ottr-worker:local .
-  podman compose up -d --no-build --force-recreate
-  podman ps --format "{{.ImageID}}"
-  ```
-
-- A proxy on the host's `localhost` breaks `podman compose build` on macOS (reported on
-  a colleague's Mac; not reproduced here): Podman passes the host's `HTTP_PROXY`/`HTTPS_PROXY`
-  into the machine and the build, and there `localhost` is the build container, not the Mac.
-  The apt step fails with `Could not connect to localhost:3128`, then `Unable to locate
-  package` for every package. Two fixes for the build:
-  - point the proxy at Podman's host name instead: `HTTP_PROXY=http://host.containers.internal:3128`,
-    or use the corporate proxy URL directly;
-  - skip the build: set `OTTR_IMAGE=ghcr.io/ottr-ai/ottr:<tag>` and run `podman compose pull`,
-    then `podman compose up -d --no-build` (the [latest release](#latest-release-no-clone-no-build) path).
-  A separate runtime rule applies whenever a host proxy is set: calls between the stack's
-  services must bypass the proxy, so `NO_PROXY` must name the compose services. The stack's
-  entry scripts append those names at container start (`docker/no-proxy.sh`); set them
-  yourself only for containers you run by hand. That rule fixes the runtime calls only —
-  it cannot help the build failure above.
-
-- `board-seed` under podman-compose: `COMPOSE_PROFILES=alate` leaves the `seed` profile off, so `podman compose run --rm board-seed` fails with `missing services [board-seed]`. Activate the profile (Docker Compose v2 starts the service you run without the flag):
-
-  ```sh
-  podman compose --profile seed run --rm board-seed --repo OWNER/NAME
-  # local checkout of the data repo instead of --repo, same relative-path rule as above:
-  podman compose --profile seed run --rm -v ../../../../Users/<you>/agent-data:/data:ro board-seed --data /data
-  ```
-
-- Shell variables beat `.env`: an `OTTR_*` value still set with `$env:` in the session wins over the `.env` file, and so does a user-level value from `setx` or `[Environment]::SetEnvironmentVariable` in every new shell. Remove old values: `Remove-Item env:OTTR_*` for the session, and per user-level name `[Environment]::SetEnvironmentVariable('OTTR_IMAGE', $null, 'User')`. The entry script logs the pinned image tag and the two host paths at start, before its refusal checks; check them with `docker compose logs server`.
-- Memory: without `HINDSIGHT_API_URL` (or a saved **Settings → Hindsight** URL) the workers keep their own `mnemopi` store in the `home` volume ([Fleet memory](docs/WORKERS.md#fleet-memory-hindsight)). Two options: copy your local mnemopi store into the volume once, or point your local omp and Ottr at the same Hindsight server. Never bind-mount the host mnemopi folder into the volume: SQLite over the WSL file share with concurrent writers can corrupt the store.
-- The default Podman machine has 2 GiB of RAM, and the server and each worker may use up to 8 GiB. Raise it: `podman machine stop; podman machine set --memory 16384; podman machine start`.
-
-Podman Desktop shows no containers, or the board times out after you recreate the stack? See [docs/WORKERS.md, Troubleshooting](docs/WORKERS.md#troubleshooting).
-
-### After the first start
-
-The `VACUUM INTO` line copies the host omp `agent.db` only when the snapshot does not exist yet. The server and the workers write to the snapshot, so the host db stays unchanged. Do not copy the host db over the snapshot again: sign the stack in under **Settings → Provider sign-in** ([docs/WORKERS.md](docs/WORKERS.md#env-settings) tells why).
-
-No data repo yet? Alate's `create-data-repo` skill builds a private one from the omp setup on your machine: install it with `npx skills add ottr-ai/alate --skill create-data-repo`, then ask your agent to run it. It scans for secrets first and asks before every step that leaves your machine (see [Alate, Start from your current setup](https://github.com/ottr-ai/alate#start-from-your-current-setup)).
-
-Before the first provision, capture this machine's omp user layer into the data repo. Run this from a checkout of the alate repo (https://github.com/ottr-ai/alate):
-
-```sh
-node sync-user.mjs --data /path/to/your-data-repo
-```
-
-It copies your omp settings, MCP servers, plugins and skills into the data repo's `user/` tree, and it scans for secrets first. Without this step, the workers get none of your user layer. The `create-data-repo` skill already runs this capture; run the command by hand when you built the data repo another way, or after you change your omp setup. Then provision again under **Settings → Alate** (or in the alate dashboard), so the workers' next install carries your layer.
-
-The Alate lines in the quick start write `COMPOSE_PROFILES`, `ALATE_URL`, and `ALATE_API_KEY` into `.env`, and start the bundled Alate server (compose profile `alate`) together with the board. The board reads `ALATE_URL` and `ALATE_API_KEY` at boot and seeds **Settings → Alate** with them. A value saved under Settings wins over the env at every boot. A user whose Alate server already runs omits the Alate block and pairs the board under **Settings → Alate** instead.
-
-The board never takes its config from the worker-writable home volume. With the Alate profile on, first open the Alate dashboard on <http://127.0.0.1:4570>. The alate container binds every interface, so the dashboard asks for the key: sign in with the `ALATE_API_KEY` value from `.env`. Then set the data repo there, and seed the board's own agent layer from your data repo once (see [Seed the board config](docs/WORKERS.md#seed-the-board-config)). The seed installs a layer and switches it in place, so no restart is needed. Replace `OWNER/NAME` with your data repo. The line is the same in bash and PowerShell:
-
-```sh
-docker compose run --rm board-seed --repo OWNER/NAME
-```
-
-The hourly deploy repeats the seed by itself when the env file sets `ALATE_DATA` (a local data-repo checkout) or `ALATE_DATA_REPO` (`owner/name`). The board shows a notice while its agent layer is not seeded, or while a model role's provider has no active sign-in.
-
-For a source-based deployment, enable the persistent host command in
-[docs/WORKERS.md](docs/WORKERS.md#persistent-host-control).
-It owns the hourly schedule and supplies the bell countdown.
-The bell's **Update** action requests a complete update cycle only when the board is idle.
-The command fetches commits, builds the image, and uses the existing safe deployment flow.
-Without this host setup, the legacy one-shot updater gives no countdown or **Update** action.
-Published release-image deployments keep their image-tag update flow.
-
-The board is then on <http://127.0.0.1:8080>. Optional: `OTTR_PORT`, `HINDSIGHT_API_URL` for fleet memory, and provider keys pass through from the host shell. [docs/WORKERS.md](docs/WORKERS.md) has the full topology, updates and crash story.
-
-Hindsight is the preferred way to share memory between workers. The board picks the
-backend from the deployment: set `HINDSIGHT_API_URL` (or save the URL under
-**Settings → Hindsight**), and every worker on every machine reads and writes the same
-memory on a [Hindsight](https://github.com/vectorize-io/hindsight) server. Without it,
-omp keeps its default `mnemopi` memory: a local store in the shared home volume, so only
-containers on the same host see it. That store is separate from your local mnemopi store
-on this machine: your existing memories never reach the workers. Two supported paths
-close the gap: copy your local mnemopi store into the `home` volume once, as a snapshot,
-or point your local omp and Ottr at the same Hindsight server. Never bind-mount the host
-mnemopi folder into the volume: SQLite over the WSL file share with concurrent writers
-can corrupt the store. The board checks memory at boot and every 60 seconds;
-when omp runs with no memory, it warns with the reason. See
-[docs/WORKERS.md](docs/WORKERS.md#fleet-memory-hindsight).
+Podman runs the stack too; see the compose provider, log driver and Windows path notes under [Podman](docs/install.md#podman) in docs/install.md.
 
 ### Bare metal
 
-The lines are the same in bash and PowerShell:
+No Docker needed.
 
 ```sh
 git clone git@github.com:ottr-ai/ottr.git ottr
@@ -360,186 +77,37 @@ bun install
 bun start
 ```
 
-Open <http://127.0.0.1:4747>. **Add project** clones any git URL (`https://…`, `git@host:…`, `ssh://host[:port]/…`) or creates a new project, sets up `.tasks/` and `.worktrees/`, and runs a short setup dialog (rules, automation, runners). Projects on hosts other than GitHub work with plain git; the GitHub extras (releases, CI watch, Dependabot cards, fork research, GHCR) stay GitHub-only and hide for other hosts. A project without `AGENTS.md` gets a rules interview card that writes one with you. Keep projects in a project folder: after a restart the board finds projects in Ottr's parent folder or in `OMP_TRACKER_ROOTS`.
+Open <http://127.0.0.1:4747>.
 
-## Alate
+## Quick start
 
-[Alate](https://github.com/ottr-ai/alate) is the provisioning side of the pair. It installs agent rules, skills, plugins and the omp user layer from a data repo onto this machine and into Ottr's Docker workers, so every agent and worker runs the same setup. Ottr integrates with it under **Settings → Alate**: point it at the alate server URL and API key, and **Provision** (or the automatic check every 5 minutes) installs pending imports; an alate that reports layer support provisions while cards run, and an older alate defers the check while cards run. With the URL set, Ottr also pulls the provider's update list each hour and offers upstream updates through the header bell. When an import waits longer than 30 minutes, the bell also shows "Alate is waiting to provision an import" with a link to the Settings section. The Overview page shows the provisioning state at a glance: the server's version and probe result, and which project lists (packages, tools, env) alate provisioned, under **Provisioning**.
+1. Open the board: <http://127.0.0.1:8080> with Docker Compose, <http://127.0.0.1:4747> on bare metal.
+2. **Add project** clones any git URL (`https://…`, `git@host:…`, `ssh://host[:port]/…`) or creates a new project, sets up `.tasks/` and `.worktrees/`, and runs a short setup dialog (rules, automation, runners).
+3. A project without `AGENTS.md` gets a rules interview card that writes one with you.
+4. Type a task in plain language. The card waits in **Todo** for a free slot: 2 agents per project, 3 in total.
+5. **In progress**: Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it. The agent finishes with the `report_outcome` tool.
+6. **Merging**: a second turn rebases, re-runs the project's checks, and integrates the work. **Done** shows the report.
 
-The alate URL carries the API key on every call, so the board refuses a plain `http://` URL for anything the public internet can reach. **Settings → Alate** and the `ALATE_URL` env seed accept `http://` only for loopback (`localhost`, `127.0.0.0/8`, `[::1]`), private-network addresses (RFC 1918 `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`; link-local `169.254.0.0/16` and `fe80::/10`; the CGNAT range `100.64.0.0/10`, which covers Tailscale) and single-label host names (the compose service name `alate`). Every other host — a public DNS name, a public IP, an IPv6 address outside the list — needs `https://`. A URL saved under an older board keeps its stored value, and each alate call answers with the reason instead of sending the key; the fix is to switch the URL to `https://`, or to one of the http-allowed hosts above.
+The full column list, research cards, backlog drafts, the second-model check and the review and release workflows: [How a task moves](docs/how-it-works.md#how-a-task-moves).
 
-## Configuration
+## How it works
 
-| Setting | Default | How to change |
-|---|---|---|
-| Port | 4747 | env `PORT` |
-| Bind address | 127.0.0.1 | env `OMP_TRACKER_HOST` |
-| Public hostnames | none | env `OMP_TRACKER_PUBLIC_HOSTS`; requests under these hosts need a login or the API key |
-| Hosted mode | off | env `OTTR_HOSTED=1` plus `OTTR_HOSTED_TENANT`, `OTTR_HOSTED_SECRET` and `OTTR_HOSTED_CONTROL_URL`; only for a board behind the ottr-cloud control plane. It replaces the login with a signed proxy header and hides host-level Settings. See `docs/specs/hosted-mode.md` |
-| Project folders | Ottr's parent folder | env `OMP_TRACKER_ROOTS` |
-| Task data location | each project's `.tasks/` | env `OTTR_DATA_DIR` (the compose stack sets `/data`) |
-| Server-only project state (each `tasks.db`, fork caches) | same dir as task data | env `OTTR_SERVER_DATA_DIR` (the compose stack sets `/app/.tasks/projects`) |
-| Database backups | one snapshot each day in `<state dir>/.tasks/backups`, 7 kept | env `OTTR_BACKUP_DIR` (the compose stack sets `/backup` on the server-only `ottr-backup` volume; `OTTR_BACKUP_MOUNT` in the compose env file puts it on a host path) and `OTTR_BACKUP_KEEP` (`0` turns the backups off). Restore with `bun src/restore.ts`. Steps: [Backups and restore](docs/WORKERS.md#backups-and-restore). Spec: [docs/specs/db-backup.md](docs/specs/db-backup.md) |
-| GitHub token | none | asked at onboarding; **Settings → GitHub → GitHub token** replaces it; stored in `.tasks/tracker.db`. Settings shows the expiry date of this token and of the compose seed token, and the board pushes a reminder from 30 days before an expiry (spec: [docs/specs/token-expiry.md](docs/specs/token-expiry.md)). Which token serves what, and which permissions to give it: [GitHub tokens](#github-tokens) |
-| GitHub host | `github.com` | env `OTTR_GITHUB_HOST` (a bare hostname), or **Settings → GitHub → GitHub host**; a saved value wins over the env until cleared. A host under `*.ghe.com` is GitHub Enterprise Cloud with data residency (API at `api.<host>`); any other host is GitHub Enterprise Server (API at `<host>/api/v3`). Spec: [docs/specs/github-host.md](docs/specs/github-host.md) |
-| GitHub App | none | optional; **Settings → GitHub → GitHub App**; when set, posted PR reviews show as the app identity (`ottr[bot]` with a bot badge) instead of your own account; stored in `.tasks/tracker.db`; the key is write-only. Spec: [docs/specs/github-app.md](docs/specs/github-app.md); setup steps below |
-| Git hosts | `OTTR_SSH_DIR` (default `~/.local/share/ottr/ssh`) | **Settings → Other git hosts**: per-host HTTPS tokens (optional username); **Settings → Git identity → SSH key**: the global SSH key; a project can set its own key in its **Settings**. Projects on other hosts clone with any `https://…`, `git@host:…` or `ssh://host[:port]/…` URL and work with plain git; the GitHub extras stay GitHub-only. Ottr tests each save with `git ls-remote` and asks you to confirm host-key fingerprints before it stores them. When a git call to a GitHub host fails with a bare HTTP 401 or 403 (SAML enforcement, an IP allow list, a token policy), Ottr asks that host's REST API for the reason with the same token and shows GitHub's message under the git error — in the Add project dialog, the Git hosts token test, and a failed merge push. SSH keys stay in `OTTR_SSH_DIR`, outside every checkout. The server does each merge push with these credentials. |
-| Running agents | 20 total, no cap per project | **Settings**; empty = no cap. Env `OMP_TRACKER_MAX_TOTAL` sets the default total until a saved config holds one (`none` = no cap) |
-| Extra paths per worktree | none | **Settings** |
-| Merge target branch | the repo's default branch (origin/HEAD) | **Settings**, per project: the branch on origin that finished cards merge into. Empty falls back to the repo's default branch, or the main checkout's upstream when origin/HEAD is missing |
-| PR mode | off | **Settings**, per project; needs a GitHub remote on the configured GitHub host. Instead of the ff-only merge push, the server pushes the card branch and opens a pull request to the target branch; the card waits in Merging until GitHub reports the PR merged. A card that came from an existing pull request (a Dependabot update) never opens a second one: it adopts that PR and waits for GitHub to merge it — and a Dependabot card filed before the board tracked source PRs adopts the PR its prompt's head line names. Fixes beyond a Dependabot PR's head ship as a follow-up pull request: the board pushes the card branch, opens one PR against the Dependabot branch so the fixes land with the bump (against the target branch when the card branch cherry-picked or rebased the bump, so they land after the bump merges), and links it in one comment on the Dependabot PR; the card waits for both PRs to merge. A rebased or cherry-picked bump with no fixes adopts the Dependabot PR instead (git proves it by merging the bump onto the target and comparing trees). When Dependabot answers that it cannot rebase an orphaned PR, the card asks you to close the PR. Dependabot then reopens it from the current config. Fixes on a fork head without Dependabot — a branch the board can never push — park with a comment on the PR. When GitHub reports that an open pull request conflicts with its target branch, the card shows **!** with the reason. The card returns to waiting when GitHub can merge the pull request again.  A reply that queues the card again merges it a second time: the push updates the same PR, and when GitHub closed a PR without merging, the next ship opens a fresh pull request with a new number. Ottr never merges or closes the PR — humans merge under the repo's protection rules. When the card ends, the server deletes the card branch it pushed on origin (after the merge's done write, or on cancel — with an open PR, GitHub closes it when its head branch goes). Before each next ship action or PR metadata write, the server reads the current cancel and turn state. A completed cancel stops later ship actions and metadata writes, including a cancel that keeps the card at `needs_you`. It cannot undo a push or GitHub request that already started. Spec: [docs/specs/pr-mode.md](docs/specs/pr-mode.md); ADR: [docs/adr/0008-pr-mode-per-project.md](docs/adr/0008-pr-mode-per-project.md) |
-| microVM work turns (experimental) | off | **Settings**, per project: **Run work turns in microVMs**; needs a Linux host with `/dev/kvm` and the `vm-runner` service (`docker compose --profile vm up -d`, server env `OTTR_VM_RUNNER_URL`). Each work turn of the project runs in its own Firecracker microVM with a fresh clone and no provider secret. Experimental: not yet run on a KVM host. Setup, limits and residuals: [docs/WORKERS.md, microVM workers](docs/WORKERS.md#microvm-workers); ADR: [docs/adr/0009-microvm-workers.md](docs/adr/0009-microvm-workers.md) |
-| Alate provisioning | off | **Settings → Alate** (see [Alate](#alate)) |
-| Package mirrors | public registries | the data repo's tool config files: `user/npmrc`, `user/m2/settings.xml`, `user/config/pip/pip.conf`, `user/gradle/init.d/*.gradle`. Alate installs each file as `~/.<path>` in the turn home, so npm, Maven, pip and Gradle resolve private packages. Registry tokens go into **Settings → Env** (names in `workers/<project>/env.txt`), never into the data repo. Rules and the Maven, pip and Gradle details: [docs/WORKERS.md, Package mirrors](docs/WORKERS.md#package-mirrors) |
-| Provider sign-in | omp's existing sign-ins | **Settings → Provider sign-in**: omp's sign-ins and the full provider list its `omp login` offers; one sign-in per provider, on the machine that runs the board, and you can finish it from a phone by pasting the redirect address. For OAuth sign-ins of Anthropic, ChatGPT (Codex) and Z.AI, worker turns get an access token as env; other providers are marked "Not lent to workers" and the workers keep their own credential (see [docs/WORKERS.md](docs/WORKERS.md)). Expired entries offer **Sign in again** and **Remove** instead of **Sign out**. |
-| Model roles | the data repo's `user/omp/agent/config.yml` | **Settings → Model roles**: set the model and the thinking level of each omp role, or add and remove a role. Each role can also hold an ordered list of fallback models (omp's `retry.fallbackChains.<role>`): omp moves to the next one when a model fails. Chains keyed by a model selector stay as they are. A missing check role is flagged: without `critic` (checks Anthropic models) or `adversary` (checks the rest), the second-model check falls back to the default model, which is often the model it checks. A save commits `config.yml` to Alate's GitHub data repo with the board's GitHub token (**Settings → GitHub → GitHub token**; it needs write access to that repo). The commit has the loaded commit as its parent, and the branch moves only as a fast-forward, so a moved data repo gives a conflict. With a folder source, the save goes through Alate's file editor instead: Alate commits the folder's own git repo when it is one; a folder that is not a git repo, or that sits on a read-only mount, locks the editor and shows the fix. Alate then imports the change and provisions the workers. On compose, the board copy changes at the next hourly seed. Needs **Settings → Alate** with a GitHub repo source or a folder source. Spec: [docs/specs/model-roles-editor.md](docs/specs/model-roles-editor.md) |
-| Retro | off | **Settings**, per project: runs one retro after each Done card. The retro shows in the **Work steps** of that Done card; while it queues, runs or asks it also shows as its own card in **Todo**, **In progress** or **Merging** — the Done lane itself never lists a retro card, and a retro that needs you shows as a card until you reply. The Done card's **Lineage** lists each retro with the proposal cards it filed nested under it, and a proposal card's **Lineage** reads source card → retro → proposal. A retro whose fix belongs to another board project (its rules, skills or AGENTS.md sources) files the proposal on that project's board; its Decide panel and lineage work the same. |
-| Fork research | off | **Settings**, per project: hourly watch of the project's GitHub forks; findings arrive as proposals you accept. An accepted proposal rebuilds the fork's idea in our own modules — it reviews the fork's approach, keeps what fits, re-creates what is missing, and never ports fork code. The commits of every open pull request into the project stay out of the analysis, in every fork and on every branch that holds them: that work arrives through the PR. The check stores each held commit per branch with its PR number and the PR head it was judged against. A check that finds no other new commit or merge files nothing and does not pause the fork. When the PR merges with the held head, the held commits drop with no card — a squash merge or a merge the local checkout has not pulled included. When the PR gets another head and drops a held commit, or closes without a merge, that commit goes into the next analysis; a commit the PR still covers stays out. The analyzed cursor never rewinds, so unrelated work that was already analyzed is never re-sent. The **Hold fork-born merges** switch (on) holds the merge of each fork-born card at needs_you, so you review the card's work before it reaches the target branch; your reply approves the merge at the parked head. Turning the switch off does not release cards parked now |
-| PR reviews | off | **Settings**, per project: hourly watch of the project's open GitHub pull requests. For each new head, the server asks the model for a draft review in one tool-free call and files it on a review card, which wears the unread `new` badge until you open it; a new review of the same PR re-badges the card. While the PR is open and its draft is not posted, the card waits in **In progress** as needs you; a post, a close or a merge moves it to **Done**. No agent runs over the PR code. A deterministic performance lens scans the added diff lines for per-item queries inside loops and nested loops or linear scans inside loops, and hands the matches to the model as unverified candidates to check against the diff. A re-review reads the board's earlier review plus the author's comments since it, lists earlier findings only while some are still open or partly fixed, and otherwise gives one line of thanks and only new findings. The draft can hold inline comments: the lines between `<!-- inline path:line -->` (or `path:start-end`) and `<!-- /inline -->` post as a comment on that line of the new file, and a ```` ```suggestion ```` block in it proposes a change the author can apply. A comment on a line outside the diff moves into the review body when the draft is saved. You edit the draft in the card and click **Post** to send one GitHub review with the `COMMENT` event; with the GitHub App configured the post goes out as `ottr[bot]`, without it under your own identity; after a post the card links the posted review. **Ask for a new draft** on the card runs a re-review of the current head with your text as a trusted note (it counts against the daily review cap). The per-project **PR review notifications** switch (on by default) rings the bell and pushes for each new or rewritten draft and for new comments after a posted review; off keeps the badges and the board lanes only. The comment watch reads the PR conversation each hour; it never starts a review. Spec: [docs/specs/pr-reviews.md](docs/specs/pr-reviews.md) |
-| Trending scout | off | **Settings**, per project: at each weekly trending scan, a read-only scout card judges the GitHub trending repos for this project. First it reads each repo's README and metadata, then up to 15 files each of up to 6 shortlisted repos from `raw.githubusercontent.com`; it never clones, installs or runs them. It files at most 3 proposals per scan as **Backlog** cards: grill or promote one to approve it, cancel it to reject it. The cancel dialog asks why, and later scans get that reason. A repo proposed or judged no fit is never offered again to that project; a fit over the cap of 3 comes back next scan. The scout takes a slot only when no other queued card wants it. It runs on a worker when one exists, and never with the board's GitHub token |
-| Issue watch | off | **Settings**, per project, needs a GitHub remote: hourly watch of the project's open GitHub issues. Each issue opened after you turn it on becomes one backlog card (`Issue #N: <title>`, the issue text fenced as untrusted data, secrets redacted) and gets the `ottr-tracked` label, which Ottr creates when the repo lacks it. At most 10 cards per project per 24 hours; the rest wait for later ticks. Pull requests and issues that already carry the label are skipped, and an issue never files twice, even after its card is cancelled. Turning the watch off and on again skips issues opened while it was off |
-| Jira import | off | **Settings → Jira connections** holds named Jira connections for the whole board: a Jira Cloud site (email and API token) or a Data Center site (personal access token), `https://` only. The board finds the Jira type from the site and lets you change it. A project picks one connection in its **Settings**. The project board then shows **Import from Jira**: write a JQL query, select some or all tickets (50 for each page, **Load more** for the next page), and import them as Backlog or Todo cards. **Overview** holds the same **Import from Jira** entry for the whole board: one JQL search, and each result row picks its own project (**choose project**, a project name, or **skip** — the board never guesses, and a ticket can land in several projects on purpose). The card prompt holds the ticket's summary, description (as Markdown), fixed fields, the custom field IDs that the connection lists, the ticket's comments and the issue links, fenced as untrusted data with secrets redacted. A ticket imports once per site while its card exists, also after a cancel. The import never writes to Jira. Spec: [docs/specs/jira-import.md](docs/specs/jira-import.md) |
-| Secret key | `.tasks/secret.key` next to `tracker.db`, made on first use | env `OTTR_SECRET_KEY` (32 bytes as hex or base64). The board seals every stored token and key field with this key. Back up the key file or set the env var: when the key is lost or changed, operator-entered fields show "token unreadable, enter it again" until you enter the value again. Board-generated values (API key, session secret, Web Push keys) regenerate at boot, so copy the new API key to your API clients |
-| omp watch | off | **Settings**, per project. Turn it on only for the project that holds Ottr (the repo with `Dockerfile.worker`). Every hour, the server reads the npm releases of omp above the `OMP_VERSION` pin. A model reads the GitHub release notes of each new version and replies `PASS` or `FAIL`. A failed version gets the card `omp <version>: compatibility review failed`. That card holds the pin for this version and all later versions until you finish or cancel it. A version that passed and is 7 or more days old gets the card `Bump omp to <version>`, and its merge turn pushes the bump. The workflow `.github/workflows/omp-bump.yml` only checks that the pinned omp starts on the image's bun. Spec: [docs/specs/omp-watch.md](docs/specs/omp-watch.md). ADR: [docs/adr/0010-omp-bump-follows-changelog-review.md](docs/adr/0010-omp-bump-follows-changelog-review.md) |
-| Hindsight server | env on compose | **Settings → Hindsight**: URL and API key for omp's memory backend |
-| omp stats dashboard | port 3848 | **Settings → omp usage → Launch omp stats dashboard** opens omp's own `omp stats` dashboard in a new tab. The board starts it on demand, shows it on a second port behind the board login, and stops it after 30 minutes without requests. It reads a copy of every board session transcript. Env `OTTR_OMP_STATS_PORT` sets the port (`0` or `off` turns it off); the compose stack publishes it on `127.0.0.1`. The link shows only on a board opened on `localhost`. Spec: [docs/specs/omp-stats-dashboard.md](docs/specs/omp-stats-dashboard.md) |
-| Review due | 150 commits | **Settings**, per project; see [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
-| Run due reviews while idle | on | **Settings**; when the board is idle for 2 hours with no turn running, Ottr files a due architecture review card by itself. See [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md) |
-| Weekly trending scan | on | **Settings**; Monday 06:00 server time (or the first check after it, if the board was down), the server fetches GitHub trending (weekly: all languages, TypeScript, JavaScript) and the repos' metadata with the board token, then files one scout card per project with **Trending scout** on. **Scan trending now** runs a scan at once without moving the weekly one. A failed fetch files no card, shows "Last trending scan failed" on Settings, and retries for 24 hours |
-| Release command | tag, push, GitHub release | **Settings**, one line; runs instead of those steps |
-| Kept-worktree quarantine | 7 days | **Settings** |
-| Proxy variables | inherited from the board's env | `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and their lower-case names. Ottr strips the userinfo (`user:pass@`) from these URLs before it builds a turn's environment, so the proxy's credentials never reach an agent; the host and port stay. If a turn then cannot reach the network, use a proxy whose URL carries no credentials (for example one that allow-lists the stack's addresses instead). Under Podman, a proxy on `localhost` breaks the image build — point it at `host.containers.internal` instead ([Podman](#podman)) |
-
-## GitHub tokens
-
-Ottr uses two kinds of GitHub credentials. The token asked at onboarding (the "Create admin" form) is the board token: it drives the GitHub API and `gh` — PR reviews, CI watch, the hourly Dependabot/PR watch, releases, the expiry probe, and the model-roles editor's commit of `config.yml` to the Alate data repo. The board token also serves the board's own git fetches and pushes on `github.com` itself: the worker image's git credential helper is pinned to `https://github.com` (`Dockerfile.worker`). Git on the configured GitHub host — a `*.ghe.com` Enterprise Cloud host or GitHub Enterprise Server — reuses the board token when **Settings → Other git hosts** has no entry for that host; an entry for the host wins. Git on any other host needs its own per-host token under **Settings → Other git hosts**. That section still offers to store the board token for the configured host: the button only stores after a live test, never on its own.
-
-The server's GitHub API fetches (GitHub App, trending scan, releases watch, branch-rule and auth probes, expiry probe) retry a `429`, a `502`/`503`/`504`, or a `403` that carries `Retry-After` or `x-ratelimit-remaining: 0`. The wait follows `Retry-After` or `x-ratelimit-reset`, capped at 4 seconds, with jittered exponential backoff and 3 attempts at most. Only repeat-safe requests (GET, HEAD) retry; a POST that creates something never retries. A wait above the cap stops, and the caller's next poll handles the error.
-
-### Recommended token
-
-Use a fine-grained personal access token:
-
-| Permission | Why |
+| Stage | What happens |
 | --- | --- |
-| Metadata: Read | always granted; expiry probe, repo lookups |
-| Contents: Read and write | clone, fetch, merge pushes, releases, and the Alate data-repo `config.yml` commit |
-| Pull requests: Read and write | Dependabot/PR watch cards, posting PR reviews |
-| Issues: Read and write | Issue watch: reading new issues and adding the `ottr-tracked` label |
-| Actions: Read and write | CI watch after merges; **Re-run failed jobs** on a card whose text links a run |
-| Workflows: Read and write | only if tasks may change `.github/workflows` files; without it, a push that touches a workflow file fails |
-| Administration: Read and write | only for **Add project → New** with a GitHub repo (`gh repo create`); the repo is created under your user account, not an org |
+| Work turn | Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it; the agent finishes with the `report_outcome` tool. |
+| Merge turn | A second turn rebases, re-runs the project's checks, and integrates the work; one merge turn per project at a time. |
+| Review | A read-only card runs the full verification, mutation tests, a security audit and a UI/UX check, and files its findings as task cards. |
+| Release | **Create release** runs the review since the last tag, tags the reviewed commit and creates the GitHub release. |
 
-A classic token also works: the `repo` scope covers everything above, plus the `workflow` scope only if tasks change workflow files.
+Architecture, the task life cycle and the diagrams: [docs/how-it-works.md](docs/how-it-works.md).
 
-### Read-only token for turns
+## Learn more
 
-Agent turns get their own optional token under **Settings → GitHub → Read-only GitHub token for turns**. A turn uses it to read pull requests, Actions runs, CI logs and private repositories; it never pushes. A fine-grained personal access token with read-only Repository permissions is the supported shape. A classic token cannot be read-only for private repositories (its `repo` scope grants write), so the board checks each saved token against the project repositories, shows a warning for a write-capable token, and uses it only after you confirm.
-
-Every turn strips `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` from its environment. `GH_ENTERPRISE_TOKEN` in a `workers/<project>/env.txt` no longer reaches turns: this setting is the only supported delivery. On an Enterprise host the token reaches a turn as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`; on `github.com` as `GH_TOKEN`. Local server-side runs (merge turns) keep the board token and stay unchanged. Spec: [docs/specs/turn-read-token.md](docs/specs/turn-read-token.md).
-
-### Enterprise orgs
-
-- A fine-grained token reaches only the repositories of its resource owner, so for an org repository the token must be owned by (or authorized for) the org. If the org does not allow org-owned fine-grained tokens for members, use a classic token.
-- With SAML SSO enforced, authorize the token for the org under **Settings → Developer settings → Tokens (classic) → Configure SSO → Authorize**. Without that step, git shows a bare `403`.
-- Git over HTTPS to a `*.ghe.com` host reuses the board token when **Settings → Other git hosts** has no entry for it; an entry for the host wins. With neither, the clone fails with `fatal: could not read Username for 'https://<host>': terminal prompts disabled` — store a token for the host under **Settings → Other git hosts**.
-
-### GitHub App setup
-
-Do these steps once, so posted PR reviews show as `ottr[bot]`:
-
-1. On GitHub, go to **Settings → Developer settings → GitHub Apps → New GitHub App**.
-2. Name the app `Ottr`. When the name is taken, use `Ottr-<owner>`.
-3. Leave the webhook off.
-4. Set the permissions: **Pull requests: Read and write** and **Metadata: Read**.
-5. Generate a private key and download the PEM file.
-6. Install the app on the repositories to review.
-7. Paste the App ID and the PEM into Ottr under **Settings → GitHub → GitHub App**.
-
-Spec: [docs/specs/github-app.md](docs/specs/github-app.md).
-
-### Remote access
-
-Public hostnames need a login (first visit creates the admin user) or the API key from **Settings**. Loopback access needs no login. Costly routes on a public hostname (card creation, task turns, git and GitHub operations) carry a per-source limit of 60 requests in 10 minutes; over the limit the route answers `429` with `Retry-After` (docs/specs/public-api-request-limit.md). Serve HTTPS with `tailscale serve --bg --https=443 http://127.0.0.1:4747`, set `OMP_TRACKER_PUBLIC_HOSTS`, and the board installs to a phone's home screen; Web Push (**Settings → Notifications**) then delivers alerts. It is the only OS notification channel: desktop browsers subscribe the same way as phones. Each device picks its classes (Request, Error, Complete), and project mutes apply to every device. Push pauses while a board tab is focused. When an alert's cause clears or you acknowledge it, Ottr retracts the notification, and a bell acknowledgement is shared by every device. **Settings → Session → Sign out everywhere** rotates the session secret and revokes all login sessions. **Settings → Session** lists the login sessions, marks the current browser, and can sign out a single session. Non-GET API requests must send an `Origin` header matching the board URL.
-
-Field text uses 16px when the viewport is 720px wide or less, or when the primary pointer is coarse at any width. This includes landscape phones and the New task, settings, search and model controls. Fine-pointer desktop views keep their compact density above 720px. User zoom remains unrestricted.
-
-### Card edit conflicts
-
-Two browser tabs can edit one card at the same time. The card edit routes accept an optional `revision` field: the task text edit, the steer edit, the steer cancel, the model choice, the release notes edit, and the editor's hold claim (`/edit/start`). Send the `revision` value that the card carried when you loaded it. The write lands only when the card still carries that revision. A stale write answers `409`, and the body holds the card's current state, so your client can re-read and retry. A request without `revision` behaves as before. The hold claim and its release never move the revision: they are bookkeeping, not content. The board sends `revision` on every edit; on a `409` it keeps your text and shows the card's current version beside it.
-
-## Development
-
-The commands are the same in bash and PowerShell:
-
-```sh
-bun run check          # tsc, biome, boot smoke, license allowlist, scratch-image guard, agent-data sync guard, UI-screenshot reminder
-bun test
-bun run test:mutation  # StrykerJS, five configs with break thresholds
-bun run audit:quality  # duplicate and dead code
-bun run dev            # UI-only demo board on port 5747
-```
-
-A mutation run stays inside the host CPU. Each config takes the concurrency from the CPU: half of `os.availableParallelism()`, at least 1, capped at the config's measured maximum. `STRYKER_CONCURRENCY` overrides this value when set. A worker runs one mutation run at a time: each run holds a host-global lock file (`tmpdir()/ott-stryker.lock`). A second run waits and logs that it waits. A run removes a lock whose holder died. Each checkout gets its own Stryker sandbox parent (`tmpdir()/ott-stryker-<hash of its root>`) and wipes it at run start, so a killed run's leftover sandbox can never reach another run (OTTR-500). Each config keeps its own incremental cache (`reports/stryker-incremental-<config>.json`, gitignored): a rerun re-tests only the mutants whose code or covering tests changed, and the release delta gate passes `--force` so a release always measures fresh (docs/ARCH-REVIEWS.md "Delta gate").
-
-A running card shows a live **Mutation testing** meter when the card's progress line matches the card format `<tool> <pct>% · <tested>/<total>[ · <stats tail>]`. The tail splits on ` · `, and a part like `38 survived (0.9%)`, `2 timed out`, `~2h 59m elapsed` or `~1h 23m left` becomes a labelled row while any other part shows raw. Ottr builds that line today from two tools only, in `src/stryker.ts`: a Stryker run (Node, read from the run's output through the `stryker-tap.cjs` copy when stdout is a pipe) and a Python `mutate.py` runner. Another tool needs no parser. Let the turn print one event line on the run's stdout stream, `{"type":"ottr_progress","text":"cargo-mutants 42% · 100/240 · 3 survived (1.2%)"}`, and the runner stores the `text` as the card's progress (`PROGRESS_EVENT` in `src/stryker.ts`, read in `src/runner.ts`). The meter's label stays `Mutation testing` whatever tool prints the line.
-
-CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; weekly workflows add Docker build checks, Trivy, a warn-only Opengrep SAST scan over `src/` and an OWASP ZAP baseline scan. Package versions stay 7 days back (`bunfig.toml`), and every action pins a full commit SHA.
-
-For UI work use `bun run dev`: it seeds five demo projects in `.dev/` (a fresh root per start), starts no agents, and never touches a real board. A board whose pinned `OTTR_DEV_ROOT` is held by another board seeds its own root `.dev-<PORT>/` and prints a warning, so set a free `PORT` for it. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
-
-Coarse-pointer controls keep a 44×44 CSS px minimum, including the meter button, Add draft, Help, and Done tools. Fine-pointer layouts keep their compact sizes. Check these controls at 320px and 375px in both themes. Exercise adjacent actions to check for overlap.
-
-### Screenshot proofs for UI cards
-
-A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board. Each start seeds its own fresh scratch root under `.dev/` (unless `OTTR_DEV_ROOT` pins it), so two boards in one checkout never share a seeded database.
-
-Workers also provide pinned `agent-browser@0.41.1` for shell proofs when MCP is locked.
-Chrome-devtools MCP remains primary.
-Read the [worker browser workflow](docs/WORKERS.md#browser-cli-in-workers) before first use.
-Its direct screenshot command follows the same PNG signature and proof rules below.
-
-1. Create the shots folder and start the demo board from inside the shot script — never as a named background service held across tool calls (registered boards die between calls and the proof phase burns restart loops). Bind every run to a fresh port number — never port 0: the board prints `http://127.0.0.1:${PORT}` straight from its env value, so with PORT=0 the printed URL and step 2's readiness poll name a port nobody bound — and give the run its own `mktemp -d` state directory and its own puppeteer profile (`--user-data-dir`), so parallel boards never collide. Keep `timeout` on the board command, but never trust it to free the port: `timeout` signals `bun run`, and the server child survives it, so `timeout N bun run dev` can outlive N with the board still holding its port — the standing no-kill rule stays intact:
-
-   ```sh
-   mkdir -p shots
-   port=$(( 50000 + $$ % 10000 ))   # fresh port per run; keep out of 4700-4899, e2e-steer's range
-   state=$(mktemp -d)               # own state directory per run
-   PORT=$port OTTR_STATE_DIR="$state" timeout 900 bun run dev &
-   ```
-
-A shot harness stops its spawned board on every exit path through try/finally with the `stopChildren` pattern of `scripts/readme-screenshot.ts`; `timeout` alone leaves an orphan that holds the seed lock.
-
-Never wait for a leftover board to expire, and never reuse a port while any board still holds it: with this step's fresh port and state directory a leftover board cannot block the run, so switch to a new port and start the new board at once — let the tracker expire the old one.
-
-2. Wait for readiness by polling the port with a bounded loop, not a fixed sleep, and fail the script when the board never comes up:
-
-   ```sh
-   for i in $(seq 1 60); do curl -fsS "http://127.0.0.1:$port/" >/dev/null && break; sleep 0.5; done
-   curl -fsS "http://127.0.0.1:$port/" || exit 1
-   ```
-
-3. Open the UI in a browser tab and drive it to the state you want to show.
-4. Save each shot in one program step with puppeteer `page.screenshot({ path: 'shots/<name>.png' })`. Never move the image bytes through agent text.
-5. Verify each file. The first eight bytes must print `89 50 4e 47 0d 0a 1a 0a`:
-
-   ```sh
-   for f in shots/*.png; do echo "$f: $(od -An -tx1 -N8 "$f")"; done
-   ```
-
-6. Pass the worktree-relative paths in `report_outcome`'s `shots` field, for example `shots/board.png`. The board rejects a path outside the worktree.
-
-A UI work turn also runs the blind visual check on the finished shots before committing: a fresh subagent whose only input is the shots' file paths — never the diff, the code, `DESIGN.md` or the task text — reports what looks broken or off (layout, spacing, contrast, cut-off text, wrong state); fix what it finds or say in the report why the shot is correct as intended.
-
-`/shots/` and `/*.png` sit in `.gitignore`, so the shots stay out of `git status` and never enter a commit.
-
-The README board screenshot has its own one-command path: `bun run readme-screenshot` starts the demo board, opens the Lumen project in headless Chrome (1440x900, dark theme, `en-US` locale), waits out the entrance animations, and writes `.github/assets/screenshot.png`. Run it in the same work as a `src/ui` change that alters what the board shows; behaviour-only or off-screen changes need no new shot. The script finds Chrome in the puppeteer cache (`~/.cache/puppeteer`, then `/root/.cache/puppeteer` for a service `HOME`) or on `PATH` — `OTTR_SCREENSHOT_CHROME` names a binary directly — and adds no dependency: it drives Chrome over CDP with Bun's WebSocket client. Spec: `docs/specs/readme-screenshot.md`.
-
-Card views have a one-command path too: `bun scripts/card-shot.ts --view card --pr 53`. The script plants a parked PR-mode card (`stage` merging, PR #53 open, never "done") and a normal done card into a fresh demo pool. It boots its own board on a free port and writes the requested views to `shots/`. The views are `card` (the PR card's drawer), `done` (the contrast card), and `board` (the Lumen project face); `--view` can repeat. The script writes its fixture rows with direct sqlite before the board boots, so no write touches a live board's database. It bounds every wait with a watchdog, verifies each PNG signature, and stops only the children it started. It calls `process.exit` once the artifacts verify, so it cannot hang after success. Use it instead of a throwaway shot script. Spec: `docs/specs/card-shot.md`.
-
-## Docs
-
-- [docs/how-it-works.md](docs/how-it-works.md): how Ottr works — architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
+- [Install and setup](docs/install.md): requirements, every install path, the first-start steps, and Alate provisioning.
+- [Configuration](docs/configuration.md): every setting with its default, remote access, and card edit conflicts.
+- [GitHub tokens](docs/github-tokens.md): the board token, the read-only token for turns, Enterprise hosts, and the GitHub App.
+- [Development](docs/development.md): the checks, the tests, CI, UI development, and the screenshot proofs.
+- [How Ottr works](docs/how-it-works.md): how Ottr works — architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
 - [docs/specs/task-lifecycle.md](docs/specs/task-lifecycle.md): current task stages, states, cancellation latch, transitions, and writer guards.
 - [docs/notifications.md](docs/notifications.md): the notification model — alert classes, per-device settings, project mutes, presence and retraction.
 - [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack — topology, updates, env settings, fleet memory.
@@ -548,7 +116,11 @@ Card views have a one-command path too: `bun scripts/card-shot.ts --view card --
 - [docs/adr/](docs/adr/README.md): the decision log — why the system has its shape; an ADR records a decision that is hard to reverse, surprising to a new reader, and a real trade-off.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
 
-## Built with Ottr badge
+## Contribute
+
+Run Ottr on your own projects and check the result against [docs/development.md](docs/development.md). Report a vulnerability per [SECURITY.md](SECURITY.md).
+
+## Built with Ottr
 
 Did you build a project with Ottr? Add this badge to its README:
 
@@ -557,10 +129,6 @@ Did you build a project with Ottr? Add this badge to its README:
   <a href="https://github.com/ottr-ai/ottr"><img src="https://raw.githubusercontent.com/ottr-ai/ottr/main/.github/assets/built-with-ottr.png" alt="Built with Ottr"></a>
 </p>
 ```
-
-<p align="center">
-  <a href="https://github.com/ottr-ai/ottr"><img src="https://raw.githubusercontent.com/ottr-ai/ottr/main/.github/assets/built-with-ottr.png" alt="Built with Ottr"></a>
-</p>
 
 ## License
 
