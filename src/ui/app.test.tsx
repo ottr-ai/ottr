@@ -928,13 +928,75 @@ describe("done lane star section", () => {
 			/>,
 		);
 		const inboxAt = html.indexOf(">Inbox</p>");
-		const starredAt = html.indexOf(">Starred</p>");
+		const starredAt = html.indexOf(">Starred</span>");
 		const normalAt = html.indexOf('data-task-id="n1"');
 		expect(inboxAt).toBeGreaterThanOrEqual(0);
 		expect(starredAt).toBeGreaterThan(inboxAt);
 		expect(normalAt).toBeGreaterThan(starredAt);
 		// The starred card left the normal list.
 		expect(html.match(/data-task-id="s1"/g)?.length).toBe(1);
+	});
+
+	test("the Starred head toggles collapsed state", () => {
+		const starredCard = cardFixture({
+			id: "s1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			starred: true,
+		});
+		const open = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[starredCard]} />,
+		);
+		expect(open).toContain('aria-expanded="true"');
+		expect(open).not.toContain("data-collapsed");
+		const shut = renderToStaticMarkup(
+			<LaneCol {...base} stage="done" tasks={[starredCard]} starredCollapsed />,
+		);
+		expect(shut).toContain('aria-expanded="false"');
+		expect(shut).toContain('data-collapsed="true"');
+	});
+
+	test("a collapsed Starred section leaves one divider, an open one two", () => {
+		const freshCard = cardFixture({
+			id: "u1",
+			stage: "done",
+			state: "idle",
+			answered: true,
+		});
+		const starredCard = cardFixture({
+			id: "s1",
+			stage: "done",
+			state: "idle",
+			research: true,
+			starred: true,
+		});
+		const normal = cardFixture({ id: "n1", stage: "done", state: "idle" });
+		const tasks = [starredCard, normal, freshCard];
+		const open = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={tasks}
+				unread={(t) => t.id === "u1"}
+			/>,
+		);
+		// One rule between Inbox and Starred, one between Starred and the rest.
+		expect(open.match(/lane-divider/g)?.length).toBe(2);
+		const shut = renderToStaticMarkup(
+			<LaneCol
+				{...base}
+				stage="done"
+				tasks={tasks}
+				unread={(t) => t.id === "u1"}
+				starredCollapsed
+			/>,
+		);
+		// The collapsed head's own fill replaces the vanished trailing rule.
+		expect(shut.match(/lane-divider/g)?.length).toBe(1);
+		expect(shut.indexOf("lane-divider")).toBeLessThan(
+			shut.indexOf(">Starred</span>"),
+		);
 	});
 
 	test("a done research steps card pins in the Inbox and sits with the read cards once seen", () => {
@@ -987,7 +1049,7 @@ describe("done lane star section", () => {
 		const html = renderToStaticMarkup(
 			<LaneCol {...base} stage="done" tasks={[normal]} />,
 		);
-		expect(html).not.toContain(">Starred</p>");
+		expect(html).not.toContain(">Starred</span>");
 	});
 });
 
@@ -6133,6 +6195,94 @@ describe("ProjectBoard done lane time view", () => {
 			expect(more?.getAttribute("aria-label")).toBe(
 				`Show more, ${hidden} older cards`,
 			);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		}
+	});
+
+	test("the Starred section stays collapsible in the time view", async () => {
+		const doneCards = [
+			cardFixture({ id: "d0", stage: "done", state: "idle", doneAt: 1 }),
+			cardFixture({
+				id: "s1",
+				stage: "done",
+				state: "idle",
+				starred: true,
+				doneAt: 2,
+			}),
+			cardFixture({ id: "d2", stage: "done", state: "idle", doneAt: 3 }),
+		];
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const project = {
+			name: "proj",
+			hasRules: true,
+			github: null,
+			gitless: false,
+			dirty: false,
+			archReview: null,
+			latestRelease: null,
+			latestImage: null,
+			settings: { setupChecklist: false },
+			sessionsDir: "/tmp/s",
+		} as unknown as ProjectView;
+		try {
+			await act(async () => {
+				root.render(
+					<ProjectBoard
+						project={project}
+						tasks={doneCards}
+						deltas={new Map()}
+						open={() => {}}
+						seenAnswers={new Set()}
+						seenDoneSince={0}
+						compose={() => {}}
+						composeDraft={() => {}}
+						act={async () => true}
+						onNotice={() => {}}
+						draining={false}
+					/>,
+				);
+			});
+			const section = container.querySelector(
+				'[data-stage="done"] section.starred',
+			);
+			expect(section).not.toBeNull();
+			const head = section!.querySelector("button.starred-head");
+			expect(head?.getAttribute("aria-expanded")).toBe("true");
+			// The head names its count, and aria-controls points at the body it folds.
+			expect(head!.querySelector(".topic-count")?.textContent).toBe("1");
+			expect(head?.getAttribute("aria-controls")).toBe(
+				section!.querySelector(".starred-body")?.id,
+			);
+			// The pinned card renders once, inside the section.
+			expect(container.querySelectorAll('[data-task-id="s1"]')).toHaveLength(1);
+			expect(section!.querySelector('[data-task-id="s1"]')).not.toBeNull();
+			// A click flips the state through the board's own toggle handler.
+			await act(async () => {
+				// happy-dom's MouseEvent class does not match lib.dom's, like submitEvent above.
+				head!.dispatchEvent(
+					new window.MouseEvent("click", {
+						bubbles: true,
+						cancelable: true,
+					}) as unknown as Event,
+				);
+			});
+			const shut = container.querySelector(
+				'[data-stage="done"] section.starred',
+			);
+			expect(shut?.getAttribute("data-collapsed")).toBe("true");
+			expect(
+				shut!
+					.querySelector("button.starred-head")
+					?.getAttribute("aria-expanded"),
+			).toBe("false");
 		} finally {
 			await act(async () => {
 				root.unmount();

@@ -4255,6 +4255,8 @@ export function ProjectBoard({
 	};
 	// Done lane lazy load: how many read cards render before "Show more" appends a page.
 	const [doneLimit, setDoneLimit] = useState(DONE_PAGE);
+	// The flat view's pinned Starred section: one collapse toggle, default expanded.
+	const [starredCollapsed, setStarredCollapsed] = useState(false);
 	// The setup wizard, opened from the checklist's Open setup button.
 	const [setupOpen, setSetupOpen] = useState(false);
 	/** One settings patch from the checklist row buttons; the board's project state refreshes. */
@@ -4555,6 +4557,8 @@ export function ProjectBoard({
 								tasks={col}
 								more={c.key === "done" ? doneHidden : 0}
 								onMore={() => setDoneLimit((n) => n + DONE_PAGE)}
+								starredCollapsed={starredCollapsed}
+								onStarredToggle={() => setStarredCollapsed((c) => !c)}
 								// Idle backlog cards park under the todo lane, below a divider; started ones
 								// joined the lane's own list and the search filter already applied.
 								parked={
@@ -5747,6 +5751,10 @@ function LaneCards(p: {
 	view: TaskCard[];
 	more: number;
 	onMore: (() => void) | undefined;
+	/** LaneCol's useId value: names the Starred body for aria-controls. */
+	uid: string;
+	starredCollapsed: boolean;
+	onStarredToggle: (() => void) | undefined;
 	showMore: (e: ReactMouseEvent<HTMLButtonElement>, go: () => void) => void;
 	card: (t: TaskCard) => ReactNode;
 }) {
@@ -5755,6 +5763,7 @@ function LaneCards(p: {
 		filtering,
 		hasTasks,
 		unread,
+		uid,
 		view,
 		more,
 		onMore,
@@ -5773,11 +5782,36 @@ function LaneCards(p: {
 			{p.fresh.length > 0 && p.fresh.length + p.starred.length < p.total && (
 				<hr className="lane-divider" />
 			)}
-			{p.starred.length > 0 && <p className="lane-label">Starred</p>}
-			{p.starred.map(p.card)}
-			{p.starred.length > 0 && p.fresh.length + p.starred.length < p.total && (
-				<hr className="lane-divider" />
+			{p.starred.length > 0 && (
+				<section
+					className="starred"
+					data-collapsed={p.starredCollapsed || undefined}
+				>
+					<button
+						type="button"
+						className="starred-head"
+						aria-expanded={!p.starredCollapsed}
+						aria-controls={`${uid}-starred`}
+						onClick={p.onStarredToggle}
+					>
+						<svg className="chev" viewBox="0 0 8 8" aria-hidden="true">
+							<path d="M2 3l2 2 2-2" />
+						</svg>
+						<span className="lane-label">Starred</span>
+						<span className="topic-count">{p.starred.length}</span>
+					</button>
+					<div className="starred-body" id={`${uid}-starred`}>
+						<div className="starred-cards">{p.starred.map(p.card)}</div>
+					</div>
+				</section>
 			)}
+			{/* A collapsed section is just its head, whose own fill already separates
+			    it from the cards below; the trailing rule renders only while open. */}
+			{p.starred.length > 0 &&
+				!p.starredCollapsed &&
+				p.fresh.length + p.starred.length < p.total && (
+					<hr className="lane-divider" />
+				)}
 			{
 				// Only the done lane pins unread and starred cards above; other lanes show every card.
 				view
@@ -5906,6 +5940,8 @@ export function LaneCol({
 	onAddDraft,
 	more = 0,
 	onMore,
+	starredCollapsed = false,
+	onStarredToggle,
 	onRerelease,
 	tick,
 }: {
@@ -5920,6 +5956,10 @@ export function LaneCol({
 	/** Done lane only: cards hidden behind the "Show more" button; 0 renders no button. */
 	more?: number;
 	onMore?: () => void;
+	/** Done lane only: the pinned Starred section starts collapsed when true. */
+	starredCollapsed?: boolean;
+	/** Done lane only: flips the Starred section's collapse state. */
+	onStarredToggle?: () => void;
 	/** Every lane's cards: a dependency hold must find a dependency that sits in another lane. */
 	projectTasks: TaskCard[];
 	/** OTTR-708: looks a dependsOn id up across every project's cards, so a hold names a
@@ -5940,6 +5980,7 @@ export function LaneCol({
 	/** The board's 30 s clock tick; feeds the memoized cards so their ages keep ticking. */
 	tick?: number;
 }) {
+	const uid = useId();
 	const boxRef = useRef<HTMLDivElement | null>(null);
 	// Optimistic overlay: the queued-id order the client adopted on a reorder tap, before the
 	// server frame confirms it. null = render the server order; a failed POST clears it and
@@ -6204,6 +6245,9 @@ export function LaneCol({
 				view={view}
 				more={more}
 				onMore={onMore}
+				uid={uid}
+				starredCollapsed={starredCollapsed}
+				onStarredToggle={onStarredToggle}
 				showMore={showMore}
 				card={card}
 			/>
