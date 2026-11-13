@@ -236,7 +236,7 @@ export type SpawnFn = (
 		stdin: string;
 		env: Record<string, string | undefined>;
 		timeoutMs: number;
-		/** Working directory for the spawned process; undefined inherits the caller's (OTTR-883: the fact lookup runs in the project's main checkout). */
+		/** Working directory for the spawned process; undefined inherits the caller's. */
 		cwd?: string;
 	},
 ) => Promise<{ code: number; stdout: string; stderr: string }>;

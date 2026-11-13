@@ -40,10 +40,9 @@ import { joinLevel, splitLevel } from "./levels.ts";
 import { modelList, modelRoles } from "./models.ts";
 import type { GateCheck } from "./promptGate.ts";
 import {
-	factLookup,
-	factsBlock,
 	GATE_REASON,
 	gateAskQuestions,
+	gateAssumptionsBlock,
 	gateCompareText,
 	gateFingerprint,
 	gateHandoff,
@@ -150,7 +149,6 @@ import type {
 	ArchReview,
 	AskQuestion,
 	DiffFileStat,
-	GateFact,
 	GitFacts,
 	LatestImage,
 	ListedTask,
@@ -870,8 +868,6 @@ export interface TurnOps {
 	titleRetryDelayMs?: number;
 	/** OTTR-823 preparation gate: the comprehension check model call; overridable for tests so none spawns a gateway. */
 	gateCheck?: typeof promptGateCheck;
-	/** OTTR-883: the read-only repo lookup that answers the gate's fact questions; overridable for tests so none spawns omp. */
-	factLookup?: typeof factLookup;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
 	commitSubjects?: typeof commitSubjects;
 	/** OTTR-763: per-commit metadata (sha, subject, committer time, changed files) the
@@ -4190,58 +4186,31 @@ export function createTurnLoop(
 			);
 			return false;
 		}
-		// OTTR-883: answer the gate's fact questions from the code before anything
-		// parks. One read-only repo lookup in the project's main checkout; its
-		// answers enter the gate's seen text as an untrusted block and the gate
-		// runs once more on them. Any lookup (or second-call) failure falls back
-		// to today's park with the first call's questions.
-		let effCheck = check;
-		let effSeen = seen;
-		let answeredFacts: GateFact[] | null = null;
-		const factQs = check.questions.filter((q) => q.kind === "fact");
-		if (factQs.length > 0) {
-			try {
-				const facts = await (ops.factLookup ?? factLookup)({
-					questions: factQs.map((q) => q.question),
-					cwd: store.path,
-					sessionDir: store.sessionsDir,
-				});
-				if (facts.length > 0) {
-					for (const f of facts)
-						await log(
-							`+ prompt gate: answered from the code: ${f.question} -> ${f.answer} (${f.evidence})`,
-						);
-					const seenWithFacts =
-						seen === null
-							? factsBlock(facts)
-							: `${seen}\n\n${factsBlock(facts)}`;
-					// The answers enter the persisted state only once the second call
-					// judged them: a failed re-run falls back to today's park with the
-					// seen text untouched, so the drawer never hides answers the state
-					// holds (and never holds answers it does not show).
-					effCheck = await (ops.gateCheck ?? promptGateCheck)({
-						prompt: judged,
-						userMessages: gateUserText(pending, seenWithFacts),
-					});
-					effSeen = seenWithFacts;
-					answeredFacts = facts;
-				}
-			} catch (e) {
-				await log(`! prompt gate: fact lookup failed: ${(e as Error).message}`);
-			}
-		}
-		const missing = !effCheck.points[4]?.covered;
-		if (effCheck.questions.length === 0 && !missing) {
+		// OTTR-904: only a blocking question (default null) parks; a question with a
+		// non-null default becomes a gate assumption that rides to the work turn. A
+		// missing outside check parks only when the gate's checks answer is empty; a
+		// concrete answer is adopted as the check.
+		const blocking = check.questions.filter((q) => q.default === null);
+		const missing = !check.points[4]?.covered;
+		const adopted = missing && check.checks !== "" ? check.checks : null;
+		const assumptions = check.questions
+			.filter((q) => q.default !== null)
+			.map((q) => ({ question: q.question, answer: q.default as string }));
+		if (blocking.length === 0 && !(missing && adopted === null)) {
 			// Pass: restate what the gate understood, stamp the fingerprint, start.
-			await log(`+ prompt gate: would build: ${effCheck.builds}`);
-			await log(`+ prompt gate: check: ${effCheck.checks}`);
-			const missingPoints = effCheck.points
+			await log(`+ prompt gate: would build: ${check.builds}`);
+			await log(`+ prompt gate: check: ${check.checks}`);
+			const missingPoints = check.points
 				.map((p, i) => ({ p, i }))
 				.filter(({ p }) => !p.covered);
 			if (missingPoints.length === 0)
 				await log("+ prompt gate: all five points covered");
 			for (const { p, i } of missingPoints)
 				await log(`+ prompt gate: missing: ${DEEPEN_POINTS[i]} — ${p.reason}`);
+			for (const q of assumptions)
+				await log(`+ prompt gate: assumption: ${q.question} -> ${q.answer}`);
+			if (adopted !== null)
+				await log(`+ prompt gate: adopted check: ${adopted}`);
 			return await store.transaction(async () => {
 				const current = await store.getTask(id);
 				if (
@@ -4252,26 +4221,28 @@ export function createTurnLoop(
 					return false;
 				await store.updateTask(id, {
 					gate: {
-						hash: gateFingerprint(gateCompareText(judged, pending, effSeen)),
-						seen: gateUserText(pending, effSeen),
+						hash: gateFingerprint(gateCompareText(judged, pending, seen)),
+						seen: gateUserText(pending, seen),
 						fails: 0,
 						sig: null,
 						parked: false,
+						...(assumptions.length > 0 ? { assumptions } : {}),
+						...(adopted !== null ? { check: adopted } : {}),
 					},
 				});
 				return true;
 			});
 		}
-		// Park with the gate's questions (and a missing outside check, named).
-		const modelQs = gateAskQuestions(effCheck);
-		const sig = effCheck.questions.map((q) => q.question).join("\n");
+		// Park with the gate's blocking questions (and a missing outside check, named).
+		const modelQs = gateAskQuestions(check);
+		const sig = blocking.map((q) => q.question).join("\n");
 		const fails = live.gate?.sig === sig ? live.gate.fails + 1 : 1;
 		let asked = modelQs;
-		if (missing) asked = [...asked, missingCheckQuestion()];
+		if (missing && adopted === null) asked = [...asked, missingCheckQuestion()];
 		if (fails >= 3 && live.gate?.sig === sig) asked = [startAnywayQuestion()];
 		else if (fails >= 2) asked = [...asked.slice(0, 4), startAnywayQuestion()];
 		const cause =
-			missing && modelQs.length === 0
+			blocking.length === 0
 				? "the prompt names no outside check"
 				: "the gate still has open questions";
 		await parkGate(
@@ -4282,11 +4253,10 @@ export function createTurnLoop(
 				asked,
 				gate: {
 					hash: null,
-					seen: effSeen,
+					seen,
 					fails,
 					sig,
 					parked: true,
-					...(answeredFacts !== null ? { facts: answeredFacts } : {}),
 				},
 			},
 			log,
@@ -4854,7 +4824,13 @@ export function createTurnLoop(
 		// Hosted wording (docs/specs/hosted-mode.md section 1) rides after the prompt, so
 		// prompts.ts stays untouched: the resume text on a reply into a session, else by kind.
 		const suffix = hostedWordingSuffix(pending, plan, kind);
-		const prompt = suffix === "" ? ownPrompt : `${ownPrompt}\n\n${suffix}`;
+		// OTTR-904: the gate's assumptions and adopted check ride to every work turn
+		// whose gate state carries them, as one untrusted data block; the gate's raw
+		// seen text never reaches the omp session.
+		const gateBlock = kind === "work" ? gateAssumptionsBlock(live.gate) : "";
+		const withGate =
+			gateBlock === "" ? ownPrompt : `${ownPrompt}\n\n${gateBlock}`;
+		const prompt = suffix === "" ? withGate : `${withGate}\n\n${suffix}`;
 		const turnImages = turnRunImages(kind, live, pending, plan);
 		const imagesDir = await store.imagesDir(id);
 		const imagePaths = turnImages.map((n) => join(imagesDir, n));

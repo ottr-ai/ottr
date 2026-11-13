@@ -31,6 +31,7 @@ import {
 } from "./ompStatsDashboard.ts";
 import { orphanPids } from "./orphans.ts";
 import { platform } from "./platform/index.ts";
+import { replayGateParks } from "./promptGate.ts";
 import {
 	commentOnPullRequest,
 	listPulls,
@@ -839,6 +840,16 @@ const supervisor = createSupervisor(
 	},
 	workerTarget,
 );
+
+// OTTR-904: the old gate parks replay once per boot stamp, so the cards the
+// old rule parked get the new park rule (defaults ride, only null defaults
+// block) on their next turn start.
+replayGateParks(projects.values(), {
+	kvGet: (key) => gstore.get(key),
+	kvSet: (key, value) => gstore.set(key, value),
+	log: (line) => console.log(`prompt gate replay: ${line}`),
+	schedule: loop.schedule,
+});
 
 /** Every pid a live turn claim or a store's runningPids() row holds; orphan checks subtract these. */
 async function claimedPids(): Promise<Set<number>> {

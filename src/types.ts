@@ -66,30 +66,30 @@ export interface AskQuestion {
 	recommended: number | null;
 }
 
-/** One gate question the repo lookup answered from the code, with its file:line evidence (OTTR-883). */
-export interface GateFact {
-	/** The gate's fact question, verbatim. */
+/** One gate question the gate itself answered with the default it would build with (OTTR-904). */
+export interface GateAssumption {
+	/** The gate's question, verbatim. */
 	question: string;
-	/** The answer the lookup found in the repository. */
+	/** The default the gate would build with; never null here (a null-default question blocks instead). */
 	answer: string;
-	/** The evidence as `file:line`, or "" when the lookup answered nothing usable. */
-	evidence: string;
 }
 
 /** The comprehension gate's persisted state for one card (OTTR-823, JSON in the DB). */
 export interface PromptGateState {
 	/** sha256 hex of the compared effective text this gate passed (or the user started anyway); null = never passed. */
 	hash: string | null;
-	/** The user text the gate last saw (a reply the run has since consumed); keeps the skip rule stable across consumption. */
+	/** Every user text the gate has seen so far, "\n\n"-joined; each pass and each Start anyway appends the newest queued text (a "." marker never counts). Keeps the skip rule stable across consumption and never drops earlier answers. */
 	seen: string | null;
 	/** Consecutive failed gate evaluations with the same failure signature. */
 	fails: number;
-	/** The last park's failure signature: the question texts joined, or "error". */
+	/** The last park's failure signature: the blocking question texts joined, or "error". */
 	sig: string | null;
 	/** True while the card sits in a gate park; the drawer shows Start anyway. */
 	parked: boolean;
-	/** Fact questions the lookup answered from the code (OTTR-883), shown in the drawer while parked; absent on a pass and after Start anyway. */
-	facts?: GateFact[];
+	/** The gate's non-blocking questions with the answers it would build with (OTTR-904); absent when none. Rides to the work turn as the Gate assumptions block. */
+	assumptions?: GateAssumption[];
+	/** The outside check the gate adopted when the prompt text carried none (OTTR-904); absent when the text carried one. */
+	check?: string;
 }
 
 /** Normalizes an ask tool call's `{ questions: [...] }` args; null when no usable question is inside. */

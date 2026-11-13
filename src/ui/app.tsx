@@ -9676,27 +9676,6 @@ function DrawerAskPanel(p: {
 					{task.needsReason !== null && (
 						<div className="needs-reason">{task.needsReason}</div>
 					)}
-					{task.gate?.facts !== undefined && task.gate.facts.length > 0 && (
-						<div className="gate-facts">
-							<div className="hint">
-								Answered from the code — reply to correct one:
-							</div>
-							<ul className="gate-fact-list">
-								{task.gate.facts.map((f) => (
-									<li key={f.question}>
-										<span className="gate-fact-q">{f.question}</span>{" "}
-										<span className="gate-fact-a">{f.answer}</span>
-										{f.evidence !== "" && (
-											<>
-												{" "}
-												<code className="gate-fact-e">{f.evidence}</code>
-											</>
-										)}
-									</li>
-								))}
-							</ul>
-						</div>
-					)}
 					<button
 						type="button"
 						className="ghost gate-start-btn"

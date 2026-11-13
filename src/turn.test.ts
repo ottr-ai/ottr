@@ -33,6 +33,7 @@ import {
 	type GateCheck,
 	gateCompareText,
 	gateFingerprint,
+	missingCheckQuestion,
 	START_ANYWAY,
 	startAnywayQuestion,
 } from "./promptGate.ts";
@@ -25357,9 +25358,7 @@ describe("prompt gate", () => {
 				covered: true,
 				reason: "covered",
 			})),
-			questions: [
-				{ question, kind: "decision", options: ["sqlite", "postgres"] },
-			],
+			questions: [{ question, default: null, options: ["sqlite", "postgres"] }],
 		};
 	}
 
@@ -25680,210 +25679,134 @@ describe("prompt gate", () => {
 		expect(calls).toBe(2);
 	});
 
-	test("a fact question gets one repo lookup, and the gate re-runs on the answers", async () => {
-		const factQ = "Where does the release currently run?";
-		const decisionQ = "If the app token mint fails, fail or fall back?";
-		const gateInputs: (string | null)[] = [];
-		let lookupInput: string[] | null | undefined;
-		let lookupCwd: string | null | undefined;
-		let calls = 0;
-		const checkWith = (questions: GateCheck["questions"]): GateCheck => ({
-			builds: "a release flow",
-			checks: "watch the release land",
-			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
-			questions,
-		});
+	test("a pass with only default answers rides the assumptions to the work turn", async () => {
 		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
-			gateCheck: async (o) => {
-				calls += 1;
-				gateInputs.push(o.userMessages);
-				return calls === 1
-					? checkWith([
-							{ question: factQ, kind: "fact", options: [] },
-							{ question: decisionQ, kind: "decision", options: ["fail"] },
-						])
-					: checkWith([
-							{ question: decisionQ, kind: "decision", options: ["fail"] },
-						]);
-			},
-			factLookup: async (o) => {
-				lookupInput = [...o.questions];
-				lookupCwd = o.cwd;
-				return [
+			gateCheck: async () => ({
+				builds: "a small service",
+				checks: "run the test suite",
+				points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "covered" })),
+				questions: [
 					{
-						question: factQ,
-						answer: "gh release create",
-						evidence: "src/release.ts:827",
+						question: "Which database?",
+						default: "sqlite",
+						options: ["sqlite", "postgres"],
 					},
-				];
-			},
+				],
+			}),
 		});
-		const task = await store.createTask("fact gate");
+		const task = await store.createTask("assume and go");
 
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
-		// The lookup saw exactly the fact questions and ran in the project's main checkout.
-		expect(lookupInput).toEqual([factQ]);
-		expect(lookupCwd).toBe(store.path);
-		// The gate ran twice: the second time with the answers in view.
-		expect(calls).toBe(2);
-		expect(gateInputs[0] ?? null).toBeNull();
-		const seenText = gateInputs[1] ?? "";
-		expect(seenText).toContain("Answered from the code");
-		expect(seenText).toContain("gh release create (src/release.ts:827)");
-		// The park carries only the decision question; the fact went to the code.
-		expect(after.state).toBe("needs_you");
-		expect(after.asked).toHaveLength(1);
-		expect(after.asked?.[0]?.question).toBe(decisionQ);
-		// The seen text holds the answered fact, and the park persists it for the drawer.
-		expect(after.gate?.seen).toContain("Answered from the code");
-		expect(after.gate?.seen).toContain(
-			"gh release create (src/release.ts:827)",
+		expect(after.state).toBe("idle");
+		expect(record.runs).toHaveLength(1);
+		expect(after.gate?.parked).toBe(false);
+		expect(after.gate?.assumptions).toEqual([
+			{ question: "Which database?", answer: "sqlite" },
+		]);
+		// The assumptions ride to the omp session as the untrusted Gate assumptions block.
+		const prompt = record.runs[0]!.prompt;
+		expect(prompt).toContain("Gate assumptions");
+		expect(prompt).toContain("- Q: Which database?");
+		expect(prompt).toContain("A: sqlite");
+		expect(await logText(store, task.id)).toContain(
+			"+ prompt gate: assumption: Which database? -> sqlite",
 		);
-		expect(after.gate?.facts).toEqual([
+	});
+
+	test("a blocking question parks alone; a default-answer question never reaches the ask", async () => {
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			gateCheck: async () => ({
+				builds: "a small service",
+				checks: "run the test suite",
+				points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "covered" })),
+				questions: [
+					{
+						question: "Which database?",
+						default: "sqlite",
+						options: ["sqlite", "postgres"],
+					},
+					{ question: "Fail or fall back?", default: null, options: ["fail"] },
+				],
+			}),
+		});
+		const task = await store.createTask("one blocker");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Prompt gate: the gate still has open questions",
+		);
+		expect(after.asked).toEqual([
 			{
-				question: factQ,
-				answer: "gh release create",
-				evidence: "src/release.ts:827",
+				question: "Fail or fall back?",
+				options: [{ label: "fail" }],
+				multi: false,
+				recommended: null,
 			},
 		]);
+		// The failure signature counts the blocking questions only.
+		expect(after.gate?.sig).toBe("Fail or fall back?");
 		expect(after.gate?.parked).toBe(true);
-		// A parked gate spawns no omp session and no worktree.
-		expect(record.runs).toHaveLength(0);
 	});
 
-	test("a lookup that answers unknown parks with both questions", async () => {
-		const factQ = "Where does the release currently run?";
-		const decisionQ = "If the app token mint fails, fail or fall back?";
-		let lookups = 0;
-		let calls = 0;
-		const { store, record, loop } = await setup({
+	test("a missing outside check with an empty checks answer parks with the check question", async () => {
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
-			gateCheck: async () => {
-				calls += 1;
-				return {
-					builds: "a release flow",
-					checks: "watch the release land",
-					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
-					questions: [
-						{ question: factQ, kind: "fact", options: [] },
-						{ question: decisionQ, kind: "decision", options: ["fail"] },
-					],
-				};
-			},
-			factLookup: async () => {
-				lookups += 1;
-				// The real factLookup filters unusable answers out before returning.
-				return [];
-			},
+			gateCheck: async () => ({
+				builds: "a small service",
+				checks: "",
+				points: DEEPEN_POINTS.map((_, i) => ({
+					covered: i !== 4,
+					reason: "covered",
+				})),
+				questions: [],
+			}),
 		});
-		const task = await store.createTask("unknown fact gate");
+		const task = await store.createTask("no check");
 
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
-		expect(lookups).toBe(1);
-		// No usable answers: no re-gate, the first call's questions park as today.
-		expect(calls).toBe(1);
 		expect(after.state).toBe("needs_you");
-		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
-		expect(after.gate?.seen).toBeNull();
-		expect(after.gate?.facts).toBeUndefined();
-		expect(after.gate?.sig).toBe(`${factQ}\n${decisionQ}`);
-		expect(record.runs).toHaveLength(0);
-	});
-
-	test("a lookup that fails parks with both questions and logs the failure", async () => {
-		const factQ = "Where does the release currently run?";
-		const decisionQ = "If the app token mint fails, fail or fall back?";
-		let calls = 0;
-		const { store, record, loop } = await setup({
-			commitsAhead: async () => 0,
-			gateCheck: async () => {
-				calls += 1;
-				return {
-					builds: "a release flow",
-					checks: "watch the release land",
-					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
-					questions: [
-						{ question: factQ, kind: "fact", options: [] },
-						{ question: decisionQ, kind: "decision", options: ["fail"] },
-					],
-				};
-			},
-			factLookup: async () => {
-				throw new Error("omp down");
-			},
-		});
-		const task = await store.createTask("broken fact lookup");
-
-		await loop.runTurn(store.name, task.id);
-
-		const after = (await store.getTask(task.id))!;
-		expect(calls).toBe(1);
-		expect(after.state).toBe("needs_you");
-		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
-		expect(after.gate?.seen).toBeNull();
-		expect(after.gate?.facts).toBeUndefined();
-		expect(readFileSync(await store.logPath(task.id), "utf8")).toContain(
-			"! prompt gate: fact lookup failed: omp down",
+		expect(after.needsReason).toBe(
+			"Prompt gate: the prompt names no outside check",
 		);
-		expect(record.runs).toHaveLength(0);
+		expect(after.asked).toEqual([missingCheckQuestion()]);
 	});
 
-	test("a failed re-run after an answered lookup parks with seen unchanged", async () => {
-		const factQ = "Where does the release currently run?";
-		const decisionQ = "If the app token mint fails, fail or fall back?";
-		const gateInputs: (string | null)[] = [];
-		let calls = 0;
+	test("a concrete checks answer is adopted as the check and the turn starts", async () => {
 		const { store, record, loop } = await setup({
 			commitsAhead: async () => 0,
-			gateCheck: async (o) => {
-				calls += 1;
-				gateInputs.push(o.userMessages);
-				if (calls === 1)
-					return {
-						builds: "a release flow",
-						checks: "watch the release land",
-						points: DEEPEN_POINTS.map(() => ({
-							covered: true,
-							reason: "fine",
-						})),
-						questions: [
-							{ question: factQ, kind: "fact", options: [] },
-							{ question: decisionQ, kind: "decision", options: ["fail"] },
-						],
-					};
-				throw new Error("re-gate down");
-			},
-			factLookup: async () => [
-				{
-					question: factQ,
-					answer: "gh release create",
-					evidence: "src/release.ts:827",
-				},
-			],
+			gateCheck: async () => ({
+				builds: "a small service",
+				checks: "bun test",
+				points: DEEPEN_POINTS.map((_, i) => ({
+					covered: i !== 4,
+					reason: "covered",
+				})),
+				questions: [],
+			}),
 		});
-		const task = await store.createTask("failed re-gate");
+		const task = await store.createTask("adopted check");
 
 		await loop.runTurn(store.name, task.id);
 
 		const after = (await store.getTask(task.id))!;
-		// Both gate calls ran; the second one failed after the lookup answered.
-		expect(calls).toBe(2);
-		// The second call saw the answers; the persisted park does not hold them.
-		expect(gateInputs[1] ?? "").toContain("Answered from the code");
-		// The fallback is today's park: the first call's questions, seen untouched.
-		expect(after.state).toBe("needs_you");
-		expect(after.asked?.map((q) => q.question)).toEqual([factQ, decisionQ]);
-		expect(after.gate?.seen).toBeNull();
-		expect(after.gate?.facts).toBeUndefined();
-		expect(readFileSync(await store.logPath(task.id), "utf8")).toContain(
-			"! prompt gate: fact lookup failed: re-gate down",
+		expect(after.state).toBe("idle");
+		expect(record.runs).toHaveLength(1);
+		expect(after.gate?.check).toBe("bun test");
+		expect(record.runs[0]!.prompt).toContain(
+			"The prompt gate adopted this outside check: bun test",
 		);
-		expect(record.runs).toHaveLength(0);
+		expect(await logText(store, task.id)).toContain(
+			"+ prompt gate: adopted check: bun test",
+		);
 	});
 
 	test("a hash match skips the gate seam entirely", async () => {
@@ -25995,7 +25918,7 @@ describe("prompt gate", () => {
 			})),
 			questions: ["a?", "b?", "c?", "d?", "e?"].map((question) => ({
 				question,
-				kind: "decision" as const,
+				default: null,
 				options: ["yes", "no"],
 			})),
 		};

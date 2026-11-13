@@ -47,7 +47,7 @@ import type {
 	DiffFileStat,
 	ForkBranchState,
 	ForkHoldState,
-	GateFact,
+	GateAssumption,
 	ListedTask,
 	OutcomeStatus,
 	ProjectSettings,
@@ -684,16 +684,16 @@ function parseGate(raw: string | null): PromptGateState | null {
 			sig: typeof g.sig === "string" ? g.sig : null,
 			parked: g.parked === true,
 		};
-		// OTTR-883: the answered facts ride through when they parse as GateFacts.
-		if (Array.isArray(g.facts))
-			state.facts = g.facts.filter(
-				(f): f is GateFact =>
-					typeof f === "object" &&
-					f !== null &&
-					typeof f.question === "string" &&
-					typeof f.answer === "string" &&
-					typeof f.evidence === "string",
+		// OTTR-904: the gate's assumptions and adopted check ride through when they parse.
+		if (Array.isArray(g.assumptions))
+			state.assumptions = g.assumptions.filter(
+				(a): a is GateAssumption =>
+					typeof a === "object" &&
+					a !== null &&
+					typeof a.question === "string" &&
+					typeof a.answer === "string",
 			);
+		if (typeof g.check === "string" && g.check !== "") state.check = g.check;
 		return state;
 	} catch {
 		return null;

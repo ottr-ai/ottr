@@ -523,9 +523,8 @@ describe("systemPrompt", () => {
 	});
 });
 
-// OTTR-883: the fact lookup's real reader is this spawn — the production line
-// `cwd: o.cwd` is what puts the lookup in the project's main checkout, so a real
-// child process must land in the directory the caller passed, not the board's own.
+// The fork analysis spawn and every gateway run ride this function: a real child
+// process must land in the directory the caller passed, not the board's own.
 describe("defaultSpawn cwd", () => {
 	test("the spawned process runs in the given cwd", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-spawn-cwd-"));
