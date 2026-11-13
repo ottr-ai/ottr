@@ -26169,6 +26169,68 @@ describe("prompt gate", () => {
 		expect(record.runs).toHaveLength(0);
 		expect(record.createWorktree).toHaveLength(0);
 	});
+
+	test("a model-restore requeue with a mid-run steer titles the queue user", async () => {
+		const { store, record, loop } = setup({
+			maxTotalRuns: () => 0, // each turn runs via a direct runTurn
+			workerTarget: { urls: ["http://worker-a:8787"] },
+			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:medium" }),
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				if (o.model === null || o.model === undefined) {
+					// A user steer lands mid-run: the run has consumed the queue,
+					// so applySteer writes just the steer, titled "user".
+					store.updateTask(task.id, {
+						pendingPrompt: "take theirs",
+						pendingBy: "user",
+					});
+					return {
+						pid: 4242,
+						done: Promise.resolve(
+							runResult({
+								exitCode: 1,
+								sawTerminalEnd: false,
+								finalText: "",
+								stderrTail:
+									"error: Could not restore model zai/glm-5.3-flash.\n",
+							}),
+						),
+						kill: async () => {},
+					};
+				}
+				return {
+					pid: 4243,
+					done: Promise.resolve(
+						runResult({ outcome: { status: "integrated", summary: "ok" } }),
+					),
+					kill: async () => {},
+				};
+			},
+		});
+		const task = store.createTask("merge please");
+		saveSession(store, "sess-9");
+		// The queue at turn start is a supervisor send-back; the settle rebuilds
+		// the queue from raw plus the mid-run steer and must not re-title it
+		// "supervisor" — the queue holds user text, so the gate judges it.
+		store.updateTask(task.id, {
+			stage: "merging",
+			state: "queued",
+			sessionId: "sess-9",
+			pendingPrompt: "Send-back 1 of 4: fix and report ready again.",
+			pendingBy: "supervisor",
+		});
+		await loop.runTurn(store.name, task.id);
+		const mid = store.getTask(task.id)!;
+		expect(mid.state).toBe("queued");
+		expect(mid.pendingPrompt).toBe(
+			"Send-back 1 of 4: fix and report ready again.\n\ntake theirs",
+		);
+		expect(mid.pendingBy).toBe("user");
+		await loop.runTurn(store.name, task.id);
+		// The retry consumes the queue; the steer was delivered with the raw text.
+		const after = store.getTask(task.id)!;
+		expect(after.pendingPrompt).toBeNull();
+	});
 });
 
 describe("async turn state boundaries", () => {

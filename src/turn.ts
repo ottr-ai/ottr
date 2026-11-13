@@ -8040,11 +8040,22 @@ export function createTurnLoop(
 			st.input.raw,
 			(await st.store.getTask(st.id))?.pendingPrompt ?? null,
 		].filter((p): p is string => p !== null && p !== ".");
+		// A steer that landed mid-run is user text: the rebuilt queue holds user
+		// text, so it keeps the user title and the gate judges it (OTTR-904).
+		// Without a mid-run steer the rebuilt queue carries only raw's text and
+		// keeps raw's authorship; a null behaves as user.
+		const live = st.store.getTask(st.id);
+		const steerLanded =
+			live?.pendingPrompt !== null &&
+			live?.pendingPrompt !== undefined &&
+			live.pendingBy === "user";
 		return {
 			...next,
 			pendingPrompt: sent.join("\n\n") || (st.input.raw ?? undefined),
-			// raw's authorship leads the re-park; a null behaves as user.
-			pendingBy: st.input.live.pendingBy ?? "user",
+			pendingBy:
+				steerLanded || st.input.live.pendingBy === null
+					? "user"
+					: st.input.live.pendingBy,
 		};
 	}
 
