@@ -2162,7 +2162,11 @@ describe("createPrWatcher", () => {
 		expect(joined.endsWith(expected)).toBe(true);
 		const system = joined.slice(0, joined.length - expected.length - 1);
 		expect(system.startsWith("You review one GitHub pull request")).toBe(true);
-		expect(system.endsWith("summary and the inline blocks.")).toBe(true);
+		// The base ends with the verdict paragraph the approve option added; the lens
+		// stays out.
+		expect(
+			system.endsWith("summary, the inline blocks, and the verdict line."),
+		).toBe(true);
 	});
 
 	test("a failed perf scan logs and the review continues without candidates", async () => {
