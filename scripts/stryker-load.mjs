@@ -15,7 +15,7 @@ import { join } from "node:path";
  * root path>. A machine-global parent put every worktree's sandbox next to every other's, and a
  * killed run's leftover sandbox then held a foreign or stale tree (OTTR-500). Stryker creates a
  * fresh randomly-named sandbox-N inside the parent per run (mkdtemp), so the parent needs no
- * per-run name — wiping it at run start (see stryker.config.mjs) clears a killed run's leftover.
+ * per-run name — wiping it at run start (see scripts/stryker-base.mjs) clears a killed run's leftover.
  * The repo root defaults to cwd: every Stryker run here starts at the checkout's root.
  */
 export function sandboxTempDirName(
@@ -75,14 +75,17 @@ function concurrencyDecision(env, parallelism, cgroup) {
 				`STRYKER_CONCURRENCY must be a positive integer, got ${JSON.stringify(raw)}`,
 			);
 		}
-		return { slots: value, rule: `STRYKER_CONCURRENCY=${raw}` };
+		return {
+			slots: value,
+			rule: `STRYKER_CONCURRENCY=${raw}, free memory unknown`,
+		};
 	}
 	const cpuSlots = Math.max(1, Math.floor(parallelism / 2));
 	const freeBytes = cgroupFreeBytes(cgroup);
 	if (freeBytes === null) {
 		return {
 			slots: cpuSlots,
-			rule: `cpu rule (${parallelism} CPUs, no cgroup memory limit)`,
+			rule: `cpu rule (${parallelism} CPUs, free memory unknown, no cgroup limit)`,
 		};
 	}
 	const memorySlots = Math.max(
@@ -98,7 +101,7 @@ function concurrencyDecision(env, parallelism, cgroup) {
 	}
 	return {
 		slots: cpuSlots,
-		rule: `cpu rule (${parallelism} CPUs; memory rule allowed ${memorySlots})`,
+		rule: `cpu rule (${parallelism} CPUs, ${freeMiB} MiB free; memory rule allowed ${memorySlots})`,
 	};
 }
 

@@ -2,8 +2,12 @@
 // per test, which inflates the whole-suite runs of the main config past their budget (513 of 516
 // mutants timed out there, 2026-10-01), so only this module's mutants pay for its suite — the same
 // isolation pattern as stryker.release.config.mjs and stryker.worktree.config.mjs.
-import base from "./stryker.config.mjs";
-import { cappedConcurrency } from "./scripts/stryker-load.mjs";
+import { makeBaseConfig } from "./scripts/stryker-base.mjs";
+
+// The base cap; the capped uniform sample kept verdicts identical at c24 (OTTR-19), and the
+// 60 s + 2x budget leaves ~10x headroom over the ~8 s store suite. The CPU-derived value,
+// the memory rule and STRYKER_CONCURRENCY only lower it.
+const base = makeBaseConfig(24);
 
 /** @type {import("@stryker-mutator/api/core").PartialStrykerOptions} */
 export default {
@@ -14,12 +18,8 @@ export default {
   // runaway from OOMing the host; the runner's own temp dirs are removed when the run ends.
   bun: { ...base.bun, timeout: 300_000, testFiles: ["src/turn.test.ts"] },
   mutate: ["src/turn.ts"],
-  // Own cache file: all five configs share the base module (stryker.config.mjs).
+  // Own cache file: all five configs share the base module (scripts/stryker-base.mjs).
   incrementalFile: "reports/stryker-incremental-turn.json",
-  // The base cap; the capped uniform sample kept verdicts identical at c24 (OTTR-19), and the
-  // 60 s + 2x budget leaves ~10x headroom over the ~8 s store suite. The CPU-derived value,
-  // the memory rule and STRYKER_CONCURRENCY only lower it.
-  concurrency: cappedConcurrency(24),
   // Budget per run = timeoutMS + timeoutFactor x dry-run net time: the store-heavy suite inflates
   // in the cold sandbox under parallel runners.
   timeoutMS: 60000,

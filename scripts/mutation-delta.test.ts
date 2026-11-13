@@ -754,7 +754,7 @@ describe("loadConfigs", () => {
 	// The delta gate's own deadlock regression (OTTR-366): the real configs took the mutation
 	// lock at import time, so loadConfigs here made this test process hold the lock its
 	// Stryker children then waited for. Reading the configs must leave the lock alone; only a
-	// Stryker run takes it (stryker-load.mjs isStrykerRun, gated in stryker.config.mjs).
+	// Stryker run takes it (stryker-load.mjs isStrykerRun, gated in scripts/stryker-base.mjs).
 	test("reading the real configs takes no mutation lock", async () => {
 		const configs = await loadConfigs(resolve(import.meta.dir, ".."));
 		expect(configs.length).toBeGreaterThan(0);

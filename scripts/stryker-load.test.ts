@@ -245,7 +245,7 @@ test("isStrykerRun matches Stryker's own entry scripts only", () => {
 // The delta gate's regression (OTTR-366): the config modules took the mutation lock at
 // import time, so a tool that imported them to read `mutate` (scripts/mutation-delta.ts)
 // held the lock its own Stryker children then waited for. The config takes the lock only
-// under a Stryker-shaped argv now (stryker.config.mjs gates on isStrykerRun). These tests
+// under a Stryker-shaped argv now (scripts/stryker-base.mjs gates on isStrykerRun). These tests
 // drive the REAL stryker.config.mjs; TMPDIR points into the sandbox, so the config's lock
 // path (tmpdir()/ott-stryker) lands inside it and the assertions touch no real lock.
 // The child scripts import the config by a runtime-computed absolute file URL (the path
@@ -387,5 +387,86 @@ test("a plain import of the real config leaves a sandbox parent alone", () => {
 			},
 		);
 		expect(out).toContain("KEPT");
+	});
+});
+
+// OTTR-886 send-back: a run logs exactly one concurrency line, with the slots the run uses
+// and the free memory (or "free memory unknown" where no reading applies). The children drive
+// the REAL configs with a Stryker-shaped argv, so the line prints; the sandbox TMPDIR keeps
+// the lock and wipe away from the real host state.
+const strykerBin = join(
+	new URL("..", import.meta.url).pathname,
+	"node_modules",
+	".bin",
+	"stryker",
+);
+
+function concurrencyLines(out: string): string[] {
+	return out.split("\n").filter((line) => line.startsWith("stryker-load:"));
+}
+
+test("the base config logs exactly one concurrency line for a run", () => {
+	withSandbox((sandbox) => {
+		const out = runChild(
+			`process.env.TMPDIR = process.env.SANDBOX_ROOT;
+			process.argv[1] = process.env.FAKE_BIN;
+			await import(${configUrl});
+			console.log("DONE");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+				FAKE_BIN: strykerBin,
+			},
+		);
+		const lines = concurrencyLines(out);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toMatch(/^stryker-load: \d+ slots; /);
+		expect(lines[0]).toMatch(/MiB free|free memory unknown/);
+		expect(out).toContain("DONE");
+	});
+});
+
+test("a wrapper config logs one line with its own cap", () => {
+	withSandbox((sandbox) => {
+		const wrapperUrl = JSON.stringify(
+			new URL("../stryker.release.config.mjs", import.meta.url).href,
+		);
+		const out = runChild(
+			`process.env.TMPDIR = process.env.SANDBOX_ROOT;
+			process.argv[1] = process.env.FAKE_BIN;
+			await import(${wrapperUrl});
+			console.log("DONE");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+				FAKE_BIN: strykerBin,
+			},
+		);
+		const lines = concurrencyLines(out);
+		expect(lines).toHaveLength(1);
+		const slots = Number(
+			/^stryker-load: (\d+) slots/.exec(lines[0] ?? "")?.[1],
+		);
+		expect(slots).toBeLessThanOrEqual(8);
+		expect(out).toContain("DONE");
+	});
+});
+
+test("STRYKER_CONCURRENCY logs free memory unknown", () => {
+	withSandbox((sandbox) => {
+		const out = runChild(
+			`process.env.TMPDIR = process.env.SANDBOX_ROOT;
+			process.env.STRYKER_CONCURRENCY = "5";
+			process.argv[1] = process.env.FAKE_BIN;
+			await import(${configUrl});
+			console.log("DONE");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+				FAKE_BIN: strykerBin,
+			},
+		);
+		const lines = concurrencyLines(out);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("STRYKER_CONCURRENCY=5");
+		expect(lines[0]).toContain("free memory unknown");
+		expect(out).toContain("DONE");
 	});
 });
