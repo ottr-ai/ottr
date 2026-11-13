@@ -86,3 +86,15 @@ commits = ["671d2721a352187c428894182c14323b954bdc23"]
 [[allowlists]]
 description = "fake api_key fixture in commit 97d3333, replaced by the zero-suffix style on the tip"
 commits = ["97d333313e17cec4683b0ca33f9be9d33e770a42"]
+
+# Commits 414f3e5 and 9e92e0f (the GitHub app release work) put the fake
+# GitHub token fixture `ghs_12345678` in src/release.test.ts, five times, and
+# generic-api-key flags that value. The tip commit moves the fixtures to the
+# zero-suffix fixture style, but the findings live in those commits' patches,
+# which history keeps forever. Scoped to those commits: a real token never
+# looks like `ghs_aaaa0000aaaa0000`, and a secret-shaped string anywhere else
+# stays flagged.
+
+[[allowlists]]
+description = "fake GitHub token fixtures in commits 414f3e5 and 9e92e0f, replaced by the zero-suffix style on the tip"
+commits = ["414f3e554b65fb1873b3edbd1cc2d2ab8966772d", "9e92e0ffefd3bcec9b6b2b51203d735c504431d3"]

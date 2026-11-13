@@ -968,7 +968,10 @@ describe("against real repos", () => {
 				version: "v0.9.2",
 				notes: "n",
 				github: "https://github.com/o/r",
-				releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+				releaseToken: {
+					token: "ghs_aaaa0000aaaa0000",
+					label: "GitHub app rel-bot",
+				},
 				dryRun: true,
 			});
 			// The head holds the reviewed feat plus one late fix, so the tag part names it.
@@ -1021,7 +1024,10 @@ describe("against real repos", () => {
 			version: "v0.9.4",
 			notes: "n",
 			github: "https://github.com/octo/widget",
-			releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+			releaseToken: {
+				token: "ghs_aaaa0000aaaa0000",
+				label: "GitHub app rel-bot",
+			},
 			dryRun: true,
 		});
 		expect(log).toBe(
@@ -1059,7 +1065,10 @@ describe("against real repos", () => {
 			version: "v0.9.6",
 			notes: "n",
 			github: "https://github.com/octo/widget",
-			releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+			releaseToken: {
+				token: "ghs_aaaa0000aaaa0000",
+				label: "GitHub app rel-bot",
+			},
 			dryRun: true,
 		});
 		// The scoped https helper never answers an ssh remote: the push keeps the origin's
@@ -1078,7 +1087,10 @@ describe("against real repos", () => {
 			version: "v0.9.7",
 			notes: "n",
 			github: "https://github.com/octo/widget",
-			releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+			releaseToken: {
+				token: "ghs_aaaa0000aaaa0000",
+				label: "GitHub app rel-bot",
+			},
 			dryRun: true,
 		});
 		// The GitHub token must never reach another host's helper: the push keeps the
@@ -1100,7 +1112,10 @@ describe("against real repos", () => {
 					version: "v0.9.9",
 					notes: "n",
 					github: "https://github.com/o/r",
-					releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+					releaseToken: {
+						token: "ghs_aaaa0000aaaa0000",
+						label: "GitHub app rel-bot",
+					},
 					dryRun: true,
 				}),
 			).rejects.toThrow(/already exists/);
