@@ -9525,10 +9525,10 @@ export function createTurnLoop(
 				// sandbox run waits for a validation sandbox.
 				if (live !== null && live.cancelledAt === null) {
 					const byFingerprint = new Map<string, ListedTask[]>();
-					// Open lead cards by title key, lowest id first: the fallback for a lead
-					// whose fingerprint finds no open or cancelled card. Only open cards
-					// block a lead here; cancelled and done titles never do.
-					const openByTitle = new Map<string, ListedTask>();
+					// Open lead cards by title key: the fallback for a lead whose
+					// fingerprint finds no open or cancelled card. Only open cards block a
+					// lead here; cancelled and done titles never do.
+					const openByTitle = new Map<string, ListedTask[]>();
 					const indexTitle = (t: ListedTask): void => {
 						const key = leadTitleKey(t.prompt);
 						if (
@@ -9537,8 +9537,9 @@ export function createTurnLoop(
 							t.stage === "done"
 						)
 							return;
-						const held = openByTitle.get(key);
-						if (held === undefined || t.id < held.id) openByTitle.set(key, t);
+						const list = openByTitle.get(key);
+						if (list === undefined) openByTitle.set(key, [t]);
+						else list.push(t);
 					};
 					for (const t of await st.store.listTasks()) {
 						indexTitle(t);
@@ -9554,16 +9555,17 @@ export function createTurnLoop(
 						const fpMatch =
 							fp === null ? null : pickLeadMatch(byFingerprint.get(fp) ?? []);
 						// Two different fingerprints are two different records, so a title
-						// match counts only when the lead or the card carries none.
-						const byTitle =
-							fpMatch !== null && fpMatch.kind !== "done"
-								? undefined
-								: openByTitle.get(leadTitleKey(lead.prompt));
-						const titleCard =
-							byTitle !== undefined &&
-							(fp === null || leadFingerprint(byTitle.prompt) === null)
-								? byTitle
-								: undefined;
+						// match counts only when the lead or the card carries none. The
+						// filter runs before the lowest-id pick, so an ineligible older card
+						// never hides an eligible later one.
+						let titleCard: ListedTask | undefined;
+						if (fpMatch === null || fpMatch.kind === "done")
+							for (const t of openByTitle.get(leadTitleKey(lead.prompt)) ?? [])
+								if (
+									(fp === null || leadFingerprint(t.prompt) === null) &&
+									(titleCard === undefined || t.id < titleCard.id)
+								)
+									titleCard = t;
 						const match =
 							titleCard === undefined
 								? fpMatch

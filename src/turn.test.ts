@@ -25702,6 +25702,47 @@ describe("stored review findings", () => {
 		);
 	});
 
+	test("an older same-title card with another fingerprint does not hide a later fingerprint-less one", async () => {
+		const record = baseRecord();
+		const lead = mkFinding(
+			"Needs validation: flaky retry on push\nFingerprint: fp-a",
+		);
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+		const older = await store.createTask(
+			"Needs validation: flaky retry on push\nFingerprint: fp-b",
+		);
+		const later = await store.createTask(
+			"Needs validation: flaky retry on push",
+		);
+		for (const t of [older, later])
+			await store.updateTask(t.id, {
+				stage: "backlog",
+				state: "idle",
+				queuedAt: null,
+			});
+		const countBefore = (await store.listTasks()).length;
+
+		await loop.runTurn(store.name, review.id);
+
+		expect(await kidsOf(store, review.id)).toHaveLength(0);
+		expect((await store.listTasks()).length).toBe(countBefore);
+		expect((await store.getTask(later.id))!.details).toContain(
+			`Seen again in review ${review.id}`,
+		);
+		expect((await store.getTask(older.id))!.details ?? "").not.toContain(
+			"Seen again",
+		);
+	});
+
 	test("deployment-fact leads file one question card; sandbox leads note the sandbox", async () => {
 		const record = baseRecord();
 		const confirmed = Array.from({ length: 12 }, (_, i) =>

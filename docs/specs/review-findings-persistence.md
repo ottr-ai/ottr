@@ -176,11 +176,13 @@ open lead card already holds (OTTR-929).
 - Title key: the first line of the prompt, lower case, each run of whitespace
   changed to one space, trimmed.
 - The index holds only open cards (not done, not cancelled) whose title key
-  starts with `needs validation`. Among several, the lowest card id decides.
-  Done and cancelled cards never block a lead by title.
+  starts with `needs validation`. Done and cancelled cards never block a lead
+  by title.
 - The board uses the title index when the fingerprint lookup finds no open or
   cancelled card. A title match counts only when the lead or the matched card
   carries no `Fingerprint:` line: two different fingerprints are two records.
+  The board removes the cards that do not count first. Then the lowest card id
+  of the cards that stay decides.
 - A title match acts like an open fingerprint match: no new card, the
   `Seen again in review <review id> on <YYYY-MM-DD>.` line on the open card, and
   `- already open: #<card id> (<prompt head>)` on the review's Findings trail.
