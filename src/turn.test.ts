@@ -2120,15 +2120,30 @@ describe("merge-turn diff capture", () => {
 		expect(after?.diffText).toBe("diff --git a/src/a.ts b/src/a.ts\n");
 	});
 
-	test("a work turn captures nothing", async () => {
-		const { store, loop } = await setup({
-			diffStat: async () => [{ file: "src/a.ts", plus: 2, minus: 1 }],
-			diffText: async () => "diff --git a/src/a.ts b/src/a.ts\n",
+	test("a work turn leaves the merge snapshot empty before the merge starts", async () => {
+		const diffStat = jest.fn(async () => [
+			{ file: "src/a.ts", plus: 2, minus: 1 },
+		]);
+		const diffText = jest.fn(async () => "diff --git a/src/a.ts b/src/a.ts\n");
+		const { store, record, loop } = await setup({
+			// The merge turn owns the snapshot. Hold the automatic merge at the work-settle boundary.
+			holdFollowUps: true,
+			diffStat,
+			diffText,
 		});
 		const task = await store.createTask("work please");
 		await loop.runTurn(store.name, task.id);
-		expect((await store.getTask(task.id))?.diffFiles).toBeNull();
-		expect((await store.getTask(task.id))?.diffText).toBeNull();
+		const after = await store.getTask(task.id);
+		expect(after?.stage).toBe("merging");
+		expect(after?.state).toBe("queued");
+		expect(record.runs).toHaveLength(1);
+		expect((await store.listTurns(task.id)).map((turn) => turn.kind)).toEqual([
+			"work",
+		]);
+		expect(diffStat).not.toHaveBeenCalled();
+		expect(diffText).not.toHaveBeenCalled();
+		expect(after?.diffFiles).toBeNull();
+		expect(after?.diffText).toBeNull();
 	});
 
 	test("an already-integrated branch keeps the earlier capture", async () => {

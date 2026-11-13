@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
-import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { openLocked } from "../src/dblock.ts";
+import type { SQLiteDatabase } from "../src/sqliteDriver.ts";
 import {
 	isUpdateCommit,
 	parseUpdateHostReply,
@@ -37,10 +37,10 @@ export class UpdateHostConflictError extends Error {
 }
 
 /** Canonical paths make a checkout and its symlink share one OS-owned SQLite lock. */
-export function lockUpdateHost(
+export async function lockUpdateHost(
 	repo: string,
 	directory = join(tmpdir(), "ottr-update-host"),
-): Database {
+): Promise<SQLiteDatabase> {
 	let canonical = realpathSync(repo);
 	if (process.platform === "win32") canonical = canonical.toLowerCase();
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -51,7 +51,7 @@ export function lockUpdateHost(
 		throw new Error(
 			"The update controller lock must stay outside the checkout.",
 		);
-	return openLocked(file);
+	return await openLocked(file);
 }
 
 /** Reject extra fields and malformed replies before they can authorize a host cycle. */
@@ -388,10 +388,10 @@ if (import.meta.main) {
 	};
 	process.on("SIGINT", signal);
 	process.on("SIGTERM", signal);
-	let lock: Database | null = null;
+	let lock: SQLiteDatabase | null = null;
 	let host: UpdateHostController | null = null;
 	try {
-		lock = lockUpdateHost(repo);
+		lock = await lockUpdateHost(repo);
 		dropBunDotenv(compose);
 		for (const [key, value] of Object.entries(envFileValues(compose))) {
 			if (process.env[key] === undefined) process.env[key] = value;
@@ -419,7 +419,7 @@ if (import.meta.main) {
 	} finally {
 		// Keep the lock while an existing child finishes. Never terminate its deploy.
 		await host?.finish();
-		lock?.close();
+		await lock?.close();
 		process.off("SIGINT", signal);
 		process.off("SIGTERM", signal);
 	}

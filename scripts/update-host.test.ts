@@ -973,7 +973,7 @@ describe("host transport and external input", () => {
 });
 
 describe("live host readers", () => {
-	test("the SQLite lock refuses duplicate canonical checkouts and releases on close", () => {
+	test("the SQLite lock refuses duplicate canonical checkouts and releases on close", async () => {
 		const dir = fixture();
 		const checkout = join(dir, "checkout");
 		const alias = join(dir, "alias");
@@ -984,17 +984,19 @@ describe("live host readers", () => {
 			process.platform === "win32" ? "junction" : "dir",
 		);
 		const lockDir = join(dir, "locks");
-		const first = lockUpdateHost(checkout, lockDir);
+		const first = await lockUpdateHost(checkout, lockDir);
 		try {
-			expect(() => lockUpdateHost(alias, lockDir)).toThrow(StoreLockedError);
+			await expect(lockUpdateHost(alias, lockDir)).rejects.toThrow(
+				StoreLockedError,
+			);
 		} finally {
-			first.close();
+			await first.close();
 		}
-		const second = lockUpdateHost(alias, lockDir);
-		second.close();
-		expect(() => lockUpdateHost(checkout, join(checkout, "..nested"))).toThrow(
-			"outside the checkout",
-		);
+		const second = await lockUpdateHost(alias, lockDir);
+		await second.close();
+		await expect(
+			lockUpdateHost(checkout, join(checkout, "..nested")),
+		).rejects.toThrow("outside the checkout");
 	});
 
 	test("real git reports commits after the running image and fetches at most once in five minutes", async () => {

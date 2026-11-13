@@ -414,7 +414,7 @@ const serverVersion = await describeVersion(SELF_ROOT);
 if (process.env.OTTR_DATA_DIR && process.env.OTTR_SERVER_DATA_DIR) {
 	let adopted: AdoptResult[] = [];
 	try {
-		adopted = adoptSharedProjectData(
+		adopted = await adoptSharedProjectData(
 			process.env.OTTR_DATA_DIR,
 			process.env.OTTR_SERVER_DATA_DIR,
 		);

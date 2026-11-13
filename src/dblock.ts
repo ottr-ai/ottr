@@ -6,6 +6,7 @@
 // server never blocks the next boot and no pid/hostname bookkeeping is needed.
 
 import { Database } from "bun:sqlite";
+import { SQLiteDatabase } from "./sqliteDriver.ts";
 
 /** Thrown when a live holder already owns the db file. The holder pid is
  * unknowable under the exclusive lock; find it with lsof/fuser on the file. */
@@ -53,24 +54,24 @@ const OPEN_ATTEMPTS = 4;
  * peek — and the lock-taking write itself fails with SQLITE_BUSY while a
  * holder lives, which is exactly the refusal signal.
  */
-export function openLocked(dbPath: string): Database {
+export async function openLocked(dbPath: string): Promise<SQLiteDatabase> {
 	for (let attempt = 0; ; attempt++) {
-		const db = new Database(dbPath);
+		const db = new SQLiteDatabase(dbPath);
 		try {
 			// Short timeout during acquisition: a live holder must refuse in
 			// ~200 ms, not sit out the operational timeout set below.
-			db.exec("PRAGMA busy_timeout = 200");
-			db.exec("PRAGMA locking_mode = EXCLUSIVE");
+			await db.exec("PRAGMA busy_timeout = 200");
+			await db.exec("PRAGMA locking_mode = EXCLUSIVE");
 			// The lock-taking write: SQLITE_BUSY while a live holder exists.
-			db.exec("PRAGMA journal_mode = WAL");
+			await db.exec("PRAGMA journal_mode = WAL");
 			// WAL + NORMAL: commits skip the per-commit fsync (Windows ~14 ms each), safe against
 			// process crashes; only an OS crash can lose commits since the last checkpoint.
-			db.exec("PRAGMA synchronous = NORMAL");
-			db.exec("DROP TABLE IF EXISTS instance_lock"); // retired pid-lock row
-			db.exec("PRAGMA busy_timeout = 5000");
+			await db.exec("PRAGMA synchronous = NORMAL");
+			await db.exec("DROP TABLE IF EXISTS instance_lock"); // retired pid-lock row
+			await db.exec("PRAGMA busy_timeout = 5000");
 			return db;
 		} catch (err) {
-			db.close(); // a refused opener must not leak its handle (rmSync EBUSY in tests)
+			await db.close(); // A refused opener must release its connection.
 			const isErr = err instanceof Error;
 			const code = isErr && "code" in err ? err.code : undefined;
 			const busy =
@@ -78,15 +79,15 @@ export function openLocked(dbPath: string): Database {
 			if (!busy) throw err;
 			if (attempt === OPEN_ATTEMPTS - 1)
 				throw new StoreLockedError(dbPath, err);
-			Bun.sleepSync(50 * (attempt + 1) + Math.floor(Math.random() * 50));
+			await Bun.sleep(50 * (attempt + 1) + Math.floor(Math.random() * 50));
 		}
 	}
 }
 
 /** Shared close sequence (R2-9): nothing to release — the OS drops an exclusive
  * lock at close; this exists so both stores keep one named close path. */
-export function closeLocked(db: Database): void {
-	db.close();
+export async function closeLocked(db: SQLiteDatabase): Promise<void> {
+	await db.close();
 }
 
 /**
@@ -94,17 +95,21 @@ export function closeLocked(db: Database): void {
  * copy: equal row counts for `tables` and a clean integrity_check. Throws on a difference.
  * The holder's own connection is the only one that can read a file under the exclusive lock.
  */
-export function vacuumInto(
-	db: Database,
+export async function vacuumInto(
+	db: SQLiteDatabase,
 	dest: string,
 	tables: readonly string[],
-): void {
-	db.query("VACUUM INTO ?").run(dest);
-	const copy = new Database(dest);
+): Promise<void> {
+	for (const table of tables) {
+		if (!/^[A-Za-z_]/.test(table) || /[^A-Za-z0-9_]/.test(table))
+			throw new Error(`Invalid SQLite table identifier: ${table}`);
+	}
+	await db.query("VACUUM INTO ?").run(dest);
+	const copy = new Database(dest, { readonly: true });
 	try {
 		for (const table of tables) {
-			const sql = `SELECT COUNT(*) AS n FROM ${table}`;
-			const a = db.query<{ n: number }, []>(sql).get()?.n;
+			const sql = `SELECT COUNT(*) AS n FROM "${table}"`;
+			const a = (await db.query<{ n: number }, []>(sql).get())?.n;
 			const b = copy.query<{ n: number }, []>(sql).get()?.n;
 			if (a !== b)
 				throw new Error(`${table} count mismatch: ${a} vs ${b} in copy`);

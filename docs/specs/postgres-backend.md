@@ -291,6 +291,35 @@ Each module keeps external effects separate from its final guarded transaction.
 `src/dblock.ts`, the independent `agent.db`, Mnemopi, and the update-host lock retain their SQLite interfaces.
 The pure dependency resolvers retain synchronous snapshot lookups for UI consumers. Card A adds no UI change.
 
+### Card B conversion and refreshed driver inventory
+
+Card B retains card A's async store API and `StoreQueue`. It changes the tracker SQLite driver to `Bun.SQL`.
+Each store retains one SQLite connection. The queue serializes ordinary operations, transactions, snapshots, and close.
+The schema, retired `learnings` table, data paths, and `rowid` tie order stay unchanged. Card D owns the insertion ordinal.
+
+The driver uses exact integer results. It converts safe integers to JavaScript numbers and retains larger integers as `bigint`.
+Number-only generated-ID methods reject an unsafe ID before commit. They never infer an ID from a later maximum.
+File paths use file URLs so literal question marks and hashes do not become SQLite connection options.
+Only SQLite's exact no-active-transaction error permits a redundant rollback. Other database errors propagate.
+
+| File or symbol | Card B boundary |
+| --- | --- |
+| `src/sqliteDriver.ts` | One connection, bound values, exact integer decode, statement metadata, async execution, and rollback. |
+| `openLocked`, `closeLocked`, `vacuumInto` | Async SQLite helpers. Preserve exclusive ownership, timeouts, WAL, normal synchronous mode, and snapshot checks. |
+| `ProjectStore`, `GlobalStore` | Shared store SQL and existing queues. Keep ordered convergence and nested transaction context. |
+| `adoptSharedProjectData`, `src/server.ts` | Await each copy and close before file moves and startup completion. |
+| `restoreSnapshot`, `runRestore` | Await target lock checks before file changes. Await errors before the CLI reports its result. |
+| `scripts/update-host.ts` | Await the shared helper. Its independent lock database remains SQLite-specific. |
+
+The refreshed search found no other shared-helper callers in `src` or `scripts`.
+Ripwire reports 89 affected tests for `store.ts` and 88 each for `globalStore.ts` and `dblock.ts`.
+Its graph has ambiguous and unresolved edges. The caller search and full suite supplement that evidence.
+
+Permanent tests use actual files from `bun:sqlite` and the new tracker path.
+They cover legacy convergence, rollback after a table swap, precise values, generated IDs, affected rows, queue isolation, and snapshots.
+Subprocess tests cover exclusive refusal, PRAGMAs, close, and natural exit. Fixed-seed properties cover signed 64-bit values and snapshot identifiers.
+The README remains correct because SQLite stays the only shipped backend. This card adds no PostgreSQL selection or support claim.
+
 
 ### SQL dialect inventory and target behavior
 

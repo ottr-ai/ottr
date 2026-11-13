@@ -1051,9 +1051,9 @@ describe("restoreSnapshot", () => {
 		return { base, dir, snap, trackerDb, projDb, marker, restore };
 	};
 
-	test("each snapshot file goes to its target, and the marker is written", () => {
+	test("each snapshot file goes to its target, and the marker is written", async () => {
 		const f = fixture();
-		expect(f.restore()).toEqual({
+		expect(await f.restore()).toEqual({
 			restored: [
 				{ file: "tracker.db", to: f.trackerDb },
 				{ file: "projects/proj/tasks.db", to: f.projDb },
@@ -1069,27 +1069,29 @@ describe("restoreSnapshot", () => {
 		expect(readFileSync(f.marker, "utf8")).toBe("2026-11-12T08:00:00.250Z\n");
 	});
 
-	test("an existing marker stays, and a null marker writes none", () => {
+	test("an existing marker stays, and a null marker writes none", async () => {
 		const kept = fixture();
 		mkdirSync(dirname(kept.marker), { recursive: true });
 		writeFileSync(kept.marker, "earlier\n");
-		kept.restore();
+		await kept.restore();
 		expect(readFileSync(kept.marker, "utf8")).toBe("earlier\n");
 
 		const none = fixture();
-		none.restore({ adoptedMarker: null });
+		await none.restore({ adoptedMarker: null });
 		expect(readdirSync(join(none.base, "server"))).toEqual(["proj"]);
 	});
 
-	test("a live holder of a target stops the restore before each change", () => {
+	test("a live holder of a target stops the restore before each change", async () => {
 		const f = fixture();
 		mkdirSync(dirname(f.projDb), { recursive: true });
-		const holder = openLocked(f.projDb);
+		const holder = await openLocked(f.projDb);
 		try {
-			holder.exec("CREATE TABLE t (v TEXT NOT NULL)");
-			holder.query("INSERT INTO t (v) VALUES (?)").run("live");
-			expect(() => f.restore()).toThrow(StoreLockedError);
-			const row = holder.query<{ v: string }, []>("SELECT v FROM t").get();
+			await holder.exec("CREATE TABLE t (v TEXT NOT NULL)");
+			await holder.query("INSERT INTO t (v) VALUES (?)").run("live");
+			await expect(f.restore()).rejects.toThrow(StoreLockedError);
+			const row = await holder
+				.query<{ v: string }, []>("SELECT v FROM t")
+				.get();
 			expect(row?.v).toBe("live");
 			// tracker.db is the first file of the snapshot: it must not be there either.
 			expect(existsSync(join(f.base, "state"))).toBe(false);
@@ -1099,21 +1101,21 @@ describe("restoreSnapshot", () => {
 			);
 			expect(touched).toEqual([]);
 		} finally {
-			closeLocked(holder);
+			await closeLocked(holder);
 		}
 
 		// With the holder gone, the same restore runs and keeps the live data aside.
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.failed).toEqual([]);
 		expect(result.movedAside).toEqual([`${f.projDb}${ASIDE}`]);
 		expect(rowIn(`${f.projDb}${ASIDE}`)).toBe("live");
 		expect(rowIn(f.projDb)).toBe("snap-proj");
 	});
 
-	test("an existing target is renamed aside, and its old content still opens there", () => {
+	test("an existing target is renamed aside, and its old content still opens there", async () => {
 		const f = fixture();
 		sqliteFile(f.trackerDb, "old");
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.failed).toEqual([]);
 		expect(result.movedAside).toEqual([`${f.trackerDb}${ASIDE}`]);
 		expect(readdirSync(dirname(f.trackerDb)).sort()).toEqual([
@@ -1124,12 +1126,12 @@ describe("restoreSnapshot", () => {
 		expect(rowIn(f.trackerDb)).toBe("snap-tracker");
 	});
 
-	test("stale -wal and -shm files of a target are renamed aside too", () => {
+	test("stale -wal and -shm files of a target are renamed aside too", async () => {
 		const f = fixture();
 		mkdirSync(dirname(f.trackerDb), { recursive: true });
 		writeFileSync(`${f.trackerDb}-wal`, "stale wal");
 		writeFileSync(`${f.trackerDb}-shm`, "stale shm");
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.movedAside).toEqual([
 			`${f.trackerDb}-wal${ASIDE}`,
 			`${f.trackerDb}-shm${ASIDE}`,
@@ -1148,11 +1150,11 @@ describe("restoreSnapshot", () => {
 		expect(rowIn(f.trackerDb)).toBe("snap-tracker");
 	});
 
-	test("a corrupt target does not stop the restore and is kept aside", () => {
+	test("a corrupt target does not stop the restore and is kept aside", async () => {
 		const f = fixture();
 		mkdirSync(dirname(f.trackerDb), { recursive: true });
 		writeFileSync(f.trackerDb, "not a sqlite file at all");
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.failed).toEqual([]);
 		expect(result.movedAside).toEqual([`${f.trackerDb}${ASIDE}`]);
 		expect(readFileSync(`${f.trackerDb}${ASIDE}`, "utf8")).toBe(
@@ -1161,11 +1163,11 @@ describe("restoreSnapshot", () => {
 		expect(rowIn(f.trackerDb)).toBe("snap-tracker");
 	});
 
-	test("a snapshot file that is not a SQLite database fails, and its target stays", () => {
+	test("a snapshot file that is not a SQLite database fails, and its target stays", async () => {
 		const f = fixture();
 		writeFileSync(join(f.snap, "tracker.db"), "not a sqlite file at all");
 		sqliteFile(f.trackerDb, "old");
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.failed.map((failure) => failure.file)).toEqual([
 			"tracker.db",
 		]);
@@ -1178,20 +1180,20 @@ describe("restoreSnapshot", () => {
 		expect(rowIn(f.trackerDb)).toBe("old");
 	});
 
-	test("a leftover .restoring file is replaced", () => {
+	test("a leftover .restoring file is replaced", async () => {
 		const f = fixture();
 		mkdirSync(dirname(f.trackerDb), { recursive: true });
 		writeFileSync(`${f.trackerDb}.restoring`, "half a copy");
-		expect(f.restore().failed).toEqual([]);
+		expect((await f.restore()).failed).toEqual([]);
 		expect(readdirSync(dirname(f.trackerDb))).toEqual(["tracker.db"]);
 		expect(rowIn(f.trackerDb)).toBe("snap-tracker");
 	});
 
-	test("a second restore in the same second deletes no kept file", () => {
+	test("a second restore in the same second deletes no kept file", async () => {
 		const f = fixture();
 		sqliteFile(f.trackerDb, "old");
-		f.restore();
-		const second = f.restore();
+		await f.restore();
+		const second = await f.restore();
 		expect(second.failed.map((failure) => failure.file)).toEqual([
 			"tracker.db",
 		]);
@@ -1200,9 +1202,9 @@ describe("restoreSnapshot", () => {
 		expect(rowIn(f.trackerDb)).toBe("snap-tracker");
 	});
 
-	test("a project with no known target gives a manual entry", () => {
+	test("a project with no known target gives a manual entry", async () => {
 		const f = fixture();
-		const result = f.restore({
+		const result = await f.restore({
 			projectDbFor: () => null,
 			adoptedMarker: null,
 		});
@@ -1220,13 +1222,13 @@ describe("restoreSnapshot", () => {
 		expect(existsSync(join(f.base, "server"))).toBe(false);
 	});
 
-	test("a snapshot with no valid manifest restores its files and says that it cannot be proven complete", () => {
+	test("a snapshot with no valid manifest restores its files and says that it cannot be proven complete", async () => {
 		for (const text of [null, "not json"]) {
 			const f = fixture();
 			const manifest = join(f.snap, "snapshot.json");
 			if (text === null) rmSync(manifest);
 			else writeFileSync(manifest, text);
-			const result = f.restore();
+			const result = await f.restore();
 			expect(result.restored.map((r) => r.file)).toEqual([
 				"tracker.db",
 				"projects/proj/tasks.db",
@@ -1240,12 +1242,12 @@ describe("restoreSnapshot", () => {
 		}
 	});
 
-	test("a database that the manifest lists but the snapshot does not hold is a failure", () => {
+	test("a database that the manifest lists but the snapshot does not hold is a failure", async () => {
 		const f = fixture();
 		rmSync(join(f.snap, "projects", "proj", "tasks.db"));
 		const other = join(f.dir, S1, "projects", "proj", "tasks.db");
 		sqliteFile(other, "in a different snapshot");
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.restored).toEqual([{ file: "tracker.db", to: f.trackerDb }]);
 		expect(result.failed).toEqual([
 			{
@@ -1256,13 +1258,13 @@ describe("restoreSnapshot", () => {
 		expect(existsSync(f.projDb)).toBe(false);
 	});
 
-	test("a database whose copy failed at backup time is a failure of the restore", () => {
+	test("a database whose copy failed at backup time is a failure of the restore", async () => {
 		const f = fixture();
 		writeManifest(f.snap, {
 			copied: ["tracker.db", "projects/proj/tasks.db"],
 			failed: [{ file: "projects/down/tasks.db", error: "disk full" }],
 		});
-		const result = f.restore();
+		const result = await f.restore();
 		expect(result.restored.map((r) => r.file)).toEqual([
 			"tracker.db",
 			"projects/proj/tasks.db",
@@ -1277,28 +1279,28 @@ describe("restoreSnapshot", () => {
 		// With a copy in an older snapshot, the failure names that snapshot and the file.
 		const older = join(f.dir, "20261109T031500Z", "projects", "down");
 		sqliteFile(join(older, "tasks.db"), "older copy");
-		expect(f.restore({ now: new Date("2026-11-12T09:00:00Z") }).failed).toEqual(
-			[
-				{
-					file: "projects/down/tasks.db",
-					error: `not in the snapshot ${S0}: the copy failed at backup time (disk full). The newest snapshot with a copy is 20261109T031500Z: ${join(older, "tasks.db")}`,
-				},
-			],
-		);
+		expect(
+			(await f.restore({ now: new Date("2026-11-12T09:00:00Z") })).failed,
+		).toEqual([
+			{
+				file: "projects/down/tasks.db",
+				error: `not in the snapshot ${S0}: the copy failed at backup time (disk full). The newest snapshot with a copy is 20261109T031500Z: ${join(older, "tasks.db")}`,
+			},
+		]);
 	});
 
-	test("a stamp that is not a snapshot throws and changes nothing", () => {
+	test("a stamp that is not a snapshot throws and changes nothing", async () => {
 		const f = fixture();
 		const partial = "20261111T031500Z.partial";
 		sqliteFile(join(f.dir, partial, "tracker.db"), "half a snapshot");
 		for (const stamp of ["20260101T000000Z", partial, "..", "", "latest"])
-			expect(() => f.restore({ stamp })).toThrow("no snapshot");
+			await expect(f.restore({ stamp })).rejects.toThrow("no snapshot");
 		expect(readdirSync(f.base)).toEqual(["backups"]);
 	});
 
 	test.skipIf(process.platform === "win32")(
 		"a symlink in the snapshot is not restored",
-		() => {
+		async () => {
 			const f = fixture();
 			const outside = join(f.base, "outside");
 			sqliteFile(join(outside, "tasks.db"), "planted");
@@ -1308,7 +1310,7 @@ describe("restoreSnapshot", () => {
 				join(outside, "tasks.db"),
 				join(f.snap, "projects", "linked-file", "tasks.db"),
 			);
-			const result = f.restore();
+			const result = await f.restore();
 			expect(result.restored.map((entry) => entry.file)).toEqual([
 				"tracker.db",
 				"projects/proj/tasks.db",

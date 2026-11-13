@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
@@ -49,6 +49,88 @@ describe("GlobalStore", () => {
 		expect(await reopened.get("k")).toBeNull();
 		await reopened.close();
 		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	});
+	test("opens old-driver kv files without changes to JSON or null values", async () => {
+		const root = tempRoot();
+		mkdirSync(join(root, ".tasks"));
+		const path = join(root, ".tasks", "tracker.db");
+		const original =
+			' { "nested": [null, false, 4294967297], "text": "日本語" } ';
+		const legacy = new Database(path, { create: true });
+		try {
+			legacy.exec(
+				"CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+			);
+			legacy.run("INSERT INTO kv (key, value) VALUES (?, ?)", [
+				"object",
+				original,
+			]);
+			legacy.run("INSERT INTO kv (key, value) VALUES (?, ?)", ["null", "null"]);
+		} finally {
+			legacy.close();
+		}
+		const store = await GlobalStore.open(root);
+		try {
+			expect(await store.get("object")).toEqual({
+				nested: [null, false, 4294967297],
+				text: "日本語",
+			});
+			expect(await store.get("null")).toBeNull();
+			await expect(
+				store.transaction(async () => {
+					await store.set("object", "discard");
+					await store.set("null", "discard");
+					throw new Error("legacy rollback");
+				}),
+			).rejects.toThrow("legacy rollback");
+			expect(await store.get("object")).toEqual(JSON.parse(original));
+			expect(await store.get("null")).toBeNull();
+		} finally {
+			await store.close();
+		}
+		const reopened = new Database(path, { readonly: true });
+		try {
+			expect(
+				reopened
+					.query<{ key: string; value: string }, []>(
+						"SELECT key, value FROM kv ORDER BY key",
+					)
+					.all(),
+			).toEqual([
+				{ key: "null", value: "null" },
+				{ key: "object", value: original },
+			]);
+		} finally {
+			reopened.close();
+		}
+	});
+
+	test("schema initialization failure releases the database lock", async () => {
+		const root = tempRoot();
+		mkdirSync(join(root, ".tasks"));
+		const path = join(root, ".tasks", "tracker.db");
+		const legacy = new Database(path, { create: true });
+		try {
+			legacy.exec(
+				"CREATE TABLE seed (value TEXT); CREATE INDEX kv ON seed(value)",
+			);
+		} finally {
+			legacy.close();
+		}
+		await expect(GlobalStore.open(root)).rejects.toThrow();
+		const repair = new Database(path);
+		try {
+			repair.exec("DROP INDEX kv");
+		} finally {
+			repair.close();
+		}
+		const store = await GlobalStore.open(root);
+		try {
+			await store.set("recovered", true);
+			expect(await store.get("recovered")).toBe(true);
+		} finally {
+			await store.close();
+		}
 	});
 	test("writes .tasks/.gitignore on a bare root", async () => {
 		const root = tempRoot();

@@ -170,7 +170,7 @@ describe("runRestore", () => {
 			expect(discoverProjects([parent])).toEqual([]);
 		});
 
-		const run = runRestore(["latest"], {
+		const run = await runRestore(["latest"], {
 			...newDirs,
 			OTTR_STATE_DIR: state,
 			OTTR_BACKUP_DIR: backups,
@@ -201,7 +201,7 @@ describe("runRestore", () => {
 
 	test("no argument lists the snapshots with the size of each file and changes nothing", async () => {
 		const d = dirs("list");
-		expect(runRestore([], d.env)).toEqual({
+		expect(await runRestore([], d.env)).toEqual({
 			code: 0,
 			out: [`no snapshots in ${d.dir}`],
 			err: [],
@@ -216,7 +216,7 @@ describe("runRestore", () => {
 		const alpha = size(S1, "projects", "alpha", "tasks.db");
 		const demo = size(S1, "projects", "demo", "tasks.db");
 		expect(tracker).toBeGreaterThan(0);
-		expect(runRestore([], d.env)).toEqual({
+		expect(await runRestore([], d.env)).toEqual({
 			code: 0,
 			out: [
 				`${S1}  tracker.db (${tracker} bytes), projects/alpha/tasks.db (${alpha} bytes), projects/demo/tasks.db (${demo} bytes)`,
@@ -231,14 +231,14 @@ describe("runRestore", () => {
 	test("a stamp that is not a snapshot gives code 1 and changes nothing", async () => {
 		const d = dirs("missing");
 		await snapshot(d.dir, T0, "one");
-		expect(runRestore(["20260101T000000Z"], d.env)).toEqual({
+		expect(await runRestore(["20260101T000000Z"], d.env)).toEqual({
 			code: 1,
 			out: [],
 			err: [`no snapshot 20260101T000000Z in ${d.dir}`],
 		});
 		const empty = join(d.base, "empty");
 		const emptyEnv = { ...d.env, OTTR_BACKUP_DIR: empty };
-		expect(runRestore(["latest"], emptyEnv)).toEqual({
+		expect(await runRestore(["latest"], emptyEnv)).toEqual({
 			code: 1,
 			out: [],
 			err: [`no snapshots in ${empty}`],
@@ -250,7 +250,7 @@ describe("runRestore", () => {
 		const d = dirs("usage");
 		await snapshot(d.dir, T0, "one");
 		for (const args of [["latest", "extra"], ["--help"], ["-f", S0], ["-"]]) {
-			const run = runRestore(args, d.env);
+			const run = await runRestore(args, d.env);
 			expect(run.code).toBe(1);
 			expect(run.out).toEqual([]);
 			expect(run.err.length).toBe(1);
@@ -265,14 +265,14 @@ describe("runRestore", () => {
 		await snapshot(d.dir, T1, "new one", ["demo"]);
 
 		// A stamp argument restores that snapshot, not the newest one.
-		expect(runRestore([S0], d.env)).toEqual({
+		expect(await runRestore([S0], d.env)).toEqual({
 			code: 0,
 			out: [`restored tracker.db -> ${d.trackerDb}`],
 			err: [],
 		});
 		expect(await kIn(d.state)).toBe("old one");
 
-		const run = runRestore(["latest"], d.env);
+		const run = await runRestore(["latest"], d.env);
 		const from = join(d.dir, S1, "projects", "demo", "tasks.db");
 		const kept = "kept the old file as ";
 		expect(run.code).toBe(0);
@@ -301,7 +301,7 @@ describe("runRestore", () => {
 		const d = dirs("data-dir");
 		const data = join(d.base, "data");
 		await snapshot(d.dir, T0, "one", ["demo"]);
-		const run = runRestore(["latest"], { ...d.env, OTTR_DATA_DIR: data });
+		const run = await runRestore(["latest"], { ...d.env, OTTR_DATA_DIR: data });
 		expect(run).toEqual({
 			code: 0,
 			out: [
@@ -319,7 +319,7 @@ describe("runRestore", () => {
 		await snapshot(d.dir, T0, "from the snapshot");
 		const live = track(await GlobalStore.open(d.state));
 		await live.set("k", "live");
-		const run = runRestore(["latest"], d.env);
+		const run = await runRestore(["latest"], d.env);
 		expect(run.code).toBe(1);
 		expect(run.out).toEqual([]);
 		expect(run.err.length).toBe(1);
@@ -355,7 +355,7 @@ describe("runRestore", () => {
 		});
 		try {
 			expect(closed).toBe(false);
-			const held = runRestore(["latest"], d.env);
+			const held = await runRestore(["latest"], d.env);
 			expect(held.code).toBe(1);
 			expect(held.err[0]).toContain("stop the board first");
 			expect(existsSync(copyPath)).toBe(false);
@@ -374,7 +374,7 @@ describe("runRestore", () => {
 		} finally {
 			drained.close();
 		}
-		const restored = runRestore(["latest"], d.env);
+		const restored = await runRestore(["latest"], d.env);
 		expect(restored.code).toBe(0);
 		expect(restored.err).toEqual([]);
 		expect(await kIn(d.state)).toBe("snapshot");
@@ -405,7 +405,7 @@ describe("runRestore", () => {
 
 		const env = { ...d.env, OTTR_SERVER_DATA_DIR: server };
 		const older = join(d.dir, S0, "projects", "demo", "tasks.db");
-		expect(runRestore(["latest"], env)).toEqual({
+		expect(await runRestore(["latest"], env)).toEqual({
 			code: 1,
 			out: [`restored tracker.db -> ${d.trackerDb}`],
 			err: [
@@ -415,7 +415,7 @@ describe("runRestore", () => {
 		expect(await kIn(d.state)).toBe("newest");
 		expect(existsSync(join(server, "demo", "tasks.db"))).toBe(false);
 
-		const list = runRestore([], env);
+		const list = await runRestore([], env);
 		expect(list.out.length).toBe(2);
 		expect(list.out[0]).toEndWith(
 			"; incomplete: projects/demo/tasks.db failed",
@@ -431,7 +431,7 @@ describe("runRestore", () => {
 			join(d.dir, S0, "projects", "demo", "tasks.db"),
 			"not a sqlite file at all",
 		);
-		const run = runRestore(["latest"], {
+		const run = await runRestore(["latest"], {
 			...d.env,
 			OTTR_SERVER_DATA_DIR: server,
 		});

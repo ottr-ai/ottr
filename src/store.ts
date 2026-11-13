@@ -1,4 +1,3 @@
-import type { Database } from "bun:sqlite";
 import type { Dirent } from "node:fs";
 import {
 	existsSync,
@@ -40,6 +39,7 @@ import {
 	readTranscript,
 	sessionContext,
 } from "./session.ts";
+import { type SQLiteDatabase, sqliteNumber } from "./sqliteDriver.ts";
 import { StoreQueue } from "./storeQueue.ts";
 import { assignTopics } from "./topics.ts";
 import type {
@@ -978,11 +978,11 @@ export type AdoptResult = {
 /** Adopts one old per-task DB into the server dir; null when the dir holds no adoptable
  * tasks.db or the server already has one. A StoreLockedError (a live board holds the DB)
  * propagates; any other failure comes back as a failed AdoptResult. */
-function adoptOne(
+async function adoptOne(
 	oldDir: string,
 	name: string,
 	newDir: string,
-): AdoptResult | null {
+): Promise<AdoptResult | null> {
 	const oldDb = join(oldDir, "tasks.db");
 	try {
 		if (!lstatSync(oldDir).isDirectory()) return null;
@@ -992,9 +992,9 @@ function adoptOne(
 	}
 	const newDb = join(newDir, "tasks.db");
 	if (existsSync(newDb)) return null;
-	let db: Database;
+	let db: SQLiteDatabase;
 	try {
-		db = openLocked(oldDb);
+		db = await openLocked(oldDb);
 	} catch (err) {
 		if (err instanceof StoreLockedError) throw err;
 		return {
@@ -1008,14 +1008,14 @@ function adoptOne(
 		mkdirSync(newDir, { recursive: true });
 		const tmp = join(newDir, "tasks.db.adopting");
 		rmSync(tmp, { force: true });
-		vacuumInto(db, tmp, ["tasks", "turns"]);
+		await vacuumInto(db, tmp, ["tasks", "turns"]);
 		renameSync(tmp, newDb);
 		open = false;
-		closeLocked(db);
+		await closeLocked(db);
 		renameSync(oldDb, join(oldDir, "tasks.db.moved-to-server"));
 		return { name, status: "adopted" };
 	} catch (err) {
-		if (open) closeLocked(db);
+		if (open) await closeLocked(db);
 		return {
 			name,
 			status: "failed",
@@ -1032,16 +1032,16 @@ export const ADOPTED_MARKER = ".adopted";
  * the server-only dir. The marker makes it one-time: a tasks.db a worker plants later is
  * never adopted. A StoreLockedError (a live board holds the DB) goes up to stop the boot.
  */
-export function adoptSharedProjectData(
+export async function adoptSharedProjectData(
 	dataDir: string,
 	serverDataDir: string,
-): AdoptResult[] {
+): Promise<AdoptResult[]> {
 	const marker = join(serverDataDir, ADOPTED_MARKER);
 	if (existsSync(marker)) return [];
 	const results: AdoptResult[] = [];
 	const names = existsSync(dataDir) ? readdirSync(dataDir) : [];
 	for (const name of names) {
-		const result = adoptOne(
+		const result = await adoptOne(
 			join(dataDir, name),
 			name,
 			join(serverDataDir, name),
@@ -1265,10 +1265,10 @@ export class ProjectStore {
 	readonly dataRoot: string;
 	readonly sessionsDir: string;
 	readonly worktreesDir: string;
-	private readonly db: Database;
+	private readonly db: SQLiteDatabase;
 	private readonly queue: StoreQueue;
 
-	private constructor(projectPath: string, db: Database) {
+	private constructor(projectPath: string, db: SQLiteDatabase) {
 		this.path = projectPath;
 		this.name = basename(projectPath);
 		this.tasksDir = tasksDirFor(projectPath);
@@ -1284,12 +1284,7 @@ export class ProjectStore {
 			commit: async () => {
 				await db.exec("COMMIT");
 			},
-			rollback: async () => {
-				// RAISE(ROLLBACK) and SQLITE_FULL already rolled the transaction back, so a
-				// ROLLBACK here would throw and mask the original error.
-				if (!db.inTransaction) return;
-				await db.exec("ROLLBACK");
-			},
+			rollback: () => db.rollback(),
 		});
 	}
 
@@ -1310,7 +1305,7 @@ export class ProjectStore {
 
 	/** Additive column convergence: adds one column when the (possibly stale) column list lacks it. */
 	private static async addColumn(
-		db: Database,
+		db: SQLiteDatabase,
 		cols: readonly string[],
 		col: string,
 		ddl: string,
@@ -1324,7 +1319,7 @@ export class ProjectStore {
 	 * columns explicitly, verifies the count, then swaps — a failure leaves the old
 	 * table untouched. Returns the live columns so later convergence cannot use the old shape. */
 	private static async rebuildTasksOnCheck(
-		db: Database,
+		db: SQLiteDatabase,
 		tasksSql: string,
 		detect: string,
 		addCols: readonly string[],
@@ -1364,14 +1359,14 @@ export class ProjectStore {
 			await db.exec("COMMIT");
 			return columns;
 		} catch (err) {
-			await db.exec("ROLLBACK");
+			await db.rollback();
 			throw err;
 		}
 	}
 
 	/** Backfills topics for done cards missing one; idempotent (only null rows). */
 	private static async backfillTopics(
-		db: Database,
+		db: SQLiteDatabase,
 		queue: StoreQueue,
 	): Promise<void> {
 		await queue.transaction(async () => {
@@ -1398,7 +1393,7 @@ export class ProjectStore {
 
 	/** The converged needs_reason for one legacy proposal row, or null when nothing rewrites it. */
 	private static async convergedReason(
-		db: Database,
+		db: SQLiteDatabase,
 		row: { needs_reason: string; follow_up_of: string | null },
 	): Promise<string | null> {
 		const reason = row.needs_reason;
@@ -1432,7 +1427,7 @@ export class ProjectStore {
 	 * only: it never touches titles, prompts or turn rows. A converged row no longer
 	 * matches, so the pass stays idempotent on every open. */
 	private static async convergeProposalReasons(
-		db: Database,
+		db: SQLiteDatabase,
 		queue: StoreQueue,
 	): Promise<void> {
 		await queue.transaction(async () => {
@@ -1502,7 +1497,7 @@ export class ProjectStore {
 	 * rows explicitly, verifies the count, swaps — one transaction, so a failure leaves
 	 * the old table untouched. */
 	private static async rebuildPrReviewRuns(
-		db: Database,
+		db: SQLiteDatabase,
 		runCols: string[],
 	): Promise<void> {
 		if (
@@ -1550,7 +1545,7 @@ export class ProjectStore {
 			);
 			await db.exec("COMMIT");
 		} catch (err) {
-			await db.exec("ROLLBACK");
+			await db.rollback();
 			throw err;
 		}
 	}
@@ -1564,7 +1559,7 @@ export class ProjectStore {
 		const dbPath = join(serverDir, "tasks.db");
 		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
 		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.
-		const db = openLocked(dbPath);
+		const db = await openLocked(dbPath);
 		const store = new ProjectStore(root, db);
 		try {
 			await store.queue.run(async () => {
@@ -2201,7 +2196,7 @@ export class ProjectStore {
 						if (prs !== null) {
 							for (const e of prs)
 								await db.run(
-									"INSERT OR IGNORE INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, 0)",
+									"INSERT INTO fork_hold (fork_id, branch_hash, sha, pr, pr_head, released) VALUES (?, ?, ?, ?, ?, 0) ON CONFLICT(fork_id, branch_hash, sha) DO NOTHING",
 									[row.fork_id, row.branch_hash, e.head, e.n, e.head],
 								);
 						}
@@ -3052,7 +3047,7 @@ export class ProjectStore {
 						: {}),
 				});
 				await this.db.run(
-					"INSERT OR REPLACE INTO jira_imports (site, issue_key, task_id, filed_at) VALUES (?, ?, ?, ?)",
+					"INSERT INTO jira_imports (site, issue_key, task_id, filed_at) VALUES (?, ?, ?, ?) ON CONFLICT(site, issue_key) DO UPDATE SET task_id = excluded.task_id, filed_at = excluded.filed_at",
 					[o.site, item.key, card.id, o.now],
 				);
 				done.set(item.key, card.id);
@@ -3289,7 +3284,7 @@ export class ProjectStore {
 	/** Counts one review attempt (the daily cap) before the model call; returns its run id. */
 	async startPrRun(number: number, head: string, at: number): Promise<number> {
 		return this.queue.transaction(async () => {
-			return Number(
+			return sqliteNumber(
 				(
 					await this.db.run(
 						"INSERT INTO pr_review_runs (number, started_at, head) VALUES (?, ?, ?)",
@@ -3711,9 +3706,10 @@ export class ProjectStore {
 			);
 			// Read back (R4-9) so the returned Turn always matches the stored row and toTurn.
 			const row = await this.db
-				.query<TurnRow, [number]>("SELECT * FROM turns WHERE id = ?")
-				.get(Number(lastInsertRowid));
+				.query<TurnRow, [number | bigint]>("SELECT * FROM turns WHERE id = ?")
+				.get(lastInsertRowid);
 			if (!row) throw new Error(`unknown turn: ${lastInsertRowid}`);
+			sqliteNumber(lastInsertRowid);
 			return toTurn(row);
 		});
 	}

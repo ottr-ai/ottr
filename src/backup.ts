@@ -15,6 +15,7 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { closeLocked, openLocked, StoreLockedError } from "./dblock.ts";
+import type { SQLiteDatabase } from "./sqliteDriver.ts";
 
 /** A snapshot is due when the newest one is this old or older. */
 export const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -337,16 +338,16 @@ function restorableFiles(root: string): SnapshotFile[] {
 }
 
 /** Throws StoreLockedError when a live board holds `target`. */
-function assertNotHeld(target: string): void {
+async function assertNotHeld(target: string): Promise<void> {
 	if (!present(target)) return;
-	let db: Database;
+	let db: SQLiteDatabase;
 	try {
-		db = openLocked(target);
+		db = await openLocked(target);
 	} catch (err) {
 		if (err instanceof StoreLockedError) throw err;
 		return; // a corrupt target must not stop a restore: the restore moves it aside
 	}
-	closeLocked(db);
+	await closeLocked(db);
 }
 
 function integrityOf(dbPath: string): string {
@@ -454,19 +455,19 @@ function missingFiles(dir: string, stamp: string, found: string[]): Failure[] {
  * `failed` also holds each database that the snapshot's manifest names but the snapshot does
  * not hold: a restore of an incomplete snapshot is never a clean result.
  */
-export function restoreSnapshot(o: {
+export async function restoreSnapshot(o: {
 	dir: string;
 	stamp: string;
 	now: Date;
 	trackerDb: string;
 	projectDbFor: (name: string) => string | null;
 	adoptedMarker: string | null;
-}): {
+}): Promise<{
 	restored: { file: string; to: string }[];
 	manual: { file: string; from: string }[];
 	failed: Failure[];
 	movedAside: string[];
-} {
+}> {
 	const dir = resolve(o.dir);
 	if (!listSnapshots(dir).includes(o.stamp))
 		throw new Error(`no snapshot ${o.stamp} in ${o.dir}`);
@@ -483,7 +484,7 @@ export function restoreSnapshot(o: {
 		if (to === null) manual.push({ file: f.file, from: f.from });
 		else jobs.push({ file: f.file, from: f.from, to });
 	}
-	for (const job of jobs) assertNotHeld(job.to);
+	for (const job of jobs) await assertNotHeld(job.to);
 	const result = {
 		restored: [] as { file: string; to: string }[],
 		manual,

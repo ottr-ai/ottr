@@ -49,15 +49,15 @@ function snapshotLine(dir: string, stamp: string): string {
 	return `${stamp}  ${list}${incompleteNote(dir, stamp)}`;
 }
 
-function restore(
+async function restore(
 	dir: string,
 	stamp: string,
 	stateDir: string,
 	env: Record<string, string | undefined>,
-): RestoreRun {
+): Promise<RestoreRun> {
 	const serverData = env.OTTR_SERVER_DATA_DIR;
 	const projectRoot = serverData || env.OTTR_DATA_DIR;
-	const result = restoreSnapshot({
+	const result = await restoreSnapshot({
 		dir,
 		stamp,
 		now: new Date(),
@@ -81,10 +81,10 @@ function restore(
 	};
 }
 
-export function runRestore(
+export async function runRestore(
 	args: string[],
 	env: Record<string, string | undefined>,
-): RestoreRun {
+): Promise<RestoreRun> {
 	const arg = args[0];
 	if (args.length > 1 || arg?.startsWith("-"))
 		return { code: 1, out: [], err: [USAGE] };
@@ -103,7 +103,7 @@ export function runRestore(
 			const what = arg === "latest" ? "no snapshots" : `no snapshot ${arg}`;
 			return { code: 1, out: [], err: [`${what} in ${dir}`] };
 		}
-		return restore(dir, stamp, stateDir, env);
+		return await restore(dir, stamp, stateDir, env);
 	} catch (err) {
 		const text = err instanceof Error ? err.message : String(err);
 		const line =
@@ -115,7 +115,7 @@ export function runRestore(
 }
 
 if (import.meta.main) {
-	const run = runRestore(process.argv.slice(2), process.env);
+	const run = await runRestore(process.argv.slice(2), process.env);
 	for (const line of run.out) console.log(line);
 	for (const line of run.err) console.error(line);
 	process.exitCode = run.code;
