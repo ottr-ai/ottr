@@ -580,7 +580,9 @@ describe("turn loop", () => {
 		expect(turns[0]!.pid).toBe(4242);
 		expect(turns[0]!.model).toBe("m");
 		// The task's selector level lands on the recorded model (transcripts carry the bare model only).
+
 		const picked = await store.createTask("work with a level", "m:max");
+
 		await loop.runTurn(store.name, picked.id);
 		expect((await store.listTurns(picked.id))[0]!.model).toBe("m:max");
 		// The turn's prompt reached the fake process in the created worktree.
@@ -593,8 +595,9 @@ describe("turn loop", () => {
 			project: store.name,
 			taskId: task.id,
 		});
-		// runTurn's finally reschedules the board.
-		expect(record.publishSoon).toBeGreaterThan(0);
+		// runTurn's claim (queued -> preparing) and settle tail are each their own
+		// publish edge: exactly one publish each, even with no scheduler flag changed.
+		expect(record.publishSoon).toBe(base + 2);
 	});
 
 	test("review turns pin a fixed session name; a plain work turn pins none", async () => {
@@ -2214,6 +2217,34 @@ describe("turn schedule", () => {
 		await flushPromises();
 		// Every flag holds the value the first cycle stored: the quiet tick must not
 		// bump the state version, or the sweep would rebuild the cache every 5 s.
+		expect(record.publishSoon).toBe(first);
+	});
+
+	test("a fresh-but-equal arch review object publishes nothing (OTTR-884)", async () => {
+		// The real refreshArchReview stores a new archReviewView object on every
+		// cycle, so the cycle compare must treat equal contents as no change; a
+		// reference compare publishes on every tick of every project with a target.
+		const { record, loop } = setup({
+			maxTotalRuns: () => 0,
+			refreshArchReview: async (e) => {
+				e.archReview = {
+					delta: 3,
+					reviewed: false,
+					base: "sha0",
+					reviewCardId: null,
+					cap: 20,
+					due: true,
+					running: false,
+				};
+			},
+		});
+		loop.schedule();
+		await flushPromises();
+		const first = record.publishSoon;
+		expect(first).toBeGreaterThan(0);
+		loop.schedule();
+		await flushPromises();
+		// The second cycle stored a NEW object with the SAME contents: a quiet tick.
 		expect(record.publishSoon).toBe(first);
 	});
 

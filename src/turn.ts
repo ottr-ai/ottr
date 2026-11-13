@@ -2523,15 +2523,15 @@ export function createTurnLoop(
 		key: string,
 		watch: { url: string; runId: string },
 		probe: NonNullable<TurnOps["detachedRuns"]>,
-	): Promise<void> {
+	): Promise<boolean> {
 		// ponytail: a watcher exists only because workerTarget answered at recovery, so
 		// the optional chain cannot see null, and ?? equals || for string|undefined.
 		const runs = await probe(watch.url, runnerToken(watch.url) ?? "").catch(
 			() => null,
 		);
 		// Probe failure is not proof of a loss: leave the row open and retry next tick.
-		if (runs === null) return;
-		if (runs.find((r) => r.id === watch.runId)?.running) return;
+		if (runs === null) return false;
+		if (runs.find((r) => r.id === watch.runId)?.running) return false;
 		const sep = key.indexOf("/");
 		const e = projects.get(key.slice(0, sep));
 		const t = await e?.store.getTask(key.slice(sep + 1));
@@ -2540,29 +2540,35 @@ export function createTurnLoop(
 		// turn, so !e and !t are backstopped by !turn.
 		if (!e || !t || !turn || turn.endedAt !== null) {
 			detached.delete(key);
-			return;
+			return false;
 		}
 		try {
 			await settleDetached(e, t, turn.id);
 			detached.delete(key);
+			// The settle wrote the card's frame (OTTR-884): report the edge so the
+			// sweep's publish covers it like a lost-row settle.
+			return true;
 		} catch (err) {
 			// Keep the watcher: the next tick retries the settle through the same route.
 			// ponytail: log-only — the watcher's fate (kept) is decided by the delete
 			// that never ran.
 			logStoreError(e.store.name, err);
 		}
+		return false;
 	}
 
 	/** OTTR-454: poll every re-bound detached run first. Still running: leave its row to the
 	 * scan below untouched this tick. Finished or gone: settle through the restart-resume
 	 * route and drop the watcher (only after the settle write, so a concurrent tick's scan
 	 * cannot double-settle the row). An unreachable worker keeps the watcher and the row. */
-	async function pollDetachedWatchers(): Promise<void> {
+	async function pollDetachedWatchers(): Promise<number> {
+		let settled = 0;
 		for (const [key, watch] of [...detached]) {
 			const probe = ops.detachedRuns;
 			if (probe === undefined) break;
-			await settleDetachedWatcher(key, watch, probe);
+			if (await settleDetachedWatcher(key, watch, probe)) settled++;
 		}
+		return settled;
 	}
 
 	/** d774111 keeps the card running while a second-model check runs, with the run's own row
@@ -2746,12 +2752,14 @@ export function createTurnLoop(
 	async function sweepLostTurns(): Promise<void> {
 		// Same fabricated data: the lost-turn sweep runs on every schedule tick.
 		if (demoBoard()) return;
-		await pollDetachedWatchers();
+		// The detached settles are writes like the lost-row settles: their count
+		// joins the sweep's publish edge (OTTR-884).
+		const detachedSettled = await pollDetachedWatchers();
 		// Each final transaction rechecks its row and task before it settles them.
 		const lost: LostRun[] = [];
 		const lostChecks: LostCheckRun[] = [];
 		await collectLostRuns(lost, lostChecks);
-		const settledCount = lost.length + lostChecks.length;
+		const settledCount = lost.length + lostChecks.length + detachedSettled;
 		await settleLostRows(lost);
 		await settleLostChecks(lostChecks);
 		// OTTR-884: publish on the settle edge only. A quiet sweep (nothing lost) must not
@@ -2854,6 +2862,12 @@ export function createTurnLoop(
 		archReview: ArchReview | null;
 	};
 	const flagSnapshots = new WeakMap<TurnProject, FlagSnapshot>();
+	// The object flags are rebuilt fresh by their refreshers on every cycle
+	// (archReviewView, openPrsView, latestImage each return a new object), so a
+	// reference compare would publish on every tick on a board with git projects
+	// or gh probes. They compare by their JSON instead; undefined vs null stays a
+	// change (JSON.stringify of undefined is not a string, so the two differ).
+	const FLAG_JSON_KEYS = ["latestImage", "openPrs", "archReview"] as const;
 	const FLAG_SNAPSHOT_KEYS = [
 		"dirty",
 		"mainUnpushed",
@@ -2861,9 +2875,6 @@ export function createTurnLoop(
 		"targetRules",
 		"latestRelease",
 		"latestReleaseUrl",
-		"latestImage",
-		"openPrs",
-		"archReview",
 	] as const;
 	const flagSnapshotOf = (e: TurnProject): FlagSnapshot => ({
 		dirty: e.dirty,
@@ -2946,7 +2957,10 @@ export function createTurnLoop(
 		flagSnapshots.set(e, after);
 		const changed =
 			prev === undefined ||
-			FLAG_SNAPSHOT_KEYS.some((k) => prev[k] !== after[k]);
+			FLAG_SNAPSHOT_KEYS.some((k) => prev[k] !== after[k]) ||
+			FLAG_JSON_KEYS.some(
+				(k) => JSON.stringify(prev[k]) !== JSON.stringify(after[k]),
+			);
 		return changed;
 	}
 
@@ -3063,7 +3077,12 @@ export function createTurnLoop(
 		try {
 			if (await dispatchRunnable(e, drained, cap, active, depProjects))
 				return true;
-			if (!drained) void settleReviews(e.store.name);
+			if (!drained)
+				void settleReviews(e.store.name).then((settled) => {
+					// A settled review card is a frame change (OTTR-884): the settle
+					// publishes its own edge, like the turn settle tail does.
+					if (settled > 0) ops.publishSoon();
+				});
 			return false;
 		} catch (err) {
 			// One sick store (locked file, missing table) must not stop the other projects'
@@ -3544,24 +3563,27 @@ export function createTurnLoop(
 	 * merge turns that may push: the release command's push must not race one (the same reason
 	 * pickRunnable holds merges while a release runs). */
 	const settling = new Set<string>();
-	async function settleReviews(name: string): Promise<void> {
+	async function settleReviews(name: string): Promise<number> {
 		const e = projects.get(name);
-		if (!e || e.target === null) return;
+		if (!e || e.target === null) return 0;
+		let settled = 0;
 		try {
 			const target = e.target;
 			const tasks = await e.store.listTasks();
 			const live = tasks.filter((t) => t.cancelledAt === null);
 			// Wait out a merge that may push: one that runs, or a queued one no review holds. A merge
 			// this release holds waits for the publish itself, so waiting for it would deadlock.
-			if (mergePushInFlight(live)) return;
+			if (mergePushInFlight(live)) return 0;
 			for (const t of tasks) {
 				if (!heldReviewCard(t)) continue;
 				await settleHeldReview(e, t, target);
+				settled++;
 			}
 		} catch (err) {
 			// Voided by schedule(): a locked store must reject into the log, not unhandled.
 			logStoreError(name, err);
 		}
+		return settled;
 	}
 
 	async function runTurn(name: string, id: string): Promise<void> {
@@ -3885,7 +3907,15 @@ export function createTurnLoop(
 				metered,
 			);
 		}
+<<<<<<< HEAD
 		await schedule();
+=======
+		// The settle's store writes (card state, requeue, findings) are a frame
+		// change (OTTR-884): the tick's unconditional publish is gone, so the
+		// settle tail publishes its own edge before the dispatch reschedule.
+		ops.publishSoon();
+		schedule();
+>>>>>>> 9946ae7 (fix: value-compare object flags and publish the turn edges)
 	}
 
 	/** True when the comprehension gate runs on this turn (OTTR-823 scope): plain work turns only —
@@ -4021,12 +4051,41 @@ export function createTurnLoop(
 				e,
 				store,
 				task,
+<<<<<<< HEAD
 				key,
 				kind: task.stage === "merging" ? "merge" : "work",
 			};
 		} finally {
 			release();
 		}
+=======
+				kind,
+				preRetro,
+				preBoardCheck,
+			);
+			if (tmpReason !== null && task.needsReason !== tmpReason) {
+				store.updateTask(id, { needsReason: tmpReason });
+				// The hold's reason line is a frame change (OTTR-884): the tick's
+				// unconditional publish is gone, so the write publishes its own edge.
+				ops.publishSoon();
+			}
+			return null;
+		}
+		// Synchronous claim before the first await so a re-entrant schedule() cannot double-start.
+		store.updateTask(id, {
+			state: "preparing",
+			needsReason: null,
+			asked: null,
+		});
+		// The claim is a frame change (queued -> preparing, OTTR-884): the tick's
+		// unconditional publish is gone, so the claim publishes its own edge.
+		ops.publishSoon();
+		preparing.add(key);
+		// A credit-stop mark belongs to a run claimed before the stop; this claim starts clean
+		// (a stop from now on marks it again, and the hold covers the gap until the gate).
+		creditStopped.delete(key);
+		return { e, store, task, key, kind };
+>>>>>>> 9946ae7 (fix: value-compare object flags and publish the turn edges)
 	}
 
 	/** OTTR-454 per-runner drain: a hold on every worker (or on "local") defers the start,
