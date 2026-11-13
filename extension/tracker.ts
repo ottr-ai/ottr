@@ -718,13 +718,17 @@ export default function (pi: Pi) {
 	});
 
 	// Names the session for the board card. omp's auto titler can take ~30 minutes or never fire,
-	// so the work prompt asks for one rename call per turn; this tool keeps an existing name.
+	// so the work prompt asks for one rename call per turn. The runner pins the draft title as
+	// the session name, so a name almost always exists when the agent renames; the tool must
+	// let a DIFFERENT title through (OTTR-912) — omp then appends the title_change record the
+	// store lifts onto the card. Only an identical title is a no-op.
 	pi.registerTool({
 		name: "rename",
 		label: "Rename session",
 		description:
-			"Give this session its board title. Call it once per turn. When a name is already set " +
-			"(omp auto-title or an earlier call), it is kept and the tool does nothing. " +
+			"Give this session its board title. Call it once per turn. A title that differs from " +
+			"the session's current name renames it, and the board card takes the first one; later " +
+			"renames leave the card's title alone. The same title does nothing. " +
 			"title: 3-8 words naming the task's goal; no branch names, no filler.",
 		parameters: z.object({
 			title: z.string().describe("Short title for the session, 3-8 words"),
@@ -732,18 +736,6 @@ export default function (pi: Pi) {
 		loadMode: "essential",
 		approval: "read",
 		async execute(_toolCallId: string, params: RenameParams) {
-			const current = await pi.getSessionName();
-			if (typeof current === "string" && current.trim() !== "") {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Session already named "${current}". Kept it; nothing to do.`,
-						},
-					],
-					details: {},
-				};
-			}
 			const title = (typeof params.title === "string" ? params.title : "")
 				.replace(/\s+/g, " ")
 				.trim()
@@ -752,6 +744,21 @@ export default function (pi: Pi) {
 				return {
 					content: [
 						{ type: "text", text: "Error: title must be a non-empty string." },
+					],
+					details: {},
+				};
+			}
+			const current = await pi.getSessionName();
+			if (
+				typeof current === "string" &&
+				current.replace(/\s+/g, " ").trim() === title
+			) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Session already named "${current}". Kept it; nothing to do.`,
+						},
 					],
 					details: {},
 				};

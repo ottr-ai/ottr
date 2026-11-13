@@ -26,6 +26,12 @@
   fixed name (`Release review`, `Review`, `Board check`) through `nameTask` with
   source `work` at turn start (the `IS NULL` guard keeps an existing stored
   title), so the rename scan never replaces it.
+- The tracker extension's `rename` tool (extension/tracker.ts) applies a title
+  that differs from the session's current name. The turn runner pins the draft
+  title as the session name (`OTTR_SESSION_NAME`), so without this omp's rename
+  was a no-op and no `title_change` record existed for the store to lift. A
+  rename with the title the session already carries stays a no-op. Later
+  renames still rename the session but change nothing on the card.
 - The title retry and title hold, the stored-notice labels, and the absence of a
   manual title edit are unchanged.
 
@@ -54,6 +60,8 @@
   a rename.
 - The guarded update keeps two racing resolves from writing different work
   titles; the loser's read shows the draft until the next poll.
+- Cards whose runs ended before this change have no rename record to take; their
+  draft title stays.
 
 ## Acceptance checks
 
@@ -66,6 +74,10 @@
   5. the open-time backfill rewrites an open card's draft title from its session
      and leaves a done card's title alone.
 - Turn test (src/turn.test.ts): `generateTitle` sends the new system text.
+- Extension tests (extension/tracker.test.ts): a rename with a different title
+  replaces the pinned session name, and one such rename reaches the card through
+  a real omp-format session file; a rename with the session's current title
+  stays a no-op.
 - One throwaway run of the new title prompt over OTTR-910's prompt
   ("Should we add a check like that https://vm.tiktok.com/ZGdXHRJBg/ ?") returns
   a title that is not a question and names the video as the source.

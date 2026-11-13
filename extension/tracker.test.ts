@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	PROPOSE_TOOL_DESCRIPTION,
 	REVIEW_PROPOSE_TOOL_DESCRIPTION,
 } from "../src/prompts.ts";
 import { applyEvent, newEventState } from "../src/runner.ts";
+import { ProjectStore } from "../src/store.ts";
 import createTracker, { hasAcceptanceSection } from "./tracker.ts";
 
 // Hermeticity: every named omp session exports OTTR_SESSION_NAME into its child shells, and an
@@ -41,6 +45,7 @@ const resultHandlers: Array<(...args: unknown[]) => unknown> = [];
 
 function fakePi(
 	tracker: typeof createTracker = createTracker,
+	setSessionNameHook?: (name: string) => Promise<void>,
 ): Record<string, RegisteredTool> {
 	const tools: Record<string, RegisteredTool> = {};
 	const chain = () => {
@@ -84,6 +89,12 @@ function fakePi(
 				throw new Error(
 					"Extension runtime not initialized. Action methods cannot be called during extension loading.",
 				);
+			if (setSessionNameHook) {
+				// The hook replaces the capture: it writes the live shape omp writes, so a
+				// test can run the tool's write through the real readers downstream.
+				await setSessionNameHook(name);
+				return;
+			}
 			setSessionNameCalls.push(name);
 			currentSessionName = name;
 		},
@@ -996,13 +1007,76 @@ describe("arch-review changed-line coverage", () => {
 		);
 	});
 
-	test("rename keeps an existing non-blank name untouched", async () => {
+	test("rename with the session's current title keeps it untouched", async () => {
 		currentSessionName = "Existing Name";
-		const out = await fakePi().rename!.execute("t1", { title: "New Name" });
+		const out = await fakePi().rename!.execute("t1", {
+			title: "Existing Name",
+		});
 		expect(text(out)).toBe(
 			'Session already named "Existing Name". Kept it; nothing to do.',
 		);
 		expect(setSessionNameCalls).toEqual([]);
+	});
+
+	// OTTR-912: the runner pins the draft title as the session name, so a name almost
+	// always exists when the agent renames. The pre-fix early return made that rename a
+	// no-op, so no title_change record ever reached the session and the card never saw
+	// the agent's work title.
+	test("rename with a different title replaces the pinned name", async () => {
+		currentSessionName = "Add TikTok link check?";
+		const out = await fakePi().rename!.execute("t1", {
+			title: "Evaluate check idea from TikTok video",
+		});
+		expect(setSessionNameCalls).toEqual([
+			"Evaluate check idea from TikTok video",
+		]);
+		expect(text(out)).toBe(
+			'Session renamed to "Evaluate check idea from TikTok video".',
+		);
+	});
+
+	// The live path end to end: the tool's write lands in a real omp-format session
+	// file, and the store's title ladder lifts it onto the card (OTTR-912).
+	test("a rename reaches the card through a real session file", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "rename-live-"));
+		const store = await ProjectStore.open(dir);
+		try {
+			const sid = "cccc0000-0000-0000-0000-000000009901";
+			const task = await store.updateTask(
+				(await store.createTask("live rename path")).id,
+				{ sessionId: sid },
+			);
+			// The runner pins the generated draft title; omp applies it to the session,
+			// which writes line 1 and the first title_change record.
+			await store.nameTask(task.id, "Add TikTok link check?");
+			mkdirSync(store.sessionsDir, { recursive: true });
+			const file = join(
+				store.sessionsDir,
+				`2026-09-27T10-00-00-000Z_${sid}.jsonl`,
+			);
+			writeFileSync(
+				file,
+				'{"type":"title","v":1,"title":"Add TikTok link check?"}\n{"type":"session"}\n{"type":"title_change","title":"Add TikTok link check?"}\n',
+			);
+			currentSessionName = "Add TikTok link check?";
+			const tools = fakePi(createTracker, async (name) =>
+				writeFileSync(
+					file,
+					`{"type":"title","v":1,"title":${JSON.stringify(name)}}\n{"type":"session"}\n{"type":"title_change","title":"Add TikTok link check?"}\n{"type":"title_change","title":${JSON.stringify(name)}}\n`,
+				),
+			);
+			const out = await tools.rename!.execute("t1", {
+				title: "Evaluate check idea from TikTok video",
+			});
+			expect(text(out)).toBe(
+				'Session renamed to "Evaluate check idea from TikTok video".',
+			);
+			expect(await store.frozenTitle((await store.getTask(task.id))!)).toBe(
+				"Evaluate check idea from TikTok video",
+			);
+		} finally {
+			await store.close();
+		}
 	});
 
 	test("rename treats a blank current name as unnamed", async () => {
