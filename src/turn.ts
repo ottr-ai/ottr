@@ -6069,9 +6069,10 @@ export function createTurnLoop(
 		const report = await readReportFile(st);
 		const autoResearch =
 			!st.idn.releaseCard && !st.task.research && report.text !== null;
+		// Preserve the first report even after cancellation, before worktree cleanup.
 		await st.store.transaction(async () => {
 			const current = await st.store.getTask(st.id);
-			if (current === null || current.cancelledAt !== null) return;
+			if (current === null) return;
 			if (report.text !== null && current.report === null)
 				await st.store.updateTask(st.id, { report: report.text });
 			if (autoResearch) await st.store.updateTask(st.id, { research: true });

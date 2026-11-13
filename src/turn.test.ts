@@ -6506,6 +6506,60 @@ describe("turn research cards", () => {
 		expect(record.runs[0]!.prompt).toContain("only researches a topic");
 	});
 
+	test("forced cancellation captures a report and research flag before worktree cleanup", async () => {
+		const { store, record, projects } = await researchStore();
+		const held = Promise.withResolvers<RunResult>();
+		const report = "# Findings from cancelled research\n";
+		let archivedBeforeRemoval: Task | null = null;
+		const loop = holdFollowUps(
+			projects,
+			fakeOps(record, {
+				createWorktree: async (o) => {
+					record.createWorktree.push(o);
+					mkdirSync(o.worktreePath, { recursive: true });
+					writeFileSync(join(o.worktreePath, RESEARCH_REPORT), report);
+				},
+				startRun: async (o) => {
+					record.runs.push(o);
+					await o.onSession?.("sess-1");
+					return {
+						pid: 4242,
+						done: held.promise,
+						kill: async () => {
+							record.killed = true;
+							held.resolve(runResult({ killed: true, sawTerminalEnd: false }));
+						},
+					};
+				},
+				removeWorktree: async (o) => {
+					archivedBeforeRemoval = await store.getTask(task.id);
+					record.removeWorktree.push(o);
+				},
+			}),
+		);
+		const task = await store.createTask("research before cancellation");
+		const key = `${store.name}/${task.id}`;
+		const run = loop.runTurn(store.name, task.id);
+		for (let i = 0; i < 100 && !loop.running.has(key); i++)
+			await flushPromises();
+		expect(loop.running.has(key)).toBe(true);
+
+		await expect(
+			loop.cancel(projects.get(store.name)!, task.id, true),
+		).resolves.toEqual({ removed: true });
+		await run;
+
+		expect(archivedBeforeRemoval).toMatchObject({ report, research: true });
+		expect(await store.getTask(task.id)).toMatchObject({
+			report,
+			research: true,
+			state: "idle",
+			cancelledAt: expect.any(Number),
+		});
+		expect((await store.listTurns(task.id)).at(-1)?.error).toBe("cancelled");
+		expect(record.removeWorktree).toHaveLength(1);
+	});
+
 	test("direct answered report_outcome preserves summary and details through the turn, task, and handoff", async () => {
 		const { store, record, projects } = await researchStore();
 		const summary =
