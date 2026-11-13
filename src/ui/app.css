@@ -8465,6 +8465,10 @@ button.log-mode[aria-pressed="true"] {
 		position: fixed;
 		right: calc(16px + env(safe-area-inset-right, 0px));
 		bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+		/* Above every lane layer (.card-tags, .starred-head): a proposal's Decide chip
+		   crosses the FAB's corner mid-scroll and, unlayered, painted over the button
+		   and ate its tap. Dialogs stay on top through the top layer, not z-index. */
+		z-index: 3;
 		width: 56px;
 		height: 56px;
 		padding: 0;
