@@ -58,26 +58,21 @@ beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-prs-"));
 });
 
-/** Closes one store with its identity on the failure and on the log: a close
- * that sits still gets named by the watchdog every 4 s, so a hang names its
- * store instead of failing as an anonymous hook timeout. */
+/** Closes one store with its identity on the log and on every failure. The
+ * "closing" line prints before the synchronous bun:sqlite close starts, so
+ * even a close that stalls the main thread names its store — the line is the
+ * last output before the hook timeout, on every hook that closes stores. */
 async function closeNamed(store: ProjectStore, index: number): Promise<void> {
 	const label = `store ${index} (${store.serverDir})`;
+	console.log(`[teardown] ${label} closing`);
 	const at = performance.now();
-	// Real interval on purpose: it observes a real stall, and fake timers
-	// would not tick during the hang it exists to name.
-	const watchdog = setInterval(() => {
-		console.error(
-			`[teardown] ${label} still closing after ${Math.round(performance.now() - at)}ms`,
-		);
-	}, 4000);
 	try {
 		await store.close();
 	} catch (error) {
 		throw new Error(`${label} failed to close`, { cause: error });
-	} finally {
-		clearInterval(watchdog);
 	}
+	const ms = Math.round(performance.now() - at);
+	if (ms > 500) console.log(`[teardown] ${label} closed in ${ms}ms`);
 }
 
 afterEach(async () => {
