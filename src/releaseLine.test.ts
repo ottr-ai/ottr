@@ -3,6 +3,7 @@ import {
 	compareVersions,
 	lineCapReached,
 	type RegistryRelease,
+	releaseLineAccepts,
 	settledLineTarget,
 	unsettledBlocker,
 } from "./releaseLine.ts";
@@ -145,6 +146,19 @@ describe("lineCapReached", () => {
 		expect(unsettledBlocker(releases, "1.2.20", NOW, AGE)).toEqual(
 			rel("1.2.21", 2),
 		);
+	});
+});
+
+describe("releaseLineAccepts", () => {
+	test("the line-wide cap lifts the whole line's wait or none of it", () => {
+		// 20 days of waiting: the cap accepts both aged releases of the line.
+		const old = [rel("1.0.1", 20), rel("1.0.2", 9), rel("1.0.3", 2)];
+		expect(releaseLineAccepts(old, "1.0.1", NOW, AGE, CAP)).toBe(true);
+		expect(releaseLineAccepts(old, "1.0.2", NOW, AGE, CAP)).toBe(true);
+		// 12 days: the wait is on, the cap is not reached, both stay blocked.
+		const young = [rel("1.0.1", 12), rel("1.0.2", 9), rel("1.0.3", 2)];
+		expect(releaseLineAccepts(young, "1.0.1", NOW, AGE, CAP)).toBe(false);
+		expect(releaseLineAccepts(young, "1.0.2", NOW, AGE, CAP)).toBe(false);
 	});
 });
 

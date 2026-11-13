@@ -33,17 +33,6 @@ const isAged = (r: RegistryRelease, now: number, ageMs: number): boolean =>
 const lineKey = (version: string): string =>
 	version.split(".").slice(0, 2).join(".");
 
-/** The counted releases grouped by release line, in input order per line. */
-function linesOf(releases: RegistryRelease[]): Map<string, RegistryRelease[]> {
-	const lines = new Map<string, RegistryRelease[]>();
-	for (const r of releases) {
-		const line = lines.get(lineKey(r.version)) ?? [];
-		line.push(r);
-		lines.set(lineKey(r.version), line);
-	}
-	return lines;
-}
-
 /** The oldest counted release of a line's aged ones, by version order. */
 const oldestAged = (
 	line: RegistryRelease[],
@@ -54,47 +43,73 @@ const oldestAged = (
 		.filter((r) => isAged(r, now, ageMs))
 		.reduce((a, b) => (compareVersions(a.version, b.version) < 0 ? a : b));
 
+/**
+ * The wait of `version`'s line, floored at `floor` when given: `now - publishedAt` of the
+ * oldest aged counted release at or above the floor, or null when the line holds no aged
+ * counted release (the wait has not started) or no young one (nothing waits).
+ */
+function lineWait(
+	releases: RegistryRelease[],
+	version: string,
+	now: number,
+	ageMs: number,
+	floor?: string,
+): number | null {
+	const line = releases
+		.filter(counts)
+		.filter(
+			(r) =>
+				lineKey(r.version) === lineKey(version) &&
+				(floor === undefined || compareVersions(r.version, floor) >= 0),
+		);
+	const aged = line.filter((r) => isAged(r, now, ageMs));
+	if (aged.length === 0 || aged.length === line.length) return null;
+	return now - oldestAged(line, now, ageMs).publishedAt;
+}
+
 /** The rule above; result is the pick's version string or null (keep the current). */
 export function settledLineTarget(
 	releases: RegistryRelease[],
 	now: number,
 	ageMs: number,
 	capMs: number,
-	maxVersion?: string,
 ): string | null {
-	const counted = releases.filter(counts);
-	const lines = linesOf(counted);
-	// The cap: a line waits when it holds an aged counted release and a counted release
-	// younger than ageMs. When any waited line's wait exceeds capMs, the pick falls back
-	// to today's behavior: the newest aged counted release, or null when none.
-	for (const line of lines.values()) {
-		const aged = line.filter((r) => isAged(r, now, ageMs));
-		if (aged.length === 0 || aged.length === line.length) continue;
-		if (now - oldestAged(line, now, ageMs).publishedAt <= capMs) continue;
-		const fallback = counted.filter((r) => isAged(r, now, ageMs));
-		if (fallback.length === 0) return null;
-		const newest = fallback.reduce((a, b) =>
-			compareVersions(a.version, b.version) > 0 ? a : b,
-		);
-		return newest.version;
-	}
-	// The newest settled candidate; maxVersion bounds the candidates only.
+	const candidates = releases
+		.filter(counts)
+		.filter((r) => isAged(r, now, ageMs));
 	let pick: RegistryRelease | undefined;
-	for (const r of counted) {
-		if (maxVersion !== undefined && compareVersions(r.version, maxVersion) > 0)
-			continue;
-		if (!isAged(r, now, ageMs)) continue;
-		const blocked = lines
-			.get(lineKey(r.version))!
-			.some(
-				(b) =>
-					compareVersions(b.version, r.version) > 0 && !isAged(b, now, ageMs),
-			);
-		if (blocked) continue;
+	for (const r of candidates) {
+		if (!releaseLineAccepts(releases, r.version, now, ageMs, capMs)) continue;
 		if (pick === undefined || compareVersions(r.version, pick.version) > 0)
 			pick = r;
 	}
-	return pick?.version ?? null;
+	if (pick !== undefined) return pick.version;
+	// The cap: with no accepted release, today's pick only when some line waited too long.
+	const waited = candidates.some(
+		(r) => (lineWait(releases, r.version, now, ageMs) ?? 0) > capMs,
+	);
+	if (!waited) return null;
+	const newest = candidates.reduce((a, b) =>
+		compareVersions(a.version, b.version) > 0 ? a : b,
+	);
+	return newest.version;
+}
+
+/** True when `version` is accepted: counted, aged, its line is settled above it, or the
+ * wait for its line (line-wide over `releases`, the candidate list) exceeds capMs. */
+export function releaseLineAccepts(
+	releases: RegistryRelease[],
+	version: string,
+	now: number,
+	ageMs: number,
+	capMs: number,
+): boolean {
+	if (unsettledBlocker(releases, version, now, ageMs) !== null) {
+		// The cap lifts the wait of the candidate's own line only, counted line-wide.
+		const wait = lineWait(releases, version, now, ageMs);
+		return wait !== null && wait > capMs;
+	}
+	return true;
 }
 
 /** The newest counted release above `version` in its line that is younger than ageMs,
@@ -127,16 +142,6 @@ export function lineCapReached(
 	ageMs: number,
 	capMs: number,
 ): boolean {
-	const line = releases
-		.filter(counts)
-		.filter(
-			(r) =>
-				lineKey(r.version) === lineKey(version) &&
-				compareVersions(r.version, version) >= 0,
-		);
-	const aged = line.filter((r) => isAged(r, now, ageMs));
-	// No aged counted release at or above the floor: the wait has not started.
-	// A line with no young counted release waits for nothing.
-	if (aged.length === 0 || aged.length === line.length) return false;
-	return now - oldestAged(line, now, ageMs).publishedAt > capMs;
+	const wait = lineWait(releases, version, now, ageMs, version);
+	return wait !== null && wait > capMs;
 }

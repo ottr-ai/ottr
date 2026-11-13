@@ -15,7 +15,7 @@ import {
 	ompBumpCardPrompt,
 	ompFailCardPrompt,
 } from "./prompts.ts";
-import { compareVersions, settledLineTarget } from "./releaseLine.ts";
+import { compareVersions, releaseLineAccepts } from "./releaseLine.ts";
 import { singleFlightTick } from "./singleFlight.ts";
 
 export const OMP_WATCH_GATES = {
@@ -223,11 +223,10 @@ export function parsePackument(
 /**
  * The highest version the pin may move to (spec "Bump target"): walk the releases above the
  * pin in ascending order, stop at the first one without a verdict or with a fail whose card
- * is not cleared; the release line gate (docs/specs/release-line-gate.md) then picks from
- * the full release list with maxVersion at the highest walked version, so a settled pick
- * above the walk cannot bless a walked release from an unsettled line (settle state is
- * registry state, so an unreviewed young release still blocks its line). The target is the
- * highest walked release that is aged, not deprecated, and at or below the pick.
+ * is not cleared. The target is the highest walked release that is counted (not deprecated),
+ * aged, and accepted by the release line gate (docs/specs/release-line-gate.md): acceptance
+ * is evaluated per release against the full release list, so nothing above the walk —
+ * settled or cap-lifted — can bless a walked release below it.
  */
 export function bumpTarget(
 	releases: OmpRelease[],
@@ -235,31 +234,18 @@ export function bumpTarget(
 	cleared: (cardId: string) => boolean,
 	now: number,
 ): string | null {
-	const walked: OmpRelease[] = [];
+	const ageMs = OMP_WATCH_GATES.ageDays * DAY_MS;
+	const capMs = OMP_WATCH_GATES.capDays * DAY_MS;
+	let target: string | null = null;
 	for (const r of releases) {
 		const v = verdicts[r.version];
 		if (v === undefined) break;
 		if (v.verdict === "fail" && (v.cardId === null || !cleared(v.cardId)))
 			break;
-		walked.push(r);
-	}
-	// The pick reads the full list, but maxVersion keeps it at or below the walk: a
-	// settled pick above the walk must not bless a walked release from an unsettled line.
-	const maxVersion = walked.at(-1)?.version;
-	const pick = settledLineTarget(
-		releases,
-		now,
-		OMP_WATCH_GATES.ageDays * DAY_MS,
-		OMP_WATCH_GATES.capDays * DAY_MS,
-		maxVersion,
-	);
-	if (pick === null) return null;
-	let target: string | null = null;
-	for (const r of walked) {
 		// A deprecated release never counts, so it is never the target (check 16).
 		if (r.deprecated === true) continue;
-		if (now - r.publishedAt < OMP_WATCH_GATES.ageDays * DAY_MS) continue;
-		if (compareVersions(r.version, pick) > 0) continue;
+		if (now - r.publishedAt < ageMs) continue;
+		if (!releaseLineAccepts(releases, r.version, now, ageMs, capMs)) continue;
 		if (target === null || compareVersions(r.version, target) > 0)
 			target = r.version;
 	}

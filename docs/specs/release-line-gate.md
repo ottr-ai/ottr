@@ -47,9 +47,15 @@ A counted release is a **target** when:
 - **settled**: its line holds no counted release above it (greater by version order) that
   is younger than `ageMs`.
 
-**Pick**: the newest target. When no target exists and the cap is not reached, the gate
-keeps the current version (result `null`). The newest settled version of an older line can
-still be the pick when the newest line is unsettled.
+A counted release is **accepted** when it meets the age and settled conditions, or when
+the cap lifted the wait for its line (the cap paragraph below). Acceptance is evaluated
+per release against the full release list, never derived from another release's
+acceptance: no version-order relation between two releases implies that one inherits the
+other's acceptance.
+
+**Pick**: the newest accepted counted release. When none exists and the cap is not
+reached, the gate keeps the current version (result `null`). The newest settled release
+of an older line can still be the pick when the newest line is unsettled.
 
 **Cap**: a line **waits** when it holds at least one aged counted release and at least one
 counted release younger than `ageMs`. A line's **wait** is `now - publishedAt` of the
@@ -57,13 +63,13 @@ oldest aged counted release **at or above the line's candidate floor** (a counte
 of that line whose version is `>= floor`). With no aged counted release at or above the
 floor the wait has not started and the cap is not reached. When any waited line's wait
 exceeds `capMs`, the pick falls back to today's behavior: the newest counted release with
-age `>= ageMs`, or `null` when none. `settledLineTarget` has no explicit floor: its input
-is the candidate list itself (for `bumpTarget`, the releases above the pin).
+age `>= ageMs`, or `null` when none. The wait's candidate floor is caller-relative:
+`bumpTarget`'s per-release check and `settledLineTarget` count the wait line-wide over
+their input (their input is the candidate list itself, the releases above the pin);
 `lineCapReached` floors at `version` (for the script, the installed version), so a line
-that started long ago below the installed version never lifts the wait.
-
-`maxVersion` (used by `bumpTarget` only, optional parameter): candidates are limited to
-versions `<= maxVersion`; the settled check and the cap still read the whole input.
+that started long ago below the installed version never lifts the wait. A cap reached on
+a line above the bump walk never lifts the wait of a walked line below it: acceptance is
+per release, so only the candidate's own line can lift the candidate's own block.
 
 ### Module contract: `src/releaseLine.ts`
 
@@ -83,8 +89,17 @@ export function settledLineTarget(
 	now: number,
 	ageMs: number,
 	capMs: number,
-	maxVersion?: string,
 ): string | null;
+
+/** True when `version` is accepted: counted, aged, its line is settled above it, or the
+ * wait for its line (line-wide over `releases`, the candidate list) exceeds capMs. */
+export function releaseLineAccepts(
+	releases: RegistryRelease[],
+	version: string,
+	now: number,
+	ageMs: number,
+	capMs: number,
+): boolean;
 
 /** The newest counted release above `version` in its line that is younger than ageMs,
  * or null when the line is settled above `version`. The script's report names it. */
@@ -115,12 +130,12 @@ existing imports keep working.
 
 - `OMP_WATCH_GATES` gains `capDays: 14`.
 - `bumpTarget` keeps its verdict walk unchanged (stop at the first version without a
-  verdict or with a fail whose card is not cleared). It calls `settledLineTarget` once
-  with the full release list and `maxVersion` set to the highest walked version, so a
-  pick above the walk (an unreviewed release, or one held by an open fail card) can
-  never bless a walked release below it; the target is the highest walked release that
-  is aged, not deprecated, and `<= pick` (a deprecated release never counts, so it is
-  never the target). No pick, no target.
+  verdict or with a fail whose card is not cleared). The target is the highest walked
+  release that is counted (not deprecated), aged, and
+  `releaseLineAccepts(releases, r.version, now, ageMs, capMs)`: acceptance is evaluated
+  for each walked release against the full release list, so no release above the walk —
+  settled or cap-lifted — can bless a walked release below it. No walked accepted
+  release, no target.
 - `parsePackument` keeps `time` entries only for versions the packument still lists in its
   `versions` map (removed versions drop out) and carries `deprecated: typeof
   versions[v]?.deprecated === "string"` on each release. The `OmpRelease` type gains
@@ -234,6 +249,10 @@ local registry listener, fixture lock derived from the real `bun.lock`):
     version: a line holding x.y.0 aged 2 years, x.y.20 aged 10 days (installed) and
     x.y.21 aged 2 days reports the unsettled release; `lineCapReached` is false at the
     installed version and true at x.y.0.
+20. A cap reached by a line above the walk does not lift a walked line's wait: v1.2.0
+    aged 8 days passed, v1.2.5 aged 2 days passed, v1.3.0 aged 20 days failed under an
+    open fail card, v1.3.1 aged 2 days: the target is null (line 1.2 waited 8 days; the
+    cap on line 1.3 is above the walk and cannot bless v1.2.0).
 
 Gates: `bun run check` and `bun test` exit 0.
 

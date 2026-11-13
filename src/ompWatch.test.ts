@@ -469,6 +469,23 @@ describe("bumpTarget", () => {
 		expect(bumpTarget(releases, verdicts, () => false, NOW)).toBeNull();
 	});
 
+	test("a cap on a line above the walk does not lift a walked line's wait", () => {
+		// Line 1.3 waited 20 days, but it sits above the walk: only 1.2.0's own line
+		// (8 days) counts for its acceptance, so no target.
+		const releases = [
+			rel("1.2.0", 8),
+			rel("1.2.5", 2),
+			rel("1.3.0", 20),
+			rel("1.3.1", 2),
+		];
+		const verdicts = {
+			"1.2.0": pass,
+			"1.2.5": pass,
+			"1.3.0": fail("T-7"),
+		};
+		expect(bumpTarget(releases, verdicts, () => false, NOW)).toBeNull();
+	});
+
 	test("an older settled line is the target while the newest line waits", () => {
 		const releases = [rel("1.1.9", 30), rel("1.2.0", 8), rel("1.2.5", 2)];
 		const verdicts = { "1.1.9": pass, "1.2.0": pass, "1.2.5": pass };
