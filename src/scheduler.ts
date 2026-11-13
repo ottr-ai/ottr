@@ -156,17 +156,19 @@ export function reviewFindings<T extends ReviewTask>(
 	return found;
 }
 
-/** True while a finding of `review` is not done; a cancelled finding counts as done.
- * A child in `backlog` stage (an unverified lead filed without a check verdict) is
- * optional work, not a commitment, so it never holds the review's Done. */
+/** True while a finding is not done: a cancelled finding counts as done, and a
+ * child in `backlog` stage (an unverified lead filed without a check verdict) is
+ * optional work, not a commitment, so it never holds the review's Done.
+ * Shared by findingsOpen and reviewHoldFor so the two open rules cannot drift. */
+function findingOpen(f: Pick<Task, "cancelledAt" | "stage">): boolean {
+	return f.cancelledAt === null && f.stage !== "done" && f.stage !== "backlog";
+}
+
 function findingsOpen(
 	tasks: readonly ReviewTask[],
 	review: Pick<Task, "id" | "doneAt">,
 ): boolean {
-	return reviewFindings(tasks, review).some(
-		(f) =>
-			f.cancelledAt === null && f.stage !== "done" && f.stage !== "backlog",
-	);
+	return reviewFindings(tasks, review).some(findingOpen);
 }
 
 /** OTTR-506: why the push hold parks a queued merge while the project's local target branch
@@ -206,10 +208,7 @@ function reviewHoldFor(
 		return "waiting for the review to finish";
 	// Parked at merging until its findings are done (findingsHold); a done review only reaches
 	// this with open findings when it finished before reviews parked.
-	if (
-		r.stage === "merging" ||
-		findings.some((f) => f.cancelledAt === null && f.stage !== "done")
-	)
+	if (r.stage === "merging" || findings.some(findingOpen))
 		return "waiting for the review's findings to be implemented";
 	return null;
 }

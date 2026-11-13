@@ -802,6 +802,37 @@ describe("pickRunnable", () => {
 		expect(mergeHold([settled, fixed, other], other)).toBeNull();
 	});
 
+	test("a done review's backlog lead never holds another merge (OTTR-889)", () => {
+		// VELV-122: a settled release review's unverified lead filed as a backlog
+		// card parked every later merge of the project forever.
+		const review = task({
+			kind: "review",
+			base: "abc",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		const fixed = task({
+			followUpOf: review.id,
+			createdAt: 300,
+			stage: "done",
+			state: "idle",
+			doneAt: 600,
+		});
+		const lead = task({
+			followUpOf: review.id,
+			createdAt: 310,
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+		const other = task({ stage: "merging", queuedAt: 100 });
+		expect(mergeHold([review, fixed, lead, other], other)).toBeNull();
+		// The parked lead stays parked; the queued merge runs.
+		expect(pickRunnable([review, fixed, lead, other], opts)).toEqual([other]);
+	});
+
 	test("a finding's follow-ups and prerequisites merge with it; a later follow-up does not", () => {
 		const review = task({
 			kind: "review",
