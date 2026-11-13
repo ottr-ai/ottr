@@ -74,3 +74,15 @@ commits = ["1b168b3a108a57db157e8489865f4ef00d40dcd4"]
 [[allowlists]]
 description = "fake Hindsight token fixture in commit 671d272, replaced by the zero-suffix style on the tip"
 commits = ["671d2721a352187c428894182c14323b954bdc23"]
+
+# Commit 97d3333 (the PR feedback park work) put an api_key fixture with a
+# sequential hex value in src/supervisor.test.ts; all 16 hex digits appear
+# uniformly, so the value's entropy of 4.0 passes generic-api-key's 3.7 bar.
+# The tip commit moves it to the zero-suffix fixture style, but the finding
+# lives in that commit's patch, which history keeps forever. Scoped to the
+# one commit: a real token never looks like `aaaa0000aaaa0000`, and a
+# secret-shaped string anywhere else stays flagged.
+
+[[allowlists]]
+description = "fake api_key fixture in commit 97d3333, replaced by the zero-suffix style on the tip"
+commits = ["97d333313e17cec4683b0ca33f9be9d33e770a42"]

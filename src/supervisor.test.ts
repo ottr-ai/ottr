@@ -5086,7 +5086,7 @@ describe("prPass", () => {
 		const ops = fakeOps({
 			apiResult: feedbackApi({
 				issue: [
-					comment("alice", 'api_key: "0123456789abcdef0123456789abcdef"'),
+					comment("alice", 'api_key: "aaaa0000aaaa0000aaaa0000aaaa0000"'),
 				],
 			}),
 		});
@@ -5097,7 +5097,7 @@ describe("prPass", () => {
 		// The park still names the author, but the refused body never reaches it.
 		expect(after.pendingPrompt).toContain("REVIEW COMMENT by alice");
 		expect(after.pendingPrompt).toContain("redacted: possible credential");
-		expect(after.pendingPrompt).not.toContain("0123456789abcdef");
+		expect(after.pendingPrompt).not.toContain("aaaa0000");
 		expect(after.pendingFeedback).toBe(true);
 		expect(after.prWatchAt).toBe(COMMENT_TS);
 		await store.close();
