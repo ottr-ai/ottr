@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import fc from "fast-check";
 import {
 	ARCH_REVIEW_MARKER,
 	deepenPrompt,
@@ -27,6 +28,7 @@ import {
 	reviewPrompt,
 	rulesInterviewPrompt,
 	shortTitle,
+	WORK_CHECK_MAX_SENDBACKS,
 	workCheckPrompt,
 	workCheckSendBack,
 	workPrompt,
@@ -738,16 +740,62 @@ describe("workCheckSendBack", () => {
 		expect(text).toContain("Do not weaken, delete or special-case tests");
 	});
 
-	test("a send-back past the cap keeps the cap as denominator and names the ask", () => {
+	test("a user-directed send-back past the cap names the spent cap, never N greater than M", () => {
 		const text = workCheckSendBack({
 			blockers: [{ finding: "still open", quote: "q" }],
 			attempt: 3,
 			max: 2,
 		});
 		expect(text).toContain(
-			"Send-back 3 of 2: while fewer than 2 send-backs have run, a failing next check sends the card back again; after 2 of them, the tracker asks the user before another send-back.",
+			"The send-back cap is spent (2 of 2); this is send-back 3, sent by user direction. A failing next check does not send the card back again; the tracker asks the user.",
 		);
+		expect(text).not.toContain("Send-back 3 of 2");
 		expect(text).not.toContain("goes to needs_you");
+		expect(text).toContain("1. still open");
+		expect(text).toContain("Do not weaken, delete or special-case tests");
+	});
+
+	test("at the real cap every attempt keeps the budget line honest and within the cap", () => {
+		for (let attempt = 1; attempt <= WORK_CHECK_MAX_SENDBACKS + 4; attempt++) {
+			const text = workCheckSendBack({
+				blockers: [{ finding: "still open", quote: "q" }],
+				attempt,
+				max: WORK_CHECK_MAX_SENDBACKS,
+			});
+			for (const [, n, m] of text.matchAll(/(\d+) of (\d+)/g)) {
+				expect(Number(n)).toBeLessThanOrEqual(Number(m));
+			}
+			if (attempt <= WORK_CHECK_MAX_SENDBACKS) {
+				expect(text).toContain(
+					`Send-back ${attempt} of ${WORK_CHECK_MAX_SENDBACKS}: while fewer than ${WORK_CHECK_MAX_SENDBACKS} send-backs have run, a failing next check sends the card back again; after ${WORK_CHECK_MAX_SENDBACKS} of them, the tracker asks the user before another send-back.`,
+				);
+			} else {
+				expect(text).toContain(
+					`The send-back cap is spent (${WORK_CHECK_MAX_SENDBACKS} of ${WORK_CHECK_MAX_SENDBACKS})`,
+				);
+				expect(text).toContain(`this is send-back ${attempt}`);
+				expect(text).toContain("sent by user direction");
+			}
+		}
+	});
+
+	test("no attempt and cap pair renders an N of M with N greater than M", () => {
+		fc.assert(
+			fc.property(
+				fc.nat({ max: 60 }),
+				fc.nat({ max: 20 }).filter((m) => m > 0),
+				(attempt, max) => {
+					const text = workCheckSendBack({
+						blockers: [{ finding: "still open", quote: "q" }],
+						attempt: attempt + 1,
+						max,
+					});
+					for (const [, n, m] of text.matchAll(/(\d+) of (\d+)/g)) {
+						expect(Number(n)).toBeLessThanOrEqual(Number(m));
+					}
+				},
+			),
+		);
 	});
 
 	test("prefixes a blocker with its bug class when the check named one", () => {

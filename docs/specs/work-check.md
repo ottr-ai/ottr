@@ -55,7 +55,9 @@ classes, and the strict-JSON verdict format are unchanged.
 - A blocked check sends the card back to the work agent with the blockers; the count
   `workCheckSendbacks` increments. `WORK_CHECK_MAX_SENDBACKS` (4) still counts every send-back.
 - Past the cap, the card asks the user: **Send it back** (one more send-back, still counted) or
-  **Merge anyway** (override with a reason). Unchanged.
+  **Merge anyway** (override with a reason). Unchanged. A user-directed round past the cap
+  renders the spent cap (`The send-back cap is spent (4 of 4); this is send-back N, sent by
+  user direction`), never an `N of M` count with N greater than M.
 - Human replies since the last check still ride along as numbered data; a tracker send-back
   text is not a human reply, full stop — no carve-out. A directed send-back (a typed reply
   on a diverging park, or the board's rethink direction on a counts-only park) carries the

@@ -9487,9 +9487,10 @@ describe("merge anyway (OTTR-28)", () => {
 		expect(row.workCheckSendbacks).toBe(WORK_CHECK_MAX_SENDBACKS + 1);
 		// A tracker send-back, so the next check does not count it as a human reply.
 		expect(row.pendingPrompt).toStartWith(WORK_CHECK_SENDBACK_OPENING);
-		// The denominator stays the tracker's cap, and the contract names the ask, not a park.
+		// The cap is spent and the text names that state: it never renders an
+		// "N of M" count with N greater than M.
 		expect(row.pendingPrompt).toContain(
-			`Send-back ${WORK_CHECK_MAX_SENDBACKS + 1} of ${WORK_CHECK_MAX_SENDBACKS}: while fewer than ${WORK_CHECK_MAX_SENDBACKS} send-backs have run, a failing next check sends the card back again; after ${WORK_CHECK_MAX_SENDBACKS} of them, the tracker asks the user before another send-back.`,
+			`The send-back cap is spent (${WORK_CHECK_MAX_SENDBACKS} of ${WORK_CHECK_MAX_SENDBACKS}); this is send-back ${WORK_CHECK_MAX_SENDBACKS + 1}, sent by user direction. A failing next check does not send the card back again; the tracker asks the user.`,
 		);
 		expect(row.pendingPrompt).not.toContain("goes to needs_you");
 		expect(row.pendingPrompt).toContain("still open");
