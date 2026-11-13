@@ -5725,7 +5725,7 @@ export function createApp(deps: AppDeps) {
 			[
 				...(deps.shared.commitIdentity
 					? identityArgs(deps.shared.commitIdentity)
-					: []),
+					: ["-c", "user.useConfigOnly=true"]),
 				"commit",
 				"-q",
 				"--allow-empty",
