@@ -16,6 +16,17 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+/**
+ * The stryker entry inside node_modules: a real package file, not the .bin symlink. The
+ * .bin entry comes from a Linux install as a symlink a Windows host cannot follow, so the
+ * guard checks the package file (OTTR-886 send-back: the first host run failed here).
+ */
+export function strykerEntryExists(repo: string): boolean {
+	return existsSync(
+		join(repo, "node_modules", "@stryker-mutator", "core", "bin", "stryker.js"),
+	);
+}
+
 /** The worker image default from docker-compose.yml, e.g. "ottr-worker:local". */
 function workerImageFromCompose(): string {
 	const compose = readFileSync("docker-compose.yml", "utf8");
@@ -47,14 +58,17 @@ export default {
 }
 
 /** The container-side script: 4 GiB ballast, then the scoped run, then the cgroup numbers. */
-function writeInnerScript(dir: string): void {
+export function writeInnerScript(dir: string): void {
 	writeFileSync(
 		join(dir, "inner.sh"),
 		`# OTTR-886 acceptance measurement inside the bounded container.
 set -eu
 target=4294967296  # 4 GiB, the ballast buffer size
 echo "ballast: holding a 4 GiB buffer and touching every page"
-bun -e 'const b = Buffer.alloc(4 * 2 ** 30, 1); let s = 0; for (let i = 0; i < b.length; i += 4096) s += b[i]; console.log("ballast resident, checksum", s); setTimeout(() => {}, 7200000);' &
+# globalThis.keep pins the buffer: after the touch loop the local reference alone lets the
+# GC free it, and the ballast silently dies (2026-11-13 host run). The interval keeps the
+# reference live for the run's duration.
+bun -e 'const b = Buffer.alloc(4 * 2 ** 30, 1); let s = 0; for (let i = 0; i < b.length; i += 4096) s += b[i]; globalThis.keep = b; console.log("ballast resident, checksum", s); setInterval(() => globalThis.keep.length, 60000);' &
 resident=0
 for i in $(seq 1 120); do
 	if [ "$(cat /sys/fs/cgroup/memory.current)" -ge "$target" ]; then
@@ -85,9 +99,9 @@ exit "$rc"
 
 function main(): number {
 	const repo = process.cwd();
-	if (!existsSync(join(repo, "node_modules", ".bin", "stryker"))) {
+	if (!strykerEntryExists(repo)) {
 		console.error(
-			"node_modules/.bin/stryker is missing; run bun install --frozen-lockfile first",
+			"node_modules/@stryker-mutator/core is missing; run bun install --frozen-lockfile first",
 		);
 		return 1;
 	}
