@@ -1366,7 +1366,10 @@ describe("board tools called through the eval kernel", () => {
 		// Nothing was consumed by the refusals: the direct calls after them still record.
 		expect(
 			text(
-				await tools.propose_task!.execute("t1", { prompt: "Direct", rank: 2 }),
+				await tools.propose_task!.execute("t1", {
+					prompt: `Direct${acceptance}`,
+					rank: 2,
+				}),
 			),
 		).toContain("Recorded");
 		currentSessionName = "Named before the direct report";
@@ -1456,12 +1459,16 @@ describe("board tools called through the eval kernel", () => {
 		// The refusal spent no proposal: the direct call records, a second direct one hits the cap.
 		expect(
 			text(
-				await tools.propose_task!.execute("t1", { prompt: "Direct proposal" }),
+				await tools.propose_task!.execute("t1", {
+					prompt: `Direct proposal${acceptance}`,
+				}),
 			),
 		).toContain("Recorded");
 		expect(
 			text(
-				await tools.propose_task!.execute("t2", { prompt: "Second direct" }),
+				await tools.propose_task!.execute("t2", {
+					prompt: `Second direct${acceptance}`,
+				}),
 			),
 		).toContain("only one proposal is allowed");
 	});
