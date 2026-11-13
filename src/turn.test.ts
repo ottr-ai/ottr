@@ -13442,11 +13442,11 @@ describe("work card check", () => {
 		await loop.runTurn(store.name, task.id);
 
 		// The launch still passes the raw selector (omp resolves its default); the card
-		// record names the model that fallback resolves to.
+		// record names the model that fallback resolves to, from the default role.
 		const after = (await store.getTask(task.id))!;
 		expect(after.stage).toBe("merging");
 		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
-		expect(after.workCheckLog[0]!.role).toBe("adversary");
+		expect(after.workCheckLog[0]!.role).toBe("default");
 		expect(after.workCheckLog[0]!.warn).toBeUndefined();
 	});
 
@@ -14188,7 +14188,7 @@ describe("work card check", () => {
 		expect(after.workCheckLog[0]!.outcome).toBe("error");
 		// No adversary role: the record names the default role the check fell back to.
 		expect(after.workCheckLog[0]!.model).toBe("fake/default-model");
-		expect(after.workCheckLog[0]!.role).toBe("adversary");
+		expect(after.workCheckLog[0]!.role).toBe("default");
 		expect(after.workCheckLog[0]!.error).toContain(
 			"the provider dropped the connection",
 		);

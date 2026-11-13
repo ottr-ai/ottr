@@ -9683,6 +9683,10 @@ export function createTurnLoop(
 		roles: Awaited<ReturnType<typeof workCheckRoles>>,
 		built: { input: string; diff: string; transcriptText: string },
 	): Promise<boolean> {
+		// The role the check's model came from: the picked role, or "default" when
+		// that role is unset and the model fell back to the default role. Never
+		// stamp the picked role on a fallback: the card must show the fallback.
+		const fromRole = roles.selector === undefined ? "default" : roles.checkRole;
 		const checkStart = Date.now();
 		let checkMs = 0;
 		let checkFailed: string | null = null;
@@ -9704,7 +9708,7 @@ export function createTurnLoop(
 					cur,
 					head,
 					roles.checkModel,
-					roles.checkRole,
+					fromRole,
 					open,
 					priorLog,
 					roles.warn,
@@ -9746,7 +9750,7 @@ export function createTurnLoop(
 				priorLog,
 				roles.warn,
 				roles.checkModel,
-				roles.checkRole,
+				fromRole,
 				checkStart,
 				checkMs,
 				checkFailed,
@@ -9870,7 +9874,7 @@ export function createTurnLoop(
 		cur: Task,
 		head: string | null,
 		checkModel: string | null,
-		checkRole: "critic" | "adversary",
+		checkRole: "critic" | "adversary" | "default",
 		open: WorkCheckBlocker[],
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
@@ -9942,8 +9946,8 @@ export function createTurnLoop(
 					};
 				const run: WorkCheckRun = {
 					at: checkStart,
-					// The resolved model, not just the role selector: with the role
-					// missing, the card must name the default role it fell back to.
+					// The role the model came from: a fallback check stamps "default",
+					// so the card shows the fallback instead of the unset role.
 					model: checkModel,
 					role: checkRole,
 					outcome: split.blockers.length === 0 ? "pass" : "blockers",
@@ -9986,7 +9990,7 @@ export function createTurnLoop(
 		priorLog: WorkCheckRun[],
 		warn: { warn?: string },
 		checkModel: string | null,
-		checkRole: "critic" | "adversary",
+		checkRole: "critic" | "adversary" | "default",
 		checkStart: number,
 		checkMs: number,
 		checkFailed: string,

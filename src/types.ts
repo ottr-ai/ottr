@@ -583,8 +583,10 @@ export interface WorkCheckRun {
 	 *  board's default role (omp's fallback when a model is unset); null = omp's own default
 	 *  (no role names it, so the card shows "default model"). */
 	model: string | null;
-	/** The check role the run picked (checkRoleFor of the checked run's model). Absent on records written before this field existed and on lost runs (settleLostCheck). */
-	role?: "critic" | "adversary";
+	/** The role the check's model came from: the picked critic or adversary role, or
+	 *  "default" when that role is unset and the model fell back to the default role.
+	 *  Absent on records written before this field existed and on lost runs (settleLostCheck). */
+	role?: "critic" | "adversary" | "default";
 	/** pass = nothing blocks, blockers = real problems found, error = the run itself failed after a retry. */
 	outcome: "pass" | "blockers" | "error";
 	blockers: WorkCheckBlocker[];

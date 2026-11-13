@@ -10194,12 +10194,17 @@ function DrawerWorkCheck(p: {
 											? "Blocked"
 											: "Error"}
 									{" · "}
-									{run.role !== undefined && (
+									{run.role === "critic" || run.role === "adversary" ? (
 										<>
 											{run.role}
 											{" · "}
 										</>
-									)}
+									) : run.role === "default" && run.model !== null ? (
+										<>
+											default role
+											{" · "}
+										</>
+									) : null}
 									{run.model === null
 										? "default model"
 										: displayModel(catalog?.models ?? [], run.model)}

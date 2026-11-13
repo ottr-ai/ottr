@@ -1913,27 +1913,38 @@ describe("work check log", () => {
 				{
 					at: 2000,
 					model: "anthropic/claude-opus-5-5",
-					// A value the union never names: the parse whitelist drops it.
-					role: "plan" as unknown as "critic" | "adversary",
+					role: "default",
 					outcome: "blockers",
 					blockers: [{ finding: "off by one", quote: "i <= n" }],
 					notes: ["a note"],
 					durationMs: 6000,
+				},
+				{
+					at: 3000,
+					model: null,
+					// A value the union never names: the parse whitelist drops it.
+					role: "plan" as unknown as "critic" | "adversary" | "default",
+					outcome: "error",
+					blockers: [],
+					notes: [],
+					durationMs: 0,
+					error: "the run was lost",
 				},
 			],
 		});
 		await store.close();
 		const reopened = await open(join(root, "wc-log"));
 		const log = (await reopened.getTask(task.id))?.workCheckLog ?? [];
-		expect(log).toHaveLength(2);
+		expect(log).toHaveLength(3);
 		expect(log[0]?.warn).toBe(
 			"The check model zai/glm-5.3-flash:medium is the same model as the run it checks — no second-model opinion.",
 		);
-		expect(log[1]?.warn).toBeUndefined();
+		expect(log[2]?.warn).toBeUndefined();
 		// The role rides the same whitelist: a picked role survives, a bogus
 		// value lands as undefined.
 		expect(log[0]?.role).toBe("critic");
-		expect(log[1]?.role).toBeUndefined();
+		expect(log[1]?.role).toBe("default");
+		expect(log[2]?.role).toBeUndefined();
 		await reopened.close();
 	});
 });

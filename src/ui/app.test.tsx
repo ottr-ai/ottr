@@ -4808,8 +4808,9 @@ describe("Drawer research report button", () => {
 	});
 
 	test("the work check rows name the role each check ran with", async () => {
-		// OTTR-916: the row shows the picked check role before the model; a record
-		// written before the field existed renders the row without a role.
+		// OTTR-916: the row names the role the model came from. A fallback check
+		// (picked role unset, model from the default role) reads "default role",
+		// and a record written before the field existed renders without a role.
 		const at = 1_700_000_000_000;
 		detailBody.workCheckLog = [
 			{
@@ -4823,8 +4824,17 @@ describe("Drawer research report button", () => {
 			},
 			{
 				at,
+				model: "fake/default-model",
+				role: "default",
+				outcome: "pass",
+				blockers: [],
+				notes: [],
+				durationMs: 12_000,
+			},
+			{
+				at,
 				model: null,
-				role: "critic",
+				role: "default",
 				outcome: "error",
 				blockers: [],
 				notes: [],
@@ -4851,16 +4861,24 @@ describe("Drawer research report button", () => {
 		const { container, unmount } = await mountDrawer(row);
 		try {
 			const rows = container.querySelectorAll(".wc-run");
-			expect(rows.length).toBe(3);
+			expect(rows.length).toBe(4);
 			const texts = Array.from(rows, (p) => p.textContent ?? "");
-			const [adversary, critic, legacy] = texts;
+			const [adversary, fallback, fallbackDefault, legacy] = texts;
 			expect(adversary).toContain("adversary");
 			expect(adversary).toContain("gpt-6");
-			expect(critic).toContain("critic");
-			expect(critic).toContain("default model");
+			expect(fallback).toContain("default role");
+			expect(fallback).toContain("default-model");
+			expect(fallback).not.toContain("critic");
+			expect(fallback).not.toContain("adversary");
+			// No model, no role to name: the row stays "default model" alone.
+			expect(fallbackDefault).toContain("default model");
+			expect(fallbackDefault).not.toContain("default role");
+			expect(fallbackDefault).not.toContain("critic");
+			expect(fallbackDefault).not.toContain("adversary");
 			expect(legacy).toContain("glm-5.3-flash");
 			expect(legacy).not.toContain("critic");
 			expect(legacy).not.toContain("adversary");
+			expect(legacy).not.toContain("default role");
 		} finally {
 			await act(async () => {
 				detailBody.workCheckLog = [];
