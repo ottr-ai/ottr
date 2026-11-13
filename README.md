@@ -36,6 +36,7 @@ Ottr is mainly built with Ottr itself.
 
 On phones, stage tabs keep equal widths and complete labels.
 Scroll the tab strip to reach more stages.
+The strip keeps the active stage label in view after a tap, swipe, or keyboard change.
 The Ottr logo links to the home page and keeps its accessible name when the wordmark is hidden.
 
 Ottr checks every report against git: `ready` needs commits ahead of the base and a clean worktree; `answered` needs no commits; `integrated` needs the branch head on the upstream branch.

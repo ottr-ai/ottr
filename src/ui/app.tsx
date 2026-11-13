@@ -4365,6 +4365,11 @@ export function ProjectBoard({
 	const reviewNote = skillGapNote(userLayer ?? null, "review");
 	// Mobile stage tabs: which column the single-column tier shows; the desktop grid ignores it.
 	const [stage, setStage] = useState<Stage>("todo");
+	const stageTab = useRef<HTMLButtonElement>(null);
+	useEffect(() => {
+		// Center alignment stays stable while tap feedback shrinks the button.
+		stageTab.current?.scrollIntoView({ block: "nearest", inline: "center" });
+	}, [stage]);
 	// Horizontal swipe on the board flips to the neighbor column; touch start point.
 	const touchStart = useRef<{ x: number; y: number } | null>(null);
 	const swipeStage = (dir: number) => {
@@ -4568,6 +4573,7 @@ export function ProjectBoard({
 						return (
 							<button
 								key={c.key}
+								ref={stage === c.key ? stageTab : null}
 								type="button"
 								role="tab"
 								id={`stage-tab-${c.key}`}
