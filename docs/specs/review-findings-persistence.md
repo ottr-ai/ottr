@@ -76,8 +76,10 @@ with exactly one blocker line:
 - `Blocker: sandbox run: <missing control>` — the proof waits on controls this
   runner lacks; the text names the missing control.
 
-(The prompt wording is new in this change; its exact text ships in the ready report
-for the user's approval — hard stop 3.)
+(The prompt wording is not part of this change: its exact text ships in the ready
+report for the user's approval — hard stop 3 — and lands in `src/prompts.ts` in a
+later change, only after approval. Until it lands, no lead carries the line, so
+every lead sorts as a sandbox-run lead and no question card files.)
 
 Code partitions the stored set by the `Needs validation` prefix, then sorts leads
 with one strict pattern, `/^[^\S\n]*Blocker: (deployment fact|sandbox run): (.+)$/`
@@ -259,8 +261,9 @@ before the run resolves.
 - No UI changes (no `src/ui/**` edits beyond the AskPanel's move onto the shared
   `askAnswerLine` wire-format helper, which keeps its output byte-identical; the
   Findings trail text update is card data, not UI code).
-- The review prompt gains the blocker-line sentence; its wording ships in the
-  ready report for approval (hard stop 3).
+- No `src/prompts.ts` change in this task: the blocker-line wording ships in the
+  ready report for approval (hard stop 3) and lands in a later change after
+  approval; until then the sorting machinery stays dormant.
 - No validation sandbox; sandbox-run leads keep waiting for one.
 - No change to leads that already exist, and no fingerprint duplicate rule (a
   separate card owns dedupe of open lead cards).
