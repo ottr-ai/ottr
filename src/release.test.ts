@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import {
 	chmodSync,
+	existsSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
@@ -24,6 +25,7 @@ import {
 	publishRelease,
 	releaseBlocked,
 	releaseChip,
+	releasePushAuth,
 	runGh,
 	runReleaseCommand,
 } from "./release.ts";
@@ -947,6 +949,187 @@ describe("against real repos", () => {
 		);
 		expect(await must(main, "tag", "--list", "v0.9.2")).toBe("");
 	}, 60_000);
+
+	test("dry run names the app identity and runs nothing", async () => {
+		// The fake gh records every call in a marker file; a dry run must never invoke it.
+		const sh = process.platform !== "win32";
+		const bin = mkdtempSync(join(tmpdir(), "ott-fakegh-"));
+		const script = join(bin, "gh");
+		writeFileSync(script, '#!/bin/sh\nprintf \'%s\\n\' "$*" > "$0.argv"\n');
+		chmodSync(script, 0o755);
+		const saved = process.env.PATH;
+		if (sh) process.env.PATH = `${bin}:${saved}`;
+		try {
+			const log = await publishRelease({
+				mainPath: main,
+				originUrl: origin,
+				reviewed: feat,
+				sha: head,
+				version: "v0.9.2",
+				notes: "n",
+				github: "https://github.com/o/r",
+				releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+				dryRun: true,
+			});
+			// The head holds the reviewed feat plus one late fix, so the tag part names it.
+			expect(log).toBe(
+				`dry run: would tag v0.9.2 at ${head.slice(0, 7)} (late fixes: 1), would push the tag to origin as GitHub app rel-bot, would create the GitHub release v0.9.2 as GitHub app rel-bot`,
+			);
+			expect(await must(main, "tag", "--list", "v0.9.2")).toBe("");
+			expect(existsSync(`${script}.argv`)).toBe(false);
+		} finally {
+			if (sh) process.env.PATH = saved;
+			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+
+	test("dry run without an identity names the user token", async () => {
+		const log = await publishRelease({
+			mainPath: main,
+			originUrl: origin,
+			reviewed: head,
+			sha: head,
+			version: "v0.9.3",
+			notes: "n",
+			github: "https://github.com/o/r",
+			dryRun: true,
+		});
+		expect(log.split("the GH_TOKEN user token").length - 1).toBe(2);
+		expect(await must(main, "tag", "--list", "v0.9.3")).toBe("");
+	}, 60_000);
+
+	test("dry run refuses an existing tag at another commit", async () => {
+		await must(main, "tag", "-a", "v0.9.9", "-m", "v0.9.9", feat);
+		try {
+			await expect(
+				publishRelease({
+					mainPath: main,
+					originUrl: origin,
+					reviewed: feat,
+					sha: head,
+					version: "v0.9.9",
+					notes: "n",
+					github: "https://github.com/o/r",
+					releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+					dryRun: true,
+				}),
+			).rejects.toThrow(/already exists/);
+		} finally {
+			await must(main, "tag", "-d", "v0.9.9");
+		}
+	}, 60_000);
+
+	test("the release runs gh with the identity's GH_TOKEN", async () => {
+		// The fake gh records its argv and the two token env names, then lets release view
+		// fail and release create succeed.
+		const sh = process.platform !== "win32";
+		const bin = mkdtempSync(join(tmpdir(), "ott-fakegh-"));
+		const script = join(bin, "gh");
+		writeFileSync(
+			script,
+			'#!/bin/sh\nprintf \'%s\\n\' "$*" > "$0.argv"\nprintf \'GH_TOKEN=%s\\n\' "$GH_TOKEN" > "$0.env"\nprintf \'GH_ENTERPRISE_TOKEN=%s\\n\' "$GH_ENTERPRISE_TOKEN" >> "$0.env"\n[ "$2" = view ] && exit 1\nexit 0\n',
+		);
+		chmodSync(script, 0o755);
+		const saved = process.env.PATH;
+		if (sh) process.env.PATH = `${bin}:${saved}`;
+		try {
+			const log = await publishRelease({
+				mainPath: main,
+				originUrl: origin,
+				reviewed: feat,
+				sha: head,
+				version: "v0.9.2",
+				notes: "n",
+				github: sh ? "https://github.com/o/r" : null,
+				releaseToken: { token: "ghs_live_0001", label: "GitHub app rel-bot" },
+			});
+			expect(log).toStartWith(`tagged v0.9.2 at ${head.slice(0, 7)}`);
+			expect(log).toContain("pushed");
+			expect(await must(main, "rev-parse", "refs/tags/v0.9.2^{commit}")).toBe(
+				head,
+			);
+			if (sh) {
+				const envDump = readFileSync(`${script}.env`, "utf8");
+				expect(envDump).toContain("GH_TOKEN=ghs_live_0001");
+				expect(envDump).toContain("GH_ENTERPRISE_TOKEN=\n");
+				// The token appears only in the GH_TOKEN line: never in argv, never elsewhere.
+				expect(
+					envDump.split("\n").filter((l) => l.includes("ghs_live_0001")),
+				).toEqual(["GH_TOKEN=ghs_live_0001"]);
+				expect(
+					readFileSync(`${script}.argv`, "utf8")
+						.split("\n")
+						.filter((l) => l.includes("ghs_live_0001")),
+				).toEqual([]);
+			}
+		} finally {
+			if (sh) process.env.PATH = saved;
+			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 60_000);
+});
+
+// releasePushAuth runs against the live configured host, so the unit assertions pin the
+// default host (the env var unset) the same way the runGh env tests do.
+describe("releasePushAuth", () => {
+	let savedHost: string | undefined;
+	beforeAll(() => {
+		savedHost = process.env.OTTR_GITHUB_HOST;
+		delete process.env.OTTR_GITHUB_HOST;
+	});
+
+	test("scopes the helper to one token", () => {
+		const env = releasePushAuth("ghs_unit_00001");
+		expect(env).not.toBeNull();
+		const helperKey = Object.keys(env!)
+			.filter((k) => k.startsWith("GIT_CONFIG_KEY_"))
+			.find((k) => env![k] === "credential.https://github.com.helper");
+		expect(helperKey).toBeDefined();
+		const idx = helperKey!.slice("GIT_CONFIG_KEY_".length);
+		const helper = env![`GIT_CONFIG_VALUE_${idx}`];
+		expect(helper).toContain("OTTR_GIT_TOKEN_0");
+		expect(helper).not.toContain("ghs_unit_00001");
+		expect(env!["OTTR_GIT_TOKEN_0"]).toBe("ghs_unit_00001");
+		expect(env!["OTTR_GIT_USER_0"]).toBe("x-access-token");
+		expect(env!["GIT_ASKPASS"]).toBe("");
+		// The cleared-helper entry sits right before the scoped one, so a planted
+		// repo-config helper never runs next to the release token.
+		expect(env![`GIT_CONFIG_VALUE_${Number(idx) - 1}`]).toBe("");
+		// The raw token value appears in exactly one env value.
+		expect(
+			Object.values(env!).filter((v) => v.includes("ghs_unit_00001")),
+		).toEqual(["ghs_unit_00001"]);
+	});
+
+	test("keeps the token in exactly one env value or rejects it", () => {
+		// Tokens the fixed scaffolding names would double-count, so the property drops them.
+		const scaffold = Object.values(
+			releasePushAuth("zzScafFold01") ?? {},
+		).filter((v) => !v.includes("zzScafFold01"));
+		fc.assert(
+			fc.property(
+				fc
+					.stringMatching(/^[A-Za-z0-9]{8,40}$/)
+					.filter((t) => !scaffold.some((v) => v.includes(t))),
+				(token) => {
+					const env = releasePushAuth(token);
+					expect(env).not.toBeNull();
+					const hits = Object.values(env!).filter((v) => v.includes(token));
+					expect(hits).toEqual([token]); // OTTR_GIT_TOKEN_0 only
+				},
+			),
+		);
+		fc.assert(
+			fc.property(fc.stringMatching(/^[!-~]{1,7}$/), (token) => {
+				expect(releasePushAuth(token)).toBeNull(); // parseGitToken wants 8+
+			}),
+		);
+	});
+
+	afterAll(() => {
+		if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+		else process.env.OTTR_GITHUB_HOST = savedHost;
+	});
 });
 
 /** Stand-in release command: records what it got, then does what the mode says. Runs with bun. */

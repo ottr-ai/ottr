@@ -4138,6 +4138,100 @@ describe("turn release cards", () => {
 		expect(record.removeWorktree).toHaveLength(1);
 	});
 
+	test("an approved release publishes with the configured GitHub app's token", async () => {
+		const record = baseRecord();
+		const asked: string[] = [];
+		const { store, projects, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			releaseIdentity: async (owner, repo) => {
+				asked.push(`${owner}/${repo}`);
+				return {
+					token: "ghs_release_token",
+					label: "GitHub app rel-bot",
+					warning: null,
+				};
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		projects.get(store.name)!.github = "https://github.com/octo/widget";
+		const task = releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(asked).toEqual(["octo/widget"]);
+		expect(record.publishRelease[0]).toMatchObject({
+			releaseToken: {
+				token: "ghs_release_token",
+				label: "GitHub app rel-bot",
+			},
+		});
+	});
+
+	test("a failed app mint falls back to the user token with the warning on the card log", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			releaseIdentity: async () => ({
+				token: "gh_user_token",
+				label: "the GH_TOKEN user token",
+				warning:
+					"the GitHub app rel-bot has no installation on octo/widget, so the release runs with the GH_TOKEN user token instead",
+			}),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		projects.get(store.name)!.github = "https://github.com/octo/widget";
+		const task = releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(record.publishRelease[0]).toMatchObject({
+			releaseToken: { token: "gh_user_token" },
+		});
+		expect(logText(store, task.id)).toContain(
+			"the GitHub app rel-bot has no installation on octo/widget",
+		);
+	});
+
+	test("a release card with no configured app passes no release token", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			releaseIdentity: async () => null,
+		});
+		projects.get(store.name)!.target = "origin/main";
+		projects.get(store.name)!.github = "https://github.com/octo/widget";
+		const task = releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(record.publishRelease).toHaveLength(1);
+		expect(record.publishRelease[0]).not.toHaveProperty("releaseToken");
+	});
+
+	test("a failed app mint with no user token passes no release token but still warns", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			releaseIdentity: async () => ({
+				token: null,
+				label: "the GH_TOKEN user token",
+				warning:
+					"the GitHub app rel-bot token failed (installation lookup answered 503), so no GH_TOKEN is configured, so the release runs with no token",
+			}),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		projects.get(store.name)!.github = "https://github.com/octo/widget";
+		const task = releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		expect(record.publishRelease).toHaveLength(1);
+		expect(record.publishRelease[0]).not.toHaveProperty("releaseToken");
+		expect(logText(store, task.id)).toContain(
+			"installation lookup answered 503",
+		);
+	});
+
 	test("release notes edited through the app route reach the publisher", async () => {
 		const record = baseRecord();
 		const { store, projects, loop } = await setupWith(record, {

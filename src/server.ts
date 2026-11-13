@@ -748,6 +748,9 @@ const loop = createTurnLoop(projects, {
 	// OTTR-876: the read-only GitHub token a turn may hold (docs/specs/turn-read-token.md);
 	// late-bound like pushAuthKind above — app exists below the loop.
 	turnReadToken: () => app.turnReadToken(),
+	// OTTR-882: the release identity (the configured GitHub app's contents-write token, else
+	// the GH_TOKEN user token with a warning); late-bound like turnReadToken above.
+	releaseIdentity: (owner, repo) => app.releaseIdentity(owner, repo),
 	runMergeGates,
 	mergeHoldMismatch,
 	mergeHoldLanded,

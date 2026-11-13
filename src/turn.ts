@@ -79,7 +79,11 @@ import {
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
 import { providerOf, usageReset } from "./quota.ts";
-import type { publishRelease, runReleaseCommand } from "./release.ts";
+import type {
+	publishRelease,
+	ReleaseIdentity,
+	runReleaseCommand,
+} from "./release.ts";
 import { hostedGh, ownerRepo } from "./release.ts";
 import type { startRun, WorkerTarget } from "./runner.ts";
 import {
@@ -1039,6 +1043,18 @@ export interface TurnOps {
 	/** Override for tests: where findHttp400Rejection reads omp's HTTP-400 request log. */
 	http400Dir?: string;
 	publishRelease: typeof publishRelease;
+	/** OTTR-882: the identity a release runs as — the configured GitHub app's installation
+	 * token (contents write), else the GH_TOKEN user token with `warning` set; null when no
+	 * app is configured. `token` null means the fallback found no token either. Hosted
+	 * boards never ask: their gh client and git auth stay the control plane's. */
+	releaseIdentity?: (
+		owner: string,
+		repo: string,
+	) => Promise<{
+		token: string | null;
+		label: string;
+		warning: string | null;
+	} | null>;
 	runReleaseCommand: typeof runReleaseCommand;
 	archReviewDelta(
 		mainPath: string,
@@ -3095,6 +3111,32 @@ export function createTurnLoop(
 		);
 		if (head.warning !== null) await log(head.warning);
 		if (!(await claimPublish())) return null;
+		// OTTR-882: the release runs as the configured GitHub app when one is set; a failed
+		// mint falls back to the GH_TOKEN user token with the reason on the card log. Hosted
+		// boards keep their project-scoped gh and git auth: nothing is resolved here.
+		let releaseToken: ReleaseIdentity | undefined;
+		if (
+			ops.hosted === undefined &&
+			ops.releaseIdentity !== undefined &&
+			e.github !== null
+		) {
+			const repo = ownerRepo(e.github);
+			const slash = repo?.indexOf("/") ?? -1;
+			if (repo !== null && slash > 0) {
+				const identity = await ops.releaseIdentity(
+					repo.slice(0, slash),
+					repo.slice(slash + 1),
+				);
+				if (identity !== null) {
+					if (identity.warning !== null) await log(identity.warning);
+					if (identity.token !== null)
+						releaseToken = {
+							token: identity.token,
+							label: identity.label,
+						};
+				}
+			}
+		}
 		return ops.publishRelease({
 			mainPath: e.path,
 			reviewed: base,
@@ -3105,6 +3147,7 @@ export function createTurnLoop(
 			github: e.github,
 			archReview,
 			originUrl: settings.originUrl,
+			...(releaseToken !== undefined && { releaseToken }),
 			// Hosted: gh takes the project's minted token, never GH_TOKEN.
 			...(ops.hosted !== undefined && {
 				gh: await hostedGh(e.path, settings.originUrl),

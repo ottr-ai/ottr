@@ -4214,6 +4214,57 @@ export async function createApp(deps: AppDeps) {
 				fetchImpl: githubAppFetch,
 			});
 	}
+	/** The app name the release identity labels: the checked name, else the raw id. */
+	function appIdentityName(): string {
+		return appCheck?.name ?? `id ${githubApp?.id ?? "?"}`;
+	}
+	/** OTTR-882: the identity a release runs as. An app mint wins: one installation token
+	 * scoped to contents write, enough to push the tag and create the release, nothing more.
+	 * A failed mint (no installation, a network or permission error) falls back to the
+	 * GH_TOKEN user token and says so in `warning`; no GH_TOKEN either means the release
+	 * runs with no token at all. null: no app is configured, the release keeps today's
+	 * GH_TOKEN-only path. Hosted boards never ask — their gh client and git auth stay the
+	 * control plane's. */
+	async function releaseIdentity(
+		owner: string,
+		repo: string,
+	): Promise<{
+		token: string | null;
+		label: string;
+		warning: string | null;
+	} | null> {
+		if (appTokens === null) return null;
+		const name = appIdentityName();
+		const fallback = (why: string) => {
+			const user = process.env.GH_TOKEN ?? null;
+			const tail =
+				user === null
+					? "no GH_TOKEN is configured, so the release runs with no token"
+					: "the release runs with the GH_TOKEN user token instead";
+			return {
+				token: user,
+				label: "the GH_TOKEN user token",
+				warning: `${why}, so ${tail}`,
+			};
+		};
+		try {
+			const token = await appTokens.tokenFor(owner, repo, {
+				contents: "write",
+			});
+			if (token !== null)
+				return {
+					token,
+					label: `GitHub app ${name}`,
+					warning: null,
+				};
+			return fallback(
+				`the GitHub app ${name} has no installation on ${owner}/${repo}`,
+			);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			return fallback(`the GitHub app ${name} token failed (${msg})`);
+		}
+	}
 	// OTTR-875: the board token also serves server-side git on the configured GitHub host
 	// when Settings → Other git hosts has no token for it, so a GitHub Enterprise board
 	// needs one token, not two. A stored token for the host wins, github.com keeps its
@@ -13425,6 +13476,9 @@ export async function createApp(deps: AppDeps) {
 		// OTTR-876: the read-only GitHub token a turn may hold, or null — the served rule
 		// (docs/specs/turn-read-token.md); the turn loop asks it at every turn start.
 		turnReadToken,
+		// OTTR-882: the release identity (the configured GitHub app's contents-write token,
+		// else the GH_TOKEN user token with a warning); the turn loop asks it at publish.
+		releaseIdentity,
 		// OTTR-754: the /tmp free-space warning phrase for this runner ("local" or a worker
 		// hostname), or null when space is fine or unknown; the turn start gate holds on it.
 		tmpFullLine: (runner: string): string | null => {

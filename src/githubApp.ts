@@ -107,7 +107,7 @@ export class AppTokenSource {
 	private readonly apiBase: string | undefined;
 	/** Ceiling for each of the two calls a token mint makes. */
 	private readonly timeoutMs: number;
-	/** One token per "owner/repo": each mint is scoped to one repo of one installation. */
+	/** One token per owner/repo and permission set: each mint is scoped to one repo of one installation. */
 	private readonly cached = new Map<string, CacheEntry>();
 
 	constructor(deps: {
@@ -129,10 +129,15 @@ export class AppTokenSource {
 		this.now = deps.now ?? (() => Date.now());
 	}
 
-	async tokenFor(owner: string, repo: string): Promise<string | null> {
+	async tokenFor(
+		owner: string,
+		repo: string,
+		/** The installation permissions to mint; default keeps every current caller's shape. */
+		permissions: Record<string, string> = { pull_requests: "write" },
+	): Promise<string | null> {
 		const base = this.apiBase ?? githubHost().apiBase;
 		const now = this.now();
-		const key = `${owner}/${repo}`;
+		const key = `${owner}/${repo}:${JSON.stringify(permissions)}`;
 		const hit = this.cached.get(key);
 		if (hit !== undefined && now < hit.until) return hit.token;
 		const { jwt } = signAppJwt(this.appId, this.keyObject, now);
@@ -178,7 +183,7 @@ export class AppTokenSource {
 					},
 					body: JSON.stringify({
 						repositories: [repo],
-						permissions: { pull_requests: "write" },
+						permissions,
 					}),
 				},
 			);

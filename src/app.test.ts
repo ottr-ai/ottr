@@ -16005,6 +16005,59 @@ describe(
 				).toBeNull();
 			});
 
+			test("releaseIdentity mints the app's contents-write token and falls back with a warning", async () => {
+				await removeApp();
+				const bodies: unknown[] = [];
+				await saveApp();
+				appFetchImpl = async (url, init) => {
+					if (url.endsWith("/installation")) return Response.json({ id: 77 });
+					if (url.includes("/access_tokens")) {
+						bodies.push(JSON.parse(String(init?.body)));
+						return Response.json({
+							token: "ghs_release_token",
+							expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+						});
+					}
+					return Response.json({ message: "no route" }, { status: 404 });
+				};
+				const ok = await m.app.releaseIdentity("acme", "widget");
+				expect(ok).toEqual({
+					token: "ghs_release_token",
+					label: expect.stringContaining("GitHub app"),
+					warning: null,
+				});
+				// The mint asks exactly for the release permission set: contents write, no more.
+				expect(bodies).toEqual([
+					{ repositories: ["widget"], permissions: { contents: "write" } },
+				]);
+				// No installation: the user token with the reason on the warning line. A
+				// different repo per phase: the minted token is cached for acme/widget, and
+				// the cache must not shadow the 404 and error paths under test.
+				appFetchImpl = async (url) =>
+					url.endsWith("/installation")
+						? new Response("{}", { status: 404 })
+						: Response.json({});
+				const saved = process.env.GH_TOKEN;
+				process.env.GH_TOKEN = "gh_user_12345678";
+				try {
+					const fb = await m.app.releaseIdentity("acme", "other");
+					expect(fb?.token).toBe("gh_user_12345678");
+					expect(fb?.label).toBe("the GH_TOKEN user token");
+					expect(fb?.warning).toContain("no installation on acme/other");
+					// A throwing mint falls back the same way, with the error named.
+					appFetchImpl = async () => {
+						throw new Error("installation lookup answered 503");
+					};
+					const err = await m.app.releaseIdentity("acme", "third");
+					expect(err?.warning).toContain("installation lookup answered 503");
+					expect(err?.token).toBe("gh_user_12345678");
+				} finally {
+					if (saved === undefined) delete process.env.GH_TOKEN;
+					else process.env.GH_TOKEN = saved;
+				}
+				await removeApp();
+			});
+
 			test("properties: random credentials never leak the key, and a throwing mint 502s without it", async () => {
 				const creds = fc.record({
 					id: fc.oneof(fc.string(), fc.constant(APP_ID)),

@@ -394,6 +394,47 @@ describe("AppTokenSource", () => {
 		);
 	});
 
+	test("tokenFor mints the requested permissions", async () => {
+		const { calls, source } = makeSource([
+			okResponse(INSTALLATION),
+			okResponse({
+				token: "t1",
+				expires_at: new Date(NOW + 50 * 60_000).toISOString(),
+			}),
+		]);
+		expect(await source.tokenFor(OWNER, REPO, { contents: "write" })).toBe(
+			"t1",
+		);
+		expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({
+			repositories: [REPO],
+			permissions: { contents: "write" },
+		});
+	});
+
+	test("a cached token never serves another permission set", async () => {
+		const fresh = (token: string) =>
+			okResponse({
+				token,
+				expires_at: new Date(NOW + 50 * 60_000).toISOString(),
+			});
+		const { calls, source } = makeSource([
+			okResponse(INSTALLATION),
+			fresh("t1"),
+			okResponse(INSTALLATION),
+			fresh("t2"),
+		]);
+		expect(await source.tokenFor(OWNER, REPO)).toBe("t1");
+		expect(await source.tokenFor(OWNER, REPO, { contents: "write" })).toBe(
+			"t2",
+		);
+		expect(calls.length).toBe(4);
+		expect(await source.tokenFor(OWNER, REPO)).toBe("t1");
+		expect(await source.tokenFor(OWNER, REPO, { contents: "write" })).toBe(
+			"t2",
+		);
+		expect(calls.length).toBe(4);
+	});
+
 	test("a token expiring within 5 minutes is not cached", async () => {
 		let now = NOW;
 		const { calls, source } = makeSource(

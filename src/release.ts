@@ -1,6 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gitAuthEnv, parseGitToken } from "./gitHosts.ts";
 import { ghEnvFor, githubHost } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
@@ -651,6 +652,21 @@ async function spawnGh(
 	}
 }
 
+/** gh runner bound to one token: ghEnvFor puts GH_TOKEN in the gh process env (GH_ENTERPRISE_TOKEN plus GH_HOST off the default host), and the output is redacted. */
+function tokenGh(token: string): typeof runGh {
+	return async (args, timeoutMs = 2 * 60_000) => {
+		const r = await spawnGh(args, timeoutMs, {
+			...process.env,
+			...ghEnvFor(githubHost(), token),
+		});
+		return {
+			...r,
+			stdout: redact(r.stdout, [token]),
+			stderr: redact(r.stderr, [token]),
+		};
+	};
+}
+
 /** Hosted gh's config dir: empty and private to this process, made on first use. */
 let hostedGhConfigDir: string | null = null;
 
@@ -796,6 +812,7 @@ async function pushReleaseTag(o: {
 	mainPath: string;
 	originUrl: string | null;
 	version: string;
+	identity?: ReleaseIdentity;
 }): Promise<string> {
 	if (!(await hasOrigin(o.mainPath))) return "";
 	// R5-1: the push names the pinned origin URL, never the remote name a work turn can
@@ -806,9 +823,17 @@ async function pushReleaseTag(o: {
 		);
 	const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
 	if (guard !== null) throw new Error(guard);
+	// With an identity the push authenticates exactly as it: the scoped helper env, not the
+	// resolver's ambient credentials. Null token: keep the resolver env (old behavior).
+	const auth =
+		o.identity === undefined
+			? undefined
+			: (releasePushAuth(o.identity.token) ?? undefined);
 	const p = await git(
 		["push", o.originUrl, `refs/tags/${o.version}`],
 		o.mainPath,
+		undefined,
+		auth,
 	);
 	if (p.code !== 0)
 		throw new Error(`git push ${o.version} failed: ${p.stderr.trim()}`);
@@ -845,6 +870,26 @@ async function ghReleasePart(
 	return `GitHub release ${githubHost().webBase}/${repo}/releases/tag/${o.version}`;
 }
 
+/** The identity a release runs as: one token and the name the logs show. */
+export interface ReleaseIdentity {
+	token: string;
+	label: string;
+}
+
+/**
+ * Credential env for the release tag push: gitAuthEnv scoped to the identity's one token,
+ * no ambient helpers, so the push authenticates exactly as the release identity and a
+ * planted helper cannot shadow it. The token rides in OTTR_GIT_TOKEN_0 and the helper
+ * reads it from env — never in the URL. Null when parseGitToken rejects the token: the
+ * push then keeps the resolver's env.
+ */
+export function releasePushAuth(token: string): Record<string, string> | null {
+	const host = githubHost().host;
+	const t = parseGitToken({ host, token });
+	if ("error" in t) return null;
+	return gitAuthEnv({ tokens: [t], key: null, knownHosts: "" });
+}
+
 export async function publishRelease(o: {
 	mainPath: string;
 	/** The commit the review saw. */
@@ -861,8 +906,14 @@ export async function publishRelease(o: {
 	originUrl: string | null;
 	/** gh runner for the release calls; hosted mode passes hostedGh's project-scoped client. */
 	gh?: typeof runGh;
+	/** The token the release runs as: GH_TOKEN in the gh process env and the tag push's credential helper; unset keeps runGh and the resolver env. */
+	releaseToken?: ReleaseIdentity;
+	/** Read-only run: no tag, no push, no gh call; the returned line names every step and the identity. */
+	dryRun?: boolean;
 }): Promise<string> {
-	const gh = o.gh ?? runGh;
+	const gh =
+		o.gh ??
+		(o.releaseToken !== undefined ? tokenGh(o.releaseToken.token) : runGh);
 	// The release waits for its review's fixes, and the merge hold keeps every other card off the
 	// target, so the commits after `reviewed` are those fixes: the tag holds them, the notes list
 	// them. The findings' mergeHeads anchor the attribution; a commit pushed outside the board
@@ -883,13 +934,66 @@ export async function publishRelease(o: {
 	);
 	if (marked === null) throw new Error("git log for the late fixes failed");
 	const notes = lateNotes(o.notes, marked);
+	if (o.dryRun === true) return dryRunLine(o, marked);
 	const parts: string[] = [];
 	const tagged = await tagReleasePart(o, marked);
 	parts.push(tagged);
-	const pushed = await pushReleaseTag(o);
+	const pushed = await pushReleaseTag({ ...o, identity: o.releaseToken });
 	if (pushed !== "") parts.push(pushed);
 	const released = await ghReleasePart({ ...o, notes }, gh);
 	if (released !== "") parts.push(released);
+	return parts.join(", ");
+}
+
+/** The dry-run line: local git reads only — no tag, no push, no gh call — every would-be step and the identity named. */
+async function dryRunLine(
+	o: {
+		mainPath: string;
+		version: string;
+		sha: string;
+		originUrl: string | null;
+		github: string | null;
+		releaseToken?: ReleaseIdentity;
+		gh?: typeof runGh;
+	},
+	marked: LateCommitInfo[],
+): Promise<string> {
+	const label =
+		o.releaseToken?.label ??
+		(o.gh !== undefined
+			? "the project's hosted credentials"
+			: "the GH_TOKEN user token");
+	const parts: string[] = [];
+	// Same read tagReleasePart runs: an existing tag at another commit is refused here too.
+	const cur = await git(
+		["rev-parse", "--verify", "--quiet", `refs/tags/${o.version}^{commit}`],
+		o.mainPath,
+	);
+	if (cur.code === 0) {
+		const at = cur.stdout.trim();
+		if (at !== o.sha)
+			throw new Error(
+				`tag ${o.version} already exists at ${at.slice(0, 7)}, not ${o.sha.slice(0, 7)}`,
+			);
+		parts.push(`dry run: tag ${o.version} already at ${o.sha.slice(0, 7)}`);
+	} else {
+		parts.push(
+			`dry run: would tag ${o.version} at ${o.sha.slice(0, 7)}${marked.length > 0 ? ` (late fixes: ${marked.length})` : ""}`,
+		);
+	}
+	if (await hasOrigin(o.mainPath)) {
+		if (o.originUrl === null)
+			throw new Error(
+				"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
+			);
+		parts.push(`would push the tag to origin as ${label}`);
+	}
+	if (o.github !== null) {
+		const repo = ownerRepo(o.github);
+		if (repo === null)
+			throw new Error(`cannot read owner/name from GitHub remote ${o.github}`);
+		parts.push(`would create the GitHub release ${o.version} as ${label}`);
+	}
 	return parts.join(", ");
 }
 
