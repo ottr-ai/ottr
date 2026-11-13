@@ -1007,6 +1007,7 @@ describe("handoffMarkdown research report", () => {
 		holdProvider: null,
 		holdWindow: null,
 		holdAttempts: 0,
+		holdSetAt: null,
 		pendingBy: null,
 		pushRetries: 0,
 		findingsCheckedAt: null,

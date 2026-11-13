@@ -1903,6 +1903,8 @@ export function createTurnLoop(
 			// A usage hold counts the card's consecutive usage-limit holds (the probe wait
 			// grows with it); a rate hold keeps the count.
 			holdAttempts: hold.rate ? cur.holdAttempts : cur.holdAttempts + 1,
+			// The refresh counts only blocked sightings after this as release evidence.
+			holdSetAt: Date.now(),
 			needsReason: hold.needsReason,
 			pendingPrompt:
 				cur.pendingPrompt === null
@@ -5076,6 +5078,7 @@ export function createTurnLoop(
 					holdUntil: startHold.resetsAt,
 					holdProvider: startHold.provider,
 					holdWindow: startHold.window,
+					holdSetAt: Date.now(),
 					needsReason: `The ${startHold.provider} usage limit is reached. The board starts the task again after the limit resets at ${at} UTC. Send a message to run it now, or cancel the card.`,
 				});
 			ops.publishSoon();
@@ -8238,6 +8241,7 @@ export function createTurnLoop(
 						holdProvider: next.holdProvider ?? null,
 						holdWindow: next.holdWindow ?? null,
 						holdAttempts: next.holdAttempts,
+						holdSetAt: st.now,
 					}
 				: { holdAttempts: 0 }),
 		};

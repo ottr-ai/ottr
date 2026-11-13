@@ -19182,6 +19182,7 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 			holdUntil: number;
 			holdProvider: string | null;
 			holdWindow?: string | null;
+			holdSetAt?: number | null;
 		},
 	) => {
 		const t = store.createTask(title);
@@ -19196,11 +19197,13 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 			holdUntil: NOW + 3_600_000,
 			holdProvider: "zai",
 			holdWindow: "7d",
+			holdSetAt: NOW - 5_000,
 		});
 		const other = held(a.store, "anthropic a", {
 			holdUntil: NOW + 3_600_000,
 			holdProvider: "anthropic",
 			holdWindow: "5h",
+			holdSetAt: NOW - 5_000,
 		});
 		const editor = held(a.store, "editing a", {
 			holdUntil: PROMPT_EDIT_HELD,
@@ -19223,9 +19226,13 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		const zaiB = held(b.store, "zai b", {
 			holdUntil: NOW + 3_600_000,
 			holdProvider: "zai",
+			holdSetAt: NOW - 5_000,
 		});
 
-		// zai reports free again; anthropic is still full with a future reset.
+		// The previous refresh saw zai's window full; this one sees it free
+		// (OTTR-880: the release needs that blocked-then-free pair).
+		const prev = quota([window({ provider: "zai", usedPct: 100 })]);
+		prev.at = NOW - 1_000;
 		const released = releaseUsageHolds(
 			quota([
 				window({ provider: "zai", usedPct: 40 }),
@@ -19237,6 +19244,7 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 			]),
 			[a, b],
 			NOW,
+			prev,
 		);
 
 		expect(released).toBe(2);
@@ -19244,6 +19252,7 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		expect(freeA.holdUntil).toBeNull();
 		expect(freeA.holdProvider).toBeNull();
 		expect(freeA.holdWindow).toBeNull();
+		expect(freeA.holdSetAt).toBeNull();
 		expect(b.store.getTask(zaiB.id)?.holdUntil).toBeNull();
 		expect(a.store.getTask(other.id)?.holdUntil).toBeGreaterThan(NOW);
 		expect(a.store.getTask(other.id)?.holdProvider).toBe("anthropic");
@@ -19255,29 +19264,75 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		b.store.close();
 	});
 
-	test("frees a probe hold: the provider is named, the window stays null", () => {
+	test("keeps a probe hold when no refresh saw the provider blocked", () => {
 		const a = {
-			store: ProjectStore.open(join(root, "quota-probe")),
+			store: ProjectStore.open(join(root, "quota-probe-keep")),
 			name: "a",
 		};
 		const probe = held(a.store, "probe hold", {
 			holdUntil: NOW + 30 * 60_000,
 			holdProvider: "zai",
 			holdWindow: null,
+			holdSetAt: NOW - 60_000,
 		});
 		a.store.updateTask(probe.id, { holdAttempts: 2 });
-		expect(
-			releaseUsageHolds(
-				quota([window({ provider: "zai", usedPct: 40 })]),
-				[a],
-				NOW,
-			),
-		).toBe(1);
+		// The previous refresh shows zai not blocked — the same report state that
+		// made the hold: no recovery evidence, so the probe wait stands (OTTR-880).
+		const silent = quota([window({ provider: "zai", usedPct: 40 })]);
+		expect(releaseUsageHolds(silent, [a], NOW, silent)).toBe(0);
+		let after = a.store.getTask(probe.id)!;
+		expect(after.holdUntil).toBe(NOW + 30 * 60_000);
+		expect(after.holdProvider).toBe("zai");
+		expect(after.holdAttempts).toBe(2);
+		// The first refresh after a start has no previous report either.
+		const cur = quota([window({ provider: "zai", usedPct: 40 })]);
+		expect(releaseUsageHolds(cur, [a], NOW, null)).toBe(0);
+		after = a.store.getTask(probe.id)!;
+		expect(after.holdUntil).toBe(NOW + 30 * 60_000);
+		a.store.close();
+	});
+
+	test("releases a probe hold once a refresh saw the provider blocked and one sees it free", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-probe-free")),
+			name: "a",
+		};
+		const probe = held(a.store, "probe hold", {
+			holdUntil: NOW + 3_600_000,
+			holdProvider: "zai",
+			holdWindow: null,
+			holdSetAt: NOW - 10_000,
+		});
+		// The hold was set from a silent report; the previous refresh then saw the
+		// window full (the report caught up), and this one sees it free: release
+		// before holdUntil.
+		const prev = quota([window({ provider: "zai", usedPct: 100 })]);
+		prev.at = NOW - 5_000;
+		const cur = quota([window({ provider: "zai", usedPct: 40 })]);
+		expect(releaseUsageHolds(cur, [a], NOW, prev)).toBe(1);
 		const free = a.store.getTask(probe.id)!;
 		expect(free.holdUntil).toBeNull();
-		expect(free.holdProvider).toBeNull();
-		// The release keeps the counter: only a run past the limit clears it.
-		expect(free.holdAttempts).toBe(2);
+		expect(free.holdSetAt).toBeNull();
+		a.store.close();
+	});
+
+	test("keeps the hold when the blocked sighting predates it", () => {
+		const a = {
+			store: ProjectStore.open(join(root, "quota-probe-stale")),
+			name: "a",
+		};
+		const probe = held(a.store, "probe hold", {
+			holdUntil: NOW + 30 * 60_000,
+			holdProvider: "zai",
+			holdSetAt: NOW,
+		});
+		// The previous refresh saw zai full, but before the hold was set: not this
+		// hold's evidence.
+		const prev = quota([window({ provider: "zai", usedPct: 100 })]);
+		prev.at = NOW - 5_000;
+		const cur = quota([window({ provider: "zai", usedPct: 40 })]);
+		expect(releaseUsageHolds(cur, [a], NOW, prev)).toBe(0);
+		expect(a.store.getTask(probe.id)?.holdUntil).toBe(NOW + 30 * 60_000);
 		a.store.close();
 	});
 
@@ -19313,11 +19368,24 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 			holdUntil: NOW + 86_400_000,
 			holdProvider: "zai",
 			holdWindow: "7d",
+			holdSetAt: NOW - 5_000,
 		});
 		const passed = held(a.store, "passed", {
 			holdUntil: NOW + 720_000,
 			holdProvider: "anthropic",
+			holdSetAt: NOW - 5_000,
 		});
+		// The previous refresh saw both windows full; this one sees anthropic's
+		// reset passed (free) and zai still full.
+		const prev = quota([
+			window({ usedPct: 100, resetsAt: NOW + 86_400_000 }),
+			window({
+				provider: "anthropic",
+				usedPct: 100,
+				resetsAt: NOW + 3_600_000,
+			}),
+		]);
+		prev.at = NOW - 1_000;
 		expect(
 			releaseUsageHolds(
 				quota([
@@ -19326,6 +19394,7 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 				]),
 				[a],
 				NOW,
+				prev,
 			),
 		).toBe(1);
 		expect(a.store.getTask(full.id)?.holdUntil).toBe(NOW + 86_400_000);
@@ -19333,7 +19402,7 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 		a.store.close();
 	});
 
-	test("a re-hold after a release does not loop: a full report keeps the new hold", () => {
+	test("a re-hold after a release does not loop: the new hold needs fresh evidence", () => {
 		const a = {
 			store: ProjectStore.open(join(root, "quota-loop")),
 			name: "a",
@@ -19342,19 +19411,39 @@ describe("releaseUsageHolds (OTTR-688)", () => {
 			holdUntil: NOW + 86_400_000,
 			holdProvider: "zai",
 			holdWindow: "7d",
+			holdSetAt: NOW - 5_000,
 		});
+		// The previous refresh saw zai full; this one sees it free: release.
+		const prev = quota([window({ usedPct: 100 })]);
+		prev.at = NOW - 1_000;
 		const free = quota([window({ usedPct: 20 })]);
-		expect(releaseUsageHolds(free, [a], NOW)).toBe(1);
+		expect(releaseUsageHolds(free, [a], NOW, prev)).toBe(1);
 		expect(a.store.getTask(t.id)?.holdUntil).toBeNull();
-		// The card starts, dies at the provider again, and re-holds from a report
-		// that says full: the next refresh with that report must keep it.
+		expect(a.store.getTask(t.id)?.holdSetAt).toBeNull();
+		// The card starts, dies at the provider again, and re-holds from a silent
+		// report (a probe hold): the next refresh with that same silent report has
+		// no blocked sighting after the new hold and must keep it waiting.
+		a.store.updateTask(t.id, {
+			holdUntil: NOW + 30 * 60_000,
+			holdProvider: "zai",
+			holdWindow: null,
+			holdSetAt: NOW,
+		});
+		const silent = quota([window({ usedPct: 20 })]);
+		silent.at = NOW + 300_000;
+		const stillSilent = quota([window({ usedPct: 20 })]);
+		expect(releaseUsageHolds(stillSilent, [a], NOW + 300_000, silent)).toBe(0);
+		expect(a.store.getTask(t.id)?.holdUntil).toBe(NOW + 30 * 60_000);
+		// A re-hold stamped from a full report keeps while that report stands.
 		a.store.updateTask(t.id, {
 			holdUntil: NOW + 86_400_000,
 			holdProvider: "zai",
 			holdWindow: "7d",
+			holdSetAt: NOW + 300_000,
 		});
 		const full = quota([window({ usedPct: 100 })]);
-		expect(releaseUsageHolds(full, [a], NOW)).toBe(0);
+		full.at = NOW + 600_000;
+		expect(releaseUsageHolds(full, [a], NOW + 600_000, silent)).toBe(0);
 		expect(a.store.getTask(t.id)?.holdUntil).toBe(NOW + 86_400_000);
 		a.store.close();
 	});

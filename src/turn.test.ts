@@ -12117,6 +12117,8 @@ describe("review findings check", () => {
 		expect(after.holdProvider).toBe("openai-codex");
 		expect(after.holdWindow).toBeNull();
 		expect(after.holdAttempts).toBe(1);
+		// The stamp lets the quota refresh gate its early release on this hold.
+		expect(after.holdSetAt).toBeGreaterThan(0);
 		expect(after.needsReason).toContain("tries again");
 		expect(store.listTasks().filter((t) => t.followUpOf === review.id)).toEqual(
 			[],
@@ -12329,6 +12331,8 @@ describe("review findings check", () => {
 			expect(after.holdProvider).toBe("fake");
 			expect(after.holdWindow).toBeNull();
 			expect(after.holdAttempts).toBe(1);
+			// The stamp lets the quota refresh gate its early release on this hold.
+			expect(after.holdSetAt).toBeGreaterThan(0);
 			expect(after.needsReason).toStartWith(
 				"The run stopped at the provider's usage limit",
 			);

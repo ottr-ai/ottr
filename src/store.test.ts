@@ -4885,7 +4885,7 @@ describe("hold provider columns", () => {
 		store.close();
 	});
 
-	test("open backfills hold_attempts on a pre-existing database and it round-trips", () => {
+	test("open backfills hold_attempts and hold_set_at on a pre-existing database and they round-trip", () => {
 		const dir = join(root, "legacy-hold-attempts");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -4898,15 +4898,19 @@ describe("hold provider columns", () => {
 		);
 		db.close();
 		const store = open(dir);
-		// The old row converges: the counter exists and reads 0.
+		// The old row converges: the counter exists and reads 0, the stamp reads null.
 		expect(store.getTask("old1")?.holdAttempts).toBe(0);
+		expect(store.getTask("old1")?.holdSetAt).toBeNull();
 		const task = store.createTask("probe held");
 		expect(task.holdAttempts).toBe(0);
-		store.updateTask(task.id, { holdAttempts: 3 });
+		expect(task.holdSetAt).toBeNull();
+		store.updateTask(task.id, { holdAttempts: 3, holdSetAt: 123 });
 		expect(store.getTask(task.id)?.holdAttempts).toBe(3);
+		expect(store.getTask(task.id)?.holdSetAt).toBe(123);
 		// A settle that runs past the limit writes the clear directly.
-		store.updateTask(task.id, { holdAttempts: 0 });
+		store.updateTask(task.id, { holdAttempts: 0, holdSetAt: null });
 		expect(store.getTask(task.id)?.holdAttempts).toBe(0);
+		expect(store.getTask(task.id)?.holdSetAt).toBeNull();
 		store.close();
 	});
 });

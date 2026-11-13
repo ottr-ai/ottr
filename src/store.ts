@@ -359,6 +359,7 @@ interface TaskRow {
 	hold_provider: string | null;
 	hold_window: string | null;
 	hold_attempts: number;
+	hold_set_at: number | null;
 	proposal_summary: string | null;
 	findings_checked_at: number | null;
 	kind: string;
@@ -585,6 +586,7 @@ function toListedTask(
 		holdProvider: r.hold_provider,
 		holdWindow: r.hold_window,
 		holdAttempts: r.hold_attempts,
+		holdSetAt: r.hold_set_at,
 		proposalSummary: parseProposalSummary(r.proposal_summary),
 		findingsCheckedAt: r.findings_checked_at,
 	};
@@ -900,6 +902,7 @@ const TASK_COLUMNS: Record<keyof TaskPatch, string> = {
 	holdProvider: "hold_provider",
 	holdWindow: "hold_window",
 	holdAttempts: "hold_attempts",
+	holdSetAt: "hold_set_at",
 	proposalSummary: "proposal_summary",
 	findingsCheckedAt: "findings_checked_at",
 };
@@ -2120,6 +2123,15 @@ export class ProjectStore {
 			cols,
 			"hold_attempts",
 			"ALTER TABLE tasks ADD COLUMN hold_attempts INTEGER NOT NULL DEFAULT 0",
+		);
+		// OTTR-880: when the current hold was stamped. The quota refresh counts only
+		// blocked-window sightings after it as early-release evidence. Nullable, so plain
+		// ADD COLUMN converges; ALTER-only after every rebuild like the hold columns above.
+		ProjectStore.addColumn(
+			db,
+			cols,
+			"hold_set_at",
+			"ALTER TABLE tasks ADD COLUMN hold_set_at INTEGER",
 		);
 		ProjectStore.addColumn(
 			db,

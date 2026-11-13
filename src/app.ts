@@ -514,19 +514,26 @@ export type Entry = TurnProject;
 
 /** OTTR-688: release usage-limit holds early. For every provider that still holds cards, when
  * the fresh quota report no longer shows a blocking window (a window 100% used with a future
- * reset), the provider's holds clear on every project and the scheduler picks the cards up;
- * holdUntil stays the upper bound when the report is silent for that provider. Only usage holds
- * go: a hold without holdProvider (an open prompt edit, a hosted credit retry) and holds whose
- * time already passed (the scheduler runs them anyway) stay. One pass per refresh releases a
- * provider at most once, and logs one line per freed provider; a re-hold after a release was
- * stamped from a full report, so the next refresh with that report keeps it. Returns the
+ * reset) AND an earlier refresh saw one, the provider's holds clear on every project and the
+ * scheduler picks the cards up; holdUntil stays the upper bound when the report is silent for
+ * that provider. Only usage holds go: a hold without holdProvider (an open prompt edit, a
+ * hosted credit retry) and holds whose time already passed (the scheduler runs them anyway)
+ * stay. OTTR-880: the earlier sighting must postdate the hold (holdSetAt) — the same silent
+ * report that made a probe hold must not release it at the next refresh, or the retry would
+ * loop every 5 minutes; a probe hold becomes releasable once a refresh has seen its provider
+ * blocked and a later one sees it free. `prev` is the report the previous refresh processed
+ * (null on the first refresh after a start: no evidence yet, nothing releases). Returns the
  * released card count. */
 export function releaseUsageHolds(
 	q: QuotaState,
 	projects: Iterable<{ store: ProjectStore }>,
 	now: number,
+	prev: QuotaState | null = null,
 ): number {
-	const held = new Map<string, { store: ProjectStore; id: string }[]>();
+	const held = new Map<
+		string,
+		{ store: ProjectStore; id: string; holdSetAt: number }[]
+	>();
 	for (const p of projects)
 		for (const t of p.store.listTasks()) {
 			if (
@@ -537,7 +544,8 @@ export function releaseUsageHolds(
 			)
 				continue;
 			const list = held.get(t.holdProvider) ?? [];
-			list.push({ store: p.store, id: t.id });
+			// A legacy row (pre hold_set_at) reads 0: every post-start sighting counts for it.
+			list.push({ store: p.store, id: t.id, holdSetAt: t.holdSetAt ?? 0 });
 			held.set(t.holdProvider, list);
 		}
 	let released = 0;
@@ -546,16 +554,28 @@ export function releaseUsageHolds(
 		// No data for the provider (a failed usage check included): holdUntil stays the bound.
 		if (rows.length === 0 || providerBlocked(rows, provider, now) !== null)
 			continue;
-		for (const c of cards)
+		// Recovery evidence: an earlier refresh saw a window of this provider at 100%.
+		const seen =
+			prev !== null &&
+			forProvider(prev.limits, provider).some((l) => l.usedPct >= 100);
+		if (!seen) continue;
+		let freed = 0;
+		for (const c of cards) {
+			// Only sightings after the hold was set say anything about this hold.
+			if (prev.at < c.holdSetAt) continue;
 			c.store.updateTask(c.id, {
 				holdUntil: null,
 				holdProvider: null,
 				holdWindow: null,
+				holdSetAt: null,
 			});
-		released += cards.length;
-		console.log(
-			`[quota] released ${cards.length} cards held for ${provider}: the limit reports free again`,
-		);
+			freed++;
+		}
+		released += freed;
+		if (freed > 0)
+			console.log(
+				`[quota] released ${freed} cards held for ${provider}: the limit reports free again`,
+			);
 	}
 	return released;
 }
@@ -6465,11 +6485,16 @@ export function createApp(deps: AppDeps) {
 			refreshingQuota = true;
 			void fetchQuota(boardOmpEnv())
 				.then((q) => {
+					// The report the previous refresh processed: early release needs it as
+					// the blocked-then-free sighting pair (OTTR-880).
+					const prev = quota;
 					quota = q;
 					// OTTR-688: holds of providers the fresh report shows free start now,
 					// not at their stored reset; nothing scheduled when nothing released.
 					try {
-						if (releaseUsageHolds(q, deps.projects.values(), Date.now()) > 0) {
+						if (
+							releaseUsageHolds(q, deps.projects.values(), Date.now(), prev) > 0
+						) {
 							deps.schedule();
 							publishSoon();
 						}

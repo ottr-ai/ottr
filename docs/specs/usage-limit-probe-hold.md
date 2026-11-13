@@ -16,9 +16,10 @@ card. The hold time comes from the first source that applies:
    the card's consecutive usage-limit holds and stops at 6h.
 
 The hold carries `holdProvider` (the run's provider, `providerOf(model)`),
-`holdWindow` (null for sources 2 and 3), and the new `holdAttempts` counter.
-The board shows the reason and the next try time; a reply or Resume clears the
-hold and runs the card at once, as today.
+`holdWindow` (null for sources 2 and 3), `holdAttempts`, and the new
+`holdSetAt` stamp (when the hold was set). The board shows the reason and the
+next try time; a reply or Resume clears the hold and runs the card at once,
+as today.
 
 A run that settles without a usage-limit death clears `holdAttempts` to 0.
 A check that passes clears it too. A usage-limit hold in a check run
@@ -28,16 +29,26 @@ A check that passes clears it too. A usage-limit hold in a check run
 continue: every usage-limit death queues again and the hold gates the retry.
 A usage-limit death never parks needs_you.
 
-The quota refresh (`releaseUsageHolds`) releases these holds early when the
-report shows the provider not blocked, as today: probe holds carry
-`holdProvider`, so they release the same way.
+## Early release (the quota refresh)
+
+`releaseUsageHolds` releases a hold early only with recovery evidence: an
+earlier refresh — after the hold was set (`holdSetAt`) — saw a window of the
+hold's provider at 100%, and the current refresh shows no blocking window.
+app.ts keeps the previous report in memory and passes it to the refresh.
+
+A hold stamped from a silent report (a probe hold, an error-named reset) has
+no such evidence at first: it waits holdUntil. It becomes releasable only
+after a refresh has seen the provider blocked and a later one sees it free.
+Without this rule the same silent report that made the hold would release it
+at the next refresh, and the retry would loop about every 5 minutes.
 
 ## Store
 
-`tasks.hold_attempts INTEGER NOT NULL DEFAULT 0`, added to `TASK_COLUMNS`,
-`TaskRow`, `toListedTask`, and `Task`. Migration: `ProjectStore.addColumn`
-in `ProjectStore.open`, ALTER-only after every rebuild, like the hold columns
-of OTTR-688. Existing databases converge with 0.
+`tasks.hold_attempts INTEGER NOT NULL DEFAULT 0` and
+`tasks.hold_set_at INTEGER` (when the hold was stamped), added to
+`TASK_COLUMNS`, `TaskRow`, `toListedTask`, and `Task`. Migration:
+`ProjectStore.addColumn` in `ProjectStore.open`, ALTER-only after every
+rebuild, like the hold columns of OTTR-688. Existing databases converge.
 
 ## Non-goals
 

@@ -535,6 +535,9 @@ export interface Task {
 	/** Consecutive usage-limit holds this card collected (OTTR-880): the probe wait grows with
 	 * it (30m → 6h). A settle that runs past the limit clears it back to 0. */
 	holdAttempts: number;
+	/** When the current hold was stamped (epoch ms); null without a hold. The quota refresh
+	 * counts only sightings after it as early-release evidence (OTTR-880). */
+	holdSetAt: number | null;
 	/** Manual triage rank; null = unrated. Overview triage sorts P0 first, unrated last. */
 	priority: Priority | null;
 	/** Close-candidate nomination: the reason this card is a duplicate, superseded, or drifted; null = not nominated. */
