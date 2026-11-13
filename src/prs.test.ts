@@ -59,14 +59,19 @@ beforeAll(() => {
 });
 
 afterEach(async () => {
+	// Close what accumulated since the last afterEach, inside this test's own
+	// hook budget: one close is ~75 ms of synchronous bun:sqlite work
+	// (WAL-checkpoint fsyncs) on a slow disk, and sixty-plus of them together
+	// in one hook exceed the 5 s hook timeout there.
 	for (const store of stores.splice(0)) await store.close();
 });
 
-afterAll(() => {
+afterAll(async () => {
+	// afterEach closed every store inside its test's own hook budget; only a
+	// test that timed out can leave one behind, so close the rest here.
+	for (const store of stores.splice(0)) await store.close();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
-	// Sixty-plus stores close at about 100 ms each, so the 5 s default kills this
-	// hook; measured 6-7 s on this project's suite.
-}, 30000);
+});
 
 const sha = (c: string) => c.repeat(40);
 const pr = (
