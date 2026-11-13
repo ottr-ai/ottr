@@ -117,7 +117,9 @@ export function unsettledBlocker(
 	return blocker;
 }
 
-/** True when `version`'s line's wait exceeds capMs (the cap definition above). */
+/** True when `version`'s line's wait exceeds capMs, measured from the oldest aged counted
+ * release at or above `version` in that line (the cap definition above; `version` is the
+ * candidate floor, for the script the installed version). */
 export function lineCapReached(
 	releases: RegistryRelease[],
 	version: string,
@@ -127,9 +129,14 @@ export function lineCapReached(
 ): boolean {
 	const line = releases
 		.filter(counts)
-		.filter((r) => lineKey(r.version) === lineKey(version));
+		.filter(
+			(r) =>
+				lineKey(r.version) === lineKey(version) &&
+				compareVersions(r.version, version) >= 0,
+		);
 	const aged = line.filter((r) => isAged(r, now, ageMs));
-	// A line waits only when it holds an aged counted release and a young one.
+	// No aged counted release at or above the floor: the wait has not started.
+	// A line with no young counted release waits for nothing.
 	if (aged.length === 0 || aged.length === line.length) return false;
 	return now - oldestAged(line, now, ageMs).publishedAt > capMs;
 }

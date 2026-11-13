@@ -224,9 +224,10 @@ export function parsePackument(
  * The highest version the pin may move to (spec "Bump target"): walk the releases above the
  * pin in ascending order, stop at the first one without a verdict or with a fail whose card
  * is not cleared; the release line gate (docs/specs/release-line-gate.md) then picks from
- * the full release list (settle state is registry state, so an unreviewed young release
- * still blocks its line), and the target is the highest walked release that is aged and at
- * or below the pick.
+ * the full release list with maxVersion at the highest walked version, so a settled pick
+ * above the walk cannot bless a walked release from an unsettled line (settle state is
+ * registry state, so an unreviewed young release still blocks its line). The target is the
+ * highest walked release that is aged, not deprecated, and at or below the pick.
  */
 export function bumpTarget(
 	releases: OmpRelease[],
@@ -242,11 +243,15 @@ export function bumpTarget(
 			break;
 		walked.push(r);
 	}
+	// The pick reads the full list, but maxVersion keeps it at or below the walk: a
+	// settled pick above the walk must not bless a walked release from an unsettled line.
+	const maxVersion = walked.at(-1)?.version;
 	const pick = settledLineTarget(
 		releases,
 		now,
 		OMP_WATCH_GATES.ageDays * DAY_MS,
 		OMP_WATCH_GATES.capDays * DAY_MS,
+		maxVersion,
 	);
 	if (pick === null) return null;
 	let target: string | null = null;

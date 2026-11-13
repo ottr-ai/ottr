@@ -135,6 +135,17 @@ describe("lineCapReached", () => {
 			),
 		).toBe(false);
 	});
+
+	test("the wait counts from the oldest aged candidate at or above the floor", () => {
+		// A line that started years ago below the installed version is not a wait.
+		const releases = [rel("1.2.0", 730), rel("1.2.20", 10), rel("1.2.21", 2)];
+		expect(lineCapReached(releases, "1.2.20", NOW, AGE, CAP)).toBe(false);
+		expect(lineCapReached(releases, "1.2.0", NOW, AGE, CAP)).toBe(true);
+		// The unsettled class on the same fixture: the young candidate above the pin.
+		expect(unsettledBlocker(releases, "1.2.20", NOW, AGE)).toEqual(
+			rel("1.2.21", 2),
+		);
+	});
 });
 
 describe("settledLineTarget properties", () => {

@@ -453,6 +453,22 @@ describe("bumpTarget", () => {
 		expect(bumpTarget(releases, verdicts, () => true, NOW)).toBe("1.2.0");
 	});
 
+	test("a pick above the walk does not bless a walked release", () => {
+		// The walk holds 1.2.0 and 1.2.5; settled 1.3.0 sits above the walk, and the
+		// young 1.2.5 keeps the 1.2.x line unsettled.
+		const releases = [rel("1.2.0", 8), rel("1.2.5", 2), rel("1.3.0", 8)];
+		expect(
+			bumpTarget(releases, { "1.2.0": pass, "1.2.5": pass }, () => true, NOW),
+		).toBeNull();
+		// The same fixture with the 1.3.0 fail card open: null too.
+		const verdicts = {
+			"1.2.0": pass,
+			"1.2.5": pass,
+			"1.3.0": fail("T-9"),
+		};
+		expect(bumpTarget(releases, verdicts, () => false, NOW)).toBeNull();
+	});
+
 	test("an older settled line is the target while the newest line waits", () => {
 		const releases = [rel("1.1.9", 30), rel("1.2.0", 8), rel("1.2.5", 2)];
 		const verdicts = { "1.1.9": pass, "1.2.0": pass, "1.2.5": pass };

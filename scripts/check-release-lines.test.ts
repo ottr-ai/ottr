@@ -327,6 +327,47 @@ describe("check-release-lines (live spawns)", () => {
 		}
 	});
 
+	test("cap wait floors at the installed version, not the line's history", async () => {
+		// Spec check 19: the line holds 7.2.0 published 2 years ago, BELOW the
+		// installed 7.2.1 (10 days) beside the young 7.2.2 (2 days). The cap
+		// wait must read the oldest aged release AT OR ABOVE the installed
+		// version (7.2.1, 10d <= 14d cap), so the 2-year history below never
+		// lifts the wait: the nested change warns like any unsettled line.
+		const repo = fixture(
+			{
+				mermaid: "12.2.0",
+				babel: "8.0.6",
+				commander: { top: "14.0.3", nested: "7.2.0", katex: "15.0.0" },
+			},
+			{
+				mermaid: "12.2.0",
+				babel: "8.0.6",
+				commander: { top: "14.0.3", nested: "7.2.1", katex: "15.0.0" },
+			},
+		);
+		const reg = listener({
+			commander: packument([
+				["7.2.0", 730],
+				["7.2.1", 10],
+				["7.2.2", 2],
+			]),
+		});
+		try {
+			const { stderr, code } = await runScript(repo, reg.base);
+			expect(code).toBe(0);
+			const lines = stderr.split("\n").filter((line) => line !== "");
+			expect(lines).toContain(
+				"warning: release line not settled: commander 7.2.1, 7.2.2 is 2 days old (transitive)",
+			);
+			expect(reg.requests).toEqual([
+				{ method: "GET", url: `${reg.base}/commander` },
+			]);
+		} finally {
+			reg.stop();
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
 	test("no lock change: exit 0, no output, no registry call", async () => {
 		const repo = fixture(
 			{ mermaid: "12.2.0", babel: "8.0.6" },

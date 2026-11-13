@@ -53,9 +53,14 @@ still be the pick when the newest line is unsettled.
 
 **Cap**: a line **waits** when it holds at least one aged counted release and at least one
 counted release younger than `ageMs`. A line's **wait** is `now - publishedAt` of the
-oldest aged counted release in that line. When any waited line's wait exceeds `capMs`, the
-pick falls back to today's behavior: the newest counted release with age `>= ageMs`, or
-`null` when none.
+oldest aged counted release **at or above the line's candidate floor** (a counted release
+of that line whose version is `>= floor`). With no aged counted release at or above the
+floor the wait has not started and the cap is not reached. When any waited line's wait
+exceeds `capMs`, the pick falls back to today's behavior: the newest counted release with
+age `>= ageMs`, or `null` when none. `settledLineTarget` has no explicit floor: its input
+is the candidate list itself (for `bumpTarget`, the releases above the pin).
+`lineCapReached` floors at `version` (for the script, the installed version), so a line
+that started long ago below the installed version never lifts the wait.
 
 `maxVersion` (used by `bumpTarget` only, optional parameter): candidates are limited to
 versions `<= maxVersion`; the settled check and the cap still read the whole input.
@@ -90,7 +95,9 @@ export function unsettledBlocker(
 	ageMs: number,
 ): RegistryRelease | null;
 
-/** True when `version`'s line's wait exceeds capMs (the cap definition above). */
+/** True when `version`'s line's wait exceeds capMs, measured from the oldest aged counted
+ * release at or above `version` in that line (the cap definition above; `version` is the
+ * candidate floor, for the script the installed version). */
 export function lineCapReached(
 	releases: RegistryRelease[],
 	version: string,
@@ -109,9 +116,11 @@ existing imports keep working.
 - `OMP_WATCH_GATES` gains `capDays: 14`.
 - `bumpTarget` keeps its verdict walk unchanged (stop at the first version without a
   verdict or with a fail whose card is not cleared). It calls `settledLineTarget` once
-  with the full release list and `maxVersion` unset; the target is the highest walked
-  release that is aged, not deprecated, and `<= pick` (a deprecated release never
-  counts, so it is never the target). No pick, no target.
+  with the full release list and `maxVersion` set to the highest walked version, so a
+  pick above the walk (an unreviewed release, or one held by an open fail card) can
+  never bless a walked release below it; the target is the highest walked release that
+  is aged, not deprecated, and `<= pick` (a deprecated release never counts, so it is
+  never the target). No pick, no target.
 - `parsePackument` keeps `time` entries only for versions the packument still lists in its
   `versions` map (removed versions drop out) and carries `deprecated: typeof
   versions[v]?.deprecated === "string"` on each release. The `OmpRelease` type gains
@@ -217,6 +226,14 @@ local registry listener, fixture lock derived from the real `bun.lock`):
     is unchanged: the fixture derives the real bun.lock's `d3-dsv/commander` nested
     entry beside a top-level `commander`; changing only the nested entry's version
     produces the registry call and the report for that nested version.
+18. A pick above the walk does not bless a walked release: v1.2.0 aged 8 days passed,
+    v1.2.5 aged 2 days passed, v1.3.0 aged 8 days unreviewed: the target is null (the
+    walk holds 1.2.0 and 1.2.5, the pick is 1.3.0, and 1.2.0's line is unsettled). The
+    same fixture with v1.3.0 failed under an open fail card returns null too.
+19. The cap wait counts from the oldest aged counted release at or above the installed
+    version: a line holding x.y.0 aged 2 years, x.y.20 aged 10 days (installed) and
+    x.y.21 aged 2 days reports the unsettled release; `lineCapReached` is false at the
+    installed version and true at x.y.0.
 
 Gates: `bun run check` and `bun test` exit 0.
 
