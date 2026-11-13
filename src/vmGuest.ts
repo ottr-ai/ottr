@@ -265,6 +265,8 @@ export interface GuestOptions {
 	pushIntervalMs?: number;
 	/** Only for tests: replace the bake installs. */
 	ensure?: { packages?: Ensure; tools?: Ensure; python?: Ensure };
+	/** Only for tests: how the agent process exits on POST /shutdown; process.exit(0) by default. */
+	exit?: () => void;
 }
 
 export function serveGuest(opts: GuestOptions): Bun.Server<never> {
@@ -546,8 +548,9 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		ndjson(
 			async (push) => {
 				const { exitCode, stderrTail } = await runBake(project, push);
-				// vm-runner stops the VM right after the sentinel, with no clean shutdown: the
-				// installs must be on the layer disk before it can read the line.
+				// vm-runner POSTs /shutdown after a clean sentinel, so PID 1 unmounts
+				// the layer and powers the VM off: the installs must be on the layer
+				// disk before it can read the line.
 				await exec(["sync"]);
 				push(
 					`${JSON.stringify({ [WORKER_DONE]: { exitCode, stderrTail } })}\n`,
@@ -638,6 +641,17 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		return Response.json({ killed: running !== null });
 	};
 
+	const handleShutdown = (): Response => {
+		// vm-runner asks for the shutdown after a bake's sentinel: the agent exits
+		// so PID 1 unmounts the layer cleanly and powers the VM off. A kill skips
+		// init's unmounts and leaves the layer's journal dirty.
+		if (current !== null)
+			return new Response("a run is active", { status: 409 });
+		const exit = opts.exit ?? (() => process.exit(0));
+		setTimeout(exit, 50); // the response must flush before the process dies
+		return Response.json({ shuttingDown: true });
+	};
+
 	/** A project name the bake may act on, or null. */
 	const bakeProject = (body: unknown): string | null => {
 		const project =
@@ -687,6 +701,7 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 		url: URL,
 	): Promise<Response | null> => {
 		if (url.pathname === "/kill") return handleKill();
+		if (url.pathname === "/shutdown") return handleShutdown();
 		if (url.pathname === "/bake") return handleBakeRequest(request);
 		if (url.pathname === "/run") return handleRunRequest(request);
 		return null;

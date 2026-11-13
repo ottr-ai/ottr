@@ -4,7 +4,8 @@
 # base rootfs is that image's own root. Boot contract (vm-runner <-> init):
 #   vda: base rootfs ext4, the kernel's root (root=/dev/vda ro), mounted read-only;
 #   vdb: the project layer ext4 with upper/ and work/ (read-only in run mode, written in bake);
-#   vdc: the scratch ext4 the turn writes to (run mode only);
+#   vdc: run: the scratch ext4 the turn writes to; bake: the bake-status ext4 init reports
+#     the shutdown outcome on (vm-runner reads it with debugfs);
 #   cmdline: ottr.mode=run|bake ottr.token=<hex> ottr.board=<board ip> ottr.boardhost=<name>;
 #   eth0 is already up: the kernel configures it from the cmdline's ip= (IP_PNP).
 # It builds a writable overlay root over vda (run: lower vdb's upper over vda, upper on vdc;
@@ -95,6 +96,9 @@ if [ "$mode" = run ]; then
 else
 	mount -t ext4 /dev/vdb "$m/layer" || die "cannot mount the project layer (vdb)"
 	mkdir -p "$m/layer/upper" "$m/layer/work" || die "cannot prepare the project layer"
+	# The bake-status disk: init reports the shutdown outcome on it. Best effort,
+	# because a lost status channel must not fail the bake.
+	mount -t ext4 /dev/vdc "$m/scratch" 2>/dev/null
 	lower="$m/base"
 	upper="$m/layer/upper"
 	work="$m/layer/work"
@@ -151,7 +155,14 @@ sleep 2
 kill -KILL -1 2>/dev/null
 sleep 1
 sync
-umount -R "$r" 2>/dev/null || umount -l "$r" 2>/dev/null || echo "ottr-vm-init: the root unmount failed; the layer journal may stay dirty"
+umount -R "$r" 2>/dev/null || umount -l "$r" 2>/dev/null
+umount "$m/layer" 2>/dev/null || mount -o remount,ro "$m/layer" 2>/dev/null || {
+	echo "ottr-vm-init: cannot unmount or remount the project layer (vdb) read-only; the layer journal stays dirty"
+	# vm-runner fails the bake on this fixed marker (debugfs cat /bake-status on vdc).
+	if [ "$mode" = bake ]; then
+		printf 'layer-unmount-failed\n' >"$m/scratch/bake-status" 2>/dev/null
+		sync
+	fi
+}
 umount "$m/scratch" 2>/dev/null
-umount "$m/layer" 2>/dev/null || mount -o remount,ro "$m/layer" 2>/dev/null || echo "ottr-vm-init: cannot unmount or remount the project layer (vdb) read-only; the layer journal stays dirty"
 power_off

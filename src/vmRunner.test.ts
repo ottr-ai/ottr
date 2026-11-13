@@ -148,6 +148,7 @@ interface GuestRec {
 interface GuestScript {
 	run?: (rec: GuestRec) => Response;
 	bake?: (rec: GuestRec) => Response;
+	shutdown?: (rec: GuestRec) => Response;
 	files?: (q: URLSearchParams) => Uint8Array;
 	healthz?: (rec: GuestRec) => Response;
 }
@@ -235,6 +236,8 @@ async function guestRoute(
 			script.bake?.(rec) ??
 			ndjson(JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }))
 		);
+	if (req.method === "POST" && u.pathname === "/shutdown")
+		return script.shutdown?.(rec) ?? new Response("ok");
 	return new Response("not found", { status: 404 });
 }
 
@@ -293,6 +296,9 @@ function startRunner(
 		exists?: (p: string) => boolean;
 		netError?: string | null;
 		rootfs?: VmRunnerOptions["rootfs"];
+		execHook?: (
+			argv: string[],
+		) => { code: number | null; stdout: string; stderr: string } | null;
 	} = {},
 ) {
 	const stateDir = mkdtempSync(join(root, "state-"));
@@ -302,7 +308,7 @@ function startRunner(
 	const execs: string[][] = [];
 	const exec: Exec = async (argv) => {
 		execs.push(argv);
-		return { code: 0, stdout: "", stderr: "" };
+		return o.execHook?.(argv) ?? { code: 0, stdout: "", stderr: "" };
 	};
 	const { launcher, recs } = fakeLauncher(o.script ?? {});
 	const server = serveVmRunner({
@@ -712,6 +718,69 @@ describe("vm-runner /run", () => {
 			sent.find((s) => s.m.name === join(lists, "apt.txt").slice(1))?.content,
 		).toBe("nope\n");
 		expect(bakeVm.killed).toBe(true);
+	});
+
+	// The bake rootfs both new tests share: the layer() callback runs the bake and
+	// publishes only on exitCode 0, like the failed-bake test above.
+	const shutdownBakeRootfs = {
+		base: async () => ({ key: "base", path: "/state/base.ext4" }),
+		layer: async (_p: string, bake: (image: string) => Promise<BakeResult>) => {
+			const b = await bake("/state/layer.tmp");
+			return b.exitCode === 0
+				? { ok: true as const, path: "/state/layer.tmp" }
+				: { ok: false as const, stderrTail: b.stderrTail };
+		},
+	};
+	// The agent answers /shutdown, then the VM powers off; the delay models the real
+	// agent's deferred exit after the response flushes (real clock, can't fake the socket).
+	const shutdownScript = (): GuestScript => ({
+		bake: () =>
+			ndjson(
+				JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } }),
+			),
+		shutdown: (rec) => {
+			setTimeout(() => rec.crash(), 20);
+			return new Response("ok");
+		},
+	});
+
+	test("a clean bake shutdown powers the VM off and reads the bake status", async () => {
+		const r = startRunner({
+			rootfs: shutdownBakeRootfs,
+			script: shutdownScript(),
+		});
+		const lists = join(r.homeRoot, ".ottr", "workers", "proj");
+		mkdirSync(lists, { recursive: true });
+		writeFileSync(join(lists, "apt.txt"), "nope\n");
+		const text = await (await post(r.url, "/run", request())).text();
+		expect(sentinelOf(text)?.exitCode).toBe(0);
+		// PID 1 reports the shutdown outcome on the bake-status disk (vdc), which
+		// vm-runner reads with debugfs: exactly one call, at the bake VM's vdc path.
+		const debugfs = r.execs.filter((a) => a[0] === "debugfs");
+		expect(debugfs).toHaveLength(1);
+		const vdc = r.recs[0]!.spec.drives.find((d) => d.id === "vdc")!;
+		expect(debugfs[0]).toEqual(["debugfs", "-R", "cat /bake-status", vdc.path]);
+		// The bake VM boots with the status disk writable beside the layer.
+		expect(r.recs[0]!.spec.drives).toHaveLength(3);
+		expect(vdc.readOnly).toBe(false);
+	});
+
+	test("a failed layer unmount fails the bake", async () => {
+		const r = startRunner({
+			rootfs: shutdownBakeRootfs,
+			script: shutdownScript(),
+			execHook: (argv) =>
+				argv[0] === "debugfs"
+					? { code: 0, stdout: "layer-unmount-failed\n", stderr: "" }
+					: null,
+		});
+		const lists = join(r.homeRoot, ".ottr", "workers", "proj");
+		mkdirSync(lists, { recursive: true });
+		writeFileSync(join(lists, "apt.txt"), "nope\n");
+		const text = await (await post(r.url, "/run", request())).text();
+		const done = sentinelOf(text);
+		expect(done?.exitCode).toBe(1);
+		expect(done?.stderrTail).toContain("could not unmount the project layer");
 	});
 
 	test("a VM that dies mid-run ends the stream without a sentinel", async () => {

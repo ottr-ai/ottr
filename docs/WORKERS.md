@@ -915,7 +915,9 @@ three, so the turn writes only to its scratch disk. Files under `OTTR_VM_STATE_D
   The key hashes the base key and those lists. The layer is rebuilt lazily: the next
   turn of the project after a list or the base changes bakes a new layer, and later
   turns reuse it. Bakes of one project run one at a time. A failed bake ends that turn
-  with exit code 1 and the bake's error tail.
+  with exit code 1 and the bake's error tail. After a bake, the runner checks the layer
+  image with `e2fsck -fy`; the bake fails when the check cannot clean the image, or when
+  the bake VM cannot unmount the layer.
 - `runs/<run id>/`: the scratch disk, the Firecracker config, its socket and its log.
   The runner removes the dir at run end.
 

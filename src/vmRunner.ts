@@ -567,6 +567,10 @@ function realDirChain(root: string, dir: string): boolean {
 
 const GUEST_PORT = 7070;
 const GUEST_TOKEN_HEADER = "x-ottr-guest-token";
+/** docker/ottr-vm-init writes this to /bake-status (vdc) when the bake's layer unmount fails. */
+const BAKE_UNMOUNT_FAILED = "layer-unmount-failed";
+/** How long a clean bake shutdown (POST /shutdown to power-off) may take. */
+const SHUTDOWN_TIMEOUT_MS = 30_000;
 
 export interface VmDrive {
 	id: "vda" | "vdb" | "vdc";
@@ -1149,11 +1153,13 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				const token = randomBytes(16).toString("hex");
 				let vm: VmHandle | null = null;
 				try {
+					const statusDisk = await newScratch();
 					vm = await boot(
 						"bake",
 						[
 							{ id: "vda", path: base, readOnly: true },
 							{ id: "vdb", path: image, readOnly: false },
+							{ id: "vdc", path: statusDisk, readOnly: false },
 						],
 						board,
 						boardName,
@@ -1169,7 +1175,39 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 						})),
 						signal,
 					);
-					return await bakeTurn(push, vm, token, signal);
+					const r = await bakeTurn(push, vm, token, signal);
+					if (r.exitCode !== 0) return r; // the kill path: a dirty journal is the e2fsck gate's problem
+					// Clean shutdown: the agent exits, PID 1 unmounts the layer and
+					// powers the VM off. A kill here skips init's unmounts.
+					try {
+						const res = await guestFetch(`${vm.guestUrl}/shutdown`, {
+							method: "POST",
+							headers: { [GUEST_TOKEN_HEADER]: token },
+							signal: AbortSignal.timeout(10_000),
+						});
+						if (!res.ok) throw new Error(`the guest answered ${res.status}`);
+					} catch {
+						// Already dead: the exit wait below still bounds the shutdown.
+					}
+					await Promise.race([
+						vm.exited,
+						Bun.sleep(SHUTDOWN_TIMEOUT_MS).then(() => vm?.kill()),
+					]);
+					// PID 1 reports the layer unmount on the status disk: a fixed
+					// marker, never console prose.
+					const status = await exec([
+						"debugfs",
+						"-R",
+						"cat /bake-status",
+						statusDisk,
+					]);
+					if (status.code === 0 && status.stdout.trim() === BAKE_UNMOUNT_FAILED)
+						return {
+							exitCode: 1,
+							stderrTail:
+								"the bake VM could not unmount the project layer (vdb); the layer image stays unpublished\n",
+						};
+					return r;
 				} catch (err) {
 					return { exitCode: 1, stderrTail: `${errText(err)}\n` };
 				} finally {

@@ -203,6 +203,7 @@ describe("guest auth", () => {
 			["POST", "/run"],
 			["POST", "/bake"],
 			["POST", "/kill"],
+			["POST", "/shutdown"],
 			["PUT", "/files"],
 			["GET", "/files?path=/tmp&since=0"],
 		];
@@ -617,5 +618,29 @@ describe("POST /bake", () => {
 			body: JSON.stringify({ project: "../etc" }),
 		});
 		expect(bad.status).toBe(400);
+	});
+});
+
+describe("POST /shutdown", () => {
+	test("the token ends the agent so PID 1 unmounts; the exit seam fires once", async () => {
+		let exits = 0;
+		const { promise: exited, resolve: exitFired } =
+			Promise.withResolvers<void>();
+		const url = start({
+			exit: () => {
+				exits++;
+				exitFired();
+			},
+		});
+		const res = await fetch(`${url}/shutdown`, {
+			method: "POST",
+			headers: AUTH,
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ shuttingDown: true });
+		// The agent defers the exit so the response flushes first: await the seam.
+		await exited;
+		// Only this test drives requests, so one POST can fire the seam once.
+		expect(exits).toBe(1);
 	});
 });
