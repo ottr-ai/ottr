@@ -29,6 +29,7 @@ import {
 	buildOmpArgs,
 	childEnv,
 	classify,
+	configOverlayPaths,
 	createRunSink,
 	findHttp400Rejection,
 	hitUsageLimit,
@@ -500,6 +501,13 @@ describe("buildOmpArgs", () => {
 	test("the no-discovery overlay ships next to the extension", () => {
 		// A missing file makes every run die at omp startup, so pin its presence.
 		expect(existsSync(NO_DISCOVERY_CONFIG)).toBe(true);
+	});
+
+	test("configOverlayPaths lists --config values in order, a dangling flag stays empty", () => {
+		expect(
+			configOverlayPaths(["omp", "--config", "/a.yml", "--config", "/b.yml"]),
+		).toEqual(["/a.yml", "/b.yml"]);
+		expect(configOverlayPaths(["omp", "--config"])).toEqual([]);
 	});
 
 	test("images become @ arguments after the flags", () => {
@@ -4879,7 +4887,9 @@ describe("startRun microVM dispatch", () => {
 			cwd: dir,
 			prompt: "do it",
 			sessionDir,
-			extensionPath: join(dir, "ext.ts"),
+			// Outside the copied-in data dir, like the image-baked tracker extension
+			// the guest reads at the same path: only /data/<project> overlays ride copyIn.
+			extensionPath: join(tmpdir(), "ext.ts"),
 			resumeId: "sess-old",
 			images: [join(dir, "img.png")],
 			model: "anthropic/claude-x",
@@ -4948,12 +4958,23 @@ describe("startRun microVM dispatch", () => {
 				hindsight: false,
 				copyOut: [join(dir, "sessions")],
 			});
-			// Only the resumed session's file, the turn's images and the memory overlay go in.
-			expect(body.vm!.copyIn).toEqual([
+			// Only the resumed session's file, the turn's images and the two
+			// --config overlays (memory, plugin skills) go in.
+			const copyIn = body.vm!.copyIn as string[];
+			expect(copyIn.slice(0, 3)).toEqual([
 				join(dir, "sessions", "1_sess-old.jsonl"),
 				join(dir, "img.png"),
 				join(dir, "omp-memory.yml"),
 			]);
+			const overlay = copyIn[3]!;
+			expect(overlay).toMatch(/omp-plugin-skills-.*\.yml$/);
+			expect(dirname(overlay)).toBe(dir);
+			// Every --config overlay under the data dir is copied in (OTTR-887: the
+			// plugin-skills overlay rode the argv but not copyIn); the extension's own
+			// run.yml and no-discovery.yml live in the guest image instead.
+			for (let i = 0; i < body.argv.length; i++)
+				if (body.argv[i] === "--config" && dirname(body.argv[i + 1]!) === dir)
+					expect(copyIn).toContain(body.argv[i + 1]!);
 			// The raw VM token never reaches the task log.
 			expect(readFileSync(join(dir, "run.log"), "utf8")).not.toContain(token);
 		} finally {

@@ -151,7 +151,7 @@ sleep 2
 kill -KILL -1 2>/dev/null
 sleep 1
 sync
-umount -R "$r" 2>/dev/null || umount -l "$r" 2>/dev/null
+umount -R "$r" 2>/dev/null || umount -l "$r" 2>/dev/null || echo "ottr-vm-init: the root unmount failed; the layer journal may stay dirty"
 umount "$m/scratch" 2>/dev/null
-umount "$m/layer" 2>/dev/null || mount -o remount,ro "$m/layer" 2>/dev/null
+umount "$m/layer" 2>/dev/null || mount -o remount,ro "$m/layer" 2>/dev/null || echo "ottr-vm-init: cannot unmount or remount the project layer (vdb) read-only; the layer journal stays dirty"
 power_off

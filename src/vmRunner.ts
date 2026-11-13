@@ -978,19 +978,22 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 	}
 
 	/** Waits until the guest agent answers /healthz; throws with the boot log otherwise. */
-	async function waitGuest(vm: VmHandle, signal: AbortSignal): Promise<void> {
+	async function waitGuest(vm: VmHandle, stop: AbortSignal): Promise<void> {
 		let gone = false;
 		void vm.exited.then(() => {
 			gone = true;
 		});
 		const deadline = now() + (opts.bootTimeoutMs ?? 60_000);
 		while (now() < deadline) {
-			if (signal.aborted) throw new Error("stopped");
-			if (gone)
+			// A VM that dies on its own is a boot failure with a log; only a real
+			// stop of the run is "stopped". The two can both be true when a stop
+			// kills the VM, so the log check must win while the run still lives.
+			if (gone && !stop.aborted)
 				throw new Error(
 					`the microVM exited during boot: ${vm.logTail().trim().slice(-1500)}`,
 				);
-			if (await guestHealthy(vm, signal)) return;
+			if (stop.aborted) throw new Error("stopped");
+			if (await guestHealthy(vm, stop)) return;
 			await Bun.sleep(200);
 		}
 		throw new Error(
@@ -1157,7 +1160,7 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 						token,
 					);
 					const signal = guestSignal(vm);
-					await waitGuest(vm, signal);
+					await waitGuest(vm, stopper.signal);
 					await putFiles(
 						vm,
 						token,
@@ -1251,7 +1254,7 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			runStart: number,
 		): Promise<GuestDone | null> => {
 			const signal = guestSignal(vm);
-			await waitGuest(vm, signal);
+			await waitGuest(vm, stopper.signal);
 			// The regular files this run copied in: the only existing files
 			// copy-out may replace.
 			const copiedIn = new Set<string>();

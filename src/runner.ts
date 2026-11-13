@@ -1953,6 +1953,14 @@ function startLocalRun(s: RunStart): RunHandle {
 	};
 }
 
+/** The `--config` overlay paths in an omp argv, in order. */
+export function configOverlayPaths(argv: readonly string[]): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < argv.length - 1; i++)
+		if (argv[i] === "--config") out.push(argv[i + 1]!);
+	return out;
+}
+
 /** The microVM dispatch: vm-runner runs the turn in a fresh VM; busy and connect failures
  * settle as workerBusy / workerLost results instead of throwing. */
 function startVmRun(
@@ -1965,6 +1973,7 @@ function startVmRun(
 		sink,
 		args,
 		memoryConfig,
+		pluginSkillsConfig,
 		startedAt,
 		layerEnv,
 		identityEnv,
@@ -1997,9 +2006,23 @@ function startVmRun(
 			...sessionPaths(o.sessionDir, o.resumeId),
 			...(o.images ?? []),
 			...(memoryConfig ? [memoryConfig] : []),
+			...(pluginSkillsConfig ? [pluginSkillsConfig] : []),
 		],
 		copyOut: [o.sessionDir],
 	};
+	// Every --config overlay under the copied-in project data dir must ride copyIn:
+	// the guest reads the image's own extension-dir overlays at the same path, but a
+	// data-dir overlay exists in the VM only if copyIn carries it, and a missed one
+	// fails only after boot with "Config overlay not found" (OTTR-887). Fails loudly,
+	// like an overlay write failure does.
+	const dataDir = dirname(o.sessionDir);
+	const missingOverlays = configOverlayPaths(args).filter(
+		(p) => dirname(p) === dataDir && !spec.copyIn.includes(p),
+	);
+	if (missingOverlays.length)
+		throw new Error(
+			`config overlays not copied into the VM: ${missingOverlays.join(", ")}`,
+		);
 	const vmHandle = runWorker(
 		{
 			id: crypto.randomUUID(),

@@ -149,6 +149,7 @@ interface GuestScript {
 	run?: (rec: GuestRec) => Response;
 	bake?: (rec: GuestRec) => Response;
 	files?: (q: URLSearchParams) => Uint8Array;
+	healthz?: (rec: GuestRec) => Response;
 }
 
 const DONE_OK = {
@@ -217,7 +218,8 @@ async function guestRoute(
 	req: Request,
 ): Promise<Response> {
 	const u = new URL(req.url);
-	if (u.pathname === "/healthz") return new Response("ok");
+	if (u.pathname === "/healthz")
+		return script.healthz?.(rec) ?? new Response("ok");
 	if (req.headers.get("x-ottr-guest-token") !== token)
 		return new Response("unauthorized", { status: 401 });
 	if (req.method === "PUT" && u.pathname === "/files") {
@@ -728,6 +730,22 @@ describe("vm-runner /run", () => {
 		expect(sentinelOf(rest)).toBeNull();
 	});
 
+	test("a VM that exits during boot reports its boot log, not stopped", async () => {
+		const r = startRunner({
+			script: {
+				healthz: (rec) => {
+					rec.crash();
+					return new Response("died", { status: 503 });
+				},
+			},
+		});
+		const text = await (await post(r.url, "/run", request())).text();
+		expect(text).toContain("the microVM exited during boot");
+		expect(text).toContain("fake console");
+		expect(text).not.toContain("vm-runner: stopped");
+		expect(sentinelOf(text)?.exitCode).toBe(1);
+	});
+
 	test("a client abort kills the VM and frees the slot", async () => {
 		const held = heldGuest();
 		const r = startRunner({ max: 1, script: { run: held.run } });
@@ -1117,22 +1135,36 @@ describe("vmRootfs", () => {
 		);
 	});
 
-	function rootfs(home: string): {
+	function rootfs(
+		home: string,
+		e2fsckCode: number | null = 0,
+	): {
 		fs: VmRootfs;
 		stateDir: string;
+		e2fsckArgv: string[][];
 	} {
 		const stateDir = mkdtempSync(join(root, "rfs-"));
 		const pkg = join(stateDir, "package.json");
 		writeFileSync(pkg, "{}");
+		const e2fsckArgv: string[][] = [];
 		const exec: Exec = async (argv) => {
 			if (argv[0] === "omp")
 				return { code: 0, stdout: "omp 1.0\n", stderr: "" };
 			if (argv[0] === "du")
 				return { code: 0, stdout: "1000\t/x\n", stderr: "" };
+			if (argv[0] === "e2fsck") {
+				e2fsckArgv.push(argv);
+				return {
+					code: e2fsckCode,
+					stdout: e2fsckCode === 0 ? "" : "unrepairable\n",
+					stderr: "",
+				};
+			}
 			return { code: 0, stdout: "", stderr: "" };
 		};
 		return {
 			stateDir,
+			e2fsckArgv,
 			fs: new VmRootfs({
 				stateDir,
 				homeRoot: home,
@@ -1181,5 +1213,36 @@ describe("vmRootfs", () => {
 			stderrTail: "E: Unable to locate package nope\n",
 		});
 		expect(readdirSync(join(stateDir, "layers", "proj"))).toEqual([]);
+	});
+
+	test("an e2fsck exit of 1 still publishes the layer", async () => {
+		const home = mkdtempSync(join(root, "rh1-"));
+		const { fs, stateDir } = rootfs(home, 1);
+		const r = await fs.layer("proj", async () => ({
+			exitCode: 0,
+			stderrTail: "",
+		}));
+		expect(r.ok).toBe(true);
+		expect(r.ok && existsSync(r.path)).toBe(true);
+		expect(readdirSync(join(stateDir, "layers", "proj"))).toHaveLength(1);
+	});
+
+	test("a layer image that fails its post-bake check is not published", async () => {
+		const home = mkdtempSync(join(root, "rh4-"));
+		const { fs, stateDir, e2fsckArgv } = rootfs(home, 4);
+		const r = await fs.layer("proj", async () => ({
+			exitCode: 0,
+			stderrTail: "",
+		}));
+		expect(r.ok).toBe(false);
+		if (!r.ok) {
+			expect(r.stderrTail).toContain("e2fsck");
+			expect(r.stderrTail).toContain("unrepairable");
+		}
+		expect(readdirSync(join(stateDir, "layers", "proj"))).toEqual([]);
+		expect(e2fsckArgv).toHaveLength(1);
+		expect(e2fsckArgv[0]!.slice(0, 2)).toEqual(["e2fsck", "-fy"]);
+		// The nonce suffix is random, so only the shape of the path is knowable.
+		expect(e2fsckArgv[0]![2]).toMatch(/\.ext4\.tmp-/);
 	});
 });

@@ -286,6 +286,16 @@ export class VmRootfs {
 					stderrTail:
 						r.stderrTail || `the package bake exited ${r.exitCode ?? "killed"}`,
 				};
+			// The bake VM must leave the layer's journal clean: a run mounts it read-only
+			// and cannot replay it (the guest then powers off). e2fsck exit 0 or 1 means
+			// the image is clean now (1 = errors corrected); anything else fails the bake
+			// with the check's output, like a failed apt install does.
+			const check = await this.o.exec(["e2fsck", "-fy", tmp]);
+			if (check.code === null || check.code >= 2)
+				return {
+					ok: false,
+					stderrTail: `the layer image failed its post-bake check (e2fsck exit ${check.code ?? "?"}):\n${(check.stdout + check.stderr).trim().slice(-2000)}`,
+				};
 			renameSync(tmp, path);
 			keepOnly(dir, `${key}.ext4`);
 			return { ok: true, path };
