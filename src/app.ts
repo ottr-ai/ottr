@@ -6642,8 +6642,9 @@ export async function createApp(deps: AppDeps) {
 	// path below must be a no-op before that (boot-time schedule() runs first).
 	let sockets = 0;
 	let lastStateJson = "";
-	/** OTTR-884: the bytes behind lastStateJson, so a quiet rebuild compares buffers
-	 * instead of re-stringifying the whole 30 MB frame on every publish. */
+	/** OTTR-884: the last published frame's own state JSON bytes, so a quiet
+	 * rebuild compares buffers instead of re-stringifying the whole 30 MB frame
+	 * on every publish. */
 	let lastStateBuf: Buffer | null = null;
 	/** The last "system" frame, replayed to a socket on open so the view renders before the next tick. */
 	let lastSystemJson: string | null = null;
@@ -6780,11 +6781,19 @@ export async function createApp(deps: AppDeps) {
 		}
 		lastAlertInputs = inputs;
 		lastStateJson = text;
-		// The published bytes equal the wrapped build bytes unless the prune changed
-		// the frame; then the text is the truth (OTTR-884).
+		// The published frame is the fixed wrapper around the state's JSON, so the
+		// wrapper bytes strip off deterministically and the compare against the next
+		// build is a plain memcmp of the state's own bytes (OTTR-884 send-back: the
+		// wrapped buffer never equals an unwrapped one, which had defeated the skip
+		// and re-stringified every quiet rebuild). A prune changed the wrapped text
+		// someplace the build's bytes cannot know, so its slice is the truth.
+		const textBuf = Buffer.from(text, "utf8");
 		lastStateBuf = pruned
-			? Buffer.from(text, "utf8")
-			: Buffer.concat([STATE_WRAP_HEAD, entry.stateBuf, STATE_WRAP_TAIL]);
+			? textBuf.subarray(
+					STATE_WRAP_HEAD.length,
+					textBuf.length - STATE_WRAP_TAIL.length,
+				)
+			: entry.stateBuf;
 		if (!closing && sockets > 0 && deps.serverRef.current !== undefined)
 			deps.serverRef.current.publish("board", text);
 		publishUpdate();

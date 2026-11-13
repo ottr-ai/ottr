@@ -11460,6 +11460,29 @@ describe("web push (R1-1, R2-3)", () => {
 		mountStores.push(g);
 	});
 
+	test("a rebuild whose frame equals the published one publishes nothing (OTTR-884)", async () => {
+		const g = GlobalStore.open(join(root, "g-byteskip"));
+		const m = mount({ gstore: g });
+		saveSubs(g, [pushSub]);
+		// Baseline: the first frame builds and publishes.
+		expect(await m.app.publishState()).toBe(true);
+		expect(m.app.stateBuilds()).toBe(1);
+		// A version bump with no store change reopens the gate: the rebuild runs,
+		// but its bytes equal the published frame, so the compare skips the
+		// publish (returns false, no re-broadcast, no push diff). The first cut of
+		// this compare wrapped one side and not the other, so the bytes could
+		// never be equal and every quiet rebuild re-sent the full frame.
+		m.app.publishSoon();
+		expect(await m.app.publishState()).toBe(false);
+		expect(m.app.stateBuilds()).toBe(2);
+		// The 1 s tick's call stays on the version gate: no third rebuild.
+		expect(await m.app.publishState()).toBe(false);
+		expect(m.app.stateBuilds()).toBe(2);
+		// The armed publishSoon timer outlives the test; the shared afterAll closes
+		// the store (mountStores), like every other test that arms one.
+		mountStores.push(g);
+	});
+
 	test("push config heals a stored @localhost subject", async () => {
 		const g = await GlobalStore.open(join(root, "g-vapid"));
 		await g.set("config", {

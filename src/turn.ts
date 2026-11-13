@@ -3907,15 +3907,11 @@ export function createTurnLoop(
 				metered,
 			);
 		}
-<<<<<<< HEAD
-		await schedule();
-=======
 		// The settle's store writes (card state, requeue, findings) are a frame
 		// change (OTTR-884): the tick's unconditional publish is gone, so the
 		// settle tail publishes its own edge before the dispatch reschedule.
 		ops.publishSoon();
 		schedule();
->>>>>>> 9946ae7 (fix: value-compare object flags and publish the turn edges)
 	}
 
 	/** True when the comprehension gate runs on this turn (OTTR-823 scope): plain work turns only —
