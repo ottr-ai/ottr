@@ -1768,6 +1768,163 @@ describe("task routes", () => {
 		expect(done.asked).toBeNull();
 	});
 
+	/** The one-question shape: the drawer sends the raw answer text for it, not the
+	 * wire line. */
+	const seedLeadAskOne = () => {
+		const review = store.createTask("review", null, "review");
+		const lead = store.createTask(
+			"Needs validation: confirm the proxy allowlist",
+		);
+		store.updateTask(lead.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+		const ask = store.createTask(
+			`${LEAD_QUESTIONS_PROMPT_PREFIX}${review.id}: reply with one answer per question, and the board applies each answer to its lead card.`,
+		);
+		store.updateTask(ask.id, {
+			followUpOf: review.id,
+			stage: "backlog",
+			state: "needs_you",
+			queuedAt: null,
+			needsReason:
+				"Wants your answer: 1 question about the review's needs-validation leads",
+			asked: [
+				{
+					question: `Q one? (card #${lead.id})`,
+					options: [
+						{ label: LEAD_APPLIES_OPTION },
+						{ label: LEAD_NOT_APPLY_OPTION },
+					],
+					multi: false,
+					recommended: null,
+				},
+			],
+		});
+		return { review, lead1: lead, ask };
+	};
+
+	test("a one-question card takes the drawer's raw answer text", async () => {
+		const { lead1, ask } = seedLeadAskOne();
+		// One question: AskPanel sends the picked label bare, without the wire line.
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: LEAD_APPLIES_OPTION,
+		});
+		expect(res.status).toBe(200);
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		expect(one.queuedAt).not.toBeNull();
+		expect(
+			one.prompt.endsWith(
+				`The user answered the review's question: ${LEAD_APPLIES_OPTION}`,
+			),
+		).toBe(true);
+		const done = store.getTask(ask.id)!;
+		expect(done.stage).toBe("done");
+		expect(done.state).toBe("idle");
+		expect(done.asked).toBeNull();
+	});
+
+	test("a one-question card keeps raw free text in the lead's details", async () => {
+		const { lead1, ask } = seedLeadAskOne();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "only behind our staging proxy",
+		});
+		expect(res.status).toBe(200);
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("backlog");
+		expect(one.state).toBe("idle");
+		expect(one.cancelledAt).toBeNull();
+		expect(one.details).toBe(
+			"\n\nThe user answered the review's question: only behind our staging proxy",
+		);
+		expect(store.getTask(ask.id)?.stage).toBe("done");
+	});
+
+	test("the drawer's Approve text records on the lead instead of vanishing", async () => {
+		const { lead1, ask } = seedLeadAskOne();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "Approve",
+		});
+		expect(res.status).toBe(200);
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("backlog");
+		expect(one.cancelledAt).toBeNull();
+		expect(one.details).toBe(
+			"\n\nThe user answered the review's question: Approve",
+		);
+		expect(store.getTask(ask.id)?.stage).toBe("done");
+	});
+
+	test("a plain reply on a multi-question card reaches every unanswered lead's details", async () => {
+		const { lead1, lead2, ask } = seedLeadAsk();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: "it is behind our staging proxy",
+		});
+		expect(res.status).toBe(200);
+		for (const id of [lead1.id, lead2.id]) {
+			const lead = store.getTask(id)!;
+			expect(lead.stage).toBe("backlog");
+			expect(lead.state).toBe("idle");
+			expect(lead.cancelledAt).toBeNull();
+			expect(lead.details).toBe(
+				"\n\nThe user answered the review's question: it is behind our staging proxy",
+			);
+		}
+		expect(store.getTask(ask.id)?.stage).toBe("done");
+	});
+
+	test("a started lead cancels through the sanctioned cancel", async () => {
+		const { lead1, ask } = seedLeadAskOne();
+		// The user kicked the lead by hand before answering: the bare cancel patch
+		// would leave a live agent behind a cancelled card.
+		store.updateTask(lead1.id, { stage: "in_progress", state: "running" });
+		const cancels: Array<[string, boolean]> = [];
+		const previous = cancelImpl;
+		cancelImpl = async (_e, id, force) => {
+			cancels.push([id, force]);
+			store.updateTask(id, { cancelledAt: Date.now(), state: "idle" });
+			return { removed: true };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+				text: askAnswerLine(
+					`Q one? (card #${lead1.id})`,
+					LEAD_NOT_APPLY_OPTION,
+				),
+			});
+			expect(res.status).toBe(200);
+			expect(cancels).toEqual([[lead1.id, false]]);
+			const one = store.getTask(lead1.id)!;
+			expect(one.cancelledAt).not.toBeNull();
+			expect(one.needsReason).toBe(
+				`Cancelled by the user's answer to the review's question: ${LEAD_NOT_APPLY_OPTION}`,
+			);
+		} finally {
+			cancelImpl = previous;
+		}
+		expect(store.getTask(ask.id)?.stage).toBe("done");
+	});
+
+	test("an applies answer on a started lead only records it", async () => {
+		const { lead1, ask } = seedLeadAskOne();
+		store.updateTask(lead1.id, { stage: "todo", state: "running" });
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_APPLIES_OPTION),
+		});
+		expect(res.status).toBe(200);
+		const one = store.getTask(lead1.id)!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("running");
+		expect(one.details).toBe(
+			`\n\nThe user answered the review's question: ${LEAD_APPLIES_OPTION}`,
+		);
+		expect(store.getTask(ask.id)?.stage).toBe("done");
+	});
+
 	test("a plain card with an ask is not intercepted: its reply queues normally", async () => {
 		const { lead1, ask } = seedLeadAsk();
 		const plain = store.createTask("a plain card");

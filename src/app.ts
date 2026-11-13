@@ -364,6 +364,7 @@ import { checkTurnToken } from "./turnGithubToken.ts";
 import {
 	APPROVE_REPLY,
 	type AppCheck,
+	type AskQuestion,
 	answeredCard,
 	askAnswerLine,
 	doneReadKey,
@@ -10036,71 +10037,156 @@ export function createApp(deps: AppDeps) {
 		deps.schedule();
 		return taskResponse(e, task.id);
 	}
+	/** One parsed answer per asked question: the drawer's wire line, or — on a
+	 * single-question card, whose drawer sends the raw answer text instead of the
+	 * wire line — the whole reply. The range marks the consumed text, so the reply's
+	 * free text can be recovered afterwards. Pure. */
+	function leadAskMatches(
+		asked: AskQuestion[],
+		text: string,
+	): Array<{
+		question: string;
+		answer: string;
+		start: number;
+		end: number;
+	}> {
+		const matches: Array<{
+			question: string;
+			answer: string;
+			start: number;
+			end: number;
+		}> = [];
+		for (const q of asked) {
+			const marker = askAnswerLine(q.question, "");
+			const at = text.indexOf(marker);
+			if (at !== -1) {
+				const rest = text.slice(at + marker.length);
+				const stop = rest.indexOf('\nFor "');
+				const answer = (stop === -1 ? rest : rest.slice(0, stop)).trim();
+				if (answer !== "")
+					matches.push({
+						question: q.question,
+						answer,
+						start: at,
+						end: at + marker.length + (stop === -1 ? rest.length : stop),
+					});
+				continue;
+			}
+			if (asked.length === 1 && text.trim() !== "")
+				matches.push({
+					question: q.question,
+					answer: text.trim(),
+					start: 0,
+					end: text.length,
+				});
+		}
+		return matches;
+	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
-	 * `For "<question>": <answer>` line per question and each answer applies to that
-	 * question's lead card — "Yes, the risk applies" queues the lead with the answer in
-	 * its prompt, "No, it does not apply" cancels it with the answer as its reason, and
-	 * free text appends to its details so the lead stays in backlog. The question card
-	 * lands Done either way, so a second reply is refused. Null is a plain reply. */
-	function reviewLeadAskReply(
+	 * `For "<question>": <answer>` line per question — raw answer text when the card
+	 * holds a single question — and each answer applies to that question's lead card.
+	 * "Yes, the risk applies" queues an idle backlog lead with the answer in its
+	 * prompt; a lead the user already started only records the answer in its details,
+	 * so no run state is overwritten. "No, it does not apply" cancels an idle backlog
+	 * lead with the answer as its reason; a started lead cancels through the
+	 * sanctioned cancel (it stops the run, disposes the worktree, deletes the
+	 * branch), never through the bare patch. Free text no question consumed appends
+	 * to the details of every open lead that got no per-question answer. The question
+	 * card lands Done either way, so a second reply is refused. Null: a plain reply. */
+	async function reviewLeadAskReply(
 		e: Entry,
 		task: Task,
 		text: string,
-	): Response | null {
+	): Promise<Response | null> {
 		if (
 			task.asked === null ||
 			!task.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)
 		)
 			return null;
 		const tasks = e.store.listTasks();
-		for (const q of task.asked) {
-			const marker = askAnswerLine(q.question, "");
-			const at = text.indexOf(marker);
-			// No answer line (or an empty answer) for this question: its lead stays as it is.
-			if (at === -1) continue;
-			const rest = text.slice(at + marker.length);
-			const stop = rest.indexOf('\nFor "');
-			const answer = (stop === -1 ? rest : rest.slice(0, stop)).trim();
-			if (answer === "") continue;
+		const leadOf = (question: string): ListedTask | undefined => {
 			// The question text carries its lead card: `... (card #<lead id>)`.
-			const leadId = /\(card #([^)]+)\)$/.exec(q.question)?.[1];
-			const lead =
-				leadId === undefined
-					? undefined
-					: tasks.find(
-							(t) => t.id === leadId && t.followUpOf === task.followUpOf,
-						);
+			const leadId = /\(card #([^)]+)\)$/.exec(question)?.[1];
+			return leadId === undefined
+				? undefined
+				: tasks.find(
+						(t) => t.id === leadId && t.followUpOf === task.followUpOf,
+					);
+		};
+		const open = (lead: ListedTask): boolean =>
+			lead.cancelledAt === null && lead.stage !== "done";
+		const appendDetails = (id: string, note: string): void => {
+			const cur = e.store.getTask(id);
+			if (cur === null) return;
+			e.store.updateTask(id, {
+				details: `${cur.details ?? ""}\n\nThe user answered the review's question: ${note}`,
+			});
+		};
+		const matches = leadAskMatches(task.asked, text);
+		const answered = new Set<string>();
+		for (const m of matches) {
+			const lead = leadOf(m.question);
 			// A stale question (its lead was cancelled or done) applies nothing.
-			if (
-				lead === undefined ||
-				lead.cancelledAt !== null ||
-				lead.stage === "done"
-			)
+			if (lead === undefined || !open(lead)) continue;
+			const live = e.store.getTask(lead.id);
+			if (live === null) continue;
+			if (m.answer === LEAD_APPLIES_OPTION) {
+				if (live.stage === "backlog" && live.state === "idle") {
+					e.store.updateTask(lead.id, {
+						stage: "todo",
+						state: "queued",
+						queuedAt: Date.now(),
+						prompt: `${live.prompt}\n\nThe user answered the review's question: ${m.answer}`,
+					});
+					answered.add(lead.id);
+					continue;
+				}
+				// The user started the lead by hand: record the answer, touch no run state.
+				appendDetails(lead.id, m.answer);
+				answered.add(lead.id);
 				continue;
-			if (answer === LEAD_APPLIES_OPTION) {
-				const cur = e.store.getTask(lead.id);
-				if (cur === null) continue;
-				e.store.updateTask(lead.id, {
-					stage: "todo",
-					state: "queued",
-					queuedAt: Date.now(),
-					prompt: `${cur.prompt}\n\nThe user answered the review's question: ${answer}`,
-				});
-			} else if (answer === LEAD_NOT_APPLY_OPTION) {
-				e.store.updateTask(lead.id, {
-					cancelledAt: Date.now(),
-					state: "idle",
-					needsReason: `Cancelled by the user's answer to the review's question: ${answer}`,
-				});
-			} else {
-				// Free text from the drawer's Other field: the lead stays in backlog.
-				const cur = e.store.getTask(lead.id);
-				if (cur === null) continue;
-				e.store.updateTask(lead.id, {
-					details: `${cur.details ?? ""}\n\nThe user answered the review's question: ${answer}`,
-				});
 			}
+			if (m.answer === LEAD_NOT_APPLY_OPTION) {
+				const reason = `Cancelled by the user's answer to the review's question: ${m.answer}`;
+				if (live.stage === "backlog" && live.state === "idle") {
+					e.store.updateTask(lead.id, {
+						cancelledAt: Date.now(),
+						state: "idle",
+						needsReason: reason,
+					});
+					answered.add(lead.id);
+					continue;
+				}
+				// A started lead cancels through the sanctioned cancel: the bare patch
+				// would leave a live agent and an orphan worktree behind a cancelled card.
+				const out = await deps.cancel(e, lead.id, false);
+				if ("removed" in out)
+					e.store.updateTask(lead.id, { needsReason: reason });
+				else
+					appendDetails(
+						lead.id,
+						`${m.answer} (the cancel kept work: ${"kept" in out ? out.kept : "unknown"})`,
+					);
+				answered.add(lead.id);
+				continue;
+			}
+			// Free text from the drawer's Other field: the lead keeps its state.
+			appendDetails(lead.id, m.answer);
+			answered.add(lead.id);
 		}
+		// Free text no question consumed (a plain reply on the card): the record for
+		// every open lead that got no per-question answer.
+		let free = text;
+		for (const m of [...matches].sort((a, b) => b.start - a.start))
+			free = free.slice(0, m.start) + free.slice(m.end);
+		free = free.trim();
+		if (free !== "")
+			for (const q of task.asked) {
+				const lead = leadOf(q.question);
+				if (lead === undefined || !open(lead)) continue;
+				if (answered.has(lead.id)) continue;
+				appendDetails(lead.id, free);
+			}
 		e.store.updateTask(task.id, {
 			stage: "done",
 			state: "idle",
@@ -10174,7 +10260,7 @@ export function createApp(deps: AppDeps) {
 		if (ask !== null) return ask;
 		// A review's lead-question card (OTTR-869): the reply carries one answer per
 		// question, each applied to its lead card, and the card lands Done here.
-		const leadAsk = reviewLeadAskReply(e, task, trimmed);
+		const leadAsk = await reviewLeadAskReply(e, task, trimmed);
 		if (leadAsk !== null) return leadAsk;
 		const names =
 			images.length > 0

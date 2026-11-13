@@ -108,16 +108,26 @@ lead.
 
 The reply route applies the answers (`src/app.ts`). A reply to a card whose prompt
 starts with the question-card prefix and whose `asked` is set parses one answer per
-question from the drawer's wire line `For "<question>": <answer>` (shared helper
-`askAnswerLine`), applies it to the question's lead card, and lands the question
-card Done (`stage: "done"`, `state: "idle"`, `asked: null`, `doneAt` set):
+question — from the drawer's wire line `For "<question>": <answer>` (shared helper
+`askAnswerLine`), or, on a single-question card, from the whole reply text (that
+drawer sends the raw answer without the wire line) — applies it to the question's
+lead card, records free text no question consumed on the unanswered open leads, and
+lands the question card Done (`stage: "done"`, `state: "idle"`, `asked: null`,
+`doneAt` set by the store's Done stamp):
 
-- `Yes, the risk applies`: the lead card moves to `stage: "todo"`, `state: "queued"`,
-  `queuedAt` set, and the answer appends to its prompt.
-- `No, it does not apply`: the lead card cancels (`cancelledAt` set,
-  `state: "idle"`) with the answer as its `needsReason`.
-- Any other text, an empty answer, or no answer line: the lead card stays in
-  backlog; non-empty free text appends to its details.
+- `Yes, the risk applies`: an idle backlog lead moves to `stage: "todo"`,
+  `state: "queued"`, `queuedAt` set, and the answer appends to its prompt. A lead
+  the user already started (any other stage or state) only records the answer in
+  its details — no run state is overwritten.
+- `No, it does not apply`: an idle backlog lead cancels with the direct patch
+  (`cancelledAt` set, `state: "idle"`) and the answer as its `needsReason`. A
+  started lead cancels through the sanctioned `cancel()` (it stops the run,
+  disposes the worktree, deletes the branch) and then carries the answer as its
+  `needsReason`; a cancel that kept work records that fact in the details.
+- Any other text, an empty answer, or no answer line: the lead keeps its state;
+  non-empty text appends to its details. Free text the reply carried but no
+  question consumed appends to the details of every open lead that got no
+  per-question answer.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
   still open (not cancelled, not done). The question card lands Done inside the
   same reply, so a second reply is refused (409, not needs_you).
@@ -252,7 +262,9 @@ before the run resolves.
 8. reply route: the answers "applies" and "does not apply" queue the first lead
    card with the answer in its prompt and cancel the second with the answer as
    its reason; the question card goes Done. Free text leaves the lead card in
-   backlog with the answer in its details.
+   backlog with the answer in its details. A one-question card takes the
+   drawer's raw answer text; a started lead cancels through the sanctioned
+   cancel and never loses its run to the bare patch.
 9. turn: a review with only sandbox-run leads (one without the blocker line)
    files no question card.
 
