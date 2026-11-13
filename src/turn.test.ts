@@ -7,7 +7,8 @@ import {
 	setSystemTime,
 	test,
 } from "bun:test";
-import { execSync } from "node:child_process";
+import { type ChildProcess, execSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import {
 	existsSync,
 	lstatSync,
@@ -22,6 +23,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { PassThrough } from "node:stream";
 import { deflateSync } from "node:zlib";
 
 import { createApp } from "./app.ts";
@@ -39,6 +41,7 @@ import {
 	DEEPEN_POINTS,
 	DEP_HELD_PROMPT,
 	followUpPrompt,
+	handoffMarkdown,
 	IMPLEMENT_RECOMMENDATIONS,
 	LOST_SESSION,
 	mergePrompt,
@@ -52,7 +55,11 @@ import {
 	workCheckSendBack,
 } from "./prompts.ts";
 import { openPullRequest } from "./prs.ts";
-import { hitUsageLimit, WORKER_LOST } from "./runner.ts";
+import {
+	hitUsageLimit,
+	startRun as realStartRun,
+	WORKER_LOST,
+} from "./runner.ts";
 import {
 	FINDINGS_HOLD,
 	isRetro,
@@ -2792,6 +2799,10 @@ describe("turn sessions, steering and images", () => {
 		expect(after.stage).toBe("merging");
 		expect(after.state).toBe("queued");
 		expect(after.needsReason).toBe(null);
+		expect(after.summary).toBe("did it");
+		expect(store.listTurns(task.id)).toMatchObject([
+			{ outcome: "ready", summary: "did it" },
+		]);
 		expect(after.shots).toHaveLength(2);
 		for (const name of after.shots)
 			expect(existsSync(join(store.imagesDir(task.id), name!))).toBe(true);
@@ -6238,6 +6249,114 @@ describe("turn research cards", () => {
 		expect(record.removeWorktree).toHaveLength(1);
 		// The run got the work prompt with the research hatch (the flag no longer picks a prompt).
 		expect(record.runs[0]!.prompt).toContain("only researches a topic");
+	});
+
+	test("direct answered report_outcome preserves summary and details through the turn, task, and handoff", async () => {
+		const { store, record, projects } = researchStore();
+		const summary =
+			"Research confirms that answered outcomes retain their exact summary — including punctuation.";
+		const details =
+			"The stored task and turn supply the summary for the handoff.\nThe complete findings are in the report.";
+		const finalText = "Final assistant text differs from the report.";
+		const report =
+			"# Findings\n\nAnswered outcomes must keep their summary and details distinct.\n";
+		const loop = createTurnLoop(
+			projects,
+			fakeOps(record, {
+				commitsAhead: async () => 0,
+				createWorktree: async (o: { worktreePath: string }) => {
+					record.createWorktree.push(o);
+					mkdirSync(o.worktreePath, { recursive: true });
+					writeFileSync(join(o.worktreePath, RESEARCH_REPORT), report);
+				},
+				startRun: (o) => {
+					record.runs.push(o);
+					const child = Object.assign(new EventEmitter(), {
+						stdout: new PassThrough(),
+						stderr: new PassThrough(),
+						stdin: new PassThrough(),
+					});
+					const handle = realStartRun({
+						...o,
+						board: null,
+						worker: null,
+						vm: null,
+						memoryConfigPath: null,
+						pluginSkillsHome: store.path,
+						gitProbe: () => ({ name: false, email: false }),
+						auditProvisioned: undefined,
+						rulesAtStart: undefined,
+						launcher: () => child as unknown as ChildProcess,
+					});
+					queueMicrotask(() => {
+						const events = [
+							{ type: "session", id: "sess-answered-summary" },
+							{
+								type: "tool_execution_start",
+								toolName: "report_outcome",
+								toolCallId: "report-answered",
+								args: { status: "answered", summary, details },
+							},
+							{
+								type: "tool_execution_end",
+								toolName: "report_outcome",
+								toolCallId: "report-answered",
+								isError: false,
+								result: {
+									content: [
+										{ type: "text", text: "Outcome recorded: answered" },
+									],
+								},
+							},
+							{
+								type: "agent_end",
+								isTerminal: true,
+								messages: [
+									{
+										role: "assistant",
+										content: [{ type: "text", text: finalText }],
+									},
+								],
+							},
+						];
+						child.stdout.write(
+							`${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+						);
+						child.emit("close", 0);
+					});
+					return handle;
+				},
+			}),
+		);
+		const task = researchTask(store);
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = store.getTask(task.id)!;
+		const turns = store.listTurns(task.id);
+		expect(after.stage).toBe("done");
+		expect(after.state).toBe("idle");
+		expect(after.report).toBe(report);
+		expect(record.removeWorktree).toHaveLength(1);
+		expect(turns).toHaveLength(1);
+		expect(turns[0]!.outcome).toBe("answered");
+		expect(turns[0]!.summary).toBe(summary);
+		expect(turns[0]!.details).toBe(details);
+		expect(after.summary).toBe(summary);
+		expect(after.details).toBe(details);
+		const handoff = handoffMarkdown({
+			task: after,
+			turns,
+			sessionsDir: store.sessionsDir,
+		});
+		expect(handoff).toContain(`## Final outcome\n\n${summary}\n\n${details}\n`);
+		expect(handoff).toContain(
+			`## Turns\n\n1. work turn — answered — ${summary}`,
+		);
+		expect(handoff).toContain(`## Research report\n\n${report}`);
+		expect(handoff).not.toContain(finalText);
+		expect(handoff).not.toContain("(no summary)");
+		expect(handoff).not.toContain("no outcome");
 	});
 
 	test("done settle saves untracked files and logs the saved list (fake op)", async () => {
