@@ -31,8 +31,7 @@ outside check.
      - src/turn.ts: retro proposals (fileRetroProposal), review findings and leads
        (fileKeptFindings);
      - src/store.ts: fork result card and fork proposals (createForkResult),
-       trending proposals (fileTrendingProposal), issue cards (fileIssueCard),
-       Jira cards (fileJiraCards), pr_review cards;
+       trending proposals (fileTrendingProposal), pr_review cards.
      - src/ompWatch.ts: fail card and bump card;
      - src/trending.ts: the weekly scout card;
      - src/supervisor.ts: retro card (retroPass), CI merge-push follow-up
@@ -113,6 +112,9 @@ outside check.
 ## Non-goals
 
 - The gate's rules for user prompts: unchanged.
+- Issue cards (fileIssueCard) and Jira cards (fileJiraCards) stay user-authored:
+  their prompts embed the issue or ticket text a person wrote, and their
+  templates name no outside check, so the gate keeps judging them.
 - The wording of src/prompts.ts review/release/interview/grill/board-check
   templates (their cards skip the gate by kind or flag already).
 - propose_repo (trending proposal prompts are agent-written and file as backlog

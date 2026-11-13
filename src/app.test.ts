@@ -719,6 +719,8 @@ describe("task routes", () => {
 		expect(String(task.id)).toMatch(/^[A-Z0-9]{1,4}-[0-9]+$/);
 		expect(String(task.state)).toBe("queued");
 		expect(store.getTask(String(task.id))?.prompt).toBe("do it");
+		// The New task form files user-authored prompts, so the gate judges them.
+		expect(store.getTask(String(task.id))?.promptAuthor).toBe("user");
 		expect(calls).toBe(before + 1);
 	});
 
@@ -8178,6 +8180,8 @@ describe("turns' own host", () => {
 		const id =
 			typeof b === "object" && b !== null && "id" in b ? String(b.id) : "";
 		expect(store.getTask(id)?.prompt).toBe("found while reviewing");
+		// An agent's create_task files board-written prompts: the token decides.
+		expect(store.getTask(id)?.promptAuthor).toBe("board");
 		// Everything else on that host stays shut, even with the token.
 		expect(
 			(await post("/api/settings/api-key", {}, asTurn(BOARD_TOKEN))).status,
@@ -8225,7 +8229,15 @@ describe("turns' own host", () => {
 		const card = { prompt: "found inside a VM" };
 		const file = (token: string) =>
 			post("/api/projects/p1/tasks", card, asTurn(token));
-		expect((await file(vm)).status).toBe(200);
+		const vmFiled = await file(vm);
+		expect(vmFiled.status).toBe(200);
+		// A live VM token files board-written prompts, like the boot token.
+		const vmBody: unknown = await vmFiled.json();
+		const vmId =
+			typeof vmBody === "object" && vmBody !== null && "id" in vmBody
+				? String(vmBody.id)
+				: "";
+		expect(store.getTask(vmId)?.promptAuthor).toBe("board");
 		// Another project's token, a trending verdict and any other route stay shut.
 		expect((await file(other)).status).toBe(403);
 		expect(

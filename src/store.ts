@@ -2881,7 +2881,8 @@ export class ProjectStore {
 			const card = this.createTask(o.prompt, null, "work");
 			this.updateTask(card.id, {
 				title: o.title,
-				promptAuthor: "board",
+				// The prompt embeds the issue's title and body, which a person wrote, so
+				// the card stays user-authored and the prompt gate judges it (OTTR-850).
 				topic: "github issue",
 				stage: "backlog",
 				state: "idle",
@@ -2934,7 +2935,9 @@ export class ProjectStore {
 				const card = this.createTask(item.prompt, null, "work");
 				this.updateTask(card.id, {
 					title: item.title,
-					promptAuthor: "board",
+					// The prompt embeds the ticket's summary, description and comments,
+					// which people wrote, so the card stays user-authored and the prompt
+					// gate judges it (OTTR-850).
 					topic: "jira",
 					...(o.stage === "backlog"
 						? { stage: "backlog", state: "idle", queuedAt: null }
