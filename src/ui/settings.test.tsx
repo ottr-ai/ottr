@@ -1697,6 +1697,7 @@ describe("Project switch cards", () => {
 			prMode: false,
 			issueWatch: false,
 			ompWatch: false,
+			dependabotWarn: true,
 			microVm: false,
 			pushSyncCommits: false,
 			...over,

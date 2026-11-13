@@ -76,6 +76,7 @@ import {
 } from "./confine.ts";
 import { logError } from "./crash.ts";
 import { checkDeepened, type DeepenCheck, deepenDraft } from "./deepen.ts";
+import { type DependabotState, dependabotAlertsState } from "./dependabot.ts";
 import { errmsg, requestFailed } from "./errmsg.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
@@ -1695,6 +1696,7 @@ const BOOLEAN_SETTING_FIELDS = [
 	"prReviewApprove",
 	"prMode",
 	"issueWatch",
+	"dependabotWarn",
 	"ompWatch",
 	"microVm",
 	"pushSyncCommits",
@@ -5061,6 +5063,9 @@ export async function createApp(deps: AppDeps) {
 			vmRunner: vmState.health,
 			githubHostNotice: gheNoticeHost(e.remote, configuredGithubHostname()),
 			prModeSuggestion: e.protectedTarget === true && settings.prMode !== true,
+			dependabotOff:
+				settings.dependabotWarn === true &&
+				dependabotStates.get(e.store.name)?.state === "disabled",
 			remote: e.remote,
 			latestRelease: e.latestRelease,
 			latestReleaseUrl: e.latestReleaseUrl ?? null,
@@ -5070,6 +5075,55 @@ export async function createApp(deps: AppDeps) {
 			settings,
 			taskPrefix: settings.taskIdPrefix ?? derivedTaskPrefix(e.name),
 		};
+	}
+
+	/** Dependabot-alerts state per project name, probed by dependabotTick (fresh for one
+	 * hour; docs/specs/dependabot-warning.md). Advisory only: the project view reads it.
+	 * Anything but a "disabled" read warns nothing. */
+	const dependabotStates = new Map<
+		string,
+		{ state: DependabotState; at: number }
+	>();
+	const DEPENDABOT_TTL_MS = 3_600_000;
+
+	/** Probes one project's Dependabot state into the cache. `force` skips the TTL (the
+	 * settings save uses it). The cache entry dies when the setting is off or the project
+	 * has no GitHub remote; a 403 logs one line and leaves no warning. */
+	async function probeDependabot(e: Entry, force: boolean): Promise<void> {
+		if (e.gitless || e.github === null) {
+			dependabotStates.delete(e.store.name);
+			return;
+		}
+		if ((await e.store.getSettings()).dependabotWarn !== true) {
+			dependabotStates.delete(e.store.name);
+			return;
+		}
+		const cached = dependabotStates.get(e.store.name);
+		const nowMs = Date.now();
+		if (!force && cached !== undefined && nowMs - cached.at < DEPENDABOT_TTL_MS)
+			return;
+		const id = ownerRepo(e.github);
+		const state = id === null ? "unknown" : await dependabotAlertsState(gh, id);
+		dependabotStates.set(e.store.name, { state, at: nowMs });
+		if (state === "unknown")
+			console.log(
+				`[dependabot] ${e.store.name}: ${id ?? e.github} status unavailable; no warning`,
+			);
+	}
+
+	/** Boot + hourly tick (src/server.ts): refreshes the Dependabot state of every project
+	 * with the warning on, then forgets projects that left the board. */
+	async function dependabotTick(): Promise<void> {
+		for (const e of deps.projects.values()) {
+			try {
+				await probeDependabot(e, false);
+			} catch (err) {
+				console.log(`[dependabot] ${e.store.name}: ${errmsg(err)}`);
+			}
+		}
+		const live = new Set([...deps.projects.values()].map((e) => e.store.name));
+		for (const name of dependabotStates.keys())
+			if (!live.has(name)) dependabotStates.delete(name);
 	}
 
 	/** One cache per app instance: two trackers (or two test apps) never share a snapshot. */
@@ -12182,6 +12236,9 @@ export async function createApp(deps: AppDeps) {
 			return null;
 		});
 		if (applied !== null) return applied;
+		// A fresh probe answers this response's dependabotOff with the repo's real state
+		// when the save turned the warning on; boot and the hourly tick cover the rest.
+		if (patch.dependabotWarn === true) await probeDependabot(e, true);
 		if (patch.targetBranch !== undefined) await refreshRemote(e);
 		return json(await projectView(e));
 	}
@@ -13876,5 +13933,6 @@ export async function createApp(deps: AppDeps) {
 		issueWatchTick: (opts?: { manual?: string }) =>
 			backgroundTick("issue watch", () => issueWatcher.tick(opts)),
 		ompWatchTick: () => backgroundTick("omp watch", () => ompWatcher.tick()),
+		dependabotTick: () => backgroundTick("dependabot", () => dependabotTick()),
 	};
 }

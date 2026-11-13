@@ -237,6 +237,8 @@ export interface ProjectSettings {
 	issueWatchSince: number | null;
 	/** Hourly omp release watch: a model reviews each new omp release; fail and bump cards (off by default; docs/specs/omp-watch.md). */
 	ompWatch: boolean;
+	/** Warn on the project page when Dependabot alerts are off for the repo on GitHub, with a link to enable them (on by default; docs/specs/dependabot-warning.md). */
+	dependabotWarn: boolean;
 	/** Board shows the "Finish setting up" checklist while true; set on add, cleared by dismiss/wizard-done. */
 	setupChecklist: boolean;
 	/**
@@ -958,6 +960,10 @@ export interface ProjectView {
 	 * Settings → GitHub → GitHub host. Null when the features are on or the origin is
 	 * not a ghe.com tenant. */
 	githubHostNotice: string | null;
+	/** True when the repo's Dependabot alerts are off on GitHub and the dependabotWarn
+	 * setting is on; the project header shows the advisory with the enable link
+	 * (docs/specs/dependabot-warning.md). */
+	dependabotOff: boolean;
 	/** OTTR-675: true when the target branch requires pull requests (a pull_request
 	 * repository rule) and PR mode is off; the project header shows the advisory with
 	 * the turn-on action. */

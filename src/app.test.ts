@@ -10194,6 +10194,131 @@ describe("projectView githubHostNotice", () => {
 	});
 });
 
+describe("dependabotWarn setting and the dependabotOff view field", () => {
+	const opened: Entry[] = [];
+	afterAll(async () => {
+		for (const e of opened) await closeTestStore(e.store);
+	});
+
+	/** A mount with one project whose GitHub remote points at octo/repo. */
+	async function depMount(gh: GhFn) {
+		const name = `dep-${Math.random().toString(36).slice(2, 8)}`;
+		const projects = new Map<string, Entry>();
+		const m = await mount({ projects, gh });
+		const add = await m.call("/api/projects", { name });
+		expect(add.status).toBe(200);
+		const e = projects.get(name)!;
+		e.target = "main";
+		e.github = "https://github.com/octo/repo.git";
+		opened.push(e);
+		return { m, e };
+	}
+
+	/** One project's dependabotOff from /api/state. */
+	const offOf = async (
+		m: { call: (path: string, body?: unknown) => Promise<Response> },
+		name: string,
+	): Promise<boolean> => {
+		const res = await m.call("/api/state");
+		expect(res.status).toBe(200);
+		const b = (await res.json()) as {
+			projects: { name: string; dependabotOff: boolean }[];
+		};
+		return b.projects.find((p) => p.name === name)!.dependabotOff;
+	};
+
+	test("a non-boolean dependabotWarn is 400; the boolean saves", async () => {
+		const bad = await post("/api/projects/p1/settings", {
+			dependabotWarn: "yes",
+		});
+		expect(bad.status).toBe(400);
+		expect(await errorOf(bad)).toBe("dependabotWarn must be a boolean");
+		const off = await post("/api/projects/p1/settings", {
+			dependabotWarn: false,
+		});
+		expect(off.status).toBe(200);
+		expect((await off.json()).dependabotOff).toBe(false);
+		expect((await store.getSettings()).dependabotWarn).toBe(false);
+		// Toggling on probes inline: p1 has no GitHub remote, so the probe only clears.
+		const on = await post("/api/projects/p1/settings", {
+			dependabotWarn: true,
+		});
+		expect(on.status).toBe(200);
+		expect((await on.json()).dependabotOff).toBe(false);
+		expect((await store.getSettings()).dependabotWarn).toBe(true);
+	});
+
+	test("a 404 probe with the warning on marks dependabotOff; the hour TTL keeps one request", async () => {
+		let calls = 0;
+		const { m, e } = await depMount(async (args) => {
+			calls++;
+			expect(args).toEqual(["api", "repos/octo/repo/vulnerability-alerts"]);
+			return { code: 1, stdout: "", stderr: "gh: Not Found (HTTP 404)" };
+		});
+		await m.app.dependabotTick();
+		expect(await offOf(m, e.name)).toBe(true);
+		await m.app.dependabotTick();
+		expect(calls).toBe(1);
+	});
+
+	test("turning the setting off clears the field; on probes inline", async () => {
+		const { m, e } = await depMount(async () => ({
+			code: 1,
+			stdout: "",
+			stderr: "gh: Not Found (HTTP 404)",
+		}));
+		await m.app.dependabotTick();
+		expect(await offOf(m, e.name)).toBe(true);
+		const off = await m.call(`/api/projects/${e.name}/settings`, {
+			dependabotWarn: false,
+		});
+		expect(off.status).toBe(200);
+		expect((await off.json()).dependabotOff).toBe(false);
+		const on = await m.call(`/api/projects/${e.name}/settings`, {
+			dependabotWarn: true,
+		});
+		expect(on.status).toBe(200);
+		// The save's inline probe sees the repo still disabled: the field is true at once.
+		expect((await on.json()).dependabotOff).toBe(true);
+	});
+
+	test("a 204 and a 403 keep the field false", async () => {
+		const fakes: GhFn[] = [
+			async () => ({ code: 0, stdout: "", stderr: "" }),
+			async () => ({
+				code: 1,
+				stdout: "",
+				stderr: "gh: Forbidden (HTTP 403)",
+			}),
+		];
+		for (const gh of fakes) {
+			const { m, e } = await depMount(gh);
+			await m.app.dependabotTick();
+			expect(await offOf(m, e.name)).toBe(false);
+		}
+	});
+
+	test("a project without a GitHub remote probes nothing", async () => {
+		let calls = 0;
+		const name = `dep-null-${Math.random().toString(36).slice(2, 8)}`;
+		const projects = new Map<string, Entry>();
+		const m = await mount({
+			projects,
+			gh: async () => {
+				calls++;
+				return { code: 0, stdout: "", stderr: "" };
+			},
+		});
+		const add = await m.call("/api/projects", { name });
+		expect(add.status).toBe(200);
+		const e = projects.get(name)!;
+		opened.push(e);
+		await m.app.dependabotTick();
+		expect(calls).toBe(0);
+		expect(await offOf(m, e.name)).toBe(false);
+	});
+});
+
 describe(
 	"projectView prModeSuggestion (OTTR-675)",
 	await (async () => {

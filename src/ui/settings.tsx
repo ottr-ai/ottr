@@ -8515,6 +8515,14 @@ function ProjectWatchesCard({
 					save={(v) => send({ ompWatch: v })}
 					act={act}
 				/>
+				<CheckRow
+					name="Dependabot warning"
+					desc={`${project.github === null ? "Needs a GitHub remote. " : ""}Warns on the project page when Dependabot alerts are off for the repo on GitHub; the warning links to GitHub's page to turn them on. Probed at boot and hourly`}
+					checked={st.dependabotWarn}
+					disabled={project.github === null && !st.dependabotWarn}
+					save={(v) => send({ dependabotWarn: v })}
+					act={act}
+				/>
 			</div>
 		</SettingsCard>
 	);

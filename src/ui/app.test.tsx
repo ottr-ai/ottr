@@ -7900,6 +7900,27 @@ describe("ProjectBoard sync-commit advisories", () => {
 		expect(html).toContain("Settings → GitHub → GitHub host");
 	});
 
+	test("a dependabot-off repo renders the advisory with the enable link", () => {
+		const html = renderBoard(
+			projectWith({
+				dependabotOff: true,
+				github: "https://github.com/acme/widget",
+			}),
+		);
+		expect(html).toContain("Dependabot alerts are off");
+		expect(html).toContain("Enable on GitHub");
+		expect(html).toContain(
+			'href="https://github.com/acme/widget/settings/security_analysis"',
+		);
+		expect(html).toContain("Settings → Watches → Dependabot warning");
+	});
+
+	test("no dependabot-off state renders no dependabot advisory", () => {
+		const html = renderBoard(projectWith({}));
+		expect(html).not.toContain("Dependabot alerts are off");
+		expect(html).not.toContain("security_analysis");
+	});
+
 	test("a clean project renders neither advisory", () => {
 		const html = renderBoard(projectWith({}));
 		expect(html).not.toContain("Push to origin");

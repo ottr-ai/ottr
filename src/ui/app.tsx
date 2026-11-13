@@ -4092,6 +4092,33 @@ function ProjectAdvisories(p: {
 						</span>
 					</p>
 				)}
+			{project.dependabotOff && project.github !== null && (
+				<p className="advisory">
+					<Icon name="info" size={14} />
+					<span>
+						Dependabot alerts are off for{" "}
+						<code>{repoSlug(project.github)}</code> on GitHub, so the board sees
+						no Dependabot alerts for it.{" "}
+						<a
+							className="notif-link"
+							href={`${project.github}/settings/security_analysis`}
+							target="_blank"
+							rel="noopener noreferrer"
+						>
+							Enable on GitHub
+						</a>
+						. Hide this warning under{" "}
+						<button
+							type="button"
+							className="notif-link"
+							onClick={() => openSettingsSection("project-watches-section")}
+						>
+							Settings → Watches → Dependabot warning
+						</button>
+						.
+					</span>
+				</p>
+			)}
 			{!project.hasRules && (
 				<p className="advisory">
 					<Icon name="info" size={14} />

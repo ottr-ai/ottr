@@ -1076,6 +1076,11 @@ every(() => app.issueWatchTick(), 3_600_000);
 runWork(() => app.ompWatchTick());
 every(() => app.ompWatchTick(), 3_600_000);
 
+// Dependabot alerts: boot + hourly probe per project with the warning on; the project
+// page warns when the repo has them off (docs/specs/dependabot-warning.md).
+runWork(() => app.dependabotTick());
+every(() => app.dependabotTick(), 3_600_000);
+
 // Token expiry: probe at boot and once a day; advisory warnings and reminder pushes inside.
 runWork(() => app.tokenReminderTick());
 every(() => app.tokenReminderTick(), 86_400_000);
