@@ -24411,7 +24411,9 @@ describe("stored review findings", () => {
 		const filed = kids[0]!;
 		expect(filed.details).not.toContain("came back");
 		expect(filed.details).toMatch(
-			new RegExp(`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.`),
+			new RegExp(
+				`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.`,
+			),
 		);
 		const reviewAfter = store.getTask(review.id)!;
 		expect(reviewAfter.details).toContain(`already open: #${filed.id}`);
