@@ -14661,7 +14661,7 @@ type InboxSummary = {
 
 /** The board's inbox: one entry per panel row, most urgent first, plus the bell's
  * tooltip lines. `inboxSeen` is the server's shared list plus this tab's pending acks. */
-function appInboxMeta(
+export function appInboxMeta(
 	state: StateResponse | null,
 	ackLocal: ReadonlySet<string>,
 	error: string | null,
@@ -14726,7 +14726,7 @@ function appInboxMeta(
 }
 
 /** The bell button and its screen-reader summary line. */
-function AppInboxBell({
+export function AppInboxBell({
 	inbox,
 	inboxTitle,
 	inboxName,
@@ -14771,12 +14771,7 @@ function AppInboxBell({
 				aria-label={inboxName}
 			>
 				<Icon name="bell" key={ring} />
-				{inbox.total > 0 && (
-					<span className="inbox-n">
-						{inbox.lit ? inbox.fresh.length : inbox.total}
-						{inbox.lit && <span className="inbox-new"> new</span>}
-					</span>
-				)}
+				{inbox.total > 0 && <span className="inbox-n">{inbox.total}</span>}
 			</button>
 			<span className="sr" role="status">
 				{inbox.fresh.length > 0

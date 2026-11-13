@@ -79,6 +79,8 @@ const {
 	cardRenderProbe,
 	reuseCards,
 	skillGapNote,
+	appInboxMeta,
+	AppInboxBell,
 } = await import("./app.tsx");
 const {
 	monogram,
@@ -10894,5 +10896,83 @@ describe("memoized Card renders", () => {
 			container.remove();
 			globalThis.fetch = realFetch;
 		}
+	});
+});
+
+describe("AppInboxBell badge", () => {
+	// 5 needs-you + 18 asked + 6 notices = 29 entries, as the panel lists them. The
+	// last `ackedCount` entries count as acknowledged, so the rest stay fresh.
+	const metaWithAcks = (ackedCount: number) => {
+		const need = Array.from({ length: 5 }, (_, n) =>
+			cardFixture({ id: `need${n}` }),
+		);
+		const ask = Array.from({ length: 18 }, (_, n) =>
+			cardFixture({ id: `ask${n}` }),
+		);
+		const info = Array.from({ length: 6 }, (_, n) => `notice:n${n}`);
+		const probe = appInboxMeta(
+			null,
+			new Set<string>(),
+			null,
+			null,
+			need,
+			ask,
+			[],
+			info,
+			[],
+			0,
+			"",
+		);
+		const ackLocal = new Set(
+			probe.entries.slice(probe.entries.length - ackedCount).map((e) => e.key),
+		);
+		return appInboxMeta(
+			null,
+			ackLocal,
+			null,
+			null,
+			need,
+			ask,
+			[],
+			info,
+			[],
+			0,
+			"",
+		);
+	};
+	const bell = (meta: ReturnType<typeof appInboxMeta>) =>
+		renderToStaticMarkup(
+			<AppInboxBell
+				inbox={meta.inbox}
+				inboxTitle={meta.inboxTitle}
+				inboxName={meta.inboxName}
+				loaded={false}
+			/>,
+		);
+
+	test("with unread entries the badge counts every entry, the bell stays lit", () => {
+		const meta = metaWithAcks(5);
+		expect(meta.inbox.total).toBe(29);
+		expect(meta.inbox.fresh.length).toBe(24);
+		expect(meta.inbox.lit).toBe(true);
+		const html = bell(meta);
+		expect(html).toContain('class="icon inbox lit"');
+		expect(html).toContain('data-level="needs"');
+		expect(html).toContain('<span class="inbox-n">29</span>');
+		expect(html).not.toContain("inbox-new");
+		// The screen-reader name keeps both numbers; the sr status line names the unread count.
+		expect(html).toContain('aria-label="Notifications, 24 new of 29"');
+		expect(html).toContain("24 new notifications");
+	});
+
+	test("with nothing unread the badge shows the total and the bell stays grey", () => {
+		const meta = metaWithAcks(29);
+		expect(meta.inbox.fresh.length).toBe(0);
+		expect(meta.inbox.lit).toBe(false);
+		const html = bell(meta);
+		expect(html).toContain('class="icon inbox"');
+		expect(html).not.toContain("icon inbox lit");
+		expect(html).toContain('<span class="inbox-n">29</span>');
+		expect(html).toContain('aria-label="Notifications, 29"');
 	});
 });

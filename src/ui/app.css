@@ -8403,11 +8403,6 @@ button.log-mode[aria-pressed="true"] {
 	.rail-toggle {
 		display: none;
 	}
-	/* The fill already says new and the bar keeps its room for the meters;
-	   the accessible name keeps the word. */
-	.inbox-new {
-		display: none;
-	}
 	/* The menu hangs from its own trigger on the left, not under the right-hand icons. */
 	.popover.areas-pop {
 		left: 12px;
