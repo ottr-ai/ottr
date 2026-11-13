@@ -20552,6 +20552,9 @@ describe("turn PR-mode merge settle", () => {
 							return !(phase === "integration proof" && failed);
 						},
 						targetSha: async (_m, ref) => {
+							// Filing plants the source head at refs/ottr/pr/20; the ship's
+							// head refresh re-reads it before judging the branch.
+							if (ref === "refs/ottr/pr/20") return "pr-head";
 							if (ref === "refs/ottr/pr/30") {
 								await waitAt("legacy source head read");
 								return phase === "legacy source head read" && failed
@@ -20630,13 +20633,20 @@ describe("turn PR-mode merge settle", () => {
 							prompt: `${dependabotHead(30, "acme/repo")}: Bump vite`,
 						});
 					const before = store.getTask(task.id)!;
-					const expectedEffects = legacy
-						? ["fetch"]
-						: phase === "PR open"
+					// Source-PR cards re-read the PR head before the ship judges the
+					// branch (OTTR-809's stale-head fix), so a fetch effect precedes
+					// everything; a legacy card fetches twice (the resolve, then the
+					// refresh re-read of the same ref).
+					const tail =
+						phase === "PR open"
 							? ["push", "open"]
 							: phase === "branch push" || phase === "source branch push"
 								? ["push"]
 								: [];
+					// The cancel gates inside the first fetch read, and the ship aborts
+					// at its entry guard afterwards, so every source-PR shape records
+					// exactly one fetch.
+					const expectedEffects = source || legacy ? ["fetch", ...tail] : tail;
 					const turn = loop.runTurn(store.name, task.id);
 					try {
 						await Promise.race([
