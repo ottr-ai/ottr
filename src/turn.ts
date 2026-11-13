@@ -1772,6 +1772,16 @@ function pickLeadMatch(
 	return null;
 }
 
+/** A lead card's title key for the fingerprint-less dedupe: the prompt's first
+ * line, lower-cased, with runs of whitespace collapsed to one space and trimmed
+ * (docs/specs/review-findings-persistence.md "Lead title dedupe"). */
+function leadTitleKey(prompt: string): string {
+	return (prompt.split("\n")[0] ?? "")
+		.toLowerCase()
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 export function createTurnLoop(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -9515,7 +9525,23 @@ export function createTurnLoop(
 				// sandbox run waits for a validation sandbox.
 				if (live !== null && live.cancelledAt === null) {
 					const byFingerprint = new Map<string, ListedTask[]>();
+					// Open lead cards by title key, lowest id first: the fallback for a lead
+					// whose fingerprint finds no open or cancelled card. Only open cards
+					// block a lead here; cancelled and done titles never do.
+					const openByTitle = new Map<string, ListedTask>();
+					const indexTitle = (t: ListedTask): void => {
+						const key = leadTitleKey(t.prompt);
+						if (
+							!key.startsWith("needs validation") ||
+							t.cancelledAt !== null ||
+							t.stage === "done"
+						)
+							return;
+						const held = openByTitle.get(key);
+						if (held === undefined || t.id < held.id) openByTitle.set(key, t);
+					};
 					for (const t of await st.store.listTasks()) {
+						indexTitle(t);
 						const fp = leadFingerprint(t.prompt);
 						if (fp === null) continue;
 						const list = byFingerprint.get(fp);
@@ -9525,8 +9551,23 @@ export function createTurnLoop(
 					const questions: string[] = [];
 					for (const lead of args.leads) {
 						const fp = leadFingerprint(lead.prompt);
-						const match =
+						const fpMatch =
 							fp === null ? null : pickLeadMatch(byFingerprint.get(fp) ?? []);
+						// Two different fingerprints are two different records, so a title
+						// match counts only when the lead or the card carries none.
+						const byTitle =
+							fpMatch !== null && fpMatch.kind !== "done"
+								? undefined
+								: openByTitle.get(leadTitleKey(lead.prompt));
+						const titleCard =
+							byTitle !== undefined &&
+							(fp === null || leadFingerprint(byTitle.prompt) === null)
+								? byTitle
+								: undefined;
+						const match =
+							titleCard === undefined
+								? fpMatch
+								: { card: titleCard, kind: "open" as const };
 						if (match !== null && match.kind !== "done") {
 							if (match.kind === "open") {
 								const full = await st.store.getTask(match.card.id);
@@ -9574,11 +9615,12 @@ export function createTurnLoop(
 						filed.push(child.id);
 						if (blocker.kind === "deployment")
 							questions.push(`${blocker.question} (card #${child.id})`);
-						// A card filed in this pass joins the index: two leads with one
-						// fingerprint file once, also when no card held the value before.
-						if (fp !== null) {
-							const fresh = await st.store.getTask(child.id);
-							if (fresh !== null) {
+						// A card filed in this pass joins both indexes: two leads with one
+						// fingerprint or one title file once, also when no card held it before.
+						const fresh = await st.store.getTask(child.id);
+						if (fresh !== null) {
+							indexTitle(fresh);
+							if (fp !== null) {
 								const list = byFingerprint.get(fp);
 								if (list === undefined) byFingerprint.set(fp, [fresh]);
 								else list.push(fresh);

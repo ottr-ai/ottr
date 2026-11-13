@@ -25572,6 +25572,136 @@ describe("stored review findings", () => {
 		expect(reviewAfter.details).toContain(`already open: #${filed.id}`);
 	});
 
+	test("a lead without a fingerprint whose title is on an open lead card is not filed again", async () => {
+		const record = baseRecord();
+		const lead = mkFinding(
+			"Needs validation: flaky retry on push\nOpen fact: the push can double-send.",
+		);
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+		// Case and whitespace differ; the title key still matches.
+		const old = await store.createTask(
+			"needs  VALIDATION:  flaky retry on push \nOlder body text.",
+		);
+		await store.updateTask(old.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+		const countBefore = (await store.listTasks()).length;
+
+		await loop.runTurn(store.name, review.id);
+
+		expect(await kidsOf(store, review.id)).toHaveLength(0);
+		expect((await store.listTasks()).length).toBe(countBefore);
+		expect((await store.getTask(old.id))!.details).toMatch(
+			new RegExp(
+				`Seen again in review ${review.id} on \\d{4}-\\d{2}-\\d{2}\\.$`,
+			),
+		);
+		const reviewAfter = (await store.getTask(review.id))!;
+		expect(reviewAfter.details).toContain(`already open: #${old.id}`);
+	});
+
+	test("a title match on a done or cancelled lead card files the lead again", async () => {
+		const record = baseRecord();
+		const lead = mkFinding("Needs validation: flaky retry on push");
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+		const done = await store.createTask(lead.prompt);
+		await store.updateTask(done.id, { stage: "done", state: "idle" });
+		const cancelled = await store.createTask(lead.prompt);
+		await store.updateTask(cancelled.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			cancelledAt: Date.now(),
+		});
+
+		await loop.runTurn(store.name, review.id);
+
+		const kids = await kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt)).toEqual([lead.prompt]);
+		expect(kids[0]!.details).not.toContain("came back");
+		expect((await store.getTask(cancelled.id))!.details ?? "").not.toContain(
+			"Seen again",
+		);
+	});
+
+	test("two fingerprint-less leads with one title file once", async () => {
+		const record = baseRecord();
+		const first = mkFinding("Needs validation: flaky retry on push");
+		const second = mkFinding(
+			"Needs validation:   flaky retry on PUSH\nOther wording of the body.",
+		);
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), first, second],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+
+		await loop.runTurn(store.name, review.id);
+
+		const kids = await kidsOf(store, review.id);
+		expect(kids.map((k) => k.prompt)).toEqual([first.prompt]);
+		expect(kids[0]!.details).toContain(`Seen again in review ${review.id}`);
+	});
+
+	test("an open card with the same title but another fingerprint does not block a fingerprinted lead", async () => {
+		const record = baseRecord();
+		const lead = mkFinding(
+			"Needs validation: flaky retry on push\nFingerprint: fp-a",
+		);
+		const { store, loop } = await storedReviewSetup(
+			record,
+			[mkFinding("Bug 1", 1), lead],
+			runResult({
+				outcome: { status: "answered", summary: "review done" },
+			}),
+			[verdicts([1, false, "not real"])],
+			{ maxTotalRuns: () => null },
+		);
+		const review = await reviewCard(store);
+		const other = await store.createTask(
+			"Needs validation: flaky retry on push\nFingerprint: fp-b",
+		);
+		await store.updateTask(other.id, {
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+		});
+
+		await loop.runTurn(store.name, review.id);
+
+		expect((await kidsOf(store, review.id)).map((k) => k.prompt)).toEqual([
+			lead.prompt,
+		]);
+		expect((await store.getTask(other.id))!.details ?? "").not.toContain(
+			"Seen again",
+		);
+	});
+
 	test("deployment-fact leads file one question card; sandbox leads note the sandbox", async () => {
 		const record = baseRecord();
 		const confirmed = Array.from({ length: 12 }, (_, i) =>

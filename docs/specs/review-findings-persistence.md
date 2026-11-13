@@ -146,7 +146,7 @@ unchanged).
 - The lead prompt carries the record's fingerprint on one fixed line:
   `Fingerprint: <value>`. The board reads it with one strict pattern: a line that
   starts with the exact prefix `Fingerprint: `, value = the trimmed rest of that
-  line. A lead without the line files as today (no fallback patterns).
+  line. A lead without the line falls back to the title dedupe below.
 - Before the board files a lead, it looks in the same project's cards for one
   whose prompt carries the same fingerprint value. Among several matches the
   lowest card id decides, with priority: open (not done, not cancelled), then
@@ -166,8 +166,26 @@ unchanged).
 
 The review prompt does not yet tell the reviewer to write the fixed line
 (`src/prompts.ts` wording changes need the user's approval). Until the wording
-lands, most leads carry no line and file as today; the dedupe activates lead by
-lead as prompts start carrying it.
+lands, most leads carry no line, and the title dedupe below applies to them.
+
+#### Lead title dedupe
+
+A lead with no fingerprint match must not file a second card for a topic that an
+open lead card already holds (OTTR-929).
+
+- Title key: the first line of the prompt, lower case, each run of whitespace
+  changed to one space, trimmed.
+- The index holds only open cards (not done, not cancelled) whose title key
+  starts with `needs validation`. Among several, the lowest card id decides.
+  Done and cancelled cards never block a lead by title.
+- The board uses the title index when the fingerprint lookup finds no open or
+  cancelled card. A title match counts only when the lead or the matched card
+  carries no `Fingerprint:` line: two different fingerprints are two records.
+- A title match acts like an open fingerprint match: no new card, the
+  `Seen again in review <review id> on <YYYY-MM-DD>.` line on the open card, and
+  `- already open: #<card id> (<prompt head>)` on the review's Findings trail.
+- A card filed for a lead joins the title index for the rest of the same pass,
+  so two leads with one title file once.
 
 ### 5. research-report.md survives the worktree
 
@@ -254,7 +272,13 @@ before the run resolves.
 6. turn (OTTR-870): a lead whose `Fingerprint:` line matches an open card files
    no new card, and that card's details gain `Seen again in review <id> on
    <date>.`; a cancelled match files nothing; a done match files a new card
-   whose details name the old card; a lead without the line files as today.
+   whose details name the old card; a lead without the line falls back to the
+   title dedupe.
+6a. turn (OTTR-929): a lead without a fingerprint whose title key matches an
+   open lead card files no new card, and the task count stays the same; a done
+   or cancelled title match files the lead; two leads with one title file once;
+   a same-title open card with another fingerprint does not block a
+   fingerprinted lead.
 7. turn: a review with two deployment-fact leads and one sandbox-run lead files
    three backlog cards and one question card with two questions; the sandbox
    card's details say it waits for a validation sandbox; each question text ends
@@ -277,8 +301,8 @@ before the run resolves.
   ready report for approval (hard stop 3) and lands in a later change after
   approval; until then the sorting machinery stays dormant.
 - No validation sandbox; sandbox-run leads keep waiting for one.
-- No change to leads that already exist, and no fingerprint duplicate rule (a
-  separate card owns dedupe of open lead cards).
+- No change to leads that already exist (OTTR-929 adds the title dedupe of new
+  leads against open lead cards).
 - No recovery of findings lost before this change; no parsing of omp session
   files.
 - No unverified marker column or UI badge; the mark is the card's details text.
