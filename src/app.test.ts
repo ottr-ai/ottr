@@ -103,6 +103,7 @@ import { prFeedbackReason } from "./supervisor.ts";
 import fc from "./test/properties.ts";
 import type { TmpDiskSpace } from "./tmpsweep.ts";
 import { formatBytes } from "./tmpsweep.ts";
+import { parseTrending, TRENDING_PAGES } from "./trending.ts";
 import {
 	cancelKeptReason,
 	FORK_HOLD_REASON,
@@ -3451,6 +3452,160 @@ describe("trending scout routes", () => {
 		expect(res.status).toBe(409);
 		expect(await errorOf(res)).toBe("no project has the trending scout on");
 		expect(fetched).toEqual([]);
+	});
+});
+
+describe("trending scan host", () => {
+	const opened: ProjectStore[] = [];
+	afterAll(async () => {
+		for (const s of opened) await closeTestStore(s);
+	});
+
+	const [ALL_URL, TS_URL, JS_URL] = TRENDING_PAGES as [string, string, string];
+	const PAGES: Record<string, string> = {
+		[ALL_URL]: readFileSync(
+			join(import.meta.dir, "fixtures", "trending", "all.html"),
+			"utf8",
+		),
+		[TS_URL]: readFileSync(
+			join(import.meta.dir, "fixtures", "trending", "typescript.html"),
+			"utf8",
+		),
+		[JS_URL]: readFileSync(
+			join(import.meta.dir, "fixtures", "trending", "javascript.html"),
+			"utf8",
+		),
+	};
+	const UNION = [
+		...new Set(Object.values(PAGES).flatMap((h) => parseTrending(h))),
+	];
+	/** Every REST call one scan makes for the fixture union: meta, readme, tree per repo. */
+	const expectedRestUrls = () =>
+		new Set(
+			UNION.flatMap((r) => [
+				`https://api.github.com/repos/${r}`,
+				`https://api.github.com/repos/${r}/readme`,
+				`https://api.github.com/repos/${r}/git/trees/main?recursive=1`,
+			]),
+		);
+
+	/** One opted-in project and a fetch stub recording every call's URL and auth header. */
+	const setup = async () => {
+		const dir = mkdtempSync(join(root, "trending-host-"));
+		const store = await ProjectStore.open(dir);
+		opened.push(store);
+		await store.setSettings({ trendingScout: true });
+		const entry: Entry = {
+			path: dir,
+			name: "tr",
+			store,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		const calls: { url: string; auth: string | null }[] = [];
+		const trendingFetch = (async (
+			input: string | URL | Request,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			calls.push({
+				url,
+				auth: new Headers(init?.headers).get("authorization"),
+			});
+			const page = PAGES[url];
+			if (page !== undefined) return new Response(page, { status: 200 });
+			const m =
+				/^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)(\/readme|\/git\/trees\/main\?recursive=1)?$/.exec(
+					url,
+				);
+			if (!m) return Response.json({ message: "Not Found" }, { status: 404 });
+			const repo = m[1] as string;
+			if (m[2] === "/readme")
+				return new Response(`# ${repo}\n`, { status: 200 });
+			if (m[2])
+				return Response.json({
+					tree: [{ path: "README.md", type: "blob" }],
+					truncated: false,
+				});
+			return Response.json({
+				full_name: repo,
+				description: `about ${repo}`,
+				stargazers_count: 42,
+				language: "TypeScript",
+				license: { spdx_id: "MIT" },
+				pushed_at: "2026-11-01T00:00:00Z",
+				archived: false,
+				default_branch: "main",
+				html_url: `https://github.com/${repo}`,
+			});
+		}) as typeof fetch;
+		const m = await mount({
+			projects: new Map([["tr", entry]]),
+			trendingFetch,
+		});
+		return { m, calls };
+	};
+
+	test("a board on an enterprise host scans public api.github.com without a token", async () => {
+		const saved = {
+			host: process.env.OTTR_GITHUB_HOST,
+			token: process.env.GH_TOKEN,
+		};
+		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
+		process.env.GH_TOKEN = "enterprise-token";
+		try {
+			const { m, calls } = await setup();
+			const res = await m.call("/api/trending/scan", {});
+			expect(res.status).toBe(200);
+			// The scan filed one scout card: every fixture repo resolved.
+			const body = (await res.json()) as { filed: string[] };
+			expect(body.filed).toHaveLength(1);
+			// Every REST lookup hit exactly its public URL, and no call carried a token.
+			const rest = calls.filter((c) => PAGES[c.url] === undefined);
+			expect(new Set(rest.map((c) => c.url))).toEqual(expectedRestUrls());
+			for (const c of calls) expect(c.auth).toBeNull();
+		} finally {
+			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = saved.host;
+			if (saved.token === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = saved.token;
+		}
+	});
+
+	test("a board on github.com sends GH_TOKEN with the scan's REST calls", async () => {
+		const saved = {
+			host: process.env.OTTR_GITHUB_HOST,
+			token: process.env.GH_TOKEN,
+		};
+		delete process.env.OTTR_GITHUB_HOST;
+		process.env.GH_TOKEN = "board-token";
+		try {
+			const { m, calls } = await setup();
+			const res = await m.call("/api/trending/scan", {});
+			expect(res.status).toBe(200);
+			const rest = calls.filter((c) => PAGES[c.url] === undefined);
+			expect(new Set(rest.map((c) => c.url))).toEqual(expectedRestUrls());
+			for (const c of calls)
+				expect(c.auth).toBe(
+					c.url.startsWith("https://api.github.com/")
+						? "Bearer board-token"
+						: null,
+				);
+		} finally {
+			if (saved.host === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = saved.host;
+			if (saved.token === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = saved.token;
+		}
 	});
 });
 

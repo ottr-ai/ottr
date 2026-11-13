@@ -2924,8 +2924,8 @@ export async function createApp(deps: AppDeps) {
 			deps.gstore.update<TrendingState>("trending", (current) =>
 				modify(normalizeTrendingState(current)),
 			),
-		token: () => process.env.GH_TOKEN,
-		apiBase: () => githubHost().apiBase,
+		// No token and apiBase here: trending is a github.com feature, so the scan reads
+		// api.github.com and lends GH_TOKEN only on a github.com board (upstreamToken).
 		fetch: deps.trendingFetch,
 		now,
 		log: (msg: string) => console.log(`[trending] ${msg}`),

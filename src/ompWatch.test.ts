@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpawnFn } from "./forkAnalysis.ts";
+import { upstreamToken } from "./githubHost.ts";
 import {
 	bumpTarget,
 	compareVersions,
@@ -19,7 +20,6 @@ import {
 	parseVerdict,
 	reviewMessage,
 	UPSTREAM_API_BASE,
-	upstreamToken,
 } from "./ompWatch.ts";
 import { OMP_REVIEW_INSTRUCTIONS } from "./prompts.ts";
 import { ProjectStore } from "./store.ts";

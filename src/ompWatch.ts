@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { clean, runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import type { ForkProject } from "./forks.ts";
-import { githubHost } from "./githubHost.ts";
+import { upstreamToken } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
 import {
 	OMP_REVIEW_INSTRUCTIONS,
@@ -280,17 +280,6 @@ type Notes = { kind: "notes"; body: string } | { kind: "missing" };
 
 /** omp's upstream releases live on public github.com, whatever host the board uses. */
 export const UPSTREAM_API_BASE = "https://api.github.com";
-
-/**
- * The token for the upstream release fetch: GH_TOKEN only when the board's own host is
- * github.com. An enterprise host's token never goes to github.com; the public release
- * endpoint then runs without a token.
- */
-export function upstreamToken(
-	env: Record<string, string | undefined> = process.env,
-): string | undefined {
-	return githubHost(env).isDefault ? env.GH_TOKEN : undefined;
-}
 
 export function createOmpWatcher(deps: {
 	projects: () => Iterable<ForkProject>;

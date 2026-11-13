@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { writeBelow } from "./confine.ts";
+import { upstreamToken } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
 import { trendingScoutPrompt } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
@@ -189,7 +190,9 @@ export function createTrendingScanner(deps: {
 	update: (
 		modify: (current: TrendingState) => TrendingState,
 	) => Promise<TrendingState>;
-	token: () => string | undefined;
+	/** The board token; defaults to upstreamToken: GH_TOKEN only on a github.com board. */
+	token?: () => string | undefined;
+	/** Test seam only; production reads https://api.github.com (trending is a github.com feature). */
 	apiBase?: () => string;
 	fetch?: typeof fetch;
 	now?: () => number;
@@ -241,7 +244,7 @@ export function createTrendingScanner(deps: {
 		return repos;
 	}
 
-	/** GET on the REST API with the board token; redirects are refused so the token never follows a hop. */
+	/** GET on the REST API; redirects are refused so the token never follows a hop. */
 	async function api(path: string, accept: string): Promise<Response> {
 		const base = (deps.apiBase?.() ?? "https://api.github.com").replace(
 			/\/+$/,
@@ -249,7 +252,7 @@ export function createTrendingScanner(deps: {
 		);
 		const url = `${base}${path}`;
 		const headers: Record<string, string> = { accept, "user-agent": "ottr" };
-		const token = deps.token();
+		const token = (deps.token ?? upstreamToken)();
 		if (token) headers.authorization = `Bearer ${token}`;
 		try {
 			return await doFetch(url, {

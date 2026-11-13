@@ -114,6 +114,18 @@ export function ghEnvFor(
 }
 
 /**
+ * The token for fetches of public github.com data (trending repos, omp's upstream
+ * releases): GH_TOKEN only when the board's own host is github.com. An enterprise host's
+ * token belongs to that host and never goes to github.com; the public endpoint then runs
+ * without a token.
+ */
+export function upstreamToken(
+	env: Record<string, string | undefined> = process.env,
+): string | undefined {
+	return githubHost(env).isDefault ? env.GH_TOKEN : undefined;
+}
+
+/**
  * Case-insensitive matcher for the configured host at a URL authority boundary. The
  * lookbehind keeps a suffix from matching ("ghe.com" inside "acme.ghe.com"), so only a
  * remote on the host itself counts.
