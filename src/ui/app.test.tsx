@@ -81,6 +81,7 @@ const {
 	skillGapNote,
 	appInboxMeta,
 	AppInboxBell,
+	AppInboxPanel,
 } = await import("./app.tsx");
 const {
 	monogram,
@@ -11037,8 +11038,107 @@ describe("AppInboxBell badge", () => {
 		);
 		expect(meta.inbox.lit).toBe(false);
 		const html = bell(meta);
+		// The dim count on a grey bell keys on data-level="info" (app.css).
+		expect(html).toContain('data-level="info"');
 		expect(html).toContain('class="icon inbox"');
 		expect(html).not.toContain("icon inbox lit");
 		expect(html).toContain('<span class="inbox-n">6</span>');
+	});
+});
+
+describe("Inbox panel ack footer", () => {
+	// The panel renders every section from null keys and empty lists, so the
+	// footer button is the only stateful markup under test.
+	const panelBase = {
+		error: null,
+		critKey: null,
+		needTasks: [],
+		askCards: [],
+		prActivity: [],
+		alarmCount: 0,
+		updatesKey: null,
+		updateCount: 0,
+		isNew: () => false,
+		notice: null,
+		noticeKey: null,
+		orphansError: null,
+		drainNotice: false,
+		drainKey: null,
+		drainCommits: [],
+		behind: 0,
+		behindKey: null,
+		behindCommits: [],
+		restartWait: null,
+		restartWaitKey: null,
+		seedFailed: null,
+		seedFailKey: null,
+		provisionError: null,
+		provisionErrKey: null,
+		state: null,
+		warnings: [],
+		orphanList: [],
+		orphansErrorKey: null,
+		orphansKey: null,
+		keptCount: { held: 0, stale: 0 },
+		keptKey: null,
+		alatePendingKey: null,
+		signinAdvisories: [],
+		projects: [],
+		nowMs: 0,
+		openTask: () => {},
+		ackInbox: () => {},
+		setShowUpdates: () => {},
+		setError: () => {},
+		setNotice: () => {},
+	};
+	const askedMeta = (ackedCount: number) => {
+		const ask = Array.from({ length: 18 }, (_, n) =>
+			cardFixture({ id: `ask${n}` }),
+		);
+		const probe = appInboxMeta(
+			null,
+			new Set<string>(),
+			null,
+			null,
+			[],
+			ask,
+			[],
+			[],
+			[],
+			0,
+			"",
+		);
+		const ackLocal = new Set(
+			probe.entries.slice(probe.entries.length - ackedCount).map((e) => e.key),
+		);
+		return appInboxMeta(null, ackLocal, null, null, [], ask, [], [], [], 0, "");
+	};
+	const footerButton = (meta: ReturnType<typeof appInboxMeta>) => {
+		const html = renderToStaticMarkup(
+			<AppInboxPanel
+				{...panelBase}
+				entries={meta.entries}
+				inbox={meta.inbox}
+			/>,
+		);
+		const { window } = new Window({ url: "http://localhost/" });
+		window.document.body.innerHTML = html;
+		const btn = window.document.querySelector("#inbox .inbox-foot button");
+		if (btn === null) throw new Error("the ack footer button did not render");
+		// React renders disabled="" for true and drops the attribute for false.
+		return btn.getAttribute("disabled") !== null;
+	};
+
+	test("18 read asked entries keep the bell lit but disable Mark all as read", () => {
+		const meta = askedMeta(18);
+		expect(meta.inbox.lit).toBe(true);
+		expect(meta.inbox.fresh.length).toBe(0);
+		expect(footerButton(meta)).toBe(true);
+	});
+
+	test("a fresh entry enables Mark all as read", () => {
+		const meta = askedMeta(17);
+		expect(meta.inbox.fresh.length).toBe(1);
+		expect(footerButton(meta)).toBe(false);
 	});
 });

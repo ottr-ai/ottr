@@ -139,7 +139,9 @@ const LEVELS: readonly InboxLevel[] = ["crit", "needs", "asked", "info"];
 
 /** What the bar bell shows. `fresh` = unacknowledged entries; lit while an action-required
  *  entry (any level but info) stands — acknowledged or not — or while any entry is fresh;
- *  `level` is the most urgent level of that standing pool; null when there is none. */
+ *  `level` is the most urgent level of that standing pool, else the most urgent of all
+ *  entries, so a grey bell with read notices keeps the dim data-level its count styles
+ *  key on; null when there are no entries. */
 export function inboxView(
 	entries: readonly InboxEntry[],
 	seen: ReadonlySet<string>,
@@ -155,11 +157,12 @@ export function inboxView(
 	const standing = entries.filter(
 		(e) => e.level !== "info" || !seen.has(e.key),
 	);
+	const pool = standing.length > 0 ? standing : entries;
 	return {
 		total: entries.length,
 		fresh,
 		lit: standing.length > 0,
-		level: LEVELS.find((l) => standing.some((e) => e.level === l)) ?? null,
+		level: LEVELS.find((l) => pool.some((e) => e.level === l)) ?? null,
 	};
 }
 

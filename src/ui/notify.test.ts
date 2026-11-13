@@ -109,11 +109,11 @@ test("inboxView: an acknowledged needs entry keeps the bell lit at its level", (
 	expect(v.level).toBe("needs");
 });
 
-test("inboxView: only read notices leave the bell grey with no level", () => {
+test("inboxView: only read notices leave the bell grey at the info level", () => {
 	const entries = [entry("notice:a", "info"), entry("notice:b", "info")];
 	const v = inboxView(entries, new Set(["notice:a", "notice:b"]));
 	expect(v.lit).toBe(false);
-	expect(v.level).toBe(null);
+	expect(v.level).toBe("info");
 	expect(v.total).toBe(2);
 	expect(v.fresh).toEqual([]);
 });

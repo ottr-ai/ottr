@@ -14784,7 +14784,7 @@ export function AppInboxBell({
 
 /** The board's notification popover: critical line, alarm groups, the upstream-updates
  * entry, notices, advisories, and the ack footer. */
-function AppInboxPanel(p: {
+export function AppInboxPanel(p: {
 	error: string | null;
 	critKey: string | null;
 	needTasks: TaskCard[];
@@ -15028,7 +15028,7 @@ function AppInboxPanel(p: {
 				<div className="inbox-foot">
 					<button
 						type="button"
-						disabled={!inbox.lit}
+						disabled={inbox.fresh.length === 0}
 						onClick={() => ackInbox(entries.map((e) => e.key))}
 					>
 						Mark all as read
