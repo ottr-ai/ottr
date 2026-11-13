@@ -848,7 +848,7 @@ const supervisor = createSupervisor(
 // initialization and crashes the boot (OTTR-904 screenshot run). The
 // loop.schedule() after loop.recoverRestarted() below starts the re-queued
 // cards.
-replayGateParks(projects.values(), {
+await replayGateParks(projects.values(), {
 	kvGet: (key) => gstore.get(key),
 	kvSet: (key, value) => gstore.set(key, value),
 	log: (line) => console.log(`prompt gate replay: ${line}`),

@@ -469,21 +469,21 @@ export function gateAssumptionsBlock(gate: PromptGateState | null): string {
  * stamp short-circuits the next start, so a re-parked card never loops through a
  * second replay. A crash mid-pass replays once more on the next start; every card
  * still gets at most one replay per pass. Returns the re-queued count. */
-export function replayGateParks(
+export async function replayGateParks(
 	projects: Iterable<{ name: string; store: ProjectStore }>,
 	o: {
 		kvGet(key: string): unknown;
 		kvSet(key: string, value: unknown): void;
 		log(line: string): void;
 	},
-): number {
+): Promise<number> {
 	if (o.kvGet("promptGateReplay") !== null) {
 		o.log("already replayed");
 		return 0;
 	}
 	let count = 0;
 	for (const { store } of projects) {
-		for (const task of store.listTasks()) {
+		for (const task of await store.listTasks()) {
 			if (
 				task.state !== "needs_you" ||
 				task.needsReason?.startsWith(GATE_REASON) !== true ||
@@ -491,7 +491,7 @@ export function replayGateParks(
 				!(task.pendingPrompt === null || task.pendingPrompt === ".")
 			)
 				continue;
-			store.updateTask(task.id, {
+			await store.updateTask(task.id, {
 				state: "queued",
 				queuedAt: Date.now(),
 				needsReason: null,

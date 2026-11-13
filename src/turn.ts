@@ -8044,7 +8044,7 @@ export function createTurnLoop(
 		// text, so it keeps the user title and the gate judges it (OTTR-904).
 		// Without a mid-run steer the rebuilt queue carries only raw's text and
 		// keeps raw's authorship; a null behaves as user.
-		const live = st.store.getTask(st.id);
+		const live = await st.store.getTask(st.id);
 		const steerLanded =
 			live?.pendingPrompt !== null &&
 			live?.pendingPrompt !== undefined &&

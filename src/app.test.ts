@@ -9226,10 +9226,10 @@ describe("merge anyway (OTTR-28)", () => {
 	});
 
 	test("a send-back under a queued user steer keeps the user title", async () => {
-		const t = parked();
+		const t = await parked();
 		// A user steer is already queued when the check's send-back lands under it:
 		// the queue holds user text, so the gate must keep judging it (OTTR-904).
-		store.updateTask(t.id, {
+		await store.updateTask(t.id, {
 			pendingPrompt: "also tighten the docs",
 			pendingBy: "user",
 		});
@@ -9237,7 +9237,7 @@ describe("merge anyway (OTTR-28)", () => {
 			text: "Send it back",
 		});
 		expect(res.status).toBe(200);
-		const row = store.getTask(t.id)!;
+		const row = (await store.getTask(t.id))!;
 		expect(row.pendingBy).toBe("user");
 		// The send-back lands under the queued steer, so the steer text leads.
 		expect(row.pendingPrompt).toStartWith("also tighten the docs\n\n");

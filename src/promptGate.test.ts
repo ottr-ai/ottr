@@ -630,12 +630,12 @@ describe("gateAssumptionsBlock", () => {
 });
 
 describe("replayGateParks", () => {
-	const parkedCard = (
+	const parkedCard = async (
 		store: ProjectStore,
 		o: { pending?: string | null } = {},
-	): string => {
-		const t = store.createTask("old park");
-		store.updateTask(t.id, {
+	): Promise<string> => {
+		const t = await store.createTask("old park");
+		await store.updateTask(t.id, {
 			state: "needs_you",
 			needsReason: `${GATE_REASON}the gate still has open questions`,
 			asked: [
@@ -672,17 +672,17 @@ describe("replayGateParks", () => {
 			lines,
 		};
 	};
-	const open = (): ProjectStore =>
+	const open = async (): Promise<ProjectStore> =>
 		ProjectStore.open(mkdtempSync(join(tmpdir(), "gate-replay-")));
 
-	test("parked gate cards in two projects re-queue once and the stamp lands", () => {
-		const a = open();
-		const idA = parkedCard(a);
-		const b = open();
-		const idB = parkedCard(b);
+	test("parked gate cards in two projects re-queue once and the stamp lands", async () => {
+		const a = await open();
+		const idA = await parkedCard(a);
+		const b = await open();
+		const idB = await parkedCard(b);
 		const h = harness();
 
-		const count = replayGateParks(
+		const count = await replayGateParks(
 			[
 				{ name: a.name, store: a },
 				{ name: b.name, store: b },
@@ -695,7 +695,7 @@ describe("replayGateParks", () => {
 			[a, idA],
 			[b, idB],
 		] as const) {
-			const after = store.getTask(id)!;
+			const after = (await store.getTask(id))!;
 			expect(after.state).toBe("queued");
 			expect(after.needsReason).toBeNull();
 			expect(after.asked).toBeNull();
@@ -709,31 +709,31 @@ describe("replayGateParks", () => {
 		}
 		expect(typeof h.kv.get("promptGateReplay")).toBe("string");
 		expect(h.lines.join("\n")).toContain("re-queued 2");
-		a.close();
-		b.close();
+		await a.close();
+		await b.close();
 	});
 
-	test("a parked card with a queued answer stays parked", () => {
-		const store = open();
-		const id = parkedCard(store, { pending: "use Postgres" });
+	test("a parked card with a queued answer stays parked", async () => {
+		const store = await open();
+		const id = await parkedCard(store, { pending: "use Postgres" });
 		const h = harness();
 
-		const count = replayGateParks([{ name: store.name, store }], h.o);
+		const count = await replayGateParks([{ name: store.name, store }], h.o);
 
 		expect(count).toBe(0);
-		const after = store.getTask(id)!;
+		const after = (await store.getTask(id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.pendingPrompt).toBe("use Postgres");
 		expect(after.gate?.parked).toBe(true);
 		// The stamp lands even on an empty pass: the replay runs once, ever.
 		expect(typeof h.kv.get("promptGateReplay")).toBe("string");
-		store.close();
+		await store.close();
 	});
 
-	test("a non-gate needs_you card is untouched", () => {
-		const store = open();
-		const plain = store.createTask("a question card");
-		store.updateTask(plain.id, {
+	test("a non-gate needs_you card is untouched", async () => {
+		const store = await open();
+		const plain = await store.createTask("a question card");
+		await store.updateTask(plain.id, {
 			state: "needs_you",
 			needsReason: "Wants your answer",
 			asked: [
@@ -745,27 +745,27 @@ describe("replayGateParks", () => {
 				},
 			],
 		});
-		const gateId = parkedCard(store);
+		const gateId = await parkedCard(store);
 		const h = harness();
 
-		const count = replayGateParks([{ name: store.name, store }], h.o);
+		const count = await replayGateParks([{ name: store.name, store }], h.o);
 
 		expect(count).toBe(1);
-		const untouched = store.getTask(plain.id)!;
+		const untouched = (await store.getTask(plain.id))!;
 		expect(untouched.state).toBe("needs_you");
 		expect(untouched.needsReason).toBe("Wants your answer");
-		expect(store.getTask(gateId)!.state).toBe("queued");
-		store.close();
+		expect((await store.getTask(gateId))!.state).toBe("queued");
+		await store.close();
 	});
 
-	test("the stamp makes a second call a no-op, even for a freshly parked card", () => {
-		const store = open();
-		const id = parkedCard(store);
+	test("the stamp makes a second call a no-op, even for a freshly parked card", async () => {
+		const store = await open();
+		const id = await parkedCard(store);
 		const h = harness();
-		expect(replayGateParks([{ name: store.name, store }], h.o)).toBe(1);
+		expect(await replayGateParks([{ name: store.name, store }], h.o)).toBe(1);
 
 		// The replay freed the card and it parked again under the new rule.
-		store.updateTask(id, {
+		await store.updateTask(id, {
 			state: "needs_you",
 			needsReason: `${GATE_REASON}the gate still has open questions`,
 			gate: {
@@ -777,11 +777,11 @@ describe("replayGateParks", () => {
 			},
 		});
 
-		expect(replayGateParks([{ name: store.name, store }], h.o)).toBe(0);
+		expect(await replayGateParks([{ name: store.name, store }], h.o)).toBe(0);
 		expect(h.lines.join("\n")).toContain("already replayed");
-		const after = store.getTask(id)!;
+		const after = (await store.getTask(id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.gate?.parked).toBe(true);
-		store.close();
+		await store.close();
 	});
 });

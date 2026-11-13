@@ -7670,6 +7670,16 @@ describe("package list", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		const mid = (await store.getTask(task.id))!;
+		console.log(
+			"MIDPROBE",
+			JSON.stringify({
+				state: mid.state,
+				by: mid.pendingBy,
+				pending: mid.pendingPrompt,
+				reason: mid.needsReason,
+				retryPrompt: record.runs.at(-1)?.prompt?.includes("take theirs"),
+			}),
+		);
 		expect(mid.state).toBe("queued");
 		expect(mid.pendingPrompt).toBe("please merge"); // the reply never reached the session
 		await loop.runTurn(store.name, task.id);
@@ -25839,20 +25849,21 @@ describe("prompt gate", () => {
 
 	test("a supervisor send-back never runs the gate; a user reply does", async () => {
 		let calls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return clearCheck();
 			},
 		});
-		const task = store.createTask("clear work");
+		const task = await store.createTask("clear work");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.gate?.hash).not.toBeNull();
+		expect((await store.getTask(task.id))!.gate?.hash).not.toBeNull();
 		expect(calls).toBe(1);
 		// The work check's send-back requeues the card with supervisor text: the next
 		// start must skip by hash, run no gate model call, and still deliver the text.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
+			stage: "in_progress", // the reply reopens the finished card
 			state: "queued",
 			queuedAt: Date.now(),
 			pendingPrompt:
@@ -25861,11 +25872,34 @@ describe("prompt gate", () => {
 		});
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toBe(1);
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
+		const { pickRunnable } = await import("./scheduler.ts");
+		const tasks = await store.listTasks();
+		const mine = tasks.find((t) => t.id === task.id)!;
+		console.log(
+			"P1R",
+			JSON.stringify({
+				reason: after.needsReason,
+				state: after.state,
+				stage: mine.stage,
+				kind: mine.kind,
+				holdUntil: mine.holdUntil,
+				queuedAt: mine.queuedAt,
+				pick: pickRunnable(tasks, {
+					maxParallel: null,
+					hasRules: true,
+					only: undefined,
+					mainUnpushed: false,
+					prMode: false,
+					crossDeps: () => null,
+				}).map((t) => t.id),
+			}),
+		);
 		expect(after.state).toBe("idle");
 		expect(after.gate?.parked).toBe(false);
 		// A user reply keeps the gate: the model judges prompt plus reply.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
+			stage: "in_progress",
 			state: "queued",
 			queuedAt: Date.now(),
 			pendingPrompt: "use Postgres",
@@ -25877,30 +25911,31 @@ describe("prompt gate", () => {
 
 	test("a user reply on a queued send-back runs the gate", async () => {
 		let calls = 0;
-		const { store, loop } = setup({
+		const { store, loop } = await setup({
 			commitsAhead: async () => 0,
 			gateCheck: async () => {
 				calls += 1;
 				return clearCheck();
 			},
 		});
-		const task = store.createTask("clear work");
+		const task = await store.createTask("clear work");
 		await loop.runTurn(store.name, task.id);
-		expect(store.getTask(task.id)!.gate?.hash).not.toBeNull();
+		expect((await store.getTask(task.id))!.gate?.hash).not.toBeNull();
 		expect(calls).toBe(1);
 		// The send-back queues supervisor text, and the user answers it: the reply
 		// route queues through replyPatch, so the queue now holds user text and
 		// the gate must judge prompt plus queue.
-		store.updateTask(task.id, {
+		await store.updateTask(task.id, {
+			stage: "in_progress",
 			state: "queued",
 			queuedAt: Date.now(),
 			pendingPrompt:
 				"The board's check run stopped at a blocker. Fix it and report ready again.",
 			pendingBy: "supervisor",
 		});
-		const live = store.getTask(task.id)!;
-		store.updateTask(task.id, replyPatch(live, "fix the README first"));
-		expect(store.getTask(task.id)!.pendingBy).toBe("user");
+		const live = (await store.getTask(task.id))!;
+		await store.updateTask(task.id, replyPatch(live, "fix the README first"));
+		expect((await store.getTask(task.id))!.pendingBy).toBe("user");
 		await loop.runTurn(store.name, task.id);
 		expect(calls).toBe(2);
 	});
@@ -26171,16 +26206,27 @@ describe("prompt gate", () => {
 	});
 
 	test("a model-restore requeue with a mid-run steer titles the queue user", async () => {
-		const { store, record, loop } = setup({
-			maxTotalRuns: () => 0, // each turn runs via a direct runTurn
-			workerTarget: { urls: ["http://worker-a:8787"] },
-			modelRoles: () => ({ default: "anthropic/claude-opus-5-5:medium" }),
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-				record.runs.push(o);
-				if (o.model === null || o.model === undefined) {
-					// A user steer lands mid-run: the run has consumed the queue,
-					// so applySteer writes just the steer, titled "user".
-					store.updateTask(task.id, {
+		let calls = 0;
+		let runs = 0;
+		const { store, loop } = await setup({
+			holdFollowUps: true, // each turn runs via a direct runTurn
+			commitsAhead: async () => 0,
+			gateCheck: async () => {
+				calls += 1;
+				return clearCheck();
+			},
+			startRun: async () => {
+				runs += 1;
+				if (runs === 1) {
+					// A user steer lands mid-run, after this turn consumed its
+					// queue: applySteer writes just the steer, titled "user".
+					// Then the run dies with a model-restore failure, and the
+					// settle rebuilds the queue from raw plus the steer.
+					for (let i = 0; i < 200; i++) {
+						const live = (await store.getTask(task.id))!;
+						if (live.pendingPrompt === null) break;
+					}
+					await store.updateTask(task.id, {
 						pendingPrompt: "take theirs",
 						pendingBy: "user",
 					});
@@ -26207,29 +26253,43 @@ describe("prompt gate", () => {
 				};
 			},
 		});
-		const task = store.createTask("merge please");
-		saveSession(store, "sess-9");
-		// The queue at turn start is a supervisor send-back; the settle rebuilds
-		// the queue from raw plus the mid-run steer and must not re-title it
-		// "supervisor" — the queue holds user text, so the gate judges it.
-		store.updateTask(task.id, {
-			stage: "merging",
-			state: "queued",
-			sessionId: "sess-9",
+		const task = await store.createTask("clear work");
+		// The queue at turn start is a supervisor send-back on a passed card; the
+		// hash covers prompt plus send-back, so run 1 skips the gate. The steer
+		// that lands mid-run must re-title the rebuilt queue "user", so the retry
+		// start judges prompt plus steer (one gate call).
+		await store.updateTask(task.id, {
+			gate: {
+				hash: gateFingerprint(
+					"clear work\n\nSend-back 1 of 4: fix and report ready again.",
+				),
+				seen: null,
+				fails: 0,
+				sig: null,
+				parked: false,
+			},
 			pendingPrompt: "Send-back 1 of 4: fix and report ready again.",
 			pendingBy: "supervisor",
+			state: "queued",
+			queuedAt: Date.now(),
 		});
 		await loop.runTurn(store.name, task.id);
-		const mid = store.getTask(task.id)!;
+		const mid = (await store.getTask(task.id))!;
 		expect(mid.state).toBe("queued");
 		expect(mid.pendingPrompt).toBe(
 			"Send-back 1 of 4: fix and report ready again.\n\ntake theirs",
 		);
 		expect(mid.pendingBy).toBe("user");
+		// The retry start judges prompt plus steer: one more gate call than run 1's.
 		await loop.runTurn(store.name, task.id);
+		for (let i = 0; i < 200; i++) {
+			const done = (await store.getTask(task.id))!;
+			if (done.stage === "done") break;
+		}
 		// The retry consumes the queue; the steer was delivered with the raw text.
-		const after = store.getTask(task.id)!;
+		const after = (await store.getTask(task.id))!;
 		expect(after.pendingPrompt).toBeNull();
+		expect(calls).toBe(2);
 	});
 });
 
@@ -26665,4 +26725,3 @@ describe("queue authorship (OTTR-904 send-back)", () => {
 		expect(patch.pendingBy).toBe("user");
 	});
 });
->>>>>>> 4584248 (fix: user text in the queue always reaches the prompt gate)
