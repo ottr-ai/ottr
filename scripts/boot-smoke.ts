@@ -121,6 +121,18 @@ symlinkSync(
 	"junction",
 );
 
+// The smoke boots the image's server, not this workstation's vm-runner wiring:
+// an ambient OTTR_VM_RUNNER_URL without its OTTR_WORKER_TOKEN makes the server
+// refuse to boot (src/runner.ts), which is ambient drift, not a boot defect.
+function smokeEnv(
+	extra: Record<string, string>,
+): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = { ...process.env, ...extra };
+	delete env.OTTR_VM_RUNNER_URL;
+	delete env.OTTR_WORKER_TOKEN;
+	return env;
+}
+
 const spawnServer = () =>
 	Bun.spawn(["bun", "src/server.ts"], {
 		cwd: imageDir,

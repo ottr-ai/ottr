@@ -385,6 +385,36 @@ for (let p = 0; p < PROJECTS; p++) {
 	turnTotal += tn;
 	eventTotal += te;
 	logLineTotal += perProjectTasks * logLinesPerTask;
+
+	// OTTR-884 send-back: the scheduler tick's real flag path (isClean,
+	// branchUnpushed, checkedOutBranch, targetTracksRules, archReviewDelta) must
+	// run over live repos during the measurement instead of failing into the
+	// keep-last-value catch, so every seeded project is a git repo with a clean
+	// main and an origin whose main matches. The origin lives outside the
+	// projects root: a bare repo under it would mount as a project itself.
+	const gitEnv = {
+		...process.env,
+		GIT_AUTHOR_NAME: "seed",
+		GIT_AUTHOR_EMAIL: "seed@ottr.local",
+		GIT_COMMITTER_NAME: "seed",
+		GIT_COMMITTER_EMAIL: "seed@ottr.local",
+		GIT_AUTHOR_DATE: "@1731500000 +0000",
+		GIT_COMMITTER_DATE: "@1731500000 +0000",
+	};
+	await Bun.$`git init -q -b main ${dir}`.env(gitEnv).quiet();
+	await Bun.write(
+		join(dir, "AGENTS.md"),
+		`# ${name}\n\nSeeded gate fixture.\n`,
+	);
+	await Bun.$`git -C ${dir} add -A`.env(gitEnv).quiet();
+	await Bun.$`git -C ${dir} commit -qm seed`.env(gitEnv).quiet();
+	const origin = join(board, "origins", `${name}.git`);
+	await Bun.$`git init -q --bare -b main ${origin}`.env(gitEnv).quiet();
+	await Bun.$`git -C ${dir} remote add origin ${origin}`.env(gitEnv).quiet();
+	await Bun.$`git -C ${dir} push -q origin main`.env(gitEnv).quiet();
+	await Bun.$`git -C ${dir} branch -q --set-upstream-to=origin/main main`
+		.env(gitEnv)
+		.quiet();
 }
 
 const ms = Date.now() - t0;
