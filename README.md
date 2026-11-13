@@ -483,6 +483,8 @@ CI runs check, tests, dependency audit, e2e, gitleaks and zizmor on every push; 
 
 For UI work use `bun run dev`: it seeds five demo projects in `.dev/` (a fresh root per start), starts no agents, and never touches a real board. A board whose pinned `OTTR_DEV_ROOT` is held by another board seeds its own root `.dev-<PORT>/` and prints a warning, so set a free `PORT` for it. It also backs `bun run readme-screenshot`, the one-command way to refresh the board screenshot under `.github/assets/`.
 
+Coarse-pointer controls keep a 44×44 CSS px minimum, including the meter button, Add draft, Help, and Done tools. Fine-pointer layouts keep their compact sizes. Check these controls at 320px and 375px in both themes. Exercise adjacent actions to check for overlap.
+
 ### Screenshot proofs for UI cards
 
 A UI change needs a picture of the new surface. `bun run dev` serves the demo board on port 5747 and touches no real board. Each start seeds its own fresh scratch root under `.dev/` (unless `OTTR_DEV_ROOT` pins it), so two boards in one checkout never share a seeded database.

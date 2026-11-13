@@ -5745,10 +5745,13 @@ dialog.confirm-dialog {
 	}
 }
 @media (pointer: coarse) {
-	.help-badge {
-		width: 32px;
-		height: 32px;
-		margin: -7px -7px -7px -3px;
+	.help-badge,
+	.sec-title .help-badge {
+		width: 44px;
+		height: 44px;
+		flex-shrink: 0;
+		margin: 0;
+		vertical-align: middle;
 	}
 }
 .state-chip {
@@ -8837,9 +8840,25 @@ button.log-mode[aria-pressed="true"] {
 	.add-tabs button,
 	.stage-tabs button,
 	.perf-range button,
+	.meters,
+	.lane-add,
+	.help-badge,
+	.lane-tools button,
 	.notif-line button.icon {
 		min-height: 44px;
 		min-width: 44px;
+	}
+	/* Done tools use layout space, with another row when the lane is too narrow. */
+	.stage[data-stage="done"] .stage-head,
+	.lane-tools {
+		flex-wrap: wrap;
+	}
+	.lane-tools {
+		max-width: 100%;
+	}
+	.lane-tools button {
+		flex-shrink: 0;
+		height: 44px;
 	}
 	/* The bar is 48px: the lit bell keeps its 44px hit area but paints a 32px plate,
 	   the same height as the other bar chrome, so it never touches the bar edges. */
