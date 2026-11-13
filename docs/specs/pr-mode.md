@@ -332,10 +332,14 @@ The park writes the `pending_feedback` flag with the prompt: it marks the
 queued text as supervisor-written reviewer data, not a user reply.
 `wentStale` ignores a flagged prompt, so the merge verdict, the merged done
 write and the closed park settle through it. A reply, a steer, an edit of
-the queued text, a session restart, and the turn dispatch clear the flag
-with the prompt, so user text keeps today's protection. The CI-failure
-reply on a feedback-parked card requeues a fix turn whose prompt holds the
-CI text first and the reviewer blocks after it, with the flag kept. When
+the queued text, and the turn dispatch clear the flag with the prompt, so
+user text keeps today's protection. The CI-failure reply on a
+feedback-parked card requeues a fix turn whose prompt holds the CI text
+first and the reviewer blocks after it, with the flag kept. A session
+restart on a feedback-parked card keeps the blocks under the session-lost
+text, clears the session, and queues a work fix turn with the flag kept;
+on a card without feedback it queues the session-lost text alone and
+clears the flag. When
 GitHub can merge a conflict-parked card that carries reviewer feedback,
 the card stays needs_you and takes the feedback reason with the blocks
 kept, so a reply still starts a fix turn; a conflict-parked card without
@@ -707,8 +711,10 @@ server remains the only writer of origin.
   feedback park with the blocks kept, and un-parks a conflict-parked card
   without feedback to idle. A CI failure on a feedback-parked card requeues
   a fix turn whose prompt holds the CI text and the reviewer blocks, with
-  the flag kept. A steer, an edit of the queued text, a session restart and
-  the turn dispatch clear the flag. A credential-shaped comment parks with
+  the flag kept. A steer, an edit of the queued text and the turn dispatch
+  clear the flag. A session restart on a feedback park keeps the blocks
+  under the session-lost text and queues a work fix turn; without feedback
+  it queues the lost-session ask alone. A credential-shaped comment parks with
   the author label and the `redacted: possible credential` marker only.
   Fresh and migrated databases converge on `pr_watch_at` and
   `pending_feedback`.

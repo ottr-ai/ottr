@@ -7059,13 +7059,15 @@ describe("steer edit route", () => {
 });
 
 describe("restart session route", () => {
-	test("a restart queues the lost-session ask and clears the feedback flag", async () => {
+	test("a restart on a feedback park queues a fix turn with the blocks", async () => {
 		const t = store.createTask("parked with feedback");
 		store.updateTask(t.id, {
+			stage: "merging",
 			state: "needs_you",
 			needsReason: prFeedbackReason(7),
 			sessionId: "sess-1",
-			pendingPrompt: "blocks",
+			pendingPrompt:
+				"REVIEW COMMENT by alice at 2026-11-01T12:00:00Z\n<<<DATA\nPlease fix the leak\nDATA>>>",
 			pendingBy: "supervisor",
 			pendingFeedback: true,
 		});
@@ -7075,12 +7077,35 @@ describe("restart session route", () => {
 		);
 		expect(res.status).toBe(200);
 		const after = store.getTask(t.id)!;
-		// A fresh session never answers the old park: the lost-session text is
-		// the new ask, and the reviewer blocks are gone with it.
-		expect(after.pendingPrompt).toBe(LOST_SESSION);
-		expect(after.pendingFeedback).toBe(false);
+		// The blocks ride under the lost-session text: the sweep's cutoff is already
+		// past them. The work stage keeps the restart from re-shipping as a merge turn.
+		expect(after.pendingPrompt?.startsWith(LOST_SESSION)).toBe(true);
+		expect(after.pendingPrompt).toContain("REVIEW COMMENT by alice");
+		expect(after.pendingPrompt).toContain("DATA>>>");
+		expect(after.pendingFeedback).toBe(true);
+		expect(after.stage).toBe("in_progress");
 		expect(after.state).toBe("queued");
 		expect(after.pendingBy).toBe("supervisor");
+		expect(after.sessionId).toBeNull();
+	});
+
+	test("a restart without feedback queues the lost-session ask alone", async () => {
+		const t = store.createTask("parked plain");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			sessionId: "sess-1",
+			pendingFeedback: false,
+		});
+		const res = await post(
+			`/api/projects/p1/tasks/${t.id}/restart-session`,
+			{},
+		);
+		expect(res.status).toBe(200);
+		const after = store.getTask(t.id)!;
+		expect(after.pendingPrompt).toBe(LOST_SESSION);
+		expect(after.pendingFeedback).toBe(false);
+		expect(after.stage).not.toBe("in_progress");
+		expect(after.state).toBe("queued");
 		expect(after.sessionId).toBeNull();
 	});
 });

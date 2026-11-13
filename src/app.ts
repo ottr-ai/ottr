@@ -8037,18 +8037,26 @@ export async function createApp(deps: AppDeps) {
 			);
 		if (task.sessionId === null)
 			return json({ error: "task has no session to restart" }, 409);
+		// A feedback park's blocks ride into the fresh session like the CI requeue's
+		// (OTTR-877): the sweep's cutoff is already past them. The work stage keeps
+		// the restart from re-shipping as a merge turn.
+		const blocks = task.pendingFeedback === true ? task.pendingPrompt : null;
+		const prompt =
+			blocks === null ? LOST_SESSION : `${LOST_SESSION}\n\n${blocks}`;
 		await updateSnapshot(e, task, {
 			sessionId: null,
 			pendingImages: [],
 			asked: null, // a fresh session knows nothing of the old ask
-			pendingPrompt: LOST_SESSION,
+			pendingPrompt: prompt,
 			pendingBy: "supervisor",
 			state: "queued",
+			...(blocks !== null ? { stage: "in_progress" as const } : {}),
 			holdUntil: null,
 			queuedAt: Date.now(),
 			needsReason: null,
-			// A fresh session never answers the old park; the lost-session text is the new ask.
-			pendingFeedback: false,
+			// With feedback the blocks are the new ask's data, so the flag stays and
+			// the passes keep settling through it; without, the ask is plain.
+			pendingFeedback: blocks !== null,
 		});
 		await deps.schedule();
 		return json({ ok: true });
