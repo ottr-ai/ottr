@@ -1285,6 +1285,9 @@ export class ProjectStore {
 				await db.exec("COMMIT");
 			},
 			rollback: async () => {
+				// RAISE(ROLLBACK) and SQLITE_FULL already rolled the transaction back, so a
+				// ROLLBACK here would throw and mask the original error.
+				if (!db.inTransaction) return;
 				await db.exec("ROLLBACK");
 			},
 		});

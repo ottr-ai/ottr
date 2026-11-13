@@ -20,6 +20,9 @@ export class GlobalStore {
 				this.db.exec("COMMIT");
 			},
 			rollback: () => {
+				// RAISE(ROLLBACK) and SQLITE_FULL already rolled the transaction back, so a
+				// ROLLBACK here would throw and mask the original error.
+				if (!this.db.inTransaction) return;
 				this.db.exec("ROLLBACK");
 			},
 		});

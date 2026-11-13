@@ -1136,7 +1136,10 @@ describe("hosted credit stop", () => {
 	});
 
 	/** Work or merge runs resolve `main` at once; each check run (check.yml) hangs until killed. */
-	function hangingChecks(main: RunResult) {
+	function hangingChecks(
+		main: RunResult,
+		completionError: Error | null = null,
+	) {
 		const runs: StartArgs[] = [];
 		const checks: { killed: boolean }[] = [];
 		const startRun = async (o: StartArgs) => {
@@ -1146,13 +1149,15 @@ describe("hosted credit stop", () => {
 				return { pid: 4242, done: Promise.resolve(main), kill: async () => {} };
 			const check = { killed: false };
 			checks.push(check);
-			const { promise, resolve } = Promise.withResolvers<RunResult>();
+			const { promise, resolve, reject } = Promise.withResolvers<RunResult>();
 			return {
 				pid: 4343,
 				done: promise,
 				kill: async () => {
 					check.killed = true;
-					resolve(runResult({ killed: true, sawTerminalEnd: false }));
+					if (completionError === null)
+						resolve(runResult({ killed: true, sawTerminalEnd: false }));
+					else reject(completionError);
 				},
 			};
 		};
@@ -1253,6 +1258,61 @@ describe("hosted credit stop", () => {
 		expect(after.needsReason).toBe(CREDIT_REASON);
 		expect(after.cancelledAt).toBeNull();
 	});
+
+	test.each(["work", "review"] as const)(
+		"creditStop completes after a %s check rejects its persistence callback",
+		async (kind) => {
+			const { hosted } = fakeHosted();
+			const failure = new Error("check callback persistence failed");
+			const h = hangingChecks(
+				kind === "work"
+					? readyRun
+					: runResult({
+							outcome: { status: "answered", summary: "review done" },
+							recorded: [
+								{ prompt: "Bug A", model: null, rank: 1, security: null },
+							],
+						}),
+				failure,
+			);
+			const { store, record, loop } = await setup({
+				hosted,
+				holdFollowUps: true,
+				targetSha: async () => "sha1",
+				workCheck: () => kind === "work",
+				commitsAhead: async () => (kind === "work" ? 1 : 0),
+				modelRoles: () => ({
+					default: "fake/default-model",
+					adversary: "zai/glm-5.3-flash",
+				}),
+				startRun: h.startRun,
+			});
+			const task = await store.createTask(
+				kind === "work"
+					? "work please"
+					: `${ARCH_REVIEW_MARKER}main (3 commits)`,
+				null,
+				kind === "work" ? "work" : "review",
+			);
+			if (kind === "review") await store.updateTask(task.id, { base: "shaR" });
+			const key = `${store.name}/${task.id}:${kind === "work" ? "workcheck" : "check"}`;
+			const run = loop.runTurn(store.name, task.id);
+			await waitFor(() => loop.running.has(key));
+			await expect(loop.creditStop()).resolves.toBe(1);
+			await run;
+			expect(h.checks).toEqual([{ killed: true }]);
+			expect(h.runs).toHaveLength(2);
+			expect(await store.getTask(task.id)).toMatchObject({
+				state: "needs_you",
+				needsReason: CREDIT_REASON,
+				cancelledAt: null,
+			});
+			expect(record.removeWorktree).toHaveLength(0);
+			expect(await Bun.file(await store.logPath(task.id)).text()).toContain(
+				failure.message,
+			);
+		},
+	);
 
 	test("creditStop during the prepare parks the turn before any agent run starts", async () => {
 		const { hosted } = fakeHosted();

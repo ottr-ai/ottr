@@ -10542,10 +10542,8 @@ export async function createApp(deps: AppDeps) {
 		task: Task,
 		text: string,
 	): Promise<Response | null> {
-		if (
-			task.asked === null ||
-			!task.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)
-		)
+		const asked = task.asked;
+		if (asked === null || !task.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX))
 			return null;
 		const leadOf = (
 			question: string,
@@ -10565,22 +10563,22 @@ export async function createApp(deps: AppDeps) {
 				details: `${cur.details ?? ""}\n\nThe user answered the review's question: ${note}`,
 			});
 		};
-		const matches = leadAskMatches(task.asked, text);
+		const matches = leadAskMatches(asked, text);
 		const answered = new Set<string>();
 		let free = text;
 		for (const m of [...matches].sort((a, b) => b.start - a.start))
 			free = free.slice(0, m.start) + free.slice(m.end);
 		free = free.trim();
-		let cursor = 0;
-		let cancelled: {
-			id: string;
-			reason: string;
-			answer: string;
-			outcome: CancelOutcome;
-		} | null = null;
+		const remaining = matches.values();
+		type LeadCancellation = { id: string; reason: string; answer: string };
+		let cancelled: (LeadCancellation & { outcome: CancelOutcome }) | null =
+			null;
 		// Preserve each database-only section around a started lead's external cancel.
 		while (true) {
-			const nextCancel = await withTask(e, task, async () => {
+			const afterCancel: boolean = cancelled !== null;
+			const apply = async (): Promise<
+				LeadCancellation | TaskConflict | null
+			> => {
 				if (cancelled !== null) {
 					const { id, reason, answer, outcome } = cancelled;
 					if ("removed" in outcome)
@@ -10592,9 +10590,23 @@ export async function createApp(deps: AppDeps) {
 						);
 					cancelled = null;
 				}
+				if (afterCancel) {
+					const current = await e.store.getTask(task.id);
+					if (
+						current === null ||
+						current.cancelledAt !== null ||
+						current.state !== "needs_you"
+					)
+						return null;
+					if (
+						JSON.stringify(current.asked) !== JSON.stringify(asked) ||
+						current.followUpOf !== task.followUpOf ||
+						!current.prompt.startsWith(LEAD_QUESTIONS_PROMPT_PREFIX)
+					)
+						return new TaskConflict(e, current);
+				}
 				const tasks = await e.store.listTasks();
-				while (cursor < matches.length) {
-					const m = matches[cursor++]!;
+				for (const m of remaining) {
 					const lead = leadOf(m.question, tasks);
 					if (
 						lead === undefined ||
@@ -10632,7 +10644,7 @@ export async function createApp(deps: AppDeps) {
 					answered.add(lead.id);
 				}
 				if (free !== "")
-					for (const q of task.asked!) {
+					for (const q of asked) {
 						const lead = leadOf(q.question, tasks);
 						if (
 							lead === undefined ||
@@ -10650,8 +10662,13 @@ export async function createApp(deps: AppDeps) {
 					needsReason: null,
 				});
 				return null;
-			});
+			};
+			// A completed external cancel must keep its note, even after another reply wins.
+			const nextCancel: LeadCancellation | TaskConflict | null = afterCancel
+				? await e.store.transaction(apply)
+				: await withTask(e, task, apply);
 			if (nextCancel === null) break;
+			if (nextCancel instanceof TaskConflict) throw nextCancel;
 			cancelled = {
 				...nextCancel,
 				outcome: await deps.cancel(e, nextCancel.id, false),

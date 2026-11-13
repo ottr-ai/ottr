@@ -1102,8 +1102,19 @@ export function createForkWatcher(deps: {
 							if (!applied) break;
 						}
 					}
-					// An incomplete legacy expansion must not advance its checkpoint.
-					if ([...snapshot.bases.values()].some((base) => base !== null))
+					// An incomplete legacy expansion must not advance its checkpoint: a base
+					// blocks only while its branch still has unreleased hold rows for the
+					// expansion to extend. A base with none (a legacy hold_prs list that
+					// seeded no rows) has nothing to expand and must not stall the fork.
+					if (
+						[...snapshot.bases].some(
+							([bh, base]) =>
+								base !== null &&
+								snapshot.holds.some(
+									(h) => h.branchHash === bh && h.released === 0,
+								),
+						)
+					)
 						continue;
 					// Step 5: pending = a moved head OR released hold rows; released commits
 					// are pending analysis work and reach the gated run without a new push.

@@ -96,6 +96,8 @@ export class StoreQueue {
 	}
 
 	private async invoke<T>(work: Work<T>, scope: Scope): Promise<T> {
+		// SQLite can already have rolled back. Later statements must not autocommit.
+		if (scope.transaction?.failed) throw scope.transaction.error;
 		try {
 			return await work();
 		} catch (error) {

@@ -1289,6 +1289,72 @@ describe("watcher", () => {
 		});
 	}
 
+	for (const holdPrs of ["[]", "[5]"] as const) {
+		test(`a legacy ${holdPrs} hold_prs list with no hold rows does not block analysis`, async () => {
+			const name = `watch-orphan-base-${holdPrs === "[]" ? "empty" : "numeric"}`;
+			const main = await initUpstream(name);
+			const base = await shaOf(main);
+			const dir = await makeFork(`${name}-fork`, main);
+			await commitFile(dir, "held.txt", "held change");
+			const head = await shaOf(dir);
+			const initial = await initStore(main);
+			await initial.setSettings({ forkResearch: true });
+			const bh = branchHash("feat");
+			await initial.saveForkBranch({
+				forkId: 1,
+				branchHash: bh,
+				branch: "feat",
+				head,
+				analyzedHead: base,
+				firstPendingAt: null,
+				lastRunAt: null,
+				lastError: null,
+				retries: 0,
+			});
+			await initial.close();
+			// The state the retired migration leaves for a hold_prs list it cannot
+			// seed: the list is spent, the base stays, and no fork_hold row exists.
+			const raw = new Database(join(initial.serverDir, "tasks.db"));
+			try {
+				raw.run(
+					"UPDATE fork_branch SET hold_base = ?, hold_prs = ? WHERE fork_id = ? AND branch_hash = ?",
+					[base, holdPrs, 1, bh],
+				);
+			} finally {
+				raw.close();
+			}
+			const store = await initStore(main);
+			const { watcher, state } = prWatcher(
+				name,
+				main,
+				store,
+				[{ id: 1, owner: "o", dir }],
+				[],
+			);
+			await watcher.tick();
+			expect(state.subjects).toEqual([["held change", "fork feature"]]);
+			const final = (await store.listForkBranches(1)).find(
+				(row) => row.branchHash === bh,
+			);
+			expect(final).toMatchObject({
+				analyzedHead: head,
+				firstPendingAt: null,
+				retries: 0,
+			});
+			expect(await store.listForkHolds(1)).toEqual([]);
+			// The spent base stays: only a guarded hold replacement may clear it.
+			expect(await store.legacyForkHoldBase(1, bh)).toBe(base);
+			const card = (await store.listTasks()).find(
+				(t) => t.topic === "fork research",
+			);
+			expect(card).toBeDefined();
+			expect(
+				(await store.events()).filter((event) => event.kind === "create"),
+			).toHaveLength(1);
+			expect(await store.forkRunsSince(0)).toBe(1);
+		});
+	}
+
 	test("an empty-range apply cannot replace a newer hold or advance its cursor", async () => {
 		const name = "watch-empty-final-hold";
 		const main = await initUpstream(name);

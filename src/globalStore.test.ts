@@ -299,6 +299,90 @@ describe("queued global operations", () => {
 	});
 });
 
+// A trigger RAISE(ROLLBACK, ...) reproduces the SQLITE_FULL auto-rollback shape
+// (SQLite discards the transaction before the store's rollback hook runs) without
+// resource pressure: only the write carrying the trigger key fails.
+function seedDoomedKeyTrigger(root: string): void {
+	const seed = new Database(join(root, ".tasks", "tracker.db"));
+	seed.exec(
+		"CREATE TRIGGER kv_doomed BEFORE INSERT ON kv WHEN NEW.key = 'doomed' BEGIN SELECT RAISE(ROLLBACK, 'synthetic doom'); END;",
+	);
+	seed.close();
+}
+
+describe("sqlite auto-rollback", () => {
+	test("a trigger rollback keeps the original error and the store usable", async () => {
+		const root = tempRoot();
+		// Create the schema and release the exclusive lock, then add the trigger.
+		await (await GlobalStore.open(root)).close();
+		seedDoomedKeyTrigger(root);
+		const store = await GlobalStore.open(root);
+		try {
+			await store.set("keeper", "original");
+			await expect(store.update("doomed", () => "discard")).rejects.toThrow(
+				"synthetic doom",
+			);
+			// The transaction rolled back: no doomed value, the keeper untouched.
+			expect(await store.get("doomed")).toBeNull();
+			expect(await store.get("keeper")).toBe("original");
+			// The queue is not quarantined: later reads and writes succeed.
+			await store.set("after", "fine");
+			expect(await store.get("after")).toBe("fine");
+			await store.update("keeper", (current) => `${current}-recovered`);
+			expect(await store.get("keeper")).toBe("original-recovered");
+		} finally {
+			await store.close();
+		}
+	});
+
+	test("a trigger rollback discards the earlier writes of its transaction", async () => {
+		const root = tempRoot();
+		await (await GlobalStore.open(root)).close();
+		seedDoomedKeyTrigger(root);
+		const store = await GlobalStore.open(root);
+		try {
+			await store.set("committed", 1);
+			await expect(
+				store.transaction(async () => {
+					await store.set("first", "kept-then-discarded");
+					await store.set("doomed", "never");
+				}),
+			).rejects.toThrow("synthetic doom");
+			expect(await store.get("committed")).toBe(1);
+			expect(await store.get("first")).toBeNull();
+			expect(await store.get("doomed")).toBeNull();
+			await store.set("after", 2);
+			expect(await store.get("after")).toBe(2);
+		} finally {
+			await store.close();
+		}
+	});
+
+	test("a caught automatic rollback cannot save later writes outside its transaction", async () => {
+		const root = tempRoot();
+		await (await GlobalStore.open(root)).close();
+		seedDoomedKeyTrigger(root);
+		const store = await GlobalStore.open(root);
+		try {
+			await expect(
+				store.transaction(async () => {
+					await store.set("first", 1);
+					try {
+						await store.set("doomed", "never");
+					} catch {}
+					await store.set("escaped", 2);
+				}),
+			).rejects.toThrow("synthetic doom");
+			expect(await store.get("first")).toBeNull();
+			expect(await store.get("escaped")).toBeNull();
+			await store.set("after", 3);
+			expect(await store.get("after")).toBe(3);
+		} finally {
+			await store.close();
+		}
+	});
+});
+
 describe("instance lock", () => {
 	test("a child calling process.exit(0) frees the tracker lock for the next boot", async () => {
 		const root = tempRoot();

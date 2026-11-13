@@ -3617,6 +3617,7 @@ export function createTurnLoop(
 		err: unknown,
 	): Promise<void> {
 		const msg = errmsg(err);
+		const key = `${name}/${id}`;
 		try {
 			await log(`! ${msg}`);
 		} catch {
@@ -3637,7 +3638,11 @@ export function createTurnLoop(
 				return;
 			await store.updateTask(id, {
 				state: "needs_you",
-				needsReason: `Tracker error: ${msg}`,
+				needsReason:
+					stopping.get(key) ??
+					(creditStopped.has(key)
+						? (ops.hosted?.config.wording.creditReason ?? DEFAULT_CREDIT_REASON)
+						: `Tracker error: ${msg}`),
 			});
 		});
 		if (mx.turn) await store.captureTurnData(mx.turn.id);
@@ -9345,7 +9350,9 @@ export function createTurnLoop(
 							state: "idle",
 							queuedAt: null,
 							details: `Unverified lead from review ${st.id}: the second-model check did not run on this finding (needs validation).${cameBack}${
-								blocker.kind === "sandbox" ? " Waits for a validation sandbox." : ""
+								blocker.kind === "sandbox"
+									? " Waits for a validation sandbox."
+									: ""
 							}`,
 						});
 						filed.push(child.id);
@@ -10291,7 +10298,10 @@ export function createTurnLoop(
 		stopping.set(`${store.name}/${id}`, reason);
 		await handle.kill();
 		await Promise.race([
-			handle.done.then(() => undefined),
+			handle.done.then(
+				() => undefined,
+				(err: unknown) => logStoreError(store.name, err),
+			),
 			new Promise<void>((r) => setTimeout(r, 15_000)),
 		]);
 		return { ok: true };
@@ -10345,7 +10355,10 @@ export function createTurnLoop(
 			return (async () => {
 				await check.kill();
 				await Promise.race([
-					check.done.then(() => undefined),
+					check.done.then(
+						() => undefined,
+						(err: unknown) => logStoreError(e.store.name, err),
+					),
 					new Promise<void>((r) => setTimeout(r, 15_000)),
 				]);
 				return true;
@@ -10588,7 +10601,10 @@ export function createTurnLoop(
 		if (handle) {
 			await handle.kill();
 			await Promise.race([
-				handle.done.then(() => undefined),
+				handle.done.then(
+					() => undefined,
+					(err: unknown) => logStoreError(store.name, err),
+				),
 				new Promise<void>((r) => setTimeout(r, 15_000)),
 			]);
 		}

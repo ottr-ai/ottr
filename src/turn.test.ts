@@ -26509,3 +26509,52 @@ describe("async turn state boundaries", () => {
 		expect(await store.events()).toEqual(events);
 	});
 });
+
+describe("async completion stop boundaries", () => {
+	test.each(["cancel", "stop"] as const)(
+		"%s completes after the run rejects its persistence callback",
+		async (action) => {
+			const completed = Promise.withResolvers<RunResult>();
+			const failure = new Error("callback persistence failed");
+			const { store, record, projects, loop } = await setup({
+				holdFollowUps: true,
+				startRun: async (o) => {
+					record.runs.push(o);
+					await o.onSession?.("sess-1");
+					return {
+						pid: 4242,
+						done: completed.promise,
+						kill: async () => {
+							completed.reject(failure);
+						},
+					};
+				},
+			});
+			const task = await store.createTask("stop after callback failure");
+			const key = `${store.name}/${task.id}`;
+			const run = loop.runTurn(store.name, task.id);
+			for (let i = 0; i < 100 && !loop.running.has(key); i++)
+				await flushPromises();
+			expect(loop.running.has(key)).toBe(true);
+			const project = projects.get(store.name)!;
+			if (action === "cancel")
+				await expect(loop.cancel(project, task.id, true)).resolves.toEqual({
+					removed: true,
+				});
+			else
+				await expect(loop.stopTurn(project, task.id)).resolves.toEqual({
+					ok: true,
+				});
+			await run;
+			const after = (await store.getTask(task.id))!;
+			expect(after.state).toBe(action === "cancel" ? "idle" : "needs_you");
+			if (action === "cancel") expect(after.cancelledAt).not.toBeNull();
+			else expect(after.cancelledAt).toBeNull();
+			expect(record.removeWorktree).toHaveLength(action === "cancel" ? 1 : 0);
+			expect((await store.listTurns(task.id)).at(-1)?.error).toBe(
+				failure.message,
+			);
+			expect(await logText(store, task.id)).toContain(failure.message);
+		},
+	);
+});

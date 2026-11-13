@@ -5174,7 +5174,7 @@ describe("hold provider columns", () => {
 		await store.close();
 	});
 
-	test("open backfills hold_attempts and hold_set_at on a pre-existing database and they round-trip", () => {
+	test("open backfills hold_attempts and hold_set_at on a pre-existing database and they round-trip", async () => {
 		const dir = join(root, "legacy-hold-attempts");
 		mkdirSync(join(dir, ".tasks"), { recursive: true });
 		const db = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
@@ -5186,21 +5186,21 @@ describe("hold provider columns", () => {
 			"INSERT INTO tasks (id, title, prompt, stage, state, created_at, updated_at, hold_until) VALUES ('old1', 'held', 'p', 'todo', 'queued', 1, 1, 5000)",
 		);
 		db.close();
-		const store = open(dir);
+		const store = await open(dir);
 		// The old row converges: the counter exists and reads 0, the stamp reads null.
-		expect(store.getTask("old1")?.holdAttempts).toBe(0);
-		expect(store.getTask("old1")?.holdSetAt).toBeNull();
-		const task = store.createTask("probe held");
+		expect((await store.getTask("old1"))?.holdAttempts).toBe(0);
+		expect((await store.getTask("old1"))?.holdSetAt).toBeNull();
+		const task = await store.createTask("probe held");
 		expect(task.holdAttempts).toBe(0);
 		expect(task.holdSetAt).toBeNull();
-		store.updateTask(task.id, { holdAttempts: 3, holdSetAt: 123 });
-		expect(store.getTask(task.id)?.holdAttempts).toBe(3);
-		expect(store.getTask(task.id)?.holdSetAt).toBe(123);
+		await store.updateTask(task.id, { holdAttempts: 3, holdSetAt: 123 });
+		expect((await store.getTask(task.id))?.holdAttempts).toBe(3);
+		expect((await store.getTask(task.id))?.holdSetAt).toBe(123);
 		// A settle that runs past the limit writes the clear directly.
-		store.updateTask(task.id, { holdAttempts: 0, holdSetAt: null });
-		expect(store.getTask(task.id)?.holdAttempts).toBe(0);
-		expect(store.getTask(task.id)?.holdSetAt).toBeNull();
-		store.close();
+		await store.updateTask(task.id, { holdAttempts: 0, holdSetAt: null });
+		expect((await store.getTask(task.id))?.holdAttempts).toBe(0);
+		expect((await store.getTask(task.id))?.holdSetAt).toBeNull();
+		await store.close();
 	});
 });
 
@@ -6595,5 +6595,51 @@ describe("async store serial operations", () => {
 				["state", "queued"],
 			]);
 		}
+	});
+});
+
+// A trigger RAISE(ROLLBACK, ...) reproduces the SQLITE_FULL auto-rollback shape
+// (SQLite discards the transaction before the store's rollback hook runs) without
+// resource pressure: only the createTask call carrying the trigger prompt fails.
+describe("sqlite auto-rollback", () => {
+	test("a trigger rollback keeps the original error, rolls the id and events back, and leaves the store usable", async () => {
+		const dir = join(root, "auto-rollback");
+		const seeded = await open(dir);
+		await seeded.close(); // release the exclusive lock so the fixture can add the trigger
+		const seed = new Database(join(tasksDirFor(dir), "tasks.db"));
+		seed.exec(
+			"CREATE TRIGGER tasks_doomed BEFORE INSERT ON tasks WHEN NEW.prompt = 'doomed-prompt' BEGIN SELECT RAISE(ROLLBACK, 'synthetic doom'); END;",
+		);
+		seed.close();
+		const store = await open(dir);
+		const prefix = await store.taskPrefix();
+		const first = await store.createTask("first card");
+		expect(first.id).toBe(`${prefix}-1`);
+		await expect(store.createTask("doomed-prompt")).rejects.toThrow(
+			"synthetic doom",
+		);
+		// The transaction rolled back: no doomed card, no doomed events, and the
+		// consumed id is back, so the next card reuses it (no id gap).
+		expect(await store.getTask(first.id)).toEqual(first);
+		expect((await store.listTasks()).map((task) => task.id)).toEqual([
+			first.id,
+		]);
+		expect(
+			(await store.events()).map((event) => [
+				event.kind,
+				event.taskId,
+				event.from,
+				event.to,
+			]),
+		).toEqual([
+			["create", first.id, null, "todo"],
+			["state", first.id, null, "queued"],
+		]);
+		const second = await store.createTask("second card");
+		expect(second.id).toBe(`${prefix}-2`);
+		expect((await store.listTasks()).map((task) => task.id)).toEqual([
+			second.id,
+			first.id,
+		]);
 	});
 });

@@ -2005,6 +2005,76 @@ describe("task routes", () => {
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});
 
+	test.each(["star", "duplicate reply"] as const)(
+		"a started lead retains its answer after a concurrent %s",
+		async (change) => {
+			const { lead1, lead2, ask } = await seedLeadAsk();
+			await store.updateTask(lead1.id, {
+				stage: "in_progress",
+				state: "running",
+			});
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let cancels = 0;
+			const previous = cancelImpl;
+			cancelImpl = async (_e, id) => {
+				cancels++;
+				await store.updateTask(id, { cancelledAt: Date.now() });
+				entered.resolve();
+				await release.promise;
+				await store.updateTask(id, { state: "idle" });
+				return { removed: true };
+			};
+			const body = {
+				text: `${askAnswerLine(`Q one? (card #${lead1.id})`, LEAD_NOT_APPLY_OPTION)}\n${askAnswerLine(`Q two? (card #${lead2.id})`, LEAD_APPLIES_OPTION)}`,
+			};
+			const reply = post(`/api/projects/p1/tasks/${ask.id}/reply`, body);
+			try {
+				await entered.promise;
+				try {
+					const concurrent =
+						change === "star"
+							? await post(`/api/projects/p1/tasks/${ask.id}/star`, {
+									starred: true,
+								})
+							: await post(`/api/projects/p1/tasks/${ask.id}/reply`, body);
+					expect(concurrent.status).toBe(200);
+				} finally {
+					release.resolve();
+				}
+				expect((await reply).status).toBe(200);
+				expect(cancels).toBe(1);
+				expect(await store.getTask(lead1.id)).toMatchObject({
+					cancelledAt: expect.any(Number),
+					state: "idle",
+					needsReason: expect.stringContaining(LEAD_NOT_APPLY_OPTION),
+				});
+				expect(await store.getTask(lead2.id)).toMatchObject({
+					stage: "todo",
+					state: "queued",
+				});
+				expect(await store.getTask(ask.id)).toMatchObject({
+					stage: "done",
+					state: "idle",
+					asked: null,
+				});
+				expect(
+					(await store.events()).filter(
+						(event) =>
+							event.taskId === lead2.id &&
+							event.kind === "stage" &&
+							event.from === "backlog" &&
+							event.to === "todo",
+					),
+				).toHaveLength(1);
+			} finally {
+				release.resolve();
+				await reply;
+				cancelImpl = previous;
+			}
+		},
+	);
+
 	test("an applies answer on a started lead only records it", async () => {
 		const { lead1, ask } = await seedLeadAskOne();
 		await store.updateTask(lead1.id, { stage: "todo", state: "running" });

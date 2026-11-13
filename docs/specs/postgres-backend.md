@@ -229,6 +229,12 @@ Integration also covers revision `4c809e1`: usage-hold stamps and attempt counts
 
 All store methods return promises. Properties and exported free filesystem helpers remain plain. Each store serializes database operations through one queue.
 
+SQLite can end a failed transaction itself. Execute `ROLLBACK` only when the connection still reports an active transaction. Preserve the original error and admit later operations after definite rollback. Reject further work in a failed transaction, even if its callback catches the error.
+
+After a lead cancellation, persist its result before other question-card guards. A concurrent metadata change must not discard its note or the remaining answers. A rejected persistence callback must not prevent stop cleanup or replace the requested stop reason. Keep the callback error in the log and turn record.
+
+Legacy bases without unreleased hold rows do not block analysis. Valid legacy holds keep their checkpoints until a successful guarded hold replacement.
+
 The current `src/store.ts` groups are:
 
 | Current source | Group and boundary |
