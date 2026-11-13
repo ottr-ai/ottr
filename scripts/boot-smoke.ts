@@ -19,6 +19,8 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, posix, resolve } from "node:path";
 
+import { smokeEnv } from "./boot-smoke-env.ts";
+
 // ponytail: bind-0-then-close leaves a race window; fine for a dev gate, parse the
 // server's "Ottr on http://127.0.0.1:<port>" log line if a collision ever bites.
 const port = await new Promise<number>((resolvePort, reject) => {
@@ -122,13 +124,12 @@ symlinkSync(
 const spawnServer = () =>
 	Bun.spawn(["bun", "src/server.ts"], {
 		cwd: imageDir,
-		env: {
-			...process.env,
+		env: smokeEnv({
 			PORT: String(port),
 			OMP_TRACKER_ROOTS: roots,
 			// Scratch state: the smoke server must never lock the checkout's live tracker.db.
 			OTTR_STATE_DIR: join(roots, "state"),
-		},
+		}),
 		stdout: "ignore",
 		stderr: "pipe",
 	});
@@ -186,14 +187,13 @@ exec "${realGit}" "$@"
 	chmodSync(join(shimDir, "git"), 0o755);
 	const early = Bun.spawn(["bun", "src/server.ts"], {
 		cwd: imageDir,
-		env: {
-			...process.env,
+		env: smokeEnv({
 			PORT: String(port),
 			OMP_TRACKER_ROOTS: roots,
 			OTTR_STATE_DIR: join(roots, "state"),
 			// Shim dir first: gitExe() resolves git through PATH on every spawn.
 			PATH: `${shimDir}:${process.env.PATH ?? ""}`,
-		},
+		}),
 		stdout: "ignore",
 		stderr: "pipe",
 	});
