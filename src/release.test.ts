@@ -972,8 +972,11 @@ describe("against real repos", () => {
 				dryRun: true,
 			});
 			// The head holds the reviewed feat plus one late fix, so the tag part names it.
+			// The fixture origin is a local bare path: no https host for the scoped helper,
+			// so the push part names the origin's own credentials while the gh release part
+			// still runs as the app token.
 			expect(log).toBe(
-				`dry run: would tag v0.9.2 at ${head.slice(0, 7)} (late fixes: 1), would push the tag to origin as GitHub app rel-bot, would create the GitHub release v0.9.2 as GitHub app rel-bot`,
+				`dry run: would tag v0.9.2 at ${head.slice(0, 7)} (late fixes: 1), would push the tag to origin with the origin's own credentials, would create the GitHub release v0.9.2 as GitHub app rel-bot`,
 			);
 			expect(await must(main, "tag", "--list", "v0.9.2")).toBe("");
 			expect(existsSync(`${script}.argv`)).toBe(false);
@@ -983,19 +986,106 @@ describe("against real repos", () => {
 		}
 	}, 60_000);
 
-	test("dry run without an identity names the user token", async () => {
+	test("dry run without an identity names the user token for gh only", async () => {
+		// No GH_TOKEN in the env: the push part cannot claim it, so the push names the
+		// origin's own credentials and only the GitHub release part names the user token.
+		const savedToken = process.env.GH_TOKEN;
+		delete process.env.GH_TOKEN;
+		try {
+			const log = await publishRelease({
+				mainPath: main,
+				originUrl: origin,
+				reviewed: head,
+				sha: head,
+				version: "v0.9.3",
+				notes: "n",
+				github: "https://github.com/o/r",
+				dryRun: true,
+			});
+			expect(log.split("the GH_TOKEN user token").length - 1).toBe(1);
+			expect(log).toContain(
+				"would push the tag to origin with the origin's own credentials",
+			);
+			expect(await must(main, "tag", "--list", "v0.9.3")).toBe("");
+		} finally {
+			if (savedToken !== undefined) process.env.GH_TOKEN = savedToken;
+		}
+	}, 60_000);
+
+	test("dry run names the app identity for both steps on the configured host", async () => {
 		const log = await publishRelease({
 			mainPath: main,
-			originUrl: origin,
+			originUrl: "https://github.com/octo/widget",
 			reviewed: head,
 			sha: head,
-			version: "v0.9.3",
+			version: "v0.9.4",
 			notes: "n",
-			github: "https://github.com/o/r",
+			github: "https://github.com/octo/widget",
+			releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
 			dryRun: true,
 		});
-		expect(log.split("the GH_TOKEN user token").length - 1).toBe(2);
-		expect(await must(main, "tag", "--list", "v0.9.3")).toBe("");
+		expect(log).toBe(
+			`dry run: would tag v0.9.4 at ${head.slice(0, 7)}, would push the tag to origin as GitHub app rel-bot, would create the GitHub release v0.9.4 as GitHub app rel-bot`,
+		);
+	}, 60_000);
+
+	test("dry run names the user token for the push when GH_TOKEN covers the host", async () => {
+		const savedToken = process.env.GH_TOKEN;
+		process.env.GH_TOKEN = "gh_dry_user_001";
+		try {
+			const log = await publishRelease({
+				mainPath: main,
+				originUrl: "https://github.com/octo/widget",
+				reviewed: head,
+				sha: head,
+				version: "v0.9.5",
+				notes: "n",
+				github: "https://github.com/octo/widget",
+				dryRun: true,
+			});
+			expect(log.split("the GH_TOKEN user token").length - 1).toBe(2);
+		} finally {
+			if (savedToken === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = savedToken;
+		}
+	}, 60_000);
+
+	test("dry run on an ssh origin names the origin's own credentials for the push", async () => {
+		const log = await publishRelease({
+			mainPath: main,
+			originUrl: "git@github.com:octo/widget.git",
+			reviewed: head,
+			sha: head,
+			version: "v0.9.6",
+			notes: "n",
+			github: "https://github.com/octo/widget",
+			releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+			dryRun: true,
+		});
+		// The scoped https helper never answers an ssh remote: the push keeps the origin's
+		// own ssh credentials, while the gh release still runs as the app token.
+		expect(log).toBe(
+			`dry run: would tag v0.9.6 at ${head.slice(0, 7)}, would push the tag to origin with the origin's own credentials, would create the GitHub release v0.9.6 as GitHub app rel-bot`,
+		);
+	}, 60_000);
+
+	test("dry run on another host names the origin's own credentials for the push", async () => {
+		const log = await publishRelease({
+			mainPath: main,
+			originUrl: "https://gitlab.com/octo/widget",
+			reviewed: head,
+			sha: head,
+			version: "v0.9.7",
+			notes: "n",
+			github: "https://github.com/octo/widget",
+			releaseToken: { token: "ghs_12345678", label: "GitHub app rel-bot" },
+			dryRun: true,
+		});
+		// The GitHub token must never reach another host's helper: the push keeps the
+		// origin's own credentials there too.
+		expect(log).toBe(
+			`dry run: would tag v0.9.7 at ${head.slice(0, 7)}, would push the tag to origin with the origin's own credentials, would create the GitHub release v0.9.7 as GitHub app rel-bot`,
+		);
 	}, 60_000);
 
 	test("dry run refuses an existing tag at another commit", async () => {
@@ -1078,8 +1168,9 @@ describe("releasePushAuth", () => {
 		delete process.env.OTTR_GITHUB_HOST;
 	});
 
-	test("scopes the helper to one token", () => {
-		const env = releasePushAuth("ghs_unit_00001");
+	test("scopes the helper to one token on the push URL's host", () => {
+		const url = "https://github.com/octo/widget";
+		const env = releasePushAuth("ghs_unit_00001", url);
 		expect(env).not.toBeNull();
 		const helperKey = Object.keys(env!)
 			.filter((k) => k.startsWith("GIT_CONFIG_KEY_"))
@@ -1099,12 +1190,32 @@ describe("releasePushAuth", () => {
 		expect(
 			Object.values(env!).filter((v) => v.includes("ghs_unit_00001")),
 		).toEqual(["ghs_unit_00001"]);
+		// The URL itself never carries the token.
+		expect(url).not.toContain("ghs_unit_00001");
+	});
+
+	test("refuses ssh, other hosts and local paths: the push keeps the resolver env", () => {
+		// The helper never answers an ssh remote, a helper on another host would hand the
+		// GitHub token to the wrong server, and a local path has no host at all.
+		expect(
+			releasePushAuth("ghs_unit_00001", "git@github.com:octo/widget.git"),
+		).toBeNull();
+		expect(
+			releasePushAuth("ghs_unit_00001", "ssh://git@github.com/octo/widget"),
+		).toBeNull();
+		expect(
+			releasePushAuth("ghs_unit_00001", "https://gitlab.com/octo/widget"),
+		).toBeNull();
+		expect(
+			releasePushAuth("ghs_unit_00001", "/tmp/ottr-bare-origin"),
+		).toBeNull();
 	});
 
 	test("keeps the token in exactly one env value or rejects it", () => {
+		const url = "https://github.com/octo/widget";
 		// Tokens the fixed scaffolding names would double-count, so the property drops them.
 		const scaffold = Object.values(
-			releasePushAuth("zzScafFold01") ?? {},
+			releasePushAuth("zzScafFold01", url) ?? {},
 		).filter((v) => !v.includes("zzScafFold01"));
 		fc.assert(
 			fc.property(
@@ -1112,7 +1223,7 @@ describe("releasePushAuth", () => {
 					.stringMatching(/^[A-Za-z0-9]{8,40}$/)
 					.filter((t) => !scaffold.some((v) => v.includes(t))),
 				(token) => {
-					const env = releasePushAuth(token);
+					const env = releasePushAuth(token, url);
 					expect(env).not.toBeNull();
 					const hits = Object.values(env!).filter((v) => v.includes(token));
 					expect(hits).toEqual([token]); // OTTR_GIT_TOKEN_0 only
@@ -1121,7 +1232,7 @@ describe("releasePushAuth", () => {
 		);
 		fc.assert(
 			fc.property(fc.stringMatching(/^[!-~]{1,7}$/), (token) => {
-				expect(releasePushAuth(token)).toBeNull(); // parseGitToken wants 8+
+				expect(releasePushAuth(token, url)).toBeNull(); // parseGitToken wants 8+
 			}),
 		);
 	});

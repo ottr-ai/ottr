@@ -1,8 +1,8 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gitAuthEnv, parseGitToken } from "./gitHosts.ts";
-import { ghEnvFor, githubHost } from "./githubHost.ts";
+import { gitAuthEnv, parseGitToken, parseGitUrl } from "./gitHosts.ts";
+import { ghEnvFor, githubHost, hostMatcher } from "./githubHost.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
 import type { LateCommit, LatestImage, ReleasePlan, Task } from "./types.ts";
@@ -824,11 +824,12 @@ async function pushReleaseTag(o: {
 	const guard = await checkPinnedRemote(o.mainPath, o.originUrl);
 	if (guard !== null) throw new Error(guard);
 	// With an identity the push authenticates exactly as it: the scoped helper env, not the
-	// resolver's ambient credentials. Null token: keep the resolver env (old behavior).
+	// resolver's ambient credentials. Null (ssh, another host, a rejected token): keep the
+	// resolver env — the origin's own credentials, never the GitHub token elsewhere.
 	const auth =
 		o.identity === undefined
 			? undefined
-			: (releasePushAuth(o.identity.token) ?? undefined);
+			: (releasePushAuth(o.identity.token, o.originUrl) ?? undefined);
 	const p = await git(
 		["push", o.originUrl, `refs/tags/${o.version}`],
 		o.mainPath,
@@ -880,12 +881,20 @@ export interface ReleaseIdentity {
  * Credential env for the release tag push: gitAuthEnv scoped to the identity's one token,
  * no ambient helpers, so the push authenticates exactly as the release identity and a
  * planted helper cannot shadow it. The token rides in OTTR_GIT_TOKEN_0 and the helper
- * reads it from env — never in the URL. Null when parseGitToken rejects the token: the
- * push then keeps the resolver's env.
+ * reads it from env — never in the URL. The helper answers only its own scheme and host,
+ * and ssh never consults one, so the token serves an https origin on the configured
+ * GitHub host only: anything else (ssh, a local path, another host — a helper there
+ * would hand the GitHub token to the wrong server) returns null, and the push keeps
+ * the resolver's own credentials for that origin.
  */
-export function releasePushAuth(token: string): Record<string, string> | null {
-	const host = githubHost().host;
-	const t = parseGitToken({ host, token });
+export function releasePushAuth(
+	token: string,
+	url: string,
+): Record<string, string> | null {
+	if (!hostMatcher(githubHost().host).test(url)) return null;
+	const u = parseGitUrl(url);
+	if ("error" in u || u.scheme !== "https") return null;
+	const t = parseGitToken({ host: u.host, token });
 	if ("error" in t) return null;
 	return gitAuthEnv({ tokens: [t], key: null, knownHosts: "" });
 }
@@ -986,7 +995,17 @@ async function dryRunLine(
 			throw new Error(
 				"the origin URL is not pinned; restart the board so the server pins it, then run the release again",
 			);
-		parts.push(`would push the tag to origin as ${label}`);
+		// The push part names the identity the push really uses: the release token serves
+		// an https origin on the configured GitHub host only; ssh origins, other hosts and
+		// a missing token keep the origin's own resolved credentials. Same check the live
+		// pushReleaseTag runs, so the dry run cannot promise an identity the push drops.
+		const pushToken = o.releaseToken?.token ?? process.env.GH_TOKEN;
+		parts.push(
+			pushToken !== undefined &&
+				releasePushAuth(pushToken, o.originUrl) !== null
+				? `would push the tag to origin as ${label}`
+				: "would push the tag to origin with the origin's own credentials",
+		);
 	}
 	if (o.github !== null) {
 		const repo = ownerRepo(o.github);
