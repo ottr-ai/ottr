@@ -2228,10 +2228,12 @@ describe("settings routes", () => {
 		])(
 			"the git-init commit uses the %s identity instead of an inferred identity",
 			async (source, expected) => {
-				// EMAIL permits Git to infer an identity without a configured name or email.
-				// The initial commit must use Settings, or the Ottr default when Settings is empty.
-				const emptyConfig = join(root, `empty-gitconfig-${Date.now()}-pw`);
-				writeFileSync(emptyConfig, "");
+				// The fixture supplies the name itself, so the precondition does not
+				// depend on the host's passwd or GECOS name. EMAIL keeps the email
+				// inferred, with no user.email configured. The initial commit must use
+				// Settings, or the Ottr default when Settings is empty, never this identity.
+				const namedConfig = join(root, `named-gitconfig-${Date.now()}-pw`);
+				writeFileSync(namedConfig, "[user]\n\tname = Inferred Name\n");
 				const saved: Record<string, string | undefined> = {};
 				for (const k of [
 					"EMAIL",
@@ -2243,8 +2245,8 @@ describe("settings routes", () => {
 					"GIT_COMMITTER_EMAIL",
 				])
 					saved[k] = process.env[k];
-				process.env.GIT_CONFIG_GLOBAL = emptyConfig;
-				process.env.GIT_CONFIG_SYSTEM = emptyConfig;
+				process.env.GIT_CONFIG_GLOBAL = namedConfig;
+				process.env.GIT_CONFIG_SYSTEM = namedConfig;
 				process.env.EMAIL = "root@passwd.invalid";
 				for (const k of [
 					"GIT_AUTHOR_NAME",
