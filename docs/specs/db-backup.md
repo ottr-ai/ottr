@@ -117,7 +117,7 @@ the operator what to do for each.
 
 `src/dblock.ts`:
 
-    vacuumInto(db: Database, dest: string, tables: readonly string[]): void
+    vacuumInto(db: SQLiteDatabase, dest: string, tables: readonly string[]): Promise<void>
 
 `VACUUM INTO dest`, then the row-count compare for `tables` and `PRAGMA integrity_check`
 on the copy. It throws on a difference. `dest` must not exist.
@@ -151,15 +151,15 @@ call it on the store's own connection. Each caller awaits the snapshot before it
       sources: () => BackupSource[]; log: (line: string) => void }): Promise<void>
     restoreSnapshot(o: { dir: string; stamp: string; now: Date; trackerDb: string;
       projectDbFor: (name: string) => string | null; adoptedMarker: string | null }):
-      { restored: { file: string; to: string }[]; manual: { file: string; from: string }[];
-        failed: { file: string; error: string }[]; movedAside: string[] }
+      Promise<{ restored: { file: string; to: string }[]; manual: { file: string; from: string }[];
+        failed: { file: string; error: string }[]; movedAside: string[] }>
 
 `resolveBackup` returns `keep: 0` and one error when `OTTR_BACKUP_DIR` is not safe. `backupTick`
 never throws: it does nothing when `keep` is 0 or no snapshot is due, and it reports the
 result and each failure through `log`.
 
-`src/restore.ts` holds `runRestore(args: string[], env): { code: number; out: string[];
-err: string[] }` and the `import.meta.main` entry that prints it.
+`src/restore.ts` holds `runRestore(args: string[], env): Promise<{ code: number; out: string[];
+err: string[] }>` and the `import.meta.main` entry that awaits the result before it prints.
 
 ## Boundaries and error cases
 
