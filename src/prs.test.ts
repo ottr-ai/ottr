@@ -58,18 +58,44 @@ beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-prs-"));
 });
 
+/** Closes one store with its identity on the failure and on the log: a close
+ * that sits still gets named by the watchdog every 4 s, so a hang names its
+ * store instead of failing as an anonymous hook timeout. */
+async function closeNamed(store: ProjectStore, index: number): Promise<void> {
+	const label = `store ${index} (${store.serverDir})`;
+	const at = performance.now();
+	// Real interval on purpose: it observes a real stall, and fake timers
+	// would not tick during the hang it exists to name.
+	const watchdog = setInterval(() => {
+		console.error(
+			`[teardown] ${label} still closing after ${Math.round(performance.now() - at)}ms`,
+		);
+	}, 4000);
+	try {
+		await store.close();
+	} catch (error) {
+		throw new Error(`${label} failed to close`, { cause: error });
+	} finally {
+		clearInterval(watchdog);
+	}
+}
+
 afterEach(async () => {
 	// Close what accumulated since the last afterEach, inside this test's own
 	// hook budget: one close is ~75 ms of synchronous bun:sqlite work
 	// (WAL-checkpoint fsyncs) on a slow disk, and sixty-plus of them together
 	// in one hook exceed the 5 s hook timeout there.
-	for (const store of stores.splice(0)) await store.close();
+	for (const [i, store] of stores.splice(0).entries())
+		await closeNamed(store, i);
 });
 
 afterAll(async () => {
 	// afterEach closed every store inside its test's own hook budget; only a
-	// test that timed out can leave one behind, so close the rest here.
-	for (const store of stores.splice(0)) await store.close();
+	// test that timed out can leave one behind, so close the rest here. Every
+	// close goes through closeNamed, so this fallback path keeps the same
+	// naming on a hang or a failure.
+	for (const [i, store] of stores.splice(0).entries())
+		await closeNamed(store, i);
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 });
 
