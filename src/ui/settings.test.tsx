@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, jest, test } from "bun:test";
 import { type Node as HappyNode, Window } from "happy-dom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -4911,6 +4911,91 @@ function alateFetchMock(handlers: AlateMockHandlers): typeof fetch {
 		throw new Error(`unexpected fetch ${init?.method ?? "GET"} ${url}`);
 	}) as typeof fetch;
 }
+
+describe("ModelRolesSection failed load recovery", () => {
+	/** The healthy roles fetch, but the first `fail` GET /api/model-roles answers
+	 *  alate's slow-provision 504; `reads()` counts the model-roles reads so a
+	 *  test can prove a retry ran without parsing the error line. */
+	const failingFirst = (
+		fail: number,
+	): { fetchMock: typeof fetch; reads: () => number } => {
+		let calls = 0;
+		const healthy = rolesFetch({ default: "zai/glm-5.3-flash" });
+		const fetchMock = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = String(input);
+			if (url.endsWith("/api/model-roles")) {
+				calls++;
+				if (calls <= fail)
+					return new Response(
+						JSON.stringify({
+							error: "alate did not answer /api/file within 10 s",
+						}),
+						{ status: 504, headers: { "Content-Type": "application/json" } },
+					);
+			}
+			return healthy(input, init);
+		}) as typeof fetch;
+		return { fetchMock, reads: () => calls };
+	};
+
+	test("Retry loads the rows and clears the error", async () => {
+		resetCatalogCache();
+		const { fetchMock, reads } = failingFirst(1);
+		const { container, unmount } = await mountRoles(fetchMock);
+		try {
+			// The first load failed: the error line and the Retry button show,
+			// and no rows render behind them.
+			expect(container.textContent).toContain(
+				"alate did not answer /api/file within 10 s",
+			);
+			const retry = [...container.querySelectorAll("button")].find(
+				(b) => b.textContent?.trim() === "Retry",
+			);
+			expect(retry).toBeDefined();
+			expect(container.querySelector(".role-add")).toBeNull();
+			await act(async () => {
+				retry!.click();
+			});
+			// The retried load answered: rows render and the error line is gone.
+			expect(container.textContent).not.toContain(
+				"Cannot load the model roles",
+			);
+			expect(container.querySelector(".role-add")).not.toBeNull();
+			expect(container.textContent).toContain("zai/glm-5.3-flash");
+			expect(reads()).toBe(2);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a failed load reads again by itself after 30 s", async () => {
+		resetCatalogCache();
+		jest.useFakeTimers();
+		const { fetchMock, reads } = failingFirst(1);
+		const { container, unmount } = await mountRoles(fetchMock);
+		try {
+			expect(container.textContent).toContain("Cannot load the model roles");
+			expect(reads()).toBe(1);
+			// Nothing automatic before the interval fires.
+			await act(async () => {
+				jest.advanceTimersByTime(29_999);
+			});
+			expect(reads()).toBe(1);
+			await act(async () => {
+				jest.advanceTimersByTime(1);
+			});
+			// The automatic retry answered: rows render without a click.
+			expect(reads()).toBe(2);
+			expect(container.textContent).not.toContain(
+				"Cannot load the model roles",
+			);
+			expect(container.querySelector(".role-add")).not.toBeNull();
+		} finally {
+			await unmount();
+			jest.useRealTimers();
+		}
+	});
+});
 
 describe("AlateSection stored API key", () => {
 	test("the stored key row shows the reveal, copy and regenerate controls", async () => {

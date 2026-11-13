@@ -5972,6 +5972,8 @@ function ModelRolesSaveButton({
  *  the read-only note, the add form, and the save button. */
 function ModelRolesContent({
 	loadErr,
+	loadBusy,
+	onRetry,
 	state,
 	catalog,
 	uid,
@@ -5997,6 +5999,9 @@ function ModelRolesContent({
 	onSubmit,
 }: {
 	loadErr: string | null;
+	/** True while a Retry load runs; disables the button and shows its spinner. */
+	loadBusy: boolean;
+	onRetry: () => void;
 	state: RolesState | null;
 	catalog: ModelCatalog | null;
 	uid: string;
@@ -6026,7 +6031,11 @@ function ModelRolesContent({
 		<>
 			{loadErr !== null ? (
 				<p className="hint" role="status">
-					Cannot load the model roles: {loadErr}.{" "}
+					Cannot load the model roles: {loadErr}. Retrying automatically.{" "}
+					<button type="button" onClick={onRetry} disabled={loadBusy}>
+						{loadBusy && <span className="spinner" aria-hidden="true" />}
+						Retry
+					</button>{" "}
 					<button
 						type="button"
 						className="notif-link"
@@ -6210,17 +6219,39 @@ export function ModelRolesSection() {
 			unwrap<RolesState>(await fetch("/api/model-roles")),
 		[],
 	);
+	const applyLoaded = useCallback((s: RolesState): void => {
+		setState(s);
+		// A folder the board saw refuse a save locks the section before
+		// any edit; `?? null` keeps stale payloads from arming `ro`.
+		setRo(s.ro ?? null);
+		setRows(Object.entries(s.roles));
+		setChains(rowChains(Object.keys(s.roles), s.fallbacks));
+	}, []);
+	// The failed load's Retry: one manual re-run, plus a read every 30 s while the
+	// error holds, so a slow alate provision needs no page reload. `loadingRef`
+	// keeps a Retry click and a timer tick from stacking two loads.
+	const [loadBusy, setLoadBusy] = useState(false);
+	const loadingRef = useRef(false);
+	const retryLoad = useCallback(async (): Promise<void> => {
+		if (loadingRef.current) return;
+		loadingRef.current = true;
+		setLoadBusy(true);
+		try {
+			applyLoaded(await load());
+			setLoadErr(null);
+		} catch (err) {
+			setLoadErr(err instanceof Error ? err.message : String(err));
+		} finally {
+			loadingRef.current = false;
+			setLoadBusy(false);
+		}
+	}, [applyLoaded, load]);
 	useEffect(() => {
 		let live = true;
 		load().then(
 			(s) => {
 				if (!live) return;
-				setState(s);
-				// A folder the board saw refuse a save locks the section before
-				// any edit; `?? null` keeps stale payloads from arming `ro`.
-				setRo(s.ro ?? null);
-				setRows(Object.entries(s.roles));
-				setChains(rowChains(Object.keys(s.roles), s.fallbacks));
+				applyLoaded(s);
 			},
 			(err: unknown) => {
 				if (live) setLoadErr(err instanceof Error ? err.message : String(err));
@@ -6229,7 +6260,17 @@ export function ModelRolesSection() {
 		return () => {
 			live = false;
 		};
-	}, [load]);
+	}, [load, applyLoaded]);
+	// The automatic retry stops when a load succeeds (loadErr clears) or the
+	// section unmounts; only loadErr and the stable retryLoad arm it, so
+	// unrelated re-renders never restart the 30 s clock.
+	useEffect(() => {
+		if (loadErr === null) return;
+		const t = setInterval(() => {
+			void retryLoad();
+		}, 30_000);
+		return () => clearInterval(t);
+	}, [loadErr, retryLoad]);
 	const seed = state?.seed ?? null;
 	const step =
 		seed === null || saved === null
@@ -6416,6 +6457,8 @@ export function ModelRolesSection() {
 		>
 			<ModelRolesContent
 				loadErr={loadErr}
+				loadBusy={loadBusy}
+				onRetry={() => void retryLoad()}
 				state={state}
 				catalog={catalog}
 				uid={uid}
