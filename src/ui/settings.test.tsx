@@ -4836,6 +4836,61 @@ describe("ModelRolesSection save source", () => {
 			await unmount();
 		}
 	});
+
+	test("the save steps wait on the board seed that runs every 5 minutes", async () => {
+		resetCatalogCache();
+		const NEW = "b".repeat(40);
+		const { container, unmount } = await mountRoles(
+			sourceFetch(
+				{ repo: { name: "o/data", ref: "main" }, path: null, ro: null },
+				() =>
+					// The save answer's seed: needed, the board still holds the old
+					// plan, and the seed commit is the one this save kept, so the
+					// steps line waits for the seed to install the save.
+					new Response(
+						JSON.stringify({
+							commit: NEW,
+							base: NEW,
+							hash: "h2",
+							roles: { plan: "anthropic/claude-opus-5-5" },
+							fallbacks: { plan: ["openai/gpt-5"] },
+							seed: {
+								needed: true,
+								commit: NEW,
+								roles: { plan: "zai/glm-5.3-flash" },
+								fallbacks: null,
+								expiresAt: null,
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					),
+			),
+		);
+		try {
+			await act(async () => {});
+			await armDirty(container);
+			const save = saveButton(container);
+			expect(save.disabled).toBe(false);
+
+			// The save commits and the steps line waits for the 5-minute seed.
+			await act(async () => {
+				onClickOf(save)({});
+			});
+			for (let i = 0; i < 3; i++)
+				await act(async () => {
+					await Bun.sleep(0);
+				});
+			expect(container.textContent).toContain(
+				`Committed ${NEW.slice(0, 7)} to the data repo.`,
+			);
+			expect(container.textContent).toContain(
+				`Waiting for the board seed of ${NEW.slice(0, 7)} (runs every 5 minutes).`,
+			);
+			expect(container.textContent).not.toContain("hourly deploy");
+		} finally {
+			await unmount();
+		}
+	});
 });
 
 /** Mounts AlateSection against `fetchMock`, same cleanup as mountSessions. */

@@ -444,6 +444,48 @@ pin or sha fails the image build loudly. To update ripwire: take the new version
 To update gitleaks: bump the CI pin first (.github/workflows/ci.yml, `Install gitleaks`),
 then move both ARGs to the same version and asset digest.
 
+### The 5-minute board seed
+
+A saved model role change and the other agent-layer files reach the board's own layer
+within 5 minutes with this schedule, not at the next hourly cycle. The full cycle still
+runs as documented above; this schedule is optional and adds the fast seed.
+
+To run it once:
+
+```sh
+bun scripts/update-image.ts --seed-only -f docker-compose.yml --env-file <env>
+```
+
+The command passes its arguments to every `docker compose` call, like the full run. The
+seed-only run reads the data repo's head and compares it with `/etc/ottr/seed-commit` on
+the board-config volume, runs `docker compose run --rm --no-deps board-seed` only when
+they differ, and records the commit. No build, no git fetch, no restart. A failed seed
+exits 1 and the board shows the seed-failed notice as before.
+
+The full run and the seed-only run share one lock per checkout, so the two never run at
+the same time. A run that finds the lock held exits 0 and logs one line. A host cycle
+that a seed run blocks deploys at the next cycle.
+
+Windows Task Scheduler (run once in the checkout, in cmd or PowerShell; replace each
+path placeholder; a path that holds spaces cannot appear in this line, keep tool and
+checkout paths without spaces or use the persistent host command above):
+
+```sh
+schtasks /Create /TN "Ottr board seed" /TR "cmd /c cd /d <checkout> && bun scripts\update-image.ts --seed-only -f docker-compose.yml --env-file <env> >> %LOCALAPPDATA%\ottr-board-seed.log 2>&1" /SC MINUTE /MO 5 /ST 00:00 /F
+```
+
+Read the log at `%LOCALAPPDATA%\ottr-board-seed.log`.
+
+Linux cron (`crontab -e`; replace the paths; `%HOME%/.bun/bin/bun` is wrong for cron —
+use the same absolute bun path style as the systemd unit above, `/home/<you>/.bun/bin/bun`):
+
+```sh
+*/5 * * * * cd /srv/ottr && /home/<you>/.bun/bin/bun scripts/update-image.ts --seed-only -f docker-compose.yml --env-file /srv/ottr/ottr.env >> /tmp/ottr-board-seed.log 2>&1
+```
+
+The seed-only run never creates or starts containers that stay up: `--no-deps` keeps the
+stack untouched, and a board that is down gets the fresh layer at its next start.
+
 ## System packages per project
 
 The image carries no project's system packages, with one exception: git-lfs,
@@ -523,7 +565,8 @@ R5-1: a turn can write the shared home, and a list there could give the secrets
 of project A to project B. The seed installs the lists into the board home's
 layers ([The agent layers](#the-agent-layers)); the hourly deploy runs it when
 it seeds the board ("Seed the board
-config"). Until a seed runs, turns get no env values.
+config"). The 5-minute board seed schedule above runs the same seed sooner when the
+host sets it up. Until a seed runs, turns get no env values.
 
 ### Python packages per project
 
@@ -1272,8 +1315,10 @@ keeps the old idle gate, because that server writes the flat home under a runnin
 #### Seed the board config
 
 Do these steps once after the first `docker compose up`. The hourly deploy repeats the
-seed by itself when the env file names the data repo (below). The first deploy of this
-change also needs them: an existing stack starts with an empty `board-config` volume.
+seed by itself when the env file names the data repo (below). The 5-minute board seed
+schedule above runs the same seed sooner when the host sets it up. The first deploy of
+this change also needs them: an existing stack starts with an empty `board-config`
+volume.
 
 1. Capture your machine's omp user layer into the data repo: run
    `node sync-user.mjs --data /path/to/your-data-repo`

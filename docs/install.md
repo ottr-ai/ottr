@@ -206,7 +206,7 @@ The board never takes its config from the worker-writable home volume. With the 
 docker compose run --rm board-seed --repo OWNER/NAME
 ```
 
-The hourly deploy repeats the seed by itself when the env file sets `ALATE_DATA` (a local data-repo checkout) or `ALATE_DATA_REPO` (`owner/name`). The board shows a notice while its agent layer is not seeded, or while a model role's provider has no active sign-in.
+The hourly deploy repeats the seed by itself when the env file sets `ALATE_DATA` (a local data-repo checkout) or `ALATE_DATA_REPO` (`owner/name`). A host can run `scripts/update-image.ts --seed-only` every 5 minutes, so a saved model role reaches the board within minutes (docs/WORKERS.md, "The 5-minute board seed"). The board shows a notice while its agent layer is not seeded, or while a model role's provider has no active sign-in.
 
 For a source-based deployment, enable the persistent host command in
 [docs/WORKERS.md](WORKERS.md#persistent-host-control).

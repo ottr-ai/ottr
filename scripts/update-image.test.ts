@@ -21,7 +21,9 @@ import {
 	type Deps,
 	dropBunDotenv,
 	envFileValues,
+	seedOnlyUpdate,
 	updateImage,
+	updateLockPath,
 } from "./update-image.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ottr-update-image-"));
@@ -4209,6 +4211,178 @@ describe("board seed", () => {
 		}
 		for (const f of [dated, undated, badDate, refused, thrown])
 			expect(f.logs.join("\n")).not.toContain(token);
+	}, 60_000);
+});
+
+describe("seed-only", () => {
+	const DATA_READ =
+		"compose -f c.yml exec -T server sh -c cat /etc/ottr/seed-commit";
+	const ALATE_PS = "compose -f c.yml ps -q alate";
+	const ALATE_INSPECT = "inspect -f {{.Config.Image}} alate123";
+	const unrecorded = "0".repeat(40);
+
+	/** Runs `run` with GitHub served from `dir`: real git, with each `https://github.com/<name>`
+	 *  rewritten to `<dir>/<name>` (url.insteadOf). Returns the argv of each ls-remote. */
+	async function fromLocalGitHub(
+		dir: string,
+		run: () => Promise<void>,
+	): Promise<string[][]> {
+		const remotes: string[][] = [];
+		mock.module("../src/worktree.ts", () => ({
+			...realWorktree,
+			git: (args: string[], cwd: string, timeoutMs?: number) => {
+				if (args.includes("ls-remote")) remotes.push(args);
+				return realGit(
+					["-c", `url.${dir}/.insteadOf=https://github.com/`, ...args],
+					cwd,
+					timeoutMs,
+				);
+			},
+		}));
+		try {
+			await run();
+		} finally {
+			mock.module("../src/worktree.ts", () => ({ ...realWorktree }));
+		}
+		return remotes;
+	}
+
+	test("an equal commit seeds nothing and runs no other docker call", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = fakes({ seedRecord: head });
+		expect(
+			await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(0);
+		// The record read is the compare itself: no build, pull, up, restart,
+		// prune, and no alate ps.
+		expect(f.calls).toEqual([DATA_READ]);
+		expect(f.seedRuns).toEqual([]);
+		expect(f.logs.join("\n")).toContain(
+			`board agent layer current at ${head.slice(0, 12)}`,
+		);
+	}, 60_000);
+
+	test("a new head runs exactly the board-seed command and no build, pull or restart", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const github = join(root, String(fixtures++));
+		must(
+			root,
+			"clone",
+			"-q",
+			"--bare",
+			data.origin,
+			join(github, "example", "data"),
+		);
+		const head = must(data.main, "rev-parse", "HEAD");
+		const seedRun =
+			"compose -f c.yml run --rm --no-deps board-seed --repo example/data";
+		const write = `compose -f c.yml exec -T server sh -c printf %s '${head}' > /etc/ottr/seed-commit`;
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+		});
+		await fromLocalGitHub(github, async () => {
+			expect(
+				await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA_REPO: "example/data",
+				}),
+			).toBe(0);
+		});
+		expect(f.seedRuns).toEqual([seedRun]);
+		// This exact list is what proves "no build, pull or restart": the whole
+		// job is the seed run, the failure-record clear, and the record write.
+		expect(f.calls).toEqual([
+			DATA_READ,
+			ALATE_PS,
+			ALATE_INSPECT,
+			seedRun,
+			RM_SEEDFAIL,
+			write,
+		]);
+		expect(f.logs.join("\n")).toContain(
+			`board agent layer seeded at ${head.slice(0, 12)}`,
+		);
+	}, 60_000);
+
+	test("a run that another run holds the lock for exits 0 without a docker call", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const lock = updateLockPath(main);
+		writeFileSync(lock, JSON.stringify({ pid: process.pid }));
+		const other = checkout();
+		const fullLock = updateLockPath(other.main);
+		writeFileSync(fullLock, JSON.stringify({ pid: process.pid }));
+		try {
+			const f = fakes({ seedRecord: unrecorded });
+			expect(
+				await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+					ALATE_DATA: data.main,
+				}),
+			).toBe(0);
+			expect(f.calls).toEqual([]);
+			expect(f.seedRuns).toEqual([]);
+			// The skipped run leaves the holder's lock untouched.
+			expect(existsSync(lock)).toBe(true);
+			expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual({
+				pid: process.pid,
+			});
+			expect(f.logs.join("\n")).toContain("holds the lock");
+
+			// The full run behaves the same against its own pre-created lock.
+			const g = fakes();
+			expect(await updateImage(other.main, ["-f", "c.yml"], g.deps, {})).toBe(
+				0,
+			);
+			expect(g.calls).toEqual([]);
+			expect(g.logs.join("\n")).toContain("holds the lock");
+		} finally {
+			rmSync(lock, { force: true });
+			rmSync(fullLock, { force: true });
+		}
+	}, 60_000);
+
+	test("a failed seed keeps the record and shows the failure", async () => {
+		const { main } = checkout();
+		const data = checkout();
+		const head = must(data.main, "rev-parse", "HEAD");
+		const f = fakes({
+			seedRecord: unrecorded,
+			alatePs: "alate123",
+			alateInspect: "alate:current",
+			seedCode: 1,
+		});
+		expect(
+			await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {
+				ALATE_DATA: data.main,
+			}),
+		).toBe(1);
+		expect(f.logs.join("\n")).toContain(
+			"board seed failed: the seed step failed",
+		);
+		// No seed-commit record write: the recorded commit stays.
+		expect(f.seedWrites).toEqual([]);
+		// The notice landed, naming the wanted head and the failure text.
+		expect(f.seedFailRecords).toHaveLength(1);
+		expect(seedFailRecordOf(f)).toEqual({
+			since: Date.UTC(2026, 9, 16),
+			commit: head,
+			text: "the seed step failed",
+		});
+	}, 60_000);
+
+	test("an environment without a data source skips the seed", async () => {
+		const { main } = checkout();
+		const f = fakes();
+		expect(await seedOnlyUpdate(main, ["-f", "c.yml"], f.deps, {})).toBe(0);
+		expect(f.calls).toEqual([]);
+		expect(f.seedRuns).toEqual([]);
+		expect(f.logs.join("\n")).toContain("no ALATE_DATA or ALATE_DATA_REPO");
 	}, 60_000);
 });
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { createHash } from "node:crypto";
 // Deploys main to a compose stack. Run it on a schedule from a clean `main` checkout
 // (docs/WORKERS.md, "Updates"): it fast-forwards main, builds the image, and rolls the
 // stack one runner at a time. The restart is idle-first: a runner that runs no turn at
@@ -18,12 +19,18 @@
 // pin moves on main only
 // (.github/workflows/omp-bump.yml), so a host needs read access and never pushes.
 // Its arguments go to every `docker compose` call, e.g. -f docker-compose.yml -f <override>.
+// `--seed-only` seeds the board's agent layer only when the data source moved — no
+// build, no pull, no restart. Both modes share one lock, so a run that another run
+// holds the lock for exits 0 with one log line.
 import {
+	closeSync,
 	existsSync,
 	mkdtempSync,
+	openSync,
 	readFileSync,
 	rmSync,
 	writeFileSync,
+	writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -2090,8 +2097,78 @@ async function reportRestartWait(
 	);
 }
 
-/** The run's exit code: 1 when it stopped early or failed, else 0. */
-export async function updateImage(
+/** The lock file path for a checkout: one per checkout, shared by both run modes. */
+export function updateLockPath(repo: string): string {
+	return join(
+		tmpdir(),
+		`ottr-update-image-${createHash("sha256").update(repo).digest("hex").slice(0, 16)}.lock`,
+	);
+}
+
+/**
+ * Takes the run lock, or reports the live holder and takes nothing — there is no
+ * waiting. A lock whose pid is gone (a hard-killed run's leftover) is dead, and this
+ * run steals it: the file is removed and the create is retried.
+ */
+function acquireLock(repo: string, d: Deps, seedOnly: boolean): boolean {
+	const path = updateLockPath(repo);
+	for (;;) {
+		try {
+			const fd = openSync(path, "wx");
+			try {
+				writeSync(fd, JSON.stringify({ pid: process.pid }));
+			} finally {
+				closeSync(fd);
+			}
+			return true;
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+		}
+		let live = false;
+		try {
+			const holder = JSON.parse(readFileSync(path, "utf8")) as {
+				pid?: unknown;
+			};
+			// An unreadable or unparseable file counts as a dead holder, and a
+			// kill that does not throw means the holder still runs.
+			if (typeof holder.pid === "number") {
+				process.kill(holder.pid, 0);
+				live = true;
+			}
+		} catch (e) {
+			// A process of another user cannot be signalled but still runs (the
+			// same read scripts/stryker-load.mjs makes); anything else is a dead
+			// holder, and this run steals the lock below.
+			if ((e as NodeJS.ErrnoException).code === "EPERM") live = true;
+		}
+		if (live) {
+			d.log(
+				seedOnly
+					? "another update-image run holds the lock; the seed-only run skips"
+					: "another update-image run holds the lock; this run skips",
+			);
+			return false;
+		}
+		rmSync(path, { force: true });
+	}
+}
+
+/** Removes the lock only when it still records this run's pid: a stolen lock is not ours. */
+function releaseLock(repo: string): void {
+	const path = updateLockPath(repo);
+	try {
+		const holder = JSON.parse(readFileSync(path, "utf8")) as {
+			pid?: unknown;
+		};
+		if (holder.pid !== process.pid) return;
+	} catch {
+		return; // The file is gone or unreadable: nothing of ours to remove.
+	}
+	rmSync(path, { force: true });
+}
+
+/** The full run's exit code: 1 when it stopped early or failed, else 0. */
+async function deployMain(
 	repo: string,
 	compose: string[],
 	d: Deps,
@@ -2169,16 +2246,89 @@ export async function updateImage(
 	return seed.failed || recordFailed ? 1 : 0;
 }
 
+/**
+ * Deploys main under the shared run lock. When another run holds the lock, this run
+ * logs one line and exits 0; the exit code is 1 when the deploy stopped early or failed.
+ */
+export async function updateImage(
+	repo: string,
+	compose: string[],
+	d: Deps,
+	env: Record<string, string | undefined> = process.env,
+): Promise<number> {
+	if (!acquireLock(repo, d, false)) return 0;
+	try {
+		return await deployMain(repo, compose, d, env);
+	} finally {
+		releaseLock(repo);
+	}
+}
+
+/**
+ * Seeds the board's agent layer only when the data source moved: no build, no pull, no
+ * restart — the seed is the whole job. Shares the run lock with the full deploy, so a
+ * blocked run logs one line and exits 0.
+ */
+export async function seedOnlyUpdate(
+	repo: string,
+	compose: string[],
+	d: Deps,
+	env: Record<string, string | undefined> = process.env,
+): Promise<number> {
+	if (!acquireLock(repo, d, true)) return 0;
+	try {
+		const seed = await seedSource(d, env, repo);
+		if (seed === null) return 0; // seedSource already logged the skip.
+		if ("failed" in seed) {
+			d.log(`board seed failed: ${seed.failed}`);
+			await seedFailRecord(d, compose, "", seed.failed, env);
+			return 1;
+		}
+		if ((await readSeedRecord(d, compose, true)) === seed.wanted) {
+			d.log(`board agent layer current at ${seed.wanted.slice(0, 12)}`);
+			return 0;
+		}
+		const outcome = await runSeed(d, compose, env, seed, {
+			seeded: false,
+			failed: false,
+			wantedSha: seed.wanted,
+			expires: seed.tokenExpires,
+		});
+		// runSeed already logged the failure and wrote the seed-failed notice, and
+		// left the record untouched.
+		if (outcome.failed) return 1;
+		// The full run records the seed commit only after the restart settles;
+		// seed-only has no restart step — the seed is the whole job, and the record
+		// is what makes the next 5-minute run compare equal instead of
+		// re-provisioning. Advisory: the seed itself landed.
+		const w = await d.docker(
+			"compose",
+			...compose,
+			"exec",
+			"-T",
+			"server",
+			"sh",
+			"-c",
+			`printf %s '${seed.wanted}' > /etc/ottr/seed-commit`,
+		);
+		if (w.code !== 0)
+			d.log("the seed commit cannot be recorded; the next run seeds again");
+		return 0;
+	} finally {
+		releaseLock(repo);
+	}
+}
+
 if (import.meta.main) {
 	const repo = resolve(import.meta.dir, "..");
-	dropBunDotenv(process.argv.slice(2));
+	const seedOnly = process.argv.slice(2).includes("--seed-only");
+	const compose = process.argv.slice(2).filter((arg) => arg !== "--seed-only");
+	dropBunDotenv(compose);
 	// The shell env wins over --env-file values, matching compose's precedence.
-	for (const [key, value] of Object.entries(
-		envFileValues(process.argv.slice(2)),
-	)) {
+	for (const [key, value] of Object.entries(envFileValues(compose))) {
 		if (process.env[key] === undefined) process.env[key] = value;
 	}
-	process.exitCode = await updateImage(repo, process.argv.slice(2), {
+	const d: Deps = {
 		docker: async (...args) => {
 			const r = await $`docker ${args}`.cwd(repo).nothrow().quiet();
 			// stderr first: compose warnings must not land after the turn count.
@@ -2187,5 +2337,8 @@ if (import.meta.main) {
 		log: (line) => console.log(`${new Date().toISOString()} ${line}`),
 		wait: (ms) => Bun.sleep(ms),
 		now: Date.now,
-	});
+	};
+	process.exitCode = seedOnly
+		? await seedOnlyUpdate(repo, compose, d)
+		: await updateImage(repo, compose, d);
 }

@@ -5882,7 +5882,7 @@ function ProvisionLine({
 	);
 }
 
-/** The seed line of the save steps: what the board copy holds after the hourly deploy. */
+/** The seed line of the save steps: what the board copy holds after the board seed. */
 function SeedStepLine({
 	step,
 	commit,
@@ -5926,7 +5926,8 @@ function SeedStepLine({
 	return (
 		<>
 			<Mark kind="queued" />
-			Waiting for the hourly deploy to seed <code>{shortSha(commit)}</code>.
+			Waiting for the board seed of <code>{shortSha(commit)}</code> (runs every
+			5 minutes).
 		</>
 	);
 }
@@ -6277,7 +6278,7 @@ export function ModelRolesSection() {
 			? null
 			: seedStep(seed, saved.seedAtSave, saved.after, saved.afterFallbacks);
 	const seedWaits = commit !== null && step === "wait";
-	// The hourly deploy seeds the board copy: read the seed state each minute until it holds the save.
+	// The board seed (every 5 minutes) installs the save on the board copy: read the seed state each minute until it holds the save.
 	useEffect(() => {
 		if (!seedWaits) return;
 		const t = setInterval(() => {
