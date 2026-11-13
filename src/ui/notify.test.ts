@@ -10,6 +10,7 @@ import {
 	inboxView,
 	loadAskDrafts,
 	loadComposeDraft,
+	newerAskDraft,
 	pruneAskDrafts,
 	pruneSeen,
 	saveAskDraft,
@@ -27,17 +28,58 @@ globalThis.localStorage ??= {
 
 test("ask drafts round-trip per task and drop on mismatching fingerprint", () => {
 	localStorage.removeItem(ASK_DRAFTS_KEY);
-	saveAskDraft("t1", { fp: "a\nb", answers: { 0: "one" } });
-	saveAskDraft("t2", { fp: "x", answers: { 0: "two", 1: "three" } });
-	expect(loadAskDrafts().t1).toEqual({ fp: "a\nb", answers: { 0: "one" } });
+	saveAskDraft("t1", { fp: "a\nb", answers: { 0: "one" }, at: 10 });
+	saveAskDraft("t2", { fp: "x", answers: { 0: "two", 1: "three" }, at: 11 });
+	expect(loadAskDrafts().t1).toEqual({
+		fp: "a\nb",
+		answers: { 0: "one" },
+		at: 10,
+	});
 	// Overwriting one task leaves the other's draft alone.
-	saveAskDraft("t1", { fp: "a\nb", answers: { 0: "one", 1: "uno" } });
+	saveAskDraft("t1", { fp: "a\nb", answers: { 0: "one", 1: "uno" }, at: 12 });
 	expect(loadAskDrafts().t2?.answers[0]).toBe("two");
 	clearAskDraft("t1");
 	expect(loadAskDrafts().t1).toBeUndefined();
 	expect(loadAskDrafts().t2).toBeDefined();
 	// A changed ask round (fingerprint miss) is the caller's signal to start empty.
 	expect(loadAskDrafts().t1?.fp === "a\nb").toBe(false);
+});
+
+test("an ask draft from an older build without `at` reads as at 0", () => {
+	localStorage.setItem(
+		ASK_DRAFTS_KEY,
+		JSON.stringify({ old: { fp: "q", answers: { 0: "a" } } }),
+	);
+	expect(loadAskDrafts().old).toEqual({ fp: "q", answers: { 0: "a" }, at: 0 });
+});
+
+describe("newerAskDraft", () => {
+	const local = { fp: "q1\nq2", answers: { 0: "local" }, at: 100 };
+	const server = { fp: "q1\nq2", answers: { 0: "server" }, at: 200 };
+	test("the larger at wins either way", () => {
+		expect(newerAskDraft(local, server, "q1\nq2")).toBe(server);
+		expect(newerAskDraft({ ...local, at: 300 }, server, "q1\nq2")?.at).toBe(
+			300,
+		);
+	});
+	test("a tie keeps the local draft", () => {
+		expect(newerAskDraft(local, { ...server, at: 100 }, "q1\nq2")).toBe(local);
+	});
+	test("a draft with another fingerprint is ignored", () => {
+		const stale = { ...server, fp: "old", at: 999 };
+		expect(newerAskDraft(local, stale, "q1\nq2")).toBe(local);
+		expect(newerAskDraft({ ...local, fp: "old" }, server, "q1\nq2")).toBe(
+			server,
+		);
+		expect(newerAskDraft({ ...local, fp: "old" }, stale, "q1\nq2")).toBe(
+			undefined,
+		);
+	});
+	test("one side absent returns the other; both absent is undefined", () => {
+		expect(newerAskDraft(undefined, server, "q1\nq2")).toBe(server);
+		expect(newerAskDraft(local, null, "q1\nq2")).toBe(local);
+		expect(newerAskDraft(undefined, null, "q1\nq2")).toBe(undefined);
+	});
 });
 
 test("compose drafts round-trip per dialog key and drop on empty text", () => {
@@ -79,8 +121,8 @@ test("clearComposeDraft drops one key and ignores absent keys without writing", 
 
 test("pruneAskDrafts keeps only tasks with an outstanding ask", () => {
 	localStorage.removeItem(ASK_DRAFTS_KEY);
-	saveAskDraft("live", { fp: "q", answers: { 0: "a" } });
-	saveAskDraft("gone", { fp: "q", answers: { 0: "b" } });
+	saveAskDraft("live", { fp: "q", answers: { 0: "a" }, at: 1 });
+	saveAskDraft("gone", { fp: "q", answers: { 0: "b" }, at: 2 });
 	pruneAskDrafts(new Set(["live"]));
 	expect(Object.keys(loadAskDrafts())).toEqual(["live"]);
 	// No change, no rewrite: an all-alive prune keeps the stored JSON untouched.

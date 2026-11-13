@@ -27,6 +27,8 @@ import {
 } from "../types.ts";
 // Static: models.ts touches no browser global at load, so hoisting is safe.
 import { resetCatalogCache } from "./models.ts";
+// Static: notify.ts reads localStorage only when called, never at load.
+import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 // Static: queue.ts is pure lane math over types.ts and scheduler.ts, no browser global.
 import { donePage } from "./queue.ts";
 
@@ -6942,50 +6944,50 @@ describe("DeepenReview", () => {
 	});
 });
 
-describe("Drawer prompt gate Start anyway", () => {
-	// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
-	const drawerFields = {
-		kind: "work",
-		research: false,
-		report: null,
-		details: null,
-		branch: null,
-		model: null,
-		worktree: null,
-		sessionId: null,
-		images: [],
-		pendingImages: [],
-		shots: [],
-		keptFiles: [],
-		workCheckLog: [],
-	} as unknown as Partial<TaskCard>;
-	const project = {
+// Fields the Drawer body reads before rendering; cardFixture's short cast omits them.
+const drawerFields = {
+	kind: "work",
+	research: false,
+	report: null,
+	details: null,
+	branch: null,
+	model: null,
+	worktree: null,
+	sessionId: null,
+	images: [],
+	pendingImages: [],
+	shots: [],
+	keptFiles: [],
+	workCheckLog: [],
+} as unknown as Partial<TaskCard>;
+const drawerBase = {
+	project: {
 		name: "proj",
 		hasRules: true,
 		github: null,
 		sessionsDir: "/tmp/sessions",
 		settings: { maxParallel: 1 },
-	} as unknown as ProjectView;
-	const base = {
-		project,
-		// sendReply wraps its POST in this act: it must run the fn (the App act
-		// executes it; a no-op would swallow the reply and the POST never fires).
-		act: async (fn: () => Promise<unknown>) => {
-			await fn();
-			return true;
-		},
-		onClose: () => {},
-		onFollowed: () => {},
-		projects: [],
-		read: true,
-		onMarkUnread: () => {},
-		onMarkSeen: () => {},
-		tasks: [],
-		onOpenTask: () => {},
-		draining: false,
-		usedTotal: 0,
-		maxTotal: null,
-	};
+	} as unknown as ProjectView,
+	// sendReply wraps its POST in this act: it must run the fn (the App act
+	// executes it; a no-op would swallow the reply and the POST never fires).
+	act: async (fn: () => Promise<unknown>) => {
+		await fn();
+		return true;
+	},
+	onClose: () => {},
+	onFollowed: () => {},
+	projects: [],
+	read: true,
+	onMarkUnread: () => {},
+	onMarkSeen: () => {},
+	tasks: [],
+	onOpenTask: () => {},
+	draining: false,
+	usedTotal: 0,
+	maxTotal: null,
+};
+
+describe("Drawer prompt gate Start anyway", () => {
 	// React interaction needs browser globals; the setup mirrors settings.test.tsx.
 	const window = new Window({ url: "http://localhost/" });
 	const host = globalThis as unknown as Record<string, unknown>;
@@ -7066,7 +7068,7 @@ describe("Drawer prompt gate Start anyway", () => {
 			await act(async () => {
 				root.render(
 					<Drawer
-						{...base}
+						{...drawerBase}
 						task={gateTask({
 							hash: null,
 							seen: null,
@@ -7107,10 +7109,234 @@ describe("Drawer prompt gate Start anyway", () => {
 
 	test("a needs_you card without a parked gate renders no Start anyway", () => {
 		const html = renderToStaticMarkup(
-			<Drawer {...base} task={gateTask(null)} />,
+			<Drawer {...drawerBase} task={gateTask(null)} />,
 		);
 		expect(html).not.toContain("Start anyway");
 		expect(html).not.toContain("gate-start");
+	});
+});
+
+describe("Drawer ask drafts on the server", () => {
+	const window = new Window({ url: "http://localhost/" });
+	const host = globalThis as unknown as Record<string, unknown>;
+	const browserGlobals: Record<string, unknown> = {
+		window,
+		document: window.document,
+		navigator: window.navigator,
+		localStorage: window.localStorage,
+		Event: window.Event,
+		HTMLElement: window.HTMLElement,
+		HTMLInputElement: window.HTMLInputElement,
+		Node: window.Node,
+	};
+	const originals = new Map<string, unknown>();
+	beforeAll(() => {
+		host.IS_REACT_ACT_ENVIRONMENT = true;
+		for (const [key, value] of Object.entries(browserGlobals)) {
+			originals.set(key, host[key]);
+			host[key] = value;
+		}
+	});
+	afterAll(() => {
+		delete host.IS_REACT_ACT_ENVIRONMENT;
+		for (const [key, value] of originals) {
+			if (value === undefined) delete host[key];
+			else host[key] = value;
+		}
+	});
+	const draftUrl = "/api/projects/proj/tasks/t1/ask-draft";
+	const fp = "Which database?\nWhich region?";
+	const askTask = cardFixture({
+		...drawerFields,
+		stage: "todo",
+		state: "needs_you",
+		asked: [
+			{
+				question: "Which database?",
+				options: [{ label: "Postgres" }, { label: "SQLite" }],
+				multi: true,
+				recommended: null,
+			},
+			{
+				question: "Which region?",
+				options: [{ label: "EU" }, { label: "US" }],
+				multi: false,
+				recommended: null,
+			},
+		],
+		gate: null,
+	});
+	/** The React prop handler on a node; happy-dom events never reach React's plugins. */
+	const propOf = (node: Element, name: "onClick" | "onChange") => {
+		const key = Object.getOwnPropertyNames(node).find((k) =>
+			k.startsWith("__reactProps$"),
+		);
+		if (key === undefined) throw new Error("react props missing on node");
+		const fn = (
+			(node as unknown as Record<string, unknown>)[key] as Record<
+				string,
+				((e: unknown) => void) | undefined
+			>
+		)[name];
+		if (fn === undefined) throw new Error(`node has no ${name}`);
+		return fn;
+	};
+	/** Lets the mocked fetch chains and React updates settle. */
+	const settle = (ms = 0) =>
+		act(async () => {
+			await Bun.sleep(ms);
+		});
+	/** Mounts the drawer on a fetch mock whose GET .../ask-draft answers `server`. */
+	async function mount(server: unknown) {
+		const realFetch = globalThis.fetch;
+		const calls: { url: string; method: string; body: string }[] = [];
+		globalThis.fetch = (async (
+			input: RequestInfo | URL,
+			init?: RequestInit,
+		) => {
+			const url = String(input);
+			const method = init?.method ?? "GET";
+			calls.push({ url, method, body: String(init?.body ?? "") });
+			if (url === draftUrl && method === "GET")
+				return new Response(JSON.stringify({ draft: server }));
+			if (url === draftUrl || url.endsWith("/tasks/t1/reply"))
+				return new Response(JSON.stringify({ ok: true }));
+			return new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		await act(async () => {
+			root.render(<Drawer {...drawerBase} task={askTask} />);
+		});
+		await settle();
+		const chosen = () =>
+			[...container.querySelectorAll(".ask-opt.chosen")].map(
+				(n) => n.textContent,
+			);
+		const input = (label: string) => {
+			const el = container.querySelector(`input[aria-label="${label}"]`);
+			if (el === null) throw new Error(`no ${label} input`);
+			return el;
+		};
+		const draftPosts = () =>
+			calls.filter((c) => c.url === draftUrl && c.method === "POST");
+		const unmount = async () => {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+		};
+		const restore = () => {
+			globalThis.fetch = realFetch;
+		};
+		return { container, calls, chosen, input, draftPosts, unmount, restore };
+	}
+
+	test("a server draft newer than the local one shows when the panel opens", async () => {
+		window.localStorage.clear();
+		saveAskDraft("t1", { fp, answers: { 1: "EU" }, at: 100 });
+		const server = { fp, answers: { 0: "SQLite", 1: "US" }, at: 200 };
+		const m = await mount(server);
+		try {
+			expect(
+				m.calls.some((c) => c.url === draftUrl && c.method === "GET"),
+			).toBe(true);
+			expect(m.chosen()).toEqual(["SQLite", "US"]);
+			// The server draft also replaces the local cache.
+			expect(loadAskDrafts().t1).toEqual(server);
+		} finally {
+			await m.unmount();
+			m.restore();
+		}
+	});
+
+	test("a local draft newer than the server draft wins and syncs to the server", async () => {
+		window.localStorage.clear();
+		const local = { fp, answers: { 0: "Postgres" }, at: 300 };
+		saveAskDraft("t1", local);
+		const m = await mount({ fp, answers: { 0: "SQLite" }, at: 200 });
+		try {
+			expect(m.chosen()).toEqual(["Postgres"]);
+			expect(loadAskDrafts().t1).toEqual(local);
+			// A draft saved offline reaches the server once the load shows it is newer.
+			expect(m.draftPosts().map((c) => JSON.parse(c.body))).toEqual([local]);
+		} finally {
+			await m.unmount();
+			m.restore();
+		}
+	});
+
+	test("a pick saves locally at once and POSTs the draft after the debounce", async () => {
+		window.localStorage.clear();
+		const m = await mount(null);
+		try {
+			const eu = m.input("EU");
+			const before = Date.now();
+			await act(async () => {
+				propOf(eu, "onChange")({ target: eu, currentTarget: eu });
+			});
+			expect(loadAskDrafts().t1?.answers).toEqual({ 1: "EU" });
+			expect(m.draftPosts()).toEqual([]);
+			await settle(600);
+			const posts = m.draftPosts();
+			expect(posts).toHaveLength(1);
+			const body = JSON.parse(posts[0]!.body) as {
+				fp: string;
+				answers: Record<string, string>;
+				at: number;
+			};
+			expect(body.fp).toBe(fp);
+			expect(body.answers).toEqual({ 1: "EU" });
+			expect(body.at).toBeGreaterThanOrEqual(before);
+		} finally {
+			await m.unmount();
+			m.restore();
+		}
+	});
+
+	test("closing the panel sends a pending save at once", async () => {
+		window.localStorage.clear();
+		const m = await mount(null);
+		try {
+			const eu = m.input("EU");
+			await act(async () => {
+				propOf(eu, "onChange")({ target: eu, currentTarget: eu });
+			});
+			await m.unmount();
+			await settle();
+			expect(m.draftPosts()).toHaveLength(1);
+		} finally {
+			m.restore();
+		}
+	});
+
+	test("a reply cancels the pending save", async () => {
+		window.localStorage.clear();
+		const m = await mount(null);
+		try {
+			const eu = m.input("EU");
+			await act(async () => {
+				propOf(eu, "onChange")({ target: eu, currentTarget: eu });
+			});
+			const approve = m.container.querySelector(
+				".ask-actions .ask-send:not(.primary)",
+			);
+			if (approve === null) throw new Error("no Approve button");
+			await act(async () => {
+				propOf(approve, "onClick")({});
+			});
+			await settle(600);
+			expect(m.calls.some((c) => c.url.endsWith("/tasks/t1/reply"))).toBe(true);
+			expect(m.draftPosts()).toEqual([]);
+			// The sent reply drops the local draft too.
+			expect(loadAskDrafts().t1).toBeUndefined();
+		} finally {
+			await m.unmount();
+			m.restore();
+		}
 	});
 });
 

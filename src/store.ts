@@ -279,6 +279,13 @@ CREATE TABLE IF NOT EXISTS jira_imports (
   filed_at INTEGER NOT NULL,
   PRIMARY KEY (site, issue_key)
 );
+-- The ask panel's unsent answers of a multi-question ask, one row per task (docs/specs/ask-drafts.md).
+CREATE TABLE IF NOT EXISTS ask_drafts (
+  task_id TEXT PRIMARY KEY,
+  fp TEXT NOT NULL,
+  answers TEXT NOT NULL,
+  at INTEGER NOT NULL
+);
 -- Retired and unused: review conventions live in the project's AGENTS.md.
 CREATE TABLE IF NOT EXISTS learnings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -822,6 +829,13 @@ function toTurn(r: TurnRow): Turn {
 		ranOn: r.ran_on,
 		logOffset: r.log_offset,
 	};
+}
+
+/** The ask panel's unsent answers: `fp` fingerprints the questions, `answers` maps a question index to its answer, `at` is the client's change time in ms. */
+export interface AskDraft {
+	fp: string;
+	answers: Record<string, string>;
+	at: number;
 }
 
 // Column names for dynamic UPDATEs are this hardcoded whitelist only — values always bind via `?`.
@@ -2873,6 +2887,49 @@ export class ProjectStore {
 			const card = await this.getTask(cardId);
 			if (!card) throw new Error(`fork result card vanished: ${cardId}`);
 			return card;
+		});
+	}
+
+	// ---- Ask drafts ----
+	// The table is created by SCHEMA at open, so existing databases gain it without a migration step.
+
+	async getAskDraft(taskId: string): Promise<AskDraft | null> {
+		return this.queue.run(async () => await this.readAskDraft(taskId));
+	}
+
+	private async readAskDraft(taskId: string): Promise<AskDraft | null> {
+		const row = await this.db
+			.query<{ fp: string; answers: string; at: number }, [string]>(
+				"SELECT fp, answers, at FROM ask_drafts WHERE task_id = ?",
+			)
+			.get(taskId);
+		return row
+			? {
+					fp: row.fp,
+					answers: JSON.parse(row.answers) as Record<string, string>,
+					at: row.at,
+				}
+			: null;
+	}
+
+	/** Upserts the draft unless the stored one is newer; returns the row as it stands after the write. */
+	async saveAskDraft(taskId: string, draft: AskDraft): Promise<AskDraft> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				`INSERT INTO ask_drafts (task_id, fp, answers, at) VALUES (?, ?, ?, ?)
+			 ON CONFLICT(task_id) DO UPDATE SET fp = excluded.fp, answers = excluded.answers, at = excluded.at
+			 WHERE excluded.at >= ask_drafts.at`,
+				[taskId, draft.fp, JSON.stringify(draft.answers), draft.at],
+			);
+			const stored = await this.readAskDraft(taskId);
+			if (!stored) throw new Error(`ask draft vanished: ${taskId}`);
+			return stored;
+		});
+	}
+
+	async deleteAskDraft(taskId: string): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run("DELETE FROM ask_drafts WHERE task_id = ?", [taskId]);
 		});
 	}
 

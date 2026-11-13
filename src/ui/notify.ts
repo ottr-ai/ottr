@@ -11,24 +11,45 @@ export function loadSeenAnswers(): Set<string> {
 	}
 }
 
-/** localStorage map of unsent ask answers per task id; survives drawer close and reload. */
+/** localStorage map of unsent ask answers per task id; survives drawer close and reload.
+ * The server keeps the same draft (`/ask-draft`); this map is the offline cache. */
 export const ASK_DRAFTS_KEY = "ottr.ask.drafts";
 
 export interface AskDraft {
 	/** Fingerprint of the questions (newline-joined texts); a mismatching draft is ignored. */
 	fp: string;
 	answers: Record<number, string>;
+	/** Client time in ms of the change; the larger one wins between local and server. */
+	at: number;
 }
 
 export function loadAskDrafts(): Record<string, AskDraft> {
 	try {
-		return JSON.parse(localStorage.getItem(ASK_DRAFTS_KEY) ?? "{}") as Record<
-			string,
-			AskDraft
-		>;
+		const drafts = JSON.parse(
+			localStorage.getItem(ASK_DRAFTS_KEY) ?? "{}",
+		) as Record<string, AskDraft>;
+		// Older builds wrote no `at`: such a draft loses to any stamped one.
+		for (const d of Object.values(drafts)) {
+			if (typeof d.at !== "number") d.at = 0;
+		}
+		return drafts;
 	} catch {
 		return {};
 	}
+}
+
+/** The draft to show for the ask with fingerprint `fp`: a mismatching draft drops out, then the
+ * larger `at` wins and a tie keeps the local one. */
+export function newerAskDraft(
+	local: AskDraft | undefined,
+	server: AskDraft | null,
+	fp: string,
+): AskDraft | undefined {
+	const l = local?.fp === fp ? local : undefined;
+	const s = server?.fp === fp ? server : undefined;
+	if (l === undefined) return s;
+	if (s === undefined) return l;
+	return s.at > l.at ? s : l;
 }
 
 export function saveAskDraft(taskId: string, draft: AskDraft): void {

@@ -160,6 +160,7 @@ import {
 	useModels,
 } from "./models.ts";
 import {
+	type AskDraft,
 	alatePendingEntry,
 	clearAskDraft,
 	clearComposeDraft,
@@ -169,6 +170,7 @@ import {
 	loadAskDrafts,
 	loadComposeDraft,
 	loadSeenAnswers,
+	newerAskDraft,
 	pruneAskDrafts,
 	SEEN_KEY,
 	saveAskDraft,
@@ -8338,9 +8340,23 @@ function DrawerLoading({ label }: { label: string }) {
 	return <Skeleton shape="list" rows={3} label={label} />;
 }
 
+/** Debounce of the server save of an ask draft; the local cache saves at once. */
+const ASK_DRAFT_SAVE_MS = 500;
+
+interface PendingAskSave {
+	url: string;
+	draft: AskDraft;
+}
+
+/** Fire-and-forget: a failed save keeps the local draft, and the next change sends the full draft again. */
+function sendAskDraft(save: PendingAskSave | null): void {
+	if (save !== null) void post(save.url, save.draft).catch(() => {});
+}
+
 /** The ask: a single question answers in one click; several collect answers first so one reply covers them all. */
 function AskPanel({
 	asked,
+	project,
 	taskId,
 	busy,
 	failed,
@@ -8349,7 +8365,9 @@ function AskPanel({
 	onSend,
 }: {
 	asked: AskQuestion[];
-	/** Draft key: unsent answers survive closing the drawer and a page reload. */
+	/** The task's project: the server draft lives under its task routes. */
+	project: string;
+	/** Draft key: unsent answers survive closing the drawer, a page reload and a device change. */
 	taskId: string;
 	busy: boolean;
 	failed: boolean;
@@ -8361,10 +8379,85 @@ function AskPanel({
 }) {
 	// A changed ask round never sees the old draft: the fingerprint drops it.
 	const fp = asked.map((q) => q.question).join("\n");
-	const [answers, setAnswers] = useState<Record<number, string>>(() => {
+	const draftUrl = `/api/projects/${encodeURIComponent(project)}/tasks/${taskId}/ask-draft`;
+	const [localDraft] = useState(() => {
 		const d = loadAskDrafts()[taskId];
-		return d !== undefined && d.fp === fp ? d.answers : {};
+		return d !== undefined && d.fp === fp ? d : undefined;
 	});
+	const [answers, setAnswers] = useState<Record<number, string>>(
+		localDraft?.answers ?? {},
+	);
+	// `at` of the answers on screen: only a newer server draft replaces them, so a pick
+	// made while the load is in flight stays.
+	const shownAt = useRef(localDraft?.at ?? 0);
+	const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+		undefined,
+	);
+	const pendingSave = useRef<PendingAskSave | null>(null);
+	// AskBlock seeds its picks and typed text from `selected` once: a loaded server
+	// draft remounts the blocks through their key.
+	const [loads, setLoads] = useState(0);
+	// Another browser or device may hold a newer draft. A failed load keeps the local
+	// draft: that is the specified offline mode, not a hidden error.
+	useEffect(() => {
+		let alive = true;
+		fetch(draftUrl)
+			.then((res) => unwrap<{ draft: AskDraft | null }>(res))
+			.then(({ draft }) => {
+				if (!alive) return;
+				const pick = newerAskDraft(loadAskDrafts()[taskId], draft, fp);
+				if (pick === undefined) return;
+				if (pick !== draft) {
+					// A local draft the server lacks (saved offline, or a failed save) syncs now;
+					// a pending save already carries a newer one.
+					const serverAt = newerAskDraft(undefined, draft, fp)?.at ?? 0;
+					if (pick.at > serverAt && pendingSave.current === null)
+						sendAskDraft({ url: draftUrl, draft: pick });
+					return;
+				}
+				if (draft.at <= shownAt.current) return;
+				shownAt.current = draft.at;
+				setAnswers(draft.answers);
+				setLoads((n) => n + 1);
+				saveAskDraft(taskId, draft);
+			})
+			.catch(() => {});
+		return () => {
+			alive = false;
+		};
+	}, [draftUrl, taskId, fp]);
+	// Closing the panel (drawer close, unmount) sends a pending save at once.
+	useEffect(
+		() => () => {
+			clearTimeout(saveTimer.current);
+			sendAskDraft(pendingSave.current);
+			pendingSave.current = null;
+		},
+		[],
+	);
+	const keepDraft = (next: Record<number, string>) => {
+		// Never behind the shown draft: a server draft from a clock ahead of ours must not
+		// make this change read as older.
+		const draft = {
+			fp,
+			answers: next,
+			at: Math.max(Date.now(), shownAt.current + 1),
+		};
+		shownAt.current = draft.at;
+		setAnswers(next);
+		saveAskDraft(taskId, draft);
+		pendingSave.current = { url: draftUrl, draft };
+		clearTimeout(saveTimer.current);
+		saveTimer.current = setTimeout(() => {
+			sendAskDraft(pendingSave.current);
+			pendingSave.current = null;
+		}, ASK_DRAFT_SAVE_MS);
+	};
+	// A reply supersedes the draft: a save that fires after it would only recreate the row.
+	const dropPendingSave = () => {
+		clearTimeout(saveTimer.current);
+		pendingSave.current = null;
+	};
 	// One send closes the ask: the card stays visible until polling removes it, so the panel
 	// stays locked past the request response; a failed send reopens it for a retry.
 	const [sent, setSent] = useState(false);
@@ -8382,6 +8475,7 @@ function AskPanel({
 			.filter(Boolean)
 			.join("\n");
 		if (text !== "") {
+			dropPendingSave();
 			setSent(true);
 			onSend(text);
 		}
@@ -8390,7 +8484,7 @@ function AskPanel({
 		<div className="ask-panel">
 			{asked.map((q, qi) => (
 				<AskBlock
-					key={qi}
+					key={`${qi}:${loads}`}
 					q={q}
 					name={`ask-${qi}`}
 					answered={answers[qi] !== undefined}
@@ -8400,12 +8494,11 @@ function AskPanel({
 					onOpenDiff={onOpenDiff}
 					onAnswer={(t) => {
 						if (asked.length === 1) {
+							dropPendingSave();
 							setSent(true);
 							onSend(t);
 						} else {
-							const next = { ...answers, [qi]: t };
-							setAnswers(next);
-							saveAskDraft(taskId, { fp, answers: next });
+							keepDraft({ ...answers, [qi]: t });
 						}
 					}}
 					onDraft={(t) => {
@@ -8414,8 +8507,7 @@ function AskPanel({
 						const next = { ...answers };
 						if (t === null) delete next[qi];
 						else next[qi] = t;
-						setAnswers(next);
-						saveAskDraft(taskId, { fp, answers: next });
+						keepDraft(next);
 					}}
 				/>
 			))}
@@ -8425,6 +8517,7 @@ function AskPanel({
 					className="ask-send"
 					disabled={locked}
 					onClick={() => {
+						dropPendingSave();
 						setSent(true);
 						onSend("Approve");
 					}}
@@ -9682,6 +9775,7 @@ function DrawerAskPanel(p: {
 			{task.asked !== null && task.state === "needs_you" && (
 				<AskPanel
 					asked={task.asked}
+					project={task.project}
 					taskId={task.id}
 					busy={replySend.busy}
 					failed={replySend.failed}

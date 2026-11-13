@@ -1774,6 +1774,141 @@ describe("task routes", () => {
 		expect(await errorOf(refusal)).toBe("task is not waiting for you");
 	});
 
+	/** A needs-you card with an outstanding two-question ask. */
+	const askedTask = async (title: string) => {
+		const t = await store.createTask(title);
+		await store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: "the agent asked",
+			asked: ["A?", "B?"].map((question) => ({
+				question,
+				options: [{ label: "yes" }, { label: "no" }],
+				multi: false,
+				recommended: null,
+			})),
+		});
+		return t;
+	};
+	/** The response's `draft` field; undefined when the body has none. */
+	const draftOf = async (res: Response): Promise<unknown> => {
+		const b: unknown = await res.json();
+		return typeof b === "object" && b !== null && "draft" in b
+			? b.draft
+			: undefined;
+	};
+
+	test("ask-draft POST stores the draft and GET returns it", async () => {
+		const t = await askedTask("draft round trip");
+		const url = `/api/projects/p1/tasks/${t.id}/ask-draft`;
+		expect(await draftOf(await get(url))).toBeNull();
+		const draft = { fp: "A?\nB?", answers: { "0": "yes" }, at: 100 };
+		const res = await post(url, draft);
+		expect(res.status).toBe(200);
+		expect(await draftOf(res)).toEqual(draft);
+		expect(await store.getAskDraft(t.id)).toEqual(draft);
+		const got = await get(url);
+		expect(got.status).toBe(200);
+		expect(await draftOf(got)).toEqual(draft);
+		// An older save changes nothing and answers with the stored newer draft.
+		const stale = await post(url, { fp: "A?\nB?", answers: {}, at: 50 });
+		expect(stale.status).toBe(200);
+		expect(await draftOf(stale)).toEqual(draft);
+	});
+
+	test("ask-draft POST is 409 without an outstanding ask", async () => {
+		const plain = await store.createTask("no ask");
+		await store.updateTask(plain.id, { state: "needs_you", needsReason: "?" });
+		const body = { fp: "A?", answers: { "0": "yes" }, at: 1 };
+		const noAsk = await post(
+			`/api/projects/p1/tasks/${plain.id}/ask-draft`,
+			body,
+		);
+		expect(noAsk.status).toBe(409);
+		expect(await errorOf(noAsk)).toBe("task has no open question");
+		const running = await askedTask("asked, then resumed");
+		await store.updateTask(running.id, { state: "running" });
+		const notWaiting = await post(
+			`/api/projects/p1/tasks/${running.id}/ask-draft`,
+			body,
+		);
+		expect(notWaiting.status).toBe(409);
+		const cancelled = await askedTask("asked, then cancelled");
+		await store.updateTask(cancelled.id, { cancelledAt: Date.now() });
+		const gone = await post(
+			`/api/projects/p1/tasks/${cancelled.id}/ask-draft`,
+			body,
+		);
+		expect(gone.status).toBe(409);
+		expect(await store.getAskDraft(plain.id)).toBeNull();
+		expect(await store.getAskDraft(running.id)).toBeNull();
+		expect(await store.getAskDraft(cancelled.id)).toBeNull();
+	});
+
+	test("ask-draft POST refuses each bad body with 400", async () => {
+		const t = await askedTask("bad drafts");
+		const ok = { fp: "A?\nB?", answers: { "0": "yes" }, at: 1 };
+		const tooMany = Object.fromEntries(
+			Array.from({ length: 51 }, (_, i) => [String(i), "x"]),
+		);
+		const bad: Record<string, unknown>[] = [
+			{ ...ok, fp: 7 },
+			{ ...ok, fp: "x".repeat(20001) },
+			{ ...ok, answers: null },
+			{ ...ok, answers: ["yes"] },
+			{ ...ok, answers: { a: "yes" } },
+			{ ...ok, answers: { "01": "yes" } },
+			{ ...ok, answers: { "-1": "yes" } },
+			{ ...ok, answers: tooMany },
+			{ ...ok, answers: { "0": 1 } },
+			{ ...ok, answers: { "0": "x".repeat(20001) } },
+			{ ...ok, at: 0 },
+			{ ...ok, at: 1.5 },
+			{ ...ok, at: "1" },
+			{ ...ok, at: Number.MAX_SAFE_INTEGER + 1 },
+			{ fp: ok.fp, answers: ok.answers },
+		];
+		for (const body of bad) {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/ask-draft`, body);
+			expect(res.status).toBe(400);
+		}
+		expect(await store.getAskDraft(t.id)).toBeNull();
+		// The edge values pass: 50 entries and the largest safe `at`.
+		const edge = {
+			fp: ok.fp,
+			answers: Object.fromEntries(
+				Array.from({ length: 50 }, (_, i) => [String(i), "x"]),
+			),
+			at: Number.MAX_SAFE_INTEGER,
+		};
+		const res = await post(`/api/projects/p1/tasks/${t.id}/ask-draft`, edge);
+		expect(res.status).toBe(200);
+	});
+
+	test("a successful reply deletes the ask draft; a refused one keeps it", async () => {
+		const t = await askedTask("draft then reply");
+		const url = `/api/projects/p1/tasks/${t.id}/ask-draft`;
+		const draft = { fp: "A?\nB?", answers: { "0": "yes" }, at: 1 };
+		expect((await post(url, draft)).status).toBe(200);
+		// A 400 (empty text) and a 409 (not waiting) leave the draft in place.
+		const empty = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "  ",
+		});
+		expect(empty.status).toBe(400);
+		await store.updateTask(t.id, { state: "running" });
+		const refused = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "yes",
+		});
+		expect(refused.status).toBe(409);
+		expect(await draftOf(await get(url))).toEqual(draft);
+		await store.updateTask(t.id, { state: "needs_you" });
+		const sent = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+			text: "yes",
+		});
+		expect(sent.status).toBe(200);
+		expect(await draftOf(await get(url))).toBeNull();
+		expect(await store.getAskDraft(t.id)).toBeNull();
+	});
+
 	test("reply and Resume keep a steer queued before the stop", async () => {
 		const t = await store.createTask("stopped while steered");
 		await store.updateTask(t.id, {

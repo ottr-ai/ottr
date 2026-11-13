@@ -324,6 +324,7 @@ import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, type SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
 import {
+	type AskDraft,
 	type BoardTurnFacts,
 	logStoreError,
 	ProjectStore,
@@ -11225,7 +11226,18 @@ export async function createApp(deps: AppDeps) {
 			return await prReviewReply(e, task, text, r.body);
 		return { e, task, text, body: r.body };
 	}
+	/** A successful reply answers the ask, so its server-side draft goes too (docs/specs/ask-drafts.md). */
 	async function handlePOSTProjectsTasksReplyByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/reply">,
+	): Promise<Response> {
+		const res = await sendReply(req);
+		if (!res.ok) return res;
+		const found = await resolveTask(req.params.project, req.params.id);
+		if (!(found instanceof Response))
+			await found.e.store.deleteAskDraft(found.task.id);
+		return res;
+	}
+	async function sendReply(
 		req: BunRequest<"/api/projects/:project/tasks/:id/reply">,
 	): Promise<Response> {
 		const picked = await replyTarget(req);
@@ -11274,6 +11286,68 @@ export async function createApp(deps: AppDeps) {
 		});
 		await deps.schedule();
 		return await taskResponse(e, task.id);
+	}
+
+	/** The validated ask draft body (docs/specs/ask-drafts.md); a Response is the 400. */
+	function askDraftBody(body: Record<string, unknown>): AskDraft | Response {
+		const { fp, at } = body;
+		if (typeof fp !== "string" || fp.length > 20000)
+			return json(
+				{ error: "fp must be a string of at most 20000 characters" },
+				400,
+			);
+		const answers = askDraftAnswers(body.answers);
+		if (answers instanceof Response) return answers;
+		if (typeof at !== "number" || !Number.isSafeInteger(at) || at <= 0)
+			return json({ error: "at must be a positive integer" }, 400);
+		return { fp, answers, at };
+	}
+	/** The draft's answers: at most 50 question indexes, each to a string of at most 20000 characters. */
+	function askDraftAnswers(v: unknown): Record<string, string> | Response {
+		if (typeof v !== "object" || v === null || Array.isArray(v))
+			return json({ error: "answers must be an object" }, 400);
+		const entries = Object.entries(v);
+		if (entries.length > 50)
+			return json({ error: "answers must have at most 50 entries" }, 400);
+		const answers: Record<string, string> = {};
+		for (const [key, value] of entries) {
+			if (!/^(0|[1-9]\d*)$/.test(key))
+				return json({ error: "answers keys must be question indexes" }, 400);
+			if (typeof value !== "string" || value.length > 20000)
+				return json(
+					{
+						error: "answers values must be strings of at most 20000 characters",
+					},
+					400,
+				);
+			answers[key] = value;
+		}
+		return answers;
+	}
+	async function handleGETProjectsTasksAskDraftByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/ask-draft">,
+	): Promise<Response> {
+		const found = await resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		return json({ draft: await found.e.store.getAskDraft(found.task.id) });
+	}
+	async function handlePOSTProjectsTasksAskDraftByProjectAndId(
+		req: BunRequest<"/api/projects/:project/tasks/:id/ask-draft">,
+	): Promise<Response> {
+		const r = await readJson(req);
+		if ("error" in r) return r.error;
+		const found = await resolveTask(req.params.project, req.params.id);
+		if (found instanceof Response) return found;
+		const draft = askDraftBody(r.body);
+		if (draft instanceof Response) return draft;
+		const { e, task } = found;
+		if (
+			task.cancelledAt !== null ||
+			task.asked === null ||
+			task.state !== "needs_you"
+		)
+			return json({ error: "task has no open question" }, 409);
+		return json({ draft: await e.store.saveAskDraft(task.id, draft) });
 	}
 
 	/** The validated triage priority; a Response is the 400. */
@@ -13555,6 +13629,18 @@ export async function createApp(deps: AppDeps) {
 					{
 						costly: true,
 					},
+				),
+		},
+		"/api/projects/:project/tasks/:id/ask-draft": {
+			GET: async (req) =>
+				await api(
+					req,
+					async () => await handleGETProjectsTasksAskDraftByProjectAndId(req),
+				),
+			POST: async (req) =>
+				await api(
+					req,
+					async () => await handlePOSTProjectsTasksAskDraftByProjectAndId(req),
 				),
 		},
 		"/api/projects/:project/tasks/:id/merge-anyway": {

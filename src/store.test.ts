@@ -6084,6 +6084,61 @@ describe("jira imports", () => {
 	});
 });
 
+describe("ask drafts", () => {
+	test("save, get and delete round-trip a task's draft", async () => {
+		const store = await open(join(root, "ask-drafts"));
+		expect(await store.getAskDraft("t1")).toBeNull();
+		const draft = { fp: "A?\nB?", answers: { "0": "yes", "1": "no" }, at: 5 };
+		expect(await store.saveAskDraft("t1", draft)).toEqual(draft);
+		expect(await store.getAskDraft("t1")).toEqual(draft);
+		expect(await store.getAskDraft("t2")).toBeNull();
+		await store.deleteAskDraft("t1");
+		expect(await store.getAskDraft("t1")).toBeNull();
+		await store.close();
+	});
+
+	test("an older draft never overwrites a newer one; an equal or newer one does", async () => {
+		const store = await open(join(root, "ask-drafts-order"));
+		const newer = { fp: "Q?", answers: { "0": "new" }, at: 20 };
+		await store.saveAskDraft("t1", newer);
+		expect(
+			await store.saveAskDraft("t1", {
+				fp: "Q?",
+				answers: { "0": "old" },
+				at: 10,
+			}),
+		).toEqual(newer);
+		expect(await store.getAskDraft("t1")).toEqual(newer);
+		const same = { fp: "Q?", answers: { "0": "same" }, at: 20 };
+		expect(await store.saveAskDraft("t1", same)).toEqual(same);
+		const later = { fp: "R?", answers: {}, at: 30 };
+		expect(await store.saveAskDraft("t1", later)).toEqual(later);
+		await store.close();
+	});
+
+	test("an old database gains the ask_drafts table on open", async () => {
+		const dir = join(root, "ask-drafts-migration");
+		mkdirSync(join(dir, ".tasks"), { recursive: true });
+		const old = new Database(join(dir, ".tasks", "tasks.db"), { create: true });
+		old.exec(
+			"CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		);
+		old.close();
+		const store = await open(dir);
+		const draft = { fp: "Q?", answers: { "0": "a" }, at: 1 };
+		await store.saveAskDraft("t1", draft);
+		await store.close();
+		const raw = new Database(join(dir, ".tasks", "tasks.db"));
+		const rows = raw
+			.query<{ task_id: string; answers: string }, []>(
+				"SELECT task_id, answers FROM ask_drafts",
+			)
+			.all();
+		raw.close();
+		expect(rows).toEqual([{ task_id: "t1", answers: '{"0":"a"}' }]);
+	});
+});
+
 describe("gate column", () => {
 	test("a fresh database carries the gate column via TASKS_DDL", async () => {
 		const store = await open(join(root, "gate-fresh"));
