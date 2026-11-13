@@ -552,14 +552,59 @@ Non-goals of this section:
   and the no-run deadline. Merge-push cards use `doneAt`, so a later card
   write does not move their deadline.
 - A failed run on the PR head does not file a separate card: the tracker
-  replies on the same card with the failed-check list and the
-  `gh run view --log-failed --repo <repo>` instruction (the
-  "CI failed on the PR head" wording), clears `pushSha`, and requeues the
-  card `in_progress`/`queued` — one fix attempt per head SHA, the same
-  one-fix-per-push dedupe rule as `ciPass`. The fix lands through the normal
-  flow: work turn, merge turn, branch push updates the same PR.
-- A failed run on the merged target commit after `done` keeps today's
-  follow-up-card flow unchanged.
+  replies on the same card with the failed-check list and the failed
+  steps' log (OTTR-915). The log is fetched on the server with the board
+  token, one `gh run view <run-id> --log-failed --repo <repo>` per failed
+  run, and lands in the reply as an untrusted data block — the same
+  `ciLogSection` fetch and fence the follow-up handoff uses; a failed
+  fetch keeps the plain refetch instruction. The reply clears `pushSha`
+  and requeues the card `in_progress`/`queued` — one fix attempt per head
+  SHA, the same one-fix-per-push dedupe rule as `ciPass`. The fix lands
+  through the normal flow: work turn, merge turn, branch push updates the
+  same PR.
+- A failed run on the merged target commit after `done` reopens the card
+  when the run matches exactly one; see the next section.
+
+## CI failure after the merge (OTTR-915)
+
+A done card keeps `pushSha` pinned to its merge commit, so `ciPass` keeps
+guarding the merged target head. A failed run there used to file a fresh
+follow-up card that started with none of the original task's prompt,
+session, decisions or check findings. The board now answers on the card
+that owns the work:
+
+- The failed run's head sha matches exactly one non-cancelled done card by
+  `pushSha`, and no open follow-up card names this failing head: the board
+  reopens that card. The write sets `in_progress`/`queued` with
+  `needsReason` null, queues the failed-check list plus the failed steps'
+  log as the pending prompt, and clears `pushSha`, `worktree` and
+  `branch`. `doneAt` stays: nothing reads it while the stage is not
+  `done`, and the next done write stamps it fresh.
+- The next turn dispatch reads the cleared row fields and takes the
+  create-worktree path: a fresh worktree and branch from the current
+  target tip, while the card's `sessionId` carries over untouched, so the
+  agent resumes its own session. The fix ships through the normal merge
+  flow; a PR-mode card re-ships and opens a new PR (OTTR-799).
+- The same one-fix-per-head dedupe as the PR-head reply: the cleared
+  `pushSha` stops a second reply for the same head, and the next ship pins
+  a new head for the next verdict.
+- Fallback — the follow-up card files exactly as before this reopen
+  existed: zero or several done cards match the `pushSha` (several cards
+  in one push), the single match is a cancelled card, or an open follow-up
+  already covers this head. The follow-up links to the card in its lineage
+  (`followUpOf`) as today, and the per-push and per-check dedupe rules
+  stand.
+
+Non-goals of this section:
+
+- No new state or schema: the reopen reuses `in_progress`/`queued` and
+  clears existing columns; no CHECK-constraint change.
+- No worktree or branch cleanup on reopen: both are already gone on every
+  done path (`removeWorktree` deletes the local branch; the PR ship's
+  remote delete covers origin). A branch that a failed delete left behind
+  is reused at its tip by `createWorktree`, which is safe: the turn then
+  works from the merged tip and the merge turn rebases.
+- The reopen makes no GitHub call beyond the log fetch.
 
 ## Store
 
@@ -636,12 +681,20 @@ server remains the only writer of origin.
 - The cancel-kept test covers `cancelledAt: null` and state `needs_you`
   after cancellation. Both survive the ship result without a success
   report overwrite.
-- PR merged: card `done`, worktree removed, `pushSha` = the merge commit, a
-  failed target CI after that files a follow-up card as today.
+- PR merged: card `done`, worktree removed, `pushSha` = the merge commit.
 - PR closed unmerged: card `in_progress`/`needs_you` with the reason, branch
   and worktree kept; a reply re-merges and opens a new PR.
 - CI failure on the PR head: one supervisor reply per head, card requeued;
-  the fixed push updates the same PR.
+  the fixed push updates the same PR. The reply text carries the fetched
+  failed-step log block (untrusted-data fence); a failed fetch keeps the
+  plain refetch instruction.
+- CI failure after the merge (OTTR-915): a failed run whose head sha
+  matches exactly one done card reopens that card — `in_progress`/`queued`
+  with the failed-step log in the pending prompt, `pushSha`, `worktree`
+  and `branch` cleared, no follow-up card filed, and the next tick replies
+  nothing. A run matching two done cards files one follow-up card as
+  today and reopens nothing. A failed log fetch keeps the refetch
+  instruction in the reopen prompt.
 - OTTR-799: a queued `merging` card with a `prNumber` is pickable and
   re-ships — the push updates the same PR (or opens a fresh one after a
   close), and `prHeadSha`/`pushSha` pin the new tip; an idle PR card is

@@ -1719,6 +1719,67 @@ export function createSupervisor(
 		return true;
 	}
 
+	/** OTTR-915: a failed run on a merged target commit reopens the one done card the
+	 * pushSha pins instead of filing a follow-up: fresh worktree from the current target at
+	 * the next dispatch (cleared worktree and branch take the create path), the same session
+	 * (sessionId untouched), the failed-check list plus the fetched log in the prompt, and
+	 * pushSha cleared — the same one-fix-per-head dedupe as ciPrHeadReply. The fallback that
+	 * files the follow-up card as before: no single matching card, a cancelled match, or an
+	 * open follow-up already covering this head. True = the failure was answered on the card. */
+	async function ciReopenDoneCard(
+		e: SupervisorEntry,
+		t: ListedTask,
+		pushSha: string,
+		failed: WorkflowRun[],
+		repo: string,
+		refetch: string,
+		head: string,
+	): Promise<boolean> {
+		if (t.stage !== "done" || t.cancelledAt !== null) return false;
+		const matches = (await e.store.listTasks()).filter(
+			(x) =>
+				x.stage === "done" && x.cancelledAt === null && x.pushSha === pushSha,
+		);
+		if (
+			matches.length !== 1 ||
+			(await ciFollowUpFiled(e, t, head.split("\n", 1)[0]))
+		)
+			return false;
+		const short = pushSha.slice(0, 7);
+		const logs = await ciLogSection(e, t, failed, repo);
+		const text = [
+			head,
+			`Find the cause (e.g. ${refetch}), fix it, and land the fix through a normal merge.`,
+			// OTTR-850: the prompt names its outside check, so it passes the gate on its own.
+			"Check: the failed workflow passes again on the merge push.",
+			logs,
+		]
+			.filter((x) => x !== "")
+			.join("\n\n");
+		if (await wentStale(e.store, t)) return true;
+		if (
+			!(await applyTask(e, t, {
+				stage: "in_progress",
+				state: "queued",
+				needsReason: null,
+				queuedAt: ops.now(),
+				pendingPrompt: text,
+				pendingBy: "supervisor",
+				pushSha: null,
+				worktree: null,
+				branch: null,
+			}))
+		)
+			return true;
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: CI failed on the merge push ${short}; reopened the card for a fix`,
+		);
+		await ops.schedule();
+		return true;
+	}
+
 	// One fix per failing push: a restarted supervisor (crash between createTask and stop)
 	// or two cards pinned to the same merge push (capture race in turn.ts) must not file twice.
 	async function ciFollowUpFiled(
@@ -1917,6 +1978,8 @@ export function createSupervisor(
 			`CI failed on the merge push of this card's parent task (${pushSha.slice(0, 7)} on ${e.target ?? "the target branch"}).`,
 			...failed.map((r) => `- ${r.name}: ${r.conclusion} - ${r.html_url}`),
 		].join("\n");
+		if (await ciReopenDoneCard(e, t, pushSha, failed, repo, refetch, head))
+			return;
 		await ciFileFollowUp(e, t, pushSha, failed, repo, head, refetch, stop);
 	}
 
