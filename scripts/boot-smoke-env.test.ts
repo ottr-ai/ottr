@@ -1,10 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import fc from "fast-check";
+import fc from "../src/test/properties.ts";
 import { INHERITED, smokeEnv } from "./boot-smoke-env.ts";
-
-// Gate: 200 runs, fixed seed (src/test/properties.ts convention). Deep tier
-// (FC_RUNS set): random seed. fast-check prints the seed and path on failure.
-const runs = Number(process.env.FC_RUNS ?? 200);
 
 // ALLOWED[key] is true for every key the booted server may inherit.
 const ALLOWED: Record<string, true> = Object.fromEntries(
@@ -100,6 +96,6 @@ describe("smokeEnv", () => {
 				expect(env.HOME).toBe("/home/smoke");
 			},
 		);
-		fc.assert(property, { numRuns: runs });
+		fc.assert(property);
 	});
 });
