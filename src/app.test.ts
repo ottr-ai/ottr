@@ -72,6 +72,7 @@ import {
 	FORK_PROPOSED_REASON_PREFIX,
 	followUpPrompt,
 	forkProposedReason,
+	LOST_SESSION,
 	RELEASE_SUMMARY_INSTRUCTIONS,
 	RETRO_MARKER,
 	RULES_INTERVIEW_MARKER,
@@ -6772,6 +6773,24 @@ describe("steer cancel route", () => {
 		expect(after.pendingBy).toBe("user");
 	});
 
+	test("a steer clears a feedback park's flag", async () => {
+		const t = store.createTask("parked with feedback");
+		store.updateTask(t.id, {
+			state: "queued",
+			pendingPrompt: "blocks",
+			pendingBy: "supervisor",
+			pendingFeedback: true,
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer`, {
+			text: "focus on the parser",
+		});
+		expect(res.status).toBe(200);
+		const after = store.getTask(t.id)!;
+		expect(after.pendingPrompt?.endsWith("focus on the parser")).toBe(true);
+		// The queue now carries user steering, not an unaddressed supervisor park.
+		expect(after.pendingFeedback).toBe(false);
+	});
+
 	test("nothing queued, or an automatic resume, is 409", async () => {
 		const t = await store.createTask("nothing queued");
 		await store.updateTask(t.id, { state: "running" });
@@ -6975,6 +6994,25 @@ describe("steer edit route", () => {
 		expect((await store.getTask(t.id))!.pendingBy).toBe("user");
 	});
 
+	test("rewriting a feedback park clears the flag", async () => {
+		const t = store.createTask("parked with feedback");
+		store.updateTask(t.id, {
+			state: "running",
+			pendingPrompt: "blocks",
+			pendingBy: "supervisor",
+			pendingFeedback: true,
+		});
+		const res = await post(`/api/projects/p1/tasks/${t.id}/steer/edit`, {
+			text: "focus on the parser",
+		});
+		expect(res.status).toBe(200);
+		const after = store.getTask(t.id)!;
+		// A human rewrote the text, so it is no longer the supervisor's park.
+		expect(after.pendingPrompt).toBe("focus on the parser");
+		expect(after.pendingBy).toBe("user");
+		expect(after.pendingFeedback).toBe(false);
+	});
+
 	test("nothing queued, an automatic resume, and empty text are rejected", async () => {
 		const t = await store.createTask("nothing queued");
 		await store.updateTask(t.id, { state: "running" });
@@ -7017,6 +7055,33 @@ describe("steer edit route", () => {
 			text: "hello",
 		});
 		expect(unknown.status).toBe(404);
+	});
+});
+
+describe("restart session route", () => {
+	test("a restart queues the lost-session ask and clears the feedback flag", async () => {
+		const t = store.createTask("parked with feedback");
+		store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: prFeedbackReason(7),
+			sessionId: "sess-1",
+			pendingPrompt: "blocks",
+			pendingBy: "supervisor",
+			pendingFeedback: true,
+		});
+		const res = await post(
+			`/api/projects/p1/tasks/${t.id}/restart-session`,
+			{},
+		);
+		expect(res.status).toBe(200);
+		const after = store.getTask(t.id)!;
+		// A fresh session never answers the old park: the lost-session text is
+		// the new ask, and the reviewer blocks are gone with it.
+		expect(after.pendingPrompt).toBe(LOST_SESSION);
+		expect(after.pendingFeedback).toBe(false);
+		expect(after.state).toBe("queued");
+		expect(after.pendingBy).toBe("supervisor");
+		expect(after.sessionId).toBeNull();
 	});
 });
 

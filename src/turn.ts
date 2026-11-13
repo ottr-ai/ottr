@@ -5748,6 +5748,8 @@ export function createTurnLoop(
 				pendingImages: restImages,
 				// rest holds only steering that landed mid-run (user); a full consume clears.
 				pendingBy: rest === null ? null : "user",
+				// The consumed park's prompt is gone; rest is user steering, not supervisor data.
+				pendingFeedback: false,
 			});
 		});
 	}

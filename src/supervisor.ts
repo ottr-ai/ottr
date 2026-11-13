@@ -1644,15 +1644,18 @@ export function createSupervisor(
 			.filter((x) => x !== "")
 			.join("\n\n");
 		if (await wentStale(e.store, t)) return true;
+		const feedback = t.pendingFeedback === true && t.pendingPrompt !== null;
 		if (
 			!(await applyTask(e, t, {
 				stage: "in_progress",
 				state: "queued",
 				needsReason: null,
 				queuedAt: ops.now(),
-				pendingPrompt: text,
+				// A feedback park's blocks ride along: the fix turn needs them and the sweep's
+				// cutoff is already past them (OTTR-877). The CI instruction goes first.
+				pendingPrompt: feedback ? `${text}\n\n${t.pendingPrompt}` : text,
 				pendingBy: "supervisor",
-				pendingFeedback: false,
+				pendingFeedback: feedback,
 				pushSha: null,
 			}))
 		)
@@ -2295,33 +2298,53 @@ export function createSupervisor(
 		mergeable: boolean | null,
 		reason: string,
 	): Promise<void> {
+		// prSettleMerging guards the number before prConflictCard gets here; this guard
+		// only narrows the type for the feedback-reason write below.
+		if (t.prNumber === null) return;
 		const parked = t.state === "needs_you" && t.needsReason === reason;
 		if (t.state !== "idle" && !parked) return;
 		// A write needs a verdict that contradicts the card: false (conflict) while it waits
 		// idle, true (can merge) while it is parked. Null equals neither flag.
 		if (mergeable !== parked) return;
 		if (await wentStale(e.store, t)) return;
-		if (
-			!(await applyTask(
-				e,
-				t,
-				parked
-					? {
-							state: "idle",
-							needsReason: null,
-							pendingPrompt: null,
-							pendingFeedback: false,
-						}
-					: { state: "needs_you", needsReason: reason },
-			))
-		)
+		// wentStale passed to get here, so the prompt is null or feedback-flagged
+		// (OTTR-877); a flagged park keeps its blocks below, an unflagged one
+		// drops the prompt with the un-park.
+		if (parked) {
+			// Reviewer feedback on the park is unaddressed (OTTR-877): keep the blocks
+			// under the feedback reason, so a reply still starts a fix turn. Only a
+			// park without feedback returns to waiting on GitHub.
+			const kept = t.pendingPrompt !== null && t.pendingFeedback === true;
+			if (
+				!(await applyTask(
+					e,
+					t,
+					kept
+						? { state: "needs_you", needsReason: prFeedbackReason(t.prNumber) }
+						: {
+								state: "idle",
+								needsReason: null,
+								pendingPrompt: null,
+								pendingFeedback: false,
+							},
+				))
+			)
+				return;
+			await ops.appendLog(
+				e.store,
+				t.id,
+				kept
+					? `supervisor: PR #${t.prNumber} can merge again; reviewer feedback kept on the card`
+					: `supervisor: PR #${t.prNumber} can merge again; card waits on GitHub`,
+			);
+			return;
+		}
+		if (!(await applyTask(e, t, { state: "needs_you", needsReason: reason })))
 			return;
 		await ops.appendLog(
 			e.store,
 			t.id,
-			parked
-				? `supervisor: PR #${t.prNumber} can merge again; card waits on GitHub`
-				: `supervisor: PR #${t.prNumber} has merge conflicts; card parked`,
+			`supervisor: PR #${t.prNumber} has merge conflicts; card parked`,
 		);
 	}
 

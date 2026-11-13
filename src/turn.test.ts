@@ -3441,6 +3441,54 @@ describe("turn sessions, steering and images", () => {
 		expect(unsavedCalls).toBe(0);
 	});
 
+	test("the turn dispatch clears a feedback park's flag", async () => {
+		const store = freshStore();
+		const record = baseRecord();
+		let unsavedCalls = 0;
+		const task = store.createTask("work please");
+		store.updateTask(task.id, {
+			pendingPrompt: "parked blocks",
+			pendingFeedback: true,
+			pendingBy: "supervisor",
+		});
+		// Cap 0: the finally's schedule() must not start the queued follow-up mid-assertion.
+		const loop = createTurnLoop(
+			new Map([[store.name, fakeProject(store)]]),
+			fakeOps(record, {
+				maxTotalRuns: () => 0,
+				startRun: (o: {
+					prompt: string;
+					onSession?: (sid: string) => void;
+				}) => {
+					record.runs.push(o as never);
+					o.onSession?.("sess-1");
+					if (record.runs.length === 1) {
+						store.updateTask(task.id, { pendingPrompt: "steer mid-run" });
+					}
+					return {
+						pid: 4242,
+						done: Promise.resolve(runResult({})),
+						kill: async () => {},
+					};
+				},
+				unsavedWork: async () => {
+					unsavedCalls += 1;
+					return null;
+				},
+			}),
+		);
+		await loop.runTurn(store.name, task.id);
+		// Same worktree walk as the sibling test: a clean tree consults nothing.
+		expect(unsavedCalls).toBe(0);
+		const after = store.getTask(task.id)!;
+		// The dispatch consumed the parked blocks as this turn's input; what is left
+		// is the mid-run steer, and the supervisor flag went with the consume.
+		expect(after.pendingPrompt).toBe("steer mid-run");
+		expect(after.pendingFeedback).toBe(false);
+		expect(after.pendingBy).toBe("user");
+		expect(after.state).toBe("queued");
+	});
+
 	test("a model switch mid-run lands with the next turn", async () => {
 		const store = await freshStore();
 		const record = baseRecord();

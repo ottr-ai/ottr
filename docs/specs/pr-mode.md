@@ -331,10 +331,16 @@ line per park write.
 The park writes the `pending_feedback` flag with the prompt: it marks the
 queued text as supervisor-written reviewer data, not a user reply.
 `wentStale` ignores a flagged prompt, so the merge verdict, the merged done
-write and the closed park settle through it; a reply or steer clears the
-flag and keeps today's protection. Moving the card off the park clears the
-prompt and the flag together: the un-park to idle, the merged done write,
-and a CI-failure requeue.
+write and the closed park settle through it. A reply, a steer, an edit of
+the queued text, a session restart, and the turn dispatch clear the flag
+with the prompt, so user text keeps today's protection. The CI-failure
+reply on a feedback-parked card requeues a fix turn whose prompt holds the
+CI text first and the reviewer blocks after it, with the flag kept. When
+GitHub can merge a conflict-parked card that carries reviewer feedback,
+the card stays needs_you and takes the feedback reason with the blocks
+kept, so a reply still starts a fix turn; a conflict-parked card without
+feedback un-parks to idle with prompt and flag cleared. The merged done
+write clears both.
 
 A reply on the parked card queues a work fix turn (stage `in_progress`);
 the merge turn after it re-ships the branch and updates the same pull
@@ -697,8 +703,12 @@ server remains the only writer of origin.
   the cutoff parks the same way. The first sweep after the park initializes
   nothing and a reply on the parked card queues a work fix turn whose merge
   turn updates the same PR. A merged pull request finishes a feedback-parked
-  card done; a conflict resolved on GitHub un-parks an appended card and
-  clears the blocks with the flag; a credential-shaped comment parks with
+  card done. A conflict resolved on GitHub turns an appended card into a
+  feedback park with the blocks kept, and un-parks a conflict-parked card
+  without feedback to idle. A CI failure on a feedback-parked card requeues
+  a fix turn whose prompt holds the CI text and the reviewer blocks, with
+  the flag kept. A steer, an edit of the queued text, a session restart and
+  the turn dispatch clear the flag. A credential-shaped comment parks with
   the author label and the `redacted: possible credential` marker only.
   Fresh and migrated databases converge on `pr_watch_at` and
   `pending_feedback`.

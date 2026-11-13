@@ -4971,7 +4971,7 @@ describe("prPass", () => {
 		store.close();
 	});
 
-	test("a resolved conflict un-parks an appended feedback card", async () => {
+	test("a resolved conflict keeps an appended card parked as feedback", async () => {
 		const store = prModeProject("pr-feedback-unpark");
 		const t = prCard(store);
 		store.updateTask(t.id, {
@@ -4996,17 +4996,22 @@ describe("prPass", () => {
 		expect(parked.pendingPrompt).toContain("REVIEW COMMENT by carol");
 		expect(parked.pendingFeedback).toBe(true);
 		ops.time += 6 * 60_000; // past the PR poll window
-		// GitHub can merge again and no new feedback arrived: the verdict un-park
-		// drops the appended blocks and their flag together.
+		// GitHub can merge again and no new feedback arrived: the appended blocks
+		// are unaddressed reviewer feedback, so the card stays parked under the
+		// feedback reason and a reply still starts a fix turn.
 		ops.apiResult = feedbackApi({
 			pull: pullBody({ state: "open", mergeable: true }),
 		});
 		await tick(projects, ops);
 		const after = store.getTask(t.id)!;
-		expect(after.state).toBe("idle");
-		expect(after.needsReason).toBeNull();
-		expect(after.pendingPrompt).toBeNull();
-		expect(after.pendingFeedback).toBe(false);
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(prFeedbackReason(7));
+		expect(after.pendingPrompt).toBe(parked.pendingPrompt);
+		expect(after.pendingFeedback).toBe(true);
+		const log = await Bun.file(store.logPath(t.id)).text();
+		expect(log).toContain(
+			"PR #7 can merge again; reviewer feedback kept on the card",
+		);
 		store.close();
 	});
 
@@ -5138,6 +5143,61 @@ describe("CI on the PR head", () => {
 		expect(after.pushSha).toBeNull();
 		expect(after.pendingPrompt).toMatch(/^CI failed on the PR head/);
 		await store.close();
+	});
+
+	test("a CI failure requeues a feedback park with both texts", async () => {
+		const store = prModeProject("ci-pr-head-feedback");
+		const t = prCard(store);
+		store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		// The PR still merges, so the conflict verdict stays out of it: tick 1 parks
+		// through the feedback watch alone.
+		const ops = fakeOps({
+			apiResult: feedbackApi({
+				issue: [
+					{
+						user: { login: "carol" },
+						created_at: "2026-11-01T12:00:00Z",
+						body: "Please fix the leak",
+					},
+				],
+			}),
+		});
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const parked = store.getTask(t.id)!;
+		expect(parked.state).toBe("needs_you");
+		expect(parked.needsReason).toBe(prFeedbackReason(7));
+		expect(parked.pendingFeedback).toBe(true);
+		const blocks = parked.pendingPrompt ?? "";
+		expect(blocks).toContain("DATA>>>");
+		// ciPass runs before prPass: the failed build replies on the parked card and
+		// the reviewer blocks ride along after the CI instruction (OTTR-877).
+		const failed = runsJson([
+			{
+				id: 42,
+				status: "completed",
+				conclusion: "failure",
+				name: "build",
+				html_url: "https://example.com/run/42",
+			},
+		]);
+		const open = prApi(pullBody({ state: "open", mergeable: false }));
+		ops.apiResult = (url) =>
+			url.includes("/actions/runs?")
+				? { code: 0, stdout: failed, stderr: "" }
+				: open(url);
+		await tick(new Map([["proj", entry(store)]]), ops);
+		const after = store.getTask(t.id)!;
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.pendingBy).toBe("supervisor");
+		expect(after.needsReason).toBeNull();
+		expect(after.pushSha).toBeNull();
+		expect(after.pendingPrompt).toMatch(/^CI failed on the PR head/);
+		expect(after.pendingPrompt).toContain("Please fix the leak");
+		expect(after.pendingPrompt).toContain("DATA>>>");
+		expect(after.pendingPrompt?.endsWith(blocks)).toBe(true);
+		expect(after.pendingFeedback).toBe(true);
+		store.close();
 	});
 });
 

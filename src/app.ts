@@ -7584,6 +7584,7 @@ export async function createApp(deps: AppDeps) {
 			{
 				pendingPrompt: text.trim(),
 				pendingBy: "user",
+				pendingFeedback: false,
 			},
 			r.body,
 		);
@@ -8046,6 +8047,8 @@ export async function createApp(deps: AppDeps) {
 			holdUntil: null,
 			queuedAt: Date.now(),
 			needsReason: null,
+			// A fresh session never answers the old park; the lost-session text is the new ask.
+			pendingFeedback: false,
 		});
 		await deps.schedule();
 		return json({ ok: true });
@@ -9855,6 +9858,8 @@ export async function createApp(deps: AppDeps) {
 			pendingBy: "user",
 			pendingImages: [...task.pendingImages, ...names],
 			holdUntil: null,
+			// Steering text is user-written; a supervisor park's flag does not survive it.
+			pendingFeedback: false,
 		});
 		await deps.schedule();
 	}
