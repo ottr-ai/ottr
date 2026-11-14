@@ -15,13 +15,13 @@
     "test:mutation:delta": "bun scripts/mutation-delta.ts"
   },
   "dependencies": {
-    "mermaid": "12.2.0",
+    "mermaid": "12.3.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "web-push": "4.0.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.6.4",
+    "@biomejs/biome": "2.6.6",
     "@hughescr/stryker-bun-runner": "^1.6.0",
     "@stryker-mutator/core": "^10.1.1",
     "@types/bun": "^1.4.4",
@@ -30,7 +30,7 @@
     "fast-check": "^4.10.2",
     "happy-dom": "^21.0.4",
     "jscpd": "5.4.2",
-    "knip": "6.44.0",
+    "knip": "6.44.1",
     "typescript": "^7.0.2"
   }
 }
