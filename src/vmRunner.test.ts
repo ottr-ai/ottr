@@ -295,6 +295,8 @@ function startRunner(
 		max?: number;
 		exists?: (p: string) => boolean;
 		netError?: string | null;
+		detachedTtlMs?: number;
+		now?: () => number;
 		rootfs?: VmRunnerOptions["rootfs"];
 		execHook?: (
 			argv: string[],
@@ -323,6 +325,8 @@ function startRunner(
 		firecracker: "/usr/local/bin/firecracker",
 		boardHost: "ottr",
 		netError: o.netError ?? null,
+		detachedTtlMs: o.detachedTtlMs,
+		now: o.now,
 		launcher,
 		rootfs: o.rootfs ?? fakeRootfs,
 		exec,
@@ -928,6 +932,45 @@ describe("vm-runner detach", () => {
 		expect(entry?.killed).toBe(true);
 		expect(entry?.running).toBe(false);
 		expect(entry?.result).toBeUndefined();
+	});
+
+	test("an expired running entry stays killable: the sweep keeps it, kill stops the VM and frees the slot", async () => {
+		const held = heldGuest();
+		const clock = { t: Date.now() };
+		const r = startRunner({
+			max: 1,
+			script: { run: held.run },
+			detachedTtlMs: 30,
+			now: () => clock.t,
+		});
+		const req = request();
+		const res = await post(r.url, "/run", req);
+		const reader = res.body!.getReader();
+		await reader.read();
+		await post(r.url, "/detach", {});
+		while (!(await reader.read()).done) {
+			// drain
+		}
+		// Past the ttl the VM still runs: the sweep must keep the entry killable.
+		// The injected clock ages the entry deterministically.
+		clock.t += 31;
+		const entry = (await detachedList(r.url))[0];
+		expect(entry?.id).toBe(req.id);
+		expect(entry?.running).toBe(true);
+		const k = await post(r.url, "/detach/kill", { id: req.id });
+		expect(k.status).toBe(200);
+		await until(() => r.recs[0]!.killed, "vm kill");
+		await until(async () => {
+			const again = await post(r.url, "/run", request());
+			if (again.status === 503) return false;
+			await again.body?.cancel();
+			return true;
+		}, "slot release");
+		// Reaped and expired: the entry is gone, and a later kill names the expiry.
+		await detachedList(r.url);
+		const late = await post(r.url, "/detach/kill", { id: req.id });
+		expect(late.status).toBe(410);
+		expect(await late.text()).toContain("expired");
 	});
 });
 

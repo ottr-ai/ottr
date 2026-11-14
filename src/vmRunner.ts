@@ -957,11 +957,22 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 	const slots = new Set<number>();
 	const active = new Map<string, VmRun>();
 	const detached = new Map<string, VmRun>();
+	// Ids the sweep removed after the guest was reaped, with the removal time: a
+	// late kill answers 410 with the expiry instead of a bare not-found.
+	const reaped = new Map<string, number>();
 	const pruneDetached = (): void => {
 		const ttl = opts.detachedTtlMs ?? 24 * 60 * 60 * 1000;
 		const t = now();
-		for (const [id, e] of detached)
-			if (t - e.startedAt > ttl) detached.delete(id);
+		for (const [id, e] of detached) {
+			// A still-running guest keeps its handle past the ttl: deleting it
+			// would strand the VM unkillable with its slot held.
+			if (e.running) continue;
+			if (t - e.startedAt > ttl) {
+				detached.delete(id);
+				reaped.set(id, t);
+			}
+		}
+		for (const [id, at] of reaped) if (t - at > ttl) reaped.delete(id);
 	};
 	const authorized = (request: Request): boolean =>
 		!opts.token || request.headers.get("x-otwr-token") === opts.token;
@@ -1513,7 +1524,13 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 			return new Response("bad json", { status: 400 });
 		}
 		const e = typeof body.id === "string" ? detached.get(body.id) : undefined;
-		if (!e) return new Response("not found", { status: 404 });
+		if (!e) {
+			if (typeof body.id === "string" && reaped.has(body.id))
+				return new Response(`detached run ${body.id} expired and was reaped`, {
+					status: 410,
+				});
+			return new Response("not found", { status: 404 });
+		}
 		if (e.running) e.stop();
 		e.killed = true;
 		e.running = false;

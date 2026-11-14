@@ -267,6 +267,13 @@ worker tracks every live run by its request id. Three token-authed routes
 - `POST /detach/kill {id}`: kills one detached run (the cancel path for a
   re-bound row).
 
+vm-runner (src/vmRunner.ts) serves the same routes with a tighter expiry. The
+sweep keeps an entry whose VM still runs past the 24 h. Without the entry, the
+board cannot stop the VM, and the slot stays held. The sweep deletes a finished
+entry after the 24 h and remembers the id. `POST /detach/kill` answers 410
+`detached run <id> expired and was reaped` for a remembered id, and 404 for an
+unknown id.
+
 The library exports `detachedRuns(url, token)` for the server and tests.
 
 ### Boot recovery re-binds detached runs (src/turn.ts, src/server.ts)
