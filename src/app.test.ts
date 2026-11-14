@@ -557,6 +557,9 @@ async function mount(
 		slowApiMs?: Parameters<typeof createApp>[0]["slowApiMs"];
 		/** Live-run seam for the system sampler (OTTR-793); tests inject to force a sample failure. */
 		liveRuns?: Parameters<typeof createApp>[0]["liveRuns"];
+		/** Test seam (OTTR-866 send-back): awaited at each state build's start; passed
+		 * through to createApp so a test can park builds across a guaranteed window. */
+		stateBuildGate?: Parameters<typeof createApp>[0]["stateBuildGate"];
 	} = {},
 ) {
 	const g =
@@ -620,6 +623,7 @@ async function mount(
 		githubTokenExpirySleep: input.githubTokenExpirySleep,
 		slowApiMs: input.slowApiMs,
 		liveRuns: input.liveRuns,
+		stateBuildGate: input.stateBuildGate,
 		runnerTurns: input.runnerTurns,
 		runners: input.runners,
 		hosted: input.hosted,
@@ -11392,6 +11396,35 @@ describe("state cache and single-flight build (OTTR-866)", () => {
 			},
 		});
 
+	/** A private one-project board: filler cards stay inside the test's own store,
+	 * so the shared p1 board keeps its suite-wide build wall. The long titles put
+	 * the tasks text past the 32 KiB gzip line, like the original board. */
+	const bigBoard = async (dirName: string, cards: number) => {
+		const dir = join(root, dirName);
+		mkdirSync(dir, { recursive: true });
+		const st = await ProjectStore.open(dir);
+		testStores.add(st);
+		const entry: Entry = {
+			path: dir,
+			name: dirName,
+			store: st,
+			target: null,
+			gitless: false,
+			github: null,
+			protectedTarget: false,
+			remote: null,
+			dirty: false,
+			mainUnpushed: false,
+			mainBranch: null,
+			latestRelease: null,
+			latestImage: null,
+			archReview: null,
+		};
+		const long = "filler ".repeat(12);
+		for (let i = 0; i < cards; i++) await st.createTask(`filler ${i} ${long}`);
+		return new Map([[dirName, entry]]);
+	};
+
 	test("the built state text is byte-equal to JSON.stringify of the state", async () => {
 		const m = await mount({ projects });
 		// Varied cards: unicode text, nulls, a cancelled card, a turn with a model,
@@ -11469,6 +11502,142 @@ describe("state cache and single-flight build (OTTR-866)", () => {
 		expect(m.app.stateBuilds()).toBe(1);
 		const texts = await Promise.all(responses.map((r) => r.text()));
 		expect(new Set(texts).size).toBe(1);
+	});
+
+	test("a GET arriving during an in-flight build never serves state from before a completed write", async () => {
+		const m = await mount({ projects: await bigBoard("big866a", 700) });
+		// Past the gzip line: the build yields for many loop turns, so the write
+		// below lands while it is still in flight and after its card reads.
+		// Build #1 starts and reads the cards; its response is never awaited.
+		const first = rawGet(m.server);
+		// Let the build get past boardCards' store reads (the card loop still yields
+		// per card after them, then gzips), so the write below postdates every read
+		// build #1 does and its frame is stale by construction. A real wait is the
+		// only signal here: the build yields through real event-loop turns, no seam
+		// exposes "reads done, still in flight" before the follow-up build lands,
+		// and fake timers would freeze the build's setImmediate slices.
+		await Bun.sleep(15);
+		const created = await m.call("/api/projects/big866a/tasks", {
+			prompt: "mid-build card",
+		});
+		expect(created.status).toBe(200);
+		const { id } = (await created.json()) as { id: string };
+		// The second GET must not join build #1: its version predates the write.
+		const res = await rawGet(m.server);
+		const b = JSON.parse(await res.text()) as {
+			tasks: Array<{ id: string }>;
+		};
+		expect(b.tasks.some((t) => t.id === id)).toBe(true);
+		// Drain build #1's response so the board body never leaks past the test.
+		await (await first).text();
+	});
+
+	test("writes during a build share one follow-up build", async () => {
+		const started = Promise.withResolvers<void>();
+		const { promise: hold, resolve: release } = Promise.withResolvers<void>();
+		let entries = 0;
+		const m = await mount({
+			projects,
+			stateBuildGate: async () => {
+				entries++;
+				// The first build reports its park, then holds until the test releases.
+				if (entries === 1) started.resolve();
+				await hold;
+			},
+		});
+		// Build #1 starts and parks on the gate before reading anything.
+		const first = rawGet(m.server);
+		await started.promise;
+		// Three awaited writes, each followed by an unawaited GET. Version-checked
+		// alone, each GET would start its own build (four starts); the shared
+		// follow-up chains them onto the one in-flight build instead.
+		const ids: string[] = [];
+		const gets: Promise<Response>[] = [first];
+		for (let i = 0; i < 3; i++) {
+			const created = await m.call("/api/projects/p1/tasks", {
+				prompt: `mid-build write ${i}`,
+			});
+			expect(created.status).toBe(200);
+			const { id } = (await created.json()) as { id: string };
+			ids.push(id);
+			gets.push(rawGet(m.server));
+		}
+		release();
+		const b = JSON.parse(await (await gets[3]!).text()) as {
+			tasks: Array<{ id: string }>;
+		};
+		// The last GET ships the last write, served by the one follow-up build.
+		expect(b.tasks.some((t) => t.id === ids[2])).toBe(true);
+		expect(m.app.stateBuildsStarted()).toBe(2);
+		expect(m.app.stateBuilds()).toBe(1);
+		// Drain the other GETs' bodies; the last one's body is spent above.
+		await Promise.all(gets.slice(0, 3).map(async (g) => (await g).text()));
+	});
+
+	test("socket opens during a build share one follow-up build", async () => {
+		const started = Promise.withResolvers<void>();
+		const { promise: hold, resolve: release } = Promise.withResolvers<void>();
+		let entries = 0;
+		const m = await mount({
+			projects,
+			realPort: true,
+			stateBuildGate: async () => {
+				entries++;
+				if (entries === 1) started.resolve();
+				await hold;
+			},
+		});
+		const rawGetReal = () =>
+			fetch(new URL("/api/state", m.server.url), {
+				headers: { Host: m.server.url.host, Origin: m.server.url.origin },
+			});
+		// Build #1 starts and parks on the gate before reading anything.
+		const first = rawGetReal();
+		await started.promise;
+		// lib.dom hides Bun's documented constructor options.
+		const BunWebSocket = WebSocket as typeof WebSocket & {
+			new (url: string | URL, options: Bun.WebSocketOptions): WebSocket;
+		};
+		// Three sockets open while the build is parked: each open bumps the version
+		// and asks for the current state. One follow-up must serve all of them.
+		type GateFrame = { type?: string };
+		const clients = Array.from({ length: 3 }, () => {
+			const socketUrl = new URL("/api/ws", m.server.url);
+			socketUrl.protocol = "ws:";
+			const socket = new BunWebSocket(socketUrl, {
+				headers: { Origin: m.server.url.origin },
+			});
+			const opened = Promise.withResolvers<void>();
+			socket.addEventListener("open", () => opened.resolve());
+			socket.addEventListener("error", () =>
+				opened.reject(new Error("socket failed before open")),
+			);
+			const stateFrame = Promise.withResolvers<void>();
+			let seen = false;
+			socket.addEventListener("message", (event) => {
+				if (seen) return;
+				const frame: GateFrame = JSON.parse(String(event.data));
+				if (frame.type === "state") {
+					seen = true;
+					stateFrame.resolve();
+				}
+			});
+			// A real deadline bounds real socket I/O; a fake clock cannot deliver
+			// frames, and without it a missing frame hangs instead of failing.
+			const timer = setTimeout(
+				() => stateFrame.reject(new Error("socket received no state frame")),
+				5_000,
+			);
+			const received = stateFrame.promise.finally(() => clearTimeout(timer));
+			return { socket, opened, received };
+		});
+		await Promise.all(clients.map((c) => c.opened));
+		release();
+		// Every open socket receives its state frame, all from the one follow-up.
+		await Promise.all(clients.map((c) => c.received));
+		expect(m.app.stateBuildsStarted()).toBe(2);
+		for (const c of clients) c.socket.close();
+		await (await first).text();
 	});
 
 	test("a GET after the 10 s TTL rebuilds once and serves fresh bytes", async () => {

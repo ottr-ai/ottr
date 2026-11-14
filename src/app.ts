@@ -584,6 +584,9 @@ interface AppDeps {
 	/** The local /tmp free-space probe (OTTR-754's local warning); defaults to the real
 	 * statfs probe of /tmp. Tests inject one, so warning assertions never read the host. */
 	tmpSpace?: () => TmpDiskSpace | null;
+	/** Test seam: awaited once at each state build's start; production never sets it.
+	 * Tests hold a build in flight across a guaranteed window (OTTR-866 send-back). */
+	stateBuildGate?: () => Promise<void>;
 	/** Latest GitHub release seam; defaults to the cached probe in release.ts. Tests inject
 	 * a stub for the release chip and the Create release routes. */
 	latestRelease?: (repo: string) => Promise<LatestGhRelease | null>;
@@ -4384,9 +4387,20 @@ export async function createApp(deps: AppDeps) {
 	/** Test seam: how often the state rebuilt (GET-triggered or publish-triggered,
 	 * one increment per completed build; OTTR-866). */
 	let builds = 0;
+	/** Test seam (send-back): how often a state build STARTED, in-flight builds
+	 * included. The share-one-follow-up tests count starts, not installs: a
+	 * superseded build resolves its joiners but installs nothing. */
+	let buildsStarted = 0;
 	let stateTimer: Timer | null = null;
 	let stateCache: StateCacheEntry | null = null;
-	let stateBuilding: Promise<StateCacheEntry> | null = null;
+	/** The one in-flight build and the version it captured at its start. A caller
+	 * joins it only while that version is still current (OTTR-866 send-back): a GET
+	 * that arrives after a completed write must never serve the pre-write frame the
+	 * older build is about to return. */
+	let stateBuilding: {
+		version: number;
+		promise: Promise<StateCacheEntry>;
+	} | null = null;
 	// OTTR-884: the cache also invalidates when any store write landed since the
 	// build, detected through each project's SQLite WAL fingerprint. A raw store
 	// write (no publishSoon — fixture writes, the supervisor's smaller calls)
@@ -6966,12 +6980,30 @@ export async function createApp(deps: AppDeps) {
 
 	/** Builds one state frame: the card loop yields between slices, the tasks text is
 	 * spliced card by card, and gzip runs async (never gzipSync on this path). Concurrent
-	 * callers share the one in-flight build; a failure clears it and leaves the cache
-	 * untouched, so the next caller rebuilds. */
+	 * callers share the one in-flight build, but only while its captured start version is
+	 * still current: a caller whose version is newer chains behind the build instead of
+	 * joining a frame that predates a completed write, and the follow-up starts at the
+	 * newest version — at most one build runs at any instant. The newest build owns the
+	 * slot; a superseded build still resolves the callers that joined it, but installs
+	 * nothing. A failure clears the slot and leaves the cache untouched, so the next
+	 * caller rebuilds. */
 	function stateBuild(): Promise<StateCacheEntry> {
-		if (stateBuilding !== null) return stateBuilding;
+		if (stateBuilding !== null) {
+			if (stateBuilding.version === stateVersion) return stateBuilding.promise;
+			// A newer version is waiting: chain, and never let the superseded build's
+			// failure fail a caller that asked for a newer frame — both branches retry.
+			return stateBuilding.promise.then(
+				() => stateBuild(),
+				() => stateBuild(),
+			);
+		}
+		// Captured before the body runs, so the slot can carry the exact version this
+		// build serves: a mid-build bump mismatches it at completion and at join time.
+		const version = stateVersion;
 		const built = (async (): Promise<StateCacheEntry> => {
-			const version = stateVersion;
+			// Test seam: park every build at its start, so a test keeps it in flight
+			// across a guaranteed window (production never sets it).
+			if (deps.stateBuildGate !== undefined) await deps.stateBuildGate();
 			const { state, tasksBufs } = await stateResponse();
 			// Byte-identity by construction: every property except tasks is one
 			// JSON.stringify; only the tasks array is spliced with the chunk bytes the
@@ -7014,17 +7046,27 @@ export async function createApp(deps: AppDeps) {
 					stateBuf.length < 32 * 1024 ? stateBuf.toString("utf8") : null,
 				gz,
 			};
-			stateCache = entry;
-			// Record the write fingerprint at build time: a later WAL move (any
-			// store write) invalidates this frame for the GET path (OTTR-884).
-			buildWalMark = storeWalMark();
-			// One increment per completed rebuild, GET-triggered or published (OTTR-866).
-			builds++;
+			// Install only while this build's version is still the live one: a write
+			// that landed mid-build bumped stateVersion, so this frame is stale by
+			// construction and the next caller rebuilds. The stateEntry guards make a
+			// stale install harmless, but pointless.
+			if (version === stateVersion) {
+				stateCache = entry;
+				// Record the write fingerprint at build time: a later WAL move (any
+				// store write) invalidates this frame for the GET path (OTTR-884).
+				buildWalMark = storeWalMark();
+				// One increment per completed rebuild, GET-triggered or published (OTTR-866).
+				builds++;
+			}
 			return entry;
 		})();
-		stateBuilding = built;
+		// Counted at start, not at install: superseded builds never install, and the
+		// share-one-follow-up tests assert on starts (send-back).
+		buildsStarted++;
+		stateBuilding = { version, promise: built };
 		const settled = (): void => {
-			if (stateBuilding === built) stateBuilding = null;
+			if (stateBuilding !== null && stateBuilding.promise === built)
+				stateBuilding = null;
 		};
 		built.then(settled, settled);
 		return built;
@@ -13822,6 +13864,9 @@ export async function createApp(deps: AppDeps) {
 		publishSoon,
 		/** Test seam (OTTR-866): how often the state rebuilt (one per completed build). */
 		stateBuilds: () => builds,
+		/** Test seam (send-back): how often a state build started, in-flight builds
+		 * included, so the share-one-follow-up tests count starts not installs. */
+		stateBuildsStarted: () => buildsStarted,
 		/** Test seam (OTTR-866): the current cached state build, or null before the first. */
 		stateCacheForTest: (): {
 			version: number;
