@@ -18,7 +18,9 @@ import {
 	createSupervisor,
 	dependabotPrompt,
 	failedCheckNames,
+	type PrFeedbackItem,
 	prConflictReason,
+	prFeedbackPrompt,
 	prFeedbackReason,
 	type SupervisorEntry,
 	type SupervisorOps,
@@ -3341,6 +3343,32 @@ function feedbackApi(o: {
 		return openList([7]);
 	};
 }
+
+describe("prFeedbackPrompt", () => {
+	// OTTR-947: the trim loop dropped one block per pass and re-rendered every kept
+	// block, so a 2000-item batch did ~2 million renders on the event loop. The
+	// render count must stay linear and the trimmed prompt must fit the budget.
+	test("trimming renders each block once and fits the budget", () => {
+		const n = 2000;
+		const base = 1_000_000_000_000;
+		const items: PrFeedbackItem[] = Array.from({ length: n }, (_, i) => ({
+			kind: "comment",
+			author: `user-${i}`,
+			at: base + i,
+			body: `feedback ${i} ${"x".repeat(80)}`,
+		}));
+		let renders = 0;
+		const text = prFeedbackPrompt(items, (item) => {
+			renders++;
+			return `block ${item.at - base} ${"y".repeat(4000)}`;
+		});
+		expect(renders).toBeLessThanOrEqual(2 * n);
+		const cut = text.indexOf("\n\nThe oldest");
+		expect(cut).toBeGreaterThan(0); // the batch did trim
+		expect(text.slice(0, cut).length).toBeLessThanOrEqual(50000);
+		expect(text.endsWith("to fit the park budget.")).toBe(true);
+	});
+});
 
 describe("prPass", () => {
 	test("PR merged finishes the card done and removes the worktree", async () => {
