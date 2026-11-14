@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cleanOrWithheld } from "./issues.ts";
+import { cleanIssueText } from "./issues.ts";
 import { type JiraIssue, jiraCardPrompt, jiraCardTitle } from "./jiraCards.ts";
 import fc from "./test/properties.ts";
 
@@ -45,10 +45,10 @@ describe("jiraCardTitle", () => {
 		);
 	});
 
-	test("an empty or withheld summary leaves the key alone", () => {
+	test("an empty summary leaves the key alone; a credential summary redacts", () => {
 		expect(jiraCardTitle("PROJ-1", "  ")).toBe("PROJ-1");
 		expect(jiraCardTitle("PROJ-1", 'password = "hunter2hunter2hunter2"')).toBe(
-			"PROJ-1",
+			'PROJ-1: password = "[REDACTED]"',
 		);
 	});
 });
@@ -88,7 +88,7 @@ describe("jiraCardPrompt", () => {
 		expect(p).toContain("FIELDS\n<<<DATA\n(none)\nDATA>>>");
 	});
 
-	test("invisible characters and secrets never reach the prompt; a pause withholds", () => {
+	test("invisible characters and secrets never reach the prompt", () => {
 		const p = jiraCardPrompt(
 			SITE,
 			issue({
@@ -101,8 +101,9 @@ describe("jiraCardPrompt", () => {
 		expect(p).not.toContain(TOKEN);
 		expect(p).not.toContain("hunter2");
 		expect(p).toContain("Status: x [REDACTED]");
-		expect(p).toContain("DESCRIPTION\n<<<DATA\n(withheld: ");
-		expect(p).toContain("; read the ticket in Jira)\nDATA>>>");
+		expect(p).toContain(
+			'DESCRIPTION\n<<<DATA\npassword = "[REDACTED]"\nDATA>>>',
+		);
 	});
 
 	test("ticket text holding fence markers cannot close its block", () => {
@@ -285,7 +286,6 @@ describe("jiraCardPrompt", () => {
 		// The same survival rules as the prompt builder: a comment without body text and
 		// a link without key characters are dropped, and at most the first 20 links enter
 		// the prompt.
-		const READ_HINT = "read the ticket in Jira";
 		const comment = fc.record({ author: str, date: str, body: str });
 		const link = fc.record({ type: str, key: str, summary: str, status: str });
 		const ticket = fc.record({
@@ -307,7 +307,7 @@ describe("jiraCardPrompt", () => {
 				const p = jiraCardPrompt(SITE, t);
 				expect(p.length).toBeLessThanOrEqual(20_000);
 				const comments = t.comments.filter(
-					(m) => cleanOrWithheld(m.body, READ_HINT).text.trim() !== "",
+					(m) => cleanIssueText(m.body).trim() !== "",
 				);
 				const links = t.links
 					.slice(0, 20)

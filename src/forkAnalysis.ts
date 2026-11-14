@@ -39,44 +39,53 @@ const REDACT_PATTERNS: RegExp[] = [
 	/\b\w+:\/\/[^/\s:]+:[^/\s@]{8,}@/g,
 ];
 
-// Pause only on QUOTED literal values: `apiKey = whisparr.apiKey` is an identifier copy, a
-// quoted 16+ char value is likely a real secret. Fixture/example values skip the pause.
+// Redact QUOTED literal values: `apiKey = whisparr.apiKey` is an identifier copy, a
+// quoted 16+ char value is likely a real secret. Fixture/example values stay visible.
+// A false match must never stop a review (OTTR-942): every other matched value becomes
+// [REDACTED], so the model never sees it.
 const SUSPICIOUS_ASSIGN_RE =
 	/\b(password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)\b\s*[:=]\s*(?:"([^"\n]{16,})"|'([^'\n]{16,})')/gi;
 const FIXTURE_VALUE_RE =
 	/^(?:fixture|test|example|sample|dummy|placeholder|changeme|redacted)[-_. ]/i;
 
 /**
- * Redact known token shapes; pause (return `paused`) on unclassifiable suspicious assignments.
- * Pause decision uses the ORIGINAL text: redaction must not hide the trigger.
+ * Redact known token shapes and quoted suspicious assignments to [REDACTED]; never
+ * pauses, so a false credential match cannot stop a review. The fixture check runs on
+ * the trimmed value. A value with a space is prose (an error message), not a credential:
+ * it still redacts, but it never counts as a credential hit.
  */
-export function redactSecrets(s: string): {
-	text: string;
-	hits: number;
-	paused: string | null;
-} {
-	for (const m of s.matchAll(SUSPICIOUS_ASSIGN_RE)) {
-		const value = (m[2] ?? m[3] ?? "").trim();
-		if (!FIXTURE_VALUE_RE.test(value)) {
-			return {
-				text: s,
-				hits: 0,
-				paused: "possible credential in fork content",
-			};
-		}
-	}
-	// Stored git tokens first, all in one pass (worktree.ts redactCount): a token like
+export function redactSecrets(s: string): { text: string; hits: number } {
+	let hits = 0;
+	let text = s.replace(
+		SUSPICIOUS_ASSIGN_RE,
+		(
+			m: string,
+			_keyword: string,
+			dq: string | undefined,
+			sq: string | undefined,
+		): string => {
+			const raw = dq ?? sq ?? "";
+			if (!FIXTURE_VALUE_RE.test(raw.trim())) {
+				if (!raw.trim().includes(" ")) hits++;
+				const quote = dq !== undefined ? '"' : "'";
+				// Keep the assignment prefix and the quote style; only the value goes.
+				return `${m.slice(0, m.length - raw.length - 2)}${quote}[REDACTED]${quote}`;
+			}
+			return m;
+		},
+	);
+	// Stored git tokens next, all in one pass (worktree.ts redactCount): a token like
 	// "REDACTED" cannot loop, and every non-empty token counts, however short.
-	const stored = redactCount(s, gitSecrets());
-	let hits = stored.hits;
-	let text = stored.text;
+	const stored = redactCount(text, gitSecrets());
+	hits += stored.hits;
+	text = stored.text;
 	for (const re of REDACT_PATTERNS) {
 		text = text.replace(re, () => {
 			hits++;
 			return "[REDACTED]";
 		});
 	}
-	return { text, hits, paused: null };
+	return { text, hits };
 }
 
 /** The DATA fence markers; untrusted text must never carry one, or it could end its block early. */
@@ -84,13 +93,14 @@ const DATA_FENCE_RE = /<<<DATA|DATA>>>/g;
 
 /**
  * Untrusted text for a prompt: stripInvisible, redactSecrets, and every DATA fence marker
- * replaced so the text cannot end its block and pose as trusted prompt text; throws when
- * redaction pauses.
+ * replaced so the text cannot end its block and pose as trusted prompt text. Never throws:
+ * a suspicious quoted value redacts instead of pausing (OTTR-942).
  */
 export function clean(s: string): string {
-	const red = redactSecrets(stripInvisible(s).text);
-	if (red.paused !== null) throw new Error(red.paused);
-	return red.text.replace(DATA_FENCE_RE, "[fence marker removed]");
+	return redactSecrets(stripInvisible(s).text).text.replace(
+		DATA_FENCE_RE,
+		"[fence marker removed]",
+	);
 }
 
 /** Fixed system prompt; all fork content arrives as data blocks in the user message. */

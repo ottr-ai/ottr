@@ -1854,11 +1854,10 @@ describe("createPrWatcher", () => {
 		expect(await s.store.prReviewRunsSince(0)).toBe(2);
 	});
 
-	test("an over-budget or secret-flagged PR takes no cap slot and never blocks a newer PR", async () => {
+	test("an over-budget PR takes no cap slot and never blocks a newer PR", async () => {
 		const s = await setup();
-		s.setOpen([pr(1, sha("a")), pr(2, sha("a")), pr(3, sha("a"))]);
+		s.setOpen([pr(1, sha("a")), pr(3, sha("a"))]);
 		s.diffs.set(1, "x".repeat(400_001));
-		s.diffs.set(2, '+cfg.password = "abcdefghijklmnop"');
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);
 		for (let i = 0; i <= PR_GATES.PROJECT_DAILY_RUNS; i++)
@@ -1869,9 +1868,63 @@ describe("createPrWatcher", () => {
 		expect(
 			s.logs.some((m) => m.includes("#1 review skipped: diff exceeds")),
 		).toBe(true);
-		expect(s.logs.some((m) => m.includes("#2 review skipped: DIFF"))).toBe(
-			true,
+		// Every skipped tick keeps exactly one notice for the head: the board
+		// shows the skip once, not once per scan.
+		const notices = s.watcher.skipNotices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]!.startsWith("p: PR #1 review skipped:")).toBe(true);
+		expect(notices[0]).toContain("diff exceeds the prompt budget");
+	});
+
+	test("a credential-shaped diff redacts its values and still reviews", async () => {
+		const s = await setup();
+		s.setOpen([pr(4, sha("a"))]);
+		s.diffs.set(
+			4,
+			[
+				"diff --git a/src/lib/connection-settings.ts b/src/lib/connection-settings.ts",
+				'+		apiKey: "A Whispa vial was lost because the connection settings never arrived.",',
+				"diff --git a/tests/connection-settings.test.ts b/tests/connection-settings.test.ts",
+				'+const before = { apiKey: " replace this fixture value" };',
+				'+const after = { apiKey: " new-jellyfin-connection" };',
+			].join("\n"),
 		);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// The review runs: the false credential match no longer stops it.
+		expect(s.prompts).toHaveLength(1);
+		expect(s.prompts[0]!.split('apiKey: "[REDACTED]"')).toHaveLength(4);
+		expect(s.prompts[0]).not.toContain("A Whispa vial");
+		expect(s.prompts[0]).not.toContain("replace this fixture value");
+		expect(s.prompts[0]).not.toContain("new-jellyfin-connection");
+		expect((await s.cards()).length).toBe(1);
+		expect(s.logs.some((m) => m.includes("#4 review skipped"))).toBe(false);
+	});
+
+	test("a skipped review shows one board notice per PR and head", async () => {
+		const s = await setup();
+		s.setOpen([pr(4, sha("a"))]);
+		s.diffs.set(4, "x".repeat(400_001));
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const notices = s.watcher.skipNotices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]!.startsWith("p: PR #4 review skipped:")).toBe(true);
+		expect(notices[0]).toContain("diff exceeds the prompt budget");
+		// A second scan of the same head writes no second notice.
+		await s.watcher.tick();
+		expect(s.watcher.skipNotices()).toHaveLength(1);
+		// A new head that also skips writes its own notice: the sync stamps the
+		// new head first, the quiet window then makes it due again.
+		s.setOpen([pr(4, sha("b"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const after = s.watcher.skipNotices();
+		expect(after).toHaveLength(2);
+		expect(after[1]!.startsWith("p: PR #4 review skipped:")).toBe(true);
 	});
 
 	test("a head that moves during the review saves no draft", async () => {

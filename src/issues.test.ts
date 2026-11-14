@@ -245,7 +245,7 @@ describe("issueCardPrompt", () => {
 		expect(p).toContain("[REDACTED]");
 	});
 
-	test("a redaction pause withholds that block instead of failing", () => {
+	test("a credential-shaped body redacts its value", () => {
 		const p = issueCardPrompt({
 			repo: "o/r",
 			number: 7,
@@ -253,7 +253,7 @@ describe("issueCardPrompt", () => {
 			body: 'password = "hunter2hunter2hunter2"',
 		});
 		expect(p).not.toContain("hunter2");
-		expect(p).toContain("BODY\n<<<DATA\n(withheld: ");
+		expect(p).toContain('BODY\n<<<DATA\npassword = "[REDACTED]"\nDATA>>>');
 		expect(p).toContain("TITLE\n<<<DATA\nt\nDATA>>>");
 	});
 
@@ -571,7 +571,7 @@ describe("createIssueWatcher", () => {
 		);
 	});
 
-	test("a quoted credential ending past the 120-char cut is withheld, not cut open", async () => {
+	test("a quoted credential ending past the 120-char cut redacts before the cut", async () => {
 		const s = await setup();
 		const value = "Zq8vN3pL7wR2tY6kM4";
 		// 121 chars: the closing quote sits at index 120, just past the card title's cut.
@@ -580,8 +580,8 @@ describe("createIssueWatcher", () => {
 		s.open([issue(11, { title })]);
 		await s.watcher.tick();
 		const c = (await s.cards())[0]!;
-		expect(c.title).toBe("Issue #11");
-		expect(c.title).not.toContain(value);
+		// Redaction runs before the cut, so the value never leaks through it.
+		expect(c.title).toBe(`Issue #11: ${"a".repeat(91)} password="[REDACTED]"`);
 		expect(c.prompt).not.toContain(value);
 	});
 

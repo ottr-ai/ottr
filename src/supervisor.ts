@@ -401,13 +401,9 @@ export function prFeedbackPrompt(items: readonly PrFeedbackItem[]): string {
 	const block = (item: PrFeedbackItem): string => {
 		const label =
 			item.kind === "comment" ? "REVIEW COMMENT" : "CHANGES REQUESTED";
-		let shown: string;
-		try {
-			shown = clean(item.body).trim();
-		} catch {
-			// clean refuses credential-shaped bodies; the park still names the author.
-			shown = "redacted: possible credential";
-		}
+		// OTTR-942: clean never throws; a credential-shaped body redacts its value,
+		// so the comment still reaches the park prompt without the secret.
+		let shown = clean(item.body).trim();
 		if (shown === "") shown = "(no text)";
 		else if (shown.length > 4000) {
 			shown = `${shown.slice(0, 4000)}\n(cut at 4000 characters)`;

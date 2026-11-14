@@ -5553,6 +5553,8 @@ export async function createApp(deps: AppDeps) {
 				// OTTR-763: the checkout guard's ambiguous-change notices; one per change,
 				// naming the commit and the running cards; bounded and expiring in the loop.
 				...(deps.checkoutNotices?.() ?? []),
+				// OTTR-942: the PR watcher's skipped-review notices; one per PR and head.
+				...prWatcher.skipNotices(),
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
 					(w) => w !== null,
 				),

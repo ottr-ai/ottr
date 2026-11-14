@@ -273,8 +273,8 @@ export function failCardPrompt(o: {
 	reasons: string[];
 	notes: string;
 }): string {
-	const reasons = o.reasons.map((r) => safeText(r, REASON_MAX));
-	const notes = safeText(o.notes || "(none)", OMP_WATCH_GATES.notesCap);
+	const reasons = o.reasons.map((r) => clean(r).slice(0, REASON_MAX));
+	const notes = clean(o.notes || "(none)").slice(0, OMP_WATCH_GATES.notesCap);
 	const room =
 		PROMPT_LIMIT - ompFailCardPrompt({ ...o, reasons, notes: "" }).length;
 	const cut =
@@ -282,15 +282,6 @@ export function failCardPrompt(o: {
 			? `${notes.slice(0, Math.max(0, room - TRUNCATED.length))}${TRUNCATED}`
 			: notes;
 	return ompFailCardPrompt({ ...o, reasons, notes: cut });
-}
-
-/** Untrusted text through clean(); a redaction pause withholds the text instead of failing. */
-function safeText(raw: string, max: number): string {
-	try {
-		return clean(raw).slice(0, max);
-	} catch (e) {
-		return `(withheld: ${errText(e)})`;
-	}
 }
 
 type Notes = { kind: "notes"; body: string } | { kind: "missing" };
@@ -589,19 +580,12 @@ export function createOmpWatcher(deps: {
 				notes: "",
 			};
 		}
-		let message: string;
-		try {
-			message = reviewMessage({ version: r.version, pin, notes: notes.body });
-		} catch (e) {
-			// Redaction paused: the notes cannot go to the model, so a human must read them.
-			return {
-				verdict: "fail",
-				reasons: [
-					`the release notes of ${r.version} were withheld from the review (${errText(e)}): read them on GitHub`,
-				],
-				notes: "",
-			};
-		}
+		// OTTR-942: reviewMessage never throws; credential-shaped notes redact.
+		const message = reviewMessage({
+			version: r.version,
+			pin,
+			notes: notes.body,
+		});
 		let reply: string;
 		try {
 			reply = await runGateway(

@@ -5099,9 +5099,10 @@ describe("prPass", () => {
 		const after = (await store.getTask(t.id))!;
 		expect(after.state).toBe("needs_you");
 		expect(after.needsReason).toBe(prFeedbackReason(7));
-		// The park still names the author, but the refused body never reaches it.
+		// The park still names the author; the body reaches the prompt with its
+		// value redacted, so the secret never shows.
 		expect(after.pendingPrompt).toContain("REVIEW COMMENT by alice");
-		expect(after.pendingPrompt).toContain("redacted: possible credential");
+		expect(after.pendingPrompt).toContain('api_key: "[REDACTED]"');
 		expect(after.pendingPrompt).not.toContain("aaaa0000");
 		expect(after.pendingFeedback).toBe(true);
 		expect(after.prWatchAt).toBe(COMMENT_TS);

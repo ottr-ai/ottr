@@ -2,7 +2,7 @@
 // ticket text is untrusted: it goes into cleaned DATA blocks only.
 
 import { stripInvisible } from "./forkAnalysis.ts";
-import { cleanOrWithheld, dataBlock } from "./issues.ts";
+import { cleanIssueText, dataBlock } from "./issues.ts";
 
 export interface JiraComment {
 	author: string;
@@ -52,23 +52,18 @@ const VALUE_TRUNCATED = "… (truncated; read the full ticket in Jira)";
 /** The marker when whole comments are dropped: the newest stay. */
 const OLDER_OMITTED = "(older comments omitted; read the ticket in Jira)";
 const OMITTED = "(fields omitted)";
-const READ_HINT = "read the ticket in Jira";
 
 /** A key or field id outside a DATA block: only its id characters survive. */
 const safeId = (s: string): string => s.replace(/[^\w.-]/g, "").slice(0, 100);
 
 /** Redact the whole value first, then cut: a cut first can split a secret past redaction. */
-const value = (raw: string): string =>
-	cleanOrWithheld(raw, READ_HINT).text.slice(0, VALUE_MAX);
+const value = (raw: string): string => cleanIssueText(raw).slice(0, VALUE_MAX);
 
-/** `KEY: <summary>`: the summary is redacted (or withheld) first, then the title cut to 120. */
+/** `KEY: <summary>`: the summary is redacted first, then the title cut to 120. */
 export function jiraCardTitle(key: string, summary: string): string {
 	const k = safeId(key);
-	const t = cleanOrWithheld(summary, READ_HINT);
-	const text = t.text.trim();
-	return t.withheld || text === ""
-		? k
-		: `${k}: ${text}`.slice(0, 120).trimEnd();
+	const text = cleanIssueText(summary).trim();
+	return text === "" ? k : `${k}: ${text}`.slice(0, 120).trimEnd();
 }
 
 function fieldsText(i: JiraIssue): string {
@@ -91,7 +86,7 @@ function fieldsText(i: JiraIssue): string {
  * was lost, so a stopped comment is visible; null when nothing readable survives.
  */
 const markedBody = (raw: string): string | null => {
-	const text = cleanOrWithheld(raw, READ_HINT).text;
+	const text = cleanIssueText(raw);
 	if (text.trim() === "") return null;
 	return text.length <= VALUE_MAX
 		? text
@@ -142,10 +137,7 @@ export function jiraCardPrompt(site: string, issue: JiraIssue): string {
 	const custom = issue.custom.map((c) =>
 		dataBlock(`FIELD ${safeId(c.id)}`, value(c.text)),
 	);
-	const description = cleanOrWithheld(
-		issue.description || "(none)",
-		READ_HINT,
-	).text;
+	const description = cleanIssueText(issue.description || "(none)");
 	const chunks = commentChunks(issue);
 	const links = linksText(issue);
 	const cutTo = (text: string, room: number): string =>

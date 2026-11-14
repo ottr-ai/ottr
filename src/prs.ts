@@ -35,6 +35,9 @@ export const PR_GATES = {
 	DAY_MS: 24 * 60 * 60 * 1000,
 } as const;
 
+/** OTTR-942: most skip notices the watcher keeps; one broken repo cannot flood the bell. */
+const PR_SKIP_NOTICE_MAX = 20;
+
 export interface PullInfo {
 	number: number;
 	head: string;
@@ -486,14 +489,8 @@ export function reviewUserMessage(o: {
 	/** Deterministic perf-lens candidates; set only when the scan found at least one. */
 	perfCandidates?: PerfFinding[];
 }): string {
-	const block = (label: string, raw: string): string => {
-		try {
-			return `${label}\n<<<DATA\n${clean(raw)}\nDATA>>>`;
-		} catch (err) {
-			// clean throws only its own pause Error.
-			throw new Error(`${label}: ${(err as Error).message}`);
-		}
-	};
+	const block = (label: string, raw: string): string =>
+		`${label}\n<<<DATA\n${clean(raw)}\nDATA>>>`;
 	const parts = [`Pull request #${o.number} of ${o.repo}.`];
 	const note = o.note?.trim();
 	if (note !== undefined && note !== "")
@@ -933,6 +930,13 @@ interface PrWatcherCtx {
 	perfScan: (diff: string, labels: string[]) => PerfFinding[];
 	/** Called with the card id when a re-review rewrites a draft the user may have read. */
 	forgetSeen?: (taskId: string) => void | Promise<void>;
+	/** OTTR-942: records one board notice per skipped review; deduped by project, PR and head. */
+	recordSkipNotice: (
+		project: string,
+		number: number,
+		head: string,
+		reason: string,
+	) => void;
 }
 
 /** The repo id of a project's GitHub remote; throws on a malformed id. */
@@ -1313,7 +1317,7 @@ async function reviewOnce(
 		};
 	});
 	if (source === null) return;
-	// Diff fetch, prompt budget and redaction pause fail the same way for the same head on
+	// Diff fetch and prompt budget fail the same way for the same head on
 	// every tick: run them before the attempt takes a cap slot, so one such PR cannot
 	// starve the others of the project.
 	let user: string;
@@ -1361,9 +1365,10 @@ async function reviewOnce(
 			perfCandidates: candidates.length > 0 ? candidates : undefined,
 		});
 	} catch (e) {
-		ctx.log(
-			`prs: ${project.name}: #${row.number} review skipped: ${(e as Error).message}`,
-		);
+		const reason = (e as Error).message;
+		// OTTR-942: the skip shows on the board, not only in this log line.
+		ctx.recordSkipNotice(project.name, row.number, row.head, reason);
+		ctx.log(`prs: ${project.name}: #${row.number} review skipped: ${reason}`);
 		return;
 	}
 	// The model attempt counts against the cap before the slow call; only a saved draft
@@ -1611,11 +1616,34 @@ export function createPrWatcher(deps: {
 		note: string;
 	}): Promise<void>;
 	reviewIdle(): Promise<void>;
+	/** OTTR-942: the board's notice lines for skipped PR reviews, one per PR and
+	 * head ("p: PR #N review skipped: <reason>"), oldest first. */
+	skipNotices(): string[];
 } {
 	const gh = deps.gh ?? runGh;
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
 		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
+	// OTTR-942: one board notice per skipped PR review, keyed by project, number and
+	// head, so a second scan of the same head writes no second notice. The list is
+	// bounded and holds no TTL: the notice stays while the same head keeps skipping,
+	// and a restart writes it again on the first skipped scan.
+	const skipNotices: Array<{ at: number; key: string; text: string }> = [];
+	const recordSkipNotice = (
+		project: string,
+		number: number,
+		head: string,
+		reason: string,
+	): void => {
+		const key = `${project}/${number}/${head}`;
+		if (skipNotices.some((n) => n.key === key)) return;
+		while (skipNotices.length >= PR_SKIP_NOTICE_MAX) skipNotices.shift();
+		skipNotices.push({
+			at: now(),
+			key,
+			text: `${project}: PR #${number} review skipped: ${reason}`,
+		});
+	};
 	const ctx: PrWatcherCtx = {
 		projects: deps.projects,
 		log: deps.log,
@@ -1624,6 +1652,7 @@ export function createPrWatcher(deps: {
 		review,
 		perfScan: deps.perfScan ?? perfFindings,
 		forgetSeen: deps.forgetSeen,
+		recordSkipNotice,
 	};
 	// Review requests serialize through one chain per watcher; reviewIdle resolves when it drains.
 	let tail: Promise<void> = Promise.resolve();
@@ -1637,5 +1666,7 @@ export function createPrWatcher(deps: {
 		// An explicit request never rejects: requestReview logs every failure and swallows it.
 		reviewNow: (o) => enqueue(() => requestReview(ctx, o).catch(() => {})),
 		reviewIdle: () => tail,
+		/** The bell's notice lines for skipped PR reviews, oldest first. */
+		skipNotices: () => skipNotices.map((n) => n.text),
 	};
 }

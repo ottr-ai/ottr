@@ -15,6 +15,7 @@ import {
 	systemPrompt,
 } from "./forkAnalysis";
 import { setGitSecrets } from "./gitHosts.ts";
+import fc from "./test/properties.ts";
 import type { ForkAnalysisResult, ForkRange } from "./types";
 
 const SHA1 = "a".repeat(40);
@@ -171,27 +172,81 @@ describe("redactSecrets", () => {
 		expect(r.hits).toBe(1);
 		expect(r.text).toBe("[REDACTED]db.example.com/x");
 	});
-	test("pauses on suspicious assignment", () => {
+	test("suspicious assignment redacts the quoted value", () => {
 		const r = redactSecrets('cfg.password = "abcdefghijklmnop"');
-		expect(r.paused).toBe("possible credential in fork content");
-		expect(r.text).toBe('cfg.password = "abcdefghijklmnop"');
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe('cfg.password = "[REDACTED]"');
 	});
-	test("identifier copy does not pause", () => {
+	test("single-quoted suspicious value redacts with its quote style kept", () => {
+		const r = redactSecrets("secret: 'aaaaaaaaaaaaaaaa'");
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe("secret: '[REDACTED]'");
+	});
+	test("identifier copy stays visible", () => {
 		const r = redactSecrets("apiKey = whisparr.apiKey;");
-		expect(r.paused).toBeNull();
 		expect(r.hits).toBe(0);
+		expect(r.text).toBe("apiKey = whisparr.apiKey;");
 	});
-	test("fixture-prefixed quoted value does not pause", () => {
+	test("fixture-prefixed quoted value stays visible", () => {
 		const r = redactSecrets('apiKey: "fixture-jellyfin-key",');
-		expect(r.paused).toBeNull();
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe('apiKey: "fixture-jellyfin-key",');
 	});
-	test("unquoted long value does not pause", () => {
-		expect(
-			redactSecrets("password = superlongunquotedvalue123").paused,
-		).toBeNull();
+	test("the fixture check runs on the trimmed value", () => {
+		const r = redactSecrets('apiKey: " test-jellyfin-key-1"');
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe('apiKey: " test-jellyfin-key-1"');
 	});
-	test("known tokens do not trigger pause", () => {
-		expect(redactSecrets(`ghp_${"x".repeat(36)}`).paused).toBeNull();
+	test("a leading-space test value that is no fixture still redacts", () => {
+		const r = redactSecrets('apiKey: " new-jellyfin-key-1"');
+		expect(r.hits).toBe(1);
+		expect(r.text).toBe('apiKey: "[REDACTED]"');
+	});
+	test("a prose value with a space redacts but never counts as a credential hit", () => {
+		const r = redactSecrets(
+			'apiKey: "A Whispa vial was lost because the settings never arrived."',
+		);
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe('apiKey: "[REDACTED]"');
+	});
+	test("unquoted long value stays visible", () => {
+		const r = redactSecrets("password = superlongunquotedvalue123");
+		expect(r.hits).toBe(0);
+		expect(r.text).toBe("password = superlongunquotedvalue123");
+	});
+	test("property: no quoted suspicious value survives redaction", () => {
+		const key = fc.constantFrom(
+			"password",
+			"passwd",
+			"secret",
+			"api_key",
+			"apiKey",
+			"access_token",
+			"private-key",
+		);
+		const chunk = fc.constantFrom("aaaa", "bbbbbbbb", "1Z3", "x y z w");
+		const value = fc
+			.array(chunk, { minLength: 6, maxLength: 9 })
+			.map((a) => a.join(""));
+		// The pad ends with a non-word character (or is empty), so the keyword
+		// keeps its \b boundary and the assignment matches.
+		fc.assert(
+			fc.property(
+				key,
+				value,
+				fc.constantFrom('"', "'"),
+				fc.constantFrom("", "x ", "-- ", "a\n"),
+				(k, v, q, pad) => {
+					const s = `${pad}${k}: ${q}${v}${q}`;
+					const fixture =
+						/^(?:fixture|test|example|sample|dummy|placeholder|changeme|redacted)[-_. ]/i;
+					const r = redactSecrets(s);
+					// The model never sees the value: every non-fixture quoted value
+					// is gone after redaction, and redaction never throws.
+					if (!fixture.test(v.trim())) expect(r.text).not.toContain(v);
+				},
+			),
+		);
 	});
 });
 
@@ -216,7 +271,7 @@ describe("buildUserMessage", () => {
 		expect(msg).toContain("title: T1");
 		expect(msg).toContain("declined: not worth it");
 	});
-	test("throws the paused error when a patch carries a suspicious assignment", () => {
+	test("redacts a suspicious assignment inside a patch instead of throwing", () => {
 		const r = range({
 			commits: [
 				{
@@ -231,9 +286,9 @@ describe("buildUserMessage", () => {
 			],
 			merges: [],
 		});
-		expect(() => buildUserMessage(r, { titles: [], declines: [] })).toThrow(
-			"possible credential in fork content",
-		);
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain('password = "[REDACTED]"');
+		expect(msg).not.toContain("abcdefghijklmnop");
 	});
 	test("throws RangeError when oversized patches bust the budget", () => {
 		const big = "x".repeat(600_000);
