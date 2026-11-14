@@ -15,6 +15,7 @@ import {
 	parseDupTerms,
 	parseDupVerdict,
 	searchCode,
+	staleDupMatches,
 } from "./duplicateGate.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import { DUPLICATE_REASON } from "./prompts.ts";
@@ -99,6 +100,64 @@ describe("dupCandidateTasks", () => {
 		expect(picked.at(-1)?.id).toBe("M-5");
 		const times = picked.map((t) => t.updatedAt);
 		expect(times).toEqual([...times].sort((a, b) => b - a));
+	});
+});
+
+describe("staleDupMatches", () => {
+	const self = task({ id: "S", stage: "todo" });
+	const seenAs = (
+		id: string,
+		status: DupCandidate["status"],
+	): DupCandidate => ({
+		id,
+		status,
+		title: id,
+		prompt: id,
+		summary: null,
+		report: null,
+	});
+	const verdict = (...ids: string[]): DupVerdict => ({
+		verdict: "duplicate",
+		matches: [
+			{ kind: "code", ref: "src/a.ts:1" },
+			...ids.map((ref) => ({ kind: "task" as const, ref })),
+		],
+		reason: "covered",
+	});
+
+	test("a match that still holds with the status the model saw is not stale", () => {
+		const a = task({ id: "A", stage: "merging" });
+		const r = task({ id: "R", stage: "done", research: true });
+		expect(
+			staleDupMatches(
+				self,
+				verdict("A", "R"),
+				[seenAs("A", "merging"), seenAs("R", "done research")],
+				[self, a, r],
+			),
+		).toEqual([]);
+	});
+
+	test("gone, cancelled, status-changed and newly followed-up matches are stale", () => {
+		const cancelled = task({ id: "C", cancelledAt: 5 });
+		const moved = task({ id: "M", stage: "merging" });
+		const done = task({ id: "D", stage: "done", research: false });
+		const research = task({ id: "R", stage: "done", research: true });
+		const child = task({ id: "K", stage: "todo", followUpOf: "R" });
+		expect(
+			staleDupMatches(
+				self,
+				verdict("G", "C", "M", "D", "R"),
+				[
+					seenAs("G", "in progress"),
+					seenAs("C", "in progress"),
+					seenAs("M", "in progress"),
+					seenAs("D", "in progress"),
+					seenAs("R", "done research"),
+				],
+				[self, cancelled, moved, done, research, child],
+			),
+		).toEqual(["G", "C", "M", "D", "R"]);
 	});
 });
 

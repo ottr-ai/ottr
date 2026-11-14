@@ -52,27 +52,54 @@ function hasFollowUp(id: string, tasks: ListedTask[]): boolean {
 	);
 }
 
-/** The same project's tasks the new card can repeat: in progress, merging, or done
- * research without a follow-up; never self, nor the card self continues. A child on
- * another board is not in the list, so its parent counts as "without a follow-up".
+/** The candidate status of `t` for the new card `self`, or null when `t` is no candidate:
+ * cancelled, self, the card self continues, or outside in progress, merging, and done
+ * research without a follow-up. A child on another board is not in the list, so its
+ * parent counts as "without a follow-up". */
+function candidateStatus(
+	self: ListedTask,
+	t: ListedTask,
+	tasks: ListedTask[],
+): DupCandidate["status"] | null {
+	const parent = self.followUpOfProject === null ? self.followUpOf : null;
+	if (t.cancelledAt !== null || t.id === self.id || t.id === parent)
+		return null;
+	if (t.stage === "in_progress") return "in progress";
+	if (t.stage === "merging") return "merging";
+	if (t.stage === "done" && t.research && !hasFollowUp(t.id, tasks))
+		return "done research";
+	return null;
+}
+
+/** The same project's tasks the new card can repeat (`candidateStatus` not null).
  * Newest updatedAt first, at most DUP_CANDIDATE_CAP. */
 export function dupCandidateTasks(
 	self: ListedTask,
 	tasks: ListedTask[],
 ): ListedTask[] {
-	const parent = self.followUpOfProject === null ? self.followUpOf : null;
 	return tasks
-		.filter(
-			(t) =>
-				t.cancelledAt === null &&
-				t.id !== self.id &&
-				t.id !== parent &&
-				(t.stage === "in_progress" ||
-					t.stage === "merging" ||
-					(t.stage === "done" && t.research && !hasFollowUp(t.id, tasks))),
-		)
+		.filter((t) => candidateStatus(self, t, tasks) !== null)
 		.sort((a, b) => b.updatedAt - a.updatedAt)
 		.slice(0, DUP_CANDIDATE_CAP);
+}
+
+/** The task matches of a verdict that no longer hold on the current task list: the
+ * matched card is gone, is no candidate anymore, or changed its status since the model
+ * saw it. A close must re-check this right before it cancels the new card. */
+export function staleDupMatches(
+	self: ListedTask,
+	v: DupVerdict,
+	candidates: DupCandidate[],
+	tasks: ListedTask[],
+): string[] {
+	return v.matches
+		.filter((m) => {
+			if (m.kind !== "task") return false;
+			const t = tasks.find((x) => x.id === m.ref);
+			const seen = candidates.find((c) => c.id === m.ref)?.status;
+			return t === undefined || candidateStatus(self, t, tasks) !== seen;
+		})
+		.map((m) => m.ref);
 }
 
 /** Maps one selected task to the capped data the model sees. A stage outside the

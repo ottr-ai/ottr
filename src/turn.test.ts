@@ -26965,6 +26965,82 @@ describe("duplicate-work gate (OTTR-941)", () => {
 		expect(kept.stage).toBe("in_progress");
 	});
 
+	test("queued user text rides into the judged prompt; a change during the check drops the close", async () => {
+		const judged: string[] = [];
+		let st: ProjectStore | null = null;
+		let taskId = "";
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			duplicateCheck: async (o) => {
+				judged.push(o.prompt);
+				// A steer lands while the model judges the older text.
+				await st!.updateTask(taskId, {
+					pendingPrompt: "Also add the JSON export.\n\nAnd an XML export.",
+					pendingBy: "user",
+				});
+				return {
+					verdict: "duplicate",
+					matches: [{ kind: "code", ref: "src/export.ts:3" }],
+					reason: "The CSV export already exists.",
+				};
+			},
+		});
+		st = store;
+		const task = await store.createTask("Add CSV export");
+		taskId = task.id;
+		await store.updateTask(task.id, {
+			pendingPrompt: "Also add the JSON export.",
+			pendingBy: "user",
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(judged).toEqual(["Add CSV export\n\nAlso add the JSON export."]);
+		const after = (await store.getTask(task.id))!;
+		expect(after.cancelledAt).toBeNull();
+		expect(after.needsReason ?? "").not.toContain("Duplicate work gate");
+		expect(after.gate?.dup).toEqual({
+			verdict: "error",
+			note: "the task text changed during the check",
+		});
+		expect(record.runs).toHaveLength(1);
+		expect(await logText(store, task.id)).toContain(
+			"! duplicate gate: verdict dropped: the task text changed during the check",
+		);
+	});
+
+	test("a matched task cancelled during the check drops the close", async () => {
+		let st: ProjectStore | null = null;
+		let otherId = "";
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			duplicateCheck: async () => {
+				await st!.updateTask(otherId, { cancelledAt: Date.now() });
+				return {
+					verdict: "duplicate",
+					matches: [{ kind: "task", ref: otherId }],
+					reason: "The other card does this work.",
+				};
+			},
+		});
+		st = store;
+		const other = await store.createTask("add a hello file, first try");
+		await store.updateTask(other.id, { stage: "in_progress", state: "idle" });
+		otherId = other.id;
+		const task = await store.createTask("add a hello file");
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.cancelledAt).toBeNull();
+		expect(after.needsReason ?? "").not.toContain("Duplicate work gate");
+		expect(after.gate?.dup?.verdict).toBe("error");
+		expect(record.runs).toHaveLength(1);
+		expect(await logText(store, task.id)).toContain(
+			`! duplicate gate: verdict dropped: matched tasks changed during the check: ${other.id}`,
+		);
+	});
+
 	test("a new verdict lets the card through untouched", async () => {
 		let calls = 0;
 		const { store, record, loop } = await setup({

@@ -98,6 +98,10 @@ the search results.
 `duplicateCheck(o)` runs the three steps and returns the `DupVerdict`. The turn loop calls
 it through the `ops.duplicateCheck` seam, so tests never spawn a gateway.
 
+The judged text (`prompt` of the seam) is `gateEffectiveText(task.prompt, pending)`: the
+task text plus the queued `pendingPrompt` when `pendingBy` is not `"supervisor"`. A steer
+before the first start can add requirements, so the gate must judge it too.
+
 ## Outcomes
 
 `dupMatchText(verdict, candidates)` joins the matches: a task as `<id> (<status>)`, code as
@@ -109,6 +113,17 @@ its ref, comma-separated.
 | `partial` | gate `dup: { verdict: "partial", note: dupOverlapNote(...) }` | `+ duplicate gate: partial overlap: <note>` | continues |
 | `new` | gate `dup: { verdict: "new" }` | `+ duplicate gate: no duplicate found` | continues |
 | error | gate `dup: { verdict: "error" }` | `! duplicate gate: <cause>` | continues (fail open) |
+| `duplicate`, stale | gate `dup: { verdict: "error", note: <why> }` | `! duplicate gate: verdict dropped: <why>` | continues (fail open) |
+
+A `duplicate` verdict holds only for the text and the task list that the model saw. The
+transaction that closes the card re-reads both and drops the verdict ("stale") when:
+
+- `prompt`, `pendingPrompt` or `pendingBy` changed since the gate read them
+  (`the task text changed during the check`), or
+- `staleDupMatches(current, verdict, candidates, await store.listTasks())` names a task
+  match that is gone, is no candidate anymore (cancelled, left the candidate stages, or a
+  done research card that gained a follow-up), or has another status than the model saw
+  (`matched tasks changed during the check: <ids>`).
 
 - `dupCloseReason` = `Duplicate work gate: <reason> Matches: <dupMatchText>`.
 - `dupOverlapNote` = `<reason> Matches: <dupMatchText>`.

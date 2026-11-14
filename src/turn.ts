@@ -23,6 +23,7 @@ import {
 	dupCloseReason,
 	duplicateCheck,
 	dupOverlapNote,
+	staleDupMatches,
 } from "./duplicateGate.ts";
 import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
@@ -53,6 +54,7 @@ import {
 	gateAskQuestions,
 	gateAssumptionsBlock,
 	gateCompareText,
+	gateEffectiveText,
 	gateFingerprint,
 	gateHandoff,
 	gateJudgedPrompt,
@@ -4331,7 +4333,11 @@ export function createTurnLoop(
 	 * a `dup` stamp, a stage other than todo, a session, a branch, a worktree or any earlier
 	 * turn row skips it. A cleared session alone is no evidence of a new card: the
 	 * restart-session route clears it but keeps the turns, the branch and the worktree, and
-	 * cards from before this gate carry no stamp. A full match closes (cancels) the card and returns false. A partial
+	 * cards from before this gate carry no stamp. The gate judges the prompt plus queued
+	 * user text (a steer before the first start adds requirements). A full match closes
+	 * (cancels) the card and returns false, but only when the closing transaction finds
+	 * the same prompt and queued text and every matched task still a candidate with the
+	 * status the model saw; else the verdict is dropped and the gate fails open. A partial
 	 * match, no match or a gate failure stamps the card and returns true (fail open). A
 	 * stamp write that finds the card cancelled or no longer preparing returns false. */
 	async function duplicateGateTurnStart(
@@ -4355,6 +4361,9 @@ export function createTurnLoop(
 			(await store.listTurns(id)).length > 0
 		)
 			return true;
+		// Queued user text is part of the work: a steer before the first start can add
+		// requirements. Supervisor text is not user scope, like in the prompt gate.
+		const pending = live.pendingBy === "supervisor" ? null : live.pendingPrompt;
 		const candidates: DupCandidate[] = [];
 		let verdict: DupVerdict;
 		try {
@@ -4365,45 +4374,74 @@ export function createTurnLoop(
 				if (full !== null) candidates.push(dupCandidate(full));
 			}
 			verdict = await (ops.duplicateCheck ?? duplicateCheck)({
-				prompt: live.prompt,
+				prompt: gateEffectiveText(live.prompt, pending),
 				candidates,
 				cwd: e.path,
 				ref: header.target,
 			});
 		} catch (err) {
 			await log(`! duplicate gate: ${errmsg(err)}`);
-			return await writeDupStamp(store, id, { verdict: "error" }, null);
+			return (await writeDupStamp(store, id, { verdict: "error" })).ok;
 		}
 		if (verdict.verdict === "duplicate") {
 			const reason = dupCloseReason(verdict, candidates);
-			await log(`! ${reason}`);
-			await writeDupStamp(
+			const r = await writeDupStamp(
 				store,
 				id,
 				{ verdict: "duplicate", note: reason },
-				reason,
+				{
+					reason,
+					// The verdict holds only for the text and the task list the model saw.
+					stale: async (current) => {
+						if (
+							current.prompt !== live.prompt ||
+							current.pendingPrompt !== live.pendingPrompt ||
+							current.pendingBy !== live.pendingBy
+						)
+							return "the task text changed during the check";
+						const gone = staleDupMatches(
+							current,
+							verdict,
+							candidates,
+							await store.listTasks(),
+						);
+						return gone.length === 0
+							? null
+							: `matched tasks changed during the check: ${gone.join(", ")}`;
+					},
+				},
 			);
-			return false;
+			if (r.dropped === null) {
+				if (r.ok) await log(`! ${reason}`);
+				return false;
+			}
+			await log(`! duplicate gate: verdict dropped: ${r.dropped}`);
+			return r.ok;
 		}
 		if (verdict.verdict === "partial") {
 			const note = dupOverlapNote(verdict, candidates);
 			await log(`+ duplicate gate: partial overlap: ${note}`);
-			return await writeDupStamp(store, id, { verdict: "partial", note }, null);
+			return (await writeDupStamp(store, id, { verdict: "partial", note })).ok;
 		}
 		await log("+ duplicate gate: no duplicate found");
-		return await writeDupStamp(store, id, { verdict: "new" }, null);
+		return (await writeDupStamp(store, id, { verdict: "new" })).ok;
 	}
 
 	/** The duplicate gate's one card write: the stamp, merged into the gate state, and on a
-	 * close (`closeReason` set) the cancel with the reason. The card has no worktree and no
-	 * branch yet, so the close needs no cleanup. Writes only while the card is uncancelled
-	 * and preparing; false = it was not, and the turn stops. */
+	 * close the cancel with the reason. The close re-checks `stale` in the same transaction:
+	 * a non-null answer drops the verdict, stamps "error" (fail open) and comes back as
+	 * `dropped`. The card has no worktree and no branch yet, so the close needs no cleanup.
+	 * Writes only while the card is uncancelled and preparing; `ok` false = it was not, and
+	 * the turn stops. */
 	async function writeDupStamp(
 		store: ProjectStore,
 		id: string,
 		dup: DupGateStamp,
-		closeReason: string | null,
-	): Promise<boolean> {
+		close?: {
+			reason: string;
+			stale: (current: Task) => Promise<string | null>;
+		},
+	): Promise<{ ok: boolean; dropped: string | null }> {
 		return await store.transaction(async () => {
 			const current = await store.getTask(id);
 			if (
@@ -4411,7 +4449,8 @@ export function createTurnLoop(
 				current.cancelledAt !== null ||
 				current.state !== "preparing"
 			)
-				return false;
+				return { ok: false, dropped: null };
+			const dropped = close === undefined ? null : await close.stale(current);
 			const gate: PromptGateState = {
 				...(current.gate ?? {
 					hash: null,
@@ -4420,20 +4459,20 @@ export function createTurnLoop(
 					sig: null,
 					parked: false,
 				}),
-				dup,
+				dup: dropped === null ? dup : { verdict: "error", note: dropped },
 			};
 			await store.updateTask(
 				id,
-				closeReason === null
+				close === undefined || dropped !== null
 					? { gate }
 					: {
 							cancelledAt: Date.now(),
 							state: "idle",
-							needsReason: closeReason,
+							needsReason: close.reason,
 							gate,
 						},
 			);
-			return true;
+			return { ok: true, dropped };
 		});
 	}
 
