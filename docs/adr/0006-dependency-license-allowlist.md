@@ -4,7 +4,7 @@ Date: 2026-11-05
 
 ## Status
 
-accepted
+superseded by [ADR-0014](0014-dependency-license-allowlist-extension.md)
 
 ## Context
 
