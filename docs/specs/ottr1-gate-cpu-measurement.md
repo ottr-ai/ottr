@@ -20,10 +20,11 @@ on the OTTR-884 final tree and re-runs the gate numbers with it.
 
 ## Verdict
 
-- Base tree: gate FAILS. State p95 7,735.4 ms pooled (per-run 7,246-7,791 ms;
-  threshold 250 ms). Timer-lag p99 10,133-10,650 ms (threshold 50 ms).
-- Final tree: gate PASSES. State p95 21.8-24.4 ms per run, 17.0 ms pooled over
-  39,267 window samples. Timer-lag p99 18.2-21.1 ms, mean 3.9-4.3 ms.
+- Base tree: gate FAILS. State p95 7,246-7,791 ms across the 5 runs (threshold
+  250 ms). Timer-lag p99 10,133-10,650 ms (threshold 50 ms).
+- Final tree: gate PASSES. State p95 21.8-24.4 ms across the 5 runs (39,267
+  window samples in total; threshold 250 ms). Timer-lag p99 18.2-21.1 ms, mean
+  3.9-4.3 ms.
 - CPU clause: not triggered, because the clause applies only to a failed gate.
   On the failed base tree the clause HOLDS: the main thread carries 82-83% of
   process CPU (below), so portable application CPU on the main thread
