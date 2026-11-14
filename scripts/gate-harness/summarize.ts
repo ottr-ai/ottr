@@ -1,7 +1,8 @@
 /**
  * summarize.ts — one summary block per run from a load.ts records.json.
  * Prints state p50/p95 over the measurement window (warm-up excluded),
- * timer-lag p99 (server probe), server CPU %, and per-response bytes
+ * timer-lag p99 (server probe), server CPU %, main-thread CPU % with its
+ * share of the process CPU, the per-thread CPU lines, and per-response bytes
  * (gzip average over windowed responses, raw from the tail GET).
  *
  * Usage: bun summarize.ts <records.json> [label]
@@ -43,6 +44,25 @@ const data = JSON.parse(readFileSync(file, "utf8")) as {
 		ticks: number | null;
 		clkTck: number;
 	};
+	mainCpu: {
+		pct: number | null;
+		ticks: number | null;
+		wallMs: number;
+		clkTck: number;
+	};
+	threads: {
+		wallMs: number;
+		clkTck: number;
+		paired: Array<{
+			tid: number;
+			comm: string;
+			main: boolean;
+			ticks: number;
+			pct: number;
+		}>;
+		newThreads: Array<{ tid: number; comm: string; ticks: number }>;
+		exitedThreads: number;
+	} | null;
 	records: Array<{
 		viewer: number;
 		phase: "warm" | "window" | "tail";
@@ -75,6 +95,25 @@ console.log(
 console.log(
 	`server CPU: ${data.cpu.pct?.toFixed(1) ?? "n/a"} % over ${((data.cpu.wallMs ?? 0) / 1000).toFixed(1)} s`,
 );
+const mainShare =
+	data.mainCpu.pct !== null && data.cpu.pct !== null && data.cpu.pct !== 0
+		? ` (${((data.mainCpu.pct / data.cpu.pct) * 100).toFixed(1)}% of process CPU)`
+		: "";
+console.log(
+	`main-thread CPU: ${data.mainCpu.pct?.toFixed(1) ?? "n/a"} %${mainShare}`,
+);
+if (data.threads === null) {
+	console.log("threads new: n/a exited: n/a");
+} else {
+	for (const t of data.threads.paired) {
+		console.log(
+			`tid ${t.tid} ${t.comm} ${t.main ? "main" : "worker"} ${t.ticks} ticks (${t.pct.toFixed(1)} %)`,
+		);
+	}
+	console.log(
+		`threads new: ${data.threads.newThreads.length} exited: ${data.threads.exitedThreads}`,
+	);
+}
 console.log(
 	`bytes per response: gz avg ${mb(gzResponses.length === 0 ? 0 : gzBytes / gzResponses.length)} over ${gzResponses.length} gzip responses; raw ${mb(data.rawBytes)} (tail GET ${data.rawMs.toFixed(0)} ms)`,
 );

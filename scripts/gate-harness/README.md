@@ -21,7 +21,10 @@ OTTR-807-style harness; this copy replaces the volatile `/tmp` versions.
   header plus continuous `GET /api/state` with `Connection: close` and
   gzip. 10 s warm-up (recorded, excluded), 30 s window. Samples the lag
   endpoint and one uncompressed GET for the raw size; reads
-  `/proc/<pid>/stat` for server CPU.
+  `/proc/<pid>/stat` for server CPU. It also samples
+  `/proc/<pid>/task/<pid>/stat` for main-thread CPU and
+  `/proc/<pid>/task/*/stat` at both window edges for a top-12 per-thread
+  breakdown.
 - `summarize.ts` — state p50/p95, lag p99, CPU %, bytes per response.
 - `runpair.sh` — seeds and runs two tree dirs once per pair (base first),
   N pairs, env-scrubbed server start (`env -i`, `OTTR_BACKUP_KEEP=0`),

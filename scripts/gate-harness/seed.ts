@@ -221,9 +221,9 @@ for (let p = 0; p < PROJECTS; p++) {
 
 	// The tree's own store creates the schema and runs its migrations, so the
 	// seeded db always matches the tree that will serve it.
-	const store = ProjectStore.init(dir);
+	const store = await ProjectStore.init(dir);
 	await store.backfill;
-	store.close();
+	await store.close();
 
 	const dbPath = join(dir, ".tasks", "tasks.db");
 	const db = new Database(dbPath);
