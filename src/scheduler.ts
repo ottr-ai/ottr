@@ -193,22 +193,60 @@ export function pushHold(
 	return t.pushRetries > 0 || t.pendingBy === "user" ? null : PUSH_HOLD;
 }
 
+/** One live review's findings plus every finding id in the array, for mergeHold and
+ * reviewHoldFor. Cached per tasks array (OTTR-940): the state build's release stamps
+ * and stall warnings call mergeHold once per task per release on one array, and
+ * reviewFindings walks every card per review — uncached that repeats the whole walk
+ * per call. The array is read-only while cached: every call site passes a fresh store
+ * read or a filter result and never mutates it. */
+const reviewClosures = new WeakMap<
+	readonly ReviewTask[],
+	{ byReview: Map<string, ReviewTask[]>; anyFinding: Set<string> }
+>();
+
+function reviewClosure(tasks: readonly ReviewTask[]): {
+	byReview: Map<string, ReviewTask[]>;
+	anyFinding: Set<string>;
+} {
+	let c = reviewClosures.get(tasks);
+	if (c === undefined) {
+		const byReview = new Map<string, ReviewTask[]>();
+		const anyFinding = new Set<string>();
+		for (const r of tasks) {
+			if (r.cancelledAt !== null || !isReview(r)) continue;
+			const fs = reviewFindings(tasks, r);
+			byReview.set(r.id, fs);
+			for (const f of fs) anyFinding.add(f.id);
+		}
+		c = { byReview, anyFinding };
+		reviewClosures.set(tasks, c);
+	}
+	return c;
+}
+
 /** The hold `merge` waits under while the open review `r` gates the target, else null when
- * `merge` is exempt (it is `r` itself, or one of `r`'s findings — those never wait). */
+ * `merge` is exempt (it is `r` itself, or one of `r`'s findings — those never wait).
+ * `findings` is `r`'s findings from the shared reviewClosure; `mergeIsFinding` says
+ * `mergeId` is a finding of some review, not necessarily `r`. */
 function reviewHoldFor(
-	tasks: readonly ReviewTask[],
+	findings: readonly ReviewTask[],
 	r: ReviewTask,
 	mergeId: string,
+	mergeIsFinding: boolean,
 ): string | null {
-	const findings = reviewFindings(tasks, r);
 	if (findings.some((f) => f.id === mergeId)) return null;
 	if (r.releaseVersion !== null && r.stage !== "done")
 		return `waiting for release ${r.releaseVersion}`;
 	if (r.stage === "todo" || r.stage === "in_progress")
 		return "waiting for the review to finish";
 	// Parked at merging until its findings are done (findingsHold); a done review only reaches
-	// this with open findings when it finished before reviews parked.
-	if (r.stage === "merging" || findings.some(findingOpen))
+	// this with open findings when it finished before reviews parked. A finding of another
+	// review never takes this hold (OTTR-940): it is the only hold edge that can close a wait
+	// cycle through a finding — a release's own completion waits only on its findings, which
+	// are exempt from their own review above — so this exemption breaks every cycle. The
+	// release and review-running holds stay: an open release can gate a finding, and it
+	// settles once its own findings merge.
+	if (!mergeIsFinding && (r.stage === "merging" || findings.some(findingOpen)))
 		return "waiting for the review's findings to be implemented";
 	return null;
 }
@@ -216,8 +254,11 @@ function reviewHoldFor(
 /** Why the tracker holds a queued merge, else null. While a review runs, and until its findings are
  * done, only its findings merge; every other card waits in merging. So the next review counts from
  * exactly the commit this one saw, and a release ships only reviewed work plus the fixes it asked
- * for. Findings themselves never wait: holding one could deadlock the review that waits for it.
- * While local main has commits origin lacks (a rejected server push, `o.mainUnpushed`), every
+ * for. Findings themselves never wait for a findings hold — not for their own review's, and not
+ * (OTTR-940) for another review's: an older done review's finding and a newer open release would
+ * otherwise hold each other and park every merge of the project. They still wait for an open
+ * release itself and for a running review. While local main has commits origin lacks (a rejected
+ * server push, `o.mainUnpushed`), every
  * queued merge but the rejected card's rebase retry waits too (pushHold). With `o.prMode`, main
  * is never written locally, so that hold is inert. */
 export function mergeHold(
@@ -225,9 +266,15 @@ export function mergeHold(
 	merge: Pick<Task, "id" | "stage" | "state" | "pushRetries" | "pendingBy">,
 	o: { mainUnpushed?: boolean; prMode?: boolean } = {},
 ): string | null {
+	const { byReview, anyFinding } = reviewClosure(tasks);
 	for (const r of tasks) {
 		if (r.id === merge.id || r.cancelledAt !== null || !isReview(r)) continue;
-		const held = reviewHoldFor(tasks, r, merge.id);
+		const held = reviewHoldFor(
+			byReview.get(r.id) ?? [],
+			r,
+			merge.id,
+			anyFinding.has(merge.id),
+		);
 		if (held !== null) return held;
 	}
 	if (o.mainUnpushed === true && o.prMode !== true) {

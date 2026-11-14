@@ -18,6 +18,7 @@ import {
 	type DepProject,
 	demoteUnquoted,
 	depHold,
+	FINDINGS_HOLD,
 	findDep,
 	findingsHold,
 	findingsSettledAt,
@@ -840,6 +841,86 @@ describe("pickRunnable", () => {
 		expect(mergeHold([review, fixed, lead, other], other)).toBeNull();
 		// The parked lead stays parked; the queued merge runs.
 		expect(pickRunnable([review, fixed, lead, other], opts)).toEqual([other]);
+	});
+
+	test("an older release's finding does not wait for a newer open release's findings (OTTR-940)", () => {
+		// velvarr 2026-11-13: every merge parked in a hold cycle. The done release's
+		// finding waited for the open release, the open release waited for its own
+		// finding, and that finding waited for the done release's findings.
+		const older = task({
+			kind: "review",
+			releaseVersion: "v0.41.0",
+			base: "abc",
+			stage: "done",
+			state: "idle",
+			createdAt: 100,
+			doneAt: 500,
+		});
+		const f1 = task({
+			followUpOf: older.id,
+			createdAt: 300,
+			stage: "merging",
+			queuedAt: 600,
+		});
+		const newer = task({
+			kind: "review",
+			releaseVersion: "v0.42.0",
+			base: "def",
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			createdAt: 700,
+		});
+		const f2 = task({
+			followUpOf: newer.id,
+			createdAt: 800,
+			stage: "merging",
+			queuedAt: 900,
+		});
+		// F2 is a finding, so the older review's findings never hold it: the cycle
+		// opens and the queue runs. F1 still waits for the open release itself.
+		expect(mergeHold([older, f1, newer, f2], f2)).toBeNull();
+		expect(mergeHold([older, f1, newer, f2], f1)).toBe(
+			"waiting for release v0.42.0",
+		);
+		expect(pickRunnable([older, f1, newer, f2], opts)).toEqual([f2]);
+		// A normal card still waits: for the older review's findings and for the
+		// open release.
+		const normal = task({ stage: "merging", queuedAt: 650 });
+		expect(mergeHold([older, f1, newer, f2, normal], normal)).toBe(
+			"waiting for the review's findings to be implemented",
+		);
+		const f1done = {
+			...f1,
+			stage: "done" as const,
+			state: "idle" as const,
+			doneAt: 940,
+		};
+		expect(mergeHold([older, f1done, newer, f2, normal], normal)).toBe(
+			"waiting for release v0.42.0",
+		);
+		// The queue drains F2, the newer release settles on its findings, and then
+		// F1 merges too: every card reaches done.
+		const f2done = {
+			...f2,
+			stage: "done" as const,
+			state: "idle" as const,
+			doneAt: 950,
+		};
+		expect(mergeHold([older, f1, newer, f2done], f1)).toBe(
+			"waiting for release v0.42.0",
+		);
+		const newerDone = {
+			...newer,
+			stage: "done" as const,
+			state: "idle" as const,
+			needsReason: null,
+			doneAt: 960,
+		};
+		expect(mergeHold([older, f1, newerDone, f2done], f1)).toBeNull();
+		expect(pickRunnable([older, f1, newerDone, f2done, normal], opts)).toEqual([
+			f1,
+		]);
 	});
 
 	test("a finding's follow-ups and prerequisites merge with it; a later follow-up does not", () => {
