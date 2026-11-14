@@ -232,8 +232,15 @@ import {
 	worktreeAnchor,
 } from "./worktree.ts";
 
+/** turn.test.ts reads logStoreError from here (main's import shape); the helper
+ * itself lives beside the store (OTTR-884 merge). */
 /** Park reasons the approving reply recognizes and the drawer's hold action bar keys on. */
-export { FORK_HOLD_REASON, MERGE_HOLD_MISMATCH_REASON, UPDATE_HOLD_REASON };
+export {
+	FORK_HOLD_REASON,
+	logStoreError,
+	MERGE_HOLD_MISMATCH_REASON,
+	UPDATE_HOLD_REASON,
+};
 
 /** How long a card whose dispatch vm-runner refused as busy waits before the next try: the
  * busy settle's own schedule() call would otherwise re-dispatch in a tight loop. */
@@ -1503,7 +1510,7 @@ export type FinishKeptOutcome =
 
 /** The engine handle the server binds: scheduler ticks, live-run kills, boot recovery. */
 export interface TurnLoop {
-/** Write-driven entry: dispatch plus the write entry publish. */
+	/** Write-driven entry: dispatch plus the write entry publish. */
 	schedule(): Promise<void>;
 	/** The 5 s tick: dispatch plus the landed-writes check (OTTR-884). */
 	scheduleTick(): Promise<void>;
@@ -1581,7 +1588,6 @@ type TurnRunShared = {
 	 * started; null when this turn kind is not guarded. The settle re-checks them. */
 	guardBefore: Map<string, { head: string | null; status: string }> | null;
 };
-
 
 /** The agent run one turn dispatches (ops.startRun's handle). */
 
@@ -2149,12 +2155,13 @@ export function createTurnLoop(
 		const lost =
 			turnId === null
 				? null
-
 				: ((await store.listTurns(t.id)).find((row) => row.id === turnId) ??
 					null);
 		const base = original?.pendingPrompt ?? resume;
 		const pending =
-			original === null ? null : lostResumePrompt(store, original, lost, base);
+			original === null
+				? null
+				: await lostResumePrompt(store, original, lost, base);
 		const resend = lost !== null && pending !== null && pending !== base;
 		await store.transaction(async () => {
 			if (turnId !== null) {
@@ -2192,7 +2199,6 @@ export function createTurnLoop(
 				pendingBy:
 					current.pendingPrompt !== null ? current.pendingBy : "supervisor",
 			});
-
 		});
 		if (turnId !== null) await store.captureTurnData(turnId);
 	}
@@ -3188,7 +3194,6 @@ export function createTurnLoop(
 	}
 
 	async function scheduleDispatch(): Promise<void> {
->>>>>>> 4327d9d (fix: split the scheduler tick from the write entry and publish landed writes)
 		void sweepLostTurns(); // before the cap check: a vanished run must free its slot this tick
 		// Refresh every project first: a full cap must not skip the later projects' dirty and
 		// release flags (they gate the board and the merge queue). Coalesced (OTTR-866): a
@@ -3941,7 +3946,7 @@ export function createTurnLoop(
 		}
 		// The settle's store writes ship through the write-driven schedule() entry
 		// below, which publishes on entry (OTTR-884).
-		schedule();
+		void schedule();
 	}
 
 	/** True when the comprehension gate runs on this turn (OTTR-823 scope): plain work turns only —
@@ -5849,11 +5854,8 @@ export function createTurnLoop(
 			kind,
 			mx,
 			marks,
-
 		);
 		const started = ops.startRun(options);
-		// A local fallback may fill its pid after the original dispatch snapshot.
-		const pidAtStart = started instanceof Promise ? undefined : started.pid;
 		const handle = await started;
 		mx.entry = handle;
 		running.set(key, mx.entry);
@@ -5874,7 +5876,6 @@ export function createTurnLoop(
 				handle,
 				header,
 				runStartedAt,
-				route.vmTurn || pidAtStart === undefined ? handle.pid : pidAtStart,
 			);
 		});
 		return { handle, runMeter, runStartedAt, turn };
@@ -9346,9 +9347,7 @@ export function createTurnLoop(
 		selector: string | undefined,
 		checkMeter: ReturnType<OpenRunMeter>,
 	): Promise<TurnRunHandle> {
-
 		return await ops.startRun({
-
 			meter: ops.hosted !== undefined,
 			auditProvisioned: (sinceMs, rulesAtStart) =>
 				auditProvisioned(homedir(), sinceMs, rulesAtStart),
@@ -9528,11 +9527,13 @@ export function createTurnLoop(
 							fp === null ? null : pickLeadMatch(byFingerprint.get(fp) ?? []);
 						if (match !== null && match.kind !== "done") {
 							if (match.kind === "open") {
-								await st.store.updateTask(match.card.id, {
-									details: `${match.card.details ?? ""}\nSeen again in review ${st.id} on ${new Date()
-										.toISOString()
-										.slice(0, 10)}.`,
-								});
+								const full = await st.store.getTask(match.card.id);
+								if (full !== null)
+									await st.store.updateTask(full.id, {
+										details: `${full.details ?? ""}\nSeen again in review ${st.id} on ${new Date()
+											.toISOString()
+											.slice(0, 10)}.`,
+									});
 								leadNotFiled.push(
 									`- already open: #${match.card.id} (${findingHead(lead)})`,
 								);

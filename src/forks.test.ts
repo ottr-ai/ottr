@@ -1093,7 +1093,9 @@ describe("watcher", () => {
 			).toBe(cards.length);
 			for (const result of results) {
 				expect(result.stage).toBe("done");
-				expect(result.report).toContain("fork feature");
+				expect((await store.getTask(result.id))!.report).toContain(
+					"fork feature",
+				);
 			}
 			const advanced = (await store.listAllForkBranches()).filter(
 				(row) => row.branch === "feat" && row.analyzedHead === row.head,
@@ -1901,7 +1903,7 @@ describe("hold acceptance checks", () => {
 		// B is not covered by D or any other open PR: it is released and analyzed.
 		expect(await f.tick({ pulls: [{ n: 5, head: d }] })).toBe(1);
 		// List rows carry no report (OTTR-866); the result card reads fresh.
-		const card = await f.store.getTask((await forkCards(f.store))[0]!.id)!;
+		const card = (await f.store.getTask((await forkCards(f.store))[0]!.id))!;
 		expect(card.report).toContain("held feature b");
 		// B's consumed row is deleted after the successful run; D's row survives.
 		expect(await holds(f.store)).toEqual([
@@ -1926,7 +1928,7 @@ describe("hold acceptance checks", () => {
 			}),
 		).toBe(1);
 		// List rows carry no report (OTTR-866); the result card reads fresh.
-		const card = await f.store.getTask((await forkCards(f.store))[0]!.id)!;
+		const card = (await f.store.getTask((await forkCards(f.store))[0]!.id))!;
 		expect(card.report).toContain("held feature b");
 		expect(await holds(f.store)).toEqual([]);
 		expect((await featRow(f.store)).analyzedHead).toBe(c);

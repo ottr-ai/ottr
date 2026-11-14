@@ -93,7 +93,7 @@ describe("createSystemSampleLog (OTTR-793)", () => {
 	});
 
 	test("a non-Error rejection still renders a message", () => {
-		let now = 0;
+		const now = 0;
 		const lines: string[] = [];
 		const sampler = createSystemSampleLog(
 			() => now,

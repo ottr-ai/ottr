@@ -22,7 +22,7 @@ import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
 import { pluginSkillsOverlayPath } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
-import type { EventState, RunHandle, RunLauncher } from "./runner.ts";
+import type { EventState, RunLauncher } from "./runner.ts";
 import {
 	APPROVAL_REFUSAL,
 	applyEvent,
@@ -2927,7 +2927,6 @@ function fakeStart(o: {
 	onSession?: (sessionId: string) => void | Promise<void>;
 	onRecorded?: (finding: RecordedFinding) => void | Promise<void>;
 }) {
-
 	const fake = new FakeOmp(o.pid);
 	const launcher: RunLauncher = () => fake as unknown as ChildProcess; // the fake stands in for Node's class
 	return startRun({
@@ -2953,7 +2952,7 @@ describe("startRun", () => {
 		try {
 			const persisted: string[] = [];
 			const started: string[] = [];
-			const { handle, fake } = fakeStart({
+			const { handle, fake } = await fakeStart({
 				logPath: join(dir, "run.log"),
 				onSession: async (id) => {
 					started.push(id);
@@ -3026,7 +3025,7 @@ describe("startRun", () => {
 		try {
 			const failure = new Error("session persistence failed");
 			const persisted: string[] = [];
-			const { handle, fake } = fakeStart({
+			const { handle, fake } = await fakeStart({
 				logPath: join(dir, "run.log"),
 				onSession: async (id) => {
 					if (id === "first") await gate.promise;
@@ -3955,12 +3954,14 @@ describe("startRun worker dispatch", () => {
 							OTTR_REQUIRE_PG_TESTS: "0",
 						}
 					: inherited;
-				await startRun({
-					...baseOpts(dir, join(dir, "run.log")),
-					worker: { urls: [`http://127.0.0.1:${server.port}`] },
-					env: supplied ? testEnv : {},
-					githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() },
-				}).done;
+				await (
+					await startRun({
+						...baseOpts(dir, join(dir, "run.log")),
+						worker: { urls: [`http://127.0.0.1:${server.port}`] },
+						env: supplied ? testEnv : {},
+						githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() },
+					})
+				).done;
 				const body = bodies.at(-1)!;
 				expect(body.env).not.toHaveProperty("OTTR_DATABASE_URL");
 				expect(body.githubReadEnv).not.toHaveProperty("OTTR_DATABASE_URL");
@@ -4000,16 +4001,18 @@ describe("startRun worker dispatch", () => {
 							OTTR_REQUIRE_PG_TESTS: "0",
 						}
 					: inherited;
-				await startRun({
-					...baseOpts(dir, join(dir, "run.log")),
-					env: supplied ? testEnv : {},
-					launcher: (_command, _args, options) => {
-						seen = options;
-						const fake = new FakeOmp();
-						queueMicrotask(() => fake.emit("close", 0));
-						return fake as unknown as ChildProcess;
-					},
-				}).done;
+				await (
+					await startRun({
+						...baseOpts(dir, join(dir, "run.log")),
+						env: supplied ? testEnv : {},
+						launcher: (_command, _args, options) => {
+							seen = options;
+							const fake = new FakeOmp();
+							queueMicrotask(() => fake.emit("close", 0));
+							return fake as unknown as ChildProcess;
+						},
+					})
+				).done;
 				expect(seen).toBeDefined();
 				expect(seen!.env).not.toHaveProperty("OTTR_DATABASE_URL");
 				expect(seen!.env?.OTTR_TEST_PG_URL).toBe(testEnv.OTTR_TEST_PG_URL);
@@ -5132,14 +5135,16 @@ describe("startRun microVM dispatch", () => {
 		try {
 			for (const supplied of [false, true]) {
 				const opts = vmOpts(dir, tokens, url);
-				await startRun({
-					...opts,
-					env: {
-						...opts.env,
-						...(supplied ? { OTTR_DATABASE_URL: crypto.randomUUID() } : {}),
-					},
-					githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() },
-				}).done;
+				await (
+					await startRun({
+						...opts,
+						env: {
+							...opts.env,
+							...(supplied ? { OTTR_DATABASE_URL: crypto.randomUUID() } : {}),
+						},
+						githubReadEnv: { OTTR_DATABASE_URL: crypto.randomUUID() },
+					})
+				).done;
 				const body = seen.at(-1)!.body;
 				expect(body.env).not.toHaveProperty("OTTR_DATABASE_URL");
 				expect(body.githubReadEnv).not.toHaveProperty("OTTR_DATABASE_URL");

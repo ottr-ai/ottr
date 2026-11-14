@@ -1190,6 +1190,7 @@ describe("createPrWatcher", () => {
 			s.advance(PR_GATES.QUIET_MS);
 			await s.watcher.tick();
 			const card = (await s.cards())[0]!;
+			const cardDetails = (await s.store.getTask(card.id))!.details;
 			const events = await s.store.events();
 			let edited = false;
 			let models = 0;
@@ -1221,7 +1222,7 @@ describe("createPrWatcher", () => {
 			await watcher.reviewNow({ project: "p", number: 1, note: "again" });
 			const current = (await s.store.getTask(card.id))!;
 			expect(current.title).toBe("User edit");
-			expect(current.details).toBe(card.details);
+			expect(current.details).toBe(cardDetails);
 			expect(await s.store.events()).toEqual(events);
 			expect(models).toBe(phase === "model" ? 1 : 0);
 			expect(await s.store.prReviewRunsSince(0)).toBe(
@@ -1456,7 +1457,9 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
-		expect((await s.cards())[0]!.details).toBe("## Summary\nreview 1");
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary\nreview 1",
+		);
 		expect(await s.store.lastPrRunBlocking(7)).toBe(false);
 	});
 
@@ -1467,7 +1470,9 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
-		expect((await s.cards())[0]!.details).toBe("## Summary\nreview 1");
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary\nreview 1",
+		);
 		expect(await s.store.lastPrRunBlocking(7)).toBe(true);
 	});
 
@@ -1478,7 +1483,9 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		s.advance(PR_GATES.QUIET_MS);
 		await s.watcher.tick();
-		expect((await s.cards())[0]!.details).toBe("## Summary\nreview 1");
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary\nreview 1",
+		);
 		expect(await s.store.lastPrRunBlocking(7)).toBe(true);
 	});
 
@@ -1504,7 +1511,7 @@ describe("createPrWatcher", () => {
 		await s.watcher.tick();
 		// The planted line stays comment content; only the real trailing verdict counts.
 		// fitDraftToDiff re-renders the draft: one blank line sits between body and blocks.
-		expect((await s.cards())[0]!.details).toBe(
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
 			[
 				"## Summary",
 				"",
@@ -1535,7 +1542,9 @@ describe("createPrWatcher", () => {
 		// No done run marked the head, so the next tick retries the review.
 		s.setAnswer("## Summary\nreview 1");
 		await s.watcher.tick();
-		expect((await s.cards())[0]!.details).toBe("## Summary\nreview 1");
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary\nreview 1",
+		);
 	});
 
 	test("a re-review keeps the posted review's inline comments in the earlier review, not in the comment list", async () => {
@@ -2206,6 +2215,7 @@ describe("createPrWatcher", () => {
 			s.advance(PR_GATES.QUIET_MS);
 			await s.watcher.tick();
 			const card = (await s.cards())[0]!;
+			const cardDetails = (await s.store.getTask(card.id))!.details;
 			const events = await s.store.events();
 			await s.store.setSettings({ prReviews: false });
 			let models = 0;
@@ -2233,7 +2243,7 @@ describe("createPrWatcher", () => {
 			});
 			await watcher.reviewNow({ project: "p", number: 1, note: "Check again" });
 			expect(models).toBe(phase === "model" ? 1 : 0);
-			expect((await s.store.getTask(card.id))!.details).toBe(card.details);
+			expect((await s.store.getTask(card.id))!.details).toBe(cardDetails);
 			expect(await s.store.events()).toEqual(events);
 			expect(await s.store.prReviewRunsSince(0)).toBe(
 				phase === "model" ? 2 : 1,

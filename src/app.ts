@@ -322,7 +322,12 @@ import {
 import { migrateSealedConfig, sealStoredConfigRow } from "./sealedConfig.ts";
 import { isSealed, type SecretBox } from "./secretBox.ts";
 import { sessionContext } from "./session.ts";
-import { type BoardTurnFacts, ProjectStore, type TaskPatch } from "./store.ts";
+import {
+	type BoardTurnFacts,
+	logStoreError,
+	ProjectStore,
+	type TaskPatch,
+} from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
 import { createSystemSampleLog } from "./systemSampleLog.ts";
 import {
@@ -1793,10 +1798,12 @@ export type AppServeOptions = App["serveOptions"];
 export type BoardApp = ReturnType<typeof createApp>;
 
 /** OTTR-488: card-view steps — the stored value, except legacy 'unknown' rows resolve against the stored report at read time (no row rewrite). 'unknown' in a view means quiet. */
-function viewSteps(t: Pick<Task, "steps" | "report">): Task["steps"] {
+function viewSteps(
+	t: Pick<Task, "steps"> & { report?: string | null },
+): Task["steps"] {
 	return t.steps !== "unknown"
 		? t.steps
-		: t.report !== null && recommendsSteps(t.report)
+		: t.report != null && recommendsSteps(t.report)
 			? "yes"
 			: "unknown";
 }
@@ -1983,28 +1990,18 @@ export async function createApp(deps: AppDeps) {
 	 * the seenDoneSince baseline — a re-done card gets a new key, so its old one decays. Marks a
 	 * client sends for anything else are stale — a pre-server-sync tab imported marks for cards
 	 * it merely had open — so /api/seen drops them and the store decays instead of poisoning the board. */
-	/** OTTR-488 steps of a list row: the stored value, except research rows with legacy
-	 * 'unknown' steps resolve against the stored report. OTTR-866: list rows carry no
-	 * report, so only those rows read it back (one narrow query each). */
-	function listedSteps(e: Entry, t: ListedTask): Task["steps"] {
-		if (t.steps !== "unknown") return t.steps;
-		const report = t.research ? e.store.getTaskReport(t.id) : null;
-		return report !== null && recommendsSteps(report) ? "yes" : "unknown";
-	}
-
 	/** Whether a card's plain id is a read-mark key right now: pr_review, question-only answered,
 	 *  or done research whose report resolves to a steps value (see seenableIds). */
 	async function cardSeenable(t: ListedTask, e: Entry): Promise<boolean> {
+		if (t.cancelledAt !== null) return false;
+		if (t.kind === "pr_review") return true;
+		if (t.stage !== "done") return false;
+		if (isRetro(t)) return false;
+		if (answeredCard(await e.store.listTurns(t.id))) return true;
+		if (!t.research) return false;
+		const full = await e.store.getTask(t.id);
 		return (
-			t.cancelledAt === null &&
-			(t.kind === "pr_review" ||
-				(t.stage === "done" &&
-					!isRetro(t) &&
-					answeredCard(await e.store.listTurns(t.id))) ||
-				(t.research &&
-					t.stage === "done" &&
-					t.report !== null &&
-					viewSteps(t) !== "unknown"))
+			full !== null && full.report !== null && viewSteps(full) !== "unknown"
 		);
 	}
 
@@ -2942,13 +2939,15 @@ export async function createApp(deps: AppDeps) {
 		projects: () => deps.projects.values(),
 		enabled: () => deps.shared.trendingScan,
 		load: loadTrendingState,
-		update: (modify) => {
-			deps.gstore.update<TrendingState>("trending", (current) =>
-				modify(normalizeTrendingState(current)),
+		update: async (modify) => {
+			const next = await deps.gstore.update<TrendingState>(
+				"trending",
+				(current) => modify(normalizeTrendingState(current)),
 			);
 			// The saved weekly slot and last outcome show on the board (trendingStatus):
 			// publish at the save edge, not on the sweep (OTTR-866).
 			publishSoon();
+			return next;
 		},
 		// No token and apiBase here: trending is a github.com feature, so the scan reads
 		// api.github.com and lends GH_TOKEN only on a github.com board (upstreamToken).
@@ -4374,7 +4373,45 @@ export async function createApp(deps: AppDeps) {
 	}
 	// Boot + interval (src/server.ts), never per turn (docs/specs/memory-backend.md).
 
-		void (await memoryHealthTick(true));
+	// The /api/state cache bindings (below: publishSoon, stateBuild, stateEntry) must
+	// exist before the boot ticks run: memory health and the worker sign-in tick
+	// publish during createApp, before the cache block's declarations would execute.
+	let stateVersion = 0;
+	/** Version of the last built frame; -1 = nothing built yet, so the first build always runs. */
+	let builtVersion = -1;
+	/** Test seam: how often the state rebuilt (GET-triggered or publish-triggered,
+	 * one increment per completed build; OTTR-866). */
+	let builds = 0;
+	let stateTimer: Timer | null = null;
+	let stateCache: StateCacheEntry | null = null;
+	let stateBuilding: Promise<StateCacheEntry> | null = null;
+	// OTTR-884: the cache also invalidates when any store write landed since the
+	// build, detected through each project's SQLite WAL fingerprint. A raw store
+	// write (no publishSoon — fixture writes, the supervisor's smaller calls)
+	// moves the WAL, so the next GET rebuilds instead of serving a frame that
+	// predates the write. Quiet boards keep the TTL cache: a still WAL means the
+	// frame is as fresh as the last build.
+	let buildWalMark = "";
+	const storePaths = (): string[] => [
+		...Array.from(deps.projects.values(), (e) =>
+			join(e.store.path, ".tasks", "tasks.db-wal"),
+		),
+	];
+	function storeWalMark(): string {
+		let mark = "";
+		for (const p of storePaths()) {
+			let st: import("node:fs").Stats | undefined;
+			try {
+				st = statSync(p, { throwIfNoEntry: false });
+			} catch {
+				st = undefined;
+			}
+			mark += `${p}:${st === undefined ? "absent" : `${st.size}:${st.mtimeMs}`};`;
+		}
+		return mark;
+	}
+
+	void (await memoryHealthTick(true));
 	// OTTR-548: the workers' sign-in self-reports boot + interval (src/server.ts), advisory only.
 	void (await workerSignInTick());
 	const logins = providerLogin();
@@ -5193,12 +5230,6 @@ export async function createApp(deps: AppDeps) {
 		},
 		now: number,
 	): Promise<TaskCard> {
-		const {
-			details: _details,
-			report: _report,
-			diffFiles: _diffFiles,
-			...card
-		} = t;
 		const progress = deps.progressOf?.(e.store.name, t.id);
 		const silent = silentSince(
 			t,
@@ -5210,7 +5241,7 @@ export async function createApp(deps: AppDeps) {
 		);
 		const tf = ctx.facts.turns.get(t.id);
 		return {
-			...card,
+			...t,
 			steps: viewSteps(t),
 			sessionTitle: await e.store.frozenTitleFrom(
 				t,
@@ -5269,7 +5300,6 @@ export async function createApp(deps: AppDeps) {
 		}
 	}
 
-
 	/** One event-loop turn released: a build chunk hands control back so requests,
 	 * timers and sockets run between slices (OTTR-866). Every build slice yields
 	 * through this one helper, so the cadence stays in lockstep. */
@@ -5306,8 +5336,8 @@ export async function createApp(deps: AppDeps) {
 				const trendingRepos = await trendingReposOf(e);
 				const cards: TaskCard[] = [];
 
-			let built = 0;
-			for (const t of await e.store.listTasks()) {
+				let built = 0;
+				for (const t of await e.store.listTasks()) {
 					const kept = keptCounts(t, now, days);
 					keptHeld += kept.held;
 					keptStale += kept.stale;
@@ -5355,7 +5385,6 @@ export async function createApp(deps: AppDeps) {
 		return { tasks, keptHeld, keptStale, keptCards, tasksBufs };
 	}
 
-
 	/** The /system holds: the cached state frame's cards, so /api/system counts the
 	 * same cards the board ships (OTTR-866). Drain and ceiling stay live reads. */
 	async function systemHolds(now: number): Promise<SystemHolds> {
@@ -5374,7 +5403,6 @@ export async function createApp(deps: AppDeps) {
 				first === undefined ? null : (first.queuedAt ?? first.createdAt),
 		};
 	}
-
 
 	/** One state frame, chunked: the card loop yields to the loop (OTTR-866). The small
 	 * views stay one step after the cards. Returns the object and the tasks array's
@@ -6677,7 +6705,6 @@ export async function createApp(deps: AppDeps) {
 		}
 	}
 
-
 	let publishTail: Promise<void> = Promise.resolve();
 	function publishState(): Promise<boolean> {
 		if (closing) return Promise.resolve(false);
@@ -6693,8 +6720,29 @@ export async function createApp(deps: AppDeps) {
 		return result;
 	}
 
-	async function publishStateNow(): Promise<boolean> {
+	/** Stop admission, then drain accepted work before the stores close. */
+	function close(): Promise<void> {
+		if (closePromise !== null) return closePromise;
+		closing = true;
+		if (stateTimer !== null) {
+			clearTimeout(stateTimer);
+			stateTimer = null;
+		}
+		closePromise = (async () => {
+			const errors: unknown[] = [];
+			while (internalWork.size > 0) {
+				const results = await Promise.allSettled([...internalWork]);
+				for (const result of results)
+					if (result.status === "rejected") errors.push(result.reason);
+			}
+			await publishTail;
+			if (errors.length > 0)
+				throw new AggregateError(errors, "app background work failed");
+		})();
+		return closePromise;
+	}
 
+	async function publishStateNow(): Promise<boolean> {
 		if (deps.serverRef.current === undefined) return false;
 		const consumers = sockets > 0 || (await loadSubs(deps.gstore)).length > 0;
 		// Without a consumer the frame exists only for the seen prune below; skip the state
@@ -6737,8 +6785,10 @@ export async function createApp(deps: AppDeps) {
 		// The prune can be the frame's only change (a key stops mapping to an alert
 		// input). Everything else compares through the build's own bytes (OTTR-884):
 		// re-stringifying the wrapped 30 MB frame just to compare it measured
-		// 120-180 ms per quiet rebuild.
-		const pruned = seenBefore !== state.inboxSeen;
+		// 120-180 ms per quiet rebuild. The seen list compares by value: gstore.update
+		// returns a fresh array on every call, so identity would prune-flag every frame.
+		const pruned =
+			JSON.stringify(seenBefore) !== JSON.stringify(state.inboxSeen);
 		// Push works without a board tab (R1-1): skip the frame only when nothing can consume
 		// it — no open socket AND no push subscriber. The baseline still moves, so a device
 		// that subscribes later is never alerted for changes from before it existed.
@@ -6807,13 +6857,9 @@ export async function createApp(deps: AppDeps) {
 	// change edge that opens the gate in publishState(): routes get it from guarded(), the
 	// ticks and scanners that write state-carrying fields call it directly, and the 5 s
 	// schedule sweep re-opens it so file-driven state never waits longer than one sweep.
-	let stateVersion = 0;
-	/** Version of the last built frame; -1 = nothing built yet, so the first build always runs. */
-	let builtVersion = -1;
-	/** Test seam: how often the state rebuilt (GET-triggered or publish-triggered,
-	 * one increment per completed build; OTTR-866). */
-	let builds = 0;
-	let stateTimer: Timer | null = null;
+	// (The bindings live above the boot ticks: those run during createApp and publish
+	// before this block executes; function declarations hoist, these bindings do not.)
+
 	function publishSoon(): void {
 		if (closing) return;
 		// Bump before the queue check: a change arriving while a publish is queued must
@@ -6844,8 +6890,6 @@ export async function createApp(deps: AppDeps) {
 		stateText: string | null;
 		gz: Uint8Array<ArrayBuffer> | null;
 	};
-	let stateCache: StateCacheEntry | null = null;
-	let stateBuilding: Promise<StateCacheEntry> | null = null;
 	// While the version is unchanged the TTL only bounds staleness of file-driven
 	// changes for poll-only clients: every store write opens the gate via publishSoon(),
 	// and the scheduler tick publishes on its flag/settle edges (OTTR-884), so a store
@@ -6917,6 +6961,9 @@ export async function createApp(deps: AppDeps) {
 				gz,
 			};
 			stateCache = entry;
+			// Record the write fingerprint at build time: a later WAL move (any
+			// store write) invalidates this frame for the GET path (OTTR-884).
+			buildWalMark = storeWalMark();
 			// One increment per completed rebuild, GET-triggered or published (OTTR-866).
 			builds++;
 			return entry;
@@ -6929,13 +6976,18 @@ export async function createApp(deps: AppDeps) {
 		return built;
 	}
 
-	/** The cached build while it matches the version and the TTL, else a fresh one. */
+	/** The cached build while it matches the version and the TTL, else a fresh one. A
+	 * frame whose orphan scan failed never serves from the cache: a failed scan is
+	 * retried on every poll (orphanCache caches successes only), so the next GET must
+	 * rebuild and re-scan instead of reshipping the stale error. */
 	async function stateEntry(): Promise<StateCacheEntry> {
 		const c = stateCache;
 		if (
 			c !== null &&
 			c.version === stateVersion &&
-			Date.now() - c.builtAt < STATE_CACHE_TTL_MS
+			c.state.orphansError === null &&
+			Date.now() - c.builtAt < STATE_CACHE_TTL_MS &&
+			storeWalMark() === buildWalMark
 		)
 			return c;
 		return stateBuild();
@@ -7106,7 +7158,6 @@ export async function createApp(deps: AppDeps) {
 								)) > 0
 							) {
 								await deps.schedule();
-								publishSoon();
 							}
 						} catch (err) {
 							console.log(`[quota] hold release failed: ${errmsg(err)}`);
@@ -7114,14 +7165,11 @@ export async function createApp(deps: AppDeps) {
 						// publishSoon ships the fresh report in the next frame without
 						// waiting for the sweep (OTTR-866); deps.schedule() above already
 						// published its own edge when a hold released.
-					} catch (err) {
-						console.log(`[quota] hold release failed: ${errmsg(err)}`);
-					}
-					publishSoon();
-				})
-				.finally(() => {
-					refreshingQuota = false;
-				}),
+						publishSoon();
+					})
+					.finally(() => {
+						refreshingQuota = false;
+					}),
 			);
 		}
 		const pending = trackWork(
@@ -12949,9 +12997,7 @@ export async function createApp(deps: AppDeps) {
 				),
 		},
 		"/api/state": {
-
 			GET: (req) => api(req, () => stateJsonResponse()),
-
 		},
 		"/api/orphans": {
 			GET: async (req) => await api(req, async () => await handleGETOrphans()),

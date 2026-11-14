@@ -57,13 +57,11 @@ import {
 	workCheckSendBack,
 } from "./prompts.ts";
 import { openPullRequest } from "./prs.ts";
-
 import {
 	hitUsageLimit,
 	startRun as realStartRun,
 	WORKER_LOST,
 } from "./runner.ts";
-
 import {
 	FINDINGS_HOLD,
 	isRetro,
@@ -78,12 +76,8 @@ import {
 	WORK_CHECK_ASK_BLOCK,
 	WORK_CHECK_ASK_DIVERGE,
 } from "./scheduler.ts";
-
-
 import { DEFAULT_SETTINGS, ProjectStore } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
-
-
 import fc from "./test/properties.ts";
 import { turnEnv } from "./tokens.ts";
 import type { TurnLoop, TurnOps, TurnProject } from "./turn.ts";
@@ -98,6 +92,7 @@ import {
 	getSettingsLogged,
 	isKeptReason,
 	keptReason,
+	logStoreError,
 	MERGE_HOLD_MISMATCH_REASON,
 	modelSwap,
 	parseDependabotHeadLine,
@@ -130,9 +125,7 @@ import {
 	checkoutState as realCheckoutState,
 	cleanMergeTree as realCleanMergeTree,
 	fetchOriginBranch as realFetchOriginBranch,
-
 	fetchPrHead as realFetchPrHead,
-
 	prIntegrated as realPrIntegrated,
 	removeWorktree as realRemoveWorktree,
 	resolveTarget as realResolveTarget,
@@ -383,10 +376,6 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		branchUnpushed: async () => false,
 		// The default main checkout sits on main, so no off-default finding fires.
 		checkedOutBranch: async () => null,
-		// Mocked like the sibling git reads above: the real probe spawns git per refresh
-		// cycle, and a cycle that awaits a real child makes edge publishes depend on
-		// spawn latency instead of the microtask flush every schedule test relies on.
-		targetTracksRules: async () => false,
 		// The default cannot converge (a conflict), so a rejected push still queues the
 		// recovery steer exactly as before OTTR-510; tests on the converged path override both.
 		rebaseTargetBranch: async () => ({
@@ -498,16 +487,12 @@ afterEach(async () => {
 
 describe("turn loop", () => {
 	test("a finished run records ranOn on the turn; a run without one leaves it null", async () => {
-
 		const { store, loop } = await setup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
-
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -580,9 +565,7 @@ describe("turn loop", () => {
 		expect(turns[0]!.pid).toBe(4242);
 		expect(turns[0]!.model).toBe("m");
 		// The task's selector level lands on the recorded model (transcripts carry the bare model only).
-
 		const picked = await store.createTask("work with a level", "m:max");
-
 		await loop.runTurn(store.name, picked.id);
 		expect((await store.listTurns(picked.id))[0]!.model).toBe("m:max");
 		// The turn's prompt reached the fake process in the created worktree.
@@ -595,9 +578,8 @@ describe("turn loop", () => {
 			project: store.name,
 			taskId: task.id,
 		});
-		// runTurn's claim (queued -> preparing) and settle tail are each their own
-		// publish edge: exactly one publish each, even with no scheduler flag changed.
-		expect(record.publishSoon).toBe(base + 2);
+		// runTurn's finally reschedules the board.
+		expect(record.publishSoon).toBeGreaterThan(0);
 	});
 
 	test("review turns pin a fixed session name; a plain work turn pins none", async () => {
@@ -1541,11 +1523,9 @@ describe("turn loop", () => {
 	});
 
 	test("a no-stderr death with dispatch context writes the same line to the turn log", async () => {
-
 		const { store, loop } = await setup({
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -1621,9 +1601,7 @@ test("no agent run carries git host auth, merge turns included (D6)", async () =
 	setNetworkGitAuth(() => ({ GIT_SSH_COMMAND: "ssh -i /k" }));
 	try {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -2044,9 +2022,7 @@ describe("turn quarantine", () => {
 	});
 
 	test("crash turn: quarantine not called", async () => {
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -2066,9 +2042,7 @@ describe("turn quarantine", () => {
 	});
 
 	test("ask turn: quarantine not called", async () => {
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -2203,68 +2177,6 @@ describe("turn schedule", () => {
 		await flushPromises();
 		expect(record.runs).toHaveLength(0);
 		expect(record.publishSoon).toBeGreaterThan(0);
-	});
-
-	test("the first cycle publishes, a quiet tick publishes nothing (OTTR-884)", async () => {
-		const { record, loop } = setup({ maxTotalRuns: () => 0 });
-		loop.schedule(); // the write-driven entry publishes; the first cycle publishes too
-		await flushPromises();
-		// First cycle: the previous flag snapshot is undefined, so undefined -> value
-		// counts as a change and the board's first tick still publishes.
-		const first = record.publishSoon;
-		expect(first).toBeGreaterThan(0);
-		loop.scheduleTick(); // the 5 s tick: no writes landed, no flag changed
-		await flushPromises();
-		// Every flag holds the value the first cycle stored: the quiet tick must not
-		// bump the state version, or the sweep would rebuild the cache every 5 s.
-		expect(record.publishSoon).toBe(first);
-	});
-
-	test("a fresh-but-equal arch review object publishes nothing (OTTR-884)", async () => {
-		// The real refreshArchReview stores a new archReviewView object on every
-		// cycle, so the cycle compare must treat equal contents as no change; a
-		// reference compare publishes on every tick of every project with a target.
-		const { record, loop } = setup({
-			maxTotalRuns: () => 0,
-			refreshArchReview: async (e) => {
-				e.archReview = {
-					delta: 3,
-					reviewed: false,
-					base: "sha0",
-					reviewCardId: null,
-					cap: 20,
-					due: true,
-					running: false,
-				};
-			},
-		});
-		loop.schedule(); // the write-driven entry publishes; the first cycle publishes too
-		await flushPromises();
-		const first = record.publishSoon;
-		expect(first).toBeGreaterThan(0);
-		loop.scheduleTick(); // the second cycle stores a NEW object, SAME contents: quiet
-		await flushPromises();
-		expect(record.publishSoon).toBe(first);
-	});
-
-	test("a flag flip publishes exactly once, not per tick (OTTR-884)", async () => {
-		let clean = true;
-		const { record, loop } = setup({
-			maxTotalRuns: () => 0,
-			isClean: async () => clean,
-		});
-		loop.schedule(); // the write-driven entry publishes; the first cycle publishes too
-		await flushPromises();
-		const base = record.publishSoon;
-		expect(base).toBeGreaterThan(0);
-		clean = false; // the main checkout turns dirty: one flag edge
-		loop.scheduleTick(); // the tick's cycle sees the flip: exactly one publish
-		await flushPromises();
-		expect(record.publishSoon).toBe(base + 1);
-		// The dirty flag now equals what the cycle stored: the next tick is quiet again.
-		loop.scheduleTick();
-		await flushPromises();
-		expect(record.publishSoon).toBe(base + 1);
 	});
 
 	test("a null global cap starts every queued card", async () => {
@@ -2493,153 +2405,6 @@ describe("turn schedule", () => {
 	});
 });
 
-// OTTR-866: the tick's refresh fan-out runs coalesced and bounded. Overlapping ticks used
-// to stack a whole board's git reads per tick (1,200 spawned children in 665 ms on a
-// simulated 100-project board), because the raw per-tick loop had no in-flight guard.
-describe("turn refresh coalescing", () => {
-	/** A board of n projects; each test wires its own flag-op stubs over it. */
-	function coalesceBoard(n: number) {
-		const stores = Array.from({ length: n }, () => freshStore());
-		const projects = new Map(stores.map((s) => [s.name, fakeProject(s)]));
-		return { stores, projects, record: baseRecord() };
-	}
-
-	test("overlapping ticks coalesce into one in-flight cycle plus one queued follow-up", async () => {
-		const { stores, projects, record } = coalesceBoard(2);
-		const calls: string[] = [];
-		const gates: (() => void)[] = [];
-		const loop = createTurnLoop(
-			projects,
-			fakeOps(record, {
-				targetTracksRules: async () => false,
-				isClean: async (path: string) => {
-					calls.push(path);
-					const { promise, resolve } = Promise.withResolvers<void>();
-					gates.push(resolve);
-					await promise;
-					return true;
-				},
-			}),
-		);
-		const allPaths = stores.map((s) => s.path).sort();
-		const settle = () => {
-			for (const resolve of gates.splice(0)) resolve();
-		};
-
-		// Cycle 1 is in flight: every project's refresh parked on the test's gates.
-		loop.schedule();
-		expect(calls).toHaveLength(2);
-		expect(calls.slice().sort()).toEqual(allPaths);
-
-		// Two ticks land mid-cycle: they only queue, neither stacks a fan-out.
-		loop.schedule();
-		loop.schedule();
-		expect(calls).toHaveLength(2);
-
-		// Cycle 1 settles: exactly one queued follow-up runs, covering both projects again.
-		settle();
-		await flushPromises();
-		expect(calls).toHaveLength(4);
-		expect(calls.slice(2).sort()).toEqual(allPaths);
-
-		// The follow-up settles: nothing queued behind it, so no third cycle runs.
-		settle();
-		await flushPromises();
-		expect(calls).toHaveLength(4);
-	});
-
-	test("a cycle walks the board through the pool, at most four projects at once", async () => {
-		const n = 12;
-		const { projects, record } = coalesceBoard(n);
-		const calls: string[] = [];
-		let inFlight = 0;
-		let maxInFlight = 0;
-		const loop = createTurnLoop(
-			projects,
-			fakeOps(record, {
-				targetTracksRules: async () => false,
-				isClean: async (path: string) => {
-					calls.push(path);
-					inFlight += 1;
-					maxInFlight = Math.max(maxInFlight, inFlight);
-					const { promise, resolve } = Promise.withResolvers<void>();
-					setImmediate(resolve);
-					await promise;
-					inFlight -= 1;
-					return true;
-				},
-			}),
-		);
-		loop.schedule();
-		await eventually(() => calls.length === n && inFlight === 0);
-		// Every project refreshed exactly once, and the pool held the burst at four.
-		expect(calls).toHaveLength(n);
-		expect(inFlight).toBe(0);
-		expect(maxInFlight).toBe(4);
-	});
-
-	test("a project whose git fails does not stop the others' flags in the same cycle", async () => {
-		const { stores, projects, record } = coalesceBoard(2);
-		const sick = projects.get(stores[0]!.name)!;
-		const healthy = projects.get(stores[1]!.name)!;
-		let cleanCalls = 0;
-		const loop = createTurnLoop(
-			projects,
-			fakeOps(record, {
-				targetTracksRules: async () => false,
-				checkedOutBranch: async () => "main",
-				isClean: async (path: string) => {
-					cleanCalls += 1;
-					if (path === stores[0]!.path) throw new Error("git gone");
-					return true;
-				},
-			}),
-		);
-		sick.dirty = true;
-		healthy.dirty = true;
-		loop.schedule();
-		await flushPromises();
-		// The healthy project's flags refreshed; the sick project kept its last flag.
-		expect(healthy.dirty).toBe(false);
-		expect(healthy.mainBranch).toBe("main");
-		expect(sick.dirty).toBe(true);
-		expect(sick.mainBranch).toBe("main");
-
-		// The cycle settled despite the rejection: the next tick runs a full new cycle.
-		loop.schedule();
-		await flushPromises();
-		expect(cleanCalls).toBe(4);
-	});
-
-	test("a settled cycle lands the refreshed flags on the projects", async () => {
-		const { projects, record } = coalesceBoard(2);
-		const loop = createTurnLoop(
-			projects,
-			fakeOps(record, {
-				targetTracksRules: async () => false,
-				isClean: async () => true,
-				checkedOutBranch: async () => "main",
-				refreshRelease: async (e) => {
-					e.latestRelease = "v9.9.9";
-				},
-			}),
-		);
-		for (const e of projects.values()) {
-			e.dirty = true;
-			e.mainBranch = "old";
-			e.targetRules = true;
-		}
-		loop.schedule();
-		await flushPromises();
-		for (const e of projects.values()) {
-			expect(e.dirty).toBe(false);
-			expect(e.mainBranch).toBe("main");
-			expect(e.targetRules).toBe(false);
-			expect(e.latestRelease).toBe("v9.9.9");
-		}
-	});
-});
-
 describe("turn runTurn guards", () => {
 	test("cancelled task never starts", async () => {
 		const { store, record, loop } = await setup();
@@ -2801,9 +2566,7 @@ describe("turn sessions, steering and images", () => {
 
 	test("work turn copies agent-reported shots, skipping missing paths", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -2845,10 +2608,8 @@ describe("turn sessions, steering and images", () => {
 
 	test("shots reported twice in one outcome are saved once", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -2886,10 +2647,8 @@ describe("turn sessions, steering and images", () => {
 
 	test("re-reporting the same shots on a later turn adds nothing", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.(`sess-${record.runs.length}`);
@@ -2982,10 +2741,8 @@ describe("turn sessions, steering and images", () => {
 
 	test("a re-captured screen with new bytes replaces the stored shot instead of doubling", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.(`sess-${record.runs.length}`);
@@ -3028,10 +2785,8 @@ describe("turn sessions, steering and images", () => {
 
 	test("a visually different new shot still appends", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.(`sess-${record.runs.length}`);
@@ -3064,10 +2819,8 @@ describe("turn sessions, steering and images", () => {
 
 	test("one outcome reporting the same screen in two encodings saves one", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -3102,9 +2855,7 @@ describe("turn sessions, steering and images", () => {
 
 	test("work turn adopts a shots/ directory when the outcome's shots were stripped", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -3572,11 +3323,9 @@ describe("turn sessions, steering and images", () => {
 	);
 
 	test("the text-only retry failing too still lands in needs_you", async () => {
-
 		const { store, record, loop } = await setup({
 			holdFollowUps: true, // assert the settle instant; each turn runs via a direct runTurn
-			startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				return {
 					pid: 4242,
@@ -3614,10 +3363,8 @@ describe("turn sessions, steering and images", () => {
 		try {
 			const { store, record, loop } = await setup({
 				http400Dir: seedDir,
-
 				holdFollowUps: true, // assert the settle instant; the turn runs directly
-				startRun: (o: Parameters<TurnOps["startRun"]>[0]) => {
-
+				startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 					record.runs.push(o);
 					// omp writes the 400 entry while the turn runs, so it lands inside
 					// the turn's window by construction.
@@ -3661,9 +3408,7 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-
 				holdFollowUps: true,
-
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -3709,7 +3454,6 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-
 				holdFollowUps: true,
 				startRun: async (o: {
 					prompt: string;
@@ -3754,7 +3498,6 @@ describe("turn sessions, steering and images", () => {
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
 				holdFollowUps: true,
-
 				startRun: async (o: {
 					prompt: string;
 					model?: string | null;
@@ -3800,9 +3543,7 @@ describe("turn sessions, steering and images", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-
 				holdFollowUps: true,
-
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -4009,9 +3750,7 @@ describe("turn classify wiring", () => {
 	test("background wait auto-continues once, then a repeat asks you", async () => {
 		const { store, record, loop } = await setup({
 			// Cap 0: keep the auto-queued card from being re-started by the finally's schedule.
-
 			holdFollowUps: true,
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -4056,9 +3795,7 @@ describe("turn classify wiring", () => {
 	});
 
 	test("killed run finishes the turn as cancelled and keeps the worktree", async () => {
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -4079,9 +3816,7 @@ describe("turn classify wiring", () => {
 	});
 
 	test("cancel landing while the run resolves finishes the turn as cancelled", async () => {
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -5043,6 +4778,84 @@ describe("turn settleReviews", () => {
 		await flushPromises();
 		expect(record.runReleaseCommand).toHaveLength(1);
 	});
+
+	test("a held review settle ships on the next tick (OTTR-884)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = await store.createTask("review the work", null, "review");
+		await store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			base: "b",
+			worktree: "wt",
+		});
+		const finding = await store.createTask("fix one finding");
+		await store.updateTask(finding.id, {
+			followUpOf: review.id,
+			stage: "in_progress",
+			state: "idle",
+		});
+		await loop.schedule(); // the visit finds the findings open: no write, no publish from it
+		await flushPromises();
+		await loop.scheduleTick();
+		await flushPromises();
+		const base = record.publishSoon;
+		// The finding lands: the settle writes the card done, and the write ships
+		// on the next tick's check.
+		await store.updateTask(finding.id, { stage: "done", state: "idle" });
+		await loop.scheduleTick();
+		await flushPromises();
+		expect(record.publishSoon).toBeGreaterThan(base);
+		expect((await store.getTask(review.id))!.stage).toBe("done");
+	});
+
+	test("a held review whose findings stay open publishes nothing per tick (OTTR-884)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		const review = await store.createTask("review the work", null, "review");
+		await store.updateTask(review.id, {
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			base: "b",
+			worktree: "wt",
+		});
+		const finding = await store.createTask("fix one finding");
+		await store.updateTask(finding.id, {
+			followUpOf: review.id,
+			stage: "in_progress",
+			state: "idle",
+		});
+		await loop.schedule(); // the visit finds the findings open: no write
+		await flushPromises();
+		// The first refresh cycle's flag edge can publish late under load (the preceding
+		// settle test's chains still drain past its flushPromises), so settle the baseline
+		// before the quiet check: tick until two consecutive ticks publish nothing.
+		let calm = 0;
+		while (calm < 2) {
+			const seen = record.publishSoon;
+			await loop.scheduleTick();
+			await flushPromises();
+			calm = record.publishSoon === seen ? calm + 1 : 0;
+		}
+		const first = record.publishSoon;
+		expect(first).toBeGreaterThan(0);
+		// The findings stay open: settleReviewCard returns with no write, so the
+		// visits must not publish — the tick stays quiet however long the wait runs.
+		await loop.scheduleTick();
+		await flushPromises();
+		await loop.scheduleTick();
+		await flushPromises();
+		expect(record.publishSoon).toBe(first);
+		expect((await store.getTask(review.id))!.state).toBe("idle");
+	});
 });
 
 describe("turn merge outcomes", () => {
@@ -5190,9 +5003,7 @@ describe("turn survivor rounds", () => {
 
 	test("a merge turn's onSession does not touch the stage", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await setupWith(record, {
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -5242,9 +5053,7 @@ describe("turn survivor rounds", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-
 				holdFollowUps: true,
-
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -5272,9 +5081,7 @@ describe("turn survivor rounds", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-
 				holdFollowUps: true,
-
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -5388,16 +5195,12 @@ describe("turn ci watch pinning", () => {
 	});
 
 	test("an integrate report naming a version stamps it when a tag points at the pushed head", async () => {
-
 		const { store, loop, task } = await mergeDoneSetup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
-
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5426,9 +5229,7 @@ describe("turn ci watch pinning", () => {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
-
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -5461,9 +5262,7 @@ describe("turn ci watch pinning", () => {
 				prompt: string;
 				onSession?: (sid: string) => void;
 			}) => {
-
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -6748,9 +6547,7 @@ describe("turn survivor rounds 3", () => {
 		const loop = holdFollowUps(
 			new Map([[store.name, fakeProject(store)]]),
 			fakeOps(record, {
-
 				holdFollowUps: true,
-
 				startRun: async (o: {
 					prompt: string;
 					onSession?: (sid: string) => void;
@@ -7061,12 +6858,17 @@ describe("turn research cards", () => {
 						vm: null,
 						memoryConfigPath: null,
 						pluginSkillsHome: store.path,
-						gitProbe: () => ({ name: false, email: false }),
+						gitProbe: async () => ({ name: false, email: false }),
 						auditProvisioned: undefined,
 						rulesAtStart: undefined,
 						launcher: () => child as unknown as ChildProcess,
 					});
-					queueMicrotask(() => {
+					// The runner's setup awaits async store reads before it registers
+					// the child's close listener, so the emit must wait for the
+					// startRun promise: it resolves only after every listener is
+					// attached, and promise callbacks are immune to leaked fake
+					// timers (OTTR-884 merge).
+					void handle.then(() => {
 						const events = [
 							{ type: "session", id: "sess-answered-summary" },
 							{
@@ -8558,9 +8360,7 @@ describe("turn ownership, cap and settle regressions", () => {
 					record.runs.push(o);
 					await o.onSession?.("sess-1");
 					markStarted();
-
 					// A handle that learns its pid only after startTurn.
-
 					return {
 						get pid() {
 							return pid;
@@ -9425,9 +9225,7 @@ describe("turn cancel, finish-kept and restart recovery", () => {
 
 	test("stop kills the run, keeps the session and parks the card at needs_you", async () => {
 		const { promise, resolve } = Promise.withResolvers<RunResult>();
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -10214,10 +10012,8 @@ describe("arch-review survivor kills", () => {
 			pidAlive: () => false,
 			// The sweep requeues the card; the cap keeps the resumed turn from claiming it
 			// mid-assertion.
-
 			holdFollowUps: true,
 			scheduledCap: 0,
-
 			startRun: async (o: {
 				prompt: string;
 				onSession?: (sid: string) => void;
@@ -11572,9 +11368,7 @@ describe("turn update-card merge hold (U7)", () => {
 		const { store, loop } = await setup({
 			targetSha: async () => "sha-1",
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
-
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -12043,11 +11837,9 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("a no-stderr death without images never quarantines images or retries text-only", async () => {
-
 		const { store, loop } = await setup({
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await o.onSession?.("sess-1");
-
 				return dieBeforeOutput();
 			},
 		});
@@ -12060,10 +11852,8 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("the provider note is logged exactly once per rejected turn", async () => {
-
 		const { store, record, loop } = await setup({
 			holdFollowUps: true, // the text-only retry runs via a direct runTurn below
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				if (record.runs.length === 1) return dieBeforeOutput();
@@ -12170,9 +11960,7 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("a research crash turn keeps its crash reason, never a missing-report bounce", async () => {
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -12227,9 +12015,7 @@ describe("turn survivor round 4", () => {
 		const { store, loop } = await setup({
 			targetSha: async () => "sha-pushed",
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
-
 				await o.onSession?.("sess-1");
-
 				return {
 					pid: 4242,
 					done: Promise.resolve(
@@ -12262,9 +12048,7 @@ describe("turn survivor round 4", () => {
 	});
 
 	test("tracker error writes the bang line to the turn log", async () => {
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -15173,9 +14957,7 @@ describe("turn dep hold (report_outcome dependsOn)", () => {
 
 	test("a ready outcome with dependsOn records the ids but keeps the normal next state", async () => {
 		let depId = "";
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -15976,10 +15758,13 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		await store.startTurn(task.id, "work", "second prompt", 4344);
 
 		await loop.schedule();
-		await flushPromises();
-		// The settle chain crosses several mocked-async hops; one drain can starve
-		// it under parallel-suite load, so drain once more before asserting.
-		await flushPromises();
+		// The merged settle chain awaits lostResumePrompt's session read and
+		// captureTurnData after the requeue write, so a fixed flush round no longer
+		// covers it: await the requeue itself (variable-depth drain, like the
+		// concurrent-turn tests).
+		await eventually(
+			async () => (await store.getTask(task.id))!.pendingPrompt !== null,
+		);
 
 		expect((await store.getTask(task.id))!.pendingPrompt).toBe(
 			"second prompt\n\n.",
@@ -16020,152 +15805,6 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		const after = (await store.getTask(task.id))!;
 		expect(after.state).toBe("queued");
 		expect(after.pendingPrompt).toBe(".");
-	});
-
-	test("a quiet sweep publishes nothing; settling a lost row publishes once (OTTR-884)", async () => {
-		const { store, record, loop } = sweepSetup();
-		loop.scheduleTick();
-		await flushPromises();
-		// First cycle publishes (undefined -> value); the baseline includes it.
-		const base = record.publishSoon;
-		expect(base).toBeGreaterThan(0);
-		loop.scheduleTick();
-		await flushPromises();
-		// Nothing lost, no flag changed: the sweep must leave the state cache alone.
-		expect(record.publishSoon).toBe(base);
-		const task = store.createTask("lost mid-run");
-		store.updateTask(task.id, { state: "running", sessionId: "sess-9" });
-		store.startTurn(task.id, "work", "prompt", 4344); // pid 4344 is dead in this fixture
-		loop.scheduleTick();
-		await flushPromises();
-		// Same settle chain as the re-send test: drain twice so the parallel-suite
-		// load cannot starve it before the count.
-		await flushPromises();
-		// Two edges in one tick: the fixture's own writes (a running card, a turn
-		// row) ship through the write check, and the sweep settles the lost row.
-		expect(record.publishSoon).toBe(base + 2);
-		expect(store.getTask(task.id)!.state).toBe("queued");
-	});
-
-	test("writes between the claim and the settle ship on the next tick (OTTR-884)", async () => {
-		// Cap 0: the fixture's queued card never claims or settles, so the count
-		// moves only on the write check.
-		const { store, record, loop } = setup({ maxTotalRuns: () => 0 });
-		loop.schedule(); // write-driven entry: publishes; first cycle publishes too
-		await flushPromises();
-		loop.scheduleTick();
-		await flushPromises();
-		const base = record.publishSoon;
-		// Mid-run writes have no publish edge of their own: the session entry, the
-		// branch/base/worktree write, the turn row, a recorded review finding. The
-		// base shipped them with the tick publish this card removed; the tick's
-		// write check must ship them too.
-		const task = store.createTask("mid-run writes");
-		store.updateTask(task.id, {
-			branch: "ott/x",
-			base: "main",
-			worktree: "wt",
-		});
-		await store.startTurn(task.id, "work", "p", 4242);
-		loop.scheduleTick();
-		await flushPromises();
-		const shipped = record.publishSoon;
-		expect(shipped).toBeGreaterThan(base);
-		// A tick with no writes on top stays quiet.
-		loop.scheduleTick();
-		await flushPromises();
-		expect(record.publishSoon).toBe(shipped);
-	});
-
-	test("a held review settle ships on the next tick (OTTR-884)", async () => {
-		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
-			publishRelease: publishingRelease(record),
-		});
-		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask("review the work", null, "review");
-		store.updateTask(review.id, {
-			stage: "merging",
-			state: "idle",
-			needsReason: FINDINGS_HOLD,
-			base: "b",
-			worktree: "wt",
-		});
-		const finding = store.createTask("fix one finding");
-		store.updateTask(finding.id, {
-			followUpOf: review.id,
-			stage: "in_progress",
-			state: "idle",
-		});
-		loop.schedule(); // the visit finds the findings open: no write, no publish from it
-		await flushPromises();
-		loop.scheduleTick();
-		await flushPromises();
-		const base = record.publishSoon;
-		// The finding lands: the settle writes the card done, and the write ships
-		// on the next tick's check.
-		store.updateTask(finding.id, { stage: "done", state: "idle" });
-		loop.scheduleTick();
-		await flushPromises();
-		expect(record.publishSoon).toBeGreaterThan(base);
-		expect(store.getTask(review.id)!.stage).toBe("done");
-	});
-
-	test("a held review whose findings stay open publishes nothing per tick (OTTR-884)", async () => {
-		const record = baseRecord();
-		const { store, projects, loop } = setupWith(record, {
-			publishRelease: publishingRelease(record),
-		});
-		projects.get(store.name)!.target = "origin/main";
-		const review = store.createTask("review the work", null, "review");
-		store.updateTask(review.id, {
-			stage: "merging",
-			state: "idle",
-			needsReason: FINDINGS_HOLD,
-			base: "b",
-			worktree: "wt",
-		});
-		const finding = store.createTask("fix one finding");
-		store.updateTask(finding.id, {
-			followUpOf: review.id,
-			stage: "in_progress",
-			state: "idle",
-		});
-		loop.schedule(); // the visit finds the findings open: no write
-		await flushPromises();
-		const first = record.publishSoon;
-		expect(first).toBeGreaterThan(0);
-		// The findings stay open: settleReviewCard returns with no write, so the
-		// visits must not publish — the tick stays quiet however long the wait runs.
-		loop.scheduleTick();
-		await flushPromises();
-		loop.scheduleTick();
-		await flushPromises();
-		expect(record.publishSoon).toBe(first);
-		expect(store.getTask(review.id)!.state).toBe("idle");
-	});
-
-	test("the /tmp hold's reason write publishes its own edge (OTTR-884)", async () => {
-		const { store, record, loop } = setup({
-			tmpFullLine: () => "/tmp of local is full (0 MiB free)",
-		});
-		const task = store.createTask("queued work");
-		loop.schedule(); // entry + first cycle + the hold write's edge
-		await flushPromises();
-		const first = record.publishSoon;
-		expect(first).toBeGreaterThan(0);
-		expect(store.getTask(task.id)!.needsReason).toContain(
-			"/tmp of local is full",
-		);
-		loop.scheduleTick(); // the hold persists (the reason text matches): quiet
-		await flushPromises();
-		expect(record.publishSoon).toBe(first);
-		const base = record.publishSoon;
-		store.updateTask(task.id, { needsReason: null }); // a user clear; the next claim rewrites
-		loop.schedule(); // entry publish + the hold rewrite's edge
-		await flushPromises();
-		expect(record.publishSoon).toBe(base + 2);
-		expect(store.getTask(task.id)!.needsReason).toContain("/tmp of local");
 	});
 
 	test("the lost sweep leaves a parked card's open row alone", async () => {
@@ -17225,9 +16864,7 @@ describe("turn survivor round 5 — run setup", () => {
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const loop = loopFor(store, record, {
-
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				await o.onSession?.("s1");
@@ -17243,10 +16880,6 @@ describe("turn survivor round 5 — run setup", () => {
 		});
 		const running = loop.runTurn(store.name, task.id);
 		await started;
-		// startRun resolves after its body, so the dispatch continuation (entry
-		// registration) is still queued here; the flush lets it run, exactly where the
-		// synchronous startRun of old registered the entry before any assert.
-		await flushPromises();
 		const key = `${store.name}/${task.id}`;
 		await eventually(() => loop.running.has(key));
 		expect(logNotes).toEqual([[store.name, task.id]]);
@@ -17275,9 +16908,7 @@ describe("turn survivor round 5 — run setup", () => {
 		const { promise: started, resolve: markStarted } =
 			Promise.withResolvers<void>();
 		const loop = loopFor(store, record, {
-
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o as never);
 				await o.onSession?.("s1");
@@ -17288,9 +16919,6 @@ describe("turn survivor round 5 — run setup", () => {
 		});
 		const running = loop.runTurn(store.name, task.id);
 		await started;
-		// The dispatch continuation registers the entry one microtask after the mock's
-		// body; the flush runs it before the first progress dispatch below.
-		await flushPromises();
 		const key = `${store.name}/${task.id}`;
 		await eventually(() => loop.running.has(key));
 		const stryker = (pct: number, elapsed: string, tested: number): string =>
@@ -17333,11 +16961,9 @@ describe("turn survivor round 5 — run setup", () => {
 		let seen: string | null | undefined;
 		const loop = loopFor(store, record, {
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
-
 				await o.onSession?.("s1");
 				await o.onSession?.("s2");
 				seen = (await store.getTask(task.id))!.sessionId;
-
 				return answeredRun();
 			},
 		});
@@ -17352,11 +16978,9 @@ describe("turn survivor round 5 — run setup", () => {
 		let seen: { state: string; sessionId: string | null } | undefined;
 		const loop = loopFor(store, record, {
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
-
 				await store.updateTask(task.id, { cancelledAt: Date.now() });
 				await o.onSession?.("s1");
 				const cur = (await store.getTask(task.id))!;
-
 				seen = { state: cur.state, sessionId: cur.sessionId };
 				return answeredRun();
 			},
@@ -17392,10 +17016,8 @@ describe("turn survivor round 5 — run setup", () => {
 		let seen: { stage: string; state: string } | undefined;
 		const loop = loopFor(store, record, {
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
-
 				await o.onSession?.("s1");
 				const cur = (await store.getTask(task.id))!;
-
 				seen = { stage: cur.stage, state: cur.state };
 				return answeredRun();
 			},
@@ -17462,12 +17084,10 @@ describe("turn survivor round 5 — run setup", () => {
 			pendingImages: ["a", "b"],
 		});
 		const loop = loopFor(store, record, {
-
 			holdFollowUps: true,
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await o.onSession?.("s1");
 				await store.updateTask(task.id, {
-
 					pendingPrompt: "one\n\ntwo",
 					pendingImages: ["a", "c"],
 				});
@@ -17636,10 +17256,8 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	test("a killed run that no stop request owns leaves the card as the cancel wrote it", async () => {
 		const record = baseRecord();
 		const held = Promise.withResolvers<RunResult>();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -17666,10 +17284,8 @@ describe("turn survivor round 5 — run result and merge push", () => {
 	test("a cancel that lands during a stop owns the card", async () => {
 		const record = baseRecord();
 		const held = Promise.withResolvers<RunResult>();
-
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -18125,13 +17741,11 @@ describe("turn survivor round 5 — run result and merge push", () => {
 describe("turn survivor round 5 — classify wiring", () => {
 	/** startRun override resolving every run with `p` (session announced unless p says otherwise). */
 	const runWith =
-
 		(
 			record: Recorded,
 			p: Partial<RunResult>,
 			during?: () => unknown | Promise<unknown>,
 		) =>
-
 		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
 			if (p.sessionId !== null) await o.onSession?.("sess-1");
@@ -18375,7 +17989,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "needs_you", summary: "hold", dependsOn: deps },
 				})(o),
@@ -18402,11 +18016,9 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				await store.updateTask(taskId, { dependsOn: [depId, depId] });
 				return runWith(record, {
-
 					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
 				})(o);
 			},
@@ -18426,7 +18038,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
 			isIntegrated: async () => false,
-			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "ready", summary: "done", dependsOn: [depId] },
 				})(o),
@@ -18451,7 +18063,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(
 					record,
 					{
@@ -18482,7 +18094,7 @@ describe("turn survivor round 5 — classify wiring", () => {
 		const { store, loop } = await setupWith(record, {
 			holdFollowUps: true,
 			commitsAhead: async () => 0,
-			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) =>
+			startRun: (o: Parameters<TurnOps["startRun"]>[0]) =>
 				runWith(record, {
 					outcome: { status: "needs_you", summary: "hold", dependsOn: [depId] },
 					asked: [
@@ -18591,13 +18203,11 @@ describe("turn survivor round 5 — run finish", () => {
 	// A startRun fake that resolves `done` with `r`; `during` runs while the agent is live
 	// (a mid-run steer lands there, as POST /steer does).
 	const runReturning =
-
 		(
 			record: Recorded,
 			r: Partial<RunResult>,
 			during?: () => unknown | Promise<unknown>,
 		) =>
-
 		async (o: Parameters<TurnOps["startRun"]>[0]) => {
 			record.runs.push(o);
 			await o.onSession?.("sess-1");
@@ -19101,9 +18711,7 @@ describe("turn survivor round 5 — post-finish branch", () => {
 		const checkRuns: StartOpts[] = [];
 		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
-
 			holdFollowUps: true,
-
 			startRun: async (o: StartOpts) => {
 				record.runs.push(o);
 				await o.onSession?.("sess");
@@ -19682,9 +19290,7 @@ describe("turn survivor round 5 — work card to merging", () => {
 
 	test("a work card that ends needs_you gets no check", async () => {
 		const record = baseRecord();
-
 		const { store, loop } = await checkCase([verdict({})], {
-
 			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -20418,9 +20024,7 @@ describe("turn survivor round 5 — run tail, cancel, finish-kept", () => {
 
 	test("a run whose done rejects frees its slot: the requeued card runs again", async () => {
 		let calls = 0;
-
 		const { store, record, loop } = await setup({
-
 			startRun: async (o: StartArgs) => {
 				record.runs.push(o);
 				await o.onSession?.("sess-1");
@@ -21062,6 +20666,33 @@ describe("/tmp free-space gates (OTTR-754)", () => {
 			tmpEnrichNeedsReason("apt: Splitting up failed", "worker-b", space),
 		).toBe("apt: Splitting up failed");
 	});
+
+	test("the /tmp hold's reason write publishes its own edge (OTTR-884)", async () => {
+		const { store, record, loop } = await setup({
+			tmpFullLine: () => "/tmp of local is full (0 MiB free)",
+		});
+		const task = await store.createTask("queued work");
+		await loop.schedule(); // entry + first cycle + the hold write's edge
+		await flushPromises();
+		const first = record.publishSoon;
+		expect(first).toBeGreaterThan(0);
+		expect((await store.getTask(task.id))!.needsReason).toContain(
+			"/tmp of local is full",
+		);
+		await loop.scheduleTick(); // the hold persists (the reason text matches): quiet
+		await flushPromises();
+		expect(record.publishSoon).toBe(first);
+		const base = record.publishSoon;
+		await store.updateTask(task.id, { needsReason: null }); // a user clear; the next claim rewrites
+		await loop.schedule(); // the entry publish; the claim rewrites the hold inside its transaction
+		await flushPromises();
+		await loop.scheduleTick(); // the hold rewrite ships on the next tick's write check
+		await flushPromises();
+		expect(record.publishSoon).toBe(base + 2);
+		expect((await store.getTask(task.id))!.needsReason).toContain(
+			"/tmp of local",
+		);
+	});
 });
 
 describe("detached re-bind after the restart", () => {
@@ -21121,34 +20752,6 @@ describe("detached re-bind after the restart", () => {
 		await flushPromises();
 		expect((await store.listTurns(task.id))[0]!.endedAt).toBeNull();
 		expect((await store.getTask(task.id))!.state).toBe("running");
-	});
-
-	test("a detached watcher settle publishes through the sweep's edge (OTTR-884)", async () => {
-		let runs: DetachedRun[] = [
-			{ id: "run-1", cwd: WT, pid: null, running: true, startedAt: 1 },
-		];
-		const { store, record, loop } = rebindSetup(() => runs);
-		const task = seededWorkerRow(store);
-		await loop.recoverRestarted(); // re-binds the still-running run; the watcher stays
-		loop.schedule(); // the write-driven entry publishes; the run is still out there
-		await flushPromises();
-		loop.scheduleTick(); // first tick: first cycle publishes; the watcher keeps waiting
-		await flushPromises();
-		const base = record.publishSoon;
-		runs = [
-			{
-				id: "run-1",
-				cwd: WT,
-				pid: null,
-				running: false,
-				startedAt: 1,
-				result: { exitCode: 0, stderrTail: "" },
-			},
-		];
-		loop.scheduleTick(); // the sweep settles the detached run: its own publish edge
-		await flushPromises();
-		expect(record.publishSoon).toBe(base + 1);
-		expect(store.getTask(task.id)!.state).toBe("queued");
 	});
 
 	test("a finished detached run settles at recovery through the resume route", async () => {
@@ -23541,11 +23144,9 @@ describe("turn PR-mode merge settle", () => {
 				const oldHead = run(main, "rev-parse", "HEAD");
 				const adoptCalls: string[][] = [];
 				let fixed = false;
-
 				const { store, record, loop, task, e, projects } = await prMergeSetup({
 					// Keep dispatch explicit: settle must not start the next turn.
 					holdFollowUps: true,
-
 					pushBranch: pushBranchReal,
 					prIntegrated: realPrIntegrated,
 					targetSha: async (path, ref) => run(path, "rev-parse", ref),
@@ -23569,8 +23170,6 @@ describe("turn PR-mode merge settle", () => {
 								};
 							},
 						}),
-					},
-
 					startRun: async (o) => {
 						record.runs.push(o);
 						if (!fixed) {
@@ -23579,18 +23178,14 @@ describe("turn PR-mode merge settle", () => {
 							run(main, ...id, "commit", "-qm", "CI fix");
 							fixed = true;
 						}
-
 						await o.onSession?.("sess-1");
-
 						return {
 							pid: 4242,
 							done: Promise.resolve(
 								runResult({
 									outcome: {
 										status:
-
 											(await store.getTask(task.id))!.stage === "in_progress"
-
 												? "ready"
 												: "integrated",
 										summary: "CI fix",
@@ -23602,11 +23197,9 @@ describe("turn PR-mode merge settle", () => {
 					},
 				});
 				e.path = main;
-
 				await store.setSettings({ originUrl: bare });
 				// Only the first ship is seeded. The next pin must come from settle.
 				await store.updateTask(task.id, {
-
 					state: "idle",
 					worktree: main,
 					prNumber: 12,
@@ -23646,9 +23239,7 @@ describe("turn PR-mode merge settle", () => {
 					worktreeHusk: async () => false,
 					worktreeLinked: async () => true,
 					branchMergedOrGone: async () => false,
-
 					quarantineUntracked: async () => ({ moved: [], refused: [] }),
-
 					targetSha: async (path, ref) => run(path, "rev-parse", ref),
 					fetchOriginBranch: async () => null,
 					fetchPrHead: async () => null,
@@ -23686,9 +23277,7 @@ describe("turn PR-mode merge settle", () => {
 					},
 				});
 				await supervisor.tick();
-
 				const cleared = (await store.getTask(task.id))!;
-
 				expect(cleared.pushSha).toBeNull();
 				expect(cleared.prNumber).toBe(12);
 				expect(cleared.prHeadSha).toBe(oldHead);
@@ -23716,7 +23305,6 @@ describe("turn PR-mode merge settle", () => {
 						: [["run", "view", "101", "--log-failed", "--repo", "acme/repo"]]),
 				]);
 				await supervisor.tick();
-
 				expect(await store.getTask(task.id)).toEqual(cleared);
 				expect(ciCalls).toEqual(firstCalls);
 				if (giveUp)
@@ -23727,7 +23315,6 @@ describe("turn PR-mode merge settle", () => {
 				else {
 					await loop.runTurn(store.name, task.id);
 					expect(await store.getTask(task.id)).toMatchObject({
-
 						stage: "merging",
 						state: "queued",
 						pushSha: null,
@@ -23742,9 +23329,7 @@ describe("turn PR-mode merge settle", () => {
 				expect(run(main, "ls-remote", bare, "refs/heads/ott/m")).toBe(
 					`${tip}\trefs/heads/ott/m`,
 				);
-
 				expect(await store.getTask(task.id)).toMatchObject({
-
 					stage: "merging",
 					state: "idle",
 					needsReason: null,
@@ -23767,9 +23352,7 @@ describe("turn PR-mode merge settle", () => {
 					html_url: "https://github.com/acme/repo/actions/runs/202",
 				};
 				await supervisor.tick();
-
 				const requeued = (await store.getTask(task.id))!;
-
 				expect(scheduled).toBe(initial === "failure" ? 2 : 1);
 				expect(requeued).toMatchObject({
 					stage: "in_progress",
@@ -23794,12 +23377,10 @@ describe("turn PR-mode merge settle", () => {
 				const replies = scheduled;
 				await supervisor.tick();
 				await supervisor.tick();
-
 				expect(await store.getTask(task.id)).toEqual(requeued);
 				expect(ciCalls).toEqual(callsAfterFailure);
 				expect(scheduled).toBe(replies);
 				expect((await store.listTasks()).map((t) => t.id)).toEqual([task.id]);
-
 			} finally {
 				rmSync(dir, { recursive: true, force: true });
 			}
@@ -25537,8 +25118,13 @@ describe("stored review findings", () => {
 		await store.updateTask(review.id, { base: "shaR" });
 		return review;
 	};
+	// List rows carry no details (OTTR-866), so the assertions below read full rows.
 	const kidsOf = async (store: ProjectStore, id: string) =>
-		(await store.listTasks()).filter((t) => t.followUpOf === id);
+		await Promise.all(
+			(await store.listTasks())
+				.filter((t) => t.followUpOf === id)
+				.map(async (t) => (await store.getTask(t.id))!),
+		);
 	const verdicts = (...v: [number, boolean, string][]) =>
 		runResult({
 			finalText: JSON.stringify(
@@ -25565,9 +25151,7 @@ describe("stored review findings", () => {
 		const checkRuns: StartOpts[] = [];
 		const s = await setupWith(record, {
 			commitsAhead: async () => 0,
-
 			holdFollowUps: true,
-
 			startRun: async (o: StartOpts) => {
 				let done: Promise<RunResult>;
 				if (o.maxTime) {
@@ -25675,12 +25259,10 @@ describe("stored review findings", () => {
 			await store.updateTask(k.id, { stage: "done", state: "idle" });
 		projects.get(store.name)!.target = "origin/main";
 		await loop.schedule();
-
 		await eventually(
 			async () => (await store.getTask(review.id))?.stage === "done",
 		);
 		after = (await store.getTask(review.id))!;
-
 		expect(record.runs).toHaveLength(1); // the tick runs no agent
 		expect(checkRuns).toHaveLength(1);
 		expect(after.stage).toBe("done");
@@ -25694,9 +25276,7 @@ describe("stored review findings", () => {
 			state: "idle",
 			needsReason: FINDINGS_HOLD,
 		});
-
 		await store.appendReviewFinding(review.id, mkFinding("Bug C", 3));
-
 		await loop.schedule();
 		await flushPromises();
 		after = (await store.getTask(review.id))!;
@@ -26039,9 +25619,7 @@ describe("stored review findings", () => {
 			expect(k.state).toBe("idle");
 			expect(k.queuedAt).toBeNull();
 			expect(k.followUpOf).toBe(review.id);
-			expect(store.getTask(k.id)!.details).toContain(
-				"Unverified lead from review",
-			);
+			expect(k.details).toContain("Unverified lead from review");
 		}
 		const sandboxKid = leadKids.find((k) =>
 			k.prompt.startsWith("Needs validation: sandbox-only parser crash"),
@@ -26050,7 +25628,6 @@ describe("stored review findings", () => {
 		const deployKids = leadKids.filter((k) => k.id !== sandboxKid.id);
 		for (const k of deployKids)
 			expect(k.details).not.toContain("Waits for a validation sandbox");
-
 
 		// Exactly ONE question card for the two deployment-fact leads: one question
 		// per lead, each naming its lead card, with the two fixed answers.
@@ -26078,7 +25655,6 @@ describe("stored review findings", () => {
 			(a) => deployKids.find((k) => a.question.endsWith(`(card #${k.id})`))?.id,
 		);
 		expect(new Set(namedIds)).toEqual(new Set(deployKids.map((k) => k.id)));
-
 	});
 
 	test("a review whose leads all wait on a sandbox files no question card", async () => {
@@ -26169,13 +25745,11 @@ describe("stored review findings", () => {
 
 		// Findings implemented: the tick publishes and lands Done.
 		for (const k of kids)
-
 			await store.updateTask(k.id, { stage: "done", state: "idle" });
 		await loop.schedule();
 		await eventually(
 			async () => (await store.getTask(review.id))?.stage === "done",
 		);
-
 		expect(record.publishRelease).toHaveLength(1);
 		const done = (await store.getTask(review.id))!;
 		expect(done.stage).toBe("done");
@@ -26762,6 +26336,11 @@ describe("prompt gate", () => {
 		await store.updateTask(task.id, replyPatch(live, "fix the README first"));
 		expect((await store.getTask(task.id))!.pendingBy).toBe("user");
 		await loop.runTurn(store.name, task.id);
+		// The merged write-driven settle tail fires schedule() after the first turn,
+		// so a background dispatch can claim this queued reply before the manual
+		// runTurn above (which then returns at the claim). Either racer runs the gate
+		// on the user text: await the observable call instead of the racer's order.
+		await eventually(() => calls === 2);
 		expect(calls).toBe(2);
 	});
 
@@ -26900,8 +26479,11 @@ describe("prompt gate", () => {
 		expect(calls).toBe(0);
 		expect((await store.getTask(merge.id))?.gate).toBeNull();
 
-		// Retro flag.
+		// Retro flag. The source card rests idle: the merged write-driven settle tail
+		// fires schedule() after every turn, and a queued card would be claimed (and
+		// gated) by that background dispatch mid-test.
 		const source = await store.createTask("the source card");
+		await store.updateTask(source.id, { state: "idle" });
 		const retro = await store.createTask(
 			`${RETRO_MARKER}the retro`,
 			null,

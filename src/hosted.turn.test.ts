@@ -735,7 +735,6 @@ describe("hosted metering at settle", () => {
 			hosted,
 			commitsAhead: async () => 0,
 			startRun: async (o: StartArgs) => {
-
 				await o.onSession?.("sess-1");
 
 				return {

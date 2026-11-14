@@ -1467,10 +1467,9 @@ describe("diff capture columns", () => {
 			details: "the details",
 			report: "the report",
 		});
-		const [listed] = await store.listTasks();
-		const { diffText, details, report, diffFiles, ...rest } = (
-			await store.getTask(task.id)
-		)!;
+		const listed = (await store.listTasks())[0]!;
+		const { diffText, details, report, diffFiles, ...rest } =
+			(await store.getTask(task.id))!;
 		expect(diffText).toBe("diff --git a/a.ts b/a.ts\n");
 		expect(details).toBe("the details");
 		expect(report).toBe("the report");
@@ -1482,8 +1481,8 @@ describe("diff capture columns", () => {
 		expect("report" in listed).toBe(false);
 		expect("diffFiles" in listed).toBe(false);
 		// The narrow per-row read the list callers fall back to (OTTR-866).
-		expect(store.getTaskReport(task.id)).toBe("the report");
-		expect(store.getTaskReport("nope")).toBeNull();
+		expect(await store.getTaskReport(task.id)).toBe("the report");
+		expect(await store.getTaskReport("nope")).toBeNull();
 		// Strict: every remaining field still matches the full row exactly.
 		expect(listed).toStrictEqual(rest);
 		await store.close();
@@ -2118,7 +2117,6 @@ describe("turn cost capture", () => {
 		await store.finishTurn(a.id, { endedAt: a.startedAt + 2000 });
 		await store.close();
 
-
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const rows = raw
 			.query<
@@ -2221,7 +2219,6 @@ describe("turn cost capture", () => {
 			true,
 		);
 		await store.close();
-
 	});
 
 	test("an owned window without usage writes zeros, not NULL", async () => {
@@ -2305,7 +2302,6 @@ describe("turn cost capture", () => {
 		const reopened = await open(dir);
 		expect((await reopened.perfFacts()).turns[0]?.cost).toBe(0.4);
 		await reopened.close();
-
 	});
 
 	test("a malformed transcript keeps cost NULL in the backfill until repaired", async () => {
@@ -2337,7 +2333,6 @@ describe("turn cost capture", () => {
 		const second = await open(dir);
 		expect((await second.perfFacts()).turns[0]?.cost).toBe(0.6);
 		await second.close();
-
 	});
 
 	// The subagent folder sits beside the session file (`<ts>_<sid>/`). Breakages are built
@@ -2394,7 +2389,6 @@ describe("turn cost capture", () => {
 			const second = await open(dir);
 			expect((await second.perfFacts()).turns[0]?.cost).toBe(3);
 			await second.close();
-
 		});
 	}
 
@@ -2418,37 +2412,34 @@ describe("turn cost capture", () => {
 
 		const reopened = await open(dir);
 		expect((await reopened.perfFacts()).turns).toEqual([
-
 			{ endedAt: turn.startedAt + 1000, failed: false, cost: 0.75 },
 		]);
 		await reopened.close();
 		// A second open is idempotent: filled turns are not re-read.
 
-		expect((await (await open(dir)).perfFacts()).turns).toEqual([
-
+		const again = await open(dir);
+		expect((await again.perfFacts()).turns).toEqual([
 			{ endedAt: turn.startedAt + 1000, failed: false, cost: 0.75 },
 		]);
-		again.close();
+		await again.close();
 	});
 
 	test("finishTurn resolves before the cost write lands; captureSettled awaits the fill", async () => {
-		// The capture reads the transcript off the finish path (OTTR-807): right after
-		// finishTurn the columns are still NULL, and only the awaited capture fills them.
+		// The OTTR-884 merge kept main's capture contract: finishTurn awaits the
+		// transcript fill itself (the branch's fire-and-forget captureSettled path is
+		// gone), so the fill has landed once the awaited finishTurn resolves.
 		const dir = join(root, "cost-capture-async");
-		const store = open(dir);
-		const t = store.updateTask(store.createTask("late fill").id, {
+		const store = await open(dir);
+		const t = await store.updateTask((await store.createTask("late fill")).id, {
 			sessionId: sid,
 		});
-		const turn = store.startTurn(t.id, "work", "p", null);
+		const turn = await store.startTurn(t.id, "work", "p", null);
 		writeTranscript(store.sessionsDir, sid, [
 			usageLine(turn.startedAt + 100, { input: 6, output: 2, cost: 0.3 }),
 		]);
-		store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
-		// Not awaited yet: the transcript read must not block finishTurn's caller.
-		expect(store.perfFacts().turns[0]?.cost).toBeNull();
-		await store.captureSettled();
-		expect(store.perfFacts().turns[0]?.cost).toBe(0.3);
-		store.close();
+		await store.finishTurn(turn.id, { endedAt: turn.startedAt + 1000 });
+		expect((await store.perfFacts()).turns[0]?.cost).toBe(0.3);
+		await store.close();
 	});
 
 	test("open adds the cost columns to a database created before them", async () => {
@@ -2760,7 +2751,6 @@ describe("done task context capture", () => {
 		await store.finishTurn(b.id, { endedAt: b.startedAt + 1000 });
 		expect((await store.perfFacts()).tasks[0]?.contextTokens).toBe(300_000);
 		await store.close();
-
 	});
 
 	test("reopen backfills a done task's reading once its transcript exists", async () => {
@@ -2788,7 +2778,6 @@ describe("done task context capture", () => {
 		expect((await (await open(dir)).perfFacts()).tasks[0]?.contextTokens).toBe(
 			128_000,
 		);
-
 	});
 
 	test("only done tasks backfill; a missing transcript keeps NULL", async () => {
@@ -2809,13 +2798,14 @@ describe("done task context capture", () => {
 		await store.close();
 		writeTranscript(store.sessionsDir, sid, [contextLine(1, 64_000)]);
 
-		const facts = (await (await open(dir)).perfFacts()).tasks;
+		const skipStore = await open(dir);
+		const facts = (await skipStore.perfFacts()).tasks;
 
 		// The running card never backfills, even with a readable transcript.
 		expect(facts.find((f) => f.doneAt === null)?.contextTokens).toBeNull();
 		// The done card has no transcript to read.
 		expect(facts.find((f) => f.doneAt !== null)?.contextTokens).toBeNull();
-		skipStore.close();
+		await skipStore.close();
 	});
 });
 

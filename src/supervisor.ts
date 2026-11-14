@@ -1510,11 +1510,15 @@ export function createSupervisor(
 			subagentTexts,
 			// List rows carry no details (OTTR-866); only the retro lessons section
 			// reads them, so retro rows read fresh and other rows carry null.
-			tasks: tasks.map((x) => ({
-				...x,
-				details:
-					x.kind === "retro" ? (e.store.getTask(x.id)?.details ?? null) : null,
-			})),
+			tasks: await Promise.all(
+				tasks.map(async (x) => ({
+					...x,
+					details:
+						x.kind === "retro"
+							? ((await e.store.getTask(x.id))?.details ?? null)
+							: null,
+				})),
+			),
 		});
 		if (settings.retroFilter && !frictionFilter(facts)) {
 			retroSkips.set(key, new Set(["friction-filter"]));

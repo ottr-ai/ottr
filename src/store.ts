@@ -1232,27 +1232,15 @@ function parseSetting(
 	return value as ProjectSettings[keyof ProjectSettings];
 }
 
-
-/** Turns of one task still missing their captured cost, oldest first. */
-interface CostBackfillTurn {
-	id: number;
-	started_at: number;
-	ended_at: number;
-}
-
-/** Writes one turn's five cost columns from a usage sum. */
-function writeTurnCost(db: Database, turnId: number, sum: UsageSum): void {
-	db.run(
-		"UPDATE turns SET tokens_in = ?, tokens_out = ?, cache_read = ?, cache_write = ?, cost = ? WHERE id = ?",
-		[
-			sum.tokensIn,
-			sum.tokensOut,
-			sum.cacheRead,
-			sum.cacheWrite,
-			sum.cost,
-			turnId,
-		],
-	);
+/** Logs a project store's failure at most once per 10 minutes per project: diagnosable, not spam.
+ *  Lives beside the store because its fire-and-forget work (the transcript backfills and the
+ *  turn-end captures) has no caller to throw into. */
+const lastStoreErrorAt = new Map<string, number>();
+export function logStoreError(name: string, err: unknown): void {
+	const now = Date.now();
+	if (now - (lastStoreErrorAt.get(name) ?? 0) < 600_000) return;
+	lastStoreErrorAt.set(name, now);
+	console.error(`project ${name}:`, err);
 }
 
 /** A trending verdict's repo: lowercase `owner/repo`. */
@@ -1317,7 +1305,7 @@ export class ProjectStore {
 	 * context) have landed; rejection-free. Reads that must see the filled columns await
 	 * it. Assigned after the migrations (OTTR-884 merge): the fills start on the
 	 * migrated database. */
-	readonly backfill: Promise<void> = Promise.resolve();
+	backfill: Promise<void> = Promise.resolve();
 
 	private constructor(projectPath: string, db: SQLiteDatabase) {
 		this.path = projectPath;
@@ -2377,31 +2365,18 @@ export class ProjectStore {
 					"ALTER TABLE pr_review_runs ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1",
 				);
 			});
-		// OTTR-866: the one-time cost and context backfills from the session
-		// transcripts start here, after the migrations, and ride the store's backfill
-		// promise so reads that need the columns can await them (OTTR-884 merge).
-		const costBackfill = backfillTurnCosts(
-			db,
-			join(tasksDir, "sessions"),
-		).catch(() => {
-			/* backfill is best-effort; the next open retries */
-		});
-		const doneContextBackfill = backfillDoneContext(
-			db,
-			join(tasksDir, "sessions"),
-		).catch(() => {
-			/* backfill is best-effort; the next open retries */
-		});
-		store.backfill = Promise.all([costBackfill, doneContextBackfill]).then(
-			() => {},
-		);
-			await store.backfillTranscriptData();
+			// OTTR-866: the one-time cost and context backfills from the session
+			// transcripts start here, after the migrations, and ride the store's backfill
+			// promise so reads that need the columns can await them (OTTR-884 merge).
+			store.backfill = store.backfillTranscriptData().catch(() => {
+				/* backfill is best-effort; the next open retries */
+			});
+			await store.backfill;
 			return store;
 		} catch (error) {
 			await store.close();
 			throw error;
 		}
-
 	}
 
 	async logPath(taskId: string): Promise<string> {
@@ -3697,8 +3672,8 @@ export class ProjectStore {
 	/** The stored research report alone, without the wide row (OTTR-866: list rows no
 	 * longer carry it): legacy 'unknown'-steps rows resolve their steps against it
 	 * (OTTR-488) one narrow query at a time. */
-	getTaskReport(id: string): string | null {
-		const row = this.db
+	async getTaskReport(id: string): Promise<string | null> {
+		const row = await this.db
 			.query<{ report: string | null }, [string]>(
 				"SELECT report FROM tasks WHERE id = ?",
 			)
@@ -4015,7 +3990,6 @@ export class ProjectStore {
 		endedAt: number,
 
 		expectedSessionId?: string | null,
-
 	): Promise<void> {
 		const sessionId =
 			expectedSessionId === undefined
@@ -4124,7 +4098,6 @@ export class ProjectStore {
 				.all();
 		});
 		for (const task of done) await this.captureTaskContext(task.id, true);
-
 	}
 
 	async listTurns(taskId: string): Promise<Turn[]> {
