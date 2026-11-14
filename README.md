@@ -88,7 +88,7 @@ Open <http://127.0.0.1:4747>.
 1. Open the board: <http://127.0.0.1:8080> with Docker Compose, <http://127.0.0.1:4747> on bare metal.
 2. **Add project** clones any git URL (`https://…`, `git@host:…`, `ssh://host[:port]/…`) or creates a new project, sets up `.tasks/` and `.worktrees/`, and runs a short setup dialog (rules, automation, runners).
 3. A project without `AGENTS.md` gets a rules interview card that writes one with you.
-4. Type a task in plain language. The card waits in **Todo** for a free slot: 2 agents per project, 3 in total.
+4. Type a task in plain language. The card waits in **Todo** for a free slot: 20 total runs, no per-project cap by default (`OMP_TRACKER_MAX_TOTAL`).
 5. **In progress**: Ottr creates `.worktrees/<id>` on branch `ott/<id>-<slug>` and runs `omp -p` in it. The agent finishes with the `report_outcome` tool.
 6. **Merging**: a second turn rebases, re-runs the project's checks, and integrates the work. **Done** shows the report.
 
