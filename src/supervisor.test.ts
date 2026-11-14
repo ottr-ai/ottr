@@ -5017,6 +5017,110 @@ describe("prPass", () => {
 		await store.close();
 	});
 
+	// OTTR-945: the watcher's fresh read and its park write run as separate store
+	// jobs. These tests drop a concurrent write into exactly that gap and pin that
+	// the park either aborts or cannot clobber what landed.
+	/** The write src/app.ts's reply route makes when a user answers the idle card. */
+	const replyLands = async (store: ProjectStore, id: string) => {
+		await store.updateTask(id, {
+			pendingPrompt: "keep my draft and add the tests",
+			pendingBy: "user",
+			pendingImages: [],
+			state: "queued",
+			queuedAt: 42,
+			needsReason: null,
+			asked: null,
+		});
+	};
+	/** The write the merged settle makes; runTaskUpdate stamps done_at with the stage. */
+	const settleLands = async (store: ProjectStore, id: string) => {
+		await store.updateTask(id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+	};
+	/** A store view whose first getTask for `id` runs `write` before (`before`) or right
+	 * after the row read — the gap between the watcher's fresh read and its park write. */
+	const raceStore = (
+		store: ProjectStore,
+		id: string,
+		write: () => Promise<unknown>,
+		before = false,
+	): ProjectStore => {
+		const racing = Object.create(store) as ProjectStore;
+		let fired = false;
+		racing.getTask = async (tid: string) => {
+			if (tid !== id || fired) return store.getTask(tid);
+			fired = true;
+			if (before) await write();
+			const task = await store.getTask(tid);
+			if (!before) await write();
+			return task;
+		};
+		return racing;
+	};
+	const assertUnparked = async (store: ProjectStore, id: string) => {
+		const after = (await store.getTask(id))!;
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBeNull();
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.pendingFeedback).toBeFalsy();
+		const logPath = await store.logPath(id);
+		const log = existsSync(logPath) ? await Bun.file(logPath).text() : "";
+		expect(log).not.toContain("review feedback; card parked");
+	};
+
+	test("a reply landing between the watcher's read and its park write survives", async () => {
+		const store = await prModeProject("pr-feedback-reply-race");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const racing = raceStore(store, t.id, () => replyLands(store, t.id));
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		await tick(new Map([["proj", entry(racing)]]), ops);
+		const after = (await store.getTask(t.id))!;
+		// The queued reply must survive the park's write untouched.
+		expect(after.state).toBe("queued");
+		expect(after.pendingPrompt).toBe("keep my draft and add the tests");
+		expect(after.pendingBy).toBe("user");
+		// The park aborted, so the cutoff stays put and the next window re-decides.
+		expect(after.prWatchAt).toBe(1_000_000_000);
+		const logPath = await store.logPath(t.id);
+		const log = existsSync(logPath) ? await Bun.file(logPath).text() : "";
+		expect(log).not.toContain("review feedback; card parked");
+		await store.close();
+	});
+
+	test("a done settle landing between the watcher's read and its park write aborts the park", async () => {
+		const store = await prModeProject("pr-feedback-settle-race");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const racing = raceStore(store, t.id, () => settleLands(store, t.id));
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		await tick(new Map([["proj", entry(racing)]]), ops);
+		await assertUnparked(store, t.id);
+		expect((await store.getTask(t.id))!.stage).toBe("done");
+		await store.close();
+	});
+
+	test("the watcher refuses to park a card that settled done before its fresh read", async () => {
+		const store = await prModeProject("pr-feedback-settled-before");
+		const t = await prCard(store);
+		await store.updateTask(t.id, { prWatchAt: 1_000_000_000 });
+		const racing = raceStore(store, t.id, () => settleLands(store, t.id), true);
+		const ops = fakeOps({
+			apiResult: feedbackApi({ issue: [comment()] }),
+		});
+		await tick(new Map([["proj", entry(racing)]]), ops);
+		await assertUnparked(store, t.id);
+		expect((await store.getTask(t.id))!.stage).toBe("done");
+		await store.close();
+	});
+
 	test("a merged PR finishes a feedback-parked card done", async () => {
 		const store = await prModeProject("pr-feedback-merged");
 		await store.setSettings({

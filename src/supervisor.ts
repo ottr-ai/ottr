@@ -2876,26 +2876,42 @@ export function createSupervisor(
 		if (items.length === 0) return;
 		const blocks = prFeedbackPrompt(items);
 		// The reads were awaited, so the card may have settled meanwhile: branch on the
-		// fresh row, not the snapshot the pass started from.
+		// fresh row, not the snapshot the pass started from. Only a card still tracked
+		// Merging parks: a done card (settled before this read) is never parked.
 		const fresh = await e.store.getTask(t.id);
 		if (fresh === null || fresh.cancelledAt !== null || fresh.prNumber !== n)
 			return;
 		const freshFeedback = fresh.needsReason === reason;
 		const freshConflict = fresh.needsReason === conflict;
-		const fullPark = fresh.state === "idle" && fresh.pendingPrompt === null;
+		const merging = fresh.stage === "merging";
+		const fullPark =
+			merging && fresh.state === "idle" && fresh.pendingPrompt === null;
 		const append =
-			fresh.state === "needs_you" && (freshFeedback || freshConflict);
+			merging &&
+			fresh.state === "needs_you" &&
+			(freshFeedback || freshConflict);
 		if (!fullPark && !append) return;
-		await e.store.updateTask(fresh.id, {
-			prWatchAt: newest,
-			state: "needs_you",
-			...(fresh.state === "idle" ? { needsReason: reason } : {}),
-			pendingPrompt: queuedReply(fresh.pendingPrompt, blocks),
-			pendingBy: fresh.pendingPrompt === null ? "supervisor" : fresh.pendingBy,
-			// Marks this prompt as supervisor feedback: wentStale passes it and any reply
-			// (turn dispatch included) clears it with the prompt.
-			pendingFeedback: true,
-		});
+		// The check above and this write run as separate store jobs, so a reply or a
+		// settle that lands between them must not be clobbered: the guarded write lands
+		// only while the revision this read saw is still current, and a stale park skips
+		// — the cutoff stays put, so the next window re-reads the same feedback and
+		// re-decides (OTTR-945).
+		const parked = await e.store.updateTaskIfCurrent(
+			fresh.id,
+			{
+				prWatchAt: newest,
+				state: "needs_you",
+				...(fresh.state === "idle" ? { needsReason: reason } : {}),
+				pendingPrompt: queuedReply(fresh.pendingPrompt, blocks),
+				pendingBy:
+					fresh.pendingPrompt === null ? "supervisor" : fresh.pendingBy,
+				// Marks this prompt as supervisor feedback: wentStale passes it and any reply
+				// (turn dispatch included) clears it with the prompt.
+				pendingFeedback: true,
+			},
+			fresh.revision,
+		);
+		if (!parked.ok) return;
 		await ops.appendLog(
 			e.store,
 			fresh.id,
