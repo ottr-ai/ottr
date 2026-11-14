@@ -3945,8 +3945,10 @@ export function createTurnLoop(
 			);
 		}
 		// The settle's store writes ship through the write-driven schedule() entry
-		// below, which publishes on entry (OTTR-884).
-		void schedule();
+		// below, which publishes on entry (OTTR-884). The call is contained: a
+		// rejection (a transient store read in the dispatch) must not become an
+		// unhandled rejection and crash the board process.
+		schedule().catch((err) => logStoreError(e.store.name, err));
 	}
 
 	/** True when the comprehension gate runs on this turn (OTTR-823 scope): plain work turns only —
