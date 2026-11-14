@@ -238,11 +238,19 @@ describe("the PostgreSQL test infrastructure shape", () => {
 		]) {
 			expect(service.options).toContain(option);
 		}
-		expect(ciCheck.env.OTTR_TEST_PG_URL).toBe(
-			"postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres",
-		);
-		expect(ciCheck.env.OTTR_REQUIRE_PG_TESTS).toBe("1");
-		for (const step of ciCheck.steps as Service[]) {
+		// Job-level env with the `job` context makes GitHub reject the whole workflow
+		// at trigger time (OTTR-937): the URL expression may only live on a step env.
+		expect(ciCheck.env).toBeUndefined();
+		const steps = ciCheck.steps as Service[];
+		const testStep = steps.find((step) => step.run === "bun test --timeout 20000");
+		expect(testStep).toBeDefined();
+		expect(testStep?.env).toEqual({
+			OTTR_TEST_PG_URL:
+				"postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres",
+			OTTR_REQUIRE_PG_TESTS: "1",
+		});
+		for (const step of steps) {
+			if (step === testStep) continue;
 			expect(step.env?.OTTR_TEST_PG_URL).toBeUndefined();
 			expect(step.env?.OTTR_REQUIRE_PG_TESTS).toBeUndefined();
 		}

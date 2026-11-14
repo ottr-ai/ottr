@@ -28,9 +28,6 @@ jobs:
           --health-timeout 5s
           --health-retries 12
           --tmpfs /var/lib/postgresql
-    env:
-      OTTR_TEST_PG_URL: postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres
-      OTTR_REQUIRE_PG_TESTS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,7 +41,14 @@ jobs:
       - run: bun run check
       # bun's 5s default fires at await boundaries; loaded windows runners stalled one
       # test to 7.3s (run 37528369810). 20s covers the legit 8.7s tail, still fails hangs.
+      # Step env, not job env: jobs.<job_id>.env has no job context (docs "Contexts
+      # availability"), so a job-level OTTR_TEST_PG_URL with job.services.ports made
+      # GitHub reject the whole workflow at trigger time (OTTR-937): every push failed
+      # with zero jobs before the service block ever ran.
       - run: bun test --timeout 20000
+        env:
+          OTTR_TEST_PG_URL: postgres://postgres@127.0.0.1:${{ job.services.postgres-test.ports[5432] }}/postgres
+          OTTR_REQUIRE_PG_TESTS: "1"
       - run: bun run test:e2e
 
   scan:

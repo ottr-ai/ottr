@@ -121,7 +121,8 @@ docker compose up -d --force-recreate
 Do not use `127.0.0.1` for the test URL inside the compose stack.
 Loopback refers to each container itself.
 The CI job runs directly on `ubuntu-latest`, so it uses `127.0.0.1` and the ephemeral host port from `job.services.postgres-test.ports[5432]`.
-The job environment passes both variables to its existing test commands and their child processes.
+The `bun test` step's environment passes both variables to the test processes and their children.
+GitHub does not allow the `job` context in the job-level environment, so the step environment is the only valid place for the URL expression.
 CI uses the same trust exception and tmpfs data.
 
 ### Per-file database fixture
