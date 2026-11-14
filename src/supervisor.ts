@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { writeBelow } from "./confine.ts";
 import { errmsg } from "./errmsg.ts";
-import { clean } from "./forkAnalysis.ts";
+import { clean, hasCredentialShape } from "./forkAnalysis.ts";
 import { githubHost } from "./githubHost.ts";
 import { followUpPrompt, handoffMarkdown, retroPrompt } from "./prompts.ts";
 import {
@@ -401,9 +401,10 @@ export function prFeedbackPrompt(items: readonly PrFeedbackItem[]): string {
 	const block = (item: PrFeedbackItem): string => {
 		const label =
 			item.kind === "comment" ? "REVIEW COMMENT" : "CHANGES REQUESTED";
-		// OTTR-942: clean never throws; a credential-shaped body redacts its value,
-		// so the comment still reaches the park prompt without the secret.
-		let shown = clean(item.body).trim();
+		let shown = hasCredentialShape(item.body)
+			? // pr-mode.md: a credential-shaped body parks as the marker, author kept.
+				"redacted: possible credential"
+			: clean(item.body).trim();
 		if (shown === "") shown = "(no text)";
 		else if (shown.length > 4000) {
 			shown = `${shown.slice(0, 4000)}\n(cut at 4000 characters)`;

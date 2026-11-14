@@ -6,6 +6,7 @@ import {
 	analyzeRange,
 	buildUserMessage,
 	defaultSpawn,
+	hasCredentialShape,
 	parseAnalysis,
 	proposalPrompt,
 	redactSecrets,
@@ -246,6 +247,23 @@ describe("redactSecrets", () => {
 					if (!fixture.test(v.trim())) expect(r.text).not.toContain(v);
 				},
 			),
+		);
+	});
+});
+
+describe("hasCredentialShape", () => {
+	test("true for a quoted non-fixture value, as the old pause refused", () => {
+		expect(
+			hasCredentialShape('api_key: "aaaa0000aaaa0000aaaa0000aaaa0000"'),
+		).toBe(true);
+		expect(hasCredentialShape('apiKey: "A Whispa vial was lost."')).toBe(true);
+	});
+	test("false for a fixture value, an identifier copy, and unquoted text", () => {
+		expect(hasCredentialShape('apiKey: "fixture-jellyfin-key"')).toBe(false);
+		expect(hasCredentialShape('apiKey: " test-jellyfin-key-1"')).toBe(false);
+		expect(hasCredentialShape("apiKey = whisparr.apiKey;")).toBe(false);
+		expect(hasCredentialShape("password = superlongunquotedvalue123")).toBe(
+			false,
 		);
 	});
 });

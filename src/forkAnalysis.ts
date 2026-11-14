@@ -48,6 +48,18 @@ const SUSPICIOUS_ASSIGN_RE =
 const FIXTURE_VALUE_RE =
 	/^(?:fixture|test|example|sample|dummy|placeholder|changeme|redacted)[-_. ]/i;
 
+/** True when `s` holds a quoted suspicious assignment whose trimmed value is no fixture:
+ * exactly the texts `clean()` refused before OTTR-942. pr-mode's feedback park keeps
+ * refusing them with the `redacted: possible credential` marker (docs/specs/pr-mode.md);
+ * prompt paths redact instead. */
+export function hasCredentialShape(s: string): boolean {
+	for (const m of s.matchAll(SUSPICIOUS_ASSIGN_RE)) {
+		const value = (m[2] ?? m[3] ?? "").trim();
+		if (!FIXTURE_VALUE_RE.test(value)) return true;
+	}
+	return false;
+}
+
 /**
  * Redact known token shapes and quoted suspicious assignments to [REDACTED]; never
  * pauses, so a false credential match cannot stop a review. The fixture check runs on
