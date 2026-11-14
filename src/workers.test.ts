@@ -2083,6 +2083,51 @@ describe("detach protocol", () => {
 		);
 	}, 30_000);
 
+	test("an expired running entry stays killable: the sweep keeps it and the kill lands", async () => {
+		const url = start({ ompPath: process.execPath, detachedTtlMs: 1500 });
+		const beatPath = join(dir, "d8-beat");
+		const res = await run(url, undefined, "d8", [sleepPath, beatPath]);
+		expect(res.status).toBe(200);
+		expect(
+			await (await fetch(`${url}/detach`, { method: "POST" })).json(),
+		).toEqual({ detached: 1 });
+		await res.text();
+		await pollUntil(
+			async () => (await detachedList(url)).length === 1,
+			"entry",
+		);
+		// Age the entry past the ttl without another sweep: every detached GET is
+		// itself the sweep, so the wait is wall-clock time from the entry's
+		// appearance (its startedAt is older still).
+		const appearedAt = Date.now();
+		await pollUntil(() => Date.now() - appearedAt > 1500, "age past ttl");
+		// Still running past the ttl: the sweep must keep the entry killable.
+		// Deleting it here would leave the child unstoppable until it exits.
+		const kept = await detachedList(url);
+		expect(kept.map((e) => e.id)).toEqual(["d8"]);
+		expect(kept[0]?.running).toBe(true);
+		const kill = await fetch(`${url}/detach/kill`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id: "d8" }),
+		});
+		expect(kill.status).toBe(200);
+		expect(await kill.json()).toEqual({ killed: true });
+		// The killed flag is set synchronously with the fire-and-forget killTree;
+		// the beat stalling proves the child received it.
+		await awaitBeatStall(beatPath, "kill landing");
+		// Finished and past the ttl: the next sweep reaps the entry and
+		// remembers the id for the ttl.
+		await pollUntil(async () => (await detachedList(url)).length === 0, "reap");
+		const late = await fetch(`${url}/detach/kill`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ id: "d8" }),
+		});
+		expect(late.status).toBe(410);
+		expect(await late.text()).toBe(`detached run d8 expired and was reaped`);
+	}, 30_000);
+
 	test("detachedRuns parses the list and throws WorkerConnectError on non-200", async () => {
 		const url = start({ token: "sekrit" });
 		const runs = await detachedRuns(url, "sekrit");

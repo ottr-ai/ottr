@@ -251,28 +251,28 @@ block becomes:
 5. A run that rolled at least one worker but left another stuck exits 0 (like
    today's "waits for a later run"); a run whose seed failed exits 1 as today.
 
-### Worker detach protocol (src/workers.ts)
+### Worker detach protocol (src/workers.ts, src/vmRunner.ts)
 
-A detached run keeps its omp child when the server's `/run` stream drops. The
-worker tracks every live run by its request id. Three token-authed routes
-(`x-otwr-token`, like `/run`):
+A detached run keeps its child when the server's `/run` stream drops. The
+worker tracks every live run by its request id, and vm-runner serves the same
+protocol for its VM runs. Three token-authed routes (`x-otwr-token`, like
+`/run`):
 
 - `POST /detach`: every live run detaches — the worker closes the stream, the
   child keeps running, and the abort handlers no longer kill it. The child's
   final result (exit code, stderr tail) is captured when it exits.
 - `GET /detached`: the detached runs as
   `[{id, cwd, pid, running, startedAt, result?: {exitCode, stderrTail}}]`.
-  Entries live in memory and expire after 24 h; a worker restart loses them, and
-  rows the server cannot re-bind settle as lost, as today.
+  Entries live in memory and expire after 24 h. The expiry sweep deletes a
+  finished entry after the 24 h and remembers the deleted id for the same 24 h.
+  An entry whose child still runs past the 24 h stays listed: without it, the
+  board cannot stop the run, and the worker's keep-set holds the pid (the
+  vm-runner slot, the same way) until the run exits on its own. A worker
+  restart loses the entries, and rows the server cannot re-bind settle as
+  lost, as today.
 - `POST /detach/kill {id}`: kills one detached run (the cancel path for a
-  re-bound row).
-
-vm-runner (src/vmRunner.ts) serves the same routes with a tighter expiry. The
-sweep keeps an entry whose VM still runs past the 24 h. Without the entry, the
-board cannot stop the VM, and the slot stays held. The sweep deletes a finished
-entry after the 24 h and remembers the id. `POST /detach/kill` answers 410
-`detached run <id> expired and was reaped` for a remembered id, and 404 for an
-unknown id.
+  re-bound row). It answers 410 `detached run <id> expired and was reaped` for
+  a remembered id, and 404 not found for an unknown id.
 
 The library exports `detachedRuns(url, token)` for the server and tests.
 

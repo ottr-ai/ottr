@@ -186,11 +186,22 @@ export function serveWorker(opts: {
 	// worker restart loses them, and rows the server cannot re-bind settle as lost.
 	const active = new Map<string, ActiveRun>();
 	const detached = new Map<string, ActiveRun>();
+	// Ids the sweep removed after the run finished, with the removal time: a late
+	// kill answers 410 with the expiry instead of a bare not-found.
+	const reaped = new Map<string, number>();
 	const pruneDetached = (): void => {
 		const ttl = opts.detachedTtlMs ?? 24 * 60 * 60 * 1000;
 		const now = Date.now();
-		for (const [id, e] of detached)
-			if (now - e.startedAt > ttl) detached.delete(id);
+		for (const [id, e] of detached) {
+			// A still-running run keeps its entry past the ttl: deleting it would
+			// strand the child unstoppable with its pid held in runChildren.
+			if (e.running) continue;
+			if (now - e.startedAt > ttl) {
+				detached.delete(id);
+				reaped.set(id, now);
+			}
+		}
+		for (const [id, at] of reaped) if (now - at > ttl) reaped.delete(id);
 	};
 	const tokenOk = (request: Request): boolean =>
 		!opts.token || request.headers.get("x-otwr-token") === opts.token;
@@ -267,7 +278,13 @@ export function serveWorker(opts: {
 			return new Response("bad json", { status: 400 });
 		}
 		const e = typeof body.id === "string" ? detached.get(body.id) : undefined;
-		if (e === undefined) return new Response("not found", { status: 404 });
+		if (e === undefined) {
+			if (typeof body.id === "string" && reaped.has(body.id))
+				return new Response(`detached run ${body.id} expired and was reaped`, {
+					status: 410,
+				});
+			return new Response("not found", { status: 404 });
+		}
 		if (e.pid !== null && e.running) platform.killTree(e.pid);
 		e.killed = true;
 		e.running = false;
