@@ -27129,6 +27129,64 @@ describe("duplicate-work gate (OTTR-941)", () => {
 		expect(await logText(store, resumed.id)).not.toContain("duplicate gate");
 	});
 
+	test("a restarted session on a card already underway never calls the seam", async () => {
+		// The second-model blocker: restart-session clears sessionId but keeps the turns,
+		// the branch and the worktree, and a card from before the gate has no dup stamp.
+		let calls = 0;
+		const { store, record, loop } = await setup({
+			commitsAhead: async () => 0,
+			duplicateCheck: async () => {
+				calls += 1;
+				return { verdict: "new", matches: [], reason: "Nothing like it." };
+			},
+		});
+		const task = await store.createTask("work already underway");
+		await loop.runTurn(store.name, task.id);
+		expect(calls).toBe(1);
+		const ran = (await store.getTask(task.id))!;
+		expect(await store.listTurns(task.id)).toHaveLength(1);
+		// A card from before the gate (no stamp), then the restart-session patch.
+		await store.updateTask(task.id, {
+			gate: null,
+			sessionId: null,
+			stage: "in_progress",
+			state: "queued",
+			pendingPrompt: "The previous session was lost.",
+			pendingBy: "supervisor",
+			queuedAt: Date.now(),
+			worktree: ran.worktree ?? join(store.path, ".worktrees", task.id),
+			branch: ran.branch ?? `ott/${task.id}`,
+		});
+
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(calls).toBe(1);
+		expect(after.cancelledAt).toBeNull();
+		expect(after.needsReason ?? "").not.toContain("Duplicate work gate");
+		expect(record.runs.length).toBeGreaterThan(1);
+	});
+
+	test("a todo card with an earlier turn row never calls the seam", async () => {
+		let calls = 0;
+		const { store, loop } = await setup({
+			commitsAhead: async () => 0,
+			duplicateCheck: async () => {
+				calls += 1;
+				throw new Error("the seam must not run");
+			},
+		});
+		// No session, no branch, no worktree, still todo: only the turn row says it ran.
+		const task = await store.createTask("parked after one turn");
+		await store.startTurn(task.id, "work", "old prompt", null);
+
+		await loop.runTurn(store.name, task.id);
+
+		expect(calls).toBe(0);
+		expect((await store.getTask(task.id))!.cancelledAt).toBeNull();
+		expect(await logText(store, task.id)).not.toContain("duplicate gate");
+	});
+
 	test("a prompt gate park keeps the dup stamp, so the next start skips the duplicate gate", async () => {
 		let dupCalls = 0;
 		const { store, loop } = await setup({

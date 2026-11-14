@@ -4327,8 +4327,11 @@ export function createTurnLoop(
 	}
 
 	/** OTTR-941 duplicate-work gate, phase before the prompt gate and the worktree
-	 * (docs/specs/duplicate-gate.md). It runs once on a new card: a session or a `dup`
-	 * stamp skips it. A full match closes (cancels) the card and returns false. A partial
+	 * (docs/specs/duplicate-gate.md). It runs once, on a card's first implementation start:
+	 * a `dup` stamp, a stage other than todo, a session, a branch, a worktree or any earlier
+	 * turn row skips it. A cleared session alone is no evidence of a new card: the
+	 * restart-session route clears it but keeps the turns, the branch and the worktree, and
+	 * cards from before this gate carry no stamp. A full match closes (cancels) the card and returns false. A partial
 	 * match, no match or a gate failure stamps the card and returns true (fail open). A
 	 * stamp write that finds the card cancelled or no longer preparing returns false. */
 	async function duplicateGateTurnStart(
@@ -4343,7 +4346,15 @@ export function createTurnLoop(
 	): Promise<boolean> {
 		if (!dupGateApplies(kind, idn, task)) return true;
 		const live = (await store.getTask(id)) ?? task;
-		if (live.sessionId !== null || live.gate?.dup !== undefined) return true;
+		if (
+			live.gate?.dup !== undefined ||
+			live.stage !== "todo" ||
+			live.sessionId !== null ||
+			live.branch !== null ||
+			live.worktree !== null ||
+			(await store.listTurns(id)).length > 0
+		)
+			return true;
 		const candidates: DupCandidate[] = [];
 		let verdict: DupVerdict;
 		try {

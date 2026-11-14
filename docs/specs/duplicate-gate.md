@@ -35,7 +35,11 @@ of these are true:
 - the turn kind is `work`;
 - no identity flag is set (interview, grill, scout, retro, review, release, board check);
 - `task.sourcePrNumber === null` and `task.kind !== "pr_review"`;
-- the card has no omp session yet (`sessionId === null`): the card is new;
+- this is the card's first implementation start, proven by lifecycle evidence: `stage` is
+  `todo`, and the card has no omp session (`sessionId === null`), no `branch`, no
+  `worktree`, and no turn row (`store.listTurns(id)` is empty). A null `sessionId` alone
+  is no proof: the restart-session route clears it but keeps the turns, the branch and the
+  worktree, and cards from before this gate carry no `dup` stamp;
 - the card's gate state carries no `dup` stamp: the gate never ran on this card.
 
 Research cards and board-written prompts are in scope. A research card can ask a question
@@ -159,7 +163,9 @@ adopted check, so the existing block text stays byte-identical.
    A done research card without a follow-up, an in-progress card and a merging card are.
 5. A thrown seam error lets the card through (fail open) and logs `! duplicate gate:`.
 6. A partial verdict lets the card through, and the work prompt carries the overlap note.
-7. A card with a `dup` stamp, or with a session, never calls the seam again.
+7. A card with a `dup` stamp, or with a session, never calls the seam again. A card that
+   restart-session reset (in progress, a turn row, a worktree, no session, no stamp) and a
+   todo card with an earlier turn row never call the seam.
 
 `src/duplicateGate.test.ts`: candidate selection, `parseDupTerms`, `parseDupVerdict`
 (examples and one fast-check property: no input throws anything but `RangeError`, and an
