@@ -10943,10 +10943,17 @@ export async function createApp(deps: AppDeps) {
 	): Promise<Response | null> {
 		if (task.stage !== "merging" || task.prNumber === null) return null;
 		if (task.needsReason !== prFeedbackReason(task.prNumber)) return null;
-		await e.store.updateTask(task.id, {
-			...replyPatch(task, text, images),
-			stage: "in_progress",
-		});
+		try {
+			await updateSnapshot(e, task, {
+				...replyPatch(task, text, images),
+				stage: "in_progress",
+			});
+		} catch (err) {
+			// The merge settled between the reply's snapshot and this write: the card
+			// is done, the park (and this reply) is void, and nothing may re-queue it.
+			if (!(err instanceof TaskConflict)) throw err;
+			return await taskResponse(e, task.id);
+		}
 		await deps.schedule();
 		return await taskResponse(e, task.id);
 	}

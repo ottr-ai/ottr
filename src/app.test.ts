@@ -2363,6 +2363,58 @@ describe("task routes", () => {
 		expect(calls).toBe(before + 1);
 	});
 
+	test("a reply losing the settle race leaves a merged card done", async () => {
+		const blocks =
+			"REVIEW COMMENT by alice at 2026-11-01T12:00:00.000Z\n<<<DATA\nPlease fix the leak\nDATA>>>";
+		const t = await store.createTask("parked for review feedback");
+		await store.updateTask(t.id, {
+			stage: "merging",
+			state: "needs_you",
+			needsReason: prFeedbackReason(7),
+			prNumber: 7,
+			pendingPrompt: blocks,
+			pendingBy: "supervisor",
+		});
+		// The merge settles (prPinDone's done write) while the reply sits between its
+		// snapshot read and its patch write. replyRefusal's steerDecoded calls
+		// getSettings inside exactly that window: the one-shot seam lands the settle
+		// write there, with the real store write prPinDone commits.
+		const realSettings = store.getSettings.bind(store);
+		let settled = false;
+		store.getSettings = async () => {
+			if (settled) return realSettings();
+			settled = true;
+			store.getSettings = realSettings;
+			await store.updateTask(t.id, {
+				stage: "done",
+				state: "idle",
+				needsReason: null,
+				pendingPrompt: null,
+				pendingFeedback: false,
+				pushSha: "a".repeat(40),
+				uncommittedFiles: [],
+			});
+			return realSettings();
+		};
+		const before = calls;
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: "fix it",
+			});
+			expect(res.status).toBe(200);
+		} finally {
+			store.getSettings = realSettings;
+		}
+		const row = (await store.getTask(t.id))!;
+		expect(row.stage).toBe("done");
+		expect(row.state).toBe("idle");
+		expect(row.needsReason).toBeNull();
+		expect(row.pendingPrompt).toBeNull();
+		expect(row.pendingFeedback).toBe(false);
+		// The settled card must not get a work turn queued against the merged PR.
+		expect(calls).toBe(before);
+	});
+
 	test("star toggles the flag and rejects a non-boolean body", async () => {
 		const t = await store.createTask("pin me");
 		expect((await store.getTask(t.id))?.starred).toBe(false);
