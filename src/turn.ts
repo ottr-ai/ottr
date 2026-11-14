@@ -15,6 +15,15 @@ import {
 	writeBelow,
 } from "./confine.ts";
 import type { pidAlive } from "./dblock.ts";
+import {
+	type DupCandidate,
+	type DupVerdict,
+	dupCandidate,
+	dupCandidateTasks,
+	dupCloseReason,
+	duplicateCheck,
+	dupOverlapNote,
+} from "./duplicateGate.ts";
 import { errmsg } from "./errmsg.ts";
 import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
 import { BRANCH_RULE_REJECTION, GIT_AUTH_FAILURE } from "./gitHosts.ts";
@@ -155,6 +164,7 @@ import type {
 	ArchReview,
 	AskQuestion,
 	DiffFileStat,
+	DupGateStamp,
 	GitFacts,
 	LatestImage,
 	ListedTask,
@@ -851,6 +861,8 @@ export interface TurnOps {
 	titleRetryDelayMs?: number;
 	/** OTTR-823 preparation gate: the comprehension check model call; overridable for tests so none spawns a gateway. */
 	gateCheck?: typeof promptGateCheck;
+	/** OTTR-941 duplicate-work gate: the code search plus verdict model calls; overridable for tests so none spawns a gateway. */
+	duplicateCheck?: typeof duplicateCheck;
 	/** Commit subjects on the target since a base, for the check run's input; overridable for tests. */
 	commitSubjects?: typeof commitSubjects;
 	/** OTTR-763: per-commit metadata (sha, subject, committer time, changed files) the
@@ -3717,6 +3729,19 @@ export function createTurnLoop(
 			const flags = await turnIdentityFlags(store, id, task);
 			const idn = await resolveTurnIdentity(store, id, task, key, flags, log);
 			if (idn === null) return;
+			if (
+				!(await duplicateGateTurnStart(
+					e,
+					store,
+					id,
+					task,
+					kind,
+					idn,
+					header,
+					log,
+				))
+			)
+				return;
 			if (!(await promptGateTurnStart(store, id, task, kind, idn, log))) return;
 			const loc = await prepareTurnWorktree(
 				e,
@@ -3968,6 +3993,17 @@ export function createTurnLoop(
 		flags: TurnIdentityFlags,
 		task: Task,
 	): boolean {
+		return !task.research && dupGateApplies(kind, flags, task);
+	}
+
+	/** True when the duplicate-work gate runs on this turn (OTTR-941 scope): the prompt gate's
+	 * exclusions, but research cards stay in, because a research question can repeat a done
+	 * research card. The session and stamp checks need the live row, so the gate reads them. */
+	function dupGateApplies(
+		kind: TurnKind,
+		flags: TurnIdentityFlags,
+		task: Task,
+	): boolean {
 		if (kind !== "work") return false;
 		if (
 			flags.interview ||
@@ -3979,7 +4015,6 @@ export function createTurnLoop(
 			flags.boardCheck
 		)
 			return false;
-		if (task.research) return false;
 		if (task.sourcePrNumber !== null) return false;
 		if (task.kind === "pr_review") return false;
 		return true;
@@ -4291,6 +4326,106 @@ export function createTurnLoop(
 		};
 	}
 
+	/** OTTR-941 duplicate-work gate, phase before the prompt gate and the worktree
+	 * (docs/specs/duplicate-gate.md). It runs once on a new card: a session or a `dup`
+	 * stamp skips it. A full match closes (cancels) the card and returns false. A partial
+	 * match, no match or a gate failure stamps the card and returns true (fail open). A
+	 * stamp write that finds the card cancelled or no longer preparing returns false. */
+	async function duplicateGateTurnStart(
+		e: TurnProject,
+		store: ProjectStore,
+		id: string,
+		task: Task,
+		kind: TurnKind,
+		idn: TurnIdentity,
+		header: TurnHeader,
+		log: (line: string) => void | Promise<void>,
+	): Promise<boolean> {
+		if (!dupGateApplies(kind, idn, task)) return true;
+		const live = (await store.getTask(id)) ?? task;
+		if (live.sessionId !== null || live.gate?.dup !== undefined) return true;
+		const candidates: DupCandidate[] = [];
+		let verdict: DupVerdict;
+		try {
+			// getTask per candidate: the list rows lack the report a done research card
+			// carries. A stage change between the two reads throws and fails open.
+			for (const listed of dupCandidateTasks(live, await store.listTasks())) {
+				const full = await store.getTask(listed.id);
+				if (full !== null) candidates.push(dupCandidate(full));
+			}
+			verdict = await (ops.duplicateCheck ?? duplicateCheck)({
+				prompt: live.prompt,
+				candidates,
+				cwd: e.path,
+				ref: header.target,
+			});
+		} catch (err) {
+			await log(`! duplicate gate: ${errmsg(err)}`);
+			return await writeDupStamp(store, id, { verdict: "error" }, null);
+		}
+		if (verdict.verdict === "duplicate") {
+			const reason = dupCloseReason(verdict, candidates);
+			await log(`! ${reason}`);
+			await writeDupStamp(
+				store,
+				id,
+				{ verdict: "duplicate", note: reason },
+				reason,
+			);
+			return false;
+		}
+		if (verdict.verdict === "partial") {
+			const note = dupOverlapNote(verdict, candidates);
+			await log(`+ duplicate gate: partial overlap: ${note}`);
+			return await writeDupStamp(store, id, { verdict: "partial", note }, null);
+		}
+		await log("+ duplicate gate: no duplicate found");
+		return await writeDupStamp(store, id, { verdict: "new" }, null);
+	}
+
+	/** The duplicate gate's one card write: the stamp, merged into the gate state, and on a
+	 * close (`closeReason` set) the cancel with the reason. The card has no worktree and no
+	 * branch yet, so the close needs no cleanup. Writes only while the card is uncancelled
+	 * and preparing; false = it was not, and the turn stops. */
+	async function writeDupStamp(
+		store: ProjectStore,
+		id: string,
+		dup: DupGateStamp,
+		closeReason: string | null,
+	): Promise<boolean> {
+		return await store.transaction(async () => {
+			const current = await store.getTask(id);
+			if (
+				current === null ||
+				current.cancelledAt !== null ||
+				current.state !== "preparing"
+			)
+				return false;
+			const gate: PromptGateState = {
+				...(current.gate ?? {
+					hash: null,
+					seen: null,
+					fails: 0,
+					sig: null,
+					parked: false,
+				}),
+				dup,
+			};
+			await store.updateTask(
+				id,
+				closeReason === null
+					? { gate }
+					: {
+							cancelledAt: Date.now(),
+							state: "idle",
+							needsReason: closeReason,
+							gate,
+						},
+			);
+			return true;
+		});
+	}
+
 	/** OTTR-823 comprehension gate, phase before the worktree: false parks the card needs_you
 	 * (no worktree, no file change, no omp spawn); true proceeds. Runs only on gated work turns. */
 	async function promptGateTurnStart(
@@ -4451,6 +4586,8 @@ export function createTurnLoop(
 						parked: false,
 						...(assumptions.length > 0 ? { assumptions } : {}),
 						...(adopted !== null ? { check: adopted } : {}),
+						// OTTR-941: keep the duplicate gate's stamp so it never reruns.
+						...(current.gate?.dup ? { dup: current.gate.dup } : {}),
 					},
 				});
 				return true;
@@ -4511,7 +4648,10 @@ export function createTurnLoop(
 				state: "needs_you",
 				needsReason: write.needsReason,
 				asked: write.asked,
-				gate: write.gate,
+				// OTTR-941: keep the duplicate gate's stamp, so the gate never runs again after a park.
+				gate: current.gate?.dup
+					? { ...write.gate, dup: current.gate.dup }
+					: write.gate,
 			});
 		});
 	}

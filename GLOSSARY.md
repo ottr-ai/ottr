@@ -29,6 +29,13 @@ A gate question with no default, because only the user can decide. It is the
 only kind of question that parks a card.
 _Avoid_: decision question, open question
 
+**Duplicate-work gate**:
+The check that runs before the first work turn of a new card. Two tool-free
+model calls and a git search on the target decide if the work already exists
+in the code or in another open task. A full match closes the card with the
+reason; a partial match adds an overlap note.
+_Avoid_: dedupe check, duplicate filter
+
 **Card title**:
 The name a board card shows. It comes from the card's own session history, and
 a card with no title yet shows a short cut of its prompt line.

@@ -221,6 +221,12 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
 			questions: [],
 		}),
+		// The duplicate-work gate defaults to "new": no test here spawns a gateway (OTTR-941).
+		duplicateCheck: async () => ({
+			verdict: "new",
+			matches: [],
+			reason: "new work",
+		}),
 		titleRetryDelayMs: 5,
 		publishRelease: async () => "published",
 		runReleaseCommand: async () => "ran",
@@ -1471,6 +1477,12 @@ describe("hosted credit stop", () => {
 				checks: "the recorded run",
 				points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
 				questions: [],
+			}),
+			// The duplicate-work gate defaults to "new": no test here spawns a gateway (OTTR-941).
+			duplicateCheck: async () => ({
+				verdict: "new",
+				matches: [],
+				reason: "new work",
 			}),
 			startRun: async (o: StartArgs) => {
 				record.runs.push(o);

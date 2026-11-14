@@ -29,6 +29,7 @@ import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
 import {
 	DEEPEN_POINTS,
+	DUPLICATE_REASON,
 	IMPLEMENT_RECOMMENDATIONS,
 	isProposalReason,
 } from "../prompts.ts";
@@ -9054,7 +9055,20 @@ function ProposalReasonLink({
 		);
 	const lead = m?.[1];
 	const hit = m?.[2];
-	if (lead === undefined || hit === undefined) return <span>{reason}</span>;
+	if (lead === undefined || hit === undefined)
+		// The duplicate-work gate's close reason names the matched cards (OTTR-941).
+		return reason.startsWith(DUPLICATE_REASON) ? (
+			<span>
+				<CardIdLinks
+					text={reason}
+					selfProject={selfProject}
+					tasks={tasks}
+					onOpenTask={onOpenTask}
+				/>
+			</span>
+		) : (
+			<span>{reason}</span>
+		);
 	const id: string = hit;
 	const linked =
 		tasks.find((t) => t.id === id && t.project === selfProject) ??

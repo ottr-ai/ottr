@@ -28,7 +28,12 @@ import {
 	tasksDirFor,
 } from "./store.ts";
 import { prConflictReason } from "./supervisor.ts";
-import { answeredCard, type RecordedFinding, type Task } from "./types.ts";
+import {
+	answeredCard,
+	type PromptGateState,
+	type RecordedFinding,
+	type Task,
+} from "./types.ts";
 
 const root = mkdtempSync(join(tmpdir(), "store-model-"));
 const opened: ProjectStore[] = [];
@@ -6211,6 +6216,29 @@ describe("gate column", () => {
 		expect((await store.getTask(task.id))?.gate?.hash).toBe("abc");
 		await store.updateTask(task.id, { gate: null });
 		expect((await store.getTask(task.id))?.gate).toBeNull();
+		await store.close();
+	});
+
+	test("a valid duplicate gate stamp round-trips; an invalid one drops alone (OTTR-941)", async () => {
+		const store = await open(join(root, "gate-dup"));
+		const task = await store.createTask("gated");
+		const base = { hash: null, seen: null, fails: 0, sig: null, parked: false };
+		const note = "Duplicate work gate: done already. Matches: src/a.ts:3";
+		await store.updateTask(task.id, {
+			gate: { ...base, dup: { verdict: "duplicate", note } },
+		});
+		expect((await store.getTask(task.id))?.gate).toEqual({
+			...base,
+			dup: { verdict: "duplicate", note },
+		});
+		// A stored verdict outside the four values drops the stamp, not the gate state.
+		await store.updateTask(task.id, {
+			gate: {
+				...base,
+				dup: { verdict: "maybe" },
+			} as unknown as PromptGateState,
+		});
+		expect((await store.getTask(task.id))?.gate).toEqual(base);
 		await store.close();
 	});
 

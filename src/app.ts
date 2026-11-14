@@ -10983,6 +10983,8 @@ export async function createApp(deps: AppDeps) {
 				fails: 0,
 				sig: null,
 				parked: false,
+				// OTTR-941: keep the duplicate gate's stamp so it never reruns.
+				...(gate.dup ? { dup: gate.dup } : {}),
 			},
 		});
 		await deps.schedule();

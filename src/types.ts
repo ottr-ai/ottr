@@ -90,6 +90,15 @@ export interface PromptGateState {
 	assumptions?: GateAssumption[];
 	/** The outside check the gate adopted when the prompt text carried none (OTTR-904); absent when the text carried one. */
 	check?: string;
+	/** The duplicate-work gate's stamp (OTTR-941); absent = the gate never ran on this card. */
+	dup?: DupGateStamp;
+}
+
+/** The duplicate-work gate's outcome on one card (OTTR-941); "error" = the gate failed open. */
+export interface DupGateStamp {
+	verdict: "duplicate" | "partial" | "new" | "error";
+	/** The overlap note (partial) or the close reason (duplicate). */
+	note?: string;
 }
 
 /** Normalizes an ask tool call's `{ questions: [...] }` args; null when no usable question is inside. */

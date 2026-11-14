@@ -4357,6 +4357,41 @@ describe("Drawer approve button", () => {
 		expect(gone).not.toContain("reason-card-link");
 	});
 
+	test("a duplicate-work close reason links the matched card ids; other reasons stay plain (OTTR-941)", () => {
+		const match = cardFixture({
+			id: "OTTR-12",
+			title: "Add the widget",
+			sessionTitle: "Add the widget",
+			stage: "in_progress",
+			state: "running",
+			needsReason: null,
+		});
+		const render = (needsReason: string) =>
+			renderToStaticMarkup(
+				<Drawer
+					{...base}
+					task={cardFixture({
+						...drawerFields,
+						stage: "todo",
+						state: "idle",
+						cancelledAt: 1,
+						needsReason,
+					})}
+					tasks={[match]}
+				/>,
+			);
+		const html = render(
+			"Duplicate work gate: OTTR-12 already adds the widget. Matches: OTTR-12 (in progress), src/widget.ts:4",
+		);
+		expect(html).toContain('href="/projects/proj/tasks/OTTR-12"');
+		expect(html).toContain('title="Add the widget"');
+		expect(html).toContain("src/widget.ts:4");
+		// The same id in a reason from another writer is not linked.
+		expect(render("Tracker error: OTTR-12 broke")).not.toContain(
+			"reason-card-link",
+		);
+	});
+
 	const releaseFields = {
 		...drawerFields,
 		releaseVersion: "v1.2.3",

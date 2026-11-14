@@ -46,6 +46,7 @@ import { assignTopics } from "./topics.ts";
 import type {
 	AskQuestion,
 	DiffFileStat,
+	DupGateStamp,
 	ForkBranchState,
 	ForkHoldState,
 	GateAssumption,
@@ -710,10 +711,29 @@ function parseGate(raw: string | null): PromptGateState | null {
 					typeof a.answer === "string",
 			);
 		if (typeof g.check === "string" && g.check !== "") state.check = g.check;
+		// OTTR-941: the duplicate-work gate's stamp rides through when it parses.
+		const dup = parseDupStamp(g.dup);
+		if (dup !== null) state.dup = dup;
 		return state;
 	} catch {
 		return null;
 	}
+}
+
+/** One parsed duplicate-work gate stamp (OTTR-941), or null when it is absent or wrong-shaped. */
+function parseDupStamp(raw: unknown): DupGateStamp | null {
+	if (typeof raw !== "object" || raw === null) return null;
+	const d = raw as Record<string, unknown>;
+	if (
+		d.verdict !== "duplicate" &&
+		d.verdict !== "partial" &&
+		d.verdict !== "new" &&
+		d.verdict !== "error"
+	)
+		return null;
+	return typeof d.note === "string"
+		? { verdict: d.verdict, note: d.note }
+		: { verdict: d.verdict };
 }
 
 function parseStringList(raw: string): string[] {

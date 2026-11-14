@@ -569,6 +569,12 @@ async function mountBoard(
 			points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
 			questions: [],
 		}),
+		// The duplicate-work gate defaults to "new": no test here spawns a gateway (OTTR-941).
+		duplicateCheck: async () => ({
+			verdict: "new",
+			matches: [],
+			reason: "new work",
+		}),
 		titleRetryDelayMs: 5,
 		drained: () => app.drained(),
 		drainedRunner: (id) => app.drainedRunner(id),
