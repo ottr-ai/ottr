@@ -50,6 +50,10 @@ that a done research card already answers.
 `dupCandidateTasks(self, tasks)` selects from the same project's task list:
 
 - `cancelledAt === null`, `id !== self.id`;
+- `kind === "work"` and `sourcePrNumber === null`: a PR-review card waits `in_progress`
+  with the outside PR author's title in its title and prompt, and a source-PR card carries
+  outside PR text too. An outsider could word such text to claim every new card as its
+  duplicate, so these cards are never candidates;
 - not the task that `self` continues (`self.followUpOf` when `self.followUpOfProject` is
   null);
 - `stage === "in_progress"`, or `stage === "merging"`, or `stage === "done"` with

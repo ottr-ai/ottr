@@ -31,6 +31,8 @@ function task(p: Partial<Task> = {}): Task {
 		id: `T-${seq}`,
 		title: `task ${seq}`,
 		prompt: `prompt ${seq}`,
+		kind: "work",
+		sourcePrNumber: null,
 		stage: "in_progress",
 		research: false,
 		cancelledAt: null,
@@ -76,6 +78,33 @@ describe("dupCandidateTasks", () => {
 		expect(new Set(dupCandidateTasks(self, tasks).map((t) => t.id))).toEqual(
 			new Set(["A", "B", "R", "R3", "R4"]),
 		);
+	});
+
+	test("PR-review, other-kind and source-PR cards are never candidates (outside text)", () => {
+		// A PR-review card waits in_progress with the PR author's title in its prompt.
+		const self = task({ id: "S", stage: "todo" });
+		const tasks = [
+			self,
+			task({ id: "W", stage: "in_progress" }),
+			task({ id: "PR", kind: "pr_review", stage: "in_progress" }),
+			task({ id: "DB", stage: "in_progress", sourcePrNumber: 10 }),
+			task({ id: "TR", kind: "trending", stage: "in_progress" }),
+			task({ id: "RV", kind: "review", stage: "done", research: true }),
+		];
+		expect(dupCandidateTasks(self, tasks).map((t) => t.id)).toEqual(["W"]);
+		// A match on such a card is stale at close time, too.
+		expect(
+			staleDupMatches(
+				self,
+				{
+					verdict: "duplicate",
+					matches: [{ kind: "task", ref: "PR" }],
+					reason: "covered",
+				},
+				[],
+				tasks,
+			),
+		).toEqual(["PR"]);
 	});
 
 	test("a parent on another project's board does not exclude the same id here", () => {
