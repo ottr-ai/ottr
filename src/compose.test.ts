@@ -242,7 +242,9 @@ describe("the PostgreSQL test infrastructure shape", () => {
 		// at trigger time (OTTR-937): the URL expression may only live on a step env.
 		expect(ciCheck.env).toBeUndefined();
 		const steps = ciCheck.steps as Service[];
-		const testStep = steps.find((step) => step.run === "bun test --timeout 20000");
+		const testStep = steps.find(
+			(step) => step.run === "bun test --timeout 20000",
+		);
 		expect(testStep).toBeDefined();
 		expect(testStep?.env).toEqual({
 			OTTR_TEST_PG_URL:
