@@ -13,6 +13,7 @@ const ALLOWED: Record<string, true> = {
 	"MPL-2.0": true,
 	"(MPL-2.0 OR Apache-2.0)": true,
 	"EPL-2.0": true,
+	"EPL-2.0 OR GPL-3.0-or-later": true,
 	Unlicense: true,
 };
 // Packages whose package.json names no license, checked by hand. khroma (a mermaid dependency)
