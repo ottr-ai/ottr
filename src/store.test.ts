@@ -6085,34 +6085,79 @@ describe("jira imports", () => {
 });
 
 describe("ask drafts", () => {
+	/** A needs-you card whose open ask holds `questions`. */
+	const askOn = async (store: ProjectStore, ...questions: string[]) => {
+		const t = await store.createTask("asked");
+		await setAsk(store, t.id, questions);
+		return t.id;
+	};
+	const setAsk = (store: ProjectStore, id: string, questions: string[]) =>
+		store.updateTask(id, {
+			state: "needs_you",
+			asked: questions.map((question) => ({
+				question,
+				options: [{ label: "yes" }],
+				multi: false,
+				recommended: null,
+			})),
+		});
+
 	test("save, get and delete round-trip a task's draft", async () => {
 		const store = await open(join(root, "ask-drafts"));
-		expect(await store.getAskDraft("t1")).toBeNull();
+		const id = await askOn(store, "A?", "B?");
+		expect(await store.getAskDraft(id)).toBeNull();
 		const draft = { fp: "A?\nB?", answers: { "0": "yes", "1": "no" }, at: 5 };
-		expect(await store.saveAskDraft("t1", draft)).toEqual(draft);
-		expect(await store.getAskDraft("t1")).toEqual(draft);
+		expect(await store.saveAskDraft(id, draft)).toEqual(draft);
+		expect(await store.getAskDraft(id)).toEqual(draft);
 		expect(await store.getAskDraft("t2")).toBeNull();
-		await store.deleteAskDraft("t1");
-		expect(await store.getAskDraft("t1")).toBeNull();
+		await store.deleteAskDraft(id);
+		expect(await store.getAskDraft(id)).toBeNull();
 		await store.close();
 	});
 
-	test("an older draft never overwrites a newer one; an equal or newer one does", async () => {
+	test("an older draft never overwrites a newer one; an equal or newer one does; a new round always does", async () => {
 		const store = await open(join(root, "ask-drafts-order"));
+		const id = await askOn(store, "Q?");
 		const newer = { fp: "Q?", answers: { "0": "new" }, at: 20 };
-		await store.saveAskDraft("t1", newer);
+		await store.saveAskDraft(id, newer);
 		expect(
-			await store.saveAskDraft("t1", {
+			await store.saveAskDraft(id, {
 				fp: "Q?",
 				answers: { "0": "old" },
 				at: 10,
 			}),
 		).toEqual(newer);
-		expect(await store.getAskDraft("t1")).toEqual(newer);
+		expect(await store.getAskDraft(id)).toEqual(newer);
 		const same = { fp: "Q?", answers: { "0": "same" }, at: 20 };
-		expect(await store.saveAskDraft("t1", same)).toEqual(same);
-		const later = { fp: "R?", answers: {}, at: 30 };
-		expect(await store.saveAskDraft("t1", later)).toEqual(later);
+		expect(await store.saveAskDraft(id, same)).toEqual(same);
+		await setAsk(store, id, ["R?"]);
+		const nextRound = { fp: "R?", answers: {}, at: 1 };
+		expect(await store.saveAskDraft(id, nextRound)).toEqual(nextRound);
+		await store.close();
+	});
+
+	test("a save checks the task in its own write step: an ask change queued first refuses it", async () => {
+		const store = await open(join(root, "ask-drafts-race"));
+		const id = await askOn(store, "old A?", "old B?");
+		const current = { fp: "old A?\nold B?", answers: { "0": "yes" }, at: 1 };
+		await store.saveAskDraft(id, current);
+		// The new round lands before the queued save from the old panel runs.
+		const change = setAsk(store, id, ["current A?", "current B?"]);
+		const save = store.saveAskDraft(id, { ...current, at: 2 });
+		await change;
+		expect(await save).toBe("stale_round");
+		expect(await store.getAskDraft(id)).toEqual(current);
+		// No open question at all: refused, nothing written.
+		const resolved = store.updateTask(id, { state: "running" });
+		const late = store.saveAskDraft(id, {
+			fp: "current A?\ncurrent B?",
+			answers: {},
+			at: 3,
+		});
+		await resolved;
+		expect(await late).toBe("no_ask");
+		expect(await store.saveAskDraft("missing", current)).toBe("no_ask");
+		expect(await store.getAskDraft(id)).toEqual(current);
 		await store.close();
 	});
 
@@ -6125,8 +6170,9 @@ describe("ask drafts", () => {
 		);
 		old.close();
 		const store = await open(dir);
+		const id = await askOn(store, "Q?");
 		const draft = { fp: "Q?", answers: { "0": "a" }, at: 1 };
-		await store.saveAskDraft("t1", draft);
+		await store.saveAskDraft(id, draft);
 		await store.close();
 		const raw = new Database(join(dir, ".tasks", "tasks.db"));
 		const rows = raw
@@ -6135,7 +6181,7 @@ describe("ask drafts", () => {
 			)
 			.all();
 		raw.close();
-		expect(rows).toEqual([{ task_id: "t1", answers: '{"0":"a"}' }]);
+		expect(rows).toEqual([{ task_id: id, answers: '{"0":"a"}' }]);
 	});
 });
 

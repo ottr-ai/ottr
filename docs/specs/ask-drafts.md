@@ -19,6 +19,7 @@ An ask with two or more questions collects answers before one reply sends them a
   - unknown project or task: 404, bad task id: 400 (same as the other task routes, `resolveTask`).
   - the task has no outstanding ask (`asked === null` or state is not `needs_you`), or the task is cancelled: 409.
   - the body `fp` is not the fingerprint of the task's current ask (a delayed save from an earlier round): 409.
+  - The store checks the task (open ask, state, cancel, fingerprint) in the same queued write step as the draft write. An ask change that commits before the save therefore refuses the save.
   - bad body: 400. `fp` is a string of at most 20000 characters. `answers` is an object of at most 50 entries. Each key is a non-negative integer index in decimal form. Each value is a string of at most 20000 characters. `at` is a positive safe integer.
 - `POST /api/projects/:project/tasks/:id/reply` deletes the draft row after a 2xx response.
 

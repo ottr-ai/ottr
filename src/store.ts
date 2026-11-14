@@ -2912,9 +2912,31 @@ export class ProjectStore {
 			: null;
 	}
 
-	/** Upserts the draft unless the stored one is newer; returns the row as it stands after the write. */
-	async saveAskDraft(taskId: string, draft: AskDraft): Promise<AskDraft> {
+	/** Upserts the draft unless the stored one of the same round is newer; returns the row as it
+	 *  stands after the write. The task check runs in the same queued step as the write, so an
+	 *  ask change that lands first refuses the save: "no_ask" when the task has no open
+	 *  question, "stale_round" when `fp` is not the current ask's fingerprint. */
+	async saveAskDraft(
+		taskId: string,
+		draft: AskDraft,
+	): Promise<AskDraft | "no_ask" | "stale_round"> {
 		return this.queue.run(async () => {
+			const task = await this.db
+				.query<
+					{ asked: string | null; state: string; cancelled_at: number | null },
+					[string]
+				>("SELECT asked, state, cancelled_at FROM tasks WHERE id = ?")
+				.get(taskId);
+			const asked = task ? parseAsked(task.asked) : null;
+			if (
+				!task ||
+				asked === null ||
+				task.state !== "needs_you" ||
+				task.cancelled_at !== null
+			)
+				return "no_ask";
+			if (draft.fp !== asked.map((q) => q.question).join("\n"))
+				return "stale_round";
 			await this.db.run(
 				`INSERT INTO ask_drafts (task_id, fp, answers, at) VALUES (?, ?, ?, ?)
 			 ON CONFLICT(task_id) DO UPDATE SET fp = excluded.fp, answers = excluded.answers, at = excluded.at

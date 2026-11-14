@@ -1824,12 +1824,24 @@ describe("task routes", () => {
 		const old = await post(url, { fp: "Old?", answers: { "0": "x" }, at: 11 });
 		expect(old.status).toBe(409);
 		expect(await store.getAskDraft(t.id)).toEqual(current);
-		// A stale row from an earlier round, stamped in the future (fast clock).
+		// A stale row from an earlier round "Old?", stamped in the future (fast clock),
+		// then the ask moves on to the current round again.
+		const round = (questions: string[]) =>
+			store.updateTask(t.id, {
+				asked: questions.map((question) => ({
+					question,
+					options: [{ label: "yes" }, { label: "no" }],
+					multi: false,
+					recommended: null,
+				})),
+			});
+		await round(["Old?"]);
 		await store.saveAskDraft(t.id, {
 			fp: "Old?",
 			answers: { "0": "x" },
 			at: Date.now() + 86_400_000,
 		});
+		await round(["A?", "B?"]);
 		const fresh = { fp: "A?\nB?", answers: { "1": "no" }, at: Date.now() };
 		const res = await post(url, fresh);
 		expect(res.status).toBe(200);

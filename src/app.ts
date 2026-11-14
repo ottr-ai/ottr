@@ -11340,17 +11340,14 @@ export async function createApp(deps: AppDeps) {
 		if (found instanceof Response) return found;
 		const draft = askDraftBody(r.body);
 		if (draft instanceof Response) return draft;
-		const { e, task } = found;
-		if (
-			task.cancelledAt !== null ||
-			task.asked === null ||
-			task.state !== "needs_you"
-		)
+		// The task check lives in the store's write step: an ask change between this
+		// request's read and the write must refuse a save from the earlier round.
+		const saved = await found.e.store.saveAskDraft(found.task.id, draft);
+		if (saved === "no_ask")
 			return json({ error: "task has no open question" }, 409);
-		// A delayed save from a panel of an earlier ask round must not replace the current draft.
-		if (draft.fp !== task.asked.map((q) => q.question).join("\n"))
+		if (saved === "stale_round")
 			return json({ error: "draft is for an earlier question round" }, 409);
-		return json({ draft: await e.store.saveAskDraft(task.id, draft) });
+		return json({ draft: saved });
 	}
 
 	/** The validated triage priority; a Response is the 400. */
