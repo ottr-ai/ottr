@@ -725,6 +725,49 @@ describe("buildUserMessage", () => {
 			/range exceeds prompt budget/,
 		);
 	});
+	test("caps a single oversize commit to the budget instead of throwing", () => {
+		const patch = `${"x".repeat(600_000)}OVERSIZE-TAIL`;
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch,
+					branches: [],
+				},
+			],
+			merges: [],
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		// Both bounds bite: cleanBlocks precaps the patch and capPatches trims the
+		// rest to the room left by the other blocks — the note conveys the cut.
+		expect(msg).toContain("patches truncated to");
+		expect(msg).not.toContain("OVERSIZE-TAIL");
+		expect(msg).toContain("[COMMIT 1]");
+	});
+	test("leaves room for the other blocks when capping patches", () => {
+		const r = range({
+			commits: [
+				{
+					sha: SHA1,
+					subject: "s",
+					files: 1,
+					plus: 1,
+					minus: 0,
+					patch: "x".repeat(600_000),
+					branches: [],
+				},
+			],
+			merges: [],
+			upstreamDocs: "y".repeat(20_000),
+		});
+		const msg = buildUserMessage(r, { titles: [], declines: [] });
+		expect(msg).toContain("patches truncated to");
+		expect(msg).toContain("UPSTREAM_DOCS");
+	});
 });
 
 describe("runGateway", () => {

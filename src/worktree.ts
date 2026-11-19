@@ -74,11 +74,49 @@ export function gitExe(resolved: string | null = Bun.which("git")): string {
 }
 
 /**
+ * Reads one child pipe into memory. Without a byte cap it buffers everything. With
+ * `maxBytes` it keeps the first `maxBytes`, then kills the child and keeps draining the
+ * pipe (discarding) so the child can never block on a full pipe: truncated output is
+ * success, because the caller asked for a bounded read.
+ */
+async function readPiped(
+	proc: { kill(): unknown },
+	stream: ReadableStream<Uint8Array>,
+	maxBytes: number | undefined,
+): Promise<{ text: string; truncated: boolean }> {
+	if (maxBytes === undefined)
+		return { text: await new Response(stream).text(), truncated: false };
+	const reader = stream.getReader();
+	const dec = new TextDecoder();
+	let text = "";
+	let total = 0;
+	let truncated = false;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		if (value === undefined || value.length === 0) continue;
+		total += value.length;
+		if (truncated) continue;
+		if (total > maxBytes) {
+			const keep = Math.max(0, maxBytes - (total - value.length));
+			text += dec.decode(value.subarray(0, keep), { stream: true });
+			truncated = true;
+			proc.kill();
+			continue;
+		}
+		text += dec.decode(value, { stream: true });
+	}
+	return { text: text + dec.decode(), truncated };
+}
+
+/**
  * One piped spawn, shared by git() and runGh(). `timeout` (Bun 1.4) bounds a hung child:
  * Bun kills it and `exited` resolves non-zero, so no caller can wait forever. `input` is
  * written to the child's stdin (then closed) before the readers run, so a command that
  * reads stdin (git cat-file --batch-check) stays one spawn; the readers start first, so
- * a big input and a big output cannot deadlock on full pipes.
+ * a big input and a big output cannot deadlock on full pipes. `maxOutputBytes` caps the
+ * bytes buffered from each pipe: past the cap the child is killed and `code` reports 0
+ * with the truncated output (a caller that needs a complete output must not pass a cap).
  */
 export async function spawnPiped(
 	argv: string[],
@@ -86,6 +124,7 @@ export async function spawnPiped(
 	timeoutMs: number,
 	env: Record<string, string | undefined> = process.env,
 	input?: string,
+	maxOutputBytes?: number,
 ): Promise<GitResult> {
 	const proc = Bun.spawn(argv, {
 		cwd,
@@ -100,16 +139,20 @@ export async function spawnPiped(
 		timeout: timeoutMs,
 	});
 	const read = Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
+		readPiped(proc, proc.stdout, maxOutputBytes),
+		readPiped(proc, proc.stderr, maxOutputBytes),
 	]);
 	if (input !== undefined && proc.stdin !== null && proc.stdin !== undefined) {
 		proc.stdin.write(input);
 		proc.stdin.end();
 	}
-	const [stdout, stderr] = await read;
+	const [out, errOut] = await read;
 	const code = await proc.exited;
-	return { code, stdout, stderr };
+	return {
+		code: out.truncated || errOut.truncated ? 0 : code,
+		stdout: out.text,
+		stderr: errOut.text,
+	};
 }
 
 /** Git subcommands that touch the network and so need GH_TOKEN for their credential helper; every other board git runs without it. `lfs` is here because `git lfs push` uploads to the origin over the same credentials as `git push` (OTTR-1058). */
@@ -291,6 +334,8 @@ export function gitEnv(
 /**
  * Run git; never throws for non-zero exit. Bounded: default ceiling 10 min; callers with
  * slow ops (clone, a big remote fetch) pass a larger timeoutMs. `env` adds to the child env.
+ * `maxOutputBytes` caps the bytes buffered from each pipe (spawnPiped): past the cap the
+ * child is killed and the truncated output reports code 0.
  */
 export async function git(
 	args: string[],
@@ -299,6 +344,7 @@ export async function git(
 	authEnv?: Record<string, string>,
 	env: Record<string, string> = {},
 	input?: string,
+	maxOutputBytes?: number,
 ): Promise<GitResult> {
 	let at = -1;
 	for (let i = 0; i < args.length; i++) {
@@ -411,6 +457,7 @@ export async function git(
 		timeoutMs,
 		{ ...gitEnv(args, auth), ...env },
 		input,
+		maxOutputBytes,
 	);
 	// Network git carries host tokens, and a remote may echo one back: its output reaches task
 	// logs and API errors, so stored secrets never leave this function raw.

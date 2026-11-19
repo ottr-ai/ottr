@@ -38,6 +38,12 @@ export const FORK_GATES = {
 	MODEL_TIMEOUT_MS: 15 * 60_000,
 	/** GitHub's size estimate cap: huge forks are not research targets. */
 	MAX_SIZE_KB: 500 * 1024,
+	/** Bytes buffered from one fork commit's git show output (each pipe); a larger patch
+	 * is truncated, never buffered whole (OTTR-998). */
+	MAX_PATCH_BYTES: 256 * 1024,
+	/** Commits plus merges collected per range run; rev-list order is newest first, so
+	 * the newest work wins when a range carries more. */
+	MAX_RANGE_COMMITS: 100,
 } as const;
 
 const NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
@@ -51,12 +57,19 @@ export type GitFn = (
 	args: string[],
 	cwd: string,
 	timeoutMs?: number,
+	/** Byte cap on each buffered pipe (spawnPiped); the output may be truncated. */
+	maxOutputBytes?: number,
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 
 /** URL built only from validated ForkInfo fields; never from data-supplied strings. */
 export function forkUrl(f: ForkInfo): string {
 	return `${githubHost().webBase}/${f.owner}/${f.name}.git`;
 }
+
+/** The board git() as a GitFn: GitFn carries the pipe byte cap in the slot where git()
+ * takes authEnv, so the wrapper forwards the cap and passes no credentials. */
+export const defaultGit: GitFn = (args, cwd, timeoutMs, maxOutputBytes) =>
+	git(args, cwd, timeoutMs, undefined, undefined, undefined, maxOutputBytes);
 
 /** Validates one GitHub /forks page; invalid entries are skipped, never thrown. */
 export function parseForkPage(body: unknown): ForkInfo[] {
@@ -335,7 +348,8 @@ function errSnippet(e: string, code: number, stderr: string): Error {
 	return new Error(`${e} failed (${code}): ${stderr.slice(0, 300)}`);
 }
 
-/** Parses `git show --format=%H%x00%s` output into a ForkCommit. */
+/** Parses `git show --format=%H%x00%s` output into a ForkCommit. The subject is one
+ * commit-message line: sliced so a pathological line cannot inflate every prompt block. */
 function parseShow(out: string): {
 	sha: string;
 	subject: string;
@@ -346,7 +360,7 @@ function parseShow(out: string): {
 	const i = header.indexOf("\0");
 	if (i < 0) return null;
 	const sha = header.slice(0, i);
-	const subject = header.slice(i + 1);
+	const subject = header.slice(i + 1, i + 1 + 500);
 	const rest = nl < 0 ? "" : out.slice(nl + 1);
 	const lines = rest.split("\n");
 	const patchStart = lines.findIndex((l) => l.startsWith("diff --git "));
@@ -499,6 +513,16 @@ export async function collectRange(o: {
 		if (branchFiltered.length > 0)
 			filteredReleased.set(b.branchHash, branchFiltered);
 		for (const sha of shas) {
+			const existing = bySha.get(sha);
+			if (existing) {
+				if (!existing.branches.includes(b.branch))
+					existing.branches.push(b.branch);
+				continue;
+			}
+			// Holds attribution above stays complete; past the cap only the model evidence
+			// (the newest commits' patches) stops being collected.
+			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS)
+				continue;
 			const r = await git(
 				[
 					"show",
@@ -511,6 +535,7 @@ export async function collectRange(o: {
 				],
 				cachePath,
 				60_000,
+				FORK_GATES.MAX_PATCH_BYTES,
 			);
 			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
 			const p = parseShow(r.stdout);
@@ -518,28 +543,24 @@ export async function collectRange(o: {
 			const numstat = r.stdout
 				.split("\n")
 				.filter((l) => /^(\d+|-)\t(\d+|-)\t/.test(l));
-			let existing = bySha.get(sha);
-			if (!existing) {
-				const n = (i: number) =>
-					numstat.reduce(
-						(a, l) =>
-							a + (l.split("\t")[i] === "-" ? 0 : Number(l.split("\t")[i])),
-						0,
-					);
-				existing = {
-					sha,
-					subject: p.subject,
-					files: numstat.length,
-					plus: n(0),
-					minus: n(1),
-					patch: p.patch,
-					branches: [],
-				};
-				bySha.set(sha, existing);
-				commits.push(existing);
-			}
-			if (!existing.branches.includes(b.branch))
-				existing.branches.push(b.branch);
+			const n = (i: number) =>
+				numstat.reduce(
+					(a, l) =>
+						a + (l.split("\t")[i] === "-" ? 0 : Number(l.split("\t")[i])),
+					0,
+				);
+			const commit: ForkCommit = {
+				sha,
+				subject: p.subject,
+				files: numstat.length,
+				plus: n(0),
+				minus: n(1),
+				patch: p.patch,
+				branches: [],
+			};
+			bySha.set(sha, commit);
+			commits.push(commit);
+			if (!commit.branches.includes(b.branch)) commit.branches.push(b.branch);
 		}
 		for (const sha of mergeShas) {
 			if (bySha.has(sha)) {
@@ -547,16 +568,20 @@ export async function collectRange(o: {
 				if (!m.branches.includes(b.branch)) m.branches.push(b.branch);
 				continue;
 			}
+			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS)
+				continue;
 			let r = await git(
 				["show", "--remerge-diff", "--format=%H%x00%s", sha],
 				cachePath,
 				60_000,
+				FORK_GATES.MAX_PATCH_BYTES,
 			);
 			if (r.code !== 0)
 				r = await git(
 					["show", "--format=%H%x00%s", "--cc", sha],
 					cachePath,
 					60_000,
+					FORK_GATES.MAX_PATCH_BYTES,
 				);
 			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
 			const p = parseShow(r.stdout);
@@ -741,7 +766,7 @@ export function createForkWatcher(deps: {
 	now?: () => number;
 }): { tick(opts?: { manual?: string }): Promise<void> } {
 	const gh = deps.gh ?? runGh;
-	const runGit = deps.git ?? git;
+	const runGit = deps.git ?? defaultGit;
 	const analyze =
 		deps.analyze ??
 		((range: ForkRange, prior: { titles: string[]; declines: string[] }) =>

@@ -13,6 +13,7 @@ import {
 	branchHash,
 	collectRange,
 	createForkWatcher,
+	defaultGit,
 	ensureCache,
 	FORK_GATES,
 	type ForkProject,
@@ -87,17 +88,21 @@ async function shaOf(dir: string, ref = "HEAD"): Promise<string> {
 
 /** Real git with the GitHub fork URL remapped to a local fixture path. */
 function localGit(forkPath: string): GitFn {
-	return (args, cwd, timeoutMs) =>
+	return (args, cwd, timeoutMs, maxOutputBytes) =>
 		git(
 			args.map((a) => (a === "https://github.com/o/r.git" ? forkPath : a)),
 			cwd,
 			timeoutMs,
+			undefined,
+			undefined,
+			undefined,
+			maxOutputBytes,
 		);
 }
 
 /** localGit plus file transport: the fixture fork is a local path, not github.com. */
 function localFileGit(forkPath: string): GitFn {
-	return async (args, cwd, timeoutMs) => {
+	return async (args, cwd, timeoutMs, maxOutputBytes) => {
 		const at = args.indexOf("fetch");
 		if (at >= 0)
 			args = [
@@ -106,7 +111,7 @@ function localFileGit(forkPath: string): GitFn {
 				"protocol.file.allow=always",
 				...args.slice(at),
 			];
-		return localGit(forkPath)(args, cwd, timeoutMs);
+		return localGit(forkPath)(args, cwd, timeoutMs, maxOutputBytes);
 	};
 }
 
@@ -313,7 +318,13 @@ describe("rangeCommits", () => {
 		await run(["commit", "-q", "--amend", "-m", "feature v2", fork], fork);
 		const newHead = await shaOf(fork);
 		const upstreamHead = await shaOf(up);
-		const r = await rangeCommits(fork, analyzed, newHead, upstreamHead, git);
+		const r = await rangeCommits(
+			fork,
+			analyzed,
+			newHead,
+			upstreamHead,
+			defaultGit,
+		);
 		expect(r.shas).toEqual([]);
 	});
 
@@ -330,7 +341,13 @@ describe("rangeCommits", () => {
 		await run(["add", "g.txt", fork], fork);
 		await run(["commit", "-q", "-m", "new feature", fork], fork);
 		const newHead = await shaOf(fork);
-		const r = await rangeCommits(fork, analyzed, newHead, await shaOf(up), git);
+		const r = await rangeCommits(
+			fork,
+			analyzed,
+			newHead,
+			await shaOf(up),
+			defaultGit,
+		);
 		expect(r.shas.length).toBe(1);
 		expect(r.merges).toEqual([]);
 	});
@@ -353,7 +370,13 @@ describe("rangeCommits", () => {
 		await run(["merge", "-q", "--no-ff", "origin/main", fork], fork);
 		const newHead = await shaOf(fork);
 		expect(newHead).not.toBe(before);
-		const r = await rangeCommits(fork, analyzed, newHead, await shaOf(up), git);
+		const r = await rangeCommits(
+			fork,
+			analyzed,
+			newHead,
+			await shaOf(up),
+			defaultGit,
+		);
 		expect(r.shas).toEqual([]);
 		expect(r.merges.length).toBe(1);
 	});
@@ -397,7 +420,7 @@ describe("collectRange", () => {
 					analyzedHead: null,
 				},
 			],
-			git,
+			git: defaultGit,
 		});
 		expect(range.commits.length).toBe(2);
 		// rev-list order: newest first.
@@ -413,6 +436,81 @@ describe("collectRange", () => {
 		);
 		expect(range.upstreamFiles).toContain("README.md");
 	});
+
+	test("caps one fork commit's buffered patch bytes", async () => {
+		const main = await initUpstream("cr-cap-main");
+		const fork = mkRepo("cr-cap-fork");
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		await Bun.write(join(fork, "big.txt"), "x".repeat(300_000));
+		await run(["add", "big.txt", fork], fork);
+		await run(["commit", "-q", "-m", "big fork feature", fork], fork);
+		const head = await shaOf(fork);
+		const cachePath = join(root, "cr-cap-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		// The watcher fetches the fork before collectRange; mirror that here.
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[`+refs/heads/feat:refs/heads/${branchHash("feat")}`],
+			localFileGit(fork),
+		);
+		const { range } = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: branchHash("feat"),
+					branch: "feat",
+					head,
+					analyzedHead: null,
+				},
+			],
+			git: defaultGit,
+		});
+		expect(range.commits.length).toBe(1);
+		expect(range.commits[0]!.patch.length).toBeGreaterThan(0);
+		expect(range.commits[0]!.patch.length).toBeLessThanOrEqual(
+			FORK_GATES.MAX_PATCH_BYTES,
+		);
+		// The 300 KB patch cannot fit under the 256 KiB cap: truncation is proven.
+		expect(range.commits[0]!.patch.length).toBeLessThan(300_000);
+	}, 60_000);
+
+	test("stops collecting commits past MAX_RANGE_COMMITS", async () => {
+		const main = await initUpstream("cr-range-main");
+		const fork = mkRepo("cr-range-fork");
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		for (let i = 0; i < FORK_GATES.MAX_RANGE_COMMITS + 6; i++)
+			await run(["commit", "-q", "--allow-empty", "-m", `c${i}`, fork], fork);
+		const head = await shaOf(fork);
+		const cachePath = join(root, "cr-range-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		// The watcher fetches the fork before collectRange; mirror that here.
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[`+refs/heads/feat:refs/heads/${branchHash("feat")}`],
+			localFileGit(fork),
+		);
+		const { range } = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: branchHash("feat"),
+					branch: "feat",
+					head,
+					analyzedHead: null,
+				},
+			],
+			git: defaultGit,
+		});
+		expect(range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
+	}, 60_000);
 });
 
 describe("watcher", () => {
@@ -1052,7 +1150,7 @@ describe("watcher", () => {
 						pushedAt: null,
 						sizeKb: 1,
 					},
-					git,
+					defaultGit,
 				);
 			}
 			if (cap === "daily") {
@@ -1628,9 +1726,9 @@ describe("ensureCache", () => {
 	test("creates a bare repo once and reuses it", async () => {
 		const dir = await initUpstream("cache");
 		const fork = forkPageEntry(77) as never;
-		const p1 = await ensureCache(dir, fork, git);
+		const p1 = await ensureCache(dir, fork, defaultGit);
 		expect(existsSync(join(p1, "HEAD"))).toBe(true);
-		const p2 = await ensureCache(dir, fork, git);
+		const p2 = await ensureCache(dir, fork, defaultGit);
 		expect(p2).toBe(p1);
 	});
 });

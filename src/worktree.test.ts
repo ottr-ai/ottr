@@ -4832,6 +4832,36 @@ describe("git", () => {
 		}
 	});
 
+	test("caps buffered output at maxOutputBytes and reports success", async () => {
+		if (process.platform === "win32") return; // the fake is a sh script
+		const bin = mkdtempSync(join(tmpdir(), "ott-cap-"));
+		const script = join(bin, "big.sh");
+		writeFileSync(
+			script,
+			'#!/bin/sh\nhead -c 1000000 /dev/zero | tr "\\0" "a"\n',
+		);
+		chmodSync(script, 0o755);
+		try {
+			const r = await spawnPiped(
+				[script],
+				tmpdir(),
+				10_000,
+				undefined,
+				undefined,
+				64 * 1024,
+			);
+			expect(r.code).toBe(0); // truncation is success, not failure
+			expect(r.stdout.length).toBe(64 * 1024); // ASCII: chars equal bytes, cap keeps exactly maxBytes
+			expect(r.stderr).toBe("");
+			// Control: without the cap the full megabyte survives.
+			const full = await spawnPiped([script], tmpdir(), 10_000);
+			expect(full.code).toBe(0);
+			expect(full.stdout.length).toBe(1_000_000);
+		} finally {
+			rmSync(bin, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
 	test("never runs a work-turn-planted core.fsmonitor command (R5-1)", async () => {
 		const main = repo();
 		await must(main, "init", "-q", "-b", "main");

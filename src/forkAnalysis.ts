@@ -222,32 +222,27 @@ function cleanBlocks(
 	};
 }
 
-// ponytail: single budget; if over, cap the longest patches first, min 2000 chars each.
+// ponytail: single budget; the other blocks keep their size, patches share what is left.
 function capPatches(
 	patches: string[],
-	total: number,
+	othersTotal: number,
 	commitCount: number,
 ): { patches: string[]; total: number; note: string } {
+	const total = othersTotal + patches.reduce((n, p) => n + p.length, 0);
 	if (total <= PROMPT_CHAR_BUDGET) {
 		return { patches, total, note: "" };
 	}
-	const cap = patchCap(commitCount);
-	let out = patches;
-	let used = total;
-	const order = out
-		.map((p, i) => [p.length, i] as const)
-		.sort((a, b) => b[0] - a[0]);
-	for (const [, i] of order) {
-		const patch = out[i];
-		if (patch !== undefined && patch.length > cap) {
-			used -= patch.length - cap;
-			out = out.map((p, j) => (j === i ? p.slice(0, cap) : p));
-		}
-		if (used <= PROMPT_CHAR_BUDGET) break;
-	}
+	// Room comes off the budget after the other blocks: a single huge commit must not be
+	// cut to the full budget (which would push the other blocks past it). The 2000 floor
+	// keeps a visible patch sliver per commit when the room per commit drops below it.
+	const cap = Math.max(
+		2000,
+		Math.floor(Math.max(0, PROMPT_CHAR_BUDGET - othersTotal) / commitCount),
+	);
+	const out = patches.map((p) => (p.length > cap ? p.slice(0, cap) : p));
 	return {
 		patches: out,
-		total: used,
+		total: othersTotal + out.reduce((n, p) => n + p.length, 0),
 		note: `(patches truncated to ${cap} chars to fit the budget)`,
 	};
 }
@@ -277,14 +272,13 @@ export function buildUserMessage(
 	prior: { titles: string[]; declines: string[] },
 ): string {
 	const b = cleanBlocks(range, prior);
-	const total =
+	const others =
 		b.fork.length +
-		b.patches.reduce((n, p) => n + p.length, 0) +
 		b.upstreamCommits.length +
 		b.upstreamFiles.length +
 		b.upstreamDocs.length +
 		b.priorSection.length;
-	const capped = capPatches(b.patches, total, b.patches.length);
+	const capped = capPatches(b.patches, others, b.patches.length);
 	if (capped.total > PROMPT_CHAR_BUDGET) {
 		throw new RangeError(`range exceeds prompt budget: ${capped.total} chars`);
 	}
