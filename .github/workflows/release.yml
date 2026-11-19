@@ -1,7 +1,7 @@
 name: release
 
 # Publishes the stack image (board and workers) to ghcr.io/ottr-ai/ottr for each GitHub
-# release. amd64 only: rtk, gh, Chrome for Testing and Godot are pinned x86_64 downloads.
+# release. Published images stay amd64; local worker builds also support arm64.
 
 on:
   release:

@@ -73,10 +73,13 @@ exist only when the profile is on (the `OTTR_VM_RUNNER_URL` pattern).
 - `moby/buildkit:v0.34.2-rootless@sha256:c8252268760e1baba80780d63d738ef9f260fb7c7c0973c78494cb9ddd99eda1`
   (multiarch index digest, checked 2026-11-10).
 - `buildkit-v0.34.2.linux-amd64.tar.gz`, sha256
-  `b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13`. The
-  release publishes no checksums file; the SHA-256 was computed when pinned,
-  like the Chrome pin. The release carries sigstore and provenance
-  attestations for a deeper check.
+  `b9f18b8e37eb450e9e5df03117045237cdd12d3c4a0034ffeeaa857852a15e13`.
+- `buildkit-v0.34.2.linux-arm64.tar.gz`, sha256
+  `a4ad483a33b2f1544c5ccce1c5956c559e1a6e84b8bf6cedd847d695885237a3`.
+  The worker selects the archive for its target Debian architecture, defaulting
+  to the build host. The release publishes no checksums file; both archive
+  digests are pinned from the release assets. The release carries sigstore and
+  provenance attestations for a deeper check.
 - `openssl 3.5.7-1~deb13u3` (trixie stable-security, 2026-11). New explicit
   pin in `Dockerfile.worker`: the cert one-off runs openssl, and the image
   only had it as a transitive dependency of `ca-certificates`.

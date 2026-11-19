@@ -3259,7 +3259,10 @@ export async function createApp(deps: AppDeps) {
 						{ proxyHint: true },
 					);
 				} catch (err) {
-					logError("updates pull failed", err);
+					logError(
+						"updates pull failed (Alate GET /api/updates; check ALATE_URL and readiness)",
+						err,
+					);
 					return;
 				}
 				if (!res.ok) {

@@ -1346,4 +1346,35 @@ try {
 	);
 }
 
-console.log(`Ottr on http://127.0.0.1:${PORT}`);
+// ponytail: the bundled dashboard port is fixed in docker-compose.yml; external
+// Alate deployments use their own dashboard URL. Compose passes its profile list.
+const alateEnabled = (process.env.COMPOSE_PROFILES ?? "")
+	.split(",")
+	.some((profile) => ["alate", "*"].includes(profile.trim()));
+const startupRows = [
+	"Ottr | Startup access",
+	"",
+	`Ottr on http://127.0.0.1:${serverRef.current.port}`,
+	`Alate   ${alateEnabled ? "http://127.0.0.1:4570" : "off"}`,
+];
+const startupWidth = Math.max(...startupRows.map((row) => row.length));
+const startupBorder = `+${"-".repeat(startupWidth + 2)}+`;
+console.log(
+	[
+		"",
+		startupBorder,
+		...startupRows.map((row) => `| ${row.padEnd(startupWidth)} |`),
+		startupBorder,
+		HOSTED === null
+			? "Ottr login: first visit, complete Create admin; later, use that admin name and password."
+			: "Ottr login: use your hosting provider's authenticated URL.",
+		...(alateEnabled
+			? [
+					HOSTED === null
+						? "Alate login: use ALATE_API_KEY from your Compose .env file; no username is required."
+						: "Alate login: use the key provided by your hosting administrator.",
+				]
+			: []),
+		"After detached startup (-d): docker compose logs --tail 30 server",
+	].join("\n"),
+);

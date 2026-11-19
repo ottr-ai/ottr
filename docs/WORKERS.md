@@ -25,6 +25,27 @@ docker compose build
 docker compose up -d
 ```
 
+Use Docker Compose ≥ 2.20.0, including as the external provider for `podman compose`:
+the optional Alate dependency uses `depends_on.required: false`. Check the selected
+provider with `podman compose version`; see [Podman setup](install.md#podman).
+
+Source builds support Linux amd64 and arm64 and use the build host's architecture
+by default: arm64 on an ARM MacBook, amd64 on an amd64 host. The target Debian
+image selects each tool's filename and pinned checksum; no build argument is
+required. Docker/Podman `--platform linux/amd64` or `--platform linux/arm64`
+overrides the target (cross-architecture builds need emulation).
+
+```sh
+podman build -f Dockerfile.worker -t ottr-worker:local .
+# Recreate only when no turns run; keep named volumes.
+OTTR_LOG_DRIVER=k8s-file podman compose up --no-build --force-recreate
+```
+
+Every build checks that the seven downloaded tools have the target ELF architecture.
+Chrome's shared libraries still come from the project's system package lists.
+The separate `vm-runner` target remains amd64-only; leave the `vm` profile off on
+an ARM MacBook. Published release images currently remain amd64-only.
+
 The board also provisions on its own: every 5 minutes it reads the alate server's
 `GET /health`, and when the server reports an unprovisioned import (`pending`), it calls
 the same provisioning API as **Settings → Alate → Provision**. When the server reports
@@ -831,7 +852,8 @@ real podman.
   for example `ALATE_URL=http://alate:4570` and a random `ALATE_API_KEY` (32
   hex bytes); the alate container itself requires the same key. The board
   never logs the key, and the runner strips it from every turn's env, since
-  no turn calls alate. A user whose Alate server already runs on another host
+  no turn calls alate. Compose waits for the bundled service's `/health` before starting
+  the board. A user whose Alate server already runs on another host
   omits the profile and saves the URL and key under **Settings -> Alate**.
   The service also mounts the stack's `workspace` volume at `/workspace`
   (`workspace:/workspace` in `docker-compose.yml`), the same volume the board
