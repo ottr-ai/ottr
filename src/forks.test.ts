@@ -423,9 +423,9 @@ describe("collectRange", () => {
 			git: defaultGit,
 		});
 		expect(range.commits.length).toBe(2);
-		// rev-list order: newest first.
-		expect(range.commits[0]!.subject).toBe("fork feature 2");
-		expect(range.commits[1]!.subject).toBe("fork feature");
+		// Collection order: oldest first, so the range cap cuts a branch's newest tail.
+		expect(range.commits[0]!.subject).toBe("fork feature");
+		expect(range.commits[1]!.subject).toBe("fork feature 2");
 		expect(range.heads[0]!.head).toBe(head);
 		// Upstream side: what upstream has that the fork branch lacks.
 		expect(range.upstreamCommits.some((l) => l.includes("docs: readme"))).toBe(
@@ -478,39 +478,120 @@ describe("collectRange", () => {
 		expect(range.commits[0]!.patch.length).toBeLessThan(300_000);
 	}, 60_000);
 
-	test("stops collecting commits past MAX_RANGE_COMMITS", async () => {
+	test("caps a range at MAX_RANGE_COMMITS and defers the newest tail", async () => {
 		const main = await initUpstream("cr-range-main");
 		const fork = mkRepo("cr-range-fork");
 		await run(["clone", "-q", main, fork], root);
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
-		for (let i = 0; i < FORK_GATES.MAX_RANGE_COMMITS + 6; i++)
+		const shas: string[] = [];
+		for (let i = 0; i < FORK_GATES.MAX_RANGE_COMMITS + 6; i++) {
 			await run(["commit", "-q", "--allow-empty", "-m", `c${i}`, fork], fork);
+			shas.push(await shaOf(fork));
+		}
 		const head = await shaOf(fork);
+		const bh = branchHash("feat");
 		const cachePath = join(root, "cr-range-cache.git");
 		await run(["init", "-q", "--bare", cachePath], root);
 		// The watcher fetches the fork before collectRange; mirror that here.
 		await fetchFork(
 			cachePath,
 			"https://github.com/o/r.git",
-			[`+refs/heads/feat:refs/heads/${branchHash("feat")}`],
+			[`+refs/heads/feat:refs/heads/${bh}`],
 			localFileGit(fork),
 		);
-		const { range } = await collectRange({
+		const first = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
+			git: defaultGit,
+		});
+		expect(first.range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
+		// The cap keeps the OLDEST commits: the run's window (analyzedHead...head) is a
+		// suffix, so only a newest-tail cut can be deferred to a later run.
+		expect(first.range.commits.map((c) => c.sha)).toEqual(
+			shas.slice(0, FORK_GATES.MAX_RANGE_COMMITS),
+		);
+		expect(first.skipped.get(bh)).toEqual(
+			shas.slice(FORK_GATES.MAX_RANGE_COMMITS),
+		);
+		expect(first.keptHead.get(bh)).toBe(shas[FORK_GATES.MAX_RANGE_COMMITS - 1]);
+		// The watcher parks the cursor on the newest kept commit; the next run's window
+		// must re-list exactly the skipped tail, so no commit is lost.
+		const second = await collectRange({
 			cachePath,
 			mainPath: main,
 			fork: forkPageEntry(1) as never,
 			branches: [
 				{
-					branchHash: branchHash("feat"),
+					branchHash: bh,
 					branch: "feat",
 					head,
-					analyzedHead: null,
+					analyzedHead: first.keptHead.get(bh)!,
 				},
 			],
 			git: defaultGit,
 		});
-		expect(range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
-	}, 60_000);
+		expect(second.range.commits.map((c) => c.sha)).toEqual(
+			shas.slice(FORK_GATES.MAX_RANGE_COMMITS),
+		);
+		expect(second.skipped.get(bh) ?? []).toEqual([]);
+	}, 120_000);
+
+	test("a branch that starts past the cap keeps nothing and defers fully", async () => {
+		const main = await initUpstream("cr-two-main");
+		const fork = mkRepo("cr-two-fork");
+		await run(["clone", "-q", main, fork], root);
+		const base = await shaOf(fork);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		const featShas: string[] = [];
+		for (let i = 0; i < FORK_GATES.MAX_RANGE_COMMITS + 2; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `f${i}`, fork], fork);
+			featShas.push(await shaOf(fork));
+		}
+		// A second branch off the clone base: the cap is already full at its turn.
+		await run(["checkout", "-q", "-b", "feat2", base], fork);
+		await run(["commit", "-q", "--allow-empty", "-m", "g0", fork], fork);
+		const g0 = await shaOf(fork);
+		await run(["commit", "-q", "--allow-empty", "-m", "g1", fork], fork);
+		const head2 = await shaOf(fork);
+		const bh1 = branchHash("feat");
+		const bh2 = branchHash("feat2");
+		const cachePath = join(root, "cr-two-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[
+				`+refs/heads/feat:refs/heads/${bh1}`,
+				`+refs/heads/feat2:refs/heads/${bh2}`,
+			],
+			localFileGit(fork),
+		);
+		const { range, skipped, keptHead } = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bh1,
+					branch: "feat",
+					head: featShas[featShas.length - 1]!,
+					analyzedHead: null,
+				},
+				{ branchHash: bh2, branch: "feat2", head: head2, analyzedHead: null },
+			],
+			git: defaultGit,
+		});
+		// feat fills the cap; feat2 contributes no collected commit at all.
+		expect(range.commits.every((c) => c.branches.includes("feat"))).toBe(true);
+		expect(skipped.get(bh1)).toEqual(
+			featShas.slice(FORK_GATES.MAX_RANGE_COMMITS),
+		);
+		expect(skipped.get(bh2)).toEqual([g0, head2]);
+		expect(keptHead.get(bh2)).toBeUndefined();
+		expect(keptHead.get(bh1)).toBe(featShas[FORK_GATES.MAX_RANGE_COMMITS - 1]);
+	}, 120_000);
 });
 
 describe("watcher", () => {
@@ -551,6 +632,67 @@ describe("watcher", () => {
 		await run(["commit", "--allow-empty", "-m", "fork feature", fork], fork);
 		return fork;
 	}
+
+	test("a capped range defers its newest tail to the next run instead of losing it", async () => {
+		const name = "watch-capdefer";
+		const main = await initUpstream(name);
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
+		const fork = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		const shas: string[] = [];
+		for (let i = 0; i < FORK_GATES.MAX_RANGE_COMMITS + 6; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `c${i}`, fork], fork);
+			shas.push(await shaOf(fork));
+		}
+		const head = await shaOf(fork);
+		const logs: string[] = [];
+		let calls = 0;
+		let clock = Date.now();
+		const watcher = createForkWatcher({
+			projects: () => [
+				{ name, path: main, store, github: "o/main" } satisfies ForkProject,
+			],
+			log: (m) => logs.push(m),
+			gh: async () => ({
+				code: 0,
+				stdout: JSON.stringify([forkPageEntry(1)]),
+				stderr: "",
+			}),
+			git: localFileGit(fork),
+			analyze: async () => {
+				calls++;
+				return {
+					features: [],
+					proposals: [],
+					coverage: "",
+					commits: [],
+					deferred: [],
+				} as never;
+			},
+			now: () => clock,
+		});
+		await watcher.tick();
+		expect(calls).toBe(1);
+		// The cursor parks on the newest kept commit: the 6-commit tail stays pending.
+		const row = (await store.listAllForkBranches())[0]!;
+		expect(row.analyzedHead).toBe(shas[FORK_GATES.MAX_RANGE_COMMITS - 1]!);
+		expect(row.analyzedHead).not.toBe(head);
+		expect(logs.some((l) => l.includes("past the range cap"))).toBe(true);
+		// Second run after the spacing gate: the deferred tail is analyzed, and then
+		// the cursor reaches the head.
+		clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
+		await watcher.tick();
+		expect(calls).toBe(2);
+		const row2 = (await store.listAllForkBranches())[0]!;
+		expect(row2.analyzedHead).toBe(head);
+		const cards = (await store.listTasks()).filter(
+			(t) => t.topic === "fork research",
+		);
+		expect(cards.length).toBe(2);
+		expect(cards.some((t) => t.title.includes("(6 new commits)"))).toBe(true);
+	}, 120_000);
 
 	test("eligible range creates card, held proposal, advances cursor; no duplicates on second tick", async () => {
 		const { main, store, watcher, calls } = await setup(
@@ -1434,7 +1576,7 @@ describe("watcher", () => {
 				[],
 			);
 			await watcher.tick();
-			expect(state.subjects).toEqual([["held change", "fork feature"]]);
+			expect(state.subjects).toEqual([["fork feature", "held change"]]);
 			const final = (await store.listForkBranches(1)).find(
 				(row) => row.branchHash === bh,
 			);

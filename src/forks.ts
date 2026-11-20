@@ -41,8 +41,10 @@ export const FORK_GATES = {
 	/** Bytes buffered from one fork commit's git show output (each pipe); a larger patch
 	 * is truncated, never buffered whole (OTTR-998). */
 	MAX_PATCH_BYTES: 256 * 1024,
-	/** Commits plus merges collected per range run; rev-list order is newest first, so
-	 * the newest work wins when a range carries more. */
+	/** Commits plus merges collected per range run. The cap bounds board memory: the
+	 * oldest commits of each branch's range are kept, the newest tail is reported as
+	 * skipped, and the watcher parks that branch's cursor on its newest kept commit, so
+	 * the tail rides the next run's window instead of being lost. */
 	MAX_RANGE_COMMITS: 100,
 } as const;
 
@@ -376,6 +378,11 @@ function parseShow(out: string): {
  * entry (ascending `n`) that covers them, keyed by branch hash; released shas ride the range
  * as extra commits, and the ones the upstream intersection drops land in `filteredReleased`.
  * Coverage uses the cache refs `prRef(n)`, which the watcher fetched beforehand.
+ *
+ * The range cap keeps the OLDEST commits of each branch's range: the run's evidence is a
+ * suffix window (analyzedHead...head), so only a newest-tail cut defers. `keptHead` carries
+ * the newest kept sha per branch — the cursor the watcher parks the branch on — and
+ * `skipped` carries the deferred tail per branch for the next run to re-list.
  */
 export async function collectRange(o: {
 	cachePath: string;
@@ -397,6 +404,11 @@ export async function collectRange(o: {
 	holds: Map<string, Array<{ sha: string; pr: number; prHead: string }>>;
 	/** Released shas per branch hash that the upstream intersection dropped. */
 	filteredReleased: Map<string, string[]>;
+	/** Newest kept commit sha per branch hash: the watcher parks that branch's cursor
+	 * here when the cap cut the branch's newest tail. */
+	keptHead: Map<string, string>;
+	/** Shas per branch hash the cap skipped; the next run's window re-lists them. */
+	skipped: Map<string, string[]>;
 }> {
 	const { cachePath, mainPath, fork, branches, git } = o;
 	const holds = new Map<
@@ -437,6 +449,16 @@ export async function collectRange(o: {
 	const bySha = new Map<string, ForkCommit>();
 	const commits: ForkCommit[] = [];
 	const merges: ForkCommit[] = [];
+	// Newest kept commit sha per branch hash: the watcher parks the branch cursor here
+	// when the cap cut the branch's newest tail, so the tail rides the next window.
+	const keptHead = new Map<string, string>();
+	// Shas per branch hash the cap skipped; the next run's window re-lists them.
+	const skipped = new Map<string, string[]>();
+	const markSkipped = (branchHash: string, sha: string) => {
+		const list = skipped.get(branchHash);
+		if (list) list.push(sha);
+		else skipped.set(branchHash, [sha]);
+	};
 	for (const b of branches) {
 		const raw = await rawRange(
 			cachePath,
@@ -512,17 +534,24 @@ export async function collectRange(o: {
 		holds.set(b.branchHash, branchHolds);
 		if (branchFiltered.length > 0)
 			filteredReleased.set(b.branchHash, branchFiltered);
-		for (const sha of shas) {
+		// Oldest first, so the cap cuts the branch's NEWEST tail: the next run's window
+		// (analyzedHead...head) is a suffix window and can only ever re-list commits
+		// newer than the cursor, so an oldest-first cut defers; a newest-first cut in
+		// this window is unreachable forever.
+		for (const sha of [...shas].reverse()) {
 			const existing = bySha.get(sha);
 			if (existing) {
 				if (!existing.branches.includes(b.branch))
 					existing.branches.push(b.branch);
+				keptHead.set(b.branchHash, sha);
 				continue;
 			}
 			// Holds attribution above stays complete; past the cap only the model evidence
-			// (the newest commits' patches) stops being collected.
-			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS)
+			// stops growing, and the skipped tail is reported for the next run.
+			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS) {
+				markSkipped(b.branchHash, sha);
 				continue;
+			}
 			const r = await git(
 				[
 					"show",
@@ -561,15 +590,20 @@ export async function collectRange(o: {
 			bySha.set(sha, commit);
 			commits.push(commit);
 			if (!commit.branches.includes(b.branch)) commit.branches.push(b.branch);
+			keptHead.set(b.branchHash, sha);
 		}
-		for (const sha of mergeShas) {
-			if (bySha.has(sha)) {
-				const m = bySha.get(sha)!;
+		// Same oldest-first cut for merges, so a merge tail also defers to the next run.
+		for (const sha of [...mergeShas].reverse()) {
+			const m = bySha.get(sha);
+			if (m) {
 				if (!m.branches.includes(b.branch)) m.branches.push(b.branch);
+				keptHead.set(b.branchHash, sha);
 				continue;
 			}
-			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS)
+			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS) {
+				markSkipped(b.branchHash, sha);
 				continue;
+			}
 			let r = await git(
 				["show", "--remerge-diff", "--format=%H%x00%s", sha],
 				cachePath,
@@ -586,7 +620,7 @@ export async function collectRange(o: {
 			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
 			const p = parseShow(r.stdout);
 			if (!p) continue;
-			const m: ForkCommit = {
+			const merge: ForkCommit = {
 				sha,
 				subject: p.subject,
 				files: 0,
@@ -595,8 +629,9 @@ export async function collectRange(o: {
 				patch: p.patch,
 				branches: [b.branch],
 			};
-			bySha.set(sha, m);
-			merges.push(m);
+			bySha.set(sha, merge);
+			merges.push(merge);
+			keptHead.set(b.branchHash, sha);
 		}
 	}
 
@@ -654,6 +689,8 @@ export async function collectRange(o: {
 		},
 		holds,
 		filteredReleased,
+		keptHead,
+		skipped,
 	};
 }
 
@@ -1202,6 +1239,8 @@ export function createForkWatcher(deps: {
 						range,
 						holds: newHolds,
 						filteredReleased,
+						keptHead,
+						skipped,
 					} = await collectRange({
 						cachePath,
 						mainPath: project.path,
@@ -1301,6 +1340,10 @@ export function createForkWatcher(deps: {
 					const result = await analyze(range, await buildPrior(store));
 					// Step 10: cursors and the consumed released rows.
 					const covered = new Set(result.commits);
+					const skippedTotal = [...skipped.values()].reduce(
+						(n, l) => n + l.length,
+						0,
+					);
 					const analyzed: Array<{
 						forkId: number;
 						branchHash: string;
@@ -1308,16 +1351,23 @@ export function createForkWatcher(deps: {
 						at: number;
 						consumed?: string[];
 					}> = [];
-					if (result.deferred.length > 0)
+					if (result.deferred.length > 0 || skippedTotal > 0)
 						deps.log(
-							`forks: ${fork.owner}/${fork.name}: deferred ${result.deferred.length} commit(s), cursor stays on the last covered sha`,
+							`forks: ${fork.owner}/${fork.name}: ${result.deferred.length} deferred by the model, ${skippedTotal} past the range cap; held branches stay on their kept commits`,
 						);
 					for (const h of range.heads) {
 						const branchCommits = range.commits.filter((c) =>
 							c.branches.includes(h.branch),
 						);
+						const branchSkipped = skipped.get(h.branchHash) ?? [];
 						let cursor: string;
-						if (branchCommits.length === 0) {
+						if (branchSkipped.length > 0) {
+							// The cap cut this branch's newest tail: park the cursor on the newest
+							// kept commit, so the tail rides the next run's window.
+							const kept = keptHead.get(h.branchHash);
+							if (kept === undefined) continue; // nothing kept: retried next run
+							cursor = kept;
+						} else if (branchCommits.length === 0) {
 							// The branch's work is all held: forward to the observed head.
 							cursor = h.head;
 						} else if (result.deferred.length > 0) {
