@@ -592,6 +592,149 @@ describe("collectRange", () => {
 		expect(keptHead.get(bh2)).toBeUndefined();
 		expect(keptHead.get(bh1)).toBe(featShas[FORK_GATES.MAX_RANGE_COMMITS - 1]);
 	}, 120_000);
+
+	// A real --no-ff merge in the middle of the range: the merge is OLDER than kept
+	// work that descends from it, so a per-list cap cut would lose it for good.
+	test("keeps a mid-range merge past the cap and defers only the newest tail", async () => {
+		const main = await initUpstream("cr-mmerge-main");
+		const fork = mkRepo("cr-mmerge-fork");
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		for (let i = 0; i < 60; i++)
+			await run(["commit", "-q", "--allow-empty", "-m", `pre${i}`, fork], fork);
+		await run(["checkout", "-q", "-b", "side", fork], fork);
+		writeFileSync(join(fork, "side.txt"), "side work\n");
+		await run(["add", "side.txt", fork], fork);
+		await run(["commit", "-q", "-m", "side work", fork], fork);
+		const sideSha = await shaOf(fork);
+		await run(["checkout", "-q", "feat", fork], fork);
+		await run(
+			["merge", "-q", "--no-ff", "-m", "merge side", "side", fork],
+			fork,
+		);
+		const mergeSha = await shaOf(fork);
+		const post: string[] = [];
+		for (let i = 0; i < 41; i++) {
+			await run(
+				["commit", "-q", "--allow-empty", "-m", `post${i}`, fork],
+				fork,
+			);
+			post.push(await shaOf(fork));
+		}
+		const head = await shaOf(fork);
+		const bh = branchHash("feat");
+		const cachePath = join(root, "cr-mmerge-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[`+refs/heads/feat:refs/heads/${bh}`],
+			localFileGit(fork),
+		);
+		// 60 pre + 1 side + 1 merge + 41 post = 103 candidates; the cap keeps the oldest
+		// 100 in commit order, so the merge sits inside them and the tail is post-only.
+		const first = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
+			git: defaultGit,
+		});
+		expect(first.range.merges.map((c) => c.sha)).toEqual([mergeSha]);
+		expect(first.range.commits.some((c) => c.sha === sideSha)).toBe(true);
+		expect(first.skipped.get(bh)).toEqual(post.slice(38));
+		expect(first.keptHead.get(bh)).toBe(post[37]);
+		// The parked cursor is the newest kept commit: the next window re-lists exactly
+		// the skipped tail and never the merge or any kept commit.
+		const second = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bh,
+					branch: "feat",
+					head,
+					analyzedHead: first.keptHead.get(bh)!,
+				},
+			],
+			git: defaultGit,
+		});
+		expect(second.range.commits.map((c) => c.sha)).toEqual(post.slice(38));
+		expect(second.range.merges).toEqual([]);
+		expect(second.skipped.get(bh) ?? []).toEqual([]);
+	}, 120_000);
+
+	test("parks the cursor on the newest kept commit even when that is a merge", async () => {
+		const main = await initUpstream("cr-mcursor-main");
+		const fork = mkRepo("cr-mcursor-fork");
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		for (let i = 0; i < 98; i++)
+			await run(["commit", "-q", "--allow-empty", "-m", `e${i}`, fork], fork);
+		// Two side-branch merges stacked on top: 98 empties + S1 + M1 + S2 + M2 = 102
+		// candidates; the cap keeps the oldest 100, so M1 is the newest kept point.
+		await run(["checkout", "-q", "-b", "side1", fork], fork);
+		writeFileSync(join(fork, "side1.txt"), "one\n");
+		await run(["add", "side1.txt", fork], fork);
+		await run(["commit", "-q", "-m", "side one", fork], fork);
+		await run(["checkout", "-q", "feat", fork], fork);
+		await run(
+			["merge", "-q", "--no-ff", "-m", "merge one", "side1", fork],
+			fork,
+		);
+		const merge1Sha = await shaOf(fork);
+		await run(["checkout", "-q", "-b", "side2", fork], fork);
+		writeFileSync(join(fork, "side2.txt"), "two\n");
+		await run(["add", "side2.txt", fork], fork);
+		await run(["commit", "-q", "-m", "side two", fork], fork);
+		const side2Sha = await shaOf(fork);
+		await run(["checkout", "-q", "feat", fork], fork);
+		await run(
+			["merge", "-q", "--no-ff", "-m", "merge two", "side2", fork],
+			fork,
+		);
+		const merge2Sha = await shaOf(fork);
+		const head = await shaOf(fork);
+		const bh = branchHash("feat");
+		const cachePath = join(root, "cr-mcursor-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[`+refs/heads/feat:refs/heads/${bh}`],
+			localFileGit(fork),
+		);
+		const first = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
+			git: defaultGit,
+		});
+		// The merge is kept and IS the cursor: a last-write-in-a-loop cursor would park
+		// on an older non-merge (re-analyzing kept work) or drop the merge entirely.
+		expect(first.range.merges.map((c) => c.sha)).toEqual([merge1Sha]);
+		expect(first.keptHead.get(bh)).toBe(merge1Sha);
+		expect(first.skipped.get(bh)).toEqual([side2Sha, merge2Sha]);
+		const second = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bh,
+					branch: "feat",
+					head,
+					analyzedHead: first.keptHead.get(bh)!,
+				},
+			],
+			git: defaultGit,
+		});
+		expect(second.range.merges.map((c) => c.sha)).toEqual([merge2Sha]);
+		expect(second.range.commits.map((c) => c.sha)).toEqual([side2Sha]);
+		expect(second.skipped.get(bh) ?? []).toEqual([]);
+	}, 120_000);
 });
 
 describe("watcher", () => {

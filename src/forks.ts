@@ -259,14 +259,21 @@ async function revList(
 	return r.stdout.split("\n").filter(Boolean);
 }
 
-/** Raw range of one branch, no PR excludes: the shas, the merges, and the upstream-side list. */
+/** Raw range of one branch, no PR excludes: the shas, the merges, and the upstream-side list.
+ * `all` is the whole window in topological order (descendants first), the order the
+ * collection pass walks oldest-first so a cap cut always lands on the newest tail. */
 async function rawRange(
 	cachePath: string,
 	analyzedHead: string | null,
 	head: string,
 	upstreamHead: string,
 	git: GitFn,
-): Promise<{ shas: string[]; merges: string[]; up: Set<string> }> {
+): Promise<{
+	shas: string[];
+	merges: string[];
+	up: Set<string>;
+	all: string[];
+}> {
 	const base = analyzedHead ?? upstreamHead;
 	const fromAnalysis = await revList(
 		["--no-merges", "--cherry-pick", "--right-only", `${base}...${head}`],
@@ -294,7 +301,12 @@ async function rawRange(
 		cachePath,
 		git,
 	);
-	return { shas, merges, up };
+	const all = await revList(
+		["--topo-order", `${base}..${head}`],
+		cachePath,
+		git,
+	);
+	return { shas, merges, up, all };
 }
 
 /**
@@ -534,11 +546,20 @@ export async function collectRange(o: {
 		holds.set(b.branchHash, branchHolds);
 		if (branchFiltered.length > 0)
 			filteredReleased.set(b.branchHash, branchFiltered);
-		// Oldest first, so the cap cuts the branch's NEWEST tail: the next run's window
-		// (analyzedHead...head) is a suffix window and can only ever re-list commits
-		// newer than the cursor, so an oldest-first cut defers; a newest-first cut in
-		// this window is unreachable forever.
-		for (const sha of [...shas].reverse()) {
+		// One collection pass over a single commit-order walk, merges and non-merges
+		// interleaved as git topo-orders them: the cap keeps the first MAX_RANGE_COMMITS
+		// and skips the newest tail. Two separate loops cannot do this: their lists are
+		// separate rev-list outputs, so "last kept" is not the newest kept point, and a
+		// shared counter cuts merges behind kept work that descends from them. On one
+		// topological walk every skipped sha is newer than the parked cursor, so the
+		// suffix window (analyzedHead...head) re-lists exactly the skipped tail.
+		const survivor = new Set([...shas, ...mergeShas]);
+		const mergeSet = new Set(mergeShas);
+		const inWalk = raw.all.filter((s) => survivor.has(s));
+		const walked = new Set(inWalk);
+		// Released extras can sit outside the window; they ride first, as they always did.
+		const order = [...shas.filter((s) => !walked.has(s)), ...inWalk.reverse()];
+		for (const sha of order) {
 			const existing = bySha.get(sha);
 			if (existing) {
 				if (!existing.branches.includes(b.branch))
@@ -552,26 +573,36 @@ export async function collectRange(o: {
 				markSkipped(b.branchHash, sha);
 				continue;
 			}
-			const r = await git(
-				[
-					"show",
-					"--format=%H%x00%s",
-					"--numstat",
-					"--patch",
-					"--no-textconv",
-					"--no-ext-diff",
-					sha,
-				],
+			const asMerge = mergeSet.has(sha);
+			let r = await git(
+				asMerge
+					? ["show", "--remerge-diff", "--format=%H%x00%s", sha]
+					: [
+							"show",
+							"--format=%H%x00%s",
+							"--numstat",
+							"--patch",
+							"--no-textconv",
+							"--no-ext-diff",
+							sha,
+						],
 				cachePath,
 				60_000,
 				FORK_GATES.MAX_PATCH_BYTES,
 			);
+			if (r.code !== 0 && asMerge)
+				r = await git(
+					["show", "--format=%H%x00%s", "--cc", sha],
+					cachePath,
+					60_000,
+					FORK_GATES.MAX_PATCH_BYTES,
+				);
 			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
 			const p = parseShow(r.stdout);
 			if (!p) continue;
-			const numstat = r.stdout
-				.split("\n")
-				.filter((l) => /^(\d+|-)\t(\d+|-)\t/.test(l));
+			const numstat = asMerge
+				? []
+				: r.stdout.split("\n").filter((l) => /^(\d+|-)\t(\d+|-)\t/.test(l));
 			const n = (i: number) =>
 				numstat.reduce(
 					(a, l) =>
@@ -588,49 +619,9 @@ export async function collectRange(o: {
 				branches: [],
 			};
 			bySha.set(sha, commit);
-			commits.push(commit);
+			if (asMerge) merges.push(commit);
+			else commits.push(commit);
 			if (!commit.branches.includes(b.branch)) commit.branches.push(b.branch);
-			keptHead.set(b.branchHash, sha);
-		}
-		// Same oldest-first cut for merges, so a merge tail also defers to the next run.
-		for (const sha of [...mergeShas].reverse()) {
-			const m = bySha.get(sha);
-			if (m) {
-				if (!m.branches.includes(b.branch)) m.branches.push(b.branch);
-				keptHead.set(b.branchHash, sha);
-				continue;
-			}
-			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS) {
-				markSkipped(b.branchHash, sha);
-				continue;
-			}
-			let r = await git(
-				["show", "--remerge-diff", "--format=%H%x00%s", sha],
-				cachePath,
-				60_000,
-				FORK_GATES.MAX_PATCH_BYTES,
-			);
-			if (r.code !== 0)
-				r = await git(
-					["show", "--format=%H%x00%s", "--cc", sha],
-					cachePath,
-					60_000,
-					FORK_GATES.MAX_PATCH_BYTES,
-				);
-			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
-			const p = parseShow(r.stdout);
-			if (!p) continue;
-			const merge: ForkCommit = {
-				sha,
-				subject: p.subject,
-				files: 0,
-				plus: 0,
-				minus: 0,
-				patch: p.patch,
-				branches: [b.branch],
-			};
-			bySha.set(sha, merge);
-			merges.push(merge);
 			keptHead.set(b.branchHash, sha);
 		}
 	}
