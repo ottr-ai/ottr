@@ -45,9 +45,11 @@ docs/specs/microvm-validation-mode.md. One VM runs one validation job:
   mounts fails with `EROFS`, and the job runs as `nobody`;
 - the job env is a fixed allowlist of three variables (`PATH`, `HOME`, `LANG`),
   never the request env;
-- limits are fixed constants: 1 vCPU, 512 MiB memory, 1 GiB scratch, 256
+- limits are fixed constants: 1 vCPU, 2048 MiB memory, 1 GiB scratch, 256
   processes (`RLIMIT_NPROC`), no core dumps, a 1 GiB file-size rlimit, and a
-  10-minute job timeout under a runner-side VM lifetime cap;
+  10-minute job timeout under a runner-side VM lifetime cap (the memory rose
+  from 512 MiB in OTTR-1167: a browser job needs the headroom; the value is a
+  floor, not a control);
 - the job spec and its result cross on drives only: the input on the scratch
   ext4, the result on a raw drive whose device node the job cannot write
   (`0600 root:root`). The trusted guest code runs a self-check of every control

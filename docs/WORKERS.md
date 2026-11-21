@@ -1178,7 +1178,9 @@ cmdline). The job env is exactly `PATH`, `HOME`, `LANG`. The overlay root mounts
 lower-only, so a write anywhere outside the scratch bind mounts fails with
 `EROFS`, and the job runs as `nobody`. The target crosses in as a tar and lands
 on a read-only ext4 drive; the toolchain is the read-only base and layer drives.
-The limits are fixed: 1 vCPU, 512 MiB memory, 1 GiB scratch, 256 processes
+The limits are fixed: 1 vCPU, 2048 MiB memory (a floor, not a control: 512 MiB
+could not start Chrome's renderer, so browser leads stayed blocked — OTTR-1167),
+1 GiB scratch, 256 processes
 (`RLIMIT_NPROC`), no core dumps, a 1 GiB file-size rlimit, and a 10-minute
 timeout. The guest's self-check proves each control before the job runs; on a
 failed check the job never runs and the result names the missing control.

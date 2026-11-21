@@ -8,20 +8,25 @@ import {
 } from "bun:test";
 import {
 	existsSync,
+	linkSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	type GitSpawn,
 	newJobId,
+	type ProcSpawn,
 	runSandboxJob,
 	runSandboxViaBoard,
 	sandboxRequestError,
 } from "./sandboxRun.ts";
+import { readTar } from "./vmRunner.ts";
 import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 
 const TAR = new Uint8Array([0x1f, 0x8b, 8, 0, 1, 2, 3, 4]);
@@ -68,7 +73,7 @@ const jobEnv = (url = "http://vm-runner:8080///"): NodeJS.ProcessEnv => ({
 	OTTR_DATA_DIR: ambientDataRoot,
 });
 
-const spawnOk: GitSpawn = async () => ({ code: 0, stdout: TAR, stderr: "" });
+const spawnOk: ProcSpawn = async () => ({ code: 0, stdout: TAR, stderr: "" });
 
 const guestResponse: ValidateResponse = {
 	id: "val-1763000000-cafebabe",
@@ -148,17 +153,22 @@ describe("runSandboxJob", () => {
 		const root = tmpRoot();
 		const { fetchImpl, seen } = fakeFetch(200, JSON.stringify(guestResponse));
 		const spawned: string[][] = [];
-		const spawnImpl: GitSpawn = async (argv) => {
+		const spawnImpl: ProcSpawn = async (argv) => {
 			spawned.push(argv);
 			return { code: 0, stdout: TAR, stderr: "" };
 		};
+		// A checkout without an installed node_modules, on every machine: the
+		// packing below appends the tree only when the checkout has one, so the
+		// spawn sequence here must not depend on the host's own installs.
+		const checkout = join(root, "checkout");
+		mkdirSync(checkout, { recursive: true });
 		const res = await runSandboxJob({
 			project: "ottr",
 			ref: "main",
 			argv: ["bun", "test", "src/parse.ts"],
 			cwd: "/target/src",
 			collect: ["tmp/poc.txt"],
-			checkout: "/workspace/ottr",
+			checkout,
 			fetchImpl,
 			spawnImpl,
 			env: jobEnv(),
@@ -166,9 +176,7 @@ describe("runSandboxJob", () => {
 			idFactory: () => "val-1763000000-cafebabe",
 		});
 		expect(res.ok).toBe(true);
-		expect(spawned).toEqual([
-			["git", "-C", "/workspace/ottr", "archive", "--", "main"],
-		]);
+		expect(spawned).toEqual([["git", "-C", checkout, "archive", "--", "main"]]);
 		expect(seen.length).toBe(1);
 		const call = seen[0]!;
 		// Trailing slashes come off the runner URL.
@@ -205,6 +213,186 @@ describe("runSandboxJob", () => {
 		expect(new Uint8Array(readFileSync(body.targetTar))).toEqual(TAR);
 		if (!res.ok) throw new Error("expected the runner's answer");
 		expect(res.result.resultSource).toBe("guest");
+	});
+
+	test("packs the checkout's installed node_modules after the tree (OTTR-1167)", async () => {
+		const root = tmpRoot();
+		const checkout = join(root, "checkout");
+		mkdirSync(join(checkout, "node_modules", "pkg"), { recursive: true });
+		writeFileSync(join(checkout, "package.json"), '{"name":"p"}\n');
+		// A plain file, a symlink (bun's .bin layout), and two hard links (bun
+		// installs hard-link files from its cache).
+		writeFileSync(join(checkout, "node_modules", "pkg", "native.node"), "BIN");
+		symlinkSync(
+			"pkg/native.node",
+			join(checkout, "node_modules", "pkg", "link"),
+		);
+		const hardFirst = join(checkout, "node_modules", "pkg", "a.bin");
+		writeFileSync(hardFirst, "AAA");
+		linkSync(hardFirst, join(checkout, "node_modules", "pkg", "b.bin"));
+
+		const { fetchImpl, seen } = fakeFetch(200, JSON.stringify(guestResponse));
+		const spawned: string[][] = [];
+		// The fake archive stands in for git; the real tar binary does the append,
+		// so the assertions below prove the packed bytes with the runner's own
+		// reader, not a call shape alone.
+		const archive = Bun.spawnSync([
+			"tar",
+			"--create",
+			"--directory",
+			checkout,
+			"package.json",
+		]);
+		const archiveBytes = new Uint8Array(archive.stdout);
+		const spawnImpl: ProcSpawn = async (argv) => {
+			spawned.push(argv);
+			if (argv[0] === "git")
+				return { code: 0, stdout: archiveBytes, stderr: "" };
+			const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+			const stderr = await new Response(proc.stderr).text();
+			return { code: await proc.exited, stdout: new Uint8Array(), stderr };
+		};
+		const res = await runSandboxJob({
+			project: "ottr",
+			argv: ["true"],
+			checkout,
+			fetchImpl,
+			spawnImpl,
+			env: jobEnv(),
+			dataRoot: root,
+			idFactory: () => "val-1763000000-nmpack",
+		});
+		expect(res.ok).toBe(true);
+		expect(spawned).toEqual([
+			["git", "-C", checkout, "archive", "--", "HEAD"],
+			[
+				"tar",
+				"--append",
+				"--file",
+				join(
+					root,
+					"ottr",
+					"validate-jobs",
+					"val-1763000000-nmpack",
+					"target.tar",
+				),
+				"--hard-dereference",
+				"--directory",
+				checkout,
+				"node_modules",
+			],
+		]);
+		const packed = join(
+			root,
+			"ottr",
+			"validate-jobs",
+			"val-1763000000-nmpack",
+			"target.tar",
+		);
+		const members = new Map<
+			string,
+			{ type: string; bytes?: Uint8Array; linkname?: string }
+		>();
+		await readTar(Bun.file(packed).stream(), async (m, data) => {
+			if (m.type === "0") {
+				const chunks: Uint8Array[] = [];
+				for await (const c of data) chunks.push(c);
+				const all = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
+				let off = 0;
+				for (const c of chunks) {
+					all.set(c, off);
+					off += c.length;
+				}
+				members.set(m.name, { type: m.type, bytes: all });
+			} else {
+				members.set(m.name, { type: m.type, linkname: m.linkname });
+			}
+		});
+		// The tracked tree stays first, the dependency tree follows it.
+		expect(members.get("package.json")?.type).toBe("0");
+		const text = (name: string): string =>
+			Buffer.from(members.get(name)!.bytes!).toString("utf8");
+		expect(text("node_modules/pkg/native.node")).toBe("BIN");
+		// Hard links arrived as dereferenced regular files: the runner's reader
+		// skips hard-link members, so a stored link would lose the file.
+		expect(members.get("node_modules/pkg/a.bin")?.type).toBe("0");
+		expect(members.get("node_modules/pkg/b.bin")?.type).toBe("0");
+		expect(text("node_modules/pkg/a.bin")).toBe("AAA");
+		expect(text("node_modules/pkg/b.bin")).toBe("AAA");
+		// A symlink stays a link, stored un-followed like the runner unpacks it.
+		expect(members.get("node_modules/pkg/link")).toEqual({
+			type: "2",
+			linkname: "pkg/native.node",
+		});
+		expect(seen.length).toBe(1);
+	});
+
+	test("a checkout without node_modules packs the bare tree and spawns no tar", async () => {
+		const root = tmpRoot();
+		const checkout = join(root, "checkout");
+		mkdirSync(checkout, { recursive: true });
+		const { fetchImpl, seen } = fakeFetch(200, JSON.stringify(guestResponse));
+		const spawned: string[][] = [];
+		const archiveBytes = new Uint8Array([1, 2, 3, 4]);
+		const res = await runSandboxJob({
+			project: "ottr",
+			argv: ["true"],
+			checkout,
+			fetchImpl,
+			spawnImpl: async (argv) => {
+				spawned.push(argv);
+				return { code: 0, stdout: archiveBytes, stderr: "" };
+			},
+			env: jobEnv(),
+			dataRoot: root,
+			idFactory: () => "val-1763000000-nonm",
+		});
+		expect(res.ok).toBe(true);
+		expect(spawned).toEqual([["git", "-C", checkout, "archive", "--", "HEAD"]]);
+		// No runner call, and the packed tar is the archive alone, byte for byte.
+		expect(seen.length).toBe(1);
+		expect(
+			new Uint8Array(
+				readFileSync(
+					join(
+						root,
+						"ottr",
+						"validate-jobs",
+						"val-1763000000-nonm",
+						"target.tar",
+					),
+				),
+			),
+		).toEqual(archiveBytes);
+	});
+
+	test("a failed tar append fails the job before any runner call", async () => {
+		const root = tmpRoot();
+		const checkout = join(root, "checkout");
+		mkdirSync(join(checkout, "node_modules"), { recursive: true });
+		const { fetchImpl, seen } = fakeFetch(200, JSON.stringify(guestResponse));
+		const res = await runSandboxJob({
+			project: "ottr",
+			argv: ["true"],
+			checkout,
+			fetchImpl,
+			spawnImpl: async (argv) =>
+				argv[0] === "tar"
+					? {
+							code: 2,
+							stdout: new Uint8Array(),
+							stderr: "tar: node_modules: Cannot open\n",
+						}
+					: { code: 0, stdout: TAR, stderr: "" },
+			env: jobEnv(),
+			dataRoot: root,
+		});
+		if (res.ok) throw new Error("expected a refusal");
+		expect(res.error).toContain("tar append of node_modules failed");
+		expect(res.error).toContain("exit 2");
+		expect(res.error).toContain("Cannot open");
+		// A job whose dependencies could not pack must not run half-packed.
+		expect(seen.length).toBe(0);
 	});
 
 	test("defaults cwd to /target and omits an empty collect", async () => {

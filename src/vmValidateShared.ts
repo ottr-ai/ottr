@@ -12,8 +12,11 @@ import type { ProvisionLists } from "./workers.ts";
 export const VM_VALIDATE = {
 	/** Firecracker machine-config vcpu_count. */
 	vcpus: 1,
-	/** Firecracker machine-config mem_size_mib. */
-	memMiB: 512,
+	/** Firecracker machine-config mem_size_mib. 512 MiB could not start Chrome's
+	 * renderer: V8 process OOM reserving the CodeRange, then every CDP command
+	 * timed out (OTTR-1167, the VELV-245 block). 2048 MiB runs the browser
+	 * oracle; the 1 vCPU, process, file and time caps stay. */
+	memMiB: 2048,
 	/** The scratch disk's size in bytes (the job's whole writable space). */
 	diskBytes: 1024 ** 3,
 	/** RLIMIT_NPROC on the job. */

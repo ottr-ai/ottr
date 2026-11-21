@@ -92,12 +92,18 @@ Fixed constants of the validation mode (no request knobs, no runner env):
 | Limit | Where enforced | Value |
 | --- | --- | --- |
 | vCPUs | Firecracker `machine-config` | 1 |
-| memory | Firecracker `machine-config` | 512 MiB |
+| memory | Firecracker `machine-config` | 2048 MiB |
 | disk | the scratch disk is a fixed-size block device | 1 GiB |
 | processes | `RLIMIT_NPROC` on the job | 256 |
 | core dumps | `RLIMIT_CORE` on the job | 0 |
 | file size | `RLIMIT_FSIZE` on the job | 1 GiB |
 | time | the guest kills the job at 600 s; the runner kills the VM at 600 s + boot slack (180 s total cap) | 10 minutes |
+
+The 2048 MiB value is a floor, not a control: 512 MiB could not start Chrome
+for Testing's renderer (V8 process OOM reserving the CodeRange, then every CDP
+command timed out), which left every browser lead blocked without proving
+anything (OTTR-1167). The vCPU, process, file-size and time caps stay as the
+controls they were.
 
 ## Guest flow (`docker/ottr-vm-init`, guest agent)
 
@@ -196,7 +202,7 @@ image bytes, parse the result, and answer JSON:
   "missingControl": null,
   "job": { "exitCode": 1, "timedOut": false, "stdoutTail": "...", "stderrTail": "..." },
   "artifacts": [],
-  "limits": { "vcpus": 1, "memMiB": 512, "diskBytes": 1073741824, "maxProcesses": 256, "timeoutSec": 600 },
+  "limits": { "vcpus": 1, "memMiB": 2048, "diskBytes": 1073741824, "maxProcesses": 256, "timeoutSec": 600 },
   "bootMs": 812,
   "totalMs": 9400,
   "logTail": "…last serial output…",
@@ -264,8 +270,16 @@ through the board like `propose_task`:
   - a gitless project gets `409`, an unknown project `404`.
 - On a pass the server packs and runs the job itself (`runSandboxJob`):
   `git archive <ref>` from the project's registered checkout (`Entry.path`,
-  the path the board already tracks), the tar staged under the board's data
-  dir (`OTTR_DATA_DIR`, default `/data`) at
+  the path the board already tracks), then, when the checkout has an installed
+  `node_modules`, the same tar gains that tree (`tar --append
+  --hard-dereference`): the sandbox has no network, no package cache, and the
+  baked project layer installs apt and pip lists only, so `/target/node_modules`
+  is the only way a job resolves a project dependency (OTTR-1167). bun installs
+  hard-link files from its cache and the runner's tar reader skips hard-link
+  members, so the append dereferences them; the tree comes from the working
+  install, so it can skew the packed `ref`. A failed append fails the job, and a
+  missing `node_modules` packs the bare tree as before. The tar staged under the
+  board's data dir (`OTTR_DATA_DIR`, default `/data`) at
   `/data/<project>/validate-jobs/<id>/target.tar`, then `POST /validate` with
   the server's own `OTTR_WORKER_TOKEN`. The runner request carries that token
   on the wire only, server-side to server-side.
@@ -293,7 +307,7 @@ retains from `result.json`.
 
 1. Fake-launcher test: a `POST /validate` builds a VM config with **no
    `"network-interfaces"` entry**, read-only target and toolchain drives, the
-   raw result drive, and the fixed limits set (1 vCPU, 512 MiB, 1 GiB scratch,
+   raw result drive, and the fixed limits set (1 vCPU, 2048 MiB, 1 GiB scratch,
    `ottr.mode=validate` on the cmdline).
 2. Test: a failed self-check stops the job (no job spawn) and returns the result
    with the missing control named.
@@ -343,8 +357,10 @@ retains from `result.json`.
   the three bugs OTTR-887 owns. A layer bake inside a validate run can trip the
   dirty-journal bug; the answer then says `resultSource: "absent"` with that
   tail, which is the honest result, not a mode defect.
-- The fixed 512 MiB guest RAM and 1 GiB scratch have not booted on real
-  hardware yet; the host run of the smoke script is their first measurement.
+- The fixed 512 MiB guest RAM and 1 GiB scratch booted on the host in the
+  VELV-230 validation run (VELV-247), but 512 MiB could not run a browser: the
+  guest RAM is now 2048 MiB (OTTR-1167), and the 2 GiB figure has one real
+  browser run's worth of evidence (the VELV-230 retry).
 - `mkfs.ext4 -d` needs e2fsprogs with the `-d` populate option (>= 1.43); verify
   the version in the `vm-runner` image on the host.
 - The target ext4 is built from a tar the caller controls: the safe-unpack rules

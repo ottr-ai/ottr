@@ -3,7 +3,8 @@
  * (docs/specs/microvm-validation-mode.md, "Board endpoint and tool"). The
  * tool (extension/tracker.ts) POSTs its args to the board's sandbox endpoint
  * with the run's own credential (runSandboxViaBoard); the board's server
- * packs the target checkout with git archive, writes the tar under the run
+ * packs the target checkout with git archive plus the checkout's installed
+ * node_modules (OTTR-1167), writes the tar under the run
  * dir, and POSTs the runner's /validate with its own token (runSandboxJob).
  * The endpoint caps the job and the VM at VM_VALIDATE.timeoutSec +
  * lifetimeSlackSec and answers after both, so neither client sets a timeout
@@ -13,6 +14,7 @@
  * network or /data.
  */
 import { randomBytes } from "node:crypto";
+import { lstatSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { childDatabaseEnv } from "./childEnv.ts";
@@ -30,12 +32,13 @@ export const PROJECT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 /** The job cwd's root in the guest; the runner takes only paths at or under it. */
 const TARGET_ROOT = "/target";
 
-/** One git spawn: the archive bytes, or the failure with its stderr. */
-export type GitSpawn = (
+/** One spawn on the job-prep path (the git archive, the tar append): the
+ * produced bytes, or the failure with its stderr. */
+export type ProcSpawn = (
 	argv: string[],
 ) => Promise<{ code: number; stdout: Uint8Array; stderr: string }>;
 
-const defaultSpawn: GitSpawn = async (argv) => {
+const defaultSpawn: ProcSpawn = async (argv) => {
 	const proc = Bun.spawn(argv, {
 		env: childDatabaseEnv(),
 		stdin: "ignore",
@@ -71,8 +74,8 @@ export interface SandboxJobOptions {
 	checkout?: string;
 	/** Defaults to globalThis.fetch. */
 	fetchImpl?: typeof fetch;
-	/** Defaults to a Bun.spawn git runner. */
-	spawnImpl?: GitSpawn;
+	/** Defaults to a Bun.spawn runner for the archive and the tar append. */
+	spawnImpl?: ProcSpawn;
 	/** Read per call; defaults to process.env. */
 	env?: NodeJS.ProcessEnv;
 	/** The run dir sits at <dataRoot>/<project>/validate-jobs/<id>; default /data. */
@@ -170,6 +173,7 @@ export async function runSandboxJob(
 	const targetTar = join(runDir, "target.tar");
 
 	const spawn = o.spawnImpl ?? defaultSpawn;
+	const checkout = o.checkout ?? join("/workspace", project);
 	// `--` ends git's option parsing: a caller-supplied ref is a tree-ish, never a
 	// flag. Without it, a value like --output=/path would truncate a host file or
 	// --remote=<host> would dial out from this process before git failed on the
@@ -177,7 +181,7 @@ export async function runSandboxJob(
 	const archive = await spawn([
 		"git",
 		"-C",
-		o.checkout ?? join("/workspace", project),
+		checkout,
 		"archive",
 		"--",
 		o.ref ?? "HEAD",
@@ -197,6 +201,42 @@ export async function runSandboxJob(
 	} catch (err) {
 		const why = err instanceof Error ? err.message : String(err);
 		return { ok: false, error: `cannot write ${targetTar} (${why})` };
+	}
+
+	// Pack the checkout's installed node_modules after the tree (OTTR-1167): the
+	// sandbox has no network, no package cache, and the baked project layer
+	// installs apt and pip lists only, so a job that imports a project
+	// dependency resolves it only from /target/node_modules. --hard-dereference
+	// matters: bun installs hard-link files from its cache, and the runner's tar
+	// reader unpacks regular files, dirs and symlinks but skips hard-link
+	// members, so a dereferenced copy is the only layout that unpacks whole.
+	// The tree comes from the checkout's working install, so it can skew the
+	// packed ref; reusing it beats leaving every dependency lead blocked.
+	const nodeModules = join(checkout, "node_modules");
+	let nmExists = false;
+	try {
+		nmExists = lstatSync(nodeModules).isDirectory();
+	} catch {
+		nmExists = false;
+	}
+	if (nmExists) {
+		const pack = await spawn([
+			"tar",
+			"--append",
+			"--file",
+			targetTar,
+			"--hard-dereference",
+			"--directory",
+			checkout,
+			"node_modules",
+		]);
+		if (pack.code !== 0) {
+			const why = pack.stderr.trim().slice(-500);
+			return {
+				ok: false,
+				error: `tar append of node_modules failed (exit ${pack.code}): ${why}`,
+			};
+		}
 	}
 
 	const request: ValidateRequest = {

@@ -1306,7 +1306,7 @@ describe("vm-runner /validate", () => {
 		expect("network-interfaces" in cfg).toBe(false);
 		expect(cfg["machine-config"]).toEqual({
 			vcpu_count: 1,
-			mem_size_mib: 512,
+			mem_size_mib: VM_VALIDATE.memMiB,
 			smt: false,
 		});
 		const drives = cfg.drives as {
@@ -1826,6 +1826,14 @@ describe("vm-runner /stats", () => {
 			const after = (await (await getStats(r.url, "tok")).json()) as StatsBody;
 			return after.vms.length === 0;
 		}, "the finished job to leave /stats");
+	});
+
+	test("the validate guest RAM stays at or above the browser floor (OTTR-1167)", () => {
+		// 512 MiB could not start Chrome's renderer: V8 process OOM reserving the
+		// CodeRange, then every CDP command timed out (VELV-245's block). A later
+		// edit that drops the constant below the floor re-blocks every browser
+		// lead, so the floor is a test, not a comment.
+		expect(VM_VALIDATE.memMiB).toBeGreaterThanOrEqual(2048);
 	});
 
 	test("vmStateDiskUsage reports allocated bytes per part and never throws on a missing tree", () => {
