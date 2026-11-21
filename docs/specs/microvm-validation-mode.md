@@ -359,8 +359,11 @@ retains from `result.json`.
   tail, which is the honest result, not a mode defect.
 - The fixed 512 MiB guest RAM and 1 GiB scratch booted on the host in the
   VELV-230 validation run (VELV-247), but 512 MiB could not run a browser: the
-  guest RAM is now 2048 MiB (OTTR-1167), and the 2 GiB figure has one real
-  browser run's worth of evidence (the VELV-230 retry).
+  renderer died on the V8 CodeRange reservation and every CDP command timed out
+  (stored results `val-1795209823-e0da9bab` and `val-1795249007-ca8a1790`). The
+  guest RAM is now 2048 MiB (OTTR-1167), a floor computed from that failure
+  envelope; no validate-mode run has executed at 2048 MiB yet, and the VELV-230
+  retry after the image roll is its first browser run.
 - `mkfs.ext4 -d` needs e2fsprogs with the `-d` populate option (>= 1.43); verify
   the version in the `vm-runner` image on the host.
 - The target ext4 is built from a tar the caller controls: the safe-unpack rules

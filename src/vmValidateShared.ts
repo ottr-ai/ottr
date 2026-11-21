@@ -14,8 +14,12 @@ export const VM_VALIDATE = {
 	vcpus: 1,
 	/** Firecracker machine-config mem_size_mib. 512 MiB could not start Chrome's
 	 * renderer: V8 process OOM reserving the CodeRange, then every CDP command
-	 * timed out (OTTR-1167, the VELV-245 block). 2048 MiB runs the browser
-	 * oracle; the 1 vCPU, process, file and time caps stay. */
+	 * timed out (OTTR-1167, the VELV-245 block; stored results
+	 * val-1795209823-e0da9bab and val-1795249007-ca8a1790). 2048 MiB is the
+	 * floor computed from that failure envelope, about 4x the RAM that refused
+	 * ~180 MiB renderer commits; no validate-mode run has executed at 2048 MiB
+	 * yet, so it carries no measured browser result. The 1 vCPU, process, file
+	 * and time caps stay. */
 	memMiB: 2048,
 	/** The scratch disk's size in bytes (the job's whole writable space). */
 	diskBytes: 1024 ** 3,
