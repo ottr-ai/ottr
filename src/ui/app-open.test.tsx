@@ -556,6 +556,22 @@ test("a cross-project lineage link switches the board to the linked card's proje
 	}
 });
 
+test("a cross-project child in its own project's window nests in the source card's lineage", async () => {
+	await mountAt("/projects/alpha/tasks/AL-2");
+	try {
+		// BE-2 rides beta's own frame (its project's Done window) and names AL-2
+		// as its source across the border: the Follow-ups branch links beta's path.
+		const kid = document.querySelector<HTMLAnchorElement>(
+			'dialog.drawer a.lineage-row[href="/projects/beta/tasks/BE-2"]',
+		);
+		expect(kid).not.toBeNull();
+		expect(kid?.textContent).toContain("Beta follow-up");
+		expect(kid?.textContent).toContain("beta");
+	} finally {
+		await unmountApp();
+	}
+});
+
 // A retro's proposal filed in another project (the OTTR-787 filing): the source
 // card's lineage still nests it, and the proposal's drawer still reads the chain.
 const pushRetroProposal = (): number => {

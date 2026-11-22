@@ -6983,6 +6983,30 @@ export async function createApp(deps: AppDeps) {
 		};
 	}
 
+	/** Every card that names `id` as its followUpOf source, across every registered
+	 * board, oldest first (OTTR-1198). Refs only — project, id, createdAt. One
+	 * listTasks per board; a board with a sick store skips its own cards and logs,
+	 * like the state build, so the rest of the lineage still renders. */
+	async function childRefsOf(
+		id: string,
+	): Promise<{ project: string; id: string; createdAt: number }[]> {
+		const refs: { project: string; id: string; createdAt: number }[] = [];
+		for (const p of deps.projects.values()) {
+			try {
+				for (const c of await p.store.listTasks())
+					if (c.followUpOf === id)
+						refs.push({
+							project: p.name,
+							id: c.id,
+							createdAt: c.createdAt,
+						});
+			} catch (err) {
+				logStoreError(p.store.name, err);
+			}
+		}
+		return refs.sort((a, b) => a.createdAt - b.createdAt);
+	}
+
 	/**
 	 * Renders a row a handler just created or updated. The 404 arm exists only for the
 	 * `Task | null` type: createTask/updateTask throw on a missing id and tasks are never
@@ -14193,6 +14217,12 @@ export async function createApp(deps: AppDeps) {
 		if (found instanceof Response) return found;
 		const { e, task } = found;
 		const view = await taskView(e, task);
+		// OTTR-1198: the Lineage rail lists every card that names this one as its
+		// source. The state's Done windows drop old children, and a child on another
+		// project's board never rides this project's frame at all, so the drawer's
+		// detail serves refs from every registered board and the drawer fetches each
+		// card from its own route (OTTR-1158's shape).
+		view.children = await childRefsOf(task.id);
 		// Done cards serve the list captured at settle (the worktree is gone, so the
 		// live read would always be []); open cards read the worktree live.
 		view.worktreeFiles =

@@ -3500,6 +3500,162 @@ describe("Drawer parent chip", () => {
 		}
 	});
 
+	test("a cross-project child outside every window loads from the detail's refs", async () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const farKid = cardFixture({
+			id: "AG-1",
+			project: "other",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Far child",
+			followUpOf: "S-1",
+			followUpOfProject: "proj",
+			createdAt: 500,
+		});
+		// Held release: the child fetch stays pending until the test releases it,
+		// so the loading row is observable.
+		const { promise: pending, resolve: release } =
+			Promise.withResolvers<Response>();
+		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
+			url.endsWith("/tasks/S-1")
+				? json({
+						...self,
+						turns: [],
+						prompt: "work",
+						summary: null,
+						details: null,
+						report: null,
+						diffFiles: null,
+						workCheckLog: [],
+						workCheckReport: null,
+						gate: null,
+						children: [{ project: "other", id: "AG-1", createdAt: 500 }],
+					})
+				: url.endsWith("/projects/other/tasks/AG-1")
+					? pending
+					: new Response("{}", { status: 404 }),
+		);
+		try {
+			await act(async () => {});
+			// The ref names the child's own board, and the fetch follows it.
+			expect(fetches).toContain("/api/projects/other/tasks/AG-1");
+			// Before the fetch lands: the id on the shared row shape. Never silence.
+			expect(container.querySelector(".lineage-gone") !== null).toBe(true);
+			expect(container.textContent).toContain("AG-1");
+			expect(container.textContent).toContain("Loading");
+			release(json({ ...farKid, turns: [] }));
+			await act(async () => {});
+			const link = container.querySelector<HTMLAnchorElement>(
+				'.lineage-rail a.lineage-row[href="/projects/other/tasks/AG-1"]',
+			);
+			expect(link !== null).toBe(true);
+			expect(link?.textContent).toContain("AG-1");
+			expect(link?.textContent).toContain("Far child");
+			expect(link?.textContent).toContain("other");
+			expect(container.querySelector(".lineage-gone")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
+	test("a child ref whose fetch 404s renders Card not found with its id", async () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const { container, fetches, close } = await mountDrawer(self, [], (url) =>
+			url.endsWith("/tasks/S-1")
+				? json({
+						...self,
+						turns: [],
+						prompt: "work",
+						summary: null,
+						details: null,
+						report: null,
+						diffFiles: null,
+						workCheckLog: [],
+						workCheckReport: null,
+						gate: null,
+						children: [{ project: "proj", id: "GONE-1", createdAt: 600 }],
+					})
+				: new Response("{}", { status: 404 }),
+		);
+		try {
+			await act(async () => {});
+			// The ref fetch ran, and the id stays visible on the row: a card that
+			// cannot be found never leaves the rail by silence.
+			expect(fetches).toContain("/api/projects/proj/tasks/GONE-1");
+			expect(container.textContent).toContain("GONE-1");
+			expect(container.textContent).toContain("Card not found");
+			const gone = container.querySelector(".lineage-gone");
+			expect(gone !== null).toBe(true);
+			// A 404 is the proof of absence: it offers no Retry button.
+			expect(gone?.querySelector("button")).toBeNull();
+		} finally {
+			await close();
+		}
+	});
+
+	test("state children and fetched refs share one branch, oldest first", async () => {
+		const self = childCard({ id: "S-1", stage: "done", state: "idle" });
+		const stateKid = cardFixture({
+			id: "K-1",
+			followUpOf: "S-1",
+			stage: "done",
+			state: "idle",
+			createdAt: 1000,
+		});
+		const oldRef = cardFixture({
+			id: "AG-0",
+			project: "other",
+			stage: "done",
+			state: "idle",
+			followUpOf: "S-1",
+			followUpOfProject: "proj",
+			createdAt: 500,
+		});
+		const newRef = cardFixture({
+			id: "AG-2",
+			project: "other",
+			stage: "done",
+			state: "idle",
+			followUpOf: "S-1",
+			followUpOfProject: "proj",
+			createdAt: 2000,
+		});
+		const { container, close } = await mountDrawer(self, [stateKid], (url) => {
+			if (url.endsWith("/tasks/S-1"))
+				return json({
+					...self,
+					turns: [],
+					prompt: "work",
+					summary: null,
+					details: null,
+					report: null,
+					diffFiles: null,
+					workCheckLog: [],
+					workCheckReport: null,
+					gate: null,
+					children: [
+						{ project: "other", id: "AG-0", createdAt: 500 },
+						{ project: "other", id: "AG-2", createdAt: 2000 },
+					],
+				});
+			if (url.endsWith("/tasks/AG-0")) return json({ ...oldRef, turns: [] });
+			if (url.endsWith("/tasks/AG-2")) return json({ ...newRef, turns: [] });
+			return new Response("{}", { status: 404 });
+		});
+		try {
+			await act(async () => {});
+			// One Follow-ups branch, filed order across the state/frame border:
+			// the older fetched ref above the state row, the younger below it.
+			const at = (id: string): number =>
+				container.textContent?.indexOf(id) ?? -1;
+			expect(at("AG-0")).toBeGreaterThanOrEqual(0);
+			expect(at("K-1")).toBeGreaterThan(at("AG-0"));
+			expect(at("AG-2")).toBeGreaterThan(at("K-1"));
+		} finally {
+			await close();
+		}
+	});
+
 	test("a parent still on the board renders as a button naming it", () => {
 		const parent = cardFixture({
 			id: "P-1",

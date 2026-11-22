@@ -10728,6 +10728,13 @@ function DrawerLineage(p: {
 	 * boardTasks). The drawer's context `tasks` list is project-scoped and would
 	 * drop a grandchild filed into another project. */
 	boardTasks: TaskCard[];
+	/** OTTR-1198: children the state's frames dropped (an older done child, or one
+	 * filed into another project's board); the detail names them and each row
+	 * fetches the card from its own tasks route. */
+	childRefs: (LineageRef & { createdAt: number })[];
+	/** Fetch entries keyed "<project>/<id>", read for a child ref's row; a missing
+	 * key reads as the row's loading state. */
+	lineageFetches: Record<string, LineageFetch>;
 	onOpenTask: (id: string, project?: string) => void;
 	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
 	 * dropped; null when the card sits in the state and nothing fetches. */
@@ -10744,6 +10751,8 @@ function DrawerLineage(p: {
 		retroSource,
 		kids,
 		boardTasks,
+		childRefs,
+		lineageFetches,
 		onOpenTask,
 		parentFetch,
 		retroFetch,
@@ -10910,12 +10919,26 @@ function DrawerLineage(p: {
 			</li>
 		);
 	};
+	// The Follow-ups rows, oldest first: the frame's tree nodes and the fetched
+	// refs merged by the filing order; a frame row wins a tie, so an in-frame
+	// child never flashes into a loading row (OTTR-1198).
+	const railRows: (
+		| { kind: "node"; node: LineageNode }
+		| { kind: "ref"; ref: LineageRef & { createdAt: number } }
+	)[] = [
+		...tree.kids.map((node) => ({ kind: "node" as const, node })),
+		...childRefs.map((ref) => ({ kind: "ref" as const, ref })),
+	].sort(
+		(a, b) =>
+			(a.kind === "node" ? a.node.card.createdAt : a.ref.createdAt) -
+			(b.kind === "node" ? b.node.card.createdAt : b.ref.createdAt),
+	);
 	return (
 		<>
 			{" "}
 			{/* Lineage rail: the parent above, this card as the filled node. Follow-ups run in
 					    parallel, so they hang one level in off this card's node, each on its own elbow. */}
-			{(row.followUpOf !== null || kids.length > 0) && (
+			{(row.followUpOf !== null || kids.length > 0 || childRefs.length > 0) && (
 				<DrawerSec id="drawer-lineage" label="Lineage" className="lineage">
 					<ol className="lineage-rail">
 						{retroSource !== null &&
@@ -10968,9 +10991,28 @@ function DrawerLineage(p: {
 								</span>
 								<span className="lineage-tag">this card</span>
 							</span>
-							{kids.length > 0 && (
+							{(kids.length > 0 || childRefs.length > 0) && (
 								<ol className="lineage-branch" aria-label="Follow-ups">
-									{tree.kids.map((k) => renderNode(k, 1))}
+									{railRows.map((e) => {
+										if (e.kind === "ref") {
+											const f =
+												lineageFetches[
+													`${e.ref.project}/${e.ref.id}`
+												] ?? null;
+											return (
+												<Fragment key={`${e.ref.project}/${e.ref.id}`}>
+													{fetchRow(
+														e.ref,
+														f,
+														f?.status === "card" && f.card.kind === "retro"
+															? "retro"
+															: "",
+													)}
+												</Fragment>
+											);
+										}
+										return renderNode(e.node, 1);
+									})}
 								</ol>
 							)}
 						</li>
@@ -14484,11 +14526,18 @@ export function Drawer({
 			: { project: retroSource.project, id: retroSource.id };
 	const lineageKey = (c: LineageRef): string => `${c.project}/${c.id}`;
 	const [lineage, setLineage] = useState<Record<string, LineageFetch>>({});
-	const loadLineage = (refs: LineageRef[]): void => {
+	// Refs this drawer mount already armed: the detail refetches while the card sits
+	// open (the row changed), so a re-run that names the same refs must not reset rows
+	// that already resolved; only the row's Retry button re-arms one.
+	const armed = useRef<Set<string>>(new Set());
+	const loadLineage = (refs: LineageRef[], force = false): void => {
 		for (const c of refs) {
+			const key = lineageKey(c);
+			if (!force && armed.current.has(key)) continue;
+			armed.current.add(key);
 			setLineage((m) => ({
 				...m,
-				[lineageKey(c)]: { status: "loading", ...c },
+				[key]: { status: "loading", ...c },
 			}));
 			void readDetail(
 				`/api/projects/${encodeURIComponent(c.project)}/tasks/${encodeURIComponent(c.id)}`,
@@ -14526,20 +14575,6 @@ export function Drawer({
 				});
 		}
 	};
-	// lineageWant encodes exactly parentRef and retroRef: the fetch restarts when the
-	// drawer's card changes or its fetched lineage lands.
-	const lineageWant = `${parentRef === null ? "" : lineageKey(parentRef)} ${retroRef === null ? "" : lineageKey(retroRef)}`;
-	useEffect(() => {
-		const refs: LineageRef[] = [];
-		if (parentRef !== null) refs.push(parentRef);
-		if (retroRef !== null) refs.push(retroRef);
-		// Empty want: this card has both lineage cards in state — drop the old fetch state.
-		if (refs.length === 0) {
-			setLineage({});
-			return;
-		}
-		loadLineage(refs);
-	}, [lineageWant]);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
 	// The whole descendant tree hangs below, one level in per card; childMap walks the
 	// loaded board once, so the rail never scans it once per level.
@@ -14581,6 +14616,8 @@ export function Drawer({
 					status: "loading",
 					...retroRef,
 				});
+	// A child ref's fetch entry (OTTR-1198) rides to DrawerLineage as the `lineage`
+	// map keyed "<project>/<id>"; a missing key reads as the row's loading state.
 	const parentCard =
 		parent ?? (parentFetch?.status === "card" ? parentFetch.card : null);
 	const retroCard =
@@ -14705,6 +14742,32 @@ export function Drawer({
 			clearTimeout(retry);
 		};
 	}, [row.project, row.id, rowKey]);
+	// OTTR-1198: children the state's frames dropped — an older done child, or one
+	// filed into another project's board. The drawer's detail names them (the server
+	// scans every registered board for followUpOf links); each ref fetches its card
+	// from its own tasks route like the parent rows. Refs the frame already carries
+	// stay out: their rows render from state, live.
+	const kidKeys = new Set(kids.map((k) => `${k.project}/${k.id}`));
+	const childRefs: (LineageRef & { createdAt: number })[] = (
+		detail?.children ?? []
+	)
+		.filter((c) => !kidKeys.has(`${c.project}/${c.id}`))
+		.sort((a, b) => a.createdAt - b.createdAt);
+	// lineageWant encodes exactly parentRef, retroRef and the child refs: the fetch
+	// restarts when the drawer's card changes or its fetched lineage lands.
+	const lineageWant = `${parentRef === null ? "" : lineageKey(parentRef)} ${retroRef === null ? "" : lineageKey(retroRef)} ${childRefs.map((c) => lineageKey(c)).join(" ")}`;
+	useEffect(() => {
+		const refs: LineageRef[] = [];
+		if (parentRef !== null) refs.push(parentRef);
+		if (retroRef !== null) refs.push(retroRef);
+		for (const c of childRefs) refs.push(c);
+		// Empty want: this card has every lineage card in state — drop the old fetch state.
+		if (refs.length === 0) {
+			setLineage({});
+			return;
+		}
+		loadLineage(refs);
+	}, [lineageWant]);
 	// The state row omits the wide fields (OTTR-965): the fallback renders empty until
 	// the detail fetch lands; the prompt section holds its space with a loading line.
 	const task: TaskView = detail ?? {
@@ -15438,10 +15501,12 @@ export function Drawer({
 						retroSource={retroCard}
 						kids={kids}
 						boardTasks={treeTasks}
+						childRefs={childRefs}
+						lineageFetches={lineage}
 						onOpenTask={onOpenTask}
 						parentFetch={parentFetch}
 						retroFetch={retroFetch}
-						onLineageRetry={(c) => loadLineage([c])}
+						onLineageRetry={(c) => loadLineage([c], true)}
 						stateRow={lineageState}
 					/>
 					<DrawerLateCommits task={task} cancelled={cancelled} />
@@ -16736,6 +16801,7 @@ function taskCardFromDetail(detail: TaskView): TaskCard {
 		lateCommits: _lateCommits,
 		retro: _retro,
 		findings: _findings,
+		children: _children,
 		...card
 	} = detail;
 	return { ...card, answered: answeredCard(turns) };

@@ -1308,6 +1308,12 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	 * first. This card's Work steps show their turns; each finding stays a card of its own.
 	 * Absent without findings. */
 	findings?: FindingView[];
+	/** Drawer detail only (OTTR-1198): every card that names this card as its followUpOf
+	 * source, across every project's board, oldest first. Refs only — the drawer fetches
+	 * each card from its own tasks route, so the Lineage shows children the state's Done
+	 * windows dropped (an older done child, or one filed into another project). Absent on
+	 * older servers. */
+	children?: { project: string; id: string; createdAt: number }[];
 }
 
 /** A retro card as its source card's drawer shows it: the facts its Work steps entry reads. */

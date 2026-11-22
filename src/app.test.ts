@@ -1810,6 +1810,80 @@ describe("task routes", () => {
 			}
 			expect((await p3.store.listTasks()).length).toBe(before);
 		});
+
+		test("the drawer detail serves every child ref across boards, oldest first", async () => {
+			const parent = await store.createTask("p1 parent with children");
+			// The foreign child first, the local one after a clock step, so the filing
+			// order is stable and the rail order is assertable.
+			const cross = await post("/api/projects/p2/tasks", {
+				prompt: "child filed in p2",
+				followUpOf: parent.id,
+			});
+			expect(cross.status).toBe(200);
+			// A genuine few-ms wait: createdAt comes from the real clock inside
+			// createTask and no seam feeds it, so fake timers cannot order the rows.
+			const ticked = Promise.withResolvers<void>();
+			setTimeout(ticked.resolve, 3);
+			await ticked.promise;
+			const local = await post("/api/projects/p1/tasks", {
+				prompt: "child filed in p1",
+				followUpOf: parent.id,
+			});
+			expect(local.status).toBe(200);
+			const res = await get(`/api/projects/p1/tasks/${parent.id}`);
+			expect(res.status).toBe(200);
+			const view = (await res.json()) as {
+				children?: { project: string; id: string; createdAt: number }[];
+			};
+			const crossId = ((await cross.json()) as { id: string }).id;
+			const localId = ((await local.json()) as { id: string }).id;
+			// Refs only, no card bodies; both boards' children ride, oldest first.
+			expect(
+				view.children?.map((c) => ({ project: c.project, id: c.id })),
+			).toEqual([
+				{ project: "p2", id: crossId },
+				{ project: "p1", id: localId },
+			]);
+			for (const c of view.children ?? [])
+				expect(typeof c.createdAt).toBe("number");
+			// A card nobody names serves an empty list, not a missing field.
+			const child = await get(`/api/projects/p1/tasks/${localId}`);
+			const childView = (await child.json()) as { children?: unknown[] };
+			expect(childView.children).toEqual([]);
+		});
+
+		test("a board with a sick store drops only its own child refs", async () => {
+			const parent = await store.createTask("p1 parent, one sick board");
+			const cross = await post("/api/projects/p2/tasks", {
+				prompt: "sick-board child",
+				followUpOf: parent.id,
+			});
+			expect(cross.status).toBe(200);
+			const crossId = ((await cross.json()) as { id: string }).id;
+			const sick = {
+				name: "sick",
+				store: {
+					name: "sick-store",
+					listTasks: async () => {
+						throw new Error("boom");
+					},
+				},
+			} as unknown as Entry;
+			projects.set("sick", sick);
+			try {
+				// Degraded, not failed: the healthy boards' refs still ship.
+				const res = await get(`/api/projects/p1/tasks/${parent.id}`);
+				expect(res.status).toBe(200);
+				const view = (await res.json()) as {
+					children?: { project: string; id: string }[];
+				};
+				expect(
+					view.children?.map((c) => ({ project: c.project, id: c.id })),
+				).toEqual([{ project: "p2", id: crossId }]);
+			} finally {
+				projects.delete("sick");
+			}
+		});
 	});
 
 	test("state cards omit details and report", async () => {
