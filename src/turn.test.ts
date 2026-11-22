@@ -302,6 +302,9 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		// A neutral default role (no provider lends it) unless a test sets one: the real
 		// modelRoles reads this machine's config.yml, and a worker turn needs a model to run.
 		modelRoles: () => ({ default: "fake/default-model" }),
+		// No fallback chains unless a test sets one: the real modelFallbacks reads this
+		// machine's config.yml, whose chains would steer these usage-limit tests.
+		modelFallbacks: () => ({}),
 		// An empty catalog unless a test sets one: the real modelList spawns this
 		// machine's omp and caches its answer process-wide, which would leak into
 		// every other modelList call in this file and its neighbors.
@@ -13739,6 +13742,96 @@ describe("review findings check", () => {
 		).toEqual([]);
 	});
 
+	test("a check at the usage limit reruns on the role's fallback provider and files", async () => {
+		const record = baseRecord();
+		record.recorded = [finding("Bug A", 1)];
+		const resetsAt = Date.now() + 3_600_000;
+		const { store, loop } = await setupWith(record, {
+			commitsAhead: async () => 0,
+			// The review runs on anthropic (quota left), the check role's model on zai
+			// (exhausted): the shape of the holds this card must not take (OTTR-1200).
+			modelRoles: () => ({
+				default: "anthropic/claude-opus-work",
+				critic: "zai/glm-check",
+			}),
+			modelFallbacks: () => ({ critic: ["openai/gpt-check"] }),
+			quota: async () => ({
+				limits: [
+					{
+						provider: "zai",
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct: 100,
+						resetsAt,
+					},
+					{
+						provider: "anthropic",
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct: 40,
+						resetsAt: resetsAt + 1_000,
+					},
+					{
+						provider: "openai",
+						label: "5 hours",
+						window: "5h",
+						plan: null,
+						usedPct: 30,
+						resetsAt: resetsAt + 2_000,
+					},
+				],
+				error: null,
+				at: Date.now(),
+			}),
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.("sess");
+				const result =
+					record.runs.length === 1
+						? runResult({
+								outcome: { status: "answered", summary: "review done" },
+								model: "anthropic/claude-opus-work",
+								recorded: record.recorded,
+							})
+						: record.runs.length === 2
+							? runResult({
+									exitCode: 1,
+									model: "zai/glm-check",
+									providerError:
+										"Codex error event: The usage limit has been reached (code=usage_limit_reached)",
+								})
+							: runResult({
+									finalText: '[{"id":1,"keep":true,"reason":""}]',
+								});
+				return {
+					pid: 4242,
+					done: Promise.resolve(result),
+					kill: async () => {},
+				};
+			},
+		});
+		const review = await reviewCard(store);
+		await loop.runTurn(store.name, review.id);
+
+		// Review + zai check (limited) + the rerun on the fallback provider.
+		expect(record.runs).toHaveLength(3);
+		expect(record.runs[1]!.model).toBe("zai/glm-check");
+		expect(record.runs[2]!.model).toBe("openai/gpt-check");
+		const after = (await store.getTask(review.id))!;
+		expect(after.state).toBe("idle");
+		expect(after.holdUntil).toBeNull();
+		expect(
+			(await store.listTasks())
+				.filter((t) => t.followUpOf === review.id)
+				.map((t) => t.prompt),
+		).toEqual(["Bug A"]);
+		const text = await logText(store, review.id);
+		expect(text).toContain("zai hit its usage limit");
+		expect(text).toContain("the check runs on openai/gpt-check");
+	});
+
 	test("a review check 429 with a long retry-after holds the review instead of parking", async () => {
 		const record = baseRecord();
 		record.recorded = [finding("Bug A", 1)];
@@ -15642,6 +15735,159 @@ describe("work card check", () => {
 		} finally {
 			setSystemTime();
 		}
+	});
+
+	test("a work check at the usage limit reruns on the fallback provider and passes", async () => {
+		const resetsAt = Date.now() + 3_600_000;
+		const { store, record, loop } = await workCheckCase(
+			{ sha: "sha1" },
+			[usageLimited, pass()],
+			{
+				modelRoles: () => ({
+					default: "anthropic/claude-opus-work",
+					adversary: "openai-codex/gpt-5.5",
+				}),
+				modelFallbacks: () => ({
+					adversary: ["anthropic/claude-check"],
+				}),
+				quota: async () => ({
+					limits: [
+						{
+							provider: "openai-codex",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 100,
+							resetsAt,
+						},
+						{
+							provider: "anthropic",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 40,
+							resetsAt: resetsAt + 1_000,
+						},
+					],
+					error: null,
+					at: Date.now(),
+				}),
+			},
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		// Work run + codex check (limited) + the rerun on the fallback provider.
+		expect(record.runs).toHaveLength(3);
+		expect(record.runs[1]!.model).toBe("openai-codex/gpt-5.5");
+		expect(record.runs[2]!.model).toBe("anthropic/claude-check");
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("merging");
+		expect(after.state).toBe("queued");
+		expect(after.holdUntil).toBeNull();
+		expect(after.needsReason).toBeNull();
+		expect(after.workCheckHead).toBe("sha1");
+		expect(after.workCheckLog).toHaveLength(1);
+		expect(after.workCheckLog[0]!.outcome).toBe("pass");
+		expect(after.workCheckLog[0]!.model).toBe("anthropic/claude-check");
+		const text = await logText(store, task.id);
+		expect(text).toContain("openai-codex hit its usage limit");
+		expect(text).toContain("the check runs on anthropic/claude-check");
+	});
+
+	test("a fallback chain with no provider with quota still holds", async () => {
+		const resetsAt = Date.now() + 3_600_000;
+		const { store, record, loop } = await workCheckCase(
+			{ sha: "sha1" },
+			[usageLimited],
+			{
+				modelRoles: () => ({
+					default: "anthropic/claude-opus-work",
+					adversary: "openai-codex/gpt-5.5",
+				}),
+				// The exhausted provider itself, a shape-invalid selector, and a
+				// second provider that is out of quota too: nothing qualifies.
+				modelFallbacks: () => ({
+					adversary: [
+						"openai-codex/gpt-5.5-mini",
+						"no-provider-here",
+						"google/gemini-check",
+					],
+				}),
+				quota: async () => ({
+					limits: [
+						{
+							provider: "openai-codex",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 100,
+							resetsAt,
+						},
+						{
+							provider: "google",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 100,
+							resetsAt: resetsAt + 5_000,
+						},
+						{
+							provider: "anthropic",
+							label: "5 hours",
+							window: "5h",
+							plan: null,
+							usedPct: 40,
+							resetsAt: resetsAt + 1_000,
+						},
+					],
+					error: null,
+					at: Date.now(),
+				}),
+			},
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2); // work run + one check attempt: no fallback ran
+		const held = (await store.getTask(task.id))!;
+		expect(held.state).toBe("queued");
+		expect(held.holdUntil).toBe(resetsAt);
+		expect(held.holdProvider).toBe("openai-codex");
+		expect(held.needsReason).toContain("openai-codex usage limit");
+		expect(held.needsReason).toContain(
+			`${new Date(resetsAt).toISOString().slice(0, 16).replace("T", " ")} UTC`,
+		);
+	});
+
+	test("a fallback chain without a trustworthy quota report holds", async () => {
+		const before = Date.now();
+		const { store, record, loop } = await workCheckCase(
+			{ sha: "sha1" },
+			[usageLimited],
+			{
+				modelRoles: () => ({
+					default: "anthropic/claude-opus-work",
+					adversary: "openai-codex/gpt-5.5",
+				}),
+				modelFallbacks: () => ({ adversary: ["anthropic/claude-check"] }),
+				quota: async () => ({
+					limits: [],
+					error: "omp usage exited with 1",
+					at: Date.now(),
+				}),
+			},
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		expect(record.runs).toHaveLength(2); // no fallback ran without quota proof
+		const held = (await store.getTask(task.id))!;
+		expect(held.state).toBe("queued");
+		expect(held.holdUntil).toBeGreaterThanOrEqual(before + 30 * 60_000);
+		expect(held.holdUntil).toBeLessThan(before + 31 * 60_000);
+		expect(held.holdProvider).toBe("openai-codex");
+		expect(held.needsReason).toContain("usage limit");
 	});
 
 	test("a check at the usage limit with no known reset holds a probe wait", async () => {

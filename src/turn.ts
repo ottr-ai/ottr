@@ -55,7 +55,7 @@ import {
 	visuallyIdentical,
 } from "./images.ts";
 import { joinLevel, splitLevel } from "./levels.ts";
-import { modelList, modelRoles } from "./models.ts";
+import { modelFallbacks, modelList, modelRoles } from "./models.ts";
 import type { GateCheck } from "./promptGate.ts";
 import {
 	GATE_REASON,
@@ -100,7 +100,7 @@ import {
 } from "./prompts.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
-import { providerOf, usageReset } from "./quota.ts";
+import { providerBlocked, providerOf, usageReset } from "./quota.ts";
 import type {
 	publishRelease,
 	ReleaseIdentity,
@@ -201,6 +201,7 @@ import type {
 	ProjectHomepage,
 	ProjectSettings,
 	PromptGateState,
+	QuotaLimit,
 	QuotaState,
 	RecordedFinding,
 	RunResult,
@@ -902,6 +903,9 @@ export interface TurnOps {
 	workCheck?: () => boolean | Promise<boolean>;
 	/** Role → selector map the check run's model resolves from; overridable for tests. */
 	modelRoles?: typeof modelRoles;
+	/** Role → fallback selectors (`retry.fallbackChains`), so a check whose provider hit
+	 *  its usage limit reruns on one with quota; overridable for tests. */
+	modelFallbacks?: typeof modelFallbacks;
 	/** OTTR-1116: the user-set vendor routing for the check run's role (POST
 	 *  /api/settings/check-routing); null = automatic. Absent counts as null, so test
 	 *  fakes need nothing. */
@@ -2018,6 +2022,36 @@ export function createTurnLoop(
 	} | null> {
 		const q = await ops.quota?.().catch(() => null);
 		return q ? usageReset(q.limits, model, Date.now()) : null;
+	}
+	/** The quota state's limits, or null when the board has none it can trust (ops.quota
+	 * absent, failed, or its report errored): a fallback needs proof of quota left, so
+	 * without it the hold path runs as before. */
+	async function knownQuotaLimits(): Promise<QuotaLimit[] | null> {
+		const q = await ops.quota?.().catch(() => null);
+		return q === undefined || q === null || q.error !== null ? null : q.limits;
+	}
+	/** The check fallback for a role whose check provider hit its usage limit: the first
+	 * selector of the role's chain (`retry.fallbackChains.<role>`) whose provider differs
+	 * from the exhausted one and shows no exhausted window in the quota state. A selector
+	 * this flow already ran, one without a provider part, and an unprovable quota state
+	 * disqualify. Null: no qualifying selector — the hold path runs as before. */
+	async function checkFallbackSelector(
+		checkRole: string,
+		exhaustedProvider: string | null,
+		tried: ReadonlySet<string>,
+	): Promise<string | null> {
+		const chain = (ops.modelFallbacks ?? modelFallbacks)()[checkRole];
+		if (chain === undefined) return null;
+		const limits = await knownQuotaLimits();
+		if (limits === null) return null;
+		for (const selector of chain) {
+			if (tried.has(selector)) continue;
+			const provider = providerOf(selector);
+			if (provider === null || provider === exhaustedProvider) continue;
+			if (providerBlocked(limits, provider, Date.now()) !== null) continue;
+			return selector;
+		}
+		return null;
 	}
 	/** The write that holds card `id`, or null when the card is no longer this run's: a cancel or
 	 * kept-worktree cancel may land during the quota await and owns the state then. Text the user
@@ -10590,7 +10624,8 @@ export function createTurnLoop(
 	}
 
 	/** Runs the review-check attempts (two, then the user decides: a half-checked review files
-	 * no cards). A usage limit skips the retry: it fails the same way until the reset.
+	 * no cards). A usage limit reruns the check on the role's fallback provider when one
+	 * has quota, else it holds until the reset (it fails the same way until then).
 	 * Null: a credit stop or a taken-over check stopped the turn. */
 	async function reviewCheckAttempts(
 		st: TurnSettle,
@@ -10615,8 +10650,8 @@ export function createTurnLoop(
 			dropped: loop.dropped,
 			checkMs: loop.checkMs,
 			checkFailed: loop.checkFailed,
-			checkModel: built.checkModel,
-			checkWarn: built.checkWarn,
+			checkModel: loop.checkModel,
+			checkWarn: loop.checkWarn,
 			hold: loop.hold,
 			limitHit: loop.limitHit,
 		};
@@ -10685,7 +10720,8 @@ export function createTurnLoop(
 	}
 
 	/** The review check attempts (two, then the user decides: a half-checked review files no
-	 * cards). A usage limit skips the retry: it fails the same way until the reset.
+	 * cards). A usage limit reruns the check on the role's fallback provider when one has
+	 * quota; with none it holds until the reset (it fails the same way until then).
 	 * Null: a credit stop or a taken-over check stopped the turn. */
 	async function reviewCheckLoop(
 		st: TurnSettle,
@@ -10694,12 +10730,16 @@ export function createTurnLoop(
 			input: string;
 			checkRole: string;
 			selector: string | undefined;
+			checkModel: string | null;
+			checkWarn: "same model" | "same vendor" | null;
 		},
 	): Promise<{
 		kept: { id: number; finding: RecordedFinding }[];
 		dropped: { id: number; finding: RecordedFinding; reason: string }[];
 		checkMs: number;
 		checkFailed: string | null;
+		checkModel: string | null;
+		checkWarn: "same model" | "same vendor" | null;
 		hold: UsageHold | null;
 		limitHit: boolean;
 	} | null> {
@@ -10715,11 +10755,15 @@ export function createTurnLoop(
 		let checkFailed: string | null = null;
 		let hold: UsageHold | null = null;
 		let limitHit = false;
+		let selector = built.selector;
+		let checkModel = built.checkModel;
+		let checkWarn = built.checkWarn;
+		const tried = new Set<string>();
 		for (let attempt = 1; attempt <= 2; attempt++) {
 			const ran = await awaitCheckAttempt(
 				st,
 				built.input,
-				built.selector,
+				selector,
 				built.checkRole,
 				`${st.key}:check`,
 			);
@@ -10736,9 +10780,27 @@ export function createTurnLoop(
 			limitHit = out.limitHit;
 			await st.log(`! review check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
+				const exhausted = providerOf(
+					ran.result.model ?? selector ?? checkModel ?? null,
+				);
+				if (selector !== undefined) tried.add(selector);
+				const fallback = await checkFallbackSelector(
+					built.checkRole,
+					exhausted,
+					tried,
+				);
+				if (fallback !== null) {
+					selector = fallback;
+					checkModel = fallback;
+					checkWarn = checkModelWarning(st.result.model, fallback);
+					await st.log(
+						`- check provider ${exhausted ?? "provider"} hit its usage limit; the check runs on ${fallback}`,
+					);
+					continue;
+				}
 				hold = await usageHold(
 					ran.result,
-					ran.result.model ?? built.selector ?? null,
+					ran.result.model ?? selector ?? null,
 					st.task.holdAttempts,
 				);
 				break;
@@ -10755,7 +10817,16 @@ export function createTurnLoop(
 				break;
 			}
 		}
-		return { kept, dropped, checkMs, checkFailed, hold, limitHit };
+		return {
+			kept,
+			dropped,
+			checkMs,
+			checkFailed,
+			checkModel,
+			checkWarn,
+			hold,
+			limitHit,
+		};
 	}
 
 	/** One review-check attempt's outcome: the kept/dropped split on a valid JSON verdict
@@ -11366,8 +11437,9 @@ export function createTurnLoop(
 	}
 
 	/** Runs the second-model check on a work card that classify sent to merging (two attempts,
-	 * then the user decides: an unchecked card never merges; a usage limit skips the retry: it
-	 * fails the same way until the reset). At an unchanged head (a reply- or evidence-driven
+	 * then the user decides: an unchecked card never merges; a usage limit reruns the check
+	 * on the role's fallback provider when one has quota, else it holds until the reset).
+	 * At an unchanged head (a reply- or evidence-driven
 	 * re-check) the full diff stays, so the check can re-cite an earlier blocker's quote
 	 * verbatim; a re-check after new commits sees only those commits: the checked code was
 	 * already reviewed once, and repeat checks mostly re-flag old code. True: the turn stopped. */
@@ -11387,8 +11459,8 @@ export function createTurnLoop(
 	}
 
 	/** The work check attempts (two, then the user decides: an unchecked card never merges;
-	 * a usage limit skips the retry: it fails the same way until the reset).
-	 * True: the turn stopped. */
+	 * a usage limit reruns the check on the role's fallback provider when one has quota,
+	 * else it holds until the reset). True: the turn stopped. */
 	async function workCheckAttempts(
 		st: TurnSettle,
 		cur: Task,
@@ -11407,11 +11479,15 @@ export function createTurnLoop(
 		let checkFailed: string | null = null;
 		let limitHit = false;
 		let hold: UsageHold | null = null;
+		let selector = roles.selector;
+		let checkModel = roles.checkModel;
+		let warn = roles.warn;
+		const tried = new Set<string>();
 		for (let attempt = 1; attempt <= 2; attempt++) {
 			const ran = await awaitWorkCheckAttempt(
 				st,
 				built.input,
-				roles.selector,
+				selector,
 				roles.checkRole,
 			);
 			if (ran === null) return true;
@@ -11434,11 +11510,11 @@ export function createTurnLoop(
 						st,
 						cur,
 						head,
-						roles.checkModel,
+						checkModel,
 						fromRole,
 						open,
 						priorLog,
-						roles.warn,
+						warn,
 						checkStart,
 						checkMs,
 						out.verdict,
@@ -11452,9 +11528,27 @@ export function createTurnLoop(
 			limitHit = out.limitHit;
 			await st.log(`! work check attempt ${attempt} failed: ${checkFailed}`);
 			if (limitHit) {
+				const exhausted = providerOf(
+					ran.result.model ?? selector ?? checkModel ?? null,
+				);
+				if (selector !== undefined) tried.add(selector);
+				const fallback = await checkFallbackSelector(
+					roles.checkRole,
+					exhausted,
+					tried,
+				);
+				if (fallback !== null) {
+					selector = fallback;
+					checkModel = fallback;
+					warn = checkWarnFields(st.result.model, fallback);
+					await st.log(
+						`- check provider ${exhausted ?? "provider"} hit its usage limit; the check runs on ${fallback}`,
+					);
+					continue;
+				}
 				hold = await usageHold(
 					ran.result,
-					ran.result.model ?? roles.selector ?? null,
+					ran.result.model ?? selector ?? null,
 					st.task.holdAttempts,
 				);
 				break;
@@ -11476,8 +11570,8 @@ export function createTurnLoop(
 			await parkFailedWorkCheck(
 				st,
 				priorLog,
-				roles.warn,
-				roles.checkModel,
+				warn,
+				checkModel,
 				fromRole,
 				checkStart,
 				checkMs,
@@ -11561,6 +11655,22 @@ export function createTurnLoop(
 		return { input, diff, transcriptText };
 	}
 
+	/** The card's check-warning object for the model pair: the two no-second-opinion
+	 * messages, or {} when the pair gives an opinion. Pure. */
+	function checkWarnFields(
+		workModel: string | null,
+		checkModel: string | null,
+	): { warn?: string } {
+		const checkWarn = checkModelWarning(workModel, checkModel);
+		if (checkWarn === null) return {};
+		return {
+			warn:
+				checkWarn === "same model"
+					? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
+					: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
+		};
+	}
+
 	/** The check's model: the role's selector, else the board's default role (omp's fallback).
 	 * The check must not be the model it checks — same model or vendor goes on the card as a
 	 * warning. The role comes from the user-set vendor routing (ops.checkRouting), else the
@@ -11578,21 +11688,11 @@ export function createTurnLoop(
 		const checkRole = checkRoleFor(routing, roles, st.result.model);
 		const selector = roles[checkRole];
 		const checkModel = selector ?? roles.default ?? null;
-		const checkWarn = checkModelWarning(st.result.model, checkModel);
-		const warn =
-			checkWarn === null
-				? {}
-				: {
-						warn:
-							checkWarn === "same model"
-								? `The check model ${checkModel} is the same model as the run it checks — no second-model opinion.`
-								: `The check model ${checkModel} is from the same vendor as the run it checks — no second-vendor opinion.`,
-					};
 		return {
 			selector,
 			checkRole,
 			checkModel,
-			warn,
+			warn: checkWarnFields(st.result.model, checkModel),
 			note: checkRoutingNote(routing, roles, st.result.model),
 		};
 	}
