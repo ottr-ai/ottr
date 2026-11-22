@@ -931,6 +931,80 @@ describe("collectRange", () => {
 		expect(skipped.get(bh)).toEqual(featShas.slice(80));
 		expect(keptHead.get(bh)).toBe(featShas[79]);
 	}, 120_000);
+
+	// Extras charge the shared budget before the window, and the charge lands even
+	// when the branch's cut is its whole (tiny) window: a later branch must see the
+	// remaining allowance, not a fresh one.
+	test("extras and the window share one per-run budget across branches", async () => {
+		const main = await initUpstream("cr-share-main");
+		const fork = mkRepo("cr-share-fork");
+		await run(["clone", "-q", main, fork], root);
+		const base = await shaOf(fork);
+		await run(["checkout", "-q", "-b", "extra", fork], fork);
+		const extraShas: string[] = [];
+		for (let i = 0; i < 150; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `x${i}`, fork], fork);
+			extraShas.push(await shaOf(fork));
+		}
+		await run(["checkout", "-q", "-b", "featA", base], fork);
+		await run(["commit", "-q", "--allow-empty", "-m", "a0", fork], fork);
+		const a0 = await shaOf(fork);
+		await run(["checkout", "-q", "-b", "featB", base], fork);
+		const bShas: string[] = [];
+		for (let i = 0; i < 100; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `b${i}`, fork], fork);
+			bShas.push(await shaOf(fork));
+		}
+		const bhA = branchHash("featA"),
+			bhB = branchHash("featB");
+		const cachePath = join(root, "cr-share-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[
+				`+refs/heads/featA:refs/heads/${bhA}`,
+				`+refs/heads/featB:refs/heads/${bhB}`,
+				"+refs/heads/extra:refs/heads/_extra",
+			],
+			localFileGit(fork),
+		);
+		const { range, skipped, keptHead } = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bhA,
+					branch: "featA",
+					head: a0,
+					analyzedHead: null,
+					released: extraShas,
+				},
+				{
+					branchHash: bhB,
+					branch: "featB",
+					head: bShas[99]!,
+					analyzedHead: null,
+				},
+			],
+			git: defaultGit,
+		});
+		// featA: 50 extras (half the allowance) + its one window commit, charged 51.
+		// featB: the remaining 49. The run total is the cap, not 51 + 100.
+		expect(range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
+		expect(
+			range.commits.filter((c) => c.branches.includes("featA")).length,
+		).toBe(51);
+		expect(
+			range.commits.filter((c) => c.branches.includes("featB")).length,
+		).toBe(49);
+		// featA's cursor parks on its window commit: no extras-only livelock.
+		expect(keptHead.get(bhA)).toBe(a0);
+		expect(skipped.get(bhA)).toHaveLength(extraShas.length - 50);
+		expect(keptHead.get(bhB)).toBe(bShas[48]);
+		expect(skipped.get(bhB)).toEqual(bShas.slice(49));
+	}, 120_000);
 });
 
 describe("watcher", () => {
@@ -1090,6 +1164,87 @@ describe("watcher", () => {
 		const held2 = await store.listForkHolds(1);
 		expect(held2.some((h) => h.sha === relSha)).toBe(false);
 	}, 120_000);
+
+	test("released extras half the budget: the window still runs and rows shrink each run", async () => {
+		const name = "watch-extralock";
+		const main = await initUpstream(name);
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
+		const forkDir = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, forkDir], root);
+		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
+		// The window: 10 real commits. The extras: 150 commits on a side branch that
+		// never merges — released hold rows riding outside the branch's window.
+		const windowShas: string[] = [];
+		for (let i = 0; i < 10; i++) {
+			writeFileSync(join(forkDir, `w${i}.txt`), `window ${i}\n`);
+			await run(["add", `w${i}.txt`, forkDir], forkDir);
+			await run(["commit", "-q", "-m", `window ${i}`, forkDir], forkDir);
+			windowShas.push(await shaOf(forkDir));
+		}
+		await run(["checkout", "-q", "-b", "extra", forkDir], forkDir);
+		const extraShas: string[] = [];
+		for (let i = 0; i < 150; i++) {
+			await run(
+				["commit", "-q", "--allow-empty", "-m", `x${i}`, forkDir],
+				forkDir,
+			);
+			extraShas.push(await shaOf(forkDir));
+		}
+		await run(["checkout", "-q", "feat", forkDir], forkDir);
+		// The held PR behind the extras: its pull ref must exist for the step-3 fetch.
+		await openPr(main, forkDir, "extra", 7);
+		await run(["branch", "-D", "extra", forkDir], forkDir);
+		const bh = branchHash("feat");
+		const extraTip = extraShas[extraShas.length - 1]!;
+		await store.setForkHolds(
+			1,
+			bh,
+			extraShas.map((sha) => ({
+				sha,
+				pr: 7,
+				prHead: extraTip,
+				released: true,
+			})),
+		);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[],
+		);
+		await watcher.tick();
+		// Run 1: 50 extras (half the allowance) + all 10 window commits — the window
+		// is not starved, and the cursor reaches the head.
+		expect(state.subjects.length).toBe(1);
+		for (let i = 0; i < 10; i++)
+			expect(state.subjects[0]).toContain(`window ${i}`);
+		// Which half of the extras rides is not pinned (the store's row order decides);
+		// the count is: 50 extras, and the window is not starved.
+		expect(state.subjects[0]!.filter((sub) => sub.startsWith("x")).length).toBe(
+			50,
+		);
+		const held1 = await store.listForkHolds(1);
+		expect(held1.length).toBe(100);
+		// Runs 2 and 3: the deferred extras ride in, get covered, and their rows are
+		// consumed — the riding set shrinks instead of repeating forever.
+		state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
+		await watcher.tick();
+		const held2 = await store.listForkHolds(1);
+		expect(held2.length).toBe(50);
+		expect(state.subjects[1]!.filter((sub) => sub.startsWith("x")).length).toBe(
+			50,
+		);
+		state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
+		await watcher.tick();
+		const held3 = await store.listForkHolds(1);
+		expect(held3.length).toBe(0);
+		expect(state.subjects[2]!.filter((sub) => sub.startsWith("x")).length).toBe(
+			50,
+		);
+		expect(state.subjects.length).toBe(3);
+	}, 180_000);
 
 	test("eligible range creates card, held proposal, advances cursor; no duplicates on second tick", async () => {
 		const { main, store, watcher, calls } = await setup(

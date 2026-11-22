@@ -573,12 +573,15 @@ export async function collectRange(o: {
 		const mergeSet = new Set(mergeShas);
 		const inWalk = raw.all.filter((s) => survivor.has(s));
 		const walked = new Set(inWalk);
-		// Released extras outside the window ride first and charge the allowance; extras
-		// past it defer, and their hold rows ride with them (keepReleased retains rows
-		// the cap skipped).
+		// Released extras outside the window ride first and charge the allowance, but
+		// they take at most half of it: a branch whose whole allowance would go to
+		// extras must still make progress on its own window, or the extras (which re-
+		// ride every run until a run covers them) would starve the window forever.
+		// Extras past their share defer, and their hold rows ride with them
+		// (keepReleased retains rows the cap skipped).
 		const outside = shas.filter((s) => !walked.has(s));
 		const allowance = Math.min(budget, FORK_GATES.MAX_RANGE_COMMITS);
-		const outsideKept = Math.min(outside.length, allowance);
+		const outsideKept = Math.min(outside.length, Math.floor(allowance / 2));
 		const windowAllowance = allowance - outsideKept;
 		for (const s of outside.slice(outsideKept)) markSkipped(b.branchHash, s);
 		const rideOutside = outside.slice(0, outsideKept);
@@ -629,10 +632,11 @@ export async function collectRange(o: {
 		for (const s of walkOldestFirst) {
 			if (!ordered.has(s)) markSkipped(b.branchHash, s);
 		}
-		if (cut !== undefined) {
-			keptHead.set(b.branchHash, cut);
-			budget -= Math.min(budget, order.length);
-		}
+		if (cut !== undefined) keptHead.set(b.branchHash, cut);
+		// The charge is unconditional: collected evidence spends the budget even when
+		// no cut commit was set (the capped-walk fallback collects without one), or
+		// later branches would each see a fresh allowance.
+		budget -= Math.min(budget, order.length);
 		for (const sha of order) {
 			const existing = bySha.get(sha);
 			if (existing) {
@@ -1418,12 +1422,35 @@ export function createForkWatcher(deps: {
 							c.branches.includes(h.branch),
 						);
 						const branchSkipped = skipped.get(h.branchHash) ?? [];
+						const consumed = (releasedByBranch.get(h.branchHash) ?? []).filter(
+							(s) => covered.has(s),
+						);
 						let cursor: string;
 						if (branchSkipped.length > 0) {
 							// The cap cut this branch's newest tail: park the cursor on the newest
 							// kept commit, so the tail rides the next run's window.
 							const kept = keptHead.get(h.branchHash);
-							if (kept === undefined) continue; // nothing kept: retried next run
+							if (kept === undefined) {
+								// Nothing kept from the walk: the run collected only riding
+								// released extras. Consume their rows but hold the cursor, so
+								// the branch's own window runs next run on the shrunken
+								// riding set instead of repeating this run forever.
+								const row = pending.find((r) => r.branchHash === h.branchHash);
+								if (
+									row === undefined ||
+									row.analyzedHead === null ||
+									consumed.length === 0
+								)
+									continue;
+								analyzed.push({
+									forkId: fork.id,
+									branchHash: h.branchHash,
+									head: row.analyzedHead,
+									at: now(),
+									consumed,
+								});
+								continue;
+							}
 							cursor = kept;
 						} else if (branchCommits.length === 0) {
 							// The branch's work is all held: forward to the observed head.
@@ -1440,9 +1467,6 @@ export function createForkWatcher(deps: {
 						}
 						// Released∩covered rows ride to createForkResult: its transaction is
 						// their only deletion point, so a failed card creation cannot lose them.
-						const consumed = (releasedByBranch.get(h.branchHash) ?? []).filter(
-							(s) => covered.has(s),
-						);
 						// The final transaction installs these holds with the result.
 						analyzed.push({
 							forkId: fork.id,
