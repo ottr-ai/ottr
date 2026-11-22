@@ -196,6 +196,8 @@ export function buildOmpArgs(o: {
 	/** Non-empty: pinned tool list (`--tools`), extension config (`--config`) or skill (`--skills`). */
 	tools?: string | null;
 	config?: string | null;
+	/** Server-only read guard overlay (src/checkGuard.ts, OTTR-985); null/omitted omits the pair (tests pin exact argv without it). Board-side check runs always carry it. */
+	guardConfig?: string | null;
 	skills?: string | null;
 	/** Non-empty caps the run's duration (`--max-time`); a hung check run must not hold a board slot forever. */
 	maxTime?: string | null;
@@ -225,6 +227,9 @@ export function buildOmpArgs(o: {
 		...(o.model ? ["--model", o.model] : []),
 		...(o.tools ? ["--tools", o.tools] : []),
 		...(o.config ? ["--config", o.config] : []),
+		// The server-only read guard (OTTR-985) rides right after the run's own overlay; the
+		// later no-discovery/memory overlays touch other keys, so this cannot be overridden.
+		...(o.guardConfig ? ["--config", o.guardConfig] : []),
 		...(o.skills ? ["--skills", o.skills] : []),
 		...(o.maxTime ? ["--max-time", o.maxTime] : []),
 		// Every run's cwd is a worker-writable worktree, so nothing in that tree may steer
@@ -1813,6 +1818,8 @@ interface StartOptions {
 	/** Pinned tool list / extension config / skill, passed to buildOmpArgs (a retro run). */
 	tools?: string | null;
 	config?: string | null;
+	/** Server-only read guard overlay path (src/checkGuard.ts); the check runs pass it, other runs leave it unset. */
+	guardConfig?: string | null;
 	skills?: string | null;
 	/** Non-empty caps the run's duration (`--max-time`); a review check run sets it so a hung
 	 * check cannot hold a board slot forever. */

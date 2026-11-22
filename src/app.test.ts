@@ -38,6 +38,7 @@ import {
 	boardWarnings,
 	dependabotHeadPrefix,
 	type Entry,
+	ompSessionStores,
 	parseValidateAgainBody,
 	pickEncoding,
 	reconcileLayerUse,
@@ -71,6 +72,7 @@ import { modelRoles } from "./models.ts";
 import { ALL_CLASSES_ON, taskEntryKey } from "./notifications.ts";
 import type { OmpStats, OmpStatsAnswer, OmpUsageTotals } from "./ompStats.ts";
 import type { DashboardState, OmpStatsDashboard } from "./ompStatsDashboard.ts";
+import { mirrorFolderName } from "./ompStatsMirror.ts";
 import { summarizeCmd } from "./orphans.ts";
 import {
 	gateCompareText,
@@ -27047,5 +27049,43 @@ describe("service quota runtime integration", () => {
 		await pending.promise;
 		m.app.checkServiceQuotas();
 		expect(read).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("ompSessionStores", () => {
+	/** A store stand-in: only the two sessions dirs the store list reads. */
+	const fakeEntry = (sessionsDir: string, checkSessionsDir: string): Entry =>
+		({
+			store: { sessionsDir, checkSessionsDir } as ProjectStore,
+		}) as unknown as Entry;
+
+	test("the check sessions dir is its own store only when it differs from the sessions dir", () => {
+		const base = mkdtempSync(join(tmpdir(), "ottr-stores-"));
+		const split = new Map([
+			[
+				"proj",
+				fakeEntry(
+					join(base, "data/proj/sessions"),
+					join(base, "server/proj/sessions"),
+				),
+			],
+			[
+				"native",
+				fakeEntry(
+					join(base, "data/native/sessions"),
+					join(base, "data/native/sessions"),
+				),
+			],
+		]);
+		const stores = ompSessionStores(split);
+		const proj = stores.find((s) => s.name === "proj")!;
+		expect(proj.dir).toBe(join(base, "data/proj/sessions"));
+		expect(proj.folder).toBe(mirrorFolderName("proj"));
+		const checks = stores.find((s) => s.name === "proj checks")!;
+		expect(checks.dir).toBe(join(base, "server/proj/sessions"));
+		expect(checks.folder).toBe(mirrorFolderName("proj checks"));
+		// Native layout (OTTR_SERVER_DATA_DIR unset): same dir, no second store.
+		expect(stores.find((s) => s.name === "native")).toBeDefined();
+		expect(stores.find((s) => s.name === "native checks")).toBeUndefined();
 	});
 });

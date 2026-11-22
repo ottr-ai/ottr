@@ -550,6 +550,31 @@ describe("buildOmpArgs", () => {
 		]);
 	});
 
+	test("the guard overlay rides right after the run's config overlay (OTTR-985)", () => {
+		expect(
+			buildOmpArgs({
+				sessionDir: "S",
+				extensionPath: null,
+				resumeId: null,
+				tools: "read,grep,glob",
+				config: "ext/check.yml",
+				guardConfig: "server/proj/check-guard.yml",
+			}).slice(0, 11),
+		).toEqual([
+			"-p",
+			"--mode",
+			"json",
+			"--session-dir",
+			"S",
+			"--tools",
+			"read,grep,glob",
+			"--config",
+			"ext/check.yml",
+			"--config",
+			"server/proj/check-guard.yml",
+		]);
+	});
+
 	test("the no-discovery overlay ships next to the extension", () => {
 		// A missing file makes every run die at omp startup, so pin its presence.
 		expect(existsSync(NO_DISCOVERY_CONFIG)).toBe(true);

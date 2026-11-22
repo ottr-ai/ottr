@@ -172,6 +172,8 @@ interface Recorded {
 		stripGithubToken?: boolean;
 		tools?: string | null;
 		config?: string | null;
+		sessionDir?: string;
+		guardConfig?: string | null;
 		skills?: string | null;
 		extensionPath?: string | null;
 		model?: string | null;
@@ -13437,6 +13439,10 @@ describe("review findings check", () => {
 		expect(check.extensionPath).toBeNull();
 		expect(check.tools).toBe("read,grep,glob");
 		expect(check.config).toBe(join(dirname("ext.ts"), "check.yml"));
+		// OTTR-985: the check writes its transcript to the server-only sessions dir.
+		expect(check.sessionDir).toBe(store.checkSessionsDir);
+		// OTTR-985: the check's read tool refuses server-only paths via the guard overlay.
+		expect(check.guardConfig).toBe(join(store.serverDir, "check-guard.yml"));
 		expect(check.model).toBe("zai/glm-5.3-flash:medium");
 		expect(check.cwd).toBe(after.worktree!);
 		expect(check.prompt).toContain("shaR");
@@ -14740,6 +14746,10 @@ describe("work card check", () => {
 		expect(check.extensionPath).toBeNull();
 		expect(check.tools).toBe("read,grep,glob");
 		expect(check.config).toBe(join(dirname("ext.ts"), "check.yml"));
+		// OTTR-985: the check writes its transcript to the server-only sessions dir.
+		expect(check.sessionDir).toBe(store.checkSessionsDir);
+		// OTTR-985: the check's read tool refuses server-only paths via the guard overlay.
+		expect(check.guardConfig).toBe(join(store.serverDir, "check-guard.yml"));
 		expect(check.model).toBe("zai/glm-5.3-flash:medium");
 		expect(check.cwd).toBe((await store.getTask(task.id))!.worktree!);
 		const after = (await store.getTask(task.id))!;

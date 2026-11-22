@@ -11,6 +11,7 @@ import {
 	leadTitleKey,
 	validationResult,
 } from "./auditLeads.ts";
+import { ensureCheckGuardOverlay } from "./checkGuard.ts";
 import {
 	copyBelow,
 	isSizeRefusal,
@@ -10831,7 +10832,13 @@ export function createTurnLoop(
 			...(checkMeter !== null && { onUsage: checkMeter.onUsage }),
 			cwd: st.loc.wt,
 			prompt: input,
-			sessionDir: st.store.sessionsDir,
+			// Server-only dir (OTTR-985): the check runs in the server container, so a
+			// worker-planted symlink it reads (REVIEW.md, the transcript path) must never
+			// persist its content on the worker-shared data volume.
+			sessionDir: st.store.checkSessionsDir,
+			// The read guard (OTTR-985): a symlinked REVIEW.md naming server-only state is
+			// refused by the read tool instead of rendered into the transcript and the log.
+			guardConfig: ensureCheckGuardOverlay(st.store.serverDir),
 			extensionPath: null,
 			resumeId: null,
 			model: selector,

@@ -923,12 +923,22 @@ export function ompSessionStores(
 	const workerStore = join(homedir(), ".omp", "agent", "sessions");
 	if (resolve(workerStore) !== resolve(board))
 		stores.push({ name: "workers' store", dir: workerStore, folder: null });
-	for (const [name, e] of projects)
+	for (const [name, e] of projects) {
 		stores.push({
 			name,
 			dir: e.store.sessionsDir,
 			folder: mirrorFolderName(name),
 		});
+		// Check-run sessions live under the server-only dir (OTTR-985); they keep counting
+		// toward the usage card as their own store. Skipped when it is the sessions dir
+		// itself (OTTR_SERVER_DATA_DIR unset) — one dir must not feed two stores.
+		if (resolve(e.store.checkSessionsDir) !== resolve(e.store.sessionsDir))
+			stores.push({
+				name: `${name} checks`,
+				dir: e.store.checkSessionsDir,
+				folder: mirrorFolderName(`${name} checks`),
+			});
+	}
 	return stores;
 }
 

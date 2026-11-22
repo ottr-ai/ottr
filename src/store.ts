@@ -1491,11 +1491,15 @@ export class ProjectStore {
 	readonly path: string;
 	readonly name: string;
 	readonly tasksDir: string;
-	/** Server-only dir (serverDirFor): tasks.db and the fork cache. */
+	/** Server-only dir (serverDirFor): tasks.db, the fork cache, and checkSessionsDir. */
 	readonly serverDir: string;
 	/** Anchor for confined writes below tasksDir (dataRootFor). */
 	readonly dataRoot: string;
 	readonly sessionsDir: string;
+	/** Sessions of the board-side check runs (startCheckRun): under the server-only dir, so a
+	 * check transcript that captures a read of server-only state never lands on the
+	 * worker-shared data volume (OTTR-985). Equals sessionsDir when OTTR_SERVER_DATA_DIR is unset. */
+	readonly checkSessionsDir: string;
 	readonly worktreesDir: string;
 
 	private readonly db: StoreDatabase;
@@ -1513,6 +1517,7 @@ export class ProjectStore {
 		this.serverDir = serverDirFor(projectPath);
 		this.dataRoot = dataRootFor(projectPath);
 		this.sessionsDir = join(this.tasksDir, "sessions");
+		this.checkSessionsDir = join(this.serverDir, "sessions");
 		this.worktreesDir = join(projectPath, ".worktrees");
 		this.db = db;
 
@@ -1955,6 +1960,9 @@ export class ProjectStore {
 		mkdirBelow(dataRootFor(root), tasksDir);
 		const serverDir = serverDirFor(root);
 		mkdirSync(serverDir, { recursive: true });
+		// startCheckRun writes its transcripts here; omp creates the file lazily, the dir must
+		// exist first (OTTR-985).
+		mkdirSync(join(serverDir, "sessions"), { recursive: true });
 		const dbPath = join(serverDir, "tasks.db");
 		// Shared PRAGMA + instance-lock sequence (R2-9): one live opener per db file
 		// (incident 2026-10-06); a refused opener throws with the holder named, handle closed.

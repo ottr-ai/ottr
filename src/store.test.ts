@@ -4033,11 +4033,29 @@ describe("OTTR_SERVER_DATA_DIR", () => {
 				join(data, "proj", "logs", `${t.id}.log`),
 			);
 			expect(store.sessionsDir).toBe(join(data, "proj", "sessions"));
+			// OTTR-985: check-run sessions live under the server-only dir, never on the
+			// worker-shared data volume.
+			expect(store.checkSessionsDir).toBe(join(server, "proj", "sessions"));
+			expect(existsSync(store.checkSessionsDir)).toBe(true);
+			expect(existsSync(join(data, "proj", "sessions"))).toBe(true);
 			expect(discoverProjects([parent])).toEqual([proj]);
 			await store.close();
 			expect((await (await open(proj)).getTask(t.id))?.prompt).toBe(
 				"trusted state",
 			);
+		});
+	});
+
+	test("check sessions fall back to the sessions dir when the server dir is unset", async () => {
+		const base = join(root, "server-dir-check-sessions-fallback");
+		const data = join(base, "data");
+		const proj = join(base, "checkouts", "proj");
+		mkdirSync(proj, { recursive: true });
+		await withDirs(data, undefined, async () => {
+			const store = await ProjectStore.init(proj);
+			opened.push(store);
+			expect(store.checkSessionsDir).toBe(store.sessionsDir);
+			await store.close();
 		});
 	});
 
