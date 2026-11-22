@@ -3352,7 +3352,9 @@ export class ProjectStore {
 		analyzed: Array<{
 			forkId: number;
 			branchHash: string;
-			head: string;
+			/** The new cursor, or the unchanged one when the run kept no walk commit
+			 * (only riding extras) and must consume their rows without advancing. */
+			head: string | null;
 			at: number;
 			/** Per-commit hold shas this run consumed; the rows die with the cursor advance. */
 			consumed?: string[];

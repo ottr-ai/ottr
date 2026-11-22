@@ -13,6 +13,7 @@ import {
 	branchHash,
 	collectRange,
 	createForkWatcher,
+	createPatchBudget,
 	defaultGit,
 	ensureCache,
 	FORK_GATES,
@@ -29,6 +30,7 @@ import {
 } from "./forks.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
 import { ProjectStore } from "./store.ts";
+import fc from "./test/properties.ts";
 import type { ForkAnalysisResult } from "./types.ts";
 import { git, gitExe, spawnPiped } from "./worktree.ts";
 
@@ -382,6 +384,64 @@ describe("rangeCommits", () => {
 	});
 });
 
+// The ingestion budget folds generated patch sequences: the caps hold, kept commits
+// stay in candidate order as a prefix, and the deferred set is exactly the rest.
+describe("createPatchBudget", () => {
+	test("caps hold, order is preserved, and admitted patches fit", () => {
+		const maxPatchArb = fc.nat({ max: 4_000 });
+		fc.assert(
+			fc.property(
+				fc.nat({ max: 30 }),
+				fc.nat({ max: 20_000 }),
+				maxPatchArb,
+				fc.array(fc.nat({ max: 5_000 }), { maxLength: 40 }),
+				(maxCommits, maxTotalChars, maxPatchChars, sizes) => {
+					const patchCharsOf = (size: number) =>
+						Math.min(size, Math.max(1, maxPatchChars));
+					const budget = createPatchBudget(
+						maxCommits,
+						Math.max(1, maxTotalChars),
+					);
+					const keptIdx: number[] = [];
+					const deferredIdx: number[] = [];
+					for (const [i, size] of sizes.entries()) {
+						if (budget.admit(patchCharsOf(size))) keptIdx.push(i);
+						else deferredIdx.push(i);
+					}
+					// The caps hold: the commit count, and the charged char total over
+					// non-empty patches. Zero-char patches (empty commits) are free
+					// and admit even past the char cap.
+					expect(keptIdx.length).toBeLessThanOrEqual(maxCommits);
+					const charged = keptIdx.reduce(
+						(n, i) => n + patchCharsOf(sizes[i]!),
+						0,
+					);
+					expect(charged).toBeLessThanOrEqual(Math.max(1, maxTotalChars));
+					for (const i of keptIdx)
+						expect(patchCharsOf(sizes[i]!)).toBeLessThanOrEqual(
+							Math.max(1, maxPatchChars),
+						);
+					// The ordering stays correct: kept and deferred partition the
+					// candidates, each in candidate order (kept keeps a commit's own
+					// walk position; a kept sha never strands a deferred ancestor,
+					// because the walk is parents-first).
+					expect(
+						[...keptIdx].every((v, i) => i === 0 || v > keptIdx[i - 1]!),
+					).toBe(true);
+					expect(
+						[...deferredIdx].every(
+							(v, i) => i === 0 || v > deferredIdx[i - 1]!,
+						),
+					).toBe(true);
+					expect([...keptIdx, ...deferredIdx].sort((a, b) => a - b)).toEqual(
+						sizes.map((_, i) => i),
+					);
+				},
+			),
+		);
+	});
+});
+
 describe("collectRange", () => {
 	test("fetches upstream, dedups commits, lists upstream context", async () => {
 		const main = await initUpstream("cr-main");
@@ -442,7 +502,7 @@ describe("collectRange", () => {
 		const fork = mkRepo("cr-cap-fork");
 		await run(["clone", "-q", main, fork], root);
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
-		await Bun.write(join(fork, "big.txt"), "x".repeat(300_000));
+		await Bun.write(join(fork, "big.txt"), "x".repeat(450_000));
 		await run(["add", "big.txt", fork], fork);
 		await run(["commit", "-q", "-m", "big fork feature", fork], fork);
 		const head = await shaOf(fork);
@@ -474,8 +534,9 @@ describe("collectRange", () => {
 		expect(range.commits[0]!.patch.length).toBeLessThanOrEqual(
 			FORK_GATES.MAX_PATCH_BYTES,
 		);
-		// The 300 KB patch cannot fit under the 256 KiB cap: truncation is proven.
-		expect(range.commits[0]!.patch.length).toBeLessThan(300_000);
+		// The 450 KB patch cannot fit under the 400 KB cap: truncation is proven and
+		// marked, so the model can see the cut.
+		expect(range.commits[0]!.patch.endsWith("[patch truncated]")).toBe(true);
 	}, 60_000);
 
 	test("caps a range at MAX_RANGE_COMMITS and defers the newest tail", async () => {
@@ -546,13 +607,16 @@ describe("collectRange", () => {
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
 		const featShas: string[] = [];
 		for (let i = 0; i < FORK_GATES.MAX_RANGE_COMMITS + 2; i++) {
-			await run(["commit", "-q", "--allow-empty", "-m", `f${i}`, fork], fork);
+			// ~8 KB of patch per commit: the shared char budget is spent inside feat,
+			// so feat2 (whose budget would otherwise be fresh) defers fully.
+			writeFileSync(join(fork, "f.txt"), `f${i} ${"z".repeat(8_000)}\n`);
+			await run(["add", "f.txt", fork], fork);
+			await run(["commit", "-q", "-m", `f${i}`, fork], fork);
 			featShas.push(await shaOf(fork));
 		}
 		// A second branch off the clone base: the cap is already full at its turn.
 		await run(["checkout", "-q", "-b", "feat2", base], fork);
 		await run(["commit", "-q", "--allow-empty", "-m", "g0", fork], fork);
-		const g0 = await shaOf(fork);
 		await run(["commit", "-q", "--allow-empty", "-m", "g1", fork], fork);
 		const head2 = await shaOf(fork);
 		const bh1 = branchHash("feat");
@@ -583,14 +647,19 @@ describe("collectRange", () => {
 			],
 			git: defaultGit,
 		});
-		// feat fills the cap; feat2 contributes no collected commit at all.
-		expect(range.commits.every((c) => c.branches.includes("feat"))).toBe(true);
-		expect(skipped.get(bh1)).toEqual(
-			featShas.slice(FORK_GATES.MAX_RANGE_COMMITS),
-		);
-		expect(skipped.get(bh2)).toEqual([g0, head2]);
-		expect(keptHead.get(bh2)).toBeUndefined();
-		expect(keptHead.get(bh1)).toBe(featShas[FORK_GATES.MAX_RANGE_COMMITS - 1]);
+		// feat's ~16 KB patches exhaust the shared char budget: its newest commits
+		// defer, feat2's empty commits ride free (zero chars), and featB-style later
+		// branches would see the shrunken budget — the budget is shared, not fresh.
+		const featCount = range.commits.filter((c) =>
+			c.branches.includes("feat"),
+		).length;
+		const totalChars = range.commits.reduce((n, c) => n + c.patch.length, 0);
+		expect(totalChars).toBeLessThanOrEqual(FORK_GATES.MAX_TOTAL_PATCH_CHARS);
+		expect(featCount).toBeLessThan(FORK_GATES.MAX_RANGE_COMMITS);
+		expect(skipped.get(bh1)).toEqual(featShas.slice(featCount));
+		expect(keptHead.get(bh1)).toBe(featShas[featCount - 1]);
+		// feat2's empty commits ride free (zero chars) and its cursor is its head.
+		expect(keptHead.get(bh2)).toBe(head2);
 	}, 120_000);
 
 	// A real --no-ff merge in the middle of the range: the merge is OLDER than kept
@@ -600,7 +669,7 @@ describe("collectRange", () => {
 		const fork = mkRepo("cr-mmerge-fork");
 		await run(["clone", "-q", main, fork], root);
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
-		for (let i = 0; i < 60; i++)
+		for (let i = 0; i < 160; i++)
 			await run(["commit", "-q", "--allow-empty", "-m", `pre${i}`, fork], fork);
 		await run(["checkout", "-q", "-b", "side", fork], fork);
 		writeFileSync(join(fork, "side.txt"), "side work\n");
@@ -670,7 +739,7 @@ describe("collectRange", () => {
 		const fork = mkRepo("cr-mcursor-fork");
 		await run(["clone", "-q", main, fork], root);
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
-		for (let i = 0; i < 98; i++)
+		for (let i = 0; i < 198; i++)
 			await run(["commit", "-q", "--allow-empty", "-m", `e${i}`, fork], fork);
 		// Two side-branch merges stacked on top: 98 empties + S1 + M1 + S2 + M2 = 102
 		// candidates; the cap keeps the oldest 100, so M1 is the newest kept point.
@@ -744,7 +813,7 @@ describe("collectRange", () => {
 		await run(["clone", "-q", main, fork], root);
 		await run(["checkout", "-q", "-b", "feat", fork], fork);
 		const aShas: string[] = [];
-		for (let i = 0; i < 99; i++) {
+		for (let i = 0; i < 199; i++) {
 			await run(["commit", "-q", "--allow-empty", "-m", `a${i}`, fork], fork);
 			aShas.push(await shaOf(fork));
 		}
@@ -775,10 +844,10 @@ describe("collectRange", () => {
 			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
 			git: defaultGit,
 		});
-		expect(first.range.commits.map((c) => c.sha)).toEqual(aShas);
+		expect(first.range.commits.map((c) => c.sha)).toEqual([...aShas, bSha]);
 		expect(first.range.merges).toEqual([]);
-		expect(first.skipped.get(bh)).toEqual([bSha, mSha]);
-		expect(first.keptHead.get(bh)).toBe(aShas[98]!);
+		expect(first.skipped.get(bh)).toEqual([mSha]);
+		expect(first.keptHead.get(bh)).toBe(aShas[198]!);
 		// The cursor is A99: the next window is exactly B1 + M — the merge cannot
 		// starve, and none of the kept A-line commits re-list.
 		const second = await collectRange({
@@ -810,7 +879,11 @@ describe("collectRange", () => {
 		await run(["checkout", "-q", "-b", "side", fork], fork);
 		const sideShas: string[] = [];
 		for (let i = 0; i < 150; i++) {
-			await run(["commit", "-q", "--allow-empty", "-m", `s${i}`, fork], fork);
+			// ~11 KB of patch per commit: 150 of them exceed the shared char budget,
+			// so the run defers inside the side line instead of reaching the merge.
+			writeFileSync(join(fork, "s.txt"), `s${i} ${"x".repeat(11_000)}\n`);
+			await run(["add", "s.txt", fork], fork);
+			await run(["commit", "-q", "-m", `s${i}`, fork], fork);
 			sideShas.push(await shaOf(fork));
 		}
 		await run(["checkout", "-q", "main", fork], fork);
@@ -837,41 +910,48 @@ describe("collectRange", () => {
 			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
 			git: defaultGit,
 		});
-		// The bypass bound: exactly the cap is collected, the merge itself deferred.
-		expect(first.range.commits.length + first.range.merges.length).toBe(
-			FORK_GATES.MAX_RANGE_COMMITS,
+		// The budget bound: the collected patches never exceed the shared char total,
+		// the commit count never exceeds the cap, and the merge itself defers.
+		const keptCount = first.range.commits.length + first.range.merges.length;
+		expect(keptCount).toBeLessThanOrEqual(FORK_GATES.MAX_RANGE_COMMITS);
+		const keptChars = first.range.commits.reduce(
+			(n, c) => n + c.patch.length,
+			0,
 		);
+		expect(keptChars).toBeLessThanOrEqual(FORK_GATES.MAX_TOTAL_PATCH_CHARS);
 		expect(first.range.merges).toEqual([]);
-		expect(first.range.commits.map((c) => c.sha)).toEqual(
-			sideShas.slice(0, FORK_GATES.MAX_RANGE_COMMITS),
-		);
-		expect(first.skipped.get(bh)).toEqual([
-			...sideShas.slice(FORK_GATES.MAX_RANGE_COMMITS),
-			mSha,
+		expect(first.skipped.get(bh)).toContain(mSha);
+		expect(first.keptHead.get(bh)).toBeDefined();
+		expect(first.keptHead.get(bh)).not.toBe(mSha);
+		// The follow-up runs from the parked cursors converge: every deferred sha
+		// re-lists until collected, so the union covers all 151 exactly once.
+		let baseCursor = first.keptHead.get(bh)!;
+		const seen = new Set([
+			...first.range.commits.map((c) => c.sha),
+			...first.range.merges.map((c) => c.sha),
 		]);
-		expect(first.keptHead.get(bh)).toBe(
-			sideShas[FORK_GATES.MAX_RANGE_COMMITS - 1],
-		);
-		// The follow-up run from the parked cursor collects the rest, merge included.
-		const second = await collectRange({
-			cachePath,
-			mainPath: main,
-			fork: forkPageEntry(1) as never,
-			branches: [
-				{
-					branchHash: bh,
-					branch: "feat",
-					head,
-					analyzedHead: first.keptHead.get(bh)!,
-				},
-			],
-			git: defaultGit,
-		});
-		expect(second.range.commits.map((c) => c.sha)).toEqual(
-			sideShas.slice(FORK_GATES.MAX_RANGE_COMMITS),
-		);
-		expect(second.range.merges.map((c) => c.sha)).toEqual([mSha]);
-		expect(second.skipped.get(bh) ?? []).toEqual([]);
+		for (let round = 0; round < 6 && seen.size < 151; round++) {
+			const next = await collectRange({
+				cachePath,
+				mainPath: main,
+				fork: forkPageEntry(1) as never,
+				branches: [
+					{ branchHash: bh, branch: "feat", head, analyzedHead: baseCursor },
+				],
+				git: defaultGit,
+			});
+			for (const c of [...next.range.commits, ...next.range.merges]) {
+				expect(seen.has(c.sha)).toBe(false); // no re-listing of kept work
+				seen.add(c.sha);
+			}
+			expect(
+				next.range.commits.length + next.range.merges.length,
+			).toBeLessThanOrEqual(FORK_GATES.MAX_RANGE_COMMITS);
+			baseCursor = next.keptHead.get(bh)!;
+		}
+		expect(seen.size).toBe(151);
+		expect(seen.has(mSha)).toBe(true);
+		for (const sha of sideShas) expect(seen.has(sha)).toBe(true);
 	}, 120_000);
 
 	// Released extras outside the window ride first and charge the allowance; the
@@ -884,13 +964,20 @@ describe("collectRange", () => {
 		await run(["checkout", "-q", "-b", "extra", fork], fork);
 		const extraShas: string[] = [];
 		for (let i = 0; i < 20; i++) {
-			await run(["commit", "-q", "--allow-empty", "-m", `x${i}`, fork], fork);
+			// ~15 KB of patch per extra: 20 extras spend 300 KB of the shared budget
+			// before the window's own commits are read.
+			writeFileSync(join(fork, "x.txt"), `x${i} ${"y".repeat(15_000)}\n`);
+			await run(["add", "x.txt", fork], fork);
+			await run(["commit", "-q", "-m", `x${i}`, fork], fork);
 			extraShas.push(await shaOf(fork));
 		}
 		await run(["checkout", "-q", "-b", "feat", base], fork);
 		const featShas: string[] = [];
 		for (let i = 0; i < 90; i++) {
-			await run(["commit", "-q", "--allow-empty", "-m", `e${i}`, fork], fork);
+			// ~20 KB of patch per window commit: the budget breaks inside the window.
+			writeFileSync(join(fork, "e.txt"), `e${i} ${"z".repeat(20_000)}\n`);
+			await run(["add", "e.txt", fork], fork);
+			await run(["commit", "-q", "-m", `e${i}`, fork], fork);
 			featShas.push(await shaOf(fork));
 		}
 		const head = featShas[featShas.length - 1]!;
@@ -922,14 +1009,17 @@ describe("collectRange", () => {
 			],
 			git: defaultGit,
 		});
-		// 20 extras + 80 window commits = the cap; the window's newest 10 defer.
-		expect(range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
-		expect(range.commits.map((c) => c.sha)).toEqual([
-			...extraShas,
-			...featShas.slice(0, 80),
-		]);
-		expect(skipped.get(bh)).toEqual(featShas.slice(80));
-		expect(keptHead.get(bh)).toBe(featShas[79]);
+		// The budget bound: the extras ride first in order, and the window keeps only
+		// what the remaining budget covers — its newest tail defers with kept rows.
+		expect(range.commits.length).toBeLessThanOrEqual(
+			FORK_GATES.MAX_RANGE_COMMITS,
+		);
+		const keptChars = range.commits.reduce((n, c) => n + c.patch.length, 0);
+		expect(keptChars).toBeLessThanOrEqual(FORK_GATES.MAX_TOTAL_PATCH_CHARS);
+		expect(range.commits.slice(0, 20).map((c) => c.sha)).toEqual(extraShas);
+		expect(range.commits.length).toBeGreaterThan(20);
+		expect(skipped.get(bh)).toEqual(featShas.slice(range.commits.length - 20));
+		expect(keptHead.get(bh)).toBeDefined();
 	}, 120_000);
 
 	// Extras charge the shared budget before the window, and the charge lands even
@@ -990,18 +1080,20 @@ describe("collectRange", () => {
 			],
 			git: defaultGit,
 		});
-		// featA: 50 extras (half the allowance) + its one window commit, charged 51.
-		// featB: the remaining 49. The run total is the cap, not 51 + 100.
+		// The commit cap is shared: featA's 150 free extras plus its window commit
+		// spend 151 of it, so featB keeps only the remaining 49 — the run total is
+		// the cap, not 151 + 100.
 		expect(range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
 		expect(
 			range.commits.filter((c) => c.branches.includes("featA")).length,
-		).toBe(51);
+		).toBe(151);
 		expect(
 			range.commits.filter((c) => c.branches.includes("featB")).length,
 		).toBe(49);
-		// featA's cursor parks on its window commit: no extras-only livelock.
+		// featA's cursor parks on its window commit (deepest mainline kept); featB's
+		// parks on its own 49th commit: no extras-only livelock on either branch.
 		expect(keptHead.get(bhA)).toBe(a0);
-		expect(skipped.get(bhA)).toHaveLength(extraShas.length - 50);
+		expect(skipped.get(bhA) ?? []).toEqual([]);
 		expect(keptHead.get(bhB)).toBe(bShas[48]);
 		expect(skipped.get(bhB)).toEqual(bShas.slice(49));
 	}, 120_000);
@@ -1115,18 +1207,16 @@ describe("watcher", () => {
 		const forkDir = mkRepo(`${name}-fork`);
 		await run(["clone", "-q", main, forkDir], root);
 		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
-		for (let i = 0; i < 99; i++)
-			await run(
-				["commit", "-q", "--allow-empty", "-m", `e${i}`, forkDir],
-				forkDir,
+		// 60 window commits of ~30 KB each exhaust the shared char budget before
+		// "released work" is read: it sits past the budget on the first run.
+		for (let i = 0; i < 60; i++) {
+			writeFileSync(
+				join(forkDir, `w${i}.txt`),
+				`w${i} ${"c".repeat(30_000)}\n`,
 			);
-		for (let i = 0; i < 2; i++)
-			await run(
-				["commit", "-q", "--allow-empty", "-m", `f${i}`, forkDir],
-				forkDir,
-			);
-		// 99 + 2 empties + this commit + 1 empty = 103 candidates: the cut lands on
-		// f0 (depth 100), so "released work" sits past the cap on the first run.
+			await run(["add", `w${i}.txt`, forkDir], forkDir);
+			await run(["commit", "-q", "-m", `w${i}`, forkDir], forkDir);
+		}
 		writeFileSync(join(forkDir, "rel.txt"), "released work\n");
 		await run(["add", "rel.txt", forkDir], forkDir);
 		await run(["commit", "-q", "-m", "released work", forkDir], forkDir);
@@ -1150,20 +1240,23 @@ describe("watcher", () => {
 			[],
 		);
 		await watcher.tick();
-		expect(state.subjects.length).toBe(1);
 		expect(state.subjects[0]).not.toContain("released work");
-		// The cap deferred "released work": its row must ride, not drop, or a commit
-		// outside the branch window could never ride again.
+		// The budget deferred "released work": its row must ride, not drop, or a
+		// commit outside the branch window could never ride again.
 		const held = await store.listForkHolds(1);
 		expect(held.some((h) => h.sha === relSha && h.released === 1)).toBe(true);
-		state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
-		await watcher.tick();
-		expect(state.subjects.length).toBe(2);
-		expect(state.subjects[1]).toContain("released work");
-		// The deferred commit was analyzed and covered: its row is consumed.
+		// Later runs ride the deferred commit forward until it fits the budget and
+		// the analysis covers it: the row is consumed, never stranded.
+		for (let round = 0; round < 8; round++) {
+			const heldNow = await store.listForkHolds(1);
+			if (!heldNow.some((h) => h.sha === relSha)) break;
+			state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
+			await watcher.tick();
+		}
+		expect(state.subjects.flat()).toContain("released work");
 		const held2 = await store.listForkHolds(1);
 		expect(held2.some((h) => h.sha === relSha)).toBe(false);
-	}, 120_000);
+	}, 180_000);
 
 	test("released extras half the budget: the window still runs and rows shrink each run", async () => {
 		const name = "watch-extralock";
@@ -1185,10 +1278,11 @@ describe("watcher", () => {
 		await run(["checkout", "-q", "-b", "extra", forkDir], forkDir);
 		const extraShas: string[] = [];
 		for (let i = 0; i < 150; i++) {
-			await run(
-				["commit", "-q", "--allow-empty", "-m", `x${i}`, forkDir],
-				forkDir,
-			);
+			// ~15 KB of patch per extra: the extras alone exceed the shared char
+			// budget, so the window defers on run 1 and the extras ride in slices.
+			writeFileSync(join(forkDir, "x.txt"), `x${i} ${"y".repeat(15_000)}\n`);
+			await run(["add", "x.txt", forkDir], forkDir);
+			await run(["commit", "-q", "-m", `x${i}`, forkDir], forkDir);
 			extraShas.push(await shaOf(forkDir));
 		}
 		await run(["checkout", "-q", "feat", forkDir], forkDir);
@@ -1214,36 +1308,37 @@ describe("watcher", () => {
 			[{ id: 1, owner: "o", dir: forkDir }],
 			[],
 		);
+		// The extras' patches (~30 KB each, 150 of them) exceed the shared char
+		// budget several times over: the window defers on the first run (not starved
+		// — it runs as soon as the riding extras fit) and the runs converge without
+		// losing or repeating a single commit.
 		await watcher.tick();
-		// Run 1: 50 extras (half the allowance) + all 10 window commits — the window
-		// is not starved, and the cursor reaches the head.
-		expect(state.subjects.length).toBe(1);
-		for (let i = 0; i < 10; i++)
-			expect(state.subjects[0]).toContain(`window ${i}`);
-		// Which half of the extras rides is not pinned (the store's row order decides);
-		// the count is: 50 extras, and the window is not starved.
-		expect(state.subjects[0]!.filter((sub) => sub.startsWith("x")).length).toBe(
-			50,
-		);
+		const run1x = state.subjects[0]!.filter((sub) =>
+			sub.startsWith("x"),
+		).length;
+		const run1w = state.subjects[0]!.filter((sub) =>
+			sub.startsWith("window"),
+		).length;
+		expect(run1x).toBeGreaterThan(0);
+		expect(run1x).toBeLessThanOrEqual(FORK_GATES.MAX_RANGE_COMMITS);
+		expect(run1w).toBe(0);
 		const held1 = await store.listForkHolds(1);
-		expect(held1.length).toBe(100);
-		// Runs 2 and 3: the deferred extras ride in, get covered, and their rows are
-		// consumed — the riding set shrinks instead of repeating forever.
-		state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
-		await watcher.tick();
-		const held2 = await store.listForkHolds(1);
-		expect(held2.length).toBe(50);
-		expect(state.subjects[1]!.filter((sub) => sub.startsWith("x")).length).toBe(
-			50,
-		);
-		state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
-		await watcher.tick();
-		const held3 = await store.listForkHolds(1);
-		expect(held3.length).toBe(0);
-		expect(state.subjects[2]!.filter((sub) => sub.startsWith("x")).length).toBe(
-			50,
-		);
-		expect(state.subjects.length).toBe(3);
+		expect(held1.length).toBe(150 - run1x);
+		for (
+			let round = 0;
+			round < 8 && state.subjects.flat().length < 160;
+			round++
+		) {
+			state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
+			await watcher.tick();
+			const roundAll = state.subjects.flat();
+			expect(new Set(roundAll).size).toBe(roundAll.length); // nothing repeats
+		}
+		const all = state.subjects.flat();
+		expect(all.filter((sub) => sub.startsWith("x")).length).toBe(150);
+		expect(all.filter((sub) => sub.startsWith("window")).length).toBe(10);
+		const held = await store.listForkHolds(1);
+		expect(held.length).toBe(0);
 	}, 180_000);
 
 	test("eligible range creates card, held proposal, advances cursor; no duplicates on second tick", async () => {

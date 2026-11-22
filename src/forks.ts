@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
 	analyzeRange,
+	PROMPT_CHAR_BUDGET,
 	proposalPrompt,
 	renderReport,
 	stripInvisible,
@@ -38,16 +39,36 @@ export const FORK_GATES = {
 	MODEL_TIMEOUT_MS: 15 * 60_000,
 	/** GitHub's size estimate cap: huge forks are not research targets. */
 	MAX_SIZE_KB: 500 * 1024,
-	/** Bytes buffered from one fork commit's git show output (each pipe); a larger patch
-	 * is truncated, never buffered whole (OTTR-998). */
-	MAX_PATCH_BYTES: 256 * 1024,
-	/** Commits plus merges collected per range run (the budget is shared across the
-	 * run's branches). Each branch keeps exactly the window ancestry of the deepest
-	 * first-parent commit that fits its allowance, reports the rest as skipped, and the
-	 * watcher parks that branch's cursor on the cut commit, so the skipped tail rides
-	 * the next run's window instead of being lost. */
-	MAX_RANGE_COMMITS: 100,
+	/** Per-commit patch cap in bytes (OTTR-998): one fork commit's git show streams
+	 * through the pipe reader and is never buffered past it; a cut patch carries a
+	 * truncation marker. Derived from the prompt budget, so one commit never carries
+	 * more prompt text than the budget itself. */
+	MAX_PATCH_BYTES: PROMPT_CHAR_BUDGET,
+	/** Total patch chars collected per range run, shared across the run's branches:
+	 * commits past it defer with their hold rows riding. Four prompt budgets. */
+	MAX_TOTAL_PATCH_CHARS: 4 * PROMPT_CHAR_BUDGET,
+	/** Commits plus merges collected per range run. */
+	MAX_RANGE_COMMITS: 200,
 } as const;
+
+/**
+ * Incremental collection budget for one range run: admit(patchChars) keeps a commit's
+ * patch while the commit count and the shared char total fit, and refuses once either
+ * is spent. Pure state, so tests can fold generated patch sequences against the caps.
+ */
+export function createPatchBudget(maxCommits: number, maxTotalChars: number) {
+	let count = 0;
+	let chars = 0;
+	return {
+		admit(patchChars: number): boolean {
+			if (count >= maxCommits) return false;
+			if (chars + patchChars > maxTotalChars) return false;
+			count += 1;
+			chars += patchChars;
+			return true;
+		},
+	};
+}
 
 const NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -470,11 +491,14 @@ export async function collectRange(o: {
 	const bySha = new Map<string, ForkCommit>();
 	const commits: ForkCommit[] = [];
 	const merges: ForkCommit[] = [];
-	// The run's shared collection budget across branches: a branch's allowance is what
-	// earlier branches left, so the total evidence stays under the cap.
-	let budget = FORK_GATES.MAX_RANGE_COMMITS;
-	// The cut commit per branch hash: the watcher parks the branch cursor here when
-	// the cap deferred the branch's tail, so the tail rides the next window.
+	// One shared ingestion budget per run (commit count + patch chars across all
+	// branches), and the cursor per branch hash: the deepest mainline commit kept,
+	// so a deferred tail rides the next run's window. Unset when nothing mainline
+	// was kept — the watcher then consumes riding extras and holds the cursor.
+	const patchBudget = createPatchBudget(
+		FORK_GATES.MAX_RANGE_COMMITS,
+		FORK_GATES.MAX_TOTAL_PATCH_CHARS,
+	);
 	const keptHead = new Map<string, string>();
 	// Shas per branch hash the cap skipped; the next run's window re-lists them.
 	const skipped = new Map<string, string[]>();
@@ -558,90 +582,34 @@ export async function collectRange(o: {
 		holds.set(b.branchHash, branchHolds);
 		if (branchFiltered.length > 0)
 			filteredReleased.set(b.branchHash, branchFiltered);
-		// Cap cut on the branch's first-parent mainline: the cursor parks on the deepest
-		// mainline commit whose window ancestry fits the branch's window allowance, and
-		// the branch collects exactly that ancestry. A walk prefix cannot do this across
-		// merge parents: its last sha excludes only its own line, so a merge joining two
-		// kept lines starves forever (its ancestry never shrinks below the cap) and kept
-		// parallel-line work re-lists every run. Collected ⊆ ancestry(cut) and
-		// skipped ∩ ancestry(cut) = ∅ hold by construction whenever a mainline cut fits.
-		// When none fits (one merge carries more new commits than the whole allowance),
-		// a capped walk inside that ancestry bounds the run instead: the deferred
-		// survivors re-list next run (parents-first walk order), and kept parallel-line
-		// work may re-list once — bounded re-analysis, never a loss.
+		// Ingestion streams one commit at a time in commit order (oldest first, released
+		// extras outside the window riding first — they have waited longest): each patch
+		// streams through a pipe capped at MAX_PATCH_BYTES and is buffered with a
+		// truncation marker when cut, and the run stops collecting when the commit count
+		// or the shared patch-char total is spent. Everything past the stop defers with
+		// markSkipped (its hold rows ride via keepReleased), and the cursor parks on the
+		// deepest mainline commit kept, so a deferred tail re-lists next run without
+		// starving a joining merge (a side-line cursor re-opens the base history next
+		// run; the upstream intersection filters its commits out of the candidates, but
+		// the mainline cursor keeps the walk and counts small).
 		const survivor = new Set([...shas, ...mergeShas]);
 		const mergeSet = new Set(mergeShas);
 		const inWalk = raw.all.filter((s) => survivor.has(s));
 		const walked = new Set(inWalk);
-		// Released extras outside the window ride first and charge the allowance, but
-		// they take at most half of it: a branch whose whole allowance would go to
-		// extras must still make progress on its own window, or the extras (which re-
-		// ride every run until a run covers them) would starve the window forever.
-		// Extras past their share defer, and their hold rows ride with them
-		// (keepReleased retains rows the cap skipped).
-		const outside = shas.filter((s) => !walked.has(s));
-		const allowance = Math.min(budget, FORK_GATES.MAX_RANGE_COMMITS);
-		const outsideKept = Math.min(outside.length, Math.floor(allowance / 2));
-		const windowAllowance = allowance - outsideKept;
-		for (const s of outside.slice(outsideKept)) markSkipped(b.branchHash, s);
-		const rideOutside = outside.slice(0, outsideKept);
-		const mainline = [...raw.mainline].reverse(); // oldest first
-		let cut: string | undefined;
-		let collectedSet = new Set<string>();
-		let bounded = false;
-		if (mainline.length > 0 && windowAllowance > 0) {
-			// ancestry(m_depth) grows monotonically with mainline depth: binary-search the
-			// deepest depth whose window ancestry fits the window allowance. depth 1 is
-			// checked too: a head whose first mainline step already overflows (one merge
-			// carrying the whole new side line) has no fitting mainline cut at all.
-			const countAt = async (depth: number) =>
-				new Set(
-					await revList([mainline[depth - 1]!, `^${base}`], cachePath, git),
-				);
-			const deepest = await countAt(mainline.length);
-			if (deepest.size <= windowAllowance) {
-				cut = mainline[mainline.length - 1]!;
-				collectedSet = deepest;
-				bounded = true;
-			} else if ((await countAt(1)).size <= windowAllowance) {
-				let lo = 1;
-				let hi = mainline.length;
-				while (hi - lo > 1) {
-					const mid = (lo + hi) >> 1;
-					if ((await countAt(mid)).size <= windowAllowance) lo = mid;
-					else hi = mid;
-				}
-				cut = mainline[lo - 1]!;
-				collectedSet = await countAt(lo);
-				bounded = true;
-			}
-		}
-		// Oldest-first reference for the skip marks: captured before any reversing, so
-		// the deferred set is always reported in commit order.
-		const walkOldestFirst = [...inWalk].reverse();
-		const windowOrder = bounded
-			? inWalk.filter((s) => collectedSet.has(s)).reverse()
-			: walkOldestFirst;
-		let order = [...rideOutside, ...windowOrder];
-		if (!bounded && order.length > allowance) {
-			order = order.slice(0, allowance);
-			const last = order[order.length - 1]!;
-			if (walked.has(last)) cut = last;
-		}
-		const ordered = new Set(order);
-		for (const s of walkOldestFirst) {
-			if (!ordered.has(s)) markSkipped(b.branchHash, s);
-		}
-		if (cut !== undefined) keptHead.set(b.branchHash, cut);
-		// The charge is unconditional: collected evidence spends the budget even when
-		// no cut commit was set (the capped-walk fallback collects without one), or
-		// later branches would each see a fresh allowance.
-		budget -= Math.min(budget, order.length);
+		const mainlineSet = new Set(raw.mainline);
+		const order = [
+			...shas.filter((s) => !walked.has(s)),
+			...[...inWalk].reverse(),
+		];
+		let keptMainline: string | undefined;
+		let keptWalk: string | undefined;
 		for (const sha of order) {
 			const existing = bySha.get(sha);
 			if (existing) {
 				if (!existing.branches.includes(b.branch))
 					existing.branches.push(b.branch);
+				if (mainlineSet.has(sha)) keptMainline = sha;
+				if (walked.has(sha)) keptWalk = sha;
 				continue;
 			}
 			const asMerge = mergeSet.has(sha);
@@ -671,6 +639,24 @@ export async function collectRange(o: {
 			if (r.code !== 0) throw errSnippet(`git show ${sha}`, r.code, r.stderr);
 			const p = parseShow(r.stdout);
 			if (!p) continue;
+			// The pipe cap cuts bytes; the decoded text's byte length tells whether it
+			// was cut (the patch substring alone can sit under the cap once the show
+			// header is stripped).
+			const truncated =
+				Buffer.byteLength(r.stdout) >= FORK_GATES.MAX_PATCH_BYTES;
+			const patch = truncated ? `${p.patch}\n[patch truncated]` : p.patch;
+			if (!patchBudget.admit(patch.length)) {
+				// The commit count or the shared patch-char total is spent: this commit
+				// and everything after it in walk order defer to the next run. The
+				// collection window closes at the first refusal — a free (empty-patch)
+				// commit further down must never be kept past deferred ones, or the
+				// cursor would strand them.
+				const at = order.indexOf(sha);
+				for (const rest of order.slice(at)) {
+					markSkipped(b.branchHash, rest);
+				}
+				break;
+			}
 			const numstat = asMerge
 				? []
 				: r.stdout.split("\n").filter((l) => /^(\d+|-)\t(\d+|-)\t/.test(l));
@@ -686,14 +672,35 @@ export async function collectRange(o: {
 				files: numstat.length,
 				plus: n(0),
 				minus: n(1),
-				patch: p.patch,
+				patch,
 				branches: [],
 			};
 			bySha.set(sha, commit);
 			if (asMerge) merges.push(commit);
 			else commits.push(commit);
 			if (!commit.branches.includes(b.branch)) commit.branches.push(b.branch);
+			if (mainlineSet.has(sha)) keptMainline = sha;
+			if (walked.has(sha)) keptWalk = sha;
 		}
+		// The cursor prefers the deepest mainline commit kept: a side-line or extra
+		// cursor re-opens the base history next run (the upstream intersection filters
+		// its commits out of the candidates, but the walk and counts carry them), while
+		// a mainline cursor keeps both small. Without a kept mainline commit — a whole
+		// side line deferred in front of the join — the last kept sha still advances
+		// the cursor along that line.
+		// A non-mainline cursor (a riding extra or a side commit) would strand the
+		// branch's own window next run: those commits are ancestors of the extra or
+		// side line, so the window would be excluded forever. Leave the cursor unset
+		// instead — the watcher consumes riding extras and holds the cursor.
+		// The cursor prefers the deepest mainline commit kept (a deferred tail then
+		// re-lists exactly). Riding extras outside the window never become the
+		// cursor: they are ancestors of the window's commits in these fixtures, and
+		// a cursor on their line would exclude the whole window next run. Without a
+		// kept mainline commit, the last kept walk commit still advances the branch
+		// along its own line; with neither, the watcher consumes riding extras and
+		// holds the cursor.
+		const cursor = keptMainline ?? keptWalk;
+		if (cursor !== undefined) keptHead.set(b.branchHash, cursor);
 	}
 
 	const list = async (args: string[], cap: number) => {
@@ -1409,7 +1416,7 @@ export function createForkWatcher(deps: {
 					const analyzed: Array<{
 						forkId: number;
 						branchHash: string;
-						head: string;
+						head: string | null;
 						at: number;
 						consumed?: string[];
 					}> = [];
@@ -1436,12 +1443,9 @@ export function createForkWatcher(deps: {
 								// the branch's own window runs next run on the shrunken
 								// riding set instead of repeating this run forever.
 								const row = pending.find((r) => r.branchHash === h.branchHash);
-								if (
-									row === undefined ||
-									row.analyzedHead === null ||
-									consumed.length === 0
-								)
-									continue;
+								if (row === undefined || consumed.length === 0) continue;
+								// The cursor stays where it is (null on a first analysis):
+								// only the riding rows are consumed this run.
 								analyzed.push({
 									forkId: fork.id,
 									branchHash: h.branchHash,
