@@ -12859,17 +12859,22 @@ export async function createApp(deps: AppDeps) {
 		if (model instanceof Response) return model;
 		return { trimmed, model };
 	}
-	/** Creates the follow-up card and saves its images; a Response cancels the fresh card. */
+	/** Creates the follow-up card and saves its images; a Response cancels the fresh card.
+	 * `backlog` parks it as a draft from the start, so no scheduler pass can claim it. */
 	async function createFollowUp(
 		target: Entry,
 		trimmed: string,
 		model: string | null,
 		images: DecodedImage[],
+		backlog: boolean,
 	): Promise<{ id: string; names: string[]; task: Task } | Response> {
 		// The creation hold keeps the task idle until its images and handoff are ready.
 		const t = await target.store.transaction(async () => {
 			const task = await target.store.createTask(trimmed, model);
-			return target.store.updateTask(task.id, { holdUntil: PROMPT_EDIT_HELD });
+			return target.store.updateTask(task.id, {
+				holdUntil: PROMPT_EDIT_HELD,
+				...(backlog ? { stage: "backlog", state: "idle", queuedAt: null } : {}),
+			});
 		});
 		const names = await followUpImages(target, t, images);
 		if (names instanceof Response) return names;
@@ -12891,7 +12896,13 @@ export async function createApp(deps: AppDeps) {
 		const images = await steerDecoded(target, body.images);
 		if (images instanceof Response) return images;
 		await withTask(e, task, () => {});
-		const made = await createFollowUp(target, trimmed, model, images);
+		const made = await createFollowUp(
+			target,
+			trimmed,
+			model,
+			images,
+			body.backlog === true,
+		);
 		if (made instanceof Response) return made;
 		let failed: Response | null;
 		try {

@@ -8037,6 +8037,70 @@ describe("FollowUpDialog project picker", () => {
 		});
 		expect(followed).toEqual(["N-1:D-1"]);
 	});
+	test("the backlog mask posts a draft without a model pick", async () => {
+		bodies.length = 0;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const followed: string[] = [];
+		try {
+			await act(async () => {
+				root.render(
+					<FollowUpDialog
+						task={
+							{
+								...cardFixture({ id: "D-2" }),
+								project: "proj",
+							} as unknown as TaskView
+						}
+						projects={[]}
+						open
+						backlog
+						onClose={() => {}}
+						act={async (fn) => {
+							await fn();
+							return true;
+						}}
+						onFollowed={(id, from) => followed.push(`${id}:${from}`)}
+					/>,
+				);
+			});
+			expect(container.querySelector(".model-trigger")).toBeNull();
+			expect(container.innerHTML).toContain("Draft backlog card");
+			const textarea = container.querySelector("textarea");
+			const form = container.querySelector("form.dialog-body");
+			if (textarea === null || form === null) throw new Error("no form");
+			const key = Object.getOwnPropertyNames(textarea).find((k) =>
+				k.startsWith("__reactProps$"),
+			);
+			if (key === undefined) throw new Error("no React props");
+			const props = (node: unknown) =>
+				Reflect.get(node as object, key) as Record<
+					string,
+					(e: unknown) => void
+				>;
+			await act(async () => {
+				props(textarea).onChange?.({ target: { value: "park this" } });
+			});
+			await act(async () => {
+				props(form).onSubmit?.({ preventDefault: () => {} });
+				await Bun.sleep(0);
+			});
+		} finally {
+			await act(async () => root.unmount());
+			container.remove();
+		}
+		expect(bodies).toHaveLength(1);
+		expect(bodies[0]?.url).toBe("/api/projects/proj/tasks/D-2/follow-up");
+		expect(bodies[0]?.body).toEqual({
+			text: "park this",
+			images: [],
+			backlog: true,
+		});
+		expect(followed).toEqual(["N-1:D-2"]);
+	});
 });
 
 describe("path URL card links", () => {

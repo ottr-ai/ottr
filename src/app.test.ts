@@ -1472,6 +1472,32 @@ describe("task routes", () => {
 		expect(handoff).toContain(`Saved files: \`${saved}\``);
 	});
 
+	test("a backlog follow-up parks a linked draft with a handoff and never queues it", async () => {
+		const parent = await store.createTask("done parent for a draft");
+		await store.updateTask(parent.id, { stage: "done", state: "idle" });
+		const res = await post(`/api/projects/p1/tasks/${parent.id}/follow-up`, {
+			text: "idea for later",
+			backlog: true,
+		});
+		expect(res.status).toBe(200);
+		const view = (await res.json()) as { id: string };
+		const kid = (await store.getTask(view.id))!;
+		expect(kid).toMatchObject({
+			stage: "backlog",
+			state: "idle",
+			queuedAt: null,
+			holdUntil: null,
+			followUpOf: parent.id,
+			followUpOfProject: null,
+		});
+		const handoffPath = join(store.tasksDir, "handoffs", `${kid.id}.md`);
+		expect(readFileSync(handoffPath, "utf8")).toContain(
+			"done parent for a draft",
+		);
+		expect(kid.prompt).toStartWith("idea for later");
+		expect(kid.prompt).toContain(`@${handoffPath}`);
+	});
+
 	test("diff endpoint serves the captured stat and text for finished cards", async () => {
 		const t = await store.createTask("captured diff");
 		await store.updateTask(t.id, {

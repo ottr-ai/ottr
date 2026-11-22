@@ -3391,7 +3391,8 @@ function ImplementStepsDialog({
 
 /**
  * Follow-up on a done task: opens from the done drawer's Follow up button; creates a fresh
- * task that continues in its drawer.
+ * task that continues in its drawer. `backlog` is the draft mask of the same flow: the card
+ * keeps the handoff and the link but parks in the backlog and runs no agent, so no model pick.
  */
 export function FollowUpDialog({
 	task,
@@ -3400,6 +3401,7 @@ export function FollowUpDialog({
 	onClose,
 	act,
 	onFollowed,
+	backlog = false,
 }: {
 	task: TaskView;
 	projects: ProjectView[];
@@ -3407,6 +3409,7 @@ export function FollowUpDialog({
 	onClose: () => void;
 	act: Act;
 	onFollowed: (id: string, from: string) => void;
+	backlog?: boolean;
 }) {
 	const [target, setTarget] = useState(task.project);
 	// Closing drops the pick: the next open defaults to the task's own board again.
@@ -3414,20 +3417,30 @@ export function FollowUpDialog({
 		if (!open) setTarget(task.project);
 	}, [open, task.project]);
 	const eligible = projects.filter((p) => !p.gitless);
+	const name = task.sessionTitle ?? task.title;
 	return (
 		<ComposeDialog
 			open={open}
 			onClose={onClose}
 			act={act}
-			draftKey={`followup:${task.id}`}
-			label={`Follow up on ${task.sessionTitle ?? task.title}`}
-			heading="Follow up"
-			sub={task.sessionTitle ?? task.title}
-			inputLabel="Follow-up"
-			placeholder="Re-run the failed tests"
-			hint="Enter sends the follow-up. Shift+Enter starts a new line. Images: paste, drop or browse."
+			draftKey={`${backlog ? "followup-draft" : "followup"}:${task.id}`}
+			label={
+				backlog ? `Draft backlog card from ${name}` : `Follow up on ${name}`
+			}
+			heading={backlog ? "Draft backlog card" : "Follow up"}
+			sub={name}
+			inputLabel={backlog ? "Idea" : "Follow-up"}
+			placeholder={
+				backlog ? "Batch-release on Thursdays" : "Re-run the failed tests"
+			}
+			hint={
+				backlog
+					? "Enter parks the draft in the backlog with a handoff of this task. Shift+Enter starts a new line. Images: paste, drop or browse. No model pick: a draft runs no agent."
+					: "Enter sends the follow-up. Shift+Enter starts a new line. Images: paste, drop or browse."
+			}
 			icon="send"
-			submitLabel="Follow up"
+			submitLabel={backlog ? "Add draft" : "Follow up"}
+			showModel={!backlog}
 			field={
 				eligible.length >= 2 && (
 					<label className="triage-rank followup-project">
@@ -3442,15 +3455,18 @@ export function FollowUpDialog({
 					</label>
 				)
 			}
-			deepen={async (text, model) =>
-				post<{
-					deepened: string;
-					check: DeepenCheck | null;
-					checkError: string | null;
-				}>(`/api/projects/${encodeURIComponent(target)}/deepen`, {
-					prompt: text,
-					model: model || undefined,
-				})
+			deepen={
+				backlog
+					? undefined
+					: async (text, model) =>
+							post<{
+								deepened: string;
+								check: DeepenCheck | null;
+								checkError: string | null;
+							}>(`/api/projects/${encodeURIComponent(target)}/deepen`, {
+								prompt: text,
+								model: model || undefined,
+							})
 			}
 			send={async ({ text, images, model }) => {
 				const next = await post<TaskView>(
@@ -3458,8 +3474,9 @@ export function FollowUpDialog({
 					{
 						text,
 						images,
-						model: model || undefined,
+						model: backlog ? undefined : model || undefined,
 						project: target === task.project ? undefined : target,
+						backlog: backlog || undefined,
 					},
 				);
 				// Close the drawer; the board flies the new card out of this one (another board's card finds no origin).
@@ -12781,13 +12798,16 @@ function DrawerHoldBar(p: {
 	);
 }
 
+/** Which compose mask the done drawer's follow-up dialog opens: a task that runs, or a backlog draft. */
+type FollowMode = "task" | "backlog";
+
 /** The follow-up call to action: one full-width row that reads as the next step (send
- *  icon and title in steel, the handoff hint under it, a chevron), plus a research
- *  report's Implement steps and No further steps under it. No filled button: the row
- *  never competes with a decision section's primary. */
+ *  icon and title in steel, the handoff hint under it, a chevron), plus Draft backlog card
+ *  and a research report's Implement steps and No further steps under it. No filled
+ *  button: the row never competes with a decision section's primary. */
 function FollowUpCta(p: {
 	task: TaskView;
-	setFollowOpen: (v: boolean) => void;
+	setFollowOpen: (v: FollowMode | null) => void;
 	setStepsOpen: (v: boolean) => void;
 	onMarkSeen: () => void;
 }) {
@@ -12797,7 +12817,7 @@ function FollowUpCta(p: {
 			<button
 				type="button"
 				className="followup-row"
-				onClick={() => setFollowOpen(true)}
+				onClick={() => setFollowOpen("task")}
 			>
 				<Icon name="send" />
 				<span>
@@ -12808,28 +12828,38 @@ function FollowUpCta(p: {
 				</span>
 				<Icon name="chevron-right" size={14} />
 			</button>
-			{task.research && researchSteps(task) === "yes" && (
-				<div className="followup-extra">
-					<button
-						type="button"
-						title="Picks a model, then creates a follow-up task that implements the report's recommended steps"
-						onClick={() => setStepsOpen(true)}
-					>
-						<Icon name="play" />
-						Implement steps
-					</button>
-					<BusyButton
-						title="Marks the report read and clears it from the Inbox"
-						run={async () => {
-							onMarkSeen();
-							return true;
-						}}
-					>
-						<Icon name="eye-off" />
-						No further steps
-					</BusyButton>
-				</div>
-			)}
+			<div className="followup-extra">
+				<button
+					type="button"
+					title="Parks a backlog draft that keeps this task's handoff and link; no agent runs until you start it"
+					onClick={() => setFollowOpen("backlog")}
+				>
+					<Icon name="edit" />
+					Draft backlog card
+				</button>
+				{task.research && researchSteps(task) === "yes" && (
+					<>
+						<button
+							type="button"
+							title="Picks a model, then creates a follow-up task that implements the report's recommended steps"
+							onClick={() => setStepsOpen(true)}
+						>
+							<Icon name="play" />
+							Implement steps
+						</button>
+						<BusyButton
+							title="Marks the report read and clears it from the Inbox"
+							run={async () => {
+								onMarkSeen();
+								return true;
+							}}
+						>
+							<Icon name="eye-off" />
+							No further steps
+						</BusyButton>
+					</>
+				)}
+			</div>
 		</div>
 	);
 }
@@ -13255,7 +13285,7 @@ function DrawerComposer(p: {
 	followUp: boolean;
 	prReviewOpen: boolean;
 	task: TaskView;
-	setFollowOpen: (v: boolean) => void;
+	setFollowOpen: (v: FollowMode | null) => void;
 	setStepsOpen: (v: boolean) => void;
 	onMarkSeen: () => void;
 	replySend: ReturnType<typeof useBusy>;
@@ -13880,8 +13910,8 @@ function DrawerDialogs(p: {
 	>;
 	cancelled: boolean;
 	projects: ProjectView[];
-	followOpen: boolean;
-	setFollowOpen: (v: boolean) => void;
+	followOpen: FollowMode | null;
+	setFollowOpen: (v: FollowMode | null) => void;
 	onFollowed: (id: string, from: string) => void;
 	stepsOpen: boolean;
 	setStepsOpen: (v: boolean) => void;
@@ -14001,8 +14031,9 @@ function DrawerDialogs(p: {
 				<FollowUpDialog
 					task={task}
 					projects={projects}
-					open={followOpen}
-					onClose={() => setFollowOpen(false)}
+					open={followOpen !== null}
+					backlog={followOpen === "backlog"}
+					onClose={() => setFollowOpen(null)}
 					act={act}
 					onFollowed={onFollowed}
 				/>
@@ -14626,7 +14657,7 @@ export function Drawer({
 		window.addEventListener("keydown", onKey);
 		return () => window.removeEventListener("keydown", onKey);
 	}, [viewing]);
-	const [followOpen, setFollowOpen] = useState(false);
+	const [followOpen, setFollowOpen] = useState<FollowMode | null>(null);
 	const [stepsOpen, setStepsOpen] = useState(false);
 	const [wfOpen, setWfOpen] = useState(false);
 	// Open model pick for a parked card: which action asked for it; null while closed.
