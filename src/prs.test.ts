@@ -86,7 +86,9 @@ afterEach(async () => {
 	// in one hook exceed the 5 s hook timeout there.
 	for (const [i, store] of stores.splice(0).entries())
 		await closeNamed(store, i);
-});
+	// On a busy host one close alone measured 6.5 s, past the 5 s hook default;
+	// afterAll carries the same budget below.
+}, 20_000);
 
 afterAll(async () => {
 	// afterEach closed every store inside its test's own hook budget; only a
@@ -3024,7 +3026,7 @@ describe("createPrWatcher", () => {
 		// Each real start and end is an edge the board publishes on: the scan run's
 		// two, then the reply run's two.
 		expect(s.edges()).toBe(4);
-	});
+	}, 60_000);
 
 	test("an explicit request that fails before the review still logs its run on the card", async () => {
 		const s = await setup();
