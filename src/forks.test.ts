@@ -389,56 +389,51 @@ describe("rangeCommits", () => {
 describe("createPatchBudget", () => {
 	test("caps hold, order is preserved, and admitted patches fit", () => {
 		const maxPatchArb = fc.nat({ max: 4_000 });
-		fc.assert(
-			fc.property(
-				fc.nat({ max: 30 }),
-				fc.nat({ max: 20_000 }),
-				maxPatchArb,
-				fc.array(fc.nat({ max: 5_000 }), { maxLength: 40 }),
-				(maxCommits, maxTotalChars, maxPatchChars, sizes) => {
-					const patchCharsOf = (size: number) =>
-						Math.min(size, Math.max(1, maxPatchChars));
-					const budget = createPatchBudget(
-						maxCommits,
-						Math.max(1, maxTotalChars),
-					);
-					const keptIdx: number[] = [];
-					const deferredIdx: number[] = [];
-					for (const [i, size] of sizes.entries()) {
-						if (budget.admit(patchCharsOf(size))) keptIdx.push(i);
-						else deferredIdx.push(i);
-					}
-					// The caps hold: the commit count, and the charged char total over
-					// non-empty patches. Zero-char patches (empty commits) are free
-					// and admit even past the char cap.
-					expect(keptIdx.length).toBeLessThanOrEqual(maxCommits);
-					const charged = keptIdx.reduce(
-						(n, i) => n + patchCharsOf(sizes[i]!),
-						0,
-					);
-					expect(charged).toBeLessThanOrEqual(Math.max(1, maxTotalChars));
-					for (const i of keptIdx)
-						expect(patchCharsOf(sizes[i]!)).toBeLessThanOrEqual(
-							Math.max(1, maxPatchChars),
-						);
-					// The ordering stays correct: kept and deferred partition the
-					// candidates, each in candidate order (kept keeps a commit's own
-					// walk position; a kept sha never strands a deferred ancestor,
-					// because the walk is parents-first).
-					expect(
-						[...keptIdx].every((v, i) => i === 0 || v > keptIdx[i - 1]!),
-					).toBe(true);
-					expect(
-						[...deferredIdx].every(
-							(v, i) => i === 0 || v > deferredIdx[i - 1]!,
-						),
-					).toBe(true);
-					expect([...keptIdx, ...deferredIdx].sort((a, b) => a - b)).toEqual(
-						sizes.map((_, i) => i),
-					);
-				},
-			),
+		const prop = fc.property(
+			fc.nat({ max: 30 }),
+			fc.nat({ max: 20_000 }),
+			maxPatchArb,
+			fc.array(fc.nat({ max: 5_000 }), { maxLength: 40 }),
+			(maxCommits, maxTotalChars, maxPatchChars, sizes) => {
+				const patchCharsOf = (size: number) =>
+					Math.min(size, Math.max(1, maxPatchChars));
+				const budget = createPatchBudget(
+					maxCommits,
+					Math.max(1, maxTotalChars),
+				);
+				const keptIdx: number[] = [];
+				const deferredIdx: number[] = [];
+				for (const [i, size] of sizes.entries()) {
+					if (budget.admit(patchCharsOf(size))) keptIdx.push(i);
+					else deferredIdx.push(i);
+				}
+				// The caps hold: the commit count, and the charged char total over
+				// non-empty patches. Zero-char patches (empty commits) are free
+				// and admit even past the char cap.
+				expect(keptIdx.length).toBeLessThanOrEqual(maxCommits);
+				const charged = keptIdx.reduce(
+					(n, i) => n + patchCharsOf(sizes[i]!),
+					0,
+				);
+				expect(charged).toBeLessThanOrEqual(Math.max(1, maxTotalChars));
+				// The ordering stays correct: kept and deferred partition the
+				// candidates, each in candidate order (kept keeps a commit's own
+				// walk position; a kept sha never strands a deferred ancestor,
+				// because the walk is parents-first).
+				expect(
+					[...keptIdx].every((v, i) => i === 0 || v > keptIdx[i - 1]!),
+				).toBe(true);
+				expect(
+					[...deferredIdx].every((v, i) => i === 0 || v > deferredIdx[i - 1]!),
+				).toBe(true);
+				expect([...keptIdx, ...deferredIdx].sort((a, b) => a - b)).toEqual(
+					sizes.map((_, i) => i),
+				);
+			},
 		);
+		// Pinned gate parameters: the fixed seed and run count come from this call,
+		// not from the shared global configuration.
+		fc.assert(prop, { seed: 42, numRuns: 200 });
 	});
 });
 
