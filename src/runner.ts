@@ -1850,7 +1850,7 @@ interface StartOptions {
 	/** Non-empty caps the run's duration (`--max-time`); a review check run sets it so a hung
 	 * check cannot hold a board slot forever. */
 	maxTime?: string | null;
-	/** Memory overlay path; computed from the deployment env when omitted (null skips the overlay — tests only). */
+	/** Memory overlay path; computed from the deployment env when omitted (null skips the overlay — check runs and tests). */
 	memoryConfigPath?: string | null;
 	/** Test seam: the home the plugin-skills overlay reads (docs/specs/turn-home-plugin-skills.md);
 	 * unset derives the run's pinned home (layerEnv.HOME, else the flat layer home). */

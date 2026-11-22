@@ -11458,6 +11458,9 @@ export function createTurnLoop(
 			model: selector,
 			tools: "read,grep,glob",
 			config: join(dirname(ops.extensionPath), "check.yml"),
+			// check.yml sets memory.backend: off; the deployment overlay would ride last
+			// and re-enable memory, so the check opts out of it here (OTTR-986).
+			memoryConfigPath: null,
 			maxTime: CHECK_MAX_TIME,
 			dataRoot: st.store.dataRoot,
 			// OTTR-994: the check run keeps its project's turn identity on a worker.

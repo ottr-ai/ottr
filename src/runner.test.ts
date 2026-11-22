@@ -3967,6 +3967,48 @@ describe("startRun", () => {
 		}
 	});
 
+	test("a check run's argv never carries the deployment memory overlay", async () => {
+		// startCheckRun passes memoryConfigPath: null because check.yml already says
+		// memory.backend: off; a late overlay would re-enable memory for the check
+		// (OTTR-986). Runs the real startRun with the check-shaped options.
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memory-check-"));
+		try {
+			const seen: (readonly string[])[] = [];
+			const launcher: RunLauncher = (_c, args) => {
+				seen.push(args);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = await startRun({
+				cwd: dir,
+				prompt: "check the findings",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				model: "zai/glm-5.3-flash:medium",
+				tools: "read,grep,glob",
+				config: join(dir, "check.yml"),
+				maxTime: "1800",
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+				memoryConfigPath: null,
+			});
+			await handle.done;
+			const args = seen[0]!;
+			const configs: string[] = [];
+			for (let i = 0; i < args.length - 1; i++)
+				if (args[i] === "--config") configs.push(args[i + 1]!);
+			// No memory overlay anywhere in the argv, and the check config is present.
+			// (The plugin-skills overlay shares the overlay dir but names no backend.)
+			expect(configs.some((c) => c.endsWith("omp-memory.yml"))).toBe(false);
+			expect(configs).toContain(join(dir, "check.yml"));
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("splits JSON events across chunks, writes the prompt, and settles the result", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));
 		try {

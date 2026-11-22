@@ -185,6 +185,7 @@ interface Recorded {
 		extensionPath?: string | null;
 		model?: string | null;
 		maxTime?: string | null;
+		memoryConfigPath?: string | null;
 		worker?: WorkerTarget | null;
 		board?: {
 			url: string;
@@ -13743,6 +13744,9 @@ describe("review findings check", () => {
 		expect(check.sessionDir).toBe(store.checkSessionsDir);
 		// OTTR-985: the check's read tool refuses server-only paths via the guard overlay.
 		expect(check.guardConfig).toBe(join(store.serverDir, "check-guard.yml"));
+		// The check opts out of the deployment memory overlay: check.yml says
+		// memory.backend: off, and null (not undefined) skips the overlay (OTTR-986).
+		expect(check.memoryConfigPath).toBeNull();
 		expect(check.model).toBe("zai/glm-5.3-flash:medium");
 		expect(check.cwd).toBe(after.worktree!);
 		expect(check.prompt).toContain("shaR");
@@ -15277,6 +15281,8 @@ describe("work card check", () => {
 		expect(check.sessionDir).toBe(store.checkSessionsDir);
 		// OTTR-985: the check's read tool refuses server-only paths via the guard overlay.
 		expect(check.guardConfig).toBe(join(store.serverDir, "check-guard.yml"));
+		// The check opts out of the deployment memory overlay (OTTR-986).
+		expect(check.memoryConfigPath).toBeNull();
 		expect(check.model).toBe("zai/glm-5.3-flash:medium");
 		expect(check.cwd).toBe((await store.getTask(task.id))!.worktree!);
 		const after = (await store.getTask(task.id))!;
