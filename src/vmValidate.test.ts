@@ -34,9 +34,9 @@ import {
 } from "./vmValidateShared.ts";
 
 /** The job path's prlimit prefix, rebuilt here so the test pins it without an export. */
-const prlimit = (): string[] => [
+const prlimit = (nproc: number = VM_VALIDATE.maxProcesses): string[] => [
 	"prlimit",
-	`--nproc=${VM_VALIDATE.maxProcesses}`,
+	`--nproc=${nproc}`,
 	"--core=0",
 	`--fsize=${VM_VALIDATE.fileSizeBytes}`,
 	"--",
@@ -110,16 +110,21 @@ const envText = (): string =>
 /**
  * The limits probe's stdout: every line the limits check reads back, at the limit
  * values. The limits table is the /proc/self/limits format the probe prints (head -30
- * of the file); `limit` defaults to the configured value so the check passes.
+ * of the file); `limit` defaults to the configured value so the check passes, and
+ * `memTotalKb` defaults to a reading inside the configured RAM band (MemTotal is
+ * the RAM minus the kernel's reservation, as on a real guest).
  */
-const limitsText = (limit: number = VM_VALIDATE.maxProcesses): string =>
+const limitsText = (
+	limit: number = VM_VALIDATE.maxProcesses,
+	memTotalKb: number = Math.floor(VM_VALIDATE.memMiB * 1024 * 0.96),
+): string =>
 	[
 		"Limit                     Soft Limit           Hard Limit           Units",
 		"Max cpu time              unlimited            unlimited            seconds",
 		"Max file size             1073741824           1073741824           bytes",
 		`Max processes             ${limit}                  ${limit}                  processes`,
 		String(VM_VALIDATE.vcpus),
-		"MemTotal:       524288 kB",
+		`MemTotal:       ${memTotalKb} kB`,
 		"Filesystem     1K-blocks    Used Available Use% Mounted on",
 		`/dev/vdc       ${Math.floor(VM_VALIDATE.diskBytes / 1024)} 0 ${Math.floor(VM_VALIDATE.diskBytes / 1024)} 0% /tmp`,
 	].join("\n");
@@ -296,6 +301,29 @@ describe("runSelfCheck", () => {
 		expect(env?.detail).toContain("EXTRA=1");
 	});
 
+	test("a guest booted below the configured RAM band fails the limits check (OTTR-1167)", async () => {
+		// The real reading of the stale 512 MiB image: a runner that still boots
+		// the old size must produce a failed self-check naming the control, never
+		// a passing result silent about its RAM.
+		const { deps } = makeDeps({
+			spawnImpl: (argv) => {
+				const inner = argv.slice(argv.indexOf("--") + 1);
+				if (inner[0] === "env") return textProc(envText(), 0);
+				if (inner[0] === "sh")
+					return textProc(limitsText(VM_VALIDATE.maxProcesses, 493248), 0);
+				return textProc("", 0);
+			},
+		});
+		const { selfCheck, missingControl } = await runSelfCheck(deps);
+		expect(missingControl).toBe(MISSING_CONTROL.limits);
+		const limits = selfCheck.checks.find(
+			(check) => check.name === "limits read back",
+		);
+		expect(limits?.ok).toBe(false);
+		expect(limits?.detail).toContain("493248 kB");
+		expect(limits?.detail).toContain(`${VM_VALIDATE.memMiB} MiB band`);
+	});
+
 	test("a probe that throws is a failed check, not a crash", async () => {
 		const { deps } = makeDeps({
 			overrides: {
@@ -375,7 +403,7 @@ describe("runSelfCheck", () => {
 		// real /bin/sh of the worker image the guest rootfs is built from — dash, which
 		// has no `ulimit -u`. Before the /proc/self/limits fix the chain died at
 		// `ulimit -u` with exit 2 and empty stdout, so every parsed field was null and
-		// this test failed. The prlimit prefix sets exactly the configured soft limit,
+		// this test failed. The prlimit prefix sets exactly the soft limit under test,
 		// so the first field must read it back; the other three fields must parse on
 		// this host, whose CPU count and memory differ from VM_VALIDATE's on purpose.
 		// Production drops to the job user (uid 65534) before the limit lands; this

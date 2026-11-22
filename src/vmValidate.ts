@@ -540,17 +540,27 @@ const steps: readonly SelfCheckStep[] = [
 		run: async (deps) => {
 			const run = await runProcess(LIMITS_PROBE_ARGV, PROBE_CWD, deps);
 			const readback = parseLimitsReadback(run.stdoutTail);
+			// The RAM band pins the booted memory to the configuration: MemTotal is
+			// the RAM minus the kernel's reservation, so it sits below mem_size_mib
+			// but must reach 90% of it. A VM booted at a stale size (a 512 MiB
+			// runner image after the constant moved) fails here instead of passing
+			// a result that proves nothing about its RAM (OTTR-1167 blocker 1).
+			const memFloorKb = (VM_VALIDATE.memMiB * 1024 * 9) / 10;
+			const memCeilKb = VM_VALIDATE.memMiB * 1024;
+			const memOk =
+				readback.memKb !== null &&
+				readback.memKb >= memFloorKb &&
+				readback.memKb <= memCeilKb;
 			const ok =
 				readback.nprocLimit === String(VM_VALIDATE.maxProcesses) &&
 				readback.cpus === String(VM_VALIDATE.vcpus) &&
-				readback.memKb !== null &&
-				readback.memKb > 0 &&
+				memOk &&
 				readback.scratchKb !== null &&
 				readback.scratchKb > 0 &&
 				readback.scratchKb <= VM_VALIDATE.diskBytes / 1024;
 			return {
 				ok,
-				detail: `nproc limit ${readback.nprocLimit ?? "(none)"}, nproc ${readback.cpus ?? "(none)"}, MemTotal ${readback.memKb ?? "(none)"} kB, scratch ${readback.scratchKb ?? "(none)"} 1K blocks`,
+				detail: `nproc limit ${readback.nprocLimit ?? "(none)"}, nproc ${readback.cpus ?? "(none)"}, MemTotal ${readback.memKb ?? "(none)"} kB in the ${VM_VALIDATE.memMiB} MiB band ${memFloorKb}-${memCeilKb} kB, scratch ${readback.scratchKb ?? "(none)"} 1K blocks`,
 			};
 		},
 	},

@@ -140,7 +140,7 @@ powers off. Checks:
 | toolchain read-only | a write attempt to `/usr` fails with `EROFS` (lower-only overlay) | `read-only toolchain` |
 | scratch writable | a write to `/tmp` succeeds as `nobody`, then unlinks | `scratch-only writes` |
 | result medium guarded | a write to `/dev/vdd` fails as `nobody`; the node is `0600 root:root` | `artifact promotion guard` |
-| limits read back | a probe prints the `Max processes` soft limit from `/proc/self/limits` equal to `maxProcesses`, `nproc` equal to the vCPU count, `MemTotal` above 0, and the scratch size equal to the configured bytes | `resource limits` |
+| limits read back | a probe prints the `Max processes` soft limit from `/proc/self/limits` equal to `maxProcesses`, `nproc` equal to the vCPU count, `MemTotal` inside the configured RAM band (at least 90% of `memMiB`, at most `memMiB`: the kernel reservation keeps the reading below the size, and a VM booted at a stale size fails instead of passing silent about its RAM), and the scratch size equal to the configured bytes | `resource limits` |
 
 ### Artifact promotion
 
