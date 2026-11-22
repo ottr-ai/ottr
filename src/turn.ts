@@ -11455,6 +11455,10 @@ export function createTurnLoop(
 			guardConfig: ensureCheckGuardOverlay(st.store.serverDir),
 			extensionPath: null,
 			resumeId: null,
+			// The check reads worker-written text (REVIEW.md, the diff, the report) as
+			// lower-trust input (OTTR-988). It needs no GitHub access, so it runs without
+			// the board's GH_TOKEN/GITHUB_TOKEN, like a worker child or the scout.
+			stripGithubToken: true,
 			model: selector,
 			tools: "read,grep,glob",
 			config: join(dirname(ops.extensionPath), "check.yml"),

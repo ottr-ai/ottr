@@ -13739,6 +13739,7 @@ describe("review findings check", () => {
 		expect(check.resumeId).toBeNull();
 		expect(check.extensionPath).toBeNull();
 		expect(check.tools).toBe("read,grep,glob");
+		expect(check.stripGithubToken).toBe(true);
 		expect(check.config).toBe(join(dirname("ext.ts"), "check.yml"));
 		// OTTR-985: the check writes its transcript to the server-only sessions dir.
 		expect(check.sessionDir).toBe(store.checkSessionsDir);
@@ -15276,6 +15277,7 @@ describe("work card check", () => {
 		expect(check.resumeId).toBeNull();
 		expect(check.extensionPath).toBeNull();
 		expect(check.tools).toBe("read,grep,glob");
+		expect(check.stripGithubToken).toBe(true);
 		expect(check.config).toBe(join(dirname("ext.ts"), "check.yml"));
 		// OTTR-985: the check writes its transcript to the server-only sessions dir.
 		expect(check.sessionDir).toBe(store.checkSessionsDir);

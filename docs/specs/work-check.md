@@ -7,6 +7,9 @@ Decided 2026-11-09 (OTTR-728). The work check is the second-model gate between a
 
 - Each check is one new model session with zero context (never `--resume`), `read,grep,glob`
   only, in the card's worktree. Its input is the work result of the card.
+- The check run carries no GitHub credentials: it starts without the board's `GH_TOKEN` and
+  `GITHUB_TOKEN` (`stripGithubToken`, OTTR-988). The check reads the worktree and the run log
+  and needs no GitHub access.
 - A ready report at stage `merging` starts a check run when at least one holds:
   - no completed check has seen this head (`workCheckHead` differs from HEAD or is null), or
   - open blockers exist (the last check sent the card back).

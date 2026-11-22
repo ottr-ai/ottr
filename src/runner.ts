@@ -1835,7 +1835,8 @@ interface StartOptions {
 	 * (docs/specs/turn-read-token.md); applied after every strip. A local run ignores it. */
 	githubReadEnv?: Record<string, string>;
 	/** Set: a local child runs without the board's GitHub token (GH_TOKEN, GITHUB_TOKEN), as a
-	 * worker child always does. A run that reads third-party text (the trending scout) sets it. */
+	 * worker child always does. A run that reads third-party or worker-written text (the
+	 * trending scout, the work and review checks) sets it. */
 	stripGithubToken?: boolean;
 	/** OTTR-693: the Settings commit identity for this turn; null keeps the built-in Ottr default (src/gitIdentity.ts). */
 	commitIdentity?: CommitIdentity | null;
