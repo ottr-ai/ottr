@@ -887,6 +887,9 @@ type RunEntry = {
 	progressAt?: number;
 	/** The dispatched worker's url; absent for a server-local run. runnerTurns() buckets by it. */
 	url?: string;
+	/** OTTR-1211: server-local runs only: when this host spawned the child. The server's
+	 * /tmp sweep keeps a live local run's scratch; worker and microVM handles omit it. */
+	startedAt?: number;
 	/** The worker run id; absent for a server-local or microVM run. The System view keys the
 	 * turn's memory and CPU (GET /stats `runs`) by it. */
 	runId?: string;

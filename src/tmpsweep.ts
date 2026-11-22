@@ -1,6 +1,7 @@
 import {
 	lstatSync,
 	readdirSync,
+	readFileSync,
 	readlinkSync,
 	rmSync,
 	type Stats,
@@ -88,6 +89,8 @@ function liveHeldPaths(procRoot: string): Set<string> {
 		if (!/^\d+$/.test(name)) continue;
 		collectFdLinks(join(procRoot, name), held);
 		collectCwdLink(join(procRoot, name), held);
+		collectArgvPaths(join(procRoot, name), held);
+		collectExeLink(join(procRoot, name), held);
 	}
 	return held;
 }
@@ -109,6 +112,27 @@ function collectFdLinks(pidDir: string, held: Set<string>): void {
 /** One pid's cwd readlink target; unreadable cwd: skip silently. */
 function collectCwdLink(pidDir: string, held: Set<string>): void {
 	const target = readDeletedLink(join(pidDir, "cwd"));
+	if (target !== null) held.add(target);
+}
+
+/** OTTR-1211: the absolute paths in one pid's argv (NUL-separated cmdline). A process
+ * whose program or config path sits inside an entry holds it; unreadable cmdline
+ * (kernel thread, exited pid): skip silently. Non-path args never match an entry. */
+function collectArgvPaths(pidDir: string, held: Set<string>): void {
+	let text: string;
+	try {
+		text = readFileSync(join(pidDir, "cmdline"), "utf8");
+	} catch {
+		return;
+	}
+	for (const arg of text.split("\0")) {
+		if (arg.startsWith("/")) held.add(arg);
+	}
+}
+
+/** One pid's exe readlink target: the real program even under a renamed argv[0]. */
+function collectExeLink(pidDir: string, held: Set<string>): void {
+	const target = readDeletedLink(join(pidDir, "exe"));
 	if (target !== null) held.add(target);
 }
 
@@ -152,6 +176,19 @@ export function sweepTmpDirs(
 			// Busy or vanished entry: leave it for the next sweep.
 		}
 	}
+	return swept;
+}
+
+/** OTTR-1211: one sweep pass that logs each removal with its size — the one pass the
+ * worker daemon (src/worker.ts) and the server (src/server.ts) both run hourly and at
+ * boot, so a deleted entry's name and bytes stay visible on the process's own console. */
+export function sweepTmpDirsLogged(
+	root: string = tmpdir(),
+	opts?: { procRoot?: string; liveTurnStarts?: readonly number[] },
+): SweptTmpEntry[] {
+	const swept = sweepTmpDirs(root, opts);
+	for (const { name, bytes } of swept)
+		console.log(`sweep: removed ${name} (${formatBytes(bytes)})`);
 	return swept;
 }
 

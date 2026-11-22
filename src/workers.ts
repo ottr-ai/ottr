@@ -1,13 +1,16 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import {
+	chownSync,
 	existsSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	readlinkSync,
 	realpathSync,
+	rmSync,
 	statSync,
 } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
 import { acquireLayerUse } from "./layers.ts";
@@ -548,6 +551,24 @@ export function serveWorker(opts: {
 				status: 500,
 			});
 		}
+		// OTTR-1211: the card's private scratch: TMPDIR points into a per-run dir, so
+		// the run's temp (pip and bun caches, tool temp) dies with the run instead of
+		// aging out a day later. OTTR_TMP_ROOT names this daemon's temp root for files
+		// that must stay host-global under the redirected TMPDIR — the mutation lock
+		// reads it (scripts/stryker-base.mjs), and GET /stats reads the same root. The
+		// run's uid owns the dir: the child drops to that uid (OTTR-994).
+		const scratch = mkdtempSync(join(tmpdir(), "ottr-run-"));
+		env.TMPDIR = scratch;
+		env.OTTR_TMP_ROOT = tmpdir();
+		if (ids !== null) chownSync(scratch, ids.uid, ids.gid);
+		const removeScratch = (): void => {
+			try {
+				rmSync(scratch, { recursive: true, force: true });
+			} catch {
+				// A leftover process still holds an entry (a detached dev server's cwd):
+				// the next aged sweep takes the tree when its holds clear.
+			}
+		};
 		let child: ChildProcess;
 		try {
 			child = spawn(opts.ompPath ?? "omp", body.argv, {
@@ -559,14 +580,19 @@ export function serveWorker(opts: {
 			});
 		} catch (err) {
 			release();
+			removeScratch();
 			return new Response(`spawn failed: ${String(err)}`, { status: 500 });
 		}
 		// A live child can emit "error" after spawn. Only a no-child spawn error releases
 		// before "close"; a live child's lease must remain held.
 		child.on("error", () => {
-			if (child.pid === undefined) release();
+			if (child.pid === undefined) {
+				release();
+				removeScratch(); // "close" never fires without a pid
+			}
 		});
 		child.on("close", release);
+		child.on("close", removeScratch);
 		const forgetChild = (): void => {
 			if (child.pid !== undefined) runChildren.delete(child.pid);
 		};

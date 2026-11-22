@@ -6,12 +6,14 @@ import {
 import {
 	existsSync,
 	lstatSync,
+	mkdtempSync,
 	readdirSync,
 	readFileSync,
 	renameSync,
+	rmSync,
 	statSync,
 } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { aptListPath } from "./apt.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
@@ -1355,6 +1357,10 @@ function sameUsage(a: TokenUsage | null, b: TokenUsage): boolean {
 
 export interface RunHandle {
 	pid: number | null;
+	/** OTTR-1211: local runs only: when this host spawned the child. The server's /tmp
+	 * sweep keeps a live local run's scratch (start at or before the newest mtime);
+	 * worker-dispatched and microVM handles omit it (their scratch is not on this host). */
+	startedAt?: number;
 	/** OTTR-454: the dispatched worker's url; absent for a local run. The turn engine
 	 * buckets live runs by it for GET /api/drain. */
 	url?: string;
@@ -2113,6 +2119,14 @@ function startLocalRun(s: RunStart): RunHandle {
 	);
 	if (layerEnv !== null) Object.assign(base, layerEnv);
 	Object.assign(base, identityEnv);
+	// OTTR-1211: the run's private scratch: TMPDIR points into a per-run dir, so the
+	// card's temp (pip and bun caches, tool temp) dies with the run instead of aging
+	// out a day later. OTTR_TMP_ROOT names the host temp root for files that must stay
+	// host-global under the redirected TMPDIR — the mutation lock reads it
+	// (scripts/stryker-base.mjs), and this process's own tmpdir() is that root.
+	const scratch = mkdtempSync(join(tmpdir(), "ottr-run-"));
+	base.TMPDIR = scratch;
+	base.OTTR_TMP_ROOT = tmpdir();
 	// OTTR-990: the run cwd is a worker-writable worktree, and omp imports its project
 	// custom tools (`.omp/tools`, plugins, foreign `.claude`/`.codex` tool dirs) into
 	// this server process at session start. Park them out of discovery for the run and
@@ -2185,6 +2199,14 @@ function startLocalRun(s: RunStart): RunHandle {
 				rejectDone(error);
 			} finally {
 				unregisterLayer();
+				// The run is over: its private scratch goes. A leftover process still
+				// holding an entry (a detached dev server's cwd) makes rm fail; the next
+				// aged sweep takes the tree when its holds clear (src/tmpsweep.ts).
+				try {
+					rmSync(scratch, { recursive: true, force: true });
+				} catch {
+					// the aged sweep is the backstop
+				}
 			}
 		})();
 	};
@@ -2202,6 +2224,7 @@ function startLocalRun(s: RunStart): RunHandle {
 
 	return {
 		pid: child.pid ?? null,
+		startedAt,
 		done,
 		kill: () => {
 			killed = true;

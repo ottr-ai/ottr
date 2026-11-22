@@ -19,7 +19,13 @@ import {
 // (scripts/mutation-delta.ts) must not hold the lock its own Stryker children then wait for
 // (OTTR-366). The lock stays host-global even though the sandbox below is per checkout, so
 // parallel runs on loaded hosts keep waiting instead of mass-timing-out (2026-09-30 review).
-const mutationLockBase = join(tmpdir(), "ott-stryker");
+// OTTR-1211: a run's TMPDIR points into its private scratch dir (src/runner.ts,
+// src/workers.ts), so the lock root reads OTTR_TMP_ROOT — the host temp root the run
+// carries beside the redirect — and stays host-global there, where GET /stats reads it.
+const mutationLockBase = join(
+	process.env.OTTR_TMP_ROOT ?? tmpdir(),
+	"ott-stryker",
+);
 // The sandbox parent is per checkout and wiped at run start (OTTR-500): the machine-global
 // parent let a killed run's leftover sandbox hold a foreign or stale tree, and Stryker's
 // per-test stage 1 then skipped the missing files and ran mutants against it. Different

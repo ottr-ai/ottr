@@ -1,6 +1,6 @@
 import { homedir, tmpdir } from "node:os";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
-import { formatBytes, sweepTmpDirs } from "./tmpsweep.ts";
+import { sweepTmpDirsLogged } from "./tmpsweep.ts";
 import {
 	bootTurnIsolation,
 	ensureForkCapacity,
@@ -60,11 +60,7 @@ if (import.meta.main) {
 	// OTTR-754: the sweep passes the live turn starts so a running turn's /tmp
 	// scratch survives, and logs each removal line for the worker's own console.
 	const sweep = (): void => {
-		for (const { name, bytes } of sweepTmpDirs(tmpdir(), {
-			liveTurnStarts: server.runStarts(),
-		})) {
-			console.log(`sweep: removed ${name} (${formatBytes(bytes)})`);
-		}
+		sweepTmpDirsLogged(tmpdir(), { liveTurnStarts: server.runStarts() });
 	};
 	sweep();
 	setInterval(sweep, 60 * 60 * 1000);

@@ -10,7 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatBytes, sweepTmpDirs } from "./tmpsweep.ts";
+import { formatBytes, sweepTmpDirs, sweepTmpDirsLogged } from "./tmpsweep.ts";
 
 describe("sweepTmpDirs", () => {
 	const root = mkdtempSync(join(tmpdir(), "sweeptest-"));
@@ -92,6 +92,57 @@ describe("sweepTmpDirs", () => {
 		expect(removed).not.toContain("held-deleted");
 		expect(existsSync(held)).toBe(true);
 		expect(existsSync(heldDeleted)).toBe(true);
+	});
+
+	test("skips an aged entry a live process names in argv or exe", () => {
+		const heldArgv = make("held-by-argv");
+		const pid = join(procRoot, "4244");
+		mkdirSync(pid, { recursive: true });
+		// NUL-separated argv like the kernel writes it; one absolute path into the
+		// entry holds it, the flag arg never matches anything.
+		writeFileSync(
+			join(pid, "cmdline"),
+			Buffer.from(`${heldArgv}/bin/tool\0--flag\0`),
+		);
+		const heldExe = make("held-by-exe");
+		mkdirSync(join(procRoot, "4245"), { recursive: true });
+		symlinkSync(`${heldExe}/bin/tool`, join(procRoot, "4245", "exe"));
+		const removed = sweepTmpDirs(root, { procRoot }).map((e) => e.name);
+		expect(removed).not.toContain("held-by-argv");
+		expect(removed).not.toContain("held-by-exe");
+		expect(existsSync(heldArgv)).toBe(true);
+		expect(existsSync(heldExe)).toBe(true);
+	});
+
+	test("keeps an aged entry a real child process holds as cwd; the sweep never signals", async () => {
+		// The acceptance drill: the hold comes from a live child this test created and
+		// the sweep reads the real /proc. sweepTmpDirs never signals — it only reads
+		// links and cmdlines; the test itself reaps the child it spawned.
+		const held = make("held-by-child-cwd");
+		const child = Bun.spawn(["sleep", "30"], { cwd: held });
+		try {
+			const removed = sweepTmpDirs(root).map((e) => e.name);
+			expect(removed).not.toContain("held-by-child-cwd");
+			expect(existsSync(held)).toBe(true);
+		} finally {
+			child.kill();
+			await child.exited;
+		}
+	}, 15000);
+
+	test("sweepTmpDirsLogged logs each removal with its size and returns it", () => {
+		make("logged-away", "f.txt", 25 * 60 * 60 * 1000); // aged entry, 1-byte file inside
+		const lines: string[] = [];
+		const realLog = console.log;
+		console.log = (msg: unknown) => lines.push(String(msg));
+		let swept: { name: string; bytes: number }[];
+		try {
+			swept = sweepTmpDirsLogged(root, { procRoot });
+		} finally {
+			console.log = realLog;
+		}
+		expect(swept.map((e) => e.name)).toContain("logged-away");
+		expect(lines).toContain("sweep: removed logged-away (1 B)");
 	});
 
 	test("liveTurnStarts: start <= newest mtime keeps the entry, newer starts do not", () => {

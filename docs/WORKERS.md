@@ -345,6 +345,18 @@ omp. Two parts do the work:
    `The temp disk (/tmp) of <runner> is full (<free> free)` notice until the
    space is back.
 
+   OTTR-1211 extends this in three ways. The hold check also reads a live
+   process's argv and exe, so a program or config path inside an entry keeps
+   it. The server runs the same sweep on its own uncapped `/tmp`, at boot and
+   hourly, with the starts of its own local runs beside the hold check. And a
+   run's `TMPDIR` points into a private `ottr-run-` dir, so the card's scratch
+   (pip and bun caches, tool temp) dies with the run instead of aging out a day
+   later; `OTTR_TMP_ROOT` names the host temp root beside the redirect, so the
+   host-global mutation lock (`scripts/stryker-base.mjs`) and `GET /stats` keep
+   reading it there. The sweep is the backstop for a scratch whose run never
+   ended cleanly (a worker restart), and for scratch a run wrote outside
+   `TMPDIR`.
+
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule, with the old hold-first
    behavior and no idle phase: it holds new turns on the whole board, waits for

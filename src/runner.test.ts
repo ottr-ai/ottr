@@ -3315,6 +3315,44 @@ describe("startRun custom-tool park", () => {
 	});
 });
 
+describe("startRun private scratch (OTTR-1211)", () => {
+	test("a local run's TMPDIR names a private dir that dies with the run", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-scratch-"));
+		try {
+			let envAtSpawn: Record<string, string | undefined> = {};
+			let scratchLive = false;
+			const fake = new FakeOmp(4243);
+			const launcher: RunLauncher = (_c, _a, options) => {
+				envAtSpawn = options.env as Record<string, string | undefined>;
+				scratchLive = existsSync(String(envAtSpawn.TMPDIR));
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = await startRun({
+				cwd: dir,
+				prompt: "check the work",
+				sessionDir: dir,
+				extensionPath: "/unused.ts",
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+			});
+			expect(handle.startedAt).toBeTypeOf("number");
+			await handle.done;
+			const scratch = envAtSpawn.TMPDIR;
+			expect(scratch!.startsWith(join(tmpdir(), "ottr-run-"))).toBe(true);
+			// OTTR_TMP_ROOT stays on the host temp root: the mutation lock and GET /stats
+			// read it there while TMPDIR points into the per-run dir.
+			expect(envAtSpawn.OTTR_TMP_ROOT).toBe(tmpdir());
+			expect(scratchLive).toBe(true); // the run owned the dir while it ran
+			expect(existsSync(scratch!)).toBe(false); // and the run's end removed it
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("startRun", () => {
 	test("session and findings persist in arrival order before local completion", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-startrun-"));

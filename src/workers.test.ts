@@ -69,6 +69,17 @@ const burst = '{"type":"tick"}\\n'.repeat(4096);
 setInterval(() => process.stdout.write(burst), 1);`,
 );
 
+// Scratch omp: prints "<TMPDIR> <OTTR_TMP_ROOT>", writes a file into its TMPDIR, then
+// stays alive until killed — the test observes the scratch live, then gone at run end.
+const scratchPath = join(dir, "scratch-omp.js");
+writeFileSync(
+	scratchPath,
+	`const fs = require("node:fs");
+process.stdout.write(process.env.TMPDIR + " " + process.env.OTTR_TMP_ROOT + "\\n");
+fs.writeFileSync(require("node:path").join(process.env.TMPDIR, "used"), "x");
+setInterval(() => {}, 1000);`,
+);
+
 // Pid-writing sleeper omp: drops its pid, then stays alive until killed. The sweep test
 // uses it as the live run child whose worktree disappears mid-run. Optional beat
 // file as argv[3], same 50 ms heartbeat.
@@ -1133,6 +1144,45 @@ describe("serveWorker", () => {
 		} catch {
 			// an aborted stream equally proves the child is gone
 		}
+	}, 15000);
+
+	test("the run's private scratch dies when the run ends (OTTR-1211)", async () => {
+		const url = start({ ompPath: process.execPath });
+		const controller = new AbortController();
+		const res = await fetch(`${url}/run`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				id: "r-scratch",
+				argv: [scratchPath],
+				cwd: dir,
+				stdin: "",
+				env: {},
+			}),
+			signal: controller.signal,
+		});
+		const reader = res.body!.getReader();
+		const firstLine = new TextDecoder().decode((await reader.read()).value);
+		const [scratch, tmpRoot] = firstLine.trim().split(" ");
+		// The child's TMPDIR is the run's own dir, and the root beside it is the
+		// daemon's temp root (where GET /stats and the mutation lock read).
+		expect(scratch!.startsWith(join(tmpdir(), "ottr-run-"))).toBe(true);
+		expect(tmpRoot).toBe(tmpdir());
+		// The run really used its scratch before the test ends it.
+		expect(existsSync(join(scratch!, "used"))).toBe(true);
+		// The card's run ends here: the child dies, and the close handler removes
+		// the scratch. The child's close event lives inside the daemon, so the test
+		// has no promise to await — poll the observable condition like awaitBeatStall.
+		controller.abort();
+		try {
+			const r = await reader.read();
+			expect(r.done).toBe(true);
+		} catch {
+			// an aborted stream equally proves the child is gone
+		}
+		const deadline = Date.now() + 10_000;
+		while (existsSync(scratch!) && Date.now() < deadline) await Bun.sleep(20);
+		expect(existsSync(scratch!)).toBe(false);
 	}, 15000);
 
 	test("omp output that arrives after the client left raises no error", async () => {

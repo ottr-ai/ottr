@@ -3,7 +3,7 @@
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
 import { lstatSync, readdirSync } from "node:fs";
-import { constants, homedir } from "node:os";
+import { constants, homedir, tmpdir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
 import {
@@ -75,6 +75,7 @@ import {
 	ProjectStore,
 } from "./store.ts";
 import { createSupervisor } from "./supervisor.ts";
+import { sweepTmpDirsLogged } from "./tmpsweep.ts";
 import { turnEnv } from "./tokens.ts";
 import {
 	buildToolsPath,
@@ -1321,6 +1322,26 @@ every(() => app.dependabotTick(), 3_600_000);
 // Token expiry: probe at boot and once a day; advisory warnings and reminder pushes inside.
 runWork(() => app.tokenReminderTick());
 every(() => app.tokenReminderTick(), 86_400_000);
+
+// OTTR-1211: /tmp age sweep. The server's /tmp has no cap, so the workers' 24h rule
+// (src/tmpsweep.ts) bounds it here too, at boot and hourly: a top-level entry goes
+// when its newest inner mtime is a day old, no live process holds it (cwd, open fd,
+// argv, exe), and no live local run started at or before that mtime — a run's own
+// scratch (its per-run TMPDIR) survives a turn that outlasts a day. Worker-dispatched
+// and microVM runs hold no scratch on this host: their handles are excluded.
+const sweepServerTmp = (): void => {
+	const starts = [...(loopRef?.running.values() ?? [])]
+		.filter(
+			(e) =>
+				e.url === undefined &&
+				e.pid !== null &&
+				typeof e.startedAt === "number",
+		)
+		.map((e) => e.startedAt as number);
+	sweepTmpDirsLogged(tmpdir(), { liveTurnStarts: starts });
+};
+runWork(() => sweepServerTmp());
+every(() => sweepServerTmp(), 3_600_000);
 
 // No bind retry: nothing in the repo restarts this process on the same port, so a
 // bind failure surfaces as the thrown error from Bun.serve.
