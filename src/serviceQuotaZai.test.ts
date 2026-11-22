@@ -15,11 +15,11 @@ const resetEndpoint =
 	"https://api.z.ai/api/biz/customer-package-reset/list?targetType=PERSONAL";
 const signal = () => new AbortController().signal;
 
-// Epochs for the captured snapshot's nextResetTime fields (milliseconds).
+// Epochs for the schema fixture's nextResetTime fields (milliseconds).
 const FIVE_HOUR_RESET = 1_764_578_800_000;
 const WEEKLY_RESET = 1_765_000_000_000;
 
-// Operator capture from 2026-11-22: extra fields stay and must be ignored.
+// Schema fixture: invented values with the documented envelope shapes; extra fields stay and must be ignored.
 const limitFixture: {
 	code: number;
 	msg: string;
@@ -169,6 +169,7 @@ interface Harness {
 async function harness(routes: {
 	limit: () => { status: number; body: string };
 	resets: () => { status: number; body: string };
+	now?: () => number;
 }): Promise<Harness> {
 	const limit = await endpointServer();
 	const resets = await endpointServer();
@@ -201,7 +202,10 @@ async function harness(routes: {
 		counts.resets++;
 		return globalThis.fetch(resets.url, init);
 	});
-	const reader = createZaiQuotaAdapter({ fetch: fetchFn }).createReader({
+	const reader = createZaiQuotaAdapter({
+		fetch: fetchFn,
+		now: routes.now,
+	}).createReader({
 		credential,
 	});
 	return {
@@ -221,7 +225,7 @@ const fresh = () => ({
 });
 
 describe("Z.AI coding plan quota adapter", () => {
-	test("reads the captured snapshot with two fixed authenticated GETs", async () => {
+	test("reads the documented snapshot with two fixed authenticated GETs", async () => {
 		const server = await harness(fresh());
 		try {
 			expect(await server.reader.read({ signal: signal() })).toEqual({
@@ -246,6 +250,7 @@ describe("Z.AI coding plan quota adapter", () => {
 					}),
 				}),
 			resets: fresh().resets,
+			now: () => Date.parse("2026-11-22T10:00:00+08:00") + 60_000,
 		});
 		try {
 			expect(await server.reader.read({ signal: signal() })).toEqual({
@@ -254,6 +259,28 @@ describe("Z.AI coding plan quota adapter", () => {
 					Date.parse("2026-11-22T10:00:00+08:00") + 5 * 3_600_000,
 					Date.parse("2026-11-19T17:54:00+08:00") + 7 * 86_400_000,
 				),
+			});
+		} finally {
+			await server.close();
+		}
+	});
+
+	test("drops a derived reset stamp that is already in the past", async () => {
+		const server = await harness({
+			limit: () => ({
+				status: 200,
+				body: changedLimit((body) => {
+					delete body.data.limits[0]?.nextResetTime;
+					body.data.limits.splice(1, 1);
+				}),
+			}),
+			resets: fresh().resets,
+			now: () => Date.parse("2026-11-27T10:00:00+08:00"),
+		});
+		try {
+			expect(await server.reader.read({ signal: signal() })).toEqual({
+				ok: true,
+				metrics: metrics(null, null),
 			});
 		} finally {
 			await server.close();
@@ -309,6 +336,7 @@ describe("Z.AI coding plan quota adapter", () => {
 		});
 		try {
 			const read = await mixed.reader.read({ signal: signal() });
+			expect(read.ok, "the mixed-grants snapshot must stay valid").toBe(true);
 			if (read.ok)
 				expect(read.metrics).toEqual(metrics(FIVE_HOUR_RESET, WEEKLY_RESET));
 		} finally {

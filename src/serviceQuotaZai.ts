@@ -122,6 +122,7 @@ function decodeResets(body: unknown): ResetStash | null {
 export function createZaiQuotaAdapter(
 	options: Pick<ServiceQuotaHttpReaderOptions, "fetch" | "now"> = {},
 ): ServiceQuotaAdapterDefinition {
+	const now = options.now ?? Date.now;
 	return {
 		id: "zai-coding-plan",
 		createReader({ credential }): ServiceQuotaReader {
@@ -166,6 +167,17 @@ export function createZaiQuotaAdapter(
 								retryAfterAt: null,
 							},
 						};
+					// A derived fallback older than now is stale, not a reset date.
+					const future = (stamp: number | null): number | null =>
+						stamp !== null && stamp > now() ? stamp : null;
+					const fiveHourFallback =
+						resets.lastFiveHourReset === null
+							? null
+							: resets.lastFiveHourReset + 5 * 3_600_000;
+					const weeklyFallback =
+						resets.lastWeekReset === null
+							? null
+							: resets.lastWeekReset + 7 * 86_400_000;
 					return {
 						ok: true,
 						metrics: [
@@ -176,11 +188,7 @@ export function createZaiQuotaAdapter(
 								unit: { kind: "count", name: "unused reset grants" },
 								remaining: resets.fiveHourGrants,
 								reportedTotal: null,
-								resetsAt:
-									limit.fiveHour ??
-									(resets.lastFiveHourReset === null
-										? null
-										: resets.lastFiveHourReset + 5 * 3_600_000),
+								resetsAt: limit.fiveHour ?? future(fiveHourFallback),
 								providerStatus: null,
 								plan: null,
 							},
@@ -191,11 +199,7 @@ export function createZaiQuotaAdapter(
 								unit: { kind: "count", name: "unused reset grants" },
 								remaining: resets.weekGrants,
 								reportedTotal: null,
-								resetsAt:
-									limit.weekly ??
-									(resets.lastWeekReset === null
-										? null
-										: resets.lastWeekReset + 7 * 86_400_000),
+								resetsAt: limit.weekly ?? future(weeklyFallback),
 								providerStatus: null,
 								plan: null,
 							},

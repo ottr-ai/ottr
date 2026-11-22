@@ -452,7 +452,7 @@ These gaps permit raw balance display, but not reset countdowns, credit-to-task 
 
 The endpoints are not in Z.ai's public API reference.
 They are the JSON endpoints that the GLM coding-plan usage page calls.
-Public client implementations document them, and the operator's capture of 2026-11-22 verifies them. [P3][zai-endpoints]
+Public client implementations document them. [P3][zai-endpoints]
 
 ### Request
 
@@ -476,8 +476,9 @@ Either failure rejects the whole source snapshot.
 
 ### Fixture and exact mapping
 
-This fixture uses the operator capture of 2026-11-22.
-The capture is one account snapshot, not a schema document. [P3][zai-endpoints]
+These fixtures use invented example values with the documented envelope shapes.
+Public client demo data supplies the shapes, not the values.
+They are schema fixtures, not live account responses. [P3][zai-endpoints]
 
 ```json
 {
@@ -491,13 +492,13 @@ The capture is one account snapshot, not a schema document. [P3][zai-endpoints]
         "type": "TOKENS_LIMIT",
         "unit": 3,
         "percentage": 100,
-        "nextResetTime": 1774831200000
+        "nextResetTime": 1764578800000
       },
       {
         "type": "TOKENS_LIMIT",
         "unit": 6,
         "percentage": 8,
-        "nextResetTime": 1774839240000
+        "nextResetTime": 1765000000000
       },
       {
         "type": "TIME_LIMIT",
@@ -540,8 +541,8 @@ The capture is one account snapshot, not a schema document. [P3][zai-endpoints]
 | `data.limits` first `TOKENS_LIMIT` with `unit 3` | Five-hour reset source | Other entries, including `TIME_LIMIT`, are ignored. |
 | `data.limits` `TOKENS_LIMIT` with `unit 6` | Weekly reset source | One entry per unit. |
 | `nextResetTime` | `resetsAt` in epoch milliseconds | Required finite safe integer when present. Absent falls back to the reset list. |
-| Absent `nextResetTime` | `lastFiveHourResetTime + 5 hours`, `lastWeekResetTime + 7 days` | The stamps are UTC+8 wall clock, parsed with a fixed +08:00 offset. |
-| Both reset sources absent | `resetsAt: null` | Never publish an invented date. |
+| Absent `nextResetTime` | `lastFiveHourResetTime + 5 hours`, `lastWeekResetTime + 7 days`, published only while still in the future; a stale result becomes `resetsAt: null` | The stamps are UTC+8 wall clock, parsed with a fixed +08:00 offset. |
+| Both reset sources absent | `resetsAt: null` | Never publish an invented or past date. |
 | `weekResets` entries with `available: true` | Unused weekly reset grant count | Entries with `available: false` do not count. |
 | Empty `fiveHourResets` | Grant count `0` | This remains a valid snapshot. |
 | `expireTime` on each grant entry | Validation only | Required UTC+8 stamp. A malformed stamp rejects the whole response. |
@@ -563,6 +564,7 @@ The failure classes below are Ottr policy, not documented Z.AI guarantees. [P3][
 | `429` | Show `rate_limit` and honor a valid `Retry-After`. |
 | Other HTTP errors | Record the HTTP status as `http`. |
 | Network failure or timeout | Apply the transport policy. |
+| Derived fallback stamp older than now | `resetsAt: null` | Never publish a past reset date. |
 | First-endpoint failure | Never issue the second request. |
 | Any failure | Never replace grant counts with invented values. |
 
@@ -642,12 +644,12 @@ An approved server secret source remains a prerequisite for live activation, not
     A missing secret produces zero outbound requests.
 14. A real Z.AI reader issues exactly the two GETs in the request section through an instrumented transport.
     Verify bearer authentication and no request body.
-    The capture-shaped fixture yields the 5-hour reset time, the weekly reset time, and one unused weekly reset grant.
+    The documented fixture yields the 5-hour reset time, the weekly reset time, and one unused weekly reset grant.
     The empty `fiveHourResets` case stays a valid snapshot.
 15. A failing first endpoint stops before the second request.
     Either endpoint's failure rejects the whole source.
     A `TEAM` target type or a malformed stamp rejects as `invalid_response`.
-    No invented reset date appears when both reset sources are absent.
+    No invented reset date appears when both reset sources are absent, or when a derived fallback stamp is already in the past.
 
 Transport checks require an isolated local listener and the exact production-URL assertion.
 Exercise the real HTTP reader, not only a mocked adapter result.
@@ -859,7 +861,7 @@ The earlier research-only implementation and commit restriction does not prohibi
 - The OTTR-1092 research report in the OTTR-1101 handoff supplies the approved scope and policy requirements.
 - [Community-documented Z.AI coding-plan endpoints][zai-endpoints], P3. The subscription UI endpoints as documented by public usage clients.
 - [Z.AI devpack FAQ on quota reset cards][zai-faq], P3. Quota reset card behavior.
-- The operator capture of 2026-11-22 supplies the fixture values for the Z.AI coding-plan endpoints.
+- The LogicIncZo/zai-usage demo fixtures supply the reset-list envelope shapes; the fixture values are invented. [P3][zai-usage]
 - Repository integration links above name the source files without historical line-number claims.
 
 [pixellab-page]: https://www.pixellab.ai/pixellab-api
@@ -867,4 +869,5 @@ The earlier research-only implementation and commit restriction does not prohibi
 [pixellab-v1]: https://api.pixellab.ai/v1/openapi.json
 [pixellab-docs]: https://api.pixellab.ai/v2/docs
 [zai-endpoints]: https://github.com/slvnlrt/usage-tray-windows/blob/main/docs/providers/zai.md
+[zai-usage]: https://github.com/LogicIncZo/zai-usage
 [zai-faq]: https://docs.z.ai/devpack/faq
