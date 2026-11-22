@@ -6983,18 +6983,25 @@ export async function createApp(deps: AppDeps) {
 		};
 	}
 
-	/** Every card that names `id` as its followUpOf source, across every registered
-	 * board, oldest first (OTTR-1198). Refs only — project, id, createdAt. One
+	/** Every card that names `id` on board `project` as its followUpOf source,
+	 * across every registered board, oldest first (OTTR-1198). Refs only — project,
+	 * id, createdAt. Ids are unique per project, not across boards, so a link
+	 * counts only when its parent's board is this one: a null followUpOfProject
+	 * names the child's own board, a set one names a foreign parent's board. One
 	 * listTasks per board; a board with a sick store skips its own cards and logs,
 	 * like the state build, so the rest of the lineage still renders. */
 	async function childRefsOf(
 		id: string,
+		project: string,
 	): Promise<{ project: string; id: string; createdAt: number }[]> {
 		const refs: { project: string; id: string; createdAt: number }[] = [];
 		for (const p of deps.projects.values()) {
 			try {
 				for (const c of await p.store.listTasks())
-					if (c.followUpOf === id)
+					if (
+						c.followUpOf === id &&
+						(c.followUpOfProject ?? p.name) === project
+					)
 						refs.push({
 							project: p.name,
 							id: c.id,
@@ -14222,7 +14229,7 @@ export async function createApp(deps: AppDeps) {
 		// project's board never rides this project's frame at all, so the drawer's
 		// detail serves refs from every registered board and the drawer fetches each
 		// card from its own route (OTTR-1158's shape).
-		view.children = await childRefsOf(task.id);
+		view.children = await childRefsOf(task.id, e.name);
 		// Done cards serve the list captured at settle (the worktree is gone, so the
 		// live read would always be []); open cards read the worktree live.
 		view.worktreeFiles =

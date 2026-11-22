@@ -14526,15 +14526,16 @@ export function Drawer({
 			: { project: retroSource.project, id: retroSource.id };
 	const lineageKey = (c: LineageRef): string => `${c.project}/${c.id}`;
 	const [lineage, setLineage] = useState<Record<string, LineageFetch>>({});
-	// Refs this drawer mount already armed: the detail refetches while the card sits
-	// open (the row changed), so a re-run that names the same refs must not reset rows
-	// that already resolved; only the row's Retry button re-arms one.
-	const armed = useRef<Set<string>>(new Set());
 	const loadLineage = (refs: LineageRef[], force = false): void => {
 		for (const c of refs) {
 			const key = lineageKey(c);
-			if (!force && armed.current.has(key)) continue;
-			armed.current.add(key);
+			// A ref with a live entry keeps it: a re-run that names the same refs (a
+			// detail refetch naming the same children) must not reset rows that
+			// already resolved. A ref whose entry is gone fetches again — the want
+			// can empty the map (the card rode the frame) and name the ref once more
+			// (it left the frame), and that row must never sit on a stuck loading
+			// state. Retry forces past the guard.
+			if (!force && lineage[key] !== undefined) continue;
 			setLineage((m) => ({
 				...m,
 				[key]: { status: "loading", ...c },

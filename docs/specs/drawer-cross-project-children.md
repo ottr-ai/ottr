@@ -52,8 +52,11 @@ another project's board (OTTR-1198).
   loading takes the answer, so a response that lands after the drawer
   moved on or after a retry writes nothing stale.
 - A refetch of the detail (the row changed while open) must not reset
-  rows that already resolved: the drawer arms each ref once per drawer
-  mount and only the Retry button re-arms a row.
+  rows that already resolved: the drawer re-arms a ref only when its
+  fetch entry is gone, and the Retry button re-arms a row
+  unconditionally. A want that empties the map and later names the same
+  ref again (the card rode the frame, then left it) fetches again, so a
+  row never sits on a stuck loading state.
 - Cross-project hrefs and the per-child fetches follow the existing
   public card routes; no permission change.
 

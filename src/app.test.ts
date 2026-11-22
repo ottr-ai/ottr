@@ -1884,6 +1884,41 @@ describe("task routes", () => {
 				projects.delete("sick");
 			}
 		});
+
+		test("a same-id card on another board is no false child ref", async () => {
+			// p2 and p3 share the folder basename "dup", so their id sequences
+			// collide: after padding the shorter sequence, the next create on each
+			// board yields the same id.
+			const n2 = (await p2.store.listTasks()).length;
+			const n3 = (await p3.store.listTasks()).length;
+			const target = Math.max(n2, n3);
+			const pad = async (s: ProjectStore, to: number): Promise<void> => {
+				while ((await s.listTasks()).length < to)
+					await s.createTask("sequence pad");
+			};
+			await pad(p2.store, target);
+			await pad(p3.store, target);
+			const twin = await p2.store.createTask("dup parent on p2");
+			const twinSame = await p3.store.createTask("dup parent on p3");
+			expect(twinSame.id).toBe(twin.id);
+			// p3's twin carries a local child: its link names p3 itself, never p2.
+			const twinChild = await p3.store.createTask("child of p3's twin");
+			await p3.store.updateTask(twinChild.id, { followUpOf: twin.id });
+			// p2's twin's detail must not serve p3's child as a Follow-up ref.
+			const res = await get(`/api/projects/p2/tasks/${twin.id}`);
+			expect(res.status).toBe(200);
+			const view = (await res.json()) as {
+				children?: { project: string; id: string }[];
+			};
+			expect(view.children ?? []).toEqual([]);
+			// p3's twin keeps its own child.
+			const other = await get(`/api/projects/p3/tasks/${twin.id}`);
+			expect(other.status).toBe(200);
+			const otherView = (await other.json()) as {
+				children?: { project: string }[];
+			};
+			expect(otherView.children?.map((c) => c.project)).toEqual(["p3"]);
+		});
 	});
 
 	test("state cards omit details and report", async () => {

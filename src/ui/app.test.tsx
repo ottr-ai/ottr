@@ -3464,6 +3464,74 @@ describe("Drawer parent chip", () => {
 		}
 	});
 
+	test("a ref whose entry the frame reset fetches again instead of sticking on loading", async () => {
+		const parent = cardFixture({
+			id: "P-9",
+			stage: "done",
+			state: "idle",
+			sessionTitle: "Parent work",
+		});
+		const child = childCard({
+			id: "C-1",
+			stage: "done",
+			state: "idle",
+			followUpOf: "P-9",
+		});
+		const realFetch = globalThis.fetch;
+		const fetches: string[] = [];
+		globalThis.fetch = (async (input: RequestInfo | URL) => {
+			const url = String(input);
+			fetches.push(url);
+			return url.endsWith("/tasks/P-9")
+				? json({ ...parent, turns: [] })
+				: new Response("{}", { status: 404 });
+		}) as unknown as typeof fetch;
+		const container = window.document.createElement(
+			"div",
+		) as unknown as HTMLDivElement;
+		window.document.body.appendChild(container as unknown as HappyNode);
+		const root = createRoot(container);
+		const link = (): Element | null =>
+			container.querySelector(
+				'.lineage-rail a.lineage-row[href="/projects/proj/tasks/P-9"]',
+			);
+		const parentFetchCount = (): number =>
+			fetches.filter((f) => f.endsWith("/tasks/P-9")).length;
+		try {
+			// Mount with the parent outside the frame: the row fetches and links.
+			await act(async () => {
+				root.render(<Drawer {...base} task={child} tasks={[]} />);
+			});
+			await act(async () => {});
+			await act(async () => {});
+			expect(link() !== null).toBe(true);
+			const first = parentFetchCount();
+			expect(first).toBeGreaterThanOrEqual(1);
+			// The parent rides the frame: the row renders from state and the want
+			// empties, dropping the fetch entries.
+			await act(async () => {
+				root.render(<Drawer {...base} task={child} tasks={[parent]} />);
+			});
+			await act(async () => {});
+			expect(parentFetchCount()).toBe(first);
+			// The parent leaves the frame again: the row must fetch again, never
+			// sit on a loading row with no entry behind it.
+			await act(async () => {
+				root.render(<Drawer {...base} task={child} tasks={[]} />);
+			});
+			await act(async () => {});
+			await act(async () => {});
+			expect(link() !== null).toBe(true);
+			expect(parentFetchCount()).toBe(first + 1);
+		} finally {
+			await act(async () => {
+				root.unmount();
+			});
+			container.remove();
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	test("a cross-project parent outside the window fetches from its own project", async () => {
 		const parent = cardFixture({
 			id: "P-2",
