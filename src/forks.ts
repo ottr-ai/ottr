@@ -41,10 +41,11 @@ export const FORK_GATES = {
 	/** Bytes buffered from one fork commit's git show output (each pipe); a larger patch
 	 * is truncated, never buffered whole (OTTR-998). */
 	MAX_PATCH_BYTES: 256 * 1024,
-	/** Commits plus merges collected per range run. The cap bounds board memory: the
-	 * oldest commits of each branch's range are kept, the newest tail is reported as
-	 * skipped, and the watcher parks that branch's cursor on its newest kept commit, so
-	 * the tail rides the next run's window instead of being lost. */
+	/** Commits plus merges collected per range run (the budget is shared across the
+	 * run's branches). Each branch keeps exactly the window ancestry of the deepest
+	 * first-parent commit that fits its allowance, reports the rest as skipped, and the
+	 * watcher parks that branch's cursor on the cut commit, so the skipped tail rides
+	 * the next run's window instead of being lost. */
 	MAX_RANGE_COMMITS: 100,
 } as const;
 
@@ -273,6 +274,7 @@ async function rawRange(
 	merges: string[];
 	up: Set<string>;
 	all: string[];
+	mainline: string[];
 }> {
 	const base = analyzedHead ?? upstreamHead;
 	const fromAnalysis = await revList(
@@ -306,7 +308,14 @@ async function rawRange(
 		cachePath,
 		git,
 	);
-	return { shas, merges, up, all };
+	// The branch's first-parent line: a monotone search space for the cap cut, since
+	// ancestry grows with every mainline step toward the head.
+	const mainline = await revList(
+		["--first-parent", "--topo-order", `${base}..${head}`],
+		cachePath,
+		git,
+	);
+	return { shas, merges, up, all, mainline };
 }
 
 /**
@@ -393,8 +402,8 @@ function parseShow(out: string): {
  *
  * The range cap keeps the OLDEST commits of each branch's range: the run's evidence is a
  * suffix window (analyzedHead...head), so only a newest-tail cut defers. `keptHead` carries
- * the newest kept sha per branch — the cursor the watcher parks the branch on — and
- * `skipped` carries the deferred tail per branch for the next run to re-list.
+ * the branch's cut commit — the cursor the watcher parks the branch on — and `skipped`
+ * carries the deferred tail per branch for the next run to re-list.
  */
 export async function collectRange(o: {
 	cachePath: string;
@@ -461,8 +470,11 @@ export async function collectRange(o: {
 	const bySha = new Map<string, ForkCommit>();
 	const commits: ForkCommit[] = [];
 	const merges: ForkCommit[] = [];
-	// Newest kept commit sha per branch hash: the watcher parks the branch cursor here
-	// when the cap cut the branch's newest tail, so the tail rides the next window.
+	// The run's shared collection budget across branches: a branch's allowance is what
+	// earlier branches left, so the total evidence stays under the cap.
+	let budget = FORK_GATES.MAX_RANGE_COMMITS;
+	// The cut commit per branch hash: the watcher parks the branch cursor here when
+	// the cap deferred the branch's tail, so the tail rides the next window.
 	const keptHead = new Map<string, string>();
 	// Shas per branch hash the cap skipped; the next run's window re-lists them.
 	const skipped = new Map<string, string[]>();
@@ -546,31 +558,61 @@ export async function collectRange(o: {
 		holds.set(b.branchHash, branchHolds);
 		if (branchFiltered.length > 0)
 			filteredReleased.set(b.branchHash, branchFiltered);
-		// One collection pass over a single commit-order walk, merges and non-merges
-		// interleaved as git topo-orders them: the cap keeps the first MAX_RANGE_COMMITS
-		// and skips the newest tail. Two separate loops cannot do this: their lists are
-		// separate rev-list outputs, so "last kept" is not the newest kept point, and a
-		// shared counter cuts merges behind kept work that descends from them. On one
-		// topological walk every skipped sha is newer than the parked cursor, so the
-		// suffix window (analyzedHead...head) re-lists exactly the skipped tail.
+		// Cap cut on the branch's first-parent mainline: the cursor parks on the deepest
+		// mainline commit whose window ancestry fits the run's remaining allowance, and
+		// the branch collects exactly that ancestry. A walk prefix cannot do this across
+		// merge parents: its last sha excludes only its own line, so a merge joining two
+		// kept lines starves forever (its ancestry never shrinks below the cap) and kept
+		// parallel-line work re-lists every run. With collected ⊆ ancestry(cut) and
+		// skipped ∩ ancestry(cut) = ∅ both hold by construction, whatever the graph.
 		const survivor = new Set([...shas, ...mergeShas]);
 		const mergeSet = new Set(mergeShas);
 		const inWalk = raw.all.filter((s) => survivor.has(s));
 		const walked = new Set(inWalk);
 		// Released extras can sit outside the window; they ride first, as they always did.
-		const order = [...shas.filter((s) => !walked.has(s)), ...inWalk.reverse()];
+		const outside = shas.filter((s) => !walked.has(s));
+		const mainline = [...raw.mainline].reverse(); // oldest first
+		const allowance = Math.min(budget, FORK_GATES.MAX_RANGE_COMMITS);
+		let cut: string | undefined;
+		let collectedSet = new Set<string>();
+		if (mainline.length > 0 && allowance > 0) {
+			// ancestry(m_depth) grows monotonically with mainline depth: binary-search the
+			// deepest depth whose window ancestry fits the allowance.
+			const countAt = async (depth: number) =>
+				new Set(
+					await revList([mainline[depth - 1]!, `^${base}`], cachePath, git),
+				);
+			let lo = 1;
+			let hi = mainline.length;
+			if ((await countAt(hi)).size <= allowance) {
+				lo = hi;
+			} else {
+				while (lo < hi) {
+					const mid = Math.ceil((lo + hi) / 2);
+					if ((await countAt(mid)).size <= allowance) lo = mid;
+					else hi = mid - 1;
+				}
+			}
+			cut = mainline[lo - 1]!;
+			collectedSet = await countAt(lo);
+		}
+		const order = [
+			...outside,
+			...inWalk.filter((s) => collectedSet.has(s)).reverse(),
+		];
+		const ordered = new Set(order);
+		for (const s of [...inWalk].reverse()) {
+			if (!ordered.has(s)) markSkipped(b.branchHash, s);
+		}
+		if (cut !== undefined) {
+			keptHead.set(b.branchHash, cut);
+			budget -= Math.min(budget, order.length);
+		}
 		for (const sha of order) {
 			const existing = bySha.get(sha);
 			if (existing) {
 				if (!existing.branches.includes(b.branch))
 					existing.branches.push(b.branch);
-				keptHead.set(b.branchHash, sha);
-				continue;
-			}
-			// Holds attribution above stays complete; past the cap only the model evidence
-			// stops growing, and the skipped tail is reported for the next run.
-			if (commits.length + merges.length >= FORK_GATES.MAX_RANGE_COMMITS) {
-				markSkipped(b.branchHash, sha);
 				continue;
 			}
 			const asMerge = mergeSet.has(sha);
@@ -622,7 +664,6 @@ export async function collectRange(o: {
 			if (asMerge) merges.push(commit);
 			else commits.push(commit);
 			if (!commit.branches.includes(b.branch)) commit.branches.push(b.branch);
-			keptHead.set(b.branchHash, sha);
 		}
 	}
 
@@ -1247,7 +1288,8 @@ export function createForkWatcher(deps: {
 						exclude: pulls.map((p) => ({ n: p.number, head: p.head })),
 					});
 					// Merges the step-7 holds over a branch's surviving rows. Released rows
-					// survive only when `keepReleased` says so; filteredReleased rows never do.
+					// survive when the analysis consumed them or the cap deferred them;
+					// filteredReleased rows never do.
 					const mergeRows = (
 						bh: string,
 						keepReleased: (h: ForkHoldState) => boolean,
@@ -1400,10 +1442,19 @@ export function createForkWatcher(deps: {
 					const dropped = await store.transaction(async () => {
 						if (!(await unchangedFork(store, fork.id, snapshot))) return false;
 						for (const branch of analyzed) {
+							// A released row the cap deferred keeps riding: dropping it would
+							// strand the commit before any analysis consumed it, and a commit
+							// outside the branch's window can never ride again.
+							const branchSkipped = new Set(
+								skipped.get(branch.branchHash) ?? [],
+							);
 							await store.setForkHolds(
 								fork.id,
 								branch.branchHash,
-								mergeRows(branch.branchHash, (rel) => covered.has(rel.sha)),
+								mergeRows(
+									branch.branchHash,
+									(rel) => covered.has(rel.sha) || branchSkipped.has(rel.sha),
+								),
 							);
 						}
 						const open = await openProposals(store);

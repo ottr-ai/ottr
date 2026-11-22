@@ -735,6 +735,70 @@ describe("collectRange", () => {
 		expect(second.range.commits.map((c) => c.sha)).toEqual([side2Sha]);
 		expect(second.skipped.get(bh) ?? []).toEqual([]);
 	}, 120_000);
+
+	// A merge joining two kept lines: the walk-prefix cursor parked on the side
+	// commit, re-listed the whole A-line every run, and starved the merge forever.
+	test("a merge joining two kept lines defers without starving across runs", async () => {
+		const main = await initUpstream("cr-join-main");
+		const fork = mkRepo("cr-join-fork");
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		const aShas: string[] = [];
+		for (let i = 0; i < 99; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `a${i}`, fork], fork);
+			aShas.push(await shaOf(fork));
+		}
+		await run(["checkout", "-q", "-b", "bside", fork], fork);
+		writeFileSync(join(fork, "b.txt"), "b work\n");
+		await run(["add", "b.txt", fork], fork);
+		await run(["commit", "-q", "-m", "b work", fork], fork);
+		const bSha = await shaOf(fork);
+		await run(["checkout", "-q", "feat", fork], fork);
+		await run(["merge", "-q", "--no-ff", "-m", "merge b", "bside", fork], fork);
+		const mSha = await shaOf(fork);
+		const head = mSha;
+		const bh = branchHash("feat");
+		const cachePath = join(root, "cr-join-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[`+refs/heads/feat:refs/heads/${bh}`],
+			localFileGit(fork),
+		);
+		// 99 A-line commits + B1 + M = 101 candidates: the cut lands on A99, whose
+		// ancestry fits the cap exactly; B1 and M defer.
+		const first = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
+			git: defaultGit,
+		});
+		expect(first.range.commits.map((c) => c.sha)).toEqual(aShas);
+		expect(first.range.merges).toEqual([]);
+		expect(first.skipped.get(bh)).toEqual([bSha, mSha]);
+		expect(first.keptHead.get(bh)).toBe(aShas[98]!);
+		// The cursor is A99: the next window is exactly B1 + M — the merge cannot
+		// starve, and none of the kept A-line commits re-list.
+		const second = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bh,
+					branch: "feat",
+					head,
+					analyzedHead: first.keptHead.get(bh)!,
+				},
+			],
+			git: defaultGit,
+		});
+		expect(second.range.commits.map((c) => c.sha)).toEqual([bSha]);
+		expect(second.range.merges.map((c) => c.sha)).toEqual([mSha]);
+		expect(second.skipped.get(bh) ?? []).toEqual([]);
+	}, 120_000);
 });
 
 describe("watcher", () => {
@@ -835,6 +899,64 @@ describe("watcher", () => {
 		);
 		expect(cards.length).toBe(2);
 		expect(cards.some((t) => t.title.includes("(6 new commits)"))).toBe(true);
+	}, 120_000);
+
+	test("a released hold row the cap deferred stays until the analysis consumes it", async () => {
+		const name = "watch-releasedefer";
+		const main = await initUpstream(name);
+		const store = await initStore(main);
+		await store.setSettings({ forkResearch: true });
+		const forkDir = mkRepo(`${name}-fork`);
+		await run(["clone", "-q", main, forkDir], root);
+		await run(["checkout", "-q", "-b", "feat", forkDir], forkDir);
+		for (let i = 0; i < 99; i++)
+			await run(
+				["commit", "-q", "--allow-empty", "-m", `e${i}`, forkDir],
+				forkDir,
+			);
+		for (let i = 0; i < 2; i++)
+			await run(
+				["commit", "-q", "--allow-empty", "-m", `f${i}`, forkDir],
+				forkDir,
+			);
+		// 99 + 2 empties + this commit + 1 empty = 103 candidates: the cut lands on
+		// f0 (depth 100), so "released work" sits past the cap on the first run.
+		writeFileSync(join(forkDir, "rel.txt"), "released work\n");
+		await run(["add", "rel.txt", forkDir], forkDir);
+		await run(["commit", "-q", "-m", "released work", forkDir], forkDir);
+		const relSha = await shaOf(forkDir);
+		await run(["branch", "relpr", relSha], forkDir);
+		await run(["commit", "-q", "--allow-empty", "-m", "g0", forkDir], forkDir);
+		const bh = branchHash("feat");
+		// The released row's PR: openPr publishes refs/pull/7/head, which step 3
+		// fetches before the re-judge.
+		await openPr(main, forkDir, "relpr", 7);
+		// Seed the released hold row directly: released rows pass the re-judge
+		// untouched, and they make the branch pending without a new push.
+		await store.setForkHolds(1, bh, [
+			{ sha: relSha, pr: 7, prHead: relSha, released: true },
+		]);
+		const { watcher, state } = prWatcher(
+			name,
+			main,
+			store,
+			[{ id: 1, owner: "o", dir: forkDir }],
+			[],
+		);
+		await watcher.tick();
+		expect(state.subjects.length).toBe(1);
+		expect(state.subjects[0]).not.toContain("released work");
+		// The cap deferred "released work": its row must ride, not drop, or a commit
+		// outside the branch window could never ride again.
+		const held = await store.listForkHolds(1);
+		expect(held.some((h) => h.sha === relSha && h.released === 1)).toBe(true);
+		state.clock += FORK_GATES.FORK_RUN_SPACING_MS + 1;
+		await watcher.tick();
+		expect(state.subjects.length).toBe(2);
+		expect(state.subjects[1]).toContain("released work");
+		// The deferred commit was analyzed and covered: its row is consumed.
+		const held2 = await store.listForkHolds(1);
+		expect(held2.some((h) => h.sha === relSha)).toBe(false);
 	}, 120_000);
 
 	test("eligible range creates card, held proposal, advances cursor; no duplicates on second tick", async () => {
