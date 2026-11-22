@@ -2453,6 +2453,214 @@ describe("card links in bell text", () => {
 		const sentence = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
 		expect(shortNoticeText(sentence)).toBe(sentence);
 	});
+
+	// Properties (OTTR-1086): OTTR-1084's send-backs were shapes the examples
+	// above missed — a temp path inside a flattened record, a path-dirty cut,
+	// a punctuated container name. One generator builds the shapes
+	// scripts/update-image.ts really sends: a single flattened line, card ids
+	// up front where the collapsed line must keep them, then the detail tail
+	// (paths, flags, containers, commands, shas) it must drop.
+	const plainWord = fc.constantFrom(
+		"bun",
+		"install",
+		"failed",
+		"exited",
+		"container",
+		"seed",
+		"finished",
+		"repair",
+		"run",
+		"node",
+		"snapshot",
+		"import",
+		"stopped",
+		"step",
+		"left",
+		"place",
+		"update",
+		"card",
+		"rejected",
+		"SkillSpector",
+		"scheduled",
+	);
+	const connector = fc.constantFrom(
+		"in",
+		"at",
+		"on",
+		"from",
+		"with",
+		"to",
+		"for",
+		"by",
+		"into",
+		"under",
+		"via",
+	);
+	const pathToken = fc
+		.tuple(
+			fc.constantFrom("tmp", "opt", "var", "usr", "etc"),
+			fc.array(
+				fc.constantFrom(
+					"alate-data-9f34",
+					"ottr-seed-3182",
+					"user",
+					"omp",
+					"agent",
+					"skills",
+					"egm-review-loop",
+					"bin",
+					"cache",
+				),
+				{ minLength: 1, maxLength: 3 },
+			),
+		)
+		.map(([root, segs]) => `/${root}/${segs.join("/")}`);
+	const flagToken = fc
+		.tuple(
+			fc.constantFrom("-", "--"),
+			fc.constantFrom("d", "f", "wait", "no-deps", "env-file", "help"),
+		)
+		.map(([dashes, word]) => `${dashes}${word}`);
+	const containerCore = fc.constantFrom(
+		"ottr-worker-1",
+		"ottr-worker-2",
+		"alate-seed-2",
+		"dev-board-7",
+		"worker-3",
+	);
+	// A tail container may carry punctuation or a bracket: the send-back 3
+	// shape the bare-core shape test must see through.
+	const containerToken = fc
+		.tuple(
+			containerCore,
+			fc.constantFrom("", "("),
+			fc.constantFrom("", ".", ",", ":", ")", ")."),
+		)
+		.map(([core, pre, suf]) => `${pre}${core}${suf}`);
+	// A head token must not end a sentence before a later id, so its
+	// decorations carry no sentence punctuation.
+	const headContainer = fc
+		.tuple(containerCore, fc.constantFrom("", "(", ","))
+		.map(([core, deco]) =>
+			deco === "" ? core : deco === "," ? `${core},` : `(${core})`,
+		);
+	const cardId = fc
+		.tuple(
+			fc.constantFrom("OTTR", "ALAT", "MYST", "VELV"),
+			fc.integer({ min: 100, max: 1299 }),
+		)
+		.map(([prefix, n]) => `${prefix}-${n}`);
+	const projectCardId = fc
+		.tuple(fc.constantFrom("ottr", "alate", "mystic-realms", "velvarr"), cardId)
+		.map(([project, id]) => `${project}#${id}`);
+	const shaToken = fc
+		.array(fc.constantFrom(..."0123456789abcdef"), {
+			minLength: 7,
+			maxLength: 10,
+		})
+		.map((chars) => chars.join(""));
+	const commandFragment = fc.constantFrom(
+		"docker compose",
+		"up -d --wait",
+		"up -d --no-deps",
+		"git push origin main",
+		"systemctl restart server",
+	);
+	const headToken = fc.oneof(
+		{ weight: 4, arbitrary: cardId },
+		{ weight: 1, arbitrary: projectCardId },
+		{ weight: 5, arbitrary: plainWord },
+		{ weight: 2, arbitrary: connector },
+		{ weight: 1, arbitrary: pathToken },
+		{ weight: 1, arbitrary: headContainer },
+		{ weight: 1, arbitrary: fc.constantFrom("(exit 1)", "(exit 125)") },
+	);
+	const tailToken = fc.oneof(
+		{ weight: 4, arbitrary: plainWord },
+		{ weight: 2, arbitrary: connector },
+		{ weight: 3, arbitrary: pathToken },
+		{ weight: 2, arbitrary: flagToken },
+		{ weight: 2, arbitrary: containerToken },
+		{ weight: 1, arbitrary: shaToken },
+		{ weight: 1, arbitrary: commandFragment },
+		{
+			weight: 1,
+			arbitrary: fc.constantFrom(
+				"sync.mjs",
+				"repair:",
+				"re-run",
+				"update-image.ts",
+			),
+		},
+	);
+	const noticeText = fc
+		.tuple(
+			fc.array(headToken, { minLength: 1, maxLength: 6 }),
+			fc.constantFrom(".", ";", "!", "?", ":"),
+			fc.array(tailToken, { minLength: 1, maxLength: 40 }),
+			fc.boolean(),
+		)
+		.map(([head, end, tail, withEnd]) => {
+			const lead = `${head.join(" ")}${withEnd ? end : ""}`;
+			return `${lead} ${tail.join(" ")}`;
+		});
+	// Independent leak oracle (never the helpers' code): the three detail
+	// shapes, judged on the token's bare core — leading and trailing
+	// punctuation and brackets ride on the token and must not hide the shape
+	// (OTTR-1084 send-back 3). A helper gap against this contract fails P1.
+	const leakShape = (token: string): "path" | "flag" | "container" | null => {
+		const core = token.replace(/^[^\w/@#-]+/, "").replace(/[^\w/@#-]+$/, "");
+		if (/^https?:\/\//i.test(core)) return null;
+		if (core.includes("/")) return "path";
+		if (/^-{1,2}[a-zA-Z0-9]/.test(core)) return "flag";
+		if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*-\d+$/.test(core)) return "container";
+		return null;
+	};
+
+	test("property: the collapsed line leaks no path, flag, or container token", () => {
+		fc.assert(
+			fc.property(noticeText, (text) => {
+				for (const line of [
+					shortNoticeText(text, 160),
+					shortNoticeText(text),
+				]) {
+					for (const token of line.split(/\s+/)) {
+						expect(leakShape(token)).toBeNull();
+					}
+				}
+			}),
+		);
+	});
+
+	test("property: every bare card id reaches the collapsed line unchanged", () => {
+		fc.assert(
+			fc.property(noticeText, (text) => {
+				const short = shortNoticeText(text, 160);
+				for (const token of text.split(/\s+/)) {
+					// The code's bare reference shape (WARNING_LINK_RE's m[6]):
+					// the id must survive whole where the renderer would link
+					// it. The sentence punctuation the code keeps from a
+					// dropped token may ride behind the id ("OTTR-100."); no
+					// cut or cap may split or drop the id itself.
+					if (/^[A-Z][A-Z0-9]*-\d+$/.test(token)) {
+						const linkable = new RegExp(
+							`(?<![A-Za-z0-9-])${token}(?![A-Za-z0-9-])`,
+						).test(short);
+						expect(linkable).toBe(true);
+					}
+				}
+			}),
+		);
+	});
+
+	test("property: the seed-line cap bounds the collapsed line", () => {
+		fc.assert(
+			fc.property(noticeText, (text) => {
+				// 160 cap characters, plus the ellipsis the code appends on a cut.
+				expect(shortNoticeText(text, 160).length).toBeLessThanOrEqual(161);
+			}),
+		);
+	});
 });
 
 describe("RestartWaitLine", () => {
