@@ -559,49 +559,74 @@ export async function collectRange(o: {
 		if (branchFiltered.length > 0)
 			filteredReleased.set(b.branchHash, branchFiltered);
 		// Cap cut on the branch's first-parent mainline: the cursor parks on the deepest
-		// mainline commit whose window ancestry fits the run's remaining allowance, and
+		// mainline commit whose window ancestry fits the branch's window allowance, and
 		// the branch collects exactly that ancestry. A walk prefix cannot do this across
 		// merge parents: its last sha excludes only its own line, so a merge joining two
 		// kept lines starves forever (its ancestry never shrinks below the cap) and kept
-		// parallel-line work re-lists every run. With collected ⊆ ancestry(cut) and
-		// skipped ∩ ancestry(cut) = ∅ both hold by construction, whatever the graph.
+		// parallel-line work re-lists every run. Collected ⊆ ancestry(cut) and
+		// skipped ∩ ancestry(cut) = ∅ hold by construction whenever a mainline cut fits.
+		// When none fits (one merge carries more new commits than the whole allowance),
+		// a capped walk inside that ancestry bounds the run instead: the deferred
+		// survivors re-list next run (parents-first walk order), and kept parallel-line
+		// work may re-list once — bounded re-analysis, never a loss.
 		const survivor = new Set([...shas, ...mergeShas]);
 		const mergeSet = new Set(mergeShas);
 		const inWalk = raw.all.filter((s) => survivor.has(s));
 		const walked = new Set(inWalk);
-		// Released extras can sit outside the window; they ride first, as they always did.
+		// Released extras outside the window ride first and charge the allowance; extras
+		// past it defer, and their hold rows ride with them (keepReleased retains rows
+		// the cap skipped).
 		const outside = shas.filter((s) => !walked.has(s));
-		const mainline = [...raw.mainline].reverse(); // oldest first
 		const allowance = Math.min(budget, FORK_GATES.MAX_RANGE_COMMITS);
+		const outsideKept = Math.min(outside.length, allowance);
+		const windowAllowance = allowance - outsideKept;
+		for (const s of outside.slice(outsideKept)) markSkipped(b.branchHash, s);
+		const rideOutside = outside.slice(0, outsideKept);
+		const mainline = [...raw.mainline].reverse(); // oldest first
 		let cut: string | undefined;
 		let collectedSet = new Set<string>();
-		if (mainline.length > 0 && allowance > 0) {
+		let bounded = false;
+		if (mainline.length > 0 && windowAllowance > 0) {
 			// ancestry(m_depth) grows monotonically with mainline depth: binary-search the
-			// deepest depth whose window ancestry fits the allowance.
+			// deepest depth whose window ancestry fits the window allowance. depth 1 is
+			// checked too: a head whose first mainline step already overflows (one merge
+			// carrying the whole new side line) has no fitting mainline cut at all.
 			const countAt = async (depth: number) =>
 				new Set(
 					await revList([mainline[depth - 1]!, `^${base}`], cachePath, git),
 				);
-			let lo = 1;
-			let hi = mainline.length;
-			if ((await countAt(hi)).size <= allowance) {
-				lo = hi;
-			} else {
-				while (lo < hi) {
-					const mid = Math.ceil((lo + hi) / 2);
-					if ((await countAt(mid)).size <= allowance) lo = mid;
-					else hi = mid - 1;
+			const deepest = await countAt(mainline.length);
+			if (deepest.size <= windowAllowance) {
+				cut = mainline[mainline.length - 1]!;
+				collectedSet = deepest;
+				bounded = true;
+			} else if ((await countAt(1)).size <= windowAllowance) {
+				let lo = 1;
+				let hi = mainline.length;
+				while (hi - lo > 1) {
+					const mid = (lo + hi) >> 1;
+					if ((await countAt(mid)).size <= windowAllowance) lo = mid;
+					else hi = mid;
 				}
+				cut = mainline[lo - 1]!;
+				collectedSet = await countAt(lo);
+				bounded = true;
 			}
-			cut = mainline[lo - 1]!;
-			collectedSet = await countAt(lo);
 		}
-		const order = [
-			...outside,
-			...inWalk.filter((s) => collectedSet.has(s)).reverse(),
-		];
+		// Oldest-first reference for the skip marks: captured before any reversing, so
+		// the deferred set is always reported in commit order.
+		const walkOldestFirst = [...inWalk].reverse();
+		const windowOrder = bounded
+			? inWalk.filter((s) => collectedSet.has(s)).reverse()
+			: walkOldestFirst;
+		let order = [...rideOutside, ...windowOrder];
+		if (!bounded && order.length > allowance) {
+			order = order.slice(0, allowance);
+			const last = order[order.length - 1]!;
+			if (walked.has(last)) cut = last;
+		}
 		const ordered = new Set(order);
-		for (const s of [...inWalk].reverse()) {
+		for (const s of walkOldestFirst) {
 			if (!ordered.has(s)) markSkipped(b.branchHash, s);
 		}
 		if (cut !== undefined) {

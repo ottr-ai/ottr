@@ -799,6 +799,138 @@ describe("collectRange", () => {
 		expect(second.range.merges.map((c) => c.sha)).toEqual([mSha]);
 		expect(second.skipped.get(bh) ?? []).toEqual([]);
 	}, 120_000);
+
+	// One merge carrying the whole new side line: the first mainline step's ancestry
+	// alone exceeds the cap, so no mainline cut fits and the run falls back to a
+	// bounded walk — the total evidence stays at the cap and the rest re-lists.
+	test("a head that is one big merge defers through a bounded walk", async () => {
+		const main = await initUpstream("cr-bigmerge-main");
+		const fork = mkRepo("cr-bigmerge-fork");
+		await run(["clone", "-q", main, fork], root);
+		await run(["checkout", "-q", "-b", "side", fork], fork);
+		const sideShas: string[] = [];
+		for (let i = 0; i < 150; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `s${i}`, fork], fork);
+			sideShas.push(await shaOf(fork));
+		}
+		await run(["checkout", "-q", "main", fork], fork);
+		await run(["checkout", "-q", "-b", "feat", fork], fork);
+		await run(
+			["merge", "-q", "--no-ff", "-m", "merge side", "side", fork],
+			fork,
+		);
+		const mSha = await shaOf(fork);
+		const head = mSha;
+		const bh = branchHash("feat");
+		const cachePath = join(root, "cr-bigmerge-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[`+refs/heads/feat:refs/heads/${bh}`],
+			localFileGit(fork),
+		);
+		const first = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [{ branchHash: bh, branch: "feat", head, analyzedHead: null }],
+			git: defaultGit,
+		});
+		// The bypass bound: exactly the cap is collected, the merge itself deferred.
+		expect(first.range.commits.length + first.range.merges.length).toBe(
+			FORK_GATES.MAX_RANGE_COMMITS,
+		);
+		expect(first.range.merges).toEqual([]);
+		expect(first.range.commits.map((c) => c.sha)).toEqual(
+			sideShas.slice(0, FORK_GATES.MAX_RANGE_COMMITS),
+		);
+		expect(first.skipped.get(bh)).toEqual([
+			...sideShas.slice(FORK_GATES.MAX_RANGE_COMMITS),
+			mSha,
+		]);
+		expect(first.keptHead.get(bh)).toBe(
+			sideShas[FORK_GATES.MAX_RANGE_COMMITS - 1],
+		);
+		// The follow-up run from the parked cursor collects the rest, merge included.
+		const second = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bh,
+					branch: "feat",
+					head,
+					analyzedHead: first.keptHead.get(bh)!,
+				},
+			],
+			git: defaultGit,
+		});
+		expect(second.range.commits.map((c) => c.sha)).toEqual(
+			sideShas.slice(FORK_GATES.MAX_RANGE_COMMITS),
+		);
+		expect(second.range.merges.map((c) => c.sha)).toEqual([mSha]);
+		expect(second.skipped.get(bh) ?? []).toEqual([]);
+	}, 120_000);
+
+	// Released extras outside the window ride first and charge the allowance; the
+	// window keeps only what the remaining allowance covers and defers its tail.
+	test("released extras charge the allowance before the window", async () => {
+		const main = await initUpstream("cr-charge-main");
+		const fork = mkRepo("cr-charge-fork");
+		await run(["clone", "-q", main, fork], root);
+		const base = await shaOf(fork);
+		await run(["checkout", "-q", "-b", "extra", fork], fork);
+		const extraShas: string[] = [];
+		for (let i = 0; i < 20; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `x${i}`, fork], fork);
+			extraShas.push(await shaOf(fork));
+		}
+		await run(["checkout", "-q", "-b", "feat", base], fork);
+		const featShas: string[] = [];
+		for (let i = 0; i < 90; i++) {
+			await run(["commit", "-q", "--allow-empty", "-m", `e${i}`, fork], fork);
+			featShas.push(await shaOf(fork));
+		}
+		const head = featShas[featShas.length - 1]!;
+		const bh = branchHash("feat");
+		const cachePath = join(root, "cr-charge-cache.git");
+		await run(["init", "-q", "--bare", cachePath], root);
+		// The extras' objects must be in the cache for their git show.
+		await fetchFork(
+			cachePath,
+			"https://github.com/o/r.git",
+			[
+				`+refs/heads/feat:refs/heads/${bh}`,
+				"+refs/heads/extra:refs/heads/_extra",
+			],
+			localFileGit(fork),
+		);
+		const { range, skipped, keptHead } = await collectRange({
+			cachePath,
+			mainPath: main,
+			fork: forkPageEntry(1) as never,
+			branches: [
+				{
+					branchHash: bh,
+					branch: "feat",
+					head,
+					analyzedHead: null,
+					released: extraShas,
+				},
+			],
+			git: defaultGit,
+		});
+		// 20 extras + 80 window commits = the cap; the window's newest 10 defer.
+		expect(range.commits.length).toBe(FORK_GATES.MAX_RANGE_COMMITS);
+		expect(range.commits.map((c) => c.sha)).toEqual([
+			...extraShas,
+			...featShas.slice(0, 80),
+		]);
+		expect(skipped.get(bh)).toEqual(featShas.slice(80));
+		expect(keptHead.get(bh)).toBe(featShas[79]);
+	}, 120_000);
 });
 
 describe("watcher", () => {
