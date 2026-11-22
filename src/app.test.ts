@@ -3915,6 +3915,39 @@ describe("settings routes", () => {
 		);
 	});
 
+	test("releaseEnv: a string or null, stored deduped, at most 300 characters", async () => {
+		const badType = await post("/api/projects/p1/settings", { releaseEnv: 7 });
+		expect(badType.status).toBe(400);
+		expect(await errorOf(badType)).toBe("releaseEnv must be a string or null");
+		const badName = await post("/api/projects/p1/settings", {
+			releaseEnv: "OK FOO-BAR",
+		});
+		expect(badName.status).toBe(400);
+		expect(await errorOf(badName)).toBe(
+			"releaseEnv must be a whitespace-separated list of valid env var names",
+		);
+		const tooLong = await post("/api/projects/p1/settings", {
+			releaseEnv: Array.from({ length: 200 }, (_, i) => `V${i}`).join(" "),
+		});
+		expect(tooLong.status).toBe(400);
+		expect(await errorOf(tooLong)).toBe(
+			"releaseEnv must hold at most 300 characters",
+		);
+		const ok = await post("/api/projects/p1/settings", {
+			releaseEnv: "  TOKEN_A   TOKEN_B TOKEN_A ",
+		});
+		expect(ok.status).toBe(200);
+		expect((await store.getSettings()).releaseEnv).toBe("TOKEN_A TOKEN_B");
+		const empty = await post("/api/projects/p1/settings", { releaseEnv: "" });
+		expect(empty.status).toBe(200);
+		expect((await store.getSettings()).releaseEnv).toBeNull();
+		const cleared = await post("/api/projects/p1/settings", {
+			releaseEnv: null,
+		});
+		expect(cleared.status).toBe(200);
+		expect((await store.getSettings()).releaseEnv).toBeNull();
+	});
+
 	test("auto-tend settings validate and round-trip through the project settings route", async () => {
 		const ok = await post("/api/projects/p1/settings", {
 			autoTend: true,

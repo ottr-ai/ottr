@@ -28,6 +28,7 @@ import {
 	releaseBlocked,
 	releaseChip,
 	releaseEnv,
+	releaseEnvNames,
 	releasePushAuth,
 	runGh,
 	runReleaseCommand,
@@ -1970,3 +1971,188 @@ test("releaseEnv strips the repo-relocating vars (OTTR-1162)", () => {
 		else process.env.GIT_DIR = previous;
 	}
 });
+
+describe("releaseEnvNames", () => {
+	test("null and empty parse to no extra names", () => {
+		expect(releaseEnvNames(null)).toEqual([]);
+		expect(releaseEnvNames("")).toEqual([]);
+	});
+
+	test("whitespace-separated names keep order and dedupe first occurrence", () => {
+		expect(releaseEnvNames("A B  C")).toEqual(["A", "B", "C"]);
+		expect(releaseEnvNames("A\tB\nC B A")).toEqual(["A", "B", "C"]);
+		expect(releaseEnvNames("  TOKEN_A  ")).toEqual(["TOKEN_A"]);
+	});
+
+	test("an invalid name is refused and named", () => {
+		expect(() => releaseEnvNames("OK 1BAD")).toThrow(
+			"releaseEnv holds an invalid env var name: 1BAD",
+		);
+		expect(() => releaseEnvNames("A-B")).toThrow(
+			"releaseEnv holds an invalid env var name: A-B",
+		);
+		expect(() => releaseEnvNames("A.B")).toThrow("A.B");
+	});
+
+	test("property: valid name lists round-trip and are idempotent", () => {
+		const NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+		const nameArb = fc.string().filter((s) => NAME.test(s) && s.length <= 30);
+		fc.assert(
+			fc.property(fc.array(nameArb, { maxLength: 8 }), (names) => {
+				const parsed = releaseEnvNames(names.join(" "));
+				expect(parsed).toEqual([...new Set(names)]);
+				expect(releaseEnvNames(parsed.join(" "))).toEqual(parsed);
+			}),
+			{ seed: 42, numRuns: 100 },
+		);
+	});
+});
+
+describe.skipIf(process.platform === "win32")(
+	"runReleaseCommand env guard",
+	() => {
+		let root: string;
+		let repo: string;
+		let first: string;
+		let head: string;
+		let script: string;
+
+		const sh = (cwd: string, ...args: string[]) => {
+			const r = Bun.spawnSync(["git", ...args], { cwd });
+			if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+			return r.stdout.toString().trim();
+		};
+
+		/** Saves and restores the seeded env around one run. */
+		async function withEnv<T>(
+			vars: Record<string, string>,
+			fn: () => Promise<T>,
+		): Promise<T> {
+			const saved: Record<string, string | undefined> = {};
+			for (const k of Object.keys(vars)) {
+				saved[k] = process.env[k];
+				process.env[k] = vars[k];
+			}
+			try {
+				return await fn();
+			} finally {
+				for (const [k, v] of Object.entries(saved)) {
+					if (v === undefined) delete process.env[k];
+					else process.env[k] = v;
+				}
+			}
+		}
+
+		beforeAll(() => {
+			root = mkdtempSync(join(tmpdir(), "ott-release-guard-"));
+			repo = join(root, "repo");
+			sh(root, "init", "-q", "-b", "main", repo);
+			sh(repo, "config", "user.name", "t");
+			sh(repo, "config", "user.email", "t@example.com");
+			sh(repo, "commit", "-q", "--allow-empty", "-m", "feat: one");
+			first = sh(repo, "rev-parse", "HEAD");
+			sh(repo, "commit", "-q", "--allow-empty", "-m", "feat: two");
+			head = sh(repo, "rev-parse", "HEAD");
+			script = join(root, "release.sh");
+		});
+
+		afterAll(() => {
+			rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+		});
+
+		/** The release command under test: dumps its env, then makes the tag the claim check reads. */
+		const writeMarkerScript = (marker: string): void => {
+			writeFileSync(
+				script,
+				`#!/bin/sh\nenv | sort > ${marker}\ngit tag v9.9.9\n`,
+			);
+			chmodSync(script, 0o755);
+		};
+
+		test("the command env is exactly base, allowlist and release facts", async () => {
+			const marker = join(root, "env.out");
+			writeMarkerScript(marker);
+			await withEnv(
+				{
+					GH_TOKEN: "board-token",
+					OTTR_HOSTED_SECRET: "signing-key",
+					BOARD_JUNK_VAR: "junk",
+					ALLOW_ME: "passed",
+				},
+				async () => {
+					const line = await runReleaseCommand({
+						command: script,
+						cwd: repo,
+						mainPath: repo,
+						originUrl: null,
+						target: "main",
+						sha: head,
+						version: "v9.9.9",
+						notesFile: join(root, "notes.md"),
+						allowEnv: "ALLOW_ME",
+						log: () => {},
+					});
+					expect(line).toContain("published v9.9.9");
+				},
+			);
+			const keys = readFileSync(marker, "utf8")
+				.split("\n")
+				.filter((l) => l !== "")
+				.map((l) => l.slice(0, l.indexOf("=")));
+			const base = ["PATH", "HOME", "LANG", "TERM"].filter(
+				(k) => process.env[k] !== undefined,
+			);
+			// Bun.spawn adds PWD for the child's cwd; it is not a leaked server env var.
+			expect(keys.sort()).toEqual(
+				[
+					...base,
+					"PWD",
+					"ALLOW_ME",
+					"OTTR_RELEASE_COMMIT",
+					"OTTR_RELEASE_NOTES_FILE",
+					"OTTR_RELEASE_VERSION",
+				].sort(),
+			);
+		}, 60_000);
+
+		test("a worktree not at the reviewed commit is refused before the command runs", async () => {
+			const marker = join(root, "mismatch.out");
+			writeMarkerScript(marker);
+			await expect(
+				runReleaseCommand({
+					command: script,
+					cwd: repo,
+					mainPath: repo,
+					originUrl: null,
+					target: "main",
+					sha: first,
+					version: "v9.9.9",
+					notesFile: join(root, "notes.md"),
+					log: () => {},
+				}),
+			).rejects.toThrow(
+				`the release worktree is at ${head.slice(0, 7)}, not the reviewed commit ${first.slice(0, 7)}; publication refused`,
+			);
+			expect(existsSync(marker)).toBe(false);
+		}, 60_000);
+
+		test("a cwd that is not a git checkout is refused", async () => {
+			const bare = join(root, "not-a-repo");
+			mkdirSync(bare);
+			await expect(
+				runReleaseCommand({
+					command: "true",
+					cwd: bare,
+					mainPath: repo,
+					originUrl: null,
+					target: "main",
+					sha: head,
+					version: "v9.9.9",
+					notesFile: join(root, "notes.md"),
+					log: () => {},
+				}),
+			).rejects.toThrow("the release worktree is not a git checkout");
+		}, 60_000);
+	},
+);
+>>>>>>> bd0ffe81 (fix: narrow the release command env and bind it to the reviewed commit)

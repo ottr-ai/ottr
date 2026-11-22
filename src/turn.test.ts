@@ -4763,7 +4763,10 @@ describe("turn release cards", () => {
 			},
 		});
 		projects.get(store.name)!.target = "origin/main";
-		await store.setSettings({ releaseCommand: "bin release" });
+		await store.setSettings({
+			releaseCommand: "bin release",
+			releaseEnv: "MY_TOKEN",
+		});
 		const task = await releaseTask(store);
 		await loop.runTurn(store.name, task.id);
 		const after = (await store.getTask(task.id))!;
@@ -4771,6 +4774,7 @@ describe("turn release cards", () => {
 		expect(after.summary).toBe("Released v1.0.0");
 		expect(record.runReleaseCommand[0]).toMatchObject({
 			command: "bin release",
+			allowEnv: "MY_TOKEN",
 			cwd: "wt-x",
 			version: "v1.0.0",
 		});

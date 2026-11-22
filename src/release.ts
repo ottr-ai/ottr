@@ -1073,11 +1073,24 @@ async function dryRunLine(
 	return parts.join(", ");
 }
 
-function withoutHostedSecret(
-	env: Record<string, string | undefined>,
-): Record<string, string | undefined> {
-	const { OTTR_HOSTED_SECRET: _, ...rest } = env;
-	return rest;
+/** Names the release command's env always keeps from the server env. */
+export const RELEASE_ENV_BASE = ["PATH", "HOME", "LANG", "TERM"] as const;
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Parses the releaseEnv setting: whitespace-separated env var names, deduped in first-occurrence
+ * order; null and empty mean no extra names. Invalid names throw — the settings route validates
+ * with this same parser. */
+export function releaseEnvNames(value: string | null): string[] {
+	if (value === null) return [];
+	const names: string[] = [];
+	for (const name of value.split(/\s+/)) {
+		if (name === "") continue;
+		if (!ENV_NAME.test(name))
+			throw new Error(`releaseEnv holds an invalid env var name: ${name}`);
+		if (!names.includes(name)) names.push(name);
+	}
+	return names;
 }
 
 /** Splits the command on spaces; double quotes group a part that holds spaces. No shell, no escapes. */
@@ -1090,21 +1103,29 @@ function releaseArgv(command: string): string[] {
 }
 
 /** The release command's child env: the command's git names its repos with path arguments,
- * so the ambient repo-relocating vars are stripped (OTTR-1162). Exported for the strip test. */
+ * so the ambient repo-relocating vars are stripped (OTTR-1162). Exported for the strip test.
+ * The base env holds only PATH, HOME, LANG and TERM plus the operator's releaseEnv allowlist
+ * (names only — values always come from the server env at spawn time), so no setting value
+ * and no other server env var reaches the command. */
 export function releaseEnv(o: {
 	sha: string;
 	version: string;
 	notesFile: string;
 	archReview?: { delta: number } | null;
+	allowEnv?: string | null;
 }): Record<string, string | undefined> {
-	const env = {
-		// The hosted signing key never reaches the tenant's command (hosted-mode spec).
-		...withoutHostedSecret(process.env),
-		OTTR_RELEASE_VERSION: o.version,
-		OTTR_RELEASE_COMMIT: o.sha,
-		OTTR_RELEASE_NOTES_FILE: o.notesFile,
-		...(o.archReview ? { OTTR_ARCH_REVIEW: String(o.archReview.delta) } : {}),
-	};
+	const env: Record<string, string | undefined> = {};
+	for (const name of [
+		...RELEASE_ENV_BASE,
+		...releaseEnvNames(o.allowEnv ?? null),
+	]) {
+		const value = process.env[name];
+		if (value !== undefined) env[name] = value;
+	}
+	env.OTTR_RELEASE_VERSION = o.version;
+	env.OTTR_RELEASE_COMMIT = o.sha;
+	env.OTTR_RELEASE_NOTES_FILE = o.notesFile;
+	if (o.archReview) env.OTTR_ARCH_REVIEW = String(o.archReview.delta);
 	// OTTR-1162: the command's git names its repos with path arguments, so an inherited
 	// GIT_DIR (a git-hook launch) would redirect its tag/commit into a foreign repository.
 	stripRepoRelocatingEnv(env);
@@ -1214,6 +1235,8 @@ export async function runReleaseCommand(o: {
 	/** Commits since the previous review, exposed as OTTR_ARCH_REVIEW for the command's tag message.
 	 * Informational: the board counts its review watermark from review cards, not from tags. */
 	archReview?: { delta: number } | null;
+	/** The raw releaseEnv setting: extra env var names the command may keep from the server env. */
+	allowEnv?: string | null;
 	log: (line: string) => void | Promise<void>;
 	/** Lets Cancel and shutdown stop the command's process tree. */
 	onSpawn?: (h: {
@@ -1223,6 +1246,18 @@ export async function runReleaseCommand(o: {
 	}) => void;
 }): Promise<string> {
 	const argv = releaseArgv(o.command);
+	// The worktree is worker-writable, so the server binds the tree it is about to
+	// execute to the reviewed commit before any code runs there.
+	const head = await git(["rev-parse", "HEAD"], o.cwd);
+	if (head.code !== 0)
+		throw new Error(
+			`the release worktree is not a git checkout: ${head.stderr.trim()}`,
+		);
+	const headSha = head.stdout.trim();
+	if (headSha !== o.sha)
+		throw new Error(
+			`the release worktree is at ${headSha.slice(0, 7)}, not the reviewed commit ${o.sha.slice(0, 7)}; publication refused`,
+		);
 	const proc = spawnRelease(argv, o.cwd, releaseEnv(o));
 	const pid = proc.pid;
 	o.onSpawn?.({

@@ -291,6 +291,7 @@ import {
 	ownerRepo,
 	planRelease,
 	releaseBlocked,
+	releaseEnvNames,
 	runGh,
 } from "./release.ts";
 import { readProductDescription, summarizeRelease } from "./releaseSummary.ts";
@@ -1702,6 +1703,37 @@ function parseReleaseCommand(
 	return null;
 }
 
+function parseReleaseEnv(
+	body: Record<string, unknown>,
+	patch: Partial<ProjectSettings>,
+): Response | null {
+	const renv = body.releaseEnv;
+	if (renv === undefined) return null;
+	if (renv !== null && typeof renv !== "string")
+		return json({ error: "releaseEnv must be a string or null" }, 400);
+	if (renv === null) {
+		patch.releaseEnv = null;
+		return null;
+	}
+	let names: string[];
+	try {
+		names = releaseEnvNames(renv);
+	} catch {
+		return json(
+			{
+				error:
+					"releaseEnv must be a whitespace-separated list of valid env var names",
+			},
+			400,
+		);
+	}
+	const normalized = names.join(" ");
+	if (normalized.length > 300)
+		return json({ error: "releaseEnv must hold at most 300 characters" }, 400);
+	patch.releaseEnv = normalized === "" ? null : normalized;
+	return null;
+}
+
 function parseTargetBranch(
 	body: Record<string, unknown>,
 	patch: Partial<ProjectSettings>,
@@ -1908,6 +1940,7 @@ const settingParsers: FieldParser[] = [
 	parseIconText,
 	parseTaskIdPrefix,
 	parseReleaseCommand,
+	parseReleaseEnv,
 	parseTargetBranch,
 	parseArchReviewCap,
 	parseMaxImages,

@@ -10256,6 +10256,8 @@ function ProjectReviewsCards({
 	send,
 	relcmd,
 	setRelcmd,
+	relenv,
+	setRelenv,
 	cap,
 	setCap,
 	reviewCap,
@@ -10268,6 +10270,8 @@ function ProjectReviewsCards({
 	send: (patch: Record<string, unknown>) => Promise<ProjectView>;
 	relcmd: string;
 	setRelcmd: (v: string) => void;
+	relenv: string;
+	setRelenv: (v: string) => void;
 	cap: string;
 	setCap: (v: string) => void;
 	reviewCap: number;
@@ -10279,8 +10283,16 @@ function ProjectReviewsCards({
 			<SaveCard
 				id="project-releases-section"
 				act={act}
-				dirty={relcmd.trim() !== (st.releaseCommand ?? "")}
-				save={() => send({ releaseCommand: relcmd.trim() || null })}
+				dirty={
+					relcmd.trim() !== (st.releaseCommand ?? "") ||
+					relenv.trim() !== (st.releaseEnv ?? "")
+				}
+				save={() =>
+					send({
+						releaseCommand: relcmd.trim() || null,
+						releaseEnv: relenv.trim() || null,
+					})
+				}
 				title="Releases"
 				status={
 					project.settings.releaseCommand !== null
@@ -10306,6 +10318,24 @@ function ProjectReviewsCards({
 									onChange={(e) => setRelcmd(e.target.value)}
 									placeholder="node scripts/release.mjs --ottr"
 									aria-label="Release command"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							settingKey="releaseEnv"
+							name="Release env allowlist"
+							action={save}
+							help="Extra env var names the release command keeps from the server env, separated by spaces. Empty: only PATH, HOME, LANG and TERM. The values come from the server env; this field never holds values."
+							shape="space-separated names"
+						>
+							<label>
+								<input
+									type="text"
+									maxLength={300}
+									value={relenv}
+									onChange={(e) => setRelenv(e.target.value)}
+									placeholder="GITHUB_TOKEN AWS_REGION"
+									aria-label="Release env allowlist"
 								/>
 							</label>
 						</DefRow>
@@ -10392,6 +10422,7 @@ export function ProjectSettingsForm({
 	const [kwd, setKwd] = useState(String(project.settings.keptWorktreeDays));
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
 	const [relcmd, setRelcmd] = useState(project.settings.releaseCommand ?? "");
+	const [relenv, setRelenv] = useState(project.settings.releaseEnv ?? "");
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
 	const [marker, setMarker] = useState(project.settings.iconText ?? "");
@@ -10540,6 +10571,8 @@ export function ProjectSettingsForm({
 					send={send}
 					relcmd={relcmd}
 					setRelcmd={setRelcmd}
+					relenv={relenv}
+					setRelenv={setRelenv}
 					cap={cap}
 					setCap={setCap}
 					reviewCap={reviewCap}

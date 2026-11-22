@@ -243,6 +243,10 @@ export interface ProjectSettings {
 	 * review).
 	 */
 	releaseCommand: string | null;
+	/** Extra env var names the release command keeps from the server env, whitespace-separated
+	 * and stored deduped; null = only PATH, HOME, LANG and TERM. Names only: the values always
+	 * come from the server env at spawn time, never from this setting. */
+	releaseEnv: string | null;
 	/** Commits on the integration target before an architecture review is due. */
 	archReviewCap: number;
 	/** Leads one validation run (OTTR-1047) validates per run; a stored value below 1 behaves as 1. */

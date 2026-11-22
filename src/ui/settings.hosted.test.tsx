@@ -139,6 +139,7 @@ const project = (): ProjectView =>
 			copyExtra: [],
 			displayName: null,
 			releaseCommand: null,
+			releaseEnv: null,
 			archReviewCap: 30,
 			maxImages: 4,
 			keptWorktreeDays: 7,
