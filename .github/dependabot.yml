@@ -41,3 +41,13 @@ updates:
     commit-message:
       prefix: chore
       include: scope
+  # Moves the pinned tag and digest of the postgres and buildkit images in docker-compose.yml.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
