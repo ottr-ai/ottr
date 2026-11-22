@@ -2015,7 +2015,8 @@ describe.skipIf(process.platform === "win32")(
 		let repo: string;
 		let first: string;
 		let head: string;
-		let script: string;
+		let notesFile: string;
+		let seq = 0;
 
 		const sh = (cwd: string, ...args: string[]) => {
 			const r = Bun.spawnSync(["git", ...args], { cwd });
@@ -2053,25 +2054,36 @@ describe.skipIf(process.platform === "win32")(
 			first = sh(repo, "rev-parse", "HEAD");
 			sh(repo, "commit", "-q", "--allow-empty", "-m", "feat: two");
 			head = sh(repo, "rev-parse", "HEAD");
-			script = join(root, "release.sh");
+			notesFile = join(root, "notes.md");
+			writeFileSync(notesFile, "n");
 		});
 
 		afterAll(() => {
 			rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 		});
 
+		/** A linked worktree of the board repo at the reviewed commit, like a release card's. */
+		const addWt = (): string => {
+			const wt = join(root, `wt${++seq}`);
+			sh(repo, "worktree", "add", "-q", "--detach", wt, head);
+			return wt;
+		};
+
 		/** The release command under test: dumps its env, then makes the tag the claim check reads. */
-		const writeMarkerScript = (marker: string): void => {
+		const writeMarkerScript = (marker: string): string => {
+			const script = join(root, `release-${++seq}.sh`);
 			writeFileSync(
 				script,
 				`#!/bin/sh\nenv | sort > ${marker}\ngit tag v9.9.9\n`,
 			);
 			chmodSync(script, 0o755);
+			return script;
 		};
 
 		test("the command env is exactly base, allowlist and release facts", async () => {
+			const wt = addWt();
 			const marker = join(root, "env.out");
-			writeMarkerScript(marker);
+			const script = writeMarkerScript(marker);
 			await withEnv(
 				{
 					GH_TOKEN: "board-token",
@@ -2082,13 +2094,13 @@ describe.skipIf(process.platform === "win32")(
 				async () => {
 					const line = await runReleaseCommand({
 						command: script,
-						cwd: repo,
+						cwd: wt,
 						mainPath: repo,
 						originUrl: null,
 						target: "main",
 						sha: head,
 						version: "v9.9.9",
-						notesFile: join(root, "notes.md"),
+						notesFile,
 						allowEnv: "ALLOW_ME",
 						log: () => {},
 					});
@@ -2116,18 +2128,19 @@ describe.skipIf(process.platform === "win32")(
 		}, 60_000);
 
 		test("a worktree not at the reviewed commit is refused before the command runs", async () => {
+			const wt = addWt();
 			const marker = join(root, "mismatch.out");
-			writeMarkerScript(marker);
+			const script = writeMarkerScript(marker);
 			await expect(
 				runReleaseCommand({
 					command: script,
-					cwd: repo,
+					cwd: wt,
 					mainPath: repo,
 					originUrl: null,
 					target: "main",
 					sha: first,
 					version: "v9.9.9",
-					notesFile: join(root, "notes.md"),
+					notesFile,
 					log: () => {},
 				}),
 			).rejects.toThrow(
@@ -2136,7 +2149,7 @@ describe.skipIf(process.platform === "win32")(
 			expect(existsSync(marker)).toBe(false);
 		}, 60_000);
 
-		test("a cwd that is not a git checkout is refused", async () => {
+		test("a cwd that does not link to the board's gitdir is refused", async () => {
 			const bare = join(root, "not-a-repo");
 			mkdirSync(bare);
 			await expect(
@@ -2148,10 +2161,98 @@ describe.skipIf(process.platform === "win32")(
 					target: "main",
 					sha: head,
 					version: "v9.9.9",
-					notesFile: join(root, "notes.md"),
+					notesFile,
 					log: () => {},
 				}),
-			).rejects.toThrow("the release worktree is not a git checkout");
+			).rejects.toThrow(
+				"the release worktree does not link to the board's gitdir",
+			);
+		}, 60_000);
+
+		test("a tracked file changed without a commit is refused before the command runs", async () => {
+			// The card's validation plan local step: change the worktree copy without a
+			// commit. The committed script tags v9.9.9 and writes CLEAN; the modified copy
+			// appends pwned, so a marker holding pwned would prove the change executed.
+			const scriptName = "release.sh";
+			writeFileSync(
+				join(repo, scriptName),
+				"#!/bin/sh\nenv | sort > CLEAN\ngit tag v9.9.9\n",
+			);
+			chmodSync(join(repo, scriptName), 0o755);
+			sh(repo, "add", scriptName);
+			sh(repo, "commit", "-q", "-m", "feat: release script");
+			const shaDirty = sh(repo, "rev-parse", "HEAD");
+			const wt = join(root, `wt${++seq}`);
+			sh(repo, "worktree", "add", "-q", "--detach", wt, shaDirty);
+			writeFileSync(
+				join(wt, scriptName),
+				"#!/bin/sh\nenv | sort > DIRTY\necho pwned >> DIRTY\ngit tag v9.9.9\n",
+			);
+			chmodSync(join(wt, scriptName), 0o755);
+			await expect(
+				runReleaseCommand({
+					command: join(wt, scriptName),
+					cwd: wt,
+					mainPath: repo,
+					originUrl: null,
+					target: "main",
+					sha: shaDirty,
+					version: "v9.9.9",
+					notesFile,
+					log: () => {},
+				}),
+			).rejects.toThrow("the release worktree holds uncommitted changes");
+			expect(existsSync(join(root, "DIRTY"))).toBe(false);
+			expect(existsSync(join(root, "CLEAN"))).toBe(false);
+		}, 60_000);
+
+		test("an untracked file is refused too", async () => {
+			const wt = addWt();
+			const marker = join(root, "untracked.out");
+			const script = writeMarkerScript(marker);
+			writeFileSync(join(wt, "extra.txt"), "untracked\n");
+			await expect(
+				runReleaseCommand({
+					command: script,
+					cwd: wt,
+					mainPath: repo,
+					originUrl: null,
+					target: "main",
+					sha: head,
+					version: "v9.9.9",
+					notesFile,
+					log: () => {},
+				}),
+			).rejects.toThrow("the release worktree holds uncommitted changes");
+			expect(existsSync(marker)).toBe(false);
+		}, 60_000);
+
+		test("a worktree whose .git link does not name the board's gitdir is refused", async () => {
+			const wt = addWt();
+			const marker = join(root, "rogue.out");
+			const script = writeMarkerScript(marker);
+			// A worker can re-point the link at a clone with the same HEAD, so the HEAD
+			// check alone would let it run.
+			const rogue = join(root, "rogue");
+			sh(root, "clone", "-q", repo, rogue);
+			sh(rogue, "checkout", "-q", "--detach", head);
+			writeFileSync(join(wt, ".git"), `gitdir: ${rogue}/.git\n`);
+			await expect(
+				runReleaseCommand({
+					command: script,
+					cwd: wt,
+					mainPath: repo,
+					originUrl: null,
+					target: "main",
+					sha: head,
+					version: "v9.9.9",
+					notesFile,
+					log: () => {},
+				}),
+			).rejects.toThrow(
+				"the release worktree does not link to the board's gitdir",
+			);
+			expect(existsSync(marker)).toBe(false);
 		}, 60_000);
 	},
 );

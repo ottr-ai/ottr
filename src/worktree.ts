@@ -2860,7 +2860,7 @@ export async function worktreeLinked(path: string): Promise<boolean> {
  * lock, dubious ownership) and the worktree may be healthy — a husk verdict there would let the pre-dispatch guard
  * settle a zero-commit card done on a vacuous proof or rebuild a live checkout. */
 /** The gitdir a `.git` link file in `dir` names, resolved; null when the link is missing, unreadable, or names nothing. */
-function readGitdir(dir: string): string | null {
+export function readGitdir(dir: string): string | null {
 	try {
 		if (!statSync(path.join(dir, ".git")).isFile()) return null;
 		const m = readFileSync(path.join(dir, ".git"), "utf8").match(

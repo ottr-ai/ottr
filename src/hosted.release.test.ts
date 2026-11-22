@@ -19,6 +19,7 @@ const REMOTE = "https://github.com/o/r";
 
 let root: string;
 let repo: string;
+let wt: string;
 let sha: string;
 let bin: string;
 let record: string;
@@ -37,6 +38,10 @@ beforeAll(() => {
 	sh(repo, "config", "user.email", "t@example.com");
 	sh(repo, "commit", "-q", "--allow-empty", "-m", "feat: x");
 	sha = sh(repo, "rev-parse", "HEAD");
+	// runReleaseCommand executes only the board's own linked worktree; the boundary
+	// tests run it against one, like a release card's.
+	wt = join(root, "wt");
+	sh(repo, "worktree", "add", "-q", "--detach", wt, sha);
 	bin = join(root, "bin");
 	mkdirSync(bin);
 	record = join(root, "gh.log");
@@ -80,7 +85,7 @@ describe.skipIf(!posix)("hosted release boundary", () => {
 			await expect(
 				runReleaseCommand({
 					command: `sh -c "printf %s \${OTTR_HOSTED_SECRET:-absent} > ${out}"`,
-					cwd: repo,
+					cwd: wt,
 					mainPath: repo,
 					originUrl: null,
 					target: "main",

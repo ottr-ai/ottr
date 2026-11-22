@@ -1,6 +1,6 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { childDatabaseEnv } from "./childEnv.ts";
 import { gitAuthEnv, parseGitToken, parseGitUrl } from "./gitHosts.ts";
 import { ghEnvFor, githubHost, hostMatcher } from "./githubHost.ts";
@@ -14,8 +14,11 @@ import {
 	git,
 	hostedGitAuth,
 	pushLfsObjects,
+	readGitdir,
 	redact,
+	rowPath,
 	spawnPiped,
+	statusRows,
 } from "./worktree.ts";
 
 export interface ConventionalCommit {
@@ -1223,7 +1226,7 @@ async function claimedTagSha(
  */
 export async function runReleaseCommand(o: {
 	command: string;
-	/** The release card's worktree, checked out at the reviewed commit. */
+	/** The release card's worktree: the board's own linked checkout, clean, at the reviewed commit. */
 	cwd: string;
 	mainPath: string;
 	/** The server-pinned origin URL (docs/specs/pinned-origin-url.md); null fails the check. */
@@ -1247,7 +1250,25 @@ export async function runReleaseCommand(o: {
 }): Promise<string> {
 	const argv = releaseArgv(o.command);
 	// The worktree is worker-writable, so the server binds the tree it is about to
-	// execute to the reviewed commit before any code runs there.
+	// execute to the board's own checkout of the reviewed commit before any code
+	// runs there: the .git link must name the board's gitdir (a planted link could
+	// speak for another repo), the tree must hold no tracked or untracked change,
+	// and HEAD must be the reviewed commit.
+	const gitdir = readGitdir(o.cwd);
+	const expectedGitdir = resolve(
+		join(o.mainPath, ".git", "worktrees", basename(o.cwd)),
+	);
+	if (gitdir === null || resolve(gitdir) !== expectedGitdir)
+		throw new Error(
+			"the release worktree does not link to the board's gitdir; publication refused",
+		);
+	const rows = await statusRows(o.cwd);
+	if (rows.length > 0) {
+		const names = rows.slice(0, 5).map(rowPath).join(", ");
+		throw new Error(
+			`the release worktree holds uncommitted changes (${names}${rows.length > 5 ? ` +${rows.length - 5} more` : ""}); publication refused`,
+		);
+	}
 	const head = await git(["rev-parse", "HEAD"], o.cwd);
 	if (head.code !== 0)
 		throw new Error(
