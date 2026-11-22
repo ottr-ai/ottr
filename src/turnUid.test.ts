@@ -8,6 +8,7 @@ import {
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	readlinkSync,
 	renameSync,
@@ -34,10 +35,12 @@ import {
 	ensureLayerCopy,
 	ensureProjectIdentity,
 	isolationEnabled,
+	newLayerToken,
 	openPinned,
 	prepareRunWorkspace,
 	prepareTurnHome,
 	projectTurnUid,
+	releaseLayerCopyUse,
 	resolvePinnedLayer,
 	retargetCacheLinks,
 	type TurnHome,
@@ -62,6 +65,12 @@ function freshDir(prefix: string): string {
 /** A real turn home under a fresh homes root. */
 function freshTurnHome(project: string): TurnHome {
 	return prepareTurnHome(freshDir("homes"), project, projectTurnUid(project));
+}
+
+/** A turn home this uid can create and chown, so the layer tests run on
+ * every gate: chown-to-self needs no privilege. */
+function selfTurnHome(project: string): TurnHome {
+	return prepareTurnHome(freshDir("homes"), project, selfIds());
 }
 
 /**
@@ -558,6 +567,111 @@ test("OTTR-1179: a prune decision waits for the layers lock and re-reads state u
 	expect(existsSync(join(turnHome.layers, "693b38b5b400-134.inuse"))).toBe(
 		true,
 	);
+});
+
+/**
+ * OTTR-1210: a provision's protection ends with its run. Ten provisions in a
+ * row, each run finished before the next starts, leave one copy per project —
+ * whatever alate still holds in the shared home, and however fresh the
+ * previous provisions were.
+ */
+test("ten provisions with no turn in flight end with one copy", () => {
+	const ids = selfIds();
+	const workerHome = freshDir("worker-bound");
+	const shared = join(workerHome, ".alate", "layers");
+	mkdirSync(shared, { recursive: true });
+	const provision = (turnHome: TurnHome, id: string): void => {
+		const layerDir = join(shared, id);
+		mkdirSync(join(layerDir, ".omp", "agent"), { recursive: true });
+		writeFileSync(join(layerDir, ".omp", "agent", "agent.db"), "store");
+		const token = newLayerToken();
+		// The run starts: the copy lands and the marker gains its line.
+		expect(
+			ensureLayerCopy(layerDir, turnHome, workerHome, ids, 50, token),
+		).toBe(join(turnHome.layers, id));
+		// The run ends before the next provision starts.
+		releaseLayerCopyUse(turnHome.layers, id, token);
+	};
+	const homes: [TurnHome, string][] = [
+		[selfTurnHome("bound-a"), "693b38b5b400-20"],
+		[selfTurnHome("bound-b"), "693b38b5b400-30"],
+	];
+	// Ten provisions per project; every source layer stays in the shared
+	// home, so retention cannot ride on it.
+	for (const [turnHome, base] of homes) {
+		for (let i = 0; i < 10; i++) provision(turnHome, `${base}${i}`);
+	}
+	// One final copy per project: the last pin. Its released marker is gone.
+	for (const [turnHome, base] of homes) {
+		const names = readdirSync(turnHome.layers).filter(
+			(n) => n !== "in-use.lock",
+		);
+		expect(names).toEqual([`${base}9`]);
+	}
+});
+
+/**
+ * OTTR-1210: a live turn's marker keeps its copy whatever the copy's age and
+ * whatever alate did to the source layer; the moment the run releases, the
+ * next provision for the project reclaims the copy.
+ */
+test("a live in-use marker keeps its copy, a released one goes", () => {
+	const ids = selfIds();
+	const turnHome = selfTurnHome("bound-live");
+	const workerHome = freshDir("worker-bound-live");
+	const shared = join(workerHome, ".alate", "layers");
+	mkdirSync(shared, { recursive: true });
+	const makeLayer = (id: string): string => {
+		const layerDir = join(shared, id);
+		mkdirSync(join(layerDir, ".omp", "agent"), { recursive: true });
+		writeFileSync(join(layerDir, ".omp", "agent", "agent.db"), "store");
+		return layerDir;
+	};
+	// Turn 1 starts on X and stays live.
+	const tokenX = newLayerToken();
+	expect(
+		ensureLayerCopy(
+			makeLayer("693b38b5b400-141"),
+			turnHome,
+			workerHome,
+			ids,
+			50,
+			tokenX,
+		),
+	).toBe(join(turnHome.layers, "693b38b5b400-141"));
+	const copyX = join(turnHome.layers, "693b38b5b400-141");
+	// Alate deletes the source layer and the copy itself ages past a day;
+	// the live marker must keep the copy all the same.
+	rmSync(join(shared, "693b38b5b400-141"), { recursive: true, force: true });
+	touchMtime(copyX, Date.now() - 25 * 60 * 60 * 1000);
+	// A finished provision for the same project lands its own copy.
+	const tokenY = newLayerToken();
+	ensureLayerCopy(
+		makeLayer("693b38b5b400-142"),
+		turnHome,
+		workerHome,
+		ids,
+		50,
+		tokenY,
+	);
+	releaseLayerCopyUse(turnHome.layers, "693b38b5b400-142", tokenY);
+	// The live turn's copy survives the finished provision's decision; the
+	// finished provision's own copy goes at the next provision's prune.
+	expect(existsSync(copyX)).toBe(true);
+	// Turn 1 ends; the next provision reclaims X and the finished copy too.
+	releaseLayerCopyUse(turnHome.layers, "693b38b5b400-141", tokenX);
+	const tokenZ = newLayerToken();
+	ensureLayerCopy(
+		makeLayer("693b38b5b400-143"),
+		turnHome,
+		workerHome,
+		ids,
+		50,
+		tokenZ,
+	);
+	expect(existsSync(copyX)).toBe(false);
+	expect(existsSync(join(turnHome.layers, "693b38b5b400-142"))).toBe(false);
+	expect(existsSync(join(turnHome.layers, "693b38b5b400-143"))).toBe(true);
 });
 
 function statOf(path: string): Stats | null {

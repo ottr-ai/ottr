@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import {
+	appendFileSync,
 	chmodSync,
 	chownSync,
 	closeSync,
@@ -31,7 +32,7 @@ import {
 	resolve,
 	sep,
 } from "node:path";
-import { holdLock } from "./layerLeaseLock.ts";
+import { type HeldLock, holdLock } from "./layerLeaseLock.ts";
 
 /**
  * Per-project turn identity for classic workers (OTTR-994,
@@ -214,17 +215,61 @@ const LAYERS_LOCK_NAME = "in-use.lock";
 const LAYERS_LOCK_WAIT_MS = 10_000;
 
 /**
- * Mark one layer id in use for the stale window: a fresh mtime keeps the
- * copy's prune away while a started turn runs on it. The marker lives in the
- * root-owned layers dir, so a turn uid can neither forge nor drop it. Throws
- * when the marker cannot be written: an unprotected turn must not start,
- * because the next prune could delete its live copy (OTTR-1179).
+ * Mark one layer id in use for the stale window: the marker beside the copy
+ * (`<id>.inuse`) gains one `<token> <iso>` line per live run, and its fresh
+ * mtime keeps the copy's prune away while a started turn runs on it. The
+ * marker lives in the root-owned layers dir, so a turn uid can neither forge
+ * nor drop it. Throws when the marker cannot be written: an unprotected turn
+ * must not start, because the next prune could delete its live copy
+ * (OTTR-1179).
  */
-function markLayerInUse(layersDir: string, id: string): void {
-	writeFileSync(
+function markLayerInUse(layersDir: string, id: string, token: string): void {
+	appendFileSync(
 		join(layersDir, id + LAYER_INUSE_SUFFIX),
-		`${new Date().toISOString()}\n`,
+		`${token} ${new Date().toISOString()}\n`,
 	);
+}
+
+/** Per-run holder token for one marker line; unique across the workers. */
+export function newLayerToken(): string {
+	return randomBytes(8).toString("hex");
+}
+
+/**
+ * The run's release of its marker line (OTTR-1179): when the child closes,
+ * the line goes, and the marker file goes when no live line remains, so a
+ * copy nothing runs on loses its protection at once. The mutation runs under
+ * the same decision lock as the mark and the prune. Never throws: a failed
+ * release keeps the marker, and the copy stays protected until the marker
+ * ages out after the stale window — the same bound a dead holder's line
+ * already carries.
+ */
+export function releaseLayerCopyUse(
+	layersDir: string,
+	id: string,
+	token: string,
+): void {
+	const marker = join(layersDir, id + LAYER_INUSE_SUFFIX);
+	let lock: HeldLock | null = null;
+	try {
+		lock = holdLock(
+			join(realpathSync(layersDir), LAYERS_LOCK_NAME),
+			LAYERS_LOCK_WAIT_MS,
+		);
+		const st = statOf(marker);
+		if (st === null || !st.isFile()) return;
+		const lines = readFileSync(marker, "utf8")
+			.split("\n")
+			.filter((line) => line !== "");
+		const rest = lines.filter((line) => !line.startsWith(`${token} `));
+		if (rest.length === lines.length) return; // A legacy marker names no holder: it ages out.
+		if (rest.length === 0) rmSync(marker, { force: true });
+		else writeFileSync(marker, `${rest.join("\n")}\n`);
+	} catch {
+		// The marker stays and keeps protecting the copy until it ages out.
+	} finally {
+		lock?.release();
+	}
 }
 
 /**
@@ -242,8 +287,10 @@ function markLayerInUse(layersDir: string, id: string): void {
  * interleave with a deletion decision on the other (OTTR-1179; both workers
  * share this volume). A marker that cannot be written, or a lock that stays
  * busy, fails the start closed before anything is deleted — the same rule as
- * a lease acquisition failure. The layer cp runs outside the section; its
- * rename race stays safe on its own.
+ * a lease acquisition failure. The layer cp runs outside the
+ * section; its rename race stays safe on its own. The caller passes the run's
+ * holder token and releases it with `releaseLayerCopyUse` when the child
+ * closes, so a finished run stops protecting its copy.
  */
 export function ensureLayerCopy(
 	layerDir: string,
@@ -251,6 +298,7 @@ export function ensureLayerCopy(
 	workerHome: string,
 	ids: TurnIdentity,
 	lockWaitMs: number = LAYERS_LOCK_WAIT_MS,
+	token: string = newLayerToken(),
 ): string {
 	const id = basename(layerDir);
 	const final = join(turnHome.layers, id);
@@ -259,7 +307,7 @@ export function ensureLayerCopy(
 		lockWaitMs,
 	);
 	try {
-		markLayerInUse(turnHome.layers, id);
+		markLayerInUse(turnHome.layers, id, token);
 		pruneLayerCopies(layerDir, turnHome);
 		if (existsSync(final)) return final;
 	} finally {
@@ -290,15 +338,15 @@ export function ensureLayerCopy(
 }
 
 /**
- * Stale layer copies: temp dirs older than a day, and final copies whose
- * source layer alate deleted — unless a fresh in-use marker says a started
- * turn still runs on the copy (OTTR-1179); the current pin is never pruned.
- * Markers whose copy is long gone age out the same way. Runs inside the
- * caller's decision lock, so every read-decide-delete below is atomic across
- * the workers and re-reads the current marker state. Best effort.
+ * Layer copy retention: temp dirs older than a day go, and a final copy goes
+ * at once unless it is the current pin or its in-use marker is fresh (a
+ * started turn still runs on it; OTTR-1179) — independent of the copy's age
+ * and of whether alate still holds the source layer. Markers whose holders
+ * are gone age out the same way. Runs inside the caller's decision lock, so
+ * every read-decide-delete below is atomic across the workers and re-reads
+ * the current marker state. Best effort.
  */
 function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
-	const sharedLayers = dirname(layerDir);
 	const staleCutoff = Date.now() - LAYER_STALE_MS;
 	let entries: Dirent[];
 	try {
@@ -333,7 +381,6 @@ function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
 			continue;
 		}
 		if (entry.name === basename(layerDir)) continue;
-		if (existsSync(join(sharedLayers, entry.name))) continue;
 		const markerPath = join(turnHome.layers, entry.name + LAYER_INUSE_SUFFIX);
 		const marker = statOf(markerPath);
 		if (marker !== null && marker.mtimeMs >= staleCutoff) continue;
@@ -341,7 +388,7 @@ function pruneLayerCopies(layerDir: string, turnHome: TurnHome): void {
 			rmSync(path, { recursive: true, force: true });
 			if (marker !== null) rmSync(markerPath, { force: true });
 		} catch {
-			// Best effort; disk pressure stays bounded by alate's own clean-up.
+			// Best effort; the next copy for the project retries.
 		}
 	}
 }
@@ -638,12 +685,21 @@ export function applyTurnHomeEnv(
 		ids: TurnIdentity;
 		copyLayer?: (layerDir: string) => string;
 		resolveLayer?: (home: unknown) => string | null;
+		/** The run's holder token for the copy's marker line (OTTR-1179). */
+		copyToken?: string;
 	},
 ): { pinned: boolean; home: string } {
 	const copyLayer =
 		ctx.copyLayer ??
 		((layerDir) =>
-			ensureLayerCopy(layerDir, ctx.turnHome, ctx.workerHome, ctx.ids));
+			ensureLayerCopy(
+				layerDir,
+				ctx.turnHome,
+				ctx.workerHome,
+				ctx.ids,
+				undefined,
+				ctx.copyToken,
+			));
 	const resolveLayer =
 		ctx.resolveLayer ??
 		((home: unknown) => resolvePinnedLayer(ctx.workerHome, home));
@@ -815,7 +871,6 @@ function closeRootProjectDirs(root: string): string[] {
 // ---------------------------------------------------------------------------
 
 import { dlopen, FFIType, ptr, suffix } from "bun:ffi";
-import { appendFileSync } from "node:fs";
 
 /** Where the passwd and group snapshots live; tests point these at temp files. */
 export interface ProvisionPaths {

@@ -2866,7 +2866,39 @@ describe("serveWorker turn identity", () => {
 				return readLines(res);
 			};
 
-			const linesA = await run("proj-a", cwdA);
+			// OTTR-1210: the run's marker line. A foreign holder line (a live
+			// turn on the other worker) pre-exists; the run appends its own
+			// line at start and releases exactly it at child close.
+			const markerA = join(homesRoot, "proj-a", "layers", "l1.inuse");
+			const foreignLine = "cafe0102 2026-11-22T00:00:00.000Z\n";
+			writeFileSync(markerA, foreignLine);
+			const resA = await post(url, {
+				id: "ti-proj-a",
+				argv: ["-p"],
+				cwd: cwdA,
+				stdin: "",
+				env: {
+					OTTR_PROJECT: "proj-a",
+					HOME: layerDir,
+					PI_CODING_AGENT_DIR: join(layerDir, ".omp", "agent"),
+					DUMMY_SECRET: "s3cret-proj-a",
+				},
+			});
+			expect(resA.status).toBe(200);
+			// Mid-run: the marker holds the foreign line plus the run's own.
+			// No promise signals the daemon's marker write, so this polls the
+			// file (the file's poll helpers above use the same real-time loop).
+			const deadline = Date.now() + 5_000;
+			let mid = "";
+			while (Date.now() < deadline) {
+				mid = readFileSync(markerA, "utf8");
+				if (mid.startsWith(foreignLine) && mid.length > foreignLine.length)
+					break;
+				await Bun.sleep(20);
+			}
+			expect(mid.startsWith(foreignLine)).toBe(true);
+			expect(mid.length).toBeGreaterThan(foreignLine.length);
+			const linesA = await readLines(resA);
 			const dumpedA = JSON.parse(linesA[0]!) as {
 				uid: number;
 				HOME: string;
@@ -2895,6 +2927,9 @@ describe("serveWorker turn identity", () => {
 				[WORKER_DONE]: { exitCode: number };
 			};
 			expect(sentinelA[WORKER_DONE].exitCode).toBe(0);
+			// At close the run's own line is gone and the foreign holder line
+			// stays byte-exact: the release never touches another run's line.
+			expect(readFileSync(markerA, "utf8")).toBe(foreignLine);
 
 			// A second project lands on a different uid and its own home.
 			const linesB = await run("proj-b", cwdB);

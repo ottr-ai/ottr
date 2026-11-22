@@ -35,10 +35,12 @@ import {
 	applyTurnHomeEnv,
 	closeProjectDir,
 	ensureProjectIdentity,
+	newLayerToken,
 	type ProvisionPaths,
 	prepareRunWorkspace,
 	prepareTurnHome,
 	projectTurnUid,
+	releaseLayerCopyUse,
 	type TurnHome,
 	type TurnIdentity,
 	uidCollisionNote,
@@ -485,6 +487,10 @@ export function serveWorker(opts: {
 		// fall-back to a root turn.
 		let ids: TurnIdentity | null = null;
 		let runNotes = notes;
+		// The run's release of its layer-copy marker line (OTTR-1179); it rides
+		// the same closure as the layer lease, so a finished run stops
+		// protecting its copy and the next prune for the project reclaims it.
+		let releaseCopyUse: (() => void) | null = null;
 		if (turnUid) {
 			const project = body.project ?? body.env?.OTTR_PROJECT;
 			if (typeof project === "string" && project !== "") {
@@ -493,11 +499,20 @@ export function serveWorker(opts: {
 					const collision = uidCollisionNote(project, ids);
 					if (collision !== null) runNotes += `${collision}\n`;
 					const turnHome = prepareTurnHome(turnUid.homesRoot, project, ids);
-					applyTurnHomeEnv(env, {
+					const copyToken = newLayerToken();
+					const home = applyTurnHomeEnv(env, {
 						workerHome: turnUid.workerHome,
 						turnHome,
 						ids,
+						copyToken,
 					});
+					if (home.pinned)
+						releaseCopyUse = () =>
+							releaseLayerCopyUse(
+								turnHome.layers,
+								basename(home.home),
+								copyToken,
+							);
 					ensureProjectIdentity(project, ids, turnHome, turnUid.provisionPaths);
 					applyTurnGitEnv(env, project, turnHome);
 					for (const root of turnUid.dataRoots)
@@ -520,7 +535,14 @@ export function serveWorker(opts: {
 		// release stays in this closure, off the entry that /detached serializes.
 		let release: () => void;
 		try {
-			release = workerLayerLease(workerHome, env.HOME);
+			const lease = workerLayerLease(workerHome, env.HOME);
+			release =
+				releaseCopyUse === null
+					? lease
+					: () => {
+							lease();
+							releaseCopyUse();
+						};
 		} catch (err) {
 			return new Response(`layer lease failed: ${String(err)}`, {
 				status: 500,

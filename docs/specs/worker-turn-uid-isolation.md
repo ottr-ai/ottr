@@ -127,18 +127,23 @@ Instead the daemon materializes a per-project copy:
   is treated as unpinned (planted-pointer refuse, as `pinTarget` does).
 - Every start marks its pinned id in use (`<id>.inuse` beside the copy, in
   the root-owned layers dir; the marker's mtime is the signal both workers
-  read on the shared volume). The mark, the prune's read-decide-delete, and
-  the reuse check run under the same shared layers lock the lease ledger
+  read on the shared volume). The marker gains one `<token> <iso>` line per
+  live run, and the run releases its own line when its child closes: the
+  line goes under the same lock, and the marker file goes when no live line
+  remains. The mark, the release, the prune's read-decide-delete, and the
+  reuse check run under the same shared layers lock the lease ledger
   uses (`in-use.lock`, SQLite POSIX locks, dropped on holder death), so a
   refresh on one worker can never interleave with a deletion on the other.
   The mark is fail closed: a start whose marker cannot be written fails
   before the spawn, and that start deletes nothing. A start that cannot
-  take the lock within its budget fails the same way. Copies whose source
-  layer alate deleted, and temp dirs older than a day, are pruned on the
-  next copy for that project; the currently pinned id is never pruned, and
-  a copy whose marker is fresh (a started turn still runs on it) is never
-  pruned either. The marker and a ghost marker without its copy age out
-  after the same day, so retention stays bounded (OTTR-1179).
+  take the lock within its budget fails the same way; a release that
+  cannot never throws and keeps the copy protected. Copies other than the
+  current pin and copies whose marker is fresh are pruned at once on the
+  next copy for that project — independent of the copy's age and of
+  whether alate still holds the source layer. Temp dirs, and markers whose
+  holders are all gone (a dead holder's line stays fresh only until its
+  last write ages past the window), age out after a day, so retention
+  stays bounded (OTTR-1179).
 
 ### Project on the request
 
