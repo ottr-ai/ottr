@@ -4,7 +4,7 @@
 // real-script spawn with no arguments proves the live path through
 // `git ls-files` (AGENTS.md work-turn rule 1).
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { markerLines } from "./check-markers.ts";
@@ -47,6 +47,12 @@ function run(args: string[]): {
 		stderr: r.stderr.toString(),
 	};
 }
+
+/** The tracked tree exists only where a repo does: a Stryker sandbox copy has
+ * no .git, so `git ls-files` cannot enumerate there (OTTR-1191 dry run). The
+ * live tracked-tree proof stays with the normal runs — plain `bun test` and
+ * `bun run check`, which runs the script against the real repo. */
+const trackedTree = test.skipIf(!existsSync(join(ROOT, ".git")));
 
 describe("check-markers (live spawns)", () => {
 	test("fails on a temp file holding the edit-tool marker line", () => {
@@ -92,7 +98,7 @@ describe("check-markers (live spawns)", () => {
 		expect(r.code).toBe(0);
 	});
 
-	test("passes on the tracked tree after the README fix", () => {
+	trackedTree("passes on the tracked tree after the README fix", () => {
 		const r = run([]);
 		expect(r.code).toBe(0);
 		expect(r.stdout).toContain("markers: ok");

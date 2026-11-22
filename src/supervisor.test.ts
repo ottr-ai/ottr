@@ -2884,7 +2884,9 @@ describe("Dependabot pass", () => {
 		expect(await store.listTasks()).toHaveLength(1);
 		expect(ops.calls.scheduled).toBe(1);
 		await store.close();
-	});
+		// The poll retry capped at bun's 5000 ms default on a loaded run, measured
+		// 10.4 s there (OTTR-1191); 30 s leaves about 3x headroom.
+	}, 30_000);
 
 	test("polls once per hour: within the hour no gh call, at exactly 1 h polls again", async () => {
 		const { store, e } = await depProject("dep-window");

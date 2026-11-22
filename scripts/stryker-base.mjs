@@ -72,16 +72,27 @@ export function makeBaseConfig(cap) {
 		appendPlugins: ["@hughescr/stryker-bun-runner"],
 		testRunner: "bun",
 		bun: {
-			// Bounds the dry run's single `bun test` process (the full sequential suite; the whole suite
-			// measured 8 m 16 s under this runner at 053838a). Mutant runs get Stryker's per-mutant
-			// budget instead: timeoutMS + timeoutFactor x the dry-run time of their covering tests.
-			timeout: 1_200_000,
+			// Bounds the dry run's single `bun test` process (the full sequential suite; measured
+			// 8 m 16 s quiet at 053838a and 17 m 0 s on the loaded worker at d6f0a9dd+ (OTTR-1191,
+			// 2026-11-22) — the runner warns once a dry run passes 80% of this budget). Mutant runs
+			// get Stryker's per-mutant budget instead: timeoutMS + timeoutFactor x the dry-run time
+			// of their covering tests.
+			timeout: 3_600_000,
 			// Replaces the command runner's `ulimit -d 2097152`: the runaway mutants in the stdout
 			// line-split loop of src/workers.ts must not OOM the host and falsely kill neighbor
-			// mutants. A bun test child over the 2 GB ceiling is killed and scored Timeout
+			// A bun test child over the 2 GB ceiling is killed and scored Timeout
 			// (detected), like the ulimit OOM abort was Killed before. ulimit is POSIX-only, so
 			// mutation runs needed Linux; the RSS ceiling works everywhere the runner does.
 			maxChildRss: 2_147_483_648,
+			// bun 1.4.5 ignores bunfig [test].timeout (probe: a 6 s test still dies at 5.01 s
+			// with timeout = 20000 present, from cwd and via --config), so the dry run's
+			// per-test default was bun's built-in 5000 ms and the instrumented slow tests
+			// aborted every dry run (OTTR-1191, 4 attempts at d6f0a9dd). This flag sets the
+			// real per-test default for every run: 60 s is ~15x the observed instrumented cost
+			// of the slowest single call ("api slow: GET /api/state took 3888 ms") and still
+			// bounds a hung test. Mutant verdicts are unaffected: Stryker's own budget
+			// (timeoutMS + timeoutFactor) kills the run before this matters.
+			bunArgs: ["--timeout=60000"],
 		},
 		coverageAnalysis: "perTest",
 		// Mutant runs bail at the first failing test (Stryker's default), so a killed mutant pays
@@ -122,7 +133,10 @@ export function makeBaseConfig(cap) {
 		timeoutFactor: 2,
 		// The dry run (full sequential suite, then each test file alone) took 260 s standalone on a quiet
 		// host at 16b3326; the cold sandbox crossed Stryker's 5-minute default (2026-10-30 v0.2.0 review).
-		dryRunTimeoutMinutes: 20,
+		// On the loaded worker its full pass alone took 17 m before the per-file stage even started
+		// (OTTR-1191, 2026-11-22), so 45 min covers that pass, the per-file stage, and the observed
+		// ~3x machine variance.
+		dryRunTimeoutMinutes: 45,
 		// Sandbox outside any repo: a mutant that drops git()'s cwd must fail there, not run git in this
 		// repo. Per checkout and wiped at run start (OTTR-500, see the header above).
 		tempDirName,

@@ -288,8 +288,14 @@ test("a caught rollback failure blocks later work in the same admitted scope", a
 	expect(laterCalls).toBe(0);
 });
 
-const real = config ? describe : describe.skip;
-real("PostgreSQL reserved driver and lifecycle", () => {
+// Register nothing without a fixture config: bun 1.4.5's inspector drops a
+// variable slice of a burst of skip events (OTTR-1191 probe: three identical
+// runs delivered 20, 26 and 30 of 32 skips, while streamed per-test results
+// never dropped), and the mutation dry run's completeness gate rightly refuses
+// summary and inspector counts that disagree. readPostgresTestConfig already
+// notices why; with a config every test below registers and runs as before.
+describe("PostgreSQL reserved driver and lifecycle", () => {
+	if (!config) return;
 	let fixture: PostgresFixture;
 	beforeAll(async () => {
 		if (!config) throw new Error("PostgreSQL fixture configuration is absent.");

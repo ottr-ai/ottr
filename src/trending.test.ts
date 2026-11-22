@@ -69,7 +69,6 @@ afterEach(async () => {
 	for (const [i, store] of stores.splice(0).entries())
 		await closeNamed(store, i);
 }, 20_000);
-
 afterAll(async () => {
 	// afterEach closed every store inside its test's own hook budget; only a
 	// test that timed out can leave one behind, so close the rest here. Every

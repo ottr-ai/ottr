@@ -16423,6 +16423,47 @@ describe("web push (R1-1, R2-3)", () => {
 		classes: ALL_CLASSES_ON,
 	};
 
+	/** An own board for a push-count test. The shared app publishes whenever any earlier
+	 * test armed the gate (fixture /api/state reads arm it), and every subscriber of the
+	 * shared store lands in the one pushSends array — so a shared-store count drifts with
+	 * late async sends (docs/specs/notification-test-isolation.md). A private endpoint
+	 * isolates the count: nothing else subscribes it, and the board's own publishes are
+	 * all awaited, so its 1 s tick always finds the gate closed. The test closes the
+	 * board, which stops its tick before the next test shares the sender array. */
+	const pushBoard = async (name: string, endpoint: string) => {
+		const g = await GlobalStore.open(join(root, name));
+		mountStores.push(g);
+		const dir = join(root, `${name}-project`);
+		mkdirSync(dir, { recursive: true });
+		const s = await ProjectStore.open(dir);
+		const boardProjects = new Map<string, Entry>([
+			[
+				name,
+				{
+					path: dir,
+					name,
+					store: s,
+					target: null,
+					gitless: false,
+					github: null,
+					protectedTarget: false,
+					remote: null,
+					dirty: false,
+					mainUnpushed: false,
+					mainBranch: null,
+					latestRelease: null,
+					latestImage: null,
+					archReview: null,
+				},
+			],
+		]);
+		const m = await mount({ gstore: g, projects: boardProjects });
+		await saveSubs(g, [{ ...pushSub, endpoint }]);
+		return { app: m.app, store: s };
+	};
+	const sentTo = (endpoint: string) =>
+		pushSends.filter((send) => send.endpoint === endpoint).length;
+
 	test("publishState rebuilds only after a publishSoon bumped the version (OTTR-866)", async () => {
 		const g = await GlobalStore.open(join(root, "g-gate"));
 		const m = await mount({ gstore: g });
@@ -16562,47 +16603,59 @@ describe("web push (R1-1, R2-3)", () => {
 	});
 
 	test("a needs-you transition pushes with zero open sockets", async () => {
-		await saveSubs(gstore, [pushSub]);
+		const endpoint = "https://push.example/needs-you";
+		const { app: boardApp, store: board } = await pushBoard(
+			"g-needs-you",
+			endpoint,
+		);
 
-		const t = await store.createTask("push me");
-		await publishNow(app); // baseline: prev = null is silent
+		const t = await board.createTask("push me");
+		await publishNow(boardApp); // baseline: prev = null is silent
 
-		const sends = pushSends.length;
-		await store.updateTask(t.id, { state: "needs_you", needsReason: "?" });
+		const sends = sentTo(endpoint);
+		await board.updateTask(t.id, { state: "needs_you", needsReason: "?" });
 		// Old code returned before the diff when sockets === 0, so with the board closed —
 		// and always, in NODE_ENV=production — no push ever fired.
 
-		expect(await publishNow(app)).toBe(true);
+		expect(await publishNow(boardApp)).toBe(true);
 
-		expect(pushSends.length).toBe(sends + 1);
-		expect(pushSends[pushSends.length - 1]!.endpoint).toBe(pushSub.endpoint);
+		expect(sentTo(endpoint)).toBe(sends + 1);
+		await closeTestApp(boardApp);
 	});
 
 	test("a retro card never pushes; a brand-new needs_you card (a proposal) pushes once", async () => {
-		await saveSubs(gstore, [pushSub]);
-		const retro = await store.createTask(
+		const endpoint = "https://push.example/retro-proposal";
+		const { app: boardApp, store: board } = await pushBoard(
+			"g-retro-proposal",
+			endpoint,
+		);
+		const retro = await board.createTask(
 			`${RETRO_MARKER}retro of quiet card`,
 			null,
 			"retro",
 		);
 
-		await publishNow(app); // baseline
-		const sends = pushSends.length;
-		await store.updateTask(retro.id, { state: "needs_you", needsReason: "?" });
-		expect(await publishNow(app)).toBe(true);
+		await publishNow(boardApp); // baseline
+		const sends = sentTo(endpoint);
+		await board.updateTask(retro.id, {
+			state: "needs_you",
+			needsReason: "?",
+		});
+		expect(await publishNow(boardApp)).toBe(true);
 
 		// Retro housekeeping is silent even on a real needs_you transition.
-		expect(pushSends.length).toBe(sends);
+		expect(sentTo(endpoint)).toBe(sends);
 		// A card absent from the previous frame alerts only in needs_you: retro proposals.
-		const proposal = await store.createTask("a held proposal");
-		await store.updateTask(proposal.id, {
+		const proposal = await board.createTask("a held proposal");
+		await board.updateTask(proposal.id, {
 			state: "needs_you",
 			needsReason: "Proposed",
 		});
 
-		await publishNow(app);
+		await publishNow(boardApp);
 
-		expect(pushSends.length).toBe(sends + 1);
+		expect(sentTo(endpoint)).toBe(sends + 1);
+		await closeTestApp(boardApp);
 	});
 
 	test("/api/push/test answers 502 when a send fails", async () => {
@@ -22288,9 +22341,11 @@ describe(
 			const reply = (id: string, body: Record<string, unknown>) =>
 				rm.call(`/api/projects/pg/tasks/${id}/reply`, body);
 			return () => {
+				// The close capped at bun's 5000 ms hook default on a loaded run
+				// (OTTR-1191); 30 s leaves about 6x headroom.
 				afterAll(async () => {
 					await closeTestStore(replyStore);
-				});
+				}, 30_000);
 
 				test("a pr_review reply runs a new draft for the current head with the note", async () => {
 					const t = await replyReviewed(30, H1);
@@ -22831,9 +22886,10 @@ describe(
 			};
 		})();
 		return () => {
+			// Same loaded-run cap as the reply store's close above.
 			afterAll(async () => {
 				await closeTestStore(prStore);
-			});
+			}, 30_000);
 			beforeEach(() => {
 				ghCalls.length = 0;
 				ghPayloads.length = 0;
