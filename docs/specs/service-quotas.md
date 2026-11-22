@@ -1,7 +1,7 @@
 # External service quotas
 
 Status: shared contracts, bounded transport, independent cache, server state integration, and overview display are implemented.
-Step 3 implements the PixelLab v2 adapter and built-in registry.
+Step 3 implements the PixelLab v2 adapter, the Z.AI coding-plan adapter, and the built-in registry.
 Approved live activation remains pending.
 
 This specification implements recommended step 1 from the OTTR-1092 research report carried by OTTR-1101.
@@ -15,6 +15,7 @@ Keep the existing `quota` field for omp model providers.
 Show external quotas only in the existing overview, without effects on task execution.
 Support both time windows and balances.
 Use PixelLab v2 as the first adapter.
+The Z.AI coding-plan adapter follows it.
 
 The configuration is an internal, server-supplied `ServiceQuotaSourceConfig` list.
 This specification adds no operator JSON environment setting, configuration file format, public configuration endpoint, or persisted configuration shape.
@@ -447,6 +448,124 @@ Generation endpoint errors and job-poll intervals do not establish this balance 
 The sources establish no balance-specific rate limit, cache headers, refresh interval, period dates, rollover rules, reserved credits, or used-percentage semantics.
 These gaps permit raw balance display, but not reset countdowns, credit-to-task estimates, or automatic execution decisions.
 
+## Z.AI coding plan reader
+
+The endpoints are not in Z.ai's public API reference.
+They are the JSON endpoints that the GLM coding-plan usage page calls.
+Public client implementations document them, and the operator's capture of 2026-11-22 verifies them. [P3][zai-endpoints]
+
+### Request
+
+The source makes two sequential bounded GETs.
+Each request carries the headers below and has no body.
+
+```http
+GET https://api.z.ai/api/monitor/usage/quota/limit
+Authorization: Bearer <resolved server secret>
+Accept: application/json
+```
+
+```http
+GET https://api.z.ai/api/biz/customer-package-reset/list?targetType=PERSONAL
+Authorization: Bearer <resolved server secret>
+Accept: application/json
+```
+
+A failure on the first endpoint stops before the second request.
+Either failure rejects the whole source snapshot.
+
+### Fixture and exact mapping
+
+This fixture uses the operator capture of 2026-11-22.
+The capture is one account snapshot, not a schema document. [P3][zai-endpoints]
+
+```json
+{
+  "code": 200,
+  "msg": "Operation successful",
+  "success": true,
+  "data": {
+    "level": "PRO",
+    "limits": [
+      {
+        "type": "TOKENS_LIMIT",
+        "unit": 3,
+        "percentage": 100,
+        "nextResetTime": 1774831200000
+      },
+      {
+        "type": "TOKENS_LIMIT",
+        "unit": 6,
+        "percentage": 8,
+        "nextResetTime": 1774839240000
+      },
+      {
+        "type": "TIME_LIMIT",
+        "unit": 5,
+        "percentage": 45,
+        "currentValue": 1828,
+        "usage": 4000,
+        "usageDetails": []
+      }
+    ]
+  }
+}
+```
+
+```json
+{
+  "code": 200,
+  "success": true,
+  "data": {
+    "customerId": 41002358991004410,
+    "targetType": "PERSONAL",
+    "organizationId": null,
+    "projectId": null,
+    "lastFiveHourResetTime": "2026-11-22 10:00:00",
+    "lastWeekResetTime": "2026-11-19 17:54:00",
+    "fiveHourResets": [],
+    "weekResets": [
+      {
+        "recordId": 920001,
+        "expireTime": "2026-12-07 23:59:59",
+        "available": true
+      }
+    ]
+  }
+}
+```
+
+| Input | Normalized output | Constraint |
+| --- | --- | --- |
+| `data.limits` first `TOKENS_LIMIT` with `unit 3` | Five-hour reset source | Other entries, including `TIME_LIMIT`, are ignored. |
+| `data.limits` `TOKENS_LIMIT` with `unit 6` | Weekly reset source | One entry per unit. |
+| `nextResetTime` | `resetsAt` in epoch milliseconds | Required finite safe integer when present. Absent falls back to the reset list. |
+| Absent `nextResetTime` | `lastFiveHourResetTime + 5 hours`, `lastWeekResetTime + 7 days` | The stamps are UTC+8 wall clock, parsed with a fixed +08:00 offset. |
+| Both reset sources absent | `resetsAt: null` | Never publish an invented date. |
+| `weekResets` entries with `available: true` | Unused weekly reset grant count | Entries with `available: false` do not count. |
+| Empty `fiveHourResets` | Grant count `0` | This remains a valid snapshot. |
+| `expireTime` on each grant entry | Validation only | Required UTC+8 stamp. A malformed stamp rejects the whole response. |
+| `data.targetType` | Validation only | Must be `PERSONAL`. Any other value rejects the whole response. |
+| `success: false` under HTTP 200 | Business error | Reject the response as `invalid_response`. |
+| `percentage`, `usage`, `usageDetails`, `recordId`, `customerId`, `msg`, `level` | Ignored | Extract known fields only. |
+| Both sources valid | Balance rows `five-hour-window` and `weekly-window` | Labels `5-hour window` and `Weekly window`, unit `{ kind: "count", name: "unused reset grants" }`, `remaining` = grant count, `resetsAt` per the rules above, other balance fields `null`. |
+
+### Response and error handling
+
+The endpoints have no published error schema.
+The failure classes below are Ottr policy, not documented Z.AI guarantees. [P3][zai-faq]
+
+| Input or failure | Result |
+| --- | --- |
+| Valid envelopes | Publish the two balance rows. |
+| Missing or wrong-typed required field, or malformed stamp | Return `invalid_response` for the whole source. |
+| `401` or `403` | Show `authentication` and pause automatic reads until rebind or restart. |
+| `429` | Show `rate_limit` and honor a valid `Retry-After`. |
+| Other HTTP errors | Record the HTTP status as `http`. |
+| Network failure or timeout | Apply the transport policy. |
+| First-endpoint failure | Never issue the second request. |
+| Any failure | Never replace grant counts with invented values. |
+
 ## Security boundary
 
 - Keep credentials outside source code and documentation.
@@ -521,6 +640,14 @@ An approved server secret source remains a prerequisite for live activation, not
     Keyboard access, text alternatives, and existing model sign-in controls remain intact.
 13. Redirect and logging checks prove that no credential reaches another origin, board state, a worker, or captured logs.
     A missing secret produces zero outbound requests.
+14. A real Z.AI reader issues exactly the two GETs in the request section through an instrumented transport.
+    Verify bearer authentication and no request body.
+    The capture-shaped fixture yields the 5-hour reset time, the weekly reset time, and one unused weekly reset grant.
+    The empty `fiveHourResets` case stays a valid snapshot.
+15. A failing first endpoint stops before the second request.
+    Either endpoint's failure rejects the whole source.
+    A `TEAM` target type or a malformed stamp rejects as `invalid_response`.
+    No invented reset date appears when both reset sources are absent.
 
 Transport checks require an isolated local listener and the exact production-URL assertion.
 Exercise the real HTTP reader, not only a mocked adapter result.
@@ -630,13 +757,25 @@ Their labels are `USD credits` and `Subscription generations`.
 Their units are `{ kind: "currency", code: "USD" }` and `{ kind: "count", name: "generations" }`.
 
 `src/serviceQuotaRegistry.ts` exports `builtInServiceQuotaAdapters: ReadonlyMap<string, ServiceQuotaAdapterDefinition>`.
-It contains the real PixelLab adapter under `pixellab-v2`.
+It contains the real PixelLab adapter under `pixellab-v2` and the Z.AI coding-plan adapter under `zai-coding-plan`.
 This separate server-only module avoids a circular dependency between the transport and coordinator.
 Registry creation starts no requests and activates no sources.
 Server credential resolution remains external to the adapter and registry.
 Step 3 adds no runtime state or UI integration, credential source, live activation, or authenticated provider call.
 The README remains unchanged because no feature becomes active.
 The step 5 acceptance checks and both live-read approvals below remain prerequisites.
+
+### Z.AI coding-plan exports
+
+`src/serviceQuotaZai.ts` exports `createZaiQuotaAdapter(options?: Pick<ServiceQuotaHttpReaderOptions, "fetch" | "now">): ServiceQuotaAdapterDefinition`.
+The adapter ID is `zai-coding-plan`.
+Each `createReader({ credential })` call creates two `createServiceQuotaHttpReader` instances with that credential and exactly the two fixed URLs in the request section above.
+The adapter accepts no endpoint option.
+The optional dependencies support tests only. Production callers omit them.
+The decoders remain private and extract only the fields in the exact mapping above.
+
+The adapter adds no live activation.
+The production source list stays empty and the README remains unchanged.
 
 Step 5 executes all acceptance checks before any live balance read.
 A live read also requires approval for the server secret source and the authenticated read itself.
@@ -718,9 +857,14 @@ The earlier research-only implementation and commit restriction does not prohibi
 - [PixelLab v1 OpenAPI][pixellab-v1], P3. Balance operation and `CreditsResponse`, for the explicit no-fallback boundary.
 - [PixelLab v2 documentation][pixellab-docs], P4. Official interactive API reference.
 - The OTTR-1092 research report in the OTTR-1101 handoff supplies the approved scope and policy requirements.
+- [Community-documented Z.AI coding-plan endpoints][zai-endpoints], P3. The subscription UI endpoints as documented by public usage clients.
+- [Z.AI devpack FAQ on quota reset cards][zai-faq], P3. Quota reset card behavior.
+- The operator capture of 2026-11-22 supplies the fixture values for the Z.AI coding-plan endpoints.
 - Repository integration links above name the source files without historical line-number claims.
 
 [pixellab-page]: https://www.pixellab.ai/pixellab-api
 [pixellab-v2]: https://api.pixellab.ai/v2/openapi.json
 [pixellab-v1]: https://api.pixellab.ai/v1/openapi.json
 [pixellab-docs]: https://api.pixellab.ai/v2/docs
+[zai-endpoints]: https://github.com/slvnlrt/usage-tray-windows/blob/main/docs/providers/zai.md
+[zai-faq]: https://docs.z.ai/devpack/faq

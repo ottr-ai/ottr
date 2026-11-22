@@ -39,6 +39,7 @@ import { loadAskDrafts, saveAskDraft } from "./notify.ts";
 import { ServiceQuotas } from "./serviceQuotas.tsx";
 // Static: status.ts touches no browser global at load.
 import { bellAlarms } from "./status.ts";
+import { stamp } from "./time.ts";
 import {
 	installBrowserGlobals,
 	mount,
@@ -14577,6 +14578,57 @@ describe("service quotas in the overview", () => {
 		expect(document.body.textContent).not.toContain("Resets");
 		expect(document.body.textContent).not.toContain("Starts");
 		expect(document.querySelector(".mark")).toBeNull();
+	});
+
+	test("a z.ai coding plan source renders grant counts and reset stamps", () => {
+		const fiveHourResetsAt = 1_764_578_800_000;
+		const weeklyResetsAt = 1_765_000_000_000;
+		const document = services([
+			{
+				id: "zai",
+				adapterId: "zai-coding-plan",
+				label: "Z.AI GLM Coding Plan",
+				status: "ok",
+				lastAttemptAt: observedAt,
+				nextAttemptAt: observedAt + 60_000,
+				sample: {
+					observedAt,
+					metrics: [
+						{
+							id: "five-hour-window",
+							label: "5-hour window",
+							kind: "balance",
+							unit: { kind: "count", name: "unused reset grants" },
+							remaining: 0,
+							reportedTotal: null,
+							resetsAt: fiveHourResetsAt,
+							providerStatus: null,
+							plan: null,
+						},
+						{
+							id: "weekly-window",
+							label: "Weekly window",
+							kind: "balance",
+							unit: { kind: "count", name: "unused reset grants" },
+							remaining: 1,
+							reportedTotal: null,
+							resetsAt: weeklyResetsAt,
+							providerStatus: null,
+							plan: null,
+						},
+					],
+				},
+				error: null,
+			},
+		]);
+		const text = document.body.textContent ?? "";
+		expect(document.querySelector("h3")?.textContent).toBe(
+			"Z.AI GLM Coding Plan",
+		);
+		expect(text).toContain("0 unused reset grants remaining");
+		expect(text).toContain("1 unused reset grants remaining");
+		expect(text).toContain(`Resets ${stamp(fiveHourResetsAt)}`);
+		expect(text).toContain(`Resets ${stamp(weeklyResetsAt)}`);
 	});
 
 	test("zero windows show raw values and positive windows retain over-limit percentages", () => {
