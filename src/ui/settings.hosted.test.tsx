@@ -413,6 +413,8 @@ const boardState = (
 		updates: null,
 		alatePendingSince: null,
 		deadSignIns: [],
+		seedFailed: null,
+		alateProvisionError: null,
 		// Per-test state (a drain hold, a restart wait, advisories); the hosted flag wins.
 		...extra,
 		...(hosted ? { hosted: true } : {}),

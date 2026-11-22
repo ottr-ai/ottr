@@ -179,6 +179,8 @@ const state = {
 	updates: null,
 	alatePendingSince: null,
 	deadSignIns: [],
+	seedFailed: null,
+	alateProvisionError: null,
 } as unknown as StateResponse;
 
 // --- per-test overrides -------------------------------------------------------

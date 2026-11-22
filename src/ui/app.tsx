@@ -24,7 +24,7 @@ import { defaultGitUsername } from "../githubHost.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
 import type { DeadSignIn } from "../login.ts";
 import type { ModelOption } from "../models.ts";
-import { shortKey, taskEntryKey } from "../notifications.ts";
+import { opsEvents, shortKey, taskEntryKey } from "../notifications.ts";
 import { derivedTaskPrefix } from "../prefix.ts";
 import { parseReviewDraft } from "../prInline.ts";
 import { commitDeltas } from "../progress.ts";
@@ -16477,6 +16477,8 @@ export function appInboxMeta(
 		...(state?.inboxSeen ?? []),
 		...ackLocal,
 	]);
+	const ops = opsEvents(state);
+	const opsKeys = new Set(ops.map((event) => event.key));
 	const entries: InboxEntry[] = [
 		...(critKey === null ? [] : [{ key: critKey, level: "crit" as const }]),
 		...needTasks.map((t) => ({
@@ -16491,9 +16493,10 @@ export function appInboxMeta(
 			key: `pr:${t.id}:posted:${t.prOccurrence?.posted?.head}`,
 			level: "needs" as const,
 		})),
+		...ops.map((event) => ({ key: event.key, level: "needs" as const })),
 		...askCards.map((t) => ({ key: taskEntryKey(t), level: "asked" as const })),
 		...infoKeys
-			.filter((key) => key !== null)
+			.filter((key): key is string => key !== null && !opsKeys.has(key))
 			.map((key) => ({ key, level: "info" as const })),
 	];
 	const inbox = inboxView(entries, inboxSeen);
@@ -16506,6 +16509,9 @@ export function appInboxMeta(
 			? `${warnings.length} warning${warnings.length === 1 ? "" : "s"}`
 			: null,
 		alarmCount > 0 ? alarmLine : null,
+		ops.length > 0
+			? `${ops.length} operational fault${ops.length === 1 ? "" : "s"}`
+			: null,
 		infoCount > 0 ? `${infoCount} notice${infoCount === 1 ? "" : "s"}` : null,
 	]
 		.filter((p) => p !== null)

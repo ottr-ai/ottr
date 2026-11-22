@@ -36,8 +36,10 @@ import {
 	type App,
 	behindMain,
 	boardWarnings,
+	type CompletionDigest,
 	dependabotHeadPrefix,
 	type Entry,
+	normalizeCompletionDigest,
 	ompSessionStores,
 	parseValidateAgainBody,
 	pickEncoding,
@@ -69,7 +71,12 @@ import { acquireLayerUse } from "./layers.ts";
 import { boardOmpEnv, boardOmpHome, type SignIn, signIns } from "./login.ts";
 import { MERMAID_VERSION, mermaidSrc } from "./mermaidVersion.ts";
 import { modelRoles } from "./models.ts";
-import { ALL_CLASSES_ON, taskEntryKey } from "./notifications.ts";
+import {
+	ALL_CLASSES_ON,
+	COMPLETION_DIGEST_MS,
+	opsEvents,
+	taskEntryKey,
+} from "./notifications.ts";
 import type { OmpStats, OmpStatsAnswer, OmpUsageTotals } from "./ompStats.ts";
 import type { DashboardState, OmpStatsDashboard } from "./ompStatsDashboard.ts";
 import { mirrorFolderName } from "./ompStatsMirror.ts";
@@ -168,7 +175,7 @@ import { loadSkips } from "./updates.ts";
 import { vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
-import { PUSH_SUBJECT, saveSubs } from "./webpush.ts";
+import { loadSubs, PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import {
 	archReviewDelta,
 	git,
@@ -15056,7 +15063,10 @@ describe("web push (R1-1, R2-3)", () => {
 	/** Isolated board for the alert flow (OTTR-494): own stores and a frozen clock.
 	 * Both Date.now and the app clock advance through clock.now. Sends land in pushSends. */
 
-	const alertBoard = async (name: string) => {
+	const alertBoard = async (
+		name: string,
+		hosted?: Parameters<typeof createApp>[0]["hosted"],
+	) => {
 		// Explicit frames and flush own publishSoon, including after reboot; HTTP stays real.
 		jest.useFakeTimers();
 		setSystemTime(new Date(1_000_000_000));
@@ -15064,6 +15074,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const dir = join(root, name);
 		mkdirSync(dir, { recursive: true });
 		const s = await ProjectStore.open(dir);
+		testStores.add(s);
 		const clock = {
 			get now() {
 				return Date.now();
@@ -15096,6 +15107,7 @@ describe("web push (R1-1, R2-3)", () => {
 		const m = await mount({
 			projects,
 			now: () => clock.now,
+			hosted,
 		});
 		alertApps.push(m.app);
 		const subscribe = async (endpoint: string) =>
@@ -15116,11 +15128,13 @@ describe("web push (R1-1, R2-3)", () => {
 			await s.updateTask(id, { state: "needs_you", needsReason: "?" });
 		/** A second board process on the same global store and project: a server restart. */
 
-		const reboot = async () => {
+		const reboot = async (previous = m) => {
+			await previous.app.close();
 			const rebooted = await mount({
 				gstore: m.g,
 				projects,
 				now: () => clock.now,
+				hosted,
 			});
 			alertApps.push(rebooted.app);
 			return rebooted;
@@ -15129,9 +15143,715 @@ describe("web push (R1-1, R2-3)", () => {
 			jest.runOnlyPendingTimers();
 			await m.app.publishState();
 		};
+		const finishDigest = async (app = m.app) => {
+			clock.now += COMPLETION_DIGEST_MS;
+			await app.publishState();
+		};
 
-		return { s, m, clock, subscribe, sentSince, needsYou, reboot, flush };
+		return {
+			s,
+			m,
+			clock,
+			projects,
+			subscribe,
+			sentSince,
+			needsYou,
+			reboot,
+			flush,
+			finishDigest,
+		};
 	};
+
+	const digestOf = async (g: GlobalStore) =>
+		(
+			await g.get<{ completionDigest: CompletionDigest | null }>(
+				"notify_live_alerts",
+			)
+		)?.completionDigest ?? null;
+
+	test("Complete uses one fixed deadline and delivers on an idle tick without tabs or a rebuild", async () => {
+		const b = await alertBoard("digest-window");
+		await b.subscribe("https://push.example/window");
+		const first = await b.s.createTask("first");
+		const second = await b.s.createTask("second");
+		const third = await b.s.createTask("next window");
+		await publishNow(b.m.app);
+		const start = b.clock.now;
+		const from = pushSends.length;
+		await b.s.updateTask(first.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		expect((await digestOf(b.m.g))?.deadline).toBe(start + 600_000);
+		b.clock.now = start + 599_999;
+		await b.s.updateTask(second.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		expect((await digestOf(b.m.g))?.deadline).toBe(start + 600_000);
+		expect(b.sentSince(from)).toEqual([]);
+		const builds = b.m.app.stateBuilds();
+		expect(b.m.app.socketCount()).toBe(0);
+		b.clock.now++;
+		await b.m.app.publishState();
+		expect(b.m.app.stateBuilds()).toBe(builds);
+		expect(b.sentSince(from)).toHaveLength(1);
+		expect(b.sentSince(from)[0]!.payload).toMatchObject({
+			tag: "complete",
+			body: "2 tasks finished",
+			url: "/",
+		});
+		expect(b.sentSince(from)[0]!.payload.keys).toEqual(
+			expect.arrayContaining([`done:${first.id}`, `done:${second.id}`]),
+		);
+		expect(await digestOf(b.m.g)).toBeNull();
+		await b.m.app.publishState();
+		expect(b.sentSince(from)).toHaveLength(1);
+		b.clock.now++;
+		await b.s.updateTask(third.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		expect((await digestOf(b.m.g))?.deadline).toBe(b.clock.now + 600_000);
+	});
+
+	test("an empty acknowledged window keeps its deadline across restart", async () => {
+		const b = await alertBoard("digest-empty-window");
+		await b.subscribe("https://push.example/empty-window");
+		const first = await b.s.createTask("acknowledge first");
+		const second = await b.s.createTask("join the same window");
+		await publishNow(b.m.app);
+		const start = b.clock.now;
+		await b.s.updateTask(first.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		await b.m.call("/api/inbox/seen", { taskIds: [first.id] });
+		await publishNow(b.m.app);
+		expect(await digestOf(b.m.g)).toEqual({
+			deadline: start + 600_000,
+			entries: [],
+		});
+		const restarted = await b.reboot();
+		await restarted.app.publishState();
+		b.clock.now = start + 599_999;
+		await b.s.updateTask(second.id, { stage: "done", state: "idle" });
+		await publishNow(restarted.app);
+		expect((await digestOf(b.m.g))?.deadline).toBe(start + 600_000);
+		const from = pushSends.length;
+		b.clock.now++;
+		await restarted.app.publishState();
+		expect(b.sentSince(from)).toHaveLength(1);
+		expect(b.sentSince(from)[0]!.payload.keys).toEqual([`done:${second.id}`]);
+	});
+
+	test("a re-done card cannot deliver its earlier completion", async () => {
+		const b = await alertBoard("digest-superseded-done");
+		await b.subscribe("https://push.example/superseded-done");
+		const task = await b.s.createTask("finish twice");
+		await publishNow(b.m.app);
+		await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		await b.s.updateTask(task.id, { stage: "in_progress" });
+		b.clock.now++;
+		await b.s.updateTask(task.id, { stage: "done" });
+		const from = pushSends.length;
+		await b.finishDigest();
+		expect(b.sentSince(from)).toEqual([]);
+	});
+
+	test.each([599_999, 600_001])(
+		"a restart at %i ms preserves the deadline and never replays the sent digest",
+		async (elapsed) => {
+			const b = await alertBoard(`digest-restart-${elapsed}`);
+			await b.subscribe(`https://push.example/restart-${elapsed}`);
+			const task = await b.s.createTask("persist completion");
+			await publishNow(b.m.app);
+			const start = b.clock.now;
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			const saved = await digestOf(b.m.g);
+			const from = pushSends.length;
+			b.clock.now = start + elapsed;
+			const restarted = await b.reboot();
+			expect(await digestOf(b.m.g)).toEqual(saved);
+			await restarted.app.publishState();
+			if (elapsed < 600_000) {
+				expect(b.sentSince(from)).toEqual([]);
+				b.clock.now = start + 600_000;
+				await restarted.app.publishState();
+			}
+			expect(b.sentSince(from)).toHaveLength(1);
+			expect(await digestOf(b.m.g)).toBeNull();
+			const again = await b.reboot(restarted);
+			await again.app.publishState();
+			expect(b.sentSince(from)).toHaveLength(1);
+		},
+	);
+
+	test.each([
+		"cancel",
+		"reopen",
+		"ack",
+		"read",
+		"mute",
+		"unsubscribe",
+		"class-off",
+		"remove-project",
+	] as const)(
+		"the digest rechecks %s at delivery through real stores",
+		async (action) => {
+			const b = await alertBoard(`digest-filter-${action}`);
+			const endpoint = `https://push.example/filter-${action}`;
+			await b.subscribe(endpoint);
+			const task = await b.s.createTask("eligible until deadline");
+			await publishNow(b.m.app);
+			b.clock.now++;
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			const from = pushSends.length;
+			switch (action) {
+				case "cancel":
+					await b.s.updateTask(task.id, { cancelledAt: b.clock.now });
+					break;
+				case "reopen":
+					await b.s.updateTask(task.id, {
+						stage: "in_progress",
+						state: "queued",
+					});
+					break;
+				case "ack":
+					await b.m.call("/api/inbox/seen", { taskIds: [task.id] });
+					break;
+				case "read": {
+					const done = (await b.s.getTask(task.id))!;
+					expect(
+						(
+							await b.m.call("/api/seen", {
+								ids: [doneReadKey({ id: task.id, doneAt: done.doneAt! })],
+							})
+						).status,
+					).toBe(200);
+					break;
+				}
+				case "mute":
+					await b.m.call("/api/notifications/prefs", {
+						mutedProjects: [b.s.name],
+					});
+					break;
+				case "unsubscribe":
+					await b.m.call("/api/push/unsubscribe", { endpoint });
+					break;
+				case "class-off":
+					await b.m.call("/api/notifications/prefs", {
+						endpoint,
+						classes: { ...ALL_CLASSES_ON, complete: false },
+					});
+					break;
+				case "remove-project":
+					b.projects.delete(b.s.name);
+					break;
+			}
+			await b.finishDigest();
+			expect(b.sentSince(from)).toEqual([]);
+			expect(await digestOf(b.m.g)).toBeNull();
+		},
+	);
+
+	test("future and replaced subscriptions cannot inherit a pending completion", async () => {
+		const b = await alertBoard("digest-recipients");
+		const replaced = "https://push.example/replaced";
+		const returned = "https://push.example/returned";
+		const retained = "https://push.example/retained";
+		await b.subscribe(replaced);
+		await b.subscribe(returned);
+		await b.subscribe(retained);
+		const task = await b.s.createTask("old event");
+		await publishNow(b.m.app);
+		await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		const from = pushSends.length;
+		await b.subscribe(replaced); // Same keys and millisecond, but a replacement identity.
+		await b.m.call("/api/push/unsubscribe", { endpoint: returned });
+		await b.subscribe(returned);
+		await b.subscribe("https://push.example/future");
+		await b.finishDigest();
+		expect(b.sentSince(from).map((send) => send.endpoint)).toEqual([retained]);
+	});
+
+	test.each(["occurrence", "deadline"] as const)(
+		"focus at %s suppresses Complete without later replay",
+		async (phase) => {
+			const b = await alertBoard(`digest-focus-${phase}`);
+			await b.subscribe("https://push.example/focus");
+			const task = await b.s.createTask("quiet completion");
+			await publishNow(b.m.app);
+			const from = pushSends.length;
+			if (phase === "occurrence")
+				await b.m.call("/api/presence", { tab: "focused", focused: true });
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			if (phase === "deadline") {
+				b.clock.now += 599_999;
+				await b.m.call("/api/presence", { tab: "focused", focused: true });
+				b.clock.now++;
+				await b.m.app.publishState();
+			} else await b.finishDigest();
+			await b.m.call("/api/presence", { tab: "focused", focused: false });
+			await b.finishDigest();
+			expect(b.sentSince(from)).toEqual([]);
+			expect(await digestOf(b.m.g)).toBeNull();
+		},
+	);
+
+	test("a burst beyond the Done page retains older cards and their acknowledgements", async () => {
+		const b = await alertBoard("digest-large");
+		const endpoint = "https://push.example/large";
+		await b.subscribe(endpoint);
+		const tasks: Task[] = [];
+		for (let i = 0; i < 25; i++)
+			tasks.push(await b.s.createTask(`completion ${i}`));
+		await publishNow(b.m.app);
+		for (const task of tasks) {
+			b.clock.now++;
+			await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+		}
+		await publishNow(b.m.app);
+		expect((await digestOf(b.m.g))?.entries).toHaveLength(25);
+		const state = (await (
+			await b.m.call("/api/state")
+		).json()) as StateResponse;
+		expect(state.tasks).toHaveLength(DONE_PAGE);
+		expect(state.tasks.some((task) => task.id === tasks[0]!.id)).toBe(false);
+		await b.m.call("/api/inbox/seen", { keys: [`done:${tasks[0]!.id}`] });
+		await publishNow(b.m.app);
+		const from = pushSends.length;
+		await b.finishDigest();
+		expect(b.sentSince(from)).toHaveLength(1);
+		expect(b.sentSince(from)[0]!.payload).toMatchObject({
+			tag: "complete",
+			body: "24 tasks finished",
+			partial: true,
+		});
+		const live = await (
+			await b.m.call(
+				`/api/notifications/live?endpoint=${encodeURIComponent(endpoint)}`,
+			)
+		).json();
+		expect(live.complete).toEqual({ live: 24, seq: 1 });
+		await publishNow(b.m.app);
+		expect(b.sentSince(from)).toHaveLength(1);
+	});
+
+	test("a real source read failure retains the batch and reports the error", async () => {
+		const b = await alertBoard("digest-source-error");
+		await b.subscribe("https://push.example/read-error");
+		const task = await b.s.createTask("wait for a real read");
+		await publishNow(b.m.app);
+		await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		const pending = await digestOf(b.m.g);
+		const from = pushSends.length;
+		const read = spyOn(b.s, "getTask").mockRejectedValueOnce(
+			new Error("project reader unavailable"),
+		);
+		const log = spyOn(console, "error").mockImplementation(() => {});
+		try {
+			await b.finishDigest();
+			expect(b.sentSince(from)).toEqual([]);
+			expect(await digestOf(b.m.g)).toEqual(pending);
+			expect(
+				log.mock.calls.some((call) =>
+					String(call[0]).includes("completion digest"),
+				),
+			).toBe(true);
+		} finally {
+			read.mockRestore();
+			log.mockRestore();
+		}
+		await b.m.app.publishState();
+		expect(b.sentSince(from)).toHaveLength(1);
+		expect(await digestOf(b.m.g)).toBeNull();
+	});
+
+	test("a failed push consumes its digest attempt without a delivery retry", async () => {
+		const b = await alertBoard("digest-send-error");
+		await b.subscribe("https://push.example/send-error");
+		const task = await b.s.createTask("one attempt");
+		await publishNow(b.m.app);
+		await b.s.updateTask(task.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		const from = pushSends.length;
+		pushFail = { statusCode: 503 };
+		try {
+			await b.finishDigest();
+			await b.m.app.publishState();
+			expect(await digestOf(b.m.g)).toBeNull();
+			expect(b.sentSince(from)).toHaveLength(1);
+		} finally {
+			await b.m.app.close();
+			pushFail = null;
+		}
+	});
+
+	test("independent board stores retain independent deadlines and recipients", async () => {
+		const a = await alertBoard("digest-isolation-a");
+		const b = await alertBoard("digest-isolation-b");
+		await a.subscribe("https://push.example/board-a");
+		await b.subscribe("https://push.example/board-b");
+		const first = await a.s.createTask("board a");
+		const second = await b.s.createTask("board b");
+		await publishNow(a.m.app);
+		await publishNow(b.m.app);
+		const start = a.clock.now;
+		await a.s.updateTask(first.id, { stage: "done", state: "idle" });
+		await publishNow(a.m.app);
+		a.clock.now += 100;
+		await b.s.updateTask(second.id, { stage: "done", state: "idle" });
+		await publishNow(b.m.app);
+		const from = pushSends.length;
+		a.clock.now = start + 600_000;
+		await a.m.app.publishState();
+		await b.m.app.publishState();
+		expect(a.sentSince(from).map((send) => send.endpoint)).toEqual([
+			"https://push.example/board-a",
+		]);
+		expect(await digestOf(a.m.g)).toBeNull();
+		expect(
+			(await digestOf(b.m.g))?.entries.map((entry) => entry.event.taskId),
+		).toEqual([second.id]);
+		a.clock.now += 100;
+		await b.m.app.publishState();
+		expect(a.sentSince(from).map((send) => send.endpoint)).toEqual([
+			"https://push.example/board-a",
+			"https://push.example/board-b",
+		]);
+		expect(
+			(
+				await a.m.call(
+					"/api/notifications/live?endpoint=https%3A%2F%2Fpush.example%2Fboard-b",
+				)
+			).status,
+		).toBe(404);
+	});
+
+	test.each(["current", "superseded", "notify-off"] as const)(
+		"automatic PR completion validates the %s source at the deadline",
+		async (mode) => {
+			const b = await alertBoard(`digest-pr-${mode}`);
+			b.projects.get(b.s.name)!.github = "acme/widget";
+			await b.subscribe("https://push.example/pr-digest");
+			const head = "a".repeat(40);
+			await b.s.savePrReview({
+				number: 42,
+				taskId: null,
+				head,
+				firstSeenAt: 0,
+				reviewedHead: null,
+				postedHead: null,
+				postedUrl: null,
+				postedLogin: null,
+				postedEvent: null,
+				postedVia: null,
+				state: "open",
+				draft: false,
+				title: "Review",
+				postError: null,
+				commentsAt: null,
+				commentsUnseen: false,
+			});
+			const run = await b.s.startPrRun(42, head, 1);
+			const task = await b.s.savePrDraft({
+				run,
+				number: 42,
+				head,
+				draft: "Review body",
+				prompt: "Review",
+				blocking: false,
+			});
+			await publishNow(b.m.app);
+			expect(await b.s.claimPrPost(42, head)).toBeNull();
+			await b.s.setPrPostedUrl(
+				42,
+				"https://github.com/acme/widget/pull/42#pullrequestreview-1",
+				"ottr",
+				"COMMENT",
+				"auto",
+			);
+			await b.s.syncPrCard(42);
+			await publishNow(b.m.app);
+			const key = `pr:${task.id}:posted:${head}`;
+			expect(
+				(await digestOf(b.m.g))?.entries.map((entry) => entry.event.key),
+			).toEqual([key]);
+			if (mode === "superseded")
+				await b.s.savePrReview({
+					...(await b.s.getPrReview(42))!,
+					head: "b".repeat(40),
+				});
+			if (mode === "notify-off")
+				await b.s.setSettings({ prReviewNotify: false });
+			const from = pushSends.length;
+			await b.finishDigest();
+			expect(b.sentSince(from)).toHaveLength(mode === "current" ? 1 : 0);
+			if (mode === "current")
+				expect(b.sentSince(from)[0]!.payload).toMatchObject({
+					tag: "complete",
+					keys: [key],
+					url: "https://github.com/acme/widget/pull/42",
+				});
+		},
+	);
+
+	test("stored digest normalization rejects invalid inputs and preserves valid batches", () => {
+		const entry: CompletionDigest["entries"][number] = {
+			event: {
+				key: "done:task",
+				class: "complete",
+				tag: "complete",
+				project: "project",
+				taskId: "task",
+				title: "Finished",
+				body: "Done",
+				url: "/",
+			},
+			doneAt: 1,
+			to: ["a".repeat(64)],
+		};
+		fc.assert(
+			fc.property(fc.jsonValue(), (raw) => {
+				const parsed = normalizeCompletionDigest(raw);
+				expect(normalizeCompletionDigest(parsed)).toEqual(parsed);
+				if (parsed !== null) {
+					expect(Number.isSafeInteger(parsed.deadline)).toBe(true);
+					for (const pending of parsed.entries) {
+						expect(pending.event.class).toBe("complete");
+						expect(pending.event.tag).toBe("complete");
+						expect(pending.to.every((id) => /^[a-f0-9]{64}$/.test(id))).toBe(
+							true,
+						);
+					}
+				}
+			}),
+		);
+		fc.assert(
+			fc.property(
+				fc.nat({ max: 2_000_000_000 }),
+				fc.string(),
+				fc.string(),
+				(deadline, title, body) => {
+					const valid = {
+						deadline,
+						entries: [{ ...entry, event: { ...entry.event, title, body } }],
+					};
+					expect(normalizeCompletionDigest(valid)).toEqual(valid);
+					for (const invalid of [
+						{ ...valid, deadline: -1 },
+						{ ...valid, deadline: Number.NaN },
+						{ ...valid, entries: [{ ...entry, doneAt: "1" }] },
+						{ ...valid, entries: [{ ...entry, to: ["not-an-identity"] }] },
+						{
+							...valid,
+							entries: [{ ...entry, event: { ...entry.event, class: "ops" } }],
+						},
+					])
+						expect(normalizeCompletionDigest(invalid)).toBeNull();
+				},
+			),
+		);
+	});
+
+	test("legacy and partial class carries preserve false switches across reload", async () => {
+		const b = await alertBoard("digest-legacy-prefs");
+		const endpoint = "https://push.example/legacy";
+		await b.m.g.set("push_subs", [
+			{
+				...pushSub,
+				endpoint,
+				classes: { request: false, error: false, complete: false },
+			},
+		]);
+		expect((await loadSubs(b.m.g))[0]!.classes).toEqual({
+			request: false,
+			error: false,
+			complete: false,
+			ops: true,
+		});
+		expect(
+			(
+				await b.m.call("/api/push/subscribe", {
+					endpoint,
+					keys: { p256dh: "k", auth: "a" },
+					classes: { complete: false },
+				})
+			).status,
+		).toBe(200);
+		const restarted = await b.reboot();
+		const prefs = await (
+			await restarted.call(
+				`/api/notifications/prefs?endpoint=${encodeURIComponent(endpoint)}`,
+			)
+		).json();
+		expect(prefs.classes).toEqual({
+			request: false,
+			error: false,
+			complete: false,
+			ops: true,
+		});
+	});
+
+	test("real seed faults bypass the digest, share bell keys, retract, and recur without project mutes", async () => {
+		const home = join(root, "ops-seed-flow");
+		mkdirSync(home, { recursive: true });
+		const previous = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+		const b = await alertBoard("ops-seed-flow");
+		try {
+			const loud = "https://push.example/ops-loud";
+			const quiet = "https://push.example/ops-quiet";
+			await b.subscribe(loud);
+			await b.subscribe(quiet);
+			await b.m.call("/api/notifications/prefs", {
+				endpoint: quiet,
+				classes: { ...ALL_CLASSES_ON, ops: false },
+			});
+			const complete = await b.s.createTask("digest waits");
+			const request = await b.s.createTask("request bypasses");
+			const error = await b.s.createTask("error bypasses");
+			await publishNow(b.m.app);
+			await b.s.updateTask(complete.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			expect(await digestOf(b.m.g)).not.toBeNull();
+			const urgent = pushSends.length;
+			await b.needsYou(request.id);
+			await failTurn(b, error.id, "failed turn", "queued");
+			await publishNow(b.m.app);
+			expect(
+				new Set(b.sentSince(urgent).map((send) => send.payload.tag)),
+			).toEqual(new Set(["request", "error"]));
+			await b.m.call("/api/notifications/prefs", { mutedProjects: [b.s.name] });
+			const record = {
+				since: b.clock.now,
+				commit: "d".repeat(40),
+				text: "Raw provisioning diagnostic must stay off push",
+			};
+			writeFileSync(join(home, "seed-failed"), JSON.stringify(record));
+			const from = pushSends.length;
+			await publishNow(b.m.app);
+			const key = `seed-failed:${record.since}`;
+			expect(b.sentSince(from)).toHaveLength(1);
+			expect(b.sentSince(from)[0]).toMatchObject({
+				endpoint: loud,
+				payload: { type: "alert", tag: "ops", keys: [key], url: "/" },
+			});
+			expect(JSON.stringify(b.sentSince(from))).not.toContain(record.text);
+			const state = (await (
+				await b.m.call("/api/state")
+			).json()) as StateResponse;
+			expect(opsEvents(state).map((event) => event.key)).toContain(key);
+			await publishNow(b.m.app);
+			expect(b.sentSince(from)).toHaveLength(1);
+			await b.m.call("/api/inbox/seen", { keys: [key] });
+			expect(b.sentSince(from)[1]!.payload).toEqual({
+				type: "clear",
+				tags: ["ops"],
+				upTo: { ops: 1 },
+			});
+			writeFileSync(join(home, "seed-failed"), "{}");
+			await publishNow(b.m.app);
+			expect(await b.m.g.get<string[]>("inbox_seen")).not.toContain(key);
+			writeFileSync(join(home, "seed-failed"), JSON.stringify(record));
+			await publishNow(b.m.app);
+			expect(b.sentSince(from)[2]!.payload).toMatchObject({
+				tag: "ops",
+				keys: [key],
+				seq: 2,
+			});
+			const rebooted = await b.reboot();
+			await rebooted.app.publishState();
+			expect(b.sentSince(from)).toHaveLength(3);
+			writeFileSync(join(home, "seed-failed"), "{}");
+			await publishNow(rebooted.app);
+			expect(b.sentSince(from)[3]!.payload).toEqual({
+				type: "clear",
+				tags: ["ops"],
+				upTo: { ops: 2 },
+			});
+			await rebooted.app.close();
+		} finally {
+			await b.m.app.close();
+			if (previous === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = previous;
+		}
+	});
+
+	test("Ops first boot stays silent and focus suppresses a new fault without replay", async () => {
+		const home = join(root, "ops-silent");
+		mkdirSync(home, { recursive: true });
+		const previous = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+		const record = {
+			since: 1_000,
+			commit: "a".repeat(40),
+			text: "Existing failure",
+		};
+		writeFileSync(join(home, "seed-failed"), JSON.stringify(record));
+		const b = await alertBoard("ops-silent");
+		try {
+			await b.subscribe("https://push.example/ops-silent");
+			const from = pushSends.length;
+			await publishNow(b.m.app);
+			expect(b.sentSince(from)).toEqual([]);
+			writeFileSync(join(home, "seed-failed"), "{}");
+			await publishNow(b.m.app);
+			await b.m.call("/api/presence", { tab: "ops-focus", focused: true });
+			writeFileSync(join(home, "seed-failed"), JSON.stringify(record));
+			await publishNow(b.m.app);
+			await b.m.call("/api/presence", { tab: "ops-focus", focused: false });
+			await publishNow(b.m.app);
+			expect(b.sentSince(from)).toEqual([]);
+		} finally {
+			await b.m.app.close();
+			if (previous === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = previous;
+		}
+	});
+
+	test("a hosted board never pushes a host seed fault", async () => {
+		const home = join(root, "ops-hosted");
+		mkdirSync(home, { recursive: true });
+		const previous = process.env.OTTR_BOARD_OMP_HOME;
+		process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+		const b = await alertBoard("ops-hosted", {
+			config: {
+				tenant: "ops-test",
+				secret: crypto.randomUUID(),
+				controlUrl: "http://127.0.0.1:9",
+				wording: {
+					workSuffix: "",
+					mergeSuffix: "",
+					resumeSuffix: "",
+					creditReason: "No credit.",
+				},
+			},
+			hooks: {
+				reportUsage: () => {},
+				creditOk: async () => true,
+				gitToken: async () => null,
+			},
+		});
+		try {
+			await saveSubs(b.m.g, [pushSub]);
+			await publishNow(b.m.app);
+			const from = pushSends.length;
+			writeFileSync(
+				join(home, "seed-failed"),
+				JSON.stringify({
+					since: b.clock.now,
+					commit: "a".repeat(40),
+					text: "Host failure",
+				}),
+			);
+			await publishNow(b.m.app);
+			expect(b.sentSince(from)).toEqual([]);
+		} finally {
+			await b.m.app.close();
+			if (previous === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = previous;
+		}
+	});
 
 	test("prefs: per-device classes survive a re-subscribe; mute list; 404 unknown endpoint, 400 bad shape", async () => {
 		const b = await alertBoard("alert-prefs");
@@ -15151,7 +15871,7 @@ describe("web push (R1-1, R2-3)", () => {
 			status: 200,
 			body: { classes: ALL_CLASSES_ON, mutedProjects: [] },
 		});
-		const quiet = { request: true, error: true, complete: false };
+		const quiet = { ...ALL_CLASSES_ON, complete: false };
 		expect(
 			(
 				await b.m.call("/api/notifications/prefs", {
@@ -15203,7 +15923,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 	test("subscribe accepts optional classes: valid carried set lands in the row; invalid shape is 400; absent keeps endpoint match", async () => {
 		const b = await alertBoard("alert-subscribe-classes");
-		const carried = { request: true, error: false, complete: true };
+		const carried = { ...ALL_CLASSES_ON, error: false };
 		const phone = "https://push.example/phone";
 		// Valid classes on a brand-new endpoint: the row is created with them.
 		expect(
@@ -15264,6 +15984,8 @@ describe("web push (R1-1, R2-3)", () => {
 		const from = pushSends.length;
 		await b.s.updateTask(t.id, { stage: "done", state: "idle" });
 		expect(await publishNow(b.m.app)).toBe(true);
+		expect(b.sentSince(from)).toEqual([]);
+		await b.finishDigest();
 
 		const sent = b.sentSince(from);
 		expect(sent.map((x) => x.endpoint)).toEqual([loud]);
@@ -15292,6 +16014,7 @@ describe("web push (R1-1, R2-3)", () => {
 		await b.s.updateTask(t.id, { summary: "Known answer summary text" });
 		await b.s.updateTask(t.id, { stage: "done", state: "idle" });
 		expect(await publishNow(b.m.app)).toBe(true);
+		await b.finishDigest();
 
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
@@ -15692,6 +16415,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 		await b.s.updateTask(done.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
+		await b.finishDigest();
 
 		const sent = b.sentSince(from);
 		expect(sent.length).toBe(1);
@@ -15918,6 +16642,7 @@ describe("web push (R1-1, R2-3)", () => {
 		await failTurn(b, failed.id, "boom", "queued");
 		await b.s.updateTask(done.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
+		await b.finishDigest();
 		const from = pushSends.length;
 		await b.s.updateTask(failed.id, { cancelledAt: Date.now() });
 		await b.s.updateTask(done.id, { cancelledAt: Date.now() });
@@ -15953,6 +16678,7 @@ describe("web push (R1-1, R2-3)", () => {
 
 		await b.s.updateTask(fin.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
+		await b.finishDigest();
 
 		const sent = b.sentSince(from).map((x) => x.payload);
 		expect(sent.map((p) => p.tag).sort()).toEqual(["complete", "request"]);
@@ -16012,15 +16738,16 @@ describe("web push (R1-1, R2-3)", () => {
 
 		await b.s.updateTask(fin.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
+		await b.finishDigest();
 
 		const sent = b.sentSince(from).map((x) => x.payload);
 		expect(sent.map((p) => [p.tag, p.seq])).toEqual([
 			["request", 2],
 			["complete", 1],
 		]);
-		// Both carry the old request's retraction, bounded at #1: whichever lands last, the
-		// service worker never closes request #2 with it.
-		for (const p of sent) expect(p.upTo).toEqual({ request: 1 });
+		// The immediate Request consumes the pending clear. The later digest carries none.
+		expect(sent[0]!.upTo).toEqual({ request: 1 });
+		expect(sent[1]!.upTo).toEqual({});
 	});
 
 	test("without any push device or socket, publishes still prune acknowledged task keys", async () => {
@@ -16053,6 +16780,7 @@ describe("web push (R1-1, R2-3)", () => {
 		await publishNow(b.m.app);
 		await b.s.updateTask(resolved.id, { stage: "done", state: "idle" });
 		await publishNow(b.m.app);
+		await b.finishDigest();
 
 		// While the board is down the card leaves done.
 		await b.s.updateTask(resolved.id, { stage: "in_progress" });
@@ -16067,8 +16795,7 @@ describe("web push (R1-1, R2-3)", () => {
 				payload: { type: "clear", tags: ["complete"], upTo: { complete: 1 } },
 			},
 		]);
-		// The pre-restart board object stays alive in this process (a real restart has none),
-		// so count only the request retraction, which only the rebooted board can send.
+		// The old app is closed, so only the rebooted board can send this retraction.
 		const before = b.sentSince(from).length;
 		expect(
 			(await r.call("/api/inbox/seen", { taskIds: [acked.id] })).status,
@@ -24720,7 +25447,7 @@ describe(
 				expect(pushSends.length).toBe(1);
 				// A device with Request off never gets the reminder.
 				await saveSubs(g, [
-					{ ...sub, classes: { request: false, error: true, complete: true } },
+					{ ...sub, classes: { ...ALL_CLASSES_ON, request: false } },
 				]);
 				setSystemTime(dayAt(17));
 				await served.tokenReminderTick();

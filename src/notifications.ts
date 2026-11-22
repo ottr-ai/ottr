@@ -1,19 +1,23 @@
 // Alert model shared by the server (event diff, retraction, push delivery) and the browser
 // (inbox entry keys). Pure on purpose: no I/O and no node imports, so the UI bundle can import it.
-import type { AskQuestion, TaskKind } from "./types.ts";
+import type { AskQuestion, StateResponse, TaskKind } from "./types.ts";
 
-export type AlertClass = "request" | "error" | "complete";
+export type AlertClass = "request" | "error" | "complete" | "ops";
 export const ALERT_CLASSES: readonly AlertClass[] = [
 	"request",
 	"error",
 	"complete",
+	"ops",
 ];
 export type ClassPrefs = Record<AlertClass, boolean>;
 export const ALL_CLASSES_ON: ClassPrefs = Object.freeze({
 	request: true,
 	error: true,
 	complete: true,
+	ops: true,
 });
+
+export const COMPLETION_DIGEST_MS = 10 * 60_000;
 
 /** Short stable hash (cyrb53, base 36) of an ask round: entry keys stay small however long the
  * questions are, so the shared seen set never has to cut or drop one. */
@@ -90,12 +94,49 @@ export interface AlertCardInput {
 export interface AlertEvent {
 	key: string;
 	class: AlertClass;
-	project: string;
-	taskId: string;
+	project: string | null;
+	taskId: string | null;
 	title: string;
 	body: string;
 	url: string;
 	tag: AlertClass;
+}
+
+/** Current board failures, with the bell's occurrence keys and safe push descriptions. */
+export function opsEvents(
+	state: Pick<
+		StateResponse,
+		"hosted" | "deadSignIns" | "seedFailed" | "alateProvisionError"
+	> | null,
+): AlertEvent[] {
+	if (state === null || state.hosted) return [];
+	const events: AlertEvent[] = [];
+	const add = (key: string, body: string) => {
+		events.push({
+			key,
+			class: "ops",
+			project: null,
+			taskId: null,
+			title: "Ottr",
+			body,
+			url: "/",
+			tag: "ops",
+		});
+	};
+	for (const { provider } of state.deadSignIns) {
+		const label = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(provider)
+			? `Sign in again to ${provider}`
+			: "A provider needs a new sign-in";
+		add(`signin:${provider}`, label);
+	}
+	if (state.seedFailed !== null)
+		add(`seed-failed:${state.seedFailed.since}`, "Agent setup failed");
+	if (state.alateProvisionError !== null)
+		add(
+			shortKey("provision-error", state.alateProvisionError),
+			"Worker provisioning failed",
+		);
+	return events;
 }
 
 const ERROR_BODY_MAX = 200;
@@ -267,8 +308,8 @@ export interface LiveAlert {
 	 * finds its own key acknowledged and never shows. */
 	sent: string;
 	class: AlertClass;
-	taskId: string;
-	project: string;
+	taskId: string | null;
+	project: string | null;
 	/** Endpoints the alert was pushed to: retraction is per device, so an alert a device never
 	 * got (class off, project muted) never keeps that device's class notification open. */
 	to: string[];
@@ -284,6 +325,7 @@ export function rekeyErrorAlerts(
 ): LiveAlert[] {
 	const cards = new Map(next.map((t) => [t.id, t]));
 	return live.map((a) => {
+		if (a.taskId === null) return a;
 		const t = cards.get(a.taskId);
 		return t !== undefined &&
 			t.state === "needs_you" &&
@@ -321,10 +363,13 @@ export function clearedAlerts(
 	live: readonly LiveAlert[],
 	next: readonly AlertCardInput[],
 	seen: ReadonlySet<string>,
+	opsKeys: ReadonlySet<string>,
 ): LiveAlert[] {
 	const cards = new Map(next.map((t) => [t.id, t]));
 	return live.filter((a) => {
 		if (seen.has(a.key)) return true;
+		if (a.class === "ops") return !opsKeys.has(a.key);
+		if (a.taskId === null) return true;
 		const t = cards.get(a.taskId);
 		if (t === undefined || t.cancelled) return true;
 		if (a.key.startsWith("task:"))
@@ -379,9 +424,11 @@ export function presenceHolds(
 export function deliverable(
 	classes: ClassPrefs,
 	mutedProjects: ReadonlySet<string>,
-	e: { class: AlertClass; project: string },
+	e: { class: AlertClass; project: string | null },
 ): boolean {
-	return classes[e.class] && !mutedProjects.has(e.project);
+	return (
+		classes[e.class] && (e.project === null || !mutedProjects.has(e.project))
+	);
 }
 
 /** Per class, the highest notification sequence number a retraction covers: the service worker
@@ -422,6 +469,7 @@ const GROUP_BODY: Record<AlertClass, (n: number) => string> = {
 	request: (n) => `${n} tasks need your attention`,
 	error: (n) => `${n} tasks failed`,
 	complete: (n) => `${n} tasks finished`,
+	ops: (n) => `${n} operational issues need your attention`,
 };
 
 /** One payload per class among `events` (already filtered for ONE device). Same-class pushes

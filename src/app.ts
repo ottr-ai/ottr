@@ -2,6 +2,7 @@
 // All mutable request state lives in createApp's closure, so two instances never share state.
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import {
 	closeSync,
 	existsSync,
@@ -207,12 +208,14 @@ import {
 	type ClassPrefs,
 	type ClearBound,
 	type ClearPayload,
+	COMPLETION_DIGEST_MS,
 	clearedAlerts,
 	deliverable,
 	diffEvents,
 	isApplePush,
 	type LiveAlert,
 	normalizeSeen,
+	opsEvents,
 	payloadsFor,
 	presenceHolds,
 	rekeyErrorAlerts,
@@ -2182,6 +2185,98 @@ class TaskConflict extends Error {
 const CHECK_VENDOR_RE = /^[a-z][a-z0-9_-]*$/;
 const CHECK_ROLE_RE = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
+interface PendingCompletion {
+	event: AlertEvent & { project: string; taskId: string };
+	doneAt: number | null;
+	to: string[];
+}
+
+export interface CompletionDigest {
+	deadline: number;
+	entries: PendingCompletion[];
+}
+
+/** Reject malformed stored batches instead of inventing recipients or deadlines. */
+export function normalizeCompletionDigest(
+	raw: unknown,
+): CompletionDigest | null {
+	if (typeof raw !== "object" || raw === null) return null;
+	const row = raw as Record<string, unknown>;
+	if (
+		typeof row.deadline !== "number" ||
+		!Number.isSafeInteger(row.deadline) ||
+		row.deadline < 0 ||
+		!Array.isArray(row.entries)
+	)
+		return null;
+	const entries: PendingCompletion[] = [];
+	for (const value of row.entries) {
+		if (typeof value !== "object" || value === null) continue;
+		const item = value as Record<string, unknown>;
+		if (
+			item.doneAt !== null &&
+			(typeof item.doneAt !== "number" ||
+				!Number.isSafeInteger(item.doneAt) ||
+				item.doneAt < 0)
+		)
+			continue;
+		if (typeof item.event !== "object" || item.event === null) continue;
+		const event = item.event as Record<string, unknown>;
+		if (
+			event.class !== "complete" ||
+			event.tag !== "complete" ||
+			typeof event.key !== "string" ||
+			typeof event.project !== "string" ||
+			typeof event.taskId !== "string" ||
+			typeof event.title !== "string" ||
+			typeof event.body !== "string" ||
+			typeof event.url !== "string" ||
+			!Array.isArray(item.to) ||
+			!item.to.every(
+				(id) => typeof id === "string" && /^[a-f0-9]{64}$/.test(id),
+			)
+		)
+			continue;
+		if (
+			event.key !== `done:${event.taskId}` &&
+			!event.key.startsWith(`pr:${event.taskId}:posted:`)
+		)
+			continue;
+		entries.push({
+			event: {
+				key: event.key,
+				class: "complete",
+				tag: "complete",
+				project: event.project,
+				taskId: event.taskId,
+				title: event.title,
+				body: event.body,
+				url: event.url,
+			},
+			doneAt: item.doneAt,
+			to: [...new Set(item.to as string[])],
+		});
+	}
+	return entries.length === 0 && row.entries.length > 0
+		? null
+		: { deadline: row.deadline, entries };
+}
+
+/** The identity excludes preferences, but changes when a subscription is replaced. */
+function subscriptionIdentity(sub: PushSub): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				sub.endpoint,
+				sub.keys.p256dh,
+				sub.keys.auth,
+				sub.addedAt,
+				sub.vapidPublicKey ?? null,
+			]),
+		)
+		.digest("hex");
+}
+
 export async function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
 		createAppNetworkDefaults(deps);
@@ -2362,6 +2457,7 @@ export async function createApp(deps: AppDeps) {
 	/** Card facts of the last published frame: the event diff's baseline. Null until the first
 	 * publish, which alerts nothing (a restart must not replay the whole board). */
 	let lastAlertInputs: AlertCardInput[] | null = null;
+	let lastOpsKeys: Set<string> | null = null;
 	/** Alerts pushed and not yet retracted: what a cleared cause or an ack closes on the devices.
 	 * Persisted (GlobalStore `notify_live_alerts`) so a restart can still retract what the
 	 * devices show; the first frame after boot clears what resolved while the board was down. */
@@ -2374,6 +2470,7 @@ export async function createApp(deps: AppDeps) {
 	 * notifications shown before it, never a later alert that overtook it. Persisted. */
 	let alertSeqs = new Map<string, Record<AlertClass, number>>();
 	let liveAlerts: LiveAlert[] = [];
+	let completionDigest: CompletionDigest | null = null;
 
 	/** A valid alert class name. */
 	const isClass = (c: unknown): c is AlertClass =>
@@ -2399,15 +2496,16 @@ export async function createApp(deps: AppDeps) {
 		const x = a as Record<string, unknown>;
 		return typeof x.key === "string" &&
 			isClass(x.class) &&
-			typeof x.taskId === "string" &&
-			typeof x.project === "string"
+			(x.class === "ops"
+				? x.taskId === null && x.project === null
+				: typeof x.taskId === "string" && typeof x.project === "string")
 			? [
 					{
 						key: x.key,
 						sent: typeof x.sent === "string" ? x.sent : x.key,
 						class: x.class,
-						taskId: x.taskId,
-						project: x.project,
+						taskId: typeof x.taskId === "string" ? x.taskId : null,
+						project: typeof x.project === "string" ? x.project : null,
 						to: endpointList(x.to),
 					},
 				]
@@ -2429,6 +2527,7 @@ export async function createApp(deps: AppDeps) {
 				request: 0,
 				error: 0,
 				complete: 0,
+				ops: 0,
 				...bounds(s),
 			});
 	}
@@ -2439,10 +2538,12 @@ export async function createApp(deps: AppDeps) {
 			alerts?: unknown;
 			appleClear?: unknown;
 			seqs?: unknown;
+			completionDigest?: unknown;
 		};
 		if (Array.isArray(r.alerts)) liveAlerts = r.alerts.flatMap(liveAlertOf);
 		restoreAppleClear(r.appleClear);
 		restoreSeqs(r.seqs);
+		completionDigest = normalizeCompletionDigest(r.completionDigest);
 	}
 	/** Restores the live-alert registry, the pending Apple clears and the sequence numbers from the stored row; malformed rows contribute nothing. */
 	async function loadAlertState(): Promise<void> {
@@ -2465,6 +2566,7 @@ export async function createApp(deps: AppDeps) {
 				alerts: liveAlerts,
 				appleClear: Object.fromEntries(appleClear),
 				seqs: Object.fromEntries(alertSeqs),
+				completionDigest,
 			});
 		});
 	}
@@ -2562,6 +2664,7 @@ export async function createApp(deps: AppDeps) {
 	function pruneInboxSeen(
 		seen: readonly string[],
 		inputs: readonly AlertCardInput[],
+		opsKeys: ReadonlySet<string>,
 	): string[] {
 		const byId = new Map<string, AlertCardInput>();
 		const entryKeys = new Set<string>();
@@ -2590,9 +2693,19 @@ export async function createApp(deps: AppDeps) {
 		 * entry carries, `done:<id>` of a card in done, `error:<id>:<turn>` of a card on that
 		 * turn. Notice and crit keys stay; the client drops those itself. */
 		function inboxKeyLive(k: string): boolean {
+			if (/^(signin|seed-failed|provision-error):/.test(k))
+				return opsKeys.has(k);
+			if (
+				completionDigest?.entries.some(
+					(entry) => entry.event.key === k && !byId.has(entry.event.taskId),
+				)
+			)
+				return true;
 			if (k.startsWith("task:")) return entryKeys.has(k);
-			if (k.startsWith("done:"))
-				return byId.get(k.slice("done:".length))?.stage === "done";
+			if (k.startsWith("done:")) {
+				const card = byId.get(k.slice("done:".length));
+				return card?.stage === "done" && !card.cancelled;
+			}
 			if (k.startsWith("error:")) {
 				const rest = k.slice("error:".length);
 				const cut = rest.lastIndexOf(":");
@@ -2645,6 +2758,7 @@ export async function createApp(deps: AppDeps) {
 			request: 0,
 			error: 0,
 			complete: 0,
+			ops: 0,
 		};
 		const upTo: ClearBound = apple
 			? { ...(appleClear.get(sub.endpoint) ?? {}) }
@@ -2696,79 +2810,289 @@ export async function createApp(deps: AppDeps) {
 		);
 	}
 
-	/** One frame's push pass: retract alerts whose cause cleared or that were acked, then deliver
-	 * the frame's new events per device (class switches, project mute). A focused board tab holds
-	 * the new events — dropped, never sent later; they still sit in the inbox — but never the retraction. */
+	/** Record attempts before delivery. The registry and sequence rules serve both paths. */
+	function alertBatches(
+		events: readonly AlertEvent[],
+		toOf: ReadonlyMap<string, string[]>,
+		removed: readonly LiveAlert[],
+		subs: readonly PushSub[],
+	) {
+		const sent = events.filter((e) => (toOf.get(e.key)?.length ?? 0) > 0);
+		const keys = new Set(sent.map((e) => e.key));
+		liveAlerts = [
+			...liveAlerts.filter((a) => !keys.has(a.key)),
+			...sent.map((e) => ({
+				key: e.key,
+				sent: e.key,
+				class: e.class,
+				taskId: e.taskId,
+				project: e.project,
+				to: toOf.get(e.key) ?? [],
+			})),
+		];
+		return subs.map((sub) => {
+			const mine = liveAlerts.filter((a) => a.to.includes(sub.endpoint));
+			const liveKeys: Record<AlertClass, string[]> = {
+				request: [],
+				error: [],
+				complete: [],
+				ops: [],
+			};
+			for (const a of mine) liveKeys[a.class].push(a.key);
+			return {
+				sub,
+				payloads: batchFor(
+					sub,
+					payloadsFor(
+						sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
+						liveKeys,
+					),
+					tagsToClear(removed, mine, sub.endpoint),
+				),
+			};
+		});
+	}
+
+	/** A real source read, also for cards outside the board's Done page. Failures propagate. */
+	async function completionSource(project: string, id: string) {
+		const entry = deps.projects.get(project);
+		if (entry === undefined) return null;
+		const task = await entry.store.getTask(id);
+		if (task === null) return null;
+		let prDraft: number | null = null;
+		let prComments: number | null = null;
+		let prPosted: string | null = null;
+		let prPostedHead: string | null = null;
+		if (task.kind === "pr_review") {
+			if (!(await entry.store.getSettings()).prReviewNotify) return null;
+			const row = await entry.store.getPrReviewByTask(id);
+			if (row !== null) {
+				prDraft = await entry.store.lastPrRun(row.number);
+				prComments = row.commentsUnseen ? row.commentsAt : null;
+				if (
+					row.postedVia === "auto" &&
+					row.postedHead !== null &&
+					row.postedHead === row.reviewedHead &&
+					row.postedHead === row.head &&
+					row.state === "open" &&
+					entry.github !== null
+				) {
+					prPostedHead = row.postedHead;
+					prPosted = prUrl(ownerRepo(entry.github) ?? entry.github, row.number);
+				}
+			}
+		}
+		const input: AlertCardInput = {
+			id,
+			project,
+			title: task.title,
+			sessionTitle: null,
+			state: task.state,
+			stage: task.stage,
+			kind: task.kind,
+			asked: task.asked,
+			answered:
+				task.stage === "done" &&
+				!isRetro(task) &&
+				answeredCard(await entry.store.listTurns(id)),
+			needsReason: task.needsReason,
+			summary: task.summary,
+			errorTurn: null,
+			errorText: null,
+			prDraft,
+			prComments,
+			prPosted,
+			prPostedHead,
+			cancelled: task.cancelledAt !== null,
+		};
+		return { input, doneAt: task.doneAt };
+	}
+
+	/** Read completions omitted by the Done page, including a burst larger than that page. */
+	async function includeCompletionSources(
+		inputs: AlertCardInput[],
+		doneAt: Map<string, number | null>,
+	): Promise<void> {
+		const known = new Set(inputs.map((input) => input.id));
+		const candidates = [
+			...liveAlerts.filter((alert) => alert.class === "complete"),
+			...(lastAlertInputs ?? [])
+				.filter((input) => input.stage !== "done")
+				.map((input) => ({ taskId: input.id, project: input.project })),
+		];
+		for (const alert of candidates) {
+			if (
+				alert.taskId === null ||
+				alert.project === null ||
+				known.has(alert.taskId)
+			)
+				continue;
+			const source = await completionSource(alert.project, alert.taskId);
+			if (source !== null) {
+				inputs.push(source.input);
+				doneAt.set(alert.taskId, source.doneAt);
+			}
+			known.add(alert.taskId);
+		}
+	}
+
+	/** New Complete events capture their eligible devices. Urgent classes deliver at once. */
 	async function pushAlerts(
 		inputs: readonly AlertCardInput[],
 		events: readonly AlertEvent[],
 		seen: ReadonlySet<string>,
+		opsKeys: Set<string>,
+		doneAt: ReadonlyMap<string, number | null>,
 	): Promise<void> {
 		const batches = await deps.gstore.transaction(async () => {
 			const acknowledged = new Set([...seen, ...(await loadInboxSeen())]);
 			lastAlertInputs = [...inputs];
+			lastOpsKeys = opsKeys;
 			const rekeyed = rekeyAlerts(inputs);
-			const removed = retire(clearedAlerts(liveAlerts, inputs, acknowledged));
+			const removed = retire(
+				clearedAlerts(liveAlerts, inputs, acknowledged, opsKeys),
+			);
+			let changed = rekeyed;
+			if (completionDigest !== null) {
+				const before = completionDigest.entries.length;
+				const known = new Set(inputs.map((input) => input.id));
+				completionDigest.entries = completionDigest.entries.filter(
+					({ event }) =>
+						!acknowledged.has(event.key) &&
+						(!known.has(event.taskId) ||
+							clearedAlerts(
+								[{ ...event, sent: event.key, to: [] }],
+								inputs,
+								acknowledged,
+								opsKeys,
+							).length === 0),
+				);
+				changed ||= before !== completionDigest.entries.length;
+			}
 			const fresh = presenceHolds(focusAt, now())
 				? []
 				: events.filter((e) => !acknowledged.has(e.key));
 			if (fresh.length === 0 && removed.length === 0) {
-				if (rekeyed) await saveAlertState();
+				if (changed) await saveAlertState();
 				return;
 			}
 			const subs = await loadSubs(deps.gstore);
 			const muted = new Set(await loadMuted());
-			const toOf = new Map(
-				fresh.map((e) => [
-					e.key,
-					subs
-						.filter((s) => deliverable(s.classes, muted, e))
-						.map((s) => s.endpoint),
-				]),
-			);
-			// An alert no device got needs no retraction, so it never enters the registry.
-			const sent = fresh.filter((e) => (toOf.get(e.key)?.length ?? 0) > 0);
-			if (sent.length > 0) {
-				const keys = new Set(sent.map((e) => e.key));
-				liveAlerts = [
-					...liveAlerts.filter((a) => !keys.has(a.key)),
-					...sent.map((e) => ({
-						key: e.key,
-						sent: e.key,
-						class: e.class,
-						taskId: e.taskId,
-						project: e.project,
-						to: toOf.get(e.key) ?? [],
-					})),
-				];
+			const immediate: AlertEvent[] = [];
+			const toOf = new Map<string, string[]>();
+			for (const event of fresh) {
+				const eligible = subs.filter((sub) =>
+					deliverable(sub.classes, muted, event),
+				);
+				if (eligible.length === 0) continue;
+				if (
+					event.class === "complete" &&
+					event.project !== null &&
+					event.taskId !== null
+				) {
+					completionDigest ??= {
+						deadline: now() + COMPLETION_DIGEST_MS,
+						entries: [],
+					};
+					completionDigest.entries = completionDigest.entries.filter(
+						(entry) => entry.event.key !== event.key,
+					);
+					completionDigest.entries.push({
+						event: { ...event, project: event.project, taskId: event.taskId },
+						doneAt: doneAt.get(event.taskId) ?? null,
+						to: eligible.map(subscriptionIdentity),
+					});
+				} else {
+					immediate.push(event);
+					toOf.set(
+						event.key,
+						eligible.map((sub) => sub.endpoint),
+					);
+				}
 			}
-			const batches = subs.map((sub) => {
-				const mine = liveAlerts.filter((a) => a.to.includes(sub.endpoint));
-				// The class notification stands for every alert of the class this device still
-				// shows, so its keys (and a grouped count) cover all of them, not just this frame.
-				const liveKeys: Record<AlertClass, string[]> = {
-					request: [],
-					error: [],
-					complete: [],
-				};
-				for (const a of mine) liveKeys[a.class].push(a.key);
-				const clear = tagsToClear(removed, mine, sub.endpoint);
-				return {
-					sub,
-					payloads: batchFor(
-						sub,
-						payloadsFor(
-							sent.filter((e) => toOf.get(e.key)?.includes(sub.endpoint)),
-							liveKeys,
-						),
-						clear,
-					),
-				};
-			});
+			const batches = alertBatches(immediate, toOf, removed, subs);
 			await saveAlertState();
 			return batches;
 		});
 		if (batches !== undefined) await sendPushes(batches);
+	}
+
+	/** Runs on the existing publish queue, even when the frame is unchanged and no tab exists. */
+	async function flushCompletionDigest(): Promise<void> {
+		if (completionDigest === null || now() < completionDigest.deadline) return;
+		try {
+			const batches = await deps.gstore.transaction(async () => {
+				if (completionDigest === null || now() < completionDigest.deadline)
+					return;
+				const seen = new Set(await loadInboxSeen());
+				const read = new Set(await loadSeen());
+				const subs = await loadSubs(deps.gstore);
+				const muted = new Set(await loadMuted());
+				const events: AlertEvent[] = [];
+				const toOf = new Map<string, string[]>();
+				const sources: AlertCardInput[] = [];
+				for (const pending of completionDigest.entries) {
+					const { event } = pending;
+					const source = await completionSource(event.project, event.taskId);
+					if (source === null) continue;
+					if (
+						source.doneAt !== pending.doneAt ||
+						read.has(event.taskId) ||
+						(source.doneAt !== null &&
+							read.has(
+								doneReadKey({ id: event.taskId, doneAt: source.doneAt }),
+							)) ||
+						clearedAlerts(
+							[{ ...event, sent: event.key, to: [] }],
+							[source.input],
+							seen,
+							new Set(),
+						).length > 0
+					)
+						continue;
+					const recipients = new Set(pending.to);
+					toOf.set(
+						event.key,
+						subs
+							.filter(
+								(sub) =>
+									recipients.has(subscriptionIdentity(sub)) &&
+									deliverable(sub.classes, muted, event),
+							)
+							.map((sub) => sub.endpoint),
+					);
+					events.push(event);
+					sources.push(source.input);
+				}
+				// Focus suppresses the due batch, never delays it. A source failure above keeps it.
+				const deliver = presenceHolds(focusAt, now()) ? [] : events;
+				const previous = completionDigest;
+				const previousLive = liveAlerts;
+				const previousSeqs = structuredClone(alertSeqs);
+				const previousClear = structuredClone(appleClear);
+				completionDigest = null;
+				const batches = alertBatches(deliver, toOf, [], subs);
+				try {
+					await saveAlertState();
+				} catch (err) {
+					completionDigest = previous;
+					liveAlerts = previousLive;
+					alertSeqs = previousSeqs;
+					appleClear = previousClear;
+					throw err;
+				}
+				if (lastAlertInputs !== null) {
+					const known = new Set(lastAlertInputs.map((input) => input.id));
+					lastAlertInputs.push(
+						...sources.filter((input) => !known.has(input.id)),
+					);
+				}
+				return batches;
+			});
+			if (batches !== undefined) await sendPushes(batches);
+		} catch (err) {
+			logError("completion digest", err);
+		}
 	}
 
 	/** Applies rekeyErrorAlerts to the registry; true when a key changed. */
@@ -2790,6 +3114,7 @@ export async function createApp(deps: AppDeps) {
 					liveAlerts,
 					lastAlertInputs,
 					new Set(await loadInboxSeen()),
+					lastOpsKeys ?? new Set(),
 				),
 			);
 			if (removed.length === 0) {
@@ -7481,7 +7806,12 @@ export async function createApp(deps: AppDeps) {
 		try {
 			state.inboxSeen = await deps.gstore.update<string[]>(
 				"inbox_seen",
-				(current) => pruneInboxSeen(normalizeSeen(current), inputs),
+				(current) =>
+					pruneInboxSeen(
+						normalizeSeen(current),
+						inputs,
+						new Set(opsEvents(state).map((event) => event.key)),
+					),
 			);
 		} catch (err) {
 			logError("inbox seen prune", err);
@@ -7528,12 +7858,15 @@ export async function createApp(deps: AppDeps) {
 
 	async function publishStateNow(): Promise<boolean> {
 		if (deps.serverRef.current === undefined) return false;
+		await flushCompletionDigest();
 		const consumers = sockets > 0 || (await loadSubs(deps.gstore)).length > 0;
 		// Without a consumer the frame exists only for the seen prune below; skip the state
 		// build (this runs every second) when no task-derived key is acknowledged.
 		if (
 			!consumers &&
-			!(await loadInboxSeen()).some((k) => /^(task|done|error):/.test(k))
+			!(await loadInboxSeen()).some((k) =>
+				/^(task|done|error|pr|signin|seed-failed|provision-error):/.test(k),
+			)
 		)
 			return false;
 		if (builtVersion === stateVersion) {
@@ -7568,6 +7901,10 @@ export async function createApp(deps: AppDeps) {
 			lastAlertInputs,
 			entry.summaries,
 		);
+		const doneAt = new Map(state.tasks.map((task) => [task.id, task.doneAt]));
+		await includeCompletionSources(inputs, doneAt);
+		const ops = opsEvents(state);
+		const opsKeys = new Set(ops.map((event) => event.key));
 		const seenBefore = state.inboxSeen;
 		await pruneSeen(state, inputs);
 		// The prune can be the frame's only change (a key stops mapping to an alert
@@ -7582,6 +7919,7 @@ export async function createApp(deps: AppDeps) {
 		// that subscribes later is never alerted for changes from before it existed.
 		if (!consumers) {
 			lastAlertInputs = inputs;
+			lastOpsKeys = opsKeys;
 			return false;
 		}
 		if (
@@ -7611,13 +7949,23 @@ export async function createApp(deps: AppDeps) {
 			}
 			await pushAlerts(
 				inputs,
-				diffEvents(lastAlertInputs, inputs).filter((e) => !quiet.has(e.taskId)),
+				[
+					...diffEvents(lastAlertInputs, inputs).filter(
+						(event) => event.taskId === null || !quiet.has(event.taskId),
+					),
+					...ops.filter(
+						(event) => lastOpsKeys !== null && !lastOpsKeys.has(event.key),
+					),
+				],
 				new Set(state.inboxSeen),
+				opsKeys,
+				doneAt,
 			);
 		} catch (err) {
 			logError("push diff", err);
 		}
 		lastAlertInputs = inputs;
+		lastOpsKeys = opsKeys;
 		lastStateJson = text;
 		// The published frame is the fixed wrapper around the state's JSON, so the
 		// wrapper bytes strip off deterministically and the compare against the next
@@ -8442,18 +8790,23 @@ export async function createApp(deps: AppDeps) {
 				typeof b.endpoint !== "string" ||
 				typeof raw !== "object" ||
 				raw === null ||
-				ALERT_CLASSES.some((c) => typeof raw[c] !== "boolean")
+				ALERT_CLASSES.some((c) =>
+					c === "ops"
+						? raw[c] !== undefined && typeof raw[c] !== "boolean"
+						: typeof raw[c] !== "boolean",
+				)
 			)
 				return json({ error: "invalid prefs" }, 400);
 			return deps.gstore.transaction(async () => {
 				const subs = await loadSubs(deps.gstore);
 				const sub = subs.find((s) => s.endpoint === b.endpoint);
 				if (sub === undefined) return json({ error: "unknown endpoint" }, 404);
-				// A fresh object of the three switches: extra posted keys never reach the store.
+				// Extra posted keys never reach the store. Old clients keep the Ops switch.
 				const classes: ClassPrefs = {
 					request: raw.request === true,
 					error: raw.error === true,
 					complete: raw.complete === true,
+					ops: raw.ops === undefined ? sub.classes.ops : raw.ops === true,
 				};
 				await saveSubs(
 					deps.gstore,
@@ -8564,7 +8917,11 @@ export async function createApp(deps: AppDeps) {
 		added: string[];
 		prFlagCleared: boolean;
 	}> {
-		const added = liveAlerts.filter((a) => ids.has(a.taskId)).map((a) => a.key);
+		const added = liveAlerts
+			.filter((a) => a.taskId !== null && ids.has(a.taskId))
+			.map((a) => a.key);
+		for (const pending of completionDigest?.entries ?? [])
+			if (ids.has(pending.event.taskId)) added.push(pending.event.key);
 		let prFlagCleared = false;
 		for (const e of deps.projects.values()) {
 			if (await ackProjectKeys(e, ids, added)) prFlagCleared = true;
@@ -10182,6 +10539,7 @@ export async function createApp(deps: AppDeps) {
 				request: { live: 0, seq: seqs?.request ?? 0 },
 				error: { live: 0, seq: seqs?.error ?? 0 },
 				complete: { live: 0, seq: seqs?.complete ?? 0 },
+				ops: { live: 0, seq: seqs?.ops ?? 0 },
 			};
 			for (const a of liveAlerts)
 				if (a.to.includes(endpoint)) live[a.class].live++;
@@ -10224,9 +10582,23 @@ export async function createApp(deps: AppDeps) {
 		if ("error" in r) return r.error;
 		if (typeof r.body.endpoint !== "string")
 			return json({ error: "endpoint required" }, 400);
-		await updateSubs(deps.gstore, (current) =>
-			current.filter((s) => s.endpoint !== r.body.endpoint),
-		);
+		await deps.gstore.transaction(async () => {
+			const current = await loadSubs(deps.gstore);
+			const removed = new Set(
+				current
+					.filter((sub) => sub.endpoint === r.body.endpoint)
+					.map(subscriptionIdentity),
+			);
+			await saveSubs(
+				deps.gstore,
+				current.filter((sub) => sub.endpoint !== r.body.endpoint),
+			);
+			if (completionDigest !== null) {
+				for (const pending of completionDigest.entries)
+					pending.to = pending.to.filter((id) => !removed.has(id));
+				await saveAlertState();
+			}
+		});
 		return json({ ok: true });
 	}
 
@@ -10246,7 +10618,7 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "invalid subscription" }, 400);
 		// ADR-0011 recovery: the re-subscribe can carry the old row's classes so the
 		// fresh row is created with them in one atomic call. Any other shape is a 400.
-		let carriedClasses: ClassPrefs | undefined;
+		let carriedClasses: Partial<ClassPrefs> | undefined;
 		if (b.classes !== undefined) {
 			if (typeof b.classes !== "object" || b.classes === null)
 				return json({ error: "invalid classes" }, 400);
@@ -10258,22 +10630,24 @@ export async function createApp(deps: AppDeps) {
 				)
 					return json({ error: "invalid classes" }, 400);
 			}
-			carriedClasses = c as ClassPrefs;
+			carriedClasses = c as Partial<ClassPrefs>;
 		}
 		const endpoint = b.endpoint;
 		const keys = { p256dh: b.keys.p256dh, auth: b.keys.auth };
 		const vapidPublicKey = (await ensureVapid()).publicKey;
 		await updateSubs(deps.gstore, (current) => {
-			const classes =
-				carriedClasses ??
-				current.find((sub) => sub.endpoint === endpoint)?.classes ??
-				ALL_CLASSES_ON;
+			const previous = current.find((sub) => sub.endpoint === endpoint);
+			const classes = {
+				...ALL_CLASSES_ON,
+				...previous?.classes,
+				...carriedClasses,
+			};
 			return [
 				...current.filter((sub) => sub.endpoint !== endpoint),
 				{
 					endpoint,
 					keys,
-					addedAt: Date.now(),
+					addedAt: Math.max(now(), (previous?.addedAt ?? 0) + 1),
 					classes: { ...classes },
 					vapidPublicKey,
 				},

@@ -13885,6 +13885,102 @@ describe("memoized Card renders", () => {
 });
 
 describe("AppInboxBell badge", () => {
+	test("Ops faults count once as action-required and share notice acknowledgement keys", () => {
+		const state = {
+			hosted: false,
+			projects: [],
+			deadSignIns: [{ provider: "anthropic" }],
+			seedFailed: { since: 123, commit: "abc", text: "Seed failed" },
+			alateProvisionError: "Provision failed",
+		} as unknown as StateResponse;
+		const keys = appNoticeKeys(
+			state,
+			new Map(),
+			null,
+			null,
+			false,
+			0,
+			null,
+			state.seedFailed ?? null,
+			false,
+			[],
+			null,
+			{ held: 0, stale: 0 } as StateResponse["keptWorktrees"],
+			0,
+		);
+		const noticeKeys = [
+			"signin:anthropic",
+			keys.seedFailKey!,
+			keys.provisionErrKey!,
+		];
+		const meta = appInboxMeta(
+			state,
+			new Set(),
+			null,
+			null,
+			[],
+			[],
+			[],
+			[],
+			noticeKeys,
+			[],
+			0,
+			"",
+		);
+		expect(meta.entries).toEqual(
+			noticeKeys.map((key) => ({ key, level: "needs" })),
+		);
+		expect(meta.inbox.total).toBe(3);
+		expect(meta.inbox.fresh).toHaveLength(3);
+		expect(meta.inbox.level).toBe("needs");
+		const read = appInboxMeta(
+			{ ...state, inboxSeen: noticeKeys },
+			new Set(),
+			null,
+			null,
+			[],
+			[],
+			[],
+			[],
+			noticeKeys,
+			[],
+			0,
+			"",
+		);
+		expect(read.inbox.fresh).toHaveLength(0);
+		expect(read.inbox.lit).toBe(true);
+		const markedAll = appInboxMeta(
+			state,
+			new Set(meta.entries.map((entry) => entry.key)),
+			null,
+			null,
+			[],
+			[],
+			[],
+			[],
+			noticeKeys,
+			[],
+			0,
+			"",
+		);
+		expect(markedAll.inbox.fresh).toHaveLength(0);
+		const hosted = appInboxMeta(
+			{ ...state, hosted: true },
+			new Set(),
+			null,
+			null,
+			[],
+			[],
+			[],
+			[],
+			[],
+			[],
+			0,
+			"",
+		);
+		expect(hosted.inbox.total).toBe(0);
+	});
+
 	// 5 needs-you + 18 asked + 6 notices = 29 entries, as the panel lists them. The
 	// last `ackedCount` entries count as acknowledged, so the rest stay fresh.
 	const inboxMeta = (

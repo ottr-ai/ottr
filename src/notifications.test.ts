@@ -9,6 +9,7 @@ import {
 	isApplePush,
 	type LiveAlert,
 	normalizeSeen,
+	opsEvents,
 	PAYLOAD_KEYS_MAX,
 	PRESENCE_WINDOW_MS,
 	payloadsFor,
@@ -48,7 +49,7 @@ const ask = (question: string): AskQuestion[] => [
 	{ question, options: [], multi: false } as unknown as AskQuestion,
 ];
 
-const zero = { request: [], error: [], complete: [] };
+const zero = { request: [], error: [], complete: [], ops: [] };
 
 describe("taskEntryKey", () => {
 	test("needs vs asked rounds", () => {
@@ -247,7 +248,7 @@ describe("payloadsFor", () => {
 				ev("complete", "C"),
 				ev("complete", "D"),
 			],
-			{ request: [], error: ["error:U", "error:A"], complete: [] },
+			{ request: [], error: ["error:U", "error:A"], complete: [], ops: [] },
 		);
 		expect(out.map((p) => [p.tag, p.body, p.keys])).toEqual([
 			["error", "3 tasks failed", ["error:A", "error:B", "error:U"]],
@@ -258,6 +259,7 @@ describe("payloadsFor", () => {
 			request: ["request:A"],
 			error: [],
 			complete: [],
+			ops: [],
 		});
 		expect([lone?.body, lone?.keys]).toEqual([
 			"2 tasks need your attention",
@@ -270,6 +272,7 @@ describe("payloadsFor", () => {
 			request: [],
 			error: [],
 			complete: many,
+			ops: [],
 		});
 		expect(p?.body).toBe("501 tasks finished");
 		expect(p?.keys.length).toBe(PAYLOAD_KEYS_MAX);
@@ -326,10 +329,20 @@ describe("clearedAlerts", () => {
 	test("answered ask clears its task key", () => {
 		const a = live("task:A:needs", "request", "A");
 		expect(
-			clearedAlerts([a], [card("A", { state: "running" })], new Set()),
+			clearedAlerts(
+				[a],
+				[card("A", { state: "running" })],
+				new Set(),
+				new Set(),
+			),
 		).toEqual([a]);
 		expect(
-			clearedAlerts([a], [card("A", { state: "needs_you" })], new Set()),
+			clearedAlerts(
+				[a],
+				[card("A", { state: "needs_you" })],
+				new Set(),
+				new Set(),
+			),
 		).toEqual([]);
 	});
 	test("a new ask replaces the old entry key", () => {
@@ -338,6 +351,7 @@ describe("clearedAlerts", () => {
 			clearedAlerts(
 				[a],
 				[card("A", { state: "needs_you", asked: ask("q") })],
+				new Set(),
 				new Set(),
 			),
 		).toEqual([a]);
@@ -348,13 +362,15 @@ describe("clearedAlerts", () => {
 			live("done:A", "complete", "A"),
 			live("error:A:t", "error", "A"),
 		];
-		expect(clearedAlerts(all, [], new Set())).toEqual(all);
+		expect(clearedAlerts(all, [], new Set(), new Set())).toEqual(all);
 	});
 	test("acked key clears", () => {
 		const a = live("done:A", "complete", "A");
 		const t = card("A", { stage: "done" });
-		expect(clearedAlerts([a], [t], new Set())).toEqual([]);
-		expect(clearedAlerts([a], [t], new Set(["done:A"]))).toEqual([a]);
+		expect(clearedAlerts([a], [t], new Set(), new Set())).toEqual([]);
+		expect(clearedAlerts([a], [t], new Set(["done:A"]), new Set())).toEqual([
+			a,
+		]);
 	});
 	test("done card leaving done clears; errorTurn change clears the error", () => {
 		const d = live("done:A", "complete", "A");
@@ -364,10 +380,16 @@ describe("clearedAlerts", () => {
 				[d, e],
 				[card("A", { stage: "in_progress", errorTurn: "t1" })],
 				new Set(),
+				new Set(),
 			),
 		).toEqual([d]);
 		expect(
-			clearedAlerts([e], [card("A", { errorTurn: "t2" })], new Set()),
+			clearedAlerts(
+				[e],
+				[card("A", { errorTurn: "t2" })],
+				new Set(),
+				new Set(),
+			),
 		).toEqual([e]);
 	});
 });
@@ -400,10 +422,9 @@ describe("cancellation and error rekey", () => {
 			errorTurn: "t1",
 			cancelled: true,
 		});
-		expect(clearedAlerts([err, done], [cancelledDone], new Set())).toEqual([
-			err,
-			done,
-		]);
+		expect(
+			clearedAlerts([err, done], [cancelledDone], new Set(), new Set()),
+		).toEqual([err, done]);
 	});
 	test("an Error that led to needs_you takes the entry key, so acking the entry retracts it", () => {
 		const err = live("error:A:t1", "error", "A");
@@ -411,11 +432,21 @@ describe("cancellation and error rekey", () => {
 		const rekeyed = rekeyErrorAlerts([err], [needs])[0]!;
 		expect(rekeyed.key).toBe(taskEntryKey(needs));
 		expect(
-			clearedAlerts([rekeyed], [needs], new Set([taskEntryKey(needs)])),
+			clearedAlerts(
+				[rekeyed],
+				[needs],
+				new Set([taskEntryKey(needs)]),
+				new Set(),
+			),
 		).toEqual([rekeyed]);
 		// Answering the entry (card leaves needs_you on the same turn) retracts it too.
 		expect(
-			clearedAlerts([rekeyed], [{ ...needs, state: "queued" }], new Set()),
+			clearedAlerts(
+				[rekeyed],
+				[{ ...needs, state: "queued" }],
+				new Set(),
+				new Set(),
+			),
 		).toEqual([rekeyed]);
 	});
 	test("task keys hash the ask: short and distinct per round", () => {
@@ -508,15 +539,20 @@ describe("PR review notifications", () => {
 
 	test("pr: alerts retract on a newer or read wave", () => {
 		const a = live("pr:P:500", "request", "P");
-		expect(clearedAlerts([a], [pr({ prComments: 600 })], new Set())).toEqual([
-			a,
-		]);
-		expect(clearedAlerts([a], [pr({ prComments: 500 })], new Set())).toEqual(
-			[],
-		);
-		expect(clearedAlerts([a], [pr()], new Set())).toEqual([a]);
 		expect(
-			clearedAlerts([a], [pr({ prComments: 500 })], new Set(["pr:P:500"])),
+			clearedAlerts([a], [pr({ prComments: 600 })], new Set(), new Set()),
+		).toEqual([a]);
+		expect(
+			clearedAlerts([a], [pr({ prComments: 500 })], new Set(), new Set()),
+		).toEqual([]);
+		expect(clearedAlerts([a], [pr()], new Set(), new Set())).toEqual([a]);
+		expect(
+			clearedAlerts(
+				[a],
+				[pr({ prComments: 500 })],
+				new Set(["pr:P:500"]),
+				new Set(),
+			),
 		).toEqual([a]);
 	});
 
@@ -633,22 +669,34 @@ describe("PR review notifications", () => {
 			prPostedHead: head,
 		});
 		// Stands while the board's post for this head is current.
-		expect(clearedAlerts([a], [posted], new Set())).toEqual([]);
+		expect(clearedAlerts([a], [posted], new Set(), new Set())).toEqual([]);
 		// A different head's stamp (a later automatic post) clears it.
 		expect(
-			clearedAlerts([a], [pr({ ...posted, prPostedHead: headB })], new Set()),
+			clearedAlerts(
+				[a],
+				[pr({ ...posted, prPostedHead: headB })],
+				new Set(),
+				new Set(),
+			),
 		).toEqual([a]);
 		// A manual post (or a new head, or a closed PR) nulls the stamp.
 		expect(
-			clearedAlerts([a], [pr({ state: "idle", stage: "done" })], new Set()),
+			clearedAlerts(
+				[a],
+				[pr({ state: "idle", stage: "done" })],
+				new Set(),
+				new Set(),
+			),
 		).toEqual([a]);
-		expect(clearedAlerts([a], [], new Set())).toEqual([a]);
+		expect(clearedAlerts([a], [], new Set(), new Set())).toEqual([a]);
 		// The numeric comment rule beside it keeps its behavior.
 		const wave = live("pr:P:500", "request", "P");
-		expect(clearedAlerts([wave], [posted], new Set())).toEqual([wave]);
-		expect(clearedAlerts([wave], [pr({ prComments: 500 })], new Set())).toEqual(
-			[],
-		);
+		expect(clearedAlerts([wave], [posted], new Set(), new Set())).toEqual([
+			wave,
+		]);
+		expect(
+			clearedAlerts([wave], [pr({ prComments: 500 })], new Set(), new Set()),
+		).toEqual([]);
 	});
 
 	test("a rewritten draft on a stamped card is one request, never a complete", () => {
@@ -697,5 +745,161 @@ describe("shortKey", () => {
 		expect(long.length).toBeLessThan(40);
 		expect(long).toBe(shortKey("crit", "e".repeat(5000)));
 		expect(long).not.toBe(shortKey("crit", "f".repeat(5000)));
+	});
+});
+
+describe("Ops alerts", () => {
+	const healthy: NonNullable<Parameters<typeof opsEvents>[0]> = {
+		deadSignIns: [],
+		seedFailed: null,
+		alateProvisionError: null,
+	};
+	const failed = {
+		...healthy,
+		deadSignIns: [
+			{ provider: "anthropic", cause: "private diagnostic", roles: ["work"] },
+		],
+		seedFailed: { since: 123, commit: "abc", text: "private seed output" },
+		alateProvisionError: "private provision output",
+	};
+
+	test("sources share bell keys without a task or project identity", () => {
+		expect(opsEvents(failed)).toEqual([
+			{
+				key: "signin:anthropic",
+				class: "ops",
+				project: null,
+				taskId: null,
+				title: "Ottr",
+				body: "Sign in again to anthropic",
+				url: "/",
+				tag: "ops",
+			},
+			{
+				key: "seed-failed:123",
+				class: "ops",
+				project: null,
+				taskId: null,
+				title: "Ottr",
+				body: "Agent setup failed",
+				url: "/",
+				tag: "ops",
+			},
+			{
+				key: shortKey("provision-error", failed.alateProvisionError),
+				class: "ops",
+				project: null,
+				taskId: null,
+				title: "Ottr",
+				body: "Worker provisioning failed",
+				url: "/",
+				tag: "ops",
+			},
+		]);
+	});
+
+	test("null, healthy and hosted states expose no host faults", () => {
+		expect(opsEvents(null)).toEqual([]);
+		expect(opsEvents(healthy)).toEqual([]);
+		expect(opsEvents({ ...failed, hosted: true })).toEqual([]);
+	});
+
+	test("single payloads expose fixed descriptions and only bounded provider labels", () => {
+		for (const event of opsEvents(failed)) {
+			const [payload] = payloadsFor([event], zero);
+			expect(payload).toMatchObject({
+				title: "Ottr",
+				body: event.body,
+				tag: "ops",
+				url: "/",
+				keys: [event.key],
+			});
+			expect(payload?.body).not.toContain("private");
+		}
+		for (const provider of ["x".repeat(65), "provider\nprivate diagnostic"]) {
+			const events = opsEvents({
+				...healthy,
+				deadSignIns: [{ provider, cause: "private cause", roles: [] }],
+			});
+			expect(payloadsFor(events, zero)[0]?.body).toBe(
+				"A provider needs a new sign-in",
+			);
+		}
+		const error = "private provision output".repeat(100);
+		expect(opsEvents({ ...healthy, alateProvisionError: error })[0]?.key).toBe(
+			shortKey("provision-error", error),
+		);
+	});
+
+	test("Ops groups by its own tag and includes earlier live failures", () => {
+		const events = opsEvents(failed);
+		const [payload] = payloadsFor(events.slice(1), {
+			...zero,
+			ops: [events[0]!.key],
+		});
+		expect(payload).toEqual({
+			type: "alert",
+			title: "Ottr",
+			body: "3 operational issues need your attention",
+			tag: "ops",
+			url: "/",
+			keys: [events[1]!.key, events[2]!.key, events[0]!.key],
+			partial: false,
+			seq: 0,
+			clear: [],
+			upTo: {},
+		});
+	});
+
+	test("recovery, acknowledgement and changed episodes retract Ops without card lookup", () => {
+		const events = opsEvents(failed);
+		const registry: LiveAlert[] = events.map((e) => ({
+			...e,
+			sent: e.key,
+			to: ["dev"],
+		}));
+		const keys = new Set(events.map((e) => e.key));
+		expect(rekeyErrorAlerts(registry, [card("A")])).toEqual(registry);
+		expect(clearedAlerts(registry, [], new Set(), keys)).toEqual([]);
+		for (const recovered of events) {
+			const remaining = new Set(
+				events.filter((e) => e !== recovered).map((e) => e.key),
+			);
+			expect(clearedAlerts(registry, [], new Set(), remaining)).toEqual(
+				registry.filter((a) => a.key === recovered.key),
+			);
+		}
+		expect(
+			clearedAlerts(registry, [], new Set([events[0]!.key]), keys),
+		).toEqual([registry[0]!]);
+		const changed = opsEvents({
+			...failed,
+			deadSignIns: [],
+			seedFailed: { ...failed.seedFailed, since: 456 },
+			alateProvisionError: "a different provision failure",
+		});
+		expect(
+			clearedAlerts(
+				registry,
+				[],
+				new Set(),
+				new Set(changed.map((e) => e.key)),
+			),
+		).toEqual(registry);
+		expect(clearedAlerts(registry, [], new Set(), new Set())).toEqual(registry);
+		expect(tagsToClear(registry.slice(0, 1), registry.slice(1), "dev")).toEqual(
+			[],
+		);
+		expect(tagsToClear(registry, [], "dev")).toEqual(["ops"]);
+		expect(tagsToClear(registry, [], "other-device")).toEqual([]);
+	});
+
+	test("board events ignore project mutes but obey the Ops switch", () => {
+		const event = opsEvents(failed)[0]!;
+		const muted = new Set(["ottr", "null", ""]);
+		expect(deliverable(ALL_CLASSES_ON, muted, event)).toBe(true);
+		expect(deliverable({ ...ALL_CLASSES_ON, ops: false }, muted, event)).toBe(
+			false,
+		);
 	});
 });

@@ -59,16 +59,21 @@ export async function loadSubs(store: GlobalStore): Promise<PushSub[]> {
 	return subs;
 }
 
-/** A stored classes field counts only when every class is a boolean; anything else is legacy/corrupt and reads as all on. */
+/** Missing Ops defaults on for legacy classes. Other malformed fields retain the all-on fallback. */
 function parseClasses(raw: unknown): ClassPrefs {
 	if (typeof raw !== "object" || raw === null) return { ...ALL_CLASSES_ON };
 	const rec = raw as Record<string, unknown>;
-	if (!ALERT_CLASSES.every((c) => typeof rec[c] === "boolean"))
+	if (
+		!ALERT_CLASSES.every(
+			(c) => (c === "ops" && !("ops" in rec)) || typeof rec[c] === "boolean",
+		)
+	)
 		return { ...ALL_CLASSES_ON };
 	return {
 		request: rec.request as boolean,
 		error: rec.error as boolean,
 		complete: rec.complete as boolean,
+		ops: "ops" in rec ? (rec.ops as boolean) : true,
 	};
 }
 

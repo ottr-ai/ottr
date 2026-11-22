@@ -6,16 +6,47 @@ The server decides which events reach the operating system. Web Push is the only
 
 - **Request**: a card enters needs you, or asks a new round of questions.
 - **Error**: a turn fails, by the runner's own rule: it exits badly, unless it reported a finished outcome (ready, answered, integrated). A needs-you report followed by a crash still fails. A clean needs-you report stores its hold reason in the same field, and that hold is a Request. A turn ended by a deliberate cancel is no error. If the card then needs you on that same failed turn, in the same frame or a later one, the Error is the only alert; once the card waits, the Error takes the needs-you entry's key, so acknowledging or answering that entry retracts it. Acknowledging that entry also acknowledges the Error's original key, so a delayed copy of the Error push never shows.
-- **Complete**: a card enters Done, or a question-only card reports its answer.
+- **Complete**: a task enters Done, a question-only card reports its answer, or an automatic PR review completes. Push delivery uses a fixed 10-minute digest.
+- **Ops**: a provider appears in `deadSignIns`, an agent-layer seed fails, or Alate provisioning reports an error. These board faults use immediate delivery.
 
 A card produces at most one event per state frame. Error wins over Request, and Request wins over Complete. A new card only alerts when it arrives in needs you or with a failed turn. A class has one notification per device: when it stands for more than one unread alert, it shows the count of them all ("3 tasks need your attention"). The payload names at most 20 of their keys (`partial` marks a larger group), so a push stays far below Web Push's ~4 KB budget; whether a payload is still unread is decided by the server, not by these keys (see Retraction).
 
+### Completion digest
+
+The first eligible Complete event starts a 10-minute window for the board. Later events join that window without changing its deadline.
+The bell and task read markers remain immediate. Request, Error, and Ops do not wait for the digest.
+
+The server stores the deadline, events, and eligible devices across restart. A new subscription receives no older events.
+The deadline runs without an open tab or another state change. After restart, an overdue digest becomes eligible after source validation.
+Before delivery, the server checks current preferences, project mutes, acknowledgements, and source state.
+It excludes cancelled, reopened, acknowledged, superseded, or removed sources. It reads the project store for cards outside the Done window.
+A source read failure retains the pending batch and reports the error.
+
+If a board tab has recent focus at the deadline, the server suppresses the digest. It does not postpone it.
+An empty digest sends nothing. A consumed digest does not repeat after restart.
+Delivery retains the existing at-most-once attempt policy. A crash after consumption but before delivery can lose an attempt.
+
+### Ops catalogue
+
+| Fault | Shared occurrence key | Recovery |
+| --- | --- | --- |
+| Provider sign-in failure | `signin:<provider>` | The provider leaves `deadSignIns`. |
+| Agent-layer seed failure | `seed-failed:<since>` | The failure clears or its episode changes. |
+| Alate provisioning error | `shortKey("provision-error", error)` | Provision succeeds, the pending import clears, or the error changes. |
+
+The bell keeps each existing fault row, its details, and its recovery action. Each row counts once as action-required.
+The bell and push use the same key. A row click or "Mark all as read" acknowledges it across devices.
+Acknowledgement or recovery retracts the alert. A new failure after recovery can alert again, even with the same key.
+Repeated state frames and server restart do not replay existing faults.
+Hosted tenants do not receive these host faults. Project mutes do not affect Ops because the faults belong to the board.
+Push bodies use fixed descriptions, not raw diagnostic errors or credentials.
+
 ## What never pushes
 
-- Notices: updates, drain, behind, orphans, kept, alate pending, sign-in advisories. They stay in the bell; upstream updates no longer push.
+- Notices: updates, drain, behind, orphans, kept worktrees, and pending Alate imports. They stay in the bell.
 - The browser-local critical entry.
 - Retro cards and cancelled cards. Cancelling a card retracts its live alerts.
-- The first frame after the server starts.
+- Existing faults and card states on the first frame after the server starts. Pending digests retain their deadlines.
 - Any event while a board tab is focused. The event is dropped, not sent later; it still sits in the bell.
 
 The GitHub token expiry reminder (once a day, 30 days before expiry and through the last two weeks) follows the same rules: it goes to devices with Request on, never while a board tab is focused, and a held reminder leaves its day open so the next daily check tries again. Project mutes do not apply; the token belongs to the board.
@@ -24,10 +55,10 @@ The GitHub token expiry reminder (once a day, 30 days before expiry and through 
 
 Preferences live in the global store (`tracker.db`):
 
-- `push_subs`: each subscription carries `classes`, the Request, Error and Complete switches for that device. A subscription without them gets all three on.
+- `push_subs`: each subscription carries `classes`, the Request, Error, Complete, and Ops switches for that device. A subscription without preferences gets all four enabled. When legacy preferences lack Ops, Ops starts enabled and the other switches keep their saved values.
 - `notify_muted_projects`: projects that never push, on any device. The bell still lights for them.
 - `inbox_seen`: acknowledged bell entry keys, shared by every device.
-- `notify_live_alerts`: alerts pushed and not yet retracted, plus retractions waiting for an Apple device. A restart keeps them, so the first frame after boot retracts what resolved while the board was down, and later acknowledgements still retract older alerts.
+- `notify_live_alerts`: live alerts, pending Apple retractions, sequence numbers, and the pending completion digest. A restart preserves the deadline and recipients. It also preserves the information needed to retract resolved or acknowledged alerts.
 
 Set them under **Settings → Notifications**. OS notifications need HTTPS, for example `tailscale serve`.
 

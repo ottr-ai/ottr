@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlobalStore } from "./globalStore.ts";
 import { ALL_CLASSES_ON } from "./notifications.ts";
+import fc from "./test/properties.ts";
 import {
 	loadSubs,
 	PUSH_SUBJECT,
@@ -106,7 +107,12 @@ describe("saveSubs/loadSubs", () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
 		pushRoots.push(root);
 		const store = await GlobalStore.open(root);
-		const classes = { request: false, error: true, complete: false };
+		const classes = {
+			request: false,
+			error: true,
+			complete: false,
+			ops: false,
+		};
 		await saveSubs(store, [
 			{
 				endpoint: "https://x/1",
@@ -117,6 +123,103 @@ describe("saveSubs/loadSubs", () => {
 		]);
 		expect((await loadSubs(store))[0]?.classes).toEqual(classes);
 		await store.close();
+	});
+
+	test("legacy false switches remain false while Ops defaults on", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
+		const store = await GlobalStore.open(root);
+		try {
+			await store.set("push_subs", [
+				{
+					endpoint: "https://x/legacy",
+					keys: { p256dh: "p", auth: "a" },
+					addedAt: 1,
+					classes: { request: false, error: false, complete: false },
+				},
+			]);
+			expect((await loadSubs(store))[0]?.classes).toEqual({
+				request: false,
+				error: false,
+				complete: false,
+				ops: true,
+			});
+		} finally {
+			await store.close();
+		}
+	});
+
+	test("persisted classes preserve booleans and normalize idempotently", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
+		const store = await GlobalStore.open(root);
+		try {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.record({
+						request: fc.boolean(),
+						error: fc.boolean(),
+						complete: fc.boolean(),
+					}),
+					fc.option(fc.boolean(), { nil: undefined }),
+					async (legacy, ops) => {
+						const classes = ops === undefined ? legacy : { ...legacy, ops };
+						await store.set("push_subs", [
+							{
+								endpoint: "https://x/property",
+								keys: { p256dh: "p", auth: "a" },
+								addedAt: 1,
+								classes,
+							},
+						]);
+						const loaded = await loadSubs(store);
+						expect(loaded[0]?.classes).toEqual({ ...legacy, ops: ops ?? true });
+						await saveSubs(store, loaded);
+						expect(await loadSubs(store)).toEqual(loaded);
+					},
+				),
+			);
+		} finally {
+			await store.close();
+		}
+	});
+
+	test("malformed persisted switches retain the existing all-on fallback", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
+		pushRoots.push(root);
+		const store = await GlobalStore.open(root);
+		try {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.constantFrom("request", "error", "complete", "ops"),
+					fc.oneof(
+						fc.string(),
+						fc.integer(),
+						fc.constant(null),
+						fc.array(fc.integer()),
+					),
+					async (field, value) => {
+						const classes = {
+							request: false,
+							error: false,
+							complete: false,
+							ops: false,
+							[field]: value,
+						};
+						await store.set("push_subs", [
+							{
+								endpoint: "https://x/malformed",
+								keys: { p256dh: "p", auth: "a" },
+								classes,
+							},
+						]);
+						expect((await loadSubs(store))[0]?.classes).toEqual(ALL_CLASSES_ON);
+					},
+				),
+			);
+		} finally {
+			await store.close();
+		}
 	});
 	test("vapidPublicKey round-trips; subs without one stay without", async () => {
 		const root = mkdtempSync(join(tmpdir(), "ottr-push-"));
@@ -269,14 +372,19 @@ describe("pruneSubs", () => {
 				updateSubs(store, (current) =>
 					current.map((entry) => ({
 						...entry,
-						classes: { request: false, error: true, complete: false },
+						classes: {
+							request: false,
+							error: true,
+							complete: false,
+							ops: true,
+						},
 					})),
 				),
 			]);
 			expect(await loadSubs(store)).toEqual([
 				{
 					...sub(2),
-					classes: { request: false, error: true, complete: false },
+					classes: { request: false, error: true, complete: false, ops: true },
 				},
 			]);
 		} finally {
@@ -349,7 +457,7 @@ describe("pruneSubs", () => {
 			const attempted = [sub(1)];
 			const changed = {
 				...sub(1),
-				classes: { request: false, error: true, complete: true },
+				classes: { request: false, error: true, complete: true, ops: true },
 			};
 			await updateSubs(store, (current) =>
 				current.map((entry) =>

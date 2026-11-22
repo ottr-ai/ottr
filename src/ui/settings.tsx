@@ -1468,7 +1468,16 @@ const CLASS_ROWS: readonly { cls: AlertClass; name: string; desc: string }[] = [
 		desc: "A task needs you or asks a question",
 	},
 	{ cls: "error", name: "Error", desc: "A turn failed" },
-	{ cls: "complete", name: "Complete", desc: "A task finished or answered" },
+	{
+		cls: "complete",
+		name: "Complete",
+		desc: "Finished tasks and answers, batched for 10 minutes",
+	},
+	{
+		cls: "ops",
+		name: "Ops",
+		desc: "Provider sign-in, agent-layer seed, and provisioning failures",
+	},
 ];
 
 /** Settings "Notifications" section: Web Push opt-in for this device, which alert classes it

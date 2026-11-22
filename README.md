@@ -122,7 +122,7 @@ See the [service quota specification](docs/specs/service-quotas.md) for the inte
 - [Development](docs/development.md): the checks, the tests, CI, UI development, and the screenshot proofs.
 - [How Ottr works](docs/how-it-works.md): the architecture, the path of a task, and the task life cycle, with Mermaid diagrams.
 - [docs/specs/task-lifecycle.md](docs/specs/task-lifecycle.md): current task stages, states, cancellation latch, transitions, and writer guards.
-- [docs/notifications.md](docs/notifications.md): the notification model, with alert classes, per-device settings, project mutes, presence and retraction.
+- [docs/notifications.md](docs/notifications.md): the four alert classes, the 10-minute completion digest, device settings, project mutes, presence and retraction.
 - [docs/WORKERS.md](docs/WORKERS.md): the Docker Compose stack, with its topology, updates, env settings and fleet memory.
 - [docs/OPERATIONS.md](docs/OPERATIONS.md): how to run one host, what "board up" means, the board-down runbook, restore, and the incident template.
 - [docs/ARCH-REVIEWS.md](docs/ARCH-REVIEWS.md): the **Review due** feature.

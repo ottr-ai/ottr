@@ -4428,7 +4428,7 @@ describe("NotificationsSection", () => {
 				if (u === "/api/push/subscribe") return Response.json({ ok: true });
 				return Response.json({
 					classes: u.includes("endpoint=")
-						? { request: true, error: true, complete: false }
+						? { request: true, error: true, complete: false, ops: true }
 						: null,
 					mutedProjects: [],
 				});
@@ -4464,10 +4464,13 @@ describe("NotificationsSection", () => {
 			expect(subscribe).toBeGreaterThanOrEqual(0);
 			expect(prefs).toBeGreaterThan(subscribe);
 			// The event switches render with the device's saved values.
-			const labels = [...container.querySelectorAll("label")].map(
-				(l) => l.textContent,
-			);
-			expect(labels).toEqual(["Request", "Error", "Complete"]);
+			expect(
+				[
+					...container.querySelectorAll<HTMLInputElement>(
+						'input[type="checkbox"]',
+					),
+				].map((input) => input.checked),
+			).toEqual([true, true, false, true]);
 		} finally {
 			await unmount();
 			fetchRestore();
@@ -4675,7 +4678,7 @@ describe("NotificationsSection stale push recovery", () => {
 		// from this map, so a test sees exactly what a real server would hold. Only
 		// the old fixture row exists; a fresh or queued endpoint has none until the
 		// subscribe POST creates it (its prefs GET 404s until then).
-		const ALL_ON = { request: true, error: true, complete: true };
+		const ALL_ON = { request: true, error: true, complete: true, ops: true };
 		const rows = new Map<string, Record<string, boolean>>([
 			[
 				"https://push.example.com/old",
@@ -4683,6 +4686,7 @@ describe("NotificationsSection stale push recovery", () => {
 					request: true,
 					error: false,
 					complete: true,
+					ops: true,
 				},
 			],
 		]);
@@ -4925,15 +4929,47 @@ describe("NotificationsSection stale push recovery", () => {
 			expect(probe.prefsReads.filter((r) => r.endpoint !== null)).toEqual([
 				{
 					endpoint: "https://push.example.com/old",
-					classes: { request: true, error: false, complete: true },
+					classes: { request: true, error: false, complete: true, ops: true },
 				},
 			]);
 			const node = probe.containerNode();
 			expect(switchOf(node, "Request")?.checked).toBe(true);
 			expect(switchOf(node, "Error")?.checked).toBe(false);
 			expect(switchOf(node, "Complete")?.checked).toBe(true);
+			expect(switchOf(node, "Ops")?.checked).toBe(true);
+			expect(probe.containerText()).toContain("batched for 10 minutes");
 			expect(probe.containerText()).toContain("Turn off");
 			expect(probe.requestPermissionCalls()).toBe(0);
+		});
+	});
+
+	test("Ops saves only this device's flag and preserves other classes", async () => {
+		await withPushBrowser(async (probe) => {
+			const ops = switchOf(probe.containerNode(), "Ops");
+			expect(ops).toBeDefined();
+			await act(async () => {
+				onChangeOf(ops!)({ target: { checked: false } });
+			});
+			expect(
+				probe.posts.filter((p) => p.url === "/api/notifications/prefs"),
+			).toEqual([
+				{
+					url: "/api/notifications/prefs",
+					body: {
+						endpoint: "https://push.example.com/old",
+						classes: {
+							request: true,
+							error: false,
+							complete: true,
+							ops: false,
+						},
+					},
+				},
+			]);
+			expect(switchOf(probe.containerNode(), "Ops")?.checked).toBe(false);
+			expect(switchOf(probe.containerNode(), "Request")?.checked).toBe(true);
+			expect(switchOf(probe.containerNode(), "Error")?.checked).toBe(false);
+			expect(switchOf(probe.containerNode(), "Complete")?.checked).toBe(true);
 		});
 	});
 
@@ -4998,7 +5034,7 @@ describe("NotificationsSection stale push recovery", () => {
 	});
 
 	test("a queued record folds the carried classes into the register on the next load", async () => {
-		const classes = { request: true, error: false, complete: true };
+		const classes = { request: true, error: false, complete: true, ops: true };
 		await withPushBrowser(
 			async (probe) => {
 				// The queued classes ride inside the register body: one atomic call
@@ -5061,7 +5097,7 @@ describe("NotificationsSection stale push recovery", () => {
 				seedPending: {
 					subscription: { endpoint: "https://push.example.com/new" },
 					oldEndpoint: "https://push.example.com/old",
-					classes: { request: true, error: false, complete: true },
+					classes: { request: true, error: false, complete: true, ops: true },
 				},
 			},
 		);
