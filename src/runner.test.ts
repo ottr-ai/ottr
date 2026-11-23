@@ -64,6 +64,8 @@ import type {
 } from "./types.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
+	lineDropNotice,
+	MAX_STREAM_LINE_CHARS,
 	serveWorker,
 	type VmOutcome,
 	WORKER_DONE,
@@ -7064,4 +7066,29 @@ test("withoutGitAuth strips the repo-relocating vars and keeps git auth (OTTR-11
 	expect(env.GIT_COMMON_DIR).toBeUndefined();
 	// GH_TOKEN is not in the stripped set: a merge turn keeps it for its push.
 	expect(env.GH_TOKEN).toBe("ghp_aaaaaaaaaaaaaaaaaaaa");
+});
+
+describe("createRunSink stream line cap", () => {
+	test("a newline-free stdout chunk over the cap logs the notice instead of buffering, and the next event still lands", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-sink-cap-"));
+		try {
+			const sink = createRunSink({
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+			});
+			sink.stdout("a".repeat(MAX_STREAM_LINE_CHARS + 1024));
+			// The dropped line must end with its own newline before the next line: the
+			// reader skips everything up to that newline as the dropped remainder.
+			sink.stdout("\n");
+			sink.stdout('{"type":"session","id":"cap-sess"}\n');
+			await sink.drain();
+			sink.flush();
+			const logText = readFileSync(join(dir, "run.log"), "utf8");
+			expect(logText).toContain(`${lineDropNotice()}\n`);
+			expect(logText).not.toContain("aaaa");
+			expect(sink.state.sessionId).toBe("cap-sess");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });

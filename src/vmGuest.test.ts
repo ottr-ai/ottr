@@ -18,7 +18,12 @@ import { aptListPath } from "./apt.ts";
 import { requirementsListPath } from "./python.ts";
 import { buildToolsPath, parseToolsJson, toolsListPath } from "./tools.ts";
 import { type GuestOptions, serveGuest } from "./vmGuest.ts";
-import { type VmOutcome, WORKER_DONE } from "./workers.ts";
+import {
+	lineDropNotice,
+	MAX_STREAM_LINE_CHARS,
+	type VmOutcome,
+	WORKER_DONE,
+} from "./workers.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "ottr-vmguest-"));
 const TOKEN = "guest-sekrit";
@@ -929,4 +934,37 @@ describe("POST /shutdown", () => {
 		// Only this test drives requests, so one POST can fire the seam once.
 		expect(exits).toBe(1);
 	});
+});
+
+describe("stream line cap", () => {
+	// Fake omp: floods stdout with a newline-free line over MAX_STREAM_LINE_CHARS,
+	// then ends it and prints a normal event line. Validation #OTTR-1231 killed the
+	// guest at this shape with the unfixed accumulate-and-rescan reader.
+	const floodPath = join(dir, "flood-omp.js");
+	writeFileSync(
+		floodPath,
+		`const chunk = "a".repeat(64 * 1024);
+for (let i = 0; i < 80; i++) process.stdout.write(chunk);
+process.stdout.write("\\n");
+process.stdout.write('{"type":"after-flood"}\\n');`,
+	);
+
+	test("a newline-free stdout line over the cap settles with a drop notice, keeps the next line, and holds reader memory", async () => {
+		const url = start();
+		const bare = makeRemote("work");
+		const rssBefore = process.memoryUsage.rss();
+		const { lines, done } = await runTurn(url, {
+			gitUrl: bare,
+			branch: "work",
+			argv: [floodPath],
+		});
+		expect(done.exitCode).toBe(0);
+		expect(lines).toContain(lineDropNotice());
+		expect(lines).toContain('{"type":"after-flood"}');
+		expect(lines.some((l) => l.startsWith("a"))).toBe(false);
+		// The reader must not have buffered the line: growth stays under the cap plus
+		// a margin (mirrors the worker stream cap test in workers.test.ts).
+		const growth = process.memoryUsage.rss() - rssBefore;
+		expect(growth).toBeLessThan(MAX_STREAM_LINE_CHARS + 48 * 1024 * 1024);
+	}, 60_000);
 });

@@ -22,7 +22,15 @@ import {
 	requirementsListPath,
 } from "./python.ts";
 import { ensureProjectTools, parseToolsJson, toolsListPath } from "./tools.ts";
-import { type ProvisionLists, type VmOutcome, WORKER_DONE } from "./workers.ts";
+import {
+	feedCappedLines,
+	flushCappedLines,
+	type LineCapState,
+	lineDropNotice,
+	type ProvisionLists,
+	type VmOutcome,
+	WORKER_DONE,
+} from "./workers.ts";
 
 /**
  * The guest agent: the one process a microVM runs after its init (docker/ottr-vm-init). vm-runner
@@ -518,15 +526,14 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 				spawned.stderr?.on("data", (chunk: Buffer) => {
 					stderrTail = tail(`${stderrTail}${chunk.toString("utf8")}`);
 				});
-				let partial = "";
+				const cap: LineCapState = { partial: "", dropping: false };
 				spawned.stdout?.on("data", (chunk: Buffer) => {
-					partial += chunk.toString("utf8");
-					let idx = partial.indexOf("\n");
-					while (idx >= 0) {
-						push(partial.slice(0, idx + 1));
-						partial = partial.slice(idx + 1);
-						idx = partial.indexOf("\n");
-					}
+					feedCappedLines(
+						cap,
+						chunk.toString("utf8"),
+						(line) => push(`${line}\n`),
+						() => push(`${lineDropNotice()}\n`),
+					);
 				});
 				// omp may die before reading stdin; a bare write would then crash the guest.
 				spawned.stdin?.on("error", () => {});
@@ -538,7 +545,7 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 					ended.resolve(1);
 				});
 				spawned.on("close", (code) => {
-					if (partial.length > 0) push(`${partial}\n`);
+					flushCappedLines(cap, (line) => push(`${line}\n`));
 					ended.resolve(code);
 				});
 				exitCode = await ended.promise;

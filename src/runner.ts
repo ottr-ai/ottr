@@ -70,7 +70,15 @@ import type {
 import { askQuestions, OUTCOME_STATUSES } from "./types.ts";
 import { memoryGrant, type VmGrant, type VmTokens } from "./vmTokens.ts";
 import type { VmSpec, WorkerRequest, WorkerTarget } from "./workers.ts";
-import { runWorker, WorkerBusyError, WorkerConnectError } from "./workers.ts";
+import {
+	feedCappedLines,
+	flushCappedLines,
+	type LineCapState,
+	lineDropNotice,
+	runWorker,
+	WorkerBusyError,
+	WorkerConnectError,
+} from "./workers.ts";
 import {
 	GIT_AUTH_ENV_NAME,
 	gitSecrets,
@@ -1553,33 +1561,31 @@ export function createRunSink(o: {
 	const handleLine = (raw: string): void =>
 		handleEventLine(raw, o, es, log, notify);
 
-	let partial = "";
-	let stderrPartial = "";
+	const stdoutCap: LineCapState = { partial: "", dropping: false };
+	const stderrCap: LineCapState = { partial: "", dropping: false };
 	return {
 		state: es,
 		drain,
 		line: handleLine,
 		stdout: (text) => {
-			partial += text;
-			let idx = partial.indexOf("\n");
-			while (idx >= 0) {
-				const line = partial.slice(0, idx);
-				partial = partial.slice(idx + 1);
-				handleLine(line);
-				idx = partial.indexOf("\n");
-			}
+			// A drop notice is plain text, so handleEventLine logs it on the same
+			// JSON-parse-failure path any non-JSON line takes.
+			feedCappedLines(stdoutCap, text, handleLine, () =>
+				handleLine(lineDropNotice()),
+			);
 		},
 		stderr: (text) => {
 			stderrTail = `${stderrTail}${text}`.replace(/\r\n/g, "\n").slice(-4000);
 			// Whole lines only: a chunk boundary inside a line must not split a token with "! ".
-			stderrPartial += text;
-			let idx = stderrPartial.indexOf("\n");
-			while (idx >= 0) {
-				const l = stderrPartial.slice(0, idx).replace(/\r$/, "");
-				stderrPartial = stderrPartial.slice(idx + 1);
-				if (l.trim()) log.write(`! ${l}\n`);
-				idx = stderrPartial.indexOf("\n");
-			}
+			feedCappedLines(
+				stderrCap,
+				text,
+				(l) => {
+					const t = l.replace(/\r$/, "");
+					if (t.trim()) log.write(`! ${t}\n`);
+				},
+				() => log.write(`! ${lineDropNotice()}\n`),
+			);
 		},
 		childError: (message) => {
 			log.write(`! ${message}\n`);
@@ -1590,11 +1596,10 @@ export function createRunSink(o: {
 		stderrLine: (line) => log.write(`! ${line}\n`),
 		logMark: log.write,
 		flush: () => {
-			if (partial.trim()) handleLine(partial);
-			partial = "";
-			if (stderrPartial.trim())
-				log.write(`! ${stderrPartial.replace(/\r$/, "")}\n`);
-			stderrPartial = "";
+			flushCappedLines(stdoutCap, handleLine);
+			flushCappedLines(stderrCap, (l) =>
+				log.write(`! ${l.replace(/\r$/, "")}\n`),
+			);
 			log.flush();
 		},
 		tail: () => redact(stderrTail, liveSecrets()),

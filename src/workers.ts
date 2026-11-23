@@ -923,6 +923,82 @@ function runChildEnv(
 	return env;
 }
 
+/** Memory bound for one accumulated stream line (worker daemon stdout, the board's
+ * worker stream reader, the VM relay). Counted in UTF-16 characters of the decoded
+ * text (within 2x of the wire bytes for any input), far above any real event line.
+ * A newline-free line over this size is dropped with a notice line instead of
+ * growing the reader's buffer: validation #OTTR-1231 OOM-killed a 512 MiB job at a
+ * 128 MiB newline-free line, with superlinear CPU from the rescan-from-offset-zero
+ * search (OTTR-1035). */
+export const MAX_STREAM_LINE_CHARS = 4 * 1024 * 1024;
+
+/** The plain-text loss notice feedCappedLines emits once per dropped oversized
+ * line. Not JSON: every sink logs it verbatim into the run log. */
+export const lineDropNotice = (): string =>
+	`[ottr] dropped a stream line over ${MAX_STREAM_LINE_CHARS} characters; the rest of the line is skipped`;
+
+/** Line-splitting state of one stream: the unterminated tail, bounded by
+ * MAX_STREAM_LINE_CHARS, and whether the reader is inside a dropped oversized line. */
+export interface LineCapState {
+	partial: string;
+	dropping: boolean;
+}
+
+/** Feeds one decoded chunk through `line` a full line at a time, with a per-line cap.
+ * The newline search runs over the new chunk only, never a rescan of the accumulated
+ * tail. A line whose accumulation would pass MAX_STREAM_LINE_CHARS is dropped: the
+ * tail is discarded, `dropped` fires once, the rest of that line is skipped up to its
+ * newline (in this chunk or a later one), and following lines are kept. Every stdout
+ * and event stream reader feeds through this, so one oversized line can neither grow
+ * memory without bound nor pay a full-buffer rescan per chunk (OTTR-1035). */
+export function feedCappedLines(
+	cap: LineCapState,
+	chunk: string,
+	line: (text: string) => void,
+	dropped: () => void,
+): void {
+	let start = 0;
+	for (;;) {
+		const end = chunk.indexOf("\n", start);
+		if (end === -1) break;
+		const seg = chunk.slice(start, end);
+		if (cap.dropping)
+			cap.dropping = false; // the dropped line ends here; keep the next
+		else if (cap.partial.length + seg.length > MAX_STREAM_LINE_CHARS) {
+			// This line completes over the cap inside one chunk: drop it whole. The
+			// newline already ended it, so no skip mode is needed for the rest.
+			cap.partial = "";
+			dropped();
+		} else {
+			line(cap.partial ? cap.partial + seg : seg);
+			cap.partial = "";
+		}
+		start = end + 1;
+	}
+	const rest = start === 0 ? chunk : chunk.slice(start);
+	if (!rest || cap.dropping) return;
+	if (cap.partial.length + rest.length > MAX_STREAM_LINE_CHARS) {
+		cap.partial = "";
+		cap.dropping = true;
+		dropped();
+		return;
+	}
+	cap.partial += rest;
+}
+
+/** End-of-stream flush for feedCappedLines: emits the bounded unterminated tail as
+ * the last line. A dropped line has no tail and no second notice; its notice fired
+ * at the drop. */
+export function flushCappedLines(
+	cap: LineCapState,
+	line: (text: string) => void,
+): void {
+	if (cap.partial.length > 0) {
+		line(cap.partial);
+		cap.partial = "";
+	}
+}
+
 /** Mutable state of one /run: the stream's closed flag, the stryker watch stopper, omp's
  * unterminated stdout tail, and the reserved stderr tail. */
 interface RunStreamState {
