@@ -3,7 +3,8 @@
 // host and reads the two write signals the GitHub API offers: `permissions.push` in the
 // body (fine-grained tokens, which send no scopes header) and the `x-oauth-scopes`
 // response header (classic tokens, where any scope outside the read-only set grants
-// write). The check fails closed: an unknown scope counts write-capable, a rejected or
+// write), read on every response because the header describes the token, not the repo.
+// The check fails closed: an unknown scope counts write-capable, a rejected or
 // unreachable check counts as error, and any error outranks every write signal.
 
 const READ_ONLY_SCOPE = /^(read:|user(:|$)|gist|notifications)/;
@@ -67,7 +68,16 @@ async function checkRepo(
 			detail: `${repo}: token rejected (HTTP ${res.status})`,
 		};
 	}
-	// The token cannot read the repo: it proves nothing about write access either.
+	// The scopes header describes the token, not the repo: read it on every
+	// answer. A 404 still names a classic token's write scopes.
+	const bad = writeScopes(res.headers.get("x-oauth-scopes"));
+	if (bad.length > 0) {
+		return {
+			kind: "write",
+			detail: `${repo}: write-capable scopes (${bad.join(", ")})`,
+		};
+	}
+	// Without the header, an unreadable repo proves nothing about write access.
 	if (res.status === 404) return { kind: "none" };
 	if (res.status !== 200) {
 		return { kind: "error", detail: `${repo}: unexpected HTTP ${res.status}` };
@@ -81,7 +91,6 @@ async function checkRepo(
 	const push =
 		(body as { permissions?: { push?: unknown } } | null)?.permissions?.push ===
 		true;
-	const bad = writeScopes(res.headers.get("x-oauth-scopes"));
 	if (push) {
 		return { kind: "write", detail: `${repo}: token has push permission` };
 	}

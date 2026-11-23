@@ -136,13 +136,19 @@ export async function checkTurnToken(o: {
 
 - One `GET <apiBase>/repos/<owner>/<repo>` per repo, headers `Authorization: Bearer <token>`,
   `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`.
-- Response 200: `permissions.push === true` in the body marks write-capable. The
-  `x-oauth-scopes` response header, when present and non-empty, lists classic scopes; a
-  scope counts read-only only when it matches `^(read:|user(:|$)|gist|notifications)` —
+- The `x-oauth-scopes` response header, when present and non-empty, lists classic scopes;
+  a scope counts read-only only when it matches `^(read:|user(:|$)|gist|notifications)` —
   every other scope (`repo`, `public_repo`, `workflow`, `delete_repo`, `admin:*`,
-  `write:*`, `delete:*`, unknown names) counts write-capable.
-- Response 401 or 403: `error` ("token rejected"). 404: the token cannot read the repo;
-  the repo adds no signal. Any other status, a malformed body, or a thrown fetch: `error`.
+  `write:*`, `delete:*`, unknown names) counts write-capable. The header describes the
+  token, not the repo, so the check reads it on every response before the status
+  dispatch: a write-capable scope on any answer — a 404 included, where a classic token
+  without the `repo` scope cannot read a private project repo — marks the token
+  write-capable. Whether the live API sends the header on a 404 is unverified (Risks);
+  reading it when present is safe in both cases.
+- Response 200: `permissions.push === true` in the body marks write-capable.
+- Response 401 or 403: `error` ("token rejected"). 404 with no write-capable scope: the
+  token cannot read the repo; the repo adds no signal. Any other status, a malformed
+  body, or a thrown fetch: `error`.
 - Precedence over the whole check: any `error` signal wins, then any write signal, else
   `ok`. Duplicate repos are checked once.
 
@@ -196,6 +202,8 @@ as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`.
   tests).
 - The checker asserts the exact method and URL (`GET <apiBase>/repos/<owner>/<repo>`,
   injected fetch, tests) and classifies scopes and `permissions.push` signals (tests).
+- A 404 answer that carries write-capable `x-oauth-scopes` marks the token write-capable;
+  a 404 without the header, or with read-only scopes only, adds no signal (tests).
 - A write-capable token is stored with `status: "write"`, is not served, and the confirm
   action enables serving; an `error` status is not served until a re-check passes (tests).
 - An scp-style ssh origin (`git@host:owner/repo.git`) on the configured host is checked
@@ -224,6 +232,13 @@ as `GH_HOST` plus `GH_ENTERPRISE_TOKEN`.
 - A classic token with the `repo` scope and zero project repos on the host checks as `ok`
   (no API call observes the scope). Mitigation: the UI help text names it; a re-check after
   adding projects closes the gap.
+- A classic token whose every project repo on the host answers 404 (the repos are private
+  and the token cannot read them) was served when the 404 answers carry no scopes header:
+  the check then sees no API answer that observes the scope, the same accepted limit as
+  the zero-repo case, and a re-check repeats the same 404s. When a 404 does carry the
+  header, the check reads it and answers `write`. Whether the live api.github.com (and an
+  Enterprise host) sends the header there is unverified; a one-request probe with a
+  throwaway classic token that lacks the `repo` scope settles it.
 - A write-capable token the user confirmed rides in worker/VM turns; the strips keep it
   out of every other turn env source, but the turn process itself can read it. That is the
   accepted trade of this feature; the warning flow exists to keep it rare and explicit.
