@@ -27,6 +27,10 @@ export interface VmRunnerEnv {
 	vcpus: number;
 	memMiB: number;
 	diskBytes: number;
+	/** OTTR_VM_COPY_OUT_MAX_FILE: per-member copy-out write budget. */
+	copyOutMaxFileBytes: number;
+	/** OTTR_VM_COPY_OUT_MAX_TOTAL: whole-transfer copy-out write budget. */
+	copyOutMaxTotalBytes: number;
 	stateDir: string;
 	kernel: string;
 	firecracker: string;
@@ -62,6 +66,8 @@ export function readVmRunnerEnv(
 		vcpus: count("OTTR_VM_VCPUS", 2),
 		memMiB: Math.floor(memBytes / 1024 ** 2),
 		diskBytes: size("OTTR_VM_DISK", "20g"),
+		copyOutMaxFileBytes: size("OTTR_VM_COPY_OUT_MAX_FILE", "256m"),
+		copyOutMaxTotalBytes: size("OTTR_VM_COPY_OUT_MAX_TOTAL", "1g"),
 		stateDir: env.OTTR_VM_STATE_DIR || "/var/lib/ottr-vm",
 		kernel: env.OTTR_VM_KERNEL || "/opt/ottr-vm/vmlinux",
 		firecracker: env.OTTR_VM_FIRECRACKER || "/usr/local/bin/firecracker",

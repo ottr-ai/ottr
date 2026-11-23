@@ -1054,6 +1054,8 @@ Runner env (on the `vm-runner` service), with defaults:
 | `OTTR_VM_VCPUS` | `2` | vCPUs per VM |
 | `OTTR_VM_MEM` | `8g` | guest RAM per VM (`8g`, `8192m` or bytes) |
 | `OTTR_VM_DISK` | `20g` | size of each VM's scratch disk, the turn's whole writable space |
+| `OTTR_VM_COPY_OUT_MAX_FILE` | `256m` | copy-out budget per file; a bigger changed file is refused |
+| `OTTR_VM_COPY_OUT_MAX_TOTAL` | `1g` | copy-out budget for one transfer; crossing it fails that copy-out |
 | `OTTR_VM_STATE_DIR` | `/var/lib/ottr-vm` | rootfs cache, project layers and scratch disks |
 | `OTTR_VM_KERNEL` | `/opt/ottr-vm/vmlinux` | guest kernel |
 | `OTTR_VM_FIRECRACKER` | `/usr/local/bin/firecracker` | Firecracker binary |

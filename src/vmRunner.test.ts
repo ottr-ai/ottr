@@ -2034,6 +2034,87 @@ describe("tar", () => {
 		bytes[0] = bytes[0]! ^ 0xff;
 		await expect(members(bytes)).rejects.toThrow("checksum");
 	});
+
+	test("readTar refuses a pax payload above the metadata cap before buffering it", async () => {
+		// A pax header whose declared payload is 150 MiB, served by the stream in
+		// 1 MiB chunks on demand like the guest's response body: the cap must throw
+		// long before those bytes exist on the host.
+		const size = 150 * 1024 * 1024;
+		const h = new Uint8Array(512);
+		const put = (off: number, s: string): void => h.set(enc.encode(s), off);
+		put(0, "12 path=big\x0A"); // a well-formed pax record for the member
+		put(124, `${size.toString(8).padStart(11, "0")}\0`);
+		h.fill(0x20, 148, 156);
+		h[156] = "x".charCodeAt(0);
+		put(257, "ustar  \0");
+		let sum = 0;
+		for (const x of h) sum += x;
+		put(148, `${sum.toString(8).padStart(6, "0")}\0 `);
+		let served = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull(c) {
+				if (served === 0) {
+					c.enqueue(h);
+					served += h.length;
+				} else if (served < size + h.length) {
+					const n = Math.min(1024 * 1024, size + h.length - served);
+					c.enqueue(new Uint8Array(n));
+					served += n;
+				} else c.close();
+			},
+		});
+		const before = process.memoryUsage.rss();
+		await expect(readTar(stream, async () => {})).rejects.toThrow(
+			"tar metadata payload too large",
+		);
+		// The declared payload never flowed, and the host did not buffer it whole.
+		expect(served).toBeLessThan(8 * 1024 * 1024);
+		expect(process.memoryUsage.rss() - before).toBeLessThan(16 * 1024 * 1024);
+	});
+
+	test.skipIf(!linux)(
+		"copy-out honors the per-file and total byte budgets",
+		async () => {
+			const dataRoot = mkdtempSync(join(root, "budget-"));
+			const proj = join(dataRoot, "proj");
+			mkdirSync(proj);
+			const name = (n: string): string => `${proj.slice(1)}/${n}`;
+			// Per file: the member above maxFileBytes is refused and writes nothing;
+			// the small member behind it still lands.
+			const out = await extractCopyOut(
+				bodyOf(
+					rawTar([
+						{ name: name("big.bin"), content: "x".repeat(2048) },
+						{ name: name("small.txt"), content: "ok" },
+					]),
+				),
+				proj,
+				proj,
+				new Set(),
+				{ maxFileBytes: 1024, maxTotalBytes: 1024 ** 3 },
+			);
+			expect(out.refused).toEqual([name("big.bin")]);
+			expect(existsSync(join(proj, "big.bin"))).toBe(false);
+			expect(readFileSync(join(proj, "small.txt"), "utf8")).toBe("ok");
+			// Total: both members fit maxFileBytes but cross maxTotalBytes; the
+			// member that would cross the budget throws and never lands.
+			await expect(
+				extractCopyOut(
+					bodyOf(
+						rawTar([
+							{ name: name("a.txt"), content: "a".repeat(600) },
+							{ name: name("b.txt"), content: "b".repeat(600) },
+						]),
+					),
+					proj,
+					proj,
+					new Set(),
+					{ maxFileBytes: 1024, maxTotalBytes: 1024 },
+				),
+			).rejects.toThrow("total byte budget exceeded");
+			expect(existsSync(join(proj, "b.txt"))).toBe(false);
+		},
+	);
 });
 
 describe("sizes and env", () => {
@@ -2062,6 +2143,8 @@ describe("sizes and env", () => {
 			vcpus: 2,
 			memMiB: 8192,
 			diskBytes: 20 * 1024 ** 3,
+			copyOutMaxFileBytes: 256 * 1024 ** 2,
+			copyOutMaxTotalBytes: 1024 ** 3,
 			stateDir: "/var/lib/ottr-vm",
 			kernel: "/opt/ottr-vm/vmlinux",
 			firecracker: "/usr/local/bin/firecracker",
@@ -2075,6 +2158,9 @@ describe("sizes and env", () => {
 		expect(() => readVmRunnerEnv({ OTTR_VM_DISK: "lots" })).toThrow(
 			"OTTR_VM_DISK",
 		);
+		expect(() =>
+			readVmRunnerEnv({ OTTR_VM_COPY_OUT_MAX_TOTAL: "big" }),
+		).toThrow("OTTR_VM_COPY_OUT_MAX_TOTAL");
 	});
 });
 

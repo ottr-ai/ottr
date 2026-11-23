@@ -511,6 +511,10 @@ services:
       OTTR_VM_VCPUS: ${OTTR_VM_VCPUS:-2}
       OTTR_VM_MEM: ${OTTR_VM_MEM:-8g} # per VM: 8g, 8192m or bytes
       OTTR_VM_DISK: ${OTTR_VM_DISK:-20g} # per VM scratch disk (sparse)
+      # Copy-out byte budgets: one changed file, then the whole transfer. A guest
+      # above either ends the copy-out instead of filling the shared ottr-data volume.
+      OTTR_VM_COPY_OUT_MAX_FILE: ${OTTR_VM_COPY_OUT_MAX_FILE:-256m}
+      OTTR_VM_COPY_OUT_MAX_TOTAL: ${OTTR_VM_COPY_OUT_MAX_TOTAL:-1g}
       # The board's compose name: the VM's /etc/hosts maps it to the board's address, so
       # OTTR_BOARD_URL (http://ottr:<port>) works unchanged inside the VM.
       OTTR_VM_BOARD_HOST: ottr

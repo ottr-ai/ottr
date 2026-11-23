@@ -353,9 +353,14 @@ interface TarMeta {
 	pax: Map<string, string>;
 }
 
+/** The largest pax or GNU long-name payload readTar buffers whole; 1 MiB. */
+const TAR_META_MAX_BYTES = 1024 * 1024;
+
 /**
  * Applies a GNU long-name or pax meta header to `meta`: it carries no member body. False
- * for a real member header.
+ * for a real member header. A payload above TAR_META_MAX_BYTES throws before any of it
+ * is read: the guest serves the stream, so its declared size must never become a whole
+ * host buffer.
  */
 async function applyMetaHeader(
 	type: string,
@@ -363,6 +368,10 @@ async function applyMetaHeader(
 	readAll: (size: number) => Promise<Uint8Array>,
 	meta: TarMeta,
 ): Promise<boolean> {
+	if (size > TAR_META_MAX_BYTES)
+		throw new Error(
+			`tar metadata payload too large: ${size} bytes (max ${TAR_META_MAX_BYTES})`,
+		);
 	if (type === "L" || type === "K") {
 		const v = cString(await readAll(size), 0, size);
 		if (type === "L") meta.longName = v;
@@ -546,27 +555,55 @@ async function writeCopyOutMember(
 	written.push(abs);
 }
 
+/** The default copy-out byte budgets: one member, then the whole transfer. */
+export interface CopyOutBudgets {
+	/** No member's declared size may exceed this; larger members are refused. */
+	maxFileBytes: number;
+	/** The total declared size of the members written may not exceed this; crossing
+	 * it throws and ends the extraction. */
+	maxTotalBytes: number;
+}
+const COPY_OUT_MAX_FILE_BYTES = 256 * 1024 ** 2;
+const COPY_OUT_MAX_TOTAL_BYTES = 1024 * 1024 ** 3;
+
 /**
  * Extracts the regular files of a guest's copy-out tar for the requested copy-out `dir`,
  * under `root` (/data/<project>). A member outside `dir`, with a ".." component or an
  * absolute name is refused; so is one whose path on the host crosses a symlink or a
  * non-directory, and one whose target already exists unless it is a file this run copied
- * in (`copiedIn`): a VM creates new files and updates its own, never others. The parent
- * dir is opened one component at a time from root's parent (the volume mount) and held
- * open (src/confine.ts), and files land through a temp file and rename inside it, which
- * replaces a link at the target instead of writing through it.
+ * in (`copiedIn`): a VM creates new files and updates its own, never others. A member
+ * above `budgets.maxFileBytes` is refused too, and members whose total declared size
+ * crosses `budgets.maxTotalBytes` throw: the guest is root in its VM and serves this
+ * tar, so only the budgets keep its sizes from becoming writes on the shared volume.
+ * The parent dir is opened one component at a time from root's parent (the volume mount)
+ * and held open (src/confine.ts), and files land through a temp file and rename inside
+ * it, which replaces a link at the target instead of writing through it.
  */
 export async function extractCopyOut(
 	stream: ReadableStream<Uint8Array>,
 	root: string,
 	dir: string,
 	copiedIn: ReadonlySet<string>,
+	budgets: CopyOutBudgets = {
+		maxFileBytes: COPY_OUT_MAX_FILE_BYTES,
+		maxTotalBytes: COPY_OUT_MAX_TOTAL_BYTES,
+	},
 ): Promise<{ written: string[]; refused: string[] }> {
 	const written: string[] = [];
 	const refused: string[] = [];
+	let total = 0;
 	const scope = posix.normalize(dir).replace(/\/+$/, "");
 	await readTar(stream, async (m, data) => {
 		if (m.type !== "0") return;
+		if (m.size > budgets.maxFileBytes) {
+			refused.push(m.name);
+			return;
+		}
+		total += m.size;
+		if (total > budgets.maxTotalBytes)
+			throw new Error(
+				`copy-out total byte budget exceeded (${budgets.maxTotalBytes} bytes)`,
+			);
 		const abs = copyOutTarget(m, root, scope);
 		const d = abs === null ? null : openCopyOutParent(root, dirname(abs));
 		if (abs === null || d === null) {
@@ -1103,6 +1140,10 @@ export interface VmRunnerOptions {
 	memMiB: number;
 	/** OTTR_VM_DISK: apparent size of each run's scratch disk. */
 	diskBytes: number;
+	/** OTTR_VM_COPY_OUT_MAX_FILE: per-member copy-out write budget; 256 MiB. */
+	copyOutMaxFileBytes?: number;
+	/** OTTR_VM_COPY_OUT_MAX_TOTAL: whole-transfer copy-out write budget; 1 GiB. */
+	copyOutMaxTotalBytes?: number;
 	stateDir: string;
 	kernel: string;
 	firecracker: string;
@@ -1656,6 +1697,10 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 				join(dataRoot, spec.project),
 				dir,
 				copiedIn,
+				{
+					maxFileBytes: opts.copyOutMaxFileBytes ?? COPY_OUT_MAX_FILE_BYTES,
+					maxTotalBytes: opts.copyOutMaxTotalBytes ?? COPY_OUT_MAX_TOTAL_BYTES,
+				},
 			);
 			for (const name of out.refused)
 				push(`vm-runner: refused copy-out of ${name}\n`);
