@@ -6,6 +6,7 @@ import {
 	futimesSync,
 	lstatSync,
 	mkdirSync,
+	opendirSync,
 	openSync,
 	readdirSync,
 	readlinkSync,
@@ -225,6 +226,25 @@ export function openBelow(d: Dir, name: string): Dir {
 		};
 	}
 	return heldDir(openChild(d.fd, n, child, false), child);
+}
+
+/**
+ * Bounded iteration over the entry names of the held dir `d`: each `next()` reads one
+ * entry through a small kernel buffer (opendirSync), so a huge directory never
+ * materializes its whole name list at once. Close the result when done.
+ */
+export function scanDir(
+	d: Dir,
+	bufferSize = 512,
+): { next(): string | null; close(): void } {
+	const handle = opendirSync(
+		guarded && d.fd !== undefined ? `${FD_DIR}/${d.fd}` : d.path,
+		{ bufferSize },
+	);
+	return {
+		next: () => handle.readSync()?.name ?? null,
+		close: () => handle.closeSync(),
+	};
 }
 
 /**

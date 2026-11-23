@@ -1335,7 +1335,10 @@ describe("task routes", () => {
 			savedFiles?: { name: string; size: number }[];
 			savedFilesTruncated?: boolean;
 		};
-		expect(b.savedFiles).toEqual([{ name: "shallow.txt", size: 3 }]);
+		// Visited-entry counting makes readdir order decide whether shallow.txt
+		// sits inside the cap, so the assertions are shape-based, not exact.
+		expect(b.savedFiles?.every((f) => f.name === "shallow.txt")).toBe(true);
+		expect((b.savedFiles ?? []).length).toBeLessThanOrEqual(1);
 		expect(b.savedFilesTruncated).toBe(true);
 	});
 
@@ -1357,13 +1360,38 @@ describe("task routes", () => {
 		// The cap lists a prefix of the folder, not a partial-walk artifact: every
 		// listed name is a top-level file of the folder.
 		expect(b.savedFiles?.every((f) => f.name.startsWith("f"))).toBe(true);
-		// The listed prefix stays inside the JSON byte budget.
-		const cost = (b.savedFiles ?? []).reduce(
-			(n, f) => n + f.name.length + 48,
-			0,
-		);
-		expect(cost).toBeLessThanOrEqual(SAVED_FILES_MAX_JSON_BYTES);
+		// The listed prefix stays inside the JSON byte budget, measured on the
+		// response's real serialized bytes.
+		expect(
+			Buffer.byteLength(JSON.stringify(b.savedFiles ?? []), "utf8"),
+		).toBeLessThanOrEqual(SAVED_FILES_MAX_JSON_BYTES);
 	}, 30000); // The 50000-file fixture alone passes bun's 5 s default.
+
+	test("drawer detail byte budget counts escaped name bytes", async () => {
+		const t = await store.createTask("escaped saved files");
+		await store.updateTask(t.id, { stage: "done", state: "idle" });
+		const qdir = join(store.tasksDir, "quarantine", t.id);
+		mkdirSync(qdir, { recursive: true });
+		// 250 control-char bytes plus a 4-digit suffix stays under the 255-byte
+		// name limit; each char serializes as a 6-byte \u0001 escape, so the
+		// serialized name is about 1500 bytes — not the 254-char UTF-16
+		// length — and the byte budget binds well before the entry cap.
+		const name = "\u0001".repeat(250);
+		for (let i = 0; i < 1000; i++)
+			writeFileSync(join(qdir, `${name}${String(i).padStart(4, "0")}`), "x\n");
+		const detail = await get(`/api/projects/p1/tasks/${t.id}`);
+		expect(detail.status).toBe(200);
+		const b = (await detail.json()) as {
+			savedFiles?: { name: string; size: number }[];
+			savedFilesTruncated?: boolean;
+		};
+		expect(b.savedFilesTruncated).toBe(true);
+		// The byte budget, not the entry cap, stops the listing.
+		expect((b.savedFiles ?? []).length).toBeLessThan(SAVED_FILES_MAX_ENTRIES);
+		expect(
+			Buffer.byteLength(JSON.stringify(b.savedFiles ?? []), "utf8"),
+		).toBeLessThanOrEqual(SAVED_FILES_MAX_JSON_BYTES);
+	}, 30000);
 
 	test("drawer detail serves the captured uncommitted files for done cards", async () => {
 		// A merged card keeps its worktree path after the merge turn removed the directory.

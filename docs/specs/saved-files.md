@@ -59,7 +59,9 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   are not listed), sorted by name; `[]` when the folder is absent. Absent on open cards.
   The walk is bounded: it opens the card folder once through the trusted-anchor
   confinement and descends from the held descriptor (`openBelow`, one open per level, not
-  a fresh anchor walk per directory). Caps: depth 64, 200 entries, 64 KiB JSON budget
+  a fresh anchor walk per directory). Caps: depth 64, 200 visited entries (directories
+  count like files, so a tree of many empty directories is also bounded), and a 64 KiB
+  JSON budget measured on the exact serialized name bytes (`\uXXXX` escapes included)
   (`SAVED_FILES_MAX_DEPTH`, `SAVED_FILES_MAX_ENTRIES`, `SAVED_FILES_MAX_JSON_BYTES` in
   `src/app.ts`; the quarantine folder is worker-writable and the walk runs synchronously
   on the board event loop). When a cap binds, the view sets `savedFilesTruncated` — the

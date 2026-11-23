@@ -5026,7 +5026,7 @@ describe("Drawer approve button", () => {
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain('id="drawer-saved"');
 		expect(html).toContain("saved-files?path=kept-00.md");
-		expect(html).toContain("…and more (the list is truncated)");
+		expect(html).toContain("The list is truncated.");
 		expect(html).not.toContain("…and 10 more");
 	});
 
@@ -5043,6 +5043,56 @@ describe("Drawer approve button", () => {
 		} as Partial<TaskCard>);
 		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
 		expect(html).toContain("…and 10 more");
+	});
+
+	test("a truncated saved list with few entries still shows the section and the truncated hint", () => {
+		// The visited-entry cap can return fewer rows than the 50-row render
+		// cap, so the flag alone must keep the section and its hint visible.
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+			savedFiles: [{ name: "kept-00.md", size: 10 }],
+			savedFilesTruncated: true,
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-saved"');
+		expect(html).toContain("saved-files?path=kept-00.md");
+		expect(html).toContain("The list is truncated.");
+	});
+
+	test("a truncated saved list with no entries still shows the section and the truncated hint", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+			savedFiles: [],
+			savedFilesTruncated: true,
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-saved"');
+		expect(html).toContain("The list is truncated.");
+		expect(html).not.toContain("saved-files?path=");
+	});
+
+	test("a saved list of a few entries with no truncation renders no count hint", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+			savedFiles: [
+				{ name: "a.md", size: 10 },
+				{ name: "b.md", size: 10 },
+				{ name: "c.md", size: 10 },
+			],
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-saved"');
+		expect(html).toContain("saved-files?path=c.md");
+		expect(html).not.toContain("…and");
 	});
 
 	test("a done card without saved files renders no saved section and keeps the old hint", () => {

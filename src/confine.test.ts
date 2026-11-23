@@ -39,6 +39,7 @@ import {
 	removeBelow,
 	renameBelow,
 	renameProven,
+	scanDir,
 	touchBelow,
 	trustedAnchor,
 	unlinkBelow,
@@ -235,6 +236,73 @@ describe("openBelow", () => {
 			expect(readFileSync(cur.at("leaf"), "utf8")).toBe("leaf");
 		} finally {
 			while (held.length > 0) held.pop()?.close();
+		}
+	});
+});
+
+describe("scanDir", () => {
+	test.skipIf(!linux)("yields every entry name of a held dir", () => {
+		const { anchor } = fixture();
+		mkdirSync(join(anchor, "a", "sub"), { recursive: true });
+		writeFileSync(join(anchor, "a", "f1"), "1");
+		writeFileSync(join(anchor, "a", "f2"), "2");
+		const d = openDir(anchor, join(anchor, "a"));
+		try {
+			const scan = scanDir(d);
+			const names: string[] = [];
+			try {
+				for (;;) {
+					const n = scan.next();
+					if (n === null) break;
+					names.push(n);
+				}
+			} finally {
+				scan.close();
+			}
+			expect(names.sort()).toEqual(readdirSync(join(anchor, "a")).sort());
+		} finally {
+			d.close();
+		}
+	});
+
+	test.skipIf(!linux)(
+		"stops yielding null only after all 500 entries; early close leaves the parent usable",
+		() => {
+			const { anchor } = fixture();
+			mkdirSync(join(anchor, "big"));
+			for (let i = 0; i < 500; i++)
+				writeFileSync(join(anchor, "big", `f${i}`), "x");
+			const parent = openDir(anchor, join(anchor, "big"));
+			try {
+				const scan = scanDir(parent);
+				let count = 0;
+				try {
+					while (scan.next() !== null) count++;
+				} finally {
+					scan.close();
+				}
+				expect(count).toBe(500);
+				const early = scanDir(parent);
+				for (let i = 0; i < 3; i++) expect(early.next()).not.toBeNull();
+				early.close();
+				expect(parent.list()).toHaveLength(500);
+			} finally {
+				parent.close();
+			}
+		},
+	);
+
+	test.skipIf(!linux)("next throws after close", () => {
+		const { anchor } = fixture();
+		mkdirSync(join(anchor, "a"));
+		writeFileSync(join(anchor, "a", "f"), "x");
+		const d = openDir(anchor, join(anchor, "a"));
+		try {
+			const scan = scanDir(d);
+			scan.close();
+			expect(() => scan.next()).toThrow();
+		} finally {
+			d.close();
 		}
 	});
 });

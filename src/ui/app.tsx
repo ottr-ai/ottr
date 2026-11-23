@@ -10985,14 +10985,15 @@ function DrawerFiles(p: {
 					</div>
 				</DrawerSec>
 			)}
-			{task.savedFiles != null && task.savedFiles.length > 0 && (
+			{((task.savedFiles?.length ?? 0) > 0 ||
+				task.savedFilesTruncated === true) && (
 				<DrawerSec id="drawer-saved" label="Saved files">
 					<div className="wt-files">
 						<p className="hint">
 							Files this task left uncommitted, kept when its worktree was
 							removed.
 						</p>
-						{task.savedFiles.slice(0, 50).map((f) => (
+						{task.savedFiles?.slice(0, 50).map((f) => (
 							<a
 								key={f.name}
 								className="wt-file"
@@ -11004,12 +11005,14 @@ function DrawerFiles(p: {
 								<span className="saved-size">{fmtBytes(f.size)}</span>
 							</a>
 						))}
-						{task.savedFiles.length > 50 &&
-							(task.savedFilesTruncated ? (
-								<p className="hint">…and more (the list is truncated)</p>
-							) : (
+						{task.savedFilesTruncated ? (
+							<p className="hint">The list is truncated.</p>
+						) : (
+							task.savedFiles != null &&
+							task.savedFiles.length > 50 && (
 								<p className="hint">…and {task.savedFiles.length - 50} more</p>
-							))}
+							)
+						)}
 					</div>
 				</DrawerSec>
 			)}

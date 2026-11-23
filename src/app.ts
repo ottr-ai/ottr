@@ -80,6 +80,7 @@ import {
 	openDir,
 	openRegularBelow,
 	readBelow,
+	scanDir,
 	unlinkBelow,
 	writeBelow,
 } from "./confine.ts";
@@ -2301,8 +2302,10 @@ function subscriptionIdentity(sub: PushSub): string {
 }
 // Caps for the saved-files listing. quarantine/<id> is worker-writable (compose mounts
 // the data volume read-write), and the listing walk runs synchronously on the board
-// event loop, so the walk bounds depth, entries, and response bytes; truncation is
-// reported, never silent.
+// event loop, so the walk bounds depth, visited entries, and response bytes.
+// Truncation is reported, never silent. SAVED_FILES_MAX_ENTRIES bounds visited
+// entries: directories count like files, so a tree of many empty directories is
+// also bounded.
 export const SAVED_FILES_MAX_DEPTH = 64;
 export const SAVED_FILES_MAX_ENTRIES = 200;
 export const SAVED_FILES_MAX_JSON_BYTES = 64 * 1024;
@@ -2312,8 +2315,9 @@ export const SAVED_FILES_MAX_JSON_BYTES = 64 * 1024;
 // and descends from the held descriptor (openBelow): one open per level instead of a
 // fresh anchor walk per directory, so a deep tree costs linear, not quadratic, opens.
 // A refusing child (a symlink at the entry) is skipped; sizes come from fd-based lstat,
-// never following the entry itself. The caps above bound depth, entries, and JSON
-// bytes. Regular files only; [] with truncated false when absent or refused.
+// never following the entry itself. The caps above bound depth, visited entries
+// (directories count), response entries, and serialized bytes. Regular files only;
+// [] with truncated false when absent or refused.
 const savedDirFiles = (
 	anchor: string,
 	dirRel: string,
@@ -2322,49 +2326,60 @@ const savedDirFiles = (
 	let bytes = 0;
 	let truncated = false;
 	let budgetFull = false;
+	let visited = 0;
 	const walk = (d: Dir, prefix: string, depth: number): void => {
-		for (const name of d.list()) {
-			// The entry and byte caps stop the whole walk: nothing is collected
-			// after either. A depth cap stops only its own branch, so siblings and
-			// ancestors keep listing their entries.
-			if (files.length >= SAVED_FILES_MAX_ENTRIES || budgetFull) {
-				truncated = true;
-				return;
-			}
-			const relName = prefix ? `${prefix}/${name}` : name;
-			let st: Stats;
-			try {
-				st = lstatSync(d.at(name));
-			} catch {
-				continue; // vanished between list and lstat
-			}
-			if (st.isDirectory()) {
-				if (depth >= SAVED_FILES_MAX_DEPTH) {
-					truncated = true; // the branch below this level is not walked
-					continue;
-				}
-				let child: Dir;
-				try {
-					child = openBelow(d, name);
-				} catch {
-					continue; // refused: a symlink at the entry is never followed
-				}
-				try {
-					walk(child, relName, depth + 1);
-				} finally {
-					child.close();
-				}
-			} else if (st.isFile()) {
-				// JSON cost estimate: the name plus the JSON wrapper around it.
-				const cost = relName.length + 48;
-				if (bytes + cost > SAVED_FILES_MAX_JSON_BYTES) {
-					budgetFull = true; // the JSON response would pass its byte budget
+		// The visited-entry and byte caps stop the whole walk: nothing is
+		// collected after either. A depth cap stops only its own branch, so
+		// siblings and ancestors keep listing their entries.
+		const scan = scanDir(d);
+		try {
+			for (;;) {
+				const name = scan.next();
+				if (name === null) break;
+				visited += 1;
+				if (visited > SAVED_FILES_MAX_ENTRIES || budgetFull) {
 					truncated = true;
 					return;
 				}
-				bytes += cost;
-				files.push({ name: relName, size: st.size });
+				const relName = prefix ? `${prefix}/${name}` : name;
+				let st: Stats;
+				try {
+					st = lstatSync(d.at(name));
+				} catch {
+					continue; // vanished between list and lstat
+				}
+				if (st.isDirectory()) {
+					if (depth >= SAVED_FILES_MAX_DEPTH) {
+						truncated = true; // the branch below this level is not walked
+						continue;
+					}
+					let child: Dir;
+					try {
+						child = openBelow(d, name);
+					} catch {
+						continue; // refused: a symlink at the entry is never followed
+					}
+					try {
+						walk(child, relName, depth + 1);
+					} finally {
+						child.close();
+					}
+				} else if (st.isFile()) {
+					// JSON cost: the name's exact serialized bytes (\uXXXX escapes
+					// included) plus a fixed bound for the JSON wrapper around name
+					// and size.
+					const cost = Buffer.byteLength(JSON.stringify(relName), "utf8") + 48;
+					if (bytes + cost > SAVED_FILES_MAX_JSON_BYTES) {
+						budgetFull = true; // the JSON response would pass its byte budget
+						truncated = true;
+						return;
+					}
+					bytes += cost;
+					files.push({ name: relName, size: st.size });
+				}
 			}
+		} finally {
+			scan.close();
 		}
 	};
 	let root: Dir;
