@@ -483,7 +483,7 @@ import {
 	diffStat,
 	diffText,
 	git,
-	githubUrl,
+	githubUrlFromPin,
 	hasRules,
 	hostedGitAuth,
 	httpsRemote,
@@ -7438,6 +7438,9 @@ export async function createApp(deps: AppDeps) {
 				taskIdPrefix: prefix === "" ? null : prefix,
 			});
 		});
+		// The pin is in: the board's repo identity follows it, not the checkout's
+		// worker-writable remotes (docs/specs/pinned-origin-url.md, OTTR-1004).
+		e.github = githubUrlFromPin((await e.store.getSettings()).originUrl);
 		// The rules interview waits for the wizard's last step: the settings saves land
 		// first, so PR mode and the target branch hold for the interview's first commit
 		// (docs/specs/add-project-wizard.md). POST /interview starts it.
@@ -7514,7 +7517,7 @@ export async function createApp(deps: AppDeps) {
 			// The target is unknowable now: report none, never a stale one.
 			e.target = null;
 		}
-		e.github = await githubUrl(e.path).catch(() => null);
+		e.github = githubUrlFromPin((await e.store.getSettings()).originUrl);
 		e.remote = await remoteUrl(e.path).catch(() => null);
 		await refreshBranchRules(e);
 	}
@@ -10427,6 +10430,15 @@ export async function createApp(deps: AppDeps) {
 		const err = await gitInitWithCommit(e.path);
 		if (err !== null) return json({ error: err }, 400);
 		e.gitless = false;
+		// R5-1: the operator may have run `git remote add origin` before init. Pin it
+		// now, before any turn of this boot can run, so the identity and every pinned
+		// push follow the operator's URL instead of the worker-writable remotes.
+		const pin = await originRemoteUrl(e.path).catch(() => null);
+		if (pin !== null)
+			await e.store.transaction(async () => {
+				if ((await e.store.getSettings()).originUrl === null)
+					await e.store.setSettings({ originUrl: pin });
+			});
 		await refreshRemote(e);
 		// The interview stays with POST /interview: the wizard's last step and the
 		// checklist call it after the settings steps saved

@@ -13547,6 +13547,10 @@ describe(
 		sh("git add seed.txt && git commit -qm seed");
 		sh("git remote add origin https://github.com/acme/widget");
 		sh("git update-ref refs/remotes/origin/main HEAD");
+		// The board's identity follows the pinned origin (OTTR-1004), and refreshRemote
+		// stamps github from that pin — never from the checkout's remotes. Pin the origin
+		// the way boot pins a discovered project.
+		await rulesStore.setSettings({ originUrl: "https://github.com/acme/widget" });
 		const rulesProjects = new Map<string, Entry>();
 		rulesProjects.set("p-rules", {
 			path: rulesDir,
@@ -21868,18 +21872,12 @@ describe(
 					url: "https://github.com/octo/appcheck-recheck",
 				});
 				expect(add.status).toBe(200);
-				// `git remote -v` displays insteadOf-rewritten URLs, so an origin under the
-				// rewrite prefix would show as file:// and githubUrl would see no github.com
-				// remote. Point origin outside the rewrite map; the settings save then
-				// re-reads it and boardRepos() gains the repo.
-				execSync(
-					`git -C ${join(root, "appcheck-recheck")} remote set-url origin https://github.com/other/appcheck-recheck`,
-					{ env: fixtureGitEnv() },
-				);
-				const saved = await m.call("/api/projects/appcheck-recheck/settings", {
-					targetBranch: "main",
-				});
-				expect(saved.status).toBe(200);
+				// OTTR-1004: Entry.github follows the pinned origin only, and the fixture's
+				// insteadOf map rewrites every clonable github.com URL to file://, so the
+				// board derives no repo from the checkout. Mint the identity on the entry
+				// directly: boardRepos() changes, and the next tick must re-run the check.
+				const fresh = prProjects.get("appcheck-recheck")!;
+				fresh.github = "https://github.com/other/appcheck-recheck";
 				// Now a check that hangs until the test releases it: the first tick starts
 				// exactly one check, a second tick while it is in flight must not stack
 				// another one (the in-flight guard still holds), and the released failure

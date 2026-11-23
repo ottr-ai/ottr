@@ -772,25 +772,21 @@ export async function targetTracksRules(
 	return r.code === 0;
 }
 
-/** HTTPS URL of the main checkout's GitHub remote on the configured host (origin preferred);
- * null when it has none. */
-export async function githubUrl(
-	mainPath: string,
+/** The board's GitHub repo identity from the pinned origin URL (docs/specs/pinned-origin-url.md);
+ * null when the pin is missing or names another host. Entry.github reads only the pin: the
+ * checkout's remotes are worker-writable (a turn can plant remote.origin.pushurl or
+ * url.<x>.pushInsteadOf), so the repo that issue watch, PR review, Dependabot, App token
+ * minting and releases act on must never follow them. */
+export function githubUrlFromPin(
+	raw: string | null,
 	host: string = githubHost().host,
-): Promise<string | null> {
-	const r = await git(["remote", "-v"], mainPath);
-	if (r.code !== 0) return null;
-	const hostRe = new RegExp(
+): string | null {
+	if (raw === null) return null;
+	const m = new RegExp(
 		`${hostMatcher(host).source}(.+?)(?:\\.git)?$`,
 		"i",
-	);
-	const byName = new Map<string, string>();
-	for (const line of r.stdout.split("\n")) {
-		const [name = "", url = "", kind = ""] = line.trim().split(/\s+/);
-		const m = kind === "(push)" ? hostRe.exec(url) : null;
-		if (m?.[1]) byName.set(name, `https://${host}/${m[1]}`);
-	}
-	return byName.get("origin") ?? [...byName.values()][0] ?? null;
+	).exec(raw.trim());
+	return m?.[1] ? `https://${host}/${m[1]}` : null;
 }
 
 /** Normalizes a git remote URL (https, ssh, scp-like) to an https URL; null for anything
@@ -809,8 +805,8 @@ export function httpsRemote(raw: string): string | null {
 }
 
 /** HTTPS URL of the main checkout's origin push remote on any host (GitHub, GitLab,
- * self-hosted); null when it has none. Icon adoption reads this; githubUrl stays the
- * configured-host view the release flow uses. */
+ * self-hosted); null when it has none. Icon adoption reads this; the board's repo
+ * identity stays the pin-derived githubUrlFromPin (docs/specs/pinned-origin-url.md). */
 export async function remoteUrl(mainPath: string): Promise<string | null> {
 	const r = await git(["remote", "-v"], mainPath);
 	if (r.code !== 0) return null;

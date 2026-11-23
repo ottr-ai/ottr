@@ -48,7 +48,7 @@ import {
 	gitEnv,
 	gitExe,
 	githubRepoName,
-	githubUrl,
+	githubUrlFromPin,
 	hasRules,
 	headVersion,
 	httpsRemote,
@@ -3019,59 +3019,91 @@ describe("against real repos", () => {
 		expect(await unsavedWork(stray, "origin/main")).toBeTruthy();
 	}, 60_000);
 
-	test("githubUrl normalizes the GitHub remote (origin preferred), null without one", async () => {
-		// The fixture's origin is a local path, not GitHub.
-		expect(await githubUrl(main)).toBeNull();
-		await must(main, "remote", "add", "gh", "git@github.com:octo/demo-app.git");
+	test("githubUrlFromPin normalizes the pinned origin URL, null without one", () => {
+		// A missing or local pin names no repo on the configured host.
+		expect(githubUrlFromPin(null)).toBeNull();
+		expect(githubUrlFromPin("/srv/repo.git")).toBeNull();
+		expect(githubUrlFromPin(`file://${main}`)).toBeNull();
+		// https and scp forms of the configured host both normalize.
+		expect(githubUrlFromPin("https://github.com/octo/tracker.git")).toBe(
+			"https://github.com/octo/tracker",
+		);
+		expect(githubUrlFromPin("git@github.com:octo/demo-app.git")).toBe(
+			"https://github.com/octo/demo-app",
+		);
+	});
+
+	test("a planted pushurl or pushInsteadOf cannot move the repo identity off the pin", async () => {
+		// The fixture's origin is a local path: pin it at the https origin first.
+		const old = await must(main, "remote", "get-url", "origin");
+		await must(
+			main,
+			"remote",
+			"set-url",
+			"origin",
+			"https://github.com/octo/a.git",
+		);
 		try {
-			expect(await githubUrl(main)).toBe("https://github.com/octo/demo-app");
-			// origin becomes a GitHub remote: it wins over the first-inserted one.
-			const old = await must(main, "remote", "get-url", "origin");
+			// A work turn owns .git/config: plant a push rewrite to its own repo.
 			await must(
 				main,
-				"remote",
-				"set-url",
-				"origin",
-				"https://github.com/octo/tracker.git",
+				"config",
+				"remote.origin.pushurl",
+				"https://github.com/octo/b.git",
 			);
-			try {
-				expect(await githubUrl(main)).toBe("https://github.com/octo/tracker");
-			} finally {
-				await must(main, "remote", "set-url", "origin", old);
-			}
+			// The plant is real: git's push line names the second repo now.
+			expect(await must(main, "remote", "-v")).toContain(
+				"https://github.com/octo/b.git",
+			);
+			const pin = await originRemoteUrl(main);
+			expect(pin).toBe("https://github.com/octo/a.git");
+			// The identity the board acts on (Entry.github) comes from the pin, so
+			// the plant is dead: it stays the pinned origin repo.
+			expect(githubUrlFromPin(pin)).toBe("https://github.com/octo/a");
+			// The pushInsteadOf variant rewrites the push line too; the pin holds.
+			await must(main, "config", "--unset", "remote.origin.pushurl");
+			await must(
+				main,
+				"config",
+				"url.https://github.com/octo/b.git.pushInsteadOf",
+				"https://github.com/octo/a.git",
+			);
+			expect(await must(main, "remote", "-v")).toContain(
+				"https://github.com/octo/b.git",
+			);
+			expect(await originRemoteUrl(main)).toBe("https://github.com/octo/a.git");
+			expect(githubUrlFromPin(await originRemoteUrl(main))).toBe(
+				"https://github.com/octo/a",
+			);
 		} finally {
-			await must(main, "remote", "remove", "gh");
+			await must(
+				main,
+				"config",
+				"--unset",
+				"url.https://github.com/octo/b.git.pushInsteadOf",
+			);
+			await must(main, "remote", "set-url", "origin", old);
 		}
 	}, 60_000);
 
-	test("githubUrl follows OTTR_GITHUB_HOST and ignores other hosts", async () => {
+	test("githubUrlFromPin follows OTTR_GITHUB_HOST and ignores other hosts", () => {
 		const savedHost = process.env.OTTR_GITHUB_HOST;
 		process.env.OTTR_GITHUB_HOST = "acme.ghe.com";
 		try {
-			await must(main, "remote", "add", "gh", "git@acme.ghe.com:o/r.git");
-			await must(
-				main,
-				"remote",
-				"add",
-				"other",
-				"https://github.com/octo/demo-app.git",
+			expect(githubUrlFromPin("git@acme.ghe.com:o/r.git")).toBe(
+				"https://acme.ghe.com/o/r",
 			);
-			expect(await githubUrl(main)).toBe("https://acme.ghe.com/o/r");
-			await must(main, "remote", "remove", "gh");
-			expect(await githubUrl(main)).toBeNull();
+			// A pin on another host names no repo on the configured host.
+			expect(
+				githubUrlFromPin("https://github.com/octo/demo-app.git"),
+			).toBeNull();
 		} finally {
-			await must(main, "remote", "remove", "other");
 			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
 			else process.env.OTTR_GITHUB_HOST = savedHost;
 		}
 		// Without the setting, only github.com counts.
-		await must(main, "remote", "add", "ghe", "git@ghe.example.com:o/r.git");
-		try {
-			expect(await githubUrl(main)).toBeNull();
-		} finally {
-			await must(main, "remote", "remove", "ghe");
-		}
-	}, 60_000);
+		expect(githubUrlFromPin("git@ghe.example.com:o/r.git")).toBeNull();
+	});
 
 	test("remoteUrl returns the https origin on any host, null for local paths", async () => {
 		// The fixture's origin is a local path: no host, no icon source.

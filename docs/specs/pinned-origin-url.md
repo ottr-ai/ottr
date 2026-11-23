@@ -85,6 +85,15 @@ from `origin` by name.
    transport can only be reached through the pinned URL (clone only accepts
    https/ssh URLs from the admin), and a local pin under a worker-writable root
    is refused, so a planted or rewritten local URL fails closed.
+7. The board's GitHub repo identity (`Entry.github` — what the issue watch, the
+   PR review bot, the Dependabot check, GitHub App token minting and the
+   release links act on) derives from the pinned URL (`githubUrlFromPin`),
+   never from the checkout's remotes. It is null when the pin is missing or
+   names another host. The pin capture sites (boot, addProject, and the git
+   init endpoint, which pins too) re-derive it once the pin lands. A planted
+   `remote.origin.pushurl` or `url.<x>.pushInsteadOf` entry cannot move the
+   identity (OTTR-1004): the checkout's remotes are worker-writable, the pin is
+   not.
 
 ## Boundaries and error cases
 
@@ -93,6 +102,7 @@ from `origin` by name.
   boot can be adopted — but the worker-root check refuses any local plant under
   a worker-writable root (workspace, data dir, shared home) at every use, and a
   planted https URL carries no matching credential, so the push fails closed.
+  The pin-derived repo identity (behavior 7) inherits the same residual.
   The residual window is no wider than the pre-fix state and closes after the
   first capture.
 - `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` rewriting to a foreign
@@ -138,13 +148,22 @@ from `origin` by name.
   `resolveTarget` fetch: the tracking ref moves to the pinned repo's tip.
 - `getSettings`/`setSettings` round-trip `originUrl`; a wrong shape keeps the
   default.
+- A planted `remote.origin.pushurl` naming a second repo leaves the board's
+  repo identity on the pinned origin repo (`src/worktree.test.ts`).
+- A planted `url.<x>.pushInsteadOf` rewrite does the same.
 - Boot pins the URL before the turn loop starts; `addProject` pins right after
   the clone.
 
 ## Non-goals
 
 - No UI for the pin; the settings API and re-adding the project are the paths.
-- No change to `remoteUrl`/`githubUrl` (display-only reads) or to the fork
+- No change to `remoteUrl` (display-only icon read) or to the fork
   mirror (already explicit URLs into the server-only dir, OTTR-180).
 - No change to clone: the admin's URL is validated by `parseGitUrl`
   (https/ssh only).
+
+Superseded 2026-11-23 (OTTR-1004): the earlier non-goal "No change to
+`remoteUrl`/`githubUrl`" held for the push and fetch paths only. `Entry.github`
+was a live `githubUrl` read of the worker-writable remotes while issue watch,
+PR review, Dependabot, App token minting and releases acted on it, so behavior 7
+replaces that read with the pin-derived `githubUrlFromPin`.

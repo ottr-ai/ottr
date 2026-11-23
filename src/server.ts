@@ -126,7 +126,7 @@ import {
 	fetchOriginBranch,
 	fetchPrHead,
 	git,
-	githubUrl,
+	githubUrlFromPin,
 	hasRules,
 	ignoreInMain,
 	integrationSha,
@@ -724,11 +724,7 @@ for (const p of discoverProjects(
 			if (r.unpushed === true) e.mainUnpushed = true;
 		})
 		.catch(() => {});
-	await githubUrl(p)
-		.then((u) => {
-			e.github = u;
-		})
-		.catch(() => {});
+	e.github = githubUrlFromPin((await store.getSettings()).originUrl);
 	await remoteUrl(p)
 		.then((u) => {
 			e.remote = u;
