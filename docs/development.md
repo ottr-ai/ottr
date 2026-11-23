@@ -4,7 +4,7 @@ The commands are the same in bash and PowerShell:
 
 ```sh
 bun run check          # tsc, biome, boot smoke, license allowlist, scratch-image guard, agent-data sync guard, UI-screenshot reminder
-bun test
+bun test --timeout=20000  # 20 s per-test ceiling (Bun honors no bunfig key for it)
 bun run test:mutation  # StrykerJS, fourteen configs with break thresholds
 bun run audit:quality  # duplicate and dead code
 bun run dev            # UI-only demo board on port 5747

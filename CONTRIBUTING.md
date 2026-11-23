@@ -18,10 +18,10 @@ Run these two commands before you open a pull request. Each one must exit 0:
 
 ```sh
 bun run check
-bun test
+bun test --timeout=20000
 ```
 
-`bun run check` runs the type check, the linter, and the project guards. `bun test` runs the unit tests. What each check does, the mutation tests, and the UI development workflow are in [docs/development.md](docs/development.md).
+`bun run check` runs the type check, the linter, and the project guards. `bun test --timeout=20000` runs the unit tests. The flag sets the 20 s per-test ceiling. Bun's default is 5 s, and bunfig.toml has no key that Bun honors for it. What each check does, the mutation tests, and the UI development workflow are in [docs/development.md](docs/development.md).
 
 To try the board on your own projects, follow [Quick start](README.md#quick-start) in the README.
 

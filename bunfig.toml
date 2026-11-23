@@ -3,13 +3,14 @@
 minimumReleaseAge = 604800
 
 [test]
-# The full suite runs many second-long integration tests (app mounts, git
-# fixtures, seeded stores); on a loaded machine several sit within ~100 ms of
-# Bun's 5000 ms default, and small load changes flip them (observed: different
-# tests capped per run in src/hosted.git.test.ts and src/turn.test.ts). The
-# ceiling stays an order of magnitude below the suite's own slow-seed tests,
-# which set 20 s explicitly, so a genuinely hung test still fails fast.
-timeout = 20000
+# No bunfig key sets the bun test per-test timeout. Bun 1.4.5 ignores [test] timeout,
+# [test] testTimeout, [test] defaultTimeout, and a top-level timeout (each ran into
+# the 5000 ms default with a 6 s test; the bunfig parser reads no timeout key,
+# oven-sh/bun#7789, oven-sh/bun#38728). The gate commands carry the 20 s ceiling
+# instead (`bun test --timeout=20000`; see AGENTS.md, CONTRIBUTING.md,
+# docs/development.md, .github/workflows/ci.yml). The ceiling stays an order of
+# magnitude below the suite's own slow-seed tests, which set 20 s explicitly, so a
+# genuinely hung test still fails fast.
 # OTTR-1162: the suite must never write the board's own repository. The preload routes every
 # git exec through a shim that refuses writes resolving into the enclosing repo (see
 # src/test/boardRepoGuard.ts). Active only under bun test.
