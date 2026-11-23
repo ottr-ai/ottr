@@ -416,6 +416,10 @@ describe("createPatchBudget", () => {
 					0,
 				);
 				expect(charged).toBeLessThanOrEqual(Math.max(1, maxTotalChars));
+				for (const i of keptIdx)
+					expect(patchCharsOf(sizes[i]!)).toBeLessThanOrEqual(
+						Math.max(1, maxPatchChars),
+					);
 				// The ordering stays correct: kept and deferred partition the
 				// candidates, each in candidate order (kept keeps a commit's own
 				// walk position; a kept sha never strands a deferred ancestor,
