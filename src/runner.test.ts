@@ -25,6 +25,7 @@ import { LOST_SESSION } from "./prompts.ts";
 import type { EventState, RunLauncher } from "./runner.ts";
 import {
 	APPROVAL_REFUSAL,
+	appendGitPins,
 	applyEvent,
 	buildOmpArgs,
 	childEnv,
@@ -4976,7 +4977,22 @@ describe("arch-review changed-line coverage", () => {
 				},
 			});
 			await handle.done;
-			for (const n of names) expect(seen[0]!.env).not.toHaveProperty(n);
+			// The auth names never survive the strip: no host auth from the server env.
+			for (const n of [
+				"GIT_SSH_COMMAND",
+				"OTTR_GIT_TOKEN_0",
+				"OTTR_GIT_USER_0",
+			])
+				expect(seen[0]!.env).not.toHaveProperty(n);
+			// OTTR-1215: a planted count or pair never reaches the session either; the
+			// only GIT_CONFIG_* entries the env carries are the gc pins the local
+			// dispatch appends after the strip.
+			const env = seen[0]!.env;
+			expect(env?.GIT_CONFIG_COUNT).toBe("2");
+			expect(env?.GIT_CONFIG_KEY_0).toBe("gc.auto");
+			expect(env?.GIT_CONFIG_VALUE_0).toBe("0");
+			expect(env?.GIT_CONFIG_KEY_1).toBe("maintenance.auto");
+			expect(env?.GIT_CONFIG_VALUE_1).toBe("false");
 		} finally {
 			for (const n of names) delete process.env[n];
 			rmSync(dir, { recursive: true, force: true });
@@ -7163,6 +7179,84 @@ describe("createRunSink stream line cap", () => {
 			expect(logText).toContain(`${lineDropNotice()}\n`);
 			expect(logText).not.toContain("aaaa");
 			expect(sink.state.sessionId).toBe("cap-sess");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("appendGitPins", () => {
+	test("writes the gc pins at count 0 on a clean env", () => {
+		const env: Record<string, string | undefined> = {};
+		appendGitPins(env);
+		expect(env.GIT_CONFIG_COUNT).toBe("2");
+		expect(env.GIT_CONFIG_KEY_0).toBe("gc.auto");
+		expect(env.GIT_CONFIG_VALUE_0).toBe("0");
+		expect(env.GIT_CONFIG_KEY_1).toBe("maintenance.auto");
+		expect(env.GIT_CONFIG_VALUE_1).toBe("false");
+	});
+
+	test("appends after pairs the base already carries", () => {
+		const env: Record<string, string | undefined> = {
+			GIT_CONFIG_COUNT: "2",
+			GIT_CONFIG_KEY_0: "credential.helper",
+			GIT_CONFIG_VALUE_0: "",
+			GIT_CONFIG_KEY_1: "credential.https://github.com.helper",
+			GIT_CONFIG_VALUE_1: "!f() { :; }; f",
+		};
+		appendGitPins(env);
+		expect(env.GIT_CONFIG_COUNT).toBe("4");
+		expect(env.GIT_CONFIG_KEY_0).toBe("credential.helper");
+		expect(env.GIT_CONFIG_KEY_2).toBe("gc.auto");
+		expect(env.GIT_CONFIG_KEY_3).toBe("maintenance.auto");
+	});
+
+	test("a malformed count starts at 0", () => {
+		const env: Record<string, string | undefined> = {
+			GIT_CONFIG_COUNT: "junk",
+		};
+		appendGitPins(env);
+		expect(env.GIT_CONFIG_COUNT).toBe("2");
+		expect(env.GIT_CONFIG_KEY_0).toBe("gc.auto");
+		expect(env.GIT_CONFIG_VALUE_0).toBe("0");
+	});
+});
+
+describe("startRun local dispatch carries the gc pins", () => {
+	// OTTR-1215 regression: a local run is a root session (merge, release, review
+	// turns) whose own git runs without the board's -c pins. Auto gc or maintenance
+	// there deletes a worktree admin entry through a symlink a worker turn planted
+	// in its project's .git, unlinking the link's target as root — in the incident
+	// shape, /dev/null itself. The pins must ride the spawn env.
+	test("the spawned session env pins gc.auto and maintenance.auto", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gcpins-"));
+		try {
+			const captured: Array<Record<string, string | undefined>> = [];
+			const fake = new FakeOmp(4242);
+			const launcher: RunLauncher = (_c, _a, options) => {
+				captured.push(
+					(options.env ?? {}) as Record<string, string | undefined>,
+				);
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			await startRun({
+				cwd: dir,
+				prompt: "check the work",
+				sessionDir: dir,
+				extensionPath: "/unused.ts",
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+			});
+			const env = captured[0];
+			expect(env).toBeDefined();
+			expect(env?.GIT_CONFIG_COUNT).toBe("2");
+			expect(env?.GIT_CONFIG_KEY_0).toBe("gc.auto");
+			expect(env?.GIT_CONFIG_VALUE_0).toBe("0");
+			expect(env?.GIT_CONFIG_KEY_1).toBe("maintenance.auto");
+			expect(env?.GIT_CONFIG_VALUE_1).toBe("false");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

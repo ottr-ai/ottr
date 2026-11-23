@@ -19,6 +19,7 @@ import { aptListPath } from "./apt.ts";
 import { prepareTurnCache, serverTurnCacheRoot } from "./cachesweep.ts";
 import { stripServerChildEnv } from "./childEnv.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
+import { devNullGuard } from "./devNullGuard.ts";
 import { errmsg } from "./errmsg.ts";
 import {
 	type CommitIdentity,
@@ -82,6 +83,7 @@ import {
 } from "./workers.ts";
 import {
 	GIT_AUTH_ENV_NAME,
+	GIT_GC_PINS,
 	gitSecrets,
 	redact,
 	redactingWriter,
@@ -2115,6 +2117,25 @@ function restoreParkedToolDirs(parked: ParkedDir[], sink: RunSink): void {
 	}
 }
 
+/**
+ * Appends the board's gc/maintenance pins as command-scope env config (GIT_CONFIG_COUNT
+ * and friends), after any pairs the base already carries. A local run is a root session
+ * (merge, release, review turns in the server container) whose own git runs without the
+ * board's -c pins: auto gc or maintenance there deletes a worktree admin entry through a
+ * symlink a worker turn planted in its project's .git (GIT_GC_PINS), unlinking the link's
+ * target as root — in the incident shape, /dev/null itself. Command scope outranks planted
+ * repo and global config, so no planted config re-enables either key.
+ */
+export function appendGitPins(env: Record<string, string | undefined>): void {
+	const parsed = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+	const at = Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+	GIT_GC_PINS.forEach(([k, v], i) => {
+		env[`GIT_CONFIG_KEY_${at + i}`] = k;
+		env[`GIT_CONFIG_VALUE_${at + i}`] = v;
+	});
+	env.GIT_CONFIG_COUNT = String(at + GIT_GC_PINS.length);
+}
+
 /** The local dispatch: omp spawns on this host and streams its events into the sink. */
 function startLocalRun(s: RunStart): RunHandle {
 	const {
@@ -2165,6 +2186,7 @@ function startLocalRun(s: RunStart): RunHandle {
 	const scratch = mkdtempSync(join(tmpdir(), "ottr-run-"));
 	base.TMPDIR = scratch;
 	base.OTTR_TMP_ROOT = tmpdir();
+	appendGitPins(base);
 	// OTTR-990: the run cwd is a worker-writable worktree, and omp imports its project
 	// custom tools (`.omp/tools`, plugins, foreign `.claude`/`.codex` tool dirs) into
 	// this server process at session start. Park them out of discovery for the run and
@@ -2606,6 +2628,14 @@ function resolveMemoryBinding(
 }
 
 export async function startRun(o: StartOptions): Promise<RunHandle> {
+	// OTTR-1215: every turn and every check session on this host launches through
+	// here (local, worker or vm dispatch), so the /dev/null guard runs first: it
+	// repairs a device that lost its 1:3 character shape, records one notice, and
+	// a device it cannot repair fails the dispatch closed.
+	const dn = devNullGuard.check();
+	if (dn.broken && !dn.repaired)
+		throw new Error(dn.notice ?? "devnull: /dev/null is not the null device");
+	if (dn.first) console.error(`devnull: ${dn.notice}`);
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
 	const vmToken = o.vm

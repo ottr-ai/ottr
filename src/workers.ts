@@ -21,6 +21,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
 import { prepareTurnCache } from "./cachesweep.ts";
 import { pidAlive } from "./dblock.ts";
+import { devNullGuard } from "./devNullGuard.ts";
 import { acquireLayerUse } from "./layers.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
@@ -669,6 +670,16 @@ export function serveWorker(opts: {
 		// fall-back to a root turn.
 		let ids: TurnIdentity | null = null;
 		let runNotes = notes;
+		// OTTR-1215: the guard runs before this container runs a turn. A repaired
+		// device carries its one notice into this run's stream once; a device the
+		// guard cannot repair refuses the run closed.
+		const dn = devNullGuard.check();
+		if (dn.broken && !dn.repaired)
+			return new Response(`devnull: ${dn.notice}`, { status: 500 });
+		if (dn.first) {
+			runNotes += `devnull: ${dn.notice}\n`;
+			console.error(`devnull: ${dn.notice}`);
+		}
 		// The run's release of its layer-copy marker line (OTTR-1179); it rides
 		// the same closure as the layer lease, so a finished run stops
 		// protecting its copy and the next prune for the project reclaims it.
@@ -882,8 +893,15 @@ export function serveWorker(opts: {
 	};
 	const route = async (request: Request): Promise<Response> => {
 		const url = new URL(request.url);
-		if (request.method === "GET" && url.pathname === "/healthz")
+		if (request.method === "GET" && url.pathname === "/healthz") {
+			// OTTR-1215: the container probe also guards: it repairs a broken
+			// /dev/null between turns, and a device it cannot repair answers 503,
+			// which makes compose restart the container onto a fresh /dev.
+			const dn = devNullGuard.check();
+			if (dn.broken && !dn.repaired)
+				return new Response(`devnull: ${dn.notice}`, { status: 503 });
 			return new Response("ok");
+		}
 		if (request.method === "GET" && url.pathname === "/signins")
 			return handleSignIns(request);
 		if (request.method === "GET" && url.pathname === "/stats")

@@ -87,6 +87,7 @@ import {
 import { logError } from "./crash.ts";
 import { checkDeepened, type DeepenCheck, deepenDraft } from "./deepen.ts";
 import { type DependabotState, dependabotAlertsState } from "./dependabot.ts";
+import { devNullGuard } from "./devNullGuard.ts";
 import { errmsg, requestFailed } from "./errmsg.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import {
@@ -790,6 +791,9 @@ interface AppDeps {
 	/** OTTR-763: the cross-project checkout guard's ambiguous-change bell notices (one per
 	 * change; names the commit and the running cards); absent = none. */
 	checkoutNotices?: () => string[];
+	/** OTTR-1215: the /dev/null guard's repair notices (one per incident, with the evidence);
+	 * absent = none. */
+	devNullNotices?: () => string[];
 	/** The board's live runs (project, id, runner hostname or "server", Stryker progress), so the
 	 * /system view can name the runs waiting on a runner's mutation lock; absent = none. */
 	liveRuns?: () => LiveRun[];
@@ -6777,6 +6781,9 @@ export async function createApp(deps: AppDeps) {
 				// OTTR-763: the checkout guard's ambiguous-change notices; one per change,
 				// naming the commit and the running cards; bounded and expiring in the loop.
 				...(deps.checkoutNotices?.() ?? []),
+				// OTTR-1215: the /dev/null guard's repair notices; one per incident, with
+				// the evidence of what the broken file held.
+				...(deps.devNullNotices?.() ?? []),
 				// OTTR-942: the PR watcher's skipped-review notices; one per PR and head.
 				...prWatcher.skipNotices(),
 				...(githubApp === null ? [] : [appCheckWarning(appCheck)]).filter(
@@ -15841,16 +15848,22 @@ export async function createApp(deps: AppDeps) {
 			// Through api() like every other route (R2-11): the Host allowlist must cover it, so
 			// a DNS-rebinding page cannot read the version or whether onboarding is open.
 			GET: async (req) =>
-				await api(req, async () =>
-					json({
+				await api(req, async () => {
+					// OTTR-1215: the compose health probe guards the container's /dev/null
+					// too; a device the guard cannot repair answers 503, and compose
+					// restarts the container onto a fresh /dev.
+					const dn = devNullGuard.check();
+					if (dn.broken && !dn.repaired)
+						return new Response(`devnull: ${dn.notice}`, { status: 503 });
+					return json({
 						onboarding: deps.hosted === undefined && admin === null,
 						// shownVersion: serverVersion keeps the boot-time stamp for the reload
 						// handshake, but the sidebar must never show a bare timestamp.
 						version: shownVersion(deps.serverVersion),
 						live: !prod,
 						...(deps.hosted !== undefined && { hosted: true }),
-					}),
-				),
+					});
+				}),
 		},
 		// Hosted credit stop (docs/specs/hosted-mode.md section 5): the control plane's call when the
 		// tenant runs out of credit. hostedRefusal lets only a signed control identity reach it.

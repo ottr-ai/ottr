@@ -35,6 +35,7 @@ import {
 } from "./cachesweep.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
+import { devNullGuard } from "./devNullGuard.ts";
 import { errmsg } from "./errmsg.ts";
 import { defaultSshDir } from "./gitHosts.ts";
 import { syncWorktreeTo } from "./gitHttp.ts";
@@ -1407,6 +1408,8 @@ const app = await createApp({
 	codeScanPollNextAt: () => codeScanPollGrid.nextAt,
 	// OTTR-763: the checkout guard's ambiguous-change notices for the bell.
 	checkoutNotices: () => loop.checkoutNotices(),
+	// OTTR-1215: the /dev/null guard's repair notices for the bell.
+	devNullNotices: () => devNullGuard.notices(),
 	// The /system view's live runs: the loop keys entries `${project}/${id}`; split at the first "/".
 	liveRuns: () =>
 		[...loop.running].map(([key, e]) => {

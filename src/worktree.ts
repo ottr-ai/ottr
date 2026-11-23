@@ -236,6 +236,22 @@ const PINNED_ARGS: Record<string, readonly string[]> = {
 export const GIT_AUTH_ENV_NAME =
 	/^(GIT_ASKPASS|GIT_SSH_COMMAND|GIT_ALLOW_PROTOCOL|GIT_PROXY_COMMAND|GIT_CONFIG_COUNT|GIT_CONFIG_(KEY|VALUE)_\d+|OTTR_GIT_(USER|TOKEN)_\d+)$/;
 
+/**
+ * The auto gc/maintenance pins every git on a board host carries: auto gc or
+ * maintenance prunes stale worktree admin entries, and git (2.47) follows a
+ * symlinked admin entry when it deletes one, emptying the link's target
+ * (guardAdminEntries). Worker turns own their project's whole .git (OTTR-994),
+ * so the board's git pins both keys off inside GIT_CONFIG_PINS, and every root
+ * local session inherits them as command-scope env config (runner.ts
+ * appendGitPins reads this pair list — the argv form cannot ride an env) — in
+ * the 2026-11-22 incident shape the link's target was /dev/null itself. The
+ * two keys here and the gc entries of GIT_CONFIG_PINS must stay the same.
+ */
+export const GIT_GC_PINS: ReadonlyArray<readonly [string, string]> = [
+	["gc.auto", "0"],
+	["maintenance.auto", "false"],
+];
+
 let networkAuthResolver: (cwd: string) => Record<string, string> = () => ({});
 export function setNetworkGitAuth(
 	fn: (cwd: string) => Record<string, string>,
@@ -449,6 +465,7 @@ export async function git(
 			...GIT_CONFIG_PINS,
 			// Auto gc/maintenance prunes stale worktree admin entries, and git follows a symlinked
 			// entry when it deletes one (guardAdminEntries): the board's git never runs either.
+
 			// OTTR-1176: main checkouts are turn-uid-owned (OTTR-994 chowns them for a
 			// run) and an image roll recreated the server while the ownership was mid
 			// change, so a branch read died with "detected dubious ownership" before the
