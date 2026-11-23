@@ -27,7 +27,11 @@ import {
 } from "./turnUid.ts";
 import {
 	detachedRuns,
+	feedCappedLines,
+	flushCappedLines,
 	killDetached,
+	lineDropNotice,
+	MAX_STREAM_LINE_CHARS,
 	matchSweepTarget,
 	probeRun,
 	runWorker,
@@ -4777,5 +4781,165 @@ describe("stale turn probe and fix (OTTR-1261)", () => {
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	}, 30_000);
+});
+
+describe("feedCappedLines", () => {
+	const emit =
+		(out: string[]) =>
+		(t: string): void => {
+			out.push(t);
+		};
+
+	test("splits a line across chunks and keeps the tail bounded", () => {
+		const cap = { partial: "", dropping: false };
+		const out: string[] = [];
+		feedCappedLines(cap, "he", emit(out), () => out.push("<dropped>"));
+		expect(out).toEqual([]);
+		expect(cap.partial).toBe("he");
+		feedCappedLines(cap, "llo\nwor", emit(out), () => out.push("<dropped>"));
+		feedCappedLines(cap, "ld\n", emit(out), () => out.push("<dropped>"));
+		expect(out).toEqual(["hello", "world"]);
+		expect(cap.partial).toBe("");
+		expect(cap.dropping).toBe(false);
+	});
+
+	test("keeps a line that ends exactly at the cap", () => {
+		const cap = { partial: "", dropping: false };
+		const out: string[] = [];
+		feedCappedLines(
+			cap,
+			`${"x".repeat(MAX_STREAM_LINE_CHARS)}\n`,
+			emit(out),
+			() => out.push("<dropped>"),
+		);
+		expect(out).toEqual(["x".repeat(MAX_STREAM_LINE_CHARS)]);
+		expect(out.some((l) => l === "<dropped>")).toBe(false);
+	});
+
+	test("drops an oversized line once and keeps the next line, even from the same chunk", () => {
+		const cap = { partial: "", dropping: false };
+		const out: string[] = [];
+		// One under the cap: the next chunk pushes the line over it and also
+		// carries the line's end plus a following normal line.
+		feedCappedLines(cap, "x".repeat(MAX_STREAM_LINE_CHARS - 1), emit(out), () =>
+			out.push("<dropped>"),
+		);
+		feedCappedLines(cap, "yy\nok\n", emit(out), () => out.push("<dropped>"));
+		expect(out).toEqual(["<dropped>", "ok"]);
+		expect(cap.partial).toBe("");
+		expect(cap.dropping).toBe(false);
+	});
+
+	test("flushCappedLines emits the bounded tail once and clears it", () => {
+		const cap = { partial: "", dropping: false };
+		const out: string[] = [];
+		feedCappedLines(cap, "tail", emit(out), () => out.push("<dropped>"));
+		flushCappedLines(cap, emit(out));
+		flushCappedLines(cap, emit(out));
+		expect(out).toEqual(["tail"]);
+		expect(cap.partial).toBe("");
+	});
+});
+
+describe("stream line cap", () => {
+	// Streams `bytes` of newline-free filler, then a normal event line and the done
+	// sentinel, as 64 KiB chunks over a real local HTTP server. Validation #OTTR-1231
+	// ran this shape through the unfixed reader and OOM-killed a 512 MiB job at a
+	// 128 MiB line.
+	function floodServer(bytes: number): ReturnType<typeof Bun.serve> {
+		const chunkSize = 64 * 1024;
+		let sent = 0;
+		const enc = new TextEncoder();
+		return Bun.serve({
+			port: 0,
+			idleTimeout: 0,
+			fetch: () =>
+				new Response(
+					new ReadableStream({
+						start(c) {
+							c.enqueue(enc.encode("a".repeat(chunkSize)));
+							sent += chunkSize;
+						},
+						pull(c) {
+							if (sent >= bytes) {
+								// End the dropped line first: the event and sentinel after
+								// it are ordinary lines the reader must keep.
+								c.enqueue(enc.encode("\n"));
+								c.enqueue(enc.encode('{"type":"after-flood"}\n'));
+								c.enqueue(
+									enc.encode(
+										`${JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } })}\n`,
+									),
+								);
+								c.close();
+								return;
+							}
+							c.enqueue(enc.encode("a".repeat(chunkSize)));
+							sent += chunkSize;
+						},
+					}),
+					{ headers: { "content-type": "text/plain" } },
+				),
+		});
+	}
+
+	test("a 64 MiB chunked flood never grows the retained tail past the cap", () => {
+		// The memory bound of the reader is exactly this invariant: the accumulated
+		// tail stays at or under MAX_STREAM_LINE_CHARS and the dropped line leaves no
+		// retained string behind. Asserting it directly keeps the bound deterministic;
+		// a raw RSS delta on this box is dominated by GC scheduling noise (measured
+		// 205 MB growth with the fix in place under load, against the unfixed
+		// reader's real 191 MB baseline in validation #OTTR-1231 — no threshold
+		// separates the two, so the RSS form false-alarms).
+		const cap = { partial: "", dropping: false };
+		let dropped = 0;
+		const chunk = "a".repeat(64 * 1024);
+		for (let i = 0; i < 1024; i++)
+			feedCappedLines(
+				cap,
+				chunk,
+				() => {},
+				() => {
+					dropped++;
+				},
+			);
+		expect(dropped).toBe(1); // one notice for the one dropped line
+		expect(cap.dropping).toBe(true);
+		expect(cap.partial.length).toBeLessThanOrEqual(MAX_STREAM_LINE_CHARS);
+	});
+
+	test("a newline-free 64 MiB line settles with a drop notice and bounded reader memory", async () => {
+		const server = floodServer(64 * 1024 * 1024);
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "flood", argv: [], cwd: dir, stdin: "", env: {} },
+			{ urls: [`http://127.0.0.1:${server.port}`] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		// The oversized line never reached the sink: the plain-text notice replaces it.
+		expect(sink.lines).toContain(`${lineDropNotice()}\n`);
+		expect(sink.lines.some((l) => l.startsWith("a"))).toBe(false);
+		server.stop(true);
+		// The memory bound itself is asserted against feedCappedLines directly in the
+		// flood-invariant unit test above; a wall-clock RSS delta here measures GC
+		// scheduling noise, not the reader (see that test's comment).
+	}, 60_000);
+
+	test("a normal event line after a dropped oversized line still reaches sink.line", async () => {
+		const server = floodServer(MAX_STREAM_LINE_CHARS + 1024 * 1024);
+		const sink = fakeSink();
+		const { done } = runWorker(
+			{ id: "flood-next", argv: [], cwd: dir, stdin: "", env: {} },
+			{ urls: [`http://127.0.0.1:${server.port}`] },
+			sink,
+		);
+		const result = await done;
+		expect(result.exitCode).toBe(0);
+		expect(sink.lines).toContain(`${lineDropNotice()}\n`);
+		expect(sink.lines).toContain('{"type":"after-flood"}\n');
+		server.stop(true);
 	}, 30_000);
 });

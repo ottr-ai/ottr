@@ -859,6 +859,7 @@ export function serveWorker(opts: {
 			closed: false,
 			stopWatch: (): void => {},
 			partial: "",
+			dropping: false,
 			stderrTail: "",
 		};
 		child.stderr?.on("data", (chunk: Buffer) => {
@@ -1229,12 +1230,14 @@ export function flushCappedLines(
 	}
 }
 
-/** Mutable state of one /run: the stream's closed flag, the stryker watch stopper, omp's
- * unterminated stdout tail, and the reserved stderr tail. */
+/** Mutable state of one /run: the stream's closed flag, the stryker watch stopper,
+ * omp's unterminated stdout tail (capped by feedCappedLines), and the reserved
+ * stderr tail. */
 interface RunStreamState {
 	closed: boolean;
 	stopWatch(): void;
 	partial: string;
+	dropping: boolean;
 	stderrTail: string;
 }
 
@@ -1261,19 +1264,19 @@ interface RunStreamArgs {
 	oomBefore: OomSnapshot | null;
 }
 
-/** Feeds one omp stdout chunk through push a full line at a time; the tail stays in `state`. */
+/** Feeds one omp stdout chunk through push a full line at a time; the tail stays in
+ * `state`, capped by feedCappedLines (OTTR-1035). */
 function pushLines(
 	state: RunStreamState,
 	chunk: Buffer,
 	push: (text: string) => void,
 ): void {
-	state.partial += chunk.toString("utf8");
-	let idx = state.partial.indexOf("\n");
-	while (idx >= 0) {
-		push(state.partial.slice(0, idx + 1));
-		state.partial = state.partial.slice(idx + 1);
-		idx = state.partial.indexOf("\n");
-	}
+	feedCappedLines(
+		state,
+		chunk.toString("utf8"),
+		(text) => push(`${text}\n`),
+		() => push(`${lineDropNotice()}\n`),
+	);
 }
 
 /** One OOM snapshot of the worker container's cgroup v2 files
@@ -1587,7 +1590,20 @@ async function consumeRun(
 	if (body === null) throw new Error(`worker ${url} answered 200 with no body`);
 	const reader = body.getReader();
 	const dec = new TextDecoder();
-	let partial = "";
+	const cap: LineCapState = { partial: "", dropping: false };
+	// A line after the sentinel in the same chunk is dropped, as the inline scan did:
+	// settleSentinel ends the run, so nothing may reach the sink behind it.
+	let sent = false;
+	const onLine = (raw: string): void => {
+		if (sent) return;
+		const sentinel = parseSentinel(raw);
+		if (sentinel) {
+			sent = true;
+			settleSentinel(sentinel, sink, url, finish);
+			return;
+		}
+		sink.line(raw);
+	};
 	let lost: string | undefined;
 	try {
 		for (;;) {
@@ -1595,25 +1611,15 @@ async function consumeRun(
 			const { done: ended, value } = await reader.read();
 			if (settled()) return;
 			if (ended) break;
-			partial += dec.decode(value, { stream: true });
-			let idx = partial.indexOf("\n");
-			while (idx >= 0) {
-				const line = partial.slice(0, idx);
-				partial = partial.slice(idx + 1);
-				const sentinel = parseSentinel(line);
-				if (sentinel) {
-					settleSentinel(sentinel, sink, url, finish);
-					return;
-				}
-				sink.line(line);
-				idx = partial.indexOf("\n");
-			}
+			feedCappedLines(cap, dec.decode(value, { stream: true }), onLine, () =>
+				onLine(lineDropNotice()),
+			);
 		}
 	} catch (err) {
 		// Keep the cause: the tail names why the stream died (idle timer, reset, ...).
 		lost = err instanceof Error ? err.message : String(err);
 	}
-	if (partial.trim()) sink.line(partial);
+	flushCappedLines(cap, onLine);
 	if (settled()) return;
 	// Gone without a sentinel: cancel the request so the daemon kills omp instead of
 	// running a turn whose client left (also covers a throw inside the read loop).

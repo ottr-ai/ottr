@@ -64,6 +64,10 @@ import {
 } from "./vmValidateShared.ts";
 import {
 	type DetachedRun,
+	feedCappedLines,
+	flushCappedLines,
+	type LineCapState,
+	lineDropNotice,
 	type ProvisionLists,
 	type VmOutcome,
 	type VmSpec,
@@ -1317,30 +1321,27 @@ function parseGuestDone(line: string): GuestDone | null {
 	};
 }
 
-/** Relays a guest NDJSON body line by line; returns the guest's sentinel, null without one. */
+/** Relays a guest NDJSON body line by line; returns the guest's sentinel, null without
+ * one. Lines are capped by feedCappedLines (OTTR-1035): a newline-free line over the
+ * cap is dropped with a notice instead of growing this reader. */
 async function relayLines(
 	body: ReadableStream<Uint8Array>,
 	push: (line: string) => void,
 ): Promise<GuestDone | null> {
 	const d = new TextDecoder();
-	let partial = "";
+	const cap: LineCapState = { partial: "", dropping: false };
 	let done: GuestDone | null = null;
 	const line = (l: string): void => {
 		const s = parseGuestDone(l);
 		if (s) done = s;
 		else push(`${l}\n`);
 	};
+	const onDrop = (): void => push(`${lineDropNotice()}\n`);
 	for await (const chunk of body) {
-		partial += d.decode(chunk, { stream: true });
-		let idx = partial.indexOf("\n");
-		while (idx >= 0) {
-			line(partial.slice(0, idx));
-			partial = partial.slice(idx + 1);
-			idx = partial.indexOf("\n");
-		}
+		feedCappedLines(cap, d.decode(chunk, { stream: true }), line, onDrop);
 	}
-	partial += d.decode();
-	if (partial.length > 0) line(partial);
+	feedCappedLines(cap, d.decode(), line, onDrop);
+	flushCappedLines(cap, line);
 	return done;
 }
 
