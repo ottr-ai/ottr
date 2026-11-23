@@ -116,6 +116,10 @@ notes it when the deployment backend is hindsight.
   seed value never re-enters a turn through the daemon.
 - The compose `HINDSIGHT_API_TOKEN` seed keeps serving hand-run omp in a
   container; board-dispatched turns never receive it.
+- The memory token opens no card routes: `agentRefusal` (card filing,
+  trending verdicts, sandbox runs) and `agentCardRequest` refuse a
+  `memoryOnly` grant, so a run that holds no boot token (a stripBoard retro
+  run) cannot file cards with its memory token.
 - `/llm` tokens are unchanged: the memory token would also pass `vmRoute`'s
   check on `/llm`, but the gateway is null on boards without VMs and hosted
   merge turns are server-side anyway.

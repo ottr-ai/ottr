@@ -5415,6 +5415,11 @@ export async function createApp(deps: AppDeps) {
 			token !== null &&
 			secretsEqual(token, bootToken);
 		const vm = boot ? null : (deps.vmTokens?.check(token) ?? null);
+		// OTTR-1006: a memory token is not an agent credential. A run that holds no boot
+		// token (a stripBoard retro run) still carries one, and it must file no cards,
+		// no trending verdicts and no sandbox runs with it.
+		if (vm !== null && vm.memoryOnly === true)
+			return json({ error: "unauthorized" }, 401);
 		if (!boot && vm === null) return json({ error: "unauthorized" }, 401);
 		const path = new URL(req.url).pathname;
 		const m =
@@ -5450,13 +5455,15 @@ export async function createApp(deps: AppDeps) {
 
 	/** OTTR-850: true when the request carries a live board or VM token, so the card it
 	 * files is agent-written (the extension's create_task), never the user's New task
-	 * form. The server reads the token itself; no client flag decides authorship. */
+	 * form. The server reads the token itself; no client flag decides authorship.
+	 * OTTR-1006: a memory-only token is no authorship credential (it files nothing). */
 	function agentCardRequest(req: Request): boolean {
 		const token = req.headers.get("x-board-token");
 		if (token === null) return false;
 		if (deps.board !== undefined && secretsEqual(token, deps.board.token))
 			return true;
-		return (deps.vmTokens?.check(token) ?? null) !== null;
+		const vm = deps.vmTokens?.check(token) ?? null;
+		return vm !== null && vm.memoryOnly !== true;
 	}
 
 	/**

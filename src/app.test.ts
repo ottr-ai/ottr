@@ -178,7 +178,7 @@ import {
 } from "./updateCycle.ts";
 import { loadSkips } from "./updates.ts";
 import { vmState } from "./vmState.ts";
-import { VmTokens } from "./vmTokens.ts";
+import { memoryGrant, VmTokens } from "./vmTokens.ts";
 import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 import { loadSubs, PUSH_SUBJECT, saveSubs } from "./webpush.ts";
 import { WORKER_DONE, type WorkerRequest } from "./workers.ts";
@@ -29174,5 +29174,30 @@ describe("hindsight memory binding (OTTR-1006)", () => {
 			worker.stop(true);
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
+	}, 30_000);
+
+	test("a memory token files no cards and still opens its own bank", async () => {
+		// The wall state this test needs: the proxy upstream from the sequence test.
+		process.env.HINDSIGHT_API_URL = `http://127.0.0.1:${upstream.port}`;
+		const token = vmTokens.issue(memoryGrant("p1", "CARD-1"));
+		const turn = {
+			Host: "ottr:4852",
+			Origin: "http://ottr:4852",
+			"x-board-token": token,
+		};
+		for (const path of [
+			"/api/projects/p1/tasks",
+			"/api/projects/p1/trending/verdicts",
+			"/api/projects/p1/sandbox",
+		]) {
+			const res = await post(path, { prompt: "nope" }, turn);
+			expect(`${path} ${res.status}`).toBe(`${path} 401`);
+		}
+		// Route-scoped: the same token still reaches its own bank through the proxy.
+		const hs = await fetch(
+			`http://127.0.0.1:${server.port}/hindsight/v1/default/banks/ottr-p1/memories`,
+			{ headers: { authorization: `Bearer ${token}` } },
+		);
+		expect(hs.status).toBe(200);
 	}, 30_000);
 });

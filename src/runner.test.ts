@@ -5449,6 +5449,77 @@ describe("startRun agent layer pinning", () => {
 		}
 	});
 
+	test("a stripBoard retro run keeps its memory binding, and the token files no cards", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-retro-memtok-"));
+		const bodies: WorkerRequest[] = [];
+		const { promise: release, resolve: unblock } =
+			Promise.withResolvers<void>();
+		const arrived = Promise.withResolvers<void>();
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				bodies.push((await req.json()) as WorkerRequest);
+				arrived.resolve();
+				await release;
+				return new Response(
+					`${JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } })}\n`,
+				);
+			},
+		});
+		const tokens = new VmTokens({ file: null });
+		const saved = saveEnv();
+		try {
+			process.env.HINDSIGHT_API_URL = "http://hindsight.local:8888";
+			process.env.HINDSIGHT_API_TOKEN = "tenant-secret";
+			const { done } = await startRun({
+				cwd: dir,
+				prompt: "retro it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: join(dir, "ext.ts"),
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				launcher: (() => {
+					throw new Error("a worker turn must never spawn locally");
+				}) as RunLauncher,
+				memoryTokens: tokens,
+				stripBoard: true,
+				project: "velvarr",
+				board: {
+					url: "http://ottr:8080",
+					token: "boot-token",
+					project: "velvarr",
+					taskId: "T-12",
+				},
+			});
+			await arrived.promise;
+			expect(bodies).toHaveLength(1);
+			const env = bodies[0]!.env;
+			// stripBoard strips the board coordinates even when the board URL exists:
+			// the retro run holds only its memory token, never the boot token.
+			expect(env.OTTR_BOARD_TOKEN).toBeUndefined();
+			expect(env.OTTR_BOARD_URL).toBeUndefined();
+			expect(env.HINDSIGHT_API_URL).toBe("http://ottr:8080/hindsight");
+			expect(env.HINDSIGHT_BANK_ID).toBe("ottr-velvarr");
+			expect(env.HINDSIGHT_SCOPING).toBe("global");
+			const token = env.HINDSIGHT_API_TOKEN;
+			expect(token).toMatch(/^[0-9a-f]{64}$/);
+			// memoryOnly keeps the card walls closed for this token (src/app.ts):
+			// a retro run files no cards, verdicts or sandbox runs with it.
+			const grant = tokens.check(token);
+			expect(grant?.memoryOnly).toBe(true);
+			expect(grant?.project).toBe("velvarr");
+			unblock();
+			expect((await done).exitCode).toBe(0);
+			expect(tokens.check(token)).toBeNull();
+		} finally {
+			restoreEnv(saved);
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 30_000);
+
 	test("a mnemopi deployment binds nothing; a project-less hindsight run logs why", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-memtok-off-"));
 		const tokens = new VmTokens({ file: null });

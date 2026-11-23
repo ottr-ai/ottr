@@ -19,12 +19,18 @@ export interface VmGrant {
 	worktree: string;
 	/** Task base as given at dispatch (a ref like `main`, or a sha); its ref stays fetchable. */
 	base?: string;
+	/** OTTR-1006: a memory-only grant (memoryGrant) opens /hindsight for its project and
+	 *  nothing else — the card walls (src/app.ts agentRefusal, agentCardRequest) refuse it,
+	 *  so a run that holds no boot token (a stripBoard retro run) cannot file cards,
+	 *  trending verdicts or sandbox runs with its memory token. */
+	memoryOnly?: true;
 }
 
 /** The grant of a classic run's memory token (docs/specs/hindsight-bank-binding.md): only
  *  the project and task matter to /hindsight's bank binding. The sentinel fields can never
  *  satisfy the git endpoint's checks (branch, worktree, base ref), so the token opens no
- *  git route; parseGrant rejects empty strings, so the values are non-empty sentinels. */
+ *  git route; parseGrant rejects empty strings, so the values are non-empty sentinels.
+ *  `memoryOnly` keeps the card walls closed for it (src/app.ts). */
 export function memoryGrant(project: string, taskId: string): VmGrant {
 	return {
 		project,
@@ -32,6 +38,7 @@ export function memoryGrant(project: string, taskId: string): VmGrant {
 		branch: "memory-token",
 		repoPath: "memory-token",
 		worktree: "memory-token",
+		memoryOnly: true,
 	};
 }
 
@@ -63,7 +70,9 @@ function parseGrant(v: unknown): VmGrant | null {
 		if (typeof base !== "string" || base === "") return null;
 		(g as Record<string, string>).base = base;
 	}
-	return Object.freeze(g as VmGrant);
+	const out = g as VmGrant;
+	if (o.memoryOnly === true) out.memoryOnly = true;
+	return Object.freeze(out);
 }
 
 /**
