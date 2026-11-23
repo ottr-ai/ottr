@@ -3,6 +3,7 @@
 import { childDatabaseEnv } from "./childEnv.ts";
 import { githubHost } from "./githubHost.ts";
 import { boardOmpEnv } from "./login.ts";
+import { modelFallbacks } from "./models.ts";
 import type {
 	ForkAnalysisResult,
 	ForkCommit,
@@ -668,10 +669,11 @@ export async function analyzeRange(
 		{ role: "system" as const, content: systemPrompt() },
 		{ role: "user" as const, content: buildUserMessage(range, prior) },
 	];
+	const chain = (deps?.fallbacks ?? modelFallbacks()).default ?? [];
 	const raw = await runGatewayWithFallbacks(
 		messages,
 		"@default",
-		deps?.fallbacks?.default ?? [],
+		chain,
 		deps?.spawn,
 	);
 	return parseAnalysis(raw, range);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -771,6 +771,107 @@ describe("runGateway", () => {
 			},
 		).catch(() => {});
 		expect(model).toBe("@default");
+	});
+	test("analyzeRange walks the default role's chain past a provider error", async () => {
+		const attempts: string[] = [];
+		const reply = JSON.stringify({
+			commits: [SHA1],
+			coverage: "n",
+			features: [],
+			proposals: [],
+		});
+		const out = await analyzeRange(
+			range(),
+			{ titles: [], declines: [] },
+			{
+				fallbacks: { default: ["c/d"] },
+				spawn: async (_argv, o) => {
+					const model = JSON.parse(o.stdin).body.model as string;
+					attempts.push(model);
+					if (model === "@default")
+						return {
+							code: 1,
+							stdout: "",
+							stderr: "gateway status 502: Codex is at capacity",
+						};
+					return {
+						code: 0,
+						stdout: [
+							JSON.stringify({ ready: true }),
+							JSON.stringify({
+								id: 1,
+								status: 200,
+								body: { choices: [{ message: { content: reply } }] },
+							}),
+						].join("\n"),
+						stderr: "",
+					};
+				},
+			},
+		);
+		expect(attempts).toEqual(["@default", "c/d"]);
+		expect(out.commits).toHaveLength(1);
+	});
+	test("analyzeRange reads the chain from the board config when deps omit fallbacks", async () => {
+		// The fork watcher's production shape: createForkWatcher (src/forks.ts) calls
+		// analyzeRange(range, prior) with no deps, so the chain must come from the
+		// board's config read (modelFallbacks()), pinned here like models.test.ts.
+		const pinned = join(tmpdir(), `ottr-forkchain-pin-${process.pid}`);
+		mkdirSync(pinned, { recursive: true });
+		writeFileSync(
+			join(pinned, "config.yml"),
+			"retry:\n  fallbackChains:\n    default:\n      - cfg/m\n",
+		);
+		const savedBoard = process.env.OTTR_BOARD_OMP_HOME;
+		const savedPin = process.env.PI_CODING_AGENT_DIR;
+		const home = join(pinned, "home");
+		mkdirSync(home, { recursive: true });
+		process.env.OTTR_BOARD_OMP_HOME = home;
+		process.env.PI_CODING_AGENT_DIR = pinned;
+		const attempts: string[] = [];
+		const reply = JSON.stringify({
+			commits: [SHA1],
+			coverage: "n",
+			features: [],
+			proposals: [],
+		});
+		try {
+			await analyzeRange(
+				range(),
+				{ titles: [], declines: [] },
+				{
+					spawn: async (_argv, o) => {
+						const model = JSON.parse(o.stdin).body.model as string;
+						attempts.push(model);
+						if (model === "@default")
+							return {
+								code: 1,
+								stdout: "",
+								stderr: "gateway status 502: Codex is at capacity",
+							};
+						return {
+							code: 0,
+							stdout: [
+								JSON.stringify({ ready: true }),
+								JSON.stringify({
+									id: 1,
+									status: 200,
+									body: { choices: [{ message: { content: reply } }] },
+								}),
+							].join("\n"),
+							stderr: "",
+						};
+					},
+				},
+			);
+		} finally {
+			if (savedBoard === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+			else process.env.OTTR_BOARD_OMP_HOME = savedBoard;
+			if (savedPin === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = savedPin;
+		}
+		expect(attempts).toEqual(["@default", "cfg/m"]);
+		rmSync(pinned, { recursive: true, force: true });
 	});
 	test("non-200 throws with the error message", async () => {
 		const out = runGateway([{ role: "user", content: "hi" }], async () => ({
