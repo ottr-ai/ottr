@@ -36,7 +36,7 @@ import {
 	runReleaseCommand,
 } from "./release.ts";
 import fc from "./test/properties.ts";
-import { gitExe } from "./worktree.ts";
+import { gitExe, gitSecrets, setGitSecrets } from "./worktree.ts";
 
 describe("releaseBlocked", () => {
 	type Card = Parameters<typeof releaseBlocked>[0][number];
@@ -1295,6 +1295,7 @@ const git = (...args) => {
 writeFileSync(record, JSON.stringify({ v, c, notes: readFileSync(n, "utf8"), head: git("rev-parse", "HEAD"), a }));
 // stdout and stderr are read concurrently, so the failing mode prints to one stream only.
 if (mode === "fail") { console.error("boom"); process.exit(3); }
+if (mode === "leak") { console.log("gh=" + (process.env.GH_TOKEN ?? "")); process.exit(7); }
 console.log("releasing " + v);
 if (mode === "sidetag") { git("tag", v, c + "~1"); git("push", "-q", "origin", "refs/tags/" + v); }
 if (mode === "ok" || mode === "offmain" || mode === "local") {
@@ -1408,6 +1409,35 @@ describe("runReleaseCommand against real repos", () => {
 		await expect(run("fail", sha, wt, "v1.0.1")).rejects.toThrow(
 			"release command exited with code 3: boom",
 		);
+	}, 60_000);
+
+	// OTTR-1019: the command runs with the server's env (releaseEnv), so an echoed
+	// GH_TOKEN must not reach the log lines or the thrown error raw. The log callback
+	// here mirrors the board's `| ${l}` -> appendLog path, which has no redaction.
+	test("a leaked GH_TOKEN redacts out of the log lines and the error", async () => {
+		const { sha, wt } = reviewed();
+		const dummy = "ott-dummy-gh-token-0123456789abcdef";
+		const previous = gitSecrets();
+		const savedToken = process.env.GH_TOKEN;
+		process.env.GH_TOKEN = dummy;
+		setGitSecrets([...previous, dummy]);
+		const lines: string[] = [];
+		try {
+			await expect(
+				run("leak", sha, wt, "v1.0.6", {
+					log: (l) => {
+						lines.push(l);
+					},
+				}),
+			).rejects.toThrow("release command exited with code 7: gh=[REDACTED]");
+		} finally {
+			setGitSecrets(previous);
+			if (savedToken === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = savedToken;
+		}
+		// The child really received the token (releaseEnv forwards GH_TOKEN), so the
+		// assertion is not vacuous: the line carries only [REDACTED], never the raw value.
+		expect(lines).toEqual(["gh=[REDACTED]"]);
 	}, 60_000);
 
 	test("awaits an async log and reports its failure before command settlement", async () => {

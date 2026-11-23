@@ -13,6 +13,7 @@ import { VERSION_RE } from "./types.ts";
 import {
 	checkPinnedRemote,
 	git,
+	gitSecrets,
 	hostedGitAuth,
 	pushLfsObjects,
 	readGitdir,
@@ -1301,7 +1302,9 @@ export async function runReleaseCommand(o: {
 	});
 	let last = "";
 	const emit = async (raw: string): Promise<void> => {
-		const line = raw.replace(/\r$/, "");
+		// The command runs with the server's env (releaseEnv), so its output can echo a
+		// credential; the run writer's redaction (runner.ts) never sees this path (OTTR-1019).
+		const line = redact(raw.replace(/\r$/, ""), gitSecrets());
 		if (line.trim() === "") return;
 		await o.log(line);
 		last = line.trim();

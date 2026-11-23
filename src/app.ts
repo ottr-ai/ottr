@@ -4977,6 +4977,9 @@ export async function createApp(deps: AppDeps) {
 			...(githubApp === null || githubApp.unreadable === true
 				? []
 				: [githubApp.key]),
+			// The separate GH_TOKEN user token (applyGithubToken) reaches release command
+			// envs and server-side git output; it redacts like the stored tokens (OTTR-1019).
+			...(githubToken === null ? [] : [githubToken]),
 			...Object.values(deps.shared.envValues),
 			sshDir,
 			sshDir.replaceAll("\\", "/"),
@@ -8466,6 +8469,7 @@ export async function createApp(deps: AppDeps) {
 		});
 		await saveConfig();
 		applyGithubToken();
+		applyGitSecrets();
 		const secure = viaPublicHost(req);
 		// The second Set-Cookie header clears the legacy port-less name a browser may
 		// still hold from before the rename.
@@ -10970,6 +10974,7 @@ export async function createApp(deps: AppDeps) {
 		githubToken = token;
 		await saveConfig();
 		applyGithubToken();
+		applyGitSecrets();
 		// Immediate probe: a pasted token shows its real date at once.
 		const expiresAt = await refreshBoardExpiry();
 		return json({ tokenSet: true, expiresAt });
