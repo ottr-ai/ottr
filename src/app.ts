@@ -330,7 +330,9 @@ import {
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
+	LEAD_APPLIES_OPTION_LEGACY,
 	LEAD_NOT_APPLY_OPTION,
+	LEAD_NOT_APPLY_OPTION_LEGACY,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
 	lastReviewBase,
 	liveCardOf,
@@ -13115,58 +13117,6 @@ export async function createApp(deps: AppDeps) {
 			});
 		return matches;
 	}
-	/** The operator's free-text answer to a deployment question (OTTR-1227): the
-	 * exact option labels match before this reads any other text. The answer
-	 * reads in order. Hedged and unevidenced wording first ("do not know",
-	 * "cannot confirm", "possibly", "no evidence") reads as unclassified, so an
-	 * uncertain answer never turns its keywords into a decision. An answer that
-	 * starts with "no" is the operator's bare refusal and cancels, whatever
-	 * follows. Otherwise the answer splits into clauses at sentence and comma
-	 * boundaries: a clause whose negator sits with an applicability word ("does
-	 * not apply", "isn't applicable", "no longer relevant", "without applying")
-	 * refuses, and a clause with a bare applicability word ("applies", "yes")
-	 * confirms; a mix of both across clauses is unclassified. Negation reads
-	 * inside its own clause, so a side note in another clause never flips the
-	 * verdict. Anything else is unclassified and only records the answer.
-	 * Pure. */
-	function leadAnswerVerdict(answer: string): "applies" | "not-apply" | null {
-		const text = answer
-			.trim()
-			.replace(/\.$/, "")
-			.toLowerCase()
-			.replace(/[\u2018\u2019\u02bc\u02b9`]/g, "'")
-			.replace(/\bcan't\b/g, "cannot")
-			.replace(/\b(\w+)n't\b/g, "$1 not");
-		if (
-			/\b(?:do\s+not|does\s+not|did\s+not|don't|doesn't|didn't|cannot|can't|could\s+not|couldn't|not)\s+(?:know|sure|certain|confirm|verify|say|tell|determine|assess|judge|see|find|recall|remember)\b/.test(
-				text,
-			) ||
-			/\bno\s+(?:evidence|proof|indication|sign|reason|basis)\b/.test(text) ||
-			/\b(?:possibly|probably|perhaps|maybe|likely|unlikely|apparently|seemingly|presumably|arguably|might|may|could|would|seems?|unsure|unclear|hard\s+to\s+say|no\s+idea)\b/.test(
-				text,
-			)
-		)
-			return null;
-		if (/^no(?![a-z])/.test(text)) return "not-apply";
-		let applies = false;
-		let refuses = false;
-		for (const clause of text.split(/[.;:!?!,]|\bbut\b/)) {
-			if (
-				/\b(?:not|never|no\s+longer|cannot|neither|nor|without)\b.{0,20}\b(?:appl(?:y|ies|ied|ying|icable)|relevant)\b/.test(
-					clause,
-				)
-			)
-				refuses = true;
-			else if (
-				/\b(?:appl(?:y|ies|ied|ying|icable)|relevant|yes)\b/.test(clause)
-			)
-				applies = true;
-		}
-		if (refuses && applies) return null;
-		if (refuses) return "not-apply";
-		if (applies) return "applies";
-		return null;
-	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
 	 * `For "<question>": <answer>` line per question — raw answer text when the card
 	 * holds a single question — and each answer applies to that question's lead card.
@@ -13240,9 +13190,15 @@ export async function createApp(deps: AppDeps) {
 			);
 		const remaining = matches.values();
 		// An answer matches an option label case-insensitively, with one trailing
-		// period of the answer ignored (OTTR-1130).
+		// period of the answer ignored (OTTR-1130). Only the exact option labels
+		// decide: the board cancels on "Does not apply" and queues on "Applies",
+		// and "Not sure" and any free text leave the lead open and unchanged
+		// (OTTR-1227). The labels the first question cards shipped with still
+		// match, so stored `asked` on open cards keeps working.
 		const appliesLabel = LEAD_APPLIES_OPTION.toLowerCase();
 		const notApplyLabel = LEAD_NOT_APPLY_OPTION.toLowerCase();
+		const legacyAppliesLabel = LEAD_APPLIES_OPTION_LEGACY.toLowerCase();
+		const legacyNotApplyLabel = LEAD_NOT_APPLY_OPTION_LEGACY.toLowerCase();
 		type LeadCancellation = { id: string; reason: string; answer: string };
 		let cancelled: (LeadCancellation & { outcome: CancelOutcome }) | null =
 			null;
@@ -13291,11 +13247,12 @@ export async function createApp(deps: AppDeps) {
 					if (live === null) continue;
 					const answerLabel = m.answer.trim().replace(/\.$/, "").toLowerCase();
 					const verdict =
-						answerLabel === appliesLabel
+						answerLabel === appliesLabel || answerLabel === legacyAppliesLabel
 							? ("applies" as const)
-							: answerLabel === notApplyLabel
+							: answerLabel === notApplyLabel ||
+									answerLabel === legacyNotApplyLabel
 								? ("not-apply" as const)
-								: leadAnswerVerdict(m.answer);
+								: null;
 					if (verdict === "applies") {
 						if (live.stage === "backlog" && live.state === "idle")
 							await e.store.updateTask(lead.id, {
@@ -13325,10 +13282,7 @@ export async function createApp(deps: AppDeps) {
 						});
 						continue;
 					}
-					await appendDetails(
-						lead.id,
-						`${m.answer} (the answer matched no option, so the lead stays unchanged)`,
-					);
+					await appendDetails(lead.id, m.answer);
 					answered.add(lead.id);
 				}
 				if (free !== "")

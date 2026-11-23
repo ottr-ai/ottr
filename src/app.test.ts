@@ -114,6 +114,7 @@ import {
 	LEAD_APPLIES_OPTION,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
+	LEAD_UNSURE_OPTION,
 	PROMPT_EDIT_HELD,
 	pickRunnable,
 	type ReviewTask,
@@ -2492,150 +2493,53 @@ describe("task routes", () => {
 		expect(await errorOf(again)).toBe("task is not waiting for you");
 	});
 
-	test("a deployment question classifies free text: negation cancels with the run id, affirmation queues (OTTR-1227)", async () => {
-		const { lead1, lead2, ask } = await seedLeadAsk();
-		// The settle's deployment note sits on the first lead; the asking run's id
-		// lives only there, so the cancel reason can quote it.
-		await store.updateTask(lead1.id, {
-			details: `\nValidated by validation run #CLIP-70 on 2026-11-22: deployment — Q one?`,
-		});
-		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
-			text: `${askAnswerLine(
-				`Q one? (card #${lead1.id})`,
-				"No, this does not apply to our deployment: the legacy cache is gone",
-			)}\n${askAnswerLine(
-				`Q two? (card #${lead2.id})`,
-				"Yes, the risk applies to our deployment: the header is set",
-			)}`,
-		});
-		expect(res.status).toBe(200);
-		// The negation cancels the lead; the reason quotes the answer and the run.
-		const one = (await store.getTask(lead1.id))!;
-		expect(one.cancelledAt).not.toBeNull();
-		expect(one.state).toBe("idle");
-		expect(one.needsReason).toBe(
-			"Cancelled by the user's answer to the review's question: No, this does not apply to our deployment: the legacy cache is gone (validation run #CLIP-70)",
-		);
-		// The affirmation queues the lead like a confirmed verdict.
-		const two = (await store.getTask(lead2.id))!;
-		expect(two.stage).toBe("todo");
-		expect(two.state).toBe("queued");
-		expect(two.queuedAt).not.toBeNull();
-		expect(
-			two.prompt.endsWith(
-				"The user answered the review's question: Yes, the risk applies to our deployment: the header is set",
-			),
-		).toBe(true);
-		const done = (await store.getTask(ask.id))!;
-		expect(done.stage).toBe("done");
-	});
-
-	test("a deployment question keeps uncertain and side-note answers in their verdict (OTTR-1227)", async () => {
+	test("the three fixed options decide their leads; Not sure and free text only record (OTTR-1227)", async () => {
 		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
 			text: `${askAnswerLine(
 				`Q one? (card #${lead1.id})`,
-				"Yes, the risk applies: no authentication is enabled",
+				LEAD_APPLIES_OPTION,
 			)}\n${askAnswerLine(
 				`Q two? (card #${lead2.id})`,
-				"It isn't applicable to this deployment",
-			)}\n${askAnswerLine(
-				`Q three? (card #${lead3.id})`,
-				"I do not know whether it applies",
-			)}`,
+				LEAD_NOT_APPLY_OPTION,
+			)}\n${askAnswerLine(`Q three? (card #${lead3.id})`, LEAD_UNSURE_OPTION)}`,
 		});
 		expect(res.status).toBe(200);
-		// A side note after the affirmation never flips the verdict to a refusal.
+		// Applies queues the lead like a confirmed verdict.
 		const one = (await store.getTask(lead1.id))!;
 		expect(one.stage).toBe("todo");
 		expect(one.state).toBe("queued");
-		expect(one.cancelledAt).toBeNull();
-		// A contracted negation of the applicability word cancels.
+		// Does not apply cancels.
 		const two = (await store.getTask(lead2.id))!;
 		expect(two.cancelledAt).not.toBeNull();
 		expect(two.needsReason).toBe(
-			"Cancelled by the user's answer to the review's question: It isn't applicable to this deployment",
+			`Cancelled by the user's answer to the review's question: ${LEAD_NOT_APPLY_OPTION}`,
 		);
-		// Uncertainty only records: the lead waits unchanged.
+		// Not sure leaves the lead open: the answer only records. The question
+		// itself is answered, so the card lands Done with the lead still open.
 		const three = (await store.getTask(lead3.id))!;
 		expect(three.stage).toBe("backlog");
 		expect(three.state).toBe("idle");
 		expect(three.cancelledAt).toBeNull();
 		expect(three.details).toBe(
-			"\n\nThe user answered the review's question: I do not know whether it applies (the answer matched no option, so the lead stays unchanged)",
+			`\n\nThe user answered the review's question: ${LEAD_UNSURE_OPTION}`,
 		);
 		const done = (await store.getTask(ask.id))!;
 		expect(done.stage).toBe("done");
-	});
-
-	test("a deployment question reads negation inside its clause (OTTR-1227)", async () => {
-		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
-		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
-			text: `${askAnswerLine(
-				`Q one? (card #${lead1.id})`,
-				"Yes, authentication is not enabled; the risk applies.",
-			)}\n${askAnswerLine(
-				`Q two? (card #${lead2.id})`,
-				"It isn’t applicable to this deployment.",
-			)}\n${askAnswerLine(
-				`Q three? (card #${lead3.id})`,
-				"I cannot confirm whether it applies.",
-			)}`,
+		expect(done.state).toBe("idle");
+		// A free-text answer to the same question records and leaves the lead open.
+		const free = await seedLeadAskOne();
+		const res2 = await post(`/api/projects/p1/tasks/${free.ask.id}/reply`, {
+			text: "only behind our staging proxy",
 		});
-		expect(res.status).toBe(200);
-		// A negation in another clause never flips the confirmation, even with a
-		// negator near the keyword across the clause boundary.
-		const one = (await store.getTask(lead1.id))!;
-		expect(one.stage).toBe("todo");
-		expect(one.state).toBe("queued");
-		expect(one.cancelledAt).toBeNull();
-		// A curly-apostrophe contracted refusal still cancels.
-		const two = (await store.getTask(lead2.id))!;
-		expect(two.cancelledAt).not.toBeNull();
-		expect(two.needsReason).toBe(
-			"Cancelled by the user's answer to the review's question: It isn’t applicable to this deployment.",
+		expect(res2.status).toBe(200);
+		const freeLead = (await store.getTask(free.lead1.id))!;
+		expect(freeLead.stage).toBe("backlog");
+		expect(freeLead.state).toBe("idle");
+		expect(freeLead.cancelledAt).toBeNull();
+		expect(freeLead.details).toBe(
+			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
-		// "cannot confirm" is uncertainty, not a refusal: the lead waits unchanged.
-		const three = (await store.getTask(lead3.id))!;
-		expect(three.stage).toBe("backlog");
-		expect(three.state).toBe("idle");
-		expect(three.cancelledAt).toBeNull();
-		expect(three.details).toBe(
-			"\n\nThe user answered the review's question: I cannot confirm whether it applies. (the answer matched no option, so the lead stays unchanged)",
-		);
-		const done = (await store.getTask(ask.id))!;
-		expect(done.stage).toBe("done");
-	});
-
-	test("the leading refusal outranks later affirmatives; hedges and missing evidence stay unclassified (OTTR-1227)", async () => {
-		const cases = [
-			{ text: "It is possibly applicable.", cancelled: false },
-			{ text: "I have no evidence that it applies.", cancelled: false },
-			{
-				text: "No, it applies only to Windows, not our Linux deployment.",
-				cancelled: true,
-			},
-		] as const;
-		for (const c of cases) {
-			const { lead1, ask } = await seedLeadAskOne();
-			const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
-				text: c.text,
-			});
-			expect(res.status).toBe(200);
-			const lead = (await store.getTask(lead1.id))!;
-			expect(lead.cancelledAt === null).toBe(!c.cancelled);
-			if (c.cancelled) {
-				expect(lead.needsReason).toBe(
-					`Cancelled by the user's answer to the review's question: ${c.text}`,
-				);
-			} else {
-				expect(lead.stage).toBe("backlog");
-				expect(lead.state).toBe("idle");
-				expect(lead.details).toBe(
-					`\n\nThe user answered the review's question: ${c.text} (the answer matched no option, so the lead stays unchanged)`,
-				);
-			}
-		}
 	});
 
 	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
@@ -2652,7 +2556,7 @@ describe("task routes", () => {
 		expect(one.state).toBe("idle");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
-			"\n\nThe user answered the review's question: only behind our staging proxy (the answer matched no option, so the lead stays unchanged)",
+			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
 		// The question without an answer line touches nothing.
 		const two = (await store.getTask(lead2.id))!;
@@ -2745,7 +2649,7 @@ describe("task routes", () => {
 		expect(one.state).toBe("idle");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
-			"\n\nThe user answered the review's question: only behind our staging proxy (the answer matched no option, so the lead stays unchanged)",
+			"\n\nThe user answered the review's question: only behind our staging proxy",
 		);
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});
@@ -2760,7 +2664,7 @@ describe("task routes", () => {
 		expect(one.stage).toBe("backlog");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
-			"\n\nThe user answered the review's question: Approve (the answer matched no option, so the lead stays unchanged)",
+			"\n\nThe user answered the review's question: Approve",
 		);
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});

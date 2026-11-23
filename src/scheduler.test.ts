@@ -27,8 +27,11 @@ import {
 	isRetro,
 	isReview,
 	LEAD_APPLIES_OPTION,
+	LEAD_APPLIES_OPTION_LEGACY,
 	LEAD_NOT_APPLY_OPTION,
+	LEAD_NOT_APPLY_OPTION_LEGACY,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
+	LEAD_UNSURE_OPTION,
 	lastFullReview,
 	lastFullReviewBase,
 	lastReviewBase,
@@ -2854,8 +2857,13 @@ describe("leadBlocker", () => {
 	});
 
 	test("the fixed option labels and question-card prefix hold their wording", () => {
-		expect(LEAD_APPLIES_OPTION).toBe("Yes, the risk applies");
-		expect(LEAD_NOT_APPLY_OPTION).toBe("No, it does not apply");
+		expect(LEAD_APPLIES_OPTION).toBe("Applies");
+		expect(LEAD_NOT_APPLY_OPTION).toBe("Does not apply");
+		expect(LEAD_UNSURE_OPTION).toBe("Not sure");
+		// The labels the first question cards shipped with stay matched by the
+		// reply route, so stored `asked` on open cards keeps working (OTTR-1227).
+		expect(LEAD_APPLIES_OPTION_LEGACY).toBe("Yes, the risk applies");
+		expect(LEAD_NOT_APPLY_OPTION_LEGACY).toBe("No, it does not apply");
 		expect(LEAD_QUESTIONS_PROMPT_PREFIX).toBe(
 			"Needs-validation lead questions from review #",
 		);

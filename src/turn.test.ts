@@ -77,6 +77,7 @@ import {
 	LEAD_NO_REVIEW_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
+	LEAD_UNSURE_OPTION,
 	liveCard,
 	mergeHold,
 	PROMPT_EDIT_HELD,
@@ -29298,6 +29299,7 @@ describe("stored review findings", () => {
 			expect(a.options).toEqual([
 				{ label: LEAD_APPLIES_OPTION },
 				{ label: LEAD_NOT_APPLY_OPTION },
+				{ label: LEAD_UNSURE_OPTION },
 			]);
 		}
 		// Every question names one of the two deployment lead cards, both covered.
@@ -29665,6 +29667,7 @@ describe("stored review findings", () => {
 				options: [
 					{ label: LEAD_APPLIES_OPTION },
 					{ label: LEAD_NOT_APPLY_OPTION },
+					{ label: LEAD_UNSURE_OPTION },
 				],
 				multi: false,
 				recommended: null,

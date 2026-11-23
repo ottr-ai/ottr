@@ -98,10 +98,11 @@ lead.
   review also files ONE question card: `createTask` with a prompt that starts with
   the fixed prefix `Needs-validation lead questions from review #`, then
   `updateTask` with `followUpOf` (the review), `stage: "backlog"`,
-  `state: "needs_you"`, `queuedAt: null`, and `asked` holding one question per
+  `state: "idle"`, `queuedAt: null`, and `asked` holding one question per
   deployment-fact lead of this pass: question text `<question> (card #<lead id>)`,
-  options `Yes, the risk applies` and `No, it does not apply` (free text rides the
-  drawer's Other field), `multi: false`, `recommended: null`.
+  the three fixed options `Applies`, `Does not apply`, and `Not sure`
+  (free text rides the drawer's Other field), `multi: false`,
+  `recommended: null`.
 - The question card holds nothing: `findingsOpen` ignores `backlog`-stage children,
   so the review's Done never waits for the answer. A review whose leads are all
   sandbox-run leads files no question card.
@@ -127,37 +128,26 @@ question's lead card, records free text no question consumed on the unanswered
 open leads, and lands the question card Done (`stage: "done"`, `state: "idle"`,
 `asked: null`, `doneAt` set by the store's Done stamp):
 
-- `Yes, the risk applies`: an idle backlog lead moves to `stage: "todo"`,
+- `Applies`: an idle backlog lead moves to `stage: "todo"`,
   `state: "queued"`, `queuedAt` set, and the answer appends to its prompt. A lead
   the user already started (any other stage or state) only records the answer in
   its details — no run state is overwritten.
-- `No, it does not apply`: an idle backlog lead cancels with the direct patch
+- `Does not apply`: an idle backlog lead cancels with the direct patch
   (`cancelledAt` set, `state: "idle"`) and the answer as its `needsReason`. A
   started lead cancels through the sanctioned `cancel()` (it stops the run,
   disposes the worktree, deletes the branch) and then carries the answer as its
   `needsReason`; a cancel that kept work records that fact in the details.
-- Any other text, an empty answer, or no answer line: the lead keeps its state;
-  non-empty text appends to its details. Free text the reply carried but no
-  question consumed appends to the details of every open lead that got no
+- `Not sure`, free text, an empty answer, or no answer line: the lead keeps its
+  state; non-empty text appends to its details. Free text the reply carried but
+  no question consumed appends to the details of every open lead that got no
   per-question answer.
 
-Free text rides the same verdict (OTTR-1227): after the exact labels miss, the
-classifier `leadAnswerVerdict` reads the answer in order. Hedged and
-unevidenced wording first ("do not know", "cannot confirm", "possibly",
-"no evidence") reads as unclassified, so an uncertain answer never turns its
-keywords into a decision. An answer that starts with "no" is the operator's
-bare refusal and cancels, whatever follows. Otherwise the answer splits into
-clauses at sentence and comma boundaries: a clause whose negator sits with an
-applicability word ("does not apply", "isn't applicable", "no longer
-relevant", "without applying") refuses, and a clause with a bare applicability
-word ("applies", "applicable", "relevant") or "yes" confirms. A mix of both
-across clauses is unclassified. Negation reads inside its own clause, so a
-side note in another clause ("authentication is not enabled") never flips the
-verdict. Unclassified text appends the answer with a note that no option
-matched, so the lead stays unchanged and the operator sees why. The not-apply
-cancel reason quotes the answer and, when the lead's details carry the
-settle's note, the asking run: `Cancelled by the user's answer to the review's
-question: <answer> (validation run #<run id>)`.
+The route matches only the exact option labels, case-insensitively with one
+trailing period ignored; the labels the first question cards shipped with
+(`Yes, the risk applies`, `No, it does not apply`) still match, so stored
+`asked` on open cards keeps working (OTTR-1227). There is no free-text
+classifier: a word rule cannot judge negation scope or hedging, so anything
+but the exact labels leaves the lead open and unchanged.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
   still open (not cancelled, not done). A complete reply lands the card Done
   inside the same reply, so a second reply is refused (409, not needs_you). A
@@ -481,7 +471,7 @@ and title dedupe keys stable:
   <evidence>`.
 - `deployment`: the lead stays `backlog`/`idle` and joins the review's
   question flow: an open question card gains one question in its `asked`
-  (`<question> (card #<lead id>)`, the same two options as the filing pass,
+  (`<question> (card #<lead id>)`, the same three options as the filing pass,
   `multi: false`, `recommended: null`); with no open question card the settle
   files one with the exact shape of the filing pass's question card. The
   lead's details gain a deployment note.
@@ -750,19 +740,15 @@ before the run resolves.
    three backlog cards and one question card with two questions; the sandbox
    card's details say it waits for a validation sandbox; each question text ends
    with its lead card's id.
-8. reply route: the answers "applies" and "does not apply" queue the first lead
+8. reply route: the answers "Applies" and "Does not apply" queue the first lead
    card with the answer in its prompt and cancel the second with the answer as
-   its reason; the question card goes Done. Free text classifies by its words
-   (OTTR-1227): a negation cancels with the answer and the run id in the
-   reason, an affirmation queues, other text leaves the lead card in backlog
-   with the answer and an unclassified note in its details. A one-question card
-   takes the drawer's raw answer text; a started lead cancels through the
-   sanctioned cancel and never loses its run to the bare patch.
-8a. reply route (red, OTTR-1227): a free-text negation answer to a deployment
-   question cancels its lead with the answer and the asking run's id in the
-   reason, and a free-text affirmation queues the lead like a confirmed
-   verdict; both fail before the fix, because the route records unclassified
-   text in the details only.
+   its reason; "Not sure" and any free-text answer leave both leads open and
+   unchanged (the text lands in the details), and a partial reply keeps the
+   card waiting. The question card goes Done only on a reply that matched every
+   question. The route matches only the exact option labels (the first cards'
+   labels `Yes, the risk applies` and `No, it does not apply` still match); a
+   one-question card takes the drawer's raw answer text; a started lead cancels
+   through the sanctioned cancel and never loses its run to the bare patch.
 9. turn: a review with only sandbox-run leads (one without the blocker line)
    files no question card.
 10. turn (OTTR-959, OTTR-980): the leads are the turn's own recorded `propose_task`

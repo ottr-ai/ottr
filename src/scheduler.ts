@@ -1266,10 +1266,17 @@ export const WORK_CHECK_ASK_DIVERGE = "The work-check loop is diverging";
 export const WORK_CHECK_ASK_NEW_APPROACH = "Send back with a new approach";
 export const WORK_CHECK_ASK_CANCEL = "Cancel";
 
-/** The two fixed answers a review question card offers per deployment-fact lead; free
- * text rides the drawer's Other field. */
-export const LEAD_APPLIES_OPTION = "Yes, the risk applies";
-export const LEAD_NOT_APPLY_OPTION = "No, it does not apply";
+/** The three fixed answers a review question card offers per deployment-fact lead;
+ * free text rides the drawer's Other field. The first two constants kept their old
+ * values (`Yes, the risk applies`, `No, it does not apply`) until OTTR-1227 renamed
+ * them; the reply route still matches the old labels on stored `asked`. */
+export const LEAD_APPLIES_OPTION = "Applies";
+export const LEAD_NOT_APPLY_OPTION = "Does not apply";
+export const LEAD_UNSURE_OPTION = "Not sure";
+/** The labels the first question cards shipped with, still matched by the reply
+ * route so stored `asked` keeps working. */
+export const LEAD_APPLIES_OPTION_LEGACY = "Yes, the risk applies";
+export const LEAD_NOT_APPLY_OPTION_LEGACY = "No, it does not apply";
 
 /** OTTR-1128: the needs_you reason of a started lead the board cannot move back to the
  * backlog: its branch holds commits from an earlier work turn (or git could not count

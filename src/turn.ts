@@ -151,6 +151,7 @@ import {
 	LEAD_NO_REVIEW_REASON,
 	LEAD_NOT_APPLY_OPTION,
 	LEAD_QUESTIONS_PROMPT_PREFIX,
+	LEAD_UNSURE_OPTION,
 	lastReviewBase,
 	leadBlocker,
 	mergeHold,
@@ -9826,6 +9827,7 @@ export function createTurnLoop(
 				options: [
 					{ label: LEAD_APPLIES_OPTION },
 					{ label: LEAD_NOT_APPLY_OPTION },
+					{ label: LEAD_UNSURE_OPTION },
 				],
 				multi: false,
 				recommended: null,
@@ -11586,6 +11588,7 @@ export function createTurnLoop(
 								options: [
 									{ label: LEAD_APPLIES_OPTION },
 									{ label: LEAD_NOT_APPLY_OPTION },
+									{ label: LEAD_UNSURE_OPTION },
 								],
 								multi: false,
 								recommended: null,
