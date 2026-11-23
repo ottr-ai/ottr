@@ -15831,6 +15831,7 @@ describe("web push (R1-1, R2-3)", () => {
 				creditOk: async () => true,
 				gitToken: async () => null,
 			},
+			creditBalance: { balance: null },
 		});
 		try {
 			await saveSubs(b.m.g, [pushSub]);

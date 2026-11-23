@@ -15082,7 +15082,9 @@ describe("credits chip in the board bar", () => {
 		warnings: [],
 		updates: null,
 		alatePendingSince: null,
+		alateProvisionError: null,
 		deadSignIns: [],
+		seedFailed: null,
 		...extra,
 	});
 
@@ -15106,7 +15108,7 @@ describe("credits chip in the board bar", () => {
 				};
 				status = 200;
 			} else if (url === "/api/state") {
-				body = stateBody(state);
+				body = stateBody({ ...state, ...(hosted ? { hosted: true } : {}) });
 				status = 200;
 			} else if (url === "/api/update") {
 				body = { behind: 0, commits: [] };
