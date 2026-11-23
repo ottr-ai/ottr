@@ -488,6 +488,7 @@ describe("instance lock", () => {
 			handle.killGroup(); // best-effort: a mutant hang must not leave the child behind
 			try {
 				await handle.exited;
+				await handle.supervisorExited;
 			} catch {}
 		}
 		rmSync(root, { recursive: true, force: true, maxRetries: 5 });

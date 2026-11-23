@@ -302,6 +302,7 @@ async function runScenarios(
 		child.killGroup(); // best-effort: a mutant hang must not orphan the child
 		try {
 			await child.exited;
+			await child.supervisorExited;
 		} catch {}
 	}
 	const reopened = spawnStoreChild({
@@ -346,6 +347,7 @@ async function runScenarios(
 		reopened.killGroup(); // best-effort: a mutant hang must not orphan the child
 		try {
 			await reopened.exited;
+			await reopened.supervisorExited;
 		} catch {}
 	}
 	return JSON.parse(stdout) as ScenarioResult;

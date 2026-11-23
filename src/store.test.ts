@@ -4241,6 +4241,7 @@ describe("instance lock", () => {
 				handle.killGroup(); // a failed start must not leave the holder behind
 				try {
 					await handle.exited;
+					await handle.supervisorExited;
 				} catch {}
 				throw e;
 			} finally {
@@ -4269,6 +4270,7 @@ describe("instance lock", () => {
 			handle.killGroup();
 			try {
 				await handle.exited;
+				await handle.supervisorExited;
 			} catch {}
 		}
 	});
@@ -4279,6 +4281,7 @@ describe("instance lock", () => {
 		handle.killGroup(); // no clean close: no release code runs, the OS drops the lock
 		try {
 			await handle.exited;
+			await handle.supervisorExited;
 			const second = await open(dir); // whatever pid or hostname the dead holder named
 			expect(await second.listTasks()).toEqual([]);
 			await second.close();
@@ -4286,6 +4289,7 @@ describe("instance lock", () => {
 			handle.killGroup();
 			try {
 				await handle.exited;
+				await handle.supervisorExited;
 			} catch {}
 		}
 	});

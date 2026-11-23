@@ -6,16 +6,17 @@ import { type StoreChildHandle, spawnStoreChild } from "./storeChild.ts";
 
 const isWindows = process.platform === "win32";
 
-// A forever-looping child that also spawns a forever grandchild of its own and records
-// the grandchild pid synchronously: the write lands before any watchdog timer can fire.
-const foreverWithGrandchild = `
+// A child that records the grandchild pid and then burns the JavaScript thread forever:
+// a synchronous loop never turns the event loop, so no timer inside this process can
+// ever fire. Only an outside supervisor or a group kill can clean this child up.
+const spinWithGrandchild = `
 import { writeFileSync } from "node:fs";
 const grand = Bun.spawn(
 	[process.execPath, "-e", "setInterval(() => {}, 250)"],
 	{ stdin: "ignore", stdout: "ignore", stderr: "ignore" },
 );
 writeFileSync(process.env.GRAND_PID_FILE!, String(grand.pid));
-await new Promise(() => {});
+for (;;) {}
 `;
 
 // The two pollers below run on the platform clock on purpose: the awaited condition is
@@ -67,7 +68,7 @@ describe("spawnStoreChild", () => {
 			try {
 				const pidFile = join(dir, "grand-pid");
 				handle = spawnStoreChild({
-					script: foreverWithGrandchild,
+					script: spinWithGrandchild,
 					env: { GRAND_PID_FILE: pidFile },
 				});
 				const grandPid = await readGrandPid(pidFile);
@@ -84,7 +85,12 @@ describe("spawnStoreChild", () => {
 	);
 
 	test.skipIf(isWindows)(
-		"the watchdog group-kills the child and its grandchild when the baseline parent dies",
+		// THE OTTR-1244 acceptance test: the child hard-spins a synchronous loop (no timer
+		// inside it can ever fire), and the parent run it belongs to ends by timeout — the
+		// dead probe's pid is the supervisor's baseline, so from the supervisor's view the
+		// parent is gone at once. The outside supervisor must kill the child within a few
+		// seconds; an in-child watchdog cannot, which is the failure this test pins.
+		"the supervisor group-kills a sync-spinning child and its grandchild when the parent run ends",
 		async () => {
 			const dir = mkdtempSync(join(tmpdir(), "store-child-"));
 			let handle: StoreChildHandle | undefined;
@@ -97,15 +103,15 @@ describe("spawnStoreChild", () => {
 				);
 				await probe.exited;
 				handle = spawnStoreChild({
-					script: foreverWithGrandchild,
+					script: spinWithGrandchild,
 					env: { GRAND_PID_FILE: pidFile },
-					parentPid: probe.pid, // the dead probe is the watchdog's baseline
+					parentPid: probe.pid, // the dead probe is the supervisor's baseline
 					watchdogMs: 100,
 				});
 				const grandPid = await readGrandPid(pidFile);
-				// The group SIGKILL lands before the watchdog's own exit(0): Bun reports
-				// the signal death as 137 (128 + 9). Any other code means the watchdog
-				// did not fire; NaN means it never exited at all.
+				// The child dies BY the supervisor's SIGKILL: Bun reports the signal death
+				// as 137 (128 + 9). Any other code means the supervisor did not fire; NaN
+				// means the child never exited at all.
 				const code = await Promise.race([
 					handle.exited,
 					Bun.sleep(3000).then(() => Number.NaN),
@@ -130,6 +136,13 @@ describe("spawnStoreChild", () => {
 				handle.child.stdout as ReadableStream<Uint8Array>,
 			).text(),
 		).toBe("ok");
+		// The supervisor notices the child is gone and exits within one poll tick; NaN
+		// would mean it leaked.
+		const supervisorCode = await Promise.race([
+			handle.supervisorExited,
+			Bun.sleep(2000).then(() => Number.NaN),
+		]);
+		expect(supervisorCode).toBe(0);
 		await assertAllDead([handle.pid], 2000);
 	});
 });
