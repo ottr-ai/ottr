@@ -535,6 +535,7 @@ async function writeCopyOutMember(
 	abs: string,
 	data: AsyncGenerator<Uint8Array>,
 	written: string[],
+	onTempOpen?: () => void | Promise<void>,
 ): Promise<void> {
 	const name = posix.basename(abs);
 	const tmp = d.at(`.${name}.ottr-copyout-${randomBytes(4).toString("hex")}`);
@@ -547,6 +548,8 @@ async function writeCopyOutMember(
 		m.mode & 0o777,
 	);
 	try {
+		// Test seam: the temp file is open in the held parent, the body is unwritten.
+		await onTempOpen?.();
 		for await (const chunk of data) {
 			let off = 0;
 			while (off < chunk.length) off += writeSync(fd, chunk, off);
@@ -596,6 +599,8 @@ export async function extractCopyOut(
 		maxFileBytes: COPY_OUT_MAX_FILE_BYTES,
 		maxTotalBytes: COPY_OUT_MAX_TOTAL_BYTES,
 	},
+	/** Test seam: called after a member's temp file opens, before its body is read. */
+	onTempOpen?: () => void | Promise<void>,
 ): Promise<{ written: string[]; refused: string[] }> {
 	const written: string[] = [];
 	const refused: string[] = [];
@@ -620,7 +625,7 @@ export async function extractCopyOut(
 		}
 		try {
 			if (!replaceableCopyOut(d, abs, copiedIn)) refused.push(m.name);
-			else await writeCopyOutMember(m, d, abs, data, written);
+			else await writeCopyOutMember(m, d, abs, data, written, onTempOpen);
 		} finally {
 			d.close();
 		}

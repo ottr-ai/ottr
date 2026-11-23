@@ -2033,33 +2033,22 @@ describe("tar", () => {
 			const outside = join(dataRoot, "outside");
 			mkdirSync(join(proj, "sub"), { recursive: true });
 			mkdirSync(outside);
-			const bytes = rawTar([
-				{ name: `${proj.slice(1)}/sub/x.txt`, content: "x" },
-			]);
-			let step = 0;
 			let atSwap: string[] = [];
-			const stream = new ReadableStream<Uint8Array>(
-				{
-					pull(c) {
-						if (step === 0)
-							// Everything up to the member's own header: a name past ustar's
-							// 100-byte limit (long TMPDIR paths) adds @LongLink blocks, so
-							// the header sits at a fixed 1536-byte tail (data + padding +
-							// end), not at 512. The member's temp file is open in sub once
-							// this chunk is consumed — the swap below lands mid-write.
-							c.enqueue(bytes.slice(0, bytes.length - 1536));
-						else if (step === 1) {
-							atSwap = readdirSync(join(proj, "sub"));
-							renameSync(join(proj, "sub"), join(proj, "held"));
-							symlinkSync(outside, join(proj, "sub"));
-							c.enqueue(bytes.slice(bytes.length - 1536));
-						} else c.close();
-						step++;
-					},
+			// The swap runs from the extract path's own seam: the temp file is open in the
+			// held parent and the member body is unwritten, with no chunk-boundary timing
+			// to hold on a loaded box.
+			const out = await extractCopyOut(
+				bodyOf(rawTar([{ name: `${proj.slice(1)}/sub/x.txt`, content: "x" }])),
+				proj,
+				proj,
+				new Set(),
+				undefined,
+				async () => {
+					atSwap = readdirSync(join(proj, "sub"));
+					renameSync(join(proj, "sub"), join(proj, "held"));
+					symlinkSync(outside, join(proj, "sub"));
 				},
-				{ highWaterMark: 0 },
 			);
-			const out = await extractCopyOut(stream, proj, proj, new Set());
 			expect(atSwap).toHaveLength(1);
 			expect(out.written).toEqual([join(proj, "sub", "x.txt")]);
 			expect(readdirSync(outside)).toEqual([]);
