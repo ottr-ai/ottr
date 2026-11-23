@@ -271,6 +271,17 @@ export function gitEnv(
 		Object.assign(env, auth);
 	} else {
 		stripGitAuthEnv(env);
+		// A local command that hits a missing object must fail, not start the lazy promisor
+		// fetch git spawns for it: that fetch re-reads the repo config a worker writes
+		// (R5-1) and runs its planted remote.<name>.uploadpack as the transport, outside
+		// the PINNED_ARGS that pin the board's own network subcommands. GIT_NO_LAZY_FETCH
+		// is the prohibition (rev-list exits 128 on the missing object); the transport
+		// pins mirror sealedGit's explicit env and cap a fetch that starts anyway.
+		// sealedGit re-enables the fetch ("0"): the lazy blob fetch of a partial clone is
+		// its job, through its stub gitdir and pinned ssh.
+		env.GIT_NO_LAZY_FETCH = "1";
+		env.GIT_SSH_COMMAND = "ssh -F /dev/null -o BatchMode=yes";
+		env.GIT_ALLOW_PROTOCOL = "https:ssh";
 	}
 	return childDatabaseEnv(env);
 }
@@ -571,6 +582,9 @@ export async function sealedGit(
 				GIT_WORK_TREE: worktreePath,
 				GIT_INDEX_FILE: path.join(gitDir, "index"),
 				GIT_OBJECT_DIRECTORY: path.join(common, "objects"),
+				// gitEnv now prohibits the lazy fetch for plain local calls (OTTR-1001); the
+				// stub's copied promisor remote and the pins below are the allowed path.
+				GIT_NO_LAZY_FETCH: "0",
 				// The lazy promisor fetch shells out to ssh (gitEnv stripped GIT_SSH_COMMAND), and
 				// ssh reads ~/.ssh/config from the passwd home (/root), which the shared home
 				// volume makes worker-writable: a planted ProxyCommand would run here. gitAuthEnv

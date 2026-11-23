@@ -34,6 +34,7 @@ import {
 	checkPinnedRemote,
 	commitFileOnBranch,
 	commitMeta,
+	commitsAhead,
 	createWorktree,
 	deleteFailureText,
 	deleteRemoteBranch,
@@ -5075,6 +5076,77 @@ describe("git", () => {
 		}
 	}, 60_000);
 
+	test("commitsAhead refuses a lazy fetch through a planted promisor uploadpack (OTTR-1001)", async () => {
+		const up = repo();
+		await must(up, "init", "-q", "-b", "main");
+		await must(up, "config", "uploadpack.allowFilter", "true");
+		writeFileSync(join(up, "f.txt"), "old\n");
+		await must(up, "add", ".");
+		await must(up, "commit", "-q", "-m", "one");
+		writeFileSync(join(up, "f.txt"), "new\n");
+		await must(up, "commit", "-q", "-am", "two");
+		const main = join(repo(), "clone");
+		// A plain-path clone: git ignores --filter for one, so the clone holds every blob
+		// and the sealed checkout needs no lazy fetch, while the planted promisor config
+		// below still makes git attempt a lazy fetch for the missing object.
+		await must(
+			tmpdir(),
+			"clone",
+			"-q",
+			"--no-checkout",
+			"--filter=blob:none",
+			up,
+			main,
+		);
+		// The worker's plant: the promisor remote's uploadpack writes the marker and fails.
+		// The lazy fetch a local command spawns for a missing object re-reads the repo
+		// config, so the planted command runs outside the pinned args of the board's own
+		// network subcommands.
+		const marker = join(main, "planted.uploadpack");
+		const script = join(main, "uploadpack.sh");
+		writeFileSync(
+			script,
+			`#!/bin/sh\ntouch '${marker}'\necho planted uploadpack >&2\nexit 1\n`,
+		);
+		chmodSync(script, 0o755);
+		await must(main, "config", "remote.origin.uploadpack", script);
+		const wt = join(main, ".worktrees", "p");
+		await createWorktree({
+			mainPath: main,
+			worktreePath: wt,
+			branch: "ott/p",
+			base: "origin/main",
+			copyExtra: [],
+			log: () => {},
+		});
+		// The worktree branch names a commit the clone does not hold; the ref file write
+		// plants it (update-ref refuses a missing object). The stub's promisor copy leaves
+		// the planted uploadpack out, so the sealed checkout above ran no marker.
+		const missing = "4444444444444444444444444444444444444444";
+		writeFileSync(
+			join(main, ".git", "refs", "heads", "ott", "p"),
+			`${missing}\n`,
+		);
+		expect(existsSync(marker)).toBe(false);
+		// Control: unprotected plain git runs the plant when rev-list fetches the ref's
+		// object from the promisor remote.
+		const raw = { ...fixtureGitEnv() } as Record<string, string>;
+		delete raw.GIT_NO_LAZY_FETCH;
+		const ctl = Bun.spawnSync([gitExe(), "rev-list", "--count", "main..HEAD"], {
+			cwd: wt,
+			env: raw,
+			stdout: "ignore",
+			stderr: "ignore",
+			windowsHide: true,
+		});
+		expect(ctl.exitCode).not.toBe(0);
+		expect(existsSync(marker)).toBe(true);
+		rmSync(marker);
+		// Board path: the local git() wrapper prohibits the lazy fetch and fails closed.
+		await expect(commitsAhead(wt, "main")).rejects.toThrow(/rev-list/);
+		expect(existsSync(marker)).toBe(false);
+	}, 60_000);
+
 	test("never runs planted diff.external, textconv, uploadpack or receivepack (R5-1)", async () => {
 		const main = repo();
 		const origin = repo();
@@ -5266,7 +5338,13 @@ describe("gitEnv", () => {
 		try {
 			for (const args of [["status"], ["commit", "-m", "x"], ["add", "."]]) {
 				const env = gitEnv(args);
-				for (const n of names) expect(env).not.toHaveProperty(n);
+				// OTTR-1001: the strip still covers the transport names, but a local command
+				// gets the board's own pins back (a planted value must not survive), and it
+				// never starts a lazy fetch.
+				expect(env.GIT_SSH_COMMAND).toBe("ssh -F /dev/null -o BatchMode=yes");
+				expect(env.GIT_ALLOW_PROTOCOL).toBe("https:ssh");
+				expect(env.GIT_NO_LAZY_FETCH).toBe("1");
+				for (const n of names.slice(1)) expect(env).not.toHaveProperty(n);
 			}
 		} finally {
 			for (const n of names) {

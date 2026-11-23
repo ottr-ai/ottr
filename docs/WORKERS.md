@@ -1377,7 +1377,13 @@ fails closed, and a planted `core.gitProxy` — which the `git://` transport wou
 run as a command — never does. Every board git also passes explicit
 `--upload-pack`/`--receive-pack` to network subcommands and `--no-ext-diff
 --no-textconv` to `diff`, `log` and `show`, so a planted `remote.<name>.uploadpack`,
-`receivepack`, `diff.external` or textconv driver does not run. These flags do not reach
+`receivepack`, `diff.external` or textconv driver does not run. Every local board
+call (a subcommand outside `clone`, `fetch`, `ls-remote`, `lfs`, `pull`, `push`) also
+runs with `GIT_NO_LAZY_FETCH=1`, the pinned `GIT_SSH_COMMAND` and
+`GIT_ALLOW_PROTOCOL=https:ssh`: a missing object fails the command instead of starting
+the lazy promisor fetch that would run a planted `remote.<name>.uploadpack` outside
+those pinned args. `sealedGit` turns the prohibition off for its stub calls, whose
+lazy blob fetch is the one allowed fetch (see below). These flags do not reach
 the child git of a submodule, so board git also never recurses into submodules
 (`--submodule=short`, `--no-recurse-submodules`, `--recurse-submodules=no`). Every board
 git also clears `http.cookieFile` and `http.saveCookies`: a planted cookie path would
@@ -1514,7 +1520,9 @@ worktree only through a stub gitdir that it writes for each call (`sealedGit` in
   the stub, and never reads a planted `uploadpack`, `sshCommand` or credential helper.
   The fetch's ssh runs as `ssh -F /dev/null -o BatchMode=yes`. So it never reads the shared
   home's `~/.ssh/config`, and a planted `ProxyCommand` never runs. `GIT_ALLOW_PROTOCOL`
-  pins the fetch transports to `https` and `ssh`.
+  pins the fetch transports to `https` and `ssh`. The stub calls set
+  `GIT_NO_LAZY_FETCH=0`, so this fetch stays allowed where every plain local board
+  call refuses one (see above).
 
 No board git call merges, rebases or cherry-picks in a checkout that a worker can write.
 Thus no call reaches a planted `merge.<driver>.driver` or `merge.default`.
