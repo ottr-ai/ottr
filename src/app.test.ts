@@ -18913,6 +18913,42 @@ describe("session registry (OTTR-387)", () => {
 		expect(await endpointsOf(g)).toEqual([]);
 	});
 
+	test("a valid API key wins over a stale session cookie at subscribe", async () => {
+		const { g, call, login } = await openBoard("g-sess-push-apikey");
+		const a = await login("curl/8.4.0");
+		// Rotation kills the session: the old cookie no longer names a live row.
+		expect(
+			(await call("/api/settings/session-secret", { cookie: a.cookie }, {}))
+				.status,
+		).toBe(200);
+		// With the board's API key the subscribe still goes through, unbound —
+		// credential precedence matches the auth wall, where the key wins first.
+		const keyed = await call(
+			"/api/push/subscribe",
+			{ "x-api-key": "g-sess-push-apikey-key", cookie: a.cookie },
+			{
+				endpoint: "https://push.example/keyed",
+				keys: { p256dh: "k", auth: "a" },
+			},
+		);
+		expect(keyed.status).toBe(200);
+		const subs = await loadSubs(g);
+		expect(subs.map((s) => s.endpoint)).toEqual(["https://push.example/keyed"]);
+		expect(subs[0]?.session).toBeUndefined();
+		// The same stale cookie without the key is refused at the auth wall (the
+		// handler-level `session ended` refusal is pinned by the race test above).
+		const cookieOnly = await call(
+			"/api/push/subscribe",
+			{ cookie: a.cookie },
+			{
+				endpoint: "https://push.example/cookie",
+				keys: { p256dh: "k", auth: "a" },
+			},
+		);
+		expect(cookieOnly.status).toBe(401);
+		expect(await endpointsOf(g)).toEqual(["https://push.example/keyed"]);
+	});
+
 	test("two logins list two rows, newest first, exactly one current", async () => {
 		const { call, login } = await openBoard("g-sess-list");
 		const a = await login("curl/8.4.0");

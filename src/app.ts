@@ -5697,12 +5697,12 @@ export async function createApp(deps: AppDeps) {
 		return true;
 	}
 
-	/** What the caller's session cookie means for subscription binding: a live id to
-	 * bind to, a legacy id-less token (still valid, binds to nothing), no cookie at
-	 * all (API-key caller), or a cookie the server no longer honors (revoked,
-	 * rotated, or forged). Push subscriptions bind to the live id so the revocation
-	 * paths can drop them (OTTR-1022); checked inside the subscription transaction,
-	 * because auth runs before the request body is read. */
+	/** What the caller's credentials mean for subscription binding: a live id to
+	 * bind to, a legacy id-less token (still valid, binds to nothing), no binding
+	 * credential (API-key caller), or a cookie the server no longer honors
+	 * (revoked, rotated, or forged). Push subscriptions bind to the live id so the
+	 * revocation paths can drop them (OTTR-1022); checked inside the subscription
+	 * transaction, because auth runs before the request body is read. */
 	function sessionBindState(
 		req: Request,
 	):
@@ -5710,6 +5710,12 @@ export async function createApp(deps: AppDeps) {
 		| { kind: "legacy" }
 		| { kind: "none" }
 		| { kind: "revoked" } {
+		// Credential precedence matches authorized(): a valid API key authenticates
+		// on its own, so an API-key caller with a stale session cookie stays an
+		// unbound caller instead of being refused for the cookie.
+		const key = req.headers.get("x-api-key");
+		if (key !== null && apiKey !== null && secretsEqual(key, apiKey))
+			return { kind: "none" };
 		const token = parseCookies(req.headers.get("cookie"))[cookieName];
 		if (token === undefined || sessionSecret === null) return { kind: "none" };
 		const v = verifySession(sessionSecret, token);
