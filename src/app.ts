@@ -158,7 +158,7 @@ import {
 	sniffImage,
 } from "./images.ts";
 import { createIssueWatcher } from "./issues.ts";
-import type { JiraNet } from "./jira.ts";
+import { assertAllowedHost, JiraError, type JiraNet } from "./jira.ts";
 import { createJiraRoutes } from "./jiraRoutes.ts";
 import { rebuildLayerUse } from "./layers.ts";
 import { handleHindsight, handleLlm } from "./llmProxy.ts";
@@ -2800,11 +2800,7 @@ export async function createApp(deps: AppDeps) {
 			"push failed",
 			Promise.all(
 				batches.flatMap(({ sub, payloads }) =>
-					payloads.map((p) =>
-						sendAll([sub], JSON.stringify(p), (s, body) =>
-							sendNotification(s, body),
-						),
-					),
+					payloads.map((p) => sendAll([sub], JSON.stringify(p), guardedSend)),
 				),
 			).then(async (reports) => {
 				// Prune gone endpoints against a fresh read (R2-7): the pre-send snapshot is
@@ -3338,7 +3334,7 @@ export async function createApp(deps: AppDeps) {
 						tag: "token-expiry",
 						url: "/",
 					}),
-					(sub, p) => sendNotification(sub, p),
+					(sub, p) => guardedSend(sub, p),
 				);
 			}
 		} catch (err) {
@@ -10569,6 +10565,32 @@ export async function createApp(deps: AppDeps) {
 		});
 	}
 
+	/**
+	 * Hosted mode's address wall for owner-supplied URLs that the board itself fetches
+	 * (OTTR-1012): the same rule as a Jira site save (docs/specs/jira-import.md §SSRF). A
+	 * Web Push endpoint or Alate URL that is or resolves to a private, loopback or
+	 * link-local address is refused. Self-hosted boards check nothing — internal hosts are
+	 * the point there. Returns the refusal message, or null when the URL may be fetched.
+	 */
+	async function hostedUrlMessage(url: string): Promise<string | null> {
+		if (deps.hosted === undefined) return null;
+		try {
+			await assertAllowedHost(url, { hosted: true });
+		} catch (err) {
+			if (!(err instanceof JiraError)) throw err;
+			return err.message;
+		}
+		return null;
+	}
+
+	/** The send seam every fan-out passes to sendAll: hosted mode refuses a blocked
+	 * endpoint as one failed send (reportFailure keeps the row) and opens no connection. */
+	async function guardedSend(sub: PushSub, payload: string): Promise<unknown> {
+		const refused = await hostedUrlMessage(sub.endpoint);
+		if (refused !== null) throw new Error(refused);
+		return await sendNotification(sub, payload);
+	}
+
 	async function handlePOSTPushTest(): Promise<Response> {
 		const subs = await loadSubs(deps.gstore);
 		if (subs.length === 0) return json({ error: "no subscribed device" }, 400);
@@ -10581,7 +10603,7 @@ export async function createApp(deps: AppDeps) {
 				tag: "ottr-test",
 				url: "/",
 			}),
-			(sub, payload) => sendNotification(sub, payload),
+			(sub, payload) => guardedSend(sub, payload),
 		);
 		await pruneSubs(deps.gstore, report.gone, subs);
 		// A 403 (rejected VAPID subject) is not a send: Settings must see it failed
@@ -10638,6 +10660,10 @@ export async function createApp(deps: AppDeps) {
 			typeof b?.keys?.auth !== "string"
 		)
 			return json({ error: "invalid subscription" }, 400);
+		// The board fetches this endpoint itself on every fan-out: hosted mode applies
+		// the same address wall as a Jira site save (OTTR-1012), before any state moves.
+		const urlRefused = await hostedUrlMessage(b.endpoint);
+		if (urlRefused !== null) return json({ error: urlRefused }, 400);
 		// ADR-0011 recovery: the re-subscribe can carry the old row's classes so the
 		// fresh row is created with them in one atomic call. Any other shape is a 400.
 		let carriedClasses: Partial<ClassPrefs> | undefined;
@@ -14536,17 +14562,20 @@ export async function createApp(deps: AppDeps) {
 		return json(await projectView(e));
 	}
 
-	function validateAlateUrl(trimmed: string): string | Response {
+	// Async for the hosted address wall (OTTR-1012): the owner-supplied Alate URL is a
+	// URL the board fetches itself, so hosted mode applies the Jira site rule to it.
+	async function validateAlateUrl(trimmed: string): Promise<string | Response> {
 		const refused = alateUrlError(trimmed);
-		return refused === null
-			? trimmed.replace(/\/+$/, "")
-			: json({ error: refused }, 400);
+		if (refused !== null) return json({ error: refused }, 400);
+		const hostedRefused = await hostedUrlMessage(trimmed);
+		if (hostedRefused !== null) return json({ error: hostedRefused }, 400);
+		return trimmed.replace(/\/+$/, "");
 	}
 
-	function validateAlateValue(
+	async function validateAlateValue(
 		key: "url" | "key" | "repo" | "branch",
 		v: unknown,
-	): string | null | Response {
+	): Promise<string | null | Response> {
 		if (v === null || v === "") return null;
 		if (typeof v !== "string")
 			return json({ error: `${key} must be a string or null` }, 400);
@@ -14560,7 +14589,7 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "repo must be owner/name" }, 400);
 		if (key === "branch" && !BRANCH.test(trimmed))
 			return json({ error: "branch must be a plain ref name" }, 400);
-		return key === "url" ? validateAlateUrl(trimmed) : trimmed;
+		return key === "url" ? await validateAlateUrl(trimmed) : trimmed;
 	}
 
 	async function handlePOSTAlate(req: Request): Promise<Response> {
@@ -14580,7 +14609,7 @@ export async function createApp(deps: AppDeps) {
 		for (const key of ["url", "key", "repo", "branch"] as const) {
 			const v = body[key];
 			if (v === undefined) continue;
-			const valid = validateAlateValue(key, v);
+			const valid = await validateAlateValue(key, v);
 			if (valid instanceof Response) return valid;
 			next[key] = valid;
 		}

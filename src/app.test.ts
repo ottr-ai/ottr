@@ -18700,6 +18700,112 @@ describe("session registry (OTTR-387)", () => {
 	});
 });
 
+describe("hosted owner-URL wall (OTTR-1012)", () => {
+	const hostedBoard = async () => {
+		const secret = crypto.randomUUID();
+		const m = await mount({
+			hosted: {
+				config: {
+					tenant: "acme",
+					secret,
+					controlUrl: "http://127.0.0.1:9",
+					wording: {
+						workSuffix: "",
+						mergeSuffix: "",
+						resumeSuffix: "",
+						creditReason: "No credit.",
+					},
+				},
+				hooks: {
+					reportUsage: () => {},
+					creditOk: async () => true,
+					gitToken: async () => null,
+				},
+				creditBalance: { balance: 12.5 },
+			},
+		});
+		return {
+			m,
+			// A fresh header per request: the board's nonce cache refuses a replayed one.
+			owner: () => ({
+				"x-ottr-identity": signIdentity(secret, "acme", "owner"),
+			}),
+		};
+	};
+	const loopback = "http://127.0.0.1:59981/x";
+	const linkLocal = "http://169.254.169.254/x";
+
+	test("hosted mode refuses a loopback or link-local push endpoint and stores nothing", async () => {
+		const { m, owner } = await hostedBoard();
+		const sends = pushSends.length;
+		for (const endpoint of [loopback, linkLocal]) {
+			const res = await m.call(
+				"/api/push/subscribe",
+				{ endpoint, keys: { p256dh: "k", auth: "a" } },
+				owner(),
+			);
+			expect(res.status).toBe(400);
+			const body = (await res.json()) as { error: string };
+			expect(body.error).toContain("hosted mode blocks it");
+		}
+		expect(await loadSubs(m.g)).toEqual([]);
+		// The later test push has no row to send to: no connection attempt to either address.
+		expect((await m.call("/api/push/test", {}, owner())).status).toBe(400);
+		expect(pushSends.length).toBe(sends);
+	});
+
+	test("hosted mode refuses to send to a blocked endpoint stored before the guard", async () => {
+		const { m, owner } = await hostedBoard();
+		const sends = pushSends.length;
+		await saveSubs(m.g, [
+			{
+				endpoint: loopback,
+				keys: { p256dh: "k", auth: "a" },
+				addedAt: 1,
+				classes: ALL_CLASSES_ON,
+			},
+		]);
+		const res = await m.call("/api/push/test", {}, owner());
+		expect(res.status).toBe(502);
+		expect(await res.json()).toEqual({ ok: false, sent: 0, failed: 1 });
+		// The send seam never ran: no connection attempt to the loopback address.
+		expect(pushSends.length).toBe(sends);
+		// A refused endpoint is a failed send, not an unsubscribe answer: the row stays.
+		expect((await loadSubs(m.g)).map((s) => s.endpoint)).toEqual([loopback]);
+	});
+
+	test("self-host still subscribes and sends to an internal endpoint on purpose", async () => {
+		const m = await mount({});
+		const res = await m.call("/api/push/subscribe", {
+			endpoint: loopback,
+			keys: { p256dh: "k", auth: "a" },
+		});
+		expect(res.status).toBe(200);
+		const test = await m.call("/api/push/test", {});
+		expect(test.status).toBe(200);
+		expect(await test.json()).toEqual({ ok: true, sent: 1 });
+		expect(pushSends.at(-1)?.endpoint).toBe(loopback);
+	});
+
+	test("hosted mode refuses an Alate URL at a private address; a public literal IP saves", async () => {
+		const { m, owner } = await hostedBoard();
+		const bad = await m.call(
+			"/api/alate",
+			{ url: "http://169.254.169.254:8787" },
+			owner(),
+		);
+		expect(bad.status).toBe(400);
+		const body = (await bad.json()) as { error: string };
+		expect(body.error).toContain("hosted mode blocks it");
+		const good = await m.call(
+			"/api/alate",
+			{ url: "https://93.184.216.34" },
+			owner(),
+		);
+		expect(good.status).toBe(200);
+	});
+});
+
 describe("update cycle control (OTTR-752)", () => {
 	const stores: ProjectStore[] = [];
 	let fixture = 0;

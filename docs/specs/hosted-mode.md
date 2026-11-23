@@ -75,6 +75,12 @@ Session cookies and `X-API-Key` give no access in hosted mode. Provider sign-ins
 are off, and the board lends no provider OAuth token to turns (`LENT_ENV`): hosted model access
 uses API keys only.
 
+Owner-supplied URLs that the board fetches itself pass the hosted address wall. A Web Push
+endpoint or a saved Alate URL cannot point at a private, loopback or link-local address, and a
+DNS name that resolves there is also refused. This is the same rule as a Jira site save. A
+stored endpoint that fails the wall counts as one failed send, and the board opens no
+connection. The `ALATE_URL` env seed stays an operator choice and keeps the self-host rule.
+
 The state payload carries `hosted: true`, and `onboarding` is always false. It also carries
 `credits` (`{ balance, accountUrl }`), and `balance` is null until a `/credit` answer carried
 one. The `/api/boot` payload also carries `hosted: true`, so the UI knows the mode before the
