@@ -2217,6 +2217,137 @@ describe("resetBranchTo", () => {
 	});
 });
 
+describe("planted git drivers (OTTR-1038)", () => {
+	interface DriverFixture {
+		dir: string;
+		bare: string;
+		main: string;
+		tip: string;
+		log: string;
+	}
+	// Fixtures use their own spawn, never git() under test.
+	const run = (cwd: string, ...args: string[]): string => {
+		const r = Bun.spawnSync(["git", ...args], {
+			cwd,
+			env: fixtureGitEnv(),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+		return r.stdout.toString().trim();
+	};
+	const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+	/** A clone whose pushed main holds a.txt/b.txt and whose held tip rewrites a.txt and
+	 * adds p1.txt, left reset back at the pushed commit. Same shape as resetBranchTo's. */
+	const fixture = (): DriverFixture => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-drivers-"));
+		const bare = join(dir, "origin.git");
+		run(dir, "init", "-q", "--bare", "-b", "main", bare);
+		const main = join(dir, "main");
+		run(dir, "clone", "-q", bare, main);
+		writeFileSync(join(main, "a.txt"), "a");
+		writeFileSync(join(main, "b.txt"), "b");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "pushed");
+		run(main, "push", "-q", "origin", "main");
+		writeFileSync(join(main, "p1.txt"), "p1");
+		writeFileSync(join(main, "a.txt"), "A");
+		run(main, ...id, "add", ".");
+		run(main, ...id, "commit", "-qm", "held");
+		const tip = run(main, "rev-parse", "main");
+		run(main, "reset", "-q", "--hard", "origin/main");
+		const log = join(dir, "drivers.log");
+		return { dir, bare, main, tip, log };
+	};
+	/** Plants the validation's drivers: filter.evil clean/smudge and merge.evil.driver in
+	 * .git/config, `* filter=evil merge=evil` in .git/info/attributes. Every script appends
+	 * a marker line to the log and still passes its content through, so a run that fires the
+	 * drivers keeps the operation's own outcome and only the log tells. */
+	const plantDrivers = (f: DriverFixture) => {
+		const sh = (name: string, body: string) => {
+			const p = join(f.dir, name);
+			writeFileSync(p, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+			return p;
+		};
+		const clean = sh("drv-clean.sh", `echo clean-fired "$1" >> ${f.log}; cat`);
+		const smudge = sh("drv-smudge.sh", `echo smudge-fired "$1" >> ${f.log}; cat`);
+		const merge = sh(
+			"drv-merge.sh",
+			`echo merge-driver-fired "$1" >> ${f.log}; cp "$3" "$1"; exit 1`,
+		);
+		const cfg = readFileSync(join(f.main, ".git", "config"), "utf8");
+		writeFileSync(
+			join(f.main, ".git", "config"),
+			`${cfg}[filter "evil"]\n\tsmudge = ${smudge}\n\tclean = ${clean}\n[merge "evil"]\n\tname = evil\n\tdriver = ${merge} %A %O %B\n`,
+		);
+		writeFileSync(
+			join(f.main, ".git", "info", "attributes"),
+			"* filter=evil merge=evil\n",
+		);
+	};
+
+	test("reset, rebase and abort never run planted filter or merge drivers", async () => {
+		const f = fixture();
+		try {
+			plantDrivers(f);
+			// Control: plain git() runs the planted clean driver on a dirty file, so the
+			// log asserts below prove a seal and not a fixture that never fires.
+			writeFileSync(join(f.main, "a.txt"), "control-dirty");
+			await git(["diff", "--stat"], f.main);
+			expect(readFileSync(f.log, "utf8")).toContain("clean-fired");
+			rmSync(f.log);
+			writeFileSync(join(f.main, "a.txt"), "a");
+
+			// The held tip rewrites a.txt, so plain git smudges it during the reset.
+			expect(await resetBranchTo(f.main, "main", f.tip)).toBe(true);
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(f.tip);
+			expect(readFileSync(join(f.main, "a.txt"), "utf8")).toBe("A");
+			expect(existsSync(f.log)).toBe(false);
+
+			// A clean rebase onto a moved origin replays the held commit. While the planting
+			// is live, the fixture runs no plain git write in this checkout: any command
+			// that re-hashes worktree files (add, a commit's index refresh) would run the
+			// planted clean driver outside the calls under test.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			writeFileSync(join(twin, "move.txt"), "moved");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			expect(await rebaseTargetBranch(f.main, "main")).toEqual({ ok: true });
+			run(
+				f.main,
+				"merge-base",
+				"--is-ancestor",
+				"refs/remotes/origin/main",
+				"refs/heads/main",
+			);
+			expect(existsSync(f.log)).toBe(false);
+
+			// A conflict: origin rewrites a.txt, and the replayed held commit rewrites it
+			// too. The planted merge driver would run on the conflicted file and the abort
+			// would smudge it. The abort must restore the branch and the checkout without
+			// either.
+			writeFileSync(join(twin, "a.txt"), "origin-conflict");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "origin side");
+			run(twin, "push", "-q", "origin", "main");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			const head = run(f.main, "rev-parse", "refs/heads/main");
+			const r = await rebaseTargetBranch(f.main, "main");
+			if (r.ok) throw new Error("expected a conflict, got ok");
+			expect(r.conflict).toBe(true);
+			expect(r.error).toContain("CONFLICT");
+			expect(run(f.main, "rev-parse", "refs/heads/main")).toBe(head);
+			expect(readFileSync(join(f.main, "a.txt"), "utf8")).toBe("A");
+			expect(existsSync(f.log)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("redactingWriter", () => {
 	test("property: any split of the input gives the same output as one redact()", () => {
 		const alpha = fc.constantFrom("a", "b", "R", "E", "D", "[", "]", "-");

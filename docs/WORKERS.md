@@ -1528,8 +1528,15 @@ worktree only through a stub gitdir that it writes for each call (`sealedGit` in
   `GIT_NO_LAZY_FETCH=0`, so this fetch stays allowed where every plain local board
   call refuses one (see above).
 
-No board git call merges, rebases or cherry-picks in a checkout that a worker can write.
-Thus no call reaches a planted `merge.<driver>.driver` or `merge.default`.
+The server's own writes to a main checkout — the hold-recovery reset (`resetBranchTo`)
+and the push-retry rebase (`rebaseTargetBranch`, its abort included) — run on the same
+kind of stub gitdir (`openGitStub` in `src/worktree.ts`, OTTR-1038). The stub leaves the
+planted config and `$GIT_DIR/info/attributes` unread, and symlinks the real `refs/` and
+`packed-refs` in, so the reset and the rebase still move the real branch. No call reaches
+a planted `filter.<driver>.clean`/`smudge`/`process`, `merge.<driver>.driver` or
+`merge.default`. A main gitdir left mid-rebase by a killed earlier attempt is recovered
+through the stub too: the state is copied in, the abort runs there, and the real state
+dirs go once the abort has stood for them.
 
 Topology: the compose file pins the board service's `GIT_CONFIG_GLOBAL` to
 `/etc/ottr/gitconfig` and `GH_CONFIG_DIR` to `/etc/ottr/gh`. These paths are on the

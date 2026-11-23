@@ -1,6 +1,7 @@
 import {
 	closeSync,
 	constants,
+	cpSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -11,6 +12,7 @@ import {
 	realpathSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -432,43 +434,52 @@ export function gitSecrets(): readonly string[] {
 }
 
 /** Repo-local core keys that git probes at init (file modes, symlinks, case, Unicode, line
- * endings). sealedGit copies them, so status reads the files as the repo's own git does.
+ * endings). The stub copies them, so status reads the files as the repo's own git does.
  * They steer only git's builtin conversion, never a command. */
 const PROBED_CORE =
 	"^core\\.(filemode|symlinks|ignorecase|precomposeunicode|autocrlf|eol)$";
 
-/**
- * Board git over a worktree's files: status, diffs against the files, the first checkout.
- * A work turn can write the shared gitdir (R5-1). Its config defines filter drivers
- * (`filter.<d>.clean`/`smudge`/`process`) under names that planted attributes pick, so no
- * `-c` can clear them, and git reads `$GIT_DIR/info/attributes` above every override. These
- * calls run against a board-written stub gitdir instead: HEAD as a sha (symbolic when
- * HEAD is unborn, so an unborn repo keeps the same seal), the worktree's own index and
- * objects, a copy of the main checkout's info/exclude, no repo config. Tracked
- * .gitattributes still apply, but they can only name drivers of system, global or
- * command-line config (git-lfs). A partial clone's promisor remote (name, url, filter) is
- * copied, so a missing blob still fetches lazily; that fetch reads the stub too, never the
+/** One board-owned stub gitdir over a checkout's files. A work turn can write the shared
+ * gitdir (R5-1). Its config defines filter drivers (`filter.<d>.clean`/`smudge`/`process`)
+ * under names that planted attributes pick, so no `-c` can clear them, and git reads
+ * `$GIT_DIR/info/attributes` above every override. The stub instead holds: HEAD as the
+ * board resolved it (symbolic when HEAD is unborn, so an unborn repo keeps the same seal),
+ * the checkout's own index and objects, a copy of the main checkout's info/exclude, no
+ * repo config and no info/attributes. Tracked .gitattributes still apply, but they can
+ * only name drivers of system, global or command-line config (git-lfs); a name planted in
+ * the repo config resolves to nothing and git passes the content through unchanged.
+ * `liveRefs=false` seals reads: the stub's refs dir is empty, so ref names never resolve
+ * and callers pass shas. `liveRefs=true` seals the main-checkout writes (OTTR-1038):
+ * `refs/` and `packed-refs` are symlinked in, so `reset` and `rebase` move the real
+ * branch while the planted config and attributes stay unread; reflog entries land in the
+ * stub and die with it. A partial clone's promisor remote (name, url, filter) is copied,
+ * so a missing blob still fetches lazily; that fetch reads the stub too, never the
  * planted remote keys (uploadpack, sshCommand, helpers), and its ssh runs pinned
  * (`ssh -F /dev/null -o BatchMode=yes`, transports https:ssh), so the shared home ssh
- * config never reaches it. Callers pass
- * `--ignore-submodules=dirty`: a submodule status runs git in the submodule's own gitdir,
- * which is planted the same way. dirtySubmodules probes each submodule through this stub.
- */
-export async function sealedGit(
-	args: string[],
+ * config never reaches it. Returns the failed trust check's GitResult instead of a stub. */
+interface GitStub {
+	/** The stub gitdir; an in-progress rebase state copy lands here for the abort path. */
+	dir: string;
+	/** One git call on the stub; never throws for a non-zero exit. */
+	run(args: string[]): Promise<GitResult>;
+	/** Deletes the stub. Every caller runs it, on every path. */
+	close(): void;
+}
+
+/** The stub's trust check: validates the object format and resolves the stub HEAD form.
+ * Returns the failed GitResult instead of the inputs when the repo cannot be trusted. */
+interface StubInputs {
+	gitDir: string;
+	common: string;
+	format: string;
+	stubHead: string;
+}
+
+async function stubInputs(
 	worktreePath: string,
-): Promise<GitResult> {
-	const info = await git(
-		[
-			"rev-parse",
-			"--path-format=absolute",
-			"--git-dir",
-			"--git-common-dir",
-			"--show-object-format",
-			"HEAD",
-		],
-		worktreePath,
-	);
+	liveRefs: boolean,
+	info: GitResult,
+): Promise<StubInputs | GitResult> {
 	const [gitDir = "", common = "", format = "", head = ""] =
 		info.stdout.split("\n");
 	// Both values land in the stub's files: a planted objectformat must not inject config lines.
@@ -498,7 +509,84 @@ export async function sealedGit(
 				stderr: `unexpected git rev-parse output: ${info.stdout.trim()}`,
 			};
 		stubHead = `ref: ${name}\n`;
+	} else if (liveRefs) {
+		// A born symbolic HEAD stays symbolic on the stub: resetBranchTo's own contract
+		// check reads `symbolic-ref --short HEAD`, and a detached stub HEAD would fail it
+		// for every caller. A really detached HEAD stays a sha here, and that check fails
+		// on it exactly as plain git does.
+		const sym = await git(["symbolic-ref", "HEAD"], worktreePath);
+		const name = sym.stdout.trim();
+		if (sym.code === 0 && /^refs\/\S+$/.test(name)) stubHead = `ref: ${name}\n`;
 	}
+	return { gitDir, common, format, stubHead };
+}
+
+/** Copies the promisor remote (name, url, filter) into the stub config, so a partial
+ * clone still fetches a missing blob lazily; that fetch reads the stub too, never the
+ * planted remote keys. Null on success, else the failing GitResult. */
+async function copyPromisorConfig(
+	stubConfig: string,
+	worktreePath: string,
+): Promise<GitResult | null> {
+	const pc = await git(
+		[
+			"config",
+			"-z",
+			"--get-regexp",
+			"^(extensions\\.partialclone|remote\\..*\\.(url|promisor|partialclonefilter))$",
+		],
+		worktreePath,
+	);
+	const entries = pc.stdout
+		.split("\0")
+		.filter(Boolean)
+		.map((kv) => {
+			const nl = kv.indexOf("\n");
+			return nl < 0 ? [kv, ""] : [kv.slice(0, nl), kv.slice(nl + 1)];
+		});
+	const remoteOf = (k: string, v: string) =>
+		k === "extensions.partialclone"
+			? v
+			: k.slice("remote.".length, k.lastIndexOf("."));
+	const promisors = new Set(
+		entries
+			.filter(
+				([k = "", v = ""]) =>
+					k === "extensions.partialclone" ||
+					(k.endsWith(".promisor") && /^(true|yes|on|1)$/i.test(v)),
+			)
+			.map(([k = "", v = ""]) => remoteOf(k, v)),
+	);
+	// git config --file escapes every value: a planted name or url cannot add config lines.
+	for (const [k = "", v = ""] of entries) {
+		if (!promisors.has(remoteOf(k, v))) continue;
+		const w = await git(
+			["config", "--file", stubConfig, "--add", k, v],
+			path.dirname(stubConfig),
+		);
+		if (w.code !== 0) return w;
+	}
+	return null;
+}
+
+async function openGitStub(
+	worktreePath: string,
+	liveRefs: boolean,
+): Promise<GitStub | GitResult> {
+	const info = await git(
+		[
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-dir",
+			"--git-common-dir",
+			"--show-object-format",
+			"HEAD",
+		],
+		worktreePath,
+	);
+	const inputs = await stubInputs(worktreePath, liveRefs, info);
+	if (!("stubHead" in inputs)) return inputs;
+	const { gitDir, common, format, stubHead } = inputs;
 	const probed = await git(
 		["config", "-z", "--get-regexp", PROBED_CORE],
 		worktreePath,
@@ -508,8 +596,19 @@ export async function sealedGit(
 		.filter(Boolean)
 		.flatMap((kv) => ["-c", kv.replace("\n", "=")]);
 	const stub = mkdtempSync(path.join(tmpdir(), "ottr-git-"));
+	let built: GitStub | null = null;
 	try {
-		mkdirSync(path.join(stub, "refs"));
+		if (liveRefs) {
+			// Writes go through: a ref update on the stub lands in the real refs store, and
+			// git takes its ref locks inside the symlinked dir, so a concurrent board git on
+			// the same checkout stays serialized with the real index.lock. A read still
+			// gains no repo config line or info/attributes from it.
+			symlinkSync(path.join(common, "refs"), path.join(stub, "refs"));
+			const packed = path.join(common, "packed-refs");
+			if (existsSync(packed)) symlinkSync(packed, path.join(stub, "packed-refs"));
+		} else {
+			mkdirSync(path.join(stub, "refs"));
+		}
 		mkdirSync(path.join(stub, "info"));
 		writeFileSync(path.join(stub, "HEAD"), stubHead);
 		writeFileSync(
@@ -527,74 +626,68 @@ export async function sealedGit(
 				return { code: 128, stdout: "", stderr: String(e) };
 		}
 		// Promisor remotes: extensions.partialClone and every remote.<name>.promisor=true.
-		const pc = await git(
-			[
-				"config",
-				"-z",
-				"--get-regexp",
-				"^(extensions\\.partialclone|remote\\..*\\.(url|promisor|partialclonefilter))$",
-			],
+		const pc = await copyPromisorConfig(
+			path.join(stub, "config"),
 			worktreePath,
 		);
-		const entries = pc.stdout
-			.split("\0")
-			.filter(Boolean)
-			.map((kv) => {
-				const nl = kv.indexOf("\n");
-				return nl < 0 ? [kv, ""] : [kv.slice(0, nl), kv.slice(nl + 1)];
-			});
-		const remoteOf = (k: string, v: string) =>
-			k === "extensions.partialclone"
-				? v
-				: k.slice("remote.".length, k.lastIndexOf("."));
-		const promisors = new Set(
-			entries
-				.filter(
-					([k = "", v = ""]) =>
-						k === "extensions.partialclone" ||
-						(k.endsWith(".promisor") && /^(true|yes|on|1)$/i.test(v)),
-				)
-				.map(([k = "", v = ""]) => remoteOf(k, v)),
-		);
-		// git config --file escapes every value: a planted name or url cannot add config lines.
-		for (const [k = "", v = ""] of entries) {
-			if (!promisors.has(remoteOf(k, v))) continue;
-			const w = await git(
-				["config", "--file", path.join(stub, "config"), "--add", k, v],
-				stub,
-			);
-			if (w.code !== 0) return w;
-		}
-		return await git(
-			[
-				"--no-optional-locks",
-				...keep,
-				// git-lfs finds its object cache through the gitdir, which is now the stub.
-				"-c",
-				`lfs.storage=${path.join(common, "lfs")}`,
-				...args,
-			],
-			worktreePath,
-			undefined,
-			undefined,
-			{
-				GIT_DIR: stub,
-				GIT_WORK_TREE: worktreePath,
-				GIT_INDEX_FILE: path.join(gitDir, "index"),
-				GIT_OBJECT_DIRECTORY: path.join(common, "objects"),
-				// gitEnv now prohibits the lazy fetch for plain local calls (OTTR-1001); the
-				// stub's copied promisor remote and the pins below are the allowed path.
-				GIT_NO_LAZY_FETCH: "0",
-				// The lazy promisor fetch shells out to ssh (gitEnv stripped GIT_SSH_COMMAND), and
-				// ssh reads ~/.ssh/config from the passwd home (/root), which the shared home
-				// volume makes worker-writable: a planted ProxyCommand would run here. gitAuthEnv
-				// pins the same way (OTTR-264); GIT_ALLOW_PROTOCOL pins the fetch transport.
-				GIT_SSH_COMMAND: "ssh -F /dev/null -o BatchMode=yes",
-				GIT_ALLOW_PROTOCOL: "https:ssh",
-			},
-		);
+		if (pc !== null) return pc;
+		built = {
+			dir: stub,
+			run: (args) =>
+				git(
+					[
+						"--no-optional-locks",
+						...keep,
+						// git-lfs finds its object cache through the gitdir, which is now the stub.
+						"-c",
+						`lfs.storage=${path.join(common, "lfs")}`,
+						...args,
+					],
+					worktreePath,
+					undefined,
+					undefined,
+					{
+						GIT_DIR: stub,
+						GIT_WORK_TREE: worktreePath,
+						GIT_INDEX_FILE: path.join(gitDir, "index"),
+						GIT_OBJECT_DIRECTORY: path.join(common, "objects"),
+						// gitEnv now prohibits the lazy fetch for plain local calls (OTTR-1001); the
+						// stub's copied promisor remote and the pins below are the allowed path.
+						GIT_NO_LAZY_FETCH: "0",
+						// The lazy promisor fetch shells out to ssh (gitEnv stripped GIT_SSH_COMMAND),
+						// and ssh reads ~/.ssh/config from the passwd home (/root), which the shared
+						// home volume makes worker-writable: a planted ProxyCommand would run here.
+						// gitAuthEnv pins the same way (OTTR-264); GIT_ALLOW_PROTOCOL pins the fetch
+						// transport.
+						GIT_SSH_COMMAND: "ssh -F /dev/null -o BatchMode=yes",
+						GIT_ALLOW_PROTOCOL: "https:ssh",
+					},
+				),
+			close: () => rmSync(stub, { recursive: true, force: true }),
+		};
+		return built;
 	} finally {
-		rmSync(stub, { recursive: true, force: true });
+		// A stub that never became a GitStub dies here; a built one belongs to its caller.
+		if (built === null) rmSync(stub, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Board git over a worktree's files: status, diffs against the files, the first checkout.
+ * One sealed call on a fresh stub (openGitStub holds the seal). Callers pass
+ * `--ignore-submodules=dirty`: a submodule status runs git in the submodule's own gitdir,
+ * which is planted the same way. dirtySubmodules probes each submodule through this stub.
+ */
+export async function sealedGit(
+	args: string[],
+	worktreePath: string,
+): Promise<GitResult> {
+	const s = await openGitStub(worktreePath, false);
+	if (!("run" in s)) return s;
+	try {
+		return await s.run(args);
+	} finally {
+		s.close();
 	}
 }
 
@@ -2557,6 +2650,10 @@ export async function fetchPrHead(
  * queues a recovery steer only when the retry cannot converge. A conflict aborts, so
  * refs/heads/<branch> stays on its rejected head and the checkout never sits mid-rebase; an
  * abort that itself fails reports a non-conflict failure (the caller then fails closed).
+ * OTTR-1038: the rebase and every abort run on the live-refs stub — no planted filter or
+ * merge driver runs on the rewritten or conflicted files. A main gitdir already mid-rebase
+ * (a killed earlier attempt, or a state a worker planted) is invisible to the stub, so it is
+ * recovered first (abortRealRebase); then the retry proceeds.
  */
 export async function rebaseTargetBranch(
 	mainPath: string,
@@ -2564,8 +2661,21 @@ export async function rebaseTargetBranch(
 	/** OTTR-693: the Settings commit identity; null keeps the built-in Ottr one. */
 	identity: CommitIdentity | null = null,
 ): Promise<{ ok: true } | { ok: false; conflict: boolean; error: string }> {
-	const r = await git(
-		[
+	const s = await openGitStub(mainPath, true);
+	if (!("run" in s))
+		return {
+			ok: false,
+			conflict: false,
+			error: s.stderr || `git rev-parse exited ${s.code}`,
+		};
+	try {
+		const left = await realRebaseState(mainPath);
+		if (left.length > 0) {
+			const aborted = await abortRealRebase(s, left);
+			if (aborted !== null)
+				return { ok: false, conflict: false, error: aborted };
+		}
+		const r = await s.run([
 			// The replay re-creates commits, so it needs a committer identity; pin the board's
 			// own (the same app.ts pins) so a checkout without git config cannot wedge the
 			// automatic retry.
@@ -2573,48 +2683,97 @@ export async function rebaseTargetBranch(
 			"rebase",
 			`refs/remotes/origin/${branch}`,
 			branch,
-		],
-		mainPath,
-	);
-	if (r.code === 0) return { ok: true };
-	const out = `${r.stdout}${r.stderr}`;
-	const mergePath = await git(
-		["rev-parse", "--git-path", "rebase-merge"],
-		mainPath,
-	);
-	const applyPath = await git(
-		["rev-parse", "--git-path", "rebase-apply"],
-		mainPath,
-	);
-	const inProgress =
-		(mergePath.code === 0 &&
-			existsSync(path.resolve(mainPath, mergePath.stdout.trim()))) ||
-		(applyPath.code === 0 &&
-			existsSync(path.resolve(mainPath, applyPath.stdout.trim())));
-	if (out.includes("CONFLICT") || inProgress) {
-		const abort = await git(["rebase", "--abort"], mainPath);
-		if (abort.code !== 0)
+		]);
+		if (r.code === 0) return { ok: true };
+		const out = `${r.stdout}${r.stderr}`;
+		const mergePath = await s.run(["rev-parse", "--git-path", "rebase-merge"]);
+		const applyPath = await s.run(["rev-parse", "--git-path", "rebase-apply"]);
+		const inProgress =
+			(mergePath.code === 0 &&
+				existsSync(path.resolve(mainPath, mergePath.stdout.trim()))) ||
+			(applyPath.code === 0 &&
+				existsSync(path.resolve(mainPath, applyPath.stdout.trim())));
+		if (out.includes("CONFLICT") || inProgress) {
+			const abort = await s.run(["rebase", "--abort"]);
+			if (abort.code !== 0)
+				return {
+					ok: false,
+					conflict: false,
+					error: `${out.trim().split("\n").filter(Boolean).pop() ?? `git rebase exited ${r.code}`}; git rebase --abort also failed: ${abort.stderr.trim()}`,
+				};
 			return {
 				ok: false,
-				conflict: false,
-				error: `${out.trim().split("\n").filter(Boolean).pop() ?? `git rebase exited ${r.code}`}; git rebase --abort also failed: ${abort.stderr.trim()}`,
+				conflict: true,
+				error:
+					out.split("\n").find((line) => line.includes("CONFLICT")) ??
+					`git rebase exited ${r.code}`,
 			};
+		}
 		return {
 			ok: false,
-			conflict: true,
+			conflict: false,
 			error:
-				out.split("\n").find((line) => line.includes("CONFLICT")) ??
+				r.stderr.split("\n").find((line) => /^(error|fatal):/i.test(line)) ??
+				r.stderr.trim().split("\n").filter(Boolean).pop() ??
 				`git rebase exited ${r.code}`,
 		};
+	} finally {
+		s.close();
 	}
-	return {
-		ok: false,
-		conflict: false,
-		error:
-			r.stderr.split("\n").find((line) => /^(error|fatal):/i.test(line)) ??
-			r.stderr.trim().split("\n").filter(Boolean).pop() ??
-			`git rebase exited ${r.code}`,
-	};
+}
+
+/** The main checkout's own in-progress rebase state dirs, by real path (plain reads:
+ * rev-parse runs no driver and reads no attribute). The sealed rebase below sees only its
+ * stub, so leftover real state — a killed earlier attempt, or one a worker planted — must
+ * be recovered before it runs, or it would sit stale behind a moved branch. */
+async function realRebaseState(mainPath: string): Promise<string[]> {
+	const dirs: string[] = [];
+	for (const name of ["rebase-merge", "rebase-apply"]) {
+		const p = await git(["rev-parse", "--git-path", name], mainPath);
+		const full =
+			p.code === 0
+				? path.resolve(mainPath, p.stdout.trim())
+				: path.join(mainPath, ".git", name);
+		if (existsSync(full)) dirs.push(full);
+	}
+	return dirs;
+}
+
+/** Recovers a leftover real rebase state through the stub: copy the state dirs in (capped —
+ * a planted oversized state fails closed instead of filling the server's tmp), abort there
+ * — the abort resets the named branch to the state's orig-head through the live refs and
+ * checks the files back out — then remove the real state dirs the completed abort stood
+ * for (the cleanup a plain abort's own run did). Null on success; else the failure text,
+ * and the real state stays, so the next retry sees it again. */
+async function abortRealRebase(
+	s: GitStub,
+	dirs: readonly string[],
+): Promise<string | null> {
+	let total = 0;
+	for (const dir of dirs) {
+		try {
+			for (const f of readdirSync(dir, { recursive: true })) {
+				const st = statSync(path.join(dir, String(f)));
+				if (st.isFile()) total += st.size;
+			}
+		} catch (e) {
+			return `cannot read the leftover rebase state ${dir}: ${String(e)}`;
+		}
+	}
+	if (total > 16 * 1024 * 1024)
+		return "the leftover rebase state is over 16 MiB; sealed recovery refuses it";
+	for (const dir of dirs) {
+		try {
+			cpSync(dir, path.join(s.dir, path.basename(dir)), { recursive: true });
+		} catch (e) {
+			return `cannot copy the leftover rebase state ${dir}: ${String(e)}`;
+		}
+	}
+	const abort = await s.run(["rebase", "--abort"]);
+	if (abort.code !== 0)
+		return `git rebase --abort also failed: ${abort.stderr.trim()}`;
+	for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+	return null;
 }
 
 /**
@@ -2840,20 +2999,24 @@ export async function mergeHoldLanded(
  * checkout has checked out back to `tip` (the gate's audited origin fetch) with --keep, which
  * refuses instead of overwriting uncommitted changes there. False when HEAD is another branch,
  * the tip is unknown to git, or the reset refused: the caller parks the card anyway and logs
- * that the patches stayed. Runs in the main repo, where the target branch lives.
+ * that the patches stayed. Runs in the main repo, where the target branch lives — on the
+ * live-refs stub, so a planted filter driver never runs on the rewritten files (OTTR-1038).
  */
 export async function resetBranchTo(
 	mainPath: string,
 	branch: string,
 	tip: string,
 ): Promise<boolean> {
-	const head = await git(
-		["symbolic-ref", "--quiet", "--short", "HEAD"],
-		mainPath,
-	);
-	if (head.code !== 0 || head.stdout.trim() !== branch) return false;
-	const r = await git(["reset", "--keep", tip], mainPath);
-	return r.code === 0;
+	const s = await openGitStub(mainPath, true);
+	if (!("run" in s)) return false;
+	try {
+		const head = await s.run(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+		if (head.code !== 0 || head.stdout.trim() !== branch) return false;
+		const r = await s.run(["reset", "--keep", tip]);
+		return r.code === 0;
+	} finally {
+		s.close();
+	}
 }
 
 /**
