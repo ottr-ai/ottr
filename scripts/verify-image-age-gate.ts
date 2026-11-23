@@ -49,24 +49,25 @@ if (!engineUp) {
 	);
 	process.exit(2);
 }
-let build;
-try {
-	build = Bun.spawnSync({
-		cmd: [
-			"docker",
-			"build",
-			"--progress=plain",
-			"-f",
-			"Dockerfile.worker",
-			"-t",
-			"ottr-age-gate-check",
-			".",
-		],
-		stdout: "inherit",
-		stderr: "inherit",
-	});
-} catch (err) {
-	console.error(`docker build failed to start: ${err}`);
-	process.exit(2);
-}
-process.exit(build.exitCode ?? 1);
+const runBuild = () => {
+	try {
+		return Bun.spawnSync({
+			cmd: [
+				"docker",
+				"build",
+				"--progress=plain",
+				"-f",
+				"Dockerfile.worker",
+				"-t",
+				"ottr-age-gate-check",
+				".",
+			],
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+	} catch (err) {
+		console.error(`docker build failed to start: ${err}`);
+		process.exit(2);
+	}
+};
+process.exit(runBuild().exitCode ?? 1);
