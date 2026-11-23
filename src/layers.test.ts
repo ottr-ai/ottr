@@ -471,6 +471,19 @@ describe("pin hardening", () => {
 			expect(inLayer).toBe(false);
 		}
 	});
+
+	test("a planted intermediate symlink fails the pin and writes nothing outside the layer", () => {
+		const home = tempHome();
+		const dir = makeLayer(home, "plant1");
+		const outside = tempHome();
+		rmSync(join(dir, ".omp"), { recursive: true });
+		symlinkSync(outside, join(dir, ".omp"));
+		switchCurrent(home, "plant1");
+		expect(pinnedAgentLayer(home)).toEqual({ ok: false, reason: "prepare" });
+		// Every `.omp` link would have been redirected into `outside` (OTTR-1016):
+		// the pin must not create any entry there.
+		expect(readdirSync(outside)).toEqual([]);
+	});
 });
 
 describe("in-use registry hardening", () => {

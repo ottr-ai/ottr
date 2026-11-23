@@ -1,17 +1,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import {
-	existsSync,
-	lstatSync,
-	mkdirSync,
-	realpathSync,
-	symlinkSync,
-} from "node:fs";
+import { existsSync, lstatSync, realpathSync, symlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
 	mkdirBelow,
 	readBelow,
 	renameBelow,
 	unlinkBelow,
+	withDir,
 	writeBelow,
 } from "./confine.ts";
 import { type HeldLock, holdLock, probeLock } from "./layerLeaseLock.ts";
@@ -97,14 +92,19 @@ export function pinnedAgentLayer(home: string): LayerPin {
 	return { ok: true, layer, agentDir: join(dir, ".omp", "agent") };
 }
 
-/** Symlink `linkPath` -> `target`; an entry already in the layer wins, an EEXIST race is fine. */
-function linkOne(linkPath: string, target: string): void {
-	mkdirSync(dirname(linkPath), { recursive: true });
-	try {
-		symlinkSync(target, linkPath);
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-	}
+/** Symlink `rel` -> `target` inside the layer; an entry already in the layer wins, an EEXIST race is fine. */
+function linkOne(anchor: string, rel: string, target: string): void {
+	// The parent components below the layer must be real directories: openDir creates
+	// missing components without following a symlink, so a planted intermediate link
+	// (the home is worker-writable, R5-1) fails the pin closed instead of redirecting
+	// the write into storage outside the layer (OTTR-1016).
+	withDir(anchor, join(anchor, dirname(rel)), { create: true }, (d) => {
+		try {
+			symlinkSync(target, d.at(basename(rel)));
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+		}
+	});
 }
 
 /**
@@ -112,12 +112,12 @@ function linkOne(linkPath: string, target: string): void {
  * entry that already exists in the layer, and never touches the layer's config.yml.
  */
 function prepareLayer(home: string, layer: AgentLayer): void {
-	for (const rel of LINK_ALWAYS) linkOne(join(layer.dir, rel), join(home, rel));
+	for (const rel of LINK_ALWAYS) linkOne(layer.dir, rel, join(home, rel));
 	for (const rel of LINK_IF_SOURCE_EXISTS) {
 		const source = join(home, rel);
 		// Missing target stays missing, as today: omp creates it in the layer, where it dies
 		// with the layer at clean-up.
-		if (existsSync(source)) linkOne(join(layer.dir, rel), source);
+		if (existsSync(source)) linkOne(layer.dir, rel, source);
 	}
 }
 
