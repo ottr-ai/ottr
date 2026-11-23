@@ -21331,6 +21331,68 @@ describe(
 				);
 			});
 
+			test("a 200 mutation answer that leaves the thread open fails", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(89, [
+					{ id: 9008, path: "src/h.ts", line: 8 },
+				]);
+				// The answer names the thread but reads unresolved: no proof, no
+				// success.
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? {
+								code: 0,
+								stdout: JSON.stringify({
+									data: {
+										resolveReviewThread: {
+											thread: { id: "RT8", isResolved: false },
+										},
+									},
+								}),
+								stderr: "",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([["RT8", 9008, "ottr[bot]", false]]),
+								),
+								stderr: "",
+							};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect((await row(89)).postError).toBe(
+					"thread RT8: the mutation did not resolve the thread",
+				);
+			});
+
+			test("a mutation answer with no thread id fails", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(90, [
+					{ id: 9009, path: "src/i.ts", line: 9 },
+				]);
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? {
+								code: 0,
+								stdout: JSON.stringify({
+									data: { resolveReviewThread: { thread: {} } },
+								}),
+								stderr: "",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([["RT9", 9009, "ottr[bot]", false]]),
+								),
+								stderr: "",
+							};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect((await row(90)).postError).toBe(
+					"thread RT9: the mutation did not resolve the thread",
+				);
+			});
+
 			test("an empty fixed list sends no GraphQL read or resolve", async () => {
 				await removeApp();
 				// No stored fixed findings: the post resolves nothing and reads no threads.

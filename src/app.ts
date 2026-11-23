@@ -11596,13 +11596,15 @@ export async function createApp(deps: AppDeps) {
 				failures.push(`thread ${id}: ${r.error}`);
 				continue;
 			}
-			// A 200 answer must still name the thread: a null result with no
-			// errors array means the mutation did not resolve it.
+			// A 200 answer must still prove the resolve: the named thread must
+			// carry the requested id and read resolved — anything else means the
+			// mutation did not resolve it.
 			const thread = asRecord(
-				asRecord(asRecord(r.body)?.data)?.resolveReviewThread,
-			)?.thread;
-			if (typeof thread !== "object" || thread === null)
-				failures.push(`thread ${id}: the mutation answered no thread`);
+				asRecord(asRecord(asRecord(r.body)?.data)?.resolveReviewThread)?.thread,
+			);
+			const resolvedId = typeof thread?.id === "string" ? thread.id : null;
+			if (resolvedId !== id || thread?.isResolved !== true)
+				failures.push(`thread ${id}: the mutation did not resolve the thread`);
 		}
 		return failures.length === 0 ? null : failures.join("; ");
 	}
