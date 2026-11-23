@@ -571,6 +571,13 @@ describe("assertAllowedHost", () => {
 		"fe80::1",
 		"::ffff:10.0.0.1",
 		"::ffff:127.0.0.1",
+		"::ffff:0:a00:5",
+		"::ffff:0:169.254.169.254",
+		"64:ff9b::a00:5",
+		"64:ff9b::a9fe:a9fe",
+		"64:ff9b:1::a00:5",
+		"64:ff9b:1:a9:fea9:fe00::",
+		"2002:a00:5::1",
 	])("hosted: %s is blocked", async (addr) => {
 		const e = await jiraError(assertAllowedHost(SITE, hosted(addr)));
 		expect(e.kind).toBe("blocked");
@@ -583,6 +590,15 @@ describe("assertAllowedHost", () => {
 			await assertAllowedHost(SITE, hosted(addr));
 		},
 	);
+
+	test.each([
+		"64:ff9b::5db8:d822",
+		"64:ff9b:1:5d:b8d8:2200::",
+		"2002:5db8:d822::1",
+		"::ffff:0:5db8:d822",
+	])("hosted: %s with a public embedded IPv4 is allowed", async (addr) => {
+		await assertAllowedHost(SITE, hosted(addr));
+	});
 
 	test("one private address among public ones blocks", async () => {
 		const n: JiraNet = {
@@ -598,6 +614,22 @@ describe("assertAllowedHost", () => {
 			lookup: () => Promise.reject(new Error("lookup must not run")),
 		};
 		for (const site of ["https://127.0.0.1", "https://[::1]:8443/jira"])
+			expect((await jiraError(assertAllowedHost(site, n))).kind).toBe(
+				"blocked",
+			);
+	});
+
+	test("hosted: NAT64, 6to4 and IPv4-translated site literals are blocked", async () => {
+		const n: JiraNet = {
+			hosted: true,
+			lookup: () => Promise.reject(new Error("lookup must not run")),
+		};
+		for (const site of [
+			"https://[64:ff9b::a00:5]",
+			"https://[64:ff9b:1::a00:5]",
+			"https://[2002:a00:5::1]",
+			"https://[::ffff:0:a00:5]",
+		])
 			expect((await jiraError(assertAllowedHost(site, n))).kind).toBe(
 				"blocked",
 			);

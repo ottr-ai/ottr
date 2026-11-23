@@ -203,11 +203,22 @@ function ipv6Groups(ip: string): number[] | null {
 }
 
 function blockedV6(g: number[]): boolean {
-	const [g0 = 0, , , , , g5 = 0, g6 = 0, g7 = 0] = g;
+	const [g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g6 = 0, g7 = 0] = g;
 	const v4 = [g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff];
 	const zeroPrefix = g.slice(0, 5).every((x) => x === 0);
 	// ::ffff:a.b.c.d (mapped) and ::a.b.c.d (compatible; covers :: and ::1).
 	if (zeroPrefix && (g5 === 0xffff || g5 === 0)) return blockedV4(v4);
+	// ::ffff:0:a.b.c.d (IPv4-translated, RFC 2765): IPv4 in the last 32 bits.
+	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0)
+		return blockedV4(v4);
+	// 64:ff9b::/96 (NAT64 well-known prefix, RFC 6052): IPv4 in the last 32 bits.
+	if (g0 === 0x64 && g1 === 0xff9b && g.slice(2, 6).every((x) => x === 0))
+		return blockedV4(v4);
+	// 64:ff9b:1::/48 (NAT64 local-use prefix, RFC 8215): u octet zero, IPv4 at bits 56-87.
+	if (g0 === 0x64 && g1 === 0xff9b && g2 === 1 && (g3 & 0xff00) === 0)
+		return blockedV4([g3 & 0xff, g4 >> 8, g4 & 0xff, g5 >> 8]);
+	// 2002::/16 (6to4): IPv4 at bits 16-47.
+	if (g0 === 0x2002) return blockedV4([g1 >> 8, g1 & 0xff, g2 >> 8, g2 & 0xff]);
 	return (
 		(g0 & 0xfe00) === 0xfc00 || // fc00::/7 unique local
 		(g0 & 0xffc0) === 0xfe80 || // fe80::/10 link-local
