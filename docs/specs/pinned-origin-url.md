@@ -70,6 +70,12 @@ from `origin` by name.
      over-approximated to fail closed). A rewrite would redirect the push or
      fetch to a repo the pin never named; `pushInsteadOf` rewrites push
      destinations only, so both keys are scanned for every call.
+   - no `remote."<pin>".url` or `remote."<pin>".pushurl` entry from any config
+     scope may exist. `git fetch <pin>` resolves the repository argument as a
+     remote name before it reads the argument as a URL, so a section named
+     exactly like the pin (case-sensitive, git's own remote-name lookup) would
+     receive the call — and the host-scoped credential — instead of the pinned
+     repo.
 6. `GIT_ALLOW_PROTOCOL` stays `https:ssh:file`. After this change a `file`
    transport can only be reached through the pinned URL (clone only accepts
    https/ssh URLs from the admin), and a local pin under a worker-writable root
@@ -104,6 +110,12 @@ from `origin` by name.
 - A planted `url.<evil>.insteadOf` entry matching the pin fails the push and
   the gate closed, with the entry named in the error.
 - A planted `url.<evil>.pushInsteadOf` entry matching the pin fails the push
+  closed.
+- A planted `remote."<pin>".url` section aimed at a second scratch repo fails
+  the target fetch closed: `resolveTarget` skips the fetch with a warning and
+  `refs/remotes/origin/main` keeps the pinned repo's tip. A control fetch by
+  plain git proves the plant is live.
+- A planted `remote."<pin>".pushurl` entry fails the push and the guard
   closed.
 - A pin that starts with `-` (a git option, not a URL) fails closed.
 - A relative pin git reads as a local path (`./x:y.git`: first slash before the

@@ -31,6 +31,7 @@ import {
 	branchUnpushed,
 	changedFiles,
 	checkedOutBranch,
+	checkPinnedRemote,
 	commitFileOnBranch,
 	commitMeta,
 	createWorktree,
@@ -1744,6 +1745,85 @@ describe("pinned origin URL (OTTR-348)", () => {
 			);
 			expect(r.status).toBe("failed");
 			expect(r.status === "failed" && r.error.includes("insteadOf")).toBe(true);
+			expect(existsSync(f.marker)).toBe(false);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("a remote section named like the pin fails the target fetch closed (OTTR-1002)", async () => {
+		const f = fixture();
+		try {
+			// A second scratch repo with its own tip, so a redirected fetch is observable.
+			const other = join(f.dir, "other.git");
+			run(f.dir, "init", "-q", "--bare", "-b", "main", other);
+			const seed = join(f.dir, "other-seed");
+			run(f.dir, "clone", "-q", other, seed);
+			writeFileSync(join(seed, "other.txt"), "o");
+			run(seed, ...id, "add", ".");
+			run(seed, ...id, "commit", "-qm", "other tip");
+			run(seed, "push", "-q", "origin", "main");
+			const otherTip = run(other, "rev-parse", "main");
+			const bareTip = run(f.bare, "rev-parse", "main");
+			expect(otherTip).not.toBe(bareTip);
+			// The plant: a remote whose name is the pinned URL itself, aimed at the
+			// second repo — `git fetch <pin>` resolves a URL-shaped repository argument
+			// as a remote name before it reads the argument as a URL. (A raw-path pin
+			// cannot resolve here: git refuses a remote shorthand that begins with "/".)
+			const pin = `file://${f.bare}`;
+			run(f.main, "config", `remote.${pin}.url`, `file://${other}`);
+			const t = await resolveTarget(f.main, true, pin);
+			expect(t.warning).toContain("named like the pinned origin");
+			expect(t.sha).toBe(bareTip);
+			// The fetch never ran, so the tracking ref keeps the pinned repo's tip.
+			expect(run(f.main, "rev-parse", "refs/remotes/origin/main")).toBe(
+				bareTip,
+			);
+			// Control: the plant is live — plain git redirects the same fetch (same
+			// refspec the board uses) to the second repo's tip.
+			run(
+				f.main,
+				"fetch",
+				"-q",
+				pin,
+				"+refs/heads/main:refs/remotes/origin/main",
+			);
+			expect(run(f.main, "rev-parse", "refs/remotes/origin/main")).toBe(
+				otherTip,
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	test("a remote section named like the pin fails the push and the guard closed (OTTR-1002)", async () => {
+		const f = fixture();
+		try {
+			// pushurl bends pushes only, so the push-side plant needs its own key; a
+			// pushurl-only section still resolves (verified: the control push lands on
+			// the evil bare).
+			const pin = `file://${f.bare}`;
+			run(f.main, "config", `remote.${pin}.pushurl`, `file://${f.evil}`);
+			// Control: the plant is live — plain git runs the evil pre-receive.
+			run(f.main, "push", "-q", pin, "main:planted2");
+			expect(existsSync(f.marker)).toBe(true);
+			rmSync(f.marker);
+			expect(await checkPinnedRemote(f.main, pin)).toContain(
+				"named like the pinned origin",
+			);
+			const r = await serverMergePush(
+				f.main,
+				f.wt,
+				"origin/main",
+				"ott/x",
+				null,
+				pin,
+			);
+			expect(r.status).toBe("failed");
+			expect(
+				r.status === "failed" &&
+					r.error.includes("named like the pinned origin"),
+			).toBe(true);
 			expect(existsSync(f.marker)).toBe(false);
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });

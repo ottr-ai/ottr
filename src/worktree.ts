@@ -1626,7 +1626,10 @@ const sameOrUnder = (child: string, root: string): boolean => {
  * remote) is refused; and an `url.<base>.insteadOf` or `url.<base>.pushInsteadOf` entry
  * matching the pin (any config scope — the repo config is worker-writable) would redirect the
  * call to a repo the pin never named. git's rewrite rule is over-approximated to fail closed:
- * any matching prefix refuses, whatever the longest-match outcome would be. The config read is
+ * any matching prefix refuses, whatever the longest-match outcome would be. A `remote"<pin>"`
+ * section (url or pushurl, any scope) is refused too: git resolves a repository argument as a
+ * remote name before it reads the argument as a URL, so the same-named section would receive
+ * the call instead of the pinned repo. The config read is
  * a local subcommand: gitEnv strips the auth env from it. Returns the error text, else null.
  */
 export async function checkPinnedRemote(
@@ -1645,11 +1648,22 @@ export async function checkPinnedRemote(
 	for (const entry of r.stdout.split("\0")) {
 		const nl = entry.indexOf("\n");
 		if (nl === -1) continue;
+		const key = entry.slice(0, nl);
 		// Both rewrite keys: insteadOf bends fetches, pushInsteadOf bends pushes only —
 		// either would send the pinned call to a repo the pin never named.
-		if (!/^url\..*\.(?:push)?insteadof$/i.test(entry.slice(0, nl))) continue;
-		if (pinned.startsWith(entry.slice(nl + 1)))
-			return `repo config rewrites the pinned origin: an url.<…>.(push)insteadOf entry matches it; remove that entry, the board pushes and fetches only the pinned URL`;
+		if (/^url\..*\.(?:push)?insteadof$/i.test(key)) {
+			if (pinned.startsWith(entry.slice(nl + 1)))
+				return `repo config rewrites the pinned origin: an url.<…>.(push)insteadOf entry matches it; remove that entry, the board pushes and fetches only the pinned URL`;
+			continue;
+		}
+		// A remote section named exactly like the pin (OTTR-1002): git resolves a
+		// repository argument as a remote name before it reads the argument as a URL,
+		// so remote."<pin>".url/pushurl would receive the call — and the host-scoped
+		// credential — instead of the pinned repo. Remote names are case-sensitive
+		// config subsections, so the name comparison is exact.
+		const m = /^remote\.(.*)\.(?:url|pushurl)$/i.exec(key);
+		if (m !== null && m[1] === pinned)
+			return `repo config plants a remote named like the pinned origin: a remote.<…>.url/pushurl section would receive the call instead; remove that entry, the board pushes and fetches only the pinned URL`;
 	}
 	return null;
 }
