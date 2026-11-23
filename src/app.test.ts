@@ -29,6 +29,7 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
+import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
@@ -11390,12 +11391,15 @@ describe("turns' own host", () => {
 	});
 
 	test("a microVM turn's token files cards in its own project only, and opens its proxies", async () => {
+		// The grant names a real card: the binding (OTTR-1009) resolves it as the
+		// filed card's parent.
+		const a = await store.createTask("the vm turn's own card", null);
 		const grant = {
 			project: "p1",
-			taskId: "P1-9",
-			branch: "ott/p1-9",
+			taskId: a.id,
+			branch: `ott/${a.id.toLowerCase()}`,
 			repoPath: projectDir,
-			worktree: join(projectDir, ".worktrees", "P1-9"),
+			worktree: join(projectDir, ".worktrees", a.id),
 		};
 		const vm = vmTokens.issue(grant);
 		const other = vmTokens.issue({ ...grant, project: "p2" });
@@ -11411,6 +11415,8 @@ describe("turns' own host", () => {
 				? String(vmBody.id)
 				: "";
 		expect((await store.getTask(vmId))?.promptAuthor).toBe("board");
+		// The filed card follows the grant's task (OTTR-1009).
+		expect((await store.getTask(vmId))?.followUpOf).toBe(a.id);
 		// Another project's token, a trending verdict and any other route stay shut.
 		expect((await file(other)).status).toBe(403);
 		expect(
@@ -11476,6 +11482,62 @@ describe("turns' own host", () => {
 		expect(l?.followUpOf).toBe(a.id);
 		expect(l?.updateIds).toEqual(["x@1"]);
 		vmTokens.revoke(vm);
+	});
+
+	test("a token revoked while the body streams keeps its grant's parent binding", async () => {
+		// The wall admits the request before the handler awaits the body; the turn can
+		// end — and its token get revoked (runner settle) — inside that window. The
+		// admitted grant decides the parent binding, not the token's liveness then.
+		const a = await store.createTask("held source", null);
+		await store.updateTask(a.id, { updateIds: ["x@1"] });
+		const grant = {
+			project: "p1",
+			taskId: a.id,
+			branch: "ott/p1-z",
+			repoPath: projectDir,
+			worktree: join(projectDir, ".worktrees", "P1-Z"),
+		};
+		const vm = vmTokens.issue(grant);
+		const body = JSON.stringify({ prompt: "filed after revocation" });
+		const chunks: string[] = [];
+		const { promise: closed, resolve: markClosed } =
+			Promise.withResolvers<void>();
+		// node:net, not Bun.connect: the repo's typed shape rejects before it connects
+		// in this runtime (vmValidate's connectProbe says the same).
+		const port = server.port;
+		if (port === undefined) throw new Error("the test server has no port");
+		const socket = netConnect({ host: "127.0.0.1", port });
+		socket.on("data", (chunk: Buffer) => chunks.push(String(chunk)));
+		socket.on("close", markClosed);
+		socket.on("error", markClosed);
+		const head =
+			[
+				"POST /api/projects/p1/tasks HTTP/1.1",
+				"Host: ottr:4852",
+				"Origin: http://ottr:4852",
+				`x-board-token: ${vm}`,
+				"Content-Type: application/json",
+				`Content-Length: ${Buffer.byteLength(body)}`,
+				"Connection: close",
+			].join("\r\n") + "\r\n\r\n";
+		const split = Math.floor(body.length / 2);
+		socket.write(head + body.slice(0, split));
+		// Real-clock beat (ts-no-test-timers integration exception): the wall runs when
+		// Bun parses the headers, and the client has no signal for it — fake timers
+		// cannot drive the server's socket work. 100 ms is ~100x the local cost.
+		await new Promise<void>((resolve) => setTimeout(resolve, 100));
+		vmTokens.revoke(vm);
+		socket.write(body.slice(split));
+		await closed;
+		socket.end();
+		const text = chunks.join("");
+		const status = Number(/^HTTP\/1\.1 (\d{3})/.exec(text)?.[1]);
+		expect(status).toBe(200);
+		const payload = text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
+		const filed = JSON.parse(payload) as { id?: string };
+		const t = await store.getTask(String(filed.id));
+		expect(t?.followUpOf).toBe(a.id);
+		expect(t?.updateIds).toEqual(["x@1"]);
 	});
 });
 

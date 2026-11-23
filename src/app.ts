@@ -466,7 +466,7 @@ import {
 	validateUpdates,
 } from "./updates.ts";
 import { vmHoldFor, vmState } from "./vmState.ts";
-import { type VmTokens, vmTokenOf } from "./vmTokens.ts";
+import { type VmGrant, type VmTokens, vmTokenOf } from "./vmTokens.ts";
 import {
 	loadSubs,
 	PUSH_SUBJECT,
@@ -5390,6 +5390,14 @@ export async function createApp(deps: AppDeps) {
 		return { host: u.host, origin: u.origin, token: deps.board.token };
 	})();
 
+	/** The VM grant each request admitted by agentRefusal authenticated with, keyed by the
+	 * request object. The tasks handler reads this instead of re-checking the token: the
+	 * wall runs before the handler awaits the body, and a turn that ends inside that
+	 * window revokes its token (runner settle) — a re-check would fail open and file the
+	 * card without the grant's parent binding (OTTR-1009). No entry means the request
+	 * never met the agent-host wall (a session, or an API key). */
+	const admittedVmGrants = new WeakMap<Request, VmGrant>();
+
 	/** True when the request arrived under the turns' own host (see agent). */
 	function viaAgentHost(req: Request): boolean {
 		const host = req.headers.get("host");
@@ -5432,6 +5440,7 @@ export async function createApp(deps: AppDeps) {
 		if (vm !== null) {
 			const refused = vmCardRefusal(m, vm.project);
 			if (refused !== null) return refused;
+			admittedVmGrants.set(req, vm);
 		}
 		return null;
 	}
@@ -14131,10 +14140,10 @@ export async function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		// A live VM token binds the card to the grant's task (OTTR-1009): followUpOf omitted
-		// or pointing at another card cannot escape the source card's merge hold.
-		const vmGrant =
-			deps.vmTokens?.check(req.headers.get("x-board-token")) ?? null;
+		// The grant the wall admitted (see admittedVmGrants), never a fresh token check:
+		// the turn can end — and revoke its token — while the body streams, and the
+		// binding to the grant's task must survive that (OTTR-1009).
+		const vmGrant = admittedVmGrants.get(req) ?? null;
 		const prep = await validateTaskCreate(e, r.body, vmGrant?.taskId ?? null);
 		if (prep instanceof Response) return prep;
 		const made = await e.store.transaction(async () => {
