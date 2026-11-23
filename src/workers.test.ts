@@ -4847,7 +4847,7 @@ describe("stream line cap", () => {
 	// sentinel, as 64 KiB chunks over a real local HTTP server. Validation #OTTR-1231
 	// ran this shape through the unfixed reader and OOM-killed a 512 MiB job at a
 	// 128 MiB line.
-	function floodServer(bytes: number): ReturnType<typeof Bun.serve> {
+	function floodServer(bytes: number, onFlood?: (sentBytes: number) => void) {
 		const chunkSize = 64 * 1024;
 		let sent = 0;
 		const enc = new TextEncoder();
@@ -4877,6 +4877,7 @@ describe("stream line cap", () => {
 							}
 							c.enqueue(enc.encode("a".repeat(chunkSize)));
 							sent += chunkSize;
+							onFlood?.(sent);
 						},
 					}),
 					{ headers: { "content-type": "text/plain" } },
@@ -4910,7 +4911,25 @@ describe("stream line cap", () => {
 	});
 
 	test("a newline-free 64 MiB line settles with a drop notice and bounded reader memory", async () => {
-		const server = floodServer(64 * 1024 * 1024);
+		// Peak RSS measured mid-flood under forced GC: Bun.gc(true) collapses the
+		// flood's transient allocation churn (a plain end-to-end delta measures GC
+		// scheduling noise: 205 MB growth with the fix in place under load), but it
+		// cannot reclaim the reader's live partial, so a retained line shows up as
+		// peak growth while a capped reader stays near the baseline. The unfixed
+		// reader retained the whole 64 MiB line at this point (validation
+		// #OTTR-1231, ~191 MB end-to-end).
+		let rssPeak = 0;
+		const gcAndSample = (): void => {
+			Bun.gc(true);
+			const rss = process.memoryUsage.rss();
+			if (rss > rssPeak) rssPeak = rss;
+		};
+		gcAndSample();
+		const rssBefore = rssPeak;
+		const server = floodServer(64 * 1024 * 1024, (sent) => {
+			// Sample every 4 MiB of flood sent, while consumeRun holds the line.
+			if (sent % (4 * 1024 * 1024) < 64 * 1024) gcAndSample();
+		});
 		const sink = fakeSink();
 		const { done } = runWorker(
 			{ id: "flood", argv: [], cwd: dir, stdin: "", env: {} },
@@ -4923,9 +4942,13 @@ describe("stream line cap", () => {
 		expect(sink.lines).toContain(`${lineDropNotice()}\n`);
 		expect(sink.lines.some((l) => l.startsWith("a"))).toBe(false);
 		server.stop(true);
-		// The memory bound itself is asserted against feedCappedLines directly in the
-		// flood-invariant unit test above; a wall-clock RSS delta here measures GC
-		// scheduling noise, not the reader (see that test's comment).
+		// Peak reader RSS growth stays under the cap plus a margin: the retained
+		// tail never exceeds MAX_STREAM_LINE_CHARS. Measured peak growth with the
+		// fix in place is a few MB; the uncapped reader retains the whole line and
+		// fails this by more than the margin (drill: set MAX_STREAM_LINE_CHARS to
+		// Number.MAX_SAFE_INTEGER and rerun this test).
+		const growth = rssPeak - rssBefore;
+		expect(growth).toBeLessThan(MAX_STREAM_LINE_CHARS + 24 * 1024 * 1024);
 	}, 60_000);
 
 	test("a normal event line after a dropped oversized line still reaches sink.line", async () => {
