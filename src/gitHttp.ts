@@ -1,3 +1,6 @@
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { type VmGrant, type VmTokens, vmTokenOf } from "./vmTokens.ts";
 import {
 	git,
@@ -12,7 +15,8 @@ import {
  * over the project's main checkout. The VM clones and pushes its card's branch here with its
  * per-turn token; it never sees the workspace or a host credential. Every ref but the card's
  * branch (and the task base, when that is a ref) is hidden, HEAD included: no other branch is
- * advertised or fetchable.
+ * advertised or fetchable. A push may reference only objects its own pack supplies (OTTR-1031):
+ * the store's hidden branches and pushed-over history stay out of the grant's reach.
  *
  *   GET  /git/<project>.git/info/refs?service=git-upload-pack|git-receive-pack
  *   POST /git/<project>.git/git-upload-pack
@@ -158,9 +162,10 @@ function parseCommandLine(raw: string, isFirst: boolean): ParsedCommand {
 }
 
 /**
- * The command section of a receive-pack request body: pkt-lines up to the first flush. Shallow
- * lines (a shallow VM clone) are skipped; anything else that is not `<old> <new> <ref>` (a
- * signed push certificate, a garbled line) is an error, so no ref escapes the check.
+ * The command section of a receive-pack request body: pkt-lines up to the first flush, plus
+ * the offset where the packfile starts (past any push-options section). Shallow lines (a
+ * shallow VM clone) are skipped; anything else that is not `<old> <new> <ref>` (a signed push
+ * certificate, a garbled line) is an error, so no ref escapes the check.
  */
 export function parseReceiveCommands(
 	body: Uint8Array,
@@ -181,6 +186,19 @@ export function parseReceiveCommands(
 	}
 }
 
+/** Where the packfile of a receive-pack body starts: the PACK signature after the command flush; body.length when none follows. */
+function packOffset(body: Uint8Array, from: number): number {
+	for (let i = from; i + 4 <= body.length; i++)
+		if (
+			body[i] === 0x50 &&
+			body[i + 1] === 0x41 &&
+			body[i + 2] === 0x43 &&
+			body[i + 3] === 0x4b
+		)
+			return i;
+	return body.length;
+}
+
 /** The refusal for a push that leaves the card's branch, or deletes it; null when allowed. */
 export function pushRefusal(
 	commands: readonly PushCommand[],
@@ -192,6 +210,264 @@ export function pushRefusal(
 		if (ZERO.test(c.new)) return `deleting ${own} is refused`;
 	}
 	return null;
+}
+
+/** The store's object directory and object format; null when the repository cannot be read. */
+async function storeInfo(
+	repoPath: string,
+): Promise<{ objects: string; format: "sha1" | "sha256" } | null> {
+	const r = await git(
+		[
+			"rev-parse",
+			"--path-format=absolute",
+			"--git-common-dir",
+			"--show-object-format",
+		],
+		repoPath,
+	);
+	const [dir = "", format = ""] = r.stdout.trim().split("\n");
+	if (r.code !== 0 || dir === "" || (format !== "sha1" && format !== "sha256"))
+		return null;
+	return { objects: path.join(dir, "objects"), format };
+}
+
+/** The shas of the refs the grant can see (its branch and its ref base); missing refs drop out. */
+async function visibleTips(grant: VmGrant): Promise<string[]> {
+	const names = [`refs/heads/${grant.branch}`];
+	const base = grant.base;
+	if (base !== undefined && !SHA.test(base))
+		names.push(base.startsWith("refs/") ? base : `refs/heads/${base}`);
+	const out: string[] = [];
+	for (const name of names) {
+		const r = await git(["rev-parse", "--verify", "-q", name], grant.repoPath);
+		if (r.code === 0 && SHA.test(r.stdout.trim())) out.push(r.stdout.trim());
+	}
+	return out;
+}
+
+/** One git run in the throwaway repo: no global or system config, and only sha-shaped arguments. */
+async function tmpGit(
+	cwd: string,
+	alternates: string | null,
+	args: string[],
+	input?: Uint8Array | ReadableStream<Uint8Array>,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+	const proc = Bun.spawn([gitExe(), ...args], {
+		cwd,
+		env: {
+			PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_NOSYSTEM: "1",
+			...(alternates === null
+				? {}
+				: { GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates }),
+		},
+		stdin: input ?? "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+	const [out, err, code] = await Promise.all([
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+		proc.exited,
+	]);
+	return { code, stdout: out, stderr: err };
+}
+
+/**
+ * The shas the guest's own pack bytes carry, listed from its index; null when it cannot be
+ * read. `index-pack --fix-thin` appends a resolved delta base behind the guest's data, where
+ * the guest's trailer used to be, so an entry at or past `guestEnd` (`pack.length` minus the
+ * store's trailer width) is store bytes, not guest bytes.
+ */
+async function packCarried(
+	tmp: string,
+	guestEnd: number,
+): Promise<Set<string> | null> {
+	const packDir = path.join(tmp, "objects", "pack");
+	const idx = readdirSync(packDir).find((f) => f.endsWith(".idx"));
+	if (idx === undefined) return null;
+	const shown = await tmpGit(
+		tmp,
+		null,
+		["show-index"],
+		readFileSync(path.join(packDir, idx)),
+	);
+	if (shown.code !== 0) return null;
+	const out = new Set<string>();
+	for (const line of shown.stdout.split("\n")) {
+		const [offset = "", sha = ""] = line.trim().split(/\s+/);
+		if (offset !== "" && SHA.test(sha) && Number(offset) < guestEnd)
+			out.add(sha);
+	}
+	return out;
+}
+
+/**
+ * The shas the pack names as delta bases, from the index listing's delta lines (`<sha> <type>
+ * <size> <packed> <offset> <depth> <base>`); null when the pack cannot be inspected.
+ */
+async function packBases(tmp: string): Promise<Set<string> | null> {
+	const packDir = path.join(tmp, "objects", "pack");
+	const idx = readdirSync(packDir).find((f) => f.endsWith(".idx"));
+	if (idx === undefined) return null;
+	const checked = await tmpGit(
+		tmp,
+		null,
+		["verify-pack", "-v", path.join(packDir, idx)],
+	);
+	if (checked.code !== 0) return null;
+	const out = new Set<string>();
+	for (const line of checked.stdout.split("\n")) {
+		const tokens = line.trim().split(/\s+/);
+		const base = tokens[tokens.length - 1] ?? "";
+		if (tokens.length >= 7 && SHA.test(base)) out.add(base);
+	}
+	return out;
+}
+
+/** The shas the visible tips reach; null when the walk fails, so the caller refuses. */
+async function visibleObjects(
+	tmp: string,
+	alternates: string,
+	tips: string[],
+): Promise<Set<string> | null> {
+	const walk = await tmpGit(tmp, alternates, ["rev-list", "--objects", ...tips]);
+	if (walk.code !== 0) return null;
+	const out = new Set<string>();
+	for (const line of walk.stdout.split("\n")) {
+		const [id = ""] = line.split(" ");
+		if (SHA.test(id)) out.add(id);
+	}
+	return out;
+}
+
+/** The objects the pushed tips add over the visible tips, or the sha whose walk failed. */
+async function walkNewObjects(
+	tmp: string,
+	alternates: string,
+	tips: string[],
+	news: string[],
+): Promise<{ listed: Set<string> } | { failed: string }> {
+	const listed = new Set<string>();
+	for (const sha of news) {
+		const walk = await tmpGit(tmp, alternates, [
+			"rev-list",
+			"--objects",
+			sha,
+			"--not",
+			...tips,
+		]);
+		if (walk.code !== 0) return { failed: sha };
+		for (const line of walk.stdout.split("\n")) {
+			const [id = ""] = line.split(" ");
+			if (SHA.test(id)) listed.add(id);
+		}
+	}
+	return { listed };
+}
+
+/**
+ * The refusal when a pushed tip reaches objects the grant's visible refs do not and the pushed
+ * pack does not supply (OTTR-1031). The store keeps objects the grant must not read: hidden
+ * branches, and history pushed over before it. receive-pack's own connectivity check counts
+ * every store object as available, so a guest that knows a hidden sha could otherwise repoint
+ * its branch at it, or craft a commit whose parent names it, and fetch the object back through
+ * the grant.
+ *
+ * The pack is indexed into a throwaway bare repo (`--fix-thin`, the store rides as an
+ * alternates dir), rev-list walks each new tip against the visible tips through that repo and
+ * the store, and every object the walk lists must be carried by the pack. A delta base the
+ * pack names without carrying is not itself an edge: rebuilding a delta needs its bytes, which
+ * only the pack can bring. A push whose history cannot be fully enumerated is refused, so a
+ * shallow push that does not supply its whole history never lands.
+ */
+export async function packSupplyRefusal(
+	commands: readonly PushCommand[],
+	grant: VmGrant,
+	pack: Uint8Array | { path: string; size: number },
+): Promise<string | null> {
+	const news = [
+		...new Set(commands.filter((c) => !ZERO.test(c.new)).map((c) => c.new)),
+	];
+	if (news.length === 0) return null;
+	const store = await storeInfo(grant.repoPath);
+	if (store === null)
+		return "push refused: the project repository cannot be read";
+	// The pack trailer holds one digest of the store's hash: 20 bytes for SHA-1, 32 for
+	// SHA-256, so the guest's data ends there and --fix-thin's appends start.
+	const trailer = store.format === "sha256" ? 32 : 20;
+	const packSize = typeof pack === "object" ? pack.size : pack.length;
+	const tips = await visibleTips(grant);
+	const tmp = mkdtempSync(path.join(tmpdir(), "ottr-push-"));
+	try {
+		const made = await tmpGit(tmp, null, [
+			"init",
+			"-q",
+			"--bare",
+			`--object-format=${store.format}`,
+			".",
+		]);
+		if (made.code !== 0)
+			return "push refused: the pushed pack cannot be checked";
+		if (packSize > 0) {
+			const input =
+				typeof pack === "object" ? Bun.file(pack.path).stream() : pack;
+			const indexed = await tmpGit(
+				tmp,
+				store.objects,
+				["index-pack", "--fix-thin", "--stdin"],
+				input,
+			);
+			if (indexed.code !== 0)
+				return "push refused: the pushed pack cannot be unpacked";
+		}
+		// The indexed pack and the store together: the walk resolves the pushed tip from the
+		// pack and the hidden history from the store, so every object it lists is one the
+		// grant cannot reach through its own refs.
+		const walked = await walkNewObjects(
+			tmp,
+			`${tmp}${path.delimiter}${store.objects}`,
+			tips,
+			news,
+		);
+		if ("failed" in walked)
+			return `push refused: the new objects of ${walked.failed.slice(0, 12)} cannot be enumerated`;
+		const listed = walked.listed;
+		if (listed.size === 0) return null;
+		const first = listed.values().next();
+		if (first.done === false && packSize === 0)
+			return `push refused: object ${first.value} is not supplied by the pushed pack`;
+		const carried = await packCarried(tmp, packSize - trailer);
+		if (carried === null)
+			return "push refused: the pushed pack cannot be inspected";
+		for (const sha of listed)
+			if (!carried.has(sha))
+				return `push refused: object ${sha} is not supplied by the pushed pack`;
+		// A delta base the guest did not carry was appended by --fix-thin from the store, and
+		// a copy delta can rebuild store bytes into a guest-carried object without the guest
+		// sending them. An external base must therefore be an object the grant already sees.
+		const bases = await packBases(tmp);
+		if (bases === null)
+			return "push refused: the pushed pack cannot be inspected";
+		const external = [...bases].filter((b) => !carried.has(b));
+		if (external.length > 0) {
+			const visible = await visibleObjects(
+				tmp,
+				`${tmp}${path.delimiter}${store.objects}`,
+				tips,
+			);
+			if (visible === null)
+				return "push refused: the pushed pack's delta bases cannot be checked";
+			for (const base of external)
+				if (!visible.has(base))
+					return `push refused: delta base ${base} is outside the grant's visible refs`;
+		}
+		return null;
+	} finally {
+		rmSync(tmp, { recursive: true, force: true, maxRetries: 5 });
+	}
 }
 
 /**
@@ -433,10 +709,9 @@ function cgiEnv(
 	}
 	const ctype = req.headers.get("content-type");
 	if (ctype !== null) env.CONTENT_TYPE = ctype;
-	const proto = req.headers.get("git-protocol");
-	// Protocol v2 for fetches; the value lands in git's env, so only its own grammar passes.
-	if (proto !== null && /^[A-Za-z0-9=:._-]{1,64}$/.test(proto))
-		env.HTTP_GIT_PROTOCOL = proto;
+	// No HTTP_GIT_PROTOCOL, so the client's Git-Protocol header cannot negotiate v2: upload-pack
+	// v2 ignores the allow*SHA1InWant pins for hidden refs and serves any store object by sha
+	// (OTTR-1031). v0 and v1 answer every want outside the advertised refs with a refusal.
 	return env;
 }
 
@@ -445,6 +720,8 @@ type GitInput =
 	| {
 			stdin: Uint8Array | ReadableStream<Uint8Array> | "ignore";
 			pushed: PushCommand[];
+			/** The scratch directory holding the pushed body and pack; removed after the push. */
+			scratch?: string;
 	  }
 	| { response: Response };
 
@@ -563,9 +840,33 @@ async function gitInput(
 			o.log(`${grant.project}/${grant.taskId}: push refused: ${refusal}`);
 			return { response: plain(refusal, 403) };
 		}
-		// Allowed: the packfile streams to http-backend, which reads stdin to EOF without
-		// CONTENT_LENGTH — the same streamed shape an upload-pack request already takes.
-		return { stdin: parsed.stdin, pushed: parsed.commands };
+		// The supply check reads the packfile from a scratch file, not memory (OTTR-1003
+		// keeps the buffering on disk), and http-backend replays the whole body afterwards.
+		const scratch = mkdtempSync(path.join(tmpdir(), "ottr-push-body-"));
+		const cleanup = () =>
+			rmSync(scratch, { recursive: true, force: true, maxRetries: 5 });
+		let bodyPath: string;
+		let packSize: number;
+		let packPath: string;
+		try {
+			bodyPath = path.join(scratch, "body");
+			await writeStreamToFile(parsed.stdin, bodyPath);
+			packPath = path.join(scratch, "pack");
+			packSize = await extractPackFile(bodyPath, packPath);
+		} catch (err) {
+			cleanup();
+			throw err;
+		}
+		const supply = await packSupplyRefusal(parsed.commands, grant, {
+			path: packPath,
+			size: packSize,
+		});
+		if (supply !== null) {
+			o.log(`${grant.project}/${grant.taskId}: push refused: ${supply}`);
+			cleanup();
+			return { response: plain(supply, 403) };
+		}
+		return { stdin: Bun.file(bodyPath).stream(), pushed: parsed.commands, scratch };
 	}
 	if (rest === "git-upload-pack") {
 		// Streamed; http-backend inflates a gzip body itself (git gzips large fetch requests).
@@ -573,6 +874,63 @@ async function gitInput(
 		return { stdin: req.body ?? new Uint8Array(0), pushed: [] };
 	}
 	return { stdin: "ignore", pushed: [] };
+}
+
+/** Streams a readable stream into one file and returns its byte size. */
+async function writeStreamToFile(
+	stream: ReadableStream<Uint8Array>,
+	path: string,
+): Promise<number> {
+	const writer = Bun.file(path).writer();
+	const reader = stream.getReader();
+	let size = 0;
+	for (;;) {
+		const { value, done } = await reader.read();
+		if (done) break;
+		if (value !== undefined) {
+			writer.write(value);
+			size += value.byteLength;
+		}
+	}
+	await writer.end();
+	return size;
+}
+
+/** The offset just past the command section's flush pkt-line; head.length when it holds no complete flush. */
+function locateFlush(head: Uint8Array): number {
+	const text = new TextDecoder();
+	let at = 0;
+	for (;;) {
+		const pkt = readPktLine(head, at, text);
+		if (pkt.kind === "error" || pkt.kind === "partial") return head.length;
+		if (pkt.kind === "flush") return pkt.at;
+		at = pkt.at;
+	}
+}
+
+/**
+ * Copies the packfile section of a receive-pack body file into its own file and returns its
+ * size. The command head is bounded by the section cap, so the scan for the flush and the
+ * PACK signature reads at most that much into memory; a pack signature beyond it, or none at
+ * all, leaves an empty pack file and fails the supply check closed.
+ */
+async function extractPackFile(
+	bodyPath: string,
+	packPath: string,
+): Promise<number> {
+	const size = Bun.file(bodyPath).size;
+	const headLen = Math.min(size, MAX_PUSH_COMMANDS + 64 * 1024);
+	const head = new Uint8Array(
+		await Bun.file(bodyPath).slice(0, headLen).arrayBuffer(),
+	);
+	const raw = packOffset(head, locateFlush(head));
+	const packAt = raw === headLen && size > headLen ? size : raw;
+	if (packAt >= size) {
+		await Bun.write(packPath, new Uint8Array(0));
+		return 0;
+	}
+	await Bun.write(packPath, Bun.file(bodyPath).slice(packAt));
+	return size - packAt;
 }
 
 /** One running http-backend: the CGI answer and the process's exit code. */
@@ -1108,14 +1466,23 @@ export async function handleGit(
 	if ("response" in input) return input.response;
 	const backend = await runBackend(grant, rest, env, input.stdin, req, o);
 	if (rest !== "git-receive-pack") return backend.res;
-	// The push answer is a short report-status: buffer it, so the VM's push returns only once
-	// the server worktree shows the pushed head.
-	const bytes = new Uint8Array(await backend.res.arrayBuffer());
-	const code = await backend.exited;
-	if (backend.res.status === 200 && code === 0 && input.pushed.length > 0)
-		await syncAfterPush(grant, o.log);
-	return new Response(bytes, {
-		status: backend.res.status,
-		headers: backend.res.headers,
-	});
+	try {
+		// The push answer is a short report-status: buffer it, so the VM's push returns only
+		// once the server worktree shows the pushed head.
+		const bytes = new Uint8Array(await backend.res.arrayBuffer());
+		const code = await backend.exited;
+		if (backend.res.status === 200 && code === 0 && input.pushed.length > 0)
+			await syncAfterPush(grant, o.log);
+		return new Response(bytes, {
+			status: backend.res.status,
+			headers: backend.res.headers,
+		});
+	} finally {
+		if (input.scratch !== undefined)
+			rmSync(input.scratch, {
+				recursive: true,
+				force: true,
+				maxRetries: 5,
+			});
+	}
 }

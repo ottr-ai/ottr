@@ -5,12 +5,14 @@ import { join } from "node:path";
 import type { Server } from "bun";
 import {
 	handleGit,
+	packSupplyRefusal,
 	pushRefusal,
 	receiveCommands,
 	syncWorktreeTo,
+	type PushCommand,
 } from "./gitHttp.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
-import { VmTokens } from "./vmTokens.ts";
+import { type VmGrant, VmTokens } from "./vmTokens.ts";
 import { gitExe } from "./worktree.ts";
 
 const dirs: string[] = [];
@@ -79,6 +81,7 @@ let main = "";
 let worktree = "";
 let token = "";
 let base = "";
+let secretSha = "";
 
 beforeAll(async () => {
 	const root = dir();
@@ -89,6 +92,14 @@ beforeAll(async () => {
 	await must(main, "commit", "-q", "-m", "init");
 	base = await must(main, "rev-parse", "HEAD");
 	await must(main, "branch", "secret");
+	// A hidden branch with its own commit and blob: nothing the grant sees reaches it
+	// (OTTR-1031). The checkout returns to main, so the main checkout keeps base's files.
+	await must(main, "checkout", "-q", "secret");
+	writeFileSync(join(main, "secret.txt"), "TOPSECRET-MARKER\n");
+	await must(main, "add", "secret.txt");
+	await must(main, "commit", "-q", "-m", "hidden commit");
+	secretSha = await must(main, "rev-parse", "refs/heads/secret");
+	await must(main, "checkout", "-q", "main");
 	worktree = join(main, ".worktrees", "ALP-1");
 	await must(main, "worktree", "add", "-q", "-b", BRANCH, worktree);
 	token = tokens.issue({
@@ -125,6 +136,44 @@ async function cloneWithCommit(file: string, text: string): Promise<string> {
 	await must(clone, "add", ".");
 	await must(clone, "commit", "-q", "-m", `add ${file}`);
 	return clone;
+}
+
+/** A zero-object packfile: the 12-byte header plus its own sha1 trailer. */
+async function emptyPack(): Promise<Uint8Array> {
+	const header = new TextEncoder().encode(
+		"PACK\x00\x00\x00\x02\x00\x00\x00\x00",
+	);
+	const sum = new Uint8Array(await crypto.subtle.digest("SHA-1", header));
+	const out = new Uint8Array(header.length + sum.length);
+	out.set(header);
+	out.set(sum, header.length);
+	return out;
+}
+
+/** A pack of the given revs (`sha`, `^sha` lines) read from the fixture repository. */
+async function packOf(revs: string): Promise<Uint8Array> {
+	const p = Bun.spawn([gitExe(), "pack-objects", "--revs", "--stdout"], {
+		cwd: main,
+		env: {
+			...fixtureGitEnv(),
+			PATH: process.env.PATH ?? "",
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			HOME: tmpdir(),
+			GIT_TERMINAL_PROMPT: "0",
+		},
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	p.stdin.write(revs);
+	p.stdin.end();
+	const [out, err] = await Promise.all([
+		new Response(p.stdout).arrayBuffer(),
+		new Response(p.stderr).text(),
+	]);
+	const code = await p.exited;
+	if (code !== 0) throw new Error(`pack-objects: ${err}`);
+	return new Uint8Array(out);
 }
 
 describe("handleGit over real git", () => {
@@ -357,6 +406,45 @@ describe("handleGit over real git", () => {
 		expect(listed).toEqual([`refs/heads/${BRANCH}`]);
 		tokens.revoke(shaTok);
 	}, 60_000);
+
+	test("protocol v2 cannot fetch a hidden object by sha", async () => {
+		// run() pins protocol.version=2 on the client; the server must answer v0 or v1, where
+		// the uploadpack.allow*SHA1InWant=false pins hold (OTTR-1031).
+		const scratch = dir();
+		await must(scratch, "init", "-q");
+		const r = await run(scratch, ...auth(token), "fetch", url(), secretSha);
+		expect(r.code).not.toBe(0);
+		expect(r.err).toMatch(/unadvertised/i);
+		expect((await run(scratch, "cat-file", "-e", secretSha)).code).not.toBe(0);
+		// Even the advertisement must not negotiate v2: v2 ignores the pins for hidden refs.
+		const res = await fetch(`${url()}/info/refs?service=git-upload-pack`, {
+			headers: {
+				authorization: `Bearer ${token}`,
+				"git-protocol": "version=2",
+			},
+		});
+		expect(await res.text()).not.toContain("version 2");
+	}, 60_000);
+
+	test("repointing the card branch at a hidden sha is refused, pack or no pack", async () => {
+		const old = await must(main, "rev-parse", `refs/heads/${BRANCH}`);
+		const line = `${old} ${secretSha} refs/heads/${BRANCH}\0report-status side-band-64k\n`;
+		const pkt = `${(line.length + 4).toString(16).padStart(4, "0")}${line}0000`;
+		const empty = await emptyPack();
+		const body = new Uint8Array(pkt.length + empty.length);
+		body.set(new TextEncoder().encode(pkt));
+		body.set(empty, pkt.length);
+		const res = await fetch(`${url()}/git-receive-pack`, {
+			method: "POST",
+			headers: {
+				authorization: `Bearer ${token}`,
+				"content-type": "application/x-git-receive-pack-request",
+			},
+			body,
+		});
+		expect(res.status).toBe(403);
+		expect(await must(main, "rev-parse", `refs/heads/${BRANCH}`)).toBe(old);
+	}, 60_000);
 });
 
 describe("receiveCommands", () => {
@@ -492,6 +580,58 @@ describe("receiveCommands", () => {
 			"deleting",
 		);
 	});
+});
+
+describe("packSupplyRefusal", () => {
+	const grant = (base?: string): VmGrant => ({
+		project: "alpha",
+		taskId: "ALP-1",
+		branch: BRANCH,
+		repoPath: main,
+		worktree,
+		...(base === undefined ? {} : { base }),
+	});
+	const cmd = (newSha: string): PushCommand => ({
+		old: "0".repeat(40),
+		new: newSha,
+		ref: `refs/heads/${BRANCH}`,
+	});
+
+	test("an empty pack cannot repoint the branch at a hidden sha", async () => {
+		const r = await packSupplyRefusal(
+			[cmd(secretSha)],
+			grant(),
+			await emptyPack(),
+		);
+		expect(r).toContain(secretSha);
+		expect(r).toContain("not supplied");
+	}, 60_000);
+
+	test("a pack that carries the hidden chain may re-send it", async () => {
+		const branchTip = await must(main, "rev-parse", `refs/heads/${BRANCH}`);
+		const pack = await packOf(`${secretSha}\n^${branchTip}\n`);
+		expect(pack.length).toBeGreaterThan(0);
+		const r = await packSupplyRefusal([cmd(secretSha)], grant("main"), pack);
+		expect(r).toBeNull();
+	}, 60_000);
+
+	test("repointing at a visible tip needs no pack objects", async () => {
+		const r = await packSupplyRefusal(
+			[cmd(base)],
+			grant("main"),
+			await emptyPack(),
+		);
+		expect(r).toBeNull();
+	}, 60_000);
+
+	test("a delete command needs no pack", async () => {
+		const r = await packSupplyRefusal(
+			[{ ...cmd(secretSha), new: "0".repeat(40) }],
+			grant(),
+			await emptyPack(),
+		);
+		expect(r).toBeNull();
+	}, 60_000);
 });
 
 describe("syncWorktreeTo", () => {
