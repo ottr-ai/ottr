@@ -158,6 +158,7 @@ interface RunOpts {
 	providers?: string[];
 	hindsight?: boolean;
 	boardUrl?: string;
+	project?: string;
 }
 
 function runBody(o: RunOpts): string {
@@ -175,6 +176,7 @@ function runBody(o: RunOpts): string {
 			boardUrl: o.boardUrl ?? "http://ottr:8080",
 			providers: o.providers ?? [],
 			hindsight: o.hindsight ?? false,
+			project: o.project ?? "proj",
 		},
 	});
 }
@@ -415,6 +417,10 @@ providers:
 		expect(env.OTTR_VM_TOKEN).toBe("vm-turn-token");
 		expect(env.HINDSIGHT_API_URL).toBe("http://ottr:8080/hindsight");
 		expect(env.HINDSIGHT_API_TOKEN).toBe("vm-turn-token");
+		// The guest pins omp to its own project's bank; the proxy refuses any other bank
+		// for the VM token (docs/specs/hindsight-bank-binding.md).
+		expect(env.HINDSIGHT_BANK_ID).toBe("ottr-proj");
+		expect(env.HINDSIGHT_SCOPING).toBe("global");
 		expect(env.FOO).toBe("bar");
 		// The turn keeps the guest's home, nothing else of its env.
 		expect(env.HOME).toBe(process.env.HOME ?? "");

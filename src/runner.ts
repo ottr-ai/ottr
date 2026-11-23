@@ -42,7 +42,11 @@ import {
 	signIns,
 	turnListHome,
 } from "./login.ts";
-import { ensureMemoryOverlay, memoryBackendFromEnv } from "./memory.ts";
+import {
+	ensureMemoryOverlay,
+	memoryBackendFromEnv,
+	memoryTurnEnv,
+} from "./memory.ts";
 import { platform } from "./platform/index.ts";
 import { ensurePluginSkillsOverlay } from "./pluginSkills.ts";
 import { LOST_SESSION } from "./prompts.ts";
@@ -63,7 +67,7 @@ import type {
 	TurnKind,
 } from "./types.ts";
 import { askQuestions, OUTCOME_STATUSES } from "./types.ts";
-import type { VmGrant, VmTokens } from "./vmTokens.ts";
+import { memoryGrant, type VmGrant, type VmTokens } from "./vmTokens.ts";
 import type { VmSpec, WorkerRequest, WorkerTarget } from "./workers.ts";
 import { runWorker, WorkerBusyError, WorkerConnectError } from "./workers.ts";
 import {
@@ -129,6 +133,12 @@ export function childEnv(o: {
 	// (docs/configuration.md); no turn ever needs it, and a holder could decrypt
 	// the stored tokens offline.
 	delete env.OTTR_SECRET_KEY;
+	// Fleet memory credentials: no turn inherits the board's Hindsight tenant key or
+	// URL. A hindsight deployment re-binds memory per run (memoryBinding): the child
+	// gets the board's /hindsight proxy URL and a per-run token that opens only its
+	// own project's bank (docs/specs/hindsight-bank-binding.md).
+	for (const k of Object.keys(env))
+		if (k.startsWith("HINDSIGHT_")) delete env[k];
 	// Same strip in serveWorker: a corporate proxy URL with credentials
 	// (http://user:pass@proxy:8080) must not sit in a turn's env; the host and
 	// port stay, so the proxy still routes the turn's network calls.
@@ -1806,6 +1816,13 @@ interface StartOptions {
 		/** Tests only; default: the deployment's memory backend is hindsight. */
 		hindsight?: boolean;
 	} | null;
+	/** The board's per-run token store (OTTR-1006, docs/specs/hindsight-bank-binding.md).
+	 *  Set on every production dispatch: a classic worker or local run whose project is
+	 *  known and whose deployment backend is hindsight gets a short-lived memory token
+	 *  that opens only its own project's bank through the board's /hindsight proxy.
+	 *  Unset (tests) or a VM dispatch (the VM token already binds memory) keeps the
+	 *  HINDSIGHT_* strip that childEnv and vmEnv apply. */
+	memoryTokens?: VmTokens | null;
 	/** Extra env merged into the child's base (a retro run's OTTR_RETRO=1). */
 	env?: Record<string, string>;
 	/** Values redacted from the log, stderr tail and provider error (the lent provider token). */
@@ -1862,6 +1879,12 @@ interface RunStart {
 	sink: RunSink;
 	args: string[];
 	memoryConfig: string | null;
+	/** The run's per-run memory binding: the env object carries the proxy URL, the raw
+	 *  token, the project bank id and the scoping pin (docs/specs/hindsight-bank-binding.md).
+	 *  The dispatcher Object.assigns it after every strip; settle revokes the token. Null
+	 *  on a VM dispatch (the VM token binds memory), a mnemopi deployment and project-less
+	 *  runs. */
+	memoryEnv: { token: string; env: Record<string, string> } | null;
 	/** The plugin-skills overlay path; startRun always sets it (the project-skill pins ride on every run). */
 	pluginSkillsConfig: string | null;
 	startedAt: number;
@@ -2154,22 +2177,31 @@ function startLocalRun(s: RunStart): RunHandle {
 		restoreParkedToolDirs(parked, sink);
 		throw err;
 	}
+	const env = childEnv({
+		sessionName: o.sessionName,
+		board: o.board ?? null,
+		// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
+		// replacing it would strip PATH and the provider auth the child needs. HOME moves
+		// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
+		base,
+		stripBoard: o.stripBoard,
+	});
+	// After every strip: the run's memory binding is the only HINDSIGHT_* env the child
+	// holds (docs/specs/hindsight-bank-binding.md). Null on a mnemopi deployment.
+	if (s.memoryEnv !== null) Object.assign(env, s.memoryEnv.env);
 	const child = launch("omp", args, {
 		cwd: o.cwd,
 		stdio: ["pipe", "pipe", "pipe"],
 		windowsHide: true,
-		env: childEnv({
-			sessionName: o.sessionName,
-			board: o.board ?? null,
-			// A run's extra env (OTTR_RETRO, OTTR_REVIEW) rides on top of the inherited base:
-			// replacing it would strip PATH and the provider auth the child needs. HOME moves
-			// to the board's own omp home (R5-1): omp reads plugins and user skills from it.
-			base,
-			stripBoard: o.stripBoard,
-		}),
+		env,
 	});
 
 	let killed = false;
+	// The token dies with the run: any outcome revokes it, so a captured token stops
+	// opening the project's bank the moment the turn settles (or the board kills it).
+	const releaseMemory = (): void => {
+		if (s.memoryEnv !== null) s.o.memoryTokens?.revoke(s.memoryEnv.token);
+	};
 	const stopWatch = watchProgress(child.pid, sink.line);
 	child.stdout?.on("data", (chunk: Buffer) =>
 		sink.stdout(chunk.toString("utf8")),
@@ -2222,6 +2254,7 @@ function startLocalRun(s: RunStart): RunHandle {
 				} catch {
 					// the aged sweep is the backstop
 				}
+				releaseMemory();
 			}
 		})();
 	};
@@ -2476,6 +2509,10 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 		base: workerBase,
 		stripBoard: o.stripBoard,
 	});
+	// After every strip: the request env is the only source of HINDSIGHT_* on the worker
+	// side too (runChildEnv strips the container's own names) — the proxy URL, the per-run
+	// token, the bank and the scoping pin (docs/specs/hindsight-bank-binding.md).
+	if (s.memoryEnv !== null) Object.assign(env, s.memoryEnv.env);
 	// One id for the request and the handle: the worker's GET /stats reports usage by it.
 	const runId = crypto.randomUUID();
 	// The board's trusted lists ride the request (R5-1): the worker never reads the shared
@@ -2504,6 +2541,10 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 	);
 	const dispatch = (): string =>
 		`worker ${workerHandle.url}, argv ${args.length}, cwd ${basename(o.cwd)}, ${Math.round((Date.now() - startedAt) / 1000)}s`;
+	// The token dies with the run: any outcome revokes it, like a local run's settle.
+	const releaseMemory = (): void => {
+		if (s.memoryEnv !== null) s.o.memoryTokens?.revoke(s.memoryEnv.token);
+	};
 	return {
 		// pid is null while omp lives in the worker container's namespace; sweepLostTurns
 		// treats an open pid-null row without a live entry as lost after a tracker restart.
@@ -2515,10 +2556,12 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 			// The worker's own pid is in its container namespace; only the wall duration is local.
 			.then((r) => {
 				unregisterLayer();
+				releaseMemory();
 				return { ...r, dispatch: dispatch() };
 			})
 			.catch((err) => {
 				unregisterLayer();
+				releaseMemory();
 				if (!(err instanceof WorkerConnectError)) throw err;
 				// Fail closed: never run a worker turn in the server, which mounts server-only
 				// volumes (board config, tracker state, tokens, ssh keys). Settle as a lost worker:
@@ -2537,12 +2580,36 @@ function startWorkerRun(s: RunStart, worker: WorkerTarget): RunHandle {
 	};
 }
 
+/** The per-run memory binding a classic dispatch carries (docs/specs/hindsight-bank-binding.md).
+ *  Null when the run gets none without a note (tests without a store, a VM dispatch whose VM
+ *  token already binds memory, a mnemopi deployment). The `skipped` shape marks a hindsight
+ *  run whose project or board URL is missing: the run starts without memory and the sink
+ *  says why. The raw token must be issued before the sink exists, so it joins the
+ *  redaction secrets. */
+function resolveMemoryBinding(
+	o: StartOptions,
+): { token: string; env: Record<string, string> } | { skipped: string } | null {
+	if (o.vm || !o.memoryTokens) return null;
+	if (memoryBackendFromEnv(process.env).backend !== "hindsight") return null;
+	const project = o.project ?? o.board?.project;
+	if (!project) return { skipped: "the run has no project" };
+	const base = (o.board?.url ?? process.env.OTTR_BOARD_URL ?? "")
+		.trim()
+		.replace(/\/+$/, "");
+	if (!base) return { skipped: "no board URL names the /hindsight proxy" };
+	const token = o.memoryTokens.issue(
+		memoryGrant(project, o.board?.taskId || "-"),
+	);
+	return { token, env: memoryTurnEnv(project, `${base}/hindsight`, token) };
+}
+
 export async function startRun(o: StartOptions): Promise<RunHandle> {
 	// Issued before the sink exists so the log redacts the raw token like any other secret.
 	// The grant carries the spec's base so the git endpoint keeps that ref fetchable.
 	const vmToken = o.vm
 		? o.vm.tokens.issue({ ...o.vm.grant, base: o.vm.base })
 		: null;
+	const memory = resolveMemoryBinding(o);
 	// Until a handle exists, no settlement releases the lease or revokes the token: every
 	// pre-handle error (sink, lease acquisition, setup, dispatch prep) cleans up here.
 	let layerPin: RunLayerPin | null = null;
@@ -2553,7 +2620,11 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 			onLog: o.onLog,
 			onSession: o.onSession,
 			onProgress: o.onProgress,
-			secrets: vmToken === null ? o.secrets : [...(o.secrets ?? []), vmToken],
+			secrets: [
+				...(o.secrets ?? []),
+				...(vmToken === null ? [] : [vmToken]),
+				...(memory !== null && !("skipped" in memory) ? [memory.token] : []),
+			],
 			meter: o.meter,
 			onUsage: o.onUsage,
 			onRecorded: o.onRecorded,
@@ -2572,10 +2643,13 @@ export async function startRun(o: StartOptions): Promise<RunHandle> {
 			layerHome,
 			layerPin,
 			vmToken,
+			memory,
 		);
 	} catch (err) {
 		layerPin?.unregisterLayer();
 		if (o.vm && vmToken !== null) o.vm.tokens.revoke(vmToken);
+		if (memory !== null && !("skipped" in memory))
+			o.memoryTokens?.revoke(memory.token);
 		throw err;
 	}
 }
@@ -2588,7 +2662,13 @@ async function startPinnedRun(
 	layerHome: string,
 	layerPin: RunLayerPin,
 	vmToken: string | null,
+	memory:
+		| { token: string; env: Record<string, string> }
+		| { skipped: string }
+		| null,
 ): Promise<RunHandle> {
+	if (memory !== null && "skipped" in memory)
+		sink.logMark(`! hindsight memory off for this run: ${memory.skipped}\n`);
 	const memoryConfig = resolveMemoryConfig(o);
 	// The plugin-skills overlay reads the run's pinned home, so a layer run gets its own
 	// layer's plugins (docs/specs/turn-home-plugin-skills.md).
@@ -2606,6 +2686,10 @@ async function startPinnedRun(
 		sink,
 		args,
 		memoryConfig,
+		memoryEnv:
+			memory !== null && !("skipped" in memory)
+				? { token: memory.token, env: memory.env }
+				: null,
 		pluginSkillsConfig,
 		startedAt,
 		...layerPin,

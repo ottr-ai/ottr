@@ -86,7 +86,9 @@ x-worker: &worker
     # omp's mnemopi default. A URL saved under Settings -> Hindsight beats this
     # env seed at the next boot. The tenant API key is set under Settings ->
     # Hindsight: the key still travels as HINDSIGHT_API_TOKEN, so the board can
-    # save it. An env file value only seeds it (and serves omp run by hand in a
+    # save it; the key stays on the board (turns reach memory through the
+    # board's /hindsight proxy with per-run tokens, docs/specs/hindsight-bank-binding.md).
+    # An env file value only seeds it (and serves omp run by hand in a
     # container).
     HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
     HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
@@ -271,7 +273,10 @@ services:
       # memory.backend is not agent-layer content (OTTR-453): the pin never
       # rewrites a layer's config.yml.
       HINDSIGHT_API_URL: ${HINDSIGHT_API_URL:-}
-      HINDSIGHT_API_TOKEN: # seed only: Settings -> Hindsight (server URL and key) replaces it, as in x-worker
+      # Seed only: Settings -> Hindsight (server URL and key) replaces it. The key stays
+      # on the server: turns reach memory through the board's /hindsight proxy with
+      # per-run tokens bound to their project bank (docs/specs/hindsight-bank-binding.md).
+      HINDSIGHT_API_TOKEN:
       # Alate pairing (the `alate` profile below): these seed Settings -> Alate while it
       # holds no URL or key, and a value saved there wins at the next boot. With the
       # profile on, http://alate:4570 is the bundled service. Never log the key.
@@ -556,7 +561,9 @@ services:
     command: [repair-agent-db]
 
   # Memory lives in the shared Hindsight server named by HINDSIGHT_API_URL
-  # (tenant-key auth); set the URL in the compose env file or in Settings.
+  # (tenant-key auth on the board only; turns get per-run tokens,
+  # docs/specs/hindsight-bank-binding.md); set the URL in the compose env file
+  # or in Settings.
 
   # Alate, the provisioning side of the pair, bundled for the quick start: the profile
   # keeps the service off unless the env sets COMPOSE_PROFILES=alate, so a user whose

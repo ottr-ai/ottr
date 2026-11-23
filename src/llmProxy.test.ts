@@ -161,15 +161,46 @@ describe("handleLlm", () => {
 });
 
 describe("handleHindsight", () => {
-	test("forwards under the Hindsight URL's own path with the board's Hindsight token", async () => {
+	test("forwards the caller's own bank under the Hindsight URL's path with the board's token", async () => {
 		const token = tokens.issue(grant);
 		seen.length = 0;
-		const res = await fetch(at("/hindsight/v1/banks/alpha/memories?limit=3"), {
-			headers: { authorization: `Bearer ${token}` },
-		});
+		const res = await fetch(
+			at("/hindsight/v1/default/banks/ottr-alpha/memories?limit=3"),
+			{ headers: { authorization: `Bearer ${token}` } },
+		);
 		expect(res.status).toBe(201);
-		expect(seen[0]?.path).toBe("/hs/v1/banks/alpha/memories?limit=3");
+		expect(seen[0]?.path).toBe(
+			"/hs/v1/default/banks/ottr-alpha/memories?limit=3",
+		);
 		expect(seen[0]?.headers.authorization).toBe("Bearer hs-secret");
+	});
+
+	test("403 for another project's bank and for the whole-tenant bank list", async () => {
+		const token = tokens.issue(grant);
+		seen.length = 0;
+		for (const path of [
+			// Another project's bank; a percent-encoded spelling of the caller's own bank
+			// refuses too (the comparison is byte-exact on the encoded segment).
+			"/hindsight/v1/default/banks/ottr-beta/memories",
+			"/hindsight/v1/default/banks/ottr-al%70ha/memories",
+			// The bank list and any non-bank path reach every bank, so both refuse.
+			"/hindsight/v1/default/banks",
+			"/hindsight/v1/health",
+		]) {
+			const res = await fetch(at(path), {
+				headers: { authorization: `Bearer ${token}` },
+			});
+			expect(`${path} ${res.status}`).toBe(`${path} 403`);
+		}
+		// Nothing reached the upstream.
+		expect(seen).toEqual([]);
+	});
+
+	test("403 when the caller sends no token at all", async () => {
+		const res = await fetch(
+			at("/hindsight/v1/default/banks/ottr-alpha/memories"),
+		);
+		expect(res.status).toBe(401);
 	});
 
 	test("401 for a revoked token, 503 when Hindsight is not configured", async () => {
@@ -178,7 +209,7 @@ describe("handleHindsight", () => {
 		const live = tokens.issue({ ...grant, taskId: "ALP-2" });
 		expect(
 			(
-				await fetch(at("/hindsight/v1/x"), {
+				await fetch(at("/hindsight/v1/default/banks/ottr-alpha/memories"), {
 					headers: { authorization: `Bearer ${revoked}` },
 				})
 			).status,
@@ -186,9 +217,10 @@ describe("handleHindsight", () => {
 		const saved = hindsightUrl;
 		hindsightUrl = undefined;
 		try {
-			const res = await fetch(at("/hindsight/v1/x"), {
-				headers: { authorization: `Bearer ${live}` },
-			});
+			const res = await fetch(
+				at("/hindsight/v1/default/banks/ottr-alpha/memories"),
+				{ headers: { authorization: `Bearer ${live}` } },
+			);
 			expect(res.status).toBe(503);
 		} finally {
 			hindsightUrl = saved;

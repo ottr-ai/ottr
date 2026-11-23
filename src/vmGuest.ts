@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { aptListPath, ensureProjectPackages, parseAptTxt } from "./apt.ts";
 import { childDatabaseEnv } from "./childEnv.ts";
+import { memoryTurnEnv } from "./memory.ts";
 import { platform } from "./platform/index.ts";
 import {
 	ensureProjectPython,
@@ -48,6 +49,8 @@ export interface GuestRunRequest {
 		boardUrl: string;
 		providers: string[];
 		hindsight: boolean;
+		/** The run's project: names the memory bank the VM token may reach. */
+		project: string;
 	};
 }
 
@@ -145,7 +148,9 @@ function parseRun(raw: unknown): GuestRunRequest | null {
 		typeof vm.token !== "string" ||
 		typeof vm.boardUrl !== "string" ||
 		!isStrings(vm.providers) ||
-		typeof vm.hindsight !== "boolean"
+		typeof vm.hindsight !== "boolean" ||
+		typeof vm.project !== "string" ||
+		vm.project === ""
 	)
 		return null;
 	return raw as GuestRunRequest;
@@ -565,10 +570,18 @@ export function serveGuest(opts: GuestOptions): Bun.Server<never> {
 			if (cloneHead === null) return;
 			const env = turnEnv();
 			if (!(await addProviders(push, env))) return;
-			if (vm.hindsight) {
-				env.HINDSIGHT_API_URL = `${boardUrl}/hindsight`;
-				env.HINDSIGHT_API_TOKEN = vm.token;
-			}
+			// Memory through the board's proxy, bound to this VM's own project bank
+			// (docs/specs/hindsight-bank-binding.md): the proxy refuses any other bank for
+			// the VM token, so the guest also pins omp to exactly that bank.
+			if (vm.hindsight)
+				Object.assign(
+					env,
+					memoryTurnEnv(
+						vm.project,
+						`${boardUrl.replace(/\/+$/, "")}/hindsight`,
+						vm.token,
+					),
+				);
 			const { exitCode, stderrTail } = await runOmp(push, env, cloneHead);
 			await pushIfMoved(cloneHead);
 			await settle(push, exitCode, stderrTail);

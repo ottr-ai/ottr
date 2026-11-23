@@ -17,7 +17,9 @@ import {
 	checkMemoryHealth,
 	ensureMemoryOverlay,
 	memoryBackendFromEnv,
+	memoryBankId,
 	memoryOverlayYaml,
+	memoryTurnEnv,
 	overlayPathFor,
 } from "./memory.ts";
 import fc from "./test/properties.ts";
@@ -362,6 +364,40 @@ describe("properties", () => {
 				expect(lines).toEqual([`  backend: ${choice.backend}`]);
 				expect(yaml.startsWith("memory:\n")).toBe(true);
 			}),
+		);
+	});
+});
+
+describe("memoryBankId and memoryTurnEnv", () => {
+	test("one bank per project, prefixed with the board's marker", () => {
+		expect(memoryBankId("ottr")).toBe("ottr-ottr");
+		expect(memoryBankId("agent-data")).toBe("ottr-agent-data");
+		expect(memoryBankId("ottr")).not.toBe(memoryBankId("velvarr"));
+	});
+
+	test("the turn env carries the proxy URL, the token, the bank and the scoping pin", () => {
+		expect(
+			memoryTurnEnv("velvarr", "http://ottr:8080/hindsight", "tok-1"),
+		).toEqual({
+			HINDSIGHT_API_URL: "http://ottr:8080/hindsight",
+			HINDSIGHT_API_TOKEN: "tok-1",
+			HINDSIGHT_BANK_ID: "ottr-velvarr",
+			HINDSIGHT_SCOPING: "global",
+		});
+	});
+
+	test("properties: distinct projects derive distinct banks, and the env bank matches the id", () => {
+		fc.assert(
+			fc.property(
+				fc.stringMatching(/^[a-z][a-z0-9-]{0,30}$/),
+				fc.stringMatching(/^[a-z][a-z0-9-]{0,30}$/),
+				(a, b) => {
+					expect(memoryBankId(a) === memoryBankId(b)).toBe(a === b);
+					const env = memoryTurnEnv(a, "http://h/hindsight", "t");
+					expect(env.HINDSIGHT_BANK_ID).toBe(memoryBankId(a));
+					expect(env.HINDSIGHT_SCOPING).toBe("global");
+				},
+			),
 		);
 	});
 });

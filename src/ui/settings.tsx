@@ -7150,7 +7150,7 @@ type HindsightView = {
 	memoryReason: string | null;
 };
 
-/** Settings "Hindsight" section: the server URL and the key every turn's omp sends to it. */
+/** Settings "Hindsight" section: the server URL and the board-held key every turn's memory flows through. */
 export function HindsightSection() {
 	const [view, setView] = useState<HindsightView | null>(null);
 	const [url, setUrl] = useState("");
@@ -7196,9 +7196,10 @@ export function HindsightSection() {
 					<>
 						Every turn keeps its memory on the Hindsight server at{" "}
 						<code>{view.url}</code>. The board saves a new key only when that
-						server accepts it. Turns that start after the save use the new key
-						and URL. A saved URL beats the <code>HINDSIGHT_API_URL</code> env
-						seed at the next boot.
+						server accepts it, and the key stays on the board: turns reach the
+						server through the board's own proxy, each with a token that opens
+						only its own project's memory bank. A saved URL beats the{" "}
+						<code>HINDSIGHT_API_URL</code> env seed at the next boot.
 					</>
 				)
 			}
@@ -7217,7 +7218,7 @@ export function HindsightSection() {
 								Server URL
 								<Help
 									label="Server URL"
-									text="The Hindsight memory server that the omp of each turn uses. Empty: turns use the HINDSIGHT_API_URL environment variable; when that is empty too, the board runs mnemopi (omp's default)."
+									text="The Hindsight memory server the board reads and writes memory on. Empty: turns use the HINDSIGHT_API_URL environment variable; when that is empty too, the board runs mnemopi (omp's default)."
 								/>
 							</b>
 							<code>
@@ -7270,7 +7271,7 @@ export function HindsightSection() {
 				<SecretTokenForm<HindsightView>
 					endpoint="/api/settings/hindsight"
 					title="API key"
-					help="The key that the omp of each turn sends to the Hindsight server. Without a key, turns have no memory."
+					help="The key the board uses to reach the Hindsight server for every turn, through its own proxy. The key never leaves the board; each turn gets a token that opens only its own project's memory bank. Without a key, turns have no memory."
 					label="Hindsight API key"
 					captionSet="Set. Paste a new key to replace it"
 					captionUnset="Not set: turns have no memory"

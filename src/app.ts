@@ -3368,10 +3368,13 @@ export async function createApp(deps: AppDeps) {
 		"a GitHub token is required (ghp_… or github_pat_…, with repo access)";
 	/**
 	 * Hindsight server URL and API key from Settings; the key is sealed at rest like apiKey
-	 * (ADR-0011, same trust level). omp reads HINDSIGHT_API_URL and HINDSIGHT_API_TOKEN over the env, and the runner
-	 * forwards the board's env to workers, so saved values reach every new turn and beat the
-	 * compose env that seeds them. Without either, the board leaves the env alone: its turns keep
-	 * omp's settings.
+	 * (ADR-0011, same trust level). omp reads HINDSIGHT_API_URL and HINDSIGHT_API_TOKEN over
+	 * the env, and a saved value beats the compose env that seeds them at every boot. The
+	 * env values are server-side state only (health checks, the Settings save probe, the
+	 * /hindsight proxy's upstream credential): childEnv strips them from every turn env,
+	 * and a hindsight deployment hands each run a per-run token bound to its project's
+	 * bank (OTTR-1006, docs/specs/hindsight-bank-binding.md). Without either, the board
+	 * leaves the env alone: its turns keep omp's settings.
 	 */
 	let hindsightToken: string | null = null;
 	let hindsightUrl: string | null = null;

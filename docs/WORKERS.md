@@ -1119,11 +1119,11 @@ the vm dispatch, never this mount. It never mounts
   copied in without the shared home's credential and identity state
   (`.omp/agent/agent.db*`, `.omp/oauth`, `.ssh`, `.config/gh`); symlinks are copied as
   links and never followed.
-- Residual: the `/hindsight` proxy forwards the whole Hindsight API, so a VM token reaches
-  every memory bank of the tenant, as a classic worker's Hindsight key does.
-
 The per-turn token lives until the turn settles. The board keeps only its hash, in a
 server-only file, so a token survives a board restart and a re-bound turn keeps pushing.
+Memory is bank-bound (OTTR-1006, docs/specs/hindsight-bank-binding.md): every turn's
+memory token opens only its own project's bank through the `/hindsight` proxy, so the
+old residual — one token reaching every memory bank of the tenant — is closed.
 
 ### Rootfs cache
 
@@ -1312,10 +1312,13 @@ Hindsight URL or a mnemopi store that refuses writes.
 The Hindsight server requires its tenant API key on every request. Set it under
 **Settings -> Hindsight** (the same place holds the server address): the board saves a
 key only after the server at the effective address accepts it (`GET
-/v1/default/banks`), stores it in `.tasks/tracker.db` and hands it to every new turn as
-`HINDSIGHT_API_TOKEN`, which omp reads over the environment. `HINDSIGHT_API_TOKEN` in the
-env file only seeds the key until Settings holds one. Fact extraction runs on the server
-and needs LLM balance there.
+/v1/default/banks`), and stores it in `.tasks/tracker.db`. The key stays on the board:
+no turn holds it. Every run gets a short-lived memory token that reaches the Hindsight
+server only through the board's `/hindsight` proxy, and the proxy forwards a run's
+requests only to its own project's bank (`ottr-<project>`, docs/specs/hindsight-bank-binding.md).
+`HINDSIGHT_API_TOKEN` in the env file only seeds the key until Settings holds one, and
+serves `omp run` by hand in a container. Fact extraction runs on the server and needs
+LLM balance there.
 
 ## Check memory
 

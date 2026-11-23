@@ -49,7 +49,9 @@ if (tool === "git") {
 		`console.log(JSON.stringify({ ...${probe},
 			guestTokenAbsent: process.env.OTTR_VM_GUEST_TOKEN === undefined,
 			requestPreserved: process.env.REQUEST_MARKER === "synthetic-request-marker",
-			hindsightPreserved: process.env.HINDSIGHT_API_TOKEN === "synthetic-turn-token"
+			hindsightPreserved: process.env.HINDSIGHT_API_TOKEN === "synthetic-turn-token",
+			hindsightBank: process.env.HINDSIGHT_BANK_ID === "ottr-synthetic-project",
+			hindsightScoping: process.env.HINDSIGHT_SCOPING === "global"
 		}));`,
 	);
 	const script = join(root, "launch.ts");
@@ -107,7 +109,7 @@ if (kind === "net") {
 			vm: {
 				gitUrl: "synthetic-remote", branch: "synthetic-branch", base: "main",
 				token: "synthetic-turn-token", boardUrl: "http://127.0.0.1:1",
-				providers: [], hindsight: true
+				providers: [], hindsight: true, project: "synthetic-project"
 			}
 		}) });
 		const lines = (await run.text()).trim().split("\\n").map(JSON.parse);
@@ -124,6 +126,8 @@ if (kind === "net") {
 			guestTokenAbsent: omp.guestTokenAbsent,
 			requestPreserved: omp.requestPreserved,
 			hindsightPreserved: omp.hindsightPreserved,
+			hindsightBank: omp.hindsightBank,
+			hindsightScoping: omp.hindsightScoping,
 			gitGuardsPreserved: captures.filter(c => c.tool === "git").every(c => c.gitRedirectAbsent && c.promptDisabled),
 			toolsCovered: ["git", "sync"].every(tool => captures.some(c => c.tool === tool)),
 			archivesCovered: ["-c", "-t", "-x"].every(arg => captures.some(c => c.tool === "tar" && c.args.includes(arg)))
@@ -186,6 +190,8 @@ for (const scrub of [false, true]) {
 			guestTokenAbsent: true,
 			requestPreserved: true,
 			hindsightPreserved: true,
+			hindsightBank: true,
+			hindsightScoping: true,
 			gitGuardsPreserved: true,
 			toolsCovered: true,
 			archivesCovered: true,

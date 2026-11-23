@@ -21,6 +21,20 @@ export interface VmGrant {
 	base?: string;
 }
 
+/** The grant of a classic run's memory token (docs/specs/hindsight-bank-binding.md): only
+ *  the project and task matter to /hindsight's bank binding. The sentinel fields can never
+ *  satisfy the git endpoint's checks (branch, worktree, base ref), so the token opens no
+ *  git route; parseGrant rejects empty strings, so the values are non-empty sentinels. */
+export function memoryGrant(project: string, taskId: string): VmGrant {
+	return {
+		project,
+		taskId,
+		branch: "memory-token",
+		repoPath: "memory-token",
+		worktree: "memory-token",
+	};
+}
+
 /** Both a raw token (32 bytes hex) and its sha256 digest are 64 lowercase hex chars. */
 const HEX64 = /^[0-9a-f]{64}$/;
 const GRANT_KEYS = [

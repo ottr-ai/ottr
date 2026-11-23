@@ -1,3 +1,4 @@
+import { memoryBankId } from "./memory.ts";
 import { type VmTokens, vmTokenOf } from "./vmTokens.ts";
 
 /**
@@ -117,16 +118,28 @@ export function handleLlm(
 	});
 }
 
-/** VM memory traffic: `/hindsight/*` → HINDSIGHT_API_URL with the board's Hindsight token. */
+/** VM memory traffic: `/hindsight/*` → HINDSIGHT_API_URL with the board's Hindsight token.
+ *  The caller's token binds the request to its own project's bank
+ *  (docs/specs/hindsight-bank-binding.md): any path outside
+ *  `/v1/default/banks/<memoryBankId(grant.project)>` answers 403, so one tenant-wide
+ *  server key stays on the board while each turn reads and writes only its own bank. */
 export function handleHindsight(
 	req: Request,
 	o: { tokens: VmTokens; url: string | undefined; token: string | undefined },
 ): Promise<Response> {
-	if (o.tokens.check(vmTokenOf(req)) === null)
-		return Promise.resolve(text("unauthorized", 401));
+	const grant = o.tokens.check(vmTokenOf(req));
+	if (grant === null) return Promise.resolve(text("unauthorized", 401));
 	if (!o.url)
 		return Promise.resolve(
 			text("Hindsight is not configured on the board", 503),
+		);
+	// Same path math as proxyTo's prefix strip: the bank segment stays encoded exactly as
+	// the client sent it, and the client (omp) encodes memoryBankId.
+	const rest = new URL(req.url).pathname.slice("/hindsight".length);
+	const bank = `/v1/default/banks/${encodeURIComponent(memoryBankId(grant.project))}`;
+	if (rest !== bank && !rest.startsWith(`${bank}/`))
+		return Promise.resolve(
+			text("this token reaches only its own project's memory bank", 403),
 		);
 	return proxyTo(req, {
 		upstream: o.url,

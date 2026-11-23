@@ -945,7 +945,9 @@ const loop = createTurnLoop(projects, {
 	vmTokens,
 	runTokens,
 	syncWorktreeTo,
-	startRun,
+	// OTTR-1006: every dispatch carries the board's token store, so a classic run gets a
+	// memory token bound to its own project's bank (docs/specs/hindsight-bank-binding.md).
+	startRun: (o) => startRun({ ...o, memoryTokens: vmTokens }),
 	// OTTR-454: the restart re-bind asks the workers for their detached runs and kills one on
 	// cancel; with no workerTarget configured the loop never probes.
 	detachedRuns: (url, token) => detachedRunsRequest(url, token),

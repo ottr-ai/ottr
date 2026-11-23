@@ -1720,6 +1720,7 @@ export function serveVmRunner(opts: VmRunnerOptions): Bun.Server<never> {
 						boardUrl: spec.boardUrl,
 						providers: spec.providers,
 						hindsight: spec.hindsight,
+						project: spec.project,
 					},
 				}),
 				signal,

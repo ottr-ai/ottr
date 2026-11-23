@@ -27,6 +27,31 @@ export function memoryOverlayYaml(choice: MemoryChoice): string {
 	return `memory:\n  backend: ${choice.backend}\n`;
 }
 
+/** The one bank a project's turns use (docs/specs/hindsight-bank-binding.md): the board
+ *  hands the same id to omp (`HINDSIGHT_BANK_ID`) and to the /hindsight proxy's path check,
+ *  so a run can never address another project's bank. Raw project name: omp encodes bank ids
+ *  in paths, and the Hindsight server accepts any string. */
+export function memoryBankId(project: string): string {
+	return `ottr-${project}`;
+}
+
+/** The exact env a classic turn needs to reach only its own bank through the board's
+ *  /hindsight proxy. `HINDSIGHT_SCOPING=global` pins omp to the single bank: omp's default
+ *  `per-project-tagged` scoping would derive a second `project:<slug>` bank the proxy
+ *  refuses, and the scoping setting reads `HINDSIGHT_SCOPING` over the settings layers. */
+export function memoryTurnEnv(
+	project: string,
+	proxyUrl: string,
+	token: string,
+): Record<string, string> {
+	return {
+		HINDSIGHT_API_URL: proxyUrl,
+		HINDSIGHT_API_TOKEN: token,
+		HINDSIGHT_BANK_ID: memoryBankId(project),
+		HINDSIGHT_SCOPING: "global",
+	};
+}
+
 /** The trusted anchor the overlay lives under: the data volume (a mount point) or a per-install temp dir. */
 export function overlayDirFor(env: Record<string, string | undefined>): string {
 	return env.OTTR_DATA_DIR

@@ -240,6 +240,19 @@ describe("childEnv", () => {
 	test("without board or pinned name the env is the inherited base", () => {
 		expect(childEnv({ base: { PATH: "/bin" } })).toEqual({ PATH: "/bin" });
 	});
+	test("strips every HINDSIGHT_* name: a turn never inherits the tenant key or URL", () => {
+		expect(
+			childEnv({
+				base: {
+					PATH: "/bin",
+					HINDSIGHT_API_URL: "http://hindsight.local:8888",
+					HINDSIGHT_API_TOKEN: "tenant-secret",
+					HINDSIGHT_SCOPING: "per-project-tagged",
+					OTHER: "kept",
+				},
+			}),
+		).toEqual({ PATH: "/bin", OTHER: "kept" });
+	});
 	test("keeps test database variables but never the production URL", () => {
 		fc.assert(
 			fc.property(
@@ -5180,6 +5193,7 @@ describe("startRun agent layer pinning", () => {
 	const ENV_KEYS = [
 		"HOME",
 		"HINDSIGHT_API_URL",
+		"HINDSIGHT_API_TOKEN",
 		"OTTR_BOARD_OMP_HOME",
 		"GH_TOKEN",
 		"PI_CODING_AGENT_DIR",
@@ -5234,7 +5248,9 @@ describe("startRun agent layer pinning", () => {
 			);
 			expect(env1.GH_TOKEN).toBeUndefined();
 			expect(env1.OTTR_BOARD_OMP_HOME).toBeUndefined();
-			expect(env1.HINDSIGHT_API_URL).toBe("https://hindsight.example/api");
+			// No memoryTokens store on this dispatch: the fleet URL is stripped, and the
+			// binding tests below cover the run-bound values (OTTR-1006).
+			expect(env1.HINDSIGHT_API_URL).toBeUndefined();
 			// The pin registered the layer and never rewrote its config: memory.backend
 			// is not layer content (OTTR-453), so the layer ships the backend as installed.
 			expect(
@@ -5316,6 +5332,177 @@ describe("startRun agent layer pinning", () => {
 		} finally {
 			restoreEnv(saved);
 			rmSync(board, { recursive: true, force: true, maxRetries: 5 });
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("a hindsight worker dispatch carries a per-run memory token bound to the project's bank", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-worker-memtok-"));
+		const bodies: WorkerRequest[] = [];
+		// The stub holds the run open until released: the token must be live while
+		// its grant is asserted, and revoked once the run settles.
+		const { promise: release, resolve: unblock } =
+			Promise.withResolvers<void>();
+		const arrived = Promise.withResolvers<void>();
+		const server = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				bodies.push((await req.json()) as WorkerRequest);
+				arrived.resolve();
+				await release;
+				return new Response(
+					`${JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } })}\n`,
+				);
+			},
+		});
+		const tokens = new VmTokens({ file: null });
+		const saved = saveEnv();
+		try {
+			process.env.HINDSIGHT_API_URL = "http://hindsight.local:8888";
+			process.env.HINDSIGHT_API_TOKEN = "tenant-secret";
+			const { done } = await startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: join(dir, "ext.ts"),
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				worker: { urls: [`http://127.0.0.1:${server.port}`] },
+				launcher: (() => {
+					throw new Error("a worker turn must never spawn locally");
+				}) as RunLauncher,
+				memoryTokens: tokens,
+				board: {
+					url: "http://ottr:8080",
+					token: "boot-token",
+					project: "velvarr",
+					taskId: "T-9",
+				},
+			});
+			await arrived.promise;
+			expect(bodies).toHaveLength(1);
+			const env = bodies[0]!.env;
+			expect(env.HINDSIGHT_API_URL).toBe("http://ottr:8080/hindsight");
+			expect(env.HINDSIGHT_BANK_ID).toBe("ottr-velvarr");
+			expect(env.HINDSIGHT_SCOPING).toBe("global");
+			const token = env.HINDSIGHT_API_TOKEN;
+			expect(token).toMatch(/^[0-9a-f]{64}$/);
+			// The grant binds the token to the run's project for /hindsight.
+			expect(tokens.check(token)?.project).toBe("velvarr");
+			// The tenant credential never rides the request: no env value carries it.
+			expect(Object.values(env)).not.toContain("tenant-secret");
+			// Settled: the token is revoked, so a captured env stops working.
+			unblock();
+			const r = await done;
+			expect(r.exitCode).toBe(0);
+			expect(tokens.check(token)).toBeNull();
+		} finally {
+			restoreEnv(saved);
+			server.stop(true);
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 30_000);
+
+	test("a hindsight local run carries the same binding and revokes at settle", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-local-memtok-"));
+		const tokens = new VmTokens({ file: null });
+		const saved = saveEnv();
+		try {
+			process.env.HINDSIGHT_API_URL = "http://hindsight.local:8888";
+			process.env.HINDSIGHT_API_TOKEN = "tenant-secret";
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = await startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				launcher,
+				memoryTokens: tokens,
+				board: {
+					url: "http://127.0.0.1:4747",
+					token: "boot-token",
+					project: "velvarr",
+					taskId: "T-10",
+				},
+			});
+			await handle.done;
+			expect(seen).toHaveLength(1);
+			const env = seen[0]!.env!;
+			expect(env.HINDSIGHT_API_URL).toBe("http://127.0.0.1:4747/hindsight");
+			expect(env.HINDSIGHT_BANK_ID).toBe("ottr-velvarr");
+			expect(env.HINDSIGHT_SCOPING).toBe("global");
+			expect(env.HINDSIGHT_API_TOKEN).toMatch(/^[0-9a-f]{64}$/);
+			expect(Object.values(env)).not.toContain("tenant-secret");
+		} finally {
+			restoreEnv(saved);
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
+
+	test("a mnemopi deployment binds nothing; a project-less hindsight run logs why", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-memtok-off-"));
+		const tokens = new VmTokens({ file: null });
+		const saved = saveEnv();
+		try {
+			process.env.HINDSIGHT_API_TOKEN = "tenant-secret";
+			delete process.env.HINDSIGHT_API_URL;
+			const seen: Parameters<RunLauncher>[2][] = [];
+			const launcher: RunLauncher = (_c, _a, options) => {
+				seen.push(options);
+				const fake = new FakeOmp();
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const base = {
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				dataRoot: dir,
+				launcher,
+				memoryTokens: tokens,
+			};
+			// Run 1: mnemopi deployment (no URL) — a bound board, but no hindsight env.
+			await (
+				await startRun({
+					...base,
+					logPath: join(dir, "mnemopi.log"),
+					board: {
+						url: "http://127.0.0.1:4747",
+						token: "boot-token",
+						project: "velvarr",
+						taskId: "T-11",
+					},
+				})
+			).done;
+			// Run 2: hindsight deployment, project-less run — no env, and the log says why.
+			process.env.HINDSIGHT_API_URL = "http://hindsight.local:8888";
+			await (await startRun({ ...base, logPath: join(dir, "noproject.log") }))
+				.done;
+			expect(seen).toHaveLength(2);
+			for (const options of seen) {
+				expect(options.env?.HINDSIGHT_API_TOKEN).toBeUndefined();
+				expect(options.env?.HINDSIGHT_API_URL).toBeUndefined();
+				expect(options.env?.HINDSIGHT_BANK_ID).toBeUndefined();
+			}
+			// Run 1 logged nothing (a FakeOmp run with no output may never create the
+			// log file); run 2's skip note must reach its log.
+			expect(readFileSync(join(dir, "noproject.log"), "utf8")).toContain(
+				"hindsight memory off for this run: the run has no project",
+			);
+		} finally {
+			restoreEnv(saved);
 			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
 		}
 	});

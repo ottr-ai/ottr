@@ -889,6 +889,12 @@ function runChildEnv(
 		...process.env,
 		...requestEnv,
 	};
+	// The container may carry a Hindsight seed (docker-compose.yml): the board strips
+	// HINDSIGHT_* from the dispatched env and re-adds the run's own binding, so the
+	// container names must lose the seed before the merge, not the request's bound
+	// values after it (docs/specs/hindsight-bank-binding.md).
+	for (const k of Object.keys(process.env))
+		if (k.startsWith("HINDSIGHT_")) delete env[k];
 	stripGitAuthEnv(env);
 	// OTTR-693: the board strips GIT_CONFIG_GLOBAL from the dispatched env (the
 	// pointer names a file only the server mounts); this side deletes whatever the

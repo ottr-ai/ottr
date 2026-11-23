@@ -106,7 +106,7 @@ import {
 	REVIEW_THREADS_QUERY,
 } from "./prs.ts";
 import { forModel, tightestFor, usageReset } from "./quota.ts";
-import { createRunSink } from "./runner.ts";
+import { createRunSink, type RunLauncher, startRun } from "./runner.ts";
 import { RunTokens } from "./runTokens.ts";
 import {
 	archReviewDue,
@@ -181,6 +181,7 @@ import { vmState } from "./vmState.ts";
 import { VmTokens } from "./vmTokens.ts";
 import { type ValidateResponse, VM_VALIDATE } from "./vmValidateShared.ts";
 import { loadSubs, PUSH_SUBJECT, saveSubs } from "./webpush.ts";
+import { WORKER_DONE, type WorkerRequest } from "./workers.ts";
 import {
 	archReviewDelta,
 	git,
@@ -29060,4 +29061,118 @@ describe("ompSessionStores", () => {
 		expect(stores.find((s) => s.name === "native")).toBeDefined();
 		expect(stores.find((s) => s.name === "native checks")).toBeUndefined();
 	});
+});
+
+describe("hindsight memory binding (OTTR-1006)", () => {
+	// Stand-in upstream: records the exact proxied request.
+	const seen: { method: string; path: string; auth: string | null }[] = [];
+	const upstream = Bun.serve({
+		port: 0,
+		fetch: (req) => {
+			const u = new URL(req.url);
+			seen.push({
+				method: req.method,
+				path: `${u.pathname}${u.search}`,
+				auth: req.headers.get("authorization"),
+			});
+			return Response.json({ ok: true });
+		},
+	});
+	const savedEnv = {
+		HINDSIGHT_API_URL: process.env.HINDSIGHT_API_URL,
+		HINDSIGHT_API_TOKEN: process.env.HINDSIGHT_API_TOKEN,
+	};
+	afterAll(() => {
+		upstream.stop(true);
+		for (const [k, v] of Object.entries(savedEnv))
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+	});
+
+	test("a real worker dispatch's memory token reaches only its own bank through the app's proxy", async () => {
+		process.env.HINDSIGHT_API_URL = `http://127.0.0.1:${upstream.port}`;
+		process.env.HINDSIGHT_API_TOKEN = "tenant-secret";
+		const bodies: WorkerRequest[] = [];
+		// The worker stub answers only when released: the token must still be live
+		// while the proxy assertions run, and revoked once the run settles.
+		const { promise: release, resolve: unblock } =
+			Promise.withResolvers<void>();
+		const arrived = Promise.withResolvers<void>();
+		const worker = Bun.serve({
+			port: 0,
+			fetch: async (req) => {
+				bodies.push((await req.json()) as WorkerRequest);
+				arrived.resolve();
+				await release;
+				return new Response(
+					`${JSON.stringify({ [WORKER_DONE]: { exitCode: 0, stderrTail: "" } })}\n`,
+				);
+			},
+		});
+		const dir = mkdtempSync(join(tmpdir(), "ottr-app-memtok-"));
+		try {
+			const boardUrl = `http://127.0.0.1:${server.port}`;
+			const handle = await startRun({
+				cwd: dir,
+				prompt: "do it",
+				sessionDir: join(dir, "sessions"),
+				extensionPath: null,
+				resumeId: null,
+				logPath: join(dir, "run.log"),
+				dataRoot: dir,
+				worker: { urls: [`http://127.0.0.1:${worker.port}`] },
+				launcher: (() => {
+					throw new Error("a worker turn must never spawn locally");
+				}) as unknown as RunLauncher,
+				memoryTokens: vmTokens,
+				board: {
+					url: boardUrl,
+					token: "boot-token",
+					project: "ottr",
+					taskId: "OTTR-1006",
+				},
+			});
+			// The dispatch POST is in flight when startRun returns; the stub's own
+			// arrival signal is the awaited condition.
+			await arrived.promise;
+			expect(bodies).toHaveLength(1);
+			const env = bodies[0]!.env;
+			expect(env.HINDSIGHT_API_URL).toBe(`${boardUrl}/hindsight`);
+			expect(env.HINDSIGHT_BANK_ID).toBe("ottr-ottr");
+			expect(env.HINDSIGHT_SCOPING).toBe("global");
+			const token = env.HINDSIGHT_API_TOKEN;
+			expect(token).toMatch(/^[0-9a-f]{64}$/);
+			// The tenant credential never rides the request env.
+			expect(Object.values(env)).not.toContain("tenant-secret");
+			// The live run's token opens its own bank through the app's route.
+			const at = (path: string) =>
+				fetch(`${boardUrl}${path}`, {
+					headers: { authorization: `Bearer ${token}` },
+				});
+			const own = await at(
+				"/hindsight/v1/default/banks/ottr-ottr/memories/recall",
+			);
+			expect(own.status).toBe(200);
+			// The proxy forwarded with the board's tenant key, path and method intact.
+			expect(seen[seen.length - 1]).toEqual({
+				method: "GET",
+				path: "/v1/default/banks/ottr-ottr/memories/recall",
+				auth: "Bearer tenant-secret",
+			});
+			// Another project's bank and the whole-tenant list refuse.
+			expect(
+				(await at("/hindsight/v1/default/banks/ottr-other/memories")).status,
+			).toBe(403);
+			expect((await at("/hindsight/v1/default/banks")).status).toBe(403);
+			// Settled: the token is revoked.
+			unblock();
+			await handle.done;
+			expect(
+				(await at("/hindsight/v1/default/banks/ottr-ottr/memories")).status,
+			).toBe(401);
+		} finally {
+			worker.stop(true);
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	}, 30_000);
 });
