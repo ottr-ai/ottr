@@ -1036,7 +1036,8 @@ export function applyCheckVerdicts(
 }
 
 /** One parsed verdict of a work-card check: the blockers it raises, its non-blocking notes,
- * and the earlier blockers it confirms fixed (by the id the check prompt assigned). */
+ * the earlier blockers it confirms fixed (by the id the check prompt assigned), and the
+ * earlier blockers it reports as still open, each with fresh evidence. */
 export interface WorkCheckVerdict {
 	blockers: {
 		finding: string;
@@ -1046,6 +1047,7 @@ export interface WorkCheckVerdict {
 	}[];
 	notes: string[];
 	fixed: { id: number; reason: string }[];
+	stillOpen: { id: number; quote: string; reason: string }[];
 }
 
 export interface WorkCheckSplit {
@@ -1114,6 +1116,29 @@ function parseWorkFixed(
 	return fixed;
 }
 
+/** The verdict's still-open references; null when `r.stillOpen` exists but is malformed
+ * (the run retries). Malformed entries are skipped, never fatal. Pure. */
+function parseWorkStillOpen(
+	r: Record<string, unknown>,
+): WorkCheckVerdict["stillOpen"] | null {
+	if (r.stillOpen === undefined) return [];
+	if (!Array.isArray(r.stillOpen)) return null;
+	const stillOpen: WorkCheckVerdict["stillOpen"] = [];
+	for (const s of r.stillOpen) {
+		if (typeof s !== "object" || s === null) continue;
+		const e = s as Record<string, unknown>;
+		if (
+			typeof e.id !== "number" ||
+			!Number.isInteger(e.id) ||
+			typeof e.quote !== "string" ||
+			typeof e.reason !== "string"
+		)
+			continue;
+		stillOpen.push({ id: e.id, quote: e.quote, reason: e.reason.trim() });
+	}
+	return stillOpen;
+}
+
 /** Parses the work check's final message; null when the text holds no JSON object at all (the
  * run failed and retries). Malformed entries are skipped, never fatal. Pure. */
 export function parseWorkCheck(text: string): WorkCheckVerdict | null {
@@ -1134,7 +1159,9 @@ export function parseWorkCheck(text: string): WorkCheckVerdict | null {
 	if (notes === null) return null;
 	const fixed = parseWorkFixed(r);
 	if (fixed === null) return null;
-	return { blockers, notes, fixed };
+	const stillOpen = parseWorkStillOpen(r);
+	if (stillOpen === null) return null;
+	return { blockers, notes, fixed, stillOpen };
 }
 
 /** Open blockers from the latest blockers run. Earlier runs remain as history,
@@ -1150,7 +1177,9 @@ export function openWorkBlockers(
 	return [];
 }
 
-/** Rejects a verdict unless each earlier blocker has an explicit fix or a grounded recurrence. Pure. */
+/** Rejects a verdict unless each earlier blocker has an explicit fix, a grounded recurrence,
+ * or an explicit still-open reference with fresh evidence. A blocker is never cleared
+ * without an explicit fix reason. Pure. */
 export function workCheckAccountingError(
 	verdict: WorkCheckVerdict,
 	open: readonly WorkCheckBlocker[],
@@ -1167,9 +1196,21 @@ export function workCheckAccountingError(
 			return "the work check used an invalid fixed blocker ID or an empty fix reason";
 		fixed.add(f.id);
 	}
+	const still = new Set<number>();
+	for (const s of verdict.stillOpen) {
+		if (
+			!Number.isInteger(s.id) ||
+			s.id < 1 ||
+			s.id > open.length ||
+			s.quote.trim() === "" ||
+			s.reason.trim() === ""
+		)
+			return "the work check used an invalid stillOpen blocker ID or an empty quote or reason";
+		still.add(s.id);
+	}
 	const requoted = new Set(blockers.map((b) => b.quote));
 	for (const [i, b] of open.entries()) {
-		if (!fixed.has(i + 1) && !requoted.has(b.quote))
+		if (!fixed.has(i + 1) && !requoted.has(b.quote) && !still.has(i + 1))
 			return `the work check did not account for earlier blocker ${i + 1}`;
 	}
 	return null;

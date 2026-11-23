@@ -372,7 +372,7 @@ export function workCheckPrompt(o: {
 					o.replies.length > 0
 						? "the work agent may have pushed fixes, and the user has replied to the blockers"
 						: "the work agent may have pushed fixes"
-				} since. For EVERY earlier blocker, report whether its fix is real in the "fixed" array (id and the reason the fix holds). A problem that is still there belongs in "blockers" again.
+				} since. For EVERY earlier blocker, report whether its fix is real in the "fixed" array (id and the reason the fix holds). A problem that is still there belongs in "blockers" again. When the code around an old quote has changed, so the old quote no longer appears verbatim, but the problem is still there, report the blocker in "stillOpen" instead (its id, a fresh verbatim quote from the current diff or the files, and the reason it still holds).
 
 Earlier blockers:
 ${o.earlier.map((b) => `${b.id}. ${b.finding}\n   quote: ${b.quote}`).join("\n")}
@@ -406,8 +406,8 @@ Tag every blocker with a severity:
 A blocker without a severity counts as important. Give each blocker a short "bugClass" name (for example "test-tampering", "off-by-one", "sql-injection") and report EVERY instance of the same bug class as its own blocker, so one send-back fixes the whole class.
 ${earlier}${replies}
 Output STRICT JSON only, no markdown fence and no other text:
-{"blockers": [{"finding": "<what is wrong>", "quote": "<verbatim part of the report or the diff>", "severity": "important", "bugClass": "<short class name>"}], "fixed": [{"id": <earlier blocker id>, "reason": "<why the fix is real>"}], "notes": ["<findings that do not block>"]}
-An empty "blockers" array means the merge may proceed. Leave "fixed" empty when there are no earlier blockers.
+{"blockers": [{"finding": "<what is wrong>", "quote": "<verbatim part of the report or the diff>", "severity": "important", "bugClass": "<short class name>"}], "fixed": [{"id": <earlier blocker id>, "reason": "<why the fix is real>"}], "stillOpen": [{"id": <earlier blocker id>, "quote": "<a fresh verbatim quote>", "reason": "<why it still holds>"}], "notes": ["<findings that do not block>"]}
+An empty "blockers" array means the merge may proceed. Leave "fixed" and "stillOpen" empty when there are no earlier blockers.
 
 Card ${o.title}, branch ${o.base}..${o.head}:
 

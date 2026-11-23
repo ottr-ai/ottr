@@ -736,6 +736,8 @@ describe("workCheckPrompt", () => {
 		expect(prompt).toContain("1. The test asserts nothing");
 		expect(prompt).toContain("quote: expect(x).toBe(true);");
 		expect(prompt).toContain('"id": <earlier blocker id>');
+		expect(prompt).toContain('"stillOpen"');
+		expect(prompt).toContain('Leave "fixed" and "stillOpen" empty');
 		expect(prompt).toContain("Original ready report");
 		expect(prompt).toContain("The widget works. Tests pass on this branch.");
 		expect(prompt).toContain("New ready report");

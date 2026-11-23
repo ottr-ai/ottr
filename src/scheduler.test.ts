@@ -2277,6 +2277,7 @@ describe("work check helpers", () => {
 		],
 		notes: ["small nit"],
 		fixed: [],
+		stillOpen: [],
 	};
 
 	test("parseWorkCheck reads the strict JSON object and skips malformed entries", () => {
@@ -2287,6 +2288,7 @@ describe("work check helpers", () => {
 			blockers: [{ finding: "a", quote: "b" }],
 			fixed: [{ id: 1, reason: "ok" }],
 			notes: ["n"],
+			stillOpen: [],
 		});
 		expect(parseWorkCheck("no json here")).toBeNull();
 	});
@@ -2311,6 +2313,7 @@ describe("work check helpers", () => {
 				],
 				notes: [],
 				fixed: [],
+				stillOpen: [],
 			},
 			"const x = 1;",
 			"",
@@ -2385,18 +2388,27 @@ describe("work check helpers", () => {
 
 		test("accepts complete fixes, with no account needed when no blockers precede the check", () => {
 			expect(
-				workCheckAccountingError({ blockers: [], notes: [], fixed }, open, []),
+				workCheckAccountingError(
+					{ blockers: [], notes: [], fixed, stillOpen: [] },
+					open,
+					[],
+				),
 			).toBeNull();
 			expect(
 				workCheckAccountingError(
-					{ blockers: [], notes: [], fixed: [] },
+					{ blockers: [], notes: [], fixed: [], stillOpen: [] },
 					[],
 					[],
 				),
 			).toBeNull();
 			expect(
 				workCheckAccountingError(
-					{ blockers: [], notes: [], fixed: [{ id: 1, reason: " \tfix\n" }] },
+					{
+						blockers: [],
+						notes: [],
+						fixed: [{ id: 1, reason: " \tfix\n" }],
+						stillOpen: [],
+					},
 					open.slice(0, 1),
 					[],
 				),
@@ -2416,7 +2428,7 @@ describe("work check helpers", () => {
 		] as const)("rejects %s", (_name, account) => {
 			expect(
 				workCheckAccountingError(
-					{ blockers: [], notes: [], fixed: [...account] },
+					{ blockers: [], notes: [], fixed: [...account], stillOpen: [] },
 					open,
 					[],
 				),
@@ -2462,6 +2474,81 @@ describe("work check helpers", () => {
 				expect(workCheckAccountingError(parsed, open, blockers)).toBeNull();
 			}
 		});
+
+		test("accepts a still-open reference with a fresh quote and a reason, and keeps the blocker open", () => {
+			const parsed = parseWorkCheck(
+				JSON.stringify({
+					blockers: [],
+					fixed: [fixed[0]],
+					stillOpen: [
+						{
+							id: 2,
+							quote: "const retry = backoff(attempt);",
+							reason: "the retry loop still drops the last attempt",
+						},
+					],
+					notes: [],
+				}),
+			)!;
+			// The parser carries the still-open references through.
+			expect(parsed.stillOpen).toEqual([
+				{
+					id: 2,
+					quote: "const retry = backoff(attempt);",
+					reason: "the retry loop still drops the last attempt",
+				},
+			]);
+			// Blocker 2 is neither fixed nor re-quoted: the check passes, and the
+			// blocker stays open (applyWorkCheckVerdict stamps only fixed ids).
+			expect(workCheckAccountingError(parsed, open, [])).toBeNull();
+			expect(parsed.fixed.map((f) => f.id)).toEqual([1]);
+		});
+
+		test("still rejects a verdict that leaves an earlier blocker out", () => {
+			const parsed = parseWorkCheck(
+				JSON.stringify({
+					blockers: [],
+					fixed: [],
+					stillOpen: [
+						{ id: 1, quote: "fresh evidence", reason: "still broken" },
+					],
+				}),
+			)!;
+			expect(workCheckAccountingError(parsed, open, [])).toBe(
+				"the work check did not account for earlier blocker 2",
+			);
+		});
+
+		test.each([
+			["an out-of-range id", { id: 3, quote: "q", reason: "r" }],
+			["an empty quote", { id: 2, quote: "  ", reason: "r" }],
+			["an empty reason", { id: 2, quote: "q", reason: " \t\n" }],
+		] as const)("rejects a still-open reference with %s", (_name, bad) => {
+			const parsed = parseWorkCheck(
+				JSON.stringify({ blockers: [], fixed: [fixed[0]], stillOpen: [bad] }),
+			)!;
+			expect(parsed.stillOpen).toHaveLength(1);
+			expect(workCheckAccountingError(parsed, open, [])).not.toBeNull();
+		});
+
+		test.each([
+			null,
+			7,
+			{ id: "2", quote: "q", reason: "r" },
+			{ id: 2, quote: 7, reason: "r" },
+			{ id: 2, quote: "q" },
+			{ id: 2, reason: "r" },
+		])(
+			"a malformed parsed still-open entry cannot account for the second blocker: %j",
+			(bad) => {
+				const parsed = parseWorkCheck(
+					JSON.stringify({ blockers: [], fixed: [], stillOpen: [bad] }),
+				);
+				expect(parsed).not.toBeNull();
+				expect(parsed!.stillOpen).toHaveLength(0); // skipped, like a malformed fix
+				expect(workCheckAccountingError(parsed!, open, [])).not.toBeNull();
+			},
+		);
 
 		test.each([
 			["second quote", undefined, ""],
@@ -2552,6 +2639,55 @@ describe("work check helpers", () => {
 						expect(
 							workCheckAccountingError(parsed, earlier, []),
 						).not.toBeNull();
+					},
+				),
+			);
+		});
+		test("property: a still-open reference accounts for a blocker only with a quote and a reason", () => {
+			fc.assert(
+				fc.property(
+					fc.array(
+						fc.record({
+							mode: fc.constantFrom("fixed", "requote", "stillOpen", "none"),
+							ok: fc.boolean(),
+						}),
+						{ minLength: 1, maxLength: 8 },
+					),
+					(modes) => {
+						const earlier = modes.map((_, i) => ({
+							finding: `finding ${i}`,
+							quote: `quote ${i}`,
+						}));
+						const fixed: { id: number; reason: string }[] = [];
+						const stillOpen: { id: number; quote: string; reason: string }[] =
+							[];
+						const blockers: { finding: string; quote: string }[] = [];
+						modes.forEach((m, i) => {
+							if (m.mode === "fixed")
+								fixed.push({ id: i + 1, reason: m.ok ? "real fix" : "  \n" });
+							else if (m.mode === "stillOpen")
+								stillOpen.push({
+									id: i + 1,
+									quote: m.ok ? `fresh ${i + 1}` : " ",
+									reason: m.ok ? "still there" : "",
+								});
+							else if (m.mode === "requote")
+								blockers.push({ finding: "again", quote: `quote ${i}` });
+						});
+						const parsed = parseWorkCheck(
+							JSON.stringify({ blockers, fixed, stillOpen }),
+						)!;
+						const accounted = modes.every((m) =>
+							m.mode === "fixed"
+								? m.ok
+								: m.mode === "stillOpen"
+									? m.ok
+									: m.mode === "requote",
+						);
+						expect(
+							workCheckAccountingError(parsed, earlier, parsed.blockers) ===
+								null,
+						).toBe(accounted);
 					},
 				),
 			);
