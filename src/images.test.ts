@@ -554,6 +554,20 @@ describe("decodePng, gray16 and visuallyIdentical", () => {
 		expect(decodePng(png)).toBe(null);
 	});
 
+	test("an IDAT inflating far past the declared geometry returns null", () => {
+		// 1x1 gray needs 2 raw bytes; 1.5 MiB of zeros deflates to a few KiB,
+		// so this bomb stays far below MAX_IMAGE_BYTES but inflates way past 2.
+		const ihdr = ihdrFor(1, 1, 1);
+		const png = Buffer.concat([
+			PNG_SIG,
+			chunk("IHDR", ihdr),
+			chunk("IDAT", deflateSync(Buffer.alloc(1.5 * 1024 * 1024))),
+			chunk("IEND", Buffer.alloc(0)),
+		]);
+		expect(png.length).toBeLessThan(MAX_IMAGE_BYTES / 64);
+		expect(decodePng(png)).toBe(null);
+	});
+
 	test("tolerates trailing bytes after IEND", () => {
 		const pixels = Uint8Array.from({ length: 4 * 4 }, (_, i) => i & 0xff);
 		const png = buildPngPixels(4, 4, 1, pixels);

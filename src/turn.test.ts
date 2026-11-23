@@ -19864,6 +19864,74 @@ describe("turn survivor round 5 — run result and merge push", () => {
 		expect(shots[7]).toMatch(/^\d+\.png$/);
 	});
 
+	/** A constant-fill 24×16 8-bit gray PNG. Fills 25+ levels apart keep the bytes
+	 * and the gray16 vectors distinct, so neither dedup check collapses candidates. */
+	const filledPng = (fill: number): Uint8Array => {
+		const w = 24;
+		const h = 16;
+		const crc32 = (buf: Buffer): number => {
+			let c = ~0;
+			for (const byte of buf) {
+				c ^= byte;
+				for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
+			}
+			return ~c >>> 0;
+		};
+		const chunk = (type: string, data: Buffer): Buffer => {
+			const head = Buffer.alloc(4);
+			head.writeUInt32BE(data.length);
+			const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+			const crc = Buffer.alloc(4);
+			crc.writeUInt32BE(crc32(body));
+			return Buffer.concat([head, body, crc]);
+		};
+		const ihdr = Buffer.alloc(13);
+		ihdr.writeUInt32BE(w, 0);
+		ihdr.writeUInt32BE(h, 4);
+		ihdr[8] = 8; // bit depth
+		ihdr[9] = 0; // grayscale
+		const raw = Buffer.alloc(h * (w + 1));
+		for (let y = 0; y < h; y++) {
+			raw[y * (w + 1)] = 0; // filter type None
+			raw.fill(fill, y * (w + 1) + 1, (y + 1) * (w + 1));
+		}
+		return Uint8Array.from(
+			Buffer.concat([
+				Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+				chunk("IHDR", ihdr),
+				chunk("IDAT", deflateSync(raw)),
+				chunk("IEND", Buffer.alloc(0)),
+			]),
+		);
+	};
+
+	test("more than 8 reported shots caps decoding to the newest 8 before any read", async () => {
+		const names = Array.from({ length: 10 }, (_, i) => `c${i}.png`);
+		const { store, loop } = await withRun({
+			outcome: { status: "ready", summary: "did it", shots: names },
+		});
+		const task = await store.createTask("work please");
+		const wt = workTree(store, task.id);
+		// c0.png and c1.png do not exist on disk: past-cap candidates must be
+		// sliced away before adoptShot reads anything.
+		for (let i = 2; i < names.length; i++)
+			writeFileSync(join(wt, names[i]!), filledPng(50 + (i - 2) * 25));
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.shots).toHaveLength(8);
+		const dir = await store.imagesDir(task.id);
+		for (let i = 0; i < 8; i++)
+			expect(
+				readFileSync(join(dir, after.shots[i]!)).equals(
+					Buffer.from(filledPng(50 + i * 25)),
+				),
+			).toBe(true);
+		const log = await logText(store, task.id);
+		expect(log).not.toContain("! shot c0.png");
+		expect(log).not.toContain("! shot c1.png");
+		expect(log).toContain("! shots: 10 reported, decoded only the newest 8");
+	});
+
 	test("a clean turn with nothing untracked writes no quarantine line", async () => {
 		const record = baseRecord();
 		const { store, loop } = await setupWith(record, {

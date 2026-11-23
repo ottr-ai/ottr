@@ -189,9 +189,12 @@ function parsePngChunks(bytes: Uint8Array): PngBody | null {
 		off = dataEnd + 4; // CRC
 	}
 	if (header === null || !sawEnd || idat.length === 0) return null;
-	const raw = inflateSync(Buffer.concat(idat));
 	const stride = header.w * header.channels;
-	if (raw.length < header.h * (stride + 1)) return null;
+	const expected = header.h * (stride + 1);
+	// deflate compresses ~1000:1, so an unbounded inflateSync lets a small
+	// PNG declare gigabytes of output; the stream must match the geometry.
+	const raw = inflateSync(Buffer.concat(idat), { maxOutputLength: expected });
+	if (raw.length !== expected) return null;
 	return { w: header.w, h: header.h, channels: header.channels, raw };
 }
 

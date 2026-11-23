@@ -1357,6 +1357,9 @@ const MERGE_PUSH_RETRY_WAIT_MS = 30_000;
 const REPORT_MAX_BYTES = 4 * 1024 * 1024;
 // ponytail: a fixed cap on the work check's transcript read; raise it when a real transcript hits it.
 const TRANSCRIPT_MAX_BYTES = 128 * 1024 * 1024;
+// OTTR-1014: the newest shots one turn adopts; each candidate past the cap costs a
+// full synchronous PNG decode, so the candidate list is sliced before the loop.
+const MAX_SHOT_CANDIDATES = 8;
 /** The park reason of a stopped turn (the board's Esc). */
 const TURN_STOPPED_REASON =
 	"Turn stopped. Reply to continue the session, Resume to rerun it, or cancel the card.";
@@ -7168,7 +7171,13 @@ export function createTurnLoop(
 		// Grays of this run's new copies: a second capture of the same new screen
 		// in one outcome skips too, instead of landing as a fresh numbered file.
 		const batch: Uint8Array[] = [];
-		for (const [shot, p] of await shotCandidates(st, reported)) {
+		const found = await shotCandidates(st, reported);
+		const candidates = found.slice(-MAX_SHOT_CANDIDATES);
+		if (found.length > MAX_SHOT_CANDIDATES)
+			await st.log(
+				`! shots: ${found.length} reported, decoded only the newest ${MAX_SHOT_CANDIDATES}`,
+			);
+		for (const [shot, p] of candidates) {
 			try {
 				await adoptShot(st, seen, stored, batch, copied, shot, p);
 			} catch (err) {
@@ -7183,7 +7192,7 @@ export function createTurnLoop(
 				await st.store.imagesDir(st.id),
 				copied,
 			);
-			st.shots = [...st.task.shots, ...names].slice(-8); // cap 8, keep newest
+			st.shots = [...st.task.shots, ...names].slice(-MAX_SHOT_CANDIDATES); // cap, keep newest
 		}
 	}
 
