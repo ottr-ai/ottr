@@ -31,7 +31,7 @@ const RENAME =
 
 /** Workers never destroy: an agent guessed PIDs once and killed its own omp mid-merge. Cleanup belongs to the tracker and the user, except the merge turn's AGENTS.md integration cleanup (worktree remove, branch -d). */
 const NO_DESTRUCTION =
-	"Never remove or delete files or directories, and never kill or force-stop a process - not even ones you believe are your own leftovers or leaked test servers - except the integration cleanup that AGENTS.md names for the merge turn (git worktree remove and git branch -d after a successful ff-merge), which you run as prescribed. If something blocks you (a locked directory, a leftover server, a stuck process), leave it untouched, report it in your outcome details (or call ask with it), and finish; the tracker and the user clean up.";
+	"Never remove or delete files or directories, and never kill or force-stop a process - not even ones you believe are your own leftovers or leaked test servers - except the integration cleanup that AGENTS.md names for the merge turn (git worktree remove and git branch -d after a successful ff-merge), which you run as prescribed. If something blocks you (a locked directory, a leftover server, a stuck process), leave it untouched, report it in your outcome details (or call ask with it), and finish; the tracker and the user clean up. A task may stop the child processes that its own commands started and delete the temporary files and directories that its own commands created; the rule forbids only processes and files that this turn did not create.";
 
 /** Features move; READMEs rot. Work turns can edit, so they fix the README in place (the read-only release review files cards instead). */
 const README_RULE =
