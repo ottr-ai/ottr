@@ -9686,27 +9686,72 @@ export function createTurnLoop(
 				);
 				continue;
 			}
+			if (full === null) {
+				await st.log(
+					`- ${result.outcome} result for #${leadId} not applied: the card is gone`,
+				);
+				continue;
+			}
+			// The verdict judges the live row, not the settle's first listing: a
+			// cancel, a start or another result that landed while the run worked
+			// owns the card (OTTR-1227).
 			const why =
-				lead.followUpOf !== reviewId
+				full.followUpOf !== reviewId
 					? "not a lead of this run's review"
-					: !lead.prompt.startsWith("Needs validation") ||
-							leadBlocker(lead.prompt).kind !== "sandbox"
+					: !full.prompt.startsWith("Needs validation") ||
+							leadBlocker(full.prompt).kind !== "sandbox"
 						? "not a batchable lead of this run's review"
-						: lead.cancelledAt !== null
+						: full.cancelledAt !== null
 							? "the lead is cancelled"
-							: lead.validatedAt !== null
+							: full.validatedAt !== null
 								? "the lead is already validated"
 								: null;
-			if (why !== null || full === null) {
+			if (why !== null) {
 				await st.log(
-					`- ${result.outcome} result for #${leadId} not applied: ${why ?? "the card is gone"}`,
+					`- ${result.outcome} result for #${leadId} not applied: ${why}`,
 				);
 				continue;
 			}
 			// A started lead (any stage beyond backlog, or a backlog lead whose grill is
-			// queued or running) records the outcome in its details only; no run state and
-			// no prompt is overwritten (the OTTR-869 rule).
-			if (lead.stage !== "backlog" || lead.state !== "idle") {
+			// queued or running) keeps its run state: confirmed, blocked and deployment
+			// record the outcome in its details only, so no run state and no prompt is
+			// overwritten (the OTTR-869 rule). A refuted verdict ends the lead even
+			// when it started: the sanctioned cancel stops the queued start or the
+			// running grill and never deletes unsaved work (OTTR-1227).
+			const started = full.stage !== "backlog" || full.state !== "idle";
+			if (result.outcome === "refuted") {
+				const reason = `Refuted by validation run #${st.id} on ${date}: ${result.evidence}`;
+				if (!started) {
+					await st.store.updateTask(lead.id, {
+						cancelledAt: now,
+						state: "idle",
+						validatedAt: now,
+						needsReason: reason,
+					});
+				} else {
+					const outcome = await cancel(st.e, lead.id, false);
+					if ("removed" in outcome) {
+						await st.store.updateTask(lead.id, {
+							validatedAt: now,
+							needsReason: reason,
+						});
+					} else {
+						// The cancel kept the lead's work: the verdict records in the
+						// details, and the kept-work park keeps its own reason.
+						const kept = "kept" in outcome ? outcome.kept : "unknown";
+						await st.store.updateTask(lead.id, {
+							validatedAt: now,
+							details: `${full.details ?? ""}\nValidated by validation run #${st.id} on ${date}: refuted${result.evidence.trim() === "" ? "" : ` — ${result.evidence.trim()}`} (the cancel kept the work: ${kept}).`,
+						});
+					}
+					await st.log(
+						`- refuted lead #${lead.id} was started; the cancel ${"removed" in outcome ? "ended it" : "kept its work"}`,
+					);
+				}
+				applied += 1;
+				continue;
+			}
+			if (started) {
 				const evidence = result.evidence.trim();
 				const text =
 					result.outcome === "blocked" ? "still blocked" : result.outcome;
@@ -9726,13 +9771,6 @@ export function createTurnLoop(
 					validatedAt: now,
 					prompt: `${lead.prompt}\n\nValidated ${date} by validation run #${st.id}${evidence === "" ? "" : `: ${evidence}`}`,
 					details: `${full.details ?? ""}\nValidated by #${st.id} on ${date}: confirmed.${evidence === "" ? "" : ` ${evidence}`}`,
-				});
-			} else if (result.outcome === "refuted") {
-				await st.store.updateTask(lead.id, {
-					cancelledAt: now,
-					state: "idle",
-					validatedAt: now,
-					needsReason: `Refuted by validation run #${st.id} on ${date}: ${result.evidence}`,
 				});
 			} else if (result.outcome === "blocked") {
 				await st.store.updateTask(lead.id, {

@@ -29708,6 +29708,51 @@ describe("stored review findings", () => {
 		expect(afterRemaining.stage).toBe("backlog");
 	});
 
+	test("a refuted verdict cancels a lead the user started while the batch was open (OTTR-1227)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record);
+		const review = await doneReview(store, "refutes a started lead");
+		const refuted = await leadCard(
+			store,
+			review.id,
+			"Needs validation: config double-read\nBlocker: sandbox run: config load",
+		);
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		// The user starts the lead while the run is open (an accept or a drag).
+		// The routing tick holds such a lead until the settle, so the settle sees
+		// it started — the CLIP-107 shape.
+		await store.updateTask(refuted.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+		});
+		const date = new Date().toISOString().slice(0, 10);
+		batches.push([
+			mkFinding(
+				`Validation: #${refuted.id} refuted\nthe job passes without it`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		const card = (await store.getTask(v1.id))!;
+		expect(card.stage).toBe("done");
+		expect(card.state).toBe("idle");
+		// The verdict ends the lead cancelled through the sanctioned cancel: the
+		// queued start is stopped, the verdict lands as the cancel's reason, and
+		// the lead never resurfaces as an uncancelled backlog card.
+		const after = (await store.getTask(refuted.id))!;
+		expect(after.cancelledAt).not.toBeNull();
+		expect(after.validatedAt).toBeGreaterThan(0);
+		expect(after.state).toBe("idle");
+		expect(after.needsReason).toBe(
+			`Refuted by validation run #${v1.id} on ${date}: the job passes without it`,
+		);
+		expect(await logText(store, v1.id)).toContain(
+			`refuted lead #${refuted.id} was started; the cancel ended it`,
+		);
+	});
+
 	test("the settle's batch gate keeps a deployment-fact lead's result out (OTTR-1047 security fix)", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, batches } = await validationCase(record);

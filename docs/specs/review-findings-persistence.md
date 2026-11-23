@@ -140,6 +140,17 @@ open leads, and lands the question card Done (`stage: "done"`, `state: "idle"`,
   non-empty text appends to its details. Free text the reply carried but no
   question consumed appends to the details of every open lead that got no
   per-question answer.
+
+Free text rides the same verdict (OTTR-1227): after the exact labels miss, the
+classifier `leadAnswerVerdict` reads the answer's words. A negation
+(`does not apply`, `doesn't apply`, `not applicable`, `not relevant`, a bare
+`no`) applies the `No, it does not apply` rule; an affirmation (`applies`,
+`applicable`, `relevant`, `yes`) applies the `Yes, the risk applies` rule.
+Negation wins when both appear. The not-apply cancel reason quotes the answer
+and, when the lead's details carry the settle's note, the asking run:
+`Cancelled by the user's answer to the review's question: <answer> (validation
+run #<run id>)`. Unclassified text appends the answer with a note that no
+option matched, so the lead stays unchanged and the operator sees why.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
   still open (not cancelled, not done). A complete reply lands the card Done
   inside the same reply, so a second reply is refused (409, not needs_you). A
@@ -433,7 +444,10 @@ validation card's findings. A result counts only when its lead is a child of
 the validation card's own review, is not cancelled, has `validatedAt ===
 null`, and the lead passes the filing predicate — its prompt starts with the
 lead tag and its `leadBlocker(prompt)` is of kind `sandbox`; any other result
-lands only in the settle log (`st.log`). Each
+lands only in the settle log (`st.log`). The settle judges each lead's live
+row at write time, not the row from the settle's first listing, so a cancel,
+a start, or a validation result that landed while the run worked owns the
+card (OTTR-1227). Each
 applied lead gets `validatedAt` set. A lead's prompt changes only in the
 confirmed case, which appends after lines 1 and 2 and keeps the fingerprint
 and title dedupe keys stable:
@@ -445,10 +459,14 @@ and title dedupe keys stable:
   the same note in its details. A lead the user already started (any other
   stage or state) records the outcome in its details only; no run state is
   overwritten.
-- `refuted`: an idle backlog lead cancels with the direct patch
-  (`cancelledAt` set, `state: "idle"`) and `needsReason`
-  `Refuted by validation run #<card id> on <YYYY-MM-DD>: <evidence>`; a
-  started lead records the outcome in its details only.
+- `refuted`: the lead ends cancelled whatever its shape (OTTR-1227). An idle
+  backlog lead cancels with the direct patch (`cancelledAt` set,
+  `state: "idle"`) and `needsReason`
+  `Refuted by validation run #<card id> on <YYYY-MM-DD>: <evidence>`. A
+  started lead cancels through the sanctioned `cancel()` (it stops the queued
+  start or the running grill, disposes the worktree, keeps unsaved work) and
+  then carries the same `needsReason`; a cancel that kept work records the
+  verdict in the details instead, so the kept-work park keeps its reason.
 - `blocked`: the lead stays `backlog`/`idle`; its details gain
   `Validated by validation run #<card id> on <YYYY-MM-DD>: still blocked —
   <evidence>`.
@@ -725,10 +743,17 @@ before the run resolves.
    with its lead card's id.
 8. reply route: the answers "applies" and "does not apply" queue the first lead
    card with the answer in its prompt and cancel the second with the answer as
-   its reason; the question card goes Done. Free text leaves the lead card in
-   backlog with the answer in its details. A one-question card takes the
-   drawer's raw answer text; a started lead cancels through the sanctioned
-   cancel and never loses its run to the bare patch.
+   its reason; the question card goes Done. Free text classifies by its words
+   (OTTR-1227): a negation cancels with the answer and the run id in the
+   reason, an affirmation queues, other text leaves the lead card in backlog
+   with the answer and an unclassified note in its details. A one-question card
+   takes the drawer's raw answer text; a started lead cancels through the
+   sanctioned cancel and never loses its run to the bare patch.
+8a. reply route (red, OTTR-1227): a free-text negation answer to a deployment
+   question cancels its lead with the answer and the asking run's id in the
+   reason, and a free-text affirmation queues the lead like a confirmed
+   verdict; both fail before the fix, because the route records unclassified
+   text in the details only.
 9. turn: a review with only sandbox-run leads (one without the blocker line)
    files no question card.
 10. turn (OTTR-959, OTTR-980): the leads are the turn's own recorded `propose_task`
@@ -759,9 +784,14 @@ before the run resolves.
     model, the batch prompt, sandbox-blocker leads only, severity order, the
     batch cap, deployment-fact and already-validated leads excluded.
 17. turn (red, OTTR-1047): each of the four results moves its lead as the
-    Results section says, a started lead records details only, a result for a
-    foreign lead only logs, and a zero-result run parks `needs_you` and
-    touches nothing.
+    Results section says, a started lead records details only (a refuted
+    verdict instead cancels the started lead through the sanctioned cancel,
+    OTTR-1227), a result for a foreign lead only logs, and a zero-result run
+    parks `needs_you` and touches nothing.
+17a. turn (red, OTTR-1227): a refuted verdict cancels a lead the user started
+    while the batch was open, through the sanctioned cancel; the lead never
+    resurfaces as an uncancelled backlog card, and a later review whose filing
+    pass matches its fingerprint files nothing.
 18. turn (red, OTTR-1047): a review whose leads exceed the cap chains a
     follow-up card for the remainder after the run settles `done`; a second
     review files no card while another validation card is open, and files one

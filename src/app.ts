@@ -13115,6 +13115,24 @@ export async function createApp(deps: AppDeps) {
 			});
 		return matches;
 	}
+	/** The operator's free-text answer to a deployment question (OTTR-1227): the
+	 * exact option labels match before this reads any other text. A negation
+	 * ("does not apply", "not applicable", a bare "no") cancels the lead; an
+	 * affirmation ("applies", "applicable", "yes") queues it like a confirmed
+	 * verdict; anything else is unclassified and only records the answer.
+	 * Negation wins, because a negated sentence can still hold "apply". Pure. */
+	function leadAnswerVerdict(answer: string): "applies" | "not-apply" | null {
+		const text = answer.trim().replace(/\.$/, "").toLowerCase();
+		if (
+			/\b(does\s+not\s+apply|doesn'?t\s+apply|not\s+applic\w*|not\s+relevant|no)\b/.test(
+				text,
+			)
+		)
+			return "not-apply";
+		return /\b(applies|applicable|relevant|yes)\b/.test(text)
+			? "applies"
+			: null;
+	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
 	 * `For "<question>": <answer>` line per question — raw answer text when the card
 	 * holds a single question — and each answer applies to that question's lead card.
@@ -13238,7 +13256,13 @@ export async function createApp(deps: AppDeps) {
 					const live = await e.store.getTask(lead.id);
 					if (live === null) continue;
 					const answerLabel = m.answer.trim().replace(/\.$/, "").toLowerCase();
-					if (answerLabel === appliesLabel) {
+					const verdict =
+						answerLabel === appliesLabel
+							? ("applies" as const)
+							: answerLabel === notApplyLabel
+								? ("not-apply" as const)
+								: leadAnswerVerdict(m.answer);
+					if (verdict === "applies") {
 						if (live.stage === "backlog" && live.state === "idle")
 							await e.store.updateTask(lead.id, {
 								stage: "todo",
@@ -13250,8 +13274,13 @@ export async function createApp(deps: AppDeps) {
 						answered.add(lead.id);
 						continue;
 					}
-					if (answerLabel === notApplyLabel) {
-						const reason = `Cancelled by the user's answer to the review's question: ${m.answer}`;
+					if (verdict === "not-apply") {
+						// The cancel reason quotes the answer and, when the settle's
+						// deployment note is on the lead, the run that asked (OTTR-1227).
+						const runId = /Validated by validation run #(\S+) on /.exec(
+							live.details ?? "",
+						)?.[1];
+						const reason = `Cancelled by the user's answer to the review's question: ${m.answer}${runId === undefined ? "" : ` (validation run #${runId})`}`;
 						answered.add(lead.id);
 						if (live.stage !== "backlog" || live.state !== "idle")
 							return { id: lead.id, reason, answer: m.answer };
@@ -13262,7 +13291,10 @@ export async function createApp(deps: AppDeps) {
 						});
 						continue;
 					}
-					await appendDetails(lead.id, m.answer);
+					await appendDetails(
+						lead.id,
+						`${m.answer} (the answer matched no option, so the lead stays unchanged)`,
+					);
 					answered.add(lead.id);
 				}
 				if (free !== "")

@@ -2492,6 +2492,44 @@ describe("task routes", () => {
 		expect(await errorOf(again)).toBe("task is not waiting for you");
 	});
 
+	test("a deployment question classifies free text: negation cancels with the run id, affirmation queues (OTTR-1227)", async () => {
+		const { lead1, lead2, ask } = await seedLeadAsk();
+		// The settle's deployment note sits on the first lead; the asking run's id
+		// lives only there, so the cancel reason can quote it.
+		await store.updateTask(lead1.id, {
+			details: `\nValidated by validation run #CLIP-70 on 2026-11-22: deployment — Q one?`,
+		});
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: `${askAnswerLine(
+				`Q one? (card #${lead1.id})`,
+				"No, this does not apply to our deployment: the legacy cache is gone",
+			)}\n${askAnswerLine(
+				`Q two? (card #${lead2.id})`,
+				"Yes, the risk applies to our deployment: the header is set",
+			)}`,
+		});
+		expect(res.status).toBe(200);
+		// The negation cancels the lead; the reason quotes the answer and the run.
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.cancelledAt).not.toBeNull();
+		expect(one.state).toBe("idle");
+		expect(one.needsReason).toBe(
+			"Cancelled by the user's answer to the review's question: No, this does not apply to our deployment: the legacy cache is gone (validation run #CLIP-70)",
+		);
+		// The affirmation queues the lead like a confirmed verdict.
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.stage).toBe("todo");
+		expect(two.state).toBe("queued");
+		expect(two.queuedAt).not.toBeNull();
+		expect(
+			two.prompt.endsWith(
+				"The user answered the review's question: Yes, the risk applies to our deployment: the header is set",
+			),
+		).toBe(true);
+		const done = (await store.getTask(ask.id))!;
+		expect(done.stage).toBe("done");
+	});
+
 	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
@@ -2506,7 +2544,7 @@ describe("task routes", () => {
 		expect(one.state).toBe("idle");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
-			"\n\nThe user answered the review's question: only behind our staging proxy",
+			"\n\nThe user answered the review's question: only behind our staging proxy (the answer matched no option, so the lead stays unchanged)",
 		);
 		// The question without an answer line touches nothing.
 		const two = (await store.getTask(lead2.id))!;
@@ -2599,7 +2637,7 @@ describe("task routes", () => {
 		expect(one.state).toBe("idle");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
-			"\n\nThe user answered the review's question: only behind our staging proxy",
+			"\n\nThe user answered the review's question: only behind our staging proxy (the answer matched no option, so the lead stays unchanged)",
 		);
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});
@@ -2614,7 +2652,7 @@ describe("task routes", () => {
 		expect(one.stage).toBe("backlog");
 		expect(one.cancelledAt).toBeNull();
 		expect(one.details).toBe(
-			"\n\nThe user answered the review's question: Approve",
+			"\n\nThe user answered the review's question: Approve (the answer matched no option, so the lead stays unchanged)",
 		);
 		expect((await store.getTask(ask.id))?.stage).toBe("done");
 	});
