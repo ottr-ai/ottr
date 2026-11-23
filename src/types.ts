@@ -467,6 +467,17 @@ export type AppCheck = {
 	error: string | null;
 };
 
+/** One earlier inline finding the re-review found fixed, keyed by GitHub's
+ * comment id; the Post resolves its review thread (docs/specs/pr-reviews.md
+ * "Resolve fixed threads"). */
+export interface FixedThread {
+	/** GitHub comment id of the board's posted review's inline comment. */
+	id: number;
+	path: string;
+	/** New-file (RIGHT-side) line of the finding. */
+	line: number;
+}
+
 /** One pr_review row: the watch state of one PR of the project's GitHub repo. */
 export interface PrReviewRow {
 	number: number;
@@ -488,6 +499,8 @@ export interface PrReviewRow {
 	draft: boolean;
 	title: string;
 	postError: string | null;
+	/** Earlier inline findings of the reviewed head's re-review that the model found fixed; the Post resolves their threads. Empty for a first review and for older rows. */
+	fixedThreads: FixedThread[];
 	/** Newest comment time the watcher has surfaced (epoch ms); the comment sweep's cutoff. Null before the first sweep. */
 	commentsAt: number | null;
 	/** The current comment wave is unseen: the bell row and the `pr:` alert are live. */
@@ -519,6 +532,8 @@ export interface PrReviewView {
 	postError: string | null;
 	/** The PR's last draft run; null when none ran since the server started. */
 	run: PrRunState | null;
+	/** Threads the next Post will resolve: the draft's fixed findings, only while a post is pending. */
+	willResolve?: FixedThread[];
 }
 
 export interface Task {

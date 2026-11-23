@@ -66,6 +66,9 @@ function migratedColumns(): Set<string> {
 		);
 		if (match !== null) columns.add(match[1]!.toLowerCase());
 	}
+	// Step 4's ALTER runs inline (no statement list to scan); the step-execution
+	// test below proves it really runs.
+	columns.add("fixed_threads");
 	return columns;
 }
 
@@ -122,6 +125,7 @@ describe("PostgreSQL migration surface", () => {
 			"CREATE TABLE IF NOT EXISTS pr_review",
 		);
 		expect(expected).toContain("posted_via");
+		expect(expected).toContain("fixed_threads");
 		const actual = migratedColumns();
 		const missing = expected.filter((column) => !actual.has(column));
 		expect(missing).toEqual([]);
@@ -134,6 +138,11 @@ describe("PostgreSQL migration surface", () => {
 		// list restores the missing-column bug, and this fails.
 		expect(db.executed).toContain(
 			"ALTER TABLE pr_review ADD COLUMN posted_via text",
+		);
+		// Step 4's inline ALTER ran the same way: a step that no longer executes
+		// its statement restores the missing-column bug, and this fails.
+		expect(db.executed).toContain(
+			"ALTER TABLE pr_review ADD COLUMN fixed_threads text",
 		);
 		// Step 1's schema ran ahead of step 2's convergence.
 		const alter = db.executed.indexOf(

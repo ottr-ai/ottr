@@ -260,6 +260,14 @@ export const projectMigrations: readonly PostgresMigration[] = [
 			"CREATE INDEX idx_code_scan_alert_card_filed ON code_scan_alert (card_filed_at)",
 		);
 	},
+	// fixed_threads landed with the re-review's fixed-finding verdicts
+	// (docs/specs/pr-reviews.md "Resolve fixed threads"): the same additive
+	// convergence the SQLite ProjectStore.addColumn path runs. Step 1 keeps the
+	// d4a617f oracle untouched, so a fresh database gets the column from this step
+	// too. Null reads as "no re-review verdicts", the state of every older row.
+	async (db) => {
+		await db.exec("ALTER TABLE pr_review ADD COLUMN fixed_threads text");
+	},
 ];
 
 /** How many versioned steps the store's own project migrations carry. The PG

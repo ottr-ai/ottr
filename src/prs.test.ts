@@ -26,10 +26,12 @@ import {
 	parseCreatedPr,
 	parseDraft,
 	parsePullPage,
+	parseReviewThreads,
 	prUrl,
 	pullState,
 	QUIET_RUN_SLACK_MS,
 	reviewUserMessage,
+	threadsToResolve,
 } from "./prs.ts";
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
@@ -882,7 +884,12 @@ describe("review prompt and draft", () => {
 				reviewedHead: sha("a"),
 				head: sha("a"),
 			}),
-		).toEqual({ review: "earlier", comments: [], rangeDiff: "" });
+		).toEqual({
+			review: "earlier",
+			comments: [],
+			rangeDiff: "",
+			findings: [],
+		});
 		// An unposted draft is never the earlier review: the reply runs like a
 		// first review, whatever the saved draft holds.
 		expect(
@@ -1072,7 +1079,7 @@ describe("review prompt and draft", () => {
 			title: "t",
 			body: "",
 			diff: "+x",
-			earlier: { review: "e", comments: [], rangeDiff: "" },
+			earlier: { review: "e", comments: [], rangeDiff: "", findings: [] },
 		});
 		expect(same).toContain("no code changes since the earlier review's head");
 		const missing = reviewUserMessage({
@@ -1081,7 +1088,7 @@ describe("review prompt and draft", () => {
 			title: "t",
 			body: "",
 			diff: "+x",
-			earlier: { review: "e", comments: [], rangeDiff: null },
+			earlier: { review: "e", comments: [], rangeDiff: null, findings: [] },
 		});
 		expect(missing).toContain("unavailable");
 		expect(missing).toContain("DIFF\n<<<DATA\n+x\nDATA>>>");
@@ -1099,6 +1106,7 @@ describe("review prompt and draft", () => {
 				review: "Earlier: bug in the loop",
 				comments: [],
 				rangeDiff: "R".repeat(400_001),
+				findings: [],
 			},
 			onDropped: (d) => dropped.push(d),
 		});
@@ -1123,6 +1131,7 @@ describe("review prompt and draft", () => {
 				review: "E".repeat(400_001),
 				comments: [{ author: "a", date: "2026-01-01T00:00:00Z", body: "c" }],
 				rangeDiff: null,
+				findings: [],
 			},
 			onDropped: (d) => dropped.push(d),
 		});
@@ -1907,6 +1916,7 @@ describe("createPrWatcher", () => {
 		]);
 		const inline = {
 			...ghComment("bot", "2026-01-02T00:00:00Z", "Off by one."),
+			id: 9001,
 			path: "src/a.ts",
 			line: 2,
 			start_line: null,
@@ -1917,6 +1927,7 @@ describe("createPrWatcher", () => {
 			// Outdated on the new head: GitHub keeps only the original line.
 			{
 				...ghComment("bot", "2026-01-02T00:00:00Z", "Range note."),
+				id: 9002,
 				path: "src/b.ts",
 				line: null,
 				original_line: 9,
@@ -1945,12 +1956,72 @@ describe("createPrWatcher", () => {
 		);
 		const msg = s.prompts.at(-1)!;
 		expect(msg).toContain(
-			"EARLIER REVIEW\n<<<DATA\nEarlier summary\n\n<!-- inline src/a.ts:2 -->\nOff by one.\n<!-- /inline -->\n\n<!-- inline src/b.ts:7-9 -->\nRange note.\n<!-- /inline -->\nDATA>>>",
+			"EARLIER REVIEW\n<<<DATA\nEarlier summary\n\n<!-- earlier finding 9001 -->\n\n<!-- inline src/a.ts:2 -->\nOff by one.\n<!-- /inline -->\n\n<!-- earlier finding 9002 -->\n\n<!-- inline src/b.ts:7-9 -->\nRange note.\n<!-- /inline -->\nDATA>>>",
 		);
 		expect(msg.split("Off by one.").length - 1).toBe(1);
 		expect(msg).toContain("COMMENT dave 2026-01-03T00:00:00Z");
 		expect(msg).not.toContain("no path here");
 		expect(msg).not.toContain("bad line here");
+	});
+
+	test("a re-review strips the model's earlier verdict lines and saves the fixed findings", async () => {
+		const s = await setup();
+		s.setOpen([pr(29, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		await s.store.savePrReview({
+			...(await s.store.getPrReview(29))!,
+			postedHead: sha("a"),
+			postedUrl: `${prUrl("o/r", 29)}#pullrequestreview-1`,
+			postedLogin: "bot",
+		});
+		s.setOpen([pr(29, sha("c"))]);
+		s.setReviews([
+			ghReview(1, sha("a"), "earlier review body", "2026-01-01T00:00:00Z"),
+		]);
+		s.setReviewComments([
+			{
+				...ghComment("bot", "2026-01-02T00:00:00Z", "Off by one."),
+				id: 9001,
+				path: "src/a.ts",
+				line: 2,
+				start_line: null,
+				pull_request_review_id: 1,
+			},
+			{
+				...ghComment("bot", "2026-01-02T00:00:00Z", "Range note."),
+				id: 9002,
+				path: "src/b.ts",
+				line: 9,
+				start_line: 7,
+				pull_request_review_id: 1,
+			},
+		]);
+		// One fixed vote, one open vote, one malformed lookalike: only 9001 counts fixed.
+		s.setAnswer(
+			[
+				"## Summary",
+				"<!-- earlier verdict: 9001 fixed -->",
+				"<!-- earlier verdict: 9002 open -->",
+				"<!-- earlier verdict: abc fixed -->",
+				"<!-- blocking: no -->",
+			].join("\n"),
+		);
+		// The head move needs its own tick before the quiet gate can pass.
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// No verdict-shaped line reaches the saved draft, and the blocking verdict
+		// still decides after the earlier verdict lines are gone.
+		expect((await s.store.getTask((await s.cards())[0]!.id))!.details).toBe(
+			"## Summary",
+		);
+		expect(await s.store.lastPrRunBlocking(29)).toBe(false);
+		// The run's saved row carries the fixed finding, keyed by the comment id.
+		expect((await s.store.getPrReview(29))!.fixedThreads).toEqual([
+			{ id: 9001, path: "src/a.ts", line: 2 },
+		]);
 	});
 
 	test("the re-review prompt lists earlier findings only while some stay open or partly fixed", async () => {
@@ -3401,5 +3472,114 @@ describe("createPrWatcher", () => {
 		expect(s.prompts).toHaveLength(1);
 		expect(s.prompts[0]).not.toContain("PERF LENS");
 		expect(s.logs).toContain("prs: p: #14 perf lens failed: scan blew up");
+	});
+});
+
+describe("review threads", () => {
+	// GitHub's documented reviewThreads response envelope, one page.
+	const envelope = (nodes: unknown[]) => ({
+		data: {
+			repository: {
+				pullRequest: {
+					reviewThreads: {
+						pageInfo: { hasNextPage: false, endCursor: null },
+						nodes,
+					},
+				},
+			},
+		},
+	});
+	const node = (over: Record<string, unknown> = {}) => ({
+		id: "PRRT_kwDOAbcdef12345",
+		isResolved: false,
+		comments: {
+			nodes: [{ databaseId: 2876543210, author: { login: "bot" } }],
+		},
+		...over,
+	});
+
+	test("parseReviewThreads reads a documented page and skips malformed nodes", () => {
+		expect(
+			parseReviewThreads(
+				envelope([
+					node(),
+					// Malformed nodes drop out whole; their shape never throws.
+					node({ id: "" }),
+					node({ isResolved: "no" }),
+					null,
+					7,
+					// No first comment: nulls, not a skip.
+					node({ comments: { nodes: [] } }),
+					// An unusable databaseId or login nulls its field alone.
+					node({
+						comments: {
+							nodes: [{ databaseId: "x", author: { login: "bot" } }],
+						},
+					}),
+					node({
+						comments: {
+							nodes: [{ databaseId: 2876543210, author: { login: "" } }],
+						},
+					}),
+				]),
+			),
+		).toEqual([
+			{
+				id: "PRRT_kwDOAbcdef12345",
+				isResolved: false,
+				firstCommentId: 2876543210,
+				authorLogin: "bot",
+			},
+			{
+				id: "PRRT_kwDOAbcdef12345",
+				isResolved: false,
+				firstCommentId: null,
+				authorLogin: null,
+			},
+			{
+				id: "PRRT_kwDOAbcdef12345",
+				isResolved: false,
+				firstCommentId: null,
+				authorLogin: "bot",
+			},
+			{
+				id: "PRRT_kwDOAbcdef12345",
+				isResolved: false,
+				firstCommentId: 2876543210,
+				authorLogin: null,
+			},
+		]);
+		// A shape miss anywhere in the envelope returns [].
+		expect(parseReviewThreads({ data: {} })).toEqual([]);
+		expect(parseReviewThreads("nope")).toEqual([]);
+		expect(parseReviewThreads(null)).toEqual([]);
+	});
+
+	test("threadsToResolve selects unresolved fixed threads the board posted itself", () => {
+		const threads: Array<{
+			id: string;
+			isResolved: boolean;
+			firstCommentId: number | null;
+			authorLogin: string | null;
+		}> = [
+			{ id: "t1", isResolved: false, firstCommentId: 9001, authorLogin: "bot" },
+			{
+				id: "t2",
+				isResolved: false,
+				firstCommentId: 9002,
+				authorLogin: "alice",
+			},
+			{ id: "t3", isResolved: true, firstCommentId: 9003, authorLogin: "bot" },
+			{ id: "t4", isResolved: false, firstCommentId: 9005, authorLogin: "bot" },
+			{ id: "t5", isResolved: false, firstCommentId: null, authorLogin: "bot" },
+			{ id: "t1", isResolved: false, firstCommentId: 9001, authorLogin: "bot" },
+		];
+		// t1 passes every gate; t2's author is a person, t3 is resolved, t4's first
+		// comment is not a fixed finding, t5 has no comment id, and the duplicate
+		// t1 dedupes out. Order follows the threads.
+		expect(threadsToResolve(threads, [9001, 9004], "bot")).toEqual(["t1"]);
+		expect(threadsToResolve(threads, [], "bot")).toEqual([]);
+		// No own login: the Post cannot prove it posted the comment, so nothing selects.
+		expect(threadsToResolve(threads, [9001], null)).toEqual([]);
 	});
 });

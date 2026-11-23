@@ -52,6 +52,8 @@ No agent runs over PR code. An agent turn in a checkout of the PR was the first 
 
 The earlier review gives a re-review its context: `fetchReReviewContext()` (in `src/prs.ts`) takes the row's `posted_head`/`posted_url`/`posted_login`/`reviewed_head` and the current head. It finds the board's posted review on GitHub by the `#pullrequestreview-<id>` fragment of `posted_url`, else by `commit_id` (last match wins). No `posted_head` means no earlier review: the run is a first review (step 6.2). Comments come from `repos/{repo}/issues/N/comments` and `repos/{repo}/pulls/N/comments` created strictly after the cutoff, each body capped at 4000 characters, sorted oldest first. The range diff is `repos/{repo}/compare/<earlierHead>...<head>` with the diff Accept header; the same head gives the empty range, any failure gives null. GitHub data is untrusted: malformed entries are skipped, never thrown on.
 
+The earlier review's inline findings carry a marker line `<!-- earlier finding <id> -->` with GitHub's comment id. The re-review system prompt tells the model to write one verdict line per marked finding before the final blocking verdict line: `<!-- earlier verdict: <id> fixed -->` or `<!-- earlier verdict: <id> open -->`. `parseEarlierVerdicts` (in `src/prInline.ts`) parses the answer as untrusted model output. An unknown id, a missing verdict, or a malformed line means the finding stays open. Exact fixed votes count only for known ids. The verdict lines never reach the saved draft or GitHub.
+
 - The reply route (`POST /api/projects/:project/tasks/:id/reply`) branches on a `pr_review` card before the needs-you gate: the route branches on the card's kind before it reads the state, so a parked PR review card never passes the normal reply path. A reply runs a new draft for the current head and the user's text goes in as the trusted maintainer note.
 - Route answers: unknown row or no GitHub repo gets 409 `not a PR review card`; a closed or merged PR gets 409 with the state; text outside 1–20000 characters gets 400 (images are refused, the note is text-only); a full daily cap gets 429 with the watcher's wording. Success returns 200 at once; the draft lands later and the save drops the card's read mark, so the updated card wears the `new` badge again.
 - `reviewNow` is an explicit request: it skips the one-draft-per-head and quiet gates, but refreshes the head from GitHub first (a move updates the row like the watcher's scan), refuses a cancelled card, applies the daily cap, and takes a cap slot like any run. Failures are logged, never thrown.
@@ -72,13 +74,14 @@ Each draft attempt of a `pr_review` card is one run. The watcher keeps the last 
 
 Each project has its own store, so the PR number is the key inside it.
 
-- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, posted_login TEXT, posted_event TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT`.
+- Table `pr_review`: `number INTEGER PRIMARY KEY, task_id TEXT, head TEXT NOT NULL, first_seen_at INTEGER NOT NULL, reviewed_head TEXT, posted_head TEXT, posted_url TEXT, posted_login TEXT, posted_event TEXT, state TEXT NOT NULL CHECK (state IN ('open','closed','merged')), draft INTEGER NOT NULL, title TEXT NOT NULL, post_error TEXT, fixed_threads TEXT`.
 - Table `pr_review_runs`: `id INTEGER PRIMARY KEY AUTOINCREMENT, number INTEGER NOT NULL, started_at INTEGER NOT NULL, head TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, blocking INTEGER NOT NULL DEFAULT 1`. Each row is one attempt. `done = 1` marks a saved draft, so the done rows are the history of reviewed heads. `blocking` says whether the run found blocking findings; the default 1 is fail-safe, so a database from an older build never reads as clean.
 - Both tables are in `SCHEMA` (`CREATE TABLE IF NOT EXISTS`), so an old database gets them on open.
 - `posted_event` is additive: DDL in `SCHEMA` plus the `PRAGMA table_info` migration in `ProjectStore.open` (the `posted_url` pattern). The column is null for every older row, and older builds never sent `REQUEST_CHANGES`, so null never hides one.
 - `setPrPostedUrl(number, url, login = null)` gains the optional event argument; `undefined` leaves the column untouched.
 - New store call `setPrPostError(number, error)` writes `post_error` only; `releasePrPost` stays the only writer that restores the head.
 - `savePrReview` keeps its explicit column list and never writes `posted_event`.
+- `fixed_threads` holds a JSON array of `{id, path, line}` for the reviewed head's re-review. `savePrDraft` writes the column and overwrites it on every draft save. `savePrReview` never writes it. The migration follows the `posted_url` pattern in `ProjectStore.open`, and the PostgreSQL schema ([postgres-backend.md](postgres-backend.md)) gains the same additive numbered step.
 - `savePrDraft({ run, number, head, draft, prompt, blocking })` runs in one transaction:
   - No card yet: create a card with kind `pr_review`, title `PR review: #N <title>`, topic `pr review`.
   - The card gets the draft as its `details` and a one-line summary. A card that exists gets the new prompt. `syncPrCard` then sets the card's stage and state (see "Card state").
@@ -124,6 +127,18 @@ A draft that nobody posted waits for the user, and a posted review waits for the
 - The Post button is disabled with a reason when the PR is closed or merged, when the head is already posted, or when no draft exists.
 - A `pr_review` card carries the unread `new` badge until the user opens its drawer, like an answered card. The read mark lives in the same server-side seen set (`/api/seen`); **Mark unread** puts the badge back. A re-review (a new head) rewrites the draft and drops the read mark, so the updated card wears the badge again.
 
+#### Resolve fixed threads
+
+- The Post click and the automatic post run the same step after the review posts.
+- When the draft has fixed findings and the row holds a `posted_login`, the board reads the PR's review threads with one GraphQL query (`REVIEW_THREADS_QUERY` in `src/prs.ts`). The query asks for `reviewThreads` with `isResolved` and the first comment's `databaseId` and `author.login`. It reads 100 threads per page and at most 5 pages.
+- A thread qualifies when it is not resolved. Its first comment's `databaseId` must be one of the draft's fixed finding ids. That comment's author login must equal the stored `posted_login`. Ottr sends the `resolveReviewThread` mutation (`RESOLVE_THREAD_MUTATION`) once per qualifying thread, with the thread id.
+- A thread that a person started, a thread already resolved, and the thread of a still-open finding get no call. Ottr never unresolves a thread and never replies on a thread.
+- A failed resolve does not fail the post. The error lands in `post_error` with the thread id, like a failed dismissal.
+- With no fixed findings or no stored `posted_login`, the board sends no GraphQL call.
+- The GitHub App path posts the query and the mutation to the GraphQL endpoint with the installation token. With no app token, the board token runs the same calls through `gh api graphql`. This uses the same identity choice as the review post and the dismissal.
+- The mutation needs the repository permission Contents: read and write on the GitHub App. Ottr's app token holds Pull requests: read and write, so a failed resolve shows the 403 in `post_error` until an admin grants Contents: write. The board token path works when the token user has push access.
+- `TaskView.prReview` gains `willResolve`: the draft's fixed findings while a post is pending, else an empty list. The drawer lists them above the Post button.
+
 ### Notifications and the comment watch
 
 The board marks PR review activity NEW and notifies. The project setting `prReviewNotify` (default `true`) controls the bell entries and the pushes. Project settings show a "PR review notifications" checkbox under "PR reviews". When it is off, the project makes no PR review bell entry and no push: no draft event, no update event, no comment event, and the watcher reads no comments. The badges and the board lanes work the same with the setting off.
@@ -168,7 +183,7 @@ The draft is one text. Inline comments are marked blocks in it, so the user edit
 - The system prompt tells the model to put a finding that belongs to diff lines into an inline block, with a suggestion fence for a concrete fix of exactly those lines, and to keep other findings in the summary.
 - Before `savePrDraft`, `fitDraftToDiff(draft, diff)` checks each block against the diff. GitHub accepts a comment only on a line that the diff shows (an added or context line) and a range only inside one hunk. A block that does not fit moves into the body as `` **`<path>:<line>`** `` and its text, so no finding is lost and the draft never fails the post for that reason. A user edit after the save is not checked: GitHub's error then shows as `post_error`.
 - The post sends each comment as `{ path, line, side: "RIGHT", body }`, plus `start_line` and `start_side: "RIGHT"` for a range.
-- A re-review keeps the earlier inline findings: when the posted review is found, `fetchReReviewContext` reads every page of `repos/{repo}/pulls/N/reviews/<id>/comments` (100 for each page, at most 30 pages) and appends each comment to the earlier review as an inline block. Ottr does not cut the body of an inline comment. An earlier review that does not fit `PROMPT_CHAR_BUDGET` takes the step 6.2 budget degrade: with the range diff dropped first and the earlier review still unfittable, the re-review runs like a first review. The comments list of the re-review skips comments of that review.
+- A re-review keeps the earlier inline findings: when the posted review is found, `fetchReReviewContext` reads every page of `repos/{repo}/pulls/N/reviews/<id>/comments` (100 for each page, at most 30 pages) and appends each comment to the earlier review as an inline block. Each earlier inline block carries the `<!-- earlier finding <id> -->` marker line. Ottr does not cut the body of an inline comment. An earlier review that does not fit `PROMPT_CHAR_BUDGET` takes the step 6.2 budget degrade: with the range diff dropped first and the earlier review still unfittable, the re-review runs like a first review. The comments list of the re-review skips comments of that review.
 - A failed read, invalid JSON, a body that is not a list, or more than 30 pages stops the re-review with an error. The watcher logs `review skipped`, rings the board notice of step 6.3, takes no cap slot, and a later tick tries again. The re-review never runs without the earlier inline findings when their fetch fails; a budget-oversized earlier review takes the step 6.2 degrade instead.
 - The drawer shows the number of inline comments in the draft under the text box and explains the marker format.
 
@@ -190,7 +205,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 - The only GitHub writes are the Post click and, with `prReviewManualPost` off, the watcher's automatic post of a finished draft ([pr-review-auto-post.md](pr-review-auto-post.md)); both run the same post path. Every other watcher step reads only.
 - No agent runs over PR code. The model gets the PR only as data and has no tools.
 - The event is `COMMENT` by default, `APPROVE` when `prReviewApprove` is on and the draft's run found no blocking findings, and `REQUEST_CHANGES` when `prReviewRequestChanges` is on and the run found blocking findings. With both settings on, a blocking draft sends `REQUEST_CHANGES` and a clean draft sends `APPROVE`.
-- Only the PR review post uses the GitHub App. Merge pushes, releases and CI reads keep the board token.
+- Only the PR review post uses the GitHub App. The re-review's thread read and the resolve calls for fixed threads use the same identity choice as the post. Merge pushes, releases and CI reads keep the board token.
 - Schema changes are additive only.
 
 ## Acceptance checks
@@ -215,6 +230,12 @@ A deterministic scan looks for two classic performance defects in the added diff
 - With `prReviewRequestChanges` on and a blocking run, the Post sends exactly POST `repos/{owner}/{repo}/pulls/N/reviews` with event `REQUEST_CHANGES`; with the setting off it sends `COMMENT`. With both settings on, blocking sends `REQUEST_CHANGES` and clean sends `APPROVE`.
 - A 422 refusal of the `REQUEST_CHANGES` attempt retries once as `COMMENT`, the response carries `changesSkipped`, and `post_error` notes the reason. A non-422 failure of the `REQUEST_CHANGES` attempt stays a 502 on both paths and releases the claim.
 - A later clean `COMMENT` post sends the exact dismissal request for the earlier review id: PUT `repos/{owner}/{repo}/pulls/N/reviews/<id>/dismissals`, the id from the `posted_url` fragment. A blocking `COMMENT` post sends no dismissal. A failed dismissal keeps the post and records the error in `post_error`.
+- A re-review answer with one exact fixed verdict on a known id saves the finding in `fixed_threads`. An unknown id, a missing verdict, or a malformed line stays open.
+- The Post resolves exactly the qualifying threads: one `resolveReviewThread` mutation per thread with the right thread id. A person thread, a resolved thread, and an open finding's thread get no call.
+- A failed resolve keeps the posted review and records the error in `post_error`.
+- The GraphQL query and mutation strings match `REVIEW_THREADS_QUERY` and `RESOLVE_THREAD_MUTATION` exactly.
+- With no fixed findings or no stored login, the post sends no GraphQL call.
+- The drawer lists the threads the post will resolve before the click.
 - A verdict line quoted into an inline comment stays in the comment, never votes, and cannot clear a trailing verdict. The verdict is honored only as the draft's last non-blank plain line; a second plain verdict line, any content after the verdict (block content included), or a block with no close marker counts as blocking.
 - A model answer of only the verdict line saves no draft: the empty-answer rule stops the review and a later tick retries the head.
 - When GitHub refuses the approve review with 422, the post retries once with event `COMMENT` and the same body, succeeds, and its response carries `approveSkipped`; the `gh` fallback detects the refusal by the `422` status or GitHub's self-approve message in stderr. A non-422 failure of the `APPROVE` attempt (a 5xx, a 403) stays a 502 on both paths, releases the claim, and sends no second review; a refused `COMMENT` stays a 502 and releases the claim.
@@ -248,3 +269,4 @@ A deterministic scan looks for two classic performance defects in the added diff
 - The comment watch starts no re-review and no model call; it reads only.
 - Comments on closed or merged PRs, and comment bodies as stored data.
 - The performance lens runs only in the PR review flow. The board's Review-button and release reviews (whole-repo agent turns) have no label surface and are out of scope. The lens never blocks or fails a review; it only adds candidates.
+- No reply comments on review threads, no unresolve, and no change to how the review writes findings. This change adds no GitHub App permission. The mutation needs Contents: read and write; an admin grants it on GitHub, not in this repository.

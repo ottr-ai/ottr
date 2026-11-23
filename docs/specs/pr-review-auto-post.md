@@ -44,6 +44,8 @@ watcher, the draft runs, the Post route, and the store details.
   4. Parse the result, dismiss a superseded request-changes review, store
      `posted_url`/`posted_login`/`posted_event`, baseline the comment watch,
      and call `syncPrCard`. While the PR stays open, the card leaves `needs_you` for the posted wait (`in_progress/idle`, reason `PR_REVIEW_POSTED`); a close or merge during the post lands it at `done/idle`.
+     The post also resolves the fixed findings' review threads (see
+     "Resolve fixed threads" in [pr-reviews.md](pr-reviews.md)).
 - One post per head. The claim decides: a second run for the same head loses
   the claim and posts nothing. The one-draft-per-head review gate already
   keeps the watcher from re-reviewing a posted head.

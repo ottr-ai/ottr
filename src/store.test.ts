@@ -5385,6 +5385,7 @@ describe("pr review store methods", () => {
 		draft: false,
 		title: "Fix the thing",
 		postError: null,
+		fixedThreads: [],
 		commentsAt: null,
 		commentsUnseen: false,
 	};
@@ -5743,6 +5744,7 @@ describe("pr review store methods", () => {
 			postedLogin: null,
 			postedEvent: null,
 			postedVia: null,
+			fixedThreads: [],
 		});
 		await store.setPrPostedUrl(7, null, "octocat");
 		expect((await store.getPrReview(7))?.postedLogin).toBe("octocat");
@@ -7911,6 +7913,7 @@ describe("async store serial operations", () => {
 			draft: false,
 			title: "PR",
 			postError: null,
+			fixedThreads: [],
 			commentsAt: null,
 			commentsUnseen: false,
 		});

@@ -9563,6 +9563,10 @@ export function PrReviewSection({
 	);
 	const inlineCount = parseReviewDraft(body).comments.length;
 	const shownError = error ?? pr.postError;
+	// The threads the Post click will resolve: the draft's fixed findings, shown
+	// only while the Post is allowed (docs/specs/pr-reviews.md "Resolve fixed threads").
+	const willResolve = blocked === null ? (pr.willResolve ?? []) : [];
+	const resolveCount = willResolve.length;
 	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
 	// "Draft runs"). The run record alone drives the result: an in-flight run shows
 	// the spinner line (asked or watcher-run), a clean end names the draft ready,
@@ -9610,6 +9614,11 @@ export function PrReviewSection({
 					line. A <code>suggestion</code> code block in a comment proposes a
 					change.
 				</p>
+				{resolveCount > 0 && (
+					<p className="dim pr-resolve-hint">
+						{`Posting will resolve ${resolveCount} fixed-finding thread${resolveCount === 1 ? "" : "s"}: ${willResolve.map((f) => `${f.path}:${f.line}`).join(", ")}`}
+					</p>
+				)}
 				<div className="reply-actions">
 					{blocked !== null && (
 						<span className="dim">

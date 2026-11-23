@@ -100,7 +100,11 @@ import {
 	WORK_CHECK_MAX_SENDBACKS,
 	WORK_CHECK_SENDBACK_OPENING,
 } from "./prompts.ts";
-import { PR_GATES } from "./prs.ts";
+import {
+	PR_GATES,
+	RESOLVE_THREAD_MUTATION,
+	REVIEW_THREADS_QUERY,
+} from "./prs.ts";
 import { forModel, tightestFor, usageReset } from "./quota.ts";
 import { createRunSink } from "./runner.ts";
 import { RunTokens } from "./runTokens.ts";
@@ -16339,6 +16343,7 @@ describe("web push (R1-1, R2-3)", () => {
 			draft: false,
 			title: "Fix it",
 			postError: null,
+			fixedThreads: [],
 			commentsAt: null,
 			commentsUnseen: false,
 		});
@@ -16435,6 +16440,7 @@ describe("web push (R1-1, R2-3)", () => {
 			draft: false,
 			title: "Fix it",
 			postError: null,
+			fixedThreads: [],
 			commentsAt: null,
 			commentsUnseen: false,
 		});
@@ -16496,6 +16502,7 @@ describe("web push (R1-1, R2-3)", () => {
 			draft: false,
 			title: "Fix it",
 			postError: null,
+			fixedThreads: [],
 			commentsAt: null,
 			commentsUnseen: false,
 		});
@@ -17898,6 +17905,7 @@ describe("read marks (/api/seen)", () => {
 			draft: false,
 			title: "Fix it",
 			postError: null,
+			fixedThreads: [],
 			commentsAt: null,
 			commentsUnseen: false,
 		});
@@ -19808,6 +19816,18 @@ describe(
 		const ghPayloads: unknown[] = [];
 		const ghInputFiles: string[] = [];
 		let ghResult = { code: 0, stdout: "{}", stderr: "" };
+		/** OTTR-1223: the canned answer for the `gh api graphql` calls a fixed-finding
+		 *  resolve makes; null falls through to ghResult like the other unstubbed calls. */
+		let graphqlAnswer:
+			| ((args: string[]) => { code: number; stdout: string; stderr: string })
+			| null = null;
+		/** The model answer a re-review reads; swappable so the verdict tests can feed
+		 *  malformed verdict lines. */
+		let prAnswer = "## Re-review\nfresh look";
+		/** OTTR-1223: the earlier review and its inline comments a re-review reads;
+		 *  swappable per test, empty by default. */
+		let earlierReviewsAnswer: unknown = [];
+		let earlierInlineAnswer: unknown = [];
 		/** Runs inside the fake gh call, after the route's checks: a race window for tests. */
 		let ghHook: (() => Promise<void>) | null = null;
 		/** GitHub App fetch stub, swappable per test; the mount closes over this indirection. */
@@ -19839,10 +19859,28 @@ describe(
 				};
 			}
 			const empty =
-				/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)$/.test(
+				/^repos\/acme\/widget\/(pulls\/\d+\/(reviews|comments)|issues\/\d+\/comments)(\?.*)?$/.test(
 					path,
 				);
 			if (empty) return { code: 0, stdout: "[]", stderr: "" };
+			// OTTR-1223: the earlier posted review and its inline comments, the re-review's
+			// verdict keys; both swappable per test, empty by default.
+			if (/^repos\/acme\/widget\/pulls\/\d+\/reviews\?per_page=100$/.test(path))
+				return {
+					code: 0,
+					stdout: JSON.stringify(earlierReviewsAnswer),
+					stderr: "",
+				};
+			if (
+				/^repos\/acme\/widget\/pulls\/\d+\/reviews\/\d+\/comments\?per_page=100&page=1$/.test(
+					path,
+				)
+			)
+				return {
+					code: 0,
+					stdout: JSON.stringify(earlierInlineAnswer),
+					stderr: "",
+				};
 			if (
 				/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
 					path,
@@ -19871,6 +19909,10 @@ describe(
 					ghPayloads.push(JSON.parse(readFileSync(file, "utf8")));
 				}
 				await ghHook?.();
+				// OTTR-1223: a fixed-finding resolve's read and mutations answer here,
+				// before the unstubbed calls fall to ghResult.
+				if (args[1] === "graphql" && graphqlAnswer !== null)
+					return graphqlAnswer(args);
 				// The read-only GET routes a re-review fetches get canned answers; everything
 				// else (diffs, review POSTs) keeps the ghResult flow.
 				const stubbed = await prApiStub(args);
@@ -19886,7 +19928,7 @@ describe(
 							id: 1,
 							status: 200,
 							body: {
-								choices: [{ message: { content: "## Re-review\nfresh look" } }],
+								choices: [{ message: { content: prAnswer } }],
 							},
 						}),
 					].join("\n"),
@@ -19904,12 +19946,14 @@ describe(
 			return r;
 		};
 		/** Saves a draft for PR `n` at `head` as the watcher does; `answered: false` leaves no draft,
-		 *  `blocking: false` records a run with no blocking findings. */
+		 *  `blocking: false` records a run with no blocking findings, `fixed` seeds the draft's
+		 *  fixed findings the Post resolves. */
 		const reviewed = async (
 			n: number,
 			head: string,
 			answered = true,
 			blocking = true,
+			fixed: PrReviewRow["fixedThreads"] = [],
 		): Promise<Task> => {
 			const prev = await prStore.getPrReview(n);
 			await prStore.savePrReview({
@@ -19927,6 +19971,7 @@ describe(
 				draft: false,
 				title: "Fix it",
 				postError: null,
+				fixedThreads: prev?.fixedThreads ?? [],
 				commentsAt: null,
 				commentsUnseen: false,
 			});
@@ -19937,6 +19982,7 @@ describe(
 				draft: "draft",
 				prompt: "review",
 				blocking,
+				fixedThreads: fixed,
 			});
 			if (!answered) await prStore.updateTask(t.id, { details: null });
 			return t;
@@ -19947,6 +19993,57 @@ describe(
 				head: (await prStore.getPrReviewByTask(id))?.reviewedHead,
 				...body,
 			});
+		/** Seeds PR `n` with an earlier posted review (head 0*40, login ottr[bot]) and a
+		 *  draft whose fixed findings the Post must resolve. */
+		const reviewedWithFixed = async (
+			n: number,
+			fixed: PrReviewRow["fixedThreads"],
+		): Promise<Task> => {
+			await prStore.savePrReview({
+				number: n,
+				taskId: null,
+				head: H1,
+				firstSeenAt: 0,
+				reviewedHead: null,
+				postedHead: "0".repeat(40),
+				postedUrl: `https://github.com/acme/widget/pull/${n}#pullrequestreview-555`,
+				postedLogin: "ottr[bot]",
+				postedEvent: "REQUEST_CHANGES",
+				postedVia: "user",
+				state: "open",
+				draft: false,
+				title: "Fix it",
+				postError: null,
+				fixedThreads: [],
+				commentsAt: null,
+				commentsUnseen: false,
+			});
+			return await reviewed(n, H1, true, true, fixed);
+		};
+		/** One reviewThreads page in GitHub's documented envelope; each row is
+		 *  [thread id, first comment's databaseId, first comment author, isResolved]. */
+		const threadsPage = (
+			rows: Array<[string, number, string, boolean]>,
+		): Record<string, unknown> => ({
+			data: {
+				repository: {
+					pullRequest: {
+						reviewThreads: {
+							pageInfo: { hasNextPage: false, endCursor: null },
+							nodes: rows.map(([id, commentId, login, resolved]) => ({
+								id,
+								isResolved: resolved,
+								comments: {
+									nodes: [{ databaseId: commentId, author: { login } }],
+								},
+							})),
+						},
+					},
+				},
+			},
+		});
+		/** The `gh api graphql` calls a post made, in order. */
+		const graphqlCalls = () => ghCalls.filter((a) => a[1] === "graphql");
 		const expectedArgv = (n: number) => [
 			"api",
 			`repos/acme/widget/pulls/${n}/reviews`,
@@ -20011,6 +20108,11 @@ describe(
 			const replyPrompts: string[] = [];
 			/** Flipped by the failing-model test; the canned gateway exits nonzero once. */
 			let replyFailGateway = false;
+			/** Canned answers for the posted-review reads a re-review fetches; swappable per test. */
+			let replyReviewsAnswer: unknown = [];
+			let replyInlineAnswer: unknown = [];
+			/** The model answer the next reply run reads; null keeps the default. */
+			let replyAnswer: string | null = null;
 			/** Same canned read-only GETs as prApiStub, but against the fresh store. */
 			const replyApiStub = async (
 				args: string[],
@@ -20035,6 +20137,22 @@ describe(
 						path,
 					);
 				if (empty) return { code: 0, stdout: "[]", stderr: "" };
+				if (/^repos\/acme\/widget\/pulls\/\d+\/reviews\?per_page=100$/.test(path))
+					return {
+						code: 0,
+						stdout: JSON.stringify(replyReviewsAnswer),
+						stderr: "",
+					};
+				if (
+					/^repos\/acme\/widget\/pulls\/\d+\/reviews\/\d+\/comments\?per_page=100&page=1$/.test(
+						path,
+					)
+				)
+					return {
+						code: 0,
+						stdout: JSON.stringify(replyInlineAnswer),
+						stderr: "",
+					};
 				if (
 					/^repos\/acme\/widget\/compare\/[0-9a-f]{40}\.\.\.[0-9a-f]{40}$/.test(
 						path,
@@ -20064,7 +20182,11 @@ describe(
 								status: 200,
 								body: {
 									choices: [
-										{ message: { content: "## Re-review\nfresh look" } },
+										{
+											message: {
+												content: replyAnswer ?? "## Re-review\nfresh look",
+											},
+										},
 									],
 								},
 							}),
@@ -20099,6 +20221,7 @@ describe(
 					draft: false,
 					title: "Fix it",
 					postError: null,
+					fixedThreads: prev?.fixedThreads ?? [],
 					commentsAt: null,
 					commentsUnseen: false,
 				});
@@ -20200,6 +20323,69 @@ describe(
 					expect(row!.prRun!.error).toContain("gateway exited with code 1");
 				});
 
+				test("a malformed re-review verdict saves no fixed findings", async () => {
+					// The earlier posted review and its one inline finding: the keys a verdict votes on.
+					await replyStore.savePrReview({
+						number: 37,
+						taskId: null,
+						head: H1,
+						firstSeenAt: 0,
+						reviewedHead: null,
+						postedHead: "0".repeat(40),
+						postedUrl:
+							"https://github.com/acme/widget/pull/37#pullrequestreview-555",
+						postedLogin: "ottr[bot]",
+						postedEvent: "REQUEST_CHANGES",
+						postedVia: "user",
+						state: "open",
+						draft: false,
+						title: "Fix it",
+						postError: null,
+						fixedThreads: [],
+						commentsAt: null,
+						commentsUnseen: false,
+					});
+					replyReviewsAnswer = [
+						{
+							id: 555,
+							body: "## Earlier review\nfound a bug",
+							commit_id: "0".repeat(40),
+							submitted_at: "2026-01-01T00:00:00Z",
+							user: { login: "ottr[bot]" },
+						},
+					];
+					replyInlineAnswer = [
+						{
+							id: 9001,
+							path: "src/a.ts",
+							line: 12,
+							body: "<!-- inline src/a.ts:12 -->\nThis can be null.\n<!-- /inline -->",
+						},
+					];
+					// The fixture run sits 25 h back, like the neighbors: the reply itself
+					// stays the only in-window attempt of this test.
+					const t = await replyReviewed(37, H1, Date.now() - 25 * 3_600_000);
+					// Both verdict lines fail safe: a bad id, and an id outside the earlier findings.
+					replyAnswer = [
+						"## Re-review",
+						"still there.",
+						"<!-- earlier verdict: abc fixed -->",
+						"<!-- earlier verdict: 424242 fixed -->",
+						"<!-- blocking: no -->",
+					].join("\n");
+					const res = await reply(t.id, { text: "recheck" });
+					expect(res.status).toBe(200);
+					await rm.app.prReviewIdle();
+					expect((await replyRow(37)).fixedThreads).toEqual([]);
+					// The verdict-shaped lines come out of the draft, so none reaches GitHub.
+					expect((await replyStore.getTask(t.id))!.details ?? "").not.toContain(
+						"earlier verdict",
+					);
+					replyAnswer = null;
+					replyReviewsAnswer = [];
+					replyInlineAnswer = [];
+				});
+
 				test("a pr_review reply respects the daily cap", async () => {
 					const t = await replyReviewed(31, H1);
 					const promptsBefore = replyPrompts.length;
@@ -20261,6 +20447,10 @@ describe(
 				ghInputFiles.length = 0;
 				ghResult = { code: 0, stdout: "{}", stderr: "" };
 				ghHook = null;
+				graphqlAnswer = null;
+				prAnswer = "## Re-review\nfresh look";
+				earlierReviewsAnswer = [];
+				earlierInlineAnswer = [];
 				appCalls.length = 0;
 				appFetchImpl = async () => new Response("{}", { status: 404 });
 			});
@@ -20844,7 +21034,143 @@ describe(
 					postedLogin: null,
 					postError: null,
 					run: null,
+					willResolve: [],
 				});
+			});
+
+			// --- OTTR-1223: a post of a draft with fixed findings resolves exactly those
+			// findings' review threads, over the same transport the post rode; a failure
+			// lands in post_error and never fails the post itself.
+			test("one fixed bot finding resolves exactly its thread", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(80, [
+					{ id: 9001, path: "src/a.ts", line: 12 },
+				]);
+				graphqlAnswer = () => ({
+					code: 0,
+					stdout: JSON.stringify(
+						threadsPage([
+							["RT1", 9001, "ottr[bot]", false],
+							["RT2", 9001, "person", false],
+							["RT3", 9001, "ottr[bot]", true],
+							["RT4", 9099, "ottr[bot]", false],
+						]),
+					),
+					stderr: "",
+				});
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect(graphqlCalls()).toEqual([
+					[
+						"api",
+						"graphql",
+						"-f",
+						`query=${REVIEW_THREADS_QUERY}`,
+						"-f",
+						"owner=acme",
+						"-f",
+						"name=widget",
+						"-F",
+						"number=80",
+					],
+					[
+						"api",
+						"graphql",
+						"-f",
+						`query=${RESOLVE_THREAD_MUTATION}`,
+						"-f",
+						"threadId=RT1",
+					],
+				]);
+				// The person-opened thread, the already resolved thread, and the thread of
+				// the still open finding never resolve.
+				const argv = JSON.stringify(graphqlCalls());
+				expect(argv).not.toContain("RT2");
+				expect(argv).not.toContain("RT3");
+				expect(argv).not.toContain("RT4");
+				expect((await row(80)).postError).toBeNull();
+			});
+
+			test("a failed resolve still posts and records the error", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(81, [
+					{ id: 9001, path: "src/a.ts", line: 12 },
+				]);
+				// The read succeeds, the resolve mutation exits nonzero.
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? { code: 1, stdout: "", stderr: "HTTP 500: resolve exploded" }
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([["RT7", 9001, "ottr[bot]", false]]),
+								),
+								stderr: "",
+							};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect(await res.json()).toMatchObject({ ok: true, via: "token" });
+				// The post itself stands: the head is posted, only post_error carries the failure.
+				expect((await row(81)).postedHead).toBe(H1);
+				const view = (await (
+					await m.call(`/api/projects/pg/tasks/${t.id}`)
+				).json()) as { prReview?: { postError: string | null } };
+				expect(view.prReview?.postError).toContain("thread RT7");
+			});
+
+			test("an empty fixed list sends no GraphQL read or resolve", async () => {
+				await removeApp();
+				// No stored fixed findings: the post resolves nothing and reads no threads.
+				const t = await reviewed(82, H1);
+				graphqlAnswer = () => ({
+					code: 0,
+					stdout: JSON.stringify(
+						threadsPage([["RT9", 9001, "ottr[bot]", false]]),
+					),
+					stderr: "",
+				});
+				const post = await postReview(t.id, { body: "Looks good." });
+				expect(post.status).toBe(200);
+				expect(graphqlCalls()).toEqual([]);
+			});
+
+			test("the thread read and resolve carry the exact GraphQL shapes", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(83, [
+					{ id: 9002, path: "src/b.ts", line: 30 },
+				]);
+				// The read fixture copies GitHub's documented reviewThreads envelope.
+				graphqlAnswer = () => ({
+					code: 0,
+					stdout: JSON.stringify(
+						threadsPage([["RT_abc123", 9002, "ottr[bot]", false]]),
+					),
+					stderr: "",
+				});
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				const graphql = graphqlCalls();
+				expect(graphql).toHaveLength(2);
+				expect(graphql[0]).toEqual([
+					"api",
+					"graphql",
+					"-f",
+					`query=${REVIEW_THREADS_QUERY}`,
+					"-f",
+					"owner=acme",
+					"-f",
+					"name=widget",
+					"-F",
+					"number=83",
+				]);
+				expect(graphql[1]).toEqual([
+					"api",
+					"graphql",
+					"-f",
+					`query=${RESOLVE_THREAD_MUTATION}`,
+					"-f",
+					"threadId=RT_abc123",
+				]);
 			});
 
 			// --- Reply asks for a new draft (OTTR-565): the note runs reviewNow for the current
@@ -22183,6 +22509,7 @@ describe("PR review auto-post routes", () => {
 				draft: false,
 				title: "Fix it",
 				postError: null,
+				fixedThreads: [],
 				commentsAt: null,
 				commentsUnseen: false,
 			});

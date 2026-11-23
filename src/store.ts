@@ -58,6 +58,7 @@ import type {
 	AskQuestion,
 	DiffFileStat,
 	DupGateStamp,
+	FixedThread,
 	ForkBranchState,
 	ForkHoldState,
 	GateAssumption,
@@ -266,7 +267,8 @@ CREATE TABLE IF NOT EXISTS pr_review (
   title TEXT NOT NULL,
   post_error TEXT,
   comments_at INTEGER,
-  comments_unseen INTEGER NOT NULL DEFAULT 0
+  comments_unseen INTEGER NOT NULL DEFAULT 0,
+  fixed_threads TEXT
 );
 ${PR_REVIEW_RUNS_DDL};
 CREATE INDEX IF NOT EXISTS idx_pr_review_runs_at ON pr_review_runs (started_at);
@@ -521,6 +523,7 @@ interface PrReviewDbRow {
 	post_error: string | null;
 	comments_at: number | null;
 	comments_unseen: number;
+	fixed_threads: string | null;
 }
 
 function toPrReview(r: PrReviewDbRow): PrReviewRow {
@@ -539,9 +542,43 @@ function toPrReview(r: PrReviewDbRow): PrReviewRow {
 		draft: r.draft !== 0,
 		title: r.title,
 		postError: r.post_error,
+		fixedThreads: parseFixedThreads(r.fixed_threads),
 		commentsAt: r.comments_at,
 		commentsUnseen: r.comments_unseen !== 0,
 	};
+}
+
+/** The stored fixed-finding verdicts, as untrusted JSON: a malformed shape gives []. */
+function parseFixedThreads(raw: string | null | undefined): FixedThread[] {
+	if (raw === null || raw === undefined) return [];
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	if (!Array.isArray(parsed)) return [];
+	const threads: FixedThread[] = [];
+	for (const entry of parsed.slice(0, 200)) {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry))
+			continue;
+		const { id, path, line } = entry as Record<string, unknown>;
+		if (
+			typeof id !== "number" ||
+			!Number.isSafeInteger(id) ||
+			id <= 0 ||
+			typeof path !== "string" ||
+			path === "" ||
+			path.length > 1000 ||
+			path.includes("\n") ||
+			typeof line !== "number" ||
+			!Number.isSafeInteger(line) ||
+			line <= 0
+		)
+			continue;
+		threads.push({ id, path, line });
+	}
+	return threads;
 }
 
 /** One code_scan_alert row: one open GitHub code scanning alert, grouped onto its rule's card (OTTR-1087). */
@@ -2816,6 +2853,15 @@ export class ProjectStore {
 					"comments_unseen",
 					"ALTER TABLE pr_review ADD COLUMN comments_unseen INTEGER NOT NULL DEFAULT 0",
 				);
+				// The fixed-finding verdicts landed with the re-review's thread resolution
+				// (docs/specs/pr-reviews.md "Resolve fixed threads"): same additive convergence;
+				// null reads as "no re-review verdicts", the state of every older row.
+				await ProjectStore.addColumn(
+					db,
+					prCols,
+					"fixed_threads",
+					"ALTER TABLE pr_review ADD COLUMN fixed_threads TEXT",
+				);
 				// pr_review_runs changed shape twice inside the first pr_review releases (head, then
 				// id/done) and CREATE TABLE IF NOT EXISTS never updates a live table, so startPrRun,
 				// prHeadReviewed and the done update then throw "no such column" and the watcher
@@ -4251,6 +4297,8 @@ export class ProjectStore {
 	 * details (or updates the existing card), marks `head` reviewed and the run done, then
 	 * lets syncPrCard place the card. It runs after the model call, so it writes only its
 	 * own columns of the live row.
+	 * The fixed-finding verdicts always overwrite the stored ones, so a new draft never
+	 * inherits the previous draft's verdicts.
 	 */
 	async savePrDraft(o: {
 		run: number;
@@ -4259,6 +4307,7 @@ export class ProjectStore {
 		draft: string;
 		prompt: string;
 		blocking: boolean;
+		fixedThreads?: Array<{ id: number; path: string; line: number }>;
 	}): Promise<Task> {
 		return this.queue.transaction(async () => {
 			let cardId = "";
@@ -4286,8 +4335,8 @@ export class ProjectStore {
 				});
 				cardId = card.id;
 				await this.db.run(
-					"UPDATE pr_review SET task_id = ?, reviewed_head = ?, post_error = NULL WHERE number = ?",
-					[card.id, o.head, o.number],
+					"UPDATE pr_review SET task_id = ?, reviewed_head = ?, fixed_threads = ?, post_error = NULL WHERE number = ?",
+					[card.id, o.head, JSON.stringify(o.fixedThreads ?? []), o.number],
 				);
 				await this.db.run(
 					"UPDATE pr_review_runs SET done = 1, blocking = ? WHERE id = ?",

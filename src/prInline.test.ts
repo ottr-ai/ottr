@@ -4,6 +4,7 @@ import {
 	formatInlineComment,
 	type InlineComment,
 	parseBlockingVerdict,
+	parseEarlierVerdicts,
 	parseReviewDraft,
 	reviewPayloadComments,
 } from "./prInline.ts";
@@ -218,6 +219,97 @@ describe("parseBlockingVerdict", () => {
 		].join("\n");
 		expect(parseBlockingVerdict(text)).toEqual({
 			text: "Summary.\n<!-- inline a.ts:2 -->\nFix it.\n<!-- /inline -->",
+			blocking: false,
+		});
+	});
+});
+
+describe("parseEarlierVerdicts", () => {
+	const first = { id: 9001, path: "src/a.ts", line: 2 };
+	const second = { id: 9002, path: "src/b.ts", line: 9 };
+	const known = [first, second];
+
+	test("an exact fixed vote on a known id marks it fixed and strips the line", () => {
+		expect(
+			parseEarlierVerdicts(
+				"Body.\n<!-- earlier verdict: 9001 fixed -->\nAfter.",
+				known,
+			),
+		).toEqual({ text: "Body.\nAfter.", fixed: [first] });
+	});
+
+	test("an exact open vote strips the line and fixes nothing", () => {
+		expect(
+			parseEarlierVerdicts("Body.\n<!-- earlier verdict: 9001 open -->", known),
+		).toEqual({ text: "Body.", fixed: [] });
+	});
+
+	test("a vote for an unknown id is stripped but never counts", () => {
+		expect(
+			parseEarlierVerdicts(
+				"Body.\n<!-- earlier verdict: 9999 fixed -->",
+				known,
+			),
+		).toEqual({ text: "Body.", fixed: [] });
+	});
+
+	test("malformed verdict-ish lines are stripped without a vote, and never throw", () => {
+		// Every line of the verdict shape comes out, whatever its payload: a bad id,
+		// a bad vote word, zero, or digits past the safe integers never vote. A line
+		// without the closing --> is not verdict-shaped and stays byte-identical.
+		const text = [
+			"Body.",
+			"<!-- earlier verdict: abc fixed -->",
+			"<!-- earlier verdict: 9001 maybe -->",
+			"<!-- earlier verdict: 0 fixed -->",
+			"<!-- earlier verdict: 99999999999999999999999 fixed -->",
+			"<!-- earlier verdict: 9002 fixed",
+		].join("\n");
+		expect(parseEarlierVerdicts(text, known)).toEqual({
+			text: "Body.\n<!-- earlier verdict: 9002 fixed",
+			fixed: [],
+		});
+	});
+
+	test("a verdict line inside an inline block stays byte-identical and never votes", () => {
+		// The block body is comment content: a verdict line quoted there keeps its
+		// text and can never mark a finding fixed.
+		const text =
+			"<!-- inline a.ts:2 -->\nQuoted: <!-- earlier verdict: 9001 fixed -->\n<!-- /inline -->";
+		expect(parseEarlierVerdicts(text, known)).toEqual({ text, fixed: [] });
+		expect(parseReviewDraft(text).comments[0]?.body).toContain(
+			"<!-- earlier verdict: 9001 fixed -->",
+		);
+	});
+
+	test("contradictory votes on one id fail safe to open", () => {
+		expect(
+			parseEarlierVerdicts(
+				"<!-- earlier verdict: 9001 fixed -->\n<!-- earlier verdict: 9001 open -->",
+				known,
+			),
+		).toEqual({ text: "", fixed: [] });
+	});
+
+	test("other lines stay byte-identical when no verdict line exists", () => {
+		const text =
+			"Summary.\n\n<!-- inline src/a.ts:2 -->\nFix it.\n<!-- /inline -->\n<!-- blocking: yes -->";
+		expect(parseEarlierVerdicts(text, known)).toEqual({ text, fixed: [] });
+	});
+
+	test("stripping first lets parseBlockingVerdict honor a trailing blocking line", () => {
+		// The composed flow: the earlier verdict lines come out, so the blocking
+		// verdict after them is the last non-blank line and decides.
+		const draft = [
+			"## Summary",
+			"<!-- earlier verdict: 9001 fixed -->",
+			"<!-- earlier verdict: 9002 open -->",
+			"<!-- blocking: no -->",
+		].join("\n");
+		const { text, fixed } = parseEarlierVerdicts(draft, known);
+		expect(fixed).toEqual([first]);
+		expect(parseBlockingVerdict(text)).toEqual({
+			text: "## Summary",
 			blocking: false,
 		});
 	});

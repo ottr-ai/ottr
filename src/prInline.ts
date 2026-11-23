@@ -148,6 +148,58 @@ export function parseBlockingVerdict(text: string): {
 	return { text: lines.join("\n"), blocking };
 }
 
+/** The model's verdict lines for the earlier inline findings of a re-review (docs/specs/pr-reviews.md
+ *  "Resolve fixed threads"). A verdict line is a whole plain line — outside every inline block —
+ *  whose trimmed text is exactly `<!-- earlier verdict: <id> fixed -->` or `<!-- earlier verdict:
+ *  <id> open -->`, with the digits of a positive safe integer; block tracking mirrors
+ *  parseBlockingVerdict, so a line inside a closed marked block is comment content that never
+ *  votes and is never stripped. `known` holds the earlier findings the earlier review marked: an
+ *  id outside it never counts. A finding is fixed only when at least one exact `fixed` vote names
+ *  it and no exact `open` vote does; anything else (none, an unknown id, a bad id, both votes)
+ *  fails safe to open. Every verdict-shaped line comes out of the text — also a malformed
+ *  lookalike, so nothing of that shape can reach GitHub. Block bodies and all other lines stay
+ *  byte-identical. Total: never throws. */
+export function parseEarlierVerdicts(
+	text: string,
+	known: Array<{ id: number; path: string; line: number }>,
+): {
+	text: string;
+	fixed: Array<{ id: number; path: string; line: number }>;
+} {
+	const lines = text.split(/\r\n|\r|\n/);
+	// Block tracking exactly as in parseBlockingVerdict: openMarker trims, CLOSE
+	// matches after trim, and an unclosed block keeps swallowing lines.
+	let open = false;
+	const VOTE = /^<!-- earlier verdict: (\d+) (fixed|open) -->$/;
+	const fixedIds = new Set<number>();
+	const openIds = new Set<number>();
+	const stripped: number[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		const t = line.trim();
+		if (!open && openMarker(line) !== null) {
+			open = true;
+			continue;
+		}
+		if (open) {
+			if (t === CLOSE) open = false;
+			continue;
+		}
+		if (t.startsWith("<!-- earlier verdict:") && t.endsWith("-->")) {
+			stripped.push(i);
+			const m = VOTE.exec(t);
+			const id = m === null ? null : lineNumber(m[1]!);
+			if (m !== null && id !== null)
+				(m[2] === "fixed" ? fixedIds : openIds).add(id);
+		}
+	}
+	for (let i = stripped.length - 1; i >= 0; i--) lines.splice(stripped[i]!, 1);
+	return {
+		text: lines.join("\n"),
+		fixed: known.filter((f) => fixedIds.has(f.id) && !openIds.has(f.id)),
+	};
+}
+
 function location(c: Pick<InlineComment, "path" | "line" | "startLine">) {
 	return c.startLine === null
 		? `${c.path}:${c.line}`

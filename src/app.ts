@@ -278,7 +278,17 @@ import {
 	workCheckSendBack,
 	workCheckSendBackDirection,
 } from "./prompts.ts";
-import { createPrWatcher, PR_GATES, postedReviewId, prUrl } from "./prs.ts";
+import {
+	createPrWatcher,
+	PR_GATES,
+	parseReviewThreads,
+	postedReviewId,
+	prUrl,
+	RESOLVE_THREAD_MUTATION,
+	REVIEW_THREADS_QUERY,
+	type ReviewThread,
+	threadsToResolve,
+} from "./prs.ts";
 import { requirementsListPath } from "./python.ts";
 import {
 	fetchQuota,
@@ -6662,6 +6672,10 @@ export async function createApp(deps: AppDeps) {
 							postedLogin: pr.postedLogin,
 							postError: pr.postError,
 							run: prWatcher.prRun(e.name, pr.number),
+							willResolve:
+								pr.state === "open" && pr.postedHead !== pr.reviewedHead
+									? pr.fixedThreads
+									: [],
 						},
 					}
 				: {}),
@@ -11408,6 +11422,151 @@ export async function createApp(deps: AppDeps) {
 			return res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
 		return null;
 	}
+	/** Resolves the review threads of the draft's fixed findings after the post succeeded; null when nothing failed or nothing was to do. */
+	async function resolveFixedThreads(o: {
+		e: Entry;
+		repo: string;
+		owner: string;
+		repoName: string;
+		number: number;
+		postLogin: string | null;
+		fixed: Array<{ id: number; path: string; line: number }>;
+	}): Promise<string | null> {
+		if (o.fixed.length === 0 || o.postLogin === null) return null;
+		const appSecrets = [...gitSecrets()];
+		// The transport rides the post's identity choice: the app's installation
+		// token first, the board token when the app cannot mint one. Picked once,
+		// like the dismissal's, so one read and its resolves never mix identities.
+		let tok: string | null = null;
+		if (githubApp !== null && appTokens !== null) {
+			try {
+				tok = await appTokens.tokenFor(o.owner, o.repoName);
+			} catch {
+				// A mint failure means no app token: the board token transports instead.
+				tok = null;
+			}
+		}
+		const call = async (
+			query: string,
+			tail: { argv: string[]; variables: Record<string, unknown> },
+		): Promise<{ ok: true; body: string } | { ok: false; error: string }> => {
+			if (tok !== null) {
+				try {
+					const res = await githubAppFetch(`${githubHost().apiBase}/graphql`, {
+						method: "POST",
+						headers: {
+							authorization: `Bearer ${tok}`,
+							accept: "application/vnd.github+json",
+							"content-type": "application/json",
+							"user-agent": "Ottr",
+						},
+						body: JSON.stringify({ query, variables: tail.variables }),
+					});
+					const text = await res.text();
+					if (!res.ok)
+						return {
+							ok: false,
+							error:
+								redact(text.trim().slice(0, 300), appSecrets) ||
+								`HTTP ${res.status}`,
+						};
+					return { ok: true, body: text };
+				} catch (err) {
+					return {
+						ok: false,
+						error:
+							redact(errmsg(err), appSecrets).trim().slice(0, 300) ||
+							"the GraphQL call failed",
+					};
+				}
+			}
+			try {
+				const res = await gh([
+					"api",
+					"graphql",
+					"-f",
+					`query=${query}`,
+					...tail.argv,
+				]);
+				if (res.code !== 0)
+					return {
+						ok: false,
+						error: res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`,
+					};
+				return { ok: true, body: res.stdout };
+			} catch (err) {
+				return {
+					ok: false,
+					error:
+						redact(errmsg(err), appSecrets).trim().slice(0, 300) ||
+						"the GraphQL call failed",
+				};
+			}
+		};
+		const threads: ReviewThread[] = [];
+		let cursor: string | null = null;
+		let hasNext = false;
+		for (let page = 0; page < 5; page++) {
+			const r = await call(REVIEW_THREADS_QUERY, {
+				argv: [
+					"-f",
+					`owner=${o.owner}`,
+					"-f",
+					`name=${o.repoName}`,
+					"-F",
+					`number=${o.number}`,
+					...(cursor === null ? [] : ["-f", `after=${cursor}`]),
+				],
+				variables: {
+					owner: o.owner,
+					name: o.repoName,
+					number: o.number,
+					after: cursor,
+				},
+			});
+			if (!r.ok) return r.error;
+			let info: { hasNextPage: unknown; endCursor: unknown } | null = null;
+			try {
+				const body = JSON.parse(r.body) as {
+					data?: {
+						repository?: {
+							pullRequest?: { reviewThreads?: { pageInfo?: unknown } };
+						};
+					};
+				};
+				threads.push(...parseReviewThreads(body));
+				// parseReviewThreads only returns the nodes: pageInfo is read defensively
+				// from the raw body, and a malformed page stops the loop here.
+				const raw = body.data?.repository?.pullRequest?.reviewThreads?.pageInfo;
+				if (typeof raw === "object" && raw !== null)
+					info = raw as { hasNextPage: unknown; endCursor: unknown };
+			} catch {
+				return "the review threads answer is malformed";
+			}
+			hasNext = info?.hasNextPage === true;
+			cursor =
+				hasNext && typeof info?.endCursor === "string" ? info.endCursor : null;
+			if (!hasNext) break;
+		}
+		if (hasNext)
+			console.log(
+				`[pr] ${o.repo}#${o.number} reviewThreads: page cap reached; resolving among the first ${threads.length} threads`,
+			);
+		const ids = threadsToResolve(
+			threads,
+			o.fixed.map((f) => f.id),
+			o.postLogin,
+		);
+		const failures: string[] = [];
+		for (const id of ids) {
+			const r = await call(RESOLVE_THREAD_MUTATION, {
+				argv: ["-f", `threadId=${id}`],
+				variables: { threadId: id },
+			});
+			if (!r.ok) failures.push(`thread ${id}: ${r.error}`);
+		}
+		return failures.length === 0 ? null : failures.join("; ");
+	}
 	/** True when u is an https URL on the configured GitHub host. */
 	function isHostedHttpsUrl(u: string): boolean {
 		try {
@@ -11677,9 +11836,21 @@ export async function createApp(deps: AppDeps) {
 					: event,
 				prep.via,
 			);
-			// A skipped review or a failed dismissal must show on the card: the note
-			// lands in post_error, the post itself stays.
-			const postError = dismissError ?? changesSkipped ?? null;
+			const resolveError =
+				row.fixedThreads.length > 0
+					? await resolveFixedThreads({
+							e,
+							repo,
+							owner,
+							repoName,
+							number: row.number,
+							postLogin: row.postedLogin,
+							fixed: row.fixedThreads,
+						})
+					: null;
+			// A skipped review, a failed dismissal, or a failed resolve must show on
+			// the card: the note lands in post_error, the post itself stays.
+			const postError = dismissError ?? resolveError ?? changesSkipped ?? null;
 			if (postError !== null)
 				await e.store.setPrPostError(row.number, postError);
 			// The posted review's own comments must never alert: the baseline is the post time.

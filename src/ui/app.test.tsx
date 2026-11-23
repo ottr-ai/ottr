@@ -5968,6 +5968,39 @@ describe("Drawer of a cancelled card opens read-only", () => {
 		expect(none).toMatch(/id="pr-review-inline"[^>]*>No inline comments/);
 	});
 
+	test("the drawer lists the fixed threads the post will resolve", () => {
+		const two = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			willResolve: [
+				{ id: 9001, path: "src/a.ts", line: 12 },
+				{ id: 9002, path: "src/b.ts", line: 30 },
+			],
+		});
+		expect(two).toContain("pr-resolve-hint");
+		expect(two).toContain(
+			"Posting will resolve 2 fixed-finding threads: src/a.ts:12, src/b.ts:30",
+		);
+		// A blocked post never resolves anything, so it never shows the hint.
+		const posted = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			postedHead: "c".repeat(40),
+			willResolve: [{ id: 9001, path: "src/a.ts", line: 12 }],
+		});
+		expect(postButton(posted)).toContain("disabled");
+		expect(posted).not.toContain("pr-resolve-hint");
+		// One thread names itself singular.
+		const one = section(waitingReview(), "## Summary\nreview", {
+			...prView("open"),
+			willResolve: [{ id: 9001, path: "src/a.ts", line: 12 }],
+		});
+		expect(one).toContain(
+			"Posting will resolve 1 fixed-finding thread: src/a.ts:12",
+		);
+		// No pending fixed findings: no hint either.
+		const none = section(waitingReview(), "## Summary\nreview");
+		expect(none).not.toContain("pr-resolve-hint");
+	});
+
 	// The ask composer mirrors the card's last draft run (docs/specs/pr-reviews.md,
 	// "Draft runs"): in flight shows the spinner line, a failed run shows its error,
 	// and a clean end names the draft ready — the record is the status, so it also
