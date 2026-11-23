@@ -21,6 +21,7 @@ The deadline runs without an open tab or another state change. After restart, an
 Before delivery, the server checks current preferences, project mutes, acknowledgements, and source state.
 It excludes cancelled, reopened, acknowledged, superseded, or removed sources. It reads the project store for cards outside the Done window.
 A source read failure retains the pending batch and reports the error.
+An unreadable project does not stop state frames or urgent pushes from healthy projects.
 
 If a board tab has recent focus at the deadline, the server suppresses the digest. It does not postpone it.
 An empty digest sends nothing. A consumed digest does not repeat after restart.

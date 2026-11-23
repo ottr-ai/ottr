@@ -2927,10 +2927,15 @@ export async function createApp(deps: AppDeps) {
 				known.has(alert.taskId)
 			)
 				continue;
-			const source = await completionSource(alert.project, alert.taskId);
-			if (source !== null) {
-				inputs.push(source.input);
-				doneAt.set(alert.taskId, source.doneAt);
+			try {
+				const source = await completionSource(alert.project, alert.taskId);
+				if (source !== null) {
+					inputs.push(source.input);
+					doneAt.set(alert.taskId, source.doneAt);
+				}
+			} catch (err) {
+				// Match boardCards: omit this source, not the whole frame. Digest reads still throw.
+				logStoreError(alert.project, err);
 			}
 			known.add(alert.taskId);
 		}

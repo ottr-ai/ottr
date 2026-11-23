@@ -142,6 +142,7 @@ import type {
 	HostedCreditsView,
 	QuotaLimit,
 	QuotaState,
+	ServerMessage,
 	ServiceQuotaAdapterDefinition,
 	ServiceQuotaMetric,
 	ServiceQuotaReadResult,
@@ -15465,6 +15466,174 @@ describe("web push (R1-1, R2-3)", () => {
 		expect(b.sentSince(from)).toHaveLength(1);
 		expect(await digestOf(b.m.g)).toBeNull();
 	});
+
+	test.each([
+		"closed",
+		"getTask",
+		"getSettings",
+		"getPrReviewByTask",
+		"lastPrRun",
+		"listTurns",
+	] as const)(
+		"a project source failure (%s) does not block healthy state frames or urgent pushes",
+		async (reader) => {
+			const b = await alertBoard(`healthy-${reader}`);
+			const dir = join(root, `unreadable-${reader}`);
+			mkdirSync(dir, { recursive: true });
+			const failed = await ProjectStore.open(dir);
+			testStores.add(failed);
+			await failed.setSettings({ prReviewNotify: true });
+			const entry = {
+				...b.projects.get(b.s.name)!,
+				path: dir,
+				name: failed.name,
+				store: failed,
+			};
+			b.projects.set(entry.name, entry);
+			const live = await failed.createTask(
+				"announced review",
+				null,
+				"pr_review",
+			);
+			const pending = await failed.createTask(
+				"pending review",
+				null,
+				"pr_review",
+			);
+			await failed.createTask("unfinished card");
+			for (const [number, task] of [
+				[41, live],
+				[42, pending],
+			] as const)
+				await failed.savePrReview({
+					number,
+					taskId: task.id,
+					head: "a".repeat(40),
+					firstSeenAt: 0,
+					reviewedHead: null,
+					postedHead: null,
+					postedUrl: null,
+					postedLogin: null,
+					postedEvent: null,
+					postedVia: null,
+					state: "open",
+					draft: false,
+					title: task.title,
+					postError: null,
+					commentsAt: null,
+					commentsUnseen: false,
+				});
+			const request = await b.s.createTask("healthy request");
+			const error = await b.s.createTask("healthy failure");
+			const acknowledged = await b.s.createTask("acknowledged completion");
+			await b.s.updateTask(acknowledged.id, { stage: "done", state: "idle" });
+			await b.subscribe("https://push.example/store-outage");
+			await publishNow(b.m.app);
+			await failed.updateTask(live.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			await b.finishDigest();
+			await failed.updateTask(pending.id, { stage: "done", state: "idle" });
+			await publishNow(b.m.app);
+			const saved = await digestOf(b.m.g);
+			expect(saved?.entries.map(({ event }) => event.taskId)).toEqual([
+				pending.id,
+			]);
+			const seenKey = `done:${acknowledged.id}`;
+			expect(
+				(await b.m.call("/api/inbox/seen", { keys: [seenKey] })).status,
+			).toBe(200);
+			expect(await b.m.g.get<string[]>("inbox_seen")).toContain(seenKey);
+
+			const url = new URL("/api/ws", b.m.server.url);
+			url.protocol = "ws:";
+			const BunWebSocket = WebSocket as typeof WebSocket & {
+				new (url: URL, options: Bun.WebSocketOptions): WebSocket;
+			};
+			const socket = new BunWebSocket(url, {
+				headers: { Host: "127.0.0.1:0", Origin: "http://127.0.0.1:0" },
+			});
+			const initial = Promise.withResolvers<StateResponse>();
+			const received = Promise.withResolvers<StateResponse>();
+			socket.addEventListener("message", (event) => {
+				const frame = JSON.parse(String(event.data)) as ServerMessage;
+				if (frame.type !== "state") return;
+				initial.resolve(frame.state);
+				if (
+					frame.state.tasks.some(
+						(task) => task.id === request.id && task.state === "needs_you",
+					)
+				)
+					received.resolve(frame.state);
+			});
+			const home = join(root, `outage-ops-${reader}`);
+			mkdirSync(home, { recursive: true });
+			const previousHome = process.env.OTTR_BOARD_OMP_HOME;
+			process.env.OTTR_BOARD_OMP_HOME = join(home, "omp-home");
+			const log = spyOn(console, "error").mockImplementation(() => {});
+			const hidden = spyOn(failed, "listTasks");
+			const fault = reader === "closed" ? null : spyOn(failed, reader);
+			try {
+				await initial.promise;
+				fault?.mockRejectedValue(new Error(`${reader} unavailable`));
+				hidden.mockResolvedValue([]);
+				if (reader === "closed") await failed.close();
+				const from = pushSends.length;
+				b.clock.now += COMPLETION_DIGEST_MS;
+				await b.needsYou(request.id);
+				await failTurn(b, error.id, "healthy turn failed", "queued");
+				await b.s.updateTask(acknowledged.id, { stage: "in_progress" });
+				writeFileSync(
+					join(home, "seed-failed"),
+					JSON.stringify({
+						since: b.clock.now,
+						commit: "b".repeat(40),
+						text: "Seed failed during the store outage",
+					}),
+				);
+				expect(await publishNow(b.m.app)).toBe(true);
+				const state = await received.promise;
+				expect(state.tasks.some((task) => task.id === error.id)).toBe(true);
+				expect(state.tasks.some((task) => task.project === failed.name)).toBe(
+					false,
+				);
+				expect(state.inboxSeen).not.toContain(seenKey);
+				expect(await b.m.g.get<string[]>("inbox_seen")).not.toContain(seenKey);
+				expect(
+					b
+						.sentSince(from)
+						.filter((send) => send.payload.type === "alert")
+						.map((send) => send.payload.tag)
+						.sort(),
+				).toEqual(["error", "ops", "request"]);
+				expect(await digestOf(b.m.g)).toEqual(saved);
+				expect(
+					log.mock.calls.some(
+						([message]) => message === `project ${failed.name}:`,
+					),
+				).toBe(true);
+			} finally {
+				fault?.mockRestore();
+				hidden.mockRestore();
+				if (reader === "closed") {
+					entry.store = await ProjectStore.open(dir);
+					testStores.delete(failed);
+					testStores.add(entry.store);
+				}
+				log.mockRestore();
+				socket.close();
+				if (previousHome === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
+				else process.env.OTTR_BOARD_OMP_HOME = previousHome;
+			}
+			const recovered = pushSends.length;
+			await b.m.app.publishState();
+			expect(b.sentSince(recovered)).toHaveLength(1);
+			expect(b.sentSince(recovered)[0]!.payload).toMatchObject({
+				tag: "complete",
+				keys: expect.arrayContaining([`done:${pending.id}`]),
+			});
+			expect(await digestOf(b.m.g)).toBeNull();
+		},
+	);
 
 	test("a failed push consumes its digest attempt without a delivery retry", async () => {
 		const b = await alertBoard("digest-send-error");
