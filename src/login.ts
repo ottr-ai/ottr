@@ -127,12 +127,23 @@ interface Login {
 	returnTo: string;
 }
 
-/** The loopback address the provider's page sends the browser back to, read from omp's sign-in URL. */
-export function redirectUri(output: string): URL | null {
+/** The sign-in page URL omp prints; null when its output names none. */
+const signInPage = (output: string): URL | null => {
 	const page = output.match(/https:\/\/\S+/)?.[0];
 	if (page === undefined) return null;
 	try {
-		const back = new URL(new URL(page).searchParams.get("redirect_uri") ?? "");
+		return new URL(page);
+	} catch {
+		return null;
+	}
+};
+
+/** The loopback address the provider's page sends the browser back to, read from omp's sign-in URL. */
+export function redirectUri(output: string): URL | null {
+	const page = signInPage(output);
+	if (page === null) return null;
+	try {
+		const back = new URL(page.searchParams.get("redirect_uri") ?? "");
 		const loopback =
 			back.hostname === "localhost" || back.hostname === "127.0.0.1";
 		return back.protocol === "http:" && loopback ? back : null;
@@ -332,10 +343,16 @@ export function providerLogin({
 	async function callback(req: Request): Promise<Response | null> {
 		const l = current;
 		if (l === null || l.ok !== null) return null;
-		const back = redirectUri(clean(l.step));
+		const output = clean(l.step);
+		const back = redirectUri(output);
 		const url = new URL(req.url);
+		// omp's pasted-address path accepts a callback whose state is missing, so the board binds
+		// the answer itself: only the state the sign-in URL named may reach the sign-in's stdin.
+		// A sign-in URL without a state has nothing to bind; its PKCE verifier stays with omp.
+		const expected = signInPage(output)?.searchParams.get("state") ?? null;
 		if (
 			back === null ||
+			(expected !== null && url.searchParams.get("state") !== expected) ||
 			req.headers.get("host")?.toLowerCase() !== back.host ||
 			url.pathname !== back.pathname
 		)

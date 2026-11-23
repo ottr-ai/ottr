@@ -243,6 +243,25 @@ describe("providerLogin", () => {
 		l.cancel();
 	}, 30_000);
 
+	test("a callback with a missing or wrong state is refused before omp's stdin", async () => {
+		const l = logins();
+		await l.start("anthropic", BOARD);
+		// The sign-in URL names state=s1: neither a stateless nor a foreign-state callback may pass.
+		expect(
+			await l.callback(browserTo("http://localhost:54545/callback?code=good")),
+		).toBeNull();
+		expect(
+			await l.callback(
+				browserTo("http://localhost:54545/callback?code=good&state=nope"),
+			),
+		).toBeNull();
+		// The same omp is still waiting, so neither refusal reached its stdin: any consumed line
+		// would have failed it (invalid_grant), and this pasted address then finds it gone.
+		const v = await l.answer(CALLBACK);
+		expect(v?.ok).toBe(true);
+		expect(v?.output).toContain("Logged in to anthropic");
+	}, 30_000);
+
 	test("a new start kills the pending sign-in and answers go to the new one", async () => {
 		const l = logins();
 		await l.start("first", BOARD);
