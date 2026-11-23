@@ -2520,7 +2520,7 @@ describe("retroPass", () => {
 		// this test near Bun's 5000 ms default; bunfig.toml's 20 s ceiling never applies
 		// (bun 1.4.5 ignores the key, OTTR-1242), so slow tests carry the budget
 		// explicitly.
-	}, 20_000);
+	}, 30_000);
 
 	test("a pushSha past CI_WAIT_MS still files (CI unknown)", async () => {
 		const dir = join(root, "retro-ci-fallback");

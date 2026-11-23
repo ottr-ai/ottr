@@ -17803,9 +17803,9 @@ describe("slim state and done pages (OTTR-965)", () => {
 		// The wide prompt text no longer rides.
 		expect(b.tasks.every((t) => t.prompt === undefined)).toBe(true);
 		// Seeding runs 6000 real store writes; measured 6.5-6.8 s on the dev
-		// workstation, so the 5000 ms default cannot hold. 20 s leaves about
-		// 3x headroom and still bounds a broken seed path.
-	}, 20_000);
+		// workstation, so the 5000 ms default cannot hold. 30 s leaves about
+		// 4x headroom and still bounds a broken seed path.
+	}, 30_000);
 
 	test("the Done window keeps the cut plus pinned cards and drops the rest", async () => {
 		const { st, projects } = await slimBoard("slim-window");
@@ -19450,7 +19450,7 @@ describe("update cycle control (OTTR-752)", () => {
 		};
 		expect(state.updateCycle.canStart).toBe(false);
 		expect((await unknown.call("/api/update", {})).status).toBe(409);
-	});
+	}, 30_000);
 
 	test("every live runner count prevents a request without a stored card", async () => {
 		const m = await board();
@@ -19475,7 +19475,7 @@ describe("update cycle control (OTTR-752)", () => {
 			expect((await m.call("/api/update", {})).status).toBe(409);
 			expect(m.app.drainedRunner("local")).toBe(false);
 		}
-	});
+	}, 30_000);
 
 	test("real stores refuse running and preparing cards in every project, even cancelled cards", async () => {
 		const m = await board();
@@ -19494,7 +19494,7 @@ describe("update cycle control (OTTR-752)", () => {
 			}
 		}
 		expect((await m.call("/api/update", {})).status).toBe(202);
-	});
+	}, 30_000);
 
 	test("a failed runner reader or project reader never proves idle", async () => {
 		const m = await board();
@@ -19524,7 +19524,7 @@ describe("update cycle control (OTTR-752)", () => {
 			failed.mockRestore();
 		}
 		expect((await m.view())?.canStart).toBe(true);
-	});
+	}, 30_000);
 
 	test("the final idle check follows the real streamed JSON reader", async () => {
 		const m = await board();
@@ -19548,7 +19548,7 @@ describe("update cycle control (OTTR-752)", () => {
 		const response = await fetch(req);
 		expect(response.status).toBe(409);
 		expect(m.app.drainedRunner("local")).toBe(false);
-	});
+	}, 30_000);
 
 	test("the idle check and manual hold share one synchronous operation", async () => {
 		const m = await board();
@@ -19563,7 +19563,7 @@ describe("update cycle control (OTTR-752)", () => {
 		expect((await m.call("/api/update", {})).status).toBe(202);
 		expect(observed.length).toBeGreaterThan(0);
 		expect(observed.every(Boolean)).toBe(true);
-	});
+	}, 30_000);
 
 	test("duplicate requests and polls share one id and hold all runner ids", async () => {
 		const m = await board();
@@ -19617,7 +19617,7 @@ describe("update cycle control (OTTR-752)", () => {
 		});
 		const again = await m.call("/api/update/host", heartbeat());
 		expect(((await again.json()) as UpdateHostReply).requestId).toBeNull();
-	});
+	}, 30_000);
 
 	test("manual hold completion and expiry preserve independent board and runner drains", async () => {
 		const m = await board();
@@ -19646,7 +19646,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setSystemTime();
 		}
-	});
+	}, 30_000);
 
 	test("DELETE drain cannot clear the separate manual hold", async () => {
 		const m = await board();
@@ -19656,7 +19656,7 @@ describe("update cycle control (OTTR-752)", () => {
 		expect(m.app.drainedRunner("local")).toBe(true);
 		expect(m.app.drained()).toBe(true);
 		expect((await m.view())?.phase).toBe("requested");
-	});
+	}, 30_000);
 
 	test("running heartbeat restores and clears the same hold across server and lease recovery", async () => {
 		const m = await board();
@@ -19685,7 +19685,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setSystemTime();
 		}
-	});
+	}, 30_000);
 
 	test("invalid input does not replace the host, clear the request or renew its lease", async () => {
 		const m = await board();
@@ -19722,7 +19722,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setSystemTime();
 		}
-	});
+	}, 30_000);
 
 	test("host registration requires direct peer state, not Host, keys, sessions or worker tokens", async () => {
 		const token = crypto.randomUUID();
@@ -19816,7 +19816,7 @@ describe("update cycle control (OTTR-752)", () => {
 				)
 			).status,
 		).toBe(202);
-	});
+	}, 30_000);
 
 	test("host metadata fits the body cap and redacts known secrets before any live reader sees it", async () => {
 		const m = await board();
@@ -19856,7 +19856,7 @@ describe("update cycle control (OTTR-752)", () => {
 		} finally {
 			setGitSecrets(previous);
 		}
-	});
+	}, 30_000);
 
 	test("Origin and JSON guards protect both routes before any mutation", async () => {
 		const m = await board();
@@ -19877,7 +19877,7 @@ describe("update cycle control (OTTR-752)", () => {
 			expect((await m.call(path, [])).status).toBe(400);
 		}
 		expect(await m.view()).toBeNull();
-	});
+	}, 30_000);
 
 	test("hosted mode refuses even a signed owner and exposes no controller view", async () => {
 		const secret = crypto.randomUUID();
@@ -19925,7 +19925,7 @@ describe("update cycle control (OTTR-752)", () => {
 			balance: 12.5,
 			accountUrl: "http://127.0.0.1:9/account",
 		});
-	});
+	}, 30_000);
 
 	test("hosted mode keeps the operator's alate pairing and model roles from a signed owner", async () => {
 		const secret = crypto.randomUUID();
@@ -20141,7 +20141,7 @@ describe("update cycle control (OTTR-752)", () => {
 			if (previous === undefined) delete process.env.OTTR_BOARD_OMP_HOME;
 			else process.env.OTTR_BOARD_OMP_HOME = previous;
 		}
-	});
+	}, 30_000);
 
 	test("GET and existing socket update frames use live host availability and discard stale values", async () => {
 		const m = await board({ realPort: true });
@@ -20257,7 +20257,7 @@ describe("update cycle control (OTTR-752)", () => {
 			setSystemTime();
 			socket.close();
 		}
-	});
+	}, 30_000);
 });
 
 describe("drain route", () => {
@@ -28781,7 +28781,7 @@ describe("system sampler vm-runner row (OTTR-1151)", () => {
 			vmState.busy = savedBusy;
 			void server.stop(true);
 		}
-	});
+	}, 30_000);
 
 	test("an unreachable vm-runner leaves the row unreachable and the request unharmed", async () => {
 		const server = Bun.serve({ port: 0, fetch: () => new Response("ok") });

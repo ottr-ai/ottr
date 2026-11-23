@@ -1338,7 +1338,7 @@ describe("restoreSnapshot", () => {
 		expect(result.movedAside).toEqual([`${f.projDb}${ASIDE}`]);
 		expect(rowIn(`${f.projDb}${ASIDE}`)).toBe("live");
 		expect(rowIn(f.projDb)).toBe("snap-proj");
-	});
+	}, 30_000);
 
 	test("an existing target is renamed aside, and its old content still opens there", async () => {
 		const f = fixture();

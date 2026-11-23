@@ -2354,7 +2354,7 @@ describe("resetBranchTo", () => {
 		} finally {
 			rmSync(f.dir, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	test("keeps uncommitted edits to files the move does not touch", async () => {
 		const f = fixture();

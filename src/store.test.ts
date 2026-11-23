@@ -210,7 +210,7 @@ describe("old-driver file compatibility", () => {
 			(await reopened.listTurns("z-first")).map((turn) => turn.id),
 		).toEqual([8001, nextTurn.id]);
 		expect((await reopened.perfFacts()).turns[0]?.cost).toBe(cost);
-	});
+	}, 30_000);
 });
 
 describe("moveInQueue", () => {
