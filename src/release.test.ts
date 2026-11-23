@@ -17,6 +17,7 @@ import {
 	computeRelease,
 	highestTag,
 	includedTasks,
+	landPostReleaseCommand,
 	lateCommits,
 	lateNotes,
 	latestGhRelease,
@@ -1569,21 +1570,27 @@ exit 1
 	}, 60_000);
 });
 
-describe("runPostReleaseCommand against real repos", () => {
-	// Same fixture shape as the runReleaseCommand describe above: a bare "origin", a main
-	// checkout, and a fake command script run via process.execPath. The command never
-	// touches origin, but the bare repo keeps the fixture comparable.
-	const POST_FAKE = `
+// The fake post-release command both real-repo describes share: counts its runs (the
+// tag line plus the scratch's HEAD, from `git rev-parse HEAD` in the command's env
+// cwd) and edits files per mode.
+const POST_FAKE = `
+import { execFileSync } from "node:child_process";
 import { appendFileSync, writeFileSync } from "node:fs";
 const [mode, counter] = process.argv.slice(2);
 const tag = process.env.OTTR_RELEASE_TAG ?? "";
 // stdout and stderr are read concurrently, so the failing mode prints to one stream only.
 if (mode === "fail") { console.error("boom"); process.exit(3); }
 appendFileSync(counter, tag + "\\n");
+appendFileSync(counter, execFileSync("git", ["rev-parse", "HEAD"]).toString().trim() + "\\n");
 if (mode === "edit") writeFileSync("artifact.txt", "touched at " + tag + "\\n");
 if (mode === "png") writeFileSync("sprite.png", Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 222, 173, 190, 239]));
 console.log("post " + tag);
 `;
+
+describe("runPostReleaseCommand against real repos", () => {
+	// Same fixture shape as the runReleaseCommand describe above: a bare "origin", a main
+	// checkout, and a fake command script run via process.execPath. The command never
+	// touches origin, but the bare repo keeps the fixture comparable.
 	let root = "";
 	let origin = "";
 	let main = "";
@@ -1607,11 +1614,12 @@ console.log("post " + tag);
 		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	}, 60_000);
 
-	/** Tracks `file` with `bytes`, commits, and tags the commit: the command's precondition. */
+	/** Tracks `file` with `bytes`, commits, pushes main, and tags: the command's precondition. */
 	function seed(tag: string, file: string, bytes: Buffer): string {
 		writeFileSync(join(main, file), bytes);
 		must(main, "add", "-A");
 		must(main, "commit", "-q", "-m", `feat: seed ${tag}`);
+		must(main, "push", "-q", "origin", "main");
 		must(main, "tag", tag);
 		return must(main, "rev-parse", `refs/tags/${tag}^{commit}`);
 	}
@@ -1620,6 +1628,7 @@ console.log("post " + tag);
 			command: `"${process.execPath}" "${fake}" ${mode} "${counter}"`,
 			mainPath: main,
 			version,
+			target: "origin/main",
 			log: () => {},
 		});
 
@@ -1629,13 +1638,26 @@ console.log("post " + tag);
 			"artifact.txt",
 			Buffer.from("seed v1.0.0\n"),
 		);
+		// Advance the target past the tag: the worktree bases at the target's head,
+		// not at the tag's commit.
+		must(main, "commit", "-q", "--allow-empty", "-m", "chore: move target on");
+		must(main, "push", "-q", "origin", "main");
+		const targetHead = must(main, "rev-parse", "refs/remotes/origin/main");
+		expect(targetHead).not.toBe(releasedSha);
 		const res = await run("edit", "v1.0.0");
 		expect(res.releasedSha).toBe(releasedSha);
-		// Exactly one run, at this tag: the counter file holds one line.
-		expect(readFileSync(counter, "utf8")).toBe("v1.0.0\n");
+		expect(res.baseSha).toBe(targetHead);
+		// Exactly one run, at this tag, in a scratch checked out at the target head:
+		// the counter holds the tag line and the scratch HEAD line.
+		const lines = readFileSync(counter, "utf8").split("\n");
+		expect(lines[0]).toBe("v1.0.0");
+		expect(lines[1]).toBe(targetHead);
 		expect(res.files).toContain("artifact.txt");
 		expect(res.commitSha).not.toBeNull();
-		expect(must(main, "rev-parse", `${res.commitSha}^`)).toBe(releasedSha);
+		expect(must(main, "rev-parse", `${res.commitSha}^`)).toBe(targetHead);
+		expect(must(main, "log", "-1", "--format=%s", `${res.commitSha}`)).toBe(
+			"chore: refresh landing site for v1.0.0",
+		);
 		expect(must(main, "show", `${res.commitSha}:artifact.txt`)).toBe(
 			"touched at v1.0.0",
 		);
@@ -1648,7 +1670,12 @@ console.log("post " + tag);
 			Buffer.from("seed v1.1.0\n"),
 		);
 		const res = await run("noop", "v1.1.0");
-		expect(res).toEqual({ releasedSha, commitSha: null, files: [] });
+		expect(res).toEqual({
+			releasedSha,
+			baseSha: releasedSha,
+			commitSha: null,
+			files: [],
+		});
 	}, 60_000);
 
 	test("a failing command throws with its exit code and last line", async () => {
@@ -1711,6 +1738,155 @@ console.log("post " + tag);
 		await expect(run("edit", "v9.9.9")).rejects.toThrow(
 			"cannot resolve the release tag v9.9.9 in the repository",
 		);
+	}, 60_000);
+});
+
+describe("landPostReleaseCommand against real repos", () => {
+	// Same fixture shape as the runPostReleaseCommand describe: a bare "origin", a main
+	// checkout whose main tracks origin/main, and the fake command script. The landing
+	// commit comes from running the real runPostReleaseCommand against the fixture.
+	let root = "";
+	let origin = "";
+	let main = "";
+	let fake = "";
+	let counter = "";
+	beforeAll(() => {
+		sweepStaleFixtures("ott-post-release-land-");
+		root = mkdtempSync(join(tmpdir(), "ott-post-release-land-"));
+		origin = join(root, "origin.git");
+		main = join(root, "main");
+		must(root, "init", "-q", "--bare", "-b", "main", origin);
+		must(root, "init", "-q", "-b", "main", main);
+		must(main, "commit", "-q", "--allow-empty", "-m", "a");
+		must(main, "remote", "add", "origin", origin);
+		must(main, "push", "-q", "-u", "origin", "main");
+		fake = join(root, "fake-post-release-land.mjs");
+		writeFileSync(fake, POST_FAKE);
+		counter = join(root, "counter.txt");
+	}, 60_000);
+	afterAll(() => {
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	}, 60_000);
+
+	/** Tracks `file` with `bytes`, commits, pushes main, and tags: the command's precondition. */
+	function seed(tag: string, file: string, bytes: Buffer): string {
+		writeFileSync(join(main, file), bytes);
+		must(main, "add", "-A");
+		must(main, "commit", "-q", "-m", `feat: seed ${tag}`);
+		must(main, "push", "-q", "origin", "main");
+		must(main, "tag", tag);
+		return must(main, "rev-parse", `refs/tags/${tag}^{commit}`);
+	}
+	/** The landing commit: the real runPostReleaseCommand makes it at the target head. */
+	async function commandCommit(version: string): Promise<string> {
+		const res = await runPostReleaseCommand({
+			command: `"${process.execPath}" "${fake}" edit "${counter}"`,
+			mainPath: main,
+			version,
+			target: "origin/main",
+			log: () => {},
+		});
+		if (res.commitSha === null) throw new Error("the command made no commit");
+		return res.commitSha;
+	}
+	const land = (
+		commitSha: string,
+		releasedSha: string,
+		originUrl: string | null,
+		branchName: string,
+		version: string,
+	) =>
+		landPostReleaseCommand({
+			mainPath: main,
+			originUrl,
+			target: "origin/main",
+			releasedSha,
+			commitSha,
+			branchName,
+			version,
+			log: () => {},
+		});
+	const branchGone = (branchName: string) =>
+		expect(() =>
+			must(main, "rev-parse", "--verify", `refs/heads/${branchName}`),
+		).toThrow();
+
+	test("lands the commit on the target with a push", async () => {
+		const releasedSha = seed(
+			"v1.0.0",
+			"artifact.txt",
+			Buffer.from("seed v1.0.0\n"),
+		);
+		const commitSha = await commandCommit("v1.0.0");
+		const res = await land(
+			commitSha,
+			releasedSha,
+			origin,
+			"ott/post-release/t1",
+			"v1.0.0",
+		);
+		expect(res.status).toBe("pushed");
+		// Origin's main holds the command's commit...
+		expect(
+			must(main, "ls-remote", origin, "refs/heads/main").split(/\s+/)[0],
+		).toBe(commitSha);
+		// ...and the local main fast-forwarded to it.
+		expect(must(main, "rev-parse", "refs/heads/main")).toBe(commitSha);
+		// The temporary branch is gone again.
+		branchGone("ott/post-release/t1");
+	}, 60_000);
+
+	test("a moved origin rejects the push", async () => {
+		const releasedSha = seed(
+			"v1.1.0",
+			"artifact.txt",
+			Buffer.from("seed v1.1.0\n"),
+		);
+		const commitSha = await commandCommit("v1.1.0");
+		// Another clone advances origin/main while the main clone's tracking ref stays
+		// stale: the landing push is a non-fast-forward the remote rejects.
+		const mover = join(root, "mover");
+		must(root, "clone", "-q", origin, mover);
+		must(mover, "commit", "-q", "--allow-empty", "-m", "move origin on");
+		must(mover, "push", "-q", "origin", "main");
+		const res = await land(
+			commitSha,
+			releasedSha,
+			origin,
+			"ott/post-release/t2",
+			"v1.1.0",
+		);
+		expect(res.status).toBe("rejected");
+		branchGone("ott/post-release/t2");
+	}, 60_000);
+
+	test("a missing origin URL fails without a push", async () => {
+		// Realign the main clone with the moved origin from the rejection test first.
+		must(main, "fetch", "-q", "origin", "main");
+		must(main, "reset", "-q", "--hard", "refs/remotes/origin/main");
+		const releasedSha = seed(
+			"v1.2.0",
+			"artifact.txt",
+			Buffer.from("seed v1.2.0\n"),
+		);
+		const commitSha = await commandCommit("v1.2.0");
+		const res = await land(
+			commitSha,
+			releasedSha,
+			null,
+			"ott/post-release/t3",
+			"v1.2.0",
+		);
+		expect(res).toEqual({
+			status: "failed",
+			error:
+				"no pinned origin URL; restart the board (or set it in project settings) so the server pins the origin remote before merging",
+		});
+		// Nothing reached origin.
+		expect(
+			must(main, "ls-remote", origin, "refs/heads/main").split(/\s+/)[0],
+		).not.toBe(commitSha);
+		branchGone("ott/post-release/t3");
 	}, 60_000);
 });
 

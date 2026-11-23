@@ -1287,6 +1287,10 @@ describe("settings", () => {
 		});
 		await store.setSettings({ postReleaseCommand: "bun run shots" });
 		await store.setSettings({
+			postReleaseLanding: "commit-push",
+			postReleasePaths: ["landing"],
+		});
+		await store.setSettings({
 			archReviewCap: 80,
 			maxImages: 4,
 		});
@@ -1300,6 +1304,8 @@ describe("settings", () => {
 			releaseCommand: "node scripts/release.mjs --ottr",
 			releaseEnv: null,
 			postReleaseCommand: "bun run shots",
+			postReleaseLanding: "commit-push",
+			postReleasePaths: ["landing"],
 			archReviewCap: 80,
 			validationBatchSize: 10,
 			maxImages: 4,
@@ -1337,6 +1343,8 @@ describe("settings", () => {
 			displayName: null,
 			releaseCommand: null,
 			postReleaseCommand: null,
+			postReleaseLanding: "card",
+			postReleasePaths: [],
 		});
 		expect(await store.getSettings()).toEqual({
 			maxParallel: 3,
@@ -1346,6 +1354,8 @@ describe("settings", () => {
 			releaseCommand: null,
 			releaseEnv: null,
 			postReleaseCommand: null,
+			postReleaseLanding: "card",
+			postReleasePaths: [],
 			archReviewCap: 80,
 			validationBatchSize: 10,
 			maxImages: 4,

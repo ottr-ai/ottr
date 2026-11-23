@@ -255,6 +255,19 @@ export interface ProjectSettings {
 	 * docs/specs/post-release-command.md
 	 */
 	postReleaseCommand: string | null;
+	/**
+	 * What happens to the post-release command's tracked changes: "card" files a normal
+	 * merge card, "commit-push" pushes changes under postReleasePaths straight to the
+	 * target branch.
+	 * docs/specs/post-release-command.md
+	 */
+	postReleaseLanding: "card" | "commit-push";
+	/**
+	 * Repo-relative path prefixes (segment-wise, gitignore respected) that the
+	 * "commit-push" landing may push directly; the "card" landing ignores them.
+	 * docs/specs/post-release-command.md
+	 */
+	postReleasePaths: string[];
 	/** Commits on the integration target before an architecture review is due. */
 	archReviewCap: number;
 	/** Leads one validation run (OTTR-1047) validates per run; a stored value below 1 behaves as 1. */

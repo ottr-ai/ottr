@@ -688,6 +688,7 @@ async function mountBoard(
 		publishRelease: notWired("a release publish"),
 		runReleaseCommand: notWired("a release command"),
 		runPostReleaseCommand: notWired("a post-release command"),
+		landPostReleaseCommand: notWired("a post-release push"),
 		archReviewDelta,
 		http400Dir: join(root, "no-http400"),
 		hosted,

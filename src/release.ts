@@ -17,7 +17,9 @@ import {
 	pushLfsObjects,
 	readGitdir,
 	redact,
+	redactUrlCredentials,
 	rowPath,
+	serverMergePush,
 	spawnPiped,
 	statusRows,
 } from "./worktree.ts";
@@ -1336,6 +1338,8 @@ export async function runReleaseCommand(o: {
 export interface PostReleaseResult {
 	/** The released tag's commit. */
 	releasedSha: string;
+	/** The worktree base: the target's head when `target` resolved, else the tag's commit; the command commit's parent. */
+	baseSha: string;
 	/** The commit holding the command's changes; null when it changed nothing. */
 	commitSha: string | null;
 	/** Changed tracked paths, sorted; empty when nothing changed. */
@@ -1344,7 +1348,8 @@ export interface PostReleaseResult {
 
 /**
  * Runs the project's post-release command once at the released tag, in a clean detached
- * worktree of the tag's commit (the release card's tree stays untouched). The command gets
+ * worktree based at the target's head when `target` resolves in the repository, else at
+ * the tag's commit (the release card's tree stays untouched). The command gets
  * `OTTR_RELEASE_TAG` plus the shared release env, but no `OTTR_RELEASE_NOTES_FILE`: the
  * release is already published, so there is no notes file. Tracked changes (`git add -A`)
  * land as one `chore:` commit with the board's default identity; the command never pushes.
@@ -1353,6 +1358,8 @@ export async function runPostReleaseCommand(o: {
 	command: string;
 	mainPath: string;
 	version: string;
+	/** Base the worktree at this target's head (for example "origin/main") when it resolves; without it the worktree bases at the tag's commit. */
+	target?: string;
 	log: (line: string) => void | Promise<void>;
 	/** Lets Cancel and shutdown stop the command's process tree. */
 	onSpawn?: (h: {
@@ -1371,10 +1378,21 @@ export async function runPostReleaseCommand(o: {
 		);
 	const releasedSha = t.stdout.trim();
 
+	// The landing refresh rides the target tip: base at the target's head when the
+	// caller names a target that resolves, else at the tag's commit as before.
+	let baseSha = releasedSha;
+	if (o.target !== undefined) {
+		const h = await git(
+			["rev-parse", "--quiet", "--verify", `${o.target}^{commit}`],
+			o.mainPath,
+		);
+		if (h.code === 0) baseSha = h.stdout.trim();
+	}
+
 	const parent = mkdtempSync(join(tmpdir(), "ottr-post-release-"));
 	const scratch = join(parent, "wt");
 	const add = await git(
-		["worktree", "add", "--quiet", "--detach", scratch, releasedSha],
+		["worktree", "add", "--quiet", "--detach", scratch, baseSha],
 		o.mainPath,
 	);
 	if (add.code !== 0) {
@@ -1416,7 +1434,7 @@ export async function runPostReleaseCommand(o: {
 			throw new Error(`git add failed: ${staged.stderr.trim()}`);
 		const status = await git(["status", "--porcelain"], scratch);
 		if (status.stdout.trim() === "")
-			return { releasedSha, commitSha: null, files: [] };
+			return { releasedSha, baseSha, commitSha: null, files: [] };
 
 		const committed = await git(
 			[
@@ -1429,7 +1447,7 @@ export async function runPostReleaseCommand(o: {
 				"commit",
 				"-q",
 				"-m",
-				`chore: post-release changes for ${o.version}`,
+				`chore: refresh landing site for ${o.version}`,
 			],
 			scratch,
 		);
@@ -1439,10 +1457,7 @@ export async function runPostReleaseCommand(o: {
 		if (head.code !== 0)
 			throw new Error(`git rev-parse HEAD failed: ${head.stderr.trim()}`);
 		const commitSha = head.stdout.trim();
-		const diff = await git(
-			["diff", "--name-only", releasedSha, "HEAD"],
-			scratch,
-		);
+		const diff = await git(["diff", "--name-only", baseSha, "HEAD"], scratch);
 		if (diff.code !== 0)
 			throw new Error(`git diff failed: ${diff.stderr.trim()}`);
 		const files = diff.stdout
@@ -1450,7 +1465,7 @@ export async function runPostReleaseCommand(o: {
 			.map((l) => l.trim())
 			.filter((l) => l !== "")
 			.sort();
-		return { releasedSha, commitSha, files };
+		return { releasedSha, baseSha, commitSha, files };
 	} finally {
 		const rm = await git(
 			["worktree", "remove", "--force", scratch],
@@ -1461,5 +1476,103 @@ export async function runPostReleaseCommand(o: {
 			await o.log(
 				`! post-release: worktree cleanup failed: ${rm.stderr.trim()}`,
 			);
+	}
+}
+
+/**
+ * Lands a post-release command's commit on the target branch. Commits nothing itself:
+ * it puts the command's commit on a temporary branch and lets the merge turn's push
+ * step (serverMergePush) fast-forward the local target and push it by the pinned
+ * origin URL; the branch goes away afterwards. The push rides no hold gate (leaseTip
+ * null): the only commit it carries is the board's own landing refresh, and a moved
+ * origin still rejects it. The branch removal runs on every exit path, and a failed
+ * removal is logged, not thrown.
+ */
+export async function landPostReleaseCommand(o: {
+	mainPath: string;
+	originUrl: string | null;
+	target: string;
+	/** The tag's commit; logged for context. */
+	releasedSha: string;
+	/** The command's commit (parent = the worktree base). */
+	commitSha: string;
+	/** Short-lived branch the push step creates and removes again. */
+	branchName: string;
+	version: string;
+	log: (line: string) => void | Promise<void>;
+}): Promise<
+	| { status: "pushed"; output: string }
+	| { status: "failed"; error: string; output?: string }
+	| { status: "rejected"; error: string; output?: string }
+> {
+	await o.log(
+		`post-release: landing ${o.commitSha.slice(0, 7)} on ${o.target} (tag ${o.version} at ${o.releasedSha.slice(0, 7)})`,
+	);
+	const made = await git(["branch", o.branchName, o.commitSha], o.mainPath);
+	if (made.code !== 0)
+		return {
+			status: "failed",
+			error: redactUrlCredentials(
+				made.stderr.trim().split("\n").filter(Boolean).pop() ??
+					`git branch exited ${made.code}`,
+			),
+		};
+	// The push step reads the integration head from a linked worktree's HEAD
+	// (integrationHead): mainPath would report the checked-out target instead of the
+	// landing branch, so the branch rides its own no-checkout worktree. Reading HEAD
+	// needs no checkout; the worktree is gone again before the status returns.
+	const parent = mkdtempSync(join(tmpdir(), "ottr-post-release-land-"));
+	const scratch = join(parent, "wt");
+	const linked = await git(
+		[
+			"worktree",
+			"add",
+			"--quiet",
+			"--no-checkout",
+			"--detach",
+			scratch,
+			o.commitSha,
+		],
+		o.mainPath,
+	);
+	try {
+		if (linked.code !== 0) {
+			rmSync(parent, { recursive: true, force: true });
+			return {
+				status: "failed",
+				error: redactUrlCredentials(
+					linked.stderr.trim().split("\n").filter(Boolean).pop() ??
+						`git worktree add exited ${linked.code}`,
+				),
+			};
+		}
+		const pushed = await serverMergePush(
+			o.mainPath,
+			scratch,
+			o.target,
+			o.branchName,
+			null,
+			o.originUrl,
+			true,
+		);
+		if (pushed.status === "skipped")
+			return {
+				status: "failed",
+				error: `the post-release commit did not reach ${o.target}`,
+			};
+		return pushed;
+	} finally {
+		const drop = await git(
+			["worktree", "remove", "--force", scratch],
+			o.mainPath,
+		);
+		if (drop.code === 0) rmSync(parent, { recursive: true, force: true });
+		else
+			await o.log(
+				`! post-release: worktree cleanup failed: ${drop.stderr.trim()}`,
+			);
+		const rm = await git(["branch", "-D", o.branchName], o.mainPath);
+		if (rm.code !== 0)
+			await o.log(`! post-release: branch cleanup failed: ${rm.stderr.trim()}`);
 	}
 }

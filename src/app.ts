@@ -1755,6 +1755,67 @@ function parsePostReleaseCommand(
 	return null;
 }
 
+function parsePostReleaseLanding(
+	body: Record<string, unknown>,
+	patch: Partial<ProjectSettings>,
+): Response | null {
+	const landing = body.postReleaseLanding;
+	if (landing === undefined) return null;
+	if (landing !== "card" && landing !== "commit-push")
+		return json(
+			{ error: `postReleaseLanding must be "card" or "commit-push"` },
+			400,
+		);
+	patch.postReleaseLanding = landing;
+	return null;
+}
+
+function parsePostReleasePaths(
+	body: Record<string, unknown>,
+	patch: Partial<ProjectSettings>,
+): Response | null {
+	const paths = body.postReleasePaths;
+	if (paths === undefined) return null;
+	if (!Array.isArray(paths) || paths.length > 50)
+		return json(
+			{
+				error:
+					"postReleasePaths must be an array of at most 50 repo-relative path prefixes",
+			},
+			400,
+		);
+	const prefixes: string[] = [];
+	for (const item of paths) {
+		if (typeof item !== "string")
+			return json(
+				{
+					error:
+						"postReleasePaths must hold repo-relative path prefixes of at most 200 characters each",
+				},
+				400,
+			);
+		const prefix = item.trim();
+		// Empty trimmed items drop instead of failing, so a blank UI line saves as nothing.
+		if (prefix === "") continue;
+		if (
+			prefix.length > 200 ||
+			/[\p{Cc}]/u.test(prefix) ||
+			prefix.startsWith("/") ||
+			/(?:^|\/)\.\.(?:\/|$)/.test(prefix)
+		)
+			return json(
+				{
+					error:
+						"postReleasePaths must hold repo-relative path prefixes of at most 200 characters each",
+				},
+				400,
+			);
+		prefixes.push(prefix);
+	}
+	patch.postReleasePaths = prefixes;
+	return null;
+}
+
 function parseTargetBranch(
 	body: Record<string, unknown>,
 	patch: Partial<ProjectSettings>,
@@ -1963,6 +2024,8 @@ const settingParsers: FieldParser[] = [
 	parseReleaseCommand,
 	parseReleaseEnv,
 	parsePostReleaseCommand,
+	parsePostReleaseLanding,
+	parsePostReleasePaths,
 	parseTargetBranch,
 	parseArchReviewCap,
 	parseMaxImages,
@@ -13707,10 +13770,10 @@ export async function createApp(deps: AppDeps) {
 		);
 	}
 
-	function checkSettingsGuards(
+	async function checkSettingsGuards(
 		e: Entry,
 		patch: Record<string, unknown>,
-	): Response | null {
+	): Promise<Response | null> {
 		// PR mode needs a GitHub host: the merge flow pushes the branch and opens
 		// a PR there (same fact the prs/check route 409s on).
 		if (patch.prMode === true && e.github === null)
@@ -13724,6 +13787,22 @@ export async function createApp(deps: AppDeps) {
 			return json(
 				{
 					error: `microVm needs a reachable vm-runner: ${vmState.health.reason ?? "not reachable"}`,
+				},
+				400,
+			);
+		// A commit-push landing needs path prefixes to push; the patch wins over the
+		// stored value, so saving landing "card" never trips on the stored paths.
+		const stored = await e.store.getSettings();
+		const landing = patch.postReleaseLanding ?? stored.postReleaseLanding;
+		const paths =
+			patch.postReleasePaths === undefined
+				? stored.postReleasePaths
+				: (patch.postReleasePaths as string[]);
+		if (landing === "commit-push" && paths.length === 0)
+			return json(
+				{
+					error:
+						"postReleasePaths must not be empty when postReleaseLanding is commit-push",
 				},
 				400,
 			);
@@ -13813,7 +13892,7 @@ export async function createApp(deps: AppDeps) {
 		if (patch instanceof Response) return patch;
 		const guard =
 			(await jira.settingsRefusal(patch.jiraConnection)) ??
-			checkSettingsGuards(e, patch);
+			(await checkSettingsGuards(e, patch));
 		if (guard instanceof Response) return guard;
 		const before = await e.store.getSettings();
 		await applyRetroSince(e, patch, r.body.retro);

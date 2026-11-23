@@ -10271,6 +10271,10 @@ function ProjectReviewsCards({
 	setRelenv,
 	postcmd,
 	setPostcmd,
+	landing,
+	setLanding,
+	pathsText,
+	setPathsText,
 	cap,
 	setCap,
 	reviewCap,
@@ -10287,6 +10291,10 @@ function ProjectReviewsCards({
 	setRelenv: (v: string) => void;
 	postcmd: string;
 	setPostcmd: (v: string) => void;
+	landing: "card" | "commit-push";
+	setLanding: (v: "card" | "commit-push") => void;
+	pathsText: string;
+	setPathsText: (v: string) => void;
 	cap: string;
 	setCap: (v: string) => void;
 	reviewCap: number;
@@ -10301,13 +10309,20 @@ function ProjectReviewsCards({
 				dirty={
 					relcmd.trim() !== (st.releaseCommand ?? "") ||
 					relenv.trim() !== (st.releaseEnv ?? "") ||
-					postcmd.trim() !== (st.postReleaseCommand ?? "")
+					postcmd.trim() !== (st.postReleaseCommand ?? "") ||
+					landing !== st.postReleaseLanding ||
+					pathsText.trim() !== st.postReleasePaths.join("\n")
 				}
 				save={() =>
 					send({
 						releaseCommand: relcmd.trim() || null,
 						releaseEnv: relenv.trim() || null,
 						postReleaseCommand: postcmd.trim() || null,
+						postReleaseLanding: landing,
+						postReleasePaths: pathsText
+							.split("\n")
+							.map((s) => s.trim())
+							.filter(Boolean),
 					})
 				}
 				title="Releases"
@@ -10371,6 +10386,45 @@ function ProjectReviewsCards({
 									onChange={(e) => setPostcmd(e.target.value)}
 									placeholder="bun run shots -- --app ../rel"
 									aria-label="Post-release command"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							settingKey="postReleaseLanding"
+							name="Post-release landing"
+							action={save}
+							help="What happens to the command's tracked changes: a card (default), or a push to the target branch when every changed file sits under the paths. A file outside the paths falls back to a card."
+							shape="card = a card; commit-push = a push"
+						>
+							<label>
+								<select
+									value={landing}
+									onChange={(e) =>
+										setLanding(
+											e.target.value === "commit-push" ? "commit-push" : "card",
+										)
+									}
+									aria-label="Post-release landing"
+								>
+									<option value="card">Card</option>
+									<option value="commit-push">Commit and push</option>
+								</select>
+							</label>
+						</DefRow>
+						<DefRow
+							settingKey="postReleasePaths"
+							name="Post-release paths"
+							action={save}
+							help="Repo-relative path prefixes for commit-push landing, one per line. Required when the landing is commit-push; ignored otherwise."
+							shape="one repo-relative prefix per line"
+						>
+							<label>
+								<textarea
+									rows={3}
+									value={pathsText}
+									onChange={(e) => setPathsText(e.target.value)}
+									placeholder="e.g. docs/site"
+									aria-label="Post-release paths"
 								/>
 							</label>
 						</DefRow>
@@ -10460,6 +10514,10 @@ export function ProjectSettingsForm({
 	const [relenv, setRelenv] = useState(project.settings.releaseEnv ?? "");
 	const [postcmd, setPostcmd] = useState(
 		project.settings.postReleaseCommand ?? "",
+	);
+	const [landing, setLanding] = useState(project.settings.postReleaseLanding);
+	const [pathsText, setPathsText] = useState(
+		project.settings.postReleasePaths.join("\n"),
 	);
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
@@ -10613,6 +10671,10 @@ export function ProjectSettingsForm({
 					setRelenv={setRelenv}
 					postcmd={postcmd}
 					setPostcmd={setPostcmd}
+					landing={landing}
+					setLanding={setLanding}
+					pathsText={pathsText}
+					setPathsText={setPathsText}
 					cap={cap}
 					setCap={setCap}
 					reviewCap={reviewCap}

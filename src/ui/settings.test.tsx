@@ -2179,6 +2179,8 @@ describe("Code scanning watch facts and Check alerts now", () => {
 			displayName: null,
 			releaseCommand: null,
 			postReleaseCommand: null,
+			postReleaseLanding: "card",
+			postReleasePaths: [],
 			archReviewCap: 30,
 			maxImages: 4,
 			keptWorktreeDays: 7,

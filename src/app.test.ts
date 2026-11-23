@@ -3915,6 +3915,66 @@ describe("settings routes", () => {
 		expect((await store.getSettings()).postReleaseCommand).toBeNull();
 	});
 
+	test("postReleaseLanding is card or commit-push, and commit-push needs postReleasePaths", async () => {
+		const bogus = await post("/api/projects/p1/settings", {
+			postReleaseLanding: "bogus",
+		});
+		expect(bogus.status).toBe(400);
+		expect(await errorOf(bogus)).toBe(
+			`postReleaseLanding must be "card" or "commit-push"`,
+		);
+		const noPaths = await post("/api/projects/p1/settings", {
+			postReleaseLanding: "commit-push",
+			postReleasePaths: [],
+		});
+		expect(noPaths.status).toBe(400);
+		expect(await errorOf(noPaths)).toBe(
+			"postReleasePaths must not be empty when postReleaseLanding is commit-push",
+		);
+		const ok = await post("/api/projects/p1/settings", {
+			postReleaseLanding: "commit-push",
+			postReleasePaths: ["landing"],
+		});
+		expect(ok.status).toBe(200);
+		expect((await store.getSettings()).postReleaseLanding).toBe("commit-push");
+		expect((await store.getSettings()).postReleasePaths).toEqual(["landing"]);
+		const notArray = await post("/api/projects/p1/settings", {
+			postReleasePaths: "../escape",
+		});
+		expect(notArray.status).toBe(400);
+		expect(await errorOf(notArray)).toBe(
+			"postReleasePaths must be an array of at most 50 repo-relative path prefixes",
+		);
+		const dotDot = await post("/api/projects/p1/settings", {
+			postReleasePaths: ["../escape"],
+		});
+		expect(dotDot.status).toBe(400);
+		expect(await errorOf(dotDot)).toBe(
+			"postReleasePaths must hold repo-relative path prefixes of at most 200 characters each",
+		);
+		const absolute = await post("/api/projects/p1/settings", {
+			postReleasePaths: ["/abs"],
+		});
+		expect(absolute.status).toBe(400);
+		expect(await errorOf(absolute)).toBe(
+			"postReleasePaths must hold repo-relative path prefixes of at most 200 characters each",
+		);
+		const trimmed = await post("/api/projects/p1/settings", {
+			postReleasePaths: [" landing ", "  ", " shots/x "],
+		});
+		expect(trimmed.status).toBe(200);
+		expect((await store.getSettings()).postReleasePaths).toEqual([
+			"landing",
+			"shots/x",
+		]);
+		const backToCard = await post("/api/projects/p1/settings", {
+			postReleaseLanding: "card",
+			postReleasePaths: [],
+		});
+		expect(backToCard.status).toBe(200);
+		expect((await store.getSettings()).postReleaseLanding).toBe("card");
+	});
+
 	test("taskIdPrefix validates, persists, and overrides the derived task id handle", async () => {
 		const ok = await post("/api/projects/p1/settings", { taskIdPrefix: "chs" });
 		expect(ok.status).toBe(200);

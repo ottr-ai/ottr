@@ -61,6 +61,7 @@ import {
 import { ensureProjectPython, pythonPathDir } from "./python.ts";
 import { fetchQuota } from "./quota.ts";
 import {
+	landPostReleaseCommand,
 	latestImage,
 	ownerRepo,
 	publishRelease,
@@ -999,6 +1000,7 @@ const loop = createTurnLoop(projects, {
 		return { lines, pathDir };
 	},
 	publishRelease,
+	landPostReleaseCommand,
 	runPostReleaseCommand,
 	runReleaseCommand,
 	archReviewDelta,

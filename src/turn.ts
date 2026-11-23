@@ -102,6 +102,7 @@ import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
 import { providerBlocked, providerOf, usageReset } from "./quota.ts";
 import type {
+	landPostReleaseCommand,
 	PostReleaseResult,
 	publishRelease,
 	ReleaseIdentity,
@@ -311,6 +312,14 @@ export function microVmTurn(o: {
 		o.task.kind !== "trending" &&
 		o.task.stage !== "backlog"
 	);
+}
+
+/** Segment-wise post-release path match (docs/specs/post-release-command.md): a file is
+ * under a pattern when it equals it or sits below `pattern/`; one trailing `/` on the
+ * stored pattern is normalized away. */
+function underPostReleasePath(file: string, pattern: string): boolean {
+	const p = pattern.replace(/\/$/, "");
+	return file === p || file.startsWith(`${p}/`);
 }
 
 /** Deadline for the prepare-phase titler; surfaced verbatim as the failure cause. */
@@ -1151,6 +1160,7 @@ export interface TurnOps {
 		warning: string | null;
 	} | null>;
 	runReleaseCommand: typeof runReleaseCommand;
+	landPostReleaseCommand: typeof landPostReleaseCommand;
 	runPostReleaseCommand: typeof runPostReleaseCommand;
 	archReviewDelta(
 		mainPath: string,
@@ -3678,6 +3688,7 @@ export function createTurnLoop(
 				e,
 				task,
 				releaseVersion,
+				target,
 				settings,
 				log,
 			);
@@ -3689,13 +3700,16 @@ export function createTurnLoop(
 	}
 
 	/** Runs once after the publish succeeded, when the project sets a post-release command.
-	 * The command's changes, when any, land as one normal card whose merge turn runs the gates
-	 * and merges; the command never pushes. A failure parks the release card without undoing
-	 * the release, and a reply reruns the publish (idempotent) and the command. */
+	 * Card landing (the default, and commit-push with any changed file outside postReleasePaths)
+	 * files one normal card whose merge turn runs the gates and merges. Commit-push landing with
+	 * every changed file under the paths pushes the commit straight to the target and files no
+	 * card. The command never pushes; the board does. A failure parks the release card without
+	 * undoing the release, and a reply reruns the publish (idempotent) and the command. */
 	async function runPostReleaseCard(
 		e: TurnProject,
 		task: ListedTask,
 		releaseVersion: string,
+		target: string,
 		settings: ProjectSettings,
 		log: (line: string) => void | Promise<void>,
 	): Promise<string | null> {
@@ -3712,6 +3726,7 @@ export function createTurnLoop(
 					command: post,
 					mainPath: e.path,
 					version: releaseVersion,
+					target,
 					log: async (l) => await log(`| ${l}`),
 					onSpawn: (h) => {
 						entry = h;
@@ -3732,6 +3747,38 @@ export function createTurnLoop(
 				throw new Error(
 					"the post-release command reported changes but no commit",
 				);
+			const landing =
+				settings.postReleaseLanding === "commit-push" &&
+				settings.postReleasePaths.length > 0;
+			if (landing) {
+				const outside = r.files.filter(
+					(f) =>
+						!settings.postReleasePaths.some((p) => underPostReleasePath(f, p)),
+				);
+				if (outside.length === 0) {
+					const r2 = await ops.landPostReleaseCommand({
+						mainPath: e.path,
+						originUrl: settings.originUrl,
+						target,
+						releasedSha: r.releasedSha,
+						commitSha: r.commitSha,
+						branchName: `ott/post-release/${task.id}`,
+						version: releaseVersion,
+						log: async (l) => await log(`- ${l}`),
+					});
+					if (r2.status !== "pushed") {
+						await log(`! post-release push ${r2.status}: ${r2.error}`);
+						if (typeof r2.output === "string" && r2.output !== "")
+							await log(`git's full push output:\n${r2.output}`);
+						throw new Error(r2.error);
+					}
+					await log(`post-release changes pushed to ${target}`);
+					return null;
+				}
+				await log(
+					`${outside.length} file(s) outside postReleasePaths; filing a card`,
+				);
+			}
 			const prompt = [
 				`Post-release changes for ${releaseVersion}`,
 				"",
@@ -3757,7 +3804,7 @@ export function createTurnLoop(
 					await store.updateTask(card.id, {
 						promptAuthor: "board",
 						branch,
-						base: r.releasedSha,
+						base: r.baseSha,
 						worktree: wt,
 						stage: "merging",
 						state: "queued",

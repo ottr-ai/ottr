@@ -232,8 +232,13 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		runReleaseCommand: async () => "ran",
 		runPostReleaseCommand: async () => ({
 			releasedSha: "shaR",
+			baseSha: "shaR",
 			commitSha: null,
 			files: [],
+		}),
+		landPostReleaseCommand: async () => ({
+			status: "failed" as const,
+			error: "post-release landing not wired in this fixture",
 		}),
 		archReviewDelta: async () => ({ delta: 0, reviewed: true, anchor: "a" }),
 		commitSubjects: async () => [],

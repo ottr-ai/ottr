@@ -190,6 +190,7 @@ interface Recorded {
 	publishRelease: unknown[];
 	runReleaseCommand: unknown[];
 	runPostReleaseCommand: unknown[];
+	landPostReleaseCommand: unknown[];
 	quarantine: { worktreePath: string; quarantineDir: string }[];
 	ignoreInMain: { mainPath: string; rel: string }[];
 	/** OTTR-800: the cancel-path remote branch delete calls, in order. */
@@ -472,8 +473,13 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		runReleaseCommand: async () => "ran",
 		runPostReleaseCommand: async () => ({
 			releasedSha: "shaR",
+			baseSha: "shaR",
 			commitSha: null,
 			files: [],
+		}),
+		landPostReleaseCommand: async () => ({
+			status: "failed" as const,
+			error: "post-release landing not wired in this fixture",
 		}),
 		archReviewDelta: async () => ({ delta: 0, reviewed: true, anchor: "a" }),
 		// The check run's git input is stubbed like http400Dir: tests never spawn real git.
@@ -563,6 +569,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1220,6 +1227,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1266,6 +1274,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1303,6 +1312,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1531,6 +1541,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1723,6 +1734,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1780,6 +1792,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1838,6 +1851,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1909,6 +1923,7 @@ describe("turn loop", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -2026,6 +2041,7 @@ function baseRecord(): Recorded {
 		publishRelease: [],
 		runReleaseCommand: [],
 		runPostReleaseCommand: [],
+		landPostReleaseCommand: [],
 		publishSoon: 0,
 		notifyLog: [],
 		killed: false,
@@ -4893,6 +4909,7 @@ describe("turn release cards", () => {
 				record.runPostReleaseCommand.push(o);
 				return {
 					releasedSha: "shaR",
+					baseSha: "shaR",
 					commitSha: "shaC",
 					files: ["shots/a.png"],
 				};
@@ -4972,6 +4989,137 @@ describe("turn release cards", () => {
 		expect(await store.listTasks()).toHaveLength(1);
 		const log = await logText(store, task.id);
 		expect(log).toContain("made no tracked changes");
+	});
+
+	test("commit-push landing pushes the changes and files no card", async () => {
+		const record = baseRecord();
+		let landed:
+			| Parameters<TurnOps["landPostReleaseCommand"]>[0]
+			| undefined;
+		const { store, projects, loop } = await setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			runPostReleaseCommand: async (o: unknown) => {
+				record.runPostReleaseCommand.push(o);
+				return {
+					releasedSha: "shaR",
+					baseSha: "shaT",
+					commitSha: "shaC",
+					files: ["landing/index.html"],
+				};
+			},
+			landPostReleaseCommand: async (o) => {
+				record.landPostReleaseCommand.push(o);
+				landed = o;
+				return { status: "pushed", output: "to origin/main" };
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({
+			postReleaseCommand: "bun run shots",
+			postReleaseLanding: "commit-push",
+			postReleasePaths: ["landing"],
+		});
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("Released v1.0.0");
+		expect(await store.listTasks()).toHaveLength(1);
+		expect(record.createWorktree).toHaveLength(0);
+		expect(record.landPostReleaseCommand).toHaveLength(1);
+		expect(landed).toMatchObject({
+			target: "origin/main",
+			commitSha: "shaC",
+			releasedSha: "shaR",
+		});
+		expect(landed!.branchName).toMatch(/^ott\/post-release\//);
+		const log = await logText(store, task.id);
+		expect(log).toContain("post-release changes pushed to origin/main");
+	});
+
+	test("a change outside postReleasePaths falls back to a card", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			runPostReleaseCommand: async (o: unknown) => {
+				record.runPostReleaseCommand.push(o);
+				return {
+					releasedSha: "shaR",
+					baseSha: "shaT",
+					commitSha: "shaC",
+					files: ["shots/a.png", "landing/index.html"],
+				};
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({
+			postReleaseCommand: "bun run shots",
+			postReleaseLanding: "commit-push",
+			postReleasePaths: ["landing"],
+		});
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		// The default land op fails loudly: a stray call parks the release card and
+		// the assertions below fail.
+		expect(record.landPostReleaseCommand).toHaveLength(0);
+		const after = (await store.getTask(task.id))!;
+		expect(after.summary).toBe("Released v1.0.0");
+		const tasks = await store.listTasks();
+		expect(tasks).toHaveLength(2);
+		const filed = tasks.find((t) => t.id !== task.id)!;
+		expect(filed.stage).toBe("merging");
+		expect(filed.state).toBe("queued");
+		expect(filed.branch).toMatch(/^ott\//);
+		expect(filed.base).toBe("shaT");
+		expect(record.createWorktree).toHaveLength(1);
+		expect(record.createWorktree[0]).toMatchObject({ base: "shaC" });
+		const log = await logText(store, task.id);
+		expect(log).toContain("1 file(s) outside postReleasePaths; filing a card");
+	});
+
+	test("a failed post-release push parks the release card", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			runPostReleaseCommand: async (o: unknown) => {
+				record.runPostReleaseCommand.push(o);
+				return {
+					releasedSha: "shaR",
+					baseSha: "shaT",
+					commitSha: "shaC",
+					files: ["landing/index.html"],
+				};
+			},
+			landPostReleaseCommand: async () => ({
+				status: "failed" as const,
+				error: "denied",
+				output: "! [rejected]",
+			}),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({
+			postReleaseCommand: "bun run shots",
+			postReleaseLanding: "commit-push",
+			postReleasePaths: ["landing"],
+		});
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Post-release command failed: denied. Fix it, then reply to retry.",
+		);
+		expect(await store.listTasks()).toHaveLength(1);
+		const log = await logText(store, task.id);
+		expect(log).toContain("! post-release push failed: denied");
+		expect(log).toContain("git's full push output:");
+		expect(log).toContain("! [rejected]");
 	});
 });
 
@@ -7685,6 +7833,7 @@ describe("turn research cards", () => {
 			publishRelease: [],
 			runReleaseCommand: [],
 			runPostReleaseCommand: [],
+			landPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
