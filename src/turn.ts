@@ -4187,6 +4187,9 @@ export function createTurnLoop(
 				))
 			)
 				return;
+			// Hosted credit stop: the prompt gate is the next model dispatch point, so a
+			// stop that landed during the duplicate gate parks the card here.
+			if (await creditBlocked()) return;
 			if (!(await promptGateTurnStart(store, id, task, kind, idn, log))) return;
 			const loc = await prepareTurnWorktree(
 				e,
@@ -4858,8 +4861,15 @@ export function createTurnLoop(
 				candidates,
 				cwd: e.path,
 				ref: header.target,
+				// Hosted credit stop: each of the gate's two model calls re-checks the hold.
+				creditHoldActive: () => creditHold,
 			});
 		} catch (err) {
+			// Hosted credit stop (docs/specs/hosted-mode.md section 5): a stop that lands
+			// inside the gate (term call, search, verdict call) parks the card here instead
+			// of failing open.
+			if (await creditBlockedRun(store, id, `${store.name}/${id}`, log))
+				return false;
 			await log(`! duplicate gate: ${errmsg(err)}`);
 			return (await writeDupStamp(store, id, { verdict: "error" })).ok;
 		}
@@ -5121,6 +5131,10 @@ export function createTurnLoop(
 				break;
 			} catch (e) {
 				err = e as Error;
+				// Hosted credit stop: the retry is a model call too, so a stop that lands
+				// during this attempt parks the card instead of retrying.
+				if (await creditBlockedRun(store, id, `${store.name}/${id}`, log))
+					return false;
 			}
 		}
 		if (err !== null || check === null) {

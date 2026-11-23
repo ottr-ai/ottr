@@ -188,6 +188,8 @@ export async function summarizeRelease(o: {
 	roles?: Record<string, string>;
 	fallbacks?: Record<string, string[]>;
 	timeoutMs?: number;
+	/** Hosted credit hold: true throws before each model call (chunk and final). */
+	creditHoldActive?: () => boolean;
 }): Promise<{ summary: string | null; reason: string | null }> {
 	const roles = o.roles ?? modelRoles();
 	const smol = roles.smol?.trim() || "";
@@ -196,6 +198,8 @@ export async function summarizeRelease(o: {
 	const chain = (o.fallbacks ?? modelFallbacks())[role] ?? [];
 	const call = async (system: string, user: string): Promise<string | null> => {
 		try {
+			if (o.creditHoldActive?.() === true)
+				throw new Error("the board is out of credit");
 			const reply = await runGatewayWithFallbacks(
 				[
 					{ role: "system", content: system },

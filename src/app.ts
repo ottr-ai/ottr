@@ -3559,6 +3559,7 @@ export async function createApp(deps: AppDeps) {
 	// {name, path, store, github}; the factory re-iterates the live Map on every tick.
 	const forkWatcher = createForkWatcher({
 		projects: () => deps.projects.values(),
+		creditHoldActive: deps.creditHoldActive,
 		log: (msg: string) => console.log(`[fork] ${msg}`),
 	});
 
@@ -3623,6 +3624,7 @@ export async function createApp(deps: AppDeps) {
 		log: (msg: string) => console.log(`[pr] ${msg}`),
 		gh,
 		spawn: deps.prReviewSpawn,
+		creditHoldActive: deps.creditHoldActive,
 		// OTTR-1094: a finished draft run posts by itself when the project turned the
 		// manual approval off; the seam runs the Post click's steps after the save.
 		postDraft: async ({ project, number }) => {
@@ -3674,6 +3676,7 @@ export async function createApp(deps: AppDeps) {
 	// omp watch: reviews new omp releases per opted-in project; state lives in gstore.
 	const ompWatcher = createOmpWatcher({
 		projects: () => deps.projects.values(),
+		creditHoldActive: deps.creditHoldActive,
 		load: async (p) => await deps.gstore.get(`ompWatch:${p}`),
 		save: async (p, s) => await deps.gstore.set(`ompWatch:${p}`, s),
 		// Upstream release fetches hit api.github.com: the same github.com token as the
@@ -9721,6 +9724,7 @@ export async function createApp(deps: AppDeps) {
 			notes: plan.notes,
 			cards,
 			spawn: deps.releaseSummarySpawn,
+			creditHoldActive: deps.creditHoldActive,
 			projectName: e.name,
 			projectDescription: readProductDescription(e.path),
 		});
@@ -14306,6 +14310,10 @@ export async function createApp(deps: AppDeps) {
 			const deepened = await (
 				deps.deepen ?? ((prompt, model) => deepenDraft({ prompt, model }))
 			)(trimmedRes, model);
+			// Hosted credit hold: re-checked between the draft and the check, so a stop that
+			// lands during the draft starts no second model call.
+			if (deps.hosted !== undefined && (deps.creditHoldActive?.() ?? false))
+				return json({ error: CREDIT_HOLD_ERROR }, 402);
 			let check: DeepenCheck | null = null;
 			let checkError: string | null = null;
 			try {

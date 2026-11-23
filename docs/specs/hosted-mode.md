@@ -183,11 +183,17 @@ usage that it saw for the run, so a late or repeated record never counts twice. 
   from a call that started before the stop does not clear it. The delayed retry of a failed
   title call is also a model call: when it fires while the hold is set, it does not run. The
   duplicate and prompt gates are model dispatch points of the turn, so a stop that lands
-  between the title and the gates parks the card before any gate call. The board's own
-  gateway calls outside the turn loop honor the hold too: the Deepen route (draft and check)
-  and the release-summary consolidation answer HTTP 402 with the credit error, and the PR
-  review draft, fork research, and omp watch compatibility review skip their model call until
-  a release or a fresh true gate answer clears the hold.
+  between the title and the gates parks the card before any gate call. Each gate re-checks
+  the hold at each of its model dispatches: the duplicate gate re-checks before its second
+  call, so a stop during the first call or the search parks the card instead of a fail-open
+  error, and the prompt gate re-checks at its entry and after each failed attempt, so a
+  stop starts no retry. The board's own gateway calls outside the turn loop honor the hold
+  too: the Deepen route answers HTTP 402 with the credit error at its entry and again
+  between the draft and the check, the release-summary consolidation re-checks before each
+  chunk call and before the final call (a stop after its entry answers the summary as null
+  with the credit reason), and the PR review draft, fork research, and omp watch
+  compatibility review skip their model call until a release or a fresh true gate answer
+  clears the hold.
 - Resume after a top-up: the owner replies `Resume` (or any reply) on the parked card. The
   card goes back to the queue. The gate asks `GET /credit` again before the turn starts, so a
   card never runs while the balance is zero.

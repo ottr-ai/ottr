@@ -1406,6 +1406,71 @@ describe("hosted credit stop", () => {
 		expect(after.cancelledAt).toBeNull();
 	});
 
+	test("creditStop during the duplicate gate parks the card before the prompt gate calls the model", async () => {
+		const { hosted } = fakeHosted();
+		const gate = Promise.withResolvers<void>();
+		let dupStarted = false;
+		let gateCalls = 0;
+		const { store, record, loop } = await setup({
+			hosted,
+			duplicateCheck: async () => {
+				dupStarted = true;
+				await gate.promise;
+				return { verdict: "new" as const, matches: [], reason: "new work" };
+			},
+			gateCheck: async () => {
+				gateCalls += 1;
+				return {
+					builds: "the task",
+					checks: "the recorded run",
+					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+					questions: [],
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => dupStarted);
+		await expect(loop.creditStop()).resolves.toBe(1);
+		gate.resolve();
+		await run;
+		expect(gateCalls).toBe(0);
+		expect(record.runs).toHaveLength(0);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+	});
+
+	test("creditStop during the prompt gate's first attempt parks the card instead of retrying", async () => {
+		const { hosted } = fakeHosted();
+		const attempt = Promise.withResolvers<void>();
+		let gateStarted = false;
+		let gateCalls = 0;
+		const { store, loop } = await setup({
+			hosted,
+			gateCheck: async () => {
+				gateCalls += 1;
+				if (gateCalls === 1) {
+					gateStarted = true;
+					await attempt.promise;
+				}
+				throw new Error("boom");
+			},
+		});
+		const task = await store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => gateStarted);
+		await expect(loop.creditStop()).resolves.toBe(1);
+		attempt.resolve();
+		await run;
+		// No second attempt: the credit park wins over the gate-error park.
+		expect(gateCalls).toBe(1);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+	});
+
 	test("a gate answer that started before the stop does not let the turn run", async () => {
 		const answer = Promise.withResolvers<boolean>();
 		const { hosted } = fakeHosted({ credit: () => answer.promise });

@@ -1102,7 +1102,11 @@ describe("watcher", () => {
 	async function setup(
 		name: string,
 		analyzeImpl: (r: unknown) => Promise<unknown>,
-		opts: { creditHoldActive?: () => boolean } = {},
+		opts: {
+			creditHoldActive?: () => boolean;
+			/** Wraps the git seam, so a test can observe mid-scan git calls. */
+			wrapGit?: (g: GitFn) => GitFn;
+		} = {},
 	) {
 		const main = await initUpstream(name);
 		const store = await initStore(main);
@@ -1120,7 +1124,9 @@ describe("watcher", () => {
 			],
 			log: (m) => logs.push(m),
 			gh,
-			git: localFileGit(join(root, `${name}-fork`)),
+			git:
+				opts.wrapGit?.(localFileGit(join(root, `${name}-fork`))) ??
+				localFileGit(join(root, `${name}-fork`)),
 			analyze: (range, prior) => {
 				analyzeCalls++;
 				return analyzeImpl({ range, prior }) as Promise<never>;
@@ -1415,6 +1421,52 @@ describe("watcher", () => {
 			),
 		).toBe(true);
 		expect(await store.listAllForkBranches()).toEqual([]);
+		expect(
+			(await store.listTasks()).filter((t) => t.topic === "fork research"),
+		).toEqual([]);
+	});
+
+	test("a stop landing during the scan consumes no fork run", async () => {
+		let hold = false;
+		const { main, store, watcher, calls, logs } = await setup(
+			"watch-hold-flip",
+			async () => {
+				throw new Error("analyze must not run under the credit hold");
+			},
+			{
+				creditHoldActive: () => hold,
+				wrapGit: (g) => {
+					let seen = false;
+					return async (args, cwd, timeoutMs) => {
+						const r = await g(args, cwd, timeoutMs);
+						// The hold flips after the first git call (the branch listing), so
+						// the stop lands between the tick's top guard and the claim.
+						if (!seen) {
+							seen = true;
+							hold = true;
+						}
+						return r;
+					};
+				},
+			},
+		);
+		await makeFork("watch-hold-flip-fork", main);
+		await watcher.tick();
+		// The claim guard broke before recordForkRun: the analyze seam never ran and
+		// the pause line names the fork (the project-level pause would name the project).
+		expect(calls()).toBe(0);
+		expect(await store.forkRunsSince(0)).toBe(0);
+		expect(
+			logs.some((m) =>
+				m.includes("o/r: research paused: the board is out of credit"),
+			),
+		).toBe(true);
+		// The scan rows persist (the scan phase is not gated) but stay pending:
+		// nothing analyzed, no run charged, no research card filed.
+		for (const row of await store.listAllForkBranches()) {
+			expect(row.lastRunAt).toBeNull();
+			expect(row.analyzedHead).toBeNull();
+		}
 		expect(
 			(await store.listTasks()).filter((t) => t.topic === "fork research"),
 		).toEqual([]);

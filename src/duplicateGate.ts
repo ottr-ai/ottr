@@ -331,9 +331,13 @@ export async function duplicateCheck(o: {
 	timeoutMs?: number;
 	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
 	fallbacks?: Record<string, string[]>;
+	/** Hosted credit hold: true throws before each of the gate's two model calls. */
+	creditHoldActive?: () => boolean;
 }): Promise<DupVerdict> {
 	const timeoutMs = o.timeoutMs ?? 120_000;
 	const chain = (o.fallbacks ?? modelFallbacks()).plan ?? [];
+	if (o.creditHoldActive?.() === true)
+		throw new Error("the board is out of credit");
 	const terms = parseDupTerms(
 		await runGatewayWithFallbacks(
 			[
@@ -350,6 +354,8 @@ export async function duplicateCheck(o: {
 		terms.length === 0
 			? []
 			: await searchCode({ cwd: o.cwd, ref: o.ref, terms, git: o.git });
+	if (o.creditHoldActive?.() === true)
+		throw new Error("the board is out of credit");
 	const raw = await runGatewayWithFallbacks(
 		[
 			{ role: "system", content: dupVerdictSystem },

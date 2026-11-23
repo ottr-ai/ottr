@@ -1719,6 +1719,20 @@ async function reviewOnce(
 		return;
 	}
 	const { run } = claim;
+	// Hosted credit hold (docs/specs/hosted-mode.md section 5): re-checked at the model
+	// dispatch, so a stop that lands during the diff fetch still starts no review call.
+	if (ctx.creditHoldActive?.() === true) {
+		const reason = "the board is out of credit";
+		ctx.recordSkipNotice(project.name, row.number, row.head, reason);
+		ctx.log(`prs: ${project.name}: #${row.number} review skipped: ${reason}`);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "skipped", text: reason },
+			row.taskId,
+		);
+		return;
+	}
 	try {
 		// The verdict comes out before the fit, so a block the fit moves can never carry
 		// or forge it, and before parseDraft: a verdict-only answer is empty and throws.

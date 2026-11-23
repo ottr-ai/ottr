@@ -874,10 +874,20 @@ export function createForkWatcher(deps: {
 }): { tick(opts?: { manual?: string }): Promise<void> } {
 	const gh = deps.gh ?? runGh;
 	const runGit = deps.git ?? defaultGit;
-	const analyze =
-		deps.analyze ??
-		((range: ForkRange, prior: { titles: string[]; declines: string[] }) =>
-			analyzeRange(range, prior));
+	const analyze = async (
+		range: ForkRange,
+		prior: { titles: string[]; declines: string[] },
+	): Promise<ForkAnalysisResult> => {
+		// Hosted credit hold (docs/specs/hosted-mode.md section 5): re-checked at the
+		// model dispatch, so a stop that lands during the claim starts no gateway call.
+		if (deps.creditHoldActive?.() === true)
+			throw new Error("fork research paused: the board is out of credit");
+		return (
+			deps.analyze ??
+			((r: ForkRange, p: { titles: string[]; declines: string[] }) =>
+				analyzeRange(r, p))
+		)(range, prior);
+	};
 	const now = deps.now ?? Date.now;
 
 	async function scan(opts?: { manual?: string }): Promise<void> {
@@ -1392,6 +1402,14 @@ export function createForkWatcher(deps: {
 							}
 						});
 						continue;
+					}
+					// Hosted credit hold (docs/specs/hosted-mode.md section 5): re-checked at the
+					// claim, so a stop during the scan consumes no fork run.
+					if (deps.creditHoldActive?.() === true) {
+						deps.log(
+							`forks: ${fork.owner}/${fork.name}: research paused: the board is out of credit`,
+						);
+						break;
 					}
 					// Step 9.
 					const claim = await store.transaction(async () => {

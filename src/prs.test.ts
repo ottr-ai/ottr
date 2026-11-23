@@ -220,6 +220,8 @@ async function setup(
 		runQuiet?: (project: string) => Promise<void> | void;
 		/** OTTR-1010: the hosted credit hold seam. */
 		creditHoldActive?: () => boolean;
+		/** OTTR-1010: runs when the gh fake serves a diff fetch. */
+		onDiffFetch?: () => void;
 	} = {},
 ) {
 	const dir = join(root, `p${++seq}`);
@@ -261,13 +263,16 @@ async function setup(
 		if (failDiff && args.includes("-H"))
 			return { code: 1, stdout: "", stderr: "HTTP 401" };
 		const m = path.match(/pulls\/(\d+)$/);
-		if (m && args.includes("-H"))
+		if (m && args.includes("-H")) {
+			// OTTR-1010: lets a test flip the credit hold mid-review, at the diff fetch.
+			opts.onDiffFetch?.();
 			return {
 				code: 0,
 				stdout:
 					state.diffs.get(Number(m[1])) ?? `diff --git a/x b/x\n+pr ${m[1]}\n`,
 				stderr: "",
 			};
+		}
 		if (m) return pullRoute(state, Number(m[1]));
 		const routed = reviewRoute(state, path);
 		return routed ?? ghJson(state.open);
@@ -2355,6 +2360,29 @@ describe("createPrWatcher", () => {
 		expect(notices).toHaveLength(1);
 		expect(notices[0]).toContain("the board is out of credit");
 		// The run record ended as a skip, not as an error or a hang.
+		expect(s.watcher.prRun("p", 4)?.endedAt).not.toBeNull();
+		expect(s.watcher.prRun("p", 4)?.error).toBe("the board is out of credit");
+	});
+
+	test("a stop landing during the diff fetch starts no review call", async () => {
+		let hold = false;
+		const s = await setup({
+			creditHoldActive: () => hold,
+			onDiffFetch: () => {
+				hold = true;
+			},
+		});
+		s.setOpen([pr(4, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		// The entry guard saw the hold inactive; the diff fetch then flipped it, so the
+		// re-check at the model dispatch must end the run as a skip.
+		await s.watcher.tick();
+		expect(s.prompts).toHaveLength(0);
+		const notices = s.watcher.skipNotices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("the board is out of credit");
+		// The run record ended as a skip, so a later tick retries the head.
 		expect(s.watcher.prRun("p", 4)?.endedAt).not.toBeNull();
 		expect(s.watcher.prRun("p", 4)?.error).toBe("the board is out of credit");
 	});

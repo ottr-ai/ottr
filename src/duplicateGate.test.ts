@@ -753,6 +753,46 @@ describe("duplicateCheck", () => {
 		expect(v.verdict).toBe("new");
 		expect(requests[1]?.body.messages[1]?.content).toContain("(no hits)");
 	});
+
+	test("an active credit hold throws before the terms call: no gateway spawn", async () => {
+		const { spawn, requests } = fakeGateway([]);
+		await expect(
+			duplicateCheck({
+				prompt: "Add a widget",
+				candidates,
+				cwd: repo,
+				ref: "main",
+				spawn,
+				creditHoldActive: () => true,
+			}),
+		).rejects.toThrow("the board is out of credit");
+		expect(requests).toHaveLength(0);
+	});
+
+	test("a hold that lands after the terms call stops the verdict call", async () => {
+		const { spawn, requests } = fakeGateway([
+			'{"terms":["renderWidget"]}',
+			'{"verdict":"new","matches":[],"reason":"never reached"}',
+		]);
+		let spawns = 0;
+		const counting: SpawnFn = async (argv, o) => {
+			spawns += 1;
+			return await spawn(argv, o);
+		};
+		await expect(
+			duplicateCheck({
+				prompt: "Add a widget",
+				candidates,
+				cwd: repo,
+				ref: "main",
+				spawn: counting,
+				creditHoldActive: () => spawns > 0,
+			}),
+		).rejects.toThrow("the board is out of credit");
+		// Only the terms call spawned; the verdict call never dispatched.
+		expect(spawns).toBe(1);
+		expect(requests).toHaveLength(1);
+	});
 });
 
 describe("outcome texts", () => {

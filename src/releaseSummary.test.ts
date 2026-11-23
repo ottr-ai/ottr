@@ -297,6 +297,48 @@ describe("summarizeRelease", () => {
 			expect(u.length).toBeLessThanOrEqual(40_000);
 	});
 
+	test("a credit hold that lands during the chunk pass stops the final call", async () => {
+		const big: ReleaseSummaryCard[] = [];
+		for (let i = 0; i < 60; i++)
+			big.push(
+				card(`C-${i}`, `card ${i}`, `## Changes\n\n- ${"z".repeat(3500)}`),
+			);
+		let spawns = 0;
+		const spawn: SpawnFn = async () => {
+			spawns += 1;
+			return {
+				code: 0,
+				stdout: [
+					JSON.stringify({ ready: true }),
+					JSON.stringify({
+						id: 1,
+						status: 200,
+						body: {
+							choices: [{ message: { content: "- chunk work" } }],
+						},
+					}),
+				].join("\n"),
+				stderr: "",
+			};
+		};
+		// Every dispatch re-checks the hold: the chunks start in one synchronous map, so
+		// only the first chunk passes the check at zero spawns; the rest and the final
+		// call see the flipped hold and never dispatch.
+		const out = await summarizeRelease({
+			notes: "- fix: login",
+			cards: big,
+			spawn,
+			projectName: "p",
+			creditHoldActive: () => spawns > 0,
+		});
+		expect(out).toEqual({
+			summary: null,
+			reason: "the board is out of credit",
+		});
+		// One chunk call ran; the hold stopped the other chunks and the final dispatch.
+		expect(spawns).toBe(1);
+	});
+
 	test("the system message stays project-neutral and the user message names the project and description", async () => {
 		const { spawn, calls, users } = okSpawn(reply);
 		const out = await summarizeRelease({

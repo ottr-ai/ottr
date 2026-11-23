@@ -19939,7 +19939,9 @@ describe("update cycle control (OTTR-752)", () => {
 	test("the hosted credit hold refuses the board's own model-call routes", async () => {
 		const secret = crypto.randomUUID();
 		let hold = false;
+		let holdDuringDraft = false;
 		let deepenCalls = 0;
+		let checkCalls = 0;
 		const m = await board({
 			hosted: {
 				config: {
@@ -19967,10 +19969,13 @@ describe("update cycle control (OTTR-752)", () => {
 			creditHoldActive: () => hold,
 			deepen: async () => {
 				deepenCalls += 1;
+				if (holdDuringDraft) hold = true;
 				return "deepened";
 			},
+			// A counting stub: the route must never reach the check while the hold is set.
 			deepenCheck: async () => {
-				throw new Error("the check must not run under the hold");
+				checkCalls += 1;
+				return { points: [], additions: [] };
 			},
 		});
 		const ok = await m.call(
@@ -19995,6 +20000,28 @@ describe("update cycle control (OTTR-752)", () => {
 		expect(deepenCalls).toBe(1);
 		const refusedBody = (await refused.json()) as { error: string };
 		expect(refusedBody.error).toContain("credit");
+		// The hold lifted: the route's entry re-check passes and both model calls run.
+		hold = false;
+		const resumed = await m.call(
+			"/api/projects/ottr/deepen",
+			{ prompt: "make a thing" },
+			{ "x-ottr-identity": signIdentity(secret, "acme", "owner") },
+		);
+		expect(resumed.status).toBe(200);
+		expect(deepenCalls).toBe(2);
+		// The check ran once in the first call and once in the resumed call.
+		expect(checkCalls).toBe(2);
+		// A stop landing during the draft: the route re-checks before the check, so the
+		// check seam never runs and the answer is the credit refusal again.
+		holdDuringDraft = true;
+		const during = await m.call(
+			"/api/projects/ottr/deepen",
+			{ prompt: "make a thing" },
+			{ "x-ottr-identity": signIdentity(secret, "acme", "owner") },
+		);
+		expect(during.status).toBe(402);
+		expect(deepenCalls).toBe(3);
+		expect(checkCalls).toBe(2);
 	});
 
 	test("the real build-commit reader wins and only sha versions provide a fallback", async () => {
