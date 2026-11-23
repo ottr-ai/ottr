@@ -10,7 +10,17 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+/** OTTR-754: 24 h. A top-level entry older than this goes, live holds aside. */
 const AGE_MS = 24 * 60 * 60 * 1000;
+
+/** OTTR-1211: how far a kernel-assigned inode timestamp may sit behind the sweep
+ * process's Date.now(). The two clocks skew by a few ms in these containers
+ * (observed ±4 ms), so a run's start can read a hair NEWER than the birth mtime
+ * of the very scratch the same run created a moment before — a quiet scratch
+ * would then fail `start <= newest` and the daily tick would delete a live
+ * run's TMPDIR. 5 s of slack only widens the keep side of the guard and stays
+ * negligible against the 24 h TTL. */
+export const SWEEP_CLOCK_SKEW_MS = 5_000;
 
 export interface SweptTmpEntry {
 	name: string;
@@ -157,7 +167,13 @@ function readDeletedLink(link: string): string | null {
  */
 export function sweepTmpDirs(
 	root: string = tmpdir(),
-	opts?: { procRoot?: string; liveTurnStarts?: readonly number[] },
+	opts?: {
+		procRoot?: string;
+		liveTurnStarts?: readonly number[];
+		/** Only for tests: the clock, so a fixture can age an entry past the TTL
+		 * without waiting. */
+		now?: number;
+	},
 ): SweptTmpEntry[] {
 	let entries: string[];
 	try {
@@ -167,11 +183,12 @@ export function sweepTmpDirs(
 	}
 	const held = [...liveHeldPaths(opts?.procRoot ?? "/proc")];
 	const starts = opts?.liveTurnStarts ?? [];
+	const now = opts?.now ?? Date.now();
 	const swept: SweptTmpEntry[] = [];
 	for (const name of entries) {
 		if (name === "." || name === "..") continue;
 		try {
-			const sweptEntry = sweepEntry(root, name, held, starts);
+			const sweptEntry = sweepEntry(root, name, held, starts, now);
 			if (sweptEntry !== null) swept.push(sweptEntry);
 		} catch {
 			// Busy or vanished entry: leave it for the next sweep.
@@ -185,7 +202,11 @@ export function sweepTmpDirs(
  * boot, so a deleted entry's name and bytes stay visible on the process's own console. */
 export function sweepTmpDirsLogged(
 	root: string = tmpdir(),
-	opts?: { procRoot?: string; liveTurnStarts?: readonly number[] },
+	opts?: {
+		procRoot?: string;
+		liveTurnStarts?: readonly number[];
+		now?: number;
+	},
 ): SweptTmpEntry[] {
 	const swept = sweepTmpDirs(root, opts);
 	for (const { name, bytes } of swept)
@@ -199,11 +220,16 @@ function sweepEntry(
 	name: string,
 	held: readonly string[],
 	starts: readonly number[],
+	now: number,
 ): SweptTmpEntry | null {
 	const entryPath = join(root, name);
 	const newest = newestMtime(entryPath);
-	if (newest === null || Date.now() - newest < AGE_MS) return null;
-	if (starts.some((start) => start <= newest)) return null;
+	if (newest === null || now - newest < AGE_MS) return null;
+	// SWEEP_CLOCK_SKEW_MS: a kernel mtime may sit a few ms behind this process's
+	// clock, so `start <= newest` alone would miss the birth mtime of a live run's
+	// own just-created scratch (see the constant's comment).
+	if (starts.some((start) => start - SWEEP_CLOCK_SKEW_MS <= newest))
+		return null;
 	if (held.some((h) => h === entryPath || h.startsWith(`${entryPath}/`)))
 		return null;
 	const bytes = sumFileBytes(entryPath);

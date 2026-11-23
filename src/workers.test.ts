@@ -8,7 +8,9 @@ import {
 	readFileSync,
 	readlinkSync,
 	rmSync,
+	statSync,
 	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +18,7 @@ import { dirname, join } from "node:path";
 import { readLayerUse, rebuildLayerUse } from "./layers.ts";
 import { signIns } from "./login.ts";
 import { createRunSink, type RunSink } from "./runner.ts";
+import { SWEEP_CLOCK_SKEW_MS, sweepTmpDirs } from "./tmpsweep.ts";
 import { projectTurnUid } from "./turnUid.ts";
 import {
 	detachedRuns,
@@ -79,6 +82,15 @@ writeFileSync(
 	`const fs = require("node:fs");
 fs.writeFileSync(require("node:path").join(process.env.TMPDIR, "used"), "x");
 process.stdout.write([process.env.TMPDIR, process.env.OTTR_TMP_ROOT, process.env.BUN_INSTALL_CACHE_DIR].join(" ") + "\\n");
+setInterval(() => {}, 1000);`,
+);
+
+// Quiet scratch omp: prints only its TMPDIR and never writes — the scratch stays at
+// its creation mtime, the shape the sweep's live-run guard must protect a day later.
+const quietScratchPath = join(dir, "quiet-scratch-omp.js");
+writeFileSync(
+	quietScratchPath,
+	`process.stdout.write(process.env.TMPDIR + "\\n");
 setInterval(() => {}, 1000);`,
 );
 
@@ -1267,6 +1279,82 @@ describe("serveWorker", () => {
 			rmSync(homes, { recursive: true, force: true });
 		}
 	}, 30000);
+
+	test("the daily tmp sweep keeps a live run's quiet scratch (guard ordering)", async () => {
+		// The run's start must be stamped before its scratch exists: a scratch that
+		// never sees a write after creation (the common case now that the caches live
+		// outside TMPDIR) ages past the TTL while its run is still live, and only
+		// `start <= newest mtime` can keep it then.
+		const homes = mkdtempSync(join(tmpdir(), "ottr-homes-guard-"));
+		const savedHomes = process.env.OTTR_TURN_HOMES;
+		process.env.OTTR_TURN_HOMES = homes;
+		try {
+			const server = serveWorker({ port: 0, ompPath: process.execPath });
+			servers.push(server);
+			const url = `http://127.0.0.1:${server.port}`;
+			const controller = new AbortController();
+			const res = await fetch(`${url}/run`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id: "r-guard",
+					argv: [quietScratchPath],
+					cwd: dir,
+					stdin: "",
+					env: {},
+					project: "alpha",
+				}),
+				signal: controller.signal,
+			});
+			const reader = res.body!.getReader();
+			const scratch = new TextDecoder()
+				.decode((await reader.read()).value)
+				.trim();
+			// The scratch never sees a write: its newest mtime is its creation time.
+			const created = statSync(scratch).mtimeMs;
+			// The contract the sweeps' guard carries: a live run's start covers its own
+			// scratch's birth mtime even across the kernel/userspace clock skew.
+			const starts = server.runStarts();
+			expect(starts.length).toBeGreaterThan(0);
+			expect(
+				starts.some((start) => start - SWEEP_CLOCK_SKEW_MS <= created),
+			).toBe(true);
+			// The daily tick's sweep, at a clock 25 hours later, with the real starts.
+			// A rival aged entry older than every live run (skew included) proves the
+			// sweep ran and that the guard — not the age rule — kept the scratch.
+			const quietGone = join(homes, "alpha", "tmp", "quiet-gone");
+			mkdirSync(quietGone);
+			writeFileSync(join(quietGone, "old.txt"), "x");
+			const uncovered =
+				starts.reduce((a, s) => Math.min(a, s), Infinity) -
+				SWEEP_CLOCK_SKEW_MS -
+				60_000;
+			// Age the dir and its file: newestMtime reads the newest child too.
+			utimesSync(quietGone, uncovered / 1000, uncovered / 1000);
+			utimesSync(
+				join(quietGone, "old.txt"),
+				uncovered / 1000,
+				uncovered / 1000,
+			);
+			const swept = sweepTmpDirs(join(homes, "alpha", "tmp"), {
+				liveTurnStarts: starts,
+				now: created + 25 * 60 * 60 * 1000,
+				procRoot: join(homes, "no-proc"),
+			});
+			expect(swept.map((e) => e.name)).toContain("quiet-gone");
+			expect(existsSync(quietGone)).toBe(false);
+			expect(existsSync(scratch)).toBe(true);
+			// The run is still going; end it and its scratch goes as always.
+			controller.abort();
+			const deadline = Date.now() + 10_000;
+			while (existsSync(scratch) && Date.now() < deadline) await Bun.sleep(20);
+			expect(existsSync(scratch)).toBe(false);
+		} finally {
+			if (savedHomes === undefined) delete process.env.OTTR_TURN_HOMES;
+			else process.env.OTTR_TURN_HOMES = savedHomes;
+			rmSync(homes, { recursive: true, force: true });
+		}
+	}, 15000);
 
 	test("omp output that arrives after the client left raises no error", async () => {
 		// The daemon kills omp when the client leaves, but lines omp wrote before the kill

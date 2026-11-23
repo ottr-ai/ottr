@@ -10,7 +10,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatBytes, sweepTmpDirs, sweepTmpDirsLogged } from "./tmpsweep.ts";
+import {
+	formatBytes,
+	SWEEP_CLOCK_SKEW_MS,
+	sweepTmpDirs,
+	sweepTmpDirsLogged,
+} from "./tmpsweep.ts";
 
 describe("sweepTmpDirs", () => {
 	const root = mkdtempSync(join(tmpdir(), "sweeptest-"));
@@ -161,6 +166,31 @@ describe("sweepTmpDirs", () => {
 			}).map((e) => e.name),
 		).toContain("turn-owned");
 		expect(existsSync(join(root, "turn-owned"))).toBe(false);
+	});
+
+	test("a start within the clock skew keeps an entry born just before it", () => {
+		// The kernel may stamp an inode a few ms behind Date.now(): a scratch created
+		// right at its run's birth then reads older than the start. The guard's skew
+		// slack keeps it; a start beyond the skew does not.
+		make("born-under-start");
+		const startMs = oldMs + 4; // the entry reads 4 ms older than the run's start
+		expect(
+			sweepTmpDirs(root, {
+				procRoot,
+				liveTurnStarts: [startMs],
+				now: oldMs + 25 * 60 * 60 * 1000,
+			}).map((e) => e.name),
+		).not.toContain("born-under-start");
+		expect(existsSync(join(root, "born-under-start"))).toBe(true);
+		const beyondSkew = oldMs + SWEEP_CLOCK_SKEW_MS + 60_000;
+		expect(
+			sweepTmpDirs(root, {
+				procRoot,
+				liveTurnStarts: [beyondSkew],
+				now: oldMs + 25 * 60 * 60 * 1000,
+			}).map((e) => e.name),
+		).toContain("born-under-start");
+		expect(existsSync(join(root, "born-under-start"))).toBe(false);
 	});
 
 	test("removes an old prefixed entry (regression)", () => {

@@ -53,8 +53,13 @@ root on the server):
    falls back to mtime; an entry with no readable freshness stays.
 2. Cap: while the root holds more than `CACHE_ROOT_MAX_BYTES` (5 GiB), evict
    the top-level entry with the oldest freshness, until the root fits.
-3. An entry a live process holds (cwd, open fd, argv, exe) is never removed.
-   The walk only lstats, so it never refreshes file atimes.
+3. An entry a live process holds (cwd, open fd, argv, exe) is never removed,
+   and an entry whose newest mtime sits within `SWEEP_CLOCK_SKEW_MS` (5 s)
+   before a live run's start is never removed: the run's start is stamped
+   before its scratch dir is created, but the kernel may assign the inode's
+   birth mtime a few ms behind the sweeping process's clock, and the guard
+   must hold for a scratch that never sees a write. The walk only lstats, so
+   it never refreshes file atimes.
 4. One log line per root per run names the root and the freed size.
 
 Constants are named; per-entry failures skip the entry for the next sweep.

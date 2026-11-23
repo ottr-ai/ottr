@@ -484,6 +484,10 @@ export function serveWorker(opts: {
 		notes: string,
 		pathDir: string,
 	): Promise<Response> => {
+		// The run's start, stamped before anything the run owns exists: the scratch dir
+		// created below carries its creation mtime, and the sweeps' live-run guard
+		// (start <= newest mtime) must hold even for a scratch that never sees a write.
+		const startedAt = Date.now();
 		const env = runChildEnv(body.env, body.githubReadEnv, pathDir);
 		// Per-project turn identity (OTTR-994): the run drops to its project's uid, its
 		// HOME moves to the per-project turn home or layer copy, its project dirs under
@@ -622,7 +626,7 @@ export function serveWorker(opts: {
 			cwd: body.cwd,
 			pid: child.pid ?? null,
 			running: true,
-			startedAt: Date.now(),
+			startedAt,
 			detached: false,
 			closeStream: (): void => {},
 		};
