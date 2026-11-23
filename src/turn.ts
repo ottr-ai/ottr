@@ -266,10 +266,12 @@ import type {
 import {
 	commitMeta,
 	commitSubjects,
+	git,
 	PUSH_LANDED_BEFORE_ATTEMPT,
 	parseKeptChoices,
 	planKeptFinish,
 	type quarantineUntracked,
+	redactUrlCredentials,
 	type saveDoneFiles,
 	slugify,
 	targetTracksRules,
@@ -3499,6 +3501,30 @@ export function createTurnLoop(
 			.map((f) => f.mergeHead);
 	}
 
+	/** OTTR-1025: the release tag's commit is the pinned origin's own tip, read with
+	 * ls-remote of the target ref — never the worker-writable tracking ref a work
+	 * turn can rewrite between the resolver's fetch and the publish. Null when there
+	 * is no pinned origin or the target is not the canonical `origin/<branch>` form:
+	 * those publishes keep the resolver's sha (a repo with no pinned origin has no
+	 * remote truth to consult, and the push part refuses or skips on its own). */
+	async function pinnedTip(
+		mainPath: string,
+		originUrl: string | null,
+		target: string,
+	): Promise<string | null> {
+		if (originUrl === null || !target.startsWith("origin/")) return null;
+		const ref = `refs/heads/${target.slice("origin/".length)}`;
+		const ls = await git(["ls-remote", originUrl, ref], mainPath);
+		if (ls.code !== 0)
+			throw new Error(
+				`cannot read ${target} from the pinned origin: ${ls.stderr.trim()}`,
+			);
+		const tip = ls.stdout.trim().split("\t")[0] ?? "";
+		if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tip))
+			throw new Error(`the pinned origin has no ${ref} to tag`);
+		return tip;
+	}
+
 	/** The default publish: tag the target's head — the review's fixes landed there after the
 	 * reviewed commit, and settleReviews waited for them (publishRelease refuses a head
 	 * without that commit). Returns the release line, or null when a cancel won the claim. */
@@ -3519,8 +3545,20 @@ export function createTurnLoop(
 			settings.originUrl,
 			settings.targetBranch,
 		);
-		if (head.warning !== null) await log(head.warning);
+		if (head.warning !== null) await log(redactUrlCredentials(head.warning));
 		if (!(await claimPublish())) return null;
+		// OTTR-1025: a best-effort resolution (failed trusted refresh, unpinned origin,
+		// a non-origin upstream) falls back to the worker-writable tracking ref. The
+		// content gate only proves ancestry of the reviewed commit, so the publish
+		// refuses instead of tagging a commit origin may never have held.
+		if (head.warning !== null)
+			throw new Error(
+				redactUrlCredentials(`refusing to publish: ${head.warning}`),
+			);
+		// OTTR-1025: the tag's commit is the pinned origin's own tip (ls-remote of the
+		// target ref), never the tracking ref a work turn can rewrite between the
+		// fetch above and this read. Null keeps the resolved sha (no pinned origin).
+		const sha = await pinnedTip(e.path, settings.originUrl, head.target);
 		// OTTR-882: the release runs as the configured GitHub app when one is set; a failed
 		// mint falls back to the GH_TOKEN user token with the reason on the card log. Hosted
 		// boards keep their project-scoped gh and git auth: nothing is resolved here.
@@ -3550,7 +3588,7 @@ export function createTurnLoop(
 		return ops.publishRelease({
 			mainPath: e.path,
 			reviewed: base,
-			sha: head.sha,
+			sha: sha ?? head.sha,
 			version: releaseVersion,
 			notes: task.releaseNotes ?? "",
 			findings,

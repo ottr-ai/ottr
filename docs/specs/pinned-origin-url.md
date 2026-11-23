@@ -44,7 +44,12 @@ from `origin` by name.
      fetch with a warning — the board never fetches by remote name;
    - `planRelease` fetches `--tags <originUrl>`;
    - `publishRelease` pushes the tag to `<originUrl>`;
-   - `runReleaseCommand` ls-remotes and fetches tags from `<originUrl>`.
+   - `runReleaseCommand` ls-remotes and fetches tags from `<originUrl>`;
+   - `publishTaggedRelease` refuses to publish a `resolveTarget` result that
+     carries a warning (a failed trusted refresh must never choose the release
+     commit: the fallback ref is worker-writable and the content gate proves
+     only ancestry), and it takes the tag's commit from `git ls-remote
+     <originUrl>` of the target ref, never from the tracking ref.
 4. `serverMergePush` and the release paths fail with a clear error when the pin
    is `null` while an origin remote exists (fail closed). `mergeHoldMismatch`
    fails closed (mismatch). `resolveTarget` skips the fetch with its warning

@@ -153,6 +153,7 @@ import {
 	setNetworkGitAuth,
 	slugify,
 } from "./worktree.ts";
+import { publishRelease as realPublishRelease } from "./release.ts";
 
 // ---- fakes -----------------------------------------------------------------
 
@@ -18497,7 +18498,7 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		expect(record.publishRelease[0]).toMatchObject({ findings: ["shaF"] });
 	});
 
-	test("a target warning at publish reaches the release card's log", async () => {
+	test("a target warning at publish refuses the release and names the failed refresh", async () => {
 		const record = baseRecord();
 		const { store, projects, loop } = await setupWith(record, {
 			publishRelease: publishingRelease(record),
@@ -18513,10 +18514,148 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		await loop.schedule();
 		await flushPromises();
 
+		// OTTR-1025: a degraded resolution never reaches the publisher. The card log
+		// names the failed refresh and the card parks with the refusal reason.
+		expect(record.publishRelease).toHaveLength(0);
 		expect(await logText(store, task.id)).toContain(
 			"origin/main is gone; tagging origin/trunk",
 		);
-		expect((await store.getTask(task.id))!.stage).toBe("done");
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Release failed: refusing to publish: origin/main is gone; tagging origin/trunk. Fix it, then reply to retry.",
+		);
+	});
+
+	test("a parked release refuses to publish when the trusted refresh fails", async () => {
+		const record = baseRecord();
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const { store, projects, loop } = await setupWith(record, {
+			resolveTarget: realResolveTarget,
+			publishRelease: async (
+				o: Parameters<TurnOps["publishRelease"]>[0],
+			) => {
+				record.publishRelease.push(o);
+				return await realPublishRelease(o);
+			},
+		});
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "reviewed base");
+		const reviewed = run(dir, "rev-parse", "HEAD");
+		run(dir, "remote", "add", "origin", origin);
+		run(dir, "push", "-q", "origin", "main:main");
+		// The work turn's plant: an unreviewed descendant of the reviewed commit on the
+		// tracking ref, plus a lock file that fails the trusted refresh of that ref.
+		const planted = run(
+			dir,
+			"commit-tree",
+			"HEAD^{tree}",
+			"-p",
+			"HEAD",
+			"-m",
+			"unreviewed",
+		);
+		run(dir, "update-ref", "refs/remotes/origin/main", planted);
+		writeFileSync(
+			join(dir, ".git", "refs", "remotes", "origin", "main.lock"),
+			"locked",
+		);
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({ originUrl: origin, targetBranch: "main" });
+		const task = await parkedRelease(store);
+		await store.updateTask(task.id, { base: reviewed });
+
+		await loop.schedule();
+		// The settle runs real git subprocesses (the pinned fetch, the lock refusal):
+		// settled() awaits the card's landed state instead of a guessed flush count.
+		const after = await settled(store, task.id);
+
+		// The publish never ran: no tag in the checkout, none on the bare origin.
+		expect(record.publishRelease).toHaveLength(0);
+		expect(run(origin, "for-each-ref", "refs/tags")).toBe("");
+		expect(run(dir, "tag", "-l")).toBe("");
+		// The card log and the hold reason name the failed refresh.
+		const log = await logText(store, task.id);
+		expect(log).toContain("git fetch");
+		expect(log).toContain("cannot lock ref");
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("Release failed: refusing to publish:");
+		expect(after.needsReason).toContain("cannot lock ref");
+	});
+
+	test("a parked release tags the pinned origin's tip, not the local tracking ref", async () => {
+		const record = baseRecord();
+		const run = (cwd: string, ...args: string[]): string => {
+			const r = Bun.spawnSync(["git", ...args], {
+				cwd,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: fixtureGitEnv(),
+			});
+			if (r.exitCode !== 0)
+				throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+			return r.stdout.toString().trim();
+		};
+		const { store, projects, loop } = await setupWith(record, {
+			// The resolver answers with a tracking-ref sha the origin never held.
+			resolveTarget: async () => ({
+				target: "origin/main",
+				sha: "planted0",
+				warning: null,
+			}),
+			publishRelease: async (
+				o: Parameters<TurnOps["publishRelease"]>[0],
+			) => {
+				record.publishRelease.push(o);
+				return await realPublishRelease(o);
+			},
+		});
+		const dir = store.path;
+		const origin = mkdtempSync(join(tmpdir(), "turn-test-origin-"));
+		dirs.push(origin);
+		run(origin, "init", "-q", "--bare", "-b", "main");
+		run(dir, "init", "-q", "-b", "main");
+		run(dir, "config", "user.email", "t@t");
+		run(dir, "config", "user.name", "t");
+		run(dir, "commit", "-q", "--allow-empty", "-m", "reviewed base");
+		const reviewed = run(dir, "rev-parse", "HEAD");
+		run(dir, "remote", "add", "origin", origin);
+		run(dir, "push", "-q", "origin", "main:main");
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({ originUrl: origin, targetBranch: "main" });
+		const task = await parkedRelease(store);
+		await store.updateTask(task.id, { base: reviewed });
+
+		await loop.schedule();
+		// The settle runs real git subprocesses (ls-remote, tag, push): settled()
+		// awaits the card's landed state instead of a guessed flush count.
+		await settled(store, task.id);
+		const after = (await store.getTask(task.id))!;
+
+		// The tag rides the pinned origin's own answer (OTTR-1025), never the
+		// resolver's worker-writable sha.
+		expect(record.publishRelease[0]).toMatchObject({ sha: reviewed });
+		expect(run(origin, "rev-parse", "refs/tags/v4.0.0^{commit}")).toBe(
+			reviewed,
+		);
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("Released v4.0.0");
 	});
 
 	test("a failed review-delta read publishes without the review range", async () => {
