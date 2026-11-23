@@ -1797,10 +1797,15 @@ project-level skill enables off and lists the run home's enabled plugins' skill
 directories as `skills.customDirectories`: omp reads those `SKILL.md` files as prompt
 content and still runs no plugin code. The run home is the run's pinned agent layer or
 its flat home: the board home (or its layer) for the board's own runs, the shared home
-(or its layer) for worker and VM runs. The overlay file name carries the home path's
-sha256, so the homes share the data dir but never the file — every run reads and
-converges only its own home's list (the ensure step runs before the spawn, the same
-guard as the memory overlay).
+(or its layer) for worker and VM runs. The overlay dir follows the dispatch: a
+board-side run writes the server-only state dir (`OTTR_SERVER_DATA_DIR`, the
+ottr-state volume — no worker mounts it, so a worker cannot replace the file between
+the board's write and omp's read), a worker or VM run the data dir the spawned omp
+mounts or copies in. The overlay file name carries the home path's sha256, so runs
+that share an anchor never share the file — every run reads and converges only its
+own home's list (the ensure step runs before the spawn; on a shared anchor the plant
+window between write and read stays the accepted residual, the memory overlay's
+guard).
 
 Custom tools have no such gate in the pinned omp line (18.15.0): omp imports every
 module under the worktree's `.omp/tools`, `.omp/plugins`, `.claude/tools`,

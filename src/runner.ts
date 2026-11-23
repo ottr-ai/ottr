@@ -1875,10 +1875,12 @@ interface RunStart {
 }
 
 /** The plugin-skills overlay for one run: the enabled plugins of the run's home
- * (docs/specs/turn-home-plugin-skills.md). A VM run scopes the overlay dir to the
- * project data dir, the only tree vm-runner copies in (resolveMemoryConfig). The
- * per-project scoping takes the same value that becomes the spawn's OTTR_PROJECT
- * (o.board.project; a stripBoard run carries none). */
+ * (docs/specs/turn-home-plugin-skills.md). The overlay dir follows the dispatch: a
+ * board-side run writes the server-only state dir (a worker could otherwise
+ * rename-over the file between the board's write and omp's read), a worker run the
+ * shared data dir and a VM run the project data dir — the only trees the spawned omp
+ * reads the path in. The per-project scoping takes the same value that becomes the
+ * spawn's `OTTR_PROJECT` (o.board.project; a stripBoard run carries none). */
 function pluginSkillsConfigFor(
 	o: StartOptions,
 	layerEnv: { HOME: string; PI_CODING_AGENT_DIR: string } | null,
@@ -1887,11 +1889,14 @@ function pluginSkillsConfigFor(
 	const home = o.pluginSkillsHome ?? layerEnv?.HOME ?? layerHome;
 	const project = o.board && !o.stripBoard ? o.board.project : null;
 	return ensurePluginSkillsOverlay(
-		o.vm
-			? { ...process.env, OTTR_DATA_DIR: dirname(o.sessionDir) }
-			: process.env,
+		process.env,
 		home,
 		project,
+		o.vm
+			? { kind: "vm", sessionDir: o.sessionDir }
+			: o.worker
+				? { kind: "worker" }
+				: { kind: "board" },
 	);
 }
 

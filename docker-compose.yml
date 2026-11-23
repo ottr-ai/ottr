@@ -191,8 +191,9 @@ services:
       OMP_TRACKER_HOST: 0.0.0.0 # default is loopback, which dead-ports through the mapping
       OMP_TRACKER_ROOTS: /workspace
       OTTR_DATA_DIR: /data # task data outside the clones: /data/<project>
-      # Server-only project state (tasks.db with settings and task rows, fork caches) on the
-      # ottr-state volume, which no worker mounts. /data keeps only what workers need.
+      # Server-only project state (tasks.db with settings and task rows, fork caches) and
+      # the board-side omp --config overlays (plugin skills) on the ottr-state volume,
+      # which no worker mounts. /data keeps only what workers need.
       OTTR_SERVER_DATA_DIR: /app/.tasks/projects
       # Server-only ssh keys and known_hosts : on the ottr-state
       # volume, which no worker mounts. /data and /root are worker-mounted, so never there.

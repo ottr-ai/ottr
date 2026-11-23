@@ -10,7 +10,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import {
 	ensurePluginSkillsOverlay,
 	overlaySkillDirs,
@@ -547,6 +547,96 @@ describe("per-project scoping", () => {
 			// A run without a project keeps today's name: the home path alone.
 			expect(pluginSkillsOverlayPath(env, home)).toBe(
 				pluginSkillsOverlayPath(env, home, null),
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("overlay dir per dispatch", () => {
+	test("a board-side run's overlay lands outside the worker-shared data dir", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-board-"));
+		try {
+			const dataDir = join(dir, "data");
+			const stateDir = join(dir, "server-state");
+			mkdirSync(dataDir, { recursive: true });
+			mkdirSync(stateDir, { recursive: true });
+			const home = join(dir, "home");
+			mkdirSync(home, { recursive: true });
+			// The server env holds both (compose: /data on the worker-shared
+			// volume, OTTR_SERVER_DATA_DIR on ottr-state, which no worker
+			// mounts). The board-side overlay must not sit where a classic
+			// worker can rename-over it between the board's write and omp's
+			// read (OTTR-1020 validation).
+			const env = { OTTR_DATA_DIR: dataDir, OTTR_SERVER_DATA_DIR: stateDir };
+			const path = ensurePluginSkillsOverlay(env, home, null, {
+				kind: "board",
+			})!;
+			expect(resolve(path).startsWith(resolve(dataDir) + sep)).toBe(false);
+			expect(resolve(path).startsWith(resolve(stateDir) + sep)).toBe(true);
+			expect(path).toBe(
+				pluginSkillsOverlayPath(env, home, null, { kind: "board" }),
+			);
+			// Same bytes as ever: the dispatch moves the file, not the content.
+			expect(readFileSync(path, "utf8")).toBe(pluginSkillsOverlayYaml([]));
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("without OTTR_SERVER_DATA_DIR a board overlay falls back to the board's own tmp dir", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-boardtmp-"));
+		try {
+			const dataDir = join(dir, "data");
+			mkdirSync(dataDir, { recursive: true });
+			const home = join(dir, "home");
+			mkdirSync(home, { recursive: true });
+			// A dev board or scratch run sets no server state dir; its overlay
+			// still stays out of the worker-shared data dir.
+			const path = ensurePluginSkillsOverlay(
+				{ OTTR_DATA_DIR: dataDir },
+				home,
+				null,
+				{ kind: "board" },
+			)!;
+			expect(resolve(path).startsWith(resolve(dataDir) + sep)).toBe(false);
+			const anchor = join(tmpdir(), "ottr-board-overlays");
+			expect(resolve(path).startsWith(anchor + sep)).toBe(true);
+			// The tmp anchor is the board's own (0700), like the memory
+			// overlay's per-install tmp dir.
+			expect(statSync(anchor).mode & 0o777).toBe(0o700);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("worker and vm runs keep the shared anchors omp reads in their own container", () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-plugins-wv-"));
+		try {
+			const dataDir = join(dir, "data");
+			mkdirSync(join(dataDir, "proj", "sessions"), { recursive: true });
+			const home = join(dir, "home");
+			mkdirSync(home, { recursive: true });
+			const env = { OTTR_DATA_DIR: dataDir };
+			// A worker container mounts /data and reads the path there.
+			const worker = ensurePluginSkillsOverlay(env, home, null, {
+				kind: "worker",
+			})!;
+			expect(resolve(worker).startsWith(resolve(dataDir) + sep)).toBe(true);
+			// vm-runner copies in only the project dir holding the session dir.
+			const vm = ensurePluginSkillsOverlay(env, home, null, {
+				kind: "vm",
+				sessionDir: join(dataDir, "proj", "sessions"),
+			})!;
+			expect(vm).toBe(
+				pluginSkillsOverlayPath(env, home, null, {
+					kind: "vm",
+					sessionDir: join(dataDir, "proj", "sessions"),
+				}),
+			);
+			expect(resolve(vm).startsWith(resolve(join(dataDir, "proj")) + sep)).toBe(
+				true,
 			);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });

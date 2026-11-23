@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { PROJECT } from "./apt.ts";
 import { readBelow, writeBelow } from "./confine.ts";
 import { overlayDirFor } from "./memory.ts";
@@ -182,48 +183,84 @@ export function pluginSkillsOverlayYaml(dirs: readonly string[]): string {
 	return [...lines, ""].join("\n");
 }
 
+/** Which container spawns omp for a run; it picks the overlay dir. */
+export type PluginSkillsRun =
+	| { kind: "board" }
+	| { kind: "worker" }
+	| { kind: "vm"; sessionDir: string };
+
+/** The overlay dir for one run's dispatch (OTTR-1020 validation). A board-side run
+ * spawns omp in the server container, so its overlay lives on the server-only state
+ * volume — compose sets OTTR_SERVER_DATA_DIR (/app/.tasks/projects, which no worker
+ * mounts); a dev board or scratch run without the env uses its own per-install tmp
+ * dir (0700). Never the worker-shared data dir: a classic worker mounts it read-write,
+ * and a rename-over between the board's write and omp's read of the path would turn
+ * the project-skill pins (and, planted, `mcp.enableProjectConfig`) back on for that
+ * run. Worker and VM runs spawn omp in a container that mounts the shared data dir
+ * (the VM copy-in mounts only the project dir holding the session dir), so their
+ * overlays must stay there; their plant window remains the accepted residual
+ * (docs/specs/turn-home-plugin-skills.md). */
+export function pluginSkillsOverlayDirFor(
+	env: Record<string, string | undefined>,
+	run: PluginSkillsRun,
+): string {
+	if (run.kind === "vm") return resolve(dirname(run.sessionDir));
+	if (run.kind === "worker") return overlayDirFor(env);
+	const dir = env.OTTR_SERVER_DATA_DIR?.trim();
+	return dir ? resolve(dir) : join(tmpdir(), "ottr-board-overlays");
+}
+
 /** One file per home and project, named by the sha256 of the home path — plus the
  * project, `\0`-joined, when one is set: a board-side run (board home) and a worker
- * run (shared home or its layer) share the data dir but never share a file, and two
- * projects on one home write two files, so no spawn can overwrite another's
- * directory list between its write and its omp read. A pinned run keeps its own
- * file's content for its whole life (docs/specs/turn-home-plugin-skills.md). */
+ * run (shared home or its layer) already sit in different dirs, and even where two
+ * runs share an anchor, two projects on one home write two files, so no spawn can
+ * overwrite another's directory list between its write and its omp read. A pinned
+ * run keeps its own file's content for its whole life
+ * (docs/specs/turn-home-plugin-skills.md). */
 export function pluginSkillsOverlayPath(
 	env: Record<string, string | undefined>,
 	home: string,
 	project?: string | null,
+	run: PluginSkillsRun = { kind: "worker" },
 ): string {
 	const hash = createHash("sha256")
 		.update(project ? `${home}\0${project}` : home)
 		.digest("hex")
 		.slice(0, 16);
-	return join(overlayDirFor(env), `omp-plugin-skills-${hash}.yml`);
+	return join(
+		pluginSkillsOverlayDirFor(env, run),
+		`omp-plugin-skills-${hash}.yml`,
+	);
 }
 
 /** Writes the overlay only when its content differs. The project-skill pins ride on
  * every run, plugin skills or none, so the worktree stays inert even when the home
  * carries no plugins. `project` is the spawn's `OTTR_PROJECT` value (a run without
  * one passes nothing): alate's per-project files for it under the same `home` scope
- * the directory list (overlaySkillDirs), everything else stays as documented. The
- * data dir is worker-writable, so a planted file converges
- * back to the computed content here, before the spawn reads it — the same accepted
- * residual as the memory overlay. A write failure fails the run loudly. */
+ * the directory list (overlaySkillDirs), everything else stays as documented. A
+ * worker-shared anchor is worker-writable, so a planted file converges back to the
+ * computed content here, before the spawn reads it — the accepted residual the board
+ * dispatch leaves behind by writing to the server-only dir. A write failure fails
+ * the run loudly. */
 export function ensurePluginSkillsOverlay(
 	env: Record<string, string | undefined>,
 	home: string,
 	project?: string | null,
+	run: PluginSkillsRun = { kind: "worker" },
 ): string | null {
 	const dirs = overlaySkillDirs(home, project);
-	const anchor = overlayDirFor(env);
-	// The tmp fallback dir is the board's own (0700); the data dir is a mount point.
-	if (!env.OTTR_DATA_DIR) mkdirSync(anchor, { recursive: true, mode: 0o700 });
-	const path = pluginSkillsOverlayPath(env, home, project);
+	const anchor = pluginSkillsOverlayDirFor(env, run);
+	// The board anchors (server-only state dir, per-install tmp) may not exist yet;
+	// the worker data dir is a mount point and the VM's anchor holds the session dir,
+	// so the recursive mkdir is a no-op there.
+	mkdirSync(anchor, { recursive: true, mode: 0o700 });
+	const path = pluginSkillsOverlayPath(env, home, project, run);
 	const content = pluginSkillsOverlayYaml(dirs);
 	try {
 		const cur = readBelow(anchor, path, 65536);
 		if (cur !== null && cur.toString("utf8") === content) return path;
 	} catch {
-		// a worker-planted symlink: fall through to the write, which refuses it too
+		// a planted symlink: fall through to the write, which refuses it too
 	}
 	// R5-1: the data dir and the home volume are worker-writable, so this write must
 	// follow no symlink — a plant at the leaf or a parent fails the spawn instead.

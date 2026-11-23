@@ -16,7 +16,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import type { IdentProbeEnv } from "./gitIdentity.ts";
 import { readLayerUse } from "./layers.ts";
 import { agentDir } from "./login.ts";
@@ -3635,6 +3635,10 @@ describe("startRun", () => {
 		const dir = mkdtempSync(join(tmpdir(), "ottr-plugin-skills-"));
 		const dataDir = join(dir, "data");
 		mkdirSync(dataDir, { recursive: true });
+		// The board-side overlay must land in the server-only state dir, not in
+		// the worker-shared data dir (OTTR-1020 validation).
+		const stateDir = join(dir, "server-state");
+		mkdirSync(stateDir, { recursive: true });
 		// The fixture home stands in for the shared home: one enabled plugin whose
 		// pi.skills names ./skills (docs/specs/turn-home-plugin-skills.md).
 		const home = join(dir, "home");
@@ -3660,7 +3664,10 @@ describe("startRun", () => {
 			}),
 		);
 		const ambientDataDir = process.env.OTTR_DATA_DIR;
+		const ambientStateDir = process.env.OTTR_SERVER_DATA_DIR;
 		process.env.OTTR_DATA_DIR = dataDir;
+		process.env.OTTR_SERVER_DATA_DIR = stateDir;
+		const boardEnv = { OTTR_DATA_DIR: dataDir, OTTR_SERVER_DATA_DIR: stateDir };
 		try {
 			const seen: (readonly string[])[] = [];
 			const launcher: RunLauncher = (_c, args) => {
@@ -3687,8 +3694,11 @@ describe("startRun", () => {
 				"--config",
 			);
 			expect(overlay).toBe(
-				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, home),
+				pluginSkillsOverlayPath(boardEnv, home, null, { kind: "board" }),
 			);
+			// pluginSkillsConfigFor picked the board dispatch: the path stays out
+			// of the worker-shared data dir a classic worker can rename-over.
+			expect(resolve(overlay).startsWith(resolve(dataDir) + sep)).toBe(false);
 			expect(readFileSync(overlay, "utf8")).toBe(
 				`skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n  customDirectories:\n    - ${JSON.stringify(join(pkgDir, "skills"))}\n`,
 			);
@@ -3703,7 +3713,7 @@ describe("startRun", () => {
 			await (await startRun({ ...base, pluginSkillsHome: empty })).done;
 			const pinsOverlay = seen[0]![seen[0]!.indexOf(NO_DISCOVERY_CONFIG) + 2]!;
 			expect(pinsOverlay).toBe(
-				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
+				pluginSkillsOverlayPath(boardEnv, empty, null, { kind: "board" }),
 			);
 			expect(readFileSync(pinsOverlay, "utf8")).toBe(
 				"skills:\n  enableAgentsProject: false\n  enableClaudeProject: false\n  enablePiProject: false\n",
@@ -3716,13 +3726,17 @@ describe("startRun", () => {
 			]);
 			expect(seen[0]!.filter((a) => a.endsWith(".yml"))).toEqual([
 				NO_DISCOVERY_CONFIG,
-				pluginSkillsOverlayPath({ OTTR_DATA_DIR: dataDir }, empty),
+				pluginSkillsOverlayPath(boardEnv, empty, null, { kind: "board" }),
+				// The memory overlay keeps its data-dir anchor (resolveMemoryConfig).
 				join(dataDir, "omp-memory.yml"),
 				NO_FETCH_CONFIG,
 			]);
 		} finally {
 			if (ambientDataDir === undefined) delete process.env.OTTR_DATA_DIR;
 			else process.env.OTTR_DATA_DIR = ambientDataDir;
+			if (ambientStateDir === undefined)
+				delete process.env.OTTR_SERVER_DATA_DIR;
+			else process.env.OTTR_SERVER_DATA_DIR = ambientStateDir;
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -3742,7 +3756,10 @@ describe("startRun", () => {
 			"---\ndescription: probe\n---\nbody\n",
 		);
 		const ambientDataDir = process.env.OTTR_DATA_DIR;
+		const ambientStateDir = process.env.OTTR_SERVER_DATA_DIR;
 		process.env.OTTR_DATA_DIR = dataDir;
+		// Board dispatch: overlays land in the server-only state dir inside dir.
+		process.env.OTTR_SERVER_DATA_DIR = join(dir, "server-state");
 		try {
 			const seen: (readonly string[])[] = [];
 			const launcher: RunLauncher = (_c, args) => {
@@ -3796,6 +3813,9 @@ describe("startRun", () => {
 		} finally {
 			if (ambientDataDir === undefined) delete process.env.OTTR_DATA_DIR;
 			else process.env.OTTR_DATA_DIR = ambientDataDir;
+			if (ambientStateDir === undefined)
+				delete process.env.OTTR_SERVER_DATA_DIR;
+			else process.env.OTTR_SERVER_DATA_DIR = ambientStateDir;
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
@@ -5954,8 +5974,10 @@ describe("startRun layer leases (OTTR-1132)", () => {
 		},
 		{
 			name: "plugin-skills overlay write",
+			// A local run writes the board anchor (OTTR_SERVER_DATA_DIR), so the
+			// planted regular file goes there (OTTR-1020 validation).
 			arrange: (run) => ({
-				env: { OTTR_DATA_DIR: plantedDataFile(run) },
+				env: { OTTR_SERVER_DATA_DIR: plantedDataFile(run) },
 				over: { memoryConfigPath: null, launcher: noSpawn },
 			}),
 		},

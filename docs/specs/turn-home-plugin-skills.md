@@ -141,18 +141,25 @@ shape.
 
 ### Overlay write
 
-`ensurePluginSkillsOverlay(env, home, project)` mirrors `ensureMemoryOverlay`
-(`src/memory.ts`):
+`ensurePluginSkillsOverlay(env, home, project, run)` mirrors `ensureMemoryOverlay`
+(`src/memory.ts`). `run` names the dispatch: `{ kind: "board" }`, `{ kind: "worker" }`,
+or `{ kind: "vm", sessionDir }`.
 
-- Path: `<overlayDirFor(env)>/omp-plugin-skills-<hash>.yml` where the hash is the
-  sha256 of the home path — plus the project, `\0`-joined, when one is set — cut to
-  16 hex chars (`OTTR_DATA_DIR`, else `tmpdir()/ottr-omp-memory`, dir 0700). One file
-  per home and project: a board-side run and a worker run share the data dir but
-  never share a file, and two projects on one home write two files, so no spawn can
-  overwrite another's directory list between its write and its omp read. A pinned
-  run keeps its own file's content for its whole life. Stale files of retired layers
-  stay behind (each under 400 bytes, written only on content change) — accepted, the
-  data dir already holds per-project trees.
+- Dir (`pluginSkillsOverlayDirFor`): the dispatch picks the anchor. A board-side run
+  writes a server-only dir — `OTTR_SERVER_DATA_DIR` when set (compose:
+  `/app/.tasks/projects` on the ottr-state volume, which no worker mounts), else the
+  board's own per-install tmp dir `tmpdir()/ottr-board-overlays` (0700). A worker run
+  writes the data dir (`overlayDirFor`: `OTTR_DATA_DIR`, else `tmpdir()/ottr-omp-memory`),
+  which the worker container mounts. A VM run writes the project dir that holds the
+  session dir, the only tree vm-runner copies in.
+- Path: `<dir>/omp-plugin-skills-<hash>.yml` where the hash is the sha256 of the home
+  path — plus the project, `\0`-joined, when one is set — cut to 16 hex chars. One
+  file per home and project: two runs that share an anchor never share a file, and
+  two projects on one home write two files, so no spawn can overwrite another's
+  directory list between its write and its omp read. A pinned run keeps its own
+  file's content for its whole life. Stale files of retired layers stay behind (each
+  under 400 bytes, written only on content change) — accepted, the anchors already
+  hold per-project trees.
 - Content (`pluginSkillsOverlayYaml`) — the three project pins ride on every run, the
   plugin directories only when the home has them:
 
@@ -168,21 +175,25 @@ shape.
   Paths are YAML double-quoted scalars (`JSON.stringify` per path), so Windows-style
   paths stay valid.
 - Write only when the content differs; writes go through `writeBelow` (no symlink
-  follow: the data dir is worker-writable, R5-1).
+  follow: the worker-shared data dir is worker-writable, R5-1).
 - Every run carries the overlay: a home with no plugin skills gets the pins-only
   file, so the worktree stays inert even there.
-- The data dir is worker-writable, so a worker could plant a file at the computed
-  name. The ensure step runs in the spawning process before the spawn: a planted file
-  converges back to the freshly computed content before omp reads it, and the plant
-  window is the milliseconds between write and read. This is the same accepted
-  residual as the memory overlay (`omp-memory.yml`, same dir, same convergence).
+- A worker-shared anchor is worker-writable, so a worker could plant a file at the
+  computed name there. The ensure step runs in the spawning process before the spawn:
+  a planted file converges back to the freshly computed content before omp reads it,
+  and the plant window is the milliseconds between write and read. This residual
+  stays for worker and VM runs. A board-side run carries it no more: its overlay
+  lives on the server-only state volume, which no worker mounts, so a worker cannot
+  replace it between the board's write and omp's read (OTTR-1020 validation). The
+  memory overlay (`omp-memory.yml`) keeps its data-dir anchor and its residual.
 
-The overlay files live in the data dir, which the server, the workers and the VM copy
-mount at the same absolute path, so the argv path resolves in every container
-(docs/WORKERS.md, "Server: `OTTR_DATA_DIR=/data` …"). Content is deterministic per
-home and project, so concurrent runs of the same home and project write identical
-bytes; different homes and different projects write different files; `writeBelow`
-gives the atomicity.
+The worker and VM overlay files live in the data dir, which the server, the workers
+and the VM copy mount at the same absolute path, so the argv path resolves in those
+containers (docs/WORKERS.md, "Server: `OTTR_DATA_DIR=/data` …"). A board-side run
+spawns omp in the server container, which reads the state-dir path itself. Content
+is deterministic per home and project, so concurrent runs of the same home and
+project write identical bytes; different homes and different projects write
+different files; `writeBelow` gives the atomicity.
 
 ### Spawn wiring (`src/runner.ts`)
 
@@ -194,9 +205,9 @@ gives the atomicity.
 - `startRun` computes, after `resolveLayerPin` (the pin resolves once per run, before
   any spawn): the plugin home is the run's pinned `HOME` — `layerEnv.HOME` when a layer
   pinned, else the flat layer home (`homedir()` for worker and VM runs, `boardOmpHome()`
-  for the board's own runs). The overlay env mirrors `resolveMemoryConfig`: a VM run
-  scopes `OTTR_DATA_DIR` to `dirname(sessionDir)` because vm-runner copies in only paths
-  under `/data/<project>/`.
+  for the board's own runs). The overlay dir follows the dispatch
+  (`pluginSkillsConfigFor`): `board` for a local run, `worker` for a worker dispatch,
+  `vm` with `dirname(sessionDir)` for a microVM run.
 - `StartOptions.pluginSkillsHome?: string` overrides the derived home; a test seam like
   `gitProbe` (tests must not read the real home).
 - `startWorkerRun` passes the computed overlay path through to `buildOmpArgs`.
@@ -236,6 +247,9 @@ change removes the cause (the skill never loaded); the reporting duty stays as i
 
 ## Acceptance checks
 
+- A board-side run's overlay path stays outside the worker-shared data dir:
+  `pluginSkillsConfigFor` picks the server-only state dir for a local dispatch, and
+  `src/pluginSkills.test.ts` pins the board anchor against `OTTR_DATA_DIR`.
 - A test pins the turn argv and config: with a fixture home holding an enabled plugin
   that declares `pi.skills`, the run's argv carries the overlay path and the overlay
   file pins the three project skills off and lists the plugin's skill directory; a
