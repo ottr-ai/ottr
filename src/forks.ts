@@ -859,6 +859,10 @@ async function unchangedFork(
 	);
 }
 
+/** The analyze dispatch paused on the hosted credit hold: no model call ran, so the
+ * attempt must not count as a failure (no retry bump, no run spacing, no consumed slot). */
+class ForkPausedError extends Error {}
+
 export function createForkWatcher(deps: {
 	projects: () => Iterable<ForkProject>;
 	log: (msg: string) => void;
@@ -881,7 +885,9 @@ export function createForkWatcher(deps: {
 		// Hosted credit hold (docs/specs/hosted-mode.md section 5): re-checked at the
 		// model dispatch, so a stop that lands during the claim starts no gateway call.
 		if (deps.creditHoldActive?.() === true)
-			throw new Error("fork research paused: the board is out of credit");
+			throw new ForkPausedError(
+				"research paused: the board is out of credit",
+			);
 		return (
 			deps.analyze ??
 			((r: ForkRange, p: { titles: string[]; declines: string[] }) =>
@@ -1034,6 +1040,10 @@ export function createForkWatcher(deps: {
 					prHead: h.prHead,
 					released: h.released === 1,
 				});
+				// The pre-claim rows and the claim stamp: a credit pause after the claim
+				// undoes both, so the pause consumes no run and starts no spacing.
+				let preClaim: ForkBranchState[] = [];
+				let claimedAt = 0;
 				try {
 					// Steps 3 and 4 run ungated: the pull refs and the re-judged holds exist
 					// before any run gate decides, and hold writes persist even when the run
@@ -1411,30 +1421,40 @@ export function createForkWatcher(deps: {
 						);
 						break;
 					}
+					// The prior proposal list is a pure read: build it before the claim, so a
+					// stop during it cannot leave a consumed run behind.
+					const prior = await buildPrior(store);
+					// The pre-claim rows: a credit pause after the claim restores them, so
+					// the pause consumes no run and starts no 24-hour spacing.
+					preClaim = pending.map((r) => ({ ...r }));
 					// Step 9.
 					const claim = await store.transaction(async () => {
-						if (!(await unchangedFork(store, fork.id, snapshot))) return false;
+						if (!(await unchangedFork(store, fork.id, snapshot))) return null;
 						const at = now();
 						if (
 							(await store.forkRunsSince(
 								at - FORK_GATES.FORK_RUN_SPACING_MS,
 							)) >= FORK_GATES.PROJECT_DAILY_RUNS
 						)
-							return false;
+							return null;
 						if (
 							Math.max(0, ...snapshot.rows.map((r) => r.lastRunAt ?? 0)) +
 								FORK_GATES.FORK_RUN_SPACING_MS >
 							at
 						)
-							return false;
+							return null;
+						// Hosted credit hold: no consumption when the stop lands before the
+						// claim's writes.
+						if (deps.creditHoldActive?.() === true) return null;
 						await store.recordForkRun(fork.id, at);
 						for (const row of pending)
 							await store.saveForkBranch({ ...row, lastRunAt: at });
 						snapshot = await readFork(store, fork.id);
-						return true;
+						return { at };
 					});
-					if (!claim) continue;
-					const result = await analyze(range, await buildPrior(store));
+					if (claim === null) continue;
+					claimedAt = claim.at;
+					const result = await analyze(range, prior);
 					// Step 10: cursors and the consumed released rows.
 					const covered = new Set(result.commits);
 					const skippedTotal = [...skipped.values()].reduce(
@@ -1555,6 +1575,17 @@ export function createForkWatcher(deps: {
 							`forks: ${fork.owner}/${fork.name}: proposal(s) dropped: cap of 3 open proposals reached`,
 						);
 				} catch (e) {
+					if (e instanceof ForkPausedError) {
+						// The pause ran no model call, so it is not a failed attempt: undo
+						// the claim (no retry bump, no 24-hour spacing, no consumed slot).
+						await store.transaction(async () => {
+							if (!(await unchangedFork(store, fork.id, snapshot))) return;
+							await store.deleteForkRun(fork.id, claimedAt);
+							for (const r of preClaim) await store.saveForkBranch(r);
+						});
+						deps.log(`forks: ${fork.owner}/${fork.name}: ${e.message}`);
+						break;
+					}
 					const msg = ((e as Error).message ?? String(e)).slice(0, 300);
 					await store.transaction(async () => {
 						if (!(await unchangedFork(store, fork.id, snapshot))) return;

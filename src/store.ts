@@ -3316,6 +3316,17 @@ export class ProjectStore {
 		});
 	}
 
+	/** Removes one recorded fork run: the hosted credit pause reverts its claim, so a
+	 * run whose model call never started consumes no daily-rate slot. */
+	async deleteForkRun(forkId: number, at: number): Promise<void> {
+		return this.queue.run(async () => {
+			await this.db.run(
+				"DELETE FROM fork_runs WHERE fork_id = ? AND started_at = ?",
+				[forkId, at],
+			);
+		});
+	}
+
 	/** Drops watch rows of forks absent from the latest scan; an empty list clears the watch. */
 	async deleteForkBranchesNotIn(ids: number[]): Promise<void> {
 		return this.queue.transaction(async () => {

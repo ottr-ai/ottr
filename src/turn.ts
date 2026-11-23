@@ -5033,6 +5033,10 @@ export function createTurnLoop(
 			// same seam the evaluation uses); the call never judges readiness and never
 			// stamps the fingerprint.
 			if (parsed.questions.some((q) => q.options.length === 0)) {
+				// Hosted credit stop: the identity reads awaited, so re-check at this
+				// model dispatch; a stop parks the card with the credit reason instead.
+				if (await creditBlockedRun(store, id, `${store.name}/${id}`, log))
+					return false;
 				try {
 					const check = await (ops.gateCheck ?? promptGateCheck)({
 						prompt: judged,
@@ -5118,6 +5122,10 @@ export function createTurnLoop(
 			await log(`! prompt gate: skill list unreadable: ${errmsg(e)}`);
 		}
 		// Model evaluation; one immediate retry on any failure.
+		// Hosted credit stop: the reads since the between-gates check awaited, so
+		// re-check right before the gate's model dispatch.
+		if (await creditBlockedRun(store, id, `${store.name}/${id}`, log))
+			return false;
 		let check: GateCheck | null = null;
 		let err: Error | null = null;
 		for (let attempt = 0; attempt < 2; attempt++) {

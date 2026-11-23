@@ -1471,6 +1471,120 @@ describe("hosted credit stop", () => {
 		expect(after.needsReason).toBe(CREDIT_REASON);
 	});
 
+	// The stop lands while the turn sits inside the prompt gate's own task read: the
+	// between-gates check has already passed, so only the dispatch re-check can stop
+	// the gate's model call. The wrapper pauses the second read after the duplicate
+	// gate (the first is the duplicate stamp's write), outside every transaction.
+	async function pauseInGateRead(
+		store: ProjectStore,
+		dupDone: { done: boolean },
+		paused: { value: boolean },
+	): Promise<PromiseWithResolvers<void>> {
+		const readGate = Promise.withResolvers<void>();
+		let released = false;
+		let readsAfterDup = 0;
+		const origGetTask = store.getTask.bind(store);
+		store.getTask = async (id: string) => {
+			const t = await origGetTask(id);
+			if (dupDone.done) {
+				readsAfterDup += 1;
+				if (readsAfterDup === 2 && !released) {
+					released = true;
+					paused.value = true;
+					await readGate.promise;
+				}
+			}
+			return t;
+		};
+		return readGate;
+	}
+
+	test("creditStop during the gate's reads parks before the evaluation call", async () => {
+		const { hosted } = fakeHosted();
+		let gateCalls = 0;
+		const dupDone = { done: false };
+		const paused = { value: false };
+		const { store, record, loop } = await setup({
+			hosted,
+			duplicateCheck: async () => {
+				dupDone.done = true;
+				return {
+					verdict: "new" as const,
+					matches: [],
+					reason: "new work",
+				};
+			},
+			gateCheck: async () => {
+				gateCalls += 1;
+				return {
+					builds: "the task",
+					checks: "the recorded run",
+					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+					questions: [],
+				};
+			},
+		});
+		const readGate = await pauseInGateRead(store, dupDone, paused);
+		const task = await store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => paused.value);
+		// creditStop's synchronous prefix sets the hold while the read is parked.
+		const stops = loop.creditStop();
+		readGate.resolve();
+		await run;
+		await stops;
+		expect(gateCalls).toBe(0);
+		expect(record.runs).toHaveLength(0);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+	});
+
+	test("creditStop during the gate's reads parks before the open-questions options call", async () => {
+		const { hosted } = fakeHosted();
+		let gateCalls = 0;
+		const dupDone = { done: false };
+		const paused = { value: false };
+		const { store, loop } = await setup({
+			hosted,
+			duplicateCheck: async () => {
+				dupDone.done = true;
+				return {
+					verdict: "new" as const,
+					matches: [],
+					reason: "new work",
+				};
+			},
+			gateCheck: async () => {
+				gateCalls += 1;
+				return {
+					builds: "the task",
+					checks: "the recorded run",
+					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+					questions: [],
+				};
+			},
+		});
+		const readGate = await pauseInGateRead(store, dupDone, paused);
+		const task = await store.createTask(
+			"work please\n\n## Open questions\n\n- Which database?",
+		);
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => paused.value);
+		const stops = loop.creditStop();
+		readGate.resolve();
+		await run;
+		await stops;
+		// The options call is a model dispatch: the stop parks with the credit reason
+		// before the gate model runs, not with the questions park.
+		expect(gateCalls).toBe(0);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+	});
+
 	test("a gate answer that started before the stop does not let the turn run", async () => {
 		const answer = Promise.withResolvers<boolean>();
 		const { hosted } = fakeHosted({ credit: () => answer.promise });

@@ -1472,6 +1472,40 @@ describe("watcher", () => {
 		).toEqual([]);
 	});
 
+	test("a stop landing inside the claim reverts the run instead of counting a failed attempt", async () => {
+		let hold = false;
+		const { main, store, watcher, calls, logs } = await setup(
+			"claim-hold",
+			async () => {
+				throw new Error("analyze must not run under the credit hold");
+			},
+			{ creditHoldActive: () => hold },
+		);
+		// The hold flips after the claim's writes (recordForkRun ran), so the analyze
+		// dispatch pauses with a claimed run on the books.
+		const origRecord = store.recordForkRun.bind(store);
+		store.recordForkRun = async (forkId: number, at: number) => {
+			await origRecord(forkId, at);
+			hold = true;
+		};
+		await makeFork("claim-hold-fork", main);
+		await watcher.tick();
+		// The pause is not a failure: no model call ran, so the claim is undone —
+		// no consumed daily slot, no 24-hour spacing, no retry bump, no lastError.
+		expect(calls()).toBe(0);
+		expect(await store.forkRunsSince(0)).toBe(0);
+		for (const row of await store.listAllForkBranches()) {
+			expect(row.lastRunAt).toBeNull();
+			expect(row.retries).toBe(0);
+			expect(row.lastError).toBeNull();
+		}
+		expect(
+			logs.some((m) =>
+				m.includes("o/r: research paused: the board is out of credit"),
+			),
+		).toBe(true);
+	});
+
 	test("fork cache and ls-remote cwd live in the server-only dir, not OTTR_DATA_DIR", async () => {
 		const saved = {
 			OTTR_DATA_DIR: process.env.OTTR_DATA_DIR,

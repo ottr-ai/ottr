@@ -187,13 +187,16 @@ usage that it saw for the run, so a late or repeated record never counts twice. 
   the hold at each of its model dispatches: the duplicate gate re-checks before its second
   call, so a stop during the first call or the search parks the card instead of a fail-open
   error, and the prompt gate re-checks at its entry and after each failed attempt, so a
-  stop starts no retry. The board's own gateway calls outside the turn loop honor the hold
+  stop starts no retry; a stop that lands inside the gate's own awaited reads parks
+  before the next dispatch too. The board's own gateway calls outside the turn loop
+  honor the hold
   too: the Deepen route answers HTTP 402 with the credit error at its entry and again
   between the draft and the check, the release-summary consolidation re-checks before each
   chunk call and before the final call (a stop after its entry answers the summary as null
   with the credit reason), and the PR review draft, fork research, and omp watch
   compatibility review skip their model call until a release or a fresh true gate answer
-  clears the hold.
+  clears the hold. A claimed fork research run whose model call never started is undone,
+  so research resumes after the release without waiting out the run spacing.
 - Resume after a top-up: the owner replies `Resume` (or any reply) on the parked card. The
   card goes back to the queue. The gate asks `GET /credit` again before the turn starts, so a
   card never runs while the balance is zero.
