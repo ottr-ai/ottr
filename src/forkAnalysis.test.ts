@@ -7,12 +7,15 @@ import {
 	buildUserMessage,
 	defaultSpawn,
 	hasCredentialShape,
+	isProviderError,
 	PROMPT_CHAR_BUDGET,
 	parseAnalysis,
 	proposalPrompt,
 	redactSecrets,
 	renderReport,
 	runGateway,
+	runGatewayWithFallbacks,
+	type SpawnFn,
 	stripInvisible,
 	systemPrompt,
 } from "./forkAnalysis";
@@ -760,6 +763,7 @@ describe("runGateway", () => {
 			range(),
 			{ titles: [], declines: [] },
 			{
+				fallbacks: {},
 				spawn: async (_argv, o) => {
 					model = JSON.parse(o.stdin).body.model;
 					return { code: 1, stdout: "", stderr: "stop" };
@@ -794,6 +798,100 @@ describe("runGateway", () => {
 			stderr: "",
 		}));
 		expect(out).rejects.toThrow("gateway did not report ready");
+	});
+});
+
+describe("isProviderError", () => {
+	const cases: Array<[string, boolean]> = [
+		["gateway status 502: bad upstream", true],
+		["gateway status 429: too many requests", true],
+		["gateway status 500: internal error", true],
+		["gateway status 404: not found", false],
+		["gateway exited with code 1", false],
+		["gateway did not report ready", false],
+		["gateway status 502: Codex is at capacity", true],
+		["rate limit exceeded", true],
+	];
+	for (const [message, expected] of cases) {
+		test(`${expected ? "covers" : "rejects"} ${JSON.stringify(message)}`, () => {
+			expect(isProviderError(new Error(message))).toBe(expected);
+		});
+	}
+});
+
+describe("runGatewayWithFallbacks", () => {
+	const spawnFor = (
+		fail: (model: string) => string | null,
+		reply = "answer",
+	): { spawn: SpawnFn; attempts: string[] } => {
+		const attempts: string[] = [];
+		return {
+			attempts,
+			spawn: async (_argv, o) => {
+				const model = JSON.parse(o.stdin).body.model as string;
+				attempts.push(model);
+				const err = fail(model);
+				if (err !== null) return { code: 1, stdout: "", stderr: err };
+				return {
+					code: 0,
+					stdout: [
+						JSON.stringify({ ready: true }),
+						JSON.stringify({
+							id: 1,
+							status: 200,
+							body: { choices: [{ message: { content: reply } }] },
+						}),
+					].join("\n"),
+					stderr: "",
+				};
+			},
+		};
+	};
+
+	test("walks the chain past a provider error to the first success", async () => {
+		const { spawn, attempts } = spawnFor((m) =>
+			m === "a/b"
+				? "gateway exited with code 1: gateway status 502: Codex is at capacity"
+				: null,
+		);
+		const out = await runGatewayWithFallbacks(
+			[{ role: "user", content: "hi" }],
+			"a/b",
+			["c/d"],
+			spawn,
+		);
+		expect(out).toBe("answer");
+		expect(attempts).toEqual(["a/b", "c/d"]);
+	});
+
+	test("a non-provider error on the first attempt does not try the chain", async () => {
+		const { spawn, attempts } = spawnFor(
+			() => "gateway exited with code 1: stop",
+		);
+		const out = runGatewayWithFallbacks(
+			[{ role: "user", content: "hi" }],
+			"a/b",
+			["c/d"],
+			spawn,
+		);
+		expect(out).rejects.toThrow("gateway exited with code 1: stop");
+		await out.catch(() => {});
+		expect(attempts).toEqual(["a/b"]);
+	});
+
+	test("an exhausted chain rethrows the last provider error", async () => {
+		const { spawn, attempts } = spawnFor(
+			() => "gateway exited with code 1: gateway status 429: rate limit",
+		);
+		const out = runGatewayWithFallbacks(
+			[{ role: "user", content: "hi" }],
+			"a/b",
+			["c/d", "e/f"],
+			spawn,
+		);
+		expect(out).rejects.toThrow("gateway status 429: rate limit");
+		await out.catch(() => {});
+		expect(attempts).toEqual(["a/b", "c/d", "e/f"]);
 	});
 });
 

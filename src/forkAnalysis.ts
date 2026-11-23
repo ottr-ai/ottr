@@ -401,6 +401,41 @@ export async function runGateway(
 	return content;
 }
 
+/** True when a gateway failure is a provider failure a fallback chain can cover: a 429 or 5xx
+ *  status line, or a capacity/rate-limit/overloaded error text. */
+export function isProviderError(err: unknown): boolean {
+	const m = err instanceof Error ? err.message : String(err);
+	const s = /^gateway status (\d{3}):/.exec(m);
+	if (s !== null) {
+		const status = Number(s[1]);
+		return status >= 500 || status === 429;
+	}
+	return /rate.?limit|at capacity|overloaded/i.test(m);
+}
+
+/** runGateway over `selector`, then over each entry of `chain` while the failure is a
+ *  provider error (rate limit, capacity, 5xx); stops at the first success; rethrows the
+ *  last error when the chain runs out or the failure is not a provider error. */
+export async function runGatewayWithFallbacks(
+	messages: Array<{ role: "system" | "user"; content: string }>,
+	selector: string,
+	chain: readonly string[],
+	spawn: SpawnFn = defaultSpawn,
+	timeoutMs = 15 * 60_000,
+): Promise<string> {
+	const attempts = [selector, ...chain];
+	let last: unknown;
+	for (const model of attempts) {
+		try {
+			return await runGateway(messages, spawn, timeoutMs, model);
+		} catch (err) {
+			last = err;
+			if (!isProviderError(err)) break;
+		}
+	}
+	throw last;
+}
+
 const SHA_RE = /^[0-9a-f]{40}$|^[0-9a-f]{7,40}$/;
 const VERDICTS = ["propose", "skip", "unknown"] as const;
 const EFFORTS = ["S", "M", "L"] as const;
@@ -624,12 +659,20 @@ export function proposalPrompt(
 export async function analyzeRange(
 	range: ForkRange,
 	prior: { titles: string[]; declines: string[] },
-	deps?: { spawn?: SpawnFn },
+	deps?: {
+		spawn?: SpawnFn;
+		fallbacks?: Record<string, string[]>;
+	},
 ): Promise<ForkAnalysisResult> {
 	const messages = [
 		{ role: "system" as const, content: systemPrompt() },
 		{ role: "user" as const, content: buildUserMessage(range, prior) },
 	];
-	const raw = await runGateway(messages, deps?.spawn);
+	const raw = await runGatewayWithFallbacks(
+		messages,
+		"@default",
+		deps?.fallbacks?.default ?? [],
+		deps?.spawn,
+	);
 	return parseAnalysis(raw, range);
 }

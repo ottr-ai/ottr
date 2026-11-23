@@ -8177,3 +8177,42 @@ describe("Env save state is per row", () => {
 		}
 	});
 });
+
+describe("ModelRolesSection role feature lines", () => {
+	test("each row names its board features, with an omp-only line for an unknown role", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			rolesFetch({ smol: "openai-codex/gpt-6-luna:max" }, { smol: [] }),
+		);
+		try {
+			const row = container.querySelector('.role-row[data-setting-key="smol"]');
+			expect(row).not.toBeNull();
+			expect(row!.querySelector(".role-use")!.textContent).toBe(
+				"Consolidate notes in the Create release dialog.",
+			);
+			// The hint carries the chain-walk sentence.
+			expect(container.textContent).toContain(
+				"The board walks each role's fallback chain itself on a provider error",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a role absent from ROLE_FEATURES reads as omp-only", async () => {
+		resetCatalogCache();
+		const { container, unmount } = await mountRoles(
+			rolesFetch({ mystery: "zai/glm-5.3-flash" }, { mystery: [] }),
+		);
+		try {
+			const row = container.querySelector(
+				'.role-row[data-setting-key="mystery"]',
+			);
+			expect(row!.querySelector(".role-use")!.textContent).toBe(
+				"No board feature runs on this role; omp itself uses it.",
+			);
+		} finally {
+			await unmount();
+		}
+	});
+});

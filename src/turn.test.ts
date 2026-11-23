@@ -22513,6 +22513,9 @@ describe("generateTitle failure causes", () => {
 				{ id: 1, status: 502, body: { error: { message: "no quota" } } },
 			]),
 			(cause) => causes.push(cause),
+			undefined,
+			// Pin the empty chain: the real config's fallbackChains must not turn this into a walk.
+			{},
 		);
 		expect(title).toBeNull();
 		expect(causes).toEqual(["gateway status 502: no quota"]);

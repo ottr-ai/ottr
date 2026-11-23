@@ -6,10 +6,15 @@
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { clean, runGateway, type SpawnFn } from "./forkAnalysis.ts";
+import {
+	clean,
+	runGatewayWithFallbacks,
+	type SpawnFn,
+} from "./forkAnalysis.ts";
 import type { ForkProject } from "./forks.ts";
 import { upstreamToken } from "./githubHost.ts";
 import { withGithubRetry } from "./githubRetry.ts";
+import { modelFallbacks } from "./models.ts";
 import {
 	OMP_REVIEW_INSTRUCTIONS,
 	ompBumpCardPrompt,
@@ -301,6 +306,8 @@ export function createOmpWatcher(deps: {
 	token?: () => string | undefined;
 	/** Test seam only; production uses UPSTREAM_API_BASE. */
 	apiBase?: () => string;
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
+	fallbacks?: Record<string, string[]>;
 }): { tick(): Promise<void> } {
 	const doFetch = withGithubRetry(deps.fetch ?? fetch);
 	const now = deps.now ?? Date.now;
@@ -588,14 +595,15 @@ export function createOmpWatcher(deps: {
 		});
 		let reply: string;
 		try {
-			reply = await runGateway(
+			reply = await runGatewayWithFallbacks(
 				[
 					{ role: "system", content: OMP_REVIEW_INSTRUCTIONS },
 					{ role: "user", content: message },
 				],
+				"@default",
+				(deps.fallbacks ?? modelFallbacks()).default ?? [],
 				deps.spawn,
 				MODEL_TIMEOUT_MS,
-				"@default",
 			);
 		} catch (e) {
 			fail(`model: omp ${r.version}: ${errText(e)}`);

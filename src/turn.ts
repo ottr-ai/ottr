@@ -34,7 +34,7 @@ import {
 	staleDupMatches,
 } from "./duplicateGate.ts";
 import { errmsg } from "./errmsg.ts";
-import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
+import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
 import { BRANCH_RULE_REJECTION, GIT_AUTH_FAILURE } from "./gitHosts.ts";
 import { GIT_HTTP_AUTH_STATUS } from "./githubAuthHint.ts";
 import { ghEnvFor, githubHost } from "./githubHost.ts";
@@ -351,6 +351,8 @@ export async function generateTitle(
 	spawn?: SpawnFn,
 	onFail?: (cause: string) => void,
 	timeoutMs: number = TITLE_TIMEOUT_MS,
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
+	fallbacks?: Record<string, string[]>,
 ): Promise<string | null> {
 	if (!prompt.trim()) {
 		onFail?.("empty prompt");
@@ -362,7 +364,7 @@ export async function generateTitle(
 		timeoutMs,
 	);
 	const { text, parentTitle } = splitHandoffTail(prompt);
-	runGateway(
+	runGatewayWithFallbacks(
 		[
 			{
 				role: "system",
@@ -378,6 +380,8 @@ export async function generateTitle(
 					text.slice(0, 1000),
 			},
 		],
+		"@default",
+		(fallbacks ?? modelFallbacks()).default ?? [],
 		spawn,
 		timeoutMs + TITLE_TIMEOUT_SLACK_MS,
 	).then(

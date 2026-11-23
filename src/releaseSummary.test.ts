@@ -179,6 +179,7 @@ describe("summarizeRelease", () => {
 			cards: [],
 			spawn,
 			projectName: "p",
+			fallbacks: {},
 		});
 		expect(out.summary).toBeNull();
 		expect(out.reason).toMatch(/no quota/);
@@ -339,6 +340,86 @@ describe("summarizeRelease", () => {
 	test("both instruction constants name no project", () => {
 		expect(RELEASE_SUMMARY_INSTRUCTIONS).not.toContain("Ottr");
 		expect(RELEASE_SUMMARY_CHUNK_INSTRUCTIONS).not.toContain("Ottr");
+	});
+
+	// Fails on the first model with the given stderr text; answers the rest with `reply`.
+	const failSpawn = (
+		failModel: string,
+		stderr: string,
+		reply: string,
+	): { spawn: SpawnFn; models: string[] } => {
+		const models: string[] = [];
+		return {
+			models,
+			spawn: async (_argv, o) => {
+				const model = JSON.parse(o.stdin).body.model as string;
+				models.push(model);
+				if (model === failModel) return { code: 1, stdout: "", stderr };
+				return {
+					code: 0,
+					stdout: [
+						JSON.stringify({ ready: true }),
+						JSON.stringify({
+							id: 1,
+							status: 200,
+							body: { choices: [{ message: { content: reply } }] },
+						}),
+					].join("\n"),
+					stderr: "",
+				};
+			},
+		};
+	};
+
+	test("a provider error on smol walks the smol fallback chain", async () => {
+		const { spawn, models } = failSpawn(
+			"a/b:max",
+			"gateway status 502: Codex error event: Codex is at capacity",
+			reply,
+		);
+		const out = await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "p",
+			roles: { smol: "a/b:max" },
+			fallbacks: { smol: ["c/d:max"] },
+		});
+		expect(out.summary).toContain(reply);
+		expect(out.reason).toBeNull();
+		expect(models).toEqual(["a/b:max", "c/d:max"]);
+	});
+
+	test("a provider error without a chain answers the gateway error as the reason", async () => {
+		const errText =
+			"gateway status 502: Codex error event: Codex is at capacity";
+		const { spawn, models } = failSpawn("a/b:max", errText, reply);
+		const out = await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "p",
+			roles: { smol: "a/b:max" },
+			fallbacks: {},
+		});
+		expect(out.summary).toBeNull();
+		expect(out.reason).toBe(`gateway exited with code 1: ${errText}`);
+		expect(models).toEqual(["a/b:max"]);
+	});
+
+	test("a non-provider failure does not walk a present chain", async () => {
+		const { spawn, models } = failSpawn("a/b:max", "stop", reply);
+		const out = await summarizeRelease({
+			notes: "n",
+			cards: [],
+			spawn,
+			projectName: "p",
+			roles: { smol: "a/b:max" },
+			fallbacks: { smol: ["c/d:max"] },
+		});
+		expect(out.summary).toBeNull();
+		expect(out.reason).toBe("gateway exited with code 1: stop");
+		expect(models).toEqual(["a/b:max"]);
 	});
 });
 

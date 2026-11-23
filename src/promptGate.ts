@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
 import { isSizeRefusal, readBelow } from "./confine.ts";
-import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
+import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
+import { modelFallbacks } from "./models.ts";
 import { gatePrompt, gateSystem } from "./prompts.ts";
 import type { ProjectStore } from "./store.ts";
 import type { SkillEntry } from "./tools.ts";
@@ -386,8 +387,11 @@ export async function promptGateCheck(o: {
 	skills?: string | null;
 	spawn?: SpawnFn;
 	timeoutMs?: number;
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
+	fallbacks?: Record<string, string[]>;
 }): Promise<GateCheck> {
-	const raw = await runGateway(
+	const chain = (o.fallbacks ?? modelFallbacks()).plan ?? [];
+	const raw = await runGatewayWithFallbacks(
 		[
 			{ role: "system", content: gateSystem },
 			{
@@ -395,9 +399,10 @@ export async function promptGateCheck(o: {
 				content: gatePrompt(o.prompt, o.userMessages, o.skills ?? null),
 			},
 		],
+		"@plan",
+		chain,
 		o.spawn,
 		o.timeoutMs ?? 120_000,
-		"@plan",
 	);
 	return parseGateCheck(raw);
 }

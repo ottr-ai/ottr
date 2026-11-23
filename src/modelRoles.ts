@@ -9,6 +9,21 @@ export class RolesLayoutError extends Error {}
 /** `retry.fallbackChains`: a chain of model selectors for each role or model key. */
 export type Fallbacks = Record<string, string[]>;
 
+/** One line per known role naming the board features that run on it, shown next to the
+ *  role's row in Settings → Model roles. A code path that starts reading modelRoles()
+ *  for a new board feature updates its role's line here. A role with no entry reads as
+ *  omp-only. */
+export const ROLE_FEATURES: Record<string, string> = {
+	default:
+		"omp turns, and the board's gateway calls with no role: task titles, fork research, the omp release watch.",
+	plan: "Release and review runs: the release review, PR review drafts, the prompt gate, the duplicate-task gate, lead validation.",
+	slow: "Reviews and releases when no plan role is set.",
+	smol: "Consolidate notes in the Create release dialog.",
+	critic:
+		"The check run's second opinion when the work model is an Anthropic model.",
+	adversary: "The check run's second opinion for every other work model.",
+};
+
 const ROLE_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const HEADER = /^modelRoles:[ \t]*(#.*)?$/;
 const SCALAR = `'(?:[^']|'')*'|"(?:[^"\\\\]|\\\\.)*"|[^\\s'"&*!|>{}[\\],#%@\`?:][^\\s#]*`;

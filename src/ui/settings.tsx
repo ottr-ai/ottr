@@ -13,6 +13,7 @@ import {
 import { defaultGitUsername } from "../githubHost.ts";
 import type { CommitIdentity } from "../gitIdentity.ts";
 import { joinLevel, splitLevel, THINKING_LEVELS } from "../levels.ts";
+import { ROLE_FEATURES } from "../modelRoles.ts";
 import type { ModelOption } from "../models.ts";
 import type { AlertClass, ClassPrefs } from "../notifications.ts";
 import type { OmpStatsReport } from "../ompStats.ts";
@@ -6094,7 +6095,9 @@ function ModelRolesHint({ state }: { state: RolesState | null }) {
 					Save commits <code>user/omp/agent/config.yml</code> to Alate's data
 					repo with the board's GitHub token, then Alate provisions the workers.
 				</>
-			)}
+			)}{" "}
+			The board walks each role's fallback chain itself on a provider error
+			(rate limit, capacity, 5xx), so a fallback also covers its gateway calls.
 		</>
 	);
 }
@@ -6167,6 +6170,10 @@ function RoleRow({
 			>
 				<Icon name="x" />
 			</button>
+			<p className="role-use">
+				{ROLE_FEATURES[name] ??
+					"No board feature runs on this role; omp itself uses it."}
+			</p>
 			{notesId !== undefined && (
 				<div className="role-notes" id={notesId}>
 					{field !== undefined && <p className="auth-error">{field}</p>}

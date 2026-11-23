@@ -9923,6 +9923,12 @@ button.log-mode[aria-pressed="true"] {
 	display: grid;
 	gap: 4px;
 }
+.role-use {
+	grid-column: 1 / -1;
+	margin: 0;
+	color: var(--dim);
+	font-size: 12px;
+}
 /* A missing check role: the needs-you box of an expired sign-in. It bleeds into the card's
    padding like that row (9px, the same inset), and its buttons sit at the right end like that
    row's actions. Each button adds its role directly. Below 640px the buttons take their own line. */

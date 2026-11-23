@@ -1,4 +1,5 @@
-import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
+import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
+import { modelFallbacks } from "./models.ts";
 import {
 	deepenCheckPrompt,
 	deepenCheckSystem,
@@ -50,15 +51,21 @@ export async function deepenDraft(o: {
 	model?: string | null;
 	spawn?: SpawnFn;
 	timeoutMs?: number;
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. Only the default selector walks a chain. */
+	fallbacks?: Record<string, string[]>;
 }): Promise<string> {
-	const raw = await runGateway(
+	const explicit = (o.model ?? "").trim();
+	const chain =
+		explicit === "" ? ((o.fallbacks ?? modelFallbacks()).default ?? []) : [];
+	const raw = await runGatewayWithFallbacks(
 		[
 			{ role: "system", content: deepenSystem },
 			{ role: "user", content: deepenPrompt(o.prompt) },
 		],
+		explicit || "@default",
+		chain,
 		o.spawn,
 		o.timeoutMs ?? 120_000,
-		(o.model ?? "").trim() || "@default",
 	);
 	return parseDeepened(raw);
 }
@@ -141,15 +148,21 @@ export async function checkDeepened(o: {
 	model?: string | null;
 	spawn?: SpawnFn;
 	timeoutMs?: number;
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. Only the default selector walks a chain. */
+	fallbacks?: Record<string, string[]>;
 }): Promise<DeepenCheck> {
-	const raw = await runGateway(
+	const explicit = (o.model ?? "").trim();
+	const chain =
+		explicit === "" ? ((o.fallbacks ?? modelFallbacks()).default ?? []) : [];
+	const raw = await runGatewayWithFallbacks(
 		[
 			{ role: "system", content: deepenCheckSystem },
 			{ role: "user", content: deepenCheckPrompt(o.draft, o.rewrite) },
 		],
+		explicit || "@default",
+		chain,
 		o.spawn,
 		o.timeoutMs ?? 120_000,
-		(o.model ?? "").trim() || "@default",
 	);
 	return parseDeepenCheck(raw);
 }

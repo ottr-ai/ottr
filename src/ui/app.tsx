@@ -3501,6 +3501,8 @@ function releaseSummary(
 	summaryBusy: boolean,
 	summarySince: number | null,
 	summaryReason: string | null,
+	goRoles: () => void,
+	role: string,
 ): ReactNode {
 	return (
 		<>
@@ -3519,7 +3521,17 @@ function releaseSummary(
 			{summaryReason !== null && (
 				<p className="advisory">
 					<Icon name="info" size={14} />
-					{`Consolidated notes unavailable: ${summaryReason} — showing the deterministic list.`}
+					{`Consolidated notes unavailable: ${summaryReason} — showing the deterministic list. The call runs on the ${role} role — add a fallback for it in `}
+					<a
+						href={`${settingsPath(null)}#model-roles-section`}
+						onClick={(e) => {
+							e.preventDefault();
+							goRoles();
+						}}
+					>
+						Settings → Model roles
+					</a>
+					{"."}
 				</p>
 			)}
 		</>
@@ -3716,11 +3728,15 @@ export function ReleaseDialog({
 	open,
 	onClose,
 	act,
+	goRoles,
 }: {
 	project: ProjectView;
 	open: boolean;
 	onClose: () => void;
 	act: Act;
+	/** Closes the dialog and SPA-navigates to Settings' Model roles section (a pushState
+	 *  anchor click alone does not re-run the view change, so we navigate directly). */
+	goRoles: () => void;
 }) {
 	const [plan, setPlan] = useState<ReleasePlan | null>(null);
 	const [version, setVersion] = useState("");
@@ -3746,6 +3762,8 @@ export function ReleaseDialog({
 	const catalog = useModels();
 	const { model, setModel, modelQuery, setModelQuery, roleModel } =
 		useReviewModel(open, catalog);
+	// Mirrors src/releaseSummary.ts: the smol selector when that role is configured, else the default role.
+	const summaryRole = catalog?.roles?.smol !== undefined ? "smol" : "default";
 	const send = useBusy();
 	const label = projectLabel(project);
 	const first = plan !== null && plan.from === null;
@@ -3874,7 +3892,13 @@ export function ReleaseDialog({
 								))}
 							</ul>
 						)}
-						{releaseSummary(summaryBusy, summarySince, summaryReason)}
+						{releaseSummary(
+							summaryBusy,
+							summarySince,
+							summaryReason,
+							() => goRoles(),
+							summaryRole,
+						)}
 						{releaseNotes(
 							plan,
 							notesDraft,
@@ -4527,6 +4551,7 @@ export function ProjectBoard({
 	tick,
 	foreignDeps,
 	userLayer,
+	navigate,
 }: {
 	project: ProjectView;
 	tasks: TaskCard[];
@@ -4547,8 +4572,11 @@ export function ProjectBoard({
 	 * foreign card; absent before the first state frame or for an unknown project. */
 	foreignDeps?: DepIndex;
 	/** The provisioned user layer; absent before the first provisioning answer, and absent
-	 * in hosted mode (the operator owns the workers' layer), so the markers stay out. */
+	 *  in hosted mode (the operator owns the workers' layer), so the markers stay out. */
 	userLayer?: ProvisioningResponse["userLayer"] | null;
+	/** SPA navigation, for the release dialog's Settings deep link. App always passes it;
+	 *  test mounts may omit it, and the link then only closes the dialog. */
+	navigate?: (path: string) => void;
 }) {
 	const hosted = useContext(HostedContext);
 	const [showRelease, setShowRelease] = useState(false);
@@ -4912,6 +4940,10 @@ export function ProjectBoard({
 				open={showRelease}
 				onClose={() => setShowRelease(false)}
 				act={act}
+				goRoles={() => {
+					setShowRelease(false);
+					navigate?.(settingsPath(null) + "#model-roles-section");
+				}}
 			/>
 			<ArchReviewDialog
 				project={project}
@@ -17491,6 +17523,7 @@ function AppMainContent(p: {
 		<ProjectBoard
 			key={project.name}
 			project={project}
+			navigate={navigate}
 			tasks={tasks.filter((t) => t.project === project.name)}
 			foreignDeps={depIndexOf(projects, tasks, project)}
 			deltas={deltas}

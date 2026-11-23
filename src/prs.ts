@@ -1,12 +1,13 @@
 import {
 	clean,
 	PROMPT_CHAR_BUDGET,
-	runGateway,
+	runGatewayWithFallbacks,
 	type SpawnFn,
 	stripInvisible,
 } from "./forkAnalysis.ts";
 import type { ForkProject, GhFn } from "./forks.ts";
 import { githubHost } from "./githubHost.ts";
+import { modelFallbacks } from "./models.ts";
 import {
 	type PerfFinding,
 	perfFindings,
@@ -1872,6 +1873,8 @@ export function createPrWatcher(deps: {
 	review?: ReviewFn;
 	/** The process spawner for the default review. */
 	spawn?: SpawnFn;
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
+	fallbacks?: Record<string, string[]>;
 	/** The deterministic perf lens over one PR diff; defaults to perfFindings. */
 	perfScan?: (diff: string, labels: string[]) => PerfFinding[];
 	/** OTTR-1071: timer seam for the quiet-time runs; defaults to setTimeout. Tests inject
@@ -1914,7 +1917,15 @@ export function createPrWatcher(deps: {
 	const log = deps.log;
 	const now = deps.now ?? Date.now;
 	const review: ReviewFn =
-		deps.review ?? ((m) => runGateway(m, deps.spawn, undefined, "@plan"));
+		deps.review ??
+		((m) =>
+			runGatewayWithFallbacks(
+				m,
+				"@plan",
+				(deps.fallbacks ?? modelFallbacks()).plan ?? [],
+				deps.spawn,
+				undefined,
+			));
 	// The run records name the review model: "custom" only on an injected review.
 	const model = deps.review !== undefined ? "custom" : "@plan";
 	// The in-memory record of each PR's last draft run: a start keeps an active

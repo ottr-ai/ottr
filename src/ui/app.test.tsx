@@ -8483,6 +8483,8 @@ describe("ReleaseDialog consolidation", () => {
 	type Harness = {
 		calls: Call[];
 		container: HTMLDivElement;
+		/** Paths the dialog's goRoles callback navigated to. */
+		navigated: string[];
 		/** Re-renders the same root with a new `open` value, for close/reopen tests. */
 		render: (open: boolean) => Promise<void>;
 		done: () => Promise<void>;
@@ -8494,10 +8496,12 @@ describe("ReleaseDialog consolidation", () => {
 		});
 	/** Mounts the open dialog over a fetch mock and lets the plan fetch land.
 	 *  GET /release answers the plan, POST /release answers {} (Start); the
-	 *  release-summary POST goes to `summary`, and every other URL 404s (the
-	 *  model catalog reads its failure and stays null). */
+	 *  release-summary POST goes to `summary`; `models`, when given, answers
+	 *  GET /api/models (with those roles); every other URL 404s (the model
+	 *  catalog reads its failure and stays null). */
 	const mount = async (
 		summary?: () => Response | Promise<Response>,
+		models?: Record<string, string>,
 	): Promise<Harness> => {
 		const calls: Call[] = [];
 		const { restore } = stubFetch(async (url, init) => {
@@ -8510,6 +8514,8 @@ describe("ReleaseDialog consolidation", () => {
 						: undefined,
 			};
 			calls.push(call);
+			if (String(call.url).endsWith("/api/models") && models !== undefined)
+				return json({ models: [], roles: models });
 			if (call.url.endsWith("/release-summary") && call.method === "POST")
 				return summary !== undefined
 					? summary()
@@ -8524,6 +8530,7 @@ describe("ReleaseDialog consolidation", () => {
 		) as unknown as HTMLDivElement;
 		window.document.body.appendChild(container as unknown as HappyNode);
 		const root = createRoot(container);
+		const navigated: string[] = [];
 		const render = (open: boolean): Promise<void> =>
 			act(async () => {
 				root.render(
@@ -8532,6 +8539,7 @@ describe("ReleaseDialog consolidation", () => {
 						open={open}
 						onClose={() => {}}
 						act={runAct}
+						goRoles={() => navigated.push("/settings#model-roles-section")}
 					/>,
 				);
 			});
@@ -8546,8 +8554,10 @@ describe("ReleaseDialog consolidation", () => {
 		return {
 			calls,
 			container,
+			navigated,
 			render,
 			done: async () => {
+				resetCatalogCache();
 				await act(async () => {
 					root.unmount();
 				});
@@ -8712,6 +8722,34 @@ describe("ReleaseDialog consolidation", () => {
 			expect(n).toBe(2);
 			expect(h.container.textContent).not.toContain("the gateway is down");
 			expect(h.container.querySelector(".deepen-diff")).not.toBeNull();
+		} finally {
+			await h.done();
+		}
+	});
+
+	test("a failed consolidation names the smol role and links to Settings' model roles", async () => {
+		const h = await mount(
+			() => json({ summary: null, reason: "the gateway is down" }),
+			{ smol: "zai/glm-5.3-flash" },
+		);
+		try {
+			await click(h, "Consolidate notes");
+			expect(h.container.textContent).toContain(
+				"The call runs on the smol role — add a fallback for it in",
+			);
+			const link = h.container.querySelector(
+				'a[href="/settings#model-roles-section"]',
+			);
+			expect(link?.textContent).toBe("Settings → Model roles");
+			// A plain click SPA-navigates to the Settings deep link (via goRoles).
+			await act(async () => {
+				onClickOf(link as HTMLAnchorElement)({
+					button: 0,
+					preventDefault: () => {},
+					currentTarget: { pathname: "/settings" },
+				});
+			});
+			expect(h.navigated).toEqual(["/settings#model-roles-section"]);
 		} finally {
 			await h.done();
 		}

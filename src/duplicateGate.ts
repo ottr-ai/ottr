@@ -1,4 +1,5 @@
-import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
+import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
+import { modelFallbacks } from "./models.ts";
 import { stripFence } from "./promptGate.ts";
 import {
 	DUPLICATE_REASON,
@@ -328,31 +329,36 @@ export async function duplicateCheck(o: {
 	spawn?: SpawnFn;
 	git?: typeof git;
 	timeoutMs?: number;
+	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
+	fallbacks?: Record<string, string[]>;
 }): Promise<DupVerdict> {
 	const timeoutMs = o.timeoutMs ?? 120_000;
+	const chain = (o.fallbacks ?? modelFallbacks()).plan ?? [];
 	const terms = parseDupTerms(
-		await runGateway(
+		await runGatewayWithFallbacks(
 			[
 				{ role: "system", content: dupTermsSystem },
 				{ role: "user", content: dupTermsPrompt(o.prompt) },
 			],
+			"@plan",
+			chain,
 			o.spawn,
 			timeoutMs,
-			"@plan",
 		),
 	);
 	const hits =
 		terms.length === 0
 			? []
 			: await searchCode({ cwd: o.cwd, ref: o.ref, terms, git: o.git });
-	const raw = await runGateway(
+	const raw = await runGatewayWithFallbacks(
 		[
 			{ role: "system", content: dupVerdictSystem },
 			{ role: "user", content: dupVerdictPrompt(o.prompt, hits, o.candidates) },
 		],
+		"@plan",
+		chain,
 		o.spawn,
 		timeoutMs,
-		"@plan",
 	);
 	return parseDupVerdict(raw, {
 		taskIds: new Set(o.candidates.map((c) => c.id)),

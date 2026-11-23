@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { runGateway, type SpawnFn } from "./forkAnalysis.ts";
-import { modelRoles } from "./models.ts";
+import { runGatewayWithFallbacks, type SpawnFn } from "./forkAnalysis.ts";
+import { modelFallbacks, modelRoles } from "./models.ts";
 import {
 	RELEASE_SUMMARY_CHUNK_INSTRUCTIONS,
 	RELEASE_SUMMARY_INSTRUCTIONS,
@@ -186,19 +186,25 @@ export async function summarizeRelease(o: {
 	projectDescription?: string | null;
 	spawn?: SpawnFn;
 	roles?: Record<string, string>;
+	fallbacks?: Record<string, string[]>;
 	timeoutMs?: number;
 }): Promise<{ summary: string | null; reason: string | null }> {
-	const selector = (o.roles ?? modelRoles()).smol?.trim() || "@default";
+	const roles = o.roles ?? modelRoles();
+	const smol = roles.smol?.trim() || "";
+	const selector = smol || "@default";
+	const role = smol !== "" ? "smol" : "default";
+	const chain = (o.fallbacks ?? modelFallbacks())[role] ?? [];
 	const call = async (system: string, user: string): Promise<string | null> => {
 		try {
-			const reply = await runGateway(
+			const reply = await runGatewayWithFallbacks(
 				[
 					{ role: "system", content: system },
 					{ role: "user", content: user },
 				],
+				selector,
+				chain,
 				o.spawn,
 				o.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-				selector,
 			);
 			const text = reply.trim();
 			return text === "" ? null : text;

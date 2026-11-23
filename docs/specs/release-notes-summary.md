@@ -25,13 +25,22 @@ click away, and the user edits and accepts in the dialog before a release starts
 
 ### Model
 
-- One call over the auth gateway (`runGateway` in `src/forkAnalysis.ts`), 90 s ceiling.
+- One call over the auth gateway (`runGatewayWithFallbacks` in `src/forkAnalysis.ts`),
+  90 s ceiling per attempt.
 - Selector: the board's `modelRoles().smol` when set, else `"@default"` (the two proven
   gateway selectors in this codebase are `"@default"` and `"@plan"`; `"@smol"` is not).
   The spec decision between smol and default: smol — consolidation is compression, not
   reasoning, and the call runs on every dialog open; the smoke run compares both and a
   clearly better default would flip this (none is expected). No project setting: one
   global role plus a per-project setting is schema and UI weight for marginal value.
+- Fallback chain: omp auth-gateway receives the resolved model id, not the role name, so
+  it does not apply `retry.fallbackChains` for this call. The board walks the chain
+  itself (`runGatewayWithFallbacks`): the first attempt uses the selector above, then
+  each entry of the role's chain — `fallbackChains.smol`, or `fallbackChains.default`
+  when the smol role is unset. The walk retries only provider errors (a 429 or 5xx
+  gateway status, or a capacity/rate-limit/overloaded error text) and stops at the
+  first success; any other failure, or a chain that runs out, keeps the deterministic
+  fallback below with the last error as its reason text.
 - The instruction text lives in `src/prompts.ts` (new exported consts), so prompt wording
   stays in one file. It needs user approval before merge (AGENTS.md hard stop 3).
 
