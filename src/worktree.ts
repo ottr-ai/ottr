@@ -2078,6 +2078,22 @@ async function mergePushPreflight(
 			mainPath,
 		);
 		if (merged.code !== 0) return { status: "skipped" };
+		// OTTR-1039: that ancestry proof binds the head into the target but not the whole
+		// pushed commit set — a target moved past the head would publish the extra
+		// commits unreviewed (validation #OTTR-1232). The board's own fast-forward is
+		// the only writer that moves the target past origin and it lands exactly on the
+		// head, so a target past the head is not a board-made state: refuse instead of
+		// publishing it. (No integration head — removed worktree and task branch —
+		// keeps the old proof: main ahead of origin.)
+		const strict = await git(
+			["merge-base", "--is-ancestor", local, head],
+			mainPath,
+		);
+		if (strict.code !== 0)
+			return {
+				status: "failed",
+				error: `merge-push guard: the local target ${branch} holds commits past the integration head ${head}; the board publishes only the reviewed head, so remove the extra commits from the target before this merge lands`,
+			};
 	}
 	if (originUrl === null)
 		return {

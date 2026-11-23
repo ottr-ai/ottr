@@ -271,6 +271,56 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("a local target moved past the integration head refuses to publish the extra commits", async () => {
+		// OTTR-1039 (validation #OTTR-1232): the ancestry proof (the task head is an
+		// ancestor of the local target) does not bind the pushed commit set. A worker
+		// that moves the local target past the reviewed head makes the push publish the
+		// extra commits in the ordinary and the held merge, fast-forward or not. The
+		// board's fast-forward is the only writer that moves the target past origin and
+		// it lands exactly on the integration head, so a target past the head is not a
+		// board-made state: the push must refuse and leave origin at the reviewed tip.
+		const f = fixture(); // local main == the reviewed work tip, origin at base
+		try {
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(f.main, "evil.txt"), "unreviewed\n");
+			run(f.main, "add", "evil.txt");
+			run(f.main, ...id, "commit", "-q", "-m", "unrelated");
+			const base = run(f.bare, "rev-parse", "main");
+			const leaseTip = run(f.main, "rev-parse", "refs/remotes/origin/main");
+			const combos = [
+				["ordinary-noff", null, false],
+				["ordinary-ff", null, true],
+				["held-noff", leaseTip, false],
+				["held-ff", leaseTip, true],
+			] as const;
+			for (const [name, lease, ff] of combos) {
+				const r = await serverMergePush(
+					f.main,
+					f.wt,
+					"origin/main",
+					"ott/x",
+					lease,
+					f.bare,
+					ff,
+				);
+				expect(["failed", "skipped"]).toContain(r.status);
+				if (r.status === "pushed")
+					throw new Error(`${name}: pushed a target past the integration head`);
+				// Nothing landed: origin still holds exactly the reviewed base.
+				expect(run(f.bare, "rev-parse", "main")).toBe(base);
+			}
+			expect(
+				Bun.spawnSync(["git", "cat-file", "-e", `${base}:evil.txt`], {
+					cwd: f.bare,
+					stdout: "pipe",
+					stderr: "pipe",
+				}).exitCode,
+			).not.toBe(0);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
 	test("pushes to origin only, whatever other remotes (a GitHub upstream) exist", async () => {
 		const f = fixture();
 		try {
