@@ -18795,9 +18795,9 @@ describe("session registry (OTTR-387)", () => {
 	}
 
 	// OTTR-1022: a push subscription is a delivery credential of its session. The
-	// revocation paths drop the bound rows; rows created without a session (legacy
-	// rows, API-key callers) stay, and the service worker's 401 live-check keeps
-	// them silent once their device's session is gone.
+	// revocation paths drop the bound rows; rows without a binding (pre-upgrade
+	// rows, API-key callers) cannot prove a live session, so each revocation event
+	// drops them too — the lost-device cutoff.
 	type Call = (
 		path: string,
 		headers?: Record<string, string>,
@@ -18818,7 +18818,7 @@ describe("session registry (OTTR-387)", () => {
 		classes: ALL_CLASSES_ON,
 	};
 
-	test("revoking a session drops its push subscription; unbound rows stay", async () => {
+	test("revoking a session drops its subscription and the unbound legacy rows", async () => {
 		const { g, call, login } = await openBoard("g-sess-push-revoke");
 		await saveSubs(g, [legacySub]);
 		const a = await login("curl/8.4.0");
@@ -18839,14 +18839,13 @@ describe("session registry (OTTR-387)", () => {
 			cookie: b.cookie,
 		});
 		expect(del.status).toBe(200);
-		expect(await endpointsOf(g)).toEqual([
-			"https://push.example/b",
-			"https://push.example/legacy",
-		]);
+		// The pre-upgrade cutoff: the unbound legacy row drops with the revocation.
+		expect(await endpointsOf(g)).toEqual(["https://push.example/b"]);
 	});
 
-	test("logout drops the caller's own push subscription", async () => {
+	test("logout drops the caller's subscription and the unbound legacy rows", async () => {
 		const { g, call, login } = await openBoard("g-sess-push-logout");
+		await saveSubs(g, [legacySub]);
 		const a = await login("curl/8.4.0");
 		const b = await login("curl/8.4.0");
 		await subscribe(call, a.cookie, "https://push.example/a");
@@ -18855,7 +18854,7 @@ describe("session registry (OTTR-387)", () => {
 		expect(await endpointsOf(g)).toEqual(["https://push.example/b"]);
 	});
 
-	test("rotating the session secret drops every session-bound subscription", async () => {
+	test("rotating the session secret drops every push subscription", async () => {
 		const { g, call, login } = await openBoard("g-sess-push-rotate");
 		await saveSubs(g, [legacySub]);
 		const a = await login("curl/8.4.0");
@@ -18864,8 +18863,54 @@ describe("session registry (OTTR-387)", () => {
 			(await call("/api/settings/session-secret", { cookie: a.cookie }, {}))
 				.status,
 		).toBe(200);
-		// The bound row dies with the registry; the unbound legacy row stays.
-		expect(await endpointsOf(g)).toEqual(["https://push.example/legacy"]);
+		// The lost-device kill switch: nothing survives, bound or unbound.
+		expect(await endpointsOf(g)).toEqual([]);
+	});
+
+	test("a subscription whose body lands after its session died is refused", async () => {
+		const { g, srv, call, login } = await openBoard("g-sess-push-race");
+		const a = await login("curl/8.4.0");
+		// The client stalls the request body: auth runs before the body read, so the
+		// route is authenticated while the body never finishes.
+		let feed!: ReadableStreamDefaultController<Uint8Array>;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				feed = controller;
+			},
+		});
+		const pending = fetch(new URL("/api/push/subscribe", srv.url), {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				Host: "board.example",
+				Origin: "https://board.example",
+				cookie: a.cookie,
+			},
+			body,
+			// Bun's RequestInit type omits the stream-body duplex option.
+			duplex: "half",
+		} as RequestInit & { duplex: "half" });
+		// Real wait, not fake timers: the client cannot observe that the server read
+		// the headers and parked on the stalled body, and no seam crosses the fetch
+		// boundary — this delay is what places the logout inside the race window.
+		await Bun.sleep(50);
+		// The session dies while the body is in flight.
+		await call("/api/logout", { cookie: a.cookie }, {});
+		// The client finishes the body now: the binding check inside the
+		// subscription transaction must refuse instead of storing an unbound row.
+		feed.enqueue(
+			new TextEncoder().encode(
+				JSON.stringify({
+					endpoint: "https://push.example/race",
+					keys: { p256dh: "k", auth: "a" },
+				}),
+			),
+		);
+		feed.close();
+		const res = await pending;
+		expect(res.status).toBe(401);
+		expect(await res.json()).toEqual({ error: "session ended" });
+		expect(await endpointsOf(g)).toEqual([]);
 	});
 
 	test("two logins list two rows, newest first, exactly one current", async () => {

@@ -65,10 +65,11 @@ export interface PushSub {
 	/** Public VAPID key this subscription was created under; absent on legacy subs.
 	 * A sub bound to a different key than the current one can never receive (ADR-0011 recovery). */
 	vapidPublicKey?: string;
-	/** Session id this sub was created under; absent on legacy subs and on subs created
-	 * without a live session (API-key callers). The session revocation paths (logout,
-	 * single-session revoke, secret rotation) drop bound subs; unbound subs stay, and the
-	 * service worker's 401/403 live-check guard keeps them silent after sign-out. */
+	/** Session id this sub was created under; absent on legacy subs created before
+	 * binding existed and on subs created without a live session (API-key callers,
+	 * legacy id-less tokens). The session revocation paths (logout, single-session
+	 * revoke, secret rotation) drop unbound rows too: they cannot prove a live
+	 * session, so each revocation event is their cutoff. */
 	session?: string;
 }
 

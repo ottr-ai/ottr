@@ -5697,16 +5697,27 @@ export async function createApp(deps: AppDeps) {
 		return true;
 	}
 
-	/** The caller's signed session id while its registry entry is still live; null
-	 * otherwise (no session, legacy token without an id, API-key call). Push
-	 * subscriptions bind to it so the revocation paths can drop them (OTTR-1022). */
-	function currentSessionId(req: Request): string | null {
-		if (sessionSecret === null) return null;
+	/** What the caller's session cookie means for subscription binding: a live id to
+	 * bind to, a legacy id-less token (still valid, binds to nothing), no cookie at
+	 * all (API-key caller), or a cookie the server no longer honors (revoked,
+	 * rotated, or forged). Push subscriptions bind to the live id so the revocation
+	 * paths can drop them (OTTR-1022); checked inside the subscription transaction,
+	 * because auth runs before the request body is read. */
+	function sessionBindState(
+		req: Request,
+	):
+		| { kind: "live"; id: string }
+		| { kind: "legacy" }
+		| { kind: "none" }
+		| { kind: "revoked" } {
 		const token = parseCookies(req.headers.get("cookie"))[cookieName];
-		if (token === undefined) return null;
+		if (token === undefined || sessionSecret === null) return { kind: "none" };
 		const v = verifySession(sessionSecret, token);
-		if (v === null || v.id === null) return null;
-		return sessions.some((s) => s.id === v.id) ? v.id : null;
+		if (v === null) return { kind: "revoked" };
+		if (v.id === null) return { kind: "legacy" };
+		return sessions.some((s) => s.id === v.id)
+			? { kind: "live", id: v.id }
+			: { kind: "revoked" };
 	}
 
 	/** True when the request arrived under a public host (HTTPS via tailscale serve). */
@@ -8577,9 +8588,10 @@ export async function createApp(deps: AppDeps) {
 				await saveConfig();
 				// The subscription is a separate delivery credential the session
 				// registry does not cover: logout drops the ones bound to this
-				// session too (OTTR-1022).
+				// session too (OTTR-1022). Rows without a binding are the pre-upgrade
+				// cutoff: they cannot prove a live session, so they drop as well.
 				await updateSubs(deps.gstore, (current) =>
-					current.filter((s) => s.session !== v.id),
+					current.filter((s) => s.session !== undefined && s.session !== v.id),
 				);
 			}
 		}
@@ -10745,8 +10757,18 @@ export async function createApp(deps: AppDeps) {
 		const endpoint = b.endpoint;
 		const keys = { p256dh: b.keys.p256dh, auth: b.keys.auth };
 		const vapidPublicKey = (await ensureVapid()).publicKey;
-		const sessionId = currentSessionId(req);
+		// The session must still be live when the row lands: auth runs before the
+		// body is read, so a client can stall the body across its own logout,
+		// revocation or rotation. The binding decision therefore runs inside the
+		// subscription transaction, and a caller whose cookie no longer names a
+		// live session is refused there (OTTR-1022 send-back).
+		const refused: { res: Response | null } = { res: null };
 		await updateSubs(deps.gstore, (current) => {
+			const state = sessionBindState(req);
+			if (state.kind === "revoked") {
+				refused.res = json({ error: "session ended" }, 401);
+				return current;
+			}
 			const previous = current.find((sub) => sub.endpoint === endpoint);
 			// Settings re-registers unchanged subscriptions; keep their pending digest identity.
 			const sameSubscription =
@@ -10770,9 +10792,10 @@ export async function createApp(deps: AppDeps) {
 			};
 			// The sub is a session-bound delivery credential: the session revocation
 			// paths (logout, revoke, rotation) drop it again (OTTR-1022).
-			if (sessionId !== null) fresh.session = sessionId;
+			if (state.kind === "live") fresh.session = state.id;
 			return [...current.filter((sub) => sub.endpoint !== endpoint), fresh];
 		});
+		if (refused.res !== null) return refused.res;
 		return json({ ok: true });
 	}
 
@@ -11112,8 +11135,12 @@ export async function createApp(deps: AppDeps) {
 		await saveConfig();
 		// The revoked session's push subscriptions die with it (OTTR-1022): the sub
 		// is a separate delivery credential the session registry does not cover.
+		// Rows without a binding are the pre-upgrade cutoff: they cannot prove a
+		// live session, so they drop as well.
 		await updateSubs(deps.gstore, (current) =>
-			current.filter((s) => s.session !== req.params.id),
+			current.filter(
+				(s) => s.session !== undefined && s.session !== req.params.id,
+			),
 		);
 		return json({ ok: true });
 	}
@@ -11152,13 +11179,10 @@ export async function createApp(deps: AppDeps) {
 		sessionSecret = newSecret();
 		// The registry dies with the secret: no ghost rows survive the rotation.
 		sessions = [];
-		// Every session-bound push subscription dies with the registry (OTTR-1022,
-		// the lost-device kill switch). Subs created without a session (legacy rows,
-		// API-key callers) stay; the service worker's 401/403 live-check keeps them
-		// silent once their device's session is gone.
-		await updateSubs(deps.gstore, (current) =>
-			current.filter((s) => s.session === undefined),
-		);
+		// Every push subscription dies with the registry (OTTR-1022, the lost-device
+		// kill switch): rows bound to now-dead sessions, and the pre-upgrade cutoff
+		// rows without a binding, which cannot prove a live session.
+		await updateSubs(deps.gstore, () => []);
 		await saveConfig();
 		return json({ ok: true });
 	}
