@@ -98,4 +98,60 @@ describe("server secrets never reach a child process", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	const STRIPPED = [
+		"OTTR_BOARD_URL",
+		"OTTR_BOARD_TOKEN",
+		"OTTR_PROJECT",
+		"OTTR_TASK_ID",
+		"OTTR_DATA_DIR",
+		"OTTR_SERVER_DATA_DIR",
+		"OTTR_BACKUP_DIR",
+		"OTTR_DATABASE_URL",
+		"OTTR_WORKER_URLS",
+		"OTTR_WORKER_TOKEN",
+		"ALATE_API_KEY",
+		"GH_TOKEN",
+		"GITHUB_TOKEN",
+		"GH_ENTERPRISE_TOKEN",
+		"GITHUB_ENTERPRISE_TOKEN",
+		"GIT_ASKPASS",
+		"OTTR_GIT_TOKEN_1",
+	];
+	const PROXY_WITH_CREDS =
+		"http://proxy-user:proxy-pass@corp-proxy.invalid:8080";
+
+	test("the gates strip every server credential name", async () => {
+		const prev = new Map<string, string | undefined>();
+		const markers = new Map<string, string>();
+		for (const name of STRIPPED) {
+			prev.set(name, process.env[name]);
+			const value = `leak-${name}`;
+			markers.set(name, value);
+			process.env[name] = value;
+		}
+		prev.set("HTTPS_PROXY", process.env.HTTPS_PROXY);
+		process.env.HTTPS_PROXY = PROXY_WITH_CREDS;
+		const echoes = [...STRIPPED, "HTTPS_PROXY"]
+			.map((name) => `echo "${name}=\${${name}:-unset}"`)
+			.join("; ");
+		const dir = fixture(`${echoes}; exit 1`, "");
+		try {
+			const r = await withSecret(() => runMergeGates(dir));
+			expect(r.ok).toBe(false);
+			for (const name of STRIPPED) expect(r.output).toContain(`${name}=unset`);
+			// The proxy URL keeps its host and loses its userinfo.
+			expect(r.output).toContain("HTTPS_PROXY=http://corp-proxy.invalid:8080");
+			for (const [, value] of markers) expect(r.output).not.toContain(value);
+			expect(r.output).not.toContain(SECRET);
+			expect(r.output).not.toContain(MASTER_KEY);
+			expect(r.output).not.toContain("proxy-user:proxy-pass");
+		} finally {
+			for (const [name, value] of prev) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });

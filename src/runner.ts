@@ -17,6 +17,7 @@ import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { aptListPath } from "./apt.ts";
 import { prepareTurnCache, serverTurnCacheRoot } from "./cachesweep.ts";
+import { stripServerChildEnv } from "./childEnv.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import { errmsg } from "./errmsg.ts";
 import {
@@ -116,29 +117,8 @@ export function childEnv(o: {
 	stripBoard?: boolean;
 }): Record<string, string> {
 	const env = { ...(o.base ?? process.env) } as Record<string, string>;
-	delete env.OTTR_DATA_DIR;
-	delete env.OTTR_SERVER_DATA_DIR;
-	delete env.OTTR_BACKUP_DIR;
-	// Database access stays on the server; the isolated test variables still pass.
-	delete env.OTTR_DATABASE_URL;
-	delete env.OTTR_WORKER_URLS;
-	delete env.OTTR_WORKER_TOKEN;
-	// The alate bearer key drives provisioning of the agent layer every turn executes;
-	// no turn ever calls alate (only the board's server-side client does), so a turn
-	// that held it could rewrite the fleet's rules, skills and plugins (R5-1 class).
-	delete env.ALATE_API_KEY;
-	// The hosted identity-signing key: a holder forges owner/control/tenant headers.
-	delete env.OTTR_HOSTED_SECRET;
-	// The SecretBox master key unseals the whole sealed credential store
-	// (docs/configuration.md); no turn ever needs it, and a holder could decrypt
-	// the stored tokens offline.
-	delete env.OTTR_SECRET_KEY;
-	// Fleet memory credentials: no turn inherits the board's Hindsight tenant key or
-	// URL. A hindsight deployment re-binds memory per run (memoryBinding): the child
-	// gets the board's /hindsight proxy URL and a per-run token that opens only its
-	// own project's bank (docs/specs/hindsight-bank-binding.md).
-	for (const k of Object.keys(env))
-		if (k.startsWith("HINDSIGHT_")) delete env[k];
+	// The per-name reasons for this strip live in childEnv.ts.
+	stripServerChildEnv(env);
 	// Same strip in serveWorker: a corporate proxy URL with credentials
 	// (http://user:pass@proxy:8080) must not sit in a turn's env; the host and
 	// port stay, so the proxy still routes the turn's network calls.

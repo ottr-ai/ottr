@@ -18,7 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { childDatabaseEnv } from "./childEnv.ts";
+import { childDatabaseEnv, stripServerChildEnv } from "./childEnv.ts";
 import {
 	appendLineBelow,
 	copyBelow,
@@ -32,7 +32,6 @@ import {
 import { githubHost, hostMatcher } from "./githubHost.ts";
 import { type CommitIdentity, identityArgs } from "./gitIdentity.ts";
 import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
-import { HOSTED_SECRET_ENV } from "./hosted.ts";
 import { platform } from "./platform/index.ts";
 import type { DiffFileStat, KeptChoice } from "./types.ts";
 
@@ -2844,9 +2843,18 @@ async function abortRealRebase(
 export async function runMergeGates(
 	mainPath: string,
 ): Promise<{ ok: boolean; output: string }> {
-	// The gates run repo code: never hand it the hosted identity-signing key.
+	// The gates run repository code in the worker-writable main checkout: give
+	// them the ordinary child credential boundary (childEnv's strip list), not a
+	// copy of the server environment. The board coordinates are dispatch state
+	// (childEnv's stripBoard list); stripGitAuthEnv removes the git host tokens.
 	const env = childDatabaseEnv();
-	delete env[HOSTED_SECRET_ENV];
+	stripServerChildEnv(env);
+	delete env.OTTR_BOARD_URL;
+	delete env.OTTR_BOARD_TOKEN;
+	delete env.OTTR_PROJECT;
+	delete env.OTTR_TASK_ID;
+	stripProxyCredentials(env);
+	stripGitAuthEnv(env);
 	const check = Bun.spawn([process.execPath, "run", "check"], {
 		cwd: mainPath,
 		env,

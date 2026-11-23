@@ -930,6 +930,49 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("runMergeGates never hands server credentials to the check gate", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "ottr-gates-"));
+		const names = [
+			"OTTR_WORKER_TOKEN",
+			"ALATE_API_KEY",
+			"OTTR_SECRET_KEY",
+			"GH_TOKEN",
+		];
+		const values = names.map((n) => `leak-${n}`);
+		const prev = names.map((n) => process.env[n]);
+		try {
+			names.forEach((n, i) => {
+				process.env[n] = values[i] as string;
+			});
+			writeFileSync(
+				join(dir, "package.json"),
+				JSON.stringify({
+					name: "gates-fixture",
+					type: "module",
+					scripts: {
+						check:
+							names.map((n) => `echo "${n}=\${${n}:-unset}"`).join("; ") +
+							"; exit 1",
+					},
+				}),
+			);
+			writeFileSync(
+				join(dir, "ok.test.ts"),
+				'import { test } from "bun:test";\ntest("ok", () => {});\n',
+			);
+			const r = await runMergeGates(dir);
+			expect(r.ok).toBe(false);
+			for (const n of names) expect(r.output).toContain(`${n}=unset`);
+			for (const v of values) expect(r.output).not.toContain(v);
+		} finally {
+			names.forEach((n, i) => {
+				if (prev[i] === undefined) delete process.env[n];
+				else process.env[n] = prev[i];
+			});
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("a hold-approved push whose lease no longer matches classifies as rejected too", async () => {
 		const f = fixture();
 		try {
