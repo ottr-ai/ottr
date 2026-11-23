@@ -13550,7 +13550,9 @@ describe(
 		// The board's identity follows the pinned origin (OTTR-1004), and refreshRemote
 		// stamps github from that pin — never from the checkout's remotes. Pin the origin
 		// the way boot pins a discovered project.
-		await rulesStore.setSettings({ originUrl: "https://github.com/acme/widget" });
+		await rulesStore.setSettings({
+			originUrl: "https://github.com/acme/widget",
+		});
 		const rulesProjects = new Map<string, Entry>();
 		rulesProjects.set("p-rules", {
 			path: rulesDir,
@@ -13670,6 +13672,69 @@ describe(
 		};
 	})(),
 );
+
+describe("init pins the operator's origin before refreshRemote (OTTR-1004)", () => {
+	test("a gitless project that gains commits at init pins the real origin and probes branch rules", async () => {
+		const savedToken = process.env.GH_TOKEN;
+		const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+		const savedSystem = process.env.GIT_CONFIG_SYSTEM;
+		makeFixture("reg-pin", /*empty*/ true);
+		const regProjects = new Map<string, Entry>();
+		let probes = 0;
+		const m = await mount({
+			projects: regProjects,
+			branchRulesFetch: async () => {
+				probes++;
+				return new Response(JSON.stringify([{ type: "pull_request" }]), {
+					status: 200,
+				});
+			},
+		});
+		try {
+			// The empty fixture clones offline through the suite map: the project registers
+			// gitless, and the pin that get-url reads through the map names a local path,
+			// the way a checkout whose remote names no real repo would.
+			const add = await m.call("/api/projects", {
+				url: "https://github.com/octo/reg-pin",
+			});
+			expect(add.status).toBe(200);
+			const e = regProjects.get("reg-pin")!;
+			expect(e.gitless).toBe(true);
+			// The operator pushes later; this test stands in for that push by pointing the
+			// config read away from the rewrite map, so `git remote get-url origin` returns
+			// the stored github.com URL verbatim — the pin a real checkout holds.
+			process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+			process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+			process.env.GH_TOKEN = "ghs_test_0000";
+			const init = await m.call("/api/projects/reg-pin/init", {});
+			expect(init.status).toBe(200);
+			// The pin landed before refreshRemote: it holds the github.com URL, and the
+			// identity and the probe it drives saw it. With the old pin-if-null write the
+			// gitless-era pin survives, github stays null, the probe never fires, and the
+			// PR-mode notice and protectedTarget stay off.
+			expect((await e.store.getSettings()).originUrl).toBe(
+				"https://github.com/octo/reg-pin",
+			);
+			expect(e.github).toBe("https://github.com/octo/reg-pin");
+			expect(e.protectedTarget).toBe(true);
+			expect(probes).toBeGreaterThan(0);
+			const view = (await init.json()) as {
+				project: { github: string | null; prModeSuggestion: boolean };
+			};
+			expect(view.project.github).toBe("https://github.com/octo/reg-pin");
+			expect(view.project.prModeSuggestion).toBe(true);
+		} finally {
+			const added = regProjects.get("reg-pin");
+			if (added) await closeTestStore(added.store);
+			if (savedToken === undefined) delete process.env.GH_TOKEN;
+			else process.env.GH_TOKEN = savedToken;
+			if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+			else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
+			if (savedSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
+			else process.env.GIT_CONFIG_SYSTEM = savedSystem;
+		}
+	});
+});
 
 describe("project icon", () => {
 	// 1x1 transparent PNG, base64.

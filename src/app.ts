@@ -7420,12 +7420,12 @@ export async function createApp(deps: AppDeps) {
 			);
 			await saveConfig();
 		}
-		await refreshRemote(e);
-
 		// R5-1 (docs/specs/pinned-origin-url.md): pin the origin URL before the project can
 		// dispatch a turn — the board's fetch and push name this server-owned URL, never the
 		// remote name the worker-writable .git/config resolves. Never refreshed while the
-		// board runs; a re-add or the settings API re-pins.
+		// board runs; a re-add or the settings API re-pins. The pin lands before
+		// refreshRemote so the repo identity and the branch-rules probe it drives see the
+		// pinned URL, not the worker-writable remotes (OTTR-1004).
 		const pin = await originRemoteUrl(p);
 		await e.store.transaction(async () => {
 			if (pin !== null && (await e.store.getSettings()).originUrl === null)
@@ -7438,9 +7438,7 @@ export async function createApp(deps: AppDeps) {
 				taskIdPrefix: prefix === "" ? null : prefix,
 			});
 		});
-		// The pin is in: the board's repo identity follows it, not the checkout's
-		// worker-writable remotes (docs/specs/pinned-origin-url.md, OTTR-1004).
-		e.github = githubUrlFromPin((await e.store.getSettings()).originUrl);
+		await refreshRemote(e);
 		// The rules interview waits for the wizard's last step: the settings saves land
 		// first, so PR mode and the target branch hold for the interview's first commit
 		// (docs/specs/add-project-wizard.md). POST /interview starts it.
@@ -10432,13 +10430,11 @@ export async function createApp(deps: AppDeps) {
 		e.gitless = false;
 		// R5-1: the operator may have run `git remote add origin` before init. Pin it
 		// now, before any turn of this boot can run, so the identity and every pinned
-		// push follow the operator's URL instead of the worker-writable remotes.
+		// push follow the operator's URL instead of the worker-writable remotes. A pin
+		// captured while the project was gitless names no real origin; the init capture
+		// replaces it.
 		const pin = await originRemoteUrl(e.path).catch(() => null);
-		if (pin !== null)
-			await e.store.transaction(async () => {
-				if ((await e.store.getSettings()).originUrl === null)
-					await e.store.setSettings({ originUrl: pin });
-			});
+		if (pin !== null) await e.store.setSettings({ originUrl: pin });
 		await refreshRemote(e);
 		// The interview stays with POST /interview: the wizard's last step and the
 		// checklist call it after the settings steps saved
