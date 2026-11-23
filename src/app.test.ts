@@ -19273,6 +19273,104 @@ describe("update cycle control (OTTR-752)", () => {
 		});
 	});
 
+	test("hosted mode keeps the operator's alate pairing and model roles from a signed owner", async () => {
+		const secret = crypto.randomUUID();
+		const alateKey = `alate-${crypto.randomUUID()}`;
+		// The exfil sink: alate.url seeds to this listener, so any owner success on the
+		// alate routes (repoint, health, provision) would send `Bearer <key>` here.
+		const hits: string[] = [];
+		const listener = Bun.serve({
+			port: 0,
+			fetch: (req) => {
+				const auth = req.headers.get("authorization");
+				if (auth !== null) hits.push(auth);
+				return Response.json({});
+			},
+		});
+		const previousUrl = process.env.ALATE_URL;
+		const previousKey = process.env.ALATE_API_KEY;
+		process.env.ALATE_URL = listener.url.origin;
+		process.env.ALATE_API_KEY = alateKey;
+		try {
+			const m = await board({
+				hosted: {
+					config: {
+						tenant: "acme",
+						secret,
+						controlUrl: "http://127.0.0.1:9",
+						wording: {
+							workSuffix: "",
+							mergeSuffix: "",
+							resumeSuffix: "",
+							creditReason: "No credit.",
+						},
+					},
+					hooks: {
+						reportUsage: () => {},
+						creditOk: async () => true,
+						gitToken: async () => null,
+					},
+					creditBalance: { balance: 12.5 },
+				},
+			});
+			const owner = () => ({
+				"x-ottr-identity": signIdentity(secret, "acme", "owner"),
+			});
+			// The stored key cannot be revealed (GET) and the pairing cannot be repointed
+			// (POST with an attacker key would rotate and call alate with bearer auth).
+			const reveal = await m.call(
+				"/api/settings/alate-key",
+				undefined,
+				owner(),
+			);
+			expect(reveal.status).toBe(404);
+			expect((await reveal.text()).includes(alateKey)).toBe(false);
+			expect(
+				(
+					await m.call(
+						"/api/alate",
+						{ url: listener.url.origin, key: `attacker-${alateKey}` },
+						owner(),
+					)
+				).status,
+			).toBe(404);
+			expect(
+				(await m.call("/api/alate/health", undefined, owner())).status,
+			).toBe(404);
+			expect((await m.call("/api/alate/provision", {}, owner())).status).toBe(
+				404,
+			);
+			// The model-roles editor and the provisioning view are operator-managed too.
+			expect((await m.call("/api/model-roles", {}, owner())).status).toBe(404);
+			expect(
+				(await m.call("/api/model-roles", undefined, owner())).status,
+			).toBe(404);
+			expect(
+				(await m.call("/api/provisioning", undefined, owner())).status,
+			).toBe(404);
+			// A signed tenant never passes either: the off-route rule runs before the
+			// role split.
+			expect(
+				(
+					await m.call("/api/settings/alate-key", undefined, {
+						"x-ottr-identity": signIdentity(secret, "acme", "tenant"),
+					})
+				).status,
+			).toBe(404);
+			// Positive control: the owner still reaches the board, so the 404s above
+			// are the operator-surface rule, not a broken wall.
+			expect((await m.call("/api/state", undefined, owner())).status).toBe(200);
+			// The bearer key reached no listener through any route.
+			expect(hits).toEqual([]);
+		} finally {
+			listener.stop(true);
+			if (previousUrl === undefined) delete process.env.ALATE_URL;
+			else process.env.ALATE_URL = previousUrl;
+			if (previousKey === undefined) delete process.env.ALATE_API_KEY;
+			else process.env.ALATE_API_KEY = previousKey;
+		}
+	});
+
 	test("the real build-commit reader wins and only sha versions provide a fallback", async () => {
 		const home = join(root, `cycle-build-${fixture++}`);
 		mkdirSync(home, { recursive: true });

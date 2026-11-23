@@ -5601,11 +5601,13 @@ export async function createApp(deps: AppDeps) {
 		);
 	}
 
-	/** Routes hosted mode answers 404 for, whoever asks (docs/specs/hosted-mode.md section 3): the
-	 *  proxy owns sign-in, so the board's own login, API key, session registry and provider
-	 *  sign-ins are off. */
+	/** Routes hosted mode answers 404 for, whoever asks (docs/specs/hosted-mode.md sections 3
+	 *  and 7): the proxy owns sign-in, so the board's own login, API key, session registry and
+	 *  provider sign-ins are off. The operator-managed surfaces are off too — the Alate pairing
+	 *  (url, key, health, provision), the model-roles editor and the provisioning view are the
+	 *  operator's, so no signed tenant identity reaches them. */
 	const HOSTED_OFF_ROUTE =
-		/^\/api\/(setup|login|logout|settings\/(api-key|session-secret|sessions(\/[^/]*)?)|provider-login(\/.*)?)$/;
+		/^\/api\/(setup|login|logout|settings\/(api-key|session-secret|alate-key|sessions(\/[^/]*)?)|provider-login(\/.*)?|alate(\/(health|provision))?|model-roles|provisioning)$/;
 
 	/** Hosted mode's one nonce cache: a replayed X-Ottr-Identity header never passes twice. */
 	const identityNonces = new NonceCache();
