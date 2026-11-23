@@ -14938,7 +14938,7 @@ describe("work card check", () => {
 		expect(text).toContain("work check attempt 2 failed:");
 	});
 
-	test("a still-open reference sends the card back and keeps the earlier blocker open", async () => {
+	test("a still-open reference for a known class parks the diverging loop", async () => {
 		const head = { sha: "sha1" };
 		const { store, record, loop } = await workCheckCase(
 			head,
@@ -14951,7 +14951,6 @@ describe("work card check", () => {
 						reason: "the retry loop still drops the last attempt",
 					},
 				]),
-				pass([], [{ id: 1, reason: "the tests now assert the real value" }]),
 			],
 			{ diffText: async () => "const x = 1;\n" },
 		);
@@ -14966,32 +14965,33 @@ describe("work card check", () => {
 
 		const after = (await store.getTask(task.id))!;
 		expect(record.runs).toHaveLength(4);
-		// The unresolved blocker returns to the work agent: no merge transition.
+		// The unresolved class repeats across two consecutive blocking checks: the
+		// recorded divergence rule parks for the user instead of another work turn.
 		expect(after.stage).toBe("in_progress");
-		expect(after.state).toBe("queued");
-		expect(after.workCheckSendbacks).toBe(2);
+		expect(after.state).toBe("needs_you");
+		expect(after.workCheckSendbacks).toBe(1);
 		expect(after.workCheckLog[1]!.outcome).toBe("blockers");
-		// The carried entry drops the old bugClass, so carrying is not a repeated class.
+		// The carried entry keeps the original bugClass, and the blocker stays open.
 		expect(after.workCheckLog[1]!.blockers).toEqual([
-			{ finding: "tests were weakened", quote: "const x = 1;" },
+			{
+				finding: "tests were weakened",
+				quote: "const x = 1;",
+				bugClass: "test-tampering",
+			},
 		]);
+		expect(after.workCheckLog[1]!.blockers[0]!.status).toBeUndefined();
 		expect(after.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
-		expect(after.pendingPrompt).toContain("tests were weakened");
-		expect(after.pendingPrompt).toContain("quote: const x = 1;");
-
-		// The next check numbers the carried blocker and clears it with an explicit fix.
-		head.sha = "sha3";
-		await loop.runTurn(store.name, task.id);
-		expect(record.runs.at(-1)!.prompt).toContain(
-			"\n1. tests were weakened\n   quote: const x = 1;",
+		expect(after.needsReason).toContain(
+			'it re-raises the bug class "test-tampering"',
 		);
-		const merged = (await store.getTask(task.id))!;
-		expect(merged.stage).toBe("merging");
-		expect(merged.state).toBe("queued");
-		expect(merged.workCheckLog[1]!.blockers[0]!.status).toBe("fixed");
-		expect(merged.workCheckLog[1]!.blockers[0]!.statusReason).toBe(
-			"the tests now assert the real value",
+		expect(after.needsReason).toContain(
+			"Reply with a new direction to send the card back with it",
 		);
+		expect(after.asked?.[0]?.options.map((o) => o.label)).toEqual([
+			"Send back with a new approach",
+			"Merge anyway",
+			"Cancel",
+		]);
 	});
 
 	test("a still-open reference rides beside a new blocker in one send-back", async () => {
@@ -15009,6 +15009,13 @@ describe("work card check", () => {
 						},
 					],
 					[{ finding: "missing validation", quote: "const z = 3;" }],
+				),
+				pass(
+					[],
+					[
+						{ id: 1, reason: "the retry loop now covers the last attempt" },
+						{ id: 2, reason: "the input is validated before use" },
+					],
 				),
 			],
 			{ diffText: async () => "const x = 1;\nconst z = 3;\n" },
@@ -15036,6 +15043,24 @@ describe("work card check", () => {
 		expect(after.pendingPrompt).toContain(
 			"2. missing validation\n   quote: const z = 3;",
 		);
+
+		// Neither carried blocker carries a repeated class, so the loop continues:
+		// the next check numbers both and an explicit fix for each merges.
+		head.sha = "sha3";
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs.at(-1)!.prompt).toContain(
+			"\n1. tests were weakened\n   quote: const x = 1;",
+		);
+		expect(record.runs.at(-1)!.prompt).toContain(
+			"\n2. missing validation\n   quote: const z = 3;",
+		);
+		const merged = (await store.getTask(task.id))!;
+		expect(merged.stage).toBe("merging");
+		expect(merged.state).toBe("queued");
+		expect(merged.workCheckLog[1]!.blockers.map((b) => b.status)).toEqual([
+			"fixed",
+			"fixed",
+		]);
 	});
 
 	test("repeated incomplete re-checks retain open blockers at the history cap", async () => {

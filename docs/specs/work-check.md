@@ -55,6 +55,10 @@ classes, and the strict-JSON verdict format are unchanged.
 - A re-check must account for every earlier open blocker before the board accepts its verdict.
 - An explicit `fixed` entry must name a valid one-based blocker ID and give a non-empty reason.
 - A blocker stays unresolved when the new grounded blockers repeat its exact quote.
+- A `stillOpen` entry also leaves the blocker unresolved: it must name a valid one-based
+  blocker ID and give a non-empty fresh quote and a non-empty reason. The carried blocker
+  keeps its `bugClass`, so a still-open class across two consecutive blocking checks parks
+  the diverging loop under the recorded repeated-class rule.
 - An omitted blocker is not fixed. Notes, malformed fixes, and demoted quotes do not resolve it.
 - An incomplete account uses the existing retry path. If both attempts fail, the card parks at
   `needs_you`, outside the merge queue.

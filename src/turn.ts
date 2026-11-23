@@ -12097,8 +12097,9 @@ export function createTurnLoop(
 	/** Applies a valid work-check verdict. Explicit fixes take precedence over repeated
 	 * quotes and still-open references. A still-open reference keeps the earlier blocker
 	 * active in the new run: the card returns to the work agent and never merges past an
-	 * unresolved blocker. Copies, never in place. A pass stamps the card (the deferred
-	 * write below stores merging/queued). Blockers return to the work agent. */
+	 * unresolved blocker, and the carried class still feeds the repeated-class divergence
+	 * rule. Copies, never in place. A pass stamps the card (the deferred write below
+	 * stores merging/queued). Blockers return to the work agent. */
 	async function applyWorkCheckVerdict(
 		st: TurnSettle,
 		cur: Task,
@@ -12139,17 +12140,18 @@ export function createTurnLoop(
 				);
 				const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
 				// A still-open reference rides into the new run as an active blocker, so the
-				// card returns to the work agent with it instead of merging past it. A re-quote
-				// already carries the problem, so only un-quoted references carry. Carried
-				// entries drop the old bugClass: the agent did not re-raise the class, the
-				// check only reported it unresolved, so carrying must not count as a repeat.
+				// card returns to the work agent with it instead of merging past it. The
+				// carried entry keeps its bugClass: an unresolved class across two consecutive
+				// blocking checks is the recorded repeated-class divergence signal, the same
+				// as a re-quote (docs/specs/work-check.md). A re-quote already carries the
+				// problem, so only un-quoted references carry.
 				const stillIds = new Set(verdict.stillOpen.map((s) => s.id));
 				const newQuotes = new Set(split.blockers.map((b) => b.quote));
 				const carried = open.flatMap((b, i) =>
 					stillIds.has(i + 1) &&
 					!fixedById.has(i + 1) &&
 					!newQuotes.has(b.quote)
-						? [{ finding: b.finding, quote: b.quote }]
+						? [{ ...b }]
 						: [],
 				);
 				const active = [...carried, ...split.blockers];
