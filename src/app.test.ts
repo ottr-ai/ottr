@@ -18794,6 +18794,80 @@ describe("session registry (OTTR-387)", () => {
 		return { g, srv, call, login };
 	}
 
+	// OTTR-1022: a push subscription is a delivery credential of its session. The
+	// revocation paths drop the bound rows; rows created without a session (legacy
+	// rows, API-key callers) stay, and the service worker's 401 live-check keeps
+	// them silent once their device's session is gone.
+	type Call = (
+		path: string,
+		headers?: Record<string, string>,
+		body?: unknown,
+	) => Promise<Response>;
+	const subscribe = (call: Call, cookie: string, endpoint: string) =>
+		call(
+			"/api/push/subscribe",
+			{ cookie },
+			{ endpoint, keys: { p256dh: "k", auth: "a" } },
+		);
+	const endpointsOf = async (g: GlobalStore) =>
+		(await loadSubs(g)).map((s) => s.endpoint).sort();
+	const legacySub = {
+		endpoint: "https://push.example/legacy",
+		keys: { p256dh: "k0", auth: "a0" },
+		addedAt: 1,
+		classes: ALL_CLASSES_ON,
+	};
+
+	test("revoking a session drops its push subscription; unbound rows stay", async () => {
+		const { g, call, login } = await openBoard("g-sess-push-revoke");
+		await saveSubs(g, [legacySub]);
+		const a = await login("curl/8.4.0");
+		const b = await login("curl/8.4.0");
+		expect(
+			(await subscribe(call, a.cookie, "https://push.example/a")).status,
+		).toBe(200);
+		expect(
+			(await subscribe(call, b.cookie, "https://push.example/b")).status,
+		).toBe(200);
+		expect(await endpointsOf(g)).toEqual([
+			"https://push.example/a",
+			"https://push.example/b",
+			"https://push.example/legacy",
+		]);
+		const del = await call(`/api/settings/sessions/${a.id}`, {
+			method: "DELETE",
+			cookie: b.cookie,
+		});
+		expect(del.status).toBe(200);
+		expect(await endpointsOf(g)).toEqual([
+			"https://push.example/b",
+			"https://push.example/legacy",
+		]);
+	});
+
+	test("logout drops the caller's own push subscription", async () => {
+		const { g, call, login } = await openBoard("g-sess-push-logout");
+		const a = await login("curl/8.4.0");
+		const b = await login("curl/8.4.0");
+		await subscribe(call, a.cookie, "https://push.example/a");
+		await subscribe(call, b.cookie, "https://push.example/b");
+		await call("/api/logout", { cookie: a.cookie }, {});
+		expect(await endpointsOf(g)).toEqual(["https://push.example/b"]);
+	});
+
+	test("rotating the session secret drops every session-bound subscription", async () => {
+		const { g, call, login } = await openBoard("g-sess-push-rotate");
+		await saveSubs(g, [legacySub]);
+		const a = await login("curl/8.4.0");
+		await subscribe(call, a.cookie, "https://push.example/a");
+		expect(
+			(await call("/api/settings/session-secret", { cookie: a.cookie }, {}))
+				.status,
+		).toBe(200);
+		// The bound row dies with the registry; the unbound legacy row stays.
+		expect(await endpointsOf(g)).toEqual(["https://push.example/legacy"]);
+	});
+
 	test("two logins list two rows, newest first, exactly one current", async () => {
 		const { call, login } = await openBoard("g-sess-list");
 		const a = await login("curl/8.4.0");

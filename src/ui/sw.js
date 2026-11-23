@@ -14,12 +14,15 @@
 //   sends these to Apple endpoints; there the next alert does the retraction.
 // - untyped (the /api/push/test payload): shown as is.
 // Each push also closes every class the server reports with no live alert. When the server
-// cannot be reached (offline, signed out), the worker falls back to its own history: every
+// cannot be reached (offline), the worker falls back to its own history: every
 // retraction bound it ever got (`upTo` of any payload, or a class the server reported dead)
 // and the newest number it knows of (shown, or reported by the server as last sent), per
 // class, persisted in the Cache API so a worker restart keeps them. Offline, an alert shows
 // only when its number is above the bound and not below the newest; `upTo` closes
 // notifications whose own number is at or below the bound.
+// A 401/403 from the live check is different: the server has ended this device's session
+// (signed out or revoked). There is no history fallback — the worker shows nothing, so a
+// session the server killed can never resurrect an alert from local history (OTTR-1022).
 const LIVE_TIMEOUT_MS = 3000;
 
 const seqOf = (n) => n.data?.seq ?? 0;
@@ -95,7 +98,13 @@ function show(data) {
 	});
 }
 
-/** This device's live state per class from the server; null when it cannot be read. */
+/** fetchLive's answer when the server refuses the live check with 401/403: this device's
+ * session is gone (signed out or revoked). Unlike null (offline, unreadable), it never
+ * falls back to local history — a session the server ended shows nothing. */
+const SIGNED_OUT = Symbol("signed-out");
+
+/** This device's live state per class from the server; null when it cannot be read,
+ * SIGNED_OUT when the server answers 401/403. */
 async function fetchLive(endpoint) {
 	if (endpoint === null) return null;
 	const ctrl = new AbortController();
@@ -105,7 +114,10 @@ async function fetchLive(endpoint) {
 			`/api/notifications/live?endpoint=${encodeURIComponent(endpoint)}`,
 			{ credentials: "same-origin", signal: ctrl.signal },
 		);
-		if (!res.ok) return null;
+		if (!res.ok) {
+			if (res.status === 401 || res.status === 403) return SIGNED_OUT;
+			return null;
+		}
 		return await res.json();
 	} catch {
 		return null;
@@ -139,6 +151,12 @@ async function handleAlert(data) {
 	const history = await loadHistory(endpoint);
 	remember(history, data.upTo);
 	const live = await fetchLive(endpoint);
+	if (live === SIGNED_OUT) {
+		// The server ended this session: no display, no history fallback. The
+		// retraction bounds above still persist for a later sign-in.
+		await saveHistory(history);
+		return;
+	}
 	let visible;
 	if (live !== null) {
 		await closeDead(live, history);
@@ -164,6 +182,10 @@ async function handleClear(data) {
 	const history = await loadHistory(endpoint);
 	remember(history, data.upTo);
 	const live = await fetchLive(endpoint);
+	if (live === SIGNED_OUT) {
+		await saveHistory(history);
+		return;
+	}
 	if (live !== null) await closeDead(live, history);
 	else await closeUpTo(data.upTo);
 	await saveHistory(history);

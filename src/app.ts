@@ -5697,6 +5697,18 @@ export async function createApp(deps: AppDeps) {
 		return true;
 	}
 
+	/** The caller's signed session id while its registry entry is still live; null
+	 * otherwise (no session, legacy token without an id, API-key call). Push
+	 * subscriptions bind to it so the revocation paths can drop them (OTTR-1022). */
+	function currentSessionId(req: Request): string | null {
+		if (sessionSecret === null) return null;
+		const token = parseCookies(req.headers.get("cookie"))[cookieName];
+		if (token === undefined) return null;
+		const v = verifySession(sessionSecret, token);
+		if (v === null || v.id === null) return null;
+		return sessions.some((s) => s.id === v.id) ? v.id : null;
+	}
+
 	/** True when the request arrived under a public host (HTTPS via tailscale serve). */
 	function viaPublicHost(req: Request): boolean {
 		const host = req.headers.get("host");
@@ -8563,6 +8575,12 @@ export async function createApp(deps: AppDeps) {
 			if (v !== null && v.id !== null && sessions.some((s) => s.id === v.id)) {
 				sessions = dropSession(sessions, v.id);
 				await saveConfig();
+				// The subscription is a separate delivery credential the session
+				// registry does not cover: logout drops the ones bound to this
+				// session too (OTTR-1022).
+				await updateSubs(deps.gstore, (current) =>
+					current.filter((s) => s.session !== v.id),
+				);
 			}
 		}
 		const secure = viaPublicHost(req);
@@ -10727,6 +10745,7 @@ export async function createApp(deps: AppDeps) {
 		const endpoint = b.endpoint;
 		const keys = { p256dh: b.keys.p256dh, auth: b.keys.auth };
 		const vapidPublicKey = (await ensureVapid()).publicKey;
+		const sessionId = currentSessionId(req);
 		await updateSubs(deps.gstore, (current) => {
 			const previous = current.find((sub) => sub.endpoint === endpoint);
 			// Settings re-registers unchanged subscriptions; keep their pending digest identity.
@@ -10740,18 +10759,19 @@ export async function createApp(deps: AppDeps) {
 				...previous?.classes,
 				...carriedClasses,
 			};
-			return [
-				...current.filter((sub) => sub.endpoint !== endpoint),
-				{
-					endpoint,
-					keys,
-					addedAt: sameSubscription
-						? previous.addedAt
-						: Math.max(now(), (previous?.addedAt ?? 0) + 1),
-					classes: { ...classes },
-					vapidPublicKey,
-				},
-			];
+			const fresh: PushSub = {
+				endpoint,
+				keys,
+				addedAt: sameSubscription
+					? previous.addedAt
+					: Math.max(now(), (previous?.addedAt ?? 0) + 1),
+				classes: { ...classes },
+				vapidPublicKey,
+			};
+			// The sub is a session-bound delivery credential: the session revocation
+			// paths (logout, revoke, rotation) drop it again (OTTR-1022).
+			if (sessionId !== null) fresh.session = sessionId;
+			return [...current.filter((sub) => sub.endpoint !== endpoint), fresh];
 		});
 		return json({ ok: true });
 	}
@@ -11090,6 +11110,11 @@ export async function createApp(deps: AppDeps) {
 			return json({ error: "no such session" }, 404);
 		sessions = dropSession(sessions, req.params.id);
 		await saveConfig();
+		// The revoked session's push subscriptions die with it (OTTR-1022): the sub
+		// is a separate delivery credential the session registry does not cover.
+		await updateSubs(deps.gstore, (current) =>
+			current.filter((s) => s.session !== req.params.id),
+		);
 		return json({ ok: true });
 	}
 
@@ -11127,6 +11152,13 @@ export async function createApp(deps: AppDeps) {
 		sessionSecret = newSecret();
 		// The registry dies with the secret: no ghost rows survive the rotation.
 		sessions = [];
+		// Every session-bound push subscription dies with the registry (OTTR-1022,
+		// the lost-device kill switch). Subs created without a session (legacy rows,
+		// API-key callers) stay; the service worker's 401/403 live-check keeps them
+		// silent once their device's session is gone.
+		await updateSubs(deps.gstore, (current) =>
+			current.filter((s) => s.session === undefined),
+		);
 		await saveConfig();
 		return json({ ok: true });
 	}

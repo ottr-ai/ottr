@@ -65,6 +65,11 @@ export interface PushSub {
 	/** Public VAPID key this subscription was created under; absent on legacy subs.
 	 * A sub bound to a different key than the current one can never receive (ADR-0011 recovery). */
 	vapidPublicKey?: string;
+	/** Session id this sub was created under; absent on legacy subs and on subs created
+	 * without a live session (API-key callers). The session revocation paths (logout,
+	 * single-session revoke, secret rotation) drop bound subs; unbound subs stay, and the
+	 * service worker's 401/403 live-check guard keeps them silent after sign-out. */
+	session?: string;
 }
 
 /** Subs whose bound VAPID key differs from the current one; legacy subs without a bound key stay. */
@@ -90,6 +95,7 @@ function parseSub(s: unknown): PushSub | null {
 	};
 	if ("vapidPublicKey" in s && typeof s.vapidPublicKey === "string")
 		out.vapidPublicKey = s.vapidPublicKey;
+	if ("session" in s && typeof s.session === "string") out.session = s.session;
 	return out;
 }
 

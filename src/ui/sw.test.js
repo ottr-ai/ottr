@@ -16,7 +16,8 @@ const calls = {
 };
 // Notifications currently shown, as { tag, title, data }.
 const tray = [];
-// What the fake /api/notifications/live answers: a per-class state object, or "fail".
+// What the fake /api/notifications/live answers: a per-class state object, "fail"
+// (offline: the fetch throws), "unauthorized" (401) or "forbidden" (403).
 let liveResponse = "fail";
 // When set, the live fetch waits for this promise first (to interleave two handlers).
 let liveGate = null;
@@ -38,6 +39,10 @@ globalThis.fetch = async (url, init) => {
 	const gate = liveGate;
 	if (gate !== null) await gate;
 	if (answer === "fail") throw new Error("offline");
+	if (answer === "unauthorized")
+		return { ok: false, status: 401, json: async () => ({}) };
+	if (answer === "forbidden")
+		return { ok: false, status: 403, json: async () => ({}) };
 	return { ok: true, json: async () => answer };
 };
 
@@ -374,6 +379,39 @@ test("offline: an alert older than one already shown stays hidden after the newe
 	tray.length = 0; // the user swiped it away
 	await push(alert); // #5 arrives late
 	expect(calls.notifications.map((n) => n.title)).toEqual(["newer"]);
+});
+
+test("signed out: a 401 live check never falls back to history, so a revoked session shows nothing", async () => {
+	liveResponse = "unauthorized";
+	// Empty bounds and an empty tray would make an offline fallback show this alert;
+	// a session the server ended must not.
+	await push(alert);
+	expect(calls.notifications).toEqual([]);
+	// The live check still ran, with the worker's own credentials.
+	expect(calls.fetches).toEqual([
+		{
+			url: `/api/notifications/live?endpoint=${encodeURIComponent("https://push.example/me")}`,
+			credentials: "same-origin",
+		},
+	]);
+});
+
+test("signed out: a 403 live check shows nothing either", async () => {
+	liveResponse = "forbidden";
+	await push(alert);
+	expect(calls.notifications).toEqual([]);
+});
+
+test("signed out: a clear still records its bound for a later offline fallback", async () => {
+	liveResponse = "unauthorized";
+	await push({ type: "clear", tags: ["request"], upTo: { request: 5 } });
+	expect(calls.notifications).toEqual([]);
+	// Signed back in but offline: the remembered bound keeps the retracted #5 hidden.
+	liveResponse = "fail";
+	await push(alert);
+	expect(calls.notifications).toEqual([]);
+	await push({ ...alert, seq: 6, title: "newer" });
+	expect(tray.map((n) => n.title)).toEqual(["newer"]);
 });
 
 test("the history survives a worker restart; a new subscription starts fresh", async () => {
