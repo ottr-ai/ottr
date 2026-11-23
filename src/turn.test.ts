@@ -6056,7 +6056,9 @@ describe("turn survivor rounds", () => {
 			expect(record.publishRelease).toHaveLength(0);
 			await store.close();
 		}
-	});
+		// Git-heavy parked-predicate fixtures: the fixture cost passes bun's 5 s
+		// default only on an idle host.
+	}, 60000);
 
 	test("settleReviews ignores idle and needs_you merging rows as blockers", async () => {
 		for (const blockerState of ["idle", "needs_you"] as const) {

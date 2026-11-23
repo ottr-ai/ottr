@@ -26,9 +26,11 @@ import { delimiter, join, relative, sep } from "node:path";
 import {
 	appendLineBelow,
 	copyBelow,
+	type Dir,
 	isSizeRefusal,
 	mkdirBelow,
 	moveBelow,
+	openBelow,
 	openDir,
 	readBelow,
 	readBoundedFile,
@@ -145,6 +147,94 @@ describe("openDir", () => {
 			expect(d.list().sort()).toEqual(["one", "two"]);
 		} finally {
 			d.close();
+		}
+	});
+});
+
+describe("openBelow", () => {
+	test.skipIf(!linux)(
+		"descends two levels and reads through the held dir",
+		() => {
+			const { anchor } = fixture();
+			mkdirSync(join(anchor, "a", "b"), { recursive: true });
+			writeFileSync(join(anchor, "a", "b", "leaf"), "leaf");
+			const parent = openDir(anchor, join(anchor, "a"));
+			try {
+				const child = openBelow(parent, "b");
+				try {
+					expect(child.list()).toEqual(["leaf"]);
+					expect(readFileSync(child.at("leaf"), "utf8")).toBe("leaf");
+				} finally {
+					child.close();
+				}
+			} finally {
+				parent.close();
+			}
+		},
+	);
+
+	test.skipIf(!linux)("refuses a symlink child in the held dir", () => {
+		const { anchor, outside } = fixture();
+		mkdirSync(join(anchor, "a"));
+		symlinkSync(outside, join(anchor, "a", "ln"));
+		const parent = openDir(anchor, join(anchor, "a"));
+		try {
+			expect(() => openBelow(parent, "ln")).toThrow(/refusing/);
+			expect(lstatSync(join(anchor, "a", "ln")).isSymbolicLink()).toBe(true);
+		} finally {
+			parent.close();
+		}
+	});
+
+	test.skipIf(!linux)("refuses a plain-file child", () => {
+		const { anchor } = fixture();
+		mkdirSync(join(anchor, "a"));
+		writeFileSync(join(anchor, "a", "f"), "x");
+		const parent = openDir(anchor, join(anchor, "a"));
+		try {
+			expect(() => openBelow(parent, "f")).toThrow(/refusing/);
+		} finally {
+			parent.close();
+		}
+	});
+
+	test.skipIf(!linux)(
+		"close releases the child descriptor, the parent stays open",
+		() => {
+			const { anchor } = fixture();
+			mkdirSync(join(anchor, "a", "b"), { recursive: true });
+			writeFileSync(join(anchor, "a", "f"), "p");
+			const parent = openDir(anchor, join(anchor, "a"));
+			try {
+				const child = openBelow(parent, "b");
+				const fdPath = `/proc/self/fd/${child.fd}`;
+				expect(child.list()).toEqual([]);
+				child.close();
+				expect(() => readdirSync(fdPath)).toThrow();
+				expect(parent.list().sort()).toEqual(["b", "f"]);
+			} finally {
+				parent.close();
+			}
+		},
+	);
+
+	test.skipIf(!linux)("descends to depth 10 one open per level", () => {
+		const { anchor } = fixture();
+		let deep = anchor;
+		for (let i = 0; i < 10; i++) deep = join(deep, `d${i}`);
+		mkdirSync(deep, { recursive: true });
+		writeFileSync(join(deep, "leaf"), "leaf");
+		let cur: Dir = openDir(anchor, anchor);
+		const held: Dir[] = [cur];
+		try {
+			for (let i = 0; i < 10; i++) {
+				cur = openBelow(cur, `d${i}`);
+				held.push(cur);
+			}
+			expect(cur.list()).toEqual(["leaf"]);
+			expect(readFileSync(cur.at("leaf"), "utf8")).toBe("leaf");
+		} finally {
+			while (held.length > 0) held.pop()?.close();
 		}
 	});
 });

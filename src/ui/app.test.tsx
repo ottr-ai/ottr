@@ -5009,6 +5009,42 @@ describe("Drawer approve button", () => {
 		expect(html).toContain("Kept copies are under Saved files.");
 	});
 
+	test("a done card with a truncated saved list shows the truncated hint, not a count", () => {
+		// The server caps the saved list. With the truncation flag, the drawer
+		// shows the open hint and not a false exact count.
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+			savedFiles: Array.from({ length: 60 }, (_, i) => ({
+				name: `kept-${String(i).padStart(2, "0")}.md`,
+				size: 10,
+			})),
+			savedFilesTruncated: true,
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain('id="drawer-saved"');
+		expect(html).toContain("saved-files?path=kept-00.md");
+		expect(html).toContain("…and more (the list is truncated)");
+		expect(html).not.toContain("…and 10 more");
+	});
+
+	test("a done card with a saved list past 50 and no truncation keeps the count", () => {
+		const task = cardFixture({
+			...drawerFields,
+			stage: "done",
+			state: "idle",
+			worktreeFiles: ["research-report.md"],
+			savedFiles: Array.from({ length: 60 }, (_, i) => ({
+				name: `kept-${String(i).padStart(2, "0")}.md`,
+				size: 10,
+			})),
+		} as Partial<TaskCard>);
+		const html = renderToStaticMarkup(<Drawer {...base} task={task} />);
+		expect(html).toContain("…and 10 more");
+	});
+
 	test("a done card without saved files renders no saved section and keeps the old hint", () => {
 		const task = cardFixture({
 			...drawerFields,

@@ -57,6 +57,13 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   `{ name: string; size: number }[]` for `stage === "done"` cards, walking
   `quarantine/<id>` recursively (repo-relative names, regular files only — symlink entries
   are not listed), sorted by name; `[]` when the folder is absent. Absent on open cards.
+  The walk is bounded: it opens the card folder once through the trusted-anchor
+  confinement and descends from the held descriptor (`openBelow`, one open per level, not
+  a fresh anchor walk per directory). Caps: depth 64, 200 entries, 64 KiB JSON budget
+  (`SAVED_FILES_MAX_DEPTH`, `SAVED_FILES_MAX_ENTRIES`, `SAVED_FILES_MAX_JSON_BYTES` in
+  `src/app.ts`; the quarantine folder is worker-writable and the walk runs synchronously
+  on the board event loop). When a cap binds, the view sets `savedFilesTruncated` — the
+  list is a prefix, never a silent cut.
 - New route `GET /api/projects/:project/tasks/:id/saved-files?path=<rel>` serves one file
   from `quarantine/<id>` with the exact header pattern of the existing
   `tasks/:id/files` route: `Content-Security-Policy: sandbox allow-scripts`,
@@ -97,6 +104,8 @@ shots survive; every other uncommitted file is deleted (`removeDoneWorktree` run
   pre-change behavior (files lost) must never regress into a stuck done settle.
 - Serving refuses traversal, absolute paths, and symlinks; the listing never follows or
   exposes links.
+- An over-cap quarantine tree lists a truncated prefix (`savedFilesTruncated` set) and
+  never blocks the board event loop unboundedly.
 - Quarantined LLM image fragments (text-only retry) share the folder; they surface in the
   listing like any other file the task produced. Accepted.
 

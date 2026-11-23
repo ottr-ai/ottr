@@ -45,6 +45,9 @@ import {
 	parseValidateAgainBody,
 	pickEncoding,
 	reconcileLayerUse,
+	SAVED_FILES_MAX_DEPTH,
+	SAVED_FILES_MAX_ENTRIES,
+	SAVED_FILES_MAX_JSON_BYTES,
 	storedProjectPaths,
 	tmpFull,
 	tmpFullNotice,
@@ -60,6 +63,7 @@ import {
 	signIdentity,
 	signSession,
 } from "./auth.ts";
+import { mkdirBelow, writeBelow } from "./confine.ts";
 import type { DeepenCheck } from "./deepen.ts";
 import type { SpawnFn } from "./forkAnalysis.ts";
 import type { GhFn } from "./forks.ts";
@@ -1305,6 +1309,61 @@ describe("task routes", () => {
 		const ob = (await openDetail.json()) as { savedFiles?: unknown };
 		expect("savedFiles" in ob).toBe(false);
 	});
+
+	test("drawer detail truncates a deep saved files tree at the depth cap", async () => {
+		const t = await store.createTask("deep saved files");
+		await store.updateTask(t.id, { stage: "done", state: "idle" });
+		const qdir = join(store.tasksDir, "quarantine", t.id);
+		mkdirSync(qdir, { recursive: true });
+		writeFileSync(join(qdir, "shallow.txt"), "top");
+		// The 2000-level chain is the validated unbounded-walk shape (~24 s). Linux
+		// caps one syscall path at PATH_MAX, so the chain is built through the same
+		// confined component-wise descent the board itself uses.
+		const levels = Array.from({ length: 2000 }, (_, i) => `d${i}`);
+		mkdirBelow(store.dataRoot, join(qdir, ...levels));
+		writeBelow(store.dataRoot, join(qdir, ...levels, "leaf.txt"), "leaf");
+		// Fixture sanity: the chain is far deeper than the walk's depth cap.
+		expect(SAVED_FILES_MAX_DEPTH).toBeLessThan(2000);
+		const started = Date.now();
+		const detail = await get(`/api/projects/p1/tasks/${t.id}`);
+		const elapsed = Date.now() - started;
+		expect(detail.status).toBe(200);
+		// The bounded walk must not stall the board event loop the way the
+		// unbounded one did.
+		expect(elapsed).toBeLessThan(1000);
+		const b = (await detail.json()) as {
+			savedFiles?: { name: string; size: number }[];
+			savedFilesTruncated?: boolean;
+		};
+		expect(b.savedFiles).toEqual([{ name: "shallow.txt", size: 3 }]);
+		expect(b.savedFilesTruncated).toBe(true);
+	});
+
+	test("drawer detail truncates a wide saved files tree at the entry cap", async () => {
+		const t = await store.createTask("wide saved files");
+		await store.updateTask(t.id, { stage: "done", state: "idle" });
+		const qdir = join(store.tasksDir, "quarantine", t.id);
+		mkdirSync(qdir, { recursive: true });
+		for (let i = 0; i < 50000; i++)
+			writeFileSync(join(qdir, `f${String(i).padStart(5, "0")}.txt`), "x\n");
+		const detail = await get(`/api/projects/p1/tasks/${t.id}`);
+		expect(detail.status).toBe(200);
+		const b = (await detail.json()) as {
+			savedFiles?: { name: string; size: number }[];
+			savedFilesTruncated?: boolean;
+		};
+		expect(b.savedFiles?.length).toBe(SAVED_FILES_MAX_ENTRIES);
+		expect(b.savedFilesTruncated).toBe(true);
+		// The cap lists a prefix of the folder, not a partial-walk artifact: every
+		// listed name is a top-level file of the folder.
+		expect(b.savedFiles?.every((f) => f.name.startsWith("f"))).toBe(true);
+		// The listed prefix stays inside the JSON byte budget.
+		const cost = (b.savedFiles ?? []).reduce(
+			(n, f) => n + f.name.length + 48,
+			0,
+		);
+		expect(cost).toBeLessThanOrEqual(SAVED_FILES_MAX_JSON_BYTES);
+	}, 30000); // The 50000-file fixture alone passes bun's 5 s default.
 
 	test("drawer detail serves the captured uncommitted files for done cards", async () => {
 		// A merged card keeps its worktree path after the merge turn removed the directory.

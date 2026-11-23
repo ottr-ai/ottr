@@ -1204,6 +1204,8 @@ export interface TaskView extends Omit<Task, "diffText"> {
 	worktreeFiles?: string[];
 	/** Repo-relative files kept when the worktree was removed; present on the drawer detail view only. */
 	savedFiles?: { name: string; size: number }[];
+	/** Set when the savedFiles walk hit its depth, entry or byte cap (docs/specs/saved-files.md): the list is a prefix, so "…and more" counts are lower bounds. */
+	savedFilesTruncated?: boolean;
 	/** Set only for kind "pr_review". */
 	prReview?: PrReviewView;
 	/** Set only for kind "pr_review" while the project alerts PR reviews: the draft run stamp and the unseen comment stamp that key the bell occurrences, plus the board-posted stamp (docs/specs/pr-review-auto-post.md). The head keys the posted occurrence. */

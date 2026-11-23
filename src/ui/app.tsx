@@ -11004,9 +11004,12 @@ function DrawerFiles(p: {
 								<span className="saved-size">{fmtBytes(f.size)}</span>
 							</a>
 						))}
-						{task.savedFiles.length > 50 && (
-							<p className="hint">…and {task.savedFiles.length - 50} more</p>
-						)}
+						{task.savedFiles.length > 50 &&
+							(task.savedFilesTruncated ? (
+								<p className="hint">…and more (the list is truncated)</p>
+							) : (
+								<p className="hint">…and {task.savedFiles.length - 50} more</p>
+							))}
 					</div>
 				</DrawerSec>
 			)}

@@ -68,6 +68,8 @@ const FLAGS: Record<WriteMode, number> = {
 export interface Dir {
 	/** The lexical path, for messages only. */
 	readonly path: string;
+	/** The held descriptor on guarded hosts (Linux with /proc/self/fd); undefined in the unguarded fallback. Internal, for openBelow. */
+	readonly fd?: number;
 	/** A path that names `name` in this directory without re-resolving any parent. */
 	at(name: string): string;
 	/** Entry names, like readdirSync. */
@@ -139,6 +141,21 @@ function openChild(
 	}
 }
 
+/** The Dir on the held descriptor of the guarded walk; at and list resolve through /proc/self/fd. */
+function heldDir(fd: number, path: string): Dir {
+	let open = true;
+	return {
+		path,
+		fd,
+		at: (name) => `${FD_DIR}/${fd}/${entryName(name)}`,
+		list: () => readdirSync(`${FD_DIR}/${fd}`),
+		close: () => {
+			if (open) closeSync(fd);
+			open = false;
+		},
+	};
+}
+
 /**
  * Opens `dir` below `anchor` without following any symlink under the anchor; `create`
  * makes the missing components (and the anchor). Throws "refusing <path>" when a component
@@ -173,17 +190,7 @@ export function openDir(
 		closeSync(fd);
 		throw err;
 	}
-	const held = fd;
-	let open = true;
-	return {
-		path: cur,
-		at: (name) => `${FD_DIR}/${held}/${entryName(name)}`,
-		list: () => readdirSync(`${FD_DIR}/${held}`),
-		close: () => {
-			if (open) closeSync(held);
-			open = false;
-		},
-	};
+	return heldDir(fd, cur);
 }
 
 /** Runs `fn` with `dir` opened below `anchor`, then closes it. */
@@ -199,6 +206,25 @@ export function withDir<T>(
 	} finally {
 		d.close();
 	}
+}
+
+/**
+ * Opens the child directory `name` inside the held dir `d`, following no symlink there
+ * (same refusals as openDir). Close the result. A caller that keeps the parent open
+ * descends at one open per level instead of reopening every component from the anchor.
+ */
+export function openBelow(d: Dir, name: string): Dir {
+	const n = entryName(name);
+	const child = join(d.path, n);
+	if (!guarded || d.fd === undefined) {
+		return {
+			path: child,
+			at: (c) => join(child, entryName(c)),
+			list: () => readdirSync(child),
+			close: () => {},
+		};
+	}
+	return heldDir(openChild(d.fd, n, child, false), child);
 }
 
 /**

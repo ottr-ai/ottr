@@ -75,10 +75,12 @@ import { acceptsGzip, boardBundle, bundleResponse } from "./boardBundle.ts";
 import { lookupBranchRules } from "./branchRules.ts";
 import { createCodeScanWatcher } from "./codeScanWatch.ts";
 import {
+	type Dir,
+	openBelow,
+	openDir,
 	openRegularBelow,
 	readBelow,
 	unlinkBelow,
-	withDir,
 	writeBelow,
 } from "./confine.ts";
 import { logError } from "./crash.ts";
@@ -2297,6 +2299,97 @@ function subscriptionIdentity(sub: PushSub): string {
 		)
 		.digest("hex");
 }
+// Caps for the saved-files listing. quarantine/<id> is worker-writable (compose mounts
+// the data volume read-write), and the listing walk runs synchronously on the board
+// event loop, so the walk bounds depth, entries, and response bytes; truncation is
+// reported, never silent.
+export const SAVED_FILES_MAX_DEPTH = 64;
+export const SAVED_FILES_MAX_ENTRIES = 200;
+export const SAVED_FILES_MAX_JSON_BYTES = 64 * 1024;
+
+// Repo-relative files kept under quarantine/<id> when the worktree was removed. The
+// walk opens the root once through the trusted-anchor O_NOFOLLOW confinement (openDir)
+// and descends from the held descriptor (openBelow): one open per level instead of a
+// fresh anchor walk per directory, so a deep tree costs linear, not quadratic, opens.
+// A refusing child (a symlink at the entry) is skipped; sizes come from fd-based lstat,
+// never following the entry itself. The caps above bound depth, entries, and JSON
+// bytes. Regular files only; [] with truncated false when absent or refused.
+const savedDirFiles = (
+	anchor: string,
+	dirRel: string,
+): { files: { name: string; size: number }[]; truncated: boolean } => {
+	const files: { name: string; size: number }[] = [];
+	let bytes = 0;
+	let truncated = false;
+	let budgetFull = false;
+	const walk = (d: Dir, prefix: string, depth: number): void => {
+		for (const name of d.list()) {
+			// The entry and byte caps stop the whole walk: nothing is collected
+			// after either. A depth cap stops only its own branch, so siblings and
+			// ancestors keep listing their entries.
+			if (files.length >= SAVED_FILES_MAX_ENTRIES || budgetFull) {
+				truncated = true;
+				return;
+			}
+			const relName = prefix ? `${prefix}/${name}` : name;
+			let st: Stats;
+			try {
+				st = lstatSync(d.at(name));
+			} catch {
+				continue; // vanished between list and lstat
+			}
+			if (st.isDirectory()) {
+				if (depth >= SAVED_FILES_MAX_DEPTH) {
+					truncated = true; // the branch below this level is not walked
+					continue;
+				}
+				let child: Dir;
+				try {
+					child = openBelow(d, name);
+				} catch {
+					continue; // refused: a symlink at the entry is never followed
+				}
+				try {
+					walk(child, relName, depth + 1);
+				} finally {
+					child.close();
+				}
+			} else if (st.isFile()) {
+				// JSON cost estimate: the name plus the JSON wrapper around it.
+				const cost = relName.length + 48;
+				if (bytes + cost > SAVED_FILES_MAX_JSON_BYTES) {
+					budgetFull = true; // the JSON response would pass its byte budget
+					truncated = true;
+					return;
+				}
+				bytes += cost;
+				files.push({ name: relName, size: st.size });
+			}
+		}
+	};
+	let root: Dir;
+	try {
+		// confine's parts() resolves `dir` against the process cwd, so the walk
+		// passes the anchor-resolved absolute path, as the withDir walk did.
+		root = openDir(anchor, resolve(anchor, dirRel));
+	} catch {
+		return { files, truncated }; // refused (a symlink at any component) or missing
+	}
+	try {
+		walk(root, "", 0);
+	} catch {
+		// a directory vanished between open and list: keep what was read, as the
+		// per-directory withDir catch did before the held-descriptor descent
+	} finally {
+		root.close();
+	}
+	return {
+		files: files.sort((a, b) =>
+			a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+		),
+		truncated,
+	};
+};
 
 export async function createApp(deps: AppDeps) {
 	const { gh, latestReleaseOf, githubAppFetch, rerunFetch } =
@@ -13753,42 +13846,6 @@ export async function createApp(deps: AppDeps) {
 			reviewed,
 		}));
 	}
-	// Repo-relative files kept under quarantine/<id> when the worktree was removed.
-	// The walk anchors at the trusted data root and opens every component with
-	// O_NOFOLLOW (withDir), so a worker-planted link at the card folder or below lists
-	// nothing instead of the link target; sizes come from fd-based lstat, never
-	// following the entry itself. Regular files only; [] when absent or refused.
-	const savedDirFiles = (
-		anchor: string,
-		dirRel: string,
-	): { name: string; size: number }[] => {
-		const out: { name: string; size: number }[] = [];
-		// confine's parts() resolves `dir` against the process cwd, so the walk passes
-		// absolute paths and keeps each one below the anchor itself.
-		const walk = (rel: string, prefix: string): void => {
-			const abs = resolve(anchor, rel);
-			if (relative(anchor, abs).startsWith(`..${sep}`)) return;
-			try {
-				withDir(anchor, abs, {}, (d) => {
-					for (const name of d.list()) {
-						const relName = prefix ? `${prefix}/${name}` : name;
-						let st: Stats;
-						try {
-							st = lstatSync(d.at(name));
-						} catch {
-							continue; // vanished between list and lstat
-						}
-						if (st.isDirectory()) walk(join(rel, name), relName);
-						else if (st.isFile()) out.push({ name: relName, size: st.size });
-					}
-				});
-			} catch {
-				// refused (a symlink at any component) or missing: nothing to list
-			}
-		};
-		walk(dirRel, "");
-		return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-	};
 	async function handleGETProjectsTasksByProjectAndId(
 		req: BunRequest<"/api/projects/:project/tasks/:id">,
 	): Promise<Response> {
@@ -13809,8 +13866,11 @@ export async function createApp(deps: AppDeps) {
 				e.store.dataRoot,
 				join(e.store.tasksDir, "quarantine", task.id),
 			);
-			if (rel !== "" && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
-				view.savedFiles = savedDirFiles(e.store.dataRoot, rel);
+			if (rel !== "" && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) {
+				const saved = savedDirFiles(e.store.dataRoot, rel);
+				view.savedFiles = saved.files;
+				if (saved.truncated) view.savedFilesTruncated = true;
+			}
 		}
 		// Finished cards read the stat captured at merge start (the worktree and branch are
 		// gone); open cards read the branch live, uncommitted edits included. A merge-hold
