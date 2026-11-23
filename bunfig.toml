@@ -17,9 +17,14 @@ timeout = 20000
 # PATH, or the restore below would silently disarm the guard (the guard's own wiring test
 # fails loud if the order ever flips).
 preload = [
-	"./src/test/boardRepoGuard.ts",
-	"./src/test/suiteEnv.ts",
-	# OTTR-1209: the temp-hygiene guard must load after the env snapshot (suiteEnv) and before
-	# any test file: it baselines tmpdir() and its afterAll fails the run on new fixture dirs.
+	# OTTR-1209: the temp-hygiene guard loads FIRST, before any other preload creates temp
+	# state: boardRepoGuard's git-shim dir then lands inside the per-process run root and is
+	# removed with it at the run's end, instead of leaking one ottr-board-guard-* dir into
+	# the OS temp dir per bun test run.
 	"./src/test/tempHygiene.ts",
+	"./src/test/boardRepoGuard.ts",
+	# OTTR-1180: suiteEnv must load after boardRepoGuard: its per-test env snapshot has to
+	# keep the guard's shim PATH, or the restore would silently disarm the guard (the guard's
+	# own wiring test fails loud if the order ever flips).
+	"./src/test/suiteEnv.ts",
 ]

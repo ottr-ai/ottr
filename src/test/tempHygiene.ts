@@ -5,11 +5,12 @@
  * fixture families leaked the same way. This preload (bunfig [test] preload, bun test only)
  * runs two mechanisms:
  *
- * 1. Containment: before any test file loads, the preload points TMPDIR at a per-process run
- *    root, so every fixture mkdtemp of the run lands inside that root instead of the shared
- *    OS temp dir. Concurrent bun test runs on the same host (the board runs merges, reviews
- *    and work turns side by side) each get their own root and cannot see each other's
- *    fixtures, so no run can be blamed for another run's dirs.
+ * 1. Containment: before any other preload or test file creates temp state, the preload
+ *    points TMPDIR at a per-process run root, so every fixture mkdtemp of the run - and
+ *    preload-time ones like boardRepoGuard's git-shim dir - lands inside that root instead
+ *    of the shared OS temp dir. Concurrent bun test runs on the same host (the board runs
+ *    merges, reviews and work turns side by side) each get their own root and cannot see
+ *    each other's fixtures, so no run can be blamed for another run's dirs.
  * 2. The guard: a preload-registered afterAll fires once, after the files' own afterAll
  *    hooks (probe-verified). It lists the run root and fails the run when entries with a
  *    known fixture prefix remain - a leak its creator's cleanup missed shows up here with
