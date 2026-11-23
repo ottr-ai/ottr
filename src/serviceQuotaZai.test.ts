@@ -15,11 +15,11 @@ const resetEndpoint =
 	"https://api.z.ai/api/biz/customer-package-reset/list?targetType=PERSONAL";
 const signal = () => new AbortController().signal;
 
-// Epochs for the schema fixture's nextResetTime fields (milliseconds).
-const FIVE_HOUR_RESET = 1_764_578_800_000;
-const WEEKLY_RESET = 1_765_000_000_000;
+// Epochs from the operator capture's nextResetTime fields (milliseconds).
+const FIVE_HOUR_RESET = 1_795_467_218_287;
+const WEEKLY_RESET = 1_795_974_608_999;
 
-// Schema fixture: invented values with the documented envelope shapes; extra fields stay and must be ignored.
+// Operator capture, 2026-11-23: real response bodies (no reset grants currently held).
 const limitFixture: {
 	code: number;
 	msg: string;
@@ -30,49 +30,50 @@ const limitFixture: {
 	msg: "Operation successful",
 	success: true,
 	data: {
-		level: "PRO",
+		level: "max",
 		limits: [
 			{
-				type: "TOKENS_LIMIT",
+				type: "CREDIT_LIMIT",
 				unit: 3,
-				percentage: 100,
+				number: 5,
+				usage: 28000,
+				currentValue: 265,
+				remaining: 27734,
+				percentage: 1,
 				nextResetTime: FIVE_HOUR_RESET,
 			},
 			{
-				type: "TOKENS_LIMIT",
+				type: "CREDIT_LIMIT",
 				unit: 6,
-				percentage: 8,
+				number: 1,
+				usage: 140000,
+				currentValue: 46505,
+				remaining: 93494,
+				percentage: 33,
 				nextResetTime: WEEKLY_RESET,
-			},
-			{
-				type: "TIME_LIMIT",
-				unit: 5,
-				percentage: 45,
-				currentValue: 1828,
-				usage: 4000,
-				usageDetails: [],
 			},
 		],
 	},
 };
 const resetsFixture: {
 	code: number;
+	msg: string;
 	success: boolean;
 	data: Record<string, unknown>;
 } = {
 	code: 200,
+	msg: "Operation successful",
 	success: true,
 	data: {
-		customerId: 41002358991004410,
+		// Captured as a JSON number beyond Number precision; the decoder ignores the field.
+		customerId: "83311787860279802",
 		targetType: "PERSONAL",
 		organizationId: null,
 		projectId: null,
-		lastFiveHourResetTime: "2026-11-22 10:00:00",
-		lastWeekResetTime: "2026-11-19 17:54:00",
+		lastFiveHourResetTime: null,
+		lastWeekResetTime: "2026-11-23 01:50:09",
 		fiveHourResets: [],
-		weekResets: [
-			{ recordId: 920001, expireTime: "2026-12-07 23:59:59", available: true },
-		],
+		weekResets: [],
 	},
 };
 
@@ -80,7 +81,7 @@ function metrics(
 	fiveHourResetsAt: number | null,
 	weeklyResetsAt: number | null,
 	fiveHourRemaining = 0,
-	weeklyRemaining = 1,
+	weeklyRemaining = 0,
 ): ServiceQuotaMetric[] {
 	return [
 		{
@@ -225,9 +226,10 @@ const fresh = () => ({
 });
 
 describe("Z.AI coding plan quota adapter", () => {
-	test("reads the documented snapshot with two fixed authenticated GETs", async () => {
+	test("reads the captured snapshot with two fixed authenticated GETs", async () => {
 		const server = await harness(fresh());
 		try {
+			// The capture holds no grants today: this is also the empty-grants acceptance case.
 			expect(await server.reader.read({ signal: signal() })).toEqual({
 				ok: true,
 				metrics: metrics(FIVE_HOUR_RESET, WEEKLY_RESET),
@@ -238,7 +240,28 @@ describe("Z.AI coding plan quota adapter", () => {
 		}
 	});
 
-	test("falls back to the last reset stamps when the limit entries lack nextResetTime", async () => {
+	test("still matches TOKENS_LIMIT entries documented by public clients", async () => {
+		const server = await harness({
+			limit: () => ({
+				status: 200,
+				body: changedLimit((body) => {
+					body.data.limits[0]!.type = "TOKENS_LIMIT";
+					body.data.limits[1]!.type = "TOKENS_LIMIT";
+				}),
+			}),
+			resets: fresh().resets,
+		});
+		try {
+			expect(await server.reader.read({ signal: signal() })).toEqual({
+				ok: true,
+				metrics: metrics(FIVE_HOUR_RESET, WEEKLY_RESET),
+			});
+		} finally {
+			await server.close();
+		}
+	});
+
+	test("falls back to the last weekly stamp when the limit entries lack nextResetTime", async () => {
 		const server = await harness({
 			limit: () =>
 				// No unit 6 entry: the weekly row must still fall back.
@@ -250,14 +273,15 @@ describe("Z.AI coding plan quota adapter", () => {
 					}),
 				}),
 			resets: fresh().resets,
-			now: () => Date.parse("2026-11-22T10:00:00+08:00") + 60_000,
+			now: () => Date.parse("2026-11-23T01:50:09+08:00") + 60_000,
 		});
 		try {
+			// The capture's lastFiveHourResetTime is null: the five-hour row has no fallback.
 			expect(await server.reader.read({ signal: signal() })).toEqual({
 				ok: true,
 				metrics: metrics(
-					Date.parse("2026-11-22T10:00:00+08:00") + 5 * 3_600_000,
-					Date.parse("2026-11-19T17:54:00+08:00") + 7 * 86_400_000,
+					null,
+					Date.parse("2026-11-23T01:50:09+08:00") + 7 * 86_400_000,
 				),
 			});
 		} finally {
@@ -275,7 +299,7 @@ describe("Z.AI coding plan quota adapter", () => {
 				}),
 			}),
 			resets: fresh().resets,
-			now: () => Date.parse("2026-11-27T10:00:00+08:00"),
+			now: () => Date.parse("2026-12-05T00:00:00+08:00"),
 		});
 		try {
 			expect(await server.reader.read({ signal: signal() })).toEqual({
@@ -313,20 +337,16 @@ describe("Z.AI coding plan quota adapter", () => {
 		}
 	});
 
-	test("counts only available grants and rejects malformed reset entries", async () => {
-		const mixed = await harness({
+	test("counts an available weekly grant and rejects malformed reset entries", async () => {
+		// Documented mutation of the capture: the card screenshot's one available weekly grant.
+		const granted = await harness({
 			...fresh(),
 			resets: () => ({
 				status: 200,
 				body: changedResets((body) => {
 					body.data.weekResets = [
 						{
-							recordId: 920002,
-							expireTime: "2026-12-01 00:00:00",
-							available: false,
-						},
-						{
-							recordId: 920003,
+							recordId: 920001,
 							expireTime: "2026-12-07 23:59:59",
 							available: true,
 						},
@@ -335,12 +355,14 @@ describe("Z.AI coding plan quota adapter", () => {
 			}),
 		});
 		try {
-			const read = await mixed.reader.read({ signal: signal() });
-			expect(read.ok, "the mixed-grants snapshot must stay valid").toBe(true);
+			const read = await granted.reader.read({ signal: signal() });
+			expect(read.ok, "the granted snapshot must stay valid").toBe(true);
 			if (read.ok)
-				expect(read.metrics).toEqual(metrics(FIVE_HOUR_RESET, WEEKLY_RESET));
+				expect(read.metrics).toEqual(
+					metrics(FIVE_HOUR_RESET, WEEKLY_RESET, 0, 1),
+				);
 		} finally {
-			await mixed.close();
+			await granted.close();
 		}
 		for (const change of [
 			(body: typeof resetsFixture) => {
@@ -387,7 +409,7 @@ describe("Z.AI coding plan quota adapter", () => {
 				route: "limit",
 				body: JSON.stringify({
 					success: true,
-					data: { level: "PRO" },
+					data: { level: "max" },
 				}),
 			},
 			{
@@ -396,7 +418,7 @@ describe("Z.AI coding plan quota adapter", () => {
 				body: JSON.stringify({
 					success: true,
 					data: {
-						limits: [{ type: "TOKENS_LIMIT", unit: 3, nextResetTime: "soon" }],
+						limits: [{ type: "CREDIT_LIMIT", unit: 3, nextResetTime: "soon" }],
 					},
 				}),
 			},
@@ -414,7 +436,7 @@ describe("Z.AI coding plan quota adapter", () => {
 					success: true,
 					data: {
 						targetType: "PERSONAL",
-						lastFiveHourResetTime: "2026-11-22 10:00:00",
+						lastFiveHourResetTime: "2026-11-23 01:50:09",
 						fiveHourResets: [],
 						weekResets: [],
 					},
@@ -424,7 +446,7 @@ describe("Z.AI coding plan quota adapter", () => {
 				name: "reset lastFiveHourResetTime unparseable",
 				route: "resets",
 				body: changedResets((body) => {
-					body.data.lastFiveHourResetTime = "yesterday";
+					body.data.lastFiveHourResetTime = "soon";
 				}),
 			},
 		];
@@ -509,10 +531,15 @@ describe("Z.AI coding plan quota adapter", () => {
 			limit: () => ({
 				status: 200,
 				body: changedLimit((body) => {
+					// Duplicate CREDIT_LIMIT unit 3 entry: the first must win.
 					body.data.limits.unshift({
-						type: "TOKENS_LIMIT",
+						type: "CREDIT_LIMIT",
 						unit: 3,
-						percentage: 100,
+						number: 5,
+						usage: 28000,
+						currentValue: 265,
+						remaining: 27734,
+						percentage: 1,
 						nextResetTime: later,
 					});
 				}),

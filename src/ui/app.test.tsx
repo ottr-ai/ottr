@@ -14581,8 +14581,9 @@ describe("service quotas in the overview", () => {
 	});
 
 	test("a z.ai coding plan source renders grant counts and reset stamps", () => {
-		const fiveHourResetsAt = 1_764_578_800_000;
-		const weeklyResetsAt = 1_765_000_000_000;
+		// Counts 0/1 mirror the capture plus the card screenshot's one available weekly grant.
+		const fiveHourResetsAt = 1_795_467_218_287;
+		const weeklyResetsAt = 1_795_974_608_999;
 		const document = services([
 			{
 				id: "zai",

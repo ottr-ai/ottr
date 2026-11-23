@@ -47,10 +47,12 @@ function decodeLimit(body: unknown): LimitStash | null {
 	const limits = body.data.limits;
 	if (!Array.isArray(limits)) return null;
 	const window = (unit: number): number | null | undefined => {
+		// Operator capture 2026-11-23 shows "CREDIT_LIMIT"; public clients document "TOKENS_LIMIT"; "number" stays ignored.
 		const entry = limits.find(
 			(candidate) =>
 				record(candidate) &&
-				candidate.type === "TOKENS_LIMIT" &&
+				(candidate.type === "TOKENS_LIMIT" ||
+					candidate.type === "CREDIT_LIMIT") &&
 				candidate.unit === unit,
 		);
 		if (!record(entry)) return null;
