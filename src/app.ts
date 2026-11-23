@@ -10428,13 +10428,17 @@ export async function createApp(deps: AppDeps) {
 		const err = await gitInitWithCommit(e.path);
 		if (err !== null) return json({ error: err }, 400);
 		e.gitless = false;
-		// R5-1: the operator may have run `git remote add origin` before init. Pin it
-		// now, before any turn of this boot can run, so the identity and every pinned
-		// push follow the operator's URL instead of the worker-writable remotes. A pin
-		// captured while the project was gitless names no real origin; the init capture
-		// replaces it.
+		// R5-1: a project registered gitless may hold no pin at all — the operator git-inits
+		// a bare folder and adds origin before init. Fill that null now, before any turn of
+		// this boot can run, so the identity and every pinned push follow the operator's
+		// URL. An existing pin stands: registration pinned the admin's clone URL, and the
+		// checkout's remotes are worker-writable — init must never adopt a planted one.
 		const pin = await originRemoteUrl(e.path).catch(() => null);
-		if (pin !== null) await e.store.setSettings({ originUrl: pin });
+		if (pin !== null)
+			await e.store.transaction(async () => {
+				if ((await e.store.getSettings()).originUrl === null)
+					await e.store.setSettings({ originUrl: pin });
+			});
 		await refreshRemote(e);
 		// The interview stays with POST /interview: the wizard's last step and the
 		// checklist call it after the settings steps saved

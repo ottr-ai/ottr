@@ -32,11 +32,12 @@ from `origin` by name.
    - in `addProject`, right after the clone — and the pin read lands before the
      registration's remote refresh, so the repo identity (behavior 7) and the
      branch-rules probe it drives see the pinned URL, not the remotes;
-   - for a project the operator git-inits, at the init endpoint, which replaces
-     a pin captured while the project was gitless.
+   - for a project the operator git-inits, at the init endpoint, when the
+     registration left no pin at all (an operator who git-inits a bare folder
+     and adds origin before init). An existing pin stands — the checkout's
+     remotes are worker-writable, and init must never adopt a planted one.
    The pin reads `git remote get-url origin` and stores it verbatim. It never
-   refreshes while the board runs. A re-pin happens through a remove/re-add or
-   that init endpoint.
+   refreshes while the board runs. A re-pin happens through a remove/re-add.
 3. Board network git never takes a remote name for the merge, release and
    target-refresh paths. It names the pinned URL instead:
    - `serverMergePush` pushes `<originUrl> refs/heads/<branch>:refs/heads/<branch>`;
@@ -155,9 +156,11 @@ from `origin` by name.
 - A planted `remote.origin.pushurl` naming a second repo leaves the board's
   repo identity on the pinned origin repo (`src/worktree.test.ts`).
 - A planted `url.<x>.pushInsteadOf` rewrite does the same.
-- A gitless project that gains its origin and commits at the init endpoint
-  leaves init with the real origin as its pin, the pin-derived repo identity,
-  and a run branch-rules probe (`src/app.test.ts`).
+- Registration answers with the pin-derived repo identity already stamped and
+  the branch-rules probe already run (`src/app.test.ts`).
+- A project with a registration pin keeps it at the init endpoint even when
+  the checkout's origin remote moved; a project with no pin picks the
+  checkout's origin up at init (`src/app.test.ts`).
 - Boot pins the URL before the turn loop starts; `addProject` pins right after
   the clone.
 

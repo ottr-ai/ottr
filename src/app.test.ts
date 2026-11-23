@@ -31,7 +31,7 @@ import {
 } from "node:fs";
 import { connect as netConnect } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Server } from "bun";
 import {
 	type App,
@@ -13673,14 +13673,21 @@ describe(
 	})(),
 );
 
-describe("init pins the operator's origin before refreshRemote (OTTR-1004)", () => {
-	test("a gitless project that gains commits at init pins the real origin and probes branch rules", async () => {
+describe("registration pins before refreshRemote (OTTR-1004)", () => {
+	test("a registered clone stamps the pin-derived identity and probes branch rules", async () => {
 		const savedToken = process.env.GH_TOKEN;
-		const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
-		const savedSystem = process.env.GIT_CONFIG_SYSTEM;
-		makeFixture("reg-pin", /*empty*/ true);
-		const regProjects = new Map<string, Entry>();
+		const savedHost = process.env.OTTR_GITHUB_HOST;
+		makeFixture("reg-pin");
+		// A fixture pin is a file:// path, so no real GitHub host matches it. With the
+		// configured host set to the pin's tmpdir label, the pin is identity-bearing
+		// (https://tmp/<root>/fixture-repos/reg-pin), and registration must stamp that
+		// identity and run the branch-rules probe before it answers. The probe stops
+		// while the identity is null, so the old order — remote refresh first, pin after
+		// — leaves github null at registration, skips the probe, and fails these checks.
+		process.env.OTTR_GITHUB_HOST = "tmp";
+		process.env.GH_TOKEN = "ghs_test_0000";
 		let probes = 0;
+		const regProjects = new Map<string, Entry>();
 		const m = await mount({
 			projects: regProjects,
 			branchRulesFetch: async () => {
@@ -13691,43 +13698,68 @@ describe("init pins the operator's origin before refreshRemote (OTTR-1004)", () 
 			},
 		});
 		try {
-			// The empty fixture clones offline through the suite map: the project registers
-			// gitless, and the pin that get-url reads through the map names a local path,
-			// the way a checkout whose remote names no real repo would.
 			const add = await m.call("/api/projects", {
 				url: "https://github.com/octo/reg-pin",
 			});
 			expect(add.status).toBe(200);
 			const e = regProjects.get("reg-pin")!;
-			expect(e.gitless).toBe(true);
-			// The operator pushes later; this test stands in for that push by pointing the
-			// config read away from the rewrite map, so `git remote get-url origin` returns
-			// the stored github.com URL verbatim — the pin a real checkout holds.
-			process.env.GIT_CONFIG_GLOBAL = "/dev/null";
-			process.env.GIT_CONFIG_SYSTEM = "/dev/null";
-			process.env.GH_TOKEN = "ghs_test_0000";
-			const init = await m.call("/api/projects/reg-pin/init", {});
-			expect(init.status).toBe(200);
-			// The pin landed before refreshRemote: it holds the github.com URL, and the
-			// identity and the probe it drives saw it. With the old pin-if-null write the
-			// gitless-era pin survives, github stays null, the probe never fires, and the
-			// PR-mode notice and protectedTarget stay off.
-			expect((await e.store.getSettings()).originUrl).toBe(
-				"https://github.com/octo/reg-pin",
+			// The identity is derived from the stored pin — a file:// URL no remote read
+			// would ever produce — and the probe ran inside registration.
+			const pin = (await e.store.getSettings()).originUrl;
+			expect(pin).toBe(`file://${fixtureRepos}/reg-pin`);
+			expect(e.github).toBe(
+				`https://tmp/${basename(root)}/fixture-repos/reg-pin`,
 			);
-			expect(e.github).toBe("https://github.com/octo/reg-pin");
 			expect(e.protectedTarget).toBe(true);
-			expect(probes).toBeGreaterThan(0);
-			const view = (await init.json()) as {
+			expect(probes).toBe(1);
+			const view = (await add.json()) as {
 				project: { github: string | null; prModeSuggestion: boolean };
 			};
-			expect(view.project.github).toBe("https://github.com/octo/reg-pin");
+			expect(view.project.github).toBe(
+				`https://tmp/${basename(root)}/fixture-repos/reg-pin`,
+			);
 			expect(view.project.prModeSuggestion).toBe(true);
 		} finally {
 			const added = regProjects.get("reg-pin");
 			if (added) await closeTestStore(added.store);
 			if (savedToken === undefined) delete process.env.GH_TOKEN;
 			else process.env.GH_TOKEN = savedToken;
+			if (savedHost === undefined) delete process.env.OTTR_GITHUB_HOST;
+			else process.env.OTTR_GITHUB_HOST = savedHost;
+		}
+	});
+
+	test("init keeps the registration pin when the checkout's remote moved", async () => {
+		const savedGlobal = process.env.GIT_CONFIG_GLOBAL;
+		const savedSystem = process.env.GIT_CONFIG_SYSTEM;
+		makeFixture("reg-pin-b", /*empty*/ true);
+		const regProjects = new Map<string, Entry>();
+		const m = await mount({ projects: regProjects });
+		try {
+			const add = await m.call("/api/projects", {
+				url: "https://github.com/octo/reg-pin-b",
+			});
+			expect(add.status).toBe(200);
+			const e = regProjects.get("reg-pin-b")!;
+			const pinAtRegistration = (await e.store.getSettings()).originUrl;
+			expect(pinAtRegistration).toBe(`file://${fixtureRepos}/reg-pin-b`);
+			// A work turn owns .git/config: it re-aims the checkout's origin at its own repo.
+			execSync("git remote set-url origin https://github.com/octo/evil", {
+				cwd: e.path,
+				stdio: "ignore",
+				env: fixtureGitEnv(),
+			});
+			// The operator's init reads the config free of the rewrite map, so a pin
+			// refill would take the planted URL verbatim. The registration pin stands;
+			// only a project with no pin at all picks the checkout's origin up.
+			process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+			process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+			const init = await m.call("/api/projects/reg-pin-b/init", {});
+			expect(init.status).toBe(200);
+			expect((await e.store.getSettings()).originUrl).toBe(pinAtRegistration);
+		} finally {
+			const added = regProjects.get("reg-pin-b");
+			if (added) await closeTestStore(added.store);
 			if (savedGlobal === undefined) delete process.env.GIT_CONFIG_GLOBAL;
 			else process.env.GIT_CONFIG_GLOBAL = savedGlobal;
 			if (savedSystem === undefined) delete process.env.GIT_CONFIG_SYSTEM;
@@ -21967,7 +21999,9 @@ describe(
 				await removeApp();
 				const rm = await m.call("/api/projects/appcheck-recheck/remove", {});
 				expect(rm.status).toBe(200);
-			});
+				// Real clones, mounts and ticks: the 5 s default times out under load
+				// (OTTR-1004 send-back), so this test carries the file's git ceiling.
+			}, 60_000);
 
 			test("no app configured: the post falls back to gh and reports the person's login", async () => {
 				await removeApp();
