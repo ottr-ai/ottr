@@ -35,4 +35,15 @@ describe("verify-image-age-gate --grep", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("the default mode exits 2 with the hint when docker is absent", () => {
+		const out = Bun.spawnSync([process.execPath, scriptPath], {
+			cwd: root,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: { ...process.env, PATH: "/age-gate-no-docker" },
+		});
+		expect(out.exitCode).toBe(2);
+		expect(out.stderr.toString()).toContain("no docker engine here");
+	});
 });

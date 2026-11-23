@@ -32,29 +32,41 @@ if (mode === "--grep") {
 	process.exit(0);
 }
 
-const docker = Bun.spawnSync({
-	cmd: ["docker", "version", "--format", "{{.Server.Version}}"],
-	stdout: "pipe",
-	stderr: "pipe",
-});
-if (docker.exitCode !== 0) {
+let engineUp = false;
+try {
+	engineUp =
+		Bun.spawnSync({
+			cmd: ["docker", "version", "--format", "{{.Server.Version}}"],
+			stdout: "pipe",
+			stderr: "pipe",
+		}).exitCode === 0;
+} catch {
+	// spawnSync throws ENOENT when the docker CLI is not on PATH.
+}
+if (!engineUp) {
 	console.error(
 		"no docker engine here; run `bun run scripts/verify-image-age-gate.ts --grep` locally, or run the full build on a host with docker",
 	);
 	process.exit(2);
 }
-const build = Bun.spawnSync({
-	cmd: [
-		"docker",
-		"build",
-		"--progress=plain",
-		"-f",
-		"Dockerfile.worker",
-		"-t",
-		"ottr-age-gate-check",
-		".",
-	],
-	stdout: "inherit",
-	stderr: "inherit",
-});
+let build;
+try {
+	build = Bun.spawnSync({
+		cmd: [
+			"docker",
+			"build",
+			"--progress=plain",
+			"-f",
+			"Dockerfile.worker",
+			"-t",
+			"ottr-age-gate-check",
+			".",
+		],
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+} catch (err) {
+	console.error(`docker build failed to start: ${err}`);
+	process.exit(2);
+}
 process.exit(build.exitCode ?? 1);
