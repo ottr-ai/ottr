@@ -1536,7 +1536,9 @@ planted config and `$GIT_DIR/info/attributes` unread, and symlinks the real `ref
 a planted `filter.<driver>.clean`/`smudge`/`process`, `merge.<driver>.driver` or
 `merge.default`. A main gitdir left mid-rebase by a killed earlier attempt is recovered
 through the stub too: the state is copied in, the abort runs there, and the real state
-dirs go once the abort has stood for them.
+dirs go once the abort has stood for them. The retry implies a checkout of the branch,
+so the real HEAD file is repointed after a sealed checkout, and a checkout the
+interruption left detached lands back on the branch.
 
 Topology: the compose file pins the board service's `GIT_CONFIG_GLOBAL` to
 `/etc/ottr/gitconfig` and `GH_CONFIG_DIR` to `/etc/ottr/gh`. These paths are on the

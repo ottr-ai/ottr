@@ -756,6 +756,88 @@ describe("serverMergePush", () => {
 		}
 	});
 
+	test("recovers a real interrupted rebase without leaving HEAD detached", async () => {
+		const f = fixture();
+		try {
+			// What a killed server rebase leaves: a real conflict stops the rebase mid-run
+			// (state dirs on disk, HEAD detached at the replayed commit). The recovery must
+			// abort that state and still point the real checkout back at the branch before
+			// the retry, or the branch moves while HEAD sits detached at a stale commit.
+			const twin = join(f.dir, "twin");
+			run(f.dir, "clone", "-q", f.bare, twin);
+			const id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+			writeFileSync(join(twin, "c.txt"), "origin line\n");
+			run(twin, ...id, "add", ".");
+			run(twin, ...id, "commit", "-qm", "another writer");
+			run(twin, "push", "-q", "origin", "main");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+			writeFileSync(join(f.main, "c.txt"), "local line\n");
+			run(f.main, ...id, "add", ".");
+			run(f.main, ...id, "commit", "-qm", "local work");
+			const interrupted = Bun.spawnSync(
+				["git", "rebase", "refs/remotes/origin/main"],
+				{
+					cwd: f.main,
+					env: fixtureGitEnv(),
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			if (interrupted.exitCode === 0)
+				throw new Error("expected the rebase to conflict");
+			const gm = Bun.spawnSync(["git", "rev-parse", "--git-path", "rebase-merge"], {
+				cwd: f.main,
+				env: fixtureGitEnv(),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(existsSync(join(f.main, gm.stdout.toString().trim()))).toBe(true);
+			const detached = Bun.spawnSync(["git", "symbolic-ref", "HEAD"], {
+				cwd: f.main,
+				env: fixtureGitEnv(),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(detached.exitCode).not.toBe(0);
+
+			// The twin takes its change back (the file goes away on origin), so the retry
+			// after the recovery converges.
+			run(twin, "rm", "-q", "c.txt");
+			run(twin, ...id, "commit", "-qm", "undo");
+			run(twin, "push", "-q", "origin", "main");
+			expect(await fetchOriginBranch(f.main, "main", f.bare)).toBeNull();
+
+			expect(await rebaseTargetBranch(f.main, "main")).toEqual({ ok: true });
+			expect(run(f.main, "symbolic-ref", "--short", "HEAD")).toBe("main");
+			expect(run(f.main, "rev-parse", "HEAD")).toBe(
+				run(f.main, "rev-parse", "refs/heads/main"),
+			);
+			run(
+				f.main,
+				"merge-base",
+				"--is-ancestor",
+				"refs/remotes/origin/main",
+				"refs/heads/main",
+			);
+			expect(readFileSync(join(f.main, "c.txt"), "utf8")).toBe("local line\n");
+			expect(run(f.main, "status", "--porcelain")).toBe("");
+			const left = Bun.spawnSync(
+				["git", "rev-parse", "--git-path", "rebase-merge"],
+				{
+					cwd: f.main,
+					env: fixtureGitEnv(),
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			expect(existsSync(join(f.main, left.stdout.toString().trim()))).toBe(
+				false,
+			);
+		} finally {
+			rmSync(f.dir, { recursive: true, force: true });
+		}
+	});
+
 	test("rebaseTargetBranch fails closed on a dirty checkout", async () => {
 		const f = fixture();
 		try {

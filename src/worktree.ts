@@ -10,6 +10,7 @@ import {
 	readdirSync,
 	readFileSync,
 	realpathSync,
+	renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -2653,7 +2654,10 @@ export async function fetchPrHead(
  * OTTR-1038: the rebase and every abort run on the live-refs stub — no planted filter or
  * merge driver runs on the rewritten or conflicted files. A main gitdir already mid-rebase
  * (a killed earlier attempt, or a state a worker planted) is invisible to the stub, so it is
- * recovered first (abortRealRebase); then the retry proceeds.
+ * recovered first (abortRealRebase); then the retry proceeds. The retry implies a checkout
+ * of <branch>, which plain git performed on the real HEAD: the checkout now runs sealed and
+ * the real HEAD file is repointed, so the branch never moves under a detached or stale
+ * checkout (send-back 1).
  */
 export async function rebaseTargetBranch(
 	mainPath: string,
@@ -2674,6 +2678,43 @@ export async function rebaseTargetBranch(
 			const aborted = await abortRealRebase(s, left);
 			if (aborted !== null)
 				return { ok: false, conflict: false, error: aborted };
+		}
+		// `rebase <upstream> <branch>` implies a checkout of <branch>: plain git moved the
+		// real gitdir's HEAD with it, and the stub cannot. A real HEAD left detached by an
+		// interrupted rebase (send-back 1) or checked out on another branch is therefore
+		// switched first — after the recovery above, so no rebase state can refuse it —
+		// with the sealed checkout keeping plain git's refuse-on-dirty behavior, and only
+		// a successful checkout may repoint the real HEAD, or the branch would move while
+		// HEAD sits stale.
+		const headPath = await git(["rev-parse", "--git-path", "HEAD"], mainPath);
+		const head =
+			headPath.code === 0
+				? path.resolve(mainPath, headPath.stdout.trim())
+				: path.join(mainPath, ".git", "HEAD");
+		const symbolic = await git(["symbolic-ref", "HEAD"], mainPath);
+		if (
+			symbolic.code !== 0 ||
+			symbolic.stdout.trim() !== `refs/heads/${branch}`
+		) {
+			const co = await s.run(["checkout", "--quiet", branch]);
+			if (co.code !== 0)
+				return {
+					ok: false,
+					conflict: false,
+					error:
+						co.stderr.split("\n").find((line) => /^(error|fatal):/i.test(line)) ??
+						co.stderr.trim().split("\n").filter(Boolean).pop() ??
+						`git checkout ${branch} exited ${co.code}`,
+				};
+			try {
+				writeRepoHead(path.dirname(head), `ref: refs/heads/${branch}\n`);
+			} catch (e) {
+				return {
+					ok: false,
+					conflict: false,
+					error: `cannot point the checkout at ${branch} before the retry: ${String(e)}`,
+				};
+			}
 		}
 		const r = await s.run([
 			// The replay re-creates commits, so it needs a committer identity; pin the board's
@@ -2722,10 +2763,22 @@ export async function rebaseTargetBranch(
 	}
 }
 
+/** Points the real gitdir's HEAD at `content` (`ref: <ref>` form), replacing the file
+ * atomically: a concurrent git read sees the old or the new HEAD, never a torn write.
+ * The temp name is removed first and written with wx, so a worker-planted file or
+ * symlink at that name cannot redirect the write; the window left is an active race on
+ * a recovery path the old plain-git code ran with far wider holes. */
+function writeRepoHead(gitdir: string, content: string): void {
+	const tmp = path.join(gitdir, "HEAD.ottr-recovery");
+	rmSync(tmp, { force: true });
+	writeFileSync(tmp, content, { flag: "wx" });
+	renameSync(tmp, path.join(gitdir, "HEAD"));
+}
+
 /** The main checkout's own in-progress rebase state dirs, by real path (plain reads:
- * rev-parse runs no driver and reads no attribute). The sealed rebase below sees only its
- * stub, so leftover real state — a killed earlier attempt, or one a worker planted — must
- * be recovered before it runs, or it would sit stale behind a moved branch. */
+ * rev-parse runs no driver and reads no attribute). The sealed rebase below sees only
+ * its stub, so leftover real state — a killed earlier attempt, or one a worker planted
+ * — must be recovered before it runs, or it would sit stale behind a moved branch. */
 async function realRebaseState(mainPath: string): Promise<string[]> {
 	const dirs: string[] = [];
 	for (const name of ["rebase-merge", "rebase-apply"]) {
@@ -2742,9 +2795,11 @@ async function realRebaseState(mainPath: string): Promise<string[]> {
 /** Recovers a leftover real rebase state through the stub: copy the state dirs in (capped —
  * a planted oversized state fails closed instead of filling the server's tmp), abort there
  * — the abort resets the named branch to the state's orig-head through the live refs and
- * checks the files back out — then remove the real state dirs the completed abort stood
- * for (the cleanup a plain abort's own run did). Null on success; else the failure text,
- * and the real state stays, so the next retry sees it again. */
+ * checks the files back out, while the real HEAD stays whatever the interruption left —
+ * then remove the real state dirs the completed abort stood for (the cleanup a plain
+ * abort's own run did). The caller points the real HEAD at the branch afterwards. Null on
+ * success; else the failure text, and the real state stays, so the next retry sees it
+ * again. */
 async function abortRealRebase(
 	s: GitStub,
 	dirs: readonly string[],
