@@ -2002,13 +2002,18 @@ describe("tar", () => {
 			const stream = new ReadableStream<Uint8Array>(
 				{
 					pull(c) {
-						if (step === 0) c.enqueue(bytes.slice(0, 512));
+						if (step === 0)
+							// Everything up to the member's own header: a name past ustar's
+							// 100-byte limit (long TMPDIR paths) adds @LongLink blocks, so
+							// the header sits at a fixed 1536-byte tail (data + padding +
+							// end), not at 512. The member's temp file is open in sub once
+							// this chunk is consumed — the swap below lands mid-write.
+							c.enqueue(bytes.slice(0, bytes.length - 1536));
 						else if (step === 1) {
-							// The member's header is read and its temp file is open in sub.
 							atSwap = readdirSync(join(proj, "sub"));
 							renameSync(join(proj, "sub"), join(proj, "held"));
 							symlinkSync(outside, join(proj, "sub"));
-							c.enqueue(bytes.slice(512));
+							c.enqueue(bytes.slice(bytes.length - 1536));
 						} else c.close();
 						step++;
 					},
