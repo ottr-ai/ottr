@@ -77,7 +77,8 @@ function newestMtime(entryPath: string): number | null {
 }
 
 // OTTR-754: paths a live process holds open via /proc, read-only — the sweep never signals.
-function liveHeldPaths(procRoot: string): Set<string> {
+// OTTR-1211: exported for the cache sweep, which honors the same holds.
+export function liveHeldPaths(procRoot: string): Set<string> {
 	const held = new Set<string>();
 	let pids: string[];
 	try {
@@ -210,8 +211,9 @@ function sweepEntry(
 	return { name, bytes };
 }
 
-/** Sum of lstat sizes of all regular files under the entry (walk before deleting). */
-function sumFileBytes(entryPath: string): number {
+/** Sum of lstat sizes of all regular files under the entry (walk before deleting).
+ * OTTR-1211: exported for the cache sweep's cap check. */
+export function sumFileBytes(entryPath: string): number {
 	let bytes = 0;
 	let st: Stats;
 	try {

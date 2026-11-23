@@ -69,14 +69,16 @@ const burst = '{"type":"tick"}\\n'.repeat(4096);
 setInterval(() => process.stdout.write(burst), 1);`,
 );
 
-// Scratch omp: prints "<TMPDIR> <OTTR_TMP_ROOT>", writes a file into its TMPDIR, then
-// stays alive until killed — the test observes the scratch live, then gone at run end.
+// Scratch omp: prints "<TMPDIR> <OTTR_TMP_ROOT> <BUN_INSTALL_CACHE_DIR>", writes a
+// file into its TMPDIR, then stays alive until killed — the test observes the
+// scratch live, then gone at run end. The write lands before the print, so the
+// test's first read proves the file exists.
 const scratchPath = join(dir, "scratch-omp.js");
 writeFileSync(
 	scratchPath,
 	`const fs = require("node:fs");
-process.stdout.write(process.env.TMPDIR + " " + process.env.OTTR_TMP_ROOT + "\\n");
 fs.writeFileSync(require("node:path").join(process.env.TMPDIR, "used"), "x");
+process.stdout.write([process.env.TMPDIR, process.env.OTTR_TMP_ROOT, process.env.BUN_INSTALL_CACHE_DIR].join(" ") + "\\n");
 setInterval(() => {}, 1000);`,
 );
 
@@ -1147,43 +1149,124 @@ describe("serveWorker", () => {
 	}, 15000);
 
 	test("the run's private scratch dies when the run ends (OTTR-1211)", async () => {
-		const url = start({ ompPath: process.execPath });
-		const controller = new AbortController();
-		const res = await fetch(`${url}/run`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				id: "r-scratch",
-				argv: [scratchPath],
-				cwd: dir,
-				stdin: "",
-				env: {},
-			}),
-			signal: controller.signal,
-		});
-		const reader = res.body!.getReader();
-		const firstLine = new TextDecoder().decode((await reader.read()).value);
-		const [scratch, tmpRoot] = firstLine.trim().split(" ");
-		// The child's TMPDIR is the run's own dir, and the root beside it is the
-		// daemon's temp root (where GET /stats and the mutation lock read).
-		expect(scratch!.startsWith(join(tmpdir(), "ottr-run-"))).toBe(true);
-		expect(tmpRoot).toBe(tmpdir());
-		// The run really used its scratch before the test ends it.
-		expect(existsSync(join(scratch!, "used"))).toBe(true);
-		// The card's run ends here: the child dies, and the close handler removes
-		// the scratch. The child's close event lives inside the daemon, so the test
-		// has no promise to await — poll the observable condition like awaitBeatStall.
-		controller.abort();
+		const homes = mkdtempSync(join(tmpdir(), "ottr-homes-"));
+		const savedHomes = process.env.OTTR_TURN_HOMES;
+		process.env.OTTR_TURN_HOMES = homes;
 		try {
-			const r = await reader.read();
-			expect(r.done).toBe(true);
-		} catch {
-			// an aborted stream equally proves the child is gone
+			const url = start({ ompPath: process.execPath });
+			const controller = new AbortController();
+			const res = await fetch(`${url}/run`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					id: "r-scratch",
+					argv: [scratchPath],
+					cwd: dir,
+					stdin: "",
+					env: {},
+					project: "alpha",
+				}),
+				signal: controller.signal,
+			});
+			const reader = res.body!.getReader();
+			const firstLine = new TextDecoder().decode((await reader.read()).value);
+			const [scratch, tmpRoot, bunCache] = firstLine.trim().split(" ");
+			// The scratch lives in the project's turn home, one sanitized run id
+			// segment deep; the cache env points at the project's shared bun dir.
+			expect(
+				scratch!.startsWith(join(homes, "alpha", "tmp", "run-r-scratch-")),
+			).toBe(true);
+			expect(tmpRoot).toBe(tmpdir());
+			expect(bunCache).toBe(join(homes, "alpha", "cache", "bun"));
+			// The run really used its scratch before the test ends it.
+			expect(existsSync(join(scratch!, "used"))).toBe(true);
+			// The card's run ends here: the child dies, and the close handler removes
+			// the scratch. The child's close event lives inside the daemon, so the test
+			// has no promise to await — poll the observable condition like awaitBeatStall.
+			controller.abort();
+			try {
+				const r = await reader.read();
+				expect(r.done).toBe(true);
+			} catch {
+				// an aborted stream equally proves the child is gone
+			}
+			const deadline = Date.now() + 10_000;
+			while (existsSync(scratch!) && Date.now() < deadline) await Bun.sleep(20);
+			expect(existsSync(scratch!)).toBe(false);
+			// The scratch parent and the cache dirs stay: other cards of the project use them.
+			expect(existsSync(join(homes, "alpha", "tmp"))).toBe(true);
+			expect(existsSync(join(homes, "alpha", "cache", "bun"))).toBe(true);
+		} finally {
+			if (savedHomes === undefined) delete process.env.OTTR_TURN_HOMES;
+			else process.env.OTTR_TURN_HOMES = savedHomes;
+			rmSync(homes, { recursive: true, force: true });
 		}
-		const deadline = Date.now() + 10_000;
-		while (existsSync(scratch!) && Date.now() < deadline) await Bun.sleep(20);
-		expect(existsSync(scratch!)).toBe(false);
 	}, 15000);
+
+	test("two cards of one project share the cache dirs; two projects do not (OTTR-1211)", async () => {
+		const homes = mkdtempSync(join(tmpdir(), "ottr-homes-share-"));
+		const savedHomes = process.env.OTTR_TURN_HOMES;
+		process.env.OTTR_TURN_HOMES = homes;
+		try {
+			const url = start({ ompPath: process.execPath });
+			const envOf = async (
+				id: string,
+				project: string,
+			): Promise<Record<string, string>> => {
+				const res = await fetch(`${url}/run`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						id,
+						argv: [envDumpPath],
+						cwd: dir,
+						stdin: "",
+						env: {},
+						project,
+					}),
+				});
+				const lines = await readLines(res);
+				return JSON.parse(lines[0]!) as Record<string, string>;
+			};
+			const a1 = await envOf("a1", "alpha");
+			const a2 = await envOf("a2", "alpha");
+			const b1 = await envOf("b1", "beta");
+			// Same project: every card shares one cache dir per tool family.
+			const expectedSubs: Record<string, string> = {
+				XDG_CACHE_HOME: "xdg",
+				BUN_INSTALL_CACHE_DIR: "bun",
+				PIP_CACHE_DIR: "pip",
+				UV_CACHE_DIR: "uv",
+				npm_config_cache: "npm",
+			};
+			for (const [key, sub] of Object.entries(expectedSubs)) {
+				expect(a1[key]).toBe(join(homes, "alpha", "cache", sub));
+				expect(a1[key]).toBe(a2[key]);
+				expect(a1[key]).not.toBe(b1[key]);
+			}
+			// Scratch stays per run, inside the project's turn home.
+			expect(a1.TMPDIR).not.toBe(a2.TMPDIR);
+			expect(
+				a1.TMPDIR!.startsWith(join(homes, "alpha", "tmp", "run-a1-")),
+			).toBe(true);
+			expect(b1.TMPDIR!.startsWith(join(homes, "beta", "tmp", "run-b1-"))).toBe(
+				true,
+			);
+			// Both runs ended (envDump exits): their scratch dirs are gone again.
+			for (const tmp of [a1.TMPDIR!, a2.TMPDIR!, b1.TMPDIR!]) {
+				const deadline = Date.now() + 10_000;
+				while (existsSync(tmp) && Date.now() < deadline) await Bun.sleep(20);
+				expect(existsSync(tmp)).toBe(false);
+			}
+			// The project cache dirs were really created under the turn homes.
+			expect(existsSync(join(homes, "alpha", "cache", "bun"))).toBe(true);
+			expect(existsSync(join(homes, "beta", "cache", "npm"))).toBe(true);
+		} finally {
+			if (savedHomes === undefined) delete process.env.OTTR_TURN_HOMES;
+			else process.env.OTTR_TURN_HOMES = savedHomes;
+			rmSync(homes, { recursive: true, force: true });
+		}
+	}, 30000);
 
 	test("omp output that arrives after the client left raises no error", async () => {
 		// The daemon kills omp when the client leaves, but lines omp wrote before the kill

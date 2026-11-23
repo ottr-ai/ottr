@@ -16,6 +16,7 @@ import {
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { aptListPath } from "./apt.ts";
+import { prepareTurnCache, serverTurnCacheRoot } from "./cachesweep.ts";
 import { mkdirBelow, touchBelow, writeBelow } from "./confine.ts";
 import { errmsg } from "./errmsg.ts";
 import {
@@ -2119,6 +2120,15 @@ function startLocalRun(s: RunStart): RunHandle {
 	);
 	if (layerEnv !== null) Object.assign(base, layerEnv);
 	Object.assign(base, identityEnv);
+	// OTTR-1211: the per-project cache (every card of the project shares it, two
+	// projects never do), on the server's own cache root — a worker-less server runs
+	// its turns here. Same layout and best-effort rule as the worker turn homes.
+	const serverCache = prepareTurnCache(
+		serverTurnCacheRoot(),
+		o.project ?? o.board?.project ?? undefined,
+		null,
+	);
+	if (serverCache !== null) Object.assign(base, serverCache.cacheEnv);
 	// OTTR-1211: the run's private scratch: TMPDIR points into a per-run dir, so the
 	// card's temp (pip and bun caches, tool temp) dies with the run instead of aging
 	// out a day later. OTTR_TMP_ROOT names the host temp root for files that must stay

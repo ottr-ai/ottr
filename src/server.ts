@@ -20,6 +20,12 @@ import {
 	POSTGRES_BACKUP_NOTICE,
 	resolveBackup,
 } from "./backup.ts";
+import {
+	CACHE_SWEEP_INTERVAL_MS,
+	projectCacheRoots,
+	serverTurnCacheRoot,
+	sweepCacheRootsLog,
+} from "./cachesweep.ts";
 import { logError, trapCrashes } from "./crash.ts";
 import { pidAlive, StoreLockedError } from "./dblock.ts";
 import { errmsg } from "./errmsg.ts";
@@ -1342,6 +1348,15 @@ const sweepServerTmp = (): void => {
 };
 runWork(() => sweepServerTmp());
 every(() => sweepServerTmp(), 3_600_000);
+
+// OTTR-1211: the daily cache sweep over the server's own per-project turn caches
+// (a worker-less server runs its turns here): TTL and cap per root, oldest first,
+// live holds kept. The hourly /tmp net above stays the safety net.
+const sweepServerCaches = (): void => {
+	sweepCacheRootsLog(projectCacheRoots(serverTurnCacheRoot()));
+};
+runWork(() => sweepServerCaches());
+every(() => sweepServerCaches(), CACHE_SWEEP_INTERVAL_MS);
 
 // No bind retry: nothing in the repo restarts this process on the same port, so a
 // bind failure surfaces as the thrown error from Bun.serve.

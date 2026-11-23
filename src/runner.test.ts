@@ -3351,6 +3351,49 @@ describe("startRun private scratch (OTTR-1211)", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	test("a local run points the five cache vars at its project's server cache", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-servercache-"));
+		const saved = process.env.OTTR_TURN_CACHE_ROOT;
+		process.env.OTTR_TURN_CACHE_ROOT = root;
+		try {
+			let envAtSpawn: Record<string, string | undefined> = {};
+			const fake = new FakeOmp(4244);
+			const launcher: RunLauncher = (_c, _a, options) => {
+				envAtSpawn = options.env as Record<string, string | undefined>;
+				queueMicrotask(() => fake.emit("close", 0));
+				return fake as unknown as ChildProcess;
+			};
+			const handle = await startRun({
+				cwd: root,
+				prompt: "check the work",
+				sessionDir: root,
+				extensionPath: "/unused.ts",
+				resumeId: null,
+				logPath: join(root, "run.log"),
+				dataRoot: root,
+				project: "gamma",
+				launcher,
+			});
+			await handle.done;
+			// The project's cache root, with one subdir per tool family; all five
+			// vars stay inside it, and the dirs exist for the tools to fill.
+			for (const [key, sub] of [
+				["XDG_CACHE_HOME", "xdg"],
+				["BUN_INSTALL_CACHE_DIR", "bun"],
+				["PIP_CACHE_DIR", "pip"],
+				["UV_CACHE_DIR", "uv"],
+				["npm_config_cache", "npm"],
+			] as const) {
+				expect(envAtSpawn[key]).toBe(join(root, "gamma", "cache", sub));
+				expect(existsSync(envAtSpawn[key]!)).toBe(true);
+			}
+		} finally {
+			if (saved === undefined) delete process.env.OTTR_TURN_CACHE_ROOT;
+			else process.env.OTTR_TURN_CACHE_ROOT = saved;
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("startRun", () => {

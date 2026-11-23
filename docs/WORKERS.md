@@ -345,17 +345,28 @@ omp. Two parts do the work:
    `The temp disk (/tmp) of <runner> is full (<free> free)` notice until the
    space is back.
 
-   OTTR-1211 extends this in three ways. The hold check also reads a live
-   process's argv and exe, so a program or config path inside an entry keeps
-   it. The server runs the same sweep on its own uncapped `/tmp`, at boot and
-   hourly, with the starts of its own local runs beside the hold check. And a
-   run's `TMPDIR` points into a private `ottr-run-` dir, so the card's scratch
-   (pip and bun caches, tool temp) dies with the run instead of aging out a day
-   later; `OTTR_TMP_ROOT` names the host temp root beside the redirect, so the
-   host-global mutation lock (`scripts/stryker-base.mjs`) and `GET /stats` keep
-   reading it there. The sweep is the backstop for a scratch whose run never
-   ended cleanly (a worker restart), and for scratch a run wrote outside
-   `TMPDIR`.
+   OTTR-1211 gives every turn a per-project cache and a per-card scratch, both
+   inside the project's turn home: `<turnHomesRoot>/<project>/cache` with one
+   subdir each for xdg, bun, pip, uv and npm (`XDG_CACHE_HOME`,
+   `BUN_INSTALL_CACHE_DIR`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`,
+   `npm_config_cache`), and `<turnHomesRoot>/<project>/tmp` holding the run's
+   own `TMPDIR` dir. All cards of one project share one cache, two projects
+   never share one, and the scratch dies with the run — a normal end and a
+   cancel alike — instead of aging out in `/tmp` a day later. The run id names
+   the scratch dir as one safe path segment. A worker-less server does the
+   same for its local runs under `~/.cache/ottr-turns`. Cache setup is best
+   effort: a failed prep keeps the default env.
+
+   Each worker and the server sweep their project cache roots once a day, at
+   boot and every 24 h: a top-level entry unused for 14 days (file atime;
+   directory atimes never decide, the sweep's own readdir refreshes them under
+   relatime) goes, then entries evict oldest-first while the root holds more
+   than 5 GiB. An entry a live process holds (cwd, open fd, argv, exe) is
+   never removed, and each run logs the root and the freed size. The worker's
+   daily tick also sweeps each project's per-card tmp dirs with the live-run
+   guard, so a scratch orphaned by a dead worker still goes. The hourly 24h
+   `/tmp` sweep stays as the safety net for scratch a run wrote outside its
+   dirs.
 
    When the board is too old for the runner API (`GET /api/drain` answers
    nothing), the script keeps the old whole-board rule, with the old hold-first

@@ -13,6 +13,7 @@ import {
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
+import { prepareTurnCache } from "./cachesweep.ts";
 import { acquireLayerUse } from "./layers.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
@@ -46,6 +47,7 @@ import {
 	releaseLayerCopyUse,
 	type TurnHome,
 	type TurnIdentity,
+	turnHomesRoot,
 	uidCollisionNote,
 } from "./turnUid.ts";
 import type { RunResult } from "./types.ts";
@@ -494,8 +496,9 @@ export function serveWorker(opts: {
 		// the same closure as the layer lease, so a finished run stops
 		// protecting its copy and the next prune for the project reclaims it.
 		let releaseCopyUse: (() => void) | null = null;
+		// One project name for the whole run: identity, cache and scratch all key on it.
+		const project = body.project ?? body.env?.OTTR_PROJECT;
 		if (turnUid) {
-			const project = body.project ?? body.env?.OTTR_PROJECT;
 			if (typeof project === "string" && project !== "") {
 				try {
 					ids = projectTurnUid(project);
@@ -551,13 +554,28 @@ export function serveWorker(opts: {
 				status: 500,
 			});
 		}
-		// OTTR-1211: the card's private scratch: TMPDIR points into a per-run dir, so
-		// the run's temp (pip and bun caches, tool temp) dies with the run instead of
-		// aging out a day later. OTTR_TMP_ROOT names this daemon's temp root for files
-		// that must stay host-global under the redirected TMPDIR — the mutation lock
-		// reads it (scripts/stryker-base.mjs), and GET /stats reads the same root. The
-		// run's uid owns the dir: the child drops to that uid (OTTR-994).
-		const scratch = mkdtempSync(join(tmpdir(), "ottr-run-"));
+		// OTTR-1211: per-project cache (every card of the project shares it, two
+		// projects never do) and the project's per-card scratch parent, both in the
+		// project's turn home — outside the audited shared home and the capped /tmp.
+		// Best effort: a failed prep keeps the default env rather than failing the run.
+		const turnRoots = prepareTurnCache(
+			turnUid?.homesRoot ?? turnHomesRoot(),
+			project,
+			ids,
+		);
+		if (turnRoots !== null) Object.assign(env, turnRoots.cacheEnv);
+		// The card's private scratch: TMPDIR points into a per-run dir, so the run's
+		// temp (pip and bun spills, tool temp) dies with the run — a normal end and a
+		// cancel both pass through the child's close. OTTR_TMP_ROOT names this daemon's
+		// temp root for files that must stay host-global under the redirected TMPDIR —
+		// the mutation lock reads it (scripts/stryker-base.mjs), and GET /stats reads
+		// the same root. The run's uid owns the dir: the child drops to that uid
+		// (OTTR-994). The run id is a single safe path segment; the mkdtemp suffix
+		// keeps concurrent runs unique.
+		const scratchParent = turnRoots?.tmp ?? tmpdir();
+		const scratch = mkdtempSync(
+			join(scratchParent, `run-${runIdSegment(body.id)}-`),
+		);
 		env.TMPDIR = scratch;
 		env.OTTR_TMP_ROOT = tmpdir();
 		if (ids !== null) chownSync(scratch, ids.uid, ids.gid);
@@ -719,6 +737,14 @@ export function validWorkerEnv(env: unknown): env is Record<string, string> {
 		!Array.isArray(env) &&
 		Object.values(env).every((value) => typeof value === "string")
 	);
+}
+
+/** OTTR-1211: the run id as one safe path segment for the per-card scratch dir.
+ * The board sends plain ids, but the path must survive any body: every character
+ * outside [A-Za-z0-9._-] becomes "_", and an empty or dotted result is "run". */
+function runIdSegment(id: string): string {
+	const safe = id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 60);
+	return safe === "" || safe === "." || safe === ".." ? "run" : safe;
 }
 
 /** A /run request is well-formed when argv is all strings, cwd is an existing absolute

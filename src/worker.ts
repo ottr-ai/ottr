@@ -1,4 +1,10 @@
 import { homedir, tmpdir } from "node:os";
+import {
+	CACHE_SWEEP_INTERVAL_MS,
+	projectCacheRoots,
+	projectSubDirs,
+	sweepCacheRootsLog,
+} from "./cachesweep.ts";
 import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import { sweepTmpDirsLogged } from "./tmpsweep.ts";
 import {
@@ -64,6 +70,19 @@ if (import.meta.main) {
 	};
 	sweep();
 	setInterval(sweep, 60 * 60 * 1000);
+
+	// OTTR-1211: the daily cache sweep — TTL and cap per project's turn-home cache —
+	// plus the aged sweep of each project's per-card tmp dirs, so a scratch orphaned
+	// by a dead worker still goes. The hourly /tmp sweep above stays the safety net;
+	// the live run starts guard keeps a running turn's scratch in both.
+	const cacheSweep = (): void => {
+		const starts = server.runStarts();
+		for (const tmp of projectSubDirs(turnHomesRoot(), "tmp"))
+			sweepTmpDirsLogged(tmp, { liveTurnStarts: starts });
+		sweepCacheRootsLog(projectCacheRoots(turnHomesRoot()));
+	};
+	cacheSweep();
+	setInterval(cacheSweep, CACHE_SWEEP_INTERVAL_MS);
 
 	// The shared home is no longer a provisioning input (docs/specs/worker-list-isolation.md),
 	// so startup has nothing to pre-warm from: a project's first turn here installs its tools
