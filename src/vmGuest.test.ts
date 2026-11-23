@@ -937,14 +937,16 @@ describe("POST /shutdown", () => {
 });
 
 describe("stream line cap", () => {
-	// Fake omp: floods stdout with a newline-free line over MAX_STREAM_LINE_CHARS,
-	// then ends it and prints a normal event line. Validation #OTTR-1231 killed the
-	// guest at this shape with the unfixed accumulate-and-rescan reader.
+	// Fake omp: floods stdout with a newline-free 64 MiB line, then ends it and
+	// prints a normal event line. Validation #OTTR-1231 killed the guest at this
+	// shape with the unfixed accumulate-and-rescan reader. The flood is 16x the
+	// cap, so a reader that retains the whole line until its newline breaks the
+	// memory bound below, while streaming and after the run alike.
 	const floodPath = join(dir, "flood-omp.js");
 	writeFileSync(
 		floodPath,
 		`const chunk = "a".repeat(64 * 1024);
-for (let i = 0; i < 80; i++) process.stdout.write(chunk);
+for (let i = 0; i < 1024; i++) process.stdout.write(chunk);
 process.stdout.write("\\n");
 process.stdout.write('{"type":"after-flood"}\\n');`,
 	);
@@ -953,18 +955,39 @@ process.stdout.write('{"type":"after-flood"}\\n');`,
 		const url = start();
 		const bare = makeRemote("work");
 		const rssBefore = process.memoryUsage.rss();
-		const { lines, done } = await runTurn(url, {
-			gitUrl: bare,
-			branch: "work",
-			argv: [floodPath],
-		});
-		expect(done.exitCode).toBe(0);
-		expect(lines).toContain(lineDropNotice());
-		expect(lines).toContain('{"type":"after-flood"}');
-		expect(lines.some((l) => l.startsWith("a"))).toBe(false);
-		// The reader must not have buffered the line: growth stays under the cap plus
-		// a margin (mirrors the worker stream cap test in workers.test.ts).
-		const growth = process.memoryUsage.rss() - rssBefore;
-		expect(growth).toBeLessThan(MAX_STREAM_LINE_CHARS + 48 * 1024 * 1024);
-	}, 60_000);
+		// Peak RSS sampled while the flood streams: a reader that retains the whole
+		// line until its newline would spike here and shrink before the post-run
+		// sample, so the peak bounds the reader, not the leftovers. This observer
+		// needs real time — the guest pushes nothing to the response while it
+		// drains the flood, so no event in this process marks the flood's window.
+		let peak = rssBefore;
+		const sampler = setInterval(() => {
+			const rss = process.memoryUsage.rss();
+			if (rss > peak) peak = rss;
+		}, 50);
+		try {
+			const { lines, done } = await runTurn(url, {
+				gitUrl: bare,
+				branch: "work",
+				argv: [floodPath],
+			});
+			expect(done.exitCode).toBe(0);
+			expect(lines).toContain(lineDropNotice());
+			expect(lines).toContain('{"type":"after-flood"}');
+			expect(lines.some((l) => l.startsWith("a"))).toBe(false);
+			// Reader growth stays under the cap plus a margin (mirrors the worker
+			// stream cap test in workers.test.ts, with a wider margin: the peak
+			// sampled in a loaded suite carries allocator slop the post-run sample
+			// misses — measured 58 MiB in-suite). The bound sits at one raw
+			// byte-copy of the 64 MiB flood: a reader that retains the line holds
+			// the decoded UTF-16 text, twice that, so any retention fails it.
+			expect(peak - rssBefore).toBeLessThan(
+				MAX_STREAM_LINE_CHARS + 64 * 1024 * 1024,
+			);
+			const growth = process.memoryUsage.rss() - rssBefore;
+			expect(growth).toBeLessThan(MAX_STREAM_LINE_CHARS + 64 * 1024 * 1024);
+		} finally {
+			clearInterval(sampler);
+		}
+	}, 90_000);
 });
