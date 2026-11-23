@@ -239,7 +239,7 @@ RUN bun install -g --ignore-scripts --minimum-release-age 604800 "agent-browser@
 ARG TYPESCRIPT_VERSION=7.0.2
 ARG TS_LANGUAGE_SERVER_VERSION=6.1.0
 ARG PYRIGHT_VERSION=1.1.414
-RUN bun install -g "typescript@${TYPESCRIPT_VERSION}" \
+RUN bun install -g --ignore-scripts --minimum-release-age 604800 "typescript@${TYPESCRIPT_VERSION}" \
       "typescript-language-server@${TS_LANGUAGE_SERVER_VERSION}" \
       "pyright@${PYRIGHT_VERSION}" \
     && tsc --version \
@@ -253,8 +253,8 @@ ARG OMP_VERSION=18.19.0
 # toon CLI (npm @toon-format/cli) for the bundled toon-json skill — must match
 # the host's toon so workers and host produce identical output.
 ARG TOON_VERSION=4.4.0
-RUN bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
-    && bun install -g "@toon-format/cli@${TOON_VERSION}" \
+RUN bun install -g --ignore-scripts --minimum-release-age 604800 "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+    && bun install -g --ignore-scripts --minimum-release-age 604800 "@toon-format/cli@${TOON_VERSION}" \
     && omp --version \
     && toon --version
 
