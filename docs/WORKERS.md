@@ -1105,7 +1105,8 @@ the vm dispatch, never this mount. It never mounts
 - Memory: with Hindsight configured, the VM calls the board's `/hindsight` proxy with the
   per-turn token; the board adds the Hindsight key.
 - Card filing: a turn files cards on the board with the per-turn token, only in its own
-  project.
+  project, and each filed card follows the turn's own task (the board takes the parent
+  from the token's grant, not from the request).
 - Network: the runner's iptables rules let a VM reach the board's address and port, drop
   every other private, link-local, CGNAT (100.64.0.0/10) or reserved address (other VMs,
   the workers, compose services, `vm-runner`'s own API), and let the VM reach the internet

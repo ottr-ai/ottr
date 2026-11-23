@@ -11433,6 +11433,50 @@ describe("turns' own host", () => {
 		expect((await file(vm)).status).toBe(401);
 		vmTokens.revoke(other);
 	});
+
+	test("a microVM turn's card follows its grant's task, not the caller's link", async () => {
+		// The grant task carries updateIds: a card that escapes the link would also escape
+		// the update card's merge hold (planMergeHolds reads the inherited updateIds).
+		const a = await store.createTask("held source", null);
+		await store.updateTask(a.id, { updateIds: ["x@1"] });
+		const c = await store.createTask("unrelated parent", null);
+		const grant = {
+			project: "p1",
+			taskId: a.id,
+			branch: "ott/p1-x",
+			repoPath: projectDir,
+			worktree: join(projectDir, ".worktrees", "P1-X"),
+		};
+		const vm = vmTokens.issue(grant);
+		const file = (body: Record<string, unknown>) =>
+			post("/api/projects/p1/tasks", body, asTurn(vm));
+		const idOf = async (res: Response): Promise<string> => {
+			const b: unknown = await res.json();
+			return typeof b === "object" && b !== null && "id" in b
+				? String(b.id)
+				: "";
+		};
+		// Omitting followUpOf still binds the card to the grant's task and its holds.
+		const omitted = await file({ prompt: "child without a link" });
+		expect(omitted.status).toBe(200);
+		const o = await store.getTask(await idOf(omitted));
+		expect(o?.followUpOf).toBe(a.id);
+		expect(o?.updateIds).toEqual(["x@1"]);
+		// An unrelated parent is refused: the link decides merge holds and review closures.
+		expect(
+			(await file({ prompt: "claims another card", followUpOf: c.id })).status,
+		).toBe(403);
+		// The grant's own task stays linkable.
+		const linked = await file({
+			prompt: "child of the grant task",
+			followUpOf: a.id,
+		});
+		expect(linked.status).toBe(200);
+		const l = await store.getTask(await idOf(linked));
+		expect(l?.followUpOf).toBe(a.id);
+		expect(l?.updateIds).toEqual(["x@1"]);
+		vmTokens.revoke(vm);
+	});
 });
 
 describe("sandbox endpoint", () => {

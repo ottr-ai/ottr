@@ -5402,7 +5402,8 @@ export async function createApp(deps: AppDeps) {
 	 * the board's sandbox endpoint) and nothing else, and only with the boot token every
 	 * task session carries (OTTR_BOARD_TOKEN): anyone else who reaches the port gets 401. A
 	 * microVM turn (OTTR-532) holds no boot token: its live per-turn VM token files cards in
-	 * its own project only, and no trending verdicts or sandbox runs. Hosted mode passes the
+	 * its own project only, as follow-ups of its own task (OTTR-1009, validateTaskCreate),
+	 * and no trending verdicts or sandbox runs. Hosted mode passes the
 	 * boot token itself: there the token, not the Host, routes a turn here (see hostedRefusal).
 	 */
 	function agentRefusal(
@@ -14033,6 +14034,7 @@ export async function createApp(deps: AppDeps) {
 	async function validateTaskCreate(
 		e: Entry,
 		body: Record<string, unknown>,
+		vmTaskId?: string | null,
 	): Promise<
 		| {
 				prompt: string;
@@ -14052,6 +14054,23 @@ export async function createApp(deps: AppDeps) {
 		let updateIds: string[] = [];
 		if (body.followUpOf != null) {
 			const linked = await resolveFollowUpOf(e.store.name, body.followUpOf);
+			if (linked instanceof Response) return linked;
+			// A VM turn's card follows its own task: the grant, not the caller, names the
+			// parent, because the merge hold and the review closure ride the link (OTTR-1009).
+			if (vmTaskId != null && linked.followUpOf !== vmTaskId)
+				return json(
+					{
+						error: "this token files cards only as follow-ups of its own task",
+					},
+					403,
+				);
+			followUpOf = linked.followUpOf;
+			followUpOfProject = linked.followUpOfProject;
+			updateIds = linked.updateIds;
+		} else if (vmTaskId != null) {
+			// No caller-chosen link: bind the card to the grant's task, so omitting
+			// followUpOf cannot escape the source card's merge hold.
+			const linked = await resolveFollowUpOf(e.store.name, vmTaskId);
 			if (linked instanceof Response) return linked;
 			followUpOf = linked.followUpOf;
 			followUpOfProject = linked.followUpOfProject;
@@ -14112,7 +14131,11 @@ export async function createApp(deps: AppDeps) {
 		const e = deps.projects.get(req.params.project);
 		if (!e) return json({ error: "unknown project" }, 404);
 		if (e.gitless) return json({ error: "init a git repository first" }, 409);
-		const prep = await validateTaskCreate(e, r.body);
+		// A live VM token binds the card to the grant's task (OTTR-1009): followUpOf omitted
+		// or pointing at another card cannot escape the source card's merge hold.
+		const vmGrant =
+			deps.vmTokens?.check(req.headers.get("x-board-token")) ?? null;
+		const prep = await validateTaskCreate(e, r.body, vmGrant?.taskId ?? null);
 		if (prep instanceof Response) return prep;
 		const made = await e.store.transaction(async () => {
 			const result = decodeImages(
