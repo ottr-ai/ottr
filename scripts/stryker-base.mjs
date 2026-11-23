@@ -2,7 +2,7 @@
 // stryker.config.mjs so a wrapper run evaluates exactly one factory call with its own cap:
 // every config file calls makeBaseConfig once, so every run logs exactly one concurrency
 // line, and the logged slot count is the count the run uses (OTTR-886 send-back).
-import { rmSync } from "node:fs";
+import { rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
 	cappedConcurrency,
 	isStrykerRun,
 	sandboxTempDirName,
+	sweepSandboxProcesses,
 } from "./stryker-load.mjs";
 
 // One mutation run at a time on a worker: every Stryker run imports this module, so the
@@ -36,6 +37,19 @@ const tempDirName = sandboxTempDirName();
 if (isStrykerRun()) {
 	acquireMutationLock(mutationLockBase);
 	rmSync(tempDirName, { recursive: true, force: true });
+	// A timed-out or killed mutant run leaves its bun -e test children spinning at full CPU
+	// (OTTR-1244): Stryker kills the bun test process hard, the preload's process.exit is
+	// single, and the children are reparented to pid 1. At run end, sweep the leftovers
+	// named by this checkout's sandbox parent. The line always prints — a normal run
+	// reports zero leftovers — and writeSync(1, ...) is deliberate: console.log at exit may
+	// not flush a piped stdout, writeSync does.
+	process.on("exit", () => {
+		const { killed, failed } = sweepSandboxProcesses(tempDirName);
+		writeSync(
+			1,
+			`[stryker] sandbox sweep: killed ${killed} leftover process(es), ${failed} kill attempt(s) failed\n`,
+		);
+	});
 }
 
 // Mutation testing: `bun run test:mutation` runs stryker.config.mjs (bare `stryker run`

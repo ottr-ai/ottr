@@ -18,6 +18,7 @@ import {
 	isStrykerRun,
 	mutationConcurrency,
 	sandboxTempDirName,
+	sweepSandboxProcesses,
 } from "./stryker-load.mjs";
 
 // Cgroup v2 paths that do not exist, so the CPU rule decides alone (the pre-OTTR-886
@@ -496,4 +497,266 @@ test("STRYKER_CONCURRENCY logs the free reading when one exists", () => {
 	expect(
 		concurrencyLogLine(24, { STRYKER_CONCURRENCY: "5" }, 24, NO_CGROUP),
 	).toBe("stryker-load: 5 slots; STRYKER_CONCURRENCY=5, free memory unknown");
+});
+
+// OTTR-1244: the run-end sweep. No test may signal a pid it did not create, so every sweep
+// test drives a FAKE /proc tree (plain directories and files under a mkdtempSync dir) with
+// a RECORDING kill; production keeps the real /proc and process.kill. The fake self entry
+// carries the sandbox path in its cmdline on purpose: the sweep must skip its own caller
+// even when the caller's cmdline names the sandbox.
+type FakeProc = {
+	procRoot: string;
+	selfPid: number;
+	sandboxDir: string;
+	kills: Array<[number, string]>;
+	kill: (pid: number, signal: string) => void;
+	addEntry: (pid: number, files: { cmdline?: string; stat?: string }) => void;
+};
+
+function withFakeProc(selfPgrp: number, run: (proc: FakeProc) => void): void {
+	const procRoot = mkdtempSync(join(tmpdir(), "ottr-stryker-proc-"));
+	const kills: Array<[number, string]> = [];
+	const kill = (pid: number, signal: string): void => {
+		kills.push([pid, signal]);
+	};
+	const selfPid = 424242;
+	const sandboxDir = join(procRoot, "ott-stryker-fake");
+	const addEntry = (
+		pid: number,
+		files: { cmdline?: string; stat?: string },
+	): void => {
+		mkdirSync(join(procRoot, String(pid)), { recursive: true });
+		if (files.cmdline !== undefined)
+			writeFileSync(join(procRoot, String(pid), "cmdline"), files.cmdline);
+		if (files.stat !== undefined)
+			writeFileSync(join(procRoot, String(pid), "stat"), files.stat);
+	};
+	addEntry(selfPid, {
+		cmdline: `bun\0-e\0/* ${sandboxDir} */ setInterval(() => {}, 250)\0`,
+		stat: `${selfPid} (bun) S 1 ${selfPgrp} ${selfPid} 0`,
+	});
+	try {
+		run({ procRoot, selfPid, sandboxDir, kills, kill, addEntry });
+	} finally {
+		rmSync(procRoot, { recursive: true, force: true });
+	}
+}
+
+// stat lines below use the real layout: pid (comm) state ppid pgrp session tty, and the
+// sweep takes pgrp from index 2 after the LAST ") ".
+const leftoverStat = (pid: number, pgrp: number): string =>
+	`${pid} (bun) S 1 ${pgrp} ${pid} 0`;
+const leftoverCmdline = (sandboxDir: string): string =>
+	`bun\0-e\0/* ${sandboxDir} */ setInterval(() => {}, 250)\0`;
+
+test("the sweep on a clean fake /proc tree kills nothing", () => {
+	withFakeProc(
+		4100,
+		({ procRoot, selfPid, sandboxDir, kills, kill, addEntry }) => {
+			addEntry(101, {
+				cmdline: "bun\0run\0test:mutation\0",
+				stat: leftoverStat(101, 999),
+			});
+			addEntry(102, {
+				cmdline: "some binary --workdir=/tmp/elsewhere",
+				stat: leftoverStat(102, 999),
+			});
+			addEntry(103, { stat: leftoverStat(103, 999) }); // empty cmdline: dead or zombie
+			addEntry(104, { cmdline: "" }); // cmdline present but empty
+			addEntry(105, { stat: leftoverStat(105, 999) }); // no cmdline file: unreadable
+			// A real /proc also holds non-numeric entries; this one carries a matching
+			// cmdline so only the numeric-name filter can spare it.
+			mkdirSync(join(procRoot, "acpi"), { recursive: true });
+			writeFileSync(join(procRoot, "acpi", "cmdline"), sandboxDir);
+			const result = sweepSandboxProcesses(sandboxDir, {
+				procRoot,
+				kill,
+				selfPid,
+			});
+			expect(result).toEqual({ killed: 0, failed: 0 });
+			expect(kills).toEqual([]);
+		},
+	);
+});
+
+test("the sweep group-kills a leftover in a foreign group", () => {
+	withFakeProc(
+		4100,
+		({ procRoot, selfPid, sandboxDir, kills, kill, addEntry }) => {
+			addEntry(500, {
+				cmdline: leftoverCmdline(sandboxDir),
+				stat: leftoverStat(500, 4200), // pgrp 4200 differs from the fake self's 4100
+			});
+			const result = sweepSandboxProcesses(sandboxDir, {
+				procRoot,
+				kill,
+				selfPid,
+			});
+			expect(kills).toEqual([
+				[-4200, "SIGKILL"],
+				[500, "SIGKILL"],
+			]);
+			expect(result).toEqual({ killed: 1, failed: 0 });
+		},
+	);
+});
+
+test("the sweep never signals its own group for a matching pid", () => {
+	withFakeProc(
+		4100,
+		({ procRoot, selfPid, sandboxDir, kills, kill, addEntry }) => {
+			addEntry(501, {
+				cmdline: leftoverCmdline(sandboxDir),
+				stat: leftoverStat(501, 4100), // same group as the fake self
+			});
+			const result = sweepSandboxProcesses(sandboxDir, {
+				procRoot,
+				kill,
+				selfPid,
+			});
+			// Only the single pid: never -4100, the own group.
+			expect(kills).toEqual([[501, "SIGKILL"]]);
+			expect(result).toEqual({ killed: 1, failed: 0 });
+		},
+	);
+});
+
+test("a failed group kill is counted and the pid kill still runs", () => {
+	withFakeProc(4100, ({ procRoot, selfPid, sandboxDir, addEntry }) => {
+		addEntry(502, {
+			cmdline: leftoverCmdline(sandboxDir),
+			stat: leftoverStat(502, 4200),
+		});
+		const pidKills: Array<[number, string]> = [];
+		const kill = (pid: number, signal: string): void => {
+			if (pid < 0) throw new Error("group kill failed"); // an EPERM on -pgrp
+			pidKills.push([pid, signal]);
+		};
+		const result = sweepSandboxProcesses(sandboxDir, {
+			procRoot,
+			kill,
+			selfPid,
+		});
+		expect(pidKills).toEqual([[502, "SIGKILL"]]); // the pid kill still attempted
+		expect(result).toEqual({ killed: 0, failed: 1 }); // counted, not thrown
+	});
+});
+
+test("a matching pid with an unreadable stat is killed by pid alone", () => {
+	withFakeProc(
+		4100,
+		({ procRoot, selfPid, sandboxDir, kills, kill, addEntry }) => {
+			addEntry(503, {
+				cmdline: leftoverCmdline(sandboxDir),
+				// no stat file: the group cannot be read, so it is never guessed
+			});
+			const result = sweepSandboxProcesses(sandboxDir, {
+				procRoot,
+				kill,
+				selfPid,
+			});
+			expect(kills).toEqual([[503, "SIGKILL"]]);
+			expect(result).toEqual({ killed: 1, failed: 0 });
+		},
+	);
+});
+
+// The live proof that the real /proc path works: a real child whose cmdline embeds the
+// sandbox dir, the production procRoot, but still only the RECORDING kill. The one real
+// signal of this test is the finally block's, and it targets the child the test itself
+// spawned (the child shares the caller's process group, so -child.pid names no group and
+// the child's own pid is the fallback). Reading /proc is reader-only throughout.
+test("the live sweep finds a real leftover child through the real /proc", async () => {
+	const sandboxDir = mkdtempSync(join(tmpdir(), "ottr-stryker-sweep-"));
+	const child = Bun.spawn([
+		process.execPath,
+		"-e",
+		`/* ${sandboxDir} */ setInterval(() => {}, 250)`,
+	]);
+	const kills: Array<[number, string]> = [];
+	const kill = (pid: number, signal: string): void => {
+		kills.push([pid, signal]);
+	};
+	try {
+		// /proc/<pid>/cmdline is empty until the child has execed; poll for the tag.
+		let visible = false;
+		for (let waited = 0; waited < 2000 && !visible; waited += 25) {
+			try {
+				visible = readFileSync(`/proc/${child.pid}/cmdline`, "utf8").includes(
+					sandboxDir,
+				);
+			} catch {
+				// not execed yet
+			}
+			if (!visible) await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		expect(visible).toBe(true);
+		const pgrpOf = (pid: number): number => {
+			const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+			return Number(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[2]);
+		};
+		const childPgrp = pgrpOf(child.pid);
+		const ownPgrp = pgrpOf(process.pid);
+		const result = sweepSandboxProcesses(sandboxDir, { kill });
+		// Own group -> the single pid; a foreign group -> the group and the pid.
+		const expected: Array<[number, string]> =
+			childPgrp === ownPgrp
+				? [[child.pid, "SIGKILL"]]
+				: [
+						[-childPgrp, "SIGKILL"],
+						[child.pid, "SIGKILL"],
+					];
+		expect(kills).toEqual(expected);
+		expect(result).toEqual({ killed: 1, failed: 0 });
+		// The sweep never matched the test process itself.
+		expect(kills.some(([target]) => target === process.pid)).toBe(false);
+	} finally {
+		// The only real signals: to the child the test created.
+		try {
+			process.kill(-child.pid, "SIGKILL");
+		} catch {
+			process.kill(child.pid, "SIGKILL");
+		}
+		await child.exited;
+		rmSync(sandboxDir, { recursive: true, force: true });
+	}
+});
+
+// OTTR-1244: the run-end hook. A Stryker-shaped import registers a process exit hook that
+// sweeps this checkout's sandbox parent and always prints the line — a normal run reports
+// zero leftovers. A plain import must register nothing (OTTR-366 invariant: a config
+// import that only reads the mutate arrays takes no lock and starts no sweep). The
+// children drive the REAL config with TMPDIR inside the sandbox, so the sweep's target
+// path is unique to this test run and no process on the host names it — the child's own
+// exit sweep cannot signal a pid the test did not create.
+test("the run-end hook sweeps the sandbox and reports zero leftovers", () => {
+	withSandbox((sandbox) => {
+		const out = runChild(
+			`process.env.TMPDIR = process.env.SANDBOX_ROOT;
+			process.argv[1] = process.env.FAKE_BIN;
+			await import(${configUrl});
+			console.log("DONE");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+				FAKE_BIN: strykerBin,
+			},
+		);
+		expect(out).toContain("sandbox sweep: killed 0 leftover process(es)");
+		expect(out).toContain("0 kill attempt(s) failed");
+		expect(out).toContain("DONE");
+	});
+});
+
+test("a plain import registers no sweep hook", () => {
+	withSandbox((sandbox) => {
+		const out = runChild(
+			`await import(${configUrl});
+			console.log("DONE");`,
+			{
+				SANDBOX_ROOT: sandbox.slice(0, sandbox.lastIndexOf("/")),
+			},
+		);
+		expect(out).not.toContain("sandbox sweep");
+		expect(out).toContain("DONE");
+	});
 });

@@ -26,3 +26,12 @@ export function acquireMutationLock(
 	tempDirName: string,
 	options?: { timeoutMs?: number; log?: (message: string) => void },
 ): () => void;
+
+export function sweepSandboxProcesses(
+	sandboxDir: string,
+	options?: {
+		procRoot?: string;
+		kill?: (pid: number, signal: string) => void;
+		selfPid?: number;
+	},
+): { killed: number; failed: number };

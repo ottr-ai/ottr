@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
 import { GlobalStore } from "./globalStore.ts";
+import { spawnStoreChild } from "./test/storeChild.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -470,22 +471,25 @@ describe("instance lock", () => {
 		const root = tempRoot();
 		// The child exits itself; the OS drops the exclusive lock with its fds.
 		// Stdio stays inherited so a boot failure prints itself.
-		const child = Bun.spawn({
-			cmd: [
-				"bun",
-				"-e",
-				`import { GlobalStore } from ${JSON.stringify(join(import.meta.dir, "globalStore.ts"))};
+		const handle = spawnStoreChild({
+			script: `import { GlobalStore } from ${JSON.stringify(join(import.meta.dir, "globalStore.ts"))};
 				 await GlobalStore.open(process.env.LOCK_DIR);
 				 process.exit(0);`,
-			],
-			env: { ...process.env, LOCK_DIR: root },
+			env: { LOCK_DIR: root },
 		});
-		const code = await child.exited;
-		expect(code).toBe(0);
-		// The next boot must open cleanly: nothing held the file after the exit.
-		const again = await GlobalStore.open(root);
-		expect(await again.get("config")).toBeNull();
-		await again.close();
+		try {
+			const code = await handle.exited;
+			expect(code).toBe(0);
+			// The next boot must open cleanly: nothing held the file after the exit.
+			const again = await GlobalStore.open(root);
+			expect(await again.get("config")).toBeNull();
+			await again.close();
+		} finally {
+			handle.killGroup(); // best-effort: a mutant hang must not leave the child behind
+			try {
+				await handle.exited;
+			} catch {}
+		}
 		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	});
 });

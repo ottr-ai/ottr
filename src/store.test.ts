@@ -41,6 +41,7 @@ import {
 	tasksDirFor,
 } from "./store.ts";
 import { prConflictReason } from "./supervisor.ts";
+import { type StoreChildHandle, spawnStoreChild } from "./test/storeChild.ts";
 import {
 	answeredCard,
 	PR_REVIEW_POSTED,
@@ -4205,19 +4206,15 @@ describe("release notes persistence", () => {
 
 describe("instance lock", () => {
 	/** Spawns a real holder process keeping `dir`'s db locked until killed, and awaits readiness. */
-	async function spawnHolder(dir: string): Promise<Bun.Subprocess> {
+	async function spawnHolder(dir: string): Promise<StoreChildHandle> {
 		mkdirSync(dir, { recursive: true }); // the watcher below needs it to exist
 		const readyFile = join(dir, ".holder-ready");
-		const child = Bun.spawn({
-			cmd: [
-				"bun",
-				"-e",
-				`import { ProjectStore } from ${JSON.stringify(join(import.meta.dir, "store.ts"))};
+		const handle = spawnStoreChild({
+			script: `import { ProjectStore } from ${JSON.stringify(join(import.meta.dir, "store.ts"))};
 				 await ProjectStore.open(process.env.LOCK_DIR);
 				 await Bun.write(process.env.READY_FILE, "1");
 				 await new Promise(() => {});`,
-			],
-			env: { ...process.env, LOCK_DIR: dir, READY_FILE: readyFile },
+			env: { LOCK_DIR: dir, READY_FILE: readyFile },
 		});
 		// The holder is a real OS process, so its readiness exists only on the
 		// platform clock (fake timers cannot drive it). Await the ready-file
@@ -4232,23 +4229,31 @@ describe("instance lock", () => {
 			const cap = setTimeout(
 				() =>
 					reject(
-						new Error(`lock holder failed to start (exit ${child.exitCode})`),
+						new Error(
+							`lock holder failed to start (exit ${handle.child.exitCode})`,
+						),
 					),
 				5000,
 			);
 			try {
 				await promise;
+			} catch (e) {
+				handle.killGroup(); // a failed start must not leave the holder behind
+				try {
+					await handle.exited;
+				} catch {}
+				throw e;
 			} finally {
 				clearTimeout(cap);
 				w.close();
 			}
 		}
-		return child;
+		return handle;
 	}
 
 	test("a second live opener is refused with StoreLockedError", async () => {
 		const dir = join(root, "lock-refused");
-		const child = await spawnHolder(dir);
+		const handle = await spawnHolder(dir);
 		try {
 			let err: unknown;
 			try {
@@ -4261,19 +4266,28 @@ describe("instance lock", () => {
 				expect(err.message).toContain(dir);
 			}
 		} finally {
-			child.kill();
-			await child.exited;
+			handle.killGroup();
+			try {
+				await handle.exited;
+			} catch {}
 		}
 	});
 
 	test("a SIGKILLed holder's lock is free for the next boot", async () => {
 		const dir = join(root, "lock-sigkill");
-		const child = await spawnHolder(dir);
-		child.kill(9); // no clean close: no release code runs, the OS drops the lock
-		await child.exited;
-		const second = await open(dir); // whatever pid or hostname the dead holder named
-		expect(await second.listTasks()).toEqual([]);
-		await second.close();
+		const handle = await spawnHolder(dir);
+		handle.killGroup(); // no clean close: no release code runs, the OS drops the lock
+		try {
+			await handle.exited;
+			const second = await open(dir); // whatever pid or hostname the dead holder named
+			expect(await second.listTasks()).toEqual([]);
+			await second.close();
+		} finally {
+			handle.killGroup();
+			try {
+				await handle.exited;
+			} catch {}
+		}
 	});
 });
 

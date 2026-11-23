@@ -14,6 +14,7 @@ import {
 	readPostgresTestConfig,
 } from "./test/postgres.ts";
 import fc from "./test/properties.ts";
+import { spawnStoreChild } from "./test/storeChild.ts";
 
 const root = mkdtempSync(join(tmpdir(), "postgres-stores-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -282,25 +283,29 @@ async function runScenarios(
 	};
 	env.OTTR_DATA_DIR = "";
 	env.OTTR_SERVER_DATA_DIR = "";
-	const child = Bun.spawn(
-		[
-			process.execPath,
-			"--eval",
-			`${imports}\nconst root = ${JSON.stringify(dir)}; const backend = ${JSON.stringify(backend)};\n${scenarios}`,
-		],
-		{ cwd: import.meta.dir, env, stdout: "pipe", stderr: "pipe" },
-	);
-	const [stdout, stderr, exit] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-	expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
-	const reopened = Bun.spawn(
-		[
-			process.execPath,
-			"--eval",
-			`${imports}
+	const child = spawnStoreChild({
+		script: `${imports}\nconst root = ${JSON.stringify(dir)}; const backend = ${JSON.stringify(backend)};\n${scenarios}`,
+		cwd: import.meta.dir,
+		env,
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let stdout = "";
+	try {
+		const [text, stderr, exit] = await Promise.all([
+			new Response(child.child.stdout as ReadableStream<Uint8Array>).text(),
+			new Response(child.child.stderr as ReadableStream<Uint8Array>).text(),
+			child.exited,
+		]);
+		stdout = text;
+		expect({ exit, stderr }).toEqual({ exit: 0, stderr: "" });
+	} finally {
+		child.killGroup(); // best-effort: a mutant hang must not orphan the child
+		try {
+			await child.exited;
+		} catch {}
+	}
+	const reopened = spawnStoreChild({
+		script: `${imports}
 		const backend = ${JSON.stringify(backend)};
 		const root = ${JSON.stringify(dir)};
 		const global = await GlobalStore.open(root);
@@ -318,23 +323,31 @@ async function runScenarios(
 			await global.close();
 			if (backend === 'postgres') await closePostgresBackend();
 		}`,
-		],
-		{ cwd: import.meta.dir, env, stdout: "pipe", stderr: "pipe" },
-	);
-	const [reopenOutput, reopenError, reopenExit] = await Promise.all([
-		new Response(reopened.stdout).text(),
-		new Response(reopened.stderr).text(),
-		reopened.exited,
-	]);
-	expect({
-		exit: reopenExit,
-		stdout: reopenOutput,
-		stderr: reopenError,
-	}).toEqual({
-		exit: 0,
-		stdout: "",
-		stderr: "",
+		cwd: import.meta.dir,
+		env,
+		stdio: ["ignore", "pipe", "pipe"],
 	});
+	try {
+		const [reopenOutput, reopenError, reopenExit] = await Promise.all([
+			new Response(reopened.child.stdout as ReadableStream<Uint8Array>).text(),
+			new Response(reopened.child.stderr as ReadableStream<Uint8Array>).text(),
+			reopened.exited,
+		]);
+		expect({
+			exit: reopenExit,
+			stdout: reopenOutput,
+			stderr: reopenError,
+		}).toEqual({
+			exit: 0,
+			stdout: "",
+			stderr: "",
+		});
+	} finally {
+		reopened.killGroup(); // best-effort: a mutant hang must not orphan the child
+		try {
+			await reopened.exited;
+		} catch {}
+	}
 	return JSON.parse(stdout) as ScenarioResult;
 }
 

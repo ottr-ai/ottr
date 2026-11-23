@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
 	closeSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	realpathSync,
 	rmSync,
@@ -249,4 +250,86 @@ export function acquireMutationLock(
 	};
 	process.on("exit", release);
 	return release;
+}
+
+/**
+ * Kills the processes whose command line names `sandboxDir` (the run's Stryker temp parent,
+ * e.g. tmpdir()/ott-stryker-<hash>): the bun -e children a timed-out or killed mutant run
+ * left behind, reparented to pid 1 and spinning for hours (OTTR-1244). The walk reads
+ * /proc: every numeric pid whose cmdline (with \0 separators read as spaces) contains the
+ * sandbox path gets its process group (`-pgrp`) and itself signalled with SIGKILL. A pid
+ * sitting in the caller's own group is signalled by pid only — never the own group — and a
+ * pid whose stat file cannot be read is signalled by pid alone (the cmdline match is proof
+ * enough; a group that cannot be read is never guessed). An unreadable or empty cmdline is
+ * skipped: a dead or zombie process shows an empty cmdline, and what cannot be read is
+ * spared. Returns { killed, failed }: `killed` counts the pids whose kill attempts all
+ * succeeded, `failed` counts the attempts that threw. Never throws, so the run-end hook in
+ * scripts/stryker-base.mjs can print both counts without failing the mutation run.
+ * `procRoot`, `kill` and `selfPid` are injectable so tests run against a fake /proc tree
+ * with a recording kill; production reads the real /proc and signals.
+ */
+export function sweepSandboxProcesses(
+	sandboxDir,
+	{
+		procRoot = "/proc",
+		kill = (pid, signal) => process.kill(pid, signal),
+		selfPid = process.pid,
+	} = {},
+) {
+	let killed = 0;
+	let failed = 0;
+	// stat's second field (the comm, in parens) may itself hold spaces and ") ", so the
+	// fixed fields start after the LAST ") ": state (0), ppid (1), pgrp (2).
+	const pgrpFromStat = (text) =>
+		Number(text.slice(text.lastIndexOf(") ") + 2).split(" ")[2]);
+	const pgrpOf = (pid) => {
+		try {
+			return pgrpFromStat(
+				readFileSync(join(procRoot, String(pid), "stat"), "utf8"),
+			);
+		} catch {
+			return null;
+		}
+	};
+	// The caller's own group. Unknown when its stat cannot be read, and then nothing is
+	// group-killed: every match is signalled by pid only.
+	const ownPgrp = pgrpOf(selfPid);
+	let pids;
+	try {
+		pids = readdirSync(procRoot).filter((name) => /^\d+$/.test(name));
+	} catch {
+		return { killed, failed }; // no /proc (or an injected empty tree): nothing to sweep
+	}
+	for (const name of pids) {
+		let cmdline;
+		try {
+			cmdline = readFileSync(join(procRoot, name, "cmdline"), "utf8");
+		} catch {
+			continue; // unreadable: spare what cannot be read
+		}
+		if (!cmdline.replaceAll("\0", " ").includes(sandboxDir)) continue;
+		const pid = Number(name);
+		if (pid === selfPid) continue;
+		const attempt = (target) => {
+			try {
+				kill(target, "SIGKILL");
+				return true;
+			} catch {
+				failed++;
+				return false;
+			}
+		};
+		const pgrp = pgrpOf(pid);
+		if (pgrp === null || ownPgrp === null || pgrp === ownPgrp) {
+			// Own group, or a group that cannot be read: signal the single pid only.
+			if (attempt(pid)) killed++;
+		} else {
+			// The group kill and the pid kill are independent attempts: a throw in one
+			// must not skip the other.
+			const groupOk = attempt(-pgrp);
+			const pidOk = attempt(pid);
+			if (groupOk && pidOk) killed++;
+		}
+	}
+	return { killed, failed };
 }
