@@ -66,6 +66,7 @@ import {
 	publishRelease,
 	releaseChip,
 	runGh,
+	runPostReleaseCommand,
 	runReleaseCommand,
 } from "./release.ts";
 import { cachedRepoHomepage } from "./repoHomepage.ts";
@@ -998,6 +999,7 @@ const loop = createTurnLoop(projects, {
 		return { lines, pathDir };
 	},
 	publishRelease,
+	runPostReleaseCommand,
 	runReleaseCommand,
 	archReviewDelta,
 	hosted,

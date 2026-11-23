@@ -8473,7 +8473,7 @@ describe("ReleaseDialog consolidation", () => {
 	const project = {
 		name: "proj",
 		github: null,
-		settings: { releaseCommand: null },
+		settings: { releaseCommand: null, postReleaseCommand: null },
 	} as unknown as ProjectView;
 	const runAct = async (fn: () => Promise<unknown>): Promise<boolean> => {
 		await fn();

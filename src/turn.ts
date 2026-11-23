@@ -102,8 +102,10 @@ import { auditProvisioned, rulesDirEntries } from "./provision.ts";
 import type { commentOnPullRequest, openPullRequest } from "./prs.ts";
 import { providerBlocked, providerOf, usageReset } from "./quota.ts";
 import type {
+	PostReleaseResult,
 	publishRelease,
 	ReleaseIdentity,
+	runPostReleaseCommand,
 	runReleaseCommand,
 } from "./release.ts";
 import { hostedGh, ownerRepo } from "./release.ts";
@@ -1149,6 +1151,7 @@ export interface TurnOps {
 		warning: string | null;
 	} | null>;
 	runReleaseCommand: typeof runReleaseCommand;
+	runPostReleaseCommand: typeof runPostReleaseCommand;
 	archReviewDelta(
 		mainPath: string,
 		target: string,
@@ -3671,9 +3674,109 @@ export function createTurnLoop(
 						);
 			if (line === null) return null;
 			await log(line);
+			const postErr = await runPostReleaseCard(
+				e,
+				task,
+				releaseVersion,
+				settings,
+				log,
+			);
+			if (postErr !== null) return postErr;
 			return null;
 		} catch (err) {
 			return `Release failed: ${errmsg(err)}. Fix it, then reply to retry.`;
+		}
+	}
+
+	/** Runs once after the publish succeeded, when the project sets a post-release command.
+	 * The command's changes, when any, land as one normal card whose merge turn runs the gates
+	 * and merges; the command never pushes. A failure parks the release card without undoing
+	 * the release, and a reply reruns the publish (idempotent) and the command. */
+	async function runPostReleaseCard(
+		e: TurnProject,
+		task: ListedTask,
+		releaseVersion: string,
+		settings: ProjectSettings,
+		log: (line: string) => void | Promise<void>,
+	): Promise<string | null> {
+		const store = e.store;
+		const post = settings.postReleaseCommand;
+		if (post === null) return null;
+		try {
+			await log(`$ ${post}`);
+			const key = `${store.name}/${task.id}`;
+			let entry: RunEntry | null = null;
+			let r: PostReleaseResult;
+			try {
+				r = await ops.runPostReleaseCommand({
+					command: post,
+					mainPath: e.path,
+					version: releaseVersion,
+					log: async (l) => await log(`| ${l}`),
+					onSpawn: (h) => {
+						entry = h;
+						running.set(key, h);
+					},
+				});
+			} finally {
+				// The command's process is over: free its cap slot, as runReleaseCommandPublish
+				// does. runTurn's finally misses this entry (it compares against the omp handle),
+				// so without this every post-release command burns one global-cap slot.
+				if (entry !== null && running.get(key) === entry) running.delete(key);
+			}
+			if (r.files.length === 0) {
+				await log("post-release command made no tracked changes");
+				return null;
+			}
+			if (r.commitSha === null)
+				throw new Error(
+					"the post-release command reported changes but no commit",
+				);
+			const prompt = [
+				`Post-release changes for ${releaseVersion}`,
+				"",
+				"The project's post-release command ran after the release published and changed tracked files. The card's branch holds the changes as one commit on top of the released tag; the worktree is checked out at it. Run the project's checks and tests, then let the merge turn integrate. The command never pushes; only the merge turn pushes.",
+				"",
+				`Command: ${post}`,
+				"Changed files:",
+				...r.files.map((f) => `- ${f}`),
+			].join("\n");
+			const card = await store.createTask(prompt);
+			const branch = `ott/${card.id.toLowerCase()}-${slugify(card.title)}`;
+			const wt = join(store.worktreesDir, card.id);
+			try {
+				await ops.createWorktree({
+					mainPath: e.path,
+					worktreePath: wt,
+					branch,
+					base: r.commitSha,
+					copyExtra: settings.copyExtra,
+					log: async (l) => await log(`+ ${l}`),
+				});
+				await store.transaction(async () => {
+					await store.updateTask(card.id, {
+						promptAuthor: "board",
+						branch,
+						base: r.releasedSha,
+						worktree: wt,
+						stage: "merging",
+						state: "queued",
+					});
+				});
+			} catch (err) {
+				// A worktree or wiring failure must not leave a half-wired card that starts a
+				// work turn; cancel it best-effort, then let the catch below park the release.
+				await store
+					.updateTask(card.id, { cancelledAt: Date.now() })
+					.catch(() => {});
+				throw err;
+			}
+			await log(
+				`post-release command changed ${r.files.length} file(s); filed card ${card.id}`,
+			);
+			return null;
+		} catch (err) {
+			return `Post-release command failed: ${errmsg(err)}. Fix it, then reply to retry.`;
 		}
 	}
 

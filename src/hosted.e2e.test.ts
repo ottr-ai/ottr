@@ -36,7 +36,7 @@ import { type RunLauncher, startRun } from "./runner.ts";
 import { checkRoleFor } from "./scheduler.ts";
 import { ProjectStore } from "./store.ts";
 import { createTurnLoop, type TurnLoop, type TurnOps } from "./turn.ts";
-import { type RunResult, type StateResponse } from "./types.ts";
+import type { RunResult, StateResponse } from "./types.ts";
 import { SLOT_STAGES, slotUse } from "./ui/queue.ts";
 import { VmTokens } from "./vmTokens.ts";
 import {
@@ -687,6 +687,7 @@ async function mountBoard(
 		ensurePackages: async () => [],
 		publishRelease: notWired("a release publish"),
 		runReleaseCommand: notWired("a release command"),
+		runPostReleaseCommand: notWired("a post-release command"),
 		archReviewDelta,
 		http400Dir: join(root, "no-http400"),
 		hosted,

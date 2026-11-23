@@ -10269,6 +10269,8 @@ function ProjectReviewsCards({
 	setRelcmd,
 	relenv,
 	setRelenv,
+	postcmd,
+	setPostcmd,
 	cap,
 	setCap,
 	reviewCap,
@@ -10283,6 +10285,8 @@ function ProjectReviewsCards({
 	setRelcmd: (v: string) => void;
 	relenv: string;
 	setRelenv: (v: string) => void;
+	postcmd: string;
+	setPostcmd: (v: string) => void;
 	cap: string;
 	setCap: (v: string) => void;
 	reviewCap: number;
@@ -10296,12 +10300,14 @@ function ProjectReviewsCards({
 				act={act}
 				dirty={
 					relcmd.trim() !== (st.releaseCommand ?? "") ||
-					relenv.trim() !== (st.releaseEnv ?? "")
+					relenv.trim() !== (st.releaseEnv ?? "") ||
+					postcmd.trim() !== (st.postReleaseCommand ?? "")
 				}
 				save={() =>
 					send({
 						releaseCommand: relcmd.trim() || null,
 						releaseEnv: relenv.trim() || null,
+						postReleaseCommand: postcmd.trim() || null,
 					})
 				}
 				title="Releases"
@@ -10347,6 +10353,24 @@ function ProjectReviewsCards({
 									onChange={(e) => setRelenv(e.target.value)}
 									placeholder="GITHUB_TOKEN AWS_REGION"
 									aria-label="Release env allowlist"
+								/>
+							</label>
+						</DefRow>
+						<DefRow
+							settingKey="postReleaseCommand"
+							name="Post-release command"
+							action={save}
+							help="Runs once after the release succeeds, in a clean worktree at the released tag (OTTR_RELEASE_TAG). Tracked changes become a normal card with the gates and the merge turn. A failure marks the release card; the release stays."
+							shape="empty = nothing runs"
+						>
+							<label>
+								<input
+									type="text"
+									maxLength={300}
+									value={postcmd}
+									onChange={(e) => setPostcmd(e.target.value)}
+									placeholder="bun run shots -- --app ../rel"
+									aria-label="Post-release command"
 								/>
 							</label>
 						</DefRow>
@@ -10434,6 +10458,9 @@ export function ProjectSettingsForm({
 	const [extra, setExtra] = useState(project.settings.copyExtra.join("\n"));
 	const [relcmd, setRelcmd] = useState(project.settings.releaseCommand ?? "");
 	const [relenv, setRelenv] = useState(project.settings.releaseEnv ?? "");
+	const [postcmd, setPostcmd] = useState(
+		project.settings.postReleaseCommand ?? "",
+	);
 	const [tb, setTb] = useState(project.settings.targetBranch ?? "");
 	const [label, setLabel] = useState(project.settings.displayName ?? "");
 	const [marker, setMarker] = useState(project.settings.iconText ?? "");
@@ -10584,6 +10611,8 @@ export function ProjectSettingsForm({
 					setRelcmd={setRelcmd}
 					relenv={relenv}
 					setRelenv={setRelenv}
+					postcmd={postcmd}
+					setPostcmd={setPostcmd}
 					cap={cap}
 					setCap={setCap}
 					reviewCap={reviewCap}

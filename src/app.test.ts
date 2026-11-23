@@ -3879,6 +3879,42 @@ describe("settings routes", () => {
 		expect((await store.getSettings()).iconText).toBeNull();
 	});
 
+	test("postReleaseCommand: a string or null, one line of at most 300 characters, empty becomes null", async () => {
+		const tooLong = await post("/api/projects/p1/settings", {
+			postReleaseCommand: "a".repeat(301),
+		});
+		expect(tooLong.status).toBe(400);
+		expect(await errorOf(tooLong)).toBe(
+			"postReleaseCommand must be one line of at most 300 characters",
+		);
+		const badType = await post("/api/projects/p1/settings", {
+			postReleaseCommand: 7,
+		});
+		expect(badType.status).toBe(400);
+		expect(await errorOf(badType)).toBe(
+			"postReleaseCommand must be a string or null",
+		);
+		const multiline = await post("/api/projects/p1/settings", {
+			postReleaseCommand: "a\nb",
+		});
+		expect(multiline.status).toBe(400);
+		expect(await errorOf(multiline)).toBe(
+			"postReleaseCommand must be one line of at most 300 characters",
+		);
+		const ok = await post("/api/projects/p1/settings", {
+			postReleaseCommand: "  bun run shots  ",
+		});
+		expect(ok.status).toBe(200);
+		expect((await store.getSettings()).postReleaseCommand).toBe(
+			"bun run shots",
+		);
+		const empty = await post("/api/projects/p1/settings", {
+			postReleaseCommand: "  ",
+		});
+		expect(empty.status).toBe(200);
+		expect((await store.getSettings()).postReleaseCommand).toBeNull();
+	});
+
 	test("taskIdPrefix validates, persists, and overrides the derived task id handle", async () => {
 		const ok = await post("/api/projects/p1/settings", { taskIdPrefix: "chs" });
 		expect(ok.status).toBe(200);

@@ -189,6 +189,7 @@ interface Recorded {
 	}[];
 	publishRelease: unknown[];
 	runReleaseCommand: unknown[];
+	runPostReleaseCommand: unknown[];
 	quarantine: { worktreePath: string; quarantineDir: string }[];
 	ignoreInMain: { mainPath: string; rel: string }[];
 	/** OTTR-800: the cancel-path remote branch delete calls, in order. */
@@ -469,6 +470,11 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		titleRetryDelayMs: 5,
 		publishRelease: async () => "published",
 		runReleaseCommand: async () => "ran",
+		runPostReleaseCommand: async () => ({
+			releasedSha: "shaR",
+			commitSha: null,
+			files: [],
+		}),
 		archReviewDelta: async () => ({ delta: 0, reviewed: true, anchor: "a" }),
 		// The check run's git input is stubbed like http400Dir: tests never spawn real git.
 		commitSubjects: async () => [],
@@ -556,6 +562,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1212,6 +1219,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1257,6 +1265,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1293,6 +1302,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1520,6 +1530,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1711,6 +1722,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1767,6 +1779,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1824,6 +1837,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -1894,6 +1908,7 @@ describe("turn loop", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],
@@ -2010,6 +2025,7 @@ function baseRecord(): Recorded {
 		runs: [],
 		publishRelease: [],
 		runReleaseCommand: [],
+		runPostReleaseCommand: [],
 		publishSoon: 0,
 		notifyLog: [],
 		killed: false,
@@ -4866,6 +4882,97 @@ describe("turn release cards", () => {
 			archReview: { delta: 12 },
 		});
 	});
+
+	test("a post-release command runs once and files a card with its changes", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			runPostReleaseCommand: async (o: unknown) => {
+				record.runPostReleaseCommand.push(o);
+				return {
+					releasedSha: "shaR",
+					commitSha: "shaC",
+					files: ["shots/a.png"],
+				};
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({ postReleaseCommand: "bun run shots" });
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(after.summary).toBe("Released v1.0.0");
+		expect(record.runPostReleaseCommand).toHaveLength(1);
+		expect(record.runPostReleaseCommand[0]).toMatchObject({
+			command: "bun run shots",
+			version: "v1.0.0",
+		});
+		const tasks = await store.listTasks();
+		expect(tasks).toHaveLength(2);
+		const filed = tasks.find((t) => t.id !== task.id)!;
+		expect(filed.stage).toBe("merging");
+		expect(filed.state).toBe("queued");
+		expect(filed.branch).toMatch(/^ott\//);
+		expect(filed.worktree).toBe(join(store.worktreesDir, filed.id));
+		expect(filed.base).toBe("shaR");
+		expect(filed.prompt).toContain("Post-release changes for v1.0.0");
+		expect(filed.prompt).toContain("- shots/a.png");
+		expect(record.createWorktree[0]).toMatchObject({
+			base: "shaC",
+			branch: filed.branch,
+			worktreePath: filed.worktree,
+		});
+		const log = await logText(store, task.id);
+		expect(log).toContain("$ bun run shots");
+		expect(log).toContain(`filed card ${filed.id}`);
+	});
+
+	test("a failing post-release command keeps the release and parks the card", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+			runPostReleaseCommand: async () => {
+				throw new Error("boom");
+			},
+		});
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({ postReleaseCommand: "bun run shots" });
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(
+			"Post-release command failed: boom. Fix it, then reply to retry.",
+		);
+		// The publish ran first: the release itself stays intact.
+		expect(record.publishRelease).toHaveLength(1);
+		expect(record.createWorktree).toHaveLength(0);
+		expect(await store.listTasks()).toHaveLength(1);
+	});
+
+	test("a post-release command that changes nothing files no card", async () => {
+		const record = baseRecord();
+		const { store, projects, loop } = await setupWith(record, {
+			isIntegrated: async () => true,
+			startRun: integratedRun(record),
+			publishRelease: publishingRelease(record),
+		});
+		projects.get(store.name)!.target = "origin/main";
+		await store.setSettings({ postReleaseCommand: "bun run shots" });
+		const task = await releaseTask(store);
+		await loop.runTurn(store.name, task.id);
+		const after = (await store.getTask(task.id))!;
+		expect(after.stage).toBe("done");
+		expect(record.createWorktree).toHaveLength(0);
+		expect(await store.listTasks()).toHaveLength(1);
+		const log = await logText(store, task.id);
+		expect(log).toContain("made no tracked changes");
+	});
 });
 
 describe("turn settleReviews", () => {
@@ -7577,6 +7684,7 @@ describe("turn research cards", () => {
 			runs: [],
 			publishRelease: [],
 			runReleaseCommand: [],
+			runPostReleaseCommand: [],
 			quarantine: [],
 			ignoreInMain: [],
 			deletes: [],

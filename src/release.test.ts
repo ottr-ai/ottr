@@ -31,6 +31,7 @@ import {
 	releaseEnvNames,
 	releasePushAuth,
 	runGh,
+	runPostReleaseCommand,
 	runReleaseCommand,
 } from "./release.ts";
 import fc from "./test/properties.ts";
@@ -1565,6 +1566,151 @@ exit 1
 			lfsOid as string,
 		);
 		expect(readFileSync(shard).toString()).toBe("release-sprite-local");
+	}, 60_000);
+});
+
+describe("runPostReleaseCommand against real repos", () => {
+	// Same fixture shape as the runReleaseCommand describe above: a bare "origin", a main
+	// checkout, and a fake command script run via process.execPath. The command never
+	// touches origin, but the bare repo keeps the fixture comparable.
+	const POST_FAKE = `
+import { appendFileSync, writeFileSync } from "node:fs";
+const [mode, counter] = process.argv.slice(2);
+const tag = process.env.OTTR_RELEASE_TAG ?? "";
+// stdout and stderr are read concurrently, so the failing mode prints to one stream only.
+if (mode === "fail") { console.error("boom"); process.exit(3); }
+appendFileSync(counter, tag + "\\n");
+if (mode === "edit") writeFileSync("artifact.txt", "touched at " + tag + "\\n");
+if (mode === "png") writeFileSync("sprite.png", Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 222, 173, 190, 239]));
+console.log("post " + tag);
+`;
+	let root = "";
+	let origin = "";
+	let main = "";
+	let fake = "";
+	let counter = "";
+	beforeAll(() => {
+		sweepStaleFixtures("ott-post-release-test-");
+		root = mkdtempSync(join(tmpdir(), "ott-post-release-test-"));
+		origin = join(root, "origin.git");
+		main = join(root, "main");
+		must(root, "init", "-q", "--bare", "-b", "main", origin);
+		must(root, "init", "-q", "-b", "main", main);
+		must(main, "commit", "-q", "--allow-empty", "-m", "a");
+		must(main, "remote", "add", "origin", join(root, "origin.git"));
+		must(main, "push", "-q", "-u", "origin", "main");
+		fake = join(root, "fake-post-release.mjs");
+		writeFileSync(fake, POST_FAKE);
+		counter = join(root, "counter.txt");
+	}, 60_000);
+	afterAll(() => {
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	}, 60_000);
+
+	/** Tracks `file` with `bytes`, commits, and tags the commit: the command's precondition. */
+	function seed(tag: string, file: string, bytes: Buffer): string {
+		writeFileSync(join(main, file), bytes);
+		must(main, "add", "-A");
+		must(main, "commit", "-q", "-m", `feat: seed ${tag}`);
+		must(main, "tag", tag);
+		return must(main, "rev-parse", `refs/tags/${tag}^{commit}`);
+	}
+	const run = (mode: string, version: string) =>
+		runPostReleaseCommand({
+			command: `"${process.execPath}" "${fake}" ${mode} "${counter}"`,
+			mainPath: main,
+			version,
+			log: () => {},
+		});
+
+	test("runs once at the new tag and gets OTTR_RELEASE_TAG", async () => {
+		const releasedSha = seed(
+			"v1.0.0",
+			"artifact.txt",
+			Buffer.from("seed v1.0.0\n"),
+		);
+		const res = await run("edit", "v1.0.0");
+		expect(res.releasedSha).toBe(releasedSha);
+		// Exactly one run, at this tag: the counter file holds one line.
+		expect(readFileSync(counter, "utf8")).toBe("v1.0.0\n");
+		expect(res.files).toContain("artifact.txt");
+		expect(res.commitSha).not.toBeNull();
+		expect(must(main, "rev-parse", `${res.commitSha}^`)).toBe(releasedSha);
+		expect(must(main, "show", `${res.commitSha}:artifact.txt`)).toBe(
+			"touched at v1.0.0",
+		);
+	}, 60_000);
+
+	test("returns no files and no commit when the command changes nothing", async () => {
+		const releasedSha = seed(
+			"v1.1.0",
+			"artifact.txt",
+			Buffer.from("seed v1.1.0\n"),
+		);
+		const res = await run("noop", "v1.1.0");
+		expect(res).toEqual({ releasedSha, commitSha: null, files: [] });
+	}, 60_000);
+
+	test("a failing command throws with its exit code and last line", async () => {
+		seed("v1.1.5", "artifact.txt", Buffer.from("seed v1.1.5\n"));
+		await expect(run("fail", "v1.1.5")).rejects.toThrow(
+			"post-release command exited with code 3: boom",
+		);
+	}, 60_000);
+
+	test("binary changes survive in the commit", async () => {
+		seed(
+			"v1.2.0",
+			"sprite.png",
+			Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1, 2]),
+		);
+		const res = await run("png", "v1.2.0");
+		expect(res.files).toEqual(["sprite.png"]);
+		// `git show` of a png via must() would corrupt the bytes: read the raw pipe.
+		const shown = Bun.spawnSync(
+			[gitExe(), "show", `${res.commitSha}:sprite.png`],
+			{
+				cwd: main,
+				env: fixtureGitEnv(),
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				windowsHide: true,
+			},
+		);
+		expect(shown.exitCode).toBe(0);
+		expect(
+			Buffer.compare(
+				Buffer.from(shown.stdout),
+				Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 222, 173, 190, 239]),
+			),
+		).toBe(0);
+	}, 60_000);
+
+	test("removes its scratch worktree", async () => {
+		seed("v1.3.0", "artifact.txt", Buffer.from("seed v1.3.0\n"));
+		await run("noop", "v1.3.0");
+		expect(must(main, "worktree", "list", "--porcelain")).not.toContain(
+			"ottr-post-release",
+		);
+	}, 60_000);
+
+	test("a command that is not on PATH fails with a readable reason", async () => {
+		const missing = runPostReleaseCommand({
+			command: "ott-no-such-post-release-command --ottr",
+			mainPath: main,
+			version: "v1.0.0",
+			log: () => {},
+		});
+		await expect(missing).rejects.toThrow(
+			"release command not found: ott-no-such-post-release-command",
+		);
+	}, 60_000);
+
+	test("a missing tag fails", async () => {
+		await expect(run("edit", "v9.9.9")).rejects.toThrow(
+			"cannot resolve the release tag v9.9.9 in the repository",
+		);
 	}, 60_000);
 });
 

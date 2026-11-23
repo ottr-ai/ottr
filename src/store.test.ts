@@ -1274,16 +1274,18 @@ describe("shortTitle", () => {
 });
 
 describe("settings", () => {
-	test("displayName and releaseCommand survive a reopen, reset to null, and leave the other settings alone", async () => {
+	test("displayName, releaseCommand and postReleaseCommand survive a reopen, reset to null, and leave the other settings alone", async () => {
 		const dir = join(root, "settings-name");
 		let store = await open(dir);
 		expect((await store.getSettings()).displayName).toBeNull();
 		expect((await store.getSettings()).releaseCommand).toBeNull();
+		expect((await store.getSettings()).postReleaseCommand).toBeNull();
 		await store.setSettings({ maxParallel: 3 });
 		await store.setSettings({ displayName: "Ottr" });
 		await store.setSettings({
 			releaseCommand: "node scripts/release.mjs --ottr",
 		});
+		await store.setSettings({ postReleaseCommand: "bun run shots" });
 		await store.setSettings({
 			archReviewCap: 80,
 			maxImages: 4,
@@ -1297,6 +1299,7 @@ describe("settings", () => {
 			iconText: null,
 			releaseCommand: "node scripts/release.mjs --ottr",
 			releaseEnv: null,
+			postReleaseCommand: "bun run shots",
 			archReviewCap: 80,
 			validationBatchSize: 10,
 			maxImages: 4,
@@ -1330,7 +1333,11 @@ describe("settings", () => {
 			originUrl: null,
 			taskIdPrefix: null,
 		});
-		await store.setSettings({ displayName: null, releaseCommand: null });
+		await store.setSettings({
+			displayName: null,
+			releaseCommand: null,
+			postReleaseCommand: null,
+		});
 		expect(await store.getSettings()).toEqual({
 			maxParallel: 3,
 			copyExtra: [],
@@ -1338,6 +1345,7 @@ describe("settings", () => {
 			iconText: null,
 			releaseCommand: null,
 			releaseEnv: null,
+			postReleaseCommand: null,
 			archReviewCap: 80,
 			validationBatchSize: 10,
 			maxImages: 4,

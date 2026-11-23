@@ -1734,6 +1734,27 @@ function parseReleaseEnv(
 	return null;
 }
 
+function parsePostReleaseCommand(
+	body: Record<string, unknown>,
+	patch: Partial<ProjectSettings>,
+): Response | null {
+	const rc = body.postReleaseCommand;
+	if (rc === undefined) return null;
+	if (rc !== null && typeof rc !== "string")
+		return json({ error: "postReleaseCommand must be a string or null" }, 400);
+	const command = typeof rc === "string" ? rc.trim() : "";
+	if (command.length > 300 || /[\p{Cc}]/u.test(command)) {
+		return json(
+			{
+				error: "postReleaseCommand must be one line of at most 300 characters",
+			},
+			400,
+		);
+	}
+	patch.postReleaseCommand = command === "" ? null : command;
+	return null;
+}
+
 function parseTargetBranch(
 	body: Record<string, unknown>,
 	patch: Partial<ProjectSettings>,
@@ -1941,6 +1962,7 @@ const settingParsers: FieldParser[] = [
 	parseTaskIdPrefix,
 	parseReleaseCommand,
 	parseReleaseEnv,
+	parsePostReleaseCommand,
 	parseTargetBranch,
 	parseArchReviewCap,
 	parseMaxImages,

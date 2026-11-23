@@ -140,6 +140,7 @@ const project = (): ProjectView =>
 			displayName: null,
 			releaseCommand: null,
 			releaseEnv: null,
+			postReleaseCommand: null,
 			archReviewCap: 30,
 			maxImages: 4,
 			keptWorktreeDays: 7,

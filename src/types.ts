@@ -248,6 +248,13 @@ export interface ProjectSettings {
 	 * Names only: the values always come from the server env at spawn time, never from this
 	 * setting. */
 	releaseEnv: string | null;
+	/**
+	 * Runs once after a release succeeds, in a clean worktree at the released tag, with
+	 * OTTR_RELEASE_TAG in the env; null = no post-release step. Split on spaces (double
+	 * quotes group), no shell.
+	 * docs/specs/post-release-command.md
+	 */
+	postReleaseCommand: string | null;
 	/** Commits on the integration target before an architecture review is due. */
 	archReviewCap: number;
 	/** Leads one validation run (OTTR-1047) validates per run; a stored value below 1 behaves as 1. */

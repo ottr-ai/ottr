@@ -1,9 +1,10 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { childDatabaseEnv } from "./childEnv.ts";
 import { gitAuthEnv, parseGitToken, parseGitUrl } from "./gitHosts.ts";
 import { ghEnvFor, githubHost, hostMatcher } from "./githubHost.ts";
+import { DEFAULT_COMMIT_EMAIL, DEFAULT_COMMIT_NAME } from "./gitIdentity.ts";
 import { stripRepoRelocatingEnv } from "./gitRepoEnv.ts";
 import { platform } from "./platform/index.ts";
 import { type ReviewTask, reviewBlocked } from "./scheduler.ts";
@@ -1122,7 +1123,8 @@ function releaseArgv(command: string): string[] {
 export function releaseEnv(o: {
 	sha: string;
 	version: string;
-	notesFile: string;
+	/** Optional: the post-release command runs after publish, with no notes file. */
+	notesFile?: string;
 	archReview?: { delta: number } | null;
 	allowEnv?: string | null;
 }): Record<string, string | undefined> {
@@ -1136,7 +1138,7 @@ export function releaseEnv(o: {
 	}
 	env.OTTR_RELEASE_VERSION = o.version;
 	env.OTTR_RELEASE_COMMIT = o.sha;
-	env.OTTR_RELEASE_NOTES_FILE = o.notesFile;
+	if (o.notesFile !== undefined) env.OTTR_RELEASE_NOTES_FILE = o.notesFile;
 	if (o.archReview) env.OTTR_ARCH_REVIEW = String(o.archReview.delta);
 	// OTTR-1162: the command's git names its repos with path arguments, so an inherited
 	// GIT_DIR (a git-hook launch) would redirect its tag/commit into a foreign repository.
@@ -1329,4 +1331,135 @@ export async function runReleaseCommand(o: {
 		throw new Error(`tag ${o.version} (${short}) is not on ${o.target}`);
 	}
 	return `release command published ${o.version} at ${short}`;
+}
+
+export interface PostReleaseResult {
+	/** The released tag's commit. */
+	releasedSha: string;
+	/** The commit holding the command's changes; null when it changed nothing. */
+	commitSha: string | null;
+	/** Changed tracked paths, sorted; empty when nothing changed. */
+	files: string[];
+}
+
+/**
+ * Runs the project's post-release command once at the released tag, in a clean detached
+ * worktree of the tag's commit (the release card's tree stays untouched). The command gets
+ * `OTTR_RELEASE_TAG` plus the shared release env, but no `OTTR_RELEASE_NOTES_FILE`: the
+ * release is already published, so there is no notes file. Tracked changes (`git add -A`)
+ * land as one `chore:` commit with the board's default identity; the command never pushes.
+ */
+export async function runPostReleaseCommand(o: {
+	command: string;
+	mainPath: string;
+	version: string;
+	log: (line: string) => void | Promise<void>;
+	/** Lets Cancel and shutdown stop the command's process tree. */
+	onSpawn?: (h: {
+		pid: number;
+		done: Promise<unknown>;
+		kill(): Promise<void>;
+	}) => void;
+}): Promise<PostReleaseResult> {
+	const t = await git(
+		["rev-parse", "--quiet", "--verify", `refs/tags/${o.version}^{commit}`],
+		o.mainPath,
+	);
+	if (t.code !== 0)
+		throw new Error(
+			`cannot resolve the release tag ${o.version} in the repository`,
+		);
+	const releasedSha = t.stdout.trim();
+
+	const parent = mkdtempSync(join(tmpdir(), "ottr-post-release-"));
+	const scratch = join(parent, "wt");
+	const add = await git(
+		["worktree", "add", "--quiet", "--detach", scratch, releasedSha],
+		o.mainPath,
+	);
+	if (add.code !== 0) {
+		// No checkout ever existed, so the empty scratch dir goes now; only a worktree
+		// that hosted a run gets the logged, kept failure below.
+		rmSync(parent, { recursive: true, force: true });
+		throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
+	}
+	try {
+		const argv = releaseArgv(o.command);
+		const proc = spawnRelease(argv, scratch, {
+			...releaseEnv({ sha: releasedSha, version: o.version }),
+			OTTR_RELEASE_TAG: o.version,
+		});
+		o.onSpawn?.({
+			pid: proc.pid,
+			done: proc.exited,
+			kill: async () => await platform.killTree(proc.pid),
+		});
+		let last = "";
+		const emit = async (raw: string): Promise<void> => {
+			const line = raw.replace(/\r$/, "");
+			if (line.trim() === "") return;
+			await o.log(line);
+			last = line.trim();
+		};
+		const [code] = await Promise.all([
+			proc.exited,
+			pumpLines(proc.stdout, emit),
+			pumpLines(proc.stderr, emit),
+		]);
+		if (code !== 0)
+			throw new Error(
+				`post-release command exited with code ${code}${last ? `: ${last}` : ""}`,
+			);
+
+		const staged = await git(["add", "-A"], scratch);
+		if (staged.code !== 0)
+			throw new Error(`git add failed: ${staged.stderr.trim()}`);
+		const status = await git(["status", "--porcelain"], scratch);
+		if (status.stdout.trim() === "")
+			return { releasedSha, commitSha: null, files: [] };
+
+		const committed = await git(
+			[
+				"-c",
+				`user.name=${DEFAULT_COMMIT_NAME}`,
+				"-c",
+				`user.email=${DEFAULT_COMMIT_EMAIL}`,
+				"-c",
+				"commit.gpgsign=false",
+				"commit",
+				"-q",
+				"-m",
+				`chore: post-release changes for ${o.version}`,
+			],
+			scratch,
+		);
+		if (committed.code !== 0)
+			throw new Error(`git commit failed: ${committed.stderr.trim()}`);
+		const head = await git(["rev-parse", "HEAD"], scratch);
+		if (head.code !== 0)
+			throw new Error(`git rev-parse HEAD failed: ${head.stderr.trim()}`);
+		const commitSha = head.stdout.trim();
+		const diff = await git(
+			["diff", "--name-only", releasedSha, "HEAD"],
+			scratch,
+		);
+		if (diff.code !== 0)
+			throw new Error(`git diff failed: ${diff.stderr.trim()}`);
+		const files = diff.stdout
+			.split("\n")
+			.map((l) => l.trim())
+			.filter((l) => l !== "")
+			.sort();
+		return { releasedSha, commitSha, files };
+	} finally {
+		const rm = await git(
+			["worktree", "remove", "--force", scratch],
+			o.mainPath,
+		);
+		if (rm.code === 0) rmSync(parent, { recursive: true, force: true });
+		else
+			await o.log(
+				`! post-release: worktree cleanup failed: ${rm.stderr.trim()}`,
+			);
+	}
 }

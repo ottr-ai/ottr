@@ -115,6 +115,9 @@ const baseSettings = {
 	displayName: null,
 	releaseCommand: null,
 	releaseEnv: null,
+	postReleaseCommand: null,
+	postReleaseLanding: "card",
+	postReleasePaths: [],
 	archReviewCap: 30,
 	maxImages: 4,
 	keptWorktreeDays: 7,
@@ -172,6 +175,9 @@ const watchBaseSettings = {
 	copyExtra: [],
 	displayName: null,
 	releaseCommand: null,
+	postReleaseCommand: null,
+	postReleaseLanding: "card",
+	postReleasePaths: [],
 	archReviewCap: 30,
 	maxImages: 4,
 	keptWorktreeDays: 7,
@@ -906,6 +912,112 @@ describe("ProjectSettingsForm target branch", () => {
 				onChangeOf(input)({ target: { checked: true }, currentTarget: input });
 			});
 			expect(postBody?.forkMergeHold).toBe(true);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the Releases card shows the post-release command row and saving posts all fields", async () => {
+		let postBody: Record<string, unknown> | undefined;
+		const fetchMock = projectFormFetch(project, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(project, fetchMock);
+		try {
+			const card = container.querySelector("#project-releases-section");
+			expect(card).not.toBeNull();
+			expect(card?.textContent).toContain("Post-release command");
+			const input = card?.querySelector<HTMLInputElement>(
+				'input[aria-label="Post-release command"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("post-release command input did not render");
+			expect(input.value).toBe("");
+			expect(input.getAttribute("maxlength")).toBe("300");
+			await act(async () => {
+				typeInto(input, "bun run shots");
+				handlerOf(input, "onChange")({ target: input, currentTarget: input });
+			});
+			const form = card?.querySelector("form");
+			if (form === null || form === undefined)
+				throw new Error("releases form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postBody).not.toBeUndefined();
+			// One Save sends all four fields; the untouched ones save their defaults.
+			expect(postBody?.postReleaseCommand).toBe("bun run shots");
+			expect(postBody?.releaseCommand).toBeNull();
+			expect(postBody?.postReleaseLanding).toBe("card");
+			expect(postBody?.postReleasePaths).toEqual([]);
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("a stored post-release command renders back into the input", async () => {
+		const fetchMock = projectFormFetch(project, () => {});
+		const stored = {
+			...project,
+			settings: { ...project.settings, postReleaseCommand: "bun run shots" },
+		} as unknown as ProjectView;
+		const { container, unmount } = await mountForm(stored, fetchMock);
+		try {
+			const input = container.querySelector<HTMLInputElement>(
+				'#project-releases-section input[aria-label="Post-release command"]',
+			);
+			if (input === null || input === undefined)
+				throw new Error("post-release command input did not render");
+			expect(input.value).toBe("bun run shots");
+		} finally {
+			await unmount();
+		}
+	});
+
+	test("the landing select and paths textarea render back and save their values", async () => {
+		const stored = projectView(
+			{},
+			{
+				postReleaseLanding: "commit-push",
+				postReleasePaths: ["landing"],
+			},
+		);
+		let postBody: Record<string, unknown> | undefined;
+		const fetchMock = projectFormFetch(stored, (body) => {
+			postBody = body;
+		});
+		const { container, unmount } = await mountForm(stored, fetchMock);
+		try {
+			const card = container.querySelector("#project-releases-section");
+			expect(card).not.toBeNull();
+			const select = card?.querySelector<HTMLSelectElement>(
+				'select[aria-label="Post-release landing"]',
+			);
+			if (select === null || select === undefined)
+				throw new Error("post-release landing select did not render");
+			expect(select.value).toBe("commit-push");
+			const textarea = card?.querySelector<HTMLTextAreaElement>(
+				'textarea[aria-label="Post-release paths"]',
+			);
+			if (textarea === null || textarea === undefined)
+				throw new Error("post-release paths textarea did not render");
+			expect(textarea.value).toBe("landing");
+			await act(async () => {
+				typeInto(textarea, "landing\nshots");
+				handlerOf(textarea, "onChange")({
+					target: textarea,
+					currentTarget: textarea,
+				});
+			});
+			const form = card?.querySelector("form");
+			if (form === null || form === undefined)
+				throw new Error("releases form did not render");
+			await act(async () => {
+				form.dispatchEvent(submitEvent());
+			});
+			expect(postBody).not.toBeUndefined();
+			expect(postBody?.postReleaseLanding).toBe("commit-push");
+			expect(postBody?.postReleasePaths).toEqual(["landing", "shots"]);
 		} finally {
 			await unmount();
 		}
@@ -2066,6 +2178,7 @@ describe("Code scanning watch facts and Check alerts now", () => {
 			copyExtra: [],
 			displayName: null,
 			releaseCommand: null,
+			postReleaseCommand: null,
 			archReviewCap: 30,
 			maxImages: 4,
 			keptWorktreeDays: 7,

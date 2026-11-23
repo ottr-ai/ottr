@@ -230,6 +230,11 @@ function fakeOps(record: Recorded, overrides: FixtureOps = {}): TurnOps {
 		titleRetryDelayMs: 5,
 		publishRelease: async () => "published",
 		runReleaseCommand: async () => "ran",
+		runPostReleaseCommand: async () => ({
+			releasedSha: "shaR",
+			commitSha: null,
+			files: [],
+		}),
 		archReviewDelta: async () => ({ delta: 0, reviewed: true, anchor: "a" }),
 		commitSubjects: async () => [],
 		http400Dir: join(tmpdir(), "ottr-test-no-http400"),
