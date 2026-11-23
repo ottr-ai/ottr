@@ -362,7 +362,18 @@ describe("handleGit over real git", () => {
 describe("receiveCommands", () => {
 	const pkt = (s: string) =>
 		`${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
-	const commands = async (body: string, cap?: number) => {
+	const enc = (s: string) => new TextEncoder().encode(s);
+	const streamBody = (...parts: string[]) =>
+		new ReadableStream<Uint8Array>({
+			start(c) {
+				for (const part of parts) c.enqueue(enc(part));
+				c.close();
+			},
+		});
+	const commands = async (
+		body: string | ReadableStream<Uint8Array>,
+		cap?: number,
+	) => {
 		const r = await receiveCommands(
 			new Request("http://board.invalid/git/alpha.git/git-receive-pack", {
 				method: "POST",
@@ -374,7 +385,10 @@ describe("receiveCommands", () => {
 		await r.stdin.cancel();
 		return r.commands;
 	};
-	const refused = async (body: string, cap?: number) => {
+	const refused = async (
+		body: string | ReadableStream<Uint8Array>,
+		cap?: number,
+	) => {
 		const r = await receiveCommands(
 			new Request("http://board.invalid/git/alpha.git/git-receive-pack", {
 				method: "POST",
@@ -401,6 +415,29 @@ describe("receiveCommands", () => {
 		]);
 	});
 
+	test("a section split across stream chunks keeps every command byte for the backend", async () => {
+		// The command section arrives in two chunks with the boundary between the commands:
+		// the stdin handed to http-backend must carry both commands and the flush byte for
+		// byte, or a valid fragmented push would lose its ref updates.
+		const first = pkt(`${a} ${b} refs/heads/x\n`);
+		const rest = pkt(`${b} ${a} refs/heads/y\n`) + "0000PACK....";
+		const r = await receiveCommands(
+			new Request("http://board.invalid/git/alpha.git/git-receive-pack", {
+				method: "POST",
+				body: streamBody(first, rest),
+			}),
+			1024 * 1024,
+		);
+		if (!("stdin" in r)) throw new Error(r.error);
+		expect(r.commands).toEqual([
+			{ old: a, new: b, ref: "refs/heads/x" },
+			{ old: b, new: a, ref: "refs/heads/y" },
+		]);
+		expect(new Uint8Array(await new Response(r.stdin).arrayBuffer())).toEqual(
+			enc(first + rest),
+		);
+	});
+
 	test("a push certificate, a garbled line or a missing flush is an error", async () => {
 		expect(
 			await refused(`${pkt("push-cert\0report-status\n")}0000`),
@@ -422,14 +459,20 @@ describe("receiveCommands", () => {
 	test("a command section with no flush is refused at the cap instead of being buffered", async () => {
 		const line = pkt(`${a} ${b} refs/heads/x\n`);
 		expect(await refused(line.repeat(10), 512)).toContain("over");
+		// Small chunks do not reset the count: consumed bytes stay counted against the cap.
+		expect(await refused(streamBody(...Array(200).fill(line)), 512)).toContain(
+			"over",
+		);
 		const flood = line.repeat(Math.ceil((1024 * 1024 * 1.2) / line.length));
 		expect(await refused(flood)).toContain("over");
-		// A flush inside the read bytes still ends the section, whatever its size: the
-		// packfile tail after it is never buffered.
+		// The cap also holds when the section finally flushes: every byte before the flush
+		// counts, whatever chunk it arrived in.
 		const lines = Math.ceil((1024 * 1024 * 1.2) / line.length);
-		expect(
-			(await commands(`${line.repeat(lines - 1)}0000PACK...`)).length,
-		).toBe(lines - 1);
+		expect(await refused(`${line.repeat(lines)}0000PACK...`)).toContain("over");
+		// A section under the cap that flushes is read normally; the packfile tail is not buffered.
+		expect((await commands(`${line.repeat(5000)}0000PACK...`)).length).toBe(
+			5000,
+		);
 	});
 
 	test("pushRefusal allows only updates of the card branch", () => {

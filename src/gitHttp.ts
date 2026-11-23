@@ -472,11 +472,11 @@ function pushStdin(
 
 /**
  * Reads the command section of a receive-pack body straight from the request stream: pkt-lines
- * up to the first flush, at most `cap` bytes. The packfile after the flush is never buffered —
- * the returned stdin streams the already-read head and then the rest of the request body to
- * http-backend. A malformed line, a section over the cap, or a body that ends inside the
- * command section is an error and cancels the request stream, so a refused push never reads
- * its packfile and answers before its body finishes arriving (OTTR-1003).
+ * up to the first flush, at most `cap` bytes before the flush. The packfile after the flush is
+ * never buffered — the returned stdin streams the already-read head and then the rest of the
+ * request body to http-backend. A malformed line, a section over the cap, or a body that ends
+ * inside the command section is an error and cancels the request stream, so a refused push
+ * never reads its packfile and answers before its body finishes arriving (OTTR-1003).
  */
 export async function receiveCommands(
 	req: Request,
@@ -490,6 +490,9 @@ export async function receiveCommands(
 	// Non-UTF-8 bytes decode to U+FFFD, which no ASCII branch name can equal.
 	const text = new TextDecoder();
 	const commands: PushCommand[] = [];
+	// `buf` keeps every section byte read so far — the stdin the backend gets is cut from
+	// it, so a compaction that drops parsed commands would corrupt fragmented pushes — and
+	// `at` is the parse position inside it. The cap bounds the whole section, not the tail.
 	let buf = new Uint8Array(0);
 	let at = 0;
 	for (;;) {
@@ -506,11 +509,16 @@ export async function receiveCommands(
 				return { error: pkt.error };
 			}
 			at = pkt.at;
-			if (pkt.kind === "flush")
+			if (pkt.kind === "flush") {
+				if (at > cap) {
+					void reader.cancel();
+					return { error: `the push command section is over ${cap} bytes` };
+				}
 				return {
 					commands,
 					stdin: pushStdin(buf.subarray(0, at), buf.subarray(at), reader),
 				};
+			}
 			const parsed = parseCommandLine(pkt.line, commands.length === 0);
 			if ("error" in parsed) {
 				void reader.cancel();
@@ -526,10 +534,6 @@ export async function receiveCommands(
 		}
 		const { value, done } = await reader.read();
 		if (done) return { error: partial };
-		if (at > 0) {
-			buf = buf.subarray(at);
-			at = 0;
-		}
 		const joined = new Uint8Array(buf.length + value.byteLength);
 		joined.set(buf);
 		joined.set(value, buf.length);
