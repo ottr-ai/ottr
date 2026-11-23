@@ -36,10 +36,11 @@ beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "ottr-trending-"));
 });
 
+// Closing ~26 stores measured 6.4s under load >=32; bun's hook budget is 5s.
 afterAll(async () => {
 	for (const s of stores) await s.close();
 	rmSync(root, { recursive: true, force: true });
-});
+}, 60_000);
 
 let seq = 0;
 async function project(
