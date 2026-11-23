@@ -214,8 +214,8 @@ function envFiles(args: string[]): string[] {
  * Bun loads the cwd's `.env` files into process.env before the script starts, and every
  * compose child would pass them on as shell values that beat `--env-file`. Compose ignores
  * `.env` when `--env-file` is given, so this removes what Bun loaded: it asks a bare Bun
- * child (empty env) what it loads in the cwd and in tmpdir, and deletes each key that only
- * the cwd child shows. On Windows a child gets the OS user variables (PATH, USERPROFILE,
+ * child (empty env) what it loads in the cwd and in a fresh private directory, and deletes
+ * each key that only the cwd child shows. On Windows a child gets the OS user variables (PATH, USERPROFILE,
  * ...) even with an empty env, so the cwd child alone cannot tell .env keys from OS keys.
  * A shell key with another value stays.
  */
@@ -238,7 +238,16 @@ export function dropBunDotenv(
 		return JSON.parse(r.stdout.toString()) as Record<string, string>;
 	};
 	const loaded = probe();
-	const bare = probe(tmpdir());
+	// The shared tmpdir is world-writable: a bunfig.toml planted there would run
+	// its preload with this run's identity. The bare child gets a fresh private
+	// directory instead (mkdtempSync creates with mode 0700).
+	const bareDir = mkdtempSync(join(tmpdir(), "ottr-bare-probe-"));
+	let bare: Record<string, string>;
+	try {
+		bare = probe(bareDir);
+	} finally {
+		rmSync(bareDir, { recursive: true, force: true, maxRetries: 5 });
+	}
 	// ponytail: a shell key with the same value as `.env` goes too; compose then reads it
 	// from --env-file. Read the start env (/proc/self/environ) if that case matters.
 	for (const [k, v] of Object.entries(loaded))

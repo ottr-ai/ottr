@@ -4752,6 +4752,33 @@ describe("envFileValues", () => {
 			Bun.spawnSync = real;
 		}
 	});
+
+	test("the bare probe runs a planted tmpdir bunfig preload nowhere", () => {
+		// The default tmpdir is world-writable: any local user can plant a
+		// bunfig.toml whose preload would then run with the deploy operator's
+		// identity. The bare probe must use a fresh private directory, so the
+		// marker file the planted preload writes never appears.
+		const shared = mkdtempSync(join(tmpdir(), "ottr-planted-tmp-"));
+		const marker = join(shared, "marker");
+		writeFileSync(
+			join(shared, "bunfig.toml"),
+			`preload = [${JSON.stringify(join(shared, "p.js"))}]\n`,
+		);
+		writeFileSync(
+			join(shared, "p.js"),
+			`require("fs").writeFileSync(${JSON.stringify(marker)}, "planted");\n`,
+		);
+		const prevTmp = process.env.TMPDIR;
+		process.env.TMPDIR = shared;
+		try {
+			dropBunDotenv(["--env-file", "stack.env"], { ALATE_IMAGE: "x" });
+			expect(existsSync(marker)).toBe(false);
+		} finally {
+			if (prevTmp === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = prevTmp;
+			rmSync(shared, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
 });
 
 describe("helpers survivor kills", () => {
