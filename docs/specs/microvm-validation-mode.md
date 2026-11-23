@@ -94,7 +94,7 @@ Fixed constants of the validation mode (no request knobs, no runner env):
 | vCPUs | Firecracker `machine-config` | 1 |
 | memory | Firecracker `machine-config` | 2048 MiB |
 | disk | the scratch disk is a fixed-size block device | 1 GiB |
-| processes | `RLIMIT_NPROC` on the job | 256 |
+| processes | `pids.max` on the job's cgroup `/sys/fs/cgroup/job` | 256 |
 | core dumps | `RLIMIT_CORE` on the job | 0 |
 | file size | `RLIMIT_FSIZE` on the job | 1 GiB |
 | time | the guest kills the job at 600 s; the runner kills the VM at 600 s + boot slack (180 s total cap) | 10 minutes |
@@ -105,6 +105,17 @@ command timed out), which left every browser lead blocked without proving
 anything (OTTR-1167). The vCPU, process, file-size and time caps stay as the
 controls they were.
 
+The process limit is a pids cgroup, not `RLIMIT_NPROC` (OTTR-1225). The kernel
+counts `RLIMIT_NPROC` per real uid over all threads in all containers on the
+host. Every turn of a project shares one uid since OTTR-994. Other turns of
+the same project hold hundreds of tasks, so a 256 cap on that uid failed the
+job's first fork whenever they ran (OTTR-1163). The second option, a per-job
+uid from a reserved range like the turn uid, lost: the gate that runs the
+validate tests runs with no capabilities, so it can neither apply nor test a
+uid drop. A `pids.max` on the job's own cgroup counts only the job's tasks,
+independent of any uid count, and the guest's root init and agent set it up.
+The limit value stays 256; the response's `limits.maxProcesses` reports it.
+
 ## Guest flow (`docker/ottr-vm-init`, guest agent)
 
 1. Init parses `ottr.mode=validate` (the shape checks relax: empty token, board and
@@ -114,12 +125,20 @@ controls they were.
    points and the hosts files, unmounts it, and mounts the final root as a
    lower-only overlay whose lowest layer is the setup upper. It binds `/tmp`,
    `/home`, `/work` from `vdc`. It leaves `/dev/vdd` with node `0600 root:root`.
+   In validate mode it also mounts cgroup2 at `/sys/fs/cgroup`, enables the
+   `pids` controller, and creates the job cgroup `/sys/fs/cgroup/job`. Any of
+   the three steps that fails stops the VM before a job can run without the
+   limit.
 3. Init starts the guest agent (`src/vmGuest.ts`) with `OTTR_VM_MODE=validate`.
    The agent does not serve HTTP in validate mode.
 4. The agent reads `/job/job.json`, runs the self-check (below), then the job
-   through one spawn path: `env` exactly the allowlist, cwd under `/target`,
-   `nobody`, the rlimits, the timeout. It captures stdout and stderr tails
-   (64 KiB each).
+   through one spawn path. The limits check writes `maxProcesses` to the job
+   cgroup's `pids.max`. The job spawn is a root wrapper that first moves its own
+   pid into the job cgroup, then drops to `nobody` with `setpriv`, and execs
+   `prlimit` with `RLIMIT_CORE` 0 and `RLIMIT_FSIZE` 1 GiB; no `RLIMIT_NPROC`.
+   The move happens before any fork, so no job task is born outside the cgroup.
+   `env` is exactly the allowlist, cwd under `/target`, the timeout kills the
+   tree. It captures stdout and stderr tails (64 KiB each).
 5. The agent writes the result JSON to `/dev/vdd` (8-byte little-endian length,
    then UTF-8 JSON), then exits. Init kills the tree, syncs, unmounts, powers off
    as today.
@@ -140,7 +159,7 @@ powers off. Checks:
 | toolchain read-only | a write attempt to `/usr` fails with `EROFS` (lower-only overlay) | `read-only toolchain` |
 | scratch writable | a write to `/tmp` succeeds as `nobody`, then unlinks | `scratch-only writes` |
 | result medium guarded | a write to `/dev/vdd` fails as `nobody`; the node is `0600 root:root` | `artifact promotion guard` |
-| limits read back | a probe prints the `Max processes` soft limit from `/proc/self/limits` equal to `maxProcesses`, `nproc` equal to the vCPU count, `MemTotal` inside the configured RAM band (at least 90% of `memMiB`, at most `memMiB`: the kernel reservation keeps the reading below the size, and a VM booted at a stale size fails instead of passing silent about its RAM), and the scratch size equal to the configured bytes | `resource limits` |
+| limits read back | the agent writes `maxProcesses` to the job cgroup's `pids.max`; a probe through the job path prints it back equal to `maxProcesses`, prints an unlimited `Max processes` row (no `RLIMIT_NPROC` on the job), `nproc` equal to the vCPU count, `MemTotal` inside the configured RAM band (at least 90% of `memMiB`, at most `memMiB`: the kernel reservation keeps the reading below the size, and a VM booted at a stale size fails instead of passing silent about its RAM), and the scratch size equal to the configured bytes | `resource limits` |
 
 ### Artifact promotion
 

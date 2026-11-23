@@ -7,6 +7,8 @@ Date: 2026-11-12
 accepted as a design; implemented by OTTR-874. Builds on
 [ADR 0009](0009-microvm-workers.md). Spec:
 [docs/specs/microvm-validation-mode.md](../specs/microvm-validation-mode.md).
+Amended by OTTR-1225: the job's 256-process cap moved from `RLIMIT_NPROC` to
+`pids.max` on the job's cgroup; the spec records the decision and the reason.
 
 ## Context
 

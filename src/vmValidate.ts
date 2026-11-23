@@ -4,6 +4,7 @@ import {
 	openSync,
 	readdirSync,
 	readFileSync,
+	writeFileSync,
 	writeSync,
 } from "node:fs";
 import { connect as netConnect } from "node:net";
@@ -48,14 +49,15 @@ const PROBE_CWD = "/tmp";
 
 /**
  * The limits probe: the same reads as before, with the process limit read from
- * /proc/self/limits. The guest's /bin/sh is dash, and dash has no `ulimit -u`;
- * the table read works in every POSIX sh, bash included. Exported so a test can
- * run this exact command line under the real shell.
+ * /proc/self/limits and the live pids cap read from the job cgroup. The guest's
+ * /bin/sh is dash, and dash has no `ulimit -u`; the table read works in every
+ * POSIX sh, bash included. Exported so a test can run this exact command line
+ * under the real shell.
  */
 export const LIMITS_PROBE_ARGV: string[] = [
 	"sh",
 	"-c",
-	"head -30 /proc/self/limits && nproc && head -1 /proc/meminfo && df -k /tmp",
+	`head -30 /proc/self/limits && nproc && head -1 /proc/meminfo && df -k /tmp && echo "pids=$(cat ${VM_VALIDATE.jobCgroup}/pids.max 2>/dev/null)"`,
 ];
 
 /** The collect name's first component selects one of the scratch roots. */
@@ -85,13 +87,18 @@ export interface ValidateStat {
 export interface ValidateFs {
 	readFile(path: string): Uint8Array;
 	lstat(path: string): ValidateStat;
+	/** One policy write: the job cgroup's `pids.max`, before the limits probe. */
+	writeFile(path: string, content: string): void;
 }
 
 export interface JobSpawnOptions {
 	cwd: string;
 	env: Record<string, string>;
-	uid: number;
-	gid: number;
+	/**
+	 * No uid/gid here on purpose: the wrapper is spawned with the agent's root
+	 * and drops to the job user itself, because only a root process can move
+	 * its own pid into the job cgroup first.
+	 */
 }
 
 /** What the job path needs from a spawned process: a Bun.Subprocess with piped stdio. */
@@ -269,9 +276,14 @@ interface RunOutcome {
 }
 
 /**
- * The one spawn path: prlimit sets the job limits, the env is the allowlist, the user is
- * nobody, and the timeout kills the whole tree. Probes and the real job share this path,
- * so the self-check proves the same controls the job runs under.
+ * The one spawn path: a root wrapper moves its own pid into the job's pids
+ * cgroup (the process cap is `pids.max` there, docs/specs/microvm-validation-mode.md),
+ * drops to the job user with setpriv, and execs prlimit with the file rlimits. The
+ * env is the allowlist and the timeout kills the whole tree. Probes and the real job
+ * share this path, so the self-check proves the same controls the job runs under.
+ * The move precedes every fork, so no job task is born outside the cgroup, and no
+ * RLIMIT_NPROC is set: that limit counts the shared uid's tasks on the whole host
+ * (OTTR-1225), not the job's.
  */
 async function runProcess(
 	argv: string[],
@@ -280,18 +292,14 @@ async function runProcess(
 ): Promise<RunOutcome> {
 	const proc = deps.spawn(
 		[
-			"prlimit",
-			`--nproc=${VM_VALIDATE.maxProcesses}`,
-			"--core=0",
-			`--fsize=${VM_VALIDATE.fileSizeBytes}`,
-			"--",
+			"sh",
+			"-c",
+			`echo "$$" > ${VM_VALIDATE.jobCgroup}/cgroup.procs && exec setpriv --reuid=${jobUid} --regid=${jobGid} --clear-groups prlimit --core=0 --fsize=${VM_VALIDATE.fileSizeBytes} -- "$0" "$@"`,
 			...argv,
 		],
 		{
 			cwd,
 			env: buildJobEnv(),
-			uid: VM_VALIDATE.jobUser.uid,
-			gid: VM_VALIDATE.jobUser.gid,
 		},
 	);
 	const stdout = new TailBuffer(VM_VALIDATE.outputTailBytes);
@@ -358,6 +366,8 @@ export interface LimitsReadback {
 	memKb: number | null;
 	/** The scratch filesystem total in 1K blocks. */
 	scratchKb: number | null;
+	/** The job cgroup's `pids.max`; "max" is possible, the cap is a number. */
+	pidsMax: string | null;
 }
 
 /**
@@ -385,11 +395,17 @@ export function parseLimitsReadback(stdoutTail: string): LimitsReadback {
 	// The df data line starts with the device path; its second field is the total in 1K blocks.
 	const df = lines.find((line) => line.startsWith("/dev/"))?.split(/\s+/);
 	const dfTotal = Number(df?.[1]);
+	// The probe's dedicated pids line: `pids=<pids.max>`. Never a bare number,
+	// so it cannot collide with nproc's output.
+	const pidsMax = /^pids=(\S+)$/.exec(
+		lines.find((line) => line.startsWith("pids=")) ?? "",
+	)?.[1];
 	return {
 		nprocLimit,
 		cpus,
 		memKb: mem === null ? null : Number(mem[1]),
 		scratchKb: Number.isFinite(dfTotal) ? dfTotal : null,
+		pidsMax: pidsMax ?? null,
 	};
 }
 
@@ -538,6 +554,20 @@ const steps: readonly SelfCheckStep[] = [
 		name: "limits read back",
 		control: MISSING_CONTROL.limits,
 		run: async (deps) => {
+			// The cap is policy the agent applies: written before the probe, the probe
+			// then proves the guest's live value. A write that fails fails the check,
+			// and the job never runs without it.
+			try {
+				deps.fs.writeFile(
+					`${VM_VALIDATE.jobCgroup}/pids.max`,
+					String(VM_VALIDATE.maxProcesses),
+				);
+			} catch (err) {
+				return {
+					ok: false,
+					detail: `cannot write ${VM_VALIDATE.jobCgroup}/pids.max: ${message(err)}`,
+				};
+			}
 			const run = await runProcess(LIMITS_PROBE_ARGV, PROBE_CWD, deps);
 			const readback = parseLimitsReadback(run.stdoutTail);
 			// The RAM band pins the booted memory to the configuration: MemTotal is
@@ -552,7 +582,10 @@ const steps: readonly SelfCheckStep[] = [
 				readback.memKb >= memFloorKb &&
 				readback.memKb <= memCeilKb;
 			const ok =
-				readback.nprocLimit === String(VM_VALIDATE.maxProcesses) &&
+				readback.pidsMax === String(VM_VALIDATE.maxProcesses) &&
+				// No RLIMIT_NPROC on the job: that limit counts the shared uid's tasks
+				// across the host's containers, not the job's (OTTR-1225).
+				readback.nprocLimit === null &&
 				readback.cpus === String(VM_VALIDATE.vcpus) &&
 				memOk &&
 				readback.scratchKb !== null &&
@@ -560,7 +593,7 @@ const steps: readonly SelfCheckStep[] = [
 				readback.scratchKb <= VM_VALIDATE.diskBytes / 1024;
 			return {
 				ok,
-				detail: `nproc limit ${readback.nprocLimit ?? "(none)"}, nproc ${readback.cpus ?? "(none)"}, MemTotal ${readback.memKb ?? "(none)"} kB in the ${VM_VALIDATE.memMiB} MiB band ${memFloorKb}-${memCeilKb} kB, scratch ${readback.scratchKb ?? "(none)"} 1K blocks`,
+				detail: `pids.max ${readback.pidsMax ?? "(none)"}, nproc limit ${readback.nprocLimit ?? "unlimited"}, nproc ${readback.cpus ?? "(none)"}, MemTotal ${readback.memKb ?? "(none)"} kB in the ${VM_VALIDATE.memMiB} MiB band ${memFloorKb}-${memCeilKb} kB, scratch ${readback.scratchKb ?? "(none)"} 1K blocks`,
 			};
 		},
 	},
@@ -904,6 +937,7 @@ const realDeps = (): ValidateDeps => ({
 	fs: {
 		readFile: (path) => readFileSync(path),
 		lstat: (path) => lstatSync(path),
+		writeFile: (path, content) => writeFileSync(path, content),
 	},
 	stat: (path) => lstatSync(path),
 	readdir: (path) => readdirSync(path),

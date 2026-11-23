@@ -23,7 +23,14 @@ export const VM_VALIDATE = {
 	memMiB: 2048,
 	/** The scratch disk's size in bytes (the job's whole writable space). */
 	diskBytes: 1024 ** 3,
-	/** RLIMIT_NPROC on the job. */
+	/**
+	 * The job's process cap, enforced as `pids.max` on the job's cgroup
+	 * (docs/specs/microvm-validation-mode.md, OTTR-1225): the kernel counts
+	 * RLIMIT_NPROC per real uid over every container on the host, and all turns
+	 * of a project share one uid, so an RLIMIT_NPROC cap fails the job's fork
+	 * whenever other turns of the project run. The pids cgroup counts only the
+	 * job's own tasks.
+	 */
 	maxProcesses: 256,
 	/** RLIMIT_FSIZE on the job; RLIMIT_CORE is always 0. */
 	fileSizeBytes: 1024 ** 3,
@@ -37,6 +44,12 @@ export const VM_VALIDATE = {
 	outputTailBytes: 64 * 1024,
 	/** The job runs as this user (nobody, ships in the Debian base). */
 	jobUser: { uid: 65534, gid: 65534 },
+	/**
+	 * The job's cgroup in the guest: init mounts cgroup2 and creates the dir,
+	 * the limits check writes `maxProcesses` into `pids.max`, and the job
+	 * wrapper moves its own pid into `cgroup.procs` before it execs the job.
+	 */
+	jobCgroup: "/sys/fs/cgroup/job",
 	/** The env the job gets: exactly these three, never the request env. */
 	envAllowlist: {
 		PATH: "/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

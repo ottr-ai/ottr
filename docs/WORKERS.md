@@ -1181,8 +1181,10 @@ on a read-only ext4 drive; the toolchain is the read-only base and layer drives.
 The limits are fixed: 1 vCPU, 2048 MiB memory (a floor, not a control: 512 MiB
 could not start Chrome's renderer, so browser leads stayed blocked — OTTR-1167),
 1 GiB scratch, 256 processes
-(`RLIMIT_NPROC`), no core dumps, a 1 GiB file-size rlimit, and a 10-minute
-timeout. The guest's self-check proves each control before the job runs; on a
+(`pids.max` on the job's cgroup; not `RLIMIT_NPROC`, whose count is the
+project's shared uid over every container on the host, OTTR-1225), no core
+dumps, a 1 GiB file-size rlimit, and a 10-minute timeout. The guest's
+self-check proves each control before the job runs; on a
 failed check the job never runs and the result names the missing control.
 
 The job spec crosses in on the scratch ext4; the result crosses out on a raw

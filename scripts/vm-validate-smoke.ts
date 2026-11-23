@@ -2,8 +2,9 @@
  * The KVM-host acceptance run for the microVM validation mode
  * (docs/specs/microvm-validation-mode.md, "Acceptance checks", item 3): one validation
  * job whose probe tries to reach the network, write to the target, and read the
- * environment. Every attempt is printed with its verdict, and the exit is non-zero when
- * one attempt is not blocked, so a host script can gate on the exit code alone.
+ * environment, then a fork bomb that must stop at the job's pids cap (OTTR-1225).
+ * Every attempt is printed with its verdict, and the exit is non-zero when one
+ * attempt is not blocked, so a host script can gate on the exit code alone.
  *
  * Run it where bun, the checkout and the vm-runner's compose network meet, for example
  * in a one-off container from the branch's vm-runner image (see docs/WORKERS.md,
@@ -102,6 +103,49 @@ export function parseAttempts(stdoutTail: string): Attempt[] {
 export const expectedEnvNames = Object.keys(VM_VALIDATE.envAllowlist)
 	.sort()
 	.join(" ");
+
+/**
+ * The fork-bomb job (OTTR-1225's live proof): an inner shell forks detached sleeps
+ * in a loop and records each success in a scratch file. When the job cgroup's pids
+ * cap refuses a fork, dash's "Cannot fork" kills the inner shell; the outer shell
+ * then reports the last recorded count, so the count lands even at the cap. With no
+ * live cap the loop reaches its own 2000 bound, which the verdict reads as a leak.
+ */
+export function bombArgv(): string[] {
+	return [
+		"sh",
+		"-c",
+		`sh -c 'i=0; : > /tmp/ottr-bomb-count; while [ "$i" -lt 2000 ]; do sleep 30 </dev/null >/dev/null 2>&1 & echo $((i+1)) > /tmp/ottr-bomb-count; i=$((i+1)); done'; echo "FORKED=$(cat /tmp/ottr-bomb-count 2>/dev/null)"; exit 0`,
+	];
+}
+
+/** The fork count the bomb reported, null when it never reported one. */
+export function parseBomb(stdoutTail: string): number | null {
+	const m = /^FORKED=(\d+)$/m.exec(stdoutTail);
+	return m === null ? null : Number(m[1]);
+}
+
+/** Every way the bomb result fails the pids-cap proof: empty means the cap held. */
+export function bombViolations(result: ValidateResponse): string[] {
+	const bad: string[] = [];
+	if (result.selfCheck?.ok !== true)
+		bad.push("the guest self-check did not pass");
+	if (result.missingControl !== null && result.missingControl !== undefined)
+		bad.push(`missing control: ${result.missingControl}`);
+	if (!result.job) {
+		bad.push("the fork bomb did not run");
+		return bad;
+	}
+	if (result.job.exitCode !== 0)
+		bad.push(`the fork bomb exited ${result.job.exitCode ?? "on signal"}`);
+	const forked = parseBomb(result.job.stdoutTail);
+	if (forked === null) bad.push("the fork bomb never reported its count");
+	else if (forked > VM_VALIDATE.maxProcesses)
+		bad.push(
+			`the job forked ${forked} times past the ${VM_VALIDATE.maxProcesses} cap: the pids limit is not live`,
+		);
+	return bad;
+}
 
 /** Every way the result fails the acceptance: empty means the sandbox held. */
 export function acceptanceViolations(result: ValidateResponse): string[] {
@@ -207,8 +251,42 @@ export async function main(
 		);
 		return 1;
 	}
+	// Second job: the fork bomb must stop at the job's pids cap (OTTR-1225).
+	print(`fork-bomb: forking past the ${VM_VALIDATE.maxProcesses} pids cap ...`);
+	const bomb = await runner({
+		project,
+		checkout,
+		argv: bombArgv(),
+		cwd: "/target",
+		...(ref !== undefined && ref !== "" ? { ref } : {}),
+		env: {
+			OTTR_VM_RUNNER_URL: url,
+			...(token !== "" ? { OTTR_WORKER_TOKEN: token } : {}),
+		},
+	});
+	if (!bomb.ok) {
+		print(`FAIL: ${bomb.error}`);
+		return 1;
+	}
+	const bombResponse = bomb.result;
+	if (!bombResponse.job) {
+		print(
+			`FAIL: the fork bomb did not run (${bombResponse.error ?? "no error line"})`,
+		);
+		return 1;
+	}
+	const forked = parseBomb(bombResponse.job.stdoutTail);
 	print(
-		`PASS: every control held (boot+run ${response.totalMs} ms, limits ${JSON.stringify(response.limits)})`,
+		`fork-bomb: stopped after ${forked ?? "no recorded"} forks (cap ${VM_VALIDATE.maxProcesses})`,
+	);
+	const bombBad = bombViolations(bombResponse);
+	if (bombBad.length > 0) {
+		for (const v of bombBad) print(`FAIL: ${v}`);
+		print(`logTail: ${bombResponse.logTail.slice(-400)}`);
+		return 1;
+	}
+	print(
+		`PASS: every control held and the fork bomb stopped at the cap (boot+run ${response.totalMs} ms, limits ${JSON.stringify(response.limits)})`,
 	);
 	return 0;
 }

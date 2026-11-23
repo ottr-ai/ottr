@@ -175,6 +175,11 @@ function walk(
 		`"${mRoot}/root")`,
 		`mkdir -p "${mRoot}/root/etc" "${mRoot}/root/tmp" "${mRoot}/root/home" "${mRoot}/root/proc" "${mRoot}/root/sys" "${mRoot}/root/dev" "${mRoot}/root/run"`,
 		";;",
+		// The guest kernel's sysfs always carries /sys/fs/cgroup for the cgroup2
+		// mount; the walk's plain temp dir does not, so the shim creates it.
+		`"${mRoot}/root/sys/fs/cgroup")`,
+		`mkdir -p "${mRoot}/root/sys/fs/cgroup"`,
+		";;",
 		"esac",
 		`echo "mount $*" >> '${log}'`,
 		"exit 0",
@@ -244,6 +249,15 @@ describe("ottr-vm-init mount walk", () => {
 			`mount --bind ${w.mRoot}/scratch/job ${w.mRoot}/root/job`,
 		])
 			expect(w.mounts).toContain(bind);
+		// The job cgroup exists: cgroup2 mounted at the root's /sys/fs/cgroup, the
+		// pids controller enabled on the subtree, the job cgroup created (OTTR-1225).
+		expect(w.mounts).toContain(
+			`mount -t cgroup2 none ${w.mRoot}/root/sys/fs/cgroup`,
+		);
+		expect(
+			readFileSync(`${w.mRoot}/root/sys/fs/cgroup/cgroup.subtree_control`, "utf8"),
+		).toBe("+pids\n");
+		expect(existsSync(`${w.mRoot}/root/sys/fs/cgroup/job`)).toBe(true);
 		// The skeleton writes happened for real, at the paths the binds need.
 		expect(readFileSync(`${w.mRoot}/root/etc/hosts`, "utf8")).toBe(
 			"127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n",
@@ -263,6 +277,8 @@ describe("ottr-vm-init mount walk", () => {
 			`upperdir=${w.mRoot}/scratch/upper,workdir=${w.mRoot}/scratch/work`,
 		);
 		expect(w.mounts).not.toContain("setup-upper");
+		// The job cgroup is a validate-mode control only.
+		expect(w.mounts).not.toContain("cgroup2");
 		expect(readFileSync(`${w.mRoot}/root/etc/hosts`, "utf8")).toContain("10.231.0.1\tottr");
 		expect(readFileSync(`${w.mRoot}/root/etc/resolv.conf`, "utf8")).toContain("nameserver");
 	});

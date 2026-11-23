@@ -33,10 +33,23 @@ import {
 	VM_VALIDATE,
 } from "./vmValidateShared.ts";
 
-/** The job path's prlimit prefix, rebuilt here so the test pins it without an export. */
-const prlimit = (nproc: number = VM_VALIDATE.maxProcesses): string[] => [
+/**
+ * The job path's wrapper argv for `argv`, rebuilt here so the tests pin it without
+ * an export (OTTR-1225): a root shell moves its own pid into the job's pids cgroup
+ * first, then drops to nobody with setpriv, then execs prlimit with the file
+ * rlimits. No RLIMIT_NPROC: that limit counts the shared uid's tasks on the whole
+ * host, not the job's.
+ */
+const jobWrapper = (argv: string[]): string[] => [
+	"sh",
+	"-c",
+	`echo "$$" > ${VM_VALIDATE.jobCgroup}/cgroup.procs && exec setpriv --reuid=${VM_VALIDATE.jobUser.uid} --regid=${VM_VALIDATE.jobUser.gid} --clear-groups prlimit --core=0 --fsize=${VM_VALIDATE.fileSizeBytes} -- "$0" "$@"`,
+	...argv,
+];
+
+/** The job path's rlimit prefix alone: what a host without the cgroup can spawn. */
+const hostPrefix = (): string[] => [
 	"prlimit",
-	`--nproc=${nproc}`,
 	"--core=0",
 	`--fsize=${VM_VALIDATE.fileSizeBytes}`,
 	"--",
@@ -110,23 +123,25 @@ const envText = (): string =>
 /**
  * The limits probe's stdout: every line the limits check reads back, at the limit
  * values. The limits table is the /proc/self/limits format the probe prints (head -30
- * of the file); `limit` defaults to the configured value so the check passes, and
+ * of the file); the process row is unlimited because the job path sets no
+ * RLIMIT_NPROC, `pids` defaults to the configured cap so the check passes, and
  * `memTotalKb` defaults to a reading inside the configured RAM band (MemTotal is
  * the RAM minus the kernel's reservation, as on a real guest).
  */
 const limitsText = (
-	limit: number = VM_VALIDATE.maxProcesses,
+	pids: string = String(VM_VALIDATE.maxProcesses),
 	memTotalKb: number = Math.floor(VM_VALIDATE.memMiB * 1024 * 0.96),
 ): string =>
 	[
 		"Limit                     Soft Limit           Hard Limit           Units",
 		"Max cpu time              unlimited            unlimited            seconds",
 		"Max file size             1073741824           1073741824           bytes",
-		`Max processes             ${limit}                  ${limit}                  processes`,
+		"Max processes             unlimited            unlimited            processes",
 		String(VM_VALIDATE.vcpus),
 		`MemTotal:       ${memTotalKb} kB`,
 		"Filesystem     1K-blocks    Used Available Use% Mounted on",
 		`/dev/vdc       ${Math.floor(VM_VALIDATE.diskBytes / 1024)} 0 ${Math.floor(VM_VALIDATE.diskBytes / 1024)} 0% /tmp`,
+		`pids=${pids}`,
 	].join("\n");
 
 interface SpawnCall {
@@ -142,10 +157,16 @@ interface SpawnCall {
  */
 function makeDeps(
 	opts: { overrides?: Partial<ValidateDeps>; spawnImpl?: JobSpawn } = {},
-): { deps: ValidateDeps; spawns: SpawnCall[] } {
+): {
+	deps: ValidateDeps;
+	spawns: SpawnCall[];
+	fsWrites: { path: string; content: string }[];
+} {
 	const spawns: SpawnCall[] = [];
+	/** The fs writes the flow made: the limits check's pids.max write lands here. */
+	const fsWrites: { path: string; content: string }[] = [];
 	const defaultSpawn: JobSpawn = (argv) => {
-		const inner = argv.slice(argv.indexOf("--") + 1);
+		const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
 		if (inner[0] === "env") return textProc(envText(), 0);
 		if (inner[0] === "sh") return textProc(limitsText(), 0);
 		return textProc("", 0);
@@ -158,6 +179,9 @@ function makeDeps(
 		fs: {
 			readFile: (path) => readFileSync(path),
 			lstat: (path) => lstatSync(path),
+			writeFile: (path, content) => {
+				fsWrites.push({ path, content });
+			},
 		},
 		// /dev/vdd does not exist in the test host: the default fakes a root-owned 0600
 		// node, so the medium-guard check passes unless a test overrides it.
@@ -192,16 +216,22 @@ function makeDeps(
 		collectTotalBytes: VM_VALIDATE.collectTotalBytes,
 		...opts.overrides,
 	};
-	return { deps, spawns };
+	return { deps, spawns, fsWrites };
 }
 
 /** A deps.fs whose readFile serves the job spec from memory (no real /job exists here). */
-const fsWithSpec = (spec: ValidateJobSpec): ValidateDeps["fs"] => ({
+const fsWithSpec = (
+	spec: ValidateJobSpec,
+	writes: { path: string; content: string }[] = [],
+): ValidateDeps["fs"] => ({
 	readFile: (path) => {
 		if (path === "/job/job.json") return Buffer.from(JSON.stringify(spec));
 		return readFileSync(path);
 	},
 	lstat: (path) => lstatSync(path),
+	writeFile: (path, content) => {
+		writes.push({ path, content });
+	},
 });
 
 function decodeResult(bytes: Uint8Array): ValidateResult {
@@ -288,7 +318,7 @@ describe("runSelfCheck", () => {
 	test("an env probe that prints an extra variable fails the env check", async () => {
 		const { deps } = makeDeps({
 			spawnImpl: (argv) => {
-				const inner = argv.slice(argv.indexOf("--") + 1);
+				const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
 				if (inner[0] === "env") return textProc(`${envText()}\nEXTRA=1`, 0);
 				if (inner[0] === "sh") return textProc(limitsText(), 0);
 				return textProc("", 0);
@@ -307,10 +337,13 @@ describe("runSelfCheck", () => {
 		// a passing result silent about its RAM.
 		const { deps } = makeDeps({
 			spawnImpl: (argv) => {
-				const inner = argv.slice(argv.indexOf("--") + 1);
+				const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
 				if (inner[0] === "env") return textProc(envText(), 0);
 				if (inner[0] === "sh")
-					return textProc(limitsText(VM_VALIDATE.maxProcesses, 493248), 0);
+					return textProc(
+						limitsText(String(VM_VALIDATE.maxProcesses), 493248),
+						0,
+					);
 				return textProc("", 0);
 			},
 		});
@@ -391,66 +424,126 @@ describe("runSelfCheck", () => {
 		}, MISSING_CONTROL.promotion);
 		await failing((deps) => {
 			deps.spawn = (argv) => {
-				const inner = argv.slice(argv.indexOf("--") + 1);
-				if (inner[0] === "sh") return textProc(limitsText(999), 0); // the limit reads back wrong
+				const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
+				if (inner[0] === "sh") return textProc(limitsText("999"), 0); // the cap reads back wrong
 				return textProc(inner[0] === "env" ? envText() : "", 0);
+			};
+		}, MISSING_CONTROL.limits);
+		await failing((deps) => {
+			// The coupling regression: a finite Max processes row means the job path
+			// set an RLIMIT_NPROC again, whose count is the shared uid's on the host.
+			deps.spawn = (argv) => {
+				const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
+				if (inner[0] === "sh")
+					return textProc(
+						limitsText().replace(
+							"Max processes             unlimited            unlimited            processes",
+							"Max processes             256                  256                  processes",
+						),
+						0,
+					);
+				return textProc(inner[0] === "env" ? envText() : "", 0);
+			};
+		}, MISSING_CONTROL.limits);
+		await failing((deps) => {
+			deps.fs.writeFile = () => {
+				throw new Error("no cgroup");
 			};
 		}, MISSING_CONTROL.limits);
 	});
 
-	test("the real limits probe reads back under this image's /bin/sh (dash)", async () => {
-		// The acceptance run: the exported probe argv, the job's prlimit prefix, and the
-		// real /bin/sh of the worker image the guest rootfs is built from — dash, which
-		// has no `ulimit -u`. Before the /proc/self/limits fix the chain died at
-		// `ulimit -u` with exit 2 and empty stdout, so every parsed field was null and
-		// this test failed. The prlimit prefix sets exactly the soft limit under test,
-		// so the first field must read it back; the other three fields must parse on
-		// this host, whose CPU count and memory differ from VM_VALIDATE's on purpose.
-		// Production drops to the job user (uid 65534) before the limit lands; this
-		// unprivileged run keeps its own uid, whose task count under parallel suites
-		// can exceed the job's 256 and kill the fork, so the soft limit here is a
-		// load-safe floor and the readback must name the value this run set. A soft
-		// limit above the inherited hard one is refused (EPERM), so the floor clamps
-		// to the hard cap this process carries, unlimited ones aside.
-		const maxProcessesRow = /^Max processes\s+\S+\s+(\S+)/m.exec(
-			readFileSync("/proc/self/limits", "utf8"),
-		);
-		const hardNproc = maxProcessesRow?.[1] ?? "";
-		const hardValue =
-			hardNproc === "" || hardNproc === "unlimited"
-				? Number.POSITIVE_INFINITY
-				: Number(hardNproc);
-		const nprocLimit = Math.min(
-			Number.isFinite(hardValue) ? hardValue : 50_000,
-			Math.max(VM_VALIDATE.maxProcesses, 50_000),
-		);
-		const proc = Bun.spawn(
-			[
-				"prlimit",
-				`--nproc=${nprocLimit}`,
-				"--core=0",
-				`--fsize=${VM_VALIDATE.fileSizeBytes}`,
-				"--",
-				...LIMITS_PROBE_ARGV,
-			],
-			{
+	test("the job still forks and passes while this uid owns more than 256 tasks", async () => {
+		// The OTTR-1163 acceptance: the gate runs as the project's shared uid, and
+		// other turns of the same project (Chrome, bun, Stryker) hold tasks of that
+		// uid on the same host. The job path must carry no RLIMIT_NPROC of its own —
+		// the kernel counts that limit per real uid over every container, so an
+		// absolute 256 fails the job's first fork whenever the shared uid is loaded.
+		// The cap lives in the guest's pids cgroup instead. This test holds more
+		// than 256 real tasks of this uid, then runs the job path's rlimit prefix
+		// (its host form: prlimit, no cgroup move, no setpriv) over the real limits
+		// probe and over a job that forks eight subshells. Both must fork and pass.
+		const holders: Bun.Subprocess<"ignore", "ignore", "ignore">[] = [];
+		try {
+			while (holders.length <= VM_VALIDATE.maxProcesses) {
+				holders.push(
+					Bun.spawn(["sleep", "120"], {
+						stdin: "ignore",
+						stdout: "ignore",
+						stderr: "ignore",
+					}),
+				);
+			}
+			// This process and the probe spawns themselves count too: the uid's task
+			// count is well above the job's 256 here.
+			expect(holders.length).toBeGreaterThan(VM_VALIDATE.maxProcesses);
+			const probe = Bun.spawn([...hostPrefix(), ...LIMITS_PROBE_ARGV], {
 				stdout: "pipe",
 				stderr: "pipe",
-			},
-		);
-		const stdout = await new Response(proc.stdout).text();
-		const stderr = await new Response(proc.stderr).text();
-		const exitCode = await proc.exited;
-		expect(exitCode).toBe(0);
-		expect(stderr).toBe("");
-		const readback = parseLimitsReadback(stdout);
-		expect(readback.nprocLimit).toBe(String(nprocLimit));
-		expect(readback.cpus).not.toBeNull();
-		expect(readback.memKb).not.toBeNull();
-		// scratchKb is deliberately not asserted here: a host's /tmp can sit on the
-		// overlay root, whose df data line names no /dev/ device, so the parser's
-		// null is correct there. The guest's /tmp is the /dev/vdc scratch ext4, and
-		// the fixture tests cover that line's parsing.
+			});
+			const stdout = await new Response(probe.stdout).text();
+			const stderr = await new Response(probe.stderr).text();
+			expect(await probe.exited).toBe(0);
+			expect(stderr).toBe("");
+			const readback = parseLimitsReadback(stdout);
+			expect(readback.cpus).not.toBeNull();
+			expect(readback.memKb).not.toBeNull();
+			// scratchKb is deliberately not asserted here: a host's /tmp can sit on the
+			// overlay root, whose df data line names no /dev/ device, so the parser's
+			// null is correct there. The guest's /tmp is the /dev/vdc scratch ext4, and
+			// the fixture tests cover that line's parsing. The probe's pids line names
+			// nothing on a host without the job cgroup, which the parser reads as null.
+			expect(readback.pidsMax).toBeNull();
+			const job = Bun.spawn(
+				[
+					...hostPrefix(),
+					"sh",
+					"-c",
+					// Eight forks that outlive no pipe: each child is fully detached, so
+					// the shell's stdout closes at its own exit. A failed fork makes dash
+					// print to stderr, which the assertion below refuses.
+					'i=0; while [ "$i" -lt 8 ]; do sleep 30 </dev/null >/dev/null 2>&1 & i=$((i+1)); done; echo "forked=$i"; exit 0',
+				],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			const jobOut = (await new Response(job.stdout).text()).trim();
+			const jobErr = await new Response(job.stderr).text();
+			expect(jobErr).toBe("");
+			expect(await job.exited).toBe(0);
+			expect(jobOut).toBe("forked=8");
+		} finally {
+			for (const holder of holders) holder.kill();
+		}
+	}, 60_000);
+
+	test("the limits check writes the pids cap before the probe reads it back", async () => {
+		const { deps, fsWrites } = makeDeps();
+		const { selfCheck, missingControl } = await runSelfCheck(deps);
+		expect(missingControl).toBeNull();
+		expect(selfCheck.ok).toBe(true);
+		const cap = `${VM_VALIDATE.jobCgroup}/pids.max`;
+		expect(fsWrites).toContainEqual({
+			path: cap,
+			content: String(VM_VALIDATE.maxProcesses),
+		});
+	});
+});
+
+describe("parseLimitsReadback", () => {
+	test("reads the pids cap, an unlimited process row, and the host fields", () => {
+		const readback = parseLimitsReadback(limitsText());
+		expect(readback.pidsMax).toBe(String(VM_VALIDATE.maxProcesses));
+		expect(readback.nprocLimit).toBeNull();
+		expect(readback.cpus).toBe(String(VM_VALIDATE.vcpus));
+		expect(readback.memKb).toBe(524288);
+	});
+
+	test("reads a 'max' cap and misses a failed or empty pids read", () => {
+		expect(parseLimitsReadback(limitsText("max")).pidsMax).toBe("max");
+		// An empty read (`cat` failed, the echo still printed) parses as null.
+		expect(parseLimitsReadback(limitsText("")).pidsMax).toBeNull();
+		// The pids line never collides with nproc's bare-number output.
+		const readback = parseLimitsReadback(limitsText());
+		expect(readback.cpus).toBe(String(VM_VALIDATE.vcpus));
 	});
 });
 
@@ -507,6 +600,7 @@ describe("promoteArtifacts", () => {
 						readFile: (path) =>
 							readFileSync(join(scratch, path.replace(/^\//, ""))),
 						lstat: (path) => lstatSync(join(scratch, path.replace(/^\//, ""))),
+						writeFile: () => {},
 					},
 				},
 			});
@@ -550,6 +644,7 @@ describe("promoteArtifacts", () => {
 						readFile: (path) =>
 							readFileSync(join(scratch, path.replace(/^\//, ""))),
 						lstat: (path) => lstatSync(join(scratch, path.replace(/^\//, ""))),
+						writeFile: () => {},
 					},
 					collectFileBytes: 8,
 					collectTotalBytes: 10,
@@ -715,12 +810,11 @@ describe("runValidationMode", () => {
 		);
 		expect(jobSpawns).toHaveLength(1);
 		const call = jobSpawns[0]!;
-		expect(call.argv.slice(0, 5)).toEqual(prlimit());
-		expect(Object.keys(call.opts.env).sort()).toEqual(["HOME", "LANG", "PATH"]);
-		expect(call.opts.env).toEqual(buildJobEnv());
-		expect(call.opts.cwd).toBe("/target");
-		expect(call.opts.uid).toBe(VM_VALIDATE.jobUser.uid);
-		expect(call.opts.gid).toBe(VM_VALIDATE.jobUser.gid);
+		expect(call.argv).toEqual(jobWrapper(["bun", "test", "src/parse.ts"]));
+		// The exact spawn options: no uid and no gid, because the wrapper is spawned
+		// with the agent's root and drops to the job user itself, after it moved into
+		// the job cgroup.
+		expect(call.opts).toEqual({ cwd: "/target", env: buildJobEnv() });
 	});
 
 	test("a timed-out job still carries its outcome in the result", async () => {
@@ -729,7 +823,7 @@ describe("runValidationMode", () => {
 		const written: Uint8Array[] = [];
 		const { deps } = makeDeps({
 			spawnImpl: (argv) => {
-				const inner = argv.slice(argv.indexOf("--") + 1);
+				const inner = argv.slice(3); // the wrapper argv: "sh", "-c", script, then the job argv
 				if (inner[0] === "env" || inner[0] === "sh")
 					return textProc(inner[0] === "env" ? envText() : limitsText(), 0);
 				const proc = hangingProc(4242);
@@ -763,6 +857,7 @@ describe("runValidationMode", () => {
 				fs: {
 					readFile: () => Buffer.from("{ not json"),
 					lstat: (path) => lstatSync(path),
+					writeFile: () => {},
 				},
 				writeResult: async (bytes) => {
 					written.push(bytes);
@@ -789,6 +884,7 @@ describe("runValidationMode", () => {
 						throw new Error("no medium");
 					},
 					lstat: (path) => lstatSync(path),
+					writeFile: () => {},
 				},
 				writeResult: async (bytes) => {
 					written.push(bytes);
@@ -809,6 +905,7 @@ describe("runValidationMode", () => {
 						throw new Error("no medium");
 					},
 					lstat: (path) => lstatSync(path),
+					writeFile: () => {},
 				},
 				writeResult: async () => {
 					throw new Error("drive gone");

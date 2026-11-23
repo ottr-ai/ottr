@@ -192,6 +192,19 @@ mount -t devpts -o gid=5,mode=0620,ptmxmode=0666 devpts "$r/dev/pts" || die "can
 mount -t tmpfs -o mode=1777 shm "$r/dev/shm" || die "cannot mount /dev/shm"
 mount -t tmpfs -o mode=0755 run "$r/run" || die "cannot mount /run"
 
+# The job's process cap is a pids cgroup, not RLIMIT_NPROC: the kernel counts
+# RLIMIT_NPROC per real uid over every container on the host, and all turns of a
+# project share one uid, so a cap there fails the job's first fork whenever other
+# turns of the project run (OTTR-1163, OTTR-1225). The pids controller counts only
+# the tasks in the job's own cgroup. Init only makes the controller exist; the
+# agent writes the cap (pids.max) and the job wrapper moves into the cgroup. Any
+# failure here stops the VM before a job can run without the limit.
+if [ "$mode" = validate ]; then
+	mount -t cgroup2 none "$r/sys/fs/cgroup" || die "cannot mount cgroup2"
+	echo +pids > "$r/sys/fs/cgroup/cgroup.subtree_control" || die "cannot enable the pids controller"
+	mkdir "$r/sys/fs/cgroup/job" || die "cannot create the job cgroup"
+fi
+
 if [ "$mode" = validate ]; then
 	# The scratch binds are the job's whole writable world: /tmp, the job home, /work, and
 	# /job with the job spec. Everything else rejects writes (lower-only overlay), and

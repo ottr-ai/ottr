@@ -6,9 +6,12 @@ import type { SandboxJobOptions } from "../src/sandboxRun.ts";
 import { type ValidateResponse, VM_VALIDATE } from "../src/vmValidateShared.ts";
 import {
 	acceptanceViolations,
+	bombArgv,
+	bombViolations,
 	expectedEnvNames,
 	main,
 	parseAttempts,
+	parseBomb,
 	probeArgv,
 	type SmokeDeps,
 } from "./vm-validate-smoke.ts";
@@ -190,6 +193,77 @@ describe("acceptanceViolations", () => {
 	});
 });
 
+/** The probe result and the bomb result share a runner; dispatch by the bomb's argv. */
+const isBomb = (o: SandboxJobOptions): boolean =>
+	o.argv.join(" ").includes("ottr-bomb-count");
+
+/** A bomb result whose self-check held and whose outer shell reported `forked`. */
+const heldBombResult = (forked: string): ValidateResponse =>
+	heldResult({
+		job: {
+			argv: bombArgv(),
+			cwd: "/target",
+			exitCode: 0,
+			signal: null,
+			timedOut: false,
+			stdoutTail: `FORKED=${forked}\n`,
+			stderrTail: "",
+		},
+	});
+
+describe("bombArgv", () => {
+	test("forks detached sleeps and reports the count from the scratch file", () => {
+		const argv = bombArgv();
+		expect(argv[0]).toBe("sh");
+		const script = argv[2] ?? "";
+		expect(script).toContain("ottr-bomb-count");
+		// The child forks are fully detached, so a failed fork (the pids cap) kills
+		// only the inner shell and the outer still prints the last recorded count.
+		expect(script).toContain("sleep 30 </dev/null >/dev/null 2>&1 &");
+		expect(script).toContain('echo "FORKED=$(cat /tmp/ottr-bomb-count');
+	});
+});
+
+describe("parseBomb", () => {
+	test("reads the FORKED line and misses everything else", () => {
+		expect(parseBomb("FORKED=254\n")).toBe(254);
+		expect(parseBomb("FORKED=2000\n")).toBe(2000);
+		expect(parseBomb("sh: 1: Cannot fork\n")).toBeNull();
+		expect(parseBomb("FORKED=\n")).toBeNull();
+	});
+});
+
+describe("bombViolations", () => {
+	test("a bomb stopped at or under the cap has no violations", () => {
+		expect(bombViolations(heldBombResult("254"))).toEqual([]);
+		expect(bombViolations(heldBombResult("1"))).toEqual([]);
+	});
+
+	test("a past-cap bomb, a missing report, a failed self-check and a bad exit violate", () => {
+		const past = bombViolations(heldBombResult("2000"));
+		expect(past).toEqual([
+			"the job forked 2000 times past the 256 cap: the pids limit is not live",
+		]);
+		const silent = heldBombResult("254");
+		if (!silent.job) throw new Error("fixture lost its job");
+		silent.job.stdoutTail = "";
+		expect(bombViolations(silent)).toEqual([
+			"the fork bomb never reported its count",
+		]);
+		const failed = heldBombResult("254");
+		failed.selfCheck = { ok: false, checks: [] };
+		failed.missingControl = "resource limits";
+		expect(bombViolations(failed)).toEqual([
+			"the guest self-check did not pass",
+			"missing control: resource limits",
+		]);
+		const crashed = heldBombResult("254");
+		if (!crashed.job) throw new Error("fixture lost its job");
+		crashed.job.exitCode = 2;
+		expect(bombViolations(crashed)).toEqual(["the fork bomb exited 2"]);
+	});
+});
+
 describe("main", () => {
 	type Runner = NonNullable<SmokeDeps["runner"]>;
 	const lines = (argv: string[], runner: Runner) => {
@@ -200,13 +274,18 @@ describe("main", () => {
 	};
 
 	test("a held run exits 0 and prints every attempt", async () => {
-		const { code, out } = lines([], async () => ({
+		const { code, out } = lines([], async (o) => ({
 			ok: true,
-			result: heldResult(),
+			result: isBomb(o) ? heldBombResult("254") : heldResult(),
 		}));
 		expect(await code()).toBe(0);
 		expect(out.join("\n")).toContain("ATTEMPT network: blocked");
-		expect(out.join("\n")).toContain("PASS: every control held");
+		expect(out.join("\n")).toContain(
+			"fork-bomb: stopped after 254 forks (cap 256)",
+		);
+		expect(out.join("\n")).toContain(
+			"PASS: every control held and the fork bomb stopped at the cap",
+		);
 	});
 
 	test("an allowed attempt exits 1 and names the leak", async () => {
@@ -253,7 +332,10 @@ describe("main", () => {
 			],
 			async (o: SandboxJobOptions) => {
 				seen = { ...o };
-				return { ok: true, result: heldResult() };
+				return {
+					ok: true,
+					result: isBomb(o) ? heldBombResult("254") : heldResult(),
+				};
 			},
 		);
 		expect(await code()).toBe(0);
@@ -263,6 +345,31 @@ describe("main", () => {
 			checkout: "/workspace/demo",
 			env: { OTTR_VM_RUNNER_URL: "http://r:1", OTTR_WORKER_TOKEN: "tok" },
 		});
+	});
+
+	test("a bomb past the cap exits 1 and names the leak", async () => {
+		const { code, out } = lines([], async (o) => ({
+			ok: true,
+			result: isBomb(o) ? heldBombResult("2000") : heldResult(),
+		}));
+		expect(await code()).toBe(1);
+		expect(out.join("\n")).toContain(
+			"FAIL: the job forked 2000 times past the 256 cap: the pids limit is not live",
+		);
+	});
+
+	test("a bomb that never reports exits 1", async () => {
+		const silent = heldBombResult("254");
+		if (!silent.job) throw new Error("fixture lost its job");
+		silent.job.stdoutTail = "nothing\n";
+		const { code, out } = lines([], async (o) => ({
+			ok: true,
+			result: isBomb(o) ? silent : heldResult(),
+		}));
+		expect(await code()).toBe(1);
+		expect(out.join("\n")).toContain(
+			"FAIL: the fork bomb never reported its count",
+		);
 	});
 });
 
