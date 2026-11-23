@@ -25,7 +25,7 @@ appendFileSync(process.env.OTTR_ENV_PROBE_LOG, JSON.stringify({
   noninteractive: process.env.DEBIAN_FRONTEND === "noninteractive",
 }) + "\\n");
 if (command === "python3") {
-  const bin = join(args[2], "bin");
+  const bin = join(args[args.indexOf("venv") + 1], "bin");
   mkdirSync(bin, { recursive: true });
   copyFileSync(process.argv[1], join(bin, "pip"));
   chmodSync(join(bin, "pip"), 0o755);

@@ -10,6 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import fc from "fast-check";
+import { childDatabaseEnv } from "./childEnv.ts";
 import {
 	ensureProjectPython,
 	ensurePython,
@@ -39,6 +40,25 @@ const freshHome = (): string => {
 const provision = (project: string, text: string, h = home): void => {
 	mkdirSync(join(h, ".ottr", "workers", project), { recursive: true });
 	writeFileSync(requirementsListPath(project, h), text);
+};
+
+/** This interpreter's user site under this HOME — the path a child with this HOME reads; creates it. */
+const pythonUserSite = (home: string): string => {
+	const p = Bun.spawnSync(
+		["python3", "-c", "import site; print(site.getusersitepackages())"],
+		{
+			env: { ...childDatabaseEnv(), HOME: home },
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	if (p.exitCode !== 0)
+		throw new Error(`python3 site probe failed: ${p.stderr.toString().trim()}`);
+	const dir = p.stdout.toString().trim();
+	if (dir === "")
+		throw new Error("python3 site probe printed no user site path");
+	mkdirSync(dir, { recursive: true });
+	return dir;
 };
 
 const A64 = "a".repeat(64);
@@ -247,6 +267,46 @@ describe("ensurePython", () => {
 		expect(await ensurePython(reqs, h, run)).toEqual([]);
 		expect(calls).toEqual([]);
 	});
+
+	// The one stub-free case: the real python3 build proves the live path. A .pth file in
+	// the shared home's user site must never execute while the venv builds (OTTR-1023).
+	test("a build never reads the HOME user site", async () => {
+		const h = freshHome();
+		const shared = freshHome();
+		const canary = join(shared, "canary-was-here");
+		writeFileSync(
+			join(pythonUserSite(shared), "zz-marker.pth"),
+			`import os; os.path.exists(${JSON.stringify(canary)}) or open(${JSON.stringify(canary)}, "w").write("ran")\n`,
+		);
+		// Control: the pre-fix env shape (HOME at the shared home, plain python3) runs the
+		// marker. If this fails, the sink itself is gone and the drill proves nothing.
+		const control = Bun.spawnSync(["python3", "-c", "pass"], {
+			env: { ...childDatabaseEnv(), HOME: shared },
+			stdout: "ignore",
+			stderr: "pipe",
+		});
+		expect(control.exitCode).toBe(0);
+		expect(existsSync(canary)).toBe(true);
+		rmSync(canary);
+		// The build inherits HOME=<shared> through the process env, yet exec pins HOME to
+		// the board home and runs python3 isolated, so the marker never runs. The fake
+		// hash pins pip's failure to after the venv step, offline and online alike.
+		const real = process.env.HOME;
+		process.env.HOME = shared;
+		let err: Error | null = null;
+		try {
+			await ensurePython(
+				parseRequirements(`idna==3.10 --hash=sha256:${A64}\n`),
+				h,
+			);
+		} catch (e) {
+			err = e as Error;
+		} finally {
+			process.env.HOME = real;
+		}
+		expect(err?.message).toContain("pip install");
+		expect(existsSync(canary)).toBe(false);
+	}, 60_000);
 });
 
 describe("pythonPathFor", () => {

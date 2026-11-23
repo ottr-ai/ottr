@@ -36,7 +36,10 @@ A project declares its Python packages once; both homes install the same set.
    turn; the server builds into the board home before each server-side turn
    (merge turn, work turn with no worker, retro and board checks). The build is
    `python3 -m venv` plus `pip install --no-cache-dir --require-hashes -r`
-   against a staged copy of the merged list. The build runs in a temp dir and
+   against a staged copy of the merged list. The build spawn pins HOME to the
+   building home. The base `python3` runs isolated (`-I`,
+   `PYTHONNOUSERSITE=1`), so nothing from a shared home's user site starts
+   with the build (R5-1). The build runs in a temp dir and
    moves in with one rename, keyed by the hash, so a rerun is a no-op and a
    failed build leaves nothing behind. The project's lines win over `_all`
    lines for the same package name.

@@ -151,12 +151,20 @@ export function pythonPathDir(project: string, home = homedir()): string {
 	);
 }
 
-type Exec = (argv: string[]) => Promise<string>;
+type Exec = (argv: string[], home: string) => Promise<string>;
 
 /** stdout; throws with the stderr tail on a non-zero exit. */
-async function exec(argv: string[]): Promise<string> {
-	const p = Bun.spawn(argv, {
-		env: childDatabaseEnv(),
+async function exec(argv: string[], home: string): Promise<string> {
+	// The server container mounts the worker-shared home volume at /root (docker-compose), so
+	// the inherited HOME is worker-writable and any .pth file planted there would execute at
+	// every interpreter startup. Pin HOME to the building home and keep the base interpreter
+	// isolated (-I implies -s: no user site, and -E: no PYTHON* env vars reach startup);
+	// PYTHONNOUSERSITE=1 covers the venv's pip run too, whose shebang interpreter takes no -I.
+	const env = { ...childDatabaseEnv(), HOME: home, PYTHONNOUSERSITE: "1" };
+	const isolated =
+		argv[0] === "python3" ? [argv[0], "-I", ...argv.slice(1)] : argv;
+	const p = Bun.spawn(isolated, {
+		env,
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -236,16 +244,19 @@ async function buildVenv(
 		const staged = join(tmp, "requirements.txt");
 		writeFileSync(staged, canonical(lines));
 		const venv = join(tmp, "venv");
-		await run(["python3", "-m", "venv", venv]);
-		await run([
-			join(venv, "bin", "pip"),
-			"install",
-			"--no-cache-dir",
-			"--disable-pip-version-check",
-			"--require-hashes",
-			"-r",
-			staged,
-		]);
+		await run(["python3", "-m", "venv", venv], home);
+		await run(
+			[
+				join(venv, "bin", "pip"),
+				"install",
+				"--no-cache-dir",
+				"--disable-pip-version-check",
+				"--require-hashes",
+				"-r",
+				staged,
+			],
+			home,
+		);
 		try {
 			renameSync(venv, target);
 		} catch (err) {
