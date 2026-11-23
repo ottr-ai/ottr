@@ -283,54 +283,79 @@ export class UpdateHostController {
 		reply: UpdateHostReply,
 		allowStart: boolean,
 		cycle: HostCycle | null,
-		phase: UpdateHostHeartbeat["phase"],
-		requestId: string | null,
+		heartbeat: UpdateHostHeartbeat,
 	): void {
 		this.registered = true;
 		this.startupConflictAt = null;
 		if (this.error === BOARD_UNAVAILABLE) this.error = null;
 		this.refresh(reply.runningCommit);
 		if (cycle === null) {
-			if (
-				allowStart &&
-				reply.requestId !== null &&
-				!this.completed.has(reply.requestId)
-			)
-				this.cycle = {
-					requestId: reply.requestId,
-					phase: "pending",
-					acknowledged: false,
-				};
+			this.cycle = this.startCycle(reply, allowStart);
 			return;
 		}
 		if (!allowStart && cycle.phase === "pending") return;
-		if (phase === "idle" && reply.requestId === null) {
+		this.settleCycle(reply, allowStart, cycle, heartbeat);
+	}
+
+	/** A reply starts a cycle only when starting is allowed and its request is new. */
+	private startCycle(
+		reply: UpdateHostReply,
+		allowStart: boolean,
+	): HostCycle | null {
+		if (
+			!allowStart ||
+			reply.requestId === null ||
+			this.completed.has(reply.requestId)
+		)
+			return null;
+		return {
+			requestId: reply.requestId,
+			phase: "pending",
+			acknowledged: false,
+		};
+	}
+
+	/** Settle a live cycle: drop it, adopt a request, acknowledge it, or rearm it. */
+	private settleCycle(
+		reply: UpdateHostReply,
+		allowStart: boolean,
+		cycle: HostCycle,
+		heartbeat: UpdateHostHeartbeat,
+	): void {
+		if (heartbeat.phase === "idle" && reply.requestId === null) {
 			this.cycle = null;
 		} else if (cycle.requestId === null && reply.requestId !== null) {
-			if (this.completed.has(reply.requestId)) {
-				if (cycle.phase === "pending") this.cycle = null;
-				return;
-			}
-			cycle.requestId = reply.requestId;
-			cycle.acknowledged = false;
-			if (cycle.phase !== "pending") this.completed.add(reply.requestId);
+			this.adoptRequest(cycle, reply.requestId);
 		} else if (
-			phase === "running" &&
-			requestId === cycle.requestId &&
-			reply.requestId === requestId
+			heartbeat.phase === "running" &&
+			heartbeat.requestId === cycle.requestId &&
+			reply.requestId === heartbeat.requestId
 		) {
 			cycle.acknowledged = true;
 			if (allowStart) this.launch();
-		} else if (phase === "idle" && reply.requestId === cycle.requestId) {
+		} else if (
+			heartbeat.phase === "idle" &&
+			reply.requestId === cycle.requestId
+		) {
 			cycle.acknowledged = false;
 		}
+	}
+
+	/** A pending cycle drops a completed request; a running one records the id. */
+	private adoptRequest(cycle: HostCycle, requestId: string): void {
+		if (this.completed.has(requestId)) {
+			if (cycle.phase === "pending") this.cycle = null;
+			return;
+		}
+		cycle.requestId = requestId;
+		cycle.acknowledged = false;
+		if (cycle.phase !== "pending") this.completed.add(requestId);
 	}
 
 	/** The loop calls this serially. A child and git refresh never block a heartbeat. */
 	async poll(allowStart = true): Promise<void> {
 		if (this.cycle?.phase === "running") this.advanceSchedule(this.deps.now());
-		const scheduled =
-			allowStart && this.deps.now() >= this.nextCycleAt && this.cycle === null;
+		const scheduled = this.startDue(allowStart);
 		if (scheduled)
 			this.cycle = {
 				requestId: null,
@@ -339,34 +364,50 @@ export class UpdateHostController {
 			};
 		// Attribute an awaited reply to its cycle, even if the child exits first.
 		const cycle = this.cycle;
+		const heartbeat = this.heartbeat(cycle);
+		let reply: UpdateHostReply | null = null;
+		try {
+			reply = await this.deps.post(heartbeat);
+		} catch (error) {
+			if (this.conflictRetry(error)) return;
+			// Do not expose Docker output or exception text in board status.
+			if (this.error === null) this.error = BOARD_UNAVAILABLE;
+		}
+		if (reply !== null) this.acceptReply(reply, allowStart, cycle, heartbeat);
+		// An explicit conflict blocks fallback until the board accepts this controller.
+		if (scheduled && reply === null && this.startupConflictAt === null)
+			this.launch();
+	}
+
+	/** A cycle may start only when starting is allowed, the schedule is due, and none runs. */
+	private startDue(allowStart: boolean): boolean {
+		return (
+			allowStart && this.deps.now() >= this.nextCycleAt && this.cycle === null
+		);
+	}
+
+	/** The heartbeat reports a finished, fully acknowledged cycle as idle. */
+	private heartbeat(cycle: HostCycle | null): UpdateHostHeartbeat {
 		const completing =
 			cycle?.phase === "finished" &&
 			(cycle.requestId === null || cycle.acknowledged);
 		const phase = cycle === null || completing ? "idle" : "running";
 		const requestId = phase === "running" ? (cycle?.requestId ?? null) : null;
-		let reply: UpdateHostReply | null = null;
-		try {
-			reply = await this.deps.post({
-				controller: this.controller,
-				nextCycleAt: this.nextCycleAt,
-				phase,
-				requestId,
-				error: this.error,
-				available: this.available,
-			});
-		} catch (error) {
-			if (error instanceof UpdateHostConflictError) {
-				if (!this.retryStartupConflict()) throw error;
-				return;
-			}
-			// Do not expose Docker output or exception text in board status.
-			if (this.error === null) this.error = BOARD_UNAVAILABLE;
-		}
-		if (reply !== null)
-			this.acceptReply(reply, allowStart, cycle, phase, requestId);
-		// An explicit conflict blocks fallback until the board accepts this controller.
-		if (scheduled && reply === null && this.startupConflictAt === null)
-			this.launch();
+		return {
+			controller: this.controller,
+			nextCycleAt: this.nextCycleAt,
+			phase,
+			requestId,
+			error: this.error,
+			available: this.available,
+		};
+	}
+
+	/** A startup conflict inside its retry window ends the poll; past the window it rethrows. */
+	private conflictRetry(error: unknown): boolean {
+		if (!(error instanceof UpdateHostConflictError)) return false;
+		if (!this.retryStartupConflict()) throw error;
+		return true;
 	}
 
 	get running(): boolean {

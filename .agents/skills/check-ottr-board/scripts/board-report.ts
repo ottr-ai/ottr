@@ -110,63 +110,91 @@ const SIGNS: [RegExp, string][] = [
 	[/^Prompt gate:/, "prompt gate: collect the questions for the user"],
 ];
 
-export function verdict(c: Card, f: Facts): { verdict: string; note: string } {
-	const r = c.needsReason ?? "";
-	if (c.state === "needs_you") {
-		if ((c.asked?.length ?? 0) > 0) return { verdict: "question", note: "" };
-		if (APPROVAL.some((re) => re.test(r)))
-			return { verdict: "decision", note: "" };
-		if (WAITS.some((re) => re.test(r)))
-			return {
-				verdict: "waits",
-				note: "resumes on the condition in its reason",
-			};
+/** A verdict table cell: the verdict word and its note. */
+type Verdict = { verdict: string; note: string };
+
+/** True when t runs or prepares, the two live states of a turn. */
+const runsOrPrepares = (t: Card) =>
+	t.state === "running" || t.state === "preparing";
+
+/** The needs_you branch: question when the card asks, decision on the APPROVAL table,
+ * waits on the WAITS table, stuck with the first matching SIGNS hint otherwise. */
+function needsYouVerdict(c: Card, r: string): Verdict {
+	if ((c.asked?.length ?? 0) > 0) return { verdict: "question", note: "" };
+	if (APPROVAL.some((re) => re.test(r)))
+		return { verdict: "decision", note: "" };
+	if (WAITS.some((re) => re.test(r)))
+		return {
+			verdict: "waits",
+			note: "resumes on the condition in its reason",
+		};
+	return {
+		verdict: "stuck",
+		note: SIGNS.find(([re]) => re.test(r))?.[1] ?? "unknown sign: diagnose",
+	};
+}
+
+/** The running/preparing branch: stuck when the log is idle past the limit. */
+function runningVerdict(logAgeS: number | null): Verdict {
+	if (logAgeS !== null && logAgeS > IDLE_LIMIT_S)
 		return {
 			verdict: "stuck",
-			note: SIGNS.find(([re]) => re.test(r))?.[1] ?? "unknown sign: diagnose",
+			note: `log idle ${Math.round(logAgeS / 60)} min`,
 		};
-	}
-	if (c.state === "running" || c.state === "preparing") {
-		if (f.logAgeS !== null && f.logAgeS > IDLE_LIMIT_S)
-			return {
-				verdict: "stuck",
-				note: `log idle ${Math.round(f.logAgeS / 60)} min`,
-			};
-		return {
-			verdict: "OK",
-			note: f.logAgeS === null ? "no log yet" : `log ${f.logAgeS}s old`,
-		};
-	}
-	if (c.state === "queued") {
-		const hu = c.holdUntil;
-		// The scheduler runs one merge per project (mergeSlot returns null while a
-		// merge turn runs), so a queued merge waits for it by design.
-		const runsMerge =
-			c.stage === "merging"
-				? f.cards.find(
-						(t) =>
-							t.id !== c.id &&
-							t.cancelledAt === null &&
-							t.project === c.project &&
-							t.stage === "merging" &&
-							(t.state === "running" || t.state === "preparing"),
-					)
-				: undefined;
-		const holds = [
-			f.drain && "drain",
-			f.capFull && "cap full",
-			f.depsOpen.length > 0 && `waits for ${f.depsOpen.join(",")}`,
-			hu !== null &&
-				hu !== undefined &&
-				hu > f.now &&
-				`holdUntil ${new Date(hu).toISOString()}`,
-			f.hold,
-			runsMerge && `a merge runs: ${runsMerge.id}`,
-		].filter(Boolean);
-		return holds.length > 0
-			? { verdict: "OK", note: holds.join("; ") }
-			: { verdict: "check", note: "queued with no hold found" };
-	}
+	return {
+		verdict: "OK",
+		note: logAgeS === null ? "no log yet" : `log ${logAgeS}s old`,
+	};
+}
+
+/** True when t is another merge turn of c's project that runs or prepares. */
+function otherRunningMerge(c: Card, t: Card): boolean {
+	return (
+		t.id !== c.id &&
+		t.cancelledAt === null &&
+		t.project === c.project &&
+		t.stage === "merging" &&
+		runsOrPrepares(t)
+	);
+}
+
+/** Every hold that keeps the queued card waiting, in note order. An empty list
+ * means no hold explains the wait. */
+function queuedHolds(c: Card, f: Facts): string[] {
+	const hu = c.holdUntil;
+	// The scheduler runs one merge per project (mergeSlot returns null while a
+	// merge turn runs), so a queued merge waits for it by design.
+	const runsMerge =
+		c.stage === "merging"
+			? f.cards.find((t) => otherRunningMerge(c, t))
+			: undefined;
+	return [
+		f.drain && "drain",
+		f.capFull && "cap full",
+		f.depsOpen.length > 0 && `waits for ${f.depsOpen.join(",")}`,
+		hu !== null &&
+			hu !== undefined &&
+			hu > f.now &&
+			`holdUntil ${new Date(hu).toISOString()}`,
+		f.hold,
+		runsMerge && `a merge runs: ${runsMerge.id}`,
+	].filter((h): h is string => Boolean(h));
+}
+
+/** The queued branch: OK with the hold notes when a hold explains the wait, check
+ * when none does. */
+function queuedVerdict(c: Card, f: Facts): Verdict {
+	const holds = queuedHolds(c, f);
+	return holds.length > 0
+		? { verdict: "OK", note: holds.join("; ") }
+		: { verdict: "check", note: "queued with no hold found" };
+}
+
+export function verdict(c: Card, f: Facts): { verdict: string; note: string } {
+	const r = c.needsReason ?? "";
+	if (c.state === "needs_you") return needsYouVerdict(c, r);
+	if (runsOrPrepares(c)) return runningVerdict(f.logAgeS);
+	if (c.state === "queued") return queuedVerdict(c, f);
 	if (
 		c.stage === "merging" &&
 		c.state === "idle" &&
@@ -235,6 +263,78 @@ const ORDER: Record<string, number> = {
 const cell = (x: string) =>
 	x.replaceAll("|", "/").replaceAll("\n", " ").slice(0, 140);
 
+/** One report table row before rendering: the card and its verdict. */
+type Row = { c: Card; v: Verdict };
+
+/** The table's sort: verdict order (ORDER, unknown verdicts as OK), then card id. */
+const byVerdictThenId = (a: Row, b: Row) =>
+	(ORDER[a.v.verdict] ?? 5) - (ORDER[b.v.verdict] ?? 5) ||
+	a.c.id.localeCompare(b.c.id);
+
+/** The card's log age in seconds, null when the card has no log file yet. */
+function logAgeSeconds(c: Card, now: number): number | null {
+	const log = `/data/${c.project}/logs/${c.id}.log`;
+	return existsSync(log)
+		? Math.round((now - statSync(log).mtimeMs) / 1000)
+		: null;
+}
+
+/** mergeHold's hold for the merging card c, null for other cards or when mergeHold
+ * answers null, an error note in place of the hold when mergeHold throws. */
+function mergeHoldFor(
+	c: Card,
+	tasks: Card[],
+	mergeHold: MergeHold | null,
+): string | null {
+	if (mergeHold === null || c.stage !== "merging") return null;
+	const sameProject = tasks.filter((t) => t.project === c.project);
+	try {
+		return mergeHold(sameProject, c);
+	} catch (e) {
+		return `hold unknown: ${String(e).slice(0, 80)}`;
+	}
+}
+
+/** The card's dependencies that are neither done nor cancelled, unknown ids included. */
+function openDeps(c: Card, byId: Map<string, Card>): string[] {
+	return (c.dependsOn ?? []).filter((d) => {
+		const t = byId.get(d);
+		return t === undefined || (t.stage !== "done" && t.cancelledAt === null);
+	});
+}
+
+/** One numbered asked question, options rendered as [a | b] with the recommended
+ * one starred. */
+function askedLine(q: Asked, i: number): string {
+	const options = q.options?.length
+		? ` [${q.options
+				.map((o, j) => (j === q.recommended ? "*" : "") + (o.label ?? ""))
+				.join(" | ")}]`
+		: "";
+	return `${i + 1}. ${q.question}${options}`;
+}
+
+/** The checkout line for one project: gitless note, git failure, or branch status. */
+function checkoutLine(p: Project): string {
+	if (p.gitless) return `- ${p.name}: gitless`;
+	const r = Bun.spawnSync([
+		"git",
+		"-C",
+		p.path,
+		"status",
+		"--porcelain",
+		"--branch",
+	]);
+	if (r.exitCode !== 0)
+		return `- ${p.name}: git status failed: ${r.stderr.toString().trim().slice(0, 120)}`;
+	const [head, ...files] = r.stdout.toString().trim().split("\n");
+	if (head === undefined) return `- ${p.name}: clean`;
+	const flag = AHEAD.test(head)
+		? " **ahead: check for a failed server push (skill step 4)**"
+		: "";
+	return `- ${p.name}: ${head}${files.length > 0 ? ` DIRTY: ${files.join(" ; ")}` : " clean"}${flag}`;
+}
+
 export async function report(s: BoardState, now: number): Promise<string> {
 	const open = s.tasks.filter(
 		(t) =>
@@ -242,9 +342,7 @@ export async function report(s: BoardState, now: number): Promise<string> {
 	);
 	const byId = new Map(s.tasks.map((t) => [t.id, t]));
 	const { mergeHold, error } = await resolveMergeHold(SCHEDULER_CANDIDATES);
-	const running = open.filter(
-		(t) => t.state === "running" || t.state === "preparing",
-	).length;
+	const running = open.filter(runsOrPrepares).length;
 	const drain = s.drainUntil !== null && s.drainUntil > now;
 	const out: string[] = [];
 	out.push(
@@ -262,30 +360,11 @@ export async function report(s: BoardState, now: number): Promise<string> {
 	const questions: string[] = [];
 	const rows = open
 		.map((c) => {
-			const log = `/data/${c.project}/logs/${c.id}.log`;
-			const logAgeS = existsSync(log)
-				? Math.round((now - statSync(log).mtimeMs) / 1000)
-				: null;
-			const sameProject = s.tasks.filter((t) => t.project === c.project);
-			let hold: string | null = null;
-			if (mergeHold !== null && c.stage === "merging") {
-				try {
-					hold = mergeHold(sameProject, c);
-				} catch (e) {
-					hold = `hold unknown: ${String(e).slice(0, 80)}`;
-				}
-			}
-			const depsOpen = (c.dependsOn ?? []).filter((d) => {
-				const t = byId.get(d);
-				return (
-					t === undefined || (t.stage !== "done" && t.cancelledAt === null)
-				);
-			});
 			const v = verdict(c, {
 				now,
-				logAgeS,
-				hold,
-				depsOpen,
+				logAgeS: logAgeSeconds(c, now),
+				hold: mergeHoldFor(c, s.tasks, mergeHold),
+				depsOpen: openDeps(c, byId),
 				drain,
 				capFull: s.maxTotal !== null && running >= s.maxTotal,
 				cards: s.tasks,
@@ -293,54 +372,17 @@ export async function report(s: BoardState, now: number): Promise<string> {
 			if (v.verdict === "question")
 				questions.push(
 					`### ${c.project}/${c.id}: ${(c.title ?? "").slice(0, 90)}`,
-					...(c.asked ?? []).map(
-						(q, i) =>
-							`${i + 1}. ${q.question}${q.options?.length ? ` [${q.options.map((o, j) => (j === q.recommended ? "*" : "") + (o.label ?? "")).join(" | ")}]` : ""}`,
-					),
+					...(c.asked ?? []).map(askedLine),
 				);
 			return { c, v };
 		})
-		.sort(
-			(a, b) =>
-				(ORDER[a.v.verdict] ?? 5) - (ORDER[b.v.verdict] ?? 5) ||
-				a.c.id.localeCompare(b.c.id),
-		);
+		.sort(byVerdictThenId);
 	for (const { c, v } of rows)
 		out.push(
 			`| ${c.project}/${c.id} ${cell((c.title ?? "").slice(0, 50))} | ${c.stage}/${c.state} | ${v.verdict} | ${cell(v.note)} | ${cell(c.needsReason ?? "")} |`,
 		);
 	out.push("", "## Main checkouts");
-	for (const p of s.projects) {
-		if (p.gitless) {
-			out.push(`- ${p.name}: gitless`);
-			continue;
-		}
-		const r = Bun.spawnSync([
-			"git",
-			"-C",
-			p.path,
-			"status",
-			"--porcelain",
-			"--branch",
-		]);
-		if (r.exitCode !== 0) {
-			out.push(
-				`- ${p.name}: git status failed: ${r.stderr.toString().trim().slice(0, 120)}`,
-			);
-			continue;
-		}
-		const [head, ...files] = r.stdout.toString().trim().split("\n");
-		if (head === undefined) {
-			out.push(`- ${p.name}: clean`);
-			continue;
-		}
-		const flag = AHEAD.test(head)
-			? " **ahead: check for a failed server push (skill step 4)**"
-			: "";
-		out.push(
-			`- ${p.name}: ${head}${files.length > 0 ? ` DIRTY: ${files.join(" ; ")}` : " clean"}${flag}`,
-		);
-	}
+	for (const p of s.projects) out.push(checkoutLine(p));
 	if (questions.length > 0) out.push("", "## Questions", ...questions);
 	return out.join("\n");
 }

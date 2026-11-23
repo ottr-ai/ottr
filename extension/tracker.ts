@@ -300,26 +300,46 @@ function rankValidationError(
 	return null;
 }
 
+// The trimmed rest of a bold `**Acceptance**` line after the marker, or null when the
+// line is not bold: non-empty rest carries the check inline, empty rest opens the section.
+function boldAcceptanceRest(line: string): string | null {
+	const bold = /^\*\*acceptance\*\*:?\s*(.*)$/i.exec(line.trim());
+	return bold === null ? null : (bold[1] ?? "").trim();
+}
+
+// One prompt line's effect on the Acceptance scan: "done" when the line carries its
+// check inline, "open"/"closed" when it starts or ends the section, "body" for a
+// checked line inside the section, null when the line changes nothing.
+function acceptanceLineVerdict(
+	line: string,
+	open: boolean,
+): "body" | "closed" | "done" | "open" | null {
+	const boldRest = boldAcceptanceRest(line);
+	if (boldRest !== null || /^#{1,6}\s+acceptance\b/i.test(line)) {
+		return boldRest !== null && boldRest !== "" ? "done" : "open";
+	}
+	if (open && /^#{1,6}\s/.test(line)) return "closed";
+	if (open && line.trim() !== "") return "body";
+	return null;
+}
+
 // OTTR-850: true when the prompt carries an "Acceptance" section with at least one
 // non-empty line. A `#`-`######` heading or a bold `**Acceptance**` line opens the
 // section; the section ends at the next heading. Every filed card then names its
 // outside check, so it passes the prompt gate on its own.
 export function hasAcceptanceSection(prompt: string): boolean {
-	const lines = prompt.split("\n");
 	let open = false;
-	for (const line of lines) {
-		const bold = /^\*\*acceptance\*\*:?\s*(.*)$/i.exec(line.trim());
-		if (/^#{1,6}\s+acceptance\b/i.test(line) || bold !== null) {
-			if (bold !== null && (bold[1] ?? "").trim() !== "") return true;
-			open = true;
-			continue;
-		}
-		if (open) {
-			if (/^#{1,6}\s/.test(line)) {
+	for (const line of prompt.split("\n")) {
+		switch (acceptanceLineVerdict(line, open)) {
+			case "done":
+			case "body":
+				return true;
+			case "open":
+				open = true;
+				break;
+			case "closed":
 				open = false;
-				continue;
-			}
-			if (line.trim() !== "") return true;
+				break;
 		}
 	}
 	return false;
@@ -348,6 +368,49 @@ function proposeValidationError(
 		summaryFieldsValidationError(params) ??
 		rankValidationError(params, reviewMode)
 	);
+}
+
+// create_task's checks before the board call: the prompt's length, the Acceptance
+// section, the optional project's shape and the model. The board's tasks route applies
+// the filing checks (project catalog included) past this tool, so no project list is
+// carried here. Returns the ready-to-show error text or null.
+function createTaskValidationError(params: CreateTaskParams): string | null {
+	const prompt = trimmed(params.prompt);
+	if (prompt === "" || prompt.length > 20000) {
+		return "Error: prompt must be 1-20000 characters.";
+	}
+	return (
+		acceptanceError(prompt, "create_task") ??
+		projectValidationError(params, []) ??
+		modelValidationError(params)
+	);
+}
+
+// The create_task success text: the target-project variant shows when the card went to
+// a project other than this task's own; both variants link the card to this task.
+function createTaskResultText(
+	id: string,
+	target: string,
+	project: string,
+): string {
+	const linked =
+		" It starts when the scheduler picks it up. File more cards or continue; report_outcome as usual when done.";
+	if (target !== "" && target !== project) {
+		return `Card ${id} filed in project ${target} and linked to this task.${linked}`;
+	}
+	return `Card ${id} filed and linked to this task.${linked}`;
+}
+
+// The propose_task refusals that precede validation: a nested eval-bridge call, or a
+// second proposal in one retro (retro mode allows one call). Returns the ready-to-show
+// text or null; `proposed` is module state and `retroMode` is the run's mode flag.
+function proposeRefusal(toolCallId: string, retroMode: boolean): string | null {
+	const bridge = evalBridgeRefusal(toolCallId, "propose_task");
+	if (bridge !== null) return bridge;
+	if (retroMode && proposed) {
+		return "Error: propose_task was already called in this retro; only one proposal is allowed.";
+	}
+	return null;
 }
 
 // The tracker pins review session names via env so every review run gets the same board title.
@@ -548,6 +611,33 @@ function proposeRepoDraft(params: TrendingParams): ProposeRepoDraft {
 // A prompt's first line, trimmed: the fallback headline of an untitled proposal.
 function firstLine(prompt: string): string {
 	return (prompt.split("\n")[0] ?? "").trim();
+}
+
+// The sandbox request body from one call's params: the trimmed project, string-only
+// argv and collect entries, and ref/cwd/collect only when given — the server treats
+// an absent field as its default. The full shape is checked by sandboxRequestError.
+function sandboxBody(params: SandboxRunParams): {
+	project: string;
+	argv: string[];
+	ref?: string;
+	cwd?: string;
+	collect?: string[];
+} {
+	const argv = Array.isArray(params.argv)
+		? params.argv.filter((x): x is string => typeof x === "string")
+		: [];
+	const ref = trimmed(params.ref);
+	const cwd = trimmed(params.cwd);
+	const collect = Array.isArray(params.collect)
+		? params.collect.filter((x): x is string => typeof x === "string")
+		: [];
+	return {
+		project: trimmed(params.project),
+		argv,
+		...(ref !== "" ? { ref } : {}),
+		...(cwd !== "" ? { cwd } : {}),
+		...(collect.length > 0 ? { collect } : {}),
+	};
 }
 
 export default function (pi: Pi) {
@@ -874,38 +964,20 @@ export default function (pi: Pi) {
 			const env = requireBoardEnv();
 			if ("error" in env) return textResult(env.error);
 			const { base, project, parent, token } = env;
-			const prompt = trimmed(params.prompt);
-			if (prompt === "" || prompt.length > 20000) {
-				return textResult("Error: prompt must be 1-20000 characters.");
-			}
-			const acceptance = acceptanceError(prompt, "create_task");
-			if (acceptance !== null) return textResult(acceptance);
-			const dependsOn = parseDependsOn(params);
+			const error = createTaskValidationError(params);
+			if (error !== null) return textResult(error);
 			const target = trimmed(params.project);
-			if (params.project !== undefined && target === "") {
-				return textResult(
-					"Error: project must be a non-empty string when given.",
-				);
-			}
-			const modelError = modelValidationError(params);
-			if (modelError !== null) return textResult(modelError);
 			const filed = await fileCard({
 				base,
 				project: target === "" ? project : target,
 				parent,
 				token,
-				prompt,
+				prompt: trimmed(params.prompt),
 				model: trimmed(params.model),
-				dependsOn,
+				dependsOn: parseDependsOn(params),
 			});
 			if (!filed.ok) return textResult(filed.text);
-			if (target !== "" && target !== project)
-				return textResult(
-					`Card ${filed.id} filed in project ${target} and linked to this task. It starts when the scheduler picks it up. File more cards or continue; report_outcome as usual when done.`,
-				);
-			return textResult(
-				`Card ${filed.id} filed and linked to this task. It starts when the scheduler picks it up. File more cards or continue; report_outcome as usual when done.`,
-			);
+			return textResult(createTaskResultText(filed.id, target, project));
 		},
 	});
 
@@ -1003,13 +1075,8 @@ export default function (pi: Pi) {
 			loadMode: "essential",
 			approval: "read",
 			async execute(toolCallId: string, params: CreateTaskParams) {
-				const bridge = evalBridgeRefusal(toolCallId, "propose_task");
-				if (bridge !== null) return textResult(bridge);
-				if (retroMode && proposed) {
-					return textResult(
-						"Error: propose_task was already called in this retro; only one proposal is allowed.",
-					);
-				}
+				const refusal = proposeRefusal(toolCallId, retroMode);
+				if (refusal !== null) return textResult(refusal);
 				const error = proposeValidationError(
 					params,
 					reviewMode,
@@ -1146,15 +1213,7 @@ export default function (pi: Pi) {
 			loadMode: "essential",
 			approval: "read",
 			async execute(_toolCallId: string, params: SandboxRunParams) {
-				const project = trimmed(params.project);
-				const argv = Array.isArray(params.argv)
-					? params.argv.filter((x): x is string => typeof x === "string")
-					: [];
-				const ref = trimmed(params.ref);
-				const cwd = trimmed(params.cwd);
-				const collect = Array.isArray(params.collect)
-					? params.collect.filter((x): x is string => typeof x === "string")
-					: [];
+				const body = sandboxBody(params);
 				const env = requireBoardEnv("sandbox_run");
 				if ("error" in env) return textResult(env.error);
 				if (env.runToken === "")
@@ -1167,13 +1226,6 @@ export default function (pi: Pi) {
 					taskId: env.parent,
 					token: env.token,
 					runToken: env.runToken,
-				};
-				const body = {
-					project,
-					argv,
-					...(ref !== "" ? { ref } : {}),
-					...(cwd !== "" ? { cwd } : {}),
-					...(collect.length > 0 ? { collect } : {}),
 				};
 				const invalid = sandboxRequestError({ taskId: board.taskId, ...body });
 				if (invalid !== null) return textResult(`Error: ${invalid}`);

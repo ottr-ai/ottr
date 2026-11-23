@@ -535,6 +535,70 @@ function seedTaskId(
 	return `${prefix}-${project.tasks.slice(0, i).filter((x) => !x.retro).length + 1}`;
 }
 
+/** Usage-hold row values: reset time, its UTC label, and when the hold was set. */
+function seedHold(
+	t: Spec,
+	now: number,
+): {
+	hold: Spec["usageHold"];
+	holdUntil: number | null;
+	holdAt: string;
+	holdSetAt: number | null;
+} {
+	const hold = t.usageHold;
+	const holdUntil = hold === undefined ? null : now + hold.inMin * MIN;
+	const holdAt =
+		holdUntil === null
+			? ""
+			: new Date(holdUntil).toISOString().slice(0, 16).replace("T", " ");
+	return {
+		hold,
+		holdUntil,
+		holdAt,
+		holdSetAt: hold === undefined ? null : now - 10 * MIN,
+	};
+}
+
+/** needs_reason column: a pending proposal's reason, else the spec's need, else the hold notice. */
+function seedNeeds(
+	t: Spec,
+	proposalReason: string | null,
+	hold: Spec["usageHold"],
+	holdAt: string,
+): string | null {
+	if (hold === undefined) return proposalReason ?? t.needs ?? null;
+	return (
+		proposalReason ??
+		t.needs ??
+		`The ${hold.provider} usage limit is reached. The board starts the task again after the limit resets at ${holdAt} UTC. Send a message to run it now, or cancel the card.`
+	);
+}
+
+/** Row timestamps: queue entry, last change, and the cancel mark. */
+function seedTimestamps(
+	t: Spec,
+	createdAt: number,
+	doneAt: number | null,
+	now: number,
+): { queuedAt: number | null; updatedAt: number; cancelledAt: number | null } {
+	return {
+		queuedAt: t.state === "queued" ? createdAt : null,
+		updatedAt: doneAt ?? (t.stage === "todo" ? createdAt : now - HOUR_STALE),
+		cancelledAt: t.cancelled ? now - t.age * DAY + 30 * MIN : null,
+	};
+}
+
+/** Title columns: a retro shows the marker title, any other card the spec title. */
+function seedTitles(
+	t: Spec,
+	retroPrompt: string,
+): { title: string; sessionTitle: string } {
+	return {
+		title: t.retro ? retroPrompt.slice(0, 80) : t.title.slice(0, 80),
+		sessionTitle: (t.retro ? retroPrompt : t.title).slice(0, 60),
+	};
+}
+
 export function insertTaskRow(
 	db: Database,
 	project: ProjectSpec,
@@ -564,22 +628,16 @@ export function insertTaskRow(
 	);
 	// A proposal links its retro; a follow-up links the card it continues.
 	const { followUpOf, proposalReason } = seedLinks(prefix, project, t);
-	const hold = t.usageHold;
-	const holdUntil = hold === undefined ? null : now + hold.inMin * MIN;
-	const holdAt =
-		holdUntil === null
-			? ""
-			: new Date(holdUntil).toISOString().slice(0, 16).replace("T", " ");
-	const needs =
-		proposalReason ??
-		t.needs ??
-		(hold === undefined
-			? null
-			: `The ${hold.provider} usage limit is reached. The board starts the task again after the limit resets at ${holdAt} UTC. Send a message to run it now, or cancel the card.`);
+	const { hold, holdUntil, holdAt, holdSetAt } = seedHold(t, now);
+	const needs = seedNeeds(t, proposalReason, hold, holdAt);
 	// queued_at marks cards that sit in a queue right now.
-	const queuedAt = t.state === "queued" ? createdAt : null;
-	const updatedAt =
-		doneAt ?? (t.stage === "todo" ? createdAt : now - HOUR_STALE);
+	const { queuedAt, updatedAt, cancelledAt } = seedTimestamps(
+		t,
+		createdAt,
+		doneAt,
+		now,
+	);
+	const { title, sessionTitle } = seedTitles(t, retroPrompt);
 	db.run(
 		`INSERT INTO tasks (id, title, prompt, stage, state, needs_reason, pending_prompt,
 			 research, asked, release_version, release_notes, follow_up_of, depends_on,
@@ -589,7 +647,7 @@ export function insertTaskRow(
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			id,
-			t.retro ? retroPrompt.slice(0, 80) : t.title.slice(0, 80),
+			title,
 			prompt,
 			t.stage,
 			t.state,
@@ -604,17 +662,17 @@ export function insertTaskRow(
 			createdAt,
 			updatedAt,
 			queuedAt,
-			t.cancelled ? now - t.age * DAY + 30 * MIN : null,
+			cancelledAt,
 			doneAt,
 			commits,
 			`demo-${id}`,
-			(t.retro ? retroPrompt : t.title).slice(0, 60),
+			sessionTitle,
 			taskKind(t),
 			hold?.model ?? null,
 			holdUntil,
 			hold?.provider ?? null,
 			hold?.window ?? null,
-			hold === undefined ? null : now - 10 * MIN,
+			holdSetAt,
 		],
 	);
 	return { id, prompt, createdAt, isDone, spec: t };

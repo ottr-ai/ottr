@@ -274,36 +274,27 @@ const chrome = Bun.spawn(
 	{ stdout: "ignore", stderr: "pipe" },
 );
 
-/** One capture run; every await below carries its own deadline. */
-async function capture(): Promise<void> {
-	// The endpoint line arrives on stderr: "DevTools listening on ws://...".
-	const endpoint = await withTimeout(
-		(async () => {
-			const reader = chrome.stderr.getReader();
-			const decoder = new TextDecoder();
-			let text = "";
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				text += decoder.decode(value, { stream: true });
-				const hit = text.match(/DevTools listening on (ws:\/\/\S+)/);
-				if (hit?.[1]) {
-					reader.releaseLock();
-					return hit[1];
-				}
-			}
-			throw new Error("chrome printed no DevTools endpoint");
-		})(),
-		15_000,
-		"the chrome endpoint line",
-	);
+/** Reads chrome's stderr until the DevTools websocket endpoint line arrives. */
+async function readDevToolsEndpoint(): Promise<string> {
+	const reader = chrome.stderr.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		text += decoder.decode(value, { stream: true });
+		const hit = text.match(/DevTools listening on (ws:\/\/\S+)/);
+		if (hit?.[1]) {
+			reader.releaseLock();
+			return hit[1];
+		}
+	}
+	throw new Error("chrome printed no DevTools endpoint");
+}
 
-	const client = new Cdp(new WebSocket(endpoint));
-	await withTimeout(client.open(), 10_000, "CDP open");
-	client.listen();
-
-	// Ready poll: the server answers the home page once the bundle is served.
-	let ready = false;
+/** Polls the board home page until it answers; refuses a board that exits early. */
+async function waitBoardReady(): Promise<void> {
+	// The server answers the home page once the bundle is served.
 	for (let waited = 0; waited < 30_000; waited += 250) {
 		if (board.exitCode !== null)
 			throw new Error(`the board exited early (code ${board.exitCode})`);
@@ -312,17 +303,17 @@ async function capture(): Promise<void> {
 				signal: AbortSignal.timeout(1_000),
 			});
 			await res.body?.cancel();
-			if (res.ok) {
-				ready = true;
-				break;
-			}
+			if (res.ok) return;
 		} catch {
 			// not listening yet
 		}
 		await Bun.sleep(250);
 	}
-	if (!ready) throw new Error("the board did not become ready within 30 s");
+	throw new Error("the board did not become ready within 30 s");
+}
 
+/** Opens a blank tab, attaches to it, and returns its page session id. */
+async function attachPage(client: Cdp): Promise<string> {
 	const created = await withTimeout(
 		client.send("Target.createTarget", { url: "about:blank" }),
 		10_000,
@@ -339,7 +330,11 @@ async function capture(): Promise<void> {
 	const sessionId = attached.sessionId;
 	if (typeof sessionId !== "string")
 		throw new Error("chrome gave no page session");
+	return sessionId;
+}
 
+/** Pins the emulated viewport, dark color scheme, and locale; enables page events. */
+async function configurePage(client: Cdp, sessionId: string): Promise<void> {
 	await client.send(
 		"Emulation.setDeviceMetricsOverride",
 		{ width: WIDTH, height: HEIGHT, deviceScaleFactor: 1, mobile: false },
@@ -356,62 +351,114 @@ async function capture(): Promise<void> {
 		sessionId,
 	);
 	await client.send("Page.enable", undefined, sessionId);
+}
+
+/** The plain value of a Runtime.evaluate reply, or undefined when it carries none. */
+function resultValue(result: unknown): unknown {
+	return result && typeof result === "object" && "value" in result
+		? result.value
+		: undefined;
+}
+
+/** Scrolls the Hindsight card under the page header and reads its warning line. */
+async function readHindsightLine(
+	client: Cdp,
+	sessionId: string,
+): Promise<unknown> {
+	// The warning line sits at the top of the Hindsight card; scroll the card
+	// under the page header before reading it.
+	const probe = await withTimeout(
+		client.send(
+			"Runtime.evaluate",
+			{
+				returnByValue: true,
+				expression:
+					"document.getElementById('hindsight-section')?.scrollIntoView({ block: 'start' }); scrollBy(0, -90); (document.querySelector('#hindsight-section p[role=alert]')?.textContent ?? 'MISSING').trim()",
+			},
+			sessionId,
+		),
+		10_000,
+		"the Hindsight section probe",
+	);
+	return resultValue(probe?.result);
+}
+
+/** Refuses the shot when the Hindsight card shows no memory warning line. */
+async function verifyHindsight(client: Cdp, sessionId: string): Promise<void> {
+	const value = await readHindsightLine(client, sessionId);
+	if (typeof value !== "string" || !value.includes("no memory"))
+		fail(
+			"card-shot",
+			`the Hindsight section shows no memory warning (${String(value)})`,
+		);
+	await Bun.sleep(500);
+}
+
+/** Screenshots the page, writes its PNG under shots/, and verifies the image. */
+async function writeShot(
+	client: Cdp,
+	sessionId: string,
+	name: string,
+): Promise<void> {
+	const shot = await withTimeout(
+		client.send("Page.captureScreenshot", { format: "png" }, sessionId),
+		30_000,
+		"Page.captureScreenshot",
+	);
+	if (typeof shot.data !== "string")
+		throw new Error("chrome returned no image data");
+	const png = Buffer.from(shot.data, "base64");
+	const file = join(SHOTS_DIR, `${name}.png`);
+	await Bun.write(file, png);
+	verifyPng(png, file);
+}
+
+/** Navigates one view, waits for its load, settles animations, and writes it. */
+async function captureView(
+	client: Cdp,
+	sessionId: string,
+	name: string,
+	planted: Planted | null,
+): Promise<void> {
+	// Register the waiter first: a load that lands before the wait would time out.
+	const load = client.waitEvent("Page.loadEventFired", sessionId);
+	await withTimeout(
+		client.send(
+			"Page.navigate",
+			{ url: `http://127.0.0.1:${port}${viewPath(name, planted)}` },
+			sessionId,
+		),
+		15_000,
+		"Page.navigate",
+	);
+	await withTimeout(load, 30_000, `the ${name} view load`);
+	// Card entrance animations run about 2 s; let them finish before the shot.
+	await Bun.sleep(SETTLE_MS);
+	if (name === "settings-hindsight") await verifyHindsight(client, sessionId);
+	await writeShot(client, sessionId, name);
+}
+
+/** One capture run; every await below carries its own deadline. */
+async function capture(): Promise<void> {
+	// The endpoint line arrives on stderr: "DevTools listening on ws://...".
+	const endpoint = await withTimeout(
+		readDevToolsEndpoint(),
+		15_000,
+		"the chrome endpoint line",
+	);
+
+	const client = new Cdp(new WebSocket(endpoint));
+	await withTimeout(client.open(), 10_000, "CDP open");
+	client.listen();
+
+	await waitBoardReady();
+
+	const sessionId = await attachPage(client);
+	await configurePage(client, sessionId);
 	mkdirSync(SHOTS_DIR, { recursive: true });
 
 	for (const name of views) {
-		// Register the waiter first: a load that lands before the wait would time out.
-		const load = client.waitEvent("Page.loadEventFired", sessionId);
-		await withTimeout(
-			client.send(
-				"Page.navigate",
-				{ url: `http://127.0.0.1:${port}${viewPath(name, planted)}` },
-				sessionId,
-			),
-			15_000,
-			"Page.navigate",
-		);
-		await withTimeout(load, 30_000, `the ${name} view load`);
-		// Card entrance animations run about 2 s; let them finish before the shot.
-		await Bun.sleep(SETTLE_MS);
-		if (name === "settings-hindsight") {
-			// The warning line sits at the top of the Hindsight card; scroll the card
-			// under the page header, then refuse the shot when the line is missing.
-			const probe = await withTimeout(
-				client.send(
-					"Runtime.evaluate",
-					{
-						returnByValue: true,
-						expression:
-							"document.getElementById('hindsight-section')?.scrollIntoView({ block: 'start' }); scrollBy(0, -90); (document.querySelector('#hindsight-section p[role=alert]')?.textContent ?? 'MISSING').trim()",
-					},
-					sessionId,
-				),
-				10_000,
-				"the Hindsight section probe",
-			);
-			const result = probe?.result;
-			const value =
-				result && typeof result === "object" && "value" in result
-					? result.value
-					: undefined;
-			if (typeof value !== "string" || !value.includes("no memory"))
-				fail(
-					"card-shot",
-					`the Hindsight section shows no memory warning (${String(value)})`,
-				);
-			await Bun.sleep(500);
-		}
-		const shot = await withTimeout(
-			client.send("Page.captureScreenshot", { format: "png" }, sessionId),
-			30_000,
-			"Page.captureScreenshot",
-		);
-		if (typeof shot.data !== "string")
-			throw new Error("chrome returned no image data");
-		const png = Buffer.from(shot.data, "base64");
-		const file = join(SHOTS_DIR, `${name}.png`);
-		await Bun.write(file, png);
-		verifyPng(png, file);
+		await captureView(client, sessionId, name, planted);
 	}
 }
 

@@ -88,65 +88,68 @@ const chrome = Bun.spawn(
 	{ stdout: "ignore", stderr: "pipe" },
 );
 
-/** One capture attempt; every await below carries its own deadline. */
-async function capture(): Promise<void> {
+/** Resolves once chrome's stderr line names the DevTools WebSocket endpoint. */
+async function readDevtoolsEndpoint(): Promise<string> {
 	// The endpoint line arrives on stderr: "DevTools listening on ws://...".
-	const endpoint = await (async () => {
-		const reader = chrome.stderr.getReader();
-		const decoder = new TextDecoder();
-		let text = "";
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			text += decoder.decode(value, { stream: true });
-			const hit = text.match(/DevTools listening on (ws:\/\/\S+)/);
-			if (hit?.[1]) {
-				reader.releaseLock();
-				return hit[1];
-			}
+	const reader = chrome.stderr.getReader();
+	const decoder = new TextDecoder();
+	let text = "";
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		text += decoder.decode(value, { stream: true });
+		const hit = text.match(/DevTools listening on (ws:\/\/\S+)/);
+		if (hit?.[1]) {
+			reader.releaseLock();
+			return hit[1];
 		}
-		throw new Error("chrome printed no DevTools endpoint");
-	})();
+	}
+	throw new Error("chrome printed no DevTools endpoint");
+}
 
-	const client = new Cdp(new WebSocket(endpoint));
-	await withTimeout(client.open(), 10_000, "CDP open");
-	client.listen();
+/** One 30 s poll window. Returns true once the home page answers in time. */
+async function pollBoardOnce(): Promise<boolean> {
+	const deadline = Date.now() + 30_000;
+	while (true) {
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return false;
+		if (board.exitCode !== null) throw new Error("the demo board exited early");
+		try {
+			const res = await fetch(`http://127.0.0.1:${port}/`, {
+				signal: AbortSignal.timeout(Math.min(1_000, remaining)),
+			});
+			await res.body?.cancel();
+			if (res.ok && Date.now() < deadline) return true;
+		} catch {
+			// not listening yet
+		}
+		const delay = Math.min(250, deadline - Date.now());
+		if (delay > 0) await Bun.sleep(delay);
+	}
+}
 
-	// Ready poll: the server answers the home page once the bundle is served.
+/** Stops the failed first board and spawns a fresh one on a new port. */
+async function restartBoard(): Promise<void> {
+	await stopChildren(board);
+	port = await freePort();
+	board = spawnBoard();
+}
+
+// Ready poll: the server answers the home page once the bundle is served.
+async function waitUntilBoardReady(): Promise<void> {
 	let ready = false;
 	for (let attempt = 0; attempt < 2 && !ready; attempt++) {
-		const deadline = Date.now() + 30_000;
-		while (true) {
-			const remaining = deadline - Date.now();
-			if (remaining <= 0) break;
-			if (board.exitCode !== null)
-				throw new Error("the demo board exited early");
-			try {
-				const res = await fetch(`http://127.0.0.1:${port}/`, {
-					signal: AbortSignal.timeout(Math.min(1_000, remaining)),
-				});
-				await res.body?.cancel();
-				if (res.ok && Date.now() < deadline) {
-					ready = true;
-					break;
-				}
-			} catch {
-				// not listening yet
-			}
-			const delay = Math.min(250, deadline - Date.now());
-			if (delay > 0) await Bun.sleep(delay);
-		}
+		ready = await pollBoardOnce();
 		if (!ready && board.exitCode !== null)
 			throw new Error("the demo board exited early");
-		if (!ready && attempt === 0) {
-			await stopChildren(board);
-			port = await freePort();
-			board = spawnBoard();
-		}
+		if (!ready && attempt === 0) await restartBoard();
 	}
 	if (!ready)
 		throw new Error("the demo board did not become ready within 30 s");
+}
 
+/** Creates an about:blank target, attaches, and returns the page session id. */
+async function openPageSession(client: Cdp): Promise<string> {
 	const created = await withTimeout(
 		client.send("Target.createTarget", { url: "about:blank" }),
 		10_000,
@@ -163,7 +166,11 @@ async function capture(): Promise<void> {
 	const sessionId = attached.sessionId;
 	if (typeof sessionId !== "string")
 		throw new Error("chrome gave no page session");
+	return sessionId;
+}
 
+/** Fixed viewport, dark scheme, and locale, so every shot is comparable. */
+async function configurePage(client: Cdp, sessionId: string): Promise<void> {
 	await client.send(
 		"Emulation.setDeviceMetricsOverride",
 		{ width: WIDTH, height: HEIGHT, deviceScaleFactor: 1, mobile: false },
@@ -180,6 +187,10 @@ async function capture(): Promise<void> {
 		sessionId,
 	);
 	await client.send("Page.enable", undefined, sessionId);
+}
+
+/** Navigates to the demo board and waits for load plus entrance animations. */
+async function loadBoard(client: Cdp, sessionId: string): Promise<void> {
 	await withTimeout(
 		client.send(
 			"Page.navigate",
@@ -196,6 +207,10 @@ async function capture(): Promise<void> {
 	);
 	// Card entrance animations run about 2 s; let them finish before the shot.
 	await Bun.sleep(SETTLE_MS);
+}
+
+/** Captures the PNG, writes it to OUT, and verifies size and format. */
+async function saveShot(client: Cdp, sessionId: string): Promise<void> {
 	const shot = await withTimeout(
 		client.send("Page.captureScreenshot", { format: "png" }, sessionId),
 		30_000,
@@ -207,6 +222,23 @@ async function capture(): Promise<void> {
 	mkdirSync(resolve(REPO, ".github/assets"), { recursive: true });
 	await Bun.write(OUT, png);
 	verifyPng(png);
+}
+
+/** One capture attempt; every await below carries its own deadline. */
+async function capture(): Promise<void> {
+	const endpoint = await readDevtoolsEndpoint();
+
+	const client = new Cdp(new WebSocket(endpoint));
+	await withTimeout(client.open(), 10_000, "CDP open");
+	client.listen();
+
+	await waitUntilBoardReady();
+
+	const sessionId = await openPageSession(client);
+
+	await configurePage(client, sessionId);
+	await loadBoard(client, sessionId);
+	await saveShot(client, sessionId);
 }
 
 let failure: Error | null = null;
