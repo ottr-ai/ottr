@@ -5,8 +5,8 @@ import { join } from "node:path";
 import type { Server } from "bun";
 import {
 	handleGit,
-	parseReceiveCommands,
 	pushRefusal,
+	receiveCommands,
 	syncWorktreeTo,
 } from "./gitHttp.ts";
 import { fixtureGitEnv } from "./gitRepoEnv.ts";
@@ -247,6 +247,60 @@ describe("handleGit over real git", () => {
 		expect(res.status).toBe(415);
 	}, 60_000);
 
+	test("a malformed chunked push is refused before its body finishes (OTTR-1003)", async () => {
+		// A raw socket, not fetch: the client writes the first body chunk and then stalls
+		// mid-body, so a refusal that lands before the last byte proves the board never
+		// buffered the whole body before the command check. The wall-clock races here are
+		// the behavior under test: fake timers cannot drive a live Bun.serve connection
+		// that is waiting on a deliberately stalled socket.
+		const chunks: string[] = [];
+		const decoder = new TextDecoder();
+		const { promise: answered, resolve: gotAnswer } =
+			Promise.withResolvers<void>();
+		const socket = await Bun.connect({
+			hostname: "127.0.0.1",
+			// Bun.serve with port 0 always fills the bound port in.
+			port: server.port!,
+			socket: {
+				data(_s, chunk) {
+					chunks.push(decoder.decode(chunk));
+					gotAnswer();
+				},
+			},
+		});
+		try {
+			socket.write(
+				`POST /git/alpha.git/git-receive-pack HTTP/1.1\r\n` +
+					`Host: 127.0.0.1:${server.port}\r\n` +
+					`Authorization: Bearer ${token}\r\n` +
+					`Content-Type: application/x-git-receive-pack-request\r\n` +
+					`Transfer-Encoding: chunked\r\n\r\n4\r\nzzzz\r\n`,
+			);
+			const beforeEnd = await Promise.race([
+				answered.then(() => true),
+				new Promise<false>((r) => setTimeout(() => r(false), 4000)),
+			]);
+			if (!beforeEnd) {
+				// The board is still buffering the body: end it and collect the late refusal.
+				socket.write("0\r\n\r\n");
+				await Promise.race([
+					answered,
+					new Promise<void>((r) => setTimeout(r, 4000)),
+				]);
+			}
+			const answer = chunks.join("");
+			expect(answer).toContain("403");
+			expect(answer).toContain("malformed pkt-line");
+			expect(beforeEnd).toBe(true);
+		} finally {
+			try {
+				socket.end();
+			} catch {
+				// The board closed the connection when it refused mid-body; that is expected.
+			}
+		}
+	}, 30_000);
+
 	test("only the card branch is advertised and fetchable; a base ref is unhidden too", async () => {
 		const remote = await must(dir(), ...auth(token), "ls-remote", url());
 		const refs = remote
@@ -305,48 +359,77 @@ describe("handleGit over real git", () => {
 	}, 60_000);
 });
 
-describe("parseReceiveCommands", () => {
+describe("receiveCommands", () => {
 	const pkt = (s: string) =>
 		`${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
-	const enc = (s: string) => new TextEncoder().encode(s);
+	const commands = async (body: string, cap?: number) => {
+		const r = await receiveCommands(
+			new Request("http://board.invalid/git/alpha.git/git-receive-pack", {
+				method: "POST",
+				body,
+			}),
+			cap ?? 1024 * 1024,
+		);
+		if ("error" in r) throw new Error(r.error);
+		await r.stdin.cancel();
+		return r.commands;
+	};
+	const refused = async (body: string, cap?: number) => {
+		const r = await receiveCommands(
+			new Request("http://board.invalid/git/alpha.git/git-receive-pack", {
+				method: "POST",
+				body,
+			}),
+			cap ?? 1024 * 1024,
+		);
+		return "error" in r ? r.error : null;
+	};
 	const a = "a".repeat(40);
 	const b = "b".repeat(40);
 
-	test("reads every command up to the flush, capabilities stripped, shallow lines skipped", () => {
-		const body = enc(
-			pkt(`shallow ${a}\n`) +
-				pkt(`${a} ${b} refs/heads/x\0report-status side-band-64k\n`) +
-				pkt(`${b} ${a} refs/heads/y\n`) +
-				"0000PACK....",
-		);
-		expect(parseReceiveCommands(body)).toEqual({
-			commands: [
-				{ old: a, new: b, ref: "refs/heads/x" },
-				{ old: b, new: a, ref: "refs/heads/y" },
-			],
-		});
+	test("reads every command up to the flush, capabilities stripped, shallow lines skipped", async () => {
+		expect(
+			await commands(
+				pkt(`shallow ${a}\n`) +
+					pkt(`${a} ${b} refs/heads/x\0report-status side-band-64k\n`) +
+					pkt(`${b} ${a} refs/heads/y\n`) +
+					"0000PACK....",
+			),
+		).toEqual([
+			{ old: a, new: b, ref: "refs/heads/x" },
+			{ old: b, new: a, ref: "refs/heads/y" },
+		]);
 	});
 
-	test("a push certificate, a garbled line or a missing flush is an error", () => {
+	test("a push certificate, a garbled line or a missing flush is an error", async () => {
 		expect(
-			"error" in
-				parseReceiveCommands(enc(`${pkt("push-cert\0report-status\n")}0000`)),
-		).toBe(true);
+			await refused(`${pkt("push-cert\0report-status\n")}0000`),
+		).not.toBeNull();
+		expect(await refused(`${pkt(`${a} ${b}\n`)}0000`)).not.toBeNull();
 		expect(
-			"error" in parseReceiveCommands(enc(`${pkt(`${a} ${b}\n`)}0000`)),
-		).toBe(true);
-		expect(
-			"error" in
-				parseReceiveCommands(enc(`${pkt(`${a} ${b} refs/heads/x y\n`)}0000`)),
-		).toBe(true);
-		expect(
-			"error" in parseReceiveCommands(enc(pkt(`${a} ${b} refs/heads/x\n`))),
-		).toBe(true);
-		expect("error" in parseReceiveCommands(enc("00"))).toBe(true);
-		expect("error" in parseReceiveCommands(enc("0003"))).toBe(true);
-		expect("error" in parseReceiveCommands(enc("zzzz"))).toBe(true);
+			await refused(`${pkt(`${a} ${b} refs/heads/x y\n`)}0000`),
+		).not.toBeNull();
+		// A missing flush is a truncated section, not a refusal of the lines before it.
+		expect(await refused(pkt(`${a} ${b} refs/heads/x\n`))).not.toBeNull();
+		expect(await refused("")).not.toBeNull();
+		expect(await refused("00")).not.toBeNull();
+		expect(await refused("0003")).not.toBeNull();
+		expect(await refused("zzzz")).toBe("malformed pkt-line");
 		// A length running past the body is not trusted.
-		expect("error" in parseReceiveCommands(enc("00ff1234"))).toBe(true);
+		expect(await refused("00ff1234")).not.toBeNull();
+	});
+
+	test("a command section with no flush is refused at the cap instead of being buffered", async () => {
+		const line = pkt(`${a} ${b} refs/heads/x\n`);
+		expect(await refused(line.repeat(10), 512)).toContain("over");
+		const flood = line.repeat(Math.ceil((1024 * 1024 * 1.2) / line.length));
+		expect(await refused(flood)).toContain("over");
+		// A flush inside the read bytes still ends the section, whatever its size: the
+		// packfile tail after it is never buffered.
+		const lines = Math.ceil((1024 * 1024 * 1.2) / line.length);
+		expect(
+			(await commands(`${line.repeat(lines - 1)}0000PACK...`)).length,
+		).toBe(lines - 1);
 	});
 
 	test("pushRefusal allows only updates of the card branch", () => {

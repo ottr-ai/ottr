@@ -45,6 +45,12 @@ const SHA = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 const ZERO = /^0+$/;
 /** A CGI header block larger than this is not git http-backend talking. */
 const MAX_CGI_HEAD = 64 * 1024;
+/**
+ * The command section of a push (pkt-lines up to the first flush): 1 MiB is far above any
+ * command list git sends for the card's one branch, and it is the only part of a push body
+ * the board ever buffers (OTTR-1003). The packfile after the flush streams to http-backend.
+ */
+const MAX_PUSH_COMMANDS = 1024 * 1024;
 
 export interface GitHttpOptions {
 	tokens: VmTokens;
@@ -109,20 +115,23 @@ export interface PushCommand {
 /** One read of a receive-pack pkt-line. */
 type PktLine =
 	| { kind: "command"; line: string; at: number }
-	| { kind: "flush" }
+	| { kind: "flush"; at: number }
+	/** More bytes are needed; `error` is what a body that ends here would report. */
+	| { kind: "partial"; error: string }
 	| { kind: "error"; error: string };
 
 /** Reads one pkt-line from the body: a flush (0000), a payload line, or an error. */
 function readPktLine(body: Uint8Array, at: number, text: TextDecoder): PktLine {
 	if (at + 4 > body.length)
-		return { kind: "error", error: "truncated command list" };
+		return { kind: "partial", error: "truncated command list" };
 	const lenHex = text.decode(body.subarray(at, at + 4));
 	if (!/^[0-9a-f]{4}$/.test(lenHex))
 		return { kind: "error", error: "malformed pkt-line" };
 	const len = Number.parseInt(lenHex, 16);
-	if (len === 0) return { kind: "flush" };
-	if (len < 4 || at + len > body.length)
-		return { kind: "error", error: "malformed pkt-line" };
+	if (len === 0) return { kind: "flush", at: at + 4 };
+	if (len < 4) return { kind: "error", error: "malformed pkt-line" };
+	if (at + len > body.length)
+		return { kind: "partial", error: "malformed pkt-line" };
 	return {
 		kind: "command",
 		line: text.decode(body.subarray(at + 4, at + len)),
@@ -162,7 +171,8 @@ export function parseReceiveCommands(
 	let at = 0;
 	for (;;) {
 		const pkt = readPktLine(body, at, text);
-		if (pkt.kind === "error") return { error: pkt.error };
+		if (pkt.kind === "error" || pkt.kind === "partial")
+			return { error: pkt.error };
 		if (pkt.kind === "flush") return { commands };
 		at = pkt.at;
 		const parsed = parseCommandLine(pkt.line, commands.length === 0);
@@ -438,7 +448,96 @@ type GitInput =
 	  }
 	| { response: Response };
 
-/** Prepares the request body for the request kind: buffered (and checked) for a push. */
+/** Streams the already-read command head and then the rest of the request body to the backend. */
+function pushStdin(
+	head: Uint8Array,
+	tail: Uint8Array,
+	reader: ReadableStreamDefaultReader<Uint8Array>,
+): ReadableStream<Uint8Array> {
+	return new ReadableStream<Uint8Array>({
+		start(c) {
+			if (head.length > 0) c.enqueue(head);
+			if (tail.length > 0) c.enqueue(tail);
+		},
+		async pull(c) {
+			const { value, done } = await reader.read();
+			if (done) c.close();
+			else c.enqueue(value);
+		},
+		cancel() {
+			void reader.cancel();
+		},
+	});
+}
+
+/**
+ * Reads the command section of a receive-pack body straight from the request stream: pkt-lines
+ * up to the first flush, at most `cap` bytes. The packfile after the flush is never buffered —
+ * the returned stdin streams the already-read head and then the rest of the request body to
+ * http-backend. A malformed line, a section over the cap, or a body that ends inside the
+ * command section is an error and cancels the request stream, so a refused push never reads
+ * its packfile and answers before its body finishes arriving (OTTR-1003).
+ */
+export async function receiveCommands(
+	req: Request,
+	cap: number,
+): Promise<
+	| { commands: PushCommand[]; stdin: ReadableStream<Uint8Array> }
+	| { error: string }
+> {
+	const reader = req.body?.getReader();
+	if (reader === undefined) return { error: "truncated command list" };
+	// Non-UTF-8 bytes decode to U+FFFD, which no ASCII branch name can equal.
+	const text = new TextDecoder();
+	const commands: PushCommand[] = [];
+	let buf = new Uint8Array(0);
+	let at = 0;
+	for (;;) {
+		// Parse every complete pkt-line the buffer already holds.
+		let partial = "truncated command list";
+		for (;;) {
+			const pkt = readPktLine(buf, at, text);
+			if (pkt.kind === "partial") {
+				partial = pkt.error;
+				break;
+			}
+			if (pkt.kind === "error") {
+				void reader.cancel();
+				return { error: pkt.error };
+			}
+			at = pkt.at;
+			if (pkt.kind === "flush")
+				return {
+					commands,
+					stdin: pushStdin(buf.subarray(0, at), buf.subarray(at), reader),
+				};
+			const parsed = parseCommandLine(pkt.line, commands.length === 0);
+			if ("error" in parsed) {
+				void reader.cancel();
+				return { error: parsed.error };
+			}
+			if (parsed.command !== null) commands.push(parsed.command);
+		}
+		// The next pkt-line is incomplete: every buffered byte is still pre-flush, so a buffer
+		// over the cap means the section never ends and more reads would only grow it.
+		if (buf.length > cap) {
+			void reader.cancel();
+			return { error: `the push command section is over ${cap} bytes` };
+		}
+		const { value, done } = await reader.read();
+		if (done) return { error: partial };
+		if (at > 0) {
+			buf = buf.subarray(at);
+			at = 0;
+		}
+		const joined = new Uint8Array(buf.length + value.byteLength);
+		joined.set(buf);
+		joined.set(value, buf.length);
+		buf = joined;
+	}
+}
+
+/** Prepares the request body for the request kind: streamed (and checked) for a push. */
 async function gitInput(
 	req: Request,
 	grant: VmGrant,
@@ -448,11 +547,9 @@ async function gitInput(
 	o: GitHttpOptions,
 ): Promise<GitInput> {
 	if (rest === "git-receive-pack") {
-		// Buffered: the ref check reads the command section before git sees a byte.
-		const body: Uint8Array<ArrayBuffer> = new Uint8Array(
-			await req.arrayBuffer(),
-		);
-		const parsed = parseReceiveCommands(body);
+		// The command section is read from the stream and checked before any packfile byte is
+		// buffered, so a refused push answers while its body is still arriving (OTTR-1003).
+		const parsed = await receiveCommands(req, MAX_PUSH_COMMANDS);
 		if ("error" in parsed) {
 			o.log(`${grant.project}/${grant.taskId}: push refused: ${parsed.error}`);
 			return { response: plain(parsed.error, 403) };
@@ -462,8 +559,9 @@ async function gitInput(
 			o.log(`${grant.project}/${grant.taskId}: push refused: ${refusal}`);
 			return { response: plain(refusal, 403) };
 		}
-		env.CONTENT_LENGTH = String(body.length);
-		return { stdin: body, pushed: parsed.commands };
+		// Allowed: the packfile streams to http-backend, which reads stdin to EOF without
+		// CONTENT_LENGTH — the same streamed shape an upload-pack request already takes.
+		return { stdin: parsed.stdin, pushed: parsed.commands };
 	}
 	if (rest === "git-upload-pack") {
 		// Streamed; http-backend inflates a gzip body itself (git gzips large fetch requests).
