@@ -12094,9 +12094,11 @@ export function createTurnLoop(
 		);
 	}
 
-	/** Applies a valid work-check verdict. Explicit fixes take precedence over repeated quotes.
-	 * Other earlier blockers stay open. Copies, never in place. A pass stamps the card
-	 * (the deferred write below stores merging/queued). Blockers return to the work agent. */
+	/** Applies a valid work-check verdict. Explicit fixes take precedence over repeated
+	 * quotes and still-open references. A still-open reference keeps the earlier blocker
+	 * active in the new run: the card returns to the work agent and never merges past an
+	 * unresolved blocker. Copies, never in place. A pass stamps the card (the deferred
+	 * write below stores merging/queued). Blockers return to the work agent. */
 	async function applyWorkCheckVerdict(
 		st: TurnSettle,
 		cur: Task,
@@ -12136,6 +12138,21 @@ export function createTurnLoop(
 					st.result.finalText,
 				);
 				const fixedById = new Map(verdict.fixed.map((f) => [f.id, f.reason]));
+				// A still-open reference rides into the new run as an active blocker, so the
+				// card returns to the work agent with it instead of merging past it. A re-quote
+				// already carries the problem, so only un-quoted references carry. Carried
+				// entries drop the old bugClass: the agent did not re-raise the class, the
+				// check only reported it unresolved, so carrying must not count as a repeat.
+				const stillIds = new Set(verdict.stillOpen.map((s) => s.id));
+				const newQuotes = new Set(split.blockers.map((b) => b.quote));
+				const carried = open.flatMap((b, i) =>
+					stillIds.has(i + 1) &&
+					!fixedById.has(i + 1) &&
+					!newQuotes.has(b.quote)
+						? [{ finding: b.finding, quote: b.quote }]
+						: [],
+				);
+				const active = [...carried, ...split.blockers];
 				const runs = [...priorLog];
 				const lastIdx = runs.findLastIndex((r) => r.outcome === "blockers");
 				const prev = lastIdx === -1 ? undefined : runs[lastIdx];
@@ -12161,17 +12178,17 @@ export function createTurnLoop(
 					// so the card shows the fallback instead of the unset role.
 					model: checkModel,
 					role: checkRole,
-					outcome: split.blockers.length === 0 ? "pass" : "blockers",
-					blockers: split.blockers,
+					outcome: active.length === 0 ? "pass" : "blockers",
+					blockers: active,
 					notes: split.notes,
 					durationMs: checkMs,
 					...warn,
 				};
 				const allRuns = appendWorkCheckRun(runs, run);
 				await st.log(
-					`- work check: ${split.blockers.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
+					`- work check: ${active.length} blocker(s), ${split.notes.length} note(s), ${(checkMs / 1000).toFixed(0)}s`,
 				);
-				if (split.blockers.length === 0)
+				if (active.length === 0)
 					// Pass: the card stays in its current state; the deferred write
 					// below stores merging/queued with the check record stamped. The
 					// check ran past the limit, so the probe count clears.
@@ -12184,7 +12201,7 @@ export function createTurnLoop(
 							? { workCheckReport: readyReport }
 							: {}),
 					});
-				else await sendWorkCheckBack(st, cur, head, split.blockers, allRuns);
+				else await sendWorkCheckBack(st, cur, head, active, allRuns);
 				if (st.plannedNext !== undefined)
 					await writePostCheckState(st, st.plannedNext);
 			});

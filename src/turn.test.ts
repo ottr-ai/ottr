@@ -14869,6 +14869,18 @@ const block = (finding: string, quote: string, bugClass?: string) =>
 			notes: [],
 		}),
 	});
+const stillOpenRef = (
+	entries: { id: number; quote: string; reason: string }[],
+	blockers: { finding: string; quote: string }[] = [],
+) =>
+	runResult({
+		finalText: JSON.stringify({
+			blockers,
+			fixed: [],
+			stillOpen: entries,
+			notes: [],
+		}),
+	});
 
 describe("work card check", () => {
 	// A ready work turn classifies merging/queued (commitsAhead 1, clean), which is the
@@ -14924,6 +14936,106 @@ describe("work card check", () => {
 		const text = await logText(store, task.id);
 		expect(text).toContain("work check attempt 1 failed:");
 		expect(text).toContain("work check attempt 2 failed:");
+	});
+
+	test("a still-open reference sends the card back and keeps the earlier blocker open", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[
+				block("tests were weakened", "const x = 1;", "test-tampering"),
+				stillOpenRef([
+					{
+						id: 1,
+						quote: "const retry = backoff(attempt);",
+						reason: "the retry loop still drops the last attempt",
+					},
+				]),
+				pass([], [{ id: 1, reason: "the tests now assert the real value" }]),
+			],
+			{ diffText: async () => "const x = 1;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+		const blocked = (await store.getTask(task.id))!;
+		expect(blocked.workCheckLog[0]!.outcome).toBe("blockers");
+		expect(blocked.workCheckSendbacks).toBe(1);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(record.runs).toHaveLength(4);
+		// The unresolved blocker returns to the work agent: no merge transition.
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckSendbacks).toBe(2);
+		expect(after.workCheckLog[1]!.outcome).toBe("blockers");
+		// The carried entry drops the old bugClass, so carrying is not a repeated class.
+		expect(after.workCheckLog[1]!.blockers).toEqual([
+			{ finding: "tests were weakened", quote: "const x = 1;" },
+		]);
+		expect(after.workCheckLog[0]!.blockers[0]!.status).toBeUndefined();
+		expect(after.pendingPrompt).toContain("tests were weakened");
+		expect(after.pendingPrompt).toContain("quote: const x = 1;");
+
+		// The next check numbers the carried blocker and clears it with an explicit fix.
+		head.sha = "sha3";
+		await loop.runTurn(store.name, task.id);
+		expect(record.runs.at(-1)!.prompt).toContain(
+			"\n1. tests were weakened\n   quote: const x = 1;",
+		);
+		const merged = (await store.getTask(task.id))!;
+		expect(merged.stage).toBe("merging");
+		expect(merged.state).toBe("queued");
+		expect(merged.workCheckLog[1]!.blockers[0]!.status).toBe("fixed");
+		expect(merged.workCheckLog[1]!.blockers[0]!.statusReason).toBe(
+			"the tests now assert the real value",
+		);
+	});
+
+	test("a still-open reference rides beside a new blocker in one send-back", async () => {
+		const head = { sha: "sha1" };
+		const { store, record, loop } = await workCheckCase(
+			head,
+			[
+				block("tests were weakened", "const x = 1;"),
+				stillOpenRef(
+					[
+						{
+							id: 1,
+							quote: "const retry = backoff(attempt);",
+							reason: "the retry loop still drops the last attempt",
+						},
+					],
+					[{ finding: "missing validation", quote: "const z = 3;" }],
+				),
+			],
+			{ diffText: async () => "const x = 1;\nconst z = 3;\n" },
+		);
+		const task = await store.createTask("work please");
+		await loop.runTurn(store.name, task.id);
+
+		head.sha = "sha2";
+		await loop.runTurn(store.name, task.id);
+
+		const after = (await store.getTask(task.id))!;
+		expect(record.runs).toHaveLength(4);
+		expect(after.stage).toBe("in_progress");
+		expect(after.state).toBe("queued");
+		expect(after.workCheckSendbacks).toBe(2);
+		expect(after.workCheckLog[1]!.outcome).toBe("blockers");
+		// The carried blocker keeps the lowest id, so its numbering stays stable.
+		expect(after.workCheckLog[1]!.blockers).toEqual([
+			{ finding: "tests were weakened", quote: "const x = 1;" },
+			{ finding: "missing validation", quote: "const z = 3;" },
+		]);
+		expect(after.pendingPrompt).toContain(
+			"1. tests were weakened\n   quote: const x = 1;",
+		);
+		expect(after.pendingPrompt).toContain(
+			"2. missing validation\n   quote: const z = 3;",
+		);
 	});
 
 	test("repeated incomplete re-checks retain open blockers at the history cap", async () => {
