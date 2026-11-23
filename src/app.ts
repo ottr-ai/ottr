@@ -13116,38 +13116,55 @@ export async function createApp(deps: AppDeps) {
 		return matches;
 	}
 	/** The operator's free-text answer to a deployment question (OTTR-1227): the
-	 * exact option labels match before this reads any other text. Uncertainty
-	 * ("do not know", "not sure", "maybe") reads as unclassified, so an
-	 * uncertain answer never turns its keywords into a decision. A negated
-	 * applicability word ("does not apply", "isn't applicable", "no longer
-	 * relevant") cancels the lead — the negator must sit near its word, so a
-	 * side note ("no authentication is enabled") never flips the verdict. A
-	 * bare applicability word ("applies", "yes") queues it like a confirmed
-	 * verdict, and an answer that starts with "no" is the operator's bare
-	 * refusal. Anything else is unclassified and only records the answer.
+	 * exact option labels match before this reads any other text. The answer
+	 * reads in order. Hedged and unevidenced wording first ("do not know",
+	 * "cannot confirm", "possibly", "no evidence") reads as unclassified, so an
+	 * uncertain answer never turns its keywords into a decision. An answer that
+	 * starts with "no" is the operator's bare refusal and cancels, whatever
+	 * follows. Otherwise the answer splits into clauses at sentence and comma
+	 * boundaries: a clause whose negator sits with an applicability word ("does
+	 * not apply", "isn't applicable", "no longer relevant", "without applying")
+	 * refuses, and a clause with a bare applicability word ("applies", "yes")
+	 * confirms; a mix of both across clauses is unclassified. Negation reads
+	 * inside its own clause, so a side note in another clause never flips the
+	 * verdict. Anything else is unclassified and only records the answer.
 	 * Pure. */
 	function leadAnswerVerdict(answer: string): "applies" | "not-apply" | null {
 		const text = answer
 			.trim()
 			.replace(/\.$/, "")
 			.toLowerCase()
+			.replace(/[\u2018\u2019\u02bc\u02b9`]/g, "'")
 			.replace(/\bcan't\b/g, "cannot")
 			.replace(/\b(\w+)n't\b/g, "$1 not");
 		if (
-			/\b(do\s+not|does\s+not|did\s+not|not|cannot)\s+(know|sure|certain|clear|aware|remember)\b/.test(
+			/\b(?:do\s+not|does\s+not|did\s+not|don't|doesn't|didn't|cannot|can't|could\s+not|couldn't|not)\s+(?:know|sure|certain|confirm|verify|say|tell|determine|assess|judge|see|find|recall|remember)\b/.test(
 				text,
 			) ||
-			/\b(maybe|perhaps|unsure|unclear|no\s+idea|hard\s+to\s+say)\b/.test(text)
-		)
-			return null;
-		if (
-			/\b(not|never|no\s+longer|cannot|neither|nor)\b[^.]{0,24}\b(appl(y|ies|ied|ying|icable)|relevant)\b/.test(
+			/\bno\s+(?:evidence|proof|indication|sign|reason|basis)\b/.test(text) ||
+			/\b(?:possibly|probably|perhaps|maybe|likely|unlikely|apparently|seemingly|presumably|arguably|might|may|could|would|seems?|unsure|unclear|hard\s+to\s+say|no\s+idea)\b/.test(
 				text,
 			)
 		)
-			return "not-apply";
-		if (/\b(applies|applicable|relevant|yes)\b/.test(text)) return "applies";
+			return null;
 		if (/^no(?![a-z])/.test(text)) return "not-apply";
+		let applies = false;
+		let refuses = false;
+		for (const clause of text.split(/[.;:!?!,]|\bbut\b/)) {
+			if (
+				/\b(?:not|never|no\s+longer|cannot|neither|nor|without)\b.{0,20}\b(?:appl(?:y|ies|ied|ying|icable)|relevant)\b/.test(
+					clause,
+				)
+			)
+				refuses = true;
+			else if (
+				/\b(?:appl(?:y|ies|ied|ying|icable)|relevant|yes)\b/.test(clause)
+			)
+				applies = true;
+		}
+		if (refuses && applies) return null;
+		if (refuses) return "not-apply";
+		if (applies) return "applies";
 		return null;
 	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one

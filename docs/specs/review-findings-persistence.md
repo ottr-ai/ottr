@@ -142,19 +142,22 @@ open leads, and lands the question card Done (`stage: "done"`, `state: "idle"`,
   per-question answer.
 
 Free text rides the same verdict (OTTR-1227): after the exact labels miss, the
-classifier `leadAnswerVerdict` reads the answer's words in order. Uncertainty
-first ("do not know", "not sure", "maybe") reads as unclassified, so an
-uncertain answer never turns its keywords into a decision. A negated
+classifier `leadAnswerVerdict` reads the answer in order. Hedged and
+unevidenced wording first ("do not know", "cannot confirm", "possibly",
+"no evidence") reads as unclassified, so an uncertain answer never turns its
+keywords into a decision. An answer that starts with "no" is the operator's
+bare refusal and cancels, whatever follows. Otherwise the answer splits into
+clauses at sentence and comma boundaries: a clause whose negator sits with an
 applicability word ("does not apply", "isn't applicable", "no longer
-relevant", "couldn't be more applicable" — the negator sits near its word)
-applies the `No, it does not apply` rule. A bare applicability word
-("applies", "applicable", "relevant") or "yes" applies the `Yes, the risk
-applies` rule. An answer that starts with "no" is the operator's bare refusal
-and cancels. Anything else is unclassified. The not-apply cancel reason quotes
-the answer and, when the lead's details carry the settle's note, the asking
-run: `Cancelled by the user's answer to the review's question: <answer>
-(validation run #<run id>)`. Unclassified text appends the answer with a note
-that no option matched, so the lead stays unchanged and the operator sees why.
+relevant", "without applying") refuses, and a clause with a bare applicability
+word ("applies", "applicable", "relevant") or "yes" confirms. A mix of both
+across clauses is unclassified. Negation reads inside its own clause, so a
+side note in another clause ("authentication is not enabled") never flips the
+verdict. Unclassified text appends the answer with a note that no option
+matched, so the lead stays unchanged and the operator sees why. The not-apply
+cancel reason quotes the answer and, when the lead's details carry the
+settle's note, the asking run: `Cancelled by the user's answer to the review's
+question: <answer> (validation run #<run id>)`.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
   still open (not cancelled, not done). A complete reply lands the card Done
   inside the same reply, so a second reply is refused (409, not needs_you). A
