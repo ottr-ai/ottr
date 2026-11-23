@@ -1,5 +1,11 @@
-import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import {
+	mkdirSync,
+	mkdtempSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -613,6 +619,7 @@ describe("gateHandoff", () => {
 	const dir = mkdtempSync(join(tmpdir(), "gate-handoff-"));
 	const handoffs = join(dir, "handoffs");
 	mkdirSync(handoffs, { recursive: true });
+	afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
 	test("the first path inside the handoffs folder is read through the real filesystem", () => {
 		writeFileSync(join(handoffs, "h.md"), "the real steps");
@@ -982,8 +989,17 @@ describe("replayGateParks", () => {
 			lines,
 		};
 	};
-	const open = async (): Promise<ProjectStore> =>
-		ProjectStore.open(mkdtempSync(join(tmpdir(), "gate-replay-")));
+	const replayDirs: string[] = [];
+	const open = async (): Promise<ProjectStore> => {
+		const dir = mkdtempSync(join(tmpdir(), "gate-replay-"));
+		replayDirs.push(dir);
+		return ProjectStore.open(dir);
+	};
+	afterAll(() => {
+		for (const dir of replayDirs) {
+			rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+		}
+	});
 
 	test("parked gate cards in two projects re-queue once and the stamp lands", async () => {
 		const a = await open();

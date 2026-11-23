@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -72,10 +72,10 @@ describe("dev board bootstrap", () => {
 	test("a .dev root held by another board seeds a root of its own per port", async () => {
 		held = "/x/.dev/lumen/.tasks/tasks.db";
 		seeded.length = 0;
+		// The workers home is set so the env fixture is written to a temp dir, not to
+		// a .dev-5801 folder in the checkout.
+		const home = mkdtempSync(join(tmpdir(), "dev-board-"));
 		try {
-			// The workers home is set so the env fixture is written to a temp dir, not to
-			// a .dev-5801 folder in the checkout.
-			const home = mkdtempSync(join(tmpdir(), "dev-board-"));
 			await boot({ PORT: "5801", OTTR_WORKERS_HOME: home }, () => {
 				const root = resolve(import.meta.dir, "..", ".dev-5801");
 				expect(seeded).toEqual([root]);
@@ -84,6 +84,7 @@ describe("dev board bootstrap", () => {
 			});
 		} finally {
 			held = null;
+			rmSync(home, { recursive: true, force: true });
 		}
 	});
 

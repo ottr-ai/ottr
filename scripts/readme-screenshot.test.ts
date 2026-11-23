@@ -1,5 +1,5 @@
-import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import type { Scenario, Trace } from "./readme-screenshot.fixture.ts";
@@ -21,11 +21,20 @@ type Result = {
 	boards: Extract<Trace, { kind: "board-spawn" }>[];
 };
 
+/** Roots run() created; the afterAll removes them after the tests have read their capture files. */
+const roots: string[] = [];
+afterAll(() => {
+	for (const root of roots) {
+		rmSync(root, { recursive: true, force: true, maxRetries: 5 });
+	}
+});
+
 async function run(
 	scenario: Scenario,
 	inheritedEnv: Record<string, string> = {},
 ): Promise<Result> {
 	const root = mkdtempSync(join(tmpdir(), "readme-screenshot-test-"));
+	roots.push(root);
 	const inheritedRoot = join(root, "inherited-demo");
 	const inheritedState = join(root, "inherited-state");
 	const child = Bun.spawn(

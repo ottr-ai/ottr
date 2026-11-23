@@ -486,6 +486,7 @@ test("a failed demo project seed leaves no partial rows", async () => {
 		).toBeNull();
 	} finally {
 		db.close();
+		rmSync(failedRoot, { recursive: true, force: true });
 	}
 });
 

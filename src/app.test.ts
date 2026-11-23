@@ -240,15 +240,16 @@ async function closeTestStore(
 const root = mkdtempSync(join(tmpdir(), "app-routes-"));
 
 const testBoxes = new WeakMap<object, SecretBox>();
+/** Box homes testBox() created; the shared afterAll removes them once the stores are closed. */
+const boxDirs: string[] = [];
 /** One stable SecretBox per store: mounts that share a gstore share a key, so a
  * re-mount of a sealed row opens it again instead of regenerating (ADR-0011). */
 function testBox(gstore: object): SecretBox {
 	let box = testBoxes.get(gstore);
 	if (box === undefined) {
-		box = loadSecretBox({
-			dir: mkdtempSync(join(tmpdir(), "app-box-")),
-			env: {},
-		});
+		const dir = mkdtempSync(join(tmpdir(), "app-box-"));
+		boxDirs.push(dir);
+		box = loadSecretBox({ dir, env: {} });
 		testBoxes.set(gstore, box);
 	}
 	return box;
@@ -353,6 +354,7 @@ afterAll(async () => {
 	// Windows cannot delete an open db: every store under root must be closed before the rm.
 	for (const g of mountStores) await closeTestStore(g);
 	for (const d of sshTempDirs) rmSync(d, { recursive: true, force: true });
+	for (const d of boxDirs) rmSync(d, { recursive: true, force: true });
 	removeSshKeygenStub();
 	rmSync(root, { recursive: true, force: true, maxRetries: 5 });
 	// The whole-shutdown sweep (every mounted server's graceful stop, then the root rm) passes

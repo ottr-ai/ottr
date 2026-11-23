@@ -1154,6 +1154,7 @@ describe("arch-review changed-line coverage", () => {
 			);
 		} finally {
 			await store.close();
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
