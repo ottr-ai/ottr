@@ -121,36 +121,77 @@ describe("server secrets never reach a child process", () => {
 	const PROXY_WITH_CREDS =
 		"http://proxy-user:proxy-pass@corp-proxy.invalid:8080";
 
-	test("the gates strip every server credential name", async () => {
+	/** Sets a leak marker for every stripped name plus the proxy, then restores. */
+	async function withGateMarkers<T>(fn: () => Promise<T>): Promise<T> {
 		const prev = new Map<string, string | undefined>();
-		const markers = new Map<string, string>();
 		for (const name of STRIPPED) {
 			prev.set(name, process.env[name]);
-			const value = `leak-${name}`;
-			markers.set(name, value);
-			process.env[name] = value;
+			process.env[name] = `leak-${name}`;
 		}
 		prev.set("HTTPS_PROXY", process.env.HTTPS_PROXY);
 		process.env.HTTPS_PROXY = PROXY_WITH_CREDS;
-		const echoes = [...STRIPPED, "HTTPS_PROXY"]
-			.map((name) => `echo "${name}=\${${name}:-unset}"`)
-			.join("; ");
-		const dir = fixture(`${echoes}; exit 1`, "");
 		try {
-			const r = await withSecret(() => runMergeGates(dir));
-			expect(r.ok).toBe(false);
-			for (const name of STRIPPED) expect(r.output).toContain(`${name}=unset`);
-			// The proxy URL keeps its host and loses its userinfo.
-			expect(r.output).toContain("HTTPS_PROXY=http://corp-proxy.invalid:8080");
-			for (const [, value] of markers) expect(r.output).not.toContain(value);
-			expect(r.output).not.toContain(SECRET);
-			expect(r.output).not.toContain(MASTER_KEY);
-			expect(r.output).not.toContain("proxy-user:proxy-pass");
+			return await fn();
 		} finally {
 			for (const [name, value] of prev) {
 				if (value === undefined) delete process.env[name];
 				else process.env[name] = value;
 			}
+		}
+	}
+
+	/** No leak marker value may appear anywhere in the child's output. */
+	function expectNoMarkers(output: string): void {
+		for (const name of STRIPPED) expect(output).not.toContain(`leak-${name}`);
+		expect(output).not.toContain(SECRET);
+		expect(output).not.toContain(MASTER_KEY);
+		expect(output).not.toContain("proxy-user:proxy-pass");
+	}
+
+	test("the check gate strips every server credential name", async () => {
+		const echoes = [...STRIPPED, "HTTPS_PROXY"]
+			.map((name) => `echo "${name}=\${${name}:-unset}"`)
+			.join("; ");
+		const dir = fixture(`${echoes}; exit 1`, "");
+		try {
+			const r = await withGateMarkers(() =>
+				withSecret(() => runMergeGates(dir)),
+			);
+			expect(r.ok).toBe(false);
+			for (const name of STRIPPED) expect(r.output).toContain(`${name}=unset`);
+			// The proxy URL keeps its host and loses its userinfo.
+			expect(r.output).toContain("HTTPS_PROXY=http://corp-proxy.invalid:8080");
+			expectNoMarkers(r.output);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the test gate strips every server credential name", async () => {
+		const picks = [...STRIPPED, "HTTPS_PROXY"]
+			.map((name) => `${name}: process.env.${name} ?? null`)
+			.join(", ");
+		const dir = fixture(
+			"exit 0",
+			`throw new Error("probe=" + JSON.stringify({ ${picks} }));`,
+		);
+		try {
+			const r = await withGateMarkers(() =>
+				withSecret(() => runMergeGates(dir)),
+			);
+			// The probe test always throws, so the ordered gate reaches bun test
+			// and reports each name's set or unset state in the failure output.
+			expect(r.ok).toBe(false);
+			const m = r.output.match(/probe=(\{.*\})/);
+			const seen = JSON.parse(m?.[1] ?? "null") as Record<
+				string,
+				string | null
+			> | null;
+			expect(seen).not.toBeNull();
+			for (const name of STRIPPED) expect(seen?.[name]).toBeNull();
+			expect(seen?.HTTPS_PROXY).toBe("http://corp-proxy.invalid:8080");
+			expectNoMarkers(r.output);
+		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
