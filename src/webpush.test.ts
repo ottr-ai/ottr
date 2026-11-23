@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { Agent as HttpAgent, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GlobalStore } from "./globalStore.ts";
@@ -9,6 +10,7 @@ import {
 	loadSubs,
 	PUSH_SUBJECT,
 	type PushSub,
+	pinnedLookup,
 	pruneSubs,
 	saveSubs,
 	sendAll,
@@ -504,5 +506,34 @@ describe("pruneSubs", () => {
 			"https://x/3",
 		]);
 		await store.close();
+	});
+});
+
+describe("pinnedLookup", () => {
+	// The runtime proof of the DNS-rebinding wall (OTTR-1012): net's connect path must
+	// honor the lookup override, so a send reaches the checked address even when the
+	// endpoint's hostname cannot resolve at all. TLS rides the same option beneath it.
+	test("the socket connects to the pinned address, never a fresh DNS answer", async () => {
+		const srv = Bun.serve({ port: 0, fetch: () => new Response("pinned") });
+		const { promise, resolve, reject } = Promise.withResolvers<number>();
+		const req = httpRequest(
+			{
+				host: "no-such-host.ottr.test",
+				port: srv.port,
+				path: "/",
+				agent: new HttpAgent({ lookup: pinnedLookup("127.0.0.1") }),
+			},
+			(res) => {
+				res.resume();
+				res.on("end", () => resolve(res.statusCode ?? 0));
+			},
+		);
+		req.on("error", reject);
+		req.end();
+		try {
+			expect(await promise).toBe(200);
+		} finally {
+			srv.stop(true);
+		}
 	});
 });

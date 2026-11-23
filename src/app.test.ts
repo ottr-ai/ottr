@@ -193,6 +193,7 @@ import {
 // before app.ts evaluates — mock.module cannot intercept a static import — so app.ts loads
 // through the await below (deliberate module-load boundary, the rule's test exception).
 const pushSends: Array<{ endpoint: string; payload: string }> = [];
+const pushSendOptions: unknown[] = [];
 let pushFail: { statusCode?: number } | null = null;
 let vapidApplied: {
 	subject: string;
@@ -207,8 +208,13 @@ mock.module("web-push", () => ({
 	setVapidDetails: (subject: string, publicKey: string, privateKey: string) => {
 		vapidApplied = { subject, publicKey, privateKey };
 	},
-	sendNotification: async (sub: { endpoint: string }, payload: string) => {
+	sendNotification: async (
+		sub: { endpoint: string },
+		payload: string,
+		options: unknown,
+	) => {
 		pushSends.push({ endpoint: sub.endpoint, payload });
+		pushSendOptions.push(options);
 		if (pushFail !== null)
 			throw Object.assign(new Error("push rejected"), pushFail);
 		return {};
@@ -18785,6 +18791,41 @@ describe("hosted owner-URL wall (OTTR-1012)", () => {
 		expect(test.status).toBe(200);
 		expect(await test.json()).toEqual({ ok: true, sent: 1 });
 		expect(pushSends.at(-1)?.endpoint).toBe(loopback);
+	});
+
+	test("hosted sends pin the checked address; self-host passes no agent", async () => {
+		const { m, owner } = await hostedBoard();
+		// A public literal IP passes the wall: the send carries the pinned-address agent.
+		expect(
+			(
+				await m.call(
+					"/api/push/subscribe",
+					{
+						endpoint: "https://93.184.216.34/x",
+						keys: { p256dh: "k", auth: "a" },
+					},
+					owner(),
+				)
+			).status,
+		).toBe(200);
+		expect((await m.call("/api/push/test", {}, owner())).status).toBe(200);
+		const hosted = pushSendOptions.at(-1) as
+			| { agent?: { options?: { lookup?: unknown } } }
+			| undefined;
+		expect(typeof hosted?.agent?.options?.lookup).toBe("function");
+		// Self-host keeps the plain transport: no agent option at all.
+		const plain = await mount({});
+		expect(
+			(
+				await plain.call("/api/push/subscribe", {
+					endpoint: "https://push.example/plain",
+					keys: { p256dh: "k", auth: "a" },
+				})
+			).status,
+		).toBe(200);
+		expect((await plain.call("/api/push/test", {})).status).toBe(200);
+		const selfHost = pushSendOptions.at(-1) as { agent?: unknown } | undefined;
+		expect(selfHost?.agent).toBeUndefined();
 	});
 
 	test("hosted mode refuses an Alate URL at a private address; a public literal IP saves", async () => {

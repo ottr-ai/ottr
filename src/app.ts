@@ -471,6 +471,7 @@ import {
 	loadSubs,
 	PUSH_SUBJECT,
 	type PushSub,
+	pinnedSend,
 	pruneSubs,
 	saveSubs,
 	sendAll,
@@ -10583,12 +10584,17 @@ export async function createApp(deps: AppDeps) {
 		return null;
 	}
 
-	/** The send seam every fan-out passes to sendAll: hosted mode refuses a blocked
-	 * endpoint as one failed send (reportFailure keeps the row) and opens no connection. */
+	/** The send seam every fan-out passes to sendAll: hosted mode checks the endpoint and
+	 * pins the approved address into the connection (web-push forwards the agent option to
+	 * https.request), so its own resolver cannot re-resolve the host at connect time. A
+	 * blocked endpoint is one failed send (reportFailure keeps the row), no connection. */
 	async function guardedSend(sub: PushSub, payload: string): Promise<unknown> {
-		const refused = await hostedUrlMessage(sub.endpoint);
-		if (refused !== null) throw new Error(refused);
-		return await sendNotification(sub, payload);
+		if (deps.hosted === undefined) return await sendNotification(sub, payload);
+		const pin = await assertAllowedHost(sub.endpoint, { hosted: true });
+		// hosted: true always pins; null is unreachable here, and refusing beats an unpinned send.
+		if (pin === null)
+			throw new Error("no pinned address for the push endpoint");
+		return await pinnedSend(sendNotification, pin)(sub, payload);
 	}
 
 	async function handlePOSTPushTest(): Promise<Response> {
@@ -14602,22 +14608,23 @@ export async function createApp(deps: AppDeps) {
 			const noBox = sealGuard();
 			if (noBox !== null) return noBox;
 		}
-		// Validate into a copy (R1-10): a bad later key must not leave the earlier
-		// key live — health, provision and the turns read the old config until the
-		// whole body validates.
-		const next = { ...alate };
+		// Validate the whole patch before any state moves (R1-10): a bad later key leaves
+		// the earlier keys unapplied. The patch merges into the live state only after the
+		// last await (the hosted DNS check): a save that raced another must not restore
+		// its stale copy over the other save's landed values.
+		const patch: Partial<typeof alate> = {};
 		for (const key of ["url", "key", "repo", "branch"] as const) {
 			const v = body[key];
 			if (v === undefined) continue;
 			const valid = await validateAlateValue(key, v);
 			if (valid instanceof Response) return valid;
-			next[key] = valid;
+			patch[key] = valid;
 		}
 		// The body carried the key: a value that normalizes to null (an explicit
 		// null or an empty string) is an operator clear, and it must win over a
 		// kept-unreadable blob (ADR-0011).
-		if (next.key === null && body.key !== undefined) clearSecret("alateKey");
-		alate = next;
+		if (patch.key === null && body.key !== undefined) clearSecret("alateKey");
+		alate = { ...alate, ...patch };
 		await saveConfig();
 		return json(alateView());
 	}

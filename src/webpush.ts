@@ -1,12 +1,57 @@
 // Web Push: VAPID subject, subscription store (with per-device alert classes), fan-out. Event
 // diffing and payloads live in notifications.ts. Network I/O is injected (`send`) so tests never
 // hit a push service; server.ts passes web-push's sendNotification.
+import { Agent as HttpsAgent } from "node:https";
+import { isIP, type LookupFunction } from "node:net";
 import type { GlobalStore } from "./globalStore.ts";
 import {
 	ALERT_CLASSES,
 	ALL_CLASSES_ON,
 	type ClassPrefs,
 } from "./notifications.ts";
+
+/**
+ * A lookup function that always answers `pin`, the address the hosted wall checked
+ * (jira.ts's pinnedFetch pins the same way): the connection cannot re-resolve the
+ * endpoint's host, so a DNS answer that flips between check and connect is refused
+ * by construction. `all` answers the list form net's happy-eyeballs path asks for.
+ */
+export const pinnedLookup =
+	(pin: string): LookupFunction =>
+	(_host, opts, cb) => {
+		const family = isIP(pin) === 6 ? 6 : 4;
+		if (opts.all) cb(null, [{ address: pin, family }]);
+		else cb(null, pin, family);
+	};
+
+/** An https agent carrying pinnedLookup: web-push forwards the `agent` option to
+ * https.request (web-push-lib.js), so a send connects to the checked address only. */
+export function pinnedAgent(pin: string): HttpsAgent {
+	return new HttpsAgent({ lookup: pinnedLookup(pin) });
+}
+
+/** The pinned send seam: checks are done, `pin` is approved. web-push's published types
+ * predate its `agent` option, so the forward rides one narrow lift here. The agent dies
+ * with the send; no pooled socket outlives the endpoint it was pinned for. */
+export function pinnedSend(
+	sendNotification: (sub: PushSub, payload: string) => Promise<unknown>,
+	pin: string,
+): (sub: PushSub, payload: string) => Promise<unknown> {
+	return async (sub, payload) => {
+		const agent = pinnedAgent(pin);
+		try {
+			return await (
+				sendNotification as (
+					sub: PushSub,
+					payload: string,
+					options: { agent: HttpsAgent },
+				) => Promise<unknown>
+			)(sub, payload, { agent });
+		} finally {
+			agent.destroy();
+		}
+	};
+}
 
 // Apple's push service answers 403 BadJwtToken for an @localhost subject; a real https URL it accepts.
 export const PUSH_SUBJECT = "https://github.com/ottr-ai/ottr";
