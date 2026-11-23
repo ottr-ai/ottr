@@ -297,21 +297,37 @@ describe("parseEarlierVerdicts", () => {
 		expect(parseEarlierVerdicts(text, known)).toEqual({ text, fixed: [] });
 	});
 
-	test("stripping first lets parseBlockingVerdict honor a trailing blocking line", () => {
-		// The composed flow: the earlier verdict lines come out, so the blocking
-		// verdict after them is the last non-blank line and decides.
+	test("the blocking scan runs on the full answer, then the earlier lines come out", () => {
+		// The composed flow: parseBlockingVerdict sees the whole answer first
+		// (the blocking line is its last non-blank line and decides), then the
+		// earlier verdict lines come out of the surviving text.
 		const draft = [
 			"## Summary",
 			"<!-- earlier verdict: 9001 fixed -->",
 			"<!-- earlier verdict: 9002 open -->",
 			"<!-- blocking: no -->",
 		].join("\n");
-		const { text, fixed } = parseEarlierVerdicts(draft, known);
+		const verdict = parseBlockingVerdict(draft);
+		expect(verdict.blocking).toBe(false);
+		const { text, fixed } = parseEarlierVerdicts(verdict.text, known);
+		expect(text).toBe("## Summary");
 		expect(fixed).toEqual([first]);
-		expect(parseBlockingVerdict(text)).toEqual({
-			text: "## Summary",
-			blocking: false,
-		});
+	});
+
+	test("content after the blocking line fails safe even in verdict shape", () => {
+		// A malformed earlier-verdict line after the blocking line is trailing
+		// content for the blocking scan: it fails safe to blocking, like any
+		// other content after the verdict.
+		const draft = [
+			"## Summary",
+			"<!-- blocking: no -->",
+			"<!-- earlier verdict: abc fixed -->",
+		].join("\n");
+		const verdict = parseBlockingVerdict(draft);
+		expect(verdict.blocking).toBe(true);
+		const { text, fixed } = parseEarlierVerdicts(verdict.text, known);
+		expect(text).toBe("## Summary");
+		expect(fixed).toEqual([]);
 	});
 });
 

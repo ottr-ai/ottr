@@ -1718,16 +1718,19 @@ async function reviewOnce(
 				{ role: "user", content: user },
 			]),
 		).text;
-		// The earlier verdict lines come out before the blocking scan, so the blocking
-		// verdict stays the stripped text's last non-blank line; a degraded re-review
-		// has no findings to key the votes to, so none can count fixed.
+		// The blocking verdict is scanned against the model's whole answer first:
+		// any non-blank content after the blocking line — an earlier-verdict line
+		// included — fails safe to blocking, exactly like the pre-verdict flow.
+		// The earlier verdict lines then come out of the surviving text; a
+		// degraded re-review has no findings to key the votes to, so none can
+		// count fixed.
+		const verdict = parseBlockingVerdict(stripped);
 		const earlierVerdicts = parseEarlierVerdicts(
-			stripped,
+			verdict.text,
 			degraded || earlier === null ? [] : earlier.findings,
 		);
-		const verdict = parseBlockingVerdict(earlierVerdicts.text);
 		// Fit before the cap: a block GitHub would reject on this diff moves into the body.
-		const fitted = fitDraftToDiff(verdict.text, diff);
+		const fitted = fitDraftToDiff(earlierVerdicts.text, diff);
 		const draft = parseDraft(fitted.text);
 		if (fitted.moved > 0)
 			ctx.log(

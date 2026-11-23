@@ -11440,9 +11440,17 @@ export async function createApp(deps: AppDeps) {
 		let tok: string | null = null;
 		if (githubApp !== null && appTokens !== null) {
 			try {
-				tok = await appTokens.tokenFor(o.owner, o.repoName);
+				// resolveReviewThread needs Contents: read and write on top of
+				// Pull requests: read and write (community discussion #44650), so
+				// the mint asks for both. An installation without the Contents
+				// grant fails the mint, and the board token transports instead.
+				tok = await appTokens.tokenFor(o.owner, o.repoName, {
+					pull_requests: "write",
+					contents: "write",
+				});
 			} catch {
-				// A mint failure means no app token: the board token transports instead.
+				// A mint failure means no usable app token: the board token
+				// transports instead.
 				tok = null;
 			}
 		}
@@ -11848,9 +11856,16 @@ export async function createApp(deps: AppDeps) {
 							fixed: row.fixedThreads,
 						})
 					: null;
-			// A skipped review, a failed dismissal, or a failed resolve must show on
-			// the card: the note lands in post_error, the post itself stays.
-			const postError = dismissError ?? resolveError ?? changesSkipped ?? null;
+			// A failed downsizing, dismissal, or resolve must show on the card:
+			// the notes land in post_error joined into one line, so a failed
+			// dismissal can never mask a failed thread resolve (the post itself
+			// stays).
+			const failures = [
+				dismissError,
+				resolveError,
+				...(changesSkipped !== undefined ? [changesSkipped] : []),
+			].filter((failure) => failure !== null);
+			const postError = failures.length > 0 ? failures.join("; ") : null;
 			if (postError !== null)
 				await e.store.setPrPostError(row.number, postError);
 			// The posted review's own comments must never alert: the baseline is the post time.

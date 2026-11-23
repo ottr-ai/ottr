@@ -20137,7 +20137,9 @@ describe(
 						path,
 					);
 				if (empty) return { code: 0, stdout: "[]", stderr: "" };
-				if (/^repos\/acme\/widget\/pulls\/\d+\/reviews\?per_page=100$/.test(path))
+				if (
+					/^repos\/acme\/widget\/pulls\/\d+\/reviews\?per_page=100$/.test(path)
+				)
 					return {
 						code: 0,
 						stdout: JSON.stringify(replyReviewsAnswer),
@@ -21118,6 +21120,83 @@ describe(
 				expect(view.prReview?.postError).toContain("thread RT7");
 			});
 
+			test("a failed dismissal and a failed resolve both reach post_error", async () => {
+				await removeApp();
+				// The earlier post requested changes; its link carries review 7. The
+				// later draft is clean and fixed: the post dismisses review 7 and
+				// resolves the fixed finding's thread. Both fail; both must show.
+				await prStore.savePrReview({
+					number: 84,
+					taskId: null,
+					head: H1,
+					firstSeenAt: 0,
+					reviewedHead: null,
+					postedHead: "0".repeat(40),
+					postedUrl:
+						"https://github.com/acme/widget/pull/84#pullrequestreview-555",
+					postedLogin: "ottr[bot]",
+					postedEvent: "REQUEST_CHANGES",
+					postedVia: "user",
+					state: "open",
+					draft: false,
+					title: "Fix it",
+					postError: null,
+					fixedThreads: [],
+					commentsAt: null,
+					commentsUnseen: false,
+				});
+				const t = await reviewed(84, H1, true, false, [
+					{ id: 9003, path: "src/c.ts", line: 12 },
+				]);
+				await prStore.setPrPostedUrl(
+					84,
+					"https://github.com/acme/widget/pull/84#pullrequestreview-7",
+					"octocat",
+					"REQUEST_CHANGES",
+				);
+				// The resolve mutation exits non-zero; the thread read answers fine.
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? {
+								code: 1,
+								stdout: "",
+								stderr: "(HTTP 403) not accessible by integration",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([["RT5", 9003, "octocat", false]]),
+								),
+								stderr: "",
+							};
+				// The review post succeeds; the dismissal PUT exits non-zero.
+				ghHook = async () => {
+					const last = ghCalls[ghCalls.length - 1] ?? [];
+					ghResult = last.some((a) => a.includes("dismissals"))
+						? {
+								code: 1,
+								stdout: "",
+								stderr: "(HTTP 403) not allowed to dismiss",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify({
+									html_url:
+										"https://github.com/acme/widget/pull/84#pullrequestreview-9",
+									user: { login: "octocat" },
+								}),
+								stderr: "",
+							};
+				};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				// The post stands; both failures share the one post_error line.
+				expect((await row(84)).postedHead).toBe(H1);
+				expect((await row(84)).postError).toBe(
+					"(HTTP 403) not allowed to dismiss; thread RT5: (HTTP 403) not accessible by integration",
+				);
+			});
+
 			test("an empty fixed list sends no GraphQL read or resolve", async () => {
 				await removeApp();
 				// No stored fixed findings: the post resolves nothing and reads no threads.
@@ -21151,11 +21230,27 @@ describe(
 				expect(res.status).toBe(200);
 				const graphql = graphqlCalls();
 				expect(graphql).toHaveLength(2);
+				// The contract strings sit here as literals copied from GitHub's
+				// GraphQL schema, never as the implementation constants: an invalid
+				// constant must fail this test. Whitespace is flattened, so the
+				// assertion pins the shape, not the line wrapping.
+				const sentQuery = (graphql[0]?.[3] ?? "")
+					.replace(/^query=/, "")
+					.replace(/\s+/g, " ")
+					.trim();
+				const sentMutation = (graphql[1]?.[3] ?? "")
+					.replace(/^query=/, "")
+					.replace(/\s+/g, " ")
+					.trim();
+				const wantQuery =
+					"query($owner: String!, $name: String!, $number: Int!, $after: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id isResolved comments(first: 1) { nodes { databaseId author { login } } } } } } } }";
+				const wantMutation =
+					"mutation($threadId: ID!) { resolveReviewThread(input: { threadId: $threadId }) { thread { id isResolved } } }";
 				expect(graphql[0]).toEqual([
 					"api",
 					"graphql",
 					"-f",
-					`query=${REVIEW_THREADS_QUERY}`,
+					expect.any(String),
 					"-f",
 					"owner=acme",
 					"-f",
@@ -21163,14 +21258,16 @@ describe(
 					"-F",
 					"number=83",
 				]);
+				expect(sentQuery).toBe(wantQuery);
 				expect(graphql[1]).toEqual([
 					"api",
 					"graphql",
 					"-f",
-					`query=${RESOLVE_THREAD_MUTATION}`,
+					expect.any(String),
 					"-f",
 					"threadId=RT_abc123",
 				]);
+				expect(sentMutation).toBe(wantMutation);
 			});
 
 			// --- Reply asks for a new draft (OTTR-565): the note runs reviewNow for the current

@@ -559,7 +559,10 @@ function parseFixedThreads(raw: string | null | undefined): FixedThread[] {
 	}
 	if (!Array.isArray(parsed)) return [];
 	const threads: FixedThread[] = [];
-	for (const entry of parsed.slice(0, 200)) {
+	// No count cap: the column holds the posted review's own inline findings,
+	// and the earlier-review reader already bounds their number (30 pages of
+	// 100). A valid finding past any guessable cap must still resolve.
+	for (const entry of parsed) {
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry))
 			continue;
 		const { id, path, line } = entry as Record<string, unknown>;
