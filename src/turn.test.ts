@@ -16117,6 +16117,121 @@ describe("work card check", () => {
 		expect((await store.getTask(task.id))!.state).toBe("needs_you");
 	});
 
+	// AGEN-120: a check whose `done` rejects after the turn row closed must not leak its
+	// `running` entry (the cap counts map keys) nor leave the card at running.
+	test("a check that throws after the turn ended parks the card and frees its entry", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const checkDone = Promise.withResolvers<RunResult>();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			scheduledCap: 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			workCheck: () => true,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done:
+						record.runs.length === 1
+							? Promise.resolve(
+									runResult({
+										outcome: {
+											status: "ready",
+											summary: "did it",
+										} satisfies Outcome,
+									}),
+								)
+							: checkDone.promise,
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await eventually(() =>
+			loop.running.has(`${store.name}/${task.id}:workcheck`),
+		);
+		expect((await store.getTask(task.id))!.state).toBe("running");
+
+		checkDone.reject(new Error("worker stream died"));
+		await run;
+
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("Tracker error: worker stream died");
+		// The rejected `done` must not leak the check entry behind the park.
+		expect(loop.running.has(`${store.name}/${task.id}:workcheck`)).toBe(false);
+	});
+
+	// AGEN-120: the check phase runs after the run's own row closed, so a vanished check
+	// entry leaves the card running with nothing alive to stop or reply to. Within the
+	// check limit the sweep must leave it alone (a check between attempts holds no entry
+	// for seconds); past the limit the reconcile parks it for Reply.
+	test("the reconcile parks a running card whose check entry vanished past the check limit", async () => {
+		const head = { sha: "sha1" };
+		const record = baseRecord();
+		const checkDone = Promise.withResolvers<RunResult>();
+		let clock = Date.now();
+		const { store, loop } = await setupWith(record, {
+			holdFollowUps: true,
+			scheduledCap: 0,
+			commitsAhead: async () => 1,
+			targetSha: async () => head.sha,
+			workCheck: () => true,
+			now: () => clock,
+			startRun: async (o: Parameters<TurnOps["startRun"]>[0]) => {
+				record.runs.push(o);
+				await o.onSession?.("sess");
+				return {
+					pid: 4242,
+					done:
+						record.runs.length === 1
+							? Promise.resolve(
+									runResult({
+										outcome: {
+											status: "ready",
+											summary: "did it",
+										} satisfies Outcome,
+									}),
+								)
+							: checkDone.promise,
+					kill: async () => {},
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		const checkKey = `${store.name}/${task.id}:workcheck`;
+		await eventually(() => loop.running.has(checkKey));
+		expect((await store.getTask(task.id))!.state).toBe("running");
+
+		// The phantom: the check entry vanishes with no state write behind it.
+		loop.running.delete(checkKey);
+
+		// Inside the check limit the card is only between attempts: no park.
+		await loop.schedule();
+		expect((await store.getTask(task.id))!.state).toBe("running");
+
+		// Past the check limit with no live proof, the reconcile parks it needs_you.
+		clock += 31 * 60 * 1000;
+		await loop.schedule();
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("no live run or check");
+		expect(after.needsReason).toContain("Reply to resume the card");
+		expect(await logText(store, task.id)).toContain(
+			"reconcile: no live run or check",
+		);
+
+		// The late check result must not clobber the park.
+		checkDone.resolve(pass());
+		await run;
+		expect((await store.getTask(task.id))!.state).toBe("needs_you");
+	});
+
 	test("a blocker whose quote matches nothing demotes to a note beside a real note", async () => {
 		const head = { sha: "sha1" };
 		const { store, loop } = await workCheckCase(head, [
@@ -17802,7 +17917,9 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		expect(after.pendingPrompt).toBeNull();
 	});
 
-	test("a running card whose last row already ended is not settled again", async () => {
+	// AGEN-120: the row-based settles stop at the ended row, and the reconcile owns the
+	// card: it parks it for Reply without touching the settled row.
+	test("the reconcile parks a running card whose last row already ended", async () => {
 		const { store, loop } = await sweepSetup();
 		const task = await store.createTask("between run and check");
 		await store.updateTask(task.id, { state: "running" });
@@ -17815,7 +17932,9 @@ describe("turn survivor round 5 — sweep, schedule, release publish, reviews", 
 		const turn = (await store.listTurns(task.id))[0]!;
 		expect(turn.endedAt).toBe(1);
 		expect(turn.error).toBeNull();
-		expect((await store.getTask(task.id))!.state).toBe("running");
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toContain("no live run or check");
 	});
 
 	test("a pid-less open row whose worker stream is live is left alone", async () => {

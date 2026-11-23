@@ -1083,6 +1083,9 @@ export interface TurnOps {
 		token: string | undefined,
 		id: string,
 	) => Promise<void>;
+	/** The lost-run sweep's clock; absent reads Date.now(). Tests inject a fake one so
+	 * the phantom reconcile can age a card past the check limit without waiting. */
+	now?: () => number;
 	startRun: (
 		...args: Parameters<typeof startRun>
 	) => ReturnType<typeof startRun> | Promise<ReturnType<typeof startRun>>;
@@ -1908,6 +1911,12 @@ function pickLeadMatch(
 	return null;
 }
 
+/** The check run's own cap (startCheckRun's maxTime) in seconds, and the same bound in
+ * ms for the phantom reconcile: one check attempt may hold no entry for no longer than
+ * this, so a running card with no live proof beyond it is lost (AGEN-120). */
+const CHECK_MAX_TIME = "1800";
+const CHECK_LIMIT_MS = 30 * 60 * 1000;
+
 export function createTurnLoop(
 	projects: Map<string, TurnProject>,
 	ops: TurnOps,
@@ -2202,6 +2211,12 @@ export function createTurnLoop(
 	 * one and cancel kills it; nothing persists, so a server restart re-registers them from the
 	 * workers' answers in recoverRestarted. */
 	const detached = new Map<string, { url: string; runId: string }>();
+	/** Per card key, when the sweep last saw live proof (a run, check, or detached
+	 * entry). The phantom reconcile ages from this, not from the turn row's end: the
+	 * seconds between two check attempts hold no entry, and aging from endedAt would
+	 * park that gap as lost. */
+	const lastLiveAt = new Map<string, number>();
+	const sweepNow = (): number => ops.now?.() ?? Date.now();
 	/** OTTR-532: "project/id" → when vm-runner last refused the card's dispatch as busy; the
 	 * pre-claim gate waits VM_BUSY_RETRY_MS before the next try. Cleared by the next dispatch
 	 * vm-runner takes (with the card's vmState.busy mark). OTTR-1142: with a known pool
@@ -2806,15 +2821,15 @@ export function createTurnLoop(
 	}
 
 	/** One card's open turn row: classify it lost (worker run with no live proof, or a dead
-	 * pid) and record the settle arguments. */
+	 * pid) and record the settle arguments. True: the row lands in `lost` for a settle. */
 	async function collectLostRow(
 		e: TurnProject,
 		t: ListedTask,
 		key: string,
 		lost: LostRun[],
-	): Promise<void> {
+	): Promise<boolean> {
 		const turn = (await e.store.listTurns(t.id)).at(-1);
-		if (!turn || turn.endedAt !== null) return;
+		if (!turn || turn.endedAt !== null) return false;
 		// A live runTurn owns its row from the claim until its settle writes: the omp pid can
 		// be dead while slow post-run git work is still in flight (running.delete happened,
 		// the preparing claim has not), and settling under it would make runTurn settle the
@@ -2826,20 +2841,60 @@ export function createTurnLoop(
 			preparing.has(key) &&
 			!(turn.pid !== null && running.get(key)?.pid === turn.pid)
 		)
-			return;
+			return false;
 		if (turn.pid === null) {
 			// Worker run: the live stream in `running` is the liveness proof. A local spawn failure
 			// stores pid null too but settles its row in runTurn's catch; and running.set precedes
 			// store.startTurn, so a sweep cannot see an open pid-null row for a
 			// live local run. A pid-null lost row therefore has no live entry to abandon by
 			// construction — the abandonment block below is pid-path only.
-			if (lostWorkerRow(key))
+			if (lostWorkerRow(key)) {
 				lost.push({ e, id: t.id, turnId: turn.id, pid: null });
-			return;
+				return true;
+			}
+			return false;
 		}
-		if (ops.pidAlive(turn.pid)) return;
+		if (ops.pidAlive(turn.pid)) return false;
 		abandonDeadEntry(key, turn);
 		lost.push({ e, id: t.id, turnId: turn.id, pid: turn.pid });
+		return true;
+	}
+
+	/** One running card the reconcile parks: in-flight state with no live proof. */
+	interface PhantomRun {
+		e: TurnProject;
+		id: string;
+		idleMs: number;
+	}
+
+	/** The reconcile (AGEN-120): the check phase keeps a card running after the run's own
+	 * turn row closed, so every row-based settle path stops at `endedAt !== null`. When the
+	 * check entry then vanishes without its state write (a lost stream, a hung check prep
+	 * inside startRun, a restart whose boot sweep could not settle the card), the card sits
+	 * running forever: /stop answers "no turn is running" and /reply "task is not waiting
+	 * for you", so nothing can move it. A running card with no live run, check, or detached
+	 * entry beyond the check limit goes to needs_you, so Reply can resume it. Detection
+	 * only — nothing is killed here, and the preparing claim stays with its own turn. */
+	async function collectPhantom(
+		e: TurnProject,
+		t: ListedTask,
+		key: string,
+		phantom: PhantomRun[],
+	): Promise<void> {
+		const turn = (await e.store.listTurns(t.id)).at(-1);
+		// An open row is live work the row paths settle; their alive-pid return (a survived
+		// agent the boot sweep left running) is proof, not a phantom.
+		if (turn !== undefined && turn.endedAt === null) return;
+		const nowMs = sweepNow();
+		// Age from the last live proof, not from the row's end: a check whose first attempt
+		// ran the full limit holds no entry only for the seconds until its second attempt.
+		// A card with no row and no proof stamp yet is too new to judge — the settle paths
+		// park a failed dispatch, and a live run stamps proof within one tick.
+		const since = Math.max(lastLiveAt.get(key) ?? 0, turn?.endedAt ?? 0);
+		if (since === 0) return;
+		const idleMs = nowMs - since;
+		if (idleMs <= CHECK_LIMIT_MS) return;
+		phantom.push({ e, id: t.id, idleMs });
 	}
 
 	/** One card of the lost-run scan. */
@@ -2848,18 +2903,34 @@ export function createTurnLoop(
 		t: ListedTask,
 		lost: LostRun[],
 		lostChecks: LostCheckRun[],
+		phantom: PhantomRun[],
 	): Promise<void> {
-		// Only in-flight cards can hold an open turn row (same filter as the boot restart sweep).
-		if (t.state !== "running" && t.state !== "preparing") return;
 		const key = `${e.name}/${t.id}`;
+		// Only in-flight cards can hold an open turn row (same filter as the boot restart sweep).
+		if (t.state !== "running" && t.state !== "preparing") {
+			lastLiveAt.delete(key);
+			return;
+		}
+		const proof =
+			running.has(key) ||
+			detached.has(key) ||
+			running.has(`${key}:check`) ||
+			running.has(`${key}:workcheck`);
+		if (proof) lastLiveAt.set(key, sweepNow());
 		if (collectLostCheck(e, t, key, lostChecks)) return;
-		await collectLostRow(e, t, key, lost);
+		if (await collectLostRow(e, t, key, lost)) return;
+		// Nothing settled the row and no entry lives: the check-phase gap the row paths
+		// cannot see. A live run, check, or detached stream (proof) is never a phantom.
+		if (proof) return;
+		if (t.state === "running" && t.cancelledAt === null)
+			await collectPhantom(e, t, key, phantom);
 	}
 
 	/** The scan half of the sweep: every project's in-flight cards, one sick store isolated. */
 	async function collectLostRuns(
 		lost: LostRun[],
 		lostChecks: LostCheckRun[],
+		phantom: PhantomRun[],
 	): Promise<void> {
 		for (const e of projects.values()) {
 			let tasks: ListedTask[];
@@ -2873,7 +2944,7 @@ export function createTurnLoop(
 			}
 			for (const t of tasks) {
 				try {
-					await collectLostRun(e, t, lost, lostChecks);
+					await collectLostRun(e, t, lost, lostChecks, phantom);
 				} catch (err) {
 					logStoreError(e.store.name, err);
 				}
@@ -2922,6 +2993,41 @@ export function createTurnLoop(
 		}
 	}
 
+	/** Parks the reconcile's phantoms: needs_you with the idle span in the reason, so Reply
+	 * can resume the card. The write rechecks the card in one transaction, so a reply or a
+	 * cancel that landed since the scan keeps the card. */
+	async function settlePhantoms(phantom: PhantomRun[]): Promise<void> {
+		for (const { e, id, idleMs } of phantom) {
+			const minutes = Math.max(1, Math.round(idleMs / 60_000));
+			const reason = `The turn stalled: no live run or check for ${minutes} minute(s). Reply to resume the card, or cancel the card.`;
+			try {
+				const parked = await e.store.transaction(async () => {
+					const cur = await e.store.getTask(id);
+					if (
+						cur === null ||
+						cur.cancelledAt !== null ||
+						cur.state !== "running"
+					)
+						return false;
+					await e.store.updateTask(id, {
+						state: "needs_you",
+						needsReason: reason,
+					});
+					return true;
+				});
+				if (parked)
+					await appendLog(
+						e.store,
+						id,
+						`! reconcile: no live run or check for ${minutes} minute(s); parked the card`,
+					);
+			} catch (err) {
+				// Same isolation as the lost-row settle: a locked store rejects into the log.
+				logStoreError(e.store.name, err);
+			}
+		}
+	}
+
 	/** Settles open turns whose agent process vanished while the tracker stayed up (killed agent,
 	 * emulator hang, machine sleep): a spawned grandchild can hold the run's stdio pipes open, the
 	 * child's `close` never fires, and without this the turn row stays open forever while the
@@ -2938,10 +3044,13 @@ export function createTurnLoop(
 		// Each final transaction rechecks its row and task before it settles them.
 		const lost: LostRun[] = [];
 		const lostChecks: LostCheckRun[] = [];
-		await collectLostRuns(lost, lostChecks);
-		const settledCount = lost.length + lostChecks.length + detachedSettled;
+		const phantom: PhantomRun[] = [];
+		await collectLostRuns(lost, lostChecks, phantom);
+		const settledCount =
+			lost.length + lostChecks.length + phantom.length + detachedSettled;
 		await settleLostRows(lost);
 		await settleLostChecks(lostChecks);
+		await settlePhantoms(phantom);
 		// OTTR-884: publish on the settle edge only. A quiet sweep (nothing lost) must not
 		// bump the state version, or the single-flight cache rebuilds every tick for nothing.
 		if (settledCount > 0) ops.publishSoon();
@@ -10918,7 +11027,7 @@ export function createTurnLoop(
 			model: selector,
 			tools: "read,grep,glob",
 			config: join(dirname(ops.extensionPath), "check.yml"),
-			maxTime: "1800",
+			maxTime: CHECK_MAX_TIME,
 			dataRoot: st.store.dataRoot,
 			// OTTR-994: the check run keeps its project's turn identity on a worker.
 			project: st.store.name,
@@ -10938,8 +11047,17 @@ export function createTurnLoop(
 		checkMeter: ReturnType<OpenRunMeter>,
 	): Promise<RunResult | null> {
 		running.set(checkKey, handle);
-		const checkResult = (await handle.done) as RunResult;
-		checkMeter?.settle(checkResult);
+		let checkResult: RunResult;
+		try {
+			checkResult = (await handle.done) as RunResult;
+			checkMeter?.settle(checkResult);
+		} catch (err) {
+			// A rejected `done` (a lost worker stream) must not leak the entry: the throw
+			// path parks the card through runTurn's catch and never reaches the delete
+			// below, and a leaked entry holds a cap slot until the map slot goes.
+			if (running.get(checkKey) === handle) running.delete(checkKey);
+			throw err;
+		}
 		// sweepLostTurns settled a lost check: its outcome owns the card now.
 		if (running.get(checkKey) !== handle) {
 			st.mx.checkTakenOver = true;
