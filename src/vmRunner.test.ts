@@ -36,6 +36,8 @@ import {
 	VmRootfs,
 } from "./vmRootfs.ts";
 import {
+	COPY_OUT_MAX_FILE_BYTES,
+	COPY_OUT_MAX_TOTAL_BYTES,
 	extractCopyOut,
 	firecrackerConfig,
 	readTar,
@@ -1927,6 +1929,43 @@ describe("firecracker config", () => {
 	});
 });
 
+/** A tar with one pax header carrying `record`, then one ordinary file member. */
+function paxTar(record: string): Uint8Array {
+	const header = (name: string, type: string, size: number): Uint8Array => {
+		const b = new Uint8Array(512);
+		const put = (off: number, s: string): void => b.set(enc.encode(s), off);
+		put(0, name);
+		put(124, `${size.toString(8).padStart(11, "0")}\0`);
+		b.fill(0x20, 148, 156);
+		b[156] = type.charCodeAt(0);
+		put(257, "ustar  \0");
+		let sum = 0;
+		for (const x of b) sum += x;
+		put(148, `${sum.toString(8).padStart(6, "0")}\0 `);
+		return b;
+	};
+	const payload = enc.encode(record);
+	const pad = (n: number): Uint8Array =>
+		new Uint8Array((512 - (n % 512)) % 512);
+	const member = enc.encode("ok");
+	const blocks = [
+		header("././@PaxHeader", "x", payload.length),
+		payload,
+		pad(payload.length),
+		header("data/f.txt", "0", member.length),
+		member,
+		pad(member.length),
+		new Uint8Array(1024),
+	];
+	const out = new Uint8Array(blocks.reduce((n, b) => n + b.length, 0));
+	let off = 0;
+	for (const b of blocks) {
+		out.set(b, off);
+		off += b.length;
+	}
+	return out;
+}
+
 describe("tar", () => {
 	test("round-trips long names and symlinks through pax headers", async () => {
 		const dir = mkdtempSync(join(root, "tar-"));
@@ -2072,6 +2111,28 @@ describe("tar", () => {
 		expect(process.memoryUsage.rss() - before).toBeLessThan(16 * 1024 * 1024);
 	});
 
+	test("an ordinary file above the metadata cap still reads whole", async () => {
+		// The 1 MiB metadata cap binds only pax and GNU long-name payloads; a plain
+		// file member is bound by the copy-out budgets, not the cap.
+		const size = 1024 * 1024 + 4096;
+		const got = await members(
+			rawTar([{ name: "data/big.bin", content: "x".repeat(size) }]),
+		);
+		expect(got).toHaveLength(1);
+		expect(got[0]!.content.length).toBe(size);
+	});
+
+	test("a pax size record that is not a whole non-negative number is an error", async () => {
+		// "15 size=banana\n": NaN would disable every later aggregate check.
+		await expect(members(paxTar("15 size=banana\n"))).rejects.toThrow(
+			"invalid member size",
+		);
+		// "11 size=-5\n": a negative size would reduce the copy-out total.
+		await expect(members(paxTar("11 size=-5\n"))).rejects.toThrow(
+			"invalid member size",
+		);
+	});
+
 	test.skipIf(!linux)(
 		"copy-out honors the per-file and total byte budgets",
 		async () => {
@@ -2136,6 +2197,9 @@ describe("sizes and env", () => {
 	});
 
 	test("readVmRunnerEnv applies the documented defaults and refuses bad values", () => {
+		// The in-code fallbacks and the env defaults must name the same sizes.
+		expect(COPY_OUT_MAX_FILE_BYTES).toBe(256 * 1024 ** 2);
+		expect(COPY_OUT_MAX_TOTAL_BYTES).toBe(1024 ** 3);
 		const cfg = readVmRunnerEnv({});
 		expect(cfg).toEqual({
 			port: 8787,

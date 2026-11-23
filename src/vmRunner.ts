@@ -358,9 +358,10 @@ const TAR_META_MAX_BYTES = 1024 * 1024;
 
 /**
  * Applies a GNU long-name or pax meta header to `meta`: it carries no member body. False
- * for a real member header. A payload above TAR_META_MAX_BYTES throws before any of it
- * is read: the guest serves the stream, so its declared size must never become a whole
- * host buffer.
+ * for a real member header. A metadata payload above TAR_META_MAX_BYTES throws before
+ * any of it is read: the guest serves the stream, so its declared size must never
+ * become a whole host buffer. Real member bodies are not capped here; the copy-out
+ * budgets bound those.
  */
 async function applyMetaHeader(
 	type: string,
@@ -368,7 +369,8 @@ async function applyMetaHeader(
 	readAll: (size: number) => Promise<Uint8Array>,
 	meta: TarMeta,
 ): Promise<boolean> {
-	if (size > TAR_META_MAX_BYTES)
+	const isMeta = type === "L" || type === "K" || type === "x" || type === "g";
+	if (isMeta && size > TAR_META_MAX_BYTES)
 		throw new Error(
 			`tar metadata payload too large: ${size} bytes (max ${TAR_META_MAX_BYTES})`,
 		);
@@ -471,6 +473,11 @@ export async function readTar(
 		const { name, linkname, mtime } = memberFields(h, meta);
 		const paxSize = meta.pax.get("size");
 		const stored = paxSize === undefined ? size : Number(paxSize);
+		// The guest is root in its VM and writes the pax records: a size that is not
+		// a whole non-negative number (NaN or negative) would poison `state.left`
+		// and the copy-out total, so it is rejected before any byte is extracted.
+		if (!Number.isSafeInteger(stored) || stored < 0)
+			throw new Error(`invalid member size: ${paxSize ?? size}`);
 		meta.pax = new Map();
 		meta.longName = null;
 		meta.longLink = null;
@@ -555,7 +562,8 @@ async function writeCopyOutMember(
 	written.push(abs);
 }
 
-/** The default copy-out byte budgets: one member, then the whole transfer. */
+/** The default copy-out byte budgets: one member, then the whole transfer. Exported for
+ * tests: they must stay equal to the documented env defaults (256m, 1g). */
 export interface CopyOutBudgets {
 	/** No member's declared size may exceed this; larger members are refused. */
 	maxFileBytes: number;
@@ -563,8 +571,8 @@ export interface CopyOutBudgets {
 	 * it throws and ends the extraction. */
 	maxTotalBytes: number;
 }
-const COPY_OUT_MAX_FILE_BYTES = 256 * 1024 ** 2;
-const COPY_OUT_MAX_TOTAL_BYTES = 1024 * 1024 ** 3;
+export const COPY_OUT_MAX_FILE_BYTES = 256 * 1024 ** 2;
+export const COPY_OUT_MAX_TOTAL_BYTES = 1024 ** 3;
 
 /**
  * Extracts the regular files of a guest's copy-out tar for the requested copy-out `dir`,
