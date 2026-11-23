@@ -134,6 +134,9 @@ A draft that nobody posted waits for the user, and a posted review waits for the
 - A thread qualifies when it is not resolved. Its first comment's `databaseId` must be one of the draft's fixed finding ids. That comment's author login must equal the stored `posted_login`. Ottr sends the `resolveReviewThread` mutation (`RESOLVE_THREAD_MUTATION`) once per qualifying thread, with the thread id.
 - A thread that a person started, a thread already resolved, and the thread of a still-open finding get no call. Ottr never unresolves a thread and never replies on a thread.
 - A failed resolve does not fail the post. The error lands in `post_error` with the thread id, like a failed dismissal.
+- The GraphQL answer decides, not the HTTP status: GitHub answers 200 with an `errors` array on a failure, and the first error message becomes the error text. A 200 read whose envelope holds no `reviewThreads` list is a failed read. A 200 mutation that names no thread is a failed resolve.
+- The read takes at most 5 pages of 100 threads. A stop at the cap leaves threads unread, so it records the error `review threads: more than 5 pages; the rest stayed unread` on the card; the readable fixed threads still resolve.
+- A post that carried failures writes both surfaces: the `[pr]` server log line and a `- post notes` entry in the card log, plus the `post_error` on the card.
 - With no fixed findings or no stored `posted_login`, the board sends no GraphQL call.
 - The GitHub App path posts the query and the mutation to the GraphQL endpoint with the installation token. With no app token, the board token runs the same calls through `gh api graphql`. This uses the same identity choice as the review post and the dismissal.
 - The mutation needs the repository permission Contents: read and write on the GitHub App, beyond Pull requests: read and write. The resolve step mints its installation token with both permissions. An installation without the Contents grant fails the mint, and the board token path transports the calls. The board token path works when the token user has push access. A failed resolve still lands in `post_error`.
@@ -233,6 +236,7 @@ A deterministic scan looks for two classic performance defects in the added diff
 - A re-review answer with one exact fixed verdict on a known id saves the finding in `fixed_threads`. An unknown id, a missing verdict, or a malformed line stays open.
 - The Post resolves exactly the qualifying threads: one `resolveReviewThread` mutation per thread with the right thread id. A person thread, a resolved thread, and an open finding's thread get no call.
 - A failed resolve keeps the posted review and records the error in `post_error`. A failed dismissal and a failed resolve share the one `post_error` line; neither masks the other.
+- A 200 GraphQL answer with an `errors` array, a read without a `reviewThreads` list, or a mutation without a thread records the failure in `post_error` and on the card log. A read that stops at the 5-page cap records the incomplete read and still resolves the fixed threads it read.
 - The GraphQL query and mutation strings match the documented schema exactly: the test pins the literal strings, not the implementation constants.
 - With no fixed findings or no stored login, the post sends no GraphQL call.
 - The drawer lists the threads the post will resolve before the click.

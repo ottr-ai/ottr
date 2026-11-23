@@ -1021,7 +1021,7 @@ export interface ReviewThread {
 }
 
 /** Untrusted data as an object, else null. */
-function asRecord(v: unknown): Record<string, unknown> | null {
+export function asRecord(v: unknown): Record<string, unknown> | null {
 	return typeof v === "object" && v !== null
 		? (v as Record<string, unknown>)
 		: null;

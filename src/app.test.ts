@@ -20042,6 +20042,11 @@ describe(
 				},
 			},
 		});
+		/** One successful resolveReviewThread answer in GitHub's documented
+		 *  envelope: the mutation names the resolved thread. */
+		const mutationOk = (id: string): Record<string, unknown> => ({
+			data: { resolveReviewThread: { thread: { id, isResolved: true } } },
+		});
 		/** The `gh api graphql` calls a post made, in order. */
 		const graphqlCalls = () => ghCalls.filter((a) => a[1] === "graphql");
 		const expectedArgv = (n: number) => [
@@ -21048,18 +21053,21 @@ describe(
 				const t = await reviewedWithFixed(80, [
 					{ id: 9001, path: "src/a.ts", line: 12 },
 				]);
-				graphqlAnswer = () => ({
-					code: 0,
-					stdout: JSON.stringify(
-						threadsPage([
-							["RT1", 9001, "ottr[bot]", false],
-							["RT2", 9001, "person", false],
-							["RT3", 9001, "ottr[bot]", true],
-							["RT4", 9099, "ottr[bot]", false],
-						]),
-					),
-					stderr: "",
-				});
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? { code: 0, stdout: JSON.stringify(mutationOk("RT1")), stderr: "" }
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([
+										["RT1", 9001, "ottr[bot]", false],
+										["RT2", 9001, "person", false],
+										["RT3", 9001, "ottr[bot]", true],
+										["RT4", 9099, "ottr[bot]", false],
+									]),
+								),
+								stderr: "",
+							};
 				const res = await postReview(t.id, { body: "Looks good." });
 				expect(res.status).toBe(200);
 				expect(graphqlCalls()).toEqual([
@@ -21197,6 +21205,132 @@ describe(
 				);
 			});
 
+			test("a 200 mutation answer with errors keeps the thread open", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(85, [
+					{ id: 9004, path: "src/d.ts", line: 4 },
+				]);
+				// GitHub answers HTTP 200 with an errors array on a refusal: the
+				// thread stays open and the error reaches post_error.
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? {
+								code: 0,
+								stdout: JSON.stringify({
+									data: { resolveReviewThread: null },
+									errors: [
+										{ message: "Resource not accessible by integration" },
+									],
+								}),
+								stderr: "",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([["RT6", 9004, "ottr[bot]", false]]),
+								),
+								stderr: "",
+							};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect((await row(85)).postError).toBe(
+					"thread RT6: Resource not accessible by integration",
+				);
+				// The card log carries the note too.
+				expect(readFileSync(await prStore.logPath(t.id), "utf8")).toContain(
+					"- post notes ",
+				);
+			});
+
+			test("a 200 read answer with errors fails the resolve step", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(86, [
+					{ id: 9005, path: "src/e.ts", line: 5 },
+				]);
+				graphqlAnswer = () => ({
+					code: 0,
+					stdout: JSON.stringify({
+						data: { repository: null },
+						errors: [{ message: "Could not resolve to a Repository" }],
+					}),
+					stderr: "",
+				});
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect((await row(86)).postError).toBe(
+					"Could not resolve to a Repository",
+				);
+			});
+
+			test("a read answer with no repository and no errors is a failed read", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(87, [
+					{ id: 9006, path: "src/f.ts", line: 6 },
+				]);
+				graphqlAnswer = () => ({
+					code: 0,
+					stdout: JSON.stringify({ data: { repository: null } }),
+					stderr: "",
+				});
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				expect((await row(87)).postError).toBe(
+					"the review threads answer holds no reviewThreads",
+				);
+			});
+
+			test("a sixth page of threads records the incomplete read", async () => {
+				await removeApp();
+				const t = await reviewedWithFixed(88, [
+					{ id: 9007, path: "src/g.ts", line: 7 },
+				]);
+				// Every page claims one more page: the fifth read stops the loop, and
+				// the readable fixed thread on page one still resolves.
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? { code: 0, stdout: JSON.stringify(mutationOk("RT7")), stderr: "" }
+						: {
+								code: 0,
+								stdout: JSON.stringify({
+									data: {
+										repository: {
+											pullRequest: {
+												reviewThreads: {
+													pageInfo: { hasNextPage: true, endCursor: "c1" },
+													nodes: [
+														{
+															id: "RT7",
+															isResolved: false,
+															comments: {
+																nodes: [
+																	{
+																		databaseId: 9007,
+																		author: { login: "ottr[bot]" },
+																	},
+																],
+															},
+														},
+													],
+												},
+											},
+										},
+									},
+								}),
+								stderr: "",
+							};
+				const res = await postReview(t.id, { body: "Looks good." });
+				expect(res.status).toBe(200);
+				// The mutation ran for the readable thread, and the cap note lands.
+				expect(
+					graphqlCalls().filter((a) =>
+						a.some((x) => x.includes("resolveReviewThread")),
+					),
+				).toHaveLength(1);
+				expect((await row(88)).postError).toBe(
+					"review threads: more than 5 pages; the rest stayed unread",
+				);
+			});
+
 			test("an empty fixed list sends no GraphQL read or resolve", async () => {
 				await removeApp();
 				// No stored fixed findings: the post resolves nothing and reads no threads.
@@ -21219,13 +21353,20 @@ describe(
 					{ id: 9002, path: "src/b.ts", line: 30 },
 				]);
 				// The read fixture copies GitHub's documented reviewThreads envelope.
-				graphqlAnswer = () => ({
-					code: 0,
-					stdout: JSON.stringify(
-						threadsPage([["RT_abc123", 9002, "ottr[bot]", false]]),
-					),
-					stderr: "",
-				});
+				graphqlAnswer = (args) =>
+					args.some((a) => a.includes("resolveReviewThread"))
+						? {
+								code: 0,
+								stdout: JSON.stringify(mutationOk("RT_abc123")),
+								stderr: "",
+							}
+						: {
+								code: 0,
+								stdout: JSON.stringify(
+									threadsPage([["RT_abc123", 9002, "ottr[bot]", false]]),
+								),
+								stderr: "",
+							};
 				const res = await postReview(t.id, { body: "Looks good." });
 				expect(res.status).toBe(200);
 				const graphql = graphqlCalls();

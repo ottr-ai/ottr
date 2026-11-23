@@ -279,6 +279,7 @@ import {
 	workCheckSendBackDirection,
 } from "./prompts.ts";
 import {
+	asRecord,
 	createPrWatcher,
 	PR_GATES,
 	parseReviewThreads,
@@ -11422,6 +11423,31 @@ export async function createApp(deps: AppDeps) {
 			return res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`;
 		return null;
 	}
+	/** Reads one GraphQL HTTP-200 answer: JSON parse, then GitHub's errors array.
+	 *  A 200 carries failures in `errors` (for example a permission refusal), so
+	 *  the body decides, never the status. */
+	function graphQlBody(
+		text: string,
+		appSecrets: string[],
+	): { ok: true; body: unknown } | { ok: false; error: string } {
+		let body: unknown;
+		try {
+			body = JSON.parse(text);
+		} catch {
+			return { ok: false, error: "the GraphQL answer is not JSON" };
+		}
+		const errors = asRecord(body)?.errors;
+		if (Array.isArray(errors) && errors.length > 0) {
+			const first = asRecord(errors[0]);
+			const message =
+				typeof first?.message === "string" ? first.message : "GraphQL error";
+			return {
+				ok: false,
+				error: redact(message.trim().slice(0, 300), appSecrets) || message,
+			};
+		}
+		return { ok: true, body };
+	}
 	/** Resolves the review threads of the draft's fixed findings after the post succeeded; null when nothing failed or nothing was to do. */
 	async function resolveFixedThreads(o: {
 		e: Entry;
@@ -11457,7 +11483,7 @@ export async function createApp(deps: AppDeps) {
 		const call = async (
 			query: string,
 			tail: { argv: string[]; variables: Record<string, unknown> },
-		): Promise<{ ok: true; body: string } | { ok: false; error: string }> => {
+		): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> => {
 			if (tok !== null) {
 				try {
 					const res = await githubAppFetch(`${githubHost().apiBase}/graphql`, {
@@ -11478,7 +11504,7 @@ export async function createApp(deps: AppDeps) {
 								redact(text.trim().slice(0, 300), appSecrets) ||
 								`HTTP ${res.status}`,
 						};
-					return { ok: true, body: text };
+					return graphQlBody(text, appSecrets);
 				} catch (err) {
 					return {
 						ok: false,
@@ -11501,7 +11527,7 @@ export async function createApp(deps: AppDeps) {
 						ok: false,
 						error: res.stderr.trim().slice(0, 300) || `gh exited ${res.code}`,
 					};
-				return { ok: true, body: res.stdout };
+				return graphQlBody(res.stdout, appSecrets);
 			} catch (err) {
 				return {
 					ok: false,
@@ -11533,45 +11559,50 @@ export async function createApp(deps: AppDeps) {
 				},
 			});
 			if (!r.ok) return r.error;
-			let info: { hasNextPage: unknown; endCursor: unknown } | null = null;
-			try {
-				const body = JSON.parse(r.body) as {
-					data?: {
-						repository?: {
-							pullRequest?: { reviewThreads?: { pageInfo?: unknown } };
-						};
-					};
-				};
-				threads.push(...parseReviewThreads(body));
-				// parseReviewThreads only returns the nodes: pageInfo is read defensively
-				// from the raw body, and a malformed page stops the loop here.
-				const raw = body.data?.repository?.pullRequest?.reviewThreads?.pageInfo;
-				if (typeof raw === "object" && raw !== null)
-					info = raw as { hasNextPage: unknown; endCursor: unknown };
-			} catch {
-				return "the review threads answer is malformed";
-			}
-			hasNext = info?.hasNextPage === true;
+			// The envelope must hold the thread list: a 200 answer with a null
+			// repository (and no errors array) is a failed read, not an empty list.
+			const container = asRecord(
+				asRecord(asRecord(asRecord(r.body)?.data)?.repository)?.pullRequest,
+			)?.reviewThreads;
+			if (container === null || container === undefined)
+				return "the review threads answer holds no reviewThreads";
+			// parseReviewThreads only returns the nodes: pageInfo is read from the
+			// same envelope, and a page without it stops the loop here.
+			const page = asRecord(asRecord(container)?.pageInfo);
+			threads.push(...parseReviewThreads(r.body));
+			hasNext = page?.hasNextPage === true;
 			cursor =
-				hasNext && typeof info?.endCursor === "string" ? info.endCursor : null;
+				hasNext && typeof page?.endCursor === "string" ? page.endCursor : null;
 			if (!hasNext) break;
 		}
+		const failures: string[] = [];
+		// A cap stop leaves threads unread: the post stays, but the card must say
+		// the resolution is incomplete, never silently complete.
 		if (hasNext)
-			console.log(
-				`[pr] ${o.repo}#${o.number} reviewThreads: page cap reached; resolving among the first ${threads.length} threads`,
+			failures.push(
+				`review threads: more than 5 pages; the rest stayed unread`,
 			);
 		const ids = threadsToResolve(
 			threads,
 			o.fixed.map((f) => f.id),
 			o.postLogin,
 		);
-		const failures: string[] = [];
 		for (const id of ids) {
 			const r = await call(RESOLVE_THREAD_MUTATION, {
 				argv: ["-f", `threadId=${id}`],
 				variables: { threadId: id },
 			});
-			if (!r.ok) failures.push(`thread ${id}: ${r.error}`);
+			if (!r.ok) {
+				failures.push(`thread ${id}: ${r.error}`);
+				continue;
+			}
+			// A 200 answer must still name the thread: a null result with no
+			// errors array means the mutation did not resolve it.
+			const thread = asRecord(
+				asRecord(asRecord(r.body)?.data)?.resolveReviewThread,
+			)?.thread;
+			if (typeof thread !== "object" || thread === null)
+				failures.push(`thread ${id}: the mutation answered no thread`);
 		}
 		return failures.length === 0 ? null : failures.join("; ");
 	}
@@ -11866,8 +11897,17 @@ export async function createApp(deps: AppDeps) {
 				...(changesSkipped !== undefined ? [changesSkipped] : []),
 			].filter((failure) => failure !== null);
 			const postError = failures.length > 0 ? failures.join("; ") : null;
-			if (postError !== null)
+			if (postError !== null) {
 				await e.store.setPrPostError(row.number, postError);
+				// The note needs both surfaces: the server log line and the card
+				// log entry, so a post that carried failures is diagnosable.
+				console.log(`[pr] ${repo}#${row.number} post note: ${postError}`);
+				await appendLog(
+					e.store,
+					prep.task.id,
+					`- post notes ${new Date().toISOString()}: ${postError}`,
+				);
+			}
 			// The posted review's own comments must never alert: the baseline is the post time.
 			await e.store.setPrComments(row.number, Date.now(), false);
 			// The head is posted: the card leaves needs_you for done/idle.
