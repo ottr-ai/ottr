@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import type { Server } from "bun";
 import {
 	handleGit,
@@ -629,6 +630,158 @@ describe("packSupplyRefusal", () => {
 			[{ ...cmd(secretSha), new: "0".repeat(40) }],
 			grant(),
 			await emptyPack(),
+		);
+		expect(r).toBeNull();
+	}, 60_000);
+
+	// Crafted pack plumbing: the guest builds raw pack entries, so a delta can name a base
+	// whose bytes it never sends.
+
+	/** The type and size varints of one pack entry header. */
+	function entryHead(type: number, size: number): Uint8Array {
+		const head: number[] = [(type << 4) | (size & 0x0f)];
+		for (let rest = size >> 4; rest > 0; rest >>= 7) {
+			const last = head.length - 1;
+			head[last] = (head[last] ?? 0) | 0x80;
+			head.push(rest & 0x7f);
+		}
+		return Uint8Array.from(head);
+	}
+
+	/** One pack entry: a type header, a size varint, and the deflated payload. */
+	function packEntry(type: number, payload: Uint8Array): Uint8Array {
+		const body = deflateSync(payload);
+		const out = new Uint8Array(
+			entryHead(type, payload.length).length + body.length,
+		);
+		out.set(entryHead(type, payload.length));
+		out.set(body, entryHead(type, payload.length).length);
+		return out;
+	}
+
+	/** A REF_DELTA entry: the 20-byte base oid rides uncompressed in front of the compressed delta. */
+	function refDeltaEntry(baseOid: string, delta: Uint8Array): Uint8Array {
+		const head = entryHead(7, delta.length);
+		const oid = Buffer.from(baseOid, "hex");
+		const body = deflateSync(delta);
+		const out = new Uint8Array(head.length + 20 + body.length);
+		out.set(head);
+		out.set(oid, head.length);
+		out.set(body, head.length + 20);
+		return out;
+	}
+
+	/** A literal-only delta body: base size, result size, one literal run. */
+	function literalDelta(baseSize: number, text: string): Uint8Array {
+		const size = (n: number): number[] => {
+			const out: number[] = [n & 0x7f];
+			for (n >>= 7; n > 0; n >>= 7) {
+				const last = out.length - 1;
+				out[last] = (out[last] ?? 0) | 0x80;
+				out.push(n & 0x7f);
+			}
+			return out;
+		};
+		return Uint8Array.from([
+			...size(baseSize),
+			...size(text.length),
+			text.length,
+			...new TextEncoder().encode(text),
+		]);
+	}
+
+	/** A tree object naming one blob by its oid. */
+	function treeBytes(blobOid: string, name: string): Uint8Array {
+		const head = new TextEncoder().encode(`100644 ${name}\0`);
+		const out = new Uint8Array(head.length + 20);
+		out.set(head);
+		out.set(Buffer.from(blobOid, "hex"), head.length);
+		return out;
+	}
+
+	/** A commit object over the given tree and parent. */
+	function commitBytes(treeOid: string, parent: string): Uint8Array {
+		return new TextEncoder().encode(
+			`tree ${treeOid}\nparent ${parent}\nauthor ott <ott@example.invalid> 0 +0000\ncommitter ott <ott@example.invalid> 0 +0000\n\ncrafted\n`,
+		);
+	}
+
+	/** The store sha of one object body. */
+	async function objectSha(type: string, body: Uint8Array): Promise<string> {
+		const head = new TextEncoder().encode(`${type} ${body.length}\0`);
+		const all = new Uint8Array(head.length + body.length);
+		all.set(head);
+		all.set(body, head.length);
+		return [...new Uint8Array(await crypto.subtle.digest("SHA-1", all))]
+			.map((b) => b.toString(16).padStart(2, "0"))
+			.join("");
+	}
+
+	/** A packfile over the entries, with the object count and the sha1 trailer. */
+	async function assemblePack(entries: Uint8Array[]): Promise<Uint8Array> {
+		const parts: Uint8Array[] = [
+			new TextEncoder().encode("PACK"),
+			new Uint8Array(new DataView(new ArrayBuffer(8)).buffer),
+			...entries,
+		];
+		new DataView(parts[1]!.buffer).setUint32(0, 2);
+		new DataView(parts[1]!.buffer).setUint32(4, entries.length);
+		const body = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+		let at = 0;
+		for (const p of parts) {
+			body.set(p, at);
+			at += p.length;
+		}
+		const out = new Uint8Array(body.length + 20);
+		out.set(body);
+		out.set(
+			new Uint8Array(await crypto.subtle.digest("SHA-1", body)),
+			body.length,
+		);
+		return out;
+	}
+
+	test("a thin delta cannot smuggle a hidden base the guest never carried", async () => {
+		// The blocker's case: the guest knows the hidden blob's oid and size, sends a
+		// literal-only REF_DELTA naming it as base, and a commit and tree that reference the
+		// blob. --fix-thin appends the hidden base's bytes to the repaired pack, so the
+		// index alone would count store bytes as guest-supplied.
+		const branchTip = await must(main, "rev-parse", `refs/heads/${BRANCH}`);
+		const secretBlob = await must(main, "rev-parse", `${secretSha}:secret.txt`);
+		const blobSize = Number(await must(main, "cat-file", "-s", secretBlob));
+		const tree = treeBytes(secretBlob, "secret.txt");
+		const commit = commitBytes(await objectSha("tree", tree), branchTip);
+		const commitSha = await objectSha("commit", commit);
+		const pack = await assemblePack([
+			packEntry(1, commit),
+			packEntry(2, tree),
+			refDeltaEntry(secretBlob, literalDelta(blobSize, "abc")),
+		]);
+		const r = await packSupplyRefusal(
+			[{ old: branchTip, new: commitSha, ref: `refs/heads/${BRANCH}` }],
+			grant("main"),
+			pack,
+		);
+		expect(r).toContain(secretBlob);
+		expect(r).toContain("not supplied");
+	}, 60_000);
+
+	test("a thin delta against a visible base stays allowed", async () => {
+		const branchTip = await must(main, "rev-parse", `refs/heads/${BRANCH}`);
+		const visibleBlob = await must(main, "rev-parse", "refs/heads/main:a.txt");
+		const blobSize = Number(await must(main, "cat-file", "-s", visibleBlob));
+		const tree = treeBytes(visibleBlob, "a.txt");
+		const commit = commitBytes(await objectSha("tree", tree), branchTip);
+		const commitSha = await objectSha("commit", commit);
+		const pack = await assemblePack([
+			packEntry(1, commit),
+			packEntry(2, tree),
+			refDeltaEntry(visibleBlob, literalDelta(blobSize, "abc")),
+		]);
+		const r = await packSupplyRefusal(
+			[{ old: branchTip, new: commitSha, ref: `refs/heads/${BRANCH}` }],
+			grant("main"),
+			pack,
 		);
 		expect(r).toBeNull();
 	}, 60_000);
