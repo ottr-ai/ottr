@@ -68,6 +68,8 @@ const WAITS = [
 	/^Re-run this card's .* after /,
 ];
 const FINDINGS = /waiting for the review's findings/;
+// A posted PR review parks its card at in_progress/idle while the pull request stays open.
+const PR_POSTED = /^Review posted; /;
 const AHEAD = /ahead \d+/;
 
 // Skill step 4 "Sign -> Cause -> Fix" as data: the first match gives the hint.
@@ -171,6 +173,11 @@ export function verdict(c: Card, f: Facts): { verdict: string; note: string } {
 		FINDINGS.test(r + (f.hold ?? ""))
 	)
 		return { verdict: "OK", note: "release waits for its findings" };
+	if (c.stage === "in_progress" && c.state === "idle" && PR_POSTED.test(r))
+		return {
+			verdict: "waits",
+			note: "posted PR review; waits for the pull request to merge or close",
+		};
 	if (c.stage === "backlog" && c.state === "idle")
 		return { verdict: "OK", note: "backlog" };
 	return { verdict: "stuck", note: `state ${c.stage}/${c.state}` };

@@ -43,6 +43,7 @@ import {
 import { prConflictReason } from "./supervisor.ts";
 import {
 	answeredCard,
+	PR_REVIEW_POSTED,
 	type PromptGateState,
 	type RecordedFinding,
 	type Task,
@@ -5565,24 +5566,24 @@ describe("pr review store methods", () => {
 			blocking: true,
 		});
 		expect(card.state).toBe("needs_you");
-		// Posted head: done/idle, done_at stamped once.
+		// Posted head, PR still open: the card parks at the posted wait, not in Done.
 		await store.savePrReview({
 			...(await store.getPrReview(12))!,
 			postedHead: "abc",
 		});
 		await store.syncPrCard(12);
-		const done = (await store.getTask(card.id))!;
-		expect(done).toMatchObject({
-			stage: "done",
+		const parked = (await store.getTask(card.id))!;
+		expect(parked).toMatchObject({
+			stage: "in_progress",
 			state: "idle",
-			needsReason: null,
+			needsReason: PR_REVIEW_POSTED,
 		});
-		expect(done.doneAt).not.toBeNull();
+		expect(parked.doneAt).toBeNull();
 		Bun.sleepSync(5);
 		await store.syncPrCard(12);
 		const same = (await store.getTask(card.id))!;
-		expect(same.doneAt).toBe(done.doneAt);
-		expect(same.updatedAt).toBe(done.updatedAt);
+		expect(same.doneAt).toBeNull();
+		expect(same.updatedAt).toBe(parked.updatedAt);
 		// A new head's draft on the posted card waits again.
 		const again = await store.savePrDraft({
 			run: await store.startPrRun(12, "def", 2),
@@ -5593,19 +5594,42 @@ describe("pr review store methods", () => {
 			blocking: true,
 		});
 		expect(again).toMatchObject({ stage: "in_progress", state: "needs_you" });
-		// Closed: done/idle.
+		// Closed: done/idle, done_at stamped once.
 		await store.setPrState(12, "closed");
 		await store.syncPrCard(12);
-		expect(await store.getTask(card.id)).toMatchObject({
+		const closed = (await store.getTask(card.id))!;
+		expect(closed).toMatchObject({
 			stage: "done",
 			state: "idle",
+			needsReason: null,
 		});
-		// Reopened: waits again.
+		expect(closed.doneAt).not.toBeNull();
+		// Merged: done/idle too, and a repeat sync writes nothing.
+		await store.setPrState(12, "merged");
+		Bun.sleepSync(5);
+		await store.syncPrCard(12);
+		const merged = (await store.getTask(card.id))!;
+		expect(merged).toMatchObject({
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+		expect(merged.doneAt).toBe(closed.doneAt);
+		expect(merged.updatedAt).toBe(closed.updatedAt);
+		// Reopened with a newer unposted head: waits again.
 		await store.setPrState(12, "open");
 		await store.syncPrCard(12);
 		expect(await store.getTask(card.id)).toMatchObject({
 			stage: "in_progress",
 			state: "needs_you",
+		});
+		// The head posts while open: the claim returns the earlier posted head.
+		expect(await store.claimPrPost(12, "def")).toBe("abc");
+		await store.syncPrCard(12);
+		expect(await store.getTask(card.id)).toMatchObject({
+			stage: "in_progress",
+			state: "idle",
+			needsReason: PR_REVIEW_POSTED,
 		});
 		// A cancelled card stays as it is.
 		await store.updateTask(card.id, { cancelledAt: 5 });
@@ -5613,7 +5637,7 @@ describe("pr review store methods", () => {
 		await store.syncPrCard(12);
 		expect(await store.getTask(card.id)).toMatchObject({
 			stage: "in_progress",
-			state: "needs_you",
+			state: "idle",
 		});
 		// No card: no throw, no write.
 		await store.savePrReview({ ...row, number: 13 });
@@ -7958,7 +7982,11 @@ describe("async store serial operations", () => {
 			store.getTask(drafts[1]!.id),
 		]);
 		expect(postedRow).toMatchObject({ postedHead: "head" });
-		expect(syncedCard).toMatchObject({ stage: "done", state: "idle" });
+		expect(syncedCard).toMatchObject({
+			stage: "in_progress",
+			state: "idle",
+			needsReason: PR_REVIEW_POSTED,
+		});
 		const doneAt = syncedCard!.doneAt;
 		const events = await store.events();
 		await Promise.all([store.syncPrCard(12), store.syncPrCard(12)]);
@@ -7970,7 +7998,6 @@ describe("async store serial operations", () => {
 			["stage", "todo", "in_progress"],
 			["state", "queued", "idle"],
 			["state", "idle", "needs_you"],
-			["stage", "in_progress", "done"],
 			["state", "needs_you", "idle"],
 		]);
 	});

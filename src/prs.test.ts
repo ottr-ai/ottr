@@ -34,7 +34,7 @@ import {
 import { ProjectStore } from "./store.ts";
 import fc from "./test/properties.ts";
 import { appendLog } from "./turn.ts";
-import type { PrReviewRow } from "./types.ts";
+import { PR_REVIEW_POSTED, type PrReviewRow } from "./types.ts";
 
 describe("prUrl", () => {
 	const oldHost = process.env.OTTR_GITHUB_HOST;
@@ -2499,6 +2499,30 @@ describe("createPrWatcher", () => {
 			stage: "in_progress",
 			state: "needs_you",
 		});
+		expect(s.prompts).toHaveLength(1);
+	});
+
+	test("a tick moves an open posted card that an older build left in Done out of Done", async () => {
+		const s = await setup();
+		s.setOpen([pr(7, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		const card = (await s.cards())[0]!;
+		// The Post claimed the head: posted_head equals reviewed_head while the PR stays open.
+		expect(await s.store.claimPrPost(7, sha("a"))).toBeNull();
+		await s.store.updateTask(card.id, {
+			stage: "done",
+			state: "idle",
+			needsReason: null,
+		});
+		await s.watcher.tick();
+		expect(await s.store.getTask(card.id)).toMatchObject({
+			stage: "in_progress",
+			state: "idle",
+			needsReason: PR_REVIEW_POSTED,
+		});
+		// The convergence write runs no review: the posted head stays reviewed.
 		expect(s.prompts).toHaveLength(1);
 	});
 

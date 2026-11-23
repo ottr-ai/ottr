@@ -85,7 +85,8 @@ The script sorted the cards with this table; the table is the rule.
 | `running` or `preparing` | Stuck only when the log does not grow for 20 minutes, or when a check runs past its limit of 30 minutes (`maxTime` 1800 s). The board sweeps dead runs by itself, so wait one 60 s tick before you act. |
 | `queued` | Find the hold: a board drain (`drainUntil` is set), a full cap (`maxTotal` or the `maxParallel` of the project), a `dependsOn` card that is not done, a merge that runs in the same project, an open release or review (`mergeHold` in `src/scheduler.ts`), or no rules file for a todo card. Stuck only when no hold explains the wait, or when the hold itself is stuck. |
 | `merging/idle` with "waiting for the review's findings to be implemented" | A review or a release that waits for its finding cards (their `followUpOf` is its id). Stuck only when a finding card is stuck. |
-| Any other state, for example `in_progress/idle` | Stuck. |
+| `in_progress/idle` with the reason "Review posted; waits for the author or the merge." | A PR review card whose posted review waits for its pull request to merge or close. Not stuck. |
+| Any other state | Stuck. |
 
 The script's `verdict()` in `scripts/board-report.ts` implements this table from `GET /api/state`, the log mtimes, `mergeHold` and `git status`. A change to this table must change `scripts/board-report.ts` in the same commit. The script reads no turn list. The 20-minute log rule covers a `running` row. When a running card's log stays young but the card runs long, check the 30-minute limit with the turn list of `GET /api/projects/<project>/tasks/<id>`.
 

@@ -80,7 +80,7 @@ import type {
 	WorkCheckBlocker,
 	WorkCheckRun,
 } from "./types.ts";
-import { askQuestions, PR_REVIEW_WAITING } from "./types.ts";
+import { askQuestions, PR_REVIEW_POSTED, PR_REVIEW_WAITING } from "./types.ts";
 
 export const DEFAULT_SETTINGS: ProjectSettings = {
 	// No per-project cap: the board-wide runner cap is the one limit by default.
@@ -4302,9 +4302,11 @@ export class ProjectStore {
 	}
 
 	/**
-	 * Places a PR review card from its row: an open PR with an unposted draft waits at
-	 * needs_you; posted, closed or merged goes to done/idle. A cancelled card or a row without
-	 * a card stays. Writes only on a difference, so done_at is not stamped again.
+	 * Places a PR review card from its row. An open PR with an unposted draft waits at
+	 * needs_you. An open PR whose newest reviewed head is posted parks at in_progress/idle
+	 * with the posted reason (OTTR-1224): only a merged or closed PR puts the card in Done.
+	 * Closed, merged, or no draft goes to done/idle. A cancelled card or a row without a
+	 * card stays. Writes only on a difference, so done_at is not stamped again.
 	 */
 	async syncPrCard(number: number): Promise<void> {
 		return this.queue.transaction(async () => {
@@ -4312,17 +4314,20 @@ export class ProjectStore {
 			if (!row || row.taskId === null) return;
 			const card = await this.getTask(row.taskId);
 			if (!card || card.cancelledAt !== null) return;
-			const waiting =
-				row.state === "open" &&
-				card.details !== null &&
-				row.postedHead !== row.reviewedHead;
-			const want = waiting
-				? ({
-						stage: "in_progress",
-						state: "needs_you",
-						needsReason: PR_REVIEW_WAITING,
-					} as const)
-				: ({ stage: "done", state: "idle", needsReason: null } as const);
+			const want =
+				row.state !== "open" || card.details === null
+					? ({ stage: "done", state: "idle", needsReason: null } as const)
+					: row.postedHead !== row.reviewedHead
+						? ({
+								stage: "in_progress",
+								state: "needs_you",
+								needsReason: PR_REVIEW_WAITING,
+							} as const)
+						: ({
+								stage: "in_progress",
+								state: "idle",
+								needsReason: PR_REVIEW_POSTED,
+							} as const);
 			if (
 				card.stage === want.stage &&
 				card.state === want.state &&

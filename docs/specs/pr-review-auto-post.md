@@ -43,7 +43,7 @@ watcher, the draft runs, the Post route, and the store details.
      comments, the same `commit_id`.
   4. Parse the result, dismiss a superseded request-changes review, store
      `posted_url`/`posted_login`/`posted_event`, baseline the comment watch,
-     and call `syncPrCard`. The card leaves `needs_you` for `done/idle`.
+     and call `syncPrCard`. While the PR stays open, the card leaves `needs_you` for the posted wait (`in_progress/idle`, reason `PR_REVIEW_POSTED`); a close or merge during the post lands it at `done/idle`.
 - One post per head. The claim decides: a second run for the same head loses
   the claim and posts nothing. The one-draft-per-head review gate already
   keeps the watcher from re-reviewing a posted head.
@@ -83,8 +83,7 @@ watcher, the draft runs, the Post route, and the store details.
     counts in the alarm line and clears when the stamp clears (a new head, a
     manual post, a closed PR). The seen prune keeps the key only while the
     stamp is current.
-- A manual Post keeps today's complete event: the card title and `was done`,
-  with the drawer URL.
+- A manual Post raises no complete event: the user posted the review.
 
 ## Acceptance checks
 
@@ -102,13 +101,10 @@ watcher, the draft runs, the Post route, and the store details.
   - A second run for the same head (the reply flow) sends no second review.
   - A failed post (gh exit 1) parks the card: `post_error` holds the error,
     the card stays `needs_you` with the draft, and the claim is released.
-  - The card of a successful automatic post sits at `done/idle` with a
-    stored `posted_url`.
+  - The card of a successful automatic post sits at the posted wait (`in_progress/idle`, reason `PR_REVIEW_POSTED`) with a stored `posted_url`; it reaches `done/idle` when the PR merges or closes.
 - A live database gains `posted_via` on open; a fresh database creates it
   with the table. `savePrReview` never clears it.
-- The auto-posted card's complete event carries the auto-post body and the
-  PR URL; a manual post's complete event keeps `was done` and the drawer
-  URL. With `prReviewNotify` off neither fires.
+- The auto-posted card's complete event (`prPostedEvent`, keyed by the posted head) carries the auto-post body and the PR URL; it fires whatever place the card takes. A manual post raises no event: the user posted the review, and the card stays on the board at the posted wait. With `prReviewNotify` off the auto-post event does not fire.
 - The bell shows the posted row with the external PR link; the alarm count
   includes it; opening the seen set clears the new mark.
 

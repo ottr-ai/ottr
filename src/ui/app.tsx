@@ -9589,7 +9589,7 @@ export function PrReviewSection({
 					PR #{pr.number}
 				</a>
 				{" · "}
-				{pr.state}
+				{pr.state === "closed" ? "closed without merge" : pr.state}
 			</p>
 			<div className="reply-form">
 				<label htmlFor="pr-review-text">Review comment</label>

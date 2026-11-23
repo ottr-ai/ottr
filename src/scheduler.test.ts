@@ -510,6 +510,12 @@ describe("pickRunnable", () => {
 		expect(pickRunnable([waiting, a, b], opts)).toEqual([a, b]);
 	});
 
+	test("a posted PR review card parked at in_progress/idle never starts a turn", () => {
+		const pr = task({ kind: "pr_review", stage: "in_progress", state: "idle" });
+		expect(pickRunnable([pr], opts)).toEqual([]);
+		expect(pickLowPriority([pr], opts)).toBeNull();
+	});
+
 	test("todo waits without rules while an in_progress reply still runs", () => {
 		const reply = task({ stage: "in_progress", state: "running" });
 		const todo = task();

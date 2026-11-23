@@ -5897,6 +5897,16 @@ describe("Drawer of a cancelled card opens read-only", () => {
 			/>,
 		);
 	};
+
+	test("a closed pr_review drawer says the PR closed without a merge", () => {
+		const html = section(
+			waitingReview(),
+			"## Summary\nreview",
+			prView("closed"),
+		);
+		expect(html).toContain("closed without merge");
+	});
+
 	const postButton = (html: string): string => {
 		const m = /<button(?:(?!<button)[\s\S])*?Post review<\/button>/.exec(html);
 		if (m === null) throw new Error("no Post review button");

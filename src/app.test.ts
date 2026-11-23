@@ -150,6 +150,7 @@ import {
 	doneReadKey,
 	type ListedTask,
 	newestLanded,
+	PR_REVIEW_POSTED,
 	type PrReviewRow,
 	REVIEW_BODY_MAX,
 	REVIEW_FOOTER,
@@ -19683,11 +19684,11 @@ describe(
 				expect(t).toMatchObject({ stage: "in_progress", state: "needs_you" });
 				const res = await postReview(t.id, { body: "Looks good." });
 				expect(res.status).toBe(200);
-				// The posted head moves the waiting card to done/idle.
+				// The posted head parks the card at the posted wait while the PR stays open.
 				expect(await prStore.getTask(t.id)).toMatchObject({
-					stage: "done",
+					stage: "in_progress",
 					state: "idle",
-					needsReason: null,
+					needsReason: PR_REVIEW_POSTED,
 				});
 				expect(ghCalls).toEqual([expectedArgv(1)]);
 				expect(ghPayloads).toEqual([expectedPayload("Looks good.", H1)]);
@@ -21293,12 +21294,12 @@ describe("PR review auto-post routes", () => {
 		expect(r.postedUrl).toBe(
 			"https://github.com/acme/widget/pull/4#pullrequestreview-1",
 		);
-		// The posted head moved the card out of needs_you for done/idle.
+		// The posted head parks the card at the posted wait while the PR stays open.
 		const card = (await h.store.getTask(r.taskId!))!;
 		expect(card).toMatchObject({
-			stage: "done",
+			stage: "in_progress",
 			state: "idle",
-			needsReason: null,
+			needsReason: PR_REVIEW_POSTED,
 		});
 	});
 
