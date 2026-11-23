@@ -29753,6 +29753,57 @@ describe("stored review findings", () => {
 		);
 	});
 
+	test("a refuted verdict still cancels a started lead whose worktree keeps unsaved work (OTTR-1227)", async () => {
+		const record = baseRecord();
+		const { store, projects, loop, batches } = await validationCase(record, {
+			unsavedWork: async () => "M lead.ts",
+		});
+		const review = await doneReview(store, "refutes kept work");
+		const refuted = await leadCard(
+			store,
+			review.id,
+			"Needs validation: legacy cache read\nBlocker: sandbox run: cache load",
+		);
+		const v1 = await loop.filePendingValidationRun(entryOf(projects, store));
+		expect("id" in v1).toBe(true);
+		if (!("id" in v1)) throw new Error("no validation run filed");
+		// The lead ran as a work turn before the batch rule: it holds a worktree
+		// with unsaved work, and it is started when the settle reads it.
+		await store.updateTask(refuted.id, {
+			stage: "todo",
+			state: "queued",
+			queuedAt: Date.now(),
+			worktree: "/wt/ottr-refuted-lead",
+			branch: "ott/refuted-lead",
+			base: "shaB",
+		});
+		const date = new Date().toISOString().slice(0, 10);
+		batches.push([
+			mkFinding(
+				`Validation: #${refuted.id} refuted\nthe cache names are content hashes`,
+			),
+		]);
+		await loop.runTurn(store.name, v1.id);
+		// The verdict ends the lead cancelled even though the cancel kept the
+		// worktree: the tree stays on disk for the operator (the sweep's unsaved
+		// check refuses to remove it), and the verdict lands as the reason.
+		const after = (await store.getTask(refuted.id))!;
+		expect(after.cancelledAt).not.toBeNull();
+		expect(after.state).toBe("idle");
+		expect(after.validatedAt).toBeGreaterThan(0);
+		expect(after.needsReason).toBe(
+			`Refuted by validation run #${v1.id} on ${date}: the cache names are content hashes`,
+		);
+		expect(after.worktree).toBe("/wt/ottr-refuted-lead");
+		expect(after.details).toContain(
+			"the cancel kept the worktree: M lead.ts",
+		);
+		expect(record.removeWorktree).toHaveLength(0);
+		expect(await logText(store, v1.id)).toContain(
+			`refuted lead #${refuted.id} was started; the cancel kept its worktree and the verdict still cancelled it`,
+		);
+	});
+
 	test("the settle's batch gate keeps a deployment-fact lead's result out (OTTR-1047 security fix)", async () => {
 		const record = baseRecord();
 		const { store, projects, loop, batches } = await validationCase(record);

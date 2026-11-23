@@ -2530,6 +2530,44 @@ describe("task routes", () => {
 		expect(done.stage).toBe("done");
 	});
 
+	test("a deployment question keeps uncertain and side-note answers in their verdict (OTTR-1227)", async () => {
+		const { lead1, lead2, lead3, ask } = await seedLeadAskThree();
+		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {
+			text: `${askAnswerLine(
+				`Q one? (card #${lead1.id})`,
+				"Yes, the risk applies: no authentication is enabled",
+			)}\n${askAnswerLine(
+				`Q two? (card #${lead2.id})`,
+				"It isn't applicable to this deployment",
+			)}\n${askAnswerLine(
+				`Q three? (card #${lead3.id})`,
+				"I do not know whether it applies",
+			)}`,
+		});
+		expect(res.status).toBe(200);
+		// A side note after the affirmation never flips the verdict to a refusal.
+		const one = (await store.getTask(lead1.id))!;
+		expect(one.stage).toBe("todo");
+		expect(one.state).toBe("queued");
+		expect(one.cancelledAt).toBeNull();
+		// A contracted negation of the applicability word cancels.
+		const two = (await store.getTask(lead2.id))!;
+		expect(two.cancelledAt).not.toBeNull();
+		expect(two.needsReason).toBe(
+			"Cancelled by the user's answer to the review's question: It isn't applicable to this deployment",
+		);
+		// Uncertainty only records: the lead waits unchanged.
+		const three = (await store.getTask(lead3.id))!;
+		expect(three.stage).toBe("backlog");
+		expect(three.state).toBe("idle");
+		expect(three.cancelledAt).toBeNull();
+		expect(three.details).toBe(
+			"\n\nThe user answered the review's question: I do not know whether it applies (the answer matched no option, so the lead stays unchanged)",
+		);
+		const done = (await store.getTask(ask.id))!;
+		expect(done.stage).toBe("done");
+	});
+
 	test("a lead-question free-text answer appends to the lead's details and keeps the card waiting for the other question", async () => {
 		const { lead1, lead2, ask } = await seedLeadAsk();
 		const res = await post(`/api/projects/p1/tasks/${ask.id}/reply`, {

@@ -142,15 +142,19 @@ open leads, and lands the question card Done (`stage: "done"`, `state: "idle"`,
   per-question answer.
 
 Free text rides the same verdict (OTTR-1227): after the exact labels miss, the
-classifier `leadAnswerVerdict` reads the answer's words. A negation
-(`does not apply`, `doesn't apply`, `not applicable`, `not relevant`, a bare
-`no`) applies the `No, it does not apply` rule; an affirmation (`applies`,
-`applicable`, `relevant`, `yes`) applies the `Yes, the risk applies` rule.
-Negation wins when both appear. The not-apply cancel reason quotes the answer
-and, when the lead's details carry the settle's note, the asking run:
-`Cancelled by the user's answer to the review's question: <answer> (validation
-run #<run id>)`. Unclassified text appends the answer with a note that no
-option matched, so the lead stays unchanged and the operator sees why.
+classifier `leadAnswerVerdict` reads the answer's words in order. Uncertainty
+first ("do not know", "not sure", "maybe") reads as unclassified, so an
+uncertain answer never turns its keywords into a decision. A negated
+applicability word ("does not apply", "isn't applicable", "no longer
+relevant", "couldn't be more applicable" — the negator sits near its word)
+applies the `No, it does not apply` rule. A bare applicability word
+("applies", "applicable", "relevant") or "yes" applies the `Yes, the risk
+applies` rule. An answer that starts with "no" is the operator's bare refusal
+and cancels. Anything else is unclassified. The not-apply cancel reason quotes
+the answer and, when the lead's details carry the settle's note, the asking
+run: `Cancelled by the user's answer to the review's question: <answer>
+(validation run #<run id>)`. Unclassified text appends the answer with a note
+that no option matched, so the lead stays unchanged and the operator sees why.
 - Answers only touch lead cards of the same review (`followUpOf` match) that are
   still open (not cancelled, not done). A complete reply lands the card Done
   inside the same reply, so a second reply is refused (409, not needs_you). A
@@ -464,9 +468,11 @@ and title dedupe keys stable:
   `state: "idle"`) and `needsReason`
   `Refuted by validation run #<card id> on <YYYY-MM-DD>: <evidence>`. A
   started lead cancels through the sanctioned `cancel()` (it stops the queued
-  start or the running grill, disposes the worktree, keeps unsaved work) and
-  then carries the same `needsReason`; a cancel that kept work records the
-  verdict in the details instead, so the kept-work park keeps its reason.
+  start or the running grill, keeps unsaved work) and then carries the same
+  `needsReason`; the lead ends cancelled even when the cancel kept its
+  worktree — the worktree stays on disk for the operator (the sweep's unsaved
+  check refuses to remove what it cannot prove empty) and the kept tree is
+  named in the details.
 - `blocked`: the lead stays `backlog`/`idle`; its details gain
   `Validated by validation run #<card id> on <YYYY-MM-DD>: still blocked —
   <evidence>`.

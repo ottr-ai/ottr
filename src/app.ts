@@ -13116,22 +13116,39 @@ export async function createApp(deps: AppDeps) {
 		return matches;
 	}
 	/** The operator's free-text answer to a deployment question (OTTR-1227): the
-	 * exact option labels match before this reads any other text. A negation
-	 * ("does not apply", "not applicable", a bare "no") cancels the lead; an
-	 * affirmation ("applies", "applicable", "yes") queues it like a confirmed
-	 * verdict; anything else is unclassified and only records the answer.
-	 * Negation wins, because a negated sentence can still hold "apply". Pure. */
+	 * exact option labels match before this reads any other text. Uncertainty
+	 * ("do not know", "not sure", "maybe") reads as unclassified, so an
+	 * uncertain answer never turns its keywords into a decision. A negated
+	 * applicability word ("does not apply", "isn't applicable", "no longer
+	 * relevant") cancels the lead — the negator must sit near its word, so a
+	 * side note ("no authentication is enabled") never flips the verdict. A
+	 * bare applicability word ("applies", "yes") queues it like a confirmed
+	 * verdict, and an answer that starts with "no" is the operator's bare
+	 * refusal. Anything else is unclassified and only records the answer.
+	 * Pure. */
 	function leadAnswerVerdict(answer: string): "applies" | "not-apply" | null {
-		const text = answer.trim().replace(/\.$/, "").toLowerCase();
+		const text = answer
+			.trim()
+			.replace(/\.$/, "")
+			.toLowerCase()
+			.replace(/\bcan't\b/g, "cannot")
+			.replace(/\b(\w+)n't\b/g, "$1 not");
 		if (
-			/\b(does\s+not\s+apply|doesn'?t\s+apply|not\s+applic\w*|not\s+relevant|no)\b/.test(
+			/\b(do\s+not|does\s+not|did\s+not|not|cannot)\s+(know|sure|certain|clear|aware|remember)\b/.test(
+				text,
+			) ||
+			/\b(maybe|perhaps|unsure|unclear|no\s+idea|hard\s+to\s+say)\b/.test(text)
+		)
+			return null;
+		if (
+			/\b(not|never|no\s+longer|cannot|neither|nor)\b[^.]{0,24}\b(appl(y|ies|ied|ying|icable)|relevant)\b/.test(
 				text,
 			)
 		)
 			return "not-apply";
-		return /\b(applies|applicable|relevant|yes)\b/.test(text)
-			? "applies"
-			: null;
+		if (/\b(applies|applicable|relevant|yes)\b/.test(text)) return "applies";
+		if (/^no(?![a-z])/.test(text)) return "not-apply";
+		return null;
 	}
 	/** A reply to a review's lead-question card (OTTR-869): the drawer sends one
 	 * `For "<question>": <answer>` line per question — raw answer text when the card

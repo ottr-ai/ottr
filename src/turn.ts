@@ -9730,22 +9730,31 @@ export function createTurnLoop(
 					});
 				} else {
 					const outcome = await cancel(st.e, lead.id, false);
-					if ("removed" in outcome) {
-						await st.store.updateTask(lead.id, {
-							validatedAt: now,
-							needsReason: reason,
-						});
-					} else {
-						// The cancel kept the lead's work: the verdict records in the
-						// details, and the kept-work park keeps its own reason.
-						const kept = "kept" in outcome ? outcome.kept : "unknown";
-						await st.store.updateTask(lead.id, {
-							validatedAt: now,
-							details: `${full.details ?? ""}\nValidated by validation run #${st.id} on ${date}: refuted${result.evidence.trim() === "" ? "" : ` — ${result.evidence.trim()}`} (the cancel kept the work: ${kept}).`,
-						});
-					}
+					// The verdict ends the lead cancelled whatever the cancel kept:
+					// a kept worktree stays on disk for the operator (the sweep's
+					// unsaved check refuses to remove what it cannot prove empty),
+					// and the kept tree is named in the details.
+					const keptWork =
+						"removed" in outcome
+							? null
+							: "kept" in outcome
+								? outcome.kept
+								: "unknown";
+					await st.store.updateTask(lead.id, {
+						cancelledAt: now,
+						state: "idle",
+						validatedAt: now,
+						needsReason: reason,
+						...(keptWork !== null
+							? {
+									details: `${full.details ?? ""}\nValidated by validation run #${st.id} on ${date}: refuted${result.evidence.trim() === "" ? "" : ` — ${result.evidence.trim()}`} (the cancel kept the worktree: ${keptWork}).`,
+								}
+							: {}),
+					});
 					await st.log(
-						`- refuted lead #${lead.id} was started; the cancel ${"removed" in outcome ? "ended it" : "kept its work"}`,
+						keptWork === null
+							? `- refuted lead #${lead.id} was started; the cancel ended it`
+							: `- refuted lead #${lead.id} was started; the cancel kept its worktree and the verdict still cancelled it`,
 					);
 				}
 				applied += 1;
