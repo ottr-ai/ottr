@@ -1141,6 +1141,8 @@ interface PrWatcherCtx {
 	scheduleQuietRun?: (project: string, at: number | null) => void;
 	/** OTTR-1071: records a finished poll's clock value and error for the state payload. */
 	recordPoll?: (project: string, at: number, error: string | null) => void;
+	/** Hosted credit hold: true while the board is out of credit; reviewOnce skips the model call. */
+	creditHoldActive?: () => boolean;
 }
 
 /** The repo id of a project's GitHub remote; throws on a malformed id. */
@@ -1556,6 +1558,20 @@ async function reviewOnce(
 	// it, and that record's start time stands. Every exit ends the record and, when
 	// the run has a card, writes its one card-log line (the record machinery does).
 	ctx.prRunStart(project.name, row.number, row.taskId);
+	// Hosted credit hold (docs/specs/hosted-mode.md section 5): the review's model call
+	// waits for the top-up. The record ends as a skip and the notice shows on the board.
+	if (ctx.creditHoldActive?.() === true) {
+		const reason = "the board is out of credit";
+		ctx.recordSkipNotice(project.name, row.number, row.head, reason);
+		ctx.log(`prs: ${project.name}: #${row.number} review skipped: ${reason}`);
+		ctx.prRunEnd(
+			project.name,
+			row.number,
+			{ kind: "skipped", text: reason },
+			row.taskId,
+		);
+		return;
+	}
 	const source = await store.transaction(async () => {
 		const current = await store.getPrReview(row.number);
 		const card = row.taskId === null ? null : await store.getTask(row.taskId);
@@ -2031,6 +2047,9 @@ export function createPrWatcher(deps: {
 	spawn?: SpawnFn;
 	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
 	fallbacks?: Record<string, string[]>;
+	/** Hosted credit hold: true while the board is out of credit; the watcher skips the
+	 * review's model call and records its OTTR-942 skip notice until the hold lifts. */
+	creditHoldActive?: () => boolean;
 	/** The deterministic perf lens over one PR diff; defaults to perfFindings. */
 	perfScan?: (diff: string, labels: string[]) => PerfFinding[];
 	/** OTTR-1071: timer seam for the quiet-time runs; defaults to setTimeout. Tests inject
@@ -2215,6 +2234,7 @@ export function createPrWatcher(deps: {
 		forgetSeen: deps.forgetSeen,
 		recordSkipNotice,
 		logDropped,
+		creditHoldActive: deps.creditHoldActive,
 	};
 	// OTTR-1071: in-memory quiet-run timers and last-poll facts, keyed by project
 	// name. A restart loses both; the start-up poll (server.ts runs one tick at

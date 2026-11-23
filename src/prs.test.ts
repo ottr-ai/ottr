@@ -218,6 +218,8 @@ async function setup(
 		perfScan?: (diff: string, labels: string[]) => PerfFinding[];
 		/** OTTR-1071: the host's background-work hook for the quiet-time tick. */
 		runQuiet?: (project: string) => Promise<void> | void;
+		/** OTTR-1010: the hosted credit hold seam. */
+		creditHoldActive?: () => boolean;
 	} = {},
 ) {
 	const dir = join(root, `p${++seq}`);
@@ -313,6 +315,7 @@ async function setup(
 		perfScan: opts.perfScan,
 		schedule,
 		runQuiet: opts.runQuiet,
+		creditHoldActive: opts.creditHoldActive,
 		review: opts.spawn
 			? undefined
 			: async (messages) => {
@@ -2338,6 +2341,22 @@ describe("createPrWatcher", () => {
 		const after = s.watcher.skipNotices();
 		expect(after).toHaveLength(2);
 		expect(after[1]!.startsWith("p: PR #4 review skipped:")).toBe(true);
+	});
+
+	test("the hosted credit hold skips the review and shows the notice", async () => {
+		const s = await setup({ creditHoldActive: () => true });
+		s.setOpen([pr(4, sha("a"))]);
+		await s.watcher.tick();
+		s.advance(PR_GATES.QUIET_MS);
+		await s.watcher.tick();
+		// A PR due for review: the model call waits for the top-up, the seam never ran.
+		expect(s.prompts).toHaveLength(0);
+		const notices = s.watcher.skipNotices();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("the board is out of credit");
+		// The run record ended as a skip, not as an error or a hang.
+		expect(s.watcher.prRun("p", 4)?.endedAt).not.toBeNull();
+		expect(s.watcher.prRun("p", 4)?.error).toBe("the board is out of credit");
 	});
 
 	test("a head that moves during the review saves no draft", async () => {

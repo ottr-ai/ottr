@@ -304,6 +304,8 @@ export function createOmpWatcher(deps: {
 	spawn?: SpawnFn;
 	now?: () => number;
 	token?: () => string | undefined;
+	/** Hosted credit hold: true pauses the release review's model call until the top-up. */
+	creditHoldActive?: () => boolean;
 	/** Test seam only; production uses UPSTREAM_API_BASE. */
 	apiBase?: () => string;
 	/** OTTR-1212: the retry.fallbackChains map keyed by role; tests pass {} to pin. */
@@ -424,7 +426,7 @@ export function createOmpWatcher(deps: {
 		let filed = 0;
 		for (const r of unreviewed.slice(0, OMP_WATCH_GATES.reviewsPerTick)) {
 			if (repo === null || !(await watching())) break;
-			const v = await review(r, repo, pin, fail);
+			const v = await review(r, repo, pin, fail, tag);
 			if (v === null) continue;
 			if (!(await watching())) {
 				deps.log(`${tag}: watch turned off during the review of ${r.version}`);
@@ -567,6 +569,7 @@ export function createOmpWatcher(deps: {
 		repo: string,
 		pin: string,
 		fail: (reason: string) => void,
+		tag: string,
 	): Promise<{
 		verdict: "pass" | "fail";
 		reasons: string[];
@@ -593,6 +596,14 @@ export function createOmpWatcher(deps: {
 			pin,
 			notes: notes.body,
 		});
+		// Hosted credit hold (docs/specs/hosted-mode.md section 5): the compatibility
+		// review's model call waits for the top-up; the next hourly tick retries it.
+		if (deps.creditHoldActive?.() === true) {
+			deps.log(
+				`${tag}: omp ${r.version}: review paused: the board is out of credit`,
+			);
+			return null;
+		}
 		let reply: string;
 		try {
 			reply = await runGatewayWithFallbacks(

@@ -1684,6 +1684,11 @@ export interface TurnLoop {
 	 * card that the credit stop or gate parked, like an owner Resume ("."); resolves to the number
 	 * queued. */
 	creditRelease(): Promise<number>;
+	/** Hosted mode: true while the credit hold is set (creditStop set it; a fresh true gate
+	 * answer or creditRelease cleared it). The board's own model calls outside the turn loop
+	 * (deepen, release summary, PR review, fork research, omp watch) read it and refuse or
+	 * skip while it is set. */
+	creditHoldActive(): boolean;
 	finishKept(
 		e: TurnProject,
 		id: string,
@@ -4165,6 +4170,10 @@ export function createTurnLoop(
 			const flags = await turnIdentityFlags(store, id, task);
 			const idn = await resolveTurnIdentity(store, id, task, key, flags, log);
 			if (idn === null) return;
+			// Hosted credit stop (docs/specs/hosted-mode.md section 5): the duplicate and
+			// prompt gates call the model too, so a stop that landed while the title ran
+			// parks the card here instead of letting the gates spend tokens.
+			if (await creditBlocked()) return;
 			if (
 				!(await duplicateGateTurnStart(
 					e,
@@ -13122,6 +13131,7 @@ export function createTurnLoop(
 		stopTurn,
 		creditStop,
 		creditRelease,
+		creditHoldActive: () => creditHold,
 		finishKept,
 		recoverRestarted,
 		running,

@@ -1102,6 +1102,7 @@ describe("watcher", () => {
 	async function setup(
 		name: string,
 		analyzeImpl: (r: unknown) => Promise<unknown>,
+		opts: { creditHoldActive?: () => boolean } = {},
 	) {
 		const main = await initUpstream(name);
 		const store = await initStore(main);
@@ -1124,6 +1125,7 @@ describe("watcher", () => {
 				analyzeCalls++;
 				return analyzeImpl({ range, prior }) as Promise<never>;
 			},
+			creditHoldActive: opts.creditHoldActive,
 			now: () => Date.now(),
 		});
 		return { main, store, watcher, calls: () => analyzeCalls, logs };
@@ -1392,6 +1394,30 @@ describe("watcher", () => {
 			(await store.listTasks()).filter((t) => t.topic === "fork research")
 				.length,
 		).toBe(1);
+	});
+
+	test("the hosted credit hold pauses research before any fork run", async () => {
+		const { main, store, watcher, calls, logs } = await setup(
+			"watch-hold",
+			async () => {
+				throw new Error("analyze must not run under the credit hold");
+			},
+			{ creditHoldActive: () => true },
+		);
+		await makeFork("watch-hold-fork", main);
+		await watcher.tick();
+		// The analyze seam never ran and nothing was consumed: no fork rows,
+		// no research card, nothing marked pending.
+		expect(calls()).toBe(0);
+		expect(
+			logs.some((m) =>
+				m.includes("research paused: the board is out of credit"),
+			),
+		).toBe(true);
+		expect(await store.listAllForkBranches()).toEqual([]);
+		expect(
+			(await store.listTasks()).filter((t) => t.topic === "fork research"),
+		).toEqual([]);
 	});
 
 	test("fork cache and ls-remote cwd live in the server-only dir, not OTTR_DATA_DIR", async () => {

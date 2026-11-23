@@ -181,7 +181,13 @@ usage that it saw for the run, so a late or repeated record never counts twice. 
   and each title call, a turn that sees the hold parks `needs_you` with the credit reason. A
   gate call that starts after the stop and answers `ok: true` clears the hold. A gate answer
   from a call that started before the stop does not clear it. The delayed retry of a failed
-  title call is also a model call: when it fires while the hold is set, it does not run.
+  title call is also a model call: when it fires while the hold is set, it does not run. The
+  duplicate and prompt gates are model dispatch points of the turn, so a stop that lands
+  between the title and the gates parks the card before any gate call. The board's own
+  gateway calls outside the turn loop honor the hold too: the Deepen route (draft and check)
+  and the release-summary consolidation answer HTTP 402 with the credit error, and the PR
+  review draft, fork research, and omp watch compatibility review skip their model call until
+  a release or a fresh true gate answer clears the hold.
 - Resume after a top-up: the owner replies `Resume` (or any reply) on the parked card. The
   card goes back to the queue. The gate asks `GET /credit` again before the turn starts, so a
   card never runs while the balance is zero.

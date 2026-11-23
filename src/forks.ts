@@ -868,6 +868,8 @@ export function createForkWatcher(deps: {
 		range: ForkRange,
 		prior: { titles: string[]; declines: string[] },
 	) => Promise<ForkAnalysisResult>;
+	/** Hosted credit hold: true pauses the research before any fork run is consumed. */
+	creditHoldActive?: () => boolean;
 	now?: () => number;
 }): { tick(opts?: { manual?: string }): Promise<void> } {
 	const gh = deps.gh ?? runGh;
@@ -890,6 +892,14 @@ export function createForkWatcher(deps: {
 				project.github === null
 			)
 				continue;
+			// Hosted credit hold (docs/specs/hosted-mode.md section 5): the research's
+			// model calls wait for the top-up; a later tick re-runs the pending ranges.
+			if (deps.creditHoldActive?.() === true) {
+				deps.log(
+					`forks: ${project.name}: research paused: the board is out of credit`,
+				);
+				continue;
+			}
 			const repo =
 				ownerRepo(`https://github.com/${project.github}.git`) ?? project.github;
 			const beforeScan = await store.transaction(async () => {

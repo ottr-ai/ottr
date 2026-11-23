@@ -1108,6 +1108,7 @@ const app = await createApp({
 		loop.filePendingValidationRun(e, reviewId, strictReview ?? true, again),
 	stopTurn: loop.stopTurn,
 	creditStop: loop.creditStop,
+	creditHoldActive: loop.creditHoldActive,
 	creditRelease: loop.creditRelease,
 	ciWatchTick: (opts) => supervisor.tick(opts),
 	finishKept: loop.finishKept,

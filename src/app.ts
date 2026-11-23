@@ -849,6 +849,13 @@ interface AppDeps {
 	 */
 	creditRelease?: () => Promise<number>;
 	/**
+	 * Hosted mode: true while the credit hold (POST /api/hosted/stop) is set. The board's own
+	 * gateway model calls refuse while it is set: the deepen and release-summary routes answer
+	 * 402, and the watchers (PR review, fork research, omp watch) skip their model call.
+	 * server.ts binds it from the turn loop; undefined keeps every check off (self-host, tests).
+	 */
+	creditHoldActive?: () => boolean;
+	/**
 	 * Hosted forwarded GitHub events (POST /api/hosted/github-event, docs/specs/hosted-mode.md
 	 * section 8): kicks the CI-watch supervisor's tick for one project. server.ts binds it after
 	 * createSupervisor; a hosted board without it throws like the missing creditStop.
@@ -3161,6 +3168,9 @@ export async function createApp(deps: AppDeps) {
 	// Costly routes (docs/specs/public-api-request-limit.md): public-host requests that
 	// start a model call, a git operation or card creation share one bucket per source.
 	const costlyLimiter = new RequestLimiter(10 * 60 * 1000, 60, 600);
+	/** Hosted credit hold (docs/specs/hosted-mode.md section 5): the error the board's own
+	 * model-call routes answer while the hold is set. */
+	const CREDIT_HOLD_ERROR = "the board is out of credit; top up and try again";
 	/** VAPID keys for Web Push; generated lazily on the first push path so boot stays silent. */
 	let vapid: { publicKey: string; privateKey: string; subject: string } | null =
 		null;
@@ -9703,6 +9713,10 @@ export async function createApp(deps: AppDeps) {
 				};
 			}),
 		);
+		// Hosted credit hold (docs/specs/hosted-mode.md section 5): the consolidation call is
+		// the board's own gateway model call; the deterministic notes above stay available.
+		if (deps.hosted !== undefined && (deps.creditHoldActive?.() ?? false))
+			return json({ error: CREDIT_HOLD_ERROR }, 402);
 		const result = await summarizeRelease({
 			notes: plan.notes,
 			cards,
@@ -14284,6 +14298,10 @@ export async function createApp(deps: AppDeps) {
 		if (trimmedRes instanceof Response) return trimmedRes;
 		const model = modelParam(r.body);
 		if (model instanceof Response) return model;
+		// Hosted credit hold (docs/specs/hosted-mode.md section 5): Deepen and its check are
+		// the board's own gateway model calls, so a hold refuses them like a turn's model run.
+		if (deps.hosted !== undefined && (deps.creditHoldActive?.() ?? false))
+			return json({ error: CREDIT_HOLD_ERROR }, 402);
 		try {
 			const deepened = await (
 				deps.deepen ?? ((prompt, model) => deepenDraft({ prompt, model }))

@@ -643,6 +643,14 @@ async function mount(
 		board?: Parameters<typeof createApp>[0]["board"];
 		/** OTTR-1197: the per-run sandbox credential store; tests share the module one. */
 		runTokens?: Parameters<typeof createApp>[0]["runTokens"];
+		/** Hosted credit stop seam; passed through to createApp. */
+		creditStop?: Parameters<typeof createApp>[0]["creditStop"];
+		/** Hosted credit hold flag seam; passed through to createApp. */
+		creditHoldActive?: Parameters<typeof createApp>[0]["creditHoldActive"];
+		/** Gateway model seam for the deepen route; defaults to the real spawn. */
+		deepen?: Parameters<typeof createApp>[0]["deepen"];
+		/** Gateway check seam for the deepen route; defaults to the real spawn. */
+		deepenCheck?: Parameters<typeof createApp>[0]["deepenCheck"];
 		/** Gateway spawn seam for the release-summary route; defaults to the real spawn. */
 		releaseSummarySpawn?: Parameters<
 			typeof createApp
@@ -701,6 +709,10 @@ async function mount(
 		projects: input.projects ?? new Map(),
 		cancel: async () => ({ removed: true }),
 		stopTurn: async () => ({ ok: true }),
+		creditStop: input.creditStop,
+		creditHoldActive: input.creditHoldActive,
+		deepen: input.deepen,
+		deepenCheck: input.deepenCheck,
 		finishKept: async () => ({ ok: true }),
 		claimedPids: () => new Set<number>(),
 		schedule: input.schedule ?? (() => {}),
@@ -19924,6 +19936,65 @@ describe("update cycle control (OTTR-752)", () => {
 			if (previousKey === undefined) delete process.env.ALATE_API_KEY;
 			else process.env.ALATE_API_KEY = previousKey;
 		}
+	test("the hosted credit hold refuses the board's own model-call routes", async () => {
+		const secret = crypto.randomUUID();
+		let hold = false;
+		let deepenCalls = 0;
+		const m = await board({
+			hosted: {
+				config: {
+					tenant: "acme",
+					secret,
+					controlUrl: "http://127.0.0.1:9",
+					wording: {
+						workSuffix: "",
+						mergeSuffix: "",
+						resumeSuffix: "",
+						creditReason: "No credit.",
+					},
+				},
+				hooks: {
+					reportUsage: () => {},
+					creditOk: async () => true,
+					gitToken: async () => null,
+				},
+				creditBalance: { balance: null },
+			},
+			creditStop: async () => {
+				hold = true;
+				return 0;
+			},
+			creditHoldActive: () => hold,
+			deepen: async () => {
+				deepenCalls += 1;
+				return "deepened";
+			},
+			deepenCheck: async () => {
+				throw new Error("the check must not run under the hold");
+			},
+		});
+		const ok = await m.call(
+			"/api/projects/ottr/deepen",
+			{ prompt: "make a thing" },
+			{ "x-ottr-identity": signIdentity(secret, "acme", "owner") },
+		);
+		expect(ok.status).toBe(200);
+		expect(deepenCalls).toBe(1);
+		const stop = await m.call(
+			"/api/hosted/stop",
+			{},
+			{ "x-ottr-identity": signIdentity(secret, "acme", "control") },
+		);
+		expect(stop.status).toBe(200);
+		const refused = await m.call(
+			"/api/projects/ottr/deepen",
+			{ prompt: "make a thing" },
+			{ "x-ottr-identity": signIdentity(secret, "acme", "owner") },
+		);
+		expect(refused.status).toBe(402);
+		expect(deepenCalls).toBe(1);
+		const refusedBody = (await refused.json()) as { error: string };
+		expect(refusedBody.error).toContain("credit");
 	});
 
 	test("the real build-commit reader wins and only sha versions provide a fallback", async () => {

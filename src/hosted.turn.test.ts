@@ -1365,6 +1365,47 @@ describe("hosted credit stop", () => {
 		expect(after.cancelledAt).toBeNull();
 	});
 
+	test("creditStop between the title and the gates parks the card before the gates call the model", async () => {
+		const { hosted } = fakeHosted();
+		const title = Promise.withResolvers<string | null>();
+		let titleStarted = false;
+		let dupCalls = 0;
+		let gateCalls = 0;
+		const { store, record, loop } = await setup({
+			hosted,
+			genTitle: async () => {
+				titleStarted = true;
+				return await title.promise;
+			},
+			duplicateCheck: async () => {
+				dupCalls += 1;
+				return { verdict: "new" as const, matches: [], reason: "new work" };
+			},
+			gateCheck: async () => {
+				gateCalls += 1;
+				return {
+					builds: "the task",
+					checks: "the recorded run",
+					points: DEEPEN_POINTS.map(() => ({ covered: true, reason: "fine" })),
+					questions: [],
+				};
+			},
+		});
+		const task = await store.createTask("work please");
+		const run = loop.runTurn(store.name, task.id);
+		await waitFor(() => titleStarted);
+		await expect(loop.creditStop()).resolves.toBe(1);
+		title.resolve(null);
+		await run;
+		expect(dupCalls).toBe(0);
+		expect(gateCalls).toBe(0);
+		expect(record.runs).toHaveLength(0);
+		const after = (await store.getTask(task.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.needsReason).toBe(CREDIT_REASON);
+		expect(after.cancelledAt).toBeNull();
+	});
+
 	test("a gate answer that started before the stop does not let the turn run", async () => {
 		const answer = Promise.withResolvers<boolean>();
 		const { hosted } = fakeHosted({ credit: () => answer.promise });

@@ -166,7 +166,14 @@ async function newProject(
 	return { name: `p${seq}`, path: dir, store, github: "o/r" };
 }
 
-async function setup(o: { on?: boolean; dockerfile?: string | null } = {}) {
+async function setup(
+	o: {
+		on?: boolean;
+		dockerfile?: string | null;
+		/** OTTR-1010: the hosted credit hold seam. */
+		creditHoldActive?: () => boolean;
+	} = {},
+) {
 	const project = await newProject(o);
 	const projects = [project];
 	const net = fakeNet();
@@ -190,6 +197,7 @@ async function setup(o: { on?: boolean; dockerfile?: string | null } = {}) {
 		spawn: model.spawn,
 		now: () => t,
 		token: () => "test-token",
+		creditHoldActive: o.creditHoldActive,
 		apiBase: () => `${API}/`,
 	});
 	const store = project.store;
@@ -809,6 +817,23 @@ describe("createOmpWatcher", () => {
 		expect(w.state().verdicts).toEqual({});
 		expect(w.state().lastError?.reason).toContain("gateway exited with code 1");
 		expect(await w.store.listTasks()).toEqual([]);
+	});
+
+	test("the hosted credit hold pauses the review: no model call, no fail", async () => {
+		const w = await setup({ creditHoldActive: () => true });
+		w.release("18.16.0", 10 * DAY);
+		await w.watcher.tick();
+		// The model seam never ran: the compatibility review waits for the top-up.
+		expect(w.model.requests).toEqual([]);
+		// The version stays pending with no fail recorded, so the next tick retries it.
+		expect(w.state().verdicts).toEqual({});
+		expect(w.state().lastError).toBeNull();
+		expect(await w.store.listTasks()).toEqual([]);
+		expect(
+			w.logs.some((l) =>
+				l.includes("omp 18.16.0: review paused: the board is out of credit"),
+			),
+		).toBe(true);
 	});
 
 	test("versions at or below the pin are ignored", async () => {
