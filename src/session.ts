@@ -1,7 +1,16 @@
 // Pure readers of omp's JSONL session transcripts: file lookup, context-window
 // snapshot, and first-title recovery. No store state; callers pass the project's
 // sessions dir.
-import { closeSync, fstatSync, openSync, readdirSync, readSync } from "node:fs";
+
+import type { Stats } from "node:fs";
+import {
+	closeSync,
+	fstatSync,
+	openSync,
+	readdirSync,
+	readSync,
+	statSync,
+} from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -410,9 +419,10 @@ function latestTitle(file: string): string | null {
 /**
  * The first title omp gave a session. Line 1 holds only the latest; every change is also
  * appended as a `title_change` record, and a later turn (merge, resume) re-titles the session.
- * ponytail: the whole file is rescanned on each call (state polls every 2 s); a cache keyed
- * by mtime+size was removed as dead weight — its hit path could never fire before the first
- * session_title write, which freezes the title in the DB.
+ * ponytail: the scan is cached per size+mtime inside topTitleChanges (OTTR-1027), so an
+ * unchanged transcript costs one stat per call. An earlier mtime+size cache was removed as
+ * dead weight because its hit path could never fire; the draft-title branch (OTTR-912)
+ * now rescans on every state build until a valid rename lands, so the hit path is live.
  */
 export function firstSessionTitle(
 	dir: string,
@@ -426,27 +436,43 @@ export function firstSessionTitle(
 	return latest === null ? null : (topTitleChanges(file)[0] ?? latest);
 }
 
+/** Completed top-title scans, keyed by file, size, and mtimeMs (OTTR-1027): every board
+ * state build resolves the stored titles, and an open card with a draft title rescans its
+ * transcript until a valid rename lands, so each unchanged transcript is read and parsed
+ * once. Transcripts are append-only, so the newest key is the warm one; the cap bounds the
+ * map across projects and dead sessions. */
+const titleScanCache = new Map<string, string[]>();
+const TITLE_SCAN_CACHE_MAX = 64;
+
 /** The file's top-level `title_change` titles, in order; empty when it has none or cannot be read. */
 function topTitleChanges(file: string): string[] {
+	// Stat before the read: an append that lands mid-read moves size or mtime, so the
+	// next call misses the cache instead of reusing a truncated scan.
+	let stat: Stats;
+	try {
+		stat = statSync(file);
+	} catch {
+		return []; // vanished between the listing and here -> no titles
+	}
+	const key = `${file}\u0000${stat.size}\u0000${stat.mtimeMs}`;
+	const cached = titleScanCache.get(key);
+	if (cached !== undefined) return cached;
 	let text: string;
 	try {
 		text = readRegular(file, TRANSCRIPT_MAX_BYTES).toString("utf8");
 	} catch {
-		return []; // unreadable or over-cap -> no titles
+		return []; // unreadable or over-cap -> no titles; uncached, a later state may read
 	}
 	const titles: string[] = [];
 	const needle = '"type":"title_change"';
-	for (
-		let at = text.indexOf(needle);
-		at >= 0;
-		at = text.indexOf(needle, at + 1)
-	) {
-		const end = text.indexOf("\n", at);
+	for (const line of text.split("\n")) {
+		// The needle holds no newline, so per-line matching sees the same occurrences as a
+		// whole-text scan; each needle-holding line is parsed once, not once per occurrence
+		// (a needle-dense line used to reparse its whole length for every hit — quadratic).
+		if (!line.includes(needle)) continue;
 		try {
 			// The needle can also sit in another record's nested data; only a top-level title_change counts.
-			const rec = JSON.parse(
-				text.slice(text.lastIndexOf("\n", at) + 1, end < 0 ? text.length : end),
-			) as { type?: unknown; title?: unknown };
+			const rec = JSON.parse(line) as { type?: unknown; title?: unknown };
 			if (
 				rec.type === "title_change" &&
 				typeof rec.title === "string" &&
@@ -457,6 +483,11 @@ function topTitleChanges(file: string): string[] {
 			// not a whole record line; keep looking
 		}
 	}
+	if (titleScanCache.size >= TITLE_SCAN_CACHE_MAX) {
+		const oldest = titleScanCache.keys().next().value;
+		if (oldest !== undefined) titleScanCache.delete(oldest);
+	}
+	titleScanCache.set(key, titles);
 	return titles;
 }
 

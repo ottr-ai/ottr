@@ -2,6 +2,7 @@
 // no store fixture (SQLite, WAL, instance lock) needed.
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+	appendFileSync,
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
@@ -15,6 +16,7 @@ import { join } from "node:path";
 import {
 	cleanTitle,
 	firstSessionTitle,
+	firstWorkTitle,
 	readTranscript,
 	sessionContext,
 	sessionFile,
@@ -220,6 +222,25 @@ describe("firstSessionTitle", () => {
 		session(d, child, ["Show Priority On Cards"]);
 		expect(firstSessionTitle(d, parent)).toBe("Add Task Priority Flag");
 		expect(firstSessionTitle(d, child)).toBe("Show Priority On Cards");
+	});
+
+	test("firstWorkTitle stays linear on a 1 MiB needle-dense line with no rename", () => {
+		const d = dir("needle-dense");
+		const sid = "eeee0000-0000-0000-0000-000000000001";
+		const file = join(d, `2026-09-27T10-00-00-000Z_${sid}.jsonl`);
+		// One line, every needle in nested data (OTTR-1027): parsing per occurrence
+		// reparses the whole line for every hit and goes quadratic on exactly this shape.
+		const item = '{"type":"title_change","title":"Nested"}';
+		const dense = `{"type":"custom","items":[${(item + ",").repeat(Math.ceil((1024 * 1024) / (item.length + 1)))}0]}`;
+		expect(dense.includes("\n")).toBe(false);
+		expect(dense.length).toBeGreaterThan(1024 * 1024);
+		writeFileSync(file, `${dense}\n`);
+		const start = performance.now();
+		expect(firstWorkTitle(d, sid, "")).toBe(null); // only nested needles -> no rename
+		expect(performance.now() - start).toBeLessThan(200);
+		// A rename appended after the dense line still wins, and the scan reruns on growth.
+		appendFileSync(file, '{"type":"title_change","title":"Real Rename"}\n');
+		expect(firstWorkTitle(d, sid, "")).toBe("Real Rename");
 	});
 });
 
