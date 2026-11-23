@@ -214,9 +214,11 @@ function blockedV6(g: number[]): boolean {
 	// 64:ff9b::/96 (NAT64 well-known prefix, RFC 6052): IPv4 in the last 32 bits.
 	if (g0 === 0x64 && g1 === 0xff9b && g.slice(2, 6).every((x) => x === 0))
 		return blockedV4(v4);
-	// 64:ff9b:1::/48 (NAT64 local-use prefix, RFC 8215): u octet zero, IPv4 at bits 56-87.
-	if (g0 === 0x64 && g1 === 0xff9b && g2 === 1 && (g3 & 0xff00) === 0)
-		return blockedV4([g3 & 0xff, g4 >> 8, g4 & 0xff, g5 >> 8]);
+	// 64:ff9b:1::/48 (NAT64 local-use prefix, RFC 8215). RFC 6052 /48 row:
+	// the first 16 IPv4 bits sit at positions 48-63 (g3), the u octet at
+	// 64-71 (g4 high byte), the last 16 IPv4 bits at 72-87 (g4 low, g5 high).
+	if (g0 === 0x64 && g1 === 0xff9b && g2 === 1 && (g4 & 0xff00) === 0)
+		return blockedV4([g3 >> 8, g3 & 0xff, g4 & 0xff, g5 >> 8]);
 	// 2002::/16 (6to4): IPv4 at bits 16-47.
 	if (g0 === 0x2002) return blockedV4([g1 >> 8, g1 & 0xff, g2 >> 8, g2 & 0xff]);
 	return (

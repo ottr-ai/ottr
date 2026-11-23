@@ -576,7 +576,8 @@ describe("assertAllowedHost", () => {
 		"64:ff9b::a00:5",
 		"64:ff9b::a9fe:a9fe",
 		"64:ff9b:1::a00:5",
-		"64:ff9b:1:a9:fea9:fe00::",
+		"64:ff9b:1:a00:0:500::",
+		"64:ff9b:1:a9fe:a9:fe00::",
 		"2002:a00:5::1",
 	])("hosted: %s is blocked", async (addr) => {
 		const e = await jiraError(assertAllowedHost(SITE, hosted(addr)));
@@ -593,7 +594,7 @@ describe("assertAllowedHost", () => {
 
 	test.each([
 		"64:ff9b::5db8:d822",
-		"64:ff9b:1:5d:b8d8:2200::",
+		"64:ff9b:1:5db8:d8:2200::",
 		"2002:5db8:d822::1",
 		"::ffff:0:5db8:d822",
 	])("hosted: %s with a public embedded IPv4 is allowed", async (addr) => {
@@ -627,6 +628,7 @@ describe("assertAllowedHost", () => {
 		for (const site of [
 			"https://[64:ff9b::a00:5]",
 			"https://[64:ff9b:1::a00:5]",
+			"https://[64:ff9b:1:a00:0:500::]",
 			"https://[2002:a00:5::1]",
 			"https://[::ffff:0:a00:5]",
 		])
