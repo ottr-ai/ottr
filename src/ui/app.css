@@ -685,6 +685,19 @@ select {
 	border-radius: 4px;
 	padding: 6px 9px;
 }
+/* Chrome paints the select popup itself and ignores the select's color-scheme,
+   so the inherited near-white option text lands on the popup's own white
+   background (unreadable in the dark theme). Give every option and group
+   heading the panel colors; the disabled row reads with --dim (4.9:1 on
+   --panel in the light theme, 5.8:1 in the dark one, both above AA 4.5:1). */
+option,
+optgroup {
+	background: var(--panel);
+	color: var(--text-strong);
+}
+option:disabled {
+	color: var(--dim);
+}
 input:hover,
 textarea:hover,
 select:hover {
