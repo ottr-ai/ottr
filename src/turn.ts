@@ -122,6 +122,7 @@ import {
 	usageLimitResetMs,
 	WORKER_BUSY,
 } from "./runner.ts";
+import type { RunTokens } from "./runTokens.ts";
 import type {
 	DepProject,
 	WorkCheckSplit,
@@ -1065,6 +1066,8 @@ export interface TurnOps {
 	vmProbe?: () => Promise<void>;
 	/** OTTR-532: the board's one per-turn VM token store; startRun issues, settle revokes. */
 	vmTokens?: VmTokens;
+	/** OTTR-1197: the board's one per-run credential store; startRun issues, the sandbox endpoint checks. */
+	runTokens?: RunTokens;
 	/** OTTR-532: resets the server worktree to the head a microVM pushed (src/gitHttp.ts). */
 	syncWorktreeTo?: (worktree: string, sha: string) => Promise<void>;
 	/** OTTR-454: asks a worker for the runs its restart detached; absent (tests, local spawn) keeps the re-bind off. */
@@ -6097,7 +6100,19 @@ export function createTurnLoop(
 			commitIdentity: (await ops.commitIdentity?.()) ?? null,
 			sessionDir: store.sessionsDir,
 			extensionPath: ops.extensionPath,
-			board: idn.retroCard ? null : { ...ops.board, project: name, taskId: id },
+			// OTTR-1197: each classic run carries its own sandbox credential,
+			// issued here and bound to this run's project and card. Retro and
+			// proposal runs get no board coordinates and no credential.
+			board: idn.retroCard
+				? null
+				: {
+						...ops.board,
+						project: name,
+						taskId: id,
+						...(ops.runTokens !== undefined && {
+							runToken: ops.runTokens.issue({ project: name, taskId: id }),
+						}),
+					},
 			resumeId: input.plan.resumeId,
 			model: route.runModel,
 			sessionName: idn.sessionName,

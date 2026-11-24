@@ -126,6 +126,7 @@ const envKeys = [
 	"OTTR_BOARD_TOKEN",
 	"OTTR_PROJECT",
 	"OTTR_TASK_ID",
+	"OTTR_RUN_TOKEN",
 	"OTTR_RETRO",
 	"OTTR_REVIEW",
 	"OTTR_TRENDING",
@@ -1644,6 +1645,7 @@ describe("sandbox_run tool", () => {
 		OTTR_PROJECT: "p1",
 		OTTR_TASK_ID: "P1-42",
 		OTTR_BOARD_TOKEN: "boot-token",
+		OTTR_RUN_TOKEN: "run-token",
 	};
 	// The runner's answer fixture, copied from src/sandboxRun.test.ts.
 	const guestResponse = {
@@ -1759,6 +1761,7 @@ describe("sandbox_run tool", () => {
 		expect(seen!.init.method).toBe("POST");
 		expect(seen!.init.headers).toMatchObject({
 			"x-board-token": "boot-token",
+			"x-run-token": "run-token",
 			origin: "http://ottr:8080",
 		});
 		expect(JSON.parse(String(seen!.init.body))).toEqual({
@@ -1776,6 +1779,26 @@ describe("sandbox_run tool", () => {
 		expect(parsed.resultSource).toBe("guest");
 		// The board token rides the header only; the result text never carries it.
 		expect(text(out)).not.toContain("boot-token");
+	});
+
+	test("refuses before any call when the run carries no OTTR_RUN_TOKEN", async () => {
+		process.env.OTTR_REVIEW = "1";
+		setEnv(boardEnv);
+		delete process.env.OTTR_RUN_TOKEN;
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response("{}", { status: 200 });
+		}) as unknown as typeof fetch;
+		expect(
+			text(
+				await fakePi().sandbox_run!.execute("t1", {
+					project: "p1",
+					argv: ["true"],
+				}),
+			),
+		).toContain("OTTR_RUN_TOKEN");
+		expect(called).toBe(false);
 	});
 
 	test("relays the board's refusal and the runner blocker as the error text", async () => {
@@ -1831,12 +1854,15 @@ describe("sandbox_run tool", () => {
 		expect(text(out)).toContain("sandbox_run is unavailable");
 	});
 
-	test("posts no token header on loopback, where the wall needs none", async () => {
+	test("posts no boot token header on loopback, where the wall needs none", async () => {
 		process.env.OTTR_REVIEW = "1";
+		// A run inside the board's own container reaches it over loopback: no
+		// boot token is injected, but the run keeps its own credential.
 		setEnv({
 			OTTR_BOARD_URL: "http://ottr:8080",
 			OTTR_PROJECT: "p1",
 			OTTR_TASK_ID: "P1-42",
+			OTTR_RUN_TOKEN: "run-token",
 		});
 		let seen: { url: string; init: RequestInit } | null = null;
 		globalThis.fetch = (async (url: string | URL, init: RequestInit) => {

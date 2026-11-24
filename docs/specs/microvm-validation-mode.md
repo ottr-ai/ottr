@@ -230,17 +230,29 @@ through the board like `propose_task`:
   (src/sandboxRun.ts), then POSTs them unchanged plus this run's card id to
   the board: `POST <OTTR_BOARD_URL>/api/projects/<OTTR_PROJECT>/sandbox`,
   body `{ taskId, project, ref?, argv, cwd?, collect? }`, the
-  `x-board-token` header with `OTTR_BOARD_TOKEN`, and the `Origin` the
-  mutation wall demands. `runSandboxViaBoard` (src/sandboxRun.ts) is the
+  `x-board-token` header with `OTTR_BOARD_TOKEN`, the `x-run-token` header
+  with `OTTR_RUN_TOKEN` (this run's own credential, below), and the `Origin`
+  the mutation wall demands. `runSandboxViaBoard` (src/sandboxRun.ts) is the
   client; the agent env never holds `OTTR_WORKER_TOKEN` or
   `OTTR_VM_RUNNER_URL` at any point on this path.
 - The endpoint sits behind the same agent-host wall as card filing
   (`agentRefusal` in src/app.ts): the boot token, POST only; a loopback caller
   from the board's own container needs no token; a microVM turn's per-turn VM
-  token stays outside, exactly as for trending verdicts. The route lifts the
-  request idle timeout: one validation runs up to the 600 s job cap plus boot
-  slack.
+  token stays outside, exactly as for trending verdicts. The boot token alone
+  opens nothing here (OTTR-1197): every classic run holds the same one, so the
+  endpoint also demands the run's own credential — the `x-run-token` header
+  with `OTTR_RUN_TOKEN`, issued at dispatch (src/turn.ts) and bound to the
+  run's project and card like a VM token, and stripped with the board
+  coordinates for retro and proposal runs (childEnv in src/runner.ts). The
+  body's `taskId` and the route's project must match that credential, checked
+  before the store is touched. The route lifts the request idle timeout: one
+  validation runs up to the 600 s job cap plus boot slack.
 - The server refuses before it packs:
+  - the request must carry this run's own credential (`x-run-token`) and name
+    its own card and project; anything else gets `403` with
+    `"sandbox_run needs this run's own credential (OTTR_RUN_TOKEN)"` or
+    `"sandbox_run runs only this run's own card in its own project"` — checked
+    before the store, so a foreign `taskId` learns nothing;
   - the caller's card must exist and be a review, validation, or
     trending-scout card (the
     body's `taskId`, checked against the store's `kind`); a work, retro,

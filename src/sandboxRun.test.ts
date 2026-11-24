@@ -512,6 +512,7 @@ const boardEnv = {
 	project: "ottr",
 	taskId: "OTTR-1",
 	token: "boot-token",
+	runToken: "run-token",
 };
 
 const validReq = { project: "ottr", argv: ["true"] };
@@ -582,6 +583,7 @@ describe("runSandboxViaBoard", () => {
 		expect(seen[0]?.init.method).toBe("POST");
 		expect(seen[0]?.init.headers).toMatchObject({
 			"x-board-token": "boot-token",
+			"x-run-token": "run-token",
 			origin: boardEnv.base,
 			"content-type": "application/json",
 		});
@@ -595,13 +597,18 @@ describe("runSandboxViaBoard", () => {
 		});
 	});
 
-	test("omits the token header on loopback, where the wall needs none", async () => {
+	test("omits the token headers on loopback, where the wall needs none", async () => {
 		const { fetchImpl, seen } = fakeFetch(
 			200,
 			JSON.stringify({ ok: true, result: guestResponse }),
 		);
-		await runSandboxViaBoard({ ...boardEnv, token: "" }, validReq, fetchImpl);
+		await runSandboxViaBoard(
+			{ ...boardEnv, token: "", runToken: "" },
+			validReq,
+			fetchImpl,
+		);
 		expect(seen[0]?.init.headers).not.toHaveProperty("x-board-token");
+		expect(seen[0]?.init.headers).not.toHaveProperty("x-run-token");
 	});
 
 	test("relays the board's error text as the exact blocker", async () => {

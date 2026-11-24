@@ -267,6 +267,8 @@ export interface SandboxBoardEnv {
 	taskId: string;
 	/** OTTR_BOARD_TOKEN; "" on loopback, where the wall needs no token. */
 	token: string;
+	/** OTTR_RUN_TOKEN: this run's own credential, bound to `project` and `taskId`. */
+	runToken: string;
 }
 
 /** The JSON body the tool POSTs to the board's sandbox endpoint. */
@@ -345,6 +347,7 @@ export async function runSandboxViaBoard(
 					"content-type": "application/json",
 					origin: board.base,
 					...(board.token !== "" ? { "x-board-token": board.token } : {}),
+					...(board.runToken !== "" ? { "x-run-token": board.runToken } : {}),
 				},
 				body: JSON.stringify(body),
 			},

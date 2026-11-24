@@ -65,6 +65,7 @@ import {
 import { cachedRepoHomepage } from "./repoHomepage.ts";
 import { publicHosts } from "./requestGuards.ts";
 import { startRun, vmRunnerFromEnv, workerFromEnv } from "./runner.ts";
+import { RunTokens } from "./runTokens.ts";
 import { archReviewView, blockingReview, lastFullReview } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import {
@@ -801,6 +802,10 @@ const vmTokens = new VmTokens({
 		? join(resolve(process.env.OTTR_SERVER_DATA_DIR), "vm-tokens.json")
 		: null,
 });
+// OTTR-1197: one credential per classic run for the sandbox endpoint, issued at
+// dispatch and bound to the run's project and card. Memory only: a run's env
+// dies with the run, and a board restart rotates the boot token too.
+const runTokens = new RunTokens();
 /** The board's provider gateway for VM turns' /llm proxy; null until it started. */
 let llmGateway: { url: string; token: string; stop(): void } | null = null;
 if (vmTarget !== null)
@@ -929,6 +934,7 @@ const loop = createTurnLoop(projects, {
 	// OTTR-1142: the settle of an accepted VM run probes the pool before its wake schedule.
 	vmProbe: () => probeVmRunner(vmTarget),
 	vmTokens,
+	runTokens,
 	syncWorktreeTo,
 	startRun,
 	// OTTR-454: the restart re-bind asks the workers for their detached runs and kills one on
@@ -1163,6 +1169,7 @@ const app = await createApp({
 	prod: PROD,
 	board,
 	vmTokens,
+	runTokens,
 	llmGateway: () => llmGateway,
 	hosted,
 	// No live secret source is approved. Keep internal bindings empty and server-only.

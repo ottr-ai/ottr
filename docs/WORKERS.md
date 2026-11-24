@@ -1170,7 +1170,8 @@ answer says so instead of a guess.
 gate and slot pool as `/run`) takes the job and answers the result JSON. The
 board tool `sandbox_run` (review, validation, and scout runs) is the audit-facing way to
 call it: it sends its args and the run's own card id to the board endpoint
-`POST /api/projects/<project>/sandbox` with the run's boot token, the server
+`POST /api/projects/<project>/sandbox` with the run's boot token and the run's
+own credential (`OTTR_RUN_TOKEN`, bound to the run's project and card), the server
 checks the run kind (review, validation, or trending scout only), packs the target with
 `git archive` from the project's registered checkout, stages the tar under the
 board's data dir (`OTTR_DATA_DIR`, default `/data`), and calls the runner with

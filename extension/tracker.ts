@@ -445,6 +445,8 @@ interface BoardEnv {
 	project: string;
 	parent: string;
 	token: string;
+	/** OTTR_RUN_TOKEN: this run's own sandbox credential; "" in runs without one. */
+	runToken: string;
 }
 
 function requireBoardEnv(tool = "create_task"): { error: string } | BoardEnv {
@@ -452,12 +454,13 @@ function requireBoardEnv(tool = "create_task"): { error: string } | BoardEnv {
 	const project = (process.env.OTTR_PROJECT ?? "").trim();
 	const parent = (process.env.OTTR_TASK_ID ?? "").trim();
 	const token = (process.env.OTTR_BOARD_TOKEN ?? "").trim();
+	const runToken = (process.env.OTTR_RUN_TOKEN ?? "").trim();
 	if (base === "" || project === "" || parent === "") {
 		return {
 			error: `Error: ${tool} is unavailable — the tracker did not inject OTTR_BOARD_URL/OTTR_PROJECT/OTTR_TASK_ID into this session. File no cards; finish the turn and report the blocker.`,
 		};
 	}
-	return { base, project, parent, token };
+	return { base, project, parent, token, runToken };
 }
 
 // A GitHub `owner/repo`: the trending scout's tools name repos this way.
@@ -1154,11 +1157,16 @@ export default function (pi: Pi) {
 					: [];
 				const env = requireBoardEnv("sandbox_run");
 				if ("error" in env) return textResult(env.error);
+				if (env.runToken === "")
+					return textResult(
+						"Error: sandbox_run is unavailable — this session carries no OTTR_RUN_TOKEN; only review, validation and scout runs can call it.",
+					);
 				const board = {
 					base: env.base,
 					project: env.project,
 					taskId: env.parent,
 					token: env.token,
+					runToken: env.runToken,
 				};
 				const body = {
 					project,

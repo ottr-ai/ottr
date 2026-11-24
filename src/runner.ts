@@ -84,6 +84,8 @@ interface BoardEnv {
 	token: string;
 	project: string;
 	taskId: string;
+	/** OTTR-1197: this run's own sandbox credential; the board's run-token store issued it at dispatch, bound to project and taskId. */
+	runToken?: string | null;
 }
 
 /**
@@ -134,6 +136,7 @@ export function childEnv(o: {
 		env.OTTR_BOARD_TOKEN = o.board.token;
 		env.OTTR_PROJECT = o.board.project;
 		env.OTTR_TASK_ID = o.board.taskId;
+		if (o.board.runToken) env.OTTR_RUN_TOKEN = o.board.runToken;
 	}
 	// After the board block: stripBoard must win even when a board object is passed.
 	if (o.stripBoard) {
@@ -141,6 +144,7 @@ export function childEnv(o: {
 		delete env.OTTR_BOARD_TOKEN;
 		delete env.OTTR_PROJECT;
 		delete env.OTTR_TASK_ID;
+		delete env.OTTR_RUN_TOKEN;
 	}
 	for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
 	return env;

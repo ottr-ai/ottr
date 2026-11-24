@@ -94,6 +94,7 @@ import {
 import { PR_GATES } from "./prs.ts";
 import { forModel, tightestFor, usageReset } from "./quota.ts";
 import { createRunSink } from "./runner.ts";
+import { RunTokens } from "./runTokens.ts";
 import {
 	archReviewDue,
 	LEAD_APPLIES_OPTION,
@@ -379,6 +380,8 @@ const shared = {
 const BOARD_TOKEN = "boot-token-test";
 // One VM token store for the app under test, as server.ts creates it (OTTR-532).
 const vmTokens = new VmTokens({ file: null });
+// One per-run sandbox credential store, as server.ts creates it (OTTR-1197).
+const runTokens = new RunTokens();
 type CancelOutcome = { kept: string } | { removed: true };
 type FinishKeptOutcome =
 	| { ok: true }
@@ -484,6 +487,7 @@ const app = await createTestApp({
 	serverRef: { current: undefined },
 	board: { url: "http://ottr:4852", token: BOARD_TOKEN },
 	vmTokens,
+	runTokens,
 });
 const server = Bun.serve({ port: 0, ...app.serveOptions });
 app.serverRef.current = server;
@@ -611,6 +615,8 @@ async function mount(
 		realPort?: boolean;
 		hosted?: Parameters<typeof createApp>[0]["hosted"];
 		board?: Parameters<typeof createApp>[0]["board"];
+		/** OTTR-1197: the per-run sandbox credential store; tests share the module one. */
+		runTokens?: Parameters<typeof createApp>[0]["runTokens"];
 		/** Gateway spawn seam for the release-summary route; defaults to the real spawn. */
 		releaseSummarySpawn?: Parameters<
 			typeof createApp
@@ -717,6 +723,7 @@ async function mount(
 		runners: input.runners,
 		hosted: input.hosted,
 		board: input.board,
+		runTokens: input.runTokens,
 		serverRef: { current: undefined },
 	};
 	const created = await createTestApp(appDeps);
@@ -11283,6 +11290,12 @@ describe("sandbox endpoint", () => {
 		Origin: origin,
 		...(token === null ? {} : { "x-board-token": token }),
 	});
+	// A classic run's request: the boot token plus the run's own credential,
+	// which the runner issues at dispatch and binds to the run's project and card.
+	const asRun = (token: string | null, runToken: string) => ({
+		...asTurn(token),
+		"x-run-token": runToken,
+	});
 
 	// The runner's happy answer, copied from src/sandboxRun.test.ts guestResponse.
 	const guestResponse = (): ValidateResponse => ({
@@ -11394,6 +11407,7 @@ describe("sandbox endpoint", () => {
 		const { dataDir, restore } = withRunnerEnv(true);
 		const { runnerCalls, restore: restoreFetch } = stubRunner();
 		seedCommit();
+		const runToken = runTokens.issue({ project: "p1", taskId: card.id });
 		try {
 			const res = await post(
 				"/api/projects/p1/sandbox",
@@ -11402,7 +11416,7 @@ describe("sandbox endpoint", () => {
 					project: "p1",
 					argv: ["bun", "test", "src/parse.ts"],
 				},
-				asTurn(BOARD_TOKEN),
+				asRun(BOARD_TOKEN, runToken),
 			);
 			expect(res.status).toBe(200);
 			const b = (await res.json()) as {
@@ -11483,7 +11497,7 @@ describe("sandbox endpoint", () => {
 			const res = await post(
 				"/api/projects/p1/sandbox",
 				{ taskId: card.id, project: "p2", argv: ["sh", "-c", "true"] },
-				asTurn(BOARD_TOKEN),
+				asRun(BOARD_TOKEN, runTokens.issue({ project: "p1", taskId: card.id })),
 			);
 			expect(res.status).toBe(200);
 			expect(runnerCalls.length).toBe(1);
@@ -11512,7 +11526,7 @@ describe("sandbox endpoint", () => {
 			const res = await post(
 				"/api/projects/p1/sandbox",
 				{ taskId: card.id, project: "p1-nope", argv: ["sh", "-c", "true"] },
-				asTurn(BOARD_TOKEN),
+				asRun(BOARD_TOKEN, runTokens.issue({ project: "p1", taskId: card.id })),
 			);
 			expect(res.status).toBe(400);
 			expect(await errorOf(res)).toBe(
@@ -11532,7 +11546,7 @@ describe("sandbox endpoint", () => {
 			const res = await post(
 				"/api/projects/p1/sandbox",
 				{ taskId: work.id, project: "p1", argv: ["sh", "-c", "true"] },
-				asTurn(BOARD_TOKEN),
+				asRun(BOARD_TOKEN, runTokens.issue({ project: "p1", taskId: work.id })),
 			);
 			expect(res.status).toBe(403);
 			expect(await errorOf(res)).toBe(
@@ -11542,6 +11556,50 @@ describe("sandbox endpoint", () => {
 		} finally {
 			await store.updateTask(work.id, { cancelledAt: Date.now() });
 			restoreFetch();
+		}
+	});
+
+	// OTTR-1197: the calling run's identity must not come from the body. Every
+	// classic run holds the same boot token, so the endpoint demands the run's
+	// own credential, issued at dispatch and bound to the run's project and
+	// card: a work run naming a review card refuses before the store is
+	// touched, and the runner never sees a job.
+	test("a work run cannot borrow a review card's id for the sandbox", async () => {
+		const review = await store.createTask("review card", null, "review");
+		const work = await store.createTask("plain work");
+		const { runnerCalls, restore: restoreFetch } = stubRunner();
+		const { restore } = withRunnerEnv(true);
+		seedCommit();
+		try {
+			// The work run's own credential, exactly what its env carries.
+			const runToken = runTokens.issue({ project: "p1", taskId: work.id });
+			const borrowed = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: review.id, project: "p1", argv: ["sh", "-c", "true"] },
+				asRun(BOARD_TOKEN, runToken),
+			);
+			expect(borrowed.status).toBe(403);
+			expect(await errorOf(borrowed)).toBe(
+				"sandbox_run runs only this run's own card in its own project",
+			);
+			// The shared boot token alone opens nothing here: any holder that is
+			// not a classic run with its own credential gets the same refusal.
+			const bootOnly = await post(
+				"/api/projects/p1/sandbox",
+				{ taskId: review.id, project: "p1", argv: ["sh", "-c", "true"] },
+				asTurn(BOARD_TOKEN),
+			);
+			expect(bootOnly.status).toBe(403);
+			expect(await errorOf(bootOnly)).toBe(
+				"sandbox_run needs this run's own credential (OTTR_RUN_TOKEN)",
+			);
+			expect(runnerCalls.length).toBe(0);
+		} finally {
+			await store.updateTask(review.id, { cancelledAt: Date.now() });
+			await store.updateTask(work.id, { cancelledAt: Date.now() });
+			restoreFetch();
+			restore();
+			dropGit();
 		}
 	});
 
@@ -11556,7 +11614,7 @@ describe("sandbox endpoint", () => {
 			const res = await post(
 				"/api/projects/p1/sandbox",
 				{ taskId: card.id, project: "p1", argv: ["sh", "-c", "true"] },
-				asTurn(BOARD_TOKEN),
+				asRun(BOARD_TOKEN, runTokens.issue({ project: "p1", taskId: card.id })),
 			);
 			expect(res.status).toBe(200);
 			expect(runnerCalls.length).toBe(1);
@@ -11573,10 +11631,13 @@ describe("sandbox endpoint", () => {
 	});
 
 	test("an unknown card and a missing taskId get the run-kind refusals", async () => {
+		// The credential names P1-999 because the run's card is gone: the binding
+		// passes, the store lookup misses, and the refusal names the run-kind rule.
+		const stale = runTokens.issue({ project: "p1", taskId: "P1-999" });
 		const missing = await post(
 			"/api/projects/p1/sandbox",
 			{ taskId: "P1-999", project: "p1", argv: ["sh", "-c", "true"] },
-			asTurn(BOARD_TOKEN),
+			asRun(BOARD_TOKEN, stale),
 		);
 		expect(missing.status).toBe(403);
 		expect(await errorOf(missing)).toBe(
@@ -11644,7 +11705,7 @@ describe("sandbox endpoint", () => {
 			const res = await post(
 				"/api/projects/p1/sandbox",
 				{ taskId: card.id, project: "p1", argv: ["sh", "-c", "true"] },
-				asTurn(BOARD_TOKEN),
+				asRun(BOARD_TOKEN, runTokens.issue({ project: "p1", taskId: card.id })),
 			);
 			expect(res.status).toBe(502);
 			expect(await errorOf(res)).toContain("OTTR_VM_RUNNER_URL");
@@ -11661,7 +11722,7 @@ describe("sandbox endpoint", () => {
 	// serves on a real port, so the child's Host and Origin match the allowlist and
 	// loopback reaches the endpoint with no token, as the board's own container does.
 	test("the stripped-env agent process runs the tool through the board", async () => {
-		const m = await mount({ projects, realPort: true });
+		const m = await mount({ projects, realPort: true, runTokens });
 		const card = await store.createTask("review run", null, "review");
 		const { restore } = withRunnerEnv(true);
 		const { restore: restoreFetch } = stubRunner();
@@ -11721,6 +11782,11 @@ describe("sandbox endpoint", () => {
 		childEnv.OTTR_PROJECT = "p1";
 		childEnv.OTTR_TASK_ID = card.id;
 		childEnv.OTTR_BOARD_TOKEN = BOARD_TOKEN;
+		// The run's own sandbox credential, exactly what the runner injects.
+		childEnv.OTTR_RUN_TOKEN = runTokens.issue({
+			project: "p1",
+			taskId: card.id,
+		});
 		childEnv.OTTR_REVIEW = "1"; // sandbox_run registers in review runs only
 		try {
 			const proc = Bun.spawn(

@@ -303,6 +303,7 @@ import {
 	originRefusal,
 	upgradeRefusal,
 } from "./requestGuards.ts";
+import type { RunTokens } from "./runTokens.ts";
 import { runSandboxJob, sandboxRequestError } from "./sandboxRun.ts";
 import {
 	archReviewDue,
@@ -811,6 +812,8 @@ interface AppDeps {
 	turnTokenFetch?: typeof fetch;
 	/** OTTR-532: the per-turn microVM tokens (git endpoint, /llm, /hindsight, card filing); absent = no VM turns. */
 	vmTokens?: VmTokens;
+	/** OTTR-1197: the per-run sandbox credentials, bound at dispatch to the run's project and card; absent = every sandbox request refuses. */
+	runTokens?: RunTokens;
 	/** OTTR-532: the local auth-gateway the /llm proxy forwards to; null while it is not running. */
 	llmGateway?: () => { url: string; token: string } | null;
 	/** Hosted mode (docs/specs/hosted-mode.md); undefined on every self-hosted board, and then no hosted path runs. */
@@ -13005,10 +13008,13 @@ export async function createApp(deps: AppDeps) {
 	}
 
 	// The sandbox_run tool's board leg (docs/specs/microvm-validation-mode.md, "Board
-	// endpoint and tool"): agentRefusal already checked the run's boot token, so the
-	// handler checks the run kind (review, validation, or trending scout only) against
-	// the route's project — the calling run's own — and packs the TARGET project's
-	// checkout server-side. runSandboxJob reads the server's own env
+	// endpoint and tool"): agentRefusal already checked the run's boot token, and the
+	// handler binds the request to the calling run's own credential (OTTR_RUN_TOKEN,
+	// issued at dispatch and bound to its project and card — every classic run holds
+	// the same boot token, so the body alone cannot be trusted), then checks the run
+	// kind (review, validation, or trending scout only) against the route's project —
+	// the calling run's own — and packs the TARGET project's checkout server-side.
+	// runSandboxJob reads the server's own env
 	// (OTTR_VM_RUNNER_URL, OTTR_WORKER_TOKEN, OTTR_DATA_DIR); the agent process never
 	// holds them (src/runner.ts childEnv strips OTTR_WORKER_TOKEN on purpose).
 	async function handlePOSTProjectsSandboxByProject(
@@ -13029,6 +13035,27 @@ export async function createApp(deps: AppDeps) {
 			cwd?: string;
 			collect?: string[];
 		};
+		// OTTR-1197: the boot token only says a classic run is calling — every
+		// classic run holds the same one, so the body alone cannot be trusted.
+		// The run's own credential binds the request to its project and card
+		// before the store is touched: a work run cannot borrow a review card's
+		// id, and a foreign project's route refuses. The check sits after the
+		// shape check, so a malformed body never learns anything at all.
+		const grant = deps.runTokens?.check(req.headers.get("x-run-token")) ?? null;
+		if (grant === null)
+			return json(
+				{
+					error: "sandbox_run needs this run's own credential (OTTR_RUN_TOKEN)",
+				},
+				403,
+			);
+		if (grant.taskId !== b.taskId || grant.project !== req.params.project)
+			return json(
+				{
+					error: "sandbox_run runs only this run's own card in its own project",
+				},
+				403,
+			);
 		const task = await e.store.getTask(b.taskId);
 		if (task === null)
 			return json(
@@ -15031,8 +15058,9 @@ export async function createApp(deps: AppDeps) {
 				),
 		},
 		// The sandbox_run tool's board leg (docs/specs/microvm-validation-mode.md, "Board endpoint and
-		// tool"): the run's boot token opens it (agentRefusal), the handler checks the run kind
-		// (review or trending scout only) and packs server-side with the server's own worker token.
+		// tool"): the run's boot token opens the wall (agentRefusal), the handler binds the request
+		// to the run's own credential, checks the run kind (review or trending scout only) and packs
+		// server-side with the server's own worker token.
 		"/api/projects/:project/sandbox": {
 			POST: async (req, server) => {
 				server.timeout(req, 0);

@@ -215,6 +215,28 @@ describe("childEnv", () => {
 		});
 	});
 
+	test("carries the run's own sandbox credential; stripBoard strips it (OTTR-1197)", () => {
+		const board = {
+			url: "http://127.0.0.1:4747",
+			token: "boot-token",
+			project: "ottr",
+			taskId: "t3",
+			runToken: "run-token",
+		};
+		expect(childEnv({ board, base: { PATH: "/bin" } })).toEqual({
+			PATH: "/bin",
+			OTTR_BOARD_URL: "http://127.0.0.1:4747",
+			OTTR_BOARD_TOKEN: "boot-token",
+			OTTR_PROJECT: "ottr",
+			OTTR_TASK_ID: "t3",
+			OTTR_RUN_TOKEN: "run-token",
+		});
+		// A retro or proposal run: no board coordinates, no credential.
+		expect(
+			childEnv({ board, stripBoard: true, base: { PATH: "/bin" } }),
+		).toEqual({ PATH: "/bin" });
+	});
+
 	test("without board or pinned name the env is the inherited base", () => {
 		expect(childEnv({ base: { PATH: "/bin" } })).toEqual({ PATH: "/bin" });
 	});
