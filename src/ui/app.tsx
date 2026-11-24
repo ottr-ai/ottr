@@ -39,13 +39,17 @@ import { missingByUse, type SkillUse } from "../requiredSkills.ts";
 import {
 	type DepIndex,
 	type DepProject,
+	FINDINGS_HOLD,
 	findDep,
+	holdWaitCards,
 	isReview,
 	type LeadStartRefusal,
 	leadValidationHold,
 	leadValidationStartRefusal,
 	liveCardOf,
 	queueOrder,
+	reviewFindings,
+	reviewOpenFindings,
 	validatableReview,
 	waitingOn,
 } from "../scheduler.ts";
@@ -10569,8 +10573,8 @@ function DrawerLineage(p: {
 	parent: TaskCard | null;
 	retroSource: (LineageRef & { card: TaskCard | null }) | null;
 	kids: TaskCard[];
-	proposals: Map<string, TaskCard[]>;
-	branchRow: (k: TaskCard, tag: string) => ReactNode;
+	/** The board's cards: the descendant tree walks them once per render. */
+	tasks: TaskCard[];
 	onOpenTask: (id: string) => void;
 	/** OTTR-1158: fetch state of a parent or retro source the state's Done window
 	 * dropped; null when the card sits in the state and nothing fetches. */
@@ -10586,8 +10590,7 @@ function DrawerLineage(p: {
 		parent,
 		retroSource,
 		kids,
-		proposals,
-		branchRow,
+		tasks,
 		onOpenTask,
 		parentFetch,
 		retroFetch,
@@ -10659,6 +10662,96 @@ function DrawerLineage(p: {
 				);
 		}
 	};
+	// Per-node fold state: card id → override. The default folds a quiet subtree:
+	// no open card below it and more than three rows.
+	const [folded, setFolded] = useState<Record<string, boolean>>({});
+	const tree = lineageTree(row, childMap(tasks));
+	/** One descendant row: the card link with its live state and its open count,
+	 * then — unless folded — its children one indent deeper, oldest first. */
+	const renderNode = (n: LineageNode, depth: number): ReactNode => {
+		const isFolded = folded[n.card.id] ?? (n.open === 0 && n.rows > 3);
+		// Past the cap a node renders no children; its whole subtree collapses
+		// into one "+N more" row that opens this node, the deepest shown card.
+		const hasKids = depth < LINEAGE_DEPTH && n.kids.length > 0;
+		const more = depth === LINEAGE_DEPTH && n.below > 0;
+		const branchOpen = (hasKids || more) && !isFolded;
+		const foldable = hasKids && n.rows > 3;
+		const openLabel = `${n.open} open sub-task${n.open === 1 ? "" : "s"}`;
+		const rowEl = (
+			<LineageCardLink
+				card={n.card}
+				selfProject={row.project}
+				tag={depth === 1 && n.card.kind === "retro" ? "retro" : ""}
+				onOpenTask={onOpenTask}
+				state={
+					n.open > 0 ? (
+						<>
+							{stateRow(n.card)}
+							{/* role="img"+aria-label is the file's established pattern for a count. */}
+							<span
+								className="lineage-open"
+								role="img"
+								aria-label={openLabel}
+								title={openLabel}
+							>
+								{n.open} open below
+							</span>
+						</>
+					) : (
+						stateRow(n.card)
+					)
+				}
+			/>
+		);
+		return (
+			<li
+				key={n.card.id}
+				// The elbow CSS hangs off this class; a folded node drops it, so no
+				// thread keeps pointing at rows that no longer render.
+				className={branchOpen ? "lineage-holds" : undefined}
+			>
+				{foldable ? (
+					<div className="lineage-line">
+						{rowEl}
+						<button
+							type="button"
+							className="lineage-fold"
+							aria-expanded={!isFolded}
+							aria-label={isFolded ? "Show sub-tasks" : "Hide sub-tasks"}
+							title={isFolded ? "Show sub-tasks" : "Hide sub-tasks"}
+							onClick={() =>
+								setFolded((m) => ({ ...m, [n.card.id]: !isFolded }))
+							}
+						>
+							<Icon name="chevron-right" size={12} />
+						</button>
+					</div>
+				) : (
+					rowEl
+				)}
+				{branchOpen && (
+					<ol
+						className="lineage-branch"
+						aria-label={n.card.kind === "retro" ? "Proposals" : "Sub-tasks"}
+					>
+						{hasKids && n.kids.map((k) => renderNode(k, depth + 1))}
+						{more && (
+							<li className="lineage-more">
+								{/* Opens the deepest shown card; the drawer re-roots one level down. */}
+								<a
+									className="lineage-row"
+									href={taskPath(n.card.project, n.card.id)}
+									onClick={(e) => navClick(e, () => onOpenTask(n.card.id))}
+								>
+									<span className="lineage-title">+{n.below} more</span>
+								</a>
+							</li>
+						)}
+					</ol>
+				)}
+			</li>
+		);
+	};
 	return (
 		<>
 			{" "}
@@ -10719,28 +10812,7 @@ function DrawerLineage(p: {
 							</span>
 							{kids.length > 0 && (
 								<ol className="lineage-branch" aria-label="Follow-ups">
-									{kids.map((k) => {
-										const props = proposals.get(k.id);
-										return (
-											<li
-												key={k.id}
-												className={
-													props !== undefined && props.length > 0
-														? "lineage-holds"
-														: undefined
-												}
-											>
-												{branchRow(k, k.kind === "retro" ? "retro" : "")}
-												{props !== undefined && props.length > 0 && (
-													<ol className="lineage-branch" aria-label="Proposals">
-														{props.map((p) => (
-															<li key={p.id}>{branchRow(p, "")}</li>
-														))}
-													</ol>
-												)}
-											</li>
-										);
-									})}
+									{tree.kids.map((k) => renderNode(k, 1))}
 								</ol>
 							)}
 						</li>
@@ -13868,26 +13940,75 @@ function followUpParent(
 	return { parent, retroSource };
 }
 
-/** Every retro under the card, each with every card filed off it (whatever its reason
- * says now), oldest first. One pass over the board, so the rail never scans it once per
- * retro. */
-function retroProposals(
-	kids: TaskCard[],
-	tasks: TaskCard[],
-	project: string,
-): Map<string, TaskCard[]> {
-	const proposals = new Map<string, TaskCard[]>();
-	for (const k of kids) if (k.kind === "retro") proposals.set(k.id, []);
-	if (proposals.size > 0)
-		for (const t of tasks)
-			if (
-				t.followUpOf !== null &&
-				(t.followUpOfProject ?? t.project) === project
-			)
-				proposals.get(t.followUpOf)?.push(t);
-	for (const list of proposals.values())
+/** Depth cap of the drawer's descendant tree: levels 1-4 render below the drawer card;
+ * deeper levels collapse into the deepest shown branch's "+N more" row. */
+const LINEAGE_DEPTH = 4;
+
+/** Children by parent key `${followUpOfProject ?? project}/${followUpOf}`, oldest first.
+ * One pass over the board, so the rail never scans it once per level. */
+function childMap(tasks: TaskCard[]): Map<string, TaskCard[]> {
+	const map = new Map<string, TaskCard[]>();
+	for (const t of tasks) {
+		if (t.followUpOf === null) continue;
+		const key = `${t.followUpOfProject ?? t.project}/${t.followUpOf}`;
+		const list = map.get(key);
+		if (list === undefined) map.set(key, [t]);
+		else list.push(t);
+	}
+	for (const list of map.values())
 		list.sort((a, b) => a.createdAt - b.createdAt);
-	return proposals;
+	return map;
+}
+
+/** One card in the drawer's descendant tree, with the counts its row shows. */
+type LineageNode = {
+	card: TaskCard;
+	/** Children, oldest first (visited cards skipped). */
+	kids: LineageNode[];
+	/** Cards this subtree holds below the card, rendered or not. */
+	below: number;
+	/** Open cards below the card: not cancelled and not landed — the UI display
+	 * rule, deliberately broader than the scheduler's findingOpen. */
+	open: number;
+	/** Rendered rows in this subtree: card rows, "+N more" rows, the card's own row. */
+	rows: number;
+};
+
+/** Builds the descendant tree under `card`, oldest first at each level, past the
+ * depth cap (the counts need the whole subtree). `seen` holds the visited keys: the
+ * store's single-parent links cannot form a reachable cycle, and the set also
+ * collapses duplicate task objects (OTTR-1258). */
+function lineageTree(
+	card: TaskCard,
+	byParent: Map<string, TaskCard[]>,
+): LineageNode {
+	const build = (
+		c: TaskCard,
+		depth: number,
+		seen: Set<string>,
+	): LineageNode => {
+		const key = `${c.project}/${c.id}`;
+		seen.add(key);
+		const kids: LineageNode[] = [];
+		let below = 0;
+		let open = 0;
+		let rows = 1;
+		for (const t of byParent.get(key) ?? []) {
+			const childKey = `${t.project}/${t.id}`;
+			if (seen.has(childKey)) continue;
+			const node = build(t, depth + 1, seen);
+			kids.push(node);
+			below += 1 + node.below;
+			// Not cancelled and not landed: the UI display rule, deliberately broader
+			// than the scheduler's findingOpen.
+			open +=
+				(t.cancelledAt === null && t.stage !== "done" ? 1 : 0) + node.open;
+			if (depth + 1 <= LINEAGE_DEPTH) rows += node.rows;
+		}
+		if (depth === LINEAGE_DEPTH && below > 0) rows += 1; // the "+N more" row
+		return { card: c, kids, below, open, rows };
+	};
+	return build(card, 0, new Set());
 }
 
 /** The model's context window for the drawer's token meter; null while the session or
@@ -14240,15 +14361,9 @@ export function Drawer({
 		loadLineage(refs);
 	}, [lineageWant]);
 	// Oldest first: the rail reads top to bottom in the order the follow-ups were filed.
-	// Retros are follow-up rows too; each retro's proposals hang one more level in under it.
-	const kids = tasks
-		.filter(
-			(t) =>
-				t.followUpOf === row.id &&
-				(t.followUpOfProject ?? t.project) === row.project,
-		)
-		.sort((a, b) => a.createdAt - b.createdAt);
-	const proposals = retroProposals(kids, tasks, row.project);
+	// The whole descendant tree hangs below, one level in per card; childMap walks the
+	// board once, so the rail never scans it once per level.
+	const kids = childMap(tasks).get(`${row.project}/${row.id}`) ?? [];
 	/** The live state span a lineage row shows after its tags, as the meta line shows
 	 * it. Follow-up rows and fetched parent rows share it. */
 	const lineageState = (k: TaskCard): ReactNode => (
@@ -14268,16 +14383,6 @@ export function Drawer({
 				draining,
 			)}
 		</span>
-	);
-	/** A follow-up or proposal row: the linked card with its live state, as the meta line shows it. */
-	const branchRow = (k: TaskCard, tag: string): ReactNode => (
-		<LineageCardLink
-			card={k}
-			selfProject={row.project}
-			tag={tag}
-			onOpenTask={onOpenTask}
-			state={lineageState(k)}
-		/>
 	);
 	// The rail rows for cards the Done window dropped: the fetch state fills the row
 	// until the card lands, then the plain link renders with its live state.
@@ -14309,6 +14414,19 @@ export function Drawer({
 				};
 	// A held card waits until these are done; a cancelled dependency counts as done.
 	const waiting = row.stage !== "done" ? waitingOn(tasks, row) : [];
+	// The banner names every card the holds park, deduped by card: the dependency
+	// list, this review's own open findings, and the cards another review's hold parks.
+	const waitSources = [
+		...waiting,
+		...(row.needsReason === FINDINGS_HOLD
+			? reviewOpenFindings(reviewFindings(tasks, row), row)
+			: []),
+		...holdWaitCards(tasks, row),
+	];
+	const waitAll = waitSources.filter(
+		(t, i, all) =>
+			all.findIndex((o) => o.project === t.project && o.id === t.id) === i,
+	);
 	const [reply, setReply] = useState("");
 	const [steer, setSteer] = useState("");
 	/** Non-null while the queued steering's text editor is open: holds the editor's draft. */
@@ -15071,7 +15189,7 @@ export function Drawer({
 						project={project}
 						cancelled={cancelled}
 						askedNow={askedNow}
-						waiting={waiting}
+						waiting={waitAll}
 						tasks={tasks}
 						draining={draining}
 						act={act}
@@ -15124,8 +15242,7 @@ export function Drawer({
 						parent={parentCard}
 						retroSource={retroCard}
 						kids={kids}
-						proposals={proposals}
-						branchRow={branchRow}
+						tasks={tasks}
 						onOpenTask={onOpenTask}
 						parentFetch={parentFetch}
 						retroFetch={retroFetch}
@@ -15141,7 +15258,7 @@ export function Drawer({
 						setDiffView={setDiffView}
 					/>
 					<DrawerWaiting
-						waiting={waiting}
+						waiting={waitAll}
 						task={task}
 						askedNow={askedNow}
 						proposal={proposal}

@@ -182,6 +182,19 @@ function findingOpen(
 	);
 }
 
+/** The findings the findings hold counts for review `r`: findingOpen, minus a lead the
+ * store flagged as a parked backlog lead at the review's doneAt (OTTR-963). Shared by
+ * reviewHoldFor and the drawer's hold banner (OTTR-1258), so the banner cannot name a
+ * card the hold does not count. */
+export function reviewOpenFindings<T extends ReviewTask>(
+	findings: readonly T[],
+	r: Pick<Task, "stage">,
+): T[] {
+	return findings.filter(
+		(f) => findingOpen(f) && (r.stage !== "done" || !f.leadAtDone),
+	);
+}
+
 function findingsOpen(
 	tasks: readonly ReviewTask[],
 	review: Pick<Task, "id" | "doneAt">,
@@ -320,12 +333,7 @@ function reviewHoldDetail(
 		};
 	if (mergeIsFinding) return null;
 	if (r.stage === "todo" || r.stage === "in_progress")
-		return cappedHold(
-			r.id,
-			"waiting for the review to finish",
-			r.createdAt,
-			now,
-		);
+		return cappedHold(r.id, REVIEW_RUN_HOLD, r.createdAt, now);
 	// Parked at merging until its findings are done (findingsHold); a done review reaches
 	// this with open findings only through a finding that was a commitment when it
 	// finished. A finding the store flagged as a parked backlog lead at doneAt never
@@ -335,12 +343,7 @@ function reviewHoldDetail(
 	// the store's record of the stage at doneAt (runTaskUpdate stamps it when the review
 	// lands done; the migration backfills it from the stage history), so a re-queue
 	// cannot blur it the way the queuedAt stamp would.
-	if (
-		r.stage === "merging" ||
-		findings.some(
-			(f) => findingOpen(f) && (r.stage !== "done" || !f.leadAtDone),
-		)
-	)
+	if (r.stage === "merging" || reviewOpenFindings(findings, r).length > 0)
 		return cappedHold(r.id, FINDINGS_HOLD, r.doneAt ?? r.createdAt, now);
 	return null;
 }
@@ -376,10 +379,38 @@ export function mergeHold(
 	return null;
 }
 
+/** The hold a running review parks merges under. */
+export const REVIEW_RUN_HOLD = "waiting for the review to finish";
+
 /** Why an approved review card waits in merging instead of done, else null: a review is done
  * only once the findings it filed are done, and a release publishes only then. */
 export const FINDINGS_HOLD =
 	"waiting for the review's findings to be implemented";
+
+/** The cards a card's review hold waits for, else empty (OTTR-1258). It reads the first
+ * hold reviewHoldsFor returns — the one mergeHold reports, under the same `now` cap — so
+ * the drawer's hold banner names exactly the cards the hold counts: the open findings of
+ * the review whose findings hold parks `t` (reviewOpenFindings), or the review itself
+ * while it runs or holds a release. Empty when no review holds `t`, or the hold names no
+ * card (a parked merging review with no open findings left). */
+export function holdWaitCards<T extends ReviewTask>(
+	tasks: readonly T[],
+	t: Pick<Task, "id">,
+	now?: number,
+): T[] {
+	const held = reviewHoldsFor(tasks, t, now)[0];
+	if (held === undefined) return [];
+	const r = tasks.find((c) => c.id === held.reviewId);
+	if (r === undefined) return [];
+	if (held.hold === FINDINGS_HOLD)
+		// reviewClosure stores the caller's own task objects, so the cast keeps the
+		// exact T references the board handed in.
+		return reviewOpenFindings(
+			(reviewClosure(tasks).byReview.get(r.id) ?? []) as T[],
+			r,
+		);
+	return [r];
+}
 
 /** Why a review card parks while its stored findings were never run through the
  * second-model check: the findings exist on the card but no check stamp covers them. */

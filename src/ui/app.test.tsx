@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { DeepenCheck } from "../deepen.ts";
 import { DEEPEN_POINTS } from "../prompts.ts";
 import { parseUsage } from "../quota.ts";
+import { FINDINGS_HOLD } from "../scheduler.ts";
 import fc from "../test/properties.ts";
 import type {
 	PerfMetrics,
@@ -3412,6 +3413,7 @@ describe("Drawer parent chip", () => {
 		) => cardFixture({ id, followUpOf, createdAt, ...over });
 		const at = (html: string, id: string) => html.indexOf(`>${id}<`);
 		const PROPOSALS = 'aria-label="Proposals"';
+		const SUBTASKS = 'aria-label="Sub-tasks"';
 
 		test("a retro source outside the Done window loads as a link", async () => {
 			// The retro parent sits in the state; its source is older than the window,
@@ -3526,7 +3528,7 @@ describe("Drawer parent chip", () => {
 			expect(at(html, "P-1")).toBeGreaterThan(html.indexOf(PROPOSALS));
 		});
 
-		test("a plain follow-up's own follow-ups do not nest", () => {
+		test("a follow-up's own follow-ups nest one level deeper", () => {
 			const html = renderToStaticMarkup(
 				<Drawer
 					{...base}
@@ -3535,7 +3537,12 @@ describe("Drawer parent chip", () => {
 				/>,
 			);
 			expect(html).toContain(">F-1<");
-			expect(html).not.toContain(">G-1<");
+			expect(html).toContain(">G-1<");
+			// G-1 nests inside F-1's own branch; a non-retro parent labels it
+			// "Sub-tasks", never "Proposals".
+			const nest = html.indexOf(SUBTASKS);
+			expect(nest).toBeGreaterThan(at(html, "F-1"));
+			expect(at(html, "G-1")).toBeGreaterThan(nest);
 			expect(html).not.toContain(PROPOSALS);
 		});
 
@@ -3597,6 +3604,176 @@ describe("Drawer parent chip", () => {
 			expect(html).not.toContain(">G-1<");
 			expect(html).not.toContain(">retro source<");
 		});
+	});
+
+	// The descendant tree tests: a done root and the row's key-span indexOf.
+	const treeSelf = childCard({ id: "S-1", stage: "done", state: "idle" });
+	const at = (html: string, id: string) => html.indexOf(`>${id}<`);
+	// The lineage section's markup: the fold assertions must not read later sections.
+	const railHtml = (html: string): string => {
+		const start = html.indexOf('id="drawer-lineage"');
+		const end = html.indexOf("<section", start + 1);
+		return html.slice(start, end === -1 ? undefined : end);
+	};
+	// The fold disclosure button's own markup.
+	const foldButton = (html: string): string => {
+		const start = html.indexOf('class="lineage-fold"');
+		return html.slice(start, html.indexOf("</button>", start));
+	};
+
+	test("a done child with a running grandchild counts its open subtree", () => {
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={[
+					cardFixture({
+						id: "K-1",
+						followUpOf: "S-1",
+						createdAt: 1000,
+						stage: "done",
+					}),
+					cardFixture({
+						id: "G-1",
+						followUpOf: "K-1",
+						createdAt: 2000,
+						stage: "in_progress",
+					}),
+				]}
+			/>,
+		);
+		// The grandchild renders one indent under the done child.
+		const nest = html.indexOf('aria-label="Sub-tasks"');
+		expect(nest).toBeGreaterThan(at(html, "K-1"));
+		expect(at(html, "G-1")).toBeGreaterThan(nest);
+		// The child's row carries the count; the grandchild's row (no descendants) does not.
+		const kRow = html.slice(at(html, "K-1"), nest);
+		expect(kRow).toContain("1 open below");
+		expect(kRow).toContain('aria-label="1 open sub-task"');
+		expect(html.slice(at(html, "G-1"))).not.toContain("open below");
+	});
+
+	test("the hold banner names the cards a review's findings hold parks", () => {
+		// A review held by its findings waits on its OPEN findings only: the done
+		// finding drops out, while its running child still counts as a finding.
+		const review = cardFixture({
+			id: "R-1",
+			kind: "review",
+			stage: "merging",
+			state: "idle",
+			needsReason: FINDINGS_HOLD,
+			doneAt: 5000,
+			createdAt: 500,
+		});
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={review}
+				tasks={[
+					cardFixture({
+						id: "F-1",
+						followUpOf: "R-1",
+						createdAt: 1000,
+						stage: "done",
+					}),
+					cardFixture({
+						id: "G-1",
+						followUpOf: "F-1",
+						createdAt: 2000,
+						stage: "in_progress",
+					}),
+				]}
+			/>,
+		);
+		const waiting = html.slice(html.indexOf('id="drawer-waiting"'));
+		expect(waiting).toContain('href="/projects/proj/tasks/G-1"');
+		expect(waiting).not.toContain('href="/projects/proj/tasks/F-1"');
+	});
+
+	test("the tree caps at four levels and folds the rest into a +N more row", () => {
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={[
+					cardFixture({ id: "L-1", followUpOf: "S-1", createdAt: 1000 }),
+					cardFixture({ id: "L-2", followUpOf: "L-1", createdAt: 2000 }),
+					cardFixture({ id: "L-3", followUpOf: "L-2", createdAt: 3000 }),
+					cardFixture({ id: "L-4", followUpOf: "L-3", createdAt: 4000 }),
+					cardFixture({ id: "L-5", followUpOf: "L-4", createdAt: 5000 }),
+					cardFixture({ id: "L-6", followUpOf: "L-5", createdAt: 6000 }),
+				]}
+			/>,
+		);
+		// Levels 1-4 render; levels 5 and 6 collapse into L-4's "+2 more" row.
+		expect(html).toContain(">L-4<");
+		expect(html).not.toContain(">L-5<");
+		expect(html).not.toContain(">L-6<");
+		expect(html.indexOf("+2 more")).toBeGreaterThan(at(html, "L-4"));
+		// The more row opens the deepest shown card, L-4 itself.
+		expect(html).toContain('href="/projects/proj/tasks/L-4"');
+	});
+
+	test("a duplicate card object renders once", () => {
+		// The store's single-parent links cannot form a reachable cycle; the visited
+		// set also collapses duplicate task objects, so each (project, id) renders once.
+		const html = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={[
+					cardFixture({ id: "C-1", followUpOf: "S-1", createdAt: 1000 }),
+					cardFixture({ id: "D-1", followUpOf: "C-1", createdAt: 2000 }),
+					cardFixture({ id: "D-1", followUpOf: "C-1", createdAt: 3000 }),
+				]}
+			/>,
+		);
+		expect(html.match(/>D-1</g)).toHaveLength(1);
+	});
+
+	test("a quiet subtree folds and an open card keeps its rows visible", () => {
+		// Four rows with no open card below Q-1: the default folds it. One running
+		// grandchild keeps the same-size subtree expanded.
+		const doneKid = (id: string, followUpOf: string, createdAt: number) =>
+			cardFixture({ id, followUpOf, createdAt, stage: "done" });
+		const quiet = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={[
+					doneKid("Q-1", "S-1", 1000),
+					doneKid("G-1", "Q-1", 2000),
+					doneKid("G-2", "Q-1", 3000),
+					doneKid("G-3", "Q-1", 4000),
+				]}
+			/>,
+		);
+		const open = renderToStaticMarkup(
+			<Drawer
+				{...base}
+				task={treeSelf}
+				tasks={[
+					doneKid("Q-1", "S-1", 1000),
+					doneKid("G-1", "Q-1", 2000),
+					cardFixture({
+						id: "G-2",
+						followUpOf: "Q-1",
+						createdAt: 3000,
+						stage: "in_progress",
+					}),
+					doneKid("G-3", "Q-1", 4000),
+				]}
+			/>,
+		);
+		expect(foldButton(quiet)).toContain('aria-expanded="false"');
+		expect(foldButton(quiet)).toContain('aria-label="Show sub-tasks"');
+		// Folded: the grandchildren render nothing and no elbow dangles.
+		expect(railHtml(quiet)).not.toContain(">G-1<");
+		expect(railHtml(quiet)).not.toContain("lineage-holds");
+		expect(foldButton(open)).toContain('aria-expanded="true"');
+		expect(foldButton(open)).toContain('aria-label="Hide sub-tasks"');
+		expect(railHtml(open)).toContain(">G-1<");
+		expect(railHtml(open)).toContain("lineage-holds");
 	});
 });
 
