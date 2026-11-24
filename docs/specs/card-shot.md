@@ -35,6 +35,9 @@ shots were already written).
     status line reads "PR #N open · waiting for merge" and the card carries
     the PR chip.
   - a normal done card next to it, for contrast.
+  - the ask card: `stage` in_progress, `state` needs_you, an `asked` round
+    whose question and options carry long unbroken tokens (API paths, jq
+    filters) the drawer must wrap.
 - Boots `bun src/server.ts` in production asset mode on a free port with
   `OTTR_DEMO=1`, the fresh root, state dir, and workers home.
 - Drives headless Chrome over CDP (1440x900, dark, `en-US`) to each requested
@@ -42,6 +45,10 @@ shots were already written).
   - `card`: the parked PR card's drawer at
     `/projects/lumen/tasks/<prId>`.
   - `done`: the contrast done card's drawer.
+  - `ask`: the ask card's drawer; the question's long tokens must wrap
+    inside the panel. Writes the dark `ask.png`, then stores the light
+    theme and navigates fresh (a reload's style-only repaint can miss the
+    headless surface) to write `ask-light.png`.
   - `board`: the Lumen project face.
   - `settings-hindsight`: `/settings`, scrolled to the Hindsight card. The
     board env strips the host's Hindsight endpoint and pins
@@ -52,6 +59,10 @@ shots were already written).
 - Prints the planted card ids before the board boots.
 - Bounds every wait: an overall 90 s watchdog plus a deadline on each CDP
   call, the Chrome endpoint line, the readiness poll, and each page load.
+- Gives Chrome its own writable HOME: its caches and crash database die on a
+  read-only one before any endpoint line. When a Chrome boot dies before it
+  prints the DevTools endpoint, the script boots once without the sandbox —
+  containers without unprivileged user namespaces kill the sandboxed zygote.
 - Verifies every PNG (signature `89 50 4e 47 0d 0a 1a 0a` and the 1440x900
   IHDR size) after the children are stopped, then calls `process.exit` so the
   script cannot hang after success.
@@ -68,8 +79,8 @@ shots were already written).
 
 ## Non-goals
 
-- Other card fixtures than the parked PR card and the done card (add a view
-  when a card needs one). Settings views stay single-purpose: a view that
+- Other card fixtures than the three planted ones (add a view when a card
+  needs one). Settings views stay single-purpose: a view that
   needs a warning line drives its own env and asserts the line.
 - Screenshots of system pages.
 - Visual-regression goldens or pixel-diff gates.

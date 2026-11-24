@@ -7655,6 +7655,14 @@ a.lineage-row:hover .lineage-title {
 	font-weight: 600;
 	color: var(--text-strong);
 }
+/* The text span takes any width: min-width:0 lifts the flex item's content floor, so a
+   long unbroken token (command, path, URL) wraps instead of pushing the ask panel wide.
+   pre-line keeps the line breaks the agent wrote. */
+.ask-text > span:first-of-type {
+	min-width: 0;
+	overflow-wrap: anywhere;
+	white-space: pre-line;
+}
 /* Answered work recedes: lighter weight and text, the check mark carries the state. */
 .ask-q.answered .ask-text {
 	font-weight: 500;
@@ -7719,10 +7727,13 @@ a.lineage-row:hover .lineage-title {
    + 8px column gap, inside the row's own 8px padding. */
 .ask-desc {
 	flex-basis: 100%;
+	min-width: 0;
 	margin: 0;
 	padding: 0 8px 3px 21px;
 	font-size: 12.5px;
 	color: var(--dim);
+	overflow-wrap: anywhere;
+	white-space: pre-line;
 }
 .ask-actions {
 	display: flex;
@@ -7936,6 +7947,7 @@ button.diff-path {
 .decide-ask > :not(.mark) {
 	flex: 1;
 	min-width: 0;
+	overflow-wrap: anywhere;
 }
 .decide-reason {
 	display: flex;
@@ -8413,6 +8425,7 @@ button.log-mode[aria-pressed="true"] {
 	-webkit-line-clamp: 3;
 	-webkit-box-orient: vertical;
 	overflow: hidden;
+	overflow-wrap: anywhere;
 }
 /* A work check step: a turn's head row with nothing to open (the Work check section holds
    the findings), so the pointer stays an arrow. */

@@ -64,12 +64,42 @@ const DONE_SPEC: Spec = {
 	merge: 2,
 };
 
+/** The ask card: a round parked on the operator, its question full of the long
+ *  unbroken tokens (API paths, jq filters) that overflowed the drawer (OTTR-1257). */
+const ASK_SPEC: Spec = {
+	title:
+		"Consolidate Velvarr code-scanning alerts into one card per error type",
+	stage: "in_progress",
+	state: "needs_you",
+	age: 0.2,
+	work: 12,
+	needs:
+		"Wants your answer: group the open alerts by rule, by tool, or as one card?",
+	asked: {
+		questions: [
+			{
+				q: "The Velvarr code-scanning poll reads repos/Skare69/velvarr/code-scanning/alerts/$n every turn and returns one blob per tool. List the 14 open alerts with jq -c '.[] | {number,created_at,tool:.tool.name,rule:.rule.id,most_recent_instance:.most_recent_instance.state}' — how should the board group them into cards?",
+				options: [
+					"One card per rule id (rule:.rule.id)",
+					"One card per tool (tool:.tool.name)",
+					"One card for all alerts",
+				],
+			},
+			{
+				q: "Dismiss the tool.name duplicates that LUME-4 already tracks?",
+				options: ["Dismiss them", "Keep them open"],
+			},
+		],
+	},
+};
+
 interface Planted {
 	prId: string;
 	doneId: string;
+	askId: string;
 }
 
-const VIEWS = ["card", "done", "board", "settings-hindsight"];
+const VIEWS = ["card", "done", "ask", "board", "settings-hindsight"];
 
 function parseView(raw: string | undefined, usage: string, views: string[]) {
 	if (raw === undefined || !VIEWS.includes(raw)) fail("card-shot", usage);
@@ -78,7 +108,7 @@ function parseView(raw: string | undefined, usage: string, views: string[]) {
 
 function parseArgs(argv: string[]): { pr: number | null; views: string[] } {
 	const usage =
-		"usage: bun scripts/card-shot.ts --pr <number> [--view card|done|board|settings-hindsight]...";
+		"usage: bun scripts/card-shot.ts --pr <number> [--view card|done|ask|board|settings-hindsight]...";
 	let pr: number | null = null;
 	const views: string[] = [];
 	for (let i = 0; i < argv.length; i++) {
@@ -94,8 +124,11 @@ function parseArgs(argv: string[]): { pr: number | null; views: string[] } {
 		}
 	}
 	if (views.length === 0) views.push("card");
-	if (pr === null && (views.includes("card") || views.includes("done")))
-		fail("card-shot", "the card and done views need --pr");
+	if (
+		pr === null &&
+		(views.includes("card") || views.includes("done") || views.includes("ask"))
+	)
+		fail("card-shot", "the card, done and ask views need --pr");
 	return { pr, views };
 }
 
@@ -152,10 +185,20 @@ function plantCards(root: string, pr: number): Planted {
 			`${prefix}-${next + 1}`,
 		);
 		seedTaskEvents(db, doneSeed);
+		// The ask round parks on the operator; the drawer's ask panel reads it.
+		const askSeed = insertTaskRow(
+			db,
+			LUMEN,
+			ASK_SPEC,
+			next,
+			now,
+			`${prefix}-${next + 2}`,
+		);
+		seedTaskEvents(db, askSeed);
 		// Cards created later on this board continue the id sequence.
 		db.run(
 			"INSERT INTO settings (key, value) VALUES ('next-task-num', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-			[JSON.stringify(next + 2)],
+			[JSON.stringify(next + 3)],
 		);
 		// OTTR-826: the done drawer's Saved files section reads the card's kept
 		// quarantine folder; plant two files and the captured uncommitted names for it.
@@ -167,7 +210,7 @@ function plantCards(root: string, pr: number): Planted {
 		mkdirSync(join(savedDir, "data"), { recursive: true });
 		writeFileSync(join(savedDir, "mockup.html"), "<h1>Backoff mock</h1>\n");
 		writeFileSync(join(savedDir, "data", "notes.csv"), "t,ms\n0,250\n1,480\n");
-		return { prId: prSeed.id, doneId: doneSeed.id };
+		return { prId: prSeed.id, doneId: doneSeed.id, askId: askSeed.id };
 	} finally {
 		db.close();
 	}
@@ -179,7 +222,13 @@ function viewPath(name: string, planted: Planted | null): string {
 	// Settings opens on its own path; the shot drives the scroll to the section.
 	if (name === "settings-hindsight") return "/settings";
 	if (planted === null) throw new Error(`the ${name} view needs --pr`);
-	return `/projects/${PROJECT}/tasks/${name === "card" ? planted.prId : planted.doneId}`;
+	const id =
+		name === "card"
+			? planted.prId
+			: name === "ask"
+				? planted.askId
+				: planted.doneId;
+	return `/projects/${PROJECT}/tasks/${id}`;
 }
 
 function verifyPng(png: Buffer, file: string): void {
@@ -253,34 +302,58 @@ const board = Bun.spawn(["bun", "src/server.ts"], {
 	stderr: "pipe",
 });
 
-const userDir = mkdtempSync(join(tmpdir(), "ottr-card-shot-chrome-"));
-const chrome = Bun.spawn(
-	[
-		chromePath,
-		"--headless=new",
-		"--remote-debugging-port=0",
-		`--user-data-dir=${userDir}`,
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-gpu",
-		"--disable-dev-shm-usage",
-		"--hide-scrollbars",
-		`--window-size=${WIDTH},${HEIGHT}`,
-		...(typeof process.getuid === "function" && process.getuid() === 0
-			? ["--no-sandbox"]
-			: []),
-		"about:blank",
-	],
-	{ stdout: "ignore", stderr: "pipe" },
-);
+// Chrome writes its caches and the crash database under HOME; a read-only HOME (a
+// service account's) kills the boot before any endpoint line. Give chrome its own.
+const chromeHome = mkdtempSync(join(tmpdir(), "ottr-card-shot-chrome-home-"));
+const bootChrome = (sandbox: boolean) => {
+	// A fresh profile dir per boot: a dead boot's Singleton lock must not block the
+	// sandbox retry below.
+	const userDir = mkdtempSync(join(tmpdir(), "ottr-card-shot-chrome-"));
+	return Bun.spawn(
+		[
+			chromePath,
+			"--headless=new",
+			"--remote-debugging-port=0",
+			`--user-data-dir=${userDir}`,
+			"--no-first-run",
+			"--no-default-browser-check",
+			"--disable-gpu",
+			"--disable-dev-shm-usage",
+			"--hide-scrollbars",
+			`--window-size=${WIDTH},${HEIGHT}`,
+			// Root keeps no sandbox (the zygote refuses it there); the retry below
+			// drops it only where unprivileged user namespaces are missing.
+			...(!sandbox ||
+			(typeof process.getuid === "function" && process.getuid() === 0)
+				? ["--no-sandbox"]
+				: []),
+			"about:blank",
+		],
+		{
+			stdout: "ignore",
+			stderr: "pipe",
+			env: { ...process.env, HOME: chromeHome },
+		},
+	);
+};
+let chrome = bootChrome(true);
 
-/** Reads chrome's stderr until the DevTools websocket endpoint line arrives. */
-async function readDevToolsEndpoint(): Promise<string> {
-	const reader = chrome.stderr.getReader();
+/** Waits for chrome's CDP endpoint line on stderr; null when the deadline wins. */
+async function waitEndpoint(
+	proc: { stderr: ReadableStream<Uint8Array> },
+	ms: number,
+): Promise<string | null> {
+	const reader = proc.stderr.getReader();
 	const decoder = new TextDecoder();
 	let text = "";
-	while (true) {
-		const { done, value } = await reader.read();
+	const deadline = Date.now() + ms;
+	while (Date.now() < deadline) {
+		const chunk = await Promise.race([
+			reader.read(),
+			Bun.sleep(deadline - Date.now()).then(() => null),
+		]);
+		if (chunk === null) break; // the deadline won
+		const { done, value } = chunk;
 		if (done) break;
 		text += decoder.decode(value, { stream: true });
 		const hit = text.match(/DevTools listening on (ws:\/\/\S+)/);
@@ -289,7 +362,8 @@ async function readDevToolsEndpoint(): Promise<string> {
 			return hit[1];
 		}
 	}
-	throw new Error("chrome printed no DevTools endpoint");
+	await reader.cancel().catch(() => {});
+	return null;
 }
 
 /** Polls the board home page until it answers; refuses a board that exits early. */
@@ -436,16 +510,55 @@ async function captureView(
 	await Bun.sleep(SETTLE_MS);
 	if (name === "settings-hindsight") await verifyHindsight(client, sessionId);
 	await writeShot(client, sessionId, name);
+	if (name === "ask") {
+		// The same drawer in the light theme: the wrap rules must hold in both.
+		// The board pins its theme from localStorage at first paint, so the
+		// emulation flip alone cannot reach it — store the theme, then navigate
+		// fresh: a reload's style-only repaint can miss the headless surface.
+		const setTheme = (theme: string) =>
+			client.send(
+				"Runtime.evaluate",
+				{ expression: `localStorage.setItem('ottr.theme', '${theme}')` },
+				sessionId,
+			);
+		const navigate = async () => {
+			const load = client.waitEvent("Page.loadEventFired", sessionId);
+			await withTimeout(
+				client.send(
+					"Page.navigate",
+					{ url: `http://127.0.0.1:${port}${viewPath(name, planted)}` },
+					sessionId,
+				),
+				15_000,
+				"Page.navigate",
+			);
+			await withTimeout(load, 30_000, "the ask light load");
+			await Bun.sleep(SETTLE_MS);
+		};
+		await setTheme("light");
+		await navigate();
+		await writeShot(client, sessionId, "ask-light");
+		// Leave the stored theme as the board's default for any later view.
+		await setTheme("system");
+	}
 }
 
 /** One capture run; every await below carries its own deadline. */
 async function capture(): Promise<void> {
 	// The endpoint line arrives on stderr: "DevTools listening on ws://...".
-	const endpoint = await withTimeout(
-		readDevToolsEndpoint(),
-		15_000,
-		"the chrome endpoint line",
-	);
+	let endpoint = await waitEndpoint(chrome, 15_000);
+	if (endpoint === null) {
+		// Chrome died before any endpoint line: on hosts without unprivileged user
+		// namespaces the sandbox zygote kills the boot ("No usable sandbox"). Confirm
+		// the exit, then boot once without the sandbox (the board's readiness retry
+		// is the pattern; this harness visits only its own demo board).
+		const exit = await Promise.race([chrome.exited, Bun.sleep(250)]);
+		if (exit !== undefined) {
+			chrome = bootChrome(false);
+			endpoint = await waitEndpoint(chrome, 15_000);
+		}
+	}
+	if (endpoint === null) throw new Error("chrome printed no DevTools endpoint");
 
 	const client = new Cdp(new WebSocket(endpoint));
 	await withTimeout(client.open(), 10_000, "CDP open");

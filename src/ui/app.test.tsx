@@ -1789,6 +1789,47 @@ describe("AskBlock", () => {
 		);
 	});
 
+	test("a long unbroken token wraps inside the ask panel instead of overflowing it", async () => {
+		// VELV-286's question shape: a path and a jq filter without spaces, here with a
+		// 300-character token as the worst case.
+		const token = "x".repeat(300);
+		const html = renderToStaticMarkup(
+			<AskBlock
+				{...base}
+				q={{
+					question: `Read repos/Skare69/velvarr/code-scanning/alerts/$n and reply per error type after ${token}.`,
+					options: [
+						{
+							label: "One card per rule id",
+							description: `jq -c '.[] | {number,created_at,tool:.tool.name,rule:.rule.id,${token}}'`,
+						},
+					],
+					multi: false,
+					recommended: 0,
+					text: false,
+				}}
+			/>,
+		);
+		// The wrap lives in app.css: load the stylesheet into the document the markup
+		// parses under and read the rules off the rendered elements.
+		const win = new Window({ url: "http://localhost/" });
+		win.document.head.innerHTML = `<style>${await Bun.file(
+			new URL("./app.css", import.meta.url),
+		).text()}</style>`;
+		win.document.body.innerHTML = html;
+		const text = win.document.querySelector(".ask-text > span:first-of-type");
+		if (text === null) throw new Error("the question span is missing");
+		expect(text.textContent).toContain(token);
+		const cs = win.getComputedStyle(text);
+		// The span shrinks below its longest token and breaks it, and newlines stay breaks.
+		expect(cs.minWidth).toBe("0");
+		expect(cs.overflowWrap).toBe("anywhere");
+		expect(cs.whiteSpace).toBe("pre-line");
+		const desc = win.document.querySelector(".ask-desc");
+		if (desc === null) throw new Error("the option description is missing");
+		expect(win.getComputedStyle(desc).overflowWrap).toBe("anywhere");
+	});
+
 	test("a quoted path without changes renders as plain text", () => {
 		const html = renderToStaticMarkup(
 			<AskBlock
