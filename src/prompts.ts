@@ -568,7 +568,7 @@ Record exactly one result per processed lead with propose_task. The prompt's fir
 - refuted: the job output shows the risk is not real.
 - blocked: the sandbox could not exercise the lead; name the exact missing control.
 - deployment: the proof waits on a user-known fact; restate the question.
-Put the evidence (the decisive output lines, shortened) on the lines after the first line. Record no other propose_task calls.
+Put the evidence (the decisive output lines, shortened) on the lines after the first line. End each result prompt with an Acceptance section that holds one observable check, for example the job id with selfCheck.ok=true. Record no other propose_task calls.
 
 Leads:
 ${listed}
