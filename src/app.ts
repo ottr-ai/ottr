@@ -370,6 +370,12 @@ import {
 } from "./serviceQuotas.ts";
 import { sessionContext } from "./session.ts";
 import {
+	isStaleAskReason,
+	STALE_FIX_PENDING_STEER,
+	STALE_OPTIONS,
+	staleAnswerKind,
+} from "./staleTurn.ts";
+import {
 	type AskDraft,
 	type BoardTurnFacts,
 	logStoreError,
@@ -676,7 +682,13 @@ interface AppDeps {
 	): Promise<
 		{ id: string; reset: string[] } | { error: string; status: number }
 	>;
-	stopTurn(e: Entry, id: string): Promise<StopOutcome>;
+	/** OTTR-1261: `reason` parks the stopped card with it instead of the plain
+	 * stopped reason; the stale-ask's Stop answer names the stale park. */
+	stopTurn(e: Entry, id: string, reason?: string): Promise<StopOutcome>;
+	/** OTTR-1261: whether the card's unsuffixed turn entry is live. The stale-ask
+	 * responder intercepts replies only while it is; absent in narrow mounts, where
+	 * every reply takes the normal path. */
+	turnLive?: (project: string, id: string) => boolean;
 	finishKept(
 		e: Entry,
 		id: string,
@@ -13567,6 +13579,89 @@ export async function createApp(deps: AppDeps) {
 		await deps.schedule();
 		return taskResponse(e, task.id);
 	}
+	/** A reply to a stale-turn ask (OTTR-1261, docs/specs/stale-turn-recovery.md):
+	 * the drawer sends `For "<question>": <answer>` with one of the three options
+	 * while the card's process is still live. "Apply the fix" queues the supervisor
+	 * marker steer, so the stale pass performs the allowlisted fix on its next tick;
+	 * "Stop the turn and restart" stops through the loop's stop path and queues the
+	 * "." resume, so a fresh turn continues on the same session; "Wait" clears the
+	 * ask and leaves the turn running (the pass's ask cooldown keeps it quiet). Any
+	 * other reply while the process is alive is refused with 409 and no row change:
+	 * free text would start a second turn on the same session. A stale-marked card
+	 * whose process died falls through to the generic reply path below, whose patch
+	 * clears the moot ask (needsReason: null, asked: null) with the resume. */
+	async function staleAskReply(
+		e: Entry,
+		task: Task,
+		trimmed: string,
+	): Promise<Response | null> {
+		if (!isStaleAskReason(task.needsReason) || task.asked === null) return null;
+		if (deps.turnLive?.(e.store.name, task.id) !== true) return null;
+		const kind = staleAnswerKind(trimmed);
+		if (kind === null)
+			return json(
+				{
+					error: `this card's turn is still running; answer with one of: ${STALE_OPTIONS.join(", ")}`,
+				},
+				409,
+			);
+		if (kind === "fix") {
+			await updateSnapshot(e, task, {
+				pendingPrompt: queuedReply(task.pendingPrompt, STALE_FIX_PENDING_STEER),
+				pendingBy: "supervisor",
+				pendingFeedback: false,
+				state: "running",
+				asked: null,
+				needsReason: null,
+			});
+			await appendLog(
+				e.store,
+				task.id,
+				"supervisor: stale fix approved by owner, applying",
+			);
+			await deps.schedule();
+			return await taskResponse(e, task.id);
+		}
+		if (kind === "stop") {
+			const out = await deps.stopTurn(
+				e,
+				task.id,
+				"supervisor: stale turn stopped by owner",
+			);
+			if ("error" in out) return json({ error: out.error }, out.status);
+			try {
+				await updateSnapshot(e, task, {
+					// "." queues nothing extra when no steer is pending, keeps any
+					// queued text, and stays supervisor-authored (replyPatch's rule),
+					// so the fresh turn auto-resumes the same session.
+					...replyPatch(task, ".", [], "supervisor"),
+				});
+			} catch (err) {
+				// The stop's settle parked the card between the kill and this write:
+				// re-read the parked row and queue the resume on it.
+				if (!(err instanceof TaskConflict)) throw err;
+				const parked = await e.store.getTask(task.id);
+				if (parked === null) return json({ error: "unknown task" }, 404);
+				await updateSnapshot(e, parked, {
+					...replyPatch(parked, ".", [], "supervisor"),
+				});
+			}
+			await deps.schedule();
+			return await taskResponse(e, task.id);
+		}
+		// "wait": the ask clears, the turn keeps running.
+		await updateSnapshot(e, task, {
+			state: "running",
+			asked: null,
+			needsReason: null,
+		});
+		await appendLog(
+			e.store,
+			task.id,
+			"supervisor: stale ask answered wait by owner",
+		);
+		return await taskResponse(e, task.id);
+	}
 	/** The reply payload refusals: not needs-you, bad images, or text over the cap. */
 	async function replyRefusal(
 		e: Entry,
@@ -13645,6 +13740,11 @@ export async function createApp(deps: AppDeps) {
 		// question, each applied to its lead card, and the card lands Done here.
 		const leadAsk = await reviewLeadAskReply(e, task, trimmed);
 		if (leadAsk !== null) return leadAsk;
+		// A stale-turn ask (OTTR-1261) answers through its three options while the
+		// process is alive; free text is refused there, and a dead process falls
+		// through to the plain resume below.
+		const stale = await staleAskReply(e, task, trimmed);
+		if (stale !== null) return stale;
 		const names =
 			images.length > 0
 				? saveImages(e.store.dataRoot, await e.store.imagesDir(task.id), images)

@@ -4,6 +4,7 @@ import {
 	mkdirSync,
 	mkdtempSync,
 	rmSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,19 @@ import { dirname, join } from "node:path";
 import { ARCH_REVIEW_MARKER, RULES_INTERVIEW_MARKER } from "./prompts.ts";
 import { classify } from "./runner.ts";
 import { mergeHold, pickRunnable } from "./scheduler.ts";
+import {
+	diagnoseStale,
+	isStaleAskReason,
+	type LastTool,
+	type LockFact,
+	type ProcSample,
+	STALE_ASK_MARKER,
+	type StaleProbe,
+	staleAskQuestion,
+	staleAskReason,
+	staleSteerText,
+	tickMap,
+} from "./staleTurn.ts";
 import { ProjectStore, type TaskPatch } from "./store.ts";
 import {
 	churnTend,
@@ -25,6 +39,7 @@ import {
 	type SupervisorEntry,
 	type SupervisorOps,
 	scratchShotsTend,
+	staleDiagnosis,
 	tendFamily,
 } from "./supervisor.ts";
 import fc from "./test/properties.ts";
@@ -102,6 +117,13 @@ interface FakeOps extends SupervisorOps {
 	swept: SweptProcess[];
 	sweepErr: Error | null;
 	sweepUrls: string[];
+	// OTTR-1261 stale-turn pass: the ops.staleFix calls, in order
+	staleFixCalls: {
+		run: { url?: string; runId?: string; pid: number | null };
+		fix:
+			| { kind: "stale-lock"; path: string; pid: number }
+			| { kind: "hung-child"; pid: number; command: string };
+	}[];
 }
 
 /** The `gh pr ...` stub answer for one ops snapshot. */
@@ -177,6 +199,7 @@ function fakeOps(p: Partial<FakeOps> = {}): FakeOps {
 		swept: [],
 		sweepErr: null,
 		sweepUrls: [],
+		staleFixCalls: [],
 		appendLog: async (store, id, line) => {
 			// ponytail: mirrors src/turn.ts appendLog minus the hook notify; test seam only
 			mkdirSync(dirname(await store.logPath(id)), { recursive: true });
@@ -6732,4 +6755,401 @@ describe("atomic supervisor decisions", () => {
 			}
 		});
 	}
+});
+
+// ---- stale-turn pass (OTTR-1261) --------------------------------------------
+// docs/specs/stale-turn-recovery.md; the incident of record is OTTR-1191: a bash tool
+// call with timeout 0 sleeping on a lock whose pid died, holding the card for hours.
+
+const OMP_PID = 329; // the run's omp process in every stale fixture
+const GATE_LOCK = "/var/tmp/gate-1191/tmp/ott-stryker.lock";
+const IDLE_MIN = 40; // every stale fixture idles past the 30 min gates
+
+/** The worker run entry the stale ops act on for one card. */
+const staleRun = () => ({
+	pid: OMP_PID,
+	url: "http://worker-b:8787",
+	runId: "r1",
+});
+
+/** The run's process tree: omp plus a bash child parked at `child` ticks. */
+const staleProcs = (child = 0): ProcSample[] => [
+	{ pid: OMP_PID, ppid: 1, ticks: 42, command: "omp --project proj" },
+	{
+		pid: 401,
+		ppid: OMP_PID,
+		ticks: child,
+		command: "bash -c while [ ! -f /x.lock ]; do sleep 600; done",
+	},
+];
+
+/** The OTTR-1191 probe: omp alive, the session file IDLE_MIN minutes old, the last tool
+ * call asleep on GATE_LOCK; `locks` and the child's ticks vary per test. */
+function staleProbe(
+	t0: number,
+	locks: LockFact[],
+	opts: {
+		child?: number;
+		lastTool?: LastTool | null;
+		omitChild?: boolean;
+	} = {},
+): StaleProbe {
+	return {
+		pid: OMP_PID,
+		alive: true,
+		procs: opts.omitChild
+			? [{ pid: OMP_PID, ppid: 1, ticks: 42, command: "omp --project proj" }]
+			: staleProcs(opts.child ?? 0),
+		sessionAt: t0 - IDLE_MIN * 60_000,
+		lastTool:
+			opts.lastTool === undefined
+				? {
+						tool: "bash",
+						command: `while [ ! -f ${GATE_LOCK} ]; do sleep 600; done`,
+						timeout: 0,
+					}
+				: opts.lastTool,
+		locks,
+	};
+}
+
+/** The dead-pid lock fact of the incident (pid 5229 died with its Docker host). */
+const deadLock = (): LockFact[] => [
+	{ path: GATE_LOCK, exists: true, pid: 5229, alive: false },
+];
+
+/** The ask row the pass writes: staleAskQuestion's labels in the drawer's AskQuestion shape. */
+function staleAskRow() {
+	const q = staleAskQuestion();
+	return {
+		question: q.question,
+		options: q.options.map((label) => ({ label })),
+		multi: false,
+		recommended: null,
+		text: false,
+	};
+}
+
+/** The concrete stale-lock verdict the fixture diagnoses. */
+const expectedFix = {
+	kind: "stale-lock",
+	path: GATE_LOCK,
+	pid: 5229,
+} as const;
+
+/** Sets the card log's mtime IDLE_MIN minutes before `t0` (the fake ops.now()). */
+function backdateLog(logPath: string, t0: number) {
+	const back = new Date(t0 - IDLE_MIN * 60_000);
+	utimesSync(logPath, back, back);
+}
+
+/** A running card in a fresh store: backdated card log, a worktree whose basename
+ * carries the card number (the confinement token the diagnosis keys on). */
+async function staleCard(name: string, t0: number) {
+	const dir = join(root, name);
+	const wt = join(dir, "OTTR-1191");
+	mkdirSync(wt, { recursive: true });
+	const store = await ProjectStore.open(dir);
+	const t = await store.createTask("stale turn");
+	await store.updateTask(t.id, { state: "running", worktree: wt });
+	const logPath = await store.logPath(t.id);
+	mkdirSync(dirname(logPath), { recursive: true });
+	writeFileSync(logPath, "turn started\n");
+	backdateLog(logPath, t0);
+	return { store, t, wt, logPath };
+}
+
+/** fakeOps with the three stale ops installed against `probe`; staleFix records and ok's. */
+function staleOps(
+	t0: number,
+	t: Task,
+	probe: StaleProbe,
+	p: Partial<FakeOps> = {},
+): FakeOps {
+	const ops = fakeOps({
+		time: t0,
+		liveRun: (project, id) =>
+			project === "proj" && id === t.id ? staleRun() : null,
+		probeStale: async () => probe,
+		staleFix: async (run, fix) => {
+			ops.staleFixCalls.push({ run, fix });
+			return { ok: true };
+		},
+		...p,
+	});
+	return ops;
+}
+
+describe("stale-turn pass", () => {
+	test("OTTR-1191: two ticks steer, remove the stale lock, and log once", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-fix", t0);
+		const probe = staleProbe(t0, deadLock());
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // tick 1: stores the tick baseline, decides nothing
+		expect(ops.staleFixCalls).toEqual([]);
+		expect((await store.getTask(t.id))!.pendingPrompt).toBeNull();
+		await tickProj(store, ops); // tick 2: steer queued first, then the fix
+		expect(ops.staleFixCalls.length).toBe(1);
+		expect(ops.staleFixCalls[0]!.fix).toEqual(expectedFix);
+		expect(ops.staleFixCalls[0]!.run).toEqual(staleRun());
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.pendingPrompt).toBe(staleSteerText(expectedFix));
+		expect(after.pendingBy).toBe("supervisor");
+		expect(after.pendingFeedback).toBe(false);
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain(
+			`supervisor: removed stale lock ${GATE_LOCK} (pid 5229 gone), steered`,
+		);
+		await tickProj(store, ops); // tick 3: the fix's log line freshened the log — quiet
+		expect(ops.staleFixCalls.length).toBe(1);
+		const settled = (await store.getTask(t.id))!;
+		expect(settled.pendingPrompt).toBe(staleSteerText(expectedFix));
+		const log3 = await Bun.file(logPath).text();
+		expect(log3.match(/removed stale lock/g)?.length).toBe(1);
+		await store.close();
+	});
+
+	test("a lock naming a live pid files the ask and fixes nothing", async () => {
+		const t0 = Date.now();
+		const { store, t, wt, logPath } = await staleCard("stale-alive", t0);
+		const probe = staleProbe(t0, [
+			{ path: GATE_LOCK, exists: true, pid: 5229, alive: true },
+		]);
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // suspect: no rule matches, park the ask
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.asked).toEqual([staleAskRow()]);
+		expect(after.asked?.[0]?.options.length).toBe(3);
+		expect(after.needsReason?.startsWith(STALE_ASK_MARKER)).toBe(true);
+		expect(isStaleAskReason(after.needsReason!)).toBe(true);
+		const d = diagnoseStale({
+			probe,
+			worktree: wt,
+			prevTicks: tickMap(probe.procs),
+		});
+		expect(d.kind).toBe("unsure");
+		expect(after.needsReason).toBe(
+			staleAskReason(
+				staleDiagnosis(
+					IDLE_MIN,
+					probe.lastTool,
+					d.kind === "unsure" ? d.reason : "",
+				),
+			),
+		);
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain(
+			`supervisor: turn idle ${IDLE_MIN} min without progress, ask filed`,
+		);
+		await store.close();
+	});
+
+	test("a lock outside the card's dirs is unsure: ask without a fix", async () => {
+		const t0 = Date.now();
+		const { store, t, wt, logPath } = await staleCard("stale-foreign", t0);
+		const probe = staleProbe(t0, [
+			{
+				path: "/var/tmp/other-999/tmp/ott-stryker.lock",
+				exists: true,
+				pid: 9999,
+				alive: false,
+			},
+		]);
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // suspect: confinement fails, park the ask
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.needsReason?.startsWith(STALE_ASK_MARKER)).toBe(true);
+		const d = diagnoseStale({
+			probe,
+			worktree: wt,
+			prevTicks: tickMap(probe.procs),
+		});
+		expect(d.kind).toBe("unsure");
+		// the runtime reason names the confinement failure the ask carries
+		expect(after.needsReason).toContain("outside the card's own dirs");
+		expect(after.needsReason).toBe(
+			staleAskReason(
+				staleDiagnosis(
+					IDLE_MIN,
+					probe.lastTool,
+					d.kind === "unsure" ? d.reason : "",
+				),
+			),
+		);
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain("ask filed");
+		await store.close();
+	});
+
+	test("a busy child keeps the turn a non-suspect", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-busy", t0);
+		let probes = 0;
+		const ops = staleOps(t0, t, staleProbe(t0, []), {
+			probeStale: async () => {
+				probes += 1;
+				// the bash child burns 5000 ticks between the probes
+				return staleProbe(t0, [], {
+					child: probes === 1 ? 10 : 5010,
+					lastTool: { tool: "bash", command: "make check", timeout: 0 },
+				});
+			},
+		});
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // busy child: not a suspect
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.asked).toBeNull();
+		expect(after.needsReason).toBeNull();
+		const log = await Bun.file(logPath).text();
+		expect(log).toBe("turn started\n");
+		await store.close();
+	});
+
+	test("command text naming another card's lock never deletes: ask", async () => {
+		const t0 = Date.now();
+		const { store, t } = await staleCard("stale-inject", t0);
+		// OTTR-1244's lock and a path outside the card's dirs and temp roots: the host
+		// never reads either, so both arrive as unreadable facts.
+		const probe = staleProbe(
+			t0,
+			[
+				{
+					path: "/var/tmp/gate-1244/tmp/ott-stryker.lock",
+					exists: false,
+					pid: null,
+					alive: null,
+				},
+				{
+					path: "/etc/ott-stryker.lock",
+					exists: false,
+					pid: null,
+					alive: null,
+				},
+			],
+			{
+				omitChild: true,
+				lastTool: {
+					tool: "bash",
+					command:
+						"while [ ! -f /var/tmp/gate-1244/tmp/ott-stryker.lock ] || [ ! -f /etc/ott-stryker.lock ]; do sleep 600; done",
+					timeout: 0,
+				},
+			},
+		);
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // suspect: no allowed lock with a dead pid
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("needs_you");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.needsReason?.startsWith(STALE_ASK_MARKER)).toBe(true);
+		// no deletion ever enters the diagnosis: no steer facts, no removal wording
+		expect(after.needsReason).not.toContain("removing the lock file");
+		expect(after.asked).toEqual([staleAskRow()]);
+		await store.close();
+	});
+
+	test("the first probe stores a baseline and decides nothing", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-first", t0);
+		const ops = staleOps(t0, t, staleProbe(t0, deadLock()));
+		await tickProj(store, ops);
+		expect(ops.staleFixCalls).toEqual([]);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.pendingPrompt).toBeNull();
+		expect(after.asked).toBeNull();
+		expect(await Bun.file(logPath).text()).toBe("turn started\n");
+		await store.close();
+	});
+
+	test("without the stale ops the pass is a no-op", async () => {
+		const t0 = Date.now();
+		const { store, t } = await staleCard("stale-noops", t0);
+		await tickProj(store, fakeOps()); // none of the three ops
+		expect((await store.getTask(t.id))!.state).toBe("running");
+		await tickProj(store, fakeOps({ time: t0, liveRun: () => staleRun() })); // probeStale missing
+		expect((await store.getTask(t.id))!.state).toBe("running");
+		await store.close();
+	});
+
+	test("a second ask inside the re-ask cooldown leaves the card alone", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-cooldown", t0);
+		const probe = staleProbe(t0, [
+			{ path: GATE_LOCK, exists: true, pid: 5229, alive: true },
+		]);
+		const ops = staleOps(t0, t, probe);
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // ask filed
+		// the reply responder's "Wait" answer: back to running, ask cleared
+		await store.updateTask(t.id, { state: "running" });
+		backdateLog(logPath, t0); // the ask's log line ages past the gate again
+		const before = (await store.getTask(t.id))!;
+		await tickProj(store, ops); // cooldown: quiet
+		const after = (await store.getTask(t.id))!;
+		expect(after.revision).toBe(before.revision);
+		expect(after.state).toBe("running");
+		expect(ops.staleFixCalls).toEqual([]);
+		const log = await Bun.file(logPath).text();
+		expect(log.match(/ask filed/g)?.length).toBe(1);
+		await store.close();
+	});
+
+	test("a pre-queued supervisor steer fixes once without a second steer", async () => {
+		const t0 = Date.now();
+		const { store, t, logPath } = await staleCard("stale-fixpending", t0);
+		const steer = staleSteerText(expectedFix);
+		await store.updateTask(t.id, {
+			pendingPrompt: steer, // this pass queued it on an earlier tick
+			pendingBy: "supervisor",
+		});
+		const ops = staleOps(t0, t, staleProbe(t0, deadLock()));
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // fix-pending: fix, no second steer
+		expect(ops.staleFixCalls.length).toBe(1);
+		const after = (await store.getTask(t.id))!;
+		expect(after.state).toBe("running");
+		expect(after.pendingPrompt).toBe(steer);
+		expect(after.pendingBy).toBe("supervisor");
+		const log = await Bun.file(logPath).text();
+		expect(log).toContain(
+			`supervisor: removed stale lock ${GATE_LOCK} (pid 5229 gone), steered`,
+		);
+		await store.close();
+	});
+
+	test("a generic supervisor approval gets the specific steer appended", async () => {
+		const t0 = Date.now();
+		const { store, t } = await staleCard("stale-approval", t0);
+		const approval = "Supervisor: the card owner approved the stale-turn fix.";
+		await store.updateTask(t.id, {
+			pendingPrompt: approval, // the reply responder's generic approval line
+			pendingBy: "supervisor",
+		});
+		const ops = staleOps(t0, t, staleProbe(t0, deadLock()));
+		await tickProj(store, ops); // baseline
+		await tickProj(store, ops); // fix runs, the specific facts ride along
+		expect(ops.staleFixCalls.length).toBe(1);
+		const after = (await store.getTask(t.id))!;
+		expect(after.pendingPrompt).toBe(
+			`${approval}\n\n${staleSteerText(expectedFix)}`,
+		);
+		expect(after.pendingBy).toBe("supervisor");
+		await store.close();
+	});
 });

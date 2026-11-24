@@ -24,8 +24,10 @@ import {
 	detachedRuns,
 	killDetached,
 	matchSweepTarget,
+	probeRun,
 	runWorker,
 	serveWorker,
+	staleFix,
 	sweepWorker,
 	WORKER_DONE,
 	WorkerConnectError,
@@ -2868,10 +2870,12 @@ setTimeout(() => process.exit(0), 60000);`,
 			expect(raw.layers.map((e) => Object.keys(e).sort())).toEqual([
 				["id", "since"],
 			]);
-			// The /detached wire shape stays unchanged: the lease never rides it.
+			// The /detached wire shape: the lease never rides it. OTTR-1261 added
+			// one field, the run's data dir the /runprobe session check reads.
 			const [entry] = await detachedList(url);
 			expect(Object.keys(entry ?? {}).sort()).toEqual([
 				"cwd",
+				"dataDir",
 				"id",
 				"pid",
 				"running",
@@ -3000,6 +3004,8 @@ describe("serveWorker turn identity", () => {
 		url: string,
 		body: Record<string, unknown>,
 	): Promise<Response> =>
+		// The stream stays open un-drained; the pid file proves the spawn, and the
+		// detach cleanup closes it. The callers await the response.
 		fetch(`${url}/run`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -3294,4 +3300,668 @@ describe("serveWorker turn identity", () => {
 		},
 		30_000,
 	);
+});
+
+describe("stale turn probe and fix (OTTR-1261)", () => {
+	// Safety contract for this block: kill assertions run against a fake proc tree
+	// through the staleKill seam (a recording kill), so no test can ever signal a
+	// process it did not create; the only real signals land via the daemon's own
+	// /detach/kill cleanup path on children these tests started. pidAlive reads are
+	// signal-0 probes on dead pids or on the run child itself.
+	//
+	// A dead pid for lock fixtures: a real child the test spawned to completion.
+	function spawnDeadPid(): number {
+		const p = Bun.spawnSync([process.execPath, "-e", ""]);
+		return p.pid;
+	}
+
+	// Fake proc entry with tick fields: the stat layout readTree parses — fields after
+	// the last ")" are state, ppid, then nine counters, then utime stime cutime cstime.
+	function staleProcFixture(
+		procRoot: string,
+		e: {
+			pid: number;
+			ppid: number;
+			ticks?: [number, number, number, number];
+			cmd?: string[];
+		},
+	): void {
+		const p = join(procRoot, String(e.pid));
+		mkdirSync(p, { recursive: true });
+		const [ut, st, cut, cst] = e.ticks ?? [0, 0, 0, 0];
+		writeFileSync(
+			join(p, "stat"),
+			`${e.pid} (bun) S ${e.ppid} 0 0 0 0 0 0 0 0 0 ${ut} ${st} ${cut} ${cst}\n`,
+		);
+		if (e.cmd !== undefined)
+			writeFileSync(
+				join(p, "cmdline"),
+				e.cmd.map((seg) => `${seg}\0`).join(""),
+			);
+	}
+
+	function freshProcRoot(): string {
+		return join(dir, `stale-proc-${procRootN++}`);
+	}
+	let procRootN = 0;
+
+	// Starts the daemon's run with the sleeper fake omp and waits for the child's pid
+	// file: the stream stays open (the pid file proves the spawn, like the detach
+	// tests). No beat file: under load a spawned child's wall-clock beats lag by
+	// seconds, so cleanup below proves the kill by the pid's death instead.
+	async function startStaleRun(
+		url: string,
+		token: string,
+		id: string,
+		cwd: string,
+		env: Record<string, string>,
+	): Promise<{ pid: number; pidFile: string }> {
+		const pidFile = join(dir, `stale-${id}.pid`);
+		// The stream stays open un-drained; the pid file proves the spawn, and the
+		// detach cleanup closes it. void: intentionally floating (biome).
+		void fetch(`${url}/run`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-otwr-token": token,
+			},
+			body: JSON.stringify({
+				id,
+				argv: [sweepSleepPath, pidFile],
+				cwd,
+				stdin: "",
+				env,
+			}),
+		});
+		const deadline = Date.now() + 20_000;
+		for (;;) {
+			try {
+				const pid = Number(readFileSync(pidFile, "utf8"));
+				if (Number.isInteger(pid) && pid > 0) return { pid, pidFile };
+			} catch {
+				// not written yet
+			}
+			if (Date.now() > deadline)
+				throw new Error(`run ${id}: child never wrote its pid`);
+			await Bun.sleep(50);
+		}
+	}
+
+	// The approved cleanup: the daemon's own detach + detach/kill path stops the child
+	// the test created; the child's pid disappearing proves the kill landed (the
+	// daemon TERMs first and SIGKILLs after its grace, so the poll cannot hang).
+	async function stopStaleRun(
+		url: string,
+		token: string,
+		id: string,
+		pidFile: string,
+	): Promise<void> {
+		await fetch(`${url}/detach`, {
+			method: "POST",
+			headers: { "x-otwr-token": token },
+		});
+		await fetch(`${url}/detach/kill`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-otwr-token": token,
+			},
+			body: JSON.stringify({ id }),
+		});
+		const pid = Number(readFileSync(pidFile, "utf8"));
+		const deadline = Date.now() + 20_000;
+		for (;;) {
+			let alive = true;
+			try {
+				process.kill(pid, 0);
+			} catch {
+				alive = false;
+			}
+			if (!alive) return;
+			if (Date.now() > deadline)
+				throw new Error(`stale run cleanup: pid ${pid} survived the kill`);
+			await Bun.sleep(20);
+		}
+	}
+
+	const postJson = (
+		url: string,
+		path: string,
+		token: string,
+		body: unknown,
+	): Promise<Response> =>
+		fetch(`${url}${path}`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				"x-otwr-token": token,
+			},
+			body: JSON.stringify(body),
+		});
+
+	test("runprobe and stalefix need the token", async () => {
+		const url = start({ token: "sekrit", ompPath: process.execPath });
+		for (const path of ["/runprobe", "/stalefix"]) {
+			const res = await postJson(url, path, "wrong", { run: "x" });
+			expect(res.status).toBe(401);
+			expect(await res.text()).toBe("unauthorized");
+		}
+	});
+
+	test("malformed probe and fix bodies answer 400", async () => {
+		const url = start({ token: "t", ompPath: process.execPath });
+		const bad = await postJson(url, "/runprobe", "t", { run: 42 });
+		expect(bad.status).toBe(400);
+		expect(await bad.text()).toBe("bad request");
+		expect((await postJson(url, "/runprobe", "t", {})).status).toBe(400);
+		expect((await postJson(url, "/runprobe", "t", { run: "" })).status).toBe(
+			400,
+		);
+		const raw = await fetch(`${url}/runprobe`, {
+			method: "POST",
+			headers: { "content-type": "application/json", "x-otwr-token": "t" },
+			body: "not json",
+		});
+		expect(raw.status).toBe(400);
+		expect(await raw.text()).toBe("bad json");
+		// Fix shapes: run string, then unlock needs a path, kill needs a positive
+		// integer pid — every miss 400s before any run lookup.
+		expect((await postJson(url, "/stalefix", "t", {})).status).toBe(400);
+		expect((await postJson(url, "/stalefix", "t", { run: "x" })).status).toBe(
+			400,
+		);
+		expect(
+			(await postJson(url, "/stalefix", "t", { run: "x", action: "unlock" }))
+				.status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: "5",
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 1.5,
+				})
+			).status,
+		).toBe(400);
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "x",
+					action: "kill",
+					pid: 0,
+				})
+			).status,
+		).toBe(400);
+	});
+
+	test("unknown run id errors on both endpoints and clients", async () => {
+		const url = start({ token: "t", ompPath: process.execPath });
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		const miss = await postJson(url, "/runprobe", "t", { run: "ghost" });
+		expect(miss.status).toBe(404);
+		expect(await miss.text()).toBe("not found");
+		expect(
+			(
+				await postJson(url, "/stalefix", "t", {
+					run: "ghost",
+					action: "kill",
+					pid: 5000,
+				})
+			).status,
+		).toBe(404);
+		await expect(probeRun(target, url, "ghost")).rejects.toBeInstanceOf(
+			WorkerConnectError,
+		);
+		await expect(
+			staleFix(target, url, { run: "ghost", action: "kill", pid: 5000 }),
+		).rejects.toBeInstanceOf(WorkerConnectError);
+	});
+
+	test("probeRun and staleFix POST the exact method and path", async () => {
+		const seen: {
+			method: string;
+			path: string;
+			token: string | null;
+			body: unknown;
+		}[] = [];
+		let answer: () => Response = () => Response.json({});
+		const cap = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const u = new URL(req.url);
+				let body: unknown = null;
+				try {
+					body = JSON.parse(await req.text());
+				} catch {
+					body = null;
+				}
+				seen.push({
+					method: req.method,
+					path: u.pathname,
+					token: req.headers.get("x-otwr-token"),
+					body,
+				});
+				return answer();
+			},
+		});
+		servers.push(cap as Bun.Server<never>);
+		const capUrl = `http://127.0.0.1:${cap.port}`;
+		const target: WorkerTarget = { urls: [capUrl], token: "t" };
+		// The documented wire shapes: POST { run } on /runprobe, the fix request
+		// verbatim on /stalefix.
+		const probeBody = {
+			pid: 77,
+			alive: false,
+			procs: [{ pid: 77, ppid: 1, ticks: 3, command: "bun run dev" }],
+			sessionAt: 1000,
+			lastTool: { tool: "bash", command: "sleep 600", timeout: 0 },
+			locks: [
+				{ path: "/tmp/gate-7/x.lock", exists: true, pid: 5, alive: false },
+			],
+		};
+		answer = () => Response.json(probeBody);
+		expect(await probeRun(target, capUrl, "r-7")).toEqual(probeBody);
+		expect(seen.at(-1)).toEqual({
+			method: "POST",
+			path: "/runprobe",
+			token: "t",
+			body: { run: "r-7" },
+		});
+		answer = () => Response.json({ ok: true });
+		expect(
+			await staleFix(target, capUrl, {
+				run: "r-7",
+				action: "kill",
+				pid: 5102,
+			}),
+		).toEqual({ ok: true });
+		expect(seen.at(-1)).toEqual({
+			method: "POST",
+			path: "/stalefix",
+			token: "t",
+			body: { run: "r-7", action: "kill", pid: 5102 },
+		});
+		answer = () =>
+			Response.json({ ok: false, reason: "lock pid 5 still alive" });
+		expect(
+			await staleFix(target, capUrl, {
+				run: "r-7",
+				action: "unlock",
+				path: "/tmp/gate-7/x.lock",
+			}),
+		).toEqual({ ok: false, reason: "lock pid 5 still alive" });
+		expect(seen.at(-1)?.body).toEqual({
+			run: "r-7",
+			action: "unlock",
+			path: "/tmp/gate-7/x.lock",
+		});
+		// A 200 body off the shape is null, not an error: the caller reads it as
+		// "no usable answer".
+		answer = () => Response.json({ pid: 7 });
+		expect(await probeRun(target, capUrl, "r-7")).toBeNull();
+		answer = () => Response.json({ ok: "yes" });
+		expect(
+			await staleFix(target, capUrl, { run: "r", action: "kill", pid: 1 }),
+		).toBeNull();
+		// Non-200 stays a WorkerConnectError.
+		answer = () => new Response("boom", { status: 500 });
+		await expect(probeRun(target, capUrl, "r-7")).rejects.toBeInstanceOf(
+			WorkerConnectError,
+		);
+		await expect(
+			staleFix(target, capUrl, { run: "r", action: "kill", pid: 1 }),
+		).rejects.toBeInstanceOf(WorkerConnectError);
+		// No token on the target: the header stays off the request.
+		answer = () => Response.json({ ok: true });
+		await staleFix({ urls: [capUrl] }, capUrl, {
+			run: "r",
+			action: "kill",
+			pid: 2,
+		});
+		expect(seen.at(-1)?.token).toBeNull();
+	});
+
+	test("/runprobe reports a real child's tree, session, and locks", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-stale-probe-"));
+		const wt = join(root, "proj", ".worktrees", "OTTR-1191");
+		mkdirSync(wt, { recursive: true });
+		const dataDir = join(root, "data");
+		const sessions = join(dataDir, "sessions");
+		mkdirSync(sessions, { recursive: true });
+		const deadPid = spawnDeadPid();
+		const lockPath = join(wt, "ott-stryker.lock");
+		writeFileSync(lockPath, JSON.stringify({ pid: deadPid }));
+		// A previous turn's session: older than the run start, so the probe must
+		// never pick it (its tool call names nothing this run locked).
+		const oldSession = join(sessions, "1000_old.jsonl");
+		writeFileSync(
+			oldSession,
+			`${JSON.stringify({
+				type: "tool_execution_start",
+				toolCallId: "old",
+				toolName: "bash",
+				args: { command: "echo from-the-old-session", timeout: 30 },
+			})}\n`,
+		);
+		const past = new Date(Date.now() - 60_000);
+		utimesSync(oldSession, past, past);
+		// This run's session: the OTTR-1191 shape — a bash tool call looping on a
+		// lock file with timeout 0 (unbounded).
+		const sessionPath = join(sessions, "1700000000000_probe.jsonl");
+		const command = `while [ -f ${lockPath} ]; do sleep 600; done`;
+		writeFileSync(
+			sessionPath,
+			`${JSON.stringify({
+				type: "tool_execution_start",
+				toolCallId: "call_1",
+				toolName: "bash",
+				args: { command, timeout: 0 },
+			})}\n`,
+		);
+		const url = start({ token: "t", ompPath: process.execPath });
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		try {
+			const { pid, pidFile } = await startStaleRun(url, "t", "probe1", wt, {
+				OTTR_DATA_DIR: dataDir,
+			});
+			// Force the mtime order past the run's startedAt stamp instead of
+			// trusting Date.now() to have advanced (AGENTS.md).
+			const fresh = new Date(Date.now() + 2000);
+			utimesSync(sessionPath, fresh, fresh);
+			const probe = await probeRun(target, url, "probe1");
+			expect(probe).not.toBeNull();
+			expect(probe?.pid).toBe(pid);
+			expect(probe?.alive).toBe(true);
+			// The real /proc tree: exactly the child, whose parent is the daemon
+			// itself (this test process).
+			expect(probe?.procs.length).toBe(1);
+			expect(probe?.procs[0]?.pid).toBe(pid);
+			expect(probe?.procs[0]?.ppid).toBe(process.pid);
+			expect(probe?.procs[0]?.ticks).toBeGreaterThanOrEqual(0);
+			expect(probe?.procs[0]?.command).toContain("sweep-sleep-omp.js");
+			expect(Math.abs((probe?.sessionAt ?? 0) - fresh.getTime())).toBeLessThan(
+				5,
+			);
+			expect(probe?.lastTool).toEqual({
+				tool: "bash",
+				command,
+				timeout: 0,
+			});
+			expect(probe?.locks).toEqual([
+				{ path: lockPath, exists: true, pid: deadPid, alive: false },
+			]);
+			// After a detach the entry moves to the detached map, keeps dataDir on
+			// the wire, and the probe still answers from it.
+			expect(
+				await (
+					await fetch(`${url}/detach`, {
+						method: "POST",
+						headers: { "x-otwr-token": "t" },
+					})
+				).json(),
+			).toEqual({ detached: 1 });
+			const listed = (await (
+				await fetch(`${url}/detached`, {
+					headers: { "x-otwr-token": "t" },
+				})
+			).json()) as { dataDir?: string | null; running: boolean }[];
+			expect(listed[0]?.dataDir).toBe(dataDir);
+			expect(listed[0]?.running).toBe(true);
+			const again = await probeRun(target, url, "probe1");
+			expect(again?.pid).toBe(pid);
+			expect(again?.alive).toBe(true);
+			expect(again?.sessionAt).not.toBeNull();
+			await stopStaleRun(url, "t", "probe1", pidFile);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("/runprobe walks the seam proc tree with exact ticks", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-stale-seam-"));
+		const wt = join(root, "proj", ".worktrees", "OTTR-1261");
+		mkdirSync(wt, { recursive: true });
+		const procRoot = freshProcRoot();
+		// Grandchild and an out-of-tree neighbor exist before the run spawns; the
+		// run pid and its child join the fake tree once the pid is known.
+		staleProcFixture(procRoot, {
+			pid: 5002,
+			ppid: 5001,
+			ticks: [12, 0, 0, 0],
+		});
+		staleProcFixture(procRoot, { pid: 5099, ppid: 1, ticks: [1, 1, 1, 1] });
+		const url = start({
+			token: "t",
+			ompPath: process.execPath,
+			staleProcRoot: procRoot,
+		});
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		try {
+			const { pid, pidFile } = await startStaleRun(url, "t", "seam1", wt, {});
+			staleProcFixture(procRoot, {
+				pid,
+				ppid: 1,
+				ticks: [7, 0, 0, 0],
+				cmd: ["bun", "run", "dev"],
+			});
+			staleProcFixture(procRoot, {
+				pid: 5001,
+				ppid: pid,
+				ticks: [10, 10, 5, 5],
+				cmd: ["bash", "-c", "sleep 600"],
+			});
+			const probe = await probeRun(target, url, "seam1");
+			expect(probe?.pid).toBe(pid);
+			expect(probe?.alive).toBe(true);
+			expect(probe?.procs).toEqual([
+				{ pid, ppid: 1, ticks: 7, command: "bun run dev" },
+				{ pid: 5001, ppid: pid, ticks: 30, command: "bash -c sleep 600" },
+				{ pid: 5002, ppid: 5001, ticks: 12, command: "" },
+			]);
+			// No OTTR_DATA_DIR: no session facts, and no lock candidates.
+			expect(probe?.sessionAt).toBeNull();
+			expect(probe?.lastTool).toBeNull();
+			expect(probe?.locks).toEqual([]);
+			await stopStaleRun(url, "t", "seam1", pidFile);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("/stalefix unlock removes only a dead-pid card-dir lock", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-stale-fix-"));
+		const wt = join(root, "proj", ".worktrees", "OTTR-1261");
+		mkdirSync(wt, { recursive: true });
+		const deadPid = spawnDeadPid();
+		const lockPath = join(wt, "ott-stryker.lock");
+		writeFileSync(lockPath, JSON.stringify({ pid: deadPid }));
+		const liveLock = join(wt, "live.lock");
+		writeFileSync(liveLock, JSON.stringify({ pid: process.pid }));
+		const outsideLock = join(root, "other.lock");
+		writeFileSync(outsideLock, JSON.stringify({ pid: deadPid }));
+		const scratchDir = join(root, "gate-1261", "tmp");
+		mkdirSync(scratchDir, { recursive: true });
+		const scratchLock = join(scratchDir, "ott-stryker.lock");
+		writeFileSync(scratchLock, JSON.stringify({ pid: deadPid }));
+		const victimDir = join(root, "outside");
+		mkdirSync(victimDir, { recursive: true });
+		const victim = join(victimDir, "victim.lock");
+		writeFileSync(victim, JSON.stringify({ pid: deadPid }));
+		const link = join(wt, "link.lock");
+		symlinkSync(victim, link);
+		const dirLock = join(wt, "dir.lock");
+		mkdirSync(dirLock);
+		const garbageLock = join(wt, "garbage.lock");
+		writeFileSync(garbageLock, "scree");
+		const initLock = join(wt, "init.lock");
+		writeFileSync(initLock, JSON.stringify({ pid: 1 }));
+		const url = start({ token: "t", ompPath: process.execPath });
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		try {
+			const { pidFile } = await startStaleRun(url, "t", "fix1", wt, {});
+			// Success: the worktree lock names a dead pid.
+			expect(
+				await staleFix(target, url, {
+					run: "fix1",
+					action: "unlock",
+					path: lockPath,
+				}),
+			).toEqual({ ok: true });
+			expect(existsSync(lockPath)).toBe(false);
+			// The OTTR-1191 scratch shape: under a temp root, one segment carries
+			// the card number, pid dead.
+			expect(
+				await staleFix(target, url, {
+					run: "fix1",
+					action: "unlock",
+					path: scratchLock,
+				}),
+			).toEqual({ ok: true });
+			expect(existsSync(scratchLock)).toBe(false);
+			// A live pid in the lock refuses and changes nothing.
+			const live = await staleFix(target, url, {
+				run: "fix1",
+				action: "unlock",
+				path: liveLock,
+			});
+			expect(live?.ok).toBe(false);
+			expect(live?.reason).toContain("still alive");
+			expect(readFileSync(liveLock, "utf8")).toBe(
+				JSON.stringify({ pid: process.pid }),
+			);
+			// Outside the worktree and outside the card-number scratch rule.
+			const outside = await staleFix(target, url, {
+				run: "fix1",
+				action: "unlock",
+				path: outsideLock,
+			});
+			expect(outside?.ok).toBe(false);
+			expect(outside?.reason).toContain("outside the card's own dirs");
+			expect(existsSync(outsideLock)).toBe(true);
+			// A symlinked lock resolves outside: refused, link and target intact.
+			const escaped = await staleFix(target, url, {
+				run: "fix1",
+				action: "unlock",
+				path: link,
+			});
+			expect(escaped?.ok).toBe(false);
+			expect(escaped?.reason).toContain("outside the card's own dirs");
+			expect(existsSync(link)).toBe(true);
+			expect(readFileSync(victim, "utf8")).toBe(
+				JSON.stringify({ pid: deadPid }),
+			);
+			// Not a regular file, not a pid, pid 1, and a path that does not
+			// resolve: every precondition refuses by name.
+			const notFile = (await (
+				await postJson(url, "/stalefix", "t", {
+					run: "fix1",
+					action: "unlock",
+					path: dirLock,
+				})
+			).json()) as { ok: boolean; reason: string };
+			expect(notFile.ok).toBe(false);
+			expect(notFile.reason).toContain("not a regular file");
+			const garbage = (await (
+				await postJson(url, "/stalefix", "t", {
+					run: "fix1",
+					action: "unlock",
+					path: garbageLock,
+				})
+			).json()) as { ok: boolean; reason: string };
+			expect(garbage.ok).toBe(false);
+			expect(garbage.reason).toContain("does not name a pid");
+			const init = (await (
+				await postJson(url, "/stalefix", "t", {
+					run: "fix1",
+					action: "unlock",
+					path: initLock,
+				})
+			).json()) as { ok: boolean; reason: string };
+			expect(init.ok).toBe(false);
+			expect(init.reason).toContain("does not name a pid");
+			const missing = (await (
+				await postJson(url, "/stalefix", "t", {
+					run: "fix1",
+					action: "unlock",
+					path: join(wt, "absent.lock"),
+				})
+			).json()) as { ok: boolean; reason: string };
+			expect(missing.ok).toBe(false);
+			expect(missing.reason).toContain("does not resolve");
+			await stopStaleRun(url, "t", "fix1", pidFile);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
+
+	test("/stalefix kill TERMs one strict descendant via the seam", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ottr-stale-kill-"));
+		const wt = join(root, "proj", ".worktrees", "OTTR-1261");
+		mkdirSync(wt, { recursive: true });
+		const procRoot = freshProcRoot();
+		staleProcFixture(procRoot, {
+			pid: 5102,
+			ppid: 5101,
+			cmd: ["sleep", "600"],
+		});
+		// A sibling of the run: its parent chain never reaches the run pid.
+		staleProcFixture(procRoot, { pid: 5099, ppid: 1 });
+		const { calls, kill } = recordingKill();
+		const url = start({
+			token: "t",
+			ompPath: process.execPath,
+			staleProcRoot: procRoot,
+			staleKill: kill,
+		});
+		const target: WorkerTarget = { urls: [url], token: "t" };
+		try {
+			const { pid, pidFile } = await startStaleRun(url, "t", "kill1", wt, {});
+			staleProcFixture(procRoot, { pid, ppid: 1, cmd: ["omp"] });
+			staleProcFixture(procRoot, {
+				pid: 5101,
+				ppid: pid,
+				cmd: ["bash", "-c", "sleep 600"],
+			});
+			// Success: the grandchild is a strict descendant, TERM only.
+			expect(
+				await staleFix(target, url, {
+					run: "kill1",
+					action: "kill",
+					pid: 5102,
+				}),
+			).toEqual({ ok: true });
+			expect(calls).toEqual([{ pid: 5102, signal: "SIGTERM" }]);
+			// Refusals, each leaving the kill log untouched: a sibling, an unknown
+			// pid, the run's own pid, the daemon's own pid, and pid 1.
+			const refusals: [number, string][] = [
+				[5099, "not a descendant"],
+				[999999, "not a descendant"],
+				[pid, "the run's own pid"],
+				[process.pid, "the daemon's own pid"],
+				[1, "pid 1 is never a fix target"],
+			];
+			for (const [badPid, reason] of refusals) {
+				const res = await staleFix(target, url, {
+					run: "kill1",
+					action: "kill",
+					pid: badPid,
+				});
+				expect(res?.ok).toBe(false);
+				expect(res?.reason).toContain(reason);
+				expect(calls).toEqual([{ pid: 5102, signal: "SIGTERM" }]);
+			}
+			await stopStaleRun(url, "t", "kill1", pidFile);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 });

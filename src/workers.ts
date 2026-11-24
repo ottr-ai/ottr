@@ -1,19 +1,26 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import {
 	chownSync,
+	closeSync,
 	existsSync,
+	fstatSync,
 	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
 	readlinkSync,
+	readSync,
 	realpathSync,
 	rmSync,
+	type Stats,
 	statSync,
+	unlinkSync,
 } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { ensurePackages as ensureAptPackages, parseAptTxt } from "./apt.ts";
 import { prepareTurnCache } from "./cachesweep.ts";
+import { pidAlive } from "./dblock.ts";
 import { acquireLayerUse } from "./layers.ts";
 import { type SignIn, signIns } from "./login.ts";
 import { platform } from "./platform/index.ts";
@@ -25,6 +32,20 @@ import {
 	type RequirementLine,
 } from "./python.ts";
 import type { RunSink } from "./runner.ts";
+import {
+	cardNumOf,
+	extractLockPaths,
+	type LastTool,
+	type LockFact,
+	lastToolCall,
+	lockFacts,
+	lockPathAllowed,
+	newestSessionAt,
+	newestSessionFile,
+	parseLockPid,
+	readTree,
+	type StaleProbe,
+} from "./staleTurn.ts";
 import { watchProgress } from "./stryker.ts";
 import { readCgroup } from "./systemStats.ts";
 import { tmpDiskSpace } from "./tmpsweep.ts";
@@ -171,6 +192,11 @@ export interface DetachedRun {
 	pid: number | null;
 	running: boolean;
 	startedAt: number;
+	/** The run's OTTR_DATA_DIR from the request env, when the board set one; null when it
+	 * did not. Kept on the entry (attached and detached, so /detached serializes it too)
+	 * because /runprobe reads the session transcripts under it after the stream drops
+	 * (OTTR-1261). */
+	dataDir?: string | null;
 	result?: {
 		exitCode: number | null;
 		stderrTail: string;
@@ -249,6 +275,15 @@ export function serveWorker(opts: {
 	lockPath?: string;
 	/** Only for tests: the /proc tree GET /stats reads the runs' usage from instead of the real one. */
 	statsProcRoot?: string;
+	/** Only for tests: the /proc tree /runprobe walks for a run's process tree and
+	 * /stalefix re-checks the descendant chain in, instead of the real one (OTTR-1261). */
+	staleProcRoot?: string;
+	/** Only for tests: the sessions dir /runprobe picks the newest transcript from,
+	 * instead of `<dataDir>/sessions` (OTTR-1261). */
+	staleSessionsDir?: string;
+	/** Only for tests: the signal call /stalefix kill uses instead of process.kill, so
+	 * a test can never signal a process it did not create (OTTR-1261). */
+	staleKill?: typeof process.kill;
 }): Bun.Server<never> & { runStarts(): number[] } {
 	// Pids of the live /run children. The sweep must never stop a turn that still runs:
 	// a merge turn removes its own worktree mid-run (AGENTS.md step 5), so omp's cwd link
@@ -393,6 +428,90 @@ export function serveWorker(opts: {
 		if (request.method === "POST" && url.pathname === "/detach/kill")
 			return handleDetachKill(request);
 		return new Response("not found", { status: 404 });
+	};
+	// OTTR-1261 (stale turn recovery): the probe below is read-only, and the fixes
+	// answer from a fixed allowlist whose preconditions are re-checked immediately
+	// before each act — a refused fix changes nothing and carries the reason back.
+	// Both endpoints act only on the daemon's own run entries.
+	const runEntry = (id: string): ActiveRun | undefined => {
+		pruneDetached();
+		return active.get(id) ?? detached.get(id);
+	};
+	// The detach-kill answer style: an expired entry answers 410 with the expiry,
+	// every other unknown id 404. An entry without a pid never spawned a child, so
+	// there is nothing to probe or fix either.
+	const unknownRun = (id: string): Response => {
+		if (reaped.has(id))
+			return new Response(`detached run ${id} expired and was reaped`, {
+				status: 410,
+			});
+		return new Response("not found", { status: 404 });
+	};
+	const handleRunProbe = async (request: Request): Promise<Response> => {
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		let body: unknown;
+		try {
+			body = await request.json();
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		if (typeof body !== "object" || body === null)
+			return new Response("bad request", { status: 400 });
+		const { run } = body as { run?: unknown };
+		if (typeof run !== "string" || run === "")
+			return new Response("bad request", { status: 400 });
+		const e = runEntry(run);
+		if (e === undefined || e.pid === null) return unknownRun(run);
+		const sessionsDir =
+			opts.staleSessionsDir ?? (e.dataDir ? join(e.dataDir, "sessions") : null);
+		return Response.json(
+			staleProbeOf(e, opts.staleProcRoot ?? "/proc", sessionsDir),
+		);
+	};
+	const handleStaleFix = async (request: Request): Promise<Response> => {
+		if (!tokenOk(request)) return new Response("unauthorized", { status: 401 });
+		let body: unknown;
+		try {
+			body = await request.json();
+		} catch {
+			return new Response("bad json", { status: 400 });
+		}
+		if (typeof body !== "object" || body === null)
+			return new Response("bad request", { status: 400 });
+		const { run, action, path, pid } = body as {
+			run?: unknown;
+			action?: unknown;
+			path?: unknown;
+			pid?: unknown;
+		};
+		// The whole request shape validates before any entry lookup: a non-conforming
+		// body is 400 even for a run id this daemon does not know.
+		if (typeof run !== "string" || run === "")
+			return new Response("bad request", { status: 400 });
+		if (action === "unlock") {
+			if (typeof path !== "string" || path === "")
+				return new Response("bad request", { status: 400 });
+			const e = runEntry(run);
+			if (e === undefined || e.pid === null) return unknownRun(run);
+			return Response.json(staleUnlock(e, path));
+		}
+		if (
+			action !== "kill" ||
+			typeof pid !== "number" ||
+			!Number.isInteger(pid) ||
+			pid <= 0
+		)
+			return new Response("bad request", { status: 400 });
+		const e = runEntry(run);
+		if (e === undefined || e.pid === null) return unknownRun(run);
+		return Response.json(
+			staleKillChild(
+				e,
+				pid,
+				opts.staleProcRoot ?? "/proc",
+				opts.staleKill ?? process.kill,
+			),
+		);
 	};
 	// The daemon provisions into the run's turn home (the test's when opts.home is set,
 	// the per-project turn home when turn identity is on). The request lists are texts,
@@ -627,6 +746,7 @@ export function serveWorker(opts: {
 			pid: child.pid ?? null,
 			running: true,
 			startedAt,
+			dataDir: body.env?.OTTR_DATA_DIR ?? null,
 			detached: false,
 			closeStream: (): void => {},
 		};
@@ -689,6 +809,10 @@ export function serveWorker(opts: {
 			return handleStats(request);
 		if (request.method === "POST" && url.pathname === "/sweep")
 			return handleSweep(request);
+		if (request.method === "POST" && url.pathname === "/runprobe")
+			return handleRunProbe(request);
+		if (request.method === "POST" && url.pathname === "/stalefix")
+			return handleStaleFix(request);
 		if (
 			url.pathname === "/detach" ||
 			url.pathname === "/detached" ||
@@ -1640,6 +1764,226 @@ async function sweepLeftovers(opts?: {
 	return stopTargets(targets, kill, graceMs);
 }
 
+// --- Stale turn recovery (OTTR-1261): the /runprobe facts and the /stalefix
+// allowlist. Session and command text are untrusted: they select which facts to
+// read, never what to execute, and every fix re-derives its preconditions from
+// real paths and a fresh /proc walk immediately before it acts.
+
+/** Cap of a process's argv on the wire, and of the session text a fix compares. */
+const SESSION_TAIL_BYTES = 64 * 1024;
+
+/** The temp roots a lock may live in when the card-number segment rule passes. */
+const STALE_TEMP_ROOTS = ["/tmp", "/var/tmp"];
+
+/** True when `ancestor` sits in `pid`'s parent chain in one ppid snapshot. The run pid
+ * itself is never its own descendant (OTTR-1261: the omp process is no fix target). */
+function isStrictDescendant(
+	ppid: Map<number, number>,
+	pid: number,
+	ancestor: number,
+): boolean {
+	let cur = pid;
+	const seen = new Set<number>();
+	while (!seen.has(cur)) {
+		seen.add(cur);
+		const parent = ppid.get(cur);
+		if (parent === undefined) return false;
+		if (parent === ancestor) return true;
+		cur = parent;
+	}
+	return false;
+}
+
+/** Reads at most `len` bytes at absolute offset `from` of an open file and decodes them
+ * tolerantly (a byte cut mid code point never throws). */
+function decodeAt(fd: number, from: number, len: number): string {
+	const buf = Buffer.alloc(len);
+	let read = 0;
+	while (read < len) {
+		const n = readSync(fd, buf, read, len - read, from + read);
+		if (n <= 0) break;
+		read += n;
+	}
+	return new TextDecoder("utf8", { fatal: false }).decode(
+		buf.subarray(0, read),
+	);
+}
+
+/** The first at most `bytes` bytes of a file, or null when it cannot be read. */
+function readHeadText(path: string, bytes: number): string | null {
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const size = fstatSync(fd).size;
+		return decodeAt(fd, 0, Math.min(bytes, size));
+	} catch {
+		return null;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** The last at most `bytes` bytes of a file, or null when it cannot be read. A first
+ * line the window cut mid-record is dropped, so the JSONL parse only sees whole lines. */
+function readTailText(path: string, bytes: number): string | null {
+	let fd: number;
+	try {
+		fd = openSync(path, "r");
+	} catch {
+		return null;
+	}
+	try {
+		const size = fstatSync(fd).size;
+		const from = Math.max(0, size - bytes);
+		const text = decodeAt(fd, from, size - from);
+		if (from === 0) return text;
+		const nl = text.indexOf("\n");
+		return nl === -1 ? "" : text.slice(nl + 1);
+	} catch {
+		return null;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** The /runprobe answer for one run entry (OTTR-1261). Every field degrades on its own
+ * internal failure — the probe never fails because one fact is unreadable. */
+function staleProbeOf(
+	e: {
+		pid: number | null;
+		cwd: string;
+		startedAt: number;
+		dataDir?: string | null;
+	},
+	procRoot: string,
+	sessionsDir: string | null,
+): StaleProbe {
+	// readTree is null on an unreadable /proc or a dead run pid: the tree degrades to
+	// empty, and alive below still reports what pidAlive saw. A null entry pid is the
+	// not-yet-spawned case: no tree, not alive.
+	const procs = e.pid === null ? [] : (readTree(e.pid, procRoot) ?? []);
+	const alive = e.pid !== null && pidAlive(e.pid);
+	let sessionAt: number | null = null;
+	let sessionPath: string | null = null;
+	if (sessionsDir !== null) {
+		// sessionAt comes from the shared helper the supervisor's own session signal
+		// reads; the path picker walks the same flat candidate set, so the tail below
+		// opens the file that mtime names.
+		sessionAt = newestSessionAt(sessionsDir, e.startedAt);
+		sessionPath = newestSessionFile(sessionsDir, e.startedAt)?.path ?? null;
+	}
+	let lastTool: LastTool | null = null;
+	if (sessionPath !== null) {
+		try {
+			const tail = readTailText(sessionPath, SESSION_TAIL_BYTES);
+			if (tail !== null) lastTool = lastToolCall(tail);
+		} catch {
+			lastTool = null;
+		}
+	}
+	let locks: LockFact[] = [];
+	try {
+		locks = lockFacts(
+			extractLockPaths(lastTool?.command ?? ""),
+			e.cwd,
+			cardNumOf(basename(e.cwd)),
+		);
+	} catch {
+		locks = [];
+	}
+	return { pid: e.pid, alive, procs, sessionAt, lastTool, locks };
+}
+
+/** One /stalefix answer: ok, or the failed precondition by name. A refusal changes
+ * nothing (OTTR-1261). */
+type StaleFixResult = { ok: true } | { ok: false; reason: string };
+
+/** The unlock fix: unlink a lock file whose pid is proven dead. Confinement is
+ * re-derived from real paths at act time, so a symlink the session text planted
+ * cannot widen the set; the card-number scratch rule applies to the real path too. */
+function staleUnlock(e: { cwd: string }, rawPath: string): StaleFixResult {
+	let realCwd: string;
+	let realPath: string;
+	try {
+		realCwd = realpathSync(e.cwd);
+		realPath = realpathSync(rawPath);
+	} catch {
+		return { ok: false, reason: "lock path does not resolve" };
+	}
+	const inWorktree = realPath === realCwd || realPath.startsWith(`${realCwd}/`);
+	const inTemp = STALE_TEMP_ROOTS.some(
+		(root) => realPath === root || realPath.startsWith(`${root}/`),
+	);
+	if (
+		!inWorktree &&
+		!(
+			inTemp && lockPathAllowed(realPath, realCwd, cardNumOf(basename(realCwd)))
+		)
+	)
+		return {
+			ok: false,
+			reason: `lock path ${rawPath} is outside the card's own dirs`,
+		};
+	let st: Stats;
+	try {
+		st = statSync(realPath);
+	} catch {
+		return { ok: false, reason: "lock file does not exist" };
+	}
+	if (!st.isFile())
+		return { ok: false, reason: "lock path is not a regular file" };
+	const pid = parseLockPid(readHeadText(realPath, 1024) ?? "");
+	if (pid === null || pid <= 1)
+		return { ok: false, reason: "lock does not name a pid > 1" };
+	if (pidAlive(pid))
+		return { ok: false, reason: `lock pid ${pid} is still alive` };
+	try {
+		unlinkSync(realPath);
+	} catch (err) {
+		return {
+			ok: false,
+			reason: `unlink failed: ${err instanceof Error ? err.message : String(err)}`,
+		};
+	}
+	return { ok: true };
+}
+
+/** The kill fix: SIGTERM one process proven to sit strictly inside the run's tree, in a
+ * fresh ppid walk. TERM only — never the omp pid, the daemon pid, or pid 1. */
+function staleKillChild(
+	e: { pid: number | null },
+	pid: number,
+	procRoot: string,
+	kill: typeof process.kill,
+): StaleFixResult {
+	if (pid === 1) return { ok: false, reason: "pid 1 is never a fix target" };
+	if (pid === process.pid)
+		return { ok: false, reason: "the daemon's own pid is never a fix target" };
+	if (e.pid === null || pid === e.pid)
+		return { ok: false, reason: "the run's own pid is never a fix target" };
+	let ppid: Map<number, number>;
+	try {
+		ppid = procParents(procRoot);
+	} catch {
+		return { ok: false, reason: "the /proc walk failed" };
+	}
+	if (!isStrictDescendant(ppid, pid, e.pid))
+		return { ok: false, reason: `pid ${pid} is not a descendant of the run` };
+	try {
+		kill(pid, "SIGTERM");
+	} catch (err) {
+		return {
+			ok: false,
+			reason: `signal failed: ${err instanceof Error ? err.message : String(err)}`,
+		};
+	}
+	return { ok: true };
+}
+
 /** POST /sweep to a worker: kills the processes whose worktree is gone on that host. */
 export async function sweepWorker(
 	target: WorkerTarget,
@@ -1734,4 +2078,137 @@ export async function killDetached(
 			`worker ${url}/detach/kill responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
 		);
 	}
+}
+
+/** One ProcSample on the wire. */
+function isProcSampleAnswer(s: unknown): boolean {
+	if (typeof s !== "object" || s === null) return false;
+	const o = s as Record<string, unknown>;
+	return (
+		typeof o.pid === "number" &&
+		typeof o.ppid === "number" &&
+		typeof o.ticks === "number" &&
+		typeof o.command === "string"
+	);
+}
+
+/** One LastTool on the wire, or null. */
+function isLastToolAnswer(t: unknown): boolean {
+	if (t === null) return true;
+	if (typeof t !== "object") return false;
+	const o = t as Record<string, unknown>;
+	return (
+		typeof o.tool === "string" &&
+		typeof o.command === "string" &&
+		(o.timeout === null || typeof o.timeout === "number")
+	);
+}
+
+/** One LockFact on the wire. */
+function isLockFactAnswer(f: unknown): boolean {
+	if (typeof f !== "object" || f === null) return false;
+	const o = f as Record<string, unknown>;
+	return (
+		typeof o.path === "string" &&
+		typeof o.exists === "boolean" &&
+		(o.pid === null || typeof o.pid === "number") &&
+		(o.alive === null || typeof o.alive === "boolean")
+	);
+}
+
+/** The /runprobe answer shape; any field off it fails whole. */
+function isStaleProbeAnswer(v: unknown): v is StaleProbe {
+	if (typeof v !== "object" || v === null) return false;
+	const o = v as Record<string, unknown>;
+	return (
+		(o.pid === null || typeof o.pid === "number") &&
+		typeof o.alive === "boolean" &&
+		Array.isArray(o.procs) &&
+		o.procs.every(isProcSampleAnswer) &&
+		(o.sessionAt === null || typeof o.sessionAt === "number") &&
+		isLastToolAnswer(o.lastTool) &&
+		Array.isArray(o.locks) &&
+		o.locks.every(isLockFactAnswer)
+	);
+}
+
+/** POST /runprobe to a worker: the read-only stale-turn facts for one run id
+ * (OTTR-1261). Null when the worker answered 200 with a body off the StaleProbe shape;
+ * transport failures and non-200 answers throw WorkerConnectError. */
+export async function probeRun(
+	target: WorkerTarget,
+	url: string,
+	runId: string,
+): Promise<StaleProbe | null> {
+	let res: Response;
+	try {
+		res = await fetch(`${url}/runprobe`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...(target.token ? { "x-otwr-token": target.token } : {}),
+			},
+			body: JSON.stringify({ run: runId }),
+			// redirect: "manual": the worker token must never follow a redirect off-host.
+			redirect: "manual",
+			signal: AbortSignal.timeout(10_000),
+		});
+	} catch (err) {
+		throw new WorkerConnectError(String(err));
+	}
+	if (res.status !== 200) {
+		const redirected = res.status >= 300 && res.status < 400;
+		const body = (await res.text()).trim().slice(0, 300);
+		throw new WorkerConnectError(
+			`worker ${url}/runprobe responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
+		);
+	}
+	const probe = (await res.json()) as unknown;
+	if (!isStaleProbeAnswer(probe)) return null;
+	return probe;
+}
+
+/** POST /stalefix to a worker: one allowlisted stale-turn fix, with the act-time
+ * preconditions re-checked on the worker that owns the run (OTTR-1261). Null when the
+ * 200 body is off the fix-answer shape; transport failures and non-200 answers throw
+ * WorkerConnectError. */
+export async function staleFix(
+	target: WorkerTarget,
+	url: string,
+	req:
+		| { run: string; action: "unlock"; path: string }
+		| { run: string; action: "kill"; pid: number },
+): Promise<{ ok: boolean; reason?: string } | null> {
+	let res: Response;
+	try {
+		res = await fetch(`${url}/stalefix`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/json",
+				...(target.token ? { "x-otwr-token": target.token } : {}),
+			},
+			body: JSON.stringify(req),
+			// redirect: "manual": the worker token must never follow a redirect off-host.
+			redirect: "manual",
+			signal: AbortSignal.timeout(10_000),
+		});
+	} catch (err) {
+		throw new WorkerConnectError(String(err));
+	}
+	if (res.status !== 200) {
+		const redirected = res.status >= 300 && res.status < 400;
+		const body = (await res.text()).trim().slice(0, 300);
+		throw new WorkerConnectError(
+			`worker ${url}/stalefix responded ${res.status}${redirected ? ` (redirect not followed${redirectProxyHint(url, res)})` : ""}${body ? `: ${body}` : ""}`,
+		);
+	}
+	const answer = (await res.json()) as unknown;
+	if (typeof answer !== "object" || answer === null) return null;
+	const { ok, reason } = answer as { ok?: unknown; reason?: unknown };
+	if (
+		typeof ok !== "boolean" ||
+		(reason !== undefined && typeof reason !== "string")
+	)
+		return null;
+	return answer as { ok: boolean; reason?: string };
 }

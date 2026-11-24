@@ -2,7 +2,14 @@
 // Startup and wiring only: routes live in createApp() (src/app.ts), the turn
 // engine lives in createTurnLoop() (src/turn.ts). This file binds them.
 
-import { lstatSync, readdirSync } from "node:fs";
+import {
+	closeSync,
+	lstatSync,
+	openSync,
+	readdirSync,
+	readSync,
+	statSync,
+} from "node:fs";
 import { constants, homedir, tmpdir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import type { Server } from "bun";
@@ -77,6 +84,20 @@ import { RunTokens } from "./runTokens.ts";
 import { archReviewView, blockingReview, lastFullReview } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import {
+	cardNumOf,
+	extractLockPaths,
+	type LastTool,
+	lastToolCall,
+	lockFacts,
+	newestSessionAt,
+	newestSessionFile,
+	readTree,
+	type StaleFix,
+	type StaleProbe,
+	staleKillLocal,
+	staleUnlockLocal,
+} from "./staleTurn.ts";
+import {
 	type AdoptResult,
 	adoptSharedProjectData,
 	discoverProjects,
@@ -106,7 +127,10 @@ import { VmTokens } from "./vmTokens.ts";
 import {
 	detachedRuns as detachedRunsRequest,
 	killDetached as killDetachedRequest,
+	probeRun as probeRunRequest,
+	staleFix as staleFixRequest,
 	sweepWorker as sweepWorkerRequest,
+	type WorkerTarget,
 } from "./workers.ts";
 import {
 	archReviewDelta,
@@ -1008,6 +1032,151 @@ const loop = createTurnLoop(projects, {
 // shutdown only releases the stores opened so far.
 loopRef = loop;
 
+// OTTR-1261 stale-turn pass (docs/specs/stale-turn-recovery.md): the ops wiring
+// below. A worker run probes and fixes on its worker host through the worker
+// clients; a server-local run probes and fixes this host in-process. Local runs
+// are the dev case, workers are the fleet case.
+
+/** One live run for the stale pass: the supervisor ops run shape plus the
+ * project/id it came from, so the server-local branch finds the card's store and
+ * worktree. The extra fields ride along the ops contract — the pass passes the run
+ * back opaquely — so they stay optional here. */
+type StaleRunRef = {
+	pid: number | null;
+	url?: string;
+	runId?: string;
+	project?: string;
+	id?: string;
+};
+
+/** The bounded transcript window the local probe parses: at most the last 64 KiB
+ * of the newest session file, never the whole (untrusted) transcript. */
+const STALE_TAIL_BYTES = 64 * 1024;
+
+/** Last 64 KiB of a text file, or null when unreadable. */
+function staleTail(path: string): string | null {
+	try {
+		const size = statSync(path).size;
+		const fd = openSync(path, "r");
+		try {
+			const start = Math.max(0, size - STALE_TAIL_BYTES);
+			const buf = Buffer.alloc(size - start);
+			const read = readSync(fd, buf, 0, buf.length, start);
+			return buf.subarray(0, read).toString("utf8");
+		} finally {
+			closeSync(fd);
+		}
+	} catch {
+		return null;
+	}
+}
+
+/** The stale pass's read-only probe for one live run. A worker run (url + runId)
+ * probes on its worker host; a server-local run probes this host from /proc and
+ * the project store. Null: no usable probe — dead run pid, unreachable worker,
+ * unknown run identity — and the pass reads null as "not a suspect, no action". */
+async function probeStaleRun(
+	projects: ReadonlyMap<string, Entry>,
+	workers: WorkerTarget | null,
+	run: StaleRunRef,
+): Promise<StaleProbe | null> {
+	if (run.url !== undefined && run.runId !== undefined) {
+		if (workers === null) return null;
+		try {
+			return await probeRunRequest(workers, run.url, run.runId);
+		} catch {
+			// An unreachable worker is not a suspect: no action, no ask.
+			return null;
+		}
+	}
+	if (run.project === undefined || run.id === undefined || run.pid === null)
+		return null;
+	const e = projects.get(run.project);
+	if (e === undefined) return null;
+	const procs = readTree(run.pid);
+	// A dead or unreadable run pid is not a suspect (OTTR-1216 owns the
+	// no-process case).
+	if (procs === null) return null;
+	const task = await e.store.getTask(run.id);
+	// The loop entry exposes no start time, so the session scan takes the newest
+	// file overall (cutoff 0): local runs are the dev case, workers are the fleet
+	// case, and the worker probe stats the run's own data dir instead.
+	const sessionAt = newestSessionAt(e.store.sessionsDir, 0);
+	const sessionPath = newestSessionFile(e.store.sessionsDir, 0)?.path ?? null;
+	const tail = sessionPath === null ? null : staleTail(sessionPath);
+	const lastTool: LastTool | null = tail === null ? null : lastToolCall(tail);
+	// The confinement root: the card's own worktree, else the main checkout.
+	const root = task === null ? null : (task.worktree ?? e.path);
+	return {
+		pid: run.pid,
+		alive: true,
+		procs,
+		sessionAt,
+		lastTool,
+		locks:
+			lastTool === null || root === null
+				? []
+				: lockFacts(
+						extractLockPaths(lastTool.command),
+						root,
+						cardNumOf(basename(task?.worktree ?? run.id)),
+					),
+	};
+}
+
+/** The stale pass's allowlisted fix for one live run, the act-time preconditions
+ * re-checked on the host that owns the run. A worker run delegates to the worker's
+ * /stalefix; a server-local run checks and acts here. A refused fix changes
+ * nothing and carries the reason, so the re-filed ask carries facts. */
+async function applyStaleFix(
+	projects: ReadonlyMap<string, Entry>,
+	workers: WorkerTarget | null,
+	run: StaleRunRef,
+	fix: StaleFix,
+): Promise<{ ok: boolean; reason?: string }> {
+	if (run.url !== undefined && run.runId !== undefined) {
+		if (workers === null)
+			return { ok: false, reason: "no worker fleet is configured" };
+		const req =
+			fix.kind === "stale-lock"
+				? { run: run.runId, action: "unlock" as const, path: fix.path }
+				: fix.kind === "hung-child"
+					? { run: run.runId, action: "kill" as const, pid: fix.pid }
+					: null;
+		if (req === null)
+			return {
+				ok: false,
+				reason: fix.kind === "unsure" ? fix.reason : "unsupported fix kind",
+			};
+		try {
+			// An unusable body is a refusal too: the ask carries facts, not a crash.
+			return (
+				(await staleFixRequest(workers, run.url, req)) ?? {
+					ok: false,
+					reason: "worker sent no usable answer",
+				}
+			);
+		} catch (err) {
+			return { ok: false, reason: errmsg(err) };
+		}
+	}
+	if (run.project === undefined || run.id === undefined || run.pid === null)
+		return { ok: false, reason: "the run is no longer live" };
+	const e = projects.get(run.project);
+	if (e === undefined)
+		return { ok: false, reason: "the run is no longer live" };
+	if (fix.kind === "unsure") return { ok: false, reason: fix.reason };
+	if (fix.kind === "stale-lock") {
+		const task = await e.store.getTask(run.id);
+		if (task === null) return { ok: false, reason: "the card row is gone" };
+		return staleUnlockLocal(task.worktree ?? e.path, fix.path);
+	}
+	// Hung child: staleKillLocal proves the pid sits strictly inside the turn's
+	// tree in a fresh walk before a signal flies; the run's own pid is never a
+	// target.
+	return staleKillLocal(run.pid, fix.pid);
+}
+
 // Supervisor: retries locked-worktree removal after done/cancel and watches CI for merge pushes.
 // Created before createApp: the hosted GitHub-event route kicks its tick through the bound
 // ciWatchTick dep (docs/specs/hosted-mode.md section 8).
@@ -1036,6 +1205,23 @@ const supervisor = createSupervisor(
 		fetchOriginBranch,
 		fetchPrHead,
 		deleteRemoteBranch,
+		// OTTR-1261: the stale pass's liveness check, probe and allowlisted fix.
+		liveRun: (project, id) => {
+			// The unsuffixed key only: the `:check`/`:workcheck` entries are not
+			// the turn the stale pass probes.
+			const entry = loop.running.get(`${project}/${id}`);
+			if (entry === undefined) return null;
+			const run: StaleRunRef = {
+				pid: entry.pid,
+				...(entry.url !== undefined && { url: entry.url }),
+				...(entry.runId !== undefined && { runId: entry.runId }),
+				project,
+				id,
+			};
+			return run;
+		},
+		probeStale: (run) => probeStaleRun(projects, workerTarget, run),
+		staleFix: (run, fix) => applyStaleFix(projects, workerTarget, run, fix),
 	},
 	workerTarget,
 );
@@ -1114,6 +1300,9 @@ const app = await createApp({
 			park,
 		),
 	stopTurn: loop.stopTurn,
+	// OTTR-1261: the reply route's stale-ask responder intercepts only while the
+	// card's unsuffixed turn entry is live.
+	turnLive: (project, id) => loop.running.has(`${project}/${id}`),
 	creditStop: loop.creditStop,
 	creditHoldActive: loop.creditHoldActive,
 	creditRelease: loop.creditRelease,

@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 import { readRegular, TASK_LOG_MAX_BYTES, writeBelow } from "./confine.ts";
 import { errmsg } from "./errmsg.ts";
@@ -20,6 +20,19 @@ import {
 import { classify } from "./runner.ts";
 import { isRetro, isReview, liveCard } from "./scheduler.ts";
 import { readTranscript } from "./session.ts";
+import {
+	busyDescendant,
+	diagnoseStale,
+	type LastTool,
+	STALE_IDLE_MS,
+	STALE_REASK_MS,
+	type StaleFix,
+	type StaleProbe,
+	staleAskQuestion,
+	staleAskReason,
+	staleSteerText,
+	tickMap,
+} from "./staleTurn.ts";
 import type { ProjectStore, TaskPatch } from "./store.ts";
 import {
 	dependabotHead,
@@ -97,7 +110,34 @@ export interface SupervisorOps {
 		mainPath: string,
 		target: string | null,
 	): Promise<number | null>;
+	/** OTTR-1261 stale-turn pass: the run loop's live entry for one running card, or null.
+	 * Absent ops (any of the three) skip the pass, so existing fakes stay valid. */
+	liveRun?(
+		project: string,
+		id: string,
+	): { pid: number | null; url?: string; runId?: string } | null;
+	/** OTTR-1261 stale-turn pass: one read-only probe of the run on the host that owns it
+	 * (process tree, session age, last tool call, lock facts); null when unreachable. */
+	probeStale?(run: StaleTurnRun): Promise<StaleProbe | null>;
+	/** OTTR-1261 stale-turn pass: applies one allowlisted fix on that host after it
+	 * re-checked every precondition; a refusal changes nothing and the card goes to the ask. */
+	staleFix?(
+		run: StaleTurnRun,
+		fix: StaleFixAction,
+	): Promise<{ ok: boolean; reason?: string }>;
 }
+
+/** A live run entry the stale-turn pass acts on (OTTR-1261); url/runId route the probe
+ * and the fix to the host that owns the run, pid is the run's omp process. */
+type StaleTurnRun = { url?: string; runId?: string; pid: number | null };
+
+/** A concrete allowlisted stale-turn fix (OTTR-1261); the unsure verdict never reaches
+ * ops.staleFix — it parks the ask instead. */
+type StaleFixAction = Exclude<StaleFix, { kind: "unsure"; reason: string }>;
+
+/** The installed stale-fix op (OTTR-1261); the pass captures it where the undefined
+ * guard narrowed it, so the helper sees a defined function. */
+type StaleFixOp = NonNullable<SupervisorOps["staleFix"]>;
 
 const CI_WAIT_MS = 2 * 60 * 60 * 1000; // give up when no run appeared
 const GH_FAIL_LIMIT = 10; // consecutive gh api failures before giving up
@@ -484,6 +524,31 @@ export function prConflictReason(n: number): string {
  * updates the same pull request. Pure. */
 export function prFeedbackReason(n: number): string {
 	return `PR #${n} received new review comments or a changes-requested review. Reply to start a fix turn; the tracker pushes the branch and updates the pull request.`;
+}
+
+/** The diagnosis text a stale-turn ask carries (OTTR-1261): the idle minutes, the
+ * busy-child check, the last tool call (command capped at 200 chars, timeout shown),
+ * the precondition that failed, and the proposed fix or its refusal when one exists.
+ * Every field is a probe fact or a verdict; session text only rides along capped. Pure. */
+export function staleDiagnosis(
+	idleMin: number,
+	lastTool: LastTool | null,
+	why: string,
+	extra?: string,
+): string {
+	const tool =
+		lastTool === null
+			? "no tool call found in the session"
+			: `last tool call ${lastTool.tool}: ${lastTool.command.slice(0, 200)} (timeout ${lastTool.timeout})`;
+	return [
+		`turn idle ${idleMin} min`,
+		"no busy child",
+		tool,
+		why,
+		...(extra === undefined ? [] : [extra]),
+	]
+		.filter((s) => s !== "")
+		.join("; ");
 }
 
 /** The tracker's own git-proof rejection strings and the outcome each expects in the last
@@ -1242,6 +1307,237 @@ export function createSupervisor(
 			t.id,
 			`hygiene: kept worktree quarantined after ${cand.days} day(s): ${moved.length} untracked file(s) in .tasks/quarantine/${t.id}${moved.length > 0 ? `: ${moved.join(", ")}` : ""}`,
 		);
+	}
+
+	// ---- stale-turn detection (OTTR-1261): docs/specs/stale-turn-recovery.md is the
+	// source of truth. A running card whose log and session sat idle past STALE_IDLE_MS
+	// with no busy descendant is a suspect: diagnose read-only, queue the steer before the
+	// allowlisted fix, or park an ask when no rule matches with all preconditions true.
+
+	// cardKey -> previous probe's per-pid ticks; memory only, so a restart re-checks once.
+	const staleTicks = new Map<
+		string,
+		{ at: number; ticks: Map<number, number> }
+	>();
+	// cardKey -> last action; keeps the pass quiet while the situation persists. Memory
+	// only — the card log keeps the durable record, and fresh log activity clears both.
+	const staleActed = new Map<
+		string,
+		{ kind: "fixed" } | { kind: "ask"; at: number }
+	>();
+
+	/** File the needs_you ask for a stale suspect (OTTR-1261): the reason carries the
+	 * marker the reply route recognises, one three-option question rides on the row, and
+	 * the card log records the park. The write goes through updateTaskIfCurrent like
+	 * prFeedbackWatch's park, because the pass's own queued steer would make plain
+	 * applyTask skip (wentStale protects any non-feedback pending prompt). A reply or a
+	 * cancel that landed during the awaits skips the park. */
+	async function staleAsk(
+		e: SupervisorEntry,
+		t: ListedTask,
+		key: string,
+		probe: StaleProbe,
+		idleMin: number,
+		why: string,
+		extra?: string,
+	): Promise<void> {
+		const fresh = await e.store.getTask(t.id);
+		if (
+			fresh === null ||
+			fresh.state !== "running" ||
+			fresh.cancelledAt !== null ||
+			(fresh.pendingPrompt !== null && fresh.pendingBy !== "supervisor")
+		)
+			return;
+		const q = staleAskQuestion();
+		const parked = await e.store.updateTaskIfCurrent(
+			fresh.id,
+			{
+				state: "needs_you",
+				needsReason: staleAskReason(
+					staleDiagnosis(idleMin, probe.lastTool, why, extra),
+				),
+				// staleAskQuestion returns bare labels; the row carries the drawer's
+				// AskQuestion shape (same adaptation parseOpenQuestions' writer uses).
+				asked: [
+					{
+						question: q.question,
+						options: q.options.map((label) => ({ label })),
+						multi: false,
+						recommended: null,
+						text: false,
+					},
+				],
+			},
+			fresh.revision,
+		);
+		if (!parked.ok) return;
+		staleActed.set(key, { kind: "ask", at: ops.now() });
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: turn idle ${idleMin} min without progress, ask filed`,
+		);
+	}
+
+	/** A suspect card: apply the allowlisted fix, steering first. `fixPending` when the
+	 * steer is already queued on the card (this pass queued it earlier, or the reply
+	 * responder answered "Apply the fix"): diagnose and fix without a second steer. Before
+	 * the fix acts on the world, re-read the card: state, cancel flag and the queued
+	 * prompt must still be what this pass saw, or the fix skips (it retries next tick). */
+	async function staleSuspect(
+		e: SupervisorEntry,
+		t: ListedTask,
+		run: StaleTurnRun,
+		probe: StaleProbe,
+		key: string,
+		prevTicks: Map<number, number>,
+		wt: string,
+		staleFixOp: StaleFixOp,
+	): Promise<void> {
+		const acted = staleActed.get(key);
+		if (acted !== undefined) {
+			if (acted.kind === "fixed") return;
+			if (ops.now() - acted.at < STALE_REASK_MS) return;
+		}
+		const fixPending = t.pendingPrompt !== null && t.pendingBy === "supervisor";
+		const d = diagnoseStale({ probe, worktree: wt, prevTicks });
+		const idleMin = Math.floor(
+			(ops.now() - (probe.sessionAt ?? ops.now())) / 60_000,
+		);
+		if (d.kind === "unsure") {
+			// No rule matches with all preconditions true: park the ask, change nothing.
+			await staleAsk(e, t, key, probe, idleMin, d.reason);
+			return;
+		}
+		const steer = staleSteerText(d);
+		if (!fixPending) {
+			const queued = await applyTask(e, t, {
+				pendingPrompt: queuedReply(t.pendingPrompt, steer),
+				pendingBy: "supervisor",
+				pendingFeedback: false,
+			});
+			if (!queued) return; // user steering landed meanwhile: skip, no fix
+		}
+		const expected = fixPending
+			? t.pendingPrompt
+			: queuedReply(t.pendingPrompt, steer);
+		const fresh = await e.store.getTask(t.id);
+		if (
+			fresh === null ||
+			fresh.state !== t.state ||
+			fresh.cancelledAt !== t.cancelledAt ||
+			fresh.pendingBy !== "supervisor" ||
+			fresh.pendingPrompt !== expected
+		)
+			return;
+		const result = await staleFixOp(run, d);
+		if (result.ok) {
+			// The queued prompt may be the reply responder's generic approval: make the
+			// fix's specific facts ride along unless the queue already carries one.
+			const hasFact =
+				d.kind === "stale-lock"
+					? (t.pendingPrompt?.includes(d.path) ?? false)
+					: (t.pendingPrompt?.includes(d.command.slice(0, 80)) ?? false);
+			if (fixPending && !hasFact) {
+				// Same reason staleAsk writes through updateTaskIfCurrent: the queued
+				// steer itself would make applyTask skip.
+				await e.store.updateTaskIfCurrent(
+					fresh.id,
+					{
+						pendingPrompt: queuedReply(t.pendingPrompt, steer),
+						pendingBy: "supervisor",
+					},
+					fresh.revision,
+				);
+			}
+			staleActed.set(key, { kind: "fixed" });
+			// OTTR-1261: the durable record of the applied fix (tests assert the exact lines).
+			await ops.appendLog(
+				e.store,
+				t.id,
+				d.kind === "stale-lock"
+					? `supervisor: removed stale lock ${d.path} (pid ${d.pid} gone), steered`
+					: `supervisor: stopped hung child ${d.pid} (${d.command}), steered`,
+			);
+			return;
+		}
+		const refusal = result.reason ?? "refused";
+		await ops.appendLog(
+			e.store,
+			t.id,
+			`supervisor: stale fix refused (${refusal})`,
+		);
+		await staleAsk(
+			e,
+			t,
+			key,
+			probe,
+			idleMin,
+			d.kind === "stale-lock"
+				? `the lock at ${d.path} still names dead pid ${d.pid}`
+				: `the child ${d.pid} (${d.command}) sat idle through the window`,
+			`the proposed fix was refused: ${refusal}`,
+		);
+	}
+
+	/** One card's stale-turn check: four gates (live ops, idle card log, live process,
+	 * idle session with no busy descendant), then diagnose. Every non-suspect exit keeps
+	 * the tick baseline current; a fresh card log clears the card's memory marks. */
+	async function staleTurnPass(
+		e: SupervisorEntry,
+		t: ListedTask,
+	): Promise<void> {
+		if (
+			ops.liveRun === undefined ||
+			ops.probeStale === undefined ||
+			ops.staleFix === undefined
+		)
+			return;
+		const staleFixOp: StaleFixOp = ops.staleFix;
+		if (t.state !== "running" || t.cancelledAt !== null) return;
+		const wt = t.worktree;
+		if (wt === null) return; // nothing to confine a diagnosis against
+		const run = ops.liveRun(e.name, t.id);
+		if (run === null) return;
+		const key = `${e.name}/${t.id}`;
+		// Gate 1: the card log is idle. A missing log reads as age 0, never a suspect.
+		const logAge =
+			ops.now() -
+			(statSync(await e.store.logPath(t.id), { throwIfNoEntry: false })
+				?.mtimeMs ?? ops.now());
+		if (logAge < STALE_IDLE_MS) {
+			staleTicks.delete(key);
+			staleActed.delete(key);
+			return;
+		}
+		// Gate 2: the run's process is alive. No process at all is OTTR-1216's domain.
+		const probe = await ops.probeStale(run);
+		if (probe === null || !probe.alive) {
+			staleTicks.delete(key); // the tick tree died with the pid; never compare across runs
+			return;
+		}
+		const prev = staleTicks.get(key);
+		const updateBaseline = () =>
+			staleTicks.set(key, { at: ops.now(), ticks: tickMap(probe.procs) });
+		// Gate 3: the session file is idle; unreadable (null) fails the signal.
+		if (
+			probe.sessionAt === null ||
+			ops.now() - probe.sessionAt < STALE_IDLE_MS
+		) {
+			updateBaseline();
+			return;
+		}
+		// Gate 4: no descendant burns ticks; the omp pid itself never counts as busy.
+		if (busyDescendant(prev?.ticks ?? null, probe.procs, probe.pid) !== null) {
+			updateBaseline();
+			return;
+		}
+		if (prev === undefined) {
+			updateBaseline(); // first probe: baseline only, decide on the next tick
+			return;
+		}
+		await staleSuspect(e, t, run, probe, key, prev.ticks, wt, staleFixOp);
 	}
 
 	// ---- auto-tend bookkeeping: supervisor-lifetime only; turn rows keep the durable count ----
@@ -3294,6 +3590,7 @@ export function createSupervisor(
 			await cleanupPass(e, t);
 			await reclassifyPass(e, t);
 			await hygienePass(e, t);
+			await staleTurnPass(e, t);
 			await ciPass(e, t);
 			await retroPass(e, t, settings, tasks);
 		}

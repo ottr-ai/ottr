@@ -132,6 +132,11 @@ import {
 } from "./scheduler.ts";
 import { loadSecretBox, type SecretBox } from "./secretBox.ts";
 import { createServiceQuotaHttpReader } from "./serviceQuotaHttp.ts";
+import {
+	STALE_ASK_MARKER,
+	STALE_FIX_PENDING_STEER,
+	STALE_OPTIONS,
+} from "./staleTurn.ts";
 import { ProjectStore } from "./store.ts";
 import { prFeedbackReason } from "./supervisor.ts";
 import fc from "./test/properties.ts";
@@ -427,10 +432,17 @@ let finishKeptImpl: (
 	id: string,
 	choices: unknown,
 ) => Promise<FinishKeptOutcome> = async () => ({ ok: true });
-let stopTurnImpl: (e: Entry, id: string) => Promise<StopOutcome> =
-	async () => ({
-		ok: true,
-	});
+let stopTurnImpl: (
+	e: Entry,
+	id: string,
+	reason?: string,
+) => Promise<StopOutcome> = async () => ({
+	ok: true,
+});
+// OTTR-1261: the reply route's stale-ask responder reads the loop's live-entry
+// check through this seam; the default keeps every pre-existing reply on the
+// normal path.
+let turnLiveImpl: (project: string, id: string) => boolean = () => false;
 // OTTR-1047: the validate route's filing seam; the route tests swap validateLeadsImpl per
 // case and the shared app reads it per request. Unstubbed calls fail loudly.
 let validateLeadsImpl:
@@ -449,7 +461,9 @@ const loopStubs = () => ({
 	cancel: (e: Entry, id: string, force: boolean) => cancelImpl(e, id, force),
 	finishKept: (e: Entry, id: string, choices: unknown) =>
 		finishKeptImpl(e, id, choices),
-	stopTurn: (e: Entry, id: string) => stopTurnImpl(e, id),
+	stopTurn: (e: Entry, id: string, reason?: string) =>
+		stopTurnImpl(e, id, reason),
+	turnLive: (project: string, id: string) => turnLiveImpl(project, id),
 	claimedPids: () => new Set<number>(),
 	validateLeads: (
 		e: Entry,
@@ -3246,6 +3260,151 @@ describe("task routes", () => {
 			starred: "yes",
 		});
 		expect(bad.status).toBe(400);
+	});
+});
+
+describe("stale-turn ask replies (OTTR-1261)", () => {
+	const resetImpls = () => {
+		turnLiveImpl = () => false;
+		stopTurnImpl = async () => ({ ok: true });
+	};
+	/** A stale-marked needs_you card holding the one stale ask. */
+	const staleCard = async () => {
+		const t = await store.createTask("stale card");
+		await store.updateTask(t.id, {
+			state: "needs_you",
+			needsReason: `${STALE_ASK_MARKER} idle 37 min; the lock could never clear`,
+			asked: [
+				{
+					question: "The turn is stuck. Apply the supervisor's fix?",
+					options: STALE_OPTIONS.map((label) => ({ label })),
+					multi: false,
+					recommended: null,
+					text: false,
+				},
+			],
+		});
+		return t;
+	};
+
+	test("Apply the fix queues the supervisor steer and keeps the row running", async () => {
+		const t = await staleCard();
+		turnLiveImpl = () => true;
+		const before = calls;
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: `For "The turn is stuck. Apply the supervisor's fix?": Apply the fix`,
+			});
+			expect(res.status).toBe(200);
+			const row = await store.getTask(t.id);
+			expect(row?.state).toBe("running");
+			expect(row?.pendingPrompt).toBe(STALE_FIX_PENDING_STEER);
+			expect(row?.pendingBy).toBe("supervisor");
+			expect(row?.pendingFeedback).toBe(false);
+			expect(row?.asked).toBeNull();
+			expect(row?.needsReason).toBeNull();
+			expect(calls).toBe(before + 1);
+			expect(readFileSync(await store.logPath(t.id), "utf8")).toContain(
+				"supervisor: stale fix approved by owner, applying",
+			);
+		} finally {
+			resetImpls();
+		}
+	});
+
+	test("Stop the turn and restart stops through the loop and queues the resume", async () => {
+		const t = await staleCard();
+		turnLiveImpl = () => true;
+		const stopped: string[] = [];
+		stopTurnImpl = async (_e, id, reason) => {
+			stopped.push(`${id} ${reason ?? ""}`);
+			return { ok: true };
+		};
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: `For "The turn is stuck. Apply the supervisor's fix?": Stop the turn and restart`,
+			});
+			expect(res.status).toBe(200);
+			expect(stopped).toEqual([
+				`${t.id} supervisor: stale turn stopped by owner`,
+			]);
+			const row = await store.getTask(t.id);
+			expect(row?.state).toBe("queued");
+			expect(row?.pendingPrompt).toBe(".");
+			expect(row?.pendingBy).toBe("supervisor");
+			expect(row?.asked).toBeNull();
+			expect(row?.needsReason).toBeNull();
+			expect(row?.queuedAt).not.toBeNull();
+		} finally {
+			resetImpls();
+		}
+	});
+
+	test("Wait clears the ask and leaves the turn running", async () => {
+		const t = await staleCard();
+		turnLiveImpl = () => true;
+		const before = calls;
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: `For "The turn is stuck. Apply the supervisor's fix?": Wait`,
+			});
+			expect(res.status).toBe(200);
+			const row = await store.getTask(t.id);
+			expect(row?.state).toBe("running");
+			expect(row?.asked).toBeNull();
+			expect(row?.needsReason).toBeNull();
+			expect(row?.pendingPrompt).toBeNull();
+			// No new turn: the process is still live, only the ask cleared.
+			expect(calls).toBe(before);
+			expect(readFileSync(await store.logPath(t.id), "utf8")).toContain(
+				"supervisor: stale ask answered wait by owner",
+			);
+		} finally {
+			resetImpls();
+		}
+	});
+
+	test("free text while the process is alive is refused and changes nothing", async () => {
+		const t = await staleCard();
+		turnLiveImpl = () => true;
+		try {
+			const rev = (await store.getTask(t.id))?.revision;
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: "please just carry on",
+			});
+			expect(res.status).toBe(409);
+			expect(await errorOf(res)).toBe(
+				`this card's turn is still running; answer with one of: ${STALE_OPTIONS.join(", ")}`,
+			);
+			const row = await store.getTask(t.id);
+			expect(row?.revision).toBe(rev);
+			expect(row?.state).toBe("needs_you");
+			expect(row?.asked).not.toBeNull();
+			expect(row?.needsReason).toContain(STALE_ASK_MARKER);
+		} finally {
+			resetImpls();
+		}
+	});
+
+	test("a stale ask whose process died falls through to the plain resume", async () => {
+		const t = await staleCard();
+		turnLiveImpl = () => false;
+		const before = calls;
+		try {
+			const res = await post(`/api/projects/p1/tasks/${t.id}/reply`, {
+				text: "carry on",
+			});
+			expect(res.status).toBe(200);
+			const row = await store.getTask(t.id);
+			expect(row?.state).toBe("queued");
+			expect(row?.pendingPrompt).toBe("carry on");
+			expect(row?.pendingBy).toBe("user");
+			expect(row?.asked).toBeNull();
+			expect(row?.needsReason).toBeNull();
+			expect(calls).toBe(before + 1);
+		} finally {
+			resetImpls();
+		}
 	});
 });
 
